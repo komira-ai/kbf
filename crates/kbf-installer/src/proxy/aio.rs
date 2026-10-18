@@ -11,21 +11,21 @@
 //! FP says only "the old process exits". Kept in [`Swap::stop_old`].
 
 use super::model::{Halt, Mode, Phase, Request, RoleState, Step};
-use super::swap::{Flow, Swap, go};
+use super::swap::{Flow, Swap, go, go_end};
 
 impl Swap<'_> {
-    pub(super) fn run_aio(&mut self) -> Result<Flow, Halt> {
+    pub(super) fn run_aio(&mut self) -> Result<Phase, Halt> {
         let phase = self.intent.phase;
         if phase.is_terminal() {
-            return Ok(Flow::End(phase));
+            return Ok(phase);
         }
         if phase <= Phase::Preflight {
-            go!(self.preflight());
-            go!(self.hold_and_quiesce());
-            go!(self.stop_old());
-            go!(self.start_new());
+            go_end!(self.preflight());
+            go_end!(self.hold_and_quiesce());
+            go_end!(self.stop_old());
+            go_end!(self.start_new());
         } else if phase < Phase::Switched {
-            go!(self.recover_aio());
+            go_end!(self.recover_aio());
         } else {
             self.recover_aio_post_switch()?;
         }

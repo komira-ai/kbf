@@ -29,6 +29,17 @@ macro_rules! go {
 }
 pub(super) use go;
 
+/// Like `go!`, for the drivers that return the final phase: the update ended, so that is
+/// the answer.
+macro_rules! go_end {
+    ($e:expr) => {
+        if let Flow::End(p) = $e? {
+            return Ok(p);
+        }
+    };
+}
+pub(super) use go_end;
+
 /// One update in progress.
 pub struct Swap<'a> {
     pub(super) ports: Ports<'a>,
@@ -98,49 +109,43 @@ impl<'a> Swap<'a> {
     /// Drive the update from the phase the intent names to a terminal phase. A fresh
     /// swap starts at `staged`; an adopted one resumes where the record says.
     pub fn run(&mut self) -> Result<Phase, Halt> {
-        let flow = match self.intent.mode {
-            super::model::Mode::Frontend => self.run_frontend()?,
-            super::model::Mode::AllInOne => self.run_aio()?,
-        };
-        match flow {
-            Flow::End(phase) => Ok(phase),
-            Flow::Go => Err(Halt::Port(
-                "the swap stopped in a non-terminal phase".into(),
-            )),
+        match self.intent.mode {
+            super::model::Mode::Frontend => self.run_frontend(),
+            super::model::Mode::AllInOne => self.run_aio(),
         }
     }
 
-    fn run_frontend(&mut self) -> Result<Flow, Halt> {
+    fn run_frontend(&mut self) -> Result<Phase, Halt> {
         let phase = self.intent.phase;
         if phase.is_terminal() {
-            return Ok(Flow::End(phase));
+            return Ok(phase);
         }
         if phase <= Phase::Preflight {
-            go!(self.preflight());
-            go!(self.start());
-            go!(self.switch());
+            go_end!(self.preflight());
+            go_end!(self.start());
+            go_end!(self.switch());
         } else if phase < Phase::Switched {
-            go!(self.recover_pre_switch());
+            go_end!(self.recover_pre_switch());
         } else {
-            go!(self.recover_post_switch());
+            go_end!(self.recover_post_switch());
         }
         self.settle()
     }
 
     /// Bake, confirm, nodes, and (on a frontend) drain and retire the old child.
-    pub(super) fn settle(&mut self) -> Result<Flow, Halt> {
+    pub(super) fn settle(&mut self) -> Result<Phase, Halt> {
         if self.intent.phase <= Phase::Baking {
-            go!(self.bake());
+            go_end!(self.bake());
         }
         // Nodes follow a confirmed release only: with the confirm failed the host still
         // boots the old `current`, so the nodes are not sent to the new one.
         if self.intent.phase <= Phase::Nodes && !self.confirm_failed() {
-            go!(self.nodes());
+            go_end!(self.nodes());
         }
         if self.intent.mode == super::model::Mode::AllInOne {
             let end = self.end_phase();
             self.set_phase(end)?;
-            return Ok(Flow::End(end));
+            return Ok(end);
         }
         self.drain()
     }

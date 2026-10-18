@@ -9,14 +9,14 @@ use super::swap::{Flow, Swap};
 
 impl Swap<'_> {
     /// Step 10: drain the old child, then retire it.
-    pub(super) fn drain(&mut self) -> Result<Flow, Halt> {
+    pub(super) fn drain(&mut self) -> Result<Phase, Halt> {
         let slot = self.intent.retire.unwrap_or(self.intent.old_slot);
         self.intent.retire = Some(slot);
         self.set_phase(Phase::Draining)?;
         self.retire(slot)?;
         let end = self.end_phase();
         self.set_phase(end)?;
-        Ok(Flow::End(end))
+        Ok(end)
     }
 
     /// Wait until `slot` is idle, send SIGTERM once, and wait for the exit. Idle means all
@@ -124,7 +124,7 @@ impl Swap<'_> {
         self.release_held(old)?;
         self.revert_staged();
         self.intent.retire = Some(new);
-        self.drain()
+        self.drain().map(Flow::End)
     }
 
     /// The rollback did not land: put the new child back, which stood down, and fail. The

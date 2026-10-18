@@ -67,6 +67,22 @@ fn a_missing_record_is_none_and_a_corrupt_one_is_refused() {
 }
 
 #[test]
+fn a_record_that_cannot_be_read_is_an_io_error_not_a_missing_one() {
+    // A directory where the file belongs: reading it fails, and it is not `NotFound`.
+    let d = dir("unreadable");
+    fs::create_dir(d.join("update.json")).expect("seed");
+    assert!(matches!(FileRecorder::load(&d), Err(LoadError::Io(_))));
+}
+
+#[test]
+fn the_file_recorder_has_no_crash_points_of_its_own() {
+    let r = FileRecorder::new(&dir("crashpoint"));
+    for point in [CrashPoint::BeforeTakeoverReturns, CrashPoint::WhileDraining] {
+        assert_eq!(r.crash_point(point), Ok(()));
+    }
+}
+
+#[test]
 fn an_unwritable_directory_stops_the_swap_before_it_acts() {
     let r = FileRecorder::new(&dir("gone").join("no/such/dir"));
     assert!(matches!(

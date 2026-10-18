@@ -56,6 +56,8 @@ mod aio_tests;
 #[cfg(test)]
 mod fakes;
 #[cfg(test)]
+mod fault_tests;
+#[cfg(test)]
 mod record_tests;
 #[cfg(test)]
 mod recover_tests;
