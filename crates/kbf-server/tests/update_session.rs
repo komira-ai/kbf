@@ -475,3 +475,102 @@ fn the_ports_read_every_state_and_refuse_the_marks() {
     let gone = transport.activate(&host, order, &release);
     assert!(gone.expect_err("closed").0.contains("not connected"));
 }
+
+/// Catches a confirmation that gets a new id at every ask (the controller repeats its orders,
+/// and the node drops a repeated id: each new one would be acted on as a fresh confirm), and
+/// two activations sharing one: the same activation keeps its confirmation id across asks, a
+/// later activation gets a higher one, and both go out under the epoch of the order.
+///
+/// Mutant seen red: the confirmation id drawn anew at every call.
+#[test]
+fn a_confirmation_keeps_its_id_for_its_activation() {
+    let farm = farm();
+    let store = store();
+    let mut node = Node::new(&farm, "mac-1", "fedcba987654");
+    let (mut transport, _) = ports(Arc::clone(&farm), Rows::new(store));
+    let epoch = farm.lease_epoch();
+    let release = Release::new(A);
+    let mut ids = Vec::new();
+    for activation in [4, 4, 4, 9, 9] {
+        transport
+            .confirm(&node.id, OrderId::new(epoch, activation), &release)
+            .expect("sent");
+        let [sent] = &node.orders()[..] else {
+            panic!("one order");
+        };
+        assert_eq!(sent.epoch, epoch);
+        ids.push(sent.order_id);
+    }
+    assert_eq!(ids[0], ids[1]);
+    assert_eq!(ids[1], ids[2]);
+    assert_eq!(ids[3], ids[4]);
+    assert!(ids[3] > ids[0], "a later activation, a higher id: {ids:?}");
+    assert!(ids[0] > 0);
+}
+
+/// Catches a status read as the answer to an order it is not: the status names an id and no
+/// epoch, so after a store restore (ids counted again) an old acknowledgement of the same
+/// number must not stand for the new activation. A host that had acked id 5 of the old store,
+/// still at the old release, is sent activation 5 of the new epoch: its unchanged status is
+/// no report for it. Once the host has acted (the new release installed) the same id counts;
+/// so does a host that acked it before a controller restart gave the order again. An id the
+/// process sent no order under, and a different id, never count.
+///
+/// Mutant seen red: the status read as the current epoch's order whatever it names.
+#[test]
+fn an_old_acknowledgement_is_not_the_answer_to_a_new_order_of_the_same_number() {
+    use kbf_proto::update::update_status::State;
+    use kbf_server::update::FactsSource as _;
+    let farm = farm();
+    let store = store();
+    let rows = Rows::new(Arc::clone(&store));
+    rows.offer(&Release::new(A), farm.wall_now())
+        .expect("a run");
+    let (mut transport, mut source) = ports(Arc::clone(&farm), rows);
+    let (stream, _inbound) = register(&farm, "mac-1", "macos");
+    let id = WorkerId::new("mac-1");
+    let epoch = farm.lease_epoch();
+    let status = |acked: u64, installed: &str, state: State| UpdateStatus {
+        running_commit: "fedcba987654".to_owned(),
+        installed_commit: installed.to_owned(),
+        state: state as i32,
+        acked_order_id: acked,
+        ..UpdateStatus::default()
+    };
+    let reported = |source: &mut kbf_server::update::FarmFacts| {
+        let hosts = source.look(FarmTime::from_millis(0)).expect("a look").hosts;
+        hosts[0].helper
+    };
+    // Acknowledged order 5 of the old store; nothing sent yet.
+    farm.update_status(&id, stream, status(5, OLD, State::Confirmed));
+    assert_eq!(
+        reported(&mut source).map(|r| r.order),
+        Some(OrderId::new(0, 5))
+    );
+    // The new store's activation 5 goes out; the status has not changed.
+    let activation = OrderId::new(epoch, 5);
+    transport
+        .activate(&id, activation, &Release::new(A))
+        .expect("sent");
+    assert_eq!(
+        reported(&mut source).map(|r| r.order),
+        Some(OrderId::new(0, 5))
+    );
+    // The host acts: the release is installed under the same number. It counts.
+    farm.update_status(&id, stream, status(5, A, State::ActivatedUnconfirmed));
+    assert_eq!(reported(&mut source).map(|r| r.order), Some(activation));
+    // Another number is no answer to it.
+    farm.update_status(&id, stream, status(6, A, State::ActivatedUnconfirmed));
+    assert_eq!(
+        reported(&mut source).map(|r| r.order),
+        Some(OrderId::new(0, 6))
+    );
+    // The same order given again after the host acked it counts as well (a controller
+    // that restarted gives its orders again): the baseline is the id itself, the release is in.
+    let (mut again, mut source) = ports(Arc::clone(&farm), Rows::new(store));
+    farm.update_status(&id, stream, status(5, A, State::Confirmed));
+    again
+        .activate(&id, activation, &Release::new(A))
+        .expect("sent");
+    assert_eq!(reported(&mut source).map(|r| r.order), Some(activation));
+}

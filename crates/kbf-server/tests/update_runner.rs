@@ -150,10 +150,25 @@ async fn nothing_starts_until_auto_nodes_is_set() {
     .await
     .expect("offered");
 
+    // The default is off, and a policy row that says nothing of it leaves it off.
+    assert!(!Policy::default().auto_nodes);
     let activation = |m: &server_message::Message| match m {
         server_message::Message::UpdateOrder(order) => Some(order.clone()),
         _ => None,
     };
+    assert!(mac.expect_within(QUIET, activation).await.is_none());
+    assert_eq!(placement(front.api, "mac-1").await, "serving");
+
+    let rows = front.rows.clone();
+    tokio::task::spawn_blocking(move || {
+        rows.set_policy(&Policy {
+            max_hosts_out: 2,
+            ..Policy::default()
+        })
+        .expect("a policy row with auto_nodes at its default");
+    })
+    .await
+    .expect("set");
     assert!(mac.expect_within(QUIET, activation).await.is_none());
     assert_eq!(placement(front.api, "mac-1").await, "serving");
 

@@ -16,7 +16,10 @@
 //! acted on. The transport draws one from the store's counter ([`Rows::mint_order`]) the
 //! first time it is asked to confirm an activation, and gives the same one again for the same
 //! activation (the controller repeats the order); the facts map a status that names it back
-//! to the activation, which is what the node step compares ([`HelperReport`]). After a
+//! to the activation, which is what the node step compares ([`HelperReport`]). A status
+//! carries an id and no epoch, so it counts only for an order this process sent, and only if
+//! the host had not acked that id before or has the order's release installed (a restored
+//! store counts ids again). After a
 //! restart of the controller the confirmation is given again under a new id and the old one
 //! is no longer mapped; a `CONFIRMED` that names it counts once the new one is acted on.
 //!
@@ -51,7 +54,34 @@ use crate::farm::{Farm, NodeAction, NodeLook};
 /// Which confirmation order id went to which host, for which activation.
 #[derive(Debug, Default)]
 struct Issued {
-    confirms: BTreeMap<WorkerId, (OrderId, u64)>,
+    sent: BTreeMap<WorkerId, Vec<Sent>>,
+}
+
+/// An order this process sent to a host.
+#[derive(Clone, Debug)]
+struct Sent {
+    /// The id on the wire: the activation's own, or a confirmation's.
+    order: OrderId,
+    /// The activation it is about.
+    activation: OrderId,
+    /// The newest order id the host had acted on when the order was first sent. A status that
+    /// still names this id says nothing about the order: the id is an older one that happens
+    /// to be the same number (a restored store counts ids again), unless the host's installed
+    /// release is the order's (a controller that restarted gives its orders again).
+    baseline: u64,
+    /// The release the order names.
+    commit: String,
+}
+
+impl Issued {
+    /// Records `sent` for `host` unless that order was recorded already: a repeat of an order
+    /// keeps the baseline of its first sending.
+    fn note(&mut self, host: &WorkerId, sent: Sent) {
+        let all = self.sent.entry(host.clone()).or_default();
+        if !all.iter().any(|s| s.order == sent.order) {
+            all.push(sent);
+        }
+    }
 }
 
 type Shared = Arc<Mutex<Issued>>;
@@ -114,6 +144,16 @@ impl SessionTransport {
         Ok(u32::try_from(window.as_secs()).unwrap_or(u32::MAX))
     }
 
+    /// The newest order id the host's status says it acted on; 0 before a status.
+    fn acked_now(&self, host: &WorkerId) -> u64 {
+        self.farm
+            .update_look()
+            .into_iter()
+            .find(|n| n.id == *host)
+            .and_then(|n| n.update)
+            .map_or(0, |u| u.acked_order_id)
+    }
+
     fn send(
         &self,
         host: &WorkerId,
@@ -169,6 +209,16 @@ impl Transport for SessionTransport {
     ) -> Result<(), TransportError> {
         self.check_epoch(order)?;
         let window = self.window_s()?;
+        let baseline = self.acked_now(host);
+        lock(&self.issued).note(
+            host,
+            Sent {
+                order,
+                activation: order,
+                baseline,
+                commit: release.as_str().to_owned(),
+            },
+        );
         self.send(
             host,
             Verb::Activate,
@@ -187,17 +237,25 @@ impl Transport for SessionTransport {
     ) -> Result<(), TransportError> {
         self.check_epoch(order)?;
         let known = lock(&self.issued)
-            .confirms
+            .sent
             .get(host)
-            .filter(|(activation, _)| *activation == order)
-            .map(|(_, id)| *id);
+            .into_iter()
+            .flatten()
+            .find(|s| s.activation == order && s.order != order)
+            .map(|s| s.order.seq);
         let id = match known {
             Some(id) => id,
             None => {
                 let drawn = self.rows.mint_order(order.epoch).map_err(failed)?;
-                lock(&self.issued)
-                    .confirms
-                    .insert(host.clone(), (order, drawn.seq));
+                lock(&self.issued).note(
+                    host,
+                    Sent {
+                        order: drawn,
+                        activation: order,
+                        baseline: self.acked_now(host),
+                        commit: release.as_str().to_owned(),
+                    },
+                );
                 drawn.seq
             }
         };
@@ -272,12 +330,21 @@ impl FarmFacts {
         };
         let helper = look.update.as_ref().and_then(|u| {
             let status = helper_status(u.kind)?;
-            let acked = OrderId::new(epoch, u.acked_order_id);
+            // The status carries an id and no epoch. It is read as the answer to an order this
+            // process sent, under the epoch it sent it, and only if the host had not acked
+            // that id already when it was sent; any other id is of an epoch not known (0),
+            // which no activation order has.
+            let acked = u.acked_order_id;
             let order = lock(&self.issued)
-                .confirms
+                .sent
                 .get(&look.id)
-                .filter(|(_, confirm)| *confirm == u.acked_order_id)
-                .map_or(acked, |(activation, _)| *activation);
+                .into_iter()
+                .flatten()
+                .find(|s| {
+                    s.order == OrderId::new(epoch, acked)
+                        && (s.baseline != acked || u.installed_commit == s.commit)
+                })
+                .map_or(OrderId::new(0, acked), |s| s.activation);
             Some(HelperReport { order, status })
         });
         let work = if look.leases > 0 {
