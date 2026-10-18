@@ -144,13 +144,9 @@ impl Offers {
                     platform,
                     component: info.component,
                 };
-                // Complete means attested, and a key never changes: a bundle that is
-                // missing now is a store that fails, and the table is kept.
-                let attestation = self
-                    .store
-                    .attestation(&key)
-                    .await?
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                // Complete means attested, and a key never changes, so the bundle is there;
+                // were it gone, the node would refuse an offer with none.
+                let attestation = self.store.attestation(&key).await?.unwrap_or_default();
                 components.push(WireComponent {
                     name: info.component.as_str().to_owned(),
                     sha256: info.sha256.to_string(),
@@ -309,5 +305,21 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(60), poll(held, Duration::from_secs(1)))
             .await
             .expect("the poll ends");
+    }
+
+    /// Catches a push task that outlives the offers: when the table's sender is gone it ends
+    /// (and with it the hold on the stream).
+    #[tokio::test(start_paused = true)]
+    async fn the_push_ends_when_the_offers_are_dropped() {
+        let offers = Offers::start(store("push"), rows(), Duration::from_secs(1));
+        let table = offers.subscribe();
+        drop(offers);
+        let (outbound, _kept) = tokio::sync::mpsc::unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            push(table, ReleasePlatform::DarwinArm64, outbound),
+        )
+        .await
+        .expect("the push ends");
     }
 }

@@ -159,6 +159,12 @@ fn store() -> Arc<dyn Store> {
     hooked::Hooked::new()
 }
 
+fn hooked_store() -> (Arc<hooked::Hooked>, Arc<dyn Store>) {
+    let hooked = hooked::Hooked::new();
+    let store: Arc<dyn Store> = hooked.clone();
+    (hooked, store)
+}
+
 fn controller(farm: &Arc<Farm>, store: &Arc<dyn Store>) -> Controller {
     let (transport, source) = ports(Arc::clone(farm), Rows::new(Arc::clone(store)));
     Controller::new(
@@ -436,6 +442,18 @@ fn the_ports_read_every_state_and_refuse_the_marks() {
             .expect("listed");
         assert_eq!(seen.helper.map(|h| h.status), want, "{state:?}");
     }
+    // A process that does not know its commit runs no release the controller can name.
+    let unknown = UpdateStatus {
+        running_commit: "unknown".to_owned(),
+        ..UpdateStatus::default()
+    };
+    farm.update_status(&WorkerId::new("mac"), mac, unknown);
+    let hosts = source.look(FarmTime::from_millis(0)).expect("a look").hosts;
+    let seen = hosts
+        .iter()
+        .find(|h| h.id.as_str() == "mac")
+        .expect("listed");
+    assert_eq!(seen.release, None);
     let hosts = source.look(FarmTime::from_millis(0)).expect("a look").hosts;
     let ids: Vec<&str> = hosts.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(ids, ["linux", "mac"], "freebsd is not an updatable host");
@@ -573,4 +591,75 @@ fn an_old_acknowledgement_is_not_the_answer_to_a_new_order_of_the_same_number() 
         .activate(&id, activation, &Release::new(A))
         .expect("sent");
     assert_eq!(reported(&mut source).map(|r| r.order), Some(activation));
+}
+
+/// Catches a farm that cannot be read answered as an empty one (the controller would then see
+/// no host and think nothing is missing): a state store that fails the read of the desired
+/// release makes the look an error that says so.
+#[test]
+fn a_look_that_cannot_read_the_run_is_an_error() {
+    use kbf_server::update::FactsSource as _;
+    let farm = farm();
+    let (hooked, store) = hooked_store();
+    let (_, mut source) = ports(Arc::clone(&farm), Rows::new(store));
+    hooked.fail_gets.store(1, Ordering::SeqCst);
+    let failed = source
+        .look(FarmTime::from_millis(0))
+        .expect_err("the store failed");
+    assert!(!failed.0.is_empty());
+    assert!(
+        source.look(FarmTime::from_millis(0)).is_ok(),
+        "and then it reads"
+    );
+}
+
+/// Catches an activation that is given again after a failed send and overwrites what the first
+/// one recorded. The host had acked 4; activation 5 is sent; the host acts on it and the helper
+/// reverts it (it reports REVERTED, acked 5, the old release still installed); the controller,
+/// which saw the first send fail, sends activation 5 again. The record of the first sending
+/// stands, so the status still answers the order: the run is held as `Reverted`, not left to
+/// stall for lack of a report. The same for a refusal.
+///
+/// Mutant seen red: a repeat of an order records afresh (the baseline becomes 5, the old
+/// release is installed, and the report is lost).
+#[test]
+fn a_repeated_activation_keeps_the_record_of_its_first_sending() {
+    use kbf_proto::update::update_status::State;
+    use kbf_server::update::{FactsSource as _, HelperStatus};
+    for (state, want) in [
+        (State::Reverted, HelperStatus::Reverted),
+        (State::Refused, HelperStatus::Refused),
+    ] {
+        let farm = farm();
+        let store = store();
+        let rows = Rows::new(Arc::clone(&store));
+        rows.offer(&Release::new(A), farm.wall_now())
+            .expect("a run");
+        let (mut transport, mut source) = ports(Arc::clone(&farm), rows);
+        let (stream, _inbound) = register(&farm, "mac-1", "macos");
+        let id = WorkerId::new("mac-1");
+        let status = |acked: u64, state: State| UpdateStatus {
+            running_commit: "fedcba987654".to_owned(),
+            installed_commit: OLD.to_owned(),
+            state: state as i32,
+            acked_order_id: acked,
+            ..UpdateStatus::default()
+        };
+        farm.update_status(&id, stream, status(4, State::Idle));
+        let activation = OrderId::new(farm.lease_epoch(), 5);
+        transport
+            .activate(&id, activation, &Release::new(A))
+            .expect("sent");
+        farm.update_status(&id, stream, status(5, state));
+        transport
+            .activate(&id, activation, &Release::new(A))
+            .expect("sent again");
+        let hosts = source.look(FarmTime::from_millis(0)).expect("a look").hosts;
+        let report = hosts[0].helper.expect("a report");
+        assert_eq!(
+            (report.order, report.status),
+            (activation, want),
+            "{state:?}"
+        );
+    }
 }

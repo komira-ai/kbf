@@ -76,11 +76,22 @@ struct Sent {
 impl Issued {
     /// Records `sent` for `host` unless that order was recorded already: a repeat of an order
     /// keeps the baseline of its first sending.
+    ///
+    /// A newer activation supersedes the older ones of the host: its orders are answered no
+    /// more, so they are dropped, and a host holds the orders of one activation (its own and
+    /// its confirmation).
     fn note(&mut self, host: &WorkerId, sent: Sent) {
         let all = self.sent.entry(host.clone()).or_default();
-        if !all.iter().any(|s| s.order == sent.order) {
-            all.push(sent);
+        if all.iter().any(|s| s.order == sent.order) {
+            return;
         }
+        all.retain(|s| s.activation >= sent.activation);
+        all.push(sent);
+    }
+
+    /// Forgets every host `present` does not name.
+    fn keep_only(&mut self, present: &[WorkerId]) {
+        self.sent.retain(|host, _| present.contains(host));
     }
 }
 
@@ -105,16 +116,11 @@ pub fn ports(farm: Arc<Farm>, rows: Rows) -> (SessionTransport, FarmFacts) {
 }
 
 /// The orders, over the sessions.
+#[derive(Debug)]
 pub struct SessionTransport {
     farm: Arc<Farm>,
     rows: Rows,
     issued: Shared,
-}
-
-impl std::fmt::Debug for SessionTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SessionTransport")
-    }
 }
 
 fn failed(why: impl std::fmt::Display) -> TransportError {
@@ -276,16 +282,11 @@ impl Transport for SessionTransport {
 }
 
 /// The facts, from the farm.
+#[derive(Debug)]
 pub struct FarmFacts {
     farm: Arc<Farm>,
     rows: Rows,
     issued: Shared,
-}
-
-impl std::fmt::Debug for FarmFacts {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("FarmFacts")
-    }
 }
 
 /// The release a host runs, given the one desired: its own commit, which the desired one
@@ -389,9 +390,10 @@ impl FactsSource for FarmFacts {
             .map(|d| d.commit);
         let epoch = self.farm.lease_epoch();
         let queue_empty = self.farm.queued_operations() == 0;
-        let hosts = self
-            .farm
-            .update_look()
+        let looks = self.farm.update_look();
+        let present: Vec<WorkerId> = looks.iter().map(|l| l.id.clone()).collect();
+        lock(&self.issued).keep_only(&present);
+        let hosts = looks
             .into_iter()
             .filter_map(|look| self.host(look, epoch, target.as_ref(), queue_empty))
             .collect();
@@ -402,5 +404,90 @@ impl FactsSource for FarmFacts {
             // class here, so it is unknown, and the last Mac of a class is never cordoned.
             queued_classes: queue_empty.then(BTreeSet::new),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kbf_caps::NodeCaps;
+    use kbf_front::{Cache, MemoryMetaLog};
+    use kbf_objstore::MemoryStore;
+    use kbf_proto::worker::ServerMessage;
+    use kbf_state::fake::{Fake, Flaw};
+    use kbf_state::{ManualClock, Store};
+    use kbf_types::Resources;
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::farm::Reported;
+
+    const A: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn farm() -> Arc<Farm> {
+        Arc::new(Farm::new(
+            Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),
+            kbf_sched::UNSERVABLE_WAIT,
+            kbf_sched::FINISHED_RETENTION,
+        ))
+    }
+
+    fn rows() -> Rows {
+        let clock = Arc::new(ManualClock::default());
+        Rows::new(Arc::new(Fake::with_flaw(clock, Flaw::None)) as Arc<dyn Store>)
+    }
+
+    /// Catches a record that grows with every activation of a host (a long-lived frontend
+    /// keeps a line per order for ever), one that forgets the order it still waits on, and
+    /// one that keeps a host that is no longer in the farm's look. A thousand activations of
+    /// one host leave the orders of the last (its own, and its confirmation); an older
+    /// activation's orders are not answered after a newer is sent; a host the look does not
+    /// name is forgotten.
+    #[test]
+    fn the_record_of_sent_orders_stays_bounded() {
+        let farm = farm();
+        let (outbound, _inbound) =
+            mpsc::unbounded_channel::<Result<ServerMessage, tonic::Status>>();
+        let caps = NodeCaps::from_report([("arch", "arm64"), ("os", "macos")]).expect("caps");
+        farm.register(
+            &WorkerId::new("mac"),
+            kbf_sched::DaemonInstance::new("mac"),
+            kbf_sched::DaemonInstance::default(),
+            Reported::serving(Resources::new(1_000, 1 << 30), caps),
+            outbound,
+            ServerMessage::default(),
+        );
+        let rows = rows();
+        let (mut transport, mut source) = ports(Arc::clone(&farm), rows.clone());
+        let epoch = farm.lease_epoch();
+        let release = Release::new(A);
+        let host = WorkerId::new("mac");
+        for _ in 0..1_000 {
+            // Every id comes from the one counter, as the controller's do.
+            let order = rows.mint_order(epoch).expect("an id");
+            transport.activate(&host, order, &release).expect("sent");
+            transport.confirm(&host, order, &release).expect("sent");
+        }
+        let held = |source: &FarmFacts, host: &WorkerId| {
+            lock(&source.issued).sent.get(host).map_or(0, Vec::len)
+        };
+        assert_eq!(
+            held(&source, &host),
+            2,
+            "the last activation and its confirmation"
+        );
+        // An older activation, sent late, is not recorded over the newer.
+        transport
+            .activate(&host, OrderId::new(epoch, 5), &release)
+            .expect("sent");
+        assert_eq!(held(&source, &host), 3);
+        // A host that is not in the farm: the activation does not go, and the record goes.
+        let ghost = WorkerId::new("ghost");
+        transport
+            .activate(&ghost, OrderId::new(epoch, 7), &release)
+            .expect_err("unknown");
+        assert_eq!(held(&source, &ghost), 1);
+        source.look(FarmTime::from_millis(0)).expect("a look");
+        assert_eq!(held(&source, &ghost), 0);
+        assert_eq!(held(&source, &host), 3);
     }
 }

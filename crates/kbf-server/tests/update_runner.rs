@@ -19,7 +19,7 @@ use kbf_server::members::MembershipConfig;
 use kbf_server::update::{Policy, Release, Rows};
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::Store;
-use support::{FakeDaemon, HELLO_WAIT, INTERVAL, QUIET, hello_on};
+use support::{Client, FakeDaemon, HELLO_WAIT, INTERVAL, Job, QUIET, hello, hello_on};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -49,8 +49,10 @@ fn listeners() -> Listeners {
 
 struct Frontend {
     api: SocketAddr,
+    reapi: SocketAddr,
     worker: SocketAddr,
     rows: Rows,
+    hooked: Arc<hooked::Hooked>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -93,11 +95,14 @@ fn start() -> Frontend {
     )
     .expect("bind");
     let (api, worker) = (bound.api.expect("an API address"), bound.worker);
+    let reapi = bound.reapi;
     tokio::spawn(async move { bound.serving.await.expect("serve") });
     Frontend {
         api,
+        reapi,
         worker,
-        rows: Rows::new(store),
+        rows: Rows::new(store.clone()),
+        hooked: store,
         stop: Some(stop),
     }
 }
@@ -186,4 +191,130 @@ async fn nothing_starts_until_auto_nodes_is_set() {
     assert_eq!(order.epoch, mac.epoch);
     assert_eq!(order.commit, A);
     assert_eq!(placement(front.api, "mac-1").await, "cordoned");
+}
+
+/// Catches a farm whose load is not read: a Mac holds a lease on a running action, another action
+/// waits in the queue, and a Linux host is idle beside them. With `auto_nodes` set and a release
+/// desired nothing is started (a host with a storage half is never started, and the queue
+/// makes the last Mac of its class untouchable), nothing is cordoned and no order is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_farm_with_work_queued_starts_nothing() {
+    let front = start();
+    let client = Client::connect(front.reapi, front.worker).await;
+    let mut mac = FakeDaemon::connect(
+        front.worker,
+        hello_on("mac-1", 4, 8, &[("arch", "arm64"), ("os", "macos")]),
+    )
+    .await
+    .expect("registered");
+    let mut linux = FakeDaemon::connect(front.worker, hello("linux-1", 4, 8))
+        .await
+        .expect("registered");
+    let (running, waiting) = (
+        Job::new("running", &[("OSFamily", "macos"), ("ISA", "arm64")]),
+        // No host runs this: it waits in the queue.
+        Job::new("waiting", &[("OSFamily", "linux"), ("ISA", "arm64")]),
+    );
+    client.upload(&running.blobs()).await;
+    client.upload(&waiting.blobs()).await;
+    let _first = client.execute(&running.action).await;
+    mac.start().await;
+    let _second = client.execute(&waiting.action).await;
+    arm(&front).await;
+    assert!(mac.expect_within(QUIET, order).await.is_none());
+    assert!(linux.expect_within(QUIET, order).await.is_none());
+    assert_eq!(placement(front.api, "mac-1").await, "serving");
+    assert_eq!(placement(front.api, "linux-1").await, "serving");
+}
+
+/// Catches a loaded host read as idle: two Macs, one running an action and nothing queued.
+/// The idle one is started and the busy one is left alone.
+///
+/// Mutant seen red: the leases read as none (the busy Mac is idle, and first by name).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_idle_mac_is_started_and_the_busy_one_is_not() {
+    let front = start();
+    let client = Client::connect(front.reapi, front.worker).await;
+    let mac_of = |name: &'static str| {
+        let worker = front.worker;
+        async move {
+            FakeDaemon::connect(
+                worker,
+                hello_on(name, 4, 8, &[("arch", "arm64"), ("os", "macos")]),
+            )
+            .await
+            .expect("registered")
+        }
+    };
+    let mut busy = mac_of("mac-1").await;
+    let mut idle = mac_of("mac-2").await;
+    let running = Job::new("running", &[("OSFamily", "macos"), ("ISA", "arm64")]);
+    client.upload(&running.blobs()).await;
+    let _op = client.execute(&running.action).await;
+    // The action lands on one of them; the other is the idle one.
+    let (busy, idle) = tokio::select! {
+        _ = busy.start() => (&mut busy, &mut idle),
+        _ = idle.start() => (&mut idle, &mut busy),
+    };
+    for node in [&*busy, &*idle] {
+        node.send(daemon_message::Message::UpdateStatus(UpdateStatus {
+            running_commit: "fedcba987654".to_owned(),
+            ..UpdateStatus::default()
+        }));
+    }
+    arm(&front).await;
+    let got = idle
+        .expect("an activation order for the idle Mac", order)
+        .await;
+    assert_eq!(got.commit, A);
+    assert!(busy.expect_within(QUIET, order).await.is_none());
+}
+
+fn order(m: &server_message::Message) -> Option<kbf_proto::update::UpdateOrder> {
+    match m {
+        server_message::Message::UpdateOrder(order) => Some(order.clone()),
+        _ => None,
+    }
+}
+
+/// Sets a release desired and `auto_nodes`.
+async fn arm(front: &Frontend) {
+    let rows = front.rows.clone();
+    tokio::task::spawn_blocking(move || {
+        rows.offer(&Release::new(A), kbf_types::FarmTime::from_millis(1_000))
+            .expect("a run");
+        rows.set_policy(&Policy {
+            auto_nodes: true,
+            ..Policy::default()
+        })
+        .expect("policy");
+    })
+    .await
+    .expect("set");
+}
+
+/// Catches a controller whose look panics taking the frontend with it, or one that goes on
+/// after it lost its state: the first read of the policy panics (a store that crashes in its
+/// blocking task); the controller stops, with a line saying so, and the frontend still
+/// answers, with nothing started for the release and `auto_nodes` set after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_look_that_panics_stops_the_controller_and_not_the_frontend() {
+    let front = start();
+    let mut mac = FakeDaemon::connect(
+        front.worker,
+        hello_on("mac-1", 4, 8, &[("arch", "arm64"), ("os", "macos")]),
+    )
+    .await
+    .expect("registered");
+    mac.send(daemon_message::Message::UpdateStatus(UpdateStatus {
+        running_commit: "fedcba987654".to_owned(),
+        ..UpdateStatus::default()
+    }));
+    front.hooked.after_get("update/policy", || {
+        panic!("a store that crashes");
+    });
+    tokio::time::sleep(QUIET).await;
+    arm(&front).await;
+    assert!(mac.expect_within(QUIET, order).await.is_none());
+    assert_eq!(placement(front.api, "mac-1").await, "serving");
 }

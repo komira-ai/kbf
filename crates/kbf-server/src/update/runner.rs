@@ -37,22 +37,22 @@ pub fn spawn(
 async fn run(farm: Arc<Farm>, store: Arc<dyn Store>, every: Duration) {
     let rows = Rows::new(Arc::clone(&store));
     let (transport, source) = ports(Arc::clone(&farm), rows.clone());
-    let mut held = Some(Controller::new(
+    let mut controller = Controller::new(
         store,
         farm.lease_epoch(),
         Box::new(transport),
         Box::new(source),
-    ));
+    );
     let mut ticker = tokio::time::interval(every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut failing: Option<String> = None;
-    while let Some(controller) = held.take() {
+    loop {
         ticker.tick().await;
-        let Some((controller, tick)) = step(controller, rows.clone(), farm.wall_now()).await else {
+        let Some((next, tick)) = step(controller, rows.clone(), farm.wall_now()).await else {
             tracing::error!("the update controller stopped: a look panicked");
             return;
         };
-        held = Some(controller);
+        controller = next;
         log(&tick, &mut failing);
     }
 }
@@ -104,7 +104,7 @@ mod tests {
 
     use super::super::command::Command;
     use super::super::node_step::HostPhase;
-    use super::super::ports::{FactsSource, FarmView, SourceError, Transport, TransportError};
+    use super::super::ports::{FactsSource, FarmView, SourceError, TransportError};
     use super::super::report::{CommandError, Moved};
     use super::*;
 
@@ -113,43 +113,6 @@ mod tests {
     impl FactsSource for Panics {
         fn look(&mut self, _now: FarmTime) -> Result<FarmView, SourceError> {
             panic!("a source that panics");
-        }
-    }
-
-    /// Never called: the look panics first.
-    struct Nothing;
-
-    impl Transport for Nothing {
-        fn cordon(&mut self, _: &WorkerId) -> Result<(), TransportError> {
-            Ok(())
-        }
-        fn uncordon(&mut self, _: &WorkerId) -> Result<(), TransportError> {
-            Ok(())
-        }
-        fn mark_down(&mut self, _: &WorkerId, _: kbf_map::MemberId) -> Result<(), TransportError> {
-            Ok(())
-        }
-        fn undown(&mut self, _: &WorkerId, _: kbf_map::MemberId) -> Result<(), TransportError> {
-            Ok(())
-        }
-        fn activate(
-            &mut self,
-            _: &WorkerId,
-            _: super::super::OrderId,
-            _: &super::super::Release,
-        ) -> Result<(), TransportError> {
-            Ok(())
-        }
-        fn confirm(
-            &mut self,
-            _: &WorkerId,
-            _: super::super::OrderId,
-            _: &super::super::Release,
-        ) -> Result<(), TransportError> {
-            Ok(())
-        }
-        fn alert(&mut self, _: &WorkerId, _: &super::super::Alert) -> Result<(), TransportError> {
-            Ok(())
         }
     }
 
@@ -164,7 +127,16 @@ mod tests {
         let rows = Rows::new(Arc::clone(&store));
         rows.offer(&super::super::Release::new("a"), FarmTime::from_millis(1))
             .expect("a run");
-        let controller = Controller::new(store, 1, Box::new(Nothing), Box::new(Panics));
+        let farm = Arc::new(Farm::new(
+            Arc::new(kbf_front::Cache::<
+                kbf_front::MemoryMetaLog,
+                kbf_objstore::MemoryStore,
+            >::memory()),
+            kbf_sched::UNSERVABLE_WAIT,
+            kbf_sched::FINISHED_RETENTION,
+        ));
+        let (transport, _) = ports(farm, rows.clone());
+        let controller = Controller::new(store, 1, Box::new(transport), Box::new(Panics));
         assert!(
             step(controller, rows, FarmTime::from_millis(2))
                 .await

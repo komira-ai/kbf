@@ -704,14 +704,15 @@ mod tests {
             running_commit: "0123456789ab".to_owned(),
             installed_commit: "a".repeat(40),
             staged_commit: String::new(),
-            refusal: "é".repeat(MAX_REFUSAL_BYTES),
+            // 513 bytes: the cut at 512 falls inside the last character.
+            refusal: format!("a{}", "é".repeat(MAX_REFUSAL_BYTES / 2)),
             ..UpdateStatus::default()
         };
         let shown = UpdateReport::new(status);
         assert_eq!(shown.running_commit, "0123456789ab");
         assert_eq!(shown.installed_commit, "a".repeat(40));
         assert_eq!(shown.staged_commit, "");
-        assert_eq!(shown.refusal.len(), MAX_REFUSAL_BYTES);
+        assert_eq!(shown.refusal.len(), MAX_REFUSAL_BYTES - 1);
         let bad = UpdateStatus {
             running_commit: "<script>".to_owned(),
             installed_commit: "A".repeat(40),

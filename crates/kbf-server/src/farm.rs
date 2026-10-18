@@ -491,10 +491,15 @@ impl Farm {
     pub fn resize(&self, worker: &WorkerId, stream: StreamId, reported: Reported) {
         let now = self.now();
         let mut state = self.lock();
-        if state.is_current(worker, stream) {
-            if let Some(link) = state.links.get_mut(worker) {
-                (link.os, link.arch) = identity(&reported.caps);
-            }
+        let (os, arch) = identity(&reported.caps);
+        // The newest stream's link takes the new identity; a replaced stream's is ignored.
+        let current = state
+            .links
+            .get_mut(worker)
+            .filter(|link| link.stream == stream)
+            .map(|link| (link.os, link.arch) = (os, arch))
+            .is_some();
+        if current {
             let event = Event::Capacity {
                 worker: worker.clone(),
                 capacity: reported.capacity,
