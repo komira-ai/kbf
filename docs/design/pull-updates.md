@@ -40,9 +40,9 @@ state store, protocol skew, upgrade order), [worker-protocol.md](worker-protocol
    frontend's control API) updates **storage and daemon nodes only**, through the drain system: **nodes update
    asynchronously, in any order, when idle or drained** (at most one storage node at a time; daemon-only hosts and Macs
    concurrently up to `max_hosts_out`, default 1; a busy Mac is deferred). The frontend is not in that rollout. Its own
-   update is a **separate step, also triggered externally**: `kbf-installer` on the frontend host does an Envoy hot restart or an instance
-   swap plus the handover (the new instance starts on the other port, Envoy routes new connections to it, the old one relays and keeps its
-   in-flight `Execute` streams until they close; it never
+   update is a **separate step, also triggered externally**, by `POST /v1/update/frontend {commit}` on the operator API (section 6.5): the
+   frontend writes an order for its own host, `kbf-installer` there pulls and verifies the release, starts the new instance behind the installed
+   Envoy, waits for its `/readyz` and hands over; the old instance stops scheduling and relays its open streams until they close (it never
    waits for `open_executions == 0` and never restarts the serving frontend). Details: split-mode-updates.md 2.5, 2.6
    and 3.3, and section 8 below for what decoupling changes.
 8. Rollback is setting the desired release back: a **higher generation** naming an older commit. The old
@@ -50,8 +50,8 @@ state store, protocol skew, upgrade order), [worker-protocol.md](worker-protocol
 9. Only the unprivileged `kbf` binary is ever pulled. `kbf-installer` (which includes the former helper), unit files, the
    sudoers entry and the pinned trust material change only by the package or a script a human runs. Root code is never
    auto-updated, and the code that downloads runs without root.
-10. The operator sees every host's version (`GET /v1/nodes`). The **update banner and button, and the desktop app, are deferred** (section 12);
-    until then the trigger is the external API call of item 1.
+10. The operator sees every host's version (`GET /v1/nodes`) and the desired release (`GET /v1/update`), read-only. Nothing in the product
+    decides to update: the trigger is the external API call of item 1.
 
 ## 2. Trust model (MVP decision)
 
@@ -73,7 +73,7 @@ against the attestation's subject digest and the attestation against the pinned 
 | GitHub / CI | build, attest, publish | reach a host, push to the frontend |
 | Compromised **frontend** (or a mirror named as the release source) | choose when and in what order; withhold; serve any bytes or any older attested build; deny service | make a host install a binary that lacks a valid `main` attestation of this workflow; run anything as root |
 | Compromised **fetch child** (a parser or TLS bug while bytes arrive) | write bytes to its pipe; **steal the node key it was lent** (accepted residual in v1: seven-day certificate; follow-up is a fetch-scoped certificate, 7.1); stall until the time cap | write any file, reach any file of `kbf` or root, make the parent install bytes that fail the checks of section 7.2 |
-| Compromised **service user** (or an action under the native driver); **on macOS `kbf` runs as root, so a compromise of it there is a compromise of root** | write an order record to the spool (an early or stale activation of a release that is attested, or a refused record); stop relaying | install an unattested binary; put bytes on the install path (there is no inbox); touch the versions directory, the installer or the units |
+| Compromised **service user** (or an action under the native driver); **on macOS `kbf` runs as root, so a compromise of it there is a compromise of root** | write an order record to the spool (an early or stale activation of a release that is attested, or a refused record), **including a `frontend_update` record that starts a frontend swap to an attested commit within the floors** (section 7); stop relaying | install an unattested binary; put bytes on the install path (there is no inbox); touch the versions directory, the installer or the units |
 | Anyone who can push to `main` | get an attested build | (see residuals) |
 
 Residuals, stated plainly:
@@ -134,10 +134,9 @@ Residuals, stated plainly:
 | Wire messages | `crates/kbf-proto/proto/kbf/update/v1/update.proto` | messages and one service; frozen (section 5) |
 | Platform names | `kbf_types::ReleasePlatform` | `linux-x86_64`, `linux-arm64`, `darwin-arm64`; from a node's `os` and `arch` report entries |
 | Release store, desired release, offers, `ReleaseService` | `kbf-server` | section 6 |
-| Update client | `kbf-update` (the node's side, unprivileged) | relays offers and orders, writes order records to the spool, reports status, refuses an order while a lease is live. It fetches nothing and stages nothing |
+| Update client | `kbf-update` (the node's side, unprivileged) | relays offers and orders, writes `activate`, `confirm` and `revert` order records to the spool (and refuses any wire order that names another verb), reports status, refuses an order while a lease is live. It fetches nothing and stages nothing |
 | Installer (fetch in a child, verify offline, install, flip, revert) | `kbf-installer`, a root unit on each host; `kbf-helper` is folded into it ([distribution.md](distribution.md) section 6) | verbs and the fetch child in section 7 |
 | Rollout controller | `kbf-server`, replaces the older record in `rollout.rs` | section 8 |
-| Release discovery | the frontend polls GitHub, read-only | proposes a desired release; never applies |
 | Fleet view | read-only over `/v1/nodes` and `/v1/update`; the UI page is deferred | section 9 |
 
 ## 5. The wire contract (frozen)
@@ -174,7 +173,7 @@ newer however large the gap (the counter is the store's, not the host's), and th
 (epoch, generation), compared lexicographically (section 7), together with the operator floor in `installer.toml`. The helper names an activation `<epoch>-<id>`, so the same id in two epochs is two
 activations. An epoch more than 1000 above the last acted on is refused with the reason in `status.json` and not
 acknowledged. This is best effort: it blunts a typo or a stray huge epoch, but an order forged at acked+1, or a first
-order at a huge epoch, is taken and wedges the installer until root clears `state.json`'s floor (the schema 1 `helper.json` of the as-built helper, which P3 migrates into `state.json` schema 2); the first order a host
+order at a huge epoch, is taken and wedges the installer until root clears `state.json`'s floor (the schema 1 state file of the as-built helper, which P3 migrates into `state.json` schema 2); the first order a host
 acts on is measured from nothing and is taken at any epoch. A compromised service user can still write a first order
 with a huge epoch: an availability limit, the same exposure as ordering an activation early (section 7.3 of the
 design study). `window_s` is the confirm window of `ACTIVATE`, **per platform as built**: on Linux the helper ignores it, and the window starts at the new
@@ -232,7 +231,7 @@ saying which is missing; nothing answers an empty 200.
 | `update/slot` | the rollout slot: one storage holder plus up to `max_hosts_out` host holders, each `{host, order_id, epoch}`, with the run state; no time to live (section 8) |
 | `update/host/<id>` | the controller's per-host phase `{phase, order_id, generation, since, boot_before}`: what a restarted controller resumes from (split-mode-updates.md 2.6) |
 | `update/available/<commit>` | the release source's proposal and its preflight result; metadata only (split-mode-updates.md 6.2) |
-| `update/policy` | `{auto_nodes (bool), auto_frontend (bool), paused (bool), auto_frontend, idle_wait, min_serving, max_hosts_out (default 1), mac_force_after, new_work_only_to_updated, accept_failing_builds}`; replaces the older `update/auto {enabled}`, whose flag is `auto_nodes` |
+| `update/policy` | `{paused (bool), idle_wait, min_serving, max_hosts_out (default 1), mac_force_after, new_work_only_to_updated, accept_failing_builds}`; the older `update/auto {enabled}` row is removed |
 
 **A release upload triggers its preflight.** The `PUT` of a release's last needed component starts the preflight for the commit and
 writes the `update/available/<commit>` row (metadata, the declared `protocol`, `min_protocol`, `state_schema`, `profile`, and the
@@ -262,7 +261,7 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
 - `GET /v1/releases`: commits with, per platform, which components are present and whether the platform is complete.
 - `POST /v1/update/desired {commit}`: the commit needs at least one complete platform (else 409). Compare-and-set
   on `update/desired`; the counter gives the new generation only when the commit differs from the current one.
-- `GET /v1/update`: `{desired, auto_update, releases}`. `POST /v1/update/auto {enabled}` sets `update/policy.auto_nodes`; the other policy fields are set through `POST /v1/update/policy` (admin).
+- `GET /v1/update`: `{desired, releases}`. The policy fields are set through `POST /v1/update/policy` (admin). There is no auto-update endpoint.
 - `GET /v1/nodes` gains, per node, an `update` object: state, the three commits, offered generation, refusal,
   `helper_present`, `up_to_date` (true, false or null) and `availability` (`ok`, `unavailable`, `unsupported`).
 
@@ -271,6 +270,15 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
 After `Welcome`, and to every connected node at every change of the desired release or of a platform's
 completeness, the frontend sends an `UpdateOffer` for that node's platform. `UpdateStatus` is kept as the newest per
 node and ignored from a replaced stream, exactly as `NodeStatus` is.
+
+### 6.5 Frontend self-update
+
+`POST /v1/update/frontend {commit}` (write gate as the other writes; admin) is the one route that updates the frontend. Gamma calls it. The commit must have a complete platform for the frontend host (else 409), and no frontend
+update may be in flight (409). The frontend then **writes an order record into its own host's `orders/` directory**, by the same mechanism as
+`kbf-update` uses for nodes (a dot-prefixed temporary name, then rename; section 7), with `verb=frontend_update`, the `commit`, a `generation` from the
+store counter, the store `epoch` and an `order_id`, and the components and expected facts of the release from its own store. The route returns the order id; the installer refuses a second order while one is in flight (`frontend_busy`) and one whose installed Envoy is outside the tested range (`envoy_range`). The root CLI `kbf-installer update --commit SHA --frontend` stays as the **local fallback** and runs the same code. It does not go
+through a node session, and nothing is sent on the wire. The installer's reply is the host's `status.json`, which the route's status
+read (`GET /v1/update`) reports.
 
 ## 7. The host
 
@@ -282,13 +290,13 @@ node and ignored from a replaced stream, exactly as `NodeStatus` is.
   releases/previous -> <commit>
   work/<commit>.partial/                        root:root 0755, extraction of one fetch; swept at start (7.3)
   work/<commit>.partial/dl/                     root:root 0700, the downloaded tarball only
-  state.json (schema 2)                         root-owned; supersedes the schema 1 helper.json, P3 migrates it
+  state.json (schema 2)                         root-owned; supersedes the schema 1 helper state file, P3 migrates it
   status.json                                   /var/lib/kbf-installer/status.json, root-owned 0644, atomic rename
   orders/                                       kbf:kbf 0700; order records written by the service user; no release bytes
 ```
 
 Everything the root side reads as authority lives in a root-owned tree that `kbf` cannot write. The earlier layout put
-`releases/` and `state.json` (then still called `helper.json`) under `/var/lib/kbf`, which is `kbf`'s `StateDirectory`; the service user would
+`releases/` and the state file under `/var/lib/kbf`, which is `kbf`'s `StateDirectory`; the service user would
 then own the directory that holds the links and the state, whatever the files' modes. The install root is
 `/var/lib/kbf-installer` and [distribution.md](distribution.md) section 1 (which names `/var/lib/kbf/releases`) must follow.
 Retention: the running, the previous and one more directory. Only `kbf-installer` writes the tree except `orders/`.
@@ -303,7 +311,7 @@ still run unprivileged there, so a fault in them is not root.
 | Command | Does |
 |---|---|
 | `kbf-installer run` | every 5 seconds (a fixed constant, not a key), each pass: finish a restart it owes; revert a swap whose confirm window ran out; sweep leftover scratch (7.3); act on order records from `orders/` in (epoch, id) order, once each. For `activate`: refuse it while a trial is pending (a release activated and not yet confirmed or reverted: there is one confirm window at a time, never two timers), check the order (below), **fetch, verify and install the release for the commit (7.1, 7.2)**, write `pending_confirm`, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart; write `status.json` |
-| `kbf-installer confirm`, `revert`, `rollback`, `update --frontend` | the operator verbs: **inline root CLI runs under the installer's lock** (exit 4 while a `run` pass holds it); no socket, and `kbf` cannot run them. `confirm` and `revert` name the activation; `rollback` is the only verb below the floor |
+| `kbf-installer confirm`, `revert`, `rollback`, `update --frontend` | the operator verbs: **inline root CLI runs under the installer's lock** (exit 4 while a `run` pass holds it); no socket, and `kbf` cannot run them. `confirm` and `revert` name the activation; `rollback` is the only verb below the floor. `update --commit SHA --frontend` is the local fallback of the `frontend_update` order (section 6.5) |
 | `kbf-installer boot-check` | `ExecStartPre` on Linux: count the starts of a release on trial and revert one that keeps failing before it starts again; start the confirm window at the first start |
 
 **The order spool.** `orders/` is owned by `kbf` with mode 0700. Root opens it with `openat` and `O_NOFOLLOW` relative to a
@@ -315,7 +323,7 @@ grow the directory or replay a stale order after a restart. `kbf-update` writes 
 so it never reads a half-written record. A record is at most 1 MiB; a larger, unparsable, symlinked or
 non-regular record is refused and removed.
 
-An order record is `{order_id, epoch, generation, verb, commit, window_s}` plus, for `activate`, the offer's components
+An order record is `{order_id, epoch, generation, verb, commit, window_s}` (`verb` is `activate`, `confirm`, `revert` or `frontend_update`, the contract's record, [kbf-installer.md](kbf-installer.md) section 4) plus, for `activate`, the offer's components
 for the host's platform (`name`, `sha256`, `size`, `attestation`: the same bytes the offer carried, at most 256 KiB each) and the
 **expected facts about the release**: `platform`, `protocol`, `min_protocol`, `state_schema` and `profile`, as the frontend's
 preflight recorded them. These are **locators and claims, not trust**: section 7.2 re-derives every one that matters, and the
@@ -338,9 +346,21 @@ rotation are not designed here, so v1 is the monotonic check plus the floor.
 
 Orders carry the verbs `activate`, `confirm` and `revert`; they are not installer subcommands. **A `confirm` is accepted only if** it names
 the pending activation (`<epoch>-<id>`), the unit is active, `/proc/<MainPID>/exe` resolves inside `releases/<current>`, and the first
-`boot-check` of that release has run; otherwise it is refused and the window keeps running. **The installer must not
-restart the serving frontend**: the frontend's own update is the separate Envoy swap (section 8 item 6, split-mode-updates.md
-2.5), and the frontend-host `activate` of split-mode-updates.md (unit U5) must exist before the installer runs on a frontend host.
+`boot-check` of that release has run; otherwise it is refused and the window keeps running. **The verb selects the dispatch.** An `activate` record is the node sequence of section 8 item 2 and **never touches `kbf-frontend@*` or the host's own
+frontend mode**. A `frontend_update` record is accepted only on a host whose `kbf.toml` mode is `frontend` or `all-in-one`, and only from `orders/`
+(or the root CLI); it is subject to the same ordering, floors and refusals as `activate`, and is dispatched to the frontend update: verify as for a
+node (7.1, 7.2), check the installed Envoy is in the tested range, point the idle slot at the release, start the other `kbf-frontend@` instance, wait for
+its `/readyz`, hand over, then confirm ([kbf-installer.md](kbf-installer.md) section 6). A second one while one is in flight is refused `frontend_busy`. The installer must have the
+frontend-host activation of split-mode-updates.md (unit U5) before it takes a `frontend_update` order.
+
+**Who may write which verb (trust consequence).** `orders/` belongs to `kbf`, so **any process running as `kbf` on a frontend or all-in-one host can
+request a frontend swap by writing a `frontend_update` record**; on an all-in-one host that includes the node daemon. This is accepted: both run as `kbf`,
+and the release must still pass every verification of 7.2, so the swap can only move to an attested commit within the floors (`min_generation`,
+`min_protocol`, the generation rule and the deny list). A compromised `kbf` could already order a node update; the new power is to start the frontend
+handover, an availability exposure bounded by the single in-flight rule, not an integrity one. **A wire order received over a node session never
+becomes a `frontend_update` record**: the wire `UpdateOrder` verb enum has `activate`, `confirm` and `revert` only, `kbf-update` maps those and nothing
+else, writes no other verb from any input, and refuses an order that names anything else. Only the frontend process, writing for its own host from
+section 6.5, writes `frontend_update`.
 
 - The installer **never executes the new binary as root**. The `--version --json` probe runs as `kbf-fetch` (no credentials, no
   network, no file of its own; the `kbf` user holds the cold-store credential and the node key and is not used), with an empty
@@ -414,7 +434,9 @@ on the authenticated listener. The follow-up is a fetch-scoped client certificat
 accepts only for `ReleaseService.Fetch`), so a stolen fetch identity cannot open a worker session. With `release_source = "url"` nothing is lent.
 
 **Setup uses the same child.** `kbf-installer setup` downloads the first release through `fetch-child` and checks it with 7.2,
-exactly as an update does, so the bootstrap path is not a second, unconfined downloader.
+exactly as an update does, so the bootstrap path is not a second, unconfined downloader. **The first release at setup comes from the `url`
+source**, because there is no node certificate yet (enrollment writes it later); a host that will use the `frontend` source switches
+`release_source` after enrollment, and the next update uses it.
 
 **Size and time caps.** The component's size is read from the order record; it must be at most `max_component_bytes`, and the
 host must have free space under `/var/lib/kbf-installer` for the tarball (`size`), its extraction (the decompressed cap, 1 GiB, or
@@ -554,22 +576,25 @@ held and the run goes `held`; a broken host never lets another take its place.
    `deny` list, needs the local root `kbf-installer rollback` verb (section 7).
 5. **Protocol skew and state schema**: split-mode-updates.md 3.3 (order rule) and 3.4 (the state-store schema is
    expand-then-contract; a contract change is refused by the planner and takes the cold path).
-6. **The frontend updates only through Envoy, as its own step** (not as a step of the node rollout above; it is triggered externally,
-   like the desired release). Envoy is already installed on the host as a prerequisite and is not touched by the update. The installer on the frontend host fetches and verifies the release exactly as on a node
-   (section 7.1 and 7.2) and flips `current`
-   without restarting the serving instance, then starts the other instance of `kbf-frontend@{a,b}` on its own ports. The new
-   process takes the state-store writer baton from the old one over the control socket (#879's protocol without the
-   passed sockets), Envoy routes new connections to it, and the old instance relays, fails its health check, sends GOAWAY, answers its
-   open `Execute` and `WaitExecution` streams from the `done/` rows, and exits when they end. The rollout **never waits for
-   `open_executions == 0` and never restarts the serving frontend**; the confirm window starts when the new instance is
-   serving. Steps E0 to E9, the writer options and the failure matrix are split-mode-updates.md 2.5 and 2.9.
+6. **The frontend updates only through Envoy, as its own step** (not as a step of the node rollout above). It is triggered by `POST
+   /v1/update/frontend {commit}` (section 6.5), and Envoy is already installed on the host as a prerequisite and is not touched by the update.
+   The installer on the frontend host takes the `frontend_update` order (section 7), fetches and verifies the release exactly as on a node
+   (section 7.1 and 7.2), points the idle slot at it (the running instance keeps its release; `current` flips only at confirm), starts the other
+   instance of `kbf-frontend@{a,b}` on its own ports, and waits for that instance's `/readyz`. The new process takes the state-store
+   writer baton from the old one over the control socket (#879's protocol without the passed sockets), Envoy routes new connections to it, and
+   the old instance **stops scheduling and relays its open `Execute` streams until they close, with no timeout** (an `Execute` stream that
+   ended early is a build that fails; nothing is answered from `done/` rows and there is no timeout), and exits when they end. The installer **confirms** once the new instance is healthy and the old reports stood down,
+   **A new instance that never becomes ready is stopped and the host reports `reverted`; the old instance is untouched and keeps serving.** After the
+   old instance has stopped scheduling the successor is the only scheduler and there is no automatic revert: the way back is to update again with the
+   older commit at a higher generation. The rollout **never waits for
+   `open_executions == 0` and never restarts the serving frontend**. **Only one frontend update may be in flight**: the route answers 409
+   (`frontend_busy`) while one is, and the installer refuses a second `frontend_update` order with `frontend_busy`. Steps E0 to E9, the writer options and the failure
+   matrix are split-mode-updates.md 2.5 and 2.9.
 
 ## 9. The fleet view
 
-Every host's running and installed version (`GET /v1/nodes`) and the desired release (`GET /v1/update`), read-only. **Deferred:** the "update
-available" notification, the button that sets the desired release, an in-product auto-update rule, and the desktop app. The `update/policy`
-fields `auto_nodes` and `auto_frontend` are not wired to any trigger in this version; the trigger is the external API call. All-in-one is the
-same call against one machine.
+Every host's running and installed version (`GET /v1/nodes`) and the desired release (`GET /v1/update`), read-only. All-in-one is the same
+call against one machine.
 
 ## 10. Failure modes and their tests
 
@@ -604,6 +629,13 @@ Each safety property has a planted mutant that turns its test red.
   - The probe runs as `kbf-fetch` and cannot read `/etc/kbf` or the key; mutant: run as `kbf` or root.
   - Redirect: any 3xx fails the fetch; mutant: follow same-origin redirects.
   - Lease source: a record claiming no leases while root's own observation (cgroup or launchd and uid) shows a live lease is refused; mutant: trust the record.
+- **Verb** (planted mutant in brackets): a wire order, from a fake server that adds a field naming `frontend_update`, becomes an `activate`/`confirm`/`revert`
+  record or is refused, never a `frontend_update` record [kbf-update copies a verb from the order]; an `activate` record never starts a `kbf-frontend@`
+  unit [dispatch on the unit named by the record]; a `frontend_update` record on a host whose mode is not `frontend` or `all-in-one` is refused
+  [dispatch ignores the host mode]; a second `frontend_update` order while one is in flight is refused `frontend_busy`, and the route answers 409 [no
+  in-flight guard]; a `frontend_update` record below the floor, with a bad attestation or off the allowed ref is refused [frontend path skips 7.2];
+  the old instance's open `Execute` stream is relayed to its end, with no timeout, while the new instance serves new ones [stream cut at a deadline];
+  a new instance that never reports `/readyz` is stopped and `reverted`, slots and `current` unchanged [no readiness wait].
 - **Capacity**: two hosts ordered at once (the slot admits one storage holder and at most `max_hosts_out` others); storage under-replicated or the metric absent (no
   order); a host with live leases (order withheld, and the node refuses it too).
 - **Bad binary**: starts and exits at once (the counter reverts, Linux); runs but never registers (the window
@@ -624,17 +656,13 @@ Each safety property has a planted mutant that turns its test red.
 | wire and store (this contract) | `update.proto`, `ReleasePlatform`, the release store, the desired release, `/v1/update`, `/v1/releases`, update view in `/v1/nodes`, offers over the session, `ReleaseService.Fetch` |
 | node client | status reporting, refuse with live leases, relay of offers and orders as order records (no fetch, no staging) |
 | installer core | versioned directories, the fetch child (7.1), the root-side checks (7.2), offline attestation check, commit-confirm, revert, retention |
-| release source | **deferred**: the frontend's read-only poll of GitHub for the newest attested `main` artifacts (the external caller names the commit) |
 | rollout controller | the slot, the per-host step, the gates, resume, pause, the frontend switch through Envoy (split-mode-updates.md) |
-| fleet view | **deferred**: the UI page, the update banner and button, the desktop app, the auto-update rule |
+| fleet view | read-only `/v1/nodes` and `/v1/update` |
 | bootstrap and rehearsal | the host-side scripts a human runs once per host; rehearsal on development nodes |
 
 ## 12. Deferred
 
-- The update banner and button, the desktop app, and the in-product auto-update rule and "update available" notification (updates are triggered by an external API call).
-- Cloud update providers (AWS, GCP, Azure): on-prem only for now.
-- Cross-version Envoy upgrades, and any pinning of Envoy or a release manifest inside kbf releases (Envoy is a prerequisite with a tested version range).
-
+- **Deferred:** an update banner or button, the "update available" notification and UI login; the desktop app; cloud update providers; cross-version Envoy upgrades; any pinning of Envoy or a release manifest in kbf releases; a managed build service; Postgres and several frontends.
 - The Ed25519 release key and a signed floor (section 2).
 - Sigstore verification beyond the attested-`main` rule (a protected `main`, required reviews).
 - Closing the early-order gap of an order-record writer under the native driver (the signed grant above does).
