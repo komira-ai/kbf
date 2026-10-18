@@ -409,7 +409,7 @@ fn an_unknown_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("sleep=0")).as_bytes()).unwrap_err(),
         ProfileError::UnknownKey {
-            line: 42,
+            line: 43,
             key: "sleep".into()
         }
     );
@@ -422,7 +422,7 @@ fn a_repeated_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("firewall=off")).as_bytes()).unwrap_err(),
         ProfileError::Duplicate {
-            line: 42,
+            line: 43,
             key: "firewall".into()
         }
     );
@@ -469,7 +469,7 @@ fn a_key_with_a_space_or_capital_is_refused() {
         assert_eq!(
             Profile::parse(text.as_bytes()).unwrap_err(),
             ProfileError::UnknownKey {
-                line: 42,
+                line: 43,
                 key: key.into()
             }
         );
@@ -900,7 +900,7 @@ fn the_old_key_twice_is_a_duplicate() {
     let text = format!("{}kbf_scratch=/Volumes/kbf/x\n", with_old_key());
     assert_eq!(
         refusal(&text),
-        "profile line 42: duplicate key: kbf_scratch"
+        "profile line 43: duplicate key: kbf_scratch"
     );
 }
 

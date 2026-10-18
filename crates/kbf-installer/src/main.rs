@@ -1,4 +1,4 @@
-//! `kbf-helper run` and `kbf-helper boot-check` (see the library's docs). Configuration is
+//! `kbf-installer run` and `kbf-installer boot-check` (see the library's docs). Configuration is
 //! by flags only; the unit file that starts the helper is root's.
 
 use std::path::PathBuf;
@@ -7,10 +7,10 @@ use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use kbf_helper::cycle::{Config, Helper};
-use kbf_helper::restart::Restart;
 use kbf_host::{HostExec, HostPath, Root};
 use kbf_installer::activate;
+use kbf_installer::helper::cycle::{Config, Helper};
+use kbf_installer::helper::restart::Restart;
 use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::release;
 use kbf_installer::run::SystemRunner;
@@ -18,7 +18,7 @@ use kbf_installer::settings::Settings;
 use kbf_installer::stage::{Context, Limits, stage_from_inbox};
 
 #[derive(Parser)]
-#[command(name = "kbf-helper", version)]
+#[command(name = "kbf-installer", version)]
 struct Cli {
     /// The directory the host's paths are under (for a rehearsal; a host's is `/`).
     #[arg(long, global = true, default_value = "/")]
@@ -134,7 +134,7 @@ fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {
     eprint!("{}", String::from_utf8_lossy(&out));
     match result {
         Ok(decision) => {
-            eprintln!("kbf-helper: boot check: {decision:?}");
+            eprintln!("kbf-installer: boot check: {decision:?}");
             Ok(())
         }
         Err(e) => Err(e.to_string()),
@@ -150,7 +150,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
-            eprintln!("kbf-helper: {why}");
+            eprintln!("kbf-installer: {why}");
             ExitCode::FAILURE
         }
     }

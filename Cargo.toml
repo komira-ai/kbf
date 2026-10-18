@@ -175,6 +175,7 @@ zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2
 kbf-alert = { path = "crates/kbf-alert" }
 kbf-all-in-one = { path = "crates/kbf-all-in-one" }
 kbf-auth = { path = "crates/kbf-auth" }
+kbf-ca = { path = "crates/kbf-ca" }
 kbf-caps = { path = "crates/kbf-caps" }
 kbf-cas-conformance = { path = "crates/kbf-cas-conformance" }
 kbf-daemon = { path = "crates/kbf-daemon" }
@@ -188,7 +189,6 @@ kbf-front = { path = "crates/kbf-front" }
 kbf-history = { path = "crates/kbf-history" }
 kbf-image = { path = "crates/kbf-image" }
 kbf-host = { path = "crates/kbf-host" }
-kbf-helper = { path = "crates/kbf-helper" }
 kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-it = { path = "crates/kbf-it" }
