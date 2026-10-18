@@ -27,6 +27,12 @@
 //! if its index is whole, `CatchingUp` if not, and its `down/<id>` mark is deleted. The
 //! last member never leaves: a map needs one member, so it stays `Down` in the map.
 //!
+//! **Boot in the map.** Each map entry carries the boot counter of the registration it
+//! stands for, so a registration with a new boot is a change of the entry and moves the
+//! generation, even for a restart inside the lease that never made the member `Down`. A
+//! reader that caches what a node said (it holds a blob) against the generation then drops
+//! it when the node restarts. Heartbeats do not change the boot, so they move nothing.
+//!
 //! **Debts.** A storage heartbeat says how many copies the node owes ([`Debts`]); the row
 //! keeps the newest report with the store's clock at its receipt, so it dies with the row
 //! and a registration (which rewrites the row) starts without one. A promotion keeps it.
@@ -310,8 +316,11 @@ struct Live {
 fn decode_row(stored: &Versioned) -> Result<Live, MembershipError> {
     let row = Row::decode(stored.value.as_slice())
         .map_err(|e| MembershipError::Corrupt(format!("member row: {e}")))?;
-    let member = Member::try_from(row.member.unwrap_or_default())
+    let mut member = Member::try_from(row.member.unwrap_or_default())
         .map_err(|e| MembershipError::Corrupt(format!("member row: {e}")))?;
+    // The row's counter is the authority (a row written before the map named boots has
+    // none inside the member).
+    member.boot = row.boot;
     Ok(Live {
         member,
         boot: row.boot,
@@ -547,7 +556,9 @@ impl Members {
                 Progress::CatchingUp => MemberState::CatchingUp,
                 Progress::CaughtUp => MemberState::Active,
             },
-            boot: 0,
+            // Published in the map, so a restart inside the lease changes the member (and the
+            // generation) even when nothing else about it did.
+            boot,
         };
         self.write_row(&member, boot)?;
         let map = self.refresh()?.ok_or(MembershipError::NoMap)?;

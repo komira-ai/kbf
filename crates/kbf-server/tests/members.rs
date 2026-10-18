@@ -290,9 +290,10 @@ fn a_racing_refresh_gives_one_winner_and_one_retry() {
 
 /// Catches: a refresh that decides on a row it no longer holds: member a's row has
 /// expired, so this frontend plans to mark it Down; before it commits, a registers again
-/// (its own refresh finds the map already says Active and bumps nothing). The map's
-/// version has not moved, so only the check on a's row stops this frontend from marking a
-/// Down beside its live row. The commit conflicts and the retry sees the row.
+/// (its own refresh finds the map already says Active, and bumps the generation once for
+/// the new boot). This frontend's commit is against the map it read, so it conflicts on the
+/// map's version; the check on a's row is what stops the retry's plan from marking a Down
+/// beside its live row. The retry sees the row and changes nothing.
 #[test]
 fn a_refresh_does_not_down_a_member_that_registered_meanwhile() {
     let s = Hooked::new();
@@ -309,7 +310,7 @@ fn a_refresh_does_not_down_a_member_that_registered_meanwhile() {
     let map = m.refresh().expect("refresh").expect("map");
 
     assert_eq!(state(&map, a.id), Some(MemberState::Active));
-    assert_eq!(map.generation(), 1);
+    assert_eq!(map.generation(), 2, "the rival's new boot, once");
     assert_eq!(s.fake.get("down/1").expect("read"), None);
     assert_eq!(*s.map_writes.lock().expect("lock"), vec![true]);
 }
