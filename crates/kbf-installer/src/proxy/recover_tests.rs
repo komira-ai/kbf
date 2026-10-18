@@ -174,16 +174,18 @@ fn row_step_6_after_takeover_before_the_swap_the_holder_is_active_and_the_old_ch
 }
 
 #[test]
-fn row_proxy_crash_during_the_hold_loses_the_hold_and_the_old_child_serves_again() {
+fn row_proxy_crash_during_the_hold_loses_the_hold_and_the_quiesced_old_child_serves_again() {
     let (w, old) = World::with_old();
     w.hold_streams(50);
-    crash_when(&w, |i| i.phase == Phase::Quiescing);
+    // The old child is quiesced and the takeover not yet asked when the proxy dies.
+    crash_when(&w, |i| i.phase == Phase::Switching);
     run_to_crash(&w, Mode::Frontend, old);
     assert_eq!(w.held(), 50);
+    assert_eq!(w.state_of(100), RoleState::Quiesced);
     let (end, _) = restart(&w);
     assert_eq!(end, Ok(Phase::Failed));
     assert_eq!(w.held(), 0, "the held streams were cut with the proxy");
-    assert_eq!(w.state_of(100), RoleState::Active);
+    assert_eq!(w.state_of(100), RoleState::Active, "the old child resumed");
 }
 
 #[test]
