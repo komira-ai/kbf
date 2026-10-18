@@ -34,7 +34,6 @@ tonic = { workspace = true, features = ["tls-ring"] }
 tower-service.workspace = true
 tracing.workspace = true
 x509-parser = { workspace = true, features = ["verify"] }
-zeroize.workspace = true
 
 [dev-dependencies]
 rcgen = { workspace = true, features = ["x509-parser"] }

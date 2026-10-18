@@ -118,6 +118,7 @@ pub mod state_store;
 pub mod storage_half;
 pub mod storage_health;
 pub mod storage_node;
+pub mod store_config;
 pub mod stores;
 pub mod streams;
 mod timeout;

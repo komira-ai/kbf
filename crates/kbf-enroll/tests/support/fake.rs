@@ -13,8 +13,8 @@ use kbf_peer::{PeerRole, role_of};
 use kbf_proto::kbf::enroll::v1::cold_store_server::{ColdStore, ColdStoreServer};
 use kbf_proto::kbf::enroll::v1::enroll_server::{Enroll, EnrollServer};
 use kbf_proto::kbf::enroll::v1::{
-    EnrollRequest, EnrollResponse, GetKeysRequest, GetKeysResponse, IssuedCert, NodeConfig,
-    RenewRequest, RenewResponse,
+    EnrollRequest, EnrollResponse, GetStoreConfigRequest, GetStoreConfigResponse, IssuedCert,
+    NodeConfig, RenewRequest, RenewResponse, StoreConfig,
 };
 use kbf_types::{RefusalReason, Role, Token, TokenId, TokenSecret};
 use tonic::transport::server::TcpIncoming;
@@ -97,6 +97,10 @@ struct State {
     generation: u64,
     keys_calls: u32,
     keys_revoked: bool,
+    /// The registration generation the fake's frontend holds (0: none registered).
+    store_generation: u64,
+    /// The `have_generation` of the newest `GetStoreConfig`.
+    last_have: u64,
 }
 
 /// The fake frontend.
@@ -147,6 +151,8 @@ impl Fake {
                 generation: 1,
                 keys_calls: 0,
                 keys_revoked: false,
+                store_generation: 3,
+                last_have: 0,
             }),
         })
     }
@@ -222,6 +228,16 @@ impl Fake {
 
     pub fn keys_calls(&self) -> u32 {
         self.state().keys_calls
+    }
+
+    /// Moves the registration generation the fake's frontend holds.
+    pub fn set_store_generation(&self, generation: u64) {
+        self.state().store_generation = generation;
+    }
+
+    /// The `have_generation` the newest `GetStoreConfig` carried.
+    pub fn last_have(&self) -> u64 {
+        self.state().last_have
     }
 
     /// The root of the CA the next rotation would move to, and its cross-signature by the current one.
@@ -524,24 +540,38 @@ impl Enroll for Svc {
 
 #[tonic::async_trait]
 impl ColdStore for Svc {
-    async fn get_keys(
+    async fn get_store_config(
         &self,
-        request: Request<GetKeysRequest>,
-    ) -> Result<Response<GetKeysResponse>, Status> {
+        request: Request<GetStoreConfigRequest>,
+    ) -> Result<Response<GetStoreConfigResponse>, Status> {
         let certs = request
             .peer_certs()
             .ok_or_else(|| Status::unauthenticated("no client certificate"))?;
         let role =
             role_of(certs[0].as_ref()).map_err(|e| Status::permission_denied(e.to_string()))?;
+        let have = request.get_ref().have_generation;
         let mut state = self.state();
         state.keys_calls += 1;
+        state.last_have = have;
         if role != PeerRole::Storage || state.keys_revoked {
             return Err(Status::permission_denied("not a storage node, or revoked"));
         }
-        Ok(Response::new(GetKeysResponse {
+        let generation = state.store_generation;
+        // As the frontend answers: the whole store for any generation but the node's own.
+        let config = (generation > 0 && have != generation).then(|| StoreConfig {
+            connection: "main".to_owned(),
+            role: "cold".to_owned(),
+            endpoint: "http://s3.example:9000".to_owned(),
+            region: "us-east-1".to_owned(),
+            bucket: "bkt".to_owned(),
+            prefix: "kbf/".to_owned(),
+            conditional_put: false,
+            min_put_rate: 0,
             access_key_id: "AKIATESTKEY0000".to_owned(),
             secret_access_key: "secret-that-must-stay-in-memory".to_owned(),
-        }))
+            secret_version: generation,
+        });
+        Ok(Response::new(GetStoreConfigResponse { generation, config }))
     }
 }
 

@@ -17,8 +17,8 @@
 
 use kbf_proto::google::rpc::Code;
 use kbf_proto::kbf::enroll::v1::{
-    CredentialMode, EnrollRequest, EnrollResponse, GetKeysRequest, GetKeysResponse, IssuedCert,
-    NodeConfig, NodeFacts, RenewRequest, RenewResponse, RoleCsr,
+    CredentialMode, EnrollRequest, EnrollResponse, GetStoreConfigRequest, GetStoreConfigResponse,
+    IssuedCert, NodeConfig, NodeFacts, RenewRequest, RenewResponse, RoleCsr, StoreConfig,
     cold_store_server::ColdStoreServer, enroll_server::EnrollServer,
 };
 use kbf_types::{CaPin, RefusalCode, RefusalReason, Token, TokenId, TokenSecret};
@@ -223,16 +223,79 @@ fn a_node_config_is_golden() {
     golden(&config(), CONFIG);
 }
 
+fn store_config() -> StoreConfig {
+    StoreConfig {
+        connection: "main".to_owned(),
+        role: "cold".to_owned(),
+        endpoint: "http://s3.example:9000".to_owned(),
+        region: "us-east-1".to_owned(),
+        bucket: "bkt".to_owned(),
+        prefix: "kbf/".to_owned(),
+        conditional_put: true,
+        min_put_rate: 1_048_576,
+        access_key_id: "AKIAEXAMPLE".to_owned(),
+        secret_access_key: "s3cr3t".to_owned(),
+        secret_version: 3,
+    }
+}
+
+const STORE_CONFIG: &str = "0a046d61696e1204636f6c641a16687474703a2f2f73332e6578616d706c653a39303030\
+220975732d656173742d312a03626b7432046b62662f3801408080404a0b414b49414558414d504c4552\
+067333637233745803";
+
+/// Catches: a `StoreConfig` field renumbered or retyped, and a default written to the wire.
+/// Every field is set, so each number is in the vector.
 #[test]
-fn the_cold_store_keys_are_golden_and_the_request_is_empty() {
+fn the_registered_store_is_golden() {
+    golden(&store_config(), STORE_CONFIG);
+}
+
+/// Catches: the request's generation moved off field 1, and an answer that carries the
+/// store when it should carry only the generation (an unchanged answer is two bytes:
+/// the secret is not in it).
+#[test]
+fn the_store_config_calls_are_golden_and_an_unchanged_answer_has_no_store() {
+    golden(&GetStoreConfigRequest { have_generation: 7 }, "0807");
     golden(
-        &GetKeysResponse {
-            access_key_id: "AKIAEXAMPLE".to_owned(),
-            secret_access_key: "s3cr3t".to_owned(),
+        &GetStoreConfigResponse {
+            generation: 7,
+            config: None,
         },
-        "0a0b414b49414558414d504c451206733363723374",
+        "0807",
     );
-    golden(&GetKeysRequest {}, "");
+    golden(
+        &GetStoreConfigResponse {
+            generation: 7,
+            config: Some(store_config()),
+        },
+        &format!("080712570a{}", &STORE_CONFIG[2..]),
+    );
+}
+
+/// Catches: the secret reaching a log through `Debug` of the message, of the answer that
+/// holds it, or of an error path that formats either; and a store that leaves its secret
+/// readable in memory after it is dropped is covered by the `zeroize` call in its `Drop`.
+#[test]
+fn the_registered_stores_debug_prints_no_secret() {
+    let config = store_config();
+    let answer = GetStoreConfigResponse {
+        generation: 7,
+        config: Some(store_config()),
+    };
+    for text in [
+        format!("{config:?}"),
+        format!("{config:#?}"),
+        format!("{answer:?}"),
+        format!("{answer:#?}"),
+    ] {
+        assert!(!text.contains("s3cr3t"), "{text}");
+        assert!(text.contains("Secret(..)"), "{text}");
+        // The rest is there to read: the name, the endpoint and the key id are not secret.
+        assert!(
+            text.contains("main") && text.contains("AKIAEXAMPLE"),
+            "{text}"
+        );
+    }
 }
 
 /// Catches: a credential mode with a reused number, a zero that is a real mode (an unset
@@ -306,4 +369,39 @@ fn a_token_fills_the_request_fields_it_travels_in() {
     let wire = request.encode_to_vec();
     // Fields 1 and 2 of the golden request, and nothing else.
     assert_eq!(wire, bytes_of(&REQUEST[..2 * (2 + 12 + 2 + 32)]));
+}
+
+/// Catches: a node that fails on an answer from a NEWER frontend (the frontend updates first,
+/// so a node must accept an N+1 frontend). The store, its answer and the request carry extra
+/// fields of an unknown number and wire type (a varint, a length-delimited one, a fixed
+/// 32-bit one) at the end and in the middle; each decodes, to the fields this build knows,
+/// and a generation this build has never held is just a number.
+///
+/// Mutant seen red: a `deny_unknown_fields`-style strict decode (a hand check that the
+/// re-encoded bytes equal the input).
+#[test]
+fn a_newer_frontends_store_config_answer_decodes() {
+    let unknown = [0x78, 0x01, 0x72, 0x02, b'h', b'i', 0xad, 0x01, 1, 2, 3, 4];
+    let mut store = store_config().encode_to_vec();
+    // After field 1 (`0a 04 main`, six bytes), so the unknown fields sit between known ones.
+    store.splice(6..6, unknown.iter().copied());
+    store.extend_from_slice(&unknown);
+    // The store is longer than 127 bytes, so its length is a two-byte varint.
+    let mut framed = vec![0x08, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x12];
+    let mut len = store.len();
+    while len >= 0x80 {
+        framed.push((len & 0x7f) as u8 | 0x80);
+        len >>= 7;
+    }
+    framed.push(len as u8);
+    framed.extend_from_slice(&store);
+    framed.extend_from_slice(&unknown);
+    let got = GetStoreConfigResponse::decode(framed.as_slice()).expect("decodes");
+    assert_eq!(got.generation, u64::from(u32::MAX));
+    assert_eq!(got.config, Some(store_config()));
+    let request = [&[0x08, 0x07][..], &unknown].concat();
+    assert_eq!(
+        GetStoreConfigRequest::decode(request.as_slice()).expect("decodes"),
+        GetStoreConfigRequest { have_generation: 7 }
+    );
 }

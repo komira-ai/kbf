@@ -12,8 +12,8 @@
 //! - [`store`]: keys, certificates and `node.json`, written atomically with their modes;
 //! - [`renew`]: renewal at half life by a request signed by the registered key, with the
 //!   schedule and backoff;
-//! - [`keys`]: the object-store keys a storage node fetches over its mutual-TLS session
-//!   and holds in memory only.
+//! - [`keys`]: the registered cold store and its keys, which a storage node fetches over its
+//!   mutual-TLS session and holds in memory only.
 //!
 //! This is a library; the `kbf enroll` and `kbf node` verbs that call it are another
 //! crate's (`docs/design/install-and-enrollment.md`, unit B4b). Time is always a

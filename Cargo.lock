@@ -1645,7 +1645,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "x509-parser",
- "zeroize",
 ]
 
 [[package]]
@@ -2043,6 +2042,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zeroize",
 ]
 
 [[package]]
