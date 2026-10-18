@@ -3,7 +3,7 @@
 
 use std::num::NonZeroUsize;
 
-use kbf_state::{Cond, Fenced};
+use kbf_state::Cond;
 use kbf_types::object_store_api::{AuditAction, BindingRole};
 use prost::Message as _;
 
@@ -176,29 +176,83 @@ fn deletes_refuse_a_bound_connection_and_remove_the_rest() {
     );
 }
 
-// Catches a registry that writes after it lost the writer role: the stale frontend's
-// call is refused as Fenced, and nothing (row, file, audit) is left.
+// Catches a registry that assumes it is the only frontend: two children on one store
+// and one directory (old and new side by side) each write, each sees the other's
+// rows, and the generation advances by exactly one per change (compare-and-set).
 #[test]
-fn a_deposed_frontend_writes_nothing() {
-    let inner = as_store(&fake());
-    let stale: Arc<dyn Store> = Arc::new(Fenced::take(Arc::clone(&inner), None).unwrap());
-    let current: Arc<dyn Store> = Arc::new(Fenced::take(Arc::clone(&inner), None).unwrap());
-    let dir = scratch("fenced").join("s");
-    let old = open(&stale, &dir);
-    let new = Registry::open(current, &dir, Counting::from(100)).unwrap();
-    let err = old.put_connection(&name("cold"), &put("s")).unwrap_err();
-    assert!(
-        matches!(err, RegistryError::Store(StoreError::Fenced)),
-        "{err}"
+fn two_frontend_children_share_one_store_and_one_directory() {
+    let store = as_store(&fake());
+    let dir = scratch("children").join("s");
+    let old = open(&store, &dir);
+    let new = open_now(Arc::clone(&store), &dir, Counting::from(100)).unwrap();
+    assert_eq!(
+        old.put_connection(&name("cold"), &put("one"))
+            .unwrap()
+            .generation,
+        1
     );
-    assert!(inner.scan_prefix("objstore/").unwrap().is_empty());
-    assert!(listing(&dir).is_empty());
-    new.put_connection(&name("cold"), &put("s")).unwrap();
-    let err = old.delete_connection(&name("cold")).unwrap_err();
-    assert!(
-        matches!(err, RegistryError::Store(StoreError::Fenced)),
-        "{err}"
+    assert_eq!(
+        new.put_connection(&name("cold"), &put("two"))
+            .unwrap()
+            .generation,
+        2
     );
+    assert_eq!(old.secret(&name("cold")).unwrap().expose(), "two");
+    assert_eq!(new.generation().unwrap(), 2);
+    new.put_binding(BindingRole::Cold, &bind("cold", "b"))
+        .unwrap();
+    assert!(matches!(
+        old.delete_connection(&name("cold")),
+        Err(RegistryError::InUse)
+    ));
+    assert_eq!(listing(&dir).len(), 1);
+}
+
+// Catches a sweep that removes the file another child has renamed into place and not yet
+// named in a row (it would leave that child's row dangling), and a reader that fails
+// when the other child rotated between its row read and its file read.
+#[test]
+fn a_young_unreferenced_file_survives_the_sweep() {
+    let store = as_store(&fake());
+    let dir = scratch("grace").join("s");
+    let reg = Registry::open(Arc::clone(&store), &dir, Counting::arc()).unwrap();
+    let young = file_of(&dir, "cold", 5);
+    std::fs::write(&young, "x").unwrap();
+    std::fs::write(dir.join(".tmp-9-9"), "x").unwrap();
+    assert_eq!(reg.sweep().unwrap(), 0);
+    assert_eq!(listing(&dir).len(), 2);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+    std::fs::File::options()
+        .write(true)
+        .open(&young)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    assert_eq!(reg.sweep().unwrap(), 1, "only the aged file goes");
+    assert_eq!(listing(&dir), [".tmp-9-9"]);
+}
+
+// Catches a reader that reports Missing when the other child rotated between the row
+// read and the file read (it removes the old version after its commit).
+#[test]
+fn a_reader_survives_the_other_child_rotating_under_it() {
+    let store = as_store(&fake());
+    let dir = scratch("rotate-under").join("s");
+    let reader = open(&store, &dir);
+    let writer = open_now(Arc::clone(&store), &dir, Counting::from(100)).unwrap();
+    writer.put_connection(&name("cold"), &put("one")).unwrap();
+    // The writer rotates between the reader's row read and its first file read.
+    let writer = Arc::new(writer);
+    let other = Arc::clone(&writer);
+    let once = std::sync::atomic::AtomicBool::new(true);
+    reader.set_failpoint(move |step| {
+        if step == crate::object_store::Step::ReadFile
+            && once.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            other.put_connection(&name("cold"), &put("two")).unwrap();
+        }
+    });
+    assert_eq!(reader.secret(&name("cold")).unwrap().expose(), "two");
 }
 
 /// What a newer binary writes: the same fields and one this binary does not know.

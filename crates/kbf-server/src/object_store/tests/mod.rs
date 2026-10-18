@@ -98,10 +98,19 @@ pub(super) fn bind(connection: &str, bucket: &str) -> BindingPut {
     }
 }
 
+/// `Registry::open` with no sweep grace, so a test's leftovers are swept at once.
+pub(super) fn open_now(
+    store: Arc<dyn Store>,
+    dir: &Path,
+    random: Arc<dyn Random>,
+) -> Result<Registry, RegistryError> {
+    Registry::open_with_grace(store, dir, random, std::time::Duration::ZERO)
+}
+
 /// A registry over `store` with files in `dir`, and the same pair opened again after a
 /// crash (the second call).
 pub(super) fn open(store: &Arc<dyn Store>, dir: &Path) -> Registry {
-    Registry::open(Arc::clone(store), dir, Counting::arc()).expect("open the registry")
+    open_now(Arc::clone(store), dir, Counting::arc()).expect("open the registry")
 }
 
 pub(super) fn as_store(fake: &Arc<Fake>) -> Arc<dyn Store> {
@@ -379,7 +388,7 @@ fn concurrent_puts_serialize_and_leave_one_file() {
 fn a_failing_random_source_writes_nothing() {
     let store = as_store(&fake());
     let dir = scratch("norandom").join("s");
-    let reg = Registry::open(Arc::clone(&store), &dir, Arc::new(NoRandom)).unwrap();
+    let reg = open_now(Arc::clone(&store), &dir, Arc::new(NoRandom)).unwrap();
     let err = reg.put_connection(&name("cold"), &put("x")).unwrap_err();
     assert!(matches!(err, RegistryError::Secret(_)), "{err}");
     assert!(err.to_string().contains("draw a version"), "{err}");

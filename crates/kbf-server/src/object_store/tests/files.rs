@@ -177,7 +177,7 @@ fn a_secret_directory_that_is_a_file_is_an_error() {
     );
     let store = as_store(&fake());
     assert!(matches!(
-        Registry::open(store, &blocker.join("below"), Counting::arc()),
+        open_now(store, &blocker.join("below"), Counting::arc()),
         Err(RegistryError::Secret(_))
     ));
 }

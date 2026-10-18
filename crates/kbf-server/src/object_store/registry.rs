@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use kbf_state::{Cond, Store, StoreError, Txn, Versioned};
 use kbf_types::object_store_api::{
@@ -20,6 +21,9 @@ use super::rows::{
 };
 use super::secrets::{SecretError, SecretFiles};
 use crate::enroll::Random;
+
+/// How old an unreferenced file must be before a sweep removes it.
+pub const SWEEP_GRACE: Duration = Duration::from_secs(600);
 
 /// Why a registry call did not do what was asked. Nothing here carries a secret.
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +76,7 @@ pub struct Registry {
     store: Arc<dyn Store>,
     files: SecretFiles,
     random: Arc<dyn Random>,
+    grace: Duration,
     /// Serializes this process's mutations and sweeps, so a sweep never removes the file
     /// of a mutation that has not committed its row yet.
     write: Mutex<()>,
@@ -132,7 +137,23 @@ impl Registry {
         dir: &Path,
         random: Arc<dyn Random>,
     ) -> Result<Self, RegistryError> {
+        Self::open_with_grace(store, dir, random, SWEEP_GRACE)
+    }
+
+    /// [`Registry::open`] with the age a file must reach before a sweep calls it an
+    /// orphan. Two frontend children share the directory, and one's file is unnamed by
+    /// any row between its rename and its commit.
+    ///
+    /// # Errors
+    /// As [`Registry::open`].
+    pub fn open_with_grace(
+        store: Arc<dyn Store>,
+        dir: &Path,
+        random: Arc<dyn Random>,
+        grace: Duration,
+    ) -> Result<Self, RegistryError> {
         let registry = Self {
+            grace,
             store,
             files: SecretFiles::new(dir)?,
             random,
@@ -274,7 +295,17 @@ impl Registry {
         let row = self
             .conn_row(name)?
             .ok_or(RegistryError::NoSuchConnection)?;
-        Ok(self.files.read(name, row.secret_version)?)
+        match self.files.read(name, row.secret_version) {
+            // The other frontend child may have rotated and removed this version
+            // after we read the row: read the row again, once.
+            Err(SecretError::Missing) => {
+                let row = self
+                    .conn_row(name)?
+                    .ok_or(RegistryError::NoSuchConnection)?;
+                Ok(self.files.read(name, row.secret_version)?)
+            }
+            other => Ok(other?),
+        }
     }
 
     /// Removes the secret files no connection row names, and the temp files a crash left.
@@ -289,7 +320,7 @@ impl Registry {
             .into_iter()
             .map(|(name, row)| (name.to_string(), row.secret_version))
             .collect();
-        Ok(self.files.sweep(&keep)?)
+        Ok(self.files.sweep(&keep, self.grace)?)
     }
 
     /// Creates or replaces a connection.

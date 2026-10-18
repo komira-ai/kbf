@@ -17,9 +17,21 @@ const STEPS: [Step; 5] = [
     Step::CommitRow,
 ];
 
-/// Files a crash at `step` leaves behind besides the live ones, before any sweep.
-fn leftovers(step: Step) -> usize {
-    usize::from(step != Step::WriteTemp)
+/// What a crash at `step` leaves besides the live files, before any sweep: temp files
+/// and files under their versioned name that no row names.
+fn leftovers(step: Step) -> (usize, usize) {
+    match step {
+        Step::WriteTemp | Step::ReadFile => (0, 0),
+        Step::SyncTemp | Step::Rename => (1, 0),
+        Step::SyncDir | Step::CommitRow => (0, 1),
+    }
+}
+
+/// The temp files and the versioned files in `dir`.
+fn counts(dir: &Path) -> (usize, usize) {
+    let all = listing(dir);
+    let temps = all.iter().filter(|n| n.starts_with(".tmp-")).count();
+    (temps, all.len() - temps)
 }
 
 fn crash_during(reg: &Registry, step: Step, call: impl FnOnce()) {
@@ -47,13 +59,13 @@ fn a_crash_at_any_step_of_a_first_write_leaves_no_row_and_no_file_after_the_swee
         crash_during(&reg, step, || {
             let _ = reg.put_connection(&name("cold"), &put(SENTINEL));
         });
-        assert_eq!(listing(&dir).len(), leftovers(step), "{step:?}");
+        assert_eq!(counts(&dir), leftovers(step), "{step:?}");
         assert!(
             store.scan_prefix("objstore/").unwrap().is_empty(),
             "{step:?}: no row"
         );
         assert!(reg.connection(&name("cold")).unwrap().is_none(), "{step:?}");
-        let restarted = Registry::open(Arc::clone(&store), &dir, Counting::from(500)).unwrap();
+        let restarted = open_now(Arc::clone(&store), &dir, Counting::from(500)).unwrap();
         assert!(listing(&dir).is_empty(), "{step:?}: swept");
         assert_eq!(restarted.generation().unwrap(), 0);
         // And the write can be done again.
@@ -81,9 +93,10 @@ fn a_crash_at_any_step_of_a_rotation_keeps_the_live_version_readable() {
             "live-secret",
             "{step:?}"
         );
-        assert_eq!(listing(&dir).len(), 1 + leftovers(step), "{step:?}");
+        let (temps, named) = leftovers(step);
+        assert_eq!(counts(&dir), (temps, 1 + named), "{step:?}");
         assert_eq!(reg.generation().unwrap(), 1, "{step:?}");
-        let restarted = Registry::open(Arc::clone(&store), &dir, Counting::from(500)).unwrap();
+        let restarted = open_now(Arc::clone(&store), &dir, Counting::from(500)).unwrap();
         assert_eq!(
             listing(&dir),
             ["cold.0000000000000001.json"],
@@ -116,7 +129,7 @@ fn a_writer_that_lost_a_race_writes_nothing_and_cleans_up() {
     let store = as_store(&fake());
     let dir = scratch("race").join("s");
     let loser = open(&store, &dir);
-    let winner = Arc::new(Registry::open(Arc::clone(&store), &dir, Counting::from(100)).unwrap());
+    let winner = Arc::new(open_now(Arc::clone(&store), &dir, Counting::from(100)).unwrap());
     let racer = Arc::clone(&winner);
     loser.set_failpoint(move |at| {
         if at == Step::CommitRow {
@@ -156,7 +169,7 @@ fn an_unchanged_write_also_loses_a_race() {
     let dir = scratch("race-same").join("s");
     let first = open(&store, &dir);
     first.put_connection(&name("cold"), &put("s")).unwrap();
-    let other = Arc::new(Registry::open(Arc::clone(&store), &dir, Counting::from(100)).unwrap());
+    let other = Arc::new(open_now(Arc::clone(&store), &dir, Counting::from(100)).unwrap());
     let racer = Arc::clone(&other);
     first.set_failpoint(move |at| {
         if at == Step::CommitRow {
@@ -218,7 +231,7 @@ fn over_random_interleavings_a_row_always_names_an_existing_file() {
                     if matches!(done, Ok(Ok(_))) {
                         model.insert(n, secret);
                     }
-                    reg = Registry::open(
+                    reg = open_now(
                         Arc::clone(&store),
                         &dir,
                         Counting::from(1_000 * (round + 1)),

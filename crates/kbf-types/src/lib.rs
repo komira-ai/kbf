@@ -15,9 +15,9 @@
 mod digest;
 mod enroll;
 pub mod enroll_api;
-pub mod object_store_api;
 mod image;
 mod lease;
+pub mod object_store_api;
 mod phase;
 mod platform;
 mod qos;

@@ -7,6 +7,7 @@ use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use kbf_types::object_store_api::{ConnectionName, Secret};
 use rustix::fs::{Mode, OFlags};
@@ -194,6 +195,7 @@ impl SecretFiles {
     /// between the check and the read), [`SecretError::NotRegular`] for a link or a
     /// directory, [`SecretError::Invalid`] for anything but this module's JSON.
     pub(super) fn read(&self, name: &ConnectionName, version: u64) -> Result<Secret, SecretError> {
+        self.reach(Step::ReadFile);
         let fd = rustix::fs::open(
             self.path(name, version),
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -233,12 +235,17 @@ impl SecretFiles {
         }
     }
 
-    /// Removes every temp file and every versioned file not in `keep`, and returns how
-    /// many. A file this module does not name is left alone.
+    /// Removes every temp file and every versioned file not in `keep` that is at least
+    /// `grace` old, and returns how many. A file this module does not name is left alone.
     ///
     /// # Errors
     /// The directory cannot be listed, or a removal failed.
-    pub(super) fn sweep(&self, keep: &BTreeSet<(String, u64)>) -> Result<usize, SecretError> {
+    pub(super) fn sweep(
+        &self,
+        keep: &BTreeSet<(String, u64)>,
+        grace: Duration,
+    ) -> Result<usize, SecretError> {
+        let now = SystemTime::now();
         let mut removed = 0;
         for entry in fs::read_dir(&self.dir).map_err(io_at("list the directory"))? {
             let entry = entry.map_err(io_at("list the directory"))?;
@@ -253,7 +260,13 @@ impl SecretFiles {
             } else {
                 false
             };
-            if orphan {
+            // Another frontend child on this host may be between its rename and its row
+            // commit: a file is an orphan only once it has sat for the grace.
+            let aged = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|at| now.duration_since(at).unwrap_or_default() >= grace);
+            if orphan && aged {
                 fs::remove_file(entry.path()).map_err(io_at("remove an orphan"))?;
                 removed += 1;
             }
