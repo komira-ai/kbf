@@ -93,7 +93,7 @@ Options:
 
           Possible values:
           - fake:                 Runs nothing; every action succeeds with an empty result. For bring-up only
-          - container:            Each action in a fresh rootless Podman container (Linux)
+          - container:            Each action in a fresh rootless container made by `crun` (Linux)
           - native:               Each action as plain processes on the node, for Macs
           - native-whole-machine: Each whole-machine lease as its own user in its GUI session, through `kbf-mac-session` (macOS)
 
@@ -192,13 +192,13 @@ Options:
           The most threads the runtime's blocking pool runs at once, for calls that wait on a disk or a process (a thread is made when a call needs one and ends when idle). Default: 512 (tokio's) for the server, 64 for the daemon
 
       --worker-client-ca <WORKER_CLIENT_CA>
-          PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`; a frontend certificate may call nothing here
+          PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`, with DNS or IP names that cover the host of the instance id and of the address it registers; a frontend certificate may call nothing here
 
       --cpu-threads <N>
           Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use on the server; `max(2, reserve/2)`, at most the physical cores, on the daemon
 
       --worker-deny-list <WORKER_DENY_LIST>
-          The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every `Hello` and `Heartbeat`, so an edit takes effect without a restart. Needs mutual TLS
+          The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every check (a daemon's `Hello`, `Heartbeat`, `Result`, `NodeStatus` and blob calls, a storage node's `Register` and `Heartbeat`), so an edit takes effect without a restart. A `node` entry also refuses a storage certificate with that DNS name. A list that cannot be read after start refuses all of those calls. Needs mutual TLS
 
       --output-upload-deadline-secs <OUTPUT_UPLOAD_DEADLINE_SECS>
           How long one lease's whole output upload (its output files, stdout and stderr) may take, in seconds, before the lease fails with a reason naming the upload and the time it ran (container and native drivers). Without it, a store that stops answering holds the lease, and its slot, with no error
@@ -386,6 +386,31 @@ Options:
           
           [default: 10]
 
+      --write-pool-writers <WRITE_POOL_WRITERS>
+          The writers of the write pool: the ByteStream and storage `Write`s of a node with a write tier are appended to shared segment files by this many writers, each holding one range open, so the node keeps at most this many block files (plus the open grouped block) open for writing for those blobs, however many uploads are in flight. At least 1
+          
+          [default: 8]
+
+      --write-pool-queue <WRITE_POOL_QUEUE>
+          The most blobs waiting for a write-pool writer. A blob that finds the queue full goes straight to the object store, as one does when the write tier has no room. At least 1
+          
+          [default: 4096]
+
+      --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
+          How often each lease's `max` events and swap are sampled, in milliseconds (container)
+          
+          [default: 1000]
+
+      --write-pool-stream-idle <WRITE_POOL_STREAM_IDLE>
+          How long, in seconds, a streamed blob may go without sending a chunk before its write-pool writer is taken back and the upload fails UNAVAILABLE (the client sends it again). Without it, a stalled but connected large upload would hold a writer for ever, and with all writers held every other blob would wait. It limits stalls only: an upload that sends a chunk more often than this (a trickle) can still hold a writer. At least 1
+          
+          [default: 30]
+
+      --memory-limit-percent <MEMORY_LIMIT_PERCENT>
+          A lease's processes are killed past this percentage of its booked memory...
+          
+          [default: 150]
+
       --store-put-attempts <STORE_PUT_ATTEMPTS>
           How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
           
@@ -396,45 +421,25 @@ Options:
           
           [default: 1048576]
 
-      --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
-          The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
-          
-          [default: 268435456]
-
-      --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
-          How often each lease's `max` events and swap are sampled, in milliseconds (container)
-          
-          [default: 1000]
-
-      --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
-          The most Directory blobs the input check reads from the store at once, across all Executes
-          
-          [default: 64]
-
-      --memory-limit-percent <MEMORY_LIMIT_PERCENT>
-          A lease's processes are killed past this percentage of its booked memory...
-          
-          [default: 150]
-
       --memory-headroom-mib <MEMORY_HEADROOM_MIB>
           ...plus this many MiB (native). A lease that booked nothing has no limit
           
           [default: 512]
 
-      --member-ttl-secs <SECONDS>
-          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
+      --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
+          The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
           
-          [default: 15]
+          [default: 268435456]
 
       --memory-poll-ms <MEMORY_POLL_MS>
           How often a lease's memory is measured, in milliseconds (native)
           
           [default: 250]
 
-      --member-dwell-secs <SECONDS>
-          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
+      --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
+          The most Directory blobs the input check reads from the store at once, across all Executes
           
-          [default: 300]
+          [default: 64]
 
       --xcode-apps <XCODE_APPS>
           The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
@@ -446,17 +451,21 @@ Options:
           
           [default: 180]
 
+      --member-ttl-secs <SECONDS>
+          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
+          
+          [default: 15]
+
       --require-metal-toolchain
           This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
 
       --image <IMAGE>
-          A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon checks each is in its user's image store, as the prepare step of every lease does, and exits with status 2 if one is not, or names an image index, saying the fix (`podman pull <repo>@sha256:<d>`). The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
+          A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 
-      --container-runtime <podman|oci>
-          The runtime that runs each action's container (container): `podman`, the default, runs `podman create` and `podman start` per action; `oci` runs each action in a fresh rootless sandbox through `--oci-runtime` directly, with no Podman on the action path (Podman only pulls and exports an image once per digest). `oci` needs the daemon user's subordinate ids in one range, `uidmap`, and every directory down to `--data-dir` searchable by others
+      --member-dwell-secs <SECONDS>
+          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
           
-          [default: podman]
-          [possible values: podman, oci]
+          [default: 300]
 
       --lease-placement <none|numa-node>
           Where each lease runs among the node's CPUs (container, Linux): `none`, the default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus` is a quota on all leases together, so it still applies; it removes no CPU from a node. Needs the `cpuset` controller delegated to the daemon (the start fails and says how when it is not); a host with fewer than two NUMA nodes that hold CPUs runs as `none`, which the start logs. Refused with a driver other than `container` (macOS has no such driver)
@@ -465,7 +474,7 @@ Options:
           [possible values: none, numa-node]
 
       --oci-runtime <OCI_RUNTIME>
-          The OCI runtime `--container-runtime=oci` runs actions with (container)
+          The OCI runtime that runs each action's container (container): `crun`, run directly. Each action gets a fresh rootless sandbox. It needs the daemon user's subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on `PATH`, and every directory down to `--data-dir` searchable by others
           
           [default: /usr/bin/crun]
 

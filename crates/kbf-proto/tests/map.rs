@@ -6,7 +6,9 @@
 //! - an unspecified or unknown enum value, or a replication factor that does not fit a
 //!   `u8`, read as a default instead of refused;
 //! - a map the domain refuses getting in through the wire;
-//! - the generation moving off field 1.
+//! - the generation moving off field 1;
+//! - the heartbeat's debts report moving off fields 5 and 6, or an older node's heartbeat
+//!   (which sends neither) being read as "owes nothing" instead of "cannot say".
 
 use kbf_map::{DenyEntry, Map, MapError, Member, MemberId, MemberState, Rule};
 use kbf_proto::MapDecodeError;
@@ -32,6 +34,7 @@ fn member(id: u64, state: MemberState) -> Member {
         },
         weight: 1 + id as u32,
         state,
+        boot: 0,
     }
 }
 
@@ -173,5 +176,77 @@ fn denied_entries_are_parsed_canonically_and_refused_when_bad_or_repeated() {
         MapDecodeError::Invalid(MapError::DuplicateDenied(DenyEntry::Serial(
             "a1b".to_owned()
         )))
+    );
+}
+
+// Catches: the debts report moved to other field numbers (a node and a frontend of two
+// builds would read each other's counts as something else). The bytes are pinned: the
+// member id and boot on fields 1 and 2, the count on field 5 and the known flag on 6,
+// each a varint.
+#[test]
+fn the_heartbeat_debts_are_fields_five_and_six() {
+    let beat = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 2,
+        repair_debts: 3,
+        debts_known: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        beat.encode_to_vec(),
+        [0x08, 1, 0x10, 2, 0x28, 3, 0x30, 1],
+        "fields 1, 2, 5 and 6"
+    );
+    let back =
+        pb::HeartbeatRequest::decode(&[0x08, 1, 0x10, 2, 0x28, 3, 0x30, 1][..]).expect("decodes");
+    assert_eq!(back, beat);
+}
+
+// Catches: a heartbeat from a node that predates the report read as having said it owes
+// nothing. It carries neither field, so `debts_known` decodes false: "cannot say". And a
+// node that says it cannot say sends no bytes for either field.
+#[test]
+fn a_heartbeat_without_the_report_says_it_cannot_say() {
+    let old = pb::HeartbeatRequest::decode(&[0x08, 1, 0x10, 2][..]).expect("decodes");
+    assert!(!old.debts_known);
+    assert_eq!(old.repair_debts, 0);
+    let blind = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 2,
+        ..Default::default()
+    };
+    assert_eq!(blind.encode_to_vec(), [0x08, 1, 0x10, 2]);
+}
+
+/// Catches: a boot that does not survive the wire, and a reader that fails on a map from a
+/// frontend that predates the field. A member's boot round-trips through bytes; a member
+/// encoded without field 6 (what an older frontend sends) decodes with boot 0, which
+/// means unknown.
+#[test]
+fn a_members_boot_round_trips_and_an_older_map_without_it_reads_as_zero() {
+    let mut m = member(1, MemberState::Active);
+    m.boot = 7;
+    let wire = pb::Member::from(&m);
+    assert_eq!(wire.boot, 7);
+    let decoded = pb::Member::decode(wire.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(Member::try_from(decoded).unwrap().boot, 7);
+
+    // The bytes an older frontend wrote: the Member as it was, fields 1 to 5 only.
+    let old = [
+        0x08, 0x01, // id = 1
+        0x12, 0x06, b'h', b'o', b's', b't', b'-', b'1', // addr
+        0x20, 0x02, // weight = 2
+        0x28, 0x03, // state = ACTIVE
+    ];
+    let decoded = pb::Member::decode(old.as_slice()).unwrap();
+    let read = Member::try_from(decoded).unwrap();
+    assert_eq!(read.boot, 0, "no field reads as unknown");
+    assert_eq!(read.state, MemberState::Active);
+
+    // The field is number 6, a varint: an older reader skips it as an unknown field.
+    let with_boot = pb::Member::from(&m).encode_to_vec();
+    assert!(
+        with_boot.windows(2).any(|w| w == [0x30, 0x07]),
+        "field 6 on the wire"
     );
 }

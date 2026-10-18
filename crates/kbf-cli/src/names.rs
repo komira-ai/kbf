@@ -15,6 +15,13 @@ pub const STORAGE_AND_DAEMON: &str = "storage-and-daemon";
 /// Frontend, storage and build node in one process.
 pub const ALL_IN_ONE: &str = "all-in-one";
 
+/// The node: the one unit for every non-frontend role. It is a word after `kbf`, not a row
+/// of [`MODES`]: it takes `kbf.toml` and the roles the frontend grants, then runs one of
+/// the modes above ([`crate::node`]).
+pub const NODE: &str = "node";
+/// One enrollment of this node, then exit ([`crate::enroll`]); not a row of [`MODES`] either.
+pub const ENROLL: &str = "enroll";
+
 /// What a mode runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entry {

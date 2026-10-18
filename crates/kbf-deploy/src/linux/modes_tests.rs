@@ -56,6 +56,47 @@ fn each_mode_renders_a_unit_that_passes_every_rule_and_matches_its_golden() {
     }
 }
 
+/// The smallest `LimitNOFILE=` a kbf unit may set. systemd starts a unit that sets none at
+/// a soft limit of 1024, and a storage node under a build's burst of uploads (a file per
+/// open write-tier block, a socket per peer, client and cold-store request) hit EMFILE
+/// there ("sync_dir ...: Too many open files").
+const MIN_NOFILE: u64 = 65536;
+
+fn nofile(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("LimitNOFILE="))
+        .and_then(|v| v.parse().ok())
+}
+
+/// Catches a kbf unit, mode or converged, with no `LimitNOFILE=` (the process runs at a
+/// soft open-file limit of 1024) or one below `MIN_NOFILE`. Mutant: the line deleted from
+/// one template turns this red for that unit.
+#[test]
+fn every_kbf_unit_sets_an_open_file_limit() {
+    let c = config();
+    for mode in Mode::ALL {
+        let text = render(&c, Some(1500), mode).expect("renders");
+        assert!(
+            nofile(&text).is_some_and(|n| n >= MIN_NOFILE),
+            "{mode}: LimitNOFILE= is {:?}",
+            nofile(&text)
+        );
+    }
+    let units = render_converged(&c, Some(1500), &Templates::BUILT_IN).expect("renders");
+    let mut seen = 0;
+    for (name, text) in units.files() {
+        if name.contains("kbf-") && name.ends_with(".service") {
+            seen += 1;
+            assert!(
+                nofile(text).is_some_and(|n| n >= MIN_NOFILE),
+                "{name}: LimitNOFILE= is {:?}",
+                nofile(text)
+            );
+        }
+    }
+    assert_eq!(seen, 2, "kbf-server's and kbf-daemon's units");
+}
+
 /// Catches a change to the units `render-units` writes without `--mode` (kbf-server's
 /// and kbf-daemon's, MinIO's drop-in and the slice): the mode units are new files and
 /// leave the converged host's units byte for byte as they were.
@@ -123,7 +164,25 @@ fn every_mode_but_the_daemon_drains() {
 #[test]
 fn each_planted_defect_turns_its_rule_red() {
     let c = config();
-    let rows: [(Mode, &str, &str, &str); 21] = [
+    let rows: [(Mode, &str, &str, &str); 24] = [
+        (
+            Mode::Daemon,
+            "RestartSec=5\n",
+            "",
+            "FAIL restart: kbf-daemon.service gives no RestartSec=5: systemd restarts after 100 ms, and a failure that repeats quickly ends in start-limit-hit with the unit down",
+        ),
+        (
+            Mode::Storage,
+            "StartLimitIntervalSec=0\n",
+            "StartLimitIntervalSec=10\n",
+            "FAIL restart: kbf-storage.service has StartLimitIntervalSec=10, not StartLimitIntervalSec=0: five starts in that interval end in start-limit-hit with the unit down",
+        ),
+        (
+            Mode::StorageAndDaemon,
+            "RestartSec=5\n",
+            "RestartSec=100ms\n",
+            "FAIL restart: kbf-storage-and-daemon.service has RestartSec=100ms, not RestartSec=5: a failure that repeats quickly must not use up the start limit",
+        ),
         (
             Mode::Frontend,
             "TimeoutStopSec=infinity\n",

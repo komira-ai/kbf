@@ -134,6 +134,58 @@ fn the_daemon_half_routes_by_the_map_only_with_a_frontend() {
     assert!(routes_by_map(&frontend));
 }
 
+/// A membership service that admits every node as member 1 at boot 1 and sends no map: a
+/// storage half started with `--frontend` registers before it opens its cache, so its
+/// start waits for an answer.
+#[cfg(target_os = "linux")]
+struct Admits;
+
+#[cfg(target_os = "linux")]
+#[tonic::async_trait]
+impl kbf_proto::kbf::map::v1::membership_server::Membership for Admits {
+    async fn register(
+        &self,
+        _: tonic::Request<kbf_proto::kbf::map::v1::RegisterRequest>,
+    ) -> Result<tonic::Response<kbf_proto::kbf::map::v1::RegisterResponse>, tonic::Status> {
+        Ok(tonic::Response::new(
+            kbf_proto::kbf::map::v1::RegisterResponse {
+                member_id: 1,
+                boot: 1,
+                heartbeat_interval_ms: 60_000,
+                map: None,
+            },
+        ))
+    }
+
+    async fn heartbeat(
+        &self,
+        _: tonic::Request<kbf_proto::kbf::map::v1::HeartbeatRequest>,
+    ) -> Result<tonic::Response<kbf_proto::kbf::map::v1::HeartbeatResponse>, tonic::Status> {
+        Ok(tonic::Response::new(
+            kbf_proto::kbf::map::v1::HeartbeatResponse {
+                map_generation: 0,
+                map: None,
+            },
+        ))
+    }
+}
+
+/// [`Admits`] on a port of its own, as the `--frontend` flag's value.
+#[cfg(target_os = "linux")]
+fn admitting_frontend(tokio: &tokio::runtime::Runtime) -> String {
+    let _enter = tokio.enter();
+    let incoming =
+        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().expect("address"))
+            .expect("bind");
+    let addr = incoming.local_addr().expect("address");
+    tokio.spawn(
+        tonic::transport::Server::builder()
+            .add_service(kbf_proto::kbf::map::v1::membership_server::MembershipServer::new(Admits))
+            .serve_with_incoming(incoming),
+    );
+    format!("--frontend=http://{addr}")
+}
+
 /// Catches a starter that cannot start the daemon half over the storage half it is
 /// given, in either mode: the routed one (the node's own member, its storage and its map)
 /// and the one-box in-process plane. Neither dials anything at start: the fake driver
@@ -170,7 +222,8 @@ fn a_starter_starts_the_daemon_half_over_the_storage_half_in_either_mode() {
         format!("--data-dir={}", at("data").display()),
     ])
     .expect("the daemon's flags");
-    for frontend in [None, Some("--frontend=http://127.0.0.1:1")] {
+    let admitting = admitting_frontend(&tokio);
+    for frontend in [None, Some(admitting.as_str())] {
         let at = |name: &str| dir.join(frontend.map_or("one", |_| "farm")).join(name);
         let cold = format!("--cold-store=file://{}", at("cold").display());
         let meta = format!("--meta-dir={}", at("meta").display());
@@ -199,6 +252,7 @@ fn a_starter_starts_the_daemon_half_over_the_storage_half_in_either_mode() {
 fn the_local_member_is_registered_under_the_advertised_address() {
     let dir = crate::one_cache::under_target("local-member");
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
+    let admitting = admitting_frontend(&tokio);
     for advertise in [Some("192.0.2.10:9982"), None] {
         let at = |name: &str| {
             dir.join(advertise.map_or("bound", |_| "advertised"))
@@ -210,7 +264,7 @@ fn the_local_member_is_registered_under_the_advertised_address() {
             "--storage-listen=127.0.0.1:0".to_owned(),
             cold,
             meta,
-            "--frontend=http://127.0.0.1:1".to_owned(),
+            admitting.clone(),
         ];
         extra.extend(advertise.map(|a| format!("--advertise-addr={a}")));
         let extra: Vec<&str> = extra.iter().map(String::as_str).collect();

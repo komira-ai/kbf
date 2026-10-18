@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::channel::mpsc;
@@ -55,6 +56,9 @@ pub struct Fake {
     /// Reads being served now, and the most at once.
     pub active: AtomicUsize,
     pub most: AtomicUsize,
+    /// Read responses the server has dropped: the client cancelled the call, or the
+    /// response ended.
+    pub streams_dropped: AtomicUsize,
     /// Requests of any kind being served now (reads, writes and FindMissing calls), and
     /// the most at once.
     pub requests: AtomicUsize,
@@ -89,6 +93,7 @@ impl Default for Fake {
             reads: Mutex::default(),
             active: AtomicUsize::new(0),
             most: AtomicUsize::new(0),
+            streams_dropped: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
             most_requests: AtomicUsize::new(0),
             gate: watch::channel(true).0,
@@ -219,6 +224,26 @@ impl Drop for Active {
 
 type ReadStream = Pin<Box<dyn Stream<Item = Result<ReadResponse, Status>> + Send>>;
 
+/// A read's messages, counted in `Fake::streams_dropped` when the server drops them.
+struct Messages {
+    messages: mpsc::Receiver<Result<ReadResponse, Status>>,
+    fake: Arc<Fake>,
+}
+
+impl Stream for Messages {
+    type Item = Result<ReadResponse, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.messages).poll_next(cx)
+    }
+}
+
+impl Drop for Messages {
+    fn drop(&mut self) {
+        self.fake.streams_dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[tonic::async_trait]
 impl ByteStream for Shared {
     type ReadStream = ReadStream;
@@ -240,6 +265,10 @@ impl ByteStream for Shared {
             return Err(Status::not_found(name));
         };
         let (mut sender, messages) = mpsc::channel(1);
+        let messages = Messages {
+            messages,
+            fake: Arc::clone(&fake),
+        };
         tokio::spawn(async move {
             // Dropped before `sender`, so the read stops counting before its stream
             // ends.
