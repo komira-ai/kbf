@@ -190,6 +190,9 @@ pub(crate) struct Usage {
 #[derive(Debug, Deserialize)]
 pub(crate) struct UpdateDoc {
     pub(crate) desired: Option<Desired>,
+    /// The server's own flag: the policy's `paused`, false without a policy row.
+    #[serde(default)]
+    pub(crate) paused: Option<bool>,
     pub(crate) policy: Option<Value>,
     pub(crate) releases: Releases,
 }
@@ -200,7 +203,6 @@ pub(crate) struct Desired {
     pub(crate) generation: u64,
     pub(crate) commit: String,
     pub(crate) set_at_ms: u64,
-    pub(crate) paused: bool,
 }
 
 /// The body of `GET /v1/releases`, as `GET /v1/update` embeds it.
@@ -234,7 +236,8 @@ pub(crate) enum Pause {
 
 impl UpdateDoc {
     /// `policy.paused` only when the policy object has that key (a value that is not a
-    /// boolean is unknown), else `desired.paused`; unknown when neither is there. A
+    /// boolean is unknown), else the document's own `paused`; unknown when neither is
+    /// there. The desired row carries no pause: it lives in the policy row. A
     /// policy row without the key never reads as running.
     pub(crate) fn pause(&self) -> Pause {
         let from_policy = self
@@ -244,7 +247,7 @@ impl UpdateDoc {
             .map(Value::as_bool);
         let paused = match from_policy {
             Some(paused) => paused,
-            None => self.desired.as_ref().map(|d| d.paused),
+            None => self.paused,
         };
         match paused {
             Some(true) => Pause::Paused,

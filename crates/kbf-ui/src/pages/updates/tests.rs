@@ -51,48 +51,43 @@ fn the_page_shows_the_farm_the_releases_the_frontend_and_the_hosts() {
 }
 
 /// Catches: a pause read wrongly. The rule: `policy.paused` only when that key is
-/// there, else `desired.paused`; never "running" when it cannot be told. Mutants: read
-/// only `policy.paused` (a policy row without the key shows running or unknown); read
-/// only `desired.paused` (a policy that says paused shows running); treat a key that is
-/// not a boolean as absent.
+/// there, else the document's own `paused` (the desired row has none); never "running"
+/// when it cannot be told. Mutants: read only `policy.paused` (a policy row without the
+/// key shows running or unknown); read only the document's `paused` (a policy that says
+/// paused shows running); treat a key that is not a boolean as absent.
 #[test]
 fn a_pause_is_read_by_the_rule_and_never_defaults_to_running() {
-    let paused_desired = |paused: bool| json!({"generation": 1, "commit": COMMIT_A, "set_at_ms": 0, "paused": paused});
     let releases = update_doc()["releases"].clone();
-    let doc = |desired: &Value, policy: &Value| json!({"desired": desired, "policy": policy, "releases": releases});
+    let desired = update_doc()["desired"].clone();
+    let doc = |top: Option<bool>, policy: &Value| {
+        let mut doc = json!({"desired": desired, "policy": policy, "releases": releases});
+        if let Some(top) = top {
+            doc["paused"] = json!(top);
+        }
+        doc
+    };
     let cases = [
-        // A policy row without the key: the desired release's pause counts.
-        (
-            doc(&paused_desired(true), &json!({"auto_nodes": true})),
-            "paused",
-        ),
-        (
-            doc(&paused_desired(false), &json!({"auto_nodes": true})),
-            "running",
-        ),
+        // A policy row without the key: the document's flag counts.
+        (doc(Some(true), &json!({"auto_nodes": true})), "paused"),
+        (doc(Some(false), &json!({"auto_nodes": true})), "running"),
         // No policy row.
-        (doc(&paused_desired(true), &Value::Null), "paused"),
+        (doc(Some(true), &Value::Null), "paused"),
+        (doc(Some(false), &Value::Null), "running"),
         // The policy's own key wins, both ways.
-        (
-            doc(&paused_desired(true), &json!({"paused": false})),
-            "running",
-        ),
-        (
-            doc(&paused_desired(false), &json!({"paused": true})),
-            "paused",
-        ),
+        (doc(Some(true), &json!({"paused": false})), "running"),
+        (doc(Some(false), &json!({"paused": true})), "paused"),
         // Nothing says, or the key is not a boolean: unknown, not running.
         (
-            doc(&Value::Null, &json!({"auto_nodes": true})),
+            doc(None, &json!({"auto_nodes": true})),
             "pause state unknown",
         ),
-        (doc(&Value::Null, &Value::Null), "pause state unknown"),
+        (doc(None, &Value::Null), "pause state unknown"),
         (
-            doc(&paused_desired(false), &json!({"paused": null})),
+            doc(Some(false), &json!({"paused": null})),
             "pause state unknown",
         ),
         (
-            doc(&paused_desired(false), &json!({"paused": "yes"})),
+            doc(Some(false), &json!({"paused": "yes"})),
             "pause state unknown",
         ),
     ];

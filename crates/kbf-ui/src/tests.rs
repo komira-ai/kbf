@@ -219,8 +219,8 @@ pub(crate) const COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 /// one, `COMMIT_B` complete on both.
 pub(crate) fn update_doc() -> Value {
     json!({
-        "desired": {"generation": 7, "commit": COMMIT_B, "set_at_ms": 1_791_370_000_000_u64,
-            "paused": false},
+        "desired": {"generation": 7, "commit": COMMIT_B, "set_at_ms": 1_791_370_000_000_u64},
+        "paused": false,
         "policy": null,
         "releases": {"releases": [
             {"commit": COMMIT_A, "platforms": [

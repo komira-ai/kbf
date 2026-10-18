@@ -202,7 +202,7 @@ async fn page(running: &Running) -> (u16, String) {
 /// Catches: a key the page reads that the routes do not answer, or answer in another
 /// form (the page would be `502`); the detail columns missing under a policy that
 /// allows `farm.get`; a host's refusal, a string from outside, written as markup; a
-/// farm paused through its desired row not shown paused.
+/// farm paused through its policy row not shown paused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_page_renders_from_the_real_routes_with_the_detail() {
     let dir = Dir::new();
