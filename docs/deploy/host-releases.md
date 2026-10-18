@@ -8,7 +8,7 @@ updates the host pulled: both call the `kbf-installer` crate, so a host has **on
 file and one layout**, on Linux and on macOS.
 
 ```text
-/usr/local/kbf/releases/<commit>/   one release: kbf (Linux) or kbf-daemon (macOS), units/
+/usr/local/kbf/releases/<commit>/   one release: kbf (both), kbf-daemon (Linux only), units/
 /usr/local/kbf/current              link to releases/<commit>, the release that runs
 /usr/local/kbf/previous             link to releases/<commit>, the one before it
 <state dir>/state.json              the deploy state (0600)
@@ -32,8 +32,10 @@ a `/usr/local` that is there is not touched.
 `<commit>` is always the full 40-character lowercase commit id. The links are relative
 (`releases/<commit>`). A release directory, its `units/` and its binaries are root's and
 0755 (units 0644), so the user a service runs as cannot replace its own binary. A Linux
-release holds `kbf`; a macOS release holds `kbf-daemon`, which is what the Mac's
-LaunchDaemon runs (`/usr/local/kbf/current/kbf-daemon`). A release may hold both.
+release holds `kbf`, and may add `kbf-daemon`; a macOS release holds `kbf` only, which is
+what the Mac's LaunchDaemon runs (`/usr/local/kbf/current/kbf daemon`, with the flags
+`kbf-mac-provision` writes). The stage refuses a Mac offer that names `kbf-daemon`
+(`offer-darwin-daemon`): no darwin `kbf-daemon` is built.
 
 ## The verbs
 

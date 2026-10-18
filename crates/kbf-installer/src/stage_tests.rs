@@ -526,12 +526,7 @@ fn an_attested_binary_of_another_platform_is_refused_unrun() {
     ];
     for (name, platform, bytes) in cases {
         let mut rig = Rig::new(&format!("stage-platform-{name}"), platform);
-        let component = if platform == Platform::Linux {
-            "kbf"
-        } else {
-            "kbf-daemon"
-        };
-        write_inbox(&rig.entry, COMMIT, &[part(component, &bytes)]);
+        write_inbox(&rig.entry, COMMIT, &[part("kbf", &bytes)]);
         let runner = FakeRunner::ok(COMMIT);
         let err = rig.stage(&runner).expect_err(name);
         assert_eq!(err.code(), "wrong-platform", "{name}");
@@ -706,7 +701,7 @@ fn a_release_of_two_binaries_is_checked_and_installed_whole() {
 /// Catches the macOS layout: a stage on a Mac uses `/var/db/kbf-deploy` for the state and
 /// scratch directory and `/var/run/kbf-deploy.lock` for the lock, and never `/var/lib` or
 /// `/run`; the missing parents are made (`/usr/local`, the state directory) 0755 and the
-/// owner the stage was given; the release holds `kbf-daemon`.
+/// owner the stage was given; the release holds `kbf`.
 ///
 /// Mutant seen red: the Linux paths used on a Mac (the lock's directory `/run` is not
 /// there, and the stage fails before anything is staged).
@@ -716,12 +711,12 @@ fn a_mac_stage_uses_the_mac_layout_and_makes_its_missing_parents() {
     write_inbox(
         &rig.entry,
         COMMIT,
-        &[part("kbf-daemon", &macho(MACHO_ARM, "daemon"))],
+        &[part("kbf", &macho(MACHO_ARM, "daemon"))],
     );
     assert!(!rig.at("/usr/local").exists() && !rig.at("/var/db/kbf-deploy").exists());
     let runner = FakeRunner::ok(COMMIT);
     let staged = rig.stage(&runner).expect("staged");
-    assert_eq!(staged.components, ["kbf-daemon"]);
+    assert_eq!(staged.components, ["kbf"]);
 
     assert!(rig.at("/var/db/kbf-deploy/state.json").is_file());
     assert!(rig.at("/var/run/kbf-deploy.lock").is_file());
@@ -742,13 +737,13 @@ fn a_mac_stage_uses_the_mac_layout_and_makes_its_missing_parents() {
             "{dir} is the stage's owner's"
         );
     }
-    let binary = rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf-daemon"));
+    let binary = rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf"));
     assert_eq!(
         fs::read(binary).expect("installed"),
         macho(MACHO_ARM, "daemon")
     );
     assert!(
-        !rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf"))
+        !rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf-daemon"))
             .exists()
     );
     assert_eq!(
@@ -759,6 +754,45 @@ fn a_mac_stage_uses_the_mac_layout_and_makes_its_missing_parents() {
             .map(CommitId::as_str),
         Some(COMMIT)
     );
+}
+
+/// Catches a Mac stage taking a release built for the old darwin layout: the Mac's
+/// LaunchDaemon runs `current/kbf daemon`, and no `kbf-daemon` is built for darwin. An
+/// offer with only `kbf-daemon`, and one with `kbf` and `kbf-daemon`, are refused before
+/// any file is read or tool run (`offer-darwin-daemon`) and nothing is staged. A Linux host still takes `kbf-daemon`
+/// alone, as it always did, and a Mac takes `kbf` alone (the test above).
+///
+/// Mutants seen red: the platform rule dropped (the Mac stages the `kbf-daemon` release
+/// and no code is returned); the rule applied on Linux (the Linux stage is refused).
+#[test]
+fn a_mac_offer_may_not_name_kbf_daemon() {
+    let macho = macho(MACHO_ARM, "daemon");
+    let cases: [(&str, &[Part]); 2] = [
+        ("daemon-only", &[part("kbf-daemon", &macho)]),
+        ("both", &[part("kbf", &macho), part("kbf-daemon", &macho)]),
+    ];
+    for (name, parts) in cases {
+        let mut rig = Rig::new(&format!("stage-mac-offer-{name}"), Platform::MacOs);
+        write_inbox(&rig.entry, COMMIT, parts);
+        let runner = FakeRunner::ok(COMMIT);
+        let err = rig.stage(&runner).expect_err(name);
+        assert_eq!(err.code(), "offer-darwin-daemon", "{name}: {err}");
+        assert!(
+            runner.calls().is_empty(),
+            "{name}: no tool ran: {:?}",
+            runner.calls()
+        );
+        assert!(rig.releases().is_empty(), "{name}: nothing staged");
+    }
+
+    let mut rig = Rig::new("stage-linux-daemon-only", Platform::Linux);
+    write_inbox(
+        &rig.entry,
+        COMMIT,
+        &[part("kbf-daemon", &elf(ELF_X86, "daemon build"))],
+    );
+    let staged = rig.stage(&FakeRunner::ok(COMMIT)).expect("linux staged");
+    assert_eq!(staged.components, ["kbf-daemon"]);
 }
 
 /// Catches the macOS checks being skipped or run out of order: for each offered file
@@ -781,28 +815,28 @@ fn the_mac_checks_run_in_order_and_each_refuses() {
     write_inbox(
         &rig.entry,
         COMMIT,
-        &[part("kbf-daemon", &macho(MACHO_ARM, "daemon"))],
+        &[part("kbf", &macho(MACHO_ARM, "daemon"))],
     );
     let runner = FakeRunner::ok(COMMIT);
     rig.stage(&runner).expect("staged");
     let order: Vec<String> = runner.calls().iter().map(program).collect();
     assert_eq!(
         order,
-        ["xattr", "xattr", "gh", "codesign", "codesign", "kbf-daemon"]
+        ["xattr", "xattr", "gh", "codesign", "codesign", "kbf"]
     );
     let xattr = &runner.calls()[0];
     assert!(
         xattr
             .args
             .iter()
-            .any(|a| a.to_str().is_some_and(|a| a.ends_with("kbf-daemon.tar.gz")))
+            .any(|a| a.to_str().is_some_and(|a| a.ends_with("kbf.tar.gz")))
     );
 
     let mut rig = Rig::new("stage-mac-quarantine", Platform::MacOs);
     write_inbox(
         &rig.entry,
         COMMIT,
-        &[part("kbf-daemon", &macho(MACHO_ARM, "daemon"))],
+        &[part("kbf", &macho(MACHO_ARM, "daemon"))],
     );
     let quarantined = FakeRunner::new(|s| {
         Ok(if s.program.ends_with("xattr") {
@@ -820,7 +854,7 @@ fn the_mac_checks_run_in_order_and_each_refuses() {
     write_inbox(
         &rig.entry,
         COMMIT,
-        &[part("kbf-daemon", &macho(MACHO_ARM, "daemon"))],
+        &[part("kbf", &macho(MACHO_ARM, "daemon"))],
     );
     let unsigned = FakeRunner::new(|s| {
         let verify = s.program.ends_with("codesign") && s.args[0] == "--verify";

@@ -150,7 +150,7 @@ rules the field comments cannot. Numbers in `kbf.worker.v1`: `DaemonMessage.upda
 `name` is `kbf` or `kbf-daemon`. `sha256` is 64 lowercase hex digits of the tarball and is also its name in
 `ReleaseService.Fetch`. `attestation` is the build-provenance bundle (JSON lines, at most 256 KiB) of the tarball.
 
-**Which components a platform needs.** `linux-x86_64`, `linux-arm64`: `kbf`. `darwin-arm64`: `kbf-daemon`. A
+**Which components a platform needs.** `linux-x86_64`, `linux-arm64`: `kbf`. `darwin-arm64`: `kbf` (no darwin `kbf-daemon` is built; the installer refuses a Mac offer that names it). A
 platform is **complete** for a commit when the frontend holds every component it needs, with their attestations.
 
 **UpdateOffer.**

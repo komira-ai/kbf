@@ -361,9 +361,9 @@ gives it **[V]**:
 
 The hosted macOS job (`native-macos`) runs `crates/kbf-vmm/tests/signing.rs` (ignored
 by default, run with `--ignored`): it signs the `kbf-vmm` stub with `sign-darwin`,
-which must apply the entitlement and pass, and a copy named `kbf-daemon`, which must
+which must apply the entitlement and pass, and a copy named `kbf`, which must
 pass with none; `darwin-asset` must accept both packaged. It then signs copies by hand
-and requires the check and `darwin-asset` to refuse each: `kbf-daemon` with the
+and requires the check and `darwin-asset` to refuse each: `kbf` with the
 virtualization entitlement, `kbf-mac-session` with `get-task-allow`, `kbf-vmm` with
 `get-task-allow` as well, `kbf-vmm` with none, `kbf-vmm` with `get-task-allow` in its
 place, and any binary when the list is missing (which `sign-darwin` must refuse
