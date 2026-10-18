@@ -2149,6 +2149,7 @@ dependencies = [
  "tracing-core",
  "tracing-subscriber",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -2312,6 +2313,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
