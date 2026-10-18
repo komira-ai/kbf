@@ -23,7 +23,7 @@ ConditionPathExists=/etc/kbf/kbf.toml
 StartLimitIntervalSec=0
 
 [Service]
-# The daemon half runs rootless Podman as the kbf user.
+# The daemon half runs its containers rootless, with crun, as the kbf user.
 User=kbf
 Slice=kbf.slice
 # kbf's own state: /var/lib/kbf, created for the unit's user by systemd; kbf-installer never
@@ -39,8 +39,6 @@ OOMScoreAdjust=-925
 LimitNOFILE=1048576
 CPUWeight=300
 # No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
-# %U is the uid of User=: rootless Podman's runtime directory.
-Environment=XDG_RUNTIME_DIR=/run/user/%U
 # One unit, one process, one user: the cold store's key is not read from an
 # EnvironmentFile= (check-units rule `credential`); kbf.toml names where kbf gets it. The
 # user builds run as can read what this process reads, so this unit is for a trusted

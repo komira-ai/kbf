@@ -46,12 +46,6 @@ pub fn needs(invocation: &Invocation) -> Needs {
             let mut n = Needs::new("storage-and-daemon");
             storage(&mut n, &flags.storage);
             daemon(&mut n, &flags.daemon);
-            n.meta_and_data = flags
-                .storage
-                .server
-                .meta_dir
-                .clone()
-                .map(|meta| (meta, flags.daemon.data_dir()));
             n
         }
         Invocation::AllInOne(flags) => {
@@ -59,11 +53,6 @@ pub fn needs(invocation: &Invocation) -> Needs {
             server_files(&mut n, &flags.server);
             n.s3 = s3(&flags.server);
             daemon(&mut n, &flags.daemon);
-            n.meta_and_data = flags
-                .server
-                .meta_dir
-                .clone()
-                .map(|meta| (meta, flags.daemon.data_dir()));
             n
         }
     }
@@ -76,7 +65,6 @@ impl Needs {
             files: Vec::new(),
             certs: Vec::new(),
             s3: false,
-            meta_and_data: None,
             container: None,
         }
     }

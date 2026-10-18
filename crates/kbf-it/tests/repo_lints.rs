@@ -23,6 +23,11 @@
 //! - an asset `.github/workflows/artifacts.yml` packages with no `actions/attest-sbom`
 //!   step for it and its own SBOM in the attest job, or such a step for an asset no
 //!   job packages (module `attested_assets`);
+//! - a tarball `.github/workflows/artifacts.yml` packages that is not attested as its
+//!   own subject, whose bundle is not named after it, uploaded, downloaded by the verify
+//!   job and the release workflow, and listed by `release locate`, or a release verify
+//!   that does not check the bundles offline for the release's commit (module
+//!   `attested_bundles`);
 //! - the artifacts workflow no longer building the pinned release set (`kbf` for
 //!   three platforms, `kbf-deploy` for macOS too), signing and attesting only on pushes
 //!   to `main` and `feature/arch-v2`, checking `kbf --version --json` (on the binary
@@ -37,6 +42,7 @@
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
 mod attested_assets;
+mod attested_bundles;
 mod coverage_wiring;
 mod interpreters;
 mod release_artifacts;

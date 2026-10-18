@@ -35,7 +35,7 @@
 //! - after the server ends a stream, nothing more is read from it;
 //! - a `MapRequest` is answered with a `MapUpdate` of the storage map the server holds
 //!   now, when it holds one (the `map_push` module);
-//! - an `Offer` is not read yet.
+//! - an `Offer` and an `UpdateStatus` are not read yet.
 //!
 //! A server given a [`MapSource`] ([`WorkerService::with_map`]) names its map in
 //! `Welcome`, and sends a `MapUpdate` each time the source's map changes.
@@ -291,7 +291,10 @@ impl Session {
                     .await?;
                 self.map.answer()
             }
-            Some(daemon_message::Message::Offer(_)) => None,
+            // Read by a later change (`docs/design/pull-updates.md`).
+            Some(daemon_message::Message::Offer(_) | daemon_message::Message::UpdateStatus(_)) => {
+                None
+            }
             None => {
                 tracing::warn!(%worker, "an empty daemon message ignored");
                 None

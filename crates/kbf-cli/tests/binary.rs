@@ -6,6 +6,8 @@ use std::process::Command;
 use kbf_cli::names;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
+#[cfg(target_os = "linux")]
+const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
     run_with(args, &[])
@@ -317,14 +319,12 @@ fn daemon_runs_the_daemons_start() {
 #[test]
 fn all_in_one_runs_both_halves_start() {
     let [ca, cert, key] = daemon_files("all_in_one_runs_both_halves_start");
-    // The container driver's host, as the self-checks want it: a `podman` on PATH and the
-    // user's runtime directory (neither is run; the start stops at the cold store).
+    // The container driver's host, as the self-checks want it: a `crun` that answers
+    // `--version` (never run otherwise; the start stops at the cold store).
     let dir = scratch("all_in_one_runs_both_halves_start_host");
-    let podman = dir.join("podman");
-    std::fs::write(&podman, "").expect("write");
-    std::fs::set_permissions(&podman, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .expect("mode");
-    let (path, xdg) = (dir.display().to_string(), dir.display().to_string());
+    let crun = dir.join("crun");
+    std::os::unix::fs::symlink(FAKE_CRUN, &crun).expect("link crun");
+    let runtime = format!("--oci-runtime={}", crun.display());
     let (code, _, err) = run_with(
         &[
             names::ALL_IN_ONE,
@@ -334,11 +334,12 @@ fn all_in_one_runs_both_halves_start() {
             &cert,
             &key,
             "--node-id=n",
+            &runtime,
             "--listen=127.0.0.1:0",
             "--worker-listen=127.0.0.1:0",
             "--cold-store=file:///proc/nonexistent/cold",
         ],
-        &[("PATH", &path), ("XDG_RUNTIME_DIR", &xdg)],
+        &[],
     );
     assert_eq!(code, Some(2), "{err}");
     assert_eq!(err.lines().last(), Some(ALL_IN_ONE_REFUSAL));

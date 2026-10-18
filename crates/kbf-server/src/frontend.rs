@@ -125,6 +125,7 @@ pub const ALLOWED: &[&str] = &[
     "worker_listen",
     "api_listen",
     "api_token_file",
+    "releases_dir",
     "readyz_store_timeout_ms",
     "worker_tls_cert",
     "worker_tls_key",
@@ -899,15 +900,17 @@ impl<'a> Prepared<'a> {
         let (worker_incoming, worker_latch) = worker.grpc(worker_tls)?;
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
+        let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
         let api_routes = crate::api::router(
             Arc::clone(&farm),
-            api.and_then(|api| api.token),
+            token.clone(),
             Arc::clone(&drain),
             members.clone(),
             // The enroll service and the CA that gives it a pin come with the frontend's
             // enroll listener; until it exists, the enrollment routes answer 404.
             None,
         )
+        .merge(crate::release::router(releases.clone(), token))
         .merge(crate::health::router_of(Arc::clone(&checks)))
         .merge(metrics_route(
             backend.clone(),
@@ -1045,6 +1048,7 @@ impl<'a> Prepared<'a> {
             let worker_stopped = worker_stop.fired();
             let worker_serve = worker_server
                 .add_service(worker_service)
+                .add_service(crate::release::service(releases))
                 .add_optional_service(membership)
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
             // Told when the REAPI listener is done (see `serve::stop_api`).

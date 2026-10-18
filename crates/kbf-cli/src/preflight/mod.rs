@@ -20,8 +20,7 @@
 //! - each certificate's private key is PEM, of a kind TLS can sign with, and the pair of the
 //!   certificate's public key ([`certs`]);
 //! - the cold store's S3 key pair is in the environment ([`env`]);
-//! - `--meta-dir` is not inside `--data-dir` ([`env`]);
-//! - the container driver's `podman`, `crun` and the user's runtime directory ([`env`]);
+//! - the container driver's `crun` ([`env`]);
 //! - the open-file limit in force is the floor the units set ([`env`], a warning).
 //!
 //! What it does not repeat, because the mode already refuses it with its fix: subordinate
@@ -182,8 +181,8 @@ pub struct CertNeed {
 /// What the container driver runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContainerNeed {
-    /// `--oci-runtime`, when the driver runs containers itself.
-    pub oci_runtime: Option<PathBuf>,
+    /// `--oci-runtime`: the program that runs the containers.
+    pub oci_runtime: PathBuf,
 }
 
 /// What one invocation asks of its host.
@@ -197,8 +196,6 @@ pub struct Needs {
     pub certs: Vec<CertNeed>,
     /// The cold store is S3: its key pair is in the environment.
     pub s3: bool,
-    /// `--meta-dir` and the data directory it must not be inside.
-    pub meta_and_data: Option<(PathBuf, PathBuf)>,
     /// The container driver runs.
     pub container: Option<ContainerNeed>,
 }

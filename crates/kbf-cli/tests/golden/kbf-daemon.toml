@@ -16,8 +16,6 @@ container-nofile = 65536
 container-nproc = 32768
 # Each container's `pids.max`: its tasks, threads included (container)
 container-pids-limit = 8192
-# The runtime that runs each action's container (container): `podman`, the default, runs `podman create` and `podman start` per action; `oci` runs each action in a fresh rootless sandbox through `--oci-runtime` directly, with no Podman on the action path (Podman only pulls and exports an image once per digest). `oci` needs the daemon user's subordinate ids in one range, `uidmap`, and every directory down to `--data-dir` searchable by others
-container-runtime = "podman"
 # The size of each container's `/dev/shm`, in MiB (container)
 container-shm-mib = 64
 # A directory holding `passwd`, `subuid` and `subgid` that the container driver's startup check reads instead of `/etc`'s. For tests of that check only
@@ -34,7 +32,7 @@ lease-swap-poll-ms = 1000
 # Where the kernel lists NUMA nodes (container). For tests of the placement only
 # (not in --help)
 numa-dir = "/sys/devices/system/node"
-# The OCI runtime `--container-runtime=oci` runs actions with (container)
+# The OCI runtime that runs each action's container (container): `crun`, run directly. Each action gets a fresh rootless sandbox. It needs the daemon user's subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on `PATH`, and every directory down to `--data-dir` searchable by others
 oci-runtime = "/usr/bin/crun"
 # Where the kernel reports memory pressure stall information. For tests only
 # (not in --help)
@@ -60,7 +58,7 @@ daemon-user = "_kbf"
 # data-max-bytes = "BYTES"
 # How leases run; once per runtime. The daemon runs each lease on the driver that serves its kind and refuses to start when two serve the same kind. The node's own driver (native or container) is set up first, whatever the order given
 # driver = []
-# A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon checks each is in its user's image store, as the prepare step of every lease does, and exits with status 2 if one is not, or names an image index, saying the fix (`podman pull <repo>@sha256:<d>`). The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
+# A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 # image = []
 # The longest wait between rounds of connection attempts, in milliseconds. Each wait is jittered down by up to half
 reconnect-max-ms = 30000
@@ -70,6 +68,8 @@ reconnect-ms = 1000
 # reserve-cpus = "N"
 # How many of the farm's processes on this host share the reserve: the daemon sizes its pools from `reserve / share` CPUs. Default 1
 # reserve-share = "N"
+# The update directory: the daemon fetches the release the frontend offers into its `inbox/`, over the connection `--cas` names, and reads the root helper's `status.json` there. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
+# update-dir = "DIR"
 
 [identity]
 # PEM file of the CA certificates that sign server certificates
