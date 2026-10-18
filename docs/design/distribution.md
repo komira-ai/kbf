@@ -259,10 +259,10 @@ Order:
    token once to a root-only file and prints the file's path, never the secret; it creates none once any
    operator token exists. Open: an authenticated remote mode (token and TLS on a separate
    operator listener) with its own threat model, before any remote client is built.
-2. **The darwin component rename.** Decided: later. The Mac component stays `kbf-daemon` (wire frozen) until a
-   release needs the rename; then it is one coordinated change with the signing allow-list
-   (`tools/ci/darwin-entitlements.txt`, `sign-darwin`) and an explicit contract version bump, before the
-   `kbf-daemon` binary is deleted.
+2. **The darwin component rename.** Decided: the darwin release component is `kbf`, and the Mac runs
+   `kbf --mode=daemon`; `kbf-mac-provision` moves to the same layout. The rename is one coordinated change with the
+   signing allow-list (`tools/ci/darwin-entitlements.txt`, `sign-darwin`) and an explicit contract version bump,
+   before the `kbf-daemon` binary is deleted.
 3. **How a frontend host gets Envoy.** Decided: host preparation installs it (frontend and all-in-one hosts
    only); setup checks it against the tested range (section 5). The release never carries it and the installer
    never fetches it.
