@@ -11,6 +11,11 @@
 //!     timeout. The probe only reads (`get_range` of one byte), so a poll never writes
 //!     to the bucket; an absent key is an answer, and so passes.
 //!
+//! Once the server has handed over ([`Readiness::set_handed_over`]) the probes are not
+//! asked and the check passes on `stopping` and `leader` alone: its stores are frozen or
+//! answered through a successor, so a probe could fail or wait out its timeout while the
+//! server is still the one to answer open calls (`docs/design/aio-handover.md`).
+//!
 //! The routes are served by the same future as the REAPI and worker listeners, which
 //! are bound before it runs and stop when it returns, so an answer from either route
 //! means both listeners are bound.
@@ -57,6 +62,7 @@ pub const STORE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Readiness {
     stopping: AtomicBool,
     leader: AtomicBool,
+    handed_over: AtomicBool,
     changed: tokio::sync::watch::Sender<()>,
 }
 
@@ -67,16 +73,38 @@ impl Default for Readiness {
         Self {
             stopping: AtomicBool::new(false),
             leader: AtomicBool::new(true),
+            handed_over: AtomicBool::new(false),
             changed: tokio::sync::watch::Sender::new(()),
         }
     }
 }
 
 impl Readiness {
-    /// A stop signal has been received: `/readyz` answers 503 from now on.
-    pub fn stop(&self) {
-        self.stopping.store(true, Ordering::SeqCst);
-        self.changed.send_replace(());
+    /// A stop signal has been received: `/readyz` answers 503 from now on. Returns
+    /// whether this call was the first.
+    pub fn stop(&self) -> bool {
+        let first = !self.stopping.swap(true, Ordering::SeqCst);
+        if first {
+            self.changed.send_replace(());
+        }
+        first
+    }
+
+    /// This server has handed its roles to a successor: [`Checks::failing`] stops asking
+    /// the probes. Readiness is otherwise untouched (it stays ready), and nothing undoes
+    /// it. Returns whether this call was the first.
+    pub fn set_handed_over(&self) -> bool {
+        let first = !self.handed_over.swap(true, Ordering::SeqCst);
+        if first {
+            self.changed.send_replace(());
+        }
+        first
+    }
+
+    /// Whether [`Readiness::set_handed_over`] has been called.
+    #[must_use]
+    pub fn is_handed_over(&self) -> bool {
+        self.handed_over.load(Ordering::SeqCst)
     }
 
     /// Whether a stop signal has been received.
@@ -98,8 +126,8 @@ impl Readiness {
         self.leader.load(Ordering::SeqCst)
     }
 
-    /// A receiver that is marked changed whenever [`Readiness::stop`] or
-    /// [`Readiness::set_leader`] runs after this call.
+    /// A receiver that is marked changed whenever [`Readiness::stop`],
+    /// [`Readiness::set_handed_over`] or [`Readiness::set_leader`] runs after this call.
     #[must_use]
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
         self.changed.subscribe()
@@ -186,6 +214,13 @@ impl Checks {
     /// The checks that fail now, in the order the route lists them; empty when the
     /// server is ready. Asks each probe once.
     pub async fn failing(&self) -> Vec<Failing> {
+        self.failing_except(&[]).await
+    }
+
+    /// [`Checks::failing`] without asking the probes named in `skip`: what a caller that
+    /// does not depend on them (a frontend's `READY=1`, which does not wait on storage)
+    /// waits for.
+    pub async fn failing_except(&self, skip: &[&str]) -> Vec<Failing> {
         let mut failing = Vec::new();
         if self.readiness.is_stopping() {
             failing.push(Failing {
@@ -199,7 +234,13 @@ impl Checks {
                 reason: "this server does not hold the scheduler role".to_owned(),
             });
         }
+        if self.readiness.is_handed_over() {
+            return failing;
+        }
         for (check, probe) in &self.probes {
+            if skip.contains(check) {
+                continue;
+            }
             if let Err(reason) = probe.probe().await {
                 failing.push(Failing { check, reason });
             }
