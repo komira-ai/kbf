@@ -247,3 +247,28 @@ fn a_frontend_process_with_a_sqlite_state_store_is_ready_and_holds_the_file() {
     assert!(second.stdout.is_empty());
     assert!(front.stop().is_some_and(|status| status.success()));
 }
+
+/// Catches a frontend process started with a Postgres `--state-store` that dies at start
+/// (the blocking client run inside the server's tokio runtime panicked with "Cannot start
+/// a runtime from within a runtime"), or that starts and does not create its tables in
+/// the database (the `kv` table is read back), or whose `/readyz` is not 200 over the
+/// store. Needs a Postgres server: `KBF_TEST_POSTGRES_URL` names a database the test may
+/// create the `kbf_state` schema in.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn a_frontend_process_with_a_postgres_state_store_is_ready_and_has_made_its_tables() {
+    let url = std::env::var("KBF_TEST_POSTGRES_URL")
+        .expect("KBF_TEST_POSTGRES_URL names a database the test may create schemas in");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("frontend-postgres-{}", std::process::id()));
+    let node = node(&dir);
+    let flag = format!("--state-store={url}");
+    let mut front = frontend(&node.field("storage="), &[&flag]);
+    let (code, body) = get(&front.field("api="), "/readyz");
+    assert_eq!(code, 200, "{body}");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
+    client
+        .query_one("SELECT count(*) FROM kbf_state.kv", &[])
+        .expect("the frontend created its tables in the database");
+    assert!(front.stop().is_some_and(|status| status.success()));
+}

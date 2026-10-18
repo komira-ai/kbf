@@ -74,6 +74,8 @@ kbf-transfer.workspace = true
 kbf-daemon.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic.workspace = true
+# The state-postgres job's process test reads the frontend's tables back (tests/frontend_process.rs).
+postgres.workspace = true
 # `kbf storage-and-daemon` running an action (tests/storage_and_daemon.rs): the act steps
 # it runs through this test binary, the REAPI messages (the node's certificates are made
 # with rcgen, below); the image store layout the stand-in `crun` runs over is

@@ -324,6 +324,8 @@ jobs:
       # farm's restart tests run on a schema of their own (`over_postgres` in tests/state_store.rs).
       - run: cargo test -p kbf-server --locked --test state_store_postgres -- --include-ignored
       - run: cargo test -p kbf-server --locked --test state_store -- --include-ignored over_postgres
+      # A frontend process started with a Postgres --state-store reaches /readyz.
+      - run: cargo test -p kbf-cli --locked --test frontend_process -- --include-ignored postgres_state_store
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

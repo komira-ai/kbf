@@ -9,8 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use postgres::NoTls;
-
+use super::conn::Conn;
 use super::{Flaw, PostgresConfig, PostgresStore};
 use crate::clock::ManualClock;
 use crate::conformance::Backend;
@@ -85,7 +84,7 @@ impl Drop for PostgresBackend {
         let Ok(config) = PostgresConfig::parse(&self.url) else {
             return;
         };
-        let Ok(mut client) = config.pg.connect(NoTls) else {
+        let Ok(mut client) = Conn::connect(&config.pg) else {
             return;
         };
         for schema in schemas.iter() {

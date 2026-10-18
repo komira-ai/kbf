@@ -101,14 +101,14 @@ fn a_flag_opened_postgres_store_takes_generations_and_epochs_as_sqlite_does() {
         .err()
         .expect("not the generation");
     assert!(
-        matches!(&refused, StateError::Open(why) if why.contains("generation 3, not the expected 99")),
+        matches!(&refused, StateError::Open(why) if why.contains("generation 2, not the expected 99")),
         "{refused:?}"
     );
     let successor = uri
-        .open_after_handover(3)
+        .open_after_handover(2)
         .expect("the generation it was told");
     assert_eq!(successor.epoch, EpochPolicy::Keep);
-    assert_eq!(generation(&successor), 4);
+    assert_eq!(generation(&successor), 3);
     assert_eq!(
         farm_over(successor).lease_epoch(),
         bumped,

@@ -30,6 +30,7 @@
 
 #[cfg(any(test, feature = "test-support"))]
 mod backend;
+mod conn;
 mod session;
 mod tx;
 

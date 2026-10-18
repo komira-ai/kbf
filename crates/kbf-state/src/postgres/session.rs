@@ -6,9 +6,10 @@
 use std::ops::{Bound, Deref, DerefMut};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
-use postgres::{Client, Config, NoTls, Statement};
+use postgres::{Config, Statement};
 
 use super::Fail;
+use super::conn::Conn;
 
 /// The time of the store's clock in microseconds since the Unix epoch, as SQL: the value
 /// of parameter `$n` when it is not NULL (a test's injected clock), else the database's
@@ -63,7 +64,7 @@ pub(super) struct Statements {
 }
 
 impl Statements {
-    fn prepare(client: &mut Client) -> Result<Statements, postgres::Error> {
+    fn prepare(client: &mut Conn) -> Result<Statements, postgres::Error> {
         let now = now_sql(2);
         let claim = |tail: &str| {
             format!(
@@ -208,7 +209,7 @@ impl RangeShape {
 
 /// One connection and its prepared statements.
 pub(super) struct Session {
-    pub client: Client,
+    pub client: Conn,
     pub st: Statements,
     /// Set when the connection is in an unknown state; the pool drops it.
     pub broken: bool,
@@ -246,7 +247,7 @@ fn schema_sql(schema: &str) -> String {
 }
 
 fn connect(config: &Config, schema: &str, create: bool) -> Result<Session, Fail> {
-    let mut client = config.connect(NoTls)?;
+    let mut client = Conn::connect(config)?;
     let setting: String = client.query_one("SHOW synchronous_commit", &[])?.get(0);
     if !matches!(setting.as_str(), "on" | "remote_apply") {
         return Err(Fail::Refused(format!(
