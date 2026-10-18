@@ -542,7 +542,7 @@ fn a_leftover_or_unknown_placeholder_is_refused() {
     };
     assert_eq!(
         refused(Which::Daemon, "Restart=on-failure", "Restart=@KBF_RESTART@").as_deref(),
-        Some("kbf-daemon.service:34: placeholder @KBF_RESTART@ has no value")
+        Some("kbf-daemon.service:36: placeholder @KBF_RESTART@ has no value")
     );
     assert_eq!(
         refused(
@@ -551,7 +551,7 @@ fn a_leftover_or_unknown_placeholder_is_refused() {
             "    --reapi-tls-cert=@KBF_ETC/"
         )
         .as_deref(),
-        Some("kbf-server.service:26: an @ that starts no @KEY@ placeholder")
+        Some("kbf-server.service:28: an @ that starts no @KEY@ placeholder")
     );
     assert_eq!(
         refused(
@@ -561,7 +561,7 @@ fn a_leftover_or_unknown_placeholder_is_refused() {
         )
         .as_deref(),
         Some(
-            "kbf-daemon.service:23: @DAEMON_IMAGE_ARGS@ stands for whole lines and must be alone on its line"
+            "kbf-daemon.service:25: @DAEMON_IMAGE_ARGS@ stands for whole lines and must be alone on its line"
         )
     );
 

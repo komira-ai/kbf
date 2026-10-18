@@ -80,6 +80,6 @@ pub use closure::{ClosureStats, DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL};
 pub use nodes::{Liveness, Nodes, TlsNodes};
 pub use repair::{ReadRepair, RepairLimit};
 pub use resume::MAX_RESUMES;
-pub use router::{DEFAULT_COPY_BYTES, Placement, Router};
+pub use router::{DEFAULT_COPY_BYTES, MAX_MAP_REFETCHES, Placement, Router};
 pub use sink::{BlobSink, IntoError};
 pub use source::{MapSource, MapView, RefetchError};
