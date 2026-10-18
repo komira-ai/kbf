@@ -35,6 +35,8 @@ pub mod fake;
 mod fence;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(any(test, feature = "test-support"))]
+pub mod recording;
 pub mod sqlite;
 mod store;
 mod types;
@@ -43,7 +45,7 @@ use std::time::Duration;
 
 pub use clock::{Clock, ManualClock, StoreTime, SystemClock};
 pub use fence::{Fenced, GENERATION, TakeError};
-pub use store::Store;
+pub use store::{LivenessGuard, Store};
 pub use types::{
     Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Op, ResumeToken,
     Revision, ScanPage, ScanRange, StoreError, Txn, Version, Versioned,

@@ -10,6 +10,29 @@ use crate::types::{
     StoreError, Txn, Versioned,
 };
 
+/// Keeps a holder's liveness announcement ([`Store::hold_liveness`]) up. Dropping it
+/// takes the announcement down; so does the death of the process that owns it.
+#[must_use = "dropping the guard ends the liveness announcement at once"]
+pub struct LivenessGuard {
+    _held: Box<dyn Send + Sync>,
+}
+
+impl LivenessGuard {
+    /// A guard that keeps `held` alive; dropping the guard drops it. A backend passes
+    /// whatever owns the announcement (for Postgres, the dedicated connection).
+    pub fn new(held: impl Send + Sync + 'static) -> LivenessGuard {
+        LivenessGuard {
+            _held: Box::new(held),
+        }
+    }
+}
+
+impl std::fmt::Debug for LivenessGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LivenessGuard")
+    }
+}
+
 /// A durable, ordered key-value store with transactions, counters, time-to-live keys and
 /// a change feed. The contract is clauses C1 to C8 of the architecture design; the
 /// `conformance` module (feature `test-support`) is the executable form every backend
@@ -115,6 +138,35 @@ pub trait Store: Send + Sync {
             }));
         }
         self.reap_expired().map(Ok)
+    }
+
+    /// Announces that the holder of `generation` is alive, for as long as the returned
+    /// guard lives or the process does: whoever asks [`Store::holder_alive`] for that
+    /// generation, from any session, is told yes. The announcement is released when the
+    /// guard is dropped, and by the backend itself when the process or its connection
+    /// dies, so "the holder is dead" is never a guess from a pid. The guard owns its own
+    /// connection to the backend, outside any pool, and nothing else uses it.
+    ///
+    /// # Errors
+    /// [`StoreError`] when the backend cannot announce (the default: only Postgres can,
+    /// with a session advisory lock), or when `generation` already has a live holder.
+    fn hold_liveness(&self, generation: u64) -> Result<LivenessGuard, StoreError> {
+        let _ = generation;
+        Err(StoreError::Failed(
+            "this backend cannot announce a holder's liveness".to_owned(),
+        ))
+    }
+
+    /// Whether the holder of `generation` is alive: whether some session holds the
+    /// announcement of [`Store::hold_liveness`] for it right now.
+    ///
+    /// # Errors
+    /// [`StoreError`] when the backend cannot tell (the default) or fails.
+    fn holder_alive(&self, generation: u64) -> Result<bool, StoreError> {
+        let _ = generation;
+        Err(StoreError::Failed(
+            "this backend cannot tell whether a holder is alive".to_owned(),
+        ))
     }
 
     /// The commit counters.

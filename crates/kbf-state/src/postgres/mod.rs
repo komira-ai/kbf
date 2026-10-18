@@ -35,10 +35,11 @@ mod tx;
 
 use std::fmt;
 use std::ops::Bound;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use postgres::NoTls;
 use postgres::config::SslMode;
 use postgres::error::SqlState;
 use postgres::types::ToSql;
@@ -49,7 +50,7 @@ use session::{Edge, Pool, RangeShape, Session};
 use tx::{Level, Row, Tx, micros};
 
 use crate::clock::{Clock, StoreTime};
-use crate::store::{Span, Store, page_of};
+use crate::store::{LivenessGuard, Span, Store, page_of};
 use crate::{
     Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Revision, ScanPage,
     ScanRange, StoreError, Txn, Version, Versioned,
@@ -358,6 +359,11 @@ impl PostgresStore {
         Ok(store)
     }
 
+    /// The text the liveness lock of `generation` is derived from.
+    fn liveness_key(&self, generation: u64) -> String {
+        format!("kbf-state/holder/{}/{generation}", self.config.schema)
+    }
+
     fn over(&self) -> Option<i64> {
         self.clock.as_ref().map(|clock| from_time(clock.now()))
     }
@@ -619,6 +625,49 @@ impl Store for PostgresStore {
             }
             Ok(verdict)
         })
+    }
+
+    /// A session-level advisory lock on a connection of its own, held until the guard is
+    /// dropped or the server sees the connection die. Locks are per database, so the key
+    /// names the schema and the generation.
+    fn hold_liveness(&self, generation: u64) -> Result<LivenessGuard, StoreError> {
+        let key = self.liveness_key(generation);
+        let mut pg = self.config.pg.clone();
+        let app = format!(
+            "{}-holder",
+            self.config.pg.get_application_name().unwrap_or("kbf-state")
+        );
+        pg.application_name(&app);
+        let mut client = pg
+            .connect(NoTls)
+            .map_err(|err| Fail::Pg(err).into_store())?;
+        let got: bool = client
+            .query_one(
+                "SELECT pg_try_advisory_lock(hashtextextended($1, 0))",
+                &[&key],
+            )
+            .map_err(|err| Fail::Pg(err).into_store())?
+            .get(0);
+        if !got {
+            return Err(StoreError::Failed(format!(
+                "generation {generation} already has a live holder"
+            )));
+        }
+        Ok(LivenessGuard::new(Mutex::new(client)))
+    }
+
+    /// Tries the same lock from a pooled connection for the length of one statement
+    /// (transaction level, so it cannot be left behind): got it means no session holds it.
+    fn holder_alive(&self, generation: u64) -> Result<bool, StoreError> {
+        let key = self.liveness_key(generation);
+        let free = self.read(|s| {
+            let row = s.client.query_one(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&key],
+            )?;
+            Ok(row.get::<_, bool>(0))
+        })?;
+        Ok(!free)
     }
 
     fn commit_stats(&self) -> CommitStats {
