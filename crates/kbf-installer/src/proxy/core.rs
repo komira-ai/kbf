@@ -202,6 +202,11 @@ impl Core {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn set_hook(&mut self, hook: Box<dyn CrashHook>) {
+        self.parts.hook = hook;
+    }
+
     /// `POST /v1/update/frontend`.
     pub fn post(&mut self, req: UpdateRequest) -> Result<Reply, Fault> {
         valid_request_id(&req.request_id)?;
@@ -601,14 +606,11 @@ impl Core {
             .supervisor
             .force_retire(reason)
             .map_err(ApiError::from)?;
-        tracing::warn!(
-            reason,
-            dropped = retired.dropped_streams,
-            "old child force-retired"
-        );
+        let dropped = retired.dropped_streams;
+        tracing::warn!(reason, dropped, "old child force-retired");
         Ok(Reply::Retired {
             update_id: sup.update.map(|u| u.update_id),
-            dropped_streams: retired.dropped_streams,
+            dropped_streams: dropped,
         })
     }
 

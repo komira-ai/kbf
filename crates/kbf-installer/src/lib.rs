@@ -33,6 +33,8 @@
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
 //! - [`envoy`]: the Envoy of a frontend host, rendered from settings and checked (a library
 //!   for the frontend-update path, with no command line).
+//! - [`proxy`]: the update API of the frontend proxy (routes, bearer-token check, the actor
+//!   that owns one update, idempotent request ids), against traits; it binds no socket.
 //! - [`run`]: the one place a process is started, behind a trait a test plays.
 //! - [`refusal`]: every way a stage is refused, one enum with a stable code per case.
 //!

@@ -296,3 +296,46 @@ fn the_system_clock_moves_forward() {
     assert!(clock.mono_ms() >= a);
     assert!(clock.wall_s() > 1_700_000_000);
 }
+
+#[test]
+fn the_default_rate_limit_allows_a_burst_of_twenty() {
+    assert_eq!(
+        RateLimit::default(),
+        RateLimit {
+            burst: 20,
+            per_second: 5
+        }
+    );
+}
+
+#[test]
+fn a_panic_while_the_limiter_is_held_does_not_lock_everyone_out() {
+    use std::sync::atomic::AtomicBool;
+    struct PanicsOnce(AtomicBool);
+    impl Clock for PanicsOnce {
+        fn mono_ms(&self) -> u64 {
+            if self.0.swap(false, Ordering::SeqCst) {
+                panic!("a clock that failed once");
+            }
+            0
+        }
+
+        fn wall_s(&self) -> u64 {
+            0
+        }
+    }
+    let auth = BearerAuth::new(
+        Box::new(FakeTokens(Mutex::new(Some(TOKEN.to_owned())))),
+        Box::new(Sha256Hasher),
+        Arc::new(PanicsOnce(AtomicBool::new(true))),
+        big(),
+    );
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        auth.authorize(&request("/x", &[&bearer(TOKEN)]))
+    }));
+    assert!(first.is_err());
+    assert_eq!(
+        auth.authorize(&request("/x", &[&bearer(TOKEN)])),
+        Ok(Principal::Operator)
+    );
+}

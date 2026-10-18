@@ -374,6 +374,13 @@ async fn auth_guards_every_route_and_nothing_runs_without_it() {
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "{m} {p}");
         assert_eq!(parse(&none)["error"], parse(&wrong)["error"]);
     }
+    let mut twice = call(Method::GET, U, Value::Null, Some(TOKEN));
+    twice
+        .headers_mut()
+        .append("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    let resp = h.router.call(twice).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(parse(&resp)["error"], "malformed_credentials");
     let q = h
         .router
         .call(call(
@@ -568,7 +575,11 @@ async fn tick_moves_a_staging_update_without_anyone_asking() {
         tokio::task::yield_now().await;
     }
     assert_eq!(rig.sup.starts(), 1);
+    // With every handle gone the actor ends.
     drop(api);
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test]

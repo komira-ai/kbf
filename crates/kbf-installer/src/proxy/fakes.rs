@@ -98,6 +98,22 @@ pub struct SupState {
     pub starts: Vec<UpdateSpec>,
     pub calls: Vec<&'static str>,
     pub start_fails: bool,
+    /// The error the next abort, rollback or force-retire answers with.
+    pub fail: Option<SupervisorError>,
+}
+
+impl SupState {
+    /// Ends the open update (abort and rollback both do), or fails as told.
+    fn end(&mut self, call: &'static str) -> Result<Phase, SupervisorError> {
+        self.calls.push(call);
+        if let Some(e) = self.fail.take() {
+            return Err(e);
+        }
+        for u in self.status.update.iter_mut() {
+            u.phase = Phase::RolledBack;
+        }
+        Ok(Phase::RolledBack)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -139,7 +155,7 @@ impl Supervisor for FakeSupervisor {
         s.starts.push(spec.clone());
         s.status.update = Some(RunningUpdate {
             update_id: spec.update_id.clone(),
-            from: spec.from.clone().unwrap_or_else(|| c(A)),
+            from: spec.from.clone().unwrap_or(c(A)),
             to: spec.to.clone(),
             phase: Phase::Preflight,
             since_s: 1_800_000_000,
@@ -153,32 +169,19 @@ impl Supervisor for FakeSupervisor {
     }
 
     fn abort(&mut self) -> Result<Phase, SupervisorError> {
-        let mut s = self.0.lock().unwrap();
-        s.calls.push("abort");
-        match s.status.update.as_mut().filter(|u| u.phase.is_open()) {
-            Some(u) => {
-                u.phase = Phase::RolledBack;
-                Ok(Phase::RolledBack)
-            }
-            None => Err(SupervisorError::NotOpen),
-        }
+        self.0.lock().unwrap().end("abort")
     }
 
     fn rollback(&mut self) -> Result<Phase, SupervisorError> {
-        let mut s = self.0.lock().unwrap();
-        s.calls.push("rollback");
-        match s.status.update.as_mut().filter(|u| u.phase.is_open()) {
-            Some(u) => {
-                u.phase = Phase::RolledBack;
-                Ok(Phase::RolledBack)
-            }
-            None => Err(SupervisorError::NotOpen),
-        }
+        self.0.lock().unwrap().end("rollback")
     }
 
     fn force_retire(&mut self, _reason: &str) -> Result<Retired, SupervisorError> {
         let mut s = self.0.lock().unwrap();
         s.calls.push("force_retire");
+        if let Some(e) = s.fail.take() {
+            return Err(e);
+        }
         let dropped = s
             .status
             .update

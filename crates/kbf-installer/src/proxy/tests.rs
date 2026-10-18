@@ -4,11 +4,14 @@
 
 use hyper::StatusCode;
 
-use super::core::{ApiError, Core, CrashPoint, Fault, Reply};
+use super::core::{ApiError, Core, Crash, CrashHook, CrashPoint, Fault, NoCrash, Reply};
 use super::fakes::{COMMIT_C, Rig, facts, idle, req, staged};
 use super::model::{OldChild, OrderVerb, Phase, RollbackBlocked, StatusBody, UpdateId};
 use super::refusal;
-use super::traits::{Compat, InstallerState, InstallerStatus, JsonFileStatus, StatusReader};
+use super::traits::{
+    Compat, CompatGate, InstallerState, InstallerStatus, JsonFileStatus, StatusReader, StubGate,
+    SupervisorError,
+};
 use crate::testkit::{A, B, c};
 
 fn accepted(r: Result<Reply, Fault>) -> (UpdateId, Phase) {
@@ -746,4 +749,140 @@ fn phases_order_and_the_abort_boundary() {
         serde_json::to_string(&Phase::RolledBack).unwrap(),
         "\"rolled_back\""
     );
+}
+
+#[test]
+fn a_request_this_process_no_longer_tracks_is_retired_not_restarted() {
+    let rig = Rig::new("u8a-retired");
+    let (id, _) = accepted(rig.core().post(req(B, "r1")));
+    // A restarted process: the request is on disk as started, the update is nowhere.
+    let e = refused(rig.core().post(req(B, "r1")));
+    assert_eq!(
+        (e.status, e.code),
+        (StatusCode::CONFLICT, "request_id_retired")
+    );
+    assert_eq!(id.0, "upd-1");
+    assert_eq!(written(&rig).len(), 1);
+}
+
+#[test]
+fn a_retried_request_finds_its_update_ended_or_with_the_supervisor() {
+    let rig = Rig::new("u8a-replay-phases");
+    let (mut core, id) = started(&rig);
+    // Handed to the supervisor: the retry reports the supervisor's phase.
+    rig.set_status(staged(B));
+    let (again, phase) = accepted(core.post(req(B, "r1")));
+    assert_eq!((again, phase), (id.clone(), Phase::Preflight));
+    // Ended inside the API: the retry reports how it ended.
+    let rig2 = Rig::new("u8a-replay-ended");
+    let (mut core2, id2) = started(&rig2);
+    accepted(core2.abort());
+    let (again, phase) = accepted(core2.post(req(B, "r1")));
+    assert_eq!((again, phase), (id2, Phase::RolledBack));
+}
+
+#[test]
+fn a_started_mark_that_cannot_be_saved_does_not_undo_the_update() {
+    struct MovesTheStateAway(std::path::PathBuf);
+    impl CrashHook for MovesTheStateAway {
+        fn at(&mut self, _point: CrashPoint) -> Result<(), Crash> {
+            std::fs::rename(&self.0, self.0.with_extension("moved")).unwrap();
+            Ok(())
+        }
+    }
+    let rig = Rig::new("u8a-nomark");
+    let state = rig.dir.join("state");
+    std::fs::create_dir(&state).unwrap();
+    let mut core = {
+        let mut rig = Rig::new("u8a-nomark-parts");
+        rig.dir = state.clone();
+        rig.core()
+    };
+    core.set_hook(Box::new(MovesTheStateAway(state)));
+    let (_, phase) = accepted(core.post(req(B, "r1")));
+    assert_eq!(phase, Phase::Accepted);
+}
+
+#[test]
+fn a_revert_order_that_cannot_be_written_still_ends_the_update() {
+    let rig = Rig::new("u8a-revert-fails");
+    let (mut core, _) = started(&rig);
+    *rig.gate.staged.lock().unwrap() = Compat::Incompatible {
+        rule: "R1".to_owned(),
+    };
+    *rig.orders.fail.lock().unwrap() = true;
+    rig.set_status(staged(B));
+    assert_eq!(body(&mut core).phase, Some(Phase::Failed));
+    assert_eq!(written(&rig).len(), 1);
+}
+
+#[test]
+fn supervisor_errors_become_defined_answers() {
+    let rig = Rig::new("u8a-sup-errors");
+    let mut core = rig.core();
+    let cases = [
+        (
+            SupervisorError::NotOpen,
+            StatusCode::CONFLICT,
+            "no_update_open",
+        ),
+        (
+            SupervisorError::Refused("busy".to_owned()),
+            StatusCode::CONFLICT,
+            "refused",
+        ),
+        (
+            SupervisorError::Failed("boom".to_owned()),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "supervisor_failed",
+        ),
+    ];
+    for (err, status, code) in cases {
+        let again = err.clone();
+        rig.sup.set(Phase::Preflight, None, 0);
+        rig.sup.0.lock().unwrap().fail = Some(err);
+        let e = refused(core.abort());
+        assert_eq!((e.status, e.code), (status, code));
+        rig.sup.set(Phase::Baking, Some(old()), 0);
+        rig.sup.0.lock().unwrap().fail = Some(again.clone());
+        let e = refused(core.rollback());
+        assert_eq!((e.status, e.code), (status, code));
+        rig.sup.set(Phase::Draining, Some(old()), 0);
+        rig.sup.0.lock().unwrap().fail = Some(again);
+        let e = refused(core.force_retire("why"));
+        assert_eq!((e.status, e.code), (status, code));
+    }
+}
+
+#[test]
+fn small_pieces_say_what_they_say() {
+    assert_eq!(NoCrash.at(CrashPoint::AfterRequestSaved), Ok(()));
+    assert_eq!(StubGate.check(&c(A), None), Compat::Compatible);
+    assert_eq!(StubGate.check(&c(A), Some(&facts())), Compat::Compatible);
+    for (why, text) in [
+        (RollbackBlocked::NoUpdate, "no update is open"),
+        (
+            RollbackBlocked::NotSwitched,
+            "the update has not switched yet (use abort)",
+        ),
+        (RollbackBlocked::OldChildGone, "the old child is gone"),
+        (
+            RollbackBlocked::NodesUpdated,
+            "a node has already been updated",
+        ),
+    ] {
+        assert_eq!(why.describe(), text);
+    }
+}
+
+#[test]
+fn a_lost_start_is_revived_once_the_other_update_has_ended() {
+    let rig = Rig::new("u8a-revive");
+    *rig.die.lock().unwrap() = Some(CrashPoint::AfterRequestSaved);
+    assert_eq!(rig.core().post(req(B, "r1")), Err(Fault::Crash));
+    let mut restarted = rig.core();
+    accepted(restarted.post(req(COMMIT_C, "r2")));
+    accepted(restarted.abort());
+    let (id, phase) = accepted(restarted.post(req(B, "r1")));
+    assert_eq!((id.0.as_str(), phase), ("upd-1", Phase::Accepted));
 }

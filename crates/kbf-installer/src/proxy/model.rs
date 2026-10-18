@@ -51,12 +51,6 @@ impl Phase {
 #[serde(transparent)]
 pub struct UpdateId(pub String);
 
-impl std::fmt::Display for UpdateId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// The verbs of the orders the proxy writes into `orders/` (KI section 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

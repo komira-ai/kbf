@@ -2,7 +2,7 @@
 //! (no proxy crate, no child admin calls, no `frontend_update` order writer), so each of
 //! them is a trait with a fake in the tests; U7b and U8b supply the real ones.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -112,10 +112,6 @@ impl RestartMarker {
         RestartMarker { path: path.into() }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn is_set(&self) -> bool {
         self.path.exists()
     }
@@ -164,7 +160,7 @@ pub struct Retired {
     pub dropped_streams: u64,
 }
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SupervisorError {
     #[error("no update is open")]
     NotOpen,

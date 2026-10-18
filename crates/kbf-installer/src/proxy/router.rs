@@ -148,7 +148,8 @@ fn parse<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
 }
 
 fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Bytes> {
-    let mut bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
+    // The bodies are plain structs and maps: serialization cannot fail.
+    let mut bytes = serde_json::to_vec(body).unwrap_or_default();
     bytes.push(b'\n');
     let mut resp = Response::new(Bytes::from(bytes));
     *resp.status_mut() = status;
