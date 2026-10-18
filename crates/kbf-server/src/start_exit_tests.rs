@@ -167,3 +167,21 @@ fn a_stale_writer_says_the_state_store_is_older() {
         None
     );
 }
+
+/// Catches a stale start that prints its error without the line that says why (the
+/// restarts would read as an ordinary crash loop), or the line for a failure it does not
+/// fit: `said` is the error, then the hint for a `StaleWriter`; the error alone otherwise.
+/// Mutant: `said` without the hint line.
+#[test]
+fn what_a_failed_start_says_is_its_error_then_the_hint() {
+    let stale: Box<dyn Error> = Box::new(stale());
+    let text = super::said("kbf storage", stale.as_ref());
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert_eq!(
+        lines[1],
+        format!("kbf storage: {}", super::STALE_WRITER_HINT)
+    );
+    let busy: Box<dyn Error> = Box::new(io::Error::from(io::ErrorKind::ResourceBusy));
+    assert_eq!(super::said("kbf storage", busy.as_ref()).lines().count(), 1);
+}

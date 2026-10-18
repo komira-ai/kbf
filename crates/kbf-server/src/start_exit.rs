@@ -94,6 +94,17 @@ pub fn hint(e: &(dyn Error + 'static)) -> Option<&'static str> {
     None
 }
 
+/// What a start that failed with `e` says on stderr, each line after `name`: the error,
+/// then [`hint`]'s line if there is one.
+#[must_use]
+pub fn said(name: &str, e: &(dyn Error + 'static)) -> String {
+    let mut text = format!("{name}: {e}\n");
+    if let Some(line) = hint(e) {
+        text.push_str(&format!("{name}: {line}\n"));
+    }
+    text
+}
+
 /// The line [`hint`] gives for a [`StaleWriter`].
 pub const STALE_WRITER_HINT: &str = "the frontend's state store is older than this node's \
     metadata log (was it restored from a backup?): the node exits 75, systemd starts it \

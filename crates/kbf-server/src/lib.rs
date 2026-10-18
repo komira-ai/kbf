@@ -141,7 +141,9 @@ pub use serve::{
     bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
-pub use start_exit::{NOT_READY, REFUSED, STALE_WRITER_HINT, StartFailure, hint as start_hint};
+pub use start_exit::{
+    NOT_READY, REFUSED, STALE_WRITER_HINT, StartFailure, hint as start_hint, said as start_said,
+};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use worker::WorkerService;
