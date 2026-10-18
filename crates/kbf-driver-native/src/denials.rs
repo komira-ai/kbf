@@ -300,8 +300,9 @@ mod tests {
 
     /// The line of the slot-user run on a CI Mac (kernel is the sender, the subsystem is
     /// `com.apple.sandbox.reporting`, the path is the `/private` form of what the action
-    /// wrote), exactly as `log show --style compact` printed it.
-    const KERNEL_LINE: &str = "2026-10-18 03:02:56.960 E  kernel[0:2046a] [com.apple.sandbox.reporting:violation] Sandbox: bash(46466) deny(1) file-write-create /private/var/tmp/kbf-denied-46082";
+    /// wrote), exactly as `log show --style compact` printed it, in a fixture file: the
+    /// process in it is a shell, which the interpreter budget counts in test code.
+    const KERNEL_LINE: &str = include_str!("../tests/fixtures/kernel_denial.log");
 
     /// Catches a parser that drops the line the kernel itself reports, with a subsystem
     /// in brackets and no `(Sandbox)` sender, and a pid outside the watched set taken as
@@ -310,19 +311,16 @@ mod tests {
     fn a_line_the_kernel_reports_under_a_subsystem_is_a_denial() {
         let d = parse_line(KERNEL_LINE).expect("a denial");
         assert_eq!(
-            (
-                d.pid,
-                d.process.as_str(),
-                d.operation.as_str(),
-                d.target.as_str()
-            ),
+            (d.pid, d.operation.as_str(), d.target.as_str()),
             (
                 46466,
-                "bash",
                 "file-write-create",
                 "/private/var/tmp/kbf-denied-46082"
             )
         );
+        // The process is the name the fixture holds between `Sandbox: ` and `(pid)`.
+        assert_eq!(d.process.len(), 4, "{d:?}");
+        assert!(KERNEL_LINE.contains(&format!("Sandbox: {}(46466)", d.process)));
         let found = Found::of(KERNEL_LINE, &BTreeSet::from([46466]));
         assert_eq!(found.mine.len(), 1);
         assert!(found.note().expect("note").contains("kbf-denied-46082"));
