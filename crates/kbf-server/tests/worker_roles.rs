@@ -56,7 +56,7 @@ const HEARTBEAT: &str = "/kbf.map.v1.Membership/Heartbeat";
 
 /// Every method the worker listener serves and the one role that may call it, spelled
 /// out here and not read from the table.
-const EXPECTED: [(&str, PeerRole); 19] = {
+const EXPECTED: [(&str, PeerRole); 20] = {
     use PeerRole::{Daemon, Storage};
     [
         (SESSION, Daemon),
@@ -95,6 +95,7 @@ const EXPECTED: [(&str, PeerRole); 19] = {
             "/build.bazel.remote.execution.v2.ContentAddressableStorage/RegisterChunkMapping",
             Daemon,
         ),
+        ("/kbf.update.v1.ReleaseService/Fetch", PeerRole::Daemon),
         ("/kbf.worker.v1.Segments/Begin", Daemon),
         ("/kbf.worker.v1.Segments/PutRange", Daemon),
         ("/kbf.worker.v1.Segments/Commit", Daemon),
