@@ -109,9 +109,7 @@ mod tests {
         let ghost = WorkerId::new("ghost");
         let now = FarmTime::from_millis(5);
         let error = decide(&facts, &ghost, &Policy::default(), now).unwrap_err();
-        assert!(
-            matches!(&error, ControllerError::Invariant(why) if why.contains("ghost")),
-            "{error}"
-        );
+        assert!(matches!(error, ControllerError::Invariant(_)));
+        assert!(error.to_string().contains("ghost"));
     }
 }
