@@ -97,8 +97,8 @@ impl Unpack {
         layers: &[(PathBuf, Compression)],
     ) -> Result<Unpacked, UnpackError> {
         std::fs::create_dir(rootfs).map_err(io(rootfs))?;
-        std::fs::set_permissions(rootfs, std::fs::Permissions::from_mode(0o755))
-            .map_err(io(rootfs))?;
+        let mode = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(rootfs, mode).map_err(io(rootfs))?;
         let mut state = State {
             unpack: *self,
             root: Root(rootfs.to_owned()),
@@ -280,8 +280,9 @@ impl State {
         let Some(fd) = open_dir_nofollow(&self.root.0, rel) else {
             return Ok(());
         };
-        let mode = rustix::fs::Mode::from_raw_mode(dir.mode & 0o7777);
-        rustix::fs::fchmod(&fd, mode).map_err(|e| io(&dir.path)(e.into()))?;
+        let dir_file = std::fs::File::from(fd);
+        let set = dir_file.set_permissions(std::fs::Permissions::from_mode(dir.mode & 0o7777));
+        set.map_err(io(&dir.path))?;
         let at = rustix::fs::Timespec {
             tv_sec: i64::try_from(dir.mtime).unwrap_or(0),
             tv_nsec: 0,
@@ -291,7 +292,7 @@ impl State {
             last_modification: at,
         };
         // A best effort, like `set_time`.
-        let _ = rustix::fs::futimens(&fd, &times);
+        let _ = rustix::fs::futimens(&dir_file, &times);
         Ok(())
     }
 
@@ -328,12 +329,12 @@ impl State {
                     return Err(UnpackError::TooBig(self.unpack.max_bytes));
                 }
                 remove_any(&dest)?;
-                let mut file = std::fs::OpenOptions::new()
+                let opened = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .mode(0o600)
-                    .open(&dest)
-                    .map_err(io(&dest))?;
+                    .open(&dest);
+                let mut file = opened.map_err(io(&dest))?;
                 layer.field(std::io::copy(entry, &mut file))?;
                 drop(file);
                 self.metadata(layer, &header, &dest, true)?;
@@ -544,12 +545,12 @@ pub fn ensure_paths(rootfs: &Path, dirs: &[&str], files: &[&str]) -> Result<(), 
             .mode(0o755)
             .create(parent)
             .map_err(io(parent))?;
-        std::fs::OpenOptions::new()
+        let opened = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o644)
-            .open(&path)
-            .map_err(io(&path))?;
+            .open(&path);
+        opened.map_err(io(&path))?;
     }
     Ok(())
 }
