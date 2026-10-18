@@ -48,8 +48,8 @@ use kbf_proto::worker::{
 };
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{
-    Cordon, DaemonInstance, Event, FARM_RERUNS, Fate, Input, LOSS_REQUEUES, MemoryLadder,
-    NodePhase, OpState, Requeue, Scheduler,
+    Cordon, DaemonInstance, Event, FARM_RERUNS, Fate, FloorChange, Input, LOSS_REQUEUES,
+    MemoryLadder, NodePhase, OpState, Requeue, Scheduler,
 };
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
@@ -66,7 +66,7 @@ mod phase;
 mod record;
 
 pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
-pub use handover::LOST_LOOKS;
+pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
 use self::durable::Durable;
@@ -265,7 +265,25 @@ struct State {
     /// Until it has, it still holds the lease and no queue row for the operation, so
     /// every one is written again before anything that follows it is
     /// ([`State::log_requeues`]).
-    unsettled: Vec<(Requeue, Option<u32>, Option<Fate>)>,
+    unsettled: Vec<(Requeue, Option<u32>, Option<Fate>, FloorChange)>,
+    /// The effects of committed records whose rows the state store has not taken, one
+    /// batch per record, oldest first. A batch leaves only when the store has taken every
+    /// row of it, in order, and nothing is carried out (no `Start`, no answer) before its
+    /// row is written, so a store that refuses holds the farm's later effects behind the
+    /// earliest refused one ([`State::release_unwritten`]).
+    unwritten: VecDeque<VecDeque<Effect>>,
+    /// The detail of a report whose answer is not settled yet, by lease: the answer's
+    /// `done/` row is made from it when the store is written, and the answer is settled
+    /// with it once the store has taken the rows.
+    parked: BTreeMap<LeaseId, Detail>,
+    /// The held effect whose last try was refused as unreachable: a "row is gone" for
+    /// this effect and no other may be its own applied work
+    /// ([`State::release_unwritten`]).
+    retrying: Option<Effect>,
+    /// Writes given up on for good: dropped as stale or fenced, or over the cap ([`Farm::dropped_writes`]).
+    write_drops: u64,
+    /// The most committed records `unwritten` holds before a new one is dropped.
+    held_cap: usize,
     /// The scheduler was told the state store is unavailable ([`State::watch_store`]).
     store_down: bool,
     /// When each node's session row in the state store was last written.
@@ -273,10 +291,17 @@ struct State {
     /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
     /// nothing and queues nothing.
     fenced: bool,
-    /// For each operation a successor is followed on ([`Farm::follow`]), how many looks
-    /// in a row found it neither unfinished nor ended.
-    looks: BTreeMap<OperationId, u8>,
+    /// For each operation this farm's callers wait on ([`Farm::follow`]) that the last
+    /// looks found neither unfinished nor ended, how many looks in a row. Only reported
+    /// (`kbf_frontend_relay_untraced`): no look count ends a caller's wait.
+    untraced_kept: BTreeMap<OperationId, u32>,
+    /// The same for the operations relays follow ([`kbf_front::Handed::look`]), until
+    /// the relay lets go of them.
+    untraced_relayed: BTreeMap<OperationId, u32>,
 }
+
+/// How many committed records the farm holds for a state store that refuses them.
+const HELD_CAP: usize = 4096;
 
 /// What a finished operation tells its callers, and the action-cache entry to write
 /// first, if any.
@@ -333,10 +358,16 @@ impl Farm {
                 recorded: BTreeSet::new(),
                 durable: None,
                 unsettled: Vec::new(),
+                unwritten: VecDeque::new(),
+                parked: BTreeMap::new(),
+                retrying: None,
+                write_drops: 0,
+                held_cap: HELD_CAP,
                 store_down: false,
                 renewed: BTreeMap::new(),
                 fenced: false,
-                looks: BTreeMap::new(),
+                untraced_kept: BTreeMap::new(),
+                untraced_relayed: BTreeMap::new(),
             }),
         }
     }
@@ -347,6 +378,17 @@ impl Farm {
     pub fn with_memory_ladder(mut self, ladder: MemoryLadder) -> Self {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         state.sched.set_memory_ladder(ladder);
+        self
+    }
+
+    /// This farm, keeping at most `bound` memory floors (instead of
+    /// [`kbf_sched::MEMORY_FLOORS`]); past that, the one raised longest ago is forgotten
+    /// first. Set before the farm takes a state store over.
+    #[must_use]
+    pub fn with_memory_floors(mut self, bound: usize) -> Self {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.sched = std::mem::replace(&mut state.sched, Scheduler::new(self.term))
+            .with_memory_floors(bound);
         self
     }
 
@@ -394,6 +436,21 @@ impl Farm {
         self.lock().sched.queued_len() as u64
     }
 
+    /// Writes to the state store the farm gave up on for good: held effects dropped as
+    /// stale or on a fence, records over the cap.
+    #[must_use]
+    pub fn dropped_writes(&self) -> u64 {
+        self.lock().write_drops
+    }
+
+    /// Held-back committed records the farm keeps for a refusing state store at most.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_held_cap(self, cap: usize) -> Self {
+        self.lock().held_cap = cap;
+        self
+    }
+
     /// The memory runs of every operation this farm holds that was killed for memory,
     /// oldest first ([`kbf_sched::MemoryState::runs_by_operation`]): what a successor
     /// farm over the same state store must hold too.
@@ -402,11 +459,26 @@ impl Farm {
         self.lock().sched.memory_state().runs_by_operation()
     }
 
+    /// The workers placement skips for each operation that has any
+    /// ([`kbf_sched::Scheduler::avoided`]): what a successor farm over the same state
+    /// store must hold too.
+    #[must_use]
+    pub fn avoided(&self) -> BTreeMap<OperationId, BTreeSet<WorkerId>> {
+        self.lock().sched.avoided()
+    }
+
     /// Execute and WaitExecution operation streams open now
     /// (`kbf_front_open_executions`).
     #[must_use]
     pub fn open_executions(&self) -> u64 {
         self.cache.metrics().execute.open_executions.get()
+    }
+
+    /// Execute and WaitExecution calls this process forwards to its successor, open now
+    /// (`kbf_handover_relays_open`): each keeps a handed-over frontend alive.
+    #[must_use]
+    pub fn relays_open(&self) -> u64 {
+        self.cache.metrics().handover_relays_open.get()
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -725,7 +797,7 @@ impl Farm {
             state.paused = paused;
             answers
                 .iter()
-                .map(|a| state.settle(a, None))
+                .map(|a| state.settle(a))
                 .collect::<Vec<Settled>>()
         };
         for settled in settled {
@@ -776,7 +848,7 @@ impl Farm {
             let usage = measured.as_ref().map(Measured::usage);
             run_record::of(&result, usage, stamp, SystemTime::now())
         });
-        let (outcome, mut detail) = self.outcome(lease, ran_on, result).await;
+        let (outcome, detail) = self.outcome(lease, ran_on, result).await;
 
         let now = self.now();
         let (answers, accepted) = {
@@ -787,11 +859,16 @@ impl Farm {
                 measured,
                 run,
             };
+            // Parked before the feed: the transaction that finishes the operation writes
+            // the result these details make. An answer the store held back earlier,
+            // released by this input, is settled with its own detail.
+            if let Some(detail) = detail {
+                state.park(lease, detail);
+            }
             let (answers, accepted) = state.take_report(now, worker, operation, report);
-            let settled: Vec<Settled> = answers
-                .iter()
-                .map(|a| state.settle(a, detail.take()))
-                .collect();
+            let settled: Vec<Settled> = answers.iter().map(|a| state.settle(a)).collect();
+            // What no answer used waits only if its answer does.
+            state.forget_parked();
             (settled, accepted)
         };
         for settled in answers {
@@ -910,7 +987,7 @@ impl Dispatch for Farm {
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
-        state.admit(&submission.request)?;
+        state.admit(&submission.request, &usage)?;
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
@@ -1107,9 +1184,21 @@ impl State {
     /// answers, for the caller to deliver once the lock is released.
     fn carry_out(&mut self, now: FarmTime, event: Event) -> Vec<Answer> {
         self.watch_store(now);
+        // Only the inputs whose callers deliver answers ([`State::feed_quiet`]) release
+        // effects an earlier refusal held back: one of them may be an answer.
+        let answering = matches!(
+            event,
+            Event::Tick | Event::Heartbeat { .. } | Event::Report { .. }
+        );
         let mut effects: VecDeque<Effect> = self.sched.apply(Input::new(now, event)).into();
         effects.extend(self.sched.apply(Input::new(now, Event::Tick)));
         self.log_requeues();
+        if answering {
+            // Before this input's own effects: they follow what was held back.
+            for effect in self.release_unwritten().into_iter().rev() {
+                effects.push_front(effect);
+            }
+        }
         let mut answers = Vec::new();
         while let Some(effect) = effects.pop_front() {
             match effect {
@@ -1119,11 +1208,18 @@ impl State {
                     }
                     // Appended is committed; the effects of the commit (the `Start`, the
                     // answer) are carried out only once the state store has taken what
-                    // they settle.
+                    // they settle. What it refuses is kept and written again, in order,
+                    // until it takes it or a newer writer fences it.
                     let committed = Event::Committed(record);
                     let next = self.sched.apply(Input::new(now, committed));
-                    if self.durably("a committed record", |d| d.persist(&next)) {
-                        effects.extend(next);
+                    if self.unwritten.len() >= self.held_cap {
+                        self.write_drops += 1;
+                        tracing::error!(cap = self.held_cap, "records over the cap: one dropped");
+                        continue;
+                    }
+                    self.unwritten.push_back(next.into());
+                    if answering || self.unwritten.len() == 1 {
+                        effects.extend(self.release_unwritten());
                     }
                 }
                 Effect::Start(start) => self.start(start),
@@ -1190,19 +1286,11 @@ impl State {
     }
 
     /// Keeps the callers of `operation`, which has just finished, until the scheduler
-    /// drops it.
-    fn keep_finished(
-        &mut self,
-        operation: OperationId,
-        waiters: Vec<WaiterId>,
-        finished: &Finished,
-    ) {
-        // After the finish is durable and before any caller is answered from this
-        // process's memory alone: a process that kept streams open across a handover
-        // reads the result here. A store that does not take it is logged and the callers
-        // here are answered all the same.
-        let retention = self.finished_retention;
-        self.durably("a result", |d| d.done(operation, finished, retention));
+    /// drops it. Its result is in the state store already: it was written in the
+    /// transaction that removed the operation's rows ([`Durable::persist`]), before any
+    /// caller is answered from this process's memory (a process that kept streams open
+    /// across a handover reads it there).
+    fn keep_finished(&mut self, operation: OperationId, waiters: Vec<WaiterId>) {
         self.machine.keep_finished(operation, waiters);
         self.forget_dropped();
     }
@@ -1359,19 +1447,20 @@ impl State {
     fn refuse(&mut self, refusal: &Refusal) {
         tracing::warn!(operation = %refusal.operation, reason = %refusal.reason, "operation refused");
         self.record_refused(refusal);
-        let finished = failed(Code::FailedPrecondition, &refusal.reason);
+        let finished = refused_as(refusal);
         // A lease given up before the operation was refused may still be listed.
         self.machine.forget_leases(refusal.operation);
         for stage in refusal.waiters.iter().filter_map(|id| self.stages.get(id)) {
             stage.send_replace(Stage::Done(finished.clone()));
         }
-        self.keep_finished(refusal.operation, refusal.waiters.clone(), &finished);
+        self.keep_finished(refusal.operation, refusal.waiters.clone());
     }
 
     /// Works out what the callers of a finished operation get, and keeps them for the
-    /// finished retention. `detail` is what the accepted report carried beyond its
-    /// outcome, if anything.
-    fn settle(&mut self, answer: &Answer, detail: Option<Detail>) -> Settled {
+    /// finished retention. The report's detail, if there is one, is the one parked for the
+    /// answer's lease ([`State::park`]), the one its `done/` row was made from.
+    fn settle(&mut self, answer: &Answer) -> Settled {
+        let detail = self.parked.remove(&answer.lease);
         self.machine.forget_leases(answer.operation);
         let waiters: Vec<&Waiter> = answer
             .waiters
@@ -1384,43 +1473,55 @@ impl State {
             .filter_map(|id| self.stages.get(id).cloned())
             .collect();
         let reason = detail.as_ref().and_then(Detail::reason);
-        let mut stored = None;
-        let (finished, write) = match (detail, answer.outcome) {
-            (Some(Detail::Ran(pending)), _) => {
+        let finished = finished_of(answer, detail.as_ref());
+        let (stored, write) = match detail {
+            Some(Detail::Ran(pending)) => {
                 let Pending { result, record } = *pending;
-                stored = Some(record.result);
                 let cacheable =
                     result.exit_code == 0 && waiters.first().is_some_and(|w| !w.do_not_cache);
+                let stored = Some(record.result);
                 let write = waiters
                     .first()
                     .filter(|_| cacheable)
                     .map(|w| (w.key.action, record));
-                (Finished::Ran(Box::new(result)), write)
+                (stored, write)
             }
-            (Some(Detail::TimedOut(partial)), Outcome::Failed(Failure::Timeout)) => {
-                let status = status(Code::DeadlineExceeded, TIMED_OUT);
-                (Finished::TimedOut { status, partial }, None)
-            }
-            (_, Outcome::Failed(Failure::Timeout)) => {
-                (failed(Code::DeadlineExceeded, TIMED_OUT), None)
-            }
-            (Some(Detail::Invalid(why)), _) => (failed(Code::InvalidArgument, &why), None),
-            (Some(Detail::Missing(blobs)), _) => {
-                (Finished::Failed(kbf_front::missing_status(&blobs)), None)
-            }
-            (_, Outcome::Failed(Failure::OutOfMemory)) => {
-                (memory::finished(&answer.memory_runs), None)
-            }
-            (_, outcome) => (unrun(outcome, &answer.farm_runs), None),
+            _ => (None, None),
         };
         self.record_finished(answer, &finished, stored, reason);
-        self.keep_finished(answer.operation, answer.waiters.clone(), &finished);
+        self.keep_finished(answer.operation, answer.waiters.clone());
         Settled {
             finished,
             write,
             stages,
         }
     }
+}
+
+/// What the callers of the operation `answer` finishes are told, given the report's
+/// `detail` if it had one. The row the state store keeps of the result is this too, so
+/// callers and followers never differ.
+fn finished_of(answer: &Answer, detail: Option<&Detail>) -> Finished {
+    match (detail, answer.outcome) {
+        (Some(Detail::Ran(pending)), _) => Finished::Ran(Box::new(pending.result.clone())),
+        (Some(Detail::TimedOut(partial)), Outcome::Failed(Failure::Timeout)) => {
+            let status = status(Code::DeadlineExceeded, TIMED_OUT);
+            Finished::TimedOut {
+                status,
+                partial: partial.clone(),
+            }
+        }
+        (_, Outcome::Failed(Failure::Timeout)) => failed(Code::DeadlineExceeded, TIMED_OUT),
+        (Some(Detail::Invalid(why)), _) => failed(Code::InvalidArgument, why),
+        (Some(Detail::Missing(blobs)), _) => Finished::Failed(kbf_front::missing_status(blobs)),
+        (_, Outcome::Failed(Failure::OutOfMemory)) => memory::finished(&answer.memory_runs),
+        (_, outcome) => unrun(outcome, &answer.farm_runs),
+    }
+}
+
+/// What the callers of the operation `refusal` refuses are told.
+fn refused_as(refusal: &Refusal) -> Finished {
+    failed(Code::FailedPrecondition, &refusal.reason)
 }
 
 /// A worker's report as [`State::take_report`] feeds it: the lease, the scheduler's

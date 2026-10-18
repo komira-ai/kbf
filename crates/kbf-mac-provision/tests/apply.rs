@@ -9,8 +9,8 @@ use std::fs;
 
 use kbf_mac_provision::cli::{self, Error};
 use support::{
-    DROPIN, ERR_LOG, FakeMac, INTENT, LOGINWINDOW, PLIST, apply, apply_keys, calls, check,
-    check_keys, golden_plist, lines, ls, sha256_hex,
+    DROPIN, ERR_LOG, FakeMac, INTENT, LOGINWINDOW, PLIST, XCODE, apply, apply_keys, calls, check,
+    check_keys, golden_plist, lines, ls, preference, sha256_hex,
 };
 
 const RECORD: &str = "/var/db/kbf-mac-provision/settings.before";
@@ -55,6 +55,7 @@ fn one_apply_converges_a_fresh_mac() {
             "CHANGE updates_config_data: ConfigDataInstall = 1",
             "CHANGE appstore_auto_update: AutomaticallyInstallAppUpdates = 0",
             "CHANGE appstore_auto_update: com.apple.commerce AutoUpdate = 0",
+            "CHANGE xcode_disable_manifest_sandbox: com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox = 1",
             "CHANGE ssh_password_auth: wrote /etc/ssh/sshd_config.d/000-kbf.conf",
             "CHANGE firewall: firewall on",
             "CHANGE time_server: network time on, server time.example.net",
@@ -66,7 +67,7 @@ fn one_apply_converges_a_fresh_mac() {
     );
     let r = check(&mac);
     assert_eq!(r.failed, 0, "{}", r.text);
-    assert!(r.text.ends_with("check: 30 pass, 0 fail\n"), "{}", r.text);
+    assert!(r.text.ends_with("check: 31 pass, 0 fail\n"), "{}", r.text);
     let sha = sha256_hex(mac.profile_text().as_bytes());
     assert_eq!(
         fs::read_to_string(mac.path(PLIST)).unwrap(),
@@ -102,6 +103,51 @@ fn one_apply_converges_a_fresh_mac() {
         );
     }
     assert!(!mac.path("/Applications/.kbf-xip-17A000").exists());
+}
+
+/// Catches: `xcode_disable_manifest_sandbox` written to another domain or key (the
+/// user default `xcodebuild` reads; `defaults write` of the system domain is what a
+/// lease user's `xcodebuild` finds after its own), left unwritten, written as a string
+/// or with the wrong sense (1 is `true`), recorded in the revert record (it is not in
+/// it), or managed when the profile leaves the key out.
+#[test]
+fn the_xcode_manifest_sandbox_default_is_written_when_the_profile_asks() {
+    const KEY: &str = "IDEPackageSupportDisableManifestSandbox";
+    let mac = FakeMac::fresh("apply-xcode-sandbox");
+    assert_eq!(preference(&mac, XCODE, KEY), None);
+    let r = apply_keys(&mac, Some("xcode_disable_manifest_sandbox"));
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert_eq!(
+        r.text,
+        "CHANGE xcode_disable_manifest_sandbox: com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox = 1\n"
+    );
+    assert_eq!(preference(&mac, XCODE, KEY).as_deref(), Some("1"));
+    assert_eq!(
+        calls(&mac, "defaults write "),
+        [format!(
+            "defaults write {} {KEY} -bool true",
+            mac.path(XCODE).display()
+        )]
+    );
+    assert!(!mac.path(RECORD).exists());
+
+    // Key left out: not managed, nothing written, and the value on the Mac is not read as drift.
+    let text: String = mac
+        .profile_text()
+        .lines()
+        .filter(|l| !l.starts_with("xcode_disable_manifest_sandbox="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let other = FakeMac::fresh("apply-xcode-sandbox-unset");
+    let path = other.profile_file(&text);
+    let r = cli::apply(&path, Some("xcode_disable_manifest_sandbox"), &other).unwrap();
+    assert_eq!((r.failed, r.text.as_str()), (0, ""));
+    assert_eq!(other.writes(), Vec::<String>::new());
+    let r = cli::check(&path, Some("xcode_disable_manifest_sandbox"), &other).unwrap();
+    assert_eq!(
+        r.text,
+        "PASS xcode_disable_manifest_sandbox: not managed\ncheck: 1 pass, 0 fail\n"
+    );
 }
 
 /// Catches: an apply that fixes an item that passes (the script's mutant "apply writes
@@ -154,7 +200,7 @@ fn keys_limits_apply_to_the_named_items() {
         (0, "CHANGE firewall: firewall on\n")
     );
     let r = check(&mac);
-    assert_eq!(lines(&r, "FAIL").len(), 19, "{}", r.text);
+    assert_eq!(lines(&r, "FAIL").len(), 20, "{}", r.text);
     let path = mac.profile_file(&mac.profile_text());
     assert!(matches!(
         cli::apply(&path, Some("firewall,bogus"), &mac),
