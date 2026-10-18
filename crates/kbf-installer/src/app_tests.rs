@@ -5,9 +5,9 @@ use super::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::layout::Layout;
+use crate::layout::{Layout, Platform};
 use crate::state::{Locked, PendingConfirm, State};
-use crate::testkit::{A, B, c, host_root};
+use crate::testkit::{A, B, c, host_root_on};
 
 fn parse(args: &[&str]) -> Cli {
     let mut full = vec!["kbf-installer"];
@@ -195,8 +195,10 @@ fn global_flags_may_follow_the_verb() {
 }
 
 /// A host root with release A current and its inbox in place, as the installer finds a host.
+/// The installer under test lays a host out for the platform it was built for, so the
+/// scratch host is laid out for that platform too (`/var/db/kbf-deploy` on macOS).
 fn seeded(name: &str) -> (Layout, PathBuf) {
-    let (layout, root) = host_root(&format!("app-{name}"));
+    let (layout, root) = host_root_on(&format!("app-{name}"), Platform::current());
     fs::create_dir_all(root.join("var/lib/kbf-updater/inbox/orders")).expect("inbox");
     let release = root.join("usr/local/kbf/releases").join(A);
     fs::create_dir_all(&release).expect("release");
@@ -239,7 +241,7 @@ const RUN: [&str; 7] = [
 /// reported).
 #[test]
 fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
-    let (_, root) = seeded("run");
+    let (layout, root) = seeded("run");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Ok, "{err}");
     let status = fs::read(root.join("var/lib/kbf-updater/status.json")).expect("status.json");
@@ -248,12 +250,16 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
     fs::create_dir(root.join(format!("var/lib/kbf-updater/inbox/{:020}-{B}", 2))).expect("entry");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Ok, "{err}");
-    fs::write(root.join("var/lib/kbf-deploy/helper.json"), b"not json").expect("ruin");
+    fs::write(
+        layout.join(&layout.state_dir()).join("helper.json"),
+        b"not json",
+    )
+    .expect("ruin");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Failed);
     assert!(err.contains("helper.json"), "{err}");
-    fs::remove_file(root.join("var/lib/kbf-deploy/helper.json")).expect("remove");
-    fs::write(root.join("var/lib/kbf-deploy/state.json"), b"not json").expect("ruin");
+    fs::remove_file(layout.join(&layout.state_dir()).join("helper.json")).expect("remove");
+    fs::write(layout.join(&layout.state_file()), b"not json").expect("ruin");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Failed);
     assert!(err.starts_with("kbf-installer:"), "{err}");
@@ -292,7 +298,7 @@ fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
     let (exit, err) = on(&root, &["boot-check"]);
     assert_eq!(exit, Exit::Failed);
     assert!(err.contains("as root"), "{err}");
-    fs::write(root.join("var/lib/kbf-deploy/state.json"), b"not json").expect("ruin");
+    fs::write(layout.join(&layout.state_file()), b"not json").expect("ruin");
     let (exit, err) = on(&root, &["boot-check"]);
     assert_eq!(exit, Exit::Failed, "{err}");
     for verb in [&RUN[..], &["boot-check"][..]] {
