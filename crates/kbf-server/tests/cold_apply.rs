@@ -20,7 +20,7 @@ use kbf_server::store_config::acks::NodeStatus;
 use kbf_state::Store as _;
 use node::{
     BEAT, ID, Rig, SECRET, bucket, class, dir, dir_of, flags, no_keys, own_keys, promoted,
-    registered, reported, rig, round_trip, started, until,
+    registered, reported, reported_status, rig, round_trip, started, until,
 };
 use support::{Source, farm_beating};
 
@@ -224,6 +224,7 @@ async fn a_lowered_generation_is_pending_for_a_running_node_and_applied_by_a_new
         .expect("starts");
     let _serving = tokio::spawn(half.serve());
     assert_eq!(reported(&rig, 5).await.nodes[0].status, NodeStatus::Ok);
+    assert_eq!(reported_status(&rig, 1), Some(1), "the node says ok at 5");
 
     rig.source.set(2);
     let behind = until("the node's report of the lowered generation", || {
@@ -234,6 +235,12 @@ async fn a_lowered_generation_is_pending_for_a_running_node_and_applied_by_a_new
     .await;
     assert_eq!(behind.nodes[0].applied_generation, Some(5));
     assert!(!behind.converged);
+    // The frontend would judge an `ok` at 5 against 2 as pending by itself; the node's own
+    // word is what is pinned: it says pending.
+    until("the node's own pending", || {
+        (reported_status(&rig, 1) == Some(2)).then_some(())
+    })
+    .await;
 
     let second = started(&flags(&rig, "lower-b", &bucket(&rig), no_keys))
         .await
@@ -338,7 +345,8 @@ async fn the_registered_secret_is_in_no_file_argument_or_variable() {
     let _serving = tokio::spawn(half.serve());
     reported(&rig, 8).await;
 
-    let root = dir_of("scan");
+    // Every node directory of this binary, and whatever else was left beside them.
+    let root = dir_of("scan").parent().expect("a parent").to_owned();
     let mut found = Vec::new();
     scan(&root, secret.as_bytes(), &mut found);
     assert!(found.is_empty(), "the secret is on disk in {found:?}");

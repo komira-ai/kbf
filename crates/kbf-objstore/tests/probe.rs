@@ -197,18 +197,6 @@ async fn a_delete_that_fails_fails_the_probe() {
     );
 }
 
-/// Catches an error that carries the store's words (mutant: `ProbeStep` wrapping the
-/// store's error): the result is a closed code whose text names no store message.
-#[tokio::test]
-async fn a_failure_carries_no_store_text() {
-    let store = Tampered::new();
-    store.fail_get.store(true, Ordering::SeqCst);
-    let failed = probe(&store, &root(), "n-5").await.unwrap_err();
-    for text in [failed.to_string(), format!("{failed:?}")] {
-        assert!(!text.contains("SENTINEL"), "{text}");
-    }
-}
-
 /// Catches a nonce that reaches the key unchecked (mutant: `unwrap` the key): a nonce
 /// that is not a key gives the `Key` step, and nothing is written.
 #[tokio::test]

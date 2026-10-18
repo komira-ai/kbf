@@ -293,9 +293,13 @@ async fn a_node_with_its_own_keys_starts_on_them_when_the_frontend_is_down() {
     let (joiner, dials) = unreachable_frontend();
     let cold = Registrable::new(&flag(), keys).expect("a store");
     let before = Instant::now();
-    let (_store, applied) = cold
-        .registered(&joiner, &joined(3))
+    // A bound that is lost would ask for ever: the paused clock would run on, so the
+    // test says so after ten virtual minutes instead of hanging.
+    let joined = joined(3);
+    let asked = tokio::time::timeout(Duration::from_secs(600), cold.registered(&joiner, &joined));
+    let (_store, applied) = asked
         .await
+        .expect("gave up asking")
         .expect("starts on its own store");
     assert_eq!(applied.for_beat(3), (0, ApplyStatus::Pending));
     let at = dials
@@ -311,19 +315,25 @@ async fn a_node_with_its_own_keys_starts_on_them_when_the_frontend_is_down() {
 }
 
 /// Catches a node with nothing of its own that starts anyway or gives up (mutants: the
-/// bound applied to every node; the own store assumed): it asks on, past any number of
-/// tries, and has not returned.
+/// bound applied to every node; the own store assumed), and one that asks without
+/// waiting (mutant: no sleep between tries, which a paused clock turns into a loop that
+/// never lets the time move, so the clock is moved by hand): after ten virtual minutes it
+/// is still asking, on the jittered waits, a few dozen times and not thousands.
 #[tokio::test(start_paused = true)]
 async fn a_node_with_no_keys_asks_until_the_frontend_answers() {
     let (joiner, dials) = unreachable_frontend();
     let cold = Registrable::new(&flag(), no_keys).expect("a store");
     let joined = joined(3);
-    let asking = cold.registered(&joiner, &joined);
-    let mut asking = std::pin::pin!(asking);
-    let outcome = tokio::time::timeout(Duration::from_secs(600), &mut asking).await;
-    assert!(outcome.is_err(), "still asking after ten minutes");
+    let mut asking = std::pin::pin!(cold.registered(&joiner, &joined));
+    for second in 0..600 {
+        if let std::task::Poll::Ready(out) = futures::poll!(asking.as_mut()) {
+            panic!("gave up after {second} s: {:?}", out.map(drop));
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
     let dialled = dials.0.lock().unwrap_or_else(PoisonError::into_inner).len();
     assert!(dialled > FALLBACK_ATTEMPTS as usize + 4, "{dialled} tries");
+    assert!(dialled < 100, "{dialled} tries in ten minutes");
 }
 
 /// Catches a node that calls the frontend although nothing is registered (mutant: the

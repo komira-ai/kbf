@@ -17,6 +17,8 @@ use kbf_server::storage_half::{StorageHalf, start};
 use kbf_server::storage_node::{StorageFlags, command, parse};
 use kbf_server::store_config::acks::Convergence;
 
+use kbf_state::Store as _;
+
 use crate::support::{Farm, Source, farm_beating};
 
 pub const BEAT: Duration = Duration::from_millis(90);
@@ -43,14 +45,16 @@ pub fn never() -> std::io::Result<std::future::Pending<()>> {
     Ok(std::future::pending())
 }
 
-/// Where [`dir`] puts `name`: apart per process.
+/// Where [`dir`] puts `name`.
 pub fn dir_of(name: &str) -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("cold-apply")
-        .join(format!("{name}-{}", std::process::id()))
+        .join(name)
 }
 
-/// An empty directory for `name`.
+/// An empty directory for `name`. Emptied first: each test's frontend is new, so its
+/// state store hands out boot 1 again, which a metadata directory a previous run left has
+/// set already (a registered node refuses to start over it).
 pub fn dir(name: &str) -> PathBuf {
     let dir = dir_of(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -155,6 +159,20 @@ pub fn promoted(rig: &Rig) -> Option<kbf_map::Map> {
             .ok()?;
     }
     rig.farm.members.refresh().ok().flatten()
+}
+
+/// The status number the node's last report to the frontend carried, as the frontend kept
+/// it (`objstore/ack/<member>`: boot, generation, status, time; 1 ok, 2 pending): the
+/// node's own word, before the frontend judges it against its generation.
+pub fn reported_status(rig: &Rig, member: u64) -> Option<u64> {
+    let row = rig
+        .farm
+        .ack_store
+        .fake
+        .get(&format!("objstore/ack/{member}"))
+        .ok()??;
+    let word = row.value.chunks_exact(8).nth(2)?;
+    Some(u64::from_be_bytes(word.try_into().ok()?))
 }
 
 /// What the frontend's acks say about `generation`, once the first node has reported.
