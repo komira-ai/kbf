@@ -752,8 +752,9 @@ Where it differs from the sections above, and why:
 - **Larger blobs** stream through a writer: queued when the stream opens, the range
   reserved when a writer takes it, each chunk written as it arrives. The writer is held
   until the commit, until the stream is dropped, or until the stream is idle for too long
-  (next bullet), so a slow sender holds a writer, never a second file. A blob larger than the tier's segment limit cannot share a block: it is
-  written to a block of its own (`reserve_upload`), still by one writer.
+  (next bullet), so a slow sender holds a writer, never a second file. A blob larger than
+  the tier's segment limit cannot share a block: it is written to a block of its own
+  (`reserve_upload`), still by one writer.
 - **Idle streams.** Without a bound, a stalled but connected large upload would hold its
   writer for ever, and with `--write-pool-writers` of them every small blob would wait
   behind them. A writer waits `--write-pool-stream-idle` seconds (default 30, at least 1)
@@ -764,7 +765,9 @@ Where it differs from the sections above, and why:
   node): the client sends the blob again, as for any retryable failure. The clock runs from
   the moment a writer takes the stream; a stream still waiting in the queue is not timed.
   It covers the wait for chunks, not the commit that follows the last one, which the
-  server itself makes at once.
+  server itself makes at once. The bound limits stalls (no chunk for the interval), not
+  total time: a trickling upload that sends a chunk more often than that can still hold
+  a writer for as long as it likes.
 - **Known limit.** A streamed blob holds a blocking-pool thread of the server runtime
   while it appends (its `append` blocks). With the default `--write-bytes-in-flight` the
   streams in flight stay far below the pool's 512 threads; if that flag is raised until
