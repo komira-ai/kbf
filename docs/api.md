@@ -10,7 +10,8 @@ line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in c
 text (h2c, with prior knowledge); every rule below holds for both.
 
 Reads answer anyone who reaches the address: bind it where only operators do. The
-exceptions are the build pages, [`GET /v1/invocations/{id}`](#get-v1invocationsid-and-below)
+exceptions are the [enrollment routes](#v1enrolltokens-and-v1enrollnodes), which pass every
+gate of a write even to be read, and the build pages, [`GET /v1/invocations/{id}`](#get-v1invocationsid-and-below)
 and below, and [`GET /v1/blobs`](#get-v1blobsdigest), which run the REAPI policy and are
 off without it. Writes need a token (see [Who may write](#who-may-write)). The roles of
 [fleet-updates-security.md](design/fleet-updates-security.md) section S9 (`admin` for
@@ -272,6 +273,74 @@ the drain, and the unit templates in `kbf-deploy` set it.
 `:uncordon`). It prints the answer's JSON, exits 0 on a 2xx and 1 otherwise, and takes
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
 restart it.
+
+## `/v1/enroll/tokens` and `/v1/enroll/nodes`
+
+The operator's side of enrollment (`design/install-and-enrollment.md`):
+the tokens a node enrolls with, and the registry of nodes that did. They live in the state
+store, so a frontend that has no enrollment (until the enroll service lands, every
+frontend) answers every one of these routes with `404` once the call passes the gates.
+
+**Every route here, a GET included, passes every gate of [Who may write](#who-may-write):**
+a loopback peer, no `Origin` header, the bearer token, and `Content-Type: application/json`
+(send it on a GET and a DELETE too, with no body). The list of tokens and nodes is the farm's
+door, so unlike `GET /v1/nodes` it is not open to whoever reaches the address. A refused
+call changes nothing. Every answer carries `Cache-Control: no-store`.
+
+| Route | Does | Answer |
+|---|---|---|
+| `POST /v1/enroll/tokens` | makes a token | the token, **with its secret and string, once** |
+| `GET /v1/enroll/tokens` | lists the tokens | `{"tokens": [...]}`, never a secret, hash or string |
+| `DELETE /v1/enroll/tokens/{id}` | revokes a token | `{"id": "..."}` |
+| `GET /v1/enroll/nodes` | lists the nodes | `{"nodes": [...]}` |
+| `POST /v1/enroll/nodes/{id}/revoke` | revokes a node | `{"id": "...", "denied": [...]}` |
+
+**Create.** The body is `{"roles": ["daemon"], "max_uses": 1, "expires_in": 86400,
+"node_id": "n1", "node_prefix": "rack-", "names": [".example"], "replace": false,
+"label": "rack 4"}`; only `roles` is required (`storage` and `daemon`, one to two, no
+repeat). `max_uses` is 1 to 1000 (default 1); `expires_in` is seconds, at least 1 and at
+most 30 days (default a day); `node_id` and `node_prefix` restrict the node ids the token
+enrolls; `names` restricts the hosts a storage node may advertise (a host, or a suffix that
+starts with `.`; empty allows any); `replace` lets it re-enroll an id that exists. An
+unknown field is a `400`. The answer is
+
+```json
+{"token": "kbft1.<id>.<secret>.<pin>", "secret": "<base64url>", "info": {"id": "...", ...}}
+```
+
+`token` is what a node is given (the pin is the SHA-256 of the root CA certificate, which
+the node checks the frontend against at first contact). **This is the only answer that
+holds `token` or `secret`:** the state store keeps a hash of the secret, and no list
+returns the hash, the secret or the string. Lose it and revoke the token. A token whose
+string cannot be built (the frontend has no CA pin, `503`; the random source fails, `500`)
+is not stored.
+
+`info` and each element of `tokens` are `{id, roles, max_uses, uses, expires_at,
+created_at, revoked_at, node_id, node_prefix, names, replace, label, created_by}`; times
+are seconds on the state store's clock. **Revoke** stops new enrollments with the token;
+nodes it enrolled stay enrolled, and revoking a revoked token is a `200`. `404` for an
+unknown or malformed id.
+
+Each element of `nodes` is `{id, roles, state, advertise, zone, token_id, token_label,
+created_at, last_renewed_at, not_after, revoked_at}`, with `state` `active` or `revoked`
+and no certificate or key. **Revoking a node** takes no body (or `{}`), marks it `revoked`
+(its id is burned: no token enrolls that id again) and writes the deny rows for the node,
+each unexpired serial it holds or held and each of its keys, in one transaction; `denied`
+lists them as the deny list spells them (`node n1`, `serial ...`, `spki-sha256 ...`). `400`
+for a node already revoked, `404` for an unknown or malformed id.
+
+**Failures.** `400` for a body or value the registry refuses, `404` (above), `409` when
+this frontend is not the signer (it lost the writer role: nothing was written, call the
+current frontend; the enroll wire's `NotSigner`), `503` when the state store failed or
+other writers kept winning (try again), `500` for a stored row that does not decode.
+`401`, `403` and `415` are the gates'.
+
+`kbf token create|list|revoke` calls these routes from the frontend's host:
+`kbf token create --roles daemon --max-uses 3 --expires-in 24h --token-file <file>` prints
+the answer; with `--out <file>` the token string goes to that file alone (created new with
+mode `0600`, removed again if the call fails) and the terminal sees the token as a list
+shows it. `kbf token list` and `kbf token revoke <id>` take the same `--token-file` and
+`--api`.
 
 ## `GET /healthz` and `GET /readyz`
 

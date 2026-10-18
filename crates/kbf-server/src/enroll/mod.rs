@@ -26,7 +26,10 @@ pub trait PinSource: Send + Sync {
 /// Why no pin is available. The text is shown to the operator, so it names no secret.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub struct PinError(pub String);
+pub struct PinError(
+    /// Why the CA has no pin now.
+    pub String,
+);
 
 /// The source of a token's id and secret.
 pub trait Random: Send + Sync {

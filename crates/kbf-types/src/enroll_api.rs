@@ -18,7 +18,7 @@ const fn one() -> u32 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenCreate {
-    /// The roles it grants: `storage`, `daemon`, `mdm`.
+    /// The roles it grants: `storage`, `daemon`.
     pub roles: Vec<String>,
     /// How many nodes it can enroll: 1 to 1000. One when absent.
     #[serde(default = "one")]
@@ -187,9 +187,7 @@ mod tests {
         round(&TokenList {
             tokens: vec![info()],
         });
-        round(&TokenRevoked {
-            id: "a".to_owned(),
-        });
+        round(&TokenRevoked { id: "a".to_owned() });
         round(&TokenCreated {
             token: "kbft1.x".to_owned(),
             secret: "s".to_owned(),

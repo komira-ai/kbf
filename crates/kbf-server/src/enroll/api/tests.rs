@@ -5,8 +5,8 @@
 use std::io;
 use std::net::SocketAddr;
 use std::str::FromStr as _;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -36,12 +36,27 @@ impl Random for Counting {
     }
 }
 
-struct NoEntropy;
+/// A source whose fills from the `from`th on (counting from 0) fail.
+struct FailsFrom {
+    calls: AtomicU8,
+    from: u8,
+}
 
-impl Random for NoEntropy {
-    fn fill(&self, _: &mut [u8]) -> io::Result<()> {
-        Err(io::Error::other("no entropy"))
+impl Random for FailsFrom {
+    fn fill(&self, buf: &mut [u8]) -> io::Result<()> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) >= self.from {
+            return Err(io::Error::other("no entropy"));
+        }
+        buf.fill(7);
+        Ok(())
     }
+}
+
+fn fails_from(from: u8) -> Arc<dyn Random> {
+    Arc::new(FailsFrom {
+        calls: AtomicU8::new(0),
+        from,
+    })
 }
 
 struct Pin(Result<CaPin, PinError>);
@@ -118,7 +133,9 @@ async fn call(state: &Arc<EnrollState>, route: &Route, peer: SocketAddr, h: Head
     match route {
         Route::Create(body) => create(st, ConnectInfo(peer), h, Bytes::from(body.clone())).await,
         Route::List => list(st, ConnectInfo(peer), h).await,
-        Route::RevokeToken(id) => revoke_token(st, ConnectInfo(peer), Path(id.clone()), h).await,
+        Route::RevokeToken(id) => {
+            revoke_token_route(st, ConnectInfo(peer), Path(id.clone()), h).await
+        }
         Route::Nodes => nodes(st, ConnectInfo(peer), h).await,
         Route::RevokeNode(id) => {
             revoke_node(st, ConnectInfo(peer), Path(id.clone()), h, Bytes::new()).await
@@ -162,6 +179,16 @@ fn node(id: &str) -> NodeId {
 /// Enrolls node `name` with the daemon role the way the frontend's enroll service would,
 /// signing with a fixed certificate.
 fn enroll(store: &dyn Store, created: &TokenCreated, name: &str) -> Result<(), RefusalReason> {
+    enroll_csr(store, created, name, name.as_bytes())
+}
+
+/// As [`enroll`], with a CSR of its own (the same token and CSR again is a replay).
+fn enroll_csr(
+    store: &dyn Store,
+    created: &TokenCreated,
+    name: &str,
+    csr: &[u8],
+) -> Result<(), RefusalReason> {
     let id = TokenId::parse(&created.info.id).expect("id");
     let node_id = node(name);
     let seed = name.bytes().fold(0u8, u8::wrapping_add);
@@ -182,7 +209,7 @@ fn enroll(store: &dyn Store, created: &TokenCreated, name: &str) -> Result<(), R
             token_id: &id,
             secret: &secret_of(created),
             node_id: &node_id,
-            csrs: &[(Role::Daemon, name.as_bytes())],
+            csrs: &[(Role::Daemon, csr)],
             advertise: "",
             zone: "z",
         },
@@ -206,7 +233,10 @@ async fn the_secret_is_in_the_create_response_only() {
     )
     .await;
     assert_eq!(
-        answer.headers().get("cache-control").map(HeaderValue::as_bytes),
+        answer
+            .headers()
+            .get("cache-control")
+            .map(HeaderValue::as_bytes),
         Some(&b"no-store"[..])
     );
     let (code, created): (_, TokenCreated) = json(answer).await;
@@ -216,22 +246,21 @@ async fn the_secret_is_in_the_create_response_only() {
     assert_eq!(token.id().as_str(), created.info.id);
     assert_eq!(token.secret().as_bytes(), &[1u8; 32]);
     assert_eq!(token.pin(), &ca_pin());
-    assert_eq!(created.token.split('.').nth(2), Some(created.secret.as_str()));
+    assert_eq!(
+        created.token.split('.').nth(2),
+        Some(created.secret.as_str())
+    );
     assert_eq!(created.info.roles, ["storage", "daemon"]);
     assert_eq!((created.info.max_uses, created.info.uses), (3, 0));
     assert_eq!(created.info.label, "rack 4");
 
     let hash: [u8; 32] = Sha256::digest([1u8; 32]).into();
-    let hash_b64 = Token::new(
-        token.id().clone(),
-        TokenSecret::from_bytes(hash),
-        ca_pin(),
-    )
-    .to_line()
-    .split('.')
-    .nth(2)
-    .expect("secret part")
-    .to_owned();
+    let hash_b64 = Token::new(token.id().clone(), TokenSecret::from_bytes(hash), ca_pin())
+        .to_line()
+        .split('.')
+        .nth(2)
+        .expect("secret part")
+        .to_owned();
     let needles = [
         created.token.clone(),
         created.secret.clone(),
@@ -257,15 +286,27 @@ async fn the_secret_is_in_the_create_response_only() {
         .map(String::as_str)
         .collect();
     let mut want = vec![
-        "id", "roles", "max_uses", "uses", "expires_at", "created_at", "revoked_at", "node_id",
-        "node_prefix", "names", "replace", "label", "created_by",
+        "id",
+        "roles",
+        "max_uses",
+        "uses",
+        "expires_at",
+        "created_at",
+        "revoked_at",
+        "node_id",
+        "node_prefix",
+        "names",
+        "replace",
+        "label",
+        "created_by",
     ];
     let mut got = keys;
     want.sort_unstable();
     got.sort_unstable();
     assert_eq!(got, want);
     let (_, list): (_, TokenList) = json(ok(&state, &Route::List).await).await;
-    assert_eq!(list.tokens, [created.info.clone()]);
+    assert_eq!(list.tokens.len(), 1);
+    assert_eq!(list.tokens[0].id, created.info.id);
     assert_eq!(list.tokens[0].uses, 1);
     let (_, nodes): (_, NodeList) = json(ok(&state, &Route::Nodes).await).await;
     assert_eq!(nodes.nodes.len(), 1);
@@ -291,11 +332,14 @@ async fn every_route_is_behind_the_operator_gate() {
     let routes = Route::all(&created.info.id, "n1");
     let remote_v4 = SocketAddr::from(([192, 0, 2, 7], 5));
     let remote_v6: SocketAddr = "[2001:db8::1]:5".parse().expect("addr");
-    let no_writes = state_with(None, Some(api(
-        store.clone(),
-        Arc::new(Counting(AtomicU8::new(50))),
-        Ok(ca_pin()),
-    )));
+    let no_writes = state_with(
+        None,
+        Some(api(
+            store.clone(),
+            Arc::new(Counting(AtomicU8::new(50))),
+            Ok(ca_pin()),
+        )),
+    );
 
     for route in &routes {
         let mut cases: Vec<(&str, StatusCode, Response)> = Vec::new();
@@ -441,7 +485,7 @@ async fn a_node_revoke_writes_deny_rows_and_burns_the_id() {
     assert_eq!(nodes.nodes[0].state, "revoked");
     assert!(nodes.nodes[0].revoked_at.is_some());
     assert_eq!(
-        enroll(&*store, &created, "n1"),
+        enroll_csr(&*store, &created, "n1", b"another key"),
         Err(RefusalReason::NodeRevoked)
     );
     for (id, want) in [
@@ -455,7 +499,7 @@ async fn a_node_revoke_writes_deny_rows_and_burns_the_id() {
     // A node revoke takes no body, or `{}`.
     let st = State(Arc::clone(&state));
     let with = |body: &'static str| {
-        revoke_node(
+        revoke_node_route(
             st.clone(),
             ConnectInfo(loopback()),
             Path("n9".into()),
@@ -504,7 +548,9 @@ async fn a_stale_frontend_cannot_write() {
     let fresh = make(&new_state, r#"{"roles":["daemon"]}"#).await;
     assert_ne!(fresh.info.id, created.info.id);
     assert_eq!(
-        ok(&new_state, &Route::RevokeNode("n1".into())).await.status(),
+        ok(&new_state, &Route::RevokeNode("n1".into()))
+            .await
+            .status(),
         StatusCode::OK
     );
 }
@@ -566,8 +612,14 @@ async fn a_create_that_cannot_build_the_string_stores_nothing() {
             Err(PinError("the CA is not loaded".into())),
             StatusCode::SERVICE_UNAVAILABLE,
         ),
+        // The id's bytes fail, then the secret's.
         (
-            Arc::new(NoEntropy) as Arc<dyn Random>,
+            fails_from(0),
+            Ok(ca_pin()),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            fails_from(1),
             Ok(ca_pin()),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
@@ -592,10 +644,16 @@ async fn each_registry_failure_has_its_own_status() {
     let table = [
         (RegistryError::Invalid("bad"), StatusCode::BAD_REQUEST),
         (RegistryError::NotFound, StatusCode::NOT_FOUND),
-        (RegistryError::Corrupt("token"), StatusCode::INTERNAL_SERVER_ERROR),
+        (
+            RegistryError::Corrupt("token"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
         (RegistryError::Contended, StatusCode::SERVICE_UNAVAILABLE),
         (down, StatusCode::SERVICE_UNAVAILABLE),
-        (RegistryError::Store(StoreError::Fenced), StatusCode::CONFLICT),
+        (
+            RegistryError::Store(StoreError::Fenced),
+            StatusCode::CONFLICT,
+        ),
     ];
     for (failure, want) in table {
         let shown = failure.to_string();
@@ -637,4 +695,14 @@ fn the_routes_are_the_documented_ones() {
     assert_eq!(TOKENS, "/v1/enroll/tokens");
     assert_eq!(NODES, "/v1/enroll/nodes");
     let _router = routes(None, None);
+}
+
+// Catches a panicking store call turning into a hung request or a dropped connection: the
+// blocking task's failure is a 500 that says nothing of the panic.
+#[tokio::test]
+async fn a_panicking_call_is_a_server_error() {
+    let failed = blocking(|| -> Result<(), Failure> { panic!("the store call panicked") }).await;
+    let (code, body) = text(failed.expect_err("a failure").into_response()).await;
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!body.contains("panicked"), "{body}");
 }

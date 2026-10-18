@@ -810,6 +810,9 @@ impl<'a> Prepared<'a> {
             api.and_then(|api| api.token),
             Arc::clone(&drain),
             members.clone(),
+            // The enroll service and the CA that gives it a pin come with the frontend's
+            // enroll listener; until it exists, the enrollment routes answer 404.
+            None,
         )
         .merge(crate::health::router_of(Arc::clone(&checks)))
         .merge(metrics_route(
