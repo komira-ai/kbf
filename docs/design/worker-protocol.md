@@ -210,8 +210,8 @@ certificates and nodes. Each line is blank, a `#` comment, or one entry:
 ```
 serial 0A:1B:2C          # a certificate serial, hex; colons, case and leading zeros ignored
 spki-sha256 <64 hex>     # SHA-256 of the certificate's DER SubjectPublicKeyInfo
-node mac-07              # a node id, whatever certificate it presents; a storage
-                         # certificate with this DNS name too (see "Storage nodes")
+node mac-07              # a node id (any case), whatever certificate it presents; a
+                         # storage certificate with this DNS name too (see "Storage nodes")
 ```
 
 `openssl x509 -noout -serial` prints a certificate's serial;
@@ -239,11 +239,22 @@ and `Heartbeat` `PERMISSION_DENIED` when its serial or its public key is listed,
 **any DNS name in it** is a listed `node`. So a `node` entry is not only a daemon's node
 id: it also refuses a storage certificate that carries that DNS name, and where a host's
 daemon and its storage half share a DNS name, `node mac-07` takes both off the farm. To
-refuse one of the two, list its `serial` or `spki-sha256`. A storage certificate's IP
-names are never matched against `node` entries; list such a certificate by serial or
-key. A refused storage node's row lapses after the member TTL (`--member-ttl-secs`,
+refuse one of the two, list its `serial` or `spki-sha256`. A `node` entry is compared with
+the certificate's DNS names up to ASCII case; a storage certificate's IP names are never
+matched against `node` entries (so `POST /v1/denied` refuses one that holds an IP address),
+and neither is a name with a trailing dot; list such a certificate by serial or key. A refused storage node's row lapses after the member TTL (`--member-ttl-secs`,
 15 s), its member goes `down`, and after the dwell (`--member-dwell-secs`, 300 s) it
 leaves the map and its blobs move to other owners.
+
+**The file is the worker listener's only.** The storage nodes' own listeners do not read
+it. What they refuse is the storage map's deny list, which the operator writes with
+`POST /v1/denied` ([api.md](../api.md#post-v1denied-and-delete-v1denied)): the same three
+kinds of entry, applied to every storage endpoint and to the membership service, and
+carried to the nodes in the map (the file is not). An entry in the file does not stop a
+storage node's data-plane calls; an entry in the map does. The reverse also holds: this
+listener reads the file only, so an entry added with `POST /v1/denied` takes a daemon's
+storage access and leaves its work stream and its blob calls here open. To remove a daemon,
+list it in the file as well.
 
 A file that cannot be read or parsed after start refuses every check `UNAVAILABLE`
 (fail closed) until it is fixed. That ends **every** connected daemon's stream within

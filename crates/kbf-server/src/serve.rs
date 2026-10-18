@@ -180,6 +180,9 @@ pub enum ServeError {
     /// The storage map could not be read from the state store.
     #[error("storage map: {0}")]
     Map(#[from] MembershipError),
+    /// A frontend that was handing its work to a successor could not stand down.
+    #[error("handover: {0}")]
+    Handover(String),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
@@ -682,10 +685,15 @@ where
         Arc::clone(&cache),
         local,
         history.as_ref().map(crate::history::History::stats),
+        members.clone(),
         tls_sources,
     ))
     .merge(blob_routes)
     .merge(page_routes);
+    // The storage health, if there are members: no branch in this generic function.
+    let api_routes = members.iter().fold(api_routes, |routes, members| {
+        routes.merge(crate::storage_health::router(Arc::clone(members)))
+    });
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);

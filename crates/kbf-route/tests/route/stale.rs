@@ -81,10 +81,12 @@ async fn a_whole_blob_read_survives_a_stale_answer() {
     assert_eq!(f.cell.fetched(), [2]);
 }
 
-/// Catches a stale answer after a refetch looped on: the node still says stale once the
-/// router has fetched, which is UNAVAILABLE, and the map was fetched once.
+/// Catches a router that gives up after one refetch (with promotions each bumping the
+/// generation, a call spanning two of them would fail) and one that chases a map nobody
+/// has: the node says stale again after the fetch, the router fetches again, and when no
+/// newer map can be had the call is UNAVAILABLE with the fetch's reason.
 #[tokio::test]
-async fn a_second_stale_answer_is_unavailable() {
+async fn a_second_stale_answer_fetches_again() {
     let f = farm();
     f.cluster.node(3).hold(&f.blob);
     f.cluster.node(1).fail_read(stale());
@@ -97,15 +99,68 @@ async fn a_second_stale_answer_is_unavailable() {
         .read_range(&f.digest, 0, 0)
         .await
         .err()
-        .expect("stale twice");
+        .expect("generation 3 cannot be had");
     assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
     assert!(
-        error
-            .to_string()
-            .contains("newer than the map just fetched"),
+        error.to_string().contains("no frontend answered"),
         "{error}"
     );
-    assert_eq!(f.cell.fetched(), [2]);
+    assert_eq!(f.cell.fetched(), [2, 3]);
+}
+
+/// Catches a write that fails when the map moves several times during it (each member's
+/// promotion is a new generation): three promotions, each answered STALE_MAP by the owner,
+/// three fetches, and the write lands against the newest map. Mutant: one refetch only.
+#[tokio::test]
+async fn a_write_across_three_promotions_lands() {
+    let maps: Vec<Arc<Map>> = (1..=4).map(|g| map(g, 1, active(&[1]))).collect();
+    let cluster = Cluster::of(1);
+    let (router, cell) = router(&maps[0], &cluster);
+    for (stale_at, next) in [(2, &maps[1]), (3, &maps[2]), (4, &maps[3])] {
+        cluster
+            .node(1)
+            .fail_next(StorageError::StaleMap { current: stale_at });
+        cell.answer_fetch(Ok(view(next)));
+    }
+    let digest = router
+        .put(Bytes::from_static(b"across promotions"))
+        .await
+        .expect("written against generation 4");
+    assert_eq!(digest, sha(b"across promotions"));
+    assert_eq!(cell.fetched(), [2, 3, 4]);
+    assert_eq!(cluster.dialled(), [(1, 1), (1, 2), (1, 3), (1, 4)]);
+}
+
+/// Catches a router that chases a map that never settles: a node that answers STALE_MAP
+/// with a newer generation every time is followed for `MAX_MAP_REFETCHES` fetches, then
+/// the call is UNAVAILABLE naming how often the map moved.
+#[tokio::test]
+async fn a_map_that_never_settles_is_followed_only_so_far() {
+    let max = kbf_route::MAX_MAP_REFETCHES;
+    let maps: Vec<Arc<Map>> = (1..=(max as u64 + 2))
+        .map(|g| map(g, 1, active(&[1])))
+        .collect();
+    let cluster = Cluster::of(1);
+    let (router, cell) = router(&maps[0], &cluster);
+    for g in 2..=(max as u64 + 1) {
+        cluster
+            .node(1)
+            .fail_next(StorageError::StaleMap { current: g });
+        cell.answer_fetch(Ok(view(&maps[g as usize - 1])));
+    }
+    cluster.node(1).fail_next(StorageError::StaleMap {
+        current: max as u64 + 2,
+    });
+    let error = router
+        .put(Bytes::from_static(b"never settles"))
+        .await
+        .expect_err("the map kept moving");
+    assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
+    assert!(
+        error.to_string().contains(&format!("moved {max} times")),
+        "{error}"
+    );
+    assert_eq!(cell.fetched().len(), max);
 }
 
 /// Catches a retry that runs against the map it already used: the fetch brings the same
