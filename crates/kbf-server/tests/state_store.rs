@@ -1233,6 +1233,65 @@ async fn running(disk: &Disk) -> (TestFarm, kbf_front::Ticket, LeaseId) {
     (farm, ticket, leases[0])
 }
 
+/// The rows a cold start over `disk` finds of operation 0: `(unfinished, ended)`, where
+/// `unfinished` counts its `op/` rows and `ended` is whether a farm started over the store
+/// has its result. Read before the successor starts, which may write.
+fn standing(disk: &Disk) -> (usize, bool) {
+    let unfinished = disk.rows("op/");
+    let successor = disk.farm(EpochPolicy::Keep);
+    let ended = successor.ended(OperationId(0)).expect("read").is_some();
+    assert_eq!(ended, disk.rows("done/") == 1, "done/ rows and ended agree");
+    (unfinished, ended)
+}
+
+/// Catches: a finish written as two transactions, the operation's rows removed first and
+/// its `done/` row after. A process killed between the two leaves the result in no row:
+/// callers and followers never get it, and a cold start neither reruns the action (its
+/// `op/` row is gone) nor finds the result. The store takes `writes` writes of the
+/// finishing report and then the process dies: whatever the cut, the store holds exactly
+/// one of the operation's unfinished rows and its result.
+#[tokio::test(start_paused = true)]
+async fn a_crash_at_any_write_of_a_finish_leaves_the_operation_or_its_result() {
+    for writes in 0..4 {
+        let mut disk = Disk::new();
+        let (farm, _ticket, lease) = running(&disk).await;
+        disk.store.fail_after(writes);
+        let _ = accepted(&farm, lease).await;
+        disk.crash(farm);
+        let (unfinished, ended) = standing(&disk);
+        assert_eq!(
+            unfinished + usize::from(ended),
+            1,
+            "after {writes} writes: {unfinished} op rows, result {ended}: the result is lost \
+             or the operation both runs again and has an answer"
+        );
+    }
+}
+
+/// Catches: the same two-transaction gap for a refusal (the operation's rows removed, then
+/// the `done/` row): whatever write the process dies at, the store holds the operation or
+/// its refusal.
+#[tokio::test(start_paused = true)]
+async fn a_crash_at_any_write_of_a_refusal_leaves_the_operation_or_its_refusal() {
+    for writes in 0..4 {
+        let mut disk = Disk::new();
+        let (farm, _ticket, _lease) = running(&disk).await;
+        for _ in 0..2 {
+            let (_, mut inbox) = lose_lease(&farm).await;
+            assert_eq!(starts(&mut inbox).len(), 1);
+        }
+        disk.store.fail_after(writes);
+        let _ = lose_lease(&farm).await;
+        disk.crash(farm);
+        let (unfinished, ended) = standing(&disk);
+        assert_eq!(
+            unfinished + usize::from(ended),
+            1,
+            "after {writes} writes: {unfinished} op rows, refusal {ended}"
+        );
+    }
+}
+
 /// Catches: a `done/` row the store refused once and the farm never wrote again. The
 /// caller is answered from memory, but a successor (or a handover's follower) over the
 /// same store finds no result for the operation and tells the client it is lost. The
