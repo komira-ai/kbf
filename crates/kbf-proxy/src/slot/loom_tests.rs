@@ -1,5 +1,5 @@
 //! The loom models of the slot and gate (design note section 5). Run by
-//! `tools/ci/proxy-loom.sh` (`--cfg kbf_loom`); under a plain `cargo test` this module is not
+//! `cargo xtask proxy-loom` (`--cfg kbf_loom`); under a plain `cargo test` this module is not
 //! built. Each model runs every interleaving of its threads up to a preemption bound.
 
 use super::*;

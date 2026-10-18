@@ -35,7 +35,7 @@ rcgen.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "test-util"] }
 
-# The model checker, under its own cfg (see the workspace lints and tools/ci/proxy-loom.sh).
+# The model checker, under its own cfg (see the workspace lints and cargo xtask proxy-loom).
 [target.'cfg(kbf_loom)'.dependencies]
 loom.workspace = true
 
