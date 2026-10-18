@@ -55,6 +55,8 @@ enum FrontendFate {
     Busy,
     /// Shows the previous order, confirmed, until the new one reverts.
     StaleThenRevert,
+    /// Accepts the order but the reply names none.
+    NoOrderId,
 }
 
 /// A farm the operator API plays, driven by a clock that only moves when the deploy sleeps.
@@ -253,6 +255,9 @@ impl Operator for Farm {
                     return Farm::reply(409, json!({"error": "busy"}));
                 }
                 self.frontend_at.set(Some(now));
+                if self.frontend_fate == FrontendFate::NoOrderId {
+                    return Farm::reply(202, json!({}));
+                }
                 Farm::reply(202, json!({"order_id": 2}))
             }
             ("GET", "/readyz") => Farm::reply(if self.ready { 200 } else { 503 }, json!({})),
@@ -806,6 +811,22 @@ fn a_confirmed_record_of_an_earlier_order_is_not_ours() {
         "{}",
         s.line()
     );
+}
+
+/// Proves an accepted order whose reply names no order id is an API error: the stale
+/// `confirmed` of the previous order must not pass the step, and no post check runs.
+#[test]
+fn an_accepted_order_without_an_order_id_is_an_api_error() {
+    let mut f = farm(two_nodes());
+    f.frontend_fate = FrontendFate::NoOrderId;
+    let s = go(&f);
+    assert_eq!(
+        (s.exit, s.reason.as_str()),
+        (1, "api_error"),
+        "{}",
+        s.line()
+    );
+    assert_eq!(s.post, PostResult::default());
 }
 
 // ---- step 6: the frontend ------------------------------------------------------------

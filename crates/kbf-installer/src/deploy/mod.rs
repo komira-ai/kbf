@@ -450,7 +450,14 @@ impl Run<'_> {
         let order_id = reply
             .json()
             .and_then(|v| v.get("order_id").and_then(Value::as_u64))
-            .unwrap_or(0);
+            .filter(|&id| id >= 1)
+            .ok_or_else(|| {
+                fail(
+                    Exit::Failed,
+                    "api_error",
+                    "POST /v1/update/frontend: the reply names no order_id",
+                )
+            })?;
         self.sum.frontend = Some(summary::Frontend {
             order_id,
             state: "pending".to_owned(),

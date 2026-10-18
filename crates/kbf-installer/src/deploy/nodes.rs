@@ -127,7 +127,7 @@ pub fn frontend_in_flight(update: &Value) -> bool {
 /// The state of our frontend order; another order's state is not ours.
 pub fn frontend_state(update: &Value, order_id: u64) -> Option<String> {
     let f = frontend(update)?;
-    if order_id != 0 && f.get("order_id").and_then(Value::as_u64) != Some(order_id) {
+    if f.get("order_id").and_then(Value::as_u64) != Some(order_id) {
         return None;
     }
     f.get("state").and_then(Value::as_str).map(str::to_owned)
