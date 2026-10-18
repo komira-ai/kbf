@@ -40,22 +40,31 @@
 //! source ref (docs/deploy/host-releases.md, "What is trusted").
 
 pub mod activate;
+pub mod app;
 pub mod archive;
 pub mod attest;
 pub mod binary;
+pub mod cli;
 pub mod darwin;
+pub mod exit;
 #[cfg(test)]
 mod fixtures;
+#[cfg(any(test, feature = "testkit"))]
+pub mod golden;
 pub mod helper;
 pub mod inbox;
+pub mod installer_toml;
 pub mod layout;
 pub mod offer;
+pub mod record;
 pub mod refusal;
 pub mod release;
 pub mod run;
 pub mod settings;
 pub mod stage;
 pub mod state;
+pub mod state_v2;
+pub mod status_v2;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod trust;
