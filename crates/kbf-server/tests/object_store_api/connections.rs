@@ -204,6 +204,36 @@ async fn a_field_that_cannot_be_a_key_or_region_is_422() {
     assert!(farm.probe.calls().is_empty());
 }
 
+// Catches an off-by-one in the length bounds that refuses a legal value: a key id of exactly
+// 256 characters, a secret of exactly 1024 and a region of exactly 64 must be accepted (the
+// test above holds the first length past each bound refused).
+#[tokio::test]
+async fn a_key_id_secret_and_region_at_their_longest_are_accepted() {
+    let farm = Farm::new();
+    let body = |key: &str, secret: &str, region: &str| {
+        format!(
+            r#"{{"endpoint":"http://s3.example:9000","access_key_id":"{key}","secret_access_key":"{secret}","region":"{region}"}}"#
+        )
+    };
+    let cases = [
+        ("a", body(&"K".repeat(256), "s", "r")),
+        ("b", body("AKID", &"s".repeat(1024), "r")),
+        ("c", body("AKID", "s", &"r".repeat(64))),
+    ];
+    for (name, body) in cases {
+        let reply = farm.call("PUT", &at(name), &body).await;
+        assert_eq!(reply.status, 201, "{name}: {}", reply.body);
+    }
+    // And the first length past each bound is still refused.
+    for body in [
+        body(&"K".repeat(257), "s", "r"),
+        body("AKID", &"s".repeat(1025), "r"),
+        body("AKID", "s", &"r".repeat(65)),
+    ] {
+        assert_eq!(farm.call("PUT", &at("d"), &body).await.status, 422);
+    }
+}
+
 // Catches an `https` endpoint accepted (S3Store refuses TLS, so every node would fail on a
 // registration the API accepted), a refusal that is not distinguished from other bad
 // endpoints, and an endpoint with a path, userinfo or the wrong scheme accepted.

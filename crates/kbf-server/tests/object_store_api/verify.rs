@@ -59,6 +59,30 @@ async fn a_put_probes_the_bound_bucket_with_the_new_key() {
     );
 }
 
+// Catches a cold lookup that ignores which connection it was asked for: with two connections
+// and the role bound to only one, a PUT of the other would probe the bound one's bucket with
+// the other's key, and `:verify` on it would find a bucket it was never given.
+#[tokio::test]
+async fn a_connection_the_role_is_not_bound_to_has_nothing_to_probe() {
+    let farm = Farm::new();
+    registered(&farm).await;
+    let other = "/v1/object-stores/connections/other";
+    assert_eq!(
+        farm.call("PUT", other, &conn_body(SENTINEL)).await.status,
+        201
+    );
+    farm.probe.calls.lock().expect("calls").clear();
+
+    let again = farm.call("PUT", other, &conn_body("a-new-secret")).await;
+    assert_eq!(again.status, 200, "{}", again.body);
+    let answer: ConnectionPutAnswer = again.json();
+    assert_eq!(answer.verified, None, "cold is bound to another connection");
+
+    let verify = farm.call("POST", &format!("{other}:verify"), "{}").await;
+    assert_eq!((verify.status, verify.code().as_str()), (422, "no_bucket"));
+    assert!(farm.probe.calls().is_empty(), "no probe ran for `other`");
+}
+
 // Catches a failed probe that commits anyway (a registration every node would fail on), one
 // that leaves a row, a file or an audit row, a failure reported as something other than 422
 // `probe_failed` with the steps, a store's text in the answer, and `verify:false` that still
