@@ -6,10 +6,11 @@
 Description=kbf build farm storage node and node daemon
 Wants=network-online.target
 After=network-online.target
-# No ordering on a MinIO unit: the cold store need not be on this host. KBF_LISTEN_AFTER
-# adds the units this one starts after: a local MinIO's, the frontend name's resolver (a
-# VPN or overlay service), the listen address's interface.
-@KBF_LISTEN_AFTER_LINES@
+# No ordering on a MinIO unit: the cold store need not be on this host. Order the unit
+# after a local MinIO's, or the frontend name's resolver (a VPN or overlay service), in a
+# systemd drop-in on the host:
+# /etc/systemd/system/kbf-storage-and-daemon.service.d/after.conf
+# with After= and Wants=.
 
 # A failure that repeats quickly (the cold store or a disk not ready) must not use up
 # systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule

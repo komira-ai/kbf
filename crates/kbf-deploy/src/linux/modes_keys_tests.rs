@@ -161,12 +161,7 @@ fn each_mode_renders_its_full_flag_set() {
 #[test]
 fn each_new_key_reaches_exactly_the_units_that_read_it() {
     use Mode::{AllInOne, Daemon, Frontend, Storage, StorageAndDaemon};
-    let rows: [(&str, &str, &[Mode]); 10] = [
-        (
-            "KBF_LISTEN_AFTER",
-            "tailscaled.service",
-            &[Frontend, AllInOne, Storage, StorageAndDaemon],
-        ),
+    let rows: [(&str, &str, &[Mode]); 9] = [
         (
             "KBF_FRONTEND_NAME",
             "other.example.internal",
@@ -443,37 +438,10 @@ fn on_the_node_a_copy_of_the_key_beside_the_allowed_file_is_refused() {
     );
 }
 
-/// `KBF_LISTEN_AFTER` renders as one `After=` and one `Wants=` line, passes every rule of
-/// `check-units`, and unset renders no line. Catches a listen unit that ignores the
-/// setting (the frontend races the interface and stays down), only one of the two lines,
-/// and lines left behind when it is empty.
-#[test]
-fn the_listen_units_order_after_the_interface_service() {
-    let c = config_with(&[("KBF_LISTEN_AFTER", "tailscaled.service network.target")]);
-    for mode in [Mode::Frontend, Mode::AllInOne] {
-        let text = render(&c, Some(1500), mode).expect("renders");
-        assert!(
-            text.contains(
-                "After=network-online.target\nAfter=tailscaled.service network.target\nWants=tailscaled.service network.target\n"
-            ),
-            "{mode}:\n{text}"
-        );
-        let r = check(&c, mode, &text, true).expect("a unit");
-        assert!(r.failures.is_empty(), "{mode}: {:?}", r.failures);
-    }
-    let base = render(&config_with(&[]), Some(1500), Mode::Frontend).expect("renders");
-    assert!(
-        !base.contains("tailscaled") && !base.contains("\n\n\n"),
-        "{base}"
-    );
-}
-
 /// Catches a `storage` or `storage-and-daemon` unit ordered after `MINIO_UNIT`, a unit
 /// that does not exist on a host whose cold store is an external S3 endpoint (the
-/// ordering is a no-op there, and the setting only means something to the converged
-/// units); and `KBF_LISTEN_AFTER` no longer a way to order such a unit after a local
-/// MinIO. With `MINIO_UNIT` set to a name nothing else in the settings uses, the
-/// rendered units never carry it; naming it in `KBF_LISTEN_AFTER` does.
+/// ordering is a no-op there). With `MINIO_UNIT` set to a name nothing else in the
+/// settings uses, the rendered units never carry it.
 #[test]
 fn a_storage_unit_is_not_ordered_after_the_minio_unit() {
     let c = config_with(&[("MINIO_UNIT", "minio-kbf.service")]);
@@ -485,36 +453,4 @@ fn a_storage_unit_is_not_ordered_after_the_minio_unit() {
             "{mode}:\n{text}"
         );
     }
-    let c = config_with(&[
-        ("MINIO_UNIT", "minio-kbf.service"),
-        ("KBF_LISTEN_AFTER", "minio-kbf.service"),
-    ]);
-    for mode in [Mode::Storage, Mode::StorageAndDaemon] {
-        let text = render(&c, Some(1500), mode).expect("renders");
-        assert!(
-            text.contains("\nAfter=minio-kbf.service\nWants=minio-kbf.service\n"),
-            "{mode}:\n{text}"
-        );
-    }
-}
-
-/// Catches a `KBF_LISTEN_AFTER` that is pasted into the unit unchecked: a newline or `=`
-/// would add a directive, `%` a specifier, a path or a bare word a name that is not one.
-#[test]
-fn listen_after_refuses_what_is_not_a_unit_name() {
-    for bad in [
-        "a.service Exec=x",
-        "a=b.service",
-        "a%n.service",
-        "/etc/x.service",
-        "tailscaled",
-        ".service",
-        "-a.service",
-        "a.service;b.service",
-        "a$.service",
-    ] {
-        let e = LinuxConfig::parse(&text_with(&[("KBF_LISTEN_AFTER", bad)])).expect_err(bad);
-        assert!(e.to_string().contains("KBF_LISTEN_AFTER"), "{bad}: {e}");
-    }
-    assert!(LinuxConfig::parse(&text_with(&[("KBF_LISTEN_AFTER", "")])).is_ok());
 }

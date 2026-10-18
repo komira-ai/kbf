@@ -189,13 +189,9 @@ fails with "address not available". kbf retries that one error, and only that on
 to 90 seconds (250 ms, doubling to 2 s between attempts, each wait logged with the
 address), below the units' `TimeoutStartSec=120`; every other bind error (address in use,
 permission) is at once fatal. This covers every listener of `frontend`, `storage`,
-`storage-and-daemon` and `all-in-one`. `KBF_LISTEN_AFTER` (default empty) names systemd
-units, space separated (for example `tailscaled.service`), that the frontend,
-all-in-one, storage and storage-and-daemon units order after: rendered as `After=` and
-`Wants=` lines under the `network-online.target` ones. Only unit names are accepted (letters,
-digits and `: _ . @ -`, ending in a unit type such as `.service`); a value with a space
-inside a name, `=`, `%`, `/` or a newline is refused, so the setting cannot add a
-directive. `check-units` accepts the lines.
+`storage-and-daemon` and `all-in-one`. To order a unit after the service that brings the
+address up (`tailscaled.service`, say), put `After=` and `Wants=` in a systemd drop-in on
+the host, `/etc/systemd/system/<unit>.d/after.conf`; kbf-deploy has no option for it.
 
 ### A frontend name that does not resolve yet
 
@@ -210,13 +206,13 @@ lookup as a failed attempt, waits and resolves again, and never stops trying. (`
 does the same.) A node that cannot find its frontend therefore stays up and logs each
 failure; it is not restarted by systemd, and needs no restart when the resolver comes up.
 To order the unit after the resolver's service anyway, so the first tries are not
-wasted, name it in `KBF_LISTEN_AFTER` (`tailscaled.service`, say): the setting orders a
-unit after any unit, not only an interface's.
+wasted, use a drop-in on the host (`/etc/systemd/system/<unit>.d/after.conf` with
+`After=tailscaled.service` and `Wants=tailscaled.service`, say).
 
 `storage` and `storage-and-daemon` units are not ordered after a MinIO unit: their cold
 store is an `s3://` endpoint that need not be on the host, and `After=` on a unit that
-does not exist does nothing. On a host with a local MinIO, add `minio.service` to
-`KBF_LISTEN_AFTER`. (The converged `kbf-server.service` still starts after `MINIO_UNIT`.)
+does not exist does nothing. On a host with a local MinIO, order the unit after it in a drop-in
+(`/etc/systemd/system/<unit>.d/after.conf` with `After=` and `Wants=`). (The converged `kbf-server.service` still starts after `MINIO_UNIT`.)
 
 ### Exit 2 and exit 75: what systemd restarts
 
