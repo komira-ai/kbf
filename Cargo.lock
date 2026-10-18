@@ -1470,6 +1470,7 @@ dependencies = [
  "rcgen",
  "rustix",
  "rustls",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
@@ -1479,6 +1480,7 @@ dependencies = [
  "tonic",
  "tracing",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

@@ -27,10 +27,16 @@ fn file(name: &str, content: &str, mode: u32) -> String {
     path.display().to_string()
 }
 
-/// The JSON of a request's body.
+/// The JSON of a request's body, without its `null` members: the shared DTOs
+/// (`BindingPut`) spell an option not given as `null`, which the server reads as absent.
 fn json_of(request: &str) -> serde_json::Value {
     let (_, body) = request.split_once("\r\n\r\n").expect("a request head");
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body:?}"))
+    let mut json: serde_json::Value =
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body:?}"));
+    if let Some(members) = json.as_object_mut() {
+        members.retain(|_, v| !v.is_null());
+    }
+    json
 }
 
 /// Catches each read verb sending the wrong call, or sending it ungated. Every object
@@ -182,7 +188,7 @@ fn each_write_verb_sends_its_method_path_and_body() {
                 &token,
             ],
             "PUT /v1/object-stores/bindings/cold HTTP/1.1",
-            serde_json::json!({"connection": "main", "bucket": "farm-cold"}),
+            serde_json::json!({"connection": "main", "bucket": "farm-cold", "prefix": ""}),
         ),
         (
             &[
@@ -255,6 +261,9 @@ fn each_write_verb_sends_its_method_path_and_body() {
             "{args:?}: {request}"
         );
         let (_, sent) = request.split_once("\r\n\r\n").expect("a head");
+        if line.starts_with("PUT /v1/object-stores/connections") {
+            assert!(!sent.contains("null"), "an absent option is absent: {sent}");
+        }
         if body.is_null() {
             assert_eq!(sent, "", "{args:?}");
         } else if body == serde_json::json!({}) {
