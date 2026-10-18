@@ -236,6 +236,35 @@ impl Host {
         std::fs::write(self.status(), text).expect("status.json");
     }
 
+    /// The installer's word with its `frontend` section, as `kbf-installer` writes it. The
+    /// section's spelling is pinned in the installer's tests (`frontend/status_tests.rs`):
+    /// change one, change the other.
+    fn say_frontend(&self, order: &Value, state: &str, commit: &str, refusal: &str) {
+        self.say_section(
+            order["order_id"].as_u64().expect("order_id"),
+            order["epoch"].as_u64().expect("epoch"),
+            state,
+            commit,
+            refusal,
+        );
+    }
+
+    fn say_section(&self, order_id: u64, epoch: u64, state: &str, commit: &str, refusal: &str) {
+        let refusal = if refusal.is_empty() {
+            String::new()
+        } else {
+            format!(",\"refusal\":\"{refusal}\"")
+        };
+        let text = format!(
+            "{{\"schema\":2,\"installed_commit\":\"{commit}\",\"previous_commit\":null,\
+             \"staged_commit\":null,\"state\":\"idle\",\"refusal\":\"\",\"acked_order_id\":0,\
+             \"staged\":null,\"envoy\":{{\"current\":null,\"previous\":null}},\
+             \"frontend\":{{\"order_id\":{order_id},\"epoch\":{epoch},\"commit\":\"{commit}\",\
+             \"state\":\"{state}\"{refusal}}}}}\n"
+        );
+        std::fs::write(self.status(), text).expect("status.json");
+    }
+
     /// The installer takes the record out of the spool, as it does once it has read it.
     fn consume_records(&self) {
         for name in self.records() {
@@ -525,44 +554,72 @@ async fn without_a_state_store_a_release_store_or_an_installer_the_route_names_t
     assert_eq!(view["frontend"]["enabled"], false, "{view}");
 }
 
-/// Catches a row closed by something other than the installer finishing this order: with the
-/// record still in the spool, whatever the status says, the route is busy; with the record
-/// gone and the installer still fetching, busy; with it gone and a confirm of some other
-/// commit (a node order), busy; with it gone, nothing in flight and the commit installed, the
-/// row is closed and the next update is ordered; `reverted` and `refused` with the record gone
-/// close it too.
+/// Catches a row closed on a guess. The installer's `status.json` names the order in its
+/// `frontend` section; the row closes exactly when `order_id` and `epoch` are this row's and
+/// the state is terminal. Each of these leaves it open (409 `frontend_busy`) although the
+/// commit is installed and the record is gone: no section (an installer that predates it:
+/// only the deadline closes the row, checked at 3600 s), another order's section (a lower and
+/// a higher id, and the same id under another epoch), `pending` and `needs_operator`, and a
+/// missing status file. Each terminal word (`confirmed`, `reverted`, `refused`) closes it
+/// with the record still in the spool, and the next update is ordered.
 ///
-/// Mutant planted: the record-in-spool test dropped from the settled check.
+/// Mutants planted: close on a different order id (the id compare dropped); close on a
+/// non-terminal state (the terminal test dropped); ignore the section (only the deadline
+/// closes); the epoch compare dropped.
 #[tokio::test]
-async fn the_row_closes_when_the_installer_has_finished_with_the_order() {
+async fn the_row_closes_exactly_when_the_installer_names_the_order_in_a_terminal_state() {
     let h = host();
     for commit in [A, B] {
         h.put(commit, X86, true).await;
     }
-    assert_eq!(h.post(A).await.0, 202);
-    h.say("confirmed", Some(A));
-    assert_eq!(h.post(B).await.0, 409, "the record is still in the spool");
-    h.consume_records();
-    h.say("fetching", Some(B));
-    assert_eq!(h.post(B).await.0, 409, "still fetching");
-    h.say("activated_unconfirmed", Some(A));
-    assert_eq!(h.post(B).await.0, 409, "on trial");
-    h.say("confirmed", Some(B));
-    assert_eq!(
-        h.post(B).await.0,
-        409,
-        "a confirm of another commit is not ours"
+    let (code, first) = h.post(A).await;
+    assert_eq!(code, 202, "{first}");
+    let (id, epoch) = (
+        first["order_id"].as_u64().expect("id"),
+        first["epoch"].as_u64().expect("epoch"),
     );
+    h.consume_records();
+
     h.say("confirmed", Some(A));
-    let (code, next) = h.post(B).await;
-    assert_eq!(code, 202, "{next}");
-    assert_eq!(next["generation"], 2);
-    // Refused and reverted are ends of the update too.
-    for word in ["refused", "reverted"] {
-        h.consume_records();
-        h.say(word, Some(A));
-        assert_eq!(h.post(A).await.0, 202, "{word}");
+    assert_eq!(h.post(B).await.0, 409, "an installer with no section");
+    h.advance(Duration::from_secs(3599));
+    assert_eq!(h.post(B).await.0, 409, "still within the deadline");
+    for (name, order_id, epoch, state) in [
+        ("a lower id", id - 1, epoch, "confirmed"),
+        ("a higher id", id + 1, epoch, "reverted"),
+        ("another epoch", id, epoch + 1, "refused"),
+        ("pending", id, epoch, "pending"),
+        ("needs_operator", id, epoch, "needs_operator"),
+    ] {
+        h.say_section(order_id, epoch, state, A, "");
+        assert_eq!(h.post(B).await.0, 409, "{name}");
     }
+    std::fs::remove_file(h.status()).expect("rm");
+    assert_eq!(h.post(B).await.0, 409, "no status file");
+
+    // The record is still in the spool: the installer's word is what closes the row.
+    let mut order = first;
+    let mut last = A;
+    for (n, word) in ["confirmed", "reverted", "refused"].into_iter().enumerate() {
+        let next = if last == A { B } else { A };
+        h.say_frontend(
+            &order,
+            word,
+            last,
+            if word == "confirmed" { "" } else { "why" },
+        );
+        let (code, got) = h.post(next).await;
+        assert_eq!(code, 202, "{word}: {got}");
+        assert_eq!(got["generation"], n as u64 + 2);
+        (order, last) = (got, next);
+        h.consume_records();
+    }
+
+    // Past the deadline an installer with no section no longer holds the route.
+    h.say("confirmed", Some(last));
+    assert_eq!(h.post(A).await.0, 409);
+    h.advance(Duration::from_secs(3600));
+    assert_eq!(h.post(A).await.0, 202, "the deadline is the fallback");
 }
 
 /// Catches a rollback that does not outrank what it undoes: A, then B, then A again are
@@ -582,7 +639,7 @@ async fn a_rollback_is_an_older_commit_under_a_higher_generation() {
             order["order_id"].as_u64().expect("id"),
         ));
         h.consume_records();
-        h.say("confirmed", Some(commit));
+        h.say_frontend(&order, "confirmed", commit, "");
     }
     assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), vec![1, 2, 3]);
     assert!(seen.windows(2).all(|w| w[0].1 < w[1].1), "{seen:?}");
@@ -601,7 +658,7 @@ async fn the_views_show_the_row_and_the_installers_status_and_change_nothing() {
     assert_eq!(before["installer"]["present"], false);
     let (_, order) = h.post(A).await;
     h.consume_records();
-    h.say("confirmed", Some(A));
+    h.say_frontend(&order, "confirmed", A, "");
     for path in ["/v1/update/frontend", "/v1/update"] {
         let (code, view) = h.get(path).await;
         assert_eq!(code, 200, "{path}");
@@ -619,7 +676,7 @@ async fn the_views_show_the_row_and_the_installers_status_and_change_nothing() {
                 section["installer"]["state"].clone(),
                 section["installer"]["installed_commit"].clone(),
             ),
-            (json!("open"), json!(false), json!("confirmed"), json!(A)),
+            (json!("open"), json!(false), json!("idle"), json!(A)),
             "{section}"
         );
     }

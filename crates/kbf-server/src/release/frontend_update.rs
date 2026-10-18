@@ -19,11 +19,11 @@
 //!   the row again and answers `500`. A crash between the two leaves an open row and no
 //!   record, which the deadline below closes. `202 {order_id, epoch, generation, commit}`.
 //! - One update is in flight at a time. The row is closed by the next call, read, when the
-//!   record is gone from the spool, the installer reports no update in flight and says the
-//!   commit is installed (or that it reverted or refused); `status.json` carries no order id
-//!   for a frontend order, so the record leaving the spool is what ties the status to the
-//!   order. After [`DEADLINE`] it is closed whatever the installer says, so an installer that
-//!   died cannot hold the route for ever. A `GET` reads the row and closes nothing.
+//!   installer's `status.json` has a `frontend` section naming this row's order (`order_id`
+//!   and `epoch`) in a terminal state (`confirmed`, `reverted` or `refused`). An installer
+//!   that predates the section never says so; after [`DEADLINE`] the row is closed whatever
+//!   the installer says, so one that died, or never wrote the section, cannot hold the route
+//!   for ever. A `GET` reads the row and closes nothing.
 //! - The generation is the last row's plus one: a rollback is an older commit under a higher
 //!   generation. The order id is drawn from the store's counter under the frontend's lease
 //!   epoch, as the nodes' orders are.
@@ -239,27 +239,23 @@ struct Order {
     commit: String,
 }
 
-/// Whether the open `row` is over: past [`DEADLINE`], or the record is gone from the spool and
-/// the installer, in no update of its own, has the commit installed or says it reverted or
-/// refused. Reads the spool and the status file.
+/// Whether the open `row` is over: past [`DEADLINE`], or the installer's `status.json` carries
+/// a `frontend` section for exactly this order (`order_id` and `epoch`) in a terminal state
+/// (confirmed, reverted or refused). A section for another order, a state still moving
+/// (`pending`, `needs_operator`), no section (an installer that predates it) and a status file
+/// that cannot be read are not an end: only the deadline closes the row then. Reads the status
+/// file.
 fn settled(row: &FrontendRow, installer: &Installer, now_ms: u64) -> bool {
     let waited = now_ms.saturating_sub(row.written_at_ms);
     if waited >= u64::try_from(DEADLINE.as_millis()).unwrap_or(u64::MAX) {
         return true;
     }
-    if installer.spool.has(row.order.epoch, row.order.seq) {
-        return false;
-    }
     let Helper::Reported(report) = helper::read(&installer.status_file) else {
         return false;
     };
-    let in_flight = matches!(
-        report.state,
-        HelperState::Fetching | HelperState::ActivatedUnconfirmed
-    );
-    let installed = report.installed.as_deref() == Some(row.commit.as_str());
-    !in_flight
-        && (installed || matches!(report.state, HelperState::Reverted | HelperState::Refused))
+    report.frontend.is_some_and(|f| {
+        f.order_id == row.order.seq && f.epoch == row.order.epoch && f.state.is_terminal()
+    })
 }
 
 /// The components of `commit` for `platform` as the record carries them, if the store holds

@@ -25,6 +25,38 @@ pub enum HelperState {
     Refused,
 }
 
+/// Where the installer's frontend update stands, from the `frontend` section of
+/// `status.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendState {
+    Pending,
+    NeedsOperator,
+    Confirmed,
+    Reverted,
+    Refused,
+}
+
+impl FrontendState {
+    /// The installer is done with the order: it will say nothing more about it.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Confirmed | Self::Reverted | Self::Refused)
+    }
+}
+
+/// The installer's word on the newest `frontend_update` order it acted on. Unknown keys are
+/// ignored: a newer installer may say more.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct FrontendReport {
+    pub order_id: u64,
+    pub epoch: u64,
+    pub commit: String,
+    pub state: FrontendState,
+    #[serde(default)]
+    pub refusal: String,
+}
+
 /// A well-formed status file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
@@ -35,6 +67,10 @@ pub struct Report {
     pub refusal: String,
     pub acked_order_id: u64,
     pub staged_facts: Option<Staged>,
+    /// The frontend section; `None` from an installer that predates it, or a section this
+    /// client cannot read (the node fields are still good, and the readers of this section
+    /// fall back to their own deadline).
+    pub frontend: Option<FrontendReport>,
 }
 
 /// What reading the file found.
@@ -58,6 +94,8 @@ struct Raw {
     refusal: String,
     acked_order_id: u64,
     staged: Option<RawStaged>,
+    #[serde(default)]
+    frontend: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -113,6 +151,10 @@ fn parse(bytes: &[u8]) -> Result<Report, String> {
         state,
         refusal: raw.refusal,
         acked_order_id: raw.acked_order_id,
+        frontend: raw
+            .frontend
+            .and_then(|v| serde_json::from_value::<FrontendReport>(v).ok())
+            .filter(|f| is_hex(&f.commit, 40)),
         staged_facts: raw.staged.map(|s| Staged {
             protocol: s.protocol,
             min_protocol: s.min_protocol,
@@ -131,3 +173,7 @@ impl Report {
             .any(|held| held == commit)
     }
 }
+
+#[cfg(test)]
+#[path = "helper_tests.rs"]
+mod tests;
