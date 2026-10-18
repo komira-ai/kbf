@@ -540,6 +540,10 @@ fn backoff(attempt: u32) -> Duration {
 }
 
 #[cfg(test)]
+#[path = "fly_tests.rs"]
+mod fly_tests;
+
+#[cfg(test)]
 mod tests {
     use super::upload_share;
 

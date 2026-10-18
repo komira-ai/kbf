@@ -342,6 +342,7 @@ impl Trio {
                 zone: String::new(),
                 weight: 1,
                 state: MemberState::Active,
+                boot: 0,
             })
             .collect();
         let map = Map::new(1, members, Rule::Rendezvous, 1, 1, Vec::new()).expect("a map");

@@ -30,7 +30,7 @@ use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status};
 
 use super::{MAP_GENERATION_HEADER, MAX_MESSAGE_BYTES, UNOWNED_HEADER, wire};
-use crate::{Answer, PutStream, ReadStream, Storage, StorageError};
+use crate::{ActionEntry, Answer, PutStream, ReadStream, Storage, StorageError};
 
 /// The largest message of a `Write`'s data.
 const WRITE_CHUNK_BYTES: usize = 1 << 20;
@@ -328,6 +328,15 @@ impl Storage for RemoteStorage {
         action: &'a Digest,
     ) -> Answer<'a, Option<(Digest, ActionResult)>> {
         Box::pin(async move {
+            Ok(self
+                .action_entry(action)
+                .await?
+                .map(|entry| (entry.result_digest, entry.result)))
+        })
+    }
+
+    fn action_entry<'a>(&'a self, action: &'a Digest) -> Answer<'a, Option<ActionEntry>> {
+        Box::pin(async move {
             let generation = self.generation();
             let request = GetRequest {
                 map_generation: generation,
@@ -341,9 +350,24 @@ impl Storage for RemoteStorage {
             let Some(entry) = response.into_inner().entry else {
                 return Ok(None);
             };
-            let digest = wire::digest(entry.result_digest.as_ref()).map_err(other)?;
+            let result_digest = wire::digest(entry.result_digest.as_ref()).map_err(other)?;
             let result = entry.result.unwrap_or_default();
-            Ok(Some((digest, result)))
+            // Unset: an older node that does not report the closure, so unchecked.
+            let closure = entry
+                .closure
+                .map(|c| {
+                    c.digests
+                        .iter()
+                        .map(|d| wire::digest(Some(d)))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()
+                .map_err(other)?;
+            Ok(Some(ActionEntry {
+                result_digest,
+                result,
+                closure,
+            }))
         })
     }
 
