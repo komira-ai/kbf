@@ -142,8 +142,8 @@ async fn a_farm_is_quiet_when_no_call_is_between_its_request_and_its_queueing() 
 /// whatever the successor does: it finishes an operation (its `done/` row is the answer),
 /// leaves one queued (nothing changes), or leaves no trace of one (answered UNAVAILABLE at
 /// the third look in a row, counted in `kbf_frontend_relay_lost_total`; a look that finds
-/// the operation again starts the count over, so a successor between the two transactions
-/// of a finish is not taken for one that lost the operation). Each follow returns how many
+/// the operation again starts the count over, so a look that misses a row for a moment
+/// is not taken for a lost operation). Each follow returns how many
 /// callers still wait. Mutants: a vanished operation answered at the first look; the look
 /// count not reset by a look that finds the operation; the `done/` row ignored.
 #[tokio::test(start_paused = true)]
