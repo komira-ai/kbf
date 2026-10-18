@@ -332,7 +332,7 @@ fn denies(name: &str, run: &Run, done: impl Fn(&Denies) -> bool) -> Denies {
             .args([
                 "show", "--style", "compact", "--start", &run.since, "--end", &run.until,
             ])
-            .args(["--predicate", "sender == \"Sandbox\""])
+            .args(["--predicate", kbf_driver_native::denials::PREDICATE])
             .stdin(Stdio::null())
             .output()
             .expect("log show");

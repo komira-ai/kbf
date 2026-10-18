@@ -799,24 +799,51 @@ fn args_without_node_label(p: &Profile) -> Vec<String> {
         .collect()
 }
 
-/// Catches: the profile's `kbf_data_dir` not rendered as the daemon's `--data-dir`, or
-/// rendered with the removed `--scratch` or `--cache-dir` (the daemon refuses both).
+/// Catches: the job not running `kbf node` with the config file and the labels (a plist
+/// that still names `kbf-daemon` and the profile's server and certificates would skip
+/// enrollment), the profile's server, certificates, node id and data directory still
+/// rendered as arguments (`kbf node` takes them from `kbf.toml` and the frontend), or the
+/// removed `--scratch` and `--cache-dir` flags.
 #[test]
-fn kbf_data_dir_renders_data_dir_and_no_removed_flag() {
+fn the_job_runs_kbf_node_with_its_config_and_the_labels() {
     let p = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
     assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     let args = kbf_mac_provision::launchd::daemon_args(&p);
-    let at = args.iter().position(|a| a == "--data-dir").unwrap();
-    assert_eq!(args[at + 1], "/Volumes/kbf/data");
+    let label = p.node_label();
+    assert_eq!(
+        args,
+        [
+            "/usr/local/kbf/current/kbf",
+            "node",
+            "--config",
+            "/usr/local/etc/kbf/kbf.toml",
+            "--label",
+            label.as_str(),
+            "--label",
+            "pool=mac",
+            "--label",
+            "rack=r2",
+        ]
+    );
     let plist = kbf_mac_provision::launchd::render_plist(&p);
-    for removed in ["--scratch", "--cache-dir", "--cache-", "--tree-"] {
-        assert!(!plist.contains(removed), "{removed} in\n{plist}");
+    for absent in [
+        "--scratch",
+        "--cache-dir",
+        "--cache-",
+        "--tree-",
+        "--server",
+        "--cert",
+        "--data-dir",
+        "--node-id",
+        "current/kbf-daemon",
+    ] {
+        assert!(!plist.contains(absent), "{absent} in\n{plist}");
     }
 }
 
 /// Catches: the old key `kbf_scratch` refused (a profile written before the rename
 /// would stop provisioning), accepted without a warning, or not treated as
-/// `kbf_data_dir` (the daemon would run without `--data-dir`).
+/// `kbf_data_dir` (the data directory the profile checks would be another key's).
 #[test]
 fn the_old_key_is_accepted_with_a_warning_and_renders_the_same() {
     let new = Profile::parse(edited(|_| {}).as_bytes()).unwrap();

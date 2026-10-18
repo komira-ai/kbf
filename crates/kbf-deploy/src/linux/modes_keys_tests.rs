@@ -88,7 +88,7 @@ fn each_mode_renders_its_full_flag_set() {
         words(&[
             "--cold-store=s3://kbf-cas/farm2/?endpoint=http://127.0.0.1:9000&conditional-put=true",
             "--meta-dir=/var/lib/kbf-server/raft",
-            "--hot-store=file:///var/lib/kbf-server/hot",
+            "--hot-store=file:///var/lib/kbf/hot",
             "--storage-listen=192.0.2.10:8983",
             "--storage-tls-cert=/etc/kbf/storage.pem",
             "--storage-tls-key=/etc/kbf/storage.key",
@@ -96,6 +96,7 @@ fn each_mode_renders_its_full_flag_set() {
             "--frontend=https://front.example.internal:8981",
             "--advertise-addr=storage-node.example.internal:8983",
             "--driver=container",
+            "--oci-runtime=/usr/bin/crun",
             "--server=https://front.example.internal:8981",
             "--ca-cert=/etc/kbf/ca.pem",
             "--cert=/etc/kbf/node.pem",
@@ -112,6 +113,7 @@ fn each_mode_renders_its_full_flag_set() {
         flags(&c, Mode::Daemon),
         words(&[
             "--driver=container",
+            "--oci-runtime=/usr/bin/crun",
             "--server=https://front.example.internal:8981",
             "--cas=https://front.example.internal:8981",
             "--ca-cert=/etc/kbf/ca.pem",
@@ -129,7 +131,7 @@ fn each_mode_renders_its_full_flag_set() {
         flags(&c, Mode::Storage),
         words(&[
             "--cold-store=s3://kbf-cas/farm2/?endpoint=http://127.0.0.1:9000&conditional-put=true",
-            "--hot-store=file:///var/lib/kbf-server/hot",
+            "--hot-store=file:///var/lib/kbf/hot",
             "--meta-dir=/var/lib/kbf-server/raft",
             "--storage-listen=192.0.2.10:8983",
             "--storage-tls-cert=/etc/kbf/storage.pem",
