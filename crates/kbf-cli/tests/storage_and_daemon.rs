@@ -126,6 +126,8 @@ fn start_node(bin: &Path, flags: &[String]) -> (Running, SocketAddr) {
         .args(flags)
         .args(cgroup_tree(bin))
         .env("PATH", image_path(bin))
+        // Rootless Podman's runtime directory, which the startup self-checks look for.
+        .env("XDG_RUNTIME_DIR", bin)
         // The stand-in finds its state beside the link it was run through, which the
         // driver runs by the name `PATH` finds (argv0 `podman`): from here.
         .current_dir(bin)
@@ -372,18 +374,27 @@ fn replaced(flags: Vec<String>, extra: &[String]) -> Vec<String> {
 /// (plain text off loopback) exits 2 before the daemon half starts; with an `s3://` cold
 /// store (no connection is made until a blob moves) the storage half starts and prints
 /// its start line, and a daemon half whose driver cannot start (no subordinate ids for
-/// its user) then exits 1, as `kbf-daemon` does.
+/// its user) then exits 2, as `kbf-daemon` does.
 #[test]
 fn a_start_either_half_refuses_says_which() {
     let dir = scratch("refused");
     pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    podman(
+        &bin,
+        FAKE_PODMAN,
+        &["write-lines", "$UPPER/out/file.txt", "a file"],
+    );
+    let (path, xdg) = (image_path(&bin), bin.display().to_string());
+    let host = [("PATH", path.as_str()), ("XDG_RUNTIME_DIR", xdg.as_str())];
     let worker: SocketAddr = "127.0.0.1:1".parse().expect("address");
     let wide = ["--storage-listen=0.0.0.0:0".to_owned()];
     let plain: Vec<String> = node_flags(&dir, worker)
         .into_iter()
         .filter(|flag| !STORAGE_TLS.iter().any(|tls| flag.starts_with(tls)))
         .collect();
-    let (code, out, err) = refused(&replaced(plain, &wide), &[]);
+    let (code, out, err) = refused(&replaced(plain, &wide), &host);
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("kbf storage-and-daemon: storage: "), "{err}");
     assert!(out.is_empty(), "{out}");
@@ -398,11 +409,15 @@ fn a_start_either_half_refuses_says_which() {
         .filter(|flag| !flag.starts_with("--hot-store="))
         .collect();
     let env = [
+        host[0],
+        host[1],
         ("AWS_ACCESS_KEY_ID", "test-key"),
         ("AWS_SECRET_ACCESS_KEY", "test-secret"),
     ];
     let (code, out, err) = refused(&flags, &env);
-    assert_eq!(code, Some(1), "{err}");
+    // 2, not 1: a user without subordinate ids is a refusal a restart would not change
+    // (the unit's RestartPreventExitStatus=2 leaves it down).
+    assert_eq!(code, Some(2), "{err}");
     assert!(out.starts_with("kbf-storage "), "{out}");
     assert!(err.contains("kbf storage-and-daemon: daemon: "), "{err}");
 }

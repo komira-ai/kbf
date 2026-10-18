@@ -1437,6 +1437,7 @@ dependencies = [
  "kbf-driver-container",
  "kbf-host",
  "kbf-node",
+ "kbf-peer",
  "kbf-proto",
  "kbf-server",
  "kbf-state",
@@ -1447,9 +1448,11 @@ dependencies = [
  "prost",
  "rcgen",
  "rustix",
+ "rustls",
  "serde_json",
  "tokio",
  "tonic",
+ "x509-parser",
 ]
 
 [[package]]

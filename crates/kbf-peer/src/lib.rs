@@ -129,6 +129,16 @@ pub struct PeerNames {
 }
 
 impl PeerNames {
+    /// Every name as written: the DNS names, then the IP addresses.
+    #[must_use]
+    pub fn all(&self) -> Vec<String> {
+        self.dns
+            .iter()
+            .cloned()
+            .chain(self.ips.iter().map(ToString::to_string))
+            .collect()
+    }
+
     /// Whether one of the names is `host`: a bare host, without port or brackets (see
     /// [`host_of`]). A host that parses as an IP address is covered by an IP name of
     /// the same address and by no DNS name; any other host is covered by a DNS name equal
