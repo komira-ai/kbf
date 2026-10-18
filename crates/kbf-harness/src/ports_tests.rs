@@ -189,3 +189,11 @@ fn the_search_wraps_round_the_blocks_once_and_gives_up() {
     });
     assert_eq!(*tried.borrow(), [2, 3, 0, 1]);
 }
+
+#[test]
+#[should_panic(expected = "all 199 blocks of ports are held or busy")]
+fn a_host_with_no_block_to_spare_is_told_so() {
+    // Catches: a farm that starts with a block somebody else holds, or a failure that does
+    // not say how many blocks there were.
+    exhausted(199);
+}

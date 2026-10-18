@@ -63,6 +63,14 @@ pub fn log_files(logs: &Path, name: &str, generation: usize) -> (PathBuf, PathBu
     )
 }
 
+/// What the child does between fork and exec: asks the kernel to kill it with SIGKILL when the
+/// thread that started it ends, which a harness killed by SIGKILL (no `Drop` runs) does. A
+/// function of its own so the test that runs it in a process of its own covers it (the
+/// child's own counters are lost at exec).
+fn die_with_the_harness() -> std::io::Result<()> {
+    rustix::process::set_parent_process_death_signal(Some(Signal::KILL)).map_err(Into::into)
+}
+
 impl Proc {
     /// Starts `spec`, its stdout and stderr in the files [`log_files`] names, as the leader of
     /// a process group of its own that the kernel kills with SIGKILL when the harness
@@ -83,15 +91,10 @@ impl Proc {
             .stdout(Stdio::from(File::create(&out).expect("stdout file")))
             .stderr(Stdio::from(File::create(&err).expect("stderr file")))
             .process_group(0);
-        // SAFETY: the closure runs in the child between fork and exec and makes one system
-        // call (prctl), which is async-signal-safe; it allocates nothing. The kernel then
-        // kills the child if the thread that started it ends, which a harness killed by
-        // SIGKILL (no Drop runs) does.
+        // SAFETY: the function runs in the child between fork and exec and makes one system
+        // call (prctl), which is async-signal-safe; it allocates nothing.
         unsafe {
-            command.pre_exec(|| {
-                rustix::process::set_parent_process_death_signal(Some(Signal::KILL))
-                    .map_err(Into::into)
-            });
+            command.pre_exec(die_with_the_harness);
         }
         let child = command
             .spawn()

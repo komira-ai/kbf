@@ -23,21 +23,26 @@ pub fn sibling_bin(name: &str) -> PathBuf {
     sibling_of(&exe, name)
 }
 
-/// The binary `name` in the profile directory (`target/debug`) that holds `exe`'s directory
-/// (`target/debug/deps`).
+/// The binary `name` in the nearest directory above `exe` that holds it: the profile
+/// directory (`target/debug`), which is two above a test binary in `deps/` and further above
+/// one in the nested layout (`target/debug/build/<package>/<hash>/deps/`) that a newer cargo,
+/// and the coverage job's, uses.
 ///
 /// # Panics
 /// When there is no such file.
 #[must_use]
 pub fn sibling_of(exe: &Path, name: &str) -> PathBuf {
-    let profile = exe.parent().and_then(Path::parent).unwrap_or(exe);
-    let path = profile.join(name);
-    assert!(
-        path.is_file(),
-        "{} is not built: `cargo test --workspace` builds it, or `cargo build -p kbf-harness --bins`",
-        path.display()
-    );
-    path
+    let found = exe
+        .ancestors()
+        .skip(1)
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file());
+    found.unwrap_or_else(|| {
+        panic!(
+            "{name} is not built above {}: `cargo test --workspace` builds it, or `cargo build -p kbf-harness --bins`",
+            exe.display()
+        )
+    })
 }
 
 #[cfg(test)]

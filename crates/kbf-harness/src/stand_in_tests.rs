@@ -14,6 +14,21 @@ fn a_binary_is_found_in_the_profile_directory_above_the_test_binarys() {
 }
 
 #[test]
+fn a_binary_is_found_above_a_nested_test_binary_too() {
+    // Catches: a lookup of exactly two directories up, which the coverage job's layout
+    // (`debug/build/<package>/<hash>/deps/<test binary>`) defeats, and the nearest
+    // directory not being preferred over a farther one.
+    let dir = crate::scratch("stand-in-nested");
+    std::fs::create_dir_all(dir.join("debug/build/kbf-harness/ab12/deps")).expect("dirs");
+    std::fs::write(dir.join("debug/fake"), b"").expect("file");
+    std::fs::write(dir.join("fake"), b"").expect("file");
+    let exe = dir.join("debug/build/kbf-harness/ab12/deps/kbf_harness-1234");
+    assert_eq!(sibling_of(&exe, "fake"), dir.join("debug/fake"));
+    std::fs::write(dir.join("debug/build/fake"), b"").expect("file");
+    assert_eq!(sibling_of(&exe, "fake"), dir.join("debug/build/fake"));
+}
+
+#[test]
 #[should_panic(expected = "cargo build -p kbf-harness --bins")]
 fn a_binary_that_was_not_built_says_how_to_build_it() {
     // Catches: a missing stand-in reported as a spawn failure far from the cause.

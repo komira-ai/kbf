@@ -17,7 +17,7 @@ const HELPER: &str = "KBF_HARNESS_HELPER";
 const REPORT: &str = "KBF_HARNESS_REPORT";
 
 /// Not a test: the process the tests below run again. Without [`HELPER`] it does nothing.
-/// `orphan` starts `sleep` and exits, leaving it; `harness` starts a [`Proc`] running `sleep`
+/// `deathsig` asks for the parent-death signal and says what it is set to; `orphan` starts `sleep` and exits, leaving it; `harness` starts a [`Proc`] running `sleep`
 /// and waits to be killed; `interruptible` supervises two `sleep`s until it is asked to stop,
 /// then stops them (SIGTERM, as `kbf-beta` does); any other role is that one.
 #[test]
@@ -43,6 +43,11 @@ fn helper() {
         cwd: dir.clone(),
     };
     match role.as_str() {
+        "deathsig" => {
+            die_with_the_harness().expect("prctl");
+            let now = rustix::process::parent_process_death_signal().expect("prctl");
+            say(format!("signal {now:?}"));
+        }
         "orphan" => {
             let child = Command::new("sleep")
                 .arg("300")
@@ -271,4 +276,20 @@ fn an_instant_too_far_away_is_far_away_not_a_panic() {
     let far = after(Duration::MAX);
     assert!(far > after(Duration::from_secs(365 * 24 * 3600)));
     assert!(after(Duration::ZERO) <= Instant::now());
+}
+
+#[test]
+fn the_child_asks_for_sigkill_when_its_harness_goes() {
+    // Catches: a child started without the parent-death signal, or with another signal than
+    // the one that cannot be ignored. The function the child runs between fork and exec is
+    // run in a process of its own (the child's counters are lost at exec) and the process
+    // says what the kernel then holds. Mutant: the function asks for nothing.
+    let d = crate::scratch("deathsig");
+    let report = d.join("report");
+    let status = helper_process("deathsig", &report)
+        .status()
+        .expect("the helper");
+    assert!(status.success());
+    let text = std::fs::read_to_string(&report).expect("the report");
+    assert_eq!(text.trim(), format!("signal {:?}", Some(Signal::KILL)));
 }

@@ -69,6 +69,11 @@ fn blocks(floor: u16) -> u32 {
     u32::from(floor.min(EPHEMERAL).saturating_sub(FIRST) / BLOCK)
 }
 
+/// The end of a search that found no block.
+fn exhausted(count: u32) -> ! {
+    panic!("all {count} blocks of ports are held or busy")
+}
+
 /// The first `Some` that `try_block` gives for block `start % count`, then the blocks after
 /// it, round the `count` blocks once; `None` when every one gives `None`.
 fn search<T>(count: u32, start: u32, try_block: impl Fn(u32) -> Option<T>) -> Option<T> {
@@ -101,8 +106,7 @@ impl Claim {
         let count = blocks(floor);
         assert!(count > 0, "no room for a block of ports below {floor}");
         let _ = std::fs::create_dir_all(lock_dir());
-        search(count, start, Self::try_block)
-            .unwrap_or_else(|| panic!("all {count} blocks of ports are held or busy"))
+        search(count, start, Self::try_block).unwrap_or_else(|| exhausted(count))
     }
 
     /// Block `index` if nobody holds it and every port of it can be bound now.
