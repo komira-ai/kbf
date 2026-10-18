@@ -23,7 +23,15 @@
 Description=kbf build farm frontend, instance %i
 Wants=network-online.target
 After=network-online.target
+# A listen address on a VPN or overlay interface can appear after network-online.target
+# (kbf#998). Order the frontend after that interface's own service with a drop-in,
+# /etc/systemd/system/kbf-frontend@.service.d/listen-after.conf, holding After= and
+# Wants= lines; kbf-installer writes it where kbf.toml names such a service. kbf also
+# retries a bind to an address that is not there yet, within its start budget.
 ConditionPathExists=/etc/kbf/kbf.toml
+# A failure that repeats quickly must not use up systemd's start limit (5 starts in 10 s)
+# and leave the frontend down (check-units rule `restart`).
+StartLimitIntervalSec=0
 
 [Service]
 # kbf sends READY=1 (sd_notify) once it serves and its probes pass, so `systemctl start`
@@ -60,6 +68,10 @@ ExecStartPre=+/usr/bin/kbf-installer boot-check
 # serving instance must never pick up a release that is still being handed over to
 # (kbf-installer points slots/<idle> at the new release, then starts that instance; `current`
 # flips only at confirm).
+# `--check` validates kbf.toml and what a restart cannot change (a file, a user, a flag)
+# and exits 2 for those. Anything that can become ready later (a listen address, a peer,
+# a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted), so a check
+# that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
 ExecStartPre=/var/lib/kbf-installer/slots/%i/kbf --mode=frontend --check
 ExecStart=/var/lib/kbf-installer/slots/%i/kbf --mode=frontend --instance=%i --handover-socket=/run/kbf-frontend/control.sock
 # The instance that handed over drains and exits by itself; kbf drains on SIGTERM too: new
@@ -69,9 +81,10 @@ ExecStart=/var/lib/kbf-installer/slots/%i/kbf --mode=frontend --instance=%i --ha
 # taking long (check-units rule `stop`).
 KillSignal=SIGTERM
 TimeoutStopSec=infinity
-# No RestartSec= or start-limit override: after a handover the old instance drains and
-# exits 0 and must stay down (Restart=on-failure does not restart a clean exit).
+# After a handover the old instance drains and exits 0 and stays down: Restart=on-failure
+# never restarts a clean exit. A failed start restarts after RestartSec.
 Restart=on-failure
+RestartSec=5
 # Exit 2 is a command line kbf refused (or a config it refused): a restart cannot fix it.
 RestartPreventExitStatus=2
 

@@ -358,13 +358,13 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     // is the named flag --mode=. Read over every kbf command line of the unit.
     for (key, value) in &execs {
         let mut words = value.trim_start_matches('+').split_whitespace();
-        if words.next().is_some_and(|p| p.ends_with("/kbf")) {
-            if let Some(w) = words.find(|w| !w.starts_with('-')) {
-                v(
-                    "positional",
-                    format!("{key} gives the word `{w}` to kbf: use --mode="),
-                );
-            }
+        if words.next().is_some_and(|p| p.ends_with("/kbf"))
+            && let Some(w) = words.find(|w| !w.starts_with('-'))
+        {
+            v(
+                "positional",
+                format!("{key} gives the word `{w}` to kbf: use --mode="),
+            );
         }
     }
     let flags: Vec<&str> = start.iter().skip(2).copied().collect();
@@ -402,10 +402,10 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         v("state-dir", "no StateDirectory=kbf".into());
     }
 
-    // Catches start-limit-hit on a failure that repeats quickly: every unit but the
-    // frontend restarts at 5 s and has no start limit. The frontend keeps its own policy (a
-    // drained instance exits 0 and stays down).
-    if mode != "frontend" {
+    // Catches start-limit-hit on a failure that repeats quickly: every mode unit, the
+    // frontend too, restarts at 5 s and has no start limit (a drained frontend instance
+    // exits 0 and stays down regardless: Restart=on-failure never restarts a clean exit).
+    {
         let sec = unit.get_in("Service", "RestartSec").map(trim);
         if !matches!(sec, Some("5" | "5s")) {
             v("restart", format!("RestartSec= is {sec:?}, not 5"));

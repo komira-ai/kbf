@@ -46,6 +46,10 @@ Environment=XDG_RUNTIME_DIR=/run/user/%U
 # The single box's cold store is a directory beside the daemon's data, so the unit
 # holds no cold-store key (check-units rule `credential`).
 ExecStartPre=+/usr/bin/kbf-installer boot-check
+# `--check` validates kbf.toml and what a restart cannot change (a file, a user, a flag)
+# and exits 2 for those. Anything that can become ready later (a listen address, a peer,
+# a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted), so a check
+# that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
 ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=all-in-one --check
 ExecStart=/var/lib/kbf-installer/current/kbf --mode=all-in-one
 # kbf drains on SIGTERM: new Execute calls are refused, open streams run until their
