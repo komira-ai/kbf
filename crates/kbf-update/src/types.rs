@@ -66,6 +66,11 @@ pub enum Verb {
     Confirm,
     /// Go back to the previous release.
     Revert,
+    /// The frontend's own update, which the frontend writes into its own host's spool. It
+    /// is a word of the record format only: no wire message maps to it and this crate never
+    /// writes it (the installer on a node host would refuse it anyway).
+    #[serde(rename = "frontend_update")]
+    FrontendUpdate,
 }
 
 impl Verb {
@@ -76,6 +81,7 @@ impl Verb {
             Self::Activate => "activate",
             Self::Confirm => "confirm",
             Self::Revert => "revert",
+            Self::FrontendUpdate => "frontend_update",
         }
     }
 }

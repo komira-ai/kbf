@@ -26,6 +26,8 @@ pub enum Verb {
     Activate,
     Confirm,
     Revert,
+    /// The frontend's own update (a record the frontend writes into its own host's spool).
+    FrontendUpdate,
 }
 
 /// What an activation says the release is and where it is, from the record: claims, not
@@ -96,6 +98,7 @@ pub fn parse(epoch: u64, id: u64, bytes: &[u8]) -> Result<Order, OrderFault> {
         RecordVerb::Activate => Verb::Activate,
         RecordVerb::Confirm => Verb::Confirm,
         RecordVerb::Revert => Verb::Revert,
+        RecordVerb::FrontendUpdate => Verb::FrontendUpdate,
     };
     let claims = record.expected.map(|f| Claims {
         components: record.components,
