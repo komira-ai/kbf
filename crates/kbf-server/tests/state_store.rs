@@ -1529,6 +1529,48 @@ async fn an_answer_released_by_another_report_keeps_its_own_detail() {
     assert_eq!(farm.dropped_writes(), 0);
 }
 
+/// Catches: the detail of a report dropped between the write of its answer and the
+/// settling of it. The answer is taken by the store, and a later record of the same feed
+/// (the grant the freed capacity lets through) is refused as stale: that must not forget
+/// the details of answers already written and waiting to be settled. Their callers would
+/// get the stand-in INTERNAL and no cache write, while the `done/` row holds the real
+/// result. The caller is answered with the report's own detail, as the store holds it.
+#[tokio::test(start_paused = true)]
+async fn a_stale_record_in_the_feed_does_not_drop_a_written_answers_detail() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    let tickets: Vec<_> = (1..=5)
+        .map(|tag| {
+            farm.submit(Submission {
+                request: request(tag),
+                call: None,
+                described: Described::default(),
+            })
+            .expect("submitted")
+        })
+        .collect();
+    let leases = starts(&mut inbox);
+    assert_eq!(leases.len(), 4, "the fifth waits for capacity");
+    // The answer is held while the store is down; the freed room goes to the fifth, whose
+    // queue row is gone from under it by the time the store takes writes: its grant, in
+    // the feed that writes the answer, is refused as stale.
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, leases[0]).await);
+    disk.store.set_down(false);
+    let gone = Txn::new().delete(format!("queue/{:016x}", 4), kbf_state::Cond::Any);
+    disk.store.txn(gone).expect("store").expect("delete");
+    farm.tick().await;
+    let Finished::Failed(status) = ended(&tickets[0]) else {
+        panic!("the caller was answered with something else");
+    };
+    assert_eq!(status.code, Code::InvalidArgument as i32);
+    assert_eq!(status.message, "test", "the report's detail was dropped");
+    assert!(farm.dropped_writes() >= 1, "the grant was not refused");
+    let row = farm.ended(OperationId(0)).expect("read").expect("a row");
+    assert_eq!(row, Finished::Failed(status), "the row is what was sent");
+}
+
 /// Catches: a grant carried out ahead of an earlier held record (or released by an input
 /// that delivers no answers), and a held `Start` written after the scheduler gave its
 /// lease up (it would put the lease back in the store over the requeue): the grant waits
