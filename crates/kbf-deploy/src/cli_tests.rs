@@ -677,9 +677,7 @@ fn the_mdm_verbs_exit_0_done_1_failed_2_refused() {
 #[test]
 fn mdm_verify_exits_1_when_a_check_fails() {
     let config = mdm_config("cli_mdm_verify");
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let via = closed.local_addr().expect("addr").to_string();
-    drop(closed);
+    let via = kbf_testkit::port::dead_addr().to_string();
     let mut exec = FakeExec::new(0);
     let (code, out, err) = cli(
         &mut exec,
