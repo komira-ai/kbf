@@ -1407,10 +1407,15 @@ fn a_stage_directory_a_killed_run_left_is_swept_by_install_stage_and_gc() {
         fs::write(leftover.join("kbf"), "half").expect("file");
     };
     plant();
+    // A stage that is a plain file is removed too, not only a directory.
+    let stray = exec.at("/var/lib/kbf-installer/releases/.stage-stray-file");
+    fs::write(&stray, "x").expect("file");
     install_on(&mut exec, &root, A, &a, Mode::DryRun).expect("dry");
+    assert!(stray.exists(), "a dry run removed a file");
     assert!(leftover.exists(), "a dry run removed something");
     install_on(&mut exec, &root, A, &a, Mode::Apply).expect("install");
     assert!(!leftover.exists(), "install left the stage");
+    assert!(!stray.exists(), "install left the stage file");
     plant();
     let st = Install {
         commit: c(B),
@@ -1533,4 +1538,53 @@ fn the_links_move_previous_before_current() {
 fn stage_names_are_unique() {
     let names: std::collections::BTreeSet<String> = (0..2_000).map(|_| unique()).collect();
     assert_eq!(names.len(), 2_000);
+}
+
+/// Catches a path the installer cannot look at being taken for one that is not there (it
+/// would then plan to make it, over something it never saw): with `releases/` unreadable, a
+/// dry run of an install stops with the host's error naming the path, and changes nothing.
+///
+/// Mutant planted: the inspect error read as `None` (the dry run plans the release).
+#[test]
+fn a_path_that_cannot_be_inspected_is_an_error_not_an_absent_one() {
+    let (mut exec, root) = host("inspect-denied");
+    let a = source("inspect-denied-a", "kbf A", None);
+    install_on(&mut exec, &root, A, &a, Mode::Apply).expect("install A");
+    let releases = exec.at("/var/lib/kbf-installer/releases");
+    fs::set_permissions(&releases, fs::Permissions::from_mode(0o000)).expect("lock the directory");
+    let err = install_on(&mut exec, &root, B, &a, Mode::DryRun);
+    fs::set_permissions(&releases, fs::Permissions::from_mode(0o755)).expect("unlock");
+    let err = err.expect_err("denied");
+    assert!(matches!(err, ReleaseError::Host(_)), "{err}");
+    assert!(err.to_string().contains("releases"), "{err}");
+}
+
+/// Catches `gc` failing on a host whose `releases/` directory is not there yet (a host that
+/// was never installed to): it has nothing to remove and says so.
+///
+/// Mutant planted: the missing directory an error.
+#[test]
+fn gc_with_no_releases_directory_has_nothing_to_do() {
+    let (mut exec, root) = host("gc-empty");
+    let out = gc_on(&mut exec, &root, 2).expect("gc");
+    assert!(!out.contains("remove"), "{out}");
+}
+
+/// Catches a `releases/` directory that cannot be listed being read as an empty one (`gc`
+/// would then report nothing to remove on a host full of old releases): only a missing
+/// directory is empty, an unreadable one is an error naming it.
+///
+/// Mutant planted: any listing error taken as "no releases".
+#[test]
+fn gc_on_an_unreadable_releases_directory_is_an_error_not_an_empty_one() {
+    let (mut exec, root) = host("gc-denied");
+    let a = source("gc-denied-a", "kbf A", None);
+    install_on(&mut exec, &root, A, &a, Mode::Apply).expect("install A");
+    let releases = exec.at("/var/lib/kbf-installer/releases");
+    fs::set_permissions(&releases, fs::Permissions::from_mode(0o100))
+        .expect("traversable, not listable");
+    let result = gc(&mut exec, &root, 2, Mode::DryRun, &mut Vec::new());
+    fs::set_permissions(&releases, fs::Permissions::from_mode(0o755)).expect("unlock");
+    let err = result.expect_err("denied");
+    assert!(matches!(err, ReleaseError::Read { .. }), "{err}");
 }

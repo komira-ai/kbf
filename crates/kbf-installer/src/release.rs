@@ -543,15 +543,11 @@ fn plan_copy<E: Exec>(
     // missing, never chmod-ed (a 0700 `/var/db/kbf-installer` stays 0700). `releases/` and the
     // release are this program's own.
     for d in [host.state_dir(), host.install_root()] {
-        if inspect(exec, &d)?.is_none() && !dirs.contains(&d) {
+        if inspect(exec, &d)?.is_none() {
             dirs.push(d);
         }
     }
-    for d in [host.releases(), dir.clone()] {
-        if !dirs.contains(&d) {
-            dirs.push(d);
-        }
-    }
+    dirs.extend([host.releases(), dir.clone()]);
     if !source.units.is_empty() {
         dirs.push(units);
     }

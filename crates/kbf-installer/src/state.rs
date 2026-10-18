@@ -237,14 +237,14 @@ impl Locked {
             path: path.clone(),
             source,
         };
-        if let Some(dir) = path.parent() {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o755)
-                .create(dir)
-                .map_err(fail)?;
-        }
+        use std::os::unix::fs::DirBuilderExt;
+        // A lock path always has a parent; the root stands in for the impossible case.
+        let dir = path.parent().unwrap_or(std::path::Path::new("/"));
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(dir)
+            .map_err(fail)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
