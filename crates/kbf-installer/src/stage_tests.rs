@@ -454,7 +454,7 @@ fn nothing_is_unpacked_before_the_attestation_holds() {
         .verify(
             &runner,
             OrderKind::Activate,
-            &[locator.clone()],
+            std::slice::from_ref(&locator),
             Some(&facts()),
             fetched,
         )
@@ -803,7 +803,7 @@ fn the_files_fetched_must_be_the_components_ordered() {
         .verify(
             &honest(),
             OrderKind::Activate,
-            &[locator.clone()],
+            std::slice::from_ref(&locator),
             Some(&facts()),
             fetched,
         )
@@ -816,7 +816,7 @@ fn the_files_fetched_must_be_the_components_ordered() {
         .verify(
             &honest(),
             OrderKind::Activate,
-            &[locator.clone()],
+            std::slice::from_ref(&locator),
             Some(&facts()),
             fetched,
         )

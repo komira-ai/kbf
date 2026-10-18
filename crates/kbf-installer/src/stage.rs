@@ -275,10 +275,10 @@ impl Verifier for Pipeline<'_> {
         gh.check_trust(self.trust)?;
         let files = pair(order, &fetched.files)?;
 
-        let scratch = Scratch::make(self.host, order.commit, self.settings, self.owner)?;
         for (locator, received) in &files {
             self.count_and_digest(locator, received)?;
         }
+        let scratch = Scratch::make(self.host, order.commit, self.settings, self.owner)?;
         let mut source_ref = None;
         for (locator, received) in &files {
             let verified = self.attest(&gh, &scratch, locator, received, order.commit)?;

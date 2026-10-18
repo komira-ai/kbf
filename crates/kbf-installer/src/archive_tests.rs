@@ -171,7 +171,8 @@ fn gzip(bytes: &[u8]) -> Vec<u8> {
 
 /// The tar a `tar_gz` of one file `kbf` holds, uncompressed.
 fn tar_of_one() -> Vec<u8> {
-    let mut gz = flate2::read::GzDecoder::new(tar_gz(&[file("kbf", b"binary")]).as_slice());
+    let packed = tar_gz(&[file("kbf", b"binary")]);
+    let mut gz = flate2::read::GzDecoder::new(packed.as_slice());
     let mut tar = Vec::new();
     io::Read::read_to_end(&mut gz, &mut tar).expect("tar");
     tar
