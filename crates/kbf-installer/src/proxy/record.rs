@@ -25,15 +25,43 @@ pub enum LoadError {
     Corrupt(#[from] serde_json::Error),
 }
 
+/// The two syncs that make a record durable. The real one is [`Fsync`]; a test passes one
+/// that looks at the directory when each is called, so that dropping a sync or moving it
+/// before the rename is visible (a crash cannot be staged in a test, a call order can).
+pub(super) trait Durable {
+    /// Flush the temp file's data, before the rename.
+    fn file(&self, file: &File) -> std::io::Result<()>;
+    /// Flush the directory entry, after the rename.
+    fn dir(&self, dir: &Path) -> std::io::Result<()>;
+}
+
+struct Fsync;
+
+impl Durable for Fsync {
+    fn file(&self, file: &File) -> std::io::Result<()> {
+        file.sync_all()
+    }
+
+    fn dir(&self, dir: &Path) -> std::io::Result<()> {
+        File::open(dir)?.sync_all()
+    }
+}
+
 /// Writes the intent record under `dir`.
 pub struct FileRecorder {
     dir: PathBuf,
+    sync: Box<dyn Durable>,
 }
 
 impl FileRecorder {
     pub fn new(dir: &Path) -> FileRecorder {
+        FileRecorder::with_sync(dir, Box::new(Fsync))
+    }
+
+    pub(super) fn with_sync(dir: &Path, sync: Box<dyn Durable>) -> FileRecorder {
         FileRecorder {
             dir: dir.to_owned(),
+            sync,
         }
     }
 
@@ -55,9 +83,9 @@ impl FileRecorder {
             .mode(0o600)
             .open(&temp)?;
         file.write_all(&bytes)?;
-        file.sync_all()?;
+        self.sync.file(&file)?;
         fs::rename(&temp, self.dir.join(NAME))?;
-        File::open(&self.dir)?.sync_all()
+        self.sync.dir(&self.dir)
     }
 }
 

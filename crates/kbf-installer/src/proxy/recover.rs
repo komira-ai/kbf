@@ -41,16 +41,47 @@ impl<'a> Swap<'a> {
     /// A frontend update that stopped at `switched` or later. The holder decides.
     pub(super) fn recover_post_switch(&mut self) -> Result<Flow, Halt> {
         let new = self.intent.new_slot;
+        if self.intent.rolling_back && self.intent.phase <= Phase::Baking {
+            return self.recover_rollback();
+        }
         match self.role_of(new) {
             Some(r) if r.holder => self.complete_switch(),
             // Alive but not the holder, before the confirm: the store says the old child
-            // (or nobody) serves, so the swap did not happen.
+            // (or nobody) serves. The new child served, so it is not killed: the update
+            // finishes as a rollback, which retires it by SIGTERM once it is idle.
             Some(_) if self.intent.phase <= Phase::Baking => {
-                self.restore_old("the new child does not hold the generation")
+                self.note("the new child does not hold the generation: rolling back".into());
+                self.intent.rolling_back = true;
+                self.save()?;
+                self.recover_rollback()
             }
             // Dead new child: the bake sees it and stays red for the operator's rollback.
             _ => Ok(Flow::Go),
         }
+    }
+
+    /// The proxy stopped inside a rollback (the intent says so; no phase does). The store
+    /// decides how far it got. If the new child still holds the generation the rollback
+    /// never landed: the new child is put back and the update fails at `rollback`.
+    /// Otherwise the old child has the generation or is about to: the rollback is run
+    /// again (every call in it is idempotent) and the new child is retired, never killed.
+    pub(super) fn recover_rollback(&mut self) -> Result<Flow, Halt> {
+        let t = self.plan.timing;
+        let new = self.intent.new_slot;
+        if matches!(self.role_of(new), Some(r) if r.holder) {
+            return self.rollback_failed("the proxy restarted before the rollback landed".into());
+        }
+        if !self.old_alive {
+            self.intent.rolling_back = false;
+            return self.fail(
+                Step::Restart,
+                "the proxy restarted during a rollback; the old child is gone".into(),
+            );
+        }
+        if let Err(e) = self.ports.gate.hold(t.hold_max) {
+            self.note(format!("hold for the rollback failed: {e}"));
+        }
+        self.rollback_swap()
     }
 
     /// The candidate holds the generation: make its slot the active one and stand the
@@ -69,9 +100,11 @@ impl<'a> Swap<'a> {
         Ok(Flow::Go)
     }
 
-    /// The old child is the active one again: kill a candidate that is not the holder,
-    /// let a quiesced or stood-down old child resume, and fail the update.
+    /// Before the switch, the old child is the active one again: kill a candidate that is
+    /// not the holder, let a quiesced old child resume, and fail the update. Never called
+    /// once the swap switched: that child served.
     fn restore_old(&mut self, reason: &str) -> Result<Flow, Halt> {
+        debug_assert!(self.intent.phase < Phase::Switched);
         let old = self.intent.old_slot;
         if !self.old_alive {
             // Nothing else can serve; leave the candidate, which may be the only child.

@@ -180,13 +180,6 @@ impl Swap<'_> {
         Ok(())
     }
 
-    fn expire_held(&mut self) {
-        let n = self.ports.gate.expire();
-        if n > 0 {
-            self.note(format!("{n} held streams expired with UNAVAILABLE"));
-        }
-    }
-
     fn old_ident(&self) -> Result<super::model::ProcIdent, Halt> {
         debug_assert_eq!(self.intent.mode, Mode::AllInOne);
         self.intent

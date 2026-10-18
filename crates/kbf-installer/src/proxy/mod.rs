@@ -23,8 +23,20 @@
 //!   the proxy dies is not found again (U7b should write a pid file at spawn).
 //! - **confirm** is sent once the bake passes and is idempotent at the root half, because
 //!   a restart between the confirm and the `nodes` record sends it again.
-//! - **abort** ends an update as `failed` with step `abort`, not `rolled_back`.
-//! - **Rollback** uses a hold, like the swap, so streams move atomically.
+//! - **abort** ends an update as `failed` with step `abort`, not `rolled_back`; so does an
+//!   abort that arrives while the old child quiesces (it is `abort`, not `switch`).
+//! - **Compatibility gate (R1, R4)** is not here: [`model::StagedFacts`] is carried and
+//!   only its commit is read. The gate that reads `protocol`, `min_protocol` and
+//!   `state_schema` is U9.
+//! - **Order locator (Q1)**: [`model::Locator`] carries `verb` with the other five fields.
+//! - **Rollback** uses a hold, like the swap, so streams move atomically. It records
+//!   `rolling_back` in `update.json` before it touches either child (it has no phase of
+//!   its own), so a restart finishes it, or puts the new child back if it never landed.
+//!   The new child served: it is never killed, only drained and sent SIGTERM.
+//! - **Confirm** is sent up to `Timing::confirm_attempts` times with a doubling wait. If
+//!   it never lands, the new child keeps serving, the staged release is kept, the nodes
+//!   are not sent, the old child is drained and retired, and the update ends `failed`
+//!   with `failure.step == confirm`. After the switch no failure drops the staged release.
 //! - **All-in-one stop**: after `quiesce`, the proxy sends SIGTERM to the old process
 //!   ([`aio`]).
 //! - A dead new child during the bake leaves the update parked in `baking` (red) until the

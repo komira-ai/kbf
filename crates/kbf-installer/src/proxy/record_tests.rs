@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use super::fakes::plan;
 use super::model::*;
 use super::ports::Recorder;
-use super::record::{FileRecorder, LoadError};
+use super::record::{Durable, FileRecorder, LoadError};
 
 fn dir(name: &str) -> PathBuf {
     kbf_host::testkit::scratch(&format!("proxy-{name}"))
@@ -100,4 +100,81 @@ fn adoption_needs_pid_start_time_and_executable_to_agree() {
         verify_ident(&recorded, &ident(8, 100, "/r/a/kbf")),
         recycled
     );
+}
+
+type Calls = std::rc::Rc<std::cell::RefCell<Vec<(&'static str, Option<Phase>)>>>;
+
+/// Remembers when each sync ran and what `update.json` held at that moment.
+struct Spy {
+    dir: PathBuf,
+    calls: Calls,
+    fail_file: bool,
+}
+
+impl Spy {
+    fn on_disk(&self) -> Option<Phase> {
+        FileRecorder::load(&self.dir)
+            .ok()
+            .flatten()
+            .map(|i| i.phase)
+    }
+}
+
+impl Durable for Spy {
+    fn file(&self, _: &fs::File) -> std::io::Result<()> {
+        self.calls.borrow_mut().push(("file", self.on_disk()));
+        if self.fail_file {
+            return Err(std::io::Error::other("disk full"));
+        }
+        Ok(())
+    }
+
+    fn dir(&self, _: &std::path::Path) -> std::io::Result<()> {
+        self.calls.borrow_mut().push(("dir", self.on_disk()));
+        Ok(())
+    }
+}
+
+fn spied(name: &str, fail_file: bool) -> (FileRecorder, Calls, PathBuf) {
+    let d = dir(name);
+    let calls: Calls = Default::default();
+    let spy = Spy {
+        dir: d.clone(),
+        calls: calls.clone(),
+        fail_file,
+    };
+    (FileRecorder::with_sync(&d, Box::new(spy)), calls, d)
+}
+
+#[test]
+fn the_temp_file_is_synced_before_the_rename_and_the_directory_after_it() {
+    let (r, calls, _) = spied("sync-order", false);
+    r.record(&intent(Phase::Starting)).expect("first");
+    r.record(&intent(Phase::Switched)).expect("second");
+    // Before the second rename the file on disk is still the first record; after it,
+    // the second. A missing sync, or a directory sync before the rename, shows here.
+    assert_eq!(
+        *calls.borrow(),
+        vec![
+            ("file", None),
+            ("dir", Some(Phase::Starting)),
+            ("file", Some(Phase::Starting)),
+            ("dir", Some(Phase::Switched)),
+        ]
+    );
+}
+
+#[test]
+fn a_failed_file_sync_leaves_the_old_record_and_stops_the_swap() {
+    let (r, calls, d) = spied("sync-fail", true);
+    assert!(matches!(
+        r.record(&intent(Phase::Starting)),
+        Err(Halt::Port(_))
+    ));
+    assert_eq!(
+        *calls.borrow(),
+        vec![("file", None)],
+        "no rename, no dir sync"
+    );
+    assert!(matches!(FileRecorder::load(&d), Ok(None)));
 }

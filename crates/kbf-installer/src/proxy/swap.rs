@@ -132,12 +132,15 @@ impl<'a> Swap<'a> {
         if self.intent.phase <= Phase::Baking {
             go!(self.bake());
         }
-        if self.intent.phase <= Phase::Nodes {
+        // Nodes follow a confirmed release only: with the confirm failed the host still
+        // boots the old `current`, so the nodes are not sent to the new one.
+        if self.intent.phase <= Phase::Nodes && !self.confirm_failed() {
             go!(self.nodes());
         }
         if self.intent.mode == super::model::Mode::AllInOne {
-            self.set_phase(Phase::Done)?;
-            return Ok(Flow::End(Phase::Done));
+            let end = self.end_phase();
+            self.set_phase(end)?;
+            return Ok(Flow::End(end));
         }
         self.drain()
     }
@@ -168,9 +171,30 @@ impl<'a> Swap<'a> {
         self.save()
     }
 
-    /// End the update as failed at `step`, and drop the staged release: nothing flips.
+    /// The `confirm` order could not be delivered; the failure is recorded and the update
+    /// goes on to retire the old child.
+    pub(super) fn confirm_failed(&self) -> bool {
+        matches!(&self.intent.failure, Some(f) if f.step == Step::Confirm)
+    }
+
+    /// The phase a swap that got through the drain ends in.
+    pub(super) fn end_phase(&self) -> Phase {
+        if self.intent.rolling_back {
+            Phase::RolledBack
+        } else if self.confirm_failed() {
+            Phase::Failed
+        } else {
+            Phase::Done
+        }
+    }
+
+    /// End the update as failed at `step`. Before the switch the staged release is dropped:
+    /// nothing flips. After it the new child has served, and the staged release stays, so
+    /// the new child is never left running a release the host would not boot.
     pub(super) fn fail(&mut self, step: Step, reason: String) -> Result<Flow, Halt> {
-        self.revert_staged();
+        if self.intent.phase < Phase::Switched {
+            self.revert_staged();
+        }
         self.intent.failure = Some(Failure { step, reason });
         self.set_phase(Phase::Failed)?;
         Ok(Flow::End(Phase::Failed))
@@ -211,11 +235,17 @@ impl<'a> Swap<'a> {
     }
 
     /// Kill the candidate: it never served. A candidate we do not hold (never spawned, or
-    /// a recycled pid after a restart) is left alone.
+    /// a recycled pid after a restart) is left alone. Every caller is before the switch:
+    /// after it the new child has served, and a served child only gets SIGTERM, after it
+    /// drained (FP section 5 step 10).
     pub(super) fn kill_candidate(&mut self) {
         if !self.new_alive {
             return;
         }
+        debug_assert!(
+            self.intent.phase < Phase::Switched,
+            "a child that served is never killed"
+        );
         if let Some(ident) = self.intent.new_proc.clone()
             && let Err(e) = self.ports.child.kill_unserved(&ident)
         {
@@ -226,16 +256,21 @@ impl<'a> Swap<'a> {
 
     /// Release the hold into `slot` after failing the streams that waited too long.
     pub(super) fn release_held(&mut self, slot: Slot) -> Result<(), Halt> {
-        let expired = self.ports.gate.expire();
-        if expired > 0 {
-            self.note(format!("{expired} held streams expired with UNAVAILABLE"));
-        }
+        self.expire_held();
         self.ports
             .gate
             .release_into(slot)
             .map_err(|e| Halt::Port(format!("release into {slot:?}: {e}")))?;
         self.active = slot;
         Ok(())
+    }
+
+    /// Fail the held streams that waited out `hold_max`. Polled in every wait under a hold.
+    pub(super) fn expire_held(&mut self) {
+        let n = self.ports.gate.expire();
+        if n > 0 {
+            self.note(format!("{n} held streams expired with UNAVAILABLE"));
+        }
     }
 
     // ---- steps ----
@@ -363,8 +398,8 @@ impl<'a> Swap<'a> {
             return self.fail(Step::Hold, e.to_string());
         }
         self.set_phase(Phase::Quiescing)?;
-        if let Err(reason) = self.quiesce_old()? {
-            return self.switch_failed(reason);
+        if let Err((step, reason)) = self.quiesce_old()? {
+            return self.switch_failed(step, reason);
         }
         self.set_phase(Phase::Switching)?;
         let t0 = self.now();
@@ -374,13 +409,16 @@ impl<'a> Swap<'a> {
             .crash_point(super::model::CrashPoint::BeforeTakeoverReturns)?;
         let took = self.now().saturating_sub(t0);
         match result {
-            Err(e) => return self.switch_failed(format!("takeover: {e}")),
+            Err(e) => return self.switch_failed(Step::Switch, format!("takeover: {e}")),
             Ok(()) if took > t.takeover => {
-                return self.switch_failed(format!(
-                    "takeover took {} ms, over the {} ms limit",
-                    took.as_millis(),
-                    t.takeover.as_millis()
-                ));
+                return self.switch_failed(
+                    Step::Switch,
+                    format!(
+                        "takeover took {} ms, over the {} ms limit",
+                        took.as_millis(),
+                        t.takeover.as_millis()
+                    ),
+                );
             }
             Ok(()) => {}
         }
@@ -397,31 +435,39 @@ impl<'a> Swap<'a> {
         Ok(Flow::Go)
     }
 
-    /// Ask the old child to quiesce and wait for `Quiesced` inside the budget.
-    fn quiesce_old(&mut self) -> Result<Result<(), String>, Halt> {
+    /// Ask the old child to quiesce and wait for `Quiesced` inside the budget. An abort
+    /// that arrives during the wait ends the update as `abort`, not `switch`.
+    fn quiesce_old(&mut self) -> Result<Result<(), (Step, String)>, Halt> {
         let t = self.plan.timing;
         let old = self.intent.old_slot;
         let t0 = self.now();
         if let Err(e) = self.ports.admin.quiesce(old) {
-            return Ok(Err(format!("quiesce: {e}")));
+            return Ok(Err((Step::Switch, format!("quiesce: {e}"))));
         }
         loop {
+            self.expire_held();
             let waited = self.now().saturating_sub(t0);
             if matches!(self.ports.admin.role(old), Ok(r) if r.state == RoleState::Quiesced) {
                 return Ok(if waited > t.quiesce {
-                    Err(format!("quiesce took {} ms", waited.as_millis()))
+                    Err((
+                        Step::Switch,
+                        format!("quiesce took {} ms", waited.as_millis()),
+                    ))
                 } else {
                     Ok(())
                 });
             }
             if waited >= t.quiesce {
-                return Ok(Err(format!(
-                    "the old child did not quiesce in {} s",
-                    t.quiesce.as_secs()
+                return Ok(Err((
+                    Step::Switch,
+                    format!("the old child did not quiesce in {} s", t.quiesce.as_secs()),
                 )));
             }
             if let Some(Request::Abort) = self.next_request() {
-                return Ok(Err("aborted while the old child quiesced".into()));
+                return Ok(Err((
+                    Step::Abort,
+                    "aborted while the old child quiesced".into(),
+                )));
             }
             self.sleep(t.tick)?;
         }
@@ -430,14 +476,14 @@ impl<'a> Swap<'a> {
     /// The switch did not complete (FP section 5 step 6 "Failure"): kill the candidate
     /// first, then read the roles, then let the old child resume, then release the hold
     /// into it. The old child resumes from the store, not from warm memory.
-    pub(super) fn switch_failed(&mut self, reason: String) -> Result<Flow, Halt> {
+    pub(super) fn switch_failed(&mut self, step: Step, reason: String) -> Result<Flow, Halt> {
         let (old, new) = (self.intent.old_slot, self.intent.new_slot);
         self.kill_candidate();
         let old_role = self.ports.admin.role(old).ok();
         let _ = self.ports.admin.role(new);
         self.resume_old(old_role, old);
         self.release_held(old)?;
-        self.fail(Step::Switch, reason)
+        self.fail(step, reason)
     }
 
     /// Resume `slot` unless it already serves as the active child.
@@ -474,10 +520,41 @@ impl<'a> Swap<'a> {
             }
             self.sleep(t.poll)?;
         }
-        if let Err(e) = self.ports.orders.confirm(&self.plan.to) {
-            return self.fail(Step::Confirm, e.to_string());
-        }
+        self.confirm()?;
         Ok(Flow::Go)
+    }
+
+    /// Send the `confirm` order, again with a doubling wait if the root half refuses or
+    /// cannot be reached. The new child serves, so the update does not undo itself: when
+    /// every try fails, `failure{step: confirm}` is recorded, the staged release is kept,
+    /// the nodes are not sent, and the old child is still drained and retired. The update
+    /// then ends `failed`. A later success clears the failure.
+    fn confirm(&mut self) -> Result<(), Halt> {
+        let t = self.plan.timing;
+        let mut wait = t.poll;
+        for attempt in 1..=t.confirm_attempts {
+            match self.ports.orders.confirm(&self.plan.to) {
+                Ok(()) => {
+                    if self.confirm_failed() {
+                        self.intent.failure = None;
+                        self.save()?;
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.intent.failure = Some(Failure {
+                        step: Step::Confirm,
+                        reason: format!("{e} (try {attempt} of {})", t.confirm_attempts),
+                    });
+                    self.save()?;
+                }
+            }
+            if attempt < t.confirm_attempts {
+                self.sleep(wait)?;
+                wait = (wait * 2).min(t.confirm_backoff_max);
+            }
+        }
+        Ok(())
     }
 
     fn new_exited(&self) -> bool {

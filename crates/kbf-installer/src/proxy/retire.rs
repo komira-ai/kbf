@@ -14,11 +14,7 @@ impl Swap<'_> {
         self.intent.retire = Some(slot);
         self.set_phase(Phase::Draining)?;
         self.retire(slot)?;
-        let end = if self.intent.rolling_back {
-            Phase::RolledBack
-        } else {
-            Phase::Done
-        };
+        let end = self.end_phase();
         self.set_phase(end)?;
         Ok(Flow::End(end))
     }
@@ -68,11 +64,13 @@ impl Swap<'_> {
 
     /// The operator's rollback (FP section 5 step 8): only between `switched` and the
     /// confirm, while the old child lives. Returns `Go` when it is refused, so the bake
-    /// goes on. The new child stands down, the old one resumes (full reload, then re-take),
-    /// the staged release is dropped, and the new child drains and retires like any other.
+    /// goes on. Once it takes the hold it records `rolling_back` before it touches either
+    /// child, so a restart finishes it ([`Swap::recover_rollback`]) instead of mistaking
+    /// the new child, which served, for an unserved candidate. The new child stands down,
+    /// the old one resumes (full reload, then re-take), the staged release is dropped, and
+    /// the new child drains and retires like any other.
     pub(super) fn rollback(&mut self) -> Result<Flow, Halt> {
         let t = self.plan.timing;
-        let (old, new) = (self.intent.old_slot, self.intent.new_slot);
         let old_up = self.old_alive
             && self
                 .intent
@@ -87,13 +85,29 @@ impl Swap<'_> {
             self.note(format!("rollback refused: the hold failed: {e}"));
             return Ok(Flow::Go);
         }
+        self.intent.rolling_back = true;
+        self.save()?;
+        self.rollback_swap()
+    }
+
+    /// The children's half of the rollback, safe to repeat after a restart.
+    pub(super) fn rollback_swap(&mut self) -> Result<Flow, Halt> {
+        let t = self.plan.timing;
+        let (old, new) = (self.intent.old_slot, self.intent.new_slot);
         if let Err(e) = self.ports.admin.stand_down(new) {
             self.note(format!("stand-down of the new child failed: {e}"));
         }
+        self.ports
+            .recorder
+            .crash_point(CrashPoint::RollbackAfterStandDown)?;
         let resumed = self.ports.admin.resume(old).map_err(|e| e.to_string());
+        self.ports
+            .recorder
+            .crash_point(CrashPoint::RollbackAfterResume)?;
         let t0 = self.now();
         let mut outcome = resumed;
         while outcome.is_ok() {
+            self.expire_held();
             let up = self.ports.admin.role(old);
             if matches!(up, Ok(r) if r.holder && r.state == RoleState::Active) {
                 break;
@@ -105,17 +119,25 @@ impl Swap<'_> {
             self.sleep(t.tick)?;
         }
         if let Err(reason) = outcome {
-            // Put the new child back: it stood down, the old one is not back.
-            if let Err(e) = self.ports.admin.resume(new) {
-                self.note(format!("resume of the new child failed: {e}"));
-            }
-            self.release_held(new)?;
-            return self.fail(Step::Rollback, reason);
+            return self.rollback_failed(reason);
         }
         self.release_held(old)?;
         self.revert_staged();
         self.intent.retire = Some(new);
-        self.intent.rolling_back = true;
         self.drain()
+    }
+
+    /// The rollback did not land: put the new child back, which stood down, and fail. The
+    /// new child served, so the staged release stays.
+    pub(super) fn rollback_failed(&mut self, reason: String) -> Result<Flow, Halt> {
+        let new = self.intent.new_slot;
+        let serving =
+            matches!(self.role_of(new), Some(r) if r.state == RoleState::Active && r.holder);
+        if !serving && let Err(e) = self.ports.admin.resume(new) {
+            self.note(format!("resume of the new child failed: {e}"));
+        }
+        self.release_held(new)?;
+        self.intent.rolling_back = false;
+        self.fail(Step::Rollback, reason)
     }
 }

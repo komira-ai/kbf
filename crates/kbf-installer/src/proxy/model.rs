@@ -173,12 +173,24 @@ pub struct StagedFacts {
     pub profile: String,
 }
 
-/// The `frontend_update` order (Q1): a locator only. Nothing in it is a path or a URL.
+/// The verb of an order record in `orders/` (Q1). The proxy sends the last three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verb {
+    Activate,
+    Confirm,
+    Revert,
+    FrontendUpdate,
+}
+
+/// An order to the root half (Q1): a locator only, `{order_id, epoch, generation, verb,
+/// commit, window_s}`. Nothing in it is a path or a URL.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Locator {
     pub order_id: u64,
     pub epoch: u64,
     pub generation: u64,
+    pub verb: Verb,
     pub commit: CommitId,
     pub window_s: u32,
 }
@@ -201,6 +213,11 @@ pub struct Timing {
     pub quiesce: Duration,
     pub takeover: Duration,
     pub bake: Duration,
+    /// How many times the `confirm` order is sent before the update is given up as failed
+    /// at `confirm`; the wait between tries starts at `poll`, doubles, and stops at
+    /// `confirm_backoff_max`.
+    pub confirm_attempts: u32,
+    pub confirm_backoff_max: Duration,
     /// How often a long wait (bake, drain, a candidate coming up) looks again.
     pub poll: Duration,
     /// How often a short wait (quiesce, takeover resolving) looks again.
@@ -216,6 +233,8 @@ impl Timing {
             quiesce: Duration::from_secs(3),
             takeover: Duration::from_secs(10),
             bake: Duration::from_secs(300),
+            confirm_attempts: 6,
+            confirm_backoff_max: Duration::from_secs(30),
             poll: Duration::from_secs(1),
             tick: Duration::from_millis(100),
         }
@@ -295,7 +314,10 @@ pub struct Intent {
     pub respawned: bool,
     /// The slot being retired (the old one, or the new one after a rollback).
     pub retire: Option<Slot>,
-    /// The update ended in a rollback; `Draining` then ends in `RolledBack`, not `Done`.
+    /// A rollback was asked for and accepted: recorded before the hold, so that a restart
+    /// in the middle of it finishes it (or puts the new child back) and never treats the
+    /// new child, which served, as an unserved candidate. `Draining` then ends in
+    /// `RolledBack`, not `Done`.
     pub rolling_back: bool,
     pub failure: Option<Failure>,
 }
@@ -338,9 +360,9 @@ pub enum Halt {
     Port(String),
 }
 
-/// The three crash points the U7 proof names (FP section 10), where a test makes the
-/// proxy die. The other FP section 6 rows are phase boundaries: the recorder crashes
-/// after it persisted a phase.
+/// The crash points the U7 proof names (FP section 10), where a test makes the proxy die,
+/// and two inside the rollback, which records no phase. The other FP section 6 rows are
+/// phase boundaries: the recorder crashes after it persisted a phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CrashPoint {
     /// The takeover call was sent; its answer is not read yet. It may or may not have landed.
@@ -349,6 +371,10 @@ pub enum CrashPoint {
     AfterTakeoverBeforeSwap,
     /// The old child was told to stand down and the retire wait starts.
     WhileDraining,
+    /// Rollback: the new child was told to stand down; the old one is not yet told to resume.
+    RollbackAfterStandDown,
+    /// Rollback: the old child was told to resume; the swap has not read the result.
+    RollbackAfterResume,
 }
 
 /// A port call that failed, with the reason for the failure record.

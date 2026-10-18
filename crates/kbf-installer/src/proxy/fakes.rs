@@ -84,6 +84,13 @@ pub struct State {
     /// How long a process takes to exit after SIGTERM.
     pub term_takes: Duration,
     pub confirm_err: bool,
+    /// The next this many confirm orders fail, then they succeed.
+    pub confirm_fails: u32,
+    /// The hold orders from this one on (1 is the first) are refused.
+    pub hold_fails_from: Option<u32>,
+    pub holds: u32,
+    /// One of the three readiness checks (0 readyz, 1 health, 2 capabilities) stays false.
+    pub ready_gap: Option<u8>,
     pub staged: Option<CommitId>,
     pub permits: BTreeMap<Slot, Until>,
     pub held: Vec<Duration>,
@@ -128,6 +135,10 @@ impl World {
                 resume_fails: Vec::new(),
                 term_takes: Duration::ZERO,
                 confirm_err: false,
+                confirm_fails: 0,
+                hold_fails_from: None,
+                holds: 0,
+                ready_gap: None,
                 staged: Some(c(B)),
                 permits: BTreeMap::new(),
                 held: Vec::new(),
@@ -271,6 +282,15 @@ impl World {
 
     pub fn hold_streams(&self, n: usize) {
         let t = self.now.get();
+        let mut st = self.st.borrow_mut();
+        for _ in 0..n {
+            st.held.push(t);
+        }
+    }
+
+    /// `n` streams that have been held for `age` already.
+    pub fn hold_streams_aged(&self, n: usize, age: Duration) {
+        let t = self.now.get() - age;
         let mut st = self.st.borrow_mut();
         for _ in 0..n {
             st.held.push(t);
@@ -548,10 +568,11 @@ impl ChildAdmin for World {
                     .is_some_and(|d| now >= p.spawned_at + d)
             })
             .unwrap_or(false);
+        let gap = self.st.borrow().ready_gap;
         Ok(Readiness {
-            readyz: ok,
-            health: ok,
-            capabilities: ok,
+            readyz: ok && gap != Some(0),
+            health: ok && gap != Some(1),
+            capabilities: ok && gap != Some(2),
         })
     }
 
@@ -579,6 +600,10 @@ impl Gate for World {
     fn hold(&self, max: Duration) -> Result<(), PortError> {
         self.log_event("hold");
         let mut st = self.st.borrow_mut();
+        st.holds += 1;
+        if st.hold_fails_from.is_some_and(|n| st.holds >= n) {
+            return Err(PortError("hold refused".into()));
+        }
         st.hold_on = true;
         st.hold_max = max;
         Ok(())
@@ -600,15 +625,21 @@ impl Gate for World {
 
     fn expire(&self) -> usize {
         let now = self.now.get();
-        let mut st = self.st.borrow_mut();
-        if !st.hold_on {
-            return 0;
+        let n = {
+            let mut st = self.st.borrow_mut();
+            if !st.hold_on {
+                return 0;
+            }
+            let max = st.hold_max;
+            let before = st.held.len();
+            st.held.retain(|t| now - *t < max);
+            let n = before - st.held.len();
+            st.expired += n;
+            n
+        };
+        if n > 0 {
+            self.log_event(format!("gate:expired {n}"));
         }
-        let max = st.hold_max;
-        let before = st.held.len();
-        st.held.retain(|t| now - *t < max);
-        let n = before - st.held.len();
-        st.expired += n;
         n
     }
 
@@ -669,7 +700,9 @@ impl RootOrders for World {
 
     fn confirm(&self, commit: &CommitId) -> Result<(), PortError> {
         self.log_event(format!("order confirm {}", &commit.as_str()[..4]));
-        if self.st.borrow().confirm_err {
+        let mut st = self.st.borrow_mut();
+        if st.confirm_err || st.confirm_fails > 0 {
+            st.confirm_fails = st.confirm_fails.saturating_sub(1);
             return Err(PortError("confirm refused".into()));
         }
         Ok(())

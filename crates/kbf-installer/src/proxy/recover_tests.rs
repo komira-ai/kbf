@@ -279,6 +279,98 @@ fn a_restart_in_a_terminal_phase_does_nothing() {
     assert_eq!(w.log().len(), n + 1, "only the restart marker");
 }
 
+#[test]
+fn a_restart_after_the_old_child_resumed_in_a_rollback_finishes_it_and_never_kills_the_new_child() {
+    let (w, old) = World::with_old();
+    w.request_at(secs(60), Request::Rollback);
+    w.crash_at.set(Some(CrashPoint::RollbackAfterResume));
+    run_to_crash(&w, Mode::Frontend, old);
+    assert_eq!(
+        w.holders(),
+        vec![Slot::A],
+        "the old child already took it back"
+    );
+    assert!(
+        w.last_intent().rolling_back,
+        "the rollback was recorded first"
+    );
+    let (end, _) = restart(&w);
+    assert_eq!(end, Ok(Phase::RolledBack), "{:#?}", w.log());
+    assert_eq!(
+        w.count("kill"),
+        0,
+        "the new child served: SIGKILL is never sent"
+    );
+    assert_eq!(w.count("terminate pid 101"), 1, "it is retired by SIGTERM");
+    assert_eq!(w.count("terminate pid 100"), 0);
+    assert_eq!(w.count("order revert"), 1);
+    assert_eq!(w.count("order confirm"), 0);
+    assert_eq!(w.holders(), vec![Slot::A]);
+    assert!(w.alive(100) && !w.alive(101));
+}
+
+#[test]
+fn a_restart_before_the_rollback_moved_a_child_puts_the_new_child_back_and_fails_at_rollback() {
+    let (w, old) = World::with_old();
+    w.request_at(secs(60), Request::Rollback);
+    // Die once the intent is on disk: nothing else has happened yet.
+    crash_when(&w, |i| i.rolling_back && i.phase == Phase::Baking);
+    run_to_crash(&w, Mode::Frontend, old);
+    assert_eq!(w.holders(), vec![Slot::B]);
+    let (end, _) = restart(&w);
+    assert_eq!(end, Ok(Phase::Failed));
+    assert_eq!(failed_at(&w), Some(Step::Rollback));
+    assert_eq!(w.count("kill"), 0);
+    assert_eq!(
+        w.count("order revert"),
+        0,
+        "the new child serves: staged stays"
+    );
+    assert_eq!(w.holders(), vec![Slot::B]);
+    assert_eq!(w.state_of(101), RoleState::Active);
+    assert!(!w.last_intent().rolling_back);
+}
+
+#[test]
+fn a_restart_after_the_new_child_stood_down_in_a_rollback_stands_it_back_up() {
+    let (w, old) = World::with_old();
+    w.request_at(secs(60), Request::Rollback);
+    w.crash_at.set(Some(CrashPoint::RollbackAfterStandDown));
+    run_to_crash(&w, Mode::Frontend, old);
+    assert_eq!(w.state_of(101), RoleState::StoodDown);
+    let (end, _) = restart(&w);
+    assert_eq!(end, Ok(Phase::Failed));
+    assert_eq!(failed_at(&w), Some(Step::Rollback));
+    assert_eq!(
+        w.state_of(101),
+        RoleState::Active,
+        "the new child serves again"
+    );
+    assert_eq!(w.holders(), vec![Slot::B]);
+    assert_eq!(w.count("kill"), 0);
+    assert_eq!(w.count("order revert"), 0);
+}
+
+#[test]
+fn a_new_child_that_lost_the_generation_after_it_served_is_retired_not_killed() {
+    let (w, old) = World::with_old();
+    crash_when(&w, |i| i.phase == Phase::Baking);
+    run_to_crash(&w, Mode::Frontend, old);
+    // Someone resumed the old child behind the proxy's back.
+    {
+        let mut st = w.st.borrow_mut();
+        st.procs[0].holder = true;
+        st.procs[0].state = RoleState::Active;
+        st.procs[1].holder = false;
+        st.procs[1].state = RoleState::StoodDown;
+    }
+    let (end, _) = restart(&w);
+    assert_eq!(end, Ok(Phase::RolledBack), "{:#?}", w.log());
+    assert_eq!(w.count("kill"), 0);
+    assert_eq!(w.count("terminate pid 101"), 1);
+    assert_eq!(w.holders(), vec![Slot::A]);
+}
+
 fn before_in(w: &World, a: &str, b: &str) {
     let log = w.log();
     let i = log

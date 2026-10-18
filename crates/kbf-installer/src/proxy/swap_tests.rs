@@ -1,6 +1,8 @@
 //! The frontend swap against the fakes of [`super::fakes`]. Each test names the defect it
 //! catches; the mutants that were planted to see it red are listed in the PR.
 
+use std::time::Duration;
+
 use super::fakes::*;
 use super::model::*;
 use super::swap::Swap;
@@ -250,10 +252,18 @@ fn a_failed_takeover_kills_the_candidate_then_reads_roles_then_resumes_the_old_c
     w.st.borrow_mut().takeover = Takeover::Err;
     assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Failed));
     assert_eq!(w.last_intent().failure.map(|f| f.step), Some(Step::Switch));
-    before(&w, "admin:takeover B", "kill pid 101");
-    before(&w, "kill pid 101", "admin:role A");
-    before(&w, "admin:role A", "admin:resume A");
-    before(&w, "admin:resume A", "release_into A");
+    // One chain from the takeover on: the role read that decides the resume is the one
+    // after the kill (quiesce polling read `role A` long before).
+    seq(
+        &w,
+        &[
+            "admin:takeover B",
+            "kill pid 101",
+            "admin:role A",
+            "admin:resume A",
+            "release_into A",
+        ],
+    );
     assert_eq!(w.count("release_into B"), 0, "nothing was swapped");
     assert_eq!(w.holders(), vec![Slot::A]);
     assert_eq!(w.state_of(100), RoleState::Active);
@@ -329,11 +339,227 @@ fn a_failed_desired_post_does_not_fail_the_frontend() {
 }
 
 #[test]
-fn a_failed_confirm_fails_the_update_at_confirm() {
-    let (w, old) = World::with_old();
+fn a_confirm_that_keeps_failing_keeps_the_new_child_serving_and_retires_the_old_one() {
+    let (w, old) = draining_world();
     w.st.borrow_mut().confirm_err = true;
     assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Failed));
-    assert_eq!(w.last_intent().failure.map(|f| f.step), Some(Step::Confirm));
+    let f = w.last_intent().failure.expect("failure surfaced");
+    assert_eq!(f.step, Step::Confirm);
+    assert!(f.reason.contains("confirm refused"), "{}", f.reason);
+    assert_eq!(w.count("order confirm"), 6, "six tries");
+    // The waits double from the poll interval: 1, 2, 4, 8, 16 s between six tries.
+    let times: Vec<u64> =
+        w.st.borrow()
+            .events
+            .iter()
+            .filter(|e| e.1.starts_with("order confirm"))
+            .map(|e| (e.0 - START).as_secs())
+            .collect();
+    let gaps: Vec<u64> = times.windows(2).map(|p| p[1] - p[0]).collect();
+    assert_eq!(gaps, vec![1, 2, 4, 8, 16]);
+    // The new child served: the staged release stays, nothing is stood back up, the
+    // old child is still drained and retired, the nodes are not sent.
+    assert_eq!(w.count("order revert"), 0, "staged is not dropped");
+    assert_eq!(w.count("admin:resume"), 0);
+    assert_eq!(w.count("kill"), 0);
+    assert_eq!(
+        w.count("admin:desired"),
+        0,
+        "no nodes under an unconfirmed release"
+    );
+    assert!(w.when("terminate pid 100").expect("old retired") >= secs(600));
+    assert!(!w.alive(100) && w.alive(101));
+    assert_eq!(w.holders(), vec![Slot::B]);
+    assert_eq!(w.phases().last(), Some(&Phase::Failed));
+    assert!(w.phases().contains(&Phase::Draining));
+}
+
+#[test]
+fn a_confirm_that_fails_twice_then_lands_ends_done_with_no_failure_left() {
+    let (w, old) = World::with_old();
+    w.st.borrow_mut().confirm_fails = 2;
+    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Done));
+    assert_eq!(w.count("order confirm"), 3);
+    assert_eq!(w.last_intent().failure, None, "a landed confirm clears it");
+    assert_eq!(w.count("admin:desired"), 1);
+    assert_eq!(w.count("order revert"), 0);
+}
+
+#[test]
+fn a_candidate_missing_any_one_readiness_check_is_not_ready() {
+    for (gap, name) in [(0, "readyz"), (1, "health"), (2, "capabilities")] {
+        let (w, old) = World::with_old();
+        w.st.borrow_mut().ready_gap = Some(gap);
+        assert_eq!(
+            go(&w, plan(Mode::Frontend), old),
+            Ok(Phase::Failed),
+            "{name}"
+        );
+        assert_eq!(
+            w.last_intent().failure.map(|f| f.step),
+            Some(Step::Ready),
+            "{name}"
+        );
+        assert_eq!(w.count("kill pid 101"), 1, "{name}");
+        assert_eq!(w.count("admin:quiesce"), 0, "{name}");
+    }
+}
+
+#[test]
+fn a_refused_hold_fails_the_update_before_the_old_child_is_touched() {
+    let (w, old) = World::with_old();
+    w.st.borrow_mut().hold_fails_from = Some(1);
+    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Failed));
+    assert_eq!(w.last_intent().failure.map(|f| f.step), Some(Step::Hold));
+    assert_eq!(
+        w.count("admin:quiesce"),
+        0,
+        "the old child was never quiesced"
+    );
+    assert_eq!(w.count("admin:takeover"), 0);
+    assert_eq!(w.count("kill pid 101"), 1, "the candidate is killed");
+    assert_eq!(w.holders(), vec![Slot::A]);
+}
+
+#[test]
+fn an_old_child_that_never_quiesces_is_given_up_on_after_three_seconds() {
+    let (w, old) = World::with_old();
+    w.st.borrow_mut().quiesce_takes = secs(3600);
+    w.set_limit(secs(600));
+    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Failed));
+    let f = w.last_intent().failure.expect("failure");
+    assert_eq!(f.step, Step::Switch);
+    assert!(f.reason.contains("did not quiesce in 3 s"), "{}", f.reason);
+    assert!(w.elapsed() < secs(10), "gave up at {:?}", w.elapsed());
+    assert_eq!(w.count("admin:takeover"), 0);
+    seq(
+        &w,
+        &[
+            "kill pid 101",
+            "admin:role A",
+            "admin:resume A",
+            "release_into A",
+        ],
+    );
+}
+
+#[test]
+fn an_abort_while_the_old_child_quiesces_is_reported_as_abort_not_switch() {
+    let (w, old) = World::with_old();
+    w.st.borrow_mut().quiesce_takes = Duration::from_millis(2500);
+    w.request_at(Duration::from_millis(2150), Request::Abort);
+    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Failed));
+    assert_eq!(w.last_intent().failure.map(|f| f.step), Some(Step::Abort));
+    assert_eq!(w.count("admin:takeover"), 0);
+    seq(
+        &w,
+        &[
+            "admin:quiesce A",
+            "kill pid 101",
+            "admin:resume A",
+            "release_into A",
+        ],
+    );
+}
+
+#[test]
+fn a_candidate_that_exits_after_the_thirty_second_window_is_not_respawned() {
+    let (w, old) = World::with_old();
+    w.script(Script {
+        ready_after: None,
+        exit_after: Some(secs(40)),
+    });
+    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Failed));
+    assert_eq!(w.count("spawn"), 1);
+    assert_eq!(w.last_intent().failure.map(|f| f.step), Some(Step::Start));
+    assert!(
+        w.elapsed() < secs(60),
+        "failed at once, at {:?}",
+        w.elapsed()
+    );
+}
+
+#[test]
+fn a_rollback_takes_the_hold_before_it_moves_either_child() {
+    let (w, old) = World::with_old();
+    w.request_at(secs(60), Request::Rollback);
+    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::RolledBack));
+    assert_eq!(w.count("hold"), 2, "the swap's hold and the rollback's");
+    // After `switched` was recorded: hold, then both children, then the release.
+    seq(
+        &w,
+        &[
+            "record Baking",
+            "hold",
+            "admin:stand_down B",
+            "admin:resume A",
+            "release_into A",
+        ],
+    );
+}
+
+#[test]
+fn a_rollback_whose_hold_is_refused_changes_nothing_and_the_bake_goes_on() {
+    let (w, old) = World::with_old();
+    w.st.borrow_mut().hold_fails_from = Some(2);
+    w.request_at(secs(60), Request::Rollback);
+    let mut s = Swap::begin(w.ports(), plan(Mode::Frontend), Some(old)).unwrap();
+    assert_eq!(s.run(), Ok(Phase::Done));
+    assert!(s.notes().iter().any(|n| n.contains("the hold failed")));
+    assert_eq!(w.count("admin:stand_down B"), 0);
+    assert_eq!(w.count("admin:resume"), 0);
+    assert!(!w.last_intent().rolling_back);
+    assert_eq!(w.holders(), vec![Slot::B]);
+}
+
+#[test]
+fn the_old_child_is_stood_down_once_and_only_after_the_takeover() {
+    let (w, old) = World::with_old();
+    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Done));
+    assert_eq!(w.count("admin:stand_down A"), 1);
+    seq(&w, &["admin:takeover B", "admin:stand_down A"]);
+    // A takeover that fails never stands the old child down: it resumes.
+    let (w, old) = World::with_old();
+    w.st.borrow_mut().takeover = Takeover::Err;
+    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Failed));
+    assert_eq!(w.count("admin:stand_down A"), 0);
+    assert_eq!(w.state_of(100), RoleState::Active);
+}
+
+#[test]
+fn held_streams_that_waited_out_the_hold_fail_before_the_release_feeds_the_rest() {
+    let (w, old) = World::with_old();
+    // 9 s old at the start: 11 s when the quiesce wait ends, 16 s after a 5 s takeover,
+    // so only the check at the release can fail them.
+    w.hold_streams_aged(30, secs(9));
+    w.st.borrow_mut().takeover = Takeover::Slow(secs(5));
+    w.hold_streams(5);
+    let mut s = Swap::begin(w.ports(), plan(Mode::Frontend), Some(old)).unwrap();
+    assert_eq!(s.run(), Ok(Phase::Done));
+    assert_eq!(w.st.borrow().expired, 30);
+    assert_eq!(
+        w.st.borrow().fed,
+        vec![(Slot::B, 5)],
+        "only the fresh ones are fed"
+    );
+    assert!(
+        s.notes()
+            .iter()
+            .any(|n| n.contains("30 held streams expired"))
+    );
+}
+
+#[test]
+fn the_hold_is_expired_while_the_old_child_quiesces_not_only_at_the_release() {
+    let (w, old) = World::with_old();
+    // 14 s old when the hold starts: they pass hold_max (15 s) during the quiesce wait.
+    w.hold_streams_aged(7, secs(12));
+    w.st.borrow_mut().quiesce_takes = Duration::from_millis(2500);
+    assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Done));
+    seq(
+        &w,
+        &["admin:quiesce A", "gate:expired 7", "admin:takeover B"],
+    );
 }
 
 #[test]
