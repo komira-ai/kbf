@@ -480,6 +480,8 @@ async fn a_slot_users_denied_write_is_named_in_its_stderr() {
     let cas = Arc::new(MemoryCas::default());
     let mut config = config(&scratch, users.pool());
     config.poll = Duration::from_millis(50);
+    let record = Arc::new(std::sync::Mutex::new(Vec::new()));
+    config.denial_record = Some(Arc::clone(&record));
     let rt = NativeRuntime::new(config, Arc::clone(&cas)).expect("runtime");
     let name = format!("kbf-denied-{}", std::process::id());
     let target = format!("/var/tmp/{name}");
@@ -492,18 +494,33 @@ async fn a_slot_users_denied_write_is_named_in_its_stderr() {
         .lines()
         .find(|l| l.starts_with("kbf:   ") && l.contains(&name))
         .unwrap_or_else(|| {
-            // What the log holds for the name, to tell a denial the log never got from
-            // one the driver attributed to the wrong pids.
-            let held = Command::new("/usr/bin/log")
-                .args(["show", "--last", "5m", "--style", "compact", "--predicate"])
-                .arg(format!("eventMessage CONTAINS \"{name}\""))
-                .output()
-                .map_or_else(
-                    |e| e.to_string(),
-                    |o| String::from_utf8_lossy(&o.stdout).into_owned(),
-                );
+            // What the driver asked and why nothing counted (its node-log record), and
+            // what the log holds for the name or the driver's predicate over a short and
+            // a long window, to tell a predicate that misses the line from a window that
+            // misses it from a line that is only late.
+            let ask = |what: &str, last: &str, predicate: &str| {
+                let out = Command::new("/usr/bin/log")
+                    .args(["show", "--last", last, "--style", "compact", "--predicate"])
+                    .arg(predicate)
+                    .output()
+                    .map_or_else(
+                        |e| e.to_string(),
+                        |o| String::from_utf8_lossy(&o.stdout).into_owned(),
+                    );
+                let hits: Vec<&str> = out.lines().filter(|l| l.contains(&name)).collect();
+                format!("{what}: {} line(s) name it: {hits:?}\n", hits.len())
+            };
+            let named = format!("eventMessage CONTAINS \"{name}\"");
+            let held = [
+                ask("A driver predicate, 5m", "5m", kbf_driver_native::denials::PREDICATE),
+                ask("B name, 30s", "30s", &named),
+                ask("C driver predicate, 30s", "30s", kbf_driver_native::denials::PREDICATE),
+                ask("D name, 5m", "5m", &named),
+            ]
+            .concat();
+            let record = record.lock().expect("record").join("\n");
             panic!(
-                "no denial names {name} (slot uid {}): {text}\nthe log holds:\n{held}",
+                "no denial names {name} (slot uid {}): {text}\nthe driver's record:\n{record}\nthe log, asked after the run:\n{held}",
                 users.0[0].uid
             )
         });

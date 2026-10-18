@@ -119,10 +119,22 @@ async fn a_failed_action_gets_its_own_denials_in_its_stderr() {
     // sandbox failed it, and another lease's paths are not this lease's to show.
     let (mut config, cas) = sandboxed("denials-others");
     config.denial_log = log_others_only;
+    config.denial_schedule = quick(50);
+    let record = Arc::new(std::sync::Mutex::new(Vec::new()));
+    config.denial_record = Some(Arc::clone(&record));
     let rt = runtime(config, &cas);
     let spec = Spec::act("echo --stderr own failure ; exit 3");
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
     assert_eq!(stderr(&cas, &result), "own failure\n");
+    // The node's log, and the record a test can print, say what was asked and why the
+    // other pid's line did not count.
+    let said = record.lock().expect("record").clone();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].contains("/usr/bin/log show --style compact --last"),
+        "{said:?}"
+    );
+    assert!(said[0].contains("pids {1} are not watched"), "{said:?}");
 
     // A note that would push stderr past the stdio limit is left out: the limit
     // would drop the action's own stderr with it.
@@ -170,8 +182,8 @@ static LATE_WINDOWS: std::sync::Mutex<Vec<Duration>> = std::sync::Mutex::new(Vec
 
 /// A log that shows the action's refusal from its third read on, as the unified log
 /// does for a line the kernel reports (it reaches `log show` seconds late).
-fn log_shows_it_late(file: &Path, ago: Duration) -> io::Result<String> {
-    LATE_WINDOWS.lock().expect("windows").push(ago);
+fn log_shows_it_late(file: &Path, window: Duration) -> io::Result<String> {
+    LATE_WINDOWS.lock().expect("windows").push(window);
     if LATE_READS.fetch_add(1, Ordering::SeqCst) + 1 < 3 {
         return Ok(String::new());
     }
@@ -180,12 +192,13 @@ fn log_shows_it_late(file: &Path, ago: Duration) -> io::Result<String> {
 
 /// Catches a report that reads the log once: a refusal the log shows seconds after it
 /// happened (the kernel-reported line of a slot user's denied write) never reaches
-/// stderr. Also that each read looks further back than the one before, and that
-/// reads stop at the first holding the action's own refusal.
+/// stderr. Also that no read looks back less than the floor, and that reads stop at
+/// the first holding the action's own refusal.
 #[tokio::test]
 async fn a_refusal_the_log_shows_late_is_still_in_stderr() {
     let (mut config, cas) = sandboxed("denials-late");
     config.denial_log = log_shows_it_late;
+    config.denial_schedule = quick(2000);
     let rt = runtime(config, &cas);
     let spec = Spec::act("pgid ; echo --stderr own failure ; exit 3");
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
@@ -195,9 +208,19 @@ async fn a_refusal_the_log_shows_late_is_still_in_stderr() {
     assert_eq!(LATE_READS.load(Ordering::SeqCst), 3);
     let windows = LATE_WINDOWS.lock().expect("windows").clone();
     assert!(
-        windows[0] < windows[1] && windows[1] < windows[2],
+        windows
+            .iter()
+            .all(|w| *w >= kbf_driver_native::denials::MIN_WINDOW),
         "{windows:?}"
     );
+}
+
+/// Reads 5 ms apart, for at most `give_up_ms`.
+fn quick(give_up_ms: u64) -> kbf_driver_native::denials::Schedule {
+    kbf_driver_native::denials::Schedule {
+        every: Duration::from_millis(5),
+        give_up: Duration::from_millis(give_up_ms),
+    }
 }
 
 fn config_without_sandbox(dir: &Path) -> NativeConfig {

@@ -25,7 +25,7 @@ use tokio::time::Instant;
 
 use crate::cas::CasStore;
 use crate::config::NativeConfig;
-use crate::denials::{self, Found};
+use crate::denials;
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::program::{Refused, Resolved, resolve};
@@ -563,34 +563,40 @@ impl<C: Cas> NativeRuntime<C> {
         if !matches!(self.config.isolation, network::Isolation::Sandbox(_)) {
             return;
         }
-        // The log can show a refusal seconds after it happened, so a read that holds none
-        // of the action's own is repeated, a window wider each time, up to
-        // `denials::RETRIES` more times. A read that fails ends the report.
-        let mut found = Found::default();
-        for attempt in 0..=denials::RETRIES {
-            let (read, file) = (self.config.denial_log, dir.join("sandbox-log"));
-            let ago = ran + denials::SETTLE * 2 * u32::try_from(attempt).unwrap_or(u32::MAX);
-            let log = match tokio::task::spawn_blocking(move || read(&file, ago)).await {
-                Ok(Ok(log)) => log,
-                Ok(Err(why)) => {
-                    tracing::warn!(%lease, %why, "the sandbox's denials could not be read");
-                    return;
-                }
-                Err(why) => {
-                    tracing::warn!(%lease, %why, "the read of the sandbox's denials did not finish");
-                    return;
-                }
-            };
-            found = Found::of(&log, &pids);
-            if !found.mine.is_empty() {
-                break;
+        // The log can show a refusal seconds after it happened, so the read is repeated
+        // until it holds one of the action's own or the schedule is spent
+        // ([`denials::collect`]). A read that fails ends the report.
+        let (read, file) = (self.config.denial_log, dir.join("sandbox-log"));
+        let (schedule, watched) = (self.config.denial_schedule, pids.clone());
+        let collected = tokio::task::spawn_blocking(move || {
+            let ended = std::time::Instant::now();
+            denials::collect(
+                &watched,
+                ran,
+                schedule,
+                |window| read(&file, window),
+                || ended.elapsed(),
+                std::thread::sleep,
+            )
+        })
+        .await;
+        let report = match collected {
+            Ok(report) => report,
+            Err(why) => {
+                tracing::warn!(%lease, %why, "the read of the sandbox's denials did not finish");
+                return;
+            }
+        };
+        if report.found.mine.is_empty() {
+            let why = report.explain(&pids);
+            tracing::warn!(%lease, "no sandbox denial is the action's own: {why}");
+            if let Some(record) = &self.config.denial_record {
+                record.lock().expect("record").push(why);
             }
         }
+        let found = report.found;
         for denial in &found.mine {
             tracing::warn!(%lease, denial = %denials::shown(denial), "the sandbox denied the action");
-        }
-        if let Some(why) = found.unwatched(&pids) {
-            tracing::warn!(%lease, "no sandbox denial is the action's own: {why}");
         }
         for line in found.other_lines() {
             tracing::info!(%lease, denial = %line, "the sandbox denied a process this lease did not watch");
