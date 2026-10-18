@@ -1,31 +1,30 @@
 # kbf-installer: contract
 
-Status: design of record for the parallel PRs. Marks: **(built)** exists on `feature/pull-updates`; **(to build)** does not. Orders, the order spool, the fetch child, generation and the verification steps are agreed with `pull-updates.md` (#1024), which is their authority (section 12); settings, CLI, units and layout names are decided here, and #1021 (distribution), #966 and #1024 are edited to match (section 11).
+Status: design of record for the parallel PRs; on-prem only for now (section 13 lists what is deferred). Marks: **(built)** exists on `feature/pull-updates`; **(to build)** does not. Orders, the order spool, the fetch child, generation and the verification steps are agreed with `pull-updates.md` (#1024), which is their authority (section 12); settings, CLI, units and layout names are decided here, and #1021 (distribution), #966 and #1024 are edited to match (section 11).
 
 ## 1. Purpose
-`kbf-installer` is the one root tool for setup and updates on every channel. It is the only writer of root-owned release files. It never updates itself; only the package manager does.
-1. **kbf** is runtime only: modes plus flags, or `/etc/kbf/kbf.toml`. It never installs, fetches or restarts anything. It writes an order record into the installer's `orders/` directory (section 4) and reports status. kbf.toml has no update or installer keys.
-2. **kbf-installer** installs, fetches, verifies, activates, confirms, reverts releases, and fetches and pins Envoy.
-3. **The package** ships `kbf-installer`, the unit files (disabled) and the trust files. It ships no kbf runtime release; `setup` installs the first one.
+`kbf-installer` is THE package and the one root tool for setup and updates of kbf. It is the only writer of root-owned release files. It never updates itself; only the package manager does.
+1. **kbf** is the runtime only: `kbf --mode=frontend|storage|daemon|storage-and-daemon|all-in-one` (or `mode = "..."` in `/etc/kbf/kbf.toml`; a flag overrides the file), with `--config`, `--check` and `--instance` as flags. There are no positional arguments and no `node` mode. The old subcommand forms stay as aliases until the test farm has moved, then are removed. kbf never installs, fetches or restarts anything. It writes an order record into the installer's `orders/` directory (section 4) and reports status. kbf.toml has no update or installer keys. Enrollment runs inside the start of the `storage`, `daemon` and `storage-and-daemon` modes; the enrollment token limits which roles a host may hold. There is no `kbf enroll`, `kbf ca` or `kbf token` command: the frontend creates its CA on first start into an empty `--ca-dir`, and tokens are operator-API routes.
+2. **kbf-installer** pulls the kbf release itself (an unprivileged fetch child from the one configured source; nothing is root-owned before it verifies), installs, verifies, activates, confirms and reverts releases. It takes its orders from the kbf-owned `orders/` directory, keeps its state under the root-owned `/var/lib/kbf-installer`, and reads its settings from `/etc/kbf/installer.toml`.
+3. **The package** ships `kbf-installer`, the unit files (disabled) and the trust files. It ships no kbf runtime release; `setup` installs the first one. On a frontend host it depends on Envoy (section 5.1).
 
-Not goals: self-update, a distro Envoy dependency, an installer network listener, root logic in kbf.
+Updates are triggered externally (section 6): nothing in kbf or in the installer decides to update. Not goals: self-update, cloud update providers, fetching or pinning Envoy, an installer network listener, root logic in kbf.
 
 ## 2. CLI
-One binary (**to build**; today a library plus `kbf-helper`). Mutating verbs are a dry run without `--apply` (**built**). Flags: `--json`, `--apply`; `--root DIR` exists only in builds with the `test-sandbox` feature. Exit codes: 0 ok; 1 failed; 2 usage or missing prerequisite; 3 refused (verification, policy); 4 busy; 5 needs operator. Every verb but `status`, `check`, `envoy list` needs root.
+One binary (**to build**; today a library plus `kbf-helper`). Mutating verbs are a dry run without `--apply` (**built**). Flags: `--json`, `--apply`; `--root DIR` exists only in builds with the `test-sandbox` feature. Exit codes: 0 ok; 1 failed; 2 usage or missing prerequisite; 3 refused (verification, policy); 4 busy; 5 needs operator. Every verb but `status` and `check` needs root.
 
 | Verb | What it does |
 |---|---|
-| `setup` | First install. `--mode`, `--release-source url\|frontend`, `--release-url`, `--min-generation`, `--commit`, `--no-start`. Fetches and verifies Envoy and the release through the same fetch child and checks as an update, writes `installer.toml` (the only writer), creates users and directories. Idempotent. |
-| `status` | Current, previous, staged, pending confirm, Envoy, last refusal. `--json` equals `status.json` (section 4). |
+| `setup` | First install. `--mode` (the kbf mode this host runs), `--release-source url\|frontend`, `--release-url`, `--min-generation`, `--commit`, `--no-start`. Fetches and verifies the release through the same fetch child and checks as an update, writes `installer.toml` (the only writer), creates users and directories. Idempotent. |
+| `status` | Current, previous, staged, pending confirm, last refusal. `--json` equals `status.json` (section 4). |
 | `run` | Run by `kbf-installer.service`, no listening socket. Each pass: finish an owed restart, revert an expired swap, sweep scratch, act once on each record in `orders/` in (epoch, id) order, write status. No release polling. |
-| `update --commit SHA --frontend` | Operator order for the frontend host (section 6). Runs inline as root under the lock (exit 4 while a `run` pass holds it); no control socket. |
+| `update --commit SHA --frontend` | The frontend host's own update (section 6), run as root by whatever external trigger the operator uses. Runs inline under the lock (exit 4 while a `run` pass holds it); no control socket. |
 | `confirm`/`revert ID` | Operator override of a pending swap, naming the activation id; inline under the lock. Exit 5 if none pending. |
 | `rollback` | `current` to `previous`, no window. Operator only; the only verb allowed below the release floor. |
 | `gc` | Keeps current, previous, one more. State-aware (S22). |
 | `boot-check` | Counts starts of a release on trial; reverts when the budget is spent (**built** logic). |
 | `quiesce` | For maintainer scripts: takes the lock, exit 5 if a swap is pending (S25). |
-| `envoy fetch\|verify\|path\|list` | Pinned Envoy under the installer tree. |
-| `check` | Validates installer config, trust files, path chain. Lists every problem. |
+| `check` | Validates installer config, trust files, path chain and, on a frontend host, that the installed Envoy is inside the tested range (section 5.1). Lists every problem. |
 
 `stage`, `activate`, `fetch-child` are internal.
 
@@ -34,20 +33,19 @@ Three roots, never nested: kbf's own state `/var/lib/kbf` (user `kbf`, systemd S
 
 Package-owned (root:root, no group/other write, changed by package upgrade only):
 - `/usr/bin/kbf-installer`, `/usr/lib/systemd/system/kbf-*.service`.
-- `/usr/share/kbf-installer/trust/`: pinned `gh`, `trusted_root.jsonl` (with `valid_until`), `installer.conf` (signer workflow, OIDC issuer, repo, allowed source refs, `deny` commit list). Replaces `/usr/local/libexec/kbf-deploy`. Allowed source refs live **only** here; `installer.toml` may narrow them, never widen (set intersection).
+- `/usr/share/kbf-installer/trust/`: pinned `gh`, `trusted_root.jsonl` (with `valid_until`), `installer.conf` (signer workflow, OIDC issuer, repo, allowed source refs, `deny` commit list, and the tested Envoy version range of section 5.1). Replaces `/usr/local/libexec/kbf-deploy`. Allowed source refs live **only** here; `installer.toml` may narrow them, never widen (set intersection).
 
 Installer-owned (root:root):
 - `/var/lib/kbf-installer/releases/<sha>/`: `kbf`, `kbf-daemon` where it applies, `units/`, and a `VERIFIED` marker written into the directory before it is renamed into place. Files 0755/0644; no setuid, setgid or file capabilities.
 - `/var/lib/kbf-installer/releases/current`, `releases/previous`: relative links to `<sha>`. Frontend instances use `slots/<instance>` links (section 6).
-- `/var/lib/kbf-installer/envoy/<version>-<sha256[:16]>/envoy` plus `envoy.sha256`.
 - `/var/lib/kbf-installer/state.json` (0600, schema 2) and `state.json.bak`; it supersedes the schema 1 `helper.json` of #1024. `status.json` (0644, section 4). `work/<sha>.partial/` (0755, extraction; `dl/` inside it 0700 holds the tarball), swept at every start. `orders/` (`kbf:kbf` 0700). Lock `/run/kbf-installer/lock`.
 - Layout constants live in `layout.rs`, one place. macOS: root-owned `/usr/local/kbf-installer` tree (not a user-owned Homebrew prefix), `/var/db/kbf-installer` for state.
 
-`state.json` schema 2 (types fixed by the golden fixture, section 9 P1; `deny_unknown_fields`): `schema`, `current`, `previous` (confirmed releases only), `staged`, `pending_confirm {activation "<epoch>-<order_id>", commit, previous, deadline_wall, deadline_mono_s, starts_left}`, `envoy {current, previous}`, `floor {epoch, order_id, generation}`, `serving_instance` (frontend), `last_acked_order_id`, `unacked` (copy of the order being acted on, with root's first-seen time of each record in `orders/`). `floor` replaces the built, unused `order_floor`. Schema 1 to 2 migration (including the string activation id) belongs to P3.
+`state.json` schema 2 (types fixed by the golden fixture, section 9 P1; `deny_unknown_fields`): `schema`, `current`, `previous` (confirmed releases only), `staged`, `pending_confirm {activation "<epoch>-<order_id>", commit, previous, deadline_wall, deadline_mono_s, starts_left}`, `floor {epoch, order_id, generation}`, `serving_instance` (frontend), `last_acked_order_id`, `unacked` (copy of the order being acted on, with root's first-seen time of each record in `orders/`). `floor` replaces the built, unused `order_floor`. Schema 1 to 2 migration (including the string activation id) belongs to P3.
 
 Config:
-- `/etc/kbf/kbf.toml`: kbf's runtime config, root:kbf 0640 (#966). The installer reads only its existence.
-- `/etc/kbf/installer.toml` (root:root 0644, TOML, unknown keys refused): `release_source` (`url`|`frontend`), `release_url`, `source_refs` (narrowing only), `confirm_window_s` (default 900, bounds 120-1800), `confirm_window_max_s`, `min_generation`, `min_protocol` (operator floors), `fetch_timeout_s` (900, bounds 60-3600), `max_component_bytes` (512 MiB, at most 1 GiB), `min_activation_interval_s` (60), and for the `frontend` source `node_cert`, `node_key` (paths `setup` copies from enrollment). Source is read only from this file, never from an order, offer, environment or flag outside `setup`. This supersedes `[update]` in kbf.toml of #1024.
+- `/etc/kbf/kbf.toml`: kbf's runtime config, root:kbf 0640 (#966). The installer reads only its existence and its `mode` key (to know whether this is a frontend host).
+- `/etc/kbf/installer.toml` (root:root 0644, TOML, unknown keys refused): `release_source` (`url`|`frontend`), `release_url`, `source_refs` (narrowing only), `confirm_window_s` (default 900, bounds 120-1800), `confirm_window_max_s`, `min_generation`, `min_protocol` (operator floors), `fetch_timeout_s` (900, bounds 60-3600), `max_component_bytes` (512 MiB, at most 1 GiB), `min_activation_interval_s` (60), and for the `frontend` source `node_cert`, `node_key` (paths of the certificate and key that enrollment, inside the start of the node modes, writes under kbf's state; the installer opens them `O_NOFOLLOW` at each fetch and lends them to the child, section 5). A host's first release therefore comes from the `url` source or a release `setup` was given; it can switch to the `frontend` source once enrolled. Source is read only from this file, never from an order, offer, environment or flag outside `setup`. This supersedes `[update]` in kbf.toml of #1024.
 
 Users: `kbf` (runtime). `kbf-fetch` (`_kbf-fetch` on macOS): dedicated, no home, `nologin`, no groups, owns no file; it runs the download and the `--version --json` probe, never anything with credentials. There is no `kbf-verify` user.
 
@@ -60,7 +58,7 @@ Channel decides authority, not a body field. There is no order socket, no contro
 - **Refused before any fetch** (reason in `status.json`): replay or older, commit not 40 lowercase hex, component set not exactly what the platform needs, size over `max_component_bytes`, expected facts missing (fail closed), a pending trial, below the floor, or a live lease. The installer observes leases itself (Linux: the cgroup of the action unit; macOS: the launchd job and processes by lease uid); the record's claim is never used.
 - **Unacknowledged orders**: the record is removed after it is read, but the order is acknowledged only after the flip, so the installer keeps its own copy in `state.json` and reruns it from the start (nothing was flipped, so repeating is safe) unless it has expired.
 - **`window_s`** is an input, clamped to `[120, confirm_window_max_s]`; on Linux the window starts at the first start (`boot-check`), so `window_s` is advisory there; on macOS it arms at activation.
-- **Status**: `/var/lib/kbf-installer/status.json` (root-owned 0644, atomic rename; in the persistent tree, so it survives reboot), schema 2: **built** fields `installed_commit`, `previous_commit`, `staged_commit`, `state`, `refusal`, `acked_order_id`, `staged{...}`, plus `envoy {current, previous}`, the probe's reported facts, days left on the trust root and "unverified: rollback refused" flags. `state` words: `idle`, `fetching`, `staged`, `activated_unconfirmed`, `confirmed`, `reverted`, `refused`, each 1:1 with `UpdateStatus.State`. `helper_present` means installer present. `kbf-installer.service` starts before the runtime units (`Before=`); `/run/kbf-installer` (tmpfiles.d) holds only the lock.
+- **Status**: `/var/lib/kbf-installer/status.json` (root-owned 0644, atomic rename; in the persistent tree, so it survives reboot), schema 2: **built** fields `installed_commit`, `previous_commit`, `staged_commit`, `state`, `refusal`, `acked_order_id`, `staged{...}`, plus the probe's reported facts, days left on the trust root and "unverified: rollback refused" flags. `state` words: `idle`, `fetching`, `staged`, `activated_unconfirmed`, `confirmed`, `reverted`, `refused`, each 1:1 with `UpdateStatus.State`. `helper_present` means installer present. `kbf-installer.service` starts before the runtime units (`Before=`); `/run/kbf-installer` (tmpfiles.d) holds only the lock.
 - A swap pending refuses `activate` (`pending`, exit 4): one confirm window at a time, and `previous` is only ever a confirmed release. A confirm is accepted only if it names the pending activation, the unit is active, `/proc/<MainPID>/exe` is in `releases/<current>`, and the first boot-check has run.
 - **macOS**: `kbf` runs as root there, so a compromise of `kbf` is a compromise of root; the separation of this section holds on Linux only. The fetch child and the probe still run unprivileged.
 
@@ -82,12 +80,16 @@ Channel decides authority, not a body field. There is no order socket, no contro
 4. **Shape**: gzip and tar with exactly one regular file named `<name>` (no link, device, directory, absolute path or `..`), at most 1 GiB, extracted by the parent into `work/<sha>.partial/` as root, mode 0755. Binary kind and CPU checked; macOS quarantine refused and `codesign --verify --strict`.
 5. **The binary names itself before the flip**: `<name> --version --json` run as `kbf-fetch` (empty environment, no credentials, no network that is enforced in v1) reports the order commit (12 hex prefix) and `protocol`, `min_protocol`, `state_schema`, `profile`, `platform` that must equal the record's expected facts, satisfy the operator floor, and be supported by this installer (else `installer_too_old`). Mismatch refuses before anything is renamed.
 6. **Install**: write `VERIFIED` into the directory, rename to `releases/<sha>`, fsync the parent, then `staged` in `state.json`. A `releases/<sha>` without `VERIFIED` and not referenced by `current`, `previous` or `pending_confirm` is removed; a referenced one stays and is flagged "unverified: rollback to it refused". "Already installed" means `VERIFIED` exists, never skips verification of a new fetch, and a rollback to it skips steps 1-4 but reruns 5. Directories made by the test-farm switch never carry the marker.
-7. **Envoy** (frontend only): its pin (`version`, `url`, `sha256`) is a component of the frontend release, attested and fetched like any other; sha256 checked, ELF machine check, `envoy --version` by descriptor as `kbf-fetch`, install into `<version>-<sha256[:16]>`, never overwriting a directory with different bytes.
 
-**Refusals** (exit 3, stable `refusal` word): `trust_chain`, `hash`, `attestation`, `commit_or_ref`, `facts`, `installer_too_old`, `platform`, `size`, `disk`, `fetch`, `replay`, `generation`, `floor`, `pending`, `lease`, `denied`. Lock contention is exit 4, not a refusal.
+### 5.1 Envoy is an installed dependency
+The frontend's update path needs an Envoy in front of it (section 6). Envoy is not part of a kbf release and the installer never fetches, pins, installs or upgrades it. It is a dependency of the package (`Depends:` with a version range) or of host preparation. The range is the one the farm has tested, kept in the package-owned `installer.conf`; `check` and `setup` refuse a frontend host whose Envoy is missing or outside it. The installer renders kbf's Envoy configuration for the frontend's ports and instances and asks the installed Envoy to reload it; the Envoy service itself is the dependency's. Changing Envoy across versions is not designed here (section 13).
+
+**Refusals** (exit 3, stable `refusal` word): `trust_chain`, `hash`, `attestation`, `commit_or_ref`, `facts`, `installer_too_old`, `platform`, `size`, `disk`, `fetch`, `replay`, `generation`, `floor`, `pending`, `lease`, `denied`, `envoy_range` (frontend update only). Lock contention is exit 4, not a refusal.
 
 ## 6. Update sequences
-**Node update** (the "update ready" click sets the desired release; `POST /v1/update/desired` of #1024 6.3 is the API, P14 builds on it). The frontend orders storage and daemon nodes one at a time through the drain system:
+**Who triggers.** An update is always triggered from outside kbf: an external system calls the frontend's control API (`POST /v1/update/desired` of #1024 6.3) to set the desired release, and separately runs the frontend host's own update (below). For our own farm that external system is its deployment pipeline. kbf shows no update button and polls nothing in this version (section 13).
+
+**Node update.** With a desired release set, the frontend rolls the storage and daemon nodes through the drain system, one storage node at a time (P14 builds on the API):
 1. Drain, then `UpdateOrder{ACTIVATE, commit, generation}`; `kbf-update` writes the record (section 4) and does nothing else.
 2. Installer fetches and verifies (section 5), then writes `pending_confirm`, flips `previous` then `current` (state first), then restarts the node units named in its code table.
 3. Linux: window starts at the first start (`boot-check`), 3 start attempts; macOS armed at activation, `expire` triggers.
@@ -95,34 +97,34 @@ Channel decides authority, not a body field. There is no order socket, no contro
 5. No confirm by the deadline (monotonic plus wall), start budget spent, or `REVERT`: revert state first, then links, then restart; report `REVERTED`.
 Crash at any step: `reconcile` makes links match `state.json` on next start (**built**). Fetch failure leaves `current` untouched and reports `refused`.
 
-**Frontend update**: separate action, never on the wire. Entry: `kbf-installer update --commit SHA --frontend`, run by root; the release comes from the configured source with the components named by the operator's order, verified as in section 5.
-1. Verify the release and, if the pin differs, Envoy.
+**Frontend update**: a separate, externally triggered step, never on the wire and not part of the node rollout. SQLite, one frontend now; Postgres and several frontends come later (section 13). Entry: `kbf-installer update --commit SHA --frontend`, run as root on the frontend host by the external trigger; the release comes from the configured source, verified as in section 5.
+1. Verify the release and check the installed Envoy is inside the tested range (`envoy_range` refusal otherwise).
 2. Point `slots/<idle>` at the new release. Instances run `slots/%i/kbf`, so a crash restart of the serving instance never picks up the new release; `current` flips only at confirm.
-3. `systemctl start kbf-frontend@<idle>`; handover per `frontend-handover.md` (**built**). Needs `--instance %i` in `kbf frontend` (**to build**, P13 adds the flag to `kbf-cli`).
-4. If Envoy changes, start `kbf-envoy@<new>`, move the frontend, retire the old after drain.
-5. Confirm: the successor reports ready (notify) and the old reports stood down inside `confirm_window_s`; the frontend's own handover signals are the confirm. Else revert: if the old instance already stood down, start it and wait for ready before flipping slots back.
-6. `kbf frontend handover` is removed after this lands. Order records never touch `kbf-frontend@*` or `kbf-envoy@*`, on an all-in-one host too; this holds after P13, replacing "forbid until P13".
+3. `systemctl start kbf-frontend@<idle>` behind the installed Envoy, then hand over per `frontend-handover.md` (**built**). Needs `--instance %i` in `kbf --mode=frontend` (**to build**, P13 adds the flag to `kbf-cli`).
+4. The successor reports ready (notify) and takes the writer baton. The old instance **stops scheduling** and **relays its open `Execute` streams until they close, with no timeout**: OSS Buck2 never calls `WaitExecution`, so a stream that ends early is a build that fails. The old instance exits by itself when it holds no stream; the installer never stops it.
+5. Confirm: the successor ready and the old instance reporting that it has stopped scheduling, inside `confirm_window_s`; the frontend's own handover signals are the confirm, and `current` flips. Else revert: until the old instance has stopped scheduling, stop the successor and flip slots back. After it has stopped, the successor is the only scheduler and there is no automatic revert; the operator re-runs the update with the older commit (a higher generation).
+6. `kbf frontend handover` is removed after this lands. Order records never touch `kbf-frontend@*`, on an all-in-one host too; this holds after P13, replacing "forbid until P13".
 
 ## 7. Units and gating
-Plain files in `packaging/linux/units/`, installed disabled, never enabled by package scripts: `kbf-installer.service`, one unit per mode `kbf` offers (`frontend` as `kbf-frontend@.service`, `storage`, `daemon`, `storage-and-daemon`, `node`, `all-in-one`; P11 lists them from `kbf --help`), `kbf-envoy@.service`. Paths are literal; there are no `@...@` substitutions. The `check-units` rules (`handover`, `state-store`, `stop`, `credential`, `storage`) move with the units (P11).
+Plain files in `packaging/linux/units/`, installed disabled, never enabled by package scripts: `kbf-installer.service`, one unit per mode `kbf` offers (`frontend` as `kbf-frontend@.service`, `storage`, `daemon`, `storage-and-daemon`, `all-in-one`; there is no `node` mode; P11 lists them from `kbf --help`). There is no Envoy unit: Envoy's service is its package's (section 5.1). Paths are literal; there are no `@...@` substitutions. The `check-units` rules (`handover`, `state-store`, `stop`, `credential`, `storage`) move with the units (P11).
 ```ini
 [Unit]
 ConditionPathExists=/etc/kbf/kbf.toml
 [Service]
 ExecStartPre=+/usr/bin/kbf-installer boot-check
-ExecStartPre=/var/lib/kbf-installer/releases/current/kbf <mode> --check
-ExecStart=/var/lib/kbf-installer/releases/current/kbf <mode>
+ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=<mode> --check
+ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=<mode> --config /etc/kbf/kbf.toml
 RestartPreventExitStatus=2
 ```
-`--check` prints every missing prerequisite and exits 2 (**to build**, P12; #1020 runs the same checks at every start). It is `ExecStartPre`, not `ExecCondition`, because `ExecCondition` skips silently on exit 1-254. `boot-check` runs as root (`+`); lock contention waits and neither counts as a start nor fails the unit. Node mode keeps its `kbf enroll` pre-start from #966.
-`kbf-installer.service` (no socket unit): `Type=simple`, `Restart=on-failure` with exit 4 treated as success, `ConditionPathExists=/etc/kbf/installer.toml`, `ExecStartPre=/usr/bin/kbf-installer check`, hardening (`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths=/var/lib/kbf-installer /run/kbf-installer`, `PrivateTmp`, trimmed capabilities); P11 lints the `systemd-analyze security` score. `kbf-envoy@.service` runs `ExecStartPre=+kbf-installer envoy verify` against the pin in `state.json`. Frontend template rules from the handover design apply (`Type=notify`, finite `TimeoutStartSec`, `RuntimeDirectoryPreserve=yes`, no `Conflicts=`).
+`--check` is a flag of every mode, prints every missing prerequisite and exits 2 (**to build**, P12; #1020 runs the same checks at every start). It is `ExecStartPre`, not `ExecCondition`, because `ExecCondition` skips silently on exit 1-254. `boot-check` runs as root (`+`); lock contention waits and neither counts as a start nor fails the unit. There is no enrollment pre-start: enrollment runs inside the start of the `storage`, `daemon` and `storage-and-daemon` modes, so a host without a valid token fails its start with one line, and the token decides which of those roles the host may hold.
+`kbf-installer.service` (no socket unit): `Type=simple`, `Restart=on-failure` with exit 4 treated as success, `ConditionPathExists=/etc/kbf/installer.toml`, `ExecStartPre=/usr/bin/kbf-installer check`, hardening (`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths=/var/lib/kbf-installer /run/kbf-installer`, `PrivateTmp`, trimmed capabilities); P11 lints the `systemd-analyze security` score. Frontend template rules from the handover design apply (`Type=notify`, finite `TimeoutStartSec`, `RuntimeDirectoryPreserve=yes`, no `Conflicts=`).
 macOS: launchd plists in `packaging/macos/`; nodes only, via cask or `.pkg` (a formula cannot place a root LaunchDaemon, #966). `kbf-installer` there is root-owned; a user-owned prefix is refused by `check`.
 
 ## 8. Compatibility and migration
 - Wire: the frozen messages stay, plus the one additive change of #1024 section 5, made together with its tests: `UpdateOrder.generation = 6` and `UpdateOffer` `protocol = 5`, `min_protocol = 6`, `state_schema = 7`, `profile = 8` (older peers ignore them; zeros are refused fail closed). `update_order = 9`, `update_status = 7` unchanged.
 - Offers stay on the wire and nodes consume them: the node builds the order record's components, attestation and expected facts from the offer it holds for the commit. `ReleaseService.Fetch`'s caller is the installer's fetch child, not `kbf`. The planner's "release complete" check reads the frontend's preflight row; a node order to an incomplete release is refused by the planner.
 - Installer vs release: no manifest range. A release declares `protocol`, `min_protocol`, `state_schema` in `--version --json`; the installer refuses (`installer_too_old`) one above what it supports, and any state schema bump needs an installer that knows it.
-- Migration is owned by P3: `setup` adopts `/usr/local/kbf` and `/var/lib/kbf-deploy` once (state schema 1 to 2, links, trust files), keeps a rollback path, and covers the test-farm hosts that run the dev installer. `kbf-helper` and `kbf-installer` never both manage one host: `setup` refuses while the old state exists unmigrated.
+- Migration is owned by P3: `setup` adopts `/usr/local/kbf` and `/var/lib/kbf-deploy` once (state schema 1 to 2, links, trust files), keeps a rollback path, and covers the test-farm hosts that run the dev installer. Old subcommand forms (`kbf frontend`, `kbf daemon`, ...) stay as aliases of `--mode` until the test farm has moved, then are removed. `kbf-helper` and `kbf-installer` never both manage one host: `setup` refuses while the old state exists unmigrated.
 
 ## 9. PR breakdown
 Fakes: temp roots, fake clock, `file://` and local HTTPS source, recorder for `systemctl`/`launchctl`, fixture order records and bundles, a pinned fake `gh`.
@@ -138,15 +140,15 @@ Fakes: temp roots, fake clock, `file://` and local HTTPS source, recorder for `s
 | P6 | `record.rs`: record parse, (epoch, generation) rule, floors, facts compare | fixture matrix |
 | P7 | Fetch child (pipe, rlimits, lent identity) and URL source | local HTTPS server, size/timeout/3xx, Linux drop test |
 | P8 | Verify pipeline `stage.rs` (section 5 order, lease check, bounded steps) | **built** attest/archive/binary tests, fake `gh`, hanging stubs |
-| P9 | Envoy pin, fetch, verify, verbs | fake Envoy script, mismatch cases |
+| P9 | Tested Envoy range: `installer.conf` key, `check` and `update --frontend` refusal (`envoy_range`), config render and reload | fake Envoy script printing versions, in and out of range |
 | P10 | `setup`, `settings.rs`, `installer.toml`, `check` path-chain, trust expiry | idempotency, partial failure |
 | P11 | Units, nfpm, macOS pkg, unit lint, hardening score | `systemd-analyze verify`, container root |
-| P12 | `kbf <mode> --check` for every mode | missing-prerequisite fixtures |
-| P13 | Frontend update: slots, `--instance`, `kbf-envoy@` | fake systemctl, **built** frontend tests |
+| P12 | `--mode` flag and `--check` on every mode, subcommand aliases, no `node` mode | missing-prerequisite fixtures |
+| P13 | Frontend update: slots, `--instance`, relay until streams close | fake systemctl, **built** frontend tests |
 | P14 | Desired release and node sequencing on `update/desired` | fake status files |
 | P15 | Fetch-scoped client certificate (extended key usage) replacing the lent node identity | fake `ReleaseService` |
 
-Dependencies: P0 and P1 first (P1 is the first merge); P2 before P3, P4, P5, P8; P4 before P5 and P14; P6 needs P1 fixtures; P7 needs P2 and the settings struct from P1; P8 needs P0, P6, P7; P9 needs P6; P10 needs P7, P9, P11 to run for real but tests against fakes; P13 needs P11, P12, P5; P15 needs P7. P4 changes the record and status writers and readers in one PR, and the wire change of section 8 lands with it. `kbf-helper` and the old units stay until P5 lands.
+Dependencies: P0 and P1 first (P1 is the first merge); P2 before P3, P4, P5, P8; P4 before P5 and P14; P6 needs P1 fixtures; P7 needs P2 and the settings struct from P1; P8 needs P0, P6, P7; P9 needs P1; P10 needs P7, P9, P11 to run for real but tests against fakes; P13 needs P11, P12, P5; P15 needs P7. P4 changes the record and status writers and readers in one PR, and the wire change of section 8 lands with it. `kbf-helper` and the old units stay until P5 lands.
 
 ## 10. Security rules
 Threats: A compromised `kbf`; B compromised fetch child or release host; C local user; D old or malicious signed release. Root is out of scope.
@@ -156,7 +158,7 @@ Threats: A compromised `kbf`; B compromised fetch child or release host; C local
 - S10. Spawn hygiene, caps, network rules, dedicated uids, download directory outside the root tree (section 5). S11. The node identity is lent over a descriptor and a compromised child can steal it (accepted v1 residual; follow-up P15).
 - S12. `window_s` clamped. S13. One activation at a time, minimum interval, `previous` only confirmed. S14. Strict record parsing: duplicate keys refused, ids and generation bounded, dot names ignored, one read into memory.
 - S15. `--root` absent from release builds; environment variables ignored; `gh`, `systemctl`, `launchctl` run by absolute path with an empty environment, `GH_NO_UPDATE_NOTIFIER=1`. S16. Trust files expire; the trust root cannot self-update, so revocation ships as a package. S17. The package signing key is the root of trust; packages are signed before any public channel (decision 7).
-- S18. Envoy is pinned by attested sha256 and re-verified at every start; never overwritten.
+- S18. Envoy is outside the attested set: it is a dependency whose version `check` compares to a tested range. It carries traffic, never authority; a bad Envoy can drop or delay builds, not forge an order or a release.
 - S19. Stage, fsync, rename, fsync parent, then state. S20. A directory is not proof (section 5 step 7). S21. Missing or corrupt `state.json`: use `.bak`, else write nothing and exit 5; never treat as empty. S22. `gc` never removes current, previous, staged, pending, or a release a process executes from; it takes the lock. S23. Links via `current.new` rename; `state.json` is the source of truth.
 - S24. Confirm deadlines use monotonic plus wall time. S25. `run` re-execs between orders if its binary is replaced; maintainer scripts call `quiesce`.
 - S26. Frontend revert order per section 6. S27. Frontend orders need root on the CLI only. S28. Leases are observed by the installer, never taken from a record.
@@ -166,16 +168,20 @@ Threats: A compromised `kbf`; B compromised fetch child or release host; C local
 1. Frontend update on the wire: no; operator CLI only. A wire field is a CEO decision.
 2. Offers: nodes consume them to build the record (section 8).
 3. Release source for a farm without a public URL: any controlled static HTTPS location serving the `files/<sha256>` layout; or the `frontend` source.
-4. Envoy: pinned upstream URL, attested sha256 as a component of the frontend release, not mirrored.
+4. Envoy: an installed dependency with a tested version range, not pinned in releases and not fetched by the installer (decided).
 5. Attestation bundles: stored with the release in the frontend's store and carried in the offer.
 6. `--deny-self-hosted-runners`: the build farm is self-hosted; decide whether the release workflow runs on GitHub-hosted runners (recommended, keep the flag) before P8.
 7. Package formats: deb, rpm, macOS cask/pkg; repository signing keys decided before any public channel.
 8. Mac component name `kbf-daemon` stays until a release needs the rename.
 9. Order channel: decided, the `orders/` directory (section 12), not a socket.
 
-Edits needed: #1024 (section 12), #1021 (no shipped first release; `releases/current` path; `kbf-envoy@`), #966 (`ExecStart` path; gating; no formula for the root installer), #1020 (`--check` flag).
+Edits needed: #1024 (its section 12 and its update-button text; see the Later list in section 13 here), #1021 (follows this document), #966 (`ExecStart` path and `--mode` form; gating; no `kbf enroll` pre-start; no formula for the root installer), #1020 (`--check` flag).
 
 ## 12. Agreed with pull-updates.md (#1024)
 - Orders: kbf writes records into `orders/` (0700, kbf-owned) under the root-owned `/var/lib/kbf-installer`; the installer reads each once with `O_NOFOLLOW`; no order socket, no control socket; status returns through the root-owned `status.json`.
 - Taken from #1024 over the first draft of this contract: generation and its floor, components and attestation in the record, expected facts checked before the flip, pipe-based fetch child (no download directory owned by `kbf-fetch`), no redirects, `files/<sha256>` URL layout, the probe as `kbf-fetch`, lent node identity, lease check by the installer, `releases/current`, `run` instead of `serve`, `VERIFIED` before rename. Dropped as a result: the release manifest, `release_seq`, `kbf-verify`, `/var/cache/kbf-fetch`.
 - Decided here and overriding #1024: the update source and floors live in `/etc/kbf/installer.toml`, not `[update]` in `kbf.toml`; `state.json` schema 2 replaces `helper.json`.
+
+## 13. Later
+Deferred, not designed here: an update banner or button and UI login; the desktop app; cloud (ASG, ECS) update providers; cross-version Envoy upgrades; a managed build service; Postgres and several frontends (a SQLite single frontend now).
+- Decided later and overriding both drafts: updates are triggered externally, Envoy is an installed dependency with a tested range, the frontend update relays open streams without a timeout, and kbf takes `--mode` instead of subcommands (section 1, 5.1, 6).
