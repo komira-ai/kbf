@@ -615,6 +615,7 @@ impl Held {
             zone: String::new(),
             weight: 1,
             state: kbf_map::MemberState::Active,
+            boot: 0,
         };
         let map = kbf_map::Map::new(
             generation,

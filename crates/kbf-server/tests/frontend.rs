@@ -674,6 +674,7 @@ async fn the_storage_check_asks_the_owners_once_the_frontend_routes_by_the_map()
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let routed_over = |ids: &[u64], addrs: &[SocketAddr]| {
         let members = ids.iter().map(|id| member(*id)).collect();

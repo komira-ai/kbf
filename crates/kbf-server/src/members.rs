@@ -547,6 +547,7 @@ impl Members {
                 Progress::CatchingUp => MemberState::CatchingUp,
                 Progress::CaughtUp => MemberState::Active,
             },
+            boot: 0,
         };
         self.write_row(&member, boot)?;
         let map = self.refresh()?.ok_or(MembershipError::NoMap)?;
