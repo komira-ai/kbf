@@ -22,6 +22,8 @@ MemoryMin=@SERVER_MEMORY_MIN@
 # A storage node answering from swap would slow every build at once.
 MemorySwapMax=0
 OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
 CPUWeight=300
 # AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the bucket's MinIO service account:
 # a secret never goes on the command line. The file is the server user's, mode 0600, so
