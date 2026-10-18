@@ -6,7 +6,7 @@
 //! writer is the service user, so the file is untrusted: the name must be the id, the
 //! verb one of three words, the commit a full commit, and no other field is accepted.
 
-use kbf_installer::CommitId;
+use crate::CommitId;
 use serde::Deserialize;
 
 /// The suffix of an order file.

@@ -2,11 +2,11 @@
 //! world-readable (the node runs as the service user). The schema is the one
 //! `kbf-update`'s client reads (`helper.rs`).
 
-use kbf_installer::CommitId;
-use kbf_installer::state::State;
+use crate::CommitId;
+use crate::state::State;
 use serde::Serialize;
 
-use crate::memory::{Event, Memory};
+use crate::helper::memory::{Event, Memory};
 
 /// The schema number the node reads.
 pub const SCHEMA: u64 = 1;

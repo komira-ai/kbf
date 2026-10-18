@@ -30,7 +30,7 @@
 //! the reboot is a one-step plan, `/usr/bin/systemctl reboot`.
 //!
 //! **Not done yet: restarting what it replaced.** Nothing restarts a service after its binary
-//! is renamed over; the pull-based helper (`kbf-helper`) does that with versioned directories.
+//! is renamed over; the pull-based helper (`kbf-installer run`) does that with versioned directories.
 
 use std::fmt::Display;
 use std::fs;

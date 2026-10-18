@@ -177,7 +177,7 @@ order at a huge epoch, is taken and wedges the installer until root clears `stat
 acts on is measured from nothing and is taken at any epoch. A compromised service user can still write a first order
 with a huge epoch: an availability limit, the same exposure as ordering an activation early (section 7.3 of the
 design study). `window_s` is the confirm window of `ACTIVATE`, **per platform as built**: on Linux the helper ignores it, and the window starts at the new
-process's first start (`kbf-helper boot-check --window-secs`, default 900, range 120 to 1800); on macOS there is no start hook, so the window is
+process's first start (`kbf-installer boot-check --window-secs`, default 900, range 120 to 1800); on macOS there is no start hook, so the window is
 armed at activation and `window_s` is clamped to 120 to 1800. Either way a compromised frontend cannot set a year.
 
 **UpdateStatus.** Sent after `Welcome` and on every change. `running_commit` is the process's own build commit

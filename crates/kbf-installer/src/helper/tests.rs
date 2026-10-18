@@ -6,18 +6,18 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
+use crate::activate;
+use crate::attest::SourceRef;
+use crate::layout::{Layout, Platform};
+use crate::refusal::{InboxFault, Refusal};
+use crate::stage::Staged;
+use crate::state::{Locked, State};
+use crate::testkit::{A, B, c};
 use kbf_host::testkit::{ScratchHost, reply};
 use kbf_host::{Root, Step};
-use kbf_installer::activate;
-use kbf_installer::attest::SourceRef;
-use kbf_installer::layout::{Layout, Platform};
-use kbf_installer::refusal::{InboxFault, Refusal};
-use kbf_installer::stage::Staged;
-use kbf_installer::state::{Locked, State};
-use kbf_installer::testkit::{A, B, c};
 
-use crate::cycle::{Config, Helper};
-use crate::restart::Restart;
+use crate::helper::cycle::{Config, Helper};
+use crate::helper::restart::Restart;
 
 const UNIT: &str = "kbf.service";
 const T0: u64 = 1_800_000_000;
@@ -102,7 +102,7 @@ impl Rig {
     }
 
     fn state(&self) -> State {
-        kbf_installer::state::read_unlocked(&self.layout)
+        crate::state::read_unlocked(&self.layout)
             .expect("reads")
             .expect("there")
     }
@@ -151,7 +151,7 @@ fn stage_b(
     layout: Layout,
 ) -> impl FnMut(&mut ScratchHost, &std::path::Path) -> Result<Staged, Refusal> {
     move |_, _| {
-        let dir = layout.join(&kbf_installer::layout::release_dir(&c(B)));
+        let dir = layout.join(&crate::layout::release_dir(&c(B)));
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"binary").expect("binary");
         let lock = Locked::acquire(&layout).expect("lock");
@@ -579,7 +579,7 @@ fn the_helpers_files_have_their_modes() {
 /// Mutant seen red: the filter dropped.
 #[test]
 fn staged_facts_are_shown_only_for_the_staged_release() {
-    use crate::memory::{Memory, StagedFacts};
+    use crate::helper::memory::{Memory, StagedFacts};
     let memory = Memory {
         staged: Some(StagedFacts {
             commit: c(B),
@@ -596,7 +596,7 @@ fn staged_facts_are_shown_only_for_the_staged_release() {
             ..State::default()
         };
         let json: serde_json::Value =
-            serde_json::from_slice(&crate::status::render(&state, &memory)).expect("json");
+            serde_json::from_slice(&crate::helper::status::render(&state, &memory)).expect("json");
         json
     };
     assert_eq!(render(Some(B))["staged"]["protocol"], 7);
@@ -611,7 +611,7 @@ fn staged_facts_are_shown_only_for_the_staged_release() {
 /// Mutants seen red: `deny_unknown_fields` dropped; the 20-digit length check dropped.
 #[test]
 fn only_the_clients_shape_of_order_is_read() {
-    use crate::order::{id_of, parse};
+    use crate::helper::order::{id_of, parse};
     let ok = order_json(5, "activate", B);
     assert!(parse(5, ok.as_bytes()).is_ok());
     let extra = ok.replace('}', ",\"path\":\"/etc\"}");
@@ -627,7 +627,7 @@ fn only_the_clients_shape_of_order_is_read() {
     let bad_commit = ok.replace(B, "NOT-A-COMMIT");
     assert_eq!(
         parse(5, bad_commit.as_bytes()),
-        Err(crate::order::OrderFault::BadCommit(
+        Err(crate::helper::order::OrderFault::BadCommit(
             "NOT-A-COMMIT".to_owned()
         ))
     );
@@ -635,7 +635,7 @@ fn only_the_clients_shape_of_order_is_read() {
     let bad_verb = ok.replace("activate", "reboot");
     assert!(matches!(
         parse(5, bad_verb.as_bytes()),
-        Err(crate::order::OrderFault::UnknownVerb(v)) if v == "reboot"
+        Err(crate::helper::order::OrderFault::UnknownVerb(v)) if v == "reboot"
     ));
     assert!(parse(6, ok.as_bytes()).is_err(), "named for another id");
     assert_eq!(id_of("00000000000000000005.json"), Some(5));
@@ -832,7 +832,12 @@ fn an_epoch_far_above_the_last_is_refused_without_moving_the_floor() {
     // Far above: refused, said so, not acknowledged.
     rig.put_order(
         2,
-        &order_in_epoch(2, 5000 + crate::order::MAX_EPOCH_JUMP + 1, "revert", A),
+        &order_in_epoch(
+            2,
+            5000 + crate::helper::order::MAX_EPOCH_JUMP + 1,
+            "revert",
+            A,
+        ),
     );
     rig.cycle(T0 + 6);
     assert_eq!(rig.state().current, Some(c(B)));
@@ -845,7 +850,7 @@ fn an_epoch_far_above_the_last_is_refused_without_moving_the_floor() {
     // Exactly at the limit, and a real next epoch, are taken.
     rig.put_order(
         3,
-        &order_in_epoch(3, 5000 + crate::order::MAX_EPOCH_JUMP, "revert", A),
+        &order_in_epoch(3, 5000 + crate::helper::order::MAX_EPOCH_JUMP, "revert", A),
     );
     rig.cycle(T0 + 9);
     assert_eq!(rig.state().current, Some(c(A)));
