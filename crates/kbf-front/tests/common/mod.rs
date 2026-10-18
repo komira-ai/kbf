@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+// One copy, shared with kbf-storage's tests (the cache is theirs).
+#[path = "../../../kbf-storage/tests/common/faulty.rs"]
 pub mod faulty;
 
 use std::mem;

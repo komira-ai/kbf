@@ -17,9 +17,9 @@ use kbf_types::Digest;
 use prost::Message as _;
 
 use super::Backend;
-use crate::cache::{Cache, VerifiedBlob};
-use crate::meta_log::MemoryMetaLog;
 use crate::{CacheStorage, Channels, Routed, SegmentsConfig};
+use kbf_storage::MemoryMetaLog;
+use kbf_storage::{Cache, VerifiedBlob};
 
 type Mem = Cache<MemoryMetaLog, kbf_objstore::MemoryStore>;
 

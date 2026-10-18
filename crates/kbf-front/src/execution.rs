@@ -113,10 +113,10 @@ use kbf_invocation::{CallKind, ExecuteAnswer};
 
 use crate::backend::Backend;
 use crate::described::Described;
-use crate::metrics::{CacheMetrics, OpenExecute};
 use crate::recorder::{ActionLabel, ExecuteCall, Recorder, listing};
 use crate::request_metadata::CallMetadata;
-use crate::wire;
+use kbf_storage::metrics::{CacheMetrics, OpenExecute};
+use kbf_storage::wire;
 
 /// The reserved platform key that names the lease kind
 /// (`docs/platform-properties.md#kbf-lease`).
@@ -375,7 +375,7 @@ struct Presubmit<'a> {
     walk: Duration,
     submit: Duration,
     dir_reads: u64,
-    _in_flight: crate::metrics::Raised<'a>,
+    _in_flight: kbf_storage::metrics::Raised<'a>,
 }
 
 impl<'a> Presubmit<'a> {

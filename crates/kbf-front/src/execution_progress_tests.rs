@@ -11,7 +11,7 @@ use prost::Message as _;
 use tokio::sync::watch;
 
 use super::{Progress, Stage, Ticket, closing, operations, progress};
-use crate::metrics::CacheMetrics;
+use kbf_storage::metrics::CacheMetrics;
 
 const EVERY: Duration = Duration::from_secs(30);
 

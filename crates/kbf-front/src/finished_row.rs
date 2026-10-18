@@ -9,7 +9,7 @@ use kbf_proto::reapi::{ActionResult, ExecuteResponse};
 use prost::Message;
 
 use crate::execution::Finished;
-use crate::wire;
+use kbf_storage::wire;
 
 const RAN: u8 = 0;
 const FAILED: u8 = 1;

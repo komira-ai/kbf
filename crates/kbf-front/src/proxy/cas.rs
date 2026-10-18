@@ -22,7 +22,8 @@ use kbf_proto::reapi::{
 use tonic::{Request, Response, Status, Streaming};
 
 use super::owners::Owners;
-use crate::{MAX_BATCH_TOTAL_BYTES, wire};
+use crate::MAX_BATCH_TOTAL_BYTES;
+use kbf_storage::wire;
 
 /// Blobs of one batch in flight at once.
 const BATCH_PARALLELISM: usize = 32;

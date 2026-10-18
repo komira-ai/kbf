@@ -2,19 +2,20 @@
 //! cache goes through (`docs/design/architecture-v2.md`, sections 3 and 13 P2).
 //!
 //! CAS reads and writes, FindMissing, the action cache and the `Segments` service, over
-//! one store. Today the one implementation is `kbf-front`'s adapter over its own cache
-//! (`kbf_front::CacheStorage`), and `kbf-server`'s in-process store
-//! (`kbf_server::LocalStore`, what `kbf-all-in-one`'s daemon reads and writes through)
-//! holds an `Arc<dyn Storage>`. The cache's code moves into this crate later; the trait
-//! is the boundary it moves behind, so the callers do not change when it does. A storage
-//! process of its own serves one over gRPC, and [`service::RemoteStorage`] is the
-//! implementation that calls it ([`service`]).
+//! one store. The one implementation is the cache itself, in this crate ([`Cache`], the
+//! write path, the write tier's flusher, the evictor, the rebuild, the input-tree walk,
+//! the `Segments` service and the cache's `/metrics` families), behind [`CacheStorage`].
+//! `kbf-front` serves the REAPI services over a [`Cache`] and re-exports these names, and
+//! `kbf-server`'s in-process store (`kbf_server::LocalStore`, what `kbf-all-in-one`'s
+//! daemon reads and writes through) holds an `Arc<dyn Storage>`. A storage process of its
+//! own serves one over gRPC, and [`service::RemoteStorage`] is the implementation that
+//! calls it ([`service`]).
 //!
 //! Object safe and asynchronous: each call returns a boxed future ([`Answer`]), so a
 //! caller holds `Arc<dyn Storage>` and never names the metadata log or the object store
 //! behind it.
 //!
-//! What every implementation keeps (the cache's promises, `kbf-front`'s crate docs):
+//! What every implementation keeps (the cache's promises, `kbf-front`'s crate docs, which serve them):
 //! - **FindMissing never omits a digest**, and answers in the order asked.
 //! - **Present means durable.** A blob is reported present, and a write answered, only
 //!   once its bytes are stored and indexed.
@@ -25,11 +26,20 @@
 //! This crate depends on no frontend crate: not the scheduler (`kbf-sched`) and not
 //! authorization (`kbf-auth`). `crates/kbf-it/tests/layering.rs` checks it.
 
+mod cache;
+mod cache_storage;
+pub mod closure;
+mod cpu;
 pub mod flush;
+mod input_tree;
 pub mod local_cache;
+mod meta_log;
+pub mod metrics;
 pub mod repair;
 pub mod replicate;
+mod segments;
 pub mod service;
+pub mod wire;
 
 use std::sync::Arc;
 
@@ -42,6 +52,71 @@ use kbf_proto::worker::segments_server::Segments;
 use kbf_types::Digest;
 use tonic::Status;
 use tonic::metadata::MetadataValue;
+
+pub use crate::cache::{
+    ADOPT_RECORDS, Admitted, BATCH_BLOBS, BATCH_BYTES, BATCH_READS_IN_FLIGHT, BUFFERED_BLOB_BYTES,
+    BlobRead, Cache, CacheError, DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, EVICT_BATCH,
+    EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX,
+    FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound, HeldObject, Losses, MAX_ADMISSION_BYTES,
+    MAX_DECODED_BLOB_BYTES, NEEDS_V3, ObjectKeys, PASS_OPENS_PER_SEC, PUT_BACKOFF,
+    PUT_BACKOFF_FACTOR, PassReport, PoolConfig, READ_WINDOW_BYTES, RebuildConfig, RebuildReport,
+    RecordStream, STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig,
+    VerifiedBlob, WriteConfig,
+};
+pub use crate::cache::{HIT_CHECKS_IN_FLIGHT, is_empty_blob};
+pub use crate::cache_storage::CacheStorage;
+pub use crate::input_tree::{Decoded, ENTRY_OVERHEAD, InputTreeConfig, Walked, decode};
+pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
+pub use crate::segments::{
+    Connection, Connections, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, MIN_SEGMENT_UPLOAD_BYTES,
+    SegmentsConfig, SegmentsService, Tracked,
+};
+
+/// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
+/// advertised in the capabilities. Larger blobs go through ByteStream. A request is
+/// decoded whole before its handler runs, so one stream may hold up to
+/// [`MAX_MESSAGE_BYTES`] (17 MiB) of decode buffer: the decode memory is that times the
+/// streams a connection may open (`--reapi-max-streams`, `--worker-max-streams`), about
+/// 3.4 GiB for 200, which `--write-bytes-in-flight` does not cover
+/// (`docs/design/write-path.md`).
+pub const MAX_BATCH_TOTAL_BYTES: usize = 16 << 20;
+
+/// The largest gRPC message the cache services accept or send: a full batch plus room
+/// for the digests and statuses around it.
+pub const MAX_MESSAGE_BYTES: usize = MAX_BATCH_TOTAL_BYTES + (1 << 20);
+
+/// No blob is too large for the cache, on any path, and none is held whole in memory
+/// past [`MAX_UNSTAGED_BLOB_BYTES`]: a ByteStream `Write` of a larger blob is handed to
+/// the store as it arrives (a multipart upload on S3), a segment upload's large records
+/// and the in-process plane's large outputs are written to the write tier as they
+/// arrive, the tier's flusher reads a block in pieces, and every read of a blob is
+/// served in windows of [`READ_WINDOW_BYTES`]. A digest's size is an `i64`, so no blob
+/// is over `i64::MAX` bytes; sizes are added as `u64`, saturating.
+///
+/// The largest blob a daemon's data plane holds in memory on its way into the cache:
+/// 16 MiB. A larger one is never held whole: with a write tier that has room for it, it
+/// is written onto the tier as it arrives (a segment upload's range, the in-process
+/// plane's stream); without one, or when the tier is full, it is streamed to the object
+/// store as it arrives (a ByteStream `Write`, the in-process plane's
+/// `Cache::store_streamed_claimed`). A segment upload that would have to hold one in
+/// memory until its commit is answered FAILED_PRECONDITION at `Begin`
+/// ([`unstaged_refusal`]), and the daemon sends its records by ByteStream instead. No
+/// blob is refused for its size. 16 MiB is where the write group already writes a blob
+/// as a segment of its own (`--write-own-segment-bytes`), four PutRange messages, and
+/// well under the 32 MiB upload a daemon batches small files into, so small outputs
+/// keep the in-memory path unchanged.
+pub const MAX_UNSTAGED_BLOB_BYTES: u64 = 16 << 20;
+
+/// Why a segment upload holding the blob `blob` (its digest), over
+/// [`MAX_UNSTAGED_BLOB_BYTES`], is not taken: no write tier has room for it, and it is
+/// not held in memory instead. The blob itself is stored by a ByteStream `Write`.
+#[must_use]
+pub fn unstaged_refusal(blob: &str) -> String {
+    format!(
+        "{blob} is over {MAX_UNSTAGED_BLOB_BYTES} bytes and no write tier has room for it: \
+         send it by a ByteStream Write, which streams it to the object store"
+    )
+}
 
 /// The answer of a [`Storage`] call.
 pub type Answer<'a, T> = BoxFuture<'a, Result<T, StorageError>>;
