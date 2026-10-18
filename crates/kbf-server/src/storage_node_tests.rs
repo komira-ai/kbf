@@ -202,6 +202,33 @@ async fn a_registration_the_log_cannot_take_refuses_the_open() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Catches a stale boot from a real [`open_registered`] (the frontend's state store
+/// restored from an older copy, so its counter hands out a boot the log has set) that
+/// does not exit as not ready, which the units' `RestartPreventExitStatus=2` leaves down
+/// for good (mutant: the `StaleWriter` arm of [`crate::StartFailure`] removed). And that
+/// the restart it asks for recovers: the next registration's boot, one past, opens the
+/// same log, so a gap of N boots takes N restarts.
+#[tokio::test]
+async fn a_stale_boot_exits_not_ready_and_a_later_boot_opens() {
+    let dir = meta_dir("stale-exit");
+    let bucket = Bucket::default();
+    for boot in [3, 3, 2, 4] {
+        let meta = RaftMetaLog::open_dir(&dir, Retention::default(), "kbf/")
+            .await
+            .expect("open the log");
+        let keys = ObjectKeys::under(meta.store_prefix());
+        let opened = open_registered(meta, bucket.clone(), keys, &joined(7, boot)).await;
+        match (boot, opened) {
+            (3 | 4, Ok(cache)) => drop(cache),
+            (_, Err(e)) => {
+                assert_eq!(crate::StartFailure::of(e.as_ref()).status(), 75, "{e}");
+            }
+            (boot, Ok(_)) => panic!("boot {boot} opened over a log at boot 3"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Catches: a node root that keeps the log id (node keys would sit under one log's
 /// prefix, and a wiped node's new log would put them elsewhere) or that takes a prefix
 /// not made of a root and the log id.

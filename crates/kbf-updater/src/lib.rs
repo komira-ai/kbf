@@ -16,7 +16,7 @@
 //!   which changes the node only through `kbf-host`'s plans.
 //!
 //! There is no socket and no binary any more: the root helper of the pull-based updates is
-//! `kbf-helper`, which polls an inbox and refuses nobody by caller (docs/design/pull-updates.md).
+//! `kbf-installer run`, which polls an inbox and refuses nobody by caller (docs/design/pull-updates.md).
 //! What stays is the signed-set library, for the release key the pull design defers.
 
 pub mod apply;

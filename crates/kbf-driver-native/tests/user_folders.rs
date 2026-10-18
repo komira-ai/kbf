@@ -9,6 +9,9 @@
 
 mod support;
 
+#[path = "mount_list/helpers.rs"]
+mod mount_list;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +20,7 @@ use kbf_daemon::Runtime;
 use kbf_driver_native::user_folders::UserFolders;
 use kbf_driver_native::xcode;
 use kbf_driver_native::{NativeConfig, NativeRuntime};
+use mount_list::{below, lost_outside, mount_points};
 use support::{
     MemoryCas, Spec, config, runtime, sandbox_denials, scratch, stderr, stdout, user_folder, work,
 };
@@ -75,6 +79,7 @@ do {
 /// that saves a file safely fails under the driver.
 #[tokio::test]
 async fn a_foundation_atomic_save_works() {
+    setup();
     let _tools = DEVELOPER_TOOLS.read().await;
     let dir = scratch("atomic");
     let cas = Arc::new(MemoryCas::default());
@@ -115,6 +120,7 @@ const LAYOUT: &str = "mkdir -p Sources/hello && mv main.swift Sources/hello/ && 
 /// files atomically, through the user's temporary folder.
 #[tokio::test]
 async fn swift_build_builds_a_package() {
+    setup();
     let _tools = DEVELOPER_TOOLS.read().await;
     let dir = scratch("swiftpm");
     let cas = Arc::new(MemoryCas::default());
@@ -178,6 +184,7 @@ fn xcodes() -> std::collections::BTreeMap<String, PathBuf> {
 /// Writes how long each survey took to stderr (not captured) for the CI log.
 #[tokio::test]
 async fn the_sandboxed_survey_answers_as_an_unsandboxed_one() {
+    setup();
     use std::io::Write as _;
 
     let _tools = DEVELOPER_TOOLS.read().await;
@@ -262,6 +269,7 @@ const PBXPROJ: &str = r#"// !$*UTF8*$!
 /// temporary folder, and exits 74 when that fails (issue #163).
 #[tokio::test]
 async fn xcodebuild_builds_a_target() {
+    setup();
     let _tools = DEVELOPER_TOOLS.read().await;
     let Some((build, developer_dir)) = newest_xcode() else {
         eprintln!("no Xcode on this runner: nothing to check");
@@ -303,6 +311,12 @@ async fn xcodebuild_builds_a_target() {
 fn tail(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(40)..].join("\n")
+}
+
+/// The first lines of `text`: a tool that rejects its command line says why there
+/// (`xcodebuild: error: ...`), before the usage text that [`tail`] shows.
+fn head(text: &str) -> String {
+    text.lines().take(10).collect::<Vec<_>>().join("\n")
 }
 
 /// How many times [`SHIMS`] times each compiler, one call at a time.
@@ -385,6 +399,7 @@ const SHIM_MARGIN: f64 = 0.1;
 /// with them, `xcrun`'s own cache is lost to their rewrites whatever the sandbox does.
 #[tokio::test]
 async fn the_compiler_shims_print_nothing_on_stderr() {
+    setup();
     use std::io::Write as _;
     // Alone: no other test's `xcrun` calls drop this one's cache entries meanwhile.
     let _tools = DEVELOPER_TOOLS.write().await;
@@ -450,6 +465,7 @@ async fn the_compiler_shims_print_nothing_on_stderr() {
 /// would, old enough to sweep; the next lease must not find it.
 #[tokio::test]
 async fn a_leftover_in_the_temporary_folder_is_swept_after_the_lease() {
+    setup();
     let dir = scratch("leftover");
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config(&dir), &cas);
@@ -480,6 +496,7 @@ async fn a_leftover_in_the_temporary_folder_is_swept_after_the_lease() {
 /// it, and removes it.
 #[tokio::test]
 async fn swift_builds_scratch_directory_can_be_made() {
+    setup();
     let dir = scratch("swbuild");
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config(&dir), &cas);
@@ -551,6 +568,7 @@ fn untouched(temp: &Path) -> bool {
 /// folder works sandboxed.
 #[tokio::test]
 async fn temporary_items_itself_cannot_be_removed_or_replaced() {
+    setup();
     let dir = std::fs::canonicalize(scratch("items-itself")).expect("real");
     let cas = Arc::new(MemoryCas::default());
     let mut got = Vec::new();
@@ -597,6 +615,7 @@ async fn temporary_items_itself_cannot_be_removed_or_replaced() {
 /// runners have; elsewhere it says so and checks nothing.
 #[tokio::test]
 async fn a_temporary_items_of_another_user_is_not_swept() {
+    setup();
     if !std::process::Command::new("sudo")
         .args(["-n", "true"])
         .status()
@@ -645,4 +664,249 @@ async fn a_temporary_items_of_another_user_is_not_swept() {
     let me = String::from_utf8(me.stdout).expect("uid");
     sudo(&["chown", me.trim()]);
     assert!(kept, "swept a TemporaryItems owned by root");
+}
+
+/// The newest Xcode on this runner whose `xcrun --find metal` finds the Metal
+/// compiler (a node without the Metal toolchain installed has none to test).
+fn xcode_with_metal() -> Option<(String, PathBuf)> {
+    xcodes().into_iter().rev().find(|(_, developer_dir)| {
+        std::process::Command::new(xcode::XCRUN)
+            .args(["--find", "metal"])
+            .env("DEVELOPER_DIR", developer_dir)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    })
+}
+
+/// A one-kernel Metal source.
+const SHADER: &str = "#include <metal_stdlib>\nusing namespace metal;\n\
+kernel void add(device float *a [[buffer(0)]], uint i [[thread_position_in_grid]]) \
+{ a[i] += 1.0; }\n";
+
+/// Catches a sandbox under which the Metal compiler cannot build its `metal_types`
+/// module: its default module cache is `DARWIN_USER_CACHE_DIR/clang/ModuleCache`,
+/// outside the lease (issue #183). No cache flag is passed: the lease's
+/// `CLANG_MODULE_CACHE_PATH` is what must move it.
+#[tokio::test]
+async fn a_metal_shader_compiles_with_no_flags() {
+    setup();
+    let _tools = DEVELOPER_TOOLS.read().await;
+    let Some((build, developer_dir)) = xcode_with_metal() else {
+        eprintln!("no Xcode with a Metal compiler on this runner: nothing to check");
+        return;
+    };
+    let dir = scratch("metal");
+    let mut config: NativeConfig = config(&dir);
+    config.xcodes = [(build.clone(), developer_dir)].into_iter().collect();
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config, &cas);
+    let mut spec = Spec::sh(
+        "xcrun metal -c shader.metal -o \"$TMPDIR/shader.air\" \
+         && xcrun metallib \"$TMPDIR/shader.air\" -o shader.metallib \
+         && head -c 4 shader.metallib",
+    )
+    .env("PATH", PATH)
+    .property("xcode", &build);
+    spec.inputs = vec![("shader.metal".to_owned(), SHADER.as_bytes().to_vec())];
+    let result = run_long(&rt, &cas, 1, &spec).await;
+    assert_eq!(
+        (result.exit_code, stdout(&cas, &result).as_str()),
+        (0, "MTLB"),
+        "{}\n{}",
+        stderr(&cas, &result),
+        sandbox_denials()
+    );
+}
+
+/// A Swift package `hello` that depends on the local package `lib` (so SwiftPM loads
+/// two manifests, and caches them).
+fn package_with_a_local_dependency() -> Vec<(String, Vec<u8>)> {
+    let root = "// swift-tools-version:5.9\n\
+                import PackageDescription\n\
+                let package = Package(name: \"hello\",\n\
+                dependencies: [.package(path: \"lib\")],\n\
+                targets: [.executableTarget(name: \"hello\", dependencies: \
+                [.product(name: \"lib\", package: \"lib\")], path: \"Sources/hello\")])\n";
+    let lib = "// swift-tools-version:5.9\n\
+               import PackageDescription\n\
+               let package = Package(name: \"lib\",\n\
+               products: [.library(name: \"lib\", targets: [\"lib\"])],\n\
+               targets: [.target(name: \"lib\")])\n";
+    vec![
+        ("Package.swift".to_owned(), root.as_bytes().to_vec()),
+        (
+            "Sources/hello/main.swift".to_owned(),
+            b"import lib\nprint(greeting)\n".to_vec(),
+        ),
+        ("lib/Package.swift".to_owned(), lib.as_bytes().to_vec()),
+        (
+            "lib/Sources/lib/lib.swift".to_owned(),
+            b"public let greeting = \"hello\"\n".to_vec(),
+        ),
+    ]
+}
+
+/// The machine setup every test here starts with, run once per test binary however
+/// many tests call it (they run in parallel): SwiftPM's manifest sandbox off for every
+/// user of this runner, the way `kbf-mac-provision`'s `xcode_disable_manifest_sandbox`
+/// does on a node (the system domain of `com.apple.dt.Xcode`, which each user's
+/// `xcodebuild` reads after its own). A hosted runner is not provisioned, so the test
+/// binary does it. The action does not: its profile denies `user-preference-write`, and
+/// `xcodebuild` 26 answers `-IDEPackageSupportDisableManifestSandbox YES` with its
+/// usage text. `defaults write` of the same value is a no-op the second time, so a
+/// runner that already has it set (or a rerun) is unchanged. Every caller sees the
+/// outcome, so a runner where it cannot be set fails each test with the reason, not
+/// only the first.
+fn setup() {
+    static DONE: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    let done = DONE.get_or_init(|| {
+        let out = std::process::Command::new("sudo")
+            .args([
+                "-n",
+                "/usr/bin/defaults",
+                "write",
+                "/Library/Preferences/com.apple.dt.Xcode",
+                "IDEPackageSupportDisableManifestSandbox",
+                "-bool",
+                "true",
+            ])
+            .output()
+            .map_err(|e| format!("run sudo defaults: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        }
+    });
+    if let Err(why) = done {
+        panic!("the runner's manifest sandbox default cannot be set: {why}");
+    }
+}
+
+/// Catches a sandbox under which `xcodebuild` cannot build a Swift package with a
+/// dependency (derived data, package cache and cloned sources in the lease): SwiftPM
+/// writes its manifest cache in `~/Library/Caches/org.swift.swiftpm`, which it finds
+/// through the user database, not `HOME` (issue #179), and `xcodebuild` writes its own
+/// `Cache.db` and plug-in cache in the per-user cache folder
+/// (`kbf_driver_native::user_folders`). The action is what a user writes: no default
+/// is set in it. SwiftPM's sandbox for manifests is off on the machine
+/// ([`setup`]), since `sandbox-exec` cannot nest in the
+/// action's sandbox ("sandbox_apply: Operation not permitted").
+#[tokio::test]
+async fn xcodebuild_builds_a_swift_package() {
+    setup();
+    let _tools = DEVELOPER_TOOLS.read().await;
+    let Some((build, developer_dir)) = newest_xcode() else {
+        eprintln!("no Xcode on this runner: nothing to check");
+        return;
+    };
+    let dir = scratch("xcodebuild-package");
+    let mut config: NativeConfig = config(&dir);
+    config.xcodes = [(build.clone(), developer_dir)].into_iter().collect();
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config, &cas);
+    let mut spec = Spec::sh(
+        "xcodebuild -scheme hello -destination 'platform=macOS' \
+         -derivedDataPath \"$TMPDIR/dd\" -packageCachePath \"$TMPDIR/pc\" \
+         -clonedSourcePackagesDirPath \"$TMPDIR/sp\" build \
+         && \"$TMPDIR/dd/Build/Products/Debug/hello\"",
+    )
+    .env("PATH", PATH)
+    .property("xcode", &build);
+    spec.inputs = package_with_a_local_dependency();
+    let result = run_long(&rt, &cas, 1, &spec).await;
+    let out = stdout(&cas, &result);
+    assert_eq!(
+        (result.exit_code, out.lines().last()),
+        (0, Some("hello")),
+        "{}\n...\n{}\n{}\n...\n{}\n{}",
+        head(&out),
+        tail(&out),
+        head(&stderr(&cas, &result)),
+        tail(&stderr(&cas, &result)),
+        sandbox_denials()
+    );
+}
+
+/// The mount points of the machine now.
+fn mounted() -> Vec<PathBuf> {
+    let out = std::process::Command::new("/sbin/mount")
+        .output()
+        .expect("mount");
+    mount_points(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Catches a lease that cannot end because of a volume mounted below its home (issue
+/// #178), the way the Metal toolchain was when `xcodebuild` had a system service mount
+/// it there: the volume is read-only and root-owned, removing the lease directory
+/// failed with `EROFS`, the directory was quarantined and the volume stayed mounted.
+///
+/// The action makes the mount itself (`hdiutil create` an image in the lease's
+/// temporary directory, `hdiutil attach -nobrowse -mountpoint` it in the lease's home),
+/// which is what a user's build can leave behind. It does not wait for a toolchain: on
+/// the runner's Xcode 26.5 the Metal toolchain is a MobileAsset cryptex the asset
+/// service mounts for the whole machine, under `/private/var/run/com.apple.security.cryptexd`,
+/// never in the lease's home, so a test that needed it there could not run. The
+/// test fails if the volume is not mounted during the action (it would check nothing;
+/// the action's own output says why, a sandbox refusing `hdiutil` included), the run
+/// fails, a mount stays below the lease directory, a lease directory stays, or a volume
+/// outside the lease (the machine's cryptex volumes among them) is gone afterwards.
+#[tokio::test]
+async fn a_volume_mounted_in_the_leases_home_does_not_keep_the_lease() {
+    setup();
+    // The write lock: other tests here mount and unmount nothing, but the comparison
+    // of the machine's mounts before and after must not span a Metal compile that has
+    // the asset service mount the toolchain meanwhile.
+    let _tools = DEVELOPER_TOOLS.write().await;
+    // `mount` lists real paths, and the scratch directory may sit under a symlink
+    // (`/var`, `/tmp`): without this `below(&after, &dir)` is empty and checks nothing.
+    let dir = std::fs::canonicalize(scratch("volume-mount")).expect("real");
+    let config: NativeConfig = config(&dir);
+    let scratch_root = config.clone();
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config, &cas);
+    // The action prints what it saw, so a red run says why: each step's output and the
+    // count of mounts at the volume's real path (`/var` is `/private/var`, and
+    // `mount` lists the real one).
+    let spec = Spec::sh(
+        "mkdir -p \"$HOME/m\" && real=$(cd \"$HOME/m\" && pwd -P) && \
+         echo \"mount point: $real\"; \
+         /usr/bin/hdiutil create -size 8m -fs HFS+ -volname kbftest \"$TMPDIR/i.dmg\" 2>&1; \
+         /usr/bin/hdiutil attach \"$TMPDIR/i.dmg\" -nobrowse -noverify -noautoopen \
+         -mountpoint \"$HOME/m\" 2>&1; \
+         n=$(/sbin/mount | grep -cF \" on $real (\"); \
+         echo \"mounts: $n\"",
+    )
+    .env("PATH", PATH);
+    let before = mounted();
+    let action = spec.timeout(Duration::from_secs(120)).store(&cas);
+    let ran = tokio::time::timeout(Duration::from_secs(150), rt.run(work(1, action, 0)))
+        .await
+        .expect("the run ends");
+    let after = mounted();
+    let left = below(&after, &dir);
+    let result = ran.unwrap_or_else(|e| panic!("the lease failed: {e}\nmounted: {left:#?}"));
+    let out = stdout(&cas, &result);
+    let during = out
+        .lines()
+        .find_map(|line| line.strip_prefix("mounts: "))
+        .and_then(|n| n.trim().parse::<u32>().ok());
+    assert!(
+        during.is_some_and(|n| n > 0),
+        "the volume was not mounted during the action, so this checks nothing:\n{out}\n{}\n{}",
+        stderr(&cas, &result),
+        sandbox_denials()
+    );
+    assert!(left.is_empty(), "mounted after the lease: {left:#?}");
+    assert_eq!(
+        lost_outside(&before, &after, &dir),
+        Vec::<PathBuf>::new(),
+        "the lease's end unmounted a volume that was not its own"
+    );
+    assert!(
+        support::no_leases(&scratch_root),
+        "a lease directory stays: {:?}",
+        std::fs::read_dir(&scratch_root.scratch)
+            .map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
+    );
 }

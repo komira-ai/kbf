@@ -1,4 +1,4 @@
-//! `kbf-helper` as the unit runs it, on a scratch root. Nothing here restarts a service or
+//! `kbf-installer` as the unit runs it, on a scratch root. Nothing here restarts a service or
 //! runs a staged binary: the passes see an empty inbox, an inbox entry the stage refuses
 //! (no `gh` is pinned under the scratch root), and a release on trial.
 
@@ -10,7 +10,7 @@ use kbf_installer::layout::Layout;
 use kbf_installer::state::{Locked, PendingConfirm, State};
 use kbf_installer::testkit::{A, B, c};
 
-const BIN: &str = env!("CARGO_BIN_EXE_kbf-helper");
+const BIN: &str = env!("CARGO_BIN_EXE_kbf-installer");
 
 fn root(name: &str) -> PathBuf {
     let (_, dir) = kbf_installer::testkit::host_root(&format!("helper-bin-{name}"));
@@ -163,7 +163,7 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     fs::write(root.join("var/lib/kbf-deploy/state.json"), b"not json").expect("ruin");
     let out = helper(&root, &["boot-check"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-helper:"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-installer:"));
 }
 
 /// Catches a helper that starts without being told what to restart: neither flag is a
@@ -239,7 +239,7 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
     elsewhere.extend(["--update-dir", "/no/such/dir"]);
     let out = helper(&root, &elsewhere);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-helper:"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-installer:"));
 }
 
 /// Catches settings the host cannot trust being ignored: with an inbox entry to stage and an

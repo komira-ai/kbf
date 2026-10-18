@@ -30,7 +30,6 @@ kbf-enroll-registry       0      0
 kbf-estimator             -      -
 kbf-front                35      7
 kbf-guest                15      6
-kbf-helper                0      0
 kbf-history               0      0
 kbf-host                  0      0
 kbf-image                 0      0
@@ -46,7 +45,7 @@ kbf-mdm                   0      0
 kbf-mdm-api               0      0
 kbf-meta                  7      1
 kbf-node                  0      0
-kbf-objstore             59     19
+kbf-objstore             51     18
 kbf-outputs               0      0
 kbf-peer                  0      0
 kbf-proto                 0      0

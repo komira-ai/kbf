@@ -61,6 +61,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 # The node's client of `kbf.enroll.v1`, run against the real enroll listener (tests/enroll_node.rs).
 kbf-enroll.workspace = true
+# A connector that fails its first lookups, under a lazy channel (tests/storage_register.rs).
+hyper-util = { workspace = true, features = ["tokio"] }
 # A test certificate's public-key hash and names, read independently of kbf-peer.
 x509-parser.workspace = true
 kbf-segments.workspace = true
