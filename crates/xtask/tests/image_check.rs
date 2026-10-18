@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use xtask::image_check::{Ran, judge_inspect, judge_refusal, judge_version, run};
+use xtask::image_check::{Ran, judge_inspect, judge_refusal, judge_version, run, run_with};
 
 fn ran(code: Option<i32>, stdout: &str) -> Ran {
     Ran {
@@ -23,7 +23,7 @@ fn refused(code: Option<i32>, stderr: &str) -> Ran {
 
 const NO_CONFIG: &str = "error: cannot read the config file /etc/kbf/kbf.toml: No such file or directory (os error 2)\n";
 const NO_FLAG: &str =
-    "error: unexpected argument '--mode' found\n\nUsage: kbf frontend --storage <URL>\n";
+    "error: unexpected argument '--config' found\n\nUsage: kbf frontend --storage <URL>\n";
 
 /// Catches a root image, an image whose user is unset (the default is root), a
 /// failed inspect read as an id, and an id taken from a differently shaped answer.
@@ -75,7 +75,7 @@ fn only_exit_2_is_a_refusal() {
 }
 
 /// Catches the check passing for the wrong reason: a binary built from a tree without
-/// `--mode` exits 2 on clap's usage error, and so would a refusal of any other kind.
+/// `--config` exits 2 on clap's usage error, and so would a refusal of any other kind.
 #[test]
 fn exit_2_for_another_reason_is_not_a_refusal() {
     for stderr in [
@@ -89,34 +89,39 @@ fn exit_2_for_another_reason_is_not_a_refusal() {
     }
 }
 
-/// The whole verb with a stand-in `docker`: an image whose binary rejects `--mode` is
-/// refused as a failed check, and one that refuses for the missing config passes.
+/// A stand-in for `docker`: answers by the arguments, and records those of the refusal call.
+fn stand_in<'a>(
+    refusal: &'a str,
+    asked: &'a std::cell::RefCell<Vec<String>>,
+) -> impl FnMut(&[&str]) -> Result<Ran, xtask::Error> + 'a {
+    move |args| {
+        Ok(match args {
+            ["image", ..] => ran(Some(0), "sha256:ab 65532:65532\n"),
+            [.., "--version"] => ran(Some(0), "kbf 0.1.0+0123456789ab\n"),
+            _ => {
+                asked.borrow_mut().push(args.join(" "));
+                refused(Some(2), refusal)
+            }
+        })
+    }
+}
+
+/// The whole verb with a stand-in for `docker` (a closure answering by the arguments it
+/// is given): an image whose binary rejects `--config` is refused as a failed check, one
+/// that refuses for the missing config passes, and the refusal is asked for as
+/// `frontend --config /etc/kbf/kbf.toml --check`, the form that names the missing file.
 #[test]
-fn run_refuses_an_image_whose_binary_rejects_mode() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("image-check-fake-docker");
-    std::fs::create_dir_all(&dir).expect("dir");
-    let script = |name: &str, refusal: &str| {
-        let path = dir.join(name);
-        std::fs::write(dir.join(format!("{name}.stderr")), refusal).expect("stderr");
-        let body = format!(
-            "#!/bin/sh\n\
-             case \"$1 $4\" in\n\
-             'image '*) echo 'sha256:ab 65532:65532';;\n\
-             *'--version') echo 'kbf 0.1.0+0123456789ab';;\n\
-             *) cat '{}.stderr' >&2; exit 2;;\n\
-             esac\n",
-            path.display()
-        );
-        std::fs::write(&path, body).expect("write");
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        path
-    };
-    let bad = script("rejects-mode", NO_FLAG);
-    let e = run(&bad, "img", None).expect_err("a binary that rejects --mode");
+fn run_refuses_an_image_whose_binary_rejects_config() {
+    let asked = std::cell::RefCell::new(Vec::new());
+    let e = run_with(stand_in(NO_FLAG, &asked), "img", None)
+        .expect_err("a binary that rejects --config");
     assert!(e.to_string().contains("another reason"), "{e}");
-    let good = script("refuses-config", NO_CONFIG);
-    assert!(run(&good, "img", None).is_ok());
+    let asked = std::cell::RefCell::new(Vec::new());
+    assert!(run_with(stand_in(NO_CONFIG, &asked), "img", None).is_ok());
+    assert_eq!(
+        *asked.borrow(),
+        ["run --rm img frontend --config /etc/kbf/kbf.toml --check"]
+    );
 }
 
 /// Catches a missing program reported as a passed check.

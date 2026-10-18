@@ -309,8 +309,8 @@ jobs:
   # The frontend container image (deploy/k8s/image/Dockerfile): the linux-x86_64 `kbf`
   # tarball, checked against the sums sums-linux assembled (the bytes attest-linux signs on a
   # push), on a distroless non-root base. Built here, never on a developer box. It is
-  # tested (it runs as non-root, `kbf --version` runs; with no /etc/kbf/kbf.toml the frontend mode
-  # refuses to start, exit 2: `cargo xtask image-check`) and saved as a `docker save` archive
+  # tested (it runs as non-root, `kbf --version` runs; `kbf frontend --config /etc/kbf/kbf.toml --check`
+  # with no such file refuses to start, exit 2: `cargo xtask image-check`) and saved as a `docker save` archive
   # artifact, with its image id in the summary. Nothing is pushed or signed: the
   # workflow lint grants no `packages: write`, and where the image is published and
   # attested is an open decision (deploy/k8s/README.md).

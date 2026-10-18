@@ -535,3 +535,89 @@ fn a_start_with_a_bad_file_exits_2_and_makes_nothing() {
         );
     }
 }
+
+/// The container args of the `kbf` container in `deploy/k8s/frontend-deployment.yaml`,
+/// read as text (the `- ` lines under its `args:`).
+fn deployment_args() -> Vec<String> {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/k8s/frontend-deployment.yaml");
+    let text = std::fs::read_to_string(&path).expect("read the Deployment");
+    let mut lines = text.lines().skip_while(|l| l.trim() != "args:");
+    assert!(lines.next().is_some(), "the Deployment has no args:");
+    lines
+        .map_while(|l| l.trim().strip_prefix("- ").map(|a| a.trim().to_owned()))
+        .collect()
+}
+
+/// Catches an image check or a Deployment whose args this `kbf` refuses as a usage error
+/// (a `--mode=frontend` form it does not parse): the Deployment's own args, with the
+/// config and the handover socket pointed into a scratch directory, plus `--check`, run
+/// against the real binary on a fine host exit 0 and say `ok`. The unknown-flag form
+/// exits 2 with clap's usage error, which is what a pod with it would die of.
+#[test]
+fn the_deployments_args_are_accepted_by_the_binary() {
+    let dir = scratch("deployment-args");
+    let pki = Pki::new(&dir);
+    // The Deployment's args give the mode, the config, the instance and the socket; the
+    // storage and the state store come from the file, so the file must carry them.
+    let mut s = settings(names::FRONTEND, &dir, &pki, Host::Fine);
+    s.push((
+        "state-store",
+        format!("sqlite://{}", dir.join("state.db").display()),
+    ));
+    let toml = dir.join("kbf.toml");
+    write(&toml, &as_toml(&s), 0o600);
+    let socket = dir.join("control.sock");
+    let args: Vec<String> = deployment_args()
+        .into_iter()
+        .map(|a| match a.split_once('=') {
+            Some(("--config", _)) => format!("--config={}", toml.display()),
+            Some(("--handover-socket", _)) => format!("--handover-socket={}", socket.display()),
+            _ => a,
+        })
+        .collect();
+    assert_eq!(
+        args.first().map(String::as_str),
+        Some(names::FRONTEND),
+        "{args:?}"
+    );
+    let mut with_check = args.clone();
+    with_check.push("--check".to_owned());
+    let r = run_in(&with_check, &host_env(&dir));
+    assert_eq!(r.code, Some(0), "{with_check:?}: {}", r.err);
+    assert_eq!(r.out, "kbf frontend: ok\n");
+    let mut old = vec!["--mode=frontend".to_owned()];
+    old.extend(args.into_iter().skip(1));
+    old.push("--check".to_owned());
+    let r = run_in(&old, &host_env(&dir));
+    assert_eq!(r.code, Some(2), "{old:?}: {}", r.err);
+    assert!(r.err.contains("unexpected argument"), "{}", r.err);
+}
+
+/// Catches `cargo xtask image-check` expecting a refusal the binary does not give: with
+/// `--config` naming a file that is not there, `kbf frontend --check` exits 2 and says
+/// `cannot read the config file <path>`; without `--config`, the default path is read only
+/// when it exists, so a host with no `/etc/kbf/kbf.toml` is refused for something else
+/// (no `--storage`), never for the missing file.
+#[test]
+fn a_missing_config_is_refused_by_name_only_when_config_is_given() {
+    let dir = scratch("missing-config");
+    let absent = dir.join("kbf.toml");
+    let r = run(&strings(&[
+        names::FRONTEND,
+        "--config",
+        &absent.display().to_string(),
+        "--check",
+    ]));
+    assert_eq!(r.code, Some(2), "{}", r.err);
+    assert!(
+        r.err.contains("cannot read") && r.err.contains(&absent.display().to_string()),
+        "{}",
+        r.err
+    );
+    if !Path::new(kbf_cli::config::DEFAULT_PATH).exists() {
+        let r = run(&strings(&[names::FRONTEND, "--check"]));
+        assert_eq!(r.code, Some(2), "{}", r.err);
+        assert!(!r.err.contains("cannot read"), "{}", r.err);
+    }
+}

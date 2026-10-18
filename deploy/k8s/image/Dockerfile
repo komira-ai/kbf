@@ -17,5 +17,5 @@ COPY --chmod=0555 kbf /usr/local/bin/kbf
 # instances must share one uid: the handover socket checks the peer's uid).
 USER 65532:65532
 
-# No default mode: `kbf` without `--mode` refuses to start, and the Deployment gives it.
+# No default mode: `kbf` without a mode word refuses to start, and the Deployment gives it.
 ENTRYPOINT ["/usr/local/bin/kbf"]

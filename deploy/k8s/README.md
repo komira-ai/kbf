@@ -28,7 +28,7 @@ The manifests assume (the install script is a separate, held step):
 
 - a node labelled `kbf/frontend-host=true`;
 - `/var/lib/kbf-server` (state, on a local file system), `/run/kbf-frontend` (mode 0700)
-  and `/etc/kbf` (with `kbf.toml`), `/etc/kbf/envoy/envoy.json` and the certificates and keys it names (under `/etc/kbf`; the Envoy pod mounts `/etc/kbf` read-only), all existing and owned by
+  and `/etc/kbf` (with `kbf.toml`, which must give the frontend's `storage` and `state-store`: the Deployment's args carry only the mode, `--config`, `--instance` and `--handover-socket`), `/etc/kbf/envoy/envoy.json` and the certificates and keys it names (under `/etc/kbf`; the Envoy pod mounts `/etc/kbf` read-only), all existing and owned by
   uid and gid 65532, the user both pods run as (the handover socket accepts a peer of the
   same uid only). `type: Directory` makes a missing path fail the pod instead of kubelet
   creating it with the wrong owner;
@@ -40,7 +40,7 @@ The manifests assume (the install script is a separate, held step):
 `artifacts.yml` job `frontend-image` builds it from the linux-x86_64 `kbf` tarball (checked
 against `SHA256SUMS`, the bytes `attest-linux` signs on a push), tests it with
 `cargo xtask image-check` (runs as 65532:65532; `kbf --version` runs and names a commit;
-`kbf --mode=frontend --check` with no `kbf.toml` exits 2 and says it cannot read `/etc/kbf/kbf.toml`; an unknown-flag usage error also exits 2 and fails the check), and uploads it as the artifact
+`kbf frontend --config /etc/kbf/kbf.toml --check` with no `kbf.toml` exits 2 and says it cannot read `/etc/kbf/kbf.toml`; an unknown-flag usage error also exits 2 and fails the check; `--config` is given because the default path is read only when it exists), and uploads it as the artifact
 `frontend-image` (a `docker save` archive). It runs for a pull request with the label
 `needs-artifacts`, and on pushes.
 

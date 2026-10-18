@@ -241,8 +241,12 @@ fn frontend(d: &Node, out: &mut Vec<String>) {
                 bad(&format!("has no {needed}"));
             }
         }
-        if !strings(get(c, "args")).contains(&"--mode=frontend") {
-            bad("args lack --mode=frontend");
+        let args = strings(get(c, "args"));
+        if args.first() != Some(&"frontend") {
+            bad("args do not start with the mode word `frontend`");
+        }
+        if !args.contains(&"--config=/etc/kbf/kbf.toml") {
+            bad("args lack --config=/etc/kbf/kbf.toml");
         }
         resources(c, "kbf-frontend", out_ref(&mut bad));
     }
@@ -490,6 +494,30 @@ fn a_short_grace_period_is_refused() {
             "terminationGracePeriodSeconds: 30",
         ),
         "under a week",
+    );
+}
+
+#[test]
+fn the_mode_flag_form_is_refused() {
+    refused(
+        &with(
+            "frontend-deployment.yaml",
+            "            - frontend\n",
+            "            - --mode=frontend\n",
+        ),
+        "do not start with the mode word",
+    );
+}
+
+#[test]
+fn a_frontend_without_its_config_flag_is_refused() {
+    refused(
+        &with(
+            "frontend-deployment.yaml",
+            "            - --config=/etc/kbf/kbf.toml\n",
+            "",
+        ),
+        "args lack --config",
     );
 }
 

@@ -6,11 +6,13 @@
 //!   manifests run as;
 //! - `docker run <image> --version` exits 0 and prints a `kbf <version>+<commit>` line,
 //!   so the binary starts on the base's libraries;
-//! - `docker run <image> --mode=frontend --check`, with no `/etc/kbf/kbf.toml` in the
-//!   image, exits [`REFUSED`] (2) and says on stderr that it cannot read
-//!   [`CONFIG_PATH`]. The exit status alone is not enough: clap's usage error for a flag
-//!   the binary does not know (an image built from a tree without `--mode`) also exits
-//!   2, and a missing library exits 127 or 1.
+//! - `docker run <image> frontend --config /etc/kbf/kbf.toml --check`, with no
+//!   `/etc/kbf/kbf.toml` in the image, exits [`REFUSED`] (2) and says on stderr that it
+//!   cannot read [`CONFIG_PATH`]. `--config` is given on purpose: `kbf <mode>` reads the
+//!   default path only when the file exists, so without the flag a missing file is not
+//!   an error of its own. The exit status alone is not enough: clap's usage error for a
+//!   flag the binary does not know (an image built from an older tree) also exits 2, and
+//!   a missing library exits 127 or 1.
 //!
 //! The image id is appended to `--summary`. Nothing is pushed.
 
@@ -81,16 +83,16 @@ pub fn judge_version(ran: &Ran) -> Result<(), Error> {
     }
 }
 
-/// `kbf --mode=frontend --check`'s answer with no config in the image: exit
+/// `kbf frontend --config <path> --check`'s answer with no config in the image: exit
 /// [`REFUSED`] and a stderr that says it cannot read [`CONFIG_PATH`].
 ///
 /// # Errors
 /// The exit status is not [`REFUSED`], or stderr does not name the missing config (the
-/// binary refused for another reason, such as an unknown `--mode` flag).
+/// binary refused for another reason, such as an unknown flag).
 pub fn judge_refusal(ran: &Ran) -> Result<(), Error> {
     if ran.code != Some(REFUSED) {
         return Err(Error::Failed(format!(
-            "`kbf --mode=frontend --check` with no kbf.toml exited {:?}, not {REFUSED}",
+            "`kbf frontend --config {CONFIG_PATH} --check` with no kbf.toml exited {:?}, not {REFUSED}",
             ran.code
         )));
     }
@@ -99,7 +101,7 @@ pub fn judge_refusal(ran: &Ran) -> Result<(), Error> {
         Ok(())
     } else {
         Err(Error::Failed(format!(
-            "`kbf --mode=frontend --check` with no kbf.toml exited {REFUSED} but did not \
+            "`kbf frontend --config {CONFIG_PATH} --check` with no kbf.toml exited {REFUSED} but did not \
              say it cannot read {CONFIG_PATH} (stderr starts {first:?}): it refused for \
              another reason"
         )))
@@ -127,24 +129,35 @@ pub fn run(
     image: &str,
     summary: Option<&PathBuf>,
 ) -> Result<Vec<String>, Error> {
-    let id = judge_inspect(&docker(
-        docker_program,
-        &[
-            "image",
-            "inspect",
-            "--format",
-            "{{.Id}} {{.Config.User}}",
-            image,
-        ],
-    )?)?;
-    judge_version(&docker(
-        docker_program,
-        &["run", "--rm", image, "--version"],
-    )?)?;
-    judge_refusal(&docker(
-        docker_program,
-        &["run", "--rm", image, "--mode=frontend", "--check"],
-    )?)?;
+    run_with(|args| docker(docker_program, args), image, summary)
+}
+
+/// [`run`] with the `docker` calls made by `call` (the arguments after `docker`).
+///
+/// # Errors
+/// As [`run`].
+pub fn run_with(
+    mut call: impl FnMut(&[&str]) -> Result<Ran, Error>,
+    image: &str,
+    summary: Option<&PathBuf>,
+) -> Result<Vec<String>, Error> {
+    let id = judge_inspect(&call(&[
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}} {{.Config.User}}",
+        image,
+    ])?)?;
+    judge_version(&call(&["run", "--rm", image, "--version"])?)?;
+    judge_refusal(&call(&[
+        "run",
+        "--rm",
+        image,
+        "frontend",
+        "--config",
+        CONFIG_PATH,
+        "--check",
+    ])?)?;
     if let Some(file) = summary {
         let mut f = std::fs::OpenOptions::new()
             .append(true)

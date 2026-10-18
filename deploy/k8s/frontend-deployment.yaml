@@ -51,7 +51,8 @@ spec:
         - name: kbf
           image: kbf-frontend
           args:
-            - --mode=frontend
+            - frontend
+            - --config=/etc/kbf/kbf.toml
             - --instance=a
             - --handover-socket=/run/kbf-frontend/control.sock
           securityContext:
