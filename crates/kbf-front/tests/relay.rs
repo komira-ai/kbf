@@ -19,7 +19,7 @@ use futures::{StreamExt, stream};
 use kbf_auth::{AuthenticationMetadata, Authenticator, Authorizers, Policy};
 use kbf_front::{
     Backend, Cache, Dispatch, Finished, Handed, OpenStreams, OperationStream, Relay, Stage,
-    Submission, Ticket, closing, progress,
+    Submission, Successor as Named, Ticket, closing, progress,
 };
 use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::google::rpc;
@@ -750,4 +750,46 @@ async fn an_unreachable_successor_refuses_the_call() {
     assert_eq!(refused.code(), Code::Unavailable);
     assert_eq!(*lock(&rig.old), 0);
     assert_eq!(rig.relayed(), (1, 0));
+}
+
+/// Catches: a relay with no successor named yet (a frontend hands over before its successor
+/// has said where it listens) that answers from the old scheduler, hangs, or counts a call
+/// it did not relay: it refuses UNAVAILABLE for both calls and counts nothing. Once the
+/// successor is named the same relay forwards, and a second naming changes nothing (a
+/// successor is named once). Mutants: `client` answering with the wrapped service while
+/// the successor is unknown; counting before the client is made.
+#[tokio::test]
+async fn a_successor_named_late_is_dialled_from_then_on() {
+    let seen = Arc::default();
+    let channel = serve(Successor {
+        items: vec![Ok(op(OP, ExecStage::Completed, 0))],
+        hang: false,
+        open_ended: false,
+        seen: Arc::clone(&seen),
+    })
+    .await;
+    let rig = Rig::to(
+        Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        vec![],
+        Arc::default(),
+    );
+    let named = Named::unknown();
+    let backend = rig.backend.clone();
+    let handed: Arc<dyn Handed> = Arc::<Rows>::clone(&rig.rows);
+    let relay = Relay::new(Old(Arc::clone(&rig.old)), handed, named.clone(), backend);
+
+    let refused = refusal(relay.execute(execute()).await);
+    assert_eq!(refused.code(), Code::Unavailable);
+    let refused = refusal(relay.wait_execution(wait()).await);
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(*lock(&rig.old), 0);
+    assert_eq!(rig.relayed(), (0, 0), "a refused call is not a relayed one");
+
+    assert!(named.set(channel));
+    let items = all(relay.execute(execute()).await.expect("opened").into_inner()).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(rig.relayed(), (1, 0));
+    assert_eq!(lock(&seen).len(), 1);
+    let other = Endpoint::from_static("http://127.0.0.1:2").connect_lazy();
+    assert!(!named.set(other), "a successor is named once");
 }

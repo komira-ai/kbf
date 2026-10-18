@@ -204,10 +204,11 @@ kbf frontend handover --wait
 ```
 
 It starts the idle instance with `systemctl start`; the unit is `Type=notify`, so the start
-returns when the new frontend has taken the listeners, the state store and the daemons over
-and serves. The old instance then answers the builds it holds and exits by itself (`--wait`
-looks at it until it has). Buck2's open streams are not broken, new calls go to the new
-frontend, daemons reconnect and keep their runs. A new instance that fails before it is
+returns when the new frontend has taken the state store and the daemons over and serves on
+listeners of its own (`--instance`, behind Envoy). The old instance then goes not ready once
+Envoy has seen the new one, answers the builds it holds and exits by itself (`--wait` looks
+at it until it has). Buck2's open streams are not broken, a call that still reaches the old
+frontend is forwarded to the new one, daemons reconnect and keep their runs. A new instance that fails before it is
 ready leaves the old one serving, and the command exits 1 and says so. With both instances
 active (the old one still draining) it refuses. What each party sees, and every failure:
 `docs/design/frontend-handover.md`. Rule `handover` of `check-units --mode frontend`

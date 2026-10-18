@@ -1897,7 +1897,9 @@ dependencies = [
 name = "kbf-peer"
 version = "0.1.0"
 dependencies = [
+ "kbf-map",
  "rcgen",
+ "sha2 0.11.0",
  "thiserror",
  "x509-parser",
 ]
@@ -1986,6 +1988,7 @@ dependencies = [
  "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",
+ "kbf-peer",
  "kbf-proto",
  "kbf-raft",
  "kbf-route",

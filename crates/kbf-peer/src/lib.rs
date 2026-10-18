@@ -13,6 +13,15 @@
 //! match exactly up to ASCII case, IP names as parsed addresses, and a wildcard name
 //! covers nothing. The role URI, other URIs and the common name are never names.
 //!
+//! A certificate is also judged against a deny list (`kbf_map::DenyEntry`: a serial, a
+//! public-key hash or a node id). [`identity_of`] reads what such an entry is compared
+//! with, as a [`PeerIdentity`] (the names above, the serial and the SHA-256 of the
+//! SubjectPublicKeyInfo, each in the entry's canonical spelling), and
+//! [`PeerIdentity::denied_by`] says which entry of a list, if any, names it. A node id names
+//! a certificate by one of its DNS names, up to ASCII case ([`PeerNames::has_dns_name`]).
+//! It is the one reader: the frontend's worker listener and membership service and every
+//! storage node use it, so they cannot disagree about which certificate an entry names.
+//!
 //! The certificate is not verified here: TLS has already verified it against the
 //! listener's client CA. Which gRPC status a refusal is belongs to the caller (see
 //! [`RoleError`]).
@@ -20,6 +29,8 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 
+use kbf_map::{DenyEntry, normalize_serial};
+use sha2::{Digest as _, Sha256};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
@@ -139,6 +150,12 @@ impl PeerNames {
             .collect()
     }
 
+    /// The DNS names as written, in the order the certificate lists them.
+    #[must_use]
+    pub fn dns(&self) -> &[String] {
+        &self.dns
+    }
+
     /// Whether one of the names is `host`: a bare host, without port or brackets (see
     /// [`host_of`]). A host that parses as an IP address is covered by an IP name of
     /// the same address and by no DNS name; any other host is covered by a DNS name equal
@@ -154,6 +171,17 @@ impl PeerNames {
                 .dns
                 .iter()
                 .any(|name| !name.contains('*') && name.eq_ignore_ascii_case(host))
+    }
+
+    /// Whether a `node` deny entry with the value `node` names these names: a DNS name equal
+    /// to it up to ASCII case, which is how DNS compares names and how [`PeerNames::covers`]
+    /// does. IP names are never matched, so an entry holding an IP address names nothing (a
+    /// deny writer refuses one), and a wildcard name is matched by the entry that spells it,
+    /// since a deny errs towards denying. A name with a trailing dot is another string and is
+    /// not matched, nor is a `host:port`.
+    #[must_use]
+    pub fn has_dns_name(&self, node: &str) -> bool {
+        self.dns.iter().any(|name| name.eq_ignore_ascii_case(node))
     }
 }
 
@@ -178,16 +206,79 @@ impl fmt::Display for PeerNames {
 /// # Errors
 /// [`RoleError::NotACertificate`]: the bytes are not an X.509 certificate.
 pub fn names_of(der: &[u8]) -> Result<PeerNames, RoleError> {
-    let cert = parse(der)?;
+    Ok(names_in(&parse(der)?))
+}
+
+fn names_in(cert: &X509Certificate<'_>) -> PeerNames {
     let mut names = PeerNames::default();
-    for name in alt_names(&cert) {
+    for name in alt_names(cert) {
         match name {
             GeneralName::DNSName(dns) => names.dns.push((*dns).to_owned()),
             GeneralName::IPAddress(raw) => names.ips.extend(ip_of(raw)),
             _ => {}
         }
     }
-    Ok(names)
+    names
+}
+
+/// What a deny list entry is compared with: the certificate's names, its serial and the
+/// hash of its public key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerIdentity {
+    names: PeerNames,
+    /// Lower-case hex without leading zeros, as `DenyEntry::Serial` spells it.
+    serial: String,
+    /// SHA-256 of the DER SubjectPublicKeyInfo, lower-case hex.
+    spki_sha256: String,
+}
+
+impl PeerIdentity {
+    /// The DNS and IP names.
+    #[must_use]
+    pub fn names(&self) -> &PeerNames {
+        &self.names
+    }
+
+    /// The serial, as a deny entry spells it.
+    #[must_use]
+    pub fn serial(&self) -> &str {
+        &self.serial
+    }
+
+    /// The SHA-256 of the SubjectPublicKeyInfo, as a deny entry spells it.
+    #[must_use]
+    pub fn spki_sha256(&self) -> &str {
+        &self.spki_sha256
+    }
+
+    /// The first entry of `denied` that names this certificate: its serial, its key hash,
+    /// or a node id that is one of its DNS names ([`PeerNames::has_dns_name`], up to ASCII
+    /// case). IP names, the role URI and the common name never match a `node` entry.
+    #[must_use]
+    pub fn denied_by<'a>(&self, denied: &'a [DenyEntry]) -> Option<&'a DenyEntry> {
+        denied.iter().find(|entry| match entry {
+            DenyEntry::Serial(serial) => *serial == self.serial,
+            DenyEntry::SpkiSha256(hash) => *hash == self.spki_sha256,
+            DenyEntry::Node(node) => self.names.has_dns_name(node),
+        })
+    }
+}
+
+/// The identity a DER certificate gives a deny list.
+///
+/// # Errors
+/// [`RoleError::NotACertificate`]: the bytes are not an X.509 certificate.
+pub fn identity_of(der: &[u8]) -> Result<PeerIdentity, RoleError> {
+    let cert = parse(der)?;
+    Ok(PeerIdentity {
+        names: names_in(&cert),
+        serial: normalize_serial(&hex(cert.raw_serial())),
+        spki_sha256: hex(&Sha256::digest(cert.public_key().raw)),
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The address an IP subjectAltName holds: four bytes (IPv4) or sixteen (IPv6).
