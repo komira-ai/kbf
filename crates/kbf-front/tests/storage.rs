@@ -297,6 +297,23 @@ fn a_write_tier_failure_is_unavailable() {
     assert_eq!(code, Code::Unavailable);
 }
 
+/// A stream the write pool stopped for sitting idle past its bound is a stall the client
+/// meets again on a retry that finds the writer free: UNAVAILABLE, which Buck2 retries,
+/// not INVALID_ARGUMENT (a refusal it would give up on). Catches `Stalled` mapped to
+/// `Invalid`, `Internal` or `NotFound`. Tested on the conversion a storage node applies
+/// to every cache error, because no storage-level rig streams a stalled upload through a
+/// node; the cache-level test (`a_stalled_stream_loses_its_writer_and_fails_retryably`)
+/// covers the stream side.
+#[test]
+fn a_stalled_stream_is_unavailable() {
+    let (storage, code) = answer(CacheError::Stalled("idle 30s".to_owned()));
+    assert_eq!(
+        kind(&storage),
+        kind(&StorageError::Unavailable(Arc::new(Backend)))
+    );
+    assert_eq!(code, Code::Unavailable);
+}
+
 /// A blob the cache's own packing refused. A blob over a segment is refused as invalid
 /// before it is packed, and a full segment is rotated, so one that reaches a caller is
 /// the cache's bug: INTERNAL, not a blip to retry. Catches `Pack` mapped to `Unavailable`.

@@ -91,9 +91,9 @@ pub fn parse(epoch: u64, id: u64, bytes: &[u8]) -> Result<Order, OrderFault> {
             inside_epoch: record.epoch,
         });
     }
-    // The record checked the commit's shape already; this is the installer's own type.
-    let commit = CommitId::new(&record.commit)
-        .map_err(|e| OrderFault::NotAnOrder(RecordError::Commit(e.0)))?;
+    // The record checked the commit's shape already (the same rule); this is the installer's
+    // own type.
+    let commit = CommitId::new(&record.commit).expect("the record checked the commit");
     let verb = match record.verb {
         RecordVerb::Activate => Verb::Activate,
         RecordVerb::Confirm => Verb::Confirm,

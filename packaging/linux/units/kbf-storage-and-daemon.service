@@ -1,0 +1,66 @@
+# kbf build farm storage node and node daemon in one process: `kbf --mode=storage-and-daemon`.
+# Static unit: shipped by the kbf-installer package (installed under /usr/lib/systemd/system/),
+# disabled, with no rendering and no @PLACEHOLDER@ in it. It starts only once
+# /etc/kbf/kbf.toml exists (ConditionPathExists=), after kbf-installer's `boot-check` (which
+# counts the starts of a release on trial and reverts a release that spends its budget) and
+# `kbf --mode=<mode> --check` (which prints every missing prerequisite and exits 2). The checks
+# are ExecStartPre=, not ExecCondition=: ExecCondition= skips the start silently on exit 1
+# to 254, and a unit that cannot start must fail where an operator sees it. kbf reads
+# /etc/kbf/kbf.toml itself: no --config. The binary is the release kbf-installer flipped
+# to; only kbf-installer replaces it. Per-host values (MemoryMin=, ports, certificates,
+# the cold store) are kbf.toml's, or a drop-in kbf-installer writes from it.
+# kbf docs/design/architecture-v2.md, sections 1 and 11. The daemon half reads and writes
+# the node's storage in-process; its control plane dials the frontend.
+[Unit]
+Description=kbf build farm storage node and node daemon
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/kbf/kbf.toml
+
+# A failure that repeats quickly (the cold store or a disk not ready) must not use up
+# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# `restart`).
+StartLimitIntervalSec=0
+
+[Service]
+# The daemon half runs its containers rootless, with crun, as the kbf user.
+User=kbf
+Slice=kbf.slice
+# kbf's own state: /var/lib/kbf, created for the unit's user by systemd; kbf-installer never
+# touches it.
+StateDirectory=kbf
+StateDirectoryMode=0750
+# The daemon half manages its own cgroup: supervisor/ for itself, actions/ for builds.
+# Delegate=yes delegates cpuset with cpu, memory and pids: --lease-placement=numa-node
+# pins each lease to one NUMA node with it (check-units rule `delegate`).
+Delegate=yes
+OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
+CPUWeight=300
+# No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
+# One unit, one process, one user: the cold store's key is not read from an
+# EnvironmentFile= (check-units rule `credential`); kbf.toml names where kbf gets it. The
+# user builds run as can read what this process reads, so this unit is for a trusted
+# network only, as all-in-one is, until a test proves an action cannot read the key
+# (design section 9).
+ExecStartPre=+/usr/bin/kbf-installer boot-check
+# `--check` validates kbf.toml and what a restart cannot change (a file, a user, a flag)
+# and exits 2 for those. Anything that can become ready later (a listen address, a peer,
+# a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted), so a check
+# that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
+ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=storage-and-daemon --check
+ExecStart=/var/lib/kbf-installer/current/kbf --mode=storage-and-daemon
+# The storage half drains on SIGTERM: a Write in flight is finished and acknowledged
+# before the process exits, and a large one takes longer than systemd's 90 s default stop
+# timeout, which would SIGKILL it and fail the upload (check-units rule `stop`).
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
+Restart=on-failure
+RestartSec=5
+# Exit 2 is a command line kbf refused (or a config it refused): a restart cannot fix it.
+# Exit 75 (a retryable failure) is restarted.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

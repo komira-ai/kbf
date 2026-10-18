@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  kbf-installer's service (`kbf-installer serve`). The package installs this file and
+  does not load it, and the job does not run until /usr/local/etc/kbf/installer.toml
+  exists, which `kbf-installer setup` writes: RunAtLoad is false and KeepAlive holds the
+  job only while that path exists (launchd's form of ConditionPathExists, which
+  kbf-installer.service has on Linux). `cargo xtask pkg build` refuses a property list
+  that is not gated this way, that runs another program or mode, or that has a key which
+  starts the job without the file (Sockets, StartInterval, StartCalendarInterval,
+  StartOnMount, WatchPaths, QueueDirectories, LaunchEvents).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.komira.kbf-installer</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/kbf-installer/bin/kbf-installer</string>
+		<string>serve</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>/usr/local/etc/kbf/installer.toml</key>
+			<true/>
+		</dict>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>/Library/Logs/kbf-installer/kbf-installer.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Library/Logs/kbf-installer/kbf-installer.err.log</string>
+</dict>
+</plist>

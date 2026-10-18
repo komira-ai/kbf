@@ -116,6 +116,12 @@ impl<E: Exec> Helper<E> {
         &mut self.exec
     }
 
+    /// The fetcher, replaced by a test.
+    #[cfg(test)]
+    pub(super) fn set_fetcher(&mut self, fetcher: Box<dyn Fetcher>) {
+        self.fetcher = fetcher;
+    }
+
     fn orders_path(&self) -> std::path::PathBuf {
         self.host.join(&self.cfg.orders_dir)
     }
@@ -268,42 +274,50 @@ impl<E: Exec> Helper<E> {
     fn orders(&mut self, now: u64, memory: &mut Memory) -> Result<(), HelperError> {
         // The spool is opened without following a link: one the service user puts in its
         // place is refused, never followed. Its absence is not an error.
-        let dir = Entry::open(&self.orders_path()).ok();
-        let mut files: Vec<((u64, u64), String)> = Vec::new();
-        if let Some(dir) = &dir {
-            let (names, crowded) = match dir.names_up_to(SCAN_LIMIT) {
-                Ok(found) => found,
-                Err(r) => {
-                    refuse(memory, &format!("{}: {r}", r.code()));
-                    return self.save(memory);
-                }
-            };
-            if crowded {
-                refuse(
-                    memory,
-                    &format!(
-                        "the order spool holds more than {SCAN_LIMIT} entries; the rest are not looked at"
-                    ),
-                );
+        let Ok(dir) = Entry::open(&self.orders_path()) else {
+            return self.save(memory);
+        };
+        self.orders_in(&dir, now, memory)
+    }
+
+    /// The order records in `dir`, in (epoch, id) order.
+    pub(super) fn orders_in(
+        &mut self,
+        dir: &Entry,
+        now: u64,
+        memory: &mut Memory,
+    ) -> Result<(), HelperError> {
+        let (names, crowded) = match dir.names_up_to(SCAN_LIMIT) {
+            Ok(found) => found,
+            Err(r) => {
+                refuse(memory, &format!("{}: {r}", r.code()));
+                return self.save(memory);
             }
-            // A name that is not a record's (a `.partial-` the client is writing, its state
-            // file, or junk) is left.
-            files = names
-                .into_iter()
-                .filter_map(|name| order::key_of(&name).map(|key| (key, name)))
-                .collect();
-            files.sort();
-            // First seen by root now, or earlier; what is no longer there is forgotten.
-            memory
-                .first_seen
-                .retain(|name, _| files.iter().any(|(_, f)| f == name));
-            for (_, name) in &files {
-                memory.first_seen.entry(name.clone()).or_insert(now);
-            }
-            self.save(memory)?;
+        };
+        if crowded {
+            refuse(
+                memory,
+                &format!(
+                    "the order spool holds more than {SCAN_LIMIT} entries; the rest are not looked at"
+                ),
+            );
         }
+        // A name that is not a record's (a `.partial-` the client is writing, its state
+        // file, or junk) is left.
+        let mut files: Vec<((u64, u64), String)> = names
+            .into_iter()
+            .filter_map(|name| order::key_of(&name).map(|key| (key, name)))
+            .collect();
+        files.sort();
+        // First seen by root now, or earlier; what is no longer there is forgotten.
+        memory
+            .first_seen
+            .retain(|name, _| files.iter().any(|(_, f)| f == name));
+        for (_, name) in &files {
+            memory.first_seen.entry(name.clone()).or_insert(now);
+        }
+        self.save(memory)?;
         for (index, ((epoch, id), name)) in files.into_iter().enumerate() {
-            let Some(dir) = &dir else { break };
             let age = now.saturating_sub(memory.first_seen.get(&name).copied().unwrap_or(now));
             if index >= kbf_update::MAX_RECORDS {
                 refuse(
@@ -409,7 +423,12 @@ impl<E: Exec> Helper<E> {
     /// its release fetched first, while nothing is owed and nothing moves. An activate or a
     /// revert then moves the links, so the restart is owed (and saved) before the verb runs;
     /// a kill between the links and the next save then leaves the restart for the next pass.
-    fn act(&mut self, order: &Order, now: u64, memory: &mut Memory) -> Result<(), HelperError> {
+    pub(super) fn act(
+        &mut self,
+        order: &Order,
+        now: u64,
+        memory: &mut Memory,
+    ) -> Result<(), HelperError> {
         let before = self.state()?;
         if order.verb == Verb::Activate
             && let Err(why) = self.prepare(order, &before, now, memory)
@@ -450,7 +469,7 @@ impl<E: Exec> Helper<E> {
     /// The checks an activation passes before anything is moved, then the fetch. Ok means
     /// `current` may be swapped to the order's commit. The rule on the order's generation
     /// and the operator's floors are the next change's.
-    fn prepare(
+    pub(super) fn prepare(
         &mut self,
         order: &Order,
         before: &State,

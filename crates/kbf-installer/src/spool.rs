@@ -67,6 +67,17 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// An entry over an open file, which is no directory: every listing of it fails. For
+    /// tests of what the caller does when the descriptor cannot be read.
+    #[cfg(test)]
+    pub(crate) fn over_file(file: &Path) -> Entry {
+        Entry {
+            dir: OwnedFd::from(File::open(file).expect("opens")),
+            mode: OpenMode::Beneath,
+            name: "not-a-directory".to_owned(),
+        }
+    }
+
     /// Open `entry_dir`, which must be a directory and not a link.
     pub fn open(entry_dir: &Path) -> Result<Entry, Refusal> {
         let name = entry_dir.display().to_string();
