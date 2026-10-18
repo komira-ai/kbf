@@ -10,7 +10,7 @@ use kbf_host::step::{Owner, Perms};
 use kbf_host::testkit::{FakeExec, reply};
 
 use super::*;
-use crate::linux::render::{Templates, render as render_converged};
+use crate::linux::shared;
 
 const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
 
@@ -155,6 +155,58 @@ fn rows() -> Vec<Row> {
             plant: |_, t| t.replace("EnvironmentFile=/etc/kbf/s3.env\n", ""),
             fails: &[Mode::Storage, Mode::StorageAndDaemon],
         },
+        // The unit's own limits on a unit that holds every lease, and a score that lets
+        // the OOM killer take the daemon before its builds.
+        Row {
+            rule: "caps",
+            plant: |_, t| last_in_service(t, "MemoryMax=1G"),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "caps",
+            plant: |_, t| last_in_service(t, "MemoryHigh=1G"),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "caps",
+            plant: |_, t| last_in_service(t, "CPUQuota=100%"),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "caps",
+            plant: |_, t| last_in_service(t, "AllowedCPUs=0-3"),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "swap",
+            plant: |_, t| last_in_service(t, "MemorySwapMax=0"),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "oom",
+            plant: |_, t| last_in_service(t, "OOMScoreAdjust=500"),
+            fails: BUILDS,
+        },
+        Row {
+            rule: "oom",
+            plant: |_, t| {
+                let score = t
+                    .lines()
+                    .find(|l| l.starts_with("OOMScoreAdjust="))
+                    .expect("every unit has one");
+                t.replace(&format!("{score}\n"), "")
+            },
+            fails: BUILDS,
+        },
+        // The metadata log put under the daemon's data directory.
+        Row {
+            rule: "meta-dir",
+            plant: |_, t| match t.lines().find(|l| l.contains("--meta-dir=")) {
+                Some(l) => t.replace(l, &format!("    --meta-dir={}/raft \\", config().data_dir)),
+                None => t.to_owned(),
+            },
+            fails: &[Mode::StorageAndDaemon, Mode::AllInOne],
+        },
         Row {
             rule: "state-store",
             // The frontend's unit gives a state store already (the last one wins): put the
@@ -284,9 +336,7 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
     let c = config();
     let slice = UnitText::new(
         SLICE,
-        render_converged(&c, Some(1500), &Templates::BUILT_IN)
-            .expect("renders")
-            .slice,
+        shared::render_slice(&c, Some(1500)).expect("renders"),
     );
     let cases: [(&str, Entry, &[Mode]); 4] = [
         ("parse", file(0o600, 0, ""), &Mode::ALL),
