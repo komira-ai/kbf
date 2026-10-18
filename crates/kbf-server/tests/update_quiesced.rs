@@ -8,20 +8,22 @@
 //! Every test runs a real `Farm` over an in-memory state store, with one Mac whose stream is the
 //! channel the server writes to, and reads what the controller left in the store.
 
+#[path = "support/hooked.rs"]
+mod hooked;
+
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kbf_caps::NodeCaps;
-use kbf_front::{Cache, MemoryMetaLog};
+use kbf_front::{Cache, Handed, MemoryMetaLog};
 use kbf_objstore::MemoryStore;
 use kbf_proto::update::{UpdateOrder, UpdateStatus};
 use kbf_proto::worker::{ServerMessage, server_message};
 use kbf_server::farm::{Farm, Reported};
 use kbf_server::update::{Policy, Release, Rows, Transport, ports, spawn_controller};
 use kbf_server::{EpochPolicy, StateStore};
-use kbf_state::fake::{Fake, Flaw};
-use kbf_state::{Fenced, ManualClock, Store, Versioned};
+use kbf_state::{Fenced, Store, Versioned};
 use kbf_types::{Resources, WorkerId};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -86,8 +88,9 @@ impl io::Write for Lines {
 /// then activate the release on it.
 struct Rig {
     farm: Arc<Farm>,
-    /// The whole store: the rows, and the generation a newer writer takes.
-    whole: Arc<dyn Store>,
+    /// The whole store: the rows, and the generation a newer writer takes. Its reads can run a
+    /// hook, to fence the farm at a chosen moment of a call.
+    whole: Arc<hooked::Hooked>,
     /// The handle of generation 1, which the farm and the controller write through.
     writer: Arc<dyn Store>,
     /// What the server sends to the Mac.
@@ -99,12 +102,9 @@ fn mac() -> WorkerId {
 }
 
 fn rig() -> Rig {
-    let whole: Arc<dyn Store> = Arc::new(Fake::with_flaw(
-        Arc::new(ManualClock::default()),
-        Flaw::None,
-    ));
+    let whole = hooked::Hooked::new();
     let writer: Arc<dyn Store> =
-        Arc::new(Fenced::take(Arc::clone(&whole), None).expect("generation 1"));
+        Arc::new(Fenced::take(Arc::clone(&whole) as Arc<dyn Store>, None).expect("generation 1"));
     let farm = Arc::new(
         Farm::new(
             Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),
@@ -256,12 +256,16 @@ async fn a_handed_over_farm_makes_no_look() {
 /// for one of the two ways it is given. On a fenced farm `Farm::place` still writes the cordon
 /// row and `Farm::send_order` still reaches the node, so each order is refused by the
 /// transport: cordon, uncordon, activation and confirmation, each with an error that names the
-/// reason, with no transaction, no cordon row and no message to the Mac. The same calls on
-/// the farm before the fence succeed.
+/// reason, with no transaction (a confirmation draws its id from the store's counter, which is
+/// a transaction), no cordon row and no message to the Mac. The same calls on the farm before
+/// the fence succeed. The activation and the confirmation refused are of a second activation,
+/// never confirmed: a confirmation that was sent already is found in the record and draws
+/// nothing, which would hide a draw made on a fenced farm.
 ///
 /// Mutants seen red: the check removed from the placement path (the cordon and the uncordon
-/// are given); the check removed from the send path (the activation and the confirmation are
-/// sent).
+/// are given); the check removed from the top of `confirm` only (the confirmation draws an
+/// id: the store took a transaction); the checks removed from the top of `activate` and
+/// `confirm` and from `send` (the activation and the confirmation are sent).
 #[tokio::test]
 async fn a_handed_over_farm_cordons_nobody_and_sends_no_order() {
     let mut rig = rig();
@@ -269,22 +273,22 @@ async fn a_handed_over_farm_cordons_nobody_and_sends_no_order() {
     let (mut transport, _facts) = ports(Arc::clone(&rig.farm), update_rows.clone());
     let release = Release::new(A);
     // From the store's counter, as the controller's are: the confirmation draws the next.
-    let activation = update_rows
-        .mint_order(rig.farm.lease_epoch())
-        .expect("an id");
+    let epoch = rig.farm.lease_epoch();
+    let sent = update_rows.mint_order(epoch).expect("an id");
 
     transport.cordon(&mac()).expect("cordoned");
     assert!(rig.cordon_row());
     transport.uncordon(&mac()).expect("uncordoned");
     assert!(!rig.cordon_row());
     transport
-        .activate(&mac(), activation, &release)
+        .activate(&mac(), sent, &release)
         .expect("activation sent");
     transport
-        .confirm(&mac(), activation, &release)
+        .confirm(&mac(), sent, &release)
         .expect("confirmation sent");
     assert_eq!(rig.orders().len(), 2);
 
+    let activation = update_rows.mint_order(epoch).expect("an id");
     rig.farm.fence();
     let (rows, txns) = (rig.rows(), rig.txns());
     let refused = [
@@ -329,7 +333,8 @@ async fn a_controller_whose_store_handle_is_superseded_ends() {
     let log = Lines::default();
     let _logging = log.subscribe();
     let mut rig = rig();
-    let _newer = Fenced::take(Arc::clone(&rig.whole), Some(1)).expect("generation 2");
+    let _newer =
+        Fenced::take(Arc::clone(&rig.whole) as Arc<dyn Store>, Some(1)).expect("generation 2");
     let (rows, txns) = (rig.rows(), rig.txns());
     let task = rig.spawn();
     within("end of the task", || task.is_finished().then_some(())).await;
@@ -338,4 +343,30 @@ async fn a_controller_whose_store_handle_is_superseded_ends() {
     assert!(rig.orders().is_empty(), "an order reached the Mac");
     assert_eq!(log.with("update controller").len(), 1);
     assert_eq!(log.with("a newer writer holds the state store").len(), 1);
+}
+
+/// Catches an activation that goes out although the farm was fenced after the transport first
+/// looked at it: the fence lands while the activation reads the policy (for the window it
+/// gives the host), which is after the check at the top of the call and before the farm is
+/// asked to send. The check just before the send refuses it with a reason, and the Mac
+/// receives nothing. The hook runs after the policy read, so the fence is the farm's own, not
+/// one placed before the call.
+///
+/// Mutants seen red: the check removed from `send` only (the activation is sent).
+#[tokio::test]
+async fn a_fence_that_lands_while_an_activation_is_prepared_stops_it() {
+    let mut rig = rig();
+    let update_rows = Rows::new(Arc::clone(&rig.writer));
+    let (mut transport, _facts) = ports(Arc::clone(&rig.farm), update_rows.clone());
+    let activation = update_rows
+        .mint_order(rig.farm.lease_epoch())
+        .expect("an id");
+    let farm = Arc::clone(&rig.farm);
+    rig.whole.after_get("update/policy", move || farm.fence());
+    let error = transport
+        .activate(&mac(), activation, &Release::new(A))
+        .expect_err("refused");
+    assert!(error.to_string().contains("handed over"), "{error}");
+    assert!(rig.farm.handed());
+    assert!(rig.orders().is_empty(), "an order reached the Mac");
 }

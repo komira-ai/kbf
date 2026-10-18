@@ -15,9 +15,11 @@
 //! quiesce or a stand-down) a cordon, an uncordon, an activation and a confirmation are
 //! refused here, not given: [`Farm::place`] still writes the cordon row of a fenced farm and
 //! [`Farm::send_order`] still reaches the node, and the successor is the one that orders the
-//! hosts now. The check is made just before the farm is asked, for a look that was under way
-//! when the farm was fenced; the store's generation fence remains what refuses a controller
-//! whose handle was superseded.
+//! hosts now. The check is made first in an activation and a confirmation, so that a refused
+//! one draws no id from the store's counter and leaves no note in the record of sent orders,
+//! and again just before the farm is asked, for a farm fenced while the order was prepared.
+//! It is made for a look that was under way when the farm was fenced; the store's generation
+//! fence remains what refuses a controller whose handle was superseded.
 //!
 //! **A confirmation has an id of its own.** The node and its helper take an id once and drop
 //! the same id again as a replay, so a `CONFIRM` under the activation's id would never be
@@ -235,6 +237,7 @@ impl Transport for SessionTransport {
         order: OrderId,
         release: &Release,
     ) -> Result<(), TransportError> {
+        self.not_handed()?;
         self.check_epoch(order)?;
         let window = self.window_s()?;
         let baseline = self.acked_now(host);
@@ -263,6 +266,7 @@ impl Transport for SessionTransport {
         order: OrderId,
         release: &Release,
     ) -> Result<(), TransportError> {
+        self.not_handed()?;
         self.check_epoch(order)?;
         let known = lock(&self.issued)
             .sent
@@ -516,6 +520,49 @@ mod tests {
         source.look(FarmTime::from_millis(0)).expect("a look");
         assert_eq!(held(&source, &ghost), 0);
         assert_eq!(held(&source, &host), 3);
+    }
+
+    /// Catches an activation or a confirmation that, on a handed-over farm, is refused only
+    /// at the send: by then a confirmation has drawn an id from the store's counter and both
+    /// have left a note for an order that never went out. The farm is fenced before the
+    /// first confirmation of the activation (a confirmation already sent would be found in
+    /// the record and draw nothing). Mutants seen red: the check removed from the top of
+    /// `activate` (a note is left); from the top of `confirm` (a note is left and an id is
+    /// drawn; the integration test `a_handed_over_farm_cordons_nobody_and_sends_no_order`
+    /// sees the draw as a store transaction).
+    #[test]
+    fn a_handed_over_farm_records_no_order_and_draws_no_id() {
+        let farm = farm();
+        let (outbound, _inbound) =
+            mpsc::unbounded_channel::<Result<ServerMessage, tonic::Status>>();
+        let caps = NodeCaps::from_report([("arch", "arm64"), ("os", "macos")]).expect("caps");
+        farm.register(
+            &WorkerId::new("mac"),
+            kbf_sched::DaemonInstance::new("mac"),
+            kbf_sched::DaemonInstance::default(),
+            Reported::serving(Resources::new(1_000, 1 << 30), caps),
+            outbound,
+            ServerMessage::default(),
+        );
+        let rows = rows();
+        let (mut transport, source) = ports(Arc::clone(&farm), rows.clone());
+        let epoch = farm.lease_epoch();
+        let (host, release) = (WorkerId::new("mac"), Release::new(A));
+        let order = rows.mint_order(epoch).expect("an id");
+        farm.fence();
+        for answer in [
+            transport.activate(&host, order, &release),
+            transport.confirm(&host, order, &release),
+        ] {
+            let error = answer.expect_err("refused");
+            assert!(error.to_string().contains("handed over"), "{error}");
+        }
+        assert_eq!(lock(&source.issued).sent.get(&host).map(Vec::len), None);
+        assert_eq!(
+            rows.mint_order(epoch).expect("an id").seq,
+            order.seq + 1,
+            "a handed-over farm drew an id"
+        );
     }
 
     /// Catches ports that cannot drive the controller in this process (the integration

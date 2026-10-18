@@ -60,14 +60,9 @@ async fn run(farm: Arc<Farm>, store: Arc<dyn Store>, every: Duration) {
     let mut waiting = false;
     loop {
         ticker.tick().await;
-        if farm.handed() {
-            // Said once for as long as the farm stays handed over, not at every tick.
-            if !std::mem::replace(&mut waiting, true) {
-                tracing::info!("the update controller makes no look: this farm is handed over");
-            }
+        if skip_handed(farm.handed(), &mut waiting) {
             continue;
         }
-        waiting = false;
         let Some((next, tick)) = step(controller, rows.clone(), farm.wall_now()).await else {
             tracing::error!("the update controller stopped: a look panicked");
             return;
@@ -79,6 +74,20 @@ async fn run(farm: Arc<Farm>, store: Arc<dyn Store>, every: Duration) {
         }
         log(&tick, &mut failing);
     }
+}
+
+/// Whether this tick makes no look because the farm is handed over. `waiting` remembers the
+/// spell: the wait is said at its first tick and not at every one, and a tick of a farm that
+/// is not handed over ends the spell, so the next one is said again.
+fn skip_handed(handed: bool, waiting: &mut bool) -> bool {
+    if !handed {
+        *waiting = false;
+        return false;
+    }
+    if !std::mem::replace(waiting, true) {
+        tracing::info!("the update controller makes no look: this farm is handed over");
+    }
+    true
 }
 
 /// Whether a look found the controller's store handle superseded: a write (or the writer
@@ -191,6 +200,25 @@ mod tests {
             "x".to_owned()
         ))));
         assert!(!superseded(&Ok(Tick::default())));
+    }
+
+    /// Catches a spell of waiting that is never told apart from the next (a farm that is
+    /// handed over again after it was resumed would be silent: `waiting` stays set), and a
+    /// tick of a farm that is not handed over that is skipped. Whether the wait is said once
+    /// is seen in `a_handed_over_farm_makes_no_look` (tests/update_quiesced.rs). Mutant seen
+    /// red: the spell never ended (`waiting` left set by a tick of a farm that is not handed
+    /// over).
+    #[test]
+    fn a_wait_on_a_handed_over_farm_is_one_spell_until_the_farm_is_not_handed_over() {
+        let mut waiting = false;
+        assert!(!skip_handed(false, &mut waiting));
+        assert!(!waiting);
+        for _ in 0..3 {
+            assert!(skip_handed(true, &mut waiting));
+            assert!(waiting);
+        }
+        assert!(!skip_handed(false, &mut waiting));
+        assert!(!waiting, "the spell did not end");
     }
 
     /// Catches an error logged at every look while it lasts (the same text is kept once),
