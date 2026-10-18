@@ -158,5 +158,24 @@ fn a_command_line_that_names_no_single_call_exits_2() {
 fn help_names_cluster_after_the_modes() {
     let (code, out, err) = kbf(&["--help"]);
     assert_eq!(code, Some(0), "{err}");
-    assert!(out.contains("kbf cluster status|drain|undrain"), "{out}");
+    assert!(
+        out.contains("kbf cluster status|drain|undrain|member|denied|object-store"),
+        "{out}"
+    );
+}
+
+/// Catches the `kbf cluster --help` about line and the "Not a mode" hint naming fewer
+/// verbs than the command has: each verb group must be named in both.
+#[test]
+fn the_cluster_help_and_the_hint_name_every_verb_group() {
+    let (code, out, err) = kbf(&["cluster", "--help"]);
+    assert_eq!(code, Some(0), "{err}");
+    let about = out.lines().next().unwrap_or_default();
+    for word in ["member", "denied", "object store"] {
+        assert!(about.contains(word), "{word} missing from the about line: {out}");
+    }
+    let (_, top, _) = kbf(&["--help"]);
+    for word in ["member", "denied", "object-store"] {
+        assert!(top.contains(word), "{word} missing from the hint: {top}");
+    }
 }
