@@ -41,7 +41,10 @@ pub const TMPFILES_PATH: &str = "/usr/lib/tmpfiles.d/kbf-installer.conf";
 pub const STATE_DIR: &str = "/var/lib/kbf-installer";
 /// The directories `tmpfiles.d` makes, with their modes (all `root:root`). The file is
 /// the unit author's, packaged unchanged; `STATE_DIR` is made by `kbf-installer setup`.
-pub const TMPFILES_DIRS: [(&str, &str); 2] = [("/run/kbf-installer", "755"), ("/var/cache/kbf-fetch", "711")];
+pub const TMPFILES_DIRS: [(&str, &str); 2] = [
+    ("/run/kbf-installer", "755"),
+    ("/var/cache/kbf-fetch", "711"),
+];
 /// The users `sysusers.d` makes.
 pub const USERS: [&str; 4] = ["kbf", "kbf-server", "kbf-fetch", "kbf-verify"];
 /// The `User=` and `Group=` names a unit's text sets, as `("User" | "Group", name)`, in

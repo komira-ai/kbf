@@ -634,7 +634,10 @@ fn the_package_ships_exactly_the_units_directory() {
         v
     };
     let units = held("units");
-    assert!(units.iter().any(|n| n == "kbf-installer.service"), "{units:?}");
+    assert!(
+        units.iter().any(|n| n == "kbf-installer.service"),
+        "{units:?}"
+    );
     let plan = plan(&Inputs {
         binary: &root.join("units/kbf-installer.service"),
         units: &root.join("units"),
@@ -680,7 +683,10 @@ fn unit_accounts_reads_user_and_group_lines_only() {
     let text = "# User=commented\n[Service]\nUser=kbf-server\nGroup=kbf\nUser=\nExecStart=/bin/x User=no\nSupplementaryGroups=other\n";
     assert_eq!(
         unit_accounts(text),
-        [("User", "kbf-server".to_owned()), ("Group", "kbf".to_owned())]
+        [
+            ("User", "kbf-server".to_owned()),
+            ("Group", "kbf".to_owned())
+        ]
     );
 }
 
@@ -693,7 +699,11 @@ fn every_user_and_group_a_packaged_unit_names_is_made_by_sysusers() {
         let text = std::fs::read_to_string(&path).expect("unit");
         for (_, account) in unit_accounts(&text) {
             seen += 1;
-            assert!(USERS.contains(&account.as_str()), "{}: {account}", path.display());
+            assert!(
+                USERS.contains(&account.as_str()),
+                "{}: {account}",
+                path.display()
+            );
         }
     }
     assert!(seen > 0);
