@@ -12,7 +12,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::run::{Runner, Spawn};
@@ -26,28 +26,60 @@ pub trait LeaseSource {
 /// The prefix of a lease's cgroup, `kbf-lease-<term>-<seq>` (kbf-driver-container).
 pub const LEASE_PREFIX: &str = "kbf-lease-";
 
-/// Where the daemon's delegated `actions/` cgroup is, unless the host says otherwise.
-pub const DEFAULT_ACTIONS: &str = "/sys/fs/cgroup/kbf.slice/actions";
+/// The cgroup2 mount.
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
-/// Linux: a lease is live while its cgroup (`<actions>/kbf-lease-*`) is populated, that is
-/// while a process runs in it or under it (`cgroup.events` says `populated 1`; the
+/// The slice every kbf unit is in (`Slice=kbf.slice`).
+pub const SLICE: &str = "kbf.slice";
+
+/// Linux: a lease is live while its cgroup (`<unit>/actions/kbf-lease-*`) is populated,
+/// that is while a process runs in it or under it (`cgroup.events` says `populated 1`; the
 /// container's own cgroup is a child, so the lease's `cgroup.procs` would miss it). A lease
 /// cgroup outlives its action, empty, to be read for its OOM events, and is not counted.
-/// No `actions/` directory at all means no daemon ever ran an action here: none is live.
+///
+/// The daemon delegates `actions/` under its own unit's cgroup, so the path depends on
+/// the mode's unit (`kbf-daemon.service`, `kbf-storage-and-daemon.service` or
+/// `kbf-all-in-one.service`; a frontend or a storage-only node runs no builds). No
+/// `actions/` in a unit cgroup that exists means the daemon never ran an action: none is
+/// live. A unit cgroup that does not exist cannot tell: the path may be wrong, and a
+/// wrong path must not read as "idle".
 pub struct CgroupLeases {
-    pub actions: PathBuf,
+    /// The unit's cgroup directory, `<cgroup root>/kbf.slice/<unit>`.
+    pub unit: PathBuf,
+}
+
+impl CgroupLeases {
+    /// The lease source of the daemon in `unit` (a unit file name) under a cgroup2 mount
+    /// at `cgroup_root` ([`CGROUP_ROOT`] on a host).
+    pub fn of_unit(cgroup_root: &Path, unit: &str) -> CgroupLeases {
+        CgroupLeases {
+            unit: cgroup_root.join(SLICE).join(unit),
+        }
+    }
+
+    /// The daemon's delegated `actions/` cgroup.
+    pub fn actions(&self) -> PathBuf {
+        self.unit.join("actions")
+    }
 }
 
 impl LeaseSource for CgroupLeases {
     fn live(&self) -> Result<usize, String> {
-        let listed = match fs::read_dir(&self.actions) {
+        let actions = self.actions();
+        let listed = match fs::read_dir(&actions) {
             Ok(listed) => listed,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(format!("{}: {e}", self.actions.display())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return if self.unit.is_dir() {
+                    Ok(0)
+                } else {
+                    Err(format!("{}: no such cgroup", self.unit.display()))
+                };
+            }
+            Err(e) => return Err(format!("{}: {e}", actions.display())),
         };
         let mut live = 0;
         for entry in listed {
-            let entry = entry.map_err(|e| format!("{}: {e}", self.actions.display()))?;
+            let entry = entry.map_err(|e| format!("{}: {e}", actions.display()))?;
             let name = entry.file_name();
             if !name.to_string_lossy().starts_with(LEASE_PREFIX) {
                 continue;

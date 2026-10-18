@@ -24,7 +24,8 @@ fn lease(actions: &std::path::Path, name: &str, events: Option<&str>) {
 /// runs in a child counted by its own `cgroup.procs`.
 #[test]
 fn a_lease_cgroup_is_live_while_it_is_populated() {
-    let dir = scratch_dir("leases-cgroup");
+    let unit = scratch_dir("leases-cgroup");
+    let dir = unit.join("actions");
     lease(&dir, "kbf-lease-1-1", Some("populated 1\nfrozen 0\n"));
     lease(&dir, "kbf-lease-1-2", Some("populated 0\nfrozen 0\n"));
     lease(&dir, "kbf-lease-1-3", Some("populated 1\n"));
@@ -32,36 +33,76 @@ fn a_lease_cgroup_is_live_while_it_is_populated() {
     fs::write(dir.join("cgroup.procs"), "").expect("file");
     // The lease's own process list is empty: its action is in a child cgroup.
     fs::write(dir.join("kbf-lease-1-1/cgroup.procs"), "").expect("procs");
-    assert_eq!(CgroupLeases { actions: dir }.live(), Ok(2));
+    assert_eq!(CgroupLeases { unit }.live(), Ok(2));
 }
 
 /// Catches a source that cannot tell passing as "none": an unreadable `cgroup.events` of a
-/// lease and an `actions` that is not a directory are errors (fail closed); an `actions/`
-/// that does not exist is no lease, since no daemon delegated one.
+/// lease and an `actions` that is not a directory are errors (fail closed). A unit cgroup
+/// with no `actions/` is idle (the daemon delegated none), but a unit cgroup that does not
+/// exist at all is an error, since a wrong path would otherwise say "no lease is live".
 ///
 /// Mutants seen red: a missing events file counted as not populated; `NotFound` of
-/// `actions/` treated as an error.
+/// `actions/` an error even in a unit that exists; `NotFound` with no unit cgroup idle.
 #[test]
-fn a_cgroup_that_cannot_be_read_is_an_error_and_a_missing_one_is_idle() {
-    let dir = scratch_dir("leases-cgroup-bad");
-    lease(&dir, "kbf-lease-1-1", None);
-    let err = CgroupLeases {
-        actions: dir.clone(),
-    }
-    .live()
-    .expect_err("events missing");
+fn a_cgroup_that_cannot_be_read_is_an_error_and_an_unused_unit_is_idle() {
+    let unit = scratch_dir("leases-cgroup-bad");
+    lease(&unit.join("actions"), "kbf-lease-1-1", None);
+    let err = CgroupLeases { unit: unit.clone() }
+        .live()
+        .expect_err("events missing");
     assert!(err.contains("cgroup.events"), "{err}");
 
-    let file = dir.join("not-a-dir");
-    fs::write(&file, "").expect("file");
-    assert!(CgroupLeases { actions: file }.live().is_err());
+    let file_unit = unit.join("file-unit");
+    fs::create_dir_all(&file_unit).expect("unit");
+    fs::write(file_unit.join("actions"), "").expect("file");
+    assert!(CgroupLeases { unit: file_unit }.live().is_err());
 
+    let bare = unit.join("bare");
+    fs::create_dir_all(&bare).expect("unit");
+    assert_eq!(CgroupLeases { unit: bare }.live(), Ok(0));
+
+    let err = CgroupLeases {
+        unit: unit.join("absent"),
+    }
+    .live()
+    .expect_err("no such unit cgroup");
+    assert!(err.contains("no such cgroup"), "{err}");
+}
+
+/// Catches `actions/` read from the wrong place. The daemon delegates it under its own
+/// unit's cgroup (`kbf.slice/<unit>/actions`, as the node's own tests lay it out), so each
+/// mode's unit names its own, and a lease under a different unit or directly in the slice
+/// is not this daemon's.
+///
+/// Mutants seen red: the unit left out of the path (`kbf.slice/actions`, the earlier
+/// default); the slice left out.
+#[test]
+fn the_actions_cgroup_is_under_the_modes_unit_in_the_slice() {
+    let root = scratch_dir("leases-unit");
+    let busy = "populated 1\n";
+    lease(
+        &root.join("kbf.slice/kbf-daemon.service/actions"),
+        "kbf-lease-1-1",
+        Some(busy),
+    );
+    lease(
+        &root.join("kbf.slice/kbf-all-in-one.service/actions"),
+        "kbf-lease-1-1",
+        Some(busy),
+    );
+    lease(
+        &root.join("kbf.slice/kbf-all-in-one.service/actions"),
+        "kbf-lease-1-2",
+        Some(busy),
+    );
+    lease(&root.join("kbf.slice/actions"), "kbf-lease-9-9", Some(busy));
+    let live = |unit: &str| CgroupLeases::of_unit(&root, unit).live();
+    assert_eq!(live("kbf-daemon.service"), Ok(1));
+    assert_eq!(live("kbf-all-in-one.service"), Ok(2));
+    assert!(live("kbf-storage-and-daemon.service").is_err());
     assert_eq!(
-        CgroupLeases {
-            actions: dir.join("absent")
-        }
-        .live(),
-        Ok(0)
+        CgroupLeases::of_unit(Path::new(CGROUP_ROOT), "kbf-daemon.service").actions(),
+        Path::new("/sys/fs/cgroup/kbf.slice/kbf-daemon.service/actions")
     );
 }
 
