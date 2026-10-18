@@ -183,7 +183,10 @@ fn doc_routes(text: &str) -> BTreeSet<Route> {
                 .chars()
                 .take_while(|c| !c.is_whitespace() && !"`?,)\"'".contains(*c))
                 .collect();
-            out.insert((method.to_string(), normalise(path.trim_end_matches(['.', ':']))));
+            out.insert((
+                method.to_string(),
+                normalise(path.trim_end_matches(['.', ':'])),
+            ));
         }
     }
     out
@@ -249,7 +252,7 @@ fn expand_verbs(routes: Vec<Route>, verbs: &[String]) -> Vec<Route> {
 }
 
 /// The exact number of `(method, path)` routes, verbs expanded. A new route moves it.
-const ROUTES: usize = 0;
+const ROUTES: usize = 39;
 
 fn server_routes() -> Vec<Route> {
     let mut files = Vec::new();
@@ -260,7 +263,8 @@ fn server_routes() -> Vec<Route> {
         .collect();
     routes.sort();
     routes.dedup();
-    let verbs = node_verbs(&fs::read_to_string(root().join("crates/kbf-server/src/api.rs")).unwrap());
+    let verbs =
+        node_verbs(&fs::read_to_string(root().join("crates/kbf-server/src/api.rs")).unwrap());
     assert_eq!(
         verbs,
         ["cordon", "drain", "uncordon"],
@@ -333,7 +337,10 @@ fn an_undocumented_route_is_reported() {
 #[test]
 fn a_custom_verb_needs_its_own_row() {
     let verbs: Vec<String> = ["cordon", "drain"].map(String::from).into();
-    let code = expand_verbs(code_routes(r#"Router::new().route("/v1/nodes/{target}", post(act))"#), &verbs);
+    let code = expand_verbs(
+        code_routes(r#"Router::new().route("/v1/nodes/{target}", post(act))"#),
+        &verbs,
+    );
     assert_eq!(code.len(), 2);
     let doc = doc_routes("`POST /v1/nodes/{node}:cordon` and `:drain`");
     assert_eq!(

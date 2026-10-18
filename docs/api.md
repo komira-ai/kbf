@@ -1173,7 +1173,7 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   not a new run; a rollback is the older commit offered the same way and gets a higher
   generation. Generations increase, but may skip numbers: each write that loses a race has
   already drawn a counter value.
-- `POST /v1/update/pause` and `/resume` (the write gates, no body) set `paused` of the policy
+- `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
   row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
   needed, and an offer leaves the flag as it is: while set, no host is started.
 
