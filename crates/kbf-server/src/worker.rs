@@ -201,9 +201,9 @@ impl Worker for WorkerService {
     }
 }
 
-/// The version a session speaks, which `Welcome` names: the version `hello` the `Hello`
-/// names, when it lies in `oldest..=newest` (so it is also the lesser of it and
-/// `newest`). A daemon checks that `Welcome` names the version it sent, so naming
+/// The version a session speaks, which `Welcome` names: the version the `Hello` names
+/// (`hello`), when it lies in `oldest..=newest` (so it is also the lesser of `hello`
+/// and `newest`). A daemon checks that `Welcome` names the version it sent, so naming
 /// `newest` instead would end every session of an older daemon this server accepts.
 ///
 /// # Errors
