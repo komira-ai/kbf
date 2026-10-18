@@ -18,8 +18,8 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 kbf-ca.workspace = true
-# SO_PEERCRED and PR_SET_DUMPABLE (Linux), the effective user id.
-rustix = { workspace = true, features = ["net", "process"] }
+# SO_PEERCRED and PR_SET_DUMPABLE (Linux), the effective user id, flock, the clock.
+rustix = { workspace = true, features = ["fs", "net", "process", "time"] }
 thiserror.workspace = true
 x509-parser.workspace = true
 

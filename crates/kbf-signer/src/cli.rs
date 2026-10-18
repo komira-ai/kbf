@@ -5,10 +5,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use kbf_ca::Policy;
 
+use kbf_ca::{Policy, SystemEntropy};
+
+use crate::ca_dir::ensure;
 use crate::error::SignerError;
-use crate::server::{SignerServer, bind, harden};
+use crate::server::{SignerServer, bind, harden, system_now};
 
 /// `kbf-signer`'s flags. Configuration is flags: nothing is read from the environment.
 #[derive(Parser, Clone, Debug, PartialEq, Eq)]
@@ -34,6 +36,9 @@ pub struct Flags {
 fn start(flags: &Flags) -> Result<Infallible, SignerError> {
     harden()?;
     let policy = Policy::new(flags.lifetime_secs)?;
+    // The signer owns ca.key, so the signer makes the CA at first start.
+    let now = system_now();
+    ensure(&flags.ca_dir, policy, now, &mut SystemEntropy)?;
     let server = SignerServer::from_dir(&flags.ca_dir, flags.frontend_uid, policy)?;
     let listener = bind(&flags.socket)?;
     Ok(server.serve(&listener)?)

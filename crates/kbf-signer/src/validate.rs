@@ -45,6 +45,12 @@ pub enum Refusal {
     /// The validity is empty or longer than the policy.
     #[error("the validity is empty or longer than the policy allows")]
     Lifetime,
+    /// The validity starts later than the signer's clock plus the backdate allowance.
+    #[error("the validity starts later than the signer's clock allows")]
+    NotYetValid,
+    /// The validity has already ended by the signer's clock.
+    #[error("the validity has already ended")]
+    Expired,
     /// Not an end-entity certificate that says so (basicConstraints `CA:FALSE`).
     #[error("not a certificate that says CA:FALSE")]
     CaCertificate,
@@ -69,7 +75,9 @@ pub enum Refusal {
 }
 
 /// Checks that `tbs` is exactly a certificate the CA of `root_subject` (the DER Name of its
-/// root) issues on `route` under `policy`.
+/// root) issues on `route` under `policy`, at the signer's clock reading `now` (Unix
+/// seconds): it starts no later than the backdate allowance after `now`, and has not
+/// already ended.
 ///
 /// # Errors
 /// The [`Refusal`] for the first thing found wrong.
@@ -78,6 +86,7 @@ pub fn check_tbs(
     route: Route,
     policy: Policy,
     root_subject: &[u8],
+    now: i64,
 ) -> Result<(), Refusal> {
     let (rest, t) = TbsCertificate::from_der(tbs).map_err(|_| Refusal::Malformed)?;
     if !rest.is_empty() {
@@ -96,6 +105,12 @@ pub fn check_tbs(
     let span = t.validity.not_after.timestamp() - t.validity.not_before.timestamp();
     if !(1..=policy.lifetime_s() + Policy::BACKDATE_S).contains(&span) {
         return Err(Refusal::Lifetime);
+    }
+    if t.validity.not_before.timestamp() > now.saturating_add(Policy::BACKDATE_S) {
+        return Err(Refusal::NotYetValid);
+    }
+    if t.validity.not_after.timestamp() <= now {
+        return Err(Refusal::Expired);
     }
     if t.extensions().iter().any(|e| !ALLOWED.contains(&e.oid)) {
         return Err(Refusal::Extension);
