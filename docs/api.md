@@ -1081,9 +1081,8 @@ node's next push makes the call succeed.
 ## `PUT /v1/releases/{commit}/{platform}/{name}` and `GET /v1/releases`
 
 The frontend's release store (`docs/design/pull-updates.md` section 6.3): the tarballs of a
-release and their build attestations, kept as uploaded. Not served by any listener until the
-frontend mounts `kbf_server::release::router`; without a store both answer `503` naming
-`--releases-dir`.
+release and their build attestations, kept as uploaded. Mounted by `--releases-dir`; without a store both answer
+`503` naming `--releases-dir`.
 
 - `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
   `darwin-arm64`, `name` is `kbf` or `kbf-daemon` (the tarball) or either with the suffix
@@ -1098,14 +1097,43 @@ frontend mounts `kbf_server::release::router`; without a store both answer `503`
   `200` with the same answer, other bytes are `409` and change nothing.
 - `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
   "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
-  order above, a platform `complete` when both tarballs have their attestation. A component is
+  order above, a platform `complete` when it holds, with their attestations, the tarballs its
+  hosts need: `kbf` for a Linux platform, `kbf-daemon` for `darwin-arm64`. A component is
   listed when its tarball is stored.
 - `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
-  the service. `Fetch` is mounted on the worker listener behind its mutual TLS and the role
-  table (the daemon role alone may call it). `GET /v1/releases` is open to whoever reaches the
+  the service. `Fetch` is mounted on the worker listener, behind its mutual TLS and the role
+  table (the daemon role alone may call it) when TLS is configured; in plain-text worker mode
+  it is open, like every worker method. `GET /v1/releases` is open to whoever reaches the
   operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
   store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
   update endpoint answers `503`.
+
+## `GET /v1/update` and `POST /v1/update/{desired,pause,resume}`
+
+The desired release (`docs/design/pull-updates.md` section 6.3), kept in the `update/desired`
+row of the state store. Without `--state-store` every answer is `503` naming it; without
+`--releases-dir`, `GET /v1/update` and `POST /v1/update/desired` are `503` naming that flag
+(`pause` and `resume` need only the state store). A write that other writers kept racing
+for the whole of its retries is `503` with `Retry-After: 1`: send it again.
+
+- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
+  "paused": bool, "policy": null | {...}, "releases": <the body of GET /v1/releases>}`. `policy`
+  is the `update/policy` row when the operator wrote one (`paused`, `auto_nodes`,
+  `auto_frontend`, `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`,
+  `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without
+  a row).
+- `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
+  `"expect_generation": N` (JSON content type, the write gates) offers the commit. With
+  `expect_generation` it is a compare-and-set: it writes only if the desired release is at
+  generation N (0 before any offer), else `409` naming both and nothing is written. `409` unless the release store holds some platform of it complete
+  (see above); `400` for a body that is not exactly that. The answer is the desired release.
+  The generation moves only when the commit differs from the desired one, so a repeated click is
+  not a new run; a rollback is the older commit offered the same way and gets a higher
+  generation. Generations increase, but may skip numbers: each write that loses a race has
+  already drawn a counter value.
+- `POST /v1/update/pause` and `/resume` (the write gates, no body) set `paused` of the policy
+  row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
+  needed, and an offer leaves the flag as it is: while set, no host is started.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 
