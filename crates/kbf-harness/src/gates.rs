@@ -5,7 +5,9 @@
 //! The rule that runs through all of them is fail closed: a metric that is not there is
 //! not zero. A series absent from the first scrape, or from any later one, fails its
 //! gate, so a metric the frontend stops exporting cannot turn a gate green, and a run
-//! with no builds, or too few scrapes to take a difference, passes nothing.
+//! with no builds, or too few scrapes to take a difference, passes nothing. A value that is
+//! not a finite number (`NaN`, an infinity) fails its gate too, and a counter that falls
+//! between two scrapes was reset (a restart), which no delta of its ends can show.
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -93,14 +95,41 @@ fn series(scrapes: &Scrapes, name: &str) -> Result<Vec<f64>, String> {
         .iter()
         .enumerate()
         .map(|(i, s): (usize, &Sample)| {
-            s.value(name).ok_or_else(|| {
+            let value = s.value(name).ok_or_else(|| {
                 format!(
                     "{name} is absent from scrape {i} of {}",
                     scrapes.samples.len()
                 )
-            })
+            })?;
+            if value.is_finite() {
+                Ok(value)
+            } else {
+                Err(format!(
+                    "{name} is {value} in scrape {i}: not a finite number"
+                ))
+            }
         })
         .collect()
+}
+
+/// How much a counter grew over the scrapes `v` (at least two): the last less the first, and
+/// an error if it fell between any two, which is a reset: the counter's process restarted,
+/// and the difference of the ends is no longer the number of events.
+fn counter_delta(v: &[f64]) -> Result<f64, String> {
+    if let Some(i) = (1..v.len()).find(|i| v[*i] < v[*i - 1]) {
+        return Err(format!(
+            "went down from {} to {} between scrapes {} and {i}: reset",
+            v[i - 1],
+            v[i],
+            i - 1
+        ));
+    }
+    Ok(v[v.len() - 1] - v[0])
+}
+
+/// The largest value of the scrapes `v`.
+fn gauge_max(v: &[f64]) -> Result<f64, String> {
+    Ok(v.iter().copied().fold(f64::MIN, f64::max))
 }
 
 impl Evidence<'_> {
@@ -134,19 +163,16 @@ impl Evidence<'_> {
         name: &str,
         metric: &str,
         threshold: &str,
-        reduce: impl Fn(&[f64]) -> f64,
+        reduce: impl Fn(&[f64]) -> Result<f64, String>,
     ) -> Gate {
-        match series(self.scrapes, metric) {
-            Ok(values) => {
-                let measured = reduce(&values);
-                self.row(
-                    name,
-                    json!(measured),
-                    threshold,
-                    measured == 0.0,
-                    Some(format!("{metric} over {} scrapes", values.len())),
-                )
-            }
+        match series(self.scrapes, metric).and_then(|values| Ok((reduce(&values)?, values.len()))) {
+            Ok((measured, scrapes)) => self.row(
+                name,
+                json!(measured),
+                threshold,
+                measured == 0.0,
+                Some(format!("{metric} over {scrapes} scrapes")),
+            ),
             Err(why) => self.row(name, Value::Null, threshold, false, Some(why)),
         }
     }
@@ -159,12 +185,15 @@ impl Evidence<'_> {
         name: &str,
         metric: &str,
         threshold: &str,
-        reduce: impl Fn(&[f64]) -> f64,
+        reduce: impl Fn(&[f64]) -> Result<f64, String>,
     ) -> Gate {
-        let reads: Vec<(&str, Result<Vec<f64>, String>)> = self
+        let reads: Vec<(&str, Result<f64, String>)> = self
             .nodes
             .iter()
-            .map(|(node, scrapes)| (node.as_str(), series(scrapes, metric)))
+            .map(|(node, scrapes)| {
+                let read = series(scrapes, metric).and_then(|values| reduce(&values));
+                (node.as_str(), read)
+            })
             .collect();
         let why: Vec<String> = reads
             .iter()
@@ -181,7 +210,6 @@ impl Evidence<'_> {
         let measured: f64 = reads
             .iter()
             .filter_map(|(_, read)| read.as_ref().ok())
-            .map(|values| reduce(values))
             .sum();
         self.row(
             name,
@@ -251,20 +279,18 @@ impl Evidence<'_> {
                     format!("event logs unreadable (each counts as a failure): {unreadable:?}")
                 }),
             ),
-            self.series_gate("execute_errors", EXECUTE_ERRORS, "delta 0", |v| {
-                v[v.len() - 1] - v[0]
-            }),
+            self.series_gate("execute_errors", EXECUTE_ERRORS, "delta 0", counter_delta),
             self.nodes_gate(
                 "lost_blobs_gauge",
                 LOST_BLOBS,
                 "max 0 in every scrape of every storage node",
-                |v| v.iter().copied().fold(f64::MIN, f64::max),
+                gauge_max,
             ),
             self.nodes_gate(
                 "blob_losses",
                 BLOB_LOSSES,
                 "delta 0 on every storage node",
-                |v| v[v.len() - 1] - v[0],
+                counter_delta,
             ),
             self.row(
                 "scrape_coverage",
