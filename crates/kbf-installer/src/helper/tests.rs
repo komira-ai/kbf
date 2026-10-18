@@ -18,10 +18,13 @@ use crate::state::{Locked, State};
 use crate::testkit::{A, B, C, c};
 
 use crate::helper::cycle::{Config, Helper};
-use crate::helper::fetcher::FetchError;
 use crate::helper::fetcher::fake::FakeFetcher;
+use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, NotWired, ReleaseLocator};
 use crate::helper::leases::fake::FakeLeases;
+use crate::helper::memory::{Event, Memory};
+use crate::helper::order::{Order, Verb as OrderVerb};
 use crate::helper::restart::Restart;
+use crate::spool::Entry;
 
 const UNIT: &str = "kbf.service";
 const T0: u64 = 1_800_000_000;
@@ -1109,4 +1112,150 @@ fn node_and_frontend_orders_have_separate_floors() {
         "the node order is above the node floor"
     );
     assert_eq!(rig.status()["acked_order_id"], 3);
+}
+
+/// Catches a spool that cannot be listed being read as an empty one (orders silently never
+/// acted on), and a crowded spool going unsaid: a directory descriptor that cannot be read
+/// is a refusal with the entry's name and the stable code, and a spool of more than 256
+/// entries says so (the first 256 are looked at, the rest are not).
+///
+/// Mutants planted: the listing error ignored (no refusal is recorded); the `crowded` flag
+/// dropped (the spool of 257 junk files says nothing).
+#[test]
+fn a_spool_that_cannot_be_listed_is_refused_and_a_crowded_one_is_said() {
+    let mut rig = Rig::new("scan");
+    let file = rig.root.join("not-a-dir");
+    fs::write(&file, b"x").expect("file");
+    let mut memory = Memory::default();
+    rig.helper
+        .orders_in(&Entry::over_file(&file), T0, &mut memory)
+        .expect("a pass");
+    assert_eq!(memory.event, Event::Refused);
+    assert!(
+        memory.refusal.contains("not-a-directory"),
+        "{}",
+        memory.refusal
+    );
+    for n in 0..257 {
+        fs::write(rig.orders().join(format!("junk-{n}")), b"").expect("junk");
+    }
+    rig.cycle(T0);
+    assert!(
+        rig.refusal().contains("more than 256 entries"),
+        "{}",
+        rig.refusal()
+    );
+}
+
+fn plain_order(verb: OrderVerb) -> Order {
+    Order {
+        id: 1,
+        epoch: 1,
+        generation: 1,
+        verb,
+        commit: c(B),
+        window_s: 600,
+        claims: None,
+    }
+}
+
+/// Catches the two defences that the parse already makes being relied on alone: an activation
+/// with no release claims is refused by the vetting itself (fail closed), and a
+/// `frontend_update` that reached the act step is refused, not carried out as a node verb.
+///
+/// Mutants planted: the claims check removed (the vetting panics or passes); the frontend arm
+/// of `act` made a revert (the links move).
+#[test]
+fn vetting_and_acting_refuse_what_parsing_already_refuses() {
+    let mut rig = Rig::new("defence");
+    let mut memory = Memory::default();
+    let before = rig.state();
+    let why = rig
+        .helper
+        .prepare(&plain_order(OrderVerb::Activate), &before, &mut memory)
+        .unwrap_err();
+    assert!(why.contains("no release claims"), "{why}");
+    rig.helper
+        .act(&plain_order(OrderVerb::FrontendUpdate), T0, &mut memory)
+        .expect("refused, not failed");
+    assert_eq!(memory.event, Event::Refused);
+    assert!(
+        memory
+            .refusal
+            .contains("frontend_update is not implemented"),
+        "{}",
+        memory.refusal
+    );
+    assert_eq!(rig.current(), Some(c(A)));
+}
+
+/// Catches an activation naming a component set the platform does not take: a Linux host takes
+/// exactly `kbf`; a second component is refused before the fetch, with both names in the
+/// reason.
+///
+/// Mutant planted: the set compared as a prefix (an extra component passes).
+#[test]
+fn an_activation_with_other_components_than_the_platform_takes_is_refused() {
+    let mut rig = Rig::new("components");
+    let mut r = rig.rec(1, 1, 1, Verb::Activate, B);
+    let mut extra = r.components[0].clone();
+    extra.name = "kbf-daemon".to_owned();
+    r.components.push(extra);
+    rig.put(&r);
+    rig.cycle(T0);
+    assert_eq!(rig.fetcher.count(), 0);
+    assert!(
+        rig.refusal().contains("names components"),
+        "{}",
+        rig.refusal()
+    );
+}
+
+/// A fetcher that reports a good release and installs nothing, as one whose directory was
+/// removed between the fetch and the swap.
+struct Hollow;
+
+impl Fetcher for Hollow {
+    fn fetch(&self, rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError> {
+        Ok(crate::helper::fetcher::fake::honest(rec))
+    }
+}
+
+/// Catches an activation that fails at the swap (the release is not on the host after all)
+/// being reported as done: the order is refused with the installer's reason, the links stay
+/// where they were, and no restart is owed. Also the fetcher of a build that has none refuses
+/// every fetch.
+///
+/// Mutants planted: the swap error turned into `Ok(Done::quiet(..))` (the order is
+/// acknowledged without a swap); `NotWired` returning an empty release.
+#[test]
+fn a_swap_that_fails_is_refused_and_moves_nothing() {
+    let mut rig = Rig::new("hollow");
+    rig.helper.set_fetcher(Box::new(Hollow));
+    rig.order(1, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.status()["state"], "refused");
+    assert_eq!(rig.current(), Some(c(A)));
+    assert_eq!(rig.restarts(), 0);
+    let loc = ReleaseLocator {
+        commit: c(B),
+        components: Vec::new(),
+    };
+    assert!(matches!(NotWired.fetch(&loc), Err(FetchError::NotWired)));
+}
+
+/// Catches an activation that goes on to fetch while the node cannot be told a fetch is under
+/// way (status.json cannot be written): the order is refused before the fetch, nothing moves,
+/// and the pass reports the failure to write instead of ending as if it had reported.
+///
+/// Mutant planted: the report error ignored in the vetting (the fetch happens anyway).
+#[test]
+fn an_activation_stops_before_the_fetch_when_status_cannot_be_written() {
+    let mut rig = Rig::new("status-unwritable");
+    fs::remove_file(rig.root.join(UPDATE).join("status.json")).expect("status.json");
+    fs::create_dir(rig.root.join(UPDATE).join("status.json")).expect("a directory in its place");
+    rig.order(1, Verb::Activate, B);
+    assert!(rig.helper.cycle(T0).is_err());
+    assert_eq!(rig.fetcher.count(), 0);
+    assert_eq!(rig.current(), Some(c(A)));
 }

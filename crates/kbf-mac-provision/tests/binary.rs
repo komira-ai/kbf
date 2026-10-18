@@ -68,7 +68,7 @@ fn a_refused_profile_exits_2_and_says_why() {
         assert_eq!(o.status.code(), Some(2), "{verb}");
         assert_eq!(
             stderr(&o),
-            "kbf-mac-provision: profile line 42: unknown key: sleep\n"
+            "kbf-mac-provision: profile line 43: unknown key: sleep\n"
         );
         assert!(o.stdout.is_empty());
     }
@@ -139,7 +139,7 @@ fn check_on_an_empty_root_fails_and_exits_1() {
         "{out}"
     );
     assert!(out.ends_with(" fail\n"), "{out}");
-    assert_eq!(out.lines().count(), 31, "{out}");
+    assert_eq!(out.lines().count(), 32, "{out}");
 }
 
 /// Catches: `check` exiting 1 when every item it checks passes.

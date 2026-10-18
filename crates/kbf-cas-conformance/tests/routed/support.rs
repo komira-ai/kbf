@@ -295,6 +295,7 @@ pub fn plane(fake: &Arc<Fake>, config: &TransferConfig) -> Arc<RoutedCas> {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let map = Map::new(1, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("a map");
     let view = MapView {

@@ -51,11 +51,17 @@ async fn a_refused_offer_is_reported_and_a_good_one_clears_it() {
     let rig = Rig::new("refused");
     let mut bad = offer_of(1);
     bad.platform = "darwin-arm64".into();
-    rig.handle.offer(bad);
+    rig.handle.offer(bad.clone());
     let status = rig.rx.borrow().clone();
     assert_eq!(status.state, State::Refused);
     assert!(status.refusal.contains("platform"), "{}", status.refusal);
     assert_eq!(status.offered_generation, 1);
+    rig.handle.offer(bad);
+    assert_eq!(
+        rig.rx.borrow().clone(),
+        status,
+        "the same refused offer again changes nothing"
+    );
     assert_eq!(
         why_of(&rig.ask(1, Verb::Activate, &commit(1))),
         no_offer(&commit(1))
@@ -252,4 +258,22 @@ async fn the_spool_is_orders_under_the_directory_and_private() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o700);
+}
+
+/// Catches an offer lost, or the client stopped, because the generation floor cannot be
+/// written: the offer is remembered in memory and reported, the failure is only logged.
+///
+/// An order cannot be recorded either, and is refused, not written.
+///
+/// Mutant planted: the save error propagated as a panic (the worker dies and the status
+/// stops following the offer).
+#[tokio::test]
+async fn an_offer_is_kept_when_the_generation_floor_cannot_be_written() {
+    let rig = Rig::new("floor-unwritable");
+    fs::create_dir(rig.spool().join("client.json.tmp"))
+        .expect("a directory where the temporary file goes");
+    rig.offer(2);
+    assert_eq!(rig.rx.borrow().offered_generation, 2);
+    let why = why_of(&rig.ask(1, Verb::Activate, &commit(2)));
+    assert!(why.contains("cannot record order 1"), "{why}");
 }

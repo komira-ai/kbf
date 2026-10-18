@@ -39,8 +39,11 @@ const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// (`xcrun_db-<..>`, which `xcrun` uses for a file): only the name is open, not
 /// what is under it. `{USWBX}` and `{USWB0}` are files in the temporary folder next to
 /// Swift Build's `swbuild.tmp.<random>`: `swbuildXtmpX<..>` (a rule whose dots match
-/// any character takes it) and `swbuild.tmp.` with nothing after it.
-const OUTSIDE: [(&str, &str); 17] = [
+/// any character takes it) and `swbuild.tmp.` with nothing after it. `{UMODX}` and
+/// `{UCLANG}` are files in the cache folder's `clang` folder next to `ModuleCache`
+/// (the one place below it the rules open): `ModuleCacheX<..>` (a rule that leaves the
+/// slash off takes it) and a name of its own.
+const OUTSIDE: [(&str, &str); 19] = [
     ("create", "echo x > {OUT}/new"),
     ("append", "echo x >> {OUT}/victim"),
     ("unlink", "rm -f {OUT}/victim"),
@@ -61,6 +64,14 @@ const OUTSIDE: [(&str, &str); 17] = [
     ),
     ("user-temp-swbuild-dots", "echo x > {USWBX}"),
     ("user-temp-swbuild-bare", "echo x > {USWB0}"),
+    (
+        "user-cache-modules-sibling",
+        "mkdir -p \"$(dirname {UMODX})\" && echo x > {UMODX}",
+    ),
+    (
+        "user-cache-clang",
+        "mkdir -p \"$(dirname {UCLANG})\" && echo x > {UCLANG}",
+    ),
 ];
 
 /// Where the rows of [`OUTSIDE`] aim.
@@ -70,8 +81,8 @@ struct Targets {
     tmp: PathBuf,
     domain: String,
     /// The files in the user folders, in the order `{UTEMP}`, `{UCACHE}`, `{UDIR}`,
-    /// `{UXCRUN}`, `{USWBX}`, `{USWB0}`.
-    user: [PathBuf; 6],
+    /// `{UXCRUN}`, `{USWBX}`, `{USWB0}`, `{UMODX}`, `{UCLANG}`.
+    user: [PathBuf; 8],
 }
 
 impl Targets {
@@ -82,13 +93,16 @@ impl Targets {
         forget(domain);
         let name = format!("kbf-sandbox-test-{}", std::process::id());
         let temp = user_folder("DARWIN_USER_TEMP_DIR");
+        let cache = user_folder("DARWIN_USER_CACHE_DIR");
         let user = [
             temp.join(&name),
-            user_folder("DARWIN_USER_CACHE_DIR").join(&name),
+            cache.join(&name),
             user_folder("DARWIN_USER_DIR").join(&name),
             temp.join(format!("xcrun_db-{name}")).join("f"),
             temp.join(format!("swbuildXtmpX{name}")),
             temp.join("swbuild.tmp."),
+            cache.join(format!("clang/ModuleCacheX{name}")),
+            cache.join(format!("clang/{name}")),
         ];
         let targets = Self {
             out: victim_in(&dir.join("outside")),
@@ -151,7 +165,9 @@ fn attempts(ways: &[(&str, &str)], to: &Targets) -> String {
                 .replace("{UDIR}", &to.user[2].to_string_lossy())
                 .replace("{UXCRUN}", &to.user[3].to_string_lossy())
                 .replace("{USWBX}", &to.user[4].to_string_lossy())
-                .replace("{USWB0}", &to.user[5].to_string_lossy());
+                .replace("{USWB0}", &to.user[5].to_string_lossy())
+                .replace("{UMODX}", &to.user[6].to_string_lossy())
+                .replace("{UCLANG}", &to.user[7].to_string_lossy());
             format!("{command} 2>/dev/null; echo {name}=$?; ")
         })
         .collect()
@@ -313,7 +329,7 @@ async fn an_action_writes_inside_its_lease() {
         lease: PathBuf::from("/unused"),
         tmp: PathBuf::from("/unused"),
         domain: String::new(),
-        user: [(); 6].map(|()| PathBuf::from("/unused")),
+        user: [(); 8].map(|()| PathBuf::from("/unused")),
     };
     let script = attempts(&ways, &unused);
     for (seq, network) in [(1, "off"), (2, "on")] {
@@ -418,4 +434,46 @@ async fn the_xcode_an_action_names_is_the_one_it_runs() {
         assert_eq!(lines.next(), Some(developer_dir.to_string_lossy().as_ref()));
         assert_eq!(xcode::build_of(&out), Some(build.as_str()), "{out}");
     }
+}
+
+/// Catches a refusal the operator cannot see: an action that writes outside its lease
+/// and fails sees only `EPERM`, which reads like any permission error (issue #184).
+/// The failed action's stderr must end with the sandbox's own report of the refusal,
+/// from the unified log: the operation and the path. Control: the same action without a
+/// sandbox writes the file and gets no note, so the note is the sandbox's and not
+/// the driver's habit.
+#[tokio::test]
+async fn a_denied_write_is_named_in_the_failed_actions_stderr() {
+    let dir = scratch("denials");
+    let cas = Arc::new(MemoryCas::default());
+    let sandboxed = config(&dir);
+    let mut open = config(&dir.join("unsandboxed"));
+    open.isolation = Isolation::None;
+    let (sandboxed, open) = (runtime(sandboxed, &cas), runtime(open, &cas));
+    let name = format!("denied-{}", std::process::id());
+    let target = dir.join(&name);
+    let script = format!("echo x > {} ; exit 1", target.display());
+
+    let spec = Spec::sh(&script).env("PATH", PATH);
+    let result = run(&sandboxed, &cas, 1, &spec).await.expect("ran");
+    let text = stderr(&cas, &result);
+    assert_eq!(result.exit_code, 1, "{text}");
+    assert!(!target.exists(), "the sandbox let the write through");
+    assert!(
+        text.contains("kbf: the macOS sandbox denied this action"),
+        "no denial in stderr: {text}\n{}",
+        support::sandbox_denials()
+    );
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("kbf:   ") && l.contains(&name))
+        .unwrap_or_else(|| panic!("no denial names {name}: {text}"));
+    assert!(line.contains("file-write-create"), "{line}");
+
+    let result = run(&open, &cas, 2, &spec).await.expect("ran");
+    let text = stderr(&cas, &result);
+    assert_eq!(result.exit_code, 1, "{text}");
+    assert!(target.exists(), "control: the unsandboxed write failed");
+    assert!(!text.contains("kbf:"), "control: {text}");
+    let _ = std::fs::remove_file(&target);
 }

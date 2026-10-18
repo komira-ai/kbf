@@ -15,6 +15,7 @@ use kbf_proto::kbf::map::v1 as pb;
 use kbf_server::members::{
     Members, MembershipConfig, MembershipError, PROTOCOL, Progress, Registrant, Registration,
 };
+use kbf_server::storage_health::Debts;
 use kbf_state::{Cond, Store, Txn};
 use kbf_types::{Digest, DigestFunction};
 use prost::Message as _;
@@ -43,7 +44,7 @@ fn other_frontend(store: &Arc<Hooked>, config: MembershipConfig) -> Members {
 fn node(i: u32) -> Registrant {
     Registrant {
         instance_id: format!("node-{i}"),
-        addr: format!("10.0.0.{i}:8982"),
+        addr: format!("192.0.2.{i}:8982"),
         zone: String::new(),
         weight: 1,
         protocol: PROTOCOL,
@@ -130,7 +131,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
     let g = map.generation();
 
     s.clock.advance(20 * SECOND);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
         .expect("a beats");
     s.clock.advance(9 * SECOND);
     let early = m.refresh().expect("refresh").expect("a map");
@@ -142,7 +143,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
     assert_eq!(early.generation(), g, "nothing changed, nothing bumped");
 
     s.clock.advance(3 * SECOND);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
         .expect("a beats");
     let down = m.refresh().expect("refresh").expect("a map");
     assert_eq!(state(&down, b.id), Some(MemberState::Down));
@@ -151,7 +152,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
 
     for _ in 0..10 {
         s.clock.advance(10 * SECOND);
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
             .expect("a beats");
     }
     let within = m.refresh().expect("refresh").expect("a map");
@@ -164,7 +165,7 @@ fn a_member_goes_down_after_the_ttl_and_leaves_after_the_dwell() {
 
     for _ in 0..3 {
         s.clock.advance(10 * SECOND);
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
             .expect("a beats");
     }
     let gone = m.refresh().expect("refresh").expect("a map");
@@ -186,9 +187,9 @@ fn heartbeats_keep_a_member_alive_and_set_state_does_not() {
     let g = m.current_map().expect("read").expect("map").generation();
     for round in 1..=6 {
         s.clock.advance(20 * SECOND);
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
             .expect("a beats");
-        m.heartbeat(b.id, b.boot, Progress::CaughtUp)
+        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
             .expect("b beats");
         let map = m.refresh().expect("refresh").expect("map");
         assert_eq!(
@@ -258,7 +259,7 @@ fn a_racing_refresh_gives_one_winner_and_one_retry() {
     m.set_state(a.id, MemberState::Active).expect("a");
     m.set_state(d.id, MemberState::Active).expect("d");
     s.clock.advance(40 * SECOND);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp)
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
         .expect("a beats");
     s.clock.advance(25 * SECOND);
     let down = m.refresh().expect("refresh").expect("map");
@@ -289,9 +290,10 @@ fn a_racing_refresh_gives_one_winner_and_one_retry() {
 
 /// Catches: a refresh that decides on a row it no longer holds: member a's row has
 /// expired, so this frontend plans to mark it Down; before it commits, a registers again
-/// (its own refresh finds the map already says Active and bumps nothing). The map's
-/// version has not moved, so only the check on a's row stops this frontend from marking a
-/// Down beside its live row. The commit conflicts and the retry sees the row.
+/// (its own refresh finds the map already says Active, and bumps the generation once for
+/// the new boot). This frontend's commit is against the map it read, so it conflicts on the
+/// map's version; the check on a's row is what stops the retry's plan from marking a Down
+/// beside its live row. The retry sees the row and changes nothing.
 #[test]
 fn a_refresh_does_not_down_a_member_that_registered_meanwhile() {
     let s = Hooked::new();
@@ -308,7 +310,7 @@ fn a_refresh_does_not_down_a_member_that_registered_meanwhile() {
     let map = m.refresh().expect("refresh").expect("map");
 
     assert_eq!(state(&map, a.id), Some(MemberState::Active));
-    assert_eq!(map.generation(), 1);
+    assert_eq!(map.generation(), 2, "the rival's new boot, once");
     assert_eq!(s.fake.get("down/1").expect("read"), None);
     assert_eq!(*s.map_writes.lock().expect("lock"), vec![true]);
 }
@@ -334,7 +336,8 @@ fn removing_a_member_remaps_only_its_blobs() {
         for _ in 0..secs / 10 {
             s.clock.advance(10 * SECOND);
             for r in survivors {
-                m.heartbeat(r.id, r.boot, Progress::CaughtUp).expect("beat");
+                m.heartbeat(r.id, r.boot, Progress::CaughtUp, Debts::Unknown, None)
+                    .expect("beat");
             }
         }
     };
@@ -440,7 +443,11 @@ fn a_report_cannot_change_a_member_that_is_not_catching_up() {
         (&active, Progress::CaughtUp),
         (&active, Progress::CatchingUp),
     ] {
-        assert_eq!(m.heartbeat(who.id, who.boot, progress).expect("beat"), g);
+        assert_eq!(
+            m.heartbeat(who.id, who.boot, progress, Debts::Unknown, None)
+                .expect("beat"),
+            g
+        );
     }
     let map = m.current_map().expect("read").expect("map");
     assert_eq!(state(&map, draining.id), Some(MemberState::Draining));
@@ -449,14 +456,14 @@ fn a_report_cannot_change_a_member_that_is_not_catching_up() {
 
     s.clock.advance(20 * SECOND);
     for who in [&draining, &joining, &active] {
-        m.heartbeat(who.id, who.boot, Progress::CatchingUp)
+        m.heartbeat(who.id, who.boot, Progress::CatchingUp, Debts::Unknown, None)
             .expect("beat");
     }
     s.clock.advance(11 * SECOND);
     let map = m.refresh().expect("refresh").expect("map");
     assert_eq!(state(&map, down.id), Some(MemberState::Down));
     assert!(matches!(
-        m.heartbeat(down.id, down.boot, Progress::CaughtUp),
+        m.heartbeat(down.id, down.boot, Progress::CaughtUp, Debts::Unknown, None),
         Err(MembershipError::NotRegistered(id)) if id == down.id
     ));
     let after = m.current_map().expect("read").expect("map");
@@ -479,23 +486,26 @@ fn a_report_of_done_promotes_only_a_catching_up_member() {
     assert_eq!(state(&map, a.id), Some(MemberState::CatchingUp));
     let g = map.generation();
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CatchingUp)
+        m.heartbeat(a.id, a.boot, Progress::CatchingUp, Debts::Unknown, None)
             .expect("beat"),
         g
     );
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp).expect("beat"),
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+            .expect("beat"),
         g + 1
     );
     assert_eq!(
-        m.heartbeat(b.id, b.boot, Progress::CaughtUp).expect("beat"),
+        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+            .expect("beat"),
         g + 1
     );
     let map = m.current_map().expect("read").expect("map");
     assert_eq!(state(&map, a.id), Some(MemberState::Active));
     assert_eq!(state(&map, b.id), Some(MemberState::Draining));
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp).expect("beat"),
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+            .expect("beat"),
         g + 1,
         "a second report changes nothing"
     );
@@ -530,16 +540,19 @@ fn bad_calls_are_refused_by_name() {
     let a = m.register(&node(1)).expect("a");
     let b = m.register(&node(1)).expect("a again");
     assert!(matches!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp),
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None),
         Err(MembershipError::Superseded {
             boot: 1,
             current: 2,
             ..
         })
     ));
-    assert!(m.heartbeat(b.id, b.boot, Progress::CaughtUp).is_ok());
+    assert!(
+        m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+            .is_ok()
+    );
     assert!(matches!(
-        m.heartbeat(MemberId(99), 1, Progress::CaughtUp),
+        m.heartbeat(MemberId(99), 1, Progress::CaughtUp, Debts::Unknown, None),
         Err(MembershipError::NotRegistered(MemberId(99)))
     ));
     assert!(matches!(
@@ -583,7 +596,8 @@ fn the_map_clamps_replication_and_reports_its_generation() {
     let b = m.register(&node(2)).expect("b");
     assert_eq!(b.map.r(), 2);
     assert_eq!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp).expect("beat"),
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+            .expect("beat"),
         b.map.generation()
     );
     assert_eq!(m.config().beat(), 10 * SECOND);
@@ -665,7 +679,7 @@ fn writers_that_keep_losing_give_up_and_store_failures_surface() {
     }
     s.conflict_on(Some("member/"));
     assert!(matches!(
-        m.heartbeat(a.id, a.boot, Progress::CaughtUp),
+        m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None),
         Err(MembershipError::Contended)
     ));
     s.conflict_on(None);
@@ -810,10 +824,15 @@ fn a_restarted_active_member_is_active_again() {
     let quick = m.register(&node(1)).expect("quick restart");
     assert_eq!((quick.id, quick.boot), (a.id, a.boot + 1));
     assert_eq!(state(&quick.map, a.id), Some(MemberState::Active));
-    assert_eq!(quick.map.generation(), g, "nothing changed in the map");
+    assert_eq!(
+        quick.map.generation(),
+        g + 1,
+        "the new boot is a change (see the boot tests below)"
+    );
 
     s.clock.advance(20 * SECOND);
-    m.heartbeat(b.id, b.boot, Progress::CaughtUp).expect("b");
+    m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+        .expect("b");
     s.clock.advance(11 * SECOND);
     let down = m.refresh().expect("refresh").expect("map");
     assert_eq!(state(&down, a.id), Some(MemberState::Down));
@@ -821,6 +840,118 @@ fn a_restarted_active_member_is_active_again() {
     assert_eq!((back.id, back.boot), (a.id, quick.boot + 1));
     assert_eq!(state(&back.map, a.id), Some(MemberState::Active));
     assert_eq!(back.map.generation(), down.generation() + 1);
+}
+
+fn boot_of(map: &Map, id: MemberId) -> Option<u64> {
+    map.member(id).map(|m| m.boot)
+}
+
+/// Catches: a storage node that restarts inside its lease (same instance, a larger boot
+/// counter, its row never lapsed) leaving the map's generation where it was. Anything a
+/// reader cached against the generation (a "this blob is present" answer from the node)
+/// would then outlive a restart that lost the node's RAM-only data. The restarted member
+/// must change the published generation, by one, and the map must carry the boot it
+/// registered with; a second restart does the same again, and the other member's entry
+/// keeps its own boot. Mutant seen red: `register` leaves `Member::boot` at 0, so the
+/// restart changes nothing the map holds and the generation stays.
+#[test]
+fn a_member_restarted_within_its_lease_bumps_the_generation_and_carries_its_new_boot() {
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
+    let a = m.register(&node(1)).expect("a");
+    let b = m.register(&node(2)).expect("b");
+    assert_eq!(
+        boot_of(&b.map, a.id),
+        Some(a.boot),
+        "first boot is published"
+    );
+    assert_eq!(boot_of(&b.map, b.id), Some(b.boot));
+    let g = b.map.generation();
+
+    s.clock.advance(5 * SECOND);
+    let quick = m.register(&node(1)).expect("restart inside the lease");
+    assert_eq!(quick.boot, a.boot + 1);
+    assert_eq!(state(&quick.map, a.id), Some(MemberState::Active));
+    assert_eq!(
+        quick.map.generation(),
+        g + 1,
+        "a new boot moves the generation"
+    );
+    assert_eq!(boot_of(&quick.map, a.id), Some(quick.boot));
+    assert_eq!(boot_of(&quick.map, b.id), Some(b.boot), "b did not restart");
+    assert_eq!(
+        m.current_map().expect("read"),
+        Some(quick.map.clone()),
+        "the stored map is the one returned"
+    );
+
+    // Through another frontend, which holds no state of its own, and a second restart.
+    let again = other_frontend(&s, config(30, 120))
+        .register(&node(1))
+        .expect("second restart");
+    assert_eq!(again.map.generation(), g + 2);
+    assert_eq!(boot_of(&again.map, a.id), Some(a.boot + 2));
+}
+
+/// Catches: churn. A generation bump makes every reader of the map drop what it cached
+/// against it, so a bump that is not caused by a new boot (every heartbeat, a refresh, an
+/// administrator setting the state a member already has, a second frontend's refresh)
+/// would empty those caches for nothing. Ten rounds of heartbeats of the same boot, with
+/// refreshes through two frontends and a no-op `set_state`, leave the generation and the
+/// published boots as they were. Mutant seen red: `touch` bumping the boot (or the
+/// generation) on a beat.
+#[test]
+fn heartbeats_of_the_same_boot_do_not_bump_the_generation() {
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
+    let other = other_frontend(&s, config(30, 120));
+    m.register(&node(1)).expect("a");
+    let b = m.register(&node(2)).expect("b");
+    let restarted = m.register(&node(1)).expect("a restarts");
+    let g = restarted.map.generation();
+    for round in 0..10 {
+        s.clock.advance(10 * SECOND);
+        for r in [&restarted, &b] {
+            m.heartbeat(r.id, r.boot, Progress::CaughtUp, Debts::Unknown, None)
+                .expect("beat");
+        }
+        for frontend in [&m, &other] {
+            let map = frontend.refresh().expect("refresh").expect("map");
+            assert_eq!(map.generation(), g, "round {round}");
+            assert_eq!(boot_of(&map, restarted.id), Some(restarted.boot));
+            assert_eq!(boot_of(&map, b.id), Some(b.boot));
+        }
+    }
+    let map = m
+        .set_state(b.id, MemberState::Active)
+        .expect("the state b has");
+    assert_eq!(
+        map.generation(),
+        g,
+        "setting the state it has changes nothing"
+    );
+}
+
+/// Catches: a member whose boot is lost when it goes Down and comes back, or a Down entry
+/// that keeps a stale boot after the node registered again: the lapsed member stays in
+/// the map as Down with the boot it had (nothing newer exists yet), and its return
+/// publishes the new one.
+#[test]
+fn a_down_member_keeps_its_boot_and_a_return_publishes_the_next() {
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
+    let a = m.register(&node(1)).expect("a");
+    let b = m.register(&node(2)).expect("b");
+    s.clock.advance(20 * SECOND);
+    m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+        .expect("b");
+    s.clock.advance(11 * SECOND);
+    let down = m.refresh().expect("refresh").expect("map");
+    assert_eq!(state(&down, a.id), Some(MemberState::Down));
+    assert_eq!(boot_of(&down, a.id), Some(a.boot));
+    let back = m.register(&node(1)).expect("back");
+    assert_eq!(boot_of(&back.map, a.id), Some(back.boot));
+    assert_eq!(back.boot, a.boot + 1);
 }
 
 /// Catches: a rolling restart that leaves members Joining: three members register, then
@@ -861,10 +992,95 @@ fn a_catching_up_registration_becomes_active_on_its_caught_up_beat() {
     let a = m.register(&rebuilding).expect("a");
     assert_eq!(state(&a.map, a.id), Some(MemberState::CatchingUp));
     assert_eq!(s.fake.get("meta/members_formed").expect("read"), None);
-    m.heartbeat(a.id, a.boot, Progress::CaughtUp).expect("beat");
+    m.heartbeat(a.id, a.boot, Progress::CaughtUp, Debts::Unknown, None)
+        .expect("beat");
     let map = m.current_map().expect("read").expect("a map");
     assert_eq!(state(&map, a.id), Some(MemberState::Active));
     assert!(s.fake.get("meta/members_formed").expect("read").is_some());
+}
+
+/// Catches: a heartbeat that rewrites a row for a caller that does not hold its address,
+/// or that tells such a caller anything about the row. The holder is asked of the
+/// address on the row (`192.0.2.1:8982`) before the boot is compared: a refused holder
+/// gets `NotHolder` with the right boot and with a wrong one (never `Superseded`, which
+/// would tell it the boot), a `NotRegistered` member is still `NotRegistered`, and the
+/// row is not touched (same version, so its time to live is not renewed, and a
+/// `CatchingUp` member is not promoted by a refused caller's report). An accepting holder
+/// beats and promotes, and is asked the same address.
+///
+/// Mutants seen red: the holder asked after the boot comparison; the holder not asked.
+#[test]
+fn a_heartbeat_is_asked_whether_the_caller_holds_the_address_before_the_boot_is_compared() {
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
+    let rebuilding = Registrant {
+        progress: Progress::CatchingUp,
+        ..node(1)
+    };
+    let a = m.register(&rebuilding).expect("a");
+    let before = s.fake.get(&format!("member/{}", a.id.0)).expect("read");
+    let asked = std::cell::RefCell::new(Vec::new());
+    let refuses = |addr: &str| {
+        asked.borrow_mut().push(addr.to_owned());
+        false
+    };
+    let accepts = |addr: &str| {
+        asked.borrow_mut().push(addr.to_owned());
+        true
+    };
+    for boot in [a.boot, a.boot + 5] {
+        let refused = m
+            .heartbeat(
+                a.id,
+                boot,
+                Progress::CaughtUp,
+                Debts::Unknown,
+                Some(&refuses),
+            )
+            .expect_err("the caller does not hold the address");
+        assert!(
+            matches!(refused, MembershipError::NotHolder(id) if id == a.id),
+            "boot {boot}: {refused}"
+        );
+    }
+    assert_eq!(*asked.borrow(), ["192.0.2.1:8982"; 2]);
+    assert_eq!(
+        s.fake.get(&format!("member/{}", a.id.0)).expect("read"),
+        before
+    );
+    let map = m.current_map().expect("read").expect("a map");
+    assert_eq!(state(&map, a.id), Some(MemberState::CatchingUp));
+    assert!(matches!(
+        m.heartbeat(
+            MemberId(99),
+            1,
+            Progress::CaughtUp,
+            Debts::Unknown,
+            Some(&refuses)
+        ),
+        Err(MembershipError::NotRegistered(MemberId(99)))
+    ));
+
+    assert!(matches!(
+        m.heartbeat(
+            a.id,
+            a.boot + 5,
+            Progress::CaughtUp,
+            Debts::Unknown,
+            Some(&accepts)
+        ),
+        Err(MembershipError::Superseded { .. })
+    ));
+    m.heartbeat(
+        a.id,
+        a.boot,
+        Progress::CaughtUp,
+        Debts::Unknown,
+        Some(&accepts),
+    )
+    .expect("the holder beats");
+    let map = m.current_map().expect("read").expect("a map");
+    assert_eq!(state(&map, a.id), Some(MemberState::Active));
 }
 
 /// Catches: `Down` being settable by hand (it is the store's verdict).
