@@ -585,3 +585,51 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # The kbf-installer deb and rpm (packaging/linux/README.md): nfpm (pinned, checked
+  # against its SHA-256) builds each twice from the configuration `cargo xtask pkg-config`
+  # writes, with the test-only kbf-installer-stub and the fixtures under
+  # packaging/linux/testdata until the real binary and the units land; `cargo xtask
+  # pkg-install-test` installs the deb into a fresh Ubuntu container and the rpm into a
+  # fresh Fedora one, with systemd as PID 1, and checks them (crates/xtask/src/pkg_install.rs).
+  packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      NFPM_VERSION: 2.48.0
+      NFPM_SHA256: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      - run: cargo build -p xtask --bin kbf-installer-stub --locked
+      - name: Fetch nfpm (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" --sha256 "$NFPM_SHA256" --out "$RUNNER_TEMP/tools/nfpm" --extract tar.gz --member nfpm
+      - name: Write the nfpm configuration
+        run: cargo xtask pkg-config --binary target/debug/kbf-installer-stub --units packaging/linux/testdata/units --trust packaging/linux/testdata/trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --platform linux-x86_64 --version 0.0.0+ci --out target/pkg
+      - name: Build the deb and the rpm, each twice
+        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
+      - name: Install, gate, remove and purge the deb in a fresh Ubuntu container
+        run: cargo xtask pkg-install-test --package target/pkg/out/kbf-installer_0.0.0+ci_amd64.deb --format deb --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu --gate kbf-node.service=/etc/kbf/kbf.toml --gate kbf-installer.service=/etc/kbf/installer.toml
+      - name: Install, gate and remove the rpm in a fresh Fedora container
+        run: cargo xtask pkg-install-test --package target/pkg/out/kbf-installer-0.0.0+ci-1.x86_64.rpm --format rpm --listing target/pkg/listing.txt --image-dir packaging/linux/test/fedora --gate kbf-node.service=/etc/kbf/kbf.toml --gate kbf-installer.service=/etc/kbf/installer.toml
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
