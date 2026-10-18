@@ -1,0 +1,59 @@
+# The release stages, and which workflow job belongs to which. The workflow lint
+# (crates/kbf-it/tests/workflows/stages.rs) reads this file and refuses:
+# - a job row that names a stage this file does not list, and an `after` that names a stage
+#   not listed before it;
+# - an `actions` stage with no job, and a stage marked `planned` that has one (delete
+#   `planned` in the change that adds the first job, so the mark cannot outlive the gap);
+# - a job of a stage workflow that no row lists, and a row whose job does not exist;
+# - a trigger on a stage workflow that no stage of its jobs allows under `events`;
+# - `id-token: write` or `attestations: write` in any job of any workflow that is not a
+#   row marked `signing: true`, and a signing row whose job holds neither.
+# What it does not check: that a job only runs for the events of its own stage (a
+# stage workflow's triggers are checked as a whole), and that the operator stages are
+# verified before release (the release workflow's own steps do that).
+stages:
+  # artifacts.yml builds, tests and (on a push) attests the files every later stage uses.
+  # It also runs for pull requests and the merge queue, which attest nothing.
+  - name: build
+    runs: actions
+    after: []
+    result: SHA256SUMS
+    events: [pull_request, merge_group, push]
+  # The full end-to-end run against the built files. Planned: no job exists yet. The change
+  # that adds the beta job to artifacts.yml deletes the `planned` line below and lists the
+  # job (and the job that attests its result, as `signing: true`) under `jobs`.
+  - name: beta
+    runs: actions
+    planned: true
+    after: [build]
+    result: beta-result.json
+    events: [merge_group, push]
+  # The operator's own deployment follows the beta result; it is not an Actions job.
+  - name: gamma
+    runs: operator
+    after: [beta]
+    result: gamma-verdict.json
+  # release.yml publishes a pushed v* tag, or dry-runs a commit by hand.
+  - name: prod
+    runs: actions
+    after: [gamma]
+    result: release.json
+    events: [push, workflow_dispatch]
+jobs:
+  - job: artifacts.yml#darwin-arm64
+    stage: build
+  - job: artifacts.yml#linux-x86_64
+    stage: build
+  - job: artifacts.yml#linux-arm64
+    stage: build
+  - job: artifacts.yml#sums
+    stage: build
+  - job: artifacts.yml#attest
+    stage: build
+    signing: true
+  - job: artifacts.yml#verify
+    stage: build
+  - job: release.yml#verify
+    stage: prod
+  - job: release.yml#publish
+    stage: prod
