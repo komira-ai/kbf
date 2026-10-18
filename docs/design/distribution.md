@@ -38,10 +38,12 @@ verbs (`kbf cluster status|drain|undrain|member` is the model) are clients of it
 
 - Everything configurable is an API call first. There are no UI-only server paths and no logic in the CLI.
 - `curl` is the documented contract. The CLI is a typed wrapper over the same calls.
-- Today's API has nodes, members, drain, storage status, invocations and health [V, `../api.md`]. Writes pass
+- Today's API has nodes, members, drain, storage status, invocations and health [F, `../api.md`]. Writes pass
   five gates: loopback peer, no `Origin` header, a token file, a Bearer token and a JSON content type. Token
-  minting (a route of this API, not a `kbf` command), object-store registration and the update endpoints are
-  designed, not built [V].
+  minting (a route of this API, not a `kbf` command) is built: `/v1/enroll/tokens` and `/v1/enroll/nodes`
+  exist [F, `../api.md`], and answer 404 until the frontend wires enrollment in. Object-store registration is
+  designed, not built ([object-store-registration.md](object-store-registration.md)), and so are the update
+  endpoints. Every verb and its route is in [operator-verbs.md](operator-verbs.md).
 - **Updates are triggered externally.** Something outside kbf calls the control API to set the desired release;
   the frontend then rolls the storage and daemon nodes through the drain system, one storage node at a time.
   The frontend's own update is a second route, `POST /v1/update/frontend {commit}` (same write gates). The
