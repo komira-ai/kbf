@@ -27,6 +27,7 @@ struct LostAck {
     inner: Fake,
     armed: AtomicBool,
     down: AtomicBool,
+    fenced: AtomicBool,
     /// Applied just before the next transaction that names an `op/` row: a write landing
     /// between the farm's look at the store and its own write.
     before_submit: std::sync::Mutex<Option<Txn>>,
@@ -38,6 +39,7 @@ impl LostAck {
             inner: Fake::with_flaw(Arc::new(ManualClock::default()), Flaw::None),
             armed: AtomicBool::new(false),
             down: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
             before_submit: std::sync::Mutex::new(None),
         })
     }
@@ -49,6 +51,9 @@ impl LostAck {
 
 impl Store for LostAck {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        if self.fenced.load(Ordering::SeqCst) {
+            return Err(StoreError::Fenced);
+        }
         if self.down.load(Ordering::SeqCst) {
             return Err(StoreError::Failed("the store is down".to_owned()));
         }
@@ -576,4 +581,32 @@ fn a_row_that_stays_in_the_way_ends_the_looks() {
     assert_eq!(refused.map(|_| ()).unwrap_err().code(), Code::Unavailable);
     assert_eq!(rows(&store, "inflight/"), 0);
     assert_eq!(rows(&store, "queue/"), 0);
+}
+
+/// Catches: a second request for an action this farm already holds that writes to the
+/// store again (a second operation, a second run) instead of joining the first; and a
+/// farm superseded by a newer writer that queues work anyway, or answers a retryable
+/// refusal where the client should stop.
+#[test]
+fn a_twin_in_memory_joins_without_a_write_and_a_fenced_farm_refuses_for_good() {
+    let store = LostAck::new();
+    let farm = farm_over(&store);
+    assert!(submit(&farm, 1).is_ok());
+    let writes = store.inner.commit_stats().txns;
+    assert!(submit(&farm, 1).is_ok());
+    assert_eq!(
+        store.inner.commit_stats().txns,
+        writes,
+        "the twin was written"
+    );
+    assert_eq!(rows(&store, "op/"), 1);
+    assert_eq!(unfinished(&farm).len(), 1);
+
+    store.fenced.store(true, Ordering::SeqCst);
+    let refused = submit(&farm, 2);
+    assert_eq!(
+        refused.map(|_| ()).unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(rows(&store, "op/"), 1);
 }
