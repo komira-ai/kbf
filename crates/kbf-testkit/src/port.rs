@@ -188,11 +188,17 @@ fn local_port(fd: &OwnedFd) -> u16 {
 /// source port.
 #[must_use]
 pub fn is_taken(addr: SocketAddr) -> bool {
-    if cfg!(target_os = "linux") {
-        TcpListener::bind(addr).is_err()
-    } else {
-        matches!(bound_socket(addr), Err(rustix::io::Errno::ADDRINUSE))
-    }
+    cannot_bind(addr)
+}
+
+#[cfg(target_os = "linux")]
+fn cannot_bind(addr: SocketAddr) -> bool {
+    TcpListener::bind(addr).is_err()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cannot_bind(addr: SocketAddr) -> bool {
+    matches!(bound_socket(addr), Err(rustix::io::Errno::ADDRINUSE))
 }
 
 /// An address on `127.0.0.1` on which connecting is refused until the test binary
