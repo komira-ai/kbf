@@ -214,12 +214,9 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     );
     // With the backup damaged too, nobody can say what the host runs: exit 5, needs an
     // operator, and nothing is written.
-    fs::write(root.join("var/lib/kbf-installer/state.json"), b"not json").expect("ruin");
-    fs::write(
-        root.join("var/lib/kbf-installer/state.json.bak"),
-        b"not json",
-    )
-    .expect("ruin");
+    for name in ["state.json", "state.json.bak"] {
+        fs::write(in_state_dir(&root, name), b"not json").expect("ruin");
+    }
     let out = helper(&root, &["boot-check"]);
     assert_eq!(out.status.code(), Some(5));
     let err = String::from_utf8_lossy(&out.stderr);
@@ -228,7 +225,7 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
         "{err}"
     );
     assert_eq!(
-        fs::read(root.join("var/lib/kbf-installer/state.json")).expect("kept"),
+        fs::read(in_state_dir(&root, "state.json")).expect("kept"),
         b"not json"
     );
 }
