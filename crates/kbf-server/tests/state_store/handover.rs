@@ -2,8 +2,8 @@
 //! callers it kept, and the operator's cordon across the change.
 
 use kbf_front::{Backend, Handed};
-use kbf_server::farm::UNTRACED_LOOKS;
 use kbf_server::farm::NodeAction;
+use kbf_server::farm::UNTRACED_LOOKS;
 use kbf_server::fleet::PlacementView;
 use kbf_state::{Cond, Txn};
 use kbf_types::OperationId;

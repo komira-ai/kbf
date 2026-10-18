@@ -659,7 +659,14 @@ async fn a_followed_stream_outlives_any_number_of_looks_and_unreadable_rows() {
     looks.extend(std::iter::repeat_n(Ok(None), 500));
     looks.push(Ok(Some(failed(5))));
     let total = looks.len();
-    let rig = Rig::new(vec![queued("operations/new-5"), Err(Status::unavailable("restarted"))], looks).await;
+    let rig = Rig::new(
+        vec![
+            queued("operations/new-5"),
+            Err(Status::unavailable("restarted")),
+        ],
+        looks,
+    )
+    .await;
     let Rig { relay, rows, .. } = rig;
     let relay = relay.following_every(Duration::from_secs(3600));
     let started = tokio::time::Instant::now();
@@ -677,7 +684,11 @@ async fn a_followed_stream_outlives_any_number_of_looks_and_unreadable_rows() {
     assert_eq!(done, [false, false, true]);
     assert_eq!(code_of(items[2].as_ref().expect("done")), 5);
     assert_eq!(lock(&rows.followed).len(), total);
-    assert!(started.elapsed() >= Duration::from_secs(3600 * 1000), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() >= Duration::from_secs(3600 * 1000),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 /// Catches: a client cancel that does not end the relay (the old process would hold the
@@ -687,11 +698,19 @@ async fn a_followed_stream_outlives_any_number_of_looks_and_unreadable_rows() {
 #[tokio::test(start_paused = true)]
 async fn a_client_cancel_ends_a_followed_relay() {
     let rig = Rig::new(
-        vec![queued("operations/new-5"), Err(Status::unavailable("restarted"))],
+        vec![
+            queued("operations/new-5"),
+            Err(Status::unavailable("restarted")),
+        ],
         vec![],
     )
     .await;
-    let Rig { relay, rows, backend, .. } = rig;
+    let Rig {
+        relay,
+        rows,
+        backend,
+        ..
+    } = rig;
     let relay = relay.following_every(Duration::from_secs(60));
     let response = relay.execute(execute()).await.expect("opened");
     let mut stream = response.into_inner();
@@ -699,7 +718,10 @@ async fn a_client_cancel_ends_a_followed_relay() {
     assert_eq!(first.name, "operations/new-5");
     let day = Duration::from_secs(24 * 3600);
     let waited = tokio::time::timeout(day, stream.next()).await;
-    assert!(waited.is_err(), "the stream does not end on its own: {waited:?}");
+    assert!(
+        waited.is_err(),
+        "the stream does not end on its own: {waited:?}"
+    );
     assert!(lock(&rows.followed).len() >= 1000, "it kept looking");
     assert_eq!(backend.metrics().handover_relays_open.get(), 1);
     assert!(lock(&rows.released).is_empty());
@@ -709,7 +731,11 @@ async fn a_client_cancel_ends_a_followed_relay() {
     assert_eq!(*lock(&rows.released), [OperationId(41)]);
     let looked = lock(&rows.followed).len();
     tokio::time::sleep(day).await;
-    assert_eq!(lock(&rows.followed).len(), looked, "no look after the cancel");
+    assert_eq!(
+        lock(&rows.followed).len(),
+        looked,
+        "no look after the cancel"
+    );
 }
 
 /// Catches: a followed stream that goes quiet between stage changes (a load balancer that
