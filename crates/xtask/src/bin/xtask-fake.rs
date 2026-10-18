@@ -3,7 +3,7 @@
 //! without building the server, `verify-assets attestations` without GitHub, and
 //! `sudo-test` and `podman-tests` without root, systemd or Podman.
 //!
-//! - Run under any name but `kbf-server`, `gh`, `sudo` or `podman`, it is cargo: it
+//! - Run under any name but `kbf-server`, `gh`, `sudo`, `podman`, `uname` or `id`, it is cargo: it
 //!   appends its arguments as one line to `target/debug/cargo-args` in its working
 //!   directory, "builds" by hard-linking itself to `target/debug/kbf-server`, and
 //!   writes the stamp that build embeds to `target/debug/kbf-server.stamp`:
@@ -31,6 +31,9 @@
 //!   --dir <dir>` copies every file of `releases/<tag>/` into `<dir>`.
 //! - Run as `sudo`, it appends `<working directory>: <arguments>` as one line to
 //!   `sudo-args` next to it, and exits 0 (the tests it was asked to run passed).
+//! - Run as `uname` (by name, from PATH, or by path), it is a host that is no platform of
+//!   ours: `-s` prints `Linux` and `-m` prints `riscv64`. Run as `id`, `-u` prints 1000
+//!   (a user that is not root).
 //! - Run as `podman`, it appends `XDG_RUNTIME_DIR=<value>: <arguments>` as one line to
 //!   `podman-args` next to it. With no socket at `$XDG_RUNTIME_DIR/bus` (the user
 //!   manager's bus, which rootless Podman needs) it exits 125. Otherwise `--version`
@@ -323,6 +326,25 @@ fn podman(argv0: &str, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `uname -s` and `uname -m` of a host with no platform of ours.
+fn uname(args: &[String]) -> ExitCode {
+    match args {
+        [a] if a == "-s" => println!("Linux"),
+        [a] if a == "-m" => println!("riscv64"),
+        _ => return ExitCode::FAILURE,
+    }
+    ExitCode::SUCCESS
+}
+
+/// `id -u` of a user that is not root.
+fn id(args: &[String]) -> ExitCode {
+    match args {
+        [a] if a == "-u" => println!("1000"),
+        _ => return ExitCode::FAILURE,
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args();
     let argv0 = args.next().expect("argv0");
@@ -337,6 +359,10 @@ fn main() -> ExitCode {
         sudo(&argv0, &rest)
     } else if argv0.ends_with("/podman") {
         podman(&argv0, &rest)
+    } else if argv0 == "uname" || argv0.ends_with("/uname") {
+        uname(&rest)
+    } else if argv0 == "id" || argv0.ends_with("/id") {
+        id(&rest)
     } else {
         cargo(&argv0, &rest)
     }

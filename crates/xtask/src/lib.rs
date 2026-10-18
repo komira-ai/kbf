@@ -16,6 +16,10 @@
 //! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
+//! - `installer-tarball --binary <path> --platform <platform> --commit <sha> [--units
+//!   <dir>].. [--trust <dir>].. --out <dir>` ([`installer_tarball`]): the files the
+//!   Debian package ships (installer, unit files, trust files), at the same paths, in a
+//!   tarball that is the same bytes on every runner, for `packaging/install.sh`.
 //! - `sums assemble <dir>` and `verify-assets {sums,attestations} <dir>` ([`sums`]): the
 //!   one `SHA256SUMS` over every platform's assets, and the checks the attest job and
 //!   a deployment make of it, each with a control that must fail.
@@ -44,6 +48,7 @@ pub mod build_commit;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
+pub mod installer_tarball;
 pub mod package;
 pub mod podman_tests;
 pub mod release;
@@ -140,6 +145,28 @@ enum Verb {
         #[arg(long)]
         commit: String,
         /// The directory the assets go in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Write the payload `packaging/install.sh` places (installer, unit files, trust
+    /// files) as a tarball in `--out`.
+    InstallerTarball {
+        /// The `kbf-installer` binary.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The platform it was built for (Linux only).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (on Actions, `GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// A directory of unit files; repeatable, at least one.
+        #[arg(long = "units")]
+        units: Vec<PathBuf>,
+        /// A directory of trust files; repeatable, at least one.
+        #[arg(long = "trust")]
+        trust: Vec<PathBuf>,
+        /// The directory the tarball goes in; created when missing.
         #[arg(long)]
         out: PathBuf,
     },
@@ -422,6 +449,14 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => package::package(&binary, &sbom, platform, &commit, &out),
+        Verb::InstallerTarball {
+            binary,
+            platform,
+            commit,
+            units,
+            trust,
+            out,
+        } => installer_tarball::installer_tarball(&binary, platform, &commit, &units, &trust, &out),
         #[cfg(target_os = "macos")]
         Verb::SignDarwin {
             binary,
