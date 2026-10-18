@@ -54,9 +54,10 @@ use tonic::metadata::MetadataMap;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::OpenStreams;
 use crate::backend::Backend;
 use crate::execution::{Closing, OperationStream, Progress, Stage, closing, operation};
-use crate::{OpenStreams, wire};
+use kbf_storage::wire;
 
 /// How often a relay that fell back to the rows looks in the state store.
 pub const FOLLOW_EVERY: Duration = Duration::from_secs(1);

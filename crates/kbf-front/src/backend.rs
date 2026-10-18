@@ -39,12 +39,12 @@ use kbf_storage::{Storage, StorageError};
 use kbf_types::Digest;
 use prost::Message as _;
 
-use crate::cache::Cache;
-use crate::closure;
-use crate::input_tree::{Walked, decode};
-use crate::meta_log::{Leadership, MetaLog};
-use crate::metrics::CacheMetrics;
+use kbf_storage::Cache;
+
 use crate::routed::Routed;
+use kbf_storage::metrics::CacheMetrics;
+use kbf_storage::{Leadership, MetaLog};
+use kbf_storage::{Walked, decode};
 
 /// The most Directory blobs [`walk`] reads from a node at once.
 const DIRS_IN_FLIGHT: usize = 16;
@@ -414,9 +414,9 @@ impl Plane for RoutedPlane {
 /// [`ActionWriteError::Absent`] naming every blob of the closure no owner holds; a
 /// missing tree, a malformed result, or owners that could not answer.
 async fn prepare(router: &Router, result: &ActionResult) -> Answer<ActionRecord> {
-    let (mut closure, trees) = closure::direct(result)?;
+    let (mut closure, trees) = kbf_storage::closure::direct(result)?;
     for tree in trees {
-        closure::add_tree(&mut closure, &tree, router.read_blob(&tree).await?)?;
+        kbf_storage::closure::add_tree(&mut closure, &tree, router.read_blob(&tree).await?)?;
     }
     let needed: Vec<Digest> = closure.iter().copied().collect();
     let missing = router.find_missing(&needed).await?;

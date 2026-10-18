@@ -9,7 +9,7 @@ use kbf_proto::reapi::{ActionResult, GetActionResultRequest, UpdateActionResultR
 use tonic::{Request, Response, Status};
 
 use super::owners::Owners;
-use crate::wire;
+use kbf_storage::wire;
 
 /// The `ActionCache` service over the storage nodes. GetActionResult is authorized by
 /// [`Authorizers::ac_get`] against the request's instance name.

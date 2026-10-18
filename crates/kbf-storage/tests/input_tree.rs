@@ -1,0 +1,943 @@
+//! The input check ([`Cache::missing_inputs`]): decoded directories and verified
+//! subtrees remembered in memory, single flight between requests, bounded reads and a
+//! bounded cache, and the retention rule that makes skipping a subtree safe.
+//!
+//! Directory reads are counted at the object store, not inferred from the cache's own
+//! counters, so a test of "reads nothing" cannot pass because a counter was not bumped.
+
+mod common;
+
+use std::mem::size_of;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use bytes::Bytes;
+use common::{Blob, DAY, days};
+use kbf_meta::Retention;
+use kbf_objstore::{
+    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
+    ObjectStoreError, PageSize,
+};
+use kbf_proto::reapi::{Directory, DirectoryNode, FileNode};
+use kbf_storage::{
+    Cache, CacheError, ENTRY_OVERHEAD, InputTreeConfig, MemoryMetaLog, MetaLog, MetaLogError,
+    VerifiedBlob,
+};
+use kbf_types::{Digest, FarmTime};
+
+/// A memory store that counts its reads and the most that were ever in flight, and
+/// yields while a read is in flight so concurrent callers interleave.
+#[derive(Clone)]
+struct Counting(Arc<Counts>);
+
+#[derive(Default)]
+struct Counts {
+    inner: Option<MemoryStore>,
+    gets: AtomicUsize,
+    active: AtomicUsize,
+    peak: AtomicUsize,
+    /// Reads panic while set.
+    panics: std::sync::atomic::AtomicBool,
+}
+
+impl Counting {
+    fn new() -> Self {
+        Self(Arc::new(Counts {
+            inner: Some(MemoryStore::new(Capabilities::default())),
+            ..Counts::default()
+        }))
+    }
+
+    fn gets(&self) -> usize {
+        self.0.gets.load(Ordering::SeqCst)
+    }
+
+    /// Forgets the reads so far (an upload reads its segment's footer back).
+    fn reset(&self) {
+        self.0.gets.store(0, Ordering::SeqCst);
+        self.0.peak.store(0, Ordering::SeqCst);
+    }
+
+    fn peak(&self) -> usize {
+        self.0.peak.load(Ordering::SeqCst)
+    }
+
+    fn store(&self) -> &MemoryStore {
+        self.0.inner.as_ref().expect("a store")
+    }
+}
+
+impl ObjectStore for Counting {
+    fn capabilities(&self) -> Capabilities {
+        self.store().capabilities()
+    }
+
+    async fn put_new(
+        &self,
+        key: &ObjectKey,
+        body: Bytes,
+        retain_until: Option<std::time::SystemTime>,
+    ) -> Result<(), ObjectStoreError> {
+        self.store().put_new(key, body, retain_until).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: ByteRange,
+    ) -> Result<Bytes, ObjectStoreError> {
+        self.0.gets.fetch_add(1, Ordering::SeqCst);
+        assert!(!self.0.panics.load(Ordering::SeqCst), "the store is broken");
+        let now = self.0.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.0.peak.fetch_max(now, Ordering::SeqCst);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let bytes = self.store().get_range(key, range).await;
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+        bytes
+    }
+
+    async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
+        self.store().delete(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &KeyPrefix,
+        after: Option<&ListToken>,
+        max_keys: PageSize,
+    ) -> Result<ListPage, ObjectStoreError> {
+        self.store().list(prefix, after, max_keys).await
+    }
+}
+
+/// A memory metadata log whose queries can be made to fail after a number of them.
+struct Flaky {
+    inner: MemoryMetaLog,
+    queries_left: AtomicUsize,
+    /// Queries to let through before the one that is held (`usize::MAX`: none held).
+    hold_after: AtomicUsize,
+    /// A permit when a query is held, and one for each query to let go.
+    held: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl Flaky {
+    fn new() -> Self {
+        Self {
+            inner: MemoryMetaLog::new(Retention::default()),
+            queries_left: AtomicUsize::new(usize::MAX),
+            hold_after: AtomicUsize::new(usize::MAX),
+            held: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    /// The query after the next `n` is computed at once, but its answer is held back
+    /// (a slow reply) until [`Flaky::let_go`]; [`Flaky::wait_held`] says it is held.
+    fn hold_after(&self, n: usize) {
+        self.hold_after.store(n, Ordering::SeqCst);
+    }
+
+    async fn wait_held(&self) {
+        self.held.acquire().await.expect("open").forget();
+    }
+
+    fn let_go(&self) {
+        self.release.add_permits(1);
+    }
+
+    /// The next `n` queries answer; every one after that fails.
+    fn fail_after(&self, n: usize) {
+        self.queries_left.store(n, Ordering::SeqCst);
+    }
+}
+
+impl MetaLog for Flaky {
+    async fn commit(&self, command: kbf_meta::Command) -> Result<kbf_meta::Applied, MetaLogError> {
+        self.inner.commit(command).await
+    }
+
+    async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>
+    where
+        F: FnOnce(&kbf_meta::MetaState) -> R + Send,
+        R: Send,
+    {
+        let left = self.queries_left.load(Ordering::SeqCst);
+        if left == 0 {
+            return Err(MetaLogError::Unavailable("down".to_owned()));
+        }
+        if left != usize::MAX {
+            self.queries_left.store(left - 1, Ordering::SeqCst);
+        }
+        let hold = self.hold_after.load(Ordering::SeqCst);
+        if hold == usize::MAX {
+            return self.inner.query(f).await;
+        }
+        if hold > 0 {
+            self.hold_after.store(hold - 1, Ordering::SeqCst);
+            return self.inner.query(f).await;
+        }
+        self.hold_after.store(usize::MAX, Ordering::SeqCst);
+        let answer = self.inner.query(f).await;
+        self.held.add_permits(1);
+        self.release.acquire().await.expect("open").forget();
+        answer
+    }
+}
+
+type TestCache = Cache<Flaky, Counting>;
+
+async fn cache_with(config: InputTreeConfig) -> (Arc<TestCache>, Counting) {
+    let store = Counting::new();
+    let cache = Cache::open(Flaky::new(), store.clone(), KeyPrefix::default())
+        .await
+        .expect("open the cache")
+        .with_input_trees(config);
+    (Arc::new(cache), store)
+}
+
+async fn cache() -> (Arc<TestCache>, Counting) {
+    cache_with(InputTreeConfig::DEFAULT).await
+}
+
+async fn put(cache: &TestCache, blobs: &[&Blob]) {
+    let blobs = blobs
+        .iter()
+        .map(|b| VerifiedBlob::new(b.digest, Bytes::from(b.data.clone())).expect("verified"))
+        .collect();
+    cache.store_blobs(blobs).await.expect("stored");
+}
+
+fn file(name: &str) -> Blob {
+    Blob::new(format!("contents of {name}"))
+}
+
+/// A directory holding `files` (named by their position) and `dirs`.
+fn dir(files: &[&Blob], dirs: &[&Blob]) -> Blob {
+    Blob::of(&Directory {
+        files: files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| FileNode {
+                name: format!("f{i}"),
+                digest: Some(f.proto.clone()),
+                ..FileNode::default()
+            })
+            .collect(),
+        directories: dirs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| DirectoryNode {
+                name: format!("d{i}"),
+                digest: Some(d.proto.clone()),
+            })
+            .collect(),
+        ..Directory::default()
+    })
+}
+
+/// A toolchain of three directories (`tc` over `bin` and `lib`) with a file each, and
+/// every blob in it.
+struct Toolchain {
+    tc: Blob,
+    blobs: Vec<Blob>,
+}
+
+fn toolchain() -> Toolchain {
+    let (compiler, library, header) = (file("cc"), file("libc"), file("stdio.h"));
+    let bin = dir(&[&compiler], &[]);
+    let lib = dir(&[&library], &[]);
+    let tc = dir(&[&header], &[&bin, &lib]);
+    Toolchain {
+        blobs: vec![compiler, library, header, bin, lib, tc.clone()],
+        tc,
+    }
+}
+
+/// A root holding the toolchain and one source file of its own: four directories read
+/// the first time, one more for each further root.
+fn root_over(tool: &Toolchain, source: &Blob) -> Blob {
+    dir(&[source], &[&tool.tc])
+}
+
+async fn walk(cache: &Arc<TestCache>, root: &Blob) -> Vec<Digest> {
+    cache.missing_inputs(root.digest).await.expect("walked")
+}
+
+fn read(cache: &TestCache) -> u64 {
+    cache.metrics().execute_dir_reads.get()
+}
+
+fn skipped(cache: &TestCache) -> u64 {
+    cache.metrics().input_dirs_skipped.get()
+}
+
+fn cached(cache: &TestCache) -> u64 {
+    cache.metrics().input_dirs_cached.get()
+}
+
+fn millis(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+/// Catches: a second Execute over the same toolchain reading its directories again, or
+/// the first walk not reading each directory exactly once.
+#[tokio::test]
+async fn a_toolchain_seen_once_is_never_read_again() {
+    let (cache, store) = cache().await;
+    let tool = toolchain();
+    let (one, two) = (file("one.c"), file("two.c"));
+    let (root_one, root_two) = (root_over(&tool, &one), root_over(&tool, &two));
+    put(&cache, &tool.blobs.iter().collect::<Vec<_>>()).await;
+    put(&cache, &[&one, &two, &root_one, &root_two]).await;
+    store.reset();
+
+    assert!(walk(&cache, &root_one).await.is_empty());
+    assert_eq!((read(&cache), store.gets()), (4, 4), "root, tc, bin, lib");
+
+    // Another action over the same toolchain: only its own root is read.
+    assert!(walk(&cache, &root_two).await.is_empty());
+    assert_eq!((read(&cache), store.gets()), (5, 5));
+    assert_eq!(skipped(&cache), 1, "the toolchain subtree is skipped whole");
+
+    // The same action again: nothing is read, the root itself is skipped.
+    assert!(walk(&cache, &root_one).await.is_empty());
+    assert_eq!(store.gets(), 5);
+    assert_eq!(skipped(&cache), 2);
+}
+
+/// Catches: `verified_until` honored past its time (the boundary included), or a
+/// re-walk that reads the store again when the decoded directory is in memory, or one
+/// that does not look at the blobs.
+#[tokio::test]
+async fn an_expired_verification_is_checked_again() {
+    let (cache, store) = cache().await;
+    let tool = toolchain();
+    let source = file("main.c");
+    let root = root_over(&tool, &source);
+    put(&cache, &tool.blobs.iter().collect::<Vec<_>>()).await;
+    put(&cache, &[&source, &root]).await;
+    store.reset();
+    let min_ttl = Retention::default().min_ttl;
+
+    assert!(walk(&cache, &root).await.is_empty());
+    let until = FarmTime::from_millis(0).saturating_add(min_ttl);
+
+    // One millisecond before the guarantee runs out: skipped.
+    cache
+        .tick(FarmTime::from_millis(until.as_millis() - 1))
+        .await
+        .expect("tick");
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 1);
+
+    // At the time itself: not skipped. Every directory is taken from memory (no read)
+    // and its blob is looked at.
+    cache.tick(until).await.expect("tick");
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 1, "no further skip at `until`");
+    assert_eq!(cached(&cache), 4);
+    assert_eq!(store.gets(), 4, "nothing read again");
+
+    // And the new verification runs for another min_ttl from that walk.
+    cache.tick(until).await.expect("tick");
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 2);
+}
+
+/// Catches: a blob collected while a verification still claims it, a verification
+/// outliving the blob once its time has passed, and a directory taken from memory
+/// without touching its blob (so the retention clock never restarts for it).
+#[tokio::test]
+async fn an_evicted_blob_is_caught_after_and_never_before_the_verification_ends() {
+    let (cache, store) = cache().await;
+    let tool = toolchain();
+    let source = file("main.c");
+    let root = root_over(&tool, &source);
+    put(&cache, &tool.blobs.iter().collect::<Vec<_>>()).await;
+    put(&cache, &[&source, &root]).await;
+    store.reset();
+    let min_ttl = Retention::default().min_ttl;
+
+    // Day 3: verified until day 3 + min_ttl; the touch is committed at once.
+    cache.tick(days(3)).await.expect("tick");
+    assert!(walk(&cache, &root).await.is_empty());
+    assert!(cache.collect().await.expect("collect").blobs.is_empty());
+    let until = days(3).saturating_add(min_ttl);
+
+    // Just before `until`: the collection keeps everything, the skip is right.
+    cache
+        .tick(FarmTime::from_millis(until.as_millis() - 1))
+        .await
+        .expect("tick");
+    assert!(
+        cache.collect().await.expect("collect").blobs.is_empty(),
+        "nothing a verification still claims is collected"
+    );
+    let reads = store.gets();
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(store.gets(), reads);
+
+    // Past the retention: the blobs go, and the next check says so rather than
+    // trusting the old verification.
+    cache.tick(days(12)).await.expect("tick");
+    let gone = cache.collect().await.expect("collect").blobs;
+    assert_eq!(gone.len(), tool.blobs.len() + 2);
+    assert_eq!(walk(&cache, &root).await, [root.digest]);
+}
+
+/// Catches: a directory skipped on the strength of a subtree that was verified earlier
+/// than the directory's own walk: its guarantee ends with the subtree's.
+#[tokio::test]
+async fn a_root_resting_on_a_skipped_subtree_is_verified_only_as_long_as_it() {
+    let (cache, _store) = cache().await;
+    let tool = toolchain();
+    let source = file("main.c");
+    let root = root_over(&tool, &source);
+    put(&cache, &tool.blobs.iter().collect::<Vec<_>>()).await;
+    put(&cache, &[&source, &root]).await;
+
+    // Day 0: the toolchain alone is verified, until day 7.
+    assert!(walk(&cache, &tool.tc).await.is_empty());
+    // Day 5: a root over it skips the toolchain; its own verification ends at day 7
+    // too, not day 12.
+    cache.tick(days(5)).await.expect("tick");
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 1);
+    assert!(cache.collect().await.expect("collect").blobs.is_empty());
+    // Day 8.5: the toolchain's blobs (last touched day 0) are past their retention.
+    cache
+        .tick(days(8).saturating_add(DAY / 2))
+        .await
+        .expect("tick");
+    let gone = cache.collect().await.expect("collect").blobs;
+    assert_eq!(
+        gone.len(),
+        tool.blobs.len(),
+        "the toolchain, not the root's own"
+    );
+    let absent = walk(&cache, &root).await;
+    assert_eq!(absent, [tool.tc.digest], "the root was not skipped");
+}
+
+/// Catches: a directory taken from memory without touching its blob, which lets the
+/// blob be collected while its files, touched, remain.
+#[tokio::test]
+async fn a_directory_taken_from_memory_is_touched() {
+    let (cache, _store) = cache().await;
+    let tool = toolchain();
+    put(&cache, &tool.blobs.iter().collect::<Vec<_>>()).await;
+    let min_ttl = Retention::default().min_ttl;
+
+    assert!(walk(&cache, &tool.tc).await.is_empty());
+    // Past the verification, inside the retention: the walk is repeated from memory.
+    cache
+        .tick(FarmTime::from_millis(0).saturating_add(min_ttl))
+        .await
+        .expect("tick");
+    assert!(walk(&cache, &tool.tc).await.is_empty());
+    assert_eq!(cached(&cache), 3);
+    // The touches of that walk commit now, at day 7. The blobs first touched at day 0
+    // are past their retention a day later; the ones the second walk touched are not.
+    assert!(cache.collect().await.expect("collect").blobs.is_empty());
+    cache
+        .tick(days(8).saturating_add(millis(1)))
+        .await
+        .expect("tick");
+    assert!(cache.collect().await.expect("collect").blobs.is_empty());
+}
+
+/// Catches: a missing directory or file not reported (with a file under an absent
+/// directory reported too), a failed walk remembered as verified, and a report that
+/// outlives the upload that fixes it.
+#[tokio::test]
+async fn missing_inputs_are_reported_and_never_remembered() {
+    let (cache, store) = cache().await;
+    let (present, lost) = (file("present"), file("lost"));
+    let (hidden, vanished) = (file("under an absent dir"), file("never uploaded dir"));
+    let absent_dir = dir(&[&hidden], &[]);
+    let deep = dir(&[&lost], &[]);
+    let root = dir(&[&present], &[&deep, &absent_dir, &dir(&[&vanished], &[])]);
+    let vanished_dir = dir(&[&vanished], &[]);
+    put(&cache, &[&present, &deep, &root]).await;
+
+    let want = {
+        let mut dirs = vec![absent_dir.digest, vanished_dir.digest];
+        dirs.sort();
+        dirs.push(lost.digest);
+        dirs
+    };
+    assert_eq!(walk(&cache, &root).await, want);
+    // Again: not skipped, and still reported.
+    assert_eq!(walk(&cache, &root).await, want);
+    assert_eq!(skipped(&cache), 0);
+
+    // Uploading what is missing is seen at once.
+    put(
+        &cache,
+        &[&lost, &absent_dir, &vanished_dir, &hidden, &vanished],
+    )
+    .await;
+    assert!(walk(&cache, &root).await.is_empty());
+    let reads = store.gets();
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(store.gets(), reads, "now verified");
+}
+
+/// Catches: a directory that does not decode being treated as absent or empty.
+#[tokio::test]
+async fn a_directory_that_does_not_decode_is_invalid() {
+    let (cache, _store) = cache().await;
+    let junk = Blob::new(vec![0xff_u8; 9]);
+    put(&cache, &[&junk]).await;
+    let error = cache.missing_inputs(junk.digest).await.expect_err("junk");
+    assert!(matches!(error, CacheError::Invalid(_)), "{error:?}");
+}
+
+/// Catches: every request walking a shared subtree itself: eight roots over one
+/// toolchain, started together, read each directory once.
+#[tokio::test]
+async fn requests_sharing_a_subtree_read_it_once() {
+    let (cache, store) = cache().await;
+    let tool = toolchain();
+    put(&cache, &tool.blobs.iter().collect::<Vec<_>>()).await;
+    let mut roots = Vec::new();
+    for n in 0..8 {
+        let source = file(&format!("source {n}"));
+        let root = root_over(&tool, &source);
+        put(&cache, &[&source, &root]).await;
+        roots.push(root);
+    }
+    store.reset();
+    let walks = roots.iter().map(|r| cache.missing_inputs(r.digest));
+    for absent in futures_join(walks).await {
+        assert!(absent.expect("walked").is_empty());
+    }
+    // Eight roots, and the toolchain's three directories once.
+    assert_eq!(store.gets(), 8 + 3);
+    assert_eq!(cache.metrics().input_dirs_joined.get(), 7);
+}
+
+/// Catches: store reads unbounded by `reads_in_flight`, and bounded so tightly that a
+/// wide directory is read one at a time.
+#[tokio::test]
+async fn directory_reads_are_concurrent_up_to_their_bound() {
+    let config = InputTreeConfig {
+        reads_in_flight: 3.try_into().expect("nonzero"),
+        ..InputTreeConfig::DEFAULT
+    };
+    let (cache, store) = cache_with(config).await;
+    let files: Vec<Blob> = (0..12).map(|n| file(&format!("leaf {n}"))).collect();
+    let leaves: Vec<Blob> = files.iter().map(|f| dir(&[f], &[])).collect();
+    let root = dir(&[], &leaves.iter().collect::<Vec<_>>());
+    put(&cache, &files.iter().collect::<Vec<_>>()).await;
+    put(&cache, &leaves.iter().collect::<Vec<_>>()).await;
+    put(&cache, &[&root]).await;
+    store.reset();
+
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(store.gets(), 13);
+    // The root is read alone, then the twelve leaves three at a time.
+    assert_eq!(store.peak(), 3);
+}
+
+/// Catches: a request dropped mid-read (a client cancel drops the handler future) leaving
+/// its check half done in the shared flight map with its read slot held. With one slot,
+/// the walk of another directory then never finishes. The cancelled directory is still
+/// checked by a later request, which finds the check done or finishes it.
+#[tokio::test]
+async fn a_request_dropped_mid_read_frees_its_read_slot() {
+    let config = InputTreeConfig {
+        reads_in_flight: 1.try_into().expect("nonzero"),
+        ..InputTreeConfig::DEFAULT
+    };
+    let (cache, store) = cache_with(config).await;
+    let (fx, fy) = (file("x"), file("y"));
+    let (x, y) = (dir(&[&fx], &[]), dir(&[&fy], &[]));
+    put(&cache, &[&fx, &fy, &x, &y]).await;
+    store.reset();
+
+    let mut cancelled = Box::pin(cache.missing_inputs(x.digest));
+    while store.gets() == 0 {
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        tokio::task::yield_now().await;
+    }
+    drop(cancelled);
+
+    let other = tokio::time::timeout(Duration::from_secs(3), cache.missing_inputs(y.digest))
+        .await
+        .expect("another directory is checked after a request was dropped mid-read");
+    assert!(other.expect("walked").is_empty());
+    let again = tokio::time::timeout(Duration::from_secs(3), cache.missing_inputs(x.digest))
+        .await
+        .expect("the cancelled directory is checked by a later request");
+    assert!(again.expect("walked").is_empty());
+}
+
+/// Catches: a check that panics (a broken store) leaving its flight in the map, so every
+/// later request for the directory joins a dead check, or the panic crossing into the
+/// request instead of failing its check.
+#[tokio::test]
+async fn a_check_that_panics_fails_its_request_and_leaves_no_flight() {
+    let (cache, store) = cache().await;
+    let fx = file("x");
+    let x = dir(&[&fx], &[]);
+    put(&cache, &[&fx, &x]).await;
+    store.0.panics.store(true, Ordering::SeqCst);
+    let failed = cache.missing_inputs(x.digest).await;
+    assert!(matches!(failed, Err(CacheError::Invalid(_))), "{failed:?}");
+    store.0.panics.store(false, Ordering::SeqCst);
+    assert!(walk(&cache, &x).await.is_empty());
+}
+
+/// Catches: a cache that outgrows its entry bound, one that evicts the wrong directory
+/// (least recently used goes first), and an oversized directory kept anyway.
+#[tokio::test]
+async fn the_cache_is_bounded_and_evicts_the_least_recently_used() {
+    let config = InputTreeConfig {
+        max_entries: 2.try_into().expect("nonzero"),
+        ..InputTreeConfig::DEFAULT
+    };
+    let (cache, store) = cache_with(config).await;
+    let files: Vec<Blob> = (0..3).map(|n| file(&format!("f{n}"))).collect();
+    let roots: Vec<Blob> = files.iter().map(|f| dir(&[f], &[])).collect();
+    put(&cache, &files.iter().collect::<Vec<_>>()).await;
+    put(&cache, &roots.iter().collect::<Vec<_>>()).await;
+    store.reset();
+
+    for r in [&roots[0], &roots[1], &roots[0], &roots[2]] {
+        assert!(walk(&cache, r).await.is_empty());
+    }
+    assert_eq!(cache.input_tree_cache().0, 2);
+    assert_eq!(store.gets(), 3);
+    // roots[1] was the least recently used, so it alone is gone.
+    assert!(walk(&cache, &roots[0]).await.is_empty());
+    assert!(walk(&cache, &roots[2]).await.is_empty());
+    assert_eq!(store.gets(), 3);
+    assert!(walk(&cache, &roots[1]).await.is_empty());
+    assert_eq!(store.gets(), 4);
+
+    // A byte bound: room for two single-file directories, not three.
+    let one = ENTRY_OVERHEAD + size_of::<Digest>() as u64;
+    let bytes = InputTreeConfig {
+        max_bytes: 2 * one + one / 2,
+        ..InputTreeConfig::DEFAULT
+    };
+    let (cache, _) = cache_with(bytes).await;
+    put(&cache, &files.iter().collect::<Vec<_>>()).await;
+    put(&cache, &roots.iter().collect::<Vec<_>>()).await;
+    for r in &roots {
+        assert!(walk(&cache, r).await.is_empty());
+    }
+    let (entries, held) = cache.input_tree_cache();
+    assert!(held <= bytes.max_bytes, "{held} bytes");
+    assert_eq!(entries, 2);
+
+    // A directory dearer than the whole bound is checked, not kept.
+    let tiny = InputTreeConfig {
+        max_bytes: ENTRY_OVERHEAD,
+        ..InputTreeConfig::DEFAULT
+    };
+    let (cache, store) = cache_with(tiny).await;
+    put(&cache, &files.iter().collect::<Vec<_>>()).await;
+    put(&cache, &roots.iter().collect::<Vec<_>>()).await;
+    store.reset();
+    assert!(walk(&cache, &roots[0]).await.is_empty());
+    assert!(walk(&cache, &roots[0]).await.is_empty());
+    assert_eq!(cache.input_tree_cache().0, 0);
+    assert_eq!(store.gets(), 2);
+}
+
+/// Catches: a directory whose object cannot be read answered as missing or empty (the
+/// input exists, so the call must fail, not tell the client to upload it), at the root
+/// and under it, and a directory naming a digest that does not parse accepted.
+#[tokio::test]
+async fn unreadable_and_malformed_directories_fail_the_check() {
+    let (cache, store) = cache().await;
+    let leaf_file = file("leaf");
+    let leaf = dir(&[&leaf_file], &[]);
+    put(&cache, &[&leaf_file, &leaf]).await;
+    let leaf_objects = objects(&store).await;
+    let root = dir(&[], &[&leaf]);
+    put(&cache, &[&root]).await;
+    for key in &leaf_objects {
+        store.delete(key).await.expect("deleted");
+    }
+    let error = cache
+        .missing_inputs(root.digest)
+        .await
+        .expect_err("unreadable");
+    assert!(
+        matches!(error, CacheError::Unreachable(d) if d == leaf.digest),
+        "{error:?}"
+    );
+    // The same, again: the object stays marked, and the failure is not remembered as
+    // anything else.
+    let error = cache
+        .missing_inputs(leaf.digest)
+        .await
+        .expect_err("unreadable");
+    assert!(matches!(error, CacheError::Unreachable(_)), "{error:?}");
+
+    let bad = Blob::of(&Directory {
+        files: vec![FileNode {
+            name: "f".to_owned(),
+            digest: Some(kbf_proto::reapi::Digest {
+                hash: "not a hash".to_owned(),
+                size_bytes: 3,
+            }),
+            ..FileNode::default()
+        }],
+        ..Directory::default()
+    });
+    put(&cache, &[&bad]).await;
+    let error = cache
+        .missing_inputs(bad.digest)
+        .await
+        .expect_err("bad digest");
+    assert!(matches!(error, CacheError::Invalid(_)), "{error:?}");
+}
+
+/// Catches: a directory two paths of one tree reach checked once per path (a tree built
+/// as a diamond chain would then cost two to the power of its depth), and its absent
+/// file listed twice.
+#[tokio::test]
+async fn a_directory_reached_twice_in_one_tree_is_checked_once() {
+    let (cache, store) = cache().await;
+    let (here, lost) = (file("here"), file("lost"));
+    let shared = dir(&[&here, &lost], &[]);
+    let (left, right) = (dir(&[&here], &[&shared]), dir(&[], &[&shared, &shared]));
+    let root = dir(&[], &[&left, &right]);
+    put(&cache, &[&here, &shared, &left, &right, &root]).await;
+    store.reset();
+
+    assert_eq!(walk(&cache, &root).await, [lost.digest]);
+    assert_eq!(
+        store.gets(),
+        4,
+        "root, left, right and the shared one, once"
+    );
+}
+
+/// Catches: a metadata log that cannot answer turned into "missing" (or into a pass):
+/// at the start of the check, while a directory's files are asked about, and while a
+/// directory taken from memory is looked at.
+#[tokio::test]
+async fn a_metadata_log_that_cannot_answer_fails_the_check() {
+    let (cache, _store) = cache().await;
+    let data = file("data");
+    let leaf = dir(&[&data], &[]);
+    put(&cache, &[&data, &leaf]).await;
+    let unavailable = |e: CacheError| matches!(e, CacheError::Meta(_));
+
+    // Its first query is the farm time.
+    cache.meta().fail_after(0);
+    assert!(unavailable(
+        cache.missing_inputs(leaf.digest).await.expect_err("down")
+    ));
+    // The directory read answers (one query); the question about its files does not.
+    cache.meta().fail_after(2);
+    assert!(unavailable(
+        cache.missing_inputs(leaf.digest).await.expect_err("down")
+    ));
+
+    // A directory known from memory: the farm time answers, the look at its blob does not.
+    cache.meta().fail_after(usize::MAX);
+    assert!(walk(&cache, &leaf).await.is_empty());
+    cache.tick(days(8)).await.expect("tick");
+    cache.meta().fail_after(1);
+    assert!(unavailable(
+        cache.missing_inputs(leaf.digest).await.expect_err("down")
+    ));
+}
+
+/// Catches: a verification recorded against a directory the bound already evicted
+/// (it must be dropped, not resurrect an entry), and a walk that depends on keeping
+/// anything.
+#[tokio::test]
+async fn a_cache_of_one_still_walks_a_tree() {
+    let config = InputTreeConfig {
+        max_entries: 1.try_into().expect("nonzero"),
+        ..InputTreeConfig::DEFAULT
+    };
+    let (cache, _store) = cache_with(config).await;
+    let tool = toolchain();
+    put(&cache, &tool.blobs.iter().collect::<Vec<_>>()).await;
+    assert!(walk(&cache, &tool.tc).await.is_empty());
+    assert!(walk(&cache, &tool.tc).await.is_empty());
+    assert_eq!(cache.input_tree_cache().0, 1);
+}
+
+/// The keys of every object in the store.
+async fn objects(store: &Counting) -> Vec<ObjectKey> {
+    let page = store
+        .list(&KeyPrefix::default(), None, PageSize::MAX)
+        .await
+        .expect("listed");
+    page.objects.into_iter().map(|o| o.key).collect()
+}
+
+/// Every future to completion on this task, interleaved, in order.
+async fn futures_join<F: std::future::Future>(
+    futures: impl IntoIterator<Item = F>,
+) -> Vec<F::Output> {
+    futures::future::join_all(futures).await
+}
+
+/// The store objects `put` made since `before`, in key order.
+async fn objects_since(store: &Counting, before: &[ObjectKey]) -> Vec<ObjectKey> {
+    objects(store)
+        .await
+        .into_iter()
+        .filter(|k| !before.contains(k))
+        .collect()
+}
+
+/// Uploads `blobs` as their own segment, and loses that segment: the store forgets it
+/// and a read of the first blob marks its object unreachable, as a real read would.
+async fn lose_object_of(cache: &TestCache, store: &Counting, blobs: &[&Blob]) {
+    let before = objects(store).await;
+    put(cache, blobs).await;
+    let made = objects_since(store, &before).await;
+    assert_eq!(made.len(), 1, "one segment per upload");
+    store.store().delete(&made[0]).await.expect("deleted");
+    let err = cache.read_blob(&blobs[0].digest).await.unwrap_err();
+    assert!(matches!(err, CacheError::Unreachable(_)), "{err:?}");
+}
+
+/// The hole a verification must not open: a tree verified, then one of its files lost
+/// (the store forgot its segment, a read found out and marked the object). FindMissing
+/// lists the file, so the check must too, well inside the verification's time, or the
+/// Execute is scheduled on an input nobody can read and the client is never told to
+/// upload it.
+///
+/// Catches: a skip that ignores objects marked unreachable since the verification (the
+/// pre-fix behavior: red at the last assertion with an empty list), and a mark that is
+/// not counted when the object is found gone.
+#[tokio::test]
+async fn a_file_lost_after_its_tree_was_verified_is_reported() {
+    let (cache, store) = cache().await;
+    let tool = toolchain();
+    let source = file("main.c");
+    let root = root_over(&tool, &source);
+    let compiler = &tool.blobs[0];
+    // The compiler in a segment of its own, so losing it loses nothing else.
+    let others: Vec<&Blob> = tool.blobs.iter().skip(1).collect();
+    put(&cache, &others).await;
+    put(&cache, &[&source, &root]).await;
+    let before = objects(&store).await;
+    put(&cache, &[compiler]).await;
+    let made = objects_since(&store, &before).await;
+    assert_eq!(made.len(), 1);
+
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(
+        cache.find_missing(&[compiler.digest]).await.expect("find"),
+        []
+    );
+
+    store.store().delete(&made[0]).await.expect("deleted");
+    let err = cache.read_blob(&compiler.digest).await.unwrap_err();
+    assert!(matches!(err, CacheError::Unreachable(_)), "{err:?}");
+    assert_eq!(
+        cache.find_missing(&[compiler.digest]).await.expect("find"),
+        [compiler.digest],
+        "FindMissing lists the lost file"
+    );
+
+    assert_eq!(
+        walk(&cache, &root).await,
+        [compiler.digest],
+        "the verification of the root ended with the loss"
+    );
+}
+
+/// A mark unrelated to a tree ends its verification once, and only once: the next check
+/// walks it from memory (no store read, every blob looked at and touched), records the
+/// new loss count, and the check after that skips again. Marks that change no answer
+/// (a read of the object already marked) cost nothing.
+///
+/// Catches: a skip that never revalidates after any mark (the hole), a verification
+/// that stays ended after the re-walk (a count read at the wrong moment, or never
+/// recorded), a count that rises on every failed read, not on a new loss.
+#[tokio::test]
+async fn an_unrelated_loss_costs_one_walk_and_no_reads() {
+    let (cache, store) = cache().await;
+    let tool = toolchain();
+    let source = file("main.c");
+    let root = root_over(&tool, &source);
+    let unrelated = file("elsewhere");
+    put(&cache, &tool.blobs.iter().collect::<Vec<_>>()).await;
+    put(&cache, &[&source, &root]).await;
+
+    assert!(walk(&cache, &root).await.is_empty());
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 1, "unchanged count: skipped");
+
+    lose_object_of(&cache, &store, &[&unrelated]).await;
+    store.reset();
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 1, "the mark ended the verification");
+    assert_eq!(cached(&cache), 4, "the whole tree is checked, from memory");
+    assert_eq!(store.gets(), 0, "and nothing is read");
+
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 2, "verified again at the new count");
+
+    // The object is already marked: reading it again commits nothing new.
+    let err = cache.read_blob(&unrelated.digest).await.unwrap_err();
+    assert!(matches!(err, CacheError::Unreachable(_)), "{err:?}");
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 3, "a repeat of the mark changes nothing");
+}
+
+/// Two requests share one check of a directory only if they began at the same loss
+/// count. A check that asked about a file before the loss, answered late, must not be
+/// the answer of a request that began after it.
+///
+/// Catches: a flight keyed by the directory alone (the second request is told the file
+/// is held, red with an empty list).
+#[tokio::test]
+async fn a_request_after_a_loss_does_not_join_a_check_from_before() {
+    let (cache, store) = cache().await;
+    let compiler = file("cc");
+    let root = dir(&[&compiler], &[]);
+    put(&cache, &[&root]).await;
+    let before = objects(&store).await;
+    put(&cache, &[&compiler]).await;
+    let made = objects_since(&store, &before).await;
+    assert!(walk(&cache, &root).await.is_empty());
+    // Past the verification, so the next request checks the root (from memory).
+    cache.tick(days(8)).await.expect("tick");
+
+    // The next request: horizon, then the root's blob, then the compiler. Its question
+    // about the compiler is answered at once and the answer is held back.
+    cache.meta().hold_after(2);
+    let slow = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        let digest = root.digest;
+        async move { cache.missing_inputs(digest).await }
+    });
+    cache.meta().wait_held().await;
+
+    store.store().delete(&made[0]).await.expect("deleted");
+    let err = cache.read_blob(&compiler.digest).await.unwrap_err();
+    assert!(matches!(err, CacheError::Unreachable(_)), "{err:?}");
+    let late = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        let digest = root.digest;
+        async move { cache.missing_inputs(digest).await }
+    });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    cache.meta().let_go();
+    assert_eq!(
+        late.await.expect("joined").expect("walked"),
+        [compiler.digest]
+    );
+    slow.await.expect("joined").expect("walked");
+}

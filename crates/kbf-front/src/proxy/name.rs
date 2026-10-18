@@ -1,7 +1,7 @@
 //! The blob and the instance a ByteStream resource name names, as the raw path needs
 //! them to route and to authorize.
 //!
-//! Unlike [`crate::wire`], which serves reads from this process and refuses
+//! Unlike [`kbf_storage::wire`], which serves reads from this process and refuses
 //! `compressed-blobs/`, this accepts both spellings: the name is still plain text, and
 //! whether a node serves compressed blobs is the node's answer. The digest of a
 //! compressed name is the uncompressed blob's, which is what routes it.
@@ -10,7 +10,7 @@ use kbf_types::Digest;
 use tonic::Status;
 
 use super::Method;
-use crate::wire;
+use kbf_storage::wire;
 
 /// What a resource name says.
 #[derive(Debug, PartialEq, Eq)]

@@ -2215,18 +2215,22 @@ dependencies = [
  "futures",
  "kbf-map",
  "kbf-meta",
+ "kbf-objstore",
  "kbf-peer",
  "kbf-proto",
  "kbf-segments",
  "kbf-store",
+ "kbf-tier",
  "kbf-tls",
  "kbf-types",
+ "prost",
  "rcgen",
  "sha2 0.11.0",
  "thiserror",
  "tokio",
  "tonic",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
