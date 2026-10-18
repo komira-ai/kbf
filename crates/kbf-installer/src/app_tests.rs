@@ -137,6 +137,52 @@ fn only_the_built_verbs_name_no_phase() {
     assert_eq!(parse(&["check"]).verb.built_by(), Some("P10"));
 }
 
+/// Catches `run` and `boot-check` not being reached from the command line, and their
+/// results not being the exit codes: on a scratch host (`--root`) a boot check with no state
+/// and one pass of `run` with an empty spool end well (exit 0, nothing printed here); a
+/// boot check on a root that has no state directory, and a `run` that cannot make its
+/// scratch, fail (exit 1) with the reason.
+#[test]
+fn run_and_boot_check_are_dispatched_and_their_failure_is_exit_1() {
+    let (_, root) = crate::testkit::host_root("app-dispatch-ok");
+    std::fs::create_dir_all(root.join("var/lib/kbf-updater/inbox/orders")).expect("inbox");
+    let root = root.to_str().expect("path").to_owned();
+    let (exit, out, err) = run_as(0, &["--root", &root, "boot-check"]);
+    assert_eq!((exit, out.as_str()), (Exit::Ok, ""), "{err}");
+    let pass = [
+        "--root",
+        &root,
+        "run",
+        "--unit",
+        "kbf.service",
+        "--passes",
+        "1",
+        "--interval-secs",
+        "0",
+    ];
+    let (exit, out, err) = run_as(0, &pass);
+    assert_eq!((exit, out.as_str()), (Exit::Ok, ""), "{err}");
+
+    let bare = kbf_host::testkit::scratch("app-dispatch-bare");
+    let bare = bare.to_str().expect("path").to_owned();
+    let (exit, _, err) = run_as(0, &["--root", &bare, "boot-check"]);
+    assert_eq!(exit, Exit::Failed, "{err}");
+    assert!(err.starts_with("kbf-installer: "), "{err}");
+    let pass = [
+        "--root",
+        &bare,
+        "run",
+        "--unit",
+        "kbf.service",
+        "--passes",
+        "1",
+        "--interval-secs",
+        "0",
+    ];
+    let (exit, _, err) = run_as(0, &pass);
+    assert_eq!(exit, Exit::Failed, "{err}");
+}
+
 /// Catches a verb that skips the root check, or one that needs root and does not need to:
 /// everything but `status` and `check` is refused as an ordinary user with
 /// exit 2, and those two get as far as their own (missing) work.

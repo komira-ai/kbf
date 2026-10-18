@@ -10,7 +10,7 @@
 use kbf_host::{Cmd, Entry, Exec, HostPath, Owner, Perms, Plan, Planner, RunUser};
 
 use super::kbf_toml::{self, Decision, Ours};
-use super::os::{DSCL, LAUNCHCTL, Os, SYSTEMCTL};
+use super::os::{DSCL, LAUNCHCTL, Os, SYSTEMCTL, View};
 use super::paths;
 use super::validate::{Valid, mode_name};
 use super::{SetupError, installer_file};
@@ -33,25 +33,23 @@ pub const INSTALLER_UNIT: &str = "kbf-installer.service";
 /// The longest token file setup reads.
 const MAX_TOKEN_BYTES: u64 = 4096;
 
+/// The planner of this module: it reads the host through a [`View`].
+type Pl<'p, 'h> = Planner<'p, View<'h>>;
+
 fn hp(path: &str) -> Result<HostPath, SetupError> {
     Ok(HostPath::new(path)?)
 }
 
 /// A directory at `path`, `mode` and `owner`'s. (One line per call site, so that a failed
 /// step has a line of its own that a test runs.)
-fn dir<E: Exec>(
-    p: &mut Planner<'_, E>,
-    path: &str,
-    mode: u32,
-    owner: Owner,
-) -> Result<(), SetupError> {
+fn dir(p: &mut Pl<'_, '_>, path: &str, mode: u32, owner: Owner) -> Result<(), SetupError> {
     p.dir(hp(path)?, Perms::new(mode), Some(owner))?;
     Ok(())
 }
 
 /// A file at `path` with these bytes, `mode` and `owner`'s; whether a step was planned.
-fn file<E: Exec>(
-    p: &mut Planner<'_, E>,
+fn file(
+    p: &mut Pl<'_, '_>,
     path: &str,
     mode: u32,
     owner: Owner,
@@ -116,7 +114,7 @@ impl Ctx {
     }
 }
 
-pub fn context<O: Os>(os: &O, mode: Mode) -> Result<Ctx, SetupError> {
+pub fn context(os: &dyn Os, mode: Mode) -> Result<Ctx, SetupError> {
     let platform = os.platform();
     if platform == Platform::MacOs && mode != Mode::Daemon {
         return Err(SetupError::Unsupported(format!(
@@ -146,7 +144,7 @@ pub struct Outcome {
 
 /// A token file's content as setup keeps it: one line, a newline after it. The file is
 /// looked at once, whole: what is checked is what is read.
-fn read_token<E: Exec>(exec: &E, file: &str) -> Result<Vec<u8>, SetupError> {
+fn read_token(exec: &dyn Exec, file: &str) -> Result<Vec<u8>, SetupError> {
     let bad = |why: &str| SetupError::Token(format!("{file}: {why}"));
     let (perms, bytes) = match exec.inspect(&hp(file)?)? {
         None => return Err(bad("no such file")),
@@ -197,7 +195,7 @@ fn next_range_start(text: &str) -> u64 {
 }
 
 fn add_subids(
-    p: &mut Planner<'_, impl Exec>,
+    p: &mut Pl<'_, '_>,
     user: &RunUser,
     kind: &'static str,
     text: &str,
@@ -233,11 +231,7 @@ fn free_mac_id(users: &str, groups: &str) -> Result<u32, SetupError> {
         .ok_or(SetupError::NoFreeId)
 }
 
-fn create_fetch_user(
-    p: &mut Planner<'_, impl Exec>,
-    os: &impl Os,
-    name: &str,
-) -> Result<(), SetupError> {
+fn create_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os, name: &str) -> Result<(), SetupError> {
     match os.platform() {
         Platform::Linux => p.run(
             Cmd::new(hp(USERADD)?)
@@ -283,9 +277,9 @@ fn create_fetch_user(
 
 /// The part of the plan before the first release: accounts, directories, the tokens and
 /// `installer.toml`. Reads the host, changes nothing.
-pub fn before_release<O: Os, E: Exec>(
-    os: &O,
-    exec: &E,
+pub fn before_release(
+    os: &dyn Os,
+    exec: &dyn Exec,
     v: &Valid,
     ctx: &Ctx,
 ) -> Result<Outcome, SetupError> {
@@ -299,7 +293,8 @@ pub fn before_release<O: Os, E: Exec>(
         .transpose()?;
     let settings = installer_file(exec, v, platform)?;
 
-    let mut p = Planner::new(exec);
+    let view = View(exec);
+    let mut p = Planner::new(&view);
     let mut notes = Vec::new();
 
     let fetch = fetch_user(platform);
@@ -345,10 +340,10 @@ pub fn before_release<O: Os, E: Exec>(
 
 /// The first operator token: made once, when the file is not there. It is never printed; the
 /// note names the file. Once a file is there, whatever it holds, setup makes no other.
-fn operator_token<O: Os, E: Exec>(
-    p: &mut Planner<'_, E>,
-    os: &O,
-    exec: &E,
+fn operator_token(
+    p: &mut Pl<'_, '_>,
+    os: &dyn Os,
+    exec: &dyn Exec,
     owner: Owner,
     notes: &mut Vec<String>,
 ) -> Result<(), SetupError> {
@@ -372,15 +367,16 @@ fn operator_token<O: Os, E: Exec>(
 
 /// The part after the first release: `kbf.toml`, then the units. `released` says whether a
 /// release is installed (or, in a dry run, would be). Reads the host, changes nothing.
-pub fn after_release<O: Os, E: Exec>(
-    os: &O,
-    exec: &E,
+pub fn after_release(
+    os: &dyn Os,
+    exec: &dyn Exec,
     v: &Valid,
     ctx: &Ctx,
     released: bool,
     no_start: bool,
 ) -> Result<Outcome, SetupError> {
-    let mut p = Planner::new(exec);
+    let view = View(exec);
+    let mut p = Planner::new(&view);
     let mut notes = Vec::new();
 
     let ours = Ours {
@@ -429,9 +425,9 @@ pub fn after_release<O: Os, E: Exec>(
     })
 }
 
-fn units<O: Os>(
-    p: &mut Planner<'_, impl Exec>,
-    os: &O,
+fn units(
+    p: &mut Pl<'_, '_>,
+    os: &dyn Os,
     v: &Valid,
     platform: Platform,
     released: bool,

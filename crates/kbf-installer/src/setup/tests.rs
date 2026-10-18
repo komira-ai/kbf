@@ -1439,3 +1439,25 @@ fn every_failure_reads_as_a_sentence() {
         .expect_err("no fetch child");
     assert!(err.to_string().contains("fetch child"), "{err}");
 }
+
+/// Catches the view a plan reads the host through forwarding wrongly: every read goes to the
+/// host it wraps, and a step is refused (a plan is made by reading and applies nothing).
+#[test]
+fn a_view_forwards_reads_and_refuses_steps() {
+    use super::os::View;
+    let mut fake = FakeExec::new(7);
+    put(&mut fake, "/etc/x", 0o600, RUNNER, "x");
+    fake.http = Ok(204);
+    let mut view = View(&fake);
+    assert_eq!(view.euid(), 7);
+    assert!(view.inspect(&hp("/etc/x")).expect("read").is_some());
+    let meta = view.stat(&hp("/etc/x")).expect("stat").expect("there");
+    assert_eq!(meta.len, 1);
+    let cmd = kbf_host::Cmd::new(hp("/bin/true"));
+    assert!(view.query(&cmd).expect("query").status.success());
+    let url = kbf_host::HttpUrl::new("http://127.0.0.1:1/").expect("url");
+    assert_eq!(view.http_status(&url).expect("status"), 204);
+    assert!(view.check_binary().is_ok());
+    let step = Step::Remove { path: hp("/etc/x") };
+    assert!(view.apply(&step).is_err());
+}

@@ -162,8 +162,8 @@ pub struct Options {
 /// The `installer.toml` this run leaves: the file that is there with the flags' settings put
 /// in, or the defaults with them. A file that is not valid is not overwritten (the operator
 /// decides), and a floor never goes down.
-pub fn installer_file<E: Exec>(
-    exec: &E,
+pub fn installer_file(
+    exec: &dyn Exec,
     v: &Valid,
     platform: Platform,
 ) -> Result<String, SetupError> {
@@ -218,17 +218,17 @@ fn node_role(mode: Mode) -> Option<&'static str> {
 }
 
 /// Whether a release is installed: `releases/current` is there (a link counts).
-fn released<E: Exec>(exec: &E, platform: Platform) -> Result<bool, SetupError> {
+fn released(exec: &dyn Exec, platform: Platform) -> Result<bool, SetupError> {
     let current = HostPath::new(&paths::current_release(platform))?;
     Ok(exec.stat(&current)?.is_some() || exec.inspect(&current)?.is_some())
 }
 
 /// Print the steps of `plan` and, when applying, carry them out. Returns how many there were.
-fn emit<E: Exec, W: Write + ?Sized>(
+fn emit(
     plan: &kbf_host::Plan,
-    exec: &mut E,
+    exec: &mut dyn Exec,
     apply: bool,
-    out: &mut W,
+    out: &mut dyn Write,
 ) -> Result<usize, SetupError> {
     for (index, step) in plan.steps().iter().enumerate() {
         if apply {
@@ -247,13 +247,13 @@ fn emit<E: Exec, W: Write + ?Sized>(
 
 /// Validate, plan and (with `options.apply`) carry out `setup` for `raw` on the host `os` and
 /// `exec` describe, printing each step and each note (never a secret).
-pub fn run<O: Os, E: Exec, R: Releases, W: Write + ?Sized>(
-    os: &O,
-    exec: &mut E,
-    releases: &R,
+pub fn run(
+    os: &dyn Os,
+    exec: &mut dyn Exec,
+    releases: &dyn Releases,
     raw: &Raw,
     options: Options,
-    out: &mut W,
+    out: &mut dyn Write,
 ) -> Result<(), SetupError> {
     let euid = os.euid();
     if euid != 0 {

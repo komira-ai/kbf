@@ -49,13 +49,51 @@ pub trait Os {
 }
 
 /// The real host, read through `kbf-host`'s [`Exec`].
-pub struct SystemOs<'a, E: Exec> {
-    exec: &'a E,
+pub struct SystemOs<'a> {
+    exec: &'a dyn Exec,
     platform: Platform,
 }
 
-impl<'a, E: Exec> SystemOs<'a, E> {
-    pub fn new(exec: &'a E, platform: Platform) -> SystemOs<'a, E> {
+/// An [`Exec`] seen through a reference, for the code that takes a sized one (a `Planner`,
+/// the user lookup). Setup's own code takes `&dyn Exec`, so that it is one function whatever
+/// host it reads and a test of it covers the function that runs on a real host. A plan only
+/// reads, so a step is refused.
+pub struct View<'a>(pub &'a dyn Exec);
+
+impl Exec for View<'_> {
+    fn euid(&self) -> u32 {
+        self.0.euid()
+    }
+
+    fn inspect(&self, path: &HostPath) -> io::Result<Option<kbf_host::Entry>> {
+        self.0.inspect(path)
+    }
+
+    fn stat(&self, path: &HostPath) -> io::Result<Option<kbf_host::Meta>> {
+        self.0.stat(path)
+    }
+
+    fn query(&self, cmd: &Cmd) -> io::Result<std::process::Output> {
+        self.0.query(cmd)
+    }
+
+    fn http_status(&self, url: &kbf_host::HttpUrl) -> io::Result<u16> {
+        self.0.http_status(url)
+    }
+
+    fn apply(&mut self, _: &kbf_host::Step) -> io::Result<()> {
+        Err(io::Error::other(
+            "a plan is made by reading; it applies nothing",
+        ))
+    }
+
+    fn check_binary(&self) -> Result<(), Untrusted> {
+        self.0.check_binary()
+    }
+}
+
+impl<'a> SystemOs<'a> {
+    pub fn new(exec: &'a dyn Exec, platform: Platform) -> SystemOs<'a> {
         SystemOs { exec, platform }
     }
 
@@ -78,7 +116,7 @@ impl<'a, E: Exec> SystemOs<'a, E> {
     }
 }
 
-impl<E: Exec> Os for SystemOs<'_, E> {
+impl Os for SystemOs<'_> {
     fn euid(&self) -> u32 {
         self.exec.euid()
     }
@@ -92,7 +130,7 @@ impl<E: Exec> Os for SystemOs<'_, E> {
     }
 
     fn user(&self, name: &str) -> io::Result<Option<RunUser>> {
-        kbf_host::user::lookup(self.exec, name).map_err(io::Error::other)
+        kbf_host::user::lookup(&View(self.exec), name).map_err(io::Error::other)
     }
 
     fn subuid(&self) -> io::Result<String> {
