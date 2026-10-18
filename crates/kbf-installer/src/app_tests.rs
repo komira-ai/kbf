@@ -40,7 +40,6 @@ fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
         (vec!["check"], "check", "P10"),
         (vec!["stage"], "stage", "P8"),
         (vec!["activate"], "activate", "P5"),
-        (vec!["fetch-child"], "fetch-child", "P7"),
     ]
 }
 
@@ -76,6 +75,29 @@ fn only_status_and_check_run_without_root() {
                 "{name}: {err}"
             );
         }
+    }
+}
+
+/// The fetch child is built (P7) and runs as the fetch user, not as root: it is not gated on
+/// root, it prints nothing on standard output but the component's bytes (never JSON, whatever
+/// the global flag), and it says why it fetched nothing in one line on standard error.
+///
+/// Catches the child inheriting the "needs root" gate (it would never start as `kbf-fetch`) and
+/// a child that prints prose where the parent counts bytes.
+#[test]
+fn the_fetch_child_is_no_root_verb_and_reports_in_one_line() {
+    let digest = "a".repeat(64);
+    for json in [false, true] {
+        let mut args = vec!["fetch-child"];
+        if json {
+            args.insert(0, "--json");
+        }
+        args.extend(["--kind", "url", "--url", "http://h.example", "--sha256", &digest, "--limit", "10"]);
+        let (exit, out, err) = run_as(1000, &args);
+        assert_eq!(exit, Exit::Failed, "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.starts_with("fetch-child: "), "{err}");
     }
 }
 

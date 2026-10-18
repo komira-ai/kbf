@@ -1666,12 +1666,17 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "flate2",
+ "futures",
  "hex",
  "kbf-host",
  "kbf-installer",
+ "kbf-proto",
  "kbf-update",
  "libc",
+ "rcgen",
  "rustix",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1679,6 +1684,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "tonic",
+ "ureq",
 ]
 
 [[package]]

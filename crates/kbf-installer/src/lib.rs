@@ -47,6 +47,7 @@ pub mod binary;
 pub mod cli;
 pub mod darwin;
 pub mod exit;
+pub mod fetch;
 #[cfg(test)]
 mod fixtures;
 #[cfg(any(test, feature = "testkit"))]

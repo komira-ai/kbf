@@ -129,6 +129,22 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
     let result = match &cli.verb {
         Verb::Run(args) => run(root_of(cli), args),
         Verb::BootCheck(args) => boot_check(root_of(cli), args),
+        // The fetch child writes the component to `out` (standard output, a pipe the root
+        // parent reads) and says why it could not on `err`, one line. It runs as the fetch
+        // user, so no root check applies, and it prints no JSON: its output is the bytes.
+        Verb::FetchChild(args) => {
+            let written = crate::fetch::child::fetch(args, out).and_then(|n| {
+                out.flush().map_err(crate::fetch::child::ChildFault::Out)?;
+                Ok(n)
+            });
+            return match written {
+                Ok(_) => Exit::Ok,
+                Err(why) => {
+                    let _ = writeln!(err, "fetch-child: {why}");
+                    Exit::Failed
+                }
+            };
+        }
         other => {
             let phase = other.built_by().unwrap_or("?");
             return say(

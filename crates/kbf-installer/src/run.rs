@@ -143,11 +143,11 @@ const FIRST_INHERITED: u32 = 3;
 /// How long the readers of a program's output get, after the program and its group are
 /// dead, to reach the end of the pipes. A descendant that left the group (`setsid`) can
 /// hold them open for as long as it lives; the output read so far is then all there is.
-const READ_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const READ_GRACE: Duration = Duration::from_secs(2);
 
 /// Whether a switch to `user` is needed: not when the caller already is that user, which
 /// is the only case an unprivileged caller can ask for.
-fn needs_switch(user: &RunAs) -> bool {
+pub(crate) fn needs_switch(user: &RunAs) -> bool {
     rustix::process::geteuid().as_raw() != user.uid
         || rustix::process::getegid().as_raw() != user.gid
 }
@@ -182,7 +182,7 @@ impl Creds for Libc {
 }
 
 /// `Ok` for the 0 a system call returns, else its `errno`.
-fn check(result: libc::c_int) -> io::Result<()> {
+pub(crate) fn check(result: libc::c_int) -> io::Result<()> {
     if result == 0 {
         Ok(())
     } else {
@@ -200,7 +200,7 @@ pub fn switch_user(creds: &dyn Creds, user: RunAs) -> io::Result<()> {
 }
 
 /// The descriptors a program must not inherit: those numbered `first` or more.
-enum Inherited {
+pub(crate) enum Inherited {
     /// All of them, by one `close_range` in the child (Linux 5.11 and later, when the
     /// kernel and the sandbox allow it).
     Range(u32),
@@ -216,7 +216,7 @@ impl Inherited {
     /// How to keep descriptors from `first` up from a program: the range call when it
     /// works (probed on a range that holds no descriptor, so nothing of this process is
     /// changed), else the descriptors listed now.
-    fn of(first: u32) -> io::Result<Inherited> {
+    pub(crate) fn of(first: u32) -> io::Result<Inherited> {
         Inherited::choose(first, range_cloexec(u32::MAX, u32::MAX), Path::new(FD_DIR))
     }
 
@@ -288,6 +288,23 @@ fn before_exec(
     user: Option<RunAs>,
     inherited: Inherited,
 ) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
+    before_exec_confined(user, inherited, None, None)
+}
+
+/// [`before_exec`] for a program that handles bytes nobody has vouched for: it also keeps the
+/// descriptor `keep` (the lent identity) open across the exec, and applies `confine` (limits,
+/// `no_new_privs`, the parent-death signal). The limits that need root are set before the
+/// switch of user and `RLIMIT_NPROC` and the parent-death signal after it (a change of user
+/// clears the signal, and the process limit counts every process of the user it is set for).
+pub(crate) fn before_exec_confined(
+    user: Option<RunAs>,
+    inherited: Inherited,
+    confine: Option<Confine>,
+    keep: Option<libc::c_int>,
+) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
+    // SAFETY: getpid takes no arguments (read here, in the parent, so that the child can tell
+    // whether it has been orphaned).
+    let parent = unsafe { libc::getpid() };
     move || {
         match &inherited {
             Inherited::Range(first) => range_cloexec(*first, u32::MAX)?,
@@ -295,11 +312,96 @@ fn before_exec(
             #[cfg(test)]
             Inherited::Fails(errno) => return Err(io::Error::from_raw_os_error(*errno)),
         }
-        match user {
-            Some(user) => switch_user(&Libc, user),
+        if let Some(fd) = keep {
+            // SAFETY: fcntl on a descriptor this process holds; this one stays open on exec.
+            check(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) })?;
+        }
+        if let Some(confine) = confine {
+            confine.before_switch()?;
+        }
+        if let Some(user) = user {
+            switch_user(&Libc, user)?;
+        }
+        match confine {
+            Some(confine) => confine.after_switch(parent, user.is_some()),
             None => Ok(()),
         }
     }
+}
+
+/// What the fetch child is not allowed to do, besides having no environment and no file it can
+/// write: set between fork and exec by [`before_exec_confined`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Confine {
+    /// `RLIMIT_AS`, in bytes (Linux; macOS does not enforce it).
+    pub address_space: u64,
+}
+
+/// The processes a confined program, switched to a user of its own, may have.
+pub const PROCESSES: u64 = 64;
+/// The descriptors a confined program may have open: 0, 1, 2, the lent identity and a few for
+/// its connections.
+pub const OPEN_FILES: u64 = 16;
+
+impl Confine {
+    /// The fetch child (contract section 5): 1 GiB of address space.
+    pub const FETCH: Confine = Confine {
+        address_space: 1 << 30,
+    };
+
+    /// Before the switch of user: `RLIMIT_FSIZE` 0 (it cannot create or grow a file),
+    /// `RLIMIT_CORE` 0, `RLIMIT_NOFILE`, `RLIMIT_AS` and `no_new_privs`.
+    fn before_switch(self) -> io::Result<()> {
+        set_limit(libc::RLIMIT_FSIZE as libc::c_int, 0)?;
+        set_limit(libc::RLIMIT_CORE as libc::c_int, 0)?;
+        set_limit(libc::RLIMIT_NOFILE as libc::c_int, OPEN_FILES)?;
+        #[cfg(target_os = "linux")]
+        {
+            set_limit(libc::RLIMIT_AS as libc::c_int, self.address_space)?;
+            // SAFETY: prctl with these arguments reads no memory.
+            check(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) })?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = self;
+        Ok(())
+    }
+
+    /// After the switch of user: at most [`PROCESSES`] processes (set only for a user the
+    /// program was switched to, who has none besides), and death with the parent on Linux.
+    /// `parent` is the pid of the process that started this one; if it is already gone the
+    /// start fails (the signal would never come).
+    fn after_switch(self, parent: libc::pid_t, switched: bool) -> io::Result<()> {
+        if switched {
+            set_limit(libc::RLIMIT_NPROC as libc::c_int, PROCESSES)?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: prctl with these arguments reads no memory.
+            check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) })?;
+            // SAFETY: getppid takes no arguments.
+            if unsafe { libc::getppid() } != parent {
+                return Err(io::Error::other("the parent is gone"));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (self, parent);
+        Ok(())
+    }
+}
+
+/// Lower both limits of `resource` to `value`.
+fn set_limit(resource: libc::c_int, value: u64) -> io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: value as libc::rlim_t,
+        rlim_max: value as libc::rlim_t,
+    };
+    // SAFETY: setrlimit reads the struct it is given.
+    #[cfg(target_os = "linux")]
+    let rc = unsafe { libc::setrlimit(resource as _, &raw const limit) };
+    // SAFETY: as above.
+    #[cfg(not(target_os = "linux"))]
+    let rc = unsafe { libc::setrlimit(resource, &raw const limit) };
+    check(rc)
 }
 
 /// Whether the child `pid` has exited, without reaping it.
@@ -330,7 +432,7 @@ fn exited(pid: u32) -> io::Result<bool> {
 
 /// SIGKILL to the process group `pgid` (the child made itself the leader of a group of
 /// its own); a group already gone is not an error.
-fn kill_group(pgid: u32) {
+pub(crate) fn kill_group(pgid: u32) {
     let pgid = i32::try_from(pgid).expect("a pid fits an i32");
     // SAFETY: kill reads no memory; a negative pid names a process group.
     unsafe {
@@ -339,7 +441,7 @@ fn kill_group(pgid: u32) {
 }
 
 /// A thread reading `pipe` to its end, keeping the first [`CAPTURE`] bytes.
-struct Capture {
+pub(crate) struct Capture {
     kept: Arc<Mutex<Vec<u8>>>,
     done: mpsc::Receiver<io::Result<()>>,
 }
@@ -361,7 +463,7 @@ impl io::Write for Keep {
     }
 }
 
-fn capture(pipe: impl Read + Send + 'static) -> Capture {
+pub(crate) fn capture(pipe: impl Read + Send + 'static) -> Capture {
     let kept = Arc::new(Mutex::new(Vec::new()));
     let (sender, done) = mpsc::channel();
     let mut sink = Keep(Arc::clone(&kept));
@@ -377,7 +479,7 @@ fn capture(pipe: impl Read + Send + 'static) -> Capture {
 impl Capture {
     /// What was read, once the pipe ended or `until` passed (the reader is left
     /// to end on its own).
-    fn finish(self, until: Instant) -> io::Result<Vec<u8>> {
+    pub(crate) fn finish(self, until: Instant) -> io::Result<Vec<u8>> {
         match self
             .done
             .recv_timeout(until.saturating_duration_since(Instant::now()))

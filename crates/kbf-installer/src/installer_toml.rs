@@ -110,7 +110,7 @@ fn absolute(key: &str, value: &Option<String>, problems: &mut Vec<String>) -> Op
 
 /// `https://host[:port][/path]` with no user information, query or fragment, lower-cased
 /// host, no trailing `/`.
-fn https_base(url: &str) -> Result<String, String> {
+pub(crate) fn https_base(url: &str) -> Result<String, String> {
     let bad = |why: &str| format!("release_url = {url:?}: {why}");
     let rest = url
         .strip_prefix("https://")

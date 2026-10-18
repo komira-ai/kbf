@@ -64,8 +64,10 @@ pub enum Verb {
     Stage,
     #[command(hide = true)]
     Activate,
+    /// Internal: pull one component to standard output. The installer starts it itself, as the
+    /// fetch user, with fixed flags; it is not a command for a person.
     #[command(hide = true)]
-    FetchChild,
+    FetchChild(crate::fetch::child::ChildArgs),
 }
 
 /// The `kbf` modes a host can be set up for. There is no `node` mode.
@@ -175,7 +177,7 @@ impl Verb {
             Verb::Check => "check",
             Verb::Stage => "stage",
             Verb::Activate => "activate",
-            Verb::FetchChild => "fetch-child",
+            Verb::FetchChild(_) => "fetch-child",
         }
     }
 
@@ -188,7 +190,7 @@ impl Verb {
     /// verbs that exist (`run`, `boot-check`).
     pub fn built_by(&self) -> Option<&'static str> {
         match self {
-            Verb::Run(_) | Verb::BootCheck(_) => None,
+            Verb::Run(_) | Verb::BootCheck(_) | Verb::FetchChild(_) => None,
             Verb::Setup(_) | Verb::Check => Some("P10"),
             Verb::Status => Some("P4"),
             Verb::Update(_) => Some("P13"),
@@ -197,7 +199,6 @@ impl Verb {
             }
             Verb::Activate => Some("P5"),
             Verb::Stage => Some("P8"),
-            Verb::FetchChild => Some("P7"),
         }
     }
 }
