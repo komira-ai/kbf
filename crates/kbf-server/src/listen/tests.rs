@@ -177,7 +177,7 @@ fn the_retry_ends_when_the_waits_reach_the_budget() {
 }
 
 /// The address `flaky` never lets bind.
-const ABSENT: &str = "10.0.0.1:9";
+const ABSENT: &str = "192.0.2.10:9";
 
 type Slept = Rc<RefCell<Vec<Duration>>>;
 
@@ -213,8 +213,8 @@ fn flaky(budget: Duration, fails: usize) -> (Binder, Slept, Rc<RefCell<Vec<Socke
 #[test]
 fn two_sequential_binds_of_an_absent_address_share_one_budget() {
     let (binder, slept, tried) = flaky(Duration::from_secs(3), usize::MAX);
-    let a: SocketAddr = "10.0.0.1:1".parse().expect("address");
-    let b: SocketAddr = "10.0.0.1:2".parse().expect("address");
+    let a: SocketAddr = "192.0.2.10:1".parse().expect("address");
+    let b: SocketAddr = "192.0.2.10:2".parse().expect("address");
     assert!(binder.bind(a).is_err());
     let first = slept.borrow().iter().sum::<Duration>();
     assert_eq!(first, Duration::from_secs(3));
@@ -232,7 +232,7 @@ fn two_sequential_binds_of_an_absent_address_share_one_budget() {
 #[test]
 fn a_bind_waits_only_for_what_an_earlier_bind_left() {
     let (binder, slept, _) = flaky(Duration::from_secs(3), 2);
-    assert!(binder.bind("10.0.0.1:1".parse().expect("address")).is_ok());
+    assert!(binder.bind("192.0.2.10:1".parse().expect("address")).is_ok());
     assert_eq!(slept.borrow().len(), 2);
     let before = slept.borrow().iter().sum::<Duration>();
     assert_eq!(before, Duration::from_millis(750));
@@ -255,7 +255,7 @@ fn the_bind_budget_is_below_the_units_start_timeout() {
 #[test]
 fn a_socket_bind_retries_an_unavailable_address() {
     let (binder, slept, tried) = flaky(BIND_BUDGET, 1);
-    let socket = Socket::bind("10.0.0.1:1".parse().expect("address"), &binder).expect("bound");
+    let socket = Socket::bind("192.0.2.10:1".parse().expect("address"), &binder).expect("bound");
     assert_ne!(socket.local.port(), 0);
     assert_eq!(tried.borrow().len(), 2);
     assert_eq!(*slept.borrow(), [Duration::from_millis(250)]);
@@ -266,7 +266,7 @@ fn a_socket_bind_retries_an_unavailable_address() {
 #[tokio::test]
 async fn a_grpc_bind_retries_an_unavailable_address() {
     let (binder, slept, tried) = flaky(BIND_BUDGET, 1);
-    let addr = "10.0.0.1:1".parse().expect("address");
+    let addr = "192.0.2.10:1".parse().expect("address");
     let (_incoming, local) = crate::serve::bind(addr, &binder).expect("bound");
     assert_ne!(local.port(), 0);
     assert_eq!(tried.borrow().len(), 2);
@@ -278,7 +278,7 @@ async fn a_grpc_bind_retries_an_unavailable_address() {
 #[tokio::test]
 async fn an_api_bind_retries_an_unavailable_address() {
     let (binder, slept, tried) = flaky(BIND_BUDGET, 1);
-    let addr = "10.0.0.1:1".parse().expect("address");
+    let addr = "192.0.2.10:1".parse().expect("address");
     let (_listener, local) = crate::serve::bind_api(addr, &binder).expect("bound");
     assert_ne!(local.port(), 0);
     assert_eq!(tried.borrow().len(), 2);
@@ -293,11 +293,11 @@ async fn an_api_bind_retries_an_unavailable_address() {
 #[test]
 fn the_frontends_listeners_bind_through_one_shared_budget() {
     let (binder, slept, _) = flaky(Duration::from_secs(2), 3);
-    let addr = |port: u16| -> SocketAddr { format!("10.0.0.1:{port}").parse().expect("address") };
+    let addr = |port: u16| -> SocketAddr { format!("192.0.2.10:{port}").parse().expect("address") };
     let error = crate::frontend::Bound::bind(addr(1), addr(2), Some(addr(3)), &binder)
         .err()
         .expect("the second listener runs out of budget");
-    assert!(error.to_string().contains("10.0.0.1:2"), "{error}");
+    assert!(error.to_string().contains("192.0.2.10:2"), "{error}");
     assert_eq!(
         slept.borrow().iter().sum::<Duration>(),
         Duration::from_secs(2)
