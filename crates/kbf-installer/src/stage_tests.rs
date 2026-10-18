@@ -227,7 +227,8 @@ fn nothing_is_unpacked_or_run_before_the_attestation_holds() {
         2,
         "the tarball and the bundle were copied"
     );
-    assert_eq!(runner.calls().len(), 1);
+    // One run of gh per accepted signer (the current name, then the former), none after.
+    assert_eq!(runner.calls().len(), 2);
     assert!(rig.releases().is_empty());
     assert_eq!(rig.state(), None);
     assert_eq!(rig.work_leftovers(), Vec::<String>::new());

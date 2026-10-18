@@ -34,6 +34,8 @@ tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+# Loopback ports nothing can take (kbf_testkit::port).
+kbf-testkit.workspace = true
 clap.workspace = true
 kbf-objstore = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["macros", "net", "io-util", "rt-multi-thread"] }

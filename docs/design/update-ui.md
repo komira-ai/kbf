@@ -8,7 +8,7 @@ update routes). **[D]** is decided in another document, **[P]** is proposed here
 
 **Scope ruling.** The page is **read-only**. It has no update button and there is no browser sign-in in this design. An update
 is made through the operator API or the CLI. A browser write path (an update button with an operator sign-in) was drafted in an
-earlier revision of this file, is not designed further, and is tracked as a future, unscheduled issue, komira-build-farm#992 (section 9).
+earlier revision of this file, is not designed further, and is tracked as a future, unscheduled issue, kbf#992 (section 9).
 
 **Where the amendments live.** This file does not change `ui-data.md`: the UI stays read-only and ui-data Q16 (how a human
 authenticates) stays as written there. It amends `pull-updates.md` 6.3 only by naming each change in section 5; the text edits
@@ -125,7 +125,7 @@ A3 and A7 are dropped (below).
 **Dropped with the write path.** A3 (`plan_digest` and `plan_issued_at` on `Offer`, `stale_plan`) existed so a browser form
 could hold an apply to the host list its operator confirmed; with no form, the digest has no reader, and a CLI or API caller
 already holds the token and the spec's call. A7 (an audit row for every `desired`, `pause` and `resume`) was for the session
-door; the read-only page needs no audit and the CLI path is unchanged. Both move to the future issue (komira-build-farm#992, section 9). The core
+door; the read-only page needs no audit and the CLI path is unchanged. Both move to the future issue (kbf#992, section 9). The core
 refactor into `offer_desired` and `set_paused` behind two doors is likewise dropped: one door exists and stays as #976 has it.
 
 **Blockers (A4).** Stable codes: `no_complete_platform` (per platform), `host_unsupported`, `helper_missing`, `paused`. An
@@ -192,7 +192,7 @@ PRs 1 to 4 are independent of the controller. PR 3 onward needs the `kbf-ui` mou
   so they stack after arch-v2 is merged into pull-updates.
 - **Q10 `/v1/releases` is open under the spec.** Left open, flagged.
 - **Q11 Where pause lives in #976.** `policy_view` has no `paused` today; ask its owner to state it. Until then the section 2 rule.
-- **Moved to the future issue (komira-build-farm#992, section 9), not open here:** whether the UI writes; the credential for a browser session; a
+- **Moved to the future issue (kbf#992, section 9), not open here:** whether the UI writes; the credential for a browser session; a
   trusted-proxy principal (Q5); carrying the resume generation into the API (Q6); a password-hash dependency (Q12); an Envoy
   `/ui` route with sticky routing (Q13); a hash-chained audit (Q14); a farm-wide apply lock (Q15); the shared token as login
   (Q17). The `ui-data.md` Q16 is unchanged.

@@ -124,8 +124,8 @@ fn verify(
         root: Root::host(),
         gh: host_path(&gh()),
         trusted_root: host_path(&testdata("trusted_root.jsonl")),
-        repo: kbf_installer::attest::REPO.to_owned(),
-        signer_workflow: kbf_installer::attest::SIGNER_WORKFLOW.to_owned(),
+        // The fixture bundle was attested under the repository's former name.
+        signers: vec![kbf_installer::attest::Signer::former()],
         issuer: kbf_installer::attest::ISSUER.to_owned(),
         source_refs: refs
             .iter()
@@ -234,13 +234,14 @@ fn the_real_gh_refuses_what_the_attestation_does_not_cover() {
     );
     assert_eq!(
         code(verify(&dir, &file, COMMIT, &[REF], |v| {
-            v.repo = "komira-ai/komira".to_owned();
+            v.signers[0].repo = "komira-ai/komira".to_owned();
         })),
         "not-attested"
     );
     assert_eq!(
         code(verify(&dir, &file, COMMIT, &[REF], |v| {
-            v.signer_workflow = "komira-ai/komira-build-farm/.github/workflows/ci.yml".to_owned();
+            v.signers[0].workflow =
+                "komira-ai/komira-build-farm/.github/workflows/ci.yml".to_owned();
         })),
         "not-attested"
     );
