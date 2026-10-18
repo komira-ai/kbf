@@ -24,6 +24,9 @@ publish.workspace = true
 [features]
 # `testkit`: the scratch host and state helpers other crates' tests of the `host` verbs use.
 testkit = ["kbf-host/testkit"]
+# `test-sandbox`: the global `--root DIR` flag, which puts a host's paths under a scratch directory.
+# Absent from release builds (contract S15); the crate's own tests turn it on.
+test-sandbox = []
 
 [dependencies]
 clap.workspace = true
@@ -38,10 +41,12 @@ serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 kbf-host = { workspace = true, features = ["testkit"] }
-kbf-installer = { workspace = true, features = ["testkit"] }
+kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
+kbf-update.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

@@ -16,7 +16,7 @@ use kbf_host::{Cmd, Exec, HostPath};
 
 use crate::CommitId;
 use crate::helper::restart::Restart;
-use crate::layout::{self, Layout, Platform};
+use crate::layout::{Layout, Platform};
 use crate::run::{Runner, Spawn, SystemRunner};
 use crate::state::PendingConfirm;
 
@@ -197,7 +197,7 @@ pub fn accept_confirm<E: Exec>(
     restart: &Restart,
     pending: &PendingConfirm,
 ) -> Result<(), String> {
-    if host.platform() == Platform::Linux && pending.deadline.is_none() {
+    if host.platform() == Platform::Linux && pending.deadline_wall.is_none() {
         return Err(format!(
             "{} has not been started since the swap: the first boot check has not run",
             pending.commit
@@ -207,7 +207,7 @@ pub fn accept_confirm<E: Exec>(
     let exe = procs
         .exe_of(pid)
         .map_err(|e| format!("cannot read the executable of process {pid}: {e}"))?;
-    let dir = host.join(&layout::release_dir(&pending.commit));
+    let dir = host.join(&host.release_dir(&pending.commit));
     if inside(&exe, &dir) {
         Ok(())
     } else {
@@ -222,7 +222,7 @@ pub fn accept_confirm<E: Exec>(
 /// The releases some process executes from. An error is a host this cannot be told on, and
 /// the caller must then remove nothing.
 pub fn in_use(procs: &dyn Procs, host: &Layout) -> io::Result<BTreeSet<CommitId>> {
-    let releases = resolved(&host.join(&layout::path(layout::RELEASES)));
+    let releases = resolved(&host.join(&host.releases()));
     Ok(procs
         .executables()?
         .iter()

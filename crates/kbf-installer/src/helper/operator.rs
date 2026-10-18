@@ -103,11 +103,10 @@ impl<E: Exec> Operator<'_, E> {
         let Some(p) = &state.pending_confirm else {
             return Err(Failure::NeedsOperator("no swap is pending".to_owned()));
         };
-        if p.order_id.as_deref() != Some(activation) {
+        if p.activation != activation {
             return Err(Failure::Refused(format!(
                 "the pending swap of {} was made by {}, not by {activation:?}",
-                p.commit,
-                p.order_id.as_deref().unwrap_or("(none)")
+                p.commit, p.activation
             )));
         }
         Ok(p.clone())
@@ -137,7 +136,7 @@ impl<E: Exec> Operator<'_, E> {
             return Ok(());
         }
         let done = self.moving(&lock, &state, |exec, out| {
-            activate::revert_in(exec, &lock, state.clone(), out)
+            activate::revert_in(exec, self.host, &lock, state.clone(), out)
         })?;
         self.say(&format!(
             "reverted {} ({activation}): {} is current",
@@ -149,13 +148,13 @@ impl<E: Exec> Operator<'_, E> {
     /// `current` back to `previous`, with no window; refused while a swap is pending.
     pub fn rollback(&mut self) -> Result<(), Failure> {
         let (lock, state) = self.locked()?;
-        let to = activate::rollback_target(&*self.exec, &state)?;
+        let to = activate::rollback_target(&*self.exec, self.host, &state)?;
         if !self.apply {
             self.say(&format!("would roll back to {to}"));
             return Ok(());
         }
         let done = self.moving(&lock, &state, |exec, out| {
-            activate::rollback_in(exec, &lock, state.clone(), out)
+            activate::rollback_in(exec, self.host, &lock, state.clone(), out)
         })?;
         self.say(&format!("rolled back: {} is current", done.to));
         Ok(())

@@ -194,10 +194,7 @@ fn a_refusal_or_no_answer_exits_1_and_says_why() {
         "{err}"
     );
 
-    let gone = {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.local_addr().expect("addr").to_string()
-    };
+    let gone = kbf_testkit::port::dead_addr().to_string();
     let (code, out, err) = kbf(&["cluster", "--api", &gone, "status"]);
     assert_eq!(code, Some(1), "{err}");
     assert!(out.is_empty(), "{out}");

@@ -405,7 +405,7 @@ fn empty_removes_every_entry_whoever_owns_it_and_keeps_the_folder() {
     assert_eq!(names(&home), ["locked"]);
 }
 
-/// Catches (komira-build-farm#652): a sweep that records an error for an entry which
+/// Catches (kbf#652): a sweep that records an error for an entry which
 /// vanished between the listing of its folder and its examination, so `user-delete`
 /// refused with "the sweep for ... is incomplete: ...: No such file or directory".
 /// First the departing uid's own entries (gone before the walk examines them; the one
@@ -444,7 +444,7 @@ fn an_entry_that_vanishes_after_the_listing_is_not_an_error() {
     assert_eq!(names(&triald), ["kept"]);
 }
 
-/// Catches (komira-build-farm#652): a directory being emptied whose entries vanish
+/// Catches (kbf#652): a directory being emptied whose entries vanish
 /// between its listing and their examination (the same daemon, one level down) that
 /// fails the sweep, or one that leaves the directory behind because of it; and the
 /// same for `empty`, which clears the lease user's home. The vanished entries are the
@@ -479,7 +479,7 @@ fn entries_that_vanish_while_a_directory_is_emptied_are_not_an_error() {
     }
 }
 
-/// Catches (komira-build-farm#652): `empty` (the home folder) recording an error for an
+/// Catches (kbf#652): `empty` (the home folder) recording an error for an
 /// entry gone since the listing, or counting it as removed.
 #[test]
 fn empty_passes_over_an_entry_gone_since_the_listing() {
@@ -501,7 +501,7 @@ fn empty_passes_over_an_entry_gone_since_the_listing() {
     assert!(names(&home).is_empty());
 }
 
-/// Catches (komira-build-farm#652): a directory gone between its examination and its
+/// Catches (kbf#652): a directory gone between its examination and its
 /// opening that fails the sweep: another owner's directory the walk searches, and one
 /// of the departing uid it removes.
 #[test]
@@ -519,7 +519,7 @@ fn a_directory_gone_since_it_was_examined_holds_nothing() {
     }
 }
 
-/// Catches (komira-build-farm#652): a removal step that fails on an entry gone since
+/// Catches (kbf#652): a removal step that fails on an entry gone since
 /// it was examined (the unlink or the directory's opening answers "no such file").
 /// The entry is examined, then removed by someone else, then removal runs on the stale
 /// examination: no listing is involved, so this is the narrowest window.
@@ -538,7 +538,7 @@ fn an_entry_gone_since_it_was_examined_is_removed_already() {
     }
 }
 
-/// Catches (komira-build-farm#652): a directory removed after the walk opened it that
+/// Catches (kbf#652): a directory removed after the walk opened it that
 /// fails the walk when listed. The walk relies on rustix's `Dir`, which reads a removed
 /// directory as empty (its own fallback for the "no such file or directory" the kernel
 /// answers), so this pins that.
@@ -551,7 +551,7 @@ fn listing_a_directory_removed_since_it_was_opened_finds_nothing() {
     assert_eq!(listed(&opened).unwrap(), Vec::<OsString>::new());
 }
 
-/// Catches (komira-build-farm#652): a fix that swallows more than "no such file": a
+/// Catches (kbf#652): a fix that swallows more than "no such file": a
 /// folder the sweep cannot read (permission denied) must still leave the sweep
 /// incomplete when another entry vanishes in the same walk, and the vanished entry
 /// must not add an error of its own.

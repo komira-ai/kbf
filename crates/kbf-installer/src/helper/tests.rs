@@ -107,19 +107,21 @@ impl Rig {
         for sub in [
             "run",
             "var/run",
-            "var/db/kbf-deploy",
-            "var/lib/kbf-deploy",
+            "var/db/kbf-installer",
+            "var/lib/kbf-installer",
             &format!("{UPDATE}/orders"),
-            "usr/local/kbf/releases",
+            "var/lib/kbf-installer/releases",
         ] {
             fs::create_dir_all(root.join(sub)).expect("seed");
         }
-        let dir = root.join("usr/local/kbf/releases").join(A);
+        let dir = root.join("var/lib/kbf-installer/releases").join(A);
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"binary").expect("binary");
         let service = ServiceRecorder::running(
             4242,
-            root.join("usr/local/kbf/releases").join(A).join("kbf"),
+            root.join("var/lib/kbf-installer/releases")
+                .join(A)
+                .join("kbf"),
         );
         host.answer = service.answer();
         let layout = Layout::new(Root::new(&root).expect("absolute"), platform);
@@ -193,7 +195,10 @@ impl Rig {
 
     /// Release `commit` as a fetch would leave it.
     fn install(&self, commit: &str) {
-        let dir = self.root.join("usr/local/kbf/releases").join(commit);
+        let dir = self
+            .root
+            .join("var/lib/kbf-installer/releases")
+            .join(commit);
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"binary").expect("binary");
     }
@@ -233,7 +238,7 @@ impl Rig {
         self.service.0.borrow_mut().exes = vec![(
             4242,
             self.root
-                .join("usr/local/kbf/releases")
+                .join("var/lib/kbf-installer/releases")
                 .join(commit)
                 .join("kbf"),
         )];
@@ -249,7 +254,7 @@ impl Rig {
 }
 
 fn link(rig: &Rig, name: &str) -> PathBuf {
-    fs::read_link(rig.root.join("usr/local/kbf").join(name)).expect("link")
+    fs::read_link(rig.root.join("var/lib/kbf-installer/releases").join(name)).expect("link")
 }
 
 /// Catches the swap being skipped, the restart being skipped or repeated, a release that
@@ -265,14 +270,8 @@ fn an_activate_order_fetches_swaps_restarts_once_and_is_not_replayed() {
     let mut rig = Rig::new("activate");
     rig.order(5, Verb::Activate, B);
     rig.cycle(T0);
-    assert_eq!(
-        link(&rig, "current"),
-        PathBuf::from(format!("releases/{B}"))
-    );
-    assert_eq!(
-        link(&rig, "previous"),
-        PathBuf::from(format!("releases/{A}"))
-    );
+    assert_eq!(link(&rig, "current"), PathBuf::from(B));
+    assert_eq!(link(&rig, "previous"), PathBuf::from(A));
     assert_eq!(rig.restarts(), 1);
     assert_eq!(rig.fetcher.count(), 1);
     let call = rig.fetcher.calls.lock().expect("lock")[0].clone();
@@ -338,10 +337,7 @@ fn a_failed_fetch_leaves_current_alone_and_reports_refused() {
     rig.order(5, Verb::Activate, B);
     rig.cycle(T0);
     assert_eq!(rig.current(), Some(c(A)));
-    assert_eq!(
-        link(&rig, "current"),
-        PathBuf::from(format!("releases/{A}"))
-    );
+    assert_eq!(link(&rig, "current"), PathBuf::from(A));
     assert_eq!(rig.restarts(), 0);
     assert_eq!(rig.state().pending_confirm, None);
     assert_eq!(rig.status()["state"], "refused");
@@ -630,7 +626,8 @@ fn the_spool_holds_at_most_64_records_and_the_excess_is_deleted() {
 /// one root saw 1801 s ago and which is still there is deleted unread.
 ///
 /// Mutants planted: expiry by the file's mtime (the ancient-mtime record is dropped and the
-/// stale one acted on); first-seen reset every pass (the stale record is acted on).
+/// stale one acted on); first-seen reset every pass (the stale record is acted on); the bound
+/// `>` made `>=` (the record exactly 1800 s old is dropped).
 #[test]
 fn a_record_expires_by_roots_first_seen_time_not_the_files() {
     let mut rig = Rig::new("expiry");
@@ -650,7 +647,7 @@ fn a_record_expires_by_roots_first_seen_time_not_the_files() {
     let mut rig = Rig::new("expiry-stale");
     rig.leases.set(0);
     rig.put(&rig.rec(5, 1, 1, Verb::Activate, B));
-    let memory_path = rig.root.join("var/lib/kbf-deploy/helper.json");
+    let memory_path = rig.root.join("var/lib/kbf-installer/helper.json");
     // Root has seen it at T0 - 1801 already (as a persisted first-seen time).
     let mut memory: serde_json::Value =
         serde_json::from_slice(&fs::read(&memory_path).expect("memory")).expect("json");
@@ -661,6 +658,17 @@ fn a_record_expires_by_roots_first_seen_time_not_the_files() {
     assert_eq!(rig.fetcher.count(), 0);
     assert!(rig.refusal().contains("expired"), "{}", rig.refusal());
     assert_eq!(rig.left(), 0, "and deleted");
+
+    // Exactly 1800 s is still good: a record expires when it is *more than* that old.
+    let mut rig = Rig::new("expiry-edge");
+    rig.put(&rig.rec(5, 1, 1, Verb::Activate, B));
+    let memory_path = rig.root.join("var/lib/kbf-installer/helper.json");
+    let mut memory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&memory_path).expect("memory")).expect("json");
+    memory["first_seen"] = serde_json::json!({ file_name(1, 5): T0 - 1800 });
+    fs::write(&memory_path, serde_json::to_vec(&memory).expect("json")).expect("seed");
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(B)), "1800 s old is not expired");
 }
 
 /// Catches an activation for another platform than this host's: the record claims a macOS
@@ -803,7 +811,7 @@ fn the_window_an_order_asks_for_is_clamped_on_macos() {
         rig.put(&r);
         rig.cycle(T0 + 3);
         let pending = rig.state().pending_confirm.expect("on trial");
-        assert_eq!(pending.deadline, Some(T0 + 3 + kept), "asked {asked}");
+        assert_eq!(pending.deadline_wall, Some(T0 + 3 + kept), "asked {asked}");
     }
 }
 
@@ -882,7 +890,7 @@ fn the_helpers_files_have_their_modes() {
             .mode()
             & 0o777
     };
-    assert_eq!(mode("var/lib/kbf-deploy/helper.json"), 0o600);
+    assert_eq!(mode("var/lib/kbf-installer/helper.json"), 0o600);
     assert_eq!(mode(&format!("{UPDATE}/status.json")), 0o644);
 }
 
@@ -940,14 +948,18 @@ fn a_missing_spool_and_names_that_are_not_records_are_skipped() {
 fn unreadable_state_is_reported_and_unreadable_memory_stops_the_pass() {
     let mut rig = Rig::new("unreadable");
     rig.helper.recover().expect("recovers");
-    fs::write(rig.root.join("var/lib/kbf-deploy/state.json"), b"not json").expect("ruin");
+    fs::write(
+        rig.root.join("var/lib/kbf-installer/state.json"),
+        b"not json",
+    )
+    .expect("ruin");
     let error = rig.helper.cycle(T0).expect_err("cannot read the state");
     assert!(error.to_string().contains("host state"), "{error}");
     rig.helper.recover().expect("recovers into a refusal");
     let memory =
-        fs::read_to_string(rig.root.join("var/lib/kbf-deploy/helper.json")).expect("memory");
+        fs::read_to_string(rig.root.join("var/lib/kbf-installer/helper.json")).expect("memory");
     assert!(memory.contains("refused"), "{memory}");
-    let path = rig.root.join("var/lib/kbf-deploy/helper.json");
+    let path = rig.root.join("var/lib/kbf-installer/helper.json");
     fs::write(&path, b"not json").expect("ruin");
     let error = rig.helper.cycle(T0).expect_err("cannot parse it");
     assert!(error.to_string().contains("helper.json"), "{error}");
@@ -990,7 +1002,13 @@ fn an_expiry_that_cannot_revert_is_reported() {
         &mut Vec::new(),
     )
     .expect("starts");
-    fs::remove_file(rig.root.join("usr/local/kbf/releases").join(A).join("kbf")).expect("gone");
+    fs::remove_file(
+        rig.root
+            .join("var/lib/kbf-installer/releases")
+            .join(A)
+            .join("kbf"),
+    )
+    .expect("gone");
     let before = rig.restarts();
     rig.cycle(T0 + 10 + 601);
     assert_eq!(rig.state().current, Some(c(B)));
@@ -1050,7 +1068,7 @@ fn the_same_id_in_two_epochs_is_two_activations() {
     rig.cycle(T0 + 3);
     assert_eq!(rig.restarts(), 1);
     let pending = rig.state().pending_confirm.expect("on trial");
-    assert_eq!(pending.order_id.as_deref(), Some("7-5"));
+    assert_eq!(pending.activation, "7-5");
     rig.put(&rig.rec(5, 8, 1, Verb::Activate, B));
     rig.cycle(T0 + 6);
     assert_eq!(rig.restarts(), 1, "not the first one's repeat");
@@ -1169,7 +1187,10 @@ fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
         rig.install(o);
     }
     // The first is the oldest by far, and a stray process runs it.
-    let old = rig.root.join("usr/local/kbf/releases").join(others[0]);
+    let old = rig
+        .root
+        .join("var/lib/kbf-installer/releases")
+        .join(others[0]);
     let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000);
     fs::File::open(&old)
         .expect("dir")
@@ -1179,7 +1200,7 @@ fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
 
     rig.order(5, Verb::Activate, B);
     rig.cycle(T0);
-    let releases = rig.root.join("usr/local/kbf/releases");
+    let releases = rig.root.join("var/lib/kbf-installer/releases");
     let there = |c: &str| releases.join(c).exists();
     assert!(there(others[1]), "nothing is collected before the confirm");
 
@@ -1297,7 +1318,7 @@ fn node_and_frontend_orders_have_separate_floors() {
     );
 
     let mut rig = Rig::new("floors-per-kind-reverse");
-    let path = rig.root.join("var/lib/kbf-deploy/helper.json");
+    let path = rig.root.join("var/lib/kbf-installer/helper.json");
     let mut memory: serde_json::Value =
         serde_json::from_slice(&fs::read(&path).expect("memory")).expect("json");
     memory["frontend_epoch"] = 1.into();
@@ -1371,7 +1392,7 @@ fn vetting_and_acting_refuse_what_parsing_already_refuses() {
     let before = rig.state();
     let why = rig
         .helper
-        .prepare(&plain_order(OrderVerb::Activate), &before, &mut memory)
+        .prepare(&plain_order(OrderVerb::Activate), &before, T0, &mut memory)
         .unwrap_err();
     assert!(why.contains("no release claims"), "{why}");
     rig.helper

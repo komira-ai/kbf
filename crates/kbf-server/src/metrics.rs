@@ -1,7 +1,7 @@
 //! `GET /metrics` on the operator API listener: the cache's upload-path metrics
 //! ([`kbf_front::metrics`]), the write tier's when one is attached, the lost-blob
 //! families read from the metadata state ([`kbf_front::Losses`]), and the fill of the
-//! node's one cache when the process has one (`kbf-all-in-one`,
+//! node's one cache when the process has one (`kbf all-in-one`,
 //! [`kbf_storage::local_cache`]), and the storage health of a frontend with a state store
 //! ([`crate::storage_health`]), in the Prometheus text format, for a scraper or for
 //! `curl` while an upload is slow (`docs/api.md#get-metrics`).

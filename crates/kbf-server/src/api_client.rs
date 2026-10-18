@@ -252,10 +252,7 @@ mod tests {
             .expect_err("garbage");
         assert!(matches!(err, ClientError::Malformed { .. }), "{err:?}");
 
-        let gone = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            listener.local_addr().expect("addr")
-        };
+        let gone = kbf_testkit::port::dead_addr();
         let err = OperatorClient::new(gone, None)
             .get("/")
             .expect_err("nothing there");

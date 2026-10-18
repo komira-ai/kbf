@@ -20,8 +20,9 @@ fn pending(commit: &str, deadline: Option<u64>) -> PendingConfirm {
     PendingConfirm {
         commit: c(commit),
         previous: Some(c(A)),
-        deadline,
-        order_id: Some("1-5".to_owned()),
+        activation: "1-5".to_owned(),
+        deadline_wall: deadline,
+        deadline_mono_s: None,
         starts_left: Some(2),
     }
 }
@@ -49,12 +50,12 @@ fn world(
 /// Mutant planted: the `starts_with('/')` filter dropped.
 #[test]
 fn ps_output_keeps_only_absolute_paths() {
-    let out = b"/sbin/launchd\n  /usr/local/kbf/releases/x y/kbf-daemon \nkernel_task\n\n";
+    let out = b"/sbin/launchd\n  /var/lib/kbf-installer/releases/x y/kbf-daemon \nkernel_task\n\n";
     assert_eq!(
         parse_ps(out),
         vec![
             PathBuf::from("/sbin/launchd"),
-            PathBuf::from("/usr/local/kbf/releases/x y/kbf-daemon")
+            PathBuf::from("/var/lib/kbf-installer/releases/x y/kbf-daemon")
         ]
     );
 }
@@ -153,7 +154,7 @@ fn an_answer_that_does_not_say_active_is_no() {
 /// passes); the " (deleted)" test dropped; the boot-check test dropped.
 #[test]
 fn a_confirm_needs_the_new_release_running_and_started_once() {
-    let release = format!("usr/local/kbf/releases/{B}/kbf");
+    let release = format!("var/lib/kbf-installer/releases/{B}/kbf");
     let (layout, dir, svc, host) = world("svc-accept", &release);
     let ok = |svc: &ServiceRecorder, deadline| {
         let _ = svc;
@@ -165,21 +166,30 @@ fn a_confirm_needs_the_new_release_running_and_started_once() {
             .unwrap_err()
             .contains("first boot check has not run")
     );
+    // A Mac keeps its releases elsewhere and has no boot check: the service runs from there.
     let mac = Layout::new(Root::new(&dir).unwrap(), Platform::MacOs);
+    svc.0.borrow_mut().exes = vec![(
+        77,
+        dir.join(format!("usr/local/kbf-installer/releases/{B}/kbf")),
+    )];
     assert_eq!(
         accept_confirm(&host, &svc, &mac, &systemd(), &pending(B, None)),
         Ok(()),
         "macOS has no boot check"
     );
+    svc.0.borrow_mut().exes = vec![(77, dir.join(&release))];
 
     for (exe, why) in [
-        (format!("usr/local/kbf/releases/{A}/kbf"), "another release"),
         (
-            format!("usr/local/kbf/releases/{B}0/kbf"),
+            format!("var/lib/kbf-installer/releases/{A}/kbf"),
+            "another release",
+        ),
+        (
+            format!("var/lib/kbf-installer/releases/{B}0/kbf"),
             "a sibling directory",
         ),
         (
-            format!("usr/local/kbf/releases/{B}/kbf (deleted)"),
+            format!("var/lib/kbf-installer/releases/{B}/kbf (deleted)"),
             "a deleted file",
         ),
         ("usr/bin/kbf".to_owned(), "a file outside"),
@@ -210,10 +220,13 @@ fn paths_are_compared_resolved() {
         dir.file_name().unwrap().to_str().unwrap()
     ));
     symlink(&dir, &via).unwrap();
-    let release = dir.join(format!("usr/local/kbf/releases/{B}"));
+    let release = dir.join(format!("var/lib/kbf-installer/releases/{B}"));
     fs::create_dir_all(&release).unwrap();
     fs::write(release.join("kbf"), b"x").unwrap();
-    let svc = ServiceRecorder::running(77, via.join(format!("usr/local/kbf/releases/{B}/kbf")));
+    let svc = ServiceRecorder::running(
+        77,
+        via.join(format!("var/lib/kbf-installer/releases/{B}/kbf")),
+    );
     let mut host = kbf_host::testkit::ScratchHost::new("svc-resolved-exec");
     host.answer = svc.answer();
     assert_eq!(
@@ -234,12 +247,15 @@ fn paths_are_compared_resolved() {
 fn releases_in_use_are_the_ones_processes_execute_from() {
     let (layout, dir) = host_root("svc-in-use");
     let svc = ServiceRecorder::default();
-    let rel = |c: &str, f: &str| dir.join(format!("usr/local/kbf/releases/{c}/{f}"));
+    let rel = |c: &str, f: &str| dir.join(format!("var/lib/kbf-installer/releases/{c}/{f}"));
     svc.0.borrow_mut().exes = vec![
         (1, rel(B, "kbf")),
         (2, rel(C, "bin/helper (deleted)")),
         (3, dir.join("usr/bin/other")),
-        (4, dir.join("usr/local/kbf/releases/not-a-commit/kbf")),
+        (
+            4,
+            dir.join("var/lib/kbf-installer/releases/not-a-commit/kbf"),
+        ),
     ];
     assert_eq!(
         in_use(&svc, &layout).unwrap(),
@@ -260,10 +276,10 @@ fn the_macos_table_comes_from_ps() {
         Ok(match spawn.args[0].to_str().unwrap() {
             "-ax" => ran(
                 0,
-                "/sbin/launchd\nkernel_task\n/usr/local/kbf/releases/x/kbf-daemon\n",
+                "/sbin/launchd\nkernel_task\n/var/lib/kbf-installer/releases/x/kbf-daemon\n",
                 "",
             ),
-            "-p" => ran(0, "/usr/local/kbf/releases/x/kbf-daemon\n", ""),
+            "-p" => ran(0, "/var/lib/kbf-installer/releases/x/kbf-daemon\n", ""),
             other => panic!("unexpected ps {other}"),
         })
     });
@@ -272,12 +288,12 @@ fn the_macos_table_comes_from_ps() {
         procs.executables().unwrap(),
         vec![
             PathBuf::from("/sbin/launchd"),
-            PathBuf::from("/usr/local/kbf/releases/x/kbf-daemon")
+            PathBuf::from("/var/lib/kbf-installer/releases/x/kbf-daemon")
         ]
     );
     assert_eq!(
         procs.exe_of(812).unwrap(),
-        PathBuf::from("/usr/local/kbf/releases/x/kbf-daemon")
+        PathBuf::from("/var/lib/kbf-installer/releases/x/kbf-daemon")
     );
 }
 

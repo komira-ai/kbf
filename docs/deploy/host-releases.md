@@ -8,32 +8,58 @@ updates the host pulled: both call the `kbf-installer` crate, so a host has **on
 file and one layout**, on Linux and on macOS.
 
 ```text
-/usr/local/kbf/releases/<commit>/   one release: kbf (Linux) or kbf-daemon (macOS), units/
-/usr/local/kbf/current              link to releases/<commit>, the release that runs
-/usr/local/kbf/previous             link to releases/<commit>, the one before it
-<state dir>/state.json              the deploy state (0600)
-<state dir>/work/                   scratch for a stage in progress, removed after it
-<lock>                              the lock the state is changed under (0600)
+/var/lib/kbf-installer/releases/<commit>/   one release: kbf (Linux) or kbf-daemon (macOS), units/
+/var/lib/kbf-installer/releases/.stage-<commit>.<rand>/   a release being installed, renamed to <commit>
+/var/lib/kbf-installer/releases/current     link to <commit>, the release that runs
+/var/lib/kbf-installer/releases/previous    link to <commit>, the one before it
+<state dir>/state.json                      the installer state, schema 2 (0600)
+<state dir>/state.json.bak                  the last state that read back whole
+<state dir>/work/                           scratch for a stage in progress, removed after it
+<lock>                                      the lock the state is changed under (0600)
+<trust dir>/{gh,trusted_root.jsonl,installer.conf}   what offline verification trusts
 ```
 
-The two platforms differ in the state directory and the lock only:
+The paths are in one place, `kbf_installer::layout`
+(`docs/design/kbf-installer.md`, section 3). The two platforms differ in four of them:
 
 | | Linux | macOS |
 |---|---|---|
-| state dir | `/var/lib/kbf-deploy` | `/var/db/kbf-deploy` |
-| lock | `/run/kbf-deploy.lock` | `/var/run/kbf-deploy.lock` |
+| installer tree | `/var/lib/kbf-installer` | `/usr/local/kbf-installer` |
+| state dir | the installer tree | `/var/db/kbf-installer` |
+| lock | `/run/kbf-installer/lock` | `/var/run/kbf-installer/lock` |
+| trust dir | `/usr/share/kbf-installer/trust` | `/usr/local/kbf-installer/trust` |
 
-The Linux state directory keeps its name: live hosts use it. macOS has no `/run`, and
-`/var/db` is where it keeps system state. `kbf-deploy host` takes the platform it was
-built for; `--platform linux|macos` names the other (for a mounted image). On a fresh Mac
-the install makes the `/usr/local` and the state directory it lacks, root-owned and 0755;
-a `/usr/local` that is there is not touched.
+This replaces the earlier `/usr/local/kbf`, `/var/lib/kbf-deploy` and
+`/usr/local/libexec/kbf-deploy` (a path change made together in `kbf-deploy` and the
+macOS LaunchDaemon, with no migration of an existing host: that is a separate step). The
+installer's tree is root's and `kbf`'s own state, `/var/lib/kbf`, is never touched.
+`kbf-deploy host` takes the platform it was built for; `--platform linux|macos` names the
+other (for a mounted image). On a fresh Mac the install makes the `/usr/local` and the
+directories it lacks, root-owned and 0755; a `/usr/local` that is there is not touched.
 
-`<commit>` is always the full 40-character lowercase commit id. The links are relative
-(`releases/<commit>`). A release directory, its `units/` and its binaries are root's and
-0755 (units 0644), so the user a service runs as cannot replace its own binary. A Linux
-release holds `kbf`; a macOS release holds `kbf-daemon`, which is what the Mac's
-LaunchDaemon runs (`/usr/local/kbf/current/kbf-daemon`). A release may hold both.
+`<commit>` is always the full 40-character lowercase commit id. The links sit beside the
+releases and name their release relative to themselves (`<commit>`). A release directory,
+its `units/` and its binaries are root's and 0755 (units 0644), so the user a service runs
+as cannot replace its own binary. A Linux release holds `kbf`; a macOS release holds
+`kbf-daemon`, which is what the Mac's LaunchDaemon runs
+(`/usr/local/kbf-installer/releases/current/kbf-daemon`). A release may hold both.
+
+**How a host is written** (the order is the crash story):
+
+1. A new release is made under `releases/.stage-<commit>.<rand>/`, each binary read back and
+   compared with its source, every file and directory synced, then renamed to
+   `releases/<commit>/` and `releases/` synced. The final name never holds a half release.
+2. Only then is `state.json` written: the last good one first becomes `state.json.bak`,
+   then the new one replaces `state.json` (written aside, synced, renamed, directory synced).
+3. Only then do the links move, `previous` before `current`, each made as `<name>.new` and
+   renamed over `<name>`. `state.json` is the truth: a crash between 2 and 3 leaves links
+   that the next `reconcile` makes agree with it.
+
+**A damaged state is not an empty one.** If `state.json` is missing or does not parse, the
+backup is used. If neither is usable and the host has a `current` or `previous` link, the
+verb stops with exit code 5 (an operator must restore the file) and writes nothing. A host
+with no state and no link has never been activated and starts empty. A `state.json` of
+another schema is refused, and the backup is not tried.
 
 ## The verbs
 
@@ -64,7 +90,7 @@ sudo kbf-deploy host gc [--keep N] [--apply]
 Each refuses while a commit-confirm deploy is pending in the state.
 
 **No verb restarts a service.** After `install --apply` or `rollback --apply`, restart
-the units that run `/usr/local/kbf/current/kbf` by hand (`sudo systemctl restart
+the units that run `/var/lib/kbf-installer/releases/current/kbf` by hand (`sudo systemctl restart
 <unit>`), then check `kbf-deploy host status`. Installing the units and restarting them
 belongs to `kbf-deploy linux install-units`.
 
@@ -105,15 +131,16 @@ message.
 
 ### What is trusted
 
-**MVP trust:** a host trusts the GitHub build attestation of `komira-ai/komira-build-farm`'s
-artifacts workflow (`artifacts.yml`) for a source ref, `refs/heads/main` unless the host's
+**MVP trust:** a host trusts the GitHub build attestation of `komira-ai/kbf`'s
+artifacts workflow (`artifacts.yml`; for one release cycle also under the name
+`komira-ai/komira-build-farm`, which releases attested before the rename carry) for a source ref, `refs/heads/main` unless the host's
 settings name others, verified offline with a pinned `gh` and a pinned Sigstore trusted
 root. The frontend and the inbox are untrusted bytes until the attestation passes; the
 frontend only says which commit and carries the files. Residuals: `main` is not
 branch-protected, there is no downgrade floor in the MVP (an older attested release is
 accepted), and a separate Ed25519 release key is a documented later option.
 
-The trust list is `/usr/local/libexec/kbf-deploy/`, root-owned and closed to group and
+The trust list is the trust directory above (`/usr/share/kbf-installer/trust/` on Linux), root-owned and closed to group and
 other writes, the same on both platforms:
 
 - `gh`: the pinned GitHub CLI release (2.102.0 at this writing; Linux amd64 and arm64

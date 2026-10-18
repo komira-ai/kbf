@@ -180,7 +180,7 @@ const CHECK: [&str; 3] = [
 ];
 
 /// The defaults of the timings: the quiesce wait and follow interval, the watchdog, and
-/// Envoy's check (the box render's: `kbf-deploy envoy render --topology box`).
+/// Envoy's check (the installer's box render).
 const QUIESCE_SECS: &str = "10";
 const FOLLOW_INTERVAL_MS: &str = "200";
 const WATCHDOG_SECS: &str = "15";
@@ -200,6 +200,13 @@ pub struct FrontendFlags {
     /// How this frontend hands over to a successor and takes over from a predecessor;
     /// `None` without `--handover-socket`.
     pub handover: Option<Handover>,
+}
+
+/// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
+/// ([`parse`]): every flag outside [`ALLOWED`] and the thread flags.
+#[must_use]
+pub fn refused_flags() -> std::collections::BTreeSet<String> {
+    crate::flag_set::refused_names(ALLOWED)
 }
 
 /// The command line of `kbf frontend`: [`Args`]'s, those it takes shown and the rest
@@ -894,16 +901,29 @@ impl<'a> Prepared<'a> {
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
         let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
+        let update_rows = state_store.clone().map(crate::update::Rows::new);
         let api_routes = crate::api::router(
             Arc::clone(&farm),
             token.clone(),
             Arc::clone(&drain),
             members.clone(),
+            update_rows.clone(),
             // The enroll service and the CA that gives it a pin come with the frontend's
             // enroll listener; until it exists, the enrollment routes answer 404.
             None,
         )
-        .merge(crate::release::router(releases.clone(), token))
+        .merge(crate::release::router(releases.clone(), token.clone()))
+        .merge(crate::update_hosts::router(
+            Arc::clone(&farm),
+            update_rows.clone(),
+            crate::update_hosts::FarmReaders::from_policy(&policy),
+        ))
+        .merge(crate::release::desired::router(
+            releases.clone(),
+            update_rows,
+            token,
+            Arc::clone(&farm),
+        ))
         .merge(crate::health::router_of(Arc::clone(&checks)))
         .merge(metrics_route(
             backend.clone(),

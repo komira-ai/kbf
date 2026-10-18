@@ -239,7 +239,7 @@ impl<E: Exec> Helper<E> {
         let due = before
             .pending_confirm
             .as_ref()
-            .and_then(|p| p.deadline)
+            .and_then(|p| p.deadline_wall)
             .is_some_and(|d| now >= d);
         let prior = memory.restart_due;
         if due {
@@ -504,7 +504,7 @@ impl<E: Exec> Helper<E> {
         // that died after the swap) is the repeat `activate` recognises.
         let this = format!("{}-{}", order.epoch, order.id);
         if let Some(p) = &before.pending_confirm
-            && p.order_id.as_deref() != Some(this.as_str())
+            && p.activation != this
         {
             return Err(format!(
                 "order {id}: {} is on trial and not yet confirmed or reverted; not activating",
@@ -599,7 +599,7 @@ impl<E: Exec> Helper<E> {
             .pending_confirm
             .as_ref()
             .filter(|p| p.commit == order.commit)
-            .and_then(|p| p.order_id.clone())
+            .map(|p| p.activation.clone())
             .unwrap_or_default();
         // The new release must be what runs before it is kept: a record saying so is the
         // service user's word, and the service user may be the one that is broken.

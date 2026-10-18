@@ -28,7 +28,7 @@ struct Rig {
 }
 
 fn release(root: &std::path::Path, commit: &str) -> PathBuf {
-    let dir = root.join("usr/local/kbf/releases").join(commit);
+    let dir = root.join("var/lib/kbf-installer/releases").join(commit);
     fs::create_dir_all(&dir).expect("release");
     fs::write(dir.join("kbf"), commit).expect("kbf");
     dir
@@ -39,14 +39,11 @@ impl Rig {
     /// service is running B's file as process 4242.
     fn new(name: &str, pending: bool) -> Rig {
         let mut exec = ScratchHost::new(&format!("operator-{name}"));
-        for sub in ["run", "var/lib/kbf-deploy"] {
+        for sub in ["run", "var/lib/kbf-installer"] {
             fs::create_dir_all(exec.root.join(sub)).expect("seed");
         }
         release(&exec.root, A);
         let b = release(&exec.root, B);
-        let kbf = exec.root.join("usr/local/kbf");
-        symlink(format!("releases/{B}"), kbf.join("current")).expect("current");
-        symlink(format!("releases/{A}"), kbf.join("previous")).expect("previous");
         let layout = Layout::linux(Root::new(&exec.root).expect("absolute"));
         let service = ServiceRecorder::running(4242, b.join("kbf"));
         exec.answer = service.answer();
@@ -58,13 +55,18 @@ impl Rig {
                 pending_confirm: pending.then(|| PendingConfirm {
                     commit: c(B),
                     previous: Some(c(A)),
-                    deadline: Some(2_000_000_000),
-                    order_id: Some(ACTIVATION.to_owned()),
+                    activation: ACTIVATION.to_owned(),
+                    deadline_wall: Some(2_000_000_000),
+                    deadline_mono_s: None,
                     starts_left: Some(3),
                 }),
                 ..State::default()
             })
             .expect("state");
+        // The links follow the state: a host with links and no state is not provisioned.
+        let kbf = exec.root.join("var/lib/kbf-installer/releases");
+        symlink(B, kbf.join("current")).expect("current");
+        symlink(A, kbf.join("previous")).expect("previous");
         Rig {
             exec,
             layout,
@@ -105,10 +107,15 @@ impl Rig {
     }
 
     fn link(&self, name: &str) -> String {
-        fs::read_link(self.exec.root.join("usr/local/kbf").join(name))
-            .expect("link")
-            .display()
-            .to_string()
+        fs::read_link(
+            self.exec
+                .root
+                .join("var/lib/kbf-installer/releases")
+                .join(name),
+        )
+        .expect("link")
+        .display()
+        .to_string()
     }
 
     fn said(&self) -> String {
@@ -135,7 +142,7 @@ fn confirm_names_the_pending_activation_and_needs_the_new_release_running() {
         4242,
         rig.exec
             .root
-            .join("usr/local/kbf/releases")
+            .join("var/lib/kbf-installer/releases")
             .join(A)
             .join("kbf"),
     )];
@@ -150,7 +157,7 @@ fn confirm_names_the_pending_activation_and_needs_the_new_release_running() {
         4242,
         rig.exec
             .root
-            .join("usr/local/kbf/releases")
+            .join("var/lib/kbf-installer/releases")
             .join(B)
             .join("kbf"),
     )];
@@ -189,7 +196,7 @@ fn revert_goes_back_restarts_once_and_leaves_no_marker() {
     rig.op(true).revert(ACTIVATION).expect("reverted");
     let state = rig.state();
     assert_eq!((state.current, state.pending_confirm), (Some(c(A)), None));
-    assert_eq!(rig.link("current"), format!("releases/{A}"));
+    assert_eq!(rig.link("current"), A);
     assert_eq!(rig.restarts(), 1);
     assert!(!rig.marker());
 }
@@ -249,7 +256,7 @@ fn rollback_goes_to_previous_and_only_when_nothing_is_on_trial() {
 #[test]
 fn gc_keeps_what_runs_and_removes_nothing_when_it_cannot_tell() {
     let mut rig = Rig::new("gc", true);
-    let releases = rig.exec.root.join("usr/local/kbf/releases");
+    let releases = rig.exec.root.join("var/lib/kbf-installer/releases");
     let running = release(&rig.exec.root, C);
     let stray = release(&rig.exec.root, "dddddddddddddddddddddddddddddddddddddddd");
     let epoch = std::time::UNIX_EPOCH + Duration::from_secs(1000);

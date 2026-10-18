@@ -107,7 +107,7 @@ pub struct Listeners {
 
 /// What keeps a long-lived stream from looking idle to a load balancer, a proxy or the
 /// peer: Buck2 sends one Execute per action and never reconnects a broken one, so an
-/// idle-timeout cut fails the action (komira-build-farm#791). Zero turns each off.
+/// idle-timeout cut fails the action (kbf#791). Zero turns each off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamTiming {
     /// How often every open Execute and WaitExecution stream is sent its operation
@@ -155,7 +155,7 @@ pub struct Api {
     pub token: Option<ApiToken>,
     /// The node's one cache, whose fill `/metrics` reports, when the process runs a
     /// daemon whose input cache shares the disk with this server's store
-    /// (`kbf-all-in-one`).
+    /// (`kbf all-in-one`).
     pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The release store (`--releases-dir`), whose upload route is mounted here and whose
     /// `ReleaseService` the worker listener serves. `None`: the update endpoints answer 503.
@@ -492,7 +492,7 @@ where
 /// are refused UNAVAILABLE, which Buck2 retries when it opens the call; and the REAPI
 /// listener stops accepting and every connection on it is sent GOAWAY. Open Execute and
 /// WaitExecution streams are kept until their action is done: Buck2 does not recover a
-/// stream that breaks (komira-build-farm#791), so ending one fails its action. The
+/// stream that breaks (kbf#791), so ending one fails its action. The
 /// serving future returns once the REAPI connections have closed. Only
 /// `listeners.shutdown_timeout` (when it is not [`Duration::MAX`]) or [`Drain::close`]
 /// (a second stop signal) ends the streams that are not done, UNAVAILABLE, after which
@@ -654,6 +654,10 @@ where
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref());
     let map = map_of(map, members.as_ref())?;
+    // The update rows live in the same store, whose handle is shared.
+    let update_rows = state
+        .as_ref()
+        .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -705,10 +709,22 @@ where
         token.clone(),
         Arc::clone(&drain),
         members.clone(),
+        update_rows.clone(),
         // A server with no frontend role has no enrollment.
         None,
     )
-    .merge(crate::release::router(releases.clone(), token))
+    .merge(crate::release::router(releases.clone(), token.clone()))
+    .merge(crate::update_hosts::router(
+        Arc::clone(&farm),
+        update_rows.clone(),
+        crate::update_hosts::FarmReaders::from_policy(&policy),
+    ))
+    .merge(crate::release::desired::router(
+        releases.clone(),
+        update_rows,
+        token,
+        Arc::clone(&farm),
+    ))
     .merge(health_routes)
     .merge(crate::metrics::router(
         Arc::clone(&cache),

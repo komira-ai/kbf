@@ -67,7 +67,7 @@ kbf-mac-provision revert                                # root: put back the rec
   passed to `kbf node` as a `--label`.
 - `--keys` limits `check` and `apply` to the named items. `--root DIR` runs everything
   under DIR; only the tests use it.
-- The job runs `/usr/local/kbf/current/kbf node --config /usr/local/etc/kbf/kbf.toml`
+- The job runs `/usr/local/kbf-installer/releases/current/kbf node --config /usr/local/etc/kbf/kbf.toml`
   with the node label and the profile's labels. `kbf node` enrolls with the frontend that
   file names and runs the daemon with the certificates the frontend issued, so the
   profile's `kbf_server`, `kbf_cas`, `kbf_ca_cert`, `kbf_cert` and `kbf_key` are not
