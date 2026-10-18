@@ -45,6 +45,12 @@ const READ_WITHIN: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const READ_BYTES: u64 = 4 << 20;
 
+/// The `log show` predicate that selects the sandbox's lines. Where the line is
+/// logged from differs by macOS release and by profile: sender `Sandbox`, or the
+/// kernel itself under the `com.apple.sandbox.reporting` subsystem; every form's
+/// message begins `Sandbox: `.
+pub const PREDICATE: &str = "sender == \"Sandbox\" OR subsystem == \"com.apple.sandbox.reporting\" OR eventMessage BEGINSWITH \"Sandbox: \"";
+
 /// A reader of the sandbox's lines since an action started `ago` (it waits [`SETTLE`]
 /// for the last ones to reach the log, and covers a second more): it may write to the scratch file
 /// `file` (a file, not a pipe: a child another thread spawns can inherit a pipe and hold
@@ -213,7 +219,7 @@ pub fn system_log(file: &Path, ago: Duration) -> io::Result<String> {
     let mut child = Command::new("/usr/bin/log")
         .args(["show", "--style", "compact", "--last"])
         .arg(format!("{}s", last.as_secs().max(1)))
-        .args(["--predicate", "sender == \"Sandbox\""])
+        .args(["--predicate", PREDICATE])
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(Stdio::null())
@@ -285,6 +291,42 @@ mod tests {
         assert_eq!(
             (d.operation.as_str(), d.target.as_str()),
             ("file-write-data", "/a b/c")
+        );
+    }
+
+    /// The line of the slot-user run on a CI Mac (kernel is the sender, the subsystem is
+    /// `com.apple.sandbox.reporting`, the path is the `/private` form of what the action
+    /// wrote), exactly as `log show --style compact` printed it.
+    const KERNEL_LINE: &str = "2026-10-18 03:02:56.960 E  kernel[0:2046a] [com.apple.sandbox.reporting:violation] Sandbox: bash(46466) deny(1) file-write-create /private/var/tmp/kbf-denied-46082";
+
+    /// Catches a parser that drops the line the kernel itself reports, with a subsystem
+    /// in brackets and no `(Sandbox)` sender, and a pid outside the watched set taken as
+    /// the action's.
+    #[test]
+    fn a_line_the_kernel_reports_under_a_subsystem_is_a_denial() {
+        let d = parse_line(KERNEL_LINE).expect("a denial");
+        assert_eq!(
+            (d.pid, d.process.as_str(), d.operation.as_str(), d.target.as_str()),
+            (46466, "bash", "file-write-create", "/private/var/tmp/kbf-denied-46082")
+        );
+        let found = Found::of(KERNEL_LINE, &BTreeSet::from([46466]));
+        assert_eq!(found.mine.len(), 1);
+        assert!(found.note().expect("note").contains("kbf-denied-46082"));
+    }
+
+    /// Catches a predicate that selects only lines whose sender is `Sandbox`: on the
+    /// runner the same denial is the kernel's own, under the sandbox reporting
+    /// subsystem, and `log show` never returned it to the driver (issue #184).
+    #[test]
+    fn the_predicate_selects_the_kernel_reported_line_too() {
+        assert!(PREDICATE.contains("sender == \"Sandbox\""), "{PREDICATE}");
+        assert!(
+            PREDICATE.contains("subsystem == \"com.apple.sandbox.reporting\""),
+            "{PREDICATE}"
+        );
+        assert!(
+            PREDICATE.contains("eventMessage BEGINSWITH \"Sandbox: \""),
+            "{PREDICATE}"
         );
     }
 
