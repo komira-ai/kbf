@@ -352,3 +352,27 @@ async fn a_new_epoch_with_a_lower_id_is_newer_and_an_old_epoch_is_not() {
         "order 9 is of epoch 7, older than the newest accepted, 9"
     );
 }
+
+/// Catches a node taking a frontend update from its session: the order is refused with its
+/// own reason (not the record's), nothing is written, no gate closes and the floor does not
+/// move, so the next real order is taken.
+///
+/// Mutant planted: the guard in `decide` removed (the record's own refusal gives another
+/// message, and the floor has moved).
+#[tokio::test]
+async fn a_frontend_update_order_is_refused_by_a_node_and_moves_nothing() {
+    let target = commit(9);
+    let rig = rig_with_helper("frontend-update", &target, &target);
+    let decision = rig.ask(1, Verb::FrontendUpdate, &target);
+    assert_eq!(
+        why(&decision),
+        "order 1 is a frontend update, which a node does not take from the session"
+    );
+    assert_eq!(rig.orders(), Vec::<String>::new());
+    assert_eq!(rig.handle.gate(), None);
+    assert_eq!(
+        rig.ask(1, Verb::Confirm, &target),
+        Decision::Accepted,
+        "id 1 is still free"
+    );
+}
