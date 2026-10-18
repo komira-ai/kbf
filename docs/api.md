@@ -811,7 +811,7 @@ Both list by end time, newest first; two runs that ended in the same millisecond
 listed latest arrival first. Runs reach the index in the order the writer receives them,
 and a failed run can arrive after runs that ended later, so the order is the index's own,
 not arrival. `next_page` is a cursor, the end time and arrival number of the last run
-listed (`<ended_ms>.<seq>` in the token); the next page lists the runs that sort after it.
+listed (`<ended_ms>.<seq>` in the token); the next page lists the runs that sort before it (older by that key).
 A run that arrives between two pages with an end time older than the cursor is listed on a
 later page; one with a newer end time is not listed by the pages that follow (read the
 first page again to see it). No run is listed twice or skipped by paging.

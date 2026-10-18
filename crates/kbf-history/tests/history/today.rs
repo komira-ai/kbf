@@ -360,7 +360,7 @@ fn runs_are_listed_by_end_time_whatever_order_they_reach_the_index() {
     // on `GET /v1/runs?node=` and `/v1/actions/{digest}/runs`, which promise newest
     // first. Also: a cursor that moves with arrival, not with time (a late run that sorts
     // before the cursor lost, or one that sorts after it listed twice), and a window
-    // search that stops early on the wrong end.
+    // filter applied to arrival order rather than end time.
     let today = Today::new(usize::MAX);
     today.begin(0);
     today.push(on_a(1, 10_050, RunOutcome::Ok));
