@@ -383,6 +383,9 @@ pub enum CrashPoint {
     AfterTakeoverBeforeSwap,
     /// The old child was told to stand down and the retire wait starts.
     WhileDraining,
+    /// The root half confirmed the staged release (`current` names it); `update.json` does
+    /// not say so yet.
+    AfterConfirmLanded,
     /// Rollback: the new child was told to stand down; the old one is not yet told to resume.
     RollbackAfterStandDown,
     /// Rollback: the old child was told to resume; the swap has not read the result.
