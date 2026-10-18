@@ -9,6 +9,11 @@
 # --platform P       linux-x86_64 or linux-arm64 (default: this host)
 # --root DIR         place the files under DIR, not /, and do not require root (for a
 #                    staging directory and for tests)
+# --help             print this usage and exit 0
+#
+# Envoy is not installed here and is not in the payload: a frontend host installs Envoy
+# (a version in the range the release notes name) from its own package first; storage and
+# daemon hosts do not need it.
 #
 # The payload (`cargo xtask installer-tarball`) holds usr/bin/kbf-installer,
 # usr/lib/systemd/system/* and usr/share/kbf-installer/trust/*, and no kbf release:
@@ -31,8 +36,25 @@ die() {
   exit 1
 }
 
+# A heredoc, not the comment above: under `curl | sh` there is no script file to read.
+usage() {
+  cat <<'EOF'
+usage: install.sh [--release-url URL] [--platform linux-x86_64|linux-arm64] [--root DIR] [--help]
+  --release-url URL  where SHA256SUMS and the payload are (default: the latest release)
+  --platform P       default: this host
+  --root DIR         place the files under DIR, not /, and do not require root
+Places kbf-installer, its units and trust files after a sha256 check; starts nothing.
+Envoy is not installed here and is not in the payload: a frontend host installs Envoy
+(a version in the range the release notes name) from its own package first.
+EOF
+}
+
 while [ $# -gt 0 ]; do
   case $1 in
+    --help)
+      usage
+      exit 0
+      ;;
     --release-url | --platform | --root)
       [ $# -ge 2 ] || die "$1 needs a value"
       case $1 in

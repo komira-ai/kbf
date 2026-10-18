@@ -361,6 +361,25 @@ fn the_host_payload_is_placed_where_the_package_puts_it_and_nothing_else() {
 }
 
 #[test]
+fn help_prints_the_usage_and_says_envoy_is_a_frontend_prerequisite() {
+    let out = Command::new(SCRIPT)
+        .arg("--help")
+        .output()
+        .expect("run install.sh");
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    for want in [
+        "--release-url",
+        "--platform",
+        "--root",
+        "Envoy is not installed here",
+        "a frontend host installs Envoy",
+    ] {
+        assert!(text.contains(want), "missing {want:?}: {text}");
+    }
+}
+
+#[test]
 fn a_restrictive_umask_does_not_narrow_the_directories_it_makes() {
     // Catches: the script not setting its own umask: `usr/share/kbf-installer` made
     // 0700 under the caller's 077 would hide the trust files from the `kbf-verify` user.
