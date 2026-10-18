@@ -119,6 +119,9 @@ pub struct Version {
     pub profile: String,
     pub state_schema: u64,
     pub version: String,
+    /// The platform the build says it is for (`linux-x86_64`, ...), when it says one.
+    #[serde(default)]
+    pub platform: Option<String>,
 }
 
 impl Version {

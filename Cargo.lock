@@ -1664,6 +1664,7 @@ dependencies = [
 name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "flate2",
  "hex",
@@ -1671,13 +1672,17 @@ dependencies = [
  "kbf-installer",
  "kbf-update",
  "libc",
+ "rcgen",
  "rustix",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tar",
  "thiserror",
  "tokio",
+ "ureq",
 ]
 
 [[package]]

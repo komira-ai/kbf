@@ -242,6 +242,7 @@ impl Verifier {
             cwd: PathBuf::from(home),
             run_as: Some(self.run_as),
             timeout: self.timeout,
+            confine: None,
         };
         let ran = runner.run(&spawn).map_err(|source| Refusal::Tool {
             what: "gh attestation verify",

@@ -313,6 +313,7 @@ impl Env<'_> {
             cwd: work.empty(),
             run_as: Some(self.settings.run_as),
             timeout: self.settings.timeout,
+            confine: None,
         };
         let ran = self.runner.run(&spawn).map_err(|source| Refusal::Tool {
             what: "the staged binary's --version --json",

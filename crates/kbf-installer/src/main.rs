@@ -34,6 +34,10 @@ enum Verb {
     /// Run before each start of the service: count the start of a release on trial, and
     /// revert one that has used its starts. Exits 0 unless the host's state is unreadable.
     BootCheck(BootArgs),
+    /// Internal: pull one component over HTTPS to standard output. The installer starts it
+    /// itself, as the fetch user, with fixed flags; it is not a command for a person.
+    #[command(hide = true)]
+    FetchChild(kbf_installer::fetch::child::ChildArgs),
 }
 
 #[derive(clap::Args)]
@@ -143,9 +147,13 @@ fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Verb::FetchChild(args) = &cli.verb {
+        return kbf_installer::fetch::child::main(args);
+    }
     let result = match cli.verb {
         Verb::Run(args) => run(cli.root, args),
         Verb::BootCheck(args) => boot_check(cli.root, &args),
+        Verb::FetchChild(_) => unreachable!("handled above"),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

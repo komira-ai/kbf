@@ -44,6 +44,7 @@ fn run(
         cwd: PathBuf::from("/"),
         run_as: None,
         timeout,
+        confine: None,
     };
     let ran = runner
         .run(&spawn)

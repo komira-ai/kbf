@@ -11,6 +11,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::Instant;
 
 use flate2::read::GzDecoder;
 use tar::{Archive, EntryType};
@@ -20,8 +21,41 @@ use crate::refusal::ArchiveFault;
 /// Write the one file `tarball` holds, which must be named `name`, to `dest` (a new file,
 /// mode 0755).
 pub fn unpack_one(tarball: &Path, name: &str, dest: &Path, cap: u64) -> Result<(), ArchiveFault> {
+    unpack_one_until(tarball, name, dest, cap, None)
+}
+
+/// A reader that fails once `deadline` has passed: a read of the tarball is the only place
+/// an unpack waits, so the wall-clock bound of an extraction is a check at each one.
+struct Until<R> {
+    inner: R,
+    deadline: Option<Instant>,
+}
+
+impl<R: Read> Read for Until<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the extraction ran out of time",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// [`unpack_one`], failing (as a malformed archive, naming the time) when `deadline` passes.
+pub fn unpack_one_until(
+    tarball: &Path,
+    name: &str,
+    dest: &Path,
+    cap: u64,
+    deadline: Option<Instant>,
+) -> Result<(), ArchiveFault> {
     let bad = |e: io::Error| ArchiveFault::NotTarGz(e.to_string());
-    let file = File::open(tarball).map_err(bad)?;
+    let file = Until {
+        inner: File::open(tarball).map_err(bad)?,
+        deadline,
+    };
     let mut archive = Archive::new(GzDecoder::new(file));
     let mut seen = 0usize;
     for entry in archive.entries().map_err(bad)? {

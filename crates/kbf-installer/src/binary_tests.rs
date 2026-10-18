@@ -101,6 +101,7 @@ fn the_version_object_is_read_by_its_fields() {
             profile: "release".to_owned(),
             state_schema: 7,
             version: "0.1.0".to_owned(),
+            platform: None,
         }
     );
     let more = version_json(COMMIT, "release").replace('}', ",\"future\":true}");

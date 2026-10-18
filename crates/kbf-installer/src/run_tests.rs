@@ -16,6 +16,7 @@ fn spawn(program: &str, args: &[&str]) -> Spawn {
         cwd: PathBuf::from("/"),
         run_as: None,
         timeout: Duration::from_secs(60),
+        confine: None,
     }
 }
 
@@ -244,7 +245,7 @@ fn the_real_calls_with_the_ids_the_process_has_succeed_or_are_refused_for_a_user
     // coverage is not written out): the same three calls, the first of which already
     // needs root.
     assert_eq!(
-        before_exec(Some(me()), Inherited::Range(HIGH_FD))().map_err(|e| e.kind()),
+        before_exec(Some(me()), Inherited::Range(HIGH_FD), None)().map_err(|e| e.kind()),
         [Err(io::ErrorKind::PermissionDenied), Ok(())][usize::from(is_root)]
     );
 }
@@ -320,10 +321,10 @@ fn the_child_inherits_no_descriptor_from_the_first_up() {
     let found = listed_in(Path::new(FD_DIR), first).expect("the descriptor directory lists");
     assert!(found.contains(&fixed.first), "{found:?}");
     assert!(!found.contains(&fixed.below), "{found:?}");
-    before_exec(None, Inherited::Listed(found.clone()))().expect("marks them");
+    before_exec(None, Inherited::Listed(found.clone()), None)().expect("marks them");
     assert!(cloexec_set(fixed.first) && !cloexec_set(fixed.below));
     fixed.unmark();
-    before_exec(None, Inherited::Range(first))().expect("the range call");
+    before_exec(None, Inherited::Range(first), None)().expect("the range call");
     assert!(cloexec_set(fixed.first) && !cloexec_set(fixed.below));
     fixed.unmark();
     // A real child, by the range way and by the listing: `first` is not inherited, below it is.
@@ -464,7 +465,7 @@ fn a_descendant_that_left_the_group_cannot_hold_the_run() {
 /// Mutant seen red: the `Fails` arm made to succeed.
 #[test]
 fn the_step_before_exec_returns_the_markings_error() {
-    let err = before_exec(None, Inherited::Fails(libc::EPERM))().expect_err("fails");
+    let err = before_exec(None, Inherited::Fails(libc::EPERM), None)().expect_err("fails");
     assert_eq!(err.raw_os_error(), Some(libc::EPERM));
 }
 
