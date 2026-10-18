@@ -38,6 +38,7 @@ async fn a_stop_gives_up_on_a_last_step_that_never_ends() {
     let running = Running {
         handle: Abort(handle),
         stop,
+        workers: Vec::new(),
     };
     let begun = Instant::now();
     finish(Some(running)).await;
@@ -63,6 +64,7 @@ async fn a_stop_returns_as_soon_as_the_last_step_ends_and_nothing_stops_at_once(
     finish(Some(Running {
         handle: Abort(handle),
         stop,
+        workers: Vec::new(),
     }))
     .await;
     assert!(begun.elapsed() < FINAL_STEP, "{:?}", begun.elapsed());
@@ -84,6 +86,7 @@ async fn dropping_a_running_writer_aborts_it_and_nothing_stops_at_once() {
     drop(Running {
         handle: Abort(handle),
         stop,
+        workers: Vec::new(),
     });
     for _ in 0..10 {
         tokio::task::yield_now().await;

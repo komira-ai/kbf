@@ -65,7 +65,7 @@ mod phase;
 mod record;
 
 pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
-pub use handover::LOST_LOOKS;
+pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
 use self::durable::{Durable, Undone};
@@ -249,9 +249,13 @@ struct State {
     /// A handover took the work from this farm ([`Farm::fence`]): it feeds the scheduler
     /// nothing and queues nothing.
     fenced: bool,
-    /// For each operation a successor is followed on ([`Farm::follow`]), how many looks
-    /// in a row found it neither unfinished nor ended.
-    looks: BTreeMap<OperationId, u8>,
+    /// For each operation this farm's callers wait on ([`Farm::follow`]) that the last
+    /// looks found neither unfinished nor ended, how many looks in a row. Only reported
+    /// (`kbf_frontend_relay_untraced`): no look count ends a caller's wait.
+    untraced_kept: BTreeMap<OperationId, u32>,
+    /// The same for the operations relays follow ([`kbf_front::Handed::look`]), until
+    /// the relay lets go of them.
+    untraced_relayed: BTreeMap<OperationId, u32>,
 }
 
 /// How many committed records the farm holds for a state store that refuses them.
@@ -321,7 +325,8 @@ impl Farm {
                 store_down: false,
                 renewed: BTreeMap::new(),
                 fenced: false,
-                looks: BTreeMap::new(),
+                untraced_kept: BTreeMap::new(),
+                untraced_relayed: BTreeMap::new(),
             }),
         }
     }
@@ -869,7 +874,7 @@ impl Dispatch for Farm {
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
-        state.admit(&submission.request)?;
+        state.admit(&submission.request, &usage)?;
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {

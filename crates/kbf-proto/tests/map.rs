@@ -34,6 +34,7 @@ fn member(id: u64, state: MemberState) -> Member {
         },
         weight: 1 + id as u32,
         state,
+        boot: 0,
     }
 }
 
@@ -215,4 +216,37 @@ fn a_heartbeat_without_the_report_says_it_cannot_say() {
         ..Default::default()
     };
     assert_eq!(blind.encode_to_vec(), [0x08, 1, 0x10, 2]);
+}
+
+/// Catches: a boot that does not survive the wire, and a reader that fails on a map from a
+/// frontend that predates the field. A member's boot round-trips through bytes; a member
+/// encoded without field 6 (what an older frontend sends) decodes with boot 0, which
+/// means unknown.
+#[test]
+fn a_members_boot_round_trips_and_an_older_map_without_it_reads_as_zero() {
+    let mut m = member(1, MemberState::Active);
+    m.boot = 7;
+    let wire = pb::Member::from(&m);
+    assert_eq!(wire.boot, 7);
+    let decoded = pb::Member::decode(wire.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(Member::try_from(decoded).unwrap().boot, 7);
+
+    // The bytes an older frontend wrote: the Member as it was, fields 1 to 5 only.
+    let old = [
+        0x08, 0x01, // id = 1
+        0x12, 0x06, b'h', b'o', b's', b't', b'-', b'1', // addr
+        0x20, 0x02, // weight = 2
+        0x28, 0x03, // state = ACTIVE
+    ];
+    let decoded = pb::Member::decode(old.as_slice()).unwrap();
+    let read = Member::try_from(decoded).unwrap();
+    assert_eq!(read.boot, 0, "no field reads as unknown");
+    assert_eq!(read.state, MemberState::Active);
+
+    // The field is number 6, a varint: an older reader skips it as an unknown field.
+    let with_boot = pb::Member::from(&m).encode_to_vec();
+    assert!(
+        with_boot.windows(2).any(|w| w == [0x30, 0x07]),
+        "field 6 on the wire"
+    );
 }

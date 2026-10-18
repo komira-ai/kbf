@@ -556,6 +556,45 @@ async fn a_stop_without_a_handover_drains_as_before() {
     drop(_stop);
     until("the drain begins", async || drain.is_draining()).await;
     assert!(drain.is_unready());
+    // The call is not taken: no operation comes back. How it fails is the transport's to
+    // choose, not the service's. UNAVAILABLE when the service refuses it; but the connection
+    // is idle, so the listener's GOAWAY and close can reach the client before or with the
+    // request: CANCELLED ("connection closed"), or INTERNAL (an h2 GOAWAY, NO_ERROR); and
+    // a channel that reconnects to the closed listener's port can find another process's
+    // HTTP server on it (the stream then ends UNIMPLEMENTED, from a 404). None of these cuts
+    // an open call: there is none. What stays fixed is that no Operation is delivered.
+    let refused = client.execute_with(&job.action, false).await;
+    if let Ok(mut operations) = refused {
+        let first = tokio::time::timeout(Duration::from_secs(20), operations.message())
+            .await
+            .expect("the call is answered");
+        assert!(
+            !matches!(first, Ok(Some(_))),
+            "a stopping frontend took an Execute: {first:?}"
+        );
+    }
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(20), served)
+        .await
+        .expect("the frontend ends")
+        .expect("the task")
+        .expect("served without an error");
+}
+
+/// Catches: the Execute service taking a new call while the drain refuses (the staged
+/// `Drain::refuse`, with no GOAWAY): the call gets UNAVAILABLE from the service itself, on
+/// the connection that is still open, so no transport race can stand in for it (the stop
+/// test above accepts any failure). Mutant: the draining check dropped from `execute`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusing_frontend_answers_a_new_execute_unavailable() {
+    let node = Node::start().await;
+    let dir = Dir::new();
+    let old = Proc::cold(&handover_flags(&node, &dir, "a", &[])).await;
+    let client = Client::connect(old.reapi, old.worker).await;
+    let job = Job::new("refused while the frontend refuses", &[]);
+    client.upload(&job.blobs()).await;
+    assert!(old.drain.refuse(), "the first refusal");
+    assert!(!old.drain.is_draining(), "refusing sends no GOAWAY");
     let refused = client.execute_with(&job.action, false).await;
     assert!(
         refused
@@ -564,7 +603,8 @@ async fn a_stop_without_a_handover_drains_as_before() {
         "{refused:?}"
     );
     drop(client);
-    tokio::time::timeout(Duration::from_secs(20), served)
+    drop(old._stop);
+    tokio::time::timeout(Duration::from_secs(20), old.served)
         .await
         .expect("the frontend ends")
         .expect("the task")

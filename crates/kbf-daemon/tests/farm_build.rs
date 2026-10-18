@@ -167,6 +167,7 @@ fn map(owner: &Node) -> Map {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     Map::new(2, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("map")
 }

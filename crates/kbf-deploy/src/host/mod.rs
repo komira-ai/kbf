@@ -1,14 +1,18 @@
-//! The host side of commit-confirm deploys: where a host keeps kbf's releases and
-//! kbf-deploy's own state, and the `host` verbs that read and change them.
+//! The `host` verbs of the command line: the host side of commit-confirm deploys.
 //!
-//! - [`layout`]: the paths: each release in its own directory under
+//! The layout, the state file and what `install`, `rollback` and `gc` do to a host are
+//! in the `kbf-installer` crate, which this module calls (and re-exports as [`layout`],
+//! [`state`] and [`release`]), so that this manual path and any other caller of the
+//! crate share one state file and one layout:
+//!
+//! - [`layout`]: each release in its own directory under
 //!   `/usr/local/kbf/releases/<commit>/`, the `current` and `previous` links beside them,
 //!   kbf-deploy's state under `/var/lib/kbf-deploy/` and its settings under
 //!   `/etc/kbf-deploy/`.
 //! - [`state`]: `state.json` (the current, previous and staged commits, the one waiting
 //!   to be confirmed, and the order floor), read and written under an exclusive lock on
 //!   `/run/kbf-deploy.lock` and replaced whole by a rename.
-//! - [`release`]: the manual `install`, `rollback` and `gc` verbs.
+//! - [`release`]: the `install`, `rollback` and `gc` verbs.
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //! - [`state_store`]: the SQLite state store's file backed up while the frontend runs
@@ -38,9 +42,7 @@
 //! `--apply` is given; what each does is in [`release`]. They exit 0 when done and 1
 //! with `kbf-deploy: <why>` on stderr when they refuse or a step fails.
 
-pub mod layout;
-pub mod release;
-pub mod state;
+pub use kbf_installer::{CommitId, NotACommit, layout, release, state};
 pub mod state_store;
 
 use std::fmt;
@@ -52,64 +54,9 @@ use clap::{Args, Subcommand};
 use kbf_host::exec::HostExec;
 use kbf_host::path::Root;
 use kbf_host::plan::Mode;
-use serde::{Deserialize, Serialize};
+use kbf_installer::layout::{Layout, Platform};
 
 use state::{CurrentLink, Status};
-
-/// A commit, as Git names it in full: exactly 40 lowercase hex characters. A release
-/// directory, a link target and the state name commits only in this form, so a short or
-/// upper-case id can never name a second copy of one release.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct CommitId(String);
-
-/// Why a string is not a [`CommitId`].
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} is not a commit id (40 lowercase hex characters)")]
-pub struct NotACommit(pub String);
-
-impl CommitId {
-    pub fn new(id: &str) -> Result<CommitId, NotACommit> {
-        let hex = |b: u8| matches!(b, b'0'..=b'9' | b'a'..=b'f');
-        if id.len() == 40 && id.bytes().all(hex) {
-            Ok(CommitId(id.to_owned()))
-        } else {
-            Err(NotACommit(id.to_owned()))
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for CommitId {
-    type Error = NotACommit;
-
-    fn try_from(id: String) -> Result<CommitId, NotACommit> {
-        CommitId::new(&id)
-    }
-}
-
-impl From<CommitId> for String {
-    fn from(id: CommitId) -> String {
-        id.0
-    }
-}
-
-impl std::str::FromStr for CommitId {
-    type Err = NotACommit;
-
-    fn from_str(id: &str) -> Result<CommitId, NotACommit> {
-        CommitId::new(id)
-    }
-}
-
-impl fmt::Display for CommitId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// The `host` verbs of the `kbf-deploy` command line ([`crate::cli`]).
 #[derive(Subcommand)]
@@ -139,6 +86,10 @@ pub struct StatusArgs {
     /// The directory the host's paths are under, such as a mounted image.
     #[arg(long, default_value = "/", value_parser = root)]
     root: Root,
+    /// The host's operating system, which decides where its state and lock are
+    /// (`linux` or `macos`); the one this program was built for by default.
+    #[arg(long)]
+    platform: Option<Platform>,
 }
 
 #[derive(Args)]
@@ -171,9 +122,17 @@ pub struct ApplyArgs {
     /// The directory the host's paths are under, such as a mounted image.
     #[arg(long, default_value = "/", value_parser = root)]
     root: Root,
+    /// The host's operating system, which decides where its state and lock are
+    /// (`linux` or `macos`); the one this program was built for by default.
+    #[arg(long)]
+    platform: Option<Platform>,
 }
 
 impl ApplyArgs {
+    fn layout(&self) -> Layout {
+        layout_of(&self.root, self.platform)
+    }
+
     fn mode(&self) -> Mode {
         if self.apply {
             Mode::Apply
@@ -183,6 +142,10 @@ impl ApplyArgs {
     }
 }
 
+fn layout_of(root: &Root, platform: Option<Platform>) -> Layout {
+    Layout::new(root.clone(), platform.unwrap_or_else(Platform::current))
+}
+
 fn root(dir: &str) -> Result<Root, kbf_host::PathError> {
     Root::new(PathBuf::from(dir))
 }
@@ -190,19 +153,19 @@ fn root(dir: &str) -> Result<Root, kbf_host::PathError> {
 /// Run a `host` verb: see the module docs for what each prints and its exit.
 pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let done = match verb {
-        Host::Status(a) => return status(&a.root, a.json, out, err),
+        Host::Status(a) => return status(&layout_of(&a.root, a.platform), a.json, out, err),
         Host::StateBackup(a) => return state_store::run_backup(a, out, err),
         Host::StateRestore(a) => return state_store::run_restore(a, out, err),
         Host::Install(a) => {
-            let r = &a.apply.root;
+            let host = a.apply.layout();
             let what = release::Install {
                 commit: a.commit,
                 from: a.from,
             };
             let mode = a.apply.mode();
             release::install(
-                &mut HostExec::new(r.clone()),
-                r,
+                &mut HostExec::new(host.root().clone()),
+                &host,
                 release::ROOT,
                 &what,
                 mode,
@@ -210,13 +173,19 @@ pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
             )
         }
         Host::Rollback(a) => {
-            release::rollback(&mut HostExec::new(a.root.clone()), &a.root, a.mode(), out)
+            let host = a.layout();
+            release::rollback(
+                &mut HostExec::new(host.root().clone()),
+                &host,
+                a.mode(),
+                out,
+            )
         }
         Host::Gc(a) => {
-            let r = &a.apply.root;
+            let host = a.apply.layout();
             release::gc(
-                &mut HostExec::new(r.clone()),
-                r,
+                &mut HostExec::new(host.root().clone()),
+                &host,
                 a.keep,
                 a.apply.mode(),
                 out,
@@ -232,8 +201,8 @@ pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     }
 }
 
-fn status(root: &Root, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    let status = match state::status(root) {
+fn status(host: &Layout, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let status = match state::status(host) {
         Ok(status) => status,
         Err(e) => {
             let _ = writeln!(err, "REFUSED: {e}");
@@ -241,9 +210,9 @@ fn status(root: &Root, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> 
         }
     };
     let text = if json {
-        format!("{}\n", status_json(&status))
+        format!("{}\n", status_json(host, &status))
     } else {
-        status_lines(&status)
+        status_lines(host, &status)
     };
     let _ = out.write_all(text.as_bytes());
     ExitCode::from(u8::from(!status.link_matches()))
@@ -262,9 +231,9 @@ impl fmt::Display for Or<'_> {
 }
 
 /// The lines `host status` prints.
-pub fn status_lines(status: &Status) -> String {
+pub fn status_lines(host: &Layout, status: &Status) -> String {
     let s = &status.state;
-    let mut text = format!("state: {}", layout::STATE_FILE);
+    let mut text = format!("state: {}", host.state_file());
     if !status.exists {
         text.push_str(" (none yet)");
     }
@@ -275,12 +244,17 @@ pub fn status_lines(status: &Status) -> String {
         Or(&s.staged)
     ));
     match &s.pending_confirm {
-        Some(p) => text.push_str(&format!(
-            "pending confirm: {} by {} (unix seconds), else back to {}\n",
-            p.commit,
-            p.deadline,
-            Or(&p.previous)
-        )),
+        Some(p) => {
+            let by = match p.deadline {
+                Some(deadline) => format!("by {deadline} (unix seconds)"),
+                None => "once its window starts (its first start)".to_owned(),
+            };
+            text.push_str(&format!(
+                "pending confirm: {} {by}, else back to {}\n",
+                p.commit,
+                Or(&p.previous)
+            ));
+        }
         None => text.push_str("pending confirm: none\n"),
     }
     text.push_str(&format!("order floor: {}\n", s.order_floor));
@@ -302,7 +276,7 @@ pub fn status_lines(status: &Status) -> String {
 }
 
 /// The object `host status --json` prints.
-pub fn status_json(status: &Status) -> serde_json::Value {
+pub fn status_json(host: &Layout, status: &Status) -> serde_json::Value {
     let (kind, target) = match &status.link {
         CurrentLink::Missing => ("missing", None),
         CurrentLink::To(target) => ("link", Some(target.display().to_string())),
@@ -310,7 +284,7 @@ pub fn status_json(status: &Status) -> serde_json::Value {
     };
     serde_json::json!({
         "schema": state::SCHEMA,
-        "state_file": layout::STATE_FILE,
+        "state_file": host.state_file().as_str(),
         "exists": status.exists,
         "state": status.state,
         "current_link": {

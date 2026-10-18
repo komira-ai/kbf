@@ -26,6 +26,9 @@
 // - Hello.phase: what the node is doing besides running leases: switching a Mac's GUI
 //   session for a whole-machine lease, or quarantined (docs/design/worker-protocol.md,
 //   "Node phases"). A Hello without it is a serving node, as before.
+// - DaemonMessage.update_status, ServerMessage.update_offer and update_order: pull-based
+//   self-update (kbf.update.v1, docs/design/pull-updates.md). A server that predates
+//   them ignores update_status; a daemon that predates them ignores the others.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -33,6 +36,7 @@ package kbf.worker.v1;
 import "build/bazel/remote/execution/v2/remote_execution.proto";
 import "google/rpc/status.proto";
 import "kbf/map/v1/map.proto";
+import "kbf/update/v1/update.proto";
 
 // The service a kbf-server front exposes to daemons.
 service Worker {
@@ -51,6 +55,8 @@ message DaemonMessage {
     Result result = 4;
     NodeStatus node_status = 5;
     MapRequest map_request = 6;
+    // What the host's update is doing (docs/design/pull-updates.md); sent on every change.
+    kbf.update.v1.UpdateStatus update_status = 7;
   }
 }
 
@@ -64,6 +70,10 @@ message ServerMessage {
     ResultAck result_ack = 5;
     Cancel cancel = 6;
     MapUpdate map_update = 7;
+    // The release the host should have, after Welcome and at every change.
+    kbf.update.v1.UpdateOffer update_offer = 8;
+    // The frontend's order of the rollout to this host.
+    kbf.update.v1.UpdateOrder update_order = 9;
   }
 }
 

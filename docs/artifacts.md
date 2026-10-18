@@ -4,8 +4,9 @@ kbf's binaries are built by CI, never on a developer's machine, and a node is to
 only bytes CI built and attested. The workflow is
 [`.github/workflows/artifacts.yml`](../.github/workflows/artifacts.yml).
 
-What exists today is the build, the signing, the sums, the attestations on a push to
-`main` or to `feature/arch-v2`, and releases of those files ([`.github/workflows/release.yml`](../.github/workflows/release.yml)).
+What exists today is the build, the signing, the sums, the attestations (and, for each
+tarball, a provenance bundle a host verifies it with offline) on a push to `main` or to
+`feature/arch-v2`, and releases of those files ([`.github/workflows/release.yml`](../.github/workflows/release.yml)).
 The deployment job that verifies an asset before it reaches a node and the node's own
 SHA-256 check are **planned** and not built yet
 ([mac-node-provisioning.md](design/mac-node-provisioning.md) sections 4.1 and 4.2).
@@ -32,7 +33,8 @@ earlier run: add the labels together, before the run you want to keep. The condi
 
 ## What is built
 
-Ten tarballs, each with its SBOM, built by one job per platform:
+Ten tarballs, each with its SBOM and (once the push is attested) its provenance bundle
+([below](#provenance-bundles-verifying-a-tarball-offline)), built by one job per platform:
 
 | Asset | Runner | Target |
 |---|---|---|
@@ -88,7 +90,15 @@ from (`kbf` through the server library it links), and `--version` prints `<binar
 checks that `kbf-server`'s `--version` names `GITHUB_SHA` (`cargo xtask build-commit
 check`), and that `kbf`'s does too and that `kbf --version --json` (below) names the
 same commit and a release build (`build-commit check --json`); the macOS job makes
-the second check on the signed `kbf`, the bytes it packages. `KBF_BUILD_COMMIT_OVERRIDE` replaces the
+the second check on the signed `kbf`, the bytes it packages. Those checks run on the
+binary before it is packaged. After packaging, every job opens the `kbf` tarball it
+wrote and makes the second check again on the binary inside it, with `cargo xtask
+build-commit check-asset <tarball> "$GITHUB_SHA"`: the binary's name and the commit are
+read from the tarball's file name (`<name>-<commit>-<platform>.tar.gz`, and the commit
+must be `GITHUB_SHA`), the tarball must be the one entry `package` writes, and the
+`kbf` extracted from it (to a directory under `target/` that the check removes) must
+pass `check --json`. So the bytes that ship, not only the bytes that were built, name
+the commit. `KBF_BUILD_COMMIT_OVERRIDE` replaces the
 commit in a build, for CI tests that need two stamps from one checkout; a build that
 set it here would fail that check.
 
@@ -124,7 +134,7 @@ one is added, dropped or renamed.
 | Event | What happens |
 |---|---|
 | Pull request, merge queue | A build check: every asset is built, signed, packaged and summed, and `SHA256SUMS` is checked. Nothing is attested, so nothing is published. |
-| Push to `main` or to `feature/arch-v2` | The same, then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`) and an SBOM attestation for every tarball (`actions/attest-sbom`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`). |
+| Push to `main` or to `feature/arch-v2` | The same, then, per platform group (Linux: `sums-linux`, `attest-linux`, `verify-linux`; macOS: `sums-darwin-arm64`, `attest-darwin-arm64`, `verify-darwin-arm64`, so the Linux files are attested as soon as the Linux builds finish, however long the macOS runners queue), the `attest-*` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`), an SBOM attestation for every tarball (`actions/attest-sbom`) and a build provenance attestation of each tarball alone, whose bundle it saves (artifact `bundles-linux` or `bundles-darwin-arm64`), and nothing else. The `verify-*` job of the group then assembles the group's `SHA256SUMS` (artifact `sha256sums-linux` or `sha256sums-darwin-arm64`, listing only that group's files, each with the same subject as in the commit's one `SHA256SUMS`) again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below, for the branch that was pushed (`--source-ref "$GITHUB_REF"`), and every tarball against its bundle, offline, for the commit (`--commit "$GITHUB_SHA"`). |
 
 An attestation names the ref it was signed on: `refs/heads/main` or
 `refs/heads/feature/arch-v2`. The second is there so that a rehearsal of a deployment
@@ -140,20 +150,101 @@ under the exact `if:` that limits it to a push to `main` or to `feature/arch-v2`
 whose `if:` is any other spelling, so no pull request or merge-queue run holds a token
 that can sign an attestation. No repository code runs in
 an `attest-*` job and nothing is built there: it holds those scopes for the pinned signing
-actions alone. Every action is pinned by commit SHA, and that lint refuses one that
-is not.
+actions and for a `cp` that names each bundle (below). Every action is pinned by commit
+SHA, and that lint refuses one that is not.
 
 The attest job of a platform group names each tarball of the group and its SBOM, one `actions/attest-sbom` step per
 tarball, and runs only on a push to one of those two branches. So that a binary added to a build job cannot reach
 `main` without its step, the repository lint (`crates/kbf-it/tests/attested_assets`)
 reads the workflow's `cargo xtask package` lines and its attest steps on every pull
 request, and refuses a packaged tarball with no step pairing it with its own SBOM, or a
-step for a tarball no job packages.
+step for a tarball no job packages. The lint `crates/kbf-it/tests/attested_bundles` does
+the same for the bundles: a packaged tarball with no provenance step of its own, no step
+that names its bundle, or a bundle that is not uploaded, downloaded by the verify job and
+by the release workflow, and required by `release locate`, is named in the pull request. It
+also names a `run:` step in an `attest-*` job that is not the `cp` right after a
+provenance step, so the claim above (no repository code runs while the job holds the
+signing scopes) is checked, not only written.
+
+## Provenance bundles: verifying a tarball offline
+
+A host that runs a tarball verifies it without asking GitHub anything: it is given the
+tarball and `<tarball>.sigstore.json` (for example
+`kbf-<commit>-linux-x86_64.tar.gz.sigstore.json`), the Sigstore bundle of a SLSA build
+provenance attestation whose one subject is that tarball, signed by `artifacts.yml` on
+the push. The bundle holds the signature, the signing certificate and the transparency
+log entry, so `gh attestation verify` needs only a trusted root, a file the host keeps.
+
+```text
+gh attestation trusted-root > trusted_root.jsonl      # on a machine with network, to keep
+gh attestation verify <tarball> \
+  --bundle <tarball>.sigstore.json \
+  --custom-trusted-root trusted_root.jsonl \
+  --repo komira-ai/komira-build-farm \
+  --signer-workflow komira-ai/komira-build-farm/.github/workflows/artifacts.yml \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --source-ref refs/heads/main \
+  --source-digest <commit> \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --deny-self-hosted-runners
+```
+
+- `--source-digest <commit>`: the commit the host is installing (the one in the
+  tarball's name). Without it an attestation made for any commit of the branch that
+  built the same bytes would verify; with it the signed commit must be the one asked for.
+- `--source-ref`, `--signer-workflow`, `--deny-self-hosted-runners`: as for the online
+  command below. `--cert-oidc-issuer` and `--predicate-type` are `gh`'s defaults; they are
+  passed so the command does not change with the `gh` it runs on.
+- `--bundle` and `--custom-trusted-root` make `gh` read the attestation from the file and
+  trust the root given, and fetch nothing. A trusted root is a snapshot of Sigstore's
+  keys: a host that pins one refreshes it with its own updates, and a bundle signed with
+  keys the pinned root does not know does not verify until it is.
+
+How a bundle is made, and what is checked of it:
+
+- **Its own subject.** The `attest-*` job runs `actions/attest-build-provenance` once per
+  tarball with `subject-path` naming that one tarball, so the bundle has that tarball as
+  its only subject and stays the same size however many files a release holds. (The step
+  over `SHA256SUMS` still attests every listed file as one of many subjects; it is what
+  the online check of the SBOM files finds. A tarball is therefore attested twice, and a
+  host is given only its own.)
+- **Its name.** The action leaves the bundle in a temporary directory, as
+  `attestation.json` for every attestation. The step after each provenance step copies it
+  to `dist/<tarball>.sigstore.json`, and the job uploads `dist/*.sigstore.json` as the
+  artifact `bundles-linux` or `bundles-darwin-arm64`.
+- **Not an SBOM's.** The SBOM attestation of a tarball carries the whole SBOM and can be
+  larger than a bundle may be (below); it is not given to a host. A tarball has exactly
+  one bundle, and nothing else has one.
+- **Not in `SHA256SUMS`.** The bundle is made after the sums, from the files they list, so
+  they cannot list it. `cargo xtask verify-assets sums` leaves out names that end
+  `.sigstore.json`, and `cargo xtask release check` holds the directory to one
+  `<tarball>.sigstore.json` per tarball the sums list and none for anything else.
+- **Its size and shape.** A bundle is one line of JSON (`mediaType` of a Sigstore bundle,
+  `dsseEnvelope`, `verificationMaterial`) of at most 256 KiB, the room a host's order
+  record has for one. `release check` refuses an empty file, two bundles in one file and
+  a bigger one.
+- **Its subject.** The statement in the bundle's `dsseEnvelope.payload` (base64 of an
+  in-toto statement) is build provenance (`https://slsa.dev/provenance/v1`) with exactly
+  one subject, whose `sha256` digest is the one `SHA256SUMS` lists for the tarball. A host
+  makes the same comparison with the digest of the bytes it read. `release check` and
+  `verify-assets attestations` refuse a bundle copied under another tarball's name, one
+  that names two subjects or none, and an SBOM attestation, before `gh` is run. (They do
+  not judge the signature: that is `gh`'s.)
+- **Verified as a host does.** `cargo xtask verify-assets attestations dir --commit
+  <commit> --trusted-root trusted_root.jsonl ...` runs the command above on every
+  tarball and its bundle, with the trusted root fetched by `gh attestation trusted-root`,
+  the proxy variables (both spellings) pointing at nothing and `NO_PROXY` removed, so a
+  check that passes did not use the network. Its controls, which must fail: another
+  tarball's bundle for the first tarball (a bundle is one tarball's own), the first
+  tarball's bundle for another commit, and a copy of the first tarball with a byte
+  flipped. The bundles in `dir` are first held to one per listed tarball and none for
+  anything else, so a stray bundle fails the `verify-*` job rather than the release.
 
 ## Where the files are, and for how long
 
 The assets are workflow artifacts of the run (`assets-darwin-arm64`,
-`assets-linux-x86_64`, `assets-linux-arm64`, `sha256sums` for the whole commit, `sha256sums-linux` and `sha256sums-darwin-arm64` for the platform groups). GitHub keeps workflow
+`assets-linux-x86_64`, `assets-linux-arm64`, `sha256sums` for the whole commit, `sha256sums-linux` and `sha256sums-darwin-arm64` for the platform groups, and the provenance
+bundles of a push's tarballs, `bundles-linux` and `bundles-darwin-arm64`). GitHub keeps workflow
 artifacts for at most 90 days, so nothing may depend on them for longer: a script that
 must still fetch an asset later pins a release asset (below). The attestations
 themselves do not expire with the artifacts.
@@ -163,8 +254,9 @@ themselves do not expire with the artifacts.
 A release is the files a push run of `artifacts.yml` on `main` left for one commit,
 attached unchanged to a GitHub release
 ([`.github/workflows/release.yml`](../.github/workflows/release.yml)). Nothing is
-rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, and
-their `SHA256SUMS`.
+rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, their
+`SHA256SUMS`, and the provenance bundle of each tarball, `<tarball>.sigstore.json`, beside
+it.
 
 To cut one, tag a commit on `main` and push the tag:
 
@@ -179,12 +271,17 @@ nothing is published) when:
 - the commit is not on `main` (GitHub's compare of `main...<commit>` is neither
   `identical` nor `behind`);
 - there is no successful `push` run of `artifacts.yml` on `main` for that exact commit,
-  or that run no longer holds all four artifacts (they expire after 90 days, so a
-  release is cut within 90 days of the commit);
+  or that run no longer holds every artifact a release needs (the assets, the sums and
+  the bundles; they expire after 90 days, so a release is cut within 90 days of the
+  commit);
 - a file does not match `SHA256SUMS` (`sha256sum --check --strict`), a file is not
   listed in it, or a listed file is not `<binary>-<commit>-<platform>`;
-- any file's attestations do not verify with the command below (`cargo xtask
-  verify-assets attestations`, with its two controls that must fail).
+- a tarball has no bundle, or a bundle file belongs to no listed tarball, is not exactly
+  one bundle of at most 256 KiB, or does not have its tarball's digest as its one subject
+  (`cargo xtask release check`);
+- any file's attestations do not verify with the command below, or a tarball does not
+  verify against its bundle offline for the tag's commit (`cargo xtask verify-assets
+  attestations`, with its controls that must fail).
 
 `publish` then creates the release with those files. It is the only job with a token
 that can write (`contents: write`), and the workflow lint refuses that scope in a job
@@ -205,8 +302,11 @@ hold for a tag on a commit of `main`; who may push a tag at all is a repository
 setting, not something this workflow controls.
 
 To use an asset, download it from the release and verify it before anything runs it,
-with the command below (the release's notes give it too). The release's `SHA256SUMS`
-lists each asset's SHA-256, but is not itself attested: the attestation is the check.
+with the command below (the release's notes give it too). A tarball also verifies
+offline against the bundle released beside it
+([above](#provenance-bundles-verifying-a-tarball-offline); the notes give that command
+too). The release's `SHA256SUMS` lists each asset's SHA-256, but is not itself attested:
+the attestation is the check.
 
 ## How a node's deployment verifies an asset (planned)
 
@@ -236,10 +336,12 @@ The node itself is then to check the asset's SHA-256 against the value the job h
 it, before it installs anything (planned, with the node's `apply`; design section 4.2).
 
 The `verify` job runs exactly these checks on what `attest` signed (`cargo xtask
-verify-assets attestations`, with read-only scopes, for the branch pushed), and two that
-must fail: the first
-tarball verified as signed by `ci.yml`, and a copy with one flipped byte. If either
-verifies, the job fails.
+verify-assets attestations`, with read-only scopes, for the branch pushed), the offline
+check of each tarball against its bundle ([above](#provenance-bundles-verifying-a-tarball-offline)),
+and checks that must fail: the first tarball verified as signed by `ci.yml`, a copy with
+one flipped byte, the first tarball against the second's bundle, against its own for
+another commit, and the flipped copy against its own. If any of them verifies, the job
+fails.
 
 ## macOS signing: what ad hoc with the hardened runtime gives
 
