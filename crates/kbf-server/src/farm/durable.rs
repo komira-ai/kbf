@@ -616,16 +616,27 @@ impl Durable {
         self.commit(txn.put(queue_key(requeue.operation), Vec::new(), Cond::Any))
     }
 
-    /// A result accepted from `lease`: the operation is finished. Compare-and-set on
-    /// the operation's lease: a result of a lease the operation no longer holds is
-    /// refused, whatever was proposed.
+    /// A result accepted from `lease`: the operation is finished. The lease row goes if
+    /// it is there, compare-and-set on its version. It may be gone: the scheduler lets a
+    /// worker's result decide an operation whose lease it gave up in the same feed, and
+    /// that give-up ([`Durable::requeued`]) already deleted the row and put the queue row
+    /// back. The operation's own rows go either way, so a finished operation is never
+    /// left queued. A lease row gone with no queue row is not that give-up: `Missing`.
     fn finished(&self, operation: OperationId, lease: LeaseId) -> Result<(), StateError> {
         let key = lease_key(lease);
-        let row = self.row(&key)?;
+        let mut txn = Txn::new();
+        match self.store.get(&key)? {
+            Some(row) => txn = txn.delete(key, Cond::Version(row.version)),
+            // Gone with the operation queued again is the farm's own give-up. Gone
+            // without is another writer's doing: the result is stale.
+            None => {
+                if self.store.get(&queue_key(operation))?.is_none() {
+                    return Err(StateError::Missing(key));
+                }
+            }
+        }
         self.commit(
-            Txn::new()
-                .delete(key, Cond::Version(row.version))
-                .delete(op_key(operation), Cond::Any)
+            txn.delete(op_key(operation), Cond::Any)
                 .delete(queue_key(operation), Cond::Any)
                 .delete(loss_key(operation), Cond::Any)
                 .delete(fate_key(operation), Cond::Any),
