@@ -17,12 +17,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use sha2::Digest;
 use xtask::package::Platform;
+
+mod support;
+use support::{BUSY_WAIT, output_unbusy};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
@@ -279,12 +283,28 @@ fn run_in(name: &str, files: Release, args: &[&str], extra_path: Option<&Path>, 
     run_with_path(&dir, files, args, extra_path, root, path)
 }
 
+/// Copies the fake to `to` and returns once it can be executed.
+///
+/// The copy leaves `to` open for writing in any child another test thread forked
+/// meanwhile, until that child execs; exec of such a file is `ETXTBSY` (komira-ai/
+/// komira-build-farm#1073). Callers here do not exec it themselves: `install.sh` does,
+/// in a child this test cannot retry. So wait here, once, with a harmless call (the
+/// fake run as `uname -s`, by `arg0`). One successful exec means no holder of the write
+/// descriptor is left, and none can appear later, since a fork after the copy returned
+/// does not inherit a descriptor this process has closed.
+fn copy_fake(to: &Path) {
+    std::fs::copy(FAKE, to).expect("copy the fake");
+    let out = output_unbusy(Command::new(to).arg0("uname").arg("-s"), BUSY_WAIT)
+        .expect("the copied fake runs");
+    assert!(out.status.success(), "the copied fake: {:?}", out.status);
+}
+
 /// PATH with `dir/fakes` first, holding the fake `systemd-sysusers` and `systemd-tmpfiles`.
 fn path_with_fake_systemd(dir: &Path) -> std::ffi::OsString {
     let fakes = dir.join("fakes");
     std::fs::create_dir_all(&fakes).expect("fakes");
     for tool in ["systemd-sysusers", "systemd-tmpfiles"] {
-        std::fs::copy(FAKE, fakes.join(tool)).expect("fake systemd tool");
+        copy_fake(&fakes.join(tool));
     }
     let mut path = fakes.into_os_string();
     path.push(":");
@@ -608,10 +628,46 @@ fn an_unknown_host_is_refused_before_any_download() {
     // Catches: a detection that falls through to some default platform. `uname` is the
     // fake of a riscv64 Linux host.
     let dir = scratch("fake-uname");
-    std::fs::copy(FAKE, dir.join("uname")).expect("fake uname");
+    copy_fake(&dir.join("uname"));
     let r = run_in("unknown-host", release().clone(), &[], Some(&dir), true);
     r.assert_refused("unsupported platform Linux-riscv64");
     assert_eq!(r.requests, Vec::<String>::new());
+}
+
+#[test]
+fn a_linux_host_is_mapped_to_the_payload_of_its_machine_name() {
+    // Catches: a detection that lacks a name Linux reports. `arm64` is what some Linux
+    // kernels and containers print for `uname -m` where most print `aarch64`; dropping
+    // the alias refuses those hosts as unsupported. `uname` is the fake, told the
+    // machine by `XTASK_FAKE_MACHINE`.
+    for (machine, want) in [
+        ("x86_64", Platform::LinuxX86_64),
+        ("aarch64", Platform::LinuxArm64),
+        ("arm64", Platform::LinuxArm64),
+    ] {
+        let dir = scratch(&format!("machine-{machine}"));
+        copy_fake(&dir.join("uname"));
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).expect("root");
+        let (url, seen) = serve(release().clone());
+        let mut path = dir.clone().into_os_string();
+        path.push(":");
+        path.push(path_with_fake_systemd(&dir));
+        let out = Command::new(SCRIPT)
+            .env("XTASK_FAKE_MACHINE", machine)
+            .env("PATH", path)
+            .args(["--release-url", &url, "--root"])
+            .arg(&root)
+            .output()
+            .expect("run install.sh");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{machine}: {err}");
+        assert_eq!(
+            *seen.lock().expect("log"),
+            ["/SHA256SUMS", &format!("/{}", tarball_name(want))],
+            "{machine}"
+        );
+    }
 }
 
 #[test]
@@ -619,7 +675,7 @@ fn without_root_it_refuses_unless_the_files_go_under_a_root_directory() {
     // Catches: a placement into `/` as a user that cannot (a half-placed package), and a
     // `--root` check that wrongly demands root. `id` is the fake of uid 1000.
     let dir = scratch("fake-id");
-    std::fs::copy(FAKE, dir.join("id")).expect("fake id");
+    copy_fake(&dir.join("id"));
     let r = run_in("not-root", release().clone(), &[], Some(&dir), false);
     r.assert_refused("must run as root");
     assert_eq!(r.requests, Vec::<String>::new());
@@ -927,10 +983,8 @@ fn the_fake_uname_and_id_answer_only_what_the_script_asks() {
         std::fs::copy(FAKE, dir.join(tool)).expect("fake");
     }
     let ask = |tool: &str, arg: &str| {
-        let out = std::process::Command::new(dir.join(tool))
-            .arg(arg)
-            .output()
-            .expect("run the fake");
+        let out =
+            output_unbusy(Command::new(dir.join(tool)).arg(arg), BUSY_WAIT).expect("run the fake");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),

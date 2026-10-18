@@ -47,7 +47,7 @@
 //! - Run as `sudo`, it appends `<working directory>: <arguments>` as one line to
 //!   `sudo-args` next to it, and exits 0 (the tests it was asked to run passed).
 //! - Run as `uname` (by name, from PATH, or by path), it is a host that is no platform of
-//!   ours: `-s` prints `Linux` and `-m` prints `riscv64`. Run as `id`, `-u` prints 1000
+//!   ours: `-s` prints `Linux` and `-m` prints `riscv64` (or `XTASK_FAKE_MACHINE` when set). Run as `id`, `-u` prints 1000
 //!   (a user that is not root).
 //! - Run as `systemd-sysusers` or `systemd-tmpfiles` (by name, from PATH, or by path), it
 //!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
@@ -456,7 +456,12 @@ fn systemd(name: &str, args: &[String]) -> ExitCode {
 fn uname(args: &[String]) -> ExitCode {
     match args {
         [a] if a == "-s" => println!("Linux"),
-        [a] if a == "-m" => println!("riscv64"),
+        [a] if a == "-m" => {
+            println!(
+                "{}",
+                std::env::var("XTASK_FAKE_MACHINE").unwrap_or("riscv64".to_owned())
+            );
+        }
         _ => return ExitCode::FAILURE,
     }
     ExitCode::SUCCESS
