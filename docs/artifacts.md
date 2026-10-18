@@ -110,9 +110,13 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"commit":"0123456789ab","min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
+{"admin_protocol":1,"commit":"0123456789ab","min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
 ```
 
+- `admin_protocol`: the version of the admin calls of `kbf --mode frontend` (`GET role`,
+  `POST quiesce`, `resume`, `takeover`, `stand-down`: `docs/api.md`). It is the contract
+  between a proxy and the frontend processes it starts; a call or an answer field that
+  changes meaning raises it.
 - `commit`: the first 12 hex digits of the commit built (`unknown` for a build with no
   git checkout); compare it with the first 12 of the commit in the asset's name.
 - `profile`: `release` for every asset here (the workflow refuses a `debug` one).

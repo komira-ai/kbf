@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use kbf_state::{Fenced, Store};
+use kbf_state::{
+    Changes, Commit, CommitStats, Conflict, Fenced, GENERATION, Revision, ScanPage, ScanRange,
+    Store, StoreError, StoreTime, Txn, Versioned,
+};
 
 use crate::farm::{EpochPolicy, StateError};
 use crate::members::MembershipConfig;
@@ -121,6 +124,18 @@ impl StateStoreUri {
         self.open_at(Some(generation), EpochPolicy::Keep)
     }
 
+    /// Opens the store to wait for a takeover: the generation is not taken, the epoch is
+    /// not touched and nothing is written ([`Candidate`]). The backend's own open still
+    /// refuses a store whose schema version this build does not support; no schema is
+    /// made or changed here.
+    ///
+    /// # Errors
+    /// [`StateError::Open`]: as [`StateStoreUri::open`].
+    pub fn open_candidate(&self) -> Result<Candidate, StateError> {
+        let Self::Sqlite(path) = self;
+        Ok(Candidate::over(open_sqlite(path)?))
+    }
+
     fn open_at(&self, expect: Option<u64>, epoch: EpochPolicy) -> Result<StateStore, StateError> {
         let Self::Sqlite(path) = self;
         // This process is the store's writer from here: it takes the next generation, and
@@ -133,6 +148,106 @@ impl StateStoreUri {
             members: MembershipConfig::default(),
             history: None,
         })
+    }
+}
+
+/// A store opened by a process that waits to take over from the one that holds the
+/// generation: it can read, and no write goes through the handle it gives out. It takes
+/// the generation only when [`Candidate::take_over`] is called, expecting the holder's.
+pub struct Candidate {
+    inner: Arc<dyn Store>,
+}
+
+impl Candidate {
+    /// A candidate over an open store (what [`StateStoreUri::open_candidate`] makes of a
+    /// backend's store, and what a test makes of an in-memory one).
+    #[must_use]
+    pub fn over(inner: Arc<dyn Store>) -> Self {
+        Self { inner }
+    }
+
+    /// A handle that reads the store and refuses every write.
+    #[must_use]
+    pub fn reader(&self) -> Arc<dyn Store> {
+        Arc::new(ReadOnly(Arc::clone(&self.inner)))
+    }
+
+    /// The generation the store is at now (0 when no writer has taken one).
+    ///
+    /// # Errors
+    /// [`StateError::Store`]: the store cannot be read, or the row is not a number.
+    pub fn generation(&self) -> Result<u64, StateError> {
+        generation_of(self.inner.as_ref())
+    }
+
+    /// Takes the generation, which must be exactly `expect`, and keeps the epoch: the
+    /// daemons that reconnect keep the runs of their leases. Nothing is written when the
+    /// store is at another generation. Returns the store the caller now writes through
+    /// and the generation it holds.
+    ///
+    /// # Errors
+    /// [`StateError::Open`]: the store is not at `expect`, or another writer took the
+    /// generation first.
+    pub fn take_over(&self, expect: u64) -> Result<(StateStore, u64), StateError> {
+        let fenced = Fenced::take(Arc::clone(&self.inner), Some(expect)).map_err(open_error)?;
+        let held = fenced.generation();
+        let state = StateStore {
+            store: Arc::new(fenced),
+            epoch: EpochPolicy::Keep,
+            members: MembershipConfig::default(),
+            history: None,
+        };
+        Ok((state, held))
+    }
+}
+
+/// The generation row of `store`: 0 when it has none.
+///
+/// # Errors
+/// [`StateError::Store`] when the store cannot be read; [`StateError::Corrupt`] when the
+/// row is not eight bytes.
+pub fn generation_of(store: &dyn Store) -> Result<u64, StateError> {
+    let Some(row) = store.get(GENERATION)? else {
+        return Ok(0);
+    };
+    let bytes = <[u8; 8]>::try_from(row.value.as_slice()).map_err(|_| StateError::Corrupt {
+        key: GENERATION.to_owned(),
+        why: "not an 8-byte number".to_owned(),
+    })?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+/// A store handle that reads and writes nothing: what a candidate probes.
+struct ReadOnly(Arc<dyn Store>);
+
+impl Store for ReadOnly {
+    fn apply_batch(&self, _: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        Err(StoreError::Failed(
+            "this process waits for a takeover and writes nothing".to_owned(),
+        ))
+    }
+    fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
+        self.0.get(key)
+    }
+    fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        self.0.scan_prefix(prefix)
+    }
+    fn scan_range(&self, scan: ScanRange<'_>) -> Result<ScanPage, StoreError> {
+        self.0.scan_range(scan)
+    }
+    fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
+        self.0.changes(after, limit)
+    }
+    fn reap_expired(&self) -> Result<usize, StoreError> {
+        Err(StoreError::Failed(
+            "this process waits for a takeover and writes nothing".to_owned(),
+        ))
+    }
+    fn commit_stats(&self) -> CommitStats {
+        self.0.commit_stats()
+    }
+    fn now(&self) -> StoreTime {
+        self.0.now()
     }
 }
 

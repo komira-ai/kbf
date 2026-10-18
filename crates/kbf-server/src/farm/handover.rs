@@ -33,6 +33,11 @@ const HANDING_OVER: &str = "this frontend is handing its work to its successor";
 /// How often [`Farm::flush_unsettled`] writes again what the state store refused.
 const FLUSH_LOOK: Duration = Duration::from_millis(10);
 
+/// A newer writer holds the state store ([`Farm::resume`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a newer writer holds the state store")]
+pub struct Superseded;
+
 /// One `Result` being taken, counted until dropped.
 pub(super) struct Taking<'a>(&'a AtomicUsize);
 
@@ -83,6 +88,39 @@ impl Farm {
     /// [`Farm::follow`] to answer.
     pub fn fence(&self) {
         self.lock().fenced = true;
+    }
+
+    /// Lets a farm that [`Farm::fence`] stopped for a takeover that did not happen feed the
+    /// scheduler again. Refused when the state store has fenced this process's writes
+    /// (a newer writer holds it: nothing this farm holds can be written, so it can only
+    /// stand down). Nothing was fed while it was fenced, so the farm's memory is the
+    /// store's as of the fence; the caller checks the store's generation first.
+    ///
+    /// # Errors
+    /// [`Superseded`]: a newer writer holds the state store.
+    pub fn resume(&self) -> Result<(), Superseded> {
+        let mut state = self.lock();
+        if state.durable.as_ref().is_some_and(Durable::superseded) {
+            return Err(Superseded);
+        }
+        state.fenced = false;
+        Ok(())
+    }
+
+    /// Whether the state store has refused a write of this farm because a newer writer
+    /// holds it.
+    #[must_use]
+    pub fn superseded(&self) -> bool {
+        self.lock()
+            .durable
+            .as_ref()
+            .is_some_and(Durable::superseded)
+    }
+
+    /// Worker streams open now.
+    #[must_use]
+    pub fn open_sessions(&self) -> usize {
+        self.lock().links.len()
     }
 
     /// Writes, to the state store, the requeues it refused (a lease the scheduler gave

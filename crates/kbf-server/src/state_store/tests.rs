@@ -274,3 +274,50 @@ fn a_refused_state_store_never_echoes_its_value() {
     .expect_err("not UTF-8");
     assert!(!refused.to_string().contains("hunter2"), "{refused}");
 }
+
+fn fake() -> Arc<dyn Store> {
+    use kbf_state::ManualClock;
+    use kbf_state::fake::{Fake, Flaw};
+    Arc::new(Fake::with_flaw(
+        Arc::new(ManualClock::default()),
+        Flaw::None,
+    ))
+}
+
+/// Catches: a candidate that can write (its reader accepts a transaction or a reap), one
+/// that moves the generation before it is told to take it, and a takeover that does not
+/// check the generation it is told to expect (it would fence a holder it was not told
+/// about) or that does not keep the epoch.
+#[test]
+fn a_candidate_reads_writes_nothing_and_takes_exactly_the_generation_it_expects() {
+    use kbf_state::{Cond, Txn};
+    let inner = fake();
+    let holder = Fenced::take(Arc::clone(&inner), None).expect("the first generation");
+    let candidate = Candidate::over(Arc::clone(&inner));
+    assert_eq!(candidate.generation().expect("read"), 1);
+
+    let reader = candidate.reader();
+    assert!(reader.get(GENERATION).expect("reads").is_some());
+    let write = Txn::new().put("probe", b"x".to_vec(), Cond::Any);
+    assert!(reader.txn(write).is_err(), "the reader wrote");
+    assert!(reader.reap_expired().is_err());
+    assert!(inner.get("probe").expect("read").is_none());
+    assert_eq!(
+        candidate.generation().expect("read"),
+        1,
+        "nothing was taken"
+    );
+
+    let refused = candidate.take_over(7).err().expect("not the generation");
+    assert!(refused.to_string().contains("generation 1"), "{refused}");
+    assert_eq!(candidate.generation().expect("read"), 1);
+
+    let (state, held) = candidate.take_over(1).expect("takes generation 1");
+    assert_eq!((held, state.epoch), (2, EpochPolicy::Keep));
+    assert_eq!(candidate.generation().expect("read"), 2);
+    let stale = Txn::new().put("probe", b"x".to_vec(), Cond::Any);
+    assert!(
+        matches!(holder.txn(stale), Err(StoreError::Fenced)),
+        "the old holder was not fenced"
+    );
+}

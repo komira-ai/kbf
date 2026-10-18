@@ -95,6 +95,7 @@ mod listen;
 mod local;
 pub mod log_file;
 pub mod machine;
+pub mod managed;
 mod map_push;
 pub mod mdm;
 pub mod members;
