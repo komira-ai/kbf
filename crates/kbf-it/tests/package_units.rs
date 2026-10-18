@@ -72,7 +72,7 @@ const RUNTIME: [&str; 6] = [
 ];
 
 /// The rules, by the tag a violation starts with.
-const RULES: [&str; 29] = [
+const RULES: [&str; 30] = [
     "install",
     "network",
     "positional",
@@ -102,6 +102,7 @@ const RULES: [&str; 29] = [
     "memory",
     "reload",
     "installer",
+    "runtime",
 ];
 
 fn units_dir() -> PathBuf {
@@ -185,6 +186,13 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
         if has_at_placeholder(code) || (code.contains('<') && code.contains('>')) {
             v("placeholder", format!("line {}: `{code}`", i + 1));
+        }
+    }
+    // Catches a unit that names Podman, in a flag, an environment or a comment: kbf runs
+    // containers with crun only, and a unit that mentions Podman says the host needs it.
+    for (i, line) in text.lines().enumerate() {
+        if line.to_ascii_lowercase().contains("podman") {
+            v("runtime", format!("line {} names Podman", i + 1));
         }
     }
     // Catches a comment inside a continued directive: systemd 239 joins it into the
@@ -969,6 +977,12 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "MemorySwapMax=0",
         "MemorySwapMax=1G",
         "swap",
+    ),
+    (
+        "kbf-storage.service",
+        "[Service]\n",
+        "[Service]\n# rootless PodMan\n",
+        "runtime",
     ),
     (
         "kbf-daemon.service",
