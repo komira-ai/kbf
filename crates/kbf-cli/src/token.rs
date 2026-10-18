@@ -1,5 +1,3 @@
-//! STUB (red): `execute` and `parse_duration` do nothing.
-//!
 //! `kbf token create|list|revoke`: a thin client of the frontend's enrollment API
 //! (`docs/api.md`, `/v1/enroll/tokens`) on the frontend's host. Like `kbf cluster` it holds
 //! no logic of its own: each verb is one call with the operator API token, and the answer's
@@ -130,8 +128,18 @@ impl CreateArgs {
 ///
 /// # Errors
 /// A text that is not a whole number followed by one of `s`, `m`, `h`, `d`.
-pub fn parse_duration(_text: &str) -> Result<u64, String> {
-    Err(String::from("unimplemented"))
+pub fn parse_duration(text: &str) -> Result<u64, String> {
+    let bad = || format!("{text:?} is not a duration like 30m, 24h or 7d");
+    let unit = text.chars().last().ok_or_else(bad)?;
+    let scale = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return Err(bad()),
+    };
+    let number: u64 = text[..text.len() - 1].parse().map_err(|_| bad())?;
+    number.checked_mul(scale).ok_or_else(bad)
 }
 
 impl Verb {
@@ -228,8 +236,23 @@ fn success(reply: Reply) -> Result<String, TokenError> {
 ///
 /// # Errors
 /// See [`TokenError`].
-pub fn execute(_token: &Token) -> Result<String, TokenError> {
-    Err(TokenError::Answer)
+pub fn execute(token: &Token) -> Result<String, TokenError> {
+    let secret = OperatorClient::read_token(&token.verb.auth().token_file)?;
+    let client = OperatorClient::new(token.api, Some(secret));
+    match &token.verb {
+        Verb::List { .. } => success(client.get_gated(TOKENS)?),
+        Verb::Revoke { id, .. } => {
+            let id = TokenId::parse(id).map_err(|_| TokenError::Id)?;
+            success(client.delete(&format!("{TOKENS}/{id}"))?)
+        }
+        Verb::Create(args) => {
+            let body = serde_json::to_string(&args.body()).unwrap_or_default();
+            match &args.out {
+                None => success(client.post(TOKENS, &body)?),
+                Some(path) => create_into(&client, &body, path),
+            }
+        }
+    }
 }
 
 /// The file `path`, new, readable and writable by its owner alone from the moment it
