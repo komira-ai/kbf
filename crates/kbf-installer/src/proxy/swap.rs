@@ -185,7 +185,14 @@ impl<'a> Swap<'a> {
     /// The phase a swap that got through the drain ends in.
     pub(super) fn end_phase(&self) -> Phase {
         if self.intent.rolling_back {
-            Phase::RolledBack
+            // A switch that failed behind the proxy's back recorded its failure
+            // (`switch`) before it rolled back: that is `failed`. The operator's rollback
+            // records none, and is the only `rolled_back`.
+            if self.intent.failure.is_some() {
+                Phase::Failed
+            } else {
+                Phase::RolledBack
+            }
         } else if self.confirm_failed() {
             Phase::Failed
         } else {

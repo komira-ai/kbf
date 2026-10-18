@@ -465,17 +465,19 @@ fn a_failure_that_is_not_the_confirm_does_not_end_a_finished_drain_as_failed() {
 
 #[test]
 fn the_slot_that_may_still_be_the_active_one_is_never_signalled() {
-    // The new child died while the old one drained, and the proxy restarted: nothing
-    // proves the new child serves, so the old child, still the active slot, is left alone.
+    // The new child is alive and holds the generation, so it is the active slot: it is
+    // never signalled, the old child (not the active one) is retired, and no rollback runs.
+    // (With the new child dead the old child used to be left alone for ever; the restart
+    // now reconciles that case first: `reconcile_tests`.)
     let (w, old) = World::with_old();
     w.crash_at.set(Some(CrashPoint::WhileDraining));
     run_to_crash(&w, plan(Mode::Frontend), Some(old));
-    w.kill_pid(101);
-    w.set_limit(secs(7200));
     let (end, _) = restart(&w);
-    assert_eq!(end, Err(Halt::Interrupted));
-    assert_eq!(w.count("terminate"), 0);
-    assert!(w.alive(100));
+    assert_eq!(end, Ok(Phase::Done));
+    assert_eq!(w.count("terminate pid 101"), 0);
+    assert_eq!(w.count("terminate pid 100"), 1);
+    assert_eq!(w.count("admin:resume"), 0);
+    assert!(w.alive(101));
 }
 
 // ---- restarts ----
@@ -727,20 +729,24 @@ fn a_restart_while_a_rollback_drains_the_new_child_finishes_the_rollback() {
 }
 
 #[test]
-fn a_restart_while_the_old_child_drains_when_the_new_one_lost_the_generation_does_not_roll_back() {
+fn a_restart_while_the_old_child_drains_when_the_new_one_lost_the_generation_rolls_back_first() {
+    // The new child is alive and the store says it is not the holder. The old child must
+    // not be left waiting on a slot that serves nothing: the restart rolls back (hold,
+    // resume the old child), retires the new child by SIGTERM and ends the update `failed`
+    // at `switch`. It used to leave both children running for ever.
     let (w, old) = World::with_old();
     w.crash_at.set(Some(CrashPoint::WhileDraining));
     run_to_crash(&w, plan(Mode::Frontend), Some(old));
-    // The new child is alive and the store says it is not the holder; the old child, which
-    // is the slot this proxy has as active, is not retired on that evidence either.
     w.st.borrow_mut().procs[1].holder = false;
     w.set_limit(secs(7200));
     let (end, _) = restart(&w);
-    assert_eq!(end, Err(Halt::Interrupted));
-    assert!(!w.last_intent().rolling_back);
-    assert_eq!(w.count("hold"), 1, "only the switch's");
-    assert_eq!(w.count("admin:resume") + w.count("admin:stand_down B"), 0);
-    assert_eq!(w.count("terminate"), 0);
+    assert_eq!(end, Ok(Phase::Failed), "{:#?}", w.log());
+    assert_eq!(failure(&w).0, Step::Switch);
+    assert_eq!(w.count("hold"), 2, "the switch's and the rollback's");
+    assert_eq!(w.count("admin:resume A"), 1);
+    assert_eq!(w.count("terminate pid 101"), 1);
+    assert_eq!(w.count("terminate pid 100"), 0);
+    assert_eq!(w.count("kill"), 0);
 }
 
 #[test]
@@ -931,15 +937,23 @@ fn a_rollback_asked_for_after_the_new_child_died_notes_the_stand_down_and_comple
 }
 
 #[test]
-fn a_restart_that_finds_the_new_childs_pid_recycled_keeps_the_bake_red_and_never_confirms() {
+fn a_restart_that_finds_the_new_childs_pid_recycled_rolls_back_and_never_signals_it() {
     let (w, old) = World::with_old();
     crash_when(&w, |i| i.phase == Phase::Baking);
     run_to_crash(&w, plan(Mode::Frontend), Some(old));
     // The pid is alive, but it is another process now: the new child is not ours to trust.
     w.recycle(101);
-    w.set_limit(secs(2000));
+    // The store's holder was the child that died; the pid's new owner holds nothing.
+    w.st.borrow_mut().procs[1].holder = false;
     let (end, _) = restart(&w);
-    assert_eq!(end, Err(Halt::Interrupted));
+    assert_eq!(
+        end,
+        Ok(Phase::Failed),
+        "a dead recorded-active child: the switch failed"
+    );
+    assert_eq!(failure(&w).0, Step::Switch);
     assert_eq!(w.count("order confirm"), 0);
     assert_eq!(w.count("terminate pid 101") + w.count("kill pid 101"), 0);
+    assert!(w.alive(101), "pid 101 is someone else now");
+    assert_eq!(w.holders(), vec![Slot::A]);
 }

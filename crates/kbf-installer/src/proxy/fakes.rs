@@ -83,6 +83,8 @@ pub struct State {
     pub open_counts_err: bool,
     pub desired_err: bool,
     pub resume_fails: Vec<Slot>,
+    /// `role` on these slots errors although the process lives (it does not answer).
+    pub role_fails: Vec<Slot>,
     /// How long a process takes to exit after SIGTERM.
     pub term_takes: Duration,
     pub confirm_err: bool,
@@ -150,6 +152,7 @@ impl World {
                 open_counts_err: false,
                 desired_err: false,
                 resume_fails: Vec::new(),
+                role_fails: Vec::new(),
                 term_takes: Duration::ZERO,
                 confirm_err: false,
                 confirm_fails: 0,
@@ -371,6 +374,14 @@ impl World {
         self.crash_at.set(None);
     }
 
+    /// A restart that keeps the crash hook the test just armed, so the next record can
+    /// kill the new proxy too.
+    pub fn proxy_restart_keep_crash_hook(&self) {
+        let hook = self.crash_on_record.borrow_mut().take();
+        self.proxy_restart();
+        *self.crash_on_record.borrow_mut() = hook;
+    }
+
     pub fn last_intent(&self) -> Intent {
         self.records
             .borrow()
@@ -506,6 +517,9 @@ impl Child for World {
 impl ChildAdmin for World {
     fn role(&self, slot: Slot) -> Result<RoleInfo, PortError> {
         self.log_event(format!("admin:role {slot:?}"));
+        if self.st.borrow().role_fails.contains(&slot) {
+            return Err(PortError("role: no answer".into()));
+        }
         let takes = self.st.borrow().quiesce_takes;
         self.with_slot(slot, |p, now| {
             if p.state == RoleState::Quiescing && p.quiesce_at.is_some_and(|t| now >= t + takes) {
