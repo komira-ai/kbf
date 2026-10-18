@@ -5,8 +5,7 @@ updating through the frontend's orders to each node's kbf-installer. Nothing her
 that.
 
 Facts below come from the code at `origin/feature/arch-v2` (25279c9d) and from research.
-Pull-updates (#1039) was still open when this was written. Re-check line references after
-it lands.
+Pull-updates (#1039) landed after they were collected, so line references may have moved.
 
 What is built: section 3's remote listener and section 4's token checks (PR unit a,
 [`kbf_server::oidc`] and [`kbf_server::remote`], `--remote-operator-listen`,

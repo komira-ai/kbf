@@ -106,6 +106,7 @@ pub mod node_map;
 pub mod oidc;
 pub mod raft_log;
 mod rebuild;
+pub mod release;
 pub mod remote;
 pub mod replication;
 pub mod rollout;

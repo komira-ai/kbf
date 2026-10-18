@@ -76,6 +76,9 @@ Options:
       --remote-operator-config <REMOTE_OPERATOR_CONFIG>
           The TOML file whose `[remote_operator]` table holds the allow-list (issuer, audience, repository_id, job_workflow_ref, refs or environments, ...); `kbf.toml` may hold it
 
+      --releases-dir <DIR>
+          The release store (`docs/design/pull-updates.md`, section 6): a directory where the tarballs of a release and their build attestations are kept, uploaded with `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the token) and fetched by the nodes through `ReleaseService.Fetch` on the worker listener, behind its mutual TLS. Made if missing. Without it every update endpoint answers 503 saying so
+
       --invocations-open
           Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy accepts, with no `invocations` or `blobs` key in the policy file (`docs/design/invocations.md` section 4.3): it fills in `allow` for whichever of the two keys the file leaves out. Without it, and without the keys, those routes answer 404. Pages and blobs hold build outputs and logs: give it only for a listener that only trusted people reach
 

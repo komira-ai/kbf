@@ -1,0 +1,34 @@
+[package]
+name = "kbf-signer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The process that holds the CA key (docs/design/install-and-enrollment.md, section 6.1):
+# it serves a Unix socket to the frontend's account alone, re-checks every certificate
+# body it is asked to sign against the table of section 5.5, and signs nothing else. The
+# client of that socket (`SocketSigner`) is a `kbf_ca::Signer` with external custody.
+[[bin]]
+name = "kbf-signer"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+kbf-ca.workspace = true
+# SO_PEERCRED and PR_SET_DUMPABLE (Linux), the effective user id, flock, the clock.
+rustix = { workspace = true, features = ["fs", "net", "process", "time"] }
+thiserror.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+kbf-types.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+time.workspace = true
+x509-parser = { workspace = true, features = ["verify"] }
+
+[lints]
+workspace = true
