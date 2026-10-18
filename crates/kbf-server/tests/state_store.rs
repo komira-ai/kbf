@@ -1391,7 +1391,10 @@ async fn a_request_while_the_finish_is_held_does_not_retake_the_finished_operati
         panic!("the caller was answered with something else");
     };
     assert_eq!(status.message, "test");
-    assert!(starts(&mut inbox).is_empty(), "the action ran a second time");
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "the action ran a second time"
+    );
     assert_eq!(
         (disk.rows("op/"), disk.rows("inflight/"), disk.rows("done/")),
         (0, 0, 1)
