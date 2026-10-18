@@ -2,10 +2,13 @@
 //! reads that would otherwise need the day index the day-close fold writes
 //! (ui-data.md 5.5, `GET /v1/actions/{digest}/runs` and `GET /v1/runs?node=`).
 //!
-//! The writer feeds it from the events it drains, one entry per run, in the order the
-//! runs arrive (which is the order they ended, give or take the queue). It holds at most
+//! The writer feeds it from the events it drains, one entry per run. Runs do not arrive
+//! in the order they ended (a failed run reaches the writer after its logs are copied,
+//! later than runs that ended after it), so the index orders them itself: by the key
+//! (`ended_ms`, arrival sequence), the arrival sequence breaking a tie, and lists the
+//! largest key first. It holds at most
 //! [`Limits::today_bytes`](crate::Limits::today_bytes) of entries and forgets the oldest
-//! first. It is not durable and not complete: a restart empties it, a full queue drops
+//! by that key first. It is not durable and not complete: a restart empties it, a full queue drops
 //! events before the writer sees them, and eviction forgets runs, so an answer carries
 //! [`TodayPage::covers_from_ms`], the time from which the index has every run it was
 //! sent, and a reader says its answer is partial.
@@ -13,6 +16,8 @@
 //! No clock is read here: the writer passes the time of its first step.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::records::{RunOutcome, RunRecord};
@@ -102,7 +107,7 @@ pub struct TodayQuery<'a> {
     /// Runs a page holds at most.
     pub limit: usize,
     /// Where the page starts: after the entry [`TodayPage::next`] named.
-    pub after: Option<u64>,
+    pub after: Option<TodayCursor>,
 }
 
 impl TodayQuery<'_> {
@@ -127,10 +132,41 @@ pub struct TodayPage {
     pub runs: Vec<TodayRun>,
     /// Where the next page starts; `None` after the last entry. A page may be short, or
     /// empty, with one: the search stopped at [`MAX_EXAMINED`].
-    pub next: Option<u64>,
+    pub next: Option<TodayCursor>,
     /// The time from which the index has every run it was sent, milliseconds; `None`
     /// before the writer's first step.
     pub covers_from_ms: Option<u64>,
+}
+
+/// A place in the listing: the sort key of an entry, its end time and its arrival
+/// sequence. A page that was given a cursor lists the entries with a smaller key, newest
+/// first, so a run that arrives late with an older end time than the cursor is on a later
+/// page, and one with a newer end time is not listed by the pages that follow. Printed as
+/// `<ended_ms>.<seq>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TodayCursor {
+    ended_ms: u64,
+    seq: u64,
+}
+
+impl fmt::Display for TodayCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.ended_ms, self.seq)
+    }
+}
+
+impl FromStr for TodayCursor {
+    type Err = ();
+
+    /// The cursor `<ended_ms>.<seq>` prints as, nothing else (no sign, no padding).
+    fn from_str(text: &str) -> Result<TodayCursor, ()> {
+        let canonical = |n: &str| n.parse::<u64>().ok().filter(|v| v.to_string() == n);
+        let (ended, seq) = text.split_once('.').ok_or(())?;
+        Ok(TodayCursor {
+            ended_ms: canonical(ended).ok_or(())?,
+            seq: canonical(seq).ok_or(())?,
+        })
+    }
 }
 
 /// An entry as the indexes hold it: shared, with its place in arrival order.
@@ -140,11 +176,29 @@ struct Entry {
     run: TodayRun,
 }
 
+impl Entry {
+    fn key(&self) -> TodayCursor {
+        TodayCursor {
+            ended_ms: self.run.ended_ms,
+            seq: self.seq,
+        }
+    }
+}
+
+/// Puts `entry` in `entries` (oldest key first), after every entry that ended no later:
+/// its sequence is the largest, so that is where its key sorts. Runs arrive nearly in
+/// order (they are late by the time the tail pool takes), so the entries it passes are
+/// few.
+fn insert(entries: &mut Entries, entry: Arc<Entry>) {
+    let at = entries.partition_point(|e| e.run.ended_ms <= entry.run.ended_ms);
+    entries.insert(at, entry);
+}
+
 type Entries = VecDeque<Arc<Entry>>;
 
 #[derive(Debug, Default)]
 struct State {
-    /// Every entry, in arrival order.
+    /// Every entry, oldest key first.
     runs: Entries,
     /// The sequence of the next entry.
     next: u64,
@@ -154,7 +208,8 @@ struct State {
     /// How many entries each instance has.
     instances: BTreeMap<String, usize>,
     started_ms: Option<u64>,
-    evicted: bool,
+    /// The latest end time among the entries forgotten, once there is one.
+    forgotten_ms: Option<u64>,
 }
 
 impl State {
@@ -170,7 +225,10 @@ impl State {
             count += 1;
         }
         self.bytes -= freed;
-        self.evicted |= count > 0;
+        if let Some(last) = count.checked_sub(1).and_then(|i| self.runs.get(i)) {
+            let ended = last.run.ended_ms;
+            self.forgotten_ms = self.forgotten_ms.max(Some(ended));
+        }
         let State {
             runs,
             by_action,
@@ -188,8 +246,8 @@ impl State {
     }
 }
 
-/// Drops the oldest entry of `key` (the one being forgotten is the oldest of all, so the
-/// oldest of its key), and the key with its last entry.
+/// Drops the oldest entry of `key` (the one being forgotten has the smallest key of all,
+/// so of its key), and the key with its last entry.
 fn drop_oldest<K: Ord>(index: &mut BTreeMap<K, Entries>, key: &K) {
     let emptied = index.get_mut(key).is_some_and(|entries| {
         entries.pop_front();
@@ -239,7 +297,8 @@ impl Today {
         self.state().started_ms.get_or_insert(now_ms);
     }
 
-    /// Takes `run` in, and forgets the oldest entries while there are more bytes than
+    /// Takes `run` in, in its place by end time (a run that ended before the entries held
+    /// goes before them, and is the first forgotten), and forgets the oldest entries while there are more bytes than
     /// the limit (an entry larger than the limit is not kept).
     pub fn push(&self, run: TodayRun) {
         let mut st = self.state();
@@ -249,13 +308,13 @@ impl Today {
         st.next += 1;
         if let Some(key) = &entry.run.action {
             let held = st.by_action.entry(key.clone()).or_default();
-            held.push_back(Arc::clone(&entry));
+            insert(held, Arc::clone(&entry));
         }
         let on_node = st.by_node.entry(entry.run.node.clone()).or_default();
-        on_node.push_back(Arc::clone(&entry));
+        insert(on_node, Arc::clone(&entry));
         *st.instances.entry(entry.run.instance.clone()).or_default() += 1;
         st.bytes += entry.run.cost();
-        st.runs.push_back(entry);
+        insert(&mut st.runs, entry);
         st.trim(self.limit);
     }
 
@@ -318,13 +377,15 @@ impl Today {
 
 fn covers(st: &State) -> Option<u64> {
     let started = st.started_ms?;
-    Some(match st.runs.front() {
-        Some(oldest) if st.evicted => started.max(oldest.run.ended_ms),
+    Some(match (st.runs.front(), st.forgotten_ms) {
+        // A run that arrived late and is older than what was forgotten does not move
+        // coverage back.
+        (Some(oldest), Some(forgotten)) => started.max(oldest.run.ended_ms.max(forgotten)),
         _ => started,
     })
 }
 
-/// The newest runs of `entries` (in arrival order) that match, `q.limit` at most.
+/// The newest runs of `entries` (oldest key first) that match, `q.limit` at most.
 fn search(
     st: &State,
     entries: Option<&Entries>,
@@ -339,12 +400,17 @@ fn search(
         return page;
     };
     let end = q.after.map_or(entries.len(), |after| {
-        entries.partition_point(|e| e.seq < after)
+        entries.partition_point(|e| e.key() < after)
     });
     for (examined, i) in (0..end).rev().enumerate() {
         let entry = &entries[i];
         if examined == MAX_EXAMINED {
-            page.next = Some(entry.seq + 1);
+            // Just above the entry, which this page has not looked at.
+            let key = entry.key();
+            page.next = Some(TodayCursor {
+                seq: key.seq + 1,
+                ..key
+            });
             break;
         }
         let run = &entry.run;
@@ -358,7 +424,7 @@ fn search(
         }
         page.runs.push(run.clone());
         if page.runs.len() == q.limit {
-            page.next = (i > 0).then_some(entry.seq);
+            page.next = (i > 0).then(|| entry.key());
             break;
         }
     }

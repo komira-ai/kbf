@@ -21,7 +21,7 @@ use axum::extract::{Path, State};
 use axum::http::request::Parts;
 use axum::response::Response;
 use kbf_history::records::RunOutcome;
-use kbf_history::{ActionKey, Allow, TodayPage, TodayQuery, TodayRun};
+use kbf_history::{ActionKey, Allow, TodayCursor, TodayPage, TodayQuery, TodayRun};
 use serde_json::{Value, json};
 
 use super::{Cross, reply};
@@ -148,13 +148,16 @@ async fn node_runs(cross: &Cross, parts: &Parts) -> Result<Value, Response> {
 }
 
 /// The page size, the position and the class a request asks for.
-fn paging(q: &Query, route: &str) -> Result<(usize, Option<u64>, Option<RunOutcome>), Response> {
+fn paging(
+    q: &Query,
+    route: &str,
+) -> Result<(usize, Option<TodayCursor>, Option<RunOutcome>), Response> {
     let size = q.page_size()?;
     let after = match q.position(route)? {
         None => None,
         Some(text) => Some(
-            text.parse::<u64>()
-                .map_err(|_| bad("bad_page_token", "the page token holds no position"))?,
+            text.parse::<TodayCursor>()
+                .map_err(|()| bad("bad_page_token", "the page token holds no position"))?,
         ),
     };
     let wanted = match q.get("class") {

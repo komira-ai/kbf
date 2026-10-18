@@ -2,7 +2,7 @@
 //! defect it catches.
 
 use kbf_history::records::RunOutcome;
-use kbf_history::{RunId, StreamId, TodayPage, TodayRun};
+use kbf_history::{RunId, StreamId, TodayCursor, TodayPage, TodayRun};
 use serde_json::{Value, json};
 
 use super::{CLASSES, item, paging, parse_digest, render};
@@ -75,15 +75,17 @@ fn a_class_is_one_of_the_apis_words() {
     assert!(paging(&q("page_size=0"), "/r").is_err());
 }
 
-/// Catches: a position that is not a number taken as the start, and a token made for
+/// Catches: a position that is not `<ended_ms>.<seq>` taken as the start, and a token made for
 /// another route used here.
 #[test]
-fn a_position_is_the_number_a_page_named() {
+fn a_position_is_the_time_and_sequence_a_page_named() {
     let known = ["page_size", "page_token"];
     let first = Query::parse("", &known).expect("a query");
-    let token = first.token("/r", "41");
+    let token = first.token("/r", "1700.41");
     let next = Query::parse(&format!("page_token={token}"), &known).expect("a query");
-    assert_eq!(paging(&next, "/r").ok().map(|p| p.1), Some(Some(41)));
+    let want = "1700.41".parse::<TodayCursor>().ok();
+    assert!(want.is_some());
+    assert_eq!(paging(&next, "/r").ok().map(|p| p.1), Some(want));
     assert!(paging(&next, "/other").is_err());
     let words =
         Query::parse(&format!("page_token={}", first.token("/r", "x")), &known).expect("a query");
@@ -119,7 +121,7 @@ fn a_page_says_it_is_partial_and_from_when_it_covers() {
     let q = Query::parse("class=failed&page_size=3", &known).expect("a query");
     let page = TodayPage {
         runs: vec![run(1)],
-        next: Some(7),
+        next: "1700.7".parse().ok(),
         covers_from_ms: Some(2_000),
     };
     let answer = render(&page, &q, 3, "/v1/actions/d/runs", "/route");

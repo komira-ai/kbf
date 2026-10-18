@@ -2,7 +2,9 @@
 //! Each test names the defect it catches.
 
 use kbf_history::records::{RunOutcome, RunRecord};
-use kbf_history::{InvRef, Limits, MAX_EXAMINED, RunId, StreamId, Today, TodayQuery, TodayRun};
+use kbf_history::{
+    InvRef, Limits, MAX_EXAMINED, RunId, StreamId, Today, TodayCursor, TodayQuery, TodayRun,
+};
 
 use crate::support::{Life, T, all, run_record};
 
@@ -385,7 +387,15 @@ fn runs_are_listed_by_end_time_whatever_order_they_reach_the_index() {
     let mut got = Vec::new();
     let mut after = None;
     while got.len() < 10 {
-        let page = today.on_node("a", &TodayQuery { limit: 1, after, ..q }, &all);
+        let page = today.on_node(
+            "a",
+            &TodayQuery {
+                limit: 1,
+                after,
+                ..q
+            },
+            &all,
+        );
         got.extend(ids(&page.runs));
         match page.next {
             Some(next) => after = Some(next),
@@ -460,4 +470,23 @@ fn eviction_and_coverage_follow_end_time_not_arrival() {
     today.push(on_a(5, 1_500, RunOutcome::Ok));
     assert_eq!(ids(&today.on_node("a", &q, &all).runs), [4, 2, 1]);
     assert_eq!(today.covers_from_ms(), Some(3_000));
+}
+
+#[test]
+fn a_cursor_prints_and_reads_back_and_refuses_anything_else() {
+    // Catches: a cursor that does not survive its own text (a page token that restarts
+    // the listing), and a token that is read loosely (a sign, padding, a missing or extra
+    // part) so two spellings name one place.
+    let today = Today::new(usize::MAX);
+    today.push(on_a(1, 10_050, RunOutcome::Ok));
+    today.push(on_a(2, 10_060, RunOutcome::Ok));
+    let page = today.on_node("a", &TodayQuery::newest(1), &all);
+    let next = page.next.expect("a cursor");
+    assert_eq!(next.to_string(), "10060.1");
+    assert_eq!("10060.1".parse::<TodayCursor>(), Ok(next));
+    for bad in [
+        "", "1", "1.", ".1", "a.1", "1.b", "01.2", "1.02", "+1.2", "1.2.3", "-1.2",
+    ] {
+        assert!(bad.parse::<TodayCursor>().is_err(), "{bad:?}");
+    }
 }
