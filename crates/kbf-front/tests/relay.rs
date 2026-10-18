@@ -19,7 +19,7 @@ use futures::{StreamExt, stream};
 use kbf_auth::{AuthenticationMetadata, Authenticator, Authorizers, Policy};
 use kbf_front::{
     Backend, Cache, Dispatch, Finished, Handed, OpenStreams, OperationStream, Relay, Stage,
-    Submission, Ticket, closing, progress,
+    Submission, Successor as Named, Ticket, closing, progress,
 };
 use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::google::rpc;
@@ -202,6 +202,7 @@ struct Rows {
     asked: Mutex<Vec<(Option<String>, Digest)>>,
     looks: Mutex<VecDeque<Result<Option<Stage>, String>>>,
     followed: Mutex<Vec<OperationId>>,
+    released: Mutex<Vec<OperationId>>,
 }
 
 impl Handed for Rows {
@@ -221,6 +222,10 @@ impl Handed for Rows {
     fn look(&self, operation: OperationId) -> Result<Option<Stage>, String> {
         lock(&self.followed).push(operation);
         lock(&self.looks).pop_front().unwrap_or(Ok(None))
+    }
+
+    fn release(&self, operation: OperationId) {
+        lock(&self.released).push(operation);
     }
 }
 
@@ -264,6 +269,7 @@ impl Rig {
             asked: Mutex::default(),
             looks: Mutex::new(looks.into()),
             followed: Mutex::default(),
+            released: Mutex::default(),
         });
         let backend = Backend::from(Arc::new(Cache::memory()));
         let old = Arc::default();
@@ -637,18 +643,99 @@ async fn a_stream_that_cannot_be_followed_ends_as_it_broke() {
     assert!(lock(&rig.rows.asked).is_empty());
 }
 
-/// Catches: a follower that cannot read the rows left waiting for ever: the stream ends
-/// UNAVAILABLE with the reason.
-#[tokio::test]
-async fn rows_that_cannot_be_read_end_the_followed_stream() {
-    let looks = vec![Err("disk gone".to_owned())];
-    let rig = Rig::new(vec![queued("operations/new-5")], looks).await;
-    let items = rig.execute().await;
-    assert_eq!(names(&items), ["operations/new-5", "Unavailable"]);
-    let status = items[1].as_ref().expect_err("an error");
-    assert!(status.message().contains("operations/new-5"), "{status}");
-    assert!(status.message().contains("disk gone"), "{status}");
-    assert_eq!(rig.relayed(), (1, 0));
+/// Catches: a followed stream ended by anything but its operation finishing (owner ruling:
+/// a relayed Execute has no timeout). Over a fake clock the successor's stream breaks, the
+/// relay follows the rows at a one-hour interval, and the rows say nothing for five
+/// hundred looks (the operation takes about three weeks), fail to read for some, and then
+/// give the result: the stream carries the result, no UNAVAILABLE ever comes from the look
+/// counting or from an unreadable row. Mutants: the relay ending the stream after N
+/// consecutive looks that show nothing; a failed read ending the stream.
+#[tokio::test(start_paused = true)]
+async fn a_followed_stream_outlives_any_number_of_looks_and_unreadable_rows() {
+    let mut looks: Looks = vec![Err("disk gone".to_owned()); 3];
+    looks.extend(std::iter::repeat_n(Ok(None), 500));
+    looks.push(Err("disk gone again".to_owned()));
+    looks.extend(std::iter::repeat_n(Ok(Some(Stage::Executing)), 20));
+    looks.extend(std::iter::repeat_n(Ok(None), 500));
+    looks.push(Ok(Some(failed(5))));
+    let total = looks.len();
+    let rig = Rig::new(
+        vec![
+            queued("operations/new-5"),
+            Err(Status::unavailable("restarted")),
+        ],
+        looks,
+    )
+    .await;
+    let Rig { relay, rows, .. } = rig;
+    let relay = relay.following_every(Duration::from_secs(3600));
+    let started = tokio::time::Instant::now();
+    let response = relay.execute(execute()).await.expect("opened");
+    let items = all(response.into_inner()).await;
+    assert_eq!(
+        names(&items),
+        ["operations/new-5"; 3],
+        "queued, executing, done: never an error"
+    );
+    let done: Vec<bool> = items
+        .iter()
+        .map(|item| item.as_ref().expect("an operation").done)
+        .collect();
+    assert_eq!(done, [false, false, true]);
+    assert_eq!(code_of(items[2].as_ref().expect("done")), 5);
+    assert_eq!(lock(&rows.followed).len(), total);
+    assert!(
+        started.elapsed() >= Duration::from_secs(3600 * 1000),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Catches: a client cancel that does not end the relay (the old process would hold the
+/// stream, the open count and the follower's report for ever). A followed stream the rows
+/// never end is dropped by its client after a day of looks: the relay is no longer open and
+/// tells the farm it stopped following. Mutants: no `release` on drop; the open count kept.
+#[tokio::test(start_paused = true)]
+async fn a_client_cancel_ends_a_followed_relay() {
+    let rig = Rig::new(
+        vec![
+            queued("operations/new-5"),
+            Err(Status::unavailable("restarted")),
+        ],
+        vec![],
+    )
+    .await;
+    let Rig {
+        relay,
+        rows,
+        backend,
+        ..
+    } = rig;
+    let relay = relay.following_every(Duration::from_secs(60));
+    let response = relay.execute(execute()).await.expect("opened");
+    let mut stream = response.into_inner();
+    let first = stream.next().await.expect("an item").expect("an operation");
+    assert_eq!(first.name, "operations/new-5");
+    let day = Duration::from_secs(24 * 3600);
+    let waited = tokio::time::timeout(day, stream.next()).await;
+    assert!(
+        waited.is_err(),
+        "the stream does not end on its own: {waited:?}"
+    );
+    assert!(lock(&rows.followed).len() >= 1000, "it kept looking");
+    assert_eq!(backend.metrics().handover_relays_open.get(), 1);
+    assert!(lock(&rows.released).is_empty());
+
+    drop(stream);
+    assert_eq!(backend.metrics().handover_relays_open.get(), 0);
+    assert_eq!(*lock(&rows.released), [OperationId(41)]);
+    let looked = lock(&rows.followed).len();
+    tokio::time::sleep(day).await;
+    assert_eq!(
+        lock(&rows.followed).len(),
+        looked,
+        "no look after the cancel"
+    );
 }
 
 /// Catches: a followed stream that goes quiet between stage changes (a load balancer that
@@ -750,4 +837,46 @@ async fn an_unreachable_successor_refuses_the_call() {
     assert_eq!(refused.code(), Code::Unavailable);
     assert_eq!(*lock(&rig.old), 0);
     assert_eq!(rig.relayed(), (1, 0));
+}
+
+/// Catches: a relay with no successor named yet (a frontend hands over before its successor
+/// has said where it listens) that answers from the old scheduler, hangs, or counts a call
+/// it did not relay: it refuses UNAVAILABLE for both calls and counts nothing. Once the
+/// successor is named the same relay forwards, and a second naming changes nothing (a
+/// successor is named once). Mutants: `client` answering with the wrapped service while
+/// the successor is unknown; counting before the client is made.
+#[tokio::test]
+async fn a_successor_named_late_is_dialled_from_then_on() {
+    let seen = Arc::default();
+    let channel = serve(Successor {
+        items: vec![Ok(op(OP, ExecStage::Completed, 0))],
+        hang: false,
+        open_ended: false,
+        seen: Arc::clone(&seen),
+    })
+    .await;
+    let rig = Rig::to(
+        Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        vec![],
+        Arc::default(),
+    );
+    let named = Named::unknown();
+    let backend = rig.backend.clone();
+    let handed: Arc<dyn Handed> = Arc::<Rows>::clone(&rig.rows);
+    let relay = Relay::new(Old(Arc::clone(&rig.old)), handed, named.clone(), backend);
+
+    let refused = refusal(relay.execute(execute()).await);
+    assert_eq!(refused.code(), Code::Unavailable);
+    let refused = refusal(relay.wait_execution(wait()).await);
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(*lock(&rig.old), 0);
+    assert_eq!(rig.relayed(), (0, 0), "a refused call is not a relayed one");
+
+    assert!(named.set(channel));
+    let items = all(relay.execute(execute()).await.expect("opened").into_inner()).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(rig.relayed(), (1, 0));
+    assert_eq!(lock(&seen).len(), 1);
+    let other = Endpoint::from_static("http://127.0.0.1:2").connect_lazy();
+    assert!(!named.set(other), "a successor is named once");
 }

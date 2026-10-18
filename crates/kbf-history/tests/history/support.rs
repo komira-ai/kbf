@@ -522,6 +522,7 @@ pub fn failed_section(instance: &str) -> FailedRun {
             env_names: vec!["PATH".into()],
             ..CommandRendering::default()
         }),
+        flog_omitted: 0,
     }
 }
 
@@ -545,7 +546,7 @@ pub struct Whole {
 pub fn whole(
     reader: &Reader<Objects>,
     inv: &InvKey,
-    allow: &dyn Fn(&str) -> bool,
+    allow: kbf_history::Allow<'_>,
 ) -> Result<Option<Whole>, ReadError> {
     let Some(InvocationView {
         header,

@@ -49,6 +49,7 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
 | `traverse` | on the node, a `file://` `--hot-store` with an existing directory above it that the unit's `User=` cannot enter (no execute bit for it as owner, group member or other); the message names the directory, its mode and owner, and the user. `install-units --mode` refuses it too, before any step |
 | `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
+| `restart` | a node unit (`storage`, `daemon`, `storage-and-daemon`) without `RestartSec=5` and, in `[Unit]`, `StartLimitIntervalSec=0`: systemd's defaults (100 ms, 5 starts in 10 s) end a quickly repeating failure in `start-limit-hit` with the unit down. The frontend keeps `Restart=on-failure` without them: an old frontend that drained after a handover exits 0 and must stay down |
 | `stop` | a mode that drains on SIGTERM (every mode but `daemon`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 | `parse` | flags that `kbf <mode>` refuses |
 
@@ -203,10 +204,11 @@ kbf frontend handover --wait
 ```
 
 It starts the idle instance with `systemctl start`; the unit is `Type=notify`, so the start
-returns when the new frontend has taken the listeners, the state store and the daemons over
-and serves. The old instance then answers the builds it holds and exits by itself (`--wait`
-looks at it until it has). Buck2's open streams are not broken, new calls go to the new
-frontend, daemons reconnect and keep their runs. A new instance that fails before it is
+returns when the new frontend has taken the state store and the daemons over and serves on
+listeners of its own (`--instance`, behind Envoy). The old instance then goes not ready once
+Envoy has seen the new one, answers the builds it holds and exits by itself (`--wait` looks
+at it until it has). Buck2's open streams are not broken, a call that still reaches the old
+frontend is forwarded to the new one, daemons reconnect and keep their runs. A new instance that fails before it is
 ready leaves the old one serving, and the command exits 1 and says so. With both instances
 active (the old one still draining) it refuses. What each party sees, and every failure:
 `docs/design/frontend-handover.md`. Rule `handover` of `check-units --mode frontend`

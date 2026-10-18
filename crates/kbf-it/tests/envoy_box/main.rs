@@ -1,5 +1,5 @@
-//! The box render of `kbf-deploy envoy render --topology box`, run by the pinned Envoy in
-//! front of two stub kbf instances (`stub.rs`), for what `envoy check` can only read:
+//! The box render of `kbf_installer::envoy`, run by the pinned Envoy in front of two stub
+//! kbf instances (`stub.rs`), for what the render's check can only read:
 //! that the settings do what the note's table says they do.
 //!
 //! - E3: a silent `Execute` or `WaitExecution` outlives the route timeout and the

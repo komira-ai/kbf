@@ -14,6 +14,7 @@ use kbf_front::{Cache, MemoryMetaLog};
 use kbf_map::{MemberId, MemberState};
 use kbf_objstore::MemoryStore;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
+use kbf_server::storage_health::Debts;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{Cond, ManualClock, Store, Txn};
@@ -75,6 +76,7 @@ fn start(state: Option<StateStore>) -> Server {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         token: None,
         local_cache: None,
+        releases: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),
@@ -249,10 +251,10 @@ async fn a_draining_or_expired_member_shows_its_state_until_it_leaves() {
     // Only `a` and `b` keep beating: `c` lapses, and is Down in the map.
     clock.advance(TTL - Duration::from_secs(1));
     frontend
-        .heartbeat(a.id, a.boot, Progress::CatchingUp, None)
+        .heartbeat(a.id, a.boot, Progress::CatchingUp, Debts::Unknown, None)
         .expect("beat a");
     frontend
-        .heartbeat(b.id, b.boot, Progress::CaughtUp, None)
+        .heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
         .expect("beat b");
     clock.advance(Duration::from_secs(2));
     frontend.refresh().expect("refreshed");

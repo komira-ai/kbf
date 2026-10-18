@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::Stream;
-use kbf_deploy::envoy::box_config::Instance as Ports;
+use kbf_installer::envoy::Instance as Ports;
 use kbf_it::pki::PkiFiles;
 use kbf_proto::google::longrunning::Operation;
 use kbf_proto::grpc::health::v1::health_check_response::ServingStatus;

@@ -1,4 +1,4 @@
-//! The farm of one test: the box render of `kbf-deploy` run by the pinned Envoy in front
+//! The farm of one test: the box render of `kbf-installer` run by the pinned Envoy in front
 //! of two stub instances, and the helpers that talk to it.
 //!
 //! Durations are scaled: a test patches a timeout of the render (its hours become
@@ -12,8 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use kbf_deploy::envoy::box_config::{BoxConfig, Instance as InstancePorts};
-use kbf_deploy::envoy::box_render::render_box;
+use kbf_installer::envoy::{BoxSettings, Instance as InstancePorts, check, render};
 use kbf_it::pki::{self, PkiFiles};
 use kbf_proto::google::longrunning::Operation;
 use kbf_proto::reapi::execution_client::ExecutionClient;
@@ -29,14 +28,15 @@ use super::stub::Instance;
 /// A deadline that only ends a hang.
 pub const HANG: Duration = Duration::from_secs(90);
 
-const EXAMPLE: &str = include_str!("../../../kbf-deploy/templates/envoy/box.example");
-
 /// The pinned Envoy binary CI fetched.
 fn envoy_binary() -> PathBuf {
     let path = std::env::var_os("KBF_TEST_ENVOY")
         .expect("KBF_TEST_ENVOY names the pinned Envoy binary (CI's test-x86 job fetches it)");
     PathBuf::from(path)
 }
+
+/// The longest action the settings name: the example's six hours.
+const LONGEST_ACTION_SECS: u64 = 21_600;
 
 /// The public ports of one test and the instances' block.
 #[derive(Clone, Copy)]
@@ -84,28 +84,9 @@ fn ports() -> Ports {
     }
 }
 
-/// The example config with `key` set to `value`.
-fn set_key(text: &str, key: &str, value: &str) -> String {
-    let prefix = format!("{key}=");
-    let mut found = false;
-    let lines: Vec<String> = text
-        .lines()
-        .map(|l| {
-            if l.starts_with(&prefix) {
-                found = true;
-                format!("{prefix}{value}")
-            } else {
-                l.to_owned()
-            }
-        })
-        .collect();
-    assert!(found, "{key} is not in the example");
-    lines.join("\n") + "\n"
-}
-
 /// What a test chooses.
 pub struct Opts {
-    /// `KBF_BOX_STREAM_CEILING` and `KBF_BOX_REAPI_MAX_STREAMS`.
+    /// The settings' `stream_ceiling` and `reapi_max_streams`.
     pub ceiling: u32,
     pub max_streams: u32,
     /// Envoy's hot-restart flags are the render's, with these two values in seconds
@@ -178,28 +159,32 @@ impl Farm {
         let ports = ports();
         let pki = pki::write(&dir, "envoy-box").expect("certificates");
         let path = |p: &Path| p.to_str().expect("utf-8").to_owned();
-        let mut text = EXAMPLE.to_owned();
-        for (key, value) in [
-            ("KBF_BOX_HOST", pki::SERVER_NAME.to_owned()),
-            ("KBF_BOX_REAPI_PORT", ports.reapi.to_string()),
-            ("KBF_BOX_WORKER_PORT", ports.worker.to_string()),
-            ("KBF_BOX_ADMIN_PORT", ports.admin.to_string()),
-            ("KBF_BOX_BACKEND_PORT_BASE", ports.base.to_string()),
-            ("KBF_BOX_CERT_FILE", path(&pki.server_cert)),
-            ("KBF_BOX_KEY_FILE", path(&pki.server_key)),
-            ("KBF_BOX_CA_FILE", path(&pki.ca_cert)),
-            ("KBF_BOX_REAPI_MAX_STREAMS", opts.max_streams.to_string()),
-            ("KBF_BOX_STREAM_CEILING", opts.ceiling.to_string()),
-        ] {
-            text = set_key(&text, key, &value);
-        }
-        let config = BoxConfig::parse(&text).expect("the box config");
-        let rendered = render_box(&config);
+        let settings = BoxSettings {
+            host: pki::SERVER_NAME.to_owned(),
+            reapi_port: ports.reapi,
+            worker_port: ports.worker,
+            admin_port: ports.admin,
+            backend_port_base: ports.base,
+            cert_file: path(&pki.server_cert),
+            key_file: path(&pki.server_key),
+            ca_file: path(&pki.ca_cert),
+            reapi_max_streams: opts.max_streams,
+            stream_ceiling: opts.ceiling,
+            longest_action_secs: LONGEST_ACTION_SECS,
+        };
+        let rendered = render(&settings).expect("the box settings");
+        // The render under test is one the check passes: a test that planted nothing
+        // would otherwise run a render the installer itself refuses.
+        let failures = check(&settings, &rendered).expect("the check");
+        assert!(
+            failures.is_empty(),
+            "the check fails the render: {failures:?}"
+        );
         let mut envoy: Value = serde_json::from_str(&rendered.envoy).expect("JSON");
         patch(&mut envoy);
         let file = dir.join("envoy.json");
         std::fs::write(&file, serde_json::to_string_pretty(&envoy).expect("print")).expect("write");
-        let [pa, pb] = config.instances();
+        let [pa, pb] = settings.instances();
         let a = Instance::start("a", &pki, pa, opts.max_streams).await;
         let b = Instance::start("b", &pki, pb, opts.max_streams).await;
         let args = match opts.hot_restart {
