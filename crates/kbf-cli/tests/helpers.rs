@@ -1,5 +1,5 @@
 //! The daemon's helper re-execs, run through the `kbf` binary (the design,
-//! komira-build-farm#657, sections 3 and 7.3): the binary answers each helper mode
+//! kbf#657, sections 3 and 7.3): the binary answers each helper mode
 //! before it reads a flag, runs the helper, and exits with the helper's status; a
 //! helper binds no listener, opens no server directory and starts no async runtime.
 //! (The native driver's `slots` helper is macOS's, where `kbf all-in-one` does not run.)
