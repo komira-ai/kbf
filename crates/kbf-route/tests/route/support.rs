@@ -101,7 +101,7 @@ pub fn unavailable() -> StorageError {
     StorageError::Unavailable(Arc::new(std::fmt::Error))
 }
 
-/// A member in `state`, at the address `node-<id>:7000`.
+/// A member in `state` (boot 1), at the address `node-<id>:7000`.
 pub fn member(id: u64, state: MemberState) -> Member {
     Member {
         id: MemberId(id),
@@ -109,7 +109,7 @@ pub fn member(id: u64, state: MemberState) -> Member {
         zone: String::new(),
         weight: 1,
         state,
-        boot: 0,
+        boot: 1,
     }
 }
 
