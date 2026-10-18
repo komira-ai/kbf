@@ -281,7 +281,8 @@ node and ignored from a replaced stream, exactly as `NodeStatus` is.
   releases/previous -> <commit>
   work/<commit>.partial/                        root:root 0755, extraction of one fetch; swept at start (7.3)
   work/<commit>.partial/dl/                     root:root 0700, the downloaded tarball only
-  state.json (schema 2), status.json            root-owned; state.json supersedes the schema 1 helper.json, P3 migrates it
+  state.json (schema 2)                         root-owned; supersedes the schema 1 helper.json, P3 migrates it
+  status.json                                   /var/lib/kbf-installer/status.json, root-owned 0644, atomic rename
   orders/                                       kbf:kbf 0700; order records written by the service user; no release bytes
 ```
 
@@ -546,8 +547,10 @@ held and the run goes `held`; a broken host never lets another take its place.
 3. **Failure**: an error after the swap rolls back, never retries. A fetch or verification that fails before the swap changes
    nothing on the host (section 7.3): it reports `REFUSED` with the reason, is uncordoned, and the run goes `held`. A host
    reverted by its own timer reports `REVERTED`; the run goes `held` and stays held until a person acts.
-4. **Pause** stops granting between hosts, never mid-host. **Rollback** is setting the desired release to the older
-   commit (a higher generation; same gates, same mechanism, no download).
+4. **Pause** stops granting between hosts, never mid-host. **Rollback** (a fleet walk-back) sets an older commit as the
+   desired release. That write gets a **new, higher generation** from the store counter, so the installer accepts it: generation orders the
+   decisions, not the releases, and the same gates and mechanism apply. Only a release below the operator's `min_generation`, or on the package's
+   `deny` list, needs the local root `kbf-installer rollback` verb (section 7).
 5. **Protocol skew and state schema**: split-mode-updates.md 3.3 (order rule) and 3.4 (the state-store schema is
    expand-then-contract; a contract change is refused by the planner and takes the cold path).
 6. **The frontend updates only through Envoy, as its own action** (not as a step of the node rollout above; the operator or the
