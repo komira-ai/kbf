@@ -26,7 +26,8 @@
 //! daemon half and the same plane, beside the storage node in place of the server.
 //!
 //! The scheduler's state is in Postgres, on the local socket `postgres:///kbf?host=/run/postgresql`
-//! unless `--state-store` names another store ([`cli`]).
+//! unless `--state-store` names another store ([`cli`]). `kbf-installer setup` creates the schema; the
+//! start refuses a database without it, or with a version outside what this build supports.
 //!
 //! Not done yet (the README lists it): the in-process plane's admission; the `--reserve-cpus` split
 //! between the halves; the whole-process

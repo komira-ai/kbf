@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand};
 use kbf_host::{HostExec, HostPath, Root};
 use kbf_installer::activate;
+use kbf_installer::database::Database;
 use kbf_installer::helper::cycle::{Config, Helper};
 use kbf_installer::helper::restart::Restart;
 use kbf_installer::layout::{Layout, Platform};
@@ -34,6 +35,28 @@ enum Verb {
     /// Run before each start of the service: count the start of a release on trial, and
     /// revert one that has used its starts. Exits 0 unless the host's state is unreadable.
     BootCheck(BootArgs),
+    /// Create the state database's schema (frontend and all-in-one hosts). A dry run
+    /// without `--apply`: it reports the schema's version and what would be applied.
+    Setup(SetupArgs),
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Mode {
+    Frontend,
+    AllInOne,
+}
+
+#[derive(clap::Args)]
+struct SetupArgs {
+    /// The kbf mode this host runs; only these two keep state in the database.
+    #[arg(long, value_enum)]
+    mode: Mode,
+    /// installer.toml, under `--root`; its `database` key names the state database.
+    #[arg(long, default_value = "/etc/kbf/installer.toml")]
+    config: PathBuf,
+    /// Make the change; without it nothing is written.
+    #[arg(long)]
+    apply: bool,
 }
 
 #[derive(clap::Args)]
@@ -63,6 +86,10 @@ struct RunArgs {
     /// Stop after this many passes (a rehearsal or a test); without it, run until stopped.
     #[arg(long)]
     passes: Option<u64>,
+    /// installer.toml, under `--root`: on a frontend or all-in-one host, the database is
+    /// migrated to what a release needs before that release is activated.
+    #[arg(long)]
+    installer_config: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -77,6 +104,38 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// `path` under the host root, which for a host is `/`.
+fn under(root: &std::path::Path, path: &std::path::Path) -> PathBuf {
+    root.join(path.strip_prefix("/").unwrap_or(path))
+}
+
+fn setup(root: &std::path::Path, args: &SetupArgs) -> Result<(), String> {
+    let database =
+        Database::from_installer_toml(&under(root, &args.config)).map_err(|e| e.to_string())?;
+    let mode = match args.mode {
+        Mode::Frontend => "frontend",
+        Mode::AllInOne => "all-in-one",
+    };
+    if args.apply {
+        let outcome = database.setup().map_err(|e| e.to_string())?;
+        println!("kbf-installer setup ({mode}): {outcome}");
+    } else {
+        let (found, newest) = database.plan().map_err(|e| e.to_string())?;
+        match found {
+            None => println!(
+                "kbf-installer setup ({mode}): dry run: would create the schema at version {newest}"
+            ),
+            Some(v) if v < newest => println!(
+                "kbf-installer setup ({mode}): dry run: would migrate the schema from {v} to {newest}"
+            ),
+            Some(v) => println!(
+                "kbf-installer setup ({mode}): dry run: the schema is at {v}, nothing to do"
+            ),
+        }
+    }
+    Ok(())
+}
+
 fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
     let root = Root::new(root).map_err(|e| e.to_string())?;
     Ok((
@@ -86,7 +145,7 @@ fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
 }
 
 fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
-    let (layout, exec) = host(root)?;
+    let (layout, exec) = host(root.clone())?;
     // clap makes exactly one of the two flags present (`required_unless_present`,
     // `conflicts_with`), so the label is there whenever the unit is not.
     let restart = match args.unit {
@@ -100,6 +159,11 @@ fn run(root: PathBuf, args: RunArgs) -> Result<(), String> {
         starts: args.starts,
     };
     let mut helper = Helper::new(layout.clone(), exec, cfg);
+    if let Some(config) = &args.installer_config {
+        let database =
+            Database::from_installer_toml(&under(&root, config)).map_err(|e| e.to_string())?;
+        helper.set_schema_step(Box::new(database));
+    }
     let trust = HostExec::new(layout.root().clone());
     let mut stager = move |exec: &mut HostExec, entry: &std::path::Path| {
         let settings = Settings::load(&trust, &layout)?;
@@ -146,6 +210,7 @@ fn main() -> ExitCode {
     let result = match cli.verb {
         Verb::Run(args) => run(cli.root, args),
         Verb::BootCheck(args) => boot_check(cli.root, &args),
+        Verb::Setup(args) => setup(&cli.root, &args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

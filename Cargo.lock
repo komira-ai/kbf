@@ -1771,8 +1771,10 @@ dependencies = [
  "hex",
  "kbf-host",
  "kbf-installer",
+ "kbf-state",
  "kbf-update",
  "libc",
+ "postgres",
  "rustix",
  "serde",
  "serde_json",
@@ -1780,6 +1782,7 @@ dependencies = [
  "tar",
  "thiserror",
  "tokio",
+ "toml",
 ]
 
 [[package]]

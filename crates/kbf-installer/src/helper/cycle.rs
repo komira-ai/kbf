@@ -20,6 +20,7 @@ use crate::stage::Staged;
 use crate::state::{self, State, StateError};
 use kbf_host::{Exec, HostPath, Perms, Step};
 
+use crate::database::SchemaStep;
 use crate::helper::memory::{Event, Memory, StagedFacts};
 use crate::helper::order::{self, Order, Verb};
 use crate::helper::restart::Restart;
@@ -59,6 +60,9 @@ pub struct Helper<E: Exec> {
     log: Vec<u8>,
     /// The last `status.json` written.
     written: Vec<u8>,
+    /// Brings the state database to what a release needs before it is activated; none on
+    /// a host that has no database (a node).
+    schema: Option<Box<dyn SchemaStep>>,
 }
 
 /// What stages an inbox entry: the installer's `stage_from_inbox` on a host. A function
@@ -79,7 +83,15 @@ impl<E: Exec> Helper<E> {
             cfg,
             log: Vec::new(),
             written: Vec::new(),
+            schema: None,
         }
+    }
+
+    /// Runs `step` before every activation of the release this helper has staged, so the
+    /// state database is migrated before the new child can start. A refusal keeps the
+    /// links where they are.
+    pub fn set_schema_step(&mut self, step: Box<dyn SchemaStep>) {
+        self.schema = Some(step);
     }
 
     /// The host's executor, for a test to read what was done.
@@ -330,7 +342,7 @@ impl<E: Exec> Helper<E> {
             self.save(memory)?;
         }
         let result = match order.verb {
-            Verb::Activate => self.activate(order, now),
+            Verb::Activate => self.activate(order, now, memory),
             Verb::Confirm => self.confirm(order, &before),
             Verb::Revert => self.revert(),
         };
@@ -361,7 +373,19 @@ impl<E: Exec> Helper<E> {
         }
     }
 
-    fn activate(&mut self, order: &Order, now: u64) -> Result<Done, String> {
+    fn activate(&mut self, order: &Order, now: u64, memory: &Memory) -> Result<Done, String> {
+        // Before the links move: a release must not start on a schema it cannot run on.
+        // A commit this helper did not stage (an older release ordered again) has no
+        // known schema here; its own start check is what guards it.
+        if let (Some(step), Some(staged)) = (
+            self.schema.as_mut(),
+            memory.staged.as_ref().filter(|f| f.commit == order.commit),
+        ) {
+            let note = step
+                .before_start(staged.state_schema)
+                .map_err(|why| format!("state schema: {why}"))?;
+            let _ = writeln!(self.log, "state schema: {note}");
+        }
         let ordered = activate::Order {
             commit: order.commit.clone(),
             // The epoch is part of the name: a restored store counts ids again, and an activation

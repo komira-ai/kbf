@@ -46,6 +46,7 @@ pub mod archive;
 pub mod attest;
 pub mod binary;
 pub mod darwin;
+pub mod database;
 pub mod envoy;
 #[cfg(test)]
 mod fixtures;

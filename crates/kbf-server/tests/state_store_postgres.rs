@@ -41,11 +41,45 @@ fn farm_over(state: StateStore) -> Farm {
 }
 
 /// The default schema, dropped, so the test starts on a store that has never been used.
-fn fresh_database() {
+fn empty_database() {
     let mut client = postgres::Client::connect(&url(), postgres::NoTls).expect("connect");
     client
         .batch_execute("DROP SCHEMA IF EXISTS kbf_state CASCADE")
         .expect("drop the schema");
+}
+
+/// The default schema as `kbf-installer setup` leaves it: kbf creates no table itself.
+fn fresh_database() {
+    empty_database();
+    let config = kbf_state::postgres::PostgresConfig::parse(&url()).expect("the URL parses");
+    let schema = kbf_state::postgres::schema::embedded();
+    kbf_state::postgres::schema::apply(&config, &schema, kbf_state::postgres::schema::latest())
+        .expect("the installer's step");
+}
+
+/// Catches a start that creates the tables itself (the installer owns the schema) and a
+/// refusal that is not one clear line: a start on a database nobody ran `setup` on fails
+/// as a `StateError::Open` that says what to run, without the URL, and leaves no schema.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn a_start_on_a_database_without_the_installers_schema_is_refused() {
+    empty_database();
+    let refused = uri(&url()).open().err().expect("refused");
+    let said = refused.to_string();
+    assert!(matches!(refused, StateError::Open(_)), "{said}");
+    assert!(
+        said.contains("kbf-installer setup") && !said.contains('\n'),
+        "{said}"
+    );
+    assert!(!said.contains("kbf-ci-throwaway"), "{said}");
+    let mut client = postgres::Client::connect(&url(), postgres::NoTls).expect("connect");
+    let made = client
+        .query(
+            "SELECT 1 FROM pg_namespace WHERE nspname = 'kbf_state'",
+            &[],
+        )
+        .expect("catalog");
+    assert!(made.is_empty(), "the refused start created the schema");
 }
 
 /// Catches: a Postgres `--state-store` that is parsed and then not opened; a fresh store

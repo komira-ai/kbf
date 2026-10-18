@@ -278,3 +278,74 @@ fn settings_that_are_not_roots_refuse_the_stage() {
         "{why}"
     );
 }
+
+fn installer_toml(root: &Path, body: &str) {
+    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
+    fs::write(root.join("etc/kbf/installer.toml"), body).expect("installer.toml");
+}
+
+/// Catches `setup` accepting a mode that keeps no state in the database, or going on when
+/// the config is wrong: `--mode storage` is a usage error (exit 2), a missing file or key
+/// exits 1 with a line that names the file and nothing from the URL.
+#[test]
+fn setup_takes_only_the_modes_with_a_database_and_names_a_bad_config() {
+    let root = root("setup-bad");
+    let out = helper(&root, &["setup", "--mode", "storage"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let out = helper(&root, &["setup", "--mode", "frontend"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("installer.toml"),
+        "{out:?}"
+    );
+    installer_toml(&root, "database = \"postgres://kbf:hunter2@db/kbf\"\n");
+    let out = helper(&root, &["setup", "--mode", "all-in-one", "--apply"]);
+    assert_eq!(out.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("password") && !said.contains("hunter2"),
+        "{said}"
+    );
+}
+
+/// Catches the verb not reaching the database: the dry run says what it would do and
+/// creates nothing, `--apply` creates the schema, a second `--apply` is a no-op, all
+/// through the binary and the `database` key of `installer.toml`.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn setup_creates_the_schema_through_the_binary() {
+    let url = std::env::var("KBF_TEST_POSTGRES_URL").expect("a test database");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
+    client
+        .batch_execute("DROP SCHEMA IF EXISTS kbf_state CASCADE")
+        .expect("start with no schema");
+    let root = root("setup-ok");
+    installer_toml(&root, &format!("database = \"{url}\"\n"));
+    let say = |out: &Output| String::from_utf8_lossy(&out.stdout).into_owned();
+    let dry = helper(&root, &["setup", "--mode", "frontend"]);
+    assert!(dry.status.success(), "{dry:?}");
+    assert!(
+        say(&dry).contains("dry run: would create the schema at version 1"),
+        "{}",
+        say(&dry)
+    );
+    let none = client
+        .query(
+            "SELECT 1 FROM pg_namespace WHERE nspname = 'kbf_state'",
+            &[],
+        )
+        .expect("catalog");
+    assert!(none.is_empty(), "the dry run created the schema");
+    let made = helper(&root, &["setup", "--mode", "all-in-one", "--apply"]);
+    assert!(made.status.success(), "{made:?}");
+    assert!(
+        say(&made).contains("created the schema at version 1"),
+        "{}",
+        say(&made)
+    );
+    client
+        .query_one("SELECT version FROM kbf_state.schema_version", &[])
+        .expect("the version row");
+    let again = helper(&root, &["setup", "--mode", "all-in-one", "--apply"]);
+    assert!(say(&again).contains("nothing to apply"), "{}", say(&again));
+}

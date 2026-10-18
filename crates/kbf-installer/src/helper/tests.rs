@@ -898,3 +898,71 @@ fn a_revert_with_nothing_to_go_back_to_is_refused() {
     assert_eq!(rig.state().current, Some(c(A)));
     assert_eq!(rig.restarts(), 0);
 }
+
+/// A schema step that records what it was asked and answers as told.
+struct FakeStep {
+    asked: std::rc::Rc<std::cell::RefCell<Vec<u32>>>,
+    answer: Result<String, String>,
+}
+
+impl crate::database::SchemaStep for FakeStep {
+    fn before_start(&mut self, release_schema: u32) -> Result<String, String> {
+        self.asked.borrow_mut().push(release_schema);
+        self.answer.clone()
+    }
+}
+
+/// Catches a release being activated before its database is ready, and a refused migration
+/// being ignored. The step is asked for the schema the staged release reports (3 here)
+/// before the links move; when it refuses, the links, the restart count and the state stay
+/// as they were and the status says why; an older release ordered again (not the staged
+/// one) asks nothing.
+///
+/// Mutants seen red: the step's error dropped (the swap went through); the staged-commit
+/// filter removed (the older release asked for a schema).
+#[test]
+fn the_database_is_migrated_before_the_links_move_and_a_refusal_stops_the_swap() {
+    let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut rig = Rig::new("schema-step");
+    rig.helper.set_schema_step(Box::new(FakeStep {
+        asked: asked.clone(),
+        answer: Err("migration 3 is a contract step".to_owned()),
+    }));
+    rig.put_offer(1, B);
+    let mut stager = stage_b(rig.layout.clone());
+    rig.helper.cycle(T0, &mut stager).expect("stage");
+    rig.put_order(5, &order_json(5, "activate", B));
+    rig.cycle(T0 + 3);
+    assert_eq!(
+        *asked.borrow(),
+        vec![3],
+        "asked for the staged release's schema"
+    );
+    assert_eq!(rig.state().current, Some(c(A)), "the links did not move");
+    assert_eq!(rig.status()["state"], "refused");
+    let why = rig.status()["refusal"].as_str().expect("text").to_owned();
+    assert!(
+        why.contains("state schema: migration 3 is a contract step"),
+        "{why}"
+    );
+
+    rig.helper.set_schema_step(Box::new(FakeStep {
+        asked: asked.clone(),
+        answer: Ok("migrated".to_owned()),
+    }));
+    rig.put_order(6, &order_json(6, "activate", B));
+    rig.cycle(T0 + 6);
+    assert_eq!(*asked.borrow(), vec![3, 3]);
+    assert_eq!(rig.state().current, Some(c(B)));
+    assert_eq!(rig.restarts(), 1);
+
+    rig.put_order(7, &order_json(7, "revert", B));
+    rig.cycle(T0 + 9);
+    rig.put_order(8, &order_json(8, "activate", A));
+    rig.cycle(T0 + 12);
+    assert_eq!(
+        *asked.borrow(),
+        vec![3, 3],
+        "a release that was not staged asks nothing"
+    );
+}

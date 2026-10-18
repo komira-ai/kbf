@@ -30,6 +30,8 @@ clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
 kbf-host.workspace = true
+# `postgres`: the schema's migrations and the client that applies them (`database` module).
+kbf-state = { workspace = true, features = ["postgres"] }
 libc.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 serde.workspace = true
@@ -37,11 +39,13 @@ serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 kbf-host = { workspace = true, features = ["testkit"] }
 kbf-installer = { workspace = true, features = ["testkit"] }
 kbf-update.workspace = true
+postgres.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
