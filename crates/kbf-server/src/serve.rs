@@ -680,6 +680,8 @@ where
         token,
         Arc::clone(&drain),
         members.clone(),
+        // A server with no frontend role has no enrollment.
+        None,
     )
     .merge(health_routes)
     .merge(crate::metrics::router(
