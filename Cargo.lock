@@ -2112,6 +2112,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "hex",
+ "hyper-util",
  "kbf-auth",
  "kbf-caps",
  "kbf-enroll-registry",
@@ -2158,6 +2159,21 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+ "x509-parser",
+]
+
+[[package]]
+name = "kbf-signer"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-ca",
+ "kbf-types",
+ "rcgen",
+ "rustix",
+ "rustls",
+ "thiserror",
+ "time",
  "x509-parser",
 ]
 

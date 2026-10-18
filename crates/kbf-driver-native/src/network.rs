@@ -54,9 +54,12 @@
 //!   user named by absolute path or found through the user database, as SwiftPM and
 //!   `xcodebuild` find `~/Library/Caches`, `/tmp`) fails; the action must point it
 //!   into the lease (`HOME`, `TMPDIR`, a cache path flag such as `swift build
-//!   --cache-path`). `xcodebuild` resolving a Swift package has no such flag for
-//!   SwiftPM's manifest cache in `~/Library/Caches`, so it fails
-//!   (`docs/platform-properties.md`).
+//!   --cache-path`).
+//! - `xcodebuild` resolving a Swift package runs each manifest under SwiftPM's own
+//!   `sandbox-exec`, which cannot nest in this sandbox, unless the Mac's user default
+//!   `IDEPackageSupportDisableManifestSandbox` is on (`kbf-mac-provision`'s
+//!   `xcode_disable_manifest_sandbox`; `swift build` has `--disable-sandbox`).
+//!   The driver sets no preference itself: `user-preference-write` is denied.
 
 use std::path::{Path, PathBuf};
 
