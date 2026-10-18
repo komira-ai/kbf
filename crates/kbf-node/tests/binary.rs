@@ -1004,7 +1004,9 @@ fn a_container_node_whose_cgroup_is_not_delegated_refuses_to_start() {
             .output()
             .expect("spawn");
         let stderr = String::from_utf8(out.stderr).expect("UTF-8");
-        assert_eq!(out.status.code(), Some(1), "{name}: {stderr}");
+        // 2: the host refuses (a restart would not change it), so the units' RestartPreventExitStatus=2
+        // leaves the daemon down.
+        assert_eq!(out.status.code(), Some(2), "{name}: {stderr}");
         assert!(!unit.join("actions").exists(), "{name}: actions/ made");
         stderr
     };
@@ -1190,7 +1192,8 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
             .expect("spawn");
         // A daemon that passed the check would run until stopped: bound the wait.
         let status = refused_within(&mut child, name, &log);
-        assert_eq!(status.code(), Some(1), "{name}");
+        // 2, as for every refusal of the host (`RestartPreventExitStatus=2`).
+        assert_eq!(status.code(), Some(2), "{name}");
         let stderr = read(&log);
         let says = format!("kbf-daemon: {}/{says}", ids.display());
         assert!(stderr.contains(&says), "{name}: {stderr}");

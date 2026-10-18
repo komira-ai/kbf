@@ -274,7 +274,8 @@ fn refused_at(name: &str, extra: &[&str], worker: SocketAddr) -> (Option<i32>, S
 /// Catches a start either half refuses that exits 0 or as the other half would, or
 /// that does not say which half refused: a server whose flags its own start refuses
 /// (a cold store that cannot be made) exits 2, as `kbf-server` does; a daemon whose
-/// driver cannot start (no subordinate ids for its user) exits 1, as `kbf-daemon` does;
+/// driver cannot start (no subordinate ids for its user) exits 2 too, as `kbf-daemon` does (a
+/// restart would not change it); the line says which half;
 /// a driver other than the container driver is a usage error, 2.
 #[test]
 fn a_start_either_half_refuses_says_which() {
@@ -285,7 +286,7 @@ fn a_start_either_half_refuses_says_which() {
     assert_eq!(code, Some(2), "{stderr}");
     assert!(stderr.contains("kbf-all-in-one: server: "), "{stderr}");
     let (code, stderr) = refused("daemon-refuses", &["--id-files=/nonexistent/ids"]);
-    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(code, Some(2), "{stderr}");
     assert!(stderr.contains("kbf-all-in-one: daemon: "), "{stderr}");
     let (code, stderr) = refused("native", &["--driver=native"]);
     assert_eq!(code, Some(2), "{stderr}");
@@ -296,14 +297,14 @@ fn a_start_either_half_refuses_says_which() {
 /// taken in between: another test binding `127.0.0.1:0`, or a connection's source port,
 /// takes any port number a probe socket gave back. The port number the reservation chose
 /// is taken here on `127.0.0.1` (the thief) while the binary starts; the daemon half's
-/// refusal must still be what the start ends with (exit 1), not the server half's
-/// "Address already in use" (exit 2).
+/// refusal must still be what the start ends with (its line says "daemon"), not the
+/// server half's "Address already in use".
 #[test]
 fn a_port_taken_after_it_was_reserved_does_not_change_which_half_refuses() {
     let worker = worker_addr();
     let _thief = std::net::TcpListener::bind(("127.0.0.1", worker.port()));
     let (code, stderr) = refused_at("thief", &["--id-files=/nonexistent/ids"], worker);
-    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(code, Some(2), "{stderr}");
     assert!(stderr.contains("kbf-all-in-one: daemon: "), "{stderr}");
 }
 

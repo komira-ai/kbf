@@ -375,18 +375,31 @@ fn replaced(flags: Vec<String>, extra: &[String]) -> Vec<String> {
 /// (plain text off loopback) exits 2 before the daemon half starts; with an `s3://` cold
 /// store (no connection is made until a blob moves) the storage half starts and prints
 /// its start line, and a daemon half whose driver cannot start (no subordinate ids for
-/// its user) then exits 1, as `kbf-daemon` does.
+/// its user) then exits 2, as `kbf-daemon` does.
 #[test]
 fn a_start_either_half_refuses_says_which() {
     let dir = scratch("refused");
     pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    crun(
+        &bin,
+        &dir.join("data"),
+        FAKE_CRUN,
+        &["write-lines", "$UPPER/out/file.txt", "a file"],
+    );
+    let path = image_path(&bin);
+    let host = [("PATH", path.as_str())];
+    // The rendered unit names `/usr/bin/crun`: this box's is the stand-in.
+    let runtime = [oci_runtime(&bin)];
     let worker: SocketAddr = "127.0.0.1:1".parse().expect("address");
     let wide = ["--storage-listen=0.0.0.0:0".to_owned()];
     let plain: Vec<String> = node_flags(&dir, worker)
         .into_iter()
         .filter(|flag| !STORAGE_TLS.iter().any(|tls| flag.starts_with(tls)))
         .collect();
-    let (code, out, err) = refused(&replaced(plain, &wide), &[]);
+    let plain: Vec<String> = plain.into_iter().chain(runtime.clone()).collect();
+    let (code, out, err) = refused(&replaced(plain, &wide), &host);
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("kbf storage-and-daemon: storage: "), "{err}");
     assert!(out.is_empty(), "{out}");
@@ -398,14 +411,18 @@ fn a_start_either_half_refuses_says_which() {
     ];
     let flags: Vec<String> = replaced(node_flags(&dir, worker), &s3)
         .into_iter()
+        .chain(runtime.clone())
         .filter(|flag| !flag.starts_with("--hot-store="))
         .collect();
     let env = [
+        host[0],
         ("AWS_ACCESS_KEY_ID", "test-key"),
         ("AWS_SECRET_ACCESS_KEY", "test-secret"),
     ];
     let (code, out, err) = refused(&flags, &env);
-    assert_eq!(code, Some(1), "{err}");
+    // 2, not 1: a user without subordinate ids is a refusal a restart would not change
+    // (the unit's RestartPreventExitStatus=2 leaves it down).
+    assert_eq!(code, Some(2), "{err}");
     assert!(out.starts_with("kbf-storage "), "{out}");
     assert!(err.contains("kbf storage-and-daemon: daemon: "), "{err}");
 }
