@@ -14,7 +14,6 @@
 Description=kbf build farm frontend, instance %i
 Wants=network-online.target
 After=network-online.target
-@KBF_LISTEN_AFTER_LINES@
 
 [Service]
 # kbf sends READY=1 (sd_notify) once it serves and its probes pass, so `systemctl start`

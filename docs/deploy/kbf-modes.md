@@ -181,22 +181,6 @@ bucket, `a/b` or `a/b/`; a fresh prefix is a fresh cold store beside the old.
 `KBF_RESERVE_CPUS` (a whole number) and `KBF_LEASE_PLACEMENT` (`none` or `numa-node`) are
 left to kbf's defaults when empty.
 
-### A listen address that appears late
-
-`network-online.target` does not wait for a VPN or overlay interface, so a listen address
-on one (`KBF_LISTEN_ADDRESS`) can be missing for a few seconds after boot, and the bind
-fails with "address not available". kbf retries that one error, and only that one, for up
-to 90 seconds (250 ms, doubling to 2 s between attempts, each wait logged with the
-address), below the units' `TimeoutStartSec=120`; every other bind error (address in use,
-permission) is at once fatal. This covers every listener of `frontend`, `storage`,
-`storage-and-daemon` and `all-in-one`. `KBF_LISTEN_AFTER` (default empty) names systemd
-units, space separated (for example `tailscaled.service`), that the frontend,
-all-in-one, storage and storage-and-daemon units order after: rendered as `After=` and
-`Wants=` lines under the `network-online.target` ones. Only unit names are accepted (letters,
-digits and `: _ . @ -`, ending in a unit type such as `.service`); a value with a space
-inside a name, `=`, `%`, `/` or a newline is refused, so the setting cannot add a
-directive. `check-units` accepts the lines.
-
 ### The state store: SQLite only
 
 The only state store kbf opens today is a SQLite file; Postgres is a later backend. Rule

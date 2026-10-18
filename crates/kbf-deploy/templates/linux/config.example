@@ -18,14 +18,6 @@ KBF_FRONTEND_NAME=frontend.example.internal
 # address (never 0.0.0.0 or ::), IPv4 or IPv6, written bare (the units bracket IPv6).
 # 192.0.2.0/24 is a documentation range.
 KBF_LISTEN_ADDRESS=192.0.2.10
-# Systemd units the listening units (frontend, all-in-one, storage, storage-and-daemon)
-# order after and want, space separated: the service that brings up the interface of
-# KBF_LISTEN_ADDRESS when that is a VPN or overlay address, such as tailscaled.service,
-# which network-online.target does not wait for. Rendered as After= and Wants= lines.
-# Names only (letters, digits and : _ . @ -, ending in .service, .target and the like);
-# anything else is refused. Empty (the default): no extra lines. kbf also retries a bind
-# to an address that is not there yet for up to 90 s, below TimeoutStartSec=120.
-KBF_LISTEN_AFTER=
 # kbf-daemon's --node-id.
 KBF_NODE_ID=storage-node-1
 # The host's RAM in GiB (free -g, the "total" column).
