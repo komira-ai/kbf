@@ -2,7 +2,7 @@
 //! (root-owned: the inbox is the service user's, so nothing the helper must trust is kept
 //! there).
 
-use kbf_installer::CommitId;
+use crate::CommitId;
 use serde::{Deserialize, Serialize};
 
 /// What the last thing the helper did came to, as `status.json` reports it.
