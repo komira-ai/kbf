@@ -1,7 +1,7 @@
 # Pull-based updates: hosts update themselves over the session they already hold
 
 Status: design; the wire contract (section 5) is frozen. Built or in review: `kbf-installer` (merged), `kbf-update` (the node client, #908) and `kbf-helper` (the root helper, #929). The rest is built in the units of section 11.
-**Revised for two rulings:** (1) node updates and the frontend's own update are decoupled (section 1 item 7, section 8); (2) the host's root tool pulls the release itself, in an unprivileged child, on the frontend's order, and kbf no longer stages release bytes into an inbox (sections 1, 2, 4, 5, 7 and 10). Where a built crate (`kbf-update`, `kbf-helper`) still has the inbox, this text is the target and section 7.4 lists what is removed. The root tool is `kbf-installer` as [distribution.md](distribution.md) section 6 describes; `kbf-helper` is folded into it. Where later text still says "the helper" (the as-built order rules, `helper.json`, `kbf-helper boot-check`), it means the root side of `kbf-installer`.
+**Revised for two rulings:** (1) node updates and the frontend's own update are decoupled (section 1 item 7, section 8); (2) the host's root tool pulls the release itself, in an unprivileged child, on the frontend's order, and kbf no longer stages release bytes into an inbox (sections 1, 2, 4, 5, 7 and 10). Where a built crate (`kbf-update`, `kbf-helper`) still has the inbox, this text is the target and section 7.5 lists what is removed. The root tool is `kbf-installer` as [distribution.md](distribution.md) section 6 describes; `kbf-helper` is folded into it. Where later text still says "the helper" (the as-built order rules, `helper.json`, `kbf-helper boot-check`), it means the root side of `kbf-installer`.
 Adapted from the pull-update design study; labels: **[F]** read in code at the time of writing,
 **[D]** a design decision, **[V]** verify before building on it.
 
@@ -193,8 +193,13 @@ validated digest. Chunks are at most 1 MiB. **The caller is the installer's fetc
 
 **The order, as the node relays it.** `UpdateOrder` is unchanged and carries `order_id`, `epoch`, `verb`, `commit` and
 `window_s`. The "update to commit `<hash>`" order is `VERB_ACTIVATE`. It gains one additive field, `uint64 generation = 6`
-(proto3, compatible both ways: an older server leaves it 0 and an installer treats 0 as "refuse `activate`"; an older node ignores
-it). The installer checks the generation is monotonic and above the operator floor (section 7), which the (epoch, id) rule alone
+(proto3, compatible both ways; an older node ignores it). **Generation 0, or a frontend that predates the field, means the
+installer refuses `activate`**: the frontend must be updated first (section 8 item 1). `UpdateOffer` gains the expected facts of
+the release, `uint32 protocol = 5`, `uint32 min_protocol = 6`, `uint32 state_schema = 7` and `string profile = 8` (the platform
+is the existing field 3); the frontend fills them from the preflight row `update/available/<commit>` and an offer without them
+carries zeros, which the installer refuses (fail closed). **Both additions count against the frozen contract of this section:**
+they are additive and compatible, but they are two changes to frozen messages and are made together in one wire change with the
+tests of section 10. The installer checks the generation is monotonic and above the operator floor (section 7), which the (epoch, id) rule alone
 cannot give it. The offer's components, attestation and expected facts reach the installer in the order record the node writes from
 the offer it holds for that commit; a node holding no offer for the commit refuses (`STATE_REFUSED`, "no offer for this commit").
 
@@ -291,7 +296,8 @@ still run unprivileged there, so a fault in them is not root.
 **The order spool.** `orders/` is owned by `kbf` with mode 0700. Root opens it with `openat` and `O_NOFOLLOW` relative to a
 descriptor it holds, takes an entry only if `fstat` says a regular file with one link, reads it **once into memory** and
 parses from that copy (never re-reads a path); the file is then removed by name through the same descriptor. At most 64 records
-are held and a record older than the confirm-window maximum (1800 s) is expired and removed, so a stuck or hostile writer cannot
+are held and a record older than the confirm-window maximum (1800 s), **measured from root's first-seen time** (recorded in memory and in
+`state.json` when root first reads it, never the file's mtime, which the writer controls), is expired and removed, so a stuck or hostile writer cannot
 grow the directory or replay a stale order after a restart. A record is at most 1 MiB; a larger, unparsable, symlinked or
 non-regular record is refused and removed.
 
@@ -302,14 +308,18 @@ preflight recorded them. These are **locators and claims, not trust**: section 7
 expected facts are the claim that 7.2 step 5 checks the binary against *before* the flip. Before fetching, the installer refuses
 (and says why in `status.json`) an order that is a replay or older by the (epoch, id) rule of section 5, a commit that is not 40
 lowercase hex, a component set that is not exactly what the host's platform needs, a size over the cap (7.1), a pending trial,
-or a host with a live lease (read by the installer from the same lease source the node client uses, not from the record).
+or a host with a live lease (read by the installer from a lease source **that root owns** (a root-written file the daemon updates through the existing
+root-readable path, not a file `kbf` can write), never from the record).
 
-**Generation and floor.** The (epoch, id) rule orders orders but does not stop a replayed or forged older order from naming an old
-attested commit. So the installer also requires the order's **generation** to be at or above the highest it has acted on
-(an additive `UpdateOrder.generation` field, section 5; a rollback is a higher generation naming an older commit, so monotonic
-holds), and an **operator floor** in root-owned `kbf.toml`: `[update] min_generation` and `min_protocol`, below which no order is
-taken. The intended end state is a frontend-signed grant on each order, verified before any fetch against a pinned
-key; that key and its rotation are not designed here, so v1 is the generation check plus the floor.
+**Generation and floor.** The (epoch, id) rule orders orders but cannot tell an old order from a replay of one. The installer
+therefore also compares **(epoch, generation) lexicographically**, mirroring the order rule: a higher epoch wins whatever its generation,
+an older epoch is refused, and within one epoch the generation must be at or above the highest acted on (a rollback is a higher
+generation naming an older commit, so monotonic holds) and at most **1000 above it per order** (best effort, like the epoch guard:
+it blunts a stray huge value, it does not stop a forger who steps by 1000). `UpdateOrder.generation` is the additive field of
+section 5. **This check stops a replay, not a forgery.** Against a compromised `kbf` (which writes the record) the only defence is
+the **operator floor** in root-owned `kbf.toml`, `[update] min_generation` and `min_protocol`, below which no order is taken. The
+intended end state is a frontend-signed grant on each order, verified before any fetch against a pinned key; that key and its
+rotation are not designed here, so v1 is the monotonic check plus the floor.
 
 Orders carry the verbs `activate`, `confirm` and `revert`; they are not installer subcommands. **The installer must not
 restart the serving frontend**: the frontend's own update is the separate Envoy swap (section 8 item 6, split-mode-updates.md
@@ -338,6 +348,8 @@ The installer pulls the release itself. The download is the only step that touch
 source = "frontend"        # "frontend" (default) or "url"
 # url = "<https base URL of a mirror>"   # only with source = "url"
 fetch_timeout_s = 900      # whole fetch of one component; 60 to 3600
+min_generation = 0         # operator floor: no order below this generation is taken
+min_protocol = 0           # operator floor: no release whose protocol is below this is installed
 max_component_bytes = 536870912   # 512 MiB, the store's own cap; at most 1 GiB
 ```
 
@@ -366,7 +378,7 @@ contract and are not required for the first version.
 
 **How bytes pass.** A **pipe**, not a staging directory. The child writes the tarball to its standard output; the parent
 reads it, hashes it as it arrives and writes it to a file it created itself in a root-owned `0700` scratch directory
-(`releases/<commit>.partial/`). The child has no writable file system object at all, so there is nothing for it to swap, link or
+(`work/<commit>.partial/dl/`). The child has no writable file system object at all, so there is nothing for it to swap, link or
 modify after the parent has looked (the TOCTOU and symlink exposure of a directory owned by the fetch user is exactly what the
 inbox had). One child per component; the attestation is not fetched (it came in the order record and is self-authenticating,
 7.2). Standard error is read by the parent up to 4 KiB for the log and is never parsed; bytes beyond 4 KiB are drained and
@@ -423,7 +435,7 @@ parsed strictly (anything else is a failure), `gh` run with an empty environment
 The child's exit status, its output and its log are not inputs to any of this: a child that "succeeds" with other bytes fails
 at 1 or 2, and one that fails after delivering all the bytes is judged on the bytes. **A release counts as already installed only
 if `releases/<commit>/VERIFIED` exists**, written by this procedure; a rollback to such a directory skips steps 1 to 4 (it re-runs
-5 and the floor) and no fetch happens. A directory without the marker is treated as absent and removed. Directories made by the
+5 and the floor) and no fetch happens. An unreferenced directory without the marker is treated as absent and removed; a referenced one is kept and flagged as above. Directories made by the
 test-farm switch (§2, attestation off) never carry the marker and so never count as verified.
 
 ### 7.3 A crash in the middle
@@ -433,7 +445,9 @@ test-farm switch (§2, attestation off) never carry the marker and so never coun
   retry. Nothing but scratch has changed. The frontend's controller treats it as a failure before the swap: the host is
   uncordoned, the run goes `held`, and a person re-issues the update (a new order id).
 - **Parent or host dies during the fetch**: `work/*.partial` is left. The installer deletes every
-  entry under `work/` and every `releases/` directory without `VERIFIED` at the start of each run; a partial file is never resumed or trusted, since its bytes were not verified. The child
+  entry under `work/` and every unreferenced `releases/` directory without `VERIFIED` at the start of each run; **the sweep never removes
+the target of `current` or `previous`**, whatever its marker: a referenced directory without `VERIFIED` stays and `status.json`
+flags it "unverified: rollback to it refused"; a partial file is never resumed or trusted, since its bytes were not verified. The child
   has `PDEATHSIG` (Linux) or is killed by process group (macOS), and a closed pipe, so it does not outlive the parent. A
   record is removed from the spool only after it was read into memory, but the order is acknowledged only after the flip, so the
   installer keeps its own copy (`state.json`, root-owned) of the unacknowledged order and runs it again from the beginning
@@ -445,9 +459,20 @@ test-farm switch (§2, attestation off) never carry the marker and so never coun
 
 **Residuals, stated.** Two nodes can be a release apart while a rollout is held (node-to-node skew is within N/N-1 by section 8). A
 host's local revert (its own timer or boot check) is not seen by the frontend until the host next reports, so the controller can
-briefly hold a stale phase. Neither is new; the fetch makes neither worse.
+briefly hold a stale phase. Neither is new; the fetch makes neither worse. **"No network for the probe and for `gh`" is not enforced in v1**: both run as
+unprivileged users with an empty environment and no credentials, but nothing in the first version blocks their sockets (a network
+namespace or a sandbox profile is the hardening of the same list as seccomp, section 12).
 
-### 7.4 What is removed
+### 7.4 Adoption of an existing host
+
+A host installed by the earlier layout (`/usr/local/kbf`, with `current`, `previous` and `state.json`) moves to
+`/var/lib/kbf-installer` in `kbf-installer setup`: setup re-fetches the **running commit** through the fetch child and verifies it by
+7.2, installing it as `releases/<commit>/` with `VERIFIED`, and points `current` at it; the old `previous` is treated the same way
+if its commit can be fetched. If the fetch or verification fails (no source reachable, the commit no longer served), setup adopts
+the running directory **as unverified**: it is copied in without `VERIFIED`, `status.json` flags it, rollback to it is refused, and
+setup prints it. It is never adopted silently and never marked verified without the procedure.
+
+### 7.5 What is removed
 
 - **The inbox** (`<generation>-<commit>/` entry directories holding `offer.json`, tarballs and attestation bundles, written by
   the service user) and the unprivileged `kbf`'s write access to any place the root side reads bytes from.
@@ -470,7 +495,7 @@ held and the run goes `held`; a broken host never lets another take its place.
    of versions in the farm is within N/N-1, so order does not matter for correctness. At most one storage-and-daemon node
    is in a step at a time (R=2); daemon-only hosts and Macs may be in a step concurrently up to `max_hosts_out` (default 1) and the capacity floor `min_serving`; a busy
    Mac is deferred, not killed. **Because the frontend no longer goes first on its own, the planner refuses to order a node to a
-   release whose `[min_protocol, protocol]` the running frontend does not accept** (409, "update the frontend first"), and refuses
+   release whose `[min_protocol, protocol]` the running frontend does not accept** (409, "update the frontend first"; it reads the same preflight row `update/available/<commit>` that fills the offer's expected facts, section 5), and refuses
    a node downgrade whose protocol the running frontend no longer accepts; the operator updates the frontend as a separate
    action and then the nodes. This replaces the "frontend first on an upgrade, nodes first on a downgrade" ordering of
    split-mode-updates.md 3.3, which assumed one rollout; that document needs the matching edit.
@@ -518,6 +543,26 @@ Each safety property has a planted mutant that turns its test red.
   create a file (fails: `RLIMIT_FSIZE`) or to read `/etc/kbf` (fails: not `kbf`'s user); the parent killed mid-fetch (scratch swept,
   no link changed, order runs again); a `url` source that redirects off its origin (refused); a configured source that is not
   `https` (setup refuses); an order whose digest differs from the attestation subject (refused at 7.2 step 2).
+- **Installer properties** (each test names the planted mutant it must catch):
+  - The sweep keeps `current` and `previous` targets without `VERIFIED` and flags them; mutant: the sweep deletes them (the
+    running release disappears).
+  - An unreferenced directory without `VERIFIED` is deleted; mutant: any directory counts as installed (an unverified rollback is taken).
+  - Adoption: a failed re-fetch adopts as flagged unverified; mutant: adopts with `VERIFIED` (a rollback to unattested bytes).
+  - (epoch, generation): a replay at the same generation is refused as a replay, an older epoch is refused whatever its
+    generation, a generation more than 1000 above in one epoch is refused; mutants: compare generation alone; drop the cap.
+  - Generation 0 refuses `activate`; mutant: treat 0 as "no check".
+  - The operator floor refuses an order below `min_generation` and a release below `min_protocol` after the probe; mutant: floor
+    ignored when the record is well formed.
+  - Expected facts mismatch (protocol, `min_protocol`, `state_schema`, `profile`, platform), or absent: refused before any
+    rename or link change; mutants: check after the flip; treat absent as match.
+  - `activate` while a trial is pending is refused; mutant: allowed (two confirm timers).
+  - Spool: a symlink swapped in after listing is not followed (`O_NOFOLLOW`); the 65th record is refused; a record is expired by
+    root's first-seen time even if its mtime is set to now; mutants: `open` by path; mtime-based expiry.
+  - Bounds: a `gh` stub that hangs, a probe that prints 1 MiB or prints malformed JSON, an extraction that never ends: each
+    killed within its limit, whole process group, order refused; mutant: no wall clock.
+  - The probe runs as `kbf-fetch` and cannot read `/etc/kbf` or the key; mutant: run as `kbf` or root.
+  - Redirect: any 3xx fails the fetch; mutant: follow same-origin redirects.
+  - Lease source: a record claiming no leases while the root-owned source shows one is refused; mutant: trust the record.
 - **Capacity**: two hosts ordered at once (the slot admits one storage holder and at most `max_hosts_out` others); storage under-replicated or the metric absent (no
   order); a host with live leases (order withheld, and the node refuses it too).
 - **Bad binary**: starts and exits at once (the counter reverts, Linux); runs but never registers (the window
@@ -550,7 +595,7 @@ Each safety property has a planted mutant that turns its test red.
 - Closing the early-order gap of an order-record writer under the native driver (the signed grant above does).
 - Pre-fetching a release into `releases/<commit>/` while the host still serves (it needs a second, non-activating order verb, and the same verification).
 - A frontend-signed grant on each order, verified before any fetch (section 7); its key and rotation are undesigned.
-- A seccomp filter and a macOS sandbox profile for the fetch child; a separate download credential in place of the lent node identity.
+- A seccomp filter and a macOS sandbox profile for the fetch child; a separate download credential in place of the lent node identity; blocking the probe and `gh` sockets (network namespace or sandbox).
 - Maintenance windows, percentage waves, tracks beyond canary plus stable.
 - Several frontends on a shared database (Postgres). A zero-impact update of one frontend does not need it: it is the Envoy switch of section 8.
 - OS, Xcode, VM-image and MDM updates ([fleet-updates.md](fleet-updates.md) owns those).
