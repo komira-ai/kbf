@@ -248,8 +248,60 @@ pub fn run<O: Os, E: Exec, R: Releases, W: Write + ?Sized>(
     options: Options,
     out: &mut W,
 ) -> Result<(), SetupError> {
-    // Stub: the tests below are written first and must be red against it.
-    let _ = (os, exec, releases, raw, options, out);
+    let euid = os.euid();
+    if euid != 0 {
+        return Err(SetupError::NotRoot { euid });
+    }
+    if options.apply {
+        os.trusted_binary()?;
+    }
+    let valid = raw.validate().map_err(SetupError::Invalid)?;
+    let ctx = plan::context(os, valid.mode)?;
+    if matches!(valid.mode, Mode::Frontend | Mode::AllInOne) {
+        os.envoy().map_err(SetupError::EnvoyRange)?;
+    }
+    let mut notes = Vec::new();
+
+    let before = plan::before_release(os, &*exec, &valid, &ctx)?;
+    let mut steps = emit(&before.plan, exec, options.apply, out)?;
+    notes.extend(before.notes);
+
+    let mut have_release = released(&*exec, ctx.platform)?;
+    match (&valid.commit, have_release) {
+        (Some(commit), false) => {
+            steps += 1;
+            if options.apply {
+                writeln!(out, "+ fetch and verify release {commit}")?;
+                releases.install_first(&mut *exec, commit, &valid.source)?;
+                have_release = released(&*exec, ctx.platform)?;
+                if !have_release {
+                    return Err(SetupError::NotBuilt(format!(
+                        "release {commit} was fetched but releases/current is not there: setup stopped before it wrote kbf.toml"
+                    )));
+                }
+            } else {
+                writeln!(out, "DRY-RUN: fetch and verify release {commit}")?;
+                have_release = true;
+            }
+        }
+        (Some(commit), true) => notes.push(format!(
+            "a release is installed already: --commit {commit} is not fetched (setup installs the first release only; use update)"
+        )),
+        (None, _) => {}
+    }
+
+    let after = plan::after_release(os, &*exec, &valid, &ctx, have_release, options.no_start)?;
+    steps += emit(&after.plan, exec, options.apply, out)?;
+    notes.extend(after.notes);
+
+    if steps == 0 {
+        writeln!(out, "{}", kbf_host::plan::NOTHING_TO_DO)?;
+    } else if !options.apply {
+        writeln!(out, "{}", kbf_host::plan::DRY_RUN_NOTE)?;
+    }
+    for note in &notes {
+        writeln!(out, "note: {note}")?;
+    }
     Ok(())
 }
 
