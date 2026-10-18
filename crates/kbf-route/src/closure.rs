@@ -96,6 +96,7 @@ struct Counters {
 }
 
 /// One owner's verified blobs, and the map generation they were verified under.
+#[derive(Default)]
 struct Owned {
     generation: u64,
     /// digest -> (when verified, its place in `Inner::recency`)
@@ -115,24 +116,38 @@ impl Inner {
     /// first. `None` when the caller's generation is older than what is remembered (the
     /// caller works from an old map: it neither reads nor adds).
     fn owned(&mut self, member: MemberId, generation: u64) -> Option<&mut Owned> {
-        let current = self.members.get(&member).map(|o| o.generation);
-        match current {
-            Some(g) if g > generation => return None,
-            Some(g) if g < generation => {
-                // TODO(storage-ram-ack PR1): a member's boot (map.proto Member.boot) joins
-                // the generation here, so a restart inside the lease drops its entries too.
-                if let Some(old) = self.members.remove(&member) {
-                    for (_, seq) in old.blobs.values() {
-                        self.recency.remove(seq);
-                    }
-                }
-            }
-            _ => {}
+        let remembered = self.members.get(&member).map(|o| o.generation);
+        if remembered.is_some_and(|g| g > generation) {
+            return None;
         }
-        Some(self.members.entry(member).or_insert_with(|| Owned {
-            generation,
-            blobs: BTreeMap::new(),
-        }))
+        if remembered.is_some_and(|g| g < generation) {
+            // TODO(storage-ram-ack PR1): a member's boot (map.proto Member.boot) joins the
+            // generation here, so a restart inside the lease drops its entries too.
+            let dropped = self.members.remove(&member).into_iter();
+            for (_, seq) in dropped.flat_map(|o| o.blobs.into_values()) {
+                self.recency.remove(&seq);
+            }
+        }
+        let owned = self.members.entry(member).or_default();
+        owned.generation = generation;
+        Some(owned)
+    }
+
+    /// Gives `digest` of `member` (already in `members`) a new place at the most recently
+    /// used end of `recency`, at time `at`; its old place, if any, is released.
+    fn put(&mut self, member: MemberId, digest: Digest, at: Instant) {
+        let seq = self.next;
+        self.next += 1;
+        self.recency.insert(seq, (member, digest));
+        let old = self
+            .members
+            .entry(member)
+            .or_default()
+            .blobs
+            .insert(digest, (at, seq));
+        if let Some((_, old)) = old {
+            self.recency.remove(&old);
+        }
     }
 }
 
@@ -164,65 +179,40 @@ impl Verified {
     /// live. A hit counts as a use.
     fn fresh(&self, member: MemberId, generation: u64, digest: &Digest, now: Instant) -> bool {
         let mut inner = self.lock();
-        let Some(owned) = inner.owned(member, generation) else {
-            return false;
-        };
-        let Some(&(at, seq)) = owned.blobs.get(digest) else {
+        let Some(&(at, seq)) = inner
+            .owned(member, generation)
+            .and_then(|owned| owned.blobs.get(digest))
+        else {
             return false;
         };
         if now.saturating_duration_since(at) >= self.ttl {
-            owned.blobs.remove(digest);
             inner.recency.remove(&seq);
+            let _ = inner
+                .members
+                .get_mut(&member)
+                .and_then(|owned| owned.blobs.remove(digest));
             return false;
         }
-        inner.touch(member, *digest, seq);
+        inner.put(member, *digest, at);
         true
     }
 
     /// Remembers that `digests` were verified at `member` under `generation` at `now`.
     fn record(&self, member: MemberId, generation: u64, digests: &[Digest], now: Instant) {
-        if self.capacity == 0 {
-            return;
-        }
         let mut inner = self.lock();
-        if inner.owned(member, generation).is_none() {
+        if self.capacity == 0 || inner.owned(member, generation).is_none() {
             return;
         }
         for digest in digests {
-            let seq = inner.next;
-            inner.next += 1;
-            let Some(owned) = inner.members.get_mut(&member) else {
-                return;
-            };
-            if let Some((_, old)) = owned.blobs.insert(*digest, (now, seq)) {
-                inner.recency.remove(&old);
-            }
-            inner.recency.insert(seq, (member, *digest));
+            inner.put(member, *digest, now);
         }
-        while inner.recency.len() > self.capacity {
-            let Some((_, (member, digest))) = inner.recency.pop_first() else {
-                break;
-            };
-            if let Some(owned) = inner.members.get_mut(&member) {
-                owned.blobs.remove(&digest);
-            }
-        }
-    }
-}
-
-impl Inner {
-    /// Marks the entry `(member, digest)` as just used.
-    fn touch(&mut self, member: MemberId, digest: Digest, old: u64) {
-        let seq = self.next;
-        self.next += 1;
-        self.recency.remove(&old);
-        self.recency.insert(seq, (member, digest));
-        if let Some(entry) = self
-            .members
-            .get_mut(&member)
-            .and_then(|o| o.blobs.get_mut(&digest))
+        while inner.recency.len() > self.capacity
+            && let Some((_, (member, digest))) = inner.recency.pop_first()
         {
-            entry.1 = seq;
+            let _ = inner
+                .members
+                .get_mut(&member)
+                .and_then(|owned| owned.blobs.remove(&digest));
         }
     }
 }

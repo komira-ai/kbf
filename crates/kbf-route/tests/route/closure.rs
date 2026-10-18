@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_map::Map;
-use kbf_route::Router;
+use kbf_route::{ClosureStats, Router};
 use kbf_storage::StorageError;
 use kbf_storage::service::MAX_FIND_MISSING_DIGESTS;
 use kbf_types::{Digest, DigestFunction};
@@ -330,6 +330,17 @@ async fn the_stats_count_checks_cache_hits_and_calls() {
     let old = blobs_with_primary(&rig.map, 3, 6)[5].1;
     rig.cluster.node(3).hold_action(old, blobs[0]);
 
+    let none = rig.router.closure_stats();
+    assert_eq!(none, ClosureStats::default());
+    assert!(
+        none.cache_hit_ratio().abs() < 1e-9,
+        "no ratio before any lookup"
+    );
+    assert!(
+        none.rpcs_per_check().abs() < 1e-9,
+        "no rate before any check"
+    );
+
     assert!(rig.hit(&whole).await);
     assert!(rig.hit(&whole).await);
     assert!(!rig.hit(&broken).await);
@@ -344,4 +355,45 @@ async fn the_stats_count_checks_cache_hits_and_calls() {
     );
     assert!((stats.cache_hit_ratio() - 3.0 / 7.0).abs() < 1e-9);
     assert!((stats.rpcs_per_check() - 1.0).abs() < 1e-9);
+}
+
+/// Catches a cache of size zero that remembers anyway: with no room, every check asks the
+/// owners again. Mutant: the bound applied after the insert is read.
+#[tokio::test]
+async fn a_cache_with_no_room_remembers_nothing() {
+    let mut rig = rig();
+    rig.router = rig.router.with_closure_cache(0, Duration::from_secs(60));
+    let blobs = rig.blobs(2);
+    hold(&rig.cluster.node(1), &blobs);
+    let action = rig.action(0, &blobs);
+
+    assert!(rig.hit(&action).await);
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2, 2]);
+}
+
+/// Catches a caller working from an older map overwriting what a newer map verified: a
+/// check under generation 2 is remembered; a check under the older generation 1 asks again
+/// and neither reads nor replaces those entries, so generation 2 is still cached after.
+/// Mutant: entries of a newer generation dropped for an older caller.
+#[tokio::test]
+async fn a_caller_on_an_older_map_does_not_disturb_what_a_newer_one_verified() {
+    let rig = rig();
+    let blobs = rig.blobs(2);
+    hold(&rig.cluster.node(1), &blobs);
+    let action = rig.action(0, &blobs);
+    let older = view(&rig.map);
+    let newer = view(&map(2, 2, active(&[1, 2, 3])));
+
+    rig.cell.set(newer.clone());
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2]);
+
+    rig.cell.set(older);
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2, 2], "the older map's caller asks again");
+
+    rig.cell.set(newer);
+    assert!(rig.hit(&action).await);
+    assert_eq!(rig.finds(1), [2, 2], "generation 2 is still remembered");
 }
