@@ -957,9 +957,8 @@ impl State {
                     self.retrying = None;
                     self.write_drops += 1;
                     tracing::error!("a committed record's remaining effects were dropped");
-                    if let Some(batch) = self.unwritten.pop_front() {
-                        self.forget_details(batch);
-                    }
+                    let dropped = self.unwritten.pop_front().unwrap_or_default();
+                    self.forget_details(dropped);
                 }
             }
         }
