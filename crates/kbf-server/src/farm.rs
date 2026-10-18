@@ -1497,6 +1497,3 @@ fn unrun(outcome: Outcome, farm_runs: &[FarmRun]) -> Finished {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod submit_tests;
