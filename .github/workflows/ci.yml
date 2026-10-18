@@ -137,12 +137,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    # The Envoy release the envoy kit's image runs (templates/envoy/config.example),
-    # for Envoy's own validation of the kit's render. The sha256 is the release's
-    # checksums.txt.asc entry.
+    # The Envoy release the real-Envoy tests run (CI only: kbf releases pin and fetch no Envoy;
+    # Envoy is a prerequisite checked against crates/kbf-installer/src/envoy/version.rs) and
+    # the installer's box render is held to, for Envoy's own validation of both renders
+    # and the real-Envoy tests of the box. The sha256 is the release's checksums.txt.asc
+    # entry.
     env:
       ENVOY_VERSION: 1.39.3
       ENVOY_SHA256: f61653fb5f7645129d3092a82f21ce3e6f70d0a75fe2e861b0e7417790f2c200
+      # The GitHub CLI release a host pins to check a release's build attestation offline
+      # (crates/kbf-installer/tests/real_gh.rs); the sha256 is the release's checksums file.
+      GH_VERSION: 2.102.0
+      GH_SHA256: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -172,6 +178,29 @@ jobs:
         run: cargo test -p kbf-deploy --test envoy_validate --locked -- --ignored
         env:
           KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+      # Envoy accepts the installer's box render and refuses a control with an unknown
+      # field (crates/kbf-it/tests/envoy_validate.rs).
+      - name: Envoy validates the installer's box render
+        run: cargo test -p kbf-it --test envoy_validate --locked -- --ignored
+        env:
+          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+      # The installer's box render run by the pinned Envoy in front of two stub instances:
+      # long silent streams, an instance turning not ready, the ceiling of open streams and
+      # a hot restart, each with a control that plants the defect and sees it
+      # (crates/kbf-it/tests/envoy_box). About half a minute.
+      - name: Envoy runs the installer's box render (long streams, health, ceiling, hot restart)
+        run: cargo test -p kbf-it --test envoy_box --locked -- --ignored
+        env:
+          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+      # The pinned gh accepts a real build attestation offline and refuses a subject
+      # changed by one byte (crates/kbf-installer/tests/real_gh.rs). The last test of the
+      # run fails unless the four before it ran, so the step cannot pass on zero.
+      - name: Fetch gh (pinned release, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_amd64.tar.gz" --sha256 "$GH_SHA256" --out "$RUNNER_TEMP/tools/gh" --extract tar.gz --member "gh_${GH_VERSION}_linux_amd64/bin/gh"
+      - name: The pinned gh verifies a real attestation offline
+        run: cargo test -p kbf-installer --test real_gh --locked -- --ignored --test-threads=1
+        env:
+          KBF_TEST_GH: ${{ runner.temp }}/tools/gh
       # A measurement: what an action-cache hit costs over a file store against the
       # memory store, by stored objects per hit (crates/kbf-front/tests/measure_hit.rs).
       # The numbers are in the log and gate nothing (runners are noisy: read the
@@ -408,6 +437,10 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      # The darwin-arm64 build of the GitHub CLI a Mac pins (see test-x86).
+      GH_VERSION: 2.102.0
+      GH_SHA256: da922c20d1792e5b2cbf375593d7a658acf034c12c84e007e71c76ef959c337e
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -447,6 +480,16 @@ jobs:
       # sign-darwin` signs it (crates/kbf-mac-session/tests/as_root.rs;
       # docs/design/fleet-updates-security.md S4.2, S4.3, S10).
       - run: cargo test -p kbf-mac-session --locked
+      # The host installer's layout, offline attestation check and stage, compiled and run
+      # on the platform they name, and the pinned gh for darwin-arm64 against a real
+      # attestation (crates/kbf-installer, docs/deploy/host-releases.md).
+      - run: cargo test -p kbf-installer --locked
+      - name: Fetch gh (pinned release, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_macOS_arm64.zip" --sha256 "$GH_SHA256" --out "$RUNNER_TEMP/tools/gh" --extract zip --member "gh_${GH_VERSION}_macOS_arm64/bin/gh"
+      - name: The pinned gh verifies a real attestation offline
+        run: cargo test -p kbf-installer --test real_gh --locked -- --ignored --test-threads=1
+        env:
+          KBF_TEST_GH: ${{ runner.temp }}/tools/gh
       - run: cargo xtask sudo-test -p kbf-mac-session --test as_root -- --test-threads=1 --nocapture
       # The native driver's lease-user pool as root, with throwaway users from uid 690:
       # actions as pool users through `launchctl asuser`, the kill by uid, the keeper's,
@@ -526,11 +569,11 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  # The container driver against real rootless Podman, each test binary inside a
-  # Delegate=yes system unit (crates/xtask/src/podman_tests.rs; the T4 spike found both
+  # The container driver against real rootless `crun`, each test binary inside a
+  # Delegate=yes system unit (crates/xtask/src/crun_tests.rs; the T4 spike found both
   # arches carry it). The same tests show as ignored, with their reason, in the plain
   # test jobs above.
-  podman-x86:
+  crun-x86:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -549,7 +592,7 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: cargo xtask podman-tests
+      - run: cargo xtask crun-tests
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -561,9 +604,9 @@ jobs:
 
   # The M2 test: pinned buck2 builds the sample project in crates/kbf-it/m2 remote-only
   # through kbf-server to kbf-daemon --driver container, every action in a rootless
-  # Podman container of distroless base-debian12 pinned by its amd64 manifest digest
+  # `crun` container of distroless base-debian12 pinned by its amd64 manifest digest
   # (`kbf-cell m2`, crates/kbf-it/src/m2.rs, says what is checked; it sets the runner
-  # up as `cargo xtask podman-tests` does). x86_64 only: the image digest is the amd64
+  # up as `cargo xtask crun-tests` does). x86_64 only: the image digest is the amd64
   # one.
   m2-container:
     runs-on: ubuntu-24.04
@@ -609,7 +652,7 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-  podman-arm:
+  crun-arm:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     permissions:
@@ -628,7 +671,55 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: cargo xtask podman-tests
+      - run: cargo xtask crun-tests
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # The kbf-installer deb and rpm (packaging/linux/README.md): nfpm (pinned, checked
+  # against its SHA-256) builds each twice from the configuration `cargo xtask pkg-config`
+  # writes, with the test-only kbf-installer-stub and the fixtures under
+  # packaging/linux/testdata until the real binary and the units land; `cargo xtask
+  # pkg-install-test` installs the deb into a fresh Ubuntu container and the rpm into a
+  # fresh Fedora one, with systemd as PID 1, and checks them (crates/xtask/src/pkg_install.rs).
+  packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      NFPM_VERSION: 2.48.0
+      NFPM_SHA256: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      - run: cargo build -p xtask --bin kbf-installer-stub --locked
+      - name: Fetch nfpm (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" --sha256 "$NFPM_SHA256" --out "$RUNNER_TEMP/tools/nfpm" --extract tar.gz --member nfpm
+      - name: Write the nfpm configuration
+        run: cargo xtask pkg-config --binary target/debug/kbf-installer-stub --units packaging/linux/units --trust packaging/linux/testdata/trust --sysusers packaging/linux/sysusers.d/kbf-installer.conf --tmpfiles packaging/linux/tmpfiles.d/kbf-installer.conf --platform linux-x86_64 --version 0.0.0+ci --out target/pkg
+      - name: Build the deb and the rpm, each twice
+        run: cargo xtask pkg-build --nfpm "$RUNNER_TEMP/tools/nfpm" --config target/pkg/nfpm.yaml --out target/pkg/out
+      - name: Install, gate, remove and purge the deb in a fresh Ubuntu container
+        run: cargo xtask pkg-install-test --package target/pkg/out/kbf-installer_0.0.0+ci_amd64.deb --format deb --listing target/pkg/listing.txt --image-dir packaging/linux/test/ubuntu --gate kbf-daemon.service=/etc/kbf/kbf.toml --gate kbf-installer.service=/etc/kbf/installer.toml
+      - name: Install, gate and remove the rpm in a fresh Fedora container
+        run: cargo xtask pkg-install-test --package target/pkg/out/kbf-installer-0.0.0+ci-1.x86_64.rpm --format rpm --listing target/pkg/listing.txt --image-dir packaging/linux/test/fedora --gate kbf-daemon.service=/etc/kbf/kbf.toml --gate kbf-installer.service=/etc/kbf/installer.toml
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

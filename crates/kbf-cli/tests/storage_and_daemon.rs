@@ -29,26 +29,27 @@ use kbf_proto::reapi::{
 };
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
 use node::{
-    PROMPT, Running, cgroup_tree, files_holding, id_files, image_path, input_bytes, pki, podman,
+    PROMPT, Running, cgroup_tree, crun, files_holding, id_files, image_path, input_bytes,
+    oci_runtime, pki,
 };
 use prost::Message as _;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-// The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
+// The stand-in `crun` runs each action as `kbf-act` beside it: a link to this test
 // binary, which answers as `kbf-act` through it.
 kbf_testkit::act_test_hook!();
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 
-/// The stand-in `podman` (`node::podman`).
-const FAKE_PODMAN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-podman");
+/// The stand-in `crun` (`node::crun`).
+const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 
 /// The bytes the action writes to its one output file.
 const OUTPUT: &[u8] = b"a file\n";
 
 /// A fresh directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+    let dir = node::scratch_root()
         .join("kbf-storage-and-daemon")
         .join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -119,17 +120,14 @@ fn node_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
 }
 
 /// Starts `kbf storage-and-daemon` with `flags`, its container driver running the
-/// stand-in `podman` in `bin`; the running node and its storage listener's address,
+/// stand-in `crun` in `bin`; the running node and its storage listener's address,
 /// from the start line.
 fn start_node(bin: &Path, flags: &[String]) -> (Running, SocketAddr) {
     let mut child = Command::new(BIN)
         .args(flags)
         .args(cgroup_tree(bin))
+        .arg(oci_runtime(bin))
         .env("PATH", image_path(bin))
-        // Rootless Podman's runtime directory, which the startup self-checks look for.
-        .env("XDG_RUNTIME_DIR", bin)
-        // The stand-in finds its state beside the link it was run through, which the
-        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
         .current_dir(bin)
         .stdout(Stdio::piped())
         .spawn()
@@ -299,9 +297,10 @@ fn storage_and_daemon_runs_an_action_over_its_own_storage() {
     pki(&dir);
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
-    let image = podman(
+    let image = crun(
         &bin,
-        FAKE_PODMAN,
+        &dir.join("data"),
+        FAKE_CRUN,
         &["write-lines", "$UPPER/out/file.txt", "a file"],
     );
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
@@ -381,19 +380,23 @@ fn a_start_either_half_refuses_says_which() {
     pki(&dir);
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
-    podman(
+    crun(
         &bin,
-        FAKE_PODMAN,
+        &dir.join("data"),
+        FAKE_CRUN,
         &["write-lines", "$UPPER/out/file.txt", "a file"],
     );
-    let (path, xdg) = (image_path(&bin), bin.display().to_string());
-    let host = [("PATH", path.as_str()), ("XDG_RUNTIME_DIR", xdg.as_str())];
+    let path = image_path(&bin);
+    let host = [("PATH", path.as_str())];
+    // The rendered unit names `/usr/bin/crun`: this box's is the stand-in.
+    let runtime = [oci_runtime(&bin)];
     let worker: SocketAddr = "127.0.0.1:1".parse().expect("address");
     let wide = ["--storage-listen=0.0.0.0:0".to_owned()];
     let plain: Vec<String> = node_flags(&dir, worker)
         .into_iter()
         .filter(|flag| !STORAGE_TLS.iter().any(|tls| flag.starts_with(tls)))
         .collect();
+    let plain: Vec<String> = plain.into_iter().chain(runtime.clone()).collect();
     let (code, out, err) = refused(&replaced(plain, &wide), &host);
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("kbf storage-and-daemon: storage: "), "{err}");
@@ -406,11 +409,11 @@ fn a_start_either_half_refuses_says_which() {
     ];
     let flags: Vec<String> = replaced(node_flags(&dir, worker), &s3)
         .into_iter()
+        .chain(runtime.clone())
         .filter(|flag| !flag.starts_with("--hot-store="))
         .collect();
     let env = [
         host[0],
-        host[1],
         ("AWS_ACCESS_KEY_ID", "test-key"),
         ("AWS_SECRET_ACCESS_KEY", "test-secret"),
     ];

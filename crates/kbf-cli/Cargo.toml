@@ -15,17 +15,18 @@ publish.workspace = true
 name = "kbf"
 path = "src/main.rs"
 
-# The container driver's stand-in `podman`, which runs each action as a plain process,
-# for tests/storage_and_daemon.rs: the program kbf-all-in-one's tests run, built here
-# because a test can run only its own package's binaries, under a name of its own so a
-# workspace build does not write two binaries to one path. Not shipped.
+# The container driver's stand-in `crun`, which runs each action as a plain process,
+# for tests/storage_and_daemon.rs and tests/rehearsal_in_a_box.rs: the program
+# kbf-all-in-one's tests run, built here because a test can run only its own package's
+# binaries, under a name of its own so a workspace build does not write two binaries to
+# one path. Not shipped.
 [[bin]]
-name = "kbf-cli-fake-podman"
-path = "../kbf-driver-container/tests/bin/fake_podman.rs"
+name = "kbf-cli-fake-crun"
+path = "../kbf-driver-container/tests/bin/fake_crun.rs"
 test = false
 
 # The stand-in `systemctl` for tests/frontend_handover.rs: `kbf frontend handover` run
-# against it, in Rust like the stand-in `podman` (no shell in test code). Not shipped.
+# against it, in Rust like the stand-in `crun` (no shell in test code). Not shipped.
 [[bin]]
 name = "kbf-cli-fake-systemctl"
 path = "tests/bin/fake_systemctl.rs"
@@ -52,7 +53,7 @@ toml.workspace = true
 # The renewal loop beside the running mode (src/node.rs).
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
-# The stand-in `podman`'s (kbf-cli-fake-podman); the effective uid and the host name that
+# The stand-in `crun`'s (kbf-cli-fake-crun); the effective uid and the host name that
 # `kbf node` and `kbf enroll` read.
 rustix = { workspace = true, features = ["process", "system"] }
 # The schema version of the SQLite state file, which `kbf --version --json` reports.
@@ -74,7 +75,7 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "syn
 tonic.workspace = true
 # `kbf storage-and-daemon` running an action (tests/storage_and_daemon.rs): the act steps
 # it runs through this test binary, the REAPI messages (the node's certificates are made
-# with rcgen, below); the image store layout the stand-in `podman` reads is
+# with rcgen, below); the image store layout the stand-in `crun` runs over is
 # kbf-driver-container's, under the Linux-only section at the end.
 kbf-testkit.workspace = true
 prost.workspace = true

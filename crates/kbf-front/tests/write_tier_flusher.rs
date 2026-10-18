@@ -55,6 +55,7 @@ fn member(id: u64, state: MemberState) -> Member {
         zone: String::new(),
         weight: 1,
         state,
+        boot: 0,
     }
 }
 
