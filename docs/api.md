@@ -448,6 +448,14 @@ carries the SHA-256 of the root, and pins it.
 
 With `--instance=b` the enroll port moves ten above, as the others do.
 
+**Behind a load balancer.** The load balancer is the operator's, set up once with a static
+config that lists both frontend instances' ports and health-checks each on its `/readyz`
+(an update starts the other instance and moves traffic by health alone). If nodes reach
+`Enroll` and `Renew` through it, list **both instances' enroll ports** there too (instance
+b's is ten above a's), checked on the same instance's `/readyz`, so enrollment follows the
+live instance through an update. A node that dials one instance's enroll port directly
+instead must be pointed at the new one after an update.
+
 **Order of an `Enroll`.** The shape (ids, role names, the size of each CSR) is checked
 first and reads nothing. Then, in one registry transaction: the token **secret** (an
 unknown id and a wrong secret are the same refusal after the same work, byte for byte);
