@@ -26,7 +26,7 @@
 //! A `state.json` of another schema is [`StateError::Schema`], and the backup is not tried:
 //! falling back to an older file would quietly undo a migration.
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -282,15 +282,11 @@ impl Locked {
             .open(&path)
             .map_err(fail)?;
         let end = Instant::now() + wait;
-        loop {
-            match lock.try_lock() {
-                Ok(()) => break,
-                Err(TryLockError::Error(e)) => return Err(fail(e)),
-                Err(TryLockError::WouldBlock) if Instant::now() >= end => {
-                    return Err(StateError::Busy { path });
-                }
-                Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(20)),
+        while lock.try_lock().is_err() {
+            if Instant::now() >= end {
+                return Err(StateError::Busy { path });
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
         Ok(Locked {
             _lock: lock,

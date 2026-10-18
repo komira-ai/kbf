@@ -7,7 +7,7 @@
 
 use std::io::Write;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -100,6 +100,15 @@ fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
 }
 
 fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
+    // A running program has a file, and the file can be read: neither can be told otherwise.
+    let me = std::env::current_exe().expect("a running program has a file");
+    let watch = FileIdentity::of(&me).expect("the file I run from can be read");
+    run_from(root, args, &me, watch)
+}
+
+/// The service loop of `me`, the file this program runs from, whose identity `watch` holds:
+/// once the file is replaced the loop starts the new one in this process's place.
+fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Result<(), Failure> {
     let (layout, exec) = host(root)?;
     let platform = layout.platform();
     let cfg = Config {
@@ -120,8 +129,6 @@ fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
         Box::new(leases::NotWired),
         Box::new(HostProcs::new(platform)),
     );
-    let me = std::env::current_exe().map_err(|e| format!("cannot find my own file: {e}"))?;
-    let watch = FileIdentity::of(&me).map_err(|e| format!("cannot read {}: {e}", me.display()))?;
     let mut serve = Serve::new(helper, Box::new(watch));
     serve.helper().recover()?;
     let mut left = args.passes;
@@ -130,7 +137,7 @@ fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
             Flow::Continue => {}
             Flow::Reexec => {
                 eprintln!("kbf-installer: my file was replaced; starting the new one");
-                let err = Command::new(&me).args(std::env::args_os().skip(1)).exec();
+                let err = Command::new(me).args(std::env::args_os().skip(1)).exec();
                 return Err(format!("cannot start {}: {err}", me.display()).into());
             }
         }

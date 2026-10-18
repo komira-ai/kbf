@@ -2,7 +2,7 @@
 //! the service manager and the process table played by a recorder.
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -314,4 +314,124 @@ fn verbs_are_busy_while_the_lock_is_held_and_quiesce_wants_rest() {
 
     let rig = Rig::new("rest", false);
     operator::quiesce(&rig.layout, Duration::ZERO).expect("at rest");
+}
+
+/// The previous release (A) loses its binary on a scratch host.
+fn lose_previous_binary(rig: &Rig) {
+    let binary = rig
+        .exec
+        .root
+        .join("var/lib/kbf-installer/releases")
+        .join(A)
+        .join("kbf");
+    fs::remove_file(binary).expect("the previous release loses its binary");
+}
+
+/// Catches a verb whose change fails leaving the restart marker behind (the next pass would
+/// restart a service nothing changed for), or reporting success: with the previous release's
+/// binary gone, `revert` is refused as a failure (exit 1), nothing moves and no marker stays;
+/// a `rollback` of a host with no trial is refused the same way before anything moves.
+///
+/// Mutants planted: the marker removal after a failed change dropped; the binary of the
+/// release rolled back to not looked for.
+#[test]
+fn a_change_that_fails_leaves_no_marker_and_moves_nothing() {
+    let mut rig = Rig::new("change-fails", true);
+    lose_previous_binary(&rig);
+    let err = rig
+        .op(true)
+        .revert(ACTIVATION)
+        .expect_err("nothing to go back to");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    assert_eq!(rig.state().current, Some(c(B)));
+    assert!(!rig.marker());
+    assert_eq!(rig.restarts(), 0);
+
+    let mut rig = Rig::new("rollback-gone", false);
+    lose_previous_binary(&rig);
+    let err = rig.op(true).rollback().expect_err("nothing to go back to");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    assert_eq!(rig.state().current, Some(c(B)));
+    assert!(!rig.marker());
+}
+
+/// Catches the restart marker being skipped when it cannot be written (a verb that moves
+/// links with no record that the service owes a restart), and a marker that cannot be
+/// removed after the restart being passed over: the first is exit 1 with nothing moved, the
+/// second is exit 1 after the restart, the marker still there for the next pass.
+///
+/// Mutants planted: the write error ignored (the links move); the removal error ignored.
+#[test]
+fn a_marker_that_cannot_be_written_or_removed_is_reported() {
+    let mut rig = Rig::new("marker-write", true);
+    let marker = rig.layout.join(&restart::owed_marker(&rig.layout));
+    fs::create_dir(&marker).expect("a directory where the marker goes");
+    let err = rig.op(true).revert(ACTIVATION).expect_err("cannot write");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    assert!(
+        err.to_string().contains("cannot write the restart marker"),
+        "{err}"
+    );
+    assert_eq!(rig.state().current, Some(c(B)), "nothing moved");
+
+    let mut rig = Rig::new("marker-remove", true);
+    let marker = rig.layout.join(&restart::owed_marker(&rig.layout));
+    let base = rig.service.answer();
+    let dir = marker.parent().expect("a directory").to_owned();
+    rig.exec.answer = Box::new(move |cmd| {
+        if cmd.args.first().map(String::as_str) == Some("restart") {
+            // The directory the marker is in closes: a file cannot be removed from it.
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("close");
+        }
+        base(cmd)
+    });
+    let err = rig.op(true).revert(ACTIVATION);
+    fs::set_permissions(
+        marker.parent().expect("a directory"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("open");
+    let err = err.expect_err("cannot remove");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    assert!(
+        err.to_string().contains("cannot remove the restart marker"),
+        "{err}"
+    );
+}
+
+/// Catches an error landing on the wrong exit code (contract section 2): a lock another run
+/// holds is busy (4), both state files unusable and an activation that is not there or a
+/// release with nothing before it need the operator (5), a verb naming another activation is
+/// refused (3), and every other state or release error failed (1).
+///
+/// Mutants planted: the busy arm folded into failed; the unusable state a plain failure.
+#[test]
+fn errors_land_on_the_exit_of_the_contract() {
+    use crate::state::StateError;
+    let busy = || StateError::Busy {
+        path: PathBuf::from("/x"),
+    };
+    let unusable = || StateError::Unusable {
+        primary: "p".to_owned(),
+        backup: "b".to_owned(),
+    };
+    let other = || StateError::NoSchema {
+        path: PathBuf::from("/x"),
+    };
+    let code = |f: Failure| f.exit_code();
+    assert_eq!(code(busy().into()), 4);
+    assert_eq!(code(unusable().into()), 5);
+    assert_eq!(code(other().into()), 1);
+    assert_eq!(code(ReleaseError::State(busy()).into()), 4);
+    assert_eq!(code(ReleaseError::State(unusable()).into()), 5);
+    assert_eq!(code(ReleaseError::NotPending(c(A)).into()), 5);
+    assert_eq!(code(ReleaseError::NoPrevious.into()), 5);
+    assert_eq!(code(ReleaseError::Pending(c(A)).into()), 5);
+    let other_order = ReleaseError::OtherOrder {
+        commit: c(A),
+        pending: "1-1".to_owned(),
+        got: "1-2".to_owned(),
+    };
+    assert_eq!(code(other_order.into()), 3);
+    assert_eq!(code(ReleaseError::NotUtf8(PathBuf::from("/x")).into()), 1);
 }

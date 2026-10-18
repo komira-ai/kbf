@@ -44,10 +44,6 @@ impl FileIdentity {
             seen: identity(path)?,
         })
     }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl BinaryWatch for FileIdentity {

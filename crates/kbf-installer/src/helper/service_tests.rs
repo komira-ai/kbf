@@ -337,3 +337,32 @@ fn the_recorder_records_and_answers_unknown_commands() {
     assert!(answer(&cmd).unwrap().status.success());
     assert_eq!(svc.asked(), vec!["/usr/bin/systemctl restart kbf.service"]);
 }
+
+/// Catches a launchd job being read wrongly: `launchctl print` of a loaded and running job
+/// names the process, one that is loaded and has no pid is "not running", and one not loaded
+/// is "not loaded"; on a Mac a confirm then finds the executable of that process.
+///
+/// Mutants planted: the exit status of `launchctl print` ignored (a job that is not loaded
+/// gives a pid); a pid of 0 taken as a process.
+#[test]
+fn a_launchd_job_is_read_by_launchctl_print() {
+    let release = format!("usr/local/kbf-installer/releases/{B}/kbf");
+    let (_, dir, svc, host) = world("svc-launchd", &release);
+    let mac = Layout::new(Root::new(&dir).unwrap(), Platform::MacOs);
+    let job = Restart::Launchd("com.example.kbf".to_owned());
+    assert_eq!(main_pid(&host, &job), Ok(77));
+    assert_eq!(
+        accept_confirm(&host, &svc, &mac, &job, &pending(B, None)),
+        Ok(())
+    );
+    svc.0.borrow_mut().main_pid = 0;
+    assert_eq!(
+        main_pid(&host, &job),
+        Err("com.example.kbf is loaded and not running".to_owned())
+    );
+    svc.0.borrow_mut().loaded = false;
+    assert_eq!(
+        main_pid(&host, &job),
+        Err("com.example.kbf is not loaded".to_owned())
+    );
+}

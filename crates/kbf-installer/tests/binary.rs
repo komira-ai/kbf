@@ -379,3 +379,50 @@ fn the_shipped_binary_refuses_a_verb_that_needs_root_and_names_the_unbuilt_ones(
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("status: not implemented (P4)"));
 }
+
+/// Catches a service that goes on running a file that was replaced under it, or that hides
+/// it: once the program's own file is another file, the loop says so and starts the new
+/// one in its place; here the new file is no program, so the start fails and the service
+/// ends with the reason (exit 1) instead of running on or hanging.
+///
+/// Mutants planted: the watch never consulted (the loop runs all its passes and exits 0);
+/// the failed start not reported.
+#[test]
+fn a_service_whose_file_was_replaced_says_so_and_ends_when_the_new_one_cannot_start() {
+    use std::process::Stdio;
+    let root = root("replaced");
+    Locked::acquire(&layout(&root))
+        .expect("lock")
+        .write(&State {
+            current: Some(c(A)),
+            ..State::default()
+        })
+        .expect("state");
+    let dir = root.join("copy");
+    fs::create_dir_all(&dir).expect("dir");
+    let me = dir.join("kbf-installer");
+    fs::copy(BIN, &me).expect("a copy of the program");
+    let child = Command::new(&me)
+        .arg("--root")
+        .arg(&root)
+        .args(["run", "--passes", "4", "--unit", "kbf.service"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starts");
+    let status_file = root.join("var/lib/kbf-installer/status.json");
+    for _ in 0..400 {
+        if status_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(status_file.exists(), "the first pass was made");
+    let other = dir.join("other");
+    fs::write(&other, b"not a program").expect("a file that is no program");
+    fs::rename(&other, &me).expect("replaced");
+    let out = child.wait_with_output().expect("ends");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("my file was replaced"), "{stderr}");
+    assert!(stderr.contains("cannot start"), "{stderr}");
+}

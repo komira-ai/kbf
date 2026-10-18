@@ -1122,6 +1122,25 @@ fn a_second_activation_inside_the_minimum_interval_is_refused() {
     assert_eq!(rig.current(), Some(c(C)));
 }
 
+/// Catches a clock that stepped back holding an activation up: the last swap is "in the
+/// future" of the pass, and the order is not held by the minimum interval.
+///
+/// Mutant planted: the `last <= now` test dropped (the future swap holds every order for
+/// the difference).
+#[test]
+fn a_clock_that_stepped_back_does_not_hold_an_activation_up() {
+    let mut rig = Rig::build("interval-back", Platform::Linux, 60);
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0 + 100);
+    rig.first_start(B, T0 + 101);
+    rig.order(6, Verb::Confirm, B);
+    rig.cycle(T0 + 103);
+    assert_eq!(rig.state().pending_confirm, None);
+    rig.put(&rig.rec(7, 1, 2, Verb::Activate, C));
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(C)));
+}
+
 /// Catches a confirm kept on the service user's word alone: a confirm order is refused
 /// while the unit's main process still runs the old release, and while the first boot
 /// check has not run; it is kept once the new release runs.
@@ -1212,6 +1231,84 @@ fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
     assert!(there(others[0]), "a release a process runs stays");
     let left = others[1..].iter().filter(|o| there(o)).count();
     assert_eq!(left, 1, "only the newest other stays");
+}
+
+/// Catches a collection that cannot run ending the pass or refusing the confirm: when the
+/// process table cannot be read, and when the releases directory cannot be listed, the
+/// confirm is still kept, nothing is removed, and the reason is in the log.
+///
+/// Mutants planted: the `in_use` error treated as an empty set (everything unneeded goes);
+/// the collection's error returned from the pass.
+#[test]
+fn a_collection_that_cannot_run_is_logged_and_the_confirm_is_kept() {
+    use std::os::unix::fs::PermissionsExt;
+    for (name, why) in [
+        ("blind", "cannot tell which releases run"),
+        ("unlistable", "gc: "),
+    ] {
+        let mut rig = Rig::new(&format!("gc-fails-{name}"));
+        rig.install("1111111111111111111111111111111111111111");
+        rig.order(5, Verb::Activate, B);
+        rig.cycle(T0);
+        rig.first_start(B, T0 + 1);
+        let releases = rig.root.join("var/lib/kbf-installer/releases");
+        if name == "blind" {
+            rig.service.0.borrow_mut().blind = true;
+        } else {
+            fs::set_permissions(&releases, fs::Permissions::from_mode(0o100)).expect("close");
+        }
+        rig.order(6, Verb::Confirm, B);
+        rig.cycle(T0 + 3);
+        fs::set_permissions(&releases, fs::Permissions::from_mode(0o755)).expect("open");
+        let mut log = Vec::new();
+        rig.helper.drain_log(&mut log);
+        let log = String::from_utf8_lossy(&log).into_owned();
+        assert!(log.contains(why), "{name}: {log}");
+        assert_eq!(
+            rig.state().pending_confirm,
+            None,
+            "{name}: the confirm is kept"
+        );
+        assert!(
+            releases
+                .join("1111111111111111111111111111111111111111")
+                .exists(),
+            "{name}: nothing was removed"
+        );
+    }
+}
+
+/// Catches a restart owed by an operator verb being lost, or done under that verb's lock: the
+/// marker is there and a verb holds the lock when the pass starts, so the pass first leaves
+/// the restart; once the verb lets go the same pass restarts the service once and removes the
+/// marker. A lock file that cannot be opened ends the pass with the error.
+///
+/// Mutants planted: the busy arm restarting anyway; the marker left after the restart.
+#[test]
+fn a_restart_an_operator_left_owed_waits_for_its_lock_then_is_done_and_cleared() {
+    let mut rig = Rig::new("owed-marker");
+    let marker = rig
+        .layout
+        .join(&crate::helper::restart::owed_marker(&rig.layout));
+    fs::write(&marker, b"owed\n").expect("marker");
+    let held = Locked::acquire(&rig.layout).expect("a verb holds the lock");
+    let verb = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(held);
+    });
+    rig.cycle(T0);
+    verb.join().expect("the verb ends");
+    assert_eq!(rig.restarts(), 1, "done once the verb let go");
+    assert!(!marker.exists(), "and cleared");
+
+    let mut rig = Rig::new("owed-marker-no-lock");
+    let marker = rig
+        .layout
+        .join(&crate::helper::restart::owed_marker(&rig.layout));
+    fs::write(&marker, b"owed\n").expect("marker");
+    let lock_dir = rig.layout.join(&rig.layout.lock());
+    fs::remove_dir_all(lock_dir.parent().expect("a directory")).expect("no lock directory");
+    assert!(rig.helper.cycle(T0).is_err());
 }
 
 struct Flag(std::rc::Rc<std::cell::Cell<bool>>);

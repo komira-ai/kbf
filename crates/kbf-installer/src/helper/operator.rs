@@ -57,6 +57,8 @@ impl From<StateError> for Failure {
     fn from(e: StateError) -> Failure {
         match e {
             StateError::Busy { .. } => Failure::Busy(e.to_string()),
+            // Neither state file is usable: only an operator can restore one.
+            StateError::Unusable { .. } => Failure::NeedsOperator(e.to_string()),
             other => Failure::Failed(other.to_string()),
         }
     }
