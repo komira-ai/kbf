@@ -157,5 +157,12 @@ fn a_nan_sample_is_recorded_as_not_measured() {
         }
         .is_finite()
     );
+    assert!(
+        !Limit::Band {
+            warn: f64::NAN,
+            red: 2.0
+        }
+        .is_finite()
+    );
     assert!(!Limit::AtLeast(f64::NAN).is_finite());
 }
