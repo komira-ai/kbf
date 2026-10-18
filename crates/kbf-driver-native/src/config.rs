@@ -9,6 +9,7 @@ use kbf_daemon::cache::Cache;
 use kbf_daemon::trees::Trees;
 use kbf_outputs::OutputLimits;
 
+use crate::denials::LogReader;
 use crate::network::Isolation;
 use crate::simulator::Listing;
 use crate::slots::Pool;
@@ -107,6 +108,16 @@ pub struct NativeConfig {
     /// trees and writes the rest of the inputs. The store must be outside the scratch
     /// directory, like the cache. `None` clones every input file one by one.
     pub trees: Option<Arc<Trees>>,
+    /// Reads the sandbox's refusals from the system's log for an action that failed
+    /// under the sandbox ([`crate::denials`]); a test replaces it.
+    pub denial_log: LogReader,
+    /// How often and how long the reads of it go on while none holds the action's own
+    /// refusal ([`crate::denials::collect`]).
+    pub denial_schedule: crate::denials::Schedule,
+    /// When set, the account of a failed action's denial reads that found none of its
+    /// own ([`crate::denials::Report::explain`]) is also pushed here, so a test can print
+    /// what the node's log holds.
+    pub denial_record: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl NativeConfig {
@@ -135,6 +146,9 @@ impl NativeConfig {
             pool: None,
             cache: None,
             trees: None,
+            denial_log: crate::denials::system_log,
+            denial_schedule: crate::denials::Schedule::DEFAULT,
+            denial_record: None,
         }
     }
 }

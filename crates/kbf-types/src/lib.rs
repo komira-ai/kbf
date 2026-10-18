@@ -14,6 +14,7 @@
 
 mod digest;
 mod enroll;
+pub mod enroll_api;
 mod image;
 mod lease;
 mod phase;

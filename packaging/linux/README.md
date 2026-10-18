@@ -6,7 +6,7 @@ installs the first one into `/var/lib/kbf-installer/releases/<sha>/`). The contr
 `docs/design/kbf-installer.md`, sections 3 (files and users), 7 (units and gating) and 9
 (P11). A deb and an rpm are built by [nfpm](https://nfpm.goreleaser.com), pinned in CI by
 SHA-256, from a configuration `cargo xtask pkg-config` writes: this directory holds the
-inputs, and `crates/xtask/src/pkg.rs` is the one place that says what goes in.
+inputs, and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes in.
 
 | path | what |
 |---|---|

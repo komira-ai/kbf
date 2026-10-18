@@ -30,8 +30,8 @@ struct Inputs {
 }
 
 impl Inputs {
-    fn sources(&self) -> pkg::Sources<'_> {
-        pkg::Sources {
+    fn sources(&self) -> pkg_linux::Sources<'_> {
+        pkg_linux::Sources {
             binary: &self.binary,
             units: &self.units,
             trust: &self.trust,
@@ -87,7 +87,7 @@ fn inputs(dir: &Path) -> Inputs {
 }
 
 fn payload_of(i: &Inputs) -> Result<Vec<File>, Error> {
-    payload(&pkg::files(&i.sources())?)
+    payload(&pkg_linux::files(&i.sources())?)
 }
 
 fn problems_of(files: &[File], tgz: &[u8]) -> Vec<String> {
@@ -129,26 +129,26 @@ fn the_payload_is_exactly_the_debs_files_with_the_debs_modes_and_bytes() {
     let dir = scratch("same-as-deb");
     let binary = dir.join("kbf-installer");
     std::fs::write(&binary, b"the installer").expect("binary");
-    let sources = pkg::Sources {
+    let sources = pkg_linux::Sources {
         binary: &binary,
         units: &root.join("units"),
         trust: &root.join("testdata/trust"),
         sysusers: &root.join("sysusers.d/kbf-installer.conf"),
         tmpfiles: &root.join("tmpfiles.d/kbf-installer.conf"),
     };
-    let deb: Vec<String> = pkg::listing(&pkg::files(&sources).expect("deb"))
+    let deb: Vec<String> = pkg_linux::listing(&pkg_linux::files(&sources).expect("deb"))
         .lines()
         .filter(|l| l.starts_with("file "))
         .map(str::to_owned)
         .collect();
-    let tar: Vec<String> = payload(&pkg::files(&sources).expect("deb"))
+    let tar: Vec<String> = payload(&pkg_linux::files(&sources).expect("deb"))
         .expect("payload")
         .iter()
         .map(|f| format!("file {:04o} /{} {}", f.mode, f.path, Sha256::of(&f.bytes)))
         .collect();
     assert_eq!(tar, deb);
     // The tarball itself, read back, holds those paths and modes.
-    let files = payload(&pkg::files(&sources).expect("deb")).expect("payload");
+    let files = payload(&pkg_linux::files(&sources).expect("deb")).expect("payload");
     let tgz = tarball(&files).expect("tarball");
     assert_eq!(problems_of(&files, &tgz), Vec::<String>::new());
     let trust_gh = files
@@ -184,7 +184,7 @@ fn a_payload_that_is_not_the_contracts_is_refused() {
     // trust file, and a sub-directory in a unit directory reaching the host.
     let dir = scratch("refuse");
     let i = inputs(&dir);
-    let refused = |what: &str, s: pkg::Sources, why: &str| match pkg::files(&s) {
+    let refused = |what: &str, s: pkg_linux::Sources, why: &str| match pkg_linux::files(&s) {
         Err(Error::Refused(p)) => assert!(
             p.iter().any(|l| l.contains(why)),
             "{what}: {p:?} lacks {why:?}"
@@ -194,7 +194,7 @@ fn a_payload_that_is_not_the_contracts_is_refused() {
     let empty = dir_of(&dir, "empty", &[]);
     refused(
         "no units",
-        pkg::Sources {
+        pkg_linux::Sources {
             units: &empty,
             ..i.sources()
         },
@@ -207,7 +207,7 @@ fn a_payload_that_is_not_the_contracts_is_refused() {
     );
     refused(
         "odd unit",
-        pkg::Sources {
+        pkg_linux::Sources {
             units: &odd,
             ..i.sources()
         },
@@ -216,7 +216,7 @@ fn a_payload_that_is_not_the_contracts_is_refused() {
     let odd = dir_of(&dir, "odd2", &[("kbf-a.timer", "x")]);
     refused(
         "timer",
-        pkg::Sources {
+        pkg_linux::Sources {
             units: &odd,
             ..i.sources()
         },
@@ -234,7 +234,7 @@ fn a_payload_that_is_not_the_contracts_is_refused() {
     );
     refused(
         "four",
-        pkg::Sources {
+        pkg_linux::Sources {
             trust: &four,
             ..i.sources()
         },
@@ -243,7 +243,7 @@ fn a_payload_that_is_not_the_contracts_is_refused() {
     let two = dir_of(&dir, "two", &[("gh", "x"), ("installer.conf", "x")]);
     refused(
         "two",
-        pkg::Sources {
+        pkg_linux::Sources {
             trust: &two,
             ..i.sources()
         },
@@ -253,7 +253,7 @@ fn a_payload_that_is_not_the_contracts_is_refused() {
     std::fs::create_dir(sub.join("dir")).expect("sub");
     refused(
         "subdir",
-        pkg::Sources {
+        pkg_linux::Sources {
             units: &sub,
             ..i.sources()
         },
@@ -262,7 +262,7 @@ fn a_payload_that_is_not_the_contracts_is_refused() {
     let missing = dir.join("missing");
     refused(
         "no binary",
-        pkg::Sources {
+        pkg_linux::Sources {
             binary: &missing,
             ..i.sources()
         },

@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 
-use crate::pkg::{self, Entry, Out};
+use crate::pkg_linux::{self, Entry, Out};
 use crate::{Error, package::read};
 
 /// Runs `docker <args>`.
@@ -36,7 +36,7 @@ pub type Docker<'a> = dyn FnMut(&[&str]) -> Result<Out, Error> + 'a;
 /// The closure that runs the program `docker`.
 pub fn process(docker: &Path) -> impl FnMut(&[&str]) -> Result<Out, Error> {
     let docker = docker.to_owned();
-    move |args| pkg::spawn(std::process::Command::new(&docker).args(args))
+    move |args| pkg_linux::spawn(std::process::Command::new(&docker).args(args))
 }
 
 /// A package format and the tools that install it.
@@ -48,7 +48,7 @@ pub enum Format {
 
 impl Format {
     /// The dependencies the package must list, as the contract says them (and not as
-    /// `pkg` does: a check that read `pkg`'s lists would pass whatever they held).
+    /// `pkg_linux` does: a check that read `pkg_linux`'s lists would pass whatever they held).
     fn depends(self) -> &'static [&'static str] {
         match self {
             Format::Deb => &["crun", "uidmap", "systemd", "ca-certificates"],
@@ -67,8 +67,8 @@ impl Format {
     /// The command that prints the dependencies.
     fn depends_command(self) -> &'static [&'static str] {
         match self {
-            Format::Deb => &["dpkg-query", "-W", "-f=${Depends}", pkg::NAME],
-            Format::Rpm => &["rpm", "-qR", pkg::NAME],
+            Format::Deb => &["dpkg-query", "-W", "-f=${Depends}", pkg_linux::NAME],
+            Format::Rpm => &["rpm", "-qR", pkg_linux::NAME],
         }
     }
 
@@ -83,7 +83,7 @@ impl Format {
                 "-printf",
                 "%f\\n",
             ],
-            Format::Rpm => &["rpm", "-q", "--scripts", pkg::NAME],
+            Format::Rpm => &["rpm", "-q", "--scripts", pkg_linux::NAME],
         }
     }
 
@@ -104,10 +104,10 @@ impl Format {
     fn installed(self, c: &mut Container) -> Result<bool, Error> {
         match self {
             Format::Deb => {
-                let status = c.say(&["dpkg-query", "-W", "-f=${Status}", pkg::NAME])?;
+                let status = c.say(&["dpkg-query", "-W", "-f=${Status}", pkg_linux::NAME])?;
                 Ok(status == "install ok installed")
             }
-            Format::Rpm => c.ok(&["rpm", "-q", pkg::NAME]),
+            Format::Rpm => c.ok(&["rpm", "-q", pkg_linux::NAME]),
         }
     }
 }
@@ -269,11 +269,11 @@ fn kept(c: &mut Container, after: &str, problems: &mut Vec<String>) -> Result<()
             problems.push(format!("{after} deleted {path}"));
         }
     }
-    let state = format!("{}/state.json", pkg::STATE_DIR);
+    let state = format!("{}/state.json", pkg_linux::STATE_DIR);
     if !c.ok(&["test", "-e", &state])? {
         problems.push(format!("{after} deleted {state}"));
     }
-    for user in pkg::USERS {
+    for user in pkg_linux::USERS {
         if !c.ok(&["getent", "passwd", user])? {
             problems.push(format!("{after} deleted the user {user}"));
         }
@@ -342,7 +342,7 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
     for e in entries {
         let Some(unit) = e
             .dst
-            .strip_prefix(pkg::UNIT_DIR)
+            .strip_prefix(pkg_linux::UNIT_DIR)
             .and_then(|u| u.strip_prefix('/'))
         else {
             continue;
@@ -372,7 +372,7 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
         &["systemd-tmpfiles", "--create"],
         &mut problems,
     )?;
-    for user in pkg::USERS {
+    for user in pkg_linux::USERS {
         let line = c.say(&["getent", "passwd", user])?;
         let shell = line.rsplit(':').next().unwrap_or("");
         eq(
@@ -384,10 +384,10 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
     }
     // Every account a packaged unit runs as exists once sysusers has run.
     for e in entries {
-        if !e.dst.starts_with(pkg::UNIT_DIR) || e.sha256.is_none() {
+        if !e.dst.starts_with(pkg_linux::UNIT_DIR) || e.sha256.is_none() {
             continue;
         }
-        for (key, name) in pkg::unit_accounts(&c.say(&["cat", &e.dst])?) {
+        for (key, name) in pkg_linux::unit_accounts(&c.say(&["cat", &e.dst])?) {
             let database = if key == "User" { "passwd" } else { "group" };
             if !c.ok(&["getent", database, &name])? {
                 problems.push(format!(
@@ -397,7 +397,7 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
             }
         }
     }
-    for (path, mode) in pkg::TMPFILES_DIRS {
+    for (path, mode) in pkg_linux::TMPFILES_DIRS {
         let got = c.say(&["stat", "-c", "%U:%G:%a:%F", path])?;
         eq(
             &mut problems,
@@ -418,7 +418,7 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
             "-m",
             "0600",
             "/dev/null",
-            &format!("{}/state.json", pkg::STATE_DIR),
+            &format!("{}/state.json", pkg_linux::STATE_DIR),
         ],
         &mut problems,
     )?;
@@ -441,7 +441,7 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
     )?;
     c.must(
         "remove",
-        &[manager, yes, "remove", pkg::NAME],
+        &[manager, yes, "remove", pkg_linux::NAME],
         &mut problems,
     )?;
     gone(c, entries, "remove", &mut problems)?;
@@ -453,9 +453,13 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
             &[manager, yes, "install", &inside(t.package)],
             &mut problems,
         )?;
-        c.must("purge", &[manager, yes, "purge", pkg::NAME], &mut problems)?;
+        c.must(
+            "purge",
+            &[manager, yes, "purge", pkg_linux::NAME],
+            &mut problems,
+        )?;
         kept(c, "purge", &mut problems)?;
-        let status = c.say(&["dpkg-query", "-W", "-f=${Status}", pkg::NAME])?;
+        let status = c.say(&["dpkg-query", "-W", "-f=${Status}", pkg_linux::NAME])?;
         if !(status.is_empty() || status.ends_with("not-installed")) {
             problems.push(format!("the package's status is {status:?} after purge"));
         }
@@ -489,7 +493,7 @@ fn must(docker: &mut Docker, args: &[&str]) -> Result<(), Error> {
 
 /// The container up, the checks run in it.
 fn session(docker: &mut Docker, t: &InstallTest, entries: &[Entry]) -> Result<Vec<String>, Error> {
-    let image = format!("{}-test-{}", pkg::NAME, t.container);
+    let image = format!("{}-test-{}", pkg_linux::NAME, t.container);
     must(
         docker,
         &["build", "-t", &image, &t.image_dir.to_string_lossy()],
@@ -528,11 +532,11 @@ fn session(docker: &mut Docker, t: &InstallTest, entries: &[Entry]) -> Result<Ve
 /// The listing cannot be read, docker fails, or a check finds a problem.
 pub fn run(docker: &mut Docker, t: &InstallTest) -> Result<Vec<String>, Error> {
     let text = String::from_utf8_lossy(&read(t.listing)?).into_owned();
-    let entries = pkg::parse_listing(&text)?;
+    let entries = pkg_linux::parse_listing(&text)?;
     let result = session(docker, t, &entries);
     // The container and its image are not needed after the run, whatever its result.
     let _ = docker(&["rm", "-f", t.container]);
-    let _ = docker(&["rmi", &format!("{}-test-{}", pkg::NAME, t.container)]);
+    let _ = docker(&["rmi", &format!("{}-test-{}", pkg_linux::NAME, t.container)]);
     let problems = result?;
     if problems.is_empty() {
         return Ok(vec![format!(

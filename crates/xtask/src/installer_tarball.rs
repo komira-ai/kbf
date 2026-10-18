@@ -1,7 +1,7 @@
 //! `installer-tarball --binary <path> --platform <platform> --commit <sha> --units <dir>
 //! --trust <dir> --sysusers <file> --tmpfiles <file> --out <dir>`: the payload
 //! `packaging/install.sh` places: the files of the Debian package, at the same paths
-//! with the same modes, because it is made from the same list ([`crate::pkg::files`],
+//! with the same modes, because it is made from the same list ([`crate::pkg_linux::files`],
 //! which the deb and the rpm are made from too) and cannot drift from it:
 //!
 //! - `usr/bin/kbf-installer` (0755);
@@ -32,7 +32,7 @@ use flate2::Compression;
 
 use crate::fetch::Sha256;
 use crate::package::{Platform, open_sums, read, write_new, write_sums};
-use crate::{Error, build_commit, pkg, sums};
+use crate::{Error, build_commit, pkg_linux, sums};
 
 /// The first part of the tarball's name.
 pub const NAME: &str = "kbf-installer-payload";
@@ -57,7 +57,7 @@ pub fn file_name(commit: &str, platform: Platform) -> String {
 ///
 /// # Errors
 /// A file that cannot be read.
-pub fn payload(entries: &[pkg::Entry]) -> Result<Vec<File>, Error> {
+pub fn payload(entries: &[pkg_linux::Entry]) -> Result<Vec<File>, Error> {
     let mut files = Vec::new();
     for e in entries.iter().filter(|e| e.sha256.is_some()) {
         files.push(File {
@@ -173,7 +173,7 @@ pub fn verify_written(path: &Path, files: &[File]) -> Result<(), Error> {
 pub fn installer_tarball(
     platform: Platform,
     commit: &str,
-    sources: &pkg::Sources,
+    sources: &pkg_linux::Sources,
     out: &Path,
 ) -> Result<Vec<String>, Error> {
     if !build_commit::is_commit(commit) {
@@ -184,7 +184,7 @@ pub fn installer_tarball(
             "--platform darwin-arm64: the payload is for Linux; a Mac gets the .pkg".to_owned(),
         ));
     }
-    let files = payload(&pkg::files(sources)?)?;
+    let files = payload(&pkg_linux::files(sources)?)?;
     let name = file_name(commit, platform);
     let (sums_path, mut lines) = open_sums(out, platform)?;
     if let Some(l) = lines.iter().find(|l| l.name == name) {

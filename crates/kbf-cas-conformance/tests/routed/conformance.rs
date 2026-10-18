@@ -86,6 +86,7 @@ async fn farm() -> Arc<RoutedCas> {
             zone: String::new(),
             weight: 1,
             state: MemberState::Active,
+            boot: 0,
         });
     }
     let map = Map::new(1, members, Rule::Rendezvous, 2, 1, Vec::new()).expect("a map");
