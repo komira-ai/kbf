@@ -432,6 +432,7 @@ async fn a_map_request_is_answered_with_the_map_held() {
         zone: String::new(),
         weight: 1,
         state: MemberState::Active,
+        boot: 0,
     };
     let held = Map::new(3, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("a map");
     let source = Arc::new(FakeMapSource::new(held));

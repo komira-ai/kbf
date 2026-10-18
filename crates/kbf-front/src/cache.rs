@@ -540,15 +540,31 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         action: &Digest,
     ) -> Result<Option<(Digest, reapi::ActionResult)>, CacheError> {
+        Ok(self
+            .action_entry(action)
+            .await?
+            .map(|(digest, result, _)| (digest, result)))
+    }
+
+    /// [`Cache::action_result`], and the entry's closure (the blobs it needs besides its
+    /// result blob), read in the same step as the hit so the two agree.
+    ///
+    /// # Errors
+    /// The metadata log or the store is unavailable.
+    pub async fn action_entry(
+        &self,
+        action: &Digest,
+    ) -> Result<Option<(Digest, reapi::ActionResult, Vec<Digest>)>, CacheError> {
         let answer = self
             .touched(|s| match s.action(action) {
-                ActionAnswer::Hit { result, touch } => {
-                    (Ok((result, s.stored_objects(action))), touch)
-                }
+                ActionAnswer::Hit { result, touch } => (
+                    Ok((result, s.stored_objects(action), s.action_closure(action))),
+                    touch,
+                ),
                 ActionAnswer::Miss(miss) => (Err(miss), Touch::default()),
             })
             .await?;
-        let (result, objects) = match answer {
+        let (result, objects, closure) = match answer {
             Ok(hit) => hit,
             Err(miss) => {
                 tracing::debug!(%action, ?miss, "action cache miss");
@@ -565,7 +581,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             Err(e) => return Err(e),
         };
         match reapi::ActionResult::decode(bytes) {
-            Ok(r) => Ok(Some((result, r))),
+            Ok(r) => Ok(Some((result, r, closure))),
             Err(e) => {
                 tracing::warn!(%action, %result, error = %e, "stored ActionResult does not decode");
                 Ok(None)
