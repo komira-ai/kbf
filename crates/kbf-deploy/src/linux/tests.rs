@@ -457,8 +457,24 @@ fn rows() -> Vec<Row> {
             "",
             "FAIL server: kbf-server has no --meta-dir",
         ),
+        // runtime: a runtime flag the daemon no longer has, and the runtime program left
+        // out.
+        row(
+            "daemon-runtime-flag",
+            Daemon,
+            "    --driver=container \\\n",
+            "    --driver=container \\\n    --container-runtime=oci \\\n",
+            "FAIL runtime: kbf-daemon.service passes --container-runtime=oci",
+        ),
+        row(
+            "daemon-oci-runtime-dropped",
+            Daemon,
+            "    --oci-runtime=/usr/bin/crun \\\n",
+            "",
+            "FAIL runtime: kbf-daemon.service does not pass --oci-runtime",
+        ),
         // image: kbf-daemon exits 2 at start on a bare --image (the kit once rendered
-        // podman's form), and must run the images the settings pin.
+        // bare form), and must run the images the settings pin.
         with_image(row(
             "daemon-image-no-scheme",
             Daemon,
@@ -524,7 +540,7 @@ fn each_planted_defect_turns_its_rule_red() {
         }
     }
     assert_eq!(wrong, Vec::<String>::new());
-    assert_eq!(rows.len(), 42, "rows");
+    assert_eq!(rows.len(), 44, "rows");
 }
 
 #[test]
@@ -542,7 +558,7 @@ fn a_leftover_or_unknown_placeholder_is_refused() {
     };
     assert_eq!(
         refused(Which::Daemon, "Restart=on-failure", "Restart=@KBF_RESTART@").as_deref(),
-        Some("kbf-daemon.service:34: placeholder @KBF_RESTART@ has no value")
+        Some("kbf-daemon.service:37: placeholder @KBF_RESTART@ has no value")
     );
     assert_eq!(
         refused(
@@ -551,7 +567,7 @@ fn a_leftover_or_unknown_placeholder_is_refused() {
             "    --reapi-tls-cert=@KBF_ETC/"
         )
         .as_deref(),
-        Some("kbf-server.service:26: an @ that starts no @KEY@ placeholder")
+        Some("kbf-server.service:28: an @ that starts no @KEY@ placeholder")
     );
     assert_eq!(
         refused(
@@ -561,7 +577,7 @@ fn a_leftover_or_unknown_placeholder_is_refused() {
         )
         .as_deref(),
         Some(
-            "kbf-daemon.service:23: @DAEMON_IMAGE_ARGS@ stands for whole lines and must be alone on its line"
+            "kbf-daemon.service:25: @DAEMON_IMAGE_ARGS@ stands for whole lines and must be alone on its line"
         )
     );
 
@@ -589,7 +605,7 @@ fn settings_change_the_units_as_documented() {
     // (`--data-dir`, `--meta-dir`), the removed KBF_META_LOG still accepted (a settings
     // file written for the old units would run with a log it never asked for); an IPv6
     // listen address written unbracketed (`2001:db8::10:8980` is no socket address);
-    // images rendered in podman's bare form or not at all; a defaulted key not taking
+    // images rendered in the bare form or not at all; a defaulted key not taking
     // its default.
     let moved = config(&[("KBF_DATA_DIR", "/srv/kbf"), ("KBF_META_DIR", "/srv/meta")]);
     let u = rendered(&moved, &Templates::BUILT_IN);
@@ -720,11 +736,11 @@ fn bad_settings_are_refused_before_anything_renders() {
         ),
         (
             format!("{EXAMPLE}KBF_RAM=1\n"),
-            "line 107: unknown key KBF_RAM",
+            "line 111: unknown key KBF_RAM",
         ),
         (
             format!("{EXAMPLE}KBF_RAM_GIB=1\n"),
-            "line 107: KBF_RAM_GIB is already set on line 24",
+            "line 111: KBF_RAM_GIB is already set on line 24",
         ),
         (
             example_with(&[("KBF_NODE_ID", "a;b")]),
@@ -745,7 +761,7 @@ fn bad_settings_are_refused_before_anything_renders() {
         ),
         (
             example_with(&[("KBF_IMAGES", &docker)]),
-            "write the bare <repo>@sha256:<digest> (podman's form)",
+            "write the bare <repo>@sha256:<digest>",
         ),
         (
             example_with(&[("KBF_RAM_GIB", "+256")]),
@@ -929,4 +945,32 @@ fn an_unset_key_takes_the_default_config_example_shows() {
         rendered(&minimal, &Templates::BUILT_IN),
         rendered(&example, &Templates::BUILT_IN)
     );
+}
+
+/// `KBF_HOT_DIR` unset takes `<KBF_DATA_DIR>/hot`, in the units of both modes that carry a
+/// hot store: the old default under `/var/lib/kbf-server` is the frontend account's
+/// 0700 directory, which `storage-and-daemon`'s `KBF_USER` cannot enter. A set value
+/// wins. Catches the default left at the server account's directory, and one that
+/// ignores a moved `KBF_DATA_DIR`.
+#[test]
+fn the_hot_dir_defaults_beside_the_data_dir_in_each_mode() {
+    use super::modes::{self, Mode};
+    let hot = |c: &LinuxConfig, mode| {
+        let text = modes::render(c, Some(1500), mode).expect("renders");
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix("--hot-store=").map(str::to_owned))
+            .unwrap_or_default()
+            .trim_end_matches(" \\")
+            .to_owned()
+    };
+    let plain = config(&[("KBF_HOT_DIR", "")]);
+    assert_eq!(plain.hot_dir.as_str(), "/var/lib/kbf/hot");
+    let moved = config(&[("KBF_HOT_DIR", ""), ("KBF_DATA_DIR", "/srv/kbf")]);
+    for mode in [Mode::Storage, Mode::StorageAndDaemon] {
+        assert_eq!(hot(&plain, mode), "file:///var/lib/kbf/hot", "{mode}");
+        assert_eq!(hot(&moved, mode), "file:///srv/kbf/hot", "{mode}");
+    }
+    let set = config(&[("KBF_HOT_DIR", "/fast/hot"), ("KBF_DATA_DIR", "/srv/kbf")]);
+    assert_eq!(set.hot_dir.as_str(), "/fast/hot");
+    assert_eq!(hot(&set, Mode::StorageAndDaemon), "file:///fast/hot");
 }
