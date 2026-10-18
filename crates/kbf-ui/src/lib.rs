@@ -19,7 +19,10 @@
 //! and a page of `GET /v1/invocations/{id}/actions`), and
 //! `/ui/builds/{id}/actions/{digest}` (Action: `GET /v1/invocations/{id}/actions/
 //! {digest}`, with stdout and stderr shown as text when the blob route links them
-//! and they are small; a larger one is a link).
+//! and they are small; a larger one is a link), and `/ui/updates` (Updates: the
+//! desired release, the releases, and each host's update, from `GET /v1/update`,
+//! `GET /v1/nodes` and, where it answers, `GET /v1/update/hosts`; read-only, with the
+//! operator-API command to set the desired release shown as text).
 //!
 //! Not mounted on a server yet. A mount routes `GET` under [`PREFIX`] to [`respond`]
 //! and gives it a [`Source`] that asks the server's own routes with the caller's
@@ -166,6 +169,7 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
         ["builds", id, "actions", digest] if !id.is_empty() && !digest.is_empty() => {
             pages::action(source, id, digest).await
         }
+        ["updates"] => pages::updates(source).await,
         _ => pages::not_found(path),
     }
 }

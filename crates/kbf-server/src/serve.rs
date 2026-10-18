@@ -654,6 +654,10 @@ where
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref());
     let map = map_of(map, members.as_ref())?;
+    // The update rows live in the same store, whose handle is shared.
+    let update_rows = state
+        .as_ref()
+        .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -705,10 +709,22 @@ where
         token.clone(),
         Arc::clone(&drain),
         members.clone(),
+        update_rows.clone(),
         // A server with no frontend role has no enrollment.
         None,
     )
-    .merge(crate::release::router(releases.clone(), token))
+    .merge(crate::release::router(releases.clone(), token.clone()))
+    .merge(crate::update_hosts::router(
+        Arc::clone(&farm),
+        update_rows.clone(),
+        crate::update_hosts::FarmReaders::from_policy(&policy),
+    ))
+    .merge(crate::release::desired::router(
+        releases.clone(),
+        update_rows,
+        token,
+        Arc::clone(&farm),
+    ))
     .merge(health_routes)
     .merge(crate::metrics::router(
         Arc::clone(&cache),

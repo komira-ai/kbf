@@ -48,7 +48,8 @@ kbf-enroll.workspace = true
 kbf-proto.workspace = true
 kbf-types.workspace = true
 thiserror.workspace = true
-# `kbf.toml` read once more for the roles its tables name (src/enroll.rs).
+# `kbf.toml` read once more for the roles its tables name (src/enroll.rs), and the settings
+# file of every mode (src/config.rs).
 toml.workspace = true
 # The renewal loop beside the running mode (src/node.rs).
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
