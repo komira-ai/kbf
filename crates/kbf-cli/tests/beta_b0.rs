@@ -1,0 +1,549 @@
+//! Scenario B0 over a real farm, as it stands today: the farm exports no lost-blob series, so
+//! `lost_blobs_gauge` and `blob_losses` fail closed on every run (see [`NOT_EXPORTED`]).
+//!
+//! Scenario B0 over a real farm: `kbf` processes (a frontend, three storage nodes, two
+//! native daemons, started from the units `kbf-deploy` renders), the harness's supervisor,
+//! scraper, gates and result document, with a stand-in `buck2` for the load (the beta
+//! workflow runs the real one) and, in the first test, a stand-in Envoy.
+//!
+//! What it catches is the harness failing on a healthy farm (a flag a unit's role refuses, a
+//! certificate, a port, a wait that never ends), and each way a run must go red: a failed
+//! build, a failed action in an event log, a build that never ends, a process that exits, a
+//! farm that never becomes ready, and an Envoy that is required and absent. The real
+//! Buck2's farm behaviour, and the mutant that shrinks a node's cap, are the workflow's.
+
+#![cfg(target_os = "linux")]
+
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex, PoisonError};
+use std::time::Duration;
+
+use kbf_harness::b0::{B0, Ended, Mutant, run};
+use kbf_harness::farm::Role;
+
+/// The gates no run of today's farm can pass: B0 reads `kbf_cache_lost_blobs` and
+/// `kbf_cache_blob_losses_total`, which only a process that holds a cache writes
+/// (`kbf_front::Cache::render_metrics`, the lost-blob families of `Cache::losses`). In a farm
+/// of `kbf` processes the frontend holds none (`Backend::remote` keeps its own counters) and
+/// a storage node, which does, serves no `/metrics` (it has no operator API listener). The
+/// gates fail closed on an absent series, so they are red until a storage node exports
+/// them; `the_loss_gates_are_red_until_storage_nodes_export_their_series` pins that, and
+/// fails the day it stops being true, so this list is then emptied.
+const NOT_EXPORTED: [&str; 2] = ["lost_blobs_gauge", "blob_losses"];
+
+/// How many farms these tests run at once. Each is seven processes, and a test runs as many
+/// at a time as the machine has CPUs: on a big machine, under coverage, a farm that is starved
+/// of CPU outlasts its waits. The tests queue for a slot instead.
+const FARMS_AT_ONCE: usize = 3;
+
+static SLOTS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// A place for one farm; given back when dropped.
+struct Slot;
+
+fn take_slot() -> Slot {
+    let (farms, free) = &SLOTS;
+    let mut running = farms.lock().unwrap_or_else(PoisonError::into_inner);
+    while *running >= FARMS_AT_ONCE {
+        running = free.wait(running).unwrap_or_else(PoisonError::into_inner);
+    }
+    *running += 1;
+    Slot
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let (farms, free) = &SLOTS;
+        *farms.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+        free.notify_one();
+    }
+}
+
+thread_local! {
+    /// The slot of the test running on this thread, held until the test ends.
+    static HELD: RefCell<Option<Slot>> = const { RefCell::new(None) };
+}
+
+/// A fresh directory for one test.
+fn scratch(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("kbf-beta")
+        .join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    dir
+}
+
+/// B0 over the stand-in `buck2` that does `mode` in each build, for about `secs` seconds.
+fn b0(name: &str, mode: &str, secs: u64) -> B0 {
+    // A slot for this test's farm, kept until its thread ends; one a test held before (for a
+    // second run) is given back first, so no test waits for a slot while holding one.
+    HELD.with(|held| held.borrow_mut().take());
+    let slot = take_slot();
+    HELD.with(|held| *held.borrow_mut() = Some(slot));
+    let dir = scratch(name);
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::write(project.join(".fake-buck2"), mode).expect("mode");
+    let fake = PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-buck2"));
+    B0 {
+        kbf: PathBuf::from(env!("CARGO_BIN_EXE_kbf")),
+        // Any file: the stand-in build runs no action.
+        act: fake.clone(),
+        buck2: fake,
+        envoy: None,
+        envoy_var: "KBF_TEST_NO_SUCH_ENVOY".to_owned(),
+        project,
+        work: dir.join("work"),
+        duration: Duration::from_secs(secs),
+        settle: Duration::from_secs(1),
+        concurrency: 2,
+        build_timeout: Duration::from_secs(60),
+        wall_bound: Duration::from_secs(secs + 120),
+        pause_secs: 1,
+        fill_kib: 4,
+        scrape_every: Duration::from_secs(1),
+        summary: Some(dir.join("summary.md")),
+        mutant: None,
+        extra_flags: Vec::new(),
+        farm_hang: Duration::from_secs(60),
+        require_envoy: false,
+    }
+}
+
+/// SIGKILL to node-3 of the run in `work`, once the load has started (its scraper has made
+/// its series file): the process is found by its working directory. A bounded wait, which
+/// guards against a run that never starts, and asserts nothing about time.
+fn kill_node_3_under_load(work: &Path) {
+    let until = std::time::Instant::now() + Duration::from_secs(120);
+    let (series, dir) = (work.join("logs/metrics.jsonl"), work.join("farm/node-3"));
+    while !series.exists() {
+        assert!(std::time::Instant::now() < until, "the load never started");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let found = std::fs::read_dir("/proc")
+        .expect("proc")
+        .flatten()
+        .find_map(|entry| {
+            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+            (std::fs::read_link(entry.path().join("cwd")).ok()? == dir).then_some(pid)
+        });
+    let pid = rustix::process::Pid::from_raw(found.expect("node-3 runs")).expect("a pid");
+    rustix::process::kill_process(pid, rustix::process::Signal::KILL).expect("SIGKILL");
+}
+
+/// The result document of a run.
+fn document(args: &B0) -> serde_json::Value {
+    let text = std::fs::read_to_string(args.work.join("beta-result.json")).expect("the result");
+    serde_json::from_str(&text).expect("JSON")
+}
+
+/// The verdict of gate `name` in `doc`.
+fn verdict<'a>(doc: &'a serde_json::Value, name: &str) -> &'a str {
+    let gate = doc["gates"]
+        .as_array()
+        .expect("gates")
+        .iter()
+        .find(|g| g["name"] == name);
+    gate.unwrap_or_else(|| panic!("no gate {name} in {doc}"))["verdict"]
+        .as_str()
+        .expect("verdict")
+}
+
+/// The failed gates other than [`NOT_EXPORTED`].
+fn other_failures(doc: &serde_json::Value) -> Vec<String> {
+    failed(doc)
+        .into_iter()
+        .filter(|g| !NOT_EXPORTED.contains(&g.as_str()))
+        .collect()
+}
+
+/// The names of the gates that failed.
+fn failed(doc: &serde_json::Value) -> Vec<String> {
+    doc["gates"]
+        .as_array()
+        .expect("gates")
+        .iter()
+        .filter(|g| g["verdict"] == "FAIL")
+        .map(|g| g["name"].as_str().expect("name").to_owned())
+        .collect()
+}
+
+/// Catches: a harness that fails on a healthy farm, and one that does not use the parts it
+/// reports using. A frontend, three storage nodes and two daemons start from their rendered
+/// units behind the stand-in Envoy (the nodes register with the frontend, the daemons dial
+/// it through Envoy), the farm is ready, builds run in two loops, the scraper reads the
+/// frontend's metrics, every process stops with exit 0, and the document says what ran:
+/// every gate passes but the two the farm cannot satisfy ([`NOT_EXPORTED`]), the native
+/// driver and no container, the Envoy named, one process-table row per role, the
+/// unattested note, and the log files of every role and of every build.
+#[test]
+fn a_healthy_farm_passes_every_gate_it_can_behind_envoy() {
+    let mut args = b0("healthy", "ok", 6);
+    args.envoy = Some(PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-envoy")));
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert_eq!(failed(&doc), NOT_EXPORTED, "{doc}");
+    assert_eq!(doc["status"], "FAILED");
+    assert_eq!(doc["gates"].as_array().expect("gates").len(), 10);
+    assert_eq!(doc["attested"], false);
+    assert_eq!(doc["runtime"]["driver"], "native");
+    assert_eq!(doc["runtime"]["container"], "none (native driver)");
+    assert_eq!(
+        doc["runtime"]["envoy"],
+        env!("CARGO_BIN_EXE_kbf-cli-fake-envoy")
+    );
+    assert!(doc["builds"]["run"].as_u64().expect("builds") >= 2, "{doc}");
+    assert_eq!(doc["builds"]["failed"], 0);
+    // One start of each of frontend, envoy, three nodes and two daemons, none restarted.
+    let table = doc["processes"].as_array().expect("processes");
+    let mut roles: Vec<&str> = table
+        .iter()
+        .map(|p| p["role"].as_str().expect("role"))
+        .collect();
+    roles.sort_unstable();
+    assert_eq!(
+        roles,
+        [
+            "daemon-1", "daemon-2", "envoy", "frontend", "node-1", "node-2", "node-3"
+        ]
+    );
+    assert!(
+        table
+            .iter()
+            .all(|p| p["generation"] == 0 && p["ended"] == "exit 0"),
+        "{table:?}"
+    );
+    let logs = args.work.join("logs");
+    for file in [
+        "frontend.out",
+        "envoy.err",
+        "node-3.err",
+        "daemon-2.out",
+        "metrics.jsonl",
+        "buck2-0-0.log",
+    ] {
+        assert!(logs.join(file).exists(), "{file}");
+    }
+    let series = std::fs::read_to_string(logs.join("metrics.jsonl")).expect("series");
+    assert!(series.lines().count() >= 4, "{series}");
+    let summary = std::fs::read_to_string(args.work.parent().expect("dir").join("summary.md"))
+        .expect("summary");
+    assert!(summary.contains("| builds_run |"), "{summary}");
+}
+
+/// Catches: a lost-blob gate that passes on a farm that exports no lost-blob series (a
+/// metric that is not there read as zero), and the day this stops being true: a storage node
+/// that serves `kbf_cache_lost_blobs` and `kbf_cache_blob_losses_total` makes this fail, and
+/// [`NOT_EXPORTED`] is then emptied and every test here asserts a passing run.
+#[test]
+fn the_loss_gates_are_red_until_storage_nodes_export_their_series() {
+    let args = b0("no-loss-series", "ok", 3);
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    for name in NOT_EXPORTED {
+        let gate = doc["gates"]
+            .as_array()
+            .expect("gates")
+            .iter()
+            .find(|g| g["name"] == name);
+        let gate = gate.unwrap_or_else(|| panic!("no gate {name}"));
+        assert_eq!(gate["verdict"], "FAIL", "{gate}");
+        assert!(gate["measured"].is_null(), "{gate}");
+        assert!(
+            gate["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("is absent from scrape 0"),
+            "{gate}"
+        );
+    }
+    let series = std::fs::read_to_string(args.work.join("logs/metrics.jsonl")).expect("series");
+    assert!(
+        series.contains("kbf_execute_errors_total"),
+        "the frontend's own series are read"
+    );
+    assert!(
+        !series.contains("kbf_cache_lost_blobs"),
+        "a series the farm now exports"
+    );
+}
+
+/// Catches: a failed build, a failed action in an event log of a build that exited 0, a
+/// build that ran its actions locally, and a build that printed no summary, each passing:
+/// every one must fail its own gate (and only the gates it should).
+#[test]
+fn each_kind_of_bad_build_fails_its_gate() {
+    for (mode, gates) in [
+        ("exit-1", vec!["builds_failed"]),
+        ("failed-action", vec!["actions_failed"]),
+        ("local", vec!["builds_failed"]),
+        ("no-summary", vec!["builds_failed"]),
+        ("bad-log", vec!["actions_failed"]),
+    ] {
+        let args = b0(&format!("bad-{mode}"), mode, 3);
+        assert_eq!(run(&args).expect("a run"), Ended::Failed, "{mode}");
+        let doc = document(&args);
+        assert_eq!(other_failures(&doc), gates, "{mode}: {doc}");
+        assert_eq!(doc["status"], "FAILED", "{mode}");
+    }
+}
+
+/// Catches: a build that never ends holding the run until the job's timeout: it is killed at
+/// its bound and the run is red (`builds_failed`, and `actions_failed` for the event log it
+/// never wrote), with every process still stopped cleanly.
+#[test]
+fn a_build_that_never_ends_is_killed_and_the_run_is_red() {
+    let mut args = b0("hang", "hang", 2);
+    args.build_timeout = Duration::from_secs(3);
+    args.concurrency = 1;
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert_eq!(
+        other_failures(&doc),
+        ["builds_failed", "actions_failed"],
+        "{doc}"
+    );
+    assert_eq!(verdict(&doc, "clean_stop"), "PASS");
+}
+
+/// Catches: a load that outlasts its wall-clock bound (a build that cannot be killed) holding
+/// the run until the job's timeout: the run ends `TIMED_OUT` at the bound, red on `hang`, with
+/// the process list in `processes.txt` (the logs are beside it), and every process still
+/// stopped.
+#[test]
+fn a_load_past_its_wall_bound_is_timed_out_with_a_report() {
+    let mut args = b0("bound", "hang", 2);
+    args.concurrency = 1;
+    args.wall_bound = Duration::from_secs(3);
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert_eq!(doc["status"], "TIMED_OUT");
+    assert!(failed(&doc).contains(&"hang".to_owned()), "{doc}");
+    assert!(
+        doc["error"]
+            .as_str()
+            .expect("error")
+            .contains("processes.txt")
+    );
+    let list = std::fs::read_to_string(args.work.join("logs/processes.txt")).expect("the list");
+    assert!(list.starts_with("--- processes ---"), "{list}");
+    assert!(list.contains("frontend pid"), "{list}");
+}
+
+/// Catches: a node that dies on its own (not killed by the harness) going unseen: the run
+/// notices at once, stops loading, fails `processes_alive` with the role and how it died, and
+/// still stops the others cleanly. The load is a hundred seconds long and ends long before
+/// (a bound that only a load which did not stop would break, not a measure of time).
+#[test]
+fn a_node_that_dies_on_its_own_fails_the_liveness_gate() {
+    let args = b0("dies", "ok", 100);
+    let work = args.work.clone();
+    // Kills node-3 once the load is under way, from outside the harness.
+    let killer = std::thread::spawn(move || kill_node_3_under_load(&work));
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    killer.join().expect("the killer");
+    let doc = document(&args);
+    assert!(
+        failed(&doc).contains(&"processes_alive".to_owned()),
+        "{doc}"
+    );
+    let gate = doc["gates"]
+        .as_array()
+        .expect("gates")
+        .iter()
+        .find(|g| g["name"] == "processes_alive");
+    assert_eq!(gate.expect("gate")["detail"], "node-3: signal 9");
+    assert_eq!(verdict(&doc, "clean_stop"), "PASS");
+    let took = doc["duration_secs"].as_f64().expect("a duration");
+    assert!(
+        took < 90.0,
+        "the load went on after a process died: {took} s"
+    );
+}
+
+/// Catches: the liveness gate that cannot go red: a node killed halfway through the load
+/// (the kill-node-midway mutant) must fail `processes_alive`, and the run must not call a
+/// farm that lost a member healthy, while the other roles stop cleanly.
+#[test]
+fn a_node_killed_midway_fails_the_liveness_gate() {
+    let mut args = b0("kill-midway", "ok", 8);
+    args.mutant = Some(Mutant::KillNodeMidway);
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert!(
+        failed(&doc).contains(&"processes_alive".to_owned()),
+        "{doc}"
+    );
+    assert_eq!(verdict(&doc, "clean_stop"), "PASS");
+    let detail = doc["gates"]
+        .as_array()
+        .expect("gates")
+        .iter()
+        .find(|g| g["name"] == "processes_alive");
+    assert!(
+        detail.expect("gate")["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("node-2")
+    );
+    // The node was killed, not just said to be: its process ended by SIGKILL.
+    let table = doc["processes"].as_array().expect("processes");
+    let node_2 = table.iter().find(|p| p["role"] == "node-2");
+    assert_eq!(node_2.expect("a row")["ended"], "signal 9", "{table:?}");
+}
+
+/// Catches: an Envoy that is required and missing becoming a skip (a green smoke that never
+/// used Envoy), and a farm started before the check: the run fails at once, with the reason
+/// in the document and no process started.
+#[test]
+fn a_required_envoy_that_is_absent_fails_the_run() {
+    let mut args = b0("no-envoy", "ok", 3);
+    args.require_envoy = true;
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert_eq!(doc["status"], "FAILED");
+    assert!(
+        doc["error"]
+            .as_str()
+            .expect("error")
+            .contains("Envoy is required"),
+        "{doc}"
+    );
+    assert!(
+        doc["runtime"]["envoy"]
+            .as_str()
+            .expect("envoy")
+            .starts_with("absent: "),
+        "{doc}"
+    );
+    assert!(!args.work.join("farm").exists());
+}
+
+/// Catches: an Envoy that is not required being missed without a word: the run goes on without
+/// one and the document says `absent: <why>`.
+#[test]
+fn an_absent_envoy_is_recorded_when_it_is_not_required() {
+    let args = b0("no-envoy-ok", "ok", 3);
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert_eq!(
+        doc["runtime"]["envoy"],
+        "absent: KBF_TEST_NO_SUCH_ENVOY is not set"
+    );
+    assert_eq!(other_failures(&doc), Vec::<String>::new(), "{doc}");
+}
+
+/// Catches: a farm that cannot start (a `kbf` that exits at once) being reported as a pass,
+/// a panic, or a hang: the run is red with `farm_ready` failing and the exit in the report.
+#[test]
+fn a_farm_that_cannot_start_is_red_with_the_reason() {
+    let mut args = b0("no-farm", "ok", 3);
+    // A program that exits at once, in place of `kbf`.
+    args.kbf = PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-systemctl"));
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert_eq!(doc["status"], "FAILED");
+    assert_eq!(verdict(&doc, "farm_ready"), "FAIL");
+    assert!(args.work.join("logs/hang-report.txt").exists());
+}
+
+/// Catches: a farm that starts but never becomes ready (a daemon told to dial a port nobody
+/// listens on, so the frontend never lists it) hanging the run: it ends `TIMED_OUT` at the farm's
+/// own bound, `farm_ready` red, with the logs of every process in `hang-report.txt`.
+#[test]
+fn a_farm_that_never_becomes_ready_times_out_with_its_logs() {
+    let mut args = b0("not-ready", "ok", 3);
+    args.farm_hang = Duration::from_secs(15);
+    args.extra_flags = vec![(
+        Role::Daemon(1),
+        vec!["--server=https://localhost:1".to_owned()],
+    )];
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert_eq!(doc["status"], "TIMED_OUT");
+    assert_eq!(verdict(&doc, "farm_ready"), "FAIL");
+    let report = std::fs::read_to_string(args.work.join("logs/hang-report.txt")).expect("report");
+    assert!(
+        report.contains("timed out waiting for every node connected to the frontend"),
+        "{report}"
+    );
+    assert!(report.contains("--- daemon-1 stderr ---"), "{report}");
+}
+
+/// Catches: a project that cannot be copied found only after a farm has started and stopped
+/// (the run is red at once, with the reason, before any process starts).
+#[test]
+fn a_project_that_cannot_be_copied_fails_before_a_farm_starts() {
+    let mut args = b0("no-project", "ok", 3);
+    args.project = args.work.parent().expect("dir").join("no-such-project");
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert!(
+        doc["error"]
+            .as_str()
+            .expect("error")
+            .starts_with("the sample project: "),
+        "{doc}"
+    );
+    assert!(!args.work.join("farm").exists());
+}
+
+/// Catches: a project whose `.buckconfig` cannot be written (so Buck2 would dial no farm) being
+/// run anyway: red at once with the reason, the farm stopped.
+#[test]
+fn a_project_whose_buckconfig_cannot_be_written_fails_the_run() {
+    let args = b0("buckconfig", "ok", 3);
+    std::fs::create_dir(args.project.join(".buckconfig")).expect("a directory in its place");
+    assert_eq!(run(&args).expect("a run"), Ended::Failed);
+    let doc = document(&args);
+    assert!(
+        doc["error"]
+            .as_str()
+            .expect("error")
+            .starts_with("the project's .buckconfig: "),
+        "{doc}"
+    );
+}
+
+/// Catches: the command line that the workflow runs not reaching the scenario: through
+/// `kbf-beta b0 --bin-dir ...` the farm starts, the loops run, the result is written, and the
+/// exit status is 1 (a gate failed: the loss gates, today).
+#[test]
+fn the_command_line_runs_b0_and_exits_1_on_a_failed_gate() {
+    let args = b0("cli", "ok", 3);
+    let bin = args.work.parent().expect("dir").join("bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    std::os::unix::fs::symlink(&args.kbf, bin.join("kbf")).expect("link");
+    std::os::unix::fs::symlink(&args.act, bin.join("kbf-m2-act")).expect("link");
+    let words: Vec<std::ffi::OsString> = [
+        "kbf-beta",
+        "b0",
+        "--duration-secs",
+        "3",
+        "--settle-secs",
+        "1",
+        "--concurrency",
+        "1",
+        "--bin-dir",
+        bin.to_str().expect("utf-8"),
+        "--buck2",
+        args.buck2.to_str().expect("utf-8"),
+        "--project",
+        args.project.to_str().expect("utf-8"),
+        "--work",
+        args.work.to_str().expect("utf-8"),
+        "--mutant",
+        "kill-node-midway",
+    ]
+    .iter()
+    .map(Into::into)
+    .collect();
+    assert_eq!(kbf_harness::cli::status(words, |_| None), 1);
+    let doc = document(&args);
+    assert!(
+        failed(&doc).contains(&"processes_alive".to_owned()),
+        "{doc}"
+    );
+}

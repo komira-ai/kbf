@@ -1,0 +1,20 @@
+# The beta sample project for buck2 (scenario B0, crates/kbf-harness): built remote-only
+# through Envoy (or the frontend) to a farm of real `kbf` processes, whose daemons run
+# actions as plain processes. No prelude: the rules are in this project.
+#
+# Not here: the farm's address and the CA it is under, which differ for each run. The
+# harness gives them on every build's command line as
+# `-c buck2_re_client.engine_address=...` (and `action_cache_address`, `cas_address`,
+# `tls_ca_certs`).
+[cells]
+  root = .
+
+[buck2]
+  digest_algorithms = SHA256
+
+[buck2_re_client]
+  tls = true
+  instance_name = kbf-beta
+
+[build]
+  execution_platforms = root//platforms:remote

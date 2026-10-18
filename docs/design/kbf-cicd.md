@@ -250,6 +250,26 @@ The proposal is to grow it into a library (`rehearsal`) that two test cells shar
   one honest deviation is that the supervisor, not systemd, starts the processes; the `systemctl` edge is covered by gamma.
   The root helper runs under `sudo` on the runner (`sudo-test` already does this in `ci.yml` **[F]**).
 
+**Status of the first change (#942).** The helpers above are now the library `crates/kbf-harness`, which `kbf-cli`'s
+rehearsal drives: `Farm` (a supervisor with `kill`, `term`, `restart`, a process table and a report of every process's
+output for a hang), the metrics scraper, the gates, the result document, the Buck2 load, the Envoy launch from the `box`
+render, and `kbf-beta b0`, which runs scenario B0 and writes `beta-result.json`. `.github/workflows/beta.yml` runs it on
+the merge queue and on a push; it builds its own binaries, so the result says it is unattested. Running it showed what
+the design did not know:
+
+- `kbf storage-and-daemon` runs the container driver only, and the stand-in `podman` runs one planted argv whatever a
+  build sends, so B0 runs three `kbf storage` nodes and two plain `kbf daemon` processes with `--driver=native` (the
+  result says no container path was exercised). The rehearsal keeps the stand-in over storage-and-daemon nodes.
+- The `kbf storage` unit renders neither `--frontend` nor `--advertise-addr`, so the harness adds both. It registers the
+  nodes with the frontend itself and not through Envoy: a node serves nothing until it has registered, the frontend is not
+  ready until a node serves, and Envoy (panic threshold 0) sends nothing to an unready frontend, so through Envoy no node
+  can register at a cold start.
+- No process of a farm exports `kbf_cache_lost_blobs` or `kbf_cache_blob_losses_total`: the frontend holds no cache, and a
+  storage node, which does, serves no `/metrics`. The two loss gates fail closed on an absent series, so B0 is red until
+  storage nodes export them (the frontend's series, `kbf_execute_errors_total` among them, are read).
+- Buck2 reads the remote execution client's address and CA when its daemon starts and ignores them on a command line, and
+  refuses a `grpcs://` address: the harness appends them to the copy of the project's `.buckconfig`.
+
 ### 4.4 Scenarios and gates
 
 All scenarios run inside one farm start where they can, to save minutes; each is a separate named test so a red run says

@@ -51,6 +51,8 @@ kbf-cas-conformance.workspace = true
 kbf-daemon.workspace = true
 # The image store layout the stand-in `podman` reads (tests/binary.rs).
 kbf-driver-container.workspace = true
+# The stand-in `podman`'s image store, cgroup tree and id files (tests/support/node.rs re-exports them).
+kbf-harness.workspace = true
 # The storage boundary the plane is checked through (tests/storage_seam.rs); where a blob is, to damage one (src/plane_tests.rs).
 kbf-meta.workspace = true
 # The store a blob is in, to damage one (src/plane_tests.rs).

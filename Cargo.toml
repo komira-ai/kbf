@@ -181,6 +181,7 @@ kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-enroll = { path = "crates/kbf-enroll" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-harness = { path = "crates/kbf-harness" }
 kbf-history = { path = "crates/kbf-history" }
 kbf-host = { path = "crates/kbf-host" }
 kbf-invocation = { path = "crates/kbf-invocation" }

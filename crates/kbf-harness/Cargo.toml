@@ -1,0 +1,40 @@
+[package]
+name = "kbf-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The rehearsal harness as a library (docs/design/kbf-cicd.md, sections 4.2 and 4.3): the
+# farm of real `kbf` processes started from the units `kbf-deploy` renders, its
+# supervisor, certificates, metrics scraper, the Buck2 load, the result document, and
+# `kbf-beta`, the binary that runs a beta scenario (B0, `farm_under_build_load`) and
+# writes `beta-result.json`. It spawns the binaries it is given by path: a library cannot
+# use `CARGO_BIN_EXE_*`, which only the package that owns a binary may, so its callers
+# (kbf-cli's rehearsal test, the beta workflow) pass `kbf` in. It links neither
+# kbf-server nor kbf-node (tests/layering.rs).
+[[bin]]
+name = "kbf-beta"
+path = "src/bin/kbf-beta.rs"
+
+[dependencies]
+clap.workspace = true
+flate2.workspace = true
+kbf-deploy.workspace = true
+kbf-driver-container.workspace = true
+# The Buck2 summary line parser (`Commands: N (cached: N, remote: N, local: N)`).
+kbf-it.workspace = true
+kbf-testkit.workspace = true
+kbf-transfer.workspace = true
+rcgen = { workspace = true, features = ["x509-parser"] }
+rustix = { workspace = true, features = ["process"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# RFC 3339 timestamps of the gates' windows.
+time.workspace = true
+
+[lints]
+workspace = true

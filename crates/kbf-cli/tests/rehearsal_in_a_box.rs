@@ -14,28 +14,19 @@
 //! the frontend's name), a certificate a deployed node would be refused, a unit kbf
 //! refuses at start. Not covered: systemd itself, the held scripts and the host setup.
 //!
-//! The deviations from the rendered units are listed in [`Farm::start`]: the cold store
-//! is a directory (no MinIO), the container driver runs the stand-in `podman` over a
-//! planted cgroup tree and id files.
+//! The farm itself is `kbf_harness::farm::Farm`, which the beta scenarios share: this file
+//! holds the REAPI client and the tests. The deviations from the rendered units are listed
+//! in `Farm::start`: the cold store is a directory (no MinIO), the container driver runs
+//! the stand-in `podman` over a planted cgroup tree and id files.
 
 #![cfg(target_os = "linux")]
 
-#[path = "../../kbf-all-in-one/tests/support/node.rs"]
-mod node;
-#[path = "rehearsal/pki.rs"]
-mod pki;
-#[path = "rehearsal/procs.rs"]
-mod procs;
-#[path = "rehearsal/units.rs"]
-mod units;
-
-use std::io::{Read as _, Write as _};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
-use kbf_deploy::linux::Mode;
-use kbf_deploy::linux::verify_cert::Row;
+use kbf_harness::api::connected;
+use kbf_harness::farm::{Bins, Farm, Role, Topology, node_id};
+use kbf_harness::node_support::input_bytes;
+use kbf_harness::procs::HANG;
 use kbf_proto::google::longrunning::operation;
 use kbf_proto::reapi::action_cache_client::ActionCacheClient;
 use kbf_proto::reapi::execution_client::ExecutionClient;
@@ -45,35 +36,15 @@ use kbf_proto::reapi::{
     ExecuteRequest, ExecuteResponse, FileNode, GetActionResultRequest, Platform,
 };
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
-use node::{cgroup_tree, files_holding, id_files, image_path, input_bytes, podman};
-use pki::Pki;
-use procs::{HANG, Proc, field};
 use prost::Message as _;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
-use units::{Rendered, config, rendered};
 
 // The stand-in `podman` runs each action as `kbf-act` beside it: a link to this test
 // binary, which answers as `kbf-act` through it.
 kbf_testkit::act_test_hook!();
 
-/// The stand-in `podman` (`node::podman`).
-const FAKE_PODMAN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-podman");
-
 /// The bytes the action writes to its one output file.
 const OUTPUT: &[u8] = b"a file\n";
-
-/// The node id of storage-and-daemon node `n` (from 1); the plain daemon's is `daemon-1`.
-fn node_id(n: usize) -> String {
-    format!("node-{n}")
-}
-
-const DAEMON: &str = "daemon-1";
-
-/// A loopback address of its own for each process (the whole of `127/8` is loopback on
-/// Linux): the frontend's, then each node's, then the plain daemon's.
-fn loopback(n: usize) -> String {
-    format!("127.0.0.{}", n + 1)
-}
 
 /// A fresh directory for one test.
 fn scratch(name: &str) -> PathBuf {
@@ -85,348 +56,35 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The last component of `dir`.
-fn file_name(dir: &Path) -> String {
-    dir.file_name()
-        .expect("a name")
-        .to_string_lossy()
-        .into_owned()
+/// The rehearsal's farm of `storage_nodes` nodes and a daemon, started from the units
+/// `kbf-deploy` renders, over the stand-in `podman`.
+fn start(name: &str, storage_nodes: usize) -> Farm {
+    let dir = scratch(name);
+    let bins = Bins {
+        kbf: PathBuf::from(env!("CARGO_BIN_EXE_kbf")),
+        fake_podman: Some(PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-podman"))),
+    };
+    Farm::start(&dir, &dir, &bins, &Topology::rehearsal(storage_nodes))
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// `n` distinct ports nothing listens on now.
-fn ports(n: usize) -> Vec<u16> {
-    let held: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind"))
-        .collect();
-    held.iter()
-        .map(|l| l.local_addr().expect("addr").port())
-        .collect()
+/// Waits until the frontend is ready and lists every node as connected.
+fn ready(farm: &mut Farm) {
+    farm.wait_ready().unwrap_or_else(|e| panic!("{e}"));
 }
 
-/// `GET path` of the operator API at `127.0.0.1:api`: the status code and the body, or
-/// `None` while nothing answers.
-fn get(api: u16, path: &str) -> Option<(u16, String)> {
-    let mut stream = std::net::TcpStream::connect(("127.0.0.1", api)).ok()?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n"
-    )
-    .ok()?;
-    let mut text = String::new();
-    stream.read_to_string(&mut text).ok()?;
-    let (head, body) = text.split_once("\r\n\r\n")?;
-    let code = head.split_whitespace().nth(1)?.parse().ok()?;
-    Some((code, body.to_owned()))
-}
-
-/// The ids of the nodes the frontend lists as connected, sorted; `None` while it does
-/// not answer.
-fn connected(api: u16) -> Option<Vec<String>> {
-    let (code, body) = get(api, "/v1/nodes")?;
-    (code == 200).then_some(())?;
-    let view: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let mut ids: Vec<String> = view["nodes"]
-        .as_array()?
-        .iter()
-        .filter(|n| n["connected"] == true)
-        .filter_map(|n| n["node_id"].as_str().map(str::to_owned))
-        .collect();
-    ids.sort();
-    Some(ids)
-}
-
-/// How many storage members `GET /v1/members` lists, and whether every one is `active`: a
-/// node that registered rebuilds its index first (`catching_up`), and each promotion is a
-/// new map generation, which a client that wrote meanwhile would be told is stale.
-fn members_active(api: u16) -> Option<(usize, bool)> {
-    let (code, body) = get(api, "/v1/members")?;
-    (code == 200).then_some(())?;
-    let view: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let members = view["members"].as_array()?;
-    Some((
-        members.len(),
-        members.iter().all(|m| m["state"] == "active"),
-    ))
-}
-
-/// What every process of the farm is told about the frontend.
-struct Wiring {
-    reapi: u16,
-    worker: u16,
-    api: u16,
-    /// The storage URL the frontend dials: node 1's.
-    storage_url: String,
-}
-
-/// The settings of one process: its own address, node id, directories under `root` and
-/// storage port, and the farm's wiring. The frontend is one name for every dialler
-/// (`KBF_FRONTEND_NAME`), not the process's own (`KBF_HOST_NAME`).
-fn settings(
-    root: &Path,
-    host: &str,
-    node_id: &str,
-    storage_port: u16,
-    wiring: &Wiring,
-    image: &str,
-) -> kbf_deploy::linux::LinuxConfig {
-    let at = |name: &str| root.join(name).display().to_string();
-    config(&[
-        ("KBF_HOST_NAME", host.to_owned()),
-        ("KBF_FRONTEND_NAME", "localhost".to_owned()),
-        ("KBF_LISTEN_ADDRESS", host.to_owned()),
-        ("KBF_NODE_ID", node_id.to_owned()),
-        // Actions get RAM less the reserved shares: 10 GiB, over the 4 GiB an action asks by default.
-        ("KBF_RAM_GIB", "16".to_owned()),
-        ("MINIO_RESERVATION_GIB", "1".to_owned()),
-        ("KBF_SERVER_RESERVATION_GIB", "1".to_owned()),
-        ("KBF_OS_HEADROOM_GIB", "4".to_owned()),
-        ("KBF_STORAGE_URL", wiring.storage_url.clone()),
-        ("KBF_REAPI_PORT", wiring.reapi.to_string()),
-        ("KBF_WORKER_PORT", wiring.worker.to_string()),
-        ("KBF_API_PORT", wiring.api.to_string()),
-        ("KBF_STORAGE_PORT", storage_port.to_string()),
-        ("KBF_ETC", at("etc")),
-        ("KBF_DATA_DIR", at("data")),
-        ("KBF_META_DIR", at("meta")),
-        ("KBF_HOT_DIR", at("hot")),
-        ("KBF_STATE_DIR", at("state")),
-        ("KBF_IMAGES", image.to_owned()),
-    ])
-}
-
-/// The directories a process's unit expects to exist (the installer makes them on a
-/// host).
-fn make_dirs(root: &Path) -> PathBuf {
-    for name in ["etc", "data", "meta", "hot", "state", "cold", "bin"] {
-        std::fs::create_dir_all(root.join(name)).expect("mkdir");
-    }
-    root.join("bin")
-}
-
-/// The running farm.
-struct Farm {
-    /// The frontend, then the storage-and-daemon nodes, then the plain daemon.
-    procs: Vec<Proc>,
-    roots: Vec<PathBuf>,
-    reapi: String,
-    api: u16,
-    ca: Vec<u8>,
-    /// The image the actions name: what the stand-in `podman` serves.
-    image: String,
-    storage_nodes: usize,
-    /// The ids the frontend must list as connected, sorted.
-    node_ids: Vec<String>,
-    /// The processes (by index) a test has killed: [`Farm::wait`] does not take their
-    /// exit for a crash.
-    killed: Vec<usize>,
-}
-
-impl Farm {
-    /// Renders the five units and starts a process from each.
-    ///
-    /// The flags a test box cannot take as rendered, and what each is changed to:
-    /// - the nodes' `--cold-store=s3://...` (no MinIO here) is a `file://` directory;
-    /// - `--driver=container` stays, over the stand-in `podman`: the nodes get it on
-    ///   `PATH`, their cgroup tree (`--cgroup-root`, `--self-cgroup`) is planted and
-    ///   `--id-files` stands for `/etc/subuid`.
-    ///
-    /// Every other flag is the unit's.
-    fn start(name: &str, storage_nodes: usize) -> Self {
-        let dir = scratch(name);
-        let uid = rustix::process::getuid().as_raw();
-        let p = ports(storage_nodes + 4);
-        let (storage, spare) = (&p[3..3 + storage_nodes], p[3 + storage_nodes]);
-        let wiring = Wiring {
-            reapi: p[0],
-            worker: p[1],
-            api: p[2],
-            storage_url: format!("https://{}:{}", loopback(1), storage[0]),
-        };
-        let pki = Pki::new();
-        let steps = ["write-lines", "$UPPER/out/file.txt", "a file"];
-        let mut farm = Farm {
-            procs: Vec::new(),
-            roots: Vec::new(),
-            reapi: String::new(),
-            api: wiring.api,
-            ca: Vec::new(),
-            image: String::new(),
-            storage_nodes,
-            node_ids: std::iter::once(DAEMON.to_owned())
-                .chain((1..=storage_nodes).map(node_id))
-                .collect(),
-            killed: Vec::new(),
-        };
-
-        // The frontend: its unit as rendered, a state directory made.
-        let root = dir.join("frontend");
-        let etc = root.join("etc");
-        make_dirs(&root);
-        pki.write_ca(&etc);
-        pki.issue(&etc, "worker", Row::FrontendWorker, &["localhost"]);
-        pki.issue_reapi(&etc, &["localhost"]);
-        // The unit names `--api-token-file <etc>/api-token`; the test's API calls only read.
-        let token = etc.join("api-token");
-        std::fs::write(&token, "rehearsal-api-token-of-32-or-more-visible-chars\n")
-            .expect("write the API token");
-        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-            .expect("the API token's mode");
-        farm.ca = std::fs::read(etc.join("ca.pem")).expect("ca");
-        let cfg = settings(&root, &loopback(0), "frontend-1", spare, &wiring, "");
-        let unit = rendered(&cfg, uid, Mode::Frontend);
-        // The unit's control socket is in a `RuntimeDirectory=` systemd makes; a test box
-        // has no such directory, and the scratch directory's path is too long for a
-        // socket's (`SUN_LEN`), so the socket is in the temporary directory, named for
-        // the test.
-        let socket = std::env::temp_dir().join(format!("{}.sock", file_name(&dir)));
-        let _ = std::fs::remove_file(&socket);
-        let control = format!("--handover-socket={}", socket.display());
-        farm.launch(&dir, &root, "frontend", unit.replace(&[control]), None);
-        let line = farm.start_line(0, "kbf-frontend ");
-        farm.reapi = field(&line, "reapi=").to_owned();
-
-        // The storage-and-daemon nodes, then the plain daemon.
-        for (i, port) in storage.iter().enumerate() {
-            let (id, host) = (node_id(i + 1), loopback(i + 1));
-            let id = id.as_str();
-            let root = dir.join(id);
-            let bin = make_dirs(&root);
-            let image = podman(&bin, FAKE_PODMAN, &steps);
-            let etc = root.join("etc");
-            pki.write_ca(&etc);
-            pki.issue(&etc, "storage", Row::Storage, &[&host]);
-            pki.issue(&etc, "node", Row::Daemon, &[id]);
-            let bare = image.strip_prefix("docker://").expect("docker://");
-            let cfg = settings(&root, &host, id, *port, &wiring, bare);
-            farm.image.clone_from(&image);
-            let unit = rendered(&cfg, uid, Mode::StorageAndDaemon);
-            let cold = format!("--cold-store=file://{}", root.join("cold").display());
-            farm.launch(&dir, &root, id, unit.replace(&[cold]), Some(&bin));
-            farm.start_line(i + 1, "kbf-storage ");
-        }
-        let (id, host) = (DAEMON, loopback(storage_nodes + 1));
-        let root = dir.join(id);
-        let bin = make_dirs(&root);
-        let image = podman(&bin, FAKE_PODMAN, &steps);
-        let etc = root.join("etc");
-        pki.write_ca(&etc);
-        pki.issue(&etc, "node", Row::Daemon, &[id]);
-        let bare = image.strip_prefix("docker://").expect("docker://");
-        let cfg = settings(&root, &host, id, spare, &wiring, bare);
-        let unit = rendered(&cfg, uid, Mode::Daemon);
-        farm.launch(&dir, &root, id, unit, Some(&bin));
-        farm
-    }
-
-    /// Starts the process for `unit`; those with a `bin` (the container driver's) get
-    /// the stand-in `podman` on `PATH` and the planted cgroup tree and id files.
-    fn launch(&mut self, dir: &Path, root: &Path, name: &str, unit: Rendered, bin: Option<&Path>) {
-        let (unit, cwd, mut env) = match bin {
-            Some(bin) => {
-                let mut flags = cgroup_tree(bin);
-                flags.push(format!("--id-files={}", id_files(root).display()));
-                let env = vec![("PATH".to_owned(), image_path(bin))];
-                // The stand-in finds its state beside the link it was run through.
-                (unit.add(&flags), bin, env)
-            }
-            None => (unit, root, Vec::new()),
-        };
-        env.extend(unit.env.iter().cloned());
-        let proc = Proc::start(name, dir, &unit.argv, &env, cwd);
-        self.procs.push(proc);
-        self.roots.push(root.to_owned());
-    }
-
-    /// Waits for `ready`, failing at once with every process's output if one exits, and
-    /// after [`HANG`] with the same.
-    fn wait<T>(&mut self, what: &str, mut ready: impl FnMut(&Farm) -> Option<T>) -> T {
-        let deadline = Instant::now() + HANG;
-        loop {
-            let killed = &self.killed;
-            let ended = self.procs.iter_mut().enumerate().find_map(|(i, p)| {
-                if killed.contains(&i) {
-                    return None;
-                }
-                p.exited()
-                    .map(|s| format!("{} exited ({s}) while waiting for {what}", p.name))
-            });
-            if let Some(ended) = ended {
-                panic!("{ended}\n{}", self.logs());
-            }
-            if let Some(found) = ready(self) {
-                return found;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {what}\n{}",
-                self.logs()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// SIGKILL to process `which`, as a host losing power would take it.
-    fn kill(&mut self, which: usize) {
-        self.procs[which].kill();
-        self.killed.push(which);
-    }
-
-    fn logs(&self) -> String {
-        self.procs.iter().map(Proc::log).collect()
-    }
-
-    fn start_line(&mut self, which: usize, prefix: &str) -> String {
-        let name = self.procs[which].name.clone();
-        self.wait(&format!("{name}'s start line"), |f| {
-            f.procs[which].line(prefix)
-        })
-    }
-
-    /// Waits until the frontend is ready and lists every node as connected.
-    fn wait_ready(&mut self) {
-        self.wait("the frontend's /readyz", |f| {
-            (get(f.api, "/readyz")?.0 == 200).then_some(())
-        });
-        self.wait("every node connected to the frontend", |f| {
-            (connected(f.api)? == f.node_ids).then_some(())
-        });
-        self.wait("every storage member active", |f| {
-            (members_active(f.api)? == (f.storage_nodes, true)).then_some(())
-        });
-    }
-
-    /// A client of the frontend's REAPI listener (TLS under the farm CA).
-    async fn channel(&self) -> Channel {
-        let tls = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(&self.ca))
-            .domain_name("localhost");
-        Endpoint::from_shared(format!("https://{}", self.reapi))
-            .expect("endpoint")
-            .tls_config(tls)
-            .expect("TLS")
-            .connect()
-            .await
-            .expect("connect to the frontend")
-    }
-
-    /// SIGTERM to each process, the daemons and nodes before the frontend (which waits
-    /// for open streams), and each must exit 0.
-    fn stop(mut self) {
-        for i in (0..self.procs.len()).rev() {
-            let status = self.procs[i].term();
-            assert!(status.success(), "{status}\n{}", self.logs());
-        }
-    }
-
-    /// The nodes (by index) that hold `bytes` in their hot or cold store.
-    fn holders(&self, bytes: &[u8]) -> Vec<usize> {
-        (1..=self.storage_nodes)
-            .filter(|n| {
-                let root = &self.roots[*n];
-                !files_holding(&[root.join("hot"), root.join("cold")], bytes).is_empty()
-            })
-            .collect()
-    }
+/// A client of the frontend's REAPI listener (TLS under the farm CA).
+async fn channel(farm: &Farm) -> Channel {
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(farm.ca_pem()))
+        .domain_name("localhost");
+    Endpoint::from_shared(format!("https://{}", farm.reapi()))
+        .expect("endpoint")
+        .tls_config(tls)
+        .expect("TLS")
+        .connect()
+        .await
+        .expect("connect to the frontend")
 }
 
 /// Blob `i`: 100 distinct bytes (the disk scan anchors on 64).
@@ -528,11 +186,11 @@ async fn write_and_read(cas: &Transfers) -> Vec<Vec<u8>> {
 fn drive(farm: &Farm) -> Vec<Vec<u8>> {
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
     tokio.block_on(async {
-        let channel = farm.channel().await;
+        let channel = channel(farm).await;
         let cas = Transfers::over(channel.clone(), TransferConfig::default());
         let blobs = write_and_read(&cas).await;
 
-        let action = upload_action(&cas, &farm.image, &input_bytes()).await;
+        let action = upload_action(&cas, farm.image(), &input_bytes()).await;
         let first = tokio::time::timeout(HANG, execute(channel.clone(), action.clone()))
             .await
             .expect("the action ran in time");
@@ -580,11 +238,11 @@ fn drive(farm: &Farm) -> Vec<Vec<u8>> {
 /// not exiting 0 on SIGTERM.
 #[test]
 fn the_rendered_units_start_connect_and_serve_cas() {
-    let mut farm = Farm::start("topology", 3);
-    farm.wait_ready();
+    let mut farm = start("topology", 3);
+    ready(&mut farm);
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
     tokio.block_on(async {
-        let cas = Transfers::over(farm.channel().await, TransferConfig::default());
+        let cas = Transfers::over(channel(&farm).await, TransferConfig::default());
         write_and_read(&cas).await;
     });
     farm.stop();
@@ -598,8 +256,8 @@ fn the_rendered_units_start_connect_and_serve_cas() {
 /// [`three_storage_nodes_run_an_action`] for the map with three.
 #[test]
 fn one_storage_node_runs_an_action_and_repeats_it_from_the_cache() {
-    let mut farm = Farm::start("one-node", 1);
-    farm.wait_ready();
+    let mut farm = start("one-node", 1);
+    ready(&mut farm);
     drive(&farm);
     farm.stop();
 }
@@ -617,13 +275,13 @@ fn one_storage_node_runs_an_action_and_repeats_it_from_the_cache() {
 /// committed with its blobs at the action's owner, and the repeat is a cache hit.
 #[test]
 fn three_storage_nodes_run_an_action() {
-    let mut farm = Farm::start("three-nodes", 3);
-    farm.wait_ready();
+    let mut farm = start("three-nodes", 3);
+    ready(&mut farm);
     let blobs = drive(&farm);
     // The map spreads the blobs: each of the three nodes holds some (a frontend that
     // sent everything to its one `--storage` node leaves two empty).
     let spread = farm.wait("blobs on every storage node", |f| {
-        let mut held = vec![0_usize; f.storage_nodes + 1];
+        let mut held = vec![0_usize; f.storage_nodes() + 1];
         blobs
             .iter()
             .flat_map(|b| f.holders(b))
@@ -780,16 +438,16 @@ async fn survivors(
 /// (no copy is written, so the blobs are on one node each).
 #[test]
 fn a_killed_storage_node_loses_no_blob() {
-    let mut farm = Farm::start("kill", 3);
-    farm.wait_ready();
+    let mut farm = start("kill", 3);
+    ready(&mut farm);
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
     let (channel, cas, blobs, actions) = tokio.block_on(async {
-        let channel = farm.channel().await;
+        let channel = channel(&farm).await;
         let cas = Transfers::over(channel.clone(), TransferConfig::default());
         let blobs = write_and_read(&cas).await;
         let mut actions = Vec::new();
         for input in 100..100 + ACTIONS {
-            actions.push(run_action(&channel, &cas, &farm.image, input).await);
+            actions.push(run_action(&channel, &cas, farm.image(), input).await);
         }
         (channel, cas, blobs, actions)
     });
@@ -804,18 +462,18 @@ fn a_killed_storage_node_loses_no_blob() {
             .filter(|b| farm.holders(b).contains(&n))
             .count()
     };
-    let victim = (1..=farm.storage_nodes)
+    let victim = (1..=farm.storage_nodes())
         .max_by_key(|n| held(*n))
         .expect("a node");
     assert!(held(victim) > 0, "no blob on any node");
     eprintln!("killing node {victim}, which holds {} blobs", held(victim));
-    farm.kill(victim);
+    farm.kill(Role::Node(victim));
 
     let check = |farm: &Farm, round: usize| {
         tokio.block_on(survivors(
             &channel,
             &cas,
-            &farm.image,
+            farm.image(),
             (&blobs, &actions),
             round,
         ))
@@ -832,13 +490,13 @@ fn a_killed_storage_node_loses_no_blob() {
 
     // The frontend lists the killed node's daemon as gone; the same again.
     let gone: Vec<String> = farm
-        .node_ids
+        .node_ids()
         .iter()
         .filter(|id| **id != node_id(victim))
         .cloned()
         .collect();
     farm.wait("the frontend to list the killed node as gone", |f| {
-        (connected(f.api)? == gone).then_some(())
+        (connected(f.api_port())? == gone).then_some(())
     });
     let (second, reruns) = check(&farm, 2);
     assert_eq!(reruns, 0, "an entry rewritten after the kill is gone again");
@@ -851,8 +509,7 @@ fn a_killed_storage_node_loses_no_blob() {
         );
     }
     // The killed process is already gone; the others stop cleanly.
-    for i in (0..farm.procs.len()).rev().filter(|i| *i != victim) {
-        let status = farm.procs[i].term();
-        assert!(status.success(), "{status}\n{}", farm.logs());
+    for (role, how) in farm.stop_all() {
+        assert_eq!(how, "exit 0", "{role}\n{}", farm.logs());
     }
 }

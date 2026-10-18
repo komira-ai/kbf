@@ -1,0 +1,105 @@
+# The beta smoke: a whole farm of real kbf processes (a frontend, three storage nodes, two
+# daemons, an Envoy in front of the frontend) under real Buck2 builds, for five minutes, on
+# a hosted runner (docs/design/kbf-cicd.md, sections 3 and 4; scenario B0,
+# `farm_under_build_load`, crates/kbf-harness). It fails on one failed build, one failed
+# action, one lost blob, a process that exits, or a hang, and it writes `beta-result.json`.
+#
+# It runs on the merge queue and on a push to main or feature/arch-v2, never on a pull
+# request: the stage lint (crates/kbf-it/tests/workflows/stages.rs) allows `merge_group`
+# and `push` only. It builds its own binaries and so is not an attested run: the result
+# says `"attested": false`. The full run of the design, on the attested bytes of
+# artifacts.yml with the update and kill scenarios, is later work; the job that attests
+# its result is not here either, so this workflow holds no `id-token` or `attestations`
+# permission.
+#
+# Envoy is a host prerequisite, not part of a kbf release: this job fetches the release
+# the envoy kit's tests use (ci.yml, test-x86), checked by SHA-256, and a missing Envoy
+# fails the run (KBF_BETA_REQUIRE_ENVOY), so a green smoke always went through it.
+#
+# Same hosted-runner, pinning and permission rules as ci.yml
+# (crates/kbf-it/tests/repo_lints.rs). Whether it is a required check of the merge queue
+# is a repository setting, held until the duration and memory of the whole farm on this
+# runner are measured (the artifact of each run records the duration).
+name: beta
+
+on:
+  merge_group:
+  push:
+    branches: [main, feature/arch-v2]
+
+permissions: {}
+
+# A newer push to feature/arch-v2 replaces an older one's run (only its head matters; a
+# cancelled run is "not run", never "passed": its result file stays RUNNING and no
+# artifact is uploaded). A merge queue entry's run is never cancelled, which would eject
+# the entry, and every commit on main keeps its own run.
+concurrency:
+  group: beta-${{ github.event_name }}-${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/feature/arch-v2' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      BUCK2_VERSION: 2026-10-01
+      BUCK2_SHA256: 828aba01bf80e8ba50ed27d89be86efe0246b3807c3d040e1ea7b4810a55fb78
+      ENVOY_VERSION: 1.39.3
+      ENVOY_SHA256: f61653fb5f7645129d3092a82f21ce3e6f70d0a75fe2e861b0e7417790f2c200
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # kbf (every role of the farm), kbf-beta (the scenario) and kbf-m2-act (the program
+      # the sample project's actions run, as plain processes: no container runtime here).
+      - run: cargo build -p kbf-cli -p kbf-harness -p kbf-it --bins --locked
+      - name: Fetch buck2 (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
+      - name: Fetch Envoy (the release the envoy kit's tests use, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/envoyproxy/envoy/releases/download/v$ENVOY_VERSION/envoy-$ENVOY_VERSION-linux-x86_64" --sha256 "$ENVOY_SHA256" --out "$RUNNER_TEMP/tools/envoy"
+      - run: $RUNNER_TEMP/tools/buck2 --version
+      - run: $RUNNER_TEMP/tools/envoy --version
+      - name: B0, the farm under build load
+        run: target/debug/kbf-beta b0 --bin-dir target/debug --buck2 "$RUNNER_TEMP/tools/buck2" --project crates/kbf-it/beta/buck2 --work "$RUNNER_TEMP/beta" --duration-secs 300 --concurrency 4 --summary "$GITHUB_STEP_SUMMARY"
+        env:
+          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+          KBF_BETA_REQUIRE_ENVOY: 1
+      # The process logs, the scraped series, every build's console output and event log,
+      # and the result document, kept 90 days whether the run passed or not; a re-run of
+      # the same commit keeps its own (the attempt is in the name).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: beta-b0-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/beta/logs
+            ${{ runner.temp }}/beta/beta-result.json
+          retention-days: 90
+          if-no-files-found: warn
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

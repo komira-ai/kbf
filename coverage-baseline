@@ -28,6 +28,7 @@ kbf-enroll                0      0
 kbf-estimator             -      -
 kbf-front                35      7
 kbf-guest                15      6
+kbf-harness               0      0
 kbf-history               0      0
 kbf-host                  0      0
 kbf-invocation            0      0
