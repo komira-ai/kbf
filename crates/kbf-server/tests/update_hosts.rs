@@ -18,7 +18,7 @@ use kbf_proto::update::UpdateStatus;
 use kbf_proto::update::update_status::State;
 use kbf_proto::worker::daemon_message;
 use kbf_server::members::MembershipConfig;
-use kbf_server::update::{Policy as UpdatePolicy, Release, Rows};
+use kbf_server::update::{Release, Rows};
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
@@ -385,16 +385,13 @@ async fn the_detail_names_commits_and_a_refusal_that_is_capped_data() {
     assert!(!refusal.contains('\n'));
 }
 
-/// Catches the pause rule on the route: a farm paused through the desired row reads
-/// paused when a policy row exists that has no `paused` key (the wrong answer,
-/// "running", is a safety error), reads paused with no policy row, running when resumed,
-/// and unknown (`null`) before any offer.
+/// Catches the pause rule on the route: `paused` is false without a policy row (the
+/// defaults, as `GET /v1/update`), true once the farm is paused, false again when resumed.
 ///
-/// Mutants seen red: `paused` read from the policy row alone (a present policy row
-/// without the key reads running); read from the desired row alone is caught by the unit
-/// table.
+/// Mutants seen red: no policy row read as unknown (`null`); `paused` read from a field
+/// other than the policy's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn paused_is_reported_by_the_rule_and_never_as_running_by_mistake() {
+async fn paused_follows_the_policy_row() {
     let (state, rows_store) = state_and_store();
     let running = start(farm_open(), Some(state));
     let paused = || async {
@@ -402,16 +399,13 @@ async fn paused_is_reported_by_the_rule_and_never_as_running_by_mistake() {
         assert_eq!(code, 200, "{body}");
         body["paused"].clone()
     };
-    assert_eq!(paused().await, Value::Null, "nothing offered yet");
+    assert_eq!(paused().await, json!(false), "no policy row");
     let rows = Rows::new(rows_store);
     rows.offer(&Release::new(A), FarmTime::from_millis(1))
         .expect("offer");
     assert_eq!(paused().await, json!(false));
     rows.set_paused(true).expect("pause");
-    assert_eq!(paused().await, json!(true), "no policy row");
-    rows.set_policy(&UpdatePolicy::default())
-        .expect("policy row");
-    assert_eq!(paused().await, json!(true), "a policy row without the key");
+    assert_eq!(paused().await, json!(true));
     rows.set_paused(false).expect("resume");
     assert_eq!(paused().await, json!(false));
 }

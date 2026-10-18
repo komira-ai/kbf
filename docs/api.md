@@ -859,7 +859,7 @@ request is `404` with `"off": "farm"`. It carries what the open `GET /v1/nodes` 
 commits a host runs, staged and installed, and its refusal text.
 
 ```json
-{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000, "paused": false },
+{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000 },
   "paused": false,
   "hosts": [
     { "node_id": "linux-1", "connected": true, "availability": "ok", "state": "refused",
@@ -870,9 +870,9 @@ commits a host runs, staged and installed, and its refusal text.
 ```
 
 - `desired` is the row of `GET /v1/update` (`null` before any offer, and without `--state-store`).
-  `paused` is `policy.paused` only when the policy object has that key, else `desired.paused`;
-  `null` when neither is there. It is never `false` merely because a policy row exists without
-  the key.
+  `paused` is the policy row's `paused` (the pause lives there alone), `false` without a policy
+  row (as on `GET /v1/update`), and `null` (unknown, never `false`) if the policy object has no
+  boolean `paused`.
 - Each host has `availability`, `state` and `up_to_date` as on `GET /v1/nodes`. The rest is as
   the host last reported, even if it is no longer `ok` (`null` for a host that never sent an
   `UpdateStatus`): `running_commit` (12 hex digits or `unknown`), `installed_commit` and

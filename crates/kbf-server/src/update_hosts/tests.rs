@@ -2,35 +2,23 @@ use serde_json::json;
 
 use super::*;
 
-/// Catches the pause rule read wrong: `policy.paused` used only when that key is there, so a
-/// policy row without it never reads as "running" (a wrong "running" is a safety error), and
-/// a policy that has the key wins over the desired row whatever the two say. A key that is
-/// not a boolean is unknown, never running. Mutants: read only `policy.paused`; read only
-/// `desired.paused`; prefer `desired.paused` when both are there; treat a policy object
-/// as the answer when it lacks the key.
+/// Catches the pause rule read wrong: the policy's `paused` when it is a boolean, false
+/// without a policy row (as `GET /v1/update`), and unknown, never "running", when the
+/// policy object lacks the key or holds a value that is not a boolean. Mutants: no policy
+/// row read as unknown; a policy without the key read as running; a non-boolean read as
+/// false.
 #[test]
-fn paused_is_the_policys_key_when_it_has_one_else_the_desired_rows() {
-    let desired = |paused| json!({"generation": 1, "paused": paused});
+fn paused_is_the_policys_key_and_unknown_never_reads_running() {
     let table = [
-        // (desired, policy, paused)
-        (desired(true), json!(null), Some(true)),
-        (desired(false), json!(null), Some(false)),
-        (desired(true), json!({"auto_nodes": true}), Some(true)),
-        (desired(false), json!({"auto_nodes": true}), Some(false)),
-        (desired(false), json!({"paused": true}), Some(true)),
-        (desired(true), json!({"paused": false}), Some(false)),
-        (json!(null), json!({"paused": true}), Some(true)),
-        (json!(null), json!({"auto_nodes": true}), None),
-        (json!(null), json!(null), None),
-        (desired(false), json!({"paused": null}), None),
-        (desired(false), json!({"paused": "yes"}), None),
+        (json!(null), Some(false)),
+        (json!({"paused": true}), Some(true)),
+        (json!({"paused": false}), Some(false)),
+        (json!({"auto_nodes": true}), None),
+        (json!({"paused": null}), None),
+        (json!({"paused": "yes"}), None),
     ];
-    for (desired, policy, want) in table {
-        assert_eq!(
-            effective_paused(&desired, &policy),
-            want,
-            "desired {desired}, policy {policy}"
-        );
+    for (policy, want) in table {
+        assert_eq!(effective_paused(&policy), want, "policy {policy}");
     }
 }
 
