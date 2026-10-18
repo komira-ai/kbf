@@ -206,13 +206,15 @@ impl Verified {
         for digest in digests {
             inner.put(member, *digest, now);
         }
-        while inner.recency.len() > self.capacity
-            && let Some((_, (member, digest))) = inner.recency.pop_first()
-        {
-            let _ = inner
-                .members
-                .get_mut(&member)
-                .and_then(|owned| owned.blobs.remove(&digest));
+        let excess = inner.recency.len().saturating_sub(self.capacity);
+        for _ in 0..excess {
+            let oldest = inner.recency.pop_first();
+            oldest.into_iter().for_each(|(_, (member, digest))| {
+                let _ = inner
+                    .members
+                    .get_mut(&member)
+                    .and_then(|owned| owned.blobs.remove(&digest));
+            });
         }
     }
 }
