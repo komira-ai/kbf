@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use kbf_server::ServeError;
+use kbf_server::{ServeError, StartFailure};
 use kbf_threads::Topology;
 use tokio::runtime::Runtime;
 
@@ -38,7 +38,7 @@ pub(crate) fn exit(name: &str, half: &str, served: Result<(), Failed>) -> ExitCo
     match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(failed) => {
-            eprintln!("{name}: {}", failed.said(half));
+            eprint!("{}", failed.text(name, half));
             failed.code()
         }
     }
@@ -65,17 +65,36 @@ impl Failed {
         Self::Stopped(e.to_string())
     }
 
-    /// The exit status: 2 for a start the server refused, as `kbf-server` exits; the
+    /// The exit status: for a start the server half refused, 2 as `kbf-server` exits, or
+    /// 75 when a later try can succeed ([`StartFailure`]: a restart is for that one); the
     /// daemon's own for a start it refused; 1 for a server half that stopped.
     fn code(&self) -> ExitCode {
         match self {
-            Self::Server(_) => ExitCode::from(2),
+            Self::Server(e) => StartFailure::of(e.as_ref()).code(),
             Self::Daemon(e) => kbf_node::exit_code(e),
             Self::Stopped(_) => ExitCode::FAILURE,
         }
     }
 
     /// What failed, `half` naming the half beside the daemon.
+    /// What the process says on stderr, each line after `name`: the failure as
+    /// [`Failed::said`] puts it, then [`Failed::hint`]'s line if there is one.
+    fn text(&self, name: &str, half: &str) -> String {
+        let mut text = format!("{name}: {}\n", self.said(half));
+        if let Some(line) = self.hint() {
+            text.push_str(&format!("{name}: {line}\n"));
+        }
+        text
+    }
+
+    /// What an operator must know beside the failure ([`kbf_server::start_hint`]).
+    fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Server(e) => kbf_server::start_hint(e.as_ref()),
+            Self::Daemon(_) | Self::Stopped(_) => None,
+        }
+    }
+
     fn said(&self, half: &str) -> String {
         match self {
             Self::Server(e) => format!("{half}: {e}"),
@@ -199,5 +218,46 @@ mod tests {
         let daemon = Failed::Daemon("no scratch".into());
         assert_eq!(daemon.said("storage"), "daemon: no scratch");
         assert_eq!(daemon.code(), ExitCode::FAILURE);
+    }
+
+    /// Catches a storage half's start that can succeed on a later try but exits 2, which
+    /// `RestartPreventExitStatus=2` never restarts (mutant: `Failed::code` answering 2
+    /// for every `Server`): a log directory the stopping process still holds, and a boot
+    /// the frontend's restored state store handed out again (`StaleWriter`) exit 75, and
+    /// a refusal that no restart clears (a log that is not one) still exits 2.
+    #[test]
+    fn a_start_a_later_try_can_pass_exits_75_and_a_refusal_2() {
+        let stale = kbf_meta::StaleWriter {
+            writer: kbf_meta::NodeWriter::new(std::num::NonZeroU64::MIN, std::num::NonZeroU64::MIN),
+            current: std::num::NonZeroU64::MIN,
+        };
+        let stale = Failed::server(kbf_front::CacheError::StaleWriter(stale));
+        assert_eq!(stale.code(), ExitCode::from(75));
+        let held = Failed::server(kbf_server::RaftLogError::Locked {
+            dir: "meta".into(),
+            source: std::io::Error::other("held"),
+        });
+        assert_eq!(held.code(), ExitCode::from(75));
+        let refused = Failed::server(kbf_server::RaftLogError::NotEmpty);
+        assert_eq!(refused.code(), ExitCode::from(2));
+    }
+
+    /// Catches a StaleWriter start that does not say why it keeps restarting (it would read
+    /// as an ordinary crash loop), and a hint printed for a failure it does not fit: the
+    /// stale start's stderr is its error and then the restored-state-store line, a refusal's
+    /// its error alone. Mutant: `Failed::text` without the hint line.
+    #[test]
+    fn a_stale_start_says_the_state_store_is_older_and_a_refusal_only_itself() {
+        let stale = kbf_meta::StaleWriter {
+            writer: kbf_meta::NodeWriter::new(std::num::NonZeroU64::MIN, std::num::NonZeroU64::MIN),
+            current: std::num::NonZeroU64::MIN,
+        };
+        let text = Failed::server(kbf_front::CacheError::StaleWriter(stale)).text("aio", "storage");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].starts_with("aio: storage: "), "{text}");
+        assert_eq!(lines[1], format!("aio: {}", kbf_server::STALE_WRITER_HINT));
+        let refused = Failed::server(kbf_server::RaftLogError::NotEmpty).text("aio", "storage");
+        assert_eq!(refused.lines().count(), 1, "{refused}");
     }
 }

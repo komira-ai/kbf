@@ -320,6 +320,11 @@ pub trait WriteTier: Send + Sync {
 
     /// The acknowledged bytes not yet flushed, and the oldest block's age at `now`.
     fn unflushed(&self, now: Instant) -> Unflushed;
+
+    /// How many block files the tier holds open for writing now: a block keeps its
+    /// handle from its creation until nothing will write it again (a grouped block
+    /// until sealed and every range answered, an upload's block until its commit).
+    fn open_write_files(&self) -> u64;
 }
 
 /// What a dropped or committed reservation tells its tier.
@@ -948,6 +953,11 @@ where
             flushed: state.seg_bytes,
             evicted: state.evicted,
         }
+    }
+
+    fn open_write_files(&self) -> u64 {
+        let state = self.lock();
+        state.blocks.values().filter(|b| b.file.is_some()).count() as u64
     }
 
     fn unflushed(&self, now: Instant) -> Unflushed {

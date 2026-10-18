@@ -730,6 +730,63 @@ Where it differs from the sections above, and why:
 - Tests: `kbf-front/tests/segments_tier.rs` (commit with every PUT held; flush after the
   store recovers; the budget fallback; restart before the flush).
 
+### 6.12 As built (the write pool)
+
+- **Why.** A ByteStream or storage `Write` used to be a block of its own: a file created
+  when the stream opened, held open while its bytes arrived, synced and sealed with its
+  commit. The files open for writing grew with the uploads in flight (a burst of 2,200
+  actions reached the 1,024 descriptors a node had).
+- **Shape.** `Cache::stream` and a ByteStream `Write` over 16 MiB hand their blob to the
+  write pool (`kbf-front/src/cache/pool.rs`): `--write-pool-writers` (default 8, at least 1)
+  threads started with the first blob, and a queue of `--write-pool-queue` blobs (default
+  4,096, at least 1). A writer holds at most one reservation in the tier at a time, in
+  the open grouped block that all pool blobs share (section 3's grouped block, recovered
+  at a restart as any grouped block is: cut to its committed length, so a partial
+  append is never exposed).
+- **Small blobs (at most 4 MiB, `BUFFERED_BLOB_BYTES`)** are received and hashed as before,
+  held in memory (the storage node takes room for them first), and handed to the pool
+  whole at the commit. A writer takes the blob waiting and every blob queued behind it
+  (up to 256 blobs and 16 MiB), writes them one after another in one range, syncs once,
+  commits one `PutStaged` listing them, and then answers each: **a blob is acknowledged
+  after its bytes are synced and its `PutStaged` applied, as before the pool.**
+- **Larger blobs** stream through a writer: queued when the stream opens, the range
+  reserved when a writer takes it, each chunk written as it arrives. The writer is held
+  until the commit, until the stream is dropped, or until the stream is idle for too long
+  (next bullet), so a slow sender holds a writer, never a second file. A blob larger than
+  the tier's segment limit cannot share a block: it is written to a block of its own
+  (`reserve_upload`), still by one writer.
+- **Idle streams.** Without a bound, a stalled but connected large upload would hold its
+  writer for ever, and with `--write-pool-writers` of them every small blob would wait
+  behind them. A writer waits `--write-pool-stream-idle` seconds (default 30, at least 1)
+  for the next chunk of a stream; when none comes it drops the reservation (the block of
+  its own is closed, or the range in the grouped block is answered as failed) and takes
+  the next job. The stream's next `append` or its commit then fails with
+  `CacheError::Stalled`, which is UNAVAILABLE (`StorageError::Unavailable` on a storage
+  node): the client sends the blob again, as for any retryable failure. The clock runs from
+  the moment a writer takes the stream; a stream still waiting in the queue is not timed.
+  It covers the wait for chunks, not the commit that follows the last one, which the
+  server itself makes at once. The bound limits stalls (no chunk for the interval), not
+  total time: a trickling upload that sends a chunk more often than that can still hold
+  a writer for as long as it likes.
+- **Known limit.** A streamed blob holds a blocking-pool thread of the server runtime
+  while it appends (its `append` blocks). With the default `--write-bytes-in-flight` the
+  streams in flight stay far below the pool's 512 threads; if that flag is raised until
+  more than about 512 large streams can be queued behind busy writers, the blocking pool
+  is exhausted and other blocking work waits. The idle timeout does not bound this, since
+  a queued stream is not timed.
+- **Backpressure.** A blob that finds the queue full is not queued and not refused: it
+  goes straight to the object store (section 3.2's streaming path), as does a blob the
+  tier cannot hold (budget, or a disk error before the commit). `kbf_storage_write_pool_direct_total`
+  counts both.
+- **The descriptor bound.** The pool's blobs keep at most `writers + 1` block files open
+  for writing: one per writer (a sealing block pinned by that writer's range) plus the open
+  grouped block. Not covered: `Segments` uploads (`reserve_range`) and `store_blobs`
+  segments, which have their own bounds. `kbf_storage_open_write_fds` is the tier's whole
+  count (`WriteTier::open_write_files`), as of the last pool step.
+- **Not changed.** Nothing is acknowledged before the sync (no RAM acknowledgement here),
+  and one `PutStaged` still goes through the Raft log before any blob of its batch is
+  answered.
+
 ### 6.11 Where records are verified
 
 The daemon computes the digest of every record it sends and re-hashes every blob it
