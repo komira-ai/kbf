@@ -23,7 +23,7 @@ use kbf_state::Direction;
 use prost::Message;
 
 use crate::keys::{IndexRoot, InvKey};
-use crate::reader::{ReadError, Reader, all_allow, decode_row};
+use crate::reader::{Allow, ReadError, Reader, all_allow, decode_row};
 use crate::records::{InvState, InvocationHeader};
 use crate::rows::{ShapeRow, StatusKind, StatusRow};
 
@@ -221,7 +221,7 @@ impl<O> Reader<O> {
     pub async fn list_invocations(
         &self,
         q: &ListQuery<'_>,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<InvocationPage, ReadError> {
         if !allow(q.instance) {
             return Ok(InvocationPage::default());
@@ -265,7 +265,7 @@ impl<O> Reader<O> {
     ///
     /// # Errors
     /// [`ReadError`] when the index fails.
-    pub async fn instances(&self, allow: &dyn Fn(&str) -> bool) -> Result<InstanceList, ReadError> {
+    pub async fn instances(&self, allow: Allow<'_>) -> Result<InstanceList, ReadError> {
         let prefix = self.index.root().inv_list_root();
         let mut out = InstanceList::default();
         let mut lower = Bound::Unbounded;
@@ -306,7 +306,7 @@ impl<O> Reader<O> {
         instance: &str,
         after: Option<&PageCursor>,
         limit: usize,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<ShapePage, ReadError> {
         if !allow(instance) {
             return Ok(ShapePage::default());
@@ -349,7 +349,7 @@ impl<O> Reader<O> {
         instance: &str,
         shape: u64,
         cfg: &str,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<Option<ShapeEntry>, ReadError> {
         let key = self.index.root().shape(instance, shape, cfg);
         let row = self.row::<ShapeRow>(key, instance, allow).await?;
@@ -371,7 +371,7 @@ impl<O> Reader<O> {
         instance: &str,
         shape: u64,
         cfg: &str,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<Option<StatusEntry>, ReadError> {
         let key = self.index.root().status(instance, shape, cfg);
         let row = self.row::<StatusRow>(key, instance, allow).await?;
@@ -395,7 +395,7 @@ impl<O> Reader<O> {
         kind: StatusKind,
         after: Option<&PageCursor>,
         limit: usize,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<StatusPage, ReadError> {
         let root = self.index.root();
         let owned = root.statusx_prefix(kind.name());
@@ -430,7 +430,7 @@ impl<O> Reader<O> {
         &self,
         key: String,
         instance: &str,
-        allow: &dyn Fn(&str) -> bool,
+        allow: Allow<'_>,
     ) -> Result<Option<M>, ReadError> {
         if !allow(instance) {
             return Ok(None);
