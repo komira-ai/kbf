@@ -36,10 +36,11 @@ mod tx;
 
 use std::fmt;
 use std::ops::Bound;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use postgres::NoTls;
 use postgres::config::SslMode;
 use postgres::error::SqlState;
 use postgres::types::ToSql;
@@ -50,14 +51,34 @@ use session::{Edge, Pool, RangeShape, Session};
 use tx::{Level, Row, Tx, micros};
 
 use crate::clock::{Clock, StoreTime};
-use crate::store::{Span, Store, page_of};
+use crate::store::{Announcement, LivenessGuard, Span, Store, page_of};
 use crate::{
-    Change, Changes, Commit, CommitStats, Conflict, Direction, Event, Revision, ScanPage,
+    Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Revision, ScanPage,
     ScanRange, StoreError, Txn, Version, Versioned,
 };
 
 /// The most times a batch is run again after a serialization failure.
 const MAX_ATTEMPTS: usize = 200;
+
+/// How many times [`Store::hold_liveness`] tries the lock, and the pause between tries. A
+/// [`Store::holder_alive`] probe holds the lock for one statement, so a refusal that
+/// outlasts these (about a second) is a real holder.
+const HOLD_ATTEMPTS: u32 = 40;
+const HOLD_BACKOFF: Duration = Duration::from_millis(25);
+
+/// The dedicated connection that holds a liveness lock: the lock lives as long as the
+/// session does.
+struct Holder(Mutex<postgres::Client>);
+
+impl Announcement for Holder {
+    fn is_held(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .query_one("SELECT 1", &[])
+            .is_ok()
+    }
+}
 
 /// A deliberate defect, to show the suite can fail on a Postgres store.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -365,6 +386,11 @@ impl PostgresStore {
         Ok(store)
     }
 
+    /// The text the liveness lock of `generation` is derived from.
+    fn liveness_key(&self, generation: u64) -> String {
+        format!("kbf-state/holder/{}/{generation}", self.config.schema)
+    }
+
     fn over(&self) -> Option<i64> {
         self.clock.as_ref().map(|clock| from_time(clock.now()))
     }
@@ -604,6 +630,84 @@ impl Store for PostgresStore {
         })
     }
 
+    /// The check is the first statement after the commit-head lock, in the transaction
+    /// that reaps: a take that holds the head waits it out and the check then sees the
+    /// new generation.
+    fn reap_expired_if(
+        &self,
+        key: &str,
+        cond: Cond,
+    ) -> Result<Result<usize, Conflict>, StoreError> {
+        let check = Txn::new().check(key, cond);
+        self.retrying(|| {
+            let mut tx = self.start(Level::Serializable)?;
+            let verdict = match tx.apply(&check)? {
+                Ok(_) => Ok(tx.reap()?),
+                Err(conflict) => Err(conflict),
+            };
+            let wrote = tx.dirty();
+            tx.commit()?;
+            if wrote {
+                self.syncs.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(verdict)
+        })
+    }
+
+    /// A session-level advisory lock on a connection of its own, held until the guard is
+    /// dropped or the server sees the connection die. Locks are per database, so the key
+    /// names the schema and the generation.
+    fn hold_liveness(&self, generation: u64) -> Result<LivenessGuard, StoreError> {
+        let key = self.liveness_key(generation);
+        let mut pg = self.config.pg.clone();
+        let app = format!(
+            "{}-holder",
+            self.config.pg.get_application_name().unwrap_or("kbf-state")
+        );
+        pg.application_name(&app);
+        // A silent network loss is noticed by the OS, not only by the next query.
+        pg.keepalives(true).keepalives_idle(Duration::from_secs(30));
+        let mut client = pg
+            .connect(NoTls)
+            .map_err(|err| Fail::Pg(err).into_store())?;
+        let mut got = false;
+        for attempt in 0..HOLD_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(HOLD_BACKOFF);
+            }
+            got = client
+                .query_one(
+                    "SELECT pg_try_advisory_lock(hashtextextended($1, 0))",
+                    &[&key],
+                )
+                .map_err(|err| Fail::Pg(err).into_store())?
+                .get(0);
+            if got {
+                break;
+            }
+        }
+        if !got {
+            return Err(StoreError::Failed(format!(
+                "generation {generation} already has a live holder"
+            )));
+        }
+        Ok(LivenessGuard::new(Holder(Mutex::new(client))))
+    }
+
+    /// Tries the same lock from a pooled connection for the length of one statement
+    /// (transaction level, so it cannot be left behind): got it means no session holds it.
+    fn holder_alive(&self, generation: u64) -> Result<bool, StoreError> {
+        let key = self.liveness_key(generation);
+        let free = self.read(|s| {
+            let row = s.client.query_one(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&key],
+            )?;
+            Ok(row.get::<_, bool>(0))
+        })?;
+        Ok(!free)
+    }
+
     fn commit_stats(&self) -> CommitStats {
         CommitStats {
             txns: self.txns.load(Ordering::Relaxed),
@@ -622,5 +726,35 @@ impl Store for PostgresStore {
             Ok(to_time(us))
         })
         .unwrap_or(StoreTime::ZERO)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use postgres::config::Host;
+
+    use super::{ConfigError, PostgresConfig};
+
+    // Catches a Unix-socket URI that parses to a TCP host (or not at all): the frontend
+    // reaches Postgres over a socket directory, and `host=/dir` must be that directory.
+    #[test]
+    fn a_socket_uri_parses_to_a_unix_host() {
+        let config = PostgresConfig::parse("postgres:///kbf?host=/run/postgresql")
+            .expect("a socket directory is a host");
+        assert_eq!(
+            config.pg.get_hosts(),
+            [Host::Unix("/run/postgresql".into())]
+        );
+        assert_eq!(config.pg.get_dbname(), Some("kbf"));
+    }
+
+    // Catches a URI with no host being accepted (it would connect to a default socket the
+    // operator never chose).
+    #[test]
+    fn a_uri_with_no_host_is_refused() {
+        assert_eq!(
+            PostgresConfig::parse("postgres:///kbf").unwrap_err(),
+            ConfigError::NoHost
+        );
     }
 }

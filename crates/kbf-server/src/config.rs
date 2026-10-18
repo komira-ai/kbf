@@ -52,7 +52,7 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
     /// The node's one cache, when a daemon in this process shares the hot store's disk
-    /// (`kbf-all-in-one`, `kbf_storage::local_cache`). No flag sets it.
+    /// (`kbf all-in-one`, `kbf_storage::local_cache`). No flag sets it.
     #[arg(skip)]
     pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The durable object store, where every blob ends up: `file:///absolute/path` (a
