@@ -51,9 +51,11 @@ RuntimeDirectoryPreserve=yes
 # user builds run as must not read the state store, the operator token or the keys.
 User=kbf-server
 Slice=kbf.slice
-# kbf's own state: /var/lib/kbf, created for the unit's user by systemd; kbf-installer never
-# touches it.
-StateDirectory=kbf
+# kbf's own state, created for the unit's user by systemd; kbf-installer never touches it.
+# /var/lib/kbf-server, not /var/lib/kbf: this unit runs as kbf-server, and systemd chowns a
+# StateDirectory= to the unit's user, so sharing kbf's would hand it back and forth on a
+# host that runs a kbf unit too. kbf.toml's paths name this directory.
+StateDirectory=kbf-server
 StateDirectoryMode=0750
 # A frontend answering from swap would slow every build at once.
 MemorySwapMax=0
