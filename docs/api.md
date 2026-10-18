@@ -203,15 +203,15 @@ store that cannot be read answers `503`.
 An operator takes a node out of placement, drains it, or returns it
 ([fleet-updates.md](design/fleet-updates.md) sections 3.3 and 4.2):
 
-- `:cordon`: the scheduler offers the node no new lease; its leases run on. A drain
+- `:cordon` (`POST /v1/nodes/{node}:cordon`): the scheduler offers the node no new lease; its leases run on. A drain
   already under way is kept.
-- `:drain`: cordons the node and waits for its leases to end. The body may be
+- `:drain` (`POST /v1/nodes/{node}:drain`): cordons the node and waits for its leases to end. The body may be
   `{"deadline_secs": N}`; without a body the deadline is 30 minutes. With no lease
   left the node is `drained`. If the deadline comes first the drain **pauses**: the
   leases run on, nothing is killed or given up, and the node stays `drain_paused`
   even after they end, until an operator drains it again (a new deadline) or
   uncordons it.
-- `:uncordon`: returns the node to placement and ends any drain.
+- `:uncordon` (`POST /v1/nodes/{node}:uncordon`): returns the node to placement and ends any drain.
 
 The answer is the node, as `GET /v1/nodes` lists it, after the action. `404` for a
 node that never registered or an unknown verb, `400` for a drain body of another
@@ -474,6 +474,29 @@ curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json'
 ```
 
 A UI comes later.
+
+## `/v1/object-stores/...` (**planned**)
+
+**Not built: every route here answers 404 today.** The routes register the farm's object
+store with the frontend, which keeps it as durable desired state and lets the storage nodes
+fetch it ([the design](design/object-store-registration.md)). Planned, each passing every
+gate of [Who may write](#who-may-write) on a GET too, with `Cache-Control: no-store`, and off
+(404) unless the frontend has a secrets directory:
+
+| Route | Does |
+|---|---|
+| `PUT /v1/object-stores/connections/{name}` | create or replace a connection (an endpoint and a key pair); idempotent |
+| `GET /v1/object-stores/connections` | list the connections, never a secret |
+| `GET /v1/object-stores/connections/{name}` | one connection, never a secret |
+| `DELETE /v1/object-stores/connections/{name}` | delete; `409 in_use` while bound |
+| `POST /v1/object-stores/connections/{name}:verify` | probe the store, change nothing |
+| `PUT /v1/object-stores/bindings/{role}` | bind the role `cold` to a connection, a bucket and a prefix |
+| `DELETE /v1/object-stores/bindings/{role}` | unbind; `409 in_use` once a node has applied it |
+| `GET /v1/object-stores` | the desired state, and which storage nodes have applied it |
+| `GET /v1/object-stores/audit?limit=` | the audit rows |
+
+The design page has the bodies, the error codes and the rotation runbook. Every verb of the
+API, built, open or planned, is in [the verbs table](design/operator-verbs.md).
 
 ## `GET /v1/storage`
 
@@ -831,9 +854,10 @@ copy (it passed, the log was over 16 MiB, or it had none) is `404` `no_log`; an 
 `404` `no_run`; a query string is `400`.
 
 **Across builds** (with `--history-objects`; otherwise these routes do not exist, `404` as
-any unknown path). They are read from the index rows the history writer keeps, never from
-an object, so they answer the same after a restart and cost no object read
-(`docs/design/ui-data.md` 4.3 and 6.2). They run the same policy as the build pages:
+any unknown path). The invocation list and the shape and test routes are read from the index
+rows the history writer keeps, never from an object, so they answer the same after a
+restart and cost no object read; the grid reads the run records of the chunks of the builds
+it names (`docs/design/ui-data.md` 4.3 and 6.2). They run the same policy as the build pages:
 `authenticationPolicy`, then `invocations.getAuthorizer` (`404` with `"off"` when it is not
 named). The authorizer is asked once per request about each instance the request would
 touch, and every answer holds only rows of allowed instances; an invocation is listed only
@@ -850,6 +874,23 @@ across restarts). An answer over more instances than the index reads at once (25
 | `GET /v1/tests` | the same with `kind=test` |
 | `GET /v1/shapes/{key}?instance=&cfg=` | one `(instance, cfg)` of the key, with `previous_keys: null`; with either absent, `{"shapes": [...]}` of the key's rows (paged) |
 | `GET /v1/shapes/{key}/runs?instance=&cfg=` | the last 16 runs of a test, newest first, each `{run_id, run_href, class, execution_ms, source: "run", digest16}` (`run_href` is `GET /v1/runs/{run_id}`), with `complete: false`, `covers: "recent_16"` (`"none"` for a shape that is not a test) and `needs: "day_index"`: older runs are not answered yet. Both parameters are required |
+| `GET /v1/grid?shapes=<key>,<key>&invocations=<id>,<id>` (or `last=<n>`) | the outcome of shapes in builds: `{"columns": [...], "rows": [...], "shapes": [...]}`. `shapes` is 1 to 50 keys; the builds are named by `invocations` (1 to 50 different ids) or are the newest `last` (1 to 50, of the instances the caller may read, `?instance=` narrows them). A column is `{id, href, first_seen, complete}` (`complete: false` when the build has more than 20,000 records and the read stopped); a row is one `(instance, key, cfg)` some build ran, `{instance, key, cfg, href, cells}`, with one cell for each column: `{status, run_id, run_href}` with `status` `pass`, `fail` (a failure or a timeout), `oom_killed` or `infra`, from the row's last run in that build that is a result, or `{status: "absent"}` where the build has no run of the row. A build that is not held, or that a caller may not read (any of its instances), is `404` `no_record`. `columns=commit` is `400` `needs_report`; there are no `cached_pass` cells yet |
+| `GET /v1/actions/{digest}/runs` | the runs of an action digest (`<64 hex>-<size>`) of today, newest first by end time, `?instance=`, `?class=`; each `{run_id, run_href, instance, worker, class, started, ended, shape}` |
+| `GET /v1/runs?node=&from=&to=&class=&instance=` | the runs of today that overlapped `[from, to]` on `node` (`node` is required; both times are optional), newest first by end time |
+
+The last two read the writer's index of today's runs, in memory (64 MiB, the oldest runs
+forgotten first, empty after a restart), not the day index: their answers always say
+`"partial": true` and `covers_from`, the time from which the index has every run it was
+sent. A run of an instance the caller may not read is never listed.
+
+Both list by end time, newest first; two runs that ended in the same millisecond are
+listed latest arrival first. Runs reach the index in the order the writer receives them,
+and a failed run can arrive after runs that ended later, so the order is the index's own,
+not arrival. `next_page` is a cursor, the end time and arrival number of the last run
+listed (`<ended_ms>.<seq>` in the token); the next page lists the runs that sort before it (older by that key).
+A run that arrives between two pages with an end time older than the cursor is listed on a
+later page; one with a newer end time is not listed by the pages that follow (read the
+first page again to see it). No run is listed twice or skipped by paging.
 
 A shape row is `{instance, key, cfg, kind, target, first_seen, last_seen, href, runs_href}`
 and, for a test, `status` (`passing`, `failing`, `flaky`, `oom_killed`, or `null` while the
@@ -1184,7 +1225,7 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   not a new run; a rollback is the older commit offered the same way and gets a higher
   generation. Generations increase, but may skip numbers: each write that loses a race has
   already drawn a counter value.
-- `POST /v1/update/pause` and `/resume` (the write gates, no body) set `paused` of the policy
+- `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
   row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
   needed, and an offer leaves the flag as it is: while set, no host is started.
 

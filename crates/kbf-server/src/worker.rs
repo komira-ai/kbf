@@ -42,7 +42,11 @@
 //! - an `Offer` from a daemon is not read: offers go the other way.
 //!
 //! A server given a [`MapSource`] ([`WorkerService::with_map`]) names its map in
-//! `Welcome`, and sends a `MapUpdate` each time the source's map changes.
+//! `Welcome`, and sends a `MapUpdate` each time the source's map changes. A server given
+//! [`Offers`] ([`WorkerService::with_offers`]) sends each node an `UpdateOffer` for its
+//! platform right after `Welcome` (when a complete release is desired for it) and again at
+//! each change; a node on a platform no release is built for is sent none. The platform is
+//! read from the first `Hello`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -64,6 +68,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::farm::{Farm, Outbound, Reported, StreamId};
 use crate::identity::{PeerCert, Peers, presented};
 use crate::map_push::MapFeed;
+use crate::release::offers::{OfferFeed, Offers, platform_of};
 
 /// The `kbf.worker.v1` version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -80,6 +85,7 @@ pub struct WorkerService {
     heartbeat_interval: Duration,
     hello_wait: Duration,
     map: MapFeed,
+    offers: OfferFeed,
 }
 
 impl WorkerService {
@@ -98,6 +104,7 @@ impl WorkerService {
             heartbeat_interval,
             hello_wait,
             map: MapFeed::NONE,
+            offers: OfferFeed::NONE,
         }
     }
 
@@ -106,6 +113,13 @@ impl WorkerService {
     #[must_use]
     pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
         self.map = MapFeed::new(map);
+        self
+    }
+
+    /// The service sending each node the `UpdateOffer` `offers` gives its platform.
+    #[must_use]
+    pub fn with_offers(mut self, offers: Arc<Offers>) -> Self {
+        self.offers = OfferFeed::new(offers);
         self
     }
 }
@@ -158,6 +172,7 @@ impl Worker for WorkerService {
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;
+        let platform = platform_of(&reported.caps);
         let stream = self.farm.register(
             &worker,
             instance,
@@ -169,6 +184,7 @@ impl Worker for WorkerService {
         tracing::info!(%worker, ?capacity, "worker registered");
         // After `register`, which queued the `Welcome`: the first update follows it.
         self.map.push(changes, &outbound);
+        self.offers.push(platform, &outbound);
         let session = Session {
             map: self.map.clone(),
             farm: Arc::clone(&self.farm),

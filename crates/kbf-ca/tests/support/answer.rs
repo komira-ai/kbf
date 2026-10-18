@@ -1,5 +1,5 @@
 //! The node's checks of the frontend's answer, copied from `kbf-enroll/src/answer.rs` of
-//! the node library (komira-build-farm#980, `origin/enroll/b4a-node-lib` at 974aa220) so the
+//! the node library (kbf#980, `origin/enroll/b4a-node-lib` at 974aa220) so the
 //! certificates this crate builds are held to what the real client expects. When that crate
 //! is on the base branch, replace this file by a dev-dependency on it.
 

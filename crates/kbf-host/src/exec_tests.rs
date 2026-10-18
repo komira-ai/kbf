@@ -376,7 +376,7 @@ fn a_capture_writes_the_filtered_output_or_nothing() {
 const UNREAD: usize = 1 << 20;
 
 /// Catches a step whose child exits without reading its input being reported as
-/// "Broken pipe" instead of by the child's status (komira-build-farm#488). The input
+/// "Broken pipe" instead of by the child's status (kbf#488). The input
 /// is larger than a pipe, so the write meets a closed pipe on every run, not by luck
 /// of timing: a failing tool reads as its exit, and one that exits 0 succeeds.
 #[test]

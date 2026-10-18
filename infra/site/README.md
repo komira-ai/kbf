@@ -123,6 +123,11 @@ environment `prod` that prints the token's `sub` and `job_workflow_ref` (never t
 printed `sub` differs, change `PUBLISH_WORKFLOW`, `WORKFLOW_REF` or `GITHUB_ENVIRONMENT` in `lib/config.ts`, re-run
 `npm test`, and redeploy step 3.
 
+**After a repository rename:** the `sub` embeds `<name>` twice (the subject and `job_workflow_ref`), and tokens carry the
+name current when they are minted, so a stack deployed under the old name stops trusting the workflow the day the
+repository is renamed (the ids do not change). Re-run step 3 with `--repo komira-ai/kbf` (the diff shows the two
+changed strings) before the next publish; step 4's check of the variables uses the same `--repo`.
+
 ## Permissions
 
 Nothing beyond this: no managed policies, no IAM, no CDK bootstrap roles.

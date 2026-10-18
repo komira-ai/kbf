@@ -670,10 +670,10 @@ fn mac(name: &str) -> (ScratchHost, Layout) {
     (exec, layout)
 }
 
-/// A release for a Mac: `kbf-daemon` holding `binary`.
+/// A release for a Mac: `kbf` holding `binary`.
 fn mac_source(name: &str, binary: &str) -> PathBuf {
     let dir = scratch(&format!("deploy-release-src-{name}"));
-    fs::write(dir.join("kbf-daemon"), binary).expect("binary");
+    fs::write(dir.join("kbf"), binary).expect("binary");
     dir
 }
 
@@ -713,12 +713,16 @@ fn a_release_of_two_binaries_is_installed_whole_and_reported() {
     );
 }
 
-/// Catches a source with only `kbf-daemon` being refused (a Mac release has no `kbf`), and
-/// a source with neither being refused naming `kbf` as before.
+/// Catches a source with only `kbf` (all a Mac release has) or only `kbf-daemon` being
+/// refused, and a source with neither being refused naming `kbf` as before.
 #[test]
-fn a_source_needs_one_binary_and_a_daemon_alone_will_do() {
-    let only = mac_source("daemon-only", "daemon A");
+fn a_source_needs_one_binary_and_either_will_do() {
+    let only = mac_source("kbf-only", "kbf A");
     let s = Source::read(&only).expect("reads");
+    assert_eq!(s.binaries, [("kbf", b"kbf A".to_vec())]);
+    let daemon = scratch("deploy-release-src-daemon-only");
+    fs::write(daemon.join("kbf-daemon"), "daemon A").expect("daemon");
+    let s = Source::read(&daemon).expect("reads");
     assert_eq!(s.binaries, [("kbf-daemon", b"daemon A".to_vec())]);
     let none = scratch("deploy-release-src-none");
     let err = Source::read(&none).expect_err("nothing");
@@ -754,7 +758,7 @@ fn a_mac_install_uses_the_mac_layout_and_makes_its_missing_parents() {
         "{out}"
     );
     assert!(
-        out.contains("restart the units that run /usr/local/kbf/current/kbf-daemon (launchctl kickstart -k system/<label>)"),
+        out.contains("restart the units that run /usr/local/kbf/current/kbf (launchctl kickstart -k system/<label>)"),
         "{out}"
     );
     assert!(exec.at("/var/db/kbf-deploy/state.json").is_file());
@@ -768,7 +772,7 @@ fn a_mac_install_uses_the_mac_layout_and_makes_its_missing_parents() {
     assert_eq!(state_of(&layout).current, Some(c(B)));
     assert!(
         !exec
-            .at(&format!("/usr/local/kbf/releases/{A}/kbf"))
+            .at(&format!("/usr/local/kbf/releases/{A}/kbf-daemon"))
             .exists()
     );
 

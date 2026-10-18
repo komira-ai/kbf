@@ -47,7 +47,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::WebPkiClientVerifier;
 use x509_parser::extensions::GeneralName;
 
-use super::check::Failure;
+use super::shared::Failure;
 
 /// How a certificate names its role: `urn:kbf:role:<name>` in its subjectAltName.
 pub const ROLE_URI_PREFIX: &str = "urn:kbf:role:";

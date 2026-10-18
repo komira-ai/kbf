@@ -82,7 +82,7 @@ impl Limits {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Staged {
     pub commit: CommitId,
-    /// The binaries installed: `kbf`, `kbf-daemon` or both.
+    /// The binaries installed: `kbf` (all a Mac has), `kbf-daemon` or both.
     pub components: Vec<&'static str>,
     /// The branch the attestation named.
     pub source_ref: SourceRef,
@@ -289,7 +289,9 @@ impl Env<'_> {
     fn read_offer(&self, entry: &Entry) -> Result<Offer, Refusal> {
         let mut file = entry.open_file(OFFER_FILE, self.limits.offer)?;
         let bytes = inbox::read_capped(&mut file, self.limits.offer, OFFER_FILE)?;
-        Offer::parse(&bytes).map_err(Refusal::Offer)
+        let offer = Offer::parse(&bytes).map_err(Refusal::Offer)?;
+        offer.fits(self.host.platform()).map_err(Refusal::Offer)?;
+        Ok(offer)
     }
 
     /// Every file the offer names with the most of it a stage takes: the tarballs, then
