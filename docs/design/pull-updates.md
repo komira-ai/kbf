@@ -1,6 +1,6 @@
 # Pull-based updates: hosts update themselves over the session they already hold
 
-Status: design; the wire contract (section 5) is frozen. Built or in review: `kbf-installer` (merged), `kbf-update` (the node client, #908) and `kbf-helper` (the root helper, #929). The rest is built in the units of section 11.
+Status: design; the wire contract (section 5) is frozen. Built or in review: `kbf-installer` (merged), `kbf-update` (the node client, #908) and the root helper (#929, now the `helper` module and the `run` and `boot-check` verbs of the `kbf-installer` binary). The rest is built in the units of section 11.
 Adapted from the pull-update design study; labels: **[F]** read in code at the time of writing,
 **[D]** a design decision, **[V]** verify before building on it.
 
@@ -120,7 +120,7 @@ Residuals, stated plainly:
 | Wire messages | `crates/kbf-proto/proto/kbf/update/v1/update.proto` | messages and one service; frozen (section 5) |
 | Platform names | `kbf_types::ReleasePlatform` | `linux-x86_64`, `linux-arm64`, `darwin-arm64`; from a node's `os` and `arch` report entries |
 | Release store, desired release, offers, `ReleaseService` | `kbf-server` | section 6 |
-| Update client | `kbf-update` (the node's side), `kbf-helper` (root), `kbf-installer` (layout, verbs) | fetch, inbox, status, refuse an order while a lease is live |
+| Update client | `kbf-update` (the node's side), `kbf-installer run` (root), `kbf-installer` (layout, verbs) | fetch, inbox, status, refuse an order while a lease is live |
 | Helper (verify offline, install, flip, revert) | a root unit on each host, one shared installer library | verbs in section 7 |
 | Rollout controller | `kbf-server`, replaces the older record in `rollout.rs` | section 8 |
 | Release discovery | the frontend polls GitHub, read-only | proposes a desired release; never applies |
@@ -165,7 +165,7 @@ order at a huge epoch, is taken and wedges the helper until root clears `helper.
 acts on is measured from nothing and is taken at any epoch. A compromised service user can still write a first order
 with a huge epoch: an availability limit, the same exposure as ordering an activation early (section 7.3 of the
 design study). `window_s` is the confirm window of `ACTIVATE`, **per platform as built**: on Linux the helper ignores it, and the window starts at the new
-process's first start (`kbf-helper boot-check --window-secs`, default 900, range 120 to 1800); on macOS there is no start hook, so the window is
+process's first start (`kbf-installer boot-check --window-secs`, default 900, range 120 to 1800); on macOS there is no start hook, so the window is
 armed at activation and `window_s` is clamped to 120 to 1800. Either way a compromised frontend cannot set a year.
 
 **UpdateStatus.** Sent after `Welcome` and on every change. `running_commit` is the process's own build commit
@@ -183,7 +183,7 @@ the offers and orders, never sends a status, and is listed `unsupported`.
 ### Contracts owned by the node client
 
 The inbox directory the unprivileged `kbf` writes and the root helper reads, and the world-readable `status.json`
-the helper writes, are specified by the update-client and helper units (`kbf-update`, `kbf-helper`) and frozen with them. This document
+the helper writes, are specified by the update-client and helper units (`kbf-update`, `kbf-installer`) and frozen with them. This document
 does not restate them so that there is one source. In short: an entry directory per offer (`<generation>-<commit>/` with `offer.json`, the
 tarballs and the attestation bundle) and, in `orders/`, one file per order.
 
@@ -248,8 +248,8 @@ command or a unit):
 
 | Command | Does |
 |---|---|
-| `kbf-helper run` | each pass: finish a restart it owes; revert a swap whose confirm window ran out; **stage the newest inbox entry itself** (through `kbf-installer`: SHA-256 and attestation verified offline, the tarball holds one file `<name>`, `--version --json` of it names the offered commit, run as the service user with an empty environment; install into `releases/<commit>/`, do not activate); act on orders from `inbox/orders/<id>.json` (`{order_id, epoch, verb, commit, window_s}`) in id order, once each (`activate`: write `pending_confirm` first, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart); write `status.json` |
-| `kbf-helper boot-check` | `ExecStartPre` on Linux: count the starts of a release on trial and revert one that keeps failing before it starts again; start the confirm window at the first start |
+| `kbf-installer run` | each pass: finish a restart it owes; revert a swap whose confirm window ran out; **stage the newest inbox entry itself** (through `kbf-installer`: SHA-256 and attestation verified offline, the tarball holds one file `<name>`, `--version --json` of it names the offered commit, run as the service user with an empty environment; install into `releases/<commit>/`, do not activate); act on orders from `inbox/orders/<id>.json` (`{order_id, epoch, verb, commit, window_s}`) in id order, once each (`activate`: write `pending_confirm` first, flip `previous` then `current`, restart the one configured service; `confirm`: keep it; `revert`: flip back and restart); write `status.json` |
+| `kbf-installer boot-check` | `ExecStartPre` on Linux: count the starts of a release on trial and revert one that keeps failing before it starts again; start the confirm window at the first start |
 
 Orders carry the verbs `activate`, `confirm` and `revert`; they are not helper subcommands. **The helper must not run on the frontend host until the
 frontend-host `activate` of split-mode-updates.md (unit U5) exists**: as built it restarts the one configured service, which for the frontend is the

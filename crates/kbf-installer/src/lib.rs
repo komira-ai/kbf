@@ -18,6 +18,9 @@
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
+//! The root helper of the pull-based updates is [`helper`], run by the `kbf-installer`
+//! binary (`run`, `boot-check`).
+//!
 //! The offline check ([`stage::stage_from_inbox`] runs them in the order that matters,
 //! documented there):
 //!
@@ -43,6 +46,7 @@ pub mod binary;
 pub mod darwin;
 #[cfg(test)]
 mod fixtures;
+pub mod helper;
 pub mod inbox;
 pub mod layout;
 pub mod offer;

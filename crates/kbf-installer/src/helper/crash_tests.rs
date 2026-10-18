@@ -8,16 +8,16 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::activate;
+use crate::layout::Layout;
+use crate::state::{Locked, State};
+use crate::testkit::{A, B, c};
 use kbf_host::exec::Exec;
 use kbf_host::testkit::{ScratchHost, reply};
 use kbf_host::{Cmd, HostPath, Root, Step};
-use kbf_installer::activate;
-use kbf_installer::layout::Layout;
-use kbf_installer::state::{Locked, State};
-use kbf_installer::testkit::{A, B, c};
 
-use crate::cycle::{Config, Helper};
-use crate::restart::Restart;
+use crate::helper::cycle::{Config, Helper};
+use crate::helper::restart::Restart;
 
 const UNIT: &str = "kbf.service";
 const T0: u64 = 1_800_000_000;
@@ -143,9 +143,7 @@ impl World {
             .unwrap_or_default()
     }
     fn state(&self) -> State {
-        kbf_installer::state::read_unlocked(&self.layout)
-            .unwrap()
-            .unwrap()
+        crate::state::read_unlocked(&self.layout).unwrap().unwrap()
     }
     fn orders_left(&self) -> usize {
         fs::read_dir(self.root.join("var/lib/kbf-updater/inbox/orders"))
@@ -156,11 +154,10 @@ impl World {
 
 fn pass(w: &World, now: u64) {
     let mut h = w.helper();
-    let mut never = |_: &mut Crashy,
-                     _: &Path|
-     -> Result<kbf_installer::stage::Staged, kbf_installer::refusal::Refusal> {
-        panic!("no offer")
-    };
+    let mut never =
+        |_: &mut Crashy, _: &Path| -> Result<crate::stage::Staged, crate::refusal::Refusal> {
+            panic!("no offer")
+        };
     h.recover().unwrap();
     h.cycle(now, &mut never).unwrap();
 }
@@ -170,12 +167,10 @@ fn crash_pass(w: &World, now: u64, at: usize) -> bool {
     w.crash_at.set(at);
     let r = catch_unwind(AssertUnwindSafe(|| {
         let mut h = w.helper();
-        let mut never = |_: &mut Crashy,
-                         _: &Path|
-         -> Result<
-            kbf_installer::stage::Staged,
-            kbf_installer::refusal::Refusal,
-        > { panic!("no offer") };
+        let mut never =
+            |_: &mut Crashy, _: &Path| -> Result<crate::stage::Staged, crate::refusal::Refusal> {
+                panic!("no offer")
+            };
         h.cycle(now, &mut never).unwrap();
     }));
     w.crash_at.set(0);

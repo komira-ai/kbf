@@ -10,20 +10,20 @@
 use std::io::Write;
 use std::path::Path;
 
+use crate::CommitId;
+use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
+use crate::inbox::{Entry, read_capped};
+use crate::layout::{self, Layout, Platform};
+use crate::refusal::Refusal;
+use crate::release::ReleaseError;
+use crate::stage::Staged;
+use crate::state::{self, State, StateError};
 use kbf_host::{Exec, HostPath, Perms, Step};
-use kbf_installer::CommitId;
-use kbf_installer::activate::{self, Activated, Arm, Confirmed, Expiry};
-use kbf_installer::inbox::{Entry, read_capped};
-use kbf_installer::layout::{self, Layout, Platform};
-use kbf_installer::refusal::Refusal;
-use kbf_installer::release::ReleaseError;
-use kbf_installer::stage::Staged;
-use kbf_installer::state::{self, State, StateError};
 
-use crate::memory::{Event, Memory, StagedFacts};
-use crate::order::{self, Order, Verb};
-use crate::restart::Restart;
-use crate::status;
+use crate::helper::memory::{Event, Memory, StagedFacts};
+use crate::helper::order::{self, Order, Verb};
+use crate::helper::restart::Restart;
+use crate::helper::status;
 
 /// How the helper is set up on a host, by its own flags.
 #[derive(Clone, Debug)]
