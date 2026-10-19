@@ -10,7 +10,7 @@
 //! Assumption (not in FP): after `quiesce` reports `Quiesced` the proxy sends SIGTERM;
 //! FP says only "the old process exits". Kept in [`Swap::stop_old`].
 
-use super::model::{Halt, Mode, Phase, Request, RoleState, Step};
+use super::model::{Halt, Mode, Phase, Request, Retired, RoleState, Slot, Step};
 use super::swap::{Flow, Swap, go, go_end};
 
 impl Swap<'_> {
@@ -75,6 +75,7 @@ impl Swap<'_> {
     /// and wait for it to go. `abort` is refused from here.
     pub(super) fn stop_old(&mut self) -> Result<Flow, Halt> {
         self.set_phase(Phase::Switching)?;
+        let old_slot = self.intent.old_slot;
         let ident = self.old_ident()?;
         let poll = self.plan.timing.poll;
         let mut terminated = false;
@@ -95,7 +96,35 @@ impl Swap<'_> {
             }
             self.sleep(poll)?;
         }
+        // The process is gone: no slot is active, and the slot closes once the streams that
+        // were bound to it have drained (its sockets are gone, so they do). Only then may
+        // the next process, or the old release again, open a slot (a new generation).
+        self.ports.gate.clear_active();
+        self.wait_closed(old_slot)?;
         Ok(Flow::Go)
+    }
+
+    /// Poll the gate's retire of `slot` until it is closed. A slot that is still busy at the
+    /// hold bound is noted once as stuck; there is no timeout, like every wait on a process
+    /// that served, and the streams held meanwhile keep expiring on their own.
+    fn wait_closed(&mut self, slot: Slot) -> Result<(), Halt> {
+        let (poll, bound) = (self.plan.timing.poll, self.plan.timing.hold_max);
+        let started = self.now();
+        let mut noted = false;
+        loop {
+            self.expire_held();
+            let answer = self.ports.gate.retire(slot);
+            if answer.is_closed() || answer == Retired::NeverOpened {
+                return Ok(());
+            }
+            if !noted && self.now().saturating_sub(started) >= bound {
+                self.note(format!(
+                    "the stopped process's slot {slot:?} still has streams bound after the hold bound: {answer:?}"
+                ));
+                noted = true;
+            }
+            self.sleep(poll)?;
+        }
     }
 
     /// Migrate, start the new process, wait for ready and release the held streams into it.

@@ -71,6 +71,8 @@ mod fakes;
 #[cfg(test)]
 mod fault_tests;
 #[cfg(test)]
+mod gate_tests;
+#[cfg(test)]
 mod reconcile_tests;
 #[cfg(test)]
 mod record_tests;

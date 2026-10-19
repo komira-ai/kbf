@@ -122,6 +122,10 @@ pub struct State {
     pub fed: Vec<(Slot, usize)>,
     pub expired: usize,
     pub active: Slot,
+    /// `clear_active` ran and no release has set a slot since.
+    pub cleared: bool,
+    /// Slots the gate closed (`retire` answered `Closed`) and no release opened again.
+    pub retired: Vec<Slot>,
     pub requests: Vec<(Duration, Request)>,
     pub events: Vec<(Duration, String)>,
     pub limit: Duration,
@@ -183,6 +187,8 @@ impl World {
                 fed: Vec::new(),
                 expired: 0,
                 active: Slot::A,
+                cleared: false,
+                retired: Vec::new(),
                 requests: Vec::new(),
                 events: Vec::new(),
                 limit: START + secs(48 * 3600),
@@ -690,6 +696,8 @@ impl Gate for World {
             st.held.clear();
             st.hold_on = false;
             st.active = slot;
+            st.cleared = false;
+            st.retired.retain(|r| *r != slot);
             st.fed.push((slot, n));
             n
         };
@@ -720,6 +728,29 @@ impl Gate for World {
     fn open_streams(&self, slot: Slot) -> u64 {
         let now = self.now.get();
         self.st.borrow().permits.get(&slot).map_or(0, |u| u.at(now))
+    }
+
+    fn clear_active(&self) {
+        self.log_event("clear_active");
+        self.st.borrow_mut().cleared = true;
+    }
+
+    fn retire(&self, slot: Slot) -> Retired {
+        let open = self.open_streams(slot);
+        let mut st = self.st.borrow_mut();
+        let answer = if st.retired.contains(&slot) {
+            Retired::AlreadyClosed
+        } else if slot == st.active && !st.cleared {
+            Retired::Current
+        } else if open > 0 {
+            Retired::Busy(open)
+        } else {
+            st.retired.push(slot);
+            Retired::Closed
+        };
+        drop(st);
+        self.log_event(format!("gate:retire {slot:?} {answer:?}"));
+        answer
     }
 }
 
