@@ -4,11 +4,15 @@
 //! The proxy is the one public port of a frontend host. This verb loads the `[proxy]` table of
 //! `installer.toml`, takes the one listening socket a service manager activated for it,
 //! binds the runtime to it and serves until SIGTERM or SIGINT. It runs as the unprivileged
-//! service user: it needs no root, writes nothing on the host and never calls a child's admin
-//! endpoint or acts on a child; it only polls the active child's `/readyz`. It does not
-//! supervise either: the supervisor that adopts the children and ends the proxy's startup
-//! hold is the update work that follows, and until it exists the proxy answers `UNAVAILABLE`
-//! once the hold is over and `/readyz` says 503.
+//! service user and needs no root. On Linux it also starts the supervisor's first duty
+//! ([`crate::proxy::supervisor`]): it adopts the frontend children a previous proxy left
+//! running, by pid, start time and executable, and ends the startup hold into the one that
+//! serves. It never calls a child's admin endpoint: resuming an update that was in flight,
+//! choosing between two live children and starting a first child need the child's admin port
+//! and the root half's orders, which are not built yet; in those cases the startup hold stays
+//! in force, the proxy answers `UNAVAILABLE` once its bound is over and `/readyz` says 503,
+//! and the reason is on the standard error. A child outlives the proxy: a stop of the proxy
+//! signals the proxy alone (`KillMode=process` in `kbf-proxy.service`).
 //!
 //! This module and the root helper (`helper/`, `run.rs`) share a binary and nothing else:
 //! `kbf-it`'s layering test fails if the root half ever names `kbf_proxy` or this module.
@@ -180,6 +184,7 @@ impl Stop {
 /// Serves on `listener` until a stop signal. The signal handlers are registered before the
 /// proxy serves, so none is lost to the default action.
 fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
+    let (state_dir, proxy_auth_file) = (config.state_dir.clone(), config.proxy_auth_file.clone());
     let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
     let runtime = handle.runtime();
     let (term, int) = runtime.block_on(async {
@@ -202,8 +207,38 @@ fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
         });
     }
     // A closed standard error (a journal that went away) must not stop the proxy from serving.
+    #[cfg(target_os = "linux")]
+    let _supervised = supervise(&handle, &state_dir, &proxy_auth_file);
     let _ = writeln!(std::io::stderr(), "kbf-installer: proxy serving");
     Ok(runner.run(NoUpdates)?)
+}
+
+/// Adopts the children a previous proxy left and reports what it did on the standard error.
+/// The gate it returns must live as long as the proxy: it keeps the hold guard of an
+/// adoption that could not finish.
+#[cfg(target_os = "linux")]
+fn supervise(
+    handle: &kbf_proxy::ProxyHandle,
+    state_dir: &Path,
+    proxy_auth_file: &Path,
+) -> crate::proxy::gate_real::ProxyGate {
+    use crate::layout::Layout;
+    use crate::proxy::child_real::ProcChild;
+    use crate::proxy::supervisor::{Startup, adopt_children, children_dir, frontend_argv};
+
+    let gate = crate::proxy::gate_real::ProxyGate::new(handle.clone());
+    let layout = Layout::linux(kbf_host::Root::host());
+    let child = ProcChild::new(
+        layout,
+        children_dir(state_dir),
+        frontend_argv(proxy_auth_file),
+    );
+    let line = match adopt_children(&gate, &child, state_dir) {
+        Startup::Adopted { active } => format!("adopted the frontend child in slot {active:?}"),
+        Startup::Held(why) => format!("no frontend child adopted, new streams stay held: {why}"),
+    };
+    let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {line}");
+    gate
 }
 
 /// The verb. With `--check`, the table is loaded and nothing is bound.

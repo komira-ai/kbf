@@ -64,6 +64,8 @@ pub mod record;
 mod recover;
 mod retire;
 pub mod runtime;
+#[cfg(target_os = "linux")]
+pub mod supervisor;
 mod swap;
 
 #[cfg(test)]

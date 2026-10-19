@@ -509,6 +509,7 @@ fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
 const MAY_NAME_THE_PROXY: &[&str] = &[
     "proxy/gate_real.rs",
     "proxy/gate_real_tests.rs",
+    "proxy/supervisor_tests.rs",
     "proxy_verb.rs",
     "installer_toml.rs",
 ];

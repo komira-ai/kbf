@@ -384,3 +384,59 @@ async fn a_closed_standard_error_does_not_stop_the_verb_serving() {
     let (status, took) = exited(&mut child, Duration::from_secs(10));
     assert_eq!(status.and_then(|s| s.code()), Some(0), "after {took:?}");
 }
+
+/// Catches a verb that does not adopt the frontend a previous proxy left, or that takes its
+/// children down when it stops: a process recorded under the proxy's state directory, still
+/// the recorded process, is adopted at start (the startup hold ends into its slot, and the
+/// verb says so), and it is still running after the proxy has drained and exited on SIGTERM.
+#[tokio::test(flavor = "current_thread")]
+async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
+    use kbf_installer::proxy::child_real::{Recorded, ident_of};
+
+    let state = kbf_host::testkit::scratch("proxy-bin-adopt-state");
+    let children = state.join("children");
+    fs::create_dir_all(&children).expect("children dir");
+    let mut frontend = Command::new("sleep");
+    frontend.arg("600").stdin(Stdio::null());
+    let frontend = reaped::spawn(&mut frontend, 3).expect("a stand-in frontend");
+    let ident = ident_of(frontend.id()).expect("identity");
+    let record = Recorded {
+        ident,
+        commit: kbf_installer::CommitId::new(&"a".repeat(40)).expect("a commit"),
+    };
+    fs::write(
+        children.join("a.json"),
+        serde_json::to_vec(&record).expect("json"),
+    )
+    .expect("record");
+
+    let table = TABLE.replacen(
+        "[proxy]\n",
+        &format!("[proxy]\nstate_dir = \"{}\"\n", state.display()),
+        1,
+    );
+    let path = config("adopt", &table);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let mut proxy = start(&path, &listener);
+    drop(listener);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+
+    // SAFETY: `kill` of our own child.
+    assert_eq!(unsafe { libc::kill(proxy.id().cast_signed(), libc::SIGTERM) }, 0);
+    let (status, _) = exited(&mut proxy, Duration::from_secs(20));
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "a clean stop");
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut proxy.stderr.take().expect("stderr"), &mut err)
+        .expect("stderr text");
+    assert!(
+        err.contains("adopted the frontend child in slot A"),
+        "the recorded child was not adopted: {err}"
+    );
+    // SAFETY: signal 0 only checks that the process exists; the child is ours.
+    let alive = unsafe { libc::kill(frontend.id().cast_signed(), 0) };
+    assert_eq!(alive, 0, "the frontend went down with the proxy");
+}
