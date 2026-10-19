@@ -365,7 +365,9 @@ async fn a_forged_node_id_is_refused() {
 /// Mutant seen red: `Behind::deny_list` dropped when the listener has no TLS.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_denied_node_is_refused_behind_the_proxy() {
-    let list = DenyList::open(&file(b"node mac-07\n", 0o600)).expect("a deny list");
+    // Bound: the list is read again at every call, so its file outlives the server.
+    let list_file = file(b"node mac-07\n", 0o600);
+    let list = DenyList::open(&list_file).expect("a deny list");
     let server = start_denying(true, Some(list));
     let denied = session_as(server.worker, "mac-07", &forwarded("mac-07", "daemon")).await;
     let refused = denied.expect_err("denied");
