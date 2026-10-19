@@ -183,7 +183,7 @@ async fn the_action_is_unprivileged_and_has_a_hosts_file_and_a_loopback_resolver
         cell.stdout(&result),
         "1000\n1000\nclosed-refused\n\
          [hosts]\n127.0.0.1 localhost\n::1 localhost\n\
-         [resolv.conf]\nnameserver 127.0.0.1\n"
+         [resolv.conf]\nnameserver 127.0.0.1\noptions timeout:1 attempts:1\n"
     );
     cell.assert_clean(1);
 }

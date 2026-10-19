@@ -45,7 +45,7 @@ pub struct ContainerLimits {
     /// limit.
     pub nofile: u64,
     /// `RLIMIT_NPROC`, soft and hard. The kernel counts it per user, and every
-    /// container's root is the same subordinate id, so it bounds the processes of all the
+    /// container's action runs as the same subordinate id (uid 1000 of the range), so it bounds the processes of all the
     /// node's actions together, not one container's.
     pub nproc: u64,
 }

@@ -459,7 +459,10 @@ async fn the_bundle_has_hosts_hostname_and_resolv_conf_others_can_read() {
     for (name, content) in [
         ("hosts", "127.0.0.1 localhost\n::1 localhost\n"),
         ("hostname", "localhost\n"),
-        ("resolv.conf", "nameserver 127.0.0.1\n"),
+        (
+            "resolv.conf",
+            "nameserver 127.0.0.1\noptions timeout:1 attempts:1\n",
+        ),
     ] {
         let path = spec.dir.join("etc").join(name);
         assert_eq!(

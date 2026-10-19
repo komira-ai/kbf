@@ -24,9 +24,11 @@ const HOSTS: &str = "127.0.0.1 localhost\n::1 localhost\n";
 /// loopback only has, 127.0.0.1, which nothing listens on. A name that is not in `hosts`
 /// then fails at once with a refused query, which glibc reports as `EAI_AGAIN` (a
 /// transient failure, as a node without a reachable resolver gives), never as `EAI_NONAME`
-/// (no such host) and never as a wait for a timeout. The image's own file, if it ships
-/// one, is covered.
-pub(crate) const RESOLV_CONF: &str = "nameserver 127.0.0.1\n";
+/// (no such host) and never as a wait for a timeout. glibc fails at once on the refused
+/// query; musl sends on an unconnected socket and would wait out its default 5 s twice per
+/// lookup, which `timeout:1 attempts:1` bounds. The image's own file, if it ships one, is
+/// covered.
+pub(crate) const RESOLV_CONF: &str = "nameserver 127.0.0.1\noptions timeout:1 attempts:1\n";
 
 /// Writes `bytes` to `path`, readable by others.
 async fn write_open(path: &Path, bytes: &[u8]) -> Result<(), JobError> {
