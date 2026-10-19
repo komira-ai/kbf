@@ -247,6 +247,91 @@ pub(crate) fn confirm_in(
     Ok(Confirmed::Kept)
 }
 
+/// Whether `commit` may be staged for the frontend: not the installed release, and no other
+/// release staged and undecided (one frontend update at a time). Staging the staged
+/// release again is allowed (a repeat).
+pub(crate) fn check_stageable(state: &State, commit: &CommitId) -> Result<(), ReleaseError> {
+    if state.current.as_ref() == Some(commit) {
+        return Err(ReleaseError::AlreadyInstalled(commit.clone()));
+    }
+    match &state.staged {
+        Some(other) if other != commit => Err(ReleaseError::FrontendBusy(other.clone())),
+        _ => Ok(()),
+    }
+}
+
+/// Record the fetched release `commit` as the staged one, moving no link (the frontend
+/// update's first order). The checks of [`check_stageable`] are made again under the lock,
+/// and the release must be on the host. A repeat changes nothing.
+pub fn stage_frontend<E: Exec>(
+    exec: &E,
+    host: &Layout,
+    commit: &CommitId,
+) -> Result<(), ReleaseError> {
+    let (lock, state) = open(host)?;
+    check_stageable(&state, commit)?;
+    if !has_binary(exec, host, commit) {
+        return Err(ReleaseError::NotInstalled(commit.clone()));
+    }
+    lock.write(&State {
+        staged: Some(commit.clone()),
+        ..state
+    })?;
+    Ok(())
+}
+
+/// The frontend's confirm: with `commit` the staged release and no node swap on trial,
+/// `previous` takes the release that ran and `current` takes `commit`, state first and then
+/// the links (`previous` first), and nothing is staged. A repeat (`commit` is already
+/// current) makes the links match the state and changes nothing else.
+pub fn confirm_frontend<E: Exec>(
+    exec: &mut E,
+    host: &Layout,
+    commit: &CommitId,
+    out: &mut dyn Write,
+) -> Result<Confirmed, ReleaseError> {
+    let (lock, state) = open(host)?;
+    if let Some(p) = &state.pending_confirm {
+        return Err(ReleaseError::Pending(p.commit.clone()));
+    }
+    if state.staged.as_ref() != Some(commit) {
+        if state.current.as_ref() != Some(commit) {
+            return Err(ReleaseError::NotStaged {
+                commit: commit.clone(),
+                staged: state.staged,
+            });
+        }
+        converge(exec, host, &state, out)?;
+        return Ok(Confirmed::AlreadyKept);
+    }
+    if !has_binary(exec, host, commit) {
+        return Err(ReleaseError::NotInstalled(commit.clone()));
+    }
+    let next = State {
+        previous: state.current.clone(),
+        current: Some(commit.clone()),
+        staged: None,
+        ..state
+    };
+    lock.write(&next)?;
+    converge(exec, host, &next, out)?;
+    Ok(Confirmed::Kept)
+}
+
+/// The frontend's revert: drop `commit` from `staged` if it is the staged release. Neither
+/// link nor `current` is touched. Whether it was dropped; a repeat finds nothing to drop.
+pub fn revert_frontend(host: &Layout, commit: &CommitId) -> Result<bool, ReleaseError> {
+    let (lock, state) = open(host)?;
+    if state.staged.as_ref() != Some(commit) {
+        return Ok(false);
+    }
+    lock.write(&State {
+        staged: None,
+        ..state
+    })?;
+    Ok(true)
+}
+
 /// Put `current` back on the release that ran before the pending swap (with none
 /// pending: on `previous`, which is then dropped), as [`Reverted`] says.
 pub fn revert<E: Exec>(

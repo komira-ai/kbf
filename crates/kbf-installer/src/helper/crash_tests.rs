@@ -73,6 +73,8 @@ struct World {
     counter: Rc<Cell<usize>>,
     crash_at: Rc<Cell<usize>>,
     fetcher: FakeFetcher,
+    /// Whether the helper is set up as a frontend host's.
+    frontend: Cell<bool>,
 }
 
 impl World {
@@ -110,6 +112,7 @@ impl World {
             layout,
             counter: Rc::new(Cell::new(0)),
             crash_at: Rc::new(Cell::new(0)),
+            frontend: Cell::new(false),
         }
     }
     fn helper(&self) -> Helper<Crashy> {
@@ -120,6 +123,7 @@ impl World {
             window_secs: 600,
             starts: 3,
             min_activation_interval_secs: 0,
+            frontend_host: self.frontend.get(),
         };
         Helper::new(
             self.layout.clone(),
@@ -141,6 +145,7 @@ impl World {
         let verb = match verb {
             "activate" => Verb::Activate,
             "confirm" => Verb::Confirm,
+            "frontend_update" => Verb::FrontendUpdate,
             _ => Verb::Revert,
         };
         let activate = verb == Verb::Activate;
@@ -226,8 +231,24 @@ fn steps_in_clean_pass(scn: &str) -> usize {
 
 fn prep(scn: &str, tag: &str) -> World {
     let w = World::new(&format!("{scn}-{tag}"));
+    w.frontend.set(scn.starts_with("frontend"));
     pass(&w, T0 - 100);
     match scn {
+        // The proxy's three orders; the host starts with B staged except for the update,
+        // which fetches it (B is not on the host then).
+        "frontend_update" => {
+            fs::remove_dir_all(w.root.join("var/lib/kbf-installer/releases").join(B)).unwrap();
+            Locked::acquire(&w.layout)
+                .unwrap()
+                .write(&State {
+                    current: Some(c(A)),
+                    ..State::default()
+                })
+                .unwrap();
+            w.order(5, "frontend_update", B);
+        }
+        "frontend_confirm" => w.order(5, "confirm", B),
+        "frontend_revert" => w.order(5, "revert", B),
         "activate" => {
             w.order(5, "activate", B);
         }
@@ -295,7 +316,31 @@ fn kill_at_every_step_of(scn: &str) {
                 why.push(format!("link {link} != state {cur}"));
             }
             let activating = scn.starts_with("activate");
-            let moved = (activating && cur == B) || (!activating && cur == A);
+            let frontend = scn.starts_with("frontend");
+            let moved = !frontend && ((activating && cur == B) || (!activating && cur == A));
+            if frontend {
+                // No unit is restarted for the proxy's orders; the state and the status end
+                // where the order puts them, and `current` is B only after a confirm.
+                let (want_cur, want_staged) = match scn {
+                    "frontend_update" => (A, Some(c(B))),
+                    "frontend_confirm" => (B, None),
+                    _ => (A, None),
+                };
+                if restarts != 0 {
+                    why.push(format!("{restarts} restarts"));
+                }
+                if cur != want_cur || st.staged != want_staged {
+                    why.push(format!("current {cur}, staged {:?}", st.staged));
+                }
+                let status = fs::read(w.root.join("var/lib/kbf-installer/status.json")).unwrap();
+                let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+                if status["installed_commit"] != cur.as_str() {
+                    why.push(format!(
+                        "status says installed {}",
+                        status["installed_commit"]
+                    ));
+                }
+            }
             if moved && restarts == 0 {
                 why.push("links moved, service never restarted".to_owned());
             }
@@ -349,6 +394,30 @@ fn kill_at_every_step_of_a_revert() {
 #[test]
 fn kill_at_every_step_of_a_revert_in_a_new_epoch() {
     kill_at_every_step_of("revert_in_a_new_epoch");
+}
+
+/// Catches a pass of a frontend host that dies around the proxy's orders leaving the host
+/// wrong: killed at every step of a `frontend_update` that fetches, a `confirm` that flips
+/// `previous` and `current`, and a `revert` that drops the staging, then started again (the
+/// start-up repair, then passes), the links agree with the state, the state is where the order
+/// puts it, `status.json` names the same installed release, no unit was restarted (not by the
+/// repair either), and the order file is gone.
+///
+/// Mutants planted: the repair owing a restart on a frontend host; the status not rewritten
+/// after a restart; the links moved before the state (the repair then restores the old ones).
+#[test]
+fn kill_at_every_step_of_a_frontend_update() {
+    kill_at_every_step_of("frontend_update");
+}
+
+#[test]
+fn kill_at_every_step_of_a_frontend_confirm() {
+    kill_at_every_step_of("frontend_confirm");
+}
+
+#[test]
+fn kill_at_every_step_of_a_frontend_revert() {
+    kill_at_every_step_of("frontend_revert");
 }
 
 #[test]

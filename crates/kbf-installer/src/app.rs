@@ -198,6 +198,7 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
         window_secs: args.window_secs,
         starts: args.starts,
         min_activation_interval_secs: args.min_activation_interval_secs,
+        frontend_host: args.frontend_host,
     };
     // The release fetcher and the lease source are wired by later changes; until then an
     // activation of a release that is not installed, and every activation, is refused.
