@@ -445,7 +445,7 @@ fn a_slot_held_by_an_adopted_child_refuses_a_spawn_until_that_child_exits() {
 fn a_started_child_that_cannot_be_identified_is_killed_and_the_spawn_fails() {
     let rig = rig("child-real-noident");
     rig.set(&["sleep", "31338"]);
-    let port = rig.restarted().with_identify(|_| Err("no pidfd".into()));
+    let port = rig.restarted().with_identify(|_, _| Err("no pidfd".into()));
     let e = refused(
         &port,
         port.spawn(Slot::A, &c(A), Start::Active),
@@ -557,12 +557,24 @@ fn the_real_reads_refuse_a_missing_pid_and_a_thread_id() {
 fn identify_started_and_pidfd_of_refuse_what_is_not_a_live_process() {
     assert_eq!(pidfd_of(0).err(), Some(Errno::INVAL));
     assert_eq!(pidfd_of(u32::MAX).err(), Some(Errno::INVAL));
-    assert!(identify_started(u32::MAX - 1).is_err(), "no such process");
+    assert!(
+        identify_started(u32::MAX - 1, Path::new("/bin/true")).is_err(),
+        "no such process"
+    );
 
     let mut zombie = std::process::Command::new("true")
         .spawn()
         .expect("a short-lived process");
     let pid = zombie.id();
+    await_zombie(pid);
+    let e = identify_started(pid, Path::new("/nonexistent/program"))
+        .expect_err("a zombie whose program cannot be named has no identity");
+    assert!(!e.is_empty(), "the reason is kept");
+    zombie.wait().expect("reaped");
+}
+
+/// Waits until `pid` is a zombie: exited and not yet reaped by its parent.
+fn await_zombie(pid: u32) {
     wait_for("the process to exit", || {
         fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
             s.rsplit(')')
@@ -570,7 +582,51 @@ fn identify_started_and_pidfd_of_refuse_what_is_not_a_live_process() {
                 .is_some_and(|r| r.trim_start().starts_with('Z'))
         })
     });
-    let e = identify_started(pid).expect_err("a zombie has no identity");
-    assert!(!e.is_empty(), "the reason is kept");
+}
+
+/// Catches a child that exits before its identity is read being a spawn failure (its `exe`
+/// link is gone once it is a zombie, which is what made `spawn` fail with ENOENT when a
+/// loaded machine ran the child to its end first): the identity is the start time and the
+/// program it was started from, and it is the same one a live read gives.
+#[test]
+fn a_zombie_is_identified_by_its_start_time_and_the_program_it_was_started_from() {
+    let program = Path::new("/bin/true").canonicalize().expect("true");
+    let mut live = std::process::Command::new("sleep")
+        .arg("31339")
+        .spawn()
+        .expect("a live process");
+    let (_fd, before) = identify_started(live.id(), &program).expect("live");
+    let _ = live.kill();
+    live.wait().expect("reaped");
+    drop(before);
+
+    let mut zombie = std::process::Command::new(&program)
+        .spawn()
+        .expect("a short-lived process");
+    let pid = zombie.id();
+    await_zombie(pid);
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
+    let (_fd, ident) = identify_started(pid, &program).expect("a zombie is identified");
+    assert_eq!(ident.pid, pid);
+    assert_eq!(ident.start_time, start_time_of(&stat).expect("start time"));
+    assert_eq!(ident.exe, program);
     zombie.wait().expect("reaped");
+}
+
+/// Catches `spawn` refusing a child that has already exited when it looks: the spawn
+/// succeeds and `exited` reports the status. The identify hook waits for the zombie, so the
+/// race that CI lost at random is the only order that runs here.
+#[test]
+fn a_child_that_exits_before_it_is_identified_still_spawns_and_reports_its_status() {
+    let rig = rig("child-real-zombie");
+    rig.set(&["exit", "3"]);
+    let port = rig.child.with_identify(|pid, program| {
+        await_zombie(pid);
+        identify_started(pid, program)
+    });
+    let ident = port
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn of a child that exits at once");
+    assert_eq!(port.exited(&ident), Some(3));
+    assert_eq!(port.recorded(Slot::A), None, "the exit clears the record");
 }

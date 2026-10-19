@@ -108,7 +108,7 @@ fn check_is_exit_0_for_a_valid_table_and_2_for_every_refusal() {
         (
             "check-other-key",
             &format!("min_generation = \"x\"\n{TABLE}"),
-            "min_generation",
+            "line 1: invalid type: string (the text is not shown)",
         ),
         (
             "check-typo",

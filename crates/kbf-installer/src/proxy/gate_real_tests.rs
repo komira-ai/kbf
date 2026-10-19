@@ -25,7 +25,10 @@ pub(super) fn proxy_table(name: &str, extra: &str) -> String {
         KeyPair, KeyUsagePurpose, SanType,
     };
     use std::os::unix::fs::PermissionsExt as _;
-    let dir = kbf_host::testkit::scratch(&format!("proxy-gate-{name}"));
+    // The process id is in the name: `cargo nextest` runs each test in its own process, so
+    // the per-process counter of `proxy()` is 0 in every one and two tests that ran at the
+    // same time wiped each other's certificates (the scratch call removes its directory).
+    let dir = kbf_host::testkit::scratch(&format!("proxy-gate-{}-{name}", std::process::id()));
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca.key_usages = vec![
@@ -322,4 +325,18 @@ fn the_all_in_one_stop_closes_the_old_slot_and_a_failed_start_reopens_it_as_a_ne
         "the old release serves a new generation: the dead process's pool is not reused"
     );
     assert_eq!(gate.handle.slots().generation(G::B), 0, "B never opened");
+}
+
+/// Catches two test processes sharing one scratch directory: the directory a table's files
+/// live in is named for the process, so a test in another process that asks for the same
+/// name cannot delete them (the `a_hold_the_proxy_refuses...` test failed with ENOENT from
+/// `Proxy::bind` under `nextest` for this reason).
+#[test]
+fn the_table_files_live_in_a_directory_named_for_this_process() {
+    let table = proxy_table("scratch-name", "");
+    let pid = std::process::id();
+    assert!(
+        table.contains(&format!("proxy-gate-{pid}-scratch-name/")),
+        "{table}"
+    );
 }
