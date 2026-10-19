@@ -53,6 +53,12 @@ impl std::ops::Deref for Scratch {
     }
 }
 
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// A scratch path beside the unit test binary, removed with its parent on drop.
 pub fn scratch(name: &str) -> Scratch {
     Scratch::of(crate::test_dir::scratch_dir(&format!(
