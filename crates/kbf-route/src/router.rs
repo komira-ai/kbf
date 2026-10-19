@@ -103,6 +103,12 @@ impl Router {
         self
     }
 
+    /// SCAFFOLD (red commit): no repair.
+    #[must_use]
+    pub fn with_background_repair(self, _limit: RepairLimit) -> Self {
+        self
+    }
+
     /// Who holds `digest` in the map as it is now.
     ///
     /// # Errors

@@ -37,6 +37,17 @@ impl Router {
             .collect())
     }
 
+    /// SCAFFOLD (red commit): the primary only, as [`Router::find_missing`].
+    ///
+    /// # Errors
+    /// As [`Router::find_missing`].
+    pub async fn find_missing_anywhere(
+        &self,
+        digests: &[Digest],
+    ) -> Result<Vec<Digest>, StorageError> {
+        self.find_missing(digests).await
+    }
+
     /// The digests missing, as the map `view` places them.
     async fn find_in(
         &self,
