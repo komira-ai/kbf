@@ -117,7 +117,7 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"admin_protocol":1,"commit":"0123456789ab","min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
+{"admin_protocol":1,"commit":"0123456789ab","meta_log":4,"min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
 ```
 
 - `admin_protocol`: the version of the admin calls of `kbf --mode frontend` (`GET role`,
@@ -126,6 +126,10 @@ sorted by name.
   changes meaning raises it.
 - `commit`: the first 12 hex digits of the commit built (`unknown` for a build with no
   git checkout); compare it with the first 12 of the commit in the asset's name.
+- `meta_log`: the highest metadata-log machine version the binary runs
+  (`kbf_server::raft_log::RUNS`). Going from release N to N-1 is reversible only if
+  `meta_log(N) <= meta_log(N-1)`; a build that prints no `meta_log` is unknown, and
+  unknown is not reversible.
 - `profile`: `release` for every asset here (the workflow refuses a `debug` one).
 - `protocol` and `min_protocol`: the newest and the oldest `kbf.worker.v1` version the
   binary speaks. The daemon half speaks exactly `protocol`; the server half accepts
