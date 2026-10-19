@@ -83,6 +83,8 @@ pub struct State {
     pub open_counts_err: bool,
     pub desired_err: bool,
     pub resume_fails: Vec<Slot>,
+    /// `role` on these slots errors although the process lives (it does not answer).
+    pub role_fails: Vec<Slot>,
     /// How long a process takes to exit after SIGTERM.
     pub term_takes: Duration,
     pub confirm_err: bool,
@@ -94,6 +96,10 @@ pub struct State {
     /// One of the three readiness checks (0 readyz, 1 health, 2 capabilities) stays false.
     pub ready_gap: Option<u8>,
     pub staged: Option<CommitId>,
+    /// The root's `current` (`installed_commit` in `status.json`); a landed confirm sets it.
+    pub installed: Option<CommitId>,
+    /// `status.json` cannot be read for `installed_commit`.
+    pub installed_err: bool,
     /// `status.json` cannot be read.
     pub staged_err: bool,
     /// How long a resumed child takes to report `Active`.
@@ -150,6 +156,7 @@ impl World {
                 open_counts_err: false,
                 desired_err: false,
                 resume_fails: Vec::new(),
+                role_fails: Vec::new(),
                 term_takes: Duration::ZERO,
                 confirm_err: false,
                 confirm_fails: 0,
@@ -157,6 +164,8 @@ impl World {
                 holds: 0,
                 ready_gap: None,
                 staged: Some(c(B)),
+                installed: Some(c(A)),
+                installed_err: false,
                 staged_err: false,
                 resume_lag: Duration::ZERO,
                 terminate_err: false,
@@ -371,6 +380,14 @@ impl World {
         self.crash_at.set(None);
     }
 
+    /// A restart that keeps the crash hook the test just armed, so the next record can
+    /// kill the new proxy too.
+    pub fn proxy_restart_keep_crash_hook(&self) {
+        let hook = self.crash_on_record.borrow_mut().take();
+        self.proxy_restart();
+        *self.crash_on_record.borrow_mut() = hook;
+    }
+
     pub fn last_intent(&self) -> Intent {
         self.records
             .borrow()
@@ -506,6 +523,9 @@ impl Child for World {
 impl ChildAdmin for World {
     fn role(&self, slot: Slot) -> Result<RoleInfo, PortError> {
         self.log_event(format!("admin:role {slot:?}"));
+        if self.st.borrow().role_fails.contains(&slot) {
+            return Err(PortError("role: no answer".into()));
+        }
         let takes = self.st.borrow().quiesce_takes;
         self.with_slot(slot, |p, now| {
             if p.state == RoleState::Quiescing && p.quiesce_at.is_some_and(|t| now >= t + takes) {
@@ -755,6 +775,13 @@ impl RootOrders for World {
         }))
     }
 
+    fn installed(&self) -> Result<Option<CommitId>, PortError> {
+        if self.st.borrow().installed_err {
+            return Err(PortError("status.json unreadable".into()));
+        }
+        Ok(self.st.borrow().installed.clone())
+    }
+
     fn confirm(&self, commit: &CommitId) -> Result<(), PortError> {
         self.log_event(format!("order confirm {}", &commit.as_str()[..4]));
         let mut st = self.st.borrow_mut();
@@ -762,6 +789,7 @@ impl RootOrders for World {
             st.confirm_fails = st.confirm_fails.saturating_sub(1);
             return Err(PortError("confirm refused".into()));
         }
+        st.installed = Some(commit.clone());
         Ok(())
     }
 

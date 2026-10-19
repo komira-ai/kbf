@@ -54,7 +54,7 @@ impl Swap<'_> {
             && matches!(self.ports.admin.open_counts(slot), Ok(c) if c.idle())
     }
 
-    fn mark_gone(&mut self, slot: Slot) {
+    pub(super) fn mark_gone(&mut self, slot: Slot) {
         if slot == self.intent.old_slot {
             self.old_alive = false;
         } else {
@@ -94,7 +94,9 @@ impl Swap<'_> {
     pub(super) fn rollback_swap(&mut self) -> Result<Flow, Halt> {
         let t = self.plan.timing;
         let (old, new) = (self.intent.old_slot, self.intent.new_slot);
-        if let Err(e) = self.ports.admin.stand_down(new) {
+        if self.new_alive
+            && let Err(e) = self.ports.admin.stand_down(new)
+        {
             self.note(format!("stand-down of the new child failed: {e}"));
         }
         self.ports
@@ -133,7 +135,10 @@ impl Swap<'_> {
         let new = self.intent.new_slot;
         let serving =
             matches!(self.role_of(new), Some(r) if r.state == RoleState::Active && r.holder);
-        if !serving && let Err(e) = self.ports.admin.resume(new) {
+        if self.new_alive
+            && !serving
+            && let Err(e) = self.ports.admin.resume(new)
+        {
             self.note(format!("resume of the new child failed: {e}"));
         }
         self.release_held(new)?;

@@ -87,6 +87,8 @@ use super::{
 use crate::action_usage::Subject;
 use crate::state_store::StateStore;
 
+use self::inflight::Submitted;
+
 /// How often a daemon session's row in the store is renewed while the daemon heartbeats:
 /// a third of the lease grace, so the row outlives two missed renewals. One write per
 /// session per interval, whatever the number of leases it holds.
@@ -257,6 +259,7 @@ impl StoredOperation {
 
 mod fate;
 mod floor;
+mod inflight;
 mod subject;
 
 /// The lease an effect starts, if it is a `Start`.
@@ -390,6 +393,22 @@ fn parse_operation(key: &str, prefix: &str) -> Result<OperationId, StateError> {
     Ok(OperationId(id))
 }
 
+/// The grant a `lease/` row holds.
+fn lease_row(key: &str, row: &Versioned) -> Result<LeaseGrant, StateError> {
+    match decode(key, &row.value)? {
+        FarmInput::Committed(ControlRecord::Lease(grant)) => Ok(grant),
+        _ => Err(corrupt(key, "not a lease grant")),
+    }
+}
+
+/// The request an `op/` row holds.
+fn request_row(key: &str, row: &Versioned) -> Result<Request, StateError> {
+    match decode(key, &row.value)? {
+        FarmInput::Submit(request) => Ok(request),
+        _ => Err(corrupt(key, "not a request")),
+    }
+}
+
 fn number(key: &str, row: &Versioned) -> Result<u64, StateError> {
     let bytes = <[u8; 8]>::try_from(row.value.as_slice())
         .map_err(|_| corrupt(key, "not an 8-byte number"))?;
@@ -441,10 +460,7 @@ impl Durable {
     pub(super) fn load(&self) -> Result<Stored, StateError> {
         let mut leases = std::collections::BTreeMap::new();
         for (key, row) in self.store.scan_prefix("lease/")? {
-            let FarmInput::Committed(ControlRecord::Lease(grant)) = decode(&key, &row.value)?
-            else {
-                return Err(corrupt(&key, "not a lease grant"));
-            };
+            let grant = lease_row(&key, &row)?;
             leases.insert(grant.operation, grant);
         }
         let mut losses = std::collections::BTreeMap::new();
@@ -480,9 +496,7 @@ impl Durable {
         }
         let mut operations = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
-            let FarmInput::Submit(request) = decode(&key, &row.value)? else {
-                return Err(corrupt(&key, "not a request"));
-            };
+            let request = request_row(&key, &row)?;
             let operation = parse_operation(&key, "op/")?;
             let lease = leases.remove(&operation);
             operations.push(StoredOperation {
@@ -537,9 +551,7 @@ impl Durable {
     ) -> Result<Vec<OperationId>, StateError> {
         let mut found = Vec::new();
         for (key, row) in self.store.scan_prefix("op/")? {
-            let FarmInput::Submit(request) = decode(&key, &row.value)? else {
-                return Err(corrupt(&key, "not a request"));
-            };
+            let request = request_row(&key, &row)?;
             let named = instance.is_none_or(|instance| request.key.instance == instance);
             if named && request.key.action == *action {
                 found.push(parse_operation(&key, "op/")?);
@@ -578,18 +590,38 @@ impl Durable {
         request: &Request,
         subject: &Subject,
     ) -> Result<(), StateError> {
+        self.commit(self.submission(operation, request, subject)?)
+    }
+
+    /// [`Durable::submitted`], with the action's in-flight row in the same transaction:
+    /// `pin` is its key and what the row must be (absent, or the leftover version).
+    fn submitted_pinned(
+        &self,
+        operation: OperationId,
+        request: &Request,
+        subject: &Subject,
+        (pin, cond): (&str, Cond),
+    ) -> Result<(), StateError> {
+        let txn = self.submission(operation, request, subject)?;
+        self.commit(txn.put(pin, operation.0.to_be_bytes(), cond))
+    }
+
+    fn submission(
+        &self,
+        operation: OperationId,
+        request: &Request,
+        subject: &Subject,
+    ) -> Result<Txn, StateError> {
         let value = encode(FarmInput::Submit(request.clone()))?;
-        self.commit(
-            Txn::new()
-                .put(op_key(operation), value, Cond::Absent)
-                .put(
-                    subject_key(operation),
-                    subject::encode(subject),
-                    Cond::Absent,
-                )
-                .put(queue_key(operation), Vec::new(), Cond::Absent)
-                .put(NEXT_OP, (operation.0 + 1).to_be_bytes(), Cond::Any),
-        )
+        Ok(Txn::new()
+            .put(op_key(operation), value, Cond::Absent)
+            .put(
+                subject_key(operation),
+                subject::encode(subject),
+                Cond::Absent,
+            )
+            .put(queue_key(operation), Vec::new(), Cond::Absent)
+            .put(NEXT_OP, (operation.0 + 1).to_be_bytes(), Cond::Any))
     }
 
     /// A grant committed: the operation leaves the queue and holds `grant`'s lease. The
@@ -696,13 +728,15 @@ impl Durable {
                 }
             }
         }
+        let txn = self.unpin(txn, operation)?;
         self.commit(ending.settle(txn, operation))
     }
 
     /// A refusal committed: the operation is finished without a lease, and its `done/`
     /// row goes in the same transaction as its rows are removed.
     fn refused(&self, operation: OperationId, ending: &Ending) -> Result<(), StateError> {
-        self.commit(ending.settle(Txn::new(), operation))
+        let txn = self.unpin(Txn::new(), operation)?;
+        self.commit(ending.settle(txn, operation))
     }
 
     /// Writes what the scheduler's effects of a committed record settle, in order.
@@ -964,6 +998,16 @@ impl State {
         }
     }
 
+    /// Whether the finish of `operation` (its answer or refusal) is held back, unwritten.
+    /// Bounded by what is held, which is capped.
+    fn finish_held(&self, operation: OperationId) -> bool {
+        self.unwritten.iter().flatten().any(|effect| match effect {
+            Effect::Answer(answer) => answer.operation == operation,
+            Effect::Refuse(refusal) => refusal.operation == operation,
+            Effect::Start(_) | Effect::Commit(_) | Effect::Waiting(_) => false,
+        })
+    }
+
     /// Forgets the details parked for the answers among `dropped` effects, which will
     /// never be written. The details of answers the store has taken stay: they are
     /// settled after this feed's writes, whatever a later record does.
@@ -1098,6 +1142,39 @@ impl State {
         }
     }
 
+    /// `op`, an operation the state store holds, as the scheduler takes it up: held for
+    /// a caller of its own that no client waits on, which the next request for the
+    /// action joins.
+    fn take_stored(&mut self, mut op: StoredOperation, now: SystemTime) -> Recovered {
+        let key = op.request.key.clone();
+        let waiter = self.machine.submit(Waiter {
+            key: key.clone(),
+            kind: op.request.kind,
+            do_not_cache: op.request.do_not_cache,
+            queued: now,
+            // A row from a writer that did not record the subject (an older build)
+            // leaves the `action usage:` line naming the empty shape.
+            usage: op
+                .subject
+                .take()
+                .unwrap_or_else(|| Subject::of(Described::default()).0),
+        });
+        self.stages.insert(waiter, watch::channel(Stage::Queued).0);
+        if let Some(grant) = &op.lease {
+            let stamp = Stamp {
+                queued: now,
+                started: now,
+            };
+            let sent = Sent {
+                operation: op.operation,
+                action: key.action,
+                stamp,
+            };
+            self.machine.start(grant.lease, sent);
+        }
+        op.recovered(waiter)
+    }
+
     /// [`Farm::with_state`] on the farm's state: opens `state`, reads what it holds and
     /// takes it up. Returns the store's epoch, or `None` if there is no store. Not
     /// generic, unlike `Farm::with_state`, so every test binary's runs count toward the
@@ -1114,34 +1191,8 @@ impl State {
         self.machine = FarmMachine::new(durable.generation()?.unwrap_or(epoch));
         let now = SystemTime::now();
         let mut recovered = Vec::new();
-        for mut op in stored.operations {
-            let key = op.request.key.clone();
-            let waiter = self.machine.submit(Waiter {
-                key: key.clone(),
-                kind: op.request.kind,
-                do_not_cache: op.request.do_not_cache,
-                queued: now,
-                // A row from a writer that did not record the subject (an older build)
-                // leaves the `action usage:` line naming the empty shape.
-                usage: op
-                    .subject
-                    .take()
-                    .unwrap_or_else(|| Subject::of(Described::default()).0),
-            });
-            self.stages.insert(waiter, watch::channel(Stage::Queued).0);
-            if let Some(grant) = &op.lease {
-                let stamp = Stamp {
-                    queued: now,
-                    started: now,
-                };
-                let sent = Sent {
-                    operation: op.operation,
-                    action: key.action,
-                    stamp,
-                };
-                self.machine.start(grant.lease, sent);
-            }
-            recovered.push(op.recovered(waiter));
+        for op in stored.operations {
+            recovered.push(self.take_stored(op, now));
         }
         let next_operation = OperationId(stored.next_operation);
         self.sched.restore_floors(stored.floors);
@@ -1159,10 +1210,17 @@ impl State {
     /// # Errors
     /// UNAVAILABLE if the store did not take it: the request is not queued, and the
     /// client, who is told nothing is queued, asks again.
-    pub(super) fn queue(&self, request: &Request, subject: &Subject) -> Result<(), Status> {
+    pub(super) fn queue(&mut self, request: &Request, subject: &Subject) -> Result<(), Status> {
+        if self.sched.twin(request).is_some() {
+            return Ok(());
+        }
         let id = self.sched.next_operation();
-        let joins = self.sched.twin(request).is_some();
-        if !joins && !self.durably("a submission", |d| d.submitted(id, request, subject)) {
+        let mut submitted = None;
+        let taken = self.durably("a submission", |d| {
+            submitted = Some(d.submit(id, request, subject)?);
+            Ok(())
+        });
+        if !taken {
             if self
                 .durable
                 .as_ref()
@@ -1175,6 +1233,32 @@ impl State {
             return Err(Status::unavailable(
                 "the scheduler's state store did not take the request",
             ));
+        }
+        match submitted {
+            Some(Submitted::Queued(used)) => self.sched.skip_to(used),
+            Some(Submitted::Joined(op)) => {
+                // The store names an operation the scheduler holds and has no twin
+                // for: it finished it, and the finish (which removes the rows) is
+                // held back. The request cannot join a finished operation, and
+                // taking the rows up again would run the action twice. It asks again:
+                // once the finish is written, the rows are gone and it queues afresh
+                // (or the cache answers it).
+                //
+                // The scheduler retires a finished operation after its retention
+                // whether or not the finish was written, so the held finish itself is
+                // asked too: while it waits, the operation's rows are not free.
+                if self.sched.state(op.operation).is_some() || self.finish_held(op.operation) {
+                    return Err(Status::unavailable(
+                        "the action's previous run is finishing; the request is not queued",
+                    ));
+                }
+                let recovered = self.take_stored(*op, SystemTime::now());
+                // The operation is neither in the scheduler nor finished (checked
+                // above), so `take_in` has nothing to refuse.
+                let taken = self.sched.take_in(recovered);
+                debug_assert!(taken, "the stored operation was already in the scheduler");
+            }
+            None => {}
         }
         Ok(())
     }
@@ -1196,5 +1280,7 @@ impl State {
     }
 }
 
+#[cfg(test)]
+mod submit_tests;
 #[cfg(test)]
 mod tests;

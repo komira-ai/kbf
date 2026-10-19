@@ -9,17 +9,28 @@
 //!
 //! The controller blocks on the store, so each look is a blocking task. Its errors are logged
 //! once while they last.
+//!
+//! **Two ways the controller stops ordering.** While the farm is handed over (fenced, as a
+//! quiesce or a stand-down does: [`Handed::handed`]) no look is made: such a farm is the
+//! successor's, and a store handle that is not yet superseded would still let the
+//! controller move host rows and cordon hosts. [`SessionTransport`](super::SessionTransport)
+//! refuses the orders of a look that was already under way when the farm was fenced. And the
+//! task ends when a look finds its store handle superseded
+//! ([`StoreError::Fenced`](kbf_state::StoreError::Fenced)): no later look could write. Neither
+//! replaces the store's generation fence, which stays what refuses a superseded controller's
+//! writes; these close the time between a farm being fenced and its handle being superseded.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_state::Store;
+use kbf_front::Handed;
+use kbf_state::{Store, StoreError};
 use tokio::task::AbortHandle;
 
 use kbf_types::FarmTime;
 
 use super::session::ports;
-use super::{Controller, ControllerError, Rows, Tick};
+use super::{Controller, ControllerError, RowError, Rows, Tick};
 use crate::farm::Farm;
 
 /// Starts the controller over `store` on the current runtime; the returned handle stops it.
@@ -46,15 +57,47 @@ async fn run(farm: Arc<Farm>, store: Arc<dyn Store>, every: Duration) {
     let mut ticker = tokio::time::interval(every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut failing: Option<String> = None;
+    let mut waiting = false;
     loop {
         ticker.tick().await;
+        if skip_handed(farm.handed(), &mut waiting) {
+            continue;
+        }
         let Some((next, tick)) = step(controller, rows.clone(), farm.wall_now()).await else {
             tracing::error!("the update controller stopped: a look panicked");
             return;
         };
         controller = next;
+        if superseded(&tick) {
+            tracing::warn!("the update controller stopped: a newer writer holds the state store");
+            return;
+        }
         log(&tick, &mut failing);
     }
+}
+
+/// Whether this tick makes no look because the farm is handed over. `waiting` remembers the
+/// spell: the wait is said at its first tick and not at every one, and a tick of a farm that
+/// is not handed over ends the spell, so the next one is said again.
+fn skip_handed(handed: bool, waiting: &mut bool) -> bool {
+    if !handed {
+        *waiting = false;
+        return false;
+    }
+    if !std::mem::replace(waiting, true) {
+        tracing::info!("the update controller makes no look: this farm is handed over");
+    }
+    true
+}
+
+/// Whether a look found the controller's store handle superseded: a write (or the writer
+/// check before an order) was refused because a newer writer holds the state store. Any
+/// other store error is the store's trouble, and the look is made again.
+fn superseded(tick: &Result<Tick, ControllerError>) -> bool {
+    matches!(
+        tick,
+        Err(ControllerError::Rows(RowError::Store(StoreError::Fenced)))
+    )
 }
 
 /// One look on a blocking task; `None` if it panicked (the controller is lost with it).
@@ -142,6 +185,40 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// Catches a controller that ends for a store error that passes: only the refusal of a
+    /// superseded handle ends it, while any other store failure (the database down for a
+    /// moment) is logged and the next look tries again. Mutant seen red: any store error
+    /// taken for a superseded handle.
+    #[test]
+    fn only_a_superseded_store_handle_ends_the_controller() {
+        let store = |e: StoreError| Err(ControllerError::Rows(RowError::Store(e)));
+        assert!(superseded(&store(StoreError::Fenced)));
+        assert!(!superseded(&store(StoreError::Failed("down".to_owned()))));
+        assert!(!superseded(&Err(ControllerError::Invariant(
+            "x".to_owned()
+        ))));
+        assert!(!superseded(&Ok(Tick::default())));
+    }
+
+    /// Catches a spell of waiting that is never told apart from the next (a farm that is
+    /// handed over again after it was resumed would be silent: `waiting` stays set), and a
+    /// tick of a farm that is not handed over that is skipped. Whether the wait is said once
+    /// is seen in `a_handed_over_farm_makes_no_look` (tests/update_quiesced.rs). Mutant seen
+    /// red: the spell never ended (`waiting` left set by a tick of a farm that is not handed
+    /// over).
+    #[test]
+    fn a_wait_on_a_handed_over_farm_is_one_spell_until_the_farm_is_not_handed_over() {
+        let mut waiting = false;
+        assert!(!skip_handed(false, &mut waiting));
+        assert!(!waiting);
+        for _ in 0..3 {
+            assert!(skip_handed(true, &mut waiting));
+            assert!(waiting);
+        }
+        assert!(!skip_handed(false, &mut waiting));
+        assert!(!waiting, "the spell did not end");
     }
 
     /// Catches an error logged at every look while it lasts (the same text is kept once),

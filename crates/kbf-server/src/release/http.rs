@@ -13,12 +13,11 @@
 //!   Serve the router with `into_make_service_with_connect_info`, as the API's.
 
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, put};
@@ -28,6 +27,7 @@ use serde_json::json;
 use super::key::{Key, Part};
 use super::store::{CommitListing, PutError, ReleaseStore, Stored};
 use crate::api::{error, json, operator_gate};
+use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 
 /// The list route.
@@ -66,11 +66,11 @@ fn disk_failed(what: &str, e: &io::Error) -> Response {
 async fn put_file(
     State(releases): State<Arc<Releases>>,
     Path((commit, platform, name)): Path<(String, String, String)>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if let Err((code, why)) = operator_gate(releases.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = operator_gate(releases.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(store) = releases.store.as_deref() else {
