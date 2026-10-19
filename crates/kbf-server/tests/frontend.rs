@@ -1270,6 +1270,109 @@ async fn a_frontend_with_a_releases_dir_serves_the_release_store() {
     std::fs::remove_dir_all(&dir).expect("clean");
 }
 
+/// Catches a frontend whose desired-release route is not held to its build: the wiring of
+/// `frontend.rs` is its own, apart from the in-process server's (`tests/update_api.rs` holds
+/// the rule through that one). Downgrades are allowed and a downgrade is a rollback (R4,
+/// `docs/design/frontend-proxy.md` section 9): a complete release that is not the build's own
+/// is `409` without `"rollback": true` and `200` with it, written as a rollback; the build's
+/// own release (its stamp and zeros) is `200` and is not one.
+///
+/// Mutant seen red: the rows of `frontend.rs` not held by the build (the foreign offer is
+/// `200`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_takes_an_offer_of_another_release_only_as_a_rollback() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = scratch_dir("desired-rollback");
+    let token = "kbf-test-token-0123456789abcdef0123456789";
+    let token_file = dir.join("token");
+    std::fs::write(&token_file, format!("{token}\n")).expect("token");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let f = flags(&[
+        "--storage=http://127.0.0.1:1",
+        &format!(
+            "--state-store=sqlite://{}",
+            dir.join("state").join("state.db").display()
+        ),
+        &format!("--api-token-file={}", token_file.display()),
+        &format!("--releases-dir={}", dir.join("releases").display()),
+    ])
+    .expect("parses");
+    let handle = start_frontend(&f, || Ok(pending::<()>())).expect("starts");
+    let api = handle.api.expect("the operator API");
+    let served = tokio::spawn(handle.serve());
+
+    let call = |method: &'static str, path: String, body: Vec<u8>| async move {
+        let mut stream = TcpStream::connect(api).await.expect("connect");
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\
+             Authorization: Bearer {token}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.expect("write");
+        stream.write_all(&body).await.expect("write");
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.expect("read");
+        let code: u16 = raw[9..12].parse().expect("a status");
+        let body = raw.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+        (
+            code,
+            serde_json::from_str::<Value>(body).unwrap_or(Value::Null),
+        )
+    };
+    let own = format!("{}{}", kbf_server::BUILD_COMMIT, "0".repeat(28));
+    assert_eq!(
+        kbf_server::BUILD_COMMIT.len(),
+        12,
+        "a build made in a git checkout"
+    );
+    let other = "fedcba9876543210fedcba9876543210fedcba98";
+    for commit in [own.as_str(), other] {
+        let path = format!("/v1/releases/{commit}/linux-x86_64/kbf");
+        assert_eq!(
+            call("PUT", path.clone(), b"a tarball".to_vec()).await.0,
+            201
+        );
+        let attestation = format!("{path}.attestation");
+        assert_eq!(
+            call("PUT", attestation, b"{\"bundle\":1}".to_vec()).await.0,
+            201
+        );
+    }
+    let offer = |body: Value| {
+        call(
+            "POST",
+            "/v1/update/desired".to_owned(),
+            body.to_string().into_bytes(),
+        )
+    };
+
+    let (code, refused) = offer(serde_json::json!({ "commit": other })).await;
+    assert_eq!(code, 409, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("rollback")),
+        "{refused}"
+    );
+    assert_eq!(get(api, "/v1/update").await.1["desired"], Value::Null);
+
+    let (code, back) = offer(serde_json::json!({ "commit": other, "rollback": true })).await;
+    assert_eq!(
+        (code, &back["rollback"]),
+        (200, &serde_json::json!(true)),
+        "{back}"
+    );
+    let (code, own_row) = offer(serde_json::json!({ "commit": own })).await;
+    assert_eq!(
+        (code, &own_row["rollback"]),
+        (200, &serde_json::json!(false)),
+        "{own_row}"
+    );
+    served.abort();
+}
+
 /// Catches a `--reapi-tls-cert` and `--reapi-tls-key` that a frontend takes and does not
 /// serve (clients would find plain text where the flags promised TLS): the REAPI listener
 /// answers a health check over TLS for the certificate's name and does not answer in

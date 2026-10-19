@@ -80,7 +80,7 @@ Where kbf differs, and why:
 1. **There is a beta stage; kci has none.** Beta is new: an ephemeral farm per merge that
    publishes nothing. It is closest to kci's build-plus-validation, not to a channel.
 2. **Gamma is not a publish destination.** kci's channels are places bytes are pushed, permanent and never overwritten.
-   Gamma is a farm that pulls: "the desired release" is the `update/desired {generation, commit, set_at}` row in the
+   Gamma is a farm that pulls: "the desired release" is the `update/desired {generation, commit, set_at, rollback}` row in the
    operator's frontend state store, and it moves. A moving pointer is the opposite of never-overwrite, so every move bumps a
    generation that only grows, and a rollback is the older commit under a higher generation. Downgrades are allowed; the
    generation is the guard (`pull-updates.md`, `split-mode-updates.md` 2.3).
@@ -331,7 +331,7 @@ A commit becomes offerable when `kbf release offer` ([P], run on the operator's 
 
 On a red or missing beta result, or an incomplete release, the command refuses and changes nothing. Otherwise it promotes the
 commit by setting `update/desired` (`POST /v1/update/desired {commit}`, compare-and-set; the generation moves only when the
-commit differs). It signs nothing. Each host's root helper verifies the GitHub build attestation offline when it stages, and
+commit differs; the commit is the frontend's own build, else the call says `"rollback": true`). It signs nothing. Each host's root helper verifies the GitHub build attestation offline when it stages, and
 the frontend does not have to **[F in the design, unbuilt]** (`pull-updates.md` section 2; #908 node client, #929 root helper).
 Hosts trust the attestation of the build, not the operator. The only exception is the held installer of a test farm, which
 runs with attestation verification off; that is a test-farm setting, not a default and not part of this contract.
@@ -375,7 +375,7 @@ Gamma and prod are not channels and there is no feed. The pull updater reads the
 keeps (`pull-updates.md` is the authority for the rows; `split-mode-updates.md` for the order of the rollout).
 
 - **One set of rows in the frontend's state store**: the release rows (`update/release/<commit>/<platform>/<name>`);
-  `update/desired {generation, commit, set_at}`; `update/slot` (the rollout slot); `update/host/<id>` (per-host progress); and
+  `update/desired {generation, commit, set_at, rollback}`; `update/slot` (the rollout slot); `update/host/<id>` (per-host progress); and
   `update/policy`. The disk release index is the source of truth for the bytes; the rows say what is wanted and how far the
   rollout has got.
 - **Promotion is setting the desired commit.** Gamma is promoted by setting the desired commit (and so a new generation) on
@@ -470,7 +470,10 @@ Rollback is the updater walking back, and it is the forward mechanism with the o
 (`split-mode-updates.md` section 2.11 **[F]**.)
 
 - A rollback sets `update/desired` to the older release's commit, which takes a higher generation. Downgrades are allowed, and
-  the generation is what stops a replayed older order. The old directories are still on the hosts (running, previous, one
+  the generation is what stops a replayed older order. **A downgrade is a rollback and the offer says so:** commits have no
+  order, so the frontend accepts its own build's commit as it is and any other commit only with `"rollback": true` in
+  `POST /v1/update/desired` (409 otherwise); the row records `rollback`, and a controller whose build is not the desired
+  release drives no node for a row that is not a rollback (`frontend-proxy.md` section 9, R4). The old directories are still on the hosts (running, previous, one
   more), and the release rows and the disk release index still name the old bytes, which the host re-verifies against the
   attestation as for any release.
 - Preflight runs; the frontend goes by a handover back (the old release started as the successor, only through Envoy, never
@@ -488,7 +491,7 @@ Rollback is the updater walking back, and it is the forward mechanism with the o
   place a rollback can arrive; B11 tests both, with N and N-1 mixed in the reverse order.
 - **Who decides when the evaluator is down.** The evaluator that notices a red gate and the command that sets the desired
   commit are separate. If the evaluator is down the bake extends and pages (it never passes), and automatic rollback is
-  unavailable; a person can set the older commit directly (`POST /v1/update/desired`), which does not depend on the evaluator. The only
+  unavailable; a person can set the older commit directly (`POST /v1/update/desired` with `"rollback": true`), which does not depend on the evaluator. The only
   guarantee with both down is the host's own commit-confirm auto-revert, which is per process and minutes-scale.
 - A rollback is tested in beta (B10, B11) and its result belongs to the same attested record.
 

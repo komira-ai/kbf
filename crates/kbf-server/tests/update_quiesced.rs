@@ -83,6 +83,17 @@ impl io::Write for Lines {
     }
 }
 
+/// The 40 digits of a commit that this build's stamp begins: the release the controller of this
+/// process drives to without a rollback.
+fn own_release() -> String {
+    assert_eq!(
+        kbf_server::BUILD_COMMIT.len(),
+        12,
+        "these tests need a build made in a git checkout, not `unknown`"
+    );
+    format!("{}{}", kbf_server::BUILD_COMMIT, "0".repeat(28))
+}
+
 /// A farm over a state store it holds generation 1 of, with `mac-1` connected and idle, a
 /// release desired and `auto_nodes` set: a controller that is free to would cordon the Mac and
 /// then activate the release on it.
@@ -101,7 +112,14 @@ fn mac() -> WorkerId {
     WorkerId::new("mac-1")
 }
 
+/// The rig with `A` desired as a rollback: `A` is not the release of this build, which the
+/// controller drives to only for a row that says so.
 fn rig() -> Rig {
+    rig_offering(A, true)
+}
+
+/// The rig with `release` desired, as a rollback or not.
+fn rig_offering(release: &str, rollback: bool) -> Rig {
     let whole = hooked::Hooked::new();
     let writer: Arc<dyn Store> =
         Arc::new(Fenced::take(Arc::clone(&whole) as Arc<dyn Store>, None).expect("generation 1"));
@@ -138,7 +156,7 @@ fn rig() -> Rig {
         },
     );
     let rows = Rows::new(Arc::clone(&writer));
-    rows.offer(&Release::new(A), farm.wall_now())
+    rows.offer_expecting(&Release::new(release), farm.wall_now(), None, rollback)
         .expect("a run");
     rows.set_policy(&Policy {
         auto_nodes: true,
@@ -369,4 +387,75 @@ async fn a_fence_that_lands_while_an_activation_is_prepared_stops_it() {
     assert!(error.to_string().contains("handed over"), "{error}");
     assert!(rig.farm.handed());
     assert!(rig.orders().is_empty(), "an order reached the Mac");
+}
+
+/// Catches an old child that drives the nodes to a release ahead of its frontend (R4,
+/// `docs/design/frontend-proxy.md` section 9): the new child wrote its own release as the
+/// desired one, the proxy put the old one back in charge, and the old one's controller finds a
+/// row that names a release other than its build's and does not say it is a rollback. Over
+/// eighty looks the store takes not one transaction, no host row or cordon is written, the Mac
+/// receives no order, the task is still running (it looks again: the row may change), and the
+/// refusal is said once, not at every look. The control is in the same test: the same row made
+/// a rollback (the same release and generation, the flag set) is driven at the next look, the
+/// Mac is cordoned and activated with that release.
+///
+/// Mutants seen red: the controller of the runner not held to its build (the Mac is ordered at
+/// the first look); the check removed from the controller.
+#[tokio::test]
+async fn a_release_that_is_not_the_builds_and_not_a_rollback_drives_no_node() {
+    let log = Lines::default();
+    let _logging = log.subscribe();
+    let mut rig = rig_offering(A, false);
+    let (rows, txns) = (rig.rows(), rig.txns());
+    let task = rig.spawn();
+    tokio::time::sleep(QUIET).await;
+    assert!(!task.is_finished(), "the refusal ended the task");
+    assert_eq!(rig.txns(), txns, "the controller wrote to the store");
+    assert_eq!(rig.rows(), rows);
+    assert!(!rig.cordon_row());
+    assert!(rig.orders().is_empty(), "an order reached the Mac");
+    let said = log.with("is not this build's");
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].contains(A), "{said:?}");
+
+    // The operator states it is a rollback: the row changes in place, and the controller drives.
+    let update_rows = Rows::new(Arc::clone(&rig.writer));
+    let before = update_rows.desired().expect("a read").value.expect("a row");
+    let after = update_rows
+        .offer_expecting(&Release::new(A), rig.farm.wall_now(), None, true)
+        .expect("a rollback");
+    assert!(after.rollback);
+    assert_eq!(after.generation, before.generation, "the same run");
+    let mut sent = Vec::new();
+    let order = within("an activation order", || {
+        sent.extend(rig.orders());
+        sent.first().cloned()
+    })
+    .await;
+    assert_eq!(order.commit, A);
+    assert!(rig.cordon_row());
+    task.abort();
+}
+
+/// Catches a controller that refuses the release it is made of: the row names this build's
+/// release (the stamp and then zeros, as the operator route writes it) and is not a rollback,
+/// and the Mac is cordoned and activated with it. Without this the refusal above could be a
+/// controller that drives nothing.
+///
+/// Mutants seen red: the runner's controller held to a stamp that is not this build's (the
+/// Mac is never ordered).
+#[tokio::test]
+async fn the_release_of_this_build_is_driven_without_a_rollback() {
+    let own = own_release();
+    let mut rig = rig_offering(&own, false);
+    let task = rig.spawn();
+    let mut sent = Vec::new();
+    let order = within("activation order", || {
+        sent.extend(rig.orders());
+        sent.first().cloned()
+    })
+    .await;
+    assert_eq!(order.commit, own);
+    assert!(rig.cordon_row());
+    task.abort();
 }

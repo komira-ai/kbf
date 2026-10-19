@@ -11,7 +11,11 @@
 //!
 //! - the update controller, every `Listeners::tick` (a test of this kind gives it a tick that
 //!   does not come within the test): `update/policy` and `update/desired`, and more rows
-//!   once a release is desired, `update/desired` again among them;
+//!   once a release is desired, `update/desired` again among them. (The controller of a build
+//!   refuses a desired release that is not the build's own and is not a rollback, R4, at the
+//!   first read of the row: such a row, offered before the start, makes the controller read
+//!   `update/desired` once and nothing more, so a test whose number counts the full look
+//!   offers a rollback row);
 //! - the offers' poll, with a release store and a state store, every tick: `update/desired`;
 //! - the membership sweeper, every beat (a third of the member ttl): `map`, `member/` and
 //!   last `deny/`.

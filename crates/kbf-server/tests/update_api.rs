@@ -7,6 +7,7 @@ mod hooked;
 #[path = "support/looks.rs"]
 mod looks;
 mod support;
+mod thread_log;
 
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -198,9 +199,17 @@ async fn http(
 const A: &str = "0123456789abcdef0123456789abcdef01234567";
 const B: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
-/// Offer `commit`: the status and body.
+/// Offer `commit` as a rollback: the status and body. `A` and `B` are not the release this
+/// server is built from, which an offer without the flag is refused for
+/// (`a_commit_other_than_the_builds_is_offered_only_as_a_rollback`); the tests that use this
+/// are about something else.
 async fn offer(running: &Running, commit: &str) -> (u16, Value) {
-    let body = json!({ "commit": commit }).to_string();
+    offer_with(running, json!({ "commit": commit, "rollback": true })).await
+}
+
+/// Post `body` as it is: the status and body of the answer.
+async fn offer_with(running: &Running, body: Value) -> (u16, Value) {
+    let body = body.to_string();
     http(
         running.api,
         "POST",
@@ -423,7 +432,8 @@ async fn an_offer_can_expect_the_generation_it_was_made_on() {
     put(&running, A, true).await;
     put(&running, B, true).await;
     let with = |commit: &'static str, expect: u64| {
-        let body = json!({ "commit": commit, "expect_generation": expect }).to_string();
+        let body =
+            json!({ "commit": commit, "expect_generation": expect, "rollback": true }).to_string();
         let api = running.api;
         async move {
             http(
@@ -676,7 +686,12 @@ async fn concurrent_clicks_on_one_generation_have_one_winner() {
         for commit in commits {
             let api = running.api;
             tasks.push(tokio::spawn(async move {
-                let body = json!({ "commit": commit, "expect_generation": generation }).to_string();
+                let body = json!({
+                    "commit": commit,
+                    "expect_generation": generation,
+                    "rollback": true,
+                })
+                .to_string();
                 http(
                     api,
                     "POST",
@@ -789,4 +804,146 @@ async fn a_pause_does_not_lose_a_policy_written_under_it() {
     hooked.conflict_on(None);
     let (code, _) = http(running.api, "POST", "/v1/update/pause", true, None, b"").await;
     assert_eq!(code, 200);
+}
+
+/// The 40 digits of a commit that this server's build stamp begins: its own release.
+fn own_release() -> String {
+    assert_eq!(
+        kbf_server::BUILD_COMMIT.len(),
+        12,
+        "this test needs a build made in a git checkout, not `unknown`"
+    );
+    format!("{}{}", kbf_server::BUILD_COMMIT, "0".repeat(28))
+}
+
+/// Catches the rule of R4 (`docs/design/frontend-proxy.md` section 9) not being kept by the
+/// route: downgrades are allowed, and a downgrade is a rollback that the offer says. The
+/// server's own release (its build stamp, then zeros) is `200` and written with `rollback`
+/// false even when the body says true; any other complete release is `409` naming the rule
+/// and the flag, with the flag false or absent, and nothing is written (the view is as it
+/// was); a body whose flag is not a boolean is `400`; with `"rollback": true` the release is
+/// `200`, written with `rollback` true under a higher generation and shown so by `GET
+/// /v1/update`; a repeat of it without the flag is refused again; and the own release after
+/// it is `200`, a higher generation, not a rollback.
+///
+/// Mutants seen red: the held check ignored in the rows (the foreign offer without the flag
+/// is `200`); the flag not passed by the route (the rollback is `409`); the own release
+/// written as asked (it is written as a rollback); the route's `Rows` not held by the build
+/// (`serve.rs`: the foreign offer is `200`); the refusal not a `409`; the view without
+/// `rollback`.
+#[tokio::test]
+async fn a_commit_other_than_the_builds_is_offered_only_as_a_rollback() {
+    let dir = Dir::new();
+    let store =
+        Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
+    let running = start(Some(store), Some(state()), &dir);
+    let own = own_release();
+    for commit in [own.as_str(), A, B] {
+        put(&running, commit, true).await;
+    }
+    let desired = || async {
+        let (_, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
+        view["desired"].clone()
+    };
+
+    for body in [
+        json!({ "commit": A }),
+        json!({ "commit": A, "rollback": false }),
+    ] {
+        let (code, refused) = offer_with(&running, body.clone()).await;
+        assert_eq!(code, 409, "{body}: {refused}");
+        let said = refused["error"].as_str().expect("text");
+        assert!(
+            said.contains("rollback") && said.contains(kbf_server::BUILD_COMMIT),
+            "{said}"
+        );
+        assert_eq!(
+            desired().await,
+            Value::Null,
+            "{body}: a refused offer wrote"
+        );
+    }
+    for flag in [json!("yes"), json!(1), Value::Null] {
+        let body = json!({ "commit": A, "rollback": flag });
+        assert_eq!(offer_with(&running, body).await.0, 400, "{flag}");
+    }
+    assert_eq!(desired().await, Value::Null);
+
+    // The server's own release needs no flag, and is not a rollback when the body says so.
+    let (code, first) = offer_with(&running, json!({ "commit": own })).await;
+    assert_eq!(
+        (code, &first["generation"], &first["rollback"]),
+        (200, &json!(1), &json!(false))
+    );
+    let (code, same) = offer_with(&running, json!({ "commit": own, "rollback": true })).await;
+    assert_eq!(
+        (code, &same["generation"], &same["rollback"]),
+        (200, &json!(1), &json!(false))
+    );
+
+    // Another release, stated as a rollback: written as one, under a higher generation.
+    let (code, back) = offer_with(&running, json!({ "commit": A, "rollback": true })).await;
+    assert_eq!(code, 200, "{back}");
+    assert_eq!(
+        (&back["generation"], &back["rollback"]),
+        (&json!(2), &json!(true))
+    );
+    let shown = desired().await;
+    assert_eq!(
+        (&shown["commit"], &shown["rollback"]),
+        (&json!(A), &json!(true))
+    );
+    // A repeat without the flag is the same refusal: the row stays a rollback.
+    assert_eq!(offer_with(&running, json!({ "commit": A })).await.0, 409);
+    assert_eq!(desired().await["rollback"], true);
+
+    // Forward again to the server's own release: a new run, not a rollback.
+    let (code, forward) = offer_with(&running, json!({ "commit": own })).await;
+    assert_eq!(code, 200, "{forward}");
+    assert_eq!(
+        (&forward["generation"], &forward["rollback"]),
+        (&json!(3), &json!(false))
+    );
+    assert_eq!(desired().await["rollback"], false);
+}
+
+/// Catches a rollback that is desired with no trace: the write of a row that moves the farm
+/// to a release other than the server's own is logged, once per write, naming the release
+/// and the generation; a write of the server's own release is not logged as one. The route
+/// runs on this test's thread (a current-thread runtime), whose log `thread_log` keeps.
+///
+/// Mutant seen red: the line dropped from the handler.
+#[test]
+fn a_rollback_write_is_logged_and_the_servers_own_release_is_not() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let log = thread_log::logged(|| {
+        runtime.block_on(async {
+            let dir = Dir::new();
+            let store = Arc::new(
+                ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"),
+            );
+            let running = start(Some(store), Some(state()), &dir);
+            let own = own_release();
+            for commit in [own.as_str(), A] {
+                put(&running, commit, true).await;
+            }
+            let (code, _) = offer_with(&running, json!({ "commit": own })).await;
+            assert_eq!(code, 200);
+            let (code, back) = offer_with(&running, json!({ "commit": A, "rollback": true })).await;
+            assert_eq!((code, &back["generation"]), (200, &json!(2)), "{back}");
+        });
+    });
+    let said: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("a rollback is desired"))
+        .collect();
+    assert_eq!(said.len(), 1, "{log}");
+    assert!(
+        said[0].contains(A) && said[0].contains("generation=2"),
+        "{}",
+        said[0]
+    );
 }

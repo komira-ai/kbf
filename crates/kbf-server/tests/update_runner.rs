@@ -148,8 +148,15 @@ async fn nothing_starts_until_auto_nodes_is_set() {
     }));
     let front_rows = front.rows.clone();
     tokio::task::spawn_blocking(move || {
+        // A rollback: `A` is not the release of this build, which the controller drives to
+        // only for a row that says so (`update_quiesced.rs` holds the refusal).
         front_rows
-            .offer(&Release::new(A), kbf_types::FarmTime::from_millis(1_000))
+            .offer_expecting(
+                &Release::new(A),
+                kbf_types::FarmTime::from_millis(1_000),
+                None,
+                true,
+            )
             .expect("a run");
     })
     .await
@@ -277,12 +284,17 @@ fn order(m: &server_message::Message) -> Option<kbf_proto::update::UpdateOrder> 
     }
 }
 
-/// Sets a release desired and `auto_nodes`.
+/// Sets a release desired (as a rollback: see the first test) and `auto_nodes`.
 async fn arm(front: &Frontend) {
     let rows = front.rows.clone();
     tokio::task::spawn_blocking(move || {
-        rows.offer(&Release::new(A), kbf_types::FarmTime::from_millis(1_000))
-            .expect("a run");
+        rows.offer_expecting(
+            &Release::new(A),
+            kbf_types::FarmTime::from_millis(1_000),
+            None,
+            true,
+        )
+        .expect("a run");
         rows.set_policy(&Policy {
             auto_nodes: true,
             ..Policy::default()

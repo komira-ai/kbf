@@ -100,7 +100,10 @@ curl -X POST http://127.0.0.1:<api-port>/v1/update/desired \
 
 The placeholders `<api-port>` and `<api-token-file>` are printed literally; the page knows no token and no path, and shows
 none. `expect_generation` is the generation the page read, so a second operator's change makes the call 409 instead of
-overwriting it. When the `kbf update set` verb exists (PR 6, optional) the page shows that instead. A blocker that makes the
+overwriting it. **Downgrades are allowed, and a downgrade is a rollback** (`frontend-proxy.md` section 9, R4): a commit other
+than the serving process's own build commit (the frontend row's) is refused with 409 unless the body also has
+`"rollback":true`, and the row records it (`desired.rollback`). The page never writes, so it posts nothing; it says this
+beside the command, pointing at the frontend row's commit, and shows a desired row that is a rollback as one. When the `kbf update set` verb exists (PR 6, optional) the page shows that instead. A blocker that makes the
 server refuse (no complete platform) is shown as a reason above the command, and the command is omitted.
 
 Every URL the page read is listed below it, as links.

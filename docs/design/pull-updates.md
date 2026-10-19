@@ -46,7 +46,10 @@ state store, protocol skew, upgrade order), [worker-protocol.md](worker-protocol
    waits for `open_executions == 0` and never restarts the serving frontend). Details: split-mode-updates.md 2.5, 2.6
    and 3.3, and section 8 below for what decoupling changes.
 8. Rollback is setting the desired release back: a **higher generation** naming an older commit. The old
-   directory is still on disk, so nothing is downloaded.
+   directory is still on disk, so nothing is downloaded. Downgrades are allowed, and a downgrade is a rollback: the
+   offer states it (`"rollback": true`) and the row records it (`update/desired.rollback`). Commits have no order, so any
+   commit other than the frontend's own build is a rollback, and the offer of one without the flag is refused with 409
+   (`frontend-proxy.md` section 9, R4).
 9. Only the unprivileged `kbf` binary is ever pulled. `kbf-installer` (which includes the former helper), unit files, the
    sudoers entry and the pinned trust material change only by the package or a script a human runs. Root code is never
    auto-updated, and the code that downloads runs without root.
@@ -226,7 +229,7 @@ saying which is missing; nothing answers an empty 200.
 | key | value |
 |---|---|
 | `update/release/<commit>/<platform>/<name>` | the component: `sha256`, `size`, and the attestation once uploaded |
-| `update/desired` | the desired release: `generation`, `commit`, `set_at` |
+| `update/desired` | the desired release: `generation`, `commit`, `set_at`, `rollback` (the offer said it is a rollback; absent is false) |
 | `update/generation` | the counter (C3) the generations come from |
 | `update/slot` | the rollout slot: one storage holder plus up to `max_hosts_out` host holders, each `{host, order_id, epoch}`, with the run state; no time to live (section 8) |
 | `update/host/<id>` | the controller's per-host phase `{phase, order_id, generation, since, boot_before}`: what a restarted controller resumes from (split-mode-updates.md 2.6) |
@@ -261,6 +264,11 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
 - `GET /v1/releases`: commits with, per platform, which components are present and whether the platform is complete.
 - `POST /v1/update/desired {commit}`: the commit needs at least one complete platform (else 409). Compare-and-set
   on `update/desired`; the counter gives the new generation only when the commit differs from the current one.
+  **A downgrade is a rollback.** Downgrades stay allowed, and the call says so: a commit other than the build commit of the
+  frontend that serves the call (12 hex digits that begin the 40) needs `"rollback": true` in the body (409 naming the rule
+  without it) and is written with `rollback` true; the frontend's own commit is written with `rollback` false. The
+  controller drives nodes to a release other than its own build's only for a row that is a rollback, so an old frontend
+  that the proxy put back in charge after the new one wrote the next release drives no node (`frontend-proxy.md` section 9, R4).
 - `GET /v1/update`: `{desired, releases}`. The policy fields are set through `POST /v1/update/policy` (admin). There is no auto-update endpoint.
 - `GET /v1/nodes` gains, per node, an `update` object: state, the three commits, offered generation, refusal,
   `helper_present`, `up_to_date` (true, false or null) and `availability` (`ok`, `unavailable`, `unsupported`).
@@ -572,7 +580,7 @@ held and the run goes `held`; a broken host never lets another take its place.
    Mac is deferred, not killed. **Because the frontend no longer goes first on its own, the planner refuses to order a node to a
    release whose `[min_protocol, protocol]` the running frontend does not accept** (409, "update the frontend first"; it reads the same preflight row `update/available/<commit>` that fills the offer's expected facts, section 5), and refuses
    a node downgrade whose protocol the running frontend no longer accepts; the operator updates the frontend as a separate
-   action and then the nodes. This replaces the "frontend first on an upgrade, nodes first on a downgrade" ordering of
+   action and then the nodes (the desired release is the frontend's own build, or a rollback the offer states: R4). This replaces the "frontend first on an upgrade, nodes first on a downgrade" ordering of
    split-mode-updates.md 3.3, which assumed one rollout; that document needs the matching edit.
 2. **Per host** (split-mode-updates.md 2.6, which is the authority): selection when idle, or the least-loaded candidate after
    `idle_wait`; cordon; wait for zero leases; on a storage node mark the member planned-down and wait for in-flight write

@@ -12,7 +12,8 @@
 //! were first written, and a few beyond them, each said where it is declared:
 //! `update/host.reason` (the reason of a `Held` phase), `update/host.order_epoch` (the epoch
 //! an order id was drawn under) and `update/host.commit` (the release the host's run drives
-//! it to), and the node step's limits in `update/policy`, each optional and absent when it is
+//! it to), `update/desired.rollback` (the offer said it is a rollback; absent is false), and
+//! the node step's limits in `update/policy`, each optional and absent when it is
 //! the default, so that a writer that knows only the agreed fields leaves them at the default
 //! instead of at zero. `paused` is an agreed field of `update/policy` (it was once
 //! `update/desired`'s); it took the next free number there, 18, because no field changes its
@@ -53,6 +54,12 @@ pub struct Desired {
     pub commit: Release,
     /// When the release was set: where the idle wait counts from until a host finishes.
     pub set_at: FarmTime,
+    /// Whether the offer said it is a rollback. A downgrade is a rollback: moving the farm
+    /// to any release other than the frontend's own (commits have no order, so "older" is
+    /// not asked) is a rollback, and the offer says so; the row records it. Absent in a row
+    /// written before the field is false. A controller whose own release is not `commit`
+    /// drives no node for a row that is not a rollback ([`super::Controller::held_by`]).
+    pub rollback: bool,
 }
 
 /// `update/host/<id>`: a host's record, and the commit its run drives it to. A host started
@@ -80,7 +87,8 @@ impl HostRow {
 }
 
 /// Tag 4 was `paused` in an earlier draft of this row, which no release wrote (the pause is
-/// `update/policy`'s); the number is not reused.
+/// `update/policy`'s); the number is not reused. `rollback` is beyond the agreed fields, and
+/// absent (false) in a row written before it.
 #[derive(Clone, PartialEq, prost::Message)]
 struct DesiredMsg {
     #[prost(uint64, tag = "1")]
@@ -89,6 +97,8 @@ struct DesiredMsg {
     commit: String,
     #[prost(uint64, tag = "3")]
     set_at_ms: u64,
+    #[prost(bool, tag = "5")]
+    rollback: bool,
 }
 
 /// The agreed fields are `phase`, `order_id`, `generation`, `since` and `boot_before`;
@@ -283,6 +293,7 @@ pub(super) fn encode_desired(desired: &Desired) -> Vec<u8> {
         generation: desired.generation.0,
         commit: desired.commit.as_str().to_owned(),
         set_at_ms: desired.set_at.as_millis(),
+        rollback: desired.rollback,
     }
     .encode_to_vec()
 }
@@ -303,6 +314,7 @@ pub(super) fn decode_desired(bytes: &[u8]) -> Result<Desired, Corrupt> {
         generation: Generation(msg.generation),
         commit: Release::new(msg.commit),
         set_at: FarmTime::from_millis(msg.set_at_ms),
+        rollback: msg.rollback,
     })
 }
 

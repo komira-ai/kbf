@@ -668,7 +668,7 @@ operator API and the hosts' sessions. The CLI and the UI are its clients. The ma
 `kbf frontend handover`) stays as the fallback; it calls the same installer code.
 
 State in `kbf-state` (one CAS row each; works on SQLite and Postgres): **one set of rows** with `pull-updates.md` section 6.2.
-That document owns `update/release/<commit>/<platform>/<name>`, `update/desired {generation, commit, set_at}` and
+That document owns `update/release/<commit>/<platform>/<name>`, `update/desired {generation, commit, set_at, rollback}` and
 `update/generation`. This one adds:
 - `update/slot`: **one storage holder plus up to `max_hosts_out` host holders** (daemon-only hosts and Macs), each `{host, order_id, epoch}`, with the run state; no TTL: if a holder dies its entry stays held and the run is `Held`, and a broken host never lets another take its place;
 - `update/host/<id> {phase, order_id, generation, since, boot_before}`: what the controller resumes from; `boot_before` is the node's boot counter before the step, which the rejoin check compares with the registered one;

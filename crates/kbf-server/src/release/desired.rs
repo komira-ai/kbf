@@ -7,12 +7,22 @@
 //! - `POST /v1/update/desired {"commit": "<40 hex>"}` offers the commit: the store must hold
 //!   it complete (tarball and attestation) for at least one platform, else `409` naming
 //!   what is missing. The row's generation moves only when the commit differs from the
-//!   desired one (a repeated click keeps it); a rollback is the older commit offered the same
-//!   way. It passes the gates of every `/v1` write ([`crate::api::operator_gate`]) and wants a
-//!   JSON body.
+//!   desired one (a repeated click keeps it). It passes the gates of every `/v1` write
+//!   ([`crate::api::operator_gate`]) and wants a JSON body.
 //!   An optional `expect_generation` makes it a compare-and-set: the row is written only if the
 //!   desired release is at that generation (0 before any offer), else `409` naming both and
 //!   nothing is written. `GET` also shows the `policy` row when the operator wrote one.
+//! - **A downgrade is a rollback, and a rollback says so** (R4 of
+//!   `docs/design/frontend-proxy.md` section 9). Downgrades are allowed: moving the farm to
+//!   an older release is an offer like any other, with `"rollback": true`. Commits have no
+//!   order, so the rule is on the frontend's own: the commit this server
+//!   was built from ([`crate::BUILD_COMMIT`], its 12 hex digits a prefix of the 40) is offered
+//!   as it is and written with `rollback` false; **any other commit is `409` unless the body
+//!   has `"rollback": true`**, and then it is written with `rollback` true and a line is
+//!   logged. A build whose commit is `unknown` has no own release: every offer needs
+//!   `"rollback": true`. The rule is [`Rows::offer_expecting`]'s, so every writer of the row
+//!   meets it. A controller drives nodes to a release other than its own only for a row that
+//!   is a rollback.
 //! - `POST /v1/update/pause` and `resume` set `paused` of the policy row (a compare-and-set of
 //!   that one field): while set, no host is started. It needs no run, and survives the next offer.
 //! - Without a state store (`--state-store`: the rows have nowhere to live) every answer is
@@ -101,6 +111,7 @@ pub(crate) fn desired_view(desired: Option<&Desired>) -> serde_json::Value {
             "generation": d.generation.0,
             "commit": d.commit.as_str(),
             "set_at_ms": d.set_at.as_millis(),
+            "rollback": d.rollback,
         })
     })
 }
@@ -186,6 +197,9 @@ struct Offer {
     commit: String,
     /// Compare-and-set: write only if the desired release is at this generation (0 before any).
     expect_generation: Option<u64>,
+    /// Says the commit is a rollback: required for a commit other than the server's own.
+    #[serde(default)]
+    rollback: bool,
 }
 
 /// The gates of a write, then the JSON content type for a body.
@@ -224,11 +238,13 @@ async fn set_desired(
     let Ok(Offer {
         commit,
         expect_generation,
+        rollback,
     }) = serde_json::from_slice::<Offer>(&body)
     else {
         return error(
             StatusCode::BAD_REQUEST,
-            "the body must be {\"commit\": \"<40 hex>\"}",
+            "the body must be {\"commit\": \"<40 hex>\"}, with \"rollback\": true for a commit \
+             other than the server's own and optionally \"expect_generation\"",
         );
     };
     let Some(parsed) = Commit::parse(&commit) else {
@@ -260,11 +276,24 @@ async fn set_desired(
     }
     // The wall clock: the controller counts its waits from this, across restarts.
     let now = update.farm.wall_now();
-    match blocking(move || rows.offer_expecting(&Release::new(commit), now, expect_generation))
-        .await
-    {
-        Ok(desired) => json(StatusCode::OK, &desired_view(Some(&desired))),
-        Err(e @ RowError::Stale { .. }) => error(StatusCode::CONFLICT, &e.to_string()),
+    let offered = blocking(move || {
+        rows.offer_expecting(&Release::new(commit), now, expect_generation, rollback)
+    })
+    .await;
+    match offered {
+        Ok(desired) => {
+            if desired.rollback {
+                tracing::warn!(
+                    commit = desired.commit.as_str(),
+                    generation = desired.generation.0,
+                    "update: a rollback is desired: a release other than this server's own"
+                );
+            }
+            json(StatusCode::OK, &desired_view(Some(&desired)))
+        }
+        Err(e @ (RowError::Stale { .. } | RowError::NotOwn { .. })) => {
+            error(StatusCode::CONFLICT, &e.to_string())
+        }
         Err(e) => row_failed(&e),
     }
 }

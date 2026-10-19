@@ -906,7 +906,10 @@ impl<'a> Prepared<'a> {
         let api_listener = api_socket.map(Socket::http).transpose()?;
         let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
         let update_store = state_store.clone();
-        let update_rows = state_store.clone().map(crate::update::Rows::new);
+        // Held by this build: an offer of another release must say it is a rollback (R4).
+        let update_rows = state_store.clone().map(|store| {
+            crate::update::Rows::new(store).held_by(crate::update::OwnCommit::this_build())
+        });
         let offers = crate::release::offers::offers_of(
             releases.clone(),
             update_rows.clone(),

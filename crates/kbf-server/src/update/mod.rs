@@ -28,6 +28,10 @@
 //!   walks back the hosts the forward run finished. A host that has done nothing
 //!   irreversible yet (steps 1 to 5) is given back when a new generation is offered; a host
 //!   past the activate order finishes the step it began.
+//! - Nodes are driven only to the frontend's own release, unless the desired row says it is a
+//!   rollback ([`OwnCommit`], R4 of `docs/design/frontend-proxy.md` section 9): an offer of
+//!   another release must say so, and a controller of a build that is not the desired release
+//!   drives no node for a row that does not. Downgrades are allowed; a downgrade is a rollback.
 //! - A helper's status counts only if it names the host's current activation order, and a
 //!   restart counts only with a larger boot counter than the one recorded at the mark.
 //! - The row is written before the orders it calls for, and never over a row that moved. The
@@ -47,6 +51,7 @@ mod facts;
 mod gate;
 mod moves;
 mod node_step;
+mod own;
 mod pick;
 mod policy;
 mod ports;
@@ -66,6 +71,7 @@ pub use facts::{
 };
 pub use gate::{GateFail, GateMode, storage_gate};
 pub use node_step::{HostPhase, Transition, step};
+pub use own::OwnCommit;
 pub use pick::{Pick, Picked, Skip, WaitReason, pick};
 pub use policy::{Policy, PolicyError};
 pub use ports::{FactsSource, FarmView, SourceError, Transport, TransportError};

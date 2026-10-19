@@ -14,8 +14,8 @@
 mod support;
 
 use kbf_server::update::{
-    Desired, Generation, HoldReason, Holder, HostPhase, HostRecord, HostRow, OrderId, Policy,
-    PolicyError, Release, RowError, Rows, Slot, SlotClass, Stored,
+    Desired, Generation, HoldReason, Holder, HostPhase, HostRecord, HostRow, OrderId, OwnCommit,
+    Policy, PolicyError, Release, RowError, Rows, Slot, SlotClass, Stored,
 };
 use kbf_state::{Cond, Txn};
 use kbf_types::FarmTime;
@@ -83,6 +83,14 @@ fn the_bytes_of_every_row_are_frozen() {
         let now = FarmTime::from_millis(1000);
         rows.offer(&Release::new("v2"), now).expect("an offer");
         assert_eq!(raw(&cell, "update/desired"), "08011202763218e807");
+        // The same release offered as a rollback: the field the row gained, beyond the agreed
+        // ones, is 5 (4 was `paused` of an earlier draft and is not reused): key 0x28, true 1.
+        // The run is the same, so the generation and the time stand.
+        let flagged = rows
+            .offer_expecting(&Release::new("v2"), now, None, true)
+            .expect("an offer");
+        assert!(flagged.rollback);
+        assert_eq!(raw(&cell, "update/desired"), "08011202763218e8072801");
 
         // update/host/<id> {phase, order_id, generation, since, boot_before}: Held (13),
         // order number 9, generation 3, entered at 5000 ms, boot counter 10 at the mark;
@@ -362,6 +370,7 @@ fn offers_grow_the_generation_and_leave_the_pause_alone() {
                 generation: Generation(1),
                 commit: Release::new("v2"),
                 set_at: at,
+                rollback: false,
             }
         );
         assert!(
@@ -424,6 +433,7 @@ fn the_commit_already_desired_keeps_its_generation_and_a_generation_is_always_ab
             generation: Generation(90),
             commit: Release::new("x"),
             set_at: FarmTime::from_millis(1),
+            rollback: false,
         };
         put_raw(
             &cell,
@@ -439,6 +449,169 @@ fn the_commit_already_desired_keeps_its_generation_and_a_generation_is_always_ab
             Generation(91),
             "above the row, whatever the counter says"
         );
+    }
+}
+
+const OWN: &str = "0123456789ab";
+const OWNED: &str = "0123456789abcdef0123456789abcdef01234567";
+const OTHER: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+/// Catches: a row written before the `rollback` field that reads as a rollback (the farm
+/// would drive nodes it should not, or a store written by the last release would be refused),
+/// a field that is not number 5 (4 was `paused` of an earlier draft: the bytes of that draft
+/// must not read as a rollback), a later field that is not skipped, and a flag that does not
+/// survive the round trip. The bytes are the wire format worked out by hand: generation 1
+/// (`08 01`), "v2" (`12 02 76 32`), set at 1000 ms (`18 e8 07`), then the field.
+///
+/// Mutants seen red: the field numbered 4; the flag not read back (always false).
+#[test]
+fn a_row_without_the_rollback_field_is_not_a_rollback_and_the_field_is_number_5() {
+    let base = [0x08, 0x01, 0x12, 0x02, 0x76, 0x32, 0x18, 0xe8, 0x07];
+    let with = |tail: &[u8]| [base.as_slice(), tail].concat();
+    for backing in BACKINGS {
+        let cell = Cell::new(backing, "legacy");
+        let rows = Rows::new(cell.store());
+        let read = |bytes: &[u8]| {
+            put_raw(&cell, "update/desired", bytes);
+            rows.desired().expect("a read").value.expect("a row")
+        };
+        let legacy = read(&base);
+        assert_eq!(
+            legacy,
+            Desired {
+                generation: Generation(1),
+                commit: Release::new("v2"),
+                set_at: FarmTime::from_millis(1000),
+                rollback: false,
+            },
+            "a row written before the field"
+        );
+        assert!(read(&with(&[0x28, 0x01])).rollback, "field 5, true");
+        assert!(!read(&with(&[0x28, 0x00])).rollback, "field 5, false");
+        assert!(
+            !read(&with(&[0x20, 0x01])).rollback,
+            "field 4 was `paused`, not this"
+        );
+        let later = read(&with(&[0x28, 0x01, 0x30, 0x01]));
+        assert!(later.rollback, "a field after it is skipped");
+        assert_eq!(later.generation, Generation(1));
+    }
+}
+
+/// Catches an offer that does not meet R4 on the rows a build holds
+/// (`docs/design/frontend-proxy.md` section 9): the build's own release is written, and not
+/// as a rollback even when the offer asked for one; any other release without the flag is
+/// refused naming the rule, and nothing is written (the row is as it was), whether it is a
+/// first offer, a change or a repeat of what is desired; with the flag it is written as a
+/// rollback under a higher generation (a downgrade is never refused for being one); a build
+/// that owns no release (`unknown`) refuses every offer without the flag; an empty release and
+/// a stale generation are still said as themselves. The permission changes in place: the
+/// same release offered with the other flag keeps its generation and time and moves only
+/// the flag, and offered with the flag it has writes nothing. Rows nothing holds apply no
+/// rule and write the flag as given. On both backends.
+///
+/// Mutants seen red: the held check ignored (the foreign offer without the flag is written);
+/// the flag written false (the rollback is recorded as none); the own release written as
+/// asked (`rollback` true on the own release); a repeat of the desired release answered with
+/// the old row whatever the flag (the flag never moves).
+#[test]
+fn rows_held_by_a_build_take_its_own_release_and_any_other_only_as_a_rollback() {
+    let at = FarmTime::from_millis;
+    let (own, other) = (Release::new(OWNED), Release::new(OTHER));
+    for backing in BACKINGS {
+        let cell = Cell::new(backing, "held");
+        let rows = Rows::new(cell.store()).held_by(OwnCommit::new(OWN));
+        let unheld = Rows::new(cell.store());
+
+        let refused = rows.offer(&other, at(1)).expect_err("another release");
+        assert_eq!(
+            refused,
+            RowError::NotOwn {
+                commit: OTHER.to_owned(),
+                own: OWN.to_owned()
+            }
+        );
+        let said = refused.to_string();
+        assert!(said.contains("rollback") && said.contains(OWN), "{said}");
+        assert_eq!(rows.desired().unwrap().value, None, "nothing was written");
+        assert_eq!(
+            rows.offer(&Release::new(""), at(1)),
+            Err(RowError::NoRelease)
+        );
+
+        // The own release is not a rollback, whatever the offer says.
+        let first = rows.offer_expecting(&own, at(2), None, true).unwrap();
+        assert_eq!((first.generation, first.rollback), (Generation(1), false));
+        // Another release as a rollback: a new run, recorded as one. A repeat of it without
+        // the flag is refused like a first offer is.
+        let back = rows.offer_expecting(&other, at(3), None, true).unwrap();
+        assert_eq!((back.generation, back.rollback), (Generation(2), true));
+        assert_eq!(rows.desired().unwrap().value.unwrap(), back);
+        assert!(matches!(
+            rows.offer(&other, at(4)),
+            Err(RowError::NotOwn { .. })
+        ));
+        assert_eq!(rows.desired().unwrap().value.unwrap(), back, "unchanged");
+        // A stale expectation is said as itself, once the offer is allowed.
+        assert_eq!(
+            rows.offer_expecting(&other, at(4), Some(9), true),
+            Err(RowError::Stale {
+                expected: 9,
+                found: 2
+            })
+        );
+        // Forward to the own release again: not a rollback, a higher generation.
+        let forward = rows.offer(&own, at(5)).unwrap();
+        assert_eq!(
+            (forward.generation, forward.rollback),
+            (Generation(3), false)
+        );
+
+        // The same release with the other flag: only the flag moves.
+        let plain = unheld.offer(&other, at(10)).unwrap();
+        assert_eq!((plain.generation, plain.rollback), (Generation(4), false));
+        let flagged = rows.offer_expecting(&other, at(11), None, true).unwrap();
+        assert_eq!(
+            flagged,
+            Desired {
+                rollback: true,
+                ..plain.clone()
+            }
+        );
+        let stored = rows.desired().unwrap();
+        assert_eq!(stored.value.as_ref(), Some(&flagged));
+        let again = rows.offer_expecting(&other, at(12), None, true).unwrap();
+        assert_eq!(again, flagged);
+        assert_eq!(rows.desired().unwrap(), stored, "a repeat writes nothing");
+        // And the own release a rollback row names is made accurate: not a rollback.
+        let marked = unheld.offer_expecting(&own, at(13), None, true).unwrap();
+        assert!(
+            marked.rollback,
+            "rows nothing holds write the flag as given"
+        );
+        let made_plain = rows.offer(&own, at(14)).unwrap();
+        assert_eq!(
+            made_plain,
+            Desired {
+                rollback: false,
+                ..marked
+            }
+        );
+
+        // A build with no release of its own: every offer needs the flag.
+        let unknown = Rows::new(cell.store()).held_by(OwnCommit::new("unknown"));
+        for release in [&own, &other] {
+            let error = unknown.offer(release, at(20)).expect_err("owns nothing");
+            assert_eq!(
+                error,
+                RowError::NotOwn {
+                    commit: release.as_str().to_owned(),
+                    own: "unknown".to_owned()
+                }
+            );
+        }
+        let forced = unknown.offer_expecting(&other, at(21), None, true).unwrap();
+        assert!(forced.rollback);
     }
 }
 

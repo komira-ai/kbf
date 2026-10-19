@@ -3,7 +3,7 @@
 //!
 //! | key | value | written by |
 //! |---|---|---|
-//! | `update/desired` | `{generation, commit, set_at}` ([`Desired`]) | an offer |
+//! | `update/desired` | `{generation, commit, set_at, rollback}` ([`Desired`]) | an offer |
 //! | `update/policy` | the nine settings (the pause among them), and the node step's limits when they are not the default ([`Policy`]) | the operator, the pause button |
 //! | `update/slot` | the places in use, `{host, order_id, epoch}` each ([`Slot`]): one storage, up to `max_hosts_out` others | the controller |
 //! | `update/host/<id>` | `{phase, order_id, generation, since, boot_before}`, and the run's commit ([`HostRow`]) | the controller |
@@ -31,6 +31,7 @@ use super::codec::{
     encode_desired, encode_host, encode_policy, encode_slot,
 };
 use super::facts::{Generation, OrderId, Release};
+use super::own::OwnCommit;
 use super::policy::{Policy, PolicyError};
 use super::slot::{Holder, Slot, SlotClass};
 
@@ -89,6 +90,18 @@ pub enum RowError {
     /// An offer names no release.
     #[error("an offer must name a release")]
     NoRelease,
+    /// An offer of a release other than the holder's own that does not say it is a rollback
+    /// (R4, [`OwnCommit`]).
+    #[error(
+        "{commit} is not this frontend's own release ({own}): a release other than the \
+         frontend's own is a rollback, and an offer of one must say so (\"rollback\": true)"
+    )]
+    NotOwn {
+        /// The release offered.
+        commit: String,
+        /// The commit the holder was built from.
+        own: String,
+    },
 }
 
 /// A row as it was read: its value, and the version a write of it must name. `version` is
@@ -113,6 +126,8 @@ impl<T> Stored<T> {
 #[derive(Clone)]
 pub struct Rows {
     store: Arc<dyn Store>,
+    /// The holder whose offers these are (R4); `None` for rows nothing holds.
+    own: Option<OwnCommit>,
 }
 
 impl std::fmt::Debug for Rows {
@@ -136,7 +151,18 @@ impl Rows {
     /// The rows of `store`.
     #[must_use]
     pub fn new(store: Arc<dyn Store>) -> Self {
-        Self { store }
+        Self { store, own: None }
+    }
+
+    /// These rows as the offers of the frontend built from `own` make them: an offer of any
+    /// other release must say it is a rollback ([`Rows::offer_expecting`]). **Every writer of
+    /// `update/desired` goes through rows made this way** (the operator route and, when it
+    /// exists, the remote one): rows from [`Rows::new`] apply no rule, for the reads of a
+    /// controller and for the tests and simulators that stand for no frontend.
+    #[must_use]
+    pub fn held_by(mut self, own: OwnCommit) -> Self {
+        self.own = Some(own);
+        self
     }
 
     /// The run, if one was ever offered.
@@ -156,10 +182,10 @@ impl Rows {
         }
     }
 
-    /// Sets the desired release to `commit`, under a higher generation. A rollback is the
-    /// older commit offered the same way (section 2.11). Setting the commit that is already
-    /// desired changes nothing and keeps the generation (`pull-updates.md` section 5), so a
-    /// repeated click is not a new run. The generation is drawn from the counter
+    /// Sets the desired release to `commit`, under a higher generation, as an offer that
+    /// does not say it is a rollback ([`Rows::offer_expecting`]). Setting the commit that is
+    /// already desired changes nothing and keeps the generation (`pull-updates.md` section
+    /// 5), so a repeated click is not a new run. The generation is drawn from the counter
     /// `update/generation`; it is never below the current run's plus one, whatever the
     /// counter says. The pause is in `update/policy` and an offer does not touch it.
     ///
@@ -167,9 +193,10 @@ impl Rows {
     /// (see [`super::Controller`]); a host past the activate order finishes its step.
     ///
     /// # Errors
-    /// [`RowError`]: the store failed, the row cannot be read, or `commit` is empty.
+    /// [`RowError`]: the store failed, the row cannot be read, `commit` is empty, or these
+    /// rows are held and `commit` is not the holder's own ([`RowError::NotOwn`]).
     pub fn offer(&self, commit: &Release, now: FarmTime) -> Result<Desired, RowError> {
-        self.offer_expecting(commit, now, None)
+        self.offer_expecting(commit, now, None, false)
     }
 
     /// [`Rows::offer`] that writes only if the desired release is at generation `expected`
@@ -177,17 +204,38 @@ impl Rows {
     /// replace what another operator has just set. The check and the write are one
     /// conditional write of the row.
     ///
+    /// **The rule of R4** ([`OwnCommit`]): on rows held by a build, an offer of the build's
+    /// own release is written with `rollback` false, and an offer of any other release is
+    /// written only if `rollback` is set, and with `rollback` true; otherwise it is refused
+    /// and nothing is written. A downgrade is a rollback and is never refused for that. On
+    /// rows nothing holds `rollback` is written as given.
+    ///
+    /// A repeat of the desired release with another `rollback` than the row records changes
+    /// that field in place, under the same generation and time: the run is the same, the
+    /// permission to drive it is what changed.
+    ///
     /// # Errors
-    /// [`RowError::Stale`] when the generation is another; otherwise as [`Rows::offer`].
+    /// [`RowError::Stale`] when the generation is another; [`RowError::NotOwn`] when the
+    /// offer is refused by R4; otherwise as [`Rows::offer`].
     pub fn offer_expecting(
         &self,
         commit: &Release,
         now: FarmTime,
         expected: Option<u64>,
+        rollback: bool,
     ) -> Result<Desired, RowError> {
         if commit.as_str().is_empty() {
             return Err(RowError::NoRelease);
         }
+        let rollback = match &self.own {
+            None => rollback,
+            Some(own) => own
+                .rollback_of(commit, rollback)
+                .ok_or_else(|| RowError::NotOwn {
+                    commit: commit.as_str().to_owned(),
+                    own: own.as_str().to_owned(),
+                })?,
+        };
         for _ in 0..ATTEMPTS {
             let current = self.desired()?;
             if let Some(expected) = expected {
@@ -196,21 +244,29 @@ impl Rows {
                     return Err(RowError::Stale { expected, found });
                 }
             }
-            if let Some(same) = current.value.as_ref().filter(|d| d.commit == *commit) {
-                return Ok(same.clone());
-            }
-            let drawn = self.store.txn(Txn::new().next(GENERATION))??;
-            let counter = drawn.counters.first().copied().ok_or_else(|| {
-                StoreError::Failed("the store returned no value for a counter".to_owned())
-            })?;
-            let above = current
-                .value
-                .as_ref()
-                .map_or(1, |d| d.generation.0.saturating_add(1));
-            let next = Desired {
-                generation: Generation(counter.max(above)),
-                commit: commit.clone(),
-                set_at: now,
+            let next = match current.value.as_ref().filter(|d| d.commit == *commit) {
+                Some(same) if same.rollback == rollback => return Ok(same.clone()),
+                // The same run with the other permission to drive it: only the flag moves.
+                Some(same) => Desired {
+                    rollback,
+                    ..same.clone()
+                },
+                None => {
+                    let drawn = self.store.txn(Txn::new().next(GENERATION))??;
+                    let counter = drawn.counters.first().copied().ok_or_else(|| {
+                        StoreError::Failed("the store returned no value for a counter".to_owned())
+                    })?;
+                    let above = current
+                        .value
+                        .as_ref()
+                        .map_or(1, |d| d.generation.0.saturating_add(1));
+                    Desired {
+                        generation: Generation(counter.max(above)),
+                        commit: commit.clone(),
+                        set_at: now,
+                        rollback,
+                    }
+                }
             };
             let txn = Txn::new().put(DESIRED, encode_desired(&next), current.cond());
             if self.store.txn(txn)?.is_ok() {

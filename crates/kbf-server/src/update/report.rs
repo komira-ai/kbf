@@ -43,6 +43,19 @@ pub enum ControllerError {
         /// This controller's epoch.
         epoch: u64,
     },
+    /// The desired release is not the release this controller's build is, and the row does not
+    /// say it is a rollback (R4): nothing was done, no host moved and no order was given
+    /// ([`super::Controller::held_by`]).
+    #[error(
+        "the desired release {commit} is not this build's ({own}) and the row is not a rollback: \
+         no host is driven"
+    )]
+    Foreign {
+        /// The desired release.
+        commit: String,
+        /// The commit this controller's build was made from.
+        own: String,
+    },
     /// The controller disagrees with itself. A bug, reported rather than guessed past.
     #[error("the controller broke its own rule: {0}")]
     Invariant(String),

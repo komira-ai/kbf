@@ -45,6 +45,13 @@
 //! past the activate order finishes the step it began. The new generation is carried out by
 //! hosts started after it, and walks the finished ones back.
 //!
+//! **The release it drives to** (R4, `docs/design/frontend-proxy.md` section 9). A controller
+//! held to a build ([`Controller::held_by`]) reads the desired row first and drives nothing
+//! for a row whose release is not the build's own unless the row says it is a rollback
+//! ([`OwnCommit::drives`]): the look ends with [`ControllerError::Foreign`] before any other
+//! read, so no host is moved, cordoned or ordered and no place is claimed. A downgrade is a
+//! rollback and is driven when the row says so.
+//!
 //! **Time.** `now` is stored in rows (`since`, `set_at`), so its origin must outlive
 //! the process: milliseconds on a clock that a restart does not reset, such as the wall
 //! clock. A clock that reads earlier than a stored time stops the controller
@@ -66,6 +73,7 @@ use super::command::{Alert, Command, SlotOp};
 use super::facts::{Facts, HostFacts, OrderId};
 use super::moves::{acts_on_the_farm, decide, next_row, split};
 use super::node_step::{HostPhase, Transition};
+use super::own::OwnCommit;
 use super::pick::{Pick, pick};
 use super::policy::Policy;
 use super::ports::{FactsSource, Transport, TransportError};
@@ -126,6 +134,8 @@ impl Pass {
 /// The controller of a rolling update.
 pub struct Controller {
     rows: Rows,
+    /// The build this controller is of (R4), if it is held to one: [`Controller::held_by`].
+    own: Option<OwnCommit>,
     epoch: u64,
     transport: Box<dyn Transport>,
     source: Box<dyn FactsSource>,
@@ -174,6 +184,7 @@ impl Controller {
     ) -> Self {
         Self {
             rows: Rows::new(store),
+            own: None,
             epoch,
             transport,
             source,
@@ -181,6 +192,23 @@ impl Controller {
             redo: BTreeSet::new(),
             told: BTreeMap::new(),
         }
+    }
+
+    /// This controller as the one of the build `own`: it drives no node, and gives no order
+    /// or cordon, for a desired row whose release is not that build's own unless the row says
+    /// it is a rollback (R4, [`OwnCommit`]). Every look then ends with
+    /// [`ControllerError::Foreign`] while the row stays so, and the rows are not touched.
+    ///
+    /// This is the old child after a frontend rollback: the new child wrote the next release
+    /// as its own, the proxy put the old one back in charge, and the old one must not drive
+    /// the nodes on to a release ahead of the frontend. A host the rows hold in a step stays
+    /// where it is until the row is one this controller may drive (the proxy rolls the
+    /// frontend back only before any node has moved). A controller that is not held to a
+    /// build (the default) drives for every row.
+    #[must_use]
+    pub fn held_by(mut self, own: OwnCommit) -> Self {
+        self.own = Some(own);
+        self
     }
 
     /// One look: reads the rows and the farm; gives again the orders of the rows a restart
@@ -246,6 +274,12 @@ impl Controller {
         let Some(desired) = self.rows.desired()?.value else {
             return Ok(None);
         };
+        if let Some(own) = self.own.as_ref().filter(|own| !own.drives(&desired)) {
+            return Err(ControllerError::Foreign {
+                commit: desired.commit.as_str().to_owned(),
+                own: own.as_str().to_owned(),
+            });
+        }
         let policy = self.rows.policy()?;
         policy.validate()?;
         // The slot before the rows: a place is claimed after its host's row is written, so a

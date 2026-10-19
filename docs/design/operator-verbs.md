@@ -87,7 +87,7 @@ All answer 404 when the feature is off.
 | upload a release file | `PUT /v1/releases/{commit}/{platform}/{name}` | [F] | write, no content-type gate |
 | list releases | `GET /v1/releases` | [F] | open |
 | read the desired release, releases, policy | `GET /v1/update` | [V] #976, #985 | open |
-| set the desired release (also a rollback: an older commit, a higher generation) | `POST /v1/update/desired` | [V] #976 | write |
+| set the desired release (also a rollback: an older commit, a higher generation, with `"rollback": true` for any commit but the frontend's own) | `POST /v1/update/desired` | [V] #976 | write |
 | preview what a commit would change | `GET /v1/update/plan` | [V] #985 (design) | open |
 | pause updates | `POST /v1/update/pause` | [V] #976 | write |
 | resume updates | `POST /v1/update/resume` | [V] #976 | write |

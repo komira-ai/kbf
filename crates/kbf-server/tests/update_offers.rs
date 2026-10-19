@@ -202,9 +202,11 @@ impl Frontend {
         assert_eq!(code, 201, "{path}");
     }
 
-    /// Offers `commit` as the desired release; its generation.
+    /// Offers `commit` as the desired release; its generation. As a rollback: the commits of
+    /// these tests are not the release this server is built from, which an offer without
+    /// the flag is refused for (`update_api.rs` holds the rule).
     async fn desire(&self, commit: &str) -> u64 {
-        let body = json!({ "commit": commit }).to_string();
+        let body = json!({ "commit": commit, "rollback": true }).to_string();
         let (code, desired) = http(
             self.api,
             "POST",

@@ -655,9 +655,11 @@ where
     let members = members_of(state.as_ref());
     let map = map_of(map, members.as_ref())?;
     // The update rows live in the same store, whose handle is shared.
-    let update_rows = state
-        .as_ref()
-        .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
+    // Held by this build: an offer of another release must say it is a rollback (R4).
+    let update_rows = state.as_ref().map(|s| {
+        crate::update::Rows::new(Arc::clone(&s.store))
+            .held_by(crate::update::OwnCommit::this_build())
+    });
     let update_store = state.as_ref().map(|s| Arc::clone(&s.store));
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.

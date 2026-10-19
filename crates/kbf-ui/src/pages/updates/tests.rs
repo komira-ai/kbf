@@ -635,3 +635,46 @@ fn a_darwin_os_name_is_a_darwin_host() {
         "{html}"
     );
 }
+
+/// Catches a page that sends an operator to a call the server refuses, and one that hides a
+/// rollback (R4, `docs/design/frontend-proxy.md` section 9: downgrades are allowed, and a
+/// downgrade is a rollback that the call states). Beside the command the page says that any
+/// commit other than the server's own (the one under Frontend, which the hint points at and
+/// does not repeat) needs `"rollback":true` and is `409` without it; the desired release is
+/// shown as a rollback when the row says so and as a plain release when it does not or when
+/// the server predates the field (the fixture has no `rollback` key). The page stays
+/// read-only.
+///
+/// Mutants seen red: the hint dropped; the rollback shown whatever the row says.
+#[test]
+fn a_commit_other_than_the_frontends_is_a_rollback_and_the_page_says_so() {
+    let (status, html) = page(&updates_farm());
+    assert_eq!(status, 200, "{html}");
+    for text in [
+        "Any commit other than the server&#39;s own (the Commit under Frontend above) is a rollback",
+        "&quot;rollback&quot;:true",
+        "refused with 409",
+    ] {
+        assert!(html.contains(text), "{text}: {html}");
+    }
+    assert!(
+        html.contains(&format!(
+            "<dt>Desired release</dt><dd>{COMMIT_B} (generation 7)</dd>"
+        )),
+        "a row with no rollback key is a plain release: {html}"
+    );
+
+    // A desired row that is a rollback is shown as one.
+    let mut update = update_doc();
+    update["desired"]["rollback"] = json!(true);
+    let (_, html) = page(&farm_with(&update));
+    assert!(
+        html.contains(&format!(
+            "<dt>Desired release</dt><dd>{COMMIT_B} (generation 7, a rollback)</dd>"
+        )),
+        "{html}"
+    );
+    update["desired"]["rollback"] = json!(false);
+    let (_, html) = page(&farm_with(&update));
+    assert!(!html.contains("a rollback)"), "{html}");
+}

@@ -10,6 +10,12 @@
 //! The controller blocks on the store, so each look is a blocking task. Its errors are logged
 //! once while they last.
 //!
+//! **The release it drives to.** The controller is held to this process's build ([`OwnCommit`]):
+//! it drives nodes to the desired release only if that is this build's own or the row says it
+//! is a rollback; for any other row every look ends with [`ControllerError::Foreign`], which
+//! is logged once while it lasts, and nothing is cordoned or ordered. That is the old child
+//! after a frontend rollback finding the next release desired.
+//!
 //! **Two ways the controller stops ordering.** While the farm is handed over (fenced, as a
 //! quiesce or a stand-down does: [`Handed::handed`]) no look is made: such a farm is the
 //! successor's, and a store handle that is not yet superseded would still let the
@@ -30,7 +36,7 @@ use tokio::task::AbortHandle;
 use kbf_types::FarmTime;
 
 use super::session::ports;
-use super::{Controller, ControllerError, RowError, Rows, Tick};
+use super::{Controller, ControllerError, OwnCommit, RowError, Rows, Tick};
 use crate::farm::Farm;
 
 /// Starts the controller over `store` on the current runtime; the returned handle stops it.
@@ -48,12 +54,14 @@ pub fn spawn(
 async fn run(farm: Arc<Farm>, store: Arc<dyn Store>, every: Duration) {
     let rows = Rows::new(Arc::clone(&store));
     let (transport, source) = ports(Arc::clone(&farm), rows.clone());
+    // R4: this process drives nodes to its own release, or to one the row calls a rollback.
     let mut controller = Controller::new(
         store,
         farm.lease_epoch(),
         Box::new(transport),
         Box::new(source),
-    );
+    )
+    .held_by(OwnCommit::this_build());
     let mut ticker = tokio::time::interval(every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut failing: Option<String> = None;

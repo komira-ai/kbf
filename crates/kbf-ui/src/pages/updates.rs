@@ -139,7 +139,10 @@ fn farm_block(h: &mut Html, update: &UpdateDoc, nodes: &[Node]) {
         h.el("p", &[], |h| pill(h, words, class));
         let desired = update.desired.as_ref().map_or_else(
             || "none offered yet".to_owned(),
-            |d| format!("{} (generation {})", d.commit, d.generation),
+            |d| {
+                let rollback = if d.rollback { ", a rollback" } else { "" };
+                format!("{} (generation {}{rollback})", d.commit, d.generation)
+            },
         );
         let set_at = update
             .desired
@@ -430,6 +433,14 @@ fn command(h: &mut Html, desired: Option<&Desired>) {
         h.text(
             "The call is refused with 409 if the generation has moved since this page was \
              read, so a second operator's change is not overwritten.",
+        );
+    });
+    // R4: downgrades are allowed, and a downgrade is a rollback that the call says.
+    h.el("p", &[attr("class", "hint")], |h| {
+        h.text(
+            "Any commit other than the server's own (the Commit under Frontend above) is a \
+             rollback, downgrades included: add \"rollback\":true to the body, or the call is \
+             refused with 409. The row then records the rollback.",
         );
     });
 }

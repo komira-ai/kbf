@@ -487,8 +487,10 @@ async fn hosts_are_paged_in_node_id_order() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_state_store_that_fails_is_a_500_on_the_detail_and_no_verdict_on_the_list() {
     let hooked = hooked::Hooked::new();
+    // A rollback, so that the controller of this build (which is not `A`) looks at the row as
+    // far as the barrier counts: any other release it would refuse after one read of the row.
     Rows::new(hooked.clone())
-        .offer(&Release::new(A), FarmTime::from_millis(1))
+        .offer_expecting(&Release::new(A), FarmTime::from_millis(1), None, true)
         .expect("offer");
     let looks = looks::Looks::count(&hooked);
     let running = start(farm_open(), Some(state_over(hooked.clone())));
@@ -527,8 +529,10 @@ async fn a_state_store_that_fails_is_a_500_on_the_detail_and_no_verdict_on_the_l
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_server_reads_the_rows_by_itself_only_at_start() {
     let hooked = hooked::Hooked::new();
+    // A rollback, so that the controller of this build (which is not `A`) looks at the row as
+    // far as the barrier counts: any other release it would refuse after one read of the row.
     Rows::new(hooked.clone())
-        .offer(&Release::new(A), FarmTime::from_millis(1))
+        .offer_expecting(&Release::new(A), FarmTime::from_millis(1), None, true)
         .expect("offer");
     let looks = looks::Looks::count(&hooked);
     let every_read = hooked.count("");

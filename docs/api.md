@@ -1182,21 +1182,33 @@ row of the state store. Without `--state-store` every answer is `503` naming it;
 (`pause` and `resume` need only the state store). A write that other writers kept racing
 for the whole of its retries is `503` with `Retry-After: 1`: send it again.
 
-- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
-  "paused": bool, "policy": null | {...}, "releases": <the body of GET /v1/releases>}`. `policy`
+- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms",
+  "rollback"}, "paused": bool, "policy": null | {...}, "releases": <the body of GET /v1/releases>}`. `policy`
   is the `update/policy` row when the operator wrote one (`paused`, `auto_nodes`,
   `auto_frontend`, `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`,
   `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without
   a row).
 - `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
-  `"expect_generation": N` (JSON content type, the write gates) offers the commit. With
-  `expect_generation` it is a compare-and-set: it writes only if the desired release is at
-  generation N (0 before any offer), else `409` naming both and nothing is written. `409` unless the release store holds some platform of it complete
-  (see above); `400` for a body that is not exactly that. The answer is the desired release.
-  The generation moves only when the commit differs from the desired one, so a repeated click is
-  not a new run; a rollback is the older commit offered the same way and gets a higher
-  generation. Generations increase, but may skip numbers: each write that loses a race has
-  already drawn a counter value.
+  `"expect_generation": N` and `"rollback": true` (JSON content type, the write gates) offers
+  the commit. With `expect_generation` it is a compare-and-set: it writes only if the desired
+  release is at generation N (0 before any offer), else `409` naming both and nothing is
+  written. `409` unless the release store holds some platform of it complete (see above); `400`
+  for a body that has other fields than these. The answer is the desired release, with its
+  `rollback`. The generation moves only when the commit differs from the desired one, so a
+  repeated click is not a new run.
+  **A downgrade is a rollback, and a rollback says so.** Downgrades are allowed: moving the farm
+  to an older release is this call with `"rollback": true`. Commits have no order, so the rule
+  does not ask which is older: the commit this server was built from (the `commit` of `server`
+  in `GET /v1/nodes`, 12 hex digits that begin the 40) is offered as it is and is written with
+  `rollback` false, and **any other commit is `409` unless the body has `"rollback": true`**, in
+  which case it is written with `rollback` true and a line is logged. A server whose build
+  commit is `unknown` (built with no git checkout) has no own release and needs `"rollback":
+  true` for every offer. A rollback gets a higher generation like any other change; a repeat of
+  the desired commit with the other `rollback` than the row records changes that field and keeps
+  the generation. The row is what the controller reads: it drives nodes to a release other than
+  the frontend's own only for a row that is a rollback (`docs/design/frontend-proxy.md` section
+  9, R4). Generations increase, but may skip numbers: each write that loses a race has already
+  drawn a counter value.
 - `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
   row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
   needed, and an offer leaves the flag as it is: while set, no host is started.
@@ -1211,7 +1223,8 @@ request is `404` with `"off": "farm"`. It carries what the open `GET /v1/nodes` 
 commits a host runs, staged and installed, and its refusal text.
 
 ```json
-{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000 },
+{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000,
+               "rollback": false },
   "paused": false,
   "hosts": [
     { "node_id": "linux-1", "connected": true, "availability": "ok", "state": "refused",

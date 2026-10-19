@@ -203,6 +203,10 @@ pub(crate) struct Desired {
     pub(crate) generation: u64,
     pub(crate) commit: String,
     pub(crate) set_at_ms: u64,
+    /// The offer said it is a rollback (a release other than the frontend's own). A server
+    /// that predates the field does not send it: false.
+    #[serde(default)]
+    pub(crate) rollback: bool,
 }
 
 /// The body of `GET /v1/releases`, as `GET /v1/update` embeds it.
