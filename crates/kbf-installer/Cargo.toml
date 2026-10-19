@@ -22,7 +22,9 @@ publish.workspace = true
 # socket and no network, and a staged binary is never run as root.
 # `deploy`'s CAS smoke is a small gRPC client of the local REAPI listener (kbf-proto, tonic, a
 # current-thread tokio runtime built for the one check); toml and x509-parser read the
-# frontend's own config for the listener's address and certificate name.
+# frontend's own config for the listener's address and certificate name. Its other calls (the
+# release store, the update API, the node and member lists) are HTTP/1.1 over rustls to the
+# same port.
 
 [features]
 # `testkit`: the scratch host and state helpers other crates' tests of the `host` verbs use.
@@ -47,6 +49,12 @@ kbf-state = { workspace = true, features = ["postgres"] }
 kbf-update.workspace = true
 libc.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
+# `deploy` speaks HTTP/1.1 over TLS to the frontend's public port (the proxy): the client
+# connection is rustls over a std socket, on the ring provider tonic's `tls-ring` already
+# builds, trusting the system's roots (rustls-native-certs, as tonic's `tls-native-roots`
+# reads them) and the farm's CA file.
+rustls.workspace = true
+rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

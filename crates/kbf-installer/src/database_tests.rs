@@ -5,11 +5,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kbf_state::postgres::schema::{self, Migration, SchemaError};
+use kbf_state::postgres::schema::{self, Migration, Outcome, SchemaError};
 use kbf_state::postgres::{PostgresConfig, PostgresStore};
 use kbf_state::{Cond, Store, Txn};
 
-use super::{Database, DatabaseError, SchemaStep};
+use super::{
+    Database, DatabaseError, SchemaOps, SchemaStep, apply_line, database_step, dry_run_line,
+};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -217,4 +219,116 @@ fn setup_plan_and_the_update_step_report_an_unreachable_server() {
     assert!(db.setup().is_err());
     assert!(db.plan().is_err());
     assert!(!db.before_start(1).unwrap_err().is_empty());
+}
+
+/// Catches the database step's three dry-run lines and its apply line going wrong: a fresh
+/// database would be created, an older one migrated, a current one left alone, and an apply
+/// says what the schema runner did (the lines need no server, so they are tested here).
+///
+/// Mutants to plant: the `v < newest` guard flipped (a behind schema says nothing to do).
+#[test]
+fn the_database_step_lines_say_create_migrate_or_nothing() {
+    assert_eq!(
+        dry_run_line("frontend", None, 3),
+        "kbf-installer setup (frontend): database step: dry run: would create the schema at version 3"
+    );
+    assert_eq!(
+        dry_run_line("frontend", Some(1), 3),
+        "kbf-installer setup (frontend): database step: dry run: would migrate the schema from 1 to 3"
+    );
+    assert_eq!(
+        dry_run_line("all-in-one", Some(3), 3),
+        "kbf-installer setup (all-in-one): database step: dry run: the schema is at 3, nothing to do"
+    );
+    let outcome = Outcome {
+        from: None,
+        to: 2,
+        ran: vec![1, 2],
+    };
+    assert_eq!(
+        apply_line("frontend", &outcome),
+        "kbf-installer setup (frontend): database step: created the schema at version 2"
+    );
+}
+
+/// A schema runner that answers as told, standing in for a server.
+struct FakeSchema {
+    setup: Result<Outcome, String>,
+    plan: Result<(Option<u32>, u32), String>,
+}
+
+impl SchemaOps for FakeSchema {
+    fn setup(&self) -> Result<Outcome, String> {
+        self.setup.clone()
+    }
+
+    fn plan(&self) -> Result<(Option<u32>, u32), String> {
+        self.plan.clone()
+    }
+}
+
+/// Catches the database step printing the wrong line once the schema runner answers, or
+/// swallowing its error: `--apply` prints the outcome, a dry run prints create, migrate or
+/// nothing to do, and a runner's error is the failure. The fake answers an error to
+/// the question the step must not ask, so asking it fails the test.
+///
+/// Mutants to plant: `apply` flipped; the error mapped to an empty line.
+#[test]
+fn the_database_step_prints_what_the_schema_runner_answered() {
+    let outcome = Outcome {
+        from: None,
+        to: 2,
+        ran: vec![1, 2],
+    };
+    let fake = |plan| FakeSchema {
+        setup: Ok(outcome.clone()),
+        plan,
+    };
+    assert_eq!(
+        database_step(&fake(Err("unused".into())), "frontend", true)
+            .unwrap_or_else(|f| panic!("applied: {f}")),
+        "kbf-installer setup (frontend): database step: created the schema at version 2"
+    );
+    for (found, tail) in [
+        (None, "would create the schema at version 3"),
+        (Some(1), "would migrate the schema from 1 to 3"),
+        (Some(3), "the schema is at 3, nothing to do"),
+    ] {
+        assert_eq!(
+            database_step(&fake(Ok((found, 3))), "all-in-one", false)
+                .unwrap_or_else(|f| panic!("planned: {f}")),
+            format!("kbf-installer setup (all-in-one): database step: dry run: {tail}")
+        );
+    }
+    let broken = FakeSchema {
+        setup: Err("no server".into()),
+        plan: Err("cannot ask".into()),
+    };
+    let apply = database_step(&broken, "frontend", true).expect_err("setup failed");
+    assert_eq!(apply, "no server");
+    let plan = database_step(&broken, "frontend", false).expect_err("plan failed");
+    assert_eq!(plan, "cannot ask");
+}
+
+/// Catches the real `Database` not being what `setup`'s database step asks (the fake-runner
+/// tests drive `database_step` alone): through `SchemaOps`, with a socket directory that does
+/// not exist (so no server is needed), both the plan and the setup reach the database and
+/// answer with its own reason, never the URL.
+///
+/// Mutants to plant: `Database::plan` or `Database::setup` swapped in `impl SchemaOps`.
+#[test]
+fn the_real_database_answers_the_schema_ops_with_its_own_error() {
+    let url = "postgres:///kbf?host=/nonexistent-kbf-test-socket";
+    let db = Database::new(
+        PostgresConfig::parse(url).expect("a url"),
+        schema::embedded(),
+    );
+    let planned = SchemaOps::plan(&db).expect_err("no server to ask");
+    let applied = SchemaOps::setup(&db).expect_err("no server to apply to");
+    for why in [planned, applied] {
+        assert!(
+            !why.is_empty() && !why.contains("nonexistent-kbf-test-socket"),
+            "{why}"
+        );
+    }
 }
