@@ -2,12 +2,15 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use hyper::{Request, Response};
+use tokio::sync::watch;
 
+use super::actor::{ActorTiming, Api, spawn};
 use super::auth::{Secret, TokenHasher, TokenSource};
 use super::core::{Config, Core, Crash, CrashHook, CrashPoint, Parts};
 use super::idempotency::Idempotency;
@@ -53,12 +56,76 @@ impl TokenHasher for CountingHasher {
     }
 }
 
+/// `status.json` as the value a test sets, behind a [`Stall`] door that a test can close to
+/// hold a reader inside `read`.
 #[derive(Clone)]
-pub struct FakeStatus(pub Arc<Mutex<Result<InstallerStatus, String>>>);
+pub struct FakeStatus(pub Arc<Mutex<Result<InstallerStatus, String>>>, Stall);
+
+impl FakeStatus {
+    pub fn stall(&self) -> &Stall {
+        &self.1
+    }
+}
 
 impl StatusReader for FakeStatus {
     fn read(&self) -> Result<InstallerStatus, StatusError> {
+        self.1.pass();
         self.0.lock().unwrap().clone().map_err(StatusError)
+    }
+}
+
+/// How long a read waits inside a closed [`Stall`] before it goes on anyway, so that a
+/// test that forgets to open it, or a mutant that blocks the test itself, ends.
+const STALL_CAP: Duration = Duration::from_secs(3);
+
+struct StallInner {
+    closed: Mutex<bool>,
+    opened: Condvar,
+    arrived: watch::Sender<usize>,
+}
+
+/// A door that readers of `status.json` pass. Open by default; while it is closed a
+/// reader waits inside it, so a test can hold the actor in the middle of a call.
+#[derive(Clone)]
+pub struct Stall(Arc<StallInner>);
+
+impl Default for Stall {
+    fn default() -> Stall {
+        Stall(Arc::new(StallInner {
+            closed: Mutex::new(false),
+            opened: Condvar::new(),
+            arrived: watch::channel(0).0,
+        }))
+    }
+}
+
+impl Stall {
+    pub fn close(&self) {
+        *self.0.closed.lock().unwrap() = true;
+    }
+
+    pub fn open(&self) {
+        *self.0.closed.lock().unwrap() = false;
+        self.0.opened.notify_all();
+    }
+
+    /// Waits, without blocking the runtime, until `n` reads have reached the door.
+    pub async fn arrived(&self, n: usize) {
+        let mut count = self.0.arrived.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), count.wait_for(|&c| c >= n))
+            .await
+            .expect("the reads did not arrive at the stall")
+            .unwrap();
+    }
+
+    fn pass(&self) {
+        self.0.arrived.send_modify(|c| *c += 1);
+        let closed = self.0.closed.lock().unwrap();
+        let _ = self
+            .0
+            .opened
+            .wait_timeout_while(closed, STALL_CAP, |closed| *closed)
+            .unwrap();
     }
 }
 
@@ -298,7 +365,7 @@ impl Rig {
         let dir = kbf_host::testkit::scratch(name);
         Rig {
             dir,
-            status: FakeStatus(Arc::new(Mutex::new(Ok(idle())))),
+            status: FakeStatus(Arc::new(Mutex::new(Ok(idle()))), Stall::default()),
             orders: FakeOrders::default(),
             sup: FakeSupervisor::default(),
             gate: FakeGate {
@@ -344,3 +411,8 @@ pub fn req(commit: &str, request_id: &str) -> super::model::UpdateRequest {
 }
 
 pub const COMMIT_C: &str = C;
+
+/// The actor over the rig's core, with the default timing and nothing to do at its death.
+pub fn api(rig: &Rig) -> Api {
+    spawn(rig.core(), ActorTiming::default(), || {}).unwrap()
+}
