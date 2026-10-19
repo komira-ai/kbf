@@ -6,16 +6,13 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use kbf_testkit::dir::TestDir;
+
 const ACT: &str = env!("CARGO_BIN_EXE_kbf-act");
 
 /// A fresh directory for one test, under Cargo's per-target temporary directory.
-fn dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("old dir");
-    }
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir
+fn dir(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 /// Links the program as `dir/<tool>` with `rules` beside it.
@@ -165,14 +162,14 @@ fn xcodebuild_found_through_path_reads_its_own_rules() {
     fake(&dir, "xcrun", "*\t-\texit 9\n");
     let out = Command::new("xcodebuild")
         .arg("-version")
-        .env("PATH", &dir)
+        .env("PATH", dir.path())
         .output()
         .expect("runs");
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert_eq!(text(&out.stdout), "Xcode 16\nBuild version 16C5032a\n");
     let out = Command::new("xcodebuild")
         .args(["-license", "check"])
-        .env("PATH", &dir)
+        .env("PATH", dir.path())
         .output()
         .expect("runs");
     assert_eq!(out.status.code(), Some(64), "{out:?}");
