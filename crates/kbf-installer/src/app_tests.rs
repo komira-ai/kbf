@@ -880,6 +880,72 @@ fn migrate_parses_its_flags_and_runs_through_the_dispatcher() {
     }
 }
 
+/// Catches the report of `migrate` going to the wrong stream or in the wrong shape: it is the
+/// result of the verb, so it is on standard output, as the text or, with `--json`, as the one
+/// object (`verb`, `apply`, `message`), whatever the lines it holds.
+///
+/// Mutants to plant: the report written to `err`; `apply` or `message` dropped from the object.
+#[test]
+fn the_migrate_report_is_on_standard_output_as_text_or_one_object() {
+    let mut out = Vec::new();
+    assert_eq!(
+        finish_migrate(false, true, "adopted 2 releases\nunits repointed", &mut out),
+        Exit::Ok
+    );
+    assert_eq!(
+        String::from_utf8(out).expect("text"),
+        "adopted 2 releases\nunits repointed\n"
+    );
+    let mut out = Vec::new();
+    assert_eq!(
+        finish_migrate(true, false, "adopted 2 releases\nunits repointed", &mut out),
+        Exit::Ok
+    );
+    let v: Value = serde_json::from_slice(&out).expect("one object");
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "verb": "migrate",
+            "apply": false,
+            "message": "adopted 2 releases\nunits repointed",
+        })
+    );
+}
+
+/// Catches a failed `migrate` (here: a probe user the host does not have) not being said the
+/// way every other verb's failure is: exit 2 for the usage error, the reason after the
+/// program's name on standard error, or with `--json` the object `error: failed` on standard
+/// output; nothing of a report.
+///
+/// Mutants to plant: the failure of the `Migrate` arm printed as a report (exit 0).
+#[test]
+fn a_migrate_that_fails_says_so_like_the_other_verbs() {
+    let root = kbf_host::testkit::scratch("app-migrate-fails");
+    let root = root.to_str().expect("text");
+    let user = "no-such-user-for-kbf-migrate";
+    let (exit, out, err) = run_as(1000, &["--root", root, "migrate", "--fetch-user", user]);
+    assert_eq!(exit, Exit::Usage, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.starts_with("kbf-installer: ") && err.contains(user),
+        "{err}"
+    );
+    let (exit, out, err) = run_as(
+        1000,
+        &["--json", "--root", root, "migrate", "--fetch-user", user],
+    );
+    assert_eq!((exit, err.as_str()), (Exit::Usage, ""));
+    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
+    assert_eq!(
+        (v["verb"].as_str(), v["error"].as_str()),
+        (Some("migrate"), Some("failed"))
+    );
+    assert!(
+        v["message"].as_str().is_some_and(|m| m.contains(user)),
+        "{v}"
+    );
+}
+
 /// Catches a host path joined to a root that is not absolute: `under` refuses it with the
 /// reason. The dispatcher's migration guard looks at the root first, so it is this test, not
 /// a verb's, that reaches the refusal.
