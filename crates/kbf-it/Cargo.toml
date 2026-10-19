@@ -55,6 +55,8 @@ kbf-installer.workspace = true
 kbf-proto.workspace = true
 kbf-proxy.workspace = true
 kbf-server.workspace = true
+kbf-state = { workspace = true, features = ["test-support"] }
+kbf-storage.workspace = true
 kbf-threads.workspace = true
 proc-macro2.workspace = true
 prost.workspace = true

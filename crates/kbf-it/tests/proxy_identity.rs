@@ -14,23 +14,32 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
+use kbf_proto::kbf::map::v1 as pb;
+use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_proxy::config::ProxyConfig;
 use kbf_proxy::control::NoUpdates;
 use kbf_proxy::slot::Slot;
 use kbf_proxy::{Proxy, ProxyHandle};
+use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
+use kbf_server::members_rpc::MembershipService;
 use kbf_server::proxy_auth::{ProxyAuthLayer, ProxySecret, Trust};
+use kbf_state::ManualClock;
+use kbf_state::Store;
+use kbf_state::fake::{Fake, Flaw};
+use kbf_storage::service::Admission;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType,
+    Issuer, KeyPair, KeyUsagePurpose, SanType, SigningKey,
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
 use tonic::codegen::{Service, http};
 use tonic::server::NamedService;
-use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server};
 
 /// The child: answers every call of the worker service with the gate's decision.
 #[derive(Clone)]
@@ -98,21 +107,79 @@ impl Pki {
     }
 
     fn leaf(&self, dns: &str, role: Option<&str>, usage: ExtendedKeyUsagePurpose) -> Leaf {
-        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
-        params.subject_alt_names = vec![SanType::DnsName(dns.try_into().expect("ia5"))];
-        if let Some(role) = role {
-            let uri = format!("urn:kbf:role:{role}");
-            params
-                .subject_alt_names
-                .push(SanType::URI(uri.try_into().expect("ia5")));
-        }
-        params.extended_key_usages = vec![usage];
-        let key = KeyPair::generate().expect("key");
-        let cert = params.signed_by(&key, &self.issuer).expect("sign");
-        Leaf {
-            cert: cert.pem(),
-            key: key.serialize_pem(),
-        }
+        leaf_under(&self.issuer, dns, role, usage, &[])
+    }
+
+    /// A client leaf that names `ips` besides its DNS name and role.
+    fn leaf_with_ips(&self, dns: &str, role: &str, ips: &[&str]) -> Leaf {
+        leaf_under(
+            &self.issuer,
+            dns,
+            Some(role),
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ips,
+        )
+    }
+
+    /// A client leaf signed by an intermediate CA that itself names `intermediate_ip`; the
+    /// chain the client presents is the leaf and then the intermediate.
+    fn leaf_via_intermediate(
+        &self,
+        dns: &str,
+        role: &str,
+        ips: &[&str],
+        intermediate_ip: &str,
+    ) -> Leaf {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "proxy identity test intermediate");
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params.subject_alt_names = vec![SanType::IpAddress(intermediate_ip.parse().expect("ip"))];
+        let intermediate =
+            CertifiedIssuer::signed_by(params, KeyPair::generate().expect("key"), &self.issuer)
+                .expect("intermediate certificate");
+        let mut leaf = leaf_under(
+            &intermediate,
+            dns,
+            Some(role),
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ips,
+        );
+        leaf.cert.push_str(&intermediate.pem());
+        leaf
+    }
+}
+
+fn leaf_under(
+    issuer: &Issuer<'_, impl SigningKey>,
+    dns: &str,
+    role: Option<&str>,
+    usage: ExtendedKeyUsagePurpose,
+    ips: &[&str],
+) -> Leaf {
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.subject_alt_names = vec![SanType::DnsName(dns.try_into().expect("ia5"))];
+    params.subject_alt_names.extend(
+        ips.iter()
+            .map(|ip| SanType::IpAddress(ip.parse().expect("an IP address"))),
+    );
+    if let Some(role) = role {
+        let uri = format!("urn:kbf:role:{role}");
+        params
+            .subject_alt_names
+            .push(SanType::URI(uri.try_into().expect("ia5")));
+    }
+    params.extended_key_usages = vec![usage];
+    let key = KeyPair::generate().expect("key");
+    let cert = params.signed_by(&key, issuer).expect("sign");
+    Leaf {
+        cert: cert.pem(),
+        key: key.serialize_pem(),
     }
 }
 
@@ -216,6 +283,41 @@ fn header(headers: &http::HeaderMap, name: &str) -> String {
         .map_or_else(String::new, |v| v.to_str().expect("text").to_owned())
 }
 
+/// A proxy in front of a bound child port: everything a test needs but the child itself.
+struct Rig {
+    pki: Arc<Pki>,
+    handle: ProxyHandle,
+    proxy: SocketAddr,
+    child: SocketAddr,
+    incoming: TcpIncoming,
+    secret: ProxySecret,
+}
+
+async fn rig(name: &str) -> Rig {
+    let dir = dir(name);
+    let pki = Arc::new(Pki::new());
+    let for_proxy = Arc::clone(&pki);
+    // The child's port is the worker listener of slot A: base + 1.
+    let incoming = TcpIncoming::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind");
+    let child = incoming.local_addr().expect("address");
+    let base = child.port() - 1;
+    // The proxy builds its own runtime, which must not be built or dropped inside this one.
+    let (handle, proxy, secret_file) =
+        tokio::task::spawn_blocking(move || start_proxy(&dir, &for_proxy, base))
+            .await
+            .expect("the proxy starts");
+    let secret = ProxySecret::from_file(&secret_file)
+        .expect("the child accepts the file the proxy wrote: 32 bytes, this user's, mode 0600");
+    Rig {
+        pki,
+        handle,
+        proxy,
+        child,
+        incoming,
+        secret,
+    }
+}
+
 /// The proxy's secret file is one the child's gate accepts, and a call through the proxy is
 /// `Proxied` with the verified certificate's node and role, whatever the client forged; the
 /// same headers sent straight to the child are not believed.
@@ -224,21 +326,14 @@ fn header(headers: &http::HeaderMap, name: &str) -> String {
 /// newline or mode 0644; identity taken from a client header.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn child_accepts_proxy_headers() {
-    let dir = dir("accepts");
-    let pki = Arc::new(Pki::new());
-    let for_proxy = Arc::clone(&pki);
-    // The child's port is the worker listener of slot A: base + 1.
-    let incoming = TcpIncoming::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind");
-    let child = incoming.local_addr().expect("address");
-    let base = child.port() - 1;
-    let started = dir.clone();
-    // The proxy builds its own runtime, which must not be built or dropped inside this one.
-    let (handle, proxy, secret_file) =
-        tokio::task::spawn_blocking(move || start_proxy(&started, &for_proxy, base))
-            .await
-            .expect("the proxy starts");
-    let secret = ProxySecret::from_file(&secret_file)
-        .expect("the child accepts the file the proxy wrote: 32 bytes, this user's, mode 0600");
+    let Rig {
+        pki,
+        handle,
+        proxy,
+        child,
+        incoming,
+        secret,
+    } = rig("accepts").await;
     let layer = ProxyAuthLayer::new(Some(Arc::new(secret)));
     tokio::spawn(
         Server::builder()
@@ -257,11 +352,13 @@ async fn child_accepts_proxy_headers() {
         ("x-kbf-role", "storage"),
         ("x-kbf-proxy-auth", "guess"),
         ("x-kbf-extra", "1"),
+        ("x-kbf-node-ips", "10.99.9.9"),
     ];
     let answer = call(tls(proxy, &pki, &daemon).await, &forged).await;
     assert_eq!(
         header(&answer, "x-trust"),
-        r#"Proxied(Identity { node_id: Some("node-5.farm"), role: Some(Daemon) })"#
+        r#"Proxied(Identity { node_id: Some("node-5.farm"), role: Some(Daemon), ips: [] })"#,
+        "a forged x-kbf-node-ips does not survive a certificate with no IP name"
     );
     assert_eq!(
         header(&answer, "x-left"),
@@ -286,7 +383,156 @@ async fn child_accepts_proxy_headers() {
     let answer = call(TcpStream::connect(child).await.expect("connect"), &admin).await;
     assert_eq!(
         header(&answer, "x-trust"),
-        "Proxied(Identity { node_id: None, role: None })"
+        "Proxied(Identity { node_id: None, role: None, ips: [] })"
     );
     handle.shutdown();
+}
+
+/// The IP names of the verified leaf reach the child as `x-kbf-node-ips`: all of them,
+/// sorted and compressed, whatever order the certificate lists them in and whatever the
+/// client forged, and only the leaf's: an intermediate CA's own IP name is not the caller's.
+///
+/// Mutants seen red: the proxy omits the header; the proxy does not strip an inbound copy
+/// (the DNS-only certificate in `child_accepts_proxy_headers`, and here a forged value
+/// beside a leaf's); the addresses taken from the intermediate (the chain's last
+/// certificate) instead of the leaf.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_proxy_forwards_the_leafs_ips_and_no_others() {
+    let Rig {
+        pki,
+        handle,
+        proxy,
+        incoming,
+        secret,
+        ..
+    } = rig("ips").await;
+    tokio::spawn(
+        Server::builder()
+            .layer(ProxyAuthLayer::new(Some(Arc::new(secret))))
+            .add_service(Seen)
+            .serve_with_incoming(incoming),
+    );
+    let forged = [("x-kbf-node-ips", "10.99.9.9")];
+
+    let storage = pki.leaf_with_ips(
+        "spoolr-node-01",
+        "storage",
+        &["10.77.0.10", "fd00:0:0:0:0:0:0:1", "10.77.0.1", "10.77.0.1"],
+    );
+    let answer = call(tls(proxy, &pki, &storage).await, &forged).await;
+    assert_eq!(
+        header(&answer, "x-trust"),
+        r#"Proxied(Identity { node_id: Some("spoolr-node-01"), role: Some(Storage), ips: [10.77.0.1, 10.77.0.10, fd00::1] })"#
+    );
+    assert_eq!(header(&answer, "x-left"), "0");
+
+    let via = pki.leaf_via_intermediate("spoolr-node-02", "storage", &["10.77.0.2"], "10.99.0.9");
+    let answer = call(tls(proxy, &pki, &via).await, &[]).await;
+    assert_eq!(
+        header(&answer, "x-trust"),
+        r#"Proxied(Identity { node_id: Some("spoolr-node-02"), role: Some(Storage), ips: [10.77.0.2] })"#,
+        "the intermediate's own address is not the caller's"
+    );
+
+    let none = pki.leaf_via_intermediate("spoolr-node-03", "storage", &[], "10.99.0.9");
+    let answer = call(tls(proxy, &pki, &none).await, &[]).await;
+    assert_eq!(
+        header(&answer, "x-trust"),
+        r#"Proxied(Identity { node_id: Some("spoolr-node-03"), role: Some(Storage), ips: [] })"#,
+        "a leaf with no IP name has none, whatever its issuer names"
+    );
+    handle.shutdown();
+}
+
+/// The farm's own case, end to end: a storage node whose certificate names its DNS name and
+/// the IP it advertises registers as `10.77.0.N:8983` through the real proxy and the real
+/// Membership service, and heartbeats; the node next door, whose certificate names another
+/// address, can neither register as the first node's address nor beat for its member.
+///
+/// Mutants seen red: the proxy omits the header; the child ignores it or drops it when it
+/// builds the proxied identity; the heartbeat check ignores the addresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_storage_node_registers_by_its_ip_through_the_proxy() {
+    let Rig {
+        pki,
+        handle,
+        proxy,
+        incoming,
+        secret,
+        ..
+    } = rig("register").await;
+    let clock = Arc::new(ManualClock::default());
+    let members = Arc::new(Members::new(
+        Arc::new(Fake::with_flaw(clock, Flaw::None)) as Arc<dyn Store>,
+        MembershipConfig {
+            ttl: Duration::from_secs(60),
+            dwell: Duration::from_secs(1),
+            replication: 2,
+        },
+    ));
+    tokio::spawn(
+        Server::builder()
+            .layer(ProxyAuthLayer::new(Some(Arc::new(secret))))
+            .add_service(MembershipService::new(members, Admission::Certified).server())
+            .serve_with_incoming(incoming),
+    );
+
+    let one = pki.leaf_with_ips("spoolr-node-01", "storage", &["10.77.0.1"]);
+    let two = pki.leaf_with_ips("spoolr-node-02", "storage", &["10.77.0.2"]);
+    let mut first = MembershipClient::new(channel(proxy, &pki, &one).await);
+    let mut second = MembershipClient::new(channel(proxy, &pki, &two).await);
+    let by_ip = |at: &str| pb::RegisterRequest {
+        role: pb::Role::Storage.into(),
+        instance_id: at.to_owned(),
+        addr: at.to_owned(),
+        weight: 1,
+        zone: "a".to_owned(),
+        protocol: PROTOCOL,
+        catching_up: false,
+    };
+    let member = first
+        .register(by_ip("10.77.0.1:8983"))
+        .await
+        .expect("the node registers by the IP its certificate names")
+        .into_inner();
+    let beat = |member: &pb::RegisterResponse| pb::HeartbeatRequest {
+        member_id: member.member_id,
+        boot: member.boot,
+        ..pb::HeartbeatRequest::default()
+    };
+    first
+        .heartbeat(beat(&member))
+        .await
+        .expect("and beats for its member");
+
+    let taken = second
+        .register(by_ip("10.77.0.1:8983"))
+        .await
+        .expect_err("another node's address");
+    assert_eq!(taken.code(), tonic::Code::PermissionDenied, "{taken}");
+    let stolen = second
+        .heartbeat(beat(&member))
+        .await
+        .expect_err("another node's member");
+    assert_eq!(stolen.code(), tonic::Code::PermissionDenied, "{stolen}");
+    second
+        .register(by_ip("10.77.0.2:8983"))
+        .await
+        .expect("each registers its own");
+    handle.shutdown();
+}
+
+/// A gRPC channel to the proxy that presents `identity` as its client certificate.
+async fn channel(proxy: SocketAddr, pki: &Pki, identity: &Leaf) -> Channel {
+    let tls = ClientTlsConfig::new()
+        .domain_name("localhost")
+        .ca_certificate(Certificate::from_pem(&pki.ca_pem))
+        .identity(Identity::from_pem(&identity.cert, &identity.key));
+    Endpoint::from_shared(format!("https://localhost:{}", proxy.port()))
+        .expect("an endpoint")
+        .tls_config(tls)
+        .expect("tls")
+        .connect()
+        .await
+        .expect("connect through the proxy")
 }

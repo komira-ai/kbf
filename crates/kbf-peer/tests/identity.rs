@@ -206,7 +206,7 @@ fn a_node_entry_names_a_certificate_by_any_of_its_dns_names() {
 /// that names the empty serial.
 #[test]
 fn a_proxied_identity_is_one_node_and_no_serial_or_key() {
-    let identity = kbf_peer::PeerIdentity::proxied("node-a");
+    let identity = kbf_peer::PeerIdentity::proxied("node-a", &[]);
     assert_eq!(identity.names().dns(), ["node-a"]);
     assert!(identity.names().covers("NODE-A"));
     assert!(!identity.names().covers("node-b"));
@@ -218,4 +218,88 @@ fn a_proxied_identity_is_one_node_and_no_serial_or_key() {
         DenyEntry::SpkiSha256("0".repeat(64)),
     ];
     assert_eq!(identity.denied_by(&by_key), None);
+}
+
+/// A proxied identity holds the node and exactly the addresses it was given: an IP host is
+/// covered by the same address and by no other, whatever the two have in common as text, and
+/// a DNS host by the node only.
+///
+/// Mutants seen red: the addresses dropped; a prefix, suffix or substring match; the mapped
+/// IPv6 form equated with IPv4.
+#[test]
+fn a_proxied_identity_covers_exactly_its_ips() {
+    let ips: Vec<IpAddr> = ["10.77.0.1", "fd00::1"]
+        .iter()
+        .map(|t| t.parse().expect("an address"))
+        .collect();
+    let identity = kbf_peer::PeerIdentity::proxied("node-a", &ips);
+    assert_eq!(identity.names().ips(), ips);
+    for covered in [
+        "10.77.0.1",
+        "fd00::1",
+        "FD00:0:0:0:0:0:0:1",
+        "node-a",
+        "NODE-A",
+    ] {
+        assert!(identity.names().covers(covered), "{covered}");
+    }
+    for refused in [
+        "10.77.0.10",
+        "10.77.0.",
+        "10.77.0",
+        "10.77.0.2",
+        "110.77.0.1",
+        "::ffff:10.77.0.1",
+        "fd00::",
+        "fd00::10",
+        "10.77.0.1x",
+        "node-b",
+        "",
+    ] {
+        assert!(!identity.names().covers(refused), "{refused:?}");
+    }
+    let wider: Vec<IpAddr> = vec!["10.77.0.10".parse().expect("an address")];
+    assert!(
+        !kbf_peer::PeerIdentity::proxied("node-a", &wider)
+            .names()
+            .covers("10.77.0.1")
+    );
+}
+
+/// The header codec both ends share: sorted canonical text, at most 16, and the reader takes
+/// only what the writer would have written.
+#[test]
+fn the_ips_header_round_trips_and_refuses_what_the_writer_never_writes() {
+    use kbf_peer::{IpsError, NODE_IPS_MAX, node_ips_value, parse_node_ips};
+    let parse = |t: &str| t.parse::<IpAddr>().expect("an address");
+    assert_eq!(node_ips_value(&[]), Ok(None));
+    let value = node_ips_value(&[
+        parse("fd00:0:0:0:0:0:0:1"),
+        parse("10.77.0.1"),
+        parse("10.77.0.1"),
+    ])
+    .expect("ok")
+    .expect("some");
+    assert_eq!(value, "10.77.0.1,fd00::1");
+    assert_eq!(
+        parse_node_ips(&value),
+        Ok(vec![parse("10.77.0.1"), parse("fd00::1")])
+    );
+    let many: Vec<IpAddr> = (1..=NODE_IPS_MAX + 1)
+        .map(|i| parse(&format!("10.0.0.{i}")))
+        .collect();
+    assert_eq!(
+        node_ips_value(&many),
+        Err(IpsError::TooMany(NODE_IPS_MAX + 1))
+    );
+    for bad in [
+        "",
+        "a",
+        "10.77.0.1,",
+        "10.77.0.1,10.77.0.1",
+        "FD00::1",
+        " 10.77.0.1",
+    ] {
+        assert_eq!(parse_node_ips(bad), Err(IpsError::Malformed), "{bad:?}");
+    }
 }

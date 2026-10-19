@@ -1870,6 +1870,8 @@ dependencies = [
  "kbf-proto",
  "kbf-proxy",
  "kbf-server",
+ "kbf-state",
+ "kbf-storage",
  "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",

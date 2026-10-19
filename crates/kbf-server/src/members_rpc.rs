@@ -112,10 +112,11 @@ impl MembershipService {
     }
 
     /// Admits a caller that presents `presented`: as [`Self::admit_leaf`] for a certificate;
-    /// for an identity a proxy forwarded, if its role is `storage` and it names a node, which
-    /// is then the one name it has: a registration or heartbeat whose instance id or address
-    /// has any other host, an IP address included, is refused PERMISSION_DENIED by the check
-    /// of [`covered`], as there is no certificate behind the proxy to cover it.
+    /// for an identity a proxy forwarded, if its role is `storage` and it names a node, whose
+    /// names are then that node and the IP addresses the proxy forwarded from the leaf: a
+    /// registration or heartbeat whose instance id or address has any other host (an IP
+    /// address the leaf does not hold included) is refused PERMISSION_DENIED by the check of
+    /// [`covered`].
     ///
     /// # Errors
     /// As [`Self::admit_leaf`]; and UNAUTHENTICATED for a proxied identity with no role or
@@ -128,7 +129,9 @@ impl MembershipService {
             return Ok(None);
         }
         match (identity.role, identity.node_id.as_deref()) {
-            (Some(PeerRole::Storage), Some(node)) => Ok(Some(PeerCert::proxied(node))),
+            (Some(PeerRole::Storage), Some(node)) => {
+                Ok(Some(PeerCert::proxied(node, &identity.ips)))
+            }
             (Some(PeerRole::Storage) | None, _) => Err(Status::unauthenticated(
                 "the proxy forwarded no node id and storage role",
             )),

@@ -340,6 +340,7 @@ mod tests {
         Identity {
             node_id: "n.farm".into(),
             role,
+            ips: Vec::new(),
         }
     }
 
