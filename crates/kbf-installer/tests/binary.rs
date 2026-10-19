@@ -400,13 +400,16 @@ fn a_service_whose_file_was_replaced_says_so_and_ends_when_the_new_one_cannot_st
     fs::create_dir_all(&dir).expect("dir");
     let me = dir.join("kbf-installer");
     fs::copy(BIN, &me).expect("a copy of the program");
-    let child = Command::new(&me)
+    let mut command = Command::new(&me);
+    command
         .arg("--root")
         .arg(&root)
         .args(["run", "--passes", "4", "--unit", "kbf.service"])
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("starts");
+        .stderr(Stdio::piped());
+    // Retried while the copy is busy: another test of this binary that starts a program
+    // while the copy is being written gives its child a copy of the write descriptor, and
+    // the exec of the file fails with "Text file busy" until that child has exec'd.
+    let child = kbf_testkit::spawn::spawn_retrying(&mut command).expect("starts");
     let status_file = root.join("var/lib/kbf-installer/status.json");
     for _ in 0..400 {
         if status_file.exists() {
