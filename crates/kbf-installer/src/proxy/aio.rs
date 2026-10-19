@@ -10,7 +10,7 @@
 //! Assumption (not in FP): after `quiesce` reports `Quiesced` the proxy sends SIGTERM;
 //! FP says only "the old process exits". Kept in [`Swap::stop_old`].
 
-use super::model::{Halt, Mode, Phase, Request, Retired, RoleState, Slot, Step};
+use super::model::{Halt, Mode, Phase, Request, Retired, RoleState, Slot, Start, Step};
 use super::swap::{Flow, Swap, go, go_end};
 
 impl Swap<'_> {
@@ -136,7 +136,7 @@ impl Swap<'_> {
                 return self.aio_fallback(Step::Migrate, e.to_string());
             }
             let first = self.now();
-            match self.ports.child.spawn(new, &self.plan.to) {
+            match self.ports.child.spawn(new, &self.plan.to, Start::Active) {
                 Ok(ident) => self.hold_candidate(ident)?,
                 Err(e) => return self.aio_fallback(Step::Start, format!("spawn: {e}")),
             }
@@ -156,7 +156,7 @@ impl Swap<'_> {
     fn aio_fallback(&mut self, step: Step, reason: String) -> Result<Flow, Halt> {
         let old = self.intent.old_slot;
         self.kill_candidate();
-        match self.ports.child.spawn(old, &self.plan.from) {
+        match self.ports.child.spawn(old, &self.plan.from, Start::Active) {
             Ok(ident) => {
                 self.intent.old_proc = Some(ident.clone());
                 self.old_alive = true;

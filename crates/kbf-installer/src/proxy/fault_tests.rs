@@ -845,7 +845,7 @@ fn the_fake_root_records_a_frontend_update_order() {
         .expect("the fake accepts it");
     assert_eq!(w.count("order frontend_update 7"), 1);
     // And a slot with no live child answers nothing, as the real admin port would not.
-    assert!(w.ports().admin.open_counts(Slot::B).is_err());
+    assert!(w.ports().admin.role(Slot::B).is_err());
 }
 
 #[test]
@@ -959,5 +959,22 @@ fn a_restart_that_finds_the_new_childs_pid_recycled_rolls_back_and_never_signals
     assert_eq!(w.count("order confirm"), 0);
     assert_eq!(w.count("terminate pid 101") + w.count("kill pid 101"), 0);
     assert!(w.alive(101), "pid 101 is someone else now");
+    assert_eq!(w.holders(), vec![Slot::A]);
+}
+
+/// Catches a restart that trusts an `active` view of the old child before the hold: its role
+/// view says `active` and the store says it is not the holder (another writer took the
+/// generation while the proxy was down), so it is resumed (the call re-takes the generation
+/// if the holder is gone), not left as the child that serves.
+#[test]
+fn a_restart_before_the_hold_resumes_an_old_child_that_is_active_but_not_the_holder() {
+    let (w, old) = World::with_old();
+    *w.crash_on_record.borrow_mut() = Some(Box::new(|i| i.phase == Phase::Ready));
+    run_to_crash(&w, plan(Mode::Frontend), Some(old));
+    w.st.borrow_mut().procs[0].holder = false;
+    let (end, _) = restart(&w);
+    assert_eq!(end, Ok(Phase::Failed), "{:#?}", w.log());
+    assert_eq!(failure(&w).0, Step::Restart);
+    assert_eq!(w.count("admin:resume A"), 1, "{:#?}", w.log());
     assert_eq!(w.holders(), vec![Slot::A]);
 }

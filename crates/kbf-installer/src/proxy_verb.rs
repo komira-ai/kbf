@@ -233,7 +233,11 @@ fn unblock_stop_signals() {
 /// proxy serves, so none is lost to the default action.
 fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
     #[cfg(target_os = "linux")]
-    let (state_dir, proxy_auth_file) = (config.state_dir.clone(), config.proxy_auth_file.clone());
+    let (state_dir, proxy_auth_file, upstream) = (
+        config.state_dir.clone(),
+        config.proxy_auth_file.clone(),
+        config.upstream,
+    );
     unblock_stop_signals();
     let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
     let runtime = handle.runtime();
@@ -258,7 +262,7 @@ fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
     }
     // A closed standard error (a journal that went away) must not stop the proxy from serving.
     #[cfg(target_os = "linux")]
-    let _supervised = supervise(&handle, &state_dir, &proxy_auth_file);
+    let _supervised = supervise(&handle, &state_dir, &proxy_auth_file, upstream);
     let _ = writeln!(std::io::stderr(), "kbf-installer: proxy serving");
     Ok(runner.run(NoUpdates)?)
 }
@@ -271,6 +275,7 @@ fn supervise(
     handle: &kbf_proxy::ProxyHandle,
     state_dir: &Path,
     proxy_auth_file: &Path,
+    upstream: kbf_proxy::config::UpstreamTable,
 ) -> crate::proxy::gate_real::ProxyGate {
     use crate::layout::Layout;
     use crate::proxy::child_real::ProcChild;
@@ -281,7 +286,7 @@ fn supervise(
     let child = ProcChild::new(
         layout,
         children_dir(state_dir),
-        frontend_argv(proxy_auth_file),
+        frontend_argv(proxy_auth_file, upstream),
     );
     let line = match adopt_children(&gate, &child, state_dir) {
         Startup::Adopted { active } => format!("adopted the frontend child in slot {active:?}"),

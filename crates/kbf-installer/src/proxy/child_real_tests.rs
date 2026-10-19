@@ -11,7 +11,10 @@ use crate::testkit::{A, B, c};
 #[test]
 fn a_spawned_child_runs_the_release_and_its_identity_is_recorded_before_spawn_returns() {
     let rig = rig("child-real-spawn");
-    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     assert_eq!(ident, ident_of(ident.pid).expect("live"));
     assert_eq!(
@@ -38,7 +41,10 @@ fn a_spawned_child_runs_the_release_and_its_identity_is_recorded_before_spawn_re
 #[test]
 fn terminate_is_sigterm_and_the_exit_is_reaped_and_clears_the_record() {
     let rig = rig("child-real-term");
-    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     rig.child.terminate(&ident).expect("signal");
     let mut code = None;
@@ -59,7 +65,11 @@ fn terminate_is_sigterm_and_the_exit_is_reaped_and_clears_the_record() {
 fn a_child_that_exits_reports_its_status() {
     let rig = rig("child-real-exit");
     rig.set(&["exit", "3"]);
-    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     let mut code = None;
     wait_for("the exit", || {
         code = rig.child.exited(&ident);
@@ -74,7 +84,10 @@ fn a_child_that_exits_reports_its_status() {
 #[test]
 fn a_live_child_is_adopted_after_a_restart_then_watched_and_terminated() {
     let rig = rig("child-real-adopt");
-    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     let after = rig.restarted();
     let recorded = after
@@ -98,7 +111,10 @@ fn a_live_child_is_adopted_after_a_restart_then_watched_and_terminated() {
 #[test]
 fn a_recycled_pid_is_never_adopted_or_signalled() {
     let rig = rig("child-real-recycled");
-    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     let after = rig.restarted();
     let wrong_start = ProcIdent {
@@ -143,7 +159,7 @@ fn a_recycled_pid_is_never_adopted_or_signalled() {
 #[test]
 fn kill_unserved_kills_the_candidate_alone_and_reaps_it() {
     let rig = rig("child-real-kill");
-    let old = rig.child.spawn(Slot::A, &c(A)).expect("old");
+    let old = rig.child.spawn(Slot::A, &c(A), Start::Active).expect("old");
     let _stop = Cleanup(&rig.child, vec![old.clone()]);
     // The candidate ignores SIGTERM, so only the SIGKILL ends it; it says when it does.
     let up = rig.layout_root.join("candidate-up");
@@ -159,7 +175,11 @@ fn kill_unserved_kills_the_candidate_alone_and_reaps_it() {
         "sleep",
         "600",
     ]);
-    let candidate = rig.child.spawn(Slot::B, &c(B)).expect("candidate");
+    let candidate = rig
+        .child
+        .spawn(Slot::B, &c(B), Start::Active)
+        .expect("candidate");
+    let _stop_candidate = Cleanup(&rig.child, vec![candidate.clone()]);
     wait_for("the candidate to ignore SIGTERM", || up.exists());
     rig.child.kill_unserved(&candidate).expect("kill");
     wait_for("the candidate to go", || !alive(candidate.pid));
@@ -181,14 +201,23 @@ fn kill_unserved_kills_the_candidate_alone_and_reaps_it() {
 #[test]
 fn a_slot_with_a_live_child_refuses_a_second_and_is_free_once_it_exited() {
     let rig = rig("child-real-occupied");
-    let first = rig.child.spawn(Slot::A, &c(A)).expect("first");
+    let first = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("first");
     let _stop = Cleanup(&rig.child, vec![first.clone()]);
-    let refused = rig.child.spawn(Slot::A, &c(B)).expect_err("occupied");
+    let refused = rig
+        .child
+        .spawn(Slot::A, &c(B), Start::Active)
+        .expect_err("occupied");
     assert!(refused.0.contains("live child already"), "{refused}");
     rig.child.terminate(&first).expect("signal");
     wait_for("exit", || !alive(first.pid));
     rig.set(&["sleep", "600"]);
-    let second = rig.child.spawn(Slot::A, &c(B)).expect("free again");
+    let second = rig
+        .child
+        .spawn(Slot::A, &c(B), Start::Active)
+        .expect("free again");
     assert_ne!(first.pid, second.pid);
     let _stop2 = Cleanup(&rig.child, vec![second]);
 }
@@ -199,7 +228,10 @@ fn a_slot_with_a_live_child_refuses_a_second_and_is_free_once_it_exited() {
 fn a_release_without_a_program_is_a_spawn_error_and_records_nothing() {
     let rig = rig("child-real-missing");
     let release = CommitId::new(&"c".repeat(40)).expect("a commit");
-    let e = rig.child.spawn(Slot::A, &release).expect_err("no program");
+    let e = rig
+        .child
+        .spawn(Slot::A, &release, Start::Active)
+        .expect_err("no program");
     assert!(e.0.contains("kbf-act"), "{e}");
     assert_eq!(rig.child.recorded(Slot::A), None);
 }
@@ -212,7 +244,10 @@ fn a_child_whose_record_cannot_be_written_is_killed_and_the_spawn_fails() {
     // The record directory is a file, so the record cannot be made.
     fs::write(&rig.dir, b"in the way").expect("block");
     rig.set(&["sleep", "31337"]);
-    let e = rig.child.spawn(Slot::A, &c(A)).expect_err("no record");
+    let e = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect_err("no record");
     assert!(e.0.contains("record the new child"), "{e}");
     let running = || {
         fs::read_dir("/proc")
@@ -232,7 +267,10 @@ fn a_child_whose_record_cannot_be_written_is_killed_and_the_spawn_fails() {
 #[test]
 fn a_child_leads_its_own_process_group_and_gets_no_activation_variables() {
     let rig = rig("child-real-group");
-    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     let stat = fs::read_to_string(format!("/proc/{}/stat", ident.pid)).expect("stat");
     // After the command name: state, parent, process group.
@@ -282,7 +320,10 @@ fn the_start_time_is_field_22_whatever_the_command_name_holds() {
 #[test]
 fn dropping_the_port_leaves_the_child_running_for_the_next_proxy_to_adopt() {
     let rig = rig("child-real-drop");
-    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
     let after = rig.restarted();
     let Rig { child, .. } = rig;
     drop(child);
@@ -369,13 +410,16 @@ fn an_identity_is_the_start_time_and_the_executable_of_that_entry() {
 #[test]
 fn a_slot_held_by_an_adopted_child_refuses_a_spawn_until_that_child_exits() {
     let rig = rig("child-real-adopted-slot");
-    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
     let after = rig.restarted();
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     let recorded = after.recorded(Slot::A).expect("record");
     after.adopt(Slot::A, &recorded.ident).expect("adopt");
     let refused = after
-        .spawn(Slot::A, &c(B))
+        .spawn(Slot::A, &c(B), Start::Active)
         .expect_err("held by the adopted child");
     assert!(refused.0.contains("live child already"), "{refused}");
     after.terminate(&ident).expect("signal");
@@ -383,7 +427,9 @@ fn a_slot_held_by_an_adopted_child_refuses_a_spawn_until_that_child_exits() {
         after.exited(&ident).is_some()
     });
     rig.set(&["sleep", "600"]);
-    let next = after.spawn(Slot::A, &c(B)).expect("free again");
+    let next = after
+        .spawn(Slot::A, &c(B), Start::Active)
+        .expect("free again");
     let _stop2 = Cleanup(&after, vec![next]);
 }
 
@@ -394,7 +440,9 @@ fn a_started_child_that_cannot_be_identified_is_killed_and_the_spawn_fails() {
     let rig = rig("child-real-noident");
     rig.set(&["sleep", "31338"]);
     let port = rig.restarted().with_identify(|_| Err("no pidfd".into()));
-    let e = port.spawn(Slot::A, &c(A)).expect_err("not identified");
+    let e = port
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect_err("not identified");
     assert!(
         e.0.contains("identify the new child") && e.0.contains("no pidfd"),
         "{e}"

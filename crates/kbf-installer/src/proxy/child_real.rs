@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::CommitId;
 use crate::layout::{Layout, RELEASE_BINARY};
 
-use super::model::{AdoptError, PortError, ProcIdent, Slot, verify_ident};
+use super::model::{AdoptError, PortError, ProcIdent, Slot, Start, verify_ident};
 use super::ports::Child;
 
 /// The exit code reported for a process that is gone but whose status this process cannot
@@ -53,8 +53,8 @@ pub struct Recorded {
     pub commit: CommitId,
 }
 
-/// The argument vector of a child in `slot`, after the program.
-pub type Argv = Box<dyn Fn(Slot) -> Vec<OsString> + Send + Sync>;
+/// The argument vector of a child in `slot` started as `start`, after the program.
+pub type Argv = Box<dyn Fn(Slot, Start) -> Vec<OsString> + Send + Sync>;
 
 struct Held {
     slot: Slot,
@@ -245,7 +245,7 @@ fn code_of(status: ExitStatus) -> i32 {
 }
 
 impl Child for ProcChild {
-    fn spawn(&self, slot: Slot, release: &CommitId) -> Result<ProcIdent, PortError> {
+    fn spawn(&self, slot: Slot, release: &CommitId, start: Start) -> Result<ProcIdent, PortError> {
         {
             let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
             held.retain(|_, h| {
@@ -261,7 +261,7 @@ impl Child for ProcChild {
         }
         let program = self.program(release);
         let mut command = Command::new(&program);
-        command.args((self.argv)(slot));
+        command.args((self.argv)(slot, start));
         detach(&mut command);
         let process = command
             .spawn()

@@ -67,5 +67,10 @@ kbf-update.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
 tracing-subscriber.workspace = true
 
+# The proxy's child command line is parsed by the `kbf` binary's own parser (Linux only: the
+# spawner is). kbf-cli does not depend on the installer.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+kbf-cli.workspace = true
+
 [lints]
 workspace = true

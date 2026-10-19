@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::child_real::ProcChild;
+use super::child_real::{ProcChild, ident_of};
 use super::model::ProcIdent;
 use super::ports::Child as _;
 use crate::testkit::{A, B, c, host_root_on};
@@ -43,7 +43,7 @@ pub(super) fn rig(name: &str) -> Rig {
     let child = ProcChild::new(
         layout,
         dir.clone(),
-        Box::new(move |_| {
+        Box::new(move |_, _| {
             seen.lock()
                 .expect("lock")
                 .iter()
@@ -68,11 +68,13 @@ impl Rig {
     /// A second `ProcChild` over the same host: the proxy after a restart.
     pub(super) fn restarted(&self) -> ProcChild {
         let layout = self.child.layout.clone();
-        ProcChild::new(layout, self.dir.clone(), Box::new(|_| Vec::new())).with_binary("kbf-act")
+        ProcChild::new(layout, self.dir.clone(), Box::new(|_, _| Vec::new())).with_binary("kbf-act")
     }
 }
 
-/// Kills (and reaps, for our own children) what a test started, whatever happens.
+/// Kills (and reaps, for our own children) what a test started, whatever happens, and, when
+/// the test did not panic, checks that none of it is left running: a stand-in child that
+/// outlives its test sleeps for ten minutes and blocks whatever waits on the test's output.
 pub(super) struct Cleanup<'a>(pub(super) &'a ProcChild, pub(super) Vec<ProcIdent>);
 
 impl Drop for Cleanup<'_> {
@@ -80,6 +82,21 @@ impl Drop for Cleanup<'_> {
         for ident in &self.1 {
             let _ = self.0.kill_unserved(ident);
         }
+        // The same process, not whatever took its pid since (a pid is also a thread id).
+        let left = |ids: &[ProcIdent]| {
+            ids.iter()
+                .filter(|i| ident_of(i.pid).is_ok_and(|now| now == **i))
+                .map(|i| i.pid)
+                .collect::<Vec<_>>()
+        };
+        // Up to 10 s for the killed processes to go; no branch, so no uncovered one.
+        (0..2000)
+            .take_while(|_| !left(&self.1).is_empty())
+            .for_each(|_| std::thread::sleep(Duration::from_millis(5)));
+        let orphans = left(&self.1);
+        // `&`, not `&&`: no short-circuit branch for the coverage ratchet to count.
+        let leaked = !orphans.is_empty() & !std::thread::panicking();
+        assert!(!leaked, "children left running by the test: {orphans:?}");
     }
 }
 

@@ -80,7 +80,13 @@ pub struct State {
     pub migrate_err: Option<String>,
     pub takeover: Takeover,
     pub quiesce_takes: Duration,
-    pub open_counts_err: bool,
+    /// The store's generation; a takeover raises it. `expect` must name it.
+    pub generation: u64,
+    /// How each child was started, in order.
+    pub starts: Vec<(Slot, Start)>,
+    /// A stood-down child's admin port is closed: `role` on it errors (the retire rule
+    /// reads it).
+    pub stood_down_silent: bool,
     pub desired_err: bool,
     pub resume_fails: Vec<Slot>,
     /// `role` on these slots errors although the process lives (it does not answer).
@@ -159,7 +165,9 @@ impl World {
                 migrate_err: None,
                 takeover: Takeover::Ok,
                 quiesce_takes: Duration::from_millis(200),
-                open_counts_err: false,
+                generation: 1,
+                starts: Vec::new(),
+                stood_down_silent: false,
                 desired_err: false,
                 resume_fails: Vec::new(),
                 role_fails: Vec::new(),
@@ -455,7 +463,7 @@ fn gone(slot: Slot) -> PortError {
 }
 
 impl Child for World {
-    fn spawn(&self, slot: Slot, release: &CommitId) -> Result<ProcIdent, PortError> {
+    fn spawn(&self, slot: Slot, release: &CommitId, start: Start) -> Result<ProcIdent, PortError> {
         let failing = {
             let mut st = self.st.borrow_mut();
             let n = st.spawn_counts.entry(slot).or_insert(0);
@@ -469,6 +477,15 @@ impl Child for World {
         }
         let script = self.st.borrow_mut().scripts.pop_front().unwrap_or_default();
         let ident = self.push(slot, release.clone(), script);
+        self.st.borrow_mut().starts.push((slot, start));
+        if start == Start::Active {
+            // Serves from its first moment: it takes the generation itself.
+            let mut st = self.st.borrow_mut();
+            st.generation += 1;
+            let p = st.procs.last_mut().expect("just pushed");
+            p.state = RoleState::Active;
+            p.holder = true;
+        }
         self.log_event(format!(
             "spawn {slot:?} {} pid {}",
             &release.as_str()[..4],
@@ -529,6 +546,53 @@ impl Child for World {
     }
 }
 
+/// The `admin_protocol` 1 view of `p` when the store is at `generation`: a holder took the
+/// current one; a child that has served and is not the holder took the one before it; a
+/// candidate took none.
+fn view_of(p: &Proc, generation: u64, now: Duration) -> RoleInfo {
+    let held_generation = if p.holder {
+        Some(generation)
+    } else if p.state == RoleState::Candidate {
+        None
+    } else {
+        Some(generation.saturating_sub(1))
+    };
+    RoleInfo {
+        state: p.state,
+        instance_id: format!("{:?}-{}", p.slot, p.commit.as_str().get(..4).unwrap_or("")),
+        admin_protocol: 1,
+        generation: Some(generation),
+        held_generation,
+        superseded: held_generation.is_some_and(|h| h != generation),
+        open_streams: p.executions.at(now),
+        open_sessions: p.queued.at(now),
+        reapi: None,
+        worker: None,
+        api: None,
+    }
+}
+
+impl World {
+    /// The view of `slot` now; the error of a port that does not answer.
+    fn view(&self, slot: Slot) -> Result<RoleInfo, PortError> {
+        let (generation, silent) = {
+            let st = self.st.borrow();
+            (st.generation, st.stood_down_silent)
+        };
+        self.with_slot(slot, |p, now| {
+            if silent && p.state == RoleState::StoodDown {
+                return Err(PortError("admin port closed".into()));
+            }
+            Ok(view_of(p, generation, now))
+        })
+        .ok_or_else(|| gone(slot))?
+    }
+}
+
+/// A quiesce takes `quiesce_takes` to finish. The real call blocks (up to 10 s) and answers
+/// `Quiesced`; the fake answers at once with the child still `Active` and turns it
+/// `Quiesced` only when that time has passed, so the swap's wait on `role` (it reads the
+/// held generation there, and an abort can still arrive) has something to wait for.
 impl ChildAdmin for World {
     fn role(&self, slot: Slot) -> Result<RoleInfo, PortError> {
         self.log_event(format!("admin:role {slot:?}"));
@@ -537,107 +601,118 @@ impl ChildAdmin for World {
         }
         let takes = self.st.borrow().quiesce_takes;
         self.with_slot(slot, |p, now| {
-            if p.state == RoleState::Quiescing && p.quiesce_at.is_some_and(|t| now >= t + takes) {
+            if let Some(t) = p.quiesce_at
+                && now >= t + takes
+            {
                 p.state = RoleState::Quiesced;
+                p.quiesce_at = None;
             }
             if p.active_at.is_some_and(|t| now >= t) {
                 p.state = RoleState::Active;
                 p.active_at = None;
             }
-            RoleInfo {
-                holder: p.holder,
-                state: p.state,
-            }
-        })
-        .ok_or_else(|| gone(slot))
+        });
+        self.view(slot)
     }
 
-    fn takeover(&self, slot: Slot, _limit: Duration) -> Result<(), PortError> {
-        self.log_event(format!("admin:takeover {slot:?}"));
+    fn takeover(&self, slot: Slot, expect: u64) -> Result<RoleInfo, PortError> {
+        self.log_event(format!("admin:takeover {slot:?} expect {expect}"));
         let mode = self.st.borrow().takeover;
         match mode {
             Takeover::Err => return Err(PortError("takeover refused".into())),
             Takeover::Slow(d) => self.advance(d),
-            Takeover::NoEffect => return Ok(()),
+            Takeover::NoEffect => return self.view(slot),
             Takeover::Ok => {}
         }
         self.refresh();
-        let mut st = self.st.borrow_mut();
-        for p in st.procs.iter_mut() {
-            if p.alive && p.slot != slot {
-                p.holder = false;
-            }
-        }
-        match st
-            .procs
-            .iter_mut()
-            .rev()
-            .find(|p| p.slot == slot && p.alive)
         {
-            Some(p) => {
-                p.holder = true;
-                p.state = RoleState::Active;
-                Ok(())
+            let mut st = self.st.borrow_mut();
+            if st.generation != expect {
+                let at = st.generation;
+                return Err(PortError(format!(
+                    "409: expect {expect}, the store is at {at}"
+                )));
             }
-            None => Err(gone(slot)),
+            let Some(at) = st.procs.iter().rposition(|p| p.slot == slot && p.alive) else {
+                return Err(gone(slot));
+            };
+            st.generation += 1;
+            for p in st.procs.iter_mut() {
+                if p.alive && p.slot != slot {
+                    p.holder = false;
+                }
+            }
+            let p = &mut st.procs[at];
+            p.holder = true;
+            p.state = RoleState::Active;
         }
+        self.view(slot)
     }
 
-    fn quiesce(&self, slot: Slot) -> Result<(), PortError> {
+    fn quiesce(&self, slot: Slot) -> Result<RoleInfo, PortError> {
         self.log_event(format!("admin:quiesce {slot:?}"));
-        self.with_slot(slot, |p, now| {
-            p.state = RoleState::Quiescing;
-            p.quiesce_at = Some(now);
-        })
-        .ok_or_else(|| gone(slot))
+        self.with_slot(slot, |p, now| p.quiesce_at = Some(now))
+            .ok_or_else(|| gone(slot))?;
+        self.view(slot)
     }
 
-    fn stand_down(&self, slot: Slot) -> Result<(), PortError> {
+    fn stand_down(&self, slot: Slot) -> Result<RoleInfo, PortError> {
         self.log_event(format!("admin:stand_down {slot:?}"));
         if self.st.borrow().stand_down_err {
             return Err(PortError("stand-down refused".into()));
         }
         self.with_slot(slot, |p, _| p.state = RoleState::StoodDown)
-            .ok_or_else(|| gone(slot))
+            .ok_or_else(|| gone(slot))?;
+        self.view(slot)
     }
 
-    fn resume(&self, slot: Slot) -> Result<(), PortError> {
+    fn resume(&self, slot: Slot) -> Result<RoleInfo, PortError> {
         self.log_event(format!("admin:resume {slot:?}"));
         if self.st.borrow().resume_fails.contains(&slot) {
             return Err(PortError("resume refused".into()));
         }
         self.refresh();
         let now = self.now.get();
-        let mut st = self.st.borrow_mut();
-        let lag = st.resume_lag;
-        // Re-take the generation only if the holder is dead or has stood down (agrees).
-        let blocked = st
-            .procs
-            .iter()
-            .any(|p| p.alive && p.slot != slot && p.holder && p.state != RoleState::StoodDown);
-        for p in st.procs.iter_mut() {
-            if p.alive && p.slot != slot && p.holder && !blocked {
-                p.holder = false;
-            }
-        }
-        match st
-            .procs
-            .iter_mut()
-            .rev()
-            .find(|p| p.slot == slot && p.alive)
         {
-            Some(p) => {
-                if lag.is_zero() {
-                    p.state = RoleState::Active;
-                } else {
-                    p.active_at = Some(now + lag);
+            let mut st = self.st.borrow_mut();
+            let lag = st.resume_lag;
+            // Re-take the generation only if the holder is dead or has stood down (agrees).
+            let blocked = st
+                .procs
+                .iter()
+                .any(|p| p.alive && p.slot != slot && p.holder && p.state != RoleState::StoodDown);
+            let retaking = !blocked
+                && st
+                    .procs
+                    .iter()
+                    .any(|p| p.alive && p.slot == slot && !p.holder);
+            for p in st.procs.iter_mut() {
+                if p.alive && p.slot != slot && p.holder && !blocked {
+                    p.holder = false;
                 }
-                p.quiesce_at = None;
-                p.holder = p.holder || !blocked;
-                Ok(())
             }
-            None => Err(gone(slot)),
+            if retaking {
+                st.generation += 1;
+            }
+            match st
+                .procs
+                .iter_mut()
+                .rev()
+                .find(|p| p.slot == slot && p.alive)
+            {
+                Some(p) => {
+                    if lag.is_zero() {
+                        p.state = RoleState::Active;
+                    } else {
+                        p.active_at = Some(now + lag);
+                    }
+                    p.quiesce_at = None;
+                    p.holder = p.holder || !blocked;
+                }
+                None => return Err(gone(slot)),
+            }
         }
+        self.view(slot)
     }
 
     fn ready(&self, slot: Slot) -> Result<Readiness, PortError> {
@@ -654,17 +729,6 @@ impl ChildAdmin for World {
             health: ok && gap != Some(1),
             capabilities: ok && gap != Some(2),
         })
-    }
-
-    fn open_counts(&self, slot: Slot) -> Result<OpenCounts, PortError> {
-        if self.st.borrow().open_counts_err {
-            return Err(PortError("admin port closed".into()));
-        }
-        self.with_slot(slot, |p, now| OpenCounts {
-            open_executions: p.executions.at(now),
-            queued_operations: p.queued.at(now),
-        })
-        .ok_or_else(|| gone(slot))
     }
 
     fn post_desired(&self, slot: Slot, commit: &CommitId) -> Result<(), PortError> {

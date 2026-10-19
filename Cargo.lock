@@ -1802,6 +1802,7 @@ dependencies = [
  "http",
  "httparse",
  "hyper",
+ "kbf-cli",
  "kbf-host",
  "kbf-installer",
  "kbf-proxy",

@@ -22,7 +22,7 @@ use kbf_proxy::slot::{HoldGuard, Retire, Slot as GateSlot};
 use super::model::{PortError, Retired, Slot};
 use super::ports::Gate;
 
-fn gate_slot(slot: Slot) -> GateSlot {
+pub(super) fn gate_slot(slot: Slot) -> GateSlot {
     match slot {
         Slot::A => GateSlot::A,
         Slot::B => GateSlot::B,

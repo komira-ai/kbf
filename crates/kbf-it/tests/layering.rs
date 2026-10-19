@@ -502,13 +502,16 @@ fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
 
 /// The files of `kbf-installer/src` that may name the proxy: the verb that hosts it, the
 /// settings file whose `[proxy]` table the verb reads, and the swap's real gate over the
-/// proxy's handle (`proxy/gate_real.rs`, with its tests). The rest of `proxy/` is written
-/// against traits and names no proxy type. Everything else, the root helper
+/// proxy's handle (`proxy/gate_real.rs`, with its tests), and the supervisor that starts the
+/// children on the ports of the proxy's upstream table (`proxy/supervisor.rs`, which also
+/// holds the real gate). The rest of `proxy/` is written against traits and names no proxy
+/// type. Everything else, the root helper
 /// (`helper/`, `run.rs`) first of all, runs as root and links a network stack it never runs
 /// if it names a proxy type.
 const MAY_NAME_THE_PROXY: &[&str] = &[
     "proxy/gate_real.rs",
     "proxy/gate_real_tests.rs",
+    "proxy/supervisor.rs",
     "proxy/supervisor_tests.rs",
     "proxy_verb.rs",
     "installer_toml.rs",

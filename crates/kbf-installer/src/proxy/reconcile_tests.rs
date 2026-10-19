@@ -575,3 +575,48 @@ fn a_confirm_that_never_landed_is_not_a_confirm_even_in_the_drain() {
     );
     assert_eq!(w.holders(), vec![Slot::A]);
 }
+
+/// Catches a cold start that takes the generation without naming it (or names a stale one):
+/// no child holds it, so the candidate's own view of the store is the only source, and the
+/// fake store (at 5, not 1) refuses any other number. The release is started waiting.
+#[test]
+fn a_cold_start_names_the_generation_the_candidate_reads_from_the_store() {
+    let w = draining();
+    w.kill_pid(100);
+    w.kill_pid(101);
+    w.st.borrow_mut().generation = 5;
+    w.st.borrow_mut().starts.clear();
+    w.proxy_restart();
+    let intent = w.last_intent();
+    let mut swap = Swap::adopt(
+        w.ports(),
+        Plan::resumed(&intent, Timing::frontend()),
+        intent,
+    );
+    assert_eq!(swap.run(), Ok(Phase::Done), "{:#?}", w.log());
+    assert_eq!(w.count("admin:takeover B expect 5"), 1, "{:#?}", w.log());
+    assert_eq!(w.holders(), vec![Slot::B]);
+    assert_eq!(w.st.borrow().starts, vec![(Slot::B, Start::Candidate)]);
+}
+
+/// Catches a cold start whose candidate cannot be read: the generation to name comes from
+/// its own view, so a view that fails ends the cold start with the reason instead of
+/// taking over with a guess. The update fails, and nothing took the generation.
+#[test]
+fn a_cold_start_whose_candidate_cannot_be_read_fails_without_a_takeover() {
+    let w = draining();
+    w.kill_pid(100);
+    w.kill_pid(101);
+    w.st.borrow_mut().role_fails.push(Slot::B);
+    w.proxy_restart();
+    let intent = w.last_intent();
+    let mut swap = Swap::adopt(
+        w.ports(),
+        Plan::resumed(&intent, Timing::frontend()),
+        intent,
+    );
+    let end = swap.run();
+    assert!(end.is_ok(), "{end:?}");
+    assert_eq!(since_restart(&w, "admin:takeover"), 0, "{:#?}", w.log());
+    assert!(w.holders().is_empty());
+}

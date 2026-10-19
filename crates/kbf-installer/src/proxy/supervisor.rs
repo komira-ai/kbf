@@ -15,8 +15,11 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::child_real::{Argv, ProcChild};
-use super::gate_real::ProxyGate;
-use super::model::Slot;
+use kbf_proxy::config::UpstreamTable;
+use kbf_proxy::route::Target;
+
+use super::gate_real::{ProxyGate, gate_slot};
+use super::model::{Slot, Start};
 use super::ports::Child as _;
 use super::record::FileRecorder;
 
@@ -34,23 +37,30 @@ pub fn children_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("children")
 }
 
-/// The command line of a frontend child after its program: its mode, its slot (listeners at
-/// the slot's offsets, `kbf-proxy`'s upstream table) and the proxy's secret file. The
-/// child's own configuration is its `kbf.toml`. The admin flags (`--admin-listen`,
-/// `--await-takeover`) belong to the child's admin port (U2) and are not given here.
-pub fn frontend_argv(proxy_auth_file: &Path) -> Argv {
+/// The command line of a frontend child after its program: its mode, the four loopback
+/// listeners at the slot's ports in `table` (`kbf-proxy`'s upstream table: REAPI, worker,
+/// operator and admin), the proxy's secret file, and `--await-takeover` for a candidate. The
+/// child's own configuration (stores, TLS) is its `kbf.toml`. Nothing here names an
+/// instance: `--instance` needs a handover socket, and the two slots do not hand over.
+pub fn frontend_argv(proxy_auth_file: &Path, table: UpstreamTable) -> Argv {
     let secret = proxy_auth_file.to_owned();
-    Box::new(move |slot| {
+    Box::new(move |slot, start| {
+        let slot = gate_slot(slot);
         let mut proxy_auth = OsString::from("--proxy-auth-file=");
         proxy_auth.push(&secret);
-        vec![
+        let listen = |flag: &str, port: u16| OsString::from(format!("--{flag}=127.0.0.1:{port}"));
+        let mut argv = vec![
             OsString::from("--mode=frontend"),
-            OsString::from(match slot {
-                Slot::A => "--instance=a",
-                Slot::B => "--instance=b",
-            }),
+            listen("listen", table.port(slot, Target::Reapi)),
+            listen("worker-listen", table.port(slot, Target::Worker)),
+            listen("api-listen", table.port(slot, Target::Operator)),
+            listen("admin-listen", table.admin_port(slot)),
             proxy_auth,
-        ]
+        ];
+        if start == Start::Candidate {
+            argv.push(OsString::from("--await-takeover"));
+        }
+        argv
     })
 }
 

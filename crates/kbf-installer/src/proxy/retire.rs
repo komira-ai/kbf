@@ -52,7 +52,7 @@ impl Swap<'_> {
     /// The child's own counts are zero and the slot is not the active one. The proxy's
     /// half, the permits, is the gate's `retire`: it is the commit, so it runs last.
     fn idle(&self, slot: Slot) -> bool {
-        slot != self.active && matches!(self.ports.admin.open_counts(slot), Ok(c) if c.idle())
+        slot != self.active && matches!(self.ports.admin.role(slot), Ok(r) if r.idle())
     }
 
     pub(super) fn mark_gone(&mut self, slot: Slot) {
@@ -112,7 +112,7 @@ impl Swap<'_> {
         while outcome.is_ok() {
             self.expire_held();
             let up = self.ports.admin.role(old);
-            if matches!(up, Ok(r) if r.holder && r.state == RoleState::Active) {
+            if matches!(up, Ok(r) if r.holder() && r.state == RoleState::Active) {
                 break;
             }
             if self.now().saturating_sub(t0) >= t.takeover {
@@ -135,7 +135,7 @@ impl Swap<'_> {
     pub(super) fn rollback_failed(&mut self, reason: String) -> Result<Flow, Halt> {
         let new = self.intent.new_slot;
         let serving =
-            matches!(self.role_of(new), Some(r) if r.state == RoleState::Active && r.holder);
+            matches!(self.role_of(new), Some(r) if r.state == RoleState::Active && r.holder());
         if self.new_alive
             && !serving
             && let Err(e) = self.ports.admin.resume(new)

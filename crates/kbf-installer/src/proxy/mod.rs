@@ -15,19 +15,31 @@
 //! - [`runtime::SystemClock`] and [`runtime::RequestQueue`], the `Clock` and the `Requests`;
 //! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left.
 //!
-//! Still fakes, stated: `ChildAdmin` (the child's admin port is U2, `proxy/u2b-admin`,
-//! not merged), `Migrator` (who migrates is open), `RootOrders` (the orders spool and
-//! `status.json` reader belong to the update API's unit, U8b). Until `ChildAdmin` exists
-//! the proxy verb cannot run a swap or resume one, so [`supervisor::adopt_children`] adopts
-//! a child only when no update is in flight.
-//! [`child_http`] is the blocking loopback client the future real `ChildAdmin`
-//! adapter and the fleet read will call a child's ports with (U8b); nothing calls it yet.
+//! Still fakes, stated: `ChildAdmin` (the child's admin port, `admin_protocol` 1, is on
+//! feature; the adapter that calls it is not written: it would send the proxy secret header
+//! on every call, over [`child_http`], the blocking loopback client that the fleet read will
+//! use too, and nothing calls that yet), `Migrator` (who migrates is open), `RootOrders`
+//! (the orders spool and `status.json` reader belong to the update API's unit, U8b). Until
+//! `ChildAdmin` has an adapter the proxy verb cannot run a swap or resume one, start a first
+//! child or choose between two live ones, so [`supervisor::adopt_children`] adopts a child
+//! only when no update is in flight.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
 //!   [`ports::ChildAdmin::resume`].
-//! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); open
-//!   executions and queued operations from the child ([`ports::ChildAdmin::open_counts`]).
+//! - **Takeover and quiesce** (`admin_protocol` 1). `takeover` names the generation the
+//!   old child holds, read from its quiesced `role` view (`held_generation`); with no live
+//!   holder (a cold start) the candidate's own `generation` is named. `quiesce` is
+//!   synchronous in the protocol, yet the swap still reads `role` until `Quiesced`: that read
+//!   gives the generation, bounds a child that answered before it flushed, and is where an
+//!   abort is noticed. From the phase `quiescing` on an `active` view is not taken as proof
+//!   that the child serves, so a failed switch resumes it ([`swap::Swap::resume_old`]).
+//! - **Start.** A frontend host starts the new child as a candidate (`--await-takeover`,
+//!   [`model::Start`]); an all-in-one host starts the new process, and the old release put
+//!   back after a failed start, to serve at once, because no takeover is ever sent there.
+//! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); the child's
+//!   own Execute/WaitExecution streams and worker streams from its `role` view
+//!   ([`model::RoleInfo::idle`]).
 //! - **Migration** (open): who runs the forward Postgres migration, and with which
 //!   credential, is undecided; the swap only calls [`ports::Migrator::migrate_forward`]
 //!   before the candidate starts. For an all-in-one host it runs after the old process
@@ -35,7 +47,10 @@
 //! - **update.json** keeps the recorded process identity of both children
 //!   ([`model::Intent::old_proc`], `new_proc`), which FP section 4 does not list: adoption
 //!   needs pid, start time and executable. A candidate spawned and not yet recorded when
-//!   the proxy dies is not found again (U7b should write a pid file at spawn).
+//!   the proxy dies is found again only by the start-up adoption: `spawn` writes
+//!   `<slot>.json` (pid, start time, executable, commit) before it returns
+//!   ([`child_real::ProcChild::recorded`]), and [`supervisor::adopt_children`] reads it;
+//!   [`Swap::adopt`] reads `update.json` alone.
 //! - **confirm** is sent once the bake passes and is idempotent at the root half, because
 //!   a restart between the confirm and the `nodes` record sends it again.
 //! - **abort** ends an update as `failed` with step `abort`, not `rolled_back`; so does an
@@ -55,8 +70,8 @@
 //! - **All-in-one stop**: after `quiesce`, the proxy sends SIGTERM to the old process
 //!   ([`aio`]).
 //! - A dead new child during the bake (the proxy running) leaves the update parked in
-//!   `baking` (red) until the operator rolls back; the proxy-supervised respawn with an
-//!   epoch bump is U7b.
+//!   `baking` (red) until the operator rolls back; nothing respawns a dead bake child in
+//!   this code, and nothing but a proxy restart looks at a child that died outside an update.
 //! - **Restart reconcile** ([`recover`]): retire never signals the recorded-active slot,
 //!   so a restart past the switch first checks that slot. If the new child is dead (or
 //!   not ours any more: a recycled pid) or does not hold the generation while the old
@@ -70,10 +85,10 @@
 
 mod aio;
 pub mod api;
+pub mod child_http;
 #[cfg(target_os = "linux")]
 pub mod child_real;
 pub mod gate_real;
-pub mod child_http;
 pub mod model;
 pub mod ports;
 pub mod record;
@@ -86,10 +101,10 @@ mod swap;
 
 #[cfg(test)]
 mod aio_tests;
-#[cfg(all(test, target_os = "linux"))]
-mod child_rig;
 #[cfg(test)]
 mod child_http_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod child_rig;
 #[cfg(test)]
 mod confirm_boundary_tests;
 #[cfg(test)]

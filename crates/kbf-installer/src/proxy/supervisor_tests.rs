@@ -3,7 +3,7 @@
 use std::net::TcpListener;
 use std::os::fd::OwnedFd;
 
-use kbf_proxy::config::ProxyConfig;
+use kbf_proxy::config::{ProxyConfig, UpstreamTable};
 use kbf_proxy::slot::Bind;
 use kbf_proxy::{Proxy, ProxyRunner};
 
@@ -46,7 +46,10 @@ fn bound_slot(gate: &ProxyGate) -> Option<kbf_proxy::slot::Slot> {
 #[test]
 fn a_live_recorded_child_is_adopted_and_the_startup_hold_ends_into_its_slot() {
     let rig = rig("supervisor-adopt");
-    let ident = rig.child.spawn(Slot::B, &c(B)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::B, &c(B), Start::Active)
+        .expect("spawn");
     let after = rig.restarted();
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     let (gate, _runner) = gate();
@@ -67,7 +70,11 @@ fn a_live_recorded_child_is_adopted_and_the_startup_hold_ends_into_its_slot() {
 #[test]
 fn a_recorded_child_that_is_gone_is_not_adopted_and_the_hold_stays() {
     let rig = rig("supervisor-gone");
-    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     rig.child.terminate(&ident).expect("signal");
     wait_for("exit", || !alive(ident.pid));
     let after = rig.restarted();
@@ -88,7 +95,10 @@ fn a_recorded_child_that_is_gone_is_not_adopted_and_the_hold_stays() {
 #[test]
 fn an_update_in_flight_or_a_corrupt_record_leaves_the_hold_with_a_live_child() {
     let rig = rig("supervisor-inflight");
-    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     let after = rig.restarted();
     let state = state_dir(&rig);
@@ -127,8 +137,8 @@ fn an_update_in_flight_or_a_corrupt_record_leaves_the_hold_with_a_live_child() {
 #[test]
 fn two_live_children_with_no_update_leave_the_hold() {
     let rig = rig("supervisor-two");
-    let a = rig.child.spawn(Slot::A, &c(A)).expect("a");
-    let b = rig.child.spawn(Slot::B, &c(B)).expect("b");
+    let a = rig.child.spawn(Slot::A, &c(A), Start::Active).expect("a");
+    let b = rig.child.spawn(Slot::B, &c(B), Start::Active).expect("b");
     let _stop = Cleanup(&rig.child, vec![a, b]);
     let after = rig.restarted();
     let (gate, _runner) = gate();
@@ -139,26 +149,42 @@ fn two_live_children_with_no_update_leave_the_hold() {
     assert_eq!(gate.active(), None);
 }
 
-/// Catches a child command line that drifts from what the proxy's table promises: the
-/// slot's instance, the mode and the secret file, by flag.
+/// The command line of each slot and start, word for word, at base port 18000: the slot's
+/// four loopback ports (the proxy's table: REAPI, worker, operator, admin), no `--instance`,
+/// and `--await-takeover` on a candidate only. (`tests/proxy_child_argv.rs` parses these
+/// same words with the `kbf` binary's own parser.)
 #[test]
-fn a_frontend_is_started_with_its_mode_slot_and_the_proxys_secret_file() {
-    let argv = frontend_argv(Path::new("/run/kbf-proxy/proxy-auth"));
-    let words = |slot| -> Vec<String> {
-        argv(slot)
+fn a_frontend_is_started_on_its_slots_ports_and_a_candidate_awaits_the_takeover() {
+    let table = UpstreamTable { base_port: 18_000 };
+    let argv = frontend_argv(Path::new("/run/kbf-proxy/proxy-auth"), table);
+    let words = |slot, start| -> Vec<String> {
+        argv(slot, start)
             .into_iter()
             .map(|w| w.to_string_lossy().into_owned())
             .collect()
     };
+    let expect = |base: u16, extra: &[&str]| -> Vec<String> {
+        let mut want = vec![
+            "--mode=frontend".to_owned(),
+            format!("--listen=127.0.0.1:{base}"),
+            format!("--worker-listen=127.0.0.1:{}", base + 1),
+            format!("--api-listen=127.0.0.1:{}", base + 2),
+            format!("--admin-listen=127.0.0.1:{}", base + 3),
+            "--proxy-auth-file=/run/kbf-proxy/proxy-auth".to_owned(),
+        ];
+        want.extend(extra.iter().map(|w| (*w).to_owned()));
+        want
+    };
+    assert_eq!(words(Slot::A, Start::Active), expect(18_000, &[]));
     assert_eq!(
-        words(Slot::A),
-        [
-            "--mode=frontend",
-            "--instance=a",
-            "--proxy-auth-file=/run/kbf-proxy/proxy-auth"
-        ]
+        words(Slot::A, Start::Candidate),
+        expect(18_000, &["--await-takeover"])
     );
-    assert_eq!(words(Slot::B)[1], "--instance=b");
+    assert_eq!(words(Slot::B, Start::Active), expect(18_010, &[]));
+    assert_eq!(
+        words(Slot::B, Start::Candidate),
+        expect(18_010, &["--await-takeover"])
+    );
     assert_eq!(
         children_dir(Path::new("/var/lib/kbf-proxy")),
         PathBuf::from("/var/lib/kbf-proxy/children")
@@ -170,7 +196,10 @@ fn a_frontend_is_started_with_its_mode_slot_and_the_proxys_secret_file() {
 #[test]
 fn an_adoption_the_gate_refuses_is_reported_as_held() {
     let rig = rig("supervisor-refused");
-    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
     let _stop = Cleanup(&rig.child, vec![ident]);
     let after = rig.restarted();
     let (gate, _runner) = gate();

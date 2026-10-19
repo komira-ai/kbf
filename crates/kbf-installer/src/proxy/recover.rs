@@ -7,7 +7,7 @@
 //! A recorded process that is gone or whose pid now belongs to another process is not
 //! ours: nothing signals it.
 
-use super::model::{Failure, Halt, Intent, Phase, Plan, Slot, Step};
+use super::model::{Failure, Halt, Intent, Phase, Plan, PortError, Slot, Start, Step};
 use super::ports::Ports;
 use super::swap::{Flow, Swap};
 use crate::CommitId;
@@ -33,7 +33,7 @@ impl<'a> Swap<'a> {
     /// old child is active again and the update fails.
     pub(super) fn recover_pre_switch(&mut self) -> Result<Flow, Halt> {
         let new = self.intent.new_slot;
-        if matches!(self.role_of(new), Some(r) if r.holder) {
+        if matches!(self.role_of(new), Some(r) if r.holder()) {
             return self.complete_switch();
         }
         if !self.old_alive && !self.new_alive {
@@ -68,7 +68,7 @@ impl<'a> Swap<'a> {
             return self.recover_rollback();
         }
         let role = self.role_of(new);
-        if matches!(role, Some(r) if r.holder) {
+        if matches!(&role, Some(r) if r.holder()) {
             return self.complete_switch();
         }
         // The rollback landed and its drain was running: the drain goes on.
@@ -199,7 +199,7 @@ impl<'a> Swap<'a> {
     /// it did not come up.
     fn cold_start(&mut self, slot: Slot, release: &CommitId) -> Result<Result<(), String>, Halt> {
         let t = self.plan.timing;
-        let ident = match self.ports.child.spawn(slot, release) {
+        let ident = match self.ports.child.spawn(slot, release, Start::Candidate) {
             Ok(i) => i,
             Err(e) => return Ok(Err(format!("spawn: {e}"))),
         };
@@ -230,8 +230,18 @@ impl<'a> Swap<'a> {
 
     /// Make `slot`, the only live child, take the generation and serve.
     fn cold_takeover(&mut self, slot: Slot) -> Result<Result<(), String>, Halt> {
-        let t = self.plan.timing;
-        if let Err(e) = self.ports.admin.takeover(slot, t.takeover) {
+        // No child holds the generation here, so the candidate's own view names it.
+        let unreadable = PortError("the child cannot read the store's generation".into());
+        let expect = match self
+            .ports
+            .admin
+            .role(slot)
+            .and_then(|r| r.generation.ok_or(unreadable))
+        {
+            Ok(generation) => generation,
+            Err(e) => return Ok(Err(format!("takeover: {e}"))),
+        };
+        if let Err(e) = self.ports.admin.takeover(slot, expect) {
             return Ok(Err(format!("takeover: {e}")));
         }
         self.release_held(slot)?;
@@ -246,7 +256,7 @@ impl<'a> Swap<'a> {
     pub(super) fn recover_rollback(&mut self) -> Result<Flow, Halt> {
         let t = self.plan.timing;
         let new = self.intent.new_slot;
-        if matches!(self.role_of(new), Some(r) if r.holder) {
+        if matches!(self.role_of(new), Some(r) if r.holder()) {
             return self.rollback_failed("the proxy restarted before the rollback landed".into());
         }
         if !self.old_alive {

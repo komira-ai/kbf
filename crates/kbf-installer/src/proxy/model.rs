@@ -1,6 +1,7 @@
 //! The values the swap orchestrator reads and writes: slots, phases, what a child reports
 //! about itself, the plan of one update and the intent record kept in `update.json`.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -150,22 +151,68 @@ impl Retired {
     }
 }
 
-/// What a child says about itself on `GET role`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The role a child reports on `GET /v1/admin/role` (`admin_protocol` 1). There is no
+/// `Quiescing`: `POST quiesce` answers once the child is quiesced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RoleState {
     /// Started with `--await-takeover`: serves nothing, holds nothing.
     Candidate,
     Active,
-    Quiescing,
     Quiesced,
     StoodDown,
 }
 
+/// How a child is started: the one that serves from its first moment (all-in-one hosts, a
+/// release put back), or a candidate that waits for `POST takeover` (`--await-takeover`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    Active,
+    Candidate,
+}
+
+/// The view every admin call answers with (`GET role`, and the 200 of each `POST`): the
+/// `admin_protocol` 1 object, field for field.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct RoleInfo {
-    /// This child holds the store's generation. The store wins every disagreement.
-    pub holder: bool,
+    #[serde(rename = "role")]
     pub state: RoleState,
+    pub instance_id: String,
+    pub admin_protocol: u32,
+    /// The generation the store is at now, if the child can read it: what a takeover's
+    /// `expect` names when no child holds it.
+    pub generation: Option<u64>,
+    /// The generation this child took; none for a candidate.
+    pub held_generation: Option<u64>,
+    /// The store refused a write of this child because another writer holds the generation.
+    pub superseded: bool,
+    /// Execute and WaitExecution streams open.
+    pub open_streams: u64,
+    /// Worker streams open.
+    pub open_sessions: u64,
+    pub reapi: Option<SocketAddr>,
+    pub worker: Option<SocketAddr>,
+    pub api: Option<SocketAddr>,
+}
+
+impl RoleInfo {
+    /// This child holds the store's generation: it took the one the store is at, and
+    /// nothing has superseded it. The store wins every disagreement.
+    pub fn holder(&self) -> bool {
+        self.held_generation.is_some()
+            && self.held_generation == self.generation
+            && !self.superseded
+    }
+
+    /// The child serves: `active`, holding the store's generation.
+    pub fn serving(&self) -> bool {
+        self.state == RoleState::Active && self.holder()
+    }
+
+    /// No Execute or WaitExecution stream and no worker stream is open.
+    pub fn idle(&self) -> bool {
+        self.open_streams == 0 && self.open_sessions == 0
+    }
 }
 
 /// Readiness of a candidate: `/readyz`, a `grpc.health.v1` check and one synthetic
@@ -188,12 +235,6 @@ impl Readiness {
 pub struct OpenCounts {
     pub open_executions: u64,
     pub queued_operations: u64,
-}
-
-impl OpenCounts {
-    pub fn idle(self) -> bool {
-        self.open_executions == 0 && self.queued_operations == 0
-    }
 }
 
 /// The facts the root half publishes under `staged{}` in `status.json` after it fetched,
