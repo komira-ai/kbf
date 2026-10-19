@@ -46,9 +46,9 @@ async fn ask(core: &Core, authorization: Option<HeaderValue>) -> Option<Vec<u8>>
         .target(permit.slot(), permit.generation(), Target::Operator);
     let (_reservation, mut send) = crate::pool::TargetPool::acquire(&pool).await.ok()?;
     let mut headers = HeaderMap::new();
-    if let Some(value) = authorization {
-        headers.insert(AUTHORIZATION, value);
-    }
+    // The edge refuses a /metrics call without the operator token, so a header is always
+    // present here; `extend` forwards it verbatim without a branch for an absent one.
+    headers.extend(authorization.map(|value| (AUTHORIZATION, value)));
     forward_headers(&mut headers, None, &core.security.secret).ok()?;
     let mut request = Request::new(());
     *request.method_mut() = Method::GET;
