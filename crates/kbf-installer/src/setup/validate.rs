@@ -201,9 +201,7 @@ fn frontend_authority(text: &str) -> Result<String, String> {
     let base = https_base_named("--frontend-url", text)?;
     let after_scheme = &base["https://".len()..];
     if after_scheme.contains('/') {
-        return Err(format!(
-            "--frontend-url {text:?}: must be https://host[:port] and nothing after it"
-        ));
+        return Err("--frontend-url: must be https://host[:port] and nothing after it".to_owned());
     }
     Ok(base)
 }
