@@ -2,7 +2,9 @@
 //! old helper remembered (`helper.json`), and the releases the `current` and `previous`
 //! links name.
 
+use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::time::{Duration, Instant};
 
 use super::error::MigrateError;
 use super::roots::Roots;
@@ -10,6 +12,7 @@ use super::tree::{self, Rules};
 use crate::CommitId;
 use crate::helper::memory::Memory;
 use crate::layout::Layout;
+use crate::state::StateError;
 use serde::Deserialize;
 
 const FILE_CAP: u64 = 1 << 20;
@@ -150,14 +153,29 @@ impl OldTree {
 
 /// The lock the old tools changed their state under, held: no verb of theirs is mid-way
 /// while the migration reads their state and tree. Dropping it lets go.
+///
+/// It is `flock(2)` on the file the deploy kit's own `Locked` takes it on (`File::lock`),
+/// so the kit's verbs and this wait for each other. That the builds on a host do the same
+/// is a check on the host (docs/deploy/kbf-installer-migrate.md).
 pub struct OldLock {
-    _file: std::fs::File,
+    file: File,
+}
+
+impl Drop for OldLock {
+    fn drop(&mut self) {
+        // As the installer's own lock does ([`crate::state::Locked`]): a copy of the
+        // descriptor in a child between fork and exec would keep the lock past the close.
+        let _ = self.file.unlock();
+    }
 }
 
 impl OldLock {
-    /// Take the lock (made, 0600, when missing), waiting while another holds it.
-    pub fn take(layout: &Layout, roots: &Roots) -> Result<OldLock, MigrateError> {
+    /// Take the lock (made, 0600, when missing), waiting at most `wait` while another holds
+    /// it: [`StateError::Busy`] (exit 4) after that, for the old tools may hold it a long
+    /// while and the installer's lock is waited for next.
+    pub fn take(layout: &Layout, roots: &Roots, wait: Duration) -> Result<OldLock, MigrateError> {
         use std::os::unix::fs::OpenOptionsExt;
+        let path = layout.join(&roots.old_lock);
         let what = roots.old_lock.to_string();
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -165,9 +183,21 @@ impl OldLock {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .open(layout.join(&roots.old_lock))
+            .open(&path)
             .map_err(MigrateError::io(what.as_str()))?;
-        file.lock().map_err(MigrateError::io(what))?;
-        Ok(OldLock { _file: file })
+        let end = Instant::now() + wait;
+        // A lock that cannot be taken is tried again until the wait is over, as the
+        // installer's own does ([`crate::state::Locked::acquire_within`]): the one thing
+        // that happens is that somebody else holds it.
+        while file.try_lock().is_err() {
+            if Instant::now() >= end {
+                return Err(StateError::Busy { path }.into());
+            }
+            std::thread::sleep(POLL);
+        }
+        Ok(OldLock { file })
     }
 }
+
+/// How often a lock held by someone else is tried again.
+const POLL: Duration = Duration::from_millis(20);

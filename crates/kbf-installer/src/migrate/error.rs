@@ -21,18 +21,18 @@ pub enum MigrateError {
     /// old tool): the migration will not guess which is right.
     #[error("the old layout disagrees with itself: {0}")]
     Disagree(String),
-    /// The old layout moved between the migration's first look and its locks (a verb of the
-    /// old tools, or another run of this verb): what was probed and planned is not what is
-    /// there now. Nothing was migrated; a run again starts from what is there.
-    #[error(
-        "the old layout changed while the migration waited for its locks ({0}): nothing was migrated, run it again"
-    )]
+    /// The old layout moved under the migration, between its first look and its locks (a
+    /// verb of the old tools, or another run of this verb) or while it stopped the old
+    /// helper (which acted on an order): what was probed and planned is not what is there
+    /// now. Nothing was migrated; a run again starts from what is there.
+    #[error("the old layout changed under the migration ({0}): nothing was migrated, run it again")]
     Changed(String),
     /// A link of the old layout that is not `releases/<40 hex>`.
     #[error("{link} points at {target:?}, not at releases/<commit>")]
     BadLink { link: &'static str, target: String },
-    /// The directory is named for one commit and the binary in it is another.
-    #[error("releases/{dir} holds a build of {probed}: its name does not match its binary")]
+    /// The directory is named for one commit and the binary in it is another. `probed` is
+    /// text the binary printed, which nobody has vetted: it is shown quoted and escaped.
+    #[error("releases/{dir} holds a build of {probed:?}: its name does not match its binary")]
     Mislabeled { dir: String, probed: String },
     /// `--version --json` of an old release could not be had.
     #[error("{release}: the version probe failed: {why}")]
@@ -103,6 +103,8 @@ impl MigrateError {
             | MigrateError::Unmigrated(_)
             | MigrateError::MovedOn(_)
             | MigrateError::NoJournal => Exit::NeedsOperator,
+            // The old tools' lock or the installer's, held past the wait: ask again.
+            MigrateError::State(StateError::Busy { .. }) => Exit::Busy,
             MigrateError::State(e) if e.needs_operator() => Exit::NeedsOperator,
             MigrateError::Corrupt { .. }
             | MigrateError::StateSchema(_)

@@ -1,40 +1,66 @@
 //! Undoing a migration: the old layout was never touched, so putting a host back is
 //! restoring the units' originals and starting what was running. It is refused once the
 //! installer has moved the host on (a release activated, staged or confirmed since), since
-//! the old tree no longer has what runs.
+//! the old tree no longer has what runs. An apply decides, and acts, under the same two locks
+//! as the migration (the old tools', then the installer's): a live installer can activate a
+//! release up to the moment it holds the lock, so only what is read under it is true.
 
 use kbf_host::{Exec, Mode};
 
 use super::apply::{remove_note, rules};
 use super::error::MigrateError;
-use super::journal::Phase;
+use super::journal::{Journal, Phase};
 use super::newtree::StateDir;
+use super::old::OldLock;
 use super::services::Services;
-use super::tree;
+use super::tree::{self, Rules};
 use super::units;
 use super::{Migration, Outcome, Report};
-use crate::state;
+use crate::state::{self, Locked, State, StateError};
 
-/// Put the host back on the old layout, or (in a dry run) say what would be done.
-pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Report, MigrateError> {
-    let rules = rules(m);
-    let Some(state_dir) = StateDir::open(&m.layout, &rules)? else {
+/// What a look at the journal and the installer's state came to.
+enum Look {
+    /// There is nothing to do: the host was rolled back already.
+    Settled(Report),
+    Go(Box<Go>),
+}
+
+/// A rollback that may go ahead.
+struct Go {
+    state_dir: StateDir,
+    journal: Journal,
+    /// Why the installer's state could not be read, when it could not: whether it moved the
+    /// host on is then unknown, and the report says so.
+    unknown_state: Option<String>,
+}
+
+/// Look at the journal and at the installer's state (as `read_state` reads it) and judge
+/// them: the journal must be there, the host not already rolled back, and, once the
+/// migration is done, the installer must not have moved on. Changes nothing. An apply looks
+/// twice, once to refuse early and once under its locks, because only what is read under
+/// the locks is still true when it is acted on.
+fn look(
+    m: &Migration,
+    rules: &Rules,
+    read_state: impl FnOnce() -> Result<Option<State>, StateError>,
+) -> Result<Look, MigrateError> {
+    let Some(state_dir) = StateDir::open(&m.layout, rules)? else {
         return Err(MigrateError::NoJournal);
     };
-    let Some(mut journal) = state_dir.journal()? else {
+    let Some(journal) = state_dir.journal()? else {
         return Err(MigrateError::NoJournal);
     };
-    let mut unknown_state = None;
     if journal.phase == Phase::RolledBack {
         let mut report = Report::new(Outcome::NothingToMigrate);
         report
             .lines
             .push("already rolled back: nothing to do".to_owned());
-        return Ok(report);
+        return Ok(Look::Settled(report));
     }
     // A state nobody can read cannot say the installer moved on, and a rollback is how a
     // host gets out of that: it goes ahead and says so.
-    let state = match state::read_unlocked(&m.layout) {
+    let mut unknown_state = None;
+    let state = match read_state() {
         Err(e) if e.needs_operator() => {
             unknown_state = Some(e.to_string());
             None
@@ -61,6 +87,16 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
             ));
         }
     }
+    Ok(Look::Go(Box::new(Go {
+        state_dir,
+        journal,
+        unknown_state,
+    })))
+}
+
+/// What the rollback says it does. `store_moved`: the migration switched the host's state
+/// store to Postgres, so the restored units name the SQLite file again.
+fn plan(mode: Mode, unknown_state: Option<String>, store_moved: bool) -> Report {
     let mut report = Report::new(match mode {
         Mode::DryRun => Outcome::Planned,
         Mode::Apply => Outcome::RolledBack,
@@ -75,7 +111,7 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
         mode,
         "restore the units' originals, enable the old helper, start what ran before",
     );
-    if journal.state_store.is_some() {
+    if store_moved {
         // The migration moved the host's state store: the original unit names the SQLite
         // file, which was never touched. Nothing is copied back from Postgres.
         report.line(
@@ -88,8 +124,21 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
                 .to_owned(),
         );
     }
+    report
+}
+
+/// Put the host back on the old layout, or (in a dry run) say what would be done.
+pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Report, MigrateError> {
+    let rules = rules(m);
+    // The first look takes no lock. It is all of a dry run, and an apply's chance to refuse
+    // before it waits for anything.
+    let first = match look(m, &rules, || state::read_unlocked(&m.layout))? {
+        Look::Settled(report) => return Ok(report),
+        Look::Go(go) => go,
+    };
     if mode == Mode::DryRun {
-        return Ok(report);
+        let store_moved = first.journal.state_store.is_some();
+        return Ok(plan(mode, first.unknown_state, store_moved));
     }
     if exec.euid() != m.owner_uid {
         return Err(MigrateError::NotRoot {
@@ -97,6 +146,25 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
             want: m.owner_uid,
         });
     }
+    // Both locks, in the order the migration takes them, each waited for `m.lock_wait` and
+    // no longer (busy, exit 4), and held to the end: the installer is stopped below with
+    // its lock held, so it writes no state while the old layout comes back, and no verb of
+    // the old tools runs while its units start.
+    let _old_lock = OldLock::take(&m.layout, &m.roots, m.lock_wait)?;
+    state::make_lock_dir(&m.layout)?;
+    let lock = Locked::acquire_within(&m.layout, m.lock_wait)?;
+    // What was read before the locks may be stale: the installer may have activated a
+    // release while this waited, or another rollback may have finished. The decision is
+    // made again, and everything below is done from this look alone.
+    let Go {
+        state_dir,
+        mut journal,
+        unknown_state,
+    } = match look(m, &rules, || lock.read())? {
+        Look::Settled(report) => return Ok(report),
+        Look::Go(go) => *go,
+    };
+    let mut report = plan(mode, unknown_state, journal.state_store.is_some());
     let mut svc = Services {
         exec,
         roots: &m.roots,

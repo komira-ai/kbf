@@ -37,6 +37,17 @@ impl FrontendFloor for NoFrontend {
     }
 }
 
+/// What the source of the floor said: the (epoch, generation) of the frontend or of the
+/// operator's flag, and what to warn of. It is asked for once, before any lock is taken (the
+/// frontend is a call over the network), and the floor is seeded from it as often as the
+/// old helper's memory is read.
+#[derive(Clone, Debug)]
+pub struct Claim {
+    epoch: u64,
+    generation: u64,
+    warnings: Vec<String>,
+}
+
 /// What the seeding decided.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Seeded {
@@ -51,18 +62,9 @@ pub(super) fn newer(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
     a.max(b)
 }
 
-/// The floor of a host whose old helper remembered `memory`. The two kinds of order
-/// shared one id counter, so the newer pair of the node and frontend kinds is a floor no
-/// later order of either kind is below.
-pub fn seed(
-    memory: &Memory,
-    seed: &Seed,
-    frontend: &dyn FrontendFloor,
-) -> Result<Seeded, MigrateError> {
-    let old = newer(
-        (memory.acked_epoch, memory.acked_order_id),
-        (memory.frontend_epoch, memory.frontend_order_id),
-    );
+/// Ask the source of the floor: the frontend, when it is the release source, else the
+/// operator's `--min-generation`, else nothing, loudly.
+pub fn claim(seed: &Seed, frontend: &dyn FrontendFloor) -> Result<Claim, MigrateError> {
     let mut warnings = Vec::new();
     let (epoch, generation) = match (seed.source, seed.min_generation) {
         (Source::Frontend, flag) => match frontend.current() {
@@ -91,16 +93,31 @@ pub fn seed(
             (0, 0)
         }
     };
-    let (epoch, order_id) = newer(old, (epoch, 0));
-    Ok(Seeded {
+    Ok(Claim {
+        epoch,
+        generation,
+        warnings,
+    })
+}
+
+/// The floor of a host whose old helper remembered `memory`, on what `claim` said. The two
+/// kinds of order shared one id counter, so the newer pair of the node and frontend kinds
+/// is a floor no later order of either kind is below.
+pub fn seed(memory: &Memory, claim: &Claim) -> Seeded {
+    let old = newer(
+        (memory.acked_epoch, memory.acked_order_id),
+        (memory.frontend_epoch, memory.frontend_order_id),
+    );
+    let (epoch, order_id) = newer(old, (claim.epoch, 0));
+    Seeded {
         floor: Floor {
             epoch,
             order_id,
-            generation,
+            generation: claim.generation,
         },
-        min_generation: (generation > 0).then_some(generation),
-        warnings,
-    })
+        min_generation: (claim.generation > 0).then_some(claim.generation),
+        warnings: claim.warnings.clone(),
+    }
 }
 
 /// `floor` raised to `other` where `other` is higher; never lowered.

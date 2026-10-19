@@ -244,6 +244,61 @@ pub fn switch_store(
     Ok(UnitOutcome::Rewritten)
 }
 
+/// What is to be done to a unit file, from everything that is read to decide it.
+enum Judged {
+    Nothing(UnitOutcome),
+    /// The file changes: `original` is what it holds, `new` what it is to hold, and `kept`
+    /// whether `backup` has an original already (the first one is the one kept).
+    Change {
+        original: Vec<u8>,
+        new: String,
+        kept: bool,
+    },
+}
+
+/// Read the unit file `unit` of `units` (the unit directory, open), and the original kept
+/// for it in `backup`, judged by the rules, and say what is to be done. Writes nothing.
+fn judge(
+    rules: &Rules,
+    units: &OwnedFd,
+    backup: &OwnedFd,
+    unit: &Unit,
+    new_bin: &str,
+) -> Result<Judged, TreeError> {
+    let name = unit.as_str();
+    let Some(bytes) = tree::read_file(rules, units, name, UNIT_CAP)? else {
+        return Ok(Judged::Nothing(UnitOutcome::Missing));
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let Some(new) = rewrite_text(unit.kind(), &text, new_bin) else {
+        let already = text.contains(new_bin) && !text.contains(OLD_BIN);
+        return Ok(Judged::Nothing(if already {
+            UnitOutcome::Already
+        } else {
+            UnitOutcome::NotOurs
+        }));
+    };
+    let kept = tree::read_file(rules, backup, name, UNIT_CAP)?.is_some();
+    Ok(Judged::Change {
+        original: bytes,
+        new,
+        kept,
+    })
+}
+
+/// Read and judge everything [`rewrite`] reads for `unit`, and write nothing: a caller that
+/// must not fail half way (the services are stopped between the reading and the writing)
+/// asks first.
+pub fn check(
+    rules: &Rules,
+    units: &OwnedFd,
+    backup: &OwnedFd,
+    unit: &Unit,
+    new_bin: &str,
+) -> Result<(), TreeError> {
+    judge(rules, units, backup, unit, new_bin).map(drop)
+}
+
 /// Point the unit file `unit` of `units` (the unit directory, open) at the new link,
 /// keeping the original in `backup` the first time.
 pub fn rewrite(
@@ -254,23 +309,20 @@ pub fn rewrite(
     new_bin: &str,
 ) -> Result<UnitOutcome, TreeError> {
     let name = unit.as_str();
-    let Some(bytes) = tree::read_file(rules, units, name, UNIT_CAP)? else {
-        return Ok(UnitOutcome::Missing);
-    };
-    let text = String::from_utf8_lossy(&bytes);
-    let Some(new) = rewrite_text(unit.kind(), &text, new_bin) else {
-        let already = text.contains(new_bin) && !text.contains(OLD_BIN);
-        return Ok(if already {
-            UnitOutcome::Already
-        } else {
-            UnitOutcome::NotOurs
-        });
-    };
-    if tree::read_file(rules, backup, name, UNIT_CAP)?.is_none() {
-        tree::replace_file(backup, name, 0o600, &bytes)?;
+    match judge(rules, units, backup, unit, new_bin)? {
+        Judged::Nothing(outcome) => Ok(outcome),
+        Judged::Change {
+            original,
+            new,
+            kept,
+        } => {
+            if !kept {
+                tree::replace_file(backup, name, 0o600, &original)?;
+            }
+            tree::replace_file(units, name, 0o644, new.as_bytes())?;
+            Ok(UnitOutcome::Rewritten)
+        }
     }
-    tree::replace_file(units, name, 0o644, new.as_bytes())?;
-    Ok(UnitOutcome::Rewritten)
 }
 
 /// Put the original of `unit` back from `backup`; `false` when none was kept.

@@ -42,12 +42,11 @@ const MARKER_TEXT: &str = "This host is managed by kbf-installer. This directory
 are kept as the rollback path (`kbf-installer migrate --rollback`); nothing here is read any more.\n";
 
 /// What a look at the host found: the journal of a migration begun, the old layout's state
-/// and memory, the old tree, and the floor seeded from that memory.
+/// and memory, and the old tree.
 struct Seen {
     journal: Option<Journal>,
     old: Old,
     old_tree: OldTree,
-    seeded: Seeded,
 }
 
 /// What a look at the host came to.
@@ -57,10 +56,11 @@ enum Look {
     Old(Box<Seen>),
 }
 
-/// Look at the host: read the old state and memory, judge them and the links, seed the
-/// floor. Changes nothing. An apply looks twice, once to plan and once under its locks,
-/// because only what is read under the locks is still true when it is written.
-fn look(m: &Migration, hooks: &Hooks<'_>, rules: &Rules) -> Result<Look, MigrateError> {
+/// Look at the host: read the old state and memory and judge them and the links. Changes
+/// nothing, and asks nothing of the network (the floor is seeded from what is read, on the
+/// claim made once). An apply looks twice, once to plan and once under its locks, because
+/// only what is read under the locks is still true when it is written.
+fn look(m: &Migration, rules: &Rules) -> Result<Look, MigrateError> {
     let existing = StateDir::open(&m.layout, rules)?;
     let journal = existing
         .as_ref()
@@ -94,20 +94,25 @@ fn look(m: &Migration, hooks: &Hooks<'_>, rules: &Rules) -> Result<Look, Migrate
                 .to_owned(),
         ));
     }
+    let old_tree = judge(m, &old)?;
+    Ok(Look::Old(Box::new(Seen {
+        journal,
+        old,
+        old_tree,
+    })))
+}
+
+/// Judge what was read of the old layout: no swap on trial, and the links are the ones the
+/// state names. The old tree, open, when they are.
+fn judge(m: &Migration, old: &Old) -> Result<OldTree, MigrateError> {
     if let Some(pending) = &old.state.pending_confirm {
         return Err(MigrateError::Pending {
             commit: pending.commit.to_string(),
         });
     }
     let old_tree = OldTree::open(&m.layout, &m.roots)?;
-    check_links(&old, &old_tree)?;
-    let seeded = floor::seed(&old.memory, &m.seed, hooks.frontend)?;
-    Ok(Look::Old(Box::new(Seen {
-        journal,
-        old,
-        old_tree,
-        seeded,
-    })))
+    check_links(old, &old_tree)?;
+    Ok(old_tree)
 }
 
 /// What the plan says of the floor, the staged release and the releases found.
@@ -181,6 +186,25 @@ fn unchanged(probed: &[Option<CommitId>; 2], old: &Old) -> Result<(), MigrateErr
     Ok(())
 }
 
+/// The old layout once the services are stopped: read and judged like the looks before it
+/// (the journal is this run's own by now, and is not read), `current` and `previous` as
+/// probed, and the floor raised to what the old helper remembers now (a floor only goes up).
+fn settle(
+    m: &Migration,
+    rules: &Rules,
+    probed: &[Option<CommitId>; 2],
+    claim: &floor::Claim,
+    seeded: Seeded,
+) -> Result<(Old, Seeded), MigrateError> {
+    let Some(old) = old::read(&m.layout, &m.roots, rules)? else {
+        return Err(MigrateError::Changed("the old state is gone".to_owned()));
+    };
+    judge(m, &old)?;
+    unchanged(probed, &old)?;
+    let floor = floor::raise(seeded.floor, floor::seed(&old.memory, claim).floor);
+    Ok((old, Seeded { floor, ..seeded }))
+}
+
 /// Migrate the host, or (in a dry run) say what would be done.
 pub fn migrate<E: Exec>(
     m: &Migration,
@@ -191,12 +215,23 @@ pub fn migrate<E: Exec>(
     let rules = rules(m);
     // The first look takes no lock. It is all of a dry run, and an apply's chance to refuse
     // and to probe the releases before it waits for anything. Only what it probed goes on
-    // (`found`, and the names it probed them under); what it read is not written from.
-    let (found, probed) = {
-        let first = match look(m, hooks, &rules)? {
+    // (`found`, and the names it probed them under); what it read is not written from. The
+    // source of the floor is asked here too, once: the frontend is a call over the network,
+    // not one to make with the locks held.
+    let (found, probed, claim) = {
+        let first = match look(m, &rules)? {
             Look::Settled(report) => return Ok(report),
             Look::Old(seen) => seen,
         };
+        // Only the owner of the tree applies. A stranger is told so before anything is run
+        // or asked: the probe, as a user it cannot become, would end the run with its own
+        // error and hide the reason.
+        if mode == Mode::Apply && exec.euid() != m.owner_uid {
+            return Err(MigrateError::NotRoot {
+                have: exec.euid(),
+                want: m.owner_uid,
+            });
+        }
         // A host that moves to Postgres is refused before any program runs or anything is
         // changed when its database cannot be asked: the migration creates none of it.
         let schema = m
@@ -204,13 +239,14 @@ pub fn migrate<E: Exec>(
             .as_ref()
             .map(|store| store.look().map(|line| (store, line)))
             .transpose()?;
+        let claim = floor::claim(&m.seed, hooks.frontend)?;
         let found = find(m, hooks, &rules, &first.old_tree, &first.old)?;
         if mode == Mode::DryRun {
             let mut report = Report::new(Outcome::Planned);
             report_plan(
                 &mut report,
                 mode,
-                &first.seeded,
+                &floor::seed(&first.old.memory, &claim),
                 first.old.state.staged.as_ref(),
                 &found,
             );
@@ -224,25 +260,21 @@ pub fn migrate<E: Exec>(
             first.old.state.current.clone(),
             first.old.state.previous.clone(),
         ];
-        (found, probed)
+        (found, probed, claim)
     };
-    if exec.euid() != m.owner_uid {
-        return Err(MigrateError::NotRoot {
-            have: exec.euid(),
-            want: m.owner_uid,
-        });
-    }
     // Both locks: no verb of the old tools is mid-way, and no run of the installer changes
-    // its state while this one does.
-    let _old_lock = OldLock::take(&m.layout, &m.roots)?;
-    let lock = Locked::acquire(&m.layout)?;
+    // its state while this one does. Each is waited for `m.lock_wait` and no longer (busy,
+    // exit 4), the old tools' first and let go with the error.
+    let _old_lock = OldLock::take(&m.layout, &m.roots, m.lock_wait)?;
+    state::make_lock_dir(&m.layout)?;
+    let lock = Locked::acquire_within(&m.layout, m.lock_wait)?;
     // Everything read before the locks may be stale by now: a verb of the old tools (or the
     // old helper) between the look and the locks moves `current`, puts a swap on trial or
     // acts on an order, and another run of this verb may have finished while this one
     // waited. So the old layout is read and judged again, and every write below is made
     // from this look alone. A different `current` or `previous` is not adopted in place of
     // the releases probed: the run is refused, nothing migrated, to be run again.
-    let seen = match look(m, hooks, &rules)? {
+    let seen = match look(m, &rules)? {
         Look::Old(seen) => seen,
         Look::Settled(report) if report.outcome == Outcome::AlreadyMigrated => return Ok(report),
         Look::Settled(_) => {
@@ -250,12 +282,8 @@ pub fn migrate<E: Exec>(
         }
     };
     unchanged(&probed, &seen.old)?;
-    let Seen {
-        journal,
-        old,
-        seeded,
-        ..
-    } = *seen;
+    let Seen { journal, old, .. } = *seen;
+    let seeded = floor::seed(&old.memory, &claim);
     let mut report = Report::new(Outcome::Migrated);
     report_plan(
         &mut report,
@@ -281,6 +309,18 @@ pub fn migrate<E: Exec>(
     journal.helper_unit = m.helper_unit.clone();
     journal.state_store = m.state_store.as_ref().map(|s| s.url.clone());
     tree.state.put_journal(&journal)?;
+
+    // The unit files are read and judged now, before a release is copied and long before a
+    // service is stopped: a unit that is a link, that others can write or that is too big
+    // would otherwise end the run half way, with the daemon stopped, the helper disabled and
+    // the state written.
+    let backup = tree.state.unit_backup()?;
+    let units_dir = tree::open_root(&m.layout.join(&m.roots.unit_dir))
+        .map_err(MigrateError::io(m.roots.unit_dir.to_string()))?;
+    let new_bin = m.layout.current().to_string();
+    for unit in &m.units {
+        units::check(&rules, &units_dir, &backup, unit, &new_bin)?;
+    }
 
     journal.adopted.clear();
     for f in &found {
@@ -326,6 +366,24 @@ pub fn migrate<E: Exec>(
             report.line(mode, format!("stopped {unit}"));
         }
     }
+    // The old helper is stopped now, so what it remembers is final. It acts on orders until
+    // its unit stops, which is after the look above: the floor is raised to what it
+    // remembers now. A swap it made meanwhile is not the host that was probed: the services
+    // run again as they were and the run ends before the installer's state, the links or the
+    // units are written (the journal and the copies made are in the new tree, and a run again
+    // starts from what is there).
+    let (old, seeded) = match settle(m, &rules, &probed, &claim, seeded) {
+        Ok(settled) => settled,
+        Err(error) => {
+            for unit in &journal.stopped {
+                // The error to report is the change; a unit that will not start is the
+                // operator's to see in the unit manager, and `migrate --rollback` starts
+                // what the journal says was stopped.
+                let _ = svc.start(unit);
+            }
+            return Err(error);
+        }
+    };
     if let Some(helper) = &m.helper_unit {
         svc.disable(helper)
             .map_err(MigrateError::io(helper.as_str()))?;
@@ -355,18 +413,9 @@ pub fn migrate<E: Exec>(
         "state.json (schema 2), helper.json (the replay floor) and status.json written",
     );
 
-    let backup = tree.state.unit_backup()?;
-    let units_dir = tree::open_root(&m.layout.join(&m.roots.unit_dir))
-        .map_err(MigrateError::io(m.roots.unit_dir.to_string()))?;
     let mut on_postgres = false;
     for unit in &m.units {
-        let outcome = units::rewrite(
-            &rules,
-            &units_dir,
-            &backup,
-            unit,
-            &m.layout.current().to_string(),
-        )?;
+        let outcome = units::rewrite(&rules, &units_dir, &backup, unit, &new_bin)?;
         report.line(mode, format!("{unit}: {}", describe(outcome)));
         if let Some(store) = &m.state_store {
             let outcome = units::switch_store(&rules, &units_dir, &backup, unit, &store.url)?;

@@ -22,19 +22,25 @@
 //!    report and in `status.json`, and never mark it verified. Re-run: a release with
 //!    `VERIFIED` is skipped, a copy with the source's digest is kept, any other leftover
 //!    is replaced, scratch is swept.
-//! 5. **Lock, look again, stop, repoint, start.** An apply takes the old tools' lock and the
-//!    installer's and does step 1 and the seeding of step 2 again under them: what it read
-//!    before may have moved (a verb of the old tools, the old helper acting on an order,
-//!    another run finishing), and every write below is made from this second look alone. A
-//!    `current` or `previous` that is not what step 3 probed ends the run with
-//!    [`MigrateError::Changed`], nothing migrated; a migration another run finished is
-//!    reported as done. The old helper's unit and the kbf units that run are
-//!    stopped (the list is journalled first), the helper is disabled so only one tool
-//!    manages the host, then `state.json` and `helper.json` (the replay floor), then
-//!    `releases/current` and `previous`, `status.json` and the units' `Exec*=` lines are
-//!    written, and only then are the stopped units started. The state comes before the
-//!    links because a link with no state beside it reads as a host whose state is lost. Re-run: links and units are compared and only what differs
-//!    is done; a unit stopped by an earlier run is started by this one.
+//! 5. **Lock, look again, stop, look again, repoint, start.** An apply takes the old tools'
+//!    lock and the installer's (each waited for [`Migration::lock_wait`], then busy) and does
+//!    step 1 and the seeding of step 2 again under them: what it read before may have moved
+//!    (a verb of the old tools, the old helper acting on an order, another run finishing),
+//!    and every write below is made from this second look alone. A `current` or `previous`
+//!    that is not what step 3 probed ends the run with [`MigrateError::Changed`], nothing
+//!    migrated; a migration another run finished is reported as done. The unit files are
+//!    read and judged before anything is copied or stopped. The old helper's unit and the
+//!    kbf units that run are stopped (the list is journalled first); the old helper acts on
+//!    orders until its unit is stopped, so the old layout is read a third time then, the
+//!    floor raised to what the helper remembers now, and a swap it made as it stopped (or an
+//!    old state that went) ends the run with [`MigrateError::Changed`] after the stopped
+//!    units are started again. The
+//!    helper is disabled so only one tool manages the host, then `state.json` and
+//!    `helper.json` (the replay floor), then `releases/current` and `previous`,
+//!    `status.json` and the units' `Exec*=` lines are written, and only then are the stopped
+//!    units started. The state comes before the links because a link with no state beside
+//!    it reads as a host whose state is lost. Re-run: links and units are compared and only
+//!    what differs is done; a unit stopped by an earlier run is started by this one.
 //! 6. **Journal** `migration.json` says `done`. From then on `migrate` is a no-op and
 //!    [`guard`] lets `setup` through.
 //!
@@ -53,7 +59,8 @@
 //! their originals back (on a frontend or all-in-one host that includes the SQLite
 //! `--state-store`; nothing is copied back from Postgres), the helper is enabled again, the
 //! units are started. The old tree and state were never touched, which is why this is
-//! possible.
+//! possible. An apply of it takes the same two locks and decides from what it reads under
+//! them, so a release the installer activated while it waited is seen.
 //!
 //! Stand-ins that remain: [`Verifier`], which asks for a release to be fetched from the
 //! configured source and verified from its commit alone (the migration holds no order, so no
@@ -77,6 +84,8 @@ mod services;
 mod store;
 pub mod tree;
 pub mod units;
+
+use std::time::Duration;
 
 use kbf_host::Mode;
 
@@ -129,6 +138,10 @@ pub struct Migration {
     /// installer and the old helper never both run.
     pub installer_unit: Option<Unit>,
     pub seed: Seed,
+    /// How long each of the two locks (the old tools', the installer's) is waited for before
+    /// the verb ends busy (exit 4): a verb of the old tools can hold theirs for a long time,
+    /// and a migration queued behind it holds up whatever else wants the installer's.
+    pub lock_wait: Duration,
     /// The state store of a frontend or all-in-one host, which the migration moves to
     /// Postgres; `None` for a node, which keeps none.
     pub state_store: Option<StateStore>,
@@ -224,6 +237,8 @@ pub fn guard(layout: &Layout, owner_uid: u32) -> Result<(), MigrateError> {
 mod coverage_tests;
 #[cfg(test)]
 mod floor_tests;
+#[cfg(test)]
+mod lock_tests;
 #[cfg(test)]
 mod moved_tests;
 #[cfg(test)]

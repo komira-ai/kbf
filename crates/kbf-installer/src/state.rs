@@ -245,24 +245,32 @@ impl Drop for Locked {
     }
 }
 
+/// Make the directory of the layout's lock file (0755) when it is missing: it is on a tmpfs,
+/// and a host the installer never ran on has none. [`Locked::acquire`] does it; a caller of
+/// [`Locked::acquire_within`], which does not, on a host that may be new does it first.
+pub fn make_lock_dir(host: &Layout) -> Result<(), StateError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let path = host.join(&host.lock());
+    // A lock path always has a parent; the root stands in for the impossible case.
+    let dir = path.parent().unwrap_or(Path::new("/"));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)
+        .map_err(|source| StateError::Lock { path, source })
+}
+
 impl Locked {
     /// Take the exclusive lock on the layout's lock file (`/run/kbf-installer/lock`; the
     /// directory is made, 0755, when missing), waiting while another run holds it. The lock
     /// file is made (mode 0600) when missing.
     pub fn acquire(host: &Layout) -> Result<Locked, StateError> {
+        make_lock_dir(host)?;
         let path = host.join(&host.lock());
         let fail = |source| StateError::Lock {
             path: path.clone(),
             source,
         };
-        use std::os::unix::fs::DirBuilderExt;
-        // A lock path always has a parent; the root stands in for the impossible case.
-        let dir = path.parent().unwrap_or(std::path::Path::new("/"));
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(dir)
-            .map_err(fail)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
