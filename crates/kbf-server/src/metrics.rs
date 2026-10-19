@@ -27,6 +27,7 @@ use kbf_tls::TlsSource;
 
 use crate::listen::{Binder, Socket};
 use crate::members::Members;
+use crate::proxy_auth::Caller;
 use crate::serve::{ServeError, StorageSocket, bind};
 use crate::start::AbortOnDrop;
 
@@ -97,7 +98,7 @@ where
         })
 }
 
-async fn metrics<M, O>(State(sources): State<Sources<M, O>>) -> Response
+async fn metrics<M, O>(_gated: Caller, State(sources): State<Sources<M, O>>) -> Response
 where
     M: MetaLog,
     O: ObjectStore + 'static,
@@ -152,7 +153,9 @@ impl NodeMetrics {
         let routes = router(cache, local, None, None, tls.into_iter().collect());
         // `pending` is its stop, so it ends only when the task is aborted; an error of
         // the accept loop has nothing to be reported to.
-        let serving = crate::serve::serve_api(Some(self.listener), routes, std::future::pending());
+        // The node is not behind the proxy: no secret, so `gate_requests` admits a direct caller.
+        let serving =
+            crate::serve::serve_api(Some(self.listener), routes, std::future::pending(), None);
         (self.addr, AbortOnDrop(tokio::spawn(serving.map(drop))))
     }
 }

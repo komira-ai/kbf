@@ -93,6 +93,22 @@ async fn a_storage_node_serves_the_lost_blob_series_on_its_metrics_listener() {
     assert_lost_blob_series(&get(addr, "/metrics").await.2);
 }
 
+/// Catches the node's metrics listener served around `serve_api` (the handler reads the
+/// gate's `Caller`, so a listener without the `gate_requests` layer answers 500), and one
+/// given a proxy secret (the node is not behind the proxy, so a loopback call carrying
+/// none would be refused with 403). Mutants: serve the routes with plain `axum::serve`;
+/// pass `Some(secret)` to `serve_api`.
+#[tokio::test]
+async fn the_metrics_listener_admits_a_direct_loopback_call_through_the_gate() {
+    let flags = flags(&dir("gate"), &["--metrics-listen=127.0.0.1:0"]);
+    let node = start_storage(&flags, never).await.expect("starts");
+    let addr = node.metrics.expect("a metrics address");
+    assert!(addr.ip().is_loopback(), "{addr}");
+    let (code, head, body) = get(addr, "/metrics").await;
+    assert_eq!(code, 200, "{head}\n{body}");
+    assert_lost_blob_series(&body);
+}
+
 /// Catches a listener that is bound without the flag (a farm would grow a port nobody
 /// asked for), and a default address other than none.
 #[tokio::test]
