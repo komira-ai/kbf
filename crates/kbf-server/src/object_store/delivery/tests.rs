@@ -440,3 +440,57 @@ fn a_draining_node_and_a_denied_node_are_not_standing() {
     assert_eq!(standing("node-denied"), MemberStanding::Denied);
     assert_eq!(standing("node-joining"), MemberStanding::Active);
 }
+
+fn interleaved(
+    inner: Arc<dyn Store>,
+    hook: Box<dyn Fn() + Send + Sync>,
+) -> (Arc<dyn Store>, Arc<AtomicBool>) {
+    let down = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(Interleaved {
+        inner,
+        hook,
+        down: Arc::clone(&down),
+    }) as Arc<dyn Store>;
+    (store, down)
+}
+
+// Catches a read that fails between the pieces (the store goes away after the bindings are
+// read) answered as anything but `Store`: the node is told to retry, and is neither handed
+// half a registration nor told the secret is the problem.
+#[test]
+fn a_store_that_fails_mid_reading_is_a_store_failure() {
+    let inner = as_store(&fake());
+    let dir = scratch("src-mid").join("s");
+    let (registry, _) = source(&inner, &dir);
+    bound(&registry);
+    let down = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&down);
+    let store = Arc::new(Interleaved {
+        inner,
+        hook: Box::new(move || flag.store(true, Ordering::SeqCst)),
+        down: Arc::clone(&down),
+    }) as Arc<dyn Store>;
+    let (_, source) = source(&store, &dir);
+    down.store(false, Ordering::SeqCst);
+    assert_eq!(
+        source.snapshot().expect_err("lost mid-way"),
+        SourceError::Store
+    );
+}
+
+// Catches an ack store that fails read as acks that say something: the operator API is
+// shown no node (and so never `converged`), not a node with invented standing, and the same
+// call lists the node once the acks read again.
+#[test]
+fn acks_that_cannot_be_read_show_no_nodes() {
+    let store = as_store(&fake());
+    let (registry, _) = source(&store, &scratch("rep-acks-down").join("s"));
+    let members = members(&store);
+    let (acks_store, down) = interleaved(Arc::clone(&store), Box::new(|| {}));
+    let acks = Arc::new(Acks::new(acks_store));
+    let reports = Reports::new(Arc::clone(&members), acks, registry);
+    join(&members, "node-a");
+    assert_eq!(reports.nodes().len(), 1);
+    down.store(true, Ordering::SeqCst);
+    assert!(reports.nodes().is_empty());
+}
