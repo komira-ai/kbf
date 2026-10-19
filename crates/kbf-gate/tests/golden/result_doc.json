@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "stage": "gamma",
+  "commit": "abababababababababababababababababababab",
+  "set_hash": "86fb10522bd8a5532f4cefc7d0d9559b9f00c54202491d27bbc4568e49f975b1",
+  "run_id": "bake-0001",
+  "attempt": 1,
+  "status": "green",
+  "started": 1000,
+  "finished": 90000,
+  "desired_generation": 7,
+  "deploy": {
+    "start": 1100,
+    "end": 1900
+  },
+  "bake": {
+    "start": 2000,
+    "end": 88400
+  },
+  "load": {
+    "actions": {
+      "measured": 1000,
+      "required": 1000
+    },
+    "builds": {
+      "measured": 12,
+      "required": 10
+    },
+    "hours": {
+      "measured": 3,
+      "required": 3
+    }
+  },
+  "waivers": [
+    {
+      "what": "min-load",
+      "by": "operator",
+      "reason": "holiday week"
+    }
+  ],
+  "gates": [
+    {
+      "name": "lost-blobs",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 0.0
+      },
+      "verdict": "green",
+      "started": 2000,
+      "finished": 88400
+    },
+    {
+      "name": "latency-p99",
+      "measured": 1.8,
+      "threshold": {
+        "band": {
+          "warn": 1.5,
+          "red": 3.0
+        }
+      },
+      "verdict": "warn",
+      "started": 2000,
+      "finished": 88400
+    },
+    {
+      "name": "tests",
+      "measured": 3.0,
+      "threshold": {
+        "at_least": 1.0
+      },
+      "verdict": "green",
+      "started": 2000,
+      "finished": 88400
+    }
+  ],
+  "note": null
+}

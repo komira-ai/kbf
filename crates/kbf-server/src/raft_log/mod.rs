@@ -55,7 +55,8 @@
 //! - **Dropping the log** stops its tick task, waits for a batch the committer is
 //!   writing, and refuses every later one `Unavailable`, so nothing reaches the raft
 //!   directory once the drop returns and the directory can be opened again in the
-//!   same process (kbf#651).
+//!   same process (kbf#651), also while a child that another thread forked has not
+//!   exec'd yet (the lock is unlocked, not only closed).
 //!
 //! Not yet: snapshots (the metadata state has no snapshot encoding, so the log is
 //! never compacted, and a directory holding a snapshot is refused), more than one
@@ -193,8 +194,9 @@ pub struct RaftMetaLog<F: Fs = StdFs> {
     shared: Arc<Shared<F>>,
     ticker: AbortHandle,
     /// The raft directory's [`LOCK`], held while the log is open (logs opened with
-    /// [`RaftMetaLog::open_dir`]); released when the log is dropped.
-    lock: Option<File>,
+    /// [`RaftMetaLog::open_dir`]); released when the log is dropped, after its handle
+    /// on the store (fields drop in order).
+    lock: Option<DirLock>,
 }
 
 struct Shared<F: Fs> {
@@ -238,21 +240,39 @@ impl RaftMetaLog<StdFs> {
     }
 }
 
-/// `dir`'s [`LOCK`], created if missing, with an exclusive `flock` on it. The lock
-/// goes with the file's descriptor, so it is released when the file is closed, by
-/// the log's drop or by the process's exit.
-fn lock_dir(dir: &Path) -> Result<File, RaftLogError> {
+/// `dir`'s [`LOCK`], created if missing, with an exclusive `flock` on it, released when
+/// the returned [`DirLock`] is dropped or the process exits.
+fn lock_dir(dir: &Path) -> Result<DirLock, RaftLogError> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(dir.join(LOCK))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(DirLock(file)),
         Err(e) => Err(RaftLogError::Locked {
             dir: dir.to_owned(),
             source: io::Error::from(e),
         }),
+    }
+}
+
+/// A raft directory's [`LOCK`] file with its `flock` held.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked
+/// while the lock is held (any spawn of a child by another thread of this process)
+/// carries a copy until it execs, so closing the file would leave the directory locked
+/// for as long as that takes. Dropping unlocks first, which no copy outlives, so the
+/// directory can be opened again once the drop returns (the promise of [`RaftMetaLog`]'s
+/// drop).
+#[derive(Debug)]
+struct DirLock(File);
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.0.unlock();
     }
 }
 

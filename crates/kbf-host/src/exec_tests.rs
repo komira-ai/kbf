@@ -623,7 +623,7 @@ fn a_link_never_replaces_a_file_or_a_directory() {
 fn a_stale_temporary_that_cannot_be_removed_fails_the_flip() {
     let (mut exec, dir) = host("link-stale");
     std::os::unix::fs::symlink("a", dir.join("current")).expect("seed");
-    fs::create_dir_all(dir.join(".current.kbf-host-tmp/x")).expect("seed");
+    fs::create_dir_all(dir.join("current.new/x")).expect("seed");
     exec.apply(&link_step("/current", "b"))
         .expect_err("the temporary name is taken by a directory");
     assert_eq!(
@@ -643,4 +643,73 @@ fn only_einval_reads_as_not_a_link() {
         link_or_other(gone).expect_err("an error").kind(),
         io::ErrorKind::NotFound
     );
+}
+
+/// S23: a link is flipped by renaming a complete new link over its name, so a reader never
+/// finds the name missing. A reader thread reads the link as fast as it can while the link is
+/// flipped many times; it must never see `NotFound`, and every target it reads is one of the
+/// two that were set.
+///
+/// Catches a flip done as remove-then-create (the service's `ExecStart` path would not exist
+/// for an instant), which is also what an interrupted flip would leave.
+///
+/// Mutant seen red: `symlink` removing `full` before creating the link.
+#[test]
+fn a_flipped_link_is_never_missing_for_a_reader() {
+    let (mut exec, dir) = host("link-atomic");
+    std::os::unix::fs::symlink("a", dir.join("current")).expect("seed");
+    let stop = Arc::new(AtomicBool::new(false));
+    let bad = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let reader = {
+        let (stop, bad, reads, path) = (
+            Arc::clone(&stop),
+            Arc::clone(&bad),
+            Arc::clone(&reads),
+            dir.join("current"),
+        );
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match fs::read_link(&path) {
+                    Ok(t) if t == Path::new("a") || t == Path::new("b") => {}
+                    _ => {
+                        bad.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                reads.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+    for i in 0..600 {
+        let target = if i % 2 == 0 { "b" } else { "a" };
+        exec.apply(&link_step("/current", target)).expect("flip");
+    }
+    stop.store(true, Ordering::Relaxed);
+    reader.join().expect("reader");
+    assert!(reads.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        bad.load(Ordering::Relaxed),
+        0,
+        "a reader saw the link missing or odd"
+    );
+}
+
+/// S23: the new link is made as `<name>.new` beside the link and renamed over it; a `.new`
+/// left by a crashed flip (even a dangling link) is replaced, and none is left after.
+///
+/// Catches a different temporary name (the contract names `current.new`), and a stale one
+/// that blocks the next flip.
+///
+/// Mutant seen red: `new_beside` naming `.<name>.kbf-host-tmp`.
+#[test]
+fn a_flip_goes_through_name_dot_new_and_leaves_none() {
+    let (mut exec, dir) = host("link-dot-new");
+    std::os::unix::fs::symlink("a", dir.join("current")).expect("seed");
+    std::os::unix::fs::symlink("gone", dir.join("current.new")).expect("a crashed flip");
+    exec.apply(&link_step("/current", "b")).expect("flip");
+    assert_eq!(
+        fs::read_link(dir.join("current")).expect("link"),
+        Path::new("b")
+    );
+    assert_eq!(names_in(&dir), ["current"]);
 }
