@@ -5,7 +5,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use kbf_server::api_client::OperatorClient;
-use kbf_server::proxy_auth::{ProxySecret, gate_requests};
 use kbf_types::object_store_api::{
     AuditList, BindingPutAnswer, ConnectionList, ConnectionPutAnswer, Deleted, Status, VerifyAnswer,
 };
@@ -17,15 +16,7 @@ async fn serve(farm: &Farm) -> SocketAddr {
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
-    // As `serve_api` serves the operator API: every call passes the proxy gate, which
-    // records that there is no proxy.
-    let app = farm
-        .router
-        .clone()
-        .layer(axum::middleware::from_fn_with_state(
-            None::<Arc<ProxySecret>>,
-            gate_requests,
-        ));
+    let app = farm.router.clone();
     tokio::spawn(async move {
         let service = app.into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, service).await.expect("serve");

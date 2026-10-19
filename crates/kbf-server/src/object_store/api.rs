@@ -33,13 +33,14 @@
 //! implementations (the real one and a test's).
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, RawQuery, State};
 use axum::http::header::{CACHE_CONTROL, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -57,7 +58,6 @@ use super::registry::{Registry, RegistryError};
 use super::secrets::SecretError;
 use crate::api::{gate, json};
 use crate::enroll::OsRandom;
-use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 
 /// The path every route is under.
@@ -303,7 +303,7 @@ struct Routes {
 
 impl Routes {
     /// The API, if the caller passed the gate and the feature is on.
-    fn admit(&self, peer: &Caller, headers: &HeaderMap) -> Result<Arc<ObjectStoreApi>, Failure> {
+    fn admit(&self, peer: SocketAddr, headers: &HeaderMap) -> Result<Arc<ObjectStoreApi>, Failure> {
         gate(self.token.as_ref(), peer, headers)
             .map_err(|(status, why)| Failure::gate(status, why))?;
         self.api.clone().ok_or_else(|| {
@@ -352,7 +352,7 @@ async fn no_store(mut response: Response) -> Response {
 /// Admits the call, runs `work` on the API, and answers.
 async fn serve<T, Fut>(
     routes: &Routes,
-    peer: &Caller,
+    peer: SocketAddr,
     headers: &HeaderMap,
     work: impl FnOnce(Arc<ObjectStoreApi>) -> Fut,
 ) -> Response
@@ -445,8 +445,12 @@ fn bad_json(e: &serde_json::Error, what: &str) -> Failure {
     ))
 }
 
-async fn status(State(state): State<Arc<Routes>>, peer: Caller, headers: HeaderMap) -> Response {
-    serve(&state, &peer, &headers, |api| {
+async fn status(
+    State(state): State<Arc<Routes>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    serve(&state, peer, &headers, |api| {
         blocking(move || api.status().map(|s| (StatusCode::OK, s)))
     })
     .await
@@ -454,11 +458,11 @@ async fn status(State(state): State<Arc<Routes>>, peer: Caller, headers: HeaderM
 
 async fn audit(
     State(state): State<Arc<Routes>>,
-    peer: Caller,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    serve(&state, &peer, &headers, |api| async move {
+    serve(&state, peer, &headers, |api| async move {
         let limit = limit_of(query.as_deref())?;
         blocking(move || api.audit(limit).map(|a| (StatusCode::OK, a))).await
     })
@@ -467,10 +471,10 @@ async fn audit(
 
 async fn connections(
     State(state): State<Arc<Routes>>,
-    peer: Caller,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    serve(&state, &peer, &headers, |api| {
+    serve(&state, peer, &headers, |api| {
         blocking(move || {
             Ok((
                 StatusCode::OK,
@@ -485,11 +489,11 @@ async fn connections(
 
 async fn connection(
     State(state): State<Arc<Routes>>,
-    peer: Caller,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(target): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    serve(&state, &peer, &headers, |api| async move {
+    serve(&state, peer, &headers, |api| async move {
         let name = connection_name(&target)?;
         blocking(move || {
             let info = api.registry.connection(&name)?;
@@ -503,12 +507,12 @@ async fn connection(
 
 async fn put_connection(
     State(state): State<Arc<Routes>>,
-    peer: Caller,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(target): Path<String>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    serve(&state, &peer, &headers, |api| async move {
+    serve(&state, peer, &headers, |api| async move {
         let name = connection_name(&target)?;
         let put: ConnectionPut = parse(body, "connection")?;
         blocking(move || api.put_connection(&name, &put)).await
@@ -518,11 +522,11 @@ async fn put_connection(
 
 async fn delete_connection(
     State(state): State<Arc<Routes>>,
-    peer: Caller,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(target): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    serve(&state, &peer, &headers, |api| async move {
+    serve(&state, peer, &headers, |api| async move {
         let name = connection_name(&target)?;
         blocking(move || {
             let written = api.registry.delete_connection(&name)?;
@@ -540,12 +544,12 @@ async fn delete_connection(
 
 async fn verify(
     State(state): State<Arc<Routes>>,
-    peer: Caller,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(target): Path<String>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    serve(&state, &peer, &headers, |api| async move {
+    serve(&state, peer, &headers, |api| async move {
         let Some(name) = target.strip_suffix(VERIFY) else {
             return Err(Failure::new(
                 StatusCode::NOT_FOUND,
@@ -562,12 +566,12 @@ async fn verify(
 
 async fn put_binding(
     State(state): State<Arc<Routes>>,
-    peer: Caller,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(role): Path<String>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    serve(&state, &peer, &headers, |api| async move {
+    serve(&state, peer, &headers, |api| async move {
         let role = role_of(&role)?;
         let put: BindingPut = parse(body, "binding")?;
         blocking(move || api.put_binding(role, &put)).await
@@ -577,11 +581,11 @@ async fn put_binding(
 
 async fn delete_binding(
     State(state): State<Arc<Routes>>,
-    peer: Caller,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(role): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    serve(&state, &peer, &headers, |api| async move {
+    serve(&state, peer, &headers, |api| async move {
         let role = role_of(&role)?;
         blocking(move || api.delete_binding(role)).await
     })
