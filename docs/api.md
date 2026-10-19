@@ -557,9 +557,17 @@ again. A member that left the map (a `DOWN` member leaves after the dwell) is no
 
 A `kbf --mode frontend` started with `--admin-listen <addr>` serves these on a port of
 their own, separate from the operator API. The address must be a loopback address (any
-other is refused at start, in the flags and again when the port is bound), and the calls
-carry no credential: they move the scheduler's role, so nothing but the host's own
-processes may reach them. The port needs `--state-store`. The calls and the `role` answer
+other is refused at start, in the flags and again when the port is bound): the calls move
+the scheduler's role, so nothing but the host's own processes may reach them. The port
+needs `--state-store`.
+
+**Who may call.** With `--proxy-auth-file` (a frontend behind the proxy) every call, `GET
+role` too, must present the proxy's secret as `x-kbf-proxy-auth: <64 hex digits>` (the
+header of [Behind the farm's proxy](#behind-the-farms-proxy); no identity header is
+needed). A call with no secret, or a wrong one, is refused `403` with
+`{"error": "..."}`, as on the operator API, and is not acted on. The proxy sends the secret
+on every admin call. Without `--proxy-auth-file` the calls take no credential: the port is
+loopback-only and every local process may call it, which is for a host with no proxy. The calls and the `role` answer
 are versioned by `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`).
 
 **`GET /v1/admin/role`**:

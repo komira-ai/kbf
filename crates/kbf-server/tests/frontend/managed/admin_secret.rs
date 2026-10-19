@@ -18,7 +18,12 @@ fn secret_file(scratch: &Scratch) -> (String, String) {
 }
 
 /// One admin call, with `x-kbf-proxy-auth: <secret>` when there is one.
-async fn admin_call(child: &Child, method: &str, path: &str, secret: Option<&str>) -> (u16, Value) {
+pub(super) async fn admin_call(
+    child: &Child,
+    method: &str,
+    path: &str,
+    secret: Option<&str>,
+) -> (u16, Value) {
     let header = secret.map_or_else(String::new, |s| format!("x-kbf-proxy-auth: {s}\r\n"));
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: kbf\r\n{header}Connection: close\r\n\

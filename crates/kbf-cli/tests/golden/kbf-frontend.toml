@@ -11,7 +11,7 @@
 # cpu-threads = "N"
 
 [handover]
-# Serve the admin calls (GET role, POST quiesce, resume, takeover, stand-down) on this loopback address. Anything that is not a loopback address is refused at start: the calls move the scheduler's role and carry no credential. Needs --state-store.
+# Serve the admin calls (GET role, POST quiesce, resume, takeover, stand-down) on this loopback address. Anything that is not a loopback address is refused at start: the calls move the scheduler's role. With --proxy-auth-file every call must present the proxy's secret (x-kbf-proxy-auth) or is refused 403; without it the calls take no credential, which is for a host with no proxy. Needs --state-store.
 # admin-listen = "ADDR"
 # Open the state store without taking its generation, bump no epoch and run no scheduler, reconciler or worker listener: serve /readyz, the health service and GetCapabilities until `POST takeover` makes this process the writer. Needs --admin-listen. A SQLite state file is held by one process (an exclusive lock), so a candidate cannot run beside the process that holds it: side by side needs the Postgres store.
 await-takeover = false
