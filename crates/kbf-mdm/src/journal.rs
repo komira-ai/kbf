@@ -164,7 +164,11 @@ mod tests {
         fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
             let log = self.clone();
             tracing_subscriber::fmt()
-                .with_writer(move || log.clone())
+                .with_writer(move || {
+                    let mut writer = log.clone();
+                    std::io::Write::flush(&mut writer).unwrap();
+                    writer
+                })
                 .with_ansi(false)
                 .finish()
         }
