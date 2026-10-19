@@ -10,6 +10,7 @@ use postgres::{Config, Statement};
 
 use super::Fail;
 use super::conn::Conn;
+use super::schema::{SchemaError, Supported, check_conn, require_durable};
 
 /// The time of the store's clock in microseconds since the Unix epoch, as SQL: the value
 /// of parameter `$n` when it is not NULL (a test's injected clock), else the database's
@@ -215,48 +216,14 @@ pub(super) struct Session {
     pub broken: bool,
 }
 
-/// The tables of one store, in its schema. Created under an advisory lock, so several
-/// frontends starting together do not race on the catalog.
-fn schema_sql(schema: &str) -> String {
-    format!(
-        "BEGIN;
-         SELECT pg_advisory_xact_lock(hashtext('kbf-state-schema'));
-         CREATE SCHEMA IF NOT EXISTS {schema};
-         CREATE TABLE IF NOT EXISTS {schema}.kv (
-             key text COLLATE \"C\" PRIMARY KEY,
-             value bytea NOT NULL,
-             version bigint NOT NULL,
-             expires_us bigint);
-         CREATE INDEX IF NOT EXISTS kv_expiry ON {schema}.kv (expires_us)
-             WHERE expires_us IS NOT NULL;
-         CREATE TABLE IF NOT EXISTS {schema}.feed (
-             rev bigint PRIMARY KEY,
-             key text NOT NULL,
-             kind smallint NOT NULL,
-             value bytea);
-         CREATE TABLE IF NOT EXISTS {schema}.counters (
-             name text PRIMARY KEY,
-             value bigint NOT NULL);
-         CREATE TABLE IF NOT EXISTS {schema}.head (
-             singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-             rev bigint NOT NULL);
-         INSERT INTO {schema}.head (rev) VALUES (0) ON CONFLICT DO NOTHING;
-         CREATE SEQUENCE IF NOT EXISTS {schema}.rev_seq;
-         COMMIT;"
-    )
-}
-
-fn connect(config: &Config, schema: &str, create: bool) -> Result<Session, Fail> {
+/// Opens a connection. The first one of a store (`judge` is `Some`) also refuses a schema
+/// outside what this build supports; later ones do not, so a serving child keeps working
+/// when the installer migrates under it.
+fn connect(config: &Config, schema: &str, judge: Option<Supported>) -> Result<Session, Fail> {
     let mut client = Conn::connect(config)?;
-    let setting: String = client.query_one("SHOW synchronous_commit", &[])?.get(0);
-    if !matches!(setting.as_str(), "on" | "remote_apply") {
-        return Err(Fail::Refused(format!(
-            "synchronous_commit is {setting:?} on this connection; the state store needs \
-             \"on\" (or \"remote_apply\"), or an acknowledged write can be lost"
-        )));
-    }
-    if create {
-        client.batch_execute(&schema_sql(schema))?;
+    require_durable(&mut client).map_err(refuse)?;
+    if let Some(supported) = judge {
+        check_conn(&mut client, schema, supported).map_err(refuse)?;
     }
     client.batch_execute(&format!(
         "SET search_path TO {schema}; SET default_transaction_isolation = 'read committed'"
@@ -267,6 +234,10 @@ fn connect(config: &Config, schema: &str, create: bool) -> Result<Session, Fail>
         st,
         broken: false,
     })
+}
+
+fn refuse(err: SchemaError) -> Fail {
+    Fail::Refused(err.to_string())
 }
 
 struct PoolState {
@@ -289,10 +260,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Pool {
-    /// Connects once, refusing a server that does not make commits durable, and creates
-    /// the schema if it is not there.
-    pub(super) fn open(config: Config, schema: String, max: usize) -> Result<Pool, Fail> {
-        let first = connect(&config, &schema, true)?;
+    /// Connects once, refusing a server that does not make commits durable and a schema
+    /// outside `supported`. It creates nothing: the installer owns the schema.
+    pub(super) fn open(
+        config: Config,
+        schema: String,
+        max: usize,
+        supported: Supported,
+    ) -> Result<Pool, Fail> {
+        let first = connect(&config, &schema, Some(supported))?;
         Ok(Pool {
             config,
             schema,
@@ -317,7 +293,7 @@ impl Pool {
             if state.open < self.max {
                 state.open += 1;
                 drop(state);
-                return match connect(&self.config, &self.schema, false) {
+                return match connect(&self.config, &self.schema, None) {
                     Ok(session) => Ok(Pooled {
                         pool: self,
                         session: Some(session),
@@ -408,8 +384,27 @@ mod tests {
     fn a_loan_is_a_working_session_and_comes_back_to_the_pool() {
         let url = std::env::var("KBF_TEST_POSTGRES_URL")
             .expect("KBF_TEST_POSTGRES_URL names a database the tests may create schemas in");
-        let config = PostgresConfig::parse(&url).expect("a usable URL");
-        let pool = Pool::open(config.pg.clone(), "kbf_unit_pool".to_owned(), 1).expect("opens");
+        let config = PostgresConfig::parse(&url)
+            .and_then(|config| config.with_schema("kbf_unit_pool"))
+            .expect("a usable URL");
+        postgres::Client::connect(&url, postgres::NoTls)
+            .and_then(|mut client| {
+                client.batch_execute("DROP SCHEMA IF EXISTS kbf_unit_pool CASCADE")
+            })
+            .expect("a clean schema");
+        crate::postgres::schema::apply(
+            &config,
+            &crate::postgres::schema::embedded(),
+            crate::postgres::schema::latest(),
+        )
+        .expect("the installer's step");
+        let pool = Pool::open(
+            config.pg.clone(),
+            "kbf_unit_pool".to_owned(),
+            1,
+            config.supported,
+        )
+        .expect("opens");
         let pid = |pooled: &mut super::Pooled<'_>| -> i32 {
             pooled
                 .client

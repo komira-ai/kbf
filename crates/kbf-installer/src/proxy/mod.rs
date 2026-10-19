@@ -8,8 +8,8 @@
 //! fsynced `update.json`; and [`orders::OrderSpool`], the one writer of every order the
 //! proxy puts in `orders/`. What is not: the proxy itself and the real child control
 //! (U4b, U7b), the update API ([`api`], U8a). [`child_http`] is the blocking
-//! loopback client that the real child control and the fleet read will call a child's
-//! ports with (U8b); nothing calls it yet.
+//! loopback client that the real child control and the fleet read call a child's ports
+//! with (U8b); [`admin`] is the `ChildAdmin` built on it, and nothing else calls it yet.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -56,6 +56,7 @@
 //!   again, takes the generation (no live holder, so the child bumps the epoch) and is
 //!   recorded. A live child that does not answer `role` is not reconciled.
 
+pub mod admin;
 mod aio;
 pub mod api;
 pub mod child_http;
@@ -67,6 +68,8 @@ mod recover;
 mod retire;
 mod swap;
 
+#[cfg(test)]
+mod admin_tests;
 #[cfg(test)]
 mod aio_tests;
 #[cfg(test)]
