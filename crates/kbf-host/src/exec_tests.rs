@@ -103,6 +103,39 @@ fn a_write_replaces_the_file_through_a_fresh_copy() {
     assert!(!dir.join(".f.kbf-host-tmp").exists());
 }
 
+/// Catches a file with secret bytes that is readable by others before it is given its mode.
+/// The copy is written first and chmodded after, so it is created 0600 whatever the umask. A
+/// step that fails between the write and the chmod (here the chown, refused to a process that
+/// is not root) leaves the copy behind, and the copy must be private: the bytes may be a
+/// token. A root process's chown does not fail, so there is nothing to look at and the test
+/// says so.
+///
+/// Mutant seen red: the copy created 0644.
+#[test]
+fn a_copy_left_by_a_failed_write_is_private() {
+    let (mut exec, dir) = host("private-copy");
+    let mine = me();
+    if mine.uid == 0 {
+        eprintln!("skipped: a root process's chown does not fail, so no copy is left to look at");
+        return;
+    }
+    let step = Step::WriteFile {
+        path: p("/secret"),
+        perms: Perms::new(0o600),
+        owner: Some(Owner {
+            uid: mine.uid + 1,
+            gid: mine.gid,
+        }),
+        bytes: b"token".to_vec(),
+    };
+    exec.apply(&step)
+        .expect_err("the chown to another user is refused");
+    assert!(!dir.join("secret").exists());
+    let copy = dir.join(".secret.kbf-host-tmp");
+    assert_eq!(fs::read(&copy).expect("the copy is left"), b"token");
+    assert_eq!(mode_of(&copy) & 0o077, 0, "{:o}", mode_of(&copy));
+}
+
 /// Catches `Mkdir` treating a file at the path as the directory (it would chmod the
 /// file, and every later run would plan the directory again), and an existing
 /// directory refused instead of having its permissions set.
