@@ -47,10 +47,9 @@ impl ForkedChild {
     pub fn before_exec() -> Self {
         let (go_rx, go_tx) = io::pipe().expect("a pipe");
         let (forked_rx, forked_tx) = io::pipe().expect("a pipe");
-        // `/bin/sh` is at that path on Linux and macOS; `true` is in `/bin` on one and
-        // `/usr/bin` on the other, and a search of `PATH` is not what a test of the fork wants.
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", ":"]);
+        // `/usr/bin/true` is at that path on macOS and on usr-merged Linux; a search of
+        // `PATH` is not what a test of the fork wants, and a shell is not needed.
+        let mut command = Command::new("/usr/bin/true");
         // SAFETY: the closure runs in the child between fork and exec, and does what
         // `hold` does: one `write` and one `read` on pipes it owns, allocating nothing.
         unsafe {
