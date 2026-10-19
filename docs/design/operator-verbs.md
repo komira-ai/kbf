@@ -99,6 +99,7 @@ All answer 404 when the feature is off.
 |---|---|---|---|
 | upload a release file | `PUT /v1/releases/{commit}/{platform}/{name}` | [F] | write, no content-type gate |
 | list releases | `GET /v1/releases` | [F] | open |
+| describe a release (its files by digest; the `releases/<commit>.json` of a `url` source) | `GET /v1/releases/{commit}` | [F] | open |
 | read the desired release, releases, policy | `GET /v1/update` | [V] #976, #985 | open |
 | set the desired release (also a rollback: an older commit, a higher generation) | `POST /v1/update/desired` | [V] #976 | write |
 | preview what a commit would change | `GET /v1/update/plan` | [V] #985 (design) | open |
