@@ -107,7 +107,7 @@ async fn a_fenced_holder_answers_its_waiting_callers_without_a_stand_down() {
 }
 
 /// A process that can be told to stop, and whose end can be read.
-struct Stoppable {
+pub(super) struct Stoppable {
     child: Child,
     stop: oneshot::Sender<()>,
     ended: JoinHandle<Result<(), kbf_server::managed::ManagedError>>,
@@ -115,7 +115,7 @@ struct Stoppable {
 }
 
 impl Stoppable {
-    async fn start(flags: &FrontendFlags, source: StoreSource) -> Self {
+    pub(super) async fn start(flags: &FrontendFlags, source: StoreSource) -> Self {
         let (stop, stopped) = oneshot::channel::<()>();
         let managed = Managed::start(flags, source, async move {
             let _ = stopped.await;
@@ -141,7 +141,7 @@ impl Stoppable {
     }
 
     /// Stops it and returns how its serving ended.
-    async fn stopped(self) -> Result<(), String> {
+    pub(super) async fn stopped(self) -> Result<(), String> {
         let _ = self.stop.send(());
         tokio::time::timeout(Duration::from_secs(20), self.ended)
             .await
