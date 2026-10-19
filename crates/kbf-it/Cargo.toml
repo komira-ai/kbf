@@ -52,6 +52,9 @@ http.workspace = true
 kbf-front.workspace = true
 # The Envoy render the real-Envoy tests (tests/envoy_box, tests/envoy_check.rs) run.
 kbf-installer.workspace = true
+# `tests/package_trust.rs`: the installer's settings parser reads the `installer.conf`
+# that `cargo xtask pkg-trust` writes, from a fake host.
+kbf-host = { workspace = true, features = ["testkit"] }
 kbf-proto.workspace = true
 kbf-proxy.workspace = true
 kbf-server.workspace = true

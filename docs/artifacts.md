@@ -34,7 +34,8 @@ earlier run: add the labels together, before the run you want to keep. The condi
 ## What is built
 
 Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
-([below](#provenance-bundles-verifying-a-tarball-offline)), built by one job per platform:
+([below](#provenance-bundles-verifying-a-tarball-offline)), and two Debian packages of
+`kbf-installer` ([below](#the-kbf-installer-package-deb)), built by one job per platform:
 
 | Asset | Runner | Target |
 |---|---|---|
@@ -55,6 +56,13 @@ updates it ([kbf-installer.md](design/kbf-installer.md)); it is built, signed, a
 and released like the others, so a package or an operator takes it by digest from these
 files. It is not a component of the release it installs on a host, and it does not
 update itself (the design's section 1).
+
+The packages are the two Linux jobs' as well:
+
+| Asset | Built by | Holds |
+|---|---|---|
+| `kbf-installer-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf-installer` of the tarball of the same name, the units, the pinned `gh` for amd64 and a trust directory |
+| `kbf-installer-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
 
 The set above is pinned: `crates/kbf-it/tests/release_artifacts` fails a pull request
 that drops one of these files from the workflow, packages one that is not listed, or
@@ -250,11 +258,12 @@ How a bundle is made, and what is checked of it:
   artifact `bundles-linux` or `bundles-darwin-arm64`.
 - **Not an SBOM's.** The SBOM attestation of a tarball carries the whole SBOM and can be
   larger than a bundle may be (below); it is not given to a host. A tarball has exactly
-  one bundle, and nothing else has one.
+  one bundle, a `kbf-installer` package has exactly one (`<package>.sigstore.json`, the
+  same kind of attestation over the one `.deb`), and nothing else has one.
 - **Not in `SHA256SUMS`.** The bundle is made after the sums, from the files they list, so
   they cannot list it. `cargo xtask verify-assets sums` leaves out names that end
   `.sigstore.json`, and `cargo xtask release check` holds the directory to one
-  `<tarball>.sigstore.json` per tarball the sums list and none for anything else.
+  `<tarball>.sigstore.json` per tarball (and per `.deb`) the sums list and none for anything else.
 - **Its size and shape.** A bundle is one line of JSON (`mediaType` of a Sigstore bundle,
   `dsseEnvelope`, `verificationMaterial`) of at most 256 KiB, the room a host's order
   record has for one. `release check` refuses an empty file, two bundles in one file and
@@ -275,6 +284,63 @@ How a bundle is made, and what is checked of it:
   tarball's bundle for another commit, and a copy of the first tarball with a byte
   flipped. The bundles in `dir` are first held to one per listed tarball and none for
   anything else, so a stray bundle fails the `verify-*` job rather than the release.
+
+## The kbf-installer package (deb)
+
+`kbf-installer` is installed by a package manager and never updates itself
+([kbf-installer.md](design/kbf-installer.md) section 1; the installer takes the `kbf`
+releases it installs from the files above, not its own replacement), so its deb is the
+way a host gets it. Each Linux job builds it from the binary it has just built and
+checked (`cargo xtask pkg-trust`, `pkg-config`, `pkg-build`: nfpm, pinned by SHA-256,
+builds it twice and the bytes must match), installs, runs and removes it in a fresh
+Ubuntu 24.04 container (`cargo xtask pkg-install-test`), and then `cargo xtask pkg-asset`
+makes it the asset `kbf-installer-<commit>-<platform>.deb` and lists it in `SHA256SUMS`,
+refusing it unless:
+
+- `usr/bin/kbf-installer` is byte for byte the binary in the tarball
+  `build-commit check-asset` checked for the commit;
+- its control file says the architecture of the platform;
+- `/usr/share/kbf-installer/trust/gh` is the pinned `gh` the job downloaded (checked by
+  SHA-256 before use) and executable, `trusted_root.jsonl` is the Sigstore trusted root
+  that `gh` fetched, and `installer.conf` is exactly `SOURCE_REFS=refs/heads/<branch>`,
+  **the branch the package is attested on**: a package built on `main` trusts `main`
+  releases and one built on `feature/arch-v2` trusts that branch's, never the other.
+
+It is attested like a tarball: build provenance (as one subject of the `SHA256SUMS`
+attestation, and alone, with its bundle `kbf-installer-<commit>-<platform>.deb.sigstore.json`
+in `bundles-linux`) and **no SBOM attestation**: provenance and a bundle only. (Its
+binary has an SBOM, in the tarball's; the `gh` it carries has none here.) The verify job
+checks both offline with the installer's flags, and runs `cargo xtask pkg-asset
+--verify-only` on the signed file, so the package that was attested is the one whose
+contents were checked.
+
+To install one, verify it first, then `dpkg -i` (every flag is the installer's: `GhCheck::args`
+in `crates/kbf-installer/src/attest.rs`; the host has no pinned `gh` before this
+package, so use the operator's own):
+
+```text
+gh run download <run-id> -R komira-ai/kbf -n assets-linux-x86_64 -n bundles-linux -n sha256sums-linux
+sha256sum --check --strict --ignore-missing SHA256SUMS
+gh attestation trusted-root > trusted_root.jsonl
+gh attestation verify kbf-installer-<commit>-linux-x86_64.deb \
+  --bundle kbf-installer-<commit>-linux-x86_64.deb.sigstore.json \
+  --custom-trusted-root trusted_root.jsonl \
+  --repo komira-ai/kbf \
+  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --source-ref refs/heads/feature/arch-v2 \
+  --source-digest <commit> \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --deny-self-hosted-runners
+sudo dpkg -i kbf-installer-<commit>-linux-x86_64.deb
+```
+
+(`--source-ref` is the branch the package was built on: `refs/heads/main` for a release's
+package.) Known limits: a package manager checks no Sigstore attestation, only the package
+file you give it, so the verification above is the operator's step; the package is not
+signed with a key and is not published through an apt repository; and the trusted root
+inside it is a snapshot, which a later Sigstore key rotation outdates (no code reads its
+`valid_until` yet).
 
 ## Where the files are, and for how long
 
