@@ -444,3 +444,30 @@ fn the_unpack_is_one_daemon_mode_over_two_directories() {
     assert!(!job.binds[1].writable);
     assert_eq!(job.binds.len(), 2);
 }
+
+/// Catches a lease's bundle lacking a file the container's name lookups read, or a file
+/// the container's ids cannot read (they are others of the daemon user's). `hosts` names
+/// `localhost` for both families; `resolv.conf` has the loopback nameserver nothing
+/// listens on, so a name outside `hosts` is refused at once rather than waited for.
+#[tokio::test]
+async fn the_bundle_has_hosts_hostname_and_resolv_conf_others_can_read() {
+    let dir = scratch("bundle");
+    let oci = start(&config(&dir, true), &dir.join("scratch")).expect("started");
+    let mut spec = crate::container::tests::spec();
+    spec.dir = dir.join("lease");
+    oci.create(&spec).await.expect("bundle");
+    for (name, content) in [
+        ("hosts", "127.0.0.1 localhost\n::1 localhost\n"),
+        ("hostname", "localhost\n"),
+        ("resolv.conf", "nameserver 127.0.0.1\n"),
+    ] {
+        let path = spec.dir.join("etc").join(name);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect(name),
+            content,
+            "{name}"
+        );
+        let mode = std::fs::metadata(&path).expect(name).permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "{name}");
+    }
+}

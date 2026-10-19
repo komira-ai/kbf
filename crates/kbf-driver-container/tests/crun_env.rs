@@ -78,12 +78,12 @@ fn expected(limits: ContainerLimits) -> String {
         nproc,
     } = limits;
     let shm_kib = shm_mib * 1024;
-    format!("{pids}\n{shm_kib}k\n{nofile}\n{nofile}\n{nproc}\n{nproc}\n0\n0\n")
+    format!("{pids}\n{shm_kib}k\n{nofile}\n{nofile}\n{nproc}\n{nproc}\n1000\n1000\n")
 }
 
 /// Catches a limit left to the runtime's defaults (the "drop the pids limit" mutant:
 /// `pids.max` then reads `max`, no limit at all), a limit that is not the configured one,
-/// and the action not running as the container's root.
+/// and the action not running as uid and gid 1000.
 #[tokio::test]
 #[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn the_configured_limits_hold_inside_the_container() {
@@ -150,4 +150,40 @@ async fn a_program_the_container_cannot_start_is_the_actions_failure() {
         assert!(stderr.contains(says), "{stderr}");
         cell.assert_clean(seq);
     }
+}
+
+/// What an action sees of the user and the network configuration a build tool relies on,
+/// one fact per line: its ids, a file of mode 000 it made itself (read or refused), and
+/// the `hosts` and `resolv.conf` it reads, between markers.
+const SANDBOX_FILES: &str = "id -u; id -g; \
+    touch /tmp/closed; chmod 000 /tmp/closed; \
+    if cat /tmp/closed >/dev/null 2>&1; then echo closed-readable; else echo closed-refused; fi; \
+    echo '[hosts]'; cat /etc/hosts; echo '[resolv.conf]'; cat /etc/resolv.conf";
+
+/// Catches the action running as root and the files that name `localhost` and a lookup that
+/// cannot reach a resolver being left to the image. A tool that tests permissions (a mode-000
+/// file is refused to a non-root user and read by root), resolves `localhost` through
+/// `getaddrinfo` (which reads `hosts`, and with no entry for a name asks the nameserver of
+/// `resolv.conf`, here 127.0.0.1 with nothing behind it: a refused query is `EAI_AGAIN`) is
+/// what a build worker runs. The "run as uid 0" mutant prints `0`, `0` and `closed-readable`;
+/// the "no `hosts`" and "no `resolv.conf`" mutants lose their sections.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn the_action_is_unprivileged_and_has_a_hosts_file_and_a_loopback_resolver() {
+    let cell = Cell::new("sandbox-files");
+    let result = cell.run(1, &sh(SANDBOX_FILES)).await.expect("ran");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "{}\n{}",
+        cell.stdout(&result),
+        cell.stderr(&result)
+    );
+    assert_eq!(
+        cell.stdout(&result),
+        "1000\n1000\nclosed-refused\n\
+         [hosts]\n127.0.0.1 localhost\n::1 localhost\n\
+         [resolv.conf]\nnameserver 127.0.0.1\n"
+    );
+    cell.assert_clean(1);
 }

@@ -53,7 +53,7 @@ async fn the_overlay_is_the_containers_while_it_runs_and_the_daemons_after() {
     assert_eq!(
         events,
         [
-            format!("chown 1:1 {dirs}"),
+            format!("chown 1001:1001 {dirs}"),
             "run ended".to_owned(),
             format!("chown 0:0 {dirs}"),
         ]
@@ -73,7 +73,7 @@ async fn the_overlay_is_the_containers_while_it_runs_and_the_daemons_after() {
 #[tokio::test]
 async fn the_inputs_phases_line_times_the_hand_over() {
     let fake = Fake::new("chown-sleeps");
-    fake.knob("chown-sleeps", "1:1");
+    fake.knob("chown-sleeps", "1001:1001");
     let logs = Logs::capture();
     let result = fake
         .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
@@ -106,7 +106,7 @@ async fn a_failed_hand_over_fails_the_lease_and_leaves_nothing() {
     let fake = Fake::new("chown-fails");
     let spec = Spec::new(&image(), "unused");
 
-    fake.knob("chown-fails", "1:1");
+    fake.knob("chown-fails", "1001:1001");
     let outcome = fake.run(1, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why))
@@ -144,6 +144,6 @@ async fn a_timed_out_lease_is_not_handed_back() {
     );
     let chowns = chowns(&fake);
     assert_eq!(chowns.len(), 1, "{chowns:?}");
-    assert!(chowns[0].starts_with("chown 1:1 "), "{chowns:?}");
+    assert!(chowns[0].starts_with("chown 1001:1001 "), "{chowns:?}");
     fake.assert_clean(1);
 }
