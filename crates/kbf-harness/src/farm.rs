@@ -128,7 +128,6 @@ fn settings(
         ("KBF_DATA_DIR", at("data")),
         ("KBF_META_DIR", at("meta")),
         ("KBF_HOT_DIR", at("hot")),
-        ("KBF_STATE_DIR", at("state")),
         ("KBF_IMAGES", image.to_owned()),
     ])
 }
@@ -304,9 +303,15 @@ impl Farm {
         let _ = std::fs::remove_file(&socket);
         let control = format!("--handover-socket={}", socket.display());
         farm.socket = Some(socket);
+        // The unit's state store is the host's Postgres and it has no control socket (kbf
+        // refuses the two together); the box has no Postgres, so the farm gives the frontend
+        // a SQLite file and its socket.
+        let state = format!("--state-store=sqlite://{}/state/state.db", root.display());
         let unit = overrides(
             Role::Frontend,
-            unit.replace(&[control]).set(&topo.limits.frontend),
+            unit.replace(&[state])
+                .append(&[control])
+                .set(&topo.limits.frontend),
         );
         farm.launch(&bins.kbf, Role::Frontend, &root, unit, None);
         let line = farm.start_line(Role::Frontend, "kbf-frontend ")?;

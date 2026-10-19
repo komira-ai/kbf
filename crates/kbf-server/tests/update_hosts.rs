@@ -348,6 +348,10 @@ async fn the_per_host_detail_needs_the_farm_get_authority() {
 /// replaced, and the open `/v1/nodes` carries none of it and none of the commits. Also the
 /// commits, the generation and the helper flag as sent, and the desired commit.
 ///
+/// The refusal starts with a word that is not hex: `/v1/nodes` carries the server's own
+/// 12-hex build commit (`KBF_BUILD_COMMIT`), which a hex word such as "bad" can occur in
+/// by chance, as it did in a CI merge commit.
+///
 /// Mutants seen red: refusal stored uncut; cut by `chars().take(512)`; control characters
 /// kept; refusal or commits on `/v1/nodes`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -358,7 +362,7 @@ async fn the_detail_names_commits_and_a_refusal_that_is_capped_data() {
     let daemon = FakeDaemon::connect(running.worker, hello("node-a", 1, 1))
         .await
         .expect("registered");
-    let refusal = format!("bad\n{}", "\u{20ac}".repeat(100 * 1024 / 3));
+    let refusal = format!("nope\n{}", "\u{20ac}".repeat(100 * 1024 / 3));
     daemon.send(daemon_message::Message::UpdateStatus(UpdateStatus {
         running_commit: B[..12].to_owned(),
         installed_commit: B.to_owned(),
@@ -375,8 +379,11 @@ async fn the_detail_names_commits_and_a_refusal_that_is_capped_data() {
         &json!({"state": "refused", "up_to_date": false, "availability": "ok"})
     );
     let open = nodes.to_string();
-    for secret in [B, A, "bad", "\u{20ac}"] {
-        assert!(!open.contains(secret), "/v1/nodes carries {secret:?}");
+    for secret in [B, A, "nope", "\u{20ac}"] {
+        assert!(
+            !open.contains(secret),
+            "/v1/nodes carries {secret:?}: {open}"
+        );
     }
 
     let (code, body) = get(running.api, "/v1/update/hosts").await;
@@ -396,7 +403,7 @@ async fn the_detail_names_commits_and_a_refusal_that_is_capped_data() {
     let refusal = host["refusal"].as_str().expect("a refusal");
     assert!(refusal.len() <= 512, "{} bytes", refusal.len());
     assert!(refusal.len() > 500, "{} bytes", refusal.len());
-    assert!(refusal.starts_with("bad\u{fffd}"), "{refusal:?}");
+    assert!(refusal.starts_with("nope\u{fffd}"), "{refusal:?}");
     assert!(!refusal.contains('\n'));
 }
 

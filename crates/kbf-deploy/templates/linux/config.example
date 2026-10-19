@@ -67,9 +67,11 @@ KBF_REAPI_KEY=
 # there; install-units never makes it and refuses a missing one, one not the server
 # user's, or one with a group or other bit.
 KBF_API_TOKEN_FILE=
-# `--mode frontend`: the directory of the SQLite state store (--state-store=
-# sqlite://<dir>/state.db). install-units makes it, the server user's, mode 0700.
-KBF_STATE_DIR=/var/lib/kbf-server/state
+# `--mode frontend`: the state store (--state-store), a postgres:// URI with no password
+# (kbf refuses one): the socket form below is the host's own Postgres. The database and its
+# schema are kbf-installer's. SQLite is dropped for the frontend; this replaces KBF_STATE_DIR,
+# which is now an unknown key.
+KBF_STATE_STORE=postgres:///kbf?host=/run/postgresql
 KBF_REAPI_PORT=8980
 KBF_WORKER_PORT=8981
 KBF_API_PORT=8982

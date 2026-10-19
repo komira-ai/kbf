@@ -78,6 +78,12 @@
 mod stages;
 mod yaml;
 
+mod jobs;
+pub use jobs::{
+    dispatch_inputs, job_env, job_environment, job_needs, job_outputs, job_permission_levels,
+    push_filters,
+};
+
 use yaml::{Node, Value};
 
 /// The keys GitHub reads at the top of a workflow file.
@@ -300,25 +306,6 @@ pub fn job_condition(text: &str, job: &str) -> Result<Option<String>, String> {
             .map(|c| Some(c.to_owned()))
             .ok_or_else(|| format!("the `if:` of job `{job}` is not a string")),
     }
-}
-
-/// The `env:` entries of the job `job` (its key matched ignoring ASCII case) whose values
-/// are strings, in file order. An error when the text does not parse or has no such job.
-pub fn job_env(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
-    let root = yaml::load(text)?;
-    let Some(Value::Map(jobs)) = get(top_of(&root)?, "jobs").map(|j| &j.value) else {
-        return Err("the workflow has no `jobs` mapping".to_owned());
-    };
-    let Some(Value::Map(found)) = get(jobs, job).map(|j| &j.value) else {
-        return Err(format!("the workflow has no job `{job}`"));
-    };
-    Ok(match get(found, "env").map(|e| &e.value) {
-        Some(Value::Map(env)) => env
-            .iter()
-            .filter_map(|(k, v)| Some((k.as_str()?.to_owned(), v.as_str()?.to_owned())))
-            .collect(),
-        _ => Vec::new(),
-    })
 }
 
 /// The names of the jobs of a workflow text, in file order. An error when the text does not
