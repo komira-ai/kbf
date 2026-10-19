@@ -246,6 +246,7 @@ impl Farm {
             interrupt: topo.interrupt.clone(),
             socket: None,
             claim: Some((claim, ports.clone())),
+            scratch: None,
         };
         let overrides = |role: Role, unit: Rendered| {
             let flags: Vec<String> = topo
