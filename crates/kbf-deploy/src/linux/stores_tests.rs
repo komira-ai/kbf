@@ -243,3 +243,54 @@ fn no_two_listeners_share_a_port() {
         )]
     );
 }
+
+/// Rule `meta-dir`: `--meta-dir` is not the data directory or under it, however the path
+/// is written. Catches a metadata directory inside `--data-dir` passing (also spelled
+/// with `.` or `..`), a sibling that only shares a name prefix (`/var/lib/kbf-server`
+/// beside `/var/lib/kbf`) refused, and a unit with only one of the two flags refused.
+#[test]
+fn the_meta_dir_is_not_under_the_data_dir() {
+    let unit = |meta: &str, data: &str| {
+        UnitFile::parse(&format!(
+            "[Service]\nExecStart=/usr/local/bin/kbf all-in-one {meta} {data}\n"
+        ))
+        .expect("a unit")
+    };
+    let under = |flags: &UnitFile| meta_dir(flags).len();
+    let rows = [
+        (
+            "--meta-dir=/var/lib/kbf-server/raft",
+            "--data-dir=/var/lib/kbf",
+            0,
+        ),
+        ("--meta-dir=/var/lib/kbf/raft", "--data-dir=/var/lib/kbf", 1),
+        ("--meta-dir=/var/lib/kbf", "--data-dir=/var/lib/kbf", 1),
+        (
+            "--meta-dir=/var/lib/kbf/./a/../raft",
+            "--data-dir=/var/lib/kbf",
+            1,
+        ),
+        (
+            "--meta-dir=/var/lib/kbf/../raft",
+            "--data-dir=/var/lib/kbf",
+            0,
+        ),
+        (
+            "--meta-dir=/var/lib/kbf/raft",
+            "--data-dir=/var/lib/kbf/",
+            1,
+        ),
+        ("--meta-dir=/var/lib/kbf/raft", "--verbose", 0),
+        ("--verbose", "--data-dir=/var/lib/kbf", 0),
+        // A relative path is left to rules `storage` and the parser: compared lexically
+        // it would be "under" `.` or under a relative twin, and refused here for the
+        // wrong reason.
+        ("--meta-dir=var/lib/kbf/raft", "--data-dir=var/lib/kbf", 0),
+        ("--meta-dir=raft", "--data-dir=.", 0),
+        ("--meta-dir=/var/lib/kbf/raft", "--data-dir=var/lib/kbf", 0),
+        ("--meta-dir=var/lib/kbf/raft", "--data-dir=/var/lib/kbf", 0),
+    ];
+    for (meta, data, want) in rows {
+        assert_eq!(under(&unit(meta, data)), want, "{meta} {data}");
+    }
+}

@@ -41,7 +41,7 @@ use kbf_host::exec::Exec;
 use kbf_host::plan::{Mode, Planner, RunAs, execute};
 
 use crate::CommitId;
-use crate::layout::{self, Layout, path};
+use crate::layout::{self, Layout};
 use crate::release::{ReleaseError, has_binary};
 use crate::state::{Locked, PendingConfirm, State};
 
@@ -139,6 +139,7 @@ fn open(host: &Layout) -> Result<(Locked, State), ReleaseError> {
 /// link moved; a state with no current release has nothing to point at.
 fn converge<E: Exec>(
     exec: &mut E,
+    host: &Layout,
     state: &State,
     out: &mut dyn Write,
 ) -> Result<bool, ReleaseError> {
@@ -148,12 +149,12 @@ fn converge<E: Exec>(
     let mut planner = Planner::new(&*exec);
     let mut moved = false;
     match &state.previous {
-        Some(c) => moved |= planner.symlink(path(layout::PREVIOUS), layout::release_link(c))?,
+        Some(c) => moved |= planner.symlink(host.previous(), layout::release_link(c))?,
         None => {
-            planner.absent(path(layout::PREVIOUS))?;
+            planner.absent(host.previous())?;
         }
     }
-    moved |= planner.symlink(path(layout::CURRENT), layout::release_link(current))?;
+    moved |= planner.symlink(host.current(), layout::release_link(current))?;
     let plan = planner.finish();
     execute(&plan, RunAs::Root, Mode::Apply, exec, &mut &mut *out)?;
     Ok(moved)
@@ -174,17 +175,17 @@ pub fn activate<E: Exec>(
     };
     let (lock, state) = open(host)?;
     if let Some(p) = &state.pending_confirm {
-        if p.order_id.as_deref() != Some(order.order_id.as_str()) {
+        if p.activation != order.order_id {
             return Err(ReleaseError::Pending(p.commit.clone()));
         }
-        converge(exec, &state, out)?;
+        converge(exec, host, &state, out)?;
         return Ok(Activated::Repeat);
     }
     if state.current.as_ref() == Some(&order.commit) {
-        converge(exec, &state, out)?;
+        converge(exec, host, &state, out)?;
         return Ok(Activated::AlreadyCurrent);
     }
-    if !has_binary(exec, &order.commit) {
+    if !has_binary(exec, host, &order.commit) {
         return Err(ReleaseError::NotInstalled(order.commit.clone()));
     }
     let next = State {
@@ -192,16 +193,17 @@ pub fn activate<E: Exec>(
         previous: state.current.clone(),
         staged: state.staged.clone().filter(|c| *c != order.commit),
         pending_confirm: Some(PendingConfirm {
+            activation: order.order_id.clone(),
             commit: order.commit.clone(),
             previous: state.current.clone(),
-            deadline,
-            order_id: Some(order.order_id.clone()),
+            deadline_wall: deadline,
+            deadline_mono_s: None,
             starts_left,
         }),
-        order_floor: state.order_floor,
+        ..state.clone()
     };
     lock.write(&next)?;
-    converge(exec, &next, out)?;
+    converge(exec, host, &next, out)?;
     Ok(Activated::Swapped)
 }
 
@@ -220,15 +222,12 @@ pub fn confirm(
             Err(ReleaseError::NotPending(commit.clone()))
         };
     };
-    match p.order_id.as_deref() {
-        Some(id) if id == order_id && p.commit == *commit => {}
-        other => {
-            return Err(ReleaseError::OtherOrder {
-                commit: p.commit.clone(),
-                pending: other.unwrap_or("(none)").to_owned(),
-                got: order_id.to_owned(),
-            });
-        }
+    if p.activation != order_id || p.commit != *commit {
+        return Err(ReleaseError::OtherOrder {
+            commit: p.commit.clone(),
+            pending: p.activation.clone(),
+            got: order_id.to_owned(),
+        });
     }
     lock.write(&State {
         pending_confirm: None,
@@ -245,11 +244,12 @@ pub fn revert<E: Exec>(
     out: &mut dyn Write,
 ) -> Result<Reverted, ReleaseError> {
     let (lock, state) = open(host)?;
-    revert_in(exec, lock, state, out)
+    revert_in(exec, host, lock, state, out)
 }
 
 fn revert_in<E: Exec>(
     exec: &mut E,
+    host: &Layout,
     lock: Locked,
     state: State,
     out: &mut dyn Write,
@@ -261,7 +261,7 @@ fn revert_in<E: Exec>(
     let Some(to) = back else {
         return Err(ReleaseError::NoPrevious);
     };
-    if !has_binary(exec, &to) {
+    if !has_binary(exec, host, &to) {
         return Err(ReleaseError::PreviousGone(to));
     }
     let from = state.current.clone();
@@ -272,7 +272,7 @@ fn revert_in<E: Exec>(
         ..state
     };
     lock.write(&next)?;
-    converge(exec, &next, out)?;
+    converge(exec, host, &next, out)?;
     Ok(Reverted { from, to })
 }
 
@@ -290,13 +290,13 @@ pub fn boot_check<E: Exec>(
     let Some(p) = state.pending_confirm.clone() else {
         return Ok(Boot::Nothing);
     };
-    if p.starts_left == Some(0) || p.deadline.is_some_and(|d| now >= d) {
-        return Ok(Boot::Reverted(revert_in(exec, lock, state, out)?));
+    if p.starts_left == Some(0) || p.deadline_wall.is_some_and(|d| now >= d) {
+        return Ok(Boot::Reverted(revert_in(exec, host, lock, state, out)?));
     }
     let starts_left = p.starts_left.map(|n| n - 1);
     lock.write(&State {
         pending_confirm: Some(PendingConfirm {
-            deadline: p.deadline.or(Some(now + window_secs)),
+            deadline_wall: p.deadline_wall.or(Some(now + window_secs)),
             starts_left,
             ..p
         }),
@@ -316,10 +316,10 @@ pub fn expire<E: Exec>(
     let Some(p) = &state.pending_confirm else {
         return Ok(Expiry::Nothing);
     };
-    match p.deadline {
+    match p.deadline_wall {
         None => Ok(Expiry::NotStarted),
         Some(d) if now < d => Ok(Expiry::Waiting { secs_left: d - now }),
-        Some(_) => Ok(Expiry::Reverted(revert_in(exec, lock, state, out)?)),
+        Some(_) => Ok(Expiry::Reverted(revert_in(exec, host, lock, state, out)?)),
     }
 }
 
@@ -331,7 +331,7 @@ pub fn reconcile<E: Exec>(
     out: &mut dyn Write,
 ) -> Result<bool, ReleaseError> {
     let (_lock, state) = open(host)?;
-    converge(exec, &state, out)
+    converge(exec, host, &state, out)
 }
 
 #[cfg(test)]

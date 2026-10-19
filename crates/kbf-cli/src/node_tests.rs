@@ -1,11 +1,14 @@
-//! What `kbf node` runs for the roles it was granted: the command line of each mode,
+//! What a start that reads `kbf.toml` runs for its mode: the command line of each mode,
 //! built from `kbf.toml` and the frontend's configuration, and parsed by the mode's own
-//! parser.
+//! parser; how the mode is resolved; how long a start waits to try again.
 
 use kbf_enroll::config::{Config, Host};
 use kbf_enroll::store::{Node as Enrolled, Store, StoredCert, StoredConfig};
 
+use crate::enroll::Want;
+
 use super::*;
+use crate::parse_from;
 
 const FRONTEND: &str = "https://farm.example:8990";
 
@@ -69,6 +72,10 @@ fn enrolled(held: &[&str], config: StoredConfig) -> Enrolled {
     }
 }
 
+fn want(mode: &str) -> Want {
+    Want::of(mode).expect("a mode that reads kbf.toml")
+}
+
 fn strings(argv: &[OsString]) -> Vec<String> {
     argv.iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -104,12 +111,20 @@ fn a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints() {
     let config = config(&c.root, "[daemon]\nreserve_cpus = 2\n");
     let node = enrolled(&["daemon"], sent(&["daemon"]));
     let labels = ["pool=mac".to_owned(), "rack=r2".to_owned()];
-    let argv = plan(&config, &node, &c.store, Driver::Native, &labels).expect("a plan");
+    let argv = plan(
+        &config,
+        &node,
+        &c.store,
+        Driver::Native,
+        &labels,
+        want(names::DAEMON),
+    )
+    .expect("a plan");
     assert_eq!(
         strings(&argv),
         [
             "kbf".to_owned(),
-            "daemon".to_owned(),
+            "--mode=daemon".to_owned(),
             "--driver=native".to_owned(),
             "--server=https://farm.example:8981".to_owned(),
             "--cas=https://farm.example:8981".to_owned(),
@@ -128,7 +143,15 @@ fn a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints() {
     let mut stored = sent(&["daemon"]);
     stored.cas_endpoint = "https://blobs.example:8981".to_owned();
     let node = enrolled(&["daemon"], stored);
-    let argv = plan(&config, &node, &c.store, Driver::Container, &[]).expect("a plan");
+    let argv = plan(
+        &config,
+        &node,
+        &c.store,
+        Driver::Container,
+        &[],
+        want(names::DAEMON),
+    )
+    .expect("a plan");
     let argv = strings(&argv);
     assert!(argv.contains(&"--cas=https://blobs.example:8981".to_owned()));
     assert!(argv.contains(&"--driver=container".to_owned()));
@@ -143,12 +166,20 @@ fn a_storage_only_node_runs_kbf_storage_registered_with_the_frontend() {
     let c = case("storage");
     let config = config(&c.root, "[storage]\n");
     let node = enrolled(&["storage"], sent(&["storage"]));
-    let argv = plan(&config, &node, &c.store, Driver::Container, &[]).expect("a plan");
+    let argv = plan(
+        &config,
+        &node,
+        &c.store,
+        Driver::Container,
+        &[],
+        want(names::STORAGE),
+    )
+    .expect("a plan");
     assert_eq!(
         strings(&argv),
         [
             "kbf".to_owned(),
-            "storage".to_owned(),
+            "--mode=storage".to_owned(),
             "--cold-store=s3://bucket/prefix/?endpoint=https://objects.example".to_owned(),
             format!("--hot-store=file://{}", state(&c, "hot")),
             format!("--meta-dir={}", state(&c, "meta")),
@@ -164,7 +195,15 @@ fn a_storage_only_node_runs_kbf_storage_registered_with_the_frontend() {
     assert!(matches!(parse_from(argv), Ok(Invocation::Storage(_))));
 
     let config = config_with_advertise(&c);
-    let argv = plan(&config, &node, &c.store, Driver::Container, &[]).expect("a plan");
+    let argv = plan(
+        &config,
+        &node,
+        &c.store,
+        Driver::Container,
+        &[],
+        want(names::STORAGE),
+    )
+    .expect("a plan");
     let argv = strings(&argv);
     assert!(argv.contains(&"--advertise-addr=node-02.farm.example:9000".to_owned()));
     assert!(argv.contains(&"--storage-zone=rack-a".to_owned()));
@@ -188,9 +227,17 @@ fn a_node_with_both_roles_runs_the_converged_mode() {
     let mut stored = sent(&["storage", "daemon"]);
     stored.tls_reload_interval_s = 0;
     let node = enrolled(&["storage", "daemon"], stored);
-    let argv = plan(&config, &node, &c.store, Driver::Container, &[]).expect("a plan");
+    let argv = plan(
+        &config,
+        &node,
+        &c.store,
+        Driver::Container,
+        &[],
+        want(names::STORAGE_AND_DAEMON),
+    )
+    .expect("a plan");
     let text = strings(&argv);
-    assert_eq!(text[1], "storage-and-daemon");
+    assert_eq!(text[1], "--mode=storage-and-daemon");
     assert!(text.iter().any(|a| a.starts_with("--storage-listen=")));
     assert!(text.iter().any(|a| a.starts_with("--cert=")));
     assert!(!text.iter().any(|a| a.starts_with("--cas=")), "{text:?}");
@@ -206,17 +253,15 @@ fn a_node_with_both_roles_runs_the_converged_mode() {
     ));
 }
 
-/// Catches a node that starts with a configuration it cannot run: no worker endpoint, a
-/// storage role with no usable port or no cold store, roles the node cannot name, and a
-/// role the frontend granted that the node holds no certificate for (it would start a
-/// mode whose certificate files do not exist). Each says what is missing.
+/// Catches a node that starts with a configuration it cannot run: no worker endpoint, or a
+/// storage half with no usable port or no cold store. Each says what is missing.
 #[test]
 fn a_configuration_the_node_cannot_run_is_refused_by_name() {
     let c = case("refused");
     let config = config(&c.root, "");
-    let refuse = |held: &[&str], stored: StoredConfig| {
+    let refuse = |mode: &str, held: &[&str], stored: StoredConfig| {
         let node = enrolled(held, stored);
-        match plan(&config, &node, &c.store, Driver::Container, &[]) {
+        match plan(&config, &node, &c.store, Driver::Container, &[], want(mode)) {
             Err(Failure::Plan(message)) => message,
             other => panic!("planned: {other:?}"),
         }
@@ -224,31 +269,96 @@ fn a_configuration_the_node_cannot_run_is_refused_by_name() {
 
     let mut none = sent(&["daemon"]);
     none.worker_endpoint.clear();
-    assert!(refuse(&["daemon"], none).contains("worker endpoint"));
+    assert!(refuse(names::DAEMON, &["daemon"], none).contains("worker endpoint"));
     for port in [0, 70_000] {
         let mut stored = sent(&["storage"]);
         stored.storage_port = port;
-        assert!(refuse(&["storage"], stored).contains("storage port"));
+        assert!(refuse(names::STORAGE, &["storage"], stored).contains("storage port"));
     }
     let mut stored = sent(&["storage"]);
     stored.cold_store.clear();
-    assert!(refuse(&["storage"], stored).contains("cold store"));
-
-    assert!(refuse(&["daemon"], sent(&[])).contains("no usable roles"));
-    assert!(refuse(&["daemon"], sent(&["frontend"])).contains("no usable roles"));
-    assert!(refuse(&["daemon"], sent(&["storage", "daemon"])).contains("storage role"));
+    assert!(refuse(names::STORAGE, &["storage"], stored).contains("cold store"));
 }
 
-/// Catches the mode table: which roles run which mode.
+/// Catches the mode table of enrollment: which roles each mode needs, and that the
+/// frontend and all-in-one, which take their files as flags, need none.
 #[test]
-fn the_roles_pick_the_mode() {
-    let set = |names: &[&str]| RoleSet::from_names(names.iter().copied()).expect("roles");
-    assert_eq!(mode_of(set(&["daemon"])), names::DAEMON);
-    assert_eq!(mode_of(set(&["storage"])), names::STORAGE);
+fn each_mode_needs_exactly_its_roles() {
+    let roles =
+        |mode: &str| Want::of(mode).map(|w| w.roles.iter().map(Role::name).collect::<Vec<_>>());
+    assert_eq!(roles(names::STORAGE), Some(vec!["storage"]));
+    assert_eq!(roles(names::DAEMON), Some(vec!["daemon"]));
     assert_eq!(
-        mode_of(set(&["daemon", "storage"])),
-        names::STORAGE_AND_DAEMON
+        roles(names::STORAGE_AND_DAEMON),
+        Some(vec!["storage", "daemon"])
     );
+    assert_eq!(roles(names::FRONTEND), None);
+    assert_eq!(roles(names::ALL_IN_ONE), None);
+    assert_eq!(roles("node"), None);
+    for mode in names::MODES {
+        assert_eq!(
+            Want::of(mode.name).is_some(),
+            names::is_registered(mode.name),
+            "{}",
+            mode.name
+        );
+    }
+}
+
+/// Catches the order of the mode's sources: the flag beats the file (and the start says
+/// so), the file is used when there is no flag, neither is an error naming both, a name
+/// in the file that is not a mode is refused, and a mode that takes flags only is
+/// refused with how to start it.
+#[test]
+fn the_flag_beats_the_file_and_neither_is_an_error() {
+    let path = std::path::Path::new("/etc/kbf/kbf.toml");
+    let (want, note) = resolve_mode(Some(names::DAEMON), None, path).expect("flag");
+    assert_eq!((want.mode, note), (names::DAEMON, None));
+    let (want, note) = resolve_mode(None, Some("storage"), path).expect("file");
+    assert_eq!((want.mode, note), (names::STORAGE, None));
+    let (want, note) = resolve_mode(Some(names::STORAGE), Some("storage"), path).expect("same");
+    assert_eq!((want.mode, note), (names::STORAGE, None));
+    let (want, note) = resolve_mode(Some(names::DAEMON), Some("storage"), path).expect("both");
+    assert_eq!(want.mode, names::DAEMON);
+    let note = note.expect("the override is said");
+    assert!(
+        note.contains("--mode=daemon") && note.contains("\"storage\""),
+        "{note}"
+    );
+
+    let none = resolve_mode(None, None, path).expect_err("no mode");
+    let text = none.to_string();
+    assert!(matches!(none, Failure::NoMode { .. }), "{text}");
+    assert!(
+        text.contains("--mode") && text.contains("mode = ") && text.contains("kbf.toml"),
+        "{text}"
+    );
+    assert_eq!(none.exit_code(), 2);
+
+    let bad = resolve_mode(None, Some("node"), path).expect_err("not a mode");
+    assert!(matches!(bad, Failure::BadMode { .. }), "{bad}");
+    assert!(bad.to_string().contains("\"node\""), "{bad}");
+    for flags_only in [names::FRONTEND, names::ALL_IN_ONE] {
+        let e = resolve_mode(Some(flags_only), None, path).expect_err("flags only");
+        assert!(
+            matches!(&e, Failure::FlagsOnly(m) if m == flags_only),
+            "{e}"
+        );
+        assert_eq!(e.exit_code(), 2);
+    }
+}
+
+/// Catches a retry that spins (no wait), never grows, or grows without a cap: 5 seconds,
+/// doubling, at most 5 minutes, and an attempt count that overflows still caps.
+#[test]
+fn a_start_waits_longer_each_time_up_to_five_minutes() {
+    let secs = |attempt| retry_wait(attempt).as_secs();
+    assert_eq!(
+        [0, 1, 2, 3, 4, 5, 6, 7].map(secs),
+        [5, 10, 20, 40, 80, 160, 300, 300]
+    );
+    assert_eq!(secs(63), 300);
+    assert_eq!(secs(u32::MAX), 300);
 }
 
 /// Catches the warning about object-store keys appearing for a node that holds no storage
@@ -286,4 +396,32 @@ fn a_nap_is_at_least_a_second_and_at_most_the_cap() {
         nap(300, Duration::from_millis(10)),
         Duration::from_millis(10)
     );
+}
+
+/// Catches the system's pause that returns at once (a retry loop that spins on a down
+/// frontend), that gives up (`false` ends the start with the failure it was retrying), or
+/// a clock that is not the system's: the pause waits at least what it was given and says
+/// to go on, and the clock reads the unix time between two reads of the system's.
+#[test]
+fn the_system_env_sleeps_what_it_is_told_and_reads_the_clock() {
+    let env = Env::system();
+    let wait = Duration::from_millis(20);
+    let began = std::time::Instant::now();
+    assert!((env.pause)(wait));
+    assert!(began.elapsed() >= wait, "{:?}", began.elapsed());
+
+    let unix = |at: std::time::SystemTime| {
+        i64::try_from(
+            at.duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_secs(),
+        )
+        .expect("fits")
+    };
+    let before = unix(std::time::SystemTime::now());
+    let read = (env.now)();
+    let after = unix(std::time::SystemTime::now());
+    assert!((before..=after).contains(&read), "{before} {read} {after}");
+    assert!(!env.host.hostname.is_empty());
+    assert!(env.host.cpus >= 1);
 }

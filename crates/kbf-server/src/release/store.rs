@@ -412,6 +412,41 @@ impl ReleaseStore {
         }
     }
 
+    /// What is stored for `commit`, by platform ([`ReleasePlatform::ALL`] order); `None` when
+    /// no platform holds a tarball of it. The same reading [`Self::list`] makes of each
+    /// commit, for a caller that wants one.
+    ///
+    /// # Errors
+    /// The directory fails.
+    pub async fn commit(&self, commit: Commit) -> io::Result<Option<CommitListing>> {
+        let mut platforms = Vec::new();
+        for platform in ReleasePlatform::ALL {
+            let mut components = Vec::new();
+            for component in Component::ALL {
+                let key = Key {
+                    commit: commit.clone(),
+                    platform,
+                    component,
+                };
+                components.extend(self.component(&key).await?);
+            }
+            if !components.is_empty() {
+                // Complete: every tarball this platform's hosts need is stored, attested.
+                let complete = platform.components().iter().all(|name| {
+                    components
+                        .iter()
+                        .any(|c| c.component.as_str() == *name && c.attested)
+                });
+                platforms.push(PlatformListing {
+                    platform,
+                    components,
+                    complete,
+                });
+            }
+        }
+        Ok((!platforms.is_empty()).then_some(CommitListing { commit, platforms }))
+    }
+
     /// Everything stored, by commit (sorted) and platform ([`ReleasePlatform::ALL`]
     /// order). A commit or platform with no stored tarball is left out. Only the names the
     /// store writes are looked at: anything else in the directory is ignored.
@@ -429,34 +464,7 @@ impl ReleaseStore {
         commits.sort();
         let mut listing = Vec::new();
         for commit in commits {
-            let mut platforms = Vec::new();
-            for platform in ReleasePlatform::ALL {
-                let mut components = Vec::new();
-                for component in Component::ALL {
-                    let key = Key {
-                        commit: commit.clone(),
-                        platform,
-                        component,
-                    };
-                    components.extend(self.component(&key).await?);
-                }
-                if !components.is_empty() {
-                    // Complete: every tarball this platform's hosts need is stored, attested.
-                    let complete = platform.components().iter().all(|name| {
-                        components
-                            .iter()
-                            .any(|c| c.component.as_str() == *name && c.attested)
-                    });
-                    platforms.push(PlatformListing {
-                        platform,
-                        components,
-                        complete,
-                    });
-                }
-            }
-            if !platforms.is_empty() {
-                listing.push(CommitListing { commit, platforms });
-            }
+            listing.extend(self.commit(commit).await?);
         }
         Ok(listing)
     }

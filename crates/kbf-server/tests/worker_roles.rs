@@ -405,7 +405,6 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls,
-        proxy: None,
         heartbeat_interval: Duration::from_secs(5),
         hello_wait: Duration::from_secs(10),
         tick: Duration::from_millis(50),

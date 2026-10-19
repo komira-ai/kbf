@@ -8,6 +8,7 @@
 //!   have written `sh -c`.
 //! - [`fake`]: the same binary run through a link named `xcrun`, `xcodebuild` or
 //!   `sandbox-exec` answers as that tool, from a rules file the test writes.
+//! - [`port`]: loopback ports a test can rely on (dead ones, and ones held until used).
 //! - [`m2`]: the verbs of `kbf-m2-act`, the program every action of the M2 sample
 //!   project runs (the M2 image has no shell).
 //! - [`reaped`]: a child a test starts, stopped and reaped when the guard drops (SIGTERM,
@@ -35,6 +36,7 @@ pub mod act;
 pub mod fake;
 pub mod m2;
 pub mod reaped;
+pub mod port;
 
 /// Why a program here stopped short.
 #[derive(Debug, PartialEq, Eq)]

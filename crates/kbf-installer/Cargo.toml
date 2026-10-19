@@ -13,10 +13,10 @@ publish.workspace = true
 # (the manual path) and the root helper that applies updates are both callers, so there
 # is one state file and one layout on a host. Changes a host only through kbf-host's plan
 # of steps. sha2 and hex check what was copied; tar and flate2 unpack a component's
-# tarball; rustix opens the inbox's files without following a link (openat, openat2);
+# tarball; rustix opens the order spool's files without following a link (openat, openat2);
 # libc drops to the unprivileged user between fork and exec of a program that reads
 # untrusted bytes. The `helper` module and the `kbf-installer` binary (verbs `run` and
-# `boot-check`) are the root half of the pull-based updates: they poll the inbox the
+# `boot-check`) are the root half of the pull-based updates: they read the order spool the
 # unprivileged `kbf` writes, stage and swap releases through this crate, restart the one
 # configured service and write the world-readable status.json the node reads. There is no
 # socket and no network, and a staged binary is never run as root. The one exception is the
@@ -31,21 +31,27 @@ testkit = ["kbf-host/testkit"]
 test-sandbox = []
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
+hyper.workspace = true
 kbf-host.workspace = true
 kbf-proxy.workspace = true
+kbf-update.workspace = true
 libc.workspace = true
 rustix = { workspace = true, features = ["fs", "net", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 # The proxy verb's signal handlers run on kbf-proxy's runtime.
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["rt", "signal", "sync"] }
 toml.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 # The proxy verb's process test is an h2c client of the real binary.
@@ -57,7 +63,8 @@ kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
 # The proxy verb's process test starts the binary under a guard that reaps it.
 kbf-testkit.workspace = true
 kbf-update.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

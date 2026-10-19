@@ -66,6 +66,10 @@ const PURE: &[&str] = &[
     "kbf-map",
 ];
 
+/// Crates that do a little file I/O (so they are not `PURE`) but are shared by every CI/CD
+/// stage and by xtask: they may reach no `FORBIDDEN` crate and no other kbf crate.
+const LEAF: &[&str] = &["kbf-gate"];
+
 const FORBIDDEN: &[&str] = &[
     "tokio",
     "tonic",
@@ -206,6 +210,29 @@ fn pure_crates_have_no_impure_dependencies() {
     assert!(
         violations.is_empty(),
         "pure crates reach impure crates:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn leaf_crates_reach_no_async_stack_and_no_other_kbf_crate() {
+    let g = load_graph();
+    let mut violations = Vec::new();
+    for &leaf in LEAF {
+        let (id, _) = g
+            .members
+            .get(leaf)
+            .unwrap_or_else(|| panic!("{leaf} is not a workspace member"));
+        for (dep, chain) in normal_closure(&g, id) {
+            let name = g.names[&dep].as_str();
+            if name != leaf && (FORBIDDEN.contains(&name) || g.members.contains_key(name)) {
+                violations.push(chain);
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "leaf crates reach the async stack or other kbf crates:\n{}",
         violations.join("\n")
     );
 }
