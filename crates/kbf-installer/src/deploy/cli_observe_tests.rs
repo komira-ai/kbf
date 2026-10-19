@@ -70,7 +70,12 @@ impl Fake {
 
 /// An update API whose preflight passes for `A` on one Linux node.
 fn update_api() -> Fake {
-    Fake::start(|path| {
+    update_api_serving(None)
+}
+
+/// The same, whose frontend status names `serving` (`a` or `b`) as the serving slot.
+fn update_api_serving(serving: Option<&'static str>) -> Fake {
+    Fake::start(move |path| {
         let body: Option<Value> = match path {
             "/v1/nodes" => Some(json!({"server": {"commit": &A[..12]}, "nodes": [{
                 "node_id": "n1", "connected": true, "placement": {"state": "serving"},
@@ -81,7 +86,7 @@ fn update_api() -> Fake {
                 "components": [{"name": "kbf", "sha256": "x", "size": 1, "attested": true}]}]}]})),
             "/v1/update" => Some(json!({"desired": {"commit": B, "generation": 7},
                                         "frontend": {"order_id": 1, "state": "confirmed"}})),
-            "/v1/update/frontend" => Some(json!({"active_slot": null})),
+            "/v1/update/frontend" => Some(json!({"active_slot": serving})),
             _ => None,
         };
         body.map_or((404, "{}".to_owned()), |b| (200, b.to_string()))
@@ -335,4 +340,58 @@ fn a_signal_seals_the_document_red_and_exits_128_plus_the_signal() {
             Some(format!("interrupted by {word}").as_str())
         );
     }
+}
+
+/// Two listeners at the operator ports of a base port's slot A and slot B.
+fn both_slots(a: &'static str, b: &'static str) -> (u16, Fake, Fake) {
+    loop {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = probe.local_addr().unwrap().port().saturating_sub(2);
+        drop(probe);
+        if base < 1024 || base > 60_000 {
+            continue;
+        }
+        let (Ok(la), Ok(lb)) = (
+            TcpListener::bind(("127.0.0.1", base + 2)),
+            TcpListener::bind(("127.0.0.1", base + 12)),
+        ) else {
+            continue;
+        };
+        let metrics = |text: &'static str| {
+            move |path: &str| match path {
+                "/metrics" => (200, text.to_owned()),
+                _ => (404, "{}".to_owned()),
+            }
+        };
+        return (base, Fake::on(la, metrics(a)), Fake::on(lb, metrics(b)));
+    }
+}
+
+/// Proves the production wiring reads the child that handed over: with `--observe-base-port`,
+/// the update API naming slot B as serving, and slot A still answering and reporting an
+/// untraced relay, the deploy ends red naming gate B and slot A, over real sockets. The
+/// serving child (B) is healthy, so only the old child's report can make it red. Catches a
+/// `Slots` resolver that lists no other child (only the unit-test fake had one).
+///
+/// Mutants planted: `Slots::resolve` listing no other child.
+#[test]
+fn the_old_child_that_reports_untraced_relays_is_read_over_real_sockets() {
+    let (base, old, serving) = both_slots(
+        "kbf_frontend_relay_untraced 1\nkbf_cache_lost_blobs 0\nkbf_cache_blob_losses_total 1\n",
+        "kbf_frontend_relay_untraced 0\nkbf_cache_lost_blobs 0\nkbf_cache_blob_losses_total 1\n\
+         kbf_under_replicated_blobs 0\n",
+    );
+    let api = update_api_serving(Some("b"));
+    let r = run(
+        "old-child",
+        &api,
+        &["--observe-base-port".to_owned(), base.to_string()],
+    );
+    assert_eq!(r.code, 3, "{}", r.summary);
+    assert_eq!(r.summary["reason"], "gate_red", "{}", r.summary);
+    let detail = r.summary["detail"].as_str().unwrap();
+    for part in ["b_relay_untraced", "slot a"] {
+        assert!(detail.contains(part), "`{part}` missing from {detail}");
+    }
+    assert!(old.saw_metrics() && serving.saw_metrics());
 }

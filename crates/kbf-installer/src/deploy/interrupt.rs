@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Mutex, MutexGuard, Once, OnceLock};
 
 use kbf_gate::{ResultDoc, Status, system_clock, write_atomic};
 
@@ -50,13 +50,42 @@ impl Drop for Armed {
     }
 }
 
+/// The calling thread's `errno`.
+#[cfg(target_os = "linux")]
+unsafe fn errno() -> *mut libc::c_int {
+    // SAFETY: returns the calling thread's errno location; the caller upholds the contract.
+    unsafe { libc::__errno_location() }
+}
+
+/// The calling thread's `errno`.
+#[cfg(not(target_os = "linux"))]
+unsafe fn errno() -> *mut libc::c_int {
+    // SAFETY: returns the calling thread's errno location; the caller upholds the contract.
+    unsafe { libc::__error() }
+}
+
 extern "C" fn on_signal(signal: libc::c_int) {
     let fd = PIPE_WRITE.load(Ordering::Relaxed);
     if fd >= 0 {
         let byte = signal as u8;
-        // SAFETY: write(2) is async-signal-safe; `byte` lives for the call.
-        unsafe { libc::write(fd, std::ptr::from_ref(&byte).cast(), 1) };
+        // SAFETY: errno is read and put back around write(2), which is async-signal-safe, so
+        // the code the signal interrupted does not see a changed errno; `byte` lives for the
+        // call.
+        unsafe {
+            let saved = *errno();
+            libc::write(fd, std::ptr::from_ref(&byte).cast(), 1);
+            *errno() = saved;
+        }
     }
+}
+
+/// Held by whoever finishes a result document: the deploy's own seal and the signal's. Both
+/// write through the same temporary name, and a document finished by one must be left alone
+/// by the other, so they take turns. The signal's holds it until the process exits.
+pub(super) fn exclusive() -> MutexGuard<'static, ()> {
+    static SEAL: Mutex<()> = Mutex::new(());
+    SEAL.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn install() {
@@ -107,24 +136,48 @@ fn watch(read_end: libc::c_int) {
             }
             continue;
         }
-        for path in &paths {
-            seal(path, signal);
+        let _held = exclusive();
+        let outcomes: Vec<Outcome> = paths.iter().map(|p| seal(p, signal)).collect();
+        // Every document already finished: the deploy ended by itself and is leaving; the
+        // signal has nothing to interrupt. Otherwise the process ends here, lock held, so the
+        // deploy's own seal cannot write after this one.
+        if outcomes.iter().all(|o| *o == Outcome::AlreadyFinished) {
+            continue;
         }
         std::process::exit(128 + signal);
     }
 }
 
+/// What [`seal`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The document was `RUNNING` and is now red.
+    Sealed,
+    /// The document was finished by the deploy itself; left alone.
+    AlreadyFinished,
+    /// No readable document (the deploy had not started it, or it is not one).
+    NoDocument,
+}
+
+/// [`seal`] under [`exclusive`].
+#[cfg(test)]
+pub(super) fn seal_exclusive(path: &Path, signal: libc::c_int) -> Outcome {
+    let _held = exclusive();
+    seal(path, signal)
+}
+
 /// Finish the document at `path` as red because `signal` ended the run, if it is still
-/// `RUNNING`. A document that is finished, absent or unreadable is left as it is.
-pub fn seal(path: &Path, signal: libc::c_int) {
+/// `RUNNING`. A document that is finished, absent or unreadable is left as it is. The caller
+/// holds [`exclusive`].
+fn seal(path: &Path, signal: libc::c_int) -> Outcome {
     let Ok(bytes) = std::fs::read(path) else {
-        return;
+        return Outcome::NoDocument;
     };
     let Ok(mut doc) = ResultDoc::from_bytes(&bytes) else {
-        return;
+        return Outcome::NoDocument;
     };
     if doc.status != Status::Running {
-        return;
+        return Outcome::AlreadyFinished;
     }
     let name = match signal {
         libc::SIGINT => "SIGINT",
@@ -137,6 +190,7 @@ pub fn seal(path: &Path, signal: libc::c_int) {
     if let Ok(out) = doc.to_bytes() {
         let _ = write_atomic(path, &out);
     }
+    Outcome::Sealed
 }
 
 #[cfg(test)]
@@ -161,7 +215,7 @@ mod tests {
         };
         let running = dir.join("running.json");
         let run = Run::start(&running, header(), system_clock).unwrap();
-        seal(&running, libc::SIGTERM);
+        assert_eq!(seal_exclusive(&running, libc::SIGTERM), Outcome::Sealed);
         let doc = ResultDoc::from_bytes(&std::fs::read(&running).unwrap()).unwrap();
         assert_eq!(doc.status, Status::Red);
         assert!(doc.finished.is_some());
@@ -174,13 +228,19 @@ mod tests {
             .extend("no decision")
             .unwrap();
         let before = std::fs::read(&done).unwrap();
-        seal(&done, libc::SIGINT);
+        assert_eq!(
+            seal_exclusive(&done, libc::SIGINT),
+            Outcome::AlreadyFinished
+        );
         assert_eq!(std::fs::read(&done).unwrap(), before);
 
-        seal(&dir.join("absent.json"), libc::SIGTERM);
+        assert_eq!(
+            seal_exclusive(&dir.join("absent.json"), libc::SIGTERM),
+            Outcome::NoDocument
+        );
         let garbled = dir.join("garbled.json");
         std::fs::write(&garbled, b"not json").unwrap();
-        seal(&garbled, libc::SIGTERM);
+        assert_eq!(seal_exclusive(&garbled, libc::SIGTERM), Outcome::NoDocument);
         assert_eq!(std::fs::read(&garbled).unwrap(), b"not json");
     }
 }

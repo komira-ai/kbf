@@ -39,6 +39,9 @@ pub(super) fn open(run: &Run) -> Result<Option<GateRun>, Fail> {
 /// not run) as no decision, anything else red with the reason. A document that cannot be
 /// written turns an `ok` into a failure.
 pub(super) fn seal(run: &mut Run, mut record: GateRun, began: u64) {
+    // A signal seals the document too, through the same temporary file: one at a time, and
+    // a document one of them finished is not touched by the other.
+    let _held = super::interrupt::exclusive();
     let now = run.env.clock.now();
     let gates = run.gates.results(now);
     let hash = run
@@ -58,6 +61,12 @@ pub(super) fn seal(run: &mut Run, mut record: GateRun, began: u64) {
         });
         if let Some(hash) = hash {
             doc.set_hash = hash;
+        }
+    });
+    #[cfg(test)]
+    MID_SEAL.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
         }
     });
     let note = match run.sum.detail.as_str() {
@@ -80,4 +89,11 @@ pub(super) fn seal(run: &mut Run, mut record: GateRun, began: u64) {
         run.sum
             .end(Exit::Failed, "result_unwritable", &e.to_string());
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run by the sealing thread between writing the gates and finishing the document.
+    pub(super) static MID_SEAL: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
 }

@@ -974,3 +974,54 @@ fn two_live_children_and_no_serving_slot_is_refused_at_the_preflight() {
     );
     assert!(f.child_reads.borrow().is_empty());
 }
+
+// ---- two sealers -------------------------------------------------------------------
+
+/// Proves the deploy's own seal and a signal's take turns. A signal lands while the deploy is
+/// between writing its gates and finishing the document: the signal's seal waits (the document
+/// is still `RUNNING` after 300 ms, not torn or overwritten), the deploy finishes it green,
+/// and the signal then finds it finished and leaves it. Catches a signal that writes red over
+/// a deploy that is finishing green, or through the same temporary file at the same time.
+///
+/// Mutants planted: the deploy's seal taking no lock; the signal's seal taking none.
+#[test]
+fn a_signal_during_the_seal_waits_and_leaves_the_finished_document() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::deploy::interrupt::{Outcome, seal_exclusive};
+
+    let f = farm(two_nodes());
+    let path = scratch("seal-race");
+    let during = Rc::new(RefCell::new(None));
+    let sealer = Rc::new(RefCell::new(None));
+    {
+        let (path, during, sealer) = (path.clone(), during.clone(), sealer.clone());
+        crate::deploy::record::MID_SEAL.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let at = path.clone();
+                *sealer.borrow_mut() = Some(std::thread::spawn(move || {
+                    seal_exclusive(&at, libc::SIGTERM)
+                }));
+                std::thread::sleep(Duration::from_millis(300));
+                let doc = ResultDoc::from_bytes(&fs::read(&path).unwrap()).unwrap();
+                *during.borrow_mut() = Some(doc.status);
+            }));
+        });
+    }
+    let mut o = opts(true);
+    o.result = Some(path.clone());
+    let s = run_with(&f, &o, SmokeResult::Pass, None);
+    crate::deploy::record::MID_SEAL.with(|hook| *hook.borrow_mut() = None);
+    assert_eq!((s.exit, s.reason.as_str()), (0, ""), "{}", s.line());
+    assert_eq!(
+        *during.borrow(),
+        Some(Status::Running),
+        "the signal's seal did not wait"
+    );
+    let outcome = sealer.borrow_mut().take().unwrap().join().unwrap();
+    assert_eq!(outcome, Outcome::AlreadyFinished);
+    let doc = ResultDoc::from_bytes(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(doc.status, Status::Green);
+    assert!(doc.note.is_none());
+}
