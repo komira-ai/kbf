@@ -845,13 +845,61 @@ fn the_probe_user_is_looked_up_with_the_exit_codes_of_the_contract() {
             (false, _) => reply(0, "991\n", ""),
         })
     });
-    assert_eq!(probe_user(&exec, "kbf-fetch").expect("found").uid, 991);
-    let missing = probe_user(&exec, "nobody-here").expect_err("unknown");
+    assert_eq!(
+        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        991
+    );
+    let missing = probe_user(&exec, "nobody-here", false).expect_err("unknown");
     assert_eq!(missing.exit, Exit::Usage);
     assert!(missing.why.contains("nobody-here"), "{}", missing.why);
-    let broken = probe_user(&exec, "broken").expect_err("broken");
+    let broken = probe_user(&exec, "broken", false).expect_err("broken");
     assert_eq!(broken.exit, Exit::Failed);
     assert!(broken.why.contains("getent"), "{}", broken.why);
+}
+
+/// Catches a version probe that runs as root: on a host `--fetch-user root`, or any user
+/// whose uid or gid is 0, is a usage error (exit 2) naming the user, for the probe runs a
+/// binary nobody has trusted yet and `run_as` is the whole of what it is run with. A
+/// rehearsal (`--root`, a tree of the caller's own) runs as whoever the caller is.
+///
+/// Mutants seen red: only the uid checked; only the gid checked; the rehearsal not excepted.
+#[test]
+fn the_version_probe_never_runs_as_root_on_a_host() {
+    use kbf_host::testkit::{FakeExec, reply};
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|cmd| {
+        let who = cmd.args.last().map(String::as_str);
+        Ok(match (cmd.program.as_str().ends_with("getent"), who) {
+            (true, Some("root")) => reply(0, "root:x:0:0:root:/root:/bin/bash\n", ""),
+            (true, Some("uid-zero")) => {
+                reply(0, "uid-zero:x:0:991::/nonexistent:/sbin/nologin\n", "")
+            }
+            (true, Some("gid-zero")) => {
+                reply(0, "gid-zero:x:991:0::/nonexistent:/sbin/nologin\n", "")
+            }
+            (true, Some("kbf-fetch")) => {
+                reply(0, "kbf-fetch:x:991:991::/nonexistent:/sbin/nologin\n", "")
+            }
+            (true, _) => reply(2, "", ""),
+            // `id -G`: the groups, which hold the primary one.
+            (false, Some("root" | "gid-zero")) => reply(0, "0\n", ""),
+            (false, _) => reply(0, "991\n", ""),
+        })
+    });
+    for name in ["root", "uid-zero", "gid-zero"] {
+        let error = probe_user(&exec, name, false).expect_err(name);
+        assert_eq!(error.exit, Exit::Usage, "{name}");
+        assert!(
+            error.why.contains(name) && error.why.contains("root"),
+            "{name}: {}",
+            error.why
+        );
+    }
+    assert_eq!(
+        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        991
+    );
+    assert_eq!(probe_user(&exec, "root", true).expect("a rehearsal").uid, 0);
 }
 
 /// Catches `migrate` missing from the command line or from the dispatcher: its flags parse

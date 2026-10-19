@@ -275,11 +275,29 @@ fn owner_uid(rehearsal: bool, euid: u32) -> u32 {
     if rehearsal { euid } else { 0 }
 }
 
-/// The user the version probe runs as: the failure when the host cannot say, or has no such
-/// user. (The generic part is one call; what it does with the answer is [`user_found`], so
-/// that there is one copy of it to run.)
-fn probe_user<E: kbf_host::Exec>(exec: &E, name: &str) -> Result<kbf_host::RunUser, Failure> {
-    user_found(kbf_host::user::lookup(exec, name), name)
+/// The user the version probe runs as: the failure when the host cannot say, has no such
+/// user, or the user is root (outside a rehearsal). (The generic part is one call; what it
+/// does with the answer is [`user_found`], so that there is one copy of it to run.)
+fn probe_user<E: kbf_host::Exec>(
+    exec: &E,
+    name: &str,
+    rehearsal: bool,
+) -> Result<kbf_host::RunUser, Failure> {
+    let user = user_found(kbf_host::user::lookup(exec, name), name)?;
+    // The probe runs a binary nobody has trusted yet, and who it runs as is the whole of what
+    // it is confined by (settings refuse root for the same reason). A rehearsal runs on the
+    // caller's own tree as the caller, whoever that is.
+    if !rehearsal && (user.uid == 0 || user.gid == 0) {
+        return Err(Failure {
+            exit: Exit::Usage,
+            why: format!(
+                "--fetch-user {name:?} is root (uid {}, gid {}): the version probe runs \
+                 binaries nobody has trusted yet and must not run as root",
+                user.uid, user.gid
+            ),
+        });
+    }
+    Ok(user)
 }
 
 fn user_found(
@@ -298,7 +316,7 @@ fn user_found(
 fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String, Failure> {
     let rehearsal = root != Path::new("/");
     let (layout, mut exec) = host(root)?;
-    let user = probe_user(&exec, &args.fetch_user)?;
+    let user = probe_user(&exec, &args.fetch_user, rehearsal)?;
     let m = migrate::Migration {
         roots: migrate::Roots::new(layout.platform()),
         layout,
