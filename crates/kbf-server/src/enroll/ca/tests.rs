@@ -6,10 +6,9 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use kbf_ca::{Policy, SystemEntropy};
 use kbf_signer::{SignerServer, Started, bind};
-use kbf_testkit::dir::TestDir;
 
 use super::*;
-use crate::enroll::testkit::{START, scratch};
+use crate::enroll::testkit::{START, Scratch, scratch};
 
 fn policy() -> Policy {
     Policy::new(86_400).expect("policy")
@@ -112,7 +111,7 @@ fn an_external_signer_issues_and_the_frontend_holds_no_key() {
         .expect("server")
         .with_clock(|| START);
     // A socket path is short (108 bytes at most): these sit under the system temp dir.
-    let socket_dir = TestDir::under(std::env::temp_dir(), "ca-external-sock");
+    let socket_dir = Scratch::under(std::env::temp_dir(), "ca-external-sock");
     let socket = socket_dir.join("signer.sock");
     let listener = bind(&socket).expect("bind");
     std::thread::spawn(move || {
@@ -163,7 +162,7 @@ fn an_external_signer_needs_the_signers_root_and_makes_nothing() {
         .expect("server")
         .with_clock(|| START);
     // A socket path is short (108 bytes at most): these sit under the system temp dir.
-    let socket_dir = TestDir::under(std::env::temp_dir(), "ca-external-bad-sock");
+    let socket_dir = Scratch::under(std::env::temp_dir(), "ca-external-bad-sock");
     let socket = socket_dir.join("signer.sock");
     let listener = bind(&socket).expect("bind");
     std::thread::spawn(move || {

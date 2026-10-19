@@ -2,6 +2,7 @@
 //! CA made in a scratch directory, the service over both), tokens, and certificate requests
 //! built the way a node builds them (and some it would not).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,9 +23,41 @@ pub const START: i64 = CLOCK_FLOOR_UNIX + 86_400;
 /// The one name this test frontend serves.
 pub const FRONTEND: &str = "front.test";
 
-/// A new, empty scratch directory no other test uses, removed when it drops.
-pub fn scratch(name: &str) -> TestDir {
-    crate::test_dir::scratch_dir(&format!("kbf-enroll-svc-{name}"))
+/// A path no other test uses and nothing has made yet (a CA directory must be made by
+/// the code under test, with its own mode), inside a directory removed when this drops.
+pub struct Scratch {
+    path: PathBuf,
+    /// Last: the parent outlives every use of `path`.
+    _root: TestDir,
+}
+
+impl Scratch {
+    /// A fresh path inside a new test directory under `root`.
+    pub fn under(root: impl AsRef<Path>, name: &str) -> Self {
+        Self::of(TestDir::under(root, name))
+    }
+
+    fn of(root: TestDir) -> Self {
+        Self {
+            path: root.join("d"),
+            _root: root,
+        }
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// A scratch path beside the unit test binary, removed with its parent on drop.
+pub fn scratch(name: &str) -> Scratch {
+    Scratch::of(crate::test_dir::scratch_dir(&format!(
+        "kbf-enroll-svc-{name}"
+    )))
 }
 
 /// A state store, a CA and the service over them.
@@ -34,7 +67,7 @@ pub struct Farm {
     pub ca: Arc<Ca>,
     pub service: EnrollService,
     /// The CA directory; last so it is removed after everything that used it.
-    _dir: TestDir,
+    _dir: Scratch,
 }
 
 /// A farm whose store clock reads `start` (unix seconds) and whose CA, made in a new
