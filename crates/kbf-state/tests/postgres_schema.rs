@@ -599,3 +599,19 @@ fn a_refused_connection_does_not_name_the_database() {
         assert!(!text.contains("kbf_nodb_marker"), "{text}");
     }
 }
+
+/// Catches a server refusal in the migration's opening statements (here: the schema table
+/// cannot be made in the system catalog) being reported as `Busy`, which would tell the
+/// swap to retry something that never will work. It is a plain database error.
+///
+/// Mutant seen red: `Busy` returned for every error of the opening statements.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn a_refusal_of_the_opening_statements_is_not_busy() {
+    let config = PostgresConfig::parse(&url())
+        .and_then(|c| c.with_schema("pg_catalog"))
+        .expect("parses");
+    let err =
+        schema::apply_within(&config, &schema::embedded(), 1, Duration::from_secs(5)).unwrap_err();
+    assert!(matches!(err, SchemaError::Database(_)), "{err:?}");
+}
