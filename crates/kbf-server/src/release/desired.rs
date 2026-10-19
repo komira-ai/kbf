@@ -25,12 +25,11 @@
 //!
 //! Serve the router with `into_make_service_with_connect_info`, as the API's.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::http::header::{CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
@@ -42,6 +41,7 @@ use super::key::Commit;
 use super::store::ReleaseStore;
 use crate::api::{error, json, operator_gate};
 use crate::farm::Farm;
+use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 use crate::update::{Desired, Policy, Release, RowError, Rows};
 
@@ -191,7 +191,7 @@ struct Offer {
 /// The gates of a write, then the JSON content type for a body.
 fn write_gate(
     update: &Update,
-    peer: SocketAddr,
+    peer: &Caller,
     headers: &HeaderMap,
     wants_json: bool,
 ) -> Result<(), (StatusCode, String)> {
@@ -208,11 +208,11 @@ fn write_gate(
 
 async fn set_desired(
     State(update): State<Arc<Update>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, why)) = write_gate(&update, peer, &headers, true) {
+    if let Err((code, why)) = write_gate(&update, &peer, &headers, true) {
         return error(code, &why);
     }
     let Some(rows) = update.rows.clone() else {
@@ -258,7 +258,8 @@ async fn set_desired(
             "the release store holds no platform of this commit complete (tarball and attestation)",
         );
     }
-    let now = update.farm.now();
+    // The wall clock: the controller counts its waits from this, across restarts.
+    let now = update.farm.wall_now();
     match blocking(move || rows.offer_expecting(&Release::new(commit), now, expect_generation))
         .await
     {
@@ -268,29 +269,21 @@ async fn set_desired(
     }
 }
 
-async fn pause(
-    state: State<Arc<Update>>,
-    peer: ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Response {
+async fn pause(state: State<Arc<Update>>, peer: Caller, headers: HeaderMap) -> Response {
     paused(state, peer, headers, true).await
 }
 
-async fn resume(
-    state: State<Arc<Update>>,
-    peer: ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Response {
+async fn resume(state: State<Arc<Update>>, peer: Caller, headers: HeaderMap) -> Response {
     paused(state, peer, headers, false).await
 }
 
 async fn paused(
     State(update): State<Arc<Update>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     paused: bool,
 ) -> Response {
-    if let Err((code, why)) = write_gate(&update, peer, &headers, false) {
+    if let Err((code, why)) = write_gate(&update, &peer, &headers, false) {
         return error(code, &why);
     }
     let Some(rows) = update.rows.clone() else {

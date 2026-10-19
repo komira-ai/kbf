@@ -233,6 +233,22 @@ pub struct PeerIdentity {
 }
 
 impl PeerIdentity {
+    /// The identity of a caller whose certificate a TLS-terminating proxy verified and
+    /// which names only `node_id`: that one DNS name, and no serial or key hash (the proxy
+    /// does not forward them), so a `serial` or `spki-sha256` deny entry cannot name it and
+    /// an IP address is covered by no name.
+    #[must_use]
+    pub fn proxied(node_id: &str) -> Self {
+        Self {
+            names: PeerNames {
+                dns: vec![node_id.to_owned()],
+                ips: Vec::new(),
+            },
+            serial: String::new(),
+            spki_sha256: String::new(),
+        }
+    }
+
     /// The DNS and IP names.
     #[must_use]
     pub fn names(&self) -> &PeerNames {
