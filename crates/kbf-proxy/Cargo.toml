@@ -9,7 +9,7 @@ publish.workspace = true
 
 # The frontend host's front door (docs/design/frontend-proxy.md, docs/design/kbf-proxy-api.md):
 # one TLS terminator that routes each HTTP/2 stream to the active child frontend over loopback.
-# The downstream side is hyper's HTTP/2 server (plaintext until U4b-2 adds TLS); the upstream
+# The downstream side is hyper's HTTP/2 and HTTP/1.1 servers behind one TLS terminator; the upstream
 # pool is built on h2's own client, because the child's advertised stream limit is on h2's
 # types and not on hyper's.
 [dependencies]
@@ -20,20 +20,25 @@ hex.workspace = true
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
-hyper = { workspace = true, features = ["http2", "server"] }
+hyper = { workspace = true, features = ["http1", "http2", "server"] }
 hyper-util = { workspace = true, features = ["http2", "server-graceful", "tokio"] }
 kbf-peer.workspace = true
+kbf-tls.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
+rustls.workspace = true
 serde.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls.workspace = true
 toml.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "test-util"] }
+tokio = { workspace = true, features = ["io-util", "macros", "test-util"] }
 
 # The model checker, under its own cfg (see the workspace lints and cargo xtask proxy-loom).
 [target.'cfg(kbf_loom)'.dependencies]

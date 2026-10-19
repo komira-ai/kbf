@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::auth::Security;
 use crate::config::{Limits, UpstreamTable};
 use crate::control::{ProxySnapshot, SlotStats};
 use crate::hold::{HoldLimits, HoldQueue};
@@ -28,6 +29,7 @@ pub(crate) struct Core {
     pub(crate) pool: Pool,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) limits: Limits,
+    pub(crate) security: Security,
     streams: AtomicUsize,
 }
 
@@ -37,6 +39,7 @@ impl Core {
         limits: Limits,
         slots: ActiveSlot,
         connector: Connector,
+        security: Security,
     ) -> Arc<Self> {
         let metrics = Arc::new(Metrics::default());
         Arc::new(Self {
@@ -45,6 +48,7 @@ impl Core {
             pool: Pool::new(table, Arc::clone(&metrics), connector),
             metrics,
             limits,
+            security,
             streams: AtomicUsize::new(0),
         })
     }

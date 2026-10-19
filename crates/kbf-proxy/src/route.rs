@@ -15,6 +15,10 @@ pub enum Target {
     Worker,
     /// The operator API (`/v1/*`).
     Operator,
+    /// Enrollment (`/kbf.enroll.v1.Enroll/*`): a node that has no certificate yet. The child
+    /// serves it on a listener of its own that authenticates the server only; the port is
+    /// fixed here so the child's unit adds the listener without a proxy change.
+    Enroll,
 }
 
 impl Target {
@@ -25,7 +29,14 @@ impl Target {
             Self::Reapi => 0,
             Self::Worker => 1,
             Self::Operator => 2,
+            Self::Enroll => 4,
         }
+    }
+
+    /// Whether the listener speaks gRPC (the operator API is plain HTTP).
+    #[must_use]
+    pub const fn grpc(self) -> bool {
+        !matches!(self, Self::Operator)
     }
 }
 
@@ -46,6 +57,17 @@ pub enum Route {
     Unknown,
 }
 
+impl Route {
+    /// Whether the route speaks gRPC, so a refusal is a gRPC status and not an HTTP one.
+    #[must_use]
+    pub const fn grpc(self) -> bool {
+        match self {
+            Self::Child(target) => target.grpc(),
+            _ => false,
+        }
+    }
+}
+
 /// Who may call a path (see [`crate::auth`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthClass {
@@ -57,6 +79,8 @@ pub enum AuthClass {
     Operator,
     /// Needs the update credential.
     Update,
+    /// Open to a caller with no certificate: the child checks the enrollment token.
+    Enroll,
     /// Open: health and readiness.
     Probe,
 }
@@ -80,7 +104,15 @@ const REAPI_PREFIXES: [&str; 5] = [
     "/build.bazel.remote.execution.v2.Capabilities/",
     "/google.bytestream.ByteStream/",
 ];
-const WORKER_PREFIXES: [&str; 3] = ["/kbf.worker.", "/kbf.map.v1.Membership/", "/kbf.update."];
+// `ColdStore` is the worker listener's (storage role only, which the child's role table
+// enforces; the proxy checks only that the caller is a worker or storage node).
+const WORKER_PREFIXES: [&str; 4] = [
+    "/kbf.worker.",
+    "/kbf.map.v1.Membership/",
+    "/kbf.update.",
+    "/kbf.enroll.v1.ColdStore/",
+];
+const ENROLL_PREFIX: &str = "/kbf.enroll.v1.Enroll/";
 const UPDATE_PREFIX: &str = "/v1/update/frontend";
 const BYTESTREAM_PREFIX: &str = "/google.bytestream.ByteStream/";
 
@@ -106,6 +138,9 @@ pub fn route_of(path: &str) -> Route {
     if WORKER_PREFIXES.iter().any(|p| path.starts_with(p)) {
         return Route::Child(Target::Worker);
     }
+    if path.starts_with(ENROLL_PREFIX) {
+        return Route::Child(Target::Enroll);
+    }
     if at_boundary(path, UPDATE_PREFIX) {
         return Route::Update;
     }
@@ -127,6 +162,7 @@ pub const fn auth_class(route: Route) -> Option<AuthClass> {
         Route::Child(Target::Reapi) => Some(AuthClass::Reapi),
         Route::Child(Target::Worker) => Some(AuthClass::Worker),
         Route::Child(Target::Operator) => Some(AuthClass::Operator),
+        Route::Child(Target::Enroll) => Some(AuthClass::Enroll),
         Route::Update => Some(AuthClass::Update),
         Route::Health | Route::Ready => Some(AuthClass::Probe),
         Route::Metrics => Some(AuthClass::Operator),
@@ -189,6 +225,32 @@ mod tests {
             Target::Reapi.offset() + Target::Worker.offset() + Target::Operator.offset(),
             3
         );
+        assert_eq!(Target::Enroll.offset(), 4, "past the admin port at 3");
+        assert!(Target::Reapi.grpc() && Target::Worker.grpc() && Target::Enroll.grpc());
+        assert!(!Target::Operator.grpc());
+        assert!(route_of(reapi).grpc());
+        for route in [
+            Route::Update,
+            Route::Health,
+            Route::Ready,
+            Route::Metrics,
+            Route::Unknown,
+        ] {
+            assert!(!route.grpc(), "{route:?}");
+        }
+    }
+
+    #[test]
+    fn enrollment_is_its_own_listener_and_cold_store_is_the_workers() {
+        let enroll = route_of("/kbf.enroll.v1.Enroll/Enroll");
+        assert_eq!(enroll, Route::Child(Target::Enroll));
+        assert_eq!(route_of("/kbf.enroll.v1.Enroll/Renew"), enroll);
+        assert_eq!(auth_class(enroll), Some(AuthClass::Enroll));
+        let cold = route_of("/kbf.enroll.v1.ColdStore/GetKeys");
+        assert_eq!(cold, Route::Child(Target::Worker));
+        assert_eq!(auth_class(cold), Some(AuthClass::Worker));
+        assert_eq!(route_of("/kbf.enroll.v1.Other/X"), Route::Unknown);
+        assert!(!bypasses_hold(enroll));
     }
 
     #[test]
@@ -210,7 +272,7 @@ mod tests {
     fn a_path_outside_the_table_is_never_forwarded() {
         for p in [
             "/",
-            "/kbf.enroll.v1.Enroll/Enroll",
+            "/kbf.enroll.v1/Enroll",
             "/grpc.health.v1.Health/Check",
             "/x",
         ] {

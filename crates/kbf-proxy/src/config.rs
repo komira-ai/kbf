@@ -26,8 +26,9 @@ pub enum ConfigError {
 }
 
 /// Ports of the children: slot `A` starts at `base_port`, slot `B` at `base_port + 10`; in a
-/// slot the REAPI, worker and operator listeners are at offsets 0, 1 and 2 and the admin
-/// calls at 3. The offsets are the frozen contract with the children (design section 10).
+/// slot the REAPI, worker and operator listeners are at offsets 0, 1 and 2, the admin
+/// calls at 3 and enrollment at 4. The offsets are the frozen contract with the children
+/// (design section 10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTable {
@@ -133,7 +134,7 @@ pub struct ProxyConfig {
     pub buck2_auth: Buck2Auth,
     /// The Buck2 API key file, required by `buck2_auth = "bearer"`.
     pub buck2_token_file: Option<PathBuf>,
-    /// The operator token file (`/etc/kbf/operator.token`), read by the proxy itself.
+    /// The operator token file (`/etc/kbf/operator.token`), read by the proxy itself at start.
     pub operator_token_file: PathBuf,
     /// The server certificate chain and key, reloaded on SIGHUP together with `client_ca`.
     pub server_cert_file: PathBuf,

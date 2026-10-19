@@ -3,7 +3,11 @@
 //! on a wall clock.
 
 mod bypass;
+mod h1;
 mod hold;
 mod kit;
 mod lifetime;
+pub(crate) mod pki;
+mod reload;
 mod routing;
+mod secure;

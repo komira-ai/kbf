@@ -2073,15 +2073,20 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kbf-peer",
+ "kbf-tls",
  "loom",
  "rcgen",
+ "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "subtle",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
+ "tracing",
 ]
 
 [[package]]

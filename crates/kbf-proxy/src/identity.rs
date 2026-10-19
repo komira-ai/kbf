@@ -7,8 +7,13 @@
 //! id. **A node id is the certificate's one DNS name**: zero, several or a wildcard name
 //! make the identity ambiguous, so the certificate is refused rather than guessed at.
 
+use std::io;
+use std::path::Path;
+
 use http::{HeaderMap, HeaderName, HeaderValue};
 use kbf_peer::{PeerRole, RoleError, names_of, role_of};
+
+use crate::files::{self, Place};
 
 /// The node id the proxy verified, `x-kbf-node-id`.
 pub const NODE_ID: &str = "x-kbf-node-id";
@@ -82,7 +87,49 @@ impl std::fmt::Debug for ProxySecret {
     }
 }
 
+/// Where [`ProxySecret::create_or_read`] got the secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretOrigin {
+    /// The file was there, whole: children that read it earlier hold this secret.
+    Existing,
+    /// The proxy wrote a new file: a child that started earlier holds another secret and
+    /// would read every call as anonymous, so a supervisor must restart it, not adopt it.
+    Created,
+}
+
 impl ProxySecret {
+    /// The secret in the file at `path`, or a new one written there.
+    ///
+    /// - A file of exactly [`SECRET_BYTES`] bytes is read: [`SecretOrigin::Existing`]. It
+    ///   must pass the child's own checks (a regular file, this user's, mode 0600 or 0400),
+    ///   or the call fails: a file anyone else could have written is not repaired.
+    /// - No file, or a file of another length (a half-written one from some other tool), is
+    ///   written anew: [`SecretOrigin::Created`]. The bytes go to a temporary file (mode
+    ///   0600, no trailing newline) that is fsynced and `link`ed into place (a replacement
+    ///   is renamed over), so a crash never leaves the 0-byte file the child refuses for ever.
+    ///
+    /// # Errors
+    /// The file is refused (see [`crate::files::FileError`]), or the new one cannot be
+    /// written, or another proxy created the name first.
+    pub fn create_or_read(path: &Path) -> io::Result<(Self, SecretOrigin)> {
+        let place = match files::read_owner_only(path, SECRET_BYTES) {
+            Ok(bytes) => match Self::from_slice(&bytes) {
+                Some(secret) => return Ok((secret, SecretOrigin::Existing)),
+                None => Place::Replace,
+            },
+            Err(e) if e.is_missing() => Place::New,
+            Err(e) => return Err(e.into()),
+        };
+        let mut bytes = [0_u8; SECRET_BYTES];
+        rustls::crypto::ring::default_provider()
+            .secure_random
+            .fill(&mut bytes)
+            .ok()
+            .ok_or(io::ErrorKind::Other)?;
+        files::write_new(path, &bytes, place)?;
+        Ok((Self(bytes), SecretOrigin::Created))
+    }
+
     /// The secret of a file's bytes; `None` unless there are exactly [`SECRET_BYTES`].
     #[must_use]
     pub fn from_slice(bytes: &[u8]) -> Option<Self> {
@@ -297,5 +344,83 @@ mod tests {
         strip_reserved(&mut h);
         assert!(h.get("x-kbf-fenced").is_none());
         assert!(h.get("x-child-id").is_some());
+    }
+
+    mod secret_file {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::super::*;
+        use crate::tests::pki::{scratch, write_file};
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path).expect("meta").permissions().mode() & 0o7777
+        }
+
+        /// The first start writes 32 bytes, mode 0600, with no newline; the next reads them.
+        ///
+        /// Kills: a trailing newline (the child needs exactly 32 bytes); mode 0644.
+        #[test]
+        fn a_new_secret_is_32_bytes_mode_0600_and_then_read_back() {
+            let dir = scratch("secret-new");
+            let path = dir.join("proxy-auth");
+            let (secret, origin) = ProxySecret::create_or_read(&path).expect("create");
+            assert_eq!(origin, SecretOrigin::Created);
+            let bytes = std::fs::read(&path).expect("read");
+            assert_eq!(bytes.len(), SECRET_BYTES, "no trailing newline");
+            assert_eq!(ProxySecret::from_slice(&bytes), Some(secret.clone()));
+            assert_eq!(mode_of(&path), 0o600);
+            assert_ne!(bytes, [0; SECRET_BYTES], "random");
+
+            let (again, origin) = ProxySecret::create_or_read(&path).expect("read");
+            assert_eq!((again, origin), (secret, SecretOrigin::Existing));
+            assert_eq!(
+                std::fs::read_dir(&dir).expect("list").count(),
+                1,
+                "no temporary file"
+            );
+        }
+
+        /// A file that is not 32 bytes (a 0-byte one, a newline-terminated one) is replaced by a
+        /// whole one and reported `Created`, so the supervisor restarts the children.
+        ///
+        /// Kills: reading a short file as a secret; failing for ever on a half file.
+        #[test]
+        fn a_file_of_another_length_is_replaced() {
+            let dir = scratch("secret-replace");
+            for (n, content) in [&[][..], &[1; 31], &[1; 33], b"deadbeef\n"]
+                .into_iter()
+                .enumerate()
+            {
+                let path = dir.join(format!("proxy-auth-{n}"));
+                write_file(&path, content, 0o600);
+                let (_, origin) = ProxySecret::create_or_read(&path).expect("replace");
+                assert_eq!(origin, SecretOrigin::Created, "{content:?}");
+                assert_eq!(std::fs::read(&path).expect("read").len(), SECRET_BYTES);
+                assert_eq!(mode_of(&path), 0o600);
+            }
+        }
+
+        /// A file the child would refuse is refused here too, not repaired, whatever its length.
+        ///
+        /// Kills: replacing a file anyone else could have written.
+        #[test]
+        fn a_file_with_the_wrong_mode_or_kind_is_refused_not_repaired() {
+            let dir = scratch("secret-refused");
+            for len in [SECRET_BYTES, 5] {
+                let path = dir.join(format!("open-{len}"));
+                write_file(&path, &vec![3; len], 0o644);
+                let error = ProxySecret::create_or_read(&path).expect_err("0644");
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(
+                    std::fs::read(&path).expect("read"),
+                    vec![3; len],
+                    "left as it was"
+                );
+            }
+            let error = ProxySecret::create_or_read(&dir).expect_err("a directory");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            let missing = dir.join("no-such-dir").join("proxy-auth");
+            assert!(ProxySecret::create_or_read(&missing).is_err());
+        }
     }
 }
