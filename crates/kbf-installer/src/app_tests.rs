@@ -386,6 +386,25 @@ fn a_loop_whose_file_was_replaced_tries_the_new_one_and_ends_when_it_cannot_star
     };
     assert_eq!(failure.exit, Exit::Failed);
     assert!(failure.why.contains("cannot start"), "{}", failure.why);
+    // A start that fails leaves this process as it was: `Command::exec` would have put
+    // SIGPIPE back to its default (the standard library does that before it execs), and a
+    // later write to a pipe nobody reads would then end the whole process by a signal
+    // instead of failing with an error. Nothing else in the lib tests reaches the re-exec.
+    assert_eq!(sigpipe_handler(), libc::SIG_IGN, "SIGPIPE is ignored again");
+}
+
+/// The disposition of SIGPIPE in this process.
+fn sigpipe_handler() -> libc::sighandler_t {
+    // SAFETY: sigaction with a null new action only reads the current one into `old`, which
+    // a zeroed `sigaction` is valid for.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        assert_eq!(
+            libc::sigaction(libc::SIGPIPE, std::ptr::null(), &raw mut old),
+            0
+        );
+        old.sa_sigaction
+    }
 }
 
 /// Catches the operator's verbs not being wired to the dispatcher, or their exits being
