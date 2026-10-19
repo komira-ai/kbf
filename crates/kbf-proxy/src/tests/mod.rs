@@ -8,6 +8,7 @@ mod h1;
 mod hold;
 mod kit;
 mod lifetime;
+mod operator;
 pub(crate) mod pki;
 mod reload;
 mod routing;

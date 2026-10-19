@@ -173,7 +173,9 @@ pub const fn auth_class(route: Route) -> Option<AuthClass> {
 /// Whether the hold gate lets the route through while it holds. Only a stream going to a
 /// backend is held; everything the proxy answers itself bypasses: the update API (so `abort`
 /// cannot deadlock), the probes, the metrics, and a path outside the table (answered 404 or
-/// `UNIMPLEMENTED` at once, never forwarded).
+/// `UNIMPLEMENTED` at once, never forwarded). An operator call (`/v1/*` but the update API) is
+/// held like any backend stream: it waits in the bounded hold queue during a swap hold and is
+/// answered 503 at the bound.
 #[must_use]
 pub const fn bypasses_hold(route: Route) -> bool {
     !matches!(route, Route::Child(_))
