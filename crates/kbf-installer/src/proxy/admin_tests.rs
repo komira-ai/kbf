@@ -202,13 +202,14 @@ struct World {
     held: Option<u64>,
     superseded: bool,
     protocol: u32,
+    /// What the role view says of the child's own open streams and worker sessions.
+    open_streams: u64,
+    open_sessions: u64,
 }
 
 /// The operator API of a child, as far as the swap uses it.
 struct Operator {
     ready: bool,
-    open_executions: u64,
-    queued_operations: u64,
     /// The commit the child was built from.
     own: String,
     /// Whether a refusal of a commit that is not the child's own names `"code": "not_own"`.
@@ -227,8 +228,8 @@ fn view(world: &World, store: &Store) -> Value {
         "generation": *lock(store),
         "held_generation": world.held,
         "superseded": world.superseded,
-        "open_streams": 0,
-        "open_sessions": 0,
+        "open_streams": world.open_streams,
+        "open_sessions": world.open_sessions,
         "reapi": "127.0.0.1:8980",
         "worker": null,
         "api": "127.0.0.1:8982",
@@ -296,20 +297,12 @@ fn takeover(world: &mut World, store: &Store, body: &[u8]) -> Reply {
     Reply::json(200, view(world, store))
 }
 
-/// The operator routes: `/readyz` and the drain read are open; the desired offer passes the
+/// The operator routes: `/readyz` is open; the desired offer passes the
 /// gates of a write (the proxy's secret, no `Origin`, the bearer token, JSON).
 fn operator_route(operator: &mut Operator, request: &Seen) -> Reply {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/readyz") if operator.ready => Reply::json(200, json!({"ready": true})),
         ("GET", "/readyz") => Reply::json(503, json!({"ready": false, "failing": []})),
-        ("GET", "/v1/frontend/drain") => Reply::json(
-            200,
-            json!({
-                "draining": false,
-                "open_executions": operator.open_executions,
-                "queued_operations": operator.queued_operations,
-            }),
-        ),
         ("POST", "/v1/update/desired") => offer(operator, request),
         _ => Reply::text(404, ""),
     }
@@ -376,11 +369,11 @@ impl Child {
             held,
             superseded: false,
             protocol: 1,
+            open_streams: 3,
+            open_sessions: 1,
         }));
         let operator = Arc::new(Mutex::new(Operator {
             ready: true,
-            open_executions: 3,
-            queued_operations: 1,
             own: COMMIT_B.to_owned(),
             coded: true,
             token: TOKEN.to_owned(),
@@ -555,14 +548,13 @@ fn the_admin_calls_use_the_admin_port_and_the_reads_and_the_offer_the_operator_p
     rig.admin.try_ready(slot).unwrap();
     rig.admin.try_open_counts(slot).unwrap();
     rig.admin.try_post_desired(slot, &offered()).unwrap();
-    assert_eq!(rig.b.admin_port.paths(), ["GET /v1/admin/role"]);
+    assert_eq!(
+        rig.b.admin_port.paths(),
+        ["GET /v1/admin/role", "GET /v1/admin/role"]
+    );
     assert_eq!(
         rig.b.operator_port.paths(),
-        [
-            "GET /readyz",
-            "GET /v1/frontend/drain",
-            "POST /v1/update/desired"
-        ]
+        ["GET /readyz", "POST /v1/update/desired"]
     );
     assert!(rig.a.untouched());
 }
@@ -1086,7 +1078,7 @@ fn every_call_that_does_not_wait_for_work_gives_up_at_the_per_call_deadline() {
         ("ready", "/readyz", |admin| {
             admin.try_ready(Slot::A).map(drop)
         }),
-        ("open_counts", "/v1/frontend/drain", |admin| {
+        ("open_counts", "/v1/admin/role", |admin| {
             admin.try_open_counts(Slot::A).map(drop)
         }),
         ("post_desired", "/v1/update/desired", |admin| {
@@ -1167,29 +1159,55 @@ fn readiness_is_not_read_from_the_admin_port() {
 }
 
 #[test]
-fn open_counts_reads_the_drain_endpoint_with_no_credential() {
-    // Catches: the two counts swapped or one dropped; a read that carries the secret it
-    // does not need.
+fn open_counts_reads_the_streams_and_sessions_of_the_admin_role_view() {
+    // Catches: the two counts swapped or one dropped; a read sent to the operator port; a
+    // count that is missing read as zero (idle); a protocol this client does not speak read
+    // as counts.
     let rig = Rig::new();
     assert_eq!(
         rig.admin.try_open_counts(Slot::A),
         Ok(OpenCounts {
-            open_executions: 3,
-            queued_operations: 1
+            open_streams: 3,
+            open_sessions: 1
         })
     );
-    let seen = rig.a.operator_port.seen();
-    assert_eq!(rig.a.operator_port.paths(), ["GET /v1/frontend/drain"]);
-    assert!(seen[0].header("x-kbf-proxy-auth").is_none());
+    assert_eq!(rig.a.admin_port.paths(), ["GET /v1/admin/role"]);
+    assert!(rig.a.operator_port.seen().is_empty());
+    {
+        let mut world = lock(&rig.a.world);
+        world.open_streams = 0;
+        world.open_sessions = 0;
+    }
+    assert!(rig.admin.try_open_counts(Slot::A).unwrap().idle());
+    for missing in ["open_streams", "open_sessions"] {
+        let mut body = json!({
+            "role": "active", "admin_protocol": 1, "open_streams": 0, "open_sessions": 0,
+        });
+        body.as_object_mut().unwrap().remove(missing);
+        rig.a.force("/v1/admin/role", Reply::json(200, body));
+        assert!(
+            matches!(
+                rig.admin.try_open_counts(Slot::A),
+                Err(AdminError::BadAnswer {
+                    call: "open_counts",
+                    ..
+                })
+            ),
+            "{missing}"
+        );
+    }
     rig.a.force(
-        "/v1/frontend/drain",
-        Reply::json(200, json!({"draining": true, "open_executions": 0})),
+        "/v1/admin/role",
+        Reply::json(
+            200,
+            json!({"admin_protocol": 2, "open_streams": 0, "open_sessions": 0}),
+        ),
     );
     assert!(matches!(
         rig.admin.try_open_counts(Slot::A),
-        Err(AdminError::BadAnswer {
+        Err(AdminError::Protocol {
             call: "open_counts",
-            ..
+            found: 2
         })
     ));
 }
@@ -1488,8 +1506,8 @@ fn through_the_trait_every_call_returns_its_value_and_errors_become_text() {
     assert_eq!(
         admin.open_counts(Slot::A),
         Ok(OpenCounts {
-            open_executions: 3,
-            queued_operations: 1
+            open_streams: 3,
+            open_sessions: 1
         })
     );
     admin.post_desired(Slot::B, &offered()).unwrap();

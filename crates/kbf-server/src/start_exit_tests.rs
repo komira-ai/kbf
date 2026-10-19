@@ -13,6 +13,7 @@ use kbf_objstore::FsStoreError;
 use super::{NOT_READY, REFUSED, StartFailure};
 use crate::RaftLogError;
 use crate::RaftMetaLog;
+use crate::cold_apply::ColdApplyError;
 use crate::write_tier::WriteTierError;
 
 fn class(e: impl Error + 'static) -> StartFailure {
@@ -184,4 +185,30 @@ fn what_a_failed_start_says_is_its_error_then_the_hint() {
     );
     let busy: Box<dyn Error> = Box::new(io::Error::from(io::ErrorKind::ResourceBusy));
     assert_eq!(super::said("kbf storage", busy.as_ref()).lines().count(), 1);
+}
+
+/// Catches a node whose registered keys fail its probe being left down (mutant: the
+/// `ColdApplyError` arm removed): the operator registers a working pair and the restart
+/// reads it, so the exit is 75; the failures a restart cannot clear (no keys of its own,
+/// a refused node, core dumps that stay on) are 2.
+#[test]
+fn registered_keys_that_do_not_work_yet_are_not_ready() {
+    use kbf_objstore::probe::ProbeStep;
+    assert_eq!(
+        class(ColdApplyError::Probe(ProbeStep::Put)),
+        StartFailure::NotReady
+    );
+    assert_eq!(class(ColdApplyError::Unusable), StartFailure::NotReady);
+    assert_eq!(
+        class(Wrapped(Box::new(ColdApplyError::Unusable))),
+        StartFailure::NotReady
+    );
+    for refused in [
+        ColdApplyError::MissingKeys("AWS_ACCESS_KEY_ID"),
+        ColdApplyError::MismatchNoKeys,
+        ColdApplyError::Refused(tonic::Code::PermissionDenied),
+        ColdApplyError::Harden(io::Error::other("no")),
+    ] {
+        assert_eq!(class(refused), StartFailure::Refused);
+    }
 }

@@ -25,9 +25,11 @@
 //! a label: `--label` is reported for operators and never matched by a request.
 //!
 //! Exits non-zero when the node cannot be detected or the configuration cannot be
-//! loaded; otherwise runs until SIGTERM or SIGINT, then exits zero. Leases still
-//! running then are abandoned (their processes killed, their directories removed);
-//! the scheduler places them again.
+//! loaded; otherwise runs until SIGTERM or SIGINT, then drains: it takes no new lease,
+//! lets the running ones finish and report, waits for their acknowledgements and exits
+//! zero. A second signal, or `--drain-deadline-secs` after the first, stops it at once;
+//! leases still running then are abandoned (their processes killed, their directories
+//! removed) and the scheduler places them again.
 //!
 //! Everything the daemon keeps on disk is under one directory, `--data-dir` (default
 //! `/var/lib/kbf`; `data_dir`): `leases/`, and under the container driver and the
@@ -223,6 +225,13 @@ pub struct Cli {
     /// pressure stall information (macOS, a kernel built without it).
     #[arg(long, default_value_t = 10.0, value_parser = percent)]
     memory_pressure_pause_percent: f64,
+    /// On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets
+    /// the running ones finish and report, waits for their acknowledgements, then exits
+    /// 0. A second signal, or this many seconds after the first, stops it at once and
+    /// abandons the leases still running. Used by `kbf daemon`; the combined modes stop
+    /// their daemon half with the other half.
+    #[arg(long, default_value_t = 600)]
+    drain_deadline_secs: u64,
     /// Where the kernel reports memory pressure stall information. For tests only.
     #[arg(long, hide = true, default_value = kbf_daemon::pressure::MEMORY_PSI)]
     psi_memory_file: PathBuf,
@@ -441,6 +450,8 @@ fn sizes_on(
 pub struct NodeHandle {
     tokio: tokio::runtime::Runtime,
     daemon: Daemon,
+    /// `--drain-deadline-secs`.
+    drain_deadline: Duration,
 }
 
 impl NodeHandle {
@@ -458,13 +469,17 @@ impl NodeHandle {
                 signal(SignalKind::interrupt())?,
             )
         };
-        self.serve_until(shutdown(term, int));
+        let (signals, received) = tokio::sync::mpsc::unbounded_channel();
+        let deadline = self.drain_deadline;
+        let Self { tokio, daemon, .. } = self;
+        tokio.spawn(forward(term, int, signals));
+        tokio.block_on(daemon.run_draining(received, deadline));
         Ok(())
     }
 
     /// Serves until `shutdown` completes, then abandons the leases still running.
     pub fn serve_until(self, shutdown: impl Future<Output = ()>) {
-        let Self { tokio, daemon } = self;
+        let Self { tokio, daemon, .. } = self;
         tokio.block_on(daemon.run(shutdown));
     }
 }
@@ -554,7 +569,11 @@ fn start_over<C: Cas>(
         let daemon = update.into_iter().fold(daemon, Daemon::with_update);
         backstop(cli, daemon)
     };
-    Ok(NodeHandle { tokio, daemon })
+    Ok(NodeHandle {
+        tokio,
+        daemon,
+        drain_deadline: Duration::from_secs(cli.drain_deadline_secs),
+    })
 }
 
 /// The data plane of a daemon whose server is elsewhere: the process's transfer engine
@@ -886,13 +905,22 @@ fn native_runtime<C: Cas>(
 /// What the native driver's surveys send the daemon, merged.
 type Reports = tokio::sync::watch::Receiver<kbf_daemon::DriverReport>;
 
-/// Completes on SIGTERM or SIGINT.
-async fn shutdown(mut term: Signal, mut int: Signal) {
-    let name = tokio::select! {
-        _ = term.recv() => "SIGTERM",
-        _ = int.recv() => "SIGINT",
-    };
-    tracing::info!("{name}: shutting down");
+/// Sends a `()` on `signals` for every SIGTERM or SIGINT, until the receiver is gone.
+async fn forward(
+    mut term: Signal,
+    mut int: Signal,
+    signals: tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    loop {
+        let name = tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        };
+        tracing::info!("{name}: shutting down");
+        if signals.send(()).is_err() {
+            return;
+        }
+    }
 }
 
 /// The data directory, resolved and made, for a daemon that runs a driver that keeps
@@ -1962,5 +1990,48 @@ mod tests {
                 assert!(why.contains(said), "{flag}: {why}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use std::time::Duration;
+
+    use tokio::signal::unix::{SignalKind, signal};
+
+    use super::forward;
+
+    fn raise(signal: libc::c_int) {
+        // SAFETY: raise(3) on this process, whose handler for `signal` the test installed.
+        assert_eq!(unsafe { libc::raise(signal) }, 0);
+    }
+
+    /// Catches a forwarder that drops a signal (the daemon would never drain), one that
+    /// reads SIGINT differently from SIGTERM, and one that outlives its receiver (a task
+    /// per stopped daemon): each SIGTERM and SIGINT is one `()`, and the task ends once
+    /// nobody listens.
+    #[tokio::test]
+    async fn each_sigterm_and_sigint_is_one_signal_and_the_task_ends_with_its_receiver() {
+        let term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let int = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(forward(term, int, tx));
+        let within = Duration::from_secs(10);
+        raise(libc::SIGTERM);
+        tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("SIGTERM forwarded")
+            .expect("open");
+        raise(libc::SIGINT);
+        tokio::time::timeout(within, rx.recv())
+            .await
+            .expect("SIGINT forwarded")
+            .expect("open");
+        drop(rx);
+        raise(libc::SIGTERM);
+        tokio::time::timeout(within, task)
+            .await
+            .expect("the forwarder ends")
+            .expect("no panic");
     }
 }

@@ -86,11 +86,11 @@ fn bad_settings_are_refused_before_anything_renders() {
         ),
         (
             format!("{EXAMPLE}KBF_RAM=1\n"),
-            "line 111: unknown key KBF_RAM",
+            "line 113: unknown key KBF_RAM",
         ),
         (
             format!("{EXAMPLE}KBF_RAM_GIB=1\n"),
-            "line 111: KBF_RAM_GIB is already set on line 24",
+            "line 113: KBF_RAM_GIB is already set on line 24",
         ),
         (
             example_with(&[("KBF_NODE_ID", "a;b")]),

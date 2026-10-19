@@ -198,7 +198,6 @@ fn a_starter_starts_the_daemon_half_over_the_storage_half_in_either_mode() {
     let dir = crate::one_cache::under_target("starter");
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
     // The daemon reads its certificates at start.
-    std::fs::create_dir_all(&dir).expect("scratch");
     let ca = rcgen::CertifiedIssuer::self_signed(
         rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params"),
         rcgen::KeyPair::generate().expect("key"),

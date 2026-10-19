@@ -206,6 +206,11 @@ Options:
           
           [default: 10]
 
+      --drain-deadline-secs <DRAIN_DEADLINE_SECS>
+          On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0. A second signal, or this many seconds after the first, stops it at once and abandons the leases still running. Used by `kbf daemon`; the combined modes stop their daemon half with the other half
+          
+          [default: 600]
+
       --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
           How often each lease's `max` events and swap are sampled, in milliseconds (container)
           

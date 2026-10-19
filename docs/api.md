@@ -259,8 +259,9 @@ message yet: the daemon is not told, and the server simply sends it no new `Star
 
 ## `POST /v1/members/{id}`
 
-An operator sets a storage member's state. The body is `{"state": "active"}` or
-`{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
+An operator sets a storage member's state. The body is `{"state": "active"}`,
+`{"state": "draining"}` or `{"state": "planned_down"}` (which may add `"for_secs": N`, 1 to
+86400, default 900); the answer is `{"id": N, "state": "...", "generation": G}`,
 the map's generation after the change. `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
 written by a registration (a new node in a farm with data), so none of them is accepted (`400`, as is
 any other body). `404` for an id that has no live row (it expired, or never
@@ -271,6 +272,32 @@ by a refused request.
 
 When a member becomes `active` the cluster also records that it has formed (see below),
 in the same transaction.
+
+**A planned restart.** `planned_down` takes an `active` member out of the write path at
+once, for a restart an operator is about to make; any other state answers `409`. A member
+is `down` in the map only a TTL (15 s by default) after its last heartbeat. Until then a write whose
+primary is the stopped node dials it first and then moves on to the next owner, which costs
+a connection attempt per write, and an action-cache commit does not move on at all and is
+refused `UNAVAILABLE`, which a client retries for about a second and a half. After this call the
+map (one new generation, in the answer) has the member `down`, so every router, chain
+primary and repair worker that holds the map sends writes to the other owner and reads
+the member's blobs from it, and a node or daemon that holds an older map reads it like
+any `down` member (the wire has no new state). The member keeps serving what reaches it
+and keeps heartbeating until it stops; a heartbeat does not undo this, until `for_secs` has
+passed: the first heartbeat after that returns it to `active` (a controller that died, or a
+restart that never came, does not strand a healthy node out of service). The `down/<id>`
+mark that keeps its slot for the dwell (the same time as for a member that fails) is
+written in the same transaction, with a value that says an operator planned it:
+[`GET /v1/storage`](#get-v1storage) shows `"state": "down", "planned_down": true` for it.
+The end of the plan is kept in the member's row, which a frontend built before it drops when it
+rewrites the row, so nothing is planned down while a frontend of an older build serves the same
+state store. Asking again for a member already planned down is the same plan with its end moved to
+`for_secs` from now: `200`, the same answer, no new generation. It is undone by
+`{"state": "active"}` (a restart that did not happen), or by the member
+registering again after the restart: `active` if its index is whole, `catching_up` while
+it rebuilds, the mark deleted. If it never returns, it leaves the map at the end of the
+dwell counted from this call, as any `down` member does. It survives a restart of the
+frontend: it is in the store.
 
 **When a member is `active` without this call.** A registration that says the node's
 index is whole enters `active`, in a fresh cluster and in a formed one alike: it is the
@@ -658,7 +685,9 @@ no registered member.
 ```json
 { "members_total": 3, "members_active": 3, "not_active": [], "silent": [],
   "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
-  "reasons": ["3 blobs owed"] }
+  "reasons": ["3 blobs owed"],
+  "nodes": [ { "id": 1, "state": "active", "planned_down": false, "repair_debts": 3, "open_writes": 0, "generation": 12 },
+             { "id": 2, "state": "active", "planned_down": false, "repair_debts": 0, "open_writes": null, "generation": 12 } ] }
 ```
 
 - `under_replicated_blobs`: the number, or `null` while unknown. A gate treats `null` as
@@ -671,6 +700,17 @@ no registered member.
 - `reasons`: why the number is not zero, in that order, as a rollout would say it
   (`member 3 not active`, `member 2 silent`, `5 blobs owed`); empty when it is known to be
   zero.
+- `nodes`: every registered member in any state (`planned_down` is true for a `down`
+  member an operator planned, [above](#post-v1membersid)), with what its newest report says:
+  `repair_debts` (the copies it owes), `open_writes` (the `Write` calls, action-cache
+  commits and daemon segment uploads it has open now, an upload from `Begin` until its
+  commit ends, as a primary or a replica) and `generation` (the map it held when
+  it counted). A value is `null` when the member's report is older than the freshness
+  window, when it has not reported, or when it cannot say (an older node does not count its
+  writes). `null` is unknown, never zero: whoever reads it fails closed. A node is idle for a
+  rollout only when every other member is `ACTIVE` and fresh, no copy is owed anywhere, and
+  the node itself reports no open write from a map at least as new as the one that stopped
+  routing writes to it (`Members::node_idle`, in-process, with the reasons).
 
 The number is as old as the newest heartbeat. A copy owed since then is not in it, so
 whoever acts on a zero keeps new writes away from the node first (drains it), then reads
@@ -1048,6 +1088,7 @@ caller goes away before the answer counts as an error.
 | `kbf_execute_requests_total`, `_errors_total` | counter | Execute calls ended, and those that ended in an error status or were dropped by their caller before the done operation (an operation that finished with a failed `ExecuteResponse` is not one) |
 | `kbf_execute_in_flight` | gauge | Execute and WaitExecution streams open |
 | `kbf_under_replicated_blobs` | gauge | the sum over all registered storage members of the blobs each owes a second copy, exported **only while it is known** (every registered member `ACTIVE` and reporting within the window); absent otherwise, never 0. Frontends with a state store. [`GET /v1/storage`](#get-v1storage) says why it is unknown |
+| `kbf_member_repair_debts{member}`, `kbf_member_open_writes{member}` | gauge | per storage member, the copies it owes and the writes it has open now, one sample per member, **only for a value that is known** (fresh report, and the node says it counts); a member with no sample is unknown, never 0. Frontends with a state store. [`GET /v1/storage`](#get-v1storage) lists the same per node |
 | `kbf_storage_health_known` | gauge | 1 when `kbf_under_replicated_blobs` is exported, 0 when it is unknown (including a membership that cannot be read). Frontends with a state store |
 | `kbf_front_open_executions` | gauge | Execute and WaitExecution operation streams alive: raised when the stream is made (before its first item is read), lowered when it ends or its caller drops it. A call still being authorized or prepared, and one answered from the action cache, is not in it. `GET /v1/frontend/drain` reports it |
 | `kbf_front_executes_started_total` | counter | Execute calls the front took (not refused because it is draining), cache hits included |
@@ -1589,10 +1630,10 @@ treated as `UNAVAILABLE`. `UNAVAILABLE` for a caller ahead of the node is the no
 lost push: the caller's map may be the right one, so the caller tries again, and the
 node's next push makes the call succeed.
 
-## `PUT /v1/releases/{commit}/{platform}/{name}` and `GET /v1/releases`
+## `PUT /v1/releases/{commit}/{platform}/{name}`, `GET /v1/releases` and `GET /v1/releases/{commit}`
 
 The frontend's release store (`docs/design/pull-updates.md` section 6.3): the tarballs of a
-release and their build attestations, kept as uploaded. Mounted by `--releases-dir`; without a store both answer
+release and their build attestations, kept as uploaded. Mounted by `--releases-dir`; without a store all three answer
 `503` naming `--releases-dir`.
 
 - `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
@@ -1605,7 +1646,12 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
   a `.partial` file, synced, and renamed into place, so an interrupted upload leaves nothing
   visible.
 - `201` `{"sha256", "size"}` for a new key. A release is immutable: the same bytes again are
-  `200` with the same answer, other bytes are `409` and change nothing.
+  `200` with the same answer, other bytes are `409` and change nothing. The answer for a
+  bundle carries the bundle's own digest, and the store also names the bundle by that
+  digest next to the tarballs (one file, two names), so that `ReleaseService.Fetch` serves a
+  bundle like a tarball. A bundle stored before that link existed has no such name until the
+  same bytes are put again (`200`); `Describe` reports it as lacking until then, though
+  `GET /v1/releases` and the offers still count its platform complete.
 - `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
   "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
   order above, a platform `complete` when it holds, with their attestations, the tarballs its
@@ -1618,6 +1664,80 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
   operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
   store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
   update endpoint answers `503`.
+
+### `ReleaseService.Describe` and `GET /v1/releases/{commit}`
+
+What the store holds of one release, for a caller that was given no offer: the installer's
+`frontend_update` order names a commit and nothing else (`docs/design/kbf-installer.md`
+section 5), so it asks the release source what the commit holds before it fetches. The
+answer is claims, not trust: the installer fetches each file by its digest and verifies the
+tarball against its bundle, which it does for an offer's components too.
+
+`rpc Describe(DescribeRequest) returns (ReleaseDescription)` on `kbf.update.v1.ReleaseService`
+(`crates/kbf-proto/proto/kbf/update/v1/update.proto`):
+
+- `DescribeRequest{commit, platform}`: `commit` is 40 lowercase hex digits; `platform` is
+  `linux-x86_64`, `linux-arm64` or `darwin-arm64`, or empty for every platform the release
+  is complete for.
+- `ReleaseDescription{commit, components}`: one `ReleaseComponent{name, platform, tarball,
+  sha256, size, bundle_sha256, bundle_size}` for each tarball a host of each described
+  platform needs (the same rule as an offer: `kbf` for a Linux platform, `kbf-daemon` for
+  `darwin-arm64`, and nothing else the store happens to hold), in platform order
+  (`linux-x86_64`, `linux-arm64`, `darwin-arm64`). `tarball` is the file name
+  `<name>-<commit>-<platform>.tar.gz`; `sha256` and `size` are the tarball's;
+  `bundle_sha256` and `bundle_size` are the build-provenance bundle's
+  (`<tarball>.sigstore.json`, at most 256 KiB). Both files are served by `Fetch` under their
+  digests.
+- A platform is described only when complete: every tarball it needs is stored with its
+  bundle, and the bundle is served by its digest. With a platform asked, one that is not
+  complete fails the call. With none asked, an incomplete platform is left out and the call
+  fails only when none is complete.
+- `INVALID_ARGUMENT` for a commit that is not exactly 40 lowercase hex digits (a 12-digit
+  short commit included) and for a platform that is not one of the three; `NOT_FOUND` when no
+  tarball of the commit is stored (a bundle alone is not a release); `FAILED_PRECONDITION`
+  when the platform asked is not complete, or none is, with a message that names what is
+  lacking per platform (`linux-arm64 has no tarball of kbf`, `linux-x86_64 has no attestation
+  of kbf`, or a bundle not served by its digest, which putting it again repairs);
+  `UNAVAILABLE` without `--releases-dir`; `INTERNAL` for a store that fails, saying only that.
+- **Who may call it** is the rule of `Fetch`, one row of the worker listener's role table:
+  under mutual TLS the daemon role alone (another role is `PERMISSION_DENIED`, no certificate
+  is `UNAUTHENTICATED`); in plain-text worker mode it is open, like every worker method.
+  The service itself checks nothing.
+
+`GET /v1/releases/{commit}` answers the same description for every complete platform as
+JSON, open like `GET /v1/releases`: `200`, `400` for a commit that is not 40 lowercase hex
+digits, `404` when no tarball of it is stored, `409` when no platform is complete (the
+message is `Describe`'s), `503` without a store.
+
+```json
+{
+  "schema": 1,
+  "commit": "<40 hex>",
+  "components": [
+    {
+      "name": "kbf",
+      "platform": "linux-x86_64",
+      "tarball": "kbf-<commit>-linux-x86_64.tar.gz",
+      "sha256": "<64 hex>",
+      "size": 123,
+      "bundle_sha256": "<64 hex>",
+      "bundle_size": 456
+    }
+  ]
+}
+```
+
+`schema` is `1`. A field is added without moving it; a reader takes `schema` 1 only, ignores
+keys it does not know, and holds every value to the shape above before it uses it.
+
+**The `url` source's file.** A `url` release source is a static HTTPS server of the store's
+layout (`docs/design/kbf-installer.md` section 5): `files/<sha256>` holds every tarball and
+every bundle by digest, and `releases/<commit>.json` is this route's body, saved. Nothing
+in this repository writes that tree: the release workflow attaches tarballs and bundles to a
+GitHub release by name, and `kbf-server` serves no files over HTTP. A mirror is made from a
+frontend's store: copy its `files/` directory and save the route's body for each commit
+(`curl -fsS "$API/v1/releases/$COMMIT" > releases/$COMMIT.json`); a commit that is not
+complete for any platform has no file to save (`409`).
 
 ## `GET /v1/update` and `POST /v1/update/{desired,pause,resume}`
 

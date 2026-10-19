@@ -29,6 +29,11 @@ pub enum NodePhase {
     /// new lease until the pressure falls, and keeps the ones it runs. It says so only
     /// while it holds one, so it is never left paused with nothing running.
     MemoryPressure,
+    /// The daemon was told to stop and drains: it takes no new lease, runs the ones it
+    /// holds to their end, reports them and waits for their acknowledgements, then
+    /// exits. The scheduler keeps its leases while it heartbeats, as for any phase that
+    /// takes no lease.
+    Draining,
 }
 
 impl NodePhase {
@@ -37,12 +42,12 @@ impl NodePhase {
     pub const fn switching(&self) -> Option<LeaseId> {
         match self {
             Self::Preparing(lease) | Self::Restoring(lease) => Some(*lease),
-            Self::Serving | Self::Quarantined(_) | Self::MemoryPressure => None,
+            Self::Serving | Self::Quarantined(_) | Self::MemoryPressure | Self::Draining => None,
         }
     }
 
     /// The phase as an operator reads it: `serving`, `preparing`, `restoring`,
-    /// `quarantined` or `memory_pressure`.
+    /// `quarantined`, `memory_pressure` or `draining`.
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
@@ -51,6 +56,7 @@ impl NodePhase {
             Self::Restoring(_) => "restoring",
             Self::Quarantined(_) => "quarantined",
             Self::MemoryPressure => "memory_pressure",
+            Self::Draining => "draining",
         }
     }
 }

@@ -1349,10 +1349,12 @@ dependencies = [
  "kbf-meta",
  "kbf-node",
  "kbf-objstore",
+ "kbf-outputs",
  "kbf-proto",
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
+ "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
@@ -1387,6 +1389,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "time",
  "ureq",
 ]
 
@@ -2208,6 +2211,7 @@ dependencies = [
  "kbf-enroll-registry",
  "kbf-front",
  "kbf-history",
+ "kbf-installer",
  "kbf-invocation",
  "kbf-log",
  "kbf-map",

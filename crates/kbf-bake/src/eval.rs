@@ -30,6 +30,10 @@ pub struct End {
     pub status: Status,
     /// Why, in a sentence.
     pub note: String,
+    /// For a red end: whether the gate that ended it had a measurement over its limit (true),
+    /// or was red for want of one (an absent series or baseline: false). Only a measured
+    /// gate is evidence that the release is bad, which is what a rollback needs.
+    pub measured: bool,
 }
 
 /// What a scrape decided.
@@ -250,6 +254,7 @@ impl Evaluator {
                     "gate `{}` is red: measured {measured}, limit {:?}",
                     g.name, g.threshold
                 ),
+                measured: g.measured.is_some(),
             });
         }
         if !last {
@@ -259,6 +264,7 @@ impl Evaluator {
             return Some(End {
                 status: Status::Green,
                 note: String::new(),
+                measured: false,
             });
         }
         Some(End {
@@ -272,6 +278,7 @@ impl Evaluator {
                 load.hours.measured,
                 load.hours.required
             ),
+            measured: false,
         })
     }
 }
@@ -288,7 +295,13 @@ fn follow_histogram(acc: &mut Vec<BucketCount>, m: &Metrics) -> bool {
     let Some(buckets) = m.buckets(metric::QUEUED_SECONDS) else {
         return false;
     };
-    for (bound, count) in buckets {
+    follow_buckets(acc, &buckets);
+    true
+}
+
+/// Follow one reading of a histogram's cumulative buckets `(upper bound, count)`.
+pub(crate) fn follow_buckets(acc: &mut Vec<BucketCount>, buckets: &[(f64, f64)]) {
+    for &(bound, count) in buckets {
         let le = bound.is_finite().then_some(bound);
         let at = match acc.iter().position(|b| b.le == le) {
             Some(i) => i,
@@ -305,12 +318,11 @@ fn follow_histogram(acc: &mut Vec<BucketCount>, m: &Metrics) -> bool {
         };
         acc[at].count.advance(count);
     }
-    true
 }
 
 /// The smallest bucket bound that holds `q` of the observations added since the bake began;
 /// zero when none were added. `None` when the histogram has not been seen.
-fn percentile(acc: &[BucketCount], q: f64) -> Option<f64> {
+pub(crate) fn percentile(acc: &[BucketCount], q: f64) -> Option<f64> {
     if acc.is_empty() {
         return None;
     }
@@ -330,6 +342,11 @@ fn percentile(acc: &[BucketCount], q: f64) -> Option<f64> {
 }
 
 impl Evaluator {
+    /// Record what became of the automatic rollback of a red end.
+    pub fn record_rollback(&mut self, what: String) {
+        self.state.rollback = Some(what);
+    }
+
     /// Record that the bake ended `status` (green or red), so a restart does not go on.
     pub fn mark_ended(&mut self, status: Status) {
         self.state.ended = Some(status);
