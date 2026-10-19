@@ -76,6 +76,8 @@ kbf-transfer.workspace = true
 # The protocol the daemon half speaks, which `kbf --version --json` reports as the
 # server's (src/tests.rs pins them equal).
 kbf-daemon.workspace = true
+# tests/installer_reads_version.rs: the installer parses what this binary prints.
+kbf-installer.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic.workspace = true
 # The state-postgres job's process test reads the frontend's tables back (tests/frontend_process.rs).

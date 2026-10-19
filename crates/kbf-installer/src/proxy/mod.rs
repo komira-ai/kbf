@@ -67,6 +67,7 @@ pub mod ports;
 pub mod record;
 mod recover;
 mod retire;
+pub mod running_binary;
 mod swap;
 
 #[cfg(test)]
@@ -95,4 +96,5 @@ mod swap_tests;
 pub use model::{Halt, Intent, Phase, Plan, Timing};
 pub use ports::Ports;
 pub use record::FileRecorder;
+pub use running_binary::RunningBinary;
 pub use swap::Swap;

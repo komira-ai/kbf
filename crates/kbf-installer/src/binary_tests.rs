@@ -98,6 +98,8 @@ fn the_version_object_is_read_by_its_fields() {
     assert_eq!(
         v,
         Version {
+            admin_protocol: Some(1),
+            meta_log: Some(4),
             commit: COMMIT[..12].to_owned(),
             min_protocol: 3,
             protocol: 4,
@@ -107,6 +109,10 @@ fn the_version_object_is_read_by_its_fields() {
             platform: None,
         }
     );
+    // A build before `admin_protocol` and `meta_log` omits them: unknown, not refused.
+    let old = r#"{"commit":"0123456789ab","min_protocol":3,"profile":"release","protocol":4,"state_schema":7,"version":"0.1.0"}"#;
+    let old = Version::parse(old.as_bytes()).expect("an older build parses");
+    assert_eq!((old.admin_protocol, old.meta_log), (None, None));
     let said = version_json(COMMIT, "release").replace('}', ",\"platform\":\"linux-arm64\"}");
     assert_eq!(
         Version::parse(said.as_bytes()).expect("parses").platform,
