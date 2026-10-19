@@ -7,7 +7,6 @@
 //! `frontend` and `all-in-one` hosts do not enroll, so they take neither and fetch from a
 //! file server.
 
-use super::paths;
 use crate::CommitId;
 use crate::cli::{Mode, ReleaseSource};
 use crate::installer_toml::{Source, https_base_named};
@@ -25,8 +24,8 @@ pub struct Raw {
     pub commit: Option<CommitId>,
     /// `--database`: the state database's URL.
     pub database: Option<String>,
-    /// `--installer-config`, as the host path it names.
-    pub installer_config: String,
+    /// `--installer-config`, as the host path it names; none: the layout's own.
+    pub installer_config: Option<String>,
 }
 
 /// The flags, valid.
@@ -93,12 +92,6 @@ impl Raw {
         };
 
         let database = self.database(&mut problems);
-        if self.installer_config != paths::INSTALLER_TOML {
-            problems.push(format!(
-                "setup writes {}, where the installer's unit reads it: --installer-config is for run",
-                paths::INSTALLER_TOML
-            ));
-        }
         let source = self.source(node, &mut problems);
         if self.commit.is_some() && source.as_ref().is_some_and(|s| *s == Source::Frontend) {
             problems.push(

@@ -111,6 +111,11 @@ fn the_platforms_differ_in_the_tree_the_state_the_lock_and_the_trust_directory()
             l.gh().to_string(),
             l.trusted_root().to_string(),
             l.settings().to_string(),
+            l.etc_dir().to_string(),
+            l.kbf_toml().to_string(),
+            l.installer_toml().to_string(),
+            l.enroll_token().to_string(),
+            l.api_token().to_string(),
         ]
     };
     assert_eq!(
@@ -129,6 +134,11 @@ fn the_platforms_differ_in_the_tree_the_state_the_lock_and_the_trust_directory()
             "/usr/share/kbf-installer/trust/gh",
             "/usr/share/kbf-installer/trust/trusted_root.jsonl",
             "/usr/share/kbf-installer/trust/installer.conf",
+            "/etc/kbf",
+            "/etc/kbf/kbf.toml",
+            "/etc/kbf/installer.toml",
+            "/etc/kbf/enroll.token",
+            "/etc/kbf/api-token",
         ]
     );
     assert_eq!(
@@ -147,6 +157,11 @@ fn the_platforms_differ_in_the_tree_the_state_the_lock_and_the_trust_directory()
             "/usr/local/kbf-installer/trust/gh",
             "/usr/local/kbf-installer/trust/trusted_root.jsonl",
             "/usr/local/kbf-installer/trust/installer.conf",
+            "/usr/local/etc/kbf",
+            "/usr/local/etc/kbf/kbf.toml",
+            "/usr/local/etc/kbf/installer.toml",
+            "/usr/local/etc/kbf/enroll.token",
+            "/usr/local/etc/kbf/api-token",
         ]
     );
     assert_eq!(

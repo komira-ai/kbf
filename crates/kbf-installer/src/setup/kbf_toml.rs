@@ -15,6 +15,8 @@ use toml::{Table, Value};
 /// What `setup` says goes in the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ours<'a> {
+    /// Where the file is, for what is said about it.
+    pub path: &'a str,
     pub mode: &'static str,
     pub frontend_url: Option<&'a str>,
     pub token_file: Option<&'a str>,
@@ -118,7 +120,7 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
         Err(e) => {
             return Decision::Refuse(format!(
                 "{} is not valid TOML ({}): fix it or remove it, then run setup again",
-                super::paths::KBF_TOML,
+                ours.path,
                 crate::installer_toml::redact(e.message())
             ));
         }
@@ -146,7 +148,7 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
     } else {
         Decision::Refuse(format!(
             "{} holds other settings and these keys differ from the flags ({}): edit them by hand",
-            super::paths::KBF_TOML,
+            ours.path,
             differ.join("; ")
         ))
     }

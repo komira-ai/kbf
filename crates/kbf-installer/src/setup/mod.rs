@@ -150,36 +150,30 @@ pub struct Options {
 /// The `installer.toml` this run leaves: the file that is there with the flags' settings put
 /// in, or the defaults with them. A file that is not valid is not overwritten (the operator
 /// decides), and a floor never goes down.
-pub fn installer_file(
-    exec: &dyn Exec,
-    v: &Valid,
-    platform: Platform,
-) -> Result<String, SetupError> {
-    let path = HostPath::new(paths::INSTALLER_TOML)?;
+pub fn installer_file(exec: &dyn Exec, v: &Valid, layout: &Layout) -> Result<String, SetupError> {
+    let path = layout.installer_toml();
+    let shown = path.to_string();
     let mut settings = match exec.inspect(&path)? {
         None => InstallerToml::default(),
         Some(Entry::File { bytes, .. }) => {
             let text = String::from_utf8_lossy(&bytes);
             InstallerToml::parse(&text).map_err(|e| {
                 SetupError::NeedsOperator(format!(
-                    "{e}\nfix {} or remove it, then run setup again",
-                    paths::INSTALLER_TOML
+                    "{e}\nfix {shown} or remove it, then run setup again"
                 ))
             })?
         }
         Some(_) => {
             return Err(SetupError::NeedsOperator(format!(
-                "{} is not a regular file",
-                paths::INSTALLER_TOML
+                "{shown} is not a regular file"
             )));
         }
     };
     if let Some(floor) = v.min_generation {
         if floor < settings.min_generation {
             return Err(SetupError::NeedsOperator(format!(
-                "--min-generation {floor} is below the {} in {}: a floor only goes up; lower it by editing the file",
-                settings.min_generation,
-                paths::INSTALLER_TOML
+                "--min-generation {floor} is below the {} in {shown}: a floor only goes up; lower it by editing the file",
+                settings.min_generation
             )));
         }
         settings.min_generation = floor;
@@ -188,7 +182,7 @@ pub fn installer_file(
     settings.database = v.database.clone();
     (settings.node_cert, settings.node_key) = match (&v.source, node_role(v.mode)) {
         (Source::Frontend, Some(role)) => {
-            let (cert, key) = paths::node_identity(platform, role);
+            let (cert, key) = paths::node_identity(layout.platform(), role);
             (Some(PathBuf::from(cert)), Some(PathBuf::from(key)))
         }
         _ => (None, None),
@@ -267,6 +261,14 @@ pub fn run(
     }
     let valid = raw.validate().map_err(SetupError::Invalid)?;
     let ctx = plan::context(os, valid.mode)?;
+    if let Some(given) = &raw.installer_config {
+        let wanted = ctx.layout.installer_toml().to_string();
+        if *given != wanted {
+            return Err(SetupError::Invalid(vec![format!(
+                "setup writes {wanted}, where the installer's service reads it: --installer-config is for run"
+            )]));
+        }
+    }
     refuse_old_layout(&*exec)?;
     let mut notes = Vec::new();
 
@@ -339,7 +341,7 @@ pub fn cli(
         min_generation: args.min_generation,
         commit: args.commit.clone(),
         database: args.database.clone(),
-        installer_config: args.installer_config.to_string(),
+        installer_config: args.installer_config.as_ref().map(ToString::to_string),
     };
     let options = Options {
         apply,

@@ -11,7 +11,6 @@ use kbf_state::postgres::schema::Outcome;
 
 use super::backend::{Backend, Releases, Schemas};
 use super::fake::{FakeOs, user};
-use super::paths::{API_TOKEN, ENROLL_TOKEN, INSTALLER_TOML, KBF_TOML};
 use super::validate::Raw;
 use super::{Options, SetupError, run};
 use crate::CommitId;
@@ -27,6 +26,12 @@ const DATABASE: &str = "postgres:///kbf?host=/run/postgresql";
 const SRC: &str = "/root/kbf.token";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const SECRET: &str = "abababababababababababababababababababababababababababababababab";
+/// The Linux configuration files, as the tests of Linux hosts pin them.
+const KBF_TOML: &str = "/etc/kbf/kbf.toml";
+const INSTALLER_TOML: &str = "/etc/kbf/installer.toml";
+const ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
+const API_TOKEN: &str = "/etc/kbf/api-token";
+
 const ROOT: Owner = Owner { uid: 0, gid: 0 };
 const KBF: Owner = Owner { uid: 990, gid: 990 };
 const KBF_SERVER: Owner = Owner { uid: 989, gid: 989 };
@@ -43,7 +48,7 @@ fn raw(mode: Mode) -> Raw {
         min_generation: None,
         commit: None,
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
-        installer_config: INSTALLER_TOML.to_owned(),
+        installer_config: None,
     }
 }
 
@@ -1087,7 +1092,7 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         min_generation: Some(0),
         commit: None,
         database: Some(DATABASE.to_owned()),
-        installer_config: "/tmp/i.toml".to_owned(),
+        installer_config: Some("/tmp/i.toml".to_owned()),
     };
     let mut exec = host();
     let err = go(&FakeOs::linux(), &mut exec, &bad, APPLY).expect_err("refused");
@@ -1322,6 +1327,52 @@ fn no_free_mac_id_is_a_refusal() {
     os.dscl_users = (300..400).map(|i| format!("u{i} {i}\n")).collect();
     let err = go(&os, &mut host(), &raw(Mode::Daemon), APPLY);
     assert!(matches!(err, Err(SetupError::NoFreeId)), "{err:?}");
+}
+
+/// Catches a `setup` that writes the host's configuration where the host's layout does not
+/// read it. On a Mac the LaunchDaemon waits for `/usr/local/etc/kbf/installer.toml` (its
+/// property list is checked here too), and `kbf.toml` and the tokens are beside it; on Linux
+/// they are in `/etc/kbf`. The directories are pinned as literals, once per platform, and
+/// `Layout` must agree with them: one source of truth for what `setup` writes and what
+/// the installer, its gate and the units read.
+///
+/// Mutants to plant: the Mac directory of `Platform::etc_dir` made `/etc/kbf`; `setup` naming
+/// the installer's file by a literal instead of the layout.
+#[test]
+fn setup_writes_the_configuration_where_the_layout_reads_it() {
+    const PLIST: &str = include_str!("../../../../packaging/macos/com.komira.kbf-installer.plist");
+    let cases = [
+        (FakeOs::linux(), Platform::Linux, "/etc/kbf"),
+        (FakeOs::mac(), Platform::MacOs, "/usr/local/etc/kbf"),
+    ];
+    for (os, platform, etc) in cases {
+        let mut exec = released(host(), platform);
+        go_ok(&os, &mut exec, &raw(Mode::Daemon));
+        let layout = Layout::new(kbf_host::Root::new("/").expect("root"), platform);
+        assert_eq!(layout.kbf_toml().to_string(), format!("{etc}/kbf.toml"));
+        assert_eq!(
+            layout.installer_toml().to_string(),
+            format!("{etc}/installer.toml")
+        );
+        for name in ["installer.toml", "kbf.toml", "enroll.token"] {
+            let at = format!("{etc}/{name}");
+            assert!(
+                matches!(exec.entries.get(&hp(&at)), Some(Entry::File { .. })),
+                "{platform:?}: setup wrote no {at}"
+            );
+        }
+        let kbf_toml = text(&exec, &format!("{etc}/kbf.toml"));
+        assert!(
+            kbf_toml.contains(&format!("token_file = \"{etc}/enroll.token\"")),
+            "{platform:?}: {kbf_toml}"
+        );
+        if platform == Platform::MacOs {
+            assert!(
+                PLIST.contains(&format!("<key>{etc}/installer.toml</key>")),
+                "the property list gates on another file than the one setup writes"
+            );
+        }
+    }
 }
 
 // The real host, read through an `Exec`

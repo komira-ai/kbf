@@ -61,7 +61,7 @@ Options:
       --no-start
           Enable the units without starting them
       --installer-config <INSTALLER_CONFIG>
-          The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root. The same flag, with the same meaning, as on `run` [default: /etc/kbf/installer.toml]
+          The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root. Only the host's own path is accepted (`/etc/kbf/installer.toml`; `/usr/local/etc/kbf/installer.toml` on macOS), which is also the default
   -h, --help
           Print help
 

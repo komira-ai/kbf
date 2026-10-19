@@ -1,19 +1,8 @@
 //! Where `setup` puts things, as the contract names them (docs/design/kbf-installer.md
-//! section 3). These are the paths of files `setup` itself writes or reads; the installer's
-//! tree (releases, links, state, `orders/`) is `layout.rs`'s, the one source of those.
+//! section 3). These are the paths `setup` itself names; the installer's tree and the configuration
+//! directory (`kbf.toml`, `installer.toml`, the tokens) are `layout.rs`'s, the one source of those.
 
 use crate::layout::Platform;
-
-/// kbf's configuration directory (root:root 0755).
-pub const ETC_DIR: &str = "/etc/kbf";
-/// kbf's runtime config: mode, the frontend URL, the enrollment token's path.
-pub const KBF_TOML: &str = "/etc/kbf/kbf.toml";
-/// The installer's settings; `setup` is its only writer.
-pub const INSTALLER_TOML: &str = "/etc/kbf/installer.toml";
-/// The enrollment token `setup` places from `--token-file`.
-pub const ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
-/// The first operator token, written once on a frontend or all-in-one host.
-pub const API_TOKEN: &str = "/etc/kbf/api-token";
 
 /// kbf's own state directory, where enrollment keeps the node's certificates (`pki/`).
 pub fn kbf_state_dir(platform: Platform) -> &'static str {

@@ -232,14 +232,38 @@ fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_passwor
 }
 
 /// Catches a setup that writes a settings file somewhere the unit does not read: the unit
-/// reads `/etc/kbf/installer.toml`, so `--installer-config` (a flag of `run`) naming another
-/// path is refused rather than followed.
+/// reads the host's `installer.toml` (`/etc/kbf`; `/usr/local/etc/kbf` on a Mac), so
+/// `--installer-config` (a flag of `run`) naming another path is refused rather than
+/// followed, and naming the host's own is the default.
 #[test]
 fn setup_writes_the_installer_toml_the_unit_reads() {
-    let mut r = raw(Mode::Daemon);
-    r.installer_config = "/srv/other.toml".to_owned();
-    let why = r.validate().expect_err("refused").join("; ");
-    assert!(why.contains("--installer-config is for run"), "{why}");
+    for (os, own, other) in [
+        (
+            FakeOs::linux(),
+            "/etc/kbf/installer.toml",
+            "/usr/local/etc/kbf/installer.toml",
+        ),
+        (
+            FakeOs::mac(),
+            "/usr/local/etc/kbf/installer.toml",
+            "/etc/kbf/installer.toml",
+        ),
+    ] {
+        for bad in ["/srv/other.toml", other] {
+            let mut r = raw(Mode::Daemon);
+            r.installer_config = Some(bad.to_owned());
+            let err = go(&os, &mut host(), &r, APPLY).expect_err("refused");
+            let SetupError::Invalid(why) = err else {
+                panic!("{bad}: {err:?}");
+            };
+            let why = why.join("; ");
+            assert!(why.contains("--installer-config is for run"), "{why}");
+            assert!(why.contains(own), "{why}");
+        }
+        let mut r = raw(Mode::Daemon);
+        r.installer_config = Some(own.to_owned());
+        go_ok(&os, &mut host(), &r);
+    }
 }
 
 /// Catches a setup that goes ahead on a host the retired helper still manages (contract
@@ -359,6 +383,7 @@ fn the_postgres_seam_makes_a_runner_without_a_server_and_never_quotes_the_url() 
 fn another_scheduler_key_makes_the_file_the_operators() {
     use crate::setup::kbf_toml::{Decision, Ours, decide};
     let ours = Ours {
+        path: "/etc/kbf/kbf.toml",
         mode: "frontend",
         frontend_url: None,
         token_file: None,
@@ -519,6 +544,7 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
 
     use crate::setup::kbf_toml::{Decision, Ours, decide};
     let ours = Ours {
+        path: "/etc/kbf/kbf.toml",
         mode: "frontend",
         frontend_url: None,
         token_file: None,
@@ -546,6 +572,7 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
 fn an_invalid_config_file_is_refused_without_its_text() {
     use crate::setup::kbf_toml::{Decision, Ours, decide};
     let ours = Ours {
+        path: "/etc/kbf/kbf.toml",
         mode: "frontend",
         frontend_url: None,
         token_file: None,

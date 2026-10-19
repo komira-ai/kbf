@@ -129,9 +129,10 @@ pub struct SetupArgs {
     #[arg(long)]
     pub no_start: bool,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
-    /// host root. The same flag, with the same meaning, as on `run`.
-    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
-    pub installer_config: kbf_host::HostPath,
+    /// host root. Only the host's own path is accepted (`/etc/kbf/installer.toml`;
+    /// `/usr/local/etc/kbf/installer.toml` on macOS), which is also the default.
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub installer_config: Option<kbf_host::HostPath>,
 }
 
 #[derive(Args)]

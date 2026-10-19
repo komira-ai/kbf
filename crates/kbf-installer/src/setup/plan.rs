@@ -11,7 +11,6 @@ use kbf_host::{Cmd, Entry, Exec, HostPath, Owner, Perms, Plan, Planner, RunUser}
 
 use super::kbf_toml::{self, Decision, Ours};
 use super::os::{DSCL, LAUNCHCTL, Os, SYSTEMCTL, View};
-use super::paths;
 use super::validate::{Valid, mode_name};
 use super::{SetupError, installer_file};
 use crate::cli::Mode;
@@ -294,7 +293,7 @@ pub fn before_release(
         .as_deref()
         .map(|file| read_token(exec, file))
         .transpose()?;
-    let settings = installer_file(exec, v, platform)?;
+    let settings = installer_file(exec, v, &ctx.layout)?;
 
     let view = View(exec);
     let mut p = Planner::new(&view);
@@ -315,7 +314,8 @@ pub fn before_release(
     // The installer's tree is root's; `orders/` inside it is the service user's (on a Mac the
     // daemon is root, so it is root's).
     let (root, service) = (ctx.root, ctx.service_owner());
-    dir(&mut p, paths::ETC_DIR, 0o755, root)?;
+    let l = &ctx.layout;
+    dir(&mut p, &l.etc_dir().to_string(), 0o755, root)?;
     let state_dir = ctx.layout.state_dir().to_string();
     dir(&mut p, &state_dir, 0o755, root)?;
     dir(&mut p, &format!("{state_dir}/orders"), 0o700, service)?;
@@ -323,15 +323,15 @@ pub fn before_release(
     // The tokens belong to the user whose process reads them: both loaders refuse a token
     // file another user owns, or one with a mode other than 0600 or 0400.
     if let Some(token) = enroll_token {
-        file(&mut p, paths::ENROLL_TOKEN, 0o600, service, token)?;
+        file(&mut p, &l.enroll_token().to_string(), 0o600, service, token)?;
     }
     if serves_api(v.mode) {
-        operator_token(&mut p, os, exec, service, &mut notes)?;
+        operator_token(&mut p, os, exec, &ctx.layout, service, &mut notes)?;
     }
 
     file(
         &mut p,
-        paths::INSTALLER_TOML,
+        &l.installer_toml().to_string(),
         0o644,
         root,
         settings.into_bytes(),
@@ -348,23 +348,18 @@ fn operator_token(
     p: &mut Pl<'_, '_>,
     os: &dyn Os,
     exec: &dyn Exec,
+    layout: &Layout,
     owner: Owner,
     notes: &mut Vec<String>,
 ) -> Result<(), SetupError> {
-    if exec.stat(&hp(paths::API_TOKEN)?)?.is_some() {
+    let token = layout.api_token().to_string();
+    if exec.stat(&hp(&token)?)?.is_some() {
         return Ok(());
     }
     let secret = hex::encode(os.random(32)?);
-    file(
-        p,
-        paths::API_TOKEN,
-        0o600,
-        owner,
-        format!("{secret}\n").into_bytes(),
-    )?;
+    file(p, &token, 0o600, owner, format!("{secret}\n").into_bytes())?;
     notes.push(format!(
-        "the first operator token is in {}: read it as root and keep it; setup makes no other",
-        paths::API_TOKEN
+        "the first operator token is in {token}: read it as root and keep it; setup makes no other"
     ));
     Ok(())
 }
@@ -383,19 +378,24 @@ pub fn after_release(
     let mut p = Planner::new(&view);
     let mut notes = Vec::new();
 
+    let (kbf_toml_path, enroll_token, api_token) = (
+        ctx.layout.kbf_toml().to_string(),
+        ctx.layout.enroll_token().to_string(),
+        ctx.layout.api_token().to_string(),
+    );
     let ours = Ours {
+        path: &kbf_toml_path,
         mode: mode_name(v.mode),
         frontend_url: v.frontend_url.as_deref(),
-        token_file: v.token_file.as_ref().map(|_| paths::ENROLL_TOKEN),
-        api_token_file: serves_api(v.mode).then_some(paths::API_TOKEN),
+        token_file: v.token_file.as_ref().map(|_| enroll_token.as_str()),
+        api_token_file: serves_api(v.mode).then_some(api_token.as_str()),
         state_store: v.database.as_deref(),
     };
-    let current = match exec.inspect(&hp(paths::KBF_TOML)?)? {
+    let current = match exec.inspect(&hp(&kbf_toml_path)?)? {
         Some(Entry::File { bytes, .. }) => Some(String::from_utf8_lossy(&bytes).into_owned()),
         Some(_) => {
             return Err(SetupError::NeedsOperator(format!(
-                "{} is not a regular file",
-                paths::KBF_TOML
+                "{kbf_toml_path} is not a regular file"
             )));
         }
         None => None,
@@ -408,7 +408,7 @@ pub fn after_release(
                 uid: ctx.root.uid,
                 gid: ctx.service_owner().gid,
             };
-            let changed = file(&mut p, paths::KBF_TOML, 0o640, owner, text.into_bytes())?;
+            let changed = file(&mut p, &kbf_toml_path, 0o640, owner, text.into_bytes())?;
             if changed && existed {
                 notes.push(
                     "kbf.toml changed: a running kbf keeps the old one until it is restarted; setup does not restart it"

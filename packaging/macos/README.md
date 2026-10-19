@@ -68,8 +68,11 @@ node; `brew uninstall --zap --cask kbf-installer` removes it too.
 ## What the real kbf-installer must match
 
 The property list runs `kbf-installer serve` and waits for `installer.toml` under
-`/usr/local/etc/kbf`; the tool is at `bin/kbf-installer` in the prefix. If the real
-layout (`layout.rs`, contract P2) puts the macOS configuration or the tool elsewhere,
+`/usr/local/etc/kbf`; the tool is at `bin/kbf-installer` in the prefix. `kbf-installer
+setup` writes `installer.toml`, `kbf.toml` and the tokens there too: the directory is
+`Layout::etc_dir` in `crates/kbf-installer/src/layout.rs`, and a `setup` test reads the
+property list's gate and the files `setup` writes against it. If the layout puts the
+macOS configuration or the tool elsewhere,
 change the property list and `GATE`/`PROGRAM` in `crates/xtask/src/pkg.rs`; the tests
 follow the constants. Until the real binary builds on the runner, CI packages a stub
 (`xtask-fake` run as `kbf-installer`, which prints its arguments); `INSTALLER` in
