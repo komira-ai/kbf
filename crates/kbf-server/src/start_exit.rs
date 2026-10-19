@@ -16,6 +16,9 @@
 //!     (its state store was restored from an older copy). Every registration takes the
 //!     next boot of the member, so a restart registers again and, once its boot is past
 //!     the log's, opens; a gap of N boots takes N restarts.
+//!   - [`ColdApplyError::Probe`] and [`ColdApplyError::Unusable`]: the keys the frontend
+//!     registered do not work (yet) and the node has none of its own; the operator
+//!     registers a working pair, and the restart reads it.
 //!   - A directory lock another process holds ([`RaftLogError::Locked`],
 //!     [`FsStoreError::Locked`]): the previous process, still stopping.
 //!   - A file system call that failed for a reason a later try can clear (the device is
@@ -30,6 +33,7 @@ use kbf_meta::StaleWriter;
 use kbf_objstore::FsStoreError;
 
 use crate::RaftLogError;
+use crate::cold_apply::ColdApplyError;
 use crate::write_tier::WriteTierError;
 
 /// The exit status of a start that was refused.
@@ -122,6 +126,9 @@ fn stale_writer(e: &(dyn Error + 'static)) -> bool {
 fn not_ready(e: &(dyn Error + 'static)) -> bool {
     if stale_writer(e) {
         return true;
+    }
+    if let Some(error) = e.downcast_ref::<ColdApplyError>() {
+        return matches!(error, ColdApplyError::Probe(_) | ColdApplyError::Unusable);
     }
     if let Some(error) = e.downcast_ref::<RaftLogError>() {
         return match error {

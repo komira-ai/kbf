@@ -307,3 +307,37 @@ fn a_newer_frontends_membership_answers_decode() {
     let got = pb::HeartbeatResponse::decode(beat.as_slice()).expect("decodes");
     assert_eq!(got.objstore_generation, 9);
 }
+
+// Catches: the open-writes report moved to other field numbers, or colliding with the debts
+// (5, 6) or the map generation and catch-up flag (3, 4). The bytes are pinned: the count on
+// field 9 and the known flag on 10 (7 and 8 are the cold-store registration report), each a
+// varint, beside every field before them.
+#[test]
+fn the_heartbeat_open_writes_are_fields_nine_and_ten() {
+    let beat = pb::HeartbeatRequest {
+        member_id: 1,
+        boot: 2,
+        have_generation: 4,
+        catching_up: true,
+        repair_debts: 3,
+        debts_known: true,
+        open_writes: 5,
+        writes_known: true,
+        ..Default::default()
+    };
+    let bytes = [
+        0x08, 1, 0x10, 2, 0x18, 4, 0x20, 1, 0x28, 3, 0x30, 1, 0x48, 5, 0x50, 1,
+    ];
+    assert_eq!(beat.encode_to_vec(), bytes, "fields 1 to 6, 9 and 10");
+    assert_eq!(
+        pb::HeartbeatRequest::decode(&bytes[..]).expect("decodes"),
+        beat
+    );
+
+    let older = pb::HeartbeatRequest::decode(&bytes[..12]).expect("decodes");
+    assert!(
+        !older.writes_known,
+        "a node that predates the report cannot say"
+    );
+    assert_eq!(older.open_writes, 0);
+}

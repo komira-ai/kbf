@@ -11,7 +11,7 @@
 #![cfg(target_os = "linux")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -20,6 +20,7 @@ use kbf_all_in_one::LocalDataPlane;
 use kbf_daemon::cpu_pool::CpuPool;
 use kbf_driver_container::tree::{OutputLimits, collect};
 use kbf_proto::reapi::ActionResult;
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::Cas;
 use kbf_types::LeaseId;
 
@@ -103,14 +104,10 @@ fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
 /// Servers started by this binary so far: each directory is one server's alone.
 static STARTED: AtomicU64 = AtomicU64::new(0);
 
-/// A fresh, empty directory under Cargo's temporary directory for this target.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-all-in-one-memory")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch directory");
-    dir
+/// A fresh, empty directory under Cargo's temporary directory for this target, removed
+/// when it drops.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("memory-{name}"))
 }
 
 /// The plane over a server started in `runtime` on the stores under `dir`, with a
@@ -187,7 +184,6 @@ fn store_one_large_output(name: &str, size: u64, tier: bool) -> usize {
     let digest = result.output_files[0].digest.clone().expect("a digest");
     let missing = runtime.block_on(lease.missing(&[digest]));
     assert!(missing.is_empty(), "not held");
-    let _ = std::fs::remove_dir_all(&dir);
     peak
 }
 
@@ -285,7 +281,6 @@ fn upload_one_large_record(name: &str, size: u64) -> usize {
     uploaded.expect("uploaded");
     let missing = runtime.block_on(store.find_missing(&[digest]));
     assert!(missing.expect("find").is_empty(), "not held");
-    let _ = std::fs::remove_dir_all(&dir);
     peak
 }
 

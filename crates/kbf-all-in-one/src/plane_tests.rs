@@ -98,13 +98,12 @@ fn a_gone_server_half_fails_every_call() {
 #[test]
 fn a_file_changed_after_the_walk_is_not_stored() {
     // Under the test binary's directory: unit tests get no `CARGO_TARGET_TMPDIR`.
-    let dir = std::env::current_exe()
+    let beside = std::env::current_exe()
         .expect("test binary")
         .parent()
         .expect("deps")
-        .join("kbf-all-in-one-unit")
-        .join(format!("changed-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
+        .join("kbf-all-in-one-unit");
+    let dir = kbf_testkit::dir::TestDir::under(beside, "changed");
     let walked = b"what the walk hashed";
     std::fs::write(dir.join("out"), walked).expect("write");
     let stamp = Stamp::of(&std::fs::File::open(dir.join("out")).expect("open")).expect("stamp");
@@ -284,6 +283,12 @@ fn put_chunks_of_a_large_blob_without_a_server_half_is_unavailable() {
 fn read_to_writes_the_blob_or_says_why_not() {
     use kbf_meta::BlobAnswer;
     use kbf_objstore::{ByteRange, ObjectStore};
+    let beside = std::env::current_exe()
+        .expect("test binary")
+        .parent()
+        .expect("deps")
+        .join("kbf-all-in-one-unit");
+    let dir = kbf_testkit::dir::TestDir::under(beside, "read-to");
     let server = server();
     let cache = {
         let _context = server.enter();
@@ -294,7 +299,7 @@ fn read_to_writes_the_blob_or_says_why_not() {
         LocalStore::new(Arc::clone(&cache), SegmentsConfig::DEFAULT)
     };
     let plane = LocalDataPlane::new(store, server.handle().clone());
-    let path = std::env::temp_dir().join(format!("kbf-read-to-{}", std::process::id()));
+    let path = dir.join("blob");
     server.block_on(async {
         let held = plane.put(b"held bytes".to_vec()).await.expect("put");
         let mut file = tokio::fs::File::create(&path).await.expect("create");
@@ -337,5 +342,4 @@ fn read_to_writes_the_blob_or_says_why_not() {
             "{damaged:?}"
         );
     });
-    let _ = std::fs::remove_file(&path);
 }
