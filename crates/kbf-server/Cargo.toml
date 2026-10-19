@@ -59,6 +59,8 @@ tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# An S3 service on loopback that refuses any other key pair (tests/cold_apply.rs).
+kbf-objstore = { workspace = true, features = ["testkit"] }
 # Loopback ports nothing can take (kbf_testkit::port).
 kbf-testkit.workspace = true
 # A connector that fails its first lookups, under a lazy channel (tests/storage_register.rs),

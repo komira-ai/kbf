@@ -43,6 +43,8 @@ kbf-driver-container.workspace = true
 kbf-meta.workspace = true
 # The store a blob is in, to damage one (src/plane_tests.rs).
 kbf-objstore.workspace = true
+# The tree removal a hardened process must still manage (tests/hardened_removal.rs).
+kbf-outputs.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 # inotify, which counts the opens of each output file (tests/one_read.rs).
