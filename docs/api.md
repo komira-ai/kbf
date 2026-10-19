@@ -447,29 +447,6 @@ curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json'
 
 A UI comes later.
 
-## `/v1/object-stores/...` (**planned**)
-
-**Not built: every route here answers 404 today.** The routes register the farm's object
-store with the frontend, which keeps it as durable desired state and lets the storage nodes
-fetch it ([the design](design/object-store-registration.md)). Planned, each passing every
-gate of [Who may write](#who-may-write) on a GET too, with `Cache-Control: no-store`, and off
-(404) unless the frontend has a secrets directory:
-
-| Route | Does |
-|---|---|
-| `PUT /v1/object-stores/connections/{name}` | create or replace a connection (an endpoint and a key pair); idempotent |
-| `GET /v1/object-stores/connections` | list the connections, never a secret |
-| `GET /v1/object-stores/connections/{name}` | one connection, never a secret |
-| `DELETE /v1/object-stores/connections/{name}` | delete; `409 in_use` while bound |
-| `POST /v1/object-stores/connections/{name}:verify` | probe the store, change nothing |
-| `PUT /v1/object-stores/bindings/{role}` | bind the role `cold` to a connection, a bucket and a prefix |
-| `DELETE /v1/object-stores/bindings/{role}` | unbind; `409 in_use` once a node has applied it |
-| `GET /v1/object-stores` | the desired state, and which storage nodes have applied it |
-| `GET /v1/object-stores/audit?limit=` | the audit rows |
-
-The design page has the bodies, the error codes and the rotation runbook. Every verb of the
-API, built, open or planned, is in [the verbs table](design/operator-verbs.md).
-
 ## `GET /v1/storage`
 
 Whether every blob is known to have its copies elsewhere: the number a rollout asks
@@ -507,6 +484,154 @@ The number is as old as the newest heartbeat. A copy owed since then is not in i
 whoever acts on a zero keeps new writes away from the node first (drains it), then reads
 again. A member that left the map (a `DOWN` member leaves after the dwell) is not counted.
 `503` with `{"error": ...}` when the membership cannot be read.
+
+## `/v1/object-stores/...`
+
+Registers the farm's object store with the frontend, which keeps it as durable desired state
+with a generation. A
+**connection** is a named endpoint plus a key pair; a **binding** maps a role to a
+connection, a bucket and a prefix. The only role is `cold`, today's `--cold-store`; `history`
+and `backup` answer `422 role_not_supported` until something consumes them. A role here is
+neither an IAM role nor an enrollment role.
+
+The routes exist when the frontend is started with `--object-store-secrets-dir DIR` (which
+needs `--api-listen`, `--api-token-file` and `--state-store`). `DIR` holds one file of mode
+0600 per connection, `<name>.<version>.json`, in a directory made 0700; every frontend child
+that serves at once must be able to read it, and it must stay out of any backup of the host
+(the state store, and so `state-backup`, never holds a secret key). Without the flag every
+route answers `404` `not_enabled` to a caller who passed the gate.
+
+**Every route, a GET included, passes the whole gate of [Who may write](#who-may-write)**
+(loopback peer, no `Origin`, the bearer token, `Content-Type: application/json`), because
+the routes list and change the farm's store and the key to it. One token, no roles. A TLS
+proxy on the host reaches them from loopback and passes the gate: whether the proxy carries
+these routes is the operator's decision. Every answer, errors and `405` included, carries
+`Cache-Control: no-store`. A body is at most 16 KiB (`413 payload_too_large`) and refuses
+unknown fields. No route is fenced: two frontend children on one state store both serve them,
+and a lost race is `409 conflict`, never a lost write.
+
+| Route | Does |
+|---|---|
+| `PUT /v1/object-stores/connections/{name}` | create or replace; `201` created, `200` changed or unchanged |
+| `GET /v1/object-stores/connections` | `{connections: [...]}`, never a secret |
+| `GET /v1/object-stores/connections/{name}` | one connection, never a secret |
+| `DELETE /v1/object-stores/connections/{name}` | `{generation}`; `409 in_use` while a binding names it |
+| `POST /v1/object-stores/connections/{name}:verify` | probe the store, change nothing |
+| `PUT /v1/object-stores/bindings/{role}` | bind `cold`; `201` created, `200` changed or unchanged |
+| `DELETE /v1/object-stores/bindings/{role}` | `{generation}`; `409 in_use` once a node has applied it |
+| `GET /v1/object-stores` | the desired state and the nodes' convergence |
+| `GET /v1/object-stores/audit?limit=N` | the newest `N` audit rows (default 50, at most 500) |
+
+The design ([object-store-registration](design/object-store-registration.md)) has the rotation
+runbook; every verb of the API is in [the verbs table](design/operator-verbs.md).
+
+**Names.** `{name}` is `[a-z0-9][a-z0-9_-]{0,62}`, else `400 bad_name`: it becomes a file name
+and a URL segment, so `/`, `.`, `:` and NUL never reach the file system. `{role}` is `cold`.
+
+**`PUT .../connections/{name}`** takes `{endpoint, region?, access_key_id,
+secret_access_key, conditional_put?, min_put_rate?, expect_generation?, verify?}`.
+
+- `endpoint` is `http://host[:port]`: `https` answers `422 tls_unsupported` (the S3 client
+  speaks no TLS yet, so a registration would be accepted and fail on every node); anything
+  else that is not that answers `422 invalid_endpoint`. `access_key_id` and
+  `secret_access_key` are visible ASCII (at most 256 and 1024 characters), `region` is
+  `[a-z0-9-]` (at most 64): else `422 invalid_field`.
+- Changing `endpoint` of a bound connection answers `409 identity_change`; credentials,
+  region, `conditional_put` and `min_put_rate` change freely. The same body again changes
+  nothing (`200`, `changed: false`, the generation stays).
+- `expect_generation` that is not the registry's answers `409 generation_mismatch` and writes
+  nothing; without it the last writer wins and both are in the audit log.
+- `verify` (default `true`): when the connection is the one the `cold` binding names, the
+  frontend probes that bucket and prefix with the key being registered before it writes
+  anything, and a failed probe answers `422 probe_failed` with no row and no file. When no
+  binding names the connection there is no bucket to probe: `verified` is `null`, and the
+  connection is probed when it is bound and by `:verify`.
+- Answer: `{name, generation, changed, access_key_id, secret_set, verified}`, never the
+  secret or a digest of it.
+
+**`PUT .../bindings/{role}`** takes `{connection, bucket, prefix?, expect_generation?,
+verify?}`; `verify` (default `true`) probes the bucket with the connection's stored key
+first. `422 unknown_connection`, `invalid_bucket`, `invalid_prefix` and `probe_failed` write
+nothing. The store identity `(endpoint, bucket, prefix)` is immutable once bound
+(`409 identity_change`): moving to another store is a migration this API has no verb for.
+Answer: `{role, generation, changed, verified}`.
+
+**`POST .../connections/{name}:verify`** takes nothing, or `{bucket?, prefix?}`; without a
+bucket it uses the `cold` binding's, else `422 no_bucket`. It puts one small object under
+`<prefix>.kbf-probe/`, reads it back, checks that a second write is refused when the
+connection says `conditional_put`, and deletes it. `200 {name, verified}`, or `422
+probe_failed` with `verified` (`{ok, put, get, delete, conditional_put}`): the steps, never
+the store's words. The probe proves that *this frontend* can reach the store with this key;
+the frontend connects to an endpoint an operator typed, so it is bounded (20 seconds in all)
+and operator-only behind the token.
+
+**`GET /v1/object-stores`** answers `{generation, connections, bindings, convergence}`;
+`convergence` is `{converged, expected, applied, unsupported, nodes: [{id, state,
+applied_generation, status, last_seen_secs}]}`.
+
+- `status` is one of `ok`, `pending`, `probe_failed`, `identity_mismatch`, `unsupported`: a
+  closed code, never a node's own text. A node that reports `ok` at another generation is
+  shown `pending`.
+- `expected` counts active nodes that report the registration; draining and denied nodes
+  are listed but not counted. A node whose build does not report it at all is `unsupported`,
+  counted in `unsupported` and not in `expected`, and named in `nodes`, so version skew is not
+  mistaken for "not fetched yet".
+- `converged` is true only when at least one node is expected, every expected node has
+  applied the current generation with status `ok`, and none is `unsupported`. It never claims
+  more than the frontend knows: a frontend that has heard from no node says `false`.
+  **This build wires no source of node reports yet: `nodes` is empty and `converged` is `false`.**
+
+**`GET /v1/object-stores/audit`** answers `{entries: [{seq, at, action, subject, outcome,
+generation}]}`, newest first. A row names what was touched and what happened, never a body
+field; the actor is always "the API token", the gate knows no finer identity. Only writes
+leave rows (a refused call, a failed probe and `:verify` leave none), an unchanged repeat leaves
+one with `outcome` `unchanged`.
+
+**Errors** are `{"error": "...", "code": "..."}` (a `probe_failed` also has `verified`). The
+text names no value of the request: a body that does not parse says where, not what.
+
+| Status | `code` |
+|---|---|
+| 400 | `bad_name`, `bad_body`, `bad_query` |
+| 401, 403, 415 | `unauthorized`, `forbidden`, `unsupported_media_type` (the gate's) |
+| 404 | `not_enabled`, `no_such_connection`, `no_such_binding`, `unknown_action` |
+| 409 | `identity_change`, `in_use`, `generation_mismatch`, `conflict` |
+| 413 | `payload_too_large` |
+| 422 | `invalid_field`, `tls_unsupported`, `invalid_endpoint`, `invalid_bucket`, `invalid_prefix`, `role_not_supported`, `unknown_connection`, `no_bucket`, `probe_failed` |
+| 500 | `secret_missing` (the file a row names is missing or not 0600: fail closed, PUT again to repair), `secret_io`, `corrupt_rows`, `internal` |
+| 503 | `state_unavailable` |
+
+`DELETE .../bindings/{role}` answers `409 in_use` when a node reports `ok` at a generation
+at or after the binding's `updated_generation`: it runs on that store, and the API cannot take
+a store back from a running node. (A binding re-PUT with another connection of the same
+endpoint moves `updated_generation`; a node that applied only the earlier version is not
+counted.)
+
+**Rotating the key** (the API never revokes a key at the store):
+
+1. Add the new key at the store.
+2. `PUT` the connection with the new secret. The frontend probes the bound bucket with it
+   first.
+3. Restart the storage nodes through the installer: a running node does not swap
+   credentials in v1, and picks the registration up at its next start.
+4. Poll `GET /v1/object-stores` until `converged` is `true` (a node still on the old key is
+   `pending`).
+5. Only then revoke the old key at the store.
+
+```sh
+T=$(cat <token file>); API=http://127.0.0.1:<port>
+# the body is a file, never an inline secret; the content type is required on every call
+curl -X PUT -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  --data @connection.json $API/v1/object-stores/connections/cold
+curl -X PUT -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  --data '{"connection":"cold","bucket":"farm-cold","prefix":"cold/"}' \
+  $API/v1/object-stores/bindings/cold
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' $API/v1/object-stores
+```
+
+The request body is read into memory and parsed; the buffers are not zeroized, so the
+secret key sits in the frontend's memory for as long as the allocator keeps those pages.
+The key is never logged, never in a state row and never in an answer.
 
 ## `GET /healthz` and `GET /readyz`
 
