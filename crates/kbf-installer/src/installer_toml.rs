@@ -42,6 +42,7 @@ struct Raw {
     /// The proxy's table, checked by `kbf_proxy::config::ProxyConfig::from_value`; its own
     /// keys are closed the same way.
     proxy: Option<toml::Value>,
+    database: Option<String>,
 }
 
 /// Where releases are fetched from.
@@ -71,6 +72,11 @@ pub struct InstallerToml {
     /// The `[proxy]` table, read by `kbf-installer proxy`. `setup` does not write it (the
     /// operator does), so [`InstallerToml::render`] leaves it out.
     pub proxy: Option<ProxyConfig>,
+    /// The state database of a frontend or all-in-one host: a `postgres://` URL without a
+    /// password (the file is world-readable). `crate::database` reads this file a second time,
+    /// leniently (only this key, and it refuses a password); this field exists so that the
+    /// closed reader here does not reject the key, and it has no other consumer.
+    pub database: Option<String>,
 }
 
 impl Default for InstallerToml {
@@ -88,6 +94,7 @@ impl Default for InstallerToml {
             node_cert: None,
             node_key: None,
             proxy: None,
+            database: None,
         }
     }
 }
@@ -308,6 +315,7 @@ impl InstallerToml {
                 node_cert,
                 node_key,
                 proxy,
+                database: raw.database,
             }),
             _ => Err(ConfigError::Invalid(problems)),
         }
@@ -354,8 +362,26 @@ impl InstallerToml {
         if let Some(p) = &self.node_key {
             out.push_str(&format!("node_key = \"{}\"\n", p.display()));
         }
+        if let Some(url) = &self.database {
+            out.push_str(&format!("database = {}\n", toml_string(url)));
+        }
         out
     }
+}
+
+/// `text` as a TOML basic string: Rust's `{:?}` is not TOML (it writes `\'` and `\u{..}`).
+fn toml_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]

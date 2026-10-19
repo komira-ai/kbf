@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use kbf_state::postgres::{Flaw, PostgresBackend, PostgresConfig, PostgresStore};
+use kbf_state::postgres::{Flaw, PostgresBackend, PostgresConfig, PostgresStore, schema};
 use kbf_state::{Cond, Revision, Store, StoreError, Txn, Version};
 use postgres::{Client, NoTls};
 
@@ -126,12 +126,16 @@ fn limited_role(admin: &mut Client, name: &str, limit: i32) -> String {
     as_user(&url(), name)
 }
 
-fn limited_config(url: &str, backend: &PostgresBackend) -> PostgresConfig {
-    let schema = config(backend).schema().to_owned();
-    PostgresConfig::parse(url)
-        .and_then(|c| c.with_schema(&schema))
+/// The configuration for the limited role's own schema (`DROP OWNED BY` removes it with
+/// the role at the start of the next run).
+fn limited_config(url: &str, schema: &str) -> PostgresConfig {
+    let config = PostgresConfig::parse(url)
+        .and_then(|c| c.with_schema(schema))
         .expect("a usable URL")
-        .with_application_name(&schema)
+        .with_application_name(schema);
+    // The installer's step, as the role the store will connect as.
+    schema::apply(&config, &schema::embedded(), schema::latest()).expect("the installer's step");
+    config
 }
 
 // Catches a pool that keeps a session the server killed: the call that meets the dead
@@ -288,8 +292,7 @@ fn a_pool_of_two_opens_a_second_connection_and_makes_a_third_call_wait() {
 fn a_connection_the_server_refuses_does_not_take_a_pool_slot() {
     let mut admin = admin();
     let url = limited_role(&mut admin, "kbf_fault_pool", 2);
-    let backend = PostgresBackend::new(&url, Flaw::None);
-    let config = limited_config(&url, &backend).with_max_connections(3);
+    let config = limited_config(&url, "kbf_fault_pool_schema").with_max_connections(3);
     let store = Arc::new(PostgresStore::open(&config).expect("opens"));
     let held = store.begin(put("held")).expect("runs to the commit");
     let second = {
@@ -325,8 +328,7 @@ fn a_connection_the_server_refuses_does_not_take_a_pool_slot() {
 fn a_liveness_lock_whose_connection_is_refused_is_an_error() {
     let mut admin = admin();
     let url = limited_role(&mut admin, "kbf_fault_hold", 1);
-    let backend = PostgresBackend::new(&url, Flaw::None);
-    let store = PostgresStore::open(&limited_config(&url, &backend)).expect("opens");
+    let store = PostgresStore::open(&limited_config(&url, "kbf_fault_hold_schema")).expect("opens");
     let Err(StoreError::Failed(why)) = store.hold_liveness(1) else {
         panic!("the holder connection is over the role's limit");
     };
@@ -392,7 +394,7 @@ fn pids(admin: &mut Client, app: &str) -> Vec<i32> {
 
 // Catches a store whose tables were dropped under it either hanging or handing out a
 // half-prepared session: every call fails with the server's words (the relation is
-// missing) until the tables are back, and the failed connection attempts leave no slot
+// missing) until the installer's step has made them again, and the failed connection attempts leave no slot
 // taken (a pool of two would block for good on a leaked slot), so the store works again
 // once they are.
 #[test]
@@ -415,8 +417,8 @@ fn a_store_whose_tables_were_dropped_fails_its_calls_and_recovers_when_they_retu
             "{said:?}"
         );
     }
-    let again = PostgresStore::open(&config).expect("creates the tables again");
-    again.txn(put("k")).expect("store").expect("commits");
+    schema::apply(&config, &schema::embedded(), schema::latest()).expect("the installer's step");
+    store.txn(put("k")).expect("store").expect("commits");
     assert!(store.get("k").expect("recovered").is_some());
 }
 
