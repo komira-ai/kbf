@@ -156,25 +156,33 @@ fn is_listening(fd: BorrowedFd<'_>) -> bool {
     socket_acceptconn(fd).unwrap_or(false)
 }
 
-/// The same question as on Linux. rustix has `socket_acceptconn` only on Linux-like targets,
-/// but macOS has `SO_ACCEPTCONN` at the libc level, so ask `getsockopt` directly.
+/// The same question as on Linux, answered from the TCP state. rustix has `socket_acceptconn`
+/// only on Linux-like targets, and macOS cannot answer it: XNU's `sogetoptlock` serves no
+/// `SO_ACCEPTCONN` (the flag lives in `so_options` and `listen` sets it, but the read side has
+/// no case for it, so `getsockopt` fails with `ENOPROTOOPT`). What XNU does serve is
+/// `TCP_CONNECTION_INFO`, whose `tcpi_state` is the socket's `t_state`; `TCPS_LISTEN` is 1.
+/// A descriptor that is not a TCP socket (not open, a Unix socket, UDP) makes the call fail and
+/// answers no.
 #[cfg(not(target_os = "linux"))]
 fn is_listening(fd: BorrowedFd<'_>) -> bool {
     use std::os::fd::AsRawFd as _;
-    let mut value: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: `fd` is open for the call; `value` and `len` are live and `len` is the size of
-    // `value`, which is all `getsockopt` writes to.
+    /// `TCPS_LISTEN` in XNU's `netinet/tcp_fsm.h`; `libc` does not carry the state names.
+    const TCPS_LISTEN: u8 = 1;
+    // SAFETY: all-zero is a valid `tcp_connection_info` (integers only).
+    let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    // SAFETY: `fd` is open for the call; `info` and `len` are live and `len` is the size of
+    // `info`, which is all `getsockopt` writes to.
     let rc = unsafe {
         libc::getsockopt(
             fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_ACCEPTCONN,
-            (&raw mut value).cast(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            (&raw mut info).cast(),
             &raw mut len,
         )
     };
-    rc == 0 && value != 0
+    rc == 0 && info.tcpi_state == TCPS_LISTEN
 }
 
 /// How long after the first stop signal the process may live. The proxy drains open streams
