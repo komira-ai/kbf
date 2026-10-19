@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use hyper::StatusCode;
 
+use super::fleet::FleetReader;
 use super::idempotency::{Entry, Idempotency};
 use super::model::{
     RollbackBlocked, StatusBody, UpdateId, UpdateRequest, abortable, rollback_gate,
@@ -19,7 +20,7 @@ use super::model::{
 use super::refusal;
 use super::traits::{
     Clock, Compat, CompatGate, InstallerState, InstallerStatus, OrderWriter, RestartMarker,
-    RunningUpdate, StatusReader, Supervisor, SupervisorError, UpdateSpec,
+    RunningUpdate, Staged, StatusReader, Supervisor, SupervisorError, UpdateSpec,
 };
 use crate::CommitId;
 use crate::proxy::model::{Failure, Locator, Phase, StagedFacts, Step, Verb};
@@ -155,6 +156,8 @@ pub struct Parts {
     pub orders: Box<dyn OrderWriter>,
     pub status: Box<dyn StatusReader>,
     pub compat: Box<dyn CompatGate>,
+    /// Read once per update, for the gate's verdict on the staged release.
+    pub fleet: Box<dyn FleetReader>,
     pub clock: Arc<dyn Clock>,
     pub marker: RestartMarker,
     pub requests: Idempotency,
@@ -288,10 +291,10 @@ impl Core {
         }
         match self.parts.compat.check(&req.commit, None) {
             Compat::Compatible => {}
-            Compat::Incompatible { rule } => {
+            Compat::Incompatible { rule, detail } => {
                 return Err(ApiError::conflict(
                     "incompatible",
-                    format!("the release breaks compatibility rule {rule}"),
+                    format!("the release breaks compatibility rule {rule}: {detail}"),
                 )
                 .with("rule", rule));
             }
@@ -429,9 +432,15 @@ impl Core {
         }
     }
 
-    /// The release is staged: judge it, then hand it to the supervisor.
+    /// The release is staged: read the fleet it would meet, judge the release against it,
+    /// then hand it to the supervisor. This runs once per update, so the fleet is read once.
     fn hand_over(&mut self, st: Box<Staging>, facts: &StagedFacts) -> Active {
-        let failure = match self.parts.compat.check(&st.to, Some(facts)) {
+        let fleet = self.parts.fleet.read();
+        let staged = Staged {
+            facts,
+            fleet: &fleet,
+        };
+        let failure = match self.parts.compat.check(&st.to, Some(staged)) {
             Compat::Compatible => {
                 let spec = UpdateSpec {
                     update_id: st.update_id.clone(),
@@ -451,9 +460,9 @@ impl Core {
                     },
                 }
             }
-            Compat::Incompatible { rule } => Failure {
+            Compat::Incompatible { rule, detail } => Failure {
                 step: Step::Compat,
-                reason: rule,
+                reason: format!("{rule}: {detail}"),
             },
             Compat::Incomplete { reason } => Failure {
                 step: Step::Compat,

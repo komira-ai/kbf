@@ -25,9 +25,9 @@
 //!   a restart between the confirm and the `nodes` record sends it again.
 //! - **abort** ends an update as `failed` with step `abort`, not `rolled_back`; so does an
 //!   abort that arrives while the old child quiesces (it is `abort`, not `switch`).
-//! - **Compatibility gate (R1, R4)** is not here: [`model::StagedFacts`] is carried and
-//!   only its commit is read. The gate that reads `protocol`, `min_protocol` and
-//!   `state_schema` is U9.
+//! - **Compatibility gate (R1)** is not here: [`model::StagedFacts`] is carried and only
+//!   its commit is read. The gate that reads `min_protocol` is [`api::compat::R1Gate`]
+//!   (U9), which the update API runs before it hands a release to the swap.
 //! - **Order locator (Q1)**: [`model::Locator`] carries `verb` with the other five fields.
 //! - **Rollback** uses a hold, like the swap, so streams move atomically. It records
 //!   `rolling_back` in `update.json` before it touches either child (it has no phase of

@@ -6,8 +6,10 @@
 //! proxy's state directory. Everything U8a needs from the rest of the system is a trait
 //! in [`traits`]: [`traits::OrderWriter`]
 //! (the `frontend_update`/`revert` records), [`traits::StatusReader`] (`status.json`),
-//! [`traits::Supervisor`] (the U7 swap), [`traits::CompatGate`] (R1/R4, a stub until U9)
-//! and [`traits::Forwarder`] (the operator port). U7b and U8b supply the real ones.
+//! [`traits::Supervisor`] (the U7 swap), [`traits::CompatGate`] (rule R1, made by
+//! [`compat::R1Gate`] over a [`fleet::FleetSnapshot`]), [`fleet::FleetReader`] (the
+//! snapshot's three reads of the active child) and [`traits::Forwarder`] (the operator
+//! port). U7b and U8b supply the real ones.
 //!
 //! The vocabulary is the swap's, in [`super::model`]: [`Phase`](super::model::Phase) (the
 //! API owns `accepted`, `fetching`, `verifying` and reports them; the swap owns `staged`
@@ -27,10 +29,11 @@
 //! - `state: fetching` is phase `fetching`;
 //! - `state: refused` for an order at or after ours is phase `failed` with the refusal
 //!   word as `failure.reason` ([`refusal`]); no child is started;
-//! - `staged_commit` equal to ours with `staged{}` facts runs the compatibility gate, and
-//!   a compatible release is handed to the [`traits::Supervisor`], which owns every later
-//!   phase; an incompatible one fails the update and a `revert` order drops the staged
-//!   release.
+//! - `staged_commit` equal to ours with `staged{}` facts reads the fleet from the active
+//!   child ([`fleet::FleetReader`], once) and runs the compatibility gate on the facts and
+//!   the fleet, and a compatible release is handed to the [`traits::Supervisor`], which
+//!   owns every later phase; an incompatible one fails the update (`step: compat`,
+//!   `reason: R1: <what>`) and a `revert` order drops the staged release.
 //!
 //! The phase `verifying` is never reported by the API: `status.json` has no state between
 //! `fetching` and `staged`.
@@ -42,10 +45,15 @@
 //! - **Which refusal is ours (Q1).** `status.json` has one `refusal` string and
 //!   `acked_order_id`; a `refused` state whose `acked_order_id` is at least our order's id
 //!   is ours ([`core::Core::advance`]). A stale refusal has a lower id.
-//! - **Compatibility before the fetch (Q1, U9).** `POST` asks the gate with no facts, so
-//!   a 409 `incompatible` or 422 at `POST` time is possible only for what U9 can know
-//!   without the release; the verdict on the staged facts arrives as `failed` /
+//! - **Compatibility before the fetch (Q1, U9).** `POST` asks the gate with no facts and
+//!   no fleet, so a 409 `incompatible` or 422 at `POST` time is possible only for what a
+//!   gate can know without the release ([`compat::R1Gate`] knows nothing: R1 needs the
+//!   release's `min_protocol`); the verdict on the staged facts arrives as `failed` /
 //!   `step: compat` ([`traits::CompatGate`]).
+//! - **The fleet is read by the actor, in the actor.** [`fleet::FleetReader::read`] runs
+//!   once per update inside [`core::Core`], which blocks on it as it does on the other
+//!   sync seams, so a real reader bounds its requests with a timeout. A failed read is a
+//!   value in the snapshot and the gate refuses on it.
 //! - **Request map (Q5).** `requests.json` in the proxy state directory is this module's
 //!   own file ([`idempotency`]); `update.json` (the swap's intent) is U7's.
 //! - **Restart marker (FP section 10).** The path of the postinst marker is not fixed by
@@ -85,7 +93,9 @@
 
 pub mod actor;
 pub mod auth;
+pub mod compat;
 pub mod core;
+pub mod fleet;
 pub mod idempotency;
 pub mod model;
 pub mod refusal;
@@ -95,7 +105,11 @@ pub mod traits;
 #[cfg(test)]
 mod auth_tests;
 #[cfg(test)]
+mod compat_tests;
+#[cfg(test)]
 mod fakes;
+#[cfg(test)]
+mod fleet_tests;
 #[cfg(test)]
 mod idempotency_tests;
 #[cfg(test)]

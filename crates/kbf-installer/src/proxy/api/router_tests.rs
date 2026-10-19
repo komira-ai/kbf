@@ -9,8 +9,10 @@ use serde_json::{Value, json};
 
 use super::actor::spawn;
 use super::auth::{BearerAuth, PeerKey, RateLimit, Sha256Hasher};
-use super::core::CrashPoint;
+use super::compat::R1Gate;
+use super::core::{Core, CrashPoint};
 use super::fakes::{COMMIT_C, FakeClock, FakeForwarder, FakeTokens, Rig, TOKEN, idle, staged};
+use super::fleet::{Enrolled, FleetSnapshot, Population};
 use super::model::OldChild;
 use super::router::{MAX_BODY, Router};
 use super::traits::{Compat, InstallerState, InstallerStatus};
@@ -36,13 +38,17 @@ fn harness(name: &str, rate: RateLimit) -> Harness {
 }
 
 fn router_over(rig: &Rig, forwarder: FakeForwarder, rate: RateLimit) -> Router {
+    router_with(rig.core(), forwarder, rate)
+}
+
+fn router_with(core: Core, forwarder: FakeForwarder, rate: RateLimit) -> Router {
     let auth = BearerAuth::new(
         Box::new(FakeTokens(Mutex::new(Some(TOKEN.to_owned())))),
         Box::new(Sha256Hasher),
         Arc::new(FakeClock(AtomicU64::new(0))),
         rate,
     );
-    Router::new(Arc::new(auth), spawn(rig.core()), Arc::new(forwarder))
+    Router::new(Arc::new(auth), spawn(core), Arc::new(forwarder))
 }
 
 fn quick() -> RateLimit {
@@ -161,6 +167,7 @@ async fn the_409s_and_the_422_reach_the_client_with_their_codes() {
     );
     *h.rig.gate.before.lock().unwrap() = Compat::Incompatible {
         rule: "R1".to_owned(),
+        detail: "a daemon is too old".to_owned(),
     };
     let (s, v) = send(&h, Method::POST, U, post_body(B, "r1")).await;
     assert_eq!(
@@ -230,6 +237,39 @@ async fn a_refused_staging_shows_as_failed_through_get() {
     assert_eq!(
         v["failure"],
         json!({"step": "verify", "reason": "attestation"})
+    );
+    assert_eq!(h.rig.sup.starts(), 0);
+}
+
+#[tokio::test]
+async fn an_r1_refusal_shows_through_get_as_a_failed_compat_step_with_its_reason() {
+    let mut h = harness("u9e-r-r1", quick());
+    h.router = router_with(
+        h.rig.core_with(Box::new(R1Gate)),
+        FakeForwarder::default(),
+        quick(),
+    );
+    // One daemon at protocol 2; the staged release has a min_protocol of 3.
+    *h.rig.fleet.snapshot.lock().unwrap() = FleetSnapshot {
+        nodes: Ok(Population {
+            names: std::iter::once("mac-1".to_owned()).collect(),
+            oldest: Some(2),
+            unknown: 0,
+        }),
+        members: Ok(Population::default()),
+        enrolled: Ok(Enrolled::default()),
+    };
+    send(&h, Method::POST, U, post_body(B, "r1")).await;
+    h.rig.set_status(staged(B));
+    let (s, v) = send(&h, Method::GET, U, Value::Null).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["phase"], "failed");
+    assert_eq!(
+        v["failure"],
+        json!({
+            "step": "compat",
+            "reason": "R1: the release's min_protocol 3 is above the oldest protocol of the daemons, 2"
+        })
     );
     assert_eq!(h.rig.sup.starts(), 0);
 }

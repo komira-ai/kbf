@@ -9,6 +9,7 @@ use bytes::Bytes;
 use hyper::{Request, Response};
 use serde::Deserialize;
 
+use super::fleet::FleetSnapshot;
 use super::model::{NewChild, OldChild, UpdateId};
 use crate::CommitId;
 use crate::proxy::model::{Failure, Locator, Phase, Slot, StagedFacts, Verb};
@@ -203,12 +204,15 @@ pub trait Supervisor: Send {
     fn status(&self) -> SupervisorStatus;
 }
 
-/// The verdict of rules R1 and R4 (FP section 9).
+/// The verdict of the compatibility gate (FP section 9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Compat {
     Compatible,
+    /// A rule is broken: `rule` is its name (`R1`) and `detail` says what broke it, for the
+    /// operator.
     Incompatible {
         rule: String,
+        detail: String,
     },
     /// The release is not complete for this platform.
     Incomplete {
@@ -216,20 +220,24 @@ pub enum Compat {
     },
 }
 
-/// R1/R4. With `facts` of `None` the gate answers from what is knowable before the
-/// release is fetched; with `Some` it judges the staged release (U9 probes
-/// `releases/<commit>/kbf --version --json`). Stubbed until U9.
-pub trait CompatGate: Send {
-    fn check(&self, commit: &CommitId, facts: Option<&StagedFacts>) -> Compat;
+/// A staged release and the fleet it would meet: what a gate needs to judge the release
+/// itself and not only its name.
+#[derive(Clone, Copy, Debug)]
+pub struct Staged<'a> {
+    pub facts: &'a StagedFacts,
+    pub fleet: &'a FleetSnapshot,
 }
 
-/// The gate until U9 lands: everything is compatible.
-pub struct StubGate;
-
-impl CompatGate for StubGate {
-    fn check(&self, _commit: &CommitId, _facts: Option<&StagedFacts>) -> Compat {
-        Compat::Compatible
-    }
+/// The gate: rule R1 ([`R1Gate`](super::compat::R1Gate)). R4 is the child's, not the
+/// proxy's (FP section 9).
+///
+/// With `staged` of `None` the gate answers from what is knowable before the release is
+/// fetched, which is its commit; with `Some` it judges the staged release against the
+/// fleet read for it. The caller reads the fleet
+/// ([`FleetReader`](super::fleet::FleetReader)) only for the second call, so the first
+/// costs no request.
+pub trait CompatGate: Send {
+    fn check(&self, commit: &CommitId, staged: Option<Staged<'_>>) -> Compat;
 }
 
 #[derive(Debug, thiserror::Error)]

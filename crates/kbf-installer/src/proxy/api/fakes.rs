@@ -10,12 +10,13 @@ use hyper::{Request, Response};
 
 use super::auth::{Secret, TokenHasher, TokenSource};
 use super::core::{Config, Core, Crash, CrashHook, CrashPoint, Parts};
+use super::fleet::{Enrolled, FleetReader, FleetSnapshot, Population};
 use super::idempotency::Idempotency;
 use super::model::{NewChild, OldChild, UpdateId};
 use super::traits::{
     Clock, Compat, CompatGate, ForwardError, Forwarder, InstallerState, InstallerStatus,
-    OrderError, OrderWriter, RestartMarker, Retired, RunningUpdate, StagedWire, StatusError,
-    StatusReader, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec,
+    OrderError, OrderWriter, RestartMarker, Retired, RunningUpdate, Staged, StagedWire,
+    StatusError, StatusReader, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec,
 };
 use crate::CommitId;
 use crate::proxy::model::{Locator, Phase, Slot, StagedFacts, Verb};
@@ -207,11 +208,34 @@ pub struct FakeGate {
 }
 
 impl CompatGate for FakeGate {
-    fn check(&self, _commit: &CommitId, facts: Option<&StagedFacts>) -> Compat {
-        match facts {
+    fn check(&self, _commit: &CommitId, staged: Option<Staged<'_>>) -> Compat {
+        match staged {
             None => self.before.lock().unwrap().clone(),
             Some(_) => self.staged.lock().unwrap().clone(),
         }
+    }
+}
+
+/// Answers every read with the snapshot it holds, and counts the reads.
+#[derive(Clone)]
+pub struct FakeFleet {
+    pub snapshot: Arc<Mutex<FleetSnapshot>>,
+    pub reads: Arc<AtomicUsize>,
+}
+
+impl FleetReader for FakeFleet {
+    fn read(&self) -> FleetSnapshot {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.snapshot.lock().unwrap().clone()
+    }
+}
+
+/// A fleet with no node in it, enrolled or listed.
+pub fn empty_fleet() -> FleetSnapshot {
+    FleetSnapshot {
+        nodes: Ok(Population::default()),
+        members: Ok(Population::default()),
+        enrolled: Ok(Enrolled::default()),
     }
 }
 
@@ -289,6 +313,7 @@ pub struct Rig {
     pub orders: FakeOrders,
     pub sup: FakeSupervisor,
     pub gate: FakeGate,
+    pub fleet: FakeFleet,
     pub clock: Arc<FakeClock>,
     pub die: Arc<Mutex<Option<CrashPoint>>>,
 }
@@ -305,6 +330,10 @@ impl Rig {
                 before: Arc::new(Mutex::new(Compat::Compatible)),
                 staged: Arc::new(Mutex::new(Compat::Compatible)),
             },
+            fleet: FakeFleet {
+                snapshot: Arc::new(Mutex::new(empty_fleet())),
+                reads: Arc::new(AtomicUsize::new(0)),
+            },
             clock: Arc::new(FakeClock(AtomicU64::new(0))),
             die: Arc::new(Mutex::new(None)),
         }
@@ -320,11 +349,17 @@ impl Rig {
 
     /// A core over this rig's state directory (a second call is a restarted process).
     pub fn core(&self) -> Core {
+        self.core_with(Box::new(self.gate.clone()))
+    }
+
+    /// The same core with another gate, such as the real one.
+    pub fn core_with(&self, gate: Box<dyn CompatGate>) -> Core {
         Core::new(Parts {
             supervisor: Box::new(self.sup.clone()),
             orders: Box::new(self.orders.clone()),
             status: Box::new(self.status.clone()),
-            compat: Box::new(self.gate.clone()),
+            compat: gate,
+            fleet: Box::new(self.fleet.clone()),
             clock: self.clock.clone(),
             marker: RestartMarker::new(self.marker_path()),
             requests: Idempotency::open(&self.dir),

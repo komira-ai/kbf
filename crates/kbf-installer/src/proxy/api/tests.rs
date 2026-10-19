@@ -11,8 +11,7 @@ use super::fakes::{COMMIT_C, Rig, facts, idle, req, staged};
 use super::model::{OldChild, RollbackBlocked, StatusBody, UpdateId, abortable};
 use super::refusal;
 use super::traits::{
-    Compat, CompatGate, InstallerState, InstallerStatus, JsonFileStatus, StatusReader, StubGate,
-    SupervisorError,
+    Compat, InstallerState, InstallerStatus, JsonFileStatus, StatusReader, SupervisorError,
 };
 use crate::proxy::model::{Phase, Step, Verb};
 use crate::testkit::{A, B, c};
@@ -169,10 +168,16 @@ fn an_incompatible_release_is_a_409_naming_the_rule() {
     let rig = Rig::new("u8a-incompat");
     *rig.gate.before.lock().unwrap() = Compat::Incompatible {
         rule: "R1".to_owned(),
+        detail: "a daemon is too old".to_owned(),
     };
     let e = refused(rig.core().post(req(B, "r1")));
     assert_eq!((e.status, e.code), (StatusCode::CONFLICT, "incompatible"));
     assert_eq!(e.extra, Some(("rule", "R1".to_owned())));
+    assert!(
+        e.message.contains("R1: a daemon is too old"),
+        "{}",
+        e.message
+    );
     assert!(written(&rig).is_empty());
     assert_eq!(rig.sup.starts(), 0);
 }
@@ -458,12 +463,16 @@ fn an_incompatible_staged_release_fails_the_update_and_drops_the_stage() {
     let (mut core, _) = started(&rig);
     *rig.gate.staged.lock().unwrap() = Compat::Incompatible {
         rule: "R4".to_owned(),
+        detail: "it is older".to_owned(),
     };
     rig.set_status(staged(B));
     let s = body(&mut core);
     assert_eq!(s.phase, Some(Phase::Failed));
     let f = s.failure.expect("failure");
-    assert_eq!((f.step, f.reason.as_str()), (Step::Compat, "R4"));
+    assert_eq!(
+        (f.step, f.reason.as_str()),
+        (Step::Compat, "R4: it is older")
+    );
     assert_eq!(rig.sup.starts(), 0);
     assert_eq!(written(&rig)[1], (Verb::Revert, B.to_owned()));
 }
@@ -808,6 +817,7 @@ fn a_revert_order_that_cannot_be_written_still_ends_the_update() {
     let (mut core, _) = started(&rig);
     *rig.gate.staged.lock().unwrap() = Compat::Incompatible {
         rule: "R1".to_owned(),
+        detail: "a daemon is too old".to_owned(),
     };
     *rig.orders.fail.lock().unwrap() = true;
     rig.set_status(staged(B));
@@ -856,8 +866,6 @@ fn supervisor_errors_become_defined_answers() {
 #[test]
 fn small_pieces_say_what_they_say() {
     assert_eq!(NoCrash.at(CrashPoint::AfterRequestSaved), Ok(()));
-    assert_eq!(StubGate.check(&c(A), None), Compat::Compatible);
-    assert_eq!(StubGate.check(&c(A), Some(&facts())), Compat::Compatible);
     for (why, text) in [
         (RollbackBlocked::NoUpdate, "no update is open"),
         (
@@ -931,6 +939,7 @@ fn a_revived_request_is_checked_again_like_a_new_one() {
             |r| {
                 *r.gate.before.lock().unwrap() = Compat::Incompatible {
                     rule: "R1".to_owned(),
+                    detail: "a daemon is too old".to_owned(),
                 }
             },
             "incompatible",
