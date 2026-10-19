@@ -346,6 +346,48 @@ async fn an_execute_that_fails_before_its_first_operation_is_still_measured() {
     assert_eq!(m.execute_submit.count(), 0, "never reached the scheduler");
 }
 
+/// Catches: an Execute refused for inputs the CAS lacks that leaves no line in the log (the
+/// only trace was a counter, and a run refused the same way every time went unnoticed):
+/// the warning names the action and how many blobs were missing, once, and no line names
+/// an Execute that was not refused.
+#[tokio::test(start_paused = true)]
+async fn an_execute_refused_for_a_missing_input_is_logged_with_its_action_and_count() {
+    let _ = log_lines();
+    let rig = Rig::new(GET).await;
+    let refused = job("refused and logged", false);
+    rig.store(&refused.blobs.iter().collect::<Vec<_>>()).await;
+    let fine = job("accepted and not logged", true);
+    rig.store(&fine.blobs.iter().collect::<Vec<_>>()).await;
+
+    execute(&rig, &refused)
+        .await
+        .expect("joined")
+        .expect_err("missing");
+    execute(&rig, &fine)
+        .await
+        .expect("joined")
+        .expect("Execute");
+
+    let lines = log_lines();
+    let refusals: Vec<_> = lines
+        .iter()
+        .filter(|l| l.contains("input blob(s) are not in the CAS"))
+        .filter(|l| l.contains(&refused.action.digest.to_string()))
+        .collect();
+    let [line] = refusals.as_slice() else {
+        panic!("one refusal logged for the action, got {lines:?}");
+    };
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains(&refused.action.digest.to_string()), "{line}");
+    assert!(line.contains("count=1"), "{line}");
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains(&fine.action.digest.to_string())),
+        "{lines:?}"
+    );
+}
+
 /// Catches: no warning for an Execute that spent 10 s or more before its first
 /// operation (the operator's only signal short of a scrape), one that omits the action,
 /// the walk or the directory count the operator reads the cause from, and one for a
