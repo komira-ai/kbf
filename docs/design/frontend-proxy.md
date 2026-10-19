@@ -77,6 +77,8 @@ POST /v1/update/frontend/rollback     after "switched" while the old child lives
 POST /v1/update/frontend/force-retire explicit, needs a reason, counts dropped streams, never automatic
 ```
 
+`active_slot` is the slot of the child that is **serving** now: the old child's until the switch, the new child's from `switched` on, the old child's again after a rollback, an abort or a revert. It is not the candidate's slot while the candidate starts, and it is `null` while no update is known. `kbf-installer deploy` follows the frontend with it (its gates read the serving child's operator port, `base_port + slot offset + 2`, and the child that handed over while it drains: that one, not its successor, reports `kbf_frontend_relay_untraced`). The supervisor that fills it in is U7b's; the API only passes it on, and `proxy/api/tests.rs` pins the values per phase.
+
 
 Phases: `accepted, fetching, verifying, staged, preflight, starting, ready, holding, quiescing, switching, switched, baking, nodes, draining, done`, plus `failed` and `rolled_back`.
 

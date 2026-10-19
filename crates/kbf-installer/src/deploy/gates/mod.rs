@@ -31,7 +31,7 @@ mod scrape;
 
 use std::collections::BTreeSet;
 
-use kbf_gate::{GateResult, Limit, Sample, SetHash, Verdict, judge};
+use kbf_gate::{GateResult, Limit, Metrics, Sample, SetHash, Verdict, judge};
 
 use std::collections::BTreeMap;
 
@@ -91,7 +91,12 @@ pub(crate) struct Gates {
     /// The host step the next reading is for.
     pub step: String,
     readings: Vec<Reading>,
-    baseline_losses: Option<f64>,
+    /// The loss counter at the deploy's first scrape.
+    first_losses: Option<f64>,
+    /// Each child's own baseline for the loss counter (its label): the deploy's first reading
+    /// while the child's reading is not below it, else the child's own first reading (a fresh
+    /// process whose counter began again).
+    child_base: BTreeMap<String, Option<f64>>,
     ids: BTreeSet<String>,
     /// The hash of the release set, when preflight derived it.
     pub derived_set_hash: Option<SetHash>,
@@ -107,7 +112,8 @@ impl Gates {
             begun: None,
             step: String::new(),
             readings: Vec::new(),
-            baseline_losses: None,
+            first_losses: None,
+            child_base: BTreeMap::new(),
             ids: BTreeSet::new(),
             derived_set_hash: None,
             observed: Vec::new(),
@@ -121,6 +127,77 @@ impl Gates {
             which.clone_into(&mut self.last_observed);
             self.observed.push(format!("{}: {which}", self.step));
         }
+    }
+
+    /// The loss counter's change since `label`'s baseline; absent when the counter is absent or
+    /// went backwards within this child (it was reset: the losses cannot be told).
+    fn loss_delta(&mut self, label: &str, losses: Sample, first_scrape: bool) -> Sample {
+        let reading = match losses {
+            Sample::Value(v) => Some(v),
+            Sample::Absent => None,
+        };
+        if first_scrape {
+            self.first_losses = reading;
+        }
+        let first = self.first_losses;
+        let base =
+            *self
+                .child_base
+                .entry(label.to_owned())
+                .or_insert_with(|| match (reading, first) {
+                    (Some(v), Some(f)) if v >= f => Some(f),
+                    (r, _) => r,
+                });
+        match (reading, base) {
+            (Some(v), Some(b)) if v >= b => Sample::Value(v - b),
+            _ => Sample::Absent,
+        }
+    }
+
+    /// Judge one child's scrape. The serving child (`primary`) must have every series; a
+    /// child that is handing over is judged on what it reports, and one that does not answer
+    /// has finished. Returns the red messages.
+    fn judge_scrape(
+        &mut self,
+        label: &str,
+        metrics: &Result<Metrics, String>,
+        primary: bool,
+        first_scrape: bool,
+        now: u64,
+    ) -> Vec<String> {
+        let get = |series: &str| match metrics {
+            Ok(m) => m.sum(series),
+            Err(_) => Sample::Absent,
+        };
+        let losses = get(series::BLOB_LOSSES);
+        let delta = self.loss_delta(label, losses, first_scrape);
+        let why = match metrics {
+            Err(e) if primary => format!(" ({e})"),
+            _ => String::new(),
+        };
+        let extra = format!(" [read from {label}]{why}");
+        let rows = [
+            (name::RELAY_UNTRACED, get(series::RELAY_UNTRACED)),
+            (name::LOST_BLOBS, get(series::LOST_BLOBS)),
+            (
+                name::BLOB_LOSSES,
+                if losses == Sample::Absent {
+                    losses
+                } else {
+                    delta
+                },
+            ),
+        ];
+        let mut reds = Vec::new();
+        for (gate, sample) in rows {
+            if !primary && sample == Sample::Absent {
+                continue;
+            }
+            if let Err(red) = self.record_with(gate, sample, now, &extra) {
+                reds.push(red);
+            }
+        }
+        reds
     }
 
     /// Keep a reading and judge it: `Err` names the gate, the value and the host step.
@@ -228,41 +305,48 @@ impl Run<'_> {
             return Ok(Sample::Value(0.0));
         }
         let now = self.env.clock.now();
-        let which = self.observed.as_ref().map(|o| o.label.clone());
-        self.gates.saw(which.as_deref().unwrap_or("none resolved"));
-        let metrics = scrape::read(self);
-        let get = |series: &str| match &metrics {
-            Ok(m) => m.sum(series),
-            Err(_) => Sample::Absent,
-        };
-        let losses = get(series::BLOB_LOSSES);
-        let first = self.gates.baseline_losses.is_none() && self.gates.begun.is_none();
+        let first = self.gates.begun.is_none();
         if first {
             self.gates.begun = Some(now);
-            self.gates.baseline_losses = match losses {
-                Sample::Value(v) => Some(v),
-                Sample::Absent => None,
-            };
         }
-        // A counter that went backwards was reset (a restart): the loss count across the
-        // deploy cannot be told, which is not a pass.
-        let delta = match (losses, self.gates.baseline_losses) {
-            (Sample::Value(now), Some(base)) if now >= base => Sample::Value(now - base),
-            _ => Sample::Absent,
+        let label = self
+            .observed
+            .as_ref()
+            .map_or_else(|| "none resolved".to_owned(), |o| o.label.clone());
+        let metrics = scrape::read(self);
+        let under = match &metrics {
+            Ok(m) => m.sum(series::UNDER_REPLICATED),
+            Err(_) => Sample::Absent,
         };
-        let results = [
-            self.gates
-                .record(name::RELAY_UNTRACED, get(series::RELAY_UNTRACED), now),
-            self.gates
-                .record(name::LOST_BLOBS, get(series::LOST_BLOBS), now),
-            self.gates.record(name::BLOB_LOSSES, delta, now),
-        ];
-        let unreadable = metrics.as_ref().err().cloned();
-        if let Some(first_red) = results.into_iter().find_map(Result::err) {
-            let why = unreadable.map_or(String::new(), |e| format!(" ({e})"));
-            return Err(gate_fail(exit, format!("{first_red}{why}")));
+        let mut reds = self.gates.judge_scrape(&label, &metrics, true, first, now);
+        // The child that handed over is still draining: its relay and loss series count too.
+        let mut also = Vec::new();
+        let others: Vec<(String, Result<Metrics, String>)> = self
+            .observed
+            .as_ref()
+            .map(|o| {
+                o.others
+                    .iter()
+                    .map(|other| (other.label.clone(), scrape::read_from(&*other.api)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (other, scraped) in others {
+            if scraped.is_ok() {
+                reds.extend(self.gates.judge_scrape(&other, &scraped, false, false, now));
+                also.push(other);
+            }
         }
-        Ok(get(series::UNDER_REPLICATED))
+        let saw = if also.is_empty() {
+            label
+        } else {
+            format!("{label}; also {}", also.join(", "))
+        };
+        self.gates.saw(&saw);
+        match reds.into_iter().next() {
+            Some(red) => Err(gate_fail(exit, red)),
+            None => Ok(under),
+        }
     }
 
     /// Record E for `sample` and fail if it is not 0.

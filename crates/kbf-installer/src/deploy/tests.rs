@@ -121,6 +121,14 @@ struct Farm {
     observed_log: RefCell<Vec<String>>,
     /// Both children answer (an ambiguous farm).
     both_children: bool,
+    /// Seconds the child that handed over goes on answering after the frontend order.
+    old_child_drains: u64,
+    /// What that child says on `/metrics` while it drains; the farm's script when `None`.
+    retiring_metrics: Option<Box<dyn Fn(u64) -> Option<String>>>,
+    /// The update API names no serving slot after the order (a status that does not say).
+    status_names_no_slot: bool,
+    /// The serving slot each resolution was told.
+    resolves: RefCell<Vec<Option<observe::Slot>>>,
     /// Calls a child that was not serving refused, and the reads each child answered (with
     /// whether the frontend order had been posted).
     refused: RefCell<Vec<String>>,
@@ -204,6 +212,10 @@ impl Farm {
             unknown: RefCell::new(Vec::new()),
             observed_log: RefCell::new(Vec::new()),
             both_children: false,
+            old_child_drains: 100_000,
+            retiring_metrics: None,
+            status_names_no_slot: false,
+            resolves: RefCell::new(Vec::new()),
             refused: RefCell::new(Vec::new()),
             child_reads: RefCell::new(Vec::new()),
         }
@@ -465,7 +477,11 @@ impl Operator for Farm {
                 Farm::reply(202, json!({"order_id": 2}))
             }
             ("GET", "/v1/update/frontend") => {
-                let slot = self.frontend_at.get().map(|_| match self.serving_child() {
+                let named = self
+                    .frontend_at
+                    .get()
+                    .filter(|_| !self.status_names_no_slot);
+                let slot = named.map(|_| match self.serving_child() {
                     observe::Slot::A => "a",
                     observe::Slot::B => "b",
                 });
@@ -493,6 +509,7 @@ impl Observe for Obs<'_> {
         Ok(observe::Observed {
             label: "fixed".to_owned(),
             api: Box::new(ObservedApi(self.0)),
+            others: Vec::new(),
         })
     }
 }
@@ -524,17 +541,38 @@ impl Farm {
         }
     }
 
+    /// Whether `slot`'s child answers. The serving one does; the one that handed over keeps
+    /// draining, and answers, until `old_child_drains` seconds after the frontend order.
     fn child_alive(&self, slot: observe::Slot) -> bool {
-        self.both_children || self.serving_child() == slot
+        if self.both_children || self.serving_child() == slot {
+            return true;
+        }
+        match self.frontend_at.get() {
+            Some(t) if slot == observe::Slot::A => self.now.get() < t + self.old_child_drains,
+            _ => false,
+        }
     }
 }
 
 impl Observe for SlotObs<'_> {
     fn resolve(&self, serving: Option<observe::Slot>) -> Result<observe::Observed<'_>, String> {
+        self.0.resolves.borrow_mut().push(serving);
         let slot = observe::choose(serving, |s| self.0.child_alive(s))?;
+        let other = if slot == observe::Slot::A {
+            observe::Slot::B
+        } else {
+            observe::Slot::A
+        };
         Ok(observe::Observed {
             label: slot.to_string(),
             api: Box::new(Child { farm: self.0, slot }),
+            others: vec![observe::Other {
+                label: other.to_string(),
+                api: Box::new(Child {
+                    farm: self.0,
+                    slot: other,
+                }),
+            }],
         })
     }
 }
@@ -552,6 +590,19 @@ impl Operator for Child<'_> {
             .child_reads
             .borrow_mut()
             .push((self.slot, self.farm.frontend_at.get().is_some()));
+        // The child that handed over reports its own series, not the farm's script.
+        let retiring = self.slot != self.farm.serving_child();
+        if let (true, "/metrics", Some(script)) =
+            (retiring, r.path.as_str(), &self.farm.retiring_metrics)
+        {
+            return match script(self.farm.now.get()) {
+                Some(text) => Ok(Reply {
+                    status: 200,
+                    body: text.into_bytes(),
+                }),
+                None => Farm::reply(503, json!({})),
+            };
+        }
         ObservedApi(self.farm).send(r)
     }
 }

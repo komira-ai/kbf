@@ -146,6 +146,12 @@ pub struct RunningUpdate {
     pub to: CommitId,
     pub phase: Phase,
     pub since_s: u64,
+    /// The slot of the child that is SERVING requests now, not the candidate and not the
+    /// child that was started last: the old child's slot until the switch, the new child's
+    /// from `switched` on, and the old child's again after a rollback or a revert (the new
+    /// child was stood down). `GET /v1/update/frontend` reports it as `active_slot`, and
+    /// `kbf-installer deploy` reads it to follow the frontend across a handover
+    /// (docs/design/frontend-proxy.md section 4).
     pub active_slot: Slot,
     pub old: Option<OldChild>,
     pub new: NewChild,

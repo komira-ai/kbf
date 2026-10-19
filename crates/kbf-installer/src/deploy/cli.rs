@@ -553,6 +553,13 @@ pub(super) fn run(
         check: &check as &dyn Check,
     };
     let _ = writeln!(err, "kbf-installer deploy: {}", parsed.options.commit);
+    // A signal ends an applied deploy; its document is finished red before the process exits.
+    let _armed = parsed
+        .options
+        .result
+        .as_deref()
+        .filter(|_| parsed.options.apply)
+        .map(super::interrupt::arm);
     let summary = deploy(&env, &parsed.options, input);
     let _ = writeln!(out, "{}", summary.line());
     summary.exit

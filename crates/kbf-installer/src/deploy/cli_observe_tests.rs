@@ -222,3 +222,117 @@ fn observe_base_port_reads_the_child_that_answers() {
     );
     assert_eq!(r.code, 3, "{}", r.summary);
 }
+
+// ---- a signal -----------------------------------------------------------------------
+
+const CHILD_DIR: &str = "KBF_TEST_SIGNAL_CHILD_DIR";
+
+/// The deploy that the signal tests interrupt, run in a child process of the test binary: an
+/// update API that never answers, so the deploy is in its first request when the signal comes.
+/// Without the variable set (a normal run of the suite) it does nothing.
+#[test]
+fn signal_child_entry() {
+    let Some(dir) = std::env::var_os(CHILD_DIR).map(std::path::PathBuf::from) else {
+        return;
+    };
+    let marker = dir.join("started");
+    let api = Fake::start(move |_| {
+        let _ = fs::write(&marker, b"x");
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        (404, "{}".to_owned())
+    });
+    let token = dir.join("token");
+    fs::write(&token, "0123456789abcdef0123456789abcdef0123456789abcdef\n").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let args: Vec<String> = [
+        "--commit",
+        A,
+        "--api",
+        &api.addr.to_string(),
+        "--token-file",
+        token.to_str().unwrap(),
+        "--lock",
+        dir.join("lock").to_str().unwrap(),
+        "--result",
+        dir.join("result.json").to_str().unwrap(),
+        "--platform",
+        "linux-x86_64",
+        "--observe",
+        "127.0.0.1:2",
+        "--apply",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let host = Host {
+        root: true,
+        config_owner: current_uid(),
+        frontend: FrontendConfig {
+            toml: dir.join("none.toml"),
+            units: Vec::new(),
+        },
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    cli::run(
+        &args,
+        &mut std::io::empty(),
+        &mut out,
+        &mut err,
+        false,
+        &host,
+    );
+}
+
+/// Proves a deploy ended by SIGTERM or SIGINT leaves its document finished red, naming the
+/// signal, and exits 128 plus the signal. The deploy runs in a child process, stuck in its first
+/// request; the signal is sent once that request has arrived. Catches a signal path that
+/// leaves the document `RUNNING` (the process is killed by its default action).
+///
+/// Mutants planted: the handlers not armed in `cli::run`.
+#[test]
+fn a_signal_seals_the_document_red_and_exits_128_plus_the_signal() {
+    for (signal, code, word) in [
+        (libc::SIGTERM, 143, "SIGTERM"),
+        (libc::SIGINT, 130, "SIGINT"),
+    ] {
+        let (_, dir) = crate::testkit::host_root(&format!("deploy-signal-{word}"));
+        let _ = fs::remove_file(dir.join("started"));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "deploy::cli_observe_tests::signal_child_entry",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_DIR, &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let waited = std::time::Instant::now();
+        while !dir.join("started").exists() {
+            assert!(
+                waited.elapsed().as_secs() < 60,
+                "the child never made its request"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // SAFETY: signals the child this test spawned.
+        unsafe { libc::kill(child.id() as libc::pid_t, signal) };
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(waited.elapsed().as_secs() < 120, "the child did not end");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(code), "{word}: {status:?}");
+        let doc =
+            kbf_gate::ResultDoc::from_bytes(&fs::read(dir.join("result.json")).unwrap()).unwrap();
+        assert_eq!(doc.status, kbf_gate::Status::Red, "{word}");
+        assert!(doc.finished.is_some() && !doc.passed());
+        assert_eq!(
+            doc.note.as_deref(),
+            Some(format!("interrupted by {word}").as_str())
+        );
+    }
+}

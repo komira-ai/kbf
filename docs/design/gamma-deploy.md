@@ -84,7 +84,11 @@ the preflight and again after every frontend step: the slot `GET /v1/update/fron
 `active_slot` (present while that update is known), else the only child that answers
 `/metrics`; none answering, or both with no slot named, ends the deploy (`observe_unresolved`).
 The result document's `observed` lists `<step>: <child>` each time the child read changes
-(for example `preflight: slot a 127.0.0.1:18002`, `frontend: slot b 127.0.0.1:18012`).
+(for example `preflight: slot a 127.0.0.1:18002`, then `frontend: slot b 127.0.0.1:18012; also slot a 127.0.0.1:18002`).
+
+**The child that handed over is read too.** It is the one that reports `kbf_frontend_relay_untraced` (set by `Farm::follow` on the fenced farm), and the successor never does; it keeps draining after the swap. So at every scrape after a handover the other slot is scraped as well, when it answers: gate B, `kbf_cache_lost_blobs` and the loss counter apply to it, and a red names it (`[read from slot a …]`). One that does not answer has finished and is not waited for. `kbf_cache_lost_blobs` and `kbf_cache_blob_losses_total` are folded from the metadata log (`MetaState`), so on the shared Raft log both children report the same numbers; an in-memory log begins again in a new process. The loss counter is therefore judged per child: a child's baseline is the deploy's first reading while its own reading is not below it (a shared log: a loss across the handover shows), else its own first reading (a fresh process); a counter that falls within one child is still red.
+
+**Signals.** `SIGTERM` and `SIGINT` seal a still-`RUNNING` document red, `interrupted by SIGTERM`, before the process exits 128 + the signal (a finished document is left alone). Only a `SIGKILL` or a crash leaves it `RUNNING`, which no reader counts as a pass.
 [A] Before any update has run on a host the API names no slot, so the preflight probes; a host
 where both children are left running after an earlier swap needs the older one stopped.
 

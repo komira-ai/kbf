@@ -783,31 +783,173 @@ fn run_slots(f: &Farm, test: &str) -> (Summary, ResultDoc) {
 }
 
 /// Proves the gates follow the frontend across its own handover. Slot A serves until the
-/// deploy hands the frontend over, then slot A refuses connections and slot B serves: every
-/// read before the handover is slot A's, every read after it slot B's, none is refused, the
-/// deploy stays green, and the document says which child each stretch of readings came from.
-/// Catches gates that go on reading the retired child (a refused scrape is red).
+/// deploy hands the frontend over; afterwards the update API names slot B and the gates read
+/// it, while slot A, which handed over, goes on draining and answering and is read too. The
+/// deploy stays green and the document says which children each stretch of readings came from.
+/// Catches gates that go on reading the retired child, that guess the serving child from who
+/// answers (both do after the swap, so the update API's word must decide), and that drop the
+/// draining child.
 ///
-/// Mutants planted: no new resolution after the frontend step.
+/// Mutants planted: no new resolution after the frontend step; the serving slot ignored (the
+/// probe alone decides); the draining child not recorded.
 #[test]
 fn the_gates_follow_the_serving_child_across_the_frontend_handover() {
     let f = farm(two_nodes());
     let (s, doc) = run_slots(&f, "handover");
     assert_eq!((s.exit, s.reason.as_str()), (0, ""), "{}", s.line());
     assert_eq!(doc.status, Status::Green);
-    assert_eq!(doc.observed, ["preflight: slot a", "frontend: slot b"]);
-    assert!(f.refused.borrow().is_empty(), "{:?}", f.refused.borrow());
+    assert_eq!(
+        doc.observed,
+        ["preflight: slot a", "frontend: slot b; also slot a"]
+    );
+    // Slot B does not exist before the order: those attempts are refused, nothing else is.
+    assert!(
+        f.refused.borrow().iter().all(|l| l.starts_with("slot b: ")),
+        "{:?}",
+        f.refused.borrow()
+    );
     let reads = f.child_reads.borrow();
-    assert!(!reads.is_empty());
-    for (slot, after_post) in reads.iter() {
-        let want = if *after_post {
-            observe::Slot::B
-        } else {
-            observe::Slot::A
-        };
-        assert_eq!(*slot, want, "{reads:?}");
-    }
-    assert!(reads.iter().any(|(s, _)| *s == observe::Slot::B));
+    assert!(
+        reads
+            .iter()
+            .all(|(slot, after)| *after || *slot == observe::Slot::A),
+        "{reads:?}"
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|(s, after)| *after && *s == observe::Slot::B)
+    );
+    assert_eq!(
+        *f.resolves.borrow(),
+        [None, Some(observe::Slot::B)],
+        "the preflight probes, the frontend step is told the serving slot"
+    );
+}
+
+/// Proves gate B reads the child that handed over: it is the one that reports
+/// `kbf_frontend_relay_untraced` (the successor never does), and it goes on draining after the
+/// swap. With slot A reporting 1 after the order and slot B healthy, the deploy is red naming
+/// gate B, the value and slot A, though the serving child says 0. Catches gates that read the
+/// serving child only.
+///
+/// Mutants planted: the draining child not scraped.
+#[test]
+fn a_draining_child_that_reports_untraced_relays_is_red_naming_it() {
+    let mut f = farm(two_nodes());
+    f.retiring_metrics = Some(Box::new(|t| {
+        let mut g = healthy();
+        if t >= 205 {
+            g.relay_untraced = Some(1.0);
+        }
+        Some(g.text())
+    }));
+    let (s, doc) = run_slots(&f, "draining-untraced");
+    red_at(&s, name::RELAY_UNTRACED, ": 1,", "slot a");
+    assert!(s.detail.contains("frontend"), "{}", s.detail);
+    assert_eq!(gate(&doc, name::RELAY_UNTRACED).measured, Some(1.0));
+}
+
+/// Proves a draining child that reports lost blobs, or a loss since the start, is red too, and
+/// one that stopped answering (finished draining) is not required. Catches B-only coverage of
+/// the draining child, and a deploy that waits for a child that is gone.
+///
+/// Mutants planted: the draining child judged by gate B only.
+#[test]
+fn a_draining_child_is_judged_on_lost_blobs_and_a_finished_one_is_not_required() {
+    let mut f = farm(two_nodes());
+    f.retiring_metrics = Some(Box::new(|t| {
+        let mut g = healthy();
+        if t >= 205 {
+            g.lost_blobs = Some(2.0);
+        }
+        Some(g.text())
+    }));
+    let (s, _) = run_slots(&f, "draining-lost");
+    red_at(&s, name::LOST_BLOBS, ": 2,", "slot a");
+
+    let mut f = farm(two_nodes());
+    f.old_child_drains = 5;
+    let (s, doc) = run_slots(&f, "drained");
+    assert_eq!((s.exit, s.reason.as_str()), (0, ""), "{}", s.line());
+    assert_eq!(doc.observed, ["preflight: slot a", "frontend: slot b"]);
+}
+
+/// Proves the loss counter is judged per child. A successor whose counter began again (an
+/// in-memory metadata log: it reads 0 against the deploy's first reading of 3) is not a
+/// "went backwards" red, its first reading is its baseline; one that reads on from the deploy's
+/// first reading (a shared durable log) keeps that baseline, so a loss across the handover is
+/// seen. Catches a single baseline for the deploy (the false red) and a fresh baseline for
+/// every child (the missed loss).
+///
+/// Mutants planted: one deploy-wide baseline; every new child's first reading its baseline.
+#[test]
+fn the_loss_counter_has_a_baseline_per_child() {
+    let mut f = farm(two_nodes());
+    script(&mut f, |t, g| {
+        if t >= 210 {
+            g.losses_total = Some(0.0);
+        }
+    });
+    f.retiring_metrics = Some(Box::new(|_| Some(healthy().text())));
+    let (s, _) = run_slots(&f, "counter-reset");
+    assert_eq!((s.exit, s.reason.as_str()), (0, ""), "{}", s.line());
+
+    let mut f = farm(two_nodes());
+    script(&mut f, |t, g| {
+        if t >= 210 {
+            g.losses_total = Some(4.0);
+        }
+    });
+    f.retiring_metrics = Some(Box::new(|_| Some(healthy().text())));
+    let (s, _) = run_slots(&f, "counter-shared");
+    red_at(&s, name::BLOB_LOSSES, ": 1,", "slot b");
+}
+
+/// Proves a reverted frontend order is followed too: the old child serves again, the update
+/// API says so, and the gates are pointed at it again (the end of the gates reads it). Catches
+/// a revert that leaves the gates on the child that was retired.
+///
+/// Mutants planted: no new resolution when the order reverts.
+#[test]
+fn a_reverted_frontend_order_points_the_gates_at_the_old_child_again() {
+    let mut f = farm(two_nodes());
+    f.frontend_fate = FrontendFate::Revert;
+    let (s, _) = run_slots(&f, "revert-follow");
+    assert_eq!(
+        (s.exit, s.reason.as_str()),
+        (1, "frontend_reverted"),
+        "{}",
+        s.line()
+    );
+    assert_eq!(
+        *f.resolves.borrow(),
+        [None, Some(observe::Slot::A)],
+        "the update API names the old slot as serving after the revert"
+    );
+}
+
+/// Proves a frontend that cannot be found after the handover ends the deploy: the update API
+/// names no serving slot and both children answer, so the gates would be guessing. Catches a
+/// failed re-resolution that is ignored (the gates would go on reading the old child).
+///
+/// Mutants planted: the error of the resolution after the frontend step ignored.
+#[test]
+fn a_frontend_that_cannot_be_found_after_the_handover_ends_the_deploy() {
+    let mut f = farm(two_nodes());
+    f.status_names_no_slot = true;
+    let (s, _) = run_slots(&f, "unresolved-after");
+    assert_eq!(
+        (s.exit, s.reason.as_str()),
+        (1, "observe_unresolved"),
+        "{}",
+        s.line()
+    );
+    assert!(
+        s.detail.contains("both frontend slots answer"),
+        "{}",
+        s.detail
+    );
 }
 
 /// Proves a farm on which both children answer and the update API names none refuses to

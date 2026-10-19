@@ -77,6 +77,15 @@ pub fn choose(serving: Option<Slot>, probe: impl Fn(Slot) -> bool) -> Result<Slo
 pub struct Observed<'a> {
     pub label: String,
     pub api: Box<dyn Operator + 'a>,
+    /// Other children whose `/metrics` still count when they answer: the one that handed
+    /// over keeps draining after the swap, and it is that one that reports
+    /// `kbf_frontend_relay_untraced` (the successor never does).
+    pub others: Vec<Other<'a>>,
+}
+
+pub struct Other<'a> {
+    pub label: String,
+    pub api: Box<dyn Operator + 'a>,
 }
 
 /// Finds the frontend the gates read.
@@ -100,6 +109,7 @@ impl Observe for Fixed {
         Ok(Observed {
             label: format!("fixed {}", self.addr),
             api: Box::new(api),
+            others: Vec::new(),
         })
     }
 }
@@ -129,9 +139,19 @@ impl Observe for Slots {
         };
         let slot = choose(serving, answers)?;
         let (addr, http) = self.client(slot)?;
+        let other = if slot == Slot::A { Slot::B } else { Slot::A };
+        let others = self
+            .client(other)
+            .map(|(addr, http)| Other {
+                label: format!("{other} {addr}"),
+                api: Box::new(http) as Box<dyn Operator + '_>,
+            })
+            .into_iter()
+            .collect();
         Ok(Observed {
             label: format!("{slot} {addr}"),
             api: Box::new(http),
+            others,
         })
     }
 }
