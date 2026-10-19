@@ -79,7 +79,7 @@ fn each_verb_sends_its_call_and_prints_the_answer() {
                 &token,
             ],
             "POST /v1/members/7 HTTP/1.1",
-            r#"{"state":"planned_down","for_secs":600}"#,
+            r#"{"for_secs":600,"state":"planned_down"}"#,
         ),
     ];
     for (args, line, body) in cases {
