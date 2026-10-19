@@ -8,7 +8,9 @@
 //! which launchd runs a lease's jobs as). `run` chooses by the service it restarts
 //! ([`for_restart`]): a mode's systemd unit gets [`CgroupLeases`]; a launchd label still
 //! gets [`NotWired`] (nothing configures the pool), which says it cannot tell, and an
-//! activation is refused (fail closed).
+//! activation is refused (fail closed). A frontend's unit holds no leases, so its count would
+//! always read idle: [`frontend_unit`] names it, and the helper refuses a node activation
+//! that would restart it.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -168,11 +170,27 @@ pub fn for_restart(restart: &Restart, cgroup_root: &Path) -> Box<dyn LeaseSource
     }
 }
 
-/// Whether `unit` is a unit of some mode: of the same family as one `setup` names for it.
+/// The unit `restart` restarts, when it is a frontend's (`kbf --mode=frontend`: the
+/// family of the unit `setup` names for that mode). A frontend holds no leases, so a count
+/// read from its cgroup is "idle" whether or not it serves; the helper uses this to refuse a
+/// node `activate` that would restart it. A launchd label is never one.
+pub fn frontend_unit(restart: &Restart) -> Option<&str> {
+    match restart {
+        Restart::Systemd(unit) if is_unit_of(unit, &[Mode::Frontend]) => Some(unit.as_str()),
+        Restart::Systemd(_) | Restart::Launchd(_) => None,
+    }
+}
+
+/// Whether `unit` is a unit of some mode.
 fn is_mode_unit(unit: &str) -> bool {
     use clap::ValueEnum;
+    is_unit_of(unit, Mode::value_variants())
+}
+
+/// Whether `unit` is a unit of one of `modes`: of the same family as one `setup` names for it.
+fn is_unit_of(unit: &str, modes: &[Mode]) -> bool {
     family(unit).is_some_and(|f| {
-        Mode::value_variants()
+        modes
             .iter()
             .flat_map(|m| mode_units(*m))
             .any(|u| family(u) == Some(f))

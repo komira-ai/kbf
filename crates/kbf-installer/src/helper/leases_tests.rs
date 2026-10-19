@@ -322,3 +322,57 @@ fn a_launchd_label_has_no_lease_source_yet() {
     let err = source.live().expect_err("not wired");
     assert!(err.contains("no lease source wired"), "{err}");
 }
+
+/// Catches a frontend's unit taken for another mode's, or another mode's for a frontend's:
+/// `run` refuses an `activate` only where the unit it restarts is the frontend mode's (a
+/// frontend holds no leases, so its lease count would let the order through, and the swap
+/// would restart the frontend). The units `setup` names for every mode are judged from the
+/// table itself, so a renamed or added unit is classified rather than missed; the forms of
+/// the frontend's family (any instance of the template, the plain unit) are its, and a name
+/// that is the family's only by prefix, an instance that is empty or would leave the slice,
+/// another mode's instance and a launchd label are not.
+///
+/// Mutants seen red: every unit given as a frontend's (the other modes' read as frontends);
+/// none (the frontend's reads as not); the family not matched (the template's instances and
+/// the plain unit read as not); a prefix match instead of the family (the two names that only
+/// start with it); the instance's characters not checked.
+#[test]
+fn only_the_frontend_modes_units_are_a_frontends() {
+    use clap::ValueEnum;
+    let table: Vec<_> = Mode::value_variants()
+        .iter()
+        .flat_map(|mode| mode_units(*mode).iter().map(move |unit| (*mode, *unit)))
+        .collect();
+    let judged: Vec<_> = table
+        .iter()
+        .map(|(_, unit)| (*unit, frontend_unit(&systemd(unit)) == Some(*unit)))
+        .collect();
+    let expected: Vec<_> = table
+        .iter()
+        .map(|(mode, unit)| (*unit, matches!(mode, Mode::Frontend)))
+        .collect();
+    assert_eq!(judged, expected);
+
+    let forms = [
+        ("kbf-frontend@a.service", true),
+        ("kbf-frontend@b.service", true),
+        ("kbf-frontend.service", true),
+        ("kbf-frontend@main-2_x.y:z.service", true),
+        ("kbf-all-in-one@1.service", false),
+        ("kbf-daemon.service", false),
+        ("kbf-frontendx.service", false),
+        ("kbf-frontend-b.service", false),
+        ("kbf-frontend@.service", false),
+        ("kbf-frontend@a/b.service", false),
+        ("kbf-frontend@../b.service", false),
+        ("kbf-frontend", false),
+        ("", false),
+    ];
+    let seen: Vec<_> = forms
+        .iter()
+        .map(|(unit, _)| (*unit, frontend_unit(&systemd(unit)).is_some()))
+        .collect();
+    assert_eq!(seen, forms);
+    let label = Restart::Launchd("kbf-frontend.service".to_owned());
+    assert_eq!(frontend_unit(&label), None);
+}
