@@ -291,6 +291,42 @@ fn a_swap_the_old_helper_makes_as_it_stops_ends_the_run_with_the_services_runnin
     );
 }
 
+/// Catches an old layout that is gone as the old helper stops (someone removed the old
+/// state meanwhile): the run ends `Changed` (exit 5) rather than migrate a layout it can
+/// no longer read, and the services it had stopped run again, in the order they were
+/// stopped, with the installer's state not written.
+///
+/// Mutant seen red: the old state read as there still, from the look before the stops.
+#[test]
+fn an_old_state_that_goes_as_the_old_helper_stops_ends_the_run_with_the_services_running() {
+    let mut rig = Rig::linux("gone-at-stop");
+    let dir = rig.at("var/lib/kbf-deploy");
+    let helper = rig.helper().as_str().to_owned();
+    rig.on_command(move |verb, unit| {
+        if verb == "stop" && unit == helper {
+            fs::remove_file(dir.join("state.json")).expect("rm");
+            fs::remove_file(dir.join("helper.json")).expect("rm");
+        }
+    });
+    let error = run_migrate(&mut rig, &never(), Mode::Apply).expect_err("refused");
+    assert!(
+        matches!(&error, MigrateError::Changed(why) if why.contains("gone")),
+        "{error}"
+    );
+    assert_eq!(error.exit().code(), 5);
+
+    assert_eq!(
+        *rig.events.borrow(),
+        [
+            "stop kbf-helper.service links=false",
+            "stop kbf-daemon.service links=false",
+            "start kbf-helper.service links=false",
+            "start kbf-daemon.service links=false",
+        ]
+    );
+    assert!(!rig.new_state_dir().join("state.json").exists());
+}
+
 /// Catches an old layout that is gone in the window (someone removed the old state): it
 /// is not "nothing to migrate" for a run that already probed releases to adopt, but a
 /// change to run again from (exit 5).

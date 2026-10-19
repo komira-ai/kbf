@@ -93,18 +93,25 @@ fn look(m: &Migration, rules: &Rules) -> Result<Look, MigrateError> {
                 .to_owned(),
         ));
     }
+    let old_tree = judge(m, &old)?;
+    Ok(Look::Old(Box::new(Seen {
+        journal,
+        old,
+        old_tree,
+    })))
+}
+
+/// Judge what was read of the old layout: no swap on trial, and the links are the ones the
+/// state names. The old tree, open, when they are.
+fn judge(m: &Migration, old: &Old) -> Result<OldTree, MigrateError> {
     if let Some(pending) = &old.state.pending_confirm {
         return Err(MigrateError::Pending {
             commit: pending.commit.to_string(),
         });
     }
     let old_tree = OldTree::open(&m.layout, &m.roots)?;
-    check_links(&old, &old_tree)?;
-    Ok(Look::Old(Box::new(Seen {
-        journal,
-        old,
-        old_tree,
-    })))
+    check_links(old, &old_tree)?;
+    Ok(old_tree)
 }
 
 /// What the plan says of the floor, the staged release and the releases found.
@@ -158,9 +165,9 @@ fn unchanged(probed: &[Option<CommitId>; 2], old: &Old) -> Result<(), MigrateErr
     Ok(())
 }
 
-/// The old layout once the services are stopped: judged like the looks before it, `current`
-/// and `previous` as probed, and the floor raised to what the old helper remembers now
-/// (a floor only goes up).
+/// The old layout once the services are stopped: read and judged like the looks before it
+/// (the journal is this run's own by now, and is not read), `current` and `previous` as
+/// probed, and the floor raised to what the old helper remembers now (a floor only goes up).
 fn settle(
     m: &Migration,
     rules: &Rules,
@@ -168,13 +175,10 @@ fn settle(
     claim: &floor::Claim,
     seeded: Seeded,
 ) -> Result<(Old, Seeded), MigrateError> {
-    let seen = match look(m, rules)? {
-        Look::Old(seen) => seen,
-        Look::Settled(_) => {
-            return Err(MigrateError::Changed("the old state is gone".to_owned()));
-        }
+    let Some(old) = old::read(&m.layout, &m.roots, rules)? else {
+        return Err(MigrateError::Changed("the old state is gone".to_owned()));
     };
-    let Seen { old, .. } = *seen;
+    judge(m, &old)?;
     unchanged(probed, &old)?;
     let floor = floor::raise(seeded.floor, floor::seed(&old.memory, claim).floor);
     Ok((old, Seeded { floor, ..seeded }))
@@ -198,6 +202,15 @@ pub fn migrate<E: Exec>(
             Look::Settled(report) => return Ok(report),
             Look::Old(seen) => seen,
         };
+        // Only the owner of the tree applies. A stranger is told so before anything is run
+        // or asked: the probe, as a user it cannot become, would end the run with its own
+        // error and hide the reason.
+        if mode == Mode::Apply && exec.euid() != m.owner_uid {
+            return Err(MigrateError::NotRoot {
+                have: exec.euid(),
+                want: m.owner_uid,
+            });
+        }
         let claim = floor::claim(&m.seed, hooks.frontend)?;
         let found = find(m, hooks, &rules, &first.old_tree, &first.old)?;
         if mode == Mode::DryRun {
@@ -218,12 +231,6 @@ pub fn migrate<E: Exec>(
         ];
         (found, probed, claim)
     };
-    if exec.euid() != m.owner_uid {
-        return Err(MigrateError::NotRoot {
-            have: exec.euid(),
-            want: m.owner_uid,
-        });
-    }
     // Both locks: no verb of the old tools is mid-way, and no run of the installer changes
     // its state while this one does. Each is waited for `m.lock_wait` and no longer (busy,
     // exit 4), the old tools' first and let go with the error.
@@ -261,6 +268,18 @@ pub fn migrate<E: Exec>(
     journal.units = m.units.clone();
     journal.helper_unit = m.helper_unit.clone();
     tree.state.put_journal(&journal)?;
+
+    // The unit files are read and judged now, before a release is copied and long before a
+    // service is stopped: a unit that is a link, that others can write or that is too big
+    // would otherwise end the run half way, with the daemon stopped, the helper disabled and
+    // the state written.
+    let backup = tree.state.unit_backup()?;
+    let units_dir = tree::open_root(&m.layout.join(&m.roots.unit_dir))
+        .map_err(MigrateError::io(m.roots.unit_dir.to_string()))?;
+    let new_bin = m.layout.current().to_string();
+    for unit in &m.units {
+        units::check(&rules, &units_dir, &backup, unit, &new_bin)?;
+    }
 
     journal.adopted.clear();
     for f in &found {
@@ -353,17 +372,8 @@ pub fn migrate<E: Exec>(
         "state.json (schema 2), helper.json (the replay floor) and status.json written",
     );
 
-    let backup = tree.state.unit_backup()?;
-    let units_dir = tree::open_root(&m.layout.join(&m.roots.unit_dir))
-        .map_err(MigrateError::io(m.roots.unit_dir.to_string()))?;
     for unit in &m.units {
-        let outcome = units::rewrite(
-            &rules,
-            &units_dir,
-            &backup,
-            unit,
-            &m.layout.current().to_string(),
-        )?;
+        let outcome = units::rewrite(&rules, &units_dir, &backup, unit, &new_bin)?;
         report.line(mode, format!("{unit}: {}", describe(outcome)));
     }
     svc.reload().map_err(MigrateError::io("daemon-reload"))?;

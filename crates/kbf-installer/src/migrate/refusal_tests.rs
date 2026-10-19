@@ -187,6 +187,104 @@ fn only_the_owner_of_the_tree_may_apply() {
     );
 }
 
+/// Catches a stranger's apply getting as far as the version probe: run by anyone but the
+/// owner of the tree it is refused (usage, exit 2) before any release is run, for the probe
+/// of a user it cannot become would end the run with its own error and hide the reason.
+///
+/// Mutant seen red: the euid check made after the probe.
+#[test]
+fn a_stranger_is_refused_before_any_release_is_run() {
+    let mut rig = Rig::linux("notroot-before-probe");
+    rig.host.euid = me() + 1;
+    let runner = runner();
+    let error =
+        run_with(&mut rig, &runner, &never(), &NoFrontend, Mode::Apply).expect_err("refused");
+    assert!(matches!(error, MigrateError::NotRoot { .. }), "{error}");
+    assert!(runner.calls().is_empty(), "no release was run");
+}
+
+/// Catches a unit file that is judged only after the services are stopped: a unit that is
+/// a link, is writable by group or other, or is over the size cap would end the run half
+/// way, the daemon stopped and the helper disabled. Each ends the run (exit 1, naming the
+/// unit) with no service touched, the installer's state not written and the links not
+/// made; a run again once the unit is right migrates.
+///
+/// Mutant seen red: the units judged only where they are rewritten.
+#[test]
+fn a_unit_that_cannot_be_judged_ends_the_run_before_a_service_is_stopped() {
+    type Spoil = fn(&Rig, &std::path::Path);
+    let cases: [(&str, Spoil); 3] = [
+        ("a link", |rig, unit| {
+            let target = rig.at("elsewhere.service");
+            put(&target, OLD_UNIT, 0o644);
+            fs::remove_file(unit).expect("remove");
+            symlink(&target, unit).expect("link");
+        }),
+        ("writable by group", |_, unit| put(unit, OLD_UNIT, 0o664)),
+        ("over the size cap", |_, unit| {
+            put(unit, &format!("{OLD_UNIT}{}", "#".repeat(70_000)), 0o644);
+        }),
+    ];
+    for (why, spoil) in cases {
+        let mut rig = Rig::linux("unit-judged-early");
+        let unit = rig.at("etc/systemd/system/kbf-daemon.service");
+        spoil(&rig, &unit);
+
+        let error = run_migrate(&mut rig, &never(), Mode::Apply).expect_err(why);
+        assert!(matches!(error, MigrateError::Tree(_)), "{why}: {error}");
+        assert!(
+            error.to_string().contains("kbf-daemon.service"),
+            "{why}: {error}"
+        );
+        assert_eq!(error.exit().code(), 1, "{why}");
+        assert!(
+            rig.events.borrow().is_empty(),
+            "{why}: a service was touched"
+        );
+        let active = rig.active.borrow().clone();
+        assert!(
+            active.contains("kbf-daemon.service") && active.contains("kbf-helper.service"),
+            "{why}: {active:?}"
+        );
+        assert!(
+            !rig.new_state_dir().join("state.json").exists(),
+            "{why}: the state was written"
+        );
+        assert!(
+            rig.at("var/lib/kbf-installer/releases/current")
+                .symlink_metadata()
+                .is_err(),
+            "{why}: the links were made"
+        );
+
+        fs::remove_file(&unit).expect("remove");
+        put(&unit, OLD_UNIT, 0o644);
+        let report = run_migrate(&mut rig, &never(), Mode::Apply).expect("a run again");
+        assert_eq!(report.outcome, Outcome::Migrated, "{why}");
+    }
+}
+
+/// Catches a hostile release writing to the operator's terminal and the logs: the commit
+/// its binary reports is shown quoted and escaped, so an escape sequence or a newline in it
+/// prints as text, and the refusal still says what the binary claimed.
+///
+/// Mutant seen red: the commit printed as it came.
+#[test]
+fn a_commit_the_binary_reports_is_shown_escaped() {
+    let mut rig = Rig::linux("mislabeled-escaped");
+    let hostile = r#"{"commit":"\u001b[2J\nfake line","min_protocol":3,"profile":"release","protocol":4,"state_schema":7,"version":"0.1.0"}"#;
+    let runner = FakeRunner::new(move |_| Ok(ran(0, hostile, "")));
+    let error =
+        run_with(&mut rig, &runner, &never(), &NoFrontend, Mode::Apply).expect_err("refused");
+    assert!(matches!(error, MigrateError::Mislabeled { .. }), "{error}");
+    let shown = error.to_string();
+    assert!(
+        !shown.contains('\u{1b}') && !shown.contains('\n'),
+        "{shown:?}"
+    );
+    assert!(shown.contains("fake line"), "{shown:?}");
+}
+
 /// Catches two managers: the installer's `state.json` beside the old state with no
 /// migration behind it is refused (the migration will not pick one), and so is a journal
 /// whose old state has gone.

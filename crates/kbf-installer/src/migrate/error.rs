@@ -30,8 +30,9 @@ pub enum MigrateError {
     /// A link of the old layout that is not `releases/<40 hex>`.
     #[error("{link} points at {target:?}, not at releases/<commit>")]
     BadLink { link: &'static str, target: String },
-    /// The directory is named for one commit and the binary in it is another.
-    #[error("releases/{dir} holds a build of {probed}: its name does not match its binary")]
+    /// The directory is named for one commit and the binary in it is another. `probed` is
+    /// text the binary printed, which nobody has vetted: it is shown quoted and escaped.
+    #[error("releases/{dir} holds a build of {probed:?}: its name does not match its binary")]
     Mislabeled { dir: String, probed: String },
     /// `--version --json` of an old release could not be had.
     #[error("{release}: the version probe failed: {why}")]
