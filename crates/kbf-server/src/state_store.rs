@@ -248,15 +248,19 @@ impl StateStoreUri {
     /// # Errors
     /// [`StateError::Open`]: as [`StateStoreUri::open`].
     pub fn open_candidate(&self) -> Result<Candidate, StateError> {
-        let Self::Sqlite(path) = self;
-        Ok(Candidate::over(open_sqlite(path)?))
+        Ok(Candidate::over(self.open_backend()?))
+    }
+
+    /// The backend's store, opened as it is: no generation taken, nothing written here.
+    fn open_backend(&self) -> Result<Arc<dyn Store>, StateError> {
+        match self {
+            Self::Sqlite(path) => open_sqlite(path),
+            Self::Postgres(url) => open_postgres(url),
+        }
     }
 
     fn open_at(&self, expect: Option<u64>, epoch: EpochPolicy) -> Result<StateStore, StateError> {
-        let inner = match self {
-            Self::Sqlite(path) => open_sqlite(path)?,
-            Self::Postgres(url) => open_postgres(url)?,
-        };
+        let inner = self.open_backend()?;
         // This process is the store's writer from here: it takes the next generation, and
         // every write through the handle is checked against it ([`Fenced`]).
         let fenced = Fenced::take(inner, expect).map_err(open_error)?;
