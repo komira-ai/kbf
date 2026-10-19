@@ -14,7 +14,7 @@ use super::*;
 /// The flags of a frontend whose worker listener serves mutual TLS (a `localhost` server
 /// certificate, clients chaining to `pki`'s CA) over a SQLite state store at `state`, and
 /// these more.
-fn tls_flags(pki: &Pki, state: &Path, more: &[String]) -> FrontendFlags {
+pub(super) fn tls_flags(pki: &Pki, state: &Path, more: &[String]) -> FrontendFlags {
     let mut params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let key = rcgen::KeyPair::generate().expect("key");
@@ -36,6 +36,11 @@ fn tls_flags(pki: &Pki, state: &Path, more: &[String]) -> FrontendFlags {
 /// A storage node's connection to the worker listener at `worker`: the certificate it
 /// presents names the role `storage` and carries exactly the DNS `names`.
 async fn storage_node(pki: &Pki, worker: SocketAddr, names: &[&str]) -> MembershipClient<Channel> {
+    MembershipClient::new(storage_channel(pki, worker, names).await)
+}
+
+/// The channel of [`storage_node`], for a caller that speaks other services on it.
+pub(super) async fn storage_channel(pki: &Pki, worker: SocketAddr, names: &[&str]) -> Channel {
     let mut params = rcgen::CertificateParams::new(
         names
             .iter()
@@ -55,18 +60,17 @@ async fn storage_node(pki: &Pki, worker: SocketAddr, names: &[&str]) -> Membersh
         .ca_certificate(Certificate::from_pem(pki.ca.pem()))
         .domain_name("localhost")
         .identity(Identity::from_pem(cert.pem(), key.serialize_pem()));
-    let channel = Endpoint::from_shared(format!("https://{worker}"))
+    Endpoint::from_shared(format!("https://{worker}"))
         .expect("endpoint")
         .tls_config(tls)
         .expect("TLS")
         .connect()
         .await
-        .expect("connect");
-    MembershipClient::new(channel)
+        .expect("connect")
 }
 
 /// A registration of the storage node `instance`, dialled at `addr`.
-fn register(instance: &str, addr: &str) -> pb::RegisterRequest {
+pub(super) fn register(instance: &str, addr: &str) -> pb::RegisterRequest {
     pb::RegisterRequest {
         role: pb::Role::Storage.into(),
         instance_id: instance.to_owned(),
@@ -77,7 +81,7 @@ fn register(instance: &str, addr: &str) -> pb::RegisterRequest {
     }
 }
 
-fn beat(joined: &pb::RegisterResponse, boot: u64) -> pb::HeartbeatRequest {
+pub(super) fn beat(joined: &pb::RegisterResponse, boot: u64) -> pb::HeartbeatRequest {
     pb::HeartbeatRequest {
         member_id: joined.member_id,
         boot,

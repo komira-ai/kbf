@@ -256,7 +256,7 @@ impl Acks {
 /// host of the address it registered, so that is the name a deny entry for the node
 /// carries; serial and key entries cannot be matched from the map and are enforced at the
 /// node's next call instead).
-fn denied(map: &Map, addr: &str) -> bool {
+pub(crate) fn denied(map: &Map, addr: &str) -> bool {
     let host = host_of(addr);
     map.denied()
         .iter()

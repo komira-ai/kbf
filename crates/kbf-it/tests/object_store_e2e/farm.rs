@@ -2,11 +2,9 @@
 //! service a farm keeps across a frontend's restart, and [`Frontend`], the processes' worth
 //! of listeners one frontend run has.
 //!
-//! **Two adapters live here because the frontend binary has neither**: [`RegistrySource`]
-//! (the `StoreConfigSource` that reads the registry and its secret file) and [`Reports`]
-//! (the `AckSource` that reads the nodes' acks). `frontend.rs` wires `NoAcks` and serves no
-//! `ColdStore` from the registry today, so a test of the whole path has to build them. They
-//! hold no logic of their own beyond reading the rows.
+//! The adapters the nodes' registration travels through are the frontend's own
+//! (`kbf_server::object_store::delivery`): this rig builds the listeners around a state
+//! store it can make fail, and nothing else of the path.
 
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
@@ -17,23 +15,22 @@ use std::time::Duration;
 
 use kbf_map::MemberState;
 use kbf_objstore::s3::fake::FakeS3;
-use kbf_proto::kbf::enroll::v1::StoreConfig;
 use kbf_server::enroll::OsRandom;
 use kbf_server::members::{Members, MembershipConfig};
 use kbf_server::members_rpc::MembershipService;
-use kbf_server::object_store::api::{AckSource, ObjectStoreApi, routes};
+use kbf_server::object_store::Registry;
+use kbf_server::object_store::api::{ObjectStoreApi, routes};
+use kbf_server::object_store::delivery::{RegistrySource, Reports};
 use kbf_server::object_store::probe::S3Probe;
-use kbf_server::object_store::{Registry, RegistryError};
 use kbf_server::proxy_auth::{ProxySecret, gate_requests};
-use kbf_server::store_config::acks::{Acks, NodeStatus as Reported};
+use kbf_server::store_config::StoreConfigSource;
+use kbf_server::store_config::acks::Acks;
 use kbf_server::store_config::service::ColdStoreService;
-use kbf_server::store_config::{Snapshot, SourceError, StoreConfigSource};
 use kbf_server::token::ApiToken;
 use kbf_server::worker_roles::WorkerRolesLayer;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 use kbf_storage::service::{Admission, ROLE_URI_PREFIX};
-use kbf_types::object_store_api::{BindingRole, MemberStanding, NodeConvergence, NodeStatus};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
@@ -162,12 +159,13 @@ impl Frontend {
             Registry::open(Arc::clone(&store), &farm.secrets(), Arc::new(OsRandom))
                 .expect("a registry"),
         );
-        let source: Arc<dyn StoreConfigSource> = Arc::new(RegistrySource(Arc::clone(&registry)));
-        let reports = Arc::new(Reports {
-            members: Arc::clone(&members),
-            acks: Arc::clone(&acks),
-            registry: Arc::clone(&registry),
-        });
+        let source: Arc<dyn StoreConfigSource> =
+            Arc::new(RegistrySource::new(Arc::clone(&registry)));
+        let reports = Arc::new(Reports::new(
+            Arc::clone(&members),
+            Arc::clone(&acks),
+            Arc::clone(&registry),
+        ));
 
         let membership = MembershipService::new(Arc::clone(&members), Admission::Certified)
             .with_store_config(Arc::clone(&source), acks)
@@ -264,108 +262,6 @@ impl Drop for Frontend {
         for done in &self.done {
             done.abort();
         }
-    }
-}
-
-/// The registry as the nodes' source: the connection the `cold` binding names, its bucket
-/// and prefix and its secret file, read as one generation.
-pub struct RegistrySource(Arc<Registry>);
-
-impl RegistrySource {
-    fn read(&self, generation: u64) -> Result<Option<StoreConfig>, RegistryError> {
-        let Some(binding) = self
-            .0
-            .bindings()?
-            .into_iter()
-            .find(|b| b.role == BindingRole::Cold)
-        else {
-            return Ok(None);
-        };
-        let connection = self
-            .0
-            .connection(&binding.connection)?
-            .ok_or(RegistryError::NoSuchConnection)?;
-        let secret = self.0.secret(&binding.connection)?;
-        Ok(Some(StoreConfig {
-            connection: connection.name.to_string(),
-            role: "cold".to_owned(),
-            endpoint: connection.endpoint,
-            region: connection.region,
-            bucket: binding.bucket,
-            prefix: binding.prefix,
-            conditional_put: connection.conditional_put,
-            min_put_rate: connection.min_put_rate.map_or(0, std::num::NonZeroU64::get),
-            access_key_id: connection.access_key_id,
-            secret_access_key: secret.expose().to_owned(),
-            secret_version: generation,
-        }))
-    }
-}
-
-impl StoreConfigSource for RegistrySource {
-    fn generation(&self) -> Result<u64, SourceError> {
-        self.0.generation().map_err(|_| SourceError::Store)
-    }
-
-    fn snapshot(&self) -> Result<Snapshot, SourceError> {
-        // The pieces are read apart: a write between them changes the generation, and the
-        // reading is made again.
-        for _ in 0..8 {
-            let before = self.generation()?;
-            let config = self.read(before).map_err(|e| match e {
-                RegistryError::Secret(_) => SourceError::SecretUnavailable,
-                _ => SourceError::Store,
-            })?;
-            if self.generation()? == before {
-                return Ok(Snapshot {
-                    generation: if config.is_some() { before } else { 0 },
-                    config,
-                });
-            }
-        }
-        Err(SourceError::Store)
-    }
-}
-
-/// The nodes' acks as the operator API reads them: the members of the map, named by the
-/// address they registered, with what they last reported.
-pub struct Reports {
-    members: Arc<Members>,
-    acks: Arc<Acks>,
-    registry: Arc<Registry>,
-}
-
-impl AckSource for Reports {
-    fn nodes(&self) -> Vec<NodeConvergence> {
-        let Some(map) = self.members.refresh().ok().flatten() else {
-            return Vec::new();
-        };
-        let generation = self.registry.generation().unwrap_or(0);
-        let Ok(got) = self.acks.convergence(&map, generation) else {
-            return Vec::new();
-        };
-        got.nodes
-            .iter()
-            .filter_map(|ack| {
-                let member = map.members().iter().find(|m| m.id == ack.member)?;
-                Some(NodeConvergence {
-                    id: member.addr.clone(),
-                    state: match ack.state {
-                        MemberState::Draining => MemberStanding::Draining,
-                        _ => MemberStanding::Active,
-                    },
-                    applied_generation: ack.applied_generation,
-                    status: match ack.status {
-                        Reported::Ok => NodeStatus::Ok,
-                        Reported::Pending => NodeStatus::Pending,
-                        Reported::ProbeFailed => NodeStatus::ProbeFailed,
-                        Reported::IdentityMismatch => NodeStatus::IdentityMismatch,
-                        Reported::Unsupported => NodeStatus::Unsupported,
-                    },
-                    last_seen_secs: ack.last_seen.map(|d| d.as_secs()),
-                })
-            })
-            .collect()
     }
 }
 

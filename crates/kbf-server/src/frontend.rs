@@ -112,12 +112,14 @@ use crate::handover::{
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::listen::{Binder, Socket};
 use crate::members::Members;
+use crate::object_store::delivery::{Delivery, RegistrySource, Reports};
 use crate::proxy_auth::ProxyAuthLayer;
 use crate::serve::{
-    AbortOnDrop, ServeError, drain_and_stop, flow_control, keepalive, log_state, map_of,
-    members_of, membership, serve_api, stop_api, sweeping, worker_peers,
+    AbortOnDrop, ServeError, cold_store, drain_and_stop, flow_control, keepalive, log_state,
+    map_of, members_of, membership, serve_api, stop_api, sweeping, worker_peers,
 };
 use crate::start::{Escalation, escalating, interruptions};
+use crate::store_config::acks::Acks;
 use crate::worker::WorkerService;
 use crate::{Args, ConfigError, SERVER_VERSION, sizes_on};
 
@@ -1014,8 +1016,9 @@ impl<'a> Prepared<'a> {
         let object_stores = flags
             .object_store_secrets_dir
             .as_deref()
-            .map(|dir| open_object_stores(dir, state_store.clone()))
+            .map(|dir| open_object_stores(dir, state_store.clone().zip(members.clone())))
             .transpose()?;
+        let delivery = object_stores.as_ref().map(|stores| stores.delivery.clone());
         let offers = crate::release::offers::offers_of(
             releases.clone(),
             update_rows.clone(),
@@ -1035,7 +1038,7 @@ impl<'a> Prepared<'a> {
         .merge(crate::release::router(releases.clone(), token.clone()))
         .merge(crate::object_store::api::routes(
             token.clone(),
-            object_stores,
+            object_stores.map(|stores| stores.api),
         ))
         .merge(crate::update_hosts::router(
             Arc::clone(&farm),
@@ -1066,7 +1069,8 @@ impl<'a> Prepared<'a> {
             listeners.streams,
         )
         .layer(ProxyAuthLayer::new(proxy_secret.clone()));
-        let membership = membership(members.clone(), &peers);
+        let membership = membership(members.clone(), &peers, delivery.as_ref());
+        let cold_store = cold_store(members.clone(), &peers, delivery.as_ref());
         let sessions = WorkerService::new(
             Arc::clone(&farm),
             peers,
@@ -1199,6 +1203,7 @@ impl<'a> Prepared<'a> {
                 .add_service(worker_service)
                 .add_service(crate::release::service(releases))
                 .add_optional_service(membership)
+                .add_optional_service(cold_store)
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
             // Told when the REAPI listener is done (see `serve::stop_api`).
             let (api_stop_when_done, api_stopped) = tokio::sync::oneshot::channel::<()>();
@@ -1311,25 +1316,45 @@ fn dial_of(flags: &FrontendFlags) -> Result<crate::handover::Dial, ConfigError> 
     }))
 }
 
-/// The store `/readyz` probes: the open state store's, if there is one.
-/// The object-store registration API over the state store, with secret files in `dir`
-/// (`--object-store-secrets-dir`). No node reports yet, so every convergence is `false`.
-fn open_object_stores(
-    dir: &Path,
-    state: Option<Arc<dyn kbf_state::Store>>,
-) -> Result<Arc<crate::object_store::api::ObjectStoreApi>, Box<dyn Error>> {
-    let store = state.ok_or("--object-store-secrets-dir needs --state-store")?;
-    let runtime = tokio::runtime::Handle::try_current()?;
-    crate::object_store::api::ObjectStoreApi::open(
-        store,
-        dir,
-        runtime,
-        Arc::new(crate::object_store::api::NoAcks),
-    )
-    .map(Arc::new)
-    .map_err(|e| format!("--object-store-secrets-dir {}: {e}", dir.display()).into())
+/// What `--object-store-secrets-dir` turns on: the operator routes, and what the worker
+/// listener serves from the same registry.
+struct ObjectStores {
+    api: Arc<crate::object_store::api::ObjectStoreApi>,
+    delivery: Delivery,
 }
 
+/// The object-store registration over the state store, with secret files in `dir`
+/// (`--object-store-secrets-dir`): the operator API; the source `Membership` announces the
+/// generation from and `ColdStore` answers from; and the acks the nodes' heartbeats leave,
+/// which the API's convergence reads.
+fn open_object_stores(
+    dir: &Path,
+    state: Option<(Arc<dyn kbf_state::Store>, Arc<Members>)>,
+) -> Result<ObjectStores, Box<dyn Error>> {
+    let (store, members) = state.ok_or("--object-store-secrets-dir needs --state-store")?;
+    let runtime = tokio::runtime::Handle::try_current()?;
+    let registry = crate::object_store::Registry::open(
+        Arc::clone(&store),
+        dir,
+        Arc::new(crate::enroll::OsRandom),
+    )
+    .map(Arc::new)
+    .map_err(|e| format!("--object-store-secrets-dir {}: {e}", dir.display()))?;
+    let acks = Arc::new(Acks::new(store));
+    let reports = Reports::new(members, Arc::clone(&acks), Arc::clone(&registry));
+    let delivery = Delivery {
+        source: Arc::new(RegistrySource::new(Arc::clone(&registry))),
+        acks,
+    };
+    let probe = Arc::new(crate::object_store::probe::S3Probe::new(runtime));
+    let api = crate::object_store::api::ObjectStoreApi::new(registry, probe, Arc::new(reports));
+    Ok(ObjectStores {
+        api: Arc::new(api),
+        delivery,
+    })
+}
+
+/// The store `/readyz` probes: the open state store's, if there is one.
 fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Store>> {
     state.map(|state| Arc::clone(&state.store))
 }

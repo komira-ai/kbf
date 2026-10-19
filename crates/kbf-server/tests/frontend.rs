@@ -18,6 +18,9 @@ mod managed;
 #[path = "frontend/membership_tls.rs"]
 mod membership_tls;
 
+#[path = "frontend/object_stores.rs"]
+mod object_stores;
+
 #[path = "frontend/proxy_auth.rs"]
 mod proxy_auth;
 
