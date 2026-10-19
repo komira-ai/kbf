@@ -156,7 +156,7 @@ fn derived_service(layout: &Layout, platform: Platform) -> Result<ServiceArgs, F
     }
     let unit = host_mode::mode_unit(layout).map_err(|why| {
         usage(format!(
-            "run needs --unit, or a kbf.toml that names the mode: {why}"
+            "run needs --unit (or run setup, which writes the kbf.toml that names the mode): {why}"
         ))
     })?;
     Ok(ServiceArgs {

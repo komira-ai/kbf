@@ -709,7 +709,8 @@ fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
 /// mode kbf does not offer (`node`), or a Mac without a label each end it with exit 2 and the
 /// reason, before any pass.
 ///
-/// Mutants planted: the platform check dropped; the unknown mode mapped to a default unit.
+/// Mutants planted: the platform check dropped; the unknown mode mapped to a default unit; a
+/// missing, unparseable, unreadable or mode-less kbf.toml mapped to a default unit.
 #[test]
 fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
     let (layout, root) = seeded("run-no-unit");
@@ -721,10 +722,34 @@ fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
     assert_eq!(missing.exit, Exit::Usage);
     assert!(missing.why.contains("--unit"), "{}", missing.why);
     assert!(missing.why.contains("is not there"), "{}", missing.why);
+    assert!(missing.why.contains("run setup"), "{}", missing.why);
+    // Every refusal names the file, says what to do and is a usage exit: no panic, no default.
+    let named = |f: &Failure, reason: &str| {
+        assert_eq!(f.exit, Exit::Usage, "{reason}: {}", f.why);
+        assert!(f.why.contains("/etc/kbf/kbf.toml"), "{reason}: {}", f.why);
+        assert!(f.why.contains("--unit"), "{reason}: {}", f.why);
+        assert!(f.why.contains("run setup"), "{reason}: {}", f.why);
+        assert!(f.why.contains(reason), "{reason}: {}", f.why);
+    };
+    named(&missing, "is not there");
     write_kbf_toml(&root, "other = 1\n");
-    assert!(refused(&root).why.contains("has no mode"));
+    named(&refused(&root), "has no mode");
+    write_kbf_toml(&root, "mode = 3\n");
+    named(&refused(&root), "has no mode");
+    write_kbf_toml(&root, "mode = [unclosed\n");
+    named(&refused(&root), "is not TOML");
+    fs::write(root.join("etc/kbf/kbf.toml"), [0xff, 0xfe]).expect("bytes");
+    named(&refused(&root), "is not UTF-8");
+    fs::write(root.join("etc/kbf/kbf.toml"), vec![b'#'; (1 << 20) + 1]).expect("big");
+    named(&refused(&root), "is over");
+    fs::remove_file(root.join("etc/kbf/kbf.toml")).expect("rm");
+    fs::create_dir(root.join("etc/kbf/kbf.toml")).expect("dir");
+    named(&refused(&root), "cannot be read");
+    fs::remove_dir(root.join("etc/kbf/kbf.toml")).expect("rmdir");
     write_kbf_toml(&root, "mode = \"node\"\n");
-    assert!(refused(&root).why.contains("no mode of kbf"));
+    named(&refused(&root), "no mode of kbf");
+    write_kbf_toml(&root, "mode = \"\"\n");
+    named(&refused(&root), "no mode of kbf");
     write_kbf_toml(&root, "mode = \"daemon\"\n");
     let mac = derived_service(&layout, Platform::MacOs)
         .err()

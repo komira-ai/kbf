@@ -29,7 +29,19 @@ pub fn mode_unit(layout: &Layout) -> Result<&'static str, String> {
     let shown = layout.kbf_toml();
     let known = crate::cli::Mode::from_str(&mode, false)
         .map_err(|_| format!("{shown} mode is {mode:?}, which is no mode of kbf"))?;
-    Ok(crate::setup::plan::mode_units(known)[0])
+    first_unit(&shown, &mode, crate::setup::plan::mode_units(known))
+}
+
+/// The first of the `units` a mode is run by; why not when the mode has none.
+fn first_unit(
+    shown: &impl std::fmt::Display,
+    mode: &str,
+    units: &'static [&'static str],
+) -> Result<&'static str, String> {
+    units
+        .first()
+        .copied()
+        .ok_or_else(|| format!("{shown} mode {mode:?} has no unit to restart"))
 }
 
 /// The top-level `mode` of the host's `kbf.toml`; why not when there is none.
@@ -53,5 +65,25 @@ fn read_mode(layout: &Layout) -> Result<String, String> {
     match table.get("mode").and_then(toml::Value::as_str) {
         Some(mode) => Ok(mode.to_owned()),
         None => Err(format!("{shown} has no mode")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_unit;
+
+    /// Catches a mode whose unit list is empty panicking `run` (or being given a default unit)
+    /// instead of being refused with the file and the mode named.
+    ///
+    /// Mutant planted: an empty list answered with a fixed unit.
+    #[test]
+    fn a_mode_with_no_unit_is_refused_naming_the_file_and_the_mode() {
+        let why = first_unit(&"/etc/kbf/kbf.toml", "storage", &[]).expect_err("no unit");
+        assert!(why.contains("/etc/kbf/kbf.toml"), "{why}");
+        assert!(why.contains("\"storage\""), "{why}");
+        assert_eq!(
+            first_unit(&"/etc/kbf/kbf.toml", "storage", &["a.service", "b.service"]),
+            Ok("a.service")
+        );
     }
 }
