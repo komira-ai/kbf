@@ -353,11 +353,10 @@ fn the_postgres_seam_makes_a_runner_without_a_server_and_never_quotes_the_url() 
 }
 
 /// Catches `kbf.toml` writing over settings it cannot see once it carries `state-store`: a
-/// file with other `[scheduler]` keys is left as it is when `state-store` matches, and when it
-/// differs the key is set from the flag with the other keys kept, the key named and its value
-/// (a database URL) never.
+/// file with other `[scheduler]` keys is the operator's, kept when `state-store` matches and
+/// refused (naming the key) when it differs.
 #[test]
-fn another_scheduler_key_survives_a_changed_state_store() {
+fn another_scheduler_key_makes_the_file_the_operators() {
     use crate::setup::kbf_toml::{Decision, Ours, decide};
     let ours = Ours {
         mode: "frontend",
@@ -371,20 +370,12 @@ fn another_scheduler_key_survives_a_changed_state_store() {
     let theirs = format!(
         "mode = \"frontend\"\n[scheduler]\nstate-store = \"{DATABASE}\"\nheartbeat-interval-ms = 500\n"
     );
-    assert_eq!(
-        decide(Some(&theirs), &ours),
-        Decision::Write {
-            text: theirs.clone(),
-            changed: Vec::new()
-        }
-    );
+    assert_eq!(decide(Some(&theirs), &ours), Decision::Keep);
     let other = theirs.replace(DATABASE, "postgres:///other?host=/run/postgresql");
-    let Decision::Write { text, changed } = decide(Some(&other), &ours) else {
-        panic!("rewritten");
+    let Decision::Refuse(why) = decide(Some(&other), &ours) else {
+        panic!("refused");
     };
-    assert_eq!(changed, ["[scheduler] state-store"]);
-    assert!(text.contains(&format!("state-store = \"{DATABASE}\"")), "{text}");
-    assert!(text.contains("heartbeat-interval-ms = 500"), "{text}");
+    assert!(why.contains("[scheduler] state-store"), "{why}");
 }
 
 /// `url` without the password of its `user:password@` part (the user stays). `setup` refuses
@@ -539,10 +530,9 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
         takes: Vec::new(),
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = \"postgres:///other?host=/run/postgresql\"\nheartbeat-interval-ms = 500\n";
-    let Decision::Write { changed, .. } = decide(Some(theirs), &ours) else {
-        panic!("rewritten");
+    let Decision::Refuse(why) = decide(Some(theirs), &ours) else {
+        panic!("refused");
     };
-    let why = changed.join(", ");
     assert!(why.contains("[scheduler] state-store"), "{why}");
     assert!(
         !why.contains("postgres:") && !why.contains("run/postgresql"),
