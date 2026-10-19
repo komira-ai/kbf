@@ -352,3 +352,59 @@ fn a_refusal_never_repeats_the_text_that_may_hold_a_password() {
         "{found}"
     );
 }
+
+/// Catches a value typed into the wrong place reaching a message: the URL is planted as a
+/// key, a table header, a value of the wrong type and a value of a key that checks it, and
+/// neither `Display` nor `Debug` of the error may hold it. (`PW` is the password.)
+///
+/// Mutants to plant: `redact` returning the message as it came; a `{v:?}`, `{r:?}` or
+/// `{other:?}` back in the key checks.
+#[test]
+fn a_value_in_the_wrong_place_is_never_repeated() {
+    const URL: &str = "postgres://u:PW@h/x";
+    for text in [
+        format!("\"{URL}\" = 1\n"),
+        format!("[\"{URL}\"]\n"),
+        format!("confirm_window_s = \"{URL}\"\n"),
+        format!("source_refs = [\"{URL}\"]\n"),
+        format!("release_source = \"{URL}\"\n"),
+        format!("node_cert = \"{URL}\"\nnode_key = \"{URL}\"\n"),
+        format!("database = [\"{URL}\"]\n"),
+        format!("database = {URL}\n"),
+    ] {
+        let err = InstallerToml::parse(&text).expect_err("refused");
+        let shown = format!("{err} {err:?}");
+        assert!(
+            !shown.contains("PW") && !shown.contains("postgres:"),
+            "{text:?}: {shown}"
+        );
+    }
+    // The URL schemes the check meets before it knows the URL is not https.
+    for url in [
+        "http://u:PW@h/x",
+        "HTTPS://u:PW@h/x",
+        "postgres://u:PW@h/x",
+        "http://h/x?token=PW",
+    ] {
+        let found = url_problem(url);
+        assert!(!found.contains("PW"), "{url}: {found}");
+        for label in ["--release-url", "--frontend-url"] {
+            let found = https_base_named(label, url).expect_err("refused");
+            assert!(!found.contains("PW") && found.starts_with(label), "{found}");
+        }
+    }
+}
+
+/// Catches the line number counted from the end of the error's span instead of its start, and
+/// the arm for an error with no span (a `custom` one) going unrun.
+#[test]
+fn a_syntax_error_names_the_line_it_starts_on() {
+    let text = "confirm_window_s = 900\nfetch_timeout_s = [\n1,\n2\n]\n";
+    let found = problems(text);
+    assert!(found.contains("line 2:"), "{found}");
+    let custom = <toml::de::Error as serde::de::Error>::custom("a reason `with text`");
+    assert_eq!(
+        syntax_line("x", &custom),
+        "a reason (the text is not shown)"
+    );
+}

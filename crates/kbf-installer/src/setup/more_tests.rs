@@ -535,3 +535,37 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
         "{why}"
     );
 }
+
+/// Catches the refusal of an invalid `kbf.toml` repeating the line the parser objected to (the
+/// state-store URL typed unquoted, with its password), and `database.rs` carrying the parser's
+/// text for a file that is not TOML.
+///
+/// Mutants to plant: `redact` left out of the `kbf.toml` refusal (`e` printed); the toml text in
+/// `DatabaseError::NotToml`.
+#[test]
+fn an_invalid_config_file_is_refused_without_its_text() {
+    use crate::setup::kbf_toml::{Decision, Ours, decide};
+    let ours = Ours {
+        mode: "frontend",
+        frontend_url: None,
+        token_file: None,
+        api_token_file: None,
+        state_store: Some(DATABASE),
+    };
+    let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = postgres://u:PW@h/x\n";
+    let Decision::Refuse(why) = decide(Some(theirs), &ours) else {
+        panic!("refused");
+    };
+    assert!(why.contains("not valid TOML"), "{why}");
+    assert!(!why.contains("PW") && !why.contains("postgres:"), "{why}");
+
+    let (exec, _) = scratch("not-toml");
+    let path = exec.root.join("installer.toml");
+    std::fs::write(&path, "database = postgres://u:PW@h/x\n").expect("write");
+    let err = crate::database::Database::from_installer_toml(&path).expect_err("not toml");
+    let shown = format!("{err} {err:?}");
+    assert!(
+        !shown.contains("PW") && !shown.contains("postgres:"),
+        "{shown}"
+    );
+}
