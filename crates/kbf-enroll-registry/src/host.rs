@@ -25,6 +25,14 @@ fn is_dns_name(text: &str) -> bool {
             .is_some_and(|last| last.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// The one spelling of a `host:port` that enrollment stores, a member registers and the
+/// update controller compares: ASCII lower case (a host is a DNS name or an IP address, and
+/// neither is case-sensitive). Nothing else is touched: no trimming, no port guessing.
+#[must_use]
+pub fn canonical_addr(text: &str) -> String {
+    text.to_ascii_lowercase()
+}
+
 /// Whether `text` is an IP address or a lower-case DNS name.
 pub(crate) fn is_host(text: &str) -> bool {
     text.parse::<IpAddr>().is_ok() || is_dns_name(text)

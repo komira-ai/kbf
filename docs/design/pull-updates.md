@@ -293,6 +293,11 @@ mark is `Members::plan_down` and its undoing `Members::undo_plan`; a host that m
 never started. **Not yet:** no operator action starts a run with `auto_nodes` written off.
 `GET /v1/nodes` lists `update` per node and `GET /v1/update/hosts` its detail (`docs/api.md`).
 
+**Mixed versions.** `auto_nodes` is a plain bool in the `update/policy` row, so a row that does not
+carry it reads false; a policy row that was never written reads as the defaults, true. An old frontend's
+`set_paused` on a never-written row stores a row without `auto_nodes`, so a new frontend reads `auto_nodes`
+off after the resume until an operator writes `true`.
+
 After `Welcome`, and to every connected node at every change of the desired release or of a platform's
 completeness, the frontend sends an `UpdateOffer` for that node's platform. `UpdateStatus` is kept as the newest per
 node and ignored from a replaced stream, exactly as `NodeStatus` is.

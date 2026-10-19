@@ -170,7 +170,7 @@ fn advertise_of(roles: RoleSet, text: &str) -> Result<Option<String>, Fail> {
             Err(RefusalReason::MalformedRequest.into())
         };
     }
-    let text = text.to_ascii_lowercase();
+    let text = crate::host::canonical_addr(text);
     let well_formed = text
         .rsplit_once(':')
         .is_some_and(|(host, port)| is_host(host) && port.parse::<u16>().is_ok_and(|p| p > 0));

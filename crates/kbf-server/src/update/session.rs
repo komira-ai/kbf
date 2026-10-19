@@ -382,9 +382,10 @@ enum Link<'a> {
     Unlinked(String),
 }
 
-/// The member whose registered address is, byte for byte, the address `host` advertised when
-/// it enrolled (`adverts`: node id to address). No prefix, no case folding, no port
-/// guessing: an address that is not exactly a member's links nothing.
+/// The member whose registered address is the address `host` advertised when it enrolled
+/// (`adverts`: node id to address), both read through [`kbf_enroll_registry::canonical_addr`],
+/// the one spelling enrollment stores and a member registers. No prefix, no port guessing: an
+/// address that is not a member's links nothing.
 fn link<'a>(
     host: &WorkerId,
     adverts: &BTreeMap<String, String>,
@@ -398,7 +399,11 @@ fn link<'a>(
     if advertised.is_empty() {
         return Link::NoStorage;
     }
-    let mut matching = members.members.iter().filter(|m| m.addr == *advertised);
+    let advertised = &kbf_enroll_registry::canonical_addr(advertised);
+    let mut matching = members
+        .members
+        .iter()
+        .filter(|m| kbf_enroll_registry::canonical_addr(&m.addr) == *advertised);
     match (matching.next(), matching.next()) {
         (Some(only), None) => Link::Member(only),
         (None, _) => Link::Unlinked(format!(

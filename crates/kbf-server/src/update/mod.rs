@@ -39,7 +39,7 @@
 //! (`session`), and [`spawn_controller`] runs the controller where the frontend starts,
 //! starting hosts unless an operator wrote `update/policy.auto_nodes` false or paused the run.
 //! A Linux host is joined to its storage member by the address it advertised at enrollment,
-//! matched exactly; a host that matches no member is never started and `FarmFacts::unlinked`
+//! matched on its lower-cased spelling; a host that matches no member is never started and `FarmFacts::unlinked`
 //! says why.
 
 mod codec;
