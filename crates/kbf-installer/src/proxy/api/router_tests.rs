@@ -1,6 +1,6 @@
 //! The routes, through the actor, with the real bearer check.
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -13,7 +13,7 @@ use super::fakes::{COMMIT_C, FakeClock, FakeForwarder, FakeTokens, Rig, TOKEN, a
 use super::model::OldChild;
 use super::router::{MAX_BODY, Router};
 use super::traits::{Compat, InstallerState, InstallerStatus};
-use crate::proxy::model::Phase;
+use crate::proxy::model::{Phase, Verb};
 use crate::testkit::{A, B};
 
 struct Harness {
@@ -220,7 +220,7 @@ async fn a_refused_staging_shows_as_failed_through_get() {
     h.rig.set_status(InstallerStatus {
         state: InstallerState::Refused,
         refusal: "attestation: not attested".to_owned(),
-        acked_order_id: 101,
+        refused_order_id: Some(101),
         ..idle()
     });
     let (s, v) = send(&h, Method::GET, U, Value::Null).await;
@@ -231,6 +231,28 @@ async fn a_refused_staging_shows_as_failed_through_get() {
         json!({"step": "verify", "reason": "attestation"})
     );
     assert_eq!(h.rig.sup.starts(), 0);
+}
+
+#[tokio::test]
+async fn an_update_not_staged_in_time_shows_as_failed_through_get() {
+    let h = harness("u8b8-r-timeout", quick());
+    send(&h, Method::POST, U, post_body(B, "r1")).await;
+    h.rig.clock.0.store(900_000, Ordering::SeqCst);
+    let (s, v) = send(&h, Method::GET, U, Value::Null).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["phase"], "failed");
+    assert_eq!(v["failure"], json!({"step": "stage", "reason": "timeout"}));
+    assert_eq!(h.rig.sup.starts(), 0);
+    let verbs: Vec<_> = h
+        .rig
+        .orders
+        .written
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|l| l.verb)
+        .collect();
+    assert_eq!(verbs, vec![Verb::FrontendUpdate, Verb::Revert]);
 }
 
 #[tokio::test]
