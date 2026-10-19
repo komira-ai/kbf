@@ -34,7 +34,8 @@
 //!   [`model::Start`]); an all-in-one host starts the new process, and the old release put
 //!   back after a failed start, to serve at once, because no takeover is ever sent there.
 //! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); open
-//!   executions and queued operations from the child ([`ports::ChildAdmin::open_counts`]).
+//!   streams and open worker sessions from the child's admin role view
+//!   ([`ports::ChildAdmin::open_counts`]); queued operations do not gate retire.
 //! - **Migration** (open): who runs the forward Postgres migration, and with which
 //!   credential, is undecided; the swap only calls [`ports::Migrator::migrate_forward`]
 //!   before the candidate starts. For an all-in-one host it runs after the old process

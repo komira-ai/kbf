@@ -14,10 +14,6 @@ use crate::probe::Readiness;
 use crate::security::Security;
 use crate::slot::{ActiveSlot, Slot};
 
-/// The streams one downstream connection may have open at once. The connection window is this
-/// many stream windows, so no set of held bodies can use it up (design note section 4).
-pub(crate) const DOWNSTREAM_CONNECTION_STREAMS: u32 = 1000;
-
 /// The clock every stream reads. It is tokio's, so a test under paused time moves it; the
 /// hold queue takes `std` instants, which tokio's convert to and from exactly.
 pub(crate) fn now() -> Instant {

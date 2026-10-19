@@ -27,16 +27,22 @@ use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_proto::reapi::FindMissingBlobsRequest;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
+use kbf_proto::update::release_service_client::ReleaseServiceClient;
+use kbf_proto::update::{DescribeRequest, FetchRequest};
 use kbf_proto::worker::{
     Capability, DaemonMessage, Hello, ServerMessage, daemon_message, server_message,
     worker_client::WorkerClient,
 };
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
+use kbf_server::release::{Commit, Component, Key, Limits, ReleaseStore};
 use kbf_server::worker_roles::{WORKER_LISTENER_ROLES, WorkerRolesLayer, admit, roles_for};
-use kbf_server::{DenyList, EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
+use kbf_server::{
+    Api, DenyList, EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state,
+};
 use kbf_state::Store;
 use kbf_storage::service::{Admission, PeerRole, ROLE_URI_PREFIX};
 use kbf_tls::TlsSource;
+use kbf_types::ReleasePlatform;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType, SerialNumber,
@@ -54,10 +60,12 @@ const SESSION: &str = "/kbf.worker.v1.Worker/Session";
 const REGISTER: &str = "/kbf.map.v1.Membership/Register";
 const HEARTBEAT: &str = "/kbf.map.v1.Membership/Heartbeat";
 const GET_STORE_CONFIG: &str = "/kbf.enroll.v1.ColdStore/GetStoreConfig";
+const FETCH: &str = "/kbf.update.v1.ReleaseService/Fetch";
+const DESCRIBE: &str = "/kbf.update.v1.ReleaseService/Describe";
 
 /// Every method the worker listener serves and the one role that may call it, spelled
 /// out here and not read from the table.
-const EXPECTED: [(&str, PeerRole); 21] = {
+const EXPECTED: [(&str, PeerRole); 22] = {
     use PeerRole::{Daemon, Storage};
     [
         (SESSION, Daemon),
@@ -96,7 +104,8 @@ const EXPECTED: [(&str, PeerRole); 21] = {
             "/build.bazel.remote.execution.v2.ContentAddressableStorage/RegisterChunkMapping",
             Daemon,
         ),
-        ("/kbf.update.v1.ReleaseService/Fetch", PeerRole::Daemon),
+        (FETCH, PeerRole::Daemon),
+        (DESCRIBE, PeerRole::Daemon),
         ("/kbf.worker.v1.Segments/Begin", Daemon),
         ("/kbf.worker.v1.Segments/PutRange", Daemon),
         ("/kbf.worker.v1.Segments/Commit", Daemon),
@@ -296,6 +305,15 @@ async fn the_layer_answers_a_refusal_itself_and_passes_an_admitted_call_on() {
     let refused = through(certified, &inner, SESSION).await;
     let status = Status::from_header_map(refused.headers()).expect("a gRPC status");
     assert_eq!(status.code(), Code::Unauthenticated);
+    assert_eq!(inner.0.load(Ordering::SeqCst), 0);
+
+    // The release service's two methods are refused alike when no certificate is there.
+    for path in [FETCH, DESCRIBE] {
+        let refused = through(certified, &inner, path).await;
+        let status = Status::from_header_map(refused.headers()).expect("a gRPC status");
+        assert_eq!(status.code(), Code::Unauthenticated, "{path}");
+        assert_eq!(status.message(), "no client certificate", "{path}");
+    }
     assert_eq!(inner.0.load(Ordering::SeqCst), 0);
 
     let served = through(open, &inner, REGISTER).await;
@@ -1045,4 +1063,147 @@ async fn an_unusable_deny_list_refuses_membership_calls_unavailable() {
     node.heartbeat(beat)
         .await
         .expect("the fixed list admits it");
+}
+
+/// A directory for one test's release store, removed when it is dropped.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("worker-roles-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("directory");
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// [`frontend`] with the release store `store` mounted, as `--releases-dir` does, so the
+/// worker listener serves `ReleaseService`.
+fn frontend_releasing(worker_tls: Option<WorkerTls>, store: Arc<ReleaseStore>) -> SocketAddr {
+    let api = Api {
+        listen: "127.0.0.1:0".parse().expect("addr"),
+        token: None,
+        local_cache: None,
+        releases: Some(store),
+    };
+    let bound = bind_server_with_state(
+        Arc::new(Cache::memory()),
+        listeners(worker_tls),
+        Some(api),
+        kbf_auth::Policy::allow_all(),
+        None,
+        std::future::pending::<()>(),
+    )
+    .expect("binds");
+    let worker = bound.worker;
+    tokio::spawn(bound.serving);
+    worker
+}
+
+/// Stores the `linux-x86_64` release of `COMMIT` (its `kbf` tarball and attestation) and
+/// returns the tarball's digest.
+async fn store_a_release(store: &ReleaseStore) -> String {
+    let key = Key {
+        commit: Commit::parse(COMMIT).expect("a commit"),
+        platform: ReleasePlatform::LinuxX86_64,
+        component: Component::Kbf,
+    };
+    let body = |bytes: &'static [u8]| {
+        futures::stream::iter(vec![Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(bytes),
+        )])
+    };
+    let stored = store
+        .put_tarball(&key, &mut body(b"a tarball"))
+        .await
+        .expect("tarball");
+    store
+        .put_attestation(&key, &mut body(b"a bundle"))
+        .await
+        .expect("attestation");
+    stored.sha256.to_string()
+}
+
+/// Catches `Describe` served to a caller `Fetch` refuses, or refused to one it serves: on
+/// the live worker listener under mutual TLS, a daemon certificate has its release
+/// described and fetched; a storage and a frontend certificate are refused both calls
+/// PERMISSION_DENIED by the table, saying it takes the daemon role; a caller with no
+/// certificate has both calls fail at the transport, the handshake being refused.
+///
+/// Mutants seen red: the `Describe` row left out of the table (a daemon is refused
+/// "not served"); the row given every role (the storage certificate is described).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_is_a_daemon_call_as_fetch_is() {
+    let pki = Pki::new();
+    let scratch = Scratch::new("describe");
+    let store = Arc::new(ReleaseStore::open(&scratch.0, Limits::default()).expect("a store"));
+    let digest = store_a_release(&store).await;
+    let worker = frontend_releasing(Some(pki.worker_tls()), store);
+    let describe = || DescribeRequest {
+        commit: COMMIT.to_owned(),
+        platform: String::new(),
+    };
+    let fetch = || FetchRequest {
+        sha256: digest.clone(),
+    };
+
+    let mut daemon = ReleaseServiceClient::new(pki.channel(worker, PeerRole::Daemon).await);
+    let described = daemon
+        .describe(describe())
+        .await
+        .expect("a daemon certificate is described to")
+        .into_inner();
+    assert_eq!(described.commit, COMMIT);
+    assert_eq!(described.components.len(), 1);
+    assert_eq!(described.components[0].sha256, digest);
+    daemon
+        .fetch(fetch())
+        .await
+        .expect("a daemon certificate fetches");
+
+    for who in [PeerRole::Storage, PeerRole::Frontend] {
+        let mut client = ReleaseServiceClient::new(pki.channel(worker, who).await);
+        let described = client.describe(describe()).await.expect_err("refused");
+        assert_eq!(described.code(), Code::PermissionDenied, "{who}");
+        assert_eq!(
+            described.message(),
+            refusal(who, DESCRIBE, PeerRole::Daemon)
+        );
+        let fetched = client.fetch(fetch()).await.expect_err("refused");
+        assert_eq!(fetched.code(), Code::PermissionDenied, "{who}");
+        assert_eq!(fetched.message(), refusal(who, FETCH, PeerRole::Daemon));
+    }
+
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(pki.ca.pem()))
+        .domain_name("localhost");
+    let anonymous = Endpoint::from_shared(format!("https://{worker}"))
+        .expect("endpoint")
+        .tls_config(tls)
+        .expect("TLS")
+        .connect()
+        .await;
+    // Under mutual TLS a caller with no certificate never reaches the table: the server
+    // ends the handshake, so the connection is refused or each call fails at the transport
+    // (a status of the client's own, which differs between a unary and a streaming call),
+    // `Describe` as `Fetch`. The table's UNAUTHENTICATED for a call that arrives without
+    // one is pinned by the layer test above.
+    if let Ok(channel) = anonymous {
+        let mut client = ReleaseServiceClient::new(channel);
+        let described = client.describe(describe()).await.expect_err("refused");
+        let fetched = client.fetch(fetch()).await.expect_err("refused");
+        let transport = [Code::Unknown, Code::Cancelled, Code::Unavailable];
+        for status in [described, fetched] {
+            assert!(transport.contains(&status.code()), "{status:?}");
+            assert!(!status.message().contains("role"), "{status:?}");
+        }
+    }
 }
