@@ -271,6 +271,28 @@ fn a_confirm_is_refused_while_a_node_swap_is_on_trial_and_the_swap_s_own_confirm
     );
 }
 
+/// Catches a node's revert taken for the proxy's on a frontend host: with B on trial (a node
+/// swap), a `revert` naming B is the swap's own and goes back to A, restarting the unit; a
+/// `revert` naming another commit is the proxy's and leaves the trial alone.
+///
+/// Mutant planted: `kind_of` ignoring the release on trial for a revert (B's revert drops a
+/// staging that is not there and the trial stays).
+#[test]
+fn on_a_frontend_host_a_revert_naming_the_release_on_trial_is_the_node_s() {
+    let mut rig = Rig::frontend("revert-trial");
+    rig.order(1, Verb::Activate, B);
+    rig.cycle(T0);
+    rig.order(2, Verb::Revert, C);
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.current(), Some(c(B)), "C is not what is on trial");
+    assert!(rig.state().pending_confirm.is_some());
+    rig.order(3, Verb::Revert, B);
+    rig.cycle(T0 + 6);
+    assert_eq!(rig.current(), Some(c(A)), "{}", rig.refusal());
+    assert_eq!(rig.state().pending_confirm, None);
+    assert_eq!(rig.restarts(), 2, "the swap and its undoing");
+}
+
 /// Catches a revert that touches `current`: a `revert` of the staged commit drops it from
 /// `staged` and nothing else (state, links and unit as they were); the release stays on the
 /// host. A repeat by a new order, and a revert of a commit that is not staged, change nothing.
@@ -409,6 +431,20 @@ fn on_a_host_without_a_frontend_confirm_and_revert_stay_the_node_s() {
     rig.cycle(T0 + 6);
     assert_eq!(rig.current(), Some(c(A)), "the node's revert went back");
     assert_eq!(rig.restarts(), 2);
+
+    // A confirm that names no swap on trial is the node's too: refused as the node's is,
+    // not as a frontend's `pending` or `commit_or_ref`.
+    let mut rig = Rig::new("plain-confirm");
+    rig.order(1, Verb::Activate, B);
+    rig.cycle(T0);
+    rig.order(2, Verb::Confirm, C);
+    rig.cycle(T0 + 3);
+    assert!(
+        rig.refusal().contains("the pending swap of"),
+        "{}",
+        rig.refusal()
+    );
+    assert!(rig.state().pending_confirm.is_some());
 
     let mut rig = staged("floors-apart", B, 8);
     let memory: serde_json::Value = serde_json::from_slice(
