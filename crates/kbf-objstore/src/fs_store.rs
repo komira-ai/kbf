@@ -209,11 +209,58 @@ struct Inner {
     window: usize,
     /// How many times a listing read every header: once per listing, not per page.
     walks: AtomicU64,
-    /// Held for the store's life: closing it releases the lock.
-    _lock: File,
+    /// Held for the store's life; released when the last handle is dropped
+    /// ([`Inner`]'s `Drop`).
+    lock: File,
+    /// Woken when the lock is released ([`Released`]).
+    released: Arc<Notify>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Unlock before waking, so whoever waits finds the directory free; a lock that
+        // cannot be unlocked is released with the file just after.
+        let _ = self.lock.unlock();
+        self.released.notify_waiters();
+    }
+}
+
+/// Completes when every handle on a store is gone and its directory is unlocked.
+/// Holds no handle itself ([`FsStore::released`]).
+pub struct Released {
+    store: std::sync::Weak<Inner>,
+    notify: Arc<Notify>,
+}
+
+impl Released {
+    /// Waits until the store's last handle is dropped and its directory unlocked.
+    /// Returns at once for a store that is already closed.
+    pub async fn wait(self) {
+        loop {
+            let woken = self.notify.notified();
+            tokio::pin!(woken);
+            // Registered before the check, so a release between the two is not missed.
+            woken.as_mut().enable();
+            if self.store.strong_count() == 0 {
+                return;
+            }
+            woken.await;
+        }
+    }
 }
 
 impl FsStore {
+    /// A watch for this store's close: [`Released::wait`] completes once every handle on
+    /// it, clones included, has been dropped and the directory is unlocked. It holds no
+    /// handle, so it does not keep the store open.
+    #[must_use]
+    pub fn released(&self) -> Released {
+        Released {
+            store: Arc::downgrade(&self.inner),
+            notify: Arc::clone(&self.inner.released),
+        }
+    }
+
     /// Opens the store in `dir`, creating the directory and its layout if missing,
     /// locking it, and removing every file left in `tmp/`. A write is refused while the
     /// file system would be left with less than `floor` free.
@@ -271,7 +318,8 @@ impl FsStore {
                 listing: Mutex::new(None),
                 window: LISTING_WINDOW,
                 walks: AtomicU64::new(0),
-                _lock: lock,
+                lock,
+                released: Arc::new(Notify::new()),
             }),
         })
     }

@@ -27,7 +27,7 @@ use bytes::Bytes;
 
 pub use body::{BodyStream, gather};
 pub use fs_store::{
-    Floor, FsStore, FsStoreError, Room, Scanned, ShardScan, SpaceSource, objects_source,
+    Floor, FsStore, FsStoreError, Released, Room, Scanned, ShardScan, SpaceSource, objects_source,
     statvfs_source,
 };
 pub use kbf_threads::disk::Space;

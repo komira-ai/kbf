@@ -151,19 +151,11 @@ fn sample(body: &str, name: &str) -> Option<f64> {
         .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
 }
 
-/// Catches a `/metrics` route that renders another cache than the node's, or a fresh one
-/// (the series present, always 0): a blob written to the node's write tier, whose tier is
-/// then abandoned at the next start (the loss the cache records itself), must show in
-/// that node's scrape as a lost blob and a loss. The first life writes one blob to the
-/// hot store, which seals after thirty seconds and so is still unflushed when the life
-/// ends; the second start abandons that tier. Mutant: the route renders `Losses::default()`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_blob_the_nodes_cache_lost_is_scraped_from_its_metrics_listener() {
-    let d = dir("loss");
-    let hot = format!("--hot-store=file://{}", d.join("hot").display());
-
+/// A first life of a storage node over `d` with the write tier `hot`: it starts, takes a
+/// blob into the tier over a channel, is told to stop, and `serve()` returns.
+async fn first_life(d: &Path, hot: &str) {
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let first = start_storage(&flags(&d, &[&hot]), || {
+    let first = start_storage(&flags(d, &[hot]), || {
         Ok(async move {
             let _ = stopped.await;
         })
@@ -183,6 +175,20 @@ async fn a_blob_the_nodes_cache_lost_is_scraped_from_its_metrics_listener() {
         .expect("put");
     stop.send(()).expect("stop");
     serving.await.expect("task").expect("serves to the end");
+}
+
+/// Catches a `/metrics` route that renders another cache than the node's, or a fresh one
+/// (the series present, always 0): a blob written to the node's write tier, whose tier is
+/// then abandoned at the next start (the loss the cache records itself), must show in
+/// that node's scrape as a lost blob and a loss. The first life writes one blob to the
+/// hot store, which seals after thirty seconds and so is still unflushed when the life
+/// ends; the second start abandons that tier. Mutant: the route renders `Losses::default()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blob_the_nodes_cache_lost_is_scraped_from_its_metrics_listener() {
+    let d = dir("loss");
+    let hot = format!("--hot-store=file://{}", d.join("hot").display());
+
+    first_life(&d, &hot).await;
 
     let tier = std::fs::read_to_string(d.join("hot/TIER")).expect("the tier file");
     let second = flags(
@@ -201,4 +207,25 @@ async fn a_blob_the_nodes_cache_lost_is_scraped_from_its_metrics_listener() {
     let counter = sample(&body, "kbf_cache_blob_losses_total");
     assert!(gauge >= Some(1.0), "{body}");
     assert!(counter >= Some(1.0), "{body}");
+}
+
+/// Catches a `serve()` that returns while something of the node still holds its cold
+/// store: the cache's own touch flusher (aborted when the cache drops, gone when it is
+/// next polled) and its write-pool threads (they end after the queue closes) hold the
+/// writer, and so the directory's lock, past the return. A restart on the same
+/// directories failed `Locked { WouldBlock }`. Fifty lives, each restarted the moment
+/// `serve()` returns, with no clock in the test. Mutant: `StorageHandle::serve` does
+/// not wait for `cold_released` (7 of 10 runs red).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_returned_serve_has_released_the_stores() {
+    for life in 0..50 {
+        let d = dir(&format!("restart-{life}"));
+        let hot = format!("--hot-store=file://{}", d.join("hot").display());
+        first_life(&d, &hot).await;
+        let tier = std::fs::read_to_string(d.join("hot/TIER")).expect("the tier file");
+        let second = flags(&d, &[&hot, &format!("--hot-store-abandon={}", tier.trim())]);
+        start_storage(&second, never)
+            .await
+            .unwrap_or_else(|e| panic!("life {life} restarts: {e}"));
+    }
 }

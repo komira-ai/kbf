@@ -184,6 +184,49 @@ async fn a_fresh_listing_after_a_key_sees_objects_written_since_an_abandoned_one
     std::fs::remove_dir_all(&dir).expect("remove");
 }
 
+/// Catches a `Released` that completes while a handle is open (a restart over the
+/// directory would be refused), one that never completes once the last handle is dropped,
+/// and one that holds the store open itself. The handle is dropped on another thread
+/// only after `wait` has been polled once; no clock is involved.
+#[tokio::test]
+async fn released_completes_when_the_last_handle_is_dropped_and_the_directory_is_free() {
+    let dir = scratch("released");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let clone = store.clone();
+    let released = store.released();
+    drop(store);
+    assert!(
+        matches!(FsStore::open(&dir, FLOOR), Err(FsStoreError::Locked { .. })),
+        "a clone still holds the directory"
+    );
+    let (polled_tx, polled_rx) = std::sync::mpsc::channel::<()>();
+    let dropper = std::thread::spawn(move || {
+        polled_rx.recv().expect("the waiter polled");
+        drop(clone);
+    });
+    let waiting = released.wait();
+    tokio::pin!(waiting);
+    // One poll that finds the handle still open: it is pending.
+    assert!(
+        futures::poll!(waiting.as_mut()).is_pending(),
+        "completed with a handle open"
+    );
+    polled_tx.send(()).expect("the dropper waits");
+    waiting.await;
+    dropper.join().expect("dropper");
+    FsStore::open(&dir, FLOOR).expect("the directory is free when the wait returns");
+}
+
+/// A store already closed: the wait returns at once.
+#[tokio::test]
+async fn released_of_a_closed_store_returns_at_once() {
+    let dir = scratch("released-closed");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let released = store.released();
+    drop(store);
+    released.wait().await;
+}
+
 /// Catches two stores sharing one directory: the second would empty `tmp/` under the
 /// first's writes. The open is refused, naming the lock file, until the first store is
 /// dropped.

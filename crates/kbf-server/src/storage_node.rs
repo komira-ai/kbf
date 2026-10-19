@@ -410,6 +410,8 @@ pub struct StorageHandle {
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
     _background: Background,
+    /// When the cold store is a directory: completes when its lock is released.
+    cold_released: Option<kbf_objstore::Released>,
     maps: Arc<MapHolder>,
     catch_up: CatchUp,
     repairs: Option<Arc<Repairs>>,
@@ -450,21 +452,47 @@ impl StorageHandle {
     }
 
     /// Serves until the shutdown future given to [`start_storage`] completes and the
-    /// calls in flight end.
+    /// calls in flight end. With a `file://` cold store it returns once the store's
+    /// lock is released too: the node's tasks are aborted, and the cache they and the
+    /// service held is closed (its own background tasks and writer threads end after
+    /// it is dropped, not before), so a start over the same directories can follow at
+    /// once. It waits for that without a clock; a task that never lets go of the cache
+    /// would hold it here.
     ///
     /// # Errors
     /// The listener fails while serving.
     pub async fn serve(self) -> Result<(), ServeError> {
         let Self {
+            addr: _,
+            metrics: _,
+            start_line: _,
             serving,
             _flusher,
             _background,
+            cold_released,
+            maps,
+            catch_up,
+            repairs,
             _joiner,
             _repair,
             _metrics,
-            ..
         } = self;
-        serving.await
+        let served = serving.await;
+        // Everything the handle holds goes, so what is left holding the stores is not it.
+        drop((
+            _flusher,
+            _background,
+            maps,
+            catch_up,
+            repairs,
+            _joiner,
+            _repair,
+            _metrics,
+        ));
+        if let Some(released) = cold_released {
+            released.wait().await;
+        }
+        served
     }
 }
 
@@ -535,6 +563,7 @@ where
     let meta = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
+    let cold_released = files.as_ref().map(kbf_objstore::FsStore::released);
     let pass = files.map(|files| StartPass::over_raft(files, grace));
     // After the log is open: it refuses a directory that holds files it did not write.
     let repair_dir = stores.meta_dir.join(REPAIR_DIR);
@@ -544,7 +573,7 @@ where
         stores.hot.as_ref(),
         (meta, store, prefix, log),
         (shutdown, &repair_dir),
-        pass,
+        (pass, cold_released),
         RebuildConfig::default(),
     )
     .await
@@ -559,7 +588,10 @@ async fn assemble<O, S, F>(
     hot: Option<&Hot>,
     (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
     (shutdown, repair_dir): (S, &Path),
-    pass: Option<StartPass<RaftMetaLog<StdFs>>>,
+    (pass, cold_released): (
+        Option<StartPass<RaftMetaLog<StdFs>>>,
+        Option<kbf_objstore::Released>,
+    ),
     rebuild: RebuildConfig,
 ) -> Result<StorageHandle, Box<dyn Error>>
 where
@@ -598,6 +630,7 @@ where
         serving: node.serving,
         _flusher,
         _background,
+        cold_released,
         maps: node.maps,
         catch_up,
         repairs: node.repairs,
