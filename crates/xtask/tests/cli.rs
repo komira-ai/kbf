@@ -12,8 +12,7 @@ const BUILD: &str = "build --locked -p kbf-server --bin kbf-server";
 
 /// An empty directory of its own for one test.
 fn scratch(name: &str) -> TestDir {
-    let dir = TestDir::under(Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask"), name);
-    dir
+    TestDir::under(Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask"), name)
 }
 
 fn xtask(root: &Path, args: &[&str]) -> Command {
@@ -36,7 +35,7 @@ fn stamps(
     name: &str,
     defect: Option<&str>,
     commit: &str,
-) -> (Option<i32>, String, String, PathBuf) {
+) -> (Option<i32>, String, String, TestDir) {
     let root = scratch(name);
     let mut cmd = xtask(&root, &["build-commit", "stamps", commit]);
     cmd.env("CARGO", FAKE).env("XTASK_FAKE_HEAD", &HEAD[..12]);
@@ -442,12 +441,12 @@ fn the_darwin_verbs_fail_off_macos() {
 }
 
 /// A git repository whose one commit holds `budget` as the budget file.
-fn repo(name: &str, budget: &str) -> PathBuf {
+fn repo(name: &str, budget: &str) -> TestDir {
     let root = scratch(name);
     let git = |args: &[&str]| {
         let out = Command::new("git")
             .arg("-C")
-            .arg(&root)
+            .arg(&*root)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")

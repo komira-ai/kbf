@@ -14,11 +14,10 @@ const PLATFORM: &str = "linux-x86_64";
 
 /// An empty directory of its own for one test.
 fn scratch(name: &str) -> TestDir {
-    let dir = TestDir::under(
+    TestDir::under(
         Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-check-asset"),
         name,
-    );
-    dir
+    )
 }
 
 /// The identity `kbf --version --json` prints, as a build of `commit` makes it.

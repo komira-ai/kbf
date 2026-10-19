@@ -3,7 +3,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -17,11 +17,10 @@ const TOOL: &[u8] = b"a pinned tool";
 
 /// An empty directory of its own for one test.
 fn scratch(name: &str) -> TestDir {
-    let dir = TestDir::under(
+    TestDir::under(
         Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-fetch-https"),
         name,
-    );
-    dir
+    )
 }
 
 /// A canned HTTP/1.1 response.

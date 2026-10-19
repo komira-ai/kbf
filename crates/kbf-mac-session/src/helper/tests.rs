@@ -17,10 +17,12 @@ fn my_gid() -> u32 {
     rustix::process::getgid().as_raw()
 }
 
+/// The scratch directory is shared with a rig started over it again (a reboot), and
+/// declared last so it is removed after the helper that uses it.
 pub(super) struct Rig {
     pub(super) host: FakeHost,
     pub(super) helper: Helper,
-    pub(super) dir: PathBuf,
+    pub(super) dir: std::sync::Arc<kbf_testkit::dir::TestDir>,
 }
 
 /// A helper whose lease range starts at the test's own uid (so a lease created first
@@ -33,9 +35,13 @@ pub(super) fn rig(name: &str, len: u32) -> Rig {
     rig
 }
 
-pub(super) fn rig_with(name: &str, range: UidRange, dir: Option<PathBuf>) -> Rig {
+pub(super) fn rig_with(
+    name: &str,
+    range: UidRange,
+    dir: Option<std::sync::Arc<kbf_testkit::dir::TestDir>>,
+) -> Rig {
     trace();
-    let dir = dir.unwrap_or_else(|| scratch(&format!("helper-{name}")));
+    let dir = dir.unwrap_or_else(|| std::sync::Arc::new(scratch(&format!("helper-{name}"))));
     let homes = dir.join("Users");
     let _ = std::fs::create_dir(&homes);
     let host = FakeHost::default();
