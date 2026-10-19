@@ -1,6 +1,6 @@
-# kbf-installer, the one root tool that sets a host up and updates it: `kbf-installer serve`
-# takes the frontend's update orders (the order socket) and the operator's (the control
-# socket), expires confirm windows and writes status. It never polls for releases and never
+# kbf-installer, the one root tool that sets a host up and updates it: `kbf-installer run`
+# acts once on each order the node wrote to the order spool, reverts an expired swap and
+# writes status. It listens on no socket. It never polls for releases and never
 # updates itself: only the package manager replaces /usr/bin/kbf-installer.
 # Static unit, installed disabled under /usr/lib/systemd/system/; kbf-installer setup
 # enables it.
@@ -13,9 +13,12 @@ Before=kbf-frontend@.service kbf-storage.service kbf-daemon.service kbf-storage-
 
 [Service]
 Type=simple
-# `check` lists every problem with the installer config, the trust files and the path chain.
-ExecStartPre=/usr/bin/kbf-installer check
-ExecStart=/usr/bin/kbf-installer serve
+# No ExecStartPre=: the contract's `check` is not built yet (it exits 1, "not implemented"), and
+# a stub there would fail every start. `run` reads installer.toml itself and refuses a bad one.
+# No --unit: `run` restarts the unit of the `mode` in /etc/kbf/kbf.toml, which `setup` wrote
+# and enabled, so this one file serves every mode; on a frontend or all-in-one host it also
+# reads the state database's address from /etc/kbf/installer.toml.
+ExecStart=/usr/bin/kbf-installer run
 Restart=on-failure
 RestartSec=5
 # Exit 4 is busy (an activation is pending): not a failure, not a restart.

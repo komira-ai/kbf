@@ -16,10 +16,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kbf_host::{HostExec, HostPath, Root};
 
 use crate::activate;
-use crate::cli::{BootArgs, Cli, RunArgs, Verb};
+use crate::cli::{BootArgs, Cli, RunArgs, ServiceArgs, Verb};
 use crate::database::Database;
 use crate::exit::Exit;
 use crate::helper::cycle::{Config, Helper, HelperError};
+use crate::helper::host_mode;
 use crate::helper::operator::{self, Operator};
 use crate::helper::restart::Restart;
 use crate::helper::serve::{FileIdentity, Flow, PASS_INTERVAL, Serve};
@@ -31,6 +32,7 @@ use crate::setup;
 
 /// Why a verb failed and the exit it ends with: `Failed`, or `NeedsOperator` when only an
 /// operator can go on (the state files are both unusable).
+#[derive(Debug)]
 struct Failure {
     exit: Exit,
     why: String,
@@ -108,6 +110,61 @@ fn under(root: &Path, path: &HostPath) -> Result<PathBuf, Failure> {
     Ok(root.join(path))
 }
 
+/// What `run` restarts after a swap, and the `installer.toml` it migrates the state database
+/// from.
+struct Target {
+    service: ServiceArgs,
+    installer_config: Option<HostPath>,
+}
+
+/// The target of `run`: the service its flags name, else (Linux) the unit of the mode in the
+/// host's `kbf.toml`, which is how the one packaged `kbf-installer.service` serves every mode.
+/// A unit found that way on a frontend or all-in-one host reads `/etc/kbf/installer.toml`
+/// when `--installer-config` is not given (`setup` wrote it there); a Mac names its launchd
+/// label in the property list.
+fn target_of(root: &Path, args: &RunArgs) -> Result<Target, Failure> {
+    if let Some(service) = args.named_service() {
+        return Ok(Target {
+            service,
+            installer_config: args.installer_config.clone(),
+        });
+    }
+    let (layout, _) = host(root.to_path_buf()).map_err(usage)?;
+    let service = derived_service(&layout, layout.platform())?;
+    let default = (args.installer_config.is_none() && service.runs_database_mode())
+        .then(|| HostPath::new(setup::paths::INSTALLER_TOML))
+        .transpose()
+        .map_err(|e| usage(e.to_string()))?;
+    let installer_config = args.installer_config.clone().or(default);
+    Ok(Target {
+        service,
+        installer_config,
+    })
+}
+
+fn usage(why: String) -> Failure {
+    Failure {
+        exit: Exit::Usage,
+        why,
+    }
+}
+
+/// The service of `layout`'s host when no flag names one.
+fn derived_service(layout: &Layout, platform: Platform) -> Result<ServiceArgs, Failure> {
+    if platform != Platform::Linux {
+        return Err(usage("run needs --launchd-label".to_owned()));
+    }
+    let unit = host_mode::mode_unit(layout).map_err(|why| {
+        usage(format!(
+            "run needs --unit, or a kbf.toml that names the mode: {why}"
+        ))
+    })?;
+    Ok(ServiceArgs {
+        unit: Some(unit.to_owned()),
+        launchd_label: None,
+    })
+}
+
 fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
     // A running program has a file, and the file can be read: neither can be told otherwise.
     let me = std::env::current_exe().expect("a running program has a file");
@@ -118,7 +175,8 @@ fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
 /// The helper `run` drives: the host's, with the schema step of `--installer-config` attached
 /// when the flag is given.
 fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failure> {
-    let database = match &args.installer_config {
+    let target = target_of(&root, args)?;
+    let database = match &target.installer_config {
         Some(config) => Some(
             Database::from_installer_toml(&under(&root, config)?)
                 .map_err(|e| Failure::from(e.to_string()))?,
@@ -130,7 +188,7 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
     let cfg = Config {
         update_dir: args.update_dir.clone(),
         orders_dir: args.orders_dir.clone(),
-        restart: args.service.restart(),
+        restart: target.service.restart(),
         window_secs: args.window_secs,
         starts: args.starts,
         min_activation_interval_secs: args.min_activation_interval_secs,
@@ -157,7 +215,8 @@ fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Re
     // A frontend or all-in-one unit activates a release only after the database is migrated
     // for it; without the installer.toml that names the database the step would be silently
     // absent, so the service does not start.
-    if args.installer_config.is_none() && args.service.runs_database_mode() {
+    let target = target_of(&root, args)?;
+    if target.installer_config.is_none() && target.service.runs_database_mode() {
         return Err(Failure {
             exit: Exit::Usage,
             why: "run needs --installer-config on a frontend or all-in-one host (the \

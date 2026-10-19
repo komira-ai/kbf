@@ -50,6 +50,7 @@ h2.workspace = true
 hex.workspace = true
 http.workspace = true
 kbf-front.workspace = true
+kbf-host.workspace = true
 # The Envoy render the real-Envoy tests (tests/envoy_box, tests/envoy_check.rs) run.
 kbf-installer.workspace = true
 kbf-proto.workspace = true

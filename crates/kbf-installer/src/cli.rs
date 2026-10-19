@@ -210,8 +210,14 @@ pub struct RunArgs {
     /// The order spool: owned by the service user, mode 0700, inside a root-owned parent.
     #[arg(long, default_value = "/var/lib/kbf-installer/orders", value_parser = kbf_host::HostPath::new)]
     pub orders_dir: kbf_host::HostPath,
-    #[command(flatten)]
-    pub service: ServiceArgs,
+    /// The systemd unit to restart after a swap (Linux). Without it and without
+    /// `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one
+    /// packaged kbf-installer.service serves every mode.
+    #[arg(long, conflicts_with = "launchd_label")]
+    pub unit: Option<String>,
+    /// The launchd label to kickstart after a swap (macOS).
+    #[arg(long)]
+    pub launchd_label: Option<String>,
     /// The confirm window the boot check gives a release on trial (120 to 1800).
     #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
@@ -226,9 +232,20 @@ pub struct RunArgs {
     pub passes: Option<u64>,
     /// installer.toml, under the host root: its `database` key is the state database the
     /// installer migrates to what a release needs before that release is activated. Required
-    /// when the unit restarted after a swap is a frontend's or the all-in-one's.
+    /// when the unit restarted after a swap is a frontend's or the all-in-one's, unless the
+    /// unit comes from kbf.toml's mode (no --unit): then /etc/kbf/installer.toml is the default.
     #[arg(long, value_parser = kbf_host::HostPath::new)]
     pub installer_config: Option<kbf_host::HostPath>,
+}
+
+impl RunArgs {
+    /// The service this `run` restarts, when the flags name it; `None` when neither does.
+    pub fn named_service(&self) -> Option<ServiceArgs> {
+        (self.unit.is_some() || self.launchd_label.is_some()).then(|| ServiceArgs {
+            unit: self.unit.clone(),
+            launchd_label: self.launchd_label.clone(),
+        })
+    }
 }
 
 #[derive(Args)]

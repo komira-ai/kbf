@@ -90,7 +90,7 @@ Options:
       --orders-dir <ORDERS_DIR>
           The order spool: owned by the service user, mode 0700, inside a root-owned parent [default: /var/lib/kbf-installer/orders]
       --unit <UNIT>
-          The systemd unit to restart after a swap (Linux)
+          The systemd unit to restart after a swap (Linux). Without it and without `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one packaged kbf-installer.service serves every mode
       --launchd-label <LAUNCHD_LABEL>
           The launchd label to kickstart after a swap (macOS)
       --window-secs <WINDOW_SECS>
@@ -102,7 +102,7 @@ Options:
       --passes <PASSES>
           Stop after this many passes (a rehearsal or a test); without it, run until stopped
       --installer-config <INSTALLER_CONFIG>
-          installer.toml, under the host root: its `database` key is the state database the installer migrates to what a release needs before that release is activated. Required when the unit restarted after a swap is a frontend's or the all-in-one's
+          installer.toml, under the host root: its `database` key is the state database the installer migrates to what a release needs before that release is activated. Required when the unit restarted after a swap is a frontend's or the all-in-one's, unless the unit comes from kbf.toml's mode (no --unit): then /etc/kbf/installer.toml is the default
   -h, --help
           Print help
 

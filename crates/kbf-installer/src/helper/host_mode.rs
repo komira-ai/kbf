@@ -14,6 +14,26 @@ const MAX_BYTES: u64 = 1 << 20;
 
 /// `Ok` when the host's `kbf.toml` says `mode = "frontend"` or `"all-in-one"`; otherwise why not.
 pub fn frontend_host(layout: &Layout) -> Result<(), String> {
+    match read_mode(layout)?.as_str() {
+        "frontend" | "all-in-one" => Ok(()),
+        other => Err(format!("{} mode is {other:?}", layout.kbf_toml())),
+    }
+}
+
+/// The systemd unit that runs this host's mode: the first unit `setup` enabled for the `mode`
+/// of its `kbf.toml`. It is how `run` learns what to restart when the service is not told
+/// (`run` with neither `--unit` nor `--launchd-label`).
+pub fn mode_unit(layout: &Layout) -> Result<&'static str, String> {
+    use clap::ValueEnum;
+    let mode = read_mode(layout)?;
+    let shown = layout.kbf_toml();
+    let known = crate::cli::Mode::from_str(&mode, false)
+        .map_err(|_| format!("{shown} mode is {mode:?}, which is no mode of kbf"))?;
+    Ok(crate::setup::plan::mode_units(known)[0])
+}
+
+/// The top-level `mode` of the host's `kbf.toml`; why not when there is none.
+fn read_mode(layout: &Layout) -> Result<String, String> {
     let path = layout.join(&layout.kbf_toml());
     let shown = layout.kbf_toml();
     let mut bytes = Vec::new();
@@ -31,8 +51,7 @@ pub fn frontend_host(layout: &Layout) -> Result<(), String> {
         .parse()
         .map_err(|e: toml::de::Error| format!("{shown} is not TOML: {}", e.message()))?;
     match table.get("mode").and_then(toml::Value::as_str) {
-        Some("frontend" | "all-in-one") => Ok(()),
-        Some(other) => Err(format!("{shown} mode is {other:?}")),
+        Some(mode) => Ok(mode.to_owned()),
         None => Err(format!("{shown} has no mode")),
     }
 }

@@ -1862,6 +1862,7 @@ dependencies = [
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
+ "kbf-host",
  "kbf-installer",
  "kbf-objstore",
  "kbf-proto",

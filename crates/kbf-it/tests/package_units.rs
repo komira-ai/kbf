@@ -17,6 +17,9 @@
 //!   `delegate`, `handover`, `credential`, user, slice, `LimitNOFILE`), each named below;
 //! - a unit that runs a program outside the installer's tree (`/var/lib/kbf-installer/`),
 //!   another mode than its name, a `--config` or any flag the contract does not give it;
+//! - kbf-installer's own unit running anything but `run`, or gating its start on a step that is
+//!   not built; the verbs every unit and the macOS property list name exist, and the runtime
+//!   units' program is the layout's current link: `package_installer_verbs.rs`;
 //! - a unit that starts without its gate (`ConditionPathExists=`, the two checks, in
 //!   order), or whose gate is `ExecCondition=` or a `-`-prefixed command that ignores a
 //!   failure;
@@ -35,7 +38,7 @@ use kbf_deploy::unit::{UnitFile, comments_in_continuations};
 /// The installer's tree: every program of a kbf unit is under it.
 const TREE: &str = "/var/lib/kbf-installer/";
 /// The release kbf-installer flipped to.
-const CURRENT: &str = "/var/lib/kbf-installer/current/";
+const CURRENT: &str = "/var/lib/kbf-installer/releases/current/";
 /// A frontend instance's slot: the release it runs, until a confirm flips `current`.
 const SLOT: &str = "/var/lib/kbf-installer/slots/%i/";
 /// The pinned Envoy of instance `%i`.
@@ -638,19 +641,17 @@ fn installer_rules(
     pre: &[&str],
     v: &mut impl FnMut(&str, String),
 ) {
-    // Catches an installer that does not check itself before it serves, runs something
-    // else, or is not the plain service the contract names.
-    let check = format!("{INSTALLER} check");
-    if pre != [check.as_str()] {
-        v(
-            "installer",
-            format!("ExecStartPre= is {pre:?}, not [{check}]"),
-        );
+    // Catches an installer unit that runs something else than `run` (the verb the contract
+    // names; `serve` does not exist), or one that gates its start on a step that is not built
+    // (`check` exits 1 "not implemented"): either way the unit cannot start. Which verbs
+    // exist, and that they parse, is `package_installer_verbs.rs`'s.
+    if !pre.is_empty() {
+        v("installer", format!("ExecStartPre= is {pre:?}, not none"));
     }
-    if start != [INSTALLER, "serve"] {
+    if start != [INSTALLER, "run"] {
         v(
             "installer",
-            format!("ExecStart= is {start:?}, not {INSTALLER} serve"),
+            format!("ExecStart= is {start:?}, not {INSTALLER} run"),
         );
     }
     let get = |k: &str| unit.get_in("Service", k).map(trim);
@@ -745,8 +746,10 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
             "{name}: no ConditionPathExists={config}"
         );
         // Envoy is the host's own (no kbf check of it at start yet: the supported version
-        // range is checked by host preparation); every kbf unit runs its checks first.
-        if *name != "kbf-envoy.service" {
+        // range is checked by host preparation); every kbf unit runs its checks first. The
+        // installer's own unit has none: its `check` is not built, and a rule pins that it names
+        // no ExecStartPre= (a stub there fails every start).
+        if !["kbf-envoy.service", "kbf-installer.service"].contains(name) {
             assert!(
                 !all(&unit, "Service", "ExecStartPre").is_empty(),
                 "{name}: no ExecStartPre= check"
@@ -829,26 +832,26 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-daemon.service",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=daemon",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=daemon \\\n    # a note\n    ",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon \\\n    # a note\n    ",
         "continuation",
     ),
     (
         "kbf-daemon.service",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=daemon",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon",
         "ExecStart=/usr/local/bin/kbf daemon",
         "exec",
     ),
     (
         "kbf-daemon.service",
-        "ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=daemon --check",
-        "ExecStartPre=-/var/lib/kbf-installer/current/kbf --mode=daemon --check",
+        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=daemon --check",
+        "ExecStartPre=-/var/lib/kbf-installer/releases/current/kbf --mode=daemon --check",
         "exec-prefix",
     ),
     (
         "kbf-storage.service",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=storage\n",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=storage --config=/etc/kbf/kbf.toml\n",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage\n",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage --config=/etc/kbf/kbf.toml\n",
         "flags",
     ),
     (
@@ -859,8 +862,8 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-all-in-one.service",
-        "ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=all-in-one --check",
-        "ExecCondition=/var/lib/kbf-installer/current/kbf --mode=all-in-one --check",
+        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=all-in-one --check",
+        "ExecCondition=/var/lib/kbf-installer/releases/current/kbf --mode=all-in-one --check",
         "gate-skip",
     ),
     (
@@ -1004,7 +1007,7 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     (
         "kbf-envoy.service",
         "ExecStart=/usr/bin/envoy ",
-        "ExecStart=/var/lib/kbf-installer/current/envoy ",
+        "ExecStart=/var/lib/kbf-installer/releases/current/envoy ",
         "envoy",
     ),
     (
@@ -1023,6 +1026,18 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "kbf-installer.service",
         "NoNewPrivileges=yes\n",
         "",
+        "installer",
+    ),
+    (
+        "kbf-installer.service",
+        "ExecStart=/usr/bin/kbf-installer run",
+        "ExecStart=/usr/bin/kbf-installer serve",
+        "installer",
+    ),
+    (
+        "kbf-installer.service",
+        "ExecStart=/usr/bin/kbf-installer run",
+        "ExecStartPre=/usr/bin/kbf-installer check\nExecStart=/usr/bin/kbf-installer run",
         "installer",
     ),
 ];
