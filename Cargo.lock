@@ -1379,6 +1379,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-bake"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-gate",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
 name = "kbf-baseline"
 version = "0.1.0"
 dependencies = [
