@@ -224,6 +224,39 @@ impl std::fmt::Display for Record {
 mod tests {
     use super::*;
 
+    /// A log held in memory: what a test's subscriber writes to.
+    #[derive(Clone, Default)]
+    struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Log {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            let log = self.clone();
+            tracing_subscriber::fmt()
+                .with_writer(move || {
+                    let mut writer = log.clone();
+                    std::io::Write::flush(&mut writer).unwrap();
+                    writer
+                })
+                .with_ansi(false)
+                .finish()
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
     fn dir(name: &str) -> kbf_testkit::dir::TestDir {
         kbf_testkit::dir::TestDir::under(
             std::env::temp_dir(),
@@ -292,7 +325,19 @@ mod tests {
         let _path_own = dir("torn");
         let path = _path_own.join("ledger");
         std::fs::write(&path, "created 3.1 600\ncreated 3.").unwrap();
-        let mut ledger = Ledger::open(&path).unwrap();
+        // Own subscriber: the warning is seen (and its field lines count as run)
+        // whatever else ran in the process.
+        let log = Log::default();
+        let subscriber = log.subscriber();
+        let mut ledger =
+            tracing::subscriber::with_default(subscriber, || Ledger::open(&path).unwrap());
+        let text = log.text();
+        assert!(text.contains("WARN"), "{text:?}");
+        assert!(
+            text.contains("dropping a ledger record cut short by a crash"),
+            "{text:?}"
+        );
+        assert!(text.contains("fragment=\"created 3.\""), "{text:?}");
         assert_eq!(ledger.get(LeaseId::new(3, 1)).map(|e| e.uid), Some(600));
         ledger.record_created(LeaseId::new(3, 2), 601).unwrap();
         drop(ledger);
