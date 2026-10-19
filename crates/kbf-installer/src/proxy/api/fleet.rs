@@ -2,11 +2,12 @@
 //! and storage member the active child knows has spoken, and the nodes that are enrolled.
 //! A [`FleetSnapshot`] holds those three reads; [`R1Gate`](super::compat::R1Gate) judges it.
 //!
-//! Nothing here opens a socket. A [`FleetReader`] (U8b) makes the three requests of the
-//! active child's operator port and hands each answer, status and body, to the
-//! constructors below, which are the one place the wire is interpreted. A read that
-//! fails, or answers something R1 cannot use, is an `Err` in the snapshot: the gate
-//! refuses on it, so a child that cannot be asked is never taken for an empty fleet.
+//! Nothing here opens a socket. A [`FleetReader`]
+//! ([`ChildFleet`](super::fleet_http::ChildFleet), U8b) makes the three requests of the
+//! active child's operator port and hands each answer, status and body, to the constructors
+//! below, which are the one place the wire is interpreted. A read that fails, or answers
+//! something R1 cannot use, is an `Err` in the snapshot: the gate refuses on it, so a child
+//! that cannot be asked is never taken for an empty fleet.
 
 use std::collections::BTreeSet;
 
@@ -72,6 +73,8 @@ pub struct FleetSnapshot {
 /// - **Gate `GET /v1/enroll/nodes` like a write**: a loopback peer, the operator bearer
 ///   token, `Content-Type: application/json`, no `Origin` (`docs/api.md`). The two views
 ///   are open.
+/// - **Never an empty fleet for a child that was not asked.** With no active child every
+///   field is an `Err`.
 pub trait FleetReader: Send {
     fn read(&self) -> FleetSnapshot;
 }

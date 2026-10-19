@@ -9,7 +9,8 @@
 //! proxy puts in `orders/`. What is not: the proxy itself and the real child control
 //! (U4b, U7b), the update API ([`api`], U8a). [`child_http`] is the blocking
 //! loopback client that the real child control and the fleet read call a child's ports
-//! with (U8b); [`admin`] is the `ChildAdmin` built on it, and nothing else calls it yet.
+//! with (U8b); [`admin`] is the `ChildAdmin` and [`api::fleet_http`] the `FleetReader` built
+//! on it, and nothing else calls either yet.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -80,6 +81,8 @@ mod confirm_boundary_tests;
 mod fakes;
 #[cfg(test)]
 mod fault_tests;
+#[cfg(test)]
+mod http_fixture_tests;
 #[cfg(test)]
 mod orders_tests;
 #[cfg(test)]

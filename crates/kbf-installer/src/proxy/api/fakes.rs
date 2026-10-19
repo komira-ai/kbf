@@ -454,5 +454,10 @@ pub const COMMIT_C: &str = C;
 
 /// The actor over the rig's core, with the default timing and nothing to do at its death.
 pub fn api(rig: &Rig) -> Api {
-    spawn(rig.core(), ActorTiming::default(), || {}).unwrap()
+    api_with(rig, Box::new(rig.gate.clone()))
+}
+
+/// The same actor with another gate, such as the real one.
+pub fn api_with(rig: &Rig, gate: Box<dyn CompatGate>) -> Api {
+    spawn(rig.core_with(gate), ActorTiming::default(), || {}).unwrap()
 }

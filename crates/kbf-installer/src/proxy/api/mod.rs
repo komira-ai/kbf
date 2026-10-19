@@ -8,8 +8,8 @@
 //! (the `frontend_update`/`revert` records), [`traits::StatusReader`] (`status.json`),
 //! [`traits::Supervisor`] (the U7 swap), [`traits::CompatGate`] (rule R1, made by
 //! [`compat::R1Gate`] over a [`fleet::FleetSnapshot`]), [`fleet::FleetReader`] (the
-//! snapshot's three reads of the active child) and [`traits::Forwarder`] (the operator
-//! port). U7b and U8b supply the real ones.
+//! snapshot's three reads of the active child, made over HTTP by [`fleet_http::ChildFleet`])
+//! and [`traits::Forwarder`] (the operator port). U7b and U8b supply the real ones.
 //!
 //! The vocabulary is the swap's, in [`super::model`]: [`Phase`](super::model::Phase) (the
 //! API owns `accepted`, `fetching`, `verifying` and reports them; the swap owns `staged`
@@ -55,8 +55,8 @@
 //!   once per update inside [`core::Core`], which blocks on it as it does on the other
 //!   sync seams: every API call waits while it runs, so a real reader bounds the three
 //!   requests by one deadline in total and names the active child on every call, not
-//!   when it is built (the rules are on the trait). A failed read is a value in the
-//!   snapshot and the gate refuses on it.
+//!   when it is built (the rules are on the trait, and [`fleet_http::ChildFleet`] keeps
+//!   them). A failed read is a value in the snapshot and the gate refuses on it.
 //! - **Request map (Q5).** `requests.json` in the proxy state directory is this module's
 //!   own file ([`idempotency`]); `update.json` (the swap's intent) is U7's.
 //! - **Restart marker (FP section 10).** The path of the postinst marker is not fixed by
@@ -112,6 +112,7 @@ pub mod auth;
 pub mod compat;
 pub mod core;
 pub mod fleet;
+pub mod fleet_http;
 pub mod handler;
 pub mod idempotency;
 pub mod model;
@@ -127,6 +128,8 @@ mod auth_tests;
 mod compat_tests;
 #[cfg(test)]
 mod fakes;
+#[cfg(test)]
+mod fleet_http_tests;
 #[cfg(test)]
 mod fleet_tests;
 #[cfg(test)]

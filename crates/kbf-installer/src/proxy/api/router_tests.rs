@@ -7,11 +7,13 @@ use bytes::Bytes;
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
 
-use super::actor::{ActorTiming, spawn};
+use super::actor::Api;
 use super::auth::{BearerAuth, PeerKey, RateLimit, Sha256Hasher};
 use super::compat::R1Gate;
-use super::core::{Core, CrashPoint};
-use super::fakes::{COMMIT_C, FakeClock, FakeForwarder, FakeTokens, Rig, TOKEN, api, idle, staged};
+use super::core::CrashPoint;
+use super::fakes::{
+    COMMIT_C, FakeClock, FakeForwarder, FakeTokens, Rig, TOKEN, api, api_with, idle, staged,
+};
 use super::fleet::{Enrolled, FleetSnapshot, Population};
 use super::model::OldChild;
 use super::router::{MAX_BODY, Router};
@@ -38,17 +40,16 @@ fn harness(name: &str, rate: RateLimit) -> Harness {
 }
 
 fn router_over(rig: &Rig, forwarder: FakeForwarder, rate: RateLimit) -> Router {
-    router_with(rig.core(), forwarder, rate)
+    router_with(api(rig), forwarder, rate)
 }
 
-fn router_with(core: Core, forwarder: FakeForwarder, rate: RateLimit) -> Router {
+fn router_with(actor: Api, forwarder: FakeForwarder, rate: RateLimit) -> Router {
     let auth = BearerAuth::new(
         Box::new(FakeTokens(Mutex::new(Some(TOKEN.to_owned())))),
         Box::new(Sha256Hasher),
         Arc::new(FakeClock(AtomicU64::new(0))),
         rate,
     );
-    let actor = spawn(core, ActorTiming::default(), || {}).unwrap();
     Router::new(Arc::new(auth), actor, Arc::new(forwarder))
 }
 
@@ -246,7 +247,7 @@ async fn a_refused_staging_shows_as_failed_through_get() {
 async fn an_r1_refusal_shows_through_get_as_a_failed_compat_step_with_its_reason() {
     let mut h = harness("u9e-r-r1", quick());
     h.router = router_with(
-        h.rig.core_with(Box::new(R1Gate)),
+        api_with(&h.rig, Box::new(R1Gate)),
         FakeForwarder::default(),
         quick(),
     );
