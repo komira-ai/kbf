@@ -167,7 +167,7 @@ fn files_that_are_not_a_release_are_refused() {
         ),
         (
             "script",
-            |d| fs::write(d.join("kbf"), b"#!/bin/sh\n").expect("script"),
+            |d| fs::write(d.join("kbf"), b"not an executable\n").expect("script"),
             "not the executable this host runs",
         ),
         (
