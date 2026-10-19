@@ -30,10 +30,23 @@ impl Proc {
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn kbf");
-        let mut line = String::new();
-        BufReader::new(child.stdout.take().expect("stdout"))
-            .read_line(&mut line)
-            .expect("a start line");
+        // Read on a thread so that a child that never prints its start line fails the
+        // test instead of hanging it.
+        let stdout = child.stdout.take().expect("stdout");
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(stdout).read_line(&mut line);
+            let _ = sent.send(line);
+        });
+        let line = match received.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(line) => line,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("kbf {args:?} printed no start line within 60 seconds");
+            }
+        };
         Self { child, line }
     }
 
@@ -143,6 +156,9 @@ kbf_cas_conformance::tests!(Through::new());
 /// One `GET` on the operator API: the status code and the body.
 fn get(api: &str, path: &str) -> (u16, String) {
     let mut stream = std::net::TcpStream::connect(api).expect("connect to the API");
+    let bound = Some(std::time::Duration::from_secs(30));
+    stream.set_read_timeout(bound).expect("a read timeout");
+    stream.set_write_timeout(bound).expect("a write timeout");
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n"
@@ -246,6 +262,59 @@ fn a_frontend_process_with_a_sqlite_state_store_is_ready_and_holds_the_file() {
     assert!(err.contains("another kbf process"), "{err}");
     assert!(second.stdout.is_empty());
     assert!(front.stop().is_some_and(|status| status.success()));
+}
+
+/// Catches a frontend process that takes `--admin-listen` and does not serve it: one
+/// started with it is the active writer (`GET /v1/admin/role`, which names the version
+/// protocol the proxy reads), one started with `--await-takeover` over another state file
+/// is a candidate that holds no generation, and both exit 0 on SIGTERM (a candidate
+/// would otherwise hold its ports for ever).
+#[test]
+fn a_frontend_process_serves_the_admin_calls_as_active_or_as_candidate() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("frontend-admin-{}", std::process::id()));
+    let node = node(&dir);
+    let storage = format!("--storage=http://{}", node.field("storage="));
+    let start = |state: &str, more: &[&str]| {
+        let state = format!("--state-store=sqlite://{}", dir.join(state).display());
+        let mut args = vec![
+            "frontend",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+            "--api-listen=127.0.0.1:0",
+            "--admin-listen=127.0.0.1:0",
+            storage.as_str(),
+            state.as_str(),
+        ];
+        args.extend_from_slice(more);
+        Proc::start(&args)
+    };
+    let mut active = start("active.db", &[]);
+    assert!(
+        active.line.starts_with("kbf-frontend-admin "),
+        "{}",
+        active.line
+    );
+    let (code, body) = get(&active.field("admin="), "/v1/admin/role");
+    assert_eq!(code, 200, "{body}");
+    let role: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(role["role"], "active", "{body}");
+    assert_eq!(role["held_generation"], 1, "{body}");
+    assert_eq!(role["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
+
+    let mut candidate = start("waiting.db", &["--await-takeover"]);
+    assert!(
+        candidate.line.contains("role=candidate"),
+        "{}",
+        candidate.line
+    );
+    let (code, body) = get(&candidate.field("admin="), "/v1/admin/role");
+    assert_eq!(code, 200, "{body}");
+    let role: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(role["role"], "candidate", "{body}");
+    assert_eq!(role["held_generation"], serde_json::Value::Null, "{body}");
+    assert!(candidate.stop().is_some_and(|status| status.success()));
+    assert!(active.stop().is_some_and(|status| status.success()));
 }
 
 /// `url` with the password of its user information removed.

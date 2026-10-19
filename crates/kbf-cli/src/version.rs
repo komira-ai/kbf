@@ -4,6 +4,10 @@
 //! check and the artifacts workflow, `cargo xtask build-commit check --json`, read
 //! them), sorted by name:
 //!
+//! - `admin_protocol`: the version of the admin calls of `kbf --mode frontend` and of the
+//!   `role` answer ([`kbf_server::managed::ADMIN_PROTOCOL`]). It is the versioned contract
+//!   between the proxy and the child processes it starts: `GET role`, `POST quiesce`,
+//!   `resume`, `takeover` and `stand-down` (`docs/api.md`);
 //! - `commit`: the first 12 hex digits of the commit built, or `unknown` for a build
 //!   with no git checkout ([`kbf_server::BUILD_COMMIT`]);
 //! - `min_protocol` and `protocol`: the oldest and the newest `kbf.worker.v1` protocol
@@ -37,6 +41,10 @@ pub fn asked(args: &[OsString]) -> bool {
 pub fn identity() -> Value {
     // Inserted in the order they print: sorted, whatever map `serde_json` is built with.
     let mut fields = Map::new();
+    fields.insert(
+        "admin_protocol".to_owned(),
+        kbf_server::managed::ADMIN_PROTOCOL.into(),
+    );
     fields.insert("commit".to_owned(), kbf_server::BUILD_COMMIT.into());
     fields.insert(
         "min_protocol".to_owned(),

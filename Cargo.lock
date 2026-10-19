@@ -1663,7 +1663,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "x509-parser",
- "zeroize",
 ]
 
 [[package]]
@@ -2084,6 +2083,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zeroize",
 ]
 
 [[package]]
@@ -4855,6 +4855,7 @@ dependencies = [
  "clap",
  "flate2",
  "hex",
+ "kbf-gate",
  "lzma-rs",
  "rcgen",
  "rustix",

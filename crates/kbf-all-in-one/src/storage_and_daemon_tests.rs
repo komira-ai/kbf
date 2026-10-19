@@ -153,6 +153,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Admits {
                 boot: 1,
                 heartbeat_interval_ms: 60_000,
                 map: None,
+                ..Default::default()
             },
         ))
     }
@@ -165,6 +166,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Admits {
             kbf_proto::kbf::map::v1::HeartbeatResponse {
                 map_generation: 0,
                 map: None,
+                ..Default::default()
             },
         ))
     }
