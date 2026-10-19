@@ -161,7 +161,9 @@ impl Managed {
         let served = tokio::spawn(async move {
             // The admin port ends with the process; a listener that fails shows as calls
             // that are refused.
-            let _ = serve_api(Some(listener), routes, stopped).await;
+            // No proxy secret: the port is loopback-only and its calls read no identity
+            // headers, which the gate strips.
+            let _ = serve_api(Some(listener), routes, stopped, None).await;
         });
         // The forwarder ends with the signal; it holds nothing else.
         drop(forwarding);

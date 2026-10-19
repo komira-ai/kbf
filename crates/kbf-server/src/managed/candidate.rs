@@ -88,6 +88,8 @@ impl Candidate {
         let listeners = args.listeners()?;
         let policy = args.reapi_auth_policy()?;
         let api = args.api()?;
+        // The operator port's stand-in gates calls as the real server will behind a proxy.
+        let proxy_secret = args.proxy()?.map(|behind| behind.secret);
         let binder = Binder::new();
         let reapi = Socket::bind(listeners.reapi, &binder)?;
         let api = api
@@ -137,6 +139,7 @@ impl Candidate {
                 Some(listener),
                 crate::health::router_of(checks),
                 either(&stop, global),
+                proxy_secret.clone(),
             );
             tasks.0.push(tokio::spawn(async move {
                 let _ = served.await;
