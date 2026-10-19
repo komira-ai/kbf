@@ -39,7 +39,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Verb {
     /// First install: accounts, directories, installer.toml, the first release.
-    Setup(SetupArgs),
+    Setup(Box<SetupArgs>),
     /// What is installed, staged and pending, and the last refusal.
     Status,
     /// Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap.

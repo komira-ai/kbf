@@ -236,17 +236,16 @@ fn a_planted_key_that_kbf_does_not_have_fails_the_guard() {
         strangers(&moved, KBF_FRONTEND),
         ["[storage-client] listen-ca"]
     );
-    // A cold store is the all-in-one's: kbf's frontend golden has no such key in `[stores]`
-    // for setup to write, and the check says so for a file that claims it.
+    // A whole table kbf has no group for.
     let wrong = format!("{FRONTEND_GOLDEN}\n[nonesuch]\nx = \"y\"\n");
     assert_eq!(strangers(&wrong, KBF_FRONTEND), ["[nonesuch] x"]);
 }
 
 /// Catches a rerun that is not a no-op, or a different run that is: the same flags again plan
-/// nothing and write no byte, and a changed flag rewrites the file in one atomic write, names
-/// the key (never the value), and keeps every other key.
+/// nothing and write no byte, and a changed flag rewrites the file in one write, says the file
+/// changed (never a value), and keeps every other key.
 #[test]
-fn the_same_flags_again_change_nothing_and_a_changed_flag_names_its_key() {
+fn the_same_flags_again_change_nothing_and_a_changed_flag_rewrites_once() {
     let raw = frontend();
     let mut exec = host_for(&raw);
     go_ok(&FakeOs::linux(), &mut exec, &raw);
@@ -270,7 +269,7 @@ fn the_same_flags_again_change_nothing_and_a_changed_flag_names_its_key() {
         .count();
     assert_eq!(writes, 1, "{:?}", exec.log);
     assert!(
-        out.contains("changed in these keys: [listener] listen, [storage-client] storage-ca;"),
+        out.contains("kbf.toml changed: a running kbf keeps the old one"),
         "{out}"
     );
     assert!(

@@ -495,16 +495,13 @@ impl KbfFlags {
         }
         let client = ["storage-ca", "storage-client-cert", "storage-client-key"];
         let given = client.iter().filter(|f| self.get(f).is_some()).count();
-        match self.get("storage-url") {
-            Some(url) if url.starts_with("https://") => {
-                if given != client.len() {
-                    problems.push(
-                        "--storage-url with https needs --storage-ca, --storage-client-cert and --storage-client-key"
-                            .to_owned(),
-                    );
-                }
-            }
-            Some(_) if given != 0 => problems.push(
+        let https = self.get("storage-url").map(|u| u.starts_with("https://"));
+        match https {
+            Some(true) if given != client.len() => problems.push(
+                "--storage-url with https needs --storage-ca, --storage-client-cert and --storage-client-key"
+                    .to_owned(),
+            ),
+            Some(false) if given != 0 => problems.push(
                 "--storage-ca, --storage-client-cert and --storage-client-key are for an https --storage-url"
                     .to_owned(),
             ),
