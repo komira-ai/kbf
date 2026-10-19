@@ -225,6 +225,29 @@ pub fn receive(
     caps: Caps,
     out: &mut File,
 ) -> Result<Received, PipeFault> {
+    read_from_child(spec, flags, lend, caps, true, out)
+}
+
+/// [`receive`] for a file whose length is not known beforehand (an index entry): `caps.size` is
+/// the most it may be, at least one byte must arrive, and the child must close its output (a
+/// child that goes on holding it is stalled, whatever it has sent).
+pub fn receive_up_to(
+    spec: &ChildSpec,
+    flags: &[OsString],
+    caps: Caps,
+    out: &mut File,
+) -> Result<Received, PipeFault> {
+    read_from_child(spec, flags, None, caps, false, out)
+}
+
+fn read_from_child(
+    spec: &ChildSpec,
+    flags: &[OsString],
+    lend: Option<BorrowedFd<'_>>,
+    caps: Caps,
+    exact: bool,
+    out: &mut File,
+) -> Result<Received, PipeFault> {
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -261,7 +284,7 @@ pub fn receive(
         let quiet = tally.last_byte + caps.no_byte;
         if now >= whole.min(quiet) {
             // Having all the bytes, a child that will not close its output is judged on them.
-            if tally.count == caps.size {
+            if exact && tally.count == caps.size {
                 break;
             }
             return Err(if now >= whole {
@@ -292,7 +315,7 @@ pub fn receive(
     let log = String::from_utf8_lossy(&log[..log.len().min(LOG_BYTES)])
         .trim()
         .to_owned();
-    if count < caps.size {
+    if count < caps.size && (exact || count == 0) {
         return Err(PipeFault::Short {
             got: count,
             size: caps.size,

@@ -20,14 +20,16 @@ use crate::activate;
 use crate::cli::{BootArgs, Cli, RunArgs, SetupArgs, Verb};
 use crate::database::Database;
 use crate::exit::Exit;
+use crate::fetch::release;
 use crate::helper::cycle::{Config, Helper, HelperError};
 use crate::helper::operator::{self, Operator};
 use crate::helper::restart::Restart;
 use crate::helper::serve::{FileIdentity, Flow, PASS_INTERVAL, Serve};
 use crate::helper::service::HostProcs;
-use crate::helper::{fetcher, leases};
+use crate::helper::leases;
 use crate::layout::{Layout, Platform};
 use crate::release::ReleaseError;
+use crate::run::SystemRunner;
 
 /// Why a verb failed and the exit it ends with: `Failed`, or `NeedsOperator` when only an
 /// operator can go on (the state files are both unusable).
@@ -189,7 +191,7 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
         ),
         None => None,
     };
-    let (layout, exec) = host(root)?;
+    let (layout, exec) = host(root.clone())?;
     let platform = layout.platform();
     let cfg = Config {
         update_dir: args.update_dir.clone(),
@@ -199,13 +201,27 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
         starts: args.starts,
         min_activation_interval_secs: args.min_activation_interval_secs,
     };
-    // The release fetcher and the lease source are wired by later changes; until then an
-    // activation of a release that is not installed, and every activation, is refused.
+    // The release comes through the fetch child from the source in installer.toml (the flag's
+    // file, else the host's own), verified by the stage pipeline. The lease source is not wired
+    // yet: until it is, an activation is refused for it before anything is fetched.
+    let config = args
+        .installer_config
+        .clone()
+        .unwrap_or_else(|| release::default_config(platform));
+    let me = std::env::current_exe().map_err(|e| Failure::from(e.to_string()))?;
+    let fetcher = release::ReleaseFetcher::new(
+        layout.clone(),
+        config,
+        me,
+        Box::new(HostExec::new(Root::new(&root).map_err(|e| Failure::from(e.to_string()))?)),
+        Box::new(SystemRunner),
+        Box::new(leases::NotWired),
+    );
     let mut helper = Helper::new(
         layout,
         exec,
         cfg,
-        Box::new(fetcher::NotWired),
+        Box::new(fetcher),
         Box::new(leases::NotWired),
         Box::new(HostProcs::new(platform)),
     );

@@ -4,12 +4,12 @@
 //! commit that is not `current` (the fetcher re-verifies a directory already on the host; a
 //! directory is not proof) and changes nothing else until it returns.
 //!
-//! The real fetcher (the unprivileged fetch child and the checks of
-//! `docs/design/pull-updates.md` 7.1 and 7.2) is wired in by a later change; until then
-//! the binary uses [`NotWired`], which refuses, so an activation of a commit that is not
-//! installed is refused with that reason and nothing is fetched.
+//! The real fetcher is [`crate::fetch::release::ReleaseFetcher`] (the unprivileged fetch child
+//! and the checks of `docs/design/pull-updates.md` 7.1 and 7.2). A build or a test with none
+//! uses [`NotWired`], which refuses, so an activation of a commit that is not installed is
+//! refused with that reason and nothing is fetched.
 
-use kbf_update::Locator;
+use kbf_update::{Facts, Locator};
 
 use crate::CommitId;
 
@@ -19,7 +19,13 @@ use crate::CommitId;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseLocator {
     pub commit: CommitId,
+    /// The components of an activation; none for a `frontend_update`, whose fetcher finds
+    /// them at the installer's own source.
     pub components: Vec<Locator>,
+    /// The facts the order expects the release to declare (an activation's; `None` for a
+    /// `frontend_update`, which expects only its commit and the release profile). The
+    /// fetcher checks them before it installs anything.
+    pub expected: Option<Facts>,
 }
 
 /// A release that is installed and verified in `releases/<commit>/`, and what its own

@@ -27,6 +27,7 @@
 pub mod child;
 pub mod identity;
 pub mod pipe;
+pub mod release;
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -135,6 +136,30 @@ impl FetchError {
             FetchError::Source(..) | FetchError::Identity(_) | FetchError::Pipe(_) => "fetch",
         }
     }
+}
+
+/// The platforms a release store keeps an index for.
+const INDEX_PLATFORMS: [&str; 3] = ["linux-x86_64", "linux-arm64", "darwin-arm64"];
+/// The suffix of an index entry that holds a build attestation.
+pub const ATTESTATION_SUFFIX: &str = ".attestation";
+
+/// Whether `text` names an entry of the release store's index:
+/// `<40 hex commit>/<platform>/<name>`, or the same with [`ATTESTATION_SUFFIX`].
+pub(crate) fn is_index_entry(text: &str) -> bool {
+    let mut parts = text.split('/');
+    let (Some(commit), Some(platform), Some(name), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let name = name.strip_suffix(ATTESTATION_SUFFIX).unwrap_or(name);
+    crate::CommitId::new(commit).is_ok()
+        && INDEX_PLATFORMS.contains(&platform)
+        && (1..=32).contains(&name.len())
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 pub(crate) fn is_digest(text: &str) -> bool {
@@ -282,6 +307,61 @@ pub fn fetch_component(
         });
     }
     Ok(got)
+}
+
+/// Read the release store's index entry `entry` (see [`is_index_entry`]) from the url `source`
+/// into `out`: a file of at most `max` bytes whose length is not known beforehand. Only the
+/// `url` source has an index; the frontend's `ReleaseService` serves blobs by digest only.
+///
+/// What arrives is a claim and nothing more: the digest and size it names are checked when the
+/// tarball arrives, and the attestation decides whether the tarball is believed.
+pub fn fetch_index(
+    child: &ChildProgram,
+    source: &Source,
+    limits: Limits,
+    entry: &str,
+    max: u64,
+    out: &mut File,
+) -> Result<Received, FetchError> {
+    if !is_index_entry(entry) {
+        return Err(FetchError::Source(
+            entry.to_owned(),
+            "not an index entry of the release store",
+        ));
+    }
+    let Source::Url { base, ca_file } = source else {
+        return Err(FetchError::Source(
+            "frontend".to_owned(),
+            "the frontend source serves blobs by digest and has no index of a commit",
+        ));
+    };
+    check_source(source)?;
+    let mut flags: Vec<OsString> = vec![
+        "--kind".into(),
+        "url".into(),
+        "--url".into(),
+        base.into(),
+        "--index".into(),
+        entry.into(),
+        // One byte more than the most, so that a source that sends more is seen to.
+        "--limit".into(),
+        (max + 1).to_string().into(),
+    ];
+    if let Some(ca) = ca_file {
+        flags.extend(["--ca-file".into(), ca.into()]);
+    }
+    let spec = ChildSpec {
+        program: child.program.clone(),
+        args: vec!["fetch-child".into()],
+        run_as: child.run_as,
+        confine: Confine::FETCH,
+    };
+    let caps = Caps {
+        size: max,
+        no_byte: NO_BYTE_TIMEOUT.min(limits.fetch_timeout),
+        total: limits.fetch_timeout,
+    };
+    Ok(pipe::receive_up_to(&spec, &flags, caps, out)?)
 }
 
 #[cfg(test)]

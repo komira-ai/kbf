@@ -342,3 +342,70 @@ fn a_read_is_counted_hashed_and_written_or_refused() {
     let got = Tally::new(6, Instant::now()).take(Ok(1), b"a", &mut Refusing);
     assert!(matches!(got, Err(PipeFault::Write(_))), "{got:?}");
 }
+
+/// The parent checks an index entry before a child exists: it must be the store's
+/// `<commit>/<platform>/<name>[.attestation]` and nothing a source could turn into another
+/// path.
+///
+/// Catches a path that climbs, a fourth part, an upper-case or empty name, a short commit, a
+/// platform the store has no index for, and an extra suffix.
+///
+/// Mutants seen red: the platform list dropped; the commit length not checked; `..` allowed in
+/// a name.
+#[test]
+fn an_index_entry_is_the_stores_shape_and_no_other() {
+    let commit = "0f4a3825305cc79733ef098eae9725948eb5d6db";
+    for good in [
+        format!("{commit}/linux-x86_64/kbf"),
+        format!("{commit}/linux-arm64/kbf.attestation"),
+        format!("{commit}/darwin-arm64/kbf-daemon"),
+    ] {
+        assert!(is_index_entry(&good), "{good}");
+    }
+    for bad in [
+        String::new(),
+        "../kbf".to_owned(),
+        format!("{commit}/linux-x86_64/../kbf"),
+        format!("{commit}/linux-x86_64/kbf/more"),
+        format!("{commit}/linux-x86_64"),
+        format!("{commit}/linux-x86_64/"),
+        format!("{commit}/linux-x86_64/Kbf"),
+        format!("{commit}/linux-x86_64/kbf.attestation.attestation"),
+        format!("{commit}/linux-x86_64/kbf.bundle"),
+        format!("{commit}/windows/kbf"),
+        format!("{}/linux-x86_64/kbf", &commit[..39]),
+        format!("{}/linux-x86_64/kbf", commit.to_uppercase()),
+        format!("{commit}/linux-x86_64/{}", "k".repeat(33)),
+        format!("{commit}/linux-x86_64/1kbf"),
+    ] {
+        assert!(!is_index_entry(&bad), "{bad:?}");
+    }
+}
+
+/// An index entry is `<sha256> <size>\n` and nothing else.
+///
+/// Mutants seen red: the line end not required; a sign or a space in the size accepted; a
+/// second field accepted.
+#[test]
+fn an_index_line_is_a_digest_and_a_size() {
+    use release::parse_index_line;
+    assert_eq!(
+        parse_index_line(format!("{SHA} 1234\n").as_bytes()),
+        Ok((SHA.to_owned(), 1234))
+    );
+    for bad in [
+        format!("{SHA} 1234"),
+        format!("{SHA}  1234\n"),
+        format!("{SHA} +1234\n"),
+        format!("{SHA} -1\n"),
+        format!("{SHA} 12 34\n"),
+        format!("{SHA}\n"),
+        format!("{} 5\n", SHA.to_uppercase()),
+        format!("{SHA} 99999999999999999999999\n"),
+        format!("{SHA} 5\n\n"),
+        String::new(),
+    ] {
+        assert!(parse_index_line(bad.as_bytes()).is_err(), "{bad:?}");
+    }
+    assert!(parse_index_line(&[0xff, 0xfe]).is_err());
+}

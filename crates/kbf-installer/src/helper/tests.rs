@@ -1660,6 +1660,7 @@ fn a_swap_that_fails_is_refused_and_moves_nothing() {
     let loc = ReleaseLocator {
         commit: c(B),
         components: Vec::new(),
+        expected: None,
     };
     assert!(matches!(NotWired.fetch(&loc), Err(FetchError::NotWired)));
 }

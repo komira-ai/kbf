@@ -20,6 +20,7 @@ use crate::spool::{Entry, read_capped};
 use crate::state::{self, Locked, State, StateError};
 use kbf_host::plan::Mode;
 use kbf_host::{Exec, HostPath, Perms, Step};
+use kbf_update::Facts;
 
 use crate::database::SchemaStep;
 use crate::helper::fetcher::{Fetcher, InstalledRelease, ReleaseLocator};
@@ -557,6 +558,13 @@ impl<E: Exec> Helper<E> {
         let rec = ReleaseLocator {
             commit: order.commit.clone(),
             components: claims.components.clone(),
+            expected: Some(Facts {
+                platform: claims.platform.clone(),
+                protocol: claims.protocol,
+                min_protocol: claims.min_protocol,
+                state_schema: claims.state_schema,
+                profile: claims.profile.clone(),
+            }),
         };
         // The node is told a fetch is under way; it may take minutes.
         memory.fetching = true;

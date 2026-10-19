@@ -735,7 +735,7 @@ impl Pipeline<'_> {
 /// The platform an order spells for a host of `host` on `arch`. The header was already
 /// checked to be the executable this host runs ([`BinaryKind::wanted`]), so the header
 /// and the host agree on it.
-fn platform_of(host: Platform, arch: Arch) -> String {
+pub(crate) fn platform_of(host: Platform, arch: Arch) -> String {
     let os = match host {
         Platform::Linux => "linux",
         Platform::MacOs => "darwin",

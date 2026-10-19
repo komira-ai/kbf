@@ -129,6 +129,22 @@ fn the_version_object_is_read_by_its_fields() {
     }
 }
 
+/// Catches a probe that refuses every real release: `kbf --version --json` has printed
+/// `admin_protocol` (the proxy's admin calls) since the frontend runs behind the proxy, and
+/// the object is read by its listed fields, so a field of the contract that is missing from
+/// the list refuses the one binary the installer exists to install. An older release does not
+/// print it, and that is read too.
+///
+/// Mutant: `admin_protocol` removed from `Version` (the real object is then refused as
+/// `version-unreadable`).
+#[test]
+fn the_admin_protocol_a_real_kbf_prints_is_read() {
+    let real = version_json(COMMIT, "release").replace('}', ",\"admin_protocol\":1}");
+    let said = Version::parse(real.as_bytes()).expect("a real kbf's object parses");
+    assert_eq!(said.protocol, 4);
+    assert!(Version::parse(version_json(COMMIT, "release").as_bytes()).is_ok());
+}
+
 /// Catches an unbounded read of what a not yet trusted binary prints: more than 4 KiB is
 /// refused whatever it holds, and exactly 4 KiB of valid JSON (padded with spaces) is read.
 ///

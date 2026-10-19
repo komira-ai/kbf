@@ -8,7 +8,9 @@
 //! (a program that only trusts its caller's checks is one mistake from a request for another
 //! URL).
 //!
-//! - `--kind url`: `GET <url>/files/<sha256>` over https. It follows **no redirect**: any
+//! - `--kind url`: `GET <url>/files/<sha256>` over https, or with `--index` the release store's
+//!   index entry `GET <url>/index/<commit>/<platform>/<name>[.attestation]` (a few bytes that
+//!   say what a component is: only the url source has them). It follows **no redirect**: any
 //!   answer but 200 is a failed fetch.
 //! - `--kind frontend`: `ReleaseService.Fetch` on the frontend's worker listener, over mutual
 //!   TLS: the server is authenticated by the pinned CA and the URL's host is checked against
@@ -27,7 +29,7 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject as _;
 
 use super::identity::{self, Identity, IdentityFault};
-use super::{CONNECT_TIMEOUT, MAX_COMPONENT_CEILING, is_digest};
+use super::{CONNECT_TIMEOUT, MAX_COMPONENT_CEILING, is_digest, is_index_entry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Kind {
@@ -43,9 +45,13 @@ pub struct ChildArgs {
     /// `url`: the https base URL of the file server. `frontend`: `https://host[:port]`.
     #[arg(long)]
     pub url: String,
-    /// The lowercase hex sha256 that names the blob.
+    /// The lowercase hex sha256 that names the blob. Exactly one of `--sha256` and `--index`.
     #[arg(long)]
-    pub sha256: String,
+    pub sha256: Option<String>,
+    /// `url` only: the index entry `<commit>/<platform>/<name>[.attestation]` to read instead of
+    /// a blob ([`super::is_index_entry`]).
+    #[arg(long)]
+    pub index: Option<String>,
     /// The most bytes written to standard output.
     #[arg(long)]
     pub limit: u64,
@@ -64,6 +70,8 @@ pub enum ChildFault {
     Url(String),
     #[error("{0:?} is not a sha256 (64 lowercase hex digits)")]
     Digest(String),
+    #[error("{0:?} is not an index entry (<40 hex>/<platform>/<name>[.attestation])")]
+    Index(String),
     #[error("the limit {0} is not 1 to {max}", max = MAX_COMPONENT_CEILING + 1)]
     Limit(u64),
     #[error("flags do not fit the kind: {0}")]
@@ -136,7 +144,7 @@ fn copy_limited(body: impl io::Read, limit: u64, out: &mut dyn Write) -> Result<
     })
 }
 
-fn fetch_url(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
+fn fetch_url(args: &ChildArgs, path: &str, out: &mut dyn Write) -> Result<u64, ChildFault> {
     let base = plain_url(&args.url, true)?;
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::Rustls)
@@ -157,7 +165,7 @@ fn fetch_url(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
         .build()
         .into();
     let mut response = agent
-        .get(format!("{base}/files/{}", args.sha256))
+        .get(format!("{base}/{path}"))
         .call()
         .map_err(|e| ChildFault::Unreachable(e.to_string()))?;
     let status = response.status().as_u16();
@@ -169,6 +177,7 @@ fn fetch_url(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
 
 fn fetch_frontend(
     args: &ChildArgs,
+    sha256: String,
     identity: &Identity,
     out: &mut dyn Write,
 ) -> Result<u64, ChildFault> {
@@ -195,9 +204,7 @@ fn fetch_frontend(
     runtime.block_on(async {
         let channel = endpoint.connect().await.map_err(|e| unreachable(&e))?;
         let mut stream = ReleaseServiceClient::new(channel)
-            .fetch(FetchRequest {
-                sha256: args.sha256.clone(),
-            })
+            .fetch(FetchRequest { sha256: sha256 })
             .await
             .map_err(|s| ChildFault::Status(format!("{:?}: {}", s.code(), s.message())))?
             .into_inner();
@@ -225,16 +232,31 @@ fn fetch_frontend(
 
 /// Fetch what `args` name and write at most `args.limit` bytes of it to `out`; the count.
 pub fn fetch(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
-    if !is_digest(&args.sha256) {
-        return Err(ChildFault::Digest(args.sha256.clone()));
-    }
     if args.limit == 0 || args.limit > MAX_COMPONENT_CEILING + 1 {
         return Err(ChildFault::Limit(args.limit));
     }
+    match (&args.sha256, &args.index) {
+        (Some(sha256), None) if !is_digest(sha256) => Err(ChildFault::Digest(sha256.clone())),
+        (None, Some(entry)) if !is_index_entry(entry) => Err(ChildFault::Index(entry.clone())),
+        (Some(_), Some(_)) | (None, None) => Err(ChildFault::Flags(
+            "exactly one of --sha256 and --index",
+        )),
+        (Some(sha256), None) => fetch_blob(args, sha256, out),
+        (None, Some(entry)) => match (args.kind, args.identity_fd) {
+            (Kind::Url, None) => {
+                identity::ensure_descriptors(&[0, 1, 2])?;
+                fetch_url(args, &format!("index/{entry}"), out)
+            }
+            _ => Err(ChildFault::Flags("an index entry is read from a url source")),
+        },
+    }
+}
+
+fn fetch_blob(args: &ChildArgs, sha256: &str, out: &mut dyn Write) -> Result<u64, ChildFault> {
     match (args.kind, args.identity_fd) {
         (Kind::Url, None) => {
             identity::ensure_descriptors(&[0, 1, 2])?;
-            fetch_url(args, out)
+            fetch_url(args, &format!("files/{sha256}"), out)
         }
         (Kind::Url, Some(_)) => Err(ChildFault::Flags("a url fetch is lent no identity")),
         (Kind::Frontend, None) => Err(ChildFault::Flags("a frontend fetch needs --identity-fd")),
@@ -246,7 +268,7 @@ pub fn fetch(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
             }
             let lent = identity::adopt(fd)?;
             let identity = Identity::decode(lent)?;
-            fetch_frontend(args, &identity, out)
+            fetch_frontend(args, sha256.to_owned(), &identity, out)
         }
     }
 }
