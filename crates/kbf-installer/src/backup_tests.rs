@@ -136,6 +136,7 @@ fn names_are_fixed_width_utc_and_sort_as_time() {
         "kbf-2027011T0800000Z.dump",
         "kbf-20270115t080000z.dump",
         "kbf-2027011AT080000Z.dump",
+        "kbf-20270115T08000AZ.dump",
         "kbf-20270115T080000Z.dump.bak",
         "notes.txt",
         "kbf-.dump",
@@ -268,6 +269,14 @@ fn an_empty_dump_is_not_a_backup() {
     let tool = Fake::with(Box::new(|_| Ok(())));
     assert!(backup(&tool, &spec(&dir, 7), NOW).is_err());
     assert!(names(&dir).is_empty());
+    // One that leaves something that is not a regular file is the same; the leftover it makes
+    // (a directory, which no `remove_file` takes) stops the next run, and the run says so.
+    let odd = scratch();
+    let tool = Fake::with(Box::new(|f| fs::create_dir(f).map_err(|e| e.to_string())));
+    let err = backup(&tool, &spec(&odd, 7), NOW).unwrap_err();
+    assert!(err.contains("empty"), "{err}");
+    let err = backup(&tool, &spec(&odd, 7), NOW).unwrap_err();
+    assert!(err.contains("cannot remove the leftover"), "{err}");
 }
 
 /// Catches retention deleting the wrong files or the wrong count: with keep = 3 and five older
@@ -391,6 +400,53 @@ fn a_backup_of_the_same_second_is_never_replaced() {
     assert!(err.contains("already exists"), "{err}");
     assert_eq!(fs::read(dir.join(NOW_NAME)).expect("read"), b"first");
     assert_eq!(names(&dir), [NOW_NAME]);
+}
+
+fn is_root() -> bool {
+    rustix::process::geteuid().as_raw() == 0
+}
+
+/// Catches a backup directory that cannot be made or is not ours being used, and the reason
+/// being lost: a directory under a regular file, one in a read-only parent and one another user
+/// owns are each an error that names the path, with no program run (root passes through the
+/// last two, so they are skipped as root); and an older "backup" that cannot be removed fails
+/// the run after the new backup is written, saying so.
+///
+/// Mutants seen red: the owner check removed; the retention error swallowed.
+#[test]
+fn a_directory_that_cannot_be_made_or_is_not_ours_is_refused() {
+    let parent = scratch();
+    let file = parent.join("file");
+    fs::write(&file, "x").expect("written");
+    let tool = Fake::dumping("PGDMP");
+    let err = backup(&tool, &spec(&file.join("sub"), 7), NOW).unwrap_err();
+    assert!(err.contains("file/sub"), "{err}");
+    assert!(tool.calls().is_empty());
+    if !is_root() {
+        let locked = parent.join("locked");
+        fs::create_dir(&locked).expect("made");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).expect("read-only");
+        let err = backup(&tool, &spec(&locked.join("sub"), 7), NOW).unwrap_err();
+        assert!(
+            err.contains("cannot make") && err.contains("locked/sub"),
+            "{err}"
+        );
+        let err = backup(&tool, &spec(Path::new("/usr"), 7), NOW).unwrap_err();
+        assert!(err.contains("owned by another user"), "{err}");
+        assert!(tool.calls().is_empty());
+    }
+
+    // An older backup that cannot be removed (it is a directory) is reported, after the new
+    // one is in place.
+    let dir = scratch();
+    fs::create_dir(dir.join("kbf-20270101T000000Z.dump")).expect("made");
+    let err = backup(&Fake::dumping("PGDMP"), &spec(&dir, 1), NOW).unwrap_err();
+    assert!(
+        err.contains("is written, but removing the old backups failed")
+            && err.contains("kbf-20270101T000000Z.dump"),
+        "{err}"
+    );
+    assert!(dir.join(NOW_NAME).is_file());
 }
 
 /// Catches a backup directory that is a link, or a file, being used: a link could point the

@@ -188,6 +188,11 @@ fn is_temp_name(name: &str) -> bool {
         .is_some_and(is_backup_name)
 }
 
+/// `result`'s error as one line naming `what` was being done to `path`.
+fn ctx<T>(result: std::io::Result<T>, what: &str, path: &Path) -> Result<T, String> {
+    result.map_err(|e| format!("{what} {}: {}", path.display(), e.kind()))
+}
+
 fn words(args: &[&str]) -> Vec<OsString> {
     args.iter().map(OsString::from).collect()
 }
@@ -204,15 +209,17 @@ fn prepare_dir(dir: &Path) -> Result<(), String> {
             }
         }
         Ok(_) => return Err(format!("{shown} is not a directory")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::DirBuilder::new()
-            .recursive(true)
-            .mode(DIR_MODE)
-            .create(dir)
-            .map_err(|e| format!("cannot make {shown}: {}", e.kind()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let made = fs::DirBuilder::new()
+                .recursive(true)
+                .mode(DIR_MODE)
+                .create(dir);
+            ctx(made, "cannot make", dir)?;
+        }
         Err(e) => return Err(format!("{shown}: {}", e.kind())),
     }
-    fs::set_permissions(dir, fs::Permissions::from_mode(DIR_MODE))
-        .map_err(|e| format!("cannot close {shown} to other users: {}", e.kind()))
+    let closed = fs::set_permissions(dir, fs::Permissions::from_mode(DIR_MODE));
+    ctx(closed, "cannot close to other users", dir)
 }
 
 /// The names in `dir` for which `keep` says yes, sorted.
@@ -235,8 +242,8 @@ fn names_where(dir: &Path, keep: fn(&str) -> bool) -> Result<Vec<String>, String
 pub fn backup(tool: &dyn Tool, spec: &Spec<'_>, now_secs: u64) -> Result<Done, String> {
     prepare_dir(spec.dir)?;
     for stale in names_where(spec.dir, is_temp_name)? {
-        fs::remove_file(spec.dir.join(&stale))
-            .map_err(|e| format!("cannot remove the leftover {stale}: {}", e.kind()))?;
+        let gone = fs::remove_file(spec.dir.join(&stale));
+        ctx(gone, "cannot remove the leftover", &spec.dir.join(&stale))?;
     }
     let name = stamp(now_secs);
     let file = spec.dir.join(&name);
@@ -246,8 +253,11 @@ pub fn backup(tool: &dyn Tool, spec: &Spec<'_>, now_secs: u64) -> Result<Done, S
     let temp = spec.dir.join(temp_name(&name));
     let made = dump_to(tool, spec, &temp).and_then(|bytes| {
         sync(&temp)?;
-        fs::rename(&temp, &file)
-            .map_err(|e| format!("cannot give the dump its name {name}: {}", e.kind()))?;
+        ctx(
+            fs::rename(&temp, &file),
+            "cannot give the dump its name",
+            &file,
+        )?;
         sync(spec.dir)?;
         Ok(bytes)
     });
@@ -258,7 +268,8 @@ pub fn backup(tool: &dyn Tool, spec: &Spec<'_>, now_secs: u64) -> Result<Done, S
             return Err(e);
         }
     };
-    let removed = prune(spec.dir, &name, spec.keep)
+    let pruned = prune(spec.dir, &name, spec.keep);
+    let removed = pruned
         .map_err(|e| format!("{name} is written, but removing the old backups failed: {e}"))?;
     Ok(Done {
         file,
@@ -283,8 +294,8 @@ fn dump_to(tool: &dyn Tool, spec: &Spec<'_>, temp: &Path) -> Result<u64, String>
     if !meta.is_file() || meta.len() == 0 {
         return Err(format!("{} wrote an empty file", spec.pg_dump));
     }
-    fs::set_permissions(temp, fs::Permissions::from_mode(FILE_MODE))
-        .map_err(|e| format!("cannot close the dump to other users: {}", e.kind()))?;
+    let closed = fs::set_permissions(temp, fs::Permissions::from_mode(FILE_MODE));
+    ctx(closed, "cannot close the dump to other users", temp)?;
     let mut list = words(&["--list"]);
     list.push(temp.as_os_str().to_owned());
     tool.run(spec.pg_restore, &list)
@@ -294,9 +305,8 @@ fn dump_to(tool: &dyn Tool, spec: &Spec<'_>, temp: &Path) -> Result<u64, String>
 
 /// Flushes `path` (a file or a directory) to disk.
 fn sync(path: &Path) -> Result<(), String> {
-    fs::File::open(path)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| format!("cannot sync {}: {}", path.display(), e.kind()))
+    let synced = fs::File::open(path).and_then(|f| f.sync_all());
+    ctx(synced, "cannot sync", path)
 }
 
 /// Removes the oldest backups so that `keep` stay, `new` among them (it is never removed).

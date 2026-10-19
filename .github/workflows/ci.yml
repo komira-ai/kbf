@@ -455,7 +455,7 @@ jobs:
       - name: Run the installer's backup round trip under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-installer --lib -- --include-ignored backup::tests::real_server_round_trip
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-installer --lib --features test-sandbox -- --include-ignored backup::tests::real_server_round_trip
       - name: Report
         env:
           LLVM_COV_FLAGS: -skip-functions
