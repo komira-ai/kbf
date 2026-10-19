@@ -5,14 +5,19 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
 use crate::config::Limits;
 use crate::control::NoUpdates;
 
 use super::kit::{
-    CAPS, EXECUTE, RawFrame, RawPeer, Rig, finish, grpc_ok, read_all, script, tagged,
+    CAPS, EXECUTE, RawFrame, RawPeer, Rig, finish, frame_on, grpc_ok, read_all, script, send_end,
+    tagged,
 };
+use super::pki::client_config;
+use super::secure::{connect_tls, tls_rig};
+use crate::auth::Buck2Auth;
 
 const MINUTE: Duration = Duration::from_secs(60);
 
@@ -30,8 +35,7 @@ async fn keepalive_closes_dead_peer_only() {
     let rig = Rig::start(slow, tagged("b")).await;
     let mut live = rig.client().await;
     let (response, mut body) = live.start(EXECUTE, false).await;
-    body.send_data(Bytes::from_static(b"x"), true)
-        .expect("body");
+    send_end(&mut body, Bytes::from_static(b"x"));
     let live_reply = tokio::spawn(finish(response));
 
     let start = Instant::now();
@@ -135,4 +139,60 @@ async fn an_unanswered_upstream_ping_stops_new_streams_and_only_the_backstop_clo
         waited >= Duration::from_secs(330) && waited < Duration::from_secs(335),
         "{waited:?}"
     );
+}
+
+/// Catches a TLS accept path that serves HTTP/2 from a builder of its own and so lacks the
+/// limits: a client that finished the handshake and then says nothing is pinged after 30 s
+/// and closed 20 s after that, like a plaintext one, and the server's SETTINGS carry the one
+/// 256 KiB stream window and the stream cap of `limits::h2_server_builder`.
+#[tokio::test(start_paused = true)]
+async fn keepalive_and_limits_apply_on_a_tls_connection() {
+    let (rig, pki, _) = tls_rig("keepalive-tls", Buck2Auth::None).await;
+    let mut tls = connect_tls(&rig, client_config(&pki.ca_pem, None, &["h2"]))
+        .await
+        .expect("the handshake");
+    let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    hello.extend(frame_on(4, 0, 0, &[]));
+    tls.write_all(&hello).await.expect("the proxy reads");
+
+    let start = Instant::now();
+    let mut pings = 0;
+    let mut settings = None;
+    let closed = tokio::time::timeout(2 * MINUTE, async {
+        loop {
+            let mut head = [0_u8; 9];
+            if tls.read_exact(&mut head).await.is_err() {
+                break;
+            }
+            let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+            let mut payload = vec![0_u8; len];
+            if tls.read_exact(&mut payload).await.is_err() {
+                break;
+            }
+            match (head[3], head[4] & 1) {
+                (RawFrame::PING, 0) => pings += 1,
+                // The first SETTINGS is the server's own; later ones are acks (empty).
+                (4, 0) if settings.is_none() => settings = Some(payload),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the silent TLS client was never closed");
+    assert_eq!(pings, 1, "one PING, and no answer");
+    let waited = start.elapsed();
+    assert!(
+        waited >= Duration::from_secs(50) && waited < Duration::from_secs(55),
+        "30 s of silence plus 20 s for the ack: {waited:?}"
+    );
+
+    let settings = settings.expect("the server's SETTINGS");
+    let value = |id: u16| {
+        settings
+            .chunks_exact(6)
+            .find(|entry| u16::from_be_bytes([entry[0], entry[1]]) == id)
+            .map(|entry| u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]))
+    };
+    assert_eq!(value(3), Some(1000), "MAX_CONCURRENT_STREAMS");
+    assert_eq!(value(4), Some(256 * 1024), "INITIAL_WINDOW_SIZE");
 }

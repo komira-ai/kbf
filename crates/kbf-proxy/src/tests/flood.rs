@@ -6,7 +6,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use h2::Reason;
 
-use super::kit::{CAPS, RawFrame, RawPeer, Rig, finish, frame_on, grpc_ok, script, tagged, until};
+use super::kit::{
+    CAPS, RawFrame, RawPeer, Rig, finish, frame_on, grpc_ok, script, send_end, tagged, until,
+};
 use crate::limits::{DOWNSTREAM_CONNECTION_STREAMS, PENDING_RESET_STREAMS};
 
 /// `ENHANCE_YOUR_CALM`, the error code h2 puts on the GOAWAY of a flood.
@@ -118,8 +120,7 @@ async fn a_rapid_reset_attack_is_sent_away_on_its_own_connection_only() {
 
     assert!(good.alive());
     let (response, mut body) = good.start(CAPS, false).await;
-    body.send_data(Bytes::from_static(b"x"), true)
-        .expect("body");
+    send_end(&mut body, Bytes::from_static(b"x"));
     assert_eq!(finish(response).await.text(), "a");
 }
 

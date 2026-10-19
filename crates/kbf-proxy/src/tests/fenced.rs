@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
 
 use super::kit::{
     CAPS, EXECUTE, RawFrame, RawPeer, Reply, Rig, Script, WRITE, finish, grpc_ok, read_all, script,
-    tagged, until,
+    send_end, tagged, until,
 };
 use crate::slot::Slot;
 
@@ -103,8 +103,7 @@ async fn always_fenced(path: &str, body: usize) -> (Reply, usize) {
     let rig = Rig::start(fencing(usize::MAX, "never"), tagged("b")).await;
     let mut client = rig.client().await;
     let (response, mut send) = client.start(path, false).await;
-    send.send_data(Bytes::from(vec![7_u8; body]), true)
-        .expect("body");
+    send_end(&mut send, Bytes::from(vec![7_u8; body]));
     let reply = finish(response).await;
     until(|| rig.core.slots.open_streams() == 0).await;
     (reply, rig.a.state.dispatches())
@@ -246,8 +245,7 @@ async fn a_stream_bound_pre_hold_dispatched_post_quiesce_then_fenced_lands_on_b(
     let rig = Rig::start(a, tagged("b")).await;
     let mut client = rig.client().await;
     let (response, mut body) = client.start(CAPS, false).await;
-    body.send_data(Bytes::from_static(b"x"), true)
-        .expect("body");
+    send_end(&mut body, Bytes::from_static(b"x"));
     let call = tokio::spawn(finish(response));
     until(|| rig.a.state.dispatches() == 1).await;
 
@@ -303,8 +301,7 @@ async fn a_retried_stream_keeps_the_first_hold_bound() {
     let guard = rig.core.slots.hold(HOLD).expect("no hold in force");
     let mut client = rig.client().await;
     let (response, mut body) = client.start(CAPS, false).await;
-    body.send_data(Bytes::from_static(b"x"), true)
-        .expect("body");
+    send_end(&mut body, Bytes::from_static(b"x"));
     let call = tokio::spawn(finish(response));
     until(|| rig.core.queue.held() == 1).await;
     tokio::time::sleep(Duration::from_secs(12)).await;
