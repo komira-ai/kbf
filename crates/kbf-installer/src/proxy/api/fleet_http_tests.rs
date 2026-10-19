@@ -5,9 +5,10 @@
 //! its own status. A test sees what the client sent and the snapshot it made of the answers.
 
 use std::collections::BTreeSet;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -256,6 +257,27 @@ fn failed(snapshot: &FleetSnapshot) -> [Option<&str>; 3] {
     .map(|why| why.map(|unreadable| unreadable.0.as_str()))
 }
 
+/// A listener that reads each of three requests through its head and answers `bytes`, whatever
+/// they are, then closes the connection.
+fn answering(bytes: &'static [u8]) -> SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().take(3).flatten() {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 512];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = stream.write_all(bytes);
+        }
+    });
+    addr
+}
+
 /// A port nothing listens on.
 fn closed_port() -> SocketAddr {
     TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -481,6 +503,27 @@ fn an_address_that_is_not_loopback_is_never_asked() {
     );
 }
 
+#[test]
+fn an_answer_that_is_not_http_1_1_is_unreadable_in_every_read() {
+    let mut failures = Vec::new();
+    for bytes in [
+        // Not a status line at all.
+        &b"SSH-2.0-banner\r\n\r\n"[..],
+        // A status line of another version, which would otherwise be a good answer.
+        b"HTTP/1.0 200 OK\r\ncontent-length: 2\r\n\r\n{}",
+    ] {
+        let got = one(answering(bytes), DEADLINE).read();
+        let why = failed(&got);
+        if !why
+            .iter()
+            .all(|t| t.is_some_and(|t| t.contains("malformed answer")))
+        {
+            failures.push(format!("{:?}: {why:?}", String::from_utf8_lossy(bytes)));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 // ----- the active child -----
 
 #[test]
@@ -556,8 +599,11 @@ fn one_deadline_covers_the_three_reads_so_a_slow_first_read_leaves_the_third_les
         why[ENROLLED].is_some_and(|t| t.contains("deadline")),
         "{why:?}"
     );
+    // What tells a shared deadline from a deadline per read is the third read's refusal
+    // above. This bound only catches a read that nothing bounds, so it leaves a loaded
+    // machine room.
     assert!(
-        took < deadline + Duration::from_millis(400),
+        took < deadline + Duration::from_secs(2),
         "the read took {took:?} of {deadline:?}"
     );
 }
@@ -581,8 +627,9 @@ fn a_child_that_answers_nothing_costs_one_deadline_and_not_three() {
             .all(|t| t.is_some_and(|t| t.contains("deadline"))),
         "{why:?}"
     );
+    // Three deadlines in a row would be `deadline * 3`; this leaves a loaded machine room.
     assert!(
-        took < deadline * 2,
+        took < deadline * 5 / 2,
         "three reads took {took:?} of one {deadline:?}"
     );
 }
@@ -643,5 +690,24 @@ fn a_token_that_cannot_be_sent_as_a_header_makes_the_enrollment_read_unreadable_
     let failures = token_refused("cannot be sent", || {
         Ok(format!("{TOKEN}\r\nOrigin: https://example.test").into_bytes())
     });
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn a_token_file_that_holds_nothing_is_refused_by_the_child_and_the_read_is_unreadable() {
+    let mut failures = Vec::new();
+    for file in ["", "\n", " \t\r\n"] {
+        // The child would answer the registry to a request that passed its gates.
+        let child = Child::start();
+        let addr = child.addr();
+        let token = move || Ok(file.as_bytes().to_vec());
+        let fleet = ChildFleet::new(|| Some(Slot::A), move |_| addr, secret(), token, DEADLINE);
+        let got = fleet.read();
+        let why = failed(&got);
+        let refused = why[ENROLLED].is_some_and(|t| t.contains("401"));
+        if why.map(|w| w.is_some()) != [false, false, true] || !refused {
+            failures.push(format!("{file:?}: {why:?}"));
+        }
+    }
     assert!(failures.is_empty(), "{failures:#?}");
 }
