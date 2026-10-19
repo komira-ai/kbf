@@ -149,6 +149,10 @@ jobs:
       # (crates/kbf-installer/tests/real_gh.rs); the sha256 is the release's checksums file.
       GH_VERSION: 2.102.0
       GH_SHA256: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+      # cargo-nextest runs the workspace's test binaries side by side, one thread per core
+      # (`cargo test` runs them one after another). The sha256 is the release's archive.
+      NEXTEST_VERSION: 0.9.146
+      NEXTEST_SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -163,7 +167,11 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: cargo test --workspace --locked
+      - name: Install cargo-nextest (pinned version and checksum)
+        run: cargo xtask fetch --url "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz" --sha256 "$NEXTEST_SHA256" --out "$HOME/.cargo/bin/cargo-nextest" --extract tar.gz --member cargo-nextest
+      - run: cargo nextest run --workspace --locked --no-fail-fast
+      # nextest does not run doc tests.
+      - run: cargo test --workspace --doc --locked
       # kbf-guest started as root through sudo must refuse (crates/kbf-guest/tests/as_root.rs).
       - run: cargo xtask sudo-test -p kbf-guest --test as_root
       # kbf-server's --version names this commit, and the CI-only override stamps two
@@ -329,6 +337,9 @@ jobs:
       # farm's restart tests run on a schema of their own (`over_postgres` in tests/state_store.rs).
       - run: cargo test -p kbf-server --locked --test state_store_postgres -- --include-ignored
       - run: cargo test -p kbf-server --locked --test state_store -- --include-ignored over_postgres
+      # Two frontend children on one Postgres schema hand over 50 builds
+      # (tests/frontend/managed/two_children.rs; its in-memory twin runs in every test run).
+      - run: cargo test -p kbf-server --locked --test frontend -- --include-ignored two_children::fifty_builds_across_a_takeover_over_postgres
       # A frontend process started with a Postgres --state-store reaches /readyz.
       - run: cargo test -p kbf-cli --locked --test frontend_process -- --include-ignored postgres_state_store
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -384,6 +395,11 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # Not `cargo llvm-cov nextest`: a test's process-wide state decides which lines count.
+      # A `tracing` macro evaluates its fields only when a subscriber is installed, and under
+      # `cargo test` an earlier test in the process has installed one, so the field lines of
+      # kbf-mdm (journal.rs), kbf-mac-session (ledger.rs) and kbf-server (rebuild.rs) are hit
+      # there and missed in a process per test (10 more missed lines on the ratchet).
       # `-skip-functions` leaves the per-function records (FN, FNDA) out of the lcov
       # export. With branch coverage on, llvm-cov's lcov exporter segfaults while
       # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
@@ -408,6 +424,10 @@ jobs:
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store -- --include-ignored over_postgres
+      - name: Run the two-children swap over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test frontend -- --include-ignored two_children::fifty_builds_across_a_takeover_over_postgres
       - name: Run the frontend process test over Postgres under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
@@ -445,6 +465,10 @@ jobs:
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
+    # As test-x86; the sha256 is the release's aarch64 archive.
+    env:
+      NEXTEST_VERSION: 0.9.146
+      NEXTEST_SHA256: b2e33d7c72de7ade0ff7b3a948ac37516b24f8a836b7a8870c1f634a94be9de9
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -459,7 +483,11 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: cargo test --workspace --locked
+      - name: Install cargo-nextest (pinned version and checksum)
+        run: cargo xtask fetch --url "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-aarch64-unknown-linux-gnu.tar.gz" --sha256 "$NEXTEST_SHA256" --out "$HOME/.cargo/bin/cargo-nextest" --extract tar.gz --member cargo-nextest
+      - run: cargo nextest run --workspace --locked --no-fail-fast
+      # nextest does not run doc tests.
+      - run: cargo test --workspace --doc --locked
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

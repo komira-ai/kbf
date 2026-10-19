@@ -1507,6 +1507,21 @@ async fn a_shutdown_that_cannot_be_made_is_a_refused_start() {
     assert_eq!(refused.to_string(), "no signal handlers");
 }
 
+/// Catches a listen address that is taken being passed over (a frontend that reports a
+/// start while one of its sockets is somebody else's) or reported without the address:
+/// the start is refused, and the message names the address.
+#[tokio::test]
+async fn a_listen_address_that_is_taken_is_a_refused_start_naming_it() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let addr = taken.local_addr().expect("its address");
+    let f = flags(&["--storage=http://127.0.0.1:1", &format!("--listen={addr}")]).expect("parses");
+    let refused = start_frontend(&f, || Ok(pending::<()>()))
+        .err()
+        .expect("refused");
+    assert!(refused.to_string().contains(&addr.to_string()), "{refused}");
+    drop(taken);
+}
+
 /// Catches a `kbf frontend` that lacks what `kbf-server` has for its drain: the operator
 /// endpoint (`GET`/`POST /v1/frontend/drain`, one shared `Drain`), its counts of open
 /// streams and queued operations, and `Drain::close` (the second stop signal's action).
