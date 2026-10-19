@@ -1484,7 +1484,6 @@ dependencies = [
  "kbf-driver-container",
  "kbf-enroll",
  "kbf-front",
- "kbf-host",
  "kbf-installer",
  "kbf-node",
  "kbf-peer",
