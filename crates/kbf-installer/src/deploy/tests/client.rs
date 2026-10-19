@@ -359,6 +359,10 @@ fn the_command_line_dials_the_api_under_the_ca_and_name_of_its_flags_or_its_conf
                 lock.to_str().unwrap(),
                 "--api",
                 &addr,
+                // The fixture release is complete for the platforms of `two_nodes()`; the
+                // frontend host's own platform must be one of them whatever machine runs this.
+                "--platform",
+                "linux-x86_64",
             ];
             args.extend_from_slice(extra);
             let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
