@@ -18,7 +18,12 @@ fn the_binary_exits_with_the_codes_of_the_command_line() {
         .args(["tag-message", "--verdict", golden])
         .output()
         .unwrap();
-    assert_eq!(ok.status.code(), Some(0));
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
     assert_eq!(ok.stdout, std::fs::read(golden).unwrap());
     let bad = bake().output().unwrap();
     assert_eq!(bad.status.code(), Some(2));

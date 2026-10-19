@@ -2184,6 +2184,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
