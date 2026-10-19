@@ -143,3 +143,5 @@ impl fmt::Display for CommitId {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod units_tests;
