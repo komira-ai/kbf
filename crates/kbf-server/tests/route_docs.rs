@@ -276,7 +276,7 @@ fn name_verify(routes: Vec<Route>) -> Vec<Route> {
 }
 
 /// The exact number of `(method, path)` routes, verbs expanded. A new route moves it.
-const ROUTES: usize = 53;
+const ROUTES: usize = 54;
 
 fn server_routes() -> Vec<Route> {
     let mut files = Vec::new();
@@ -319,6 +319,46 @@ fn check(doc_path: &str) {
 #[test]
 fn every_route_is_in_the_api_doc() {
     check("docs/api.md");
+}
+
+fn title(heading: &str) -> String {
+    heading.split(" (").next().unwrap_or(heading).to_string()
+}
+
+/// `##` headings (outside code fences) that appear more than once, an annotation after the
+/// title (`(**planned**)`) not told apart: the planned stub and the real section of one
+/// route are the same section.
+fn duplicate_headings(text: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut dup = Vec::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        if line.starts_with("```") {
+            fenced = !fenced;
+        } else if !fenced && line.starts_with("## ") && !seen.insert(title(line)) {
+            dup.push(line.to_string());
+        }
+    }
+    dup
+}
+
+#[test]
+fn the_api_doc_names_each_section_once() {
+    let text = fs::read_to_string(root().join("docs/api.md")).unwrap();
+    let dup = duplicate_headings(&text);
+    assert!(
+        dup.is_empty(),
+        "docs/api.md repeats these sections: {dup:?}"
+    );
+}
+
+#[test]
+fn a_repeated_section_heading_is_reported() {
+    let text = "## A\ntext\n```\n## A\n```\n## B\n## A (planned)\n## B\n";
+    assert_eq!(
+        duplicate_headings(text),
+        vec!["## A (planned)".to_string(), "## B".to_string()]
+    );
 }
 
 #[test]
@@ -392,4 +432,34 @@ fn the_doc_reader_keeps_verbs_and_strips_queries_and_punctuation() {
     .map(|(m, p)| (m.to_string(), p.to_string()))
     .into();
     assert_eq!(doc, want);
+}
+
+#[test]
+fn the_probe_route_needs_its_verify_row() {
+    let code = name_verify(code_routes(
+        r#"Router::new().route("/v1/object-stores/connections/{target}", get(a).post(b))"#,
+    ));
+    assert_eq!(
+        code,
+        [
+            (
+                "GET".to_string(),
+                "/v1/object-stores/connections/{}".to_string()
+            ),
+            (
+                "POST".to_string(),
+                "/v1/object-stores/connections/{}:verify".to_string()
+            ),
+        ]
+    );
+    let doc = doc_routes(
+        "`GET /v1/object-stores/connections/{name}` and `POST /v1/object-stores/connections/{name}`",
+    );
+    assert_eq!(
+        missing(&code, &doc),
+        [(
+            "POST".to_string(),
+            "/v1/object-stores/connections/{}:verify".to_string()
+        )]
+    );
 }

@@ -1276,6 +1276,62 @@ async fn a_frontend_with_a_releases_dir_serves_the_release_store() {
     std::fs::remove_dir_all(&dir).expect("clean");
 }
 
+/// Catches a frontend whose operator API does not serve `GET /v1/denied`: the route is
+/// merged in `frontend.rs`, not only in the all-in-one server's `serve.rs`, so a started
+/// frontend (the main deployment mode) answers 200 with the entry that `POST` stored, its
+/// reason, and `no-store`. The state store is the one a frontend takes today (SQLite).
+///
+/// Mutant seen red: the `verbs::routes` merge deleted from `frontend.rs` (404).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_serves_the_deny_list_listing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = scratch_dir("frontend-denied");
+    let token = "kbf-test-token-0123456789abcdef0123456789";
+    let token_file = dir.join("token");
+    std::fs::write(&token_file, format!("{token}\n")).expect("token");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let node = Node::start().await;
+    let front = Front::start(
+        &flags(&[
+            &format!("--storage=http://{}", node.addr),
+            &format!("--api-token-file={}", token_file.display()),
+            &format!("--state-store=sqlite://{}", dir.join("state.db").display()),
+        ])
+        .expect("parses"),
+    )
+    .await;
+    let call = |method: &'static str, body: &'static str| {
+        let api = front.api;
+        async move {
+            let mut stream = TcpStream::connect(api).await.expect("connect");
+            let request = format!(
+                "{method} /v1/denied HTTP/1.1\r\nHost: kbf\r\nAuthorization: Bearer {token}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).await.expect("write");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.expect("read");
+            response.split_once("\r\n\r\n").map_or_else(
+                || panic!("no head: {response}"),
+                |(head, body)| (head.to_ascii_lowercase(), body.to_owned()),
+            )
+        }
+    };
+    let (head, body) = call("POST", r#"{"entry":"node mac-07","reason":"retired"}"#).await;
+    assert!(head.starts_with("http/1.1 200"), "{head} {body}");
+    let (head, body) = call("GET", "").await;
+    assert!(head.starts_with("http/1.1 200"), "{head} {body}");
+    assert!(head.contains("cache-control: no-store"), "{head}");
+    let list: kbf_types::operator_api::DeniedList = serde_json::from_str(&body).expect("a list");
+    assert_eq!(list.denied.len(), 1, "{body}");
+    assert_eq!(list.denied[0].entry, "node mac-07");
+    assert_eq!(list.denied[0].reason, "retired");
+    std::fs::remove_dir_all(&dir).expect("clean");
+}
+
 /// Catches a `--reapi-tls-cert` and `--reapi-tls-key` that a frontend takes and does not
 /// serve (clients would find plain text where the flags promised TLS): the REAPI listener
 /// answers a health check over TLS for the certificate's name and does not answer in

@@ -161,7 +161,7 @@ section 8) and is not an operator verb of the farm.
 | frontend handover, enroll, `kbf node` | `kbf frontend handover`, `kbf enroll`, `kbf node` **[F]** | replaced by the installer's side-by-side children (#1054, #1062) and removed by #1049 **[V]** |
 | render, check, install units, swap, verify certificate; envoy render, check, apply | `kbf-deploy` **[F]** | become installer logic and package units; root |
 | `mdm`, `minio`, `pilot`, `erase-request` | `kbf-deploy` **[F]** | leave the product (distribution.md section 8); an erase request is signed with a security key on the operator's machine |
-| `kbf cluster status`, `drain`, `undrain`, `member` | the `kbf` CLI **[F]**, with object-store verbs in unit G1 | a thin client of the routes above, no logic |
+| `kbf cluster status`, `drain`, `undrain`, `member`, `denied`, `object-store status\|audit\|connection\|bind\|unbind\|verify` | the `kbf` CLI **[F]** (the last two groups: unit G1) | a thin client of the routes above, no logic |
 | frontend log tail | none | cut (Q4) |
 | update policy, image pull | none | no source verb exists (Q5) |
 | rotate the CA | its own unit | out of the object-store series (Q5) |
