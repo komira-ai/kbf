@@ -565,3 +565,30 @@ fn budget_diff_defaults_to_this_repository() {
         "ok: tools/interpreter_budget.tsv adds no row to HEAD's\n"
     );
 }
+
+#[test]
+fn proxy_loom_passes_when_cargo_passes_and_fails_when_it_fails() {
+    let root = scratch("proxy-loom");
+    // The fake cargo prints cargo's result line for five models; `true` prints nothing, which
+    // is a gate that ran no model.
+    let mut passing = xtask(&root, &["proxy-loom"]);
+    passing.env("CARGO", FAKE);
+    let (code, out, err) = outcome(passing.output().expect("run xtask"));
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    assert!(
+        out.contains("the kbf-proxy loom models passed (5 ran)"),
+        "{out}"
+    );
+
+    let mut silent = xtask(&root, &["proxy-loom"]);
+    silent.env("CARGO", "true");
+    let (code, _, err) = outcome(silent.output().expect("run xtask"));
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ran 0 tests"), "{err}");
+
+    let mut failing = xtask(&root, &["proxy-loom"]);
+    failing.env("CARGO", "false");
+    let (code, _, err) = outcome(failing.output().expect("run xtask"));
+    assert_eq!(code, Some(1));
+    assert!(err.contains("the kbf-proxy loom models failed"), "{err}");
+}
