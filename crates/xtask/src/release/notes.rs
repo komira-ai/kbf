@@ -5,7 +5,7 @@
 use kbf_gate::{Floor, ResultDoc, Verdict};
 
 use super::git;
-use super::verdict::{Subject, verify};
+use super::verdict::{Subject, bake_secs, verify};
 use crate::Error;
 
 /// Commits listed at most; the rest are counted.
@@ -54,17 +54,20 @@ fn render(doc: &ResultDoc, tag: &str, since: Option<&str>, commits: &[String]) -
     }
 
     let mut gamma = Vec::new();
-    if let Some(secs) = doc.bake.and_then(|b| Some(b.end?.saturating_sub(b.start))) {
-        gamma.push(format!("bake: {}h {:02}m", secs / 3600, secs % 3600 / 60));
-    }
-    if let Some(l) = doc.load {
-        gamma.push(format!(
+    // A verified verdict has a finished, forward bake, so this always yields one line.
+    gamma.extend(
+        bake_secs(doc)
+            .flatten()
+            .map(|secs| format!("bake: {}h {:02}m", secs / 3600, secs % 3600 / 60)),
+    );
+    gamma.extend(doc.load.map(|l| {
+        format!(
             "load: {}, {}, {}",
             floor("actions", l.actions),
             floor("builds", l.builds),
             floor("hours", l.hours)
-        ));
-    }
+        )
+    }));
     for g in &doc.gates {
         let measured = g.measured.map_or("absent".to_owned(), |m| m.to_string());
         let mark = if g.verdict == Verdict::Warn {

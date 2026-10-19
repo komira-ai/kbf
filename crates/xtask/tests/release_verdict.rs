@@ -411,6 +411,18 @@ fn a_verdict_naming_another_tag_fails() {
 }
 
 #[test]
+fn a_tag_on_an_object_that_is_not_a_commit_fails_naming_its_kind() {
+    // Catches: a tag of a tree (same message, same name) passing because only the
+    // object id was compared, or the kind never being part of the check.
+    let fx = fx("tag-of-tree");
+    let tree = fx.git(&["rev-parse", &format!("{RELEASE}^{{tree}}")]);
+    fx.annotate(TAG, &tree, &msg(&good()));
+    let (code, out, err) = verdict(&fx, TAG, RELEASE);
+    assert_eq!(code, Some(1), "{out}{err}");
+    assert!(err.contains("names tree"), "{err}");
+}
+
+#[test]
 fn a_tag_object_named_other_than_its_ref_fails() {
     // Catches: refs/tags/v0.10.0 made to point at another tag's object (the verdict then
     // names a tag the ref is not).

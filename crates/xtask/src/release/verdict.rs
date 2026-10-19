@@ -63,7 +63,8 @@ pub fn verify(s: &Subject) -> Result<Verified, Error> {
         )]));
     };
     let mut problems = Vec::new();
-    if kind != "commit" || object != s.commit {
+    // An object of another kind has another id, so the id alone refuses a tag of a tree.
+    if object != s.commit {
         problems.push(format!(
             "tag {} names {kind} {object}, not commit {}",
             s.tag, s.commit
@@ -87,6 +88,13 @@ pub fn verify(s: &Subject) -> Result<Verified, Error> {
         return Err(Error::Refused(problems));
     }
     Ok(Verified { doc, set_hash })
+}
+
+/// How long the bake lasted: none when it has no end yet, and `Some(None)` when it ends
+/// before it starts (never a wrapped duration).
+pub(super) fn bake_secs(doc: &ResultDoc) -> Option<Option<u64>> {
+    let bake = doc.bake?;
+    Some(bake.end?.checked_sub(bake.start))
 }
 
 /// What is wrong with a parsed verdict for this release. The parser has already refused a
@@ -124,7 +132,7 @@ fn judge(doc: &ResultDoc, s: &Subject, set_hash: &SetHash) -> Vec<String> {
             s.tag
         ));
     }
-    match doc.bake.and_then(|b| Some(b.end?.checked_sub(b.start))) {
+    match bake_secs(doc) {
         Some(Some(secs)) if secs >= MIN_BAKE_SECS => {}
         Some(Some(secs)) => problems.push(format!(
             "the bake lasted {secs} s, less than {MIN_BAKE_SECS} s (24 h)"
