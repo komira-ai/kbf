@@ -33,6 +33,7 @@
 #[cfg(any(test, feature = "test-support"))]
 mod backend;
 mod conn;
+pub mod schema;
 mod session;
 mod tx;
 
@@ -127,6 +128,7 @@ pub struct PostgresConfig {
     pg: postgres::Config,
     schema: String,
     max_connections: usize,
+    supported: schema::Supported,
 }
 
 impl fmt::Debug for PostgresConfig {
@@ -176,6 +178,7 @@ impl PostgresConfig {
             pg,
             schema: Self::DEFAULT_SCHEMA.to_owned(),
             max_connections: Self::DEFAULT_MAX_CONNECTIONS,
+            supported: schema::Supported::this_build(),
         })
     }
 
@@ -195,6 +198,15 @@ impl PostgresConfig {
         }
         self.schema = schema.to_owned();
         Ok(self)
+    }
+
+    /// Makes the store accept schema versions `min` to `max` instead of what this build
+    /// embeds. For tests that play another release.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_supported_schema(mut self, min: u32, max: u32) -> PostgresConfig {
+        self.supported = schema::Supported { min, max };
+        self
     }
 
     /// Names the connections in `pg_stat_activity`.
@@ -340,17 +352,20 @@ impl Pending<'_> {
 }
 
 impl PostgresStore {
-    /// Connects, checks that the server makes commits durable, and creates the tables
-    /// if they are not there. Expiry is judged by the database's clock.
+    /// Connects, checks that the server makes commits durable and that the schema is one
+    /// this build supports ([`schema`]). It creates nothing: `kbf-installer` owns the
+    /// schema. Expiry is judged by the database's clock.
     ///
     /// # Errors
-    /// [`StoreError`] when the server cannot be reached or does not flush commits
-    /// (`synchronous_commit` is not on).
+    /// [`StoreError`] when the server cannot be reached, does not flush commits
+    /// (`synchronous_commit` is not on), or holds no schema or one outside the supported
+    /// range (one line saying which and what to run).
     pub fn open(config: &PostgresConfig) -> Result<PostgresStore, StoreError> {
         let pool = Pool::open(
             config.pg.clone(),
             config.schema.clone(),
             config.max_connections,
+            config.supported,
         )
         .map_err(Fail::into_store)?;
         Ok(PostgresStore {
@@ -876,7 +891,22 @@ mod tests {
         client
             .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
             .expect("a clean schema");
+        installed(&config);
         (PostgresStore::open(&config).expect("opens"), client)
+    }
+
+    /// The schema in `config`, as the installer makes it.
+    fn installed(config: &PostgresConfig) {
+        postgres::Client::connect(&url(), postgres::NoTls)
+            .and_then(|mut client| {
+                client.batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {} CASCADE",
+                    config.schema()
+                ))
+            })
+            .expect("a clean schema");
+        super::schema::apply(config, &super::schema::embedded(), super::schema::latest())
+            .expect("the installer's step");
     }
 
     /// The error the server gives for `code`.
@@ -978,6 +1008,7 @@ mod tests {
             .and_then(|config| config.with_schema("kbf_unit_empty"))
             .expect("a usable URL and schema")
             .with_application_name("kbf_unit_empty");
+        installed(&config);
         let store = PostgresStore::open(&config).expect("opens");
         let mut client = postgres::Client::connect(&url(), postgres::NoTls).expect("connect");
         let sessions = |client: &mut postgres::Client| -> i64 {

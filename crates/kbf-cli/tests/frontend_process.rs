@@ -327,13 +327,14 @@ fn without_password(url: &str) -> String {
 
 /// Catches a frontend process started with a Postgres `--state-store` that dies at start
 /// (the blocking client run inside the server's tokio runtime panicked with "Cannot start
-/// a runtime from within a runtime"), or that starts and does not create its tables in
-/// the database (the `kv` table is read back), or whose `/readyz` is not 200 over the
-/// store. Needs a Postgres server: `KBF_TEST_POSTGRES_URL` names a database the test may
-/// create the `kbf_state` schema in.
+/// a runtime from within a runtime"), or whose `/readyz` is not 200 over the schema the
+/// installer made, or that creates the tables itself: started on a database nobody ran
+/// `setup` on it must exit with the one line that says what to run, and leave no schema.
+/// Needs a Postgres server: `KBF_TEST_POSTGRES_URL` names a database the test may create
+/// the `kbf_state` schema in.
 #[test]
 #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
-fn a_frontend_process_with_a_postgres_state_store_is_ready_and_has_made_its_tables() {
+fn a_frontend_process_with_a_postgres_state_store_is_ready_over_the_installers_schema() {
     let url = std::env::var("KBF_TEST_POSTGRES_URL")
         .expect("KBF_TEST_POSTGRES_URL names a database the test may create schemas in");
     let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-postgres");
@@ -341,12 +342,45 @@ fn a_frontend_process_with_a_postgres_state_store_is_ready_and_has_made_its_tabl
     // The flag refuses a password (the command line is world-readable), so the process
     // gets the URL without one; the server the job runs trusts its loopback clients.
     let flag = format!("--state-store={}", without_password(&url));
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
+    client
+        .batch_execute("DROP SCHEMA IF EXISTS kbf_state CASCADE")
+        .expect("start from a database with no schema");
+
+    let storage = format!("--storage=http://{}", node.field("storage="));
+    let refused = Command::new(BIN)
+        .args([
+            "frontend",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+        ])
+        .args([storage.as_str(), flag.as_str()])
+        .output()
+        .expect("run kbf");
+    assert!(
+        !refused.status.success(),
+        "a start with no schema must fail"
+    );
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("kbf-installer setup"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+    let made = client
+        .query(
+            "SELECT 1 FROM pg_namespace WHERE nspname = 'kbf_state'",
+            &[],
+        )
+        .expect("catalog");
+    assert!(made.is_empty(), "the refused start created the schema");
+
+    let config = kbf_state::postgres::PostgresConfig::parse(&url).expect("the URL parses");
+    let set = kbf_state::postgres::schema::embedded();
+    kbf_state::postgres::schema::apply(&config, &set, kbf_state::postgres::schema::latest())
+        .expect("the installer's step");
     let mut front = frontend(&node.field("storage="), &[&flag]);
     let (code, body) = get(&front.field("api="), "/readyz");
     assert_eq!(code, 200, "{body}");
-    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
     client
         .query_one("SELECT count(*) FROM kbf_state.kv", &[])
-        .expect("the frontend created its tables in the database");
+        .expect("the installer's tables are there");
     assert!(front.stop().is_some_and(|status| status.success()));
 }
