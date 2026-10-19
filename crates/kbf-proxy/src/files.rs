@@ -164,12 +164,13 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir).and_then(|dir| dir.sync_all())
 }
 
-/// [`write_new`] with the directory's fsync given, so a test can fail it.
+/// [`write_new`] with the directory's fsync given, so a test can fail it. (A function
+/// pointer and not a generic: one copy of the code, so every test counts toward its coverage.)
 fn write_new_with(
     path: &Path,
     bytes: &[u8],
     place: Place,
-    sync_dir: impl FnOnce(&Path) -> io::Result<()>,
+    sync_dir: fn(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let dir = path
         .parent()
@@ -384,7 +385,9 @@ mod tests {
         // A creation whose directory fsync fails reports it and leaves no file; a replacement
         // keeps its new content.
         let fresh = dir.join("fresh");
-        let broken = |_: &Path| Err(io::Error::from(io::ErrorKind::Other));
+        fn broken(_: &Path) -> io::Result<()> {
+            Err(io::ErrorKind::Other.into())
+        }
         write_new_with(&fresh, &[5; 32], Place::New, broken).expect_err("fsync fails");
         assert_eq!(entries(&dir), ["proxy-auth"]);
         write_new_with(&path, &[6; 32], Place::Replace, broken).expect_err("fsync fails");
