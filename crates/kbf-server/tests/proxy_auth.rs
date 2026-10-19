@@ -693,6 +693,39 @@ fn the_deny_list_applies_behind_the_proxy() {
     ));
 }
 
+/// Catches: `Args::proxy` starting a proxied server on a deny list it cannot read or parse
+/// (it fails, rather than warn and go on with no list), and the failure carrying the proxy
+/// secret: the error names the flag, the list path and the line, nothing of the secret.
+///
+/// Mutant seen red: the `DenyList::open` error dropped (`.and_then(|p| ...ok())`). The `?` on
+/// `certificate_entries` after it is reached only by a list that goes bad between the two
+/// reads; `tests/identity.rs` covers that call.
+#[test]
+fn a_deny_list_that_cannot_be_read_or_parsed_stops_a_proxied_start_without_the_secret() {
+    let secret = file(&SECRET, 0o600);
+    let secret = secret.to_str().expect("UTF-8");
+    let bad = file(b"node a\nserial zz\n", 0o600);
+    let missing = dir().join("no-such-deny-list");
+    let _ = std::fs::remove_file(&missing);
+    for (list, words) in [(bad, ["serial", ":2:"]), (missing, ["read", "no-such"])] {
+        let list = list.to_str().expect("UTF-8");
+        let error = args(&["--proxy-auth-file", secret, "--worker-deny-list", list])
+            .proxy()
+            .map(|_| ())
+            .expect_err("a list the server cannot apply");
+        assert!(matches!(error, ConfigError::DenyList(_)), "{error:?}");
+        let text = format!("{error} {error:?}");
+        assert!(text.contains(list), "{text}");
+        for word in words {
+            assert!(text.contains(word), "{word} not in {text}");
+        }
+        assert!(
+            !text.contains(&presented_secret()) && !text.contains(&"Z".repeat(32)),
+            "{text}"
+        );
+    }
+}
+
 /// Catches the proxy arm of the role table: a proxied call is judged by the role the proxy
 /// forwarded (a daemon may open a session, a storage node may not, a call with no role is
 /// UNAUTHENTICATED), under no admission only the path is checked, and a method the listener

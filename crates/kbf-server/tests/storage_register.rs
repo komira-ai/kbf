@@ -1094,6 +1094,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
             boot: 1,
             heartbeat_interval_ms: 1,
             map: Some(self.map()),
+            ..Default::default()
         }))
     }
 
@@ -1104,6 +1105,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
         Ok(tonic::Response::new(pb::HeartbeatResponse {
             map_generation: 9,
             map: Some(self.map()),
+            ..Default::default()
         }))
     }
 }
@@ -1576,6 +1578,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for SharedHourly {
             boot: 1,
             heartbeat_interval_ms: 3_600_000,
             map: Some(a_map(1)),
+            ..Default::default()
         }))
     }
 
@@ -1590,6 +1593,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for SharedHourly {
         Ok(tonic::Response::new(pb::HeartbeatResponse {
             map_generation: 2,
             map: behind.then(|| a_map(2)),
+            ..Default::default()
         }))
     }
 }
@@ -1674,6 +1678,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for FlakyService {
             boot: 1,
             heartbeat_interval_ms: 1,
             map: None,
+            ..Default::default()
         }))
     }
 
@@ -1688,6 +1693,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for FlakyService {
         Ok(tonic::Response::new(pb::HeartbeatResponse {
             map_generation: 1,
             map: None,
+            ..Default::default()
         }))
     }
 }

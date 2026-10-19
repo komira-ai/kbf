@@ -20,6 +20,35 @@ fn the_golden_files_decode_and_render_to_themselves() {
     }
 }
 
+/// Catches the closed reader refusing the `database` key that `kbf-installer setup` and
+/// `run --installer-config` read (so the `check` verb would call a working host's file
+/// invalid), or the key lost on the way back out.
+#[test]
+fn the_database_key_is_accepted_and_rendered() {
+    let text = "database = \"postgres:///kbf?host=/run/postgresql\"\n";
+    let parsed = InstallerToml::parse(text).expect("parses");
+    assert_eq!(
+        parsed.database.as_deref(),
+        Some("postgres:///kbf?host=/run/postgresql")
+    );
+    assert!(parsed.render().ends_with(text), "{}", parsed.render());
+    assert_eq!(InstallerToml::default().database, None);
+}
+
+/// Catches `render` writing the database URL with Rust's Debug escaping, which is not TOML
+/// (a `'` came out as `\'` and a non-ASCII character as `\u{..}`): the rendered file must
+/// parse back to the same URL.
+#[test]
+fn a_database_url_with_quotes_and_non_ascii_renders_as_toml() {
+    let url = "postgres://kbf@db/it's?application_name=caf\u{e9}\"x\\y";
+    let file = InstallerToml {
+        database: Some(url.to_owned()),
+        ..InstallerToml::default()
+    };
+    let back = InstallerToml::parse(&file.render()).expect("the rendered file parses");
+    assert_eq!(back.database.as_deref(), Some(url));
+}
+
 /// Catches a default that drifted from the contract (section 3): an empty file is a frontend
 /// source, 900 s window, 900 s fetch, 512 MiB, 60 s between activations.
 #[test]
@@ -284,4 +313,14 @@ fn the_identity_pair_and_the_source_agree() {
         "release_source = \"frontend\"\nnode_cert = \"/c\"\nnode_key = \"/k\"",
     );
     assert!(ok.is_ok());
+}
+
+/// Catches a control character in the database URL being written raw into the file (which
+/// would break the line, or hide a key): it is escaped as `\u00XX` and reads back the same.
+#[test]
+fn a_control_character_in_the_database_url_is_escaped() {
+    let rendered = toml_string("a\u{1}b\tc");
+    assert_eq!(rendered, "\"a\\u0001b\\u0009c\"");
+    let back: toml::Table = format!("k = {rendered}").parse().expect("valid TOML");
+    assert_eq!(back["k"].as_str(), Some("a\u{1}b\tc"));
 }
