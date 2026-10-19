@@ -1486,7 +1486,8 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
   bundle carries the bundle's own digest, and the store also names the bundle by that
   digest next to the tarballs (one file, two names), so that `ReleaseService.Fetch` serves a
   bundle like a tarball. A bundle stored before that link existed has no such name until the
-  same bytes are put again (`200`); `Describe` reports it as lacking until then.
+  same bytes are put again (`200`); `Describe` reports it as lacking until then, though
+  `GET /v1/releases` and the offers still count its platform complete.
 - `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
   "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
   order above, a platform `complete` when it holds, with their attestations, the tarballs its

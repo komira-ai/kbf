@@ -2,13 +2,16 @@
 //! `ReleaseService.Describe` ([`super::grpc`]) and `GET /v1/releases/{commit}`
 //! ([`super::http`]), which answer from [`describe`] and differ only in how they say it.
 //!
-//! - **The same rule as an offer.** A platform is described only when it is complete: every
-//!   tarball it needs ([`ReleasePlatform::components`]) stored with its attestation, exactly
-//!   what [`super::offers`] offers. A description carries those tarballs and no others.
+//! - **An offer's rule, and a bundle that can be fetched.** A platform is described only
+//!   when it is complete: every tarball it needs ([`ReleasePlatform::components`]) stored
+//!   with its attestation, as [`super::offers`] offers it, and each attestation served
+//!   under its digest (next). A description carries those tarballs and no others.
 //! - **Every file named can be fetched.** A component carries the digest and size of its
 //!   tarball and of its attestation bundle; both are served under their digests
-//!   ([`ReleaseStore::open_tarball`]), so a bundle stored before the store linked bundles
-//!   into `files/` is reported as lacking until it is put again.
+//!   ([`ReleaseStore::open_tarball`]). A bundle stored before the store linked bundles
+//!   into `files/` has no such name: its platform is still complete by an offer's rule
+//!   (and in `GET /v1/releases`), and is reported as lacking here until the bundle is put
+//!   again.
 //! - **One platform, or all that are complete.** For a platform asked, anything it lacks
 //!   fails the call and is named; for none asked, a platform that is not complete is left
 //!   out, and the call fails only when no platform is complete.
@@ -175,8 +178,11 @@ pub async fn describe(
             Found::Lacking(missing) => lacks.extend(missing),
         }
     }
-    // An incomplete platform fails a call that asked for it; one among others is left out.
-    if !lacks.is_empty() && (platform.is_some() || components.is_empty()) {
+    // A platform that lacks anything adds no component, so for the one platform asked,
+    // `components` is empty exactly when it is incomplete and the call fails. For none
+    // asked, a platform among others is left out and the call fails only when none is
+    // complete.
+    if !lacks.is_empty() && components.is_empty() {
         return Err(DescribeError::Incomplete {
             commit: commit.clone(),
             lacks,
