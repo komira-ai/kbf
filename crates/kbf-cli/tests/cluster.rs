@@ -172,7 +172,10 @@ fn the_cluster_help_and_the_hint_name_every_verb_group() {
     assert_eq!(code, Some(0), "{err}");
     let about = out.lines().next().unwrap_or_default();
     for word in ["member", "denied", "object store"] {
-        assert!(about.contains(word), "{word} missing from the about line: {out}");
+        assert!(
+            about.contains(word),
+            "{word} missing from the about line: {out}"
+        );
     }
     let (_, top, _) = kbf(&["--help"]);
     for word in ["member", "denied", "object-store"] {

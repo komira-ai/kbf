@@ -345,7 +345,10 @@ fn duplicate_headings(text: &str) -> Vec<String> {
 fn the_api_doc_names_each_section_once() {
     let text = fs::read_to_string(root().join("docs/api.md")).unwrap();
     let dup = duplicate_headings(&text);
-    assert!(dup.is_empty(), "docs/api.md repeats these sections: {dup:?}");
+    assert!(
+        dup.is_empty(),
+        "docs/api.md repeats these sections: {dup:?}"
+    );
 }
 
 #[test]
