@@ -56,6 +56,8 @@ kbf-driver-container.workspace = true
 kbf-meta.workspace = true
 # The store a blob is in, to damage one (src/plane_tests.rs).
 kbf-objstore.workspace = true
+# The tree removal a hardened process must still manage (src/storage_and_daemon_tests.rs).
+kbf-outputs.workspace = true
 # The act steps the stand-in `crun` runs as each action, through this test binary.
 kbf-testkit.workspace = true
 prost.workspace = true

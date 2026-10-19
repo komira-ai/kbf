@@ -1334,6 +1334,7 @@ dependencies = [
  "kbf-meta",
  "kbf-node",
  "kbf-objstore",
+ "kbf-outputs",
  "kbf-proto",
  "kbf-segments",
  "kbf-server",

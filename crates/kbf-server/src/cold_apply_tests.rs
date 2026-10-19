@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_objstore::s3::fake::FakeS3;
-use kbf_objstore::{ByteRange, Capabilities, MemoryStore, ObjectKey};
+use kbf_objstore::{ByteRange, Capabilities, MemoryStore, ObjectKey, ObjectStoreError};
 use kbf_proto::kbf::enroll::v1::GetStoreConfigRequest;
 use kbf_proto::kbf::enroll::v1::cold_store_server::{ColdStore, ColdStoreServer};
 use tokio::time::Instant;
@@ -579,6 +579,58 @@ async fn registered_keys_that_pass_the_probe_are_the_store_the_node_runs_on() {
         assert!(
             takes_registered_writes(&store, &format!("keys-{keys}")).await,
             "own keys {keys}"
+        );
+    }
+}
+
+/// Catches a registration whose put settings do not reach the store the node runs on
+/// (mutants: `conditional_put` taken from the flag, `false`, or negated; `min_put_rate`
+/// taken from the flag): for each setting of the registration, with the flag set the
+/// other way, the address the store is opened on carries the registration's, and a rate
+/// of 0 (not set) falls back to the flag's.
+#[test]
+fn the_registered_put_settings_are_the_stores_not_the_flags() {
+    for registered in [true, false] {
+        let mut config = config("bkt", "kbf/", "http://127.0.0.1:9");
+        config.conditional_put = registered;
+        config.min_put_rate = 7;
+        let mut flag = uri("bkt", "kbf/", "http://127.0.0.1:9");
+        flag.conditional_put = !registered;
+        flag.min_put_rate = NonZeroU64::new(3).expect("non-zero");
+        let opened = registered_uri(&flag, &config);
+        assert_eq!(opened.conditional_put, registered);
+        assert_eq!(opened.min_put_rate.get(), 7);
+        config.min_put_rate = 0;
+        assert_eq!(registered_uri(&flag, &config).min_put_rate.get(), 3);
+        assert_eq!(opened.region, "eu-west-1", "the registration's region");
+    }
+}
+
+/// Catches the same defect one step on, where it matters (mutants as above, in
+/// `registered_store`): a registration that says conditional puts gives a store that
+/// refuses a second `put_new` of a key, and one that says not gives a store that
+/// replaces it, whatever the node's flag says.
+#[tokio::test]
+async fn the_registered_store_puts_as_the_registration_says() {
+    let s3 = s3().await;
+    for conditional in [true, false] {
+        let mut answer = registered(&s3, 7, SECRET);
+        answer.config.as_mut().expect("a config").conditional_put = conditional;
+        let joiner = answering(Ok(answer)).await;
+        let mut flag = uri("bkt", "kbf/", s3.endpoint());
+        flag.conditional_put = !conditional;
+        let node = Registrable::new(&flag, no_keys).expect("a store");
+        let (store, _) = within(node.registered(&joiner, &joined(7)))
+            .await
+            .expect("opens on the registration");
+        assert_eq!(store.capabilities().conditional_put, conditional);
+        let key = ObjectKey::new(format!("kbf/cas/put-{conditional}")).expect("a key");
+        let put = || store.put_new(&key, bytes::Bytes::from_static(b"x"), None);
+        put().await.expect("the first put");
+        assert_eq!(
+            matches!(put().await, Err(ObjectStoreError::AlreadyExists(_))),
+            conditional,
+            "conditional {conditional}"
         );
     }
 }

@@ -36,7 +36,7 @@
 //! them prints the secret as `Secret(..)` and overwrites it when dropped; the store
 //! client keeps its own copy for the life of the process. They are never written, passed
 //! as an argument or an environment variable, or logged. [`harden_process`] turns off core
-//! dumps for the process before the node can hold them.
+//! dumps for the process before the node can hold them, and makes it not dumpable.
 
 use std::error::Error;
 use std::future::Future;
@@ -245,17 +245,12 @@ fn refusal(why: Unusable) -> ColdApplyError {
     }
 }
 
-/// The store `config` names with its keys, probed as `nonce`.
-async fn registered_store(
-    flag: &S3Uri,
-    config: &StoreConfig,
-    nonce: &str,
-) -> Result<S3Store, Unusable> {
-    let prefix = prefix_of(&config.prefix);
-    let root = KeyPrefix::new(prefix.clone()).map_err(|_| Unusable::Config)?;
-    let uri = S3Uri {
+/// The address and put settings of the store `config` registers: its own, and the flag's
+/// region or minimum put rate where it names none.
+fn registered_uri(flag: &S3Uri, config: &StoreConfig) -> S3Uri {
+    S3Uri {
         bucket: config.bucket.clone(),
-        prefix,
+        prefix: prefix_of(&config.prefix),
         endpoint: config.endpoint.clone(),
         region: if config.region.is_empty() {
             flag.region.clone()
@@ -264,7 +259,17 @@ async fn registered_store(
         },
         conditional_put: config.conditional_put,
         min_put_rate: NonZeroU64::new(config.min_put_rate).unwrap_or(flag.min_put_rate),
-    };
+    }
+}
+
+/// The store `config` names with its keys, probed as `nonce`.
+async fn registered_store(
+    flag: &S3Uri,
+    config: &StoreConfig,
+    nonce: &str,
+) -> Result<S3Store, Unusable> {
+    let uri = registered_uri(flag, config);
+    let root = KeyPrefix::new(uri.prefix.clone()).map_err(|_| Unusable::Config)?;
     let credentials = Credentials::new(&config.access_key_id, config.secret_access_key.clone());
     let store = s3_store_keyed(&uri, credentials).map_err(|_| Unusable::Config)?;
     probe(&store, &root, nonce).await.map_err(Unusable::Probe)?;
@@ -414,9 +419,18 @@ impl ColdPick for Registrable {
     }
 }
 
-/// Makes the process refuse to leave its memory in a file: no core dump, and where the
-/// system has the control, not dumpable. A node that registers with a frontend may hold
-/// the cold store's keys, so it calls this before it starts.
+/// Makes the process refuse to leave its memory in a file: no core dump (`RLIMIT_CORE` 0),
+/// and where the system has the control, not
+/// dumpable (`PR_SET_DUMPABLE` 0: no other process of the same user can `ptrace` it or
+/// read `/proc/self/mem`). A node that registers with a frontend may hold the cold store's
+/// keys, so it calls this before it starts.
+///
+/// Not dumpable makes a process's `/proc/self` entries root-owned, but the kernel lets a
+/// process open its own `/proc/self/fd` and follow its entries whatever their owner
+/// (`proc_fd_permission`, `proc_fd_access_allowed`). The worker daemon of
+/// `kbf storage-and-daemon` shares the process and needs exactly that to chmod a read-only
+/// directory before it removes the tree (`kbf_outputs::remove_tree`); a test of that
+/// mode pins that it still works.
 ///
 /// # Errors
 /// The limit cannot be set.

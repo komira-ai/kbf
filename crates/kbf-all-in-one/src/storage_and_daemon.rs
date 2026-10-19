@@ -147,7 +147,7 @@ fn serve(flags: Flags) -> Result<(), crate::run::Failed> {
     sizes.log();
     let tokio = sizes.runtime().map_err(Failed::server)?;
     // Before the half can hold the keys of a registered cold store.
-    kbf_server::storage_node::harden(&flags.storage).map_err(Failed::server)?;
+    protect_keys(&flags.storage).map_err(Failed::server)?;
     let start = kbf_server::storage_half::start(&flags.storage, kbf_server::interrupted);
     let half = tokio.block_on(start);
     let half = half.map_err(Failed::server)?;
@@ -155,6 +155,17 @@ fn serve(flags: Flags) -> Result<(), crate::run::Failed> {
     let start = starter(&flags, &half, tokio.handle());
     let serving = Box::pin(half.serve());
     with_daemon(&tokio, serving, start, &flags.daemon)
+}
+
+/// Hardens the process for a storage half that may hold registered keys, as `kbf storage`
+/// does (`kbf_server::storage_node::harden`). The daemon half shares the process; its
+/// output removal opens `/proc/self/fd`, which a hardened process may (see
+/// `kbf_server::cold_apply::harden_process`).
+#[cfg(target_os = "linux")]
+fn protect_keys(
+    storage: &kbf_server::storage_node::StorageFlags,
+) -> Result<(), Box<dyn std::error::Error>> {
+    kbf_server::storage_node::harden(storage)
 }
 
 /// Whether the daemon half routes its blobs by the storage map: when the node registers
