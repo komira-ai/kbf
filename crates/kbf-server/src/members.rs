@@ -847,7 +847,7 @@ impl Members {
     /// while it rebuilds, the mark deleted); if it stops and does not return, its row
     /// expires and the dwell, counted from this call, decides when it leaves the map.
     ///
-    /// **Mixed frontends.** The end of the plan lives in the member's row (tag 4), which a
+    /// **Mixed frontends.** The end of the plan lives in the member's row (tag 5), which a
     /// frontend built before it does not know: it keeps the state `Down` when it rewrites the
     /// row (a heartbeat, a promotion) but drops the end, so the plan would never run out.
     /// Plan nothing down while a frontend of an older build serves the same state store.

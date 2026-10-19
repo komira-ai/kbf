@@ -313,7 +313,7 @@ fn a_newer_frontends_membership_answers_decode() {
 // field 9 and the known flag on 10 (7 and 8 are the cold-store registration report), each a
 // varint, beside every field before them.
 #[test]
-fn the_heartbeat_open_writes_are_fields_seven_and_eight() {
+fn the_heartbeat_open_writes_are_fields_nine_and_ten() {
     let beat = pb::HeartbeatRequest {
         member_id: 1,
         boot: 2,
