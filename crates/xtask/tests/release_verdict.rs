@@ -452,6 +452,18 @@ fn a_bake_one_second_short_of_24_hours_fails_and_24_hours_passes() {
 }
 
 #[test]
+fn a_bake_that_ends_before_it_starts_is_refused_not_wrapped_to_a_long_one() {
+    // Catches: the duration taken with `wrapping_sub` (end before start becomes ~2^64 s,
+    // past the 24 h floor), a verdict forged past the bake gate.
+    let mut d = good();
+    d.bake = Some(Window {
+        start: 2_000 + DAY,
+        end: Some(2_000),
+    });
+    refused("bake-backwards", &d, "the bake ends before it starts");
+}
+
+#[test]
 fn thin_load_needs_a_recorded_waiver() {
     // Catches: a check that never reads the load, or one that reads a waiver of anything.
     let thin = |d: &mut ResultDoc| {
@@ -569,6 +581,7 @@ fn the_notes_list_what_is_not_reversible_and_say_so_when_nothing_is() {
 #[test]
 fn the_notes_carry_the_verdict_summary_the_escapes_and_the_withdrawn() {
     let notes = notes_of(&with_notes("notes-summary", |d| {
+        d.load.as_mut().unwrap().actions.measured = 1_500;
         d.escapes = vec![
             "handover with a build in flight".to_owned(),
             "two".to_owned(),
@@ -578,7 +591,8 @@ fn the_notes_carry_the_verdict_summary_the_escapes_and_the_withdrawn() {
         d.gates[0] = GateResult::decide("lost-blobs", Sample::Value(0.0), Limit::AtMost(0.0), 1, 2);
     }));
     assert!(notes.contains("- bake: 24h 00m\n"), "{notes}");
-    assert!(notes.contains("actions 1000 (needs 1000)"), "{notes}");
+    assert!(notes.contains("actions 1500 (needs 1000)"), "{notes}");
+    assert!(notes.contains("builds 12 (needs 10)"), "{notes}");
     assert!(notes.contains("- gate lost-blobs: 0\n"), "{notes}");
     assert!(
         notes.contains("- waived min-load by op: holiday week\n"),
@@ -716,4 +730,77 @@ fn a_commit_that_is_not_a_full_sha_is_a_usage_error() {
     fx.annotate(TAG, RELEASE, &msg(&good()));
     let (code, _, err) = verdict(&fx, TAG, "abc");
     assert_eq!(code, Some(2), "{err}");
+}
+
+#[test]
+fn verdict_output_appends_to_a_file_that_holds_earlier_lines() {
+    // Catches: `--output` truncating instead of appending. On Actions the file is
+    // GITHUB_OUTPUT, which holds the earlier steps' lines the publish step still reads.
+    let fx = fx("output-append");
+    fx.annotate(TAG, RELEASE, &msg(&good()));
+    let output = fx.root.join("out");
+    std::fs::write(&output, "earlier=1\n").unwrap();
+    let out = output.to_str().unwrap();
+    for _ in 0..2 {
+        let (code, stdout, err) = run(&fx, "verdict", TAG, RELEASE, &["--output", out]);
+        assert_eq!(code, Some(0), "{stdout}{err}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&output).unwrap(),
+        format!("earlier=1\nset-hash={SET}\nset-hash={SET}\n")
+    );
+}
+
+#[test]
+fn verdict_output_that_cannot_be_written_fails_after_the_checks_pass() {
+    // Catches: a lost set hash reported as success (the publish step would then run
+    // without `--set-hash`); here the output path is a directory.
+    let fx = fx("output-unwritable");
+    fx.annotate(TAG, RELEASE, &msg(&good()));
+    let dir = fx.root.join("a-directory");
+    std::fs::create_dir(&dir).unwrap();
+    let (code, _, err) = run(
+        &fx,
+        "verdict",
+        TAG,
+        RELEASE,
+        &["--output", dir.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("append to"), "{err}");
+}
+
+#[test]
+fn notes_that_cannot_be_written_fail() {
+    // Catches: a notes file that was not written reported as written.
+    let fx = fx("notes-unwritable");
+    fx.annotate(TAG, RELEASE, &msg(&good()));
+    let out = fx.root.join("missing-dir").join("notes.md");
+    let (code, _, err) = run(
+        &fx,
+        "notes",
+        TAG,
+        RELEASE,
+        &["--out", out.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("write "), "{err}");
+}
+
+#[test]
+fn a_machine_without_git_fails_naming_git() {
+    // Catches: a git that cannot be started reported as anything but a failure that
+    // names it (the spawn error arm of every git call).
+    let fx = fx("no-git");
+    fx.annotate(TAG, RELEASE, &msg(&good()));
+    let (dist, repo) = (fx.dist(), fx.repo());
+    let out = Command::new(XTASK)
+        .args(["release", "verdict", dist.to_str().unwrap(), "--repo-dir"])
+        .arg(&repo)
+        .args(["--tag", TAG, "--commit", RELEASE, "--main-ref", "main"])
+        .env("PATH", fx.root.join("empty"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("git"));
 }

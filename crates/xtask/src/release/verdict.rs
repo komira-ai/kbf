@@ -124,11 +124,12 @@ fn judge(doc: &ResultDoc, s: &Subject, set_hash: &SetHash) -> Vec<String> {
             s.tag
         ));
     }
-    match doc.bake.and_then(|b| Some(b.end?.saturating_sub(b.start))) {
-        Some(secs) if secs >= MIN_BAKE_SECS => {}
-        Some(secs) => problems.push(format!(
+    match doc.bake.and_then(|b| Some(b.end?.checked_sub(b.start))) {
+        Some(Some(secs)) if secs >= MIN_BAKE_SECS => {}
+        Some(Some(secs)) => problems.push(format!(
             "the bake lasted {secs} s, less than {MIN_BAKE_SECS} s (24 h)"
         )),
+        Some(None) => problems.push("the bake ends before it starts".to_owned()),
         None => problems.push("the verdict records no finished bake".to_owned()),
     }
     let load_met = doc.load.is_some_and(|l| l.met());
