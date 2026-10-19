@@ -147,7 +147,7 @@ impl ProcChild {
     }
 
     /// The program of `release`.
-    fn program(&self, release: &CommitId) -> PathBuf {
+    pub(super) fn program(&self, release: &CommitId) -> PathBuf {
         let dir = self.layout.release_dir(release);
         self.layout.join(&dir).join(self.binary)
     }

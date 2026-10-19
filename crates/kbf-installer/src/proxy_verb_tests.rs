@@ -248,7 +248,7 @@ fn errors_map_to_exit_codes_and_words() {
 fn a_descriptor_the_runtime_cannot_use_is_a_failure_to_start() {
     let config = load(&file("serve", PROXY.as_bytes())).expect("valid");
     let regular = OwnedFd::from(fs::File::open(file("fd", b"x")).expect("open"));
-    match serve(config, regular) {
+    match serve(config, regular, Path::new("/nonexistent")) {
         Err(VerbError::Failed(text)) => {
             assert!(text.starts_with("cannot start the proxy: "), "{text}");
         }
@@ -264,6 +264,7 @@ fn check_stops_at_the_table_and_a_run_needs_its_socket() {
     let args = |check| ProxyArgs {
         config: path.clone(),
         check,
+        update_dir: "/nonexistent".into(),
     };
     assert_eq!(run(&args(true)), Ok(()));
     let text = usage_of(run(&args(false)));
@@ -271,6 +272,7 @@ fn check_stops_at_the_table_and_a_run_needs_its_socket() {
     let missing = ProxyArgs {
         config: path.with_file_name("none.toml"),
         check: true,
+        update_dir: "/nonexistent".into(),
     };
     assert!(usage_of(run(&missing)).contains("No such file"));
 }

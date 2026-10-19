@@ -496,12 +496,37 @@ async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
     )
     .expect("record");
 
+    // The adopted child is asked its role before the startup hold ends into it: a stand-in
+    // admin port answers as an active holder. Slot A's admin port is the base port plus 3.
+    let admin = TcpListener::bind("127.0.0.1:0").expect("admin port");
+    let admin_port = admin.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        const ROLE: &str = "{\"role\":\"active\",\"admin_protocol\":1,\"generation\":1,\
+                            \"held_generation\":1,\"superseded\":false}";
+        for stream in admin.incoming().flatten() {
+            let mut stream = stream;
+            let mut head = [0_u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut head);
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{ROLE}",
+                ROLE.len()
+            );
+            let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
+        }
+    });
     let (path, ca) = served_config("adopt");
-    let table = fs::read_to_string(&path).expect("config text").replacen(
-        "[proxy]\n",
-        &format!("[proxy]\nstate_dir = \"{}\"\n", state.display()),
-        1,
-    );
+    let table = fs::read_to_string(&path)
+        .expect("config text")
+        .replacen(
+            "[proxy]\n",
+            &format!("[proxy]\nstate_dir = \"{}\"\n", state.display()),
+            1,
+        )
+        .replace(
+            "base_port = 18000",
+            &format!("base_port = {}", admin_port - 3),
+        );
     fs::write(&path, table).expect("write");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -523,7 +548,7 @@ async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
     std::io::Read::read_to_string(&mut proxy.stderr.take().expect("stderr"), &mut err)
         .expect("stderr text");
     assert!(
-        err.contains("adopted the frontend child in slot A"),
+        err.contains("the frontend child in slot A serves"),
         "the recorded child was not adopted: {err}"
     );
     // SAFETY: signal 0 only checks that the process exists; the child is ours.

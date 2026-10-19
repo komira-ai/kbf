@@ -118,7 +118,8 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
     assert!(
         !Verb::Proxy(ProxyArgs {
             config: file,
-            check: true
+            check: true,
+            update_dir: "/var/lib/kbf-installer".into(),
         })
         .needs_root()
     );
@@ -265,6 +266,7 @@ fn the_visible_verbs_are_the_contracts() {
             "confirm",
             "revert",
             "rollback",
+            "record-release",
             "gc",
             "boot-check",
             "quiesce",

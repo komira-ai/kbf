@@ -70,6 +70,7 @@ pub mod layout;
 pub mod proxy;
 pub mod proxy_verb;
 pub mod record;
+pub mod record_release;
 pub mod refusal;
 pub mod release;
 pub mod run;

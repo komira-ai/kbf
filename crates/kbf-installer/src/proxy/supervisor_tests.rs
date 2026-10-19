@@ -8,12 +8,15 @@ use kbf_proxy::slot::Bind;
 use kbf_proxy::{Proxy, ProxyRunner};
 
 use super::*;
+use crate::proxy::boot::Progress;
 use crate::proxy::child_rig::{Cleanup, alive, rig, wait_for};
 use crate::proxy::fakes::plan;
 use crate::proxy::gate_real_tests::proxy_table;
-use crate::proxy::model::{Intent, Mode, Phase};
+use crate::proxy::model::{Intent, Mode, Phase, Readiness, RoleInfo};
 use crate::proxy::ports::Recorder as _;
 use crate::testkit::{A, B, c};
+use std::cell::{Cell, RefCell};
+use std::time::Duration;
 
 fn gate() -> (ProxyGate, ProxyRunner) {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -50,12 +53,13 @@ fn a_live_recorded_child_is_adopted_and_the_startup_hold_ends_into_its_slot() {
     let after = rig.restarted();
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     let (gate, _runner) = gate();
+    let env = Env::new(&rig, &gate);
     assert!(
         matches!(gate.handle.slots().bind(), Bind::Held { .. }),
         "held at first"
     );
     assert_eq!(
-        adopt_children(&gate, &after, &state_dir(&rig)),
+        adopt_children(&gate, &after, &state_dir(&rig), &env.boot()),
         Startup::Adopted { active: Slot::B }
     );
     assert_eq!(bound_slot(&gate), Some(kbf_proxy::slot::Slot::B));
@@ -76,10 +80,12 @@ fn a_recorded_child_that_is_gone_is_not_adopted_and_the_hold_stays() {
     wait_for("exit", || !alive(ident.pid));
     let after = rig.restarted();
     let (gate, _runner) = gate();
-    let Startup::Held(why) = adopt_children(&gate, &after, &state_dir(&rig)) else {
+    let env = Env::new(&rig, &gate);
+    let Startup::Held(why) = adopt_children(&gate, &after, &state_dir(&rig), &env.boot()) else {
         panic!("adopted a dead child");
     };
     assert!(why.contains("no frontend child is running"), "{why}");
+    assert!(why.contains("no-installed-release"), "{why}");
     assert!(
         gate.handle.snapshot().holding,
         "the startup hold is untouched"
@@ -100,11 +106,12 @@ fn an_update_in_flight_or_a_corrupt_record_leaves_the_hold_with_a_live_child() {
     let after = rig.restarted();
     let state = state_dir(&rig);
     let (gate, _runner) = gate();
+    let env = Env::new(&rig, &gate);
 
     let intent = Intent::begin(&plan(Mode::Frontend), Some(ident.clone()), 1);
     assert_eq!(intent.phase, Phase::Staged);
     FileRecorder::new(&state).record(&intent).expect("record");
-    let Startup::Held(why) = adopt_children(&gate, &after, &state) else {
+    let Startup::Held(why) = adopt_children(&gate, &after, &state, &env.boot()) else {
         panic!("adopted under an update");
     };
     assert!(
@@ -113,7 +120,7 @@ fn an_update_in_flight_or_a_corrupt_record_leaves_the_hold_with_a_live_child() {
     );
 
     std::fs::write(state.join("update.json"), b"{not json").expect("corrupt");
-    let Startup::Held(why) = adopt_children(&gate, &after, &state) else {
+    let Startup::Held(why) = adopt_children(&gate, &after, &state, &env.boot()) else {
         panic!("adopted with a corrupt record");
     };
     assert!(why.contains("corrupt"), "{why}");
@@ -124,7 +131,7 @@ fn an_update_in_flight_or_a_corrupt_record_leaves_the_hold_with_a_live_child() {
     done.phase = Phase::Done;
     FileRecorder::new(&state).record(&done).expect("record");
     assert_eq!(
-        adopt_children(&gate, &after, &state),
+        adopt_children(&gate, &after, &state, &env.boot()),
         Startup::Adopted { active: Slot::A }
     );
 }
@@ -139,7 +146,8 @@ fn two_live_children_with_no_update_leave_the_hold() {
     let _stop = Cleanup(&rig.child, vec![a, b]);
     let after = rig.restarted();
     let (gate, _runner) = gate();
-    let Startup::Held(why) = adopt_children(&gate, &after, &state_dir(&rig)) else {
+    let env = Env::new(&rig, &gate);
+    let Startup::Held(why) = adopt_children(&gate, &after, &state_dir(&rig), &env.boot()) else {
         panic!("picked one of two");
     };
     assert!(why.contains("both slots"), "{why}");
@@ -200,9 +208,407 @@ fn an_adoption_the_gate_refuses_is_reported_as_held() {
     let _stop = Cleanup(&rig.child, vec![ident]);
     let after = rig.restarted();
     let (gate, _runner) = gate();
+    let env = Env::new(&rig, &gate);
     let _taken = gate.handle.startup_hold().expect("the startup hold");
-    let Startup::Held(why) = adopt_children(&gate, &after, &state_dir(&rig)) else {
+    let Startup::Held(why) = adopt_children(&gate, &after, &state_dir(&rig), &env.boot()) else {
         panic!("reported adopted without the hold");
     };
     assert!(why.contains("startup hold is gone"), "{why}");
+}
+
+/// Admin calls that answer from a script: the role, when `/readyz` turns true, and how many
+/// takeovers fail first.
+struct ScriptAdmin<'a> {
+    role: RoleInfo,
+    ready_after: u32,
+    polls: Cell<u32>,
+    takeovers: Cell<u32>,
+    takeover_fails: Cell<u32>,
+    /// Whether the startup hold is in force, read at each `/readyz` poll.
+    holding: Box<dyn Fn() -> bool + 'a>,
+    held_at_poll: RefCell<Vec<bool>>,
+}
+
+impl ChildAdmin for ScriptAdmin<'_> {
+    fn role(&self, _slot: Slot) -> Result<RoleInfo, PortError> {
+        Ok(self.role)
+    }
+
+    fn takeover(&self, _slot: Slot, _limit: Duration) -> Result<(), PortError> {
+        self.takeovers.set(self.takeovers.get() + 1);
+        if self.takeover_fails.get() > 0 {
+            self.takeover_fails.set(self.takeover_fails.get() - 1);
+            return Err(PortError("refused".into()));
+        }
+        Ok(())
+    }
+
+    fn ready(&self, _slot: Slot) -> Result<Readiness, PortError> {
+        self.polls.set(self.polls.get() + 1);
+        self.held_at_poll.borrow_mut().push((self.holding)());
+        Ok(Readiness {
+            readyz: self.polls.get() > self.ready_after,
+            health: false,
+            capabilities: false,
+        })
+    }
+
+    fn quiesce(&self, _: Slot) -> Result<(), PortError> {
+        unreachable!("the boot never quiesces")
+    }
+
+    fn stand_down(&self, _: Slot) -> Result<(), PortError> {
+        unreachable!("the boot never stands down")
+    }
+
+    fn resume(&self, _: Slot) -> Result<(), PortError> {
+        unreachable!("the boot never resumes")
+    }
+
+    fn open_counts(&self, _: Slot) -> Result<crate::proxy::model::OpenCounts, PortError> {
+        unreachable!("the boot never counts")
+    }
+
+    fn post_desired(&self, _: Slot, _: &CommitId) -> Result<(), PortError> {
+        unreachable!("the boot never posts a desired release")
+    }
+}
+
+/// Time that moves only when the boot sleeps, plus a real millisecond so a process that
+/// should exit has the time to; `on_wait` runs at each sleep of two seconds, the wait
+/// between tries.
+struct FastClock<'a> {
+    now: Cell<Duration>,
+    on_wait: Box<dyn Fn() + 'a>,
+}
+
+impl Clock for FastClock<'_> {
+    fn now(&self) -> Duration {
+        self.now.get()
+    }
+
+    fn sleep(&self, d: Duration) -> Result<(), crate::proxy::model::Halt> {
+        let wait = d == Duration::from_secs(2);
+        // A stopped process needs a moment to be gone before the next try starts.
+        std::thread::sleep(Duration::from_millis(if wait { 200 } else { 1 }));
+        self.now.set(self.now.get() + d);
+        if wait {
+            (self.on_wait)();
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct Notes(RefCell<Vec<Progress>>);
+
+impl Report for Notes {
+    fn progress(&self, progress: &Progress, _detail: Option<&str>) {
+        self.0.borrow_mut().push(*progress);
+    }
+}
+
+struct Env<'a> {
+    admin: ScriptAdmin<'a>,
+    clock: FastClock<'a>,
+    notes: Notes,
+    status: PathBuf,
+}
+
+impl<'a> Env<'a> {
+    fn new(rig: &crate::proxy::child_rig::Rig, gate: &'a ProxyGate) -> Env<'a> {
+        Env {
+            admin: ScriptAdmin {
+                role: RoleInfo {
+                    holder: true,
+                    state: RoleState::Active,
+                },
+                ready_after: 0,
+                polls: Cell::new(0),
+                takeovers: Cell::new(0),
+                takeover_fails: Cell::new(0),
+                holding: Box::new(|| gate.handle.snapshot().holding),
+                held_at_poll: RefCell::new(Vec::new()),
+            },
+            clock: FastClock {
+                now: Cell::new(Duration::ZERO),
+                on_wait: Box::new(|| {}),
+            },
+            notes: Notes::default(),
+            status: state_dir(rig).join("status.json"),
+        }
+    }
+
+    fn boot(&self) -> Boot<'_> {
+        Boot {
+            admin: &self.admin,
+            clock: &self.clock,
+            migrator: &NoMigration,
+            report: &self.notes,
+            status: &self.status,
+            timing: Timing {
+                ready_within: Duration::from_secs(5),
+                ..Timing::frontend()
+            },
+            retry: Retry {
+                attempts: 3,
+                first_wait: Duration::from_secs(2),
+                max_wait: Duration::from_secs(4),
+            },
+        }
+    }
+
+    /// `status.json` says `commit` is installed.
+    fn install(&self, commit: &str) {
+        std::fs::write(
+            &self.status,
+            format!("{{\"installed_commit\":\"{commit}\"}}\n"),
+        )
+        .expect("status.json");
+    }
+}
+
+/// The marker the installer writes into a release it installed.
+fn verify(rig: &crate::proxy::child_rig::Rig, commit: &str) {
+    let dir = rig
+        .child
+        .layout
+        .join(&rig.child.layout.release_dir(&c(commit)));
+    std::fs::write(dir.join(crate::stage::VERIFIED), format!("{commit}\n")).expect("VERIFIED");
+}
+
+fn reasons(env: &Env<'_>) -> Vec<&'static str> {
+    env.notes
+        .0
+        .borrow()
+        .iter()
+        .filter_map(|p| p.reason)
+        .collect()
+}
+
+/// Catches a host that comes up with no child staying dark: after a reboot nothing runs,
+/// `status.json` names the installed release, and that release is started in slot A (a
+/// process of its own, recorded), made to take the generation, and the streams are
+/// released into it.
+#[test]
+fn after_a_reboot_the_installed_release_is_started_and_the_streams_are_released_into_it() {
+    let rig = rig("supervisor-cold");
+    let (gate, _runner) = gate();
+    let env = Env::new(&rig, &gate);
+    env.install(A);
+    verify(&rig, A);
+    let outcome = adopt_children(&gate, &rig.child, &state_dir(&rig), &env.boot());
+    let recorded = rig
+        .child
+        .recorded(Slot::A)
+        .expect("the process is recorded");
+    let _stop = Cleanup(&rig.child, vec![recorded.ident.clone()]);
+    assert_eq!(outcome, Startup::Adopted { active: Slot::A });
+    assert_eq!(
+        recorded.commit,
+        c(A),
+        "the installed release, not `current`"
+    );
+    assert_eq!(env.admin.takeovers.get(), 1);
+    assert_eq!(bound_slot(&gate), Some(kbf_proxy::slot::Slot::A));
+    assert!(!gate.handle.snapshot().holding);
+    assert_eq!(reasons(&env), Vec::<&str>::new());
+}
+
+/// Catches streams let through before the child is ready: every poll of `/readyz` that says
+/// "not yet" finds the startup hold in force, and no stream binds until the child is ready
+/// and has taken the generation.
+#[test]
+fn the_streams_stay_held_until_the_child_is_ready() {
+    let rig = rig("supervisor-cold-hold");
+    let (gate, _runner) = gate();
+    let mut env = Env::new(&rig, &gate);
+    env.admin.ready_after = 3;
+    env.install(A);
+    verify(&rig, A);
+    let outcome = adopt_children(&gate, &rig.child, &state_dir(&rig), &env.boot());
+    let recorded = rig.child.recorded(Slot::A).expect("recorded");
+    let _stop = Cleanup(&rig.child, vec![recorded.ident]);
+    assert_eq!(outcome, Startup::Adopted { active: Slot::A });
+    assert_eq!(env.admin.polls.get(), 4);
+    assert!(
+        env.admin.held_at_poll.borrow().iter().all(|held| *held),
+        "held at every poll: {:?}",
+        env.admin.held_at_poll.borrow()
+    );
+    assert_eq!(bound_slot(&gate), Some(kbf_proxy::slot::Slot::A));
+}
+
+/// Catches starting a release the installer did not name or did not install: a commit that
+/// has no directory (the hand-placed host whose `status.json` names another), and a
+/// directory without `VERIFIED`. Nothing is spawned, no record is written, the streams stay
+/// held, and the report says why in a fixed word with the operator's fix.
+#[test]
+fn a_release_that_is_missing_or_not_verified_is_refused_and_nothing_starts() {
+    let rig = rig("supervisor-cold-refuse");
+    let (gate, _runner) = gate();
+    let env = Env::new(&rig, &gate);
+    // The rig has releases A and B, neither verified: a commit with no directory.
+    env.install(crate::testkit::C);
+    let Startup::Held(why) = adopt_children(&gate, &rig.child, &state_dir(&rig), &env.boot())
+    else {
+        panic!("started a release with no directory");
+    };
+    assert!(why.contains("binary-missing"), "{why}");
+    assert!(
+        !why.contains(crate::testkit::C),
+        "no value in the reason: {why}"
+    );
+    env.install(A);
+    let Startup::Held(why) = adopt_children(&gate, &rig.child, &state_dir(&rig), &env.boot())
+    else {
+        panic!("started an unverified release");
+    };
+    assert!(why.contains("release-not-verified"), "{why}");
+    assert_eq!(rig.child.recorded(Slot::A), None, "nothing was spawned");
+    assert_eq!(env.admin.polls.get(), 0);
+    assert!(gate.handle.snapshot().holding);
+    assert!(
+        env.notes
+            .0
+            .borrow()
+            .iter()
+            .any(|p| p.state == "gave-up" && p.fix.is_some_and(|f| f.contains("VERIFIED")))
+    );
+    assert_eq!(gate.active(), None);
+}
+
+/// Catches a cold start that gives up on the first failure or never gives up: the first
+/// takeover is refused, the process is stopped, the boot waits and starts a second process
+/// that serves; the first was SIGTERMed, not left running next to it.
+#[test]
+fn a_refused_takeover_is_retried_with_a_new_process_that_then_serves() {
+    let rig = rig("supervisor-cold-retry");
+    let (gate, _runner) = gate();
+    let env = Env::new(&rig, &gate);
+    env.admin.takeover_fails.set(1);
+    env.install(A);
+    verify(&rig, A);
+    let first = std::rc::Rc::new(RefCell::new(None));
+    let seen = std::rc::Rc::clone(&first);
+    let child = &rig.child;
+    let clock = FastClock {
+        now: Cell::new(Duration::ZERO),
+        on_wait: Box::new(move || {
+            // The wait between the tries: the first process must be gone by now.
+            *seen.borrow_mut() = child_pid_record(child);
+        }),
+    };
+    let boot = Boot {
+        clock: &clock,
+        ..env.boot()
+    };
+    let outcome = adopt_children(&gate, child, &state_dir(&rig), &boot);
+    let second = rig.child.recorded(Slot::A).expect("recorded");
+    let _stop = Cleanup(&rig.child, vec![second.ident.clone()]);
+    assert_eq!(outcome, Startup::Adopted { active: Slot::A });
+    assert_eq!(env.admin.takeovers.get(), 2);
+    let first = first.borrow().expect("a first process was started");
+    assert_ne!(
+        first, second.ident.pid,
+        "a new process, not the first again"
+    );
+    wait_for("the first process is stopped", || !alive(first));
+    assert_eq!(
+        env.notes
+            .0
+            .borrow()
+            .iter()
+            .map(|p| p.state)
+            .collect::<Vec<_>>(),
+        ["starting", "retrying", "starting", "serving"]
+    );
+}
+
+fn child_pid_record(child: &ProcChild) -> Option<u32> {
+    child.recorded(Slot::A).map(|r| r.ident.pid)
+}
+
+/// Catches a boot with no end: every try is refused, the third is the last, and the proxy
+/// then holds with the last word; the streams were never released.
+#[test]
+fn a_boot_that_cannot_start_gives_up_after_the_cap_and_holds() {
+    let rig = rig("supervisor-cold-giveup");
+    let (gate, _runner) = gate();
+    let env = Env::new(&rig, &gate);
+    env.admin.takeover_fails.set(99);
+    env.install(A);
+    verify(&rig, A);
+    let outcome = adopt_children(&gate, &rig.child, &state_dir(&rig), &env.boot());
+    let ident = rig.child.recorded(Slot::A).map(|r| r.ident);
+    let _stop = Cleanup(&rig.child, ident.into_iter().collect());
+    let Startup::Held(why) = outcome else {
+        panic!("served after every takeover was refused");
+    };
+    assert!(why.contains("takeover-failed"), "{why}");
+    assert_eq!(env.admin.takeovers.get(), 3);
+    assert_eq!(reasons(&env), ["takeover-failed"; 3]);
+    assert!(gate.handle.snapshot().holding);
+    assert_eq!(gate.active(), None);
+}
+
+/// Catches a proxy restart that starts a second child: a candidate its predecessor started
+/// and never made take the generation is adopted (same pid, no new spawn) and takes it.
+#[test]
+fn a_candidate_a_previous_proxy_started_is_adopted_and_takes_the_generation() {
+    let rig = rig("supervisor-cold-candidate");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Candidate)
+        .expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
+    let after = rig.restarted();
+    let (gate, _runner) = gate();
+    let mut env = Env::new(&rig, &gate);
+    env.admin.role = RoleInfo {
+        holder: false,
+        state: RoleState::Candidate,
+    };
+    let outcome = adopt_children(&gate, &after, &state_dir(&rig), &env.boot());
+    assert_eq!(outcome, Startup::Adopted { active: Slot::A });
+    assert_eq!(env.admin.takeovers.get(), 1);
+    assert_eq!(
+        after.recorded(Slot::A).map(|r| r.ident),
+        Some(ident),
+        "the process the predecessor recorded, not a second one"
+    );
+    assert_eq!(bound_slot(&gate), Some(kbf_proxy::slot::Slot::A));
+}
+
+/// Catches adopting a pid that was reused: the record names a live process whose start time
+/// differs, so it is not ours. It is not signalled, the cold start proceeds and the record
+/// then names the new process.
+#[test]
+fn a_record_whose_pid_was_reused_is_discarded_and_the_cold_start_goes_on() {
+    let rig = rig("supervisor-cold-stale");
+    let stranger = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
+    let _stop_stranger = Cleanup(&rig.child, vec![stranger.clone()]);
+    let path = rig.dir.join("a.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("record")).expect("json");
+    record["ident"]["start_time"] = (stranger.start_time + 1).into();
+    std::fs::write(&path, serde_json::to_vec(&record).expect("json")).expect("rewrite");
+    let after = rig.restarted();
+    let (gate, _runner) = gate();
+    let env = Env::new(&rig, &gate);
+    env.install(A);
+    verify(&rig, A);
+    let outcome = adopt_children(&gate, &after, &state_dir(&rig), &env.boot());
+    let fresh = after.recorded(Slot::A).expect("a new record").ident;
+    let _stop_fresh = Cleanup(&after, vec![fresh.clone()]);
+    assert_eq!(outcome, Startup::Adopted { active: Slot::A });
+    assert_ne!(fresh.pid, stranger.pid, "a process of the boot's own");
+    assert!(
+        alive(stranger.pid),
+        "the process that is not ours is not signalled"
+    );
+    assert_eq!(env.admin.takeovers.get(), 1);
 }
