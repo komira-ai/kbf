@@ -302,14 +302,15 @@ async fn an_exit_one_is_the_actions_unless_crun_logged_an_error() {
     fake.assert_clean(2);
 }
 
-/// Catches a program crun cannot find being the farm's failure, not the action's:
-/// exit 127 and kbf's message on the action's stderr.
+/// Catches a program the container's init cannot find being the farm's failure, not the
+/// action's: exit 127 and kbf's message on the action's stderr.
 #[tokio::test]
-async fn a_program_crun_cannot_find_is_the_actions_exit_127() {
+async fn a_program_the_init_cannot_find_is_the_actions_exit_127() {
     let fake = Fake::new("not-found");
-    fake.knob(
-        "crun-error",
+    fake.init_says(
         "executable file `sh` not found in $PATH: No such file or directory",
+        127,
+        false,
     );
     let mut spec = Spec::new(&image(), "unused");
     spec.env = vec![("PATH".to_owned(), "/bin".to_owned())];

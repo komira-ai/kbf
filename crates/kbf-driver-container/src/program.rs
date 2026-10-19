@@ -7,17 +7,20 @@
 //! (not found) or 126 (found, not an executable file), as a shell answers, with kbf's
 //! message on stderr before `crun`'s own words. A non-zero exit is never cached.
 //!
-//! Only crun's own report of its program lookup counts (crun 1.14): ``executable file
-//! `<argv[0]>` not found in $PATH`` for any `ENOENT`, and `open executable: ` for a file
-//! it may not execute or that is not a regular file. Any other report (a missing mount
-//! source, a cgroup it may not write) is the farm's: that start stays the farm's
-//! failure, with `crun`'s words in it.
+//! The container's first process is the init (`oci::init`), which looks the program up
+//! and reports a failure to start it in `crun`'s words: ``executable file `<argv[0]>` not
+//! found in $PATH`` for any `ENOENT`, and `open executable: ` for a file it may not
+//! execute or that is not a regular file. Only the init's report counts. `crun` itself
+//! only ever starts the init, so anything `crun` reports (a failed exec of the init, a
+//! missing mount source, a cgroup it may not write) is the farm's: that start stays the
+//! farm's failure, with the words in it.
 
 use std::path::{Path, PathBuf};
 
 use kbf_daemon::RuntimeError;
 
 use crate::container::{ContainerSpec, EXEC_ROOT};
+use crate::oci::init::DEST as INIT;
 use crate::runtime::failed;
 
 /// How much of the runtime's words are read back when the container did not run.
@@ -116,23 +119,34 @@ impl Said {
     /// report, if any, in the same words. A log that is not there is an error, unless a
     /// report is configured: the words of the init alone then answer.
     pub(crate) async fn read(&self) -> std::io::Result<String> {
+        let mut words = self.read_log().await?;
+        let init = self.read_init().await?;
+        if !words.is_empty() && !init.is_empty() {
+            words.push_str("; ");
+        }
+        words.push_str(&init);
+        Ok(words)
+    }
+
+    /// `crun`'s own error records.
+    async fn read_log(&self) -> std::io::Result<String> {
         let log = match (read_capped(&self.source).await, &self.report) {
             (Err(e), Some(_)) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             (read, _) => read?,
         };
-        let mut words = crun_words(&String::from_utf8_lossy(&log));
-        if let Some(file) = &self.report {
-            let report = match read_capped(file).await {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                read => read?,
-            };
-            let init = init_words(&String::from_utf8_lossy(&report));
-            if !words.is_empty() && !init.is_empty() {
-                words.push_str("; ");
-            }
-            words.push_str(&init);
-        }
-        Ok(words)
+        Ok(crun_words(&String::from_utf8_lossy(&log)))
+    }
+
+    /// The init's report alone, in `crun`'s words; empty without one.
+    async fn read_init(&self) -> std::io::Result<String> {
+        let Some(file) = &self.report else {
+            return Ok(String::new());
+        };
+        let report = match read_capped(file).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            read => read?,
+        };
+        Ok(init_words(&String::from_utf8_lossy(&report)))
     }
 }
 
@@ -203,14 +217,25 @@ pub(crate) async fn not_run(
     }
 }
 
-/// Reads what the runtime said and, when crun reports its lookup of the program,
-/// rewrites it as the action's stderr: why, or the runtime's words if not.
+/// Reads what was said and, when the container's init reports its lookup of the program,
+/// rewrites it as the action's stderr: why, or all the words if not. `crun` itself only
+/// ever starts the init, so what `crun` says about an exec is about the init: the
+/// node's, however it is worded, and never read as the action's.
 async fn answer(spec: &ContainerSpec, said: &Said) -> std::io::Result<Result<Unstartable, String>> {
-    let words = said.read().await?;
     let program = spec.argv.first().map_or("", String::as_str);
-    let Some(why) = classify(program, &words) else {
-        return Ok(Err(words));
+    let init = said.read_init().await?;
+    let log = said.read_log().await?;
+    let Some(why) = classify(program, &init).filter(|_| log.is_empty()) else {
+        let words = said.read().await?;
+        return Ok(Err(if log.is_empty() {
+            words
+        } else {
+            format!(
+                "{words} (crun starts only the container's init, {INIT}, so an exec it reports failing is the init's: the scratch directory mounted noexec, or a bad binary)"
+            )
+        }));
     };
+    let words = init;
     let message = message(why, program, &spec.env, &spec.working_directory);
     tracing::info!(container = %spec.name, "{message}");
     tokio::fs::write(&said.stderr, format!("{message}\ncrun log: {words}\n")).await?;
@@ -326,20 +351,26 @@ mod tests {
         assert_eq!(classify("env", &words), Some(Unstartable::NotFound));
     }
 
-    /// Catches the OCI path reading the action's stderr instead of crun's log, losing the
-    /// rewrite of the lookup report into the action's stderr, and the message naming the
-    /// wrong runtime.
+    /// Catches the OCI path reading the action's stderr instead of the init's report,
+    /// losing the rewrite of the lookup report into the action's stderr, the message
+    /// naming the wrong runtime, and (the point of the init) `crun`'s own words about an
+    /// exec, which are about the init and the node's: a lookup-shaped record in
+    /// `crun`'s log is the farm's failure, with a hint naming the init.
     #[tokio::test]
-    async fn a_crun_lookup_report_becomes_the_actions_exit_127() {
-        let dir = scratch("crun-lookup");
-        let log = dir.join("crun.log");
-        let stderr = dir.join("stderr");
-        std::fs::write(&log, LOG).expect("log");
+    async fn the_inits_lookup_report_becomes_the_actions_exit_127() {
+        let dir = scratch("init-lookup");
+        let (log, report, stderr) = (dir.join("crun.log"), dir.join("report"), dir.join("stderr"));
+        std::fs::write(&log, "").expect("log");
+        std::fs::write(
+            &report,
+            "executable file `env` not found in $PATH: No such file or directory\n",
+        )
+        .expect("report");
         std::fs::write(&stderr, b"the action's own words\n").expect("stderr");
         let mut spec = crate::container::tests::spec();
         spec.argv = vec!["env".to_owned()];
-        let said = Said::crun(&log, &stderr);
-        assert_eq!(not_run(&spec, &said, "exited 1").await.expect("127"), 127);
+        let said = Said::crun(&log, &stderr).with_report(&report);
+        assert_eq!(not_run(&spec, &said, "exited 127").await.expect("127"), 127);
         let written = std::fs::read_to_string(&stderr).expect("stderr");
         assert!(
             written.starts_with("kbf: the action's program `env` was not found"),
@@ -350,8 +381,43 @@ mod tests {
             "{written}"
         );
 
+        // `crun` reporting an exec failure is about the init: the farm's, never the
+        // action's, whatever the words (a noexec scratch mount says `open executable`).
+        for said_by_crun in [
+            LOG,
+            r#"{"level":"error","msg":"open executable: Permission denied"}"#,
+        ] {
+            std::fs::write(&log, said_by_crun).expect("log");
+            std::fs::write(&report, "").expect("no report");
+            let farm = not_run(&spec, &said, "exited 1").await;
+            let why = farm.expect_err("the farm's failure").to_string();
+            assert!(why.contains("crun log: crun: "), "{why}");
+            assert!(
+                why.contains("crun starts only the container's init, /dev/kbf-init"),
+                "{why}"
+            );
+        }
+
+        // The init's own sandbox step failing: not a lookup, the farm's, words kept.
+        std::fs::write(&log, "").expect("log");
+        std::fs::write(
+            &report,
+            "kbf-init: prctl(PR_SET_DUMPABLE) failed: Operation not permitted\n",
+        )
+        .expect("report");
+        let why = not_run(&spec, &said, "exited 126")
+            .await
+            .expect_err("farm")
+            .to_string();
+        assert!(
+            why.contains("kbf-init: prctl(PR_SET_DUMPABLE) failed"),
+            "{why}"
+        );
+        assert!(!why.contains("crun starts only"), "{why}");
+
         // Not a lookup report: the farm's failure, naming crun.
         spec.argv = vec!["other".to_owned()];
+        std::fs::write(&report, "").expect("report");
         std::fs::write(
             &log,
             r#"{"level":"error","msg":"mount `/x` to `/kbf/root`: No such file or directory"}"#,
@@ -443,8 +509,15 @@ mod tests {
         assert!(why.contains(&format!("{}: ", dir.display())), "{why}");
 
         let log = dir.join("crun.log");
-        std::fs::write(&log, LOG).expect("log");
-        let unwritable = not_run(&spec, &Said::crun(&log, &dir), "exited 1").await;
+        std::fs::write(&log, "").expect("log");
+        let report = dir.join("report");
+        std::fs::write(
+            &report,
+            "executable file `env` not found in $PATH: No such file\n",
+        )
+        .expect("report");
+        let said = Said::crun(&log, &dir).with_report(&report);
+        let unwritable = not_run(&spec, &said, "exited 1").await;
         let why = unwritable.expect_err("unwritable").to_string();
         assert!(why.contains(&format!("{}: ", log.display())), "{why}");
     }

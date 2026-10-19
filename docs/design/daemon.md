@@ -452,7 +452,13 @@ back; `crun delete --force` closes the lease. That is four `crun` processes.
   127 (not found) or 126 (anything else, `ETXTBSY` included), and the driver reads
   that line where it reads `crun`'s log. The init is not dumpable (`PR_SET_DUMPABLE` 0; the action it execs is
   dumpable again), so the action, the same user in the same pid namespace, cannot open the report
-  file through `/proc/1/fd/0` to forge a report, or trace the init. So everything above about 127, 126 and the
+  file through `/proc/1/fd/0` to forge a report, or trace the init.
+  The init also closes every descriptor above stderr first and makes SIGCHLD the default again; looks
+  a bare name up with `faccessat(X_OK, AT_EACCESS)` per `PATH` entry, as `crun` does; and treats a step of
+  its own sandbox that fails (`close_range`, the two `prctl`s) as the node's failure (a `kbf-init: ...` line
+  on stderr and in the report, exit 126, the program not started). Only the init's report is read as
+  the action's lookup failure: anything `crun` itself reports about an exec is about the init (a noexec
+  scratch mount, a bad binary) and is the farm's failure, with a message saying so. So everything above about 127, 126 and the
   `ETXTBSY` retry holds unchanged. Building the daemon needs the C library's static
   archive (`libc.a`).
 - **Namespaces:** pid, network (new, nothing configured: loopback only; `crun` brings

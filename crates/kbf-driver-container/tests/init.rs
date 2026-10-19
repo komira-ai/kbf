@@ -301,3 +301,195 @@ fn a_call_without_a_program_is_a_usage_error() {
         assert_eq!(status.code(), Some(2), "{args:?}");
     }
 }
+
+unsafe extern "C" {
+    #[link_name = "signal"]
+    fn libc_signal(signal: i32, handler: usize) -> usize;
+    fn prctl(option: i32, ...) -> i32;
+}
+
+/// Runs `command` to its end within ten seconds (killing it otherwise), and its code.
+fn code_within_ten_seconds(mut command: Command) -> Option<i32> {
+    let mut child = command.stdout(Stdio::null()).spawn().expect("init");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return status.code();
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill");
+            child.wait().expect("wait");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Catches a descriptor the runtime left open (above stderr) reaching the program: this
+/// test leaves one open on purpose, past the init's exec, and the program must not find
+/// it. (The mutant: no `close_range`.)
+#[test]
+fn a_descriptor_left_open_does_not_reach_the_program() {
+    let dir = scratch("close-range");
+    let link = dir.join("kbf-act");
+    let leaked = std::fs::File::create(dir.join("leaked")).expect("leaked");
+    // Not close-on-exec, so it survives into the init as a runtime's would.
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&leaked);
+    rustix::io::fcntl_setfd(&leaked, rustix::io::FdFlags::empty()).expect("setfd");
+    let probe = format!("/proc/self/fd/{fd}");
+    let ran = finish(
+        &dir,
+        &mut init(
+            &dir,
+            None,
+            "",
+            link.to_str().expect("utf-8"),
+            &["test", "!", "-e", &probe],
+        ),
+    );
+    assert_eq!(ran.code, 0, "descriptor {fd} reached the program");
+    drop(leaked);
+}
+
+/// Catches a SIGCHLD the init inherited ignored (a runtime's choice, inherited across
+/// exec): the kernel then reaps every child unseen, no SIGCHLD is ever queued, and the
+/// init waits for ever. It must run the program and answer its status.
+#[test]
+fn an_ignored_sigchld_is_made_the_default() {
+    let dir = scratch("sigchld");
+    let link = dir.join("kbf-act");
+    let mut command = init(
+        &dir,
+        None,
+        "",
+        link.to_str().expect("utf-8"),
+        &["exit", "7"],
+    );
+    // SAFETY: the closure makes one async-signal-safe call between fork and exec.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            libc_signal(17, 1);
+            Ok(())
+        });
+    }
+    assert_eq!(code_within_ten_seconds(command), Some(7));
+}
+
+/// Catches the program search taking a file the user cannot execute because some
+/// execute bit is set (a mode `0010` file of the user's: group execute only): `crun`
+/// asks `faccessat(X_OK, AT_EACCESS)` and goes on to the next directory. (A superuser
+/// may execute it, so the file is found first, and the test does not apply.)
+#[test]
+fn the_path_search_asks_the_kernel_whether_the_file_can_be_executed() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("access");
+    let (first, second) = (dir.join("first"), dir.join("second"));
+    std::fs::create_dir_all(&first).expect("first");
+    std::fs::create_dir_all(&second).expect("second");
+    std::fs::write(first.join("kbf-act"), b"not for us").expect("decoy");
+    std::fs::set_permissions(
+        first.join("kbf-act"),
+        std::fs::Permissions::from_mode(0o010),
+    )
+    .expect("mode");
+    std::os::unix::fs::symlink(dir.join("kbf-act"), second.join("kbf-act")).expect("link");
+    let path = std::env::join_paths([&first, &second]).expect("path");
+    let ran = finish(
+        &dir,
+        &mut init(
+            &dir,
+            Some(Path::new(&path)),
+            "",
+            "kbf-act",
+            &["echo", "second"],
+        ),
+    );
+    assert_eq!(ran.code, 0, "{}", ran.report);
+    assert_eq!(ran.stdout, "second\n");
+}
+
+/// A command that runs the init with every `prctl(option, ..)` refused (EPERM) by a
+/// seccomp filter, as a sandbox that does not allow them would.
+fn init_refused_prctl(dir: &Path, option: u32) -> Command {
+    #[repr(C)]
+    struct Filter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+    #[repr(C)]
+    struct Program {
+        len: u16,
+        filter: *const Filter,
+    }
+    const fn op(code: u16, jt: u8, jf: u8, k: u32) -> Filter {
+        Filter { code, jt, jf, k }
+    }
+    #[cfg(target_arch = "x86_64")]
+    const PRCTL: u32 = 157;
+    #[cfg(target_arch = "aarch64")]
+    const PRCTL: u32 = 167;
+    // seccomp_data: nr at 0, args[0] at 16.
+    let link = dir.join("kbf-act");
+    let mut command = init(
+        dir,
+        None,
+        "",
+        link.to_str().expect("utf-8"),
+        &["append", "ready", "x"],
+    );
+    let filter = [
+        op(0x20, 0, 0, 0),           // ld nr
+        op(0x15, 0, 3, PRCTL),       // nr == prctl ? next : allow
+        op(0x20, 0, 0, 16),          // ld args[0]
+        op(0x15, 0, 1, option),      // option matches ? deny : allow
+        op(0x06, 0, 0, 0x0005_0001), // ERRNO(EPERM)
+        op(0x06, 0, 0, 0x7fff_0000), // ALLOW
+    ];
+    // SAFETY: the closure runs between fork and exec, makes system calls only and
+    // allocates nothing; `filter` outlives the spawn.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+            let program = Program {
+                len: 6,
+                filter: filter.as_ptr(),
+            };
+            prctl(38, 1u64, 0u64, 0u64, 0u64); // PR_SET_NO_NEW_PRIVS
+            if prctl(22, 2u64, std::ptr::addr_of!(program)) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+/// Catches a step of the init's own sandbox failing without a word, the program then
+/// running without it (the dumpable or subreaper step ignored): the init says what
+/// failed on stderr and in the report (which the driver reads as the node's failure),
+/// exits 126 and does not start the program.
+#[test]
+fn a_sandbox_step_that_fails_stops_the_init_with_a_message() {
+    for (option, name) in [(36_u32, "PR_SET_CHILD_SUBREAPER"), (4, "PR_SET_DUMPABLE")] {
+        let dir = scratch(&format!("prctl-{option}"));
+        let mut command = init_refused_prctl(&dir, option);
+        let out = command.stderr(Stdio::piped()).output().expect("init");
+        assert_eq!(out.status.code(), Some(126), "{name}");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            said.contains(&format!("kbf-init: prctl({name}) failed: ")),
+            "{said}"
+        );
+        let report = std::fs::read_to_string(dir.join("report")).expect("report");
+        assert!(
+            report.starts_with(&format!("kbf-init: prctl({name}) failed: ")),
+            "{report}"
+        );
+        // Nothing of the program ran: it would have written its `ready` file.
+        assert!(!dir.join("ready").exists());
+    }
+}

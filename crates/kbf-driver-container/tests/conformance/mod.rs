@@ -193,6 +193,21 @@ async fn the_inits_report_is_read_like_cruns() {
         matches!(outcome, Err(RuntimeError::Failed(_))),
         "{outcome:?}"
     );
+    // `crun` failing to exec its first process, the init (a noexec scratch mount, a bad
+    // binary), is worded as a lookup failure and is still the farm's, never the action's.
+    let fake = Fake::new("conf-init-exec");
+    fake.knob("crun-error", "open executable: Permission denied");
+    let outcome = fake.run(1, &spec, &["exit", "0"]).await;
+    let why = match outcome {
+        Err(RuntimeError::Failed(why)) => why,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        why.contains("crun starts only the container's init, /dev/kbf-init"),
+        "{why}"
+    );
+    fake.assert_clean(1);
+
     let fake = Fake::new("conf-exit-127");
     let result = fake.run(1, &spec, &["exit", "127"]).await.expect("ran");
     assert_eq!(result.exit_code, 127);

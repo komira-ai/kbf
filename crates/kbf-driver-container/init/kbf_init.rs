@@ -23,6 +23,10 @@
 //!   in `crun`'s words, is written to it, and the exit code is 127 (not found) or 126
 //!   (anything else), as a shell answers; the driver reads the line back
 //!   (`crates/kbf-driver-container/src/program.rs`).
+//! - It closes every descriptor above stderr before anything else, and makes SIGCHLD
+//!   the default again. A step of its own sandbox that fails (`close_range`, the two
+//!   `prctl`s) is the node's failure: a line `kbf-init: <what> failed: <why>` on stderr
+//!   and in the report, exit 126, the program not started.
 //! - It is not dumpable, so the program (the same user) cannot reach its stdin through
 //!   `/proc/<pid>/fd`: the report is the init's alone.
 //! - It makes itself the subreaper of its descendants, so that run on a host, outside
@@ -47,6 +51,12 @@ const SIGCHLD: i32 = 17;
 const WNOHANG: i32 = 1;
 const PR_SET_DUMPABLE: i32 = 4;
 const PR_SET_CHILD_SUBREAPER: i32 = 36;
+const SIG_DFL: usize = 0;
+/// `close_range(2)`, the same number on x86-64 and aarch64.
+const SYS_CLOSE_RANGE: i64 = 436;
+const AT_FDCWD: i32 = -100;
+const AT_EACCESS: i32 = 0x200;
+const X_OK: i32 = 1;
 const ENOENT: i32 = 2;
 const ETXTBSY: i32 = 26;
 /// The signals a fault of this program raises in itself: left unblocked.
@@ -61,6 +71,9 @@ unsafe extern "C" {
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
+    fn signal(signal: i32, handler: usize) -> usize;
+    fn syscall(number: i64, ...) -> i64;
+    fn faccessat(dir: i32, path: *const std::ffi::c_char, mode: i32, flags: i32) -> i32;
     fn write(fd: i32, bytes: *const std::ffi::c_void, count: usize) -> isize;
 }
 
@@ -80,20 +93,34 @@ fn main() {
     }
     let arguments: Vec<OsString> = args.collect();
 
-    // Blocked, then taken one at a time with sigwait: no handler, no race.
+    // Nothing but stdin (the report file), stdout and stderr reaches the program: a
+    // descriptor the runtime left open is closed before anything else is done.
+    // SAFETY: a plain system call on a range of descriptors.
+    if unsafe { syscall(SYS_CLOSE_RANGE, 3u32, u32::MAX, 0u32) } != 0 {
+        broken("close_range(3, ~0)");
+    }
+
+    // Blocked, then taken one at a time with sigwait: no handler, no race. SIGCHLD is
+    // the default again first: an ignored one is never queued, and the children of an
+    // init that inherited it ignored would vanish without a status.
     let mut set = SigSet([0; 16]);
     // SAFETY: `set` is a valid, writable sigset of the size libc expects.
     unsafe {
+        signal(SIGCHLD, SIG_DFL);
         sigfillset(&mut set);
         for signal in SYNCHRONOUS {
             sigdelset(&mut set, signal);
         }
         pthread_sigmask(SIG_SETMASK, &set, std::ptr::null_mut());
-        prctl(PR_SET_CHILD_SUBREAPER, 1u64);
+        if prctl(PR_SET_CHILD_SUBREAPER, 1u64) != 0 {
+            broken("prctl(PR_SET_CHILD_SUBREAPER)");
+        }
         // Not dumpable: another process of the same user, the action, cannot open this
         // process's descriptors in /proc (the report file on stdin) or trace it. The
         // program it starts is dumpable again, as every exec makes it.
-        prctl(PR_SET_DUMPABLE, 0u64);
+        if prctl(PR_SET_DUMPABLE, 0u64) != 0 {
+            broken("prctl(PR_SET_DUMPABLE)");
+        }
     }
 
     let child = match start(&program, &arguments) {
@@ -123,6 +150,17 @@ fn main() {
             );
         }
     }
+}
+
+/// This sandbox could not be set up: the node's failure, not the program's. Says so on
+/// stderr and in the report (the driver reads a line that is no lookup failure as the
+/// farm's), and exits 126 without starting the program.
+fn broken(what: &str) -> ! {
+    let error = std::io::Error::last_os_error();
+    let words = format!("kbf-init: {what} failed: {}", strip(&error));
+    eprintln!("{words}");
+    report(&words);
+    std::process::exit(126);
 }
 
 fn usage() -> ! {
@@ -177,14 +215,21 @@ fn lookup(program: &OsStr) -> Result<PathBuf, Refused> {
             directory
         };
         let candidate = Path::new(OsStr::from_bytes(directory)).join(program);
-        if let Ok(meta) = std::fs::metadata(&candidate) {
-            use std::os::unix::fs::PermissionsExt as _;
-            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
-                return Ok(candidate);
-            }
+        if executable(&candidate) {
+            return Ok(candidate);
         }
     }
     Err(not_found(program))
+}
+
+/// Whether the effective user may execute `path`, as `crun` asks: `faccessat` with
+/// `X_OK` and `AT_EACCESS`.
+fn executable(path: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a NUL-terminated string that outlives the call.
+    unsafe { faccessat(AT_FDCWD, path.as_ptr(), X_OK, AT_EACCESS) == 0 }
 }
 
 fn not_found(program: &OsStr) -> Refused {
