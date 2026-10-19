@@ -567,3 +567,81 @@ fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
     assert!(!why.is_empty());
     assert!(with(&[]).schema_step_mut().is_none(), "no flag, no step");
 }
+
+/// Catches the database step's three dry-run lines and its apply line going wrong: a fresh
+/// database would be created, an older one migrated, a current one left alone, and an apply
+/// says what the schema runner did (the lines need no server, so they are tested here).
+///
+/// Mutants to plant: the `v < newest` guard flipped (a behind schema says nothing to do).
+#[test]
+fn the_database_step_lines_say_create_migrate_or_nothing() {
+    assert_eq!(
+        dry_run_line("frontend", None, 3),
+        "kbf-installer setup (frontend): database step: dry run: would create the schema at version 3"
+    );
+    assert_eq!(
+        dry_run_line("frontend", Some(1), 3),
+        "kbf-installer setup (frontend): database step: dry run: would migrate the schema from 1 to 3"
+    );
+    assert_eq!(
+        dry_run_line("all-in-one", Some(3), 3),
+        "kbf-installer setup (all-in-one): database step: dry run: the schema is at 3, nothing to do"
+    );
+    let outcome = Outcome {
+        from: None,
+        to: 2,
+        ran: vec![1, 2],
+    };
+    assert_eq!(
+        apply_line("frontend", &outcome),
+        "kbf-installer setup (frontend): database step: created the schema at version 2"
+    );
+}
+
+/// Catches a successful verb that returned a line printing nothing or not exiting 0, and one
+/// without a line printing something (the only verb with a line, the database step, needs a
+/// server, so the reporting is tested on its own).
+#[test]
+fn a_successful_verb_prints_its_line_only_when_it_has_one() {
+    let cli = parse(&["setup", "--mode=frontend"]);
+    let mut out = Vec::new();
+    assert_eq!(report(None, &cli, "setup", &mut out), Exit::Ok);
+    assert!(out.is_empty());
+    assert_eq!(
+        report(Some("the line".into()), &cli, "setup", &mut out),
+        Exit::Ok
+    );
+    assert_eq!(String::from_utf8(out).expect("text"), "the line\n");
+}
+
+/// Catches the database step's failures being swallowed: with the socket directory missing
+/// (no server needed), a dry run and an apply as an ordinary user each fail with exit 1 and
+/// the database's own reason, for the mode's name in the line.
+#[test]
+fn the_database_step_fails_with_the_reason_when_the_server_cannot_be_reached() {
+    let (_, root) = seeded("setup-database-down");
+    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
+    fs::write(
+        root.join("etc/kbf/installer.toml"),
+        "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n",
+    )
+    .expect("config");
+    for extra in [&[][..], &["--apply"][..]] {
+        let mut argv = vec!["setup", "--mode", "frontend"];
+        argv.extend_from_slice(extra);
+        let (exit, err) = on(&root, &argv);
+        assert_eq!(exit, Exit::Failed, "{extra:?}: {err}");
+        assert!(err.starts_with("kbf-installer: "), "{extra:?}: {err}");
+        assert!(!err.contains("installer.toml"), "{extra:?}: {err}");
+    }
+}
+
+/// Catches the database step reading `installer.toml` under a host root that is not an
+/// absolute path (the root is the sandbox flag's, and a relative one is refused with its
+/// reason rather than reading from the working directory).
+#[test]
+fn the_database_step_refuses_a_relative_host_root() {
+    let (exit, err) = on(Path::new("relative-root"), &["setup", "--mode", "frontend"]);
+    assert_eq!(exit, Exit::Failed, "{err}");
+    assert!(err.starts_with("kbf-installer: "), "{err}");
+}

@@ -392,6 +392,31 @@ fn setup_takes_only_the_modes_with_a_database_and_names_a_bad_config() {
     );
 }
 
+/// `url` without the password of its `user:password@` part (the user stays). The installer
+/// refuses a URL with a password in the world-readable `installer.toml`, and CI's Postgres
+/// service trusts host connections, so the password in `KBF_TEST_POSTGRES_URL` is not needed.
+fn without_password(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let Some((userinfo, host)) = rest.split_once('@') else {
+        return url.to_owned();
+    };
+    let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
+    format!("{scheme}://{user}@{host}")
+}
+
+#[test]
+fn without_password_keeps_the_user_and_the_rest() {
+    assert_eq!(
+        without_password("postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres"),
+        "postgres://postgres@127.0.0.1:5432/postgres"
+    );
+    for same in ["postgres://u@h/db", "postgres:///db?host=/run/x"] {
+        assert_eq!(without_password(same), same);
+    }
+}
+
 /// Catches the verb not reaching the database: the dry run says what it would do and
 /// creates nothing, `--apply` creates the schema, a second `--apply` is a no-op, all
 /// through the binary and the `database` key of `installer.toml`.
@@ -404,7 +429,10 @@ fn setup_creates_the_schema_through_the_binary() {
         .batch_execute("DROP SCHEMA IF EXISTS kbf_state CASCADE")
         .expect("start with no schema");
     let root = root("setup-ok");
-    installer_toml(&root, &format!("database = \"{url}\"\n"));
+    installer_toml(
+        &root,
+        &format!("database = \"{}\"\n", without_password(&url)),
+    );
     let say = |out: &Output| String::from_utf8_lossy(&out.stdout).into_owned();
     let dry = helper(&root, &["setup", "--mode", "frontend"]);
     assert!(dry.status.success(), "{dry:?}");

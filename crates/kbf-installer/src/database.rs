@@ -119,19 +119,37 @@ impl Database {
     /// [`SchemaError`] when the server cannot be asked.
     pub fn plan(&self) -> Result<(Option<u32>, u32), SchemaError> {
         let newest = self.migrations.last().map_or(0, Migration::version);
-        match schema::current(&self.config) {
-            Ok(v) => Ok((Some(v), newest)),
-            Err(SchemaError::NotInitialised) => Ok((None, newest)),
-            Err(other) => Err(other),
-        }
+        plan_of(schema::current(&self.config), newest)
     }
+}
+
+/// The plan from what asking the server for its version said: no schema yet is a plan
+/// (`None`), any other failure is an error.
+fn plan_of(
+    current: Result<u32, SchemaError>,
+    newest: u32,
+) -> Result<(Option<u32>, u32), SchemaError> {
+    match current {
+        Ok(v) => Ok((Some(v), newest)),
+        Err(SchemaError::NotInitialised) => Ok((None, newest)),
+        Err(other) => Err(other),
+    }
+}
+
+/// The log line (or the one-line refusal) for what [`schema::apply`] did.
+fn step_line(applied: Result<Outcome, SchemaError>) -> Result<String, String> {
+    applied
+        .map(|out| out.to_string())
+        .map_err(|e| e.to_string())
 }
 
 impl SchemaStep for Database {
     fn before_start(&mut self, release_schema: u32) -> Result<String, String> {
-        schema::apply(&self.config, &self.migrations, release_schema)
-            .map(|out| out.to_string())
-            .map_err(|e| e.to_string())
+        step_line(schema::apply(
+            &self.config,
+            &self.migrations,
+            release_schema,
+        ))
     }
 }
 

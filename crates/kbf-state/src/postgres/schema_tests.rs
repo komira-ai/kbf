@@ -252,3 +252,69 @@ fn a_schema_behind_the_newest_but_in_range_is_accepted() {
         })
     );
 }
+
+/// Catches a migration kind written to `schema_version` under the wrong name, and the
+/// accessors reading the wrong field: the recorded kind text is what `judge` compares.
+#[test]
+fn a_migration_reports_its_name_and_the_kind_text_recorded() {
+    assert_eq!(Kind::Expand.as_str(), "expand");
+    assert_eq!(Kind::Contract.as_str(), "contract");
+    let m = Migration::new(2, "widen", "-- kbf-migration: contract\nDROP TABLE old;")
+        .expect("a contract step may drop");
+    assert_eq!(m.name(), "widen");
+    assert_eq!(m.version(), 2);
+}
+
+/// Catches the outcome text of `setup` naming the wrong case: created, current, migrated.
+#[test]
+fn the_outcome_says_created_current_or_migrated() {
+    use super::Outcome;
+    let text = |from, ran: Vec<u32>| Outcome { from, to: 3, ran }.to_string();
+    assert_eq!(text(None, vec![1, 2, 3]), "created the schema at version 3");
+    assert_eq!(
+        text(Some(3), vec![]),
+        "the schema is at version 3, nothing to apply"
+    );
+    assert_eq!(text(Some(1), vec![2, 3]), "migrated the schema from 1 to 3");
+}
+
+/// Catches the lint's word scanner losing its place: a nested block comment hides a DROP
+/// until its outer end, a doubled quote does not end a string early (the DROP after it is
+/// still seen), a comment at the end of the file with no newline and an unterminated string
+/// end the scan without a panic or a phantom word.
+#[test]
+fn the_scanner_handles_nested_comments_doubled_quotes_and_unterminated_text() {
+    for sql in [
+        "ALTER TABLE kv ADD COLUMN a text; /* outer /* DROP TABLE kv */ DELETE */ SELECT 1;",
+        "COMMENT ON TABLE kv IS 'it''s a DROP';",
+        "SELECT 1; -- DROP TABLE kv",
+        "SELECT 'DROP TABLE kv",
+    ] {
+        assert!(expand(sql).is_ok(), "{sql}: {:?}", expand(sql));
+    }
+    assert!(expand("COMMENT ON TABLE kv IS 'it''s'; DROP TABLE kv;").is_err());
+}
+
+/// Catches an `ALTER ... TYPE` check that trips on a statement that also says CREATE, and an
+/// UPDATE after a `(`, `ELSE` or `LOOP` slipping through as not a row rewrite.
+#[test]
+fn alter_type_beside_create_is_not_a_type_change_and_nested_updates_are_refused() {
+    assert!(
+        expand("ALTER TABLE kv ADD COLUMN type int DEFAULT 0, ADD COLUMN create int DEFAULT 0;")
+            .is_ok()
+    );
+    for sql in [
+        "DO $$ BEGIN IF a THEN UPDATE kv SET v = 1; END IF; END $$;",
+        "DO $$ BEGIN IF a THEN NULL; ELSE UPDATE kv SET v = 1; END IF; END $$;",
+        "DO $$ BEGIN LOOP UPDATE kv SET v = 1; END LOOP; END $$;",
+    ] {
+        assert!(expand(sql).is_err(), "{sql}");
+    }
+}
+
+/// Catches a unique index on a table whose name the lint could not read (a quoted name
+/// leaves nothing) being allowed: the lint fails closed.
+#[test]
+fn a_unique_index_on_a_table_with_a_quoted_name_is_refused() {
+    assert!(expand("CREATE TABLE \"q\" (a int);\nCREATE UNIQUE INDEX i ON \"q\" (a);").is_err());
+}

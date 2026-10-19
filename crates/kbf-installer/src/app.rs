@@ -13,6 +13,7 @@ use std::thread::sleep;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kbf_host::{HostExec, HostPath, Root};
+use kbf_state::postgres::schema::Outcome;
 
 use crate::activate;
 use crate::cli::{BootArgs, Cli, RunArgs, SetupArgs, Verb};
@@ -117,25 +118,32 @@ fn setup_database(root: &Path, apply: bool, args: &SetupArgs) -> Result<String, 
     let mode = args.mode.name();
     if apply {
         let outcome = database.setup().map_err(|e| Failure::from(e.to_string()))?;
-        return Ok(format!(
-            "kbf-installer setup ({mode}): database step: {outcome}"
-        ));
+        return Ok(apply_line(&mode, &outcome));
     }
     let (found, newest) = database.plan().map_err(|e| Failure::from(e.to_string()))?;
-    Ok(match found {
+    Ok(dry_run_line(&mode, found, newest))
+}
+
+/// The line `setup --apply` prints for what the database step did.
+fn apply_line(mode: &str, outcome: &Outcome) -> String {
+    format!("kbf-installer setup ({mode}): database step: {outcome}")
+}
+
+/// The line a `setup` dry run prints: the schema's version (`None` before the first setup)
+/// against this build's newest.
+fn dry_run_line(mode: &str, found: Option<u32>, newest: u32) -> String {
+    match found {
         None => format!(
             "kbf-installer setup ({mode}): database step: dry run: would create the schema at version {newest}"
         ),
         Some(v) if v < newest => format!(
             "kbf-installer setup ({mode}): database step: dry run: would migrate the schema from {v} to {newest}"
         ),
-        Some(v) => {
-            format!(
-                "kbf-installer setup ({mode}): database step: dry run: the schema is at {v}, \
-                 nothing to do"
-            )
-        }
-    })
+        Some(v) => format!(
+            "kbf-installer setup ({mode}): database step: dry run: the schema is at {v}, \
+             nothing to do"
+        ),
+    }
 }
 
 fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
@@ -354,18 +362,21 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         }
     };
     match result {
-        Ok(line) => {
-            if let Some(line) = line {
-                print_success(cli.json, cli.apply, name, &line, out);
-            }
-            Exit::Ok
-        }
+        Ok(line) => report(line, cli, name, out),
         Err(Failure { exit, why }) => say(
             exit,
             format!("kbf-installer: {why}"),
             serde_json::json!({"verb": name, "error": "failed", "message": why}),
         ),
     }
+}
+
+/// A verb that succeeded: its line, when it has one, goes to `out`.
+fn report(line: Option<String>, cli: &Cli, name: &str, out: &mut dyn Write) -> Exit {
+    if let Some(line) = line {
+        print_success(cli.json, cli.apply, name, &line, out);
+    }
+    Exit::Ok
 }
 
 #[cfg(test)]

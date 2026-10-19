@@ -314,3 +314,13 @@ fn the_identity_pair_and_the_source_agree() {
     );
     assert!(ok.is_ok());
 }
+
+/// Catches a control character in the database URL being written raw into the file (which
+/// would break the line, or hide a key): it is escaped as `\u00XX` and reads back the same.
+#[test]
+fn a_control_character_in_the_database_url_is_escaped() {
+    let rendered = toml_string("a\u{1}b\tc");
+    assert_eq!(rendered, "\"a\\u0001b\\u0009c\"");
+    let back: toml::Table = format!("k = {rendered}").parse().expect("valid TOML");
+    assert_eq!(back["k"].as_str(), Some("a\u{1}b\tc"));
+}

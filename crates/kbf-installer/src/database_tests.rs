@@ -180,3 +180,41 @@ fn the_update_step_migrates_to_what_the_release_needs_while_the_old_child_serves
     assert!(!err.contains('\n'));
     assert_eq!(schema::current(&s.config()), Ok(2));
 }
+
+/// Catches the plan and the update-step line mishandling what the server said, without a
+/// server: no schema yet is a plan (`None`), any other fault stays an error, and the step's
+/// line is the outcome's text or the error's one line.
+#[test]
+fn the_plan_and_the_step_line_follow_what_the_server_said() {
+    use super::{plan_of, step_line};
+    assert_eq!(plan_of(Ok(2), 3).unwrap(), (Some(2), 3));
+    assert_eq!(
+        plan_of(Err(SchemaError::NotInitialised), 3).unwrap(),
+        (None, 3)
+    );
+    assert!(plan_of(Err(SchemaError::Database("down".into())), 3).is_err());
+    let done = schema::Outcome {
+        from: Some(1),
+        to: 3,
+        ran: vec![2, 3],
+    };
+    assert_eq!(
+        step_line(Ok(done)).unwrap(),
+        "migrated the schema from 1 to 3"
+    );
+    assert_eq!(
+        step_line(Err(SchemaError::NotInitialised)).unwrap_err(),
+        SchemaError::NotInitialised.to_string()
+    );
+}
+
+/// Catches the step against an unreachable server (the socket directory is missing) hiding
+/// the failure: `setup`, `plan` and the update step each return the database's reason.
+#[test]
+fn setup_plan_and_the_update_step_report_an_unreachable_server() {
+    let file = toml_file("database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n");
+    let mut db = Database::from_installer_toml(&file).expect("a usable url");
+    assert!(db.setup().is_err());
+    assert!(db.plan().is_err());
+    assert!(!db.before_start(1).unwrap_err().is_empty());
+}
