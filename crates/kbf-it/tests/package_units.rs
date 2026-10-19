@@ -36,6 +36,9 @@ use kbf_deploy::unit::{UnitFile, comments_in_continuations};
 const TREE: &str = "/var/lib/kbf-installer/";
 /// The release kbf-installer flipped to.
 const CURRENT: &str = "/var/lib/kbf-installer/current/";
+/// The release `releases/current` points at (contract section 7): where the plain
+/// frontend unit, on a host without the proxy, runs `kbf` from.
+const RELEASE: &str = "/var/lib/kbf-installer/releases/current/";
 /// A frontend instance's slot: the release it runs, until a confirm flips `current`.
 const SLOT: &str = "/var/lib/kbf-installer/slots/%i/";
 /// The pinned Envoy of instance `%i`.
@@ -50,10 +53,11 @@ const INSTALLER_CONFIG: &str = "/etc/kbf/installer.toml";
 const ENVOY_CONFIG: &str = "/etc/kbf/envoy/envoy.json";
 
 /// The files of the package, and nothing else.
-const FILES: [&str; 8] = [
+const FILES: [&str; 9] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
     "kbf-envoy.service",
+    "kbf-frontend.service",
     "kbf-frontend@.service",
     "kbf-installer.service",
     "kbf-storage-and-daemon.service",
@@ -62,17 +66,18 @@ const FILES: [&str; 8] = [
 ];
 
 /// The runtime units kbf-installer starts before (`Before=` of its unit).
-const RUNTIME: [&str; 6] = [
+const RUNTIME: [&str; 7] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
     "kbf-envoy.service",
+    "kbf-frontend.service",
     "kbf-frontend@.service",
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
 ];
 
 /// The rules, by the tag a violation starts with.
-const RULES: [&str; 30] = [
+const RULES: [&str; 33] = [
     "install",
     "network",
     "positional",
@@ -103,6 +108,9 @@ const RULES: [&str; 30] = [
     "reload",
     "installer",
     "runtime",
+    "proxyless",
+    "config",
+    "slots",
 ];
 
 fn units_dir() -> PathBuf {
@@ -394,10 +402,17 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     }
 
     let mode = mode.expect("a mode unit");
+    // The frontend for a host without the proxy: not a template, no handover, the release
+    // `releases/current` points at, its configuration named by `--config`.
+    let plain = name == "kbf-frontend.service";
     // Catches a unit that starts another mode (or an old binary) under this mode's name,
     // a `--config` (kbf reads /etc/kbf/kbf.toml itself), or a flag the contract does not
     // give the mode: the frontend's instance and control socket only.
-    let bin = if mode == "frontend" { SLOT } else { CURRENT };
+    let bin = match (mode, plain) {
+        ("frontend", true) => RELEASE,
+        ("frontend", false) => SLOT,
+        _ => CURRENT,
+    };
     let kbf = format!("{bin}kbf");
     let mode_flag = format!("--mode={mode}");
     if start.get(..2) != Some(&[kbf.as_str(), mode_flag.as_str()][..]) {
@@ -410,8 +425,13 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     // is the named flag --mode=. Read over every kbf command line of the unit.
     for (key, value) in &execs {
         let mut words = value.trim_start_matches('+').split_whitespace();
+        let mut after_config = false;
         if words.next().is_some_and(|p| p.ends_with("/kbf"))
-            && let Some(w) = words.find(|w| !w.starts_with('-'))
+            && let Some(w) = words.find(|w| {
+                // `--config FILE` takes its value as the next word.
+                let is_value = std::mem::replace(&mut after_config, *w == "--config");
+                !w.starts_with('-') && !is_value
+            })
         {
             v(
                 "positional",
@@ -420,7 +440,9 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         }
     }
     let flags: Vec<&str> = start.iter().skip(2).copied().collect();
-    let allowed: &[&str] = if mode == "frontend" {
+    let allowed: &[&str] = if plain {
+        &["--config", CONFIG]
+    } else if mode == "frontend" {
         &[
             "--instance=%i",
             "--handover-socket=/run/kbf-frontend/control.sock",
@@ -593,7 +615,45 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         );
     }
 
-    if mode == "frontend" {
+    if plain {
+        // Catches a plain frontend that still carries the handover model: a template, an
+        // instance (kbf refuses --instance without --handover-socket), a control socket,
+        // a RuntimeDirectory= for it, a `%i`. Read over every line of the unit's commands.
+        if name.contains('@') {
+            v("proxyless", "a template unit".into());
+        }
+        for (key, value) in &execs {
+            for flag in ["--instance", "--handover-socket"] {
+                if value.contains(flag) {
+                    v("proxyless", format!("{key} gives {flag}: {value}"));
+                }
+            }
+            if value.contains("%i") {
+                v(
+                    "proxyless",
+                    format!("{key} uses the instance specifier: {value}"),
+                );
+            }
+            // Catches a command that runs a slot: with no slots the link is not there.
+            if value.contains("/slots/") {
+                v("slots", format!("{key} runs a slot: {value}"));
+            }
+        }
+        if !all(&unit, "Service", "RuntimeDirectory").is_empty() {
+            v(
+                "proxyless",
+                "RuntimeDirectory= (the handover socket's)".into(),
+            );
+        }
+        // Catches a start that does not read kbf.toml as the contract has it: exactly
+        // `--config /etc/kbf/kbf.toml`, the two words in order.
+        if !start.windows(2).any(|w| w == ["--config", CONFIG]) {
+            v(
+                "config",
+                format!("ExecStart= is {start:?}, without --config {CONFIG}"),
+            );
+        }
+    } else if mode == "frontend" {
         // Catches a frontend that cannot hand over: no template instance, no --instance,
         // a control socket outside a preserved RuntimeDirectory=.
         if !name.ends_with("@.service") {
@@ -765,13 +825,15 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
         }
         n += 1;
     }
-    assert_eq!(n, 7, "a unit was not checked");
+    assert_eq!(n, 8, "a unit was not checked");
 }
 
 /// The modes whose units `files` hold, sorted.
 fn modes_in<'a>(files: &[&'a str]) -> Vec<&'a str> {
     let mut m: Vec<&str> = files.iter().filter_map(|f| mode_of(f)).collect();
     m.sort_unstable();
+    // The frontend has two units, the template and the plain one: one mode.
+    m.dedup();
     m
 }
 
@@ -1041,6 +1103,162 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "\nRestart=on-failure\n",
         "\nRestart=on-failure\nExecReload=/usr/bin/systemctl restart kbf-envoy\n",
         "reload",
+    ),
+    (
+        "kbf-frontend.service",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --config /etc/kbf/kbf.toml",
+        "ExecStart=/var/lib/kbf-installer/slots/a/kbf --mode=frontend --config /etc/kbf/kbf.toml",
+        "slots",
+    ),
+    (
+        "kbf-frontend.service",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --config /etc/kbf/kbf.toml",
+        "ExecStart=/var/lib/kbf-installer/slots/a/kbf --mode=frontend --config /etc/kbf/kbf.toml",
+        "exec",
+    ),
+    (
+        "kbf-frontend.service",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --config /etc/kbf/kbf.toml",
+        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=frontend --config /etc/kbf/kbf.toml",
+        "exec",
+    ),
+    (
+        "kbf-frontend.service",
+        "kbf --mode=frontend --config",
+        "kbf --mode=daemon --config",
+        "exec",
+    ),
+    (
+        "kbf-frontend.service",
+        "kbf --mode=frontend --config",
+        "kbf frontend --config",
+        "positional",
+    ),
+    (
+        "kbf-frontend.service",
+        "--config /etc/kbf/kbf.toml",
+        "--config /etc/kbf/kbf.toml --handover-socket=/run/kbf-frontend/control.sock",
+        "proxyless",
+    ),
+    (
+        "kbf-frontend.service",
+        "--config /etc/kbf/kbf.toml",
+        "--config /etc/kbf/kbf.toml --instance=a",
+        "proxyless",
+    ),
+    (
+        "kbf-frontend.service",
+        "--config /etc/kbf/kbf.toml",
+        "--config /etc/kbf/kbf.toml --instance=%i",
+        "proxyless",
+    ),
+    (
+        "kbf-frontend.service",
+        "[Service]\n",
+        "[Service]\nRuntimeDirectory=kbf-frontend\n",
+        "proxyless",
+    ),
+    (
+        "kbf-frontend.service",
+        "--config /etc/kbf/kbf.toml",
+        "--config /etc/kbf/other.toml",
+        "config",
+    ),
+    (
+        "kbf-frontend.service",
+        " --config /etc/kbf/kbf.toml",
+        "",
+        "config",
+    ),
+    (
+        "kbf-frontend.service",
+        "--config /etc/kbf/kbf.toml",
+        "--config=/etc/kbf/kbf.toml",
+        "config",
+    ),
+    (
+        "kbf-frontend.service",
+        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --check",
+        "ExecStartPre=/var/lib/kbf-installer/slots/a/kbf --mode=frontend --check",
+        "gate-check",
+    ),
+    (
+        "kbf-frontend.service",
+        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --check",
+        "ExecStartPre=/var/lib/kbf-installer/slots/a/kbf --mode=frontend --check",
+        "slots",
+    ),
+    (
+        "kbf-frontend.service",
+        "\nUser=kbf-server\n",
+        "\nUser=kbf\n",
+        "user",
+    ),
+    (
+        "kbf-frontend.service",
+        "TimeoutStopSec=infinity",
+        "TimeoutStopSec=90",
+        "stop",
+    ),
+    (
+        "kbf-frontend.service",
+        "Type=notify",
+        "Type=simple",
+        "notify",
+    ),
+    (
+        "kbf-frontend.service",
+        "ExecStartPre=+/usr/bin/kbf-installer boot-check\n",
+        "",
+        "gate-check",
+    ),
+    (
+        "kbf-frontend.service",
+        "MemorySwapMax=0",
+        "MemorySwapMax=1G",
+        "swap",
+    ),
+    (
+        "kbf-frontend.service",
+        "ConditionPathExists=/etc/kbf/kbf.toml\n",
+        "",
+        "gate-file",
+    ),
+    (
+        "kbf-frontend.service",
+        "StartLimitIntervalSec=0\n",
+        "",
+        "restart-limit",
+    ),
+    (
+        "kbf-frontend.service",
+        "Restart=on-failure",
+        "Restart=always",
+        "restart",
+    ),
+    (
+        "kbf-frontend.service",
+        "RestartPreventExitStatus=2",
+        "RestartPreventExitStatus=",
+        "restart-exit",
+    ),
+    (
+        "kbf-frontend.service",
+        "LimitNOFILE=1048576",
+        "LimitNOFILE=1024",
+        "nofile",
+    ),
+    (
+        "kbf-frontend.service",
+        "StateDirectory=kbf-server\n",
+        "StateDirectory=kbf\n",
+        "state-dir",
+    ),
+    (
+        "kbf-frontend.service",
+        "Slice=kbf.slice",
+        "Slice=system.slice",
+        "slice",
     ),
     (
         "kbf-installer.service",

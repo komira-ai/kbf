@@ -27,6 +27,20 @@ inputs, and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes
   unchanged; `/var/lib/kbf-installer` is made by `kbf-installer setup`, not at install);
 - all of it `root:root`, with one time (`SOURCE_DATE_EPOCH`) on every file and the package.
 
+### Which frontend unit
+
+A frontend host enables exactly one of two units; they bind the same ports.
+
+- `kbf-frontend.service`: a host **without** the frontend proxy. One process, `kbf
+  --mode=frontend --config /etc/kbf/kbf.toml`, run from `/var/lib/kbf-installer/releases/current/kbf`
+  (no slots, no `--instance`, no `--handover-socket`); listeners, state store and certificates
+  are `kbf.toml`'s. An update is a restart after `kbf-installer confirm` flips `current`.
+- `kbf-proxy` (the unprivileged proxy that starts the frontend as its child from
+  `releases/<commit>/kbf`): a host **with** the proxy does not enable a frontend unit.
+- `kbf-frontend@.service`: the handover model (instances `a` and `b`, a control socket, a
+  slot per instance). It is kept until the proxy work removes it (frontend-proxy units U7c);
+  use it only where `kbf-installer setup` enables `kbf-frontend@a` today.
+
 It refuses anything else (a unit named neither `kbf-*.service` nor `kbf.slice`, a fourth trust file, no unit).
 
 Dependencies: deb `crun, uidmap, systemd, ca-certificates`; rpm the same with Fedora's name
