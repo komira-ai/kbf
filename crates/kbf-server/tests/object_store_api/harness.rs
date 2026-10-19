@@ -19,6 +19,7 @@ use kbf_server::enroll::Random;
 use kbf_server::object_store::Registry;
 use kbf_server::object_store::api::{AckSource, ObjectStoreApi, routes};
 use kbf_server::object_store::probe::{Probe, ProbeTarget};
+use kbf_server::proxy_auth::Trust;
 use kbf_server::token::ApiToken;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
@@ -264,6 +265,8 @@ pub async fn send_body(
 ) -> Reply {
     let mut request = request.body(body).expect("a request");
     request.extensions_mut().insert(ConnectInfo(peer));
+    // What `gate_requests` records on a server with no proxy configured.
+    request.extensions_mut().insert(Trust::Direct);
     let response = router.clone().call(request).await.expect("infallible");
     let (parts, body) = response.into_parts();
     let bytes = axum::body::to_bytes(body, usize::MAX).await.expect("body");
