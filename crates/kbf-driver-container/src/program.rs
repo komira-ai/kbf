@@ -399,7 +399,15 @@ mod tests {
             said.read().await.expect("report"),
             "crun: executable file `env` not found in $PATH: No such file or directory"
         );
+        // The log's words alone, when the init said nothing.
         std::fs::write(&log, LOG).expect("log");
+        std::fs::write(&report, "").expect("empty report");
+        assert_eq!(said.read().await.expect("log only"), crun_words(LOG));
+        std::fs::write(
+            &report,
+            "executable file `env` not found in $PATH: No such file or directory\n",
+        )
+        .expect("report");
         let both = said.read().await.expect("both");
         assert!(both.starts_with("crun: executable file `env` not found in $PATH: No such file or directory; crun: open executable"), "{both}");
         assert!(both.ends_with("directory"), "{both}");
