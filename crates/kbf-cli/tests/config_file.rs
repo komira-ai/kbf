@@ -430,6 +430,101 @@ fn check_file_names_the_file() {
     assert_eq!(config::check_file(&path), Ok(()));
 }
 
+/// Catches `file_mode` taking a `mode` that is not a string (a number, a table) for a mode
+/// or for none, or an unreadable file for a file with no mode: a non-string `mode` is
+/// refused saying it is a string naming one mode; a file whose bytes are not text is
+/// refused as unreadable, naming the file; one with no `mode` answers `None`.
+#[test]
+fn file_mode_reads_a_string_and_refuses_the_rest() {
+    let dir = scratch("file_mode");
+    let path = file(&dir, "mode = 3\n", 0o600);
+    let why = config::file_mode(&path).expect_err("not a string");
+    assert!(
+        why.contains("`mode` is a string naming one mode")
+            && why.contains(&path.display().to_string()),
+        "{why}"
+    );
+    let path = file(&dir, "mode = \"daemon\"\n", 0o600);
+    assert_eq!(config::file_mode(&path), Ok(Some("daemon".to_owned())));
+    let path = file(&dir, "[node]\nid = \"a\"\n", 0o600);
+    assert_eq!(config::file_mode(&path), Ok(None));
+
+    let path = dir.join("kbf.toml");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    let why = config::file_mode(&path).expect_err("not text");
+    assert!(
+        why.starts_with("cannot read the config file ")
+            && why.contains(&path.display().to_string()),
+        "{why}"
+    );
+    let err = kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None).expect_err("bad");
+    assert!(
+        err.to_string().contains("cannot read the config file"),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// Catches enrollment's tables (`[node]`, `[enroll]`, ...) in the shared file being passed
+/// to a mode as flags, or a key of them that enrollment does not read being let by: a
+/// known key rides along without becoming a flag, an unknown one is refused naming
+/// `table.key` and the file (a table that is no table is refused by
+/// `a_value_where_an_enrollment_table_is_refused_naming_key_and_file`).
+#[test]
+fn enrollments_tables_are_in_the_file_but_are_not_flags() {
+    let dir = scratch("own_tables");
+    let with = |extra: &str| file(&dir, &format!("{FRONTEND_FILE}{extra}"), 0o600);
+    let parse = |path: &Path| kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(path)), None);
+
+    let path = with("[node]\nid = \"node-02\"\nzone = \"a\"\n[enroll]\ntoken_file = \"/t\"\n");
+    let parsed = parse(&path).expect("enrollment's known keys are let through");
+    assert_eq!(
+        frontend(&parsed.invocation).server.listen.to_string(),
+        "127.0.0.1:9980"
+    );
+
+    let path = with("[node]\nid = \"node-02\"\nbogus = 1\n");
+    let err = parse(&path).expect_err("unknown key of an enrollment table");
+    let msg = err.to_string();
+    assert!(msg.contains("unknown key `node.bogus`"), "{msg}");
+    assert!(msg.contains("enrollment's table"), "{msg}");
+    assert!(msg.contains(&path.display().to_string()), "{msg}");
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// Catches a value where one of enrollment's tables is being skipped by the flags' check
+/// (it would reach the mode as nothing, so `storage = "http://..."` meant as the
+/// frontend's `--storage` is silently dropped): a top-level `storage`, `daemon`, `node`,
+/// `tls` as a string, number or bool is refused naming the key and the file, in the
+/// flags' parser, `--check`'s settings check and a `kbf <mode>` parse alike.
+#[test]
+fn a_value_where_an_enrollment_table_is_refused_naming_key_and_file() {
+    let dir = scratch("own_scalar");
+    for key in [
+        "storage", "daemon", "node", "tls", "enroll", "dirs", "frontend",
+    ] {
+        for value in ["\"x\"", "1", "true"] {
+            let path = file(&dir, &format!("{key} = {value}\n{FRONTEND_FILE}"), 0o600);
+            let at = path.display().to_string();
+            let err = kbf_cli::parse_with(argv(&["kbf", "frontend"], Some(&path)), None)
+                .expect_err("a value for a table");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("`{key}`")) && msg.contains(&at),
+                "{key} = {value}: {msg}"
+            );
+            assert_eq!(err.exit_code(), 2, "{key} = {value}");
+            let why = kbf_cli::check_settings("frontend", &path).expect_err("check");
+            assert!(
+                why.contains(&format!("`{key}`")) && why.contains(&at),
+                "{key} = {value}: {why}"
+            );
+        }
+    }
+}
+
 /// A command with three settings, to read files against `config::file_args` directly:
 /// `listen` and `storage` are in the real group table (`listener`, `storage-client`),
 /// `zz-ungrouped` is in none, which no real mode allows (`config::tests` refuses it).
@@ -476,13 +571,14 @@ fn a_top_level_key_that_is_no_setting_is_refused() {
     assert!(err.contains("unknown key `nonsense`"), "{err}");
 }
 
-/// Catches the same name being read either way: a top-level `storage` is a real setting
-/// of another mode's `[storage-client]` but not a flag of this command, so it is unknown
-/// here, while the command's own `listen` at top level is told its table.
+/// Catches the same name being read either way: a top-level `worker-listen` is a real
+/// setting of another mode's `[listener]` but not a flag of this command, so it is unknown
+/// here, while the command's own `listen` at top level is told its table. (Not `storage`:
+/// that is enrollment's table name, whose scalar enrollment's own parser refuses.)
 #[test]
 fn a_top_level_flag_of_another_mode_is_unknown_and_of_this_one_is_misplaced() {
-    let other = small_args("storage = \"x\"\n", "top_other").expect_err("unknown");
-    assert!(other.contains("unknown key `storage`"), "{other}");
+    let other = small_args("worker-listen = \"x\"\n", "top_other").expect_err("unknown");
+    assert!(other.contains("unknown key `worker-listen`"), "{other}");
     let own = small_args("listen = \"x\"\n", "top_own").expect_err("misplaced");
     assert!(own.contains("belongs under [listener]"), "{own}");
 }

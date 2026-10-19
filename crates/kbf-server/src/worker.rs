@@ -147,13 +147,11 @@ impl Worker for WorkerService {
                 "the first message of a session must be Hello",
             ));
         };
-        let version = hello.protocol_version;
-        if !(OLDEST_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
-            return Err(Status::failed_precondition(format!(
-                "protocol version {version} is not accepted; this server speaks \
-                 {OLDEST_PROTOCOL_VERSION} to {PROTOCOL_VERSION}"
-            )));
-        }
+        let version = negotiate(
+            hello.protocol_version,
+            OLDEST_PROTOCOL_VERSION,
+            PROTOCOL_VERSION,
+        )?;
         if hello.node_id.is_empty() {
             return Err(Status::invalid_argument("Hello has no node_id"));
         }
@@ -201,6 +199,22 @@ impl Worker for WorkerService {
             |mut responses| async move { responses.recv().await.map(|m| (m, responses)) },
         ))))
     }
+}
+
+/// The version a session speaks, which `Welcome` names: the version the `Hello` names
+/// (`hello`), when it lies in `oldest..=newest` (so it is also the lesser of `hello`
+/// and `newest`). A daemon checks that `Welcome` names the version it sent, so naming
+/// `newest` instead would end every session of an older daemon this server accepts.
+///
+/// # Errors
+/// FAILED_PRECONDITION: `hello` is below `oldest` or above `newest`.
+fn negotiate(hello: u32, oldest: u32, newest: u32) -> Result<u32, Status> {
+    if !(oldest..=newest).contains(&hello) {
+        return Err(Status::failed_precondition(format!(
+            "protocol version {hello} is not accepted; this server speaks {oldest} to {newest}"
+        )));
+    }
+    Ok(hello)
 }
 
 /// One stream after its first `Hello`.
@@ -429,4 +443,43 @@ fn entry(capabilities: &[Capability], key: &str) -> Result<Option<u64>, String> 
         })
     })
     .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::Code;
+
+    use super::negotiate;
+
+    /// Catches: a `Welcome` that names the server's newest version (the integration
+    /// tests speak version 1 to a server of version 1, so they cannot tell it from the
+    /// `Hello`'s own), or the greater of the two; and an accepted range with a bound
+    /// moved in (the oldest or the newest version refused).
+    #[test]
+    fn a_hello_in_range_is_answered_with_its_own_version() {
+        for hello in 1..=3 {
+            assert_eq!(negotiate(hello, 1, 3).expect("in range"), hello);
+        }
+        assert_eq!(negotiate(1, 1, 1).expect("the only version"), 1);
+    }
+
+    /// Catches: a version below the oldest or above the newest accepted (a bound moved
+    /// out by one, or the check dropped), the wrong code, and a message that does not
+    /// name the version refused and the range the server speaks.
+    #[test]
+    fn a_hello_out_of_range_is_refused_naming_the_range() {
+        for hello in [0, 4, u32::MAX] {
+            let status = negotiate(hello, 1, 3).expect_err("out of range");
+            assert_eq!(status.code(), Code::FailedPrecondition, "{hello}");
+            let said = format!("protocol version {hello} is not accepted");
+            assert!(status.message().contains(&said), "{}", status.message());
+            assert!(status.message().contains("1 to 3"), "{}", status.message());
+        }
+        assert_eq!(
+            negotiate(2, 1, 1)
+                .expect_err("above the only version")
+                .code(),
+            Code::FailedPrecondition
+        );
+    }
 }

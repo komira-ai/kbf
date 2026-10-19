@@ -127,12 +127,17 @@ pub struct Cli {
     /// one connection, within the `--transfer-*` limits.
     #[arg(long)]
     cas: Option<String>,
-    /// The update directory: the daemon fetches the release the frontend offers into
-    /// its `inbox/`, over the connection `--cas` names, and reads the root helper's
-    /// `status.json` there. Left out, the node updates by hand: it says so and touches
-    /// no directory. Not taken by the all-in-one binary yet.
+    /// The root installer's directory: the daemon reads its `status.json` there. The
+    /// frontend's orders are written to `orders/` beneath it unless `--orders-dir` says
+    /// otherwise. Left out, the node updates by hand: it says so and touches no
+    /// directory. Not taken by the all-in-one binary yet.
     #[arg(long, value_name = "DIR")]
     update_dir: Option<PathBuf>,
+    /// The order spool (owned by the service user, mode 0700): where the daemon writes
+    /// the order records the root installer reads. With `--update-dir` only; default
+    /// `<update-dir>/orders`.
+    #[arg(long, value_name = "DIR", requires = "update_dir")]
+    orders_dir: Option<PathBuf>,
     #[command(flatten)]
     data: data_dir::DataArgs,
     #[command(flatten)]

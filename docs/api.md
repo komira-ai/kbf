@@ -151,15 +151,15 @@ store that cannot be read answers `503`.
 An operator takes a node out of placement, drains it, or returns it
 ([fleet-updates.md](design/fleet-updates.md) sections 3.3 and 4.2):
 
-- `:cordon`: the scheduler offers the node no new lease; its leases run on. A drain
+- `:cordon` (`POST /v1/nodes/{node}:cordon`): the scheduler offers the node no new lease; its leases run on. A drain
   already under way is kept.
-- `:drain`: cordons the node and waits for its leases to end. The body may be
+- `:drain` (`POST /v1/nodes/{node}:drain`): cordons the node and waits for its leases to end. The body may be
   `{"deadline_secs": N}`; without a body the deadline is 30 minutes. With no lease
   left the node is `drained`. If the deadline comes first the drain **pauses**: the
   leases run on, nothing is killed or given up, and the node stays `drain_paused`
   even after they end, until an operator drains it again (a new deadline) or
   uncordons it.
-- `:uncordon`: returns the node to placement and ends any drain.
+- `:uncordon` (`POST /v1/nodes/{node}:uncordon`): returns the node to placement and ends any drain.
 
 The answer is the node, as `GET /v1/nodes` lists it, after the action. `404` for a
 node that never registered or an unknown verb, `400` for a drain body of another
@@ -422,6 +422,29 @@ curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json'
 ```
 
 A UI comes later.
+
+## `/v1/object-stores/...` (**planned**)
+
+**Not built: every route here answers 404 today.** The routes register the farm's object
+store with the frontend, which keeps it as durable desired state and lets the storage nodes
+fetch it ([the design](design/object-store-registration.md)). Planned, each passing every
+gate of [Who may write](#who-may-write) on a GET too, with `Cache-Control: no-store`, and off
+(404) unless the frontend has a secrets directory:
+
+| Route | Does |
+|---|---|
+| `PUT /v1/object-stores/connections/{name}` | create or replace a connection (an endpoint and a key pair); idempotent |
+| `GET /v1/object-stores/connections` | list the connections, never a secret |
+| `GET /v1/object-stores/connections/{name}` | one connection, never a secret |
+| `DELETE /v1/object-stores/connections/{name}` | delete; `409 in_use` while bound |
+| `POST /v1/object-stores/connections/{name}:verify` | probe the store, change nothing |
+| `PUT /v1/object-stores/bindings/{role}` | bind the role `cold` to a connection, a bucket and a prefix |
+| `DELETE /v1/object-stores/bindings/{role}` | unbind; `409 in_use` once a node has applied it |
+| `GET /v1/object-stores` | the desired state, and which storage nodes have applied it |
+| `GET /v1/object-stores/audit?limit=` | the audit rows |
+
+The design page has the bodies, the error codes and the rotation runbook. Every verb of the
+API, built, open or planned, is in [the verbs table](design/operator-verbs.md).
 
 ## `GET /v1/storage`
 
@@ -1150,7 +1173,7 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   not a new run; a rollback is the older commit offered the same way and gets a higher
   generation. Generations increase, but may skip numbers: each write that loses a race has
   already drawn a counter value.
-- `POST /v1/update/pause` and `/resume` (the write gates, no body) set `paused` of the policy
+- `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
   row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
   needed, and an offer leaves the flag as it is: while set, no host is started.
 

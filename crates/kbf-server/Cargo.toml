@@ -55,6 +55,8 @@ tonic = { workspace = true, features = ["tls-ring"] }
 tower-layer.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The wipe of a secret file's bytes after they are read or written (object_store/secrets.rs).
+zeroize.workspace = true
 
 [dev-dependencies]
 # Loopback ports nothing can take (kbf_testkit::port).

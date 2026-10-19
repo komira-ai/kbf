@@ -62,6 +62,8 @@ drain-deadline-secs = 600
 # driver = []
 # A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 # image = []
+# The order spool (owned by the service user, mode 0700): where the daemon writes the order records the root installer reads. With `--update-dir` only; default `<update-dir>/orders`
+# orders-dir = "DIR"
 # The longest wait between rounds of connection attempts, in milliseconds. Each wait is jittered down by up to half
 reconnect-max-ms = 30000
 # The wait, in milliseconds, after a session ends and after the first round of connection attempts that all failed. It doubles with each further failed round
@@ -72,7 +74,7 @@ reconnect-ms = 1000
 # reserve-share = "N"
 # The roles to run
 role = "all"
-# The update directory: the daemon fetches the release the frontend offers into its `inbox/`, over the connection `--cas` names, and reads the root helper's `status.json` there. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
+# The root installer's directory: the daemon reads its `status.json` there. The frontend's orders are written to `orders/` beneath it unless `--orders-dir` says otherwise. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
 # update-dir = "DIR"
 
 [history]

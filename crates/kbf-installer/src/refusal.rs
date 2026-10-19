@@ -200,6 +200,8 @@ pub enum OfferFault {
     BadSha256(String),
     #[error("{0:?} is not a commit (40 lowercase hex digits)")]
     BadCommit(String),
+    #[error("no `kbf-daemon` is built for a Mac, and it names that component")]
+    DarwinDaemon,
 }
 
 impl OfferFault {
@@ -214,6 +216,7 @@ impl OfferFault {
             OfferFault::RepeatedFile(_) => "offer-repeated-file",
             OfferFault::BadSha256(_) => "offer-sha256",
             OfferFault::BadCommit(_) => "offer-commit",
+            OfferFault::DarwinDaemon => "offer-darwin-daemon",
         }
     }
 }

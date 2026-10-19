@@ -42,20 +42,19 @@ kbf-server.workspace = true
 kbf-peer.workspace = true
 rustls.workspace = true
 x509-parser.workspace = true
-# `kbf node` and `kbf enroll`: the node's side of enrollment, and the types and wire it
-# speaks (src/enroll.rs, src/node.rs).
+# The start of the storage, daemon and storage-and-daemon modes enrolls the host: the
+# node's side of enrollment, and the types and wire it speaks (src/enroll.rs, src/node.rs).
 kbf-enroll.workspace = true
 kbf-proto.workspace = true
 kbf-types.workspace = true
 thiserror.workspace = true
-# `kbf.toml` read once more for the roles its tables name (src/enroll.rs), and the settings
-# file of every mode (src/config.rs).
+# The settings file of every mode (src/config.rs).
 toml.workspace = true
 # The renewal loop beside the running mode (src/node.rs).
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
 # The stand-in `crun`'s (kbf-cli-fake-crun); the effective uid and the host name that
-# `kbf node` and `kbf enroll` read.
+# a start that enrolls reads.
 rustix = { workspace = true, features = ["process", "system"] }
 # The schema version of the SQLite state file, which `kbf --version --json` reports.
 kbf-state.workspace = true
@@ -90,8 +89,7 @@ kbf-host.workspace = true
 # (tests/deploy_units.rs), and the node's certificates (tests/storage_and_daemon.rs).
 rcgen = { workspace = true, features = ["x509-parser"] }
 # The in-process frontend of kbf-enroll's tests (tests/node.rs includes it): its
-# certificate authority and the role check of its worker listener.
-kbf-peer.workspace = true
+# certificate authority (the role check of its worker listener is kbf-peer's, above).
 sha2.workspace = true
 time.workspace = true
 x509-parser = { workspace = true, features = ["verify"] }

@@ -103,6 +103,7 @@ mod memory;
 pub mod metrics;
 mod missing;
 pub mod node_map;
+pub mod object_store;
 pub mod raft_log;
 mod rebuild;
 pub mod release;
