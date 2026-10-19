@@ -52,7 +52,7 @@ fn entry_inode(fake: &Fake, bytes: &[u8]) -> u64 {
 /// Catches the cache not consulted by the driver, an output-named input linked to the
 /// cache (in the overlay's upper directory, which the container's root owns, the
 /// action could then write the entry), and the whole input root handed to the
-/// container's root (every cached inode re-owned: the "`chown -hR 1:1` over `root`"
+/// container's root (every cached inode re-owned: the "`chown -hR 1001:1001` over `root`"
 /// mutant at the fake's level). The action reports the inode and link count of an
 /// input and of an output-named input; the second lease fetches nothing.
 #[tokio::test]
@@ -98,8 +98,8 @@ async fn inputs_are_links_to_the_cache_and_only_directories_change_owner() {
     assert_eq!(
         owners,
         [
-            format!("chown-dirs 1:1 {root}"),
-            format!("chown 1:1 {upper} {work} {rw}"),
+            format!("chown-dirs 1001:1001 {root}"),
+            format!("chown 1001:1001 {upper} {work} {rw}"),
             "run ended".to_owned(),
             format!("chown-dirs 0:0 {root}"),
             format!("chown 0:0 {upper} {work} {rw}"),

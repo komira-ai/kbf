@@ -15,7 +15,7 @@ mod node;
 
 use std::io::{BufRead as _, BufReader};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ use kbf_proto::reapi::{
     Action, ActionResult, Command as ReapiCommand, Digest, Directory, DirectoryNode,
     ExecuteRequest, ExecuteResponse, FileNode, Platform,
 };
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
 use node::{
     PROMPT, Running, cgroup_tree, crun, files_holding, id_files, image_path, input_bytes,
@@ -47,14 +48,10 @@ const FAKE_CRUN: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-crun");
 /// The bytes the action writes to its one output file.
 const OUTPUT: &[u8] = b"a file\n";
 
-/// A fresh directory for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = node::scratch_root()
-        .join("kbf-storage-and-daemon")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A fresh directory for one test, removed when it drops (declare it before the
+/// processes that write into it).
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(node::scratch_root().join("kbf-storage-and-daemon"), name)
 }
 
 /// The scheduler: `kbf-server` in this process over its own stores in `dir`, its worker

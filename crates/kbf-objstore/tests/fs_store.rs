@@ -12,6 +12,7 @@ use kbf_objstore::{
     ByteRange, Floor, FsStore, FsStoreError, KeyPrefix, ListToken, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize, Room, Space, conformance, objects_source,
 };
+use kbf_testkit::forked::ForkedChild;
 use sha2::{Digest, Sha256};
 
 /// A floor every file system the tests run on meets: one byte.
@@ -205,6 +206,34 @@ fn a_second_open_is_refused_until_the_first_store_closes() {
     );
     drop(first);
     drop(FsStore::open(&dir, FLOOR).expect("open after the first closed"));
+    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
+/// Catches a lock the last handle's drop releases only by closing its descriptor, which
+/// a process forked while the store was open keeps held until it execs. A process that
+/// spawns children from one thread while another reopens a directory (the tests of one
+/// test binary run on threads of one process) is then refused its own reopen with
+/// `Locked` for as long as a child is between fork and exec. The child here is held
+/// before exec until the reopen has been tried, so the interleaving is the failing one
+/// every time. A clone is held across the fork too: the directory is unlocked when the
+/// last handle goes, not before.
+///
+/// Mutant: the `Drop` of `DirLock` removed: `Locked` from the reopen.
+#[test]
+fn a_child_forked_while_the_store_was_open_does_not_keep_the_dir_locked_after_the_drop() {
+    let dir = scratch("lock-forked");
+    let first = FsStore::open(&dir, FLOOR).expect("open");
+    let clone = first.clone();
+    let child = ForkedChild::before_exec();
+    drop(first);
+    assert!(
+        matches!(FsStore::open(&dir, FLOOR), Err(FsStoreError::Locked { .. })),
+        "a clone is still open, and the directory was not locked"
+    );
+    drop(clone);
+    let again = FsStore::open(&dir, FLOOR);
+    drop(again.expect("an open after the last handle was dropped, with the child alive"));
+    child.finish();
     std::fs::remove_dir_all(&dir).expect("remove");
 }
 

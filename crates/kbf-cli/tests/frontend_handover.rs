@@ -5,23 +5,24 @@
 //! `start`, so a stop, restart or kill by the command fails the test.
 
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use kbf_testkit::dir::TestDir;
 
 const KBF: &str = env!("CARGO_BIN_EXE_kbf");
 const FAKE: &str = env!("CARGO_BIN_EXE_kbf-cli-fake-systemctl");
 
 struct Fake {
-    dir: PathBuf,
+    dir: TestDir,
 }
 
 impl Fake {
     fn new(name: &str) -> Fake {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("frontend_handover")
-            .join(name);
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("scratch");
+        // Each command runs to its end inside a call, so no child outlives the dir.
+        let dir = TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("frontend_handover-{name}"),
+        );
         std::os::unix::fs::symlink(FAKE, dir.join("systemctl")).expect("link");
         Fake { dir }
     }
