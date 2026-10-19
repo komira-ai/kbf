@@ -26,7 +26,8 @@ pub enum Verb {
     Activate,
     Confirm,
     Revert,
-    /// The frontend's own update (a record the frontend writes into its own host's spool).
+    /// The frontend's own update (a record the frontend writes into its own host's spool): a
+    /// locator, so the order has no claims; the commit is fetched from the installer's source.
     FrontendUpdate,
 }
 
