@@ -135,14 +135,17 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
         starts: args.starts,
         min_activation_interval_secs: args.min_activation_interval_secs,
     };
-    // The release fetcher and the lease source are wired by later changes; until then an
-    // activation of a release that is not installed, and every activation, is refused.
+    // The leases are those of the unit restarted after a swap, read below the host root's
+    // cgroup mount. The release fetcher is wired by a later change; until then an
+    // activation of a release that is not installed is refused.
+    let cgroups = HostPath::new(leases::CGROUP_ROOT).expect("CGROUP_ROOT is an absolute path");
+    let lease_source = leases::for_restart(&cfg.restart, &layout.join(&cgroups));
     let mut helper = Helper::new(
         layout,
         exec,
         cfg,
         Box::new(fetcher::NotWired),
-        Box::new(leases::NotWired),
+        lease_source,
         Box::new(HostProcs::new(platform)),
     );
     if let Some(database) = database {

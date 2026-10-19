@@ -127,6 +127,12 @@ impl<E: Exec> Helper<E> {
         self.schema.as_deref_mut()
     }
 
+    /// The lease source, for a test to see what a caller wired.
+    #[cfg(test)]
+    pub(crate) fn leases(&self) -> &dyn LeaseSource {
+        self.leases.as_ref()
+    }
+
     /// The host's executor, for a test to read what was done.
     pub fn exec(&self) -> &E {
         &self.exec

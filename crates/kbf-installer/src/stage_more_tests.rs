@@ -386,3 +386,36 @@ fn a_stream_the_parent_hashed_differently_from_the_file_is_a_hash_refusal() {
     assert_eq!(err.word(), Some("hash"), "{err}");
     assert!(runner.calls().is_empty());
 }
+
+/// Catches the lease check holding up an order that moves no node link. A `frontend_update`
+/// is verified and installed whatever the lease source says (live leases, or a source that
+/// cannot tell: setup's first release runs on a host whose unit never ran, so there is no
+/// cgroup to read, and the frontend's streams belong to the swap and the proxy). An
+/// activation of the same release with the same source is refused as `lease` before
+/// anything is installed, so the skip is the frontend update's alone.
+///
+/// Mutants seen red: the check skipped for every kind (the activation installs); the check
+/// kept for the frontend update (the update is refused as `lease`).
+#[test]
+fn a_frontend_update_does_not_wait_for_leases_and_an_activation_does() {
+    for (name, leases) in [("cannot-tell", usize::MAX), ("live", 2)] {
+        let rig = Rig::new(&format!("lease-kind-{name}"));
+        rig.leases.set(leases);
+        let err = rig.activate(&honest()).expect_err("an activation waits");
+        assert_eq!(err.word(), Some("lease"), "{name}: {err}");
+        rig.assert_nothing_installed();
+
+        let (locator, fetched) = rig.fetch(&tarball());
+        let staged = rig
+            .verify(
+                &honest(),
+                OrderKind::FrontendUpdate,
+                &[locator],
+                None,
+                fetched,
+            )
+            .unwrap_or_else(|e| panic!("{name}: a frontend update moves no node link: {e}"));
+        assert!(!staged.already_installed, "{name}");
+        assert!(rig.release().exists(), "{name}: the release is installed");
+    }
+}

@@ -50,8 +50,11 @@ fn status(root: &Path) -> serde_json::Value {
 
 /// Catches a helper that cannot do one pass of its own: it writes a world-readable
 /// status.json and exits 0 (here as a non-root user, so with the installer's refusal); with an order it cannot
-/// carry out (the binary has no fetcher yet), the pass ends and the refusal is the node's to
-/// read, not a crash.
+/// carry out (the binary has no fetcher yet, and no cgroup of the unit's leases exists on
+/// this root), the pass ends and the refusal is the node's to read, not a crash.
+///
+/// Mutant seen red: `leases::NotWired` left in `build_helper` (the refusal says there is no
+/// lease source wired in, not that the unit's cgroup is missing).
 #[test]
 fn one_pass_reports_the_host_and_a_refused_order() {
     let root = root("pass");
@@ -67,7 +70,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
     fs::create_dir_all(&release).expect("release");
     fs::write(release.join("kbf"), b"x").expect("binary");
 
-    let run = ["run", "--passes", "1", "--unit", "kbf.service"];
+    let run = ["run", "--passes", "1", "--unit", "kbf-daemon.service"];
     let out = helper(&root, &run);
     assert!(
         out.status.success(),
@@ -91,8 +94,9 @@ fn one_pass_reports_the_host_and_a_refused_order() {
         .mode();
     assert_eq!(mode & 0o777, 0o644, "the node reads it as the service user");
 
-    // An activation: the binary has no lease source and no fetcher yet, so it is refused
-    // with that reason (fail closed), and the pass ends.
+    // An activation: the binary reads the leases of the daemon's unit from its cgroup, and
+    // this scratch root has none, so it cannot tell and the order is refused with that
+    // reason (fail closed), and the pass ends. (It has no fetcher yet either.)
     let record = kbf_update::OrderRecord {
         order_id: 2,
         epoch: 1,
@@ -135,7 +139,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
     assert_eq!(status(&root)["state"], "refused");
     let why = status(&root)["refusal"].as_str().expect("text").to_owned();
     assert!(
-        why.contains("lease source"),
+        why.contains("kbf-daemon.service: no such cgroup"),
         "the order's own refusal now: {why}"
     );
 }
