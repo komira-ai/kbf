@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::auth::Security;
 use crate::config::{Limits, UpstreamTable};
 use crate::control::{ProxySnapshot, SlotStats};
 use crate::hold::{HoldLimits, HoldQueue};
 use crate::metrics::Metrics;
 use crate::pool::{Connector, Pool};
+use crate::security::Security;
 use crate::slot::{ActiveSlot, Slot};
 
 /// The streams one downstream connection may have open at once. The connection window is this

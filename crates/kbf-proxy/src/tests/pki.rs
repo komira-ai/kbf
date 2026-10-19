@@ -1,11 +1,8 @@
-//! A throwaway farm CA and the certificates the tests present, and a scratch directory for
-//! the files the proxy reads. Nothing here is committed key material: every key is made by
-//! the test that uses it.
+//! A throwaway farm CA and the certificates the tests present. Nothing here is committed key
+//! material: every key is made by the test that uses it.
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -16,29 +13,6 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::tls::TlsPaths;
-
-/// A fresh empty directory for one test, beside the test binary.
-pub(crate) fn scratch(name: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps directory")
-        .join("kbf-proxy-unit")
-        .join(format!("{name}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
-}
-
-/// Writes `content` to `path` with `mode`.
-pub(crate) fn write_file(path: &Path, content: &[u8], mode: u32) {
-    // A read-only file of an earlier write cannot be written over.
-    let _ = std::fs::remove_file(path);
-    std::fs::write(path, content).expect("write the file");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-}
 
 /// A certificate and its key, as PEM, and the certificate's DER.
 pub(crate) struct Leaf {

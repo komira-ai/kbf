@@ -180,7 +180,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::tests::pki::{scratch, write_file};
+    use crate::scratch::{scratch, write_file};
 
     #[test]
     fn a_file_is_trusted_only_when_it_is_this_users_and_closed() {

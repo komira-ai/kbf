@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::auth::{Buck2Auth, Security, Token, Tokens};
+use crate::auth::{Buck2Auth, Token, Tokens};
 use crate::config::{Limits, UpstreamTable};
 use crate::control::{NoUpdates, UpdateHandler};
 use crate::core::Core;
@@ -26,6 +26,7 @@ use crate::identity::Identity;
 use crate::identity::ProxySecret;
 use crate::pool::{BoxIo, Connector, upstream_addr};
 use crate::route::Target;
+use crate::security::Security;
 use crate::serve::{Listen, serve};
 use crate::slot::{ActiveSlot, Slot};
 use crate::tls::{Acceptor, TlsPaths, TlsReloader};

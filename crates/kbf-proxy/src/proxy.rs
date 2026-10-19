@@ -14,12 +14,13 @@ use tokio::net::TcpListener;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::watch;
 
-use crate::auth::{Buck2Auth, Security, Tokens};
+use crate::auth::{Buck2Auth, Tokens};
 use crate::config::ProxyConfig;
 use crate::control::{ProxySnapshot, UpdateHandler};
 use crate::core::{Core, now};
 use crate::identity::{ProxySecret, SecretOrigin, admin_headers};
 use crate::pool::tcp_connector;
+use crate::security::Security;
 use crate::serve::serve;
 use crate::slot::{ActiveSlot, HoldGuard};
 use crate::tls::{Acceptor, TlsPaths, TlsReloadError, TlsReloader};

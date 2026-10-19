@@ -47,6 +47,10 @@ pub mod replay;
 #[cfg(not(kbf_loom))]
 mod reply;
 pub mod route;
+#[cfg(test)]
+mod scratch;
+#[cfg(not(kbf_loom))]
+mod security;
 #[cfg(not(kbf_loom))]
 mod serve;
 pub mod slot;

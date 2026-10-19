@@ -22,10 +22,11 @@ use super::kit::{
     Access, BUCK2_TOKEN, CAPS, Client, OPERATOR, OPERATOR_TOKEN, Rig, SECRET, client_builder,
     finish,
 };
-use super::pki::{Pki, client_config, scratch};
+use super::pki::{Pki, client_config};
 use crate::auth::Buck2Auth;
 use crate::identity::Identity;
 use crate::route::{Route, route_of};
+use crate::scratch::scratch;
 
 const WORKER: &str = "/kbf.worker.v1.Worker/Session";
 const ENROLL: &str = "/kbf.enroll.v1.Enroll/Enroll";

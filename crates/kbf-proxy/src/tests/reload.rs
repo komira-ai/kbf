@@ -3,9 +3,10 @@
 use std::sync::atomic::Ordering;
 
 use super::kit::{Access, CAPS, Rig};
-use super::pki::{Pki, client_config, scratch};
+use super::pki::{Pki, client_config};
 use super::secure::{connect_tls, h2_over_tls, tls_rig};
 use crate::auth::Buck2Auth;
+use crate::scratch::scratch;
 
 /// The DER of the certificate the server presented.
 fn served<T>(tls: &tokio_rustls::client::TlsStream<T>) -> Vec<u8> {

@@ -353,7 +353,8 @@ struct Files {
 }
 
 fn files(name: &str, base: u16, extra: &str) -> Files {
-    use super::pki::{Pki, scratch, write_file};
+    use super::pki::Pki;
+    use crate::scratch::{scratch, write_file};
     let dir = scratch(name);
     let pki = Pki::new("farm CA");
     let paths = pki.write(&dir, &pki.server());
@@ -485,7 +486,7 @@ fn bind_reports_where_the_secret_came_from() {
 /// Kills: a bind that starts without TLS, without the operator token, or on an open secret.
 #[test]
 fn bind_refuses_files_it_cannot_use() {
-    use super::pki::write_file;
+    use crate::scratch::write_file;
     let bind = |files: &Files| {
         let (socket, _) = listener();
         Proxy::bind(files.config.clone(), OwnedFd::from(socket)).map(|_| ())

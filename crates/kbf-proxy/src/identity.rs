@@ -350,7 +350,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         use super::super::*;
-        use crate::tests::pki::{scratch, write_file};
+        use crate::scratch::{scratch, write_file};
 
         fn mode_of(path: &Path) -> u32 {
             std::fs::metadata(path).expect("meta").permissions().mode() & 0o7777
