@@ -36,7 +36,13 @@ fn helper() {
             .expect("the report");
         writeln!(file, "{line}").expect("report");
     };
-    let dir = crate::scratch(&format!("helper-{role}"));
+    // The test's directory, not one of its own: a directory named for this process's id is a
+    // dead process's once the harness is killed, and the sweep of any test that starts
+    // removes it, with the records the sentinel is about to read.
+    let dir = Path::new(&report)
+        .parent()
+        .expect("the report's directory")
+        .to_owned();
     let sleeper = |name: &str| Spec {
         name: name.to_owned(),
         program: PathBuf::from("sleep"),
@@ -122,6 +128,7 @@ fn helper() {
                 &dir,
                 0,
             );
+            say(format!("records {}", dir.display()));
             say(format!("child {}", proc.pid()));
             let _held = (sentinel, proc);
             loop {
@@ -486,6 +493,39 @@ fn a_harness_killed_by_sigkill_takes_what_its_roles_started_with_it() {
     until("the grandchild to die with the harness", || {
         (!alive(sleeper)).then_some(())
     });
+}
+
+#[test]
+fn what_a_killed_harness_recorded_survives_the_sweep_of_a_test_that_starts() {
+    // Catches: the records the sentinel acts on (the groups of the roles) lying in a
+    // directory named for the harness's own process id. The harness is killed; its id is
+    // then a dead process's, and the first `scratch` of any test that starts (the CI runs
+    // thousands, each in a process of its own) removes the directories of dead ones, the
+    // records with them, in the moment before the sentinel reads them: the grandchild then
+    // runs on. Here the sweep is run by hand between the kill and the check, which makes
+    // the race a certainty. Mutant: the helper makes its directory with `scratch` (named
+    // for its own process id) instead of using its test's.
+    let d = crate::scratch("sweep-race");
+    let report = d.join("report");
+    let mut harness = Killed(
+        helper_process("grouped", &report)
+            .spawn()
+            .expect("the helper"),
+    );
+    let find = children(&report, 1)[0];
+    let _cleanup = Cleanup(vec![find, child_sleep_of(find)]);
+    let records = until("the helper to say where its records are", || {
+        let text = std::fs::read_to_string(&report).unwrap_or_default();
+        text.lines()
+            .find_map(|l| l.strip_prefix("records ").map(PathBuf::from))
+    });
+    harness.0.kill().expect("kill the harness");
+    harness.0.wait().expect("reaped");
+    crate::sweep_dead(d.parent().expect("the root"), &crate::alive);
+    assert!(
+        pgid_file(&records, "find", 0).exists(),
+        "the group record of a killed harness was swept with the directory of its process"
+    );
 }
 
 #[test]
