@@ -15,7 +15,7 @@ fn header(life: &Life, inv: &InvRef) -> Option<InvocationHeader> {
     let row = life
         .index
         .inner
-        .get(&format!("ui/invid/{}", inv.key))
+        .get(&life.index_root.header(&inv.key, life.writer_id))
         .unwrap()?;
     Some(InvocationHeader::decode(row.value.as_slice()).unwrap())
 }
@@ -33,7 +33,8 @@ fn a_close_with_no_records_writes_no_header_row() {
     life.drain(T, 5);
     assert_eq!(header(&life, &bare), None);
     assert_eq!(life.writer.open_invocations(), 0, "nothing held for it");
-    // A close with no new record still closes the header a previous life stored.
+    // Nor does a close of an invocation another writer recorded: a writer closes the
+    // header of its own records, and the other writer's row is left as it is.
     let inv = InvRef::named("b1");
     life.run(&inv, T, "main", RunOutcome::Ok);
     life.step(T);
@@ -42,9 +43,13 @@ fn a_close_with_no_records_writes_no_header_row() {
     let mut second = Life::start(&objects, &index, 2, Limits::default());
     second.close(&inv);
     second.drain(T + 120_001, 5);
-    let h = header(&second, &inv).unwrap();
-    assert_eq!((h.state(), h.runs), (InvState::Closed, 1));
-    assert_eq!(h.instances, ["main"]);
+    assert_eq!(
+        header(&second, &inv),
+        None,
+        "no row for records it never wrote"
+    );
+    let h = header(&life, &inv).unwrap();
+    assert_eq!((h.state(), h.runs), (InvState::Open, 1));
 }
 
 #[test]

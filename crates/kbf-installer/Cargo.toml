@@ -70,7 +70,9 @@ h2.workspace = true
 http.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
 kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
-# The proxy verb's process test starts the binary under a guard that reaps it.
+# The proxy verb's process test starts the binary under a guard that reaps it
+# (kbf_testkit::reaped); a child held between fork and exec (kbf_testkit::forked), and a
+# start that waits out a program still open for writing (kbf_testkit::spawn).
 kbf-testkit.workspace = true
 kbf-update.workspace = true
 # The proxy verb serves TLS: its process test makes a CA and a server certificate, and is a
