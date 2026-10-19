@@ -645,6 +645,22 @@ fn force_retire_works_on_an_old_child_left_by_an_ended_update() {
     ));
 }
 
+/// Catches a status that ignores the restart seam (always false, always true, or read once
+/// at construction): the answer follows the seam on every request, idle or not.
+///
+/// Mutants planted: `restart_pending` fixed to `false`; fixed to `true`.
+#[test]
+fn status_restart_pending_follows_the_restart_seam_on_every_request() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let rig = Rig::new("u8a-restart-seam");
+    let mut core = rig.core();
+    assert!(!body(&mut core).restart_pending);
+    rig.restart.store(true, SeqCst);
+    assert!(body(&mut core).restart_pending);
+    rig.restart.store(false, SeqCst);
+    assert!(!body(&mut core).restart_pending);
+}
+
 #[test]
 fn status_reports_the_supervisors_update_and_the_gate_on_rollback() {
     let rig = Rig::new("u8a-status");
@@ -658,13 +674,16 @@ fn status_reports_the_supervisors_update_and_the_gate_on_rollback() {
     assert!(!idle_body.restart_pending);
 
     rig.sup.set(Phase::Baking, Some(old()), 0);
-    std::fs::write(rig.marker_path(), b"").unwrap();
+    rig.restart.store(true, std::sync::atomic::Ordering::SeqCst);
     let s = body(&mut core);
     assert_eq!(s.update_id.map(|u| u.0), Some("upd-9".to_owned()));
     assert_eq!((s.from, s.to), (Some(c(A)), Some(c(B))));
     assert_eq!(s.phase, Some(Phase::Baking));
     assert_eq!(s.since, Some(1_800_000_000));
-    assert!(s.restart_pending, "the postinst marker is set");
+    assert!(
+        s.restart_pending,
+        "the running proxy is not the installed binary"
+    );
     assert!(s.rollback_allowed);
     assert_eq!(s.rollback_blocked_reason, None);
     assert_eq!(s.old, Some(old()));
