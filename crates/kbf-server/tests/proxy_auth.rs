@@ -59,9 +59,14 @@ impl std::ops::Deref for Owned {
 
 /// A file holding `content` with `mode`, unique to this call.
 fn file(content: &[u8], mode: u32) -> Owned {
+    named("secret", content, mode)
+}
+
+/// As [`file`], with the file called `name` (an error that names the path shows it).
+fn named(name: &str, content: &[u8], mode: u32) -> Owned {
     let dir =
         kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-proxy-auth");
-    let path = dir.join("secret");
+    let path = dir.join(name);
     std::fs::write(&path, content).expect("write the file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
     Owned { path, _dir: dir }
@@ -712,7 +717,7 @@ fn a_deny_list_that_cannot_be_read_or_parsed_stops_a_proxied_start_without_the_s
     let secret = file(&SECRET, 0o600);
     let secret = secret.to_str().expect("UTF-8");
     let bad = file(b"node a\nserial zz\n", 0o600);
-    let missing = file(b"", 0o600);
+    let missing = named("no-such-deny-list", b"", 0o600);
     std::fs::remove_file(&missing.path).expect("remove the file, so it is missing");
     for (list, words) in [(bad, ["serial", ":2:"]), (missing, ["read", "no-such"])] {
         let list = list.to_str().expect("UTF-8");
