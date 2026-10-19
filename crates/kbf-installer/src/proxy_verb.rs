@@ -18,7 +18,9 @@
 //!
 //! `--check` loads the whole file the way a run does, so a bad key outside `[proxy]` is
 //! refused (exit 2) too. A stop signal drains for at most 5 s; the process ends within
-//! [`STOP_BOUND`] of the first one whatever the runtime is doing, and at once on a second.
+//! [`STOP_BOUND`] of the first one is seen, whatever the drain is doing, and at once on a
+//! second. SIGTERM and SIGINT are unblocked at start, so a launcher's inherited mask cannot
+//! hide them.
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
@@ -152,9 +154,11 @@ pub fn activated(
 const STOP_BOUND: Duration = Duration::from_secs(10);
 
 /// What a stop signal does. The first asks the proxy to drain and starts a clock on a thread
-/// of its own (the runtime may be the thing that is stuck), so a SIGTERM always ends the
-/// process within [`STOP_BOUND`]; any later signal is an operator who is done waiting and ends
-/// it at once. Both exits are status 1: the stop was not the clean drain.
+/// of its own, so a drain that never finishes ends the process within [`STOP_BOUND`] of the
+/// signal being seen. The signal itself is received by a task on the proxy's runtime: the
+/// bound does not cover a runtime too stuck to run that task. Any later signal is an operator
+/// who is done waiting and ends the process at once. Both exits are status 1: the stop was
+/// not the clean drain.
 struct Stop {
     seen: AtomicBool,
     bound: Duration,
@@ -177,9 +181,25 @@ impl Stop {
     }
 }
 
+/// Unblocks SIGTERM and SIGINT in this thread, and so in the runtime threads created after it:
+/// the signal mask survives `exec`, and a launcher that blocked them would otherwise leave a
+/// verb that no stop signal reaches.
+fn unblock_stop_signals() {
+    // SAFETY: `sigemptyset` and `sigaddset` fill a set owned here; `pthread_sigmask` reads it
+    // and changes only this thread's mask.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut set);
+        libc::sigaddset(&raw mut set, libc::SIGTERM);
+        libc::sigaddset(&raw mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+    }
+}
+
 /// Serves on `listener` until a stop signal. The signal handlers are registered before the
 /// proxy serves, so none is lost to the default action.
 fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
+    unblock_stop_signals();
     let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
     let runtime = handle.runtime();
     let (term, int) = runtime.block_on(async {

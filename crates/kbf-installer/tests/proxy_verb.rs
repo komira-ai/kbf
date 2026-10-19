@@ -116,6 +116,12 @@ fn start(path: &Path, listener: &TcpListener) -> Reaped {
 
 /// [`start`] with `stderr` for the verb's standard error.
 fn start_with(path: &Path, listener: &TcpListener, stderr: Stdio) -> Reaped {
+    start_masked(path, listener, stderr, false)
+}
+
+/// [`start_with`], and with `block_term` the verb inherits SIGTERM and SIGINT blocked, as from
+/// a launcher that blocked them.
+fn start_masked(path: &Path, listener: &TcpListener, stderr: Stdio, block_term: bool) -> Reaped {
     let fd = listener.as_raw_fd();
     let mut command = Command::new(BIN);
     command
@@ -124,11 +130,18 @@ fn start_with(path: &Path, listener: &TcpListener, stderr: Stdio) -> Reaped {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
-    // SAFETY: only async-signal-safe calls and `setenv`, which is safe here: the child is a
+    // SAFETY: only async-signal-safe calls (`sigprocmask` family included) and `setenv`, which is safe here: the child is a
     // fresh fork of a test thread that holds no environment lock, and nothing else in this
     // file forks with a hook.
     unsafe {
         command.pre_exec(move || {
+            if block_term {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&raw mut set);
+                libc::sigaddset(&raw mut set, libc::SIGTERM);
+                libc::sigaddset(&raw mut set, libc::SIGINT);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+            }
             if fd == 3 {
                 libc::fcntl(3, libc::F_SETFD, 0);
             } else if libc::dup2(fd, 3) < 0 {
@@ -383,4 +396,31 @@ async fn a_closed_standard_error_does_not_stop_the_verb_serving() {
     );
     let (status, took) = exited(&mut child, Duration::from_secs(10));
     assert_eq!(status.and_then(|s| s.code()), Some(0), "after {took:?}");
+}
+
+/// Catches a verb that serves with the stop signals still blocked, as a launcher that blocked
+/// them leaves it (the mask is inherited through `exec`, and a blocked signal is never
+/// delivered, handler or not): started with SIGTERM and SIGINT blocked, the verb still ends
+/// on each with status 0.
+#[tokio::test(flavor = "current_thread")]
+async fn a_launcher_that_blocked_the_stop_signals_cannot_make_the_verb_unstoppable() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let path = config(&format!("masked-{signal}"), TABLE);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mut child = start_masked(&path, &listener, Stdio::piped(), true);
+        drop(listener);
+        let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, "/healthz"))
+            .await
+            .expect("the proxy answers");
+        assert_eq!(status, 200);
+        // SAFETY: `kill` of our own child.
+        assert_eq!(unsafe { libc::kill(child.id().cast_signed(), signal) }, 0);
+        let (status, took) = exited(&mut child, Duration::from_secs(10));
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(0),
+            "signal {signal}, after {took:?}"
+        );
+    }
 }
