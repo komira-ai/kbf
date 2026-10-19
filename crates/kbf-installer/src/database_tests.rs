@@ -421,10 +421,12 @@ mod provisioned {
     }
 
     fn sql(statement: &str) {
-        postgres::Client::connect(&url(), NoTls)
-            .expect("the test server")
-            .batch_execute(statement)
-            .expect("statement");
+        // One statement per call: several in one are a transaction, where CREATE and DROP
+        // DATABASE are refused.
+        let mut client = postgres::Client::connect(&url(), NoTls).expect("the test server");
+        for one in statement.split(';').filter(|s| !s.trim().is_empty()) {
+            client.batch_execute(one).expect("statement");
+        }
     }
 
     /// A role and a database name unique to one test; both are dropped with it.
