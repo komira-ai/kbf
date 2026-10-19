@@ -224,7 +224,7 @@ fn a_wildcard_san_covers_one_label() {
 #[test]
 fn a_key_that_is_not_the_certificates_is_refused() {
     let p = pair("mismatch");
-    let mut entries = two(&p, true);
+    let entries = two(&p, true);
     let other = leaf(&ca("third CA"), PUBLIC, ServerAuth, false);
     std::fs::write(&entries[0].key, &other.key).expect("swap key");
     let why = refused(&entries);
