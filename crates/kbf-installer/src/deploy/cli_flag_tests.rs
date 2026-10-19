@@ -145,7 +145,26 @@ fn an_applied_deploy_must_name_the_frontend_it_observes() {
     let host = rig.host(true);
     let (code, out, err) = rig.go_with(without.clone(), &["--apply"], b"", &host);
     assert_eq!((code, out.as_str()), (2, ""));
-    assert!(err.contains("--observe is required"), "{err}");
+    assert!(
+        err.contains("--observe or --observe-base-port is required"),
+        "{err}"
+    );
+    let mut both = rig.base();
+    both.extend(["--observe-base-port".to_owned(), "18000".to_owned()]);
+    let (code, _, err) = rig.go_with(both, &["--apply"], b"", &host);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("give one"), "{err}");
+    for bad in ["80", "65535", "x"] {
+        let mut a = rig.base();
+        let at = a.iter().position(|x| x == "--observe").unwrap();
+        a.splice(
+            at..=at + 1,
+            ["--observe-base-port".to_owned(), bad.to_owned()],
+        );
+        let (code, _, err) = rig.go_with(a, &["--apply"], b"", &host);
+        assert_eq!(code, 2, "{bad}: {err}");
+        assert!(err.contains("--observe-base-port"), "{bad}: {err}");
+    }
     let (code, _, err) = rig.go_with(without, &[], b"", &host);
     assert_ne!(code, 2, "a plan needs no --observe: {err}");
     for bad in ["0.0.0.0:2", "not-an-address"] {

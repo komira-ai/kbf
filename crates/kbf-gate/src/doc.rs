@@ -256,6 +256,11 @@ pub struct ResultDoc {
     pub gates: Vec<GateResult>,
     /// Why a run ended without deciding, or was dropped.
     pub note: Option<String>,
+    /// Which process each reading of a stage was taken from, when the stage reads a process
+    /// that can change (a deploy follows the frontend across a handover): `<step>: <which>`,
+    /// one entry each time the process read changes. Left out when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed: Vec<String>,
     /// The release tag a gamma verdict is for; `release verdict` refuses another.
     pub tag: Option<String>,
     /// What makes the release not reversible (section 8.3), one line each; the notes carry it.
@@ -286,6 +291,7 @@ impl ResultDoc {
             waivers: Vec::new(),
             gates: Vec::new(),
             note: None,
+            observed: Vec::new(),
             tag: None,
             not_reversible: Vec::new(),
             escapes: Vec::new(),

@@ -230,3 +230,19 @@ fn the_status_is_green_only_with_gates_and_none_red() {
         assert!(!d.passed(), "{s:?} is not a pass");
     }
 }
+
+/// Proves `observed` survives a write and a read, and that a document without it reads as
+/// before (the golden file has none). Catches a field that is dropped on write or required
+/// on read.
+#[test]
+fn observed_round_trips_and_is_optional() {
+    let mut d = full();
+    d.observed = vec![
+        "preflight: slot a".to_owned(),
+        "frontend: slot b".to_owned(),
+    ];
+    let back = ResultDoc::from_bytes(&d.to_bytes().unwrap()).unwrap();
+    assert_eq!(back.observed, d.observed);
+    let plain = String::from_utf8(full().to_bytes().unwrap()).unwrap();
+    assert!(!plain.contains("observed"));
+}

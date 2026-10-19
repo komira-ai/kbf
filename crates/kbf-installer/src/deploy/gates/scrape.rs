@@ -9,9 +9,7 @@ use crate::deploy::api::Request;
 /// that is not a sample: each is an error, which the gates read as every series absent.
 pub(super) fn read(run: &Run) -> Result<Metrics, String> {
     let reply = run
-        .env
-        .observe
-        .send(&Request::get("/metrics"))
+        .observe_send(&Request::get("/metrics"))
         .map_err(|e| format!("scrape failed: GET /metrics: {e}"))?;
     if reply.status != 200 {
         return Err(format!(

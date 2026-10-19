@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::api::{Http, Operator, Reply, Request, parse_reply};
+use super::observe::Observe;
 use super::*;
 use crate::testkit::{A, B, c};
 
@@ -116,8 +117,14 @@ struct Farm {
     /// Calls the fake does not know. It answers them 404 and notes them here, so a test that
     /// leans on a call the fake never learned fails instead of passing on a silent default.
     unknown: RefCell<Vec<String>>,
-    /// Every call the observed frontend ([`Observed`]) was asked.
+    /// Every call the observed frontend ([`ObservedApi`]) was asked.
     observed_log: RefCell<Vec<String>>,
+    /// Both children answer (an ambiguous farm).
+    both_children: bool,
+    /// Calls a child that was not serving refused, and the reads each child answered (with
+    /// whether the frontend order had been posted).
+    refused: RefCell<Vec<String>>,
+    child_reads: RefCell<Vec<(observe::Slot, bool)>>,
 }
 
 /// A build the fake farm knows: running from `from` to `to` (seconds), whose actions had
@@ -196,6 +203,9 @@ impl Farm {
             page: 0,
             unknown: RefCell::new(Vec::new()),
             observed_log: RefCell::new(Vec::new()),
+            both_children: false,
+            refused: RefCell::new(Vec::new()),
+            child_reads: RefCell::new(Vec::new()),
         }
     }
 
@@ -454,6 +464,13 @@ impl Operator for Farm {
                 }
                 Farm::reply(202, json!({"order_id": 2}))
             }
+            ("GET", "/v1/update/frontend") => {
+                let slot = self.frontend_at.get().map(|_| match self.serving_child() {
+                    observe::Slot::A => "a",
+                    observe::Slot::B => "b",
+                });
+                Farm::reply(200, json!({"active_slot": slot}))
+            }
             ("GET", "/readyz") => Farm::reply(if self.ready { 200 } else { 503 }, json!({})),
             _ => {
                 self.unknown.borrow_mut().push(call);
@@ -466,9 +483,80 @@ impl Operator for Farm {
 /// The frontend the gates observe (`--observe`): `/metrics` and `/v1/invocations`, on the
 /// farm's state and clock but a listener of its own. It answers nothing else (404, noted), and
 /// the update API ([`Farm`]) answers none of these.
-struct Observed<'a>(&'a Farm);
+struct ObservedApi<'a>(&'a Farm);
 
-impl Operator for Observed<'_> {
+/// The observed frontend as one fixed address (`--observe`).
+struct Obs<'a>(&'a Farm);
+
+impl Observe for Obs<'_> {
+    fn resolve(&self, _: Option<observe::Slot>) -> Result<observe::Observed<'_>, String> {
+        Ok(observe::Observed {
+            label: "fixed".to_owned(),
+            api: Box::new(ObservedApi(self.0)),
+        })
+    }
+}
+
+/// The two children of the frontend proxy (`--observe-base-port`): only the serving one
+/// answers, the other refuses the connection, and the serving one changes with the handover.
+struct SlotObs<'a>(&'a Farm);
+
+struct Child<'a> {
+    farm: &'a Farm,
+    slot: observe::Slot,
+}
+
+impl Farm {
+    /// The child that serves now: slot A until the frontend order is posted, slot B after
+    /// (A again once a reverting order has reverted).
+    fn serving_child(&self) -> observe::Slot {
+        match self.frontend_at.get() {
+            None => observe::Slot::A,
+            Some(t)
+                if matches!(
+                    self.frontend_fate,
+                    FrontendFate::Revert | FrontendFate::StaleThenRevert
+                ) && self.now.get() >= t + 10 =>
+            {
+                observe::Slot::A
+            }
+            Some(_) => observe::Slot::B,
+        }
+    }
+
+    fn child_alive(&self, slot: observe::Slot) -> bool {
+        self.both_children || self.serving_child() == slot
+    }
+}
+
+impl Observe for SlotObs<'_> {
+    fn resolve(&self, serving: Option<observe::Slot>) -> Result<observe::Observed<'_>, String> {
+        let slot = observe::choose(serving, |s| self.0.child_alive(s))?;
+        Ok(observe::Observed {
+            label: slot.to_string(),
+            api: Box::new(Child { farm: self.0, slot }),
+        })
+    }
+}
+
+impl Operator for Child<'_> {
+    fn send(&self, r: &Request) -> io::Result<Reply> {
+        if !self.farm.child_alive(self.slot) {
+            self.farm
+                .refused
+                .borrow_mut()
+                .push(format!("{}: {} {}", self.slot, r.method, r.path));
+            return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+        }
+        self.farm
+            .child_reads
+            .borrow_mut()
+            .push((self.slot, self.farm.frontend_at.get().is_some()));
+        ObservedApi(self.farm).send(r)
+    }
+}
+
+impl Operator for ObservedApi<'_> {
     fn send(&self, r: &Request) -> io::Result<Reply> {
         let f = self.0;
         let call = format!("{} {}", r.method, r.path);
@@ -545,13 +633,22 @@ fn run_with(
     smoke: SmokeResult,
     bundle: Option<&mut dyn io::Read>,
 ) -> Summary {
+    run_observing(farm, o, smoke, bundle, &Obs(farm))
+}
+
+fn run_observing(
+    farm: &Farm,
+    o: &Options,
+    smoke: SmokeResult,
+    bundle: Option<&mut dyn io::Read>,
+    observe: &dyn Observe,
+) -> Summary {
     let clock = Clk(farm.now.clone());
     let smoke = FixedSmoke(smoke);
     let check = FixedCheck(Ok(true));
-    let observed = Observed(farm);
     let env = Env {
         api: farm,
-        observe: &observed,
+        observe,
         clock: &clock,
         smoke: &smoke,
         check: &check,
@@ -872,7 +969,7 @@ fn a_failed_installer_check_refuses_and_an_unavailable_one_is_recorded() {
     let clock = Clk(f.now.clone());
     let smoke = FixedSmoke(SmokeResult::Pass);
     let bad = FixedCheck(Err("envoy is out of range".into()));
-    let observed = Observed(&f);
+    let observed = Obs(&f);
     let env = Env {
         api: &f,
         observe: &observed,
@@ -887,7 +984,7 @@ fn a_failed_installer_check_refuses_and_an_unavailable_one_is_recorded() {
     let f = farm(two_nodes());
     let clock = Clk(f.now.clone());
     let none = NoCheck;
-    let observed = Observed(&f);
+    let observed = Obs(&f);
     let env = Env {
         api: &f,
         observe: &observed,
@@ -1169,7 +1266,7 @@ fn with_step_back(farm: &Farm, at: u64) -> Summary {
     };
     let smoke = FixedSmoke(SmokeResult::Pass);
     let check = FixedCheck(Ok(true));
-    let observed = Observed(farm);
+    let observed = Obs(farm);
     let env = Env {
         api: farm,
         observe: &observed,
@@ -1374,6 +1471,7 @@ mod cli_tests {
             ("--cas", "http://127.0.0.1:1"),
             ("--result", "/etc/cron.d/x"),
             ("--observe", "127.0.0.1:2"),
+            ("--observe-base-port", "18000"),
             ("--observe-token-file", "/etc/shadow"),
         ] {
             let list = args(&["--commit", &commit, flag, value]);

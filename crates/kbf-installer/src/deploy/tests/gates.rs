@@ -767,3 +767,68 @@ fn a_build_whose_rows_are_capped_is_red() {
     assert!(s.detail.contains("capped"), "{}", s.detail);
     assert_eq!(gate(&doc, name::FARM_FAILURES).measured, None);
 }
+
+// ---- the frontend moves ------------------------------------------------------------
+
+/// Run an applied deploy over the two children of the frontend proxy; the summary and the
+/// document.
+fn run_slots(f: &Farm, test: &str) -> (Summary, ResultDoc) {
+    let path = scratch(test);
+    let mut o = opts(true);
+    o.result = Some(path.clone());
+    let s = run_observing(f, &o, SmokeResult::Pass, None, &SlotObs(f));
+    assert!(f.unknown.borrow().is_empty(), "{:?}", f.unknown.borrow());
+    let doc = ResultDoc::from_bytes(&fs::read(&path).unwrap()).unwrap();
+    (s, doc)
+}
+
+/// Proves the gates follow the frontend across its own handover. Slot A serves until the
+/// deploy hands the frontend over, then slot A refuses connections and slot B serves: every
+/// read before the handover is slot A's, every read after it slot B's, none is refused, the
+/// deploy stays green, and the document says which child each stretch of readings came from.
+/// Catches gates that go on reading the retired child (a refused scrape is red).
+///
+/// Mutants planted: no new resolution after the frontend step.
+#[test]
+fn the_gates_follow_the_serving_child_across_the_frontend_handover() {
+    let f = farm(two_nodes());
+    let (s, doc) = run_slots(&f, "handover");
+    assert_eq!((s.exit, s.reason.as_str()), (0, ""), "{}", s.line());
+    assert_eq!(doc.status, Status::Green);
+    assert_eq!(doc.observed, ["preflight: slot a", "frontend: slot b"]);
+    assert!(f.refused.borrow().is_empty(), "{:?}", f.refused.borrow());
+    let reads = f.child_reads.borrow();
+    assert!(!reads.is_empty());
+    for (slot, after_post) in reads.iter() {
+        let want = if *after_post {
+            observe::Slot::B
+        } else {
+            observe::Slot::A
+        };
+        assert_eq!(*slot, want, "{reads:?}");
+    }
+    assert!(reads.iter().any(|(s, _)| *s == observe::Slot::B));
+}
+
+/// Proves a farm on which both children answer and the update API names none refuses to
+/// start the gates, saying so, and reads neither. Catches a resolver that guesses.
+///
+/// Mutants planted: two live children resolved to the first (unit test in `observe.rs`).
+#[test]
+fn two_live_children_and_no_serving_slot_is_refused_at_the_preflight() {
+    let mut f = farm(two_nodes());
+    f.both_children = true;
+    let (s, _) = run_slots(&f, "ambiguous");
+    assert_eq!(
+        (s.exit, s.reason.as_str()),
+        (3, "observe_unresolved"),
+        "{}",
+        s.line()
+    );
+    assert!(
+        s.detail.contains("both frontend slots answer"),
+        "{}",
+        s.detail
+    );
+    assert!(f.child_reads.borrow().is_empty());
+}

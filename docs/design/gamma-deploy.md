@@ -13,7 +13,7 @@ drain system rolls the nodes, one storage node at a time.
 neither. The config must be a regular file nobody else may write (and root-owned); it is not
 read when both flags are given. The token file must be a regular file, mode 0600 or 0400.
 The address must be loopback. Run through `sudo` (the environment carries `SUDO_UID`, set to the
-caller's uid), `deploy` refuses `--api`, `--token-file`, `--config`, `--lock`, `--platform`, `--result`, `--observe` and `--observe-token-file`
+caller's uid), `deploy` refuses `--api`, `--token-file`, `--config`, `--lock`, `--platform`, `--result`, `--observe`, `--observe-base-port` and `--observe-token-file`
 with exit 2: the caller would choose where root sends the token and which file it reads. Those
 values then come only from the root-owned config. Scope the sudoers rule to the exact argument
 list too, with no wildcard: `deploy --apply --json --commit` followed by forty `[0-9a-f]`
@@ -68,15 +68,25 @@ the deploy first (`result_unwritable`). `--set-hash <64hex>` is the hash of the 
 (`SHA256SUMS`); without it the document carries a hash of what `GET /v1/releases` lists for
 the commit. `--settle-timeout-s` (default 600) is gate E's window.
 
-**Where the gates read.** `--observe <127.0.0.1:port>` (host flag; config key `observe`;
-required with `--apply`, exit 2 without it) is the frontend whose `/metrics` and
-`/v1/invocations` the gates read, and `--observe-token-file` (host flag; config key
-`observe_token_file`; default: the `--token-file` token, one operator token guards both). It is
-not `--api`: the public proxy answers `/metrics` itself (its own `kbf_proxy_*` counters, not
-the frontend's) and serves the update routes, so a gate read sent there would see no
-series. Gates read only `--observe`; the release and update calls go only to `--api`. Both
-addresses must be loopback. The active child's port changes with the slot on a handover, so
-`--observe` must name the child that is serving after the swap [A].
+**Where the gates read.** Either `--observe <127.0.0.1:port>` (one frontend that does not move)
+or `--observe-base-port <N>` (the children of the frontend proxy: slot A listens from `N`, slot B
+from `N + 10`, the operator listener is at offset 2 of a slot) is required with `--apply`
+(exit 2 without one, or with both; host flags; config keys `observe`, `observe_base_port`).
+`--observe-token-file` (host flag; key `observe_token_file`) defaults to the `--token-file`
+token: one operator token guards both. The gates do not read `--api`: the public proxy answers
+`/metrics` itself (its own `kbf_proxy_*` counters, not the frontend's) and serves the update
+routes, and no `/v1` path carries `kbf_frontend_relay_untraced` or the cache gauges, so only
+the serving child's operator listener can be read. Release and update calls go only to `--api`.
+Both addresses must be loopback.
+
+With `--observe-base-port` the deploy follows the handover. It resolves the serving child at
+the preflight and again after every frontend step: the slot `GET /v1/update/frontend` names in
+`active_slot` (present while that update is known), else the only child that answers
+`/metrics`; none answering, or both with no slot named, ends the deploy (`observe_unresolved`).
+The result document's `observed` lists `<step>: <child>` each time the child read changes
+(for example `preflight: slot a 127.0.0.1:18002`, `frontend: slot b 127.0.0.1:18012`).
+[A] Before any update has run on a host the API names no slot, so the preflight probes; a host
+where both children are left running after an earlier swap needs the older one stopped.
 
 `/metrics` is scraped from `--observe` at the preflight, after `desired`, at every
 poll of the node wait, after the frontend step and at the post checks. A measurement that is

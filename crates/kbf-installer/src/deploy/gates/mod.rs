@@ -95,6 +95,9 @@ pub(crate) struct Gates {
     ids: BTreeSet<String>,
     /// The hash of the release set, when preflight derived it.
     pub derived_set_hash: Option<SetHash>,
+    /// Which frontend each reading came from: `<step>: <which>` each time it changes.
+    pub observed: Vec<String>,
+    last_observed: String,
 }
 
 impl Gates {
@@ -107,6 +110,16 @@ impl Gates {
             baseline_losses: None,
             ids: BTreeSet::new(),
             derived_set_hash: None,
+            observed: Vec::new(),
+            last_observed: String::new(),
+        }
+    }
+
+    /// Note that the next reading comes from `which`, in the current step.
+    pub fn saw(&mut self, which: &str) {
+        if self.last_observed != which {
+            which.clone_into(&mut self.last_observed);
+            self.observed.push(format!("{}: {which}", self.step));
         }
     }
 
@@ -176,6 +189,32 @@ fn gate_fail(exit: Exit, detail: String) -> Fail {
 }
 
 impl Run<'_> {
+    /// Find the frontend the gates read now: the slot the update API reports as serving
+    /// (`GET /v1/update/frontend`, `active_slot`, present while an update is known), else the
+    /// only child that answers. Asked at the start and after every frontend step, since a
+    /// handover retires the child that was read.
+    pub(super) fn resolve_observed(&mut self, step: &str, exit: Exit) -> Result<(), Fail> {
+        if !self.gates.active {
+            return Ok(());
+        }
+        let serving = self.get_json("/v1/update/frontend").ok().and_then(|v| {
+            v.get("active_slot")
+                .and_then(serde_json::Value::as_str)
+                .and_then(super::observe::Slot::parse)
+        });
+        match self.env.observe.resolve(serving) {
+            Ok(found) => {
+                self.observed = Some(found);
+                Ok(())
+            }
+            Err(e) => Err(fail(
+                exit,
+                "observe_unresolved",
+                format!("step {step}: cannot find the frontend to observe: {e}"),
+            )),
+        }
+    }
+
     /// Name the host step the next readings are for.
     pub(super) fn gate_step(&mut self, step: impl Into<String>) {
         self.gates.step = step.into();
@@ -189,6 +228,8 @@ impl Run<'_> {
             return Ok(Sample::Value(0.0));
         }
         let now = self.env.clock.now();
+        let which = self.observed.as_ref().map(|o| o.label.clone());
+        self.gates.saw(which.as_deref().unwrap_or("none resolved"));
         let metrics = scrape::read(self);
         let get = |series: &str| match &metrics {
             Ok(m) => m.sum(series),

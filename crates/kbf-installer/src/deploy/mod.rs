@@ -19,11 +19,14 @@ pub mod bundle;
 pub mod cli;
 #[cfg(test)]
 mod cli_flag_tests;
+#[cfg(test)]
+mod cli_observe_tests;
 mod frontend_addr;
 #[cfg(test)]
 mod frontend_addr_tests;
 mod gates;
 mod nodes;
+pub mod observe;
 mod post;
 mod record;
 pub mod smoke;
@@ -164,10 +167,11 @@ impl Options {
 pub struct Env<'a> {
     /// The update API: every call that reads or changes the release (`--api`).
     pub api: &'a dyn Operator,
-    /// The frontend the gates observe (`--observe`): `/metrics` and `/v1/invocations`. A
-    /// different listener from `api` on a real host (the public proxy answers its own
-    /// `/metrics`, and the update routes are not the child's), so a gate never reads `api`.
-    pub observe: &'a dyn Operator,
+    /// Finds the frontend the gates observe (`--observe`, `--observe-base-port`):
+    /// `/metrics` and `/v1/invocations`. A different listener from `api` on a real host (the
+    /// public proxy answers its own `/metrics`, and the update routes are not the child's), so
+    /// a gate never reads `api`. Asked again after every frontend step.
+    pub observe: &'a dyn observe::Observe,
     pub clock: &'a dyn Clock,
     pub smoke: &'a dyn Smoke,
     pub check: &'a dyn Check,
@@ -231,6 +235,8 @@ pub(crate) struct Run<'a> {
     pub opts: &'a Options,
     pub sum: Summary,
     pub gates: Gates,
+    /// The frontend the gates read now; set by [`Run::resolve_observed`].
+    pub observed: Option<observe::Observed<'a>>,
 }
 
 impl Run<'_> {
@@ -254,9 +260,7 @@ impl Run<'_> {
     /// GET `path` from the observed frontend and parse the JSON body.
     pub fn observe_json(&self, path: &str) -> Result<Value, String> {
         let reply = self
-            .env
-            .observe
-            .send(&Request::get(path))
+            .observe_send(&Request::get(path))
             .map_err(|e| format!("GET {path}: {e}"))?;
         if reply.status != 200 {
             return Err(format!("GET {path}: status {}", reply.status));
@@ -264,6 +268,15 @@ impl Run<'_> {
         reply
             .json()
             .ok_or_else(|| format!("GET {path}: the body is not JSON"))
+    }
+
+    /// Send `request` to the observed frontend (never to the update API).
+    pub fn observe_send(&self, request: &Request) -> Result<Reply, String> {
+        let observed = self
+            .observed
+            .as_ref()
+            .ok_or("no frontend to observe was resolved")?;
+        observed.api.send(request).map_err(|e| e.to_string())
     }
 
     /// Run `body` as the step `name` and record it. A skipped step is `Ok(false)`.
@@ -298,6 +311,7 @@ pub fn deploy(env: &Env, opts: &Options, bundle: Option<&mut dyn Read>) -> Summa
         opts,
         sum: Summary::new(&opts.commit, began),
         gates: Gates::new(opts.apply),
+        observed: None,
     };
     let record = match record::open(&run) {
         Ok(record) => record,
@@ -474,6 +488,7 @@ impl Run<'_> {
         // The gates start from a farm that is healthy now: storage fully replicated, no lost
         // blob, nothing untraced. Nothing has been changed yet, so a red is a refusal.
         self.gate_step("preflight");
+        self.resolve_observed("preflight", Exit::Refused)?;
         let under = self.gate_scrape(Exit::Refused)?;
         self.gate_preflight_storage(under)?;
         self.gate_snapshot(Exit::Refused)?;
@@ -568,11 +583,15 @@ impl Run<'_> {
                     "confirmed" => {
                         self.gate_step("frontend");
                         self.gate_revert(None);
+                        // The old child is retired: read the one that serves now.
+                        self.resolve_observed("frontend", Exit::Failed)?;
                         return self.gate_checkpoint("frontend");
                     }
                     "reverted" => {
                         self.gate_step("frontend");
                         self.gate_revert(Some("frontend"));
+                        // The old child serves again; the end of the gates reads it.
+                        let _ = self.resolve_observed("frontend", Exit::Failed);
                         return Err(fail(
                             Exit::Failed,
                             "frontend_reverted",

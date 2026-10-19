@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use super::api::Http;
 use super::frontend_addr::derive;
+use super::observe::{self, Observe};
 use super::smoke::CasSmoke;
 use super::summary::Exit;
 use super::summary::Summary;
@@ -27,7 +28,7 @@ pub const CONFIG: &str = "/etc/kbf-installer/deploy.json";
 pub const RESULT: &str = "/var/lib/kbf-installer/deploy-result.json";
 
 pub const USAGE: &str = "usage: kbf-installer deploy --commit <40hex> [--api <127.0.0.1:port>] \
-[--token-file <path>] [--observe <127.0.0.1:port>] [--observe-token-file <path>] [--config <path>] [--result <path>] [--set-hash <64hex>] [--settle-timeout-s N] [--cas http(s)://127.0.0.1:port] [--cas-ca <pem>] [--cas-server-name <dns>] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
+[--token-file <path>] [--observe <127.0.0.1:port> | --observe-base-port N] [--observe-token-file <path>] [--config <path>] [--result <path>] [--set-hash <64hex>] [--settle-timeout-s N] [--cas http(s)://127.0.0.1:port] [--cas-ca <pem>] [--cas-server-name <dns>] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
 [--allow-offline <id>[,<id>...]] [--node-timeout-s N] [--handover-timeout-s N] [--smoke-timeout-s N] \
 [--lock <path>] [--platform linux-x86_64|linux-arm64|darwin-arm64]";
 
@@ -40,11 +41,18 @@ pub(super) struct CasFlags {
     pub(super) server_name: Option<String>,
 }
 
+/// Where the gates read: one address, or the children of the frontend proxy.
+#[derive(Clone, Copy)]
+enum Observed {
+    Fixed(SocketAddr),
+    Slots(u16),
+}
+
 struct Args {
     options: Options,
     api: SocketAddr,
     /// The frontend the gates observe; required with `--apply`.
-    observe: Option<SocketAddr>,
+    observe: Option<Observed>,
     observe_token_file: Option<PathBuf>,
     cas: CasFlags,
     token_file: PathBuf,
@@ -56,9 +64,10 @@ struct Args {
 /// that got here through `sudo` (a deploy account that may only run `deploy`) must not set
 /// them: root would read a file of the caller's choosing and send it to an address of the
 /// caller's choosing. Those values come from the root-owned config.
-const HOST_FLAGS: [&str; 11] = [
+const HOST_FLAGS: [&str; 12] = [
     "--api",
     "--observe",
+    "--observe-base-port",
     "--observe-token-file",
     "--result",
     "--token-file",
@@ -76,6 +85,7 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     let mut cas = CasFlags::default();
     let mut token_file = None;
     let mut observe = None;
+    let mut observe_base = None;
     let mut observe_token_file = None;
     let mut bundle = None;
     let mut apply = false;
@@ -106,6 +116,7 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
             "--cas-ca" => cas.ca = Some(PathBuf::from(value("--cas-ca")?)),
             "--cas-server-name" => cas.server_name = Some(value("--cas-server-name")?),
             "--observe" => observe = Some(value("--observe")?),
+            "--observe-base-port" => observe_base = Some(value("--observe-base-port")?),
             "--observe-token-file" => {
                 observe_token_file = Some(PathBuf::from(value("--observe-token-file")?));
             }
@@ -156,14 +167,18 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
         owner,
         api.is_none()
             || token_file.is_none()
-            || (apply && observe.is_none())
+            || (apply && observe.is_none() && observe_base.is_none())
             || cas.url.is_none()
             || cas.ca.is_none()
             || cas.server_name.is_none(),
     )?;
     let api = api.or(conf.api);
     let token_file = token_file.or(conf.token_file);
-    let observe = observe.or(conf.observe);
+    // Either one wins over the config's key of the other kind.
+    let (observe, observe_base) = match (observe, observe_base) {
+        (None, None) => (conf.observe, conf.observe_base_port),
+        flags => flags,
+    };
     let observe_token_file = observe_token_file.or(conf.observe_token_file);
     let result = result
         .or(conf.result)
@@ -188,19 +203,39 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     }
     // The gates read the frontend, not the update API; an applied deploy that is not told where
     // would either read the wrong listener or skip its gates, so it does not start.
-    let observe: Option<SocketAddr> = match observe {
-        Some(text) => Some(
-            text.parse()
-                .map_err(|_| format!("--observe {text:?} is not host:port"))?,
-        ),
-        None if apply => {
+    let observe: Option<Observed> = match (observe, observe_base) {
+        (Some(_), Some(_)) => {
             return Err(
-                "--observe is required with --apply (or `observe` in the config): the address of \
-                 the frontend whose /metrics and /v1/invocations the gates read"
+                "--observe and --observe-base-port are two ways to say the same \
+                        thing: give one"
                     .to_owned(),
             );
         }
-        None => None,
+        (Some(text), None) => {
+            Some(Observed::Fixed(text.parse().map_err(|_| {
+                format!("--observe {text:?} is not host:port")
+            })?))
+        }
+        (None, Some(text)) => {
+            let port = text
+                .parse::<u16>()
+                .ok()
+                .filter(|p| (1024..=super::observe::MAX_BASE_PORT).contains(p))
+                .ok_or(format!(
+                    "--observe-base-port {text:?} is not a port from 1024 to {} (both slots must fit)",
+                    super::observe::MAX_BASE_PORT
+                ))?;
+            Some(Observed::Slots(port))
+        }
+        (None, None) if apply => {
+            return Err(
+                "--observe or --observe-base-port is required with --apply (or `observe` / \
+                 `observe_base_port` in the config): where the frontend whose /metrics and \
+                 /v1/invocations the gates read listens"
+                    .to_owned(),
+            );
+        }
+        (None, None) => None,
     };
     let mut options = Options::new(commit, &platform);
     options.apply = apply;
@@ -231,6 +266,7 @@ struct HostConfig {
     token_file: Option<PathBuf>,
     /// The frontend the gates observe, and the file of its token (else the update API's).
     observe: Option<String>,
+    observe_base_port: Option<String>,
     observe_token_file: Option<PathBuf>,
     /// Where the result document goes.
     result: Option<PathBuf>,
@@ -273,6 +309,7 @@ fn read_config(path: &Path, owner: u32, needed: bool) -> Result<HostConfig, Stri
         api: get("api"),
         token_file: get("token_file").map(PathBuf::from),
         observe: get("observe"),
+        observe_base_port: get("observe_base_port"),
         observe_token_file: get("observe_token_file").map(PathBuf::from),
         result: get("result").map(PathBuf::from),
         cas: get("cas"),
@@ -470,9 +507,23 @@ pub(super) fn run(
         None => token.clone(),
     };
     let timeout = Duration::from_secs(60);
-    let observe = match Http::new(parsed.observe.unwrap_or(parsed.api), observe_token, timeout) {
-        Ok(a) => a,
-        Err(e) => return usage(err, &format!("--observe: {e}")),
+    // Nothing is read from it in a plan; the update API's address stands in.
+    let observe: Box<dyn Observe> = match parsed.observe.unwrap_or(Observed::Fixed(parsed.api)) {
+        Observed::Fixed(addr) => {
+            if let Err(e) = Http::new(addr, String::new(), timeout) {
+                return usage(err, &format!("--observe: {e}"));
+            }
+            Box::new(observe::Fixed {
+                addr,
+                token: observe_token,
+                timeout,
+            })
+        }
+        Observed::Slots(base_port) => Box::new(observe::Slots {
+            base_port,
+            token: observe_token,
+            timeout,
+        }),
     };
     let api = match Http::new(parsed.api, token, timeout) {
         Ok(a) => a,
@@ -496,7 +547,7 @@ pub(super) fn run(
     let (clock, check) = (SystemClock, NoCheck);
     let env = Env {
         api: &api,
-        observe: &observe,
+        observe: &*observe,
         clock: &clock,
         smoke: &*smoke,
         check: &check as &dyn Check,

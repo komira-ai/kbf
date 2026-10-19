@@ -47,8 +47,10 @@ pub(super) fn seal(run: &mut Run, mut record: GateRun, began: u64) {
         .clone()
         .or_else(|| run.gates.derived_set_hash.clone());
     let generation = run.sum.generation;
+    let observed = run.gates.observed.clone();
     let wrote = record.update(|doc| {
         doc.gates = gates;
+        doc.observed = observed;
         doc.desired_generation = generation;
         doc.deploy = Some(Window {
             start: began,
