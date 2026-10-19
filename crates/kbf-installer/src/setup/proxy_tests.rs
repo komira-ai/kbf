@@ -13,6 +13,10 @@ use crate::setup::proxy::{AuthFlag, DEFAULT_BASE_PORT, ProxyFlags};
 /// with `InstallerToml::parse` and renders back to itself.
 const PROXY_GOLDEN: &str = include_str!("../../tests/golden/proxy_host/installer.toml");
 
+/// An edit of the `kbf.toml` flags, and of the proxy's, for the tables of cases.
+type Edit = fn(&mut KbfFlags);
+type ProxyEdit = fn(&mut ProxyFlags);
+
 fn some(text: &str) -> Option<String> {
     Some(text.to_owned())
 }
@@ -258,7 +262,7 @@ fn refused(edit: impl FnOnce(&mut Raw)) -> String {
 /// (the proxy gives the children their loopback ports and they serve plain h2c).
 #[test]
 fn flags_the_proxy_makes_pointless_are_refused() {
-    let edits: [(&str, fn(&mut KbfFlags)); 5] = [
+    let edits: [(&str, Edit); 5] = [
         ("--listen", |k| k.listen = some("0.0.0.0:8980")),
         ("--worker-listen", |k| {
             k.worker_listen = some("0.0.0.0:8981")
@@ -302,7 +306,7 @@ fn the_proxy_flags_belong_to_a_frontend_and_to_each_other() {
         );
         assert!(exec.log.is_empty(), "{mode:?}");
     }
-    let without: [(&str, fn(&mut ProxyFlags)); 3] = [
+    let without: [(&str, ProxyEdit); 3] = [
         ("--proxy-base-port", |p| p.proxy_base_port = Some(18_000)),
         ("--buck2-auth", |p| p.buck2_auth = Some(AuthFlag::None)),
         ("--buck2-token-file", |p| {
@@ -324,7 +328,7 @@ fn the_proxy_flags_belong_to_a_frontend_and_to_each_other() {
 /// is required by name, and a certificate without its key still fails.
 #[test]
 fn the_proxy_needs_its_certificate_key_and_client_ca() {
-    let edits: [(&str, fn(&mut KbfFlags)); 3] = [
+    let edits: [(&str, Edit); 3] = [
         ("--reapi-tls-cert", |k| k.reapi_tls_cert = None),
         ("--reapi-tls-key", |k| k.reapi_tls_key = None),
         ("--worker-client-ca", |k| k.worker_client_ca = None),
