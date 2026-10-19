@@ -81,6 +81,28 @@ async fn no_stream_deadline_3h_paused() {
     assert_eq!(reply.grpc_status().as_deref(), Some("0"));
     assert!(reply.error.is_none());
     assert!(start.elapsed() >= 3 * HOUR);
+
+    // A ByteStream Write whose upload takes 3 hours, a chunk an hour: no timer of the
+    // proxy's ends a stream that is moving, however long it runs.
+    let a = script(|mut call| async move {
+        let body = read_all(&mut call.body).await;
+        assert_eq!(body, b"www");
+        grpc_ok(&mut call.respond, "written");
+    });
+    let rig = Rig::start(a, tagged("b")).await;
+    let mut client = rig.client().await;
+    let start = Instant::now();
+    let (response, mut body) = client.start(WRITE, false).await;
+    for chunk in 0..3 {
+        tokio::time::sleep(HOUR).await;
+        body.send_data(Bytes::from_static(b"w"), chunk == 2)
+            .expect("data");
+    }
+    let reply = finish(response).await;
+    assert_eq!(reply.text(), "written");
+    assert_eq!(reply.grpc_status().as_deref(), Some("0"));
+    assert!(reply.error.is_none());
+    assert!(start.elapsed() >= 3 * HOUR);
 }
 
 #[tokio::test(start_paused = true)]
