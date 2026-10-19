@@ -394,12 +394,16 @@ fn only_the_scheduling_modes_take_a_state_store() {
     let path = std::path::PathBuf::from("/var/lib/kbf/state.db");
     assert!(matches!(&both, Invocation::AllInOne(flags)
         if flags.server.state_store == Some(kbf_server::StateStoreUri::Sqlite(path.clone()))));
-    // Only SQLite is wired; the refusal is fixed text, not the value.
-    let postgres = error(with(BOTH, &["--state-store=postgres://db.example/kbf"]));
-    assert!(postgres.contains("only sqlite:///"), "{postgres}");
+    // A Postgres URL with a password is refused with fixed text, not the value.
+    let postgres = error(with(
+        BOTH,
+        &["--state-store=postgres://u:hunter2@db.example/kbf"],
+    ));
+    assert!(postgres.contains("must carry no password"), "{postgres}");
+    assert!(!postgres.contains("hunter2"), "{postgres}");
     let default = parse_from(with(BOTH, &[])).expect("all-in-one");
     assert!(matches!(&default, Invocation::AllInOne(flags)
-        if matches!(flags.server.state_store, Some(kbf_server::StateStoreUri::Sqlite(_)))));
+        if flags.server.state_store == Some(kbf_server::StateStoreUri::local_postgres())));
     let front = parse_from(with(
         FRONTEND,
         &["--state-store=sqlite:///var/lib/kbf/state.db"],
@@ -408,7 +412,7 @@ fn only_the_scheduling_modes_take_a_state_store() {
     assert!(matches!(&front, Invocation::Frontend(flags)
         if flags.server.state_store == Some(kbf_server::StateStoreUri::Sqlite(path.clone()))));
     let file = error(with(BOTH, &["--state-store=file:///var/lib/kbf"]));
-    assert!(file.contains("only sqlite:///"), "{file}");
+    assert!(file.contains("only postgres:///"), "{file}");
     let daemon = refusal(with(DAEMON, &["--state-store=sqlite:///x.db"]));
     assert_eq!(daemon.kind(), ErrorKind::ArgumentConflict);
     assert!(
