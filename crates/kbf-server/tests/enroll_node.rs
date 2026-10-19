@@ -54,12 +54,21 @@ struct Farm {
 }
 
 fn flags(ca_dir: PathBuf, limits: Limits, allow_unenforced_deny: bool) -> EnrollFlags {
+    flags_for(ca_dir, limits, allow_unenforced_deny, 86_400)
+}
+
+fn flags_for(
+    ca_dir: PathBuf,
+    limits: Limits,
+    allow_unenforced_deny: bool,
+    cert_lifetime_secs: i64,
+) -> EnrollFlags {
     EnrollFlags {
         listen: "127.0.0.1:0".parse().expect("addr"),
         ca_dir,
         signer: SignerChoice::DevFile,
         frontend_names: vec!["localhost".to_owned()],
-        cert_lifetime_secs: 86_400,
+        cert_lifetime_secs,
         limits,
         allow_unenforced_deny,
         settings: NodeSettings {
@@ -72,13 +81,17 @@ fn flags(ca_dir: PathBuf, limits: Limits, allow_unenforced_deny: bool) -> Enroll
 }
 
 async fn start(name: &str, limits: Limits) -> Farm {
+    start_with(name, limits, 86_400).await
+}
+
+async fn start_with(name: &str, limits: Limits, cert_lifetime_secs: i64) -> Farm {
     let clock = Arc::new(ManualClock::default());
     clock.advance(Duration::from_secs(
         u64::try_from(unix_now()).expect("time"),
     ));
     let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None));
     let ca_dir = scratch(name).join("ca");
-    let flags = flags(ca_dir.clone(), limits, true);
+    let flags = flags_for(ca_dir.clone(), limits, true, cert_lifetime_secs);
     let prepared = prepare(&flags).expect("prepared");
     let (port, pin) = (prepared.local().port(), prepared.ca().pin());
     let mut serving = prepared.serve(Arc::clone(&store)).expect("serving");
@@ -96,6 +109,10 @@ async fn start(name: &str, limits: Limits) -> Farm {
 
 impl Farm {
     fn token(&self, bits: u64, roles: &[Role], uses: u32) -> Token {
+        self.token_for(bits, roles, uses, None)
+    }
+
+    fn token_for(&self, bits: u64, roles: &[Role], uses: u32, ttl: Option<Duration>) -> Token {
         let id = TokenId::from_bits(bits);
         #[allow(clippy::cast_possible_truncation)]
         let secret = TokenSecret::from_bytes([bits as u8; 32]);
@@ -106,7 +123,7 @@ impl Farm {
             &TokenSpec {
                 roles: RoleSet::new(roles.iter().copied()).expect("roles"),
                 max_uses: uses,
-                ttl: None,
+                ttl,
                 node_id: None,
                 node_prefix: None,
                 names: Vec::new(),
@@ -228,6 +245,47 @@ async fn a_node_enrolls_over_tls_and_its_client_accepts_the_answer() {
     assert_eq!(nodes[0].advertise, "node-02.nodes.test:8983");
     assert_eq!(list_tokens(&*farm.store).expect("tokens")[0].uses, 1);
     assert!(farm.ca_dir.join("ca.pem").exists() && farm.ca_dir.join("ca.key").exists());
+}
+
+/// The certificates a frontend issues live exactly `--enroll-cert-lifetime-secs`.
+///
+/// Catches: the lifetime flag read and then ignored on the way to the CA (a default or a
+/// constant used instead: a farm that asked for two hours would hold 30-day certificates,
+/// or the reverse), checked on the wire through the listener `prepare` builds.
+#[tokio::test(flavor = "multi_thread")]
+async fn issued_certificates_live_the_configured_lifetime() {
+    let farm = start_with("lifetime", Limits::DEFAULT, 7200).await;
+    let token = farm.token(0x4444, &[Role::Storage, Role::Daemon], 1);
+    let node = node("lifetime-node", &farm, &token, true);
+    let installed = enroll_with(&node, &token, &[Role::Storage, Role::Daemon])
+        .await
+        .expect("enrolled");
+    assert_eq!(installed.certs.len(), 2);
+    for cert in &installed.certs {
+        assert_eq!(cert.not_after - cert.not_before, 7200, "{}", cert.role);
+    }
+}
+
+/// A token past its `expires_at` on the store's clock is refused `TokenExpired` through the
+/// listener, and the node is not enrolled.
+///
+/// Catches: expiry not judged at the service layer (the registry's own test would still
+/// pass if the service never asked it), and a token that outlives its ttl.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_past_its_expiry_is_refused_token_expired() {
+    let farm = start("expired", Limits::DEFAULT).await;
+    let token = farm.token_for(0x5555, &[Role::Daemon], 1, Some(Duration::from_secs(600)));
+    farm.advance(601);
+    let node = node("expired-node", &farm, &token, false);
+    let error = enroll_with(&node, &token, &[Role::Daemon])
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        refused(&error),
+        Some(RefusalReason::TokenExpired),
+        "{error:?}"
+    );
+    assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
 }
 
 /// The same node renews with its registered key, over the same listener, and its client
