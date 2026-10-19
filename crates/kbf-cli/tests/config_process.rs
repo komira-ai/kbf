@@ -580,7 +580,13 @@ fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
         );
         pki.issue(&etc, "node", Row::Daemon, &["farm-1"], false);
         write(&etc.join("api-token"), "a-token-of-no-importance\n", 0o600);
-        write(&etc.join("enroll.token"), "an-enrollment-token\n", 0o600);
+        // A token of the right form: `--check` parses it and calls no frontend.
+        let token = kbf_types::Token::new(
+            kbf_types::TokenId::from_bits(1),
+            kbf_types::TokenSecret::from_bytes([7; 32]),
+            kbf_types::CaPin::from_bytes([9; 32]),
+        );
+        write(&etc.join("enroll.token"), &token.to_line(), 0o600);
         let golden = std::fs::read_to_string(goldens.join(format!("{}.toml", mode.name)))
             .unwrap_or_else(|e| panic!("the installer's golden for {}: {e}", mode.name));
         // The golden names the paths of a host; this one is a scratch directory.
