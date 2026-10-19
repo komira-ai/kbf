@@ -183,7 +183,7 @@ impl Rig {
     }
 
     /// The child's operations for a shelf: serve what it is asked for from it.
-    fn from_the_shelf(&self) -> PathBuf {
+    fn shelf_ops(&self) -> PathBuf {
         self.ops(&[format!("serve:{}", self.dir.join("shelf").display())])
     }
 
@@ -192,7 +192,7 @@ impl Rig {
         self.shelve("describe", described_as(COMMIT, entries).as_bytes());
         self.shelve(&sha(tar), tar);
         self.shelve(&sha(bundle), bundle);
-        self.from_the_shelf()
+        self.shelf_ops()
     }
 
     /// A file the child can serve.
@@ -519,7 +519,7 @@ fn a_commit_the_source_will_not_describe_is_refused_with_its_words() {
     ] {
         let rig = Rig::new("update-refused");
         rig.shelve("describe", format!("refused {said}\n").as_bytes());
-        let ops = rig.from_the_shelf();
+        let ops = rig.shelf_ops();
         let fetcher = rig.fetcher(Some(&ops), Answers::honest());
         assert_eq!(
             fetcher.fetch(&rec(Vec::new())),
@@ -549,7 +549,7 @@ fn a_description_that_is_not_the_hosts_release_is_refused() {
             "describe",
             described_as(B, vec![entry_for("kbf", "linux-x86_64", &tar, BUNDLE)]).as_bytes(),
         );
-        (rig.from_the_shelf(), rig)
+        (rig.shelf_ops(), rig)
     };
     let only_arm = {
         let rig = Rig::new("update-only-arm");
@@ -557,7 +557,7 @@ fn a_description_that_is_not_the_hosts_release_is_refused() {
             "describe",
             described_as(COMMIT, vec![entry_for("kbf", "linux-arm64", &tar, BUNDLE)]).as_bytes(),
         );
-        (rig.from_the_shelf(), rig)
+        (rig.shelf_ops(), rig)
     };
     let cases = [
         (
@@ -613,7 +613,7 @@ fn bytes_that_do_not_match_the_described_digest_are_refused() {
         };
         rig.shelve(&sha(&tar), &served_tar);
         rig.shelve(&sha(BUNDLE), &served_bundle);
-        let ops = rig.from_the_shelf();
+        let ops = rig.shelf_ops();
         let fetcher = rig.fetcher(Some(&ops), Answers::honest());
         match fetcher.fetch(&rec(Vec::new())) {
             Err(FetchError::Rejected(why)) => {
@@ -681,7 +681,7 @@ fn a_source_that_cannot_be_asked_is_an_outage_and_makes_nothing() {
     }
     assert!(!rig.work().exists(), "nothing was made");
     // The child runs and has nothing to serve: it says why on standard error and ends.
-    let ops = rig.from_the_shelf();
+    let ops = rig.shelf_ops();
     let fetcher = rig.fetcher(Some(&ops), Answers::honest());
     assert_eq!(
         fetcher.fetch(&rec(Vec::new())),

@@ -2004,6 +2004,29 @@ fn the_child_writes_a_refusal_for_404_and_409_and_fails_for_the_rest() {
     );
 }
 
+/// A file that ends before its declared length is a failed fetch with the transport's words, and
+/// nothing is written: half a description is not one.
+///
+/// Mutant: the body read's error taken for the end of the file (red: the half is parsed and
+/// refused as a file without a schema).
+#[test]
+fn a_description_cut_short_is_a_failed_fetch() {
+    let (pki, leaf) = pki_and_server();
+    let server = Https::start(
+        &leaf,
+        Plan::Short {
+            declared: 5000,
+            sent: 100,
+        },
+    );
+    let rig = Rig::new("hand-describe-short");
+    let ca = rig.write("ca.pem", &pki.ca_pem());
+    let out = by_hand(&describe_args(&server.url(), &ca, 6000));
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(said(&out).contains("source unreachable"), "{}", said(&out));
+}
+
 /// A `url` source that is not there is the same failed start as for a blob.
 #[test]
 fn a_url_source_that_is_not_there_fails_the_describing_child() {
