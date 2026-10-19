@@ -3,8 +3,10 @@
 use std::cmp::Ordering;
 use std::num::NonZeroUsize;
 use std::ops::Bound;
+use std::sync::Arc;
 
 use crate::clock::StoreTime;
+use crate::own_keys::Permit;
 use crate::types::{
     Changes, Commit, CommitStats, Cond, Conflict, ResumeToken, Revision, ScanPage, ScanRange,
     StoreError, Txn, Versioned,
@@ -219,6 +221,17 @@ pub trait Store: Send + Sync {
         Err(StoreError::Failed(
             "this backend cannot give up its writer role".to_owned(),
         ))
+    }
+
+    /// A handle on this store whose writes `permit` accepts are not checked against a
+    /// generation ([`crate::OwnKeys`]), for a holder that a successor has superseded and that
+    /// must still write the rows only it writes. `None` for a store with no generation to
+    /// check (every write through it is unfenced already) and for a wrapper that does not
+    /// forward the call, so a caller keeps the handle it has and loses nothing but the
+    /// exemption.
+    fn own_keys(&self, permit: Permit) -> Option<Arc<dyn Store>> {
+        let _ = permit;
+        None
     }
 
     /// Applies one transaction: a batch of one.

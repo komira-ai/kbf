@@ -7,11 +7,8 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 /// Catches a start that stops at the first problem, or that goes on to start on a host it

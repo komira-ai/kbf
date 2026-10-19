@@ -23,16 +23,18 @@ const INVID: &str = "ui/invid/";
 fn assert_no_dangling(life: &Life) {
     let reader = life.reader();
     for key in life.index.keys(INVID) {
-        let inv = kbf_history::InvKey::parse(key.trim_start_matches(INVID)).unwrap();
+        // `ui/invid/<inv>/<writer>`: the invocation is the first sixteen digits.
+        let inv = kbf_history::InvKey::parse(&key.trim_start_matches(INVID)[..16]).unwrap();
         whole(&reader, &inv, &all).unwrap_or_else(|e| panic!("{key}: {e}"));
     }
 }
 
+/// The header row `life`'s writer keeps of `inv`.
 fn header(life: &Life, inv: &InvRef) -> InvocationHeader {
     let row = life
         .index
         .inner
-        .get(&format!("{INVID}{}", inv.key))
+        .get(&life.index_root.header(&inv.key, life.writer_id))
         .unwrap()
         .unwrap();
     InvocationHeader::decode(row.value.as_slice()).unwrap()
@@ -515,8 +517,10 @@ fn an_invocation_left_open_by_a_crash_reads_incomplete_from_its_last_chunk() {
 
 #[test]
 fn a_restarted_writer_continues_the_header_and_reopens_a_closed_invocation() {
-    // Catches: a new writer life overwriting an invocation's header with its own
-    // counts only, or a closed invocation that takes records while still closed.
+    // Catches: a new writer life writing into the header row of another (the rows of
+    // two writers racing, or one life's counts replacing the other's), a reader that
+    // reports one life's counts instead of the sum, and a closed invocation that takes
+    // records while still closed.
     let objects = Objects::new();
     let index = Index::fake();
     let inv = InvRef::named("b1");
@@ -531,9 +535,22 @@ fn a_restarted_writer_continues_the_header_and_reopens_a_closed_invocation() {
     second.step(T + 10);
     second.step(T + 130_000);
     let h = header(&second, &inv);
-    assert_eq!((h.runs, h.failed, h.chunks), (3, 1, 2));
-    assert_eq!(h.instances, ["a", "b"]);
+    assert_eq!((h.runs, h.failed, h.chunks), (1, 0, 1), "its own records");
+    assert_eq!(h.instances, ["b"]);
     assert_eq!(h.state(), kbf_history::records::InvState::Open);
+    let h = header(&first, &inv);
+    assert_eq!(
+        (h.runs, h.failed, h.chunks),
+        (2, 1, 1),
+        "the first's untouched"
+    );
+    assert_eq!(h.state(), kbf_history::records::InvState::Closed);
+    // The invocation is open while one writer has it open, and the reader adds them up.
+    let got = whole(&second.reader(), &inv.key, &all).unwrap().unwrap();
+    assert!(!got.complete);
+    assert_eq!(got.header.state(), kbf_history::records::InvState::Open);
+    assert_eq!((got.header.runs, got.header.failed), (3, 1));
+    assert_eq!(got.header.instances, ["a", "b"]);
     second.close(&inv);
     second.step(T + 130_001);
     let got = whole(&second.reader(), &inv.key, &all).unwrap().unwrap();
@@ -543,27 +560,37 @@ fn a_restarted_writer_continues_the_header_and_reopens_a_closed_invocation() {
         (3, 1, 2)
     );
 
-    // A header that cannot be read is read again: the stored one is never replaced by
-    // a fresh count, and what the writer added meanwhile is merged into it.
+    // A third life whose header read fails writes its chunk meanwhile and its row once
+    // the read answers: the row holds its own records, and the others' rows are not
+    // touched by it.
     let mut third = Life::start(&objects, &index, 3, Limits::default());
     index.fail_gets.store(true, Ordering::SeqCst);
     third.run(&inv, T + 20, "c", RunOutcome::Ok);
     third.step(T + 20);
     third.step(T + 140_000);
     assert_eq!(chunks(&objects).len(), 3, "the chunk is written meanwhile");
-    assert_eq!(
-        header(&third, &inv).runs,
-        3,
-        "the stored header is untouched"
+    assert!(
+        index
+            .inner
+            .get(&third.index_root.header(&inv.key, third.writer_id))
+            .unwrap()
+            .is_none(),
+        "no row until the header read answers"
     );
     index.fail_gets.store(false, Ordering::SeqCst);
     third.step(T + 140_001);
     third.step(T + 140_002);
     let h = header(&third, &inv);
-    assert_eq!((h.runs, h.failed, h.chunks), (4, 1, 3));
-    assert_eq!(h.instances, ["a", "b", "c"]);
-    assert_eq!(h.first_seen_ms, T);
+    assert_eq!((h.runs, h.failed, h.chunks), (1, 0, 1));
+    assert_eq!(h.instances, ["c"]);
     assert_eq!(h.state(), kbf_history::records::InvState::Open);
+    let got = whole(&third.reader(), &inv.key, &all).unwrap().unwrap();
+    assert_eq!(
+        (got.header.runs, got.header.failed, got.header.chunks),
+        (4, 1, 3)
+    );
+    assert_eq!(got.header.instances, ["a", "b", "c"]);
+    assert_eq!(got.header.first_seen_ms, T);
 }
 
 #[test]
@@ -693,7 +720,7 @@ fn a_dropped_header_with_no_object_is_counted_and_not_kept() {
     );
     // A header written alone: a stored header closed with nothing buffered.
     life.index.put(
-        &format!("{INVID}{}", empty.key),
+        &life.index_root.header(&empty.key, life.writer_id),
         InvocationHeader {
             instances: vec!["main".into()],
             ..InvocationHeader::default()
@@ -1029,7 +1056,7 @@ fn open_invocations_are_bounded_forgetting_idle_ones_first() {
     assert!(
         life.index
             .inner
-            .get(&format!("{INVID}{}", refused.key))
+            .get(&life.index_root.header(&refused.key, life.writer_id))
             .unwrap()
             .is_none()
     );
