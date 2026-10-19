@@ -35,7 +35,7 @@ use kbf_deploy::unit::{UnitFile, comments_in_continuations};
 /// The installer's tree: every program of a kbf unit is under it.
 const TREE: &str = "/var/lib/kbf-installer/";
 /// The release kbf-installer flipped to.
-const CURRENT: &str = "/var/lib/kbf-installer/current/";
+const CURRENT: &str = "/var/lib/kbf-installer/releases/current/";
 /// A frontend instance's slot: the release it runs, until a confirm flips `current`.
 const SLOT: &str = "/var/lib/kbf-installer/slots/%i/";
 /// The pinned Envoy of instance `%i`.
@@ -840,26 +840,26 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-daemon.service",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=daemon",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=daemon \\\n    # a note\n    ",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon \\\n    # a note\n    ",
         "continuation",
     ),
     (
         "kbf-daemon.service",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=daemon",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon",
         "ExecStart=/usr/local/bin/kbf daemon",
         "exec",
     ),
     (
         "kbf-daemon.service",
-        "ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=daemon --check",
-        "ExecStartPre=-/var/lib/kbf-installer/current/kbf --mode=daemon --check",
+        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=daemon --check",
+        "ExecStartPre=-/var/lib/kbf-installer/releases/current/kbf --mode=daemon --check",
         "exec-prefix",
     ),
     (
         "kbf-storage.service",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=storage\n",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=storage --config=/etc/kbf/kbf.toml\n",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage\n",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage --config=/etc/kbf/kbf.toml\n",
         "flags",
     ),
     (
@@ -870,8 +870,8 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-all-in-one.service",
-        "ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=all-in-one --check",
-        "ExecCondition=/var/lib/kbf-installer/current/kbf --mode=all-in-one --check",
+        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=all-in-one --check",
+        "ExecCondition=/var/lib/kbf-installer/releases/current/kbf --mode=all-in-one --check",
         "gate-skip",
     ),
     (
@@ -1027,7 +1027,7 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     (
         "kbf-envoy.service",
         "ExecStart=/usr/bin/envoy ",
-        "ExecStart=/var/lib/kbf-installer/current/envoy ",
+        "ExecStart=/var/lib/kbf-installer/releases/current/envoy ",
         "envoy",
     ),
     (
