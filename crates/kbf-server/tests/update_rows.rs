@@ -117,7 +117,9 @@ fn the_bytes_of_every_row_are_frozen() {
         );
 
         // update/policy, the defaults with a floor of one, three places and a Mac force:
-        // only the fields that are not the default are written.
+        // only the fields that are not the default are written. `auto_nodes` is true in the
+        // defaults and a plain bool in the row (absent is false, as every build has read it),
+        // so it is the first field.
         let policy = Policy {
             min_serving: 1,
             max_hosts_out: 3,
@@ -125,7 +127,7 @@ fn the_bytes_of_every_row_are_frozen() {
             ..Policy::default()
         };
         rows.set_policy(&policy).expect("a policy");
-        assert_eq!(raw(&cell, "update/policy"), "2001280330c0ee6d");
+        assert_eq!(raw(&cell, "update/policy"), "08012001280330c0ee6d");
         // Every agreed field set (the first eight, in the design's order of the time, 1 to
         // 8), then two of the node step's limits (the write limit is 13, the rebuild limit
         // 16), and the pause, which came later and is 18: a varint key of two bytes

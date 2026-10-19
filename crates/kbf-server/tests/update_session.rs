@@ -426,8 +426,9 @@ fn facts_come_from_the_current_stream_only() {
 /// is a pretence: every helper state maps to its report (the states of an idle or fetching
 /// node to none), a Linux host is listed as a storage-and-daemon host linked to no member (so
 /// never started), a Mac is daemon-only of the class of its arch, a host of another `os` is
-/// not listed, and both planned-down orders are refused in words that name the cause. An
-/// alert goes out at either severity.
+/// not listed, a mark of a member that does not exist is refused in words that name the host,
+/// the member and the cause, and the undo of it is nothing to do. An alert goes out at either
+/// severity.
 #[test]
 fn the_ports_read_every_state_and_refuse_the_marks() {
     use kbf_proto::update::update_status::State;
@@ -510,12 +511,18 @@ fn the_ports_read_every_state_and_refuse_the_marks() {
     assert!(matches!(&hosts[1].platform, Platform::Mac(class) if class.as_str() == "macos-arm64"));
 
     let host = WorkerId::new("mac");
-    for refused in [
-        transport.mark_down(&host, kbf_map::MemberId(1)),
-        transport.undown(&host, kbf_map::MemberId(1)),
-    ] {
-        assert!(refused.expect_err("refused").0.contains("U3"));
-    }
+    // A member that has no row cannot be marked, and the error names the host, the member and
+    // the cause; it has nothing to undo, which is not an error (it stopped, and registering
+    // again deletes its mark).
+    let refused = transport
+        .mark_down(&host, kbf_map::MemberId(1))
+        .expect_err("no such member");
+    assert!(refused.0.contains("mac"), "{refused}");
+    assert!(refused.0.contains("member m1"), "{refused}");
+    assert!(refused.0.contains("no live row"), "{refused}");
+    transport
+        .undown(&host, kbf_map::MemberId(1))
+        .expect("nothing to undo");
     transport
         .alert(&host, &Alert::Held(HoldReason::RevertRefused))
         .expect("paged");
