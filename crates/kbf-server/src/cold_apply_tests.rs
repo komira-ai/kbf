@@ -535,6 +535,15 @@ fn own(name: &str) -> Option<String> {
     Some(format!("own-{name}"))
 }
 
+/// `fut`, or a failure of the test after twenty real seconds: a node that retries a
+/// refusal waits for ever on a loopback frontend, which a hang would not report.
+async fn within<T>(fut: impl std::future::Future<Output = T>) -> T {
+    let patience = Duration::from_secs(20);
+    tokio::time::timeout(patience, fut)
+        .await
+        .expect("the start took too long")
+}
+
 async fn s3() -> FakeS3 {
     let s3 = FakeS3::start().await;
     s3.require_credentials(ID, SECRET);
@@ -563,8 +572,7 @@ async fn registered_keys_that_pass_the_probe_are_the_store_the_node_runs_on() {
     let s3 = s3().await;
     let joiner = answering(Ok(registered(&s3, 7, SECRET))).await;
     for keys in [false, true] {
-        let (store, applied) = flagged(&s3, keys)
-            .registered(&joiner, &joined(6))
+        let (store, applied) = within(flagged(&s3, keys).registered(&joiner, &joined(6)))
             .await
             .expect("opens on the registration");
         assert_eq!(applied.for_beat(7), (7, ApplyStatus::Ok), "own keys {keys}");
@@ -583,8 +591,7 @@ async fn registered_keys_that_pass_the_probe_are_the_store_the_node_runs_on() {
 async fn registered_keys_that_fail_the_probe_leave_the_node_on_its_own_or_stop_it() {
     let s3 = s3().await;
     let joiner = answering(Ok(registered(&s3, 7, "wrong-secret"))).await;
-    let (store, applied) = flagged(&s3, true)
-        .registered(&joiner, &joined(7))
+    let (store, applied) = within(flagged(&s3, true).registered(&joiner, &joined(7)))
         .await
         .expect("keeps its own store");
     assert_eq!(applied.for_beat(7), (0, ApplyStatus::ProbeFailed));
@@ -592,7 +599,7 @@ async fn registered_keys_that_fail_the_probe_leave_the_node_on_its_own_or_stop_i
         !takes_registered_writes(&store, "own").await,
         "the node's own pair is refused here"
     );
-    let Err(error) = flagged(&s3, false).registered(&joiner, &joined(7)).await else {
+    let Err(error) = within(flagged(&s3, false).registered(&joiner, &joined(7))).await else {
         panic!("a node with nothing that works starts");
     };
     assert!(matches!(
@@ -610,12 +617,11 @@ async fn a_registration_for_another_bucket_leaves_the_node_on_its_flag_or_stops_
     let mut other = registered(&s3, 7, SECRET);
     other.config.as_mut().expect("a config").bucket = "other".to_owned();
     let joiner = answering(Ok(other)).await;
-    let (_store, applied) = flagged(&s3, true)
-        .registered(&joiner, &joined(7))
+    let (_store, applied) = within(flagged(&s3, true).registered(&joiner, &joined(7)))
         .await
         .expect("keeps its flag's store");
     assert_eq!(applied.for_beat(7), (0, ApplyStatus::IdentityMismatch));
-    let Err(error) = flagged(&s3, false).registered(&joiner, &joined(7)).await else {
+    let Err(error) = within(flagged(&s3, false).registered(&joiner, &joined(7))).await else {
         panic!("a node with nothing to run on starts");
     };
     assert!(matches!(
@@ -636,12 +642,13 @@ async fn a_registration_for_another_bucket_leaves_the_node_on_its_flag_or_stops_
 async fn a_registration_taken_back_leaves_the_node_on_its_flag_or_stops_it() {
     let s3 = s3().await;
     let joiner = answering(Ok(answer(0))).await;
-    let (_store, applied) = flagged(&s3, true)
-        .registered(&joiner, &joined(7))
+    let (_store, applied) = within(flagged(&s3, true).registered(&joiner, &joined(7)))
         .await
         .expect("keeps its flag's store");
     assert_eq!(applied.for_beat(7), (0, ApplyStatus::Pending));
-    let Err(error) = flagged(&s3, false).registered(&joiner, &joined(7)).await else {
+    // The frontend's own word is gone with the registration: nothing to apply.
+    assert_eq!(applied.for_beat(0), (0, ApplyStatus::Ok));
+    let Err(error) = within(flagged(&s3, false).registered(&joiner, &joined(7))).await else {
         panic!("a node with nothing starts");
     };
     assert!(matches!(
@@ -657,12 +664,11 @@ async fn a_registration_taken_back_leaves_the_node_on_its_flag_or_stops_it() {
 async fn a_frontend_that_refuses_the_node_leaves_it_on_its_own_keys_or_stops_it() {
     let s3 = s3().await;
     let joiner = answering(Err(Code::PermissionDenied)).await;
-    let (_store, applied) = flagged(&s3, true)
-        .registered(&joiner, &joined(7))
+    let (_store, applied) = within(flagged(&s3, true).registered(&joiner, &joined(7)))
         .await
         .expect("keeps its flag's store");
     assert_eq!(applied.for_beat(7), (0, ApplyStatus::Pending));
-    let Err(error) = flagged(&s3, false).registered(&joiner, &joined(7)).await else {
+    let Err(error) = within(flagged(&s3, false).registered(&joiner, &joined(7))).await else {
         panic!("a refused node with nothing starts");
     };
     assert!(matches!(
