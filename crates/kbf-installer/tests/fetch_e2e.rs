@@ -870,6 +870,11 @@ fn the_key_is_in_no_error() {
 fn child_command(args: &[&str]) -> std::process::Command {
     let mut command = std::process::Command::new(BIN);
     command.arg("fetch-child").args(args).env_clear();
+    // An instrumented run (coverage) names where each process writes its profile; without it
+    // the child writes one into the working directory, inside the repository.
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt as _;
