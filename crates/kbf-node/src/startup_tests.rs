@@ -36,9 +36,10 @@ use clap::Parser as _;
 /// How long the test waits for what should happen promptly.
 const PROMPT: Duration = Duration::from_secs(30);
 
-/// How long the daemon may take from its start to the server's Welcome. Its survey is
-/// held for 20 s, so a daemon that waits for it takes 20 s at least.
-const HELLO_WITHIN: Duration = Duration::from_secs(2);
+/// How long the first survey's `xcodebuild` stays held unless the test releases it:
+/// longer than [`PROMPT`], so a daemon that sends Hello only after its first survey
+/// cannot be welcomed within [`PROMPT`] and the test fails by order, not by a clock.
+const SURVEY_HELD_SECS: u32 = 120;
 
 /// A CA, a client certificate for node `mac-1` (`node.pem`, `node.key`: the server
 /// takes the node id from its one DNS name, and requires the daemon role) and a server
@@ -208,7 +209,7 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     let go = dir.join("go");
     let apps = dir.join("Applications");
     let developer_dir = apps.join("Xcode_1.app/Contents/Developer");
-    let wait = format!("wait-for {} 20", go.display());
+    let wait = format!("wait-for {} {SURVEY_HELD_SECS}", go.display());
     fake(
         &developer_dir.join(kbf_driver_native::xcode::XCODEBUILD),
         &format!("-version\t-\t{wait} ; echo Build version 1A1\n*\t-\t{wait}\n"),
@@ -251,7 +252,6 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     let real_developer_dir = std::fs::canonicalize(&developer_dir).expect("real");
     config.xcodes = [("1A1".to_owned(), real_developer_dir.clone())].into();
 
-    let started = Instant::now();
     let (daemon, mut reports) = native_with(&cli, config, &xcrun).expect("the native daemon");
     let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(daemon.with_events(events).run(pending()));
@@ -267,9 +267,12 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     });
     let welcomed = welcomed.await;
     assert!(welcomed.is_ok(), "not welcomed: {before:#?}");
-    let hello = started.elapsed();
-    eprintln!("startup_tests: welcomed {hello:.2?} after the start, the survey held");
-    assert!(hello < HELLO_WITHIN, "Hello waited: {hello:?}");
+    // Order, not speed: the survey cannot answer before the test writes `go`, which it
+    // does only below, and the Welcome was awaited above. So a Welcome seen here came
+    // while the first survey was unfinished, however slow the machine was to get here;
+    // a daemon that sends Hello after its survey is never welcomed within PROMPT. The
+    // survey's state is read below through the API, which is polled (the daemon's first
+    // listing of the Xcodes is asynchronous, so reading it here would race).
 
     let software = software_until(api, |s| !s.is_null()).await;
     assert_eq!(
