@@ -91,6 +91,8 @@ impl MigrateError {
             | MigrateError::Unmigrated(_)
             | MigrateError::MovedOn(_)
             | MigrateError::NoJournal => Exit::NeedsOperator,
+            // The old tools' lock or the installer's, held past the wait: ask again.
+            MigrateError::State(StateError::Busy { .. }) => Exit::Busy,
             MigrateError::State(e) if e.needs_operator() => Exit::NeedsOperator,
             MigrateError::Corrupt { .. }
             | MigrateError::Tree(_)

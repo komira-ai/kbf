@@ -8,6 +8,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use kbf_host::Root;
 use kbf_host::testkit::{ScratchHost, reply};
@@ -45,6 +46,9 @@ pub const PLIST: &str = "<dict>\n<key>ProgramArguments</key>\n<array>\n<string>/
 
 type Verify = Box<dyn Fn(&CommitId, &Version) -> Result<(), String>>;
 
+/// What a test plays at a service command: the verb and the unit file.
+type CommandHook = Box<dyn Fn(&str, &str)>;
+
 /// A verifier a test plays.
 pub struct FnVerifier(pub Verify);
 
@@ -65,6 +69,13 @@ pub struct Rig {
     pub events: Rc<RefCell<Vec<String>>>,
     /// Make the next `start` fail.
     pub fail_start: Rc<Cell<bool>>,
+    /// Called with the verb and the unit file of every service command before it is answered
+    /// (`stop`, `start`, `is-active`, `daemon-reload` with no unit): what a test plays as
+    /// the host doing something while the migration is in that call.
+    on_command: Rc<RefCell<Option<CommandHook>>>,
+    /// How long the migration waits for each lock ([`Migration::lock_wait`]); long, so that a
+    /// test which holds a lock for a moment is waited out.
+    pub lock_wait: Duration,
 }
 
 pub fn put(path: &Path, bytes: &str, mode: u32) {
@@ -98,12 +109,14 @@ impl Rig {
         let active = Rc::new(RefCell::new(BTreeSet::new()));
         let events = Rc::new(RefCell::new(Vec::new()));
         let fail_start = Rc::new(Cell::new(false));
+        let on_command: Rc<RefCell<Option<CommandHook>>> = Rc::new(RefCell::new(None));
         host.answer = Box::new({
-            let (active, events, fail_start, root) = (
+            let (active, events, fail_start, root, on_command) = (
                 active.clone(),
                 events.clone(),
                 fail_start.clone(),
                 root.clone(),
+                on_command.clone(),
             );
             move |cmd| {
                 let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
@@ -135,6 +148,9 @@ impl Rig {
                     ),
                     other => panic!("a command the rig does not know: {other:?}"),
                 };
+                if let Some(hook) = on_command.borrow().as_ref() {
+                    hook(verb, &unit);
+                }
                 match verb {
                     "is-active" => Ok(reply(
                         i32::from(!active.borrow().contains(&unit)) * 3,
@@ -169,7 +185,14 @@ impl Rig {
             active,
             events,
             fail_start,
+            on_command,
+            lock_wait: Duration::from_secs(20),
         }
+    }
+
+    /// Play `hook(verb, unit)` at every service command from now on.
+    pub fn on_command(&self, hook: impl Fn(&str, &str) + 'static) {
+        *self.on_command.borrow_mut() = Some(Box::new(hook));
     }
 
     pub fn at(&self, path: &str) -> PathBuf {
@@ -299,6 +322,7 @@ impl Rig {
                 source: Source::Url,
                 min_generation: Some(17),
             },
+            lock_wait: self.lock_wait,
         }
     }
 

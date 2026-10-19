@@ -34,6 +34,16 @@ fn frontend(min_generation: Option<u64>) -> Seed {
     }
 }
 
+/// The floor seeded from `memory` on what the source says: the two steps of an apply
+/// (asking the source, once; seeding from the memory read, as often as it is read) in one.
+fn seed(
+    memory: &Memory,
+    seed: &Seed,
+    frontend: &dyn FrontendFloor,
+) -> Result<Seeded, MigrateError> {
+    claim(seed, frontend).map(|claim| super::floor::seed(memory, &claim))
+}
+
 fn floor(epoch: u64, order_id: u64, generation: u64) -> crate::state::Floor {
     crate::state::Floor {
         epoch,

@@ -417,7 +417,7 @@ fn every_error_has_the_contract_exit_code() {
             MigrateError::State(crate::state::StateError::Busy {
                 path: std::path::PathBuf::new(),
             }),
-            1,
+            4,
         ),
         (MigrateError::Disagree(String::new()), 5),
         (MigrateError::Changed(String::new()), 5),

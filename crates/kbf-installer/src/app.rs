@@ -317,6 +317,7 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
             },
             min_generation: args.min_generation,
         },
+        lock_wait: operator::LOCK_WAIT,
     };
     let mode = if apply {
         kbf_host::Mode::Apply

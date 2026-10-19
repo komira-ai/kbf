@@ -64,6 +64,8 @@ mod services;
 pub mod tree;
 pub mod units;
 
+use std::time::Duration;
+
 use kbf_host::Mode;
 
 pub use apply::migrate;
@@ -114,6 +116,10 @@ pub struct Migration {
     /// installer and the old helper never both run.
     pub installer_unit: Option<Unit>,
     pub seed: Seed,
+    /// How long each of the two locks (the old tools', the installer's) is waited for before
+    /// the verb ends busy (exit 4): a verb of the old tools can hold theirs for a long time,
+    /// and a migration queued behind it holds up whatever else wants the installer's.
+    pub lock_wait: Duration,
 }
 
 /// The programs and servers a migration asks.
@@ -206,6 +212,8 @@ pub fn guard(layout: &Layout, owner_uid: u32) -> Result<(), MigrateError> {
 mod coverage_tests;
 #[cfg(test)]
 mod floor_tests;
+#[cfg(test)]
+mod lock_tests;
 #[cfg(test)]
 mod moved_tests;
 #[cfg(test)]

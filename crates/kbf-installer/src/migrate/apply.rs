@@ -41,12 +41,11 @@ const MARKER_TEXT: &str = "This host is managed by kbf-installer. This directory
 are kept as the rollback path (`kbf-installer migrate --rollback`); nothing here is read any more.\n";
 
 /// What a look at the host found: the journal of a migration begun, the old layout's state
-/// and memory, the old tree, and the floor seeded from that memory.
+/// and memory, and the old tree.
 struct Seen {
     journal: Option<Journal>,
     old: Old,
     old_tree: OldTree,
-    seeded: Seeded,
 }
 
 /// What a look at the host came to.
@@ -56,10 +55,11 @@ enum Look {
     Old(Box<Seen>),
 }
 
-/// Look at the host: read the old state and memory, judge them and the links, seed the
-/// floor. Changes nothing. An apply looks twice, once to plan and once under its locks,
-/// because only what is read under the locks is still true when it is written.
-fn look(m: &Migration, hooks: &Hooks<'_>, rules: &Rules) -> Result<Look, MigrateError> {
+/// Look at the host: read the old state and memory and judge them and the links. Changes
+/// nothing, and asks nothing of the network (the floor is seeded from what is read, on the
+/// claim made once). An apply looks twice, once to plan and once under its locks, because
+/// only what is read under the locks is still true when it is written.
+fn look(m: &Migration, rules: &Rules) -> Result<Look, MigrateError> {
     let existing = StateDir::open(&m.layout, rules)?;
     let journal = existing
         .as_ref()
@@ -100,12 +100,10 @@ fn look(m: &Migration, hooks: &Hooks<'_>, rules: &Rules) -> Result<Look, Migrate
     }
     let old_tree = OldTree::open(&m.layout, &m.roots)?;
     check_links(&old, &old_tree)?;
-    let seeded = floor::seed(&old.memory, &m.seed, hooks.frontend)?;
     Ok(Look::Old(Box::new(Seen {
         journal,
         old,
         old_tree,
-        seeded,
     })))
 }
 
@@ -170,19 +168,22 @@ pub fn migrate<E: Exec>(
     let rules = rules(m);
     // The first look takes no lock. It is all of a dry run, and an apply's chance to refuse
     // and to probe the releases before it waits for anything. Only what it probed goes on
-    // (`found`, and the names it probed them under); what it read is not written from.
-    let (found, probed) = {
-        let first = match look(m, hooks, &rules)? {
+    // (`found`, and the names it probed them under); what it read is not written from. The
+    // source of the floor is asked here too, once: the frontend is a call over the network,
+    // not one to make with the locks held.
+    let (found, probed, claim) = {
+        let first = match look(m, &rules)? {
             Look::Settled(report) => return Ok(report),
             Look::Old(seen) => seen,
         };
+        let claim = floor::claim(&m.seed, hooks.frontend)?;
         let found = find(m, hooks, &rules, &first.old_tree, &first.old)?;
         if mode == Mode::DryRun {
             let mut report = Report::new(Outcome::Planned);
             report_plan(
                 &mut report,
                 mode,
-                &first.seeded,
+                &floor::seed(&first.old.memory, &claim),
                 first.old.state.staged.as_ref(),
                 &found,
             );
@@ -193,7 +194,7 @@ pub fn migrate<E: Exec>(
             first.old.state.current.clone(),
             first.old.state.previous.clone(),
         ];
-        (found, probed)
+        (found, probed, claim)
     };
     if exec.euid() != m.owner_uid {
         return Err(MigrateError::NotRoot {
@@ -202,16 +203,18 @@ pub fn migrate<E: Exec>(
         });
     }
     // Both locks: no verb of the old tools is mid-way, and no run of the installer changes
-    // its state while this one does.
-    let _old_lock = OldLock::take(&m.layout, &m.roots)?;
-    let lock = Locked::acquire(&m.layout)?;
+    // its state while this one does. Each is waited for `m.lock_wait` and no longer (busy,
+    // exit 4), the old tools' first and let go with the error.
+    let _old_lock = OldLock::take(&m.layout, &m.roots, m.lock_wait)?;
+    state::make_lock_dir(&m.layout)?;
+    let lock = Locked::acquire_within(&m.layout, m.lock_wait)?;
     // Everything read before the locks may be stale by now: a verb of the old tools (or the
     // old helper) between the look and the locks moves `current`, puts a swap on trial or
     // acts on an order, and another run of this verb may have finished while this one
     // waited. So the old layout is read and judged again, and every write below is made
     // from this look alone. A different `current` or `previous` is not adopted in place of
     // the releases probed: the run is refused, nothing migrated, to be run again.
-    let seen = match look(m, hooks, &rules)? {
+    let seen = match look(m, &rules)? {
         Look::Old(seen) => seen,
         Look::Settled(report) if report.outcome == Outcome::AlreadyMigrated => return Ok(report),
         Look::Settled(_) => {
@@ -219,12 +222,8 @@ pub fn migrate<E: Exec>(
         }
     };
     unchanged(&probed, &seen.old)?;
-    let Seen {
-        journal,
-        old,
-        seeded,
-        ..
-    } = *seen;
+    let Seen { journal, old, .. } = *seen;
+    let seeded = floor::seed(&old.memory, &claim);
     let mut report = Report::new(Outcome::Migrated);
     report_plan(
         &mut report,

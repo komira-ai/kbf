@@ -13,7 +13,7 @@ use crate::helper::memory::Memory;
 use crate::state::{Locked, State};
 use crate::testkit::{A, B, C};
 
-fn never() -> FnVerifier {
+pub(super) fn never() -> FnVerifier {
     FnVerifier(Box::new(|_, _| Err("no pipeline here".to_owned())))
 }
 
@@ -24,7 +24,7 @@ fn apply_with(rig: &mut Rig, between: impl Fn() + 'static) -> Result<Report, Mig
 }
 
 /// The installer's tree was not made and no service was touched.
-fn assert_nothing_migrated(rig: &Rig) {
+pub(super) fn assert_nothing_migrated(rig: &Rig) {
     assert!(!rig.new_state_dir().exists(), "no state directory");
     assert!(!rig.new_tree().exists(), "no tree");
     assert!(rig.events.borrow().is_empty() && rig.host.log.is_empty());
