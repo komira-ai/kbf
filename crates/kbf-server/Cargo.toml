@@ -15,6 +15,7 @@ form_urlencoded.workspace = true
 hex.workspace = true
 futures.workspace = true
 kbf-auth.workspace = true
+kbf-ca.workspace = true
 kbf-front.workspace = true
 kbf-history.workspace = true
 kbf-invocation.workspace = true
@@ -33,6 +34,7 @@ kbf-proto.workspace = true
 kbf-raft.workspace = true
 kbf-route.workspace = true
 kbf-sched.workspace = true
+kbf-signer.workspace = true
 kbf-state = { workspace = true, features = ["postgres"] }
 kbf-storage.workspace = true
 kbf-store.workspace = true
@@ -59,6 +61,8 @@ tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# The node's client of `kbf.enroll.v1`, run against the real enroll listener (tests/enroll_node.rs).
+kbf-enroll.workspace = true
 # An S3 service on loopback that refuses any other key pair (tests/cold_apply.rs).
 kbf-objstore = { workspace = true, features = ["testkit"] }
 # Loopback ports nothing can take (kbf_testkit::port).
