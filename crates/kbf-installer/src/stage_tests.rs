@@ -1,953 +1,1017 @@
-use std::cell::{Cell, RefCell};
-use std::fs;
+use std::cell::RefCell;
+use std::ffi::CString;
 use std::io;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::rc::Rc;
-use std::time::Duration;
+use std::time::Instant;
 
 use kbf_host::path::HostPath;
-use kbf_host::step::Perms;
-use kbf_host::testkit::{FakeExec, ScratchHost};
+use kbf_host::testkit::FakeExec;
 
 use super::*;
-use crate::binary::Arch;
-use crate::fixtures::*;
-use crate::layout::{Layout, Platform};
-use crate::run::{Ran, Runner};
-use crate::state;
+use crate::fixtures::{COMMIT, FakeRunner, OTHER, elf, file, me, ran, tar_gz, trusted_host_on};
+use crate::fixtures::{Item, version_json};
+use crate::helper::leases::fake::FakeLeases;
+use crate::run::{Ran, SystemRunner};
+use crate::testkit::host_root;
 
-const ELF_X86: u8 = 0x3e;
-const ELF_ARM: u8 = 0xb7;
-const MACHO_ARM: u32 = 0x0100_000c;
-const MACHO_X86: u32 = 0x0100_0007;
+fn commit() -> CommitId {
+    CommitId::new(COMMIT).expect("commit")
+}
 
-/// A host, an inbox and everything a stage reads, on a scratch root.
+fn owner() -> Owner {
+    let me = me();
+    Owner {
+        uid: me.uid,
+        gid: me.gid,
+    }
+}
+
+/// The facts `version_json` makes a binary declare.
+fn facts() -> Facts {
+    Facts {
+        platform: "linux-x86_64".to_owned(),
+        protocol: 4,
+        min_protocol: 3,
+        state_schema: 7,
+        profile: "release".to_owned(),
+    }
+}
+
+fn policy() -> Policy {
+    Policy {
+        max_component_bytes: 1 << 20,
+        max_binary_bytes: 1 << 20,
+        min_protocol: 0,
+        supported: Supported {
+            protocol: 10,
+            min_protocol: 10,
+            state_schema: 10,
+        },
+        timeouts: Timeouts::DEFAULT,
+    }
+}
+
+/// The tarball of an honest x86-64 Linux `kbf`.
+fn tarball() -> Vec<u8> {
+    tar_gz(&[file("kbf", &elf(0x3e, "payload"))])
+}
+
+fn sha(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// A runner that answers `gh` with `gh` and the probe with `probe`.
+fn runner(gh: Ran, probe: Ran) -> FakeRunner {
+    FakeRunner::new(move |spawn| {
+        if spawn.program.file_name().is_some_and(|n| n == "gh") {
+            Ok(gh.clone())
+        } else {
+            Ok(probe.clone())
+        }
+    })
+}
+
+fn honest() -> FakeRunner {
+    runner(ran(0, "", ""), ran(0, &version_json(COMMIT, "release"), ""))
+}
+
+fn probing(stdout: &str) -> FakeRunner {
+    runner(ran(0, "", ""), ran(0, stdout, ""))
+}
+
+/// The names of the programs a runner was asked to run, in order.
+fn programs(runner: &FakeRunner) -> Vec<String> {
+    runner
+        .calls()
+        .iter()
+        .map(|c| {
+            c.program
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into()
+        })
+        .collect()
+}
+
 struct Rig {
-    exec: ScratchHost,
     host: Layout,
+    dir: PathBuf,
     settings: Settings,
     trust: FakeExec,
-    /// The inbox entry.
-    entry: PathBuf,
-    /// A place outside the entry (a file a stage must never read).
-    outside: PathBuf,
+    policy: Policy,
+    leases: FakeLeases,
 }
 
 impl Rig {
-    fn new(name: &str, platform: Platform) -> Rig {
-        let (exec, host) = scratch_layout(name, platform);
-        // What a host has above the layout: a Linux one `/run` and `/var/lib`; a Mac
-        // `/var/run` and `/var/db`, and, on both, whatever `/usr` has (not `/usr/local`
-        // on a fresh Mac).
-        let seeded: &[&str] = match platform {
-            Platform::Linux => &["run", "var/lib", "usr/local", "etc"],
-            Platform::MacOs => &["var/run", "var/db", "usr"],
-        };
-        for sub in seeded {
-            fs::create_dir_all(exec.root.join(sub)).expect("seed");
-        }
+    fn new(name: &str) -> Rig {
+        let (host, dir) = host_root(&format!("stage-{name}"));
+        Rig::on(host, dir)
+    }
+
+    fn on(host: Layout, dir: PathBuf) -> Rig {
         let mut settings = Settings::defaults(&host);
         settings.run_as = me();
-        settings.timeout = Duration::from_secs(30);
-        settings.arch = match platform {
-            Platform::Linux => Arch::X86_64,
-            Platform::MacOs => Arch::Aarch64,
-        };
-        let outside = scratch_dir(&format!("stage-{name}-outside"));
-        let entry = outside.join("entry");
+        settings.arch = Arch::X86_64;
+        let trust = trusted_host_on(host.platform());
         Rig {
-            exec,
             host,
+            dir,
             settings,
-            trust: trusted_host(),
-            entry,
-            outside,
+            trust,
+            policy: policy(),
+            leases: FakeLeases::default(),
         }
     }
 
-    /// An inbox offering `COMMIT` with a `kbf` carrying `bytes`.
-    fn kbf(&self, bytes: &[u8]) -> String {
-        write_inbox(&self.entry, COMMIT, &[part("kbf", bytes)])
+    /// The fetch step's hand-over of `bytes` as the tarball of `kbf`, and the order's
+    /// locator for them.
+    fn fetch(&self, bytes: &[u8]) -> (Locator, Fetched) {
+        let partial = Partial::create(&self.host, &commit(), owner()).expect("partial");
+        let path = partial.dl().join("kbf.tar.gz");
+        fs::write(&path, bytes).expect("seed");
+        let locator = Locator {
+            name: "kbf".to_owned(),
+            sha256: sha(bytes),
+            size: bytes.len() as u64,
+            attestation: "{\"mediaType\":\"bundle\"}\n".to_owned(),
+        };
+        let received = Received {
+            name: "kbf".to_owned(),
+            tarball: path,
+            bytes: bytes.len() as u64,
+            sha256: sha(bytes),
+        };
+        let fetched = Fetched {
+            partial,
+            files: vec![received],
+        };
+        (locator, fetched)
     }
 
-    fn stage(&mut self, runner: &dyn Runner) -> Result<Staged, Refusal> {
-        self.stage_with(runner, &Hooks::default(), Limits::DEFAULT)
-    }
-
-    fn stage_with(
-        &mut self,
+    fn verify(
+        &self,
         runner: &dyn Runner,
-        hooks: &Hooks,
-        limits: Limits,
+        kind: OrderKind,
+        locators: &[Locator],
+        expected: Option<&Facts>,
+        fetched: Fetched,
     ) -> Result<Staged, Refusal> {
-        let mut ctx = Context {
+        let commit = commit();
+        let pipeline = Pipeline {
             host: &self.host,
             settings: &self.settings,
-            exec: &mut self.exec,
+            policy: self.policy,
             trust: &self.trust,
             runner,
-            owner: me_owner(),
-            limits,
+            leases: &self.leases,
+            owner: owner(),
         };
-        stage_with(&mut ctx, &self.entry, hooks)
+        let order = Order {
+            kind,
+            commit: &commit,
+            components: locators,
+            expected,
+        };
+        pipeline.verify(&order, fetched)
     }
 
-    fn at(&self, host_path: &str) -> PathBuf {
-        self.exec.at(host_path)
+    /// An activation of the honest release, with `runner` playing the programs.
+    fn activate(&self, runner: &dyn Runner) -> Result<Staged, Refusal> {
+        let (locator, fetched) = self.fetch(&tarball());
+        self.verify(
+            runner,
+            OrderKind::Activate,
+            &[locator],
+            Some(&facts()),
+            fetched,
+        )
     }
 
-    /// The names under the scratch directory of stages: empty when each was removed.
-    fn work_leftovers(&self) -> Vec<String> {
-        let dir = self.exec.at(&self.host.work_dir().to_string());
-        fs::read_dir(dir)
-            .map(|d| {
-                d.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn release(&self) -> PathBuf {
+        self.host.join(&self.host.release_dir(&commit()))
     }
 
-    fn releases(&self) -> Vec<String> {
-        fs::read_dir(self.at("/usr/local/kbf/releases"))
-            .map(|d| {
-                d.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn work(&self) -> PathBuf {
+        self.host.join(&self.host.work_dir())
     }
 
-    fn state(&self) -> Option<state::State> {
-        state::read_unlocked(&self.host).expect("reads")
+    /// Nothing of the stage is left: no release directory, no scratch.
+    fn assert_nothing_installed(&self) {
+        assert!(!self.release().exists(), "a release directory was made");
+        let left: Vec<_> = fs::read_dir(self.work())
+            .map(|d| d.map(|e| e.expect("entry").file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "scratch left behind: {left:?}");
     }
 }
 
-fn code(result: Result<Staged, Refusal>) -> &'static str {
-    result.expect_err("refused").code()
+/// The scratch root holds an executable (the installed release), which `cargo llvm-cov`
+/// would scan as an object: it goes with the rig.
+impl Drop for Rig {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
 }
 
-fn is_gh(spawn: &Spawn) -> bool {
-    spawn.program.file_name().is_some_and(|n| n == "gh")
-}
+#[path = "stage_more_tests.rs"]
+mod more;
 
-fn is_staged_binary(spawn: &Spawn) -> bool {
-    spawn.args.iter().any(|a| a == "--version")
-}
-
-/// The happy path, and the whole contract of what a stage leaves behind: the release
-/// installed root-owned (here the test user) under `releases/<commit>/` with the binary
-/// 0755 and the bytes of the tarball's file; the state's `staged` set and nothing else in
-/// it; no `current` or `previous` link (nothing is activated); the scratch directory gone;
-/// the version facts read from the binary's own output; and the programs run in order:
-/// `gh` for the tarball, then the staged binary (in the scratch `out/`, an empty
-/// environment, an empty directory, as the unprivileged user).
+/// Catches a stage that does not do the whole job, in order: the honest release is checked
+/// by `gh` (with the unprivileged user, a scratch home and the order's commit) and then
+/// run once, as the unprivileged user with an empty environment and a 10 s limit, and is
+/// installed as `releases/<commit>/` holding the 0755 binary and the `VERIFIED` marker,
+/// with nothing of the download left, root's, and the state's `staged` naming it. The
+/// scratch directories are gone, and the cycle's view of the release is what the binary
+/// declared.
+///
+/// Mutants seen red: the probe run with no `run_as`; the marker not written; the state
+/// not updated; `dl/` left in the release.
 #[test]
-fn a_verified_release_is_staged_and_nothing_is_activated() {
-    let mut rig = Rig::new("stage-ok", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    let runner = FakeRunner::ok(COMMIT);
-    let staged = rig.stage(&runner).expect("staged");
+fn an_honest_release_is_verified_in_order_and_installed_with_its_marker() {
+    let rig = Rig::new("honest");
+    let runner = honest();
+    let staged = rig.activate(&runner).expect("staged");
 
-    assert_eq!(staged.commit.as_str(), COMMIT);
+    assert_eq!(programs(&runner), ["gh", "kbf"], "gh before anything runs");
+    let calls = runner.calls();
+    let probe = &calls[1];
+    assert_eq!(probe.args, ["--version", "--json"]);
+    assert!(probe.env.is_empty());
+    assert_eq!(probe.run_as, Some(me()));
+    assert_eq!(probe.timeout, Duration::from_secs(10));
+    assert_eq!(calls[0].timeout, Duration::from_secs(120));
+    let gh = &calls[0].args;
+    assert!(
+        gh.iter().any(|a| a == COMMIT),
+        "--source-digest is the commit"
+    );
+
+    let release = rig.release();
+    assert_eq!(
+        fs::read(release.join("kbf")).expect("binary"),
+        elf(0x3e, "payload")
+    );
+    let mode = |p: &str| fs::metadata(release.join(p)).expect(p).permissions().mode() & 0o7777;
+    assert_eq!(mode("kbf"), 0o755);
+    assert_eq!(mode("VERIFIED"), 0o644);
+    assert_eq!(
+        fs::read_to_string(release.join("VERIFIED")).expect("m"),
+        format!("{COMMIT}\n")
+    );
+    let mut names: Vec<_> = fs::read_dir(&release)
+        .expect("dir")
+        .map(|e| e.expect("e").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["VERIFIED", "kbf"],
+        "the download is not part of the release"
+    );
+    assert_eq!(mode_of_dir(&release), 0o755);
+
+    assert_eq!(staged.commit, commit());
     assert_eq!(staged.components, ["kbf"]);
     assert_eq!(staged.source_ref.as_str(), "refs/heads/main");
+    assert_eq!(staged.platform, "linux-x86_64");
+    assert!(!staged.already_installed);
+    let installed = staged.installed();
     assert_eq!(
-        (staged.protocol, staged.min_protocol, staged.state_schema),
+        (
+            installed.protocol,
+            installed.min_protocol,
+            installed.state_schema
+        ),
         (4, 3, 7)
     );
-    assert_eq!(staged.version, "0.1.0");
-    assert!(
-        staged.log.contains(&format!("release {COMMIT}:")),
-        "{}",
-        staged.log
-    );
-    assert!(staged.log.contains(&format!("state: {COMMIT} staged")));
+    assert_eq!(installed.profile, "release");
 
-    let binary = rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf"));
-    assert_eq!(
-        fs::read(&binary).expect("installed"),
-        elf(ELF_X86, "kbf build")
-    );
-    assert_eq!(
-        fs::metadata(&binary).expect("stat").permissions().mode() & 0o7777,
-        0o755
-    );
-    let state = rig.state().expect("a state");
-    assert_eq!(state.staged.as_ref().map(CommitId::as_str), Some(COMMIT));
-    assert_eq!(
-        (state.current, state.previous, state.pending_confirm),
-        (None, None, None)
-    );
-    assert!(fs::symlink_metadata(rig.at("/usr/local/kbf/current")).is_err());
-    assert!(fs::symlink_metadata(rig.at("/usr/local/kbf/previous")).is_err());
-    assert_eq!(rig.work_leftovers(), Vec::<String>::new());
-
-    let calls = runner.calls();
-    assert_eq!(calls.len(), 2);
-    assert!(is_gh(&calls[0]));
-    let run = &calls[1];
-    assert!(run.program.ends_with("out/kbf"), "{:?}", run.program);
-    assert_eq!(run.args, ["--version", "--json"]);
-    assert!(run.env.is_empty());
-    assert!(run.cwd.ends_with("empty"), "{:?}", run.cwd);
-    assert_eq!(
-        (run.run_as, run.timeout),
-        (Some(me()), rig.settings.timeout)
-    );
+    let state = crate::state::read_unlocked(&rig.host)
+        .expect("state")
+        .expect("written");
+    assert_eq!(state.staged, Some(commit()));
+    let left: Vec<_> = fs::read_dir(rig.work()).expect("work").collect();
+    assert!(left.is_empty(), "scratch left: {left:?}");
 }
 
-/// Catches an unpack or a run before the gate: when `gh` is asked, the scratch `out/` has
-/// nothing in it and nothing was run; when it says no, no other program was run, nothing
-/// was installed and no state was written.
+fn mode_of_dir(dir: &Path) -> u32 {
+    fs::metadata(dir).expect("dir").permissions().mode() & 0o7777
+}
+
+/// Catches a size that is only claimed: a tarball one byte short or long on disk, a fetch
+/// parent that counted another number of bytes, and a component over the host's cap each
+/// end the stage as `size` before `gh` is asked or anything is unpacked.
 ///
-/// Mutant seen red: the unpack loop moved before the attestation loop (`out/` holds the
-/// unpacked `kbf` when `gh` is asked, and the staged binary is then run, though the
-/// release is not attested).
+/// Mutant seen red: the on-disk length not compared; the received count not compared;
+/// the cap not applied.
 #[test]
-fn nothing_is_unpacked_or_run_before_the_attestation_holds() {
-    let mut rig = Rig::new("stage-gate", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    let unpacked_when_asked = Rc::new(Cell::new(usize::MAX));
-    let copies_when_asked = Rc::new(Cell::new(0));
-    let (unpacked, copies) = (unpacked_when_asked.clone(), copies_when_asked.clone());
-    let runner = FakeRunner::new(move |s| {
-        let work = s.cwd.parent().expect("the stage's directory").to_owned();
-        unpacked.set(fs::read_dir(work.join("out")).expect("out").count());
-        copies.set(fs::read_dir(work.join("in")).expect("in").count());
-        Ok(ran(1, "", "no attestation found"))
-    });
-    let err = rig.stage(&runner).expect_err("not attested");
-    assert_eq!(err.code(), "not-attested");
-    assert_eq!(
-        unpacked_when_asked.get(),
-        0,
-        "out/ was empty when gh was asked"
-    );
-    assert_eq!(
-        copies_when_asked.get(),
-        2,
-        "the tarball and the bundle were copied"
-    );
-    // One run of gh per accepted signer (the current name, then the former), none after.
-    assert_eq!(runner.calls().len(), 2);
-    assert!(rig.releases().is_empty());
-    assert_eq!(rig.state(), None);
-    assert_eq!(rig.work_leftovers(), Vec::<String>::new());
-}
-
-/// Catches a byte of the copy changing between the copy and the check being missed (the
-/// copy is hashed, after it is made), and a change to the original after the copy
-/// mattering (the original is not read again): flipping a byte of the copy is refused
-/// with the sha mismatch before any program runs; flipping a byte of the original in the
-/// inbox after the copy changes nothing, and the release is staged from the copy.
-///
-/// Mutant seen red: the hash taken of the original inbox file instead of the copy (the
-/// flipped copy is then accepted by the stage, and only `gh` would notice).
-#[test]
-fn the_copy_is_what_is_hashed_and_the_original_is_not_read_again() {
-    let flip = |path: &Path| {
-        let mut bytes = fs::read(path).expect("read");
-        bytes[10] ^= 1;
-        fs::write(path, bytes).expect("write");
-    };
-    let mut rig = Rig::new("stage-flip-copy", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    let runner = FakeRunner::ok(COMMIT);
-    let on_copy = |dir: &Path| flip(&dir.join("kbf.tar.gz"));
-    let hooks = Hooks {
-        after_copy: Some(&on_copy),
-        ..Hooks::default()
-    };
-    let err = rig
-        .stage_with(&runner, &hooks, Limits::DEFAULT)
-        .expect_err("a byte flipped");
-    assert_eq!(err.code(), "hash-mismatch");
-    assert_eq!(
-        err.to_string(),
-        "\"kbf.tar.gz\" does not hash to the sha256 the offer names for it"
-    );
-    assert!(runner.calls().is_empty());
-
-    let mut rig = Rig::new("stage-flip-original", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    let entry = rig.entry.clone();
-    let on_original = move |_: &Path| flip(&entry.join("kbf.tar.gz"));
-    let hooks = Hooks {
-        after_copy: Some(&on_original),
-        ..Hooks::default()
-    };
-    rig.stage_with(&FakeRunner::ok(COMMIT), &hooks, Limits::DEFAULT)
-        .expect("the copy was good");
-}
-
-/// Catches an offered file that does not have the sha256 the offer names: the tarball, and
-/// the bundle, each refused naming the file.
-#[test]
-fn a_file_that_is_not_the_one_offered_is_refused() {
-    for (target, name) in [
-        ("kbf.tar.gz", "kbf.tar.gz"),
-        ("provenance.jsonl", "provenance.jsonl"),
-    ] {
-        let mut rig = Rig::new(&format!("stage-sha-{name}"), Platform::Linux);
-        rig.kbf(&elf(ELF_X86, "kbf build"));
-        let mut bytes = fs::read(rig.entry.join(target)).expect("read");
-        bytes.push(b'x');
-        fs::write(rig.entry.join(target), bytes).expect("write");
-        let err = rig.stage(&FakeRunner::ok(COMMIT)).expect_err("changed");
-        assert_eq!(err.code(), "hash-mismatch");
-        assert!(err.to_string().starts_with(&format!("{name:?}")), "{err}");
-    }
-}
-
-/// Catches an inbox file the stage reads that it should not: a symbolic link to a file
-/// outside the entry (the secret must not be copied: the refusal is the symlink's, not a
-/// hash mismatch), a FIFO (which must not hang the stage), a directory, a file with
-/// another hard link, an empty one, one past its size cap, a file the offer does not name,
-/// one it names that is not there, and `offer.json` itself being a link. Each is refused
-/// with its own code, before any program runs.
-///
-/// Mutants seen red: `O_NOFOLLOW` removed from the opens (the symlink cases then fail
-/// with a hash mismatch, because the secret was read through the link); the link count
-/// check dropped; the unexpected-name check dropped.
-#[test]
-fn an_inbox_entry_with_a_link_fifo_hard_link_or_stranger_is_refused() {
-    type Attack = fn(&Rig);
-    let attacks: [(&str, &str, Attack); 9] = [
-        ("symlink", "inbox-symlink", |rig| {
-            fs::write(rig.outside.join("secret"), b"not yours").expect("secret");
-            fs::remove_file(rig.entry.join("kbf.tar.gz")).expect("remove");
-            symlink(rig.outside.join("secret"), rig.entry.join("kbf.tar.gz")).expect("link");
-        }),
-        ("bundle-symlink", "inbox-symlink", |rig| {
-            fs::remove_file(rig.entry.join("provenance.jsonl")).expect("remove");
-            symlink("kbf.tar.gz", rig.entry.join("provenance.jsonl")).expect("link");
-        }),
-        ("offer-symlink", "inbox-symlink", |rig| {
-            fs::rename(rig.entry.join("offer.json"), rig.outside.join("offer.json")).expect("move");
-            symlink(rig.outside.join("offer.json"), rig.entry.join("offer.json")).expect("link");
-        }),
-        ("fifo", "inbox-not-regular", |rig| {
-            fs::remove_file(rig.entry.join("kbf.tar.gz")).expect("remove");
-            // `mkfifo(1)`: rustix has no `mknodat` on macOS.
-            let made = std::process::Command::new("mkfifo")
-                .arg(rig.entry.join("kbf.tar.gz"))
-                .status()
-                .expect("run mkfifo");
-            assert!(made.success(), "a fifo");
-        }),
-        ("directory", "inbox-not-regular", |rig| {
-            fs::remove_file(rig.entry.join("kbf.tar.gz")).expect("remove");
-            fs::create_dir(rig.entry.join("kbf.tar.gz")).expect("dir");
-        }),
-        ("hard-link", "inbox-hard-linked", |rig| {
-            fs::hard_link(
-                rig.entry.join("kbf.tar.gz"),
-                rig.outside.join("second-name"),
-            )
-            .expect("link");
-        }),
-        ("empty", "inbox-empty", |rig| {
-            fs::write(rig.entry.join("provenance.jsonl"), b"").expect("empty");
-        }),
-        ("stranger", "inbox-unexpected", |rig| {
-            fs::write(rig.entry.join("extra.txt"), b"a stranger\n").expect("stranger");
-        }),
-        ("missing", "inbox-missing", |rig| {
-            fs::remove_file(rig.entry.join("kbf.tar.gz")).expect("remove");
-        }),
-    ];
-    for (name, want, attack) in attacks {
-        let mut rig = Rig::new(&format!("stage-inbox-{name}"), Platform::Linux);
-        rig.kbf(&elf(ELF_X86, "kbf build"));
-        attack(&rig);
-        let runner = FakeRunner::ok(COMMIT);
-        assert_eq!(code(rig.stage(&runner)), want, "{name}");
-        assert!(runner.calls().is_empty(), "{name}");
-        assert!(rig.releases().is_empty(), "{name}");
-        assert_eq!(rig.work_leftovers(), Vec::<String>::new(), "{name}");
-    }
-}
-
-/// Catches a file swapped between the listing of the entry and its being opened (the
-/// race a check by path and then an open would lose): the hook replaces the tarball with a
-/// link to a secret after the offer was read, and the open, which does not follow links,
-/// refuses it. And a hook that does nothing changes nothing.
-#[test]
-fn a_file_swapped_for_a_link_before_it_is_opened_is_refused() {
-    let mut rig = Rig::new("stage-swap", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    fs::write(rig.outside.join("secret"), b"not yours").expect("secret");
-    let secret = rig.outside.join("secret");
-    let swapped = Rc::new(RefCell::new(Vec::new()));
-    let log = swapped.clone();
-    let swap = move |entry: &Path, name: &str| {
-        log.borrow_mut().push(name.to_owned());
-        if name == "kbf.tar.gz" {
-            fs::remove_file(entry.join(name)).expect("remove");
-            symlink(&secret, entry.join(name)).expect("link");
+fn a_component_of_another_size_than_ordered_is_refused_before_anything_runs() {
+    let bytes = tarball();
+    for case in ["short", "long", "counted", "cap"] {
+        let mut rig = Rig::new(&format!("size-{case}"));
+        let (mut locator, mut fetched) = rig.fetch(&bytes);
+        match case {
+            "short" => locator.size += 1,
+            "long" => locator.size -= 1,
+            "counted" => fetched.files[0].bytes += 1,
+            _ => rig.policy.max_component_bytes = locator.size - 1,
         }
-    };
-    let hooks = Hooks {
-        before_open: Some(&swap),
-        ..Hooks::default()
-    };
-    let runner = FakeRunner::ok(COMMIT);
-    let err = rig
-        .stage_with(&runner, &hooks, Limits::DEFAULT)
-        .expect_err("swapped");
-    assert_eq!(err.code(), "inbox-symlink");
-    assert_eq!(*swapped.borrow(), ["kbf.tar.gz"]);
-    assert!(runner.calls().is_empty());
-}
-
-/// Catches the size caps not applying: with small limits, an oversize offer, tarball and
-/// bundle are each refused as oversize before they are copied.
-#[test]
-fn a_file_over_its_cap_is_refused() {
-    let limits = |f: fn(&mut Limits)| {
-        let mut l = Limits::DEFAULT;
-        f(&mut l);
-        l
-    };
-    let cases: [(&str, Limits, &str); 3] = [
-        ("offer", limits(|l| l.offer = 10), "offer.json"),
-        ("tarball", limits(|l| l.tarball = 10), "kbf.tar.gz"),
-        ("bundle", limits(|l| l.bundle = 10), "provenance.jsonl"),
-    ];
-    for (name, l, file) in cases {
-        let mut rig = Rig::new(&format!("stage-cap-{name}"), Platform::Linux);
-        rig.kbf(&elf(ELF_X86, "kbf build"));
+        let runner = honest();
         let err = rig
-            .stage_with(&FakeRunner::ok(COMMIT), &Hooks::default(), l)
-            .expect_err("oversize");
-        assert_eq!(err.code(), "inbox-oversize", "{name}");
-        assert!(err.to_string().contains(file), "{err}");
+            .verify(
+                &runner,
+                OrderKind::Activate,
+                &[locator],
+                Some(&facts()),
+                fetched,
+            )
+            .expect_err(case);
+        assert_eq!(err.word(), Some("size"), "{case}: {err}");
+        assert!(runner.calls().is_empty(), "{case}: nothing was run");
+        rig.assert_nothing_installed();
     }
 }
 
-/// Catches an offer that is not an offer, and one that names a file the entry does not
-/// hold, reaching the checks after it.
+/// Catches a digest that is only a locator: the order's sha256 must equal what the fetch
+/// parent computed, and what is on the disk now (a tarball swapped after it was hashed has
+/// the right length and the wrong hash). Neither reaches `gh`.
+///
+/// Mutants seen red: the claim not compared with the order; the file not hashed again.
 #[test]
-fn an_offer_that_is_not_an_offer_is_refused() {
-    let mut rig = Rig::new("stage-offer", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    fs::write(rig.entry.join("offer.json"), "{\"schema\":2}").expect("offer");
-    assert_eq!(code(rig.stage(&FakeRunner::ok(COMMIT))), "offer-malformed");
-    fs::write(rig.entry.join("offer.json"), "nonsense").expect("offer");
-    assert_eq!(code(rig.stage(&FakeRunner::ok(COMMIT))), "offer-malformed");
+fn a_digest_other_than_the_orders_is_refused() {
+    let bytes = tarball();
+    for case in ["order", "swapped"] {
+        let rig = Rig::new(&format!("hash-{case}"));
+        let (mut locator, fetched) = rig.fetch(&bytes);
+        if case == "order" {
+            locator.sha256 = sha(b"another file");
+        } else {
+            let mut other = bytes.clone();
+            let last = other.len() - 1;
+            other[last] ^= 1;
+            fs::write(&fetched.files[0].tarball, other).expect("swap");
+        }
+        let runner = honest();
+        let err = rig
+            .verify(
+                &runner,
+                OrderKind::Activate,
+                &[locator],
+                Some(&facts()),
+                fetched,
+            )
+            .expect_err(case);
+        assert_eq!(err.word(), Some("hash"), "{case}: {err}");
+        assert!(runner.calls().is_empty());
+        rig.assert_nothing_installed();
+    }
 }
 
-/// Catches a tarball the attestation accepted but that is not one regular file named for
-/// the component: two files, a `../` entry, a symlink entry, another name, a directory
-/// prefix, and a file that is no archive. Each is refused, nothing is installed, and the
-/// staged binary is not run.
+/// Catches a file that is not what the fetch parent made: a link in its place, a file with
+/// a second name, a FIFO (which must not block the open), another owner's file. Each is a
+/// `trust_chain` refusal, before a byte is read.
 ///
-/// Mutants seen red: the entry count check dropped (the tarball with two files is
-/// installed); the name check dropped (the `../kbf` entry is unpacked).
+/// Mutants seen red: `O_NOFOLLOW` dropped; the link-count check dropped; `O_NONBLOCK`
+/// dropped (the FIFO case hangs, so it is bounded by the test runner's timeout); the owner
+/// check dropped.
 #[test]
-fn a_tarball_that_is_not_one_file_with_the_component_name_is_refused() {
-    let binary = elf(ELF_X86, "kbf build");
+fn a_download_that_is_not_the_parents_plain_file_is_refused() {
+    let bytes = tarball();
+    for case in ["symlink", "hardlink", "fifo", "owner"] {
+        let rig = Rig::new(&format!("file-{case}"));
+        let (locator, fetched) = rig.fetch(&bytes);
+        let path = fetched.files[0].tarball.clone();
+        let real = path.with_extension("real");
+        match case {
+            "symlink" => {
+                fs::rename(&path, &real).expect("move");
+                symlink(&real, &path).expect("link");
+            }
+            "hardlink" => fs::hard_link(&path, &real).expect("link"),
+            "fifo" => {
+                fs::remove_file(&path).expect("rm");
+                let c = CString::new(path.to_str().expect("utf-8")).expect("c");
+                // SAFETY: mkfifo reads a NUL-terminated path.
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            }
+            // The file is intact; the stage expects another owner than this process.
+            _ => {}
+        }
+        let runner = honest();
+        let commit = commit();
+        let pipeline = Pipeline {
+            host: &rig.host,
+            settings: &rig.settings,
+            policy: rig.policy,
+            trust: &rig.trust,
+            runner: &runner,
+            leases: &rig.leases,
+            owner: Owner {
+                uid: if case == "owner" {
+                    owner().uid + 1
+                } else {
+                    owner().uid
+                },
+                gid: owner().gid,
+            },
+        };
+        let order = Order {
+            kind: OrderKind::Activate,
+            commit: &commit,
+            components: &[locator],
+            expected: Some(&facts()),
+        };
+        let err = pipeline.verify(&order, fetched).expect_err(case);
+        assert_eq!(err.word(), Some("trust_chain"), "{case}: {err}");
+        assert!(runner.calls().is_empty(), "{case}");
+        rig.assert_nothing_installed();
+    }
+}
+
+/// Catches the attestation being skipped or ignored: a `gh` that refuses ends the stage as
+/// `attestation`, every allowed ref is tried before it does, nothing is unpacked or run
+/// (the binary is never started), and nothing is installed.
+///
+/// Mutants seen red: `gh` not run; its exit status ignored.
+#[test]
+fn a_release_gh_does_not_accept_is_refused_and_nothing_runs() {
+    let mut rig = Rig::new("gh-no");
+    rig.settings.source_refs = ["refs/heads/main", "refs/heads/release"]
+        .iter()
+        .map(|r| SourceRef::new(r).expect("ref"))
+        .collect();
+    let runner = runner(
+        ran(1, "", "no matching attestation\n"),
+        ran(0, &version_json(COMMIT, "release"), ""),
+    );
+    let err = rig.activate(&runner).expect_err("not attested");
+    assert_eq!(err.word(), Some("attestation"), "{err}");
+    assert_eq!(
+        programs(&runner),
+        ["gh", "gh", "gh", "gh"],
+        "each allowed ref under each accepted signer, then stop"
+    );
+    rig.assert_nothing_installed();
+}
+
+/// Catches the order of the checks, which is the safety property: an archive that is
+/// garbage and is also not attested is refused as `attestation` (it was never opened), and
+/// an attested archive that is garbage is refused as `shape` without anything being run.
+///
+/// Mutant seen red: the archive unpacked before the attestation is asked.
+#[test]
+fn nothing_is_unpacked_before_the_attestation_holds() {
+    let rig = Rig::new("order");
+    let garbage = b"this is not a tarball".to_vec();
+    let (locator, fetched) = rig.fetch(&garbage);
+    let runner = runner(ran(1, "", "bad"), ran(0, "", ""));
+    let err = rig
+        .verify(
+            &runner,
+            OrderKind::Activate,
+            std::slice::from_ref(&locator),
+            Some(&facts()),
+            fetched,
+        )
+        .expect_err("refused");
+    assert_eq!(err.word(), Some("attestation"), "{err}");
+    rig.assert_nothing_installed();
+
+    let (locator, fetched) = rig.fetch(&garbage);
+    let runner = honest();
+    let err = rig
+        .verify(
+            &runner,
+            OrderKind::Activate,
+            &[locator],
+            Some(&facts()),
+            fetched,
+        )
+        .expect_err("refused");
+    assert_eq!(err.word(), Some("shape"), "{err}");
+    assert_eq!(programs(&runner), ["gh"], "the garbage was never run");
+    rig.assert_nothing_installed();
+}
+
+/// Catches an archive that is accepted though it is not one plain file: a link entry, a
+/// second entry, a path in the name, trailing bytes. Each is `shape`, after `gh` accepted
+/// it and before anything ran.
+///
+/// Mutant seen red: the shape check dropped from the pipeline (the symlink entry installs).
+#[test]
+fn an_attested_archive_of_the_wrong_shape_is_refused_unrun() {
     let link = Item {
         name: b"kbf",
         kind: b'2',
-        data: b"",
+        data: b"x",
     };
-    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+    let mut trailing = tarball();
+    trailing.extend_from_slice(b"extra");
+    let cases = [
+        ("link", tar_gz(&[link])),
         (
             "two",
-            tar_gz(&[file("kbf", &binary), file("README", b"hi")]),
-            "archive-entries",
+            tar_gz(&[file("kbf", &elf(0x3e, "")), file("other", b"x")]),
         ),
-        (
-            "dotdot",
-            tar_gz(&[Item {
-                name: b"../kbf",
-                kind: b'0',
-                data: &binary,
-            }]),
-            "archive-name",
-        ),
-        ("symlink", tar_gz(&[link]), "archive-not-regular"),
-        (
-            "wrong-name",
-            tar_gz(&[file("kbf-daemon", &binary)]),
-            "archive-name",
-        ),
-        (
-            "prefixed",
-            tar_gz(&[file("bin/kbf", &binary)]),
-            "archive-name",
-        ),
-        (
-            "not-a-tarball",
-            b"plain bytes".to_vec(),
-            "archive-malformed",
-        ),
+        ("path", tar_gz(&[file("bin/kbf", &elf(0x3e, ""))])),
+        ("trailing", trailing),
     ];
-    for (name, tarball, want) in cases {
-        let mut rig = Rig::new(&format!("stage-archive-{name}"), Platform::Linux);
-        write_inbox(
-            &rig.entry,
-            COMMIT,
-            &[Part {
-                name: "kbf",
-                tarball,
-            }],
-        );
-        let runner = FakeRunner::ok(COMMIT);
-        assert_eq!(code(rig.stage(&runner)), want, "{name}");
-        assert_eq!(runner.calls().len(), 1, "{name}: only gh ran");
-        assert!(rig.releases().is_empty(), "{name}");
+    for (name, bytes) in cases {
+        let rig = Rig::new(&format!("shape-{name}"));
+        let (locator, fetched) = rig.fetch(&bytes);
+        let runner = honest();
+        let err = rig
+            .verify(
+                &runner,
+                OrderKind::Activate,
+                &[locator],
+                Some(&facts()),
+                fetched,
+            )
+            .expect_err(name);
+        assert_eq!(err.word(), Some("shape"), "{name}: {err}");
+        assert_eq!(programs(&runner), ["gh"], "{name}: nothing was run");
+        rig.assert_nothing_installed();
     }
 }
 
-/// Catches a staged binary that is not this host's kind being run or installed: an
-/// attested file for the wrong platform (a Mach-O on Linux, an ELF on a Mac), the wrong
-/// CPU on either, and a script, are each refused by the header, before the binary is run.
+/// Catches an attested binary of another platform being run: a 64-bit ARM ELF on an x86-64
+/// host, a Mach-O on Linux and a script are `platform` refusals, before the probe.
 ///
-/// Mutants seen red: the kind comparison dropped, for each of the four cases in turn (the
-/// wrong file is then run and installed).
+/// Mutant seen red: the header check dropped.
 #[test]
-fn an_attested_binary_of_another_platform_is_refused_unrun() {
-    let cases: [(&str, Platform, Vec<u8>); 6] = [
-        ("macho-on-linux", Platform::Linux, macho(MACHO_ARM, "x")),
-        ("wrong-cpu-on-linux", Platform::Linux, elf(ELF_ARM, "x")),
-        (
-            "script-on-linux",
-            Platform::Linux,
-            b"#!/usr/bin/env kbf-no-such-program\necho hi\n".to_vec(),
-        ),
-        ("elf-on-mac", Platform::MacOs, elf(ELF_ARM, "x")),
-        ("wrong-cpu-on-mac", Platform::MacOs, macho(MACHO_X86, "x")),
-        (
-            "script-on-mac",
-            Platform::MacOs,
-            b"#!/usr/bin/env kbf-no-such-program\necho hi\n".to_vec(),
-        ),
-    ];
-    for (name, platform, bytes) in cases {
-        let mut rig = Rig::new(&format!("stage-platform-{name}"), platform);
-        write_inbox(&rig.entry, COMMIT, &[part("kbf", &bytes)]);
-        let runner = FakeRunner::ok(COMMIT);
-        let err = rig.stage(&runner).expect_err(name);
-        assert_eq!(err.code(), "wrong-platform", "{name}");
-        assert!(
-            runner.calls().iter().all(|c| !is_staged_binary(c)),
-            "{name}: the binary was run"
-        );
-        assert!(rig.releases().is_empty(), "{name}");
+fn a_binary_for_another_platform_is_refused_unrun() {
+    for (name, content) in [
+        ("arm", elf(0xb7, "")),
+        ("macho", crate::fixtures::macho(0x0100_000c, "")),
+        ("script", b"#!/usr/bin/true\necho hi\n".to_vec()),
+    ] {
+        let rig = Rig::new(&format!("platform-{name}"));
+        let (locator, fetched) = rig.fetch(&tar_gz(&[file("kbf", &content)]));
+        let runner = honest();
+        let err = rig
+            .verify(
+                &runner,
+                OrderKind::Activate,
+                &[locator],
+                Some(&facts()),
+                fetched,
+            )
+            .expect_err(name);
+        assert_eq!(err.word(), Some("platform"), "{name}: {err}");
+        assert_eq!(programs(&runner), ["gh"]);
+        rig.assert_nothing_installed();
     }
-    let mut rig = Rig::new("stage-platform-message", Platform::Linux);
-    write_inbox(&rig.entry, COMMIT, &[part("kbf", &macho(MACHO_ARM, "x"))]);
-    let err = rig.stage(&FakeRunner::ok(COMMIT)).expect_err("macho");
-    assert_eq!(
-        err.to_string(),
-        "kbf is a Mach-O arm64 binary, and this host runs an ELF x86_64 binary"
-    );
 }
 
-/// Catches the version check being skipped or loosened: a binary that says another commit
-/// (or that is a debug build, exits non-zero, prints no JSON, or hangs) is refused, and
-/// not installed. Each has its own code.
+/// Catches the expected facts being compared loosely: each of the five (platform, protocol,
+/// min_protocol, state_schema, profile) that differs from what the binary declared is a
+/// `facts` refusal naming the field, and the release is not installed.
 ///
-/// Mutants seen red: the commit comparison dropped; the profile comparison dropped.
+/// Mutants seen red: one field dropped from the comparison (each field is tried alone).
 #[test]
-fn a_binary_that_does_not_say_it_is_the_commits_release_build_is_refused() {
-    type Answer = fn(&Spawn) -> io::Result<Ran>;
-    let cases: [(&str, &str, Answer); 5] = [
-        ("commit", "version-commit", |s| {
-            Ok(play(s, OTHER, "release"))
-        }),
-        ("profile", "version-profile", |s| {
-            Ok(play(s, COMMIT, "debug"))
-        }),
-        ("exit", "version-failed", |s| {
-            Ok(if is_staged_binary(s) {
-                ran(2, "", "usage")
-            } else {
-                play(s, COMMIT, "release")
-            })
-        }),
-        ("garbage", "version-unreadable", |s| {
-            Ok(if is_staged_binary(s) {
-                ran(0, "kbf 0.1.0\n", "")
-            } else {
-                play(s, COMMIT, "release")
-            })
-        }),
-        ("killed", "version-failed", |s| {
-            Ok(if is_staged_binary(s) {
-                Ran {
-                    code: None,
-                    ..ran(0, "", "")
-                }
-            } else {
-                play(s, COMMIT, "release")
-            })
-        }),
-    ];
-    for (name, want, answer) in cases {
-        let mut rig = Rig::new(&format!("stage-version-{name}"), Platform::Linux);
-        rig.kbf(&elf(ELF_X86, "kbf build"));
-        assert_eq!(code(rig.stage(&FakeRunner::new(answer))), want, "{name}");
-        assert!(rig.releases().is_empty(), "{name}");
-        assert_eq!(rig.state(), None, "{name}");
-    }
-}
-
-/// Catches a staged binary that cannot be started, or that runs out of time, being read as
-/// anything but a refusal.
-#[test]
-fn a_binary_that_cannot_run_or_hangs_is_refused() {
-    let mut rig = Rig::new("stage-version-spawn", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    let cannot = FakeRunner::new(|s| {
-        if is_staged_binary(s) {
-            Err(io::Error::from(io::ErrorKind::PermissionDenied))
-        } else {
-            Ok(play(s, COMMIT, "release"))
+fn each_expected_fact_must_equal_what_the_binary_declares() {
+    for field in [
+        "platform",
+        "protocol",
+        "min_protocol",
+        "state_schema",
+        "profile",
+    ] {
+        let rig = Rig::new(&format!("facts-{field}"));
+        let mut expected = facts();
+        match field {
+            "platform" => expected.platform = "linux-arm64".to_owned(),
+            "protocol" => expected.protocol += 1,
+            "min_protocol" => expected.min_protocol += 1,
+            "state_schema" => expected.state_schema += 1,
+            _ => expected.profile = "debug".to_owned(),
         }
-    });
-    assert_eq!(code(rig.stage(&cannot)), "tool-failed");
-    let hangs = FakeRunner::new(|s| {
-        Ok(Ran {
-            timed_out: is_staged_binary(s),
-            ..play(s, COMMIT, "release")
-        })
-    });
-    assert_eq!(code(rig.stage(&hangs)), "timed-out");
+        let (locator, fetched) = rig.fetch(&tarball());
+        let err = rig
+            .verify(
+                &honest(),
+                OrderKind::Activate,
+                &[locator],
+                Some(&expected),
+                fetched,
+            )
+            .expect_err(field);
+        assert_eq!(err.word(), Some("facts"), "{field}: {err}");
+        assert!(
+            err.to_string().contains(field) || field == "platform",
+            "{err}"
+        );
+        rig.assert_nothing_installed();
+    }
 }
 
-/// Catches a release being replaced: staging the same commit again with the same bytes is
-/// a no-op that succeeds, and with different bytes (another tarball for the same commit,
-/// which the attestation, being for one tarball, would not have covered) is refused and the
-/// release on disk stays as it was.
+/// Catches facts that fail open: an activation with no expected facts is refused as
+/// `facts` before any work (nothing is run, nothing created), while a `frontend_update`
+/// may leave them out and is then held to the commit and the release profile only.
 ///
-/// Mutant seen red: the "differs" comparison in the install dropped (the second release
-/// overwrites the first).
+/// Mutants seen red: a missing `expected` skipping the comparison for an activation; the
+/// commit check skipped for a `frontend_update`.
 #[test]
-fn a_commit_staged_again_with_other_bytes_is_refused_never_replaced() {
-    let mut rig = Rig::new("stage-restage", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "first build"));
-    rig.stage(&FakeRunner::ok(COMMIT)).expect("staged");
-    rig.stage(&FakeRunner::ok(COMMIT))
-        .expect("the same release again");
+fn facts_are_required_for_an_activation_and_optional_for_a_frontend_update() {
+    let rig = Rig::new("facts-optional");
+    let (locator, fetched) = rig.fetch(&tarball());
+    let runner = honest();
+    let err = rig
+        .verify(&runner, OrderKind::Activate, &[locator], None, fetched)
+        .expect_err("fails closed");
+    assert_eq!(err.word(), Some("facts"));
+    assert_eq!(err.code(), "facts-missing");
+    assert!(runner.calls().is_empty());
+    rig.assert_nothing_installed();
 
-    fs::remove_dir_all(&rig.entry).expect("new inbox");
-    rig.kbf(&elf(ELF_X86, "second build"));
-    let err = rig.stage(&FakeRunner::ok(COMMIT)).expect_err("other bytes");
-    assert_eq!(err.code(), "release-differs");
-    assert!(
-        err.to_string().contains(&format!("releases/{COMMIT}/kbf")),
-        "{err}"
-    );
-    let binary = rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf"));
-    assert_eq!(fs::read(binary).expect("kept"), elf(ELF_X86, "first build"));
+    let (locator, fetched) = rig.fetch(&tarball());
+    rig.verify(
+        &honest(),
+        OrderKind::FrontendUpdate,
+        &[locator],
+        None,
+        fetched,
+    )
+    .expect("a frontend update needs no expected facts");
+
+    let rig = Rig::new("facts-optional-commit");
+    let (locator, fetched) = rig.fetch(&tarball());
+    let other = probing(&version_json(OTHER, "release"));
+    let err = rig
+        .verify(&other, OrderKind::FrontendUpdate, &[locator], None, fetched)
+        .expect_err("another commit");
+    assert_eq!(err.word(), Some("commit_or_ref"), "{err}");
+    rig.assert_nothing_installed();
 }
 
-/// Catches a trust list that is not root's alone being used: with a directory above `gh`
-/// others can write, the stage refuses naming it before it reads the inbox, and runs
-/// nothing; and a settings file that others can write is refused the same way (load is
-/// the caller's, tested in settings).
+/// Catches a probe read loosely or run unbounded: output over 4 KiB, a field the contract
+/// does not list, a field named twice, a non-zero exit and a build that declares another
+/// platform than its own header are each refused (`facts`), and a build that declares the
+/// right one passes.
+///
+/// Mutants seen red: the cap dropped; unknown fields allowed; the declared platform not
+/// compared with the header.
 #[test]
-fn an_untrusted_gh_stops_the_stage_before_the_inbox_is_read() {
-    let mut rig = Rig::new("stage-untrusted", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    rig.trust.entries.insert(
-        HostPath::new("/usr/local/libexec").expect("path"),
-        kbf_host::exec::Entry::Dir {
-            perms: Perms::new(0o775),
-            owner: Owner { uid: 0, gid: 0 },
-        },
-    );
-    let runner = FakeRunner::ok(COMMIT);
-    let err = rig.stage(&runner).expect_err("untrusted");
-    assert_eq!(err.code(), "untrusted-writable");
+fn the_probe_is_read_strictly() {
+    let json = version_json(COMMIT, "release");
+    let big = format!("{json}{}", " ".repeat(5000));
+    let unknown = json.replace('}', ",\"extra\":1}");
+    let twice = json.replace('}', ",\"profile\":\"release\"}");
+    let lies = json.replace('}', ",\"platform\":\"linux-arm64\"}");
+    let truth = json.replace('}', ",\"platform\":\"linux-x86_64\"}");
+    for (name, runner) in [
+        ("big", probing(&big)),
+        ("unknown", probing(&unknown)),
+        ("twice", probing(&twice)),
+        ("lies", probing(&lies)),
+        ("exit", runner(ran(0, "", ""), ran(3, &json, ""))),
+        ("empty", probing("")),
+    ] {
+        let rig = Rig::new(&format!("probe-{name}"));
+        let err = rig.activate(&runner).expect_err(name);
+        assert_eq!(err.word(), Some("facts"), "{name}: {err}");
+        rig.assert_nothing_installed();
+    }
+    let rig = Rig::new("probe-truth");
+    rig.activate(&probing(&truth))
+        .expect("a declared platform that is right");
+}
+
+/// Catches the operator's floor and the installer's own limits being skipped: a release
+/// whose protocol is below `min_protocol` is `floor`; one whose protocol, min_protocol or
+/// state schema is above what this installer understands is `installer_too_old`.
+///
+/// Mutants seen red: the floor comparison reversed; one of the three limits dropped.
+#[test]
+fn a_release_below_the_floor_or_beyond_the_installer_is_refused() {
+    let mut rig = Rig::new("floor");
+    rig.policy.min_protocol = 5;
+    let err = rig.activate(&honest()).expect_err("below");
+    assert_eq!(err.word(), Some("floor"), "{err}");
+    rig.assert_nothing_installed();
+    rig.policy.min_protocol = 4;
+    rig.activate(&honest()).expect("at the floor");
+
+    for field in ["protocol", "min_protocol", "state_schema"] {
+        let mut rig = Rig::new(&format!("old-{field}"));
+        match field {
+            "protocol" => rig.policy.supported.protocol = 3,
+            "min_protocol" => rig.policy.supported.min_protocol = 2,
+            _ => rig.policy.supported.state_schema = 6,
+        }
+        let err = rig.activate(&honest()).expect_err(field);
+        assert_eq!(err.word(), Some("installer_too_old"), "{field}: {err}");
+        assert!(err.to_string().contains(field), "{err}");
+        rig.assert_nothing_installed();
+    }
+}
+
+/// Catches a lease check that is missing, late or read from the wrong place: a live lease,
+/// and a source that cannot tell, each refuse as `lease` after the binary was verified and
+/// before the release directory exists.
+///
+/// Mutants seen red: the check dropped; the check after the rename.
+#[test]
+fn a_live_lease_refuses_before_the_release_is_installed() {
+    let rig = Rig::new("lease");
+    rig.leases.set(2);
+    let runner = honest();
+    let err = rig.activate(&runner).expect_err("busy");
+    assert_eq!(err.word(), Some("lease"), "{err}");
+    assert!(err.to_string().contains("2 leases are live"));
+    assert_eq!(programs(&runner), ["gh", "kbf"], "it was verified first");
+    rig.assert_nothing_installed();
+
+    rig.leases.set(usize::MAX);
+    let err = rig.activate(&honest()).expect_err("cannot tell");
+    assert_eq!(err.word(), Some("lease"));
+    assert!(err.to_string().contains("cannot tell"));
+    rig.assert_nothing_installed();
+
+    rig.leases.set(0);
+    rig.activate(&honest()).expect("idle");
+}
+
+/// Catches the marker being written after the rename: with the marker's name taken by a
+/// directory in the partial tree, writing it fails, and then no release directory may
+/// exist (a `releases/<commit>/` is only ever made whole, with its marker).
+///
+/// Mutant seen red: the rename before the marker.
+#[test]
+fn the_marker_is_written_before_the_directory_is_renamed_into_place() {
+    let rig = Rig::new("marker");
+    let (locator, fetched) = rig.fetch(&tarball());
+    fs::create_dir(fetched.partial.path().join(VERIFIED)).expect("plant");
+    let err = rig
+        .verify(
+            &honest(),
+            OrderKind::Activate,
+            &[locator],
+            Some(&facts()),
+            fetched,
+        )
+        .expect_err("cannot write the marker");
+    assert_eq!(err.code(), "work-dir");
+    rig.assert_nothing_installed();
     assert!(
-        err.to_string()
-            .starts_with("/usr/local/libexec is not trusted"),
-        "{err}"
+        crate::state::read_unlocked(&rig.host)
+            .expect("state")
+            .is_none()
     );
+}
+
+/// Catches a directory being taken as proof: the same release verified again is installed
+/// "already" (and its bytes are not touched); a directory there without the marker, with
+/// other bytes, or as a link is `release-differs` and left as it was. A new fetch is
+/// always fully verified first (the honest runner is asked every time).
+///
+/// Mutants seen red: the marker not required; the bytes not compared; a component missing
+/// from the directory taken as the same.
+#[test]
+fn an_existing_release_directory_is_the_same_release_or_a_refusal() {
+    let rig = Rig::new("existing");
+    let first = rig.activate(&honest()).expect("first");
+    assert!(!first.already_installed);
+    let runner = honest();
+    let again = rig.activate(&runner).expect("again");
+    assert!(again.already_installed);
+    assert_eq!(
+        programs(&runner),
+        ["gh", "kbf"],
+        "verified again, not skipped"
+    );
+    assert_eq!(fs::read_dir(rig.work()).expect("work").count(), 0);
+
+    let kbf = rig.release().join("kbf");
+    fs::write(&kbf, b"different bytes").expect("tamper");
+    let err = rig.activate(&honest()).expect_err("other bytes");
+    assert_eq!(err.code(), "release-differs");
+    assert_eq!(fs::read(&kbf).expect("kept"), b"different bytes");
+    assert_eq!(err.word(), None);
+
+    let rig = Rig::new("existing-nomarker");
+    fs::create_dir_all(rig.release()).expect("dir");
+    fs::write(rig.release().join("kbf"), elf(0x3e, "payload")).expect("bytes");
+    let err = rig.activate(&honest()).expect_err("no marker");
+    assert_eq!(err.code(), "release-differs");
+    assert!(!rig.release().join(VERIFIED).exists());
+
+    // The marker is there and the binary is not: still a different release.
+    let rig = Rig::new("existing-nofile");
+    fs::create_dir_all(rig.release()).expect("dir");
+    fs::write(rig.release().join(VERIFIED), b"").expect("marker");
+    let err = rig.activate(&honest()).expect_err("no binary");
+    assert_eq!(err.code(), "release-differs");
+
+    let rig = Rig::new("existing-link");
+    fs::create_dir_all(rig.release().parent().expect("parent")).expect("dir");
+    symlink("/", rig.release()).expect("link");
+    let err = rig.activate(&honest()).expect_err("a link");
+    assert_eq!(err.code(), "release-differs");
+}
+
+/// Catches a component set that is not the one ordered: a file missing, one fetched twice
+/// and one nobody ordered are each `fetch`.
+#[test]
+fn the_files_fetched_must_be_the_components_ordered() {
+    let rig = Rig::new("components");
+    let (locator, mut fetched) = rig.fetch(&tarball());
+    let extra = Received {
+        name: "kbf-daemon".to_owned(),
+        ..fetched.files[0].clone()
+    };
+    fetched.files.push(extra);
+    let err = rig
+        .verify(
+            &honest(),
+            OrderKind::Activate,
+            std::slice::from_ref(&locator),
+            Some(&facts()),
+            fetched,
+        )
+        .expect_err("extra");
+    assert_eq!(err.word(), Some("fetch"), "{err}");
+
+    let (locator, mut fetched) = rig.fetch(&tarball());
+    fetched.files.clear();
+    let err = rig
+        .verify(
+            &honest(),
+            OrderKind::Activate,
+            std::slice::from_ref(&locator),
+            Some(&facts()),
+            fetched,
+        )
+        .expect_err("missing");
+    assert!(err.to_string().contains("was not fetched"), "{err}");
+
+    let (locator, mut fetched) = rig.fetch(&tarball());
+    let again = fetched.files[0].clone();
+    fetched.files.push(again);
+    let err = rig
+        .verify(
+            &honest(),
+            OrderKind::Activate,
+            &[locator],
+            Some(&facts()),
+            fetched,
+        )
+        .expect_err("twice");
+    assert!(err.to_string().contains("twice"), "{err}");
+}
+
+/// Catches the trust list not being checked first: a `gh` that group or others may write
+/// ends the stage as `trust_chain` before any file of the download is opened.
+///
+/// Mutant seen red: the trust check dropped.
+#[test]
+fn an_untrusted_gh_ends_the_stage_first() {
+    let mut rig = Rig::new("trust");
+    let gh = HostPath::new(crate::fixtures::GH_PATH).expect("path");
+    if let Some(kbf_host::exec::Entry::File { perms, .. }) = rig.trust.entries.get_mut(&gh) {
+        *perms = kbf_host::step::Perms::new(0o775);
+    }
+    let runner = honest();
+    let err = rig.activate(&runner).expect_err("untrusted");
+    assert_eq!(err.word(), Some("trust_chain"), "{err}");
     assert!(runner.calls().is_empty());
 }
 
-/// Catches a release of two components (Linux: `kbf` and `kbf-daemon`) not being checked
-/// and installed whole: `gh` is asked for each tarball, each binary is run, both are
-/// installed and reported, the first one's version facts are the ones reported.
+/// Catches an attestation bundle over the cap being handed to `gh`: 256 KiB is the most.
 #[test]
-fn a_release_of_two_binaries_is_checked_and_installed_whole() {
-    let mut rig = Rig::new("stage-two", Platform::Linux);
-    write_inbox(
-        &rig.entry,
-        COMMIT,
-        &[
-            part("kbf", &elf(ELF_X86, "kbf build")),
-            part("kbf-daemon", &elf(ELF_X86, "daemon build")),
-        ],
-    );
-    let runner = FakeRunner::ok(COMMIT);
-    let staged = rig.stage(&runner).expect("staged");
-    assert_eq!(staged.components, ["kbf", "kbf-daemon"]);
-    let calls = runner.calls();
-    assert_eq!(calls.iter().filter(|c| is_gh(c)).count(), 2);
-    assert_eq!(calls.iter().filter(|c| is_staged_binary(c)).count(), 2);
-    let dir = format!("/usr/local/kbf/releases/{COMMIT}");
-    assert_eq!(
-        fs::read(rig.at(&format!("{dir}/kbf-daemon"))).expect("daemon"),
-        elf(ELF_X86, "daemon build")
-    );
-    assert!(staged.log.contains("also kbf-daemon ("), "{}", staged.log);
-}
-
-/// Catches the macOS layout: a stage on a Mac uses `/var/db/kbf-deploy` for the state and
-/// scratch directory and `/var/run/kbf-deploy.lock` for the lock, and never `/var/lib` or
-/// `/run`; the missing parents are made (`/usr/local`, the state directory) 0755 and the
-/// owner the stage was given; the release holds `kbf`.
-///
-/// Mutant seen red: the Linux paths used on a Mac (the lock's directory `/run` is not
-/// there, and the stage fails before anything is staged).
-#[test]
-fn a_mac_stage_uses_the_mac_layout_and_makes_its_missing_parents() {
-    let mut rig = Rig::new("stage-mac", Platform::MacOs);
-    write_inbox(
-        &rig.entry,
-        COMMIT,
-        &[part("kbf", &macho(MACHO_ARM, "daemon"))],
-    );
-    assert!(!rig.at("/usr/local").exists() && !rig.at("/var/db/kbf-deploy").exists());
-    let runner = FakeRunner::ok(COMMIT);
-    let staged = rig.stage(&runner).expect("staged");
-    assert_eq!(staged.components, ["kbf"]);
-
-    assert!(rig.at("/var/db/kbf-deploy/state.json").is_file());
-    assert!(rig.at("/var/run/kbf-deploy.lock").is_file());
-    assert!(!rig.at("/var/lib").exists());
-    assert!(!rig.at("/run").exists());
-    let me = me_owner();
-    for dir in [
-        "/usr/local",
-        "/var/db/kbf-deploy",
-        "/usr/local/kbf",
-        "/usr/local/kbf/releases",
-    ] {
-        let meta = fs::metadata(rig.at(dir)).expect(dir);
-        assert_eq!(meta.permissions().mode() & 0o7777, 0o755, "{dir}");
-        assert_eq!(
-            std::os::unix::fs::MetadataExt::uid(&meta),
-            me.uid,
-            "{dir} is the stage's owner's"
-        );
-    }
-    let binary = rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf"));
-    assert_eq!(
-        fs::read(binary).expect("installed"),
-        macho(MACHO_ARM, "daemon")
-    );
-    assert!(
-        !rig.at(&format!("/usr/local/kbf/releases/{COMMIT}/kbf-daemon"))
-            .exists()
-    );
-    assert_eq!(
-        rig.state()
-            .expect("state")
-            .staged
-            .as_ref()
-            .map(CommitId::as_str),
-        Some(COMMIT)
-    );
-}
-
-/// Catches a Mac stage taking a release built for the old darwin layout: the Mac's
-/// LaunchDaemon runs `current/kbf daemon`, and no `kbf-daemon` is built for darwin. An
-/// offer with only `kbf-daemon`, and one with `kbf` and `kbf-daemon`, are refused before
-/// any file is read or tool run (`offer-darwin-daemon`) and nothing is staged. A Linux host still takes `kbf-daemon`
-/// alone, as it always did, and a Mac takes `kbf` alone (the test above).
-///
-/// Mutants seen red: the platform rule dropped (the Mac stages the `kbf-daemon` release
-/// and no code is returned); the rule applied on Linux (the Linux stage is refused).
-#[test]
-fn a_mac_offer_may_not_name_kbf_daemon() {
-    let macho = macho(MACHO_ARM, "daemon");
-    let cases: [(&str, &[Part]); 2] = [
-        ("daemon-only", &[part("kbf-daemon", &macho)]),
-        ("both", &[part("kbf", &macho), part("kbf-daemon", &macho)]),
-    ];
-    for (name, parts) in cases {
-        let mut rig = Rig::new(&format!("stage-mac-offer-{name}"), Platform::MacOs);
-        write_inbox(&rig.entry, COMMIT, parts);
-        let runner = FakeRunner::ok(COMMIT);
-        let err = rig.stage(&runner).expect_err(name);
-        assert_eq!(err.code(), "offer-darwin-daemon", "{name}: {err}");
-        assert!(
-            runner.calls().is_empty(),
-            "{name}: no tool ran: {:?}",
-            runner.calls()
-        );
-        assert!(rig.releases().is_empty(), "{name}: nothing staged");
-    }
-
-    let mut rig = Rig::new("stage-linux-daemon-only", Platform::Linux);
-    write_inbox(
-        &rig.entry,
-        COMMIT,
-        &[part("kbf-daemon", &elf(ELF_X86, "daemon build"))],
-    );
-    let staged = rig.stage(&FakeRunner::ok(COMMIT)).expect("linux staged");
-    assert_eq!(staged.components, ["kbf-daemon"]);
-}
-
-/// Catches the macOS checks being skipped or run out of order: for each offered file
-/// `xattr` is asked before anything is copied; `gh` before `codesign`; `codesign
-/// --verify` and `--display` before the binary is run; and a release with a quarantined
-/// file or a signature that is not CI's is refused, with the later programs not run.
-///
-/// Mutants seen red: the quarantine check dropped (a quarantined tarball is staged);
-/// the signature check dropped (a binary with other flags is staged).
-#[test]
-fn the_mac_checks_run_in_order_and_each_refuses() {
-    let program = |s: &Spawn| {
-        s.program
-            .file_name()
-            .expect("name")
-            .to_string_lossy()
-            .into_owned()
-    };
-    let mut rig = Rig::new("stage-mac-order", Platform::MacOs);
-    write_inbox(
-        &rig.entry,
-        COMMIT,
-        &[part("kbf", &macho(MACHO_ARM, "daemon"))],
-    );
-    let runner = FakeRunner::ok(COMMIT);
-    rig.stage(&runner).expect("staged");
-    let order: Vec<String> = runner.calls().iter().map(program).collect();
-    assert_eq!(
-        order,
-        ["xattr", "xattr", "gh", "codesign", "codesign", "kbf"]
-    );
-    let xattr = &runner.calls()[0];
-    assert!(
-        xattr
-            .args
-            .iter()
-            .any(|a| a.to_str().is_some_and(|a| a.ends_with("kbf.tar.gz")))
-    );
-
-    let mut rig = Rig::new("stage-mac-quarantine", Platform::MacOs);
-    write_inbox(
-        &rig.entry,
-        COMMIT,
-        &[part("kbf", &macho(MACHO_ARM, "daemon"))],
-    );
-    let quarantined = FakeRunner::new(|s| {
-        Ok(if s.program.ends_with("xattr") {
-            ran(0, "0081;5f;Safari;\n", "")
-        } else {
-            play(s, COMMIT, "release")
-        })
-    });
-    let err = rig.stage(&quarantined).expect_err("quarantined");
-    assert_eq!(err.code(), "quarantined");
-    assert_eq!(quarantined.calls().len(), 1, "stopped at the first file");
-    assert!(rig.releases().is_empty());
-
-    let mut rig = Rig::new("stage-mac-signature", Platform::MacOs);
-    write_inbox(
-        &rig.entry,
-        COMMIT,
-        &[part("kbf", &macho(MACHO_ARM, "daemon"))],
-    );
-    let unsigned = FakeRunner::new(|s| {
-        let verify = s.program.ends_with("codesign") && s.args[0] == "--verify";
-        Ok(if verify {
-            ran(1, "", "not signed")
-        } else {
-            play(s, COMMIT, "release")
-        })
-    });
-    let err = rig.stage(&unsigned).expect_err("unsigned");
-    assert_eq!(err.code(), "signature-invalid");
-    assert!(unsigned.calls().iter().all(|c| !is_staged_binary(c)));
-    assert!(rig.releases().is_empty());
-}
-
-/// Catches the Mac checks running on Linux: nothing asks `xattr` or `codesign` there.
-#[test]
-fn the_mac_tools_are_not_run_on_linux() {
-    let mut rig = Rig::new("stage-linux-no-mac-tools", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    let runner = FakeRunner::ok(COMMIT);
-    rig.stage(&runner).expect("staged");
-    assert!(
-        runner
-            .calls()
-            .iter()
-            .all(|c| !c.program.ends_with("xattr") && !c.program.ends_with("codesign"))
-    );
-}
-
-/// Catches the scratch directory's handling: a directory a crashed stage left is not
-/// touched and not reused; the stage's own is removed after a success and after a
-/// refusal; and a scratch directory that cannot be made is a refusal of its own, not a
-/// panic.
-#[test]
-fn the_scratch_directory_is_fresh_removed_and_its_failure_a_refusal() {
-    let mut rig = Rig::new("stage-work", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    let work = rig.at(&rig.host.work_dir().to_string());
-    let pid = std::process::id();
-    for n in 0..2 {
-        fs::create_dir_all(work.join(format!("stage.{pid}.{n}"))).expect("left behind");
-    }
-    rig.stage(&FakeRunner::ok(COMMIT)).expect("staged");
-    let mut left = rig.work_leftovers();
-    left.sort();
-    assert_eq!(left, [format!("stage.{pid}.0"), format!("stage.{pid}.1")]);
-
-    // The work directory cannot be written: the stage's directory cannot be made.
-    fs::set_permissions(&work, fs::Permissions::from_mode(0o555)).expect("read-only");
-    let err = rig.stage(&FakeRunner::ok(COMMIT)).expect_err("cannot make");
-    assert_eq!(err.code(), "work-dir");
-    fs::set_permissions(&work, fs::Permissions::from_mode(0o755)).expect("restore");
-
-    // A file where the state directory should be: not even the parent can be made.
-    let mut rig = Rig::new("stage-work-file", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    fs::write(rig.at("/var/lib/kbf-deploy"), b"a file").expect("seed");
-    assert_eq!(code(rig.stage(&FakeRunner::ok(COMMIT))), "work-dir");
-}
-
-/// Catches a failing install being read as a staged release: a file where the release
-/// directory's parent should be makes the copy fail, and the stage reports that as an
-/// install failure, with nothing recorded as staged.
-#[test]
-fn a_failing_install_is_reported_and_records_nothing() {
-    let mut rig = Rig::new("stage-install-fails", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    fs::write(rig.at("/usr/local/kbf"), b"a file").expect("seed");
+fn an_oversize_attestation_bundle_is_refused_before_gh() {
+    let rig = Rig::new("bundle");
+    let (mut locator, fetched) = rig.fetch(&tarball());
+    locator.attestation = "x".repeat(BUNDLE_CAP as usize + 1);
+    let runner = honest();
     let err = rig
-        .stage(&FakeRunner::ok(COMMIT))
-        .expect_err("cannot install");
-    assert_eq!(err.code(), "install-failed");
-    assert_eq!(rig.state(), None);
-    assert_eq!(rig.work_leftovers(), Vec::<String>::new());
+        .verify(
+            &runner,
+            OrderKind::Activate,
+            &[locator],
+            Some(&facts()),
+            fetched,
+        )
+        .expect_err("big");
+    assert_eq!(err.word(), Some("size"));
+    assert!(runner.calls().is_empty());
 }
 
-/// Catches the public entry point differing from the hooked one: with no hooks it stages
-/// the same release.
+/// Runs the stand-in program for the program the stage asks to run, for real (so the
+/// bounds are the real ones), and records what was asked.
+struct Stub {
+    gh: Option<(PathBuf, Vec<String>)>,
+    probe: Option<(PathBuf, Vec<String>)>,
+    seen: RefCell<Vec<Spawn>>,
+}
+
+impl Runner for Stub {
+    fn run(&self, spawn: &Spawn) -> io::Result<Ran> {
+        self.seen.borrow_mut().push(spawn.clone());
+        let is_gh = spawn.program.file_name().is_some_and(|n| n == "gh");
+        let stub = if is_gh { &self.gh } else { &self.probe };
+        match stub {
+            Some((program, args)) => SystemRunner.run(&Spawn {
+                program: program.clone(),
+                args: args.iter().map(Into::into).collect(),
+                ..spawn.clone()
+            }),
+            None if is_gh => Ok(ran(0, "", "")),
+            None => Ok(ran(0, &version_json(COMMIT, "release"), "")),
+        }
+    }
+}
+
+/// A long sleep that carries `marker` in its arguments, so that the test can tell it from
+/// every other process: a stand-in for a program that never returns.
+fn hanging_sleep(marker: &str) -> (PathBuf, Vec<String>) {
+    (PathBuf::from("/bin/sleep"), vec![format!("300.{marker}")])
+}
+
+/// Whether no process is left whose arguments carry `marker` (the sleep was killed).
+fn gone(marker: &str) -> bool {
+    for _ in 0..200 {
+        let found = std::process::Command::new("/usr/bin/pgrep")
+            .args(["-f", &format!("300.{marker}")])
+            .output()
+            .expect("pgrep runs");
+        if found.stdout.is_empty() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// Catches an unbounded step: a `gh` that never returns, and a binary whose
+/// `--version --json` never returns, are killed with their whole process group at their
+/// own limit (here 300 ms in place of 120 s and 10 s), and the stage ends as `attestation`
+/// and `facts`, in seconds, installing nothing. The stand-in (a long `sleep`) is dead too;
+/// that a program's whole group is killed is `run`'s test.
+///
+/// Mutants seen red: the policy's limit not passed to `gh`; not passed to the probe.
 #[test]
-fn the_entry_point_without_hooks_stages_the_release() {
-    let mut rig = Rig::new("stage-entry", Platform::Linux);
-    rig.kbf(&elf(ELF_X86, "kbf build"));
-    let runner = FakeRunner::ok(COMMIT);
-    let mut ctx = Context {
-        host: &rig.host,
-        settings: &rig.settings,
-        exec: &mut rig.exec,
-        trust: &rig.trust,
-        runner: &runner,
-        owner: me_owner(),
-        limits: Limits::DEFAULT,
-    };
-    let staged = stage_from_inbox(&mut ctx, &rig.entry).expect("staged");
-    assert_eq!(staged.commit.as_str(), COMMIT);
+fn a_hanging_gh_and_a_hanging_binary_are_killed_at_their_limits() {
+    for (who, word) in [("gh", "attestation"), ("probe", "facts")] {
+        let mut rig = Rig::new(&format!("hang-{who}"));
+        rig.policy.timeouts.gh = Duration::from_millis(300);
+        rig.policy.timeouts.probe = Duration::from_millis(300);
+        let marker = format!(
+            "{}{}",
+            std::process::id(),
+            rig.dir.display().to_string().len()
+        );
+        let stand_in = hanging_sleep(&marker);
+        let stub = Stub {
+            gh: (who == "gh").then(|| stand_in.clone()),
+            probe: (who == "probe").then_some(stand_in),
+            seen: RefCell::default(),
+        };
+        let started = Instant::now();
+        let err = rig.activate(&stub).expect_err(who);
+        assert_eq!(err.word(), Some(word), "{who}: {err}");
+        assert!(matches!(err, Refusal::TimedOut { .. }), "{who}: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{who} was bounded"
+        );
+        assert!(gone(&marker), "{who}: the stand-in is dead");
+        rig.assert_nothing_installed();
+    }
+}
+
+/// Catches the unpack taking the whole budget of the stage: an extraction given no time
+/// ends as `shape`; the 120 s default is the one the pipeline passes.
+#[test]
+fn an_extraction_out_of_time_is_a_shape_refusal() {
+    let mut rig = Rig::new("extract-time");
+    rig.policy.timeouts.extract = Duration::ZERO;
+    let runner = honest();
+    let err = rig.activate(&runner).expect_err("no time");
+    assert_eq!(err.word(), Some("shape"), "{err}");
+    assert_eq!(err.code(), "archive-timeout");
+    assert_eq!(programs(&runner), ["gh"]);
+    rig.assert_nothing_installed();
+    assert_eq!(Timeouts::DEFAULT.extract, Duration::from_secs(120));
+}
+
+/// Catches a partial directory that is not made as the contract says (0755, with `dl/`
+/// 0700, owned as asked), a stale one being silently reused, and one left behind when the
+/// holder is dropped.
+#[test]
+fn the_partial_directory_is_made_whole_and_removed_when_dropped() {
+    let rig = Rig::new("partial");
+    let partial = Partial::create(&rig.host, &commit(), owner()).expect("made");
+    assert_eq!(mode_of_dir(partial.path()), 0o755);
+    assert_eq!(mode_of_dir(&partial.dl()), 0o700);
+    assert!(partial.path().ends_with(format!("{COMMIT}.partial")));
+    let again = Partial::create(&rig.host, &commit(), owner()).expect_err("stale is refused");
+    assert_eq!(again.code(), "work-dir");
+    // The refused second holder removed nothing of the first's.
+    assert!(partial.dl().is_dir());
+    let path = partial.path().to_owned();
+    drop(partial);
+    assert!(!path.exists());
 }

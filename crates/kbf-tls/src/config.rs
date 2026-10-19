@@ -181,3 +181,59 @@ pub(crate) fn build(
         not_after,
     })
 }
+
+/// A server configuration for a listener that asks every client for a certificate but does
+/// not insist on one (the frontend proxy: a build node presents its certificate, a Buck2 or
+/// operator client need not).
+///
+/// - A client that presents no certificate is served; it is anonymous.
+/// - A client that presents one is verified against `client_ca_pem` (chain and client-auth
+///   usage), and one that fails is a handshake error, never anonymous. With TLS 1.3 the
+///   client's own handshake completes first; the refusal reaches it as an alert on its
+///   first read.
+/// - ALPN offers `h2` then `http/1.1`; the ring provider and the safe default protocol
+///   versions, as [`TlsSource`](crate::TlsSource); early data is off.
+///
+/// `reject_expired` refuses a leaf whose validity has ended (a reload does; the first load
+/// does not, as a server has always started with the certificate it was given).
+///
+/// # Errors
+/// [`TlsError`]: the PEM is not what it must be, the key is not the leaf's, the CA bundle
+/// holds no usable certificate, or the leaf has expired and `reject_expired` is set.
+pub fn server_config_optional_client(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    client_ca_pem: &[u8],
+    reject_expired: bool,
+) -> Result<Arc<ServerConfig>, TlsError> {
+    let (cert_path, key_path, ca_path) = (
+        PathBuf::from("<certificate>"),
+        PathBuf::from("<key>"),
+        PathBuf::from("<client CA>"),
+    );
+    let chain = certificates(&cert_path, cert_pem)?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| pem_error(&key_path, e))?;
+    let (not_after, expired) = validity(&chain[0], &cert_path)?;
+    if reject_expired && expired {
+        return Err(TlsError::Expired { not_after });
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = RootCertStore::empty();
+    roots.add_parsable_certificates(certificates(&ca_path, client_ca_pem)?);
+    let verifier =
+        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
+            .allow_unauthenticated()
+            .build()
+            .map_err(|e| pem_error(&ca_path, format!("no usable CA certificate: {e}")))?;
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .and_then(|builder| {
+            builder
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(chain, key)
+        })
+        .map_err(|e| TlsError::Config(e.to_string()))?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.max_early_data_size = 0;
+    Ok(Arc::new(config))
+}

@@ -8,7 +8,7 @@ pub fn golden_plist(sha12: &str) -> String {
 
 /// The golden property list with `UserName` and `GroupName` set to `user`, or without
 /// them (a job launchd runs as root) for `None`.
-pub fn golden_plist_as(sha12: &str, user: Option<&str>) -> String {
+pub fn golden_plist_as(_sha12: &str, user: Option<&str>) -> String {
     let user = user.map_or_else(String::new, |u| {
         format!("\t<key>UserName</key>\n\t<string>{u}</string>\n\t<key>GroupName</key>\n\t<string>{u}</string>\n")
     });
@@ -21,30 +21,10 @@ pub fn golden_plist_as(sha12: &str, user: Option<&str>) -> String {
 	<string>org.example.kbf-daemon</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/kbf/current/kbf</string>
-		<string>daemon</string>
-		<string>--driver</string>
-		<string>native</string>
-		<string>--server</string>
-		<string>https://farm.example.net:8981</string>
-		<string>--cas</string>
-		<string>https://farm.example.net:8981</string>
-		<string>--ca-cert</string>
-		<string>/usr/local/kbf/etc/ca.pem</string>
-		<string>--cert</string>
-		<string>/usr/local/kbf/etc/node.pem</string>
-		<string>--key</string>
-		<string>/usr/local/kbf/etc/node.key</string>
-		<string>--node-id</string>
-		<string>kbf-mac-07</string>
-		<string>--data-dir</string>
-		<string>/Volumes/kbf/data</string>
-		<string>--label</string>
-		<string>profile=mac-arm64-test@{sha12}</string>
-		<string>--label</string>
-		<string>pool=mac</string>
-		<string>--label</string>
-		<string>rack=r2</string>
+		<string>/usr/local/kbf-installer/releases/current/kbf</string>
+		<string>--mode=daemon</string>
+		<string>--config</string>
+		<string>/usr/local/etc/kbf/kbf.toml</string>
 	</array>
 {user}	<key>RunAtLoad</key>
 	<true/>
@@ -70,6 +50,31 @@ pub fn golden_plist_as(sha12: &str, user: Option<&str>) -> String {
 	</dict>
 </dict>
 </plist>
+"#
+    )
+}
+
+/// The golden `kbf.toml` of the test profile: written by hand, not by the renderer, so a
+/// key, a table or a value the renderer gets wrong differs from it. Each key is in the
+/// table of kbf-cli's `GROUPS` for the flag of that name.
+pub fn golden_config(sha12: &str) -> String {
+    format!(
+        r#"# Written by kbf-mac-provision from its profile; `apply` puts it back if it is edited.
+# One table per flag group, one key per flag long name (kbf-cli, config.rs).
+mode = "daemon"
+
+[identity]
+server = "https://farm.example.net:8981"
+cas = "https://farm.example.net:8981"
+ca-cert = "/usr/local/kbf/etc/ca.pem"
+cert = "/usr/local/kbf/etc/node.pem"
+key = "/usr/local/kbf/etc/node.key"
+node-id = "kbf-mac-07"
+label = ["profile=mac-arm64-test@{sha12}", "pool=mac", "rack=r2"]
+
+[daemon]
+driver = ["native"]
+data-dir = "/Volumes/kbf/data"
 "#
     )
 }

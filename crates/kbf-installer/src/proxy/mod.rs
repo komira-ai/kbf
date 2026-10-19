@@ -6,7 +6,9 @@
 //! side) and for an all-in-one host (stop, hold, start); recovery after a proxy restart
 //! ([`Swap::adopt`]); the operator's rollback; the retire rule; and [`FileRecorder`], the
 //! fsynced `update.json`. What is not: the proxy itself, the real child control and the
-//! orders spool (U4b, U7b), the update API ([`api`], U8a).
+//! orders spool (U4b, U7b), the update API ([`api`], U8a). [`child_http`] is the blocking
+//! loopback client that the real child control and the fleet read will call a child's
+//! ports with (U8b); nothing calls it yet.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -39,11 +41,23 @@
 //!   with `failure.step == confirm`. After the switch no failure drops the staged release.
 //! - **All-in-one stop**: after `quiesce`, the proxy sends SIGTERM to the old process
 //!   ([`aio`]).
-//! - A dead new child during the bake leaves the update parked in `baking` (red) until the
-//!   operator rolls back; the proxy-supervised respawn with an epoch bump is U7b.
+//! - A dead new child during the bake (the proxy running) leaves the update parked in
+//!   `baking` (red) until the operator rolls back; the proxy-supervised respawn with an
+//!   epoch bump is U7b.
+//! - **Restart reconcile** ([`recover`]): retire never signals the recorded-active slot,
+//!   so a restart past the switch first checks that slot. If the new child is dead (or
+//!   not ours any more: a recycled pid) or does not hold the generation while the old
+//!   child lives, the switch failed: `rolling_back` and `failure{step: switch}` are
+//!   recorded before either child is touched, the old child resumes, and retire runs on
+//!   the other one (a dead child needs no signal; a live one gets SIGTERM once idle,
+//!   never SIGKILL). The update ends `failed` at `switch`, not `rolled_back`, which is the
+//!   operator's answer. If both children are dead the recorded-active release is spawned
+//!   again, takes the generation (no live holder, so the child bumps the epoch) and is
+//!   recorded. A live child that does not answer `role` is not reconciled.
 
 mod aio;
 pub mod api;
+pub mod child_http;
 pub mod model;
 pub mod ports;
 pub mod record;
@@ -54,9 +68,15 @@ mod swap;
 #[cfg(test)]
 mod aio_tests;
 #[cfg(test)]
+mod child_http_tests;
+#[cfg(test)]
+mod confirm_boundary_tests;
+#[cfg(test)]
 mod fakes;
 #[cfg(test)]
 mod fault_tests;
+#[cfg(test)]
+mod reconcile_tests;
 #[cfg(test)]
 mod record_tests;
 #[cfg(test)]

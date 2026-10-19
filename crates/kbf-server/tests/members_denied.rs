@@ -17,7 +17,8 @@ use kbf_map::{DenyEntry, MemberId, MemberState};
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
-use kbf_server::{EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
+use kbf_server::proxy_auth::ProxySecret;
+use kbf_server::{Behind, EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_options};
 use kbf_state::Store;
 use kbf_storage::service::ROLE_URI_PREFIX;
 use kbf_tls::TlsSource;
@@ -169,6 +170,11 @@ fn listeners(worker_tls: WorkerTls) -> Listeners {
 /// store behind it with its clock, and another frontend over the same store (the
 /// operator's side: it writes the deny list and refreshes the map).
 fn frontend(pki: &Pki) -> (SocketAddr, Arc<Hooked>, Members) {
+    frontend_behind(pki, None)
+}
+
+/// [`frontend`], behind a proxy when `proxy` is set.
+fn frontend_behind(pki: &Pki, proxy: Option<Behind>) -> (SocketAddr, Arc<Hooked>, Members) {
     let store = Hooked::new();
     let state = StateStore {
         store: Arc::clone(&store) as Arc<dyn Store>,
@@ -176,12 +182,15 @@ fn frontend(pki: &Pki) -> (SocketAddr, Arc<Hooked>, Members) {
         members: config(),
         history: None,
     };
-    let bound = bind_server_with_state(
+    let bound = bind_server_with_options(
         Arc::new(Cache::memory()),
         listeners(pki.worker_tls()),
         None,
         kbf_auth::Policy::allow_all(),
         Some(state),
+        None,
+        None,
+        proxy,
         std::future::pending::<()>(),
     )
     .expect("binds");
@@ -330,4 +339,52 @@ async fn a_denied_member_is_refused_its_beats_and_goes_down_when_its_row_lapses(
         .await
         .expect_err("A is still denied");
     assert_eq!(refused.code(), Code::PermissionDenied);
+}
+
+/// Catches a worker listener with mutual TLS that ignores `--proxy-auth-file`: its proxy
+/// layer must read the secret even though a certificate is also there, so a call that
+/// presents the secret with a role that is not a role is refused `PERMISSION_DENIED` before
+/// `Register` reads it, and one the proxy vouched for as the certificate's own node and
+/// role registers.
+///
+/// Mutant seen red: the mutual-TLS arm of `worker_peers` built with `ProxyAuthLayer::new(None)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flagged_mutual_tls_worker_listener_still_reads_the_proxys_word() {
+    const SECRET: [u8; 32] = [0x77; 32];
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("members-denied-secret");
+    std::fs::write(&path, SECRET).expect("write");
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("chmod");
+    let secret = Arc::new(ProxySecret::from_file(&path).expect("a usable secret"));
+    let pki = Pki::new();
+    let (worker, _store, _ops) = frontend_behind(
+        &pki,
+        Some(Behind {
+            secret,
+            deny_list: None,
+        }),
+    );
+    let mut node = pki.node(worker, "node-a", 1).await;
+    let registration = node.registration();
+    let call = |role: &str| {
+        let mut request = tonic::Request::new(registration.clone());
+        let meta = request.metadata_mut();
+        meta.insert(
+            "x-kbf-proxy-auth",
+            hex::encode(SECRET).parse().expect("a value"),
+        );
+        meta.insert("x-kbf-node-id", "node-a".parse().expect("a value"));
+        meta.insert("x-kbf-role", role.parse().expect("a value"));
+        request
+    };
+    let refused = node.client.register(call("admin")).await;
+    assert_eq!(
+        refused.expect_err("a malformed role").code(),
+        Code::PermissionDenied
+    );
+    let request = call("storage");
+    node.client
+        .register(request)
+        .await
+        .expect("the proxy vouched for node-a as storage");
 }

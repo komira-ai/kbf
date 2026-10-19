@@ -18,6 +18,7 @@ use kbf_proto::worker::{NodeStatus, ServerMessage, XcodeState, XcodeStatus, daem
 use kbf_server::api::{DRAIN_DEADLINE, Write, write_request};
 use kbf_server::farm::NodeAction;
 use kbf_server::fleet::SoftwareView;
+use kbf_server::proxy_auth::Caller;
 use kbf_server::token::ApiToken;
 use kbf_server::{
     Api, BUILD_COMMIT, Farm, Listeners, SERVER_VERSION, ServeError, bind_server_with_api,
@@ -254,7 +255,10 @@ const NOT_READY: &str = "Xcode 16B40 (/Applications/Xcode_16.1.app) installed bu
 /// of `null`, an older status kept over a newer one, a node still listed as connected
 /// after its stream ended, an installed Xcode that is not ready missing from
 /// `xcodes` or from `needs_attention` (issue #164), and a node's pinned container
-/// images (`NodeStatus.container_images`) not listed as `software.container_images`.
+/// images (`NodeStatus.container_images`) not listed as `software.container_images`;
+/// a node's `protocol` other than the version its `Hello` named, through the real worker
+/// service, and an envelope without `oldest_protocol` and `protocol_unknown` at its top
+/// level.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_nodes_lists_each_nodes_newest_software() {
     let server = start();
@@ -266,7 +270,8 @@ async fn get_nodes_lists_each_nodes_newest_software() {
     );
     assert_eq!(
         nodes(api).await,
-        json!({ "server": this_build, "nodes": [] })
+        json!({ "server": this_build, "nodes": [],
+                "oldest_protocol": null, "protocol_unknown": 0 })
     );
 
     let before = now_ms();
@@ -308,7 +313,7 @@ async fn get_nodes_lists_each_nodes_newest_software() {
     assert_eq!(
         got,
         json!({ "server": this_build, "nodes": [
-            { "node_id": "linux-1", "connected": true, "software": {
+            { "node_id": "linux-1", "connected": true, "protocol": 1, "software": {
                 "os_name": "Ubuntu", "os_version": "24.04", "os_build": "",
                 "kernel": "6.8.0-45-generic", "daemon_version": "0.1.0",
                 "xcode_builds": [], "xcodes": [],
@@ -317,7 +322,7 @@ async fn get_nodes_lists_each_nodes_newest_software() {
               "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" } },
-            { "node_id": "mac-1", "connected": true, "software": {
+            { "node_id": "mac-1", "connected": true, "protocol": 1, "software": {
                 "os_name": "macOS", "os_version": "15.1", "os_build": "24B83",
                 "kernel": "", "daemon_version": "0.1.0",
                 "xcode_builds": ["16C5032a"],
@@ -332,12 +337,12 @@ async fn get_nodes_lists_each_nodes_newest_software() {
               "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" } },
-            { "node_id": "old-1", "connected": true, "software": null,
+            { "node_id": "old-1", "connected": true, "protocol": 1, "software": null,
               "needs_attention": [],
               "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" } },
-        ] })
+        ], "oldest_protocol": 1, "protocol_unknown": 0 })
     );
 
     linux.send(daemon_message::Message::NodeStatus(linux_status(
@@ -731,9 +736,9 @@ fn writes_are_accepted_only_from_loopback() {
     let token = token();
     let headers = headers(&[("authorization", &format!("Bearer {TOKEN}")), JSON]);
     let write = |peer: &str, target: &'static str, body: &'static [u8]| {
-        let peer: SocketAddr = peer.parse().expect("an address");
+        let peer = Caller::direct(peer.parse().expect("an address"));
         let request = Write {
-            peer,
+            peer: &peer,
             headers: &headers,
             target,
             body,
@@ -793,8 +798,9 @@ fn a_write_passes_every_gate_or_is_refused() {
     let bearer = format!("Bearer {TOKEN}");
     let check = |token: Option<&ApiToken>, pairs: &[(&str, &str)]| {
         let headers = headers(pairs);
+        let peer = Caller::direct("127.0.0.1:4000".parse().expect("an address"));
         let request = Write {
-            peer: "127.0.0.1:4000".parse().expect("an address"),
+            peer: &peer,
             headers: &headers,
             target: "mac-1:cordon",
             body: b"",
