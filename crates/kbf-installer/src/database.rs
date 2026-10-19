@@ -6,7 +6,8 @@
 //! Where the database is: the `database` key of `installer.toml`, a `postgres://` URL
 //! (`postgres:///kbf?host=/run/postgresql`). The file is world-readable, so a URL that
 //! carries a password is refused; peer authentication needs none. This module reads that
-//! one key and leaves the others to their own readers. No message here quotes the URL.
+//! one key and leaves the others to their own readers. No message here quotes the URL, and a server's refusal of
+//! the connection is reduced to its SQLSTATE (the server's text quotes role and database).
 //!
 //! The migrations are the ones embedded in this installer build. An update needs schema
 //! `state_schema` (what the staged release's `--version --json` says); the installer runs

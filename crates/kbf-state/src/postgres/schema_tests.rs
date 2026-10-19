@@ -1,7 +1,13 @@
 //! The migration lint and the embedded set. No database: the tests that need a server are
 //! `tests/postgres_schema.rs`.
 
-use super::{Kind, MIN_SUPPORTED, Migration, SchemaError, Supported, embedded, judge, latest};
+use std::time::Duration;
+
+use super::{
+    CONNECT_LIMIT, Kind, MIN_SUPPORTED, Migration, SchemaError, Supported, connect_settings,
+    embedded, judge, latest,
+};
+use crate::postgres::PostgresConfig;
 
 fn expand(body: &str) -> Result<Migration, SchemaError> {
     Migration::new(2, "t", &format!("-- kbf-migration: expand\n{body}"))
@@ -317,4 +323,22 @@ fn alter_type_beside_create_is_not_a_type_change_and_nested_updates_are_refused(
 #[test]
 fn a_unique_index_on_a_table_with_a_quoted_name_is_refused() {
     assert!(expand("CREATE TABLE \"q\" (a int);\nCREATE UNIQUE INDEX i ON \"q\" (a);").is_err());
+}
+
+/// Catches a bounded call that can wait for ever on a server that accepts the connection
+/// and never answers: the bounded call carries a connect timeout of exactly 10 s, and an
+/// unbounded call (`apply`) carries none.
+///
+/// Mutants seen red: the `connect_timeout` call removed; `CONNECT_LIMIT` made 3000 s; the
+/// bound applied to the unbounded call.
+#[test]
+fn a_bounded_call_connects_with_the_limit_and_an_unbounded_one_does_not() {
+    let config = PostgresConfig::parse("postgres:///kbf?host=/run/postgresql").expect("parses");
+    assert_eq!(CONNECT_LIMIT, Duration::from_secs(10));
+    let bounded = connect_settings(&config.pg, Some(Duration::from_secs(1)));
+    assert_eq!(bounded.get_connect_timeout(), Some(&CONNECT_LIMIT));
+    assert_eq!(
+        connect_settings(&config.pg, None).get_connect_timeout(),
+        None
+    );
 }

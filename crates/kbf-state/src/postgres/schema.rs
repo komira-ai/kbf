@@ -175,7 +175,8 @@ impl Supported {
 }
 
 /// Why the schema was refused, or could not be read or changed. Each message is one line
-/// and never carries the connection URL.
+/// and never carries the connection URL, and a server's refusal of the connection is
+/// reduced to its SQLSTATE (`describe_refusal`), so it names no role, database or host.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SchemaError {
     /// No `schema_version` rows.
@@ -300,7 +301,24 @@ pub enum SchemaError {
 
 impl From<postgres::Error> for SchemaError {
     fn from(err: postgres::Error) -> SchemaError {
-        SchemaError::Database(describe(&err))
+        SchemaError::Database(describe_refusal(&err))
+    }
+}
+
+/// What the server said, for a schema error. Unlike [`describe`], which the store keeps for
+/// its own paths, a server's FATAL (a connection refused: `role "x" does not exist`,
+/// `database "y" does not exist`, a `pg_hba` rejection that quotes host, user and database)
+/// is reduced to a fixed phrase and its SQLSTATE, because these errors end up in
+/// `failure.reason`, which is shown to operators and written to `update.json`. Other
+/// server errors keep their text: they name tables and statements of the migration, not
+/// the connection.
+fn describe_refusal(err: &postgres::Error) -> String {
+    match err.as_db_error() {
+        Some(db) if db.severity() == "FATAL" || db.severity() == "PANIC" => format!(
+            "the server refused the connection or ended the session (SQLSTATE {})",
+            db.code().code()
+        ),
+        _ => describe(err),
     }
 }
 
@@ -716,6 +734,16 @@ pub fn apply_within(
 /// The longest [`apply_within`] waits to reach the server.
 pub const CONNECT_LIMIT: Duration = Duration::from_secs(10);
 
+/// How a call connects: a bounded call (`lock_wait` given) gives up reaching the server
+/// after [`CONNECT_LIMIT`], an unbounded one waits as the operating system lets it.
+fn connect_settings(pg: &postgres::Config, lock_wait: Option<Duration>) -> postgres::Config {
+    let mut settings = pg.clone();
+    if lock_wait.is_some() {
+        settings.connect_timeout(CONNECT_LIMIT);
+    }
+    settings
+}
+
 fn apply_with(
     config: &PostgresConfig,
     set: &[Migration],
@@ -731,11 +759,7 @@ fn apply_with(
         });
     }
     let schema = config.schema.as_str();
-    let mut pg = config.pg.clone();
-    if lock_wait.is_some() {
-        pg.connect_timeout(CONNECT_LIMIT);
-    }
-    let mut conn = Conn::connect(&pg)?;
+    let mut conn = Conn::connect(&connect_settings(&config.pg, lock_wait))?;
     require_durable(&mut conn)?;
     let have = rows(&mut conn, schema)?;
     contiguous(&have)?;
@@ -826,7 +850,7 @@ fn run_in_transaction(
         return Err(SchemaError::Failed {
             version: m.version,
             name: m.name.clone(),
-            why: format!("{}{hint}", describe(&err)),
+            why: format!("{}{hint}", describe_refusal(&err)),
         });
     }
     conn.execute(

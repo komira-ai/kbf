@@ -20,11 +20,15 @@
 //! - **The credential.** The database is the one `installer.toml` names, as the role in
 //!   that URL; the URL carries no password (`Database::from_installer_toml` refuses one),
 //!   so there is no secret to leak, and no message here quotes the URL. A connection that
-//!   fails says so in fixed words.
+//!   fails says so in fixed words, and a server's refusal of the connection (`FATAL: role
+//!   "x" does not exist`, a `pg_hba` rejection) is reduced to its SQLSTATE, because the
+//!   server's text quotes the role, database and host: the refusal reads
+//!   `database_error: ... (SQLSTATE 28000)`. Server text about a migration's own
+//!   statements (a table that does not exist) is kept: it names the migration's objects.
 
 use std::time::Duration;
 
-use kbf_state::postgres::schema::SchemaError;
+use kbf_state::postgres::schema::{Outcome, SchemaError};
 
 use crate::CommitId;
 use crate::database::Database;
@@ -101,7 +105,12 @@ pub struct DbMigrator<'a> {
     db: Database,
     orders: &'a dyn RootOrders,
     lock_wait: Duration,
+    apply: Apply<'a>,
 }
+
+/// What runs the migrations: the database, the schema wanted and the lock wait. A seam so
+/// that a test sees which bounds are handed over.
+type Apply<'a> = Box<dyn Fn(&Database, u32, Duration) -> Result<Outcome, SchemaError> + 'a>;
 
 impl<'a> DbMigrator<'a> {
     /// The longest any lock is waited for: another installer's migration is seconds, and a
@@ -115,7 +124,15 @@ impl<'a> DbMigrator<'a> {
             db,
             orders,
             lock_wait: Self::LOCK_WAIT,
+            apply: Box::new(Database::migrate_within),
         }
+    }
+
+    /// Runs `apply` instead of the database, to see what it is handed.
+    #[cfg(test)]
+    pub(super) fn with_apply(mut self, apply: Apply<'a>) -> DbMigrator<'a> {
+        self.apply = apply;
+        self
     }
 
     /// Waits for a lock at most `wait` (a test shortens it).
@@ -138,8 +155,7 @@ impl<'a> DbMigrator<'a> {
 impl Migrator for DbMigrator<'_> {
     fn migrate_forward(&self, release: &CommitId) -> Result<(), PortError> {
         let schema = self.needs(release)?;
-        self.db
-            .migrate_within(schema, self.lock_wait)
+        (self.apply)(&self.db, schema, self.lock_wait)
             .map(drop)
             .map_err(|e| Refusal::of(&e).because(e))
     }

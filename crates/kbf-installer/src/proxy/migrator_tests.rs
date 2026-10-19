@@ -160,6 +160,43 @@ fn an_unreachable_database_is_refused_without_the_url_in_any_message() {
     }
 }
 
+/// Catches the bounds not reaching the migration: a swap that waits for a lock as long as
+/// the day. The default wait handed to the schema code is exactly 30 s, a configured one
+/// is passed as it is, and the schema is the staged release's.
+///
+/// Mutants seen red: `LOCK_WAIT` made 3000 s; `with_lock_wait` ignored.
+#[test]
+fn the_lock_wait_is_handed_to_the_migration() {
+    use kbf_state::postgres::schema::Outcome;
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    let (w, _) = World::with_old();
+    w.st.borrow_mut().staged_schema = 2;
+    let seen = RefCell::new(Vec::new());
+    let record = |_: &Database, schema: u32, wait: Duration| {
+        seen.borrow_mut().push((schema, wait));
+        Ok(Outcome {
+            from: None,
+            to: schema,
+            ran: Vec::new(),
+        })
+    };
+    DbMigrator::new(unreachable_db(), &w)
+        .with_apply(Box::new(record))
+        .migrate_forward(&c(B))
+        .expect("the recorder accepts");
+    DbMigrator::new(unreachable_db(), &w)
+        .with_lock_wait(Duration::from_secs(7))
+        .with_apply(Box::new(record))
+        .migrate_forward(&c(B))
+        .expect("the recorder accepts");
+    assert_eq!(
+        *seen.borrow(),
+        [(2, Duration::from_secs(30)), (2, Duration::from_secs(7))]
+    );
+}
+
 /// Real schema, real swap: the tests that need a server.
 mod database {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -520,6 +557,61 @@ mod database {
             .migrate_forward(&c(B))
             .expect("the racing installer finds it done");
         assert_eq!(applied_at(&s).len(), 2);
+    }
+
+    /// The test URL with its role or its database replaced by one that does not exist.
+    fn url_with(role: Option<&str>, database: Option<&str>) -> String {
+        let (scheme, rest) = url()
+            .split_once("://")
+            .map(|(a, b)| (a.to_owned(), b.to_owned()))
+            .expect("a URL");
+        let (host, path) = rest.rsplit_once('/').expect("a database");
+        let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+        let at = role.map_or_else(String::new, |r| format!("{r}@"));
+        let at = if role.is_none() {
+            userinfo().map_or(at, |i| format!("{i}@"))
+        } else {
+            at
+        };
+        format!("{scheme}://{at}{host}/{}", database.unwrap_or(path))
+    }
+
+    /// Catches a server's refusal of the connection leaking the role or database name
+    /// (`FATAL: role "x" does not exist`) into the reason, its `Display` or its `Debug`.
+    /// A role that does not exist and a database that does not exist are each refused as
+    /// `database_error` with the SQLSTATE and neither name.
+    ///
+    /// Mutant seen red: `describe_refusal` made to return `describe` (the FATAL text with
+    /// both names in it).
+    #[test]
+    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+    fn a_refused_connection_names_neither_role_nor_database() {
+        let _turn = turn();
+        let (w, _) = World::with_old();
+        w.st.borrow_mut().staged_schema = 1;
+        for (url, secret) in [
+            (
+                url_with(Some("kbf_norole_marker"), None),
+                "kbf_norole_marker",
+            ),
+            (url_with(None, Some("kbf_nodb_marker")), "kbf_nodb_marker"),
+        ] {
+            let config = PostgresConfig::parse(&url).expect("parses");
+            let db = Database::new(config, releases());
+            let shown = format!("{db:?}");
+            let err = db
+                .migrate_within(1, std::time::Duration::from_secs(5))
+                .unwrap_err();
+            let reason = DbMigrator::new(db, &w)
+                .migrate_forward(&c(B))
+                .unwrap_err()
+                .0;
+            assert!(reason.starts_with("database_error: "), "{reason}");
+            assert!(reason.contains("SQLSTATE"), "{reason}");
+            for text in [reason, err.to_string(), format!("{err:?}"), shown] {
+                assert!(!text.contains(secret), "{secret} in {text}");
+            }
+        }
     }
 
     /// Catches a half-applied migration and a swap that goes on after a failed one. The

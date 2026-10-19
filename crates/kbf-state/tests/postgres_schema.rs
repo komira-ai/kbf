@@ -570,3 +570,32 @@ fn a_migration_gives_up_when_a_table_it_alters_is_in_use() {
         "the first statement of the rolled back migration remained"
     );
 }
+
+// ---- refused connections ----------------------------------------------------------------
+
+/// Catches the server's FATAL text, which quotes role, database and host, reaching a schema
+/// error: a database that does not exist is refused with its SQLSTATE and not its name, in
+/// `apply`, in `current` and in `Debug`.
+///
+/// Mutant seen red: `describe_refusal` returning the server's text.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn a_refused_connection_does_not_name_the_database() {
+    let (base, _) = url()
+        .rsplit_once('/')
+        .map(|(a, b)| (a.to_owned(), b.to_owned()))
+        .expect("a URL");
+    let config = PostgresConfig::parse(&format!("{base}/kbf_nodb_marker")).expect("parses");
+    let err = schema::apply(&config, &schema::embedded(), 1).unwrap_err();
+    let SchemaError::Database(why) = &err else {
+        panic!("a database error: {err:?}")
+    };
+    assert!(why.contains("SQLSTATE 3D000"), "{why}");
+    for text in [
+        err.to_string(),
+        format!("{err:?}"),
+        format!("{:?}", schema::current(&config)),
+    ] {
+        assert!(!text.contains("kbf_nodb_marker"), "{text}");
+    }
+}
