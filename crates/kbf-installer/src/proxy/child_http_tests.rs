@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -503,6 +504,36 @@ fn a_server_that_never_answers_ends_the_call_at_the_deadline() {
     assert_eq!(err, HttpError::Timeout);
     assert!(started.elapsed() < Duration::from_secs(5));
     fixture.request();
+}
+
+#[test]
+fn a_peer_that_stops_reading_ends_the_call_at_the_deadline() {
+    // Catches: no deadline on the write. The server takes the connection and never reads
+    // it; a 32 MiB body is far over what the socket buffers of both ends hold, so the
+    // write blocks for good and only a write timeout ends the call. The call runs on a
+    // thread of its own, so a client without that timeout fails this test at the wait
+    // below and does not hang it.
+    let (release, held) = mpsc::channel::<()>();
+    let fixture = Fixture::serve_raw(move |_stream| {
+        let _ = held.recv();
+        Vec::new()
+    });
+    let client = fixture.client(within(Duration::from_millis(300)));
+    let (done, outcome) = mpsc::channel();
+    let caller = thread::spawn(move || {
+        let started = Instant::now();
+        let reply = client.post("/x", &Headers::new(), &vec![7u8; 32 << 20]);
+        let _ = done.send((reply, started.elapsed()));
+    });
+    let outcome = outcome.recv_timeout(Duration::from_secs(10));
+    // Letting go closes the connection with the body unread, which frees a stuck writer.
+    release.send(()).unwrap();
+    caller.join().unwrap();
+    fixture.request();
+    let (reply, elapsed) =
+        outcome.expect("the call was still writing 10 s after its 300 ms deadline");
+    assert_eq!(reply.unwrap_err(), HttpError::Timeout);
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
 }
 
 /// Write `bytes` one at a time, `gap` apart, until the client closes.

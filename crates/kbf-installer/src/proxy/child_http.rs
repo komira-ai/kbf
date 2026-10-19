@@ -27,6 +27,13 @@
 //! `Transfer-Encoding` (a chunked answer is refused as [`HttpError::Unsupported`]; a
 //! child's JSON answers carry a `Content-Length`), and response headers (none is returned
 //! yet). A caller that needs a retry on `503` with `Retry-After` adds the header read here.
+//! A request whose write fails (a child that answered and closed before it read a large
+//! body) is reported as the failed write, without reading the answer.
+//!
+//! For callers: a call blocks its thread for up to the deadline, so a caller on an async
+//! runtime makes it with `spawn_blocking` or on a thread of its own, never on a worker.
+//! The limits belong to the [`Client`] and a call has no override of its own: a call that
+//! needs a longer deadline than the rest uses a second client for the same address.
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
