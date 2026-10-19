@@ -16,6 +16,7 @@ use crate::support::cache_kit::{
 };
 use crate::support::scratch;
 use kbf_daemon::cache::{Cache, CacheConfig, Discarded, FIXED_MTIME, Key, Point};
+use kbf_testkit::forked::ForkedChild;
 
 const GIB: u64 = 1 << 30;
 
@@ -614,4 +615,27 @@ async fn the_pass_leaves_a_key_whose_slot_is_held() {
     assert_eq!(cache.stats().adopted_entries, 0);
     assert_eq!(cache.stats().bytes, on_disk_sum(&dir));
     stop(cache, &gates);
+}
+
+/// Catches a cache directory still locked after the cache is stopped and dropped, when a
+/// process forked while it was open has not exec'd: the lock was released only by closing
+/// its descriptor, and a child holds a copy of that until its exec. The daemon starts an
+/// action per lease, and the tests of one binary run on threads of one process, so a
+/// restart in such a process was refused as `locked` (the daemon would then run
+/// uncached). The child here is held before exec until the reopen has been made, so the
+/// interleaving is the failing one every time.
+///
+/// Mutant: the `Drop` of `DirLock` removed.
+#[test]
+fn a_child_forked_while_the_cache_was_open_does_not_keep_the_directory_locked() {
+    let dir = scratch("cache-forked-lock");
+    let gates = Gates::new();
+    let clock = FakeClock::at(1000);
+    let cache = Cache::open(config(&dir, GIB, Arc::clone(&gates), &clock)).expect("open");
+    let child = ForkedChild::before_exec();
+    stop(cache, &gates);
+    let again = Cache::open(config(&dir, GIB, Arc::clone(&gates), &clock));
+    let again = again.expect("an open after the stop, with the forked child still alive");
+    stop(again, &gates);
+    child.finish();
 }

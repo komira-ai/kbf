@@ -207,6 +207,36 @@ pub fn activate<E: Exec>(
     Ok(Activated::Swapped)
 }
 
+/// Make `commit`, installed and verified, the release that runs on a host that has none:
+/// `setup`'s first release. There is no trial (nothing to go back to) and no confirm. The
+/// state is written first and the links follow, as in [`activate`]; a repeat for the same
+/// commit only makes the links agree.
+pub fn first<E: Exec>(
+    exec: &mut E,
+    host: &Layout,
+    commit: &CommitId,
+    out: &mut dyn Write,
+) -> Result<(), ReleaseError> {
+    let (lock, state) = open(host)?;
+    if state.current.as_ref() == Some(commit) {
+        converge(exec, host, &state, out)?;
+        return Ok(());
+    }
+    if state.current.is_some() {
+        return Err(ReleaseError::NotFirst(commit.clone()));
+    }
+    if !has_binary(exec, host, commit) {
+        return Err(ReleaseError::NotInstalled(commit.clone()));
+    }
+    let next = State {
+        current: Some(commit.clone()),
+        ..state
+    };
+    lock.write(&next)?;
+    converge(exec, host, &next, out)?;
+    Ok(())
+}
+
 /// Keep the swap that `order_id` made. `commit` is the release the order named, so that
 /// a confirm after the swap was reverted is not taken for a repeat.
 pub fn confirm(

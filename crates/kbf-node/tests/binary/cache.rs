@@ -4,6 +4,9 @@
 //! refused, and the binary answers as the driver's `__chown-dirs` helper before it
 //! parses its flags.
 
+#[cfg(target_os = "linux")]
+use kbf_testkit::dir::TestDir;
+
 use super::{BIN, one_native_daemon, runs_until_sigterm_logged, tls};
 
 /// Whether a line of `log` holds every one of `words`.
@@ -13,11 +16,14 @@ fn logged(log: &[String], words: &[&str]) -> bool {
 }
 
 /// The flags of a container daemon with the id tools on `PATH`, a stand-in cgroup tree and
-/// a full subordinate id range, run as `name`, with its data directory `data`.
+/// a full subordinate id range, run as `name`, with its data directory `data`; the
+/// directory of the id tools, and the directories the flags name (which go when the
+/// caller drops them, so it holds them as long as it runs the flags).
 #[cfg(target_os = "linux")]
-fn container(name: &str, data: &std::path::Path) -> (Vec<String>, std::path::PathBuf) {
+fn container(name: &str, data: &std::path::Path) -> (Vec<String>, TestDir, [TestDir; 2]) {
     let ids = super::id_files(&format!("{name}-ids"), "65536");
-    let (_, cgroup) = super::cgroup_tree(&tls(&format!("{name}-cgroup")), "cpu memory pids");
+    let cgroup_dir = tls(&format!("{name}-cgroup"));
+    let (_, cgroup) = super::cgroup_tree(&cgroup_dir, "cpu memory pids");
     let mut flags = vec![
         "--driver=container".to_owned(),
         super::OCI_RUNTIME.to_owned(),
@@ -28,7 +34,7 @@ fn container(name: &str, data: &std::path::Path) -> (Vec<String>, std::path::Pat
     ];
     flags.extend(cgroup);
     let bin = super::container_bin(&format!("{name}-bin"));
-    (flags, bin)
+    (flags, bin, [ids, cgroup_dir])
 }
 
 /// C-16 and contract 3, at the daemon's level. Catches the container driver not opening
@@ -53,7 +59,7 @@ fn a_container_node_opens_its_cache_and_trees_under_the_data_dir() {
         use std::os::unix::fs::PermissionsExt as _;
         let data = tls("cache-data");
         let (leases, dir) = (data.join("leases"), data.join("cache"));
-        let (flags, bin) = container("cache-open", &data);
+        let (flags, bin, _held) = container("cache-open", &data);
         let snap = dir.join("v1/index.snap");
         let after_load = || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -93,7 +99,7 @@ fn a_container_node_opens_its_cache_and_trees_under_the_data_dir() {
         );
         let held = Cache::open(CacheConfig::new(dir.clone(), leases.clone(), 1000))
             .expect("this test owns it");
-        let (flags, bin) = container("cache-locked", &data);
+        let (flags, bin, _held) = container("cache-locked", &data);
         let (status, log) = runs_until_sigterm_logged("cache-locked", &flags, Some(&bin));
         assert!(status.success(), "{status}: {log:#?}");
         assert!(

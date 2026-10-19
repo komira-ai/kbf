@@ -1817,6 +1817,7 @@ dependencies = [
  "kbf-installer",
  "kbf-proto",
  "kbf-state",
+ "kbf-testkit",
  "kbf-update",
  "libc",
  "postgres",
@@ -2258,6 +2259,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "kbf-ca",
+ "kbf-testkit",
  "kbf-types",
  "rcgen",
  "rustix",
@@ -2301,6 +2303,7 @@ name = "kbf-state"
 version = "0.1.0"
 dependencies = [
  "kbf-state",
+ "kbf-testkit",
  "postgres",
  "rusqlite",
  "rustix",

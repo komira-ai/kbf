@@ -11,6 +11,12 @@
 //! module's own (`requests.json` in the proxy state directory); `update.json`, which
 //! carries the intent of the swap, is U7's, and U8b may fold this map into it.
 //!
+//! The entry of the update that is waiting for the installer to stage its release also
+//! carries [`Waiting`]: the order, where the update began and the deadline it must stage
+//! by. A restarted process reads it and goes on waiting with the same deadline, and the
+//! entry stops waiting when the update is handed over or ends, so only an update that
+//! was still waiting is taken up again.
+//!
 //! A file that exists and does not parse is not treated as empty: that would let a retry
 //! start a second update. The store reports [`Idempotency::lost`] and the API refuses new
 //! updates (`409 state_lost`) until an operator removes the file.
@@ -23,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use super::model::UpdateId;
 use crate::CommitId;
+use crate::proxy::model::Locator;
 
 /// Entries kept.
 pub const KEEP: usize = 64;
@@ -40,6 +47,25 @@ pub struct Entry {
     /// The order has been written and the update is in motion. An entry that is not
     /// started was accepted and then the process died or the order could not be written.
     pub started: bool,
+    /// Set while the update waits for the installer to stage its release; `None` before
+    /// the order is written and once the update has been handed over or has ended.
+    #[serde(default)]
+    pub waiting: Option<Waiting>,
+}
+
+/// What a restarted process needs to go on waiting for an update's release to be staged,
+/// with the deadline the first process gave it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Waiting {
+    /// The commit the installer ran when the update was accepted.
+    pub from: Option<CommitId>,
+    /// The `frontend_update` order that asked for the stage.
+    pub order: Locator,
+    /// Unix seconds when that order was written.
+    pub since_s: u64,
+    /// Unix seconds by which the release must be staged.
+    pub deadline_s: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +119,15 @@ impl Idempotency {
         self.entries.iter().find(|e| e.request_id == request_id)
     }
 
+    /// The update that was waiting for the installer when the process last stopped.
+    /// There is at most one: [`mark_started`](Idempotency::mark_started) ends the wait
+    /// of every other entry.
+    pub fn waiting(&self) -> Option<(&Entry, &Waiting)> {
+        self.entries
+            .iter()
+            .find_map(|e| e.waiting.as_ref().map(|w| (e, w)))
+    }
+
     /// Records a new request under a fresh update id and makes it durable before it
     /// returns.
     pub fn insert(
@@ -109,6 +144,7 @@ impl Idempotency {
             nodes,
             rollback,
             started: false,
+            waiting: None,
         };
         self.next_seq += 1;
         self.entries.push(entry.clone());
@@ -119,10 +155,34 @@ impl Idempotency {
         Ok(entry)
     }
 
-    /// Marks the entry started, durably.
-    pub fn mark_started(&mut self, request_id: &str) -> Result<(), SaveError> {
-        if let Some(e) = self.entries.iter_mut().find(|e| e.request_id == request_id) {
-            e.started = true;
+    /// Marks the entry started and waiting for the installer, durably. One update is open
+    /// at a time, so any other entry that still says it waits (its end could not be
+    /// saved) is over: it stops waiting here.
+    pub fn mark_started(&mut self, request_id: &str, waiting: Waiting) -> Result<(), SaveError> {
+        if !self.entries.iter().any(|e| e.request_id == request_id) {
+            return Ok(());
+        }
+        for e in &mut self.entries {
+            if e.request_id == request_id {
+                e.started = true;
+                e.waiting = Some(waiting.clone());
+            } else {
+                e.waiting = None;
+            }
+        }
+        self.save()?;
+        Ok(())
+    }
+
+    /// The update no longer waits for the installer: it was handed over or it ended.
+    /// Durable before it returns; nothing is written when the entry was not waiting.
+    pub fn finish_waiting(&mut self, request_id: &str) -> Result<(), SaveError> {
+        let waiting = self
+            .entries
+            .iter_mut()
+            .find(|e| e.request_id == request_id && e.waiting.is_some());
+        if let Some(e) = waiting {
+            e.waiting = None;
             self.save()?;
         }
         Ok(())

@@ -65,8 +65,8 @@ async fn the_bundle_carries_the_actions_settings() {
     assert_eq!(process["args"], json!(spec.argv));
     assert_eq!(process["cwd"], "/kbf/root/pkg");
     assert_eq!(process["terminal"], false);
-    assert_eq!(process["user"]["uid"], 0);
-    assert_eq!(process["user"]["gid"], 0);
+    assert_eq!(process["user"]["uid"], 1000);
+    assert_eq!(process["user"]["gid"], 1000);
     assert_eq!(process["oomScoreAdj"], 0);
     assert_eq!(
         process["env"],
@@ -247,7 +247,10 @@ async fn the_hand_over_covers_every_directory_the_action_writes() {
         .collect();
     assert_eq!(
         events,
-        [format!("chown 1:1 {paths}"), format!("chown 0:0 {paths}")]
+        [
+            format!("chown 1001:1001 {paths}"),
+            format!("chown 0:0 {paths}")
+        ]
     );
 }
 
@@ -383,7 +386,7 @@ async fn unremovable_scratch_falls_back_to_a_helper_container() {
 /// helper said, in either direction, and cleans up.
 #[tokio::test]
 async fn a_failed_hand_over_fails_the_lease() {
-    for owner in ["1:1", "0:0"] {
+    for owner in ["1001:1001", "0:0"] {
         let fake = Fake::new(&format!("give-fails-{}", owner.replace(':', "-")));
         fake.knob("chown-fails", owner);
         let outcome = fake
@@ -829,8 +832,8 @@ async fn with_the_cache_only_the_input_roots_directories_change_owner() {
     assert_eq!(
         owners,
         [
-            format!("chown-dirs 1:1 {l}/root"),
-            format!("chown 1:1 {l}/upper {l}/work {l}/rw"),
+            format!("chown-dirs 1001:1001 {l}/root"),
+            format!("chown 1001:1001 {l}/upper {l}/work {l}/rw"),
             format!("chown-dirs 0:0 {l}/root"),
             format!("chown 0:0 {l}/upper {l}/work {l}/rw"),
         ]

@@ -11,11 +11,8 @@ use std::path::{Path, PathBuf};
 use clap::error::ErrorKind;
 use kbf_cli::{Invocation, config};
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("command-line-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("command-line-{name}"))
 }
 
 fn file(dir: &Path, text: &str) -> PathBuf {

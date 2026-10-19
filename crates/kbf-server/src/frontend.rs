@@ -219,6 +219,10 @@ pub struct FrontendFlags {
     /// connections are kept (one 0600 file each), which also turns on the
     /// `/v1/object-stores` routes of the operator API. `None`: they answer 404.
     pub object_store_secrets_dir: Option<PathBuf>,
+    /// The id of this process under the admin port ([`crate::managed`]); `None` for a
+    /// frontend that has none. Its history writer is named by it, so the history rows
+    /// the process writes carry its id and no other process writes them.
+    pub instance_id: Option<String>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -432,6 +436,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         handover,
         admin,
         object_store_secrets_dir: m.get_one::<PathBuf>(SECRETS_DIR).cloned(),
+        instance_id: None,
     })
 }
 
@@ -933,7 +938,8 @@ impl<'a> Prepared<'a> {
         } = self;
         let args = &flags.server;
         let state = crate::start::with_members(state, args.members());
-        let state = crate::history::with_history(state, &args.history)?;
+        let writer = (flags.instance_id.as_deref()).map(kbf_history::WriterId::from_instance);
+        let state = crate::history::with_history_as(state, &args.history, writer)?;
         let (state, history) = crate::history::take(state);
         let members = members_of(state.as_ref());
         let map = map_of(None, members.as_ref())?;

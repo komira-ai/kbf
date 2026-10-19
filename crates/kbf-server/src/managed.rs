@@ -124,12 +124,14 @@ impl Managed {
         });
         let (listener, bound) = bind_api(admin.listen, &Binder::new())?;
         let (handoff, takeover) = oneshot::channel();
-        let control = Arc::new(Control::new(
-            instance::new_id()?,
-            flags.clone(),
-            stop.clone(),
-            handoff,
-        ));
+        // The frontend this process starts, or takes over as, is built from these flags:
+        // they carry the id its history rows are written under.
+        let id = instance::new_id()?;
+        let flags = &FrontendFlags {
+            instance_id: Some(id.clone()),
+            ..flags.clone()
+        };
+        let control = Arc::new(Control::new(id, flags.clone(), stop.clone(), handoff));
         let mut running = None;
         if admin.await_takeover {
             let candidate = match source {
