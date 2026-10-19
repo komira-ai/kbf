@@ -110,7 +110,8 @@ fn an_external_signer_issues_and_the_frontend_holds_no_key() {
     let server = SignerServer::from_dir(&dir, uid, policy())
         .expect("server")
         .with_clock(|| START);
-    let socket = scratch("ca-external-sock").join("signer.sock");
+    let socket_dir = scratch("ca-external-sock");
+    let socket = socket_dir.join("signer.sock");
     let listener = bind(&socket).expect("bind");
     std::thread::spawn(move || {
         let _ = server.serve(&listener);
@@ -159,7 +160,8 @@ fn an_external_signer_needs_the_signers_root_and_makes_nothing() {
     let server = SignerServer::from_dir(&dir, uid, policy())
         .expect("server")
         .with_clock(|| START);
-    let socket = scratch("ca-external-bad-sock").join("signer.sock");
+    let socket_dir = scratch("ca-external-bad-sock");
+    let socket = socket_dir.join("signer.sock");
     let listener = bind(&socket).expect("bind");
     std::thread::spawn(move || {
         let _ = server.serve(&listener);

@@ -2,9 +2,7 @@
 //! CA made in a scratch directory, the service over both), tokens, and certificate requests
 //! built the way a node builds them (and some it would not).
 
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use kbf_ca::{CLOCK_FLOOR_UNIX, ISSUED_AT_OID, Policy, SystemEntropy};
@@ -13,6 +11,7 @@ use kbf_proto::kbf::enroll::v1 as pb;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
 use kbf_types::{NodeId, Role, RoleSet, TokenId, TokenSecret};
+use kbf_testkit::dir::TestDir;
 use rcgen::{Attribute, CertificateParams, DistinguishedName, KeyPair};
 
 use super::ca::{Ca, SignerChoice};
@@ -23,14 +22,9 @@ pub const START: i64 = CLOCK_FLOOR_UNIX + 86_400;
 /// The one name this test frontend serves.
 pub const FRONTEND: &str = "front.test";
 
-/// A scratch directory no other test uses (a path that does not exist yet).
-pub fn scratch(name: &str) -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    std::env::temp_dir().join(format!(
-        "kbf-enroll-svc-{}-{}-{name}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
+/// A new, empty scratch directory no other test uses, removed when it drops.
+pub fn scratch(name: &str) -> TestDir {
+    TestDir::under(std::env::temp_dir(), &format!("kbf-enroll-svc-{name}"))
 }
 
 /// A state store, a CA and the service over them.
@@ -39,6 +33,8 @@ pub struct Farm {
     pub store: Arc<dyn Store>,
     pub ca: Arc<Ca>,
     pub service: EnrollService,
+    /// The CA directory; last so it is removed after everything that used it.
+    _dir: TestDir,
 }
 
 /// A farm whose store clock reads `start` (unix seconds) and whose CA, made in a new
@@ -65,6 +61,7 @@ pub fn farm_at(name: &str, start: i64) -> Farm {
         store,
         ca,
         service,
+        _dir: dir,
     }
 }
 
