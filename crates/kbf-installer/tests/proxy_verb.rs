@@ -31,12 +31,37 @@ base_port = 18000
 /// `localhost`, the operator token (0600, 32 or more characters) and a secret path. Returns
 /// the `installer.toml` and the CA file a client trusts.
 fn served_config(name: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = kbf_host::testkit::scratch(&format!("proxy-bin-{name}"));
+    let ca_file = issue(&dir, "");
+    let private = |file: &str, text: &str| {
+        let path = dir.join(file);
+        fs::write(&path, text).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        path
+    };
+    let token = private("operator.token", "operator-token-0123456789-abcdefghijkl");
+    let (cert, key) = (dir.join("server.pem"), dir.join("server.key"));
+    let text = format!(
+        "[proxy]\noperator_token_file = {token:?}\nserver_cert_file = {cert:?}\n\
+         server_key_file = {key:?}\nclient_ca_file = {ca_file:?}\n\
+         proxy_auth_file = {:?}\n[proxy.upstream]\nbase_port = 18000\n",
+        dir.join("proxy-auth"),
+    );
+    // Not `config`: it makes the directory again, and the files above are in it.
+    let path = dir.join("installer.toml");
+    fs::write(&path, text).expect("write");
+    (path, ca_file)
+}
+
+/// A new CA and a server certificate for `localhost` it signed, written (0600) to
+/// `{prefix}ca.pem`, `{prefix}server.pem` and `{prefix}server.key` in `dir`. Returns the CA file.
+fn issue(dir: &Path, prefix: &str) -> PathBuf {
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
         KeyPair, KeyUsagePurpose, SanType,
     };
     use std::os::unix::fs::PermissionsExt as _;
-    let dir = kbf_host::testkit::scratch(&format!("proxy-bin-{name}"));
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca.key_usages = vec![
@@ -50,27 +75,14 @@ fn served_config(name: &str) -> (PathBuf, PathBuf) {
     let key = KeyPair::generate().expect("key");
     let cert = server.signed_by(&key, &ca).expect("server certificate");
     let private = |file: &str, text: &str| {
-        let path = dir.join(file);
+        let path = dir.join(format!("{prefix}{file}"));
         fs::write(&path, text).expect("write");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
         path
     };
-    let (cert, key) = (
-        private("server.pem", &cert.pem()),
-        private("server.key", &key.serialize_pem()),
-    );
-    let ca_file = private("ca.pem", &ca.pem());
-    let token = private("operator.token", "operator-token-0123456789-abcdefghijkl");
-    let text = format!(
-        "[proxy]\noperator_token_file = {token:?}\nserver_cert_file = {cert:?}\n\
-         server_key_file = {key:?}\nclient_ca_file = {ca_file:?}\n\
-         proxy_auth_file = {:?}\n[proxy.upstream]\nbase_port = 18000\n",
-        dir.join("proxy-auth"),
-    );
-    // Not `config`: it makes the directory again, and the files above are in it.
-    let path = dir.join("installer.toml");
-    fs::write(&path, text).expect("write");
-    (path, ca_file)
+    private("server.pem", &cert.pem());
+    private("server.key", &key.serialize_pem());
+    private("ca.pem", &ca.pem())
 }
 
 fn config(name: &str, text: &str) -> PathBuf {
@@ -165,7 +177,7 @@ fn start_with(path: &Path, listener: &TcpListener, stderr: Stdio) -> Reaped {
     start_masked(path, listener, stderr, false)
 }
 
-/// [`start_with`], and with `block_term` the verb inherits SIGTERM and SIGINT blocked, as from
+/// [`start_with`], and with `block_term` the verb inherits SIGTERM, SIGINT and SIGHUP blocked, as from
 /// a launcher that blocked them.
 fn start_masked(path: &Path, listener: &TcpListener, stderr: Stdio, block_term: bool) -> Reaped {
     let fd = listener.as_raw_fd();
@@ -186,6 +198,7 @@ fn start_masked(path: &Path, listener: &TcpListener, stderr: Stdio, block_term: 
                 libc::sigemptyset(&raw mut set);
                 libc::sigaddset(&raw mut set, libc::SIGTERM);
                 libc::sigaddset(&raw mut set, libc::SIGINT);
+                libc::sigaddset(&raw mut set, libc::SIGHUP);
                 libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
             }
             if fd == 3 {
@@ -218,6 +231,15 @@ async fn tls(
     addr: SocketAddr,
     ca: &Path,
 ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    try_tls(addr, ca).await.expect("TLS handshake")
+}
+
+/// [`tls`], and the handshake's failure instead of a panic: whether the server's certificate
+/// chains to `ca`.
+async fn try_tls(
+    addr: SocketAddr,
+    ca: &Path,
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
     use rustls::pki_types::pem::PemObject as _;
     let mut roots = rustls::RootCertStore::empty();
     for der in rustls::pki_types::CertificateDer::pem_file_iter(ca).expect("CA file") {
@@ -237,7 +259,6 @@ async fn tls(
             tcp,
         )
         .await
-        .expect("TLS handshake")
 }
 
 /// One `GET` over TLS and h2 to `addr`: the status and the body.
@@ -556,4 +577,131 @@ async fn a_launcher_that_blocked_the_stop_signals_cannot_make_the_verb_unstoppab
             "signal {signal}, after {took:?}"
         );
     }
+}
+
+/// Sends `signal` to the child.
+fn send(child: &Reaped, signal: i32) {
+    // SAFETY: `kill` of our own child.
+    assert_eq!(unsafe { libc::kill(child.id().cast_signed(), signal) }, 0);
+}
+
+/// Waits until a handshake that trusts `ca` succeeds, or fails the test after 20 s.
+async fn until_served_by(addr: SocketAddr, ca: &Path) {
+    let started = Instant::now();
+    while try_tls(addr, ca).await.is_err() {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the certificate of {} is never served",
+            ca.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Catches a verb that does not reload on SIGHUP, one that dies of it (the default action),
+/// one that cuts the streams open at the reload, and one that cannot be reloaded when its
+/// launcher blocked SIGHUP. The files are replaced as a renewal does (a new CA, certificate
+/// and key renamed over the old ones); SIGHUP arrives; a new handshake then sees the new
+/// certificate and the old CA no longer verifies it; the h2 connection opened before the
+/// signal still answers afterwards; the verb is still running, and then stops on SIGTERM with 0.
+#[tokio::test(flavor = "current_thread")]
+async fn sighup_serves_the_renewed_certificate_and_cuts_no_stream() {
+    let (path, ca_a) = served_config("hup-reload");
+    let dir = path.parent().expect("dir").to_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let mut child = start_masked(&path, &listener, Stdio::piped(), true);
+    drop(listener);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca_a, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+
+    // A connection opened under the old certificate, kept open across the reload.
+    let (open, connection) = h2::client::handshake(tls(addr, &ca_a).await)
+        .await
+        .expect("h2 handshake");
+    tokio::spawn(connection);
+
+    let ca_b = issue(&dir, "b-");
+    for file in ["server.pem", "server.key", "ca.pem"] {
+        fs::rename(dir.join(format!("b-{file}")), dir.join(file)).expect("replace");
+    }
+    // Before the signal nothing changes: a renewal alone reloads nothing.
+    assert!(try_tls(addr, &ca_b).await.is_err(), "reloaded without a signal");
+    send(&child, libc::SIGHUP);
+    until_served_by(addr, &ca_b).await;
+    assert!(
+        try_tls(addr, &ca_a).await.is_err(),
+        "the old certificate is still served"
+    );
+    assert!(child.try_wait().expect("wait").is_none(), "SIGHUP stopped the verb");
+
+    let request = http::Request::builder()
+        .uri("http://proxy.test/healthz")
+        .body(())
+        .expect("a request");
+    let (response, _) = open
+        .ready()
+        .await
+        .expect("the old connection is open")
+        .send_request(request, true)
+        .expect("send");
+    assert_eq!(response.await.expect("a response").status().as_u16(), 200);
+
+    send(&child, libc::SIGTERM);
+    let (status, took) = exited(&mut child, Duration::from_secs(10));
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "after {took:?}");
+}
+
+/// Catches a reload that swaps before every file is checked, and one that says nothing: with
+/// the key file gone SIGHUP leaves the old certificate served (the new one is never
+/// half-applied), the verb keeps running, and its standard error says once that the files are
+/// unusable and names the key file. A later SIGHUP with the key back reloads.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sighup_with_a_missing_key_keeps_the_old_certificate_and_names_the_file() {
+    let (path, ca_a) = served_config("hup-missing-key");
+    let dir = path.parent().expect("dir").to_owned();
+    let log = dir.join("verb.log");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let mut child = start_with(
+        &path,
+        &listener,
+        Stdio::from(fs::File::create(&log).expect("log file")),
+    );
+    drop(listener);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca_a, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+
+    // A renewed certificate and CA are in place, the key is not: the three do not make a
+    // unit, so none of them may apply.
+    let ca_b = issue(&dir, "b-");
+    fs::rename(dir.join("b-server.pem"), dir.join("server.pem")).expect("replace");
+    fs::rename(dir.join("b-ca.pem"), dir.join("ca.pem")).expect("replace");
+    let key = dir.join("server.key");
+    fs::rename(&key, dir.join("old.key")).expect("move the key away");
+    send(&child, libc::SIGHUP);
+    let started = Instant::now();
+    let said = loop {
+        let text = fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("previous ones are kept") {
+            break text;
+        }
+        assert!(started.elapsed() < Duration::from_secs(20), "no line: {text}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(said.matches("previous ones are kept").count(), 1, "{said}");
+    assert!(said.contains(&key.display().to_string()), "no file named: {said}");
+    assert!(try_tls(addr, &ca_b).await.is_err(), "the new certificate half-applied");
+    assert!(child.try_wait().expect("wait").is_none(), "a failed reload stopped the verb");
+
+    fs::rename(dir.join("b-server.key"), &key).expect("the renewed key");
+    send(&child, libc::SIGHUP);
+    until_served_by(addr, &ca_b).await;
+    send(&child, libc::SIGTERM);
+    let (status, took) = exited(&mut child, Duration::from_secs(10));
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "after {took:?}");
 }

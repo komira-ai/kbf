@@ -222,9 +222,9 @@ impl Stop {
     }
 }
 
-/// Unblocks SIGTERM and SIGINT in this thread, and so in the runtime threads created after it:
-/// the signal mask survives `exec`, and a launcher that blocked them would otherwise leave a
-/// verb that no stop signal reaches.
+/// Unblocks SIGTERM, SIGINT and SIGHUP in this thread, and so in the runtime threads created
+/// after it: the signal mask survives `exec`, and a launcher that blocked them would otherwise
+/// leave a verb that no stop signal and no reload reaches.
 fn unblock_stop_signals() {
     // SAFETY: `sigemptyset` and `sigaddset` fill a set owned here; `pthread_sigmask` reads it
     // and changes only this thread's mask.
@@ -233,6 +233,7 @@ fn unblock_stop_signals() {
         libc::sigemptyset(&raw mut set);
         libc::sigaddset(&raw mut set, libc::SIGTERM);
         libc::sigaddset(&raw mut set, libc::SIGINT);
+        libc::sigaddset(&raw mut set, libc::SIGHUP);
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
     }
 }
@@ -249,10 +250,11 @@ fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
     unblock_stop_signals();
     let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
     let runtime = handle.runtime();
-    let (term, int) = runtime.block_on(async {
+    let (term, int, hup) = runtime.block_on(async {
         (
             signal(SignalKind::terminate()),
             signal(SignalKind::interrupt()),
+            signal(SignalKind::hangup()),
         )
     });
     let stop = Arc::new(Stop {
@@ -268,6 +270,27 @@ fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
             }
         });
     }
+    // SIGHUP re-reads the certificate, key and client CA (`systemctl reload`, which the renew
+    // hook calls). It never stops the proxy: without this handler its default action would
+    // end the process and cut every stream. A failed reload keeps the old files and counts
+    // itself (`kbf_proxy_tls_reload_failed_total`); this verb installs no `tracing`
+    // subscriber, so the one line that says it happened is written here, to the journal. The
+    // reload reads files and parses X.509, so it runs on the blocking pool, not on a runtime
+    // thread; signals that arrive while one runs coalesce, and the reloader runs one at a time.
+    let mut hup = hup?;
+    let reloading = handle.clone();
+    runtime.spawn(async move {
+        while hup.recv().await.is_some() {
+            let handle = reloading.clone();
+            drop(tokio::task::spawn_blocking(move || {
+                let line = match handle.reload_tls() {
+                    Ok(()) => "reloaded the TLS files".to_owned(),
+                    Err(error) => format!("TLS files unusable, the previous ones are kept: {error}"),
+                };
+                let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {line}");
+            }));
+        }
+    });
     // A closed standard error (a journal that went away) must not stop the proxy from serving.
     #[cfg(target_os = "linux")]
     let _supervised = supervise(&handle, &state_dir, &proxy_auth_file, upstream);
