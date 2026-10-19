@@ -1,5 +1,6 @@
-//! What the integration cells (`kbf-cell m1`, `kbf-cell m2`) share: their error, the
-//! processes they start, and the reading of the logs those processes write.
+//! What the integration cells (`kbf-cell m1`, `kbf-cell m2` and `kbf-cell
+//! cross-version`) share: their error, the processes they start, and the reading of the
+//! logs those processes write.
 
 use std::fmt::Display;
 use std::fs::File;
@@ -18,6 +19,10 @@ pub(crate) const LEASE_WAIT: Duration = Duration::from_secs(60);
 
 /// How often a log is read while waiting for a line.
 pub(crate) const POLL: Duration = Duration::from_millis(100);
+
+/// How long a process has to end after the SIGINT it gets as it is dropped, before it
+/// is killed.
+pub(crate) const STOP_WAIT: Duration = Duration::from_secs(30);
 
 /// Why a cell test did not pass.
 #[derive(Debug, thiserror::Error)]
@@ -42,10 +47,12 @@ impl CellError {
 }
 
 /// A process the cell started. Dropped before it is waited for, it gets SIGINT (as a
-/// terminal's Ctrl-C) and is then waited for.
+/// terminal's Ctrl-C) and is then waited for, for at most [`STOP_WAIT`]: a process that
+/// has not ended by then is killed, so one that ignores SIGINT cannot hold the run.
 pub(crate) struct Process {
     child: Child,
     reaped: bool,
+    stop_wait: Duration,
 }
 
 impl Process {
@@ -55,7 +62,16 @@ impl Process {
         Ok(Self {
             child,
             reaped: false,
+            stop_wait: STOP_WAIT,
         })
+    }
+
+    /// This process, with `limit` in place of [`STOP_WAIT`] (so a test need not wait out
+    /// the real one).
+    #[cfg(test)]
+    fn stop_within(mut self, limit: Duration) -> Self {
+        self.stop_wait = limit;
+        self
     }
 
     pub(crate) fn wait(&mut self) -> Result<ExitStatus, CellError> {
@@ -112,7 +128,16 @@ impl Drop for Process {
         if !self.reaped {
             // Errors are left: the process may have exited already.
             let _ = kill_process(Pid::from_child(&self.child), Signal::INT);
-            let _ = self.child.wait();
+            let ended = matches!(self.wait_within(self.stop_wait), Ok(Some(_)));
+            if !ended {
+                eprintln!(
+                    "process {} did not end within {:?} of SIGINT: killed",
+                    self.child.id(),
+                    self.stop_wait
+                );
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
         }
     }
 }
@@ -245,5 +270,77 @@ pub(crate) fn print_tails(logs: &Path, n: usize) {
                 println!("{line}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use rustix::process::test_kill_process;
+
+    use super::*;
+
+    /// Held while this process's SIGINT disposition is changed, so two tests do not
+    /// hand each other's.
+    static DISPOSITION: Mutex<()> = Mutex::new(());
+
+    /// `sleep 20`, started with SIGINT ignored if `ignore` (an ignored disposition
+    /// survives the exec) and with the default action otherwise. This process has the
+    /// disposition it had before again as the child is running. (A `pre_exec` closure
+    /// would set it in the child alone, but the coverage of a closure that runs after
+    /// the fork is lost with the child.)
+    fn sleeper(ignore: bool) -> Process {
+        let _held = DISPOSITION.lock().expect("no test panics holding it");
+        let set = if ignore { libc::SIG_IGN } else { libc::SIG_DFL };
+        // SAFETY: `signal` with `SIG_IGN` or `SIG_DFL` installs no handler of ours.
+        let before = unsafe { libc::signal(libc::SIGINT, set) };
+        let mut command = Command::new("sleep");
+        command.arg("20");
+        let started = Process::spawn(command, "sleep");
+        // SAFETY: `before` is what `signal` returned for this signal, a disposition.
+        unsafe { libc::signal(libc::SIGINT, before) };
+        started.expect("sleep starts")
+    }
+
+    /// Catches a drop that sends no SIGINT and waits out the stop wait, or one that
+    /// kills at once instead of asking first: the process here ends on SIGINT, so the
+    /// drop must return long before the (long) stop wait.
+    #[test]
+    fn a_process_that_ends_on_sigint_is_not_waited_for_longer() {
+        let process = sleeper(false).stop_within(Duration::from_secs(10));
+        let started = Instant::now();
+        drop(process);
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "the drop took {took:?}");
+    }
+
+    /// Catches a drop that waits for a process without end (this one ignores SIGINT and
+    /// would run for 20 s), one that kills before the stop wait has passed, and one that
+    /// leaves the process running.
+    #[test]
+    fn a_process_that_ignores_sigint_is_killed_after_the_stop_wait() {
+        let process = sleeper(true).stop_within(Duration::from_millis(300));
+        let pid = Pid::from_child(&process.child);
+        let started = Instant::now();
+        drop(process);
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(300), "the drop took {took:?}");
+        assert!(took < Duration::from_secs(10), "the drop took {took:?}");
+        assert!(test_kill_process(pid).is_err(), "the process still runs");
+    }
+
+    /// The arm of the drop for a process that was waited for: it sends no signal (the
+    /// pid may be another process's by then) and returns at once. This test sees only a
+    /// drop that blocks; it cannot see the signal.
+    #[test]
+    fn a_process_that_was_waited_for_is_dropped_at_once() {
+        let mut done = Process::spawn(Command::new("true"), "true").expect("true starts");
+        let status = done.wait().expect("true ends");
+        assert!(status.success(), "{status}");
+        let started = Instant::now();
+        drop(done);
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "the drop took {took:?}");
     }
 }

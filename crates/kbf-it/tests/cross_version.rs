@@ -78,10 +78,31 @@ mod fake {
         record(&role, &dir, &args);
         let code = match role.as_str() {
             "kbf" => kbf(&dir, &args),
+            "kbf-server" | "kbf-daemon" if args == ["--version"] => version(&role, &dir),
             "kbf-server" => server(&dir, &args),
             _ => daemon(&args),
         };
         std::process::exit(code);
+    }
+
+    /// The commit the directory's `facts.json` states.
+    fn commit(dir: &Path) -> String {
+        let facts = std::fs::read_to_string(dir.join("facts.json")).expect("facts.json");
+        let facts: serde_json::Value = serde_json::from_str(&facts).expect("facts are JSON");
+        facts["commit"].as_str().expect("a commit").to_owned()
+    }
+
+    /// `<program> 0.0.0+<commit>`, as `--version` prints: of another commit than the
+    /// directory's `kbf` states, or of none, as the defect says.
+    fn version(role: &str, dir: &Path) -> i32 {
+        match (role, defect().as_str()) {
+            ("kbf-server", "server-skew") | ("kbf-daemon", "daemon-skew") => {
+                println!("{role} 0.0.0+ffffffffffff");
+            }
+            ("kbf-server", "server-no-commit") => println!("{role} 0.0.0"),
+            _ => println!("{role} 0.0.0+{}", commit(dir)),
+        }
+        0
     }
 
     fn defect() -> String {
@@ -332,10 +353,14 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The facts a build states: its `kbf --version --json` line.
-fn facts(min_protocol: u32, protocol: u32) -> String {
+/// The commit of the server's build, and of the daemon's when it is another build.
+const SERVER_COMMIT: &str = "0123456789ab";
+const DAEMON_COMMIT: &str = "fedcba987654";
+
+/// The facts a build of `commit` states: its `kbf --version --json` line.
+fn facts(commit: &str, min_protocol: u32, protocol: u32) -> String {
     format!(
-        "{{\"commit\":\"0123456789ab\",\"min_protocol\":{min_protocol},\"profile\":\"debug\",\
+        "{{\"commit\":\"{commit}\",\"min_protocol\":{min_protocol},\"profile\":\"debug\",\
          \"protocol\":{protocol},\"state_schema\":3,\"version\":\"0.1.0\"}}\n"
     )
 }
@@ -353,12 +378,31 @@ impl Run {
         self.code == Some(0)
     }
 
-    /// The fakes that were started, in order, as `role` or `role@directory`.
+    /// Whether `call` (`role<TAB>directory<TAB>arguments`) asked a program only for its
+    /// `--version`: the check that it is the build its directory's `kbf` states.
+    fn is_identity(call: &str) -> bool {
+        call.ends_with("\t--version")
+    }
+
+    /// The calls that ran a fake for its work (`kbf --version --json` included), in order.
+    fn ran(&self) -> Vec<&str> {
+        let ran = self.calls.iter().filter(|c| !Self::is_identity(c));
+        ran.map(String::as_str).collect()
+    }
+
+    /// The fakes that ran for their work, in order, by role.
     fn started(&self) -> Vec<&str> {
-        self.calls
-            .iter()
+        let roles = self.ran().into_iter();
+        roles
             .map(|c| c.split('\t').next().unwrap_or_default())
             .collect()
+    }
+
+    /// The `<role>@<directory>` of each call that only asked for a `--version`.
+    fn identities(&self) -> Vec<String> {
+        let asked = self.calls.iter().filter(|c| Self::is_identity(c));
+        let fields = asked.map(|c| c.split('\t').collect::<Vec<_>>());
+        fields.map(|f| format!("{}@{}", f[0], f[1])).collect()
     }
 }
 
@@ -383,9 +427,13 @@ impl Cell {
             (
                 &server_dir,
                 ["kbf", "kbf-server"],
-                facts(server.0, server.1),
+                facts(SERVER_COMMIT, server.0, server.1),
             ),
-            (&daemon_dir, ["kbf", "kbf-daemon"], facts(1, daemon)),
+            (
+                &daemon_dir,
+                ["kbf", "kbf-daemon"],
+                facts(DAEMON_COMMIT, 1, daemon),
+            ),
         ] {
             std::fs::create_dir_all(path).expect("a build directory");
             std::fs::write(path.join("facts.json"), text).expect("facts.json");
@@ -409,7 +457,8 @@ impl Cell {
         let mut cell = Self::new(name, (min, protocol), protocol, defect);
         let both = cell.dir.join("both");
         std::fs::create_dir_all(&both).expect("the build directory");
-        std::fs::write(both.join("facts.json"), facts(min, protocol)).expect("facts.json");
+        let text = facts(SERVER_COMMIT, min, protocol);
+        std::fs::write(both.join("facts.json"), text).expect("facts.json");
         let me = std::env::current_exe().expect("this test binary");
         for link in ["kbf", "kbf-server", "kbf-daemon"] {
             std::os::unix::fs::symlink(&me, both.join(link)).expect("link a fake");
@@ -500,7 +549,9 @@ fn fails(run: &Run, code: i32, needles: &[&str]) {
 /// than the real one takes (the fake exits 3 on those), a server given no listener or
 /// TLS flag, the probes sent inside the range or not around it (the fake server refuses
 /// exactly outside what its facts state), and a run that prints no proof of a step: the
-/// output names each. Server 2 to 4 and a daemon at 3: the probes are 3, 1 and 5.
+/// output names each. Server 2 to 4 and a daemon at 3: the probes are 1, 3 and 5. The
+/// two directories are two builds (two commits) and the server accepts from 2: neither
+/// note of the self-test appears.
 #[test]
 fn a_pair_that_fits_passes_every_step() {
     let run = Cell::new("fits", (2, 4), 3, "").run();
@@ -516,33 +567,35 @@ fn a_pair_that_fits_passes_every_step() {
     ] {
         assert!(run.text.contains(line), "{line:?} not in:\n{}", run.text);
     }
+    for line in ["one build", "self-test", "lower edge"] {
+        assert!(!run.text.contains(line), "{line:?} in:\n{}", run.text);
+    }
     assert_eq!(run.started(), ["kbf", "kbf", "kbf-server", "kbf-daemon"]);
-    let call = |at: usize| run.calls[at].as_str();
+    // Each directory's binary was asked which build it is, once, before anything started.
+    assert_eq!(run.identities(), ["kbf-server@server", "kbf-daemon@daemon"]);
+    assert_eq!(run.calls.len(), 6, "{:?}", run.calls);
+    let ran = run.ran();
     assert!(
-        call(0).starts_with("kbf\tserver\t--version --json"),
-        "{}",
-        call(0)
+        ran[0].starts_with("kbf\tserver\t--version --json"),
+        "{ran:?}"
     );
     assert!(
-        call(1).starts_with("kbf\tdaemon\t--version --json"),
-        "{}",
-        call(1)
+        ran[1].starts_with("kbf\tdaemon\t--version --json"),
+        "{ran:?}"
     );
+    assert!(ran[2].contains("--worker-listen 127.0.0.1:0"), "{ran:?}");
     assert!(
-        call(2).contains("--worker-listen 127.0.0.1:0"),
-        "{}",
-        call(2)
-    );
-    assert!(
-        call(3).contains("--driver fake --server https://127.0.0.1:"),
-        "{}",
-        call(3)
+        ran[3].contains("--driver fake --server https://127.0.0.1:"),
+        "{ran:?}"
     );
 }
 
 /// Catches the self-test shape (one directory as both) refused or mixed up with two, and
-/// a node protocol the operator API names being compared to the wrong number. A server
-/// of one protocol: the probes outside it are 0 (the wire's "not named") and 2.
+/// a node protocol the operator API names being compared to the wrong number, and a run
+/// that does not say what it is: two directories of one commit are a self-test, and a
+/// server accepting from 1 has no real lower edge (the probe is 0, which any server
+/// refuses). A server of one protocol: the probes outside it are 0 (the wire's "not
+/// named") and 2.
 #[test]
 fn one_directory_is_the_self_test_and_a_named_node_protocol_is_checked() {
     let run = Cell::one_directory("self", 1, 1, "")
@@ -553,6 +606,10 @@ fn one_directory_is_the_self_test_and_a_named_node_protocol_is_checked() {
         "a Hello at protocol 0 is refused",
         "a Hello at protocol 2 is refused",
         "OK: GET /v1/nodes lists cell-node-1, connected, at protocol 1",
+        "NOTE: the server and the daemon are one build (commit 0123456789ab): this run is a \
+         self-test, not a cross-version run",
+        "NOTE: the server's min_protocol is 1, so the probe below its range is protocol 0",
+        "the lower edge of the range is not exercised",
     ] {
         assert!(run.text.contains(line), "{line:?} not in:\n{}", run.text);
     }
@@ -588,6 +645,47 @@ fn a_daemon_outside_the_servers_range_fails_before_anything_starts() {
     for daemon in [2, 3] {
         let run = Cell::new("edge", (2, 3), daemon, "").run();
         assert!(run.ok(), "{daemon}: {}", run.text);
+    }
+}
+
+/// Catches a directory that mixes two builds passed: its `kbf` states one build's
+/// protocols and its `kbf-server` or `kbf-daemon` is another build (an older release's
+/// `kbf` beside a newer daemon, say), so the run would test protocols nobody runs. Also a
+/// `--version` with no commit taken for a match. Nothing is started: the identity of the
+/// binaries is asked with the facts, and for the daemon only after the server's.
+#[test]
+fn a_binary_of_another_build_than_its_kbf_fails_before_anything_starts() {
+    let skewed: &[&str] = &["ffffffffffff, but ", "mixes two builds"];
+    let commitless: &[&str] = &["prints no <version>+<commit> as its second word"];
+    for (defect, program, needles, roles) in [
+        (
+            "server-skew",
+            "kbf-server",
+            skewed,
+            vec!["kbf", "kbf-server"],
+        ),
+        (
+            "server-no-commit",
+            "kbf-server",
+            commitless,
+            vec!["kbf", "kbf-server"],
+        ),
+        (
+            "daemon-skew",
+            "kbf-daemon",
+            skewed,
+            vec!["kbf", "kbf-server", "kbf", "kbf-daemon"],
+        ),
+    ] {
+        let run = Cell::new(defect, (1, 1), 1, defect).run();
+        fails(&run, 1, needles);
+        assert!(run.text.contains(&format!("/{program}")), "{}", run.text);
+        let called: Vec<&str> = run
+            .calls
+            .iter()
+            .map(|c| c.split('\t').next().unwrap_or_default())
+            .collect();
+        assert_eq!(called, roles, "{defect}: {}", run.text);
     }
 }
 

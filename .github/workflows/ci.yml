@@ -704,7 +704,9 @@ jobs:
   # protocol facts agree. Release N enters through SERVER_DIR and DAEMON_DIR below: a
   # directory holding that release's `kbf`, `kbf-server` and `kbf-daemon`, set by a step
   # before the run (both directions are two runs, one with each variable set to it).
-  # x86_64 only, like m2-container, whose build it shares.
+  # x86_64 only, like m2-container. It shares nothing with that job's build: the cache
+  # key carries the job's name and the package set differs (it adds kbf-cli), so its
+  # first run builds from a cold cache.
   cross-version:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

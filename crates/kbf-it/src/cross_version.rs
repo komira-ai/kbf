@@ -11,10 +11,13 @@
 //! What is checked, in order; the first failure ends the run with exit status 1, after
 //! printing the last lines of the server's and the daemon's logs:
 //! 1. Both `kbf --version --json` answer within `--wait` with a `commit`, a
-//!    `min_protocol` and a `protocol` (positive whole numbers), and the daemon's
-//!    `protocol` lies in the server's `min_protocol..=protocol`: the range the server
-//!    accepts (a release that raised `min_protocol` past a shipped daemon fails here,
-//!    before anything starts);
+//!    `min_protocol` and a `protocol` (positive whole numbers); `kbf-server --version`
+//!    and `kbf-daemon --version` name that same commit (a directory that mixes two
+//!    builds would otherwise state one build's protocols and run another's); and the
+//!    daemon's `protocol` lies in the server's `min_protocol..=protocol`: the range the
+//!    server accepts (a release that raised `min_protocol` past a shipped daemon fails
+//!    here, before anything starts). When both builds are one commit the run says it is
+//!    a self-test, not a cross-version run;
 //! 2. `kbf-server` (a cold store and a metadata log in the cell's directory, every
 //!    listener on 127.0.0.1 with a port the system picks) prints its ` reapi=` start
 //!    line, which names the worker listener and the operator API; it must not exit
@@ -23,7 +26,10 @@
 //!    mutual TLS as a daemon: at the daemon's protocol it is welcomed *as that
 //!    protocol* (a shipped daemon ends a session whose `Welcome` names another version);
 //!    at one below the server's `min_protocol` and one above its `protocol` it is
-//!    refused, FAILED_PRECONDITION naming the version as not accepted;
+//!    refused, FAILED_PRECONDITION naming the version as not accepted. While the
+//!    server's `min_protocol` is 1 the probe below is protocol 0, which the wire reads as
+//!    "not named" and any server refuses: that edge of the range is then not exercised,
+//!    and the run says so;
 //! 4. `kbf-daemon --driver fake` is started with the cell's certificates and logs
 //!    `welcomed`, before it exits, within `--wait`;
 //! 5. `GET /v1/nodes` lists the daemon's node connected and, when the entry carries a
@@ -31,7 +37,9 @@
 //!    field) is noted, not failed.
 //!
 //! Every wait of a step is bounded by `--wait`, so a process that hangs fails the run
-//! with the step's name instead of the job's timeout. Every log is under
+//! with the step's name instead of the job's timeout. The stop at the end is bounded
+//! too, though not by `--wait`: the server and the daemon get SIGINT and, if still
+//! running 30 s later, are killed (a run that passed stays passed). Every log is under
 //! `<work>/logs`.
 
 use std::path::{Path, PathBuf};
@@ -143,6 +151,34 @@ pub fn mismatch(server: &Facts, daemon: &Facts) -> Option<String> {
             daemon.commit, daemon.protocol, server.commit, server.min_protocol, server.protocol
         )
     })
+}
+
+/// The commit a build says it was made from in the line it prints: `+<commit>` at the
+/// end of the version, the second word (`kbf-server 0.1.0+0123456789ab` is what
+/// `--version` prints, and the start line begins the same way).
+fn built_from(printed: &str) -> Option<&str> {
+    let version = printed.split_whitespace().nth(1)?;
+    version.split_once('+').map(|(_, commit)| commit)
+}
+
+/// Why `program`, which printed `printed` for `--version`, is not a build of the commit
+/// `facts` (the `kbf` of its directory) states, or `None` when it is.
+fn build_problem(program: &Path, printed: &str, facts: &Facts) -> Option<String> {
+    let dir = program.parent().unwrap_or(program);
+    match built_from(printed) {
+        Some(commit) if commit == facts.commit => None,
+        Some(commit) => Some(format!(
+            "{} is built from commit {commit}, but {}/kbf states commit {}: the directory \
+             mixes two builds",
+            program.display(),
+            dir.display(),
+            facts.commit
+        )),
+        None => Some(format!(
+            "{} --version prints no <version>+<commit> as its second word: {printed:?}",
+            program.display()
+        )),
+    }
 }
 
 /// The worker and operator API addresses in the server's start line.
@@ -344,14 +380,21 @@ impl Cell {
 
     /// Everything after setup. The processes it starts are stopped as it returns.
     fn steps(&self) -> Result<(), CellError> {
-        let server = self.facts("server", &self.server_dir)?;
-        let daemon = self.facts("daemon", &self.daemon_dir)?;
+        let server = self.facts("server", &self.server_dir, "kbf-server")?;
+        let daemon = self.facts("daemon", &self.daemon_dir, "kbf-daemon")?;
         let why = mismatch(&server, &daemon);
         ensure(why.is_none(), why.unwrap_or_default())?;
         println!(
             "OK: the daemon's protocol {} is in the server's {} to {}",
             daemon.protocol, server.min_protocol, server.protocol
         );
+        if server.commit == daemon.commit {
+            println!(
+                "NOTE: the server and the daemon are one build (commit {}): this run is a \
+                 self-test, not a cross-version run",
+                server.commit
+            );
+        }
         let pki = crate::pki::write(&self.work.join("pki"), NODE_ID);
         let pki = pki.or_broken(&"the certificates")?;
         let (_server, addresses) = self.start_server(&pki)?;
@@ -360,20 +403,22 @@ impl Cell {
         self.node_listed(&addresses.api, &daemon)
     }
 
-    /// The facts of the build in `dir`, from its `kbf --version --json`.
-    fn facts(&self, role: &str, dir: &Path) -> Result<Facts, CellError> {
-        let log = self.logs.join(format!("{role}-version.json"));
-        let mut command = Command::new(dir.join("kbf"));
-        command.args(["--version", "--json"]);
-        to_log(&mut command, &log)?;
-        let mut asked = Process::spawn(command, "kbf --version --json")?;
-        let ended = asked.wait_within(self.wait)?;
-        let text = read(&log)?;
-        let what = format!("{} --version --json", dir.join("kbf").display());
-        let why = format!("{what} failed, or ran past {:?}: {text}", self.wait);
-        ensure(ended.is_some_and(|s| s.success()), why)?;
-        let facts =
-            Facts::parse(&text).map_err(|why| CellError::Failed(format!("{what}: {why}")))?;
+    /// The facts of the build in `dir`, from its `kbf --version --json`, once its
+    /// `binary` (`kbf-server` or `kbf-daemon`) has said it is that same build.
+    fn facts(&self, role: &str, dir: &Path, binary: &str) -> Result<Facts, CellError> {
+        let kbf = dir.join("kbf");
+        let text = self.printed(
+            &kbf,
+            &["--version", "--json"],
+            &format!("{role}-version.json"),
+        )?;
+        let facts = Facts::parse(&text).map_err(|why| {
+            CellError::Failed(format!("{} --version --json: {why}", kbf.display()))
+        })?;
+        let program = dir.join(binary);
+        let printed = self.printed(&program, &["--version"], &format!("{binary}-version.txt"))?;
+        let why = build_problem(&program, &printed, &facts);
+        ensure(why.is_none(), why.unwrap_or_default())?;
         println!(
             "{role} {}: commit {}, protocol {} to {}",
             dir.display(),
@@ -382,6 +427,22 @@ impl Cell {
             facts.protocol
         );
         Ok(facts)
+    }
+
+    /// What `program args` prints (stdout and stderr, kept in `<logs>/<log>`). It must
+    /// end with status 0 within `--wait`.
+    fn printed(&self, program: &Path, args: &[&str], log: &str) -> Result<String, CellError> {
+        let log = self.logs.join(log);
+        let mut command = Command::new(program);
+        command.args(args);
+        to_log(&mut command, &log)?;
+        let what = format!("{} {}", program.display(), args.join(" "));
+        let mut asked = Process::spawn(command, &what)?;
+        let ended = asked.wait_within(self.wait)?;
+        let text = read(&log)?;
+        let why = format!("{what} failed, or ran past {:?}: {text}", self.wait);
+        ensure(ended.is_some_and(|s| s.success()), why)?;
+        Ok(text)
     }
 
     /// Starts `kbf-server` and waits for its start line.
@@ -449,6 +510,13 @@ impl Cell {
         );
         // One below the range (0, the wire's "not named", when the server accepts from
         // 1, which it refuses all the same) and one above it.
+        if server.min_protocol == 1 {
+            println!(
+                "NOTE: the server's min_protocol is 1, so the probe below its range is \
+                 protocol 0, which the wire reads as \"not named\" and any server refuses: \
+                 the lower edge of the range is not exercised"
+            );
+        }
         let outside = [
             server.min_protocol.saturating_sub(1),
             server.protocol.saturating_add(1),
@@ -627,6 +695,43 @@ mod tests {
             holds(&why, &[&speaks, "accepts 2 to 4", "build d", "build s"]);
         }
         assert!(mismatch(&facts("s", 5, 3), &facts("d", 1, 4)).is_some());
+    }
+
+    /// Catches a binary of another build than its directory's `kbf` passed (the commit
+    /// compared as a prefix or not at all), a version with no `+<commit>` taken for a
+    /// match, the commit read from the wrong word, and a failure that names neither the
+    /// binary nor both commits.
+    #[test]
+    fn a_binary_must_be_the_build_its_directorys_kbf_states() {
+        let facts = facts("0123456789ab", 1, 1);
+        let program = Path::new("/builds/n/kbf-daemon");
+        let problem = |printed: &str| build_problem(program, printed, &facts);
+        assert_eq!(problem("kbf-daemon 0.1.0+0123456789ab\n"), None);
+        assert_eq!(
+            problem("kbf-server 0.1.0+0123456789ab reapi=x worker=y"),
+            None
+        );
+        let why = problem("kbf-daemon 0.1.0+ffffffffffff\n").expect("another build");
+        holds(
+            &why,
+            &[
+                "/builds/n/kbf-daemon is built from commit ffffffffffff",
+                "/builds/n/kbf states commit 0123456789ab",
+                "mixes two builds",
+            ],
+        );
+        for printed in [
+            "kbf-daemon 0.1.0+0123456789a\n",
+            "kbf-daemon 0.1.0+0123456789abc\n",
+            "kbf-daemon 0.1.0\n",
+            "kbf-daemon\n",
+            "",
+            "0.1.0+0123456789ab\n",
+        ] {
+            assert!(problem(printed).is_some(), "{printed:?} passed");
+        }
+        let why = problem("kbf-daemon 0.1.0\n").expect("no commit");
+        holds(&why, &["prints no <version>+<commit>", "kbf-daemon 0.1.0"]);
     }
 
     /// Catches the worker and API addresses read from each other's words, a prefix match
