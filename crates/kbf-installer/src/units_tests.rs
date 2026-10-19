@@ -55,7 +55,11 @@ fn every_linux_unit_runs_the_kbf_the_layout_links_as_current() {
         .collect();
     names.sort();
     for path in names {
-        let name = path.file_name().expect("name").to_string_lossy().into_owned();
+        let name = path
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
         let text = fs::read_to_string(&path).expect("unit");
         for (key, program) in programs(&text) {
             let in_tree = program.starts_with(&format!("{tree}/"));
@@ -73,15 +77,18 @@ fn every_linux_unit_runs_the_kbf_the_layout_links_as_current() {
     }
     // kbf-daemon, kbf-storage, kbf-storage-and-daemon, kbf-all-in-one: a check and a
     // start each; kbf-frontend@: a check and a start.
-    assert!(checked >= 10, "only {checked} kbf commands found in {dir:?}");
+    assert!(
+        checked >= 10,
+        "only {checked} kbf commands found in {dir:?}"
+    );
 }
 
 /// Catches the installer's own unit running a program from the release tree (a
 /// release can be pruned under it) and a unit program that is relative or missing.
 #[test]
 fn the_installer_unit_runs_the_installed_binary() {
-    let text = fs::read_to_string(repo_file("packaging/linux/units/kbf-installer.service"))
-        .expect("unit");
+    let text =
+        fs::read_to_string(repo_file("packaging/linux/units/kbf-installer.service")).expect("unit");
     let progs = programs(&text);
     assert!(progs.len() >= 2, "{progs:?}");
     for (key, program) in progs {
