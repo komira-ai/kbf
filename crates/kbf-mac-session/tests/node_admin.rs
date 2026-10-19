@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use admin_fake::{FakeMac, NOW};
 use kbf_mac_session::node_admin::{self, LOCK_WAIT, Sudo, Verb};
+use kbf_testkit::forked::ForkedChild;
 use rustix::fs::FlockOperation;
 
 fn log_lines(mac: &FakeMac) -> Vec<String> {
@@ -466,13 +467,47 @@ fn the_lock_is_taken_once_free_and_released_at_the_end() {
     let mut held = Some(hold(&mac));
     mac.state.borrow_mut().on_pause = Some(Box::new(move |count| {
         if count == 3 {
-            held.take();
+            // Unlocked, not only closed: a child another test of this binary has forked
+            // (a_child_forked_under_the_lock_does_not_keep_it_after_the_verb) holds a copy
+            // of the descriptor, and so of a lock that is only closed.
+            held.take()
+                .expect("held until the third pause")
+                .unlock()
+                .unwrap();
         }
     }));
     mac.run(&["phase0", "apply"]).succeeded();
     assert_eq!(mac.state.borrow().pauses, 3);
     let after = File::open(mac.lock()).unwrap();
     rustix::fs::flock(&after, FlockOperation::NonBlockingLockExclusive).unwrap();
+}
+
+/// Catches: a lock the end of the verb releases only by closing its descriptor, which a
+/// process forked while the verb held it keeps held until it execs: the next call, in any
+/// process that can see the file, is then told another call still holds it, for as long
+/// as the child is between fork and exec. The child here is forked under the lock and
+/// held before exec until the lock has been tried again, so the interleaving is the
+/// failing one every time.
+///
+/// Mutant: the `Drop` of `Lock` removed.
+#[test]
+fn a_child_forked_under_the_lock_does_not_keep_it_after_the_verb() {
+    let mac = FakeMac::new("lock-forked");
+    let children = Rc::new(RefCell::new(Vec::new()));
+    let forking = Rc::clone(&children);
+    mac.state.borrow_mut().on_command = Some(Box::new(move |_| {
+        if forking.borrow().is_empty() {
+            forking.borrow_mut().push(ForkedChild::before_exec());
+        }
+    }));
+    mac.run(&["phase0", "apply"]).succeeded();
+    assert_eq!(children.borrow().len(), 1, "the verb ran no command");
+    let after = File::open(mac.lock()).unwrap();
+    let tried = rustix::fs::flock(&after, FlockOperation::NonBlockingLockExclusive);
+    assert_eq!(tried, Ok(()), "the lock outlived the verb");
+    for child in children.borrow_mut().drain(..) {
+        child.finish();
+    }
 }
 
 /// Catches: a lock released as soon as it is taken (dropped, not held), so a second

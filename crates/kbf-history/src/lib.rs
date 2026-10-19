@@ -12,6 +12,9 @@
 //!   [`Family`]s, object keys and, under an [`IndexRoot`], index row keys.
 //! - [`HistoryIndex`]: the state store under its [`IndexRoot`], every blocking call run
 //!   through an [`Offload`] (the server's blocking pool, or [`Inline`]).
+//! - [`RowKind`] and [`IndexRoot::permit`]: which kind of row a `ui/` key is (a writer's
+//!   own, an insert, or shared by every writer) and which a process may write once another
+//!   holds the state store's generation.
 //! - [`records`]: run, hit and outcome records, tails, command renderings and the
 //!   failed-run section, each with its `instance`; the index row values.
 //! - [`run_id`]: time-ordered [`RunId`]s, stream blocks and the fallback range.
@@ -36,8 +39,10 @@
 pub mod container;
 mod derived;
 pub mod flog;
+mod header_rows;
 mod index;
 pub mod keys;
+mod kinds;
 mod listing;
 mod pending;
 mod queue;
@@ -54,6 +59,7 @@ pub use derived::DerivedLimits;
 pub use flog::{FlogObject, FlogParts, FlogRef, FlogStore};
 pub use index::{HistoryIndex, Inline, Offload, Offloaded};
 pub use keys::{Class, Day, Family, HistoryRoot, IndexPrefixError, IndexRoot, InvKey, WriterId};
+pub use kinds::{Ownership, RowKind};
 pub use listing::{
     InstanceList, InvocationPage, ListQuery, ListedInvocation, MAX_PAGE, MAX_SCAN, PageCursor,
     PageCursorError, ShapeEntry, ShapePage, StatusEntry, StatusPage,

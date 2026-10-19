@@ -20,6 +20,16 @@ const OPEN_FILE: u32 = 0o644;
 /// The `hosts` file of every action's container: loopback only, as `--network=none`.
 const HOSTS: &str = "127.0.0.1 localhost\n::1 localhost\n";
 
+/// The `resolv.conf` of every action's container: the one nameserver a namespace with
+/// loopback only has, 127.0.0.1, which nothing listens on. A name that is not in `hosts`
+/// then fails at once with a refused query, which glibc reports as `EAI_AGAIN` (a
+/// transient failure, as a node without a reachable resolver gives), never as `EAI_NONAME`
+/// (no such host) and never as a wait for a timeout. glibc fails at once on the refused
+/// query; musl sends on an unconnected socket and would wait out its default 5 s twice per
+/// lookup, which `timeout:1 attempts:1` bounds. The image's own file, if it ships one, is
+/// covered.
+pub(crate) const RESOLV_CONF: &str = "nameserver 127.0.0.1\noptions timeout:1 attempts:1\n";
+
 /// Writes `bytes` to `path`, readable by others.
 async fn write_open(path: &Path, bytes: &[u8]) -> Result<(), JobError> {
     at(path, tokio::fs::write(path, bytes).await)?;
@@ -58,8 +68,8 @@ impl Oci {
         self.run_jobs("give", Mapping::Setup, &[job]).await
     }
 
-    /// Writes the bundle of `spec`: `config.json` and the `hosts` and `hostname` files it
-    /// binds.
+    /// Writes the bundle of `spec`: `config.json` and the `hosts`, `hostname` and `resolv.conf`
+    /// files it binds.
     async fn write_bundle(&self, spec: &ContainerSpec) -> Result<(), JobError> {
         open_dir(&spec.dir).await?;
         let etc = spec.dir.join("etc");
@@ -67,6 +77,7 @@ impl Oci {
         write_open(&etc.join("hosts"), HOSTS.as_bytes()).await?;
         let hostname = format!("{}\n", spec::HOSTNAME);
         write_open(&etc.join("hostname"), hostname.as_bytes()).await?;
+        write_open(&etc.join("resolv.conf"), RESOLV_CONF.as_bytes()).await?;
         let rootfs = self.images.rootfs_of(&spec.image_digest);
         let placement = spec::Placement {
             rootfs: &rootfs,
