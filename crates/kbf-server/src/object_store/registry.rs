@@ -15,6 +15,7 @@ use prost::Message as _;
 use subtle::ConstantTimeEq as _;
 
 use super::Step;
+use super::probe::check_endpoint;
 use super::rows::{
     AUDIT_PREFIX, AuditRow, BIND_PREFIX, BindRow, CONN_PREFIX, ConnRow, GEN_KEY, GenRow,
     action_code, action_of, audit_key, bind_key, conn_key, decode, outcome_code, outcome_of,
@@ -193,6 +194,9 @@ pub fn cold_store_view(store: &dyn Store) -> Result<ColdStoreView, RegistryError
 
 /// The URI of the store `bind` and `conn` register, checked to read back as itself.
 fn cold_uri(bind: &BindRow, conn: &ConnRow) -> Result<String, RegistryError> {
+    // The checks registration makes: a row written by anything else still yields no
+    // userinfo, no https and no path in the URI a node is sent.
+    check_endpoint(&conn.endpoint).map_err(|_| RegistryError::Corrupt("conn"))?;
     let prefix = match bind.prefix.as_str() {
         "" => DEFAULT_S3_PREFIX.to_owned(),
         p if p.ends_with('/') => p.to_owned(),
@@ -211,9 +215,11 @@ fn cold_uri(bind: &BindRow, conn: &ConnRow) -> Result<String, RegistryError> {
         min_put_rate: NonZeroU64::new(conn.min_put_rate).unwrap_or(DEFAULT_MIN_PUT_RATE),
     };
     let uri = s3.node_uri();
-    match uri.parse::<StoreUri>() {
-        Ok(StoreUri::S3(back)) if back == s3 => Ok(uri),
-        _ => Err(RegistryError::Corrupt("bind")),
+    let back = uri.parse::<StoreUri>().ok();
+    if back.as_ref().and_then(StoreUri::as_s3) == Some(&s3) {
+        Ok(uri)
+    } else {
+        Err(RegistryError::Corrupt("bind"))
     }
 }
 

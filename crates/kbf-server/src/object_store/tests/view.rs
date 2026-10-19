@@ -6,15 +6,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, Cond, Revision, ScanPage, ScanRange, Store,
-    StoreError, StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Cond, Conflict, Revision, ScanPage, ScanRange, Store, StoreError,
+    StoreTime, Txn, Versioned,
 };
 use kbf_types::object_store_api::BindingRole;
 use prost::Message as _;
 
 use super::{SENTINEL, as_store, bind, fake, name, open, put, scratch};
 use crate::object_store::registry::cold_store_view;
-use crate::object_store::rows::BindRow;
+use crate::object_store::rows::{BindRow, ConnRow, conn_key};
 use crate::object_store::{ColdStoreView, Registry, RegistryError};
 
 fn bound(store: &Arc<dyn Store>, label: &str) -> Registry {
@@ -47,7 +47,8 @@ fn no_binding_is_no_uri_at_the_registry_generation() {
             uri: None
         }
     );
-    reg.put_binding(BindingRole::Cold, &bind("cold", "farm")).unwrap();
+    reg.put_binding(BindingRole::Cold, &bind("cold", "farm"))
+        .unwrap();
     assert_eq!(view(&store).generation, 2);
     reg.delete_binding(BindingRole::Cold).unwrap();
     assert_eq!(view(&store).uri, None, "a binding taken back is no store");
@@ -104,7 +105,8 @@ fn the_registered_settings_are_in_the_uri() {
 fn rows_that_do_not_make_a_store_are_corrupt_not_absent() {
     let store = as_store(&fake());
     let reg = bound(&store, "view-bad");
-    reg.put_binding(BindingRole::Cold, &bind("cold", "b?x")).unwrap();
+    reg.put_binding(BindingRole::Cold, &bind("cold", "b?x"))
+        .unwrap();
     let err = cold_store_view(&*store).unwrap_err();
     assert!(matches!(err, RegistryError::Corrupt("bind")), "{err}");
 
@@ -115,13 +117,48 @@ fn rows_that_do_not_make_a_store_are_corrupt_not_absent() {
         updated_generation: 1,
     };
     let write = |connection: &str| {
-        let txn = Txn::new().put("objstore/bind/cold", row(connection, "b").encode_to_vec(), Cond::Any);
+        let txn = Txn::new().put(
+            "objstore/bind/cold",
+            row(connection, "b").encode_to_vec(),
+            Cond::Any,
+        );
         store.txn(txn).unwrap().unwrap();
     };
     write("NOT A NAME");
     let err = cold_store_view(&*store).unwrap_err();
     assert!(matches!(err, RegistryError::Corrupt("bind")), "{err}");
     write("gone");
+    let err = cold_store_view(&*store).unwrap_err();
+    assert!(matches!(err, RegistryError::Corrupt("conn")), "{err}");
+}
+
+// Catches a connection row whose endpoint carries a password (or another shape the
+// registration refuses) being put into the URI a storage node is sent: the view checks the
+// endpoint again, so "no userinfo in the URI" holds whatever the rows hold.
+#[test]
+fn a_connection_row_with_userinfo_is_corrupt_and_makes_no_uri() {
+    let store = as_store(&fake());
+    let reg = bound(&store, "view-userinfo");
+    reg.put_binding(BindingRole::Cold, &bind("cold", "b"))
+        .unwrap();
+    view(&store);
+    let key = conn_key(&name("cold"));
+    let stored = store.get(&key).unwrap().expect("the connection row");
+    let mut row = ConnRow::decode(&*stored.value).expect("a row");
+    for endpoint in [
+        "http://user:hunter2@s3.example:9000",
+        "https://s3.example:9000",
+    ] {
+        row.endpoint = endpoint.to_owned();
+        let txn = Txn::new().put(&key, row.encode_to_vec(), Cond::Any);
+        store.txn(txn).unwrap().unwrap();
+        let err = cold_store_view(&*store).unwrap_err();
+        assert!(matches!(err, RegistryError::Corrupt("conn")), "{err}");
+        assert!(!err.to_string().contains("hunter2"), "{err}");
+    }
+    // A connection row that does not decode is corrupt too, not absent.
+    let txn = Txn::new().put(&key, vec![0xff, 0xff, 0xff], Cond::Any);
+    store.txn(txn).unwrap().unwrap();
     let err = cold_store_view(&*store).unwrap_err();
     assert!(matches!(err, RegistryError::Corrupt("conn")), "{err}");
 }
@@ -174,7 +211,9 @@ impl Store for Changing {
 fn changing(label: &str, times: usize) -> Changing {
     let inner = as_store(&fake());
     let writer = bound(&inner, label);
-    writer.put_binding(BindingRole::Cold, &bind("cold", "b")).unwrap();
+    writer
+        .put_binding(BindingRole::Cold, &bind("cold", "b"))
+        .unwrap();
     Changing {
         inner,
         writer,
@@ -190,7 +229,10 @@ fn changing(label: &str, times: usize) -> Changing {
 fn a_write_between_the_reads_is_read_again() {
     let store = changing("view-retry", 1);
     let seen = cold_store_view(&store).expect("a view");
-    assert_eq!(seen.generation, 3, "connection, binding, then the region change");
+    assert_eq!(
+        seen.generation, 3,
+        "connection, binding, then the region change"
+    );
     assert!(
         seen.uri.expect("a uri").contains("region=r0"),
         "the rows of the generation named"
