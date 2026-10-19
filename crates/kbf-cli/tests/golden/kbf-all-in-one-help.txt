@@ -389,35 +389,35 @@ Options:
           
           [default: 4]
 
+      --drain-deadline-secs <DRAIN_DEADLINE_SECS>
+          On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0. A second signal, or this many seconds after the first, stops it at once and abandons the leases still running. Used by `kbf daemon`; the combined modes stop their daemon half with the other half
+          
+          [default: 600]
+
       --write-pool-writers <WRITE_POOL_WRITERS>
           The writers of the write pool: the ByteStream and storage `Write`s of a node with a write tier are appended to shared segment files by this many writers, each holding one range open, so the node keeps at most this many block files (plus the open grouped block) open for writing for those blobs, however many uploads are in flight. At least 1
           
           [default: 8]
-
-      --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
-          How often each lease's `max` events and swap are sampled, in milliseconds (container)
-          
-          [default: 1000]
 
       --write-pool-queue <WRITE_POOL_QUEUE>
           The most blobs waiting for a write-pool writer. A blob that finds the queue full goes straight to the object store, as one does when the write tier has no room. At least 1
           
           [default: 4096]
 
-      --memory-limit-percent <MEMORY_LIMIT_PERCENT>
-          A lease's processes are killed past this percentage of its booked memory...
+      --lease-swap-poll-ms <LEASE_SWAP_POLL_MS>
+          How often each lease's `max` events and swap are sampled, in milliseconds (container)
           
-          [default: 150]
+          [default: 1000]
 
       --write-pool-stream-idle <WRITE_POOL_STREAM_IDLE>
           How long, in seconds, a streamed blob may go without sending a chunk before its write-pool writer is taken back and the upload fails UNAVAILABLE (the client sends it again). Without it, a stalled but connected large upload would hold a writer for ever, and with all writers held every other blob would wait. It limits stalls only: an upload that sends a chunk more often than this (a trickle) can still hold a writer. At least 1
           
           [default: 30]
 
-      --memory-headroom-mib <MEMORY_HEADROOM_MIB>
-          ...plus this many MiB (native). A lease that booked nothing has no limit
+      --memory-limit-percent <MEMORY_LIMIT_PERCENT>
+          A lease's processes are killed past this percentage of its booked memory...
           
-          [default: 512]
+          [default: 150]
 
       --store-put-attempts <STORE_PUT_ATTEMPTS>
           How many times a segment PUT is tried. Only a PUT that did not complete (connect, reset, timeout) or that the store answered 5xx is tried again, after 100 ms and then four times longer each time, under a new object key; if every attempt fails, the segment's blobs are answered UNAVAILABLE
@@ -429,30 +429,40 @@ Options:
           
           [default: 1048576]
 
-      --memory-poll-ms <MEMORY_POLL_MS>
-          How often a lease's memory is measured, in milliseconds (native)
+      --memory-headroom-mib <MEMORY_HEADROOM_MIB>
+          ...plus this many MiB (native). A lease that booked nothing has no limit
           
-          [default: 250]
+          [default: 512]
 
       --input-tree-cache-bytes <INPUT_TREE_CACHE_BYTES>
           The most bytes of decoded Directories the input check keeps (each costs its digests, 40 bytes apiece, and 160 bytes)
           
           [default: 268435456]
 
-      --xcode-apps <XCODE_APPS>
-          The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
+      --memory-poll-ms <MEMORY_POLL_MS>
+          How often a lease's memory is measured, in milliseconds (native)
           
-          [default: /Applications]
+          [default: 250]
 
       --input-tree-reads-in-flight <INPUT_TREE_READS_IN_FLIGHT>
           The most Directory blobs the input check reads from the store at once, across all Executes
           
           [default: 64]
 
+      --xcode-apps <XCODE_APPS>
+          The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
+          
+          [default: /Applications]
+
       --xcode-recheck-secs <XCODE_RECHECK_SECS>
           How often, in seconds, the Xcodes are asked again (native), so one fixed while the daemon runs becomes ready without a restart
           
           [default: 180]
+
+      --member-ttl-secs <SECONDS>
+          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
+          
+          [default: 15]
 
       --require-metal-toolchain
           This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
@@ -460,21 +470,16 @@ Options:
       --image <IMAGE>
           A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 
-      --member-ttl-secs <SECONDS>
-          How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
+      --member-dwell-secs <SECONDS>
+          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
           
-          [default: 15]
+          [default: 300]
 
       --lease-placement <none|numa-node>
           Where each lease runs among the node's CPUs (container, Linux): `none`, the default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus` is a quota on all leases together, so it still applies; it removes no CPU from a node. Needs the `cpuset` controller delegated to the daemon (the start fails and says how when it is not); a host with fewer than two NUMA nodes that hold CPUs runs as `none`, which the start logs. Refused with a driver other than `container` (macOS has no such driver)
           
           [default: none]
           [possible values: none, numa-node]
-
-      --member-dwell-secs <SECONDS>
-          How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
-          
-          [default: 300]
 
       --oci-runtime <OCI_RUNTIME>
           The OCI runtime that runs each action's container (container): `crun`, run directly. Each action gets a fresh rootless sandbox. It needs the daemon user's subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on `PATH`, and every directory down to `--data-dir` searchable by others

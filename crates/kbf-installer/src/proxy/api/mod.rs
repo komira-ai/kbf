@@ -67,8 +67,8 @@
 //!   `step: compat` ([`traits::CompatGate`]).
 //! - **Request map (Q5).** `requests.json` in the proxy state directory is this module's
 //!   own file ([`idempotency`]); `update.json` (the swap's intent) is U7's.
-//! - **Restart marker (FP section 10).** The path of the postinst marker is not fixed by
-//!   the design; [`traits::RestartMarker`] takes it from the caller.
+//! - **Restart pending (FP section 10).** `restart_pending` is asked of the caller's
+//!   [`traits::RestartPending`]; the proxy passes its `RunningBinary`. No marker file.
 //! - **The confirm window** the orders ask for is [`core::Config::window_s`].
 //! - **Operator port forwards.** `/v1/update/pause` and `/v1/update/resume` are the paths
 //!   of the two forwarded verbs (FP names `/pause`, `/resume` under `/v1/update`).
@@ -89,7 +89,8 @@
 //!   [`super::ports::Requests`] queue and answer with the phase read from
 //!   [`super::Swap::intent`]; the swap decides later whether it can honor them.
 //! - `status` is built from the intent record (`phase`, `phase_started`, slots) plus
-//!   [`super::ports::Gate::open_streams`] and [`super::ports::ChildAdmin::open_counts`].
+//!   [`super::ports::Gate::open_streams`] and [`super::ports::ChildAdmin::open_counts`]
+//!   (`open_streams` and `open_sessions` of the child's role view).
 //!   The intent keeps `nodes_posted` as a bool, the API wants a count: the adapter maps
 //!   it to 0 or 1, which is all [`model::rollback_gate`] reads.
 //! - `force_retire` has no counterpart in the swap, which leaves a draining old child

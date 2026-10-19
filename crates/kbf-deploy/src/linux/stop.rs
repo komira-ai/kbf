@@ -18,9 +18,12 @@
 //! - `KillSignal=SIGTERM` (or `TERM` or `15`, as `signal_from_string` reads it), given:
 //!   kbf drains on it, and the rule does not trust the default to stay SIGTERM.
 //!
-//! Not for `daemon`: a daemon does not drain on SIGTERM (its leases are abandoned; the
-//! operator API's `POST /v1/nodes/{node}:drain` empties a node before it is stopped), so
-//! an infinite stop would only hold a reboot on a daemon that hangs.
+//! Not for `daemon`: a daemon drains on SIGTERM too, but only up to `--drain-deadline-secs`
+//! (600 by default), when it stops and abandons the leases still running. So its unit
+//! has a finite `TimeoutStopSec=` above that deadline (660) and `KillSignal=SIGTERM`
+//! (the package's `package_units` test requires both), and an infinite stop would only
+//! hold a reboot on a daemon that hangs. The infinite rule is for the modes that drain
+//! for as long as it takes.
 //!
 //! What it cannot see: a value systemd ignores because it cannot parse it (a later
 //! `TimeoutStopSec=` it ignores keeps the earlier one, and the rule fails the unit: a

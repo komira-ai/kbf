@@ -479,8 +479,8 @@ restart it. `kbf cluster member <id> --state active|draining --token-file F` cal
 
 The operator's side of enrollment (`design/install-and-enrollment.md`):
 the tokens a node enrolls with, and the registry of nodes that did. They live in the state
-store, so a frontend that has no enrollment (until the enroll service lands, every
-frontend) answers every one of these routes with `404` once the call passes the gates.
+store, so a frontend that has no enrollment (one started without `--enroll-listen`)
+answers every one of these routes with `404` once the call passes the gates.
 
 **Every route here, a GET included, passes every gate of [Who may write](#who-may-write):**
 a loopback peer (one that presents the proxy's secret, with `--proxy-auth-file`), no `Origin` header, the bearer token, and `Content-Type: application/json`
@@ -551,6 +551,121 @@ curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json'
 
 A UI comes later.
 
+## `kbf.enroll.v1`: `Enroll` and `Renew` on `--enroll-listen`
+
+The node's side of enrollment: a gRPC service (`kbf.enroll.v1.Enroll`, two methods) on a
+listener of its own, **off unless `--enroll-listen=<addr>` is given**. It is served over
+TLS that authenticates the server only (a node with no certificate yet cannot present
+one). The server certificate is the frontend's own, issued by the farm CA for the
+`--frontend-name` list and held in memory (never written), replaced at half its life; the
+chain it sends is the leaf and then the root. A node learns the CA from its token, which
+carries the SHA-256 of the root, and pins it.
+
+**Flags** (all are the frontend's alone, and every one but `--enroll-listen` needs it):
+
+| Flag | Meaning |
+|---|---|
+| `--enroll-listen=ADDR` | serve `Enroll` and `Renew` here; needs `--state-store`, `--ca-dir`, `--frontend-name` and a signer flag |
+| `--ca-dir=DIR` | the CA directory (`ca.key` mode `0600`, `ca.pem`). Empty or missing: a new CA is made once. Holding a CA: it is loaded and **nothing is overwritten**. Holding anything else, or half a CA: refused, untouched |
+| `--ca-signer=SOCKET` | **production.** The CA key lives in a `kbf-signer` process; this process holds none. `--ca-dir` must hold the `ca.pem` the signer made, and the signer's public key must match it |
+| `--ca-dev-file-signer` | development and tests only: the key is a file in this process. A start with neither signer flag fails, so production cannot end up holding the key by default |
+| `--frontend-name=NAME` | a DNS name or address this frontend serves (repeat). The listener's certificate carries them; no node may advertise one, or a host under one |
+| `--enroll-cert-lifetime-secs=N` | certificate life, 3600 to 2592000 (default 604800); nodes renew at half. The signer's own `--lifetime-secs` must be at least this |
+| `--enroll-rate-per-minute=N`, `--enroll-rate-burst=N`, `--enroll-max-in-flight=N` | the limits below (defaults 60, 30, 64) |
+| `--enroll-worker-endpoint`, `--enroll-cas-endpoint`, `--enroll-storage-port` | what every node is told (`NodeConfig`) |
+| `--enroll-allow-unenforced-deny` | see the start gate |
+
+With `--instance=b` the enroll port moves ten above, as the others do.
+
+
+**Order of an `Enroll`.** The shape (ids, role names, the size of each CSR) is checked
+first and reads nothing. Then, in one registry transaction: the token **secret** (an
+unknown id and a wrong secret are the same refusal after the same work, byte for byte);
+**idempotency** (a request already served is answered from the stored node); the token's
+**policy** (revoked, expired, used up, roles, node id, advertise names; the roles asked
+must be a subset of the token's); and only then the CA: each CSR is parsed
+(`kbf_ca::parse_csr`: ECDSA P-256, `ecdsa-with-SHA256`, at most 2 KiB, a signature that
+verifies) and a certificate is issued for it. A CSR is therefore parsed only for a caller
+who proved the secret. The answer carries one certificate per role, the CA bundle (PEM),
+the frontend's clock (`server_time`), `renew_after` (half-way through the shortest life)
+and the `NodeConfig`. A storage node must send `advertise` (`host:port`) and no other node
+may; the host may not be a frontend name, `localhost`, or a loopback, unspecified,
+link-local or multicast address. Set `node.advertise` in `kbf.toml` on a storage node.
+
+**`Renew`** needs no token: the node signs a CSR per role with the key the registry holds
+and puts `issued_at` among the signed attributes. Checked: the node exists and is not
+revoked; it asks for exactly the roles it holds, each with the **same key**; the CSR's
+`issued_at` attribute **equals** `RenewRequest.issued_at` (the field is not signed, so a
+captured CSR replayed under a new field is refused `MalformedRequest`); `issued_at` is
+within five minutes of the frontend's clock; the same CSR was not seen in the last ten
+minutes and the node did not renew in the last minute. Certificates are issued for the
+same keys. The answer carries `config` only when the node's `config_generation` differs.
+
+**Refusals** are exactly a `RefusalReason`: the gRPC status code is `reason.code()` and
+the message is `reason.message()`, byte for byte, with no detail. The node client
+recognises a refusal only by both. `NotSigner` is a frontend that lost the writer role,
+or whose CA cannot sign now (its signer is down, the clock is before the build's floor);
+any other state-store failure is `StoreUnavailable`.
+
+**Limits.** The request body is at most **16 KiB** (a longer message is `MalformedRequest`).
+A token bucket per **TCP peer address** (an IPv6 address counts as its /64) allows the
+burst, then the per-minute rate, and at most `--enroll-max-in-flight` calls run at once; the rest are `RateLimited`.
+The table of sources is bounded (4096). Behind the bundled kbf-proxy (which routes
+`kbf.enroll.v1` to the child's `--enroll-listen`) every peer is loopback, so these limits are
+in effect one global bucket for the listener; the per-client-address limit is the proxy's, on
+its accept path. **The counts are in memory: they start again at a restart**, so a new
+process gives every source a full bucket. A call is
+ended after 30 seconds and a TLS handshake after its own deadline.
+
+**Start gate (design section 8.3).** Revoking a node refuses its renewal at once, but the
+deny rows it writes are enforced by storage and the worker listener only when the
+revocation unit lands (`enroll::gate::DENY_ENFORCED`, `false` in this build). Until then
+`--enroll-listen` is **refused at start** unless `--enroll-allow-unenforced-deny` is also
+given, which accepts that a revoked node is still served by storage until its certificate
+expires (at most `--enroll-cert-lifetime-secs`). The refusal happens before the CA
+directory or any socket is touched.
+
+### Operator steps
+
+1. Start the frontend with the listener (development shown; production replaces the signer
+   flag with `--ca-signer=/run/kbf-signer/signer.sock`):
+
+   ```sh
+   kbf --mode=frontend ... --state-store=<uri> --api-token-file /etc/kbf/api.token \
+     --enroll-listen=0.0.0.0:7444 --frontend-name=kbf.example.com \
+     --ca-dir=/var/lib/kbf/ca --ca-dev-file-signer --enroll-allow-unenforced-deny
+   ```
+
+2. Make a token, on the frontend's host (the answer holds the token string once):
+
+   ```sh
+   T=$(cat /etc/kbf/api.token); API=http://127.0.0.1:<api port>
+   curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+     -d '{"roles": ["storage","daemon"], "max_uses": 1, "expires_in": 3600, "node_id": "node-07", "label": "rack 4"}' \
+     $API/v1/enroll/tokens
+   # {"token": "kbft1.<id>.<secret>.<pin>", ...}
+   ```
+
+3. On the node, place `/etc/kbf/kbf.toml` and the token file (mode `0600`, owned by the
+   service user, one line), then start it:
+
+   ```toml
+   [frontend]
+   url = "https://kbf.example.com:7444"
+   [node]
+   id = "node-07"
+   advertise = "node-07.nodes.example.com:8983"   # storage nodes only
+   [enroll]
+   token_file = "/var/lib/kbf/enroll.token"
+   ```
+
+   The node enrolls, installs its keys and certificates, removes the token file, and
+   renews at half life. The token limits the roles; the mode the node runs is the
+   operator's choice.
+
+4. Revoke a node or a token with the routes above. A revoked node is refused `NodeRevoked`
+   on its next renewal.
+
 ## `GET /v1/storage`
 
 Whether every blob is known to have its copies elsewhere: the number a rollout asks
@@ -606,9 +721,17 @@ again. A member that left the map (a `DOWN` member leaves after the dwell) is no
 
 A `kbf --mode frontend` started with `--admin-listen <addr>` serves these on a port of
 their own, separate from the operator API. The address must be a loopback address (any
-other is refused at start, in the flags and again when the port is bound), and the calls
-carry no credential: they move the scheduler's role, so nothing but the host's own
-processes may reach them. The port needs `--state-store`. The calls and the `role` answer
+other is refused at start, in the flags and again when the port is bound): the calls move
+the scheduler's role, so nothing but the host's own processes may reach them. The port
+needs `--state-store`.
+
+**Who may call.** With `--proxy-auth-file` (a frontend behind the proxy) every call, `GET
+role` too, must present the proxy's secret as `x-kbf-proxy-auth: <64 hex digits>` (the
+header of [Behind the farm's proxy](#behind-the-farms-proxy); no identity header is
+needed). A call with no secret, or a wrong one, is refused `403` with
+`{"error": "..."}`, as on the operator API, and is not acted on. The proxy sends the secret
+on every admin call. Without `--proxy-auth-file` the calls take no credential: the port is
+loopback-only and every local process may call it, which is for a host with no proxy. The calls and the `role` answer
 are versioned by `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`).
 
 **`GET /v1/admin/role`**:
@@ -1507,10 +1630,10 @@ treated as `UNAVAILABLE`. `UNAVAILABLE` for a caller ahead of the node is the no
 lost push: the caller's map may be the right one, so the caller tries again, and the
 node's next push makes the call succeed.
 
-## `PUT /v1/releases/{commit}/{platform}/{name}` and `GET /v1/releases`
+## `PUT /v1/releases/{commit}/{platform}/{name}`, `GET /v1/releases` and `GET /v1/releases/{commit}`
 
 The frontend's release store (`docs/design/pull-updates.md` section 6.3): the tarballs of a
-release and their build attestations, kept as uploaded. Mounted by `--releases-dir`; without a store both answer
+release and their build attestations, kept as uploaded. Mounted by `--releases-dir`; without a store all three answer
 `503` naming `--releases-dir`.
 
 - `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
@@ -1523,7 +1646,12 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
   a `.partial` file, synced, and renamed into place, so an interrupted upload leaves nothing
   visible.
 - `201` `{"sha256", "size"}` for a new key. A release is immutable: the same bytes again are
-  `200` with the same answer, other bytes are `409` and change nothing.
+  `200` with the same answer, other bytes are `409` and change nothing. The answer for a
+  bundle carries the bundle's own digest, and the store also names the bundle by that
+  digest next to the tarballs (one file, two names), so that `ReleaseService.Fetch` serves a
+  bundle like a tarball. A bundle stored before that link existed has no such name until the
+  same bytes are put again (`200`); `Describe` reports it as lacking until then, though
+  `GET /v1/releases` and the offers still count its platform complete.
 - `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
   "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
   order above, a platform `complete` when it holds, with their attestations, the tarballs its
@@ -1536,6 +1664,80 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
   operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
   store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
   update endpoint answers `503`.
+
+### `ReleaseService.Describe` and `GET /v1/releases/{commit}`
+
+What the store holds of one release, for a caller that was given no offer: the installer's
+`frontend_update` order names a commit and nothing else (`docs/design/kbf-installer.md`
+section 5), so it asks the release source what the commit holds before it fetches. The
+answer is claims, not trust: the installer fetches each file by its digest and verifies the
+tarball against its bundle, which it does for an offer's components too.
+
+`rpc Describe(DescribeRequest) returns (ReleaseDescription)` on `kbf.update.v1.ReleaseService`
+(`crates/kbf-proto/proto/kbf/update/v1/update.proto`):
+
+- `DescribeRequest{commit, platform}`: `commit` is 40 lowercase hex digits; `platform` is
+  `linux-x86_64`, `linux-arm64` or `darwin-arm64`, or empty for every platform the release
+  is complete for.
+- `ReleaseDescription{commit, components}`: one `ReleaseComponent{name, platform, tarball,
+  sha256, size, bundle_sha256, bundle_size}` for each tarball a host of each described
+  platform needs (the same rule as an offer: `kbf` for a Linux platform, `kbf-daemon` for
+  `darwin-arm64`, and nothing else the store happens to hold), in platform order
+  (`linux-x86_64`, `linux-arm64`, `darwin-arm64`). `tarball` is the file name
+  `<name>-<commit>-<platform>.tar.gz`; `sha256` and `size` are the tarball's;
+  `bundle_sha256` and `bundle_size` are the build-provenance bundle's
+  (`<tarball>.sigstore.json`, at most 256 KiB). Both files are served by `Fetch` under their
+  digests.
+- A platform is described only when complete: every tarball it needs is stored with its
+  bundle, and the bundle is served by its digest. With a platform asked, one that is not
+  complete fails the call. With none asked, an incomplete platform is left out and the call
+  fails only when none is complete.
+- `INVALID_ARGUMENT` for a commit that is not exactly 40 lowercase hex digits (a 12-digit
+  short commit included) and for a platform that is not one of the three; `NOT_FOUND` when no
+  tarball of the commit is stored (a bundle alone is not a release); `FAILED_PRECONDITION`
+  when the platform asked is not complete, or none is, with a message that names what is
+  lacking per platform (`linux-arm64 has no tarball of kbf`, `linux-x86_64 has no attestation
+  of kbf`, or a bundle not served by its digest, which putting it again repairs);
+  `UNAVAILABLE` without `--releases-dir`; `INTERNAL` for a store that fails, saying only that.
+- **Who may call it** is the rule of `Fetch`, one row of the worker listener's role table:
+  under mutual TLS the daemon role alone (another role is `PERMISSION_DENIED`, no certificate
+  is `UNAUTHENTICATED`); in plain-text worker mode it is open, like every worker method.
+  The service itself checks nothing.
+
+`GET /v1/releases/{commit}` answers the same description for every complete platform as
+JSON, open like `GET /v1/releases`: `200`, `400` for a commit that is not 40 lowercase hex
+digits, `404` when no tarball of it is stored, `409` when no platform is complete (the
+message is `Describe`'s), `503` without a store.
+
+```json
+{
+  "schema": 1,
+  "commit": "<40 hex>",
+  "components": [
+    {
+      "name": "kbf",
+      "platform": "linux-x86_64",
+      "tarball": "kbf-<commit>-linux-x86_64.tar.gz",
+      "sha256": "<64 hex>",
+      "size": 123,
+      "bundle_sha256": "<64 hex>",
+      "bundle_size": 456
+    }
+  ]
+}
+```
+
+`schema` is `1`. A field is added without moving it; a reader takes `schema` 1 only, ignores
+keys it does not know, and holds every value to the shape above before it uses it.
+
+**The `url` source's file.** A `url` release source is a static HTTPS server of the store's
+layout (`docs/design/kbf-installer.md` section 5): `files/<sha256>` holds every tarball and
+every bundle by digest, and `releases/<commit>.json` is this route's body, saved. Nothing
+in this repository writes that tree: the release workflow attaches tarballs and bundles to a
+GitHub release by name, and `kbf-server` serves no files over HTTP. A mirror is made from a
+frontend's store: copy its `files/` directory and save the route's body for each commit
+(`curl -fsS "$API/v1/releases/$COMMIT" > releases/$COMMIT.json`); a commit that is not
+complete for any platform has no file to save (`409`).
 
 ## `GET /v1/update` and `POST /v1/update/{desired,pause,resume}`
 

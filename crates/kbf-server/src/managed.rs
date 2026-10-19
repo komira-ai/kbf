@@ -2,6 +2,11 @@
 //! 5 and 10): `--admin-listen` serves the calls of [`http`], and `--await-takeover` starts
 //! the process as a candidate.
 //!
+//! **Who may call the admin port.** It is loopback-only. With `--proxy-auth-file` every call
+//! must also present the proxy's secret ([`http`]), else it is refused `403` and not acted
+//! on: another process of the host is not the proxy. Without the flag the port takes no
+//! credential, for a host with no proxy.
+//!
 //! **A candidate** opens the state store without taking the generation and without
 //! touching the epoch, binds the REAPI and operator API listeners, and serves only
 //! `/readyz`, the health service and `GetCapabilities` ([`candidate`]). It binds no worker
@@ -116,6 +121,8 @@ impl Managed {
         if !crate::config::loopback_only(admin.listen.ip()) {
             return Err(format!("{} is not a loopback address", admin.listen).into());
         }
+        // Behind the proxy the port takes only its secret; without one it is loopback-only.
+        let proxy_secret = flags.server.proxy()?.map(|behind| behind.secret);
         let stop = Stop::new();
         let forward = stop.clone();
         let forwarding = tokio::spawn(async move {
@@ -159,13 +166,18 @@ impl Managed {
             running = Some(handle);
         }
         let routes = http::router(Arc::clone(&control));
+        let routes = if proxy_secret.is_some() {
+            http::secured(routes)
+        } else {
+            routes
+        };
         let stopped = stop.fired();
         let served = tokio::spawn(async move {
             // The admin port ends with the process; a listener that fails shows as calls
             // that are refused.
-            // No proxy secret: the port is loopback-only and its calls read no identity
-            // headers, which the gate strips.
-            let _ = serve_api(Some(listener), routes, stopped, None).await;
+            // The gate decides who presented the secret and strips every identity header:
+            // the calls read none, only whether the secret came.
+            let _ = serve_api(Some(listener), routes, stopped, proxy_secret).await;
         });
         // The forwarder ends with the signal; it holds nothing else.
         drop(forwarding);
