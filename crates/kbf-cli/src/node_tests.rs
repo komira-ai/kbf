@@ -12,12 +12,11 @@ use crate::parse_from;
 
 const FRONTEND: &str = "https://farm.example:8990";
 
-/// A scratch directory of this test run.
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-cli-node-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    std::fs::canonicalize(&dir).expect("canonical")
+/// A scratch directory (canonical path) removed when it drops. A unit test gets no
+/// `CARGO_TARGET_TMPDIR`, so it is under the system's temporary directory.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical");
+    kbf_testkit::dir::TestDir::under(temp, &format!("kbf-cli-node-{name}"))
 }
 
 /// A `kbf.toml` for node-02 with `extra` lines, its state under `root`.
@@ -83,14 +82,15 @@ fn strings(argv: &[OsString]) -> Vec<String> {
 }
 
 struct Case {
-    root: std::path::PathBuf,
     store: Store,
+    /// Last, so it drops after the store that has files in it.
+    root: kbf_testkit::dir::TestDir,
 }
 
 fn case(name: &str) -> Case {
     let root = scratch(name);
     let store = Store::open(&root.join("state")).expect("state dir");
-    Case { root, store }
+    Case { store, root }
 }
 
 fn pki(c: &Case, file: &str) -> String {
