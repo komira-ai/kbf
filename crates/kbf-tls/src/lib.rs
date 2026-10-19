@@ -26,7 +26,7 @@ mod config;
 mod incoming;
 mod source;
 
-pub use config::{TlsError, TlsFiles};
+pub use config::{TlsError, TlsFiles, server_config_optional_client};
 pub use incoming::{
     Conn, ConnInfo, HANDSHAKE_TIMEOUT, Incoming, peer_certs, peer_certs_of, remote_addr,
 };
