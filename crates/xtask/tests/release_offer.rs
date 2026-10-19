@@ -686,6 +686,10 @@ impl Cli {
     }
 
     fn run(&self, extra: &[&str]) -> (Option<i32>, String, String) {
+        self.run_with(extra, None)
+    }
+
+    fn run_with(&self, extra: &[&str], defect: Option<&str>) -> (Option<i32>, String, String) {
         let tmp = self.fx.root.join("tmp");
         std::fs::create_dir_all(&tmp).unwrap();
         let out = Command::new(XTASK)
@@ -700,6 +704,7 @@ impl Cli {
             .env("TMPDIR", &tmp)
             .env("NO_PROXY", "*")
             .env_remove("XTASK_FAKE_DEFECT")
+            .envs(defect.map(|d| ("XTASK_FAKE_DEFECT", d)))
             .output()
             .expect("run xtask");
         let t = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
@@ -843,4 +848,22 @@ fn the_cli_has_no_default_out() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(!c.fx.root.join("offer.json").exists());
+}
+
+#[test]
+fn the_beta_control_catches_a_gh_that_ignores_the_commit() {
+    // A gh that accepts the beta bundle for any commit passes the verification itself;
+    // only the control (the same bundle asked for another commit) can fail the run. The
+    // defect applies to the beta workflow only, so the artifacts controls pass first.
+    // Mutant: skip the beta control in `Gh::beta`.
+    let c = cli("cli-beta-control");
+    let beta = put_beta(&c.fx.root, &beta_doc(C, &c.fx.set));
+    c.attest(Some(&beta));
+    let b = beta.to_str().unwrap();
+    let (code, _, err) = c.run_with(&["--beta-result", b], Some("beta-bundle-any-commit"));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("control failed: the beta bundle of"), "{err}");
+    assert!(!c.out.exists());
+    let (code, _, err) = c.run(&["--beta-result", b]);
+    assert_eq!(code, Some(0), "{err}");
 }
