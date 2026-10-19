@@ -29,7 +29,12 @@ pub(super) struct Scratch(pub kbf_testkit::dir::TestDir);
 
 impl Scratch {
     pub fn new() -> Self {
-        Self(crate::test_dir::scratch_dir("kbf-handover"))
+        // Under the system temp dir, not beside the test binary: a unix socket path is
+        // limited to 108 bytes and the target directory's path is long.
+        Self(kbf_testkit::dir::TestDir::under(
+            std::env::temp_dir(),
+            "kbf-handover",
+        ))
     }
 
     /// Where a control socket is made.
