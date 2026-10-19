@@ -50,6 +50,11 @@ const OFFER: &[&str] = &[
     "22540a036b626612406162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616218d20922087b2261223a317d0a",
     // components[1] (kbf-daemon)
     "22530a0a6b62662d6461656d6f6e1240636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463641805220178",
+    // protocol = 2, min_protocol = 1, state_schema = 4, profile = release
+    "2802",
+    "3001",
+    "3804",
+    "420772656c65617365",
 ];
 
 const ORDER: &[&str] = &[
@@ -63,6 +68,8 @@ const ORDER: &[&str] = &[
     "222830313233343536373839616263646566303132333435363738396162636465663031323334353637",
     // window_s = 900
     "288407",
+    // generation = 11
+    "300b",
 ];
 
 const STATUS: &[&str] = &[
@@ -136,6 +143,10 @@ fn offer() -> UpdateOffer {
         commit: COMMIT.to_owned(),
         platform: "linux-x86_64".to_owned(),
         components: vec![kbf(), kbf_daemon()],
+        protocol: 2,
+        min_protocol: 1,
+        state_schema: 4,
+        profile: "release".to_owned(),
     }
 }
 
@@ -146,6 +157,7 @@ fn order() -> UpdateOrder {
         verb: Verb::Activate.into(),
         commit: COMMIT.to_owned(),
         window_s: 900,
+        generation: 11,
     }
 }
 
@@ -232,12 +244,12 @@ fn the_session_carries_the_messages_on_fields_7_8_and_9() {
         message: Some(server_message::Message::UpdateOffer(offer())),
     };
     // Length 0xe501 = 229 (a two-byte varint).
-    golden(&offered, &framed("42e501", OFFER));
+    golden(&offered, &framed("42f401", OFFER));
     let ordered = ServerMessage {
         message: Some(server_message::Message::UpdateOrder(order())),
     };
     // Length 0x33 = 51.
-    golden(&ordered, &framed("4a33", ORDER));
+    golden(&ordered, &framed("4a35", ORDER));
 }
 
 /// Catches an enum value renumbered: the numbers are on the wire, and a host that reads a

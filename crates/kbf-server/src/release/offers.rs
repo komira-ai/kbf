@@ -166,6 +166,10 @@ impl Offers {
                 commit: commit.to_string(),
                 platform: platform.as_str().to_owned(),
                 components,
+                // The release facts the preflight records (protocol, minimum protocol, state
+                // schema, profile) are a later change; the installer refuses an offer that
+                // carries none, so an activation waits for it (fail closed).
+                ..UpdateOffer::default()
             };
             table.insert(platform, offer);
         }
@@ -362,6 +366,7 @@ mod tests {
             commit: COMMIT.to_owned(),
             platform: platform.as_str().to_owned(),
             components: Vec::new(),
+            ..UpdateOffer::default()
         }
     }
 

@@ -1,36 +1,41 @@
 //! One pass of the helper (`Helper::cycle`), and the verbs it carries out.
 //!
 //! The order within a pass is the safe one: finish a restart that is owed, revert a swap
-//! whose window ran out, stage the newest offer, then act on the orders. Orders are acted
-//! on in id order, once each: the id is written to `helper.json` before the file is
-//! removed, so a crash between the two finds the order acknowledged and only removes it.
-//! The links move before the service restarts and the restart is recorded as owed before it
-//! is tried, so a crash anywhere leaves a state the next pass completes.
+//! whose window ran out, then act on the order records. Orders are acted on in (epoch, id)
+//! order, once each: the pair is written to `helper.json` before the file is removed, so a
+//! crash between the two finds the order acknowledged and only removes it. An activation
+//! fetches the release (if it is not installed) before it owes a restart or moves a link, so
+//! a refused or failed fetch changes nothing. The links move before the service restarts and
+//! the restart is recorded as owed before it is tried, so a crash anywhere leaves a state the
+//! next pass completes.
 
 use std::io::Write;
-use std::path::Path;
 
 use crate::CommitId;
 use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
-use crate::inbox::{Entry, read_capped};
-use crate::layout::{self, Layout, Platform};
-use crate::refusal::Refusal;
+use crate::layout::{Layout, Platform};
 use crate::release::ReleaseError;
-use crate::stage::Staged;
+use crate::spool::{Entry, read_capped};
 use crate::state::{self, State, StateError};
 use kbf_host::{Exec, HostPath, Perms, Step};
 
+use crate::helper::fetcher::{Fetcher, InstalledRelease, ReleaseLocator};
+use crate::helper::leases::LeaseSource;
 use crate::helper::memory::{Event, Memory, StagedFacts};
-use crate::helper::order::{self, Order, Verb};
+use crate::helper::order::{self, Claims, Order, Verb};
 use crate::helper::restart::Restart;
 use crate::helper::status;
+
+/// The most names looked at in the order spool in one pass; more is said, not followed.
+const SCAN_LIMIT: usize = 256;
 
 /// How the helper is set up on a host, by its own flags.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Root's directory: `status.json` goes here and `inbox/` (the service user's) is
-    /// beneath it.
+    /// Root's directory: `status.json` goes here.
     pub update_dir: HostPath,
+    /// The order spool: owned by the service user, mode 0700, inside a root-owned parent.
+    pub orders_dir: HostPath,
     pub restart: Restart,
     /// The window the boot check gives a swap to be confirmed (Linux).
     pub window_secs: u64,
@@ -59,12 +64,9 @@ pub struct Helper<E: Exec> {
     log: Vec<u8>,
     /// The last `status.json` written.
     written: Vec<u8>,
+    fetcher: Box<dyn Fetcher>,
+    leases: Box<dyn LeaseSource>,
 }
-
-/// What stages an inbox entry: the installer's `stage_from_inbox` on a host. A function
-/// object, not a type parameter: each closure a test passed would be an instantiation of
-/// every function that takes it, and the coverage ratchet counts the best one.
-pub type Stager<'a, E> = &'a mut dyn FnMut(&mut E, &Path) -> Result<Staged, Refusal>;
 
 fn memory_path(host: &Layout) -> HostPath {
     HostPath::new(&format!("{}/helper.json", host.state_dir().as_str()))
@@ -72,13 +74,21 @@ fn memory_path(host: &Layout) -> HostPath {
 }
 
 impl<E: Exec> Helper<E> {
-    pub fn new(host: Layout, exec: E, cfg: Config) -> Helper<E> {
+    pub fn new(
+        host: Layout,
+        exec: E,
+        cfg: Config,
+        fetcher: Box<dyn Fetcher>,
+        leases: Box<dyn LeaseSource>,
+    ) -> Helper<E> {
         Helper {
             host,
             exec,
             cfg,
             log: Vec::new(),
             written: Vec::new(),
+            fetcher,
+            leases,
         }
     }
 
@@ -92,10 +102,14 @@ impl<E: Exec> Helper<E> {
         &mut self.exec
     }
 
-    fn dir(&self, sub: &str) -> std::path::PathBuf {
-        let name = format!("{}/{sub}", self.cfg.update_dir.as_str());
-        self.host
-            .join(&HostPath::new(&name).expect("the update directory and a plain name"))
+    /// The fetcher, replaced by a test.
+    #[cfg(test)]
+    pub(super) fn set_fetcher(&mut self, fetcher: Box<dyn Fetcher>) {
+        self.fetcher = fetcher;
+    }
+
+    fn orders_path(&self) -> std::path::PathBuf {
+        self.host.join(&self.cfg.orders_dir)
     }
 
     fn load(&self) -> Result<Memory, HelperError> {
@@ -141,11 +155,10 @@ impl<E: Exec> Helper<E> {
     }
 
     /// One pass. `now` is seconds since the epoch.
-    pub fn cycle(&mut self, now: u64, stager: Stager<E>) -> Result<(), HelperError> {
+    pub fn cycle(&mut self, now: u64) -> Result<(), HelperError> {
         let mut memory = self.load()?;
         self.restart_if_owed(&mut memory)?;
         self.expire(now, &mut memory)?;
-        self.offers(&mut memory, stager)?;
         self.orders(now, &mut memory)?;
         self.restart_if_owed(&mut memory)?;
         self.report(&memory)
@@ -170,7 +183,7 @@ impl<E: Exec> Helper<E> {
         let due = before
             .pending_confirm
             .as_ref()
-            .and_then(|p| p.deadline)
+            .and_then(|p| p.deadline_wall)
             .is_some_and(|d| now >= d);
         let prior = memory.restart_due;
         if due {
@@ -202,115 +215,83 @@ impl<E: Exec> Helper<E> {
         Ok(self.state()?.current != before.current)
     }
 
-    /// Stage the newest inbox entry, once.
-    fn offers(&mut self, memory: &mut Memory, stager: Stager<E>) -> Result<(), HelperError> {
-        let inbox = self.dir("inbox");
-        let Ok(entry) = Entry::open(&inbox) else {
-            return Ok(());
-        };
-        let names = match entry.names() {
-            Ok(names) => names,
-            Err(r) => {
-                refuse(memory, &format!("{}: {r}", r.code()));
-                return self.save(memory);
-            }
-        };
-        let Some((name, commit)) = names.iter().filter_map(|n| offer_of(n)).max() else {
-            return Ok(());
-        };
-        if memory.handled_entry == name {
-            return Ok(());
-        }
-        let state = self.state()?;
-        let installed = self
-            .exec
-            .stat(&layout::release_dir(&commit))
-            .ok()
-            .flatten()
-            .is_some();
-        if installed | (state.current.as_ref() == Some(&commit)) {
-            memory.handled_entry = name;
+    fn orders(&mut self, now: u64, memory: &mut Memory) -> Result<(), HelperError> {
+        // The spool is opened without following a link: one the service user puts in its
+        // place is refused, never followed. Its absence is not an error.
+        let Ok(dir) = Entry::open(&self.orders_path()) else {
             return self.save(memory);
-        }
-        match stager(&mut self.exec, &inbox.join(&name)) {
-            Ok(staged) => {
-                memory.event = Event::Idle;
-                memory.refusal.clear();
-                memory.staged = Some(facts(&staged));
-            }
-            Err(r) => {
-                memory.event = Event::Refused;
-                memory.refusal = format!("{}: {r}", r.code());
-            }
-        }
-        memory.handled_entry = name;
-        self.save(memory)
+        };
+        self.orders_in(&dir, now, memory)
     }
 
-    fn orders(&mut self, now: u64, memory: &mut Memory) -> Result<(), HelperError> {
-        // `inbox` is opened without following a link and `orders` relative to it: a link
-        // the service user puts in either place is refused, never followed.
-        let Ok(inbox) = Entry::open(&self.dir("inbox")) else {
-            return Ok(());
-        };
-        let Ok(dir) = inbox.sub("orders") else {
-            return Ok(());
-        };
-        let names = match dir.names() {
-            Ok(names) => names,
+    /// The order records in `dir`, in (epoch, id) order.
+    pub(super) fn orders_in(
+        &mut self,
+        dir: &Entry,
+        now: u64,
+        memory: &mut Memory,
+    ) -> Result<(), HelperError> {
+        let (names, crowded) = match dir.names_up_to(SCAN_LIMIT) {
+            Ok(found) => found,
             Err(r) => {
                 refuse(memory, &format!("{}: {r}", r.code()));
                 return self.save(memory);
             }
         };
-        // A name that is not an order's (a `.partial-` the client is writing, or junk) is left.
-        let mut files: Vec<(u64, String)> = names
+        if crowded {
+            refuse(
+                memory,
+                &format!(
+                    "the order spool holds more than {SCAN_LIMIT} entries; the rest are not looked at"
+                ),
+            );
+        }
+        // A name that is not a record's (a `.partial-` the client is writing, its state
+        // file, or junk) is left.
+        let mut files: Vec<((u64, u64), String)> = names
             .into_iter()
-            .filter_map(|name| order::id_of(&name).map(|id| (id, name)))
+            .filter_map(|name| order::key_of(&name).map(|key| (key, name)))
             .collect();
         files.sort();
-        for (id, name) in files {
-            let read = dir
-                .open_file(&name, order::MAX_BYTES)
-                .and_then(|mut f| read_capped(&mut f, order::MAX_BYTES, &name));
-            let parsed = read
-                .map_err(|r| format!("{}: {r}", r.code()))
-                .and_then(|bytes| order::parse(id, &bytes).map_err(|e| e.to_string()));
-            match parsed {
-                Ok(o)
-                    if memory.acked_epoch != 0
-                        && o.epoch > memory.acked_epoch.saturating_add(order::MAX_EPOCH_JUMP) =>
-                {
-                    refuse(
-                        memory,
-                        &format!(
-                            "order {id} is from epoch {}, more than {} above the last acted on ({}): \
-                             not acted on",
-                            o.epoch,
-                            order::MAX_EPOCH_JUMP,
-                            memory.acked_epoch
-                        ),
-                    );
-                }
-                Ok(o) if o.epoch < memory.acked_epoch => {
-                    refuse(
-                        memory,
-                        &format!(
-                            "order {id} is from epoch {}, older than the last acted on ({})",
-                            o.epoch, memory.acked_epoch
-                        ),
-                    );
-                }
-                // The same epoch and an id not above the last: a replay, dropped silently.
-                Ok(o) if o.epoch == memory.acked_epoch && o.id <= memory.acked_order_id => {}
-                Ok(o) => {
-                    self.act(&o, now, memory)?;
-                    memory.acked_order_id = o.id;
-                    memory.acked_epoch = o.epoch;
-                }
-                // Not acknowledged: a garbage file must not move the floor.
-                Err(why) => refuse(memory, &format!("order file {name}: {why}")),
+        // First seen by root now, or earlier; what is no longer there is forgotten.
+        memory
+            .first_seen
+            .retain(|name, _| files.iter().any(|(_, f)| f == name));
+        for (_, name) in &files {
+            memory.first_seen.entry(name.clone()).or_insert(now);
+        }
+        self.save(memory)?;
+        for (index, ((epoch, id), name)) in files.into_iter().enumerate() {
+            let age = now.saturating_sub(memory.first_seen.get(&name).copied().unwrap_or(now));
+            if index >= kbf_update::MAX_RECORDS {
+                refuse(
+                    memory,
+                    &format!(
+                        "the order spool holds more than {} records; order {id} was deleted unread",
+                        kbf_update::MAX_RECORDS
+                    ),
+                );
+            } else if age > kbf_update::MAX_AGE_SECS {
+                refuse(
+                    memory,
+                    &format!(
+                        "order {id} was first seen {age} s ago, more than {} s: expired, \
+                         deleted unread",
+                        kbf_update::MAX_AGE_SECS
+                    ),
+                );
+            } else {
+                // Opened by name beneath the descriptor, judged by fstat, read once into
+                // memory, and parsed from that copy.
+                let read = dir
+                    .open_file(&name, order::MAX_BYTES)
+                    .and_then(|mut f| read_capped(&mut f, order::MAX_BYTES, &name));
+                let parsed = read
+                    .map_err(|r| format!("{}: {r}", r.code()))
+                    .and_then(|bytes| order::parse(epoch, id, &bytes).map_err(|e| e.to_string()));
+                self.take(parsed, &name, now, memory)?;
             }
+            memory.first_seen.remove(&name);
             self.save(memory)?;
             if let Err(r) = dir.remove_file(&name) {
                 refuse(memory, &format!("{}: {r}", r.code()));
@@ -319,11 +300,86 @@ impl<E: Exec> Helper<E> {
         self.save(memory)
     }
 
-    /// Carry out one order; what came of it goes into `memory`. An activate or a revert
-    /// moves the links, so the restart is owed (and saved) before the verb runs; a kill
-    /// between the links and the next save then leaves the restart for the next pass.
-    fn act(&mut self, order: &Order, now: u64, memory: &mut Memory) -> Result<(), HelperError> {
+    /// Decide what to do with one record read: act on it, drop it as a replay, or refuse it.
+    fn take(
+        &mut self,
+        parsed: Result<Order, String>,
+        name: &str,
+        now: u64,
+        memory: &mut Memory,
+    ) -> Result<(), HelperError> {
+        // Each kind of order is ordered against its own floor.
+        let floor = |o: &Order, memory: &Memory| match o.verb {
+            Verb::FrontendUpdate => (memory.frontend_epoch, memory.frontend_order_id),
+            Verb::Activate | Verb::Confirm | Verb::Revert => {
+                (memory.acked_epoch, memory.acked_order_id)
+            }
+        };
+        match parsed {
+            Ok(o)
+                if floor(&o, memory).0 != 0
+                    && o.epoch > floor(&o, memory).0.saturating_add(order::MAX_EPOCH_JUMP) =>
+            {
+                refuse(
+                    memory,
+                    &format!(
+                        "order {} is from epoch {}, more than {} above the last acted on ({}): \
+                         not acted on",
+                        o.id,
+                        o.epoch,
+                        order::MAX_EPOCH_JUMP,
+                        floor(&o, memory).0
+                    ),
+                );
+            }
+            Ok(o) if o.epoch < floor(&o, memory).0 => {
+                refuse(
+                    memory,
+                    &format!(
+                        "order {} is from epoch {}, older than the last acted on ({})",
+                        o.id,
+                        o.epoch,
+                        floor(&o, memory).0
+                    ),
+                );
+            }
+            // The same epoch and an id not above the last: a replay, dropped silently.
+            Ok(o) if o.epoch == floor(&o, memory).0 && o.id <= floor(&o, memory).1 => {}
+            // The frontend swap is a later change (P13). It is refused here with that reason
+            // and, like any refusal of a record, does not move its floor (nor the node's):
+            // the next real order still runs.
+            Ok(o) if o.verb == Verb::FrontendUpdate => refuse(
+                memory,
+                &format!("order {}: frontend_update is not implemented (P13)", o.id),
+            ),
+            Ok(o) => {
+                self.act(&o, now, memory)?;
+                memory.acked_order_id = o.id;
+                memory.acked_epoch = o.epoch;
+            }
+            // Not acknowledged: a garbage file must not move the floor.
+            Err(why) => refuse(memory, &format!("order file {name}: {why}")),
+        }
+        Ok(())
+    }
+
+    /// Carry out one order; what came of it goes into `memory`. An activation is vetted and
+    /// its release fetched first, while nothing is owed and nothing moves. An activate or a
+    /// revert then moves the links, so the restart is owed (and saved) before the verb runs;
+    /// a kill between the links and the next save then leaves the restart for the next pass.
+    pub(super) fn act(
+        &mut self,
+        order: &Order,
+        now: u64,
+        memory: &mut Memory,
+    ) -> Result<(), HelperError> {
         let before = self.state()?;
+        if order.verb == Verb::Activate
+            && let Err(why) = self.prepare(order, &before, memory)
+        {
+            refuse(memory, &why);
+            return self.save(memory);
+        }
         let prior = memory.restart_due;
         if order.verb != Verb::Confirm {
             memory.restart_due = true;
@@ -333,6 +389,7 @@ impl<E: Exec> Helper<E> {
             Verb::Activate => self.activate(order, now),
             Verb::Confirm => self.confirm(order, &before),
             Verb::Revert => self.revert(),
+            Verb::FrontendUpdate => Err("frontend_update is not implemented (P13)".to_owned()),
         };
         let moved = self.moved(&before)?;
         match result {
@@ -346,6 +403,87 @@ impl<E: Exec> Helper<E> {
                 memory.restart_due = prior | moved;
             }
         }
+        Ok(())
+    }
+
+    /// The checks an activation passes before anything is moved, then the fetch. Ok means
+    /// `current` may be swapped to the order's commit. The rule on the order's generation
+    /// and the operator's floors are the next change's.
+    pub(super) fn prepare(
+        &mut self,
+        order: &Order,
+        before: &State,
+        memory: &mut Memory,
+    ) -> Result<(), String> {
+        let id = order.id;
+        // Fail closed: an activation without the release's claims is not taken.
+        let Some(claims) = &order.claims else {
+            return Err(format!(
+                "order {id}: an activation carries no release claims"
+            ));
+        };
+        // `kbf` is the one component a release of either platform carries that an order may
+        // name (a Mac is given no `kbf-daemon`).
+        let prefix = match self.host.platform() {
+            Platform::Linux => "linux-",
+            Platform::MacOs => "darwin-",
+        };
+        let needs = ["kbf"].as_slice();
+        if !claims.platform.starts_with(prefix) {
+            return Err(format!(
+                "order {id} is for platform {:?}, not this host's ({prefix}*)",
+                claims.platform
+            ));
+        }
+        let mut names: Vec<&str> = claims.components.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        if names != needs {
+            return Err(format!(
+                "order {id} names components {names:?}; this platform needs exactly {needs:?}"
+            ));
+        }
+        // One confirm window at a time, never two timers. The same order again (a pass
+        // that died after the swap) is the repeat `activate` recognises.
+        let this = format!("{}-{}", order.epoch, order.id);
+        if let Some(p) = &before.pending_confirm
+            && p.activation != this
+        {
+            return Err(format!(
+                "order {id}: {} is on trial and not yet confirmed or reverted; not activating",
+                p.commit
+            ));
+        }
+        // The lease check again, from what the installer observes.
+        match self.leases.live() {
+            Ok(0) => {}
+            Ok(n) => return Err(format!("{n} leases are live; not activating")),
+            Err(why) => return Err(format!("cannot tell whether leases are live: {why}")),
+        }
+        // Already the running release: nothing to fetch, `activate` says so.
+        if before.current.as_ref() == Some(&order.commit) {
+            return Ok(());
+        }
+        // A directory on the host is not proof: the fetcher verifies the release whether it
+        // pulls it or finds it.
+        let rec = ReleaseLocator {
+            commit: order.commit.clone(),
+            components: claims.components.clone(),
+        };
+        // The node is told a fetch is under way; it may take minutes.
+        memory.fetching = true;
+        self.report(memory).map_err(|e| e.to_string())?;
+        let fetched = self.fetcher.fetch(&rec);
+        memory.fetching = false;
+        let got = fetched.map_err(|e| format!("order {id}: {e}"))?;
+        // What the fetched binary declared must be what the order expected, before a link
+        // moves: a release that is attested but is another build than the one ordered is
+        // refused.
+        if let Err(why) = matches_claims(&got, order, claims) {
+            return Err(format!(
+                "order {id}: the fetched release is not the one ordered: {why}"
+            ));
+        }
+        memory.staged = Some(facts(&got));
         Ok(())
     }
 
@@ -389,7 +527,7 @@ impl<E: Exec> Helper<E> {
             .pending_confirm
             .as_ref()
             .filter(|p| p.commit == order.commit)
-            .and_then(|p| p.order_id.clone())
+            .map(|p| p.activation.clone())
             .unwrap_or_default();
         match activate::confirm(&self.host, &activation, &order.commit) {
             Ok(Confirmed::Kept | Confirmed::AlreadyKept) => Ok(Done::quiet(Event::Confirmed)),
@@ -467,21 +605,49 @@ fn short(c: &Option<CommitId>) -> String {
         .unwrap_or_default()
 }
 
-/// The commit an inbox entry directory is for: `<generation:020>-<commit>`.
-fn offer_of(name: &str) -> Option<(String, CommitId)> {
-    let (generation, commit) = name.split_once('-')?;
-    if (generation.len() != 20) | !generation.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+/// Whether the release the fetcher installed is the one the order named and expected.
+fn matches_claims(got: &InstalledRelease, order: &Order, claims: &Claims) -> Result<(), String> {
+    if got.commit != order.commit {
+        return Err(format!("it is commit {}", got.commit.as_str()));
     }
-    Some((name.to_owned(), CommitId::new(commit).ok()?))
+    let same = (
+        &got.platform,
+        got.protocol,
+        got.min_protocol,
+        got.state_schema,
+        &got.profile,
+    ) == (
+        &claims.platform,
+        claims.protocol,
+        claims.min_protocol,
+        claims.state_schema,
+        &claims.profile,
+    );
+    if same {
+        Ok(())
+    } else {
+        Err(format!(
+            "it declares platform {:?}, protocol {}, min_protocol {}, state_schema {}, profile {:?}; \
+             the order expected {:?}, {}, {}, {}, {:?}",
+            got.platform,
+            got.protocol,
+            got.min_protocol,
+            got.state_schema,
+            got.profile,
+            claims.platform,
+            claims.protocol,
+            claims.min_protocol,
+            claims.state_schema,
+            claims.profile
+        ))
+    }
 }
 
-fn facts(staged: &Staged) -> StagedFacts {
-    let narrow = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+fn facts(got: &InstalledRelease) -> StagedFacts {
     StagedFacts {
-        commit: staged.commit.clone(),
-        protocol: narrow(staged.protocol),
-        min_protocol: narrow(staged.min_protocol),
-        state_schema: narrow(staged.state_schema),
+        commit: got.commit.clone(),
+        protocol: got.protocol,
+        min_protocol: got.min_protocol,
+        state_schema: got.state_schema,
     }
 }

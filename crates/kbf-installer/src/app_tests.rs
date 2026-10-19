@@ -194,13 +194,13 @@ fn global_flags_may_follow_the_verb() {
     assert_eq!((cli.apply, cli.json), (true, true));
 }
 
-/// A host root with release A current and its inbox in place, as the installer finds a host.
+/// A host root with release A current and its order spool in place, as the installer finds a host.
 /// The installer under test lays a host out for the platform it was built for, so the
-/// scratch host is laid out for that platform too (`/var/db/kbf-deploy` on macOS).
+/// scratch host is laid out for that platform too (`/var/db/kbf-installer` on macOS).
 fn seeded(name: &str) -> (Layout, PathBuf) {
     let (layout, root) = host_root_on(&format!("app-{name}"), Platform::current());
-    fs::create_dir_all(root.join("var/lib/kbf-updater/inbox/orders")).expect("inbox");
-    let release = root.join("usr/local/kbf/releases").join(A);
+    fs::create_dir_all(root.join("var/lib/kbf-installer/orders")).expect("order spool");
+    let release = layout.join(&layout.release_dir(&c(A)));
     fs::create_dir_all(&release).expect("release");
     fs::write(release.join("kbf"), b"x").expect("binary");
     Locked::acquire(&layout)
@@ -232,7 +232,7 @@ const RUN: [&str; 7] = [
 
 /// Catches `run` not doing a pass in this build of the crate (the real binary does; this is
 /// the same code run in the unit tests, so a change to it is seen by both): a pass on a host
-/// reports and exits 0 even as an ordinary user, with an inbox entry the stage refuses the
+/// reports and exits 0 even as an ordinary user, with an order record that is not one the
 /// pass still ends, an unreadable state stops it before any pass (exit 1), and a memory file
 /// it cannot read stops the loop with the file named.
 ///
@@ -244,10 +244,15 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
     let (layout, root) = seeded("run");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Ok, "{err}");
-    let status = fs::read(root.join("var/lib/kbf-updater/status.json")).expect("status.json");
+    let status = fs::read(root.join("var/lib/kbf-installer/status.json")).expect("status.json");
     let status: Value = serde_json::from_slice(&status).expect("json");
     assert_eq!(status["state"], "refused", "not root: the pass says so");
-    fs::create_dir(root.join(format!("var/lib/kbf-updater/inbox/{:020}-{B}", 2))).expect("entry");
+    let record = kbf_update::record::file_name(1, 2);
+    fs::write(
+        root.join("var/lib/kbf-installer/orders").join(record),
+        b"not an order",
+    )
+    .expect("record");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Ok, "{err}");
     fs::write(
@@ -261,7 +266,11 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
     fs::remove_file(layout.join(&layout.state_dir()).join("helper.json")).expect("remove");
     fs::write(layout.join(&layout.state_file()), b"not json").expect("ruin");
     let (exit, err) = on(&root, &RUN);
-    assert_eq!(exit, Exit::Failed);
+    assert_eq!(
+        exit,
+        Exit::NeedsOperator,
+        "no usable state: only an operator goes on"
+    );
     assert!(err.starts_with("kbf-installer:"), "{err}");
 }
 
@@ -275,7 +284,7 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
 #[test]
 fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
     let (layout, root) = seeded("boot");
-    let release = root.join("usr/local/kbf/releases").join(B);
+    let release = root.join("var/lib/kbf-installer/releases").join(B);
     fs::create_dir_all(&release).expect("release");
     fs::write(release.join("kbf"), b"x").expect("binary");
     let lock = Locked::acquire(&layout).expect("lock");
@@ -285,8 +294,9 @@ fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
         pending_confirm: Some(PendingConfirm {
             commit: c(B),
             previous: Some(c(A)),
-            deadline: None,
-            order_id: Some("5".to_owned()),
+            activation: "5".to_owned(),
+            deadline_wall: None,
+            deadline_mono_s: None,
             starts_left: Some(1),
         }),
         ..State::default()
@@ -298,13 +308,52 @@ fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
     let (exit, err) = on(&root, &["boot-check"]);
     assert_eq!(exit, Exit::Failed);
     assert!(err.contains("as root"), "{err}");
-    fs::write(layout.join(&layout.state_file()), b"not json").expect("ruin");
+    for file in [layout.state_file(), layout.state_backup()] {
+        fs::write(layout.join(&file), b"not json").expect("ruin");
+    }
     let (exit, err) = on(&root, &["boot-check"]);
-    assert_eq!(exit, Exit::Failed, "{err}");
+    assert_eq!(exit, Exit::NeedsOperator, "{err}");
     for verb in [&RUN[..], &["boot-check"][..]] {
         let mut full = vec!["--root", "relative"];
         full.extend_from_slice(verb);
         let (exit, _, _) = run_as(1000, &full);
         assert_eq!(exit, Exit::Failed, "{verb:?}");
     }
+}
+
+/// Catches an exit that does not tell an operator's job from a retry: only an unusable state
+/// (both files damaged) ends `needs an operator` (5); every other state error, a memory file
+/// that cannot be read, and a plain message end `failed` (1). Both of the error types a verb
+/// can end with are checked.
+///
+/// Mutant planted: the guard dropped (every state error asks for an operator).
+#[test]
+fn only_an_unusable_state_asks_for_an_operator() {
+    use crate::helper::cycle::HelperError;
+    use crate::release::ReleaseError;
+    use crate::state::StateError;
+    let unusable = || StateError::Unusable {
+        primary: "p".to_owned(),
+        backup: "b".to_owned(),
+    };
+    let other = || StateError::NoSchema {
+        path: PathBuf::from("/x"),
+    };
+    let exit = |f: Failure| f.exit;
+    assert_eq!(
+        exit(HelperError::State(unusable()).into()),
+        Exit::NeedsOperator
+    );
+    assert_eq!(exit(HelperError::State(other()).into()), Exit::Failed);
+    assert_eq!(
+        exit(HelperError::Memory("m".to_owned()).into()),
+        Exit::Failed
+    );
+    assert_eq!(
+        exit(ReleaseError::State(unusable()).into()),
+        Exit::NeedsOperator
+    );
+    assert_eq!(exit(ReleaseError::State(other()).into()), Exit::Failed);
+    assert_eq!(exit(ReleaseError::Pending(c(A)).into()), Exit::Failed);
+    assert_eq!(exit("message".to_owned().into()), Exit::Failed);
 }

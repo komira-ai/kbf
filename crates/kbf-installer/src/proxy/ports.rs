@@ -119,6 +119,11 @@ pub trait RootOrders {
     /// The `staged{}` object of `status.json`, if a release is staged.
     fn staged(&self) -> Result<Option<StagedFacts>, PortError>;
 
+    /// The commit `status.json` reports as `installed_commit`: the root's `current`. After
+    /// a `confirm` it names the confirmed commit; it is the one fact that says whether a
+    /// confirm landed, whatever `update.json` recorded.
+    fn installed(&self) -> Result<Option<CommitId>, PortError>;
+
     /// Flip `previous` then `current` to the staged commit, after the bake (Q2).
     fn confirm(&self, commit: &CommitId) -> Result<(), PortError>;
 

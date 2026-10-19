@@ -22,5 +22,10 @@ rustix = { workspace = true, features = ["fs", "process"] }
 sha2.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The loader of `kbf.toml` the daemon itself runs (tests/node_config.rs): the file this
+# tool renders is parsed by it, on Linux, into the flags it must stand for.
+kbf-cli = { path = "../kbf-cli" }
+
 [lints]
 workspace = true

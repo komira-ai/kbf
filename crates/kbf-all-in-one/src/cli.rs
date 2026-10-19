@@ -10,30 +10,28 @@
 //! belong to Macs, which run `kbf daemon`), and `--cas` (the daemon half reads and
 //! writes blobs through calls into the server half, not over the network).
 //!
-//! The scheduler's state is always SQLite (`docs/design/architecture-v2.md`, section 1):
-//! `--state-store` is given as `sqlite:///absolute/path`, or left out for
-//! `<data-dir>/state.db`, beside the daemon's data. Any other value is refused.
-
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+//! The scheduler's state is Postgres (`docs/design/frontend-proxy.md`, section 11):
+//! `--state-store` is given as `postgres:///kbf?host=/run/postgresql` (the form it is left
+//! out for) or, until SQLite is deleted, as `sqlite:///absolute/path`.
 
 use clap::error::ErrorKind;
 use clap::{ArgMatches, Command, CommandFactory as _, FromArgMatches as _};
+use std::collections::BTreeSet;
 
 /// What the binary is, for `--help`.
 const ABOUT: &str = "The kbf farm server and a worker daemon in one process (Linux, the \
                      container driver only).";
 
-/// The scheduler's state file in the data directory, when `--state-store` is left out.
-const STATE_FILE: &str = "state.db";
-
 /// `--state-store` here, in place of the server's: this binary always has one.
 const STATE_STORE_HELP: &str = "Where the scheduler keeps its state, written before each change \
-    is acknowledged and replayed at start: `sqlite:///absolute/path`, a file on a local disk \
-    that this process owns (created, with its directory, if missing; the file is 0600 and a \
-    directory it makes 0700; every start is a new epoch, so the daemon kills the runs of the \
-    leases it held before). Left out, it is `<data-dir>/state.db`. Any other value, \
-    `postgres://` included, is refused (Postgres is not wired yet)";
+    is acknowledged and replayed at start: `postgres:///kbf?host=/run/postgresql`, the database \
+    `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a \
+    URL with a password is refused, and the server must flush commits before it acknowledges \
+    them, `synchronous_commit` on, or the start is refused), or `sqlite:///absolute/path`, a \
+    file on a local disk that this process owns (created, with its directory, if missing; the \
+    file is 0600 and a directory it makes 0700). Every start is a new epoch, so the daemon \
+    kills the runs of the leases it held before. Left out, it is \
+    `postgres:///kbf?host=/run/postgresql`";
 
 /// The one command: the daemon's flags, then the server's that do not share a name with
 /// one of them.
@@ -69,25 +67,13 @@ pub struct Flags {
 /// Both halves' flags from what [`command`] matched.
 ///
 /// # Errors
-/// A `--driver` other than `container`, `--cas`, or
-/// a relative `--data-dir` (which the state file would be put in).
+/// A `--driver` other than `container`, or `--cas`.
 pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
     refuse_remote_plane(matches, "kbf-all-in-one", "server", command)?;
     let daemon = kbf_node::Cli::from_arg_matches(matches)?;
     let mut server = kbf_server::Args::from_arg_matches(matches)?;
     if server.state_store.is_none() {
-        let dir = matches
-            .get_one::<PathBuf>("data_dir")
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from(kbf_node::DEFAULT_DATA_DIR));
-        if !dir.is_absolute() {
-            let said = format!(
-                "--data-dir {}: must be absolute (the state file {STATE_FILE} goes in it)",
-                dir.display()
-            );
-            return Err(command().error(ErrorKind::ArgumentConflict, said));
-        }
-        server.state_store = Some(kbf_server::StateStoreUri::Sqlite(dir.join(STATE_FILE)));
+        server.state_store = Some(kbf_server::StateStoreUri::local_postgres());
     }
     // The thread flags matched are the daemon's.
     server.threads = kbf_threads::PoolArgs::default();

@@ -33,7 +33,7 @@ kbf-proto.workspace = true
 kbf-raft.workspace = true
 kbf-route.workspace = true
 kbf-sched.workspace = true
-kbf-state.workspace = true
+kbf-state = { workspace = true, features = ["postgres"] }
 kbf-storage.workspace = true
 kbf-store.workspace = true
 kbf-threads.workspace = true
@@ -77,6 +77,8 @@ kbf-state = { workspace = true, features = ["test-support"] }
 kbf-ui.workspace = true
 # fcntl and kill for the test that holds the server at its start line (tests/binary.rs).
 libc.workspace = true
+# Drops the default schema before the Postgres flag test (tests/state_store_postgres.rs).
+postgres.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }

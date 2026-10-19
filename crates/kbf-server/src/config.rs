@@ -465,12 +465,15 @@ pub struct Args {
     #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
     pub input_tree_reads_in_flight: NonZeroUsize,
     /// Where the scheduler keeps its state, written before each change is acknowledged and
-    /// replayed at start: `sqlite:///absolute/path`, a file on a local disk that this
-    /// process owns. Every start is a new epoch, so daemons kill the runs of the leases
-    /// they held before. The file is created, with its directory, if missing (0600, and
-    /// 0700 for a directory it makes) and held by one process: a second frontend on it
-    /// refuses to start. Any other value, `postgres://` included, is refused (Postgres is
-    /// not wired yet). Left out, the scheduler's state is in memory and a restart loses it
+    /// replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a
+    /// local Unix socket, reached as this process's own user (peer authentication; a URL
+    /// with a password is refused, as the command line is world-readable). The server must
+    /// flush commits before it acknowledges them (`synchronous_commit` on) or the start is
+    /// refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on
+    /// a local disk that this process owns (created, with its directory, if missing: 0600,
+    /// and 0700 for a directory it makes; a second frontend on it refuses to start). Every
+    /// start is a new epoch, so daemons kill the runs of the leases they held before. Left
+    /// out, the scheduler's state is in memory and a restart loses it
     // Listed beside `--meta-dir`, whose place in the help it takes without moving the
     // flags declared after it.
     #[arg(

@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use futures::future::BoxFuture;
 use kbf_caps::NodeCaps;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::MemoryStore;
@@ -22,7 +21,7 @@ use kbf_server::farm::{Farm, Reported, StreamId};
 use kbf_server::update::{Controller, HostPhase, OrderId, Policy, Release, Rows, Transport, ports};
 use kbf_state::Store;
 use kbf_types::{FarmTime, Resources, WorkerId};
-use kbf_update::{Chunks, Config, FetchError, Handle, Order, Source};
+use kbf_update::{Component, Config, Expected, Handle, Offer, Order};
 use tokio::sync::mpsc;
 
 const A: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -40,21 +39,12 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The node's release store is never asked: no offer is made in these tests.
-struct NoFetch;
-
-impl Source for NoFetch {
-    fn fetch(&self, _sha256: &str) -> BoxFuture<'_, Result<Chunks, FetchError>> {
-        Box::pin(async { Err(FetchError::Transport("not in this test".to_owned())) })
-    }
-}
-
 /// What the root helper writes: `state`, with `installed` and `staged` as the commits it
 /// holds, having acted on order `acked`.
 fn helper_says(dir: &Path, state: &str, installed: &str, staged: &str, acked: u64) {
     let quote = |c: &str| format!("\"{c}\"").replace("\"\"", "null");
     let text = format!(
-        "{{\"schema\":1,\"installed_commit\":{},\"previous_commit\":null,\"staged_commit\":{},\
+        "{{\"schema\":2,\"installed_commit\":{},\"previous_commit\":null,\"staged_commit\":{},\
          \"state\":\"{state}\",\"refusal\":\"\",\"acked_order_id\":{acked},\"staged\":null}}",
         quote(installed),
         quote(staged)
@@ -90,9 +80,7 @@ fn register(farm: &Farm, name: &str, os: &str) -> (StreamId, Inbound) {
 
 fn client(dir: &Path, running: &str) -> Handle {
     let config = Config::new(dir.to_path_buf(), PLATFORM.to_owned(), running.to_owned());
-    kbf_update::start(config, Arc::new(NoFetch))
-        .expect("the client starts")
-        .0
+    kbf_update::start(config).expect("the client starts").0
 }
 
 impl Node {
@@ -109,6 +97,24 @@ impl Node {
             stream,
             inbound,
         };
+        // The frontend's offer of the release, which an activation needs the node to hold.
+        node.client.offer(Offer {
+            generation: 1,
+            commit: A.to_owned(),
+            platform: PLATFORM.to_owned(),
+            components: vec![Component {
+                name: "kbf".to_owned(),
+                sha256: "ab".repeat(32),
+                size: 1000,
+                attestation: b"{\"bundle\":1}".to_vec(),
+            }],
+            expected: Expected {
+                protocol: 7,
+                min_protocol: 6,
+                state_schema: 3,
+                profile: "release".to_owned(),
+            },
+        });
         node.report();
         node
     }
@@ -340,8 +346,13 @@ fn a_replayed_order_is_dropped_at_the_node() {
     assert_eq!(sent.len(), 2);
     assert_eq!(node.take(&sent[0]), kbf_update::Decision::Accepted);
     assert_eq!(node.take(&sent[1]), kbf_update::Decision::Replayed);
-    let written = fs::read_dir(node.dir.join("inbox").join("orders"))
+    // The records in the spool, not the client's own state file beside them.
+    let written = fs::read_dir(node.dir.join("orders"))
         .expect("orders")
+        .filter(|e| {
+            let name = e.as_ref().expect("entry").file_name();
+            kbf_update::record::parse_file_name(&name.to_string_lossy()).is_some()
+        })
         .count();
     assert_eq!(written, 1, "written once");
     assert_eq!(node.client.status().borrow().acked_order_id, 9);
