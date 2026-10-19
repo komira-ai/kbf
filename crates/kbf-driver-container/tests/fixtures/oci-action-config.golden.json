@@ -185,6 +185,18 @@
       "type": "bind"
     },
     {
+      "destination": "/etc/resolv.conf",
+      "options": [
+        "rbind",
+        "ro",
+        "nosuid",
+        "noexec",
+        "nodev"
+      ],
+      "source": "/scratch/kbf-lease-1-2/etc/resolv.conf",
+      "type": "bind"
+    },
+    {
       "destination": "/kbf/root",
       "options": [
         "lowerdir=/scratch/kbf-lease-1-2/root,upperdir=/scratch/kbf-lease-1-2/upper,workdir=/scratch/kbf-lease-1-2/work,userxattr,metacopy=off,redirect_dir=nofollow,index=off,xino=off",
@@ -311,8 +323,8 @@
     ],
     "terminal": false,
     "user": {
-      "gid": 0,
-      "uid": 0
+      "gid": 1000,
+      "uid": 1000
     }
   },
   "root": {

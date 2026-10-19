@@ -13,7 +13,7 @@ fn header(life: &Life, inv: &InvRef) -> InvocationHeader {
     let row = life
         .index
         .inner
-        .get(&format!("ui/invid/{}", inv.key))
+        .get(&life.index_root.header(&inv.key, life.writer_id))
         .unwrap()
         .unwrap();
     InvocationHeader::decode(row.value.as_slice()).unwrap()
@@ -125,8 +125,10 @@ fn a_header_past_the_backlog_bound_is_written_again_and_counted_once() {
             instances: vec!["main".into()],
             ..InvocationHeader::default()
         };
-        life.index
-            .put(&format!("ui/invid/{}", inv.key), stored.encode_to_vec());
+        life.index.put(
+            &life.index_root.header(&inv.key, life.writer_id),
+            stored.encode_to_vec(),
+        );
     }
     life.close(&a);
     life.close(&b);
