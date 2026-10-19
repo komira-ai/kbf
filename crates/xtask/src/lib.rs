@@ -37,7 +37,7 @@
 //!   attestations` and `release check` hold a directory to one bundle per tarball,
 //!   each that tarball's (its one subject is the tarball's digest); `verify-assets
 //!   attestations` also has `gh` verify each tarball against its bundle.
-//! - `release {locate,main-control,check,publish}` ([`release`]): a GitHub release of
+//! - `release {locate,main-control,check,verdict,notes,publish}` ([`release`]): a GitHub release of
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
@@ -449,10 +449,61 @@ enum ReleaseVerb {
         /// The artifacts workflow run that built and attested the files.
         #[arg(long)]
         run_id: u64,
+        /// The set hash the gamma verdict names, as `release verdict` printed it.
+        #[arg(long)]
+        set_hash: String,
         /// The `gh` program.
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
     },
+    /// The tag's message is a green gamma verdict for this tag, commit and set, after a bake
+    /// of 24 hours or more. Prints `set-hash=<hex>`.
+    Verdict {
+        #[command(flatten)]
+        subject: SubjectArgs,
+        /// Append `set-hash=<hex>` to this file (on Actions, `GITHUB_OUTPUT`).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// The same checks, then write the release's notes.
+    Notes {
+        #[command(flatten)]
+        subject: SubjectArgs,
+        /// Write the notes here.
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+/// What `release verdict` and `release notes` check a release against.
+#[derive(clap::Args)]
+struct SubjectArgs {
+    /// The verified release files (`SHA256SUMS` among them).
+    dir: PathBuf,
+    /// A checkout that holds the tag object and main's history.
+    #[arg(long, default_value = ".")]
+    repo_dir: PathBuf,
+    /// The release tag, annotated.
+    #[arg(long)]
+    tag: String,
+    /// The commit being released, a full SHA.
+    #[arg(long)]
+    commit: String,
+    /// The ref of main in `--repo-dir`.
+    #[arg(long, default_value = "origin/main")]
+    main_ref: String,
+}
+
+impl SubjectArgs {
+    fn subject(&self) -> release::verdict::Subject<'_> {
+        release::verdict::Subject {
+            repo_dir: &self.repo_dir,
+            tag: &self.tag,
+            commit: &self.commit,
+            dir: &self.dir,
+            main_ref: &self.main_ref,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -720,14 +771,50 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             &gh, &repo, &on_main, &off_main,
         )?]),
         Verb::Release(ReleaseVerb::Check { dir, commit }) => release::check(&dir, &commit),
+        Verb::Release(ReleaseVerb::Verdict { subject, output }) => {
+            let verified = release::verdict::verify(&subject.subject())?;
+            let line = format!("set-hash={}", verified.set_hash.as_str());
+            if let Some(output) = output {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&output)
+                    .and_then(|mut f| {
+                        std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes())
+                    })
+                    .map_err(Error::spawn(format!("append to {}", output.display())))?;
+            }
+            Ok(vec![
+                format!(
+                    "tag {}: a green gamma verdict for {} and set {}",
+                    subject.tag,
+                    subject.commit,
+                    verified.set_hash.as_str()
+                ),
+                line,
+            ])
+        }
+        Verb::Release(ReleaseVerb::Notes { subject, out }) => {
+            let text = release::notes::notes(&subject.subject())?;
+            std::fs::write(&out, &text)
+                .map_err(Error::spawn(format!("write {}", out.display())))?;
+            Ok(vec![format!(
+                "wrote the notes of {} to {}",
+                subject.tag,
+                out.display()
+            )])
+        }
         Verb::Release(ReleaseVerb::Publish {
             dir,
             repo,
             tag,
             commit,
             run_id,
+            set_hash,
             gh,
         }) => {
+            let set_hash = kbf_gate::SetHash::parse(&set_hash)
+                .map_err(|e| Error::Usage(format!("--set-hash: {e}")))?;
             // The release's assets as it holds them, of this process alone.
             let scratch =
                 std::env::temp_dir().join(format!("xtask-release-{}", std::process::id()));
@@ -738,6 +825,7 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 tag: &tag,
                 commit: &commit,
                 run_id,
+                set_hash: &set_hash,
                 gh: &gh,
                 scratch: &scratch,
             };

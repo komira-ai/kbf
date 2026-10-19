@@ -4769,6 +4769,7 @@ dependencies = [
  "clap",
  "flate2",
  "hex",
+ "kbf-gate",
  "lzma-rs",
  "rcgen",
  "rustix",
