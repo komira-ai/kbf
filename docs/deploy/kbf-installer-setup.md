@@ -85,6 +85,18 @@ Every step is planned only where the host differs, so the same flags again is "n
 (the database step reports the schema as current). A run that stopped part way is finished by
 running it again.
 
+**The re-run rule.** `setup` keeps no state of its own: every run reads the host and plans the
+difference. So a run that failed at any step (a test plants a failure at each step of each Linux
+mode) is finished by the same command, and the host then equals the one a clean run leaves. The
+order makes the half-done host safe: `kbf.toml` and the units come last, so a stopped run leaves
+no config that a unit would start from. Changed flags rewrite the files they own atomically and
+never restart anything; a floor only goes up; a file `setup` cannot safely rewrite stops it
+with exit 5.
+
+**Proxy units.** The bundled proxy's units (`kbf-proxy.service` and `.socket`) are not on
+`feature/arch-v2` yet (kbf#1153), so a frontend or all-in-one host enables the units that exist
+(`mode_units` in `src/setup/plan.rs` is the one place to change when they land).
+
 ## Exit codes
 
 0 done; 1 failed (including a database that cannot be reached and a first release this build

@@ -448,3 +448,43 @@ fn setup_creates_the_schema_over_a_real_server() {
     let again = say(APPLY);
     assert!(again.contains("nothing to apply"), "{again}");
 }
+
+/// Catches a setup that an interruption leaves unfinishable, or whose re-run reaches a
+/// different host than a clean run: a failure planted at every single step of a clean run,
+/// in every Linux mode, must be an error, must never leave a `kbf.toml` without the files
+/// it names, and the same command again must finish with the files a clean run leaves.
+/// This is the stated re-run rule: setup holds no state of its own, each run plans from what
+/// is on the host.
+#[test]
+fn a_failure_at_any_step_is_finished_by_running_again() {
+    for mode in [Mode::Storage, Mode::Daemon, Mode::Frontend, Mode::AllInOne] {
+        let clean = {
+            let mut exec = released(host(), Platform::Linux);
+            go_ok(&FakeOs::linux(), &mut exec, &raw(mode));
+            exec
+        };
+        assert!(clean.log.len() > 5, "{mode:?}: {}", clean.log.len());
+        for at in 0..clean.log.len() {
+            let mut exec = released(host(), Platform::Linux);
+            exec.fail_at = Some(at);
+            let err = go(&FakeOs::linux(), &mut exec, &raw(mode), APPLY);
+            assert!(
+                matches!(err, Err(SetupError::Host(_))),
+                "{mode:?} at {at}: {err:?}"
+            );
+            if exec.entries.contains_key(&hp(KBF_TOML)) {
+                assert!(
+                    exec.entries.contains_key(&hp(INSTALLER_TOML)),
+                    "{mode:?} at {at}: kbf.toml before installer.toml"
+                );
+            }
+            exec.fail_at = None;
+            go(&FakeOs::linux(), &mut exec, &raw(mode), APPLY)
+                .unwrap_or_else(|e| panic!("{mode:?} at {at}: the re-run failed: {e}"));
+            assert_eq!(
+                exec.entries, clean.entries,
+                "{mode:?} at {at}: the re-run left another host than a clean run"
+            );
+        }
+    }
+}
