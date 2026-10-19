@@ -532,3 +532,38 @@ fn setup_does_the_database_step_for_two_modes_without_root() {
         assert!(err.contains("setup needs root"), "{mode}: {err}");
     }
 }
+
+/// Catches `run --installer-config` not attaching the schema step to the helper it drives
+/// (the helper tests attach a fake directly, and the Postgres tests never go through `run`):
+/// the helper `run` builds from a config naming a database refuses a release's schema with
+/// the database's own error (the socket directory does not exist, so no server is needed),
+/// and one built without the flag has no step.
+///
+/// Mutants seen red: the `set_schema_step` call removed from `build_helper`.
+#[test]
+fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
+    let (_, root) = seeded("run-schema-step");
+    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
+    fs::write(
+        root.join("etc/kbf/installer.toml"),
+        "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n",
+    )
+    .expect("config");
+    let with = |extra: &[&str]| {
+        let mut argv = vec!["--root", root.to_str().expect("text")];
+        argv.extend_from_slice(&RUN);
+        argv.extend_from_slice(extra);
+        let Verb::Run(args) = parse(&argv).verb else {
+            panic!("a run");
+        };
+        match build_helper(root.clone(), &args) {
+            Ok(helper) => helper,
+            Err(f) => panic!("{}", f.why),
+        }
+    };
+    let mut helper = with(&["--installer-config", "/etc/kbf/installer.toml"]);
+    let step = helper.schema_step_mut().expect("the step is attached");
+    let why = step.before_start(1).expect_err("no server to migrate");
+    assert!(!why.is_empty());
+    assert!(with(&[]).schema_step_mut().is_none(), "no flag, no step");
+}

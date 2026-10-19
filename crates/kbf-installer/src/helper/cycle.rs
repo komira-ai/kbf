@@ -118,6 +118,12 @@ impl<E: Exec> Helper<E> {
         self.schema = Some(step);
     }
 
+    /// The schema step, for a test to see what a caller attached.
+    #[cfg(test)]
+    pub(crate) fn schema_step_mut(&mut self) -> Option<&mut (dyn SchemaStep + 'static)> {
+        self.schema.as_deref_mut()
+    }
+
     /// The host's executor, for a test to read what was done.
     pub fn exec(&self) -> &E {
         &self.exec

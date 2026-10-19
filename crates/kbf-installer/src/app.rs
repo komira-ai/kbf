@@ -145,20 +145,9 @@ fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
     run_from(root, args, &me, watch)
 }
 
-/// The service loop of `me`, the file this program runs from, whose identity `watch` holds:
-/// once the file is replaced the loop starts the new one in this process's place.
-fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Result<(), Failure> {
-    // A frontend or all-in-one unit activates a release only after the database is migrated
-    // for it; without the installer.toml that names the database the step would be silently
-    // absent, so the service does not start.
-    if args.installer_config.is_none() && args.service.runs_database_mode() {
-        return Err(Failure {
-            exit: Exit::Usage,
-            why: "run needs --installer-config on a frontend or all-in-one host (the \
-                  database is migrated before a release is activated)"
-                .to_owned(),
-        });
-    }
+/// The helper `run` drives: the host's, with the schema step of `--installer-config` attached
+/// when the flag is given.
+fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failure> {
     let database = match &args.installer_config {
         Some(config) => Some(
             Database::from_installer_toml(&under(&root, config)?)
@@ -189,6 +178,24 @@ fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Re
     if let Some(database) = database {
         helper.set_schema_step(Box::new(database));
     }
+    Ok(helper)
+}
+
+/// The service loop of `me`, the file this program runs from, whose identity `watch` holds:
+/// once the file is replaced the loop starts the new one in this process's place.
+fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Result<(), Failure> {
+    // A frontend or all-in-one unit activates a release only after the database is migrated
+    // for it; without the installer.toml that names the database the step would be silently
+    // absent, so the service does not start.
+    if args.installer_config.is_none() && args.service.runs_database_mode() {
+        return Err(Failure {
+            exit: Exit::Usage,
+            why: "run needs --installer-config on a frontend or all-in-one host (the \
+                  database is migrated before a release is activated)"
+                .to_owned(),
+        });
+    }
+    let helper = build_helper(root, args)?;
     let mut serve = Serve::new(helper, Box::new(watch));
     serve.helper().recover()?;
     let mut left = args.passes;
