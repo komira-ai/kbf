@@ -51,6 +51,9 @@ pub struct Memory {
     /// before the restart, so a crash between the two restarts on the next cycle.
     pub restart_due: bool,
     pub staged: Option<StagedFacts>,
+    /// When the last swap was made, in seconds since the epoch; 0 when none was. Orders
+    /// closer to it than `min_activation_interval_s` are refused.
+    pub last_activation_at: u64,
     /// A fetch is in progress (only while a pass runs; never stored, so a crash cannot
     /// leave it set).
     #[serde(skip)]
