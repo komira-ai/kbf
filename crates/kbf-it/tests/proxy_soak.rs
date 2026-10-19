@@ -49,8 +49,8 @@ use kbf_proxy::Proxy;
 use kbf_proxy::control::NoUpdates;
 use kbf_proxy::slot::{Retire, Slot};
 use proxy_support::{
-    Child, Open, actions, api_get, connect, frontend_args, free_base, open_executions, proxy_config,
-    proxy_get, storage_node, store, until, until_ready, within,
+    Child, Open, actions, api_get, connect, free_base, frontend_args, open_executions,
+    proxy_config, proxy_get, storage_node, store, until, until_ready, within,
 };
 
 pub fn frontend(dir: &Path, name: &str, node: &Child, base: u16) -> Child {

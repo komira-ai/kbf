@@ -214,7 +214,10 @@ pub fn grpc_request(path: &str) -> http::Request<()> {
 
 /// A TLS h2 client of the proxy, trusting the CA in `ca_pem` (no client certificate: the
 /// proxy's default `buck2_auth = "none"` serves an anonymous caller).
-pub async fn connect(addr: &str, ca_pem: &Path) -> (SendRequest<Bytes>, tokio::task::JoinHandle<()>) {
+pub async fn connect(
+    addr: &str,
+    ca_pem: &Path,
+) -> (SendRequest<Bytes>, tokio::task::JoinHandle<()>) {
     use rustls::pki_types::pem::PemObject as _;
     let mut roots = rustls::RootCertStore::empty();
     for der in rustls::pki_types::CertificateDer::pem_file_iter(ca_pem).expect("CA file") {
@@ -335,7 +338,10 @@ pub struct Open {
 impl Open {
     /// Starts `request` through `client`. The `Err` is the gRPC status of a refusal that
     /// came in the headers (a trailers-only answer) or the transport error.
-    pub async fn start(client: &SendRequest<Bytes>, request: &ExecuteRequest) -> Result<Self, String> {
+    pub async fn start(
+        client: &SendRequest<Bytes>,
+        request: &ExecuteRequest,
+    ) -> Result<Self, String> {
         let (response, mut send) = client
             .clone()
             .ready()

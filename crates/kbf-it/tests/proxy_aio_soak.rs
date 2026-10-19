@@ -55,7 +55,7 @@
 
 mod proxy_support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
@@ -68,12 +68,10 @@ use std::time::{Duration, Instant};
 use kbf_installer::CommitId;
 use kbf_installer::proxy::gate_real::ProxyGate;
 use kbf_installer::proxy::model::{
-    AdoptError, Locator, Mode, OpenCounts, Phase, Plan, PortError, ProcIdent, Readiness,
-    Retired, RoleInfo, RoleState, Slot, StagedFacts, Start, Timing,
+    AdoptError, Locator, Mode, OpenCounts, Phase, Plan, PortError, ProcIdent, Readiness, Retired,
+    RoleInfo, RoleState, Slot, StagedFacts, Start, Timing,
 };
-use kbf_installer::proxy::ports::{
-    Child, ChildAdmin, Gate, Migrator, Ports, RootOrders,
-};
+use kbf_installer::proxy::ports::{Child, ChildAdmin, Gate, Migrator, Ports, RootOrders};
 use kbf_installer::proxy::runtime::{RequestQueue, SystemClock};
 use kbf_installer::proxy::{FileRecorder, Swap};
 use kbf_proxy::Proxy;
@@ -82,13 +80,16 @@ use kbf_proxy::hold::ALL_IN_ONE_HOLD;
 use kbf_proxy::slot::Slot as GateSlot;
 use kbf_testkit::reaped::{self, Reaped};
 use proxy_support::{
-    Open, actions, api_get, connect, frontend_args, free_base, open_executions, proxy_config,
+    Open, actions, api_get, connect, free_base, frontend_args, open_executions, proxy_config,
     proxy_get, storage_node, store, until, until_ready, within,
 };
 
 /// Streams that arrive while the swap holds, between the old process's stop and the new
 /// process's start.
 const HELD: usize = 200;
+
+/// How long the streams are held with the new child up and the swap not yet ready to release.
+const DWELL: Duration = Duration::from_millis(600);
 
 /// The test's clock for its own waits.
 const WAIT: Duration = Duration::from_secs(30);
@@ -166,7 +167,9 @@ impl Child for Procs {
         let mut command = Command::new(self.dir.join("bin/kbf"));
         command
             .args(frontend_args(&self.storage, slot_base(self.base, slot)))
-            .stdout(Stdio::from(out.try_clone().map_err(|e| PortError(e.to_string()))?))
+            .stdout(Stdio::from(
+                out.try_clone().map_err(|e| PortError(e.to_string()))?,
+            ))
             .stderr(out);
         let process = reaped::spawn(&mut command, 3).map_err(|e| PortError(e.to_string()))?;
         let pid = process.id();
@@ -482,7 +485,7 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
         timing: Timing {
             poll: Duration::from_millis(20),
             bake: Duration::ZERO,
-            ready_within: Duration::from_secs(60),
+            ready_within: Duration::from_secs(20),
             ..Timing::all_in_one()
         },
     };
@@ -493,6 +496,15 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
         .enable_all()
         .build()
         .expect("runtime");
+    // The actions are stored and the client is connected before the swap starts: it stops the
+    // old process at once, and `/readyz` is 503 with no slot active.
+    let (executes, blobs) = actions("held", HELD);
+    let (client, driver) = client_runtime.block_on(async {
+        within("the actions", store(&format!("127.0.0.1:{base}"), blobs)).await;
+        let (client, driver) = connect(&public_addr.to_string(), &pki.ca_cert).await;
+        until_ready(&client).await;
+        (client, driver)
+    });
     let (end, notes) = std::thread::scope(|scope| {
         let swap = scope.spawn(|| {
             // The recorder is not `Sync`, and only the swap uses it.
@@ -512,10 +524,6 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
             (end, swap.notes().to_vec())
         });
         client_runtime.block_on(async {
-            let (requests, blobs) = actions("held", HELD);
-            within("the actions", store(&format!("127.0.0.1:{base}"), blobs)).await;
-            let (client, driver) = connect(&public_addr.to_string(), &pki.ca_cert).await;
-            until_ready(&client).await;
 
             // The swap has stopped the old process and cleared the active slot, and has not
             // started the new one: it is in the migration.
@@ -541,7 +549,7 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
             );
 
             // 200 streams arrive now.
-            let streams: Vec<_> = requests
+            let streams: Vec<_> = executes
                 .iter()
                 .map(|request| {
                     let (client, request) = (client.clone(), request.clone());
@@ -563,11 +571,14 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
             wait_for("the swap's probe of the new child", || {
                 stand.refused_ready.load(Ordering::SeqCst) >= 3
             });
+            // The streams wait out a stretch of time that a short bound would not survive.
+            tokio::time::sleep(DWELL).await;
             let snapshot = handle.snapshot();
             assert_eq!(
                 (snapshot.active, snapshot.held, snapshot.per_slot[1].open_streams),
                 (None, HELD, 0),
-                "the swap let streams go before it saw the new child ready"
+                "after the dwell the streams are not all still held (a release before the swap saw the new \
+child ready, or a hold that ran out, shows here)"
             );
             assert_eq!(open_executions(&api_b), 0, "nothing reached the new child yet");
             assert!(streams.iter().all(|s| !s.is_finished()));
@@ -583,10 +594,11 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
                     Err(why) => refused.push(why),
                 }
             }
+            let answers: BTreeSet<_> = refused.iter().collect();
             assert_eq!(
-                (served.len(), refused),
-                (HELD, Vec::<String>::new()),
-                "streams served by the new child, and streams refused"
+                (served.len(), refused.len(), answers),
+                (HELD, 0, BTreeSet::new()),
+                "streams served by the new child, streams refused, and how"
             );
             assert_eq!(open_executions(&api_b), HELD as u64, "B's own count");
             let snapshot = handle.snapshot();
@@ -664,11 +676,18 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
         held_for < ALL_IN_ONE_HOLD,
         "the hold lasted {held_for:?}, past its bound"
     );
-    assert_eq!(spy.expired.load(Ordering::SeqCst), 0, "streams the swap expired");
+    assert_eq!(
+        spy.expired.load(Ordering::SeqCst),
+        0,
+        "streams the swap expired"
+    );
     assert_eq!(handle.snapshot().holds_abandoned, 0);
     handle.shutdown();
     serving.join().expect("the runner thread").expect("run");
     drop(procs);
     let mut node = node;
-    assert!(node.stop().is_some_and(|status| status.success()), "the node exits 0");
+    assert!(
+        node.stop().is_some_and(|status| status.success()),
+        "the node exits 0"
+    );
 }
