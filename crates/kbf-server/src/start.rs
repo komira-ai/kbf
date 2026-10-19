@@ -312,8 +312,9 @@ where
     let shutdown = shutdown()?;
     let api = args.api()?;
     let storage = args.storage()?;
+    let proxy = args.proxy()?;
     let bound = bind_server_with_options(
-        cache, listeners, api, policy, state, storage, None, shutdown,
+        cache, listeners, api, policy, state, storage, None, proxy, shutdown,
     )?;
     let plain = args.plain_text_off_loopback();
     Ok(ServerHandle {

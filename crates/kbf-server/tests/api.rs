@@ -18,6 +18,7 @@ use kbf_proto::worker::{NodeStatus, ServerMessage, XcodeState, XcodeStatus, daem
 use kbf_server::api::{DRAIN_DEADLINE, Write, write_request};
 use kbf_server::farm::NodeAction;
 use kbf_server::fleet::SoftwareView;
+use kbf_server::proxy_auth::Caller;
 use kbf_server::token::ApiToken;
 use kbf_server::{
     Api, BUILD_COMMIT, Farm, Listeners, SERVER_VERSION, ServeError, bind_server_with_api,
@@ -735,9 +736,9 @@ fn writes_are_accepted_only_from_loopback() {
     let token = token();
     let headers = headers(&[("authorization", &format!("Bearer {TOKEN}")), JSON]);
     let write = |peer: &str, target: &'static str, body: &'static [u8]| {
-        let peer: SocketAddr = peer.parse().expect("an address");
+        let peer = Caller::direct(peer.parse().expect("an address"));
         let request = Write {
-            peer,
+            peer: &peer,
             headers: &headers,
             target,
             body,
@@ -797,8 +798,9 @@ fn a_write_passes_every_gate_or_is_refused() {
     let bearer = format!("Bearer {TOKEN}");
     let check = |token: Option<&ApiToken>, pairs: &[(&str, &str)]| {
         let headers = headers(pairs);
+        let peer = Caller::direct("127.0.0.1:4000".parse().expect("an address"));
         let request = Write {
-            peer: "127.0.0.1:4000".parse().expect("an address"),
+            peer: &peer,
             headers: &headers,
             target: "mac-1:cordon",
             body: b"",
