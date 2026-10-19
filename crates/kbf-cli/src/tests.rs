@@ -215,8 +215,7 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
     // both places.
     let e = error(vec!["kbf".into()]);
     assert!(e.contains("no mode") && e.contains("--mode=<"), "{e}");
-    let dir = std::env::temp_dir().join(format!("kbf-cli-lib-mode-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-cli-lib-mode");
     let file = dir.join("kbf.toml");
     std::fs::write(
         &file,
