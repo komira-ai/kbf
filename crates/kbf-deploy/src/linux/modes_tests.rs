@@ -151,7 +151,7 @@ fn the_modes_are_listed_with_the_sets_the_rules_use() {
 
 /// Catches rule `stop` skipped for a mode that drains (a storage node finishes its large
 /// Writes at stop; systemd's 90 s default would cut them) or applied to the daemon,
-/// which abandons its leases on SIGTERM.
+/// whose drain ends at its own deadline and whose stop timeout is finite.
 #[test]
 fn every_mode_but_the_daemon_drains() {
     let drains: Vec<_> = Mode::ALL.iter().filter(|m| m.drains()).collect();

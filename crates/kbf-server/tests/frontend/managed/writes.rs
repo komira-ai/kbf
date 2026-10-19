@@ -49,7 +49,7 @@ async fn execute_as_build(
 }
 
 /// A child over `store` that stops when `stop` is sent.
-async fn child_until(
+pub(super) async fn child_until(
     flags: &FrontendFlags,
     store: Arc<dyn Store>,
     stop: oneshot::Receiver<()>,

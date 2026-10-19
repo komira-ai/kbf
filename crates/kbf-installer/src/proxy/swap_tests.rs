@@ -39,13 +39,13 @@ fn untouched(w: &World, pid: u32) {
     assert!(hits.is_empty(), "pid {pid} was signalled: {hits:?}");
 }
 
-/// A world where the old child drains late: permits, executions and queued operations
-/// clear one after the other.
+/// A world where the old child drains late: permits, streams and sessions clear one after
+/// the other.
 fn draining_world() -> (World, ProcIdent) {
     let (w, old) = World::with_old();
     w.permits(Slot::A, 3, Some(secs(400)));
     w.busy(Slot::A, 2, Some(secs(500)));
-    w.queued(Slot::A, 1, Some(secs(600)));
+    w.sessions(Slot::A, 1, Some(secs(600)));
     (w, old)
 }
 
@@ -85,13 +85,13 @@ fn a_swap_runs_every_phase_in_order_and_retires_the_old_child_last() {
 }
 
 #[test]
-fn the_old_child_is_retired_only_when_streams_executions_and_queue_are_all_zero() {
+fn the_old_child_is_retired_only_when_permits_streams_and_sessions_are_all_zero() {
     let (w, old) = draining_world();
     assert_eq!(go(&w, plan(Mode::Frontend), old), Ok(Phase::Done));
     let at = w.when("terminate pid 100").expect("retired");
     assert!(
         at >= secs(600),
-        "retired at {at:?}, before the queue emptied at 600 s"
+        "retired at {at:?}, before the sessions closed at 600 s"
     );
     assert_eq!(w.count("terminate"), 1);
 }
@@ -104,12 +104,12 @@ fn an_old_child_that_never_drains_is_never_signalled_in_24_hours() {
             Box::new(|w: &World| w.permits(Slot::A, 1, None)) as Box<dyn Fn(&World)>,
         ),
         (
-            "an execution stays open",
+            "a stream stays open",
             Box::new(|w: &World| w.busy(Slot::A, 1, None)),
         ),
         (
-            "a queued operation stays",
-            Box::new(|w: &World| w.queued(Slot::A, 1, None)),
+            "a worker session stays open",
+            Box::new(|w: &World| w.sessions(Slot::A, 1, None)),
         ),
         (
             "the gate never opened the slot, so it cannot be retired",

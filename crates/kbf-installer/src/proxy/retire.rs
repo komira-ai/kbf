@@ -22,7 +22,8 @@ impl Swap<'_> {
 
     /// Wait until `slot` is idle, send SIGTERM once, and wait for the exit. Idle means all
     /// of: the slot is not the active one, the proxy holds no permit on it, and the child
-    /// reports no open execution and no queued operation. If the child cannot be asked, it
+    /// reports no open stream and no open session (queued operations do not count: the new
+    /// holder serves them). If the child cannot be asked, it
     /// is not provably idle. A child that exits by itself ends the wait at once.
     pub(super) fn retire(&mut self, slot: Slot) -> Result<(), Halt> {
         if !self.slot_alive(slot) {
