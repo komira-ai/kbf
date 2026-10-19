@@ -76,8 +76,11 @@ kbf-segments.workspace = true
 # The node's update client the offer tests hand the offers to (tests/update_offers.rs).
 kbf-update.workspace = true
 # The proxy's `ChildAdmin`, run against the admin and operator ports of two managed
-# frontends (tests/frontend/managed/admin_client.rs).
-kbf-installer.workspace = true
+# frontends (tests/frontend/managed/admin_client.rs). `test-sandbox` as the installer's own
+# tests build it: the coverage job also runs `-p kbf-server` alone, where nothing else turns
+# the feature on, and the production arm of `app::root_of` would be compiled in and counted
+# with no test running it. The feature only adds the `--root` flag; ChildAdmin never reads it.
+kbf-installer = { workspace = true, features = ["test-sandbox"] }
 # The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
 kbf-sim.workspace = true
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/).
