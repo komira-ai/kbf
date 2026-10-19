@@ -43,6 +43,12 @@ impl std::ops::Deref for Rooted {
     }
 }
 
+impl AsRef<Path> for Rooted {
+    fn as_ref(&self) -> &Path {
+        &self.root
+    }
+}
+
 /// Unpacks the tars (lowest first) into `<scratch>/<name>/rootfs`.
 fn unpack(name: &str, layers: &[Vec<u8>]) -> (Rooted, Result<kbf_image::Unpacked, UnpackError>) {
     unpack_with(name, layers, Unpack::new(mine()))
@@ -65,13 +71,7 @@ fn unpack_with(
         .collect();
     let root = base.join("rootfs");
     let result = unpack.run(&root, &sources);
-    (
-        Rooted {
-            root,
-            _base: base,
-        },
-        result,
-    )
+    (Rooted { root, _base: base }, result)
 }
 
 fn tar(items: &[Item<'_>]) -> Vec<u8> {

@@ -5,7 +5,6 @@
 //! breaks the order it promises.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;

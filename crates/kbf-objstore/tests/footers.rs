@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
