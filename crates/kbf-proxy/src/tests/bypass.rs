@@ -375,8 +375,8 @@ fn files(name: &str, base: u16, extra: &str) -> Files {
          hold_max_s = 600\n\
          {extra}\n\
          [upstream]\nbase_port = {base}\n",
-        paths.cert,
-        paths.key,
+        paths.certs[0].cert,
+        paths.certs[0].key,
         paths.client_ca,
         dir.join("proxy-auth"),
     ))

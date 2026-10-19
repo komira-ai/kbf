@@ -69,8 +69,7 @@ impl Proxy {
         let (slots, startup) = ActiveSlot::starting(hold_max);
         let metrics = Arc::new(Metrics::default());
         let paths = TlsPaths {
-            cert: cfg.server_cert_file,
-            key: cfg.server_key_file,
+            certs: cfg.cert_entries(),
             client_ca: cfg.client_ca_file,
         };
         let tls =

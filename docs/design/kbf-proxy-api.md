@@ -252,9 +252,12 @@ Decision C8: the modes do not combine. In `bearer` mode a certificate is neither
 ```toml
 [proxy]
 operator_token_file = "/etc/kbf/operator.token"   # read by the proxy; reloaded on SIGHUP
+client_ca_file   = "/etc/kbf/tls/ca.pem"   # verifies client certificates, whatever name they asked for
+# Server certificates, one of two forms (not both).
+# Single certificate, served for every name:
 server_cert_file = "/etc/kbf/tls/server.pem"
 server_key_file  = "/etc/kbf/tls/server.key"
-client_ca_file   = "/etc/kbf/tls/ca.pem"
+# Or a list chosen by SNI (the ClientHello's server name), in [[proxy.server_cert]] tables below.
 buck2_auth = "none"                  # none | bearer | mtls
 buck2_token_file = "/etc/kbf/buck2.token"   # required for bearer
 proxy_auth_file = "/run/kbf-proxy/proxy-auth"
@@ -262,10 +265,22 @@ state_dir = "/var/lib/kbf-proxy"     # update.json and the swap state machine ar
 hold_max_s = 20                      # a frontend swap's hold; all-in-one is fixed at 300
 [proxy.upstream]
 base_port = 18000
+# The list form of the server certificates, in place of server_cert_file/server_key_file:
+# [[proxy.server_cert]]
+# names = ["reapi.example.com"]        # DNS names, each in the certificate's SANs
+# cert_file = "/etc/kbf/tls/reapi.pem"
+# key_file  = "/etc/kbf/tls/reapi.key"
+# default = true                        # exactly one when there are two or more
+# [[proxy.server_cert]]
+# names = ["farm.internal.example"]
+# cert_file = "/etc/kbf/tls/worker.pem"
+# key_file  = "/etc/kbf/tls/worker.key"
 [proxy.limits]                       # every key optional; defaults shown
 pre_stream_timeout_s = 10   max_connections = 50000   max_connections_per_ip = 2000   max_streams = 8192
 max_header_list_bytes = 16384   keepalive_interval_s = 30   keepalive_ack_s = 20
 ```
+
+**Server certificates.** `server_cert_file` + `server_key_file` is the same as one `[[proxy.server_cert]]` with no names and `default = true`, so a config written before SNI stays valid. With a list, a ClientHello whose server name equals a `names` entry (case-insensitive, trailing dot ignored) gets that entry's certificate; no server name, or a name that is in no entry, gets the entry marked `default = true`. Two or more entries need exactly one default; an entry without `names` must be the default. At start, and at every reload, each pair is checked: the key is the certificate's, every configured name is a DNS subject alternative name of the leaf (a `*.rest` SAN covers one label), no name appears twice, and the shape rules above hold; a reload also refuses an expired leaf. Any failure refuses the whole list: a start does not proceed, and a reload keeps the previous one. Client certificates are verified against `client_ca_file` and the per-path rules apply, the same on every name.
 
 Unknown keys are refused at start. U4b-3 adds `proxy: Option<ProxyConfig>` to the installer's settings and keeps the installer's own deny-unknown rule. The operator token and update credential (C9) are read by the proxy; U8 injects a different `UpdateHandler`, not a different token source.
 
@@ -483,7 +498,7 @@ Known and left: `/healthz` answers 200 unconditionally and `/readyz` 503 until t
 
 TLS, identity and auth. The public API of section 3 is unchanged; `ProxyHandle` now has `secret_origin`, `admin_headers` and `reload_tls`, `ProxySecret::create_or_read` and `SecretOrigin` exist, and `Proxy::bind` no longer refuses `buck2_auth` other than `none`. Where it differs from sections 2 to 15:
 
-- **Terminator.** `kbf_tls::server_config_optional_client(cert, key, client_ca, reject_expired)` builds the rustls config (`WebPkiClientVerifier::builder_with_provider(..).allow_unauthenticated()`, confirmed on rustls 0.23.46: a presented certificate that fails is a handshake error, none is anonymous; ALPN `h2` then `http/1.1`; ring; early data 0). `tls::TlsReloader` reads the three files, builds, and swaps the whole `Arc<ServerConfig>` or nothing; a reload also refuses an expired leaf, the first load does not. The accept path is `Acceptor::accept` (handshake bounded by `pre_stream_timeout_s`, then `identity_of` on the leaf, then ALPN picks h2 or HTTP/1.1; no ALPN is HTTP/1.1). A verified certificate with no usable identity closes the connection (`kbf_proxy_identity_refused_total`). `Acceptor::Plain` exists only under `cfg(test)`. Graceful shutdown no longer goes through hyper-util's `GracefulShutdown` (it needs the connection before the handshake); each connection task selects on the shutdown flag and the accept loop waits for the tasks through a channel whose senders they hold.
+- **Terminator.** `kbf_tls::server_config_optional_client(cert, key, client_ca, reject_expired)` builds the rustls config (`WebPkiClientVerifier::builder_with_provider(..).allow_unauthenticated()`, confirmed on rustls 0.23.46: a presented certificate that fails is a handshake error, none is anonymous; ALPN `h2` then `http/1.1`; ring; early data 0). `tls::TlsReloader` builds a `kbf_tls::SniCerts` from the certificate list (`SniCerts::from_config`), reads the client CA, builds the config around the resolver (`server_config_optional_client_sni`), and swaps the whole `Arc<ServerConfig>` or nothing; a reload also refuses an expired leaf, the first load does not. The accept path is `Acceptor::accept` (handshake bounded by `pre_stream_timeout_s`, then `identity_of` on the leaf, then ALPN picks h2 or HTTP/1.1; no ALPN is HTTP/1.1). A verified certificate with no usable identity closes the connection (`kbf_proxy_identity_refused_total`). `Acceptor::Plain` exists only under `cfg(test)`. Graceful shutdown no longer goes through hyper-util's `GracefulShutdown` (it needs the connection before the handshake); each connection task selects on the shutdown flag and the accept loop waits for the tasks through a channel whose senders they hold.
 - **Auth.** `Service::handle` classifies once: the HTTP/1.1 check, then `route_of`, then `Security::authorize`, then the hold. The bearer limit counts **wrong tokens, not calls** (a Buck2 client sends its key on every call, thousands a second): ten in a row per address, one earned back per second; an address past it is refused (`RESOURCE_EXHAUSTED`, 429) before its token is hashed. Token files follow the child's rules (regular file, this user, mode 0600 or 0400, at least 32 visible ASCII characters). The operator token and the Buck2 key are read at start; **reloading them on SIGHUP is not built** (only `reload_tls` is), so the config comment says "at start".
 - **HTTP/1.1** uses hyper's HTTP/1.1 server (which parses with `httparse`) with `max_buf_size` 16 KiB, 100 headers and the pre-stream bound as the head timeout; origin-form, no `CONNECT`, no `Upgrade`; gRPC paths are 426. The request is made absolute and its connection-level headers dropped so it enters the same code as an h2 one.
 - **Secret file.** Written by `link` (a creation never clobbers) or `rename` (a replacement of a file that is not 32 bytes); a file with another owner or a mode other than 0600 or 0400 is an error, not a repair, whatever its length. A second proxy racing the creation fails with `AlreadyExists` and is restarted by its unit.
