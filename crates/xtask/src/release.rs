@@ -23,6 +23,11 @@
 //!   gamma verdict for that tag, that commit (on main) and the set `<dir>`'s `SHA256SUMS`
 //!   hashes to, after a bake of 24 hours or more. Prints `set-hash=<hex>`, which
 //!   `publish --set-hash` must be given.
+//! - `release offer <dir> --repo <owner/repo> --commit <sha> --platform <p>... (--beta-result
+//!   <file> | --waive-beta <reason> --operator <name>) [--previous <sha> --version-json <file>
+//!   --previous-version-json <file>] [--plan] [--out offer.json]` ([`offer`]): the checks
+//!   that make a commit offerable, and `offer.json`, the record a deploy reads. It sets
+//!   nothing on any farm.
 //! - `release notes <dir> ... --out <file>` ([`notes`]): the same checks, then the
 //!   release's notes: commits since the previous `v*` tag, the verdict's summary, what
 //!   is not reversible, the gamma escapes and what is withdrawn.
@@ -35,6 +40,7 @@
 
 mod git;
 pub mod notes;
+pub mod offer;
 pub mod verdict;
 
 use std::io::Write;
