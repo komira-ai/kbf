@@ -12,19 +12,28 @@
 //! view when the call does not apply (the role, or the generation), `400` for a body that
 //! is not what the call takes and `500` when a takeover took the generation and could not
 //! start.
+//!
+//! **Who may call.** With `--proxy-auth-file` ([`secured`]) every call, `GET role` too,
+//! must present the proxy's secret (`x-kbf-proxy-auth`; no identity header is needed):
+//! without it, or with a wrong one, the call is refused `403` and not acted on. Without
+//! the flag the port is loopback-only and takes no credential: that is for a host with no
+//! proxy, where every local process is trusted to move the scheduler's role.
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::Request;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
 use super::control::{Control, Refusal, RoleView};
+use crate::proxy_auth::Trust;
 
 /// The routes.
 pub(crate) fn router(control: Arc<Control>) -> Router {
@@ -35,6 +44,24 @@ pub(crate) fn router(control: Arc<Control>) -> Router {
         .route("/v1/admin/takeover", post(takeover))
         .route("/v1/admin/stand-down", post(stand_down))
         .with_state(control)
+}
+
+/// `routes` for a frontend behind the proxy: a call that did not present the proxy's secret
+/// is refused `403` before a handler sees it. It needs the gate of
+/// [`crate::serve::serve_api`] to run first (that is what decides the [`Trust`]), and a
+/// call it has not seen pass is refused too.
+pub(crate) fn secured(routes: Router) -> Router {
+    routes.layer(middleware::from_fn(require_proxy))
+}
+
+async fn require_proxy(request: Request, next: Next) -> Response {
+    if matches!(request.extensions().get::<Trust>(), Some(Trust::Proxied(_))) {
+        return next.run(request).await;
+    }
+    crate::api::error(
+        StatusCode::FORBIDDEN,
+        "the admin calls of a frontend behind a proxy need the proxy's secret (x-kbf-proxy-auth)",
+    )
 }
 
 fn json(code: StatusCode, value: &impl Serialize) -> Response {

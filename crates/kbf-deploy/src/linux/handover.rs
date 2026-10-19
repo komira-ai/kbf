@@ -15,7 +15,10 @@
 //!   it for ever.
 //! - `--handover-socket=` an absolute path in a `RuntimeDirectory=` of the unit, with
 //!   `RuntimeDirectoryPreserve=yes`: the instance that stops must not take the directory,
-//!   and so the socket the next handover asks at, with it.
+//!   and so the socket the next handover asks at, with it. Only for a SQLite state store
+//!   (or none given): `kbf frontend` cannot hand a Postgres store over and exits 2 on the
+//!   socket beside one, so a unit with a `postgres://` store has no socket, and the rule
+//!   fails one that gives it.
 //! - No `Conflicts=` in `[Unit]`: starting an instance would stop the other, which is the
 //!   one still draining the builds in flight, and every one of them would fail.
 //!
@@ -60,6 +63,40 @@ pub(super) fn check(unit: &UnitFile) -> Vec<String> {
              handover for ever; give a finite TimeoutStartSec="
         ));
     }
+    // A Postgres store cannot be handed over: `kbf frontend` exits 2 on the socket beside it
+    // (the bundled proxy replaces the handover, docs/design/frontend-proxy.md). Such a
+    // unit has no control socket, and so needs neither it nor the preserved directory.
+    let postgres = unit
+        .flag("state-store")
+        .is_some_and(|v| v.starts_with("postgres://") || v.starts_with("postgresql://"));
+    if postgres {
+        if unit.flag(SOCKET_FLAG).is_some() {
+            out.push(
+                "has --handover-socket with a postgres --state-store: kbf frontend refuses the \
+                 two together (a Postgres store cannot be handed over), so the unit would exit \
+                 2 at start; drop the socket"
+                    .to_owned(),
+            );
+        }
+    } else {
+        socket(unit, &mut out);
+    }
+    if let Some(conflicts) = unit
+        .directives()
+        .iter()
+        .find(|d| d.section == "Unit" && d.key == "Conflicts" && !trim(&d.value).is_empty())
+    {
+        out.push(format!(
+            "has Conflicts={}: starting an instance would stop the other, which is draining \
+             the builds in flight",
+            trim(&conflicts.value)
+        ));
+    }
+    out
+}
+
+/// The control socket and the directory it lives in (a unit that hands over).
+fn socket(unit: &UnitFile, out: &mut Vec<String>) {
     match unit.flag(SOCKET_FLAG) {
         None => out.push(
             "gives no --handover-socket: the instances cannot hand over, and an update would \
@@ -97,18 +134,6 @@ pub(super) fn check(unit: &UnitFile) -> Vec<String> {
             )
         ));
     }
-    if let Some(conflicts) = unit
-        .directives()
-        .iter()
-        .find(|d| d.section == "Unit" && d.key == "Conflicts" && !trim(&d.value).is_empty())
-    {
-        out.push(format!(
-            "has Conflicts={}: starting an instance would stop the other, which is draining \
-             the builds in flight",
-            trim(&conflicts.value)
-        ));
-    }
-    out
 }
 
 /// The directories the `RuntimeDirectory=` lines name, in order (a list per line; an
