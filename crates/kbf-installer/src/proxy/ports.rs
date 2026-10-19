@@ -80,7 +80,7 @@ pub trait Gate {
     fn release_into(&self, slot: Slot) -> Result<(), PortError>;
 
     /// Fail each held stream that has waited `hold_max` with gRPC `UNAVAILABLE` and count
-    /// it in `kbf_proxy_hold_expired_total`. Returns how many. Does not end the update.
+    /// it in the proxy's hold-expired counter. Returns how many. Does not end the update.
     /// The swap calls it on every poll of a wait and before it releases the hold.
     fn expire(&self) -> usize;
 

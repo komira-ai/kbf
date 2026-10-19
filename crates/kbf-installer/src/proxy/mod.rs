@@ -55,6 +55,7 @@
 
 mod aio;
 pub mod api;
+pub mod gate_real;
 pub mod model;
 pub mod ports;
 pub mod record;
@@ -70,6 +71,8 @@ mod confirm_boundary_tests;
 mod fakes;
 #[cfg(test)]
 mod fault_tests;
+#[cfg(test)]
+mod gate_real_tests;
 #[cfg(test)]
 mod gate_tests;
 #[cfg(test)]
