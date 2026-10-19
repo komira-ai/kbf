@@ -25,6 +25,14 @@ pub(crate) struct Metrics {
     pub(crate) upstream_dial_failed: AtomicU64,
     /// Streams dispatched again after a safe failure.
     pub(crate) retries: AtomicU64,
+    /// Reloads of the TLS files that failed (the old configuration stayed).
+    pub(crate) tls_reload_failed: AtomicU64,
+    /// TLS handshakes that failed or ran out of time.
+    pub(crate) handshake_failed: AtomicU64,
+    /// Connections closed because a verified certificate names no usable identity.
+    pub(crate) identity_refused: AtomicU64,
+    /// Calls refused by the auth rules (a missing or wrong credential, a wrong role, a limit).
+    pub(crate) auth_refused: AtomicU64,
 }
 
 impl Metrics {
@@ -83,6 +91,30 @@ impl Metrics {
             "counter",
             "Streams dispatched again after a safe failure.",
             get(&self.retries),
+        );
+        line(
+            "kbf_proxy_tls_reload_failed_total",
+            "counter",
+            "Reloads of the TLS files that failed; the old configuration stayed.",
+            get(&self.tls_reload_failed),
+        );
+        line(
+            "kbf_proxy_tls_handshake_failed_total",
+            "counter",
+            "TLS handshakes that failed or ran out of time.",
+            get(&self.handshake_failed),
+        );
+        line(
+            "kbf_proxy_identity_refused_total",
+            "counter",
+            "Connections closed for a certificate that names no usable identity.",
+            get(&self.identity_refused),
+        );
+        line(
+            "kbf_proxy_auth_refused_total",
+            "counter",
+            "Calls refused for a missing or wrong credential, a wrong role or a limit.",
+            get(&self.auth_refused),
         );
         line(
             "kbf_proxy_hold_expired_total",

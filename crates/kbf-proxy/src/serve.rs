@@ -1,7 +1,9 @@
 //! The accept loop, the per-connection limits and the per-request dispatch.
 //!
-//! Plaintext HTTP/2 for now (U4b-1): TLS, identity and auth arrive in U4b-2 at the one place a
-//! request is classified ([`Service::handle`]). Until then this must not face a network.
+//! A connection is accepted, passes the limits, and then (in its own task, so a slow client
+//! never holds up the accept loop) does its TLS handshake ([`Acceptor`]) and is served over
+//! HTTP/2 or HTTP/1.1 by what ALPN picked. Every request is classified in one place,
+//! [`Service::handle`]: the route, then who may call it, then where it goes.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -13,23 +15,23 @@ use std::time::Duration;
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
-use hyper::server::conn::http2;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::body::ProxyBody;
 use crate::control::{MAX_UPDATE_BODY, UPDATE_DEADLINE, UpdateHandler, UpdateReply, UpdateRequest};
-use crate::core::{Core, DOWNSTREAM_CONNECTION_STREAMS};
+use crate::core::{Core, DOWNSTREAM_CONNECTION_STREAMS, now};
 use crate::hold::STREAM_WINDOW_BYTES;
 use crate::metrics::Metrics;
 use crate::pool::BoxIo;
-use crate::reply::{from_update, is_grpc, text, unknown};
-use crate::route::{Route, route_of};
+use crate::reply::{from_update, is_grpc, refused, text, unknown};
+use crate::route::{Route, auth_class, route_of};
 use crate::stream::proxy_child;
+use crate::tls::{Acceptor, Peer, Proto};
 
 /// Where connections come from: the public socket, or an in-memory queue in the tests.
 pub(crate) trait Listen: Send + 'static {
@@ -84,23 +86,53 @@ impl<U: UpdateHandler + 'static> Service<U> {
     pub(crate) async fn call(
         self: Arc<Self>,
         request: Request<Incoming>,
+        peer: Arc<Peer>,
     ) -> Result<Response<ProxyBody>, StreamPanicked> {
         let core = Arc::clone(&self.core);
-        let mut task = AbortOnDrop(tokio::spawn(async move { self.handle(request).await }));
+        let mut task = AbortOnDrop(tokio::spawn(
+            async move { self.handle(request, &peer).await },
+        ));
         (&mut task.0).await.map_err(|_| {
             Metrics::inc(&core.metrics.panics);
             StreamPanicked
         })
     }
 
-    async fn handle(self: Arc<Self>, request: Request<Incoming>) -> Response<ProxyBody> {
+    async fn handle(
+        self: Arc<Self>,
+        request: Request<Incoming>,
+        peer: &Peer,
+    ) -> Response<ProxyBody> {
+        // HTTP/1.1 is checked, and made to look like HTTP/2, before anything reads the request.
+        let request = if peer.h1 {
+            match crate::h1::admit(request) {
+                Ok(request) => request,
+                Err(answer) => return *answer,
+            }
+        } else {
+            request
+        };
         let grpc = is_grpc(request.headers());
+        let route = route_of(request.uri().path());
+        // Who may call it, before the call is counted or held or forwarded.
+        let refusal = auth_class(route).and_then(|class| {
+            let headers = request.headers();
+            let security = &self.core.security;
+            security
+                .authorize(class, headers, peer.identity.as_ref(), peer.ip, now())
+                .err()
+        });
+        if let Some(refusal) = refusal {
+            Metrics::inc(&self.core.metrics.auth_refused);
+            return refused(route.grpc(), refusal);
+        }
         // Counted from accept: a bypass stream is one for its whole life, a backend stream
         // until its permit exists.
         let pending = self.core.slots.begin_stream();
-        match route_of(request.uri().path()) {
+        match route {
             Route::Child(target) => {
-                proxy_child(Arc::clone(&self.core), pending, target, request).await
+                let core = Arc::clone(&self.core);
+                proxy_child(core, pending, target, request, peer.identity.clone()).await
             }
             Route::Update => self.update(request).await,
             Route::Health => text(StatusCode::OK, "ok"),
@@ -226,6 +258,65 @@ async fn stopped(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|stop| *stop).await;
 }
 
+/// Everything one connection's task needs.
+struct Conn<U> {
+    io: BoxIo,
+    ip: IpAddr,
+    permit: ConnPermit,
+    acceptor: Arc<Acceptor>,
+    service: Arc<Service<U>>,
+    h2: http2::Builder<TokioExecutor>,
+    h1: http1::Builder,
+    shutdown: watch::Receiver<bool>,
+    /// Dropped when the connection ends: the accept loop waits for every clone to drain.
+    drain: mpsc::Sender<()>,
+}
+
+/// Drives a connection to its end; on a shutdown asks it to finish its open streams first.
+/// A macro and not a generic function: the compiler cannot prove a `Send` future through one.
+macro_rules! finish {
+    ($conn:expr, $shutdown:expr) => {{
+        let mut conn = std::pin::pin!($conn);
+        let mut shutdown = $shutdown;
+        tokio::select! {
+            _ = conn.as_mut() => {}
+            () = stopped(&mut shutdown) => {
+                conn.as_mut().graceful_shutdown();
+                let _ = conn.await;
+            }
+        }
+    }};
+}
+
+/// Runs one connection to its end: the handshake, then HTTP/2 or HTTP/1.1 by ALPN. A
+/// shutdown makes the connection finish its open streams and close.
+async fn connection<U: UpdateHandler + 'static>(conn: Conn<U>) {
+    let Conn {
+        io,
+        ip,
+        permit,
+        acceptor,
+        service,
+        h2,
+        h1,
+        shutdown,
+        drain,
+    } = conn;
+    let _held = (permit, drain);
+    let core = &service.core;
+    let limit = core.limits.pre_stream_timeout();
+    let Some(accepted) = acceptor.accept(io, ip, limit, &core.metrics).await else {
+        return;
+    };
+    let peer = Arc::new(accepted.peer);
+    let serve = move |request| Arc::clone(&service).call(request, Arc::clone(&peer));
+    let io = TokioIo::new(accepted.io);
+    match accepted.proto {
+        Proto::H2 => finish!(h2.serve_connection(io, service_fn(serve)), shutdown),
+        Proto::H1 => finish!(h1.serve_connection(io, service_fn(serve)), shutdown),
+    }
+}
+
 /// Accepts connections on `listener` until `shutdown` turns true (or its sender is gone),
 /// then sends each connection a graceful GOAWAY, the only GOAWAY the proxy sends on purpose,
 /// and gives open streams [`SHUTDOWN_DRAIN`] to finish.
@@ -233,31 +324,35 @@ pub(crate) async fn serve<U: UpdateHandler + 'static>(
     core: Arc<Core>,
     updates: U,
     mut listener: impl Listen,
+    acceptor: Acceptor,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let http = http_builder(&core);
+    let h2 = http_builder(&core);
+    let h1 = crate::h1::builder(&core.limits);
     let limits = ConnLimits::new(
         core.limits.max_connections,
         core.limits.max_connections_per_ip,
     );
     let service = Service::new(core, updates);
-    let graceful = GracefulShutdown::new();
+    let acceptor = Arc::new(acceptor);
+    let (drain, mut drained) = mpsc::channel::<()>(1);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     // A connection over a limit is dropped, which closes it.
-                    Ok((io, peer)) => if let Some(permit) = limits.admit(peer) {
-                        let service = Arc::clone(&service);
-                        let connection = http.serve_connection(
-                            TokioIo::new(io),
-                            service_fn(move |request| Arc::clone(&service).call(request)),
-                        );
-                        let watched = graceful.watch(connection);
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let _ = watched.await;
-                        });
+                    Ok((io, ip)) => if let Some(permit) = limits.admit(ip) {
+                        tokio::spawn(connection(Conn {
+                            io,
+                            ip,
+                            permit,
+                            acceptor: Arc::clone(&acceptor),
+                            service: Arc::clone(&service),
+                            h2: h2.clone(),
+                            h1: h1.clone(),
+                            shutdown: shutdown.clone(),
+                            drain: drain.clone(),
+                        }));
                     },
                     // Out of descriptors, say: back off instead of spinning on the error.
                     Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
@@ -267,5 +362,7 @@ pub(crate) async fn serve<U: UpdateHandler + 'static>(
         }
     }
     drop(listener);
-    let _ = tokio::time::timeout(SHUTDOWN_DRAIN, graceful.shutdown()).await;
+    drop(drain);
+    // `recv` ends when the last connection has dropped its sender.
+    let _ = tokio::time::timeout(SHUTDOWN_DRAIN, drained.recv()).await;
 }

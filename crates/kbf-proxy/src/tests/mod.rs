@@ -4,8 +4,12 @@
 
 mod bypass;
 mod frames;
+mod h1;
 mod hold;
 mod kit;
 mod lifetime;
+pub(crate) mod pki;
 mod ready;
+mod reload;
 mod routing;
+mod secure;

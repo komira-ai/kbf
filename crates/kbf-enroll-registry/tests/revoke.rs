@@ -6,7 +6,7 @@ mod common;
 use common::{DAY, Mode, Req, Wrap, fake, issue, make_token, node, serial_of, spec};
 use kbf_enroll_registry::{
     ATTEMPTS, NodeState, RegistryError, bump_ca_generation, ca_generation, deny_rows, list_nodes,
-    revoke_node,
+    node_state, revoke_node,
 };
 use kbf_state::{Cond, Op, Txn};
 use kbf_types::Role::{Daemon, Storage};
@@ -310,5 +310,28 @@ fn the_ca_generation_counts_bundle_changes() {
     assert_eq!(
         bump_ca_generation(&*env.store),
         Err(RegistryError::Corrupt("ca generation"))
+    );
+}
+
+// Catches a lookup that reads the wrong row or maps the state backwards: an unknown id is
+// `None` (not `Active`), an enrolled node is `Active`, and a revoked one is `Revoked`, from
+// the one row, so a caller that asks at every call sees a revocation at the next.
+#[test]
+fn one_node_state_is_read_from_its_own_row_and_follows_a_revocation() {
+    let env = fake();
+    make_token(&env, 1, &spec(&[Storage], 5));
+    Req::new(1, "n1", &[Storage])
+        .enroll(&env, 1)
+        .expect("enroll");
+    assert_eq!(
+        node_state(&*env.store, &node("n1")).expect("read"),
+        Some(NodeState::Active)
+    );
+    assert_eq!(node_state(&*env.store, &node("n2")).expect("read"), None);
+    env.advance(60);
+    revoke_node(&*env.store, &node("n1"), "operator").expect("revoke");
+    assert_eq!(
+        node_state(&*env.store, &node("n1")).expect("read"),
+        Some(NodeState::Revoked)
     );
 }
