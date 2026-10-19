@@ -7,16 +7,21 @@
 //! first when a read failed or the child is older than the protocol fields (the snapshot
 //! says so), and then, for the daemons and after them the storage members, when:
 //!
-//! 1. the view lists a node that names no protocol (`protocol_unknown`);
+//! 1. the view lists a node that names no protocol (`protocol_unknown`), or lists nodes and
+//!    names no oldest protocol at all (a combination the server does not send);
 //! 2. a node is enrolled but the child has not seen it, so its protocol is unknown: a
 //!    daemon that is offline, or one that has not dialed this child since a swap;
 //! 3. `min_protocol` is above the view's `oldest_protocol`.
 //!
 //! A fleet with no node in it, enrolled or listed, is compatible: no one can be locked out.
-//! The limits are the child's: it lists only the daemons that connected to it since it
-//! started, and a child with no enrollment (a 404) enrolls no one, so a daemon with a
-//! hand-issued certificate that is not connected now is not seen. A node that connects
-//! between the read and the switch is not seen either.
+//! The limits are the child's, and they make an empty fleet weaker than it sounds: the
+//! child lists only the daemons that connected to it since it started, and a child with no
+//! enrollment (a 404) enrolls no one. A freshly swapped child that no daemon has dialed
+//! yet therefore reads as an empty fleet and passes, and a daemon with a hand-issued
+//! certificate that is not connected now is not seen. Until enrollment is mounted or a
+//! last-`Hello` protocol is stored per daemon, R1 protects the daemons already connected
+//! to the child and the members in the store, no more. A node that connects between the
+//! read and the switch is not seen either.
 
 use super::fleet::FleetSnapshot;
 use super::traits::{Compat, CompatGate, Staged};
@@ -69,6 +74,13 @@ fn judge(min_protocol: u32, fleet: &FleetSnapshot) -> Result<(), String> {
             return Err(format!(
                 "{} of the {who} name no protocol, so they cannot be judged",
                 listed.unknown
+            ));
+        }
+        if listed.oldest.is_none() && !listed.names.is_empty() {
+            // Nodes listed, none counted unknown, and no oldest protocol: the server does
+            // not send that, and `None` must not read as "every node is fine".
+            return Err(format!(
+                "the {who} are listed but the view names no oldest protocol, so they cannot be judged"
             ));
         }
         let missing: Vec<&str> = expected

@@ -58,10 +58,20 @@ pub struct FleetSnapshot {
 
 /// Reads the fleet from the child that is active now, never from a candidate.
 ///
-/// The actor calls it once per update, when the staged release is judged, and waits for it:
-/// an implementation bounds every request with a timeout. `GET /v1/enroll/nodes` is gated
-/// like a write (a loopback peer, the operator bearer token, `Content-Type:
-/// application/json`, no `Origin`; `docs/api.md`), the two views are open.
+/// The actor calls it once per update, when the staged release is judged, and waits for it.
+/// What an implementation must do, none of which the trait can check:
+///
+/// - **Name the active child on every call.** The active child's port changes after every
+///   swap, so an address fixed when the reader is built reads a child that is gone. Like
+///   [`Forwarder`](super::traits::Forwarder), the reader finds the child at each read, and
+///   its test reads after a swap.
+/// - **Bound the whole read.** `read` is synchronous and runs on the actor's task, which
+///   every API call waits on, abort included, so a slow child stalls them all. One
+///   deadline for the three requests together, not a timeout each (three add up), and a
+///   blocking client: `block_on` inside a runtime task panics.
+/// - **Gate `GET /v1/enroll/nodes` like a write**: a loopback peer, the operator bearer
+///   token, `Content-Type: application/json`, no `Origin` (`docs/api.md`). The two views
+///   are open.
 pub trait FleetReader: Send {
     fn read(&self) -> FleetSnapshot;
 }

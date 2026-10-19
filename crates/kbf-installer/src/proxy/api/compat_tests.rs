@@ -113,6 +113,34 @@ fn a_member_that_names_no_protocol_refuses_whatever_the_others_say() {
 }
 
 #[test]
+fn a_view_that_lists_nodes_but_names_no_oldest_protocol_refuses() {
+    // Each listed node either names a protocol, which sets `oldest`, or is counted in
+    // `unknown`. Nodes listed, `oldest` unset and `unknown` 0 is a combination the server
+    // cannot send; the numbers are not to be relied on, and `None` is not "all are fine".
+    let mut daemons = at(9, 9);
+    daemons.nodes = Ok(pop(&["d1"], None, 0));
+    let mut members = at(9, 9);
+    members.members = Ok(pop(&["a:1"], None, 0));
+    let mut wrong = Vec::new();
+    for (fleet, expect) in [
+        (
+            daemons,
+            "the daemons are listed but the view names no oldest protocol, so they cannot be judged",
+        ),
+        (
+            members,
+            "the storage members are listed but the view names no oldest protocol, so they cannot be judged",
+        ),
+    ] {
+        match judged(1, &fleet) {
+            Compat::Incompatible { rule, detail } if rule == "R1" && detail == expect => {}
+            other => wrong.push(format!("{expect}: {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
 fn an_enrolled_daemon_the_child_has_not_seen_refuses() {
     let mut fleet = at(5, 5);
     fleet.nodes = Ok(pop(&["d1"], Some(5), 0));

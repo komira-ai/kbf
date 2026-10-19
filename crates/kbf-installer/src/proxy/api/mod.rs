@@ -52,8 +52,10 @@
 //!   `step: compat` ([`traits::CompatGate`]).
 //! - **The fleet is read by the actor, in the actor.** [`fleet::FleetReader::read`] runs
 //!   once per update inside [`core::Core`], which blocks on it as it does on the other
-//!   sync seams, so a real reader bounds its requests with a timeout. A failed read is a
-//!   value in the snapshot and the gate refuses on it.
+//!   sync seams: every API call waits while it runs, so a real reader bounds the three
+//!   requests by one deadline in total and names the active child on every call, not
+//!   when it is built (the rules are on the trait). A failed read is a value in the
+//!   snapshot and the gate refuses on it.
 //! - **Request map (Q5).** `requests.json` in the proxy state directory is this module's
 //!   own file ([`idempotency`]); `update.json` (the swap's intent) is U7's.
 //! - **Restart marker (FP section 10).** The path of the postinst marker is not fixed by
