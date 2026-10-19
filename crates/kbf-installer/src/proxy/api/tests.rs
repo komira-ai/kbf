@@ -371,7 +371,7 @@ fn every_refusal_word_fails_the_update_and_starts_no_child() {
         rig.set_status(InstallerStatus {
             state: InstallerState::Refused,
             refusal: format!("{word}: some detail"),
-            acked_order_id: 101,
+            refused_order_id: Some(101),
             ..idle()
         });
         let s = body(&mut core);
@@ -428,7 +428,7 @@ fn an_unknown_refusal_word_fails_closed() {
     rig.set_status(InstallerStatus {
         state: InstallerState::Refused,
         refusal: "the restart failed".to_owned(),
-        acked_order_id: 101,
+        refused_order_id: Some(101),
         ..idle()
     });
     let f = body(&mut core).failure.expect("failure");
@@ -445,7 +445,7 @@ fn a_refusal_of_an_older_order_is_not_ours() {
     rig.set_status(InstallerStatus {
         state: InstallerState::Refused,
         refusal: "hash: old".to_owned(),
-        acked_order_id: 7,
+        refused_order_id: Some(7),
         ..idle()
     });
     let (mut core, _) = started(&rig);
@@ -736,6 +736,10 @@ fn status_json_written_by_the_installer_parses() {
     assert_eq!(read.state, InstallerState::Refused);
     assert_eq!((read.refusal_word(), read.acked_order_id), ("hash", 12));
     assert_eq!(
+        read.refused_order_id, None,
+        "the root half does not name the order a refusal answers yet, so no refusal is attributed"
+    );
+    assert_eq!(
         read.staged_facts()
             .map(|f| (f.commit, f.protocol, f.min_protocol, f.state_schema)),
         Some((c(B), 5, 3, 7))
@@ -772,15 +776,23 @@ fn phases_order_and_the_abort_boundary() {
 #[test]
 fn a_request_this_process_no_longer_tracks_is_retired_not_restarted() {
     let rig = Rig::new("u8a-retired");
-    let (id, _) = accepted(rig.core().post(req(B, "r1")));
-    // A restarted process: the request is on disk as started, the update is nowhere.
+    let mut core = rig.core();
+    let (id, _) = accepted(core.post(req(B, "r1")));
+    accepted(core.abort());
+    // A restarted process: the request is on disk as started, the update is over and is
+    // nowhere (one that is still waiting for the installer is taken up again:
+    // `staging_tests.rs`).
     let e = refused(rig.core().post(req(B, "r1")));
     assert_eq!(
         (e.status, e.code),
         (StatusCode::CONFLICT, "request_id_retired")
     );
     assert_eq!(id.0, "upd-1");
-    assert_eq!(written(&rig).len(), 1);
+    assert_eq!(
+        written(&rig).len(),
+        2,
+        "the order and the abort's revert; the retry writes none"
+    );
 }
 
 #[test]
@@ -928,7 +940,7 @@ fn since_moves_with_each_phase_change_the_api_owns() {
     rig.set_status(InstallerStatus {
         state: InstallerState::Refused,
         refusal: "disk_full: no room".to_owned(),
-        acked_order_id: 101,
+        refused_order_id: Some(101),
         ..idle()
     });
     let s = body(&mut core);
