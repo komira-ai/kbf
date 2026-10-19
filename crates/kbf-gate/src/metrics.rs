@@ -71,6 +71,44 @@ impl Metrics {
         })
     }
 
+    /// The sum of the series named `name` whose label `key` satisfies `keep` (a series
+    /// without the label is not kept). `Absent` only when no series is named `name` at all,
+    /// or one of its series is not finite: a counter family that exists and has no kept member sums
+    /// to zero, which is a measurement.
+    pub fn sum_by(&self, name: &str, key: &str, keep: impl Fn(&str) -> bool) -> Sample {
+        let family = || self.series.iter().filter(|s| s.name == name);
+        if family().next().is_none() || family().any(|s| !s.value.is_finite()) {
+            return Sample::Absent;
+        }
+        Sample::Value(
+            family()
+                .filter(|s| s.labels.iter().any(|(k, v)| k == key && keep(v)))
+                .map(|s| s.value)
+                .sum(),
+        )
+    }
+
+    /// The cumulative buckets of the histogram `name` (its `<name>_bucket` series), as
+    /// `(upper bound, count)` sorted by bound, summed over every other label. `None` when
+    /// there is no such series, a bucket has no readable `le`, or a count is not finite.
+    pub fn buckets(&self, name: &str) -> Option<Vec<(f64, f64)>> {
+        let bucket = format!("{name}_bucket");
+        let mut out: Vec<(f64, f64)> = Vec::new();
+        for s in self.series.iter().filter(|s| s.name == bucket) {
+            let le = s.labels.iter().find(|(k, _)| k == "le")?;
+            let bound = le.1.parse::<f64>().ok().filter(|b| !b.is_nan())?;
+            if !s.value.is_finite() {
+                return None;
+            }
+            match out.iter_mut().find(|(b, _)| *b == bound) {
+                Some((_, count)) => *count += s.value,
+                None => out.push((bound, s.value)),
+            }
+        }
+        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        (!out.is_empty()).then_some(out)
+    }
+
     fn sum_matching(&self, name: &str, keep: impl Fn(&Series) -> bool) -> Sample {
         let mut total = 0.0;
         let mut seen = false;

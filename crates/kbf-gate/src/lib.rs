@@ -31,4 +31,4 @@ pub use doc::{
 };
 pub use gate::{GateResult, Limit, Verdict, judge};
 pub use metrics::{Metrics, MetricsError, Sample};
-pub use run::{Clock, GateError, Run, system_clock};
+pub use run::{Clock, GateError, Run, system_clock, write_atomic};
