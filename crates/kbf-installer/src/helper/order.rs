@@ -1,11 +1,13 @@
 //! An order record: what the unprivileged `kbf` leaves in the order spool after the
-//! frontend ordered this host to activate, confirm or revert a release.
+//! frontend ordered this host to activate, confirm or revert a release, or (on the
+//! frontend's own host) to update the frontend.
 //!
 //! The format is `kbf_update::OrderRecord`, which the writer builds and this side reads, in
 //! a file named `<epoch:020>-<order_id:020>.json`. The writer is the service user, so the
-//! record is untrusted: the name must be the pair inside, the verb one of three words, the
-//! commit a full commit, an activation's claims complete, and no other or repeated key is
-//! accepted.
+//! record is untrusted: the name must be the pair inside, the verb one of four words, the
+//! commit a full commit, an activation's claims complete, the other three verbs carry no
+//! claims (a `frontend_update` is a locator and nothing else), and no other or repeated key
+//! is accepted.
 
 use kbf_update::{Locator, OrderRecord, RecordError, Verb as RecordVerb};
 
