@@ -16,7 +16,7 @@ use kbf_ca::{
 use kbf_types::Role;
 use rcgen::{KeyPair, PKCS_ECDSA_P384_SHA384};
 use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
-use support::{External, NOW, Stream, public_of, scratch, view};
+use support::{External, NOW, Scratch, Stream, public_of, scratch, view};
 
 fn mode(path: &Path) -> u32 {
     fs::metadata(path).expect("metadata").permissions().mode() & 0o777
@@ -30,10 +30,13 @@ fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-fn init(name: &str) -> (std::path::PathBuf, Authority) {
-    let dir = scratch(name).join("ca");
+/// The scratch directory (keep it bound: it is removed on drop), the CA's directory in it,
+/// and the CA.
+fn init(name: &str) -> (Scratch, std::path::PathBuf, Authority) {
+    let root = scratch(name);
+    let dir = root.join("ca");
     let ca = Authority::init_dir(&dir, Policy::default(), NOW, &mut Stream(4)).expect("init");
-    (dir, ca)
+    (root, dir, ca)
 }
 
 fn key_fault(result: Result<impl Sized, CaError>) -> KeyFileFault {
@@ -47,7 +50,7 @@ fn key_fault(result: Result<impl Sized, CaError>) -> KeyFileFault {
 // that is not world readable, and a reload that does not give back the same CA.
 #[test]
 fn init_makes_a_closed_directory_a_closed_key_and_an_open_certificate() {
-    let (dir, ca) = init("init");
+    let (_root, dir, ca) = init("init");
     assert_eq!(mode(&dir), 0o700);
     assert_eq!(mode(&dir.join("ca.key")), 0o600);
     assert_eq!(mode(&dir.join("ca.pem")), 0o644);
@@ -86,7 +89,7 @@ fn init_makes_a_closed_directory_a_closed_key_and_an_open_certificate() {
 // with it), and one that writes into an open directory.
 #[test]
 fn init_overwrites_nothing_and_refuses_an_open_directory() {
-    let (dir, ca) = init("twice");
+    let (_root, dir, ca) = init("twice");
     let before = fs::read(dir.join("ca.key")).expect("key");
     let again = Authority::init_dir(&dir, Policy::default(), NOW, &mut Stream(4));
     assert_eq!(key_fault(again), KeyFileFault::Io(ErrorKind::AlreadyExists));
@@ -98,7 +101,8 @@ fn init_overwrites_nothing_and_refuses_an_open_directory() {
         ca.pin()
     );
 
-    let open = scratch("open").join("ca");
+    let open_root = scratch("open");
+    let open = open_root.join("ca");
     fs::create_dir(&open).expect("dir");
     chmod(&open, 0o755);
     let result = Authority::init_dir(&open, Policy::default(), NOW, &mut Stream(4));
@@ -108,12 +112,14 @@ fn init_overwrites_nothing_and_refuses_an_open_directory() {
         "nothing is written into an open directory"
     );
 
-    let closed = scratch("closed").join("ca");
+    let closed_root = scratch("closed");
+    let closed = closed_root.join("ca");
     fs::create_dir(&closed).expect("dir");
     chmod(&closed, 0o700);
     assert!(Authority::init_dir(&closed, Policy::default(), NOW, &mut Stream(4)).is_ok());
 
-    let missing_parent = scratch("orphan").join("nowhere").join("ca");
+    let orphan_root = scratch("orphan");
+    let missing_parent = orphan_root.join("nowhere").join("ca");
     let result = Authority::init_dir(&missing_parent, Policy::default(), NOW, &mut Stream(4));
     assert_eq!(key_fault(result), KeyFileFault::Io(ErrorKind::NotFound));
 }
@@ -122,7 +128,8 @@ fn init_overwrites_nothing_and_refuses_an_open_directory() {
 // stored, in a closed file in a closed directory.
 #[test]
 fn create_in_stores_the_key_it_returns() {
-    let dir = scratch("create-in").join("ca");
+    let root = scratch("create-in");
+    let dir = root.join("ca");
     let signer = FileSigner::create_in(&dir).expect("created");
     assert_eq!(mode(&dir), 0o700);
     assert_eq!(mode(&dir.join("ca.key")), 0o600);
@@ -166,7 +173,7 @@ fn creating_the_key_never_follows_a_link() {
 // directory that is not closed.
 #[test]
 fn a_key_that_is_not_closed_is_not_loaded() {
-    let (dir, _) = init("refuse");
+    let (_root, dir, _) = init("refuse");
     let key = dir.join("ca.key");
     assert!(FileSigner::load(&dir).is_ok());
 
@@ -238,7 +245,7 @@ fn a_key_that_is_not_closed_is_not_loaded() {
 // being taken for the CA's.
 #[test]
 fn a_file_that_is_not_a_p256_key_is_not_loaded() {
-    let (dir, _) = init("contents");
+    let (_root, dir, _) = init("contents");
     let key = dir.join("ca.key");
     fs::write(&key, "not a key at all\n").expect("write");
     assert!(matches!(FileSigner::load(&dir), Err(CaError::Build(_))));
@@ -260,8 +267,8 @@ fn a_file_that_is_not_a_p256_key_is_not_loaded() {
 // backups): the CA would hand out certificates its own root cannot verify.
 #[test]
 fn a_certificate_that_is_not_the_keys_is_not_loaded() {
-    let (dir, _) = init("mismatch");
-    let (other_dir, _) = init("mismatch-other");
+    let (_root, dir, _) = init("mismatch");
+    let (_other_root, other_dir, _) = init("mismatch-other");
     fs::copy(other_dir.join("ca.pem"), dir.join("ca.pem")).expect("copy");
     assert_eq!(
         Authority::load_dir(&dir, Policy::default()).err(),

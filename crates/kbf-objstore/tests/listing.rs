@@ -17,6 +17,7 @@ use kbf_objstore::{
     ByteRange, Capabilities, Floor, FsStore, KeyError, KeyPrefix, ListPage, ListToken, MemoryStore,
     ObjectInfo, ObjectKey, ObjectStore, ObjectStoreError, PageSize,
 };
+use kbf_testkit::dir::TestDir;
 
 fn key(name: &str) -> ObjectKey {
     ObjectKey::new(name).expect("a valid key")
@@ -105,14 +106,10 @@ async fn every_case_over_the_memory_store() {
 /// The same over a `file://` store, whose later pages are cut from kept keys.
 #[tokio::test]
 async fn every_case_over_a_file_store() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-objstore-listing")
-        .join(std::process::id().to_string());
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-objstore-listing");
     let store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
     every_case(&store).await;
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// A listing resumed with [`ListToken::after`] a key, as a rebuild resumes after a
@@ -156,14 +153,10 @@ async fn a_listing_resumed_after_a_key_lists_only_the_rest_over_the_memory_store
 /// The same over a `file://` store (its window crossing is a unit test in `fs_store.rs`).
 #[tokio::test]
 async fn a_listing_resumed_after_a_key_lists_only_the_rest_over_a_file_store() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-objstore-listing-resumed")
-        .join(std::process::id().to_string());
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-objstore-listing-resumed");
     let store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
     resumes_after_a_key(&store).await;
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// Catches: a prefix or key with a character outside kbf's alphabet (here, non-ASCII)

@@ -18,6 +18,7 @@ use kbf_state::sqlite::{
     Options, SqliteError, SqliteStore, StoreLock, Summary, backup, check_backup, restore_locked,
 };
 use kbf_state::{Clock, Cond, Revision, Store, SystemClock, Txn};
+use kbf_testkit::dir::TestDir;
 use rusqlite::Connection;
 
 fn put(store: &SqliteStore, key: &str, value: &str) -> Revision {
@@ -283,7 +284,7 @@ fn the_tool_lock_is_the_stores_lock() {
 
 /// A directory with the state file's directory `real/`, a link `alias` to it, and a link
 /// `link.db` to `real/state.db`.
-fn linked(name: &str) -> PathBuf {
+fn linked(name: &str) -> TestDir {
     let dir = scratch(name);
     fs::create_dir(dir.join("real")).expect("a directory");
     std::os::unix::fs::symlink("real", dir.join("alias")).expect("a linked directory");

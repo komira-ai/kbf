@@ -19,6 +19,7 @@ use kbf_objstore::{
 };
 use kbf_segments::layout::{MAGIC, TRAILER_LEN, VERSION, footer_len};
 use kbf_segments::{MAX_SEGMENT_BYTES, SegmentError, SegmentWriter};
+use kbf_testkit::dir::TestDir;
 use kbf_types::Digest;
 
 /// Where each blob is, as the writer laid it out: object, offset.
@@ -134,13 +135,13 @@ async fn a_rebuild_recovers_exactly_the_written_index() {
     );
 }
 
-/// A fresh, absent directory for `name`, under the target directory.
-fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-objstore-footers")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A fresh, empty directory for `name`, under the target directory, removed when the
+/// returned value is dropped.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-objstore-footers-{name}"),
+    )
 }
 
 /// Catches the same over a `file://` store, whose listing pages are cut from one walk
@@ -155,7 +156,6 @@ async fn a_rebuild_over_a_directory_recovers_the_written_index() {
     assert!(skipped.is_empty(), "{skipped:?}");
     assert_eq!(index, want);
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// A trailer that passes every check of its own and claims `entries` records before

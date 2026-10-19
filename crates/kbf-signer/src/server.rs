@@ -290,6 +290,7 @@ impl<S: Signer> SignerServer<S> {
 
 #[cfg(test)]
 mod tests {
+    use kbf_testkit::dir::TestDir;
     use kbf_testkit::forked::ForkedChild;
 
     use super::*;
@@ -305,7 +306,10 @@ mod tests {
     /// Mutant: the `Drop` of `StartersLock` removed.
     #[test]
     fn a_child_forked_while_the_lock_was_held_does_not_keep_it_after_the_drop() {
-        let dir = std::env::temp_dir().join(format!("kbf-signer-unit-{}", std::process::id()));
+        // `prepare_dir` wants a directory of mode 0700, which it makes itself: it is made
+        // inside the test's own directory, which is removed with it.
+        let base = TestDir::under(std::env::temp_dir(), "kbf-signer-unit");
+        let dir = base.join("socket-dir");
         prepare_dir(&dir).expect("a directory of mode 0700");
         let socket = dir.join("sock");
         let first = lock_starters(&socket).expect("the first lock");
@@ -314,6 +318,5 @@ mod tests {
         let again = lock_starters(&socket);
         drop(again.expect("a lock after the drop, with the forked child still alive"));
         child.finish();
-        fs::remove_dir_all(&dir).expect("remove");
     }
 }

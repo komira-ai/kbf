@@ -25,6 +25,8 @@ time.workspace = true
 x509-parser = { workspace = true, features = ["verify"] }
 
 [dev-dependencies]
+# Scratch directories the tests own (kbf_testkit::dir).
+kbf-testkit.workspace = true
 kbf-map.workspace = true
 kbf-peer.workspace = true
 kbf-proto.workspace = true

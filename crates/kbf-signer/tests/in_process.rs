@@ -50,7 +50,7 @@ fn run_serves_a_fresh_ca_and_a_second_run_on_its_socket_fails() {
         root: root.clone(),
         spki: client.public_key().to_vec(),
         root_subject: cert.subject().as_raw().to_vec(),
-        scratch: scratch.clone(),
+        scratch,
     };
     let tbs = support::node_tbs_at(&made, kbf_types::Role::Daemon, None, real_now());
     let signature = client

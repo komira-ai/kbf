@@ -8,11 +8,12 @@ pub mod answer;
 
 use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kbf_ca::{Algorithm, Custody, Entropy, PublicKey, SignError, Signer};
+use kbf_testkit::dir::TestDir;
 use rcgen::{Attribute, CertificateParams, DistinguishedName, KeyPair, PublicKeyData, SigningKey};
 use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
@@ -107,12 +108,25 @@ impl Signer for External {
     }
 }
 
-/// A scratch directory, new and empty, resolved through symlinks.
-pub fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-ca-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    std::fs::canonicalize(&dir).expect("canonical scratch dir")
+/// A scratch directory, new and empty, under the target directory, removed when this
+/// is dropped. `path` is resolved through symlinks.
+pub struct Scratch {
+    pub path: PathBuf,
+    _dir: TestDir,
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+pub fn scratch(name: &str) -> Scratch {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("kbf-ca-{name}"));
+    let path = std::fs::canonicalize(&dir).expect("canonical scratch dir");
+    Scratch { path, _dir: dir }
 }
 
 /// The key of a freshly generated rcgen key pair.

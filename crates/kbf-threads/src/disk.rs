@@ -151,6 +151,8 @@ impl FreeSpace for Statvfs {
 mod tests {
     use std::path::Path;
 
+    use kbf_testkit::dir::TestDir;
+
     use super::{FreeSpace, GIB, Space, Statvfs, keep_free, percent_of};
 
     /// Catches a floor that is not 5% with a 1 GiB minimum, one larger than the
@@ -229,8 +231,9 @@ mod tests {
     /// refuses a directory not made yet.
     #[test]
     fn the_real_source_sums_the_files_under_a_directory() {
-        let root = std::env::temp_dir().join(format!("kbf-threads-held-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let base = TestDir::under(std::env::temp_dir(), "kbf-threads-held");
+        // A directory not made yet: the test's own directory holds it, and is removed.
+        let root = base.join("root");
         assert_eq!(Statvfs.held(&root).expect("not made yet"), 0);
         std::fs::create_dir_all(root.join("a/b")).expect("dirs");
         std::fs::write(root.join("top"), [0_u8; 10]).expect("file");
@@ -244,6 +247,5 @@ mod tests {
             Statvfs.held(&root.join("top")).is_err(),
             "a file is no directory"
         );
-        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

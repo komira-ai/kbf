@@ -4,14 +4,42 @@
 
 pub mod registry;
 
-use std::path::{Path, PathBuf};
+use std::ops::Deref;
+use std::path::Path;
 
-/// A fresh, empty directory for one test, under Cargo's temporary directory.
-pub fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("kbf-image-{name}"));
-    force_remove(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
-    dir
+use kbf_testkit::dir::TestDir;
+
+/// A fresh, empty directory for one test, under Cargo's temporary directory, removed
+/// (by [`force_remove`], since a test may leave directories nobody can write) when it is
+/// dropped.
+pub struct Scratch(TestDir);
+
+impl Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // The `TestDir` inside drops after this and finds nothing left to remove.
+        force_remove(self.0.path());
+    }
+}
+
+pub fn scratch(name: &str) -> Scratch {
+    Scratch(TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-image-{name}"),
+    ))
 }
 
 /// Removes `dir`, first giving the owner every permission on every directory in it.
