@@ -40,7 +40,6 @@ mod pass;
 mod verify;
 
 use std::collections::{BTreeSet, HashMap};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -352,7 +351,7 @@ struct Inner {
     blobs: PathBuf,
     tmp: PathBuf,
     /// Holds the exclusive flock while the cache is open.
-    _lock: File,
+    _lock: layout::DirLock,
     link_mode: LinkMode,
     link_max: u64,
     uid: u32,

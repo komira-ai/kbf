@@ -53,6 +53,9 @@ tracing.workspace = true
 [dev-dependencies]
 kbf-host = { workspace = true, features = ["testkit"] }
 kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
+# A child held between fork and exec (kbf_testkit::forked), and a start that waits out a
+# program still open for writing (kbf_testkit::spawn).
+kbf-testkit.workspace = true
 kbf-update.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 tracing-subscriber.workspace = true
