@@ -320,7 +320,13 @@ fn every_route_is_in_the_api_doc() {
     check("docs/api.md");
 }
 
-/// Headings (outside code fences) that appear more than once, with their `##` level kept.
+fn title(heading: &str) -> String {
+    heading.split(" (").next().unwrap_or(heading).to_string()
+}
+
+/// `##` headings (outside code fences) that appear more than once, an annotation after the
+/// title (`(**planned**)`) not told apart: the planned stub and the real section of one
+/// route are the same section.
 fn duplicate_headings(text: &str) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut dup = Vec::new();
@@ -328,7 +334,7 @@ fn duplicate_headings(text: &str) -> Vec<String> {
     for line in text.lines() {
         if line.starts_with("```") {
             fenced = !fenced;
-        } else if !fenced && line.starts_with("## ") && !seen.insert(line.to_string()) {
+        } else if !fenced && line.starts_with("## ") && !seen.insert(title(line)) {
             dup.push(line.to_string());
         }
     }
@@ -345,7 +351,10 @@ fn the_api_doc_names_each_section_once() {
 #[test]
 fn a_repeated_section_heading_is_reported() {
     let text = "## A\ntext\n```\n## A\n```\n## B\n## A (planned)\n## B\n";
-    assert_eq!(duplicate_headings(text), vec!["## B".to_string()]);
+    assert_eq!(
+        duplicate_headings(text),
+        vec!["## A (planned)".to_string(), "## B".to_string()]
+    );
 }
 
 #[test]

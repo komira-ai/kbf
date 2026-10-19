@@ -347,10 +347,6 @@ pub fn parse_handover(args: &[std::ffi::OsString]) -> Result<handover::Handover,
 pub fn cluster_command() -> Command {
     let cmd = Command::new(CLUSTER)
         .bin_name(format!("kbf {CLUSTER}"))
-        .about(
-            "Show, drain and undrain the cluster, set a member's state, list the denied hosts and \
-             manage the object store, through the frontend's operator API.",
-        )
         .subcommand_required(true)
         .arg_required_else_help(true)
         .disable_help_subcommand(true);

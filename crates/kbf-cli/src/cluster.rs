@@ -40,7 +40,8 @@ use zeroize::Zeroizing;
 /// `--api-listen`.
 pub const DEFAULT_API: &str = "127.0.0.1:8982";
 
-/// `kbf cluster`'s command line.
+/// Show, drain and undrain the cluster, set a member's state, list the denied hosts and
+/// manage the object store, through the frontend's operator API.
 #[derive(Args, Clone, Debug, PartialEq, Eq)]
 pub struct Cluster {
     /// The operator API (the server's `--api-listen`).
