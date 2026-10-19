@@ -226,7 +226,9 @@ mod tests {
             3
         );
         assert_eq!(Target::Enroll.offset(), 4, "past the admin port at 3");
-        assert!(Target::Reapi.grpc() && Target::Worker.grpc() && Target::Enroll.grpc());
+        for target in [Target::Reapi, Target::Worker, Target::Enroll] {
+            assert!(target.grpc(), "{target:?}");
+        }
         assert!(!Target::Operator.grpc());
         assert!(route_of(reapi).grpc());
         for route in [

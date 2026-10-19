@@ -617,6 +617,9 @@ mod tests {
             limit.record(ip(n), t0);
         }
         assert_eq!(limit.tracked(), MAX_TRACKED);
+        // An address already remembered needs no room.
+        limit.record(ip(0), t0);
+        assert_eq!(limit.tracked(), MAX_TRACKED);
         // Everyone still owes a failure: one is forgotten to make room.
         limit.record(ip(most), t0);
         assert_eq!(limit.tracked(), MAX_TRACKED);
@@ -708,7 +711,8 @@ mod tests {
         ));
 
         let both = Tokens::from_files(&good, Some(&read_only)).expect("both");
-        assert!(both.operator.is_some() && both.buck2.is_some());
+        assert!(both.operator.is_some());
+        assert!(both.buck2.is_some());
         let one = Tokens::from_files(&good, None).expect("one");
         assert!(one.buck2.is_none());
         assert!(Tokens::from_files(&good, Some(&open)).is_err());

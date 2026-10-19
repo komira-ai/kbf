@@ -235,6 +235,11 @@ mod tests {
             source: io::ErrorKind::NotFound.into(),
         };
         assert!(read.is_missing());
+        let denied = FileError::Read {
+            path: PathBuf::new(),
+            source: io::ErrorKind::PermissionDenied.into(),
+        };
+        assert!(!denied.is_missing());
         assert!(
             !FileError::NotAFile {
                 path: PathBuf::new()
