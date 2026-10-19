@@ -866,9 +866,9 @@ fn a_member_and_a_host_that_spell_one_address_differently_are_joined() {
         "s1.example:7000"
     );
     assert_eq!(
-        kbf_enroll_registry::canonical_addr("10.0.0.1:7000"),
-        "10.0.0.1:7000",
-        "an address with no letters is as it was"
+        kbf_enroll_registry::canonical_addr("s1.example:7000"),
+        "s1.example:7000",
+        "a canonical address is as it was"
     );
     let mut rig = rig();
     let node = rig.member("storage-1", "S1.Example:7000");
