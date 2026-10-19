@@ -181,4 +181,36 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
         assert!(Journal::open(&dir, Box::new(LogAlerts)).is_err());
     }
+
+    /// Catches: an alert that never reaches the host's log (the default sink), or one
+    /// that drops the verb, serial, outcome or detail an operator pages on. The test
+    /// installs its own subscriber, so the event is seen (and its field lines count as
+    /// run) whatever else ran in the process.
+    #[test]
+    fn log_alerts_write_the_event_to_the_log() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let dir = crate::testkit::scratch("journal-log");
+        let journal = Journal::open(&dir.join("audit.log"), Box::new(LogAlerts)).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            journal
+                .record(&Event::new(0, "erase", "S9", "refused", "no touch", true))
+                .unwrap();
+        });
+        let text = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        for want in [
+            "ERROR",
+            "kbf_mdm_gate::alert",
+            "verb=erase",
+            "serial=S9",
+            "outcome=refused",
+            "detail=no touch",
+            "kbf-mdm-gate alert",
+        ] {
+            assert!(text.contains(want), "{want:?} missing from {text:?}");
+        }
+    }
 }

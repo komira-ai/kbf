@@ -562,6 +562,12 @@ async fn a_finished_rebuild_is_not_run_again_by_a_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_rebuild_is_tried_again_and_the_node_stays_catching_up() {
     let dir = scratch("retry");
+    // A subscriber on this thread: the rebuild task logs its failure from a worker thread,
+    // which this guard does not reach, but a registered subscriber is what makes the
+    // `tracing` macro evaluate its fields at all (rebuild.rs), whatever else ran in the
+    // process. The text itself is not seen here.
+    let _log =
+        tracing::subscriber::set_default(tracing_subscriber::fmt().with_ansi(false).finish());
     let frontend = Frontend::start();
     let bucket = Bucket::new();
     let old = old_segments(&bucket, 0x11, 3).await;

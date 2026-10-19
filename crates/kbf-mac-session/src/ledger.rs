@@ -292,7 +292,22 @@ mod tests {
     fn a_torn_last_line_is_cut_and_a_corrupt_line_refused() {
         let path = dir("torn").join("ledger");
         std::fs::write(&path, "created 3.1 600\ncreated 3.").unwrap();
-        let mut ledger = Ledger::open(&path).unwrap();
+        // Own subscriber: the warning is seen (and its field lines count as run)
+        // whatever else ran in the process.
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let mut ledger =
+            tracing::subscriber::with_default(subscriber, || Ledger::open(&path).unwrap());
+        let text = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("WARN"), "{text:?}");
+        assert!(
+            text.contains("dropping a ledger record cut short by a crash"),
+            "{text:?}"
+        );
+        assert!(text.contains("fragment=\"created 3.\""), "{text:?}");
         assert_eq!(ledger.get(LeaseId::new(3, 1)).map(|e| e.uid), Some(600));
         ledger.record_created(LeaseId::new(3, 2), 601).unwrap();
         drop(ledger);
