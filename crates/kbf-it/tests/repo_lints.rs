@@ -46,6 +46,7 @@ mod attested_bundles;
 mod coverage_wiring;
 mod interpreters;
 mod release_artifacts;
+mod release_workflow;
 mod test_spawns;
 mod workflows;
 
