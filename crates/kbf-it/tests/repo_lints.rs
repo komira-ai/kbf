@@ -39,12 +39,15 @@
 //! - the coverage job's `kbf-coverage --run-id/--repo/--artifact` flags drifting from
 //!   the run and the artifact the job uploads, which breaks the download command the
 //!   ratchet prints (module `coverage_wiring`);
+//! - the bake evaluator named anywhere under `.github/` (a workflow, a local action or any
+//!   other file): it runs on the operator's side, never in Actions (module `bake_operator_side`);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
 mod attested_assets;
 mod attested_bundles;
+mod bake_operator_side;
 mod beta_pins;
 mod coverage_wiring;
 mod interpreters;

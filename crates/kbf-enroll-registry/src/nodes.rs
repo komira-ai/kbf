@@ -86,6 +86,17 @@ pub fn list_nodes(store: &dyn Store) -> Result<Vec<NodeInfo>, RegistryError> {
     Ok(out)
 }
 
+/// One node's state: `None` for an id the registry has never seen. A single row read, for
+/// a caller that asks at every call (the cold-store registration is handed out only to a
+/// node that is `Active`).
+///
+/// # Errors
+/// The store failing; a row that does not decode.
+pub fn node_state(store: &dyn Store, id: &NodeId) -> Result<Option<NodeState>, RegistryError> {
+    let read = rows::fetch::<NodeRow>(store, &rows::node_key(id), "node")?;
+    Ok(read.map(|read| state_of(&read.row)).transpose()?)
+}
+
 /// The `deny/` keys that end a node's certificates: its unexpired serials (current and
 /// earlier), the hash of each key, and with `with_node` the node id itself.
 pub(crate) fn deny_keys(id: &NodeId, row: &NodeRow, now: u64, with_node: bool) -> Vec<String> {

@@ -56,6 +56,7 @@ impl pb::membership_server::Membership for Fake {
             boot: front.boots.fetch_add(1, Ordering::SeqCst) + 1,
             heartbeat_interval_ms: 20,
             map: Some(front.map.clone()),
+            ..Default::default()
         }))
     }
 
@@ -66,6 +67,7 @@ impl pb::membership_server::Membership for Fake {
         Ok(tonic::Response::new(pb::HeartbeatResponse {
             map_generation: self.0.map.generation,
             map: None,
+            ..Default::default()
         }))
     }
 }

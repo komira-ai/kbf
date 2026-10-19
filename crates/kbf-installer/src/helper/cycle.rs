@@ -21,6 +21,7 @@ use crate::state::{self, Locked, State, StateError};
 use kbf_host::plan::Mode;
 use kbf_host::{Exec, HostPath, Perms, Step};
 
+use crate::database::SchemaStep;
 use crate::helper::fetcher::{Fetcher, InstalledRelease, ReleaseLocator};
 use crate::helper::leases::LeaseSource;
 use crate::helper::memory::{Event, Memory, StagedFacts};
@@ -72,6 +73,9 @@ pub struct Helper<E: Exec> {
     log: Vec<u8>,
     /// The last `status.json` written.
     written: Vec<u8>,
+    /// Brings the state database to what a release needs before it is activated; none on
+    /// a host that has no database (a node).
+    schema: Option<Box<dyn SchemaStep>>,
     fetcher: Box<dyn Fetcher>,
     leases: Box<dyn LeaseSource>,
     procs: Box<dyn Procs>,
@@ -99,11 +103,25 @@ impl<E: Exec> Helper<E> {
             cfg,
             log: Vec::new(),
             written: Vec::new(),
+            schema: None,
             fetcher,
             leases,
             procs,
             gc_due: false,
         }
+    }
+
+    /// Runs `step` before every activation of the release this helper has staged, so the
+    /// state database is migrated before the new child can start. A refusal keeps the
+    /// links where they are.
+    pub fn set_schema_step(&mut self, step: Box<dyn SchemaStep>) {
+        self.schema = Some(step);
+    }
+
+    /// The schema step, for a test to see what a caller attached.
+    #[cfg(test)]
+    pub(crate) fn schema_step_mut(&mut self) -> Option<&mut (dyn SchemaStep + 'static)> {
+        self.schema.as_deref_mut()
     }
 
     /// The host's executor, for a test to read what was done.
@@ -442,7 +460,7 @@ impl<E: Exec> Helper<E> {
             self.save(memory)?;
         }
         let result = match order.verb {
-            Verb::Activate => self.activate(order, now),
+            Verb::Activate => self.activate(order, now, memory),
             Verb::Confirm => self.confirm(order, &before),
             Verb::Revert => self.revert(),
             Verb::FrontendUpdate => Err("frontend_update is not implemented (P13)".to_owned()),
@@ -570,7 +588,38 @@ impl<E: Exec> Helper<E> {
         }
     }
 
-    fn activate(&mut self, order: &Order, now: u64) -> Result<Done, String> {
+    fn activate(&mut self, order: &Order, now: u64, memory: &Memory) -> Result<Done, String> {
+        // Before the links move: a release must not start on a schema it cannot run on.
+        // The schema is known here only for the release this helper has staged (its own
+        // report): the rule is "the staged commit equals the order's". An order for any other
+        // release (one fetched by an earlier run, say) asks for no migration and says so in
+        // the log: kbf's own start check guards it. The staged release stays staged after its
+        // swap, so a repeat of its activation asks again (idempotent, but refused while the
+        // database is down).
+        if let Some(step) = self.schema.as_mut() {
+            match memory.staged.as_ref().filter(|f| f.commit == order.commit) {
+                Some(staged) => {
+                    let note = step
+                        .before_start(staged.state_schema)
+                        .map_err(|why| format!("state schema: {why}"))?;
+                    let _ = writeln!(self.log, "state schema: {note}");
+                }
+                None => {
+                    let _ = writeln!(
+                        self.log,
+                        "state schema: no migration for order {}: {} was not fetched for it \
+                         (the staged release is {}), so the schema it needs is not known \
+                         here; its own start check guards it",
+                        order.id,
+                        &order.commit.as_str()[..12],
+                        memory
+                            .staged
+                            .as_ref()
+                            .map_or("none", |f| &f.commit.as_str()[..12]),
+                    );
+                }
+            }
+        }
         let ordered = activate::Order {
             commit: order.commit.clone(),
             // The epoch is part of the name: a restored store counts ids again, and an activation
