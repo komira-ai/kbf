@@ -58,7 +58,7 @@ const CPU_PERIOD_US: u64 = 100_000;
 pub const SUPERVISOR: &str = "supervisor";
 /// The cgroup every lease cgroup is made under.
 pub const ACTIONS: &str = "actions";
-/// How many times the processes are listed and moved again when one appeared after the
+/// How many times the threads are listed and moved again when one appeared after the
 /// listing (enabling controllers then fails with EBUSY).
 const MOVE_TRIES: u32 = 20;
 /// Where the kernel names the cgroups of this process.
@@ -339,7 +339,11 @@ pub(crate) fn delegate_in(
     make(fs, &supervisor)?;
     let mut tries = 0;
     loop {
-        for pid in read(fs, root, "cgroup.procs")?.split_whitespace() {
+        // `cgroup.threads`, not `cgroup.procs`: `procs` lists thread-group leaders only,
+        // so a thread that is not one (made in `root` while its process moved out, as
+        // a test binary's second test thread is) keeps `root` populated and is never
+        // named. Writing a thread's id to `cgroup.procs` moves its whole process.
+        for pid in read(fs, root, "cgroup.threads")?.split_whitespace() {
             match fs.write(&supervisor, "cgroup.procs", pid) {
                 // The process ended after the listing.
                 Err(e) if e.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => {}

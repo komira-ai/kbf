@@ -729,6 +729,7 @@ fn cgroup_tree(dir: &Path, offered: &str) -> (PathBuf, Vec<String>) {
     );
     plant(unit.join("cgroup.controllers"), &format!("{offered}\n"));
     plant(unit.join("cgroup.procs"), "1\n");
+    plant(unit.join("cgroup.threads"), "1\n");
     plant(unit.join("cpuset.cpus.effective"), "0\n");
     let own = dir.join("self-cgroup");
     plant(own.clone(), "0::/kbf.slice/kbf-daemon.service\n");

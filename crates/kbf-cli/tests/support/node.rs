@@ -159,6 +159,7 @@ pub(crate) fn cgroup_tree(bin: &Path) -> Vec<String> {
     );
     plant(unit.join("cgroup.controllers"), "cpu memory pids\n");
     plant(unit.join("cgroup.procs"), "1\n");
+    plant(unit.join("cgroup.threads"), "1\n");
     plant(unit.join("cpuset.cpus.effective"), "0\n");
     let own = bin.join("self-cgroup");
     plant(own.clone(), "0::/kbf.slice/kbf-all-in-one.service\n");
