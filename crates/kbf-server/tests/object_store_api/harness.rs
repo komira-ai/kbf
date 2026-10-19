@@ -19,6 +19,7 @@ use kbf_server::enroll::Random;
 use kbf_server::object_store::Registry;
 use kbf_server::object_store::api::{AckSource, ObjectStoreApi, routes};
 use kbf_server::object_store::probe::{Probe, ProbeTarget};
+use kbf_server::proxy_auth::{ProxySecret, gate_requests};
 use kbf_server::token::ApiToken;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
@@ -46,6 +47,23 @@ fn unique(label: &str) -> PathBuf {
         .join(format!("{label}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     dir
+}
+
+/// The 32 bytes the proxy presents, hex, as the `x-kbf-proxy-auth` value.
+pub const PROXY_SECRET: [u8; 32] = [0x5a; 32];
+
+pub fn proxy_secret() -> Arc<ProxySecret> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = unique("proxy").join("secret");
+    std::fs::write(&path, PROXY_SECRET).expect("write the secret");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    Arc::new(ProxySecret::from_file(&path).expect("a usable secret"))
+}
+
+/// `router` behind the layer the frontend's API listener has (`serve_api`): the handlers
+/// read the `Trust` it decides, and a router without it answers 500.
+pub fn gated(router: Router, proxy: Option<Arc<ProxySecret>>) -> Router {
+    router.layer(axum::middleware::from_fn_with_state(proxy, gate_requests))
 }
 
 pub fn token_file() -> ApiToken {
@@ -291,6 +309,15 @@ impl Farm {
     }
 
     pub fn with_token(token: Option<ApiToken>) -> Self {
+        Self::build(token, None)
+    }
+
+    /// A farm whose listener is behind a proxy that presents `secret`.
+    pub fn behind_proxy() -> Self {
+        Self::build(Some(token_file()), Some(proxy_secret()))
+    }
+
+    fn build(token: Option<ApiToken>, proxy: Option<Arc<ProxySecret>>) -> Self {
         let clock = Arc::new(ManualClock::default());
         clock.advance(std::time::Duration::from_secs(1_000));
         let store = Arc::new(Fake::with_flaw(clock, Flaw::None));
@@ -312,7 +339,7 @@ impl Farm {
             acks.clone(),
         ));
         Self {
-            router: routes(token, Some(api)),
+            router: gated(routes(token, Some(api)), proxy),
             registry,
             probe,
             acks,
