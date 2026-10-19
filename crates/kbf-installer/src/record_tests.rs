@@ -263,17 +263,48 @@ fn confirm_and_revert_carry_no_facts_either() {
     );
 }
 
-/// Catches a `frontend_update` record held to a weaker rule than `activate` (it too starts a
-/// release, so it too must carry its files and the facts to check them against), and a verb
-/// spelled with a hyphen or in capitals.
+/// Catches a `frontend_update` record that names files or facts. It is a locator and nothing
+/// else (the root half fetches the commit from its own source, takes the attestation from
+/// there and probes the binary), so the record cannot name a path, a URL or a digest: the
+/// bare locator parses, and a record that adds components, expected facts or both is refused
+/// whole, each on its own. A verb spelled with a hyphen or in capitals is no verb.
+///
+/// Mutants planted: the old rule restored (a `frontend_update` must carry components and
+/// facts: the locator and the golden are refused); components tolerated on a
+/// `frontend_update` (the `components` case is accepted); facts tolerated (the `facts` case).
 #[test]
-fn a_frontend_update_is_checked_like_an_activate() {
-    let no_facts = edit(ORDER_FRONTEND_UPDATE, |v| {
-        v.as_object_mut().expect("o").remove("expected");
-    });
-    assert!(shape_error(&no_facts).contains("expected facts"));
-    let no_files = edit(ORDER_FRONTEND_UPDATE, |v| v["components"] = json!([]));
-    assert!(shape_error(&no_files).contains("FrontendUpdate"));
+fn a_frontend_update_is_a_locator_and_nothing_else() {
+    let parsed = OrderRecord::parse(ORDER_FRONTEND_UPDATE.as_bytes()).expect("the locator");
+    assert_eq!(parsed.verb, OrderVerb::FrontendUpdate);
+    assert!(parsed.components.is_empty());
+    assert!(parsed.expected.is_none());
+    let facts = serde_json::to_value(order_activate().expected).expect("value");
+    let cases = [
+        (
+            "components",
+            edit(ORDER_FRONTEND_UPDATE, |v| {
+                v["components"] = json!([order_component()])
+            }),
+        ),
+        (
+            "facts",
+            edit(ORDER_FRONTEND_UPDATE, |v| v["expected"] = facts.clone()),
+        ),
+        (
+            "both",
+            edit(ORDER_FRONTEND_UPDATE, |v| {
+                v["components"] = json!([order_component()]);
+                v["expected"] = facts.clone();
+            }),
+        ),
+    ];
+    for (what, bytes) in cases {
+        let err = shape_error(&bytes);
+        assert!(
+            err.contains("FrontendUpdate record carries no components"),
+            "{what}: {err}"
+        );
+    }
     for spelling in ["frontend-update", "FrontendUpdate", "frontend_Update"] {
         let bytes = edit(ORDER_FRONTEND_UPDATE, |v| v["verb"] = json!(spelling));
         assert!(
@@ -281,10 +312,92 @@ fn a_frontend_update_is_checked_like_an_activate() {
             "{spelling}"
         );
     }
-    assert_eq!(
-        OrderRecord::parse(ORDER_FRONTEND_UPDATE.as_bytes())
-            .expect("parses")
-            .verb,
-        OrderVerb::FrontendUpdate
-    );
+}
+
+/// Catches the proxy's order writer and the two readers drifting apart, which is how the
+/// record format once contradicted the design with every unit green: the proxy writes
+/// [`Locator`] as `serde_json` would, and each of the three verbs it sends is accepted by
+/// this crate's parser, by `kbf-update`'s (the format both ends share) and by the root half's
+/// `helper::order::parse`, which yields the same ids and verb and no claims. The same bytes
+/// with components or expected facts added to a `frontend_update` are refused by all three,
+/// and a locator whose verb is `activate` is no activation in any of them (it has no files
+/// to fetch).
+///
+/// Mutants planted: `kbf-update`'s `check` letting a `frontend_update` carry components (its
+/// refusal below is the one that goes red); the installer's `check_shape` doing the same;
+/// `helper::order::parse` mapping the locator to `Verb::Activate`.
+#[test]
+fn what_the_proxy_writes_both_readers_accept_and_what_it_cannot_say_both_refuse() {
+    use crate::helper::order::{self, Verb as HelperVerb};
+    use crate::proxy::model::{Locator, Verb as ProxyVerb};
+
+    let locator = |verb| Locator {
+        order_id: 45,
+        epoch: 3,
+        generation: 18,
+        verb,
+        commit: crate::testkit::c(crate::testkit::B),
+        window_s: 900,
+    };
+    let readers = |bytes: &[u8]| {
+        (
+            OrderRecord::parse(bytes).map(|r| r.verb),
+            kbf_update::OrderRecord::parse(bytes).map(|r| r.verb.name()),
+            order::parse(3, 45, bytes).map(|o| (o.verb, o.claims)),
+        )
+    };
+    for (sent, installer, update, helper) in [
+        (
+            ProxyVerb::FrontendUpdate,
+            OrderVerb::FrontendUpdate,
+            "frontend_update",
+            HelperVerb::FrontendUpdate,
+        ),
+        (
+            ProxyVerb::Confirm,
+            OrderVerb::Confirm,
+            "confirm",
+            HelperVerb::Confirm,
+        ),
+        (
+            ProxyVerb::Revert,
+            OrderVerb::Revert,
+            "revert",
+            HelperVerb::Revert,
+        ),
+    ] {
+        let bytes = serde_json::to_vec(&locator(sent)).expect("bytes");
+        let (a, b, c) = readers(&bytes);
+        assert_eq!(a, Ok(installer), "{update}: this crate");
+        assert_eq!(b, Ok(update), "{update}: kbf-update");
+        assert_eq!(c, Ok((helper, None)), "{update}: the root half");
+    }
+
+    let sent = serde_json::to_value(locator(ProxyVerb::FrontendUpdate)).expect("value");
+    let extras: [(&str, Value); 2] = [
+        ("components", json!([order_component()])),
+        (
+            "expected",
+            serde_json::to_value(order_activate().expected).expect("value"),
+        ),
+    ];
+    for (key, value) in extras {
+        let mut v = sent.clone();
+        v[key] = value;
+        let bytes = serde_json::to_vec(&v).expect("bytes");
+        let (a, b, c) = readers(&bytes);
+        assert!(a.is_err(), "{key}: this crate took it");
+        assert_eq!(
+            b,
+            Err(kbf_update::RecordError::Unexpected("frontend_update")),
+            "{key}: kbf-update"
+        );
+        assert!(c.is_err(), "{key}: the root half took it");
+    }
+
+    let bytes = serde_json::to_vec(&locator(ProxyVerb::Activate)).expect("bytes");
+    let (a, b, c) = readers(&bytes);
+    assert!(a.is_err(), "this crate: {a:?}");
+    assert!(b.is_err(), "kbf-update: {b:?}");
+    assert!(c.is_err(), "the root half: {c:?}");
 }
