@@ -465,7 +465,7 @@ impl ActiveSlot {
     ///
     /// Read it for `== 0`, not as an exact number: a stream holding a `Pending` and a permit
     /// counts twice. It is one word, and a stream takes its permit before it drops its
-    /// `Pending`, and a retry calls [`ActiveSlot::begin_stream`] before it drops its old permit,
+    /// `Pending`, and a retry keeps the `Pending` the stream began with until the stream ends,
     /// so it never reads 0 while a stream lives. (Summing the two slot words and a separate
     /// pending count cannot give that: either read order misses one of the two hand-overs.)
     #[must_use]

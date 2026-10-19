@@ -73,7 +73,7 @@ postgres = "0.19.10"
 hyper = { version = "1.12.0", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
 # The model checker behind kbf-proxy's permit and hold-gate models (`--cfg kbf_loom`,
-# `tools/ci/proxy-loom.sh`). A dev-dependency only, and only under that cfg.
+# `cargo xtask proxy-loom`). A dev-dependency only, and only under that cfg.
 loom = "0.7.2"
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
@@ -241,7 +241,7 @@ xtask = { path = "crates/xtask" }
 # its `lib.rs` (an in-source attribute overrides this table), and the layering test in
 # `kbf-it` checks that the deny is present.
 [workspace.lints.rust]
-# `kbf_loom` swaps kbf-proxy's atomics for loom's (`tools/ci/proxy-loom.sh`). Not `loom`:
+# `kbf_loom` swaps kbf-proxy's atomics for loom's (`cargo xtask proxy-loom`). Not `loom`:
 # tokio reads `cfg(loom)` too and then needs a loom dependency of its own.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kbf_loom)"] }
 

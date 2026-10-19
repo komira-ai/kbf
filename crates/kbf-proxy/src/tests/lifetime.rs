@@ -10,7 +10,9 @@ use h2::Reason;
 use http::HeaderMap;
 use tokio::time::Instant;
 
-use super::kit::{CAPS, EXECUTE, OPERATOR, Rig, finish, grpc_ok, read_all, script, tagged, until};
+use super::kit::{
+    CAPS, EXECUTE, OPERATOR, Rig, WRITE, finish, grpc_ok, read_all, script, tagged, until,
+};
 use crate::slot::Slot;
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -344,4 +346,85 @@ async fn a_child_that_never_accepts_fails_the_stream_at_the_connect_timeout() {
             .load(Ordering::Acquire),
         1
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_upload_is_not_idle_while_it_keeps_sending() {
+    let a = script(|mut call| async move {
+        read_all(&mut call.body).await;
+        grpc_ok(&mut call.respond, "done");
+    });
+    let rig = Rig::start(a, tagged("b")).await;
+    let mut client = rig.client().await;
+    let (response, mut body) = client.start(WRITE, false).await;
+    // One chunk an hour for three hours: silent for 1 h at a time, never for 2 h.
+    for _ in 0..3 {
+        tokio::time::sleep(HOUR).await;
+        body.send_data(Bytes::from_static(b"x"), false)
+            .expect("body");
+    }
+    body.send_data(Bytes::new(), true).expect("end");
+    let reply = finish(response).await;
+    assert_eq!(reply.text(), "done", "{reply:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_child_ends_the_stream_at_one_idle_bound_and_is_not_dispatched_again() {
+    let a = script(|mut call| async move {
+        read_all(&mut call.body).await;
+        std::future::pending::<()>().await;
+    });
+    let rig = Rig::start(a, tagged("b")).await;
+    let start = Instant::now();
+    let reply = rig.client().await.unary(CAPS).await;
+    assert_eq!(reply.grpc_status().as_deref(), Some("14"), "{reply:?}");
+    assert!(
+        start.elapsed() < 2 * HOUR + Duration::from_secs(100),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        rig.core.metrics.retries.load(Ordering::Acquire),
+        0,
+        "an idle bound is not a safe failure: the child may have started the call"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pump_parked_on_a_full_upstream_window_ends_with_the_response() {
+    // The child answers the head, then never reads: its window (4 MiB) fills, and the proxy's
+    // request pump parks waiting for credit that never comes.
+    let a = script(|mut call| async move {
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(())
+            .expect("a response");
+        let _send = call.respond.send_response(response, false).expect("head");
+        std::future::pending::<()>().await;
+    });
+    let rig = Rig::start(a, tagged("b")).await;
+    let mut client = rig.client().await;
+    let (response, mut body) = client.start(WRITE, false).await;
+    let answer = tokio::spawn(finish(response));
+    // More than the child's window; the client stops when the proxy stops reading it.
+    let sender = tokio::spawn(async move {
+        for _ in 0..(6 << 4) {
+            let mut chunk = Bytes::from(vec![7_u8; 64 * 1024]);
+            while !chunk.is_empty() {
+                body.reserve_capacity(chunk.len());
+                let granted = std::future::poll_fn(|cx| body.poll_capacity(cx)).await;
+                let Some(Ok(granted)) = granted else { return };
+                if body.send_data(chunk.split_to(granted), false).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    // Silent for the idle bound: the response half gives up, and the pump must let go.
+    let reply = answer.await.expect("client");
+    assert_eq!(reply.grpc_status().as_deref(), Some("14"), "{reply:?}");
+    until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
+    assert_eq!(rig.core.slots.open_streams(), 0);
+    sender.abort();
 }

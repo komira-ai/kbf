@@ -12,6 +12,8 @@
 //!   not 12 lowercase hex digits fails the build with the build script's message. With
 //!   `--no-run` it builds nothing: it prints the file `cargo-messages` in its working
 //!   directory, the JSON messages a test wrote for it.
+//! - As cargo with a `loom_` filter among its arguments (`xtask proxy-loom`), it prints the
+//!   result line of five passing tests and builds nothing.
 //! - Run as `kbf-server`, it prints `kbf-server 0.1.0+<stamp>` from the stamp file next
 //!   to it.
 //! - Run as `kbf`, it prints `kbf 0.1.0+<stamp>` for `--version`, with the stamp from the
@@ -159,6 +161,12 @@ fn cargo(argv0: &str, args: &[String]) -> ExitCode {
             "{}",
             std::fs::read_to_string("cargo-messages").expect("cargo-messages")
         );
+        return ExitCode::SUCCESS;
+    }
+    // `cargo test -p kbf-proxy ... -- loom_` (proxy-loom): cargo's result line for the five
+    // models, as the real run prints it.
+    if args.iter().any(|a| a == "loom_") {
+        println!("test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 37 filtered out");
         return ExitCode::SUCCESS;
     }
     let head = std::env::var("XTASK_FAKE_HEAD").expect("XTASK_FAKE_HEAD");

@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::watch;
 
+use crate::auth::Buck2Auth;
 use crate::config::ProxyConfig;
 use crate::control::{ProxySnapshot, UpdateHandler};
 use crate::core::{Core, now};
@@ -34,9 +35,19 @@ impl Proxy {
     /// (`ActiveSlot::starting`); the supervisor takes [`ProxyHandle::startup_hold`] and ends
     /// it with `release_into` once it has adopted the children.
     ///
+    /// This serves plaintext HTTP/2 with no authentication: the TLS and auth code is U4b-2.
+    /// Until then a configuration that asks for authentication is refused, not served open.
+    ///
     /// # Errors
-    /// The runtime could not be built, or the socket could not be made non-blocking.
+    /// [`io::ErrorKind::Unsupported`]: `buck2_auth` is not `none`. Otherwise the runtime could
+    /// not be built, or the socket could not be made non-blocking.
     pub fn bind(cfg: ProxyConfig, listener: OwnedFd) -> io::Result<(ProxyHandle, ProxyRunner)> {
+        if cfg.buck2_auth != Buck2Auth::None {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "buck2_auth other than none needs the proxy's TLS and auth, which is not built yet",
+            ));
+        }
         let workers = std::thread::available_parallelism().map_or(1, usize::from);
         let runtime = Builder::new_multi_thread()
             .worker_threads(workers.min(MAX_WORKERS))
@@ -116,7 +127,8 @@ pub struct ProxyHandle {
 }
 
 impl ProxyHandle {
-    /// The proxy's runtime: the supervisor's async actor runs here.
+    /// The proxy's runtime: the supervisor's async actor runs here. The runtime is dropped
+    /// when [`ProxyRunner::run`] returns, so a task spawned after that never runs.
     #[must_use]
     pub fn runtime(&self) -> Handle {
         self.runtime.clone()
@@ -129,7 +141,8 @@ impl ProxyHandle {
     }
 
     /// Fails every held stream past its bound now and returns how many: the sweep the swap
-    /// calls on each poll. A stream's own deadline stays the guarantee.
+    /// calls on each poll. A stream's own deadline stays the guarantee. The count is
+    /// `#[must_use]`: a caller that does not need it writes `let _ = handle.expire();`.
     #[must_use]
     pub fn expire(&self) -> usize {
         self.core.queue.expire(now())

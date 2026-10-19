@@ -91,8 +91,9 @@ pub(crate) async fn proxy_child(
 
 impl Stream {
     async fn run(&self, pending: Pending) -> Response<ProxyBody> {
-        // Kept alive, never read: the stream is in a count for as long as it runs.
-        let mut _pending = pending;
+        // Kept alive, never read: the stream is in a count for as long as it runs, across
+        // every attempt, so it is never in no count between two permits.
+        let _pending = pending;
         let mut attempts = 0;
         loop {
             let permit = match admit(&self.core).await {
@@ -102,14 +103,11 @@ impl Stream {
             attempts += 1;
             match self.attempt(permit).await {
                 Ok(response) => return response,
-                Err((failure, carry)) => {
+                Err(failure) => {
                     if !self.source.may_retry(&self.path, failure, attempts) {
                         return self.refuse(Refusal::Retries);
                     }
                     Metrics::inc(&self.core.metrics.retries);
-                    // The count that kept the stream alive across the failed attempt takes
-                    // over from the one the stream began with.
-                    _pending = carry;
                 }
             }
         }
@@ -120,19 +118,13 @@ impl Stream {
         unavailable(self.grpc, refusal.message())
     }
 
-    /// One dispatch. On a failure before the upstream's response head it returns the failure
-    /// and a fresh `Pending`, created before this attempt's permit drops, so the stream is
-    /// never in no count.
-    async fn attempt(&self, permit: Permit) -> Result<Response<ProxyBody>, (Failure, Pending)> {
+    /// One dispatch. On a failure before the upstream's response head it returns the failure.
+    async fn attempt(&self, permit: Permit) -> Result<Response<ProxyBody>, Failure> {
         let pool = self
             .core
             .pool
             .target(permit.slot(), permit.generation(), self.target);
-        let carry = || self.core.slots.begin_stream();
-        let (reservation, mut send) = match TargetPool::acquire(&pool).await {
-            Ok(got) => got,
-            Err(failure) => return Err((failure, carry())),
-        };
+        let (reservation, mut send) = TargetPool::acquire(&pool).await?;
         let life = Lifetime::new(permit, reservation, Arc::clone(&self.count));
         let ended = self.source.bodiless();
         let mut upstream = Request::new(());
@@ -174,15 +166,18 @@ impl Stream {
                     task.abort();
                     let _ = task.await;
                 }
-                Err((failure, carry()))
+                Err(failure)
             }
         }
     }
 }
 
 /// How an h2 error before the response head tells the proxy whether it may dispatch again.
+/// Only a GOAWAY the child sent proves the stream unprocessed (h2 fails streams above its
+/// `last_stream_id` with a remote error). A GOAWAY the h2 library raised itself, on a protocol
+/// error of the connection, also reaches streams the child already took.
 fn classify(error: &h2::Error) -> Failure {
-    if error.is_go_away() {
+    if error.is_go_away() && error.is_remote() {
         Failure::GoAway
     } else if error.reason() == Some(Reason::REFUSED_STREAM) {
         Failure::RefusedStream

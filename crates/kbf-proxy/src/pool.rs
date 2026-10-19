@@ -43,7 +43,7 @@ pub(crate) const MAX_DIALS: usize = 16;
 /// The child's listener must accept within this, or the stream fails `UNAVAILABLE`.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// The connection window of an upstream connection, in streams' worth of window.
-pub(crate) const CONNECTION_WINDOWS: u32 = 1000;
+pub(crate) const UPSTREAM_CONNECTION_STREAMS: u32 = 1000;
 
 /// Where a child listens: always loopback, whatever the table says.
 pub(crate) const fn upstream_addr(table: UpstreamTable, slot: Slot, target: Target) -> SocketAddr {
@@ -124,11 +124,23 @@ async fn connect(connector: &Connector, addr: SocketAddr) -> Option<Handshaken> 
         .ok()?;
     h2::client::Builder::new()
         .initial_window_size(STREAM_WINDOW_BYTES)
-        .initial_connection_window_size(STREAM_WINDOW_BYTES.saturating_mul(CONNECTION_WINDOWS))
+        .initial_connection_window_size(
+            STREAM_WINDOW_BYTES.saturating_mul(UPSTREAM_CONNECTION_STREAMS),
+        )
         .enable_push(false)
         .handshake::<_, Bytes>(io)
         .await
         .ok()
+}
+
+/// One of the pool's dial slots, held for the length of one dial.
+struct DialSlot(Arc<TargetPool>);
+
+impl Drop for DialSlot {
+    fn drop(&mut self) {
+        self.0.dialing.fetch_sub(1, Ordering::AcqRel);
+        self.0.notify.notify_waiters();
+    }
 }
 
 pub(crate) struct TargetPool {
@@ -164,16 +176,18 @@ impl TargetPool {
             .map(Arc::clone)
     }
 
-    /// Takes a dial slot if the dial and connection caps allow one.
-    fn begin_dial(&self) -> bool {
+    /// Takes a dial slot if the dial and connection caps allow one. The slot is given back,
+    /// and the waiters woken, when the guard drops: at the end of the dial, or when a stream
+    /// that was dialing is cancelled (a client reset) and its future dropped.
+    fn begin_dial(self: &Arc<Self>) -> Option<DialSlot> {
         let mut conns = self.lock();
         conns.retain(|c| !c.dead.load(Ordering::Acquire));
         let dialing = self.dialing.load(Ordering::Acquire);
         let room = dialing < MAX_DIALS && conns.len() + dialing < MAX_CONNECTIONS;
-        if room {
+        room.then(|| {
             self.dialing.fetch_add(1, Ordering::AcqRel);
-        }
-        room
+            DialSlot(Arc::clone(self))
+        })
     }
 
     async fn dial(self: &Arc<Self>) -> Result<Arc<Conn>, Failure> {
@@ -201,9 +215,19 @@ impl TargetPool {
         // Until the child's SETTINGS arrive h2 assumes 100 streams, so a burst of streams could
         // all be reserved on this connection against a limit of 2. The child sends its SETTINGS
         // before it answers a PING, so one round trip makes the advertised limit the real one.
+        // A child that does not answer is not there: running on h2's assumed 100 streams is the
+        // very thing the PING is for.
         let ponged =
             OptionFuture::from(ping.map(|mut p| async move { p.ping(h2::Ping::opaque()).await }));
-        let _ = tokio::time::timeout(CONNECT_TIMEOUT, ponged).await;
+        let answered = matches!(
+            tokio::time::timeout(CONNECT_TIMEOUT, ponged).await,
+            Ok(Some(Ok(_)))
+        );
+        if !answered {
+            conn.dead.store(true, Ordering::Release);
+            Metrics::inc(&self.metrics.upstream_dial_failed);
+            return Err(Failure::Connect);
+        }
         Ok(conn)
     }
 
@@ -221,29 +245,27 @@ impl TargetPool {
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(conn) = self.pick() {
+                // The reservation exists before the first await, so a stream cancelled while
+                // it waits for the connection gives its place back.
+                let reservation = Reservation {
+                    conn: Arc::clone(&conn),
+                    pool: Arc::clone(self),
+                };
                 match conn.send.clone().ready().await {
-                    Ok(send) => {
-                        let reservation = Reservation {
-                            conn,
-                            pool: Arc::clone(self),
-                        };
-                        return Ok((reservation, send));
-                    }
+                    Ok(send) => return Ok((reservation, send)),
                     Err(_) => {
                         // A GOAWAY or a closed socket: no new stream goes here again.
                         conn.dead.store(true, Ordering::Release);
-                        conn.inflight.fetch_sub(1, Ordering::AcqRel);
                         continue;
                     }
                 }
             }
-            if self.begin_dial() {
+            if let Some(slot) = self.begin_dial() {
                 let dialed = self.dial().await;
                 if let Ok(conn) = &dialed {
                     self.lock().push(Arc::clone(conn));
                 }
-                self.dialing.fetch_sub(1, Ordering::AcqRel);
-                self.notify.notify_waiters();
+                drop(slot);
                 dialed?;
                 continue;
             }

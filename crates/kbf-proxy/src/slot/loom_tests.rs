@@ -1,5 +1,5 @@
 //! The loom models of the slot and gate (design note section 5). Run by
-//! `tools/ci/proxy-loom.sh` (`--cfg kbf_loom`); under a plain `cargo test` this module is not
+//! `cargo xtask proxy-loom` (`--cfg kbf_loom`); under a plain `cargo test` this module is not
 //! built. Each model runs every interleaving of its threads up to a preemption bound.
 
 use super::*;
@@ -105,6 +105,9 @@ fn loom_model_1_bind_flip_retire_with_a_dropped_guard() {
 /// gate would fail this.
 #[test]
 fn loom_model_2_a_release_is_never_missed() {
+    // Outside the model, so it survives its runs: some interleaving must have answered `Held`,
+    // or the waiter's assertion never ran and a `bind` that ignores the hold would pass.
+    static HELD_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     model(|| {
         let s = live();
         s.open(Slot::B);
@@ -115,15 +118,15 @@ fn loom_model_2_a_release_is_never_missed() {
             let released = Arc::clone(&released);
             thread::spawn(move || match s.bind() {
                 Bind::Held { epoch, .. } => {
+                    HELD_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
                     // The waiter parks only if the epoch still equals what it sampled; so
                     // once the release is over, it must differ.
                     while !released.load(Ordering::Acquire) {
                         thread::yield_now();
                     }
                     assert_ne!(s.epoch(), epoch, "a release the waiter would sleep through");
-                    true
                 }
-                Bind::Bound(_) => false,
+                Bind::Bound(_) => {}
                 Bind::NoActive => panic!("A is active and open"),
             })
         };
@@ -135,13 +138,16 @@ fn loom_model_2_a_release_is_never_missed() {
                 released.store(true, Ordering::Release);
             })
         };
-        let was_held = binder.join().expect("binder");
+        binder.join().expect("binder");
         releaser.join().expect("releaser");
         assert_eq!(s.epoch(), 1, "one hold ended once");
-        let _ = was_held;
         drop(guard);
         assert_eq!(s.abandoned_holds(), 0, "released, so the drop is inert");
     });
+    assert!(
+        HELD_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+        "no interleaving answered Held: the model checked nothing"
+    );
 }
 
 /// Model 2b, the doorbell: two holds end on two threads (the supervisor is single-writer in

@@ -10,7 +10,10 @@ use http::HeaderValue;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use super::kit::{CAPS, Rig, Script, WRITE, finish, grpc_ok, read_all, script, tagged, until};
+use super::kit::{
+    CAPS, Rig, Script, WRITE, addr_of, finish, grpc_ok, next_of, read_all, script, tagged, until,
+};
+use crate::route::Target;
 use crate::slot::Slot;
 
 const HOLD: Duration = Duration::from_secs(20);
@@ -60,8 +63,7 @@ async fn flip_200_streams_complete_on_a() {
 
     gate.add_permits(200);
     let mut done = 0;
-    while let Some(reply) = open.join_next().await {
-        let reply = reply.expect("a client task");
+    while let Some(reply) = next_of(&mut open).await {
         assert!(
             reply.error.is_none(),
             "no RST_STREAM and no GOAWAY: {:?}",
@@ -194,7 +196,10 @@ async fn a_request_still_open_is_not_dispatched_again() {
     let (response, mut body) = client.start(CAPS, false).await;
     body.send_data(Bytes::from_static(b"part"), false)
         .expect("body");
-    let reply = finish(response).await;
+    // A bound, not a hang: a pump left running would never let the stream go.
+    let reply = tokio::time::timeout(Duration::from_secs(5), finish(response))
+        .await
+        .expect("the stream was not answered");
     assert_eq!(reply.grpc_status().as_deref(), Some("14"));
     assert_eq!(
         rig.a.state.dispatches(),
@@ -424,8 +429,8 @@ async fn the_pool_grows_instead_of_queueing_behind_the_childs_stream_limit() {
     until(|| rig.a.state.dispatches() == 6).await;
     assert!(rig.a.state.conns_total.load(Ordering::Acquire) >= 3);
     gate.add_permits(6);
-    while let Some(reply) = open.join_next().await {
-        assert_eq!(reply.expect("client").text(), "a");
+    while let Some(reply) = next_of(&mut open).await {
+        assert_eq!(reply.text(), "a");
     }
 }
 
@@ -454,8 +459,8 @@ async fn a_stream_beyond_the_connection_cap_waits_and_keeps_its_permit() {
     gate.add_permits(1);
     until(|| rig.a.state.dispatches() == 257).await;
     gate.add_permits(300);
-    while let Some(reply) = open.join_next().await {
-        assert_eq!(reply.expect("client").text(), "a");
+    while let Some(reply) = next_of(&mut open).await {
+        assert_eq!(reply.text(), "a");
     }
     until(|| rig.core.slots.open_permits(Slot::A) == 0).await;
 }
@@ -486,4 +491,181 @@ async fn goaway_below_last_stream_id_retries_the_in_flight_stream() {
         .ready()
         .await
         .expect("the client got no GOAWAY");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_library_goaway_is_not_a_proof_that_the_child_never_took_the_stream() {
+    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    // The child takes the first stream, then breaks the protocol: h2 raises a GOAWAY of its own
+    // on every stream, the one the child received included.
+    rig.a.state.raw_garbage_first.store(true, Ordering::Release);
+    let reply = rig.client().await.unary(CAPS).await;
+    assert_eq!(
+        rig.core.metrics.retries.load(Ordering::Acquire),
+        0,
+        "dispatched again after a GOAWAY the proxy's own library raised: {reply:?}"
+    );
+    assert_eq!(reply.grpc_status().as_deref(), Some("14"), "{reply:?}");
+    assert_eq!(rig.a.state.conns_total.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dial_cancelled_by_a_client_reset_gives_back_its_dial_slot() {
+    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    rig.net
+        .blackhole(addr_of(rig.table, Slot::A, Target::Reapi));
+    let mut client = rig.client().await;
+    // More cancelled dials than the pool allows at once: each leaked slot would count.
+    for dials in 1..=u64::try_from(crate::pool::MAX_DIALS).expect("small") {
+        let (_response, mut body) = client.start(CAPS, false).await;
+        until(|| rig.core.metrics.upstream_dials.load(Ordering::Acquire) == dials).await;
+        body.send_reset(Reason::CANCEL);
+        until(|| rig.core.slots.open_streams() == 0).await;
+    }
+    let (response, mut body) = client.start(CAPS, false).await;
+    body.send_data(Bytes::from_static(b"x"), true)
+        .expect("body");
+    let reply = tokio::time::timeout(Duration::from_secs(30), finish(response))
+        .await
+        .expect("the next stream was never answered: the pool is wedged");
+    assert_eq!(reply.grpc_status().as_deref(), Some("14"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_burst_dials_at_most_16_at_once_and_opens_at_most_256_connections() {
+    let gate = Arc::new(Semaphore::new(0));
+    let rig = Rig::start(gated(&gate), tagged("b")).await;
+    rig.a.state.max_concurrent.store(1, Ordering::Release);
+    rig.net.delay_connects(Duration::from_millis(500));
+    let mut client = rig.client().await;
+    // One stream first, so the waves of 16 dials do not line up with the 256 cap: the last
+    // wave has room for 15 only, and a dial count that forgot the dials in flight sends 16.
+    let mut open = start_many(&mut client, 1).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(rig.a.state.dispatches(), 1);
+    let mut rest = start_many(&mut client, 299).await;
+    // 256 connections at 16 per half second take 8 s; the clock runs ahead only when idle.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(rig.a.state.dispatches(), 256);
+    assert_eq!(
+        rig.net.peak_connects(),
+        crate::pool::MAX_DIALS,
+        "dials in flight at once: parallel, up to the cap and no more"
+    );
+    assert_eq!(
+        rig.core.metrics.upstream_dials.load(Ordering::Acquire),
+        256,
+        "no dial past the connection cap, however many were in flight"
+    );
+    gate.add_permits(400);
+    while let Some(reply) = next_of(&mut open).await {
+        assert_eq!(reply.text(), "a");
+    }
+    while let Some(reply) = next_of(&mut rest).await {
+        assert_eq!(reply.text(), "a");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_child_that_never_answers_the_ping_is_not_there() {
+    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    rig.a.state.raw_mute_first.store(true, Ordering::Release);
+    let mut client = rig.client().await;
+    let (response, _body) = client.start(CAPS, true).await;
+    let reply = finish(response).await;
+    // The mute connection is given up after the connect bound, and the whole request is
+    // dialed once more, to the real child.
+    assert_eq!(reply.text(), "a", "{reply:?}");
+    assert_eq!(
+        rig.core
+            .metrics
+            .upstream_dial_failed
+            .load(Ordering::Acquire),
+        1
+    );
+    assert_eq!(rig.core.metrics.upstream_dials.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_response_larger_than_the_stream_window_arrives_whole() {
+    let a = script(|mut call| async move {
+        read_all(&mut call.body).await;
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(())
+            .expect("a response");
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let mut send = call.respond.send_response(response, false).expect("head");
+        send.send_data(Bytes::from(vec![5_u8; 1 << 20]), false)
+            .expect("data");
+        send.send_trailers(trailers).expect("trailers");
+    });
+    let rig = Rig::start(a, tagged("b")).await;
+    let reply = tokio::time::timeout(Duration::from_secs(1), rig.client().await.unary(CAPS))
+        .await
+        .expect("a response of 1 MiB completes: credit is returned as frames are read");
+    assert_eq!(reply.body.len(), 1 << 20);
+    assert_eq!(reply.grpc_status().as_deref(), Some("0"));
+}
+
+/// Sends `frames` DATA frames of `size` bytes each, then one byte with END_STREAM.
+async fn send_frames(
+    client: &mut super::kit::Client,
+    frames: usize,
+    size: usize,
+) -> h2::client::ResponseFuture {
+    let (response, mut body) = client.start(CAPS, false).await;
+    for _ in 0..frames {
+        body.send_data(Bytes::from(vec![1_u8; size]), false)
+            .expect("body");
+    }
+    body.send_data(Bytes::from_static(b"z"), true).expect("end");
+    response
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_of_many_tiny_frames_is_not_kept_for_a_replay() {
+    // The child reads the whole request, then refuses it: a replay is safe by the stream's
+    // state, but the window is 64 frames, however few bytes they are. (h2 itself ends a
+    // connection that sends about a hundred tiny frames, so the cap sits under that.)
+    let rig = Rig::start(refusing(1, "second"), tagged("b")).await;
+    let mut client = rig.client().await;
+    let response = send_frames(&mut client, 80, 1).await;
+    let reply = finish(response).await;
+    assert_eq!(reply.grpc_status().as_deref(), Some("14"), "{reply:?}");
+    assert_eq!(rig.core.metrics.retries.load(Ordering::Acquire), 0);
+    assert_eq!(rig.a.state.dispatches(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_few_small_frames_are_replayed_whole() {
+    let rig = Rig::start(refusing(1, "second"), tagged("b")).await;
+    let mut client = rig.client().await;
+    let response = send_frames(&mut client, 40, 1).await;
+    let reply = finish(response).await;
+    assert_eq!(reply.text(), "second", "{reply:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_response_that_ends_with_its_data_ends_without_trailers() {
+    let a = script(|mut call| async move {
+        read_all(&mut call.body).await;
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(())
+            .expect("a response");
+        let mut send = call.respond.send_response(response, false).expect("head");
+        send.send_data(Bytes::from_static(b"whole"), true)
+            .expect("data and END_STREAM");
+    });
+    let rig = Rig::start(a, tagged("b")).await;
+    let reply = rig.client().await.unary(CAPS).await;
+    assert_eq!(reply.text(), "whole", "{reply:?}");
+    assert!(
+        reply.trailers.is_none(),
+        "no status was invented: {reply:?}"
+    );
 }

@@ -1,5 +1,5 @@
 //! The primitives the slot state machine is built from, behind one name so the same code runs
-//! under the `loom` model checker (`--cfg kbf_loom`, `tools/ci/proxy-loom.sh`) and under
+//! under the `loom` model checker (`--cfg kbf_loom`, `cargo xtask proxy-loom`) and under
 //! std.
 //!
 //! Only `slot.rs` takes its atomics from here. Everything else in the crate (hold queue,
