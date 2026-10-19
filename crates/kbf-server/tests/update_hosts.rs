@@ -5,6 +5,8 @@
 
 #[path = "support/hooked.rs"]
 mod hooked;
+#[path = "support/looks.rs"]
+mod looks;
 mod support;
 
 use std::net::SocketAddr;
@@ -31,6 +33,19 @@ use tokio::net::TcpStream;
 const A: &str = "0123456789abcdef0123456789abcdef01234567";
 const B: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
+/// The tick of every server here: one that does not come within a test. The update controller
+/// looks at every tick, and its reads of the store meet the injections of
+/// [`hooked::Hooked`] that a test arms for a request (`support/looks.rs` says why). No test
+/// here waits for a tick: they are HTTP calls against the rows and the daemons' streams.
+const TICK: Duration = Duration::from_secs(3600);
+
+/// The reads of `(update/desired, deny/)` the server makes by itself as it starts, with a
+/// release already offered: the controller's look reads `update/desired` for its pass and
+/// again for the farm's facts (the offers' poll is off, there is no release store), and the
+/// sweeper's refresh reads `deny/` ([`looks::Looks`]). A test that arms an injection first
+/// waits for them; the test at the end holds the numbers.
+const START_LOOKS: (usize, usize) = (2, 1);
+
 fn listeners() -> Listeners {
     let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
     Listeners {
@@ -40,7 +55,7 @@ fn listeners() -> Listeners {
         worker_tls: None,
         heartbeat_interval: INTERVAL,
         hello_wait: HELLO_WAIT,
-        tick: Duration::from_millis(50),
+        tick: TICK,
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
@@ -333,6 +348,10 @@ async fn the_per_host_detail_needs_the_farm_get_authority() {
 /// replaced, and the open `/v1/nodes` carries none of it and none of the commits. Also the
 /// commits, the generation and the helper flag as sent, and the desired commit.
 ///
+/// The refusal starts with a word that is not hex: `/v1/nodes` carries the server's own
+/// 12-hex build commit (`KBF_BUILD_COMMIT`), which a hex word such as "bad" can occur in
+/// by chance, as it did in a CI merge commit.
+///
 /// Mutants seen red: refusal stored uncut; cut by `chars().take(512)`; control characters
 /// kept; refusal or commits on `/v1/nodes`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -343,7 +362,7 @@ async fn the_detail_names_commits_and_a_refusal_that_is_capped_data() {
     let daemon = FakeDaemon::connect(running.worker, hello("node-a", 1, 1))
         .await
         .expect("registered");
-    let refusal = format!("bad\n{}", "\u{20ac}".repeat(100 * 1024 / 3));
+    let refusal = format!("nope\n{}", "\u{20ac}".repeat(100 * 1024 / 3));
     daemon.send(daemon_message::Message::UpdateStatus(UpdateStatus {
         running_commit: B[..12].to_owned(),
         installed_commit: B.to_owned(),
@@ -360,8 +379,11 @@ async fn the_detail_names_commits_and_a_refusal_that_is_capped_data() {
         &json!({"state": "refused", "up_to_date": false, "availability": "ok"})
     );
     let open = nodes.to_string();
-    for secret in [B, A, "bad", "\u{20ac}"] {
-        assert!(!open.contains(secret), "/v1/nodes carries {secret:?}");
+    for secret in [B, A, "nope", "\u{20ac}"] {
+        assert!(
+            !open.contains(secret),
+            "/v1/nodes carries {secret:?}: {open}"
+        );
     }
 
     let (code, body) = get(running.api, "/v1/update/hosts").await;
@@ -381,7 +403,7 @@ async fn the_detail_names_commits_and_a_refusal_that_is_capped_data() {
     let refusal = host["refusal"].as_str().expect("a refusal");
     assert!(refusal.len() <= 512, "{} bytes", refusal.len());
     assert!(refusal.len() > 500, "{} bytes", refusal.len());
-    assert!(refusal.starts_with("bad\u{fffd}"), "{refusal:?}");
+    assert!(refusal.starts_with("nope\u{fffd}"), "{refusal:?}");
     assert!(!refusal.contains('\n'));
 }
 
@@ -463,13 +485,21 @@ async fn hosts_are_paged_in_node_id_order() {
 /// (it must not show hosts as unjudgeable and the farm as unpaused), while the open node
 /// list is still served, with no verdict, and says nothing false. Healthy again, the
 /// verdicts return.
+///
+/// Each failure is armed for one read, which must be the handler's: the server's own readers
+/// of the store (the update controller and the membership sweeper) look at start, which the
+/// test waits for (`START_LOOKS`; the release is offered before the server starts so that
+/// the controller's look is the same whenever it runs), and not again within the test
+/// (`TICK` and the sweeper's beat).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_state_store_that_fails_is_a_500_on_the_detail_and_no_verdict_on_the_list() {
     let hooked = hooked::Hooked::new();
-    let running = start(farm_open(), Some(state_over(hooked.clone())));
     Rows::new(hooked.clone())
         .offer(&Release::new(A), FarmTime::from_millis(1))
         .expect("offer");
+    let looks = looks::Looks::count(&hooked);
+    let running = start(farm_open(), Some(state_over(hooked.clone())));
+    looks.done(START_LOOKS).await;
     let daemon = FakeDaemon::connect(running.worker, hello("node-a", 1, 1))
         .await
         .expect("registered");
@@ -490,4 +520,33 @@ async fn a_state_store_that_fails_is_a_500_on_the_detail_and_no_verdict_on_the_l
     });
     assert_eq!(get(running.api, "/v1/update/hosts").await.0, 500);
     nodes_until(running.api, |n| summary(n, "node-a")["up_to_date"] == true).await;
+}
+
+/// Catches the wait of `Looks::done` being wrong, which the failing-store test above cannot
+/// show by itself (it would flake, or hang): the server's own reads of `update/desired` and
+/// `deny/` are `START_LOOKS` at start, and it reads nothing at all by itself after the wait,
+/// for as long as a test runs, with a daemon connected and beating. A reader added beside the
+/// controller and the sweeper, a read added to either's look, or a tick that comes, makes the
+/// total more, and an injection armed after the wait would be met by one of them and not by
+/// its request; a read fewer makes a count less, and the wait never ends.
+///
+/// Mutants seen red: `START_LOOKS` of `(1, 1)` and of `(2, 0)` (the counts after the wait).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_server_reads_the_rows_by_itself_only_at_start() {
+    let hooked = hooked::Hooked::new();
+    Rows::new(hooked.clone())
+        .offer(&Release::new(A), FarmTime::from_millis(1))
+        .expect("offer");
+    let looks = looks::Looks::count(&hooked);
+    let every_read = hooked.count("");
+    let running = start(farm_open(), Some(state_over(hooked.clone())));
+    looks.done(START_LOOKS).await;
+    let at_start = every_read.load(Ordering::SeqCst);
+    let daemon = FakeDaemon::connect(running.worker, hello("node-a", 1, 1))
+        .await
+        .expect("registered");
+    daemon.send(update(&A[..12], State::Idle));
+    tokio::time::sleep(3 * INTERVAL).await;
+    assert_eq!(looks.seen(), START_LOOKS);
+    assert_eq!(every_read.load(Ordering::SeqCst), at_start);
 }

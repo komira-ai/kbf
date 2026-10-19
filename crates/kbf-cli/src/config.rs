@@ -70,6 +70,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "tls",
         &[
             "api-token-file",
+            "proxy-auth-file",
             "reapi-auth-policy",
             "reapi-tls-cert",
             "reapi-tls-key",
@@ -108,6 +109,8 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "handover",
         &[
+            "admin-listen",
+            "await-takeover",
             "envoy-check-interval-ms",
             "envoy-check-timeout-ms",
             "envoy-unhealthy-threshold",
@@ -142,6 +145,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "hot-store-abandon",
             "hot-store-max-bytes",
             "meta-dir",
+            "object-store-secrets-dir",
             "store-put-attempts",
             "write-bytes-in-flight",
             "write-linger",
@@ -162,6 +166,25 @@ const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("log", &["log-dir", "log-files", "log-max-bytes"]),
+    (
+        // Not `enroll` or `frontend`: those tables are the enrollment client's own.
+        "enroll-service",
+        &[
+            "ca-dev-file-signer",
+            "ca-dir",
+            "ca-signer",
+            "enroll-allow-unenforced-deny",
+            "enroll-cas-endpoint",
+            "enroll-cert-lifetime-secs",
+            "enroll-listen",
+            "enroll-max-in-flight",
+            "enroll-rate-burst",
+            "enroll-rate-per-minute",
+            "enroll-storage-port",
+            "enroll-worker-endpoint",
+            "frontend-name",
+        ],
+    ),
     (
         "identity",
         &[

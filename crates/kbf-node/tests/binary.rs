@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 
 use guarded::{Guarded, SpawnGuarded as _};
+use kbf_testkit::dir::TestDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-daemon");
 
@@ -169,12 +170,10 @@ fn scratch_root() -> std::path::PathBuf {
     }
 }
 
-/// A scratch directory for one test, with a CA and a client certificate in it.
-fn tls(name: &str) -> PathBuf {
-    let dir = scratch_root()
-        .join("kbf-node")
-        .join(format!("{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
+/// A scratch directory for one test, with a CA and a client certificate in it, removed
+/// when it drops: declare it before the processes that write into it.
+fn tls(name: &str) -> TestDir {
+    let dir = TestDir::under(scratch_root().join("kbf-node"), name);
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
@@ -354,8 +353,13 @@ fn runs_until_sigterm_logged_then(
         .iter()
         .find(|l| l.contains(FIRST_ATTEMPT))
         .expect("seen");
+    // The cause is whatever the OS reports for the dead port: "refused" on Linux, a
+    // reset on macOS. Only its presence is the contract, not its wording.
+    let cause = ended
+        .split_once("connect: transport error: ")
+        .map(|(_, rest)| rest.split(" attempts").next().unwrap_or(rest));
     assert!(
-        ended.contains("connect: transport error: ") && ended.contains("refused"),
+        cause.is_some_and(|c| !c.trim_matches(|ch: char| ch == ' ' || ch == '"').is_empty()),
         "no cause: {ended}"
     );
     let all = all.into_iter().cloned().collect();
@@ -563,7 +567,8 @@ fn each_driver_starts_and_stops_on_sigterm() {
     if cfg!(target_os = "linux") {
         // A full range of subordinate ids for this user, whatever the host's files say.
         let ids = id_files("container-ids", "65536");
-        let (unit, cgroup_flags) = cgroup_tree(&tls("container-cgroup"), "cpu memory pids");
+        let cgroup_dir = tls("container-cgroup");
+        let (unit, cgroup_flags) = cgroup_tree(&cgroup_dir, "cpu memory pids");
         let mut container = vec![
             "--driver=container".to_owned(),
             OCI_RUNTIME.to_owned(),
@@ -593,9 +598,10 @@ fn each_driver_starts_and_stops_on_sigterm() {
 
 /// A container node started with `--lease-placement=numa-node` over `nodes` (a fake
 /// `/sys/devices/system/node`, one `cpulist` each) on the stand-in cgroup mount. Returns
-/// the unit's directory after SIGTERM and the daemon's log.
+/// the unit's directory after SIGTERM, the daemon's log and the scratch directory
+/// that holds the unit (removed when the caller drops it).
 #[cfg(target_os = "linux")]
-fn placed_container_node(name: &str, nodes: &[(u32, &str)]) -> (PathBuf, String) {
+fn placed_container_node(name: &str, nodes: &[(u32, &str)]) -> (PathBuf, String, TestDir) {
     let dir = tls(name);
     let numa = dir.join("numa");
     for (id, list) in nodes {
@@ -619,7 +625,7 @@ fn placed_container_node(name: &str, nodes: &[(u32, &str)]) -> (PathBuf, String)
     let (status, log) = runs_until_sigterm_logged(name, &flags, Some(&bin));
     let log = log.join("\n");
     assert!(status.success(), "{status}: {log}");
-    (unit, log)
+    (unit, log, dir)
 }
 
 /// Catches `--lease-placement=numa-node` not reaching the cgroup setup on a two-node
@@ -631,7 +637,8 @@ fn placed_container_node(name: &str, nodes: &[(u32, &str)]) -> (PathBuf, String)
 #[test]
 #[cfg(target_os = "linux")]
 fn numa_node_placement_enables_cpuset_on_a_two_node_host() {
-    let (unit, log) = placed_container_node("numa-two", &[(0, "0-21,44-65"), (1, "22-43,66-87")]);
+    let (unit, log, _dir) =
+        placed_container_node("numa-two", &[(0, "0-21,44-65"), (1, "22-43,66-87")]);
     assert_eq!(read(&unit.join("cgroup.subtree_control")), "+cpuset");
     assert_eq!(
         read(&unit.join("actions/cgroup.subtree_control")),
@@ -648,7 +655,7 @@ fn numa_node_placement_enables_cpuset_on_a_two_node_host() {
 #[test]
 #[cfg(target_os = "linux")]
 fn numa_node_placement_on_a_one_node_host_runs_unplaced() {
-    let (unit, log) = placed_container_node("numa-one", &[(0, "0-87")]);
+    let (unit, log, _dir) = placed_container_node("numa-one", &[(0, "0-87")]);
     assert_eq!(
         read(&unit.join("cgroup.subtree_control")),
         "+cpu +memory +pids"
@@ -695,7 +702,7 @@ const OCI_RUNTIME: &str = "--oci-runtime=/usr/bin/true";
 /// A directory to put first in `PATH` for a container daemon. It holds `newuidmap` and
 /// `newgidmap` as the `uidmap` package installs them (setuid; the container driver's
 /// start-up looks for both).
-fn container_bin(name: &str) -> PathBuf {
+fn container_bin(name: &str) -> TestDir {
     use std::os::unix::fs::PermissionsExt as _;
     let bin = tls(name);
     for tool in ["newuidmap", "newgidmap"] {
@@ -978,6 +985,8 @@ fn a_container_node_whose_cgroup_is_not_delegated_refuses_to_start() {
             .args(flags)
             .output()
             .expect("spawn");
+        // Writable again whatever `prepare` did, so the directory can be removed.
+        let _ = std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o755));
         let stderr = String::from_utf8(out.stderr).expect("UTF-8");
         // 2: the host refuses (a restart would not change it), so the units' RestartPreventExitStatus=2
         // leaves the daemon down.
@@ -1013,9 +1022,6 @@ fn a_container_node_whose_cgroup_is_not_delegated_refuses_to_start() {
             std::fs::set_permissions(unit, std::fs::Permissions::from_mode(0o555)).expect("chmod");
         };
         let stderr = refused("read-only", "cpu memory pids", &read_only);
-        // Writable again, so the target directory can be cleaned.
-        let unit = tls("read-only").join("cgroup/kbf.slice/kbf-daemon.service");
-        std::fs::set_permissions(unit, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert!(stderr.contains("may not write its cgroup"), "{stderr}");
     }
 }
@@ -1026,7 +1032,7 @@ fn read(path: &Path) -> String {
 
 /// A directory for `--id-files`: a passwd naming this test's user `kbf`, and a
 /// subuid and subgid giving `kbf` `count` subordinate ids (none when empty).
-fn id_files(name: &str, count: &str) -> PathBuf {
+fn id_files(name: &str, count: &str) -> TestDir {
     use std::os::unix::fs::MetadataExt;
 
     let dir = tls(name);
@@ -1185,7 +1191,8 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
 )]
 fn a_node_needs_its_oci_runtime() {
     let ids = id_files("oci-ids", "65536");
-    let (_unit, cgroup_flags) = cgroup_tree(&tls("oci-cgroup"), "cpu memory pids");
+    let cgroup_dir = tls("oci-cgroup");
+    let (_unit, cgroup_flags) = cgroup_tree(&cgroup_dir, "cpu memory pids");
     let absent = ids.join("no-such-crun");
     let log = ids.join("stderr");
     let mut container = vec![

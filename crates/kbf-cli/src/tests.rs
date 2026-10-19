@@ -215,8 +215,7 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
     // both places.
     let e = error(vec!["kbf".into()]);
     assert!(e.contains("no mode") && e.contains("--mode=<"), "{e}");
-    let dir = std::env::temp_dir().join(format!("kbf-cli-lib-mode-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
+    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-cli-lib-mode");
     let file = dir.join("kbf.toml");
     std::fs::write(
         &file,
@@ -394,12 +393,16 @@ fn only_the_scheduling_modes_take_a_state_store() {
     let path = std::path::PathBuf::from("/var/lib/kbf/state.db");
     assert!(matches!(&both, Invocation::AllInOne(flags)
         if flags.server.state_store == Some(kbf_server::StateStoreUri::Sqlite(path.clone()))));
-    // Only SQLite is wired; the refusal is fixed text, not the value.
-    let postgres = error(with(BOTH, &["--state-store=postgres://db.example/kbf"]));
-    assert!(postgres.contains("only sqlite:///"), "{postgres}");
+    // A Postgres URL with a password is refused with fixed text, not the value.
+    let postgres = error(with(
+        BOTH,
+        &["--state-store=postgres://u:hunter2@db.example/kbf"],
+    ));
+    assert!(postgres.contains("must carry no password"), "{postgres}");
+    assert!(!postgres.contains("hunter2"), "{postgres}");
     let default = parse_from(with(BOTH, &[])).expect("all-in-one");
     assert!(matches!(&default, Invocation::AllInOne(flags)
-        if matches!(flags.server.state_store, Some(kbf_server::StateStoreUri::Sqlite(_)))));
+        if flags.server.state_store == Some(kbf_server::StateStoreUri::local_postgres())));
     let front = parse_from(with(
         FRONTEND,
         &["--state-store=sqlite:///var/lib/kbf/state.db"],
@@ -408,7 +411,7 @@ fn only_the_scheduling_modes_take_a_state_store() {
     assert!(matches!(&front, Invocation::Frontend(flags)
         if flags.server.state_store == Some(kbf_server::StateStoreUri::Sqlite(path.clone()))));
     let file = error(with(BOTH, &["--state-store=file:///var/lib/kbf"]));
-    assert!(file.contains("only sqlite:///"), "{file}");
+    assert!(file.contains("only postgres:///"), "{file}");
     let daemon = refusal(with(DAEMON, &["--state-store=sqlite:///x.db"]));
     assert_eq!(daemon.kind(), ErrorKind::ArgumentConflict);
     assert!(
@@ -889,6 +892,23 @@ fn only_version_and_json_ask_for_the_identity() {
     }
 }
 
+/// Catches `meta_log` written as a literal: a literal equal to the constant today passes
+/// the value check above and goes stale the day the constant is bumped, and a rollout
+/// then calls an irreversible step reversible. The one place the number may come from is
+/// `kbf_server::raft_log::RUNS`, so the source of `identity` must read it.
+#[test]
+fn meta_log_is_read_from_the_log_constant_not_written_down() {
+    let source = include_str!("version.rs");
+    let at = source
+        .find("\"meta_log\".to_owned()")
+        .expect("meta_log is inserted");
+    let insert = &source[at..source[at..].find(");").map_or(source.len(), |e| at + e)];
+    assert!(
+        insert.contains("kbf_server::raft_log::RUNS"),
+        "meta_log must be read from kbf_server::raft_log::RUNS: {insert}"
+    );
+}
+
 /// An empty protocol range is a build error.
 const _: () =
     assert!(kbf_server::worker::OLDEST_PROTOCOL_VERSION <= kbf_server::worker::PROTOCOL_VERSION);
@@ -911,7 +931,9 @@ fn the_identity_is_the_libraries_own_and_both_halves_speak_one_protocol() {
         v["min_protocol"],
         kbf_server::worker::OLDEST_PROTOCOL_VERSION
     );
-    assert_eq!(v["state_schema"], kbf_state::sqlite::SCHEMA_VERSION);
+    assert_eq!(v["meta_log"], kbf_server::raft_log::RUNS.get());
+    assert_eq!(v["state_schema"], kbf_state::postgres::schema::latest());
+    assert_eq!(v["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     assert!(
         ["debug", "release"].contains(&version::PROFILE),

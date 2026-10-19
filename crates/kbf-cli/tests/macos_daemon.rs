@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use kbf_daemon::keeper::{self, Mode};
 use kbf_deploy::linux::verify_cert::{CLIENT_AUTH, ROLE_URI_PREFIX, Row, verify};
+use kbf_testkit::dir::TestDir;
 use rcgen::{
     CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
     SanType,
@@ -62,12 +63,14 @@ impl Drop for Guarded {
 /// never says `Hello`. The front's certificate is a plain TLS server's: the fake front
 /// checks the client's certificate against the CA only, not its role. Both keys are
 /// private to this user (0600), as the self-checks require.
-fn tls(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-macos-daemon")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
+///
+/// The directory is removed when the returned [`TestDir`] drops: bind it before the
+/// processes that run in it, so they are reaped first.
+fn tls(name: &str) -> TestDir {
+    let dir = TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-macos-daemon-{name}"),
+    );
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -276,7 +279,7 @@ fn kbf_daemon_starts_as_the_units_words_start_it() {
     let mut daemon = Command::new(BIN)
         .args(unit_args(&dir, &data, front.worker.port()))
         .current_dir(&dir)
-        .env("HOME", &dir)
+        .env("HOME", dir.path())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).expect("log file"))
         .spawn()
@@ -367,7 +370,7 @@ fn kbf_daemon_starts_from_the_config_file_the_unit_names() {
         .args(["--mode=daemon", "--config"])
         .arg(&config)
         .current_dir(&dir)
-        .env("HOME", &dir)
+        .env("HOME", dir.path())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).expect("log file"))
         .spawn()

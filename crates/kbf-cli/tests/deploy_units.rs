@@ -194,24 +194,30 @@ fn no_rendered_mode_unit_is_refused_over_where_its_directories_are() {
     }
 }
 
-/// The all-in-one unit gives no `--state-store`, and kbf all-in-one, parsing the rendered
-/// command line, takes the SQLite file `state.db` in the unit's `--data-dir`: the state
-/// the template's comment promises, and one rule `state-store` passes. Catches the unit
-/// growing a `--state-store` (a Postgres URI, say) or kbf's default moving out of the
-/// data directory, or off SQLite.
+/// The all-in-one unit names the SQLite file `state.db` in its `--data-dir` as its
+/// `--state-store`, and kbf all-in-one, parsing the rendered command line, takes that file:
+/// kbf's own default is Postgres, so a unit that left the flag out would change store when
+/// its binary is replaced. One rule `state-store` passes. Catches the unit leaving the
+/// flag out (the farm would need Postgres at its next restart), or naming a file outside
+/// the data directory.
 #[test]
-fn the_all_in_one_unit_leaves_its_state_store_to_kbfs_sqlite_default() {
+fn the_all_in_one_unit_names_its_sqlite_state_file_in_the_data_directory() {
     let text = render(&config(), Some(1500), Mode::AllInOne).expect("renders");
     let unit = UnitFile::parse(&text).expect("a unit");
     let argv = unit.exec_start();
-    assert!(
-        !argv.iter().any(|a| a.starts_with("--state-store")),
-        "{argv:?}"
-    );
     let data_dir = argv
         .iter()
         .find_map(|a| a.strip_prefix("--data-dir="))
         .expect("the all-in-one unit gives --data-dir");
+    let stores: Vec<&&str> = argv
+        .iter()
+        .filter(|a| a.starts_with("--state-store"))
+        .collect();
+    assert_eq!(
+        stores,
+        [&format!("--state-store=sqlite://{data_dir}/state.db").as_str()],
+        "{argv:?}"
+    );
     match parse_from(argv.iter().copied()) {
         Ok(Invocation::AllInOne(flags)) => assert_eq!(
             flags.server.state_store,

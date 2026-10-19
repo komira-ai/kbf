@@ -1,20 +1,23 @@
 //! Test doubles for the seams of the update API, and a rig that assembles them.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use hyper::{Request, Response};
+use tokio::sync::watch;
 
+use super::actor::{ActorTiming, Api, spawn};
 use super::auth::{Secret, TokenHasher, TokenSource};
 use super::core::{Config, Core, Crash, CrashHook, CrashPoint, Parts};
 use super::idempotency::Idempotency;
 use super::model::{NewChild, OldChild, UpdateId};
 use super::traits::{
     Clock, Compat, CompatGate, ForwardError, Forwarder, InstallerState, InstallerStatus,
-    OrderError, OrderWriter, RestartMarker, Retired, RunningUpdate, StagedWire, StatusError,
+    OrderError, OrderWriter, RestartPending, Retired, RunningUpdate, StagedWire, StatusError,
     StatusReader, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec,
 };
 use crate::CommitId;
@@ -53,12 +56,81 @@ impl TokenHasher for CountingHasher {
     }
 }
 
+/// `status.json` as the value a test sets, behind a [`Stall`] door that a test can close to
+/// hold a reader inside `read`.
 #[derive(Clone)]
-pub struct FakeStatus(pub Arc<Mutex<Result<InstallerStatus, String>>>);
+pub struct FakeStatus(pub Arc<Mutex<Result<InstallerStatus, String>>>, Stall);
+
+impl FakeStatus {
+    pub fn stall(&self) -> &Stall {
+        &self.1
+    }
+}
 
 impl StatusReader for FakeStatus {
     fn read(&self) -> Result<InstallerStatus, StatusError> {
+        self.1.pass();
         self.0.lock().unwrap().clone().map_err(StatusError)
+    }
+}
+
+/// How long a read waits inside a closed [`Stall`] before it goes on anyway, so that a
+/// test that forgets to open it, or a mutant that blocks the test itself, ends.
+const STALL_CAP: Duration = Duration::from_secs(3);
+
+struct StallInner {
+    closed: Mutex<bool>,
+    opened: Condvar,
+    arrived: watch::Sender<usize>,
+}
+
+/// A door that readers of `status.json` pass. Open by default; while it is closed a
+/// reader waits inside it, so a test can hold the actor in the middle of a call.
+#[derive(Clone)]
+pub struct Stall(Arc<StallInner>);
+
+impl Default for Stall {
+    fn default() -> Stall {
+        Stall(Arc::new(StallInner {
+            closed: Mutex::new(false),
+            opened: Condvar::new(),
+            arrived: watch::channel(0).0,
+        }))
+    }
+}
+
+impl Stall {
+    pub fn close(&self) {
+        *self.0.closed.lock().unwrap() = true;
+    }
+
+    pub fn open(&self) {
+        *self.0.closed.lock().unwrap() = false;
+        self.0.opened.notify_all();
+    }
+
+    /// How many reads have reached the door so far.
+    pub fn reads(&self) -> usize {
+        *self.0.arrived.borrow()
+    }
+
+    /// Waits, without blocking the runtime, until `n` reads have reached the door.
+    pub async fn arrived(&self, n: usize) {
+        let mut count = self.0.arrived.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), count.wait_for(|&c| c >= n))
+            .await
+            .expect("the reads did not arrive at the stall")
+            .unwrap();
+    }
+
+    fn pass(&self) {
+        self.0.arrived.send_modify(|c| *c += 1);
+        let closed = self.0.closed.lock().unwrap();
+        let _ = self
+            .0
+            .opened
+            .wait_timeout_while(closed, STALL_CAP, |closed| *closed)
+            .unwrap();
     }
 }
 
@@ -282,6 +354,15 @@ pub fn staged(commit: &str) -> InstallerStatus {
     }
 }
 
+/// The restart answer, set from the test.
+pub struct FakeRestart(pub Arc<AtomicBool>);
+
+impl RestartPending for FakeRestart {
+    fn restart_pending(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// Every seam, with handles to look at and change them.
 pub struct Rig {
     pub dir: PathBuf,
@@ -291,6 +372,7 @@ pub struct Rig {
     pub gate: FakeGate,
     pub clock: Arc<FakeClock>,
     pub die: Arc<Mutex<Option<CrashPoint>>>,
+    pub restart: Arc<AtomicBool>,
 }
 
 impl Rig {
@@ -298,7 +380,7 @@ impl Rig {
         let dir = kbf_host::testkit::scratch(name);
         Rig {
             dir,
-            status: FakeStatus(Arc::new(Mutex::new(Ok(idle())))),
+            status: FakeStatus(Arc::new(Mutex::new(Ok(idle()))), Stall::default()),
             orders: FakeOrders::default(),
             sup: FakeSupervisor::default(),
             gate: FakeGate {
@@ -307,15 +389,12 @@ impl Rig {
             },
             clock: Arc::new(FakeClock(AtomicU64::new(0))),
             die: Arc::new(Mutex::new(None)),
+            restart: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn set_status(&self, s: InstallerStatus) {
         *self.status.0.lock().unwrap() = Ok(s);
-    }
-
-    pub fn marker_path(&self) -> PathBuf {
-        self.dir.join("restart-pending")
     }
 
     /// A core over this rig's state directory (a second call is a restarted process).
@@ -326,7 +405,7 @@ impl Rig {
             status: Box::new(self.status.clone()),
             compat: Box::new(self.gate.clone()),
             clock: self.clock.clone(),
-            marker: RestartMarker::new(self.marker_path()),
+            restart: Box::new(FakeRestart(self.restart.clone())),
             requests: Idempotency::open(&self.dir),
             hook: Box::new(DieAt(self.die.clone())),
             config: Config::default(),
@@ -344,3 +423,8 @@ pub fn req(commit: &str, request_id: &str) -> super::model::UpdateRequest {
 }
 
 pub const COMMIT_C: &str = C;
+
+/// The actor over the rig's core, with the default timing and nothing to do at its death.
+pub fn api(rig: &Rig) -> Api {
+    spawn(rig.core(), ActorTiming::default(), || {}).unwrap()
+}

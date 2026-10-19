@@ -95,8 +95,21 @@ pub enum ReleaseError {
         pending: String,
         got: String,
     },
+    #[error(
+        "release {0} is current already: the first release is the only one setup installs, use update"
+    )]
+    NotFirst(CommitId),
     #[error("no swap is pending, and {0} is not the current release")]
     NotPending(CommitId),
+    #[error("{0} is staged and has not been confirmed or dropped: one frontend update at a time")]
+    FrontendBusy(CommitId),
+    #[error("{0} is the installed release already")]
+    AlreadyInstalled(CommitId),
+    #[error("{commit} is not the staged release ({})", staged.as_ref().map_or("none staged".to_owned(), ToString::to_string))]
+    NotStaged {
+        commit: CommitId,
+        staged: Option<CommitId>,
+    },
     #[error("a confirm window of {0} s is outside the {min} to {max} s the host allows", min = crate::activate::WINDOW_MIN_SECS, max = crate::activate::WINDOW_MAX_SECS)]
     Window(u64),
 }
@@ -617,24 +630,41 @@ pub(crate) fn has_binary<E: Exec>(exec: &E, host: &Layout, commit: &CommitId) ->
 
 /// `host gc --keep N`: remove each release directory but the kept ones: the state's
 /// current, previous and staged, what the `current` and `previous` links point to, and
-/// the `keep` newest others (by the directory's modification time). An entry of
-/// `releases/` that is not a directory named by a commit id is left alone.
+/// the release a pending swap names and the one it came from, every release in `in_use` (a
+/// process executes from it), and the `keep` newest others (by the directory's modification
+/// time). An entry of `releases/` that is not a directory named by a commit id is left alone.
 pub fn gc<E: Exec>(
     exec: &mut E,
     host: &Layout,
     keep: usize,
+    in_use: &BTreeSet<CommitId>,
     mode: Mode,
     out: &mut dyn Write,
 ) -> Result<(), ReleaseError> {
     // Held through the removals, so an install cannot make a release current meanwhile.
-    let (_lock, state) = begin(host, mode)?;
-    if _lock.is_some() {
+    // Unlike an install, `gc` is not refused while a swap is on trial: it keeps both of the
+    // swap's releases (S22).
+    let lock = match mode {
+        Mode::Apply => Some(Locked::acquire(host)?),
+        Mode::DryRun => None,
+    };
+    let state = match &lock {
+        Some(lock) => lock.read()?,
+        None => state::read_unlocked(host)?,
+    };
+    let state = state.unwrap_or_default();
+    if lock.is_some() {
         sweep_stages(host)?;
     }
     let mut kept: BTreeSet<CommitId> = [state.current, state.previous, state.staged]
         .into_iter()
         .flatten()
         .collect();
+    if let Some(p) = &state.pending_confirm {
+        kept.insert(p.commit.clone());
+        kept.extend(p.previous.clone());
+    }
+    kept.extend(in_use.iter().cloned());
     for link in [host.current(), host.previous()] {
         if let Some(Entry::Link { target }) = inspect(exec, &link)? {
             kept.extend(linked(&target));

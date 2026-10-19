@@ -275,7 +275,7 @@ fn kbf(name: &str, stamp: &str, json: &str) -> PathBuf {
 /// The identity `kbf --version --json` prints, as a release build of `commit` makes it.
 fn identity(commit: &str, profile: &str) -> String {
     format!(
-        "{{\"commit\":\"{commit}\",\"min_protocol\":1,\"profile\":\"{profile}\",\"protocol\":1,\"state_schema\":1,\"version\":\"0.1.0\"}}\n"
+        "{{\"admin_protocol\":1,\"commit\":\"{commit}\",\"meta_log\":4,\"min_protocol\":1,\"profile\":\"{profile}\",\"protocol\":1,\"state_schema\":1,\"version\":\"0.1.0\"}}\n"
     )
 }
 
@@ -564,4 +564,31 @@ fn budget_diff_defaults_to_this_repository() {
         out,
         "ok: tools/interpreter_budget.tsv adds no row to HEAD's\n"
     );
+}
+
+#[test]
+fn proxy_loom_passes_when_cargo_passes_and_fails_when_it_fails() {
+    let root = scratch("proxy-loom");
+    // The fake cargo prints cargo's result line for five models; `true` prints nothing, which
+    // is a gate that ran no model.
+    let mut passing = xtask(&root, &["proxy-loom"]);
+    passing.env("CARGO", FAKE);
+    let (code, out, err) = outcome(passing.output().expect("run xtask"));
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    assert!(
+        out.contains("the kbf-proxy loom models passed (5 ran)"),
+        "{out}"
+    );
+
+    let mut silent = xtask(&root, &["proxy-loom"]);
+    silent.env("CARGO", "true");
+    let (code, _, err) = outcome(silent.output().expect("run xtask"));
+    assert_eq!(code, Some(1));
+    assert!(err.contains("ran 0 tests"), "{err}");
+
+    let mut failing = xtask(&root, &["proxy-loom"]);
+    failing.env("CARGO", "false");
+    let (code, _, err) = outcome(failing.output().expect("run xtask"));
+    assert_eq!(code, Some(1));
+    assert!(err.contains("the kbf-proxy loom models failed"), "{err}");
 }

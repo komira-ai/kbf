@@ -66,7 +66,7 @@ use tokio::time::timeout;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::farm::{Farm, Outbound, Reported, StreamId};
-use crate::identity::{PeerCert, Peers};
+use crate::identity::{PeerCert, Peers, presented};
 use crate::map_push::MapFeed;
 use crate::release::offers::{OfferFeed, Offers, platform_of};
 
@@ -76,6 +76,16 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// The oldest version it accepts. The protocol promises N-1 and N; version 1 is the
 /// first, so there is no N-1 yet.
 pub const OLDEST_PROTOCOL_VERSION: u32 = 1;
+
+/// The protocol version a wire field names: `None` for 0. Versions start at 1, and
+/// proto3 cannot tell a 0 from a field the sender never set (a `Hello` or a storage
+/// registration from a build that predates the field, or a stored row written before
+/// the field existed), so a 0 is a node whose version is not known and not a node that
+/// speaks version 0.
+#[must_use]
+pub const fn named_protocol(wire: u32) -> Option<u32> {
+    if wire == 0 { None } else { Some(wire) }
+}
 
 /// The `Worker` service over a [`Farm`].
 #[derive(Debug)]
@@ -135,9 +145,7 @@ impl Worker for WorkerService {
         &self,
         request: Request<Streaming<DaemonMessage>>,
     ) -> Result<Response<SessionStream>, Status> {
-        let certs = kbf_tls::peer_certs(&request);
-        let leaf = certs.as_deref().and_then(|chain| chain.first());
-        let peer = self.peers.peer(leaf.map(AsRef::as_ref))?;
+        let peer = self.peers.peer_of(&presented(request.extensions()))?;
         let mut inbound = request.into_inner();
         let first = timeout(self.hello_wait, inbound.message())
             .await
@@ -352,7 +360,8 @@ pub(crate) fn message(message: server_message::Message) -> ServerMessage {
     }
 }
 
-/// What a `Hello` reports: [`capacity`], [`caps`] and [`phase`].
+/// What a `Hello` reports: [`capacity`], [`caps`] and [`phase`], and the version it
+/// speaks ([`named_protocol`] of `protocol_version`).
 ///
 /// # Errors
 /// Any of the three is malformed.
@@ -361,6 +370,7 @@ pub fn reported(hello: &Hello) -> Result<Reported, String> {
         capacity: capacity(hello)?,
         caps: caps(hello)?,
         phase: phase(hello)?,
+        protocol: named_protocol(hello.protocol_version),
     })
 }
 
@@ -448,7 +458,17 @@ fn entry(capabilities: &[Capability], key: &str) -> Result<Option<u64>, String> 
 mod tests {
     use tonic::Code;
 
-    use super::negotiate;
+    use super::{named_protocol, negotiate};
+
+    /// Catches: a wire 0 (a field its sender never set) taken for a version, so that a
+    /// node naming none would read as speaking version 0 and pull the oldest version of
+    /// a list down to it; and a version that is changed or dropped on the way.
+    #[test]
+    fn a_wire_zero_names_no_protocol_and_any_other_number_is_itself() {
+        assert_eq!(named_protocol(0), None);
+        assert_eq!(named_protocol(1), Some(1));
+        assert_eq!(named_protocol(u32::MAX), Some(u32::MAX));
+    }
 
     /// Catches: a `Welcome` that names the server's newest version (the integration
     /// tests speak version 1 to a server of version 1, so they cannot tell it from the

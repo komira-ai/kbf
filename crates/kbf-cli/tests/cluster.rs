@@ -4,100 +4,9 @@
 //! `kbf-server`'s `tests/frontend_drain.rs`, which runs the client against the real
 //! operator API.
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener};
-use std::process::Command;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+mod cluster_support;
 
-const BIN: &str = env!("CARGO_BIN_EXE_kbf");
-
-/// How long a test waits for the binary to call the server: a hang deadline.
-const HANG: Duration = Duration::from_secs(20);
-
-/// Answers one request with `status` and `body`; the thread returns the request as it
-/// was sent (head and body).
-fn serve_once(status: &'static str, body: &'static str) -> (SocketAddr, JoinHandle<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.set_nonblocking(true).expect("non-blocking");
-    let addr = listener.local_addr().expect("addr");
-    let thread = std::thread::spawn(move || {
-        let deadline = Instant::now() + HANG;
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => panic!("kbf never called the server: {e}"),
-            }
-        };
-        stream.set_nonblocking(false).expect("blocking");
-        stream.set_read_timeout(Some(HANG)).expect("timeout");
-        let mut request = Vec::new();
-        let mut buf = [0u8; 4096];
-        let wanted = loop {
-            let n = stream.read(&mut buf).expect("read the request");
-            request.extend_from_slice(&buf[..n]);
-            let text = String::from_utf8_lossy(&request);
-            if let Some((head, rest)) = text.split_once("\r\n\r\n") {
-                let length = head
-                    .lines()
-                    .find_map(|l| {
-                        l.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(|v| v.trim().parse::<usize>().expect("a length"))
-                    })
-                    .unwrap_or(0);
-                if rest.len() >= length {
-                    break request.len();
-                }
-            }
-            assert!(n > 0, "the request ended early");
-        };
-        assert_eq!(wanted, request.len());
-        let reply = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(reply.as_bytes()).expect("reply");
-        String::from_utf8(request).expect("UTF-8")
-    });
-    (addr, thread)
-}
-
-fn kbf(args: &[&str]) -> (Option<i32>, String, String) {
-    let out = Command::new(BIN).args(args).output().expect("run kbf");
-    (
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
-}
-
-/// A token file holding `token` (the client does not check its mode).
-fn token_file(name: &str, token: &str) -> String {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-cluster");
-    std::fs::create_dir_all(&dir).expect("a directory");
-    let path = dir.join(format!("{name}-{}", std::process::id()));
-    std::fs::write(&path, format!("{token}\n")).expect("write");
-    path.display().to_string()
-}
-
-/// Runs `kbf cluster --api <server> <args>` against a server answering `status` and
-/// `body`; the exit status, stdout, stderr and the request the server saw.
-fn cluster(
-    status: &'static str,
-    body: &'static str,
-    args: &[&str],
-) -> (Option<i32>, String, String, String) {
-    let (addr, request) = serve_once(status, body);
-    let api = addr.to_string();
-    let mut argv = vec!["cluster", "--api", &api];
-    argv.extend_from_slice(args);
-    let (code, out, err) = kbf(&argv);
-    (code, out, err, request.join().expect("the server thread"))
-}
+use cluster_support::{cluster, kbf, token_file};
 
 /// Catches each verb sending the wrong call: the method, the path (the node id
 /// percent-encoded as one segment), the `Authorization` header of the token file on a
@@ -247,5 +156,27 @@ fn a_command_line_that_names_no_single_call_exits_2() {
 fn help_names_cluster_after_the_modes() {
     let (code, out, err) = kbf(&["--help"]);
     assert_eq!(code, Some(0), "{err}");
-    assert!(out.contains("kbf cluster status|drain|undrain"), "{out}");
+    assert!(
+        out.contains("kbf cluster status|drain|undrain|member|denied|object-store"),
+        "{out}"
+    );
+}
+
+/// Catches the `kbf cluster --help` about line and the "Not a mode" hint naming fewer
+/// verbs than the command has: each verb group must be named in both.
+#[test]
+fn the_cluster_help_and_the_hint_name_every_verb_group() {
+    let (code, out, err) = kbf(&["cluster", "--help"]);
+    assert_eq!(code, Some(0), "{err}");
+    let about = out.lines().next().unwrap_or_default();
+    for word in ["member", "denied", "object store"] {
+        assert!(
+            about.contains(word),
+            "{word} missing from the about line: {out}"
+        );
+    }
+    let (_, top, _) = kbf(&["--help"]);
+    for word in ["member", "denied", "object-store"] {
+        assert!(top.contains(word), "{word} missing from the hint: {top}");
+    }
 }

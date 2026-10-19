@@ -586,3 +586,31 @@ fn a_write_that_dies_between_the_backup_and_the_state_loses_nothing() {
         "the backup was not made first"
     );
 }
+
+/// Catches a verb that queues behind a pass for ever, or gives up at once, or reports the
+/// wrong thing: with the lock held `acquire_within` waits its time and then says busy; when
+/// the holder lets go within the time it gets the lock; a lock file that cannot be opened is
+/// a lock error (not busy).
+///
+/// Mutants planted: no wait (busy at once with a holder that lets go in time); the busy
+/// error turned into a lock error.
+#[test]
+fn acquire_within_waits_for_a_holder_then_says_busy() {
+    use std::time::{Duration, Instant};
+    let (root, _dir) = host_root("acquire-within");
+    let held = Locked::acquire(&root).expect("held");
+    let started = Instant::now();
+    let err = Locked::acquire_within(&root, Duration::from_millis(60)).expect_err("busy");
+    assert!(matches!(err, StateError::Busy { .. }), "{err}");
+    assert!(started.elapsed() >= Duration::from_millis(60));
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(held);
+    });
+    Locked::acquire_within(&root, Duration::from_secs(20)).expect("got it once it was let go");
+    holder.join().expect("the holder ends");
+    let lock = root.join(&root.lock());
+    fs::remove_dir_all(lock.parent().expect("a directory")).expect("no lock directory");
+    let err = Locked::acquire_within(&root, Duration::ZERO).expect_err("cannot open");
+    assert!(matches!(err, StateError::Lock { .. }), "{err}");
+}

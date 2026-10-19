@@ -436,14 +436,18 @@ async fn a_resent_hello_from_a_denied_node_ends_the_stream() {
     );
 }
 
-/// Catches: a deny list flag accepted without mutual TLS (it could never be applied),
-/// and a server that starts with a deny list it cannot read or parse.
+/// Catches: a deny list flag accepted with neither mutual TLS nor a proxy (it could never
+/// be applied), and a server that starts with a deny list it cannot read or parse.
 #[test]
 fn the_deny_list_flag_needs_tls_and_a_good_file() {
-    let plain = Args::try_parse_from(["kbf-server", "--worker-deny-list", "deny.list"]);
-    assert!(plain.is_err(), "a deny list without TLS");
-
     let pki = Pki::new("deny-flag");
+    let good = pki.write("good.list", "node mac-07\n");
+    let plain =
+        Args::try_parse_from(["kbf-server", "--worker-deny-list", &good]).expect("the flag parses");
+    assert!(matches!(
+        plain.listeners(),
+        Err(ConfigError::DenyListWithoutIdentity)
+    ));
     let bad = pki.write("bad.list", "serial\n");
     let error = pki
         .args(&["--worker-deny-list", &bad])

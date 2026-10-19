@@ -8,7 +8,12 @@
 //!   have written `sh -c`.
 //! - [`fake`]: the same binary run through a link named `xcrun`, `xcodebuild` or
 //!   `sandbox-exec` answers as that tool, from a rules file the test writes.
+//! - [`dir`]: a scratch directory a test owns and that is removed on drop.
 //! - [`port`]: loopback ports a test can rely on (dead ones, and ones held until used).
+//! - [`forked`]: a child held between `fork` and `exec`, to show what a lock or a file
+//!   a test holds open does when another thread of the test binary starts a program.
+//! - [`spawn`]: starting a program the test has just copied or written, again while the
+//!   start fails with `ETXTBSY` because such a child still holds the file open.
 //! - [`m2`]: the verbs of `kbf-m2-act`, the program every action of the M2 sample
 //!   project runs (the M2 image has no shell).
 //!
@@ -31,9 +36,12 @@
 use std::io::Write;
 
 pub mod act;
+pub mod dir;
 pub mod fake;
+pub mod forked;
 pub mod m2;
 pub mod port;
+pub mod spawn;
 
 /// Why a program here stopped short.
 #[derive(Debug, PartialEq, Eq)]

@@ -21,7 +21,14 @@
 //! - **One read per blob** for callers that ask at the same time, whichever owner
 //!   answers ([`Router::read_blob`]).
 //! - **FindMissing** ([`Router::find_missing`]) asks each digest's primary only, one call
-//!   per primary, and puts the answers back in the order asked.
+//!   per primary, and puts the answers back in the order asked. It is the client's
+//!   question: a blob only a replica holds is reported missing, and the upload that
+//!   follows fills the primary.
+//! - **FindMissing for a caller that must not refuse what a read would find**
+//!   ([`Router::find_missing_anywhere`], the input check of an Execute): what the primary
+//!   lacks is asked of the blob's other owners and of the previous generation's, and
+//!   only a blob none of them holds is missing. A blob found off its primary is told to
+//!   read repair ([`Router::with_background_repair`] copies it, in the background).
 //! - **The closure check** (inside [`Router::action_result`]): the node that holds an
 //!   action-cache entry reports its closure with it. The entry is served only if every
 //!   blob of the closure is held by one of the blob's owners: each primary is asked in
@@ -64,6 +71,7 @@
 //! [`Liveness`] it is given (ten seconds to dial, pings every ten seconds by default), so
 //! a read fails over to the next owner instead of waiting for the operating system.
 
+mod anywhere;
 mod closure;
 mod find;
 mod flights;
@@ -78,7 +86,7 @@ mod write;
 
 pub use closure::{ClosureStats, DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL};
 pub use nodes::{Liveness, Nodes, TlsNodes};
-pub use repair::{ReadRepair, RepairLimit};
+pub use repair::{MAX_REPAIRS_IN_FLIGHT, ReadRepair, RepairLimit};
 pub use resume::MAX_RESUMES;
 pub use router::{DEFAULT_COPY_BYTES, MAX_MAP_REFETCHES, Placement, Router};
 pub use sink::{BlobSink, IntoError};

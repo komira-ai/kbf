@@ -763,7 +763,15 @@ fn retention_keeps_the_running_the_previous_and_one_more() {
         (at(C), at(B))
     );
 
-    release::gc(&mut exec, &layout, 1, Mode::Apply, &mut Vec::new()).expect("gc");
+    release::gc(
+        &mut exec,
+        &layout,
+        1,
+        &Default::default(),
+        Mode::Apply,
+        &mut Vec::new(),
+    )
+    .expect("gc");
     let mut left: Vec<String> = fs::read_dir(exec.at("/var/lib/kbf-installer/releases"))
         .expect("list")
         .map(|i| i.expect("entry").file_name().to_string_lossy().into_owned())
@@ -778,4 +786,57 @@ fn retention_keeps_the_running_the_previous_and_one_more() {
 
     let done = revert(&mut exec, &layout, &mut Vec::new()).expect("revert");
     assert_eq!(done.to, c(B));
+}
+
+/// Catches a first release that is put on trial, or whose links and state disagree: on a host
+/// with no release `first` writes the state with `current` and no trial (nothing to go back
+/// to, so no pending confirm), points `current` at it and leaves `previous` unset, and a
+/// repeat changes nothing.
+///
+/// Mutants to plant: `pending_confirm` set in `first`; the state written after the links;
+/// the repeat arm removed (the repeat then fails with `NotFirst`).
+#[test]
+fn the_first_release_becomes_current_with_no_trial() {
+    let (mut exec, layout) = host("first");
+    seed(&exec, A, 1_000);
+    first(&mut exec, &layout, &c(A), &mut Vec::new()).expect("first");
+    let state = Locked::acquire(&layout)
+        .expect("lock")
+        .read()
+        .expect("read")
+        .expect("a state");
+    assert_eq!(state.current, Some(c(A)));
+    assert_eq!((state.previous, state.pending_confirm), (None, None));
+    assert_eq!(link(&exec, "current"), at(A));
+    assert_eq!(link(&exec, "previous"), None);
+    first(&mut exec, &layout, &c(A), &mut Vec::new()).expect("a repeat");
+    assert_eq!(link(&exec, "current"), at(A));
+}
+
+/// Catches a first release taken for a host that already runs one, and one that is not on
+/// the host: another release current is `NotFirst` (setup never replaces a release: that is
+/// an update), and a release with no binary is `NotInstalled`; neither writes a state.
+///
+/// Mutants to plant: the `NotFirst` guard removed; the `has_binary` check removed.
+#[test]
+fn a_first_release_never_replaces_one_and_must_be_installed() {
+    let (mut exec, layout) = host("first-refused");
+    running(&exec, &layout, A, &[B]);
+    let err = first(&mut exec, &layout, &c(B), &mut Vec::new()).expect_err("refused");
+    assert!(
+        matches!(&err, ReleaseError::NotFirst(x) if *x == c(B)),
+        "{err:?}"
+    );
+    assert_eq!(
+        state_of(&layout).current,
+        Some(c(A)),
+        "the state is as it was"
+    );
+    let (mut bare, layout) = host("first-missing");
+    let err = first(&mut bare, &layout, &c(D), &mut Vec::new()).expect_err("refused");
+    assert!(
+        matches!(&err, ReleaseError::NotInstalled(x) if *x == c(D)),
+        "{err:?}"
+    );
+    assert!(state::read_unlocked(&layout).expect("read").is_none());
 }

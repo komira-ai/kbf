@@ -7,10 +7,12 @@
 //! | key | value | lives |
 //! |---|---|---|
 //! | `instance/<instance id>` | the member id | for ever: a node that returns keeps its id |
-//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter and its newest debts report | `ttl` after the last heartbeat |
+//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter, its newest debts report and the protocol version it registered naming | `ttl` after the last heartbeat |
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
 //! | `meta/members_formed` | nothing | for ever: the cluster has had an `Active` member |
+//! | `meta/members_forming` | nothing | a minute from the first `Active` member |
+//! | `unfilled/<id>` | nothing | for ever, until the member is made `Active` |
 //! | `deny/<kind>/<value>` | the reason and the time it was added | for ever, until [`Members::allow`] |
 //!
 //! and the counters `member-id` and `boot/<id>`. The store assigns both numbers, so no
@@ -38,6 +40,13 @@
 //! and a registration (which rewrites the row) starts without one. A promotion keeps it.
 //! [`Members::storage_health`] judges the rows ([`crate::storage_health`]).
 //!
+//! **Protocol.** The row keeps the protocol version the node named when it registered, for
+//! the operator view ([`Members::protocols`], `GET /v1/members`): a heartbeat and a state
+//! change keep it, a new registration replaces it, and nothing judges it after the
+//! registration. A row written before the field existed names none and reads as a node
+//! whose version is not known, never as version 0. The row lives `ttl` after the last
+//! heartbeat, so a member that went `Down` has no version either.
+//!
 //! **The map** is a function of the rows: [`Members::refresh`] reads `map`, `member/` and
 //! the `down/` marks, builds the next member list, and if it differs commits generation
 //! `g + 1` with the compare-and-set on `map`'s version and a check on every row it read,
@@ -56,6 +65,10 @@
 //! `docs/design/frontend-proxy.md` section 9). Only registration judges the floor: storage
 //! nodes do not enforce `min_protocol` themselves, and a floor this build lifts reaches the
 //! stored map with the next change of members, not on its own.
+//!
+//! **Joiners.** A node the farm has not seen before, registering after the farm's first
+//! bootstrap minute, is `Joining` with an `unfilled/<id>` mark and is promoted by
+//! [`Members::set_state`] only (module `join`); the paragraph below is for the others.
 //!
 //! **Promotion.** A node's own request moves it in two ways only. A registration saying the
 //! index is whole ([`Progress::CaughtUp`]) writes `Active`, so a rolling restart leaves
@@ -98,6 +111,11 @@ use prost::Message as _;
 use tokio::sync::watch;
 
 use crate::storage_health::{Debts, MemberReport, Report, StorageHealth, storage_health};
+use crate::worker::named_protocol;
+
+mod denials;
+pub use denials::Denial;
+mod join;
 
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
@@ -278,8 +296,8 @@ pub enum MembershipError {
     Map(#[from] MapError),
 }
 
-/// A stored member row: the member as the map will hold it, its boot counter and the
-/// newest debts report.
+/// A stored member row: the member as the map will hold it, its boot counter, the newest
+/// debts report and the protocol version its node registered with.
 #[derive(Clone, PartialEq, prost::Message)]
 struct Row {
     #[prost(message, optional, tag = "1")]
@@ -288,6 +306,11 @@ struct Row {
     boot: u64,
     #[prost(message, optional, tag = "3")]
     report: Option<StoredReport>,
+    /// The `protocol` of the registration that wrote the row. 0 is absent: a row written
+    /// before this field existed (or by a registration that named none) reads as a node
+    /// whose version is not known ([`named_protocol`]).
+    #[prost(uint32, tag = "4")]
+    protocol: u32,
 }
 
 /// [`Report`] as stored.
@@ -327,6 +350,8 @@ struct Live {
     member: Member,
     boot: u64,
     report: Option<Report>,
+    /// What its registration named; `None` for a row that names none.
+    protocol: Option<u32>,
     version: Version,
 }
 
@@ -342,15 +367,24 @@ fn decode_row(stored: &Versioned) -> Result<Live, MembershipError> {
         member,
         boot: row.boot,
         report: row.report.as_ref().map(Report::from),
+        protocol: named_protocol(row.protocol),
         version: stored.version,
     })
 }
 
-fn encode_row(member: &Member, boot: u64, report: Option<&Report>) -> Vec<u8> {
+/// The value of the row of `member` at `boot`, for a node that registered naming
+/// `protocol`, with `report` as its newest debts report.
+fn encode_row(
+    member: &Member,
+    boot: u64,
+    protocol: Option<u32>,
+    report: Option<&Report>,
+) -> Vec<u8> {
     Row {
         member: Some(pb::Member::from(member)),
         boot,
         report: report.map(StoredReport::from),
+        protocol: protocol.unwrap_or(0),
     }
     .encode_to_vec()
 }
@@ -572,7 +606,8 @@ impl Members {
 
     /// Registers a storage node: assigns its id (the same for the same instance) and a
     /// larger boot counter, writes its row as `Active` (`CatchingUp` if it is rebuilding
-    /// its index, see the module docs), and rebuilds the map.
+    /// its index, `Joining` while its `unfilled/` mark is there: see the module docs and
+    /// `join`), and rebuilds the map.
     ///
     /// The node is judged against the floor of the map this registration makes
     /// ([`next_floor`]: the stored map's, lifted to this build's oldest), so what the store
@@ -608,20 +643,23 @@ impl Members {
             addr: who.addr.clone(),
             zone: who.zone.clone(),
             weight: who.weight,
-            state: match who.progress {
-                Progress::CatchingUp => MemberState::CatchingUp,
-                Progress::CaughtUp => MemberState::Active,
-            },
+            state: MemberState::Active,
             // Published in the map, so a restart inside the lease changes the member (and the
             // generation) even when nothing else about it did.
             boot,
         };
-        self.write_row(&member, boot)?;
+        self.write_row(
+            member,
+            who.progress == Progress::CatchingUp,
+            boot,
+            named_protocol(who.protocol),
+        )?;
         let map = self.refresh()?.ok_or(MembershipError::NoMap)?;
         Ok(Registration { id, boot, map })
     }
 
-    /// The id of `instance` (assigned on first sight) and a new boot counter for it.
+    /// The id of `instance` (assigned on first sight, with its `unfilled/` mark if the farm
+    /// holds data) and a new boot counter for it.
     fn assign(&self, instance: &str) -> Result<(MemberId, u64), MembershipError> {
         let key = instance_key(instance);
         for _ in 0..ATTEMPTS {
@@ -636,7 +674,7 @@ impl Members {
                     let taken = self.store.txn(Txn::new().next(ID_COUNTER))?;
                     let id = MemberId(taken.map_err(|_| MembershipError::Contended)?.counters[0]);
                     let txn = Txn::new().put(&key, id.0.to_be_bytes(), Cond::Absent);
-                    (id, txn.next(boot_counter(id)))
+                    (id, self.unfilled_if_data(txn, id)?.next(boot_counter(id)))
                 }
             };
             if let Ok(commit) = self.store.txn(txn)? {
@@ -647,11 +685,21 @@ impl Members {
     }
 
     /// Stores `member`'s row with a whole time to live, unless a newer boot is there, and
-    /// clears its `down/` mark. An `Active` row also writes `meta/members_formed`, in the
-    /// same transaction.
-    fn write_row(&self, member: &Member, boot: u64) -> Result<(), MembershipError> {
+    /// clears its `down/` mark. The row names the `protocol` this registration did, in
+    /// place of any an earlier boot wrote. The state is [`Members::admit`]'s (read again at
+    /// every attempt, and the write checks the mark it read); an `Active` row also writes
+    /// `meta/members_formed`, in the same transaction.
+    fn write_row(
+        &self,
+        mut member: Member,
+        rebuilding: bool,
+        boot: u64,
+        protocol: Option<u32>,
+    ) -> Result<(), MembershipError> {
         let key = member_key(member.id);
         for _ in 0..ATTEMPTS {
+            let (state, mark) = self.admit(member.id, rebuilding)?;
+            member.state = state;
             let cond = match self.store.get(&key)? {
                 Some(stored) => {
                     let current = decode_row(&stored)?.boot;
@@ -666,14 +714,26 @@ impl Members {
                 }
                 None => Cond::Absent,
             };
-            let mut txn = Txn::new();
+            let mut txn = Txn::new().check(join::unfilled_key(member.id), mark);
             if member.state == MemberState::Active {
-                txn = txn.put(FORMED, Vec::new(), Cond::Any);
+                txn = self.formed(txn)?;
             }
             let txn = txn
-                .put_ttl(&key, encode_row(member, boot, None), self.config.ttl, cond)
+                .put_ttl(
+                    &key,
+                    encode_row(&member, boot, protocol, None),
+                    self.config.ttl,
+                    cond,
+                )
                 .delete(down_key(member.id), Cond::Any);
             if self.store.txn(txn)?.is_ok() {
+                if member.state == MemberState::Joining {
+                    tracing::warn!(
+                        member = member.id.0,
+                        addr = %member.addr,
+                        "a joiner: it is not primary until promoted by the operator (POST /v1/members, state active)"
+                    );
+                }
                 return Ok(());
             }
         }
@@ -771,12 +831,17 @@ impl Members {
             };
             let mut put = Txn::new().put_ttl(
                 &key,
-                encode_row(&live.member, live.boot, live.report.as_ref()),
+                encode_row(&live.member, live.boot, live.protocol, live.report.as_ref()),
                 ttl,
                 Cond::Version(stored.version),
             );
             if live.member.state == MemberState::Active && before != MemberState::Active {
-                put = put.put(FORMED, Vec::new(), Cond::Any);
+                put = self.formed(put)?;
+            }
+            // Every time an operator's call leaves the member `Active`, not only on the
+            // transition: a mark a frontend that predates it left is cleaned by the next.
+            if matches!(how, Touch::State(_)) && live.member.state == MemberState::Active {
+                put = put.delete(join::unfilled_key(id), Cond::Any);
             }
             if self.store.txn(put)?.is_ok() {
                 return Ok(live.member.state != before);
@@ -979,6 +1044,21 @@ impl Members {
         let now = self.store.now();
         let members: Vec<MemberReport> = members.into_values().collect();
         Ok(storage_health(&members, now, self.config.freshness()))
+    }
+
+    /// The protocol version each member with a live row registered naming (`None`: the row
+    /// names none, as a row written before the field existed). A member the map holds
+    /// whose row has lapsed (`Down`) is not here: its row, which held the version, expired
+    /// with the heartbeats, so a reader treats it as not known.
+    ///
+    /// # Errors
+    /// The store failing; a stored row not decoding.
+    pub fn protocols(&self) -> Result<BTreeMap<MemberId, Option<u32>>, MembershipError> {
+        Ok(self
+            .read_rows()?
+            .into_iter()
+            .map(|(id, live)| (id, live.protocol))
+            .collect())
     }
 
     fn read_rows(&self) -> Result<BTreeMap<MemberId, Live>, MembershipError> {

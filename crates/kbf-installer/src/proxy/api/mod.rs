@@ -22,34 +22,53 @@
 //! `POST` checks the request (409 and 422 cases), saves its `request_id`, writes a
 //! `frontend_update` order (a locator; the root half fetches, verifies and stages without
 //! flipping, FP section 2) and answers 202 with phase `accepted`. From then on the API
-//! reads `status.json` on every status read and on [`actor::Api::tick`]:
+//! reads `status.json` on every call that matters to it and on the actor's own tick
+//! ([`actor::ActorTiming::tick`]):
 //!
 //! - `state: fetching` is phase `fetching`;
-//! - `state: refused` for an order at or after ours is phase `failed` with the refusal
-//!   word as `failure.reason` ([`refusal`]); no child is started;
+//! - `state: refused` with `refused_order_id` naming our order is phase `failed` with the
+//!   refusal word as `failure.reason` ([`refusal`]); no child is started;
 //! - `staged_commit` equal to ours with `staged{}` facts runs the compatibility gate, and
 //!   a compatible release is handed to the [`traits::Supervisor`], which owns every later
 //!   phase; an incompatible one fails the update and a `revert` order drops the staged
-//!   release.
+//!   release;
+//! - none of these within [`core::StagingDeadline`] of the order (default 15 minutes)
+//!   fails the update with `failure{step: stage, reason: timeout}` and a `revert` order
+//!   drops whatever the installer may still stage. This is the end of an update whose
+//!   order was lost, whose refusal `status.json` does not name, whose installer is dead,
+//!   or whose `status.json` cannot be read (the deadline does not wait for the file);
+//!   without it such an update would stay `accepted` and block every later one.
 //!
 //! The phase `verifying` is never reported by the API: `status.json` has no state between
 //! `fetching` and `staged`.
+//!
+//! A staging update survives a restart of the process: its deadline is written with its
+//! `request_id` ([`idempotency::Waiting`]), and a new [`core::Core`] takes the update up
+//! again with the deadline the first one set. An update that was handed over or has ended
+//! is not taken up again (the supervisor has the first; the second is `request_id_retired`
+//! to a retry).
 //!
 //! # Assumptions on open questions (each lives in one place)
 //!
 //! - **Order ids (Q1).** `order_id`, `epoch` and `generation` come from the
 //!   [`traits::OrderWriter`]; the API does not know where their counter lives.
-//! - **Which refusal is ours (Q1).** `status.json` has one `refusal` string and
-//!   `acked_order_id`; a `refused` state whose `acked_order_id` is at least our order's id
-//!   is ours ([`core::Core::advance`]). A stale refusal has a lower id.
+//! - **Which refusal is ours (Q1).** `status.json` has one `refusal` string for the last
+//!   thing the installer refused, with no name for the order. `acked_order_id` is the id of
+//!   the last node order acted on: a `frontend_update` has a floor of its own, which a
+//!   refusal does not move, and another writer's ids on the host may be any size, so it
+//!   cannot attribute a refusal. The API reads `refused_order_id`
+//!   ([`traits::InstallerStatus`]) and a refusal is an update's own only when that names
+//!   its order ([`core::Core::advance`]); a stale refusal names an older order, or none.
+//!   The root half does not write the field yet, so today a refusal ends its update at
+//!   the staging deadline, with reason `timeout`, not with its own word.
 //! - **Compatibility before the fetch (Q1, U9).** `POST` asks the gate with no facts, so
 //!   a 409 `incompatible` or 422 at `POST` time is possible only for what U9 can know
 //!   without the release; the verdict on the staged facts arrives as `failed` /
 //!   `step: compat` ([`traits::CompatGate`]).
 //! - **Request map (Q5).** `requests.json` in the proxy state directory is this module's
 //!   own file ([`idempotency`]); `update.json` (the swap's intent) is U7's.
-//! - **Restart marker (FP section 10).** The path of the postinst marker is not fixed by
-//!   the design; [`traits::RestartMarker`] takes it from the caller.
+//! - **Restart pending (FP section 10).** `restart_pending` is asked of the caller's
+//!   [`traits::RestartPending`]; the proxy passes its `RunningBinary`. No marker file.
 //! - **The confirm window** the orders ask for is [`core::Config::window_s`].
 //! - **Operator port forwards.** `/v1/update/pause` and `/v1/update/resume` are the paths
 //!   of the two forwarded verbs (FP names `/pause`, `/resume` under `/v1/update`).
@@ -78,14 +97,28 @@
 //!   ports.
 //!
 //! U7b implements [`traits::Supervisor`] over the real children and the `confirm`
-//! order; U8b implements [`traits::OrderWriter`] over `orders/` and the counter,
-//! [`traits::Forwarder`] over the operator port, a hyper listener that builds
-//! `Request<Bytes>` (with a [`auth::PeerKey`] extension) and calls [`router::Router::call`],
-//! the timer that calls [`actor::Api::tick`], and the OIDC [`auth::Authorize`] (#1088).
+//! order; U8b implements [`traits::OrderWriter`] over `orders/` and the counter and the
+//! OIDC [`auth::Authorize`] (#1088).
+//!
+//! # How a listener hosts the API
+//!
+//! [`handler::Handler`] is the API behind plain values: a listener that has authenticated
+//! a caller calls [`handler::Handler::handle`] with `{method, path, body}` and gets
+//! `{status, headers, body}`. The router's own token check, rate limit and operator-port
+//! forwarding are not in that path (the listener authenticates, and sends the forwarded
+//! paths on itself). Two promises come with it:
+//!
+//! - **The actor never runs on the listener's runtime** ([`actor`]): it has a thread of
+//!   its own, ticks on it, and a caller waits for it at most [`actor::ActorTiming::deadline`]
+//!   (then 503), so a stalled `status.json` read or fleet read stalls no one else.
+//! - **The actor's death is not silent**: `on_death` of [`handler::Handler::start`] runs
+//!   once on the actor's thread when the actor dies of a crash or a panic, and the
+//!   listener passes what stops its process. Every request after that is a 503.
 
 pub mod actor;
 pub mod auth;
 pub mod core;
+pub mod handler;
 pub mod idempotency;
 pub mod model;
 pub mod refusal;
@@ -93,12 +126,18 @@ pub mod router;
 pub mod traits;
 
 #[cfg(test)]
+mod actor_tests;
+#[cfg(test)]
 mod auth_tests;
 #[cfg(test)]
 mod fakes;
 #[cfg(test)]
+mod handler_tests;
+#[cfg(test)]
 mod idempotency_tests;
 #[cfg(test)]
 mod router_tests;
+#[cfg(test)]
+mod staging_tests;
 #[cfg(test)]
 mod tests;

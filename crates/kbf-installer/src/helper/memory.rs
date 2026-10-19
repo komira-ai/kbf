@@ -41,6 +41,10 @@ pub struct Memory {
     /// order never advances or blocks the node's, and the reverse.
     pub frontend_order_id: u64,
     pub frontend_epoch: u64,
+    /// The id of the newest order acted on, of either kind: what `status.json` reports as
+    /// `acked_order_id` when it is above the node floor, so the proxy sees its own orders
+    /// (they ride the frontend floor) acknowledged.
+    pub last_acted_id: u64,
     pub event: Event,
     /// Why the last order was refused, or what was reverted.
     pub refusal: String,
@@ -51,6 +55,13 @@ pub struct Memory {
     /// before the restart, so a crash between the two restarts on the next cycle.
     pub restart_due: bool,
     pub staged: Option<StagedFacts>,
+    /// The profile that release declared (`--version --json`), shown beside its facts; a field
+    /// of its own rather than of [`StagedFacts`], which the proxy's tests build as a literal.
+    /// `None` in a `helper.json` written before the proxy read it.
+    pub staged_profile: Option<String>,
+    /// When the last swap was made, in seconds since the epoch; 0 when none was. Orders
+    /// closer to it than `min_activation_interval_s` are refused.
+    pub last_activation_at: u64,
     /// A fetch is in progress (only while a pass runs; never stored, so a crash cannot
     /// leave it set).
     #[serde(skip)]

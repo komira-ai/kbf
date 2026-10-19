@@ -1,0 +1,33 @@
+[package]
+name = "kbf-bake"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The 24 hour bake evaluator of the gamma stage (docs/design/kbf-cicd.md, section 7): it
+# scrapes the farm's metrics endpoint, keeps the bake's clock in a state file so a restart
+# does not restart it, decides the gates of the table (src/table.rs, which a test holds equal
+# to the page's table) and writes `gamma-verdict.json` in the shape kbf-gate defines. It
+# runs on the operator's side, never in a GitHub Actions job (crates/kbf-it/tests/
+# repo_lints.rs refuses its name under .github/). Its only kbf dependency is kbf-gate, and
+# it links no async runtime (crates/kbf-it/tests/layering.rs).
+[[bin]]
+name = "kbf-bake"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+kbf-gate.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# RFC 3339 times for the invocation list's `since` and `until`.
+time.workspace = true
+# The metrics scrape: a blocking GET of a plain-HTTP endpoint.
+ureq.workspace = true
+
+[lints]
+workspace = true
