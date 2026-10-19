@@ -606,8 +606,11 @@ async fn until_served_by(addr: SocketAddr, ca: &Path) {
 /// signal still answers afterwards; the verb is still running, and then stops on SIGTERM with 0.
 #[tokio::test(flavor = "current_thread")]
 async fn sighup_serves_the_renewed_certificate_and_cuts_no_stream() {
-    let (path, ca_a) = served_config("hup-reload");
+    let (path, served_ca) = served_config("hup-reload");
     let dir = path.parent().expect("dir").to_owned();
+    // The file the proxy reads is replaced below; the client keeps trusting a copy of the old one.
+    let ca_a = dir.join("a-ca.pem");
+    fs::copy(&served_ca, &ca_a).expect("copy the old CA");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let mut child = start_masked(&path, &listener, Stdio::piped(), true);
@@ -624,9 +627,10 @@ async fn sighup_serves_the_renewed_certificate_and_cuts_no_stream() {
     tokio::spawn(connection);
 
     let ca_b = issue(&dir, "b-");
-    for file in ["server.pem", "server.key", "ca.pem"] {
+    for file in ["server.pem", "server.key"] {
         fs::rename(dir.join(format!("b-{file}")), dir.join(file)).expect("replace");
     }
+    fs::copy(&ca_b, &served_ca).expect("replace the client CA");
     // Before the signal nothing changes: a renewal alone reloads nothing.
     assert!(
         try_tls(addr, &ca_b).await.is_err(),
@@ -666,8 +670,10 @@ async fn sighup_serves_the_renewed_certificate_and_cuts_no_stream() {
 /// unusable and names the key file. A later SIGHUP with the key back reloads.
 #[tokio::test(flavor = "current_thread")]
 async fn a_sighup_with_a_missing_key_keeps_the_old_certificate_and_names_the_file() {
-    let (path, ca_a) = served_config("hup-missing-key");
+    let (path, served_ca) = served_config("hup-missing-key");
     let dir = path.parent().expect("dir").to_owned();
+    let ca_a = dir.join("a-ca.pem");
+    fs::copy(&served_ca, &ca_a).expect("copy the old CA");
     let log = dir.join("verb.log");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -686,7 +692,7 @@ async fn a_sighup_with_a_missing_key_keeps_the_old_certificate_and_names_the_fil
     // unit, so none of them may apply.
     let ca_b = issue(&dir, "b-");
     fs::rename(dir.join("b-server.pem"), dir.join("server.pem")).expect("replace");
-    fs::rename(dir.join("b-ca.pem"), dir.join("ca.pem")).expect("replace");
+    fs::copy(&ca_b, &served_ca).expect("replace the client CA");
     let key = dir.join("server.key");
     fs::rename(&key, dir.join("old.key")).expect("move the key away");
     send(&child, libc::SIGHUP);
