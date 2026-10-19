@@ -814,6 +814,37 @@ fn the_directories_come_from_the_flags_the_units_carry() {
     );
 }
 
+/// A SQLite state file in a directory no other flag makes (the rendered units have none
+/// today: the all-in-one's is in `--data-dir`) gets its directory made, 0700, once. Catches
+/// the directory of a `sqlite://` file left for kbf to make, and one made again beside
+/// the data directory's own mode.
+#[test]
+fn a_sqlite_state_files_directory_is_made_unless_another_flag_made_it() {
+    let dirs = |flags: &str| {
+        let unit = UnitFile::parse(&format!(
+            "[Service]\nExecStart=/usr/local/bin/kbf all-in-one {flags}\n"
+        ))
+        .expect("a unit");
+        directories(&unit)
+            .expect("directories")
+            .into_iter()
+            .map(|(p, bits)| format!("{p} {bits:o}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        dirs("--state-store=sqlite:///srv/kbf/state/state.db"),
+        ["/srv/kbf/state 700"]
+    );
+    assert_eq!(
+        dirs("--data-dir=/srv/kbf --state-store=sqlite:///srv/kbf/state.db"),
+        ["/srv/kbf 755"]
+    );
+    assert_eq!(
+        dirs("--state-store=postgres:///kbf?host=/run/postgresql"),
+        Vec::<String>::new()
+    );
+}
+
 /// The live failure: `storage-and-daemon` runs as `KBF_USER` and its `--hot-store` sat
 /// under `/var/lib/kbf-server`, the server account's, mode 0700. The scratch host cannot
 /// chown, so the unit's user has another uid than the test's (the owner of every
