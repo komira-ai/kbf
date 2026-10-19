@@ -5,10 +5,11 @@
 //! `run`, `boot-check` and the operator's verbs (`confirm`, `revert`, `rollback`, `gc`,
 //! `quiesce`) keep their own checks: they work on a scratch root as an ordinary user.
 
+use std::ffi::CString;
+use std::io;
 use std::io::Write;
-use std::os::unix::process::CommandExt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread::sleep;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -137,7 +138,7 @@ fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Re
             Flow::Continue => {}
             Flow::Reexec => {
                 eprintln!("kbf-installer: my file was replaced; starting the new one");
-                let err = Command::new(me).args(std::env::args_os().skip(1)).exec();
+                let err = reexec(me);
                 return Err(format!("cannot start {}: {err}", me.display()).into());
             }
         }
@@ -278,3 +279,24 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;
+
+/// Start `me` in this process's place with this process's arguments; returns only the error
+/// of a start that failed. Not `Command::exec`: the standard library puts SIGPIPE back to its
+/// default in the calling process before it execs, and when the exec then fails that process
+/// carries on with the default (a write to a pipe nobody reads ends it by a signal instead of
+/// failing with an error). `execv` changes no disposition, and the program that starts is
+/// this one, which ignores SIGPIPE itself.
+fn reexec(me: &Path) -> io::Error {
+    let arg = |s: &std::ffi::OsStr| CString::new(s.as_bytes());
+    let mut argv = vec![arg(me.as_os_str())];
+    argv.extend(std::env::args_os().skip(1).map(|a| arg(&a)));
+    let Ok(argv) = argv.into_iter().collect::<Result<Vec<_>, _>>() else {
+        return io::Error::new(io::ErrorKind::InvalidInput, "an argument holds a NUL byte");
+    };
+    let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    // SAFETY: `ptrs` is a null-terminated array of pointers to NUL-terminated strings that
+    // live (in `argv`) across the call; execv returns only on failure.
+    unsafe { libc::execv(ptrs[0], ptrs.as_ptr()) };
+    io::Error::last_os_error()
+}
