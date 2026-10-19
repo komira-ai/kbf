@@ -11,6 +11,8 @@
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
 //! | `meta/members_formed` | nothing | for ever: the cluster has had an `Active` member |
+//! | `meta/members_forming` | nothing | a minute from the first `Active` member |
+//! | `unfilled/<id>` | nothing | for ever, until the member is made `Active` |
 //! | `deny/<kind>/<value>` | the reason and the time it was added | for ever, until [`Members::allow`] |
 //!
 //! and the counters `member-id` and `boot/<id>`. The store assigns both numbers, so no
@@ -64,6 +66,10 @@
 //! nodes do not enforce `min_protocol` themselves, and a floor this build lifts reaches the
 //! stored map with the next change of members, not on its own.
 //!
+//! **Joiners.** A node the farm has not seen before, registering after the farm's first
+//! bootstrap minute, is `Joining` with an `unfilled/<id>` mark and is promoted by
+//! [`Members::set_state`] only (module `join`); the paragraph below is for the others.
+//!
 //! **Promotion.** A node's own request moves it in two ways only. A registration saying the
 //! index is whole ([`Progress::CaughtUp`]) writes `Active`, so a rolling restart leaves
 //! every member `Active`; a registration saying it is rebuilding ([`Progress::CatchingUp`])
@@ -109,6 +115,7 @@ use crate::worker::named_protocol;
 
 mod denials;
 pub use denials::Denial;
+mod join;
 
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
@@ -629,16 +636,14 @@ impl Members {
                 min: floor,
             });
         }
-        let (id, boot) = self.assign(&who.instance_id)?;
+        let (id, boot, fresh) = self.assign(&who.instance_id)?;
+        let state = self.admit(id, fresh, who.progress == Progress::CatchingUp)?;
         let member = Member {
             id,
             addr: who.addr.clone(),
             zone: who.zone.clone(),
             weight: who.weight,
-            state: match who.progress {
-                Progress::CatchingUp => MemberState::CatchingUp,
-                Progress::CaughtUp => MemberState::Active,
-            },
+            state,
             // Published in the map, so a restart inside the lease changes the member (and the
             // generation) even when nothing else about it did.
             boot,
@@ -648,26 +653,27 @@ impl Members {
         Ok(Registration { id, boot, map })
     }
 
-    /// The id of `instance` (assigned on first sight) and a new boot counter for it.
-    fn assign(&self, instance: &str) -> Result<(MemberId, u64), MembershipError> {
+    /// The id of `instance` (assigned on first sight) and a new boot counter for it, and
+    /// whether this is the first time the farm sees the instance.
+    fn assign(&self, instance: &str) -> Result<(MemberId, u64, bool), MembershipError> {
         let key = instance_key(instance);
         for _ in 0..ATTEMPTS {
-            let (id, txn) = match self.store.get(&key)? {
+            let (id, txn, fresh) = match self.store.get(&key)? {
                 Some(known) => {
                     let id = MemberId(decode_id(&known.value)?);
                     let txn = Txn::new().check(&key, Cond::Version(known.version));
-                    (id, txn.next(boot_counter(id)))
+                    (id, txn.next(boot_counter(id)), false)
                 }
                 None => {
                     // A counter has no precondition, so it cannot conflict.
                     let taken = self.store.txn(Txn::new().next(ID_COUNTER))?;
                     let id = MemberId(taken.map_err(|_| MembershipError::Contended)?.counters[0]);
                     let txn = Txn::new().put(&key, id.0.to_be_bytes(), Cond::Absent);
-                    (id, txn.next(boot_counter(id)))
+                    (id, txn.next(boot_counter(id)), true)
                 }
             };
             if let Ok(commit) = self.store.txn(txn)? {
-                return Ok((id, commit.counters[0]));
+                return Ok((id, commit.counters[0], fresh));
             }
         }
         Err(MembershipError::Contended)
@@ -701,7 +707,10 @@ impl Members {
             };
             let mut txn = Txn::new();
             if member.state == MemberState::Active {
-                txn = txn.put(FORMED, Vec::new(), Cond::Any);
+                txn = self.formed(txn)?;
+            }
+            if member.state == MemberState::Joining {
+                txn = txn.put(join::unfilled_key(member.id), Vec::new(), Cond::Any);
             }
             let txn = txn
                 .put_ttl(
@@ -814,7 +823,7 @@ impl Members {
                 Cond::Version(stored.version),
             );
             if live.member.state == MemberState::Active && before != MemberState::Active {
-                put = put.put(FORMED, Vec::new(), Cond::Any);
+                put = self.formed(put)?.delete(join::unfilled_key(id), Cond::Any);
             }
             if self.store.txn(put)?.is_ok() {
                 return Ok(live.member.state != before);
