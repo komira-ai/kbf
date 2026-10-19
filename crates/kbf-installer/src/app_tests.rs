@@ -261,6 +261,22 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
     assert!(err.starts_with("kbf-installer:"), "{err}");
 }
 
+/// Catches `run` not waiting between passes, or not stopping after the last: two passes on a
+/// host take one `PASS_INTERVAL` (the only wait, none after the last pass) and exit 0.
+///
+/// Mutants to plant: the wait dropped (the test finishes in well under the interval); the
+/// wait taken after the last pass too (it takes two intervals).
+#[test]
+fn run_waits_one_interval_between_two_passes_and_not_after_the_last() {
+    let (_, root) = seeded("run-two-passes");
+    let began = std::time::Instant::now();
+    let (exit, err) = on(&root, &["run", "--passes", "2", "--unit", "kbf.service"]);
+    let took = began.elapsed();
+    assert_eq!(exit, Exit::Ok, "{err}");
+    assert!(took >= PASS_INTERVAL, "{took:?}");
+    assert!(took < PASS_INTERVAL * 2, "{took:?}");
+}
+
 /// Catches a boot check that does not count a start or that guesses on a state it cannot
 /// read: with a swap on trial the first start is counted (exit 0), the last start's revert
 /// needs root and so refuses an ordinary user (exit 1), a ruined state refuses (exit 1), and
@@ -424,4 +440,328 @@ fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
         exit(Operator::NeedsOperator("x".to_owned())),
         Exit::NeedsOperator
     );
+}
+
+/// Catches a frontend or all-in-one unit that activates releases with no database migration
+/// and no warning: `run` for the unit of either mode refuses (exit 2, one line) unless
+/// `--installer-config` is given, before it touches the host; a unit of a mode with no
+/// database (or a launchd label, which names no mode) still runs without one; and a config
+/// that cannot be read stops the service rather than starting it without the step.
+///
+/// Mutants seen red: the unit check removed (the all-in-one unit ran its pass); the unit
+/// check matching `kbf-frontend` without the `@` (the plain `kbf-frontend.service` refused);
+/// the all-in-one template (`kbf-all-in-one@1.service`) is in the test list.
+#[test]
+fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
+    let (_, root) = seeded("run-database");
+    for unit in [
+        "kbf-all-in-one.service",
+        "kbf-all-in-one@1.service",
+        "kbf-frontend@main.service",
+    ] {
+        let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
+        assert_eq!(exit, Exit::Usage, "{unit}: {err}");
+        assert_eq!(
+            err,
+            "kbf-installer: run needs --installer-config on a frontend or all-in-one host \
+             (the database is migrated before a release is activated)\n",
+            "{unit}"
+        );
+        assert!(
+            !root.join("var/lib/kbf-installer/status.json").exists(),
+            "{unit}: nothing was done before the refusal"
+        );
+    }
+    for unit in ["kbf.service", "kbf-daemon.service", "kbf-frontend.service"] {
+        let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
+        assert_eq!(exit, Exit::Ok, "{unit}: {err}");
+    }
+    let (exit, err) = on(
+        &root,
+        &["run", "--passes", "1", "--launchd-label", "com.example.kbf"],
+    );
+    assert_eq!(exit, Exit::Ok, "a label names no mode: {err}");
+    let (exit, err) = on(
+        &root,
+        &[
+            "run",
+            "--passes",
+            "1",
+            "--unit",
+            "kbf-all-in-one.service",
+            "--installer-config",
+            "/etc/kbf/missing.toml",
+        ],
+    );
+    assert_eq!(exit, Exit::Failed, "{err}");
+    assert!(err.contains("missing.toml"), "{err}");
+}
+
+/// Catches a relative `--installer-config` (on `run` or `setup`) being quietly re-rooted
+/// under `/` and read from somewhere the operator did not name: both flags take a host path
+/// like `--update-dir` does, so a relative one is a usage error (clap, exit 2), not a read.
+#[test]
+fn the_installer_config_flag_must_be_an_absolute_host_path() {
+    for args in [
+        &[
+            "run",
+            "--unit",
+            "kbf.service",
+            "--installer-config",
+            "etc/kbf/installer.toml",
+        ][..],
+        &[
+            "setup",
+            "--mode=frontend",
+            "--installer-config",
+            "./installer.toml",
+        ][..],
+    ] {
+        let mut full = vec!["kbf-installer"];
+        full.extend_from_slice(args);
+        assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
+    }
+}
+
+/// Catches the success line of the database step of `setup` going nowhere or in the wrong
+/// shape: text mode prints the bare line, `--json` one object with the verb, `--apply` and
+/// the message. (The step itself needs a Postgres server; CI's state-postgres job runs it.)
+#[test]
+fn the_database_step_prints_its_line_as_text_or_json() {
+    let mut text = Vec::new();
+    print_success(
+        false,
+        true,
+        "setup",
+        "kbf-installer setup (frontend): database step: x",
+        &mut text,
+    );
+    assert_eq!(
+        String::from_utf8(text).expect("text"),
+        "kbf-installer setup (frontend): database step: x\n"
+    );
+    let mut json = Vec::new();
+    print_success(true, false, "setup", "the line", &mut json);
+    let object: serde_json::Value = serde_json::from_slice(&json).expect("one object");
+    assert_eq!(
+        object,
+        serde_json::json!({"verb": "setup", "apply": false, "message": "the line"})
+    );
+}
+
+/// Catches `setup` taking the database step for a mode with no database, or demanding root
+/// for the step that does not need it: as an ordinary user `--mode frontend` and
+/// `all-in-one` read installer.toml (a missing file is a failure that names it, exit 1),
+/// the other modes stay behind the root check (exit 2, config not read).
+#[test]
+fn setup_does_the_database_step_for_two_modes_without_root() {
+    let (_, root) = seeded("setup-database");
+    for mode in ["frontend", "all-in-one"] {
+        let (exit, err) = on(&root, &["setup", "--mode", mode]);
+        assert_eq!(exit, Exit::Failed, "{mode}: {err}");
+        assert!(err.contains("installer.toml"), "{mode}: {err}");
+    }
+    for mode in ["storage", "daemon", "storage-and-daemon"] {
+        let (exit, err) = on(&root, &["setup", "--mode", mode]);
+        assert_eq!(exit, Exit::Usage, "{mode}: {err}");
+        assert!(err.contains("setup needs root"), "{mode}: {err}");
+    }
+}
+
+/// Catches `run --installer-config` not attaching the schema step to the helper it drives
+/// (the helper tests attach a fake directly, and the Postgres tests never go through `run`):
+/// the helper `run` builds from a config naming a database refuses a release's schema with
+/// the database's own error (the socket directory does not exist, so no server is needed),
+/// and one built without the flag has no step.
+///
+/// Mutants seen red: the `set_schema_step` call removed from `build_helper`.
+#[test]
+fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
+    let (_, root) = seeded("run-schema-step");
+    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
+    fs::write(
+        root.join("etc/kbf/installer.toml"),
+        "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n",
+    )
+    .expect("config");
+    let with = |extra: &[&str]| {
+        let mut argv = vec!["--root", root.to_str().expect("text")];
+        argv.extend_from_slice(&RUN);
+        argv.extend_from_slice(extra);
+        let Verb::Run(args) = parse(&argv).verb else {
+            panic!("a run");
+        };
+        match build_helper(root.clone(), &args) {
+            Ok(helper) => helper,
+            Err(f) => panic!("{}", f.why),
+        }
+    };
+    let mut helper = with(&["--installer-config", "/etc/kbf/installer.toml"]);
+    let step = helper.schema_step_mut().expect("the step is attached");
+    let why = step.before_start(1).expect_err("no server to migrate");
+    assert!(!why.is_empty());
+    assert!(with(&[]).schema_step_mut().is_none(), "no flag, no step");
+}
+
+/// Catches the database step's three dry-run lines and its apply line going wrong: a fresh
+/// database would be created, an older one migrated, a current one left alone, and an apply
+/// says what the schema runner did (the lines need no server, so they are tested here).
+///
+/// Mutants to plant: the `v < newest` guard flipped (a behind schema says nothing to do).
+#[test]
+fn the_database_step_lines_say_create_migrate_or_nothing() {
+    assert_eq!(
+        dry_run_line("frontend", None, 3),
+        "kbf-installer setup (frontend): database step: dry run: would create the schema at version 3"
+    );
+    assert_eq!(
+        dry_run_line("frontend", Some(1), 3),
+        "kbf-installer setup (frontend): database step: dry run: would migrate the schema from 1 to 3"
+    );
+    assert_eq!(
+        dry_run_line("all-in-one", Some(3), 3),
+        "kbf-installer setup (all-in-one): database step: dry run: the schema is at 3, nothing to do"
+    );
+    let outcome = Outcome {
+        from: None,
+        to: 2,
+        ran: vec![1, 2],
+    };
+    assert_eq!(
+        apply_line("frontend", &outcome),
+        "kbf-installer setup (frontend): database step: created the schema at version 2"
+    );
+}
+
+/// Catches a successful verb that returned a line printing nothing or not exiting 0, and one
+/// without a line printing something (the only verb with a line, the database step, needs a
+/// server, so the reporting is tested on its own).
+#[test]
+fn a_successful_verb_prints_its_line_only_when_it_has_one() {
+    let cli = parse(&["setup", "--mode=frontend"]);
+    let mut out = Vec::new();
+    assert_eq!(report(None, &cli, "setup", &mut out), Exit::Ok);
+    assert!(out.is_empty());
+    assert_eq!(
+        report(Some("the line".into()), &cli, "setup", &mut out),
+        Exit::Ok
+    );
+    assert_eq!(String::from_utf8(out).expect("text"), "the line\n");
+}
+
+/// Catches the database step's failures being swallowed: with the socket directory missing
+/// (no server needed), a dry run and an apply as an ordinary user each fail with exit 1 and
+/// the database's own reason, for the mode's name in the line.
+#[test]
+fn the_database_step_fails_with_the_reason_when_the_server_cannot_be_reached() {
+    let (_, root) = seeded("setup-database-down");
+    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
+    fs::write(
+        root.join("etc/kbf/installer.toml"),
+        "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n",
+    )
+    .expect("config");
+    for extra in [&[][..], &["--apply"][..]] {
+        let mut argv = vec!["setup", "--mode", "frontend"];
+        argv.extend_from_slice(extra);
+        let (exit, err) = on(&root, &argv);
+        assert_eq!(exit, Exit::Failed, "{extra:?}: {err}");
+        assert!(err.starts_with("kbf-installer: "), "{extra:?}: {err}");
+        assert!(!err.contains("installer.toml"), "{extra:?}: {err}");
+    }
+}
+
+/// Catches the database step reading `installer.toml` under a host root that is not an
+/// absolute path (the root is the sandbox flag's, and a relative one is refused with its
+/// reason rather than reading from the working directory).
+#[test]
+fn the_database_step_refuses_a_relative_host_root() {
+    let (exit, err) = on(Path::new("relative-root"), &["setup", "--mode", "frontend"]);
+    assert_eq!(exit, Exit::Failed, "{err}");
+    assert!(err.starts_with("kbf-installer: "), "{err}");
+}
+
+/// A schema runner that answers as told, standing in for a server.
+struct FakeSchema {
+    setup: Result<Outcome, String>,
+    plan: Result<(Option<u32>, u32), String>,
+}
+
+impl SchemaOps for FakeSchema {
+    fn setup(&self) -> Result<Outcome, String> {
+        self.setup.clone()
+    }
+
+    fn plan(&self) -> Result<(Option<u32>, u32), String> {
+        self.plan.clone()
+    }
+}
+
+/// Catches the database step printing the wrong line once the schema runner answers, or
+/// swallowing its error: `--apply` prints the outcome, a dry run prints create, migrate or
+/// nothing to do, and a runner's error is the failure. The fake answers an error to
+/// the question the step must not ask, so asking it fails the test.
+///
+/// Mutants to plant: `apply` flipped; the error mapped to an empty line.
+#[test]
+fn the_database_step_prints_what_the_schema_runner_answered() {
+    let outcome = Outcome {
+        from: None,
+        to: 2,
+        ran: vec![1, 2],
+    };
+    let fake = |plan| FakeSchema {
+        setup: Ok(outcome.clone()),
+        plan,
+    };
+    assert_eq!(
+        database_step(&fake(Err("unused".into())), "frontend", true)
+            .unwrap_or_else(|f| panic!("applied: {}", f.why)),
+        "kbf-installer setup (frontend): database step: created the schema at version 2"
+    );
+    for (found, tail) in [
+        (None, "would create the schema at version 3"),
+        (Some(1), "would migrate the schema from 1 to 3"),
+        (Some(3), "the schema is at 3, nothing to do"),
+    ] {
+        assert_eq!(
+            database_step(&fake(Ok((found, 3))), "all-in-one", false)
+                .unwrap_or_else(|f| panic!("planned: {}", f.why)),
+            format!("kbf-installer setup (all-in-one): database step: dry run: {tail}")
+        );
+    }
+    let broken = FakeSchema {
+        setup: Err("no server".into()),
+        plan: Err("cannot ask".into()),
+    };
+    let apply = database_step(&broken, "frontend", true).expect_err("setup failed");
+    assert_eq!(apply.why, "no server");
+    assert!(matches!(apply.exit, Exit::Failed));
+    let plan = database_step(&broken, "frontend", false).expect_err("plan failed");
+    assert_eq!(plan.why, "cannot ask");
+}
+
+/// Catches the real `Database` not being what `setup`'s database step asks (the fake tests
+/// drive `database_step` alone): with an installer.toml naming a socket directory that does
+/// not exist, both `setup --mode frontend` and `setup --mode frontend --apply` reach the
+/// database and fail with its own error (exit 1), as the ordinary user the step needs no
+/// server to be tested for. No server is started.
+///
+/// Mutants to plant: `Database::plan` or `Database::setup` swapped in `impl SchemaOps`.
+#[test]
+fn setup_asks_the_real_database_and_reports_its_error() {
+    let (_, root) = seeded("setup-real-database");
+    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
+    fs::write(
+        root.join("etc/kbf/installer.toml"),
+        "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n",
+    )
+    .expect("config");
+    for extra in [&[][..], &["--apply"][..]] {
+        let mut argv = vec!["setup", "--mode", "frontend"];
+        argv.extend_from_slice(extra);
+        let (exit, err) = on(&root, &argv);
+        assert_eq!(exit, Exit::Failed, "{extra:?}: {err}");
+        assert!(!err.contains("installer.toml"), "{extra:?}: {err}");
+    }
 }

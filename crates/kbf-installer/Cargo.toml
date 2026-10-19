@@ -42,6 +42,8 @@ httparse.workspace = true
 hyper.workspace = true
 kbf-host.workspace = true
 kbf-proto.workspace = true
+# `postgres`: the schema's migrations and the client that applies them (`database` module).
+kbf-state = { workspace = true, features = ["postgres"] }
 kbf-update.workspace = true
 libc.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
@@ -62,6 +64,7 @@ rcgen.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
 kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
 kbf-update.workspace = true
+postgres.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
 tracing-subscriber.workspace = true
 

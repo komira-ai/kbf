@@ -10,7 +10,9 @@
 //!   `ContentAddressableStorage` (the chunking calls too) and `kbf.worker.v1.Segments`, and
 //!   fetches the release it was offered (`kbf.update.v1.ReleaseService/Fetch`).
 //! - The storage role registers and heartbeats (`kbf.map.v1.Membership`); a storage
-//!   node gets the map in those answers.
+//!   node gets the map in those answers. It also fetches the farm's registered cold store
+//!   and its keys (`kbf.enroll.v1.ColdStore/GetStoreConfig`): the only method that
+//!   carries the secret, so the only row a daemon or frontend certificate must never reach.
 //! - The frontend role may call nothing here.
 //!
 //! A method not in the table is refused PERMISSION_DENIED, whatever the certificate and
@@ -95,6 +97,8 @@ pub const WORKER_LISTENER_ROLES: &[(&str, &[PeerRole])] = &[
     ("/kbf.worker.v1.Segments/ReadRange", DAEMON),
     ("/kbf.map.v1.Membership/Register", STORAGE),
     ("/kbf.map.v1.Membership/Heartbeat", STORAGE),
+    // The registered cold store and its keys (`crate::store_config`): storage nodes only.
+    ("/kbf.enroll.v1.ColdStore/GetStoreConfig", STORAGE),
 ];
 
 /// The roles that may call `path` on the worker listener; `None` if it is not served.

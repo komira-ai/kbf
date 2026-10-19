@@ -38,6 +38,7 @@ struct Raw {
     min_activation_interval_s: Option<u32>,
     node_cert: Option<String>,
     node_key: Option<String>,
+    database: Option<String>,
 }
 
 /// Where releases are fetched from.
@@ -64,6 +65,11 @@ pub struct InstallerToml {
     /// The node identity the fetch child is lent, for the frontend source.
     pub node_cert: Option<PathBuf>,
     pub node_key: Option<PathBuf>,
+    /// The state database of a frontend or all-in-one host: a `postgres://` URL without a
+    /// password (the file is world-readable). `crate::database` reads this file a second time,
+    /// leniently (only this key, and it refuses a password); this field exists so that the
+    /// closed reader here does not reject the key, and it has no other consumer.
+    pub database: Option<String>,
 }
 
 impl Default for InstallerToml {
@@ -80,6 +86,7 @@ impl Default for InstallerToml {
             min_activation_interval_s: 60,
             node_cert: None,
             node_key: None,
+            database: None,
         }
     }
 }
@@ -294,6 +301,7 @@ impl InstallerToml {
                 min_activation_interval_s,
                 node_cert,
                 node_key,
+                database: raw.database,
             }),
             _ => Err(ConfigError::Invalid(problems)),
         }
@@ -338,8 +346,26 @@ impl InstallerToml {
         if let Some(p) = &self.node_key {
             out.push_str(&format!("node_key = \"{}\"\n", p.display()));
         }
+        if let Some(url) = &self.database {
+            out.push_str(&format!("database = {}\n", toml_string(url)));
+        }
         out
     }
+}
+
+/// `text` as a TOML basic string: Rust's `{:?}` is not TOML (it writes `\'` and `\u{..}`).
+fn toml_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]

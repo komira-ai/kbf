@@ -10,6 +10,7 @@ use crate::control::{ProxySnapshot, SlotStats};
 use crate::hold::{HoldLimits, HoldQueue};
 use crate::metrics::Metrics;
 use crate::pool::{Connector, Pool};
+use crate::security::Security;
 use crate::slot::{ActiveSlot, Slot};
 
 /// The streams one downstream connection may have open at once. The connection window is this
@@ -28,23 +29,47 @@ pub(crate) struct Core {
     pub(crate) pool: Pool,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) limits: Limits,
+    pub(crate) security: Security,
     streams: AtomicUsize,
 }
 
 impl Core {
+    /// A core over fresh metrics: what the tests start from.
+    #[cfg(test)]
     pub(crate) fn new(
         table: UpstreamTable,
         limits: Limits,
         slots: ActiveSlot,
         connector: Connector,
+        security: Security,
     ) -> Arc<Self> {
-        let metrics = Arc::new(Metrics::default());
+        Self::with_metrics(
+            table,
+            limits,
+            slots,
+            connector,
+            security,
+            Arc::new(Metrics::default()),
+        )
+    }
+
+    /// As [`Core::new`], over `metrics` made earlier: what must be loaded before the secret
+    /// is created (the TLS files) counts its failures there.
+    pub(crate) fn with_metrics(
+        table: UpstreamTable,
+        limits: Limits,
+        slots: ActiveSlot,
+        connector: Connector,
+        security: Security,
+        metrics: Arc<Metrics>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             slots,
             queue: HoldQueue::new(HoldLimits::default()),
             pool: Pool::new(table, Arc::clone(&metrics), connector),
             metrics,
             limits,
+            security,
             streams: AtomicUsize::new(0),
         })
     }

@@ -1379,6 +1379,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-bake"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-gate",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
 name = "kbf-baseline"
 version = "0.1.0"
 dependencies = [
@@ -1663,7 +1675,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "x509-parser",
- "zeroize",
 ]
 
 [[package]]
@@ -1804,8 +1815,10 @@ dependencies = [
  "kbf-host",
  "kbf-installer",
  "kbf-proto",
+ "kbf-state",
  "kbf-update",
  "libc",
+ "postgres",
  "rcgen",
  "rustix",
  "serde",
@@ -1839,13 +1852,16 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "futures",
+ "h2",
  "hex",
+ "http",
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
  "kbf-installer",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-proxy",
  "kbf-server",
  "kbf-testkit",
  "kbf-threads",
@@ -1855,12 +1871,14 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustix",
+ "rustls",
  "saphyr-parser",
  "serde_json",
  "sha2 0.11.0",
  "syn 2.0.119",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tracing-subscriber",
  "xtask",
@@ -2087,6 +2105,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zeroize",
 ]
 
 [[package]]
@@ -2103,15 +2122,20 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kbf-peer",
+ "kbf-tls",
  "loom",
  "rcgen",
+ "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "subtle",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -4859,6 +4883,7 @@ dependencies = [
  "clap",
  "flate2",
  "hex",
+ "kbf-gate",
  "lzma-rs",
  "rcgen",
  "rustix",

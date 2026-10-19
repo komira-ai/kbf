@@ -255,12 +255,15 @@ pub(crate) fn bind(
 
 /// Serves `routes` on `listener` until it fails, or until `stop` completes and the
 /// requests in flight are answered; without a listener, it only waits for `stop`.
-pub(crate) fn serve_api(
-    listener: Option<tokio::net::TcpListener>,
+pub(crate) fn serve_api<L>(
+    listener: Option<L>,
     routes: axum::Router,
     stop: impl Future<Output = ()> + Send + 'static,
     proxy: Option<Arc<ProxySecret>>,
-) -> impl Future<Output = std::io::Result<()>> {
+) -> impl Future<Output = std::io::Result<()>>
+where
+    L: axum::serve::Listener<Io = tokio::net::TcpStream, Addr = SocketAddr>,
+{
     // Every route, the fallback too, sees only a call that passed the proxy check.
     let routes = routes.layer(axum::middleware::from_fn_with_state(proxy, gate_requests));
     match listener {

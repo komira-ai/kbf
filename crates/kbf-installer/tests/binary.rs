@@ -357,6 +357,111 @@ fn the_operator_verbs_exit_by_the_contract() {
     assert!(root.join("var/lib/kbf-installer/releases").join(A).exists());
 }
 
+fn installer_toml(root: &Path, body: &str) {
+    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
+    fs::write(root.join("etc/kbf/installer.toml"), body).expect("installer.toml");
+}
+
+/// Catches `setup` accepting a mode that keeps no state in the database, or going on when
+/// the config is wrong: `--mode storage` does not take the database step (it is the rest of
+/// `setup`, which needs root: exit 2, and the config is not read), a missing file or key
+/// exits 1 with a line that names the file and nothing from the URL.
+#[test]
+fn setup_takes_only_the_modes_with_a_database_and_names_a_bad_config() {
+    let root = root("setup-bad");
+    let out = helper(&root, &["setup", "--mode", "storage"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("setup needs root") && !said.contains("installer.toml"),
+        "{said}"
+    );
+    let out = helper(&root, &["setup", "--mode", "frontend"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("installer.toml"),
+        "{out:?}"
+    );
+    installer_toml(&root, "database = \"postgres://kbf:hunter2@db/kbf\"\n");
+    let out = helper(&root, &["setup", "--mode", "all-in-one", "--apply"]);
+    assert_eq!(out.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("password") && !said.contains("hunter2"),
+        "{said}"
+    );
+}
+
+/// `url` without the password of its `user:password@` part (the user stays). The installer
+/// refuses a URL with a password in the world-readable `installer.toml`, and CI's Postgres
+/// service trusts host connections, so the password in `KBF_TEST_POSTGRES_URL` is not needed.
+fn without_password(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let Some((userinfo, host)) = rest.split_once('@') else {
+        return url.to_owned();
+    };
+    let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
+    format!("{scheme}://{user}@{host}")
+}
+
+#[test]
+fn without_password_keeps_the_user_and_the_rest() {
+    assert_eq!(
+        without_password("postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres"),
+        "postgres://postgres@127.0.0.1:5432/postgres"
+    );
+    for same in ["postgres://u@h/db", "postgres:///db?host=/run/x"] {
+        assert_eq!(without_password(same), same);
+    }
+}
+
+/// Catches the verb not reaching the database: the dry run says what it would do and
+/// creates nothing, `--apply` creates the schema, a second `--apply` is a no-op, all
+/// through the binary and the `database` key of `installer.toml`.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn setup_creates_the_schema_through_the_binary() {
+    let url = std::env::var("KBF_TEST_POSTGRES_URL").expect("a test database");
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
+    client
+        .batch_execute("DROP SCHEMA IF EXISTS kbf_state CASCADE")
+        .expect("start with no schema");
+    let root = root("setup-ok");
+    installer_toml(
+        &root,
+        &format!("database = \"{}\"\n", without_password(&url)),
+    );
+    let say = |out: &Output| String::from_utf8_lossy(&out.stdout).into_owned();
+    let dry = helper(&root, &["setup", "--mode", "frontend"]);
+    assert!(dry.status.success(), "{dry:?}");
+    assert!(
+        say(&dry).contains("dry run: would create the schema at version 1"),
+        "{}",
+        say(&dry)
+    );
+    let none = client
+        .query(
+            "SELECT 1 FROM pg_namespace WHERE nspname = 'kbf_state'",
+            &[],
+        )
+        .expect("catalog");
+    assert!(none.is_empty(), "the dry run created the schema");
+    let made = helper(&root, &["setup", "--mode", "all-in-one", "--apply"]);
+    assert!(made.status.success(), "{made:?}");
+    assert!(
+        say(&made).contains("created the schema at version 1"),
+        "{}",
+        say(&made)
+    );
+    client
+        .query_one("SELECT version FROM kbf_state.schema_version", &[])
+        .expect("the version row");
+    let again = helper(&root, &["setup", "--mode", "all-in-one", "--apply"]);
+    assert!(say(&again).contains("nothing to apply"), "{}", say(&again));
+}
+
 /// Catches the gate in front of the verbs being absent from the shipped binary (the unit tests
 /// run the same code, but the binary is what a host runs): an ordinary user is refused every
 /// verb that needs root with exit 2 and the reason, `--json` puts one object on standard

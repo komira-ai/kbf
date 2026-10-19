@@ -57,6 +57,12 @@ fn write_atomic_between(
     File::open(dir)?.sync_all()
 }
 
+/// Write `bytes` to `path` so that a reader, or a crash, sees the old file or the new one
+/// (see `write_atomic_between`). The file holds exactly `bytes` when this returns `Ok`.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    write_atomic_between(path, bytes, || {})
+}
+
 /// A stage run being recorded in a result document on disk.
 ///
 /// [`Run::start`] writes the document `RUNNING`. [`Run::finish`], [`Run::fail`] and
@@ -141,7 +147,7 @@ impl Run {
 
     fn write(&self) -> Result<(), GateError> {
         let bytes = self.doc.to_bytes()?;
-        write_atomic_between(&self.path, &bytes, || {}).map_err(|source| GateError::Io {
+        write_atomic(&self.path, &bytes).map_err(|source| GateError::Io {
             path: self.path.clone(),
             source,
         })

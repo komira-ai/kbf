@@ -109,6 +109,8 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "handover",
         &[
+            "admin-listen",
+            "await-takeover",
             "envoy-check-interval-ms",
             "envoy-check-timeout-ms",
             "envoy-unhealthy-threshold",

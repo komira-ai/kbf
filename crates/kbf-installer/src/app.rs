@@ -13,10 +13,12 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kbf_host::{HostExec, Root};
+use kbf_host::{HostExec, HostPath, Root};
+use kbf_state::postgres::schema::Outcome;
 
 use crate::activate;
-use crate::cli::{BootArgs, Cli, RunArgs, Verb};
+use crate::cli::{BootArgs, Cli, RunArgs, SetupArgs, Verb};
+use crate::database::Database;
 use crate::exit::Exit;
 use crate::helper::cycle::{Config, Helper, HelperError};
 use crate::helper::operator::{self, Operator};
@@ -100,6 +102,76 @@ fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
     ))
 }
 
+/// `path` (an absolute path on the host) under the host root.
+fn under(root: &Path, path: &HostPath) -> Result<PathBuf, Failure> {
+    let root = Root::new(root).map_err(|e| Failure::from(e.to_string()))?;
+    Ok(root.join(path))
+}
+
+/// The database step of `setup`, for the modes that keep their state in the database: a dry
+/// run reports the schema's version and what would be applied; `--apply` creates the schema
+/// or brings an older one forward, and does nothing when it is current. Returns the line to
+/// print; it says it covers the database step only, because the rest of `setup` is not built.
+/// It needs no root: it talks to the database as the role the URL names.
+fn setup_database(root: &Path, apply: bool, args: &SetupArgs) -> Result<String, Failure> {
+    let database = Database::from_installer_toml(&under(root, &args.installer_config)?)
+        .map_err(|e| Failure::from(e.to_string()))?;
+    database_step(&database, &args.mode.name(), apply)
+}
+
+/// What the database step needs of the schema: `Database` is the one real implementation; a
+/// test's fake stands in for a server, so the lines `setup` prints after the schema runner
+/// answers are tested without one. The errors are their text: that is all `setup` prints.
+trait SchemaOps {
+    /// Creates or brings forward the schema.
+    fn setup(&self) -> Result<Outcome, String>;
+
+    /// The schema's version (`None` before the first setup) and this build's newest.
+    fn plan(&self) -> Result<(Option<u32>, u32), String>;
+}
+
+impl SchemaOps for Database {
+    fn setup(&self) -> Result<Outcome, String> {
+        Database::setup(self).map_err(|e| e.to_string())
+    }
+
+    fn plan(&self) -> Result<(Option<u32>, u32), String> {
+        Database::plan(self).map_err(|e| e.to_string())
+    }
+}
+
+/// The line the database step prints for `mode`: `--apply` runs the schema, a dry run asks.
+fn database_step(database: &dyn SchemaOps, mode: &str, apply: bool) -> Result<String, Failure> {
+    if apply {
+        let outcome = database.setup().map_err(Failure::from)?;
+        return Ok(apply_line(mode, &outcome));
+    }
+    let (found, newest) = database.plan().map_err(Failure::from)?;
+    Ok(dry_run_line(mode, found, newest))
+}
+
+/// The line `setup --apply` prints for what the database step did.
+fn apply_line(mode: &str, outcome: &Outcome) -> String {
+    format!("kbf-installer setup ({mode}): database step: {outcome}")
+}
+
+/// The line a `setup` dry run prints: the schema's version (`None` before the first setup)
+/// against this build's newest.
+fn dry_run_line(mode: &str, found: Option<u32>, newest: u32) -> String {
+    match found {
+        None => format!(
+            "kbf-installer setup ({mode}): database step: dry run: would create the schema at version {newest}"
+        ),
+        Some(v) if v < newest => format!(
+            "kbf-installer setup ({mode}): database step: dry run: would migrate the schema from {v} to {newest}"
+        ),
+        Some(v) => format!(
+            "kbf-installer setup ({mode}): database step: dry run: the schema is at {v}, \
+             nothing to do"
+        ),
+    }
+}
+
 fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
     // A running program has a file, and the file can be read: neither can be told otherwise.
     let me = std::env::current_exe().expect("a running program has a file");
@@ -107,9 +179,16 @@ fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
     run_from(root, args, &me, watch)
 }
 
-/// The service loop of `me`, the file this program runs from, whose identity `watch` holds:
-/// once the file is replaced the loop starts the new one in this process's place.
-fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Result<(), Failure> {
+/// The helper `run` drives: the host's, with the schema step of `--installer-config` attached
+/// when the flag is given.
+fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failure> {
+    let database = match &args.installer_config {
+        Some(config) => Some(
+            Database::from_installer_toml(&under(&root, config)?)
+                .map_err(|e| Failure::from(e.to_string()))?,
+        ),
+        None => None,
+    };
     let (layout, exec) = host(root)?;
     let platform = layout.platform();
     let cfg = Config {
@@ -122,7 +201,7 @@ fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Re
     };
     // The release fetcher and the lease source are wired by later changes; until then an
     // activation of a release that is not installed, and every activation, is refused.
-    let helper = Helper::new(
+    let mut helper = Helper::new(
         layout,
         exec,
         cfg,
@@ -130,6 +209,27 @@ fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Re
         Box::new(leases::NotWired),
         Box::new(HostProcs::new(platform)),
     );
+    if let Some(database) = database {
+        helper.set_schema_step(Box::new(database));
+    }
+    Ok(helper)
+}
+
+/// The service loop of `me`, the file this program runs from, whose identity `watch` holds:
+/// once the file is replaced the loop starts the new one in this process's place.
+fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Result<(), Failure> {
+    // A frontend or all-in-one unit activates a release only after the database is migrated
+    // for it; without the installer.toml that names the database the step would be silently
+    // absent, so the service does not start.
+    if args.installer_config.is_none() && args.service.runs_database_mode() {
+        return Err(Failure {
+            exit: Exit::Usage,
+            why: "run needs --installer-config on a frontend or all-in-one host (the \
+                  database is migrated before a release is activated)"
+                .to_owned(),
+        });
+    }
+    let helper = build_helper(root, args)?;
     let mut serve = Serve::new(helper, Box::new(watch));
     serve.helper().recover()?;
     let mut left = args.passes;
@@ -217,8 +317,21 @@ fn root_of(cli: &Cli) -> PathBuf {
     }
 }
 
+/// The success line of the one verb that reports one (the database step of `setup`): text
+/// on `out`, or with `--json` one object.
+fn print_success(json: bool, apply: bool, verb: &str, line: &str, out: &mut dyn Write) {
+    // A closed pipe is the reader's business; the exit code still tells.
+    let _ = if json {
+        let object = serde_json::json!({"verb": verb, "apply": apply, "message": line});
+        writeln!(out, "{object}")
+    } else {
+        writeln!(out, "{line}")
+    };
+}
+
 /// Carry out `cli` as the user `euid`. A verb that fails or is not built says so: as text on
-/// `err`, or with `--json` as one object on `out`. A verb that succeeds prints nothing here.
+/// `err`, or with `--json` as one object on `out`. A verb that succeeds prints nothing here,
+/// except the database step of `setup`, whose one line goes to `out`.
 pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
     let name = cli.verb.name();
     let mut say = |code: Exit, text: String, json: serde_json::Value| {
@@ -231,9 +344,9 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         code
     };
     // `run` and `boot-check` keep the helper's own checks (they work on a scratch root as an
-    // ordinary user) until P5 replaces them; every other verb is gated here.
-    let gated = cli.verb.built_by().is_some();
-    if gated && cli.verb.needs_root() && euid != 0 {
+    // ordinary user) until P5 replaces them; every other verb that is not built is gated
+    // here. The verb table says which are built (`built_by`).
+    if cli.verb.built_by().is_some() && cli.verb.needs_root() && euid != 0 {
         return say(
             Exit::Usage,
             format!("kbf-installer: {name} needs root: run it with sudo (effective uid is {euid})"),
@@ -241,17 +354,25 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         );
     }
     let result = match &cli.verb {
-        Verb::Run(args) => run(root_of(cli), args),
-        Verb::BootCheck(args) => boot_check(root_of(cli), args),
+        // As the role the database URL names, the step needs no root.
+        Verb::Setup(args) if args.mode.keeps_state_in_database() => {
+            setup_database(&root_of(cli), cli.apply, args).map(Some)
+        }
+        Verb::Run(args) => run(root_of(cli), args).map(|()| None),
+        Verb::BootCheck(args) => boot_check(root_of(cli), args).map(|()| None),
         Verb::Confirm(n) => operate(root_of(cli), cli.apply, n.service.restart(), |o| {
             o.confirm(&n.id.to_string())
-        }),
+        })
+        .map(|()| None),
         Verb::Revert(n) => operate(root_of(cli), cli.apply, n.service.restart(), |o| {
             o.revert(&n.id.to_string())
-        }),
-        Verb::Rollback(s) => operate(root_of(cli), cli.apply, s.restart(), |o| o.rollback()),
-        Verb::Gc(g) => gc(root_of(cli), cli.apply, g.keep),
-        Verb::Quiesce => quiesce(root_of(cli)),
+        })
+        .map(|()| None),
+        Verb::Rollback(s) => {
+            operate(root_of(cli), cli.apply, s.restart(), |o| o.rollback()).map(|()| None)
+        }
+        Verb::Gc(g) => gc(root_of(cli), cli.apply, g.keep).map(|()| None),
+        Verb::Quiesce => quiesce(root_of(cli)).map(|()| None),
         other => {
             let phase = other.built_by().unwrap_or("?");
             return say(
@@ -267,13 +388,21 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         }
     };
     match result {
-        Ok(()) => Exit::Ok,
+        Ok(line) => report(line, cli, name, out),
         Err(Failure { exit, why }) => say(
             exit,
             format!("kbf-installer: {why}"),
             serde_json::json!({"verb": name, "error": "failed", "message": why}),
         ),
     }
+}
+
+/// A verb that succeeded: its line, when it has one, goes to `out`.
+fn report(line: Option<String>, cli: &Cli, name: &str, out: &mut dyn Write) -> Exit {
+    if let Some(line) = line {
+        print_success(cli.json, cli.apply, name, &line, out);
+    }
+    Exit::Ok
 }
 
 #[cfg(test)]
