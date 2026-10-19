@@ -346,13 +346,13 @@ fn every_slot_and_target_has_its_own_loopback_port() {
 }
 
 /// The files of a proxy: certificates, tokens, a secret, a config over them.
-struct Files {
-    pki: super::pki::Pki,
-    config: ProxyConfig,
-    dir: std::path::PathBuf,
+pub(super) struct Files {
+    pub(super) pki: super::pki::Pki,
+    pub(super) config: ProxyConfig,
+    pub(super) dir: std::path::PathBuf,
 }
 
-fn files(name: &str, base: u16, extra: &str) -> Files {
+pub(super) fn files(name: &str, base: u16, extra: &str) -> Files {
     use super::pki::Pki;
     use crate::scratch::{scratch, write_file};
     let dir = scratch(name);

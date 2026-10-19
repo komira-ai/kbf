@@ -61,6 +61,8 @@ use kbf_testkit::reaped::{self, Reaped};
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 
+/// The operator token the proxy reads at start; `/metrics` wants it as a bearer.
+const OPERATOR_TOKEN: &str = "operator-token-0123456789-abcdefghijkl";
 /// Streams opened before the swap and finished after it.
 const OLD: usize = 200;
 /// Streams opened while the gate holds: served by the new child.
@@ -230,11 +232,32 @@ fn grpc_request(path: &str) -> http::Request<()> {
         .expect("a request")
 }
 
-async fn connect(addr: &str) -> (SendRequest<Bytes>, tokio::task::JoinHandle<()>) {
+/// A TLS h2 client of the proxy, trusting the CA in `ca_pem` (no client certificate: the
+/// proxy's default `buck2_auth = "none"` serves an anonymous caller).
+async fn connect(addr: &str, ca_pem: &Path) -> (SendRequest<Bytes>, tokio::task::JoinHandle<()>) {
+    use rustls::pki_types::pem::PemObject as _;
+    let mut roots = rustls::RootCertStore::empty();
+    for der in rustls::pki_types::CertificateDer::pem_file_iter(ca_pem).expect("CA file") {
+        roots.add(der.expect("CA PEM")).expect("root");
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
     let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").expect("name"),
+            tcp,
+        )
+        .await
+        .expect("TLS handshake");
     let (client, connection) = h2::client::Builder::new()
         .initial_connection_window_size(64 << 20)
-        .handshake::<_, Bytes>(tcp)
+        .handshake::<_, Bytes>(tls)
         .await
         .expect("h2 handshake");
     let driver = tokio::spawn(async move {
@@ -367,6 +390,7 @@ impl Open {
 async fn proxy_get(client: &SendRequest<Bytes>, path: &str) -> (u16, String) {
     let request = http::Request::builder()
         .uri(format!("http://frontend.test{path}"))
+        .header("authorization", format!("Bearer {OPERATOR_TOKEN}"))
         .body(())
         .expect("a request");
     let (response, _) = client
@@ -436,12 +460,24 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
 
     let public = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("public socket");
     let public_addr: SocketAddr = public.local_addr().expect("addr");
+    // The proxy terminates TLS (U4b-2): a CA and a server certificate, and the operator token
+    // file it reads at start (0600, at least 32 characters).
+    let pki = kbf_it::pki::write(&dir.join("pki"), "soak-client").expect("certificates");
+    let token = dir.join("operator.token");
+    std::fs::write(&token, OPERATOR_TOKEN).expect("token");
+    std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("chmod");
     let config = ProxyConfig::from_toml_str(&format!(
-        "operator_token_file = \"/etc/kbf/operator.token\"\n\
-         server_cert_file = \"/etc/kbf/tls/server.pem\"\n\
-         server_key_file = \"/etc/kbf/tls/server.key\"\n\
-         client_ca_file = \"/etc/kbf/tls/ca.pem\"\n\
-         [upstream]\nbase_port = {base}\n"
+        "operator_token_file = {token:?}\n\
+         server_cert_file = {:?}\n\
+         server_key_file = {:?}\n\
+         client_ca_file = {:?}\n\
+         proxy_auth_file = {:?}\n\
+         [upstream]\nbase_port = {base}\n",
+        pki.server_cert,
+        pki.server_key,
+        pki.ca_cert,
+        dir.join("proxy-auth"),
     ))
     .expect("a valid table");
     let (handle, runner) = Proxy::bind(config, OwnedFd::from(public)).expect("bind");
@@ -463,7 +499,7 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
         let (new_requests, new_blobs) = actions("new", HELD + NEW);
         within("the old actions", store(&a.field("reapi="), old_blobs)).await;
         within("the new actions", store(&b.field("reapi="), new_blobs)).await;
-        let (client, driver) = connect(&public_addr.to_string()).await;
+        let (client, driver) = connect(&public_addr.to_string(), &pki.ca_cert).await;
         // `/readyz` is the proxy's poll of the real child: 200 once a poll has passed.
         until_ready(&client).await;
 

@@ -76,7 +76,7 @@ fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
     );
     refused(
         &file("port", PROXY.replace("18000", "80").as_bytes()),
-        "proxy: upstream.base_port must be 1024 to 65522",
+        "proxy: upstream.base_port must be 1024 to 65521 so both slots fit",
     );
     refused(
         &file("big", &vec![b'#'; MAX_FILE_BYTES + 1]),
