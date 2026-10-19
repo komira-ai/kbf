@@ -42,7 +42,7 @@ pub enum IdentityFault {
     #[error("cannot read {}: {why}", path.display())]
     File { path: PathBuf, why: String },
     #[error("cannot lend the identity: {0}")]
-    Lend(io::Error),
+    Lend(#[from] io::Error),
     #[error("the lent identity is malformed: {0}")]
     Malformed(&'static str),
     #[error("the child holds descriptor {0}, which nobody lent it")]
@@ -66,18 +66,16 @@ pub fn read_pem(path: &Path) -> Result<Vec<u8>, IdentityFault> {
     if !meta.is_file() {
         return Err(fault("not a regular file".to_owned()));
     }
-    if meta.len() == 0 || meta.len() > MAX_PEM_BYTES {
-        return Err(fault(format!(
-            "{} bytes; at least 1 and at most {MAX_PEM_BYTES}",
-            meta.len()
-        )));
-    }
+    // One more than the most, so a file that is too large is seen and not silently cut.
     let mut bytes = Vec::new();
-    file.take(MAX_PEM_BYTES + 1)
+    let mut reader = file.take(MAX_PEM_BYTES + 1);
+    reader
         .read_to_end(&mut bytes)
         .map_err(|e| fault(e.to_string()))?;
-    if bytes.len() as u64 > MAX_PEM_BYTES {
-        return Err(fault("it grew while it was read".to_owned()));
+    if bytes.is_empty() || bytes.len() as u64 > MAX_PEM_BYTES {
+        return Err(fault(format!(
+            "empty or over {MAX_PEM_BYTES} bytes; at least 1 and at most {MAX_PEM_BYTES}"
+        )));
     }
     Ok(bytes)
 }
@@ -143,25 +141,24 @@ impl Identity {
     #[cfg(target_os = "linux")]
     pub fn lend(&self) -> Result<OwnedFd, IdentityFault> {
         use rustix::fs::{MemfdFlags, SealFlags, SeekFrom, fcntl_add_seals, memfd_create, seek};
-        let lend = |e: rustix::io::Errno| IdentityFault::Lend(e.into());
         let fd = memfd_create(
             "kbf-fetch-identity",
             MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
         )
-        .map_err(lend)?;
+        .map_err(io::Error::from)?;
         let blob = self.encode();
         let mut written = 0;
         while written < blob.len() {
-            written += rustix::io::write(&fd, &blob[written..]).map_err(lend)?;
+            written += rustix::io::write(&fd, &blob[written..]).map_err(io::Error::from)?;
         }
         // The child shares this open file description: it starts reading at the front, and
         // cannot change what it reads.
-        seek(&fd, SeekFrom::Start(0)).map_err(lend)?;
+        seek(&fd, SeekFrom::Start(0)).map_err(io::Error::from)?;
         fcntl_add_seals(
             &fd,
             SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL,
         )
-        .map_err(lend)?;
+        .map_err(io::Error::from)?;
         Ok(fd)
     }
 
@@ -227,13 +224,8 @@ const FD_DIR: &str = "/dev/fd";
 fn open_descriptors() -> io::Result<Vec<i32>> {
     let mut listed = Vec::new();
     for entry in std::fs::read_dir(FD_DIR)? {
-        if let Some(n) = entry?
-            .file_name()
-            .to_str()
-            .and_then(|n| n.parse::<i32>().ok())
-        {
-            listed.push(n);
-        }
+        let name = entry?.file_name();
+        listed.extend(name.to_str().and_then(|n| n.parse::<i32>().ok()));
     }
     // SAFETY: F_GETFD on a number only reports whether it is open.
     listed.retain(|n| unsafe { libc::fcntl(*n, libc::F_GETFD) } >= 0);

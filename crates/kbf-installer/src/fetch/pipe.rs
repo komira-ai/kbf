@@ -16,7 +16,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -107,14 +107,10 @@ impl Drop for Reaper {
     }
 }
 
-fn set_nonblocking(fd: i32) -> io::Result<()> {
-    // SAFETY: fcntl on a descriptor this process holds.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: as above.
-    crate::run::check(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) })
+pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(fd)?;
+    rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)?;
+    Ok(())
 }
 
 /// Wait for `fd` to be readable for at most `wait`; whether it is (or hung up).
@@ -128,17 +124,92 @@ fn readable(fd: i32, wait: Duration) -> io::Result<bool> {
     let ms = wait.as_millis().saturating_add(1).min(i32::MAX as u128) as libc::c_int;
     // SAFETY: poll reads and writes the one struct it is given.
     let n = unsafe { libc::poll(&raw mut poll, 1, ms) };
-    match n {
-        0 => Ok(false),
-        n if n > 0 => Ok(true),
-        _ => {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                Ok(false)
-            } else {
-                Err(e)
-            }
+    polled(n, io::Error::last_os_error)
+}
+
+/// What the result `n` of `poll` says: whether the descriptor is ready. A call a signal
+/// interrupted is "not yet" (the caller looks at the clock and asks again); any other failure
+/// is an error. `last` is read only for a failure.
+pub(crate) fn polled(n: libc::c_int, last: impl FnOnce() -> io::Error) -> io::Result<bool> {
+    if n >= 0 {
+        return Ok(n > 0);
+    }
+    let e = last();
+    if e.kind() == io::ErrorKind::Interrupted {
+        Ok(false)
+    } else {
+        Err(e)
+    }
+}
+
+/// What one non-blocking read of the child's output came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Chunk {
+    /// The child closed its output.
+    End,
+    /// This many bytes arrived.
+    Data(usize),
+    /// Nothing yet (the read was interrupted or would block): look at the clock and ask again.
+    Again,
+}
+
+pub(crate) fn chunk(read: io::Result<usize>) -> Result<Chunk, PipeFault> {
+    match read {
+        Ok(0) => Ok(Chunk::End),
+        Ok(n) => Ok(Chunk::Data(n)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(Chunk::Again)
         }
+        Err(e) => Err(PipeFault::Read(e)),
+    }
+}
+
+/// What has come in so far.
+pub(crate) struct Tally {
+    pub(crate) count: u64,
+    pub(crate) hash: Sha256,
+    /// When the last byte came (the start, before the first).
+    pub(crate) last_byte: Instant,
+    size: u64,
+}
+
+impl Tally {
+    pub(crate) fn new(size: u64, started: Instant) -> Tally {
+        Tally {
+            count: 0,
+            hash: Sha256::new(),
+            last_byte: started,
+            size,
+        }
+    }
+
+    /// Account for one read (`read`, into the front of `buf`): count and hash the bytes and write
+    /// them to `out`. Whether the child has closed its output. More bytes than were declared are
+    /// an error before they are written.
+    pub(crate) fn take(
+        &mut self,
+        read: io::Result<usize>,
+        buf: &[u8],
+        out: &mut impl Write,
+    ) -> Result<bool, PipeFault> {
+        let n = match chunk(read)? {
+            Chunk::End => return Ok(true),
+            Chunk::Again => return Ok(false),
+            Chunk::Data(n) => n,
+        };
+        self.count += n as u64;
+        if self.count > self.size {
+            return Err(PipeFault::Oversize { size: self.size });
+        }
+        self.last_byte = Instant::now();
+        self.hash.update(&buf[..n]);
+        out.write_all(&buf[..n]).map_err(PipeFault::Write)?;
+        Ok(false)
     }
 }
 
@@ -179,27 +250,25 @@ pub fn receive(
     let stderr = capture(guard.0.stderr.take().expect("stderr is piped"));
     let mut stdout = guard.0.stdout.take().expect("stdout is piped");
     let fd = stdout.as_raw_fd();
-    set_nonblocking(fd).map_err(PipeFault::Read)?;
+    set_nonblocking(stdout.as_fd()).map_err(PipeFault::Read)?;
 
     let started = Instant::now();
-    let mut last_byte = started;
-    let mut hash = Sha256::new();
-    let mut count = 0_u64;
+    let mut tally = Tally::new(caps.size, started);
     let mut buf = vec![0_u8; CHUNK];
     loop {
         let now = Instant::now();
         let whole = started + caps.total;
-        let quiet = last_byte + caps.no_byte;
+        let quiet = tally.last_byte + caps.no_byte;
         if now >= whole.min(quiet) {
             // Having all the bytes, a child that will not close its output is judged on them.
-            if count == caps.size {
+            if tally.count == caps.size {
                 break;
             }
             return Err(if now >= whole {
                 PipeFault::TimedOut { after: caps.total }
             } else {
                 PipeFault::Stalled {
-                    got: count,
+                    got: tally.count,
                     size: caps.size,
                     after: caps.no_byte,
                 }
@@ -208,25 +277,11 @@ pub fn receive(
         if !readable(fd, whole.min(quiet) - now).map_err(PipeFault::Read)? {
             continue;
         }
-        match stdout.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                count += n as u64;
-                if count > caps.size {
-                    return Err(PipeFault::Oversize { size: caps.size });
-                }
-                last_byte = Instant::now();
-                hash.update(&buf[..n]);
-                out.write_all(&buf[..n]).map_err(PipeFault::Write)?;
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) => {}
-            Err(e) => return Err(PipeFault::Read(e)),
+        if tally.take(stdout.read(&mut buf), &buf, out)? {
+            break;
         }
     }
+    let (count, hash) = (tally.count, tally.hash);
     out.sync_all().map_err(PipeFault::Write)?;
     // The child is done, or judged on the bytes it gave: end it and what it started, then take
     // what it said.

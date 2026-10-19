@@ -302,9 +302,20 @@ pub(crate) fn before_exec_confined(
     confine: Option<Confine>,
     keep: Option<libc::c_int>,
 ) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
-    // SAFETY: getpid takes no arguments (read here, in the parent, so that the child can tell
-    // whether it has been orphaned).
-    let parent = unsafe { libc::getpid() };
+    before_exec_with(Libc, user, inherited, confine, keep)
+}
+
+/// [`before_exec_confined`] with the system calls it makes given, so a test plays them (a real
+/// run would limit the test process itself) and reads the order they are made in.
+pub(crate) fn before_exec_with<S: Creds + Confiner + Send + Sync + 'static>(
+    sys: S,
+    user: Option<RunAs>,
+    inherited: Inherited,
+    confine: Option<Confine>,
+    keep: Option<libc::c_int>,
+) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
+    // Read here, in the parent, so that the child can tell whether it has been orphaned.
+    let parent = sys.pid();
     move || {
         match &inherited {
             Inherited::Range(first) => range_cloexec(*first, u32::MAX)?,
@@ -313,17 +324,16 @@ pub(crate) fn before_exec_confined(
             Inherited::Fails(errno) => return Err(io::Error::from_raw_os_error(*errno)),
         }
         if let Some(fd) = keep {
-            // SAFETY: fcntl on a descriptor this process holds; this one stays open on exec.
-            check(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) })?;
+            sys.keep_open(fd)?;
         }
         if let Some(confine) = confine {
-            confine.before_switch()?;
+            confine.before_switch(&sys)?;
         }
         if let Some(user) = user {
-            switch_user(&Libc, user)?;
+            switch_user(&sys, user)?;
         }
         match confine {
-            Some(confine) => confine.after_switch(parent, user.is_some()),
+            Some(confine) => confine.after_switch(&sys, parent, user.is_some()),
             None => Ok(()),
         }
     }
@@ -351,57 +361,116 @@ impl Confine {
 
     /// Before the switch of user: `RLIMIT_FSIZE` 0 (it cannot create or grow a file),
     /// `RLIMIT_CORE` 0, `RLIMIT_NOFILE`, `RLIMIT_AS` and `no_new_privs`.
-    fn before_switch(self) -> io::Result<()> {
-        set_limit(libc::RLIMIT_FSIZE as libc::c_int, 0)?;
-        set_limit(libc::RLIMIT_CORE as libc::c_int, 0)?;
-        set_limit(libc::RLIMIT_NOFILE as libc::c_int, OPEN_FILES)?;
-        #[cfg(target_os = "linux")]
-        {
-            set_limit(libc::RLIMIT_AS as libc::c_int, self.address_space)?;
-            // SAFETY: prctl with these arguments reads no memory.
-            check(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) })?;
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = self;
-        Ok(())
+    fn before_switch(self, sys: &dyn Confiner) -> io::Result<()> {
+        sys.limit(libc::RLIMIT_FSIZE as libc::c_int, 0)?;
+        sys.limit(libc::RLIMIT_CORE as libc::c_int, 0)?;
+        sys.limit(libc::RLIMIT_NOFILE as libc::c_int, OPEN_FILES)?;
+        sys.address_space(self.address_space)?;
+        sys.no_new_privs()
     }
 
     /// After the switch of user: at most [`PROCESSES`] processes (set only for a user the
     /// program was switched to, who has none besides), and death with the parent on Linux.
     /// `parent` is the pid of the process that started this one; if it is already gone the
     /// start fails (the signal would never come).
-    fn after_switch(self, parent: libc::pid_t, switched: bool) -> io::Result<()> {
+    fn after_switch(
+        self,
+        sys: &dyn Confiner,
+        parent: libc::pid_t,
+        switched: bool,
+    ) -> io::Result<()> {
         if switched {
-            set_limit(libc::RLIMIT_NPROC as libc::c_int, PROCESSES)?;
+            sys.limit(libc::RLIMIT_NPROC as libc::c_int, PROCESSES)?;
         }
-        #[cfg(target_os = "linux")]
-        {
-            // SAFETY: prctl with these arguments reads no memory.
-            check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) })?;
-            // SAFETY: getppid takes no arguments.
-            if unsafe { libc::getppid() } != parent {
-                return Err(io::Error::other("the parent is gone"));
-            }
+        sys.die_with_parent()?;
+        if sys.parent_pid() == parent {
+            Ok(())
+        } else {
+            Err(io::Error::other("the parent is gone"))
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = (self, parent);
-        Ok(())
     }
 }
 
-/// Lower both limits of `resource` to `value`.
-fn set_limit(resource: libc::c_int, value: u64) -> io::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: value as libc::rlim_t,
-        rlim_max: value as libc::rlim_t,
-    };
-    // SAFETY: setrlimit reads the struct it is given.
+/// The calls a confined start makes besides the change of user ([`Creds`]), so a test plays
+/// them. Those that have no meaning off Linux do nothing there.
+pub trait Confiner {
+    /// This process's id.
+    fn pid(&self) -> libc::pid_t;
+    /// The id of the process that started this one.
+    fn parent_pid(&self) -> libc::pid_t;
+    /// Lower both limits of `resource` to `value`.
+    fn limit(&self, resource: libc::c_int, value: u64) -> io::Result<()>;
+    /// `RLIMIT_AS` (Linux only; macOS does not enforce it).
+    fn address_space(&self, bytes: u64) -> io::Result<()>;
+    /// `PR_SET_NO_NEW_PRIVS` (Linux).
+    fn no_new_privs(&self) -> io::Result<()>;
+    /// `PR_SET_PDEATHSIG` with SIGKILL (Linux).
+    fn die_with_parent(&self) -> io::Result<()>;
+    /// Keep `fd` open across exec.
+    fn keep_open(&self, fd: libc::c_int) -> io::Result<()>;
+}
+
+impl Confiner for Libc {
+    fn pid(&self) -> libc::pid_t {
+        // SAFETY: getpid takes no arguments.
+        unsafe { libc::getpid() }
+    }
+
+    fn parent_pid(&self) -> libc::pid_t {
+        // SAFETY: getppid takes no arguments.
+        unsafe { libc::getppid() }
+    }
+
+    fn limit(&self, resource: libc::c_int, value: u64) -> io::Result<()> {
+        let limit = libc::rlimit {
+            rlim_cur: value as libc::rlim_t,
+            rlim_max: value as libc::rlim_t,
+        };
+        // SAFETY: setrlimit reads the struct it is given.
+        #[cfg(target_os = "linux")]
+        let rc = unsafe { libc::setrlimit(resource as _, &raw const limit) };
+        // SAFETY: as above.
+        #[cfg(not(target_os = "linux"))]
+        let rc = unsafe { libc::setrlimit(resource, &raw const limit) };
+        check(rc)
+    }
+
     #[cfg(target_os = "linux")]
-    let rc = unsafe { libc::setrlimit(resource as _, &raw const limit) };
-    // SAFETY: as above.
+    fn address_space(&self, bytes: u64) -> io::Result<()> {
+        self.limit(libc::RLIMIT_AS as libc::c_int, bytes)
+    }
+
     #[cfg(not(target_os = "linux"))]
-    let rc = unsafe { libc::setrlimit(resource, &raw const limit) };
-    check(rc)
+    fn address_space(&self, _bytes: u64) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn no_new_privs(&self) -> io::Result<()> {
+        // SAFETY: prctl with these arguments reads no memory.
+        check(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn no_new_privs(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn die_with_parent(&self) -> io::Result<()> {
+        // SAFETY: prctl with these arguments reads no memory.
+        check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn die_with_parent(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn keep_open(&self, fd: libc::c_int) -> io::Result<()> {
+        // SAFETY: fcntl on a descriptor this process holds; this one stays open on exec.
+        check(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) })
+    }
 }
 
 /// Whether the child `pid` has exited, without reaping it.
@@ -498,3 +567,7 @@ impl Capture {
 #[cfg(test)]
 #[path = "run_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "confine_tests.rs"]
+mod confine_tests;

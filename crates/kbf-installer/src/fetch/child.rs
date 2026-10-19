@@ -185,11 +185,9 @@ fn fetch_frontend(
         .identity(TlsIdentity::from_pem(&identity.cert, &identity.key))
         // The name in the SAN: the URL's host and no other.
         .domain_name(host);
-    let endpoint = Endpoint::from_shared(url.clone())
-        .map_err(|e| unreachable(&e))?
-        .tls_config(tls)
-        .map_err(|e| unreachable(&e))?
-        .connect_timeout(CONNECT_TIMEOUT);
+    let endpoint = Endpoint::from_shared(url.clone()).map_err(|e| unreachable(&e))?;
+    let endpoint = endpoint.tls_config(tls).map_err(|e| unreachable(&e))?;
+    let endpoint = endpoint.connect_timeout(CONNECT_TIMEOUT);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

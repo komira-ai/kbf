@@ -185,6 +185,7 @@ fn a_source_that_is_not_a_plain_https_url_is_refused() {
         "http://front.example:9000",
         "https://front.example:9000/v1",
         "https://u@front.example",
+        "https://FRONT.example",
     ] {
         let got = pull(&frontend(url), SHA, 10, 0);
         assert!(
@@ -216,4 +217,128 @@ fn the_refusal_words_are_the_contracts() {
     .map(FetchError::word)
     .collect();
     assert_eq!(words, ["hash", "size", "disk", "fetch", "hash", "fetch"]);
+}
+
+/// The words a person reads when a child ends short: what the child said is in them, when it
+/// said anything.
+#[test]
+fn a_short_read_says_what_the_child_said() {
+    use super::pipe::PipeFault;
+    let short = |log: &str| {
+        PipeFault::Short {
+            got: 3,
+            size: 10,
+            log: log.to_owned(),
+        }
+        .to_string()
+    };
+    assert_eq!(
+        short(""),
+        "the child ended after 3 of the 10 bytes declared"
+    );
+    assert_eq!(
+        short("source unreachable: boom"),
+        "the child ended after 3 of the 10 bytes declared (source unreachable: boom)"
+    );
+}
+
+/// What `poll` answers: ready, not ready, interrupted (look again), or a real failure.
+///
+/// Catches an interrupted wait taken for a failure (a fetch killed by a stray signal) and a
+/// failure taken for "not yet" (a loop that never ends).
+#[test]
+fn a_poll_that_was_interrupted_is_not_an_error_and_another_failure_is() {
+    use super::pipe::polled;
+    let eintr = || io::Error::from(io::ErrorKind::Interrupted);
+    let other = || io::Error::from(io::ErrorKind::OutOfMemory);
+    assert!(polled(1, || unreachable!("no failure")).expect("ready"));
+    assert!(!polled(0, || unreachable!("no failure")).expect("not yet"));
+    assert!(!polled(-1, eintr).expect("interrupted"));
+    assert_eq!(
+        polled(-1, other).map_err(|e| e.kind()),
+        Err(io::ErrorKind::OutOfMemory)
+    );
+}
+
+/// What one read of the child's output comes to: the end, bytes, "look again" for a read that
+/// would block or was interrupted, and an error for the rest.
+#[test]
+fn a_read_that_would_block_is_looked_at_again_and_a_failed_one_is_an_error() {
+    use super::pipe::{Chunk, chunk};
+    assert_eq!(chunk(Ok(0)).expect("end"), Chunk::End);
+    assert_eq!(chunk(Ok(7)).expect("data"), Chunk::Data(7));
+    for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted] {
+        assert_eq!(chunk(Err(kind.into())).expect("again"), Chunk::Again);
+    }
+    let got = chunk(Err(io::ErrorKind::BrokenPipe.into()));
+    assert!(matches!(got, Err(PipeFault::Read(_))), "{got:?}");
+}
+
+/// A directory that cannot be measured is a refusal, not a pass.
+#[test]
+fn a_directory_that_cannot_be_measured_is_a_refusal() {
+    let got = ensure_room(Path::new("/nonexistent/kbf-fetch"), 1);
+    assert!(
+        matches!(got, Err(FetchError::Pipe(PipeFault::Write(_)))),
+        "{got:?}"
+    );
+}
+
+/// A descriptor that cannot be switched to non-blocking is an error, not a pipe read that waits.
+#[test]
+fn a_descriptor_that_is_not_open_cannot_be_made_non_blocking() {
+    use std::os::fd::BorrowedFd;
+    // SAFETY: 901 is a number no test of this crate opens; the only use of it is an `fcntl`
+    // that reports it is not open.
+    let closed = unsafe { BorrowedFd::borrow_raw(901) };
+    let got = super::pipe::set_nonblocking(closed);
+    assert_eq!(got.map_err(|e| e.raw_os_error()), Err(Some(libc::EBADF)));
+}
+
+/// What one read does to the running count: bytes are counted, hashed and written; the end and
+/// a read to look at again change nothing; a read past the declared size is refused before it is
+/// written; a read that fails and a write that fails are faults.
+///
+/// Catches a count taken after the write (the oversize byte lands on disk), a hash of the wrong
+/// slice, and an interrupted read taken for the end (a short file judged complete).
+#[test]
+fn a_read_is_counted_hashed_and_written_or_refused() {
+    use super::pipe::Tally;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    use std::time::Instant;
+    struct Refusing;
+    impl Write for Refusing {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::StorageFull.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut tally = Tally::new(6, Instant::now());
+    let mut out = Vec::new();
+    assert!(!tally.take(Ok(3), b"abcXXX", &mut out).expect("data"));
+    assert!(
+        !tally
+            .take(Err(io::ErrorKind::WouldBlock.into()), b"", &mut out)
+            .expect("again")
+    );
+    assert!(!tally.take(Ok(3), b"def", &mut out).expect("data"));
+    assert!(tally.take(Ok(0), b"", &mut out).expect("end"));
+    assert_eq!((tally.count, out.as_slice()), (6, &b"abcdef"[..]));
+    assert_eq!(
+        tally.hash.clone().finalize()[..],
+        Sha256::digest(b"abcdef")[..]
+    );
+    let got = tally.take(Ok(1), b"g", &mut out);
+    assert!(
+        matches!(got, Err(PipeFault::Oversize { size: 6 })),
+        "{got:?}"
+    );
+    assert_eq!(out, b"abcdef", "the byte over the size is not written");
+    let got = tally.take(Err(io::ErrorKind::BrokenPipe.into()), b"", &mut out);
+    assert!(matches!(got, Err(PipeFault::Read(_))), "{got:?}");
+    let got = Tally::new(6, Instant::now()).take(Ok(1), b"a", &mut Refusing);
+    assert!(matches!(got, Err(PipeFault::Write(_))), "{got:?}");
 }

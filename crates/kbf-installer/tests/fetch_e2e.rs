@@ -214,6 +214,11 @@ enum Serve {
     Stall {
         sent: usize,
     },
+    /// The first `sent` bytes and then an error status.
+    #[cfg(target_os = "linux")]
+    Break {
+        sent: usize,
+    },
 }
 
 struct Grpc {
@@ -259,6 +264,15 @@ impl kbf_proto::update::release_service_server::ReleaseService for Svc {
                 Ok(tonic::Response::new(Box::pin(futures::stream::iter(
                     chunks,
                 ))))
+            }
+            #[cfg(target_os = "linux")]
+            Serve::Break { sent } => {
+                let first = body(*sent);
+                let broken = Err(tonic::Status::internal("the store failed"));
+                Ok(tonic::Response::new(Box::pin(futures::stream::iter(vec![
+                    chunk(&first),
+                    broken,
+                ]))))
             }
             Serve::Stall { sent } => {
                 let first = body(*sent);
@@ -1077,4 +1091,356 @@ fn a_proxy_in_the_environment_is_not_used() {
     assert_eq!(out.stdout, bytes);
     assert!(proxy.accept().is_err(), "the proxy was contacted");
     assert_eq!(server.hits(), [format!("/files/{digest}")]);
+}
+
+// ------------------------------------------------- the child started by hand (not confined)
+//
+// The children `fetch_component` starts are confined to write no file, so their coverage
+// profile cannot be written; the same code is run here by a plain start of the binary (with the
+// test's own profile variable), and the tests state what the child does on its own.
+
+/// The arguments of a url fetch of `bytes` from `server`, trusting `ca`.
+fn url_args(url: &str, ca: &std::path::Path, digest: &str, limit: u64) -> Vec<String> {
+    [
+        "--kind",
+        "url",
+        "--url",
+        url,
+        "--sha256",
+        digest,
+        "--limit",
+        &limit.to_string(),
+        "--ca-file",
+        ca.to_str().expect("utf-8"),
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+fn by_hand(args: &[String]) -> std::process::Output {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    child_command(&args).output().expect("runs")
+}
+
+fn said(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Whatever the source sends beyond the limit the child is given is not written.
+///
+/// Mutant seen red: `.take(limit)` removed from `copy_limited` (all 1000 bytes are written).
+#[test]
+fn the_child_writes_no_more_than_its_limit() {
+    let (pki, leaf) = pki_and_server();
+    let bytes = body(1000);
+    let server = Https::start(&leaf, Plan::Body(bytes.clone()));
+    let rig = Rig::new("hand-limit");
+    let ca = rig.write("ca.pem", &pki.ca_pem());
+    let out = by_hand(&url_args(&server.url(), &ca, &sha(&bytes), 600));
+    assert!(out.status.success(), "{}", said(&out));
+    assert_eq!(out.stdout, bytes[..600]);
+}
+
+/// A source that answers anything but 200 is a failed fetch that names the status.
+#[test]
+fn the_child_names_the_status_it_was_answered() {
+    let (pki, leaf) = pki_and_server();
+    let server = Https::start(&leaf, Plan::Status(404));
+    let rig = Rig::new("hand-status");
+    let ca = rig.write("ca.pem", &pki.ca_pem());
+    let out = by_hand(&url_args(&server.url(), &ca, &sha(b"x"), 10));
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(said(&out).contains("answered 404"), "{}", said(&out));
+}
+
+/// A body that ends before its declared length is a failed fetch with the transport's words,
+/// and the bytes that did arrive are all the child wrote.
+#[test]
+fn a_body_cut_short_is_a_failed_fetch() {
+    let (pki, leaf) = pki_and_server();
+    let server = Https::start(
+        &leaf,
+        Plan::Short {
+            declared: 5000,
+            sent: 100,
+        },
+    );
+    let rig = Rig::new("hand-short");
+    let ca = rig.write("ca.pem", &pki.ca_pem());
+    let out = by_hand(&url_args(&server.url(), &ca, &sha(b"x"), 6000));
+    assert!(!out.status.success());
+    assert!(said(&out).contains("source unreachable"), "{}", said(&out));
+}
+
+/// A reader that has gone away is not a source fault: the child says it cannot write.
+#[test]
+fn a_reader_that_has_gone_is_a_write_fault() {
+    let (pki, leaf) = pki_and_server();
+    let bytes = body(900_000);
+    let server = Https::start(&leaf, Plan::Body(bytes.clone()));
+    let rig = Rig::new("hand-gone");
+    let ca = rig.write("ca.pem", &pki.ca_pem());
+    let args = url_args(&server.url(), &ca, &sha(&bytes), 1_000_000);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut command = child_command(&args);
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().expect("starts");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("ends");
+    assert!(!out.status.success());
+    assert!(
+        said(&out).contains("cannot write the bytes"),
+        "{}",
+        said(&out)
+    );
+}
+
+/// The roots a url child trusts come from the file it is given and from nowhere else: a file
+/// that is missing, holds no certificate or is not PEM is a failed start naming the file.
+#[test]
+fn a_roots_file_that_cannot_be_used_is_a_failed_start() {
+    let rig = Rig::new("hand-roots");
+    let digest = sha(b"x");
+    let none = rig.write("none.pem", "no certificates here\n");
+    let broken = rig.write(
+        "broken.pem",
+        "-----BEGIN CERTIFICATE-----\n@@@@\n-----END CERTIFICATE-----\n",
+    );
+    let missing = rig.dir.join("missing.pem");
+    for (file, why) in [
+        (&missing, "cannot read the roots"),
+        (&none, "no certificate"),
+        (&broken, "cannot read the roots"),
+    ] {
+        let out = by_hand(&url_args("https://localhost:1", file, &digest, 10));
+        assert!(!out.status.success());
+        let err = said(&out);
+        assert!(err.contains(why), "{file:?}: {err}");
+        assert!(err.contains(file.to_str().expect("utf-8")), "{err}");
+    }
+}
+
+/// A URL that is not exactly what settings write (a host in capitals, a path on a frontend) is
+/// refused by the child itself.
+#[test]
+fn the_child_refuses_a_url_that_is_not_in_the_form_settings_write() {
+    let good = sha(b"x");
+    for url in ["https://H.example", "https://h.example/"] {
+        let args = [
+            "--kind", "url", "--url", url, "--sha256", &good, "--limit", "10",
+        ];
+        let (ok, err) = run_child(&args);
+        assert!(!ok);
+        assert!(err.contains("not a plain https URL"), "{url}: {err}");
+    }
+}
+
+// The lent identity needs a descriptor to lend it on; the child is started with exactly the
+// descriptors a parent would give it (0, 1, 2 and the lent one) unless a test says otherwise.
+
+/// What a by-hand frontend fetch is given.
+#[cfg(target_os = "linux")]
+struct Lent<'a> {
+    id: &'a kbf_installer::fetch::identity::Identity,
+    /// The number the descriptor has in the child, and in `--identity-fd`.
+    at: i32,
+    /// Close everything above the standard streams and the lent descriptor.
+    tidy: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn frontend_by_hand(url: &str, digest: &str, limit: u64, lent: &Lent<'_>) -> std::process::Output {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    let fd = lent.id.lend().expect("lends");
+    let (from, at, tidy) = (fd.as_raw_fd(), lent.at, lent.tidy);
+    let mut command = std::process::Command::new(BIN);
+    command
+        .args(["fetch-child", "--kind", "frontend", "--url", url])
+        .args(["--sha256", digest, "--limit", &limit.to_string()])
+        .args(["--identity-fd", &at.to_string()])
+        .env_clear();
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    // SAFETY: the closure runs between fork and exec and makes only system calls.
+    unsafe {
+        command.pre_exec(move || {
+            if from != at {
+                libc::dup2(from, at);
+            }
+            libc::fcntl(at, libc::F_SETFD, 0);
+            if tidy {
+                libc::syscall(libc::SYS_close_range, 3_u32, (at - 1) as u32, 0_u32);
+                libc::syscall(libc::SYS_close_range, (at + 1) as u32, u32::MAX, 0_u32);
+            }
+            Ok(())
+        });
+    }
+    let out = command.output().expect("runs");
+    drop(fd);
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn identity_of(pki: &Pki, node: &Leaf) -> kbf_installer::fetch::identity::Identity {
+    kbf_installer::fetch::identity::Identity {
+        cert: node.cert.clone().into_bytes(),
+        key: node.key.clone().into_bytes(),
+        ca: pki.ca_pem().into_bytes(),
+    }
+}
+
+/// A child lent an identity on descriptor 4 or any other number fetches over mutual TLS and
+/// writes the bytes, no more than its limit.
+///
+/// Mutants seen red: the identity not presented; the limit not applied to the stream (the loop
+/// condition `written < limit` removed).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_lent_an_identity_fetches_from_the_frontend() {
+    let (pki, server) = pki_and_server();
+    let bytes = body(50_000);
+    let grpc = Grpc::start(&server, &pki.ca_pem(), Serve::Bytes(bytes.clone()));
+    let id = identity_of(&pki, &pki.client());
+    for (at, limit) in [(4, 50_001), (9, 20_500)] {
+        let lent = Lent {
+            id: &id,
+            at,
+            tidy: true,
+        };
+        let out = frontend_by_hand(&grpc.url(), &sha(&bytes), limit, &lent);
+        assert!(out.status.success(), "fd {at}: {}", said(&out));
+        let want = &bytes[..bytes.len().min(limit as usize)];
+        assert_eq!(out.stdout, want, "fd {at}");
+    }
+    assert_eq!(*grpc.peers.lock().expect("lock"), [1, 1]);
+}
+
+/// A frontend that answers with an error, before or in the middle of the bytes, is a failed
+/// fetch that names the status; one that is not there is unreachable.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_frontend_that_fails_is_a_failed_fetch() {
+    let (pki, server) = pki_and_server();
+    let id = identity_of(&pki, &pki.client());
+    let lent = Lent {
+        id: &id,
+        at: 4,
+        tidy: true,
+    };
+    let missing = Grpc::start(&server, &pki.ca_pem(), Serve::NotFound);
+    let out = frontend_by_hand(&missing.url(), &sha(b"x"), 100, &lent);
+    assert!(!out.status.success());
+    assert!(said(&out).contains("NotFound"), "{}", said(&out));
+    let broken = Grpc::start(&server, &pki.ca_pem(), Serve::Break { sent: 300 });
+    let out = frontend_by_hand(&broken.url(), &sha(b"x"), 1000, &lent);
+    assert!(!out.status.success());
+    assert!(said(&out).contains("Internal"), "{}", said(&out));
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    };
+    let out = frontend_by_hand(&format!("https://localhost:{port}"), &sha(b"x"), 100, &lent);
+    assert!(!out.status.success());
+    assert!(said(&out).contains("source unreachable"), "{}", said(&out));
+}
+
+/// What the child says when the descriptor it is told to adopt is not a lent identity: a
+/// standard stream, one that is not open, a descriptor the parent left open besides it.
+///
+/// Mutant seen red: the check that the child holds nothing else removed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lent_descriptor_the_child_cannot_adopt_is_a_failed_start() {
+    let (pki, _) = pki_and_server();
+    let id = identity_of(&pki, &pki.client());
+    let url = "https://localhost:1";
+    let digest = sha(b"x");
+    let own = |at: i32, tidy: bool| {
+        let lent = Lent { id: &id, at, tidy };
+        frontend_by_hand(url, &digest, 10, &lent)
+    };
+    // A standard stream is not a lent descriptor.
+    let (ok, err) = run_child(&[
+        "--kind",
+        "frontend",
+        "--url",
+        url,
+        "--sha256",
+        &digest,
+        "--limit",
+        "10",
+        "--identity-fd",
+        "1",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("standard stream"), "{err}");
+    // The parent left a descriptor open besides the lent one.
+    let held = File::open("/").expect("a directory");
+    // SAFETY: dup of a descriptor this test owns; dup clears close-on-exec, on purpose.
+    let leaked = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(&held)) };
+    let out = own(11, false);
+    // SAFETY: closing the descriptor made above.
+    unsafe { libc::close(leaked) };
+    assert!(!out.status.success());
+    assert!(
+        said(&out).contains("which nobody lent it"),
+        "{}",
+        said(&out)
+    );
+}
+
+/// A frontend child refuses a roots file (it trusts the pinned CA only), a URL with a path, and
+/// an identity descriptor that is not open.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_frontend_child_checks_what_it_was_given() {
+    let (pki, _) = pki_and_server();
+    let id = identity_of(&pki, &pki.client());
+    let lent = Lent {
+        id: &id,
+        at: 4,
+        tidy: true,
+    };
+    let out = frontend_by_hand("https://localhost:1/path", &sha(b"x"), 10, &lent);
+    assert!(
+        said(&out).contains("not a plain https URL"),
+        "{}",
+        said(&out)
+    );
+    let good = sha(b"x");
+    let (ok, err) = run_child(&[
+        "--kind",
+        "frontend",
+        "--url",
+        "https://localhost:1",
+        "--sha256",
+        &good,
+        "--limit",
+        "10",
+        "--identity-fd",
+        "77",
+        "--ca-file",
+        "/nonexistent",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("pinned CA only"), "{err}");
+    let (ok, err) = run_child(&[
+        "--kind",
+        "frontend",
+        "--url",
+        "https://localhost:1",
+        "--sha256",
+        &good,
+        "--limit",
+        "10",
+        "--identity-fd",
+        "77",
+    ]);
+    assert!(!ok);
+    assert!(err.contains("Bad file descriptor"), "{err}");
 }

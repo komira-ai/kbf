@@ -174,3 +174,12 @@ fn a_stray_descriptor_is_named() {
     );
     drop(held);
 }
+
+/// A file that cannot be read is a refusal naming it (the read of a process's memory at offset
+/// 0 fails though the file is regular).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_that_fails_to_read_is_refused() {
+    let got = read_pem(Path::new("/proc/self/mem"));
+    assert!(matches!(got, Err(IdentityFault::File { .. })), "{got:?}");
+}
