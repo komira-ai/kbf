@@ -155,8 +155,13 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
         ),
         fenced(
             Keys::Exactly("meta/members_forming"),
-            "members",
+            "members (bootstrap window)",
             "meta/members_forming",
+        ),
+        fenced(
+            Keys::Under("unfilled/"),
+            "members (joiner mark)",
+            "unfilled/3",
         ),
         fenced(
             Keys::Under("deny/"),
