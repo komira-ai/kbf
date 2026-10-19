@@ -60,11 +60,7 @@ fn record(
         window_s: 600,
         components: if activate {
             vec![Locator {
-                name: match platform {
-                    Platform::Linux => "kbf",
-                    Platform::MacOs => "kbf-daemon",
-                }
-                .to_owned(),
+                name: "kbf".to_owned(),
                 sha256: "ab".repeat(32),
                 size: 1000,
                 attestation: "{\"bundle\":1}".to_owned(),
