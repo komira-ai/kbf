@@ -257,6 +257,22 @@ async fn an_identity_that_cannot_be_a_header_is_refused() {
     assert_eq!(rig.a.state.dispatches(), 0);
 }
 
+/// A refusal is sent from the request headers, so the stream is closed before the client's
+/// message is. A client that sends its message after the answer has landed must still read the
+/// answer (RFC 9113 section 8.1), not fail on the closed stream.
+///
+/// Kills: a test client that treats `InactiveStreamId` from `send_data` as a failure of the
+/// call, which failed `bind_run_hold_release_and_shutdown` when the refusal won the race.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_that_beats_the_message_is_still_read() {
+    let rig = Rig::start_secure(Buck2Auth::Bearer, Access::Plain(None)).await;
+    let mut client = rig.client().await;
+    let reply = client.unary_after(CAPS, Duration::from_secs(1)).await;
+    assert_eq!(reply.grpc_status().as_deref(), Some("16"), "{reply:?}");
+    assert!(reply.error.is_none(), "{reply:?}");
+    assert_eq!(rig.a.state.dispatches(), 0);
+}
+
 /// Wrong tokens are counted per address; past the burst even the right token is not looked
 /// at (429, `RESOURCE_EXHAUSTED`), and an address that stops earns its place back. A client
 /// that is right every time is never slowed down.

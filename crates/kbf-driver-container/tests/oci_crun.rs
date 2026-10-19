@@ -46,7 +46,8 @@ async fn run(
 }
 
 /// Catches the sandbox being less than `config.json` says, read from inside: the
-/// action is root with every id a subordinate id, alone in its pid namespace, with the
+/// action is the unprivileged uid 1000 (no capability held, the bounding set kept) with every
+/// id a subordinate id, alone in its pid namespace, with the
 /// constant hostname and loopback only, behind a seccomp filter with the eleven
 /// capabilities, and with no id of the daemon user (a file the daemon owns is
 /// `nobody`'s). The first lease unpacks the image, so this also runs the whole
@@ -59,7 +60,7 @@ async fn the_sandbox_is_what_the_config_says() {
         echo "uid $(id -u):$(id -g) pid $$ host $(hostname)"
         echo "map $(cat /proc/self/uid_map)"
         echo "net $(ls /sys/class/net | tr '\n' ' ')"
-        grep -E '^(Seccomp|NoNewPrivs|CapEff|CapBnd|CapAmb):' /proc/self/status
+        grep -E '^(Seccomp|NoNewPrivs|CapEff|CapPrm|CapBnd|CapAmb):' /proc/self/status
         echo "fds $(ls /proc/self/fd | tr '\n' ' ')"
         echo "kcore $(wc -c < /proc/kcore)"
         (echo x > /proc/sys/kernel/hostname) 2>/dev/null && echo "proc-sys writable" || echo "proc-sys read-only"
@@ -74,14 +75,16 @@ async fn the_sandbox_is_what_the_config_says() {
     let out = cell.stdout(&result);
     assert_eq!(result.exit_code, 0, "{out}\n{}", cell.stderr(&result));
     let subuid = first_subordinate_id();
-    assert!(out.contains("uid 0:0 pid 1 host localhost"), "{out}");
+    assert!(out.contains("uid 1000:1000 pid 1 host localhost"), "{out}");
     assert!(
         out.contains(&format!("map          0 {subuid:>10}      65536")),
         "{out}"
     );
     assert!(out.contains("net lo"), "{out}");
     assert!(out.contains("Seccomp:\t2"), "{out}");
-    assert!(out.contains("CapEff:\t00000000800405fb"), "{out}");
+    // A non-root process holds no capability after `exec`, whatever the bounding set.
+    assert!(out.contains("CapEff:\t0000000000000000"), "{out}");
+    assert!(out.contains("CapPrm:\t0000000000000000"), "{out}");
     assert!(out.contains("CapBnd:\t00000000800405fb"), "{out}");
     assert!(out.contains("CapAmb:\t0000000000000000"), "{out}");
     // 0, 1, 2 and the descriptor `ls` itself holds: nothing of the host leaks in.

@@ -114,10 +114,28 @@ pub(crate) struct Layout {
     pub v1: PathBuf,
     pub blobs: PathBuf,
     pub tmp: PathBuf,
-    /// The open lock file, holding the exclusive flock for as long as it is open.
-    pub lock: File,
+    /// The lock file, holding the exclusive flock until it is dropped.
+    pub lock: DirLock,
     /// Whether the cache shares a filesystem with the scratch directory.
     pub same_filesystem: bool,
+}
+
+/// The cache directory's `lock` file with its `flock` held.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked while
+/// the cache is open (any spawn of a child by another thread of this process, and the
+/// daemon starts an action per lease) carries a copy until it execs, so closing the file
+/// would leave the directory locked for as long as that takes. Dropping unlocks first,
+/// which no copy outlives, so the directory can be opened again once the drop returns.
+#[derive(Debug)]
+pub(crate) struct DirLock(File);
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.0.unlock();
+    }
 }
 
 /// Takes the lock on `dir`, then (and only then) moves an unknown layout version aside,
@@ -145,6 +163,8 @@ pub(crate) fn open(dir: &Path, scratch: &Path, now: u64) -> Result<Layout, Disab
     locked
         .map_err(io::Error::from)
         .map_err(unusable(&lock_path))?;
+    // From here every way out of the open, an error included, unlocks.
+    let lock = DirLock(lock);
     move_aside(dir, now).map_err(unusable(dir))?;
     let v1 = dir.join(VERSION);
     let blobs = v1.join("blobs");

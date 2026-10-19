@@ -73,7 +73,7 @@ fn unchanged(path: &Path, bytes: &[u8]) {
     );
 }
 
-/// C-1. Catches a cached inode a container can write or re-own (the "`chown -hR 1:1`
+/// C-1. Catches a cached inode a container can write or re-own (the "`chown -hR 1001:1001`
 /// over `root`, files included" mutant): an action appends to, truncates, chmods,
 /// opens for read and write, and links-then-appends a cached input. Each write is
 /// refused (in place, the action gets EACCES), the entry is unchanged, and a second

@@ -199,6 +199,18 @@ impl Router {
             .map_err(Tried::Node)
     }
 
+    /// [`Router::copy_to`] for a caller outside a commit (read repair): the blob `digest`,
+    /// read from whichever owner has it and stored on `node`.
+    pub(crate) async fn copy_blob_to(
+        &self,
+        node: &Arc<dyn Storage>,
+        digest: Digest,
+    ) -> Result<(), StorageError> {
+        self.copy_to(node, digest)
+            .await
+            .map_err(|(Tried::Node(e) | Tried::Elsewhere(e))| e)
+    }
+
     /// The blob `digest`, read from whichever owner has it and stored on `node`.
     async fn copy_to(&self, node: &Arc<dyn Storage>, digest: Digest) -> Result<(), Tried> {
         let room = digest

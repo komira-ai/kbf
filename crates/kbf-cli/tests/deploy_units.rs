@@ -314,12 +314,10 @@ fn kbf_deploy_renders_exactly_the_modes_kbf_takes() {
     assert_eq!(deploy, help);
 }
 
-/// The scratch directory `name` under the workspace's `target/`, empty.
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A fresh, empty scratch directory for `name` under the workspace's `target/`, removed
+/// when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 /// The real host, but a command it runs keeps this test's `LLVM_PROFILE_FILE`:

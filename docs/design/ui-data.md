@@ -354,7 +354,7 @@ The footer's offset and length are kept in the object's index row, so a footer i
 
 | Key | Value | Row | Count | Size |
 |---|---|---|---|---|
-| `ui/invid/<inv-key>` | invocation header: counters, owner, instance names, commit and branch refs, state, `complete`, report pointers; `idless` for a pseudo-invocation (3), which has no list entries | about 450 B indexed | 1,000/day x 400 d | 180 MB |
+| `ui/invid/<inv-key>/<writer>` | one writer's invocation header, counting the records that writer wrote: counters, owner, instance names, commit and branch refs, state, `complete`, report pointers; `idless` for a pseudo-invocation (3), which has no list entries. A reader merges the rows of every writer (counts summed, instances joined, the span widened, closed only when every writer closed it, the earliest list time). A row `ui/invid/<inv-key>` with no writer, written before headers were per writer, is read as one more writer's | about 450 B indexed | 1,000/day x 400 d | 180 MB |
 | `ui/inv/<instance>/<first_seen ms>/<inv-key>` | list entry, one per instance the record's calls used | about 80 B | 400,000 or more | 32 MB |
 | `ui/invc/<commit ref>/<first_seen ms>/<inv-key>` | list entry by commit, written when a report or header names the commit | about 60 B | about 1,000/day x 400 d | 24 MB |
 | `ui/ichunk/<inv-key>/<writer>/<seq>` | day, bytes, row range, time range, failed count, footer offset and length | 60 B | about 10,400/day x 30 d | 19 MB |
