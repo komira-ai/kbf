@@ -1,6 +1,7 @@
 use std::fs::TryLockError;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -52,7 +53,54 @@ fn the_lock_is_held_while_a_locked_lives() {
     );
     held.write(&full_state()).expect("write");
     drop(held);
-    other.try_lock().expect("free once dropped");
+    free_once_dropped(&other);
+}
+
+/// Takes the lock on `other` once the holder is dropped, waiting out a child forked meanwhile.
+///
+/// Other tests of this binary spawn processes. A child forked while the lock's descriptor was
+/// open holds a duplicate of it until it execs (`CLOEXEC` closes at exec, not at fork), and
+/// `flock` is released only when the last duplicate closes, so for those microseconds a
+/// dropped lock still looks held. The wait is bounded; a lock that stays held fails.
+fn free_once_dropped(other: &File) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match other.try_lock() {
+            Ok(()) => return,
+            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => panic!("still held 2 s after it was dropped: {e}"),
+        }
+    }
+}
+
+/// Catches a lock that is not released once its holder is dropped while processes are being
+/// spawned: the drop must free it for good, though a forked child briefly keeps a duplicate
+/// of the descriptor.
+///
+/// Mutant seen red: the strict check in the test above (`try_lock` once, no wait) failed 6 of
+/// 300 rounds with a spawner thread running; the bounded wait never fails.
+#[test]
+fn the_lock_is_free_after_a_drop_while_children_are_spawned() {
+    let (root, dir) = host_root("deploy-host-state-lock-spawn");
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawner = {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = std::process::Command::new("/bin/true").status();
+            }
+        })
+    };
+    for _ in 0..300 {
+        let held = Locked::acquire(&root).expect("lock");
+        let other = File::open(dir.join("run/kbf-installer/lock")).expect("the lock file exists");
+        drop(held);
+        free_once_dropped(&other);
+    }
+    stop.store(true, Ordering::Relaxed);
+    spawner.join().expect("spawner");
 }
 
 /// Catches a lock file or state file another user can read or write: the state says
