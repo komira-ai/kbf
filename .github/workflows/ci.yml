@@ -332,9 +332,11 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       # pg_dump and pg_restore for the installer's backup test: as new as the server above
-      # (17), because a dump tool older than its server refuses to run. The runner image
-      # already has the PostgreSQL apt repository.
-      - run: sudo apt-get update
+      # (17), because a dump tool older than its server refuses to run.
+      # The runner image has no PostgreSQL apt repository: postgresql-common's own script adds
+      # the project's (with its signing key) and updates the package lists.
+      - run: sudo apt-get install -y --no-install-recommends postgresql-common
+      - run: sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
       - run: sudo apt-get install -y --no-install-recommends postgresql-client-17
       - run: cargo clippy -p kbf-state --features postgres --all-targets --locked -- -D warnings
       - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored
@@ -445,7 +447,10 @@ jobs:
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-cli --test frontend_process -- --include-ignored postgres_state_store
-      - run: sudo apt-get update
+      # The runner image has no PostgreSQL apt repository: postgresql-common's own script adds
+      # the project's (with its signing key) and updates the package lists.
+      - run: sudo apt-get install -y --no-install-recommends postgresql-common
+      - run: sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
       - run: sudo apt-get install -y --no-install-recommends postgresql-client-17
       - name: Run the installer's backup round trip under coverage
         env:
