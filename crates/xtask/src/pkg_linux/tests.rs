@@ -351,7 +351,27 @@ fn the_real_sysusers_and_tmpfiles_files_say_what_the_contract_says() {
             .map(|l| l.split_whitespace().map(str::to_owned).collect())
             .collect()
     };
-    let users: Vec<String> = lines("sysusers.d/kbf-installer.conf")
+    let entries = lines("sysusers.d/kbf-installer.conf");
+    // Design section 3: `kbf-signer` owns the CA key and has no home, no login and a
+    // system id with a group of its own name; there is no `kbf-verify` user.
+    let signer: Vec<&Vec<String>> = entries.iter().filter(|f| f[1] == "kbf-signer").collect();
+    assert_eq!(signer.len(), 1, "exactly one kbf-signer entry: {entries:?}");
+    let f = signer[0];
+    assert_eq!(
+        [
+            f[0].as_str(),
+            f[2].as_str(),
+            f[f.len() - 2].as_str(),
+            f[f.len() - 1].as_str()
+        ],
+        ["u", "-", "/nonexistent", "/usr/sbin/nologin"],
+        "{f:?}"
+    );
+    assert!(
+        entries.iter().all(|f| f[1] != "kbf-verify"),
+        "section 3: there is no kbf-verify user: {entries:?}"
+    );
+    let users: Vec<String> = entries
         .into_iter()
         .map(|f| {
             assert_eq!((f[0].as_str(), f[3].starts_with('"')), ("u", true), "{f:?}");

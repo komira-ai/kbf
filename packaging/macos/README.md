@@ -26,7 +26,7 @@ writes `<dir>/kbf-installer-<v>-macos-arm64.pkg`, a flat component package (iden
 | `/Library/Logs/kbf-installer` | 0755 | where the job writes |
 
 Every directory on the way to the tool is 0755 root:wheel. The package creates no
-configuration, no release and no user (`kbf`, `_kbf-fetch`, `kbf-verify` and the lease
+configuration, no release and no user (`kbf`, `_kbf-fetch` and the lease
 users are made by `setup`, as root; a payload cannot make users).
 
 ### Written in Rust, not by `pkgbuild`

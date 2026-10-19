@@ -329,7 +329,7 @@ fn installer_places_files_and_loads_nothing() {
     assert!(!Path::new(JOB_LOG).exists());
     assert!(!Path::new("/usr/local/kbf-installer/releases").exists());
     assert!(!Path::new("/usr/local/kbf-installer/current").exists());
-    for user in ["kbf", "_kbf-fetch", "kbf-verify"] {
+    for user in ["kbf", "_kbf-fetch"] {
         failure("id", &["-u", user]);
     }
 

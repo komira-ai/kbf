@@ -46,7 +46,7 @@ pub const TMPFILES_DIRS: [(&str, &str); 2] = [
     ("/var/cache/kbf-fetch", "711"),
 ];
 /// The users `sysusers.d` makes.
-pub const USERS: [&str; 4] = ["kbf", "kbf-server", "kbf-fetch", "kbf-verify"];
+pub const USERS: [&str; 4] = ["kbf", "kbf-server", "kbf-fetch", "kbf-signer"];
 /// The `User=` and `Group=` names a unit's text sets, as `("User" | "Group", name)`, in
 /// order. Comments and empty values (which reset the setting) are skipped.
 pub fn unit_accounts(text: &str) -> Vec<(&'static str, String)> {

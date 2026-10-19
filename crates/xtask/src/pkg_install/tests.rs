@@ -357,7 +357,7 @@ impl World {
         if !pkg_linux::USERS.contains(&name) {
             return fail("");
         }
-        let shell = if self.is(Defect::UserWithShell) && name == "kbf-verify" {
+        let shell = if self.is(Defect::UserWithShell) && name == "kbf-signer" {
             "/opt/shell"
         } else {
             "/usr/sbin/nologin"
@@ -500,7 +500,7 @@ fn each_defect_of_the_package_or_the_system_is_a_named_problem() {
         (
             Format::Deb,
             Defect::UserWithShell,
-            "kbf-verify's login shell: \"/opt/shell\"",
+            "kbf-signer's login shell: \"/opt/shell\"",
         ),
         (
             Format::Deb,
