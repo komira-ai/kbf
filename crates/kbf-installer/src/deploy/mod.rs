@@ -162,7 +162,12 @@ impl Options {
 
 /// What a deploy talks to.
 pub struct Env<'a> {
+    /// The update API: every call that reads or changes the release (`--api`).
     pub api: &'a dyn Operator,
+    /// The frontend the gates observe (`--observe`): `/metrics` and `/v1/invocations`. A
+    /// different listener from `api` on a real host (the public proxy answers its own
+    /// `/metrics`, and the update routes are not the child's), so a gate never reads `api`.
+    pub observe: &'a dyn Operator,
     pub clock: &'a dyn Clock,
     pub smoke: &'a dyn Smoke,
     pub check: &'a dyn Check,
@@ -238,6 +243,21 @@ impl Run<'_> {
 
     pub fn get_json(&self, path: &str) -> Result<Value, String> {
         let reply = self.send(&Request::get(path))?;
+        if reply.status != 200 {
+            return Err(format!("GET {path}: status {}", reply.status));
+        }
+        reply
+            .json()
+            .ok_or_else(|| format!("GET {path}: the body is not JSON"))
+    }
+
+    /// GET `path` from the observed frontend and parse the JSON body.
+    pub fn observe_json(&self, path: &str) -> Result<Value, String> {
+        let reply = self
+            .env
+            .observe
+            .send(&Request::get(path))
+            .map_err(|e| format!("GET {path}: {e}"))?;
         if reply.status != 200 {
             return Err(format!("GET {path}: status {}", reply.status));
         }
@@ -455,7 +475,7 @@ impl Run<'_> {
         // blob, nothing untraced. Nothing has been changed yet, so a red is a refusal.
         self.gate_step("preflight");
         let under = self.gate_scrape(Exit::Refused)?;
-        self.gate_under_replicated(under, Exit::Refused)?;
+        self.gate_preflight_storage(under)?;
         self.gate_snapshot(Exit::Refused)?;
         Ok(wanted)
     }

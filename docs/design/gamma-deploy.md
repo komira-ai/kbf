@@ -13,7 +13,7 @@ drain system rolls the nodes, one storage node at a time.
 neither. The config must be a regular file nobody else may write (and root-owned); it is not
 read when both flags are given. The token file must be a regular file, mode 0600 or 0400.
 The address must be loopback. Run through `sudo` (the environment carries `SUDO_UID`, set to the
-caller's uid), `deploy` refuses `--api`, `--token-file`, `--config`, `--lock`, `--platform` and `--result`
+caller's uid), `deploy` refuses `--api`, `--token-file`, `--config`, `--lock`, `--platform`, `--result`, `--observe` and `--observe-token-file`
 with exit 2: the caller would choose where root sends the token and which file it reads. Those
 values then come only from the root-owned config. Scope the sudoers rule to the exact argument
 list too, with no wildcard: `deploy --apply --json --commit` followed by forty `[0-9a-f]`
@@ -68,7 +68,17 @@ the deploy first (`result_unwritable`). `--set-hash <64hex>` is the hash of the 
 (`SHA256SUMS`); without it the document carries a hash of what `GET /v1/releases` lists for
 the commit. `--settle-timeout-s` (default 600) is gate E's window.
 
-`/metrics` is scraped through the operator API at the preflight, after `desired`, at every
+**Where the gates read.** `--observe <127.0.0.1:port>` (host flag; config key `observe`;
+required with `--apply`, exit 2 without it) is the frontend whose `/metrics` and
+`/v1/invocations` the gates read, and `--observe-token-file` (host flag; config key
+`observe_token_file`; default: the `--token-file` token, one operator token guards both). It is
+not `--api`: the public proxy answers `/metrics` itself (its own `kbf_proxy_*` counters, not
+the frontend's) and serves the update routes, so a gate read sent there would see no
+series. Gates read only `--observe`; the release and update calls go only to `--api`. Both
+addresses must be loopback. The active child's port changes with the slot on a handover, so
+`--observe` must name the child that is serving after the swap [A].
+
+`/metrics` is scraped from `--observe` at the preflight, after `desired`, at every
 poll of the node wait, after the frontend step and at the post checks. A measurement that is
 not there is red: a scrape that fails or cannot be parsed, a series that is missing, a
 listing that is cut off. The first red ends the deploy (`gate_red`; exit 1, or 3 in the
@@ -76,11 +86,11 @@ preflight where nothing has changed) and the detail names the gate, the value an
 
 | Gate row | Reads | Red when |
 |---|---|---|
-| `a_inflight_ids` | `GET /v1/invocations?state=open` at the preflight, at each node's confirmation and after `desired` and the frontend; then `?since=&until=` over the whole deploy | a listing cannot be read (also when the route is off: it needs `--history-objects`) |
+| `a_inflight_ids` | `GET /v1/invocations?state=open` at the preflight, at each node's confirmation and after `desired` and the frontend; then `?since=&until=` over the whole deploy | a listing cannot be read (also when the route is off: it needs `--history-objects`) or is partial |
 | `b_relay_untraced` | `kbf_frontend_relay_untraced` at every scrape | any scrape is above 0 or lacks the series |
-| `c_farm_class_failures` | every recorded id's `/actions` pages, after the deploy (also after a failed one) | an attempt ended `infra`, `lost` or `lost_*` (client-side filter), or an id cannot be read |
+| `c_farm_class_failures` | every recorded id's `/actions` pages, after the deploy (also after a failed one) | an attempt ended `infra`, `lost` or `lost_*` (client-side filter), an id cannot be read, or its record is `rows_capped` (not every attempt is visible) |
 | `d_lost_blobs`, `d_blob_losses_delta` | `kbf_cache_lost_blobs`; `kbf_cache_blob_losses_total` minus its first scrape | any scrape is above 0 or lacks the series; the counter went backwards |
-| `e_under_replicated` | `kbf_under_replicated_blobs` | not 0 (or absent) at the preflight; not back to 0 within the settle window after a node's step; the next node's step began (`activated_unconfirmed`) or confirmed before that |
+| `e_under_replicated` | `kbf_under_replicated_blobs` | not 0 at the preflight (a farm that reports no series at all is refused there as `gate_unjudgeable`, exit 3: it needs storage members that have reported, as the post check on `/v1/members` already does); not back to 0 within the settle window after a node's step; the next node's step began (`activated_unconfirmed`) or confirmed before that |
 | `f_auto_revert` | node states and the frontend order | a node or the frontend reverted by its own timer |
 
 The deploy never orders a node, so gate E cannot hold the drain system's next step; it

@@ -232,6 +232,27 @@ impl Run<'_> {
             .map_err(|e| gate_fail(exit, e))
     }
 
+    /// E before anything is changed: storage must be known to be fully replicated. A farm that
+    /// reports no such series at all (no storage members, or none that has reported lately)
+    /// can never pass the gate, so it is refused here with that said, not found red mid-deploy.
+    /// It stays red, not waived.
+    pub(super) fn gate_preflight_storage(&mut self, under: Sample) -> Result<(), Fail> {
+        if self.gates.active && under == Sample::Absent {
+            let now = self.env.clock.now();
+            let _ = self.gates.record(name::UNDER_REPLICATED, under, now);
+            return Err(fail(
+                Exit::Refused,
+                "gate_unjudgeable",
+                format!(
+                    "gate {}: this farm reports no under-replicated series, so the gate cannot \
+                     be judged (it needs storage members that have reported); at step preflight",
+                    name::UNDER_REPLICATED
+                ),
+            ));
+        }
+        self.gate_under_replicated(under, Exit::Refused)
+    }
+
     /// Record F: `reverted` is what fired (a node, or the frontend), else a clean look.
     pub(super) fn gate_revert(&mut self, reverted: Option<&str>) {
         if !self.gates.active {

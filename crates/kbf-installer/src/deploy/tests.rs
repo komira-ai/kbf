@@ -116,6 +116,8 @@ struct Farm {
     /// Calls the fake does not know. It answers them 404 and notes them here, so a test that
     /// leans on a call the fake never learned fails instead of passing on a silent default.
     unknown: RefCell<Vec<String>>,
+    /// Every call the observed frontend ([`Observed`]) was asked.
+    observed_log: RefCell<Vec<String>>,
 }
 
 /// A build the fake farm knows: running from `from` to `to` (seconds), whose actions had
@@ -126,6 +128,8 @@ struct Build {
     from: u64,
     to: Option<u64>,
     classes: Vec<&'static str>,
+    /// Its record stopped at the row bound.
+    capped: bool,
 }
 
 /// What a healthy farm says on `/metrics`.
@@ -191,10 +195,26 @@ impl Farm {
             builds: Vec::new(),
             page: 0,
             unknown: RefCell::new(Vec::new()),
+            observed_log: RefCell::new(Vec::new()),
         }
     }
 
     /// `/metrics` is the same at every scrape.
+    /// The scripted failure for `call`, if one applies.
+    fn broken_reply(&self, call: &str) -> Option<io::Result<Reply>> {
+        let b = self.broken.iter().find(|b| {
+            call.starts_with(b.call) && (!b.after_desired || self.desired_at.get().is_some())
+        })?;
+        Some(match b.how {
+            Breaks::Io => Err(io::Error::other("the API is down")),
+            Breaks::Status(s) => Farm::reply(s, json!({})),
+            Breaks::Body(text) => Ok(Reply {
+                status: 200,
+                body: text.as_bytes().to_vec(),
+            }),
+        })
+    }
+
     fn rfc3339(secs: u64) -> String {
         summary::utc(1_790_000_000 + secs)
     }
@@ -255,9 +275,12 @@ impl Farm {
                 .collect();
             return Some(self.paged(path, "invocations", query, items));
         }
-        let id = path
-            .strip_prefix("/v1/invocations/")?
-            .strip_suffix("/actions")?;
+        let rest = path.strip_prefix("/v1/invocations/")?;
+        if !rest.ends_with("/actions") {
+            let build = self.builds.iter().find(|b| b.id == rest)?;
+            return Some(json!({"id": build.id, "rows_capped": build.capped, "complete": true}));
+        }
+        let id = rest.strip_suffix("/actions")?;
         let build = self.builds.iter().find(|b| b.id == id)?;
         let mut rows: Vec<Value> = vec![json!({"attempts": [{"end": {"result": "ok"}}]})];
         rows.extend(
@@ -339,17 +362,8 @@ impl Operator for Farm {
             .push(format!("{} {}", r.method, r.path));
         let now = self.now.get();
         let call = format!("{} {}", r.method, r.path);
-        if let Some(b) = self.broken.iter().find(|b| {
-            call.starts_with(b.call) && (!b.after_desired || self.desired_at.get().is_some())
-        }) {
-            return match b.how {
-                Breaks::Io => Err(io::Error::other("the API is down")),
-                Breaks::Status(s) => Farm::reply(s, json!({})),
-                Breaks::Body(text) => Ok(Reply {
-                    status: 200,
-                    body: text.as_bytes().to_vec(),
-                }),
-            };
+        if let Some(reply) = self.broken_reply(&call) {
+            return reply;
         }
         match (r.method, r.path.as_str()) {
             ("PUT", _) => Farm::reply(self.upload_status, json!({"sha256": "x", "size": 1})),
@@ -441,19 +455,42 @@ impl Operator for Farm {
                 Farm::reply(202, json!({"order_id": 2}))
             }
             ("GET", "/readyz") => Farm::reply(if self.ready { 200 } else { 503 }, json!({})),
-            ("GET", "/metrics") => match (self.metrics)(now) {
+            _ => {
+                self.unknown.borrow_mut().push(call);
+                Farm::reply(404, json!({}))
+            }
+        }
+    }
+}
+
+/// The frontend the gates observe (`--observe`): `/metrics` and `/v1/invocations`, on the
+/// farm's state and clock but a listener of its own. It answers nothing else (404, noted), and
+/// the update API ([`Farm`]) answers none of these.
+struct Observed<'a>(&'a Farm);
+
+impl Operator for Observed<'_> {
+    fn send(&self, r: &Request) -> io::Result<Reply> {
+        let f = self.0;
+        let call = format!("{} {}", r.method, r.path);
+        f.observed_log.borrow_mut().push(call.clone());
+        if let Some(reply) = f.broken_reply(&call) {
+            return reply;
+        }
+        let now = f.now.get();
+        match (r.method, r.path.as_str()) {
+            ("GET", "/metrics") => match (f.metrics)(now) {
                 Some(text) => Ok(Reply {
                     status: 200,
                     body: text.into_bytes(),
                 }),
                 None => Farm::reply(503, json!({})),
             },
-            ("GET", p) if p.starts_with("/v1/invocations") => match self.invocations(r, now) {
+            ("GET", p) if p.starts_with("/v1/invocations") => match f.invocations(r, now) {
                 Some(body) => Farm::reply(200, body),
                 None => Farm::reply(404, json!({"error": "no_record"})),
             },
             _ => {
-                self.unknown.borrow_mut().push(call);
+                f.unknown.borrow_mut().push(format!("observe: {call}"));
                 Farm::reply(404, json!({}))
             }
         }
@@ -511,8 +548,10 @@ fn run_with(
     let clock = Clk(farm.now.clone());
     let smoke = FixedSmoke(smoke);
     let check = FixedCheck(Ok(true));
+    let observed = Observed(farm);
     let env = Env {
         api: farm,
+        observe: &observed,
         clock: &clock,
         smoke: &smoke,
         check: &check,
@@ -833,8 +872,10 @@ fn a_failed_installer_check_refuses_and_an_unavailable_one_is_recorded() {
     let clock = Clk(f.now.clone());
     let smoke = FixedSmoke(SmokeResult::Pass);
     let bad = FixedCheck(Err("envoy is out of range".into()));
+    let observed = Observed(&f);
     let env = Env {
         api: &f,
+        observe: &observed,
         clock: &clock,
         smoke: &smoke,
         check: &bad,
@@ -846,8 +887,10 @@ fn a_failed_installer_check_refuses_and_an_unavailable_one_is_recorded() {
     let f = farm(two_nodes());
     let clock = Clk(f.now.clone());
     let none = NoCheck;
+    let observed = Observed(&f);
     let env = Env {
         api: &f,
+        observe: &observed,
         clock: &clock,
         smoke: &smoke,
         check: &none,
@@ -1126,8 +1169,10 @@ fn with_step_back(farm: &Farm, at: u64) -> Summary {
     };
     let smoke = FixedSmoke(SmokeResult::Pass);
     let check = FixedCheck(Ok(true));
+    let observed = Observed(farm);
     let env = Env {
         api: farm,
+        observe: &observed,
         clock: &clock,
         smoke: &smoke,
         check: &check,
@@ -1328,6 +1373,8 @@ mod cli_tests {
             ("--platform", "linux-x86_64"),
             ("--cas", "http://127.0.0.1:1"),
             ("--result", "/etc/cron.d/x"),
+            ("--observe", "127.0.0.1:2"),
+            ("--observe-token-file", "/etc/shadow"),
         ] {
             let list = args(&["--commit", &commit, flag, value]);
             let (mut out, mut err) = (Vec::new(), Vec::new());

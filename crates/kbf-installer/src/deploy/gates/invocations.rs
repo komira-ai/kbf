@@ -39,7 +39,7 @@ pub(super) fn list(run: &Run, query: &str) -> Result<Vec<String>, String> {
     let mut path = format!("/v1/invocations?{query}&page_size=200");
     let mut ids = Vec::new();
     for _ in 0..MAX_PAGES {
-        let page = run.get_json(&path)?;
+        let page = run.observe_json(&path)?;
         let items = page
             .get("invocations")
             .and_then(Value::as_array)
@@ -70,12 +70,22 @@ pub(super) fn farm_class_failures(run: &Run, id: &str) -> Result<Vec<String>, St
     if !safe_id(id) {
         return Err(format!("`{id}` is not an invocation id"));
     }
+    // A record that stopped at its row bound shows only part of its attempts: a gate that
+    // cannot see every attempt cannot pass.
+    let record = run
+        .observe_json(&format!("/v1/invocations/{id}"))
+        .map_err(|e| format!("build {id}: {e}"))?;
+    if record.get("rows_capped").and_then(Value::as_bool) == Some(true) {
+        return Err(format!(
+            "build {id}: its rows are capped, so not every attempt is visible"
+        ));
+    }
     let prefix = format!("/v1/invocations/{id}/actions?");
     let mut path = format!("{prefix}page_size=1000");
     let mut found = Vec::new();
     for _ in 0..MAX_PAGES {
         let page = run
-            .get_json(&path)
+            .observe_json(&path)
             .map_err(|e| format!("build {id}: {e}"))?;
         let rows = page
             .get("actions")

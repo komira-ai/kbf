@@ -262,11 +262,14 @@ fn a_loss_counter_that_went_backwards_is_red() {
 /// Mutants planted: an absent under-replicated reading passed as 0.
 #[test]
 fn the_preflight_refuses_storage_that_is_not_healthy_or_not_known() {
-    for (under, value) in [(Some(2.0), ": 2,"), (None, "absent")] {
+    for (under, value, reason) in [
+        (Some(2.0), ": 2,", "gate_red"),
+        (None, "no under-replicated series", "gate_unjudgeable"),
+    ] {
         let mut f = farm(two_nodes());
         script(&mut f, move |_, g| g.under_replicated = under);
         let (s, doc) = run_gated(&f, &format!("preflight-{}", under.is_some()));
-        assert_eq!((s.exit, s.reason.as_str()), (3, "gate_red"), "{}", s.line());
+        assert_eq!((s.exit, s.reason.as_str()), (3, reason), "{}", s.line());
         for part in [name::UNDER_REPLICATED, value, "preflight"] {
             assert!(
                 s.detail.contains(part),
@@ -380,6 +383,31 @@ fn storage_not_repaired_when_the_settle_window_ends_is_red() {
     assert!(f.now.get() <= 170, "ended at {}", f.now.get());
 }
 
+/// Proves a series that goes missing after a node's step (the members stopped reporting) is
+/// not a repair: the gate waits out the window and is red naming the absence. Catches an absent
+/// reading taken as 0 once the farm is running.
+///
+/// Mutants planted: an absent under-replicated reading passed as 0.
+#[test]
+fn storage_that_stops_reporting_after_a_node_step_is_red() {
+    let mut f = farm(vec![node("a-store", "linux-x86_64", Fate::Confirm(100))]);
+    f.complete = vec!["linux-x86_64"];
+    script(&mut f, |t, g| {
+        if t >= 100 {
+            g.under_replicated = None;
+        }
+    });
+    let (s, _) = run_gated_with(&f, "stops-reporting", |o| {
+        o.settle = Duration::from_secs(60)
+    });
+    red_at(
+        &s,
+        name::UNDER_REPLICATED,
+        "absent",
+        "not repaired within the 60s settle window",
+    );
+}
+
 // ---- gate A and C ------------------------------------------------------------------
 
 fn build(id: &'static str, from: u64, to: Option<u64>, classes: &[&'static str]) -> Build {
@@ -388,6 +416,7 @@ fn build(id: &'static str, from: u64, to: Option<u64>, classes: &[&'static str])
         from,
         to,
         classes: classes.to_vec(),
+        capped: false,
     }
 }
 
@@ -617,6 +646,8 @@ fn the_command_line_leaves_a_finished_document_on_an_api_failure() {
         "--result",
         result.to_str().unwrap(),
         "--apply",
+        "--observe",
+        "127.0.0.1:2",
     ]
     .map(str::to_owned)
     .to_vec();
@@ -679,4 +710,56 @@ fn a_document_that_cannot_be_started_stops_the_deploy_before_it_begins() {
         s.line()
     );
     assert!(f.log.borrow().is_empty(), "{:?}", f.log.borrow());
+}
+
+// ---- where the gates read ----------------------------------------------------------
+
+/// Proves the gates read only the observed frontend and the update calls go only to the
+/// update API: every `/metrics` and `/v1/invocations` call is in the observed log, none is in
+/// the API log, and the observed frontend was asked nothing else. Both fakes answer an unknown
+/// call 404 (noted), so a gate that reads the wrong listener is red, not quietly served.
+/// Catches gate reads sent to `--api` (the public proxy answers its own `/metrics`, and the
+/// update API serves neither route).
+///
+/// Mutants planted: the gate reads sent to the update API.
+#[test]
+fn gate_reads_go_to_the_observed_frontend_and_update_calls_to_the_api() {
+    let mut f = farm(two_nodes());
+    f.builds = vec![build("b1", 22, Some(27), &[])];
+    let (s, _) = run_gated(&f, "addressing");
+    assert_eq!(s.exit, 0, "{}", s.line());
+    let on_api = |l: &String| l.contains("/metrics") || l.contains("/v1/invocations");
+    assert!(
+        !f.log.borrow().iter().any(on_api),
+        "gate reads reached --api: {:?}",
+        f.log.borrow()
+    );
+    let seen = f.observed_log.borrow();
+    assert!(seen.iter().any(|l| l == "GET /metrics"));
+    assert!(
+        seen.iter()
+            .any(|l| l.starts_with("GET /v1/invocations?state=open"))
+    );
+    assert!(
+        seen.iter().all(on_api),
+        "the observed frontend was asked: {seen:?}"
+    );
+    assert!(f.requests("POST /v1/update/desired") == 1);
+}
+
+/// Proves a recorded build whose record stopped at its row bound is red for gate C (not
+/// every attempt is visible), and an uncapped one is read. Catches a gate that passes on the
+/// rows it can see.
+///
+/// Mutants planted: `rows_capped` not looked at.
+#[test]
+fn a_build_whose_rows_are_capped_is_red() {
+    let mut f = farm(two_nodes());
+    let mut capped = build("b-capped", 22, Some(27), &[]);
+    capped.capped = true;
+    f.builds = vec![capped];
+    let (s, doc) = run_gated(&f, "capped");
+    red_at(&s, name::FARM_FAILURES, "absent", "b-capped");
+    assert!(s.detail.contains("capped"), "{}", s.detail);
+    assert_eq!(gate(&doc, name::FARM_FAILURES).measured, None);
 }

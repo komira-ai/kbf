@@ -55,6 +55,8 @@ impl Rig {
             lock.to_str().unwrap(),
             "--result",
             self.dir.join("result.json").to_str().unwrap(),
+            "--observe",
+            "127.0.0.1:2",
         ]
         .map(str::to_owned)
         .to_vec()
@@ -123,6 +125,40 @@ fn every_flag_takes_its_value() {
     assert!(err.contains("--set-hash"), "{err}");
     let (code, _, err) = rig.go(&["--set-hash", &"ab".repeat(32)], b"", false);
     assert_ne!(code, 2, "{err}");
+}
+
+/// Proves an applied deploy that is not told where the gates read does not start (exit 2,
+/// naming `--observe`), a plan does not need it, `--observe` must be loopback and an address,
+/// and `--observe-token-file` is read like the token file. Catches a deploy that defaults the
+/// gate reads to `--api` (which does not serve them) or reads them from a remote address.
+///
+/// Mutants planted: the missing `--observe` allowed with `--apply`.
+#[test]
+fn an_applied_deploy_must_name_the_frontend_it_observes() {
+    let rig = Rig::new("observe");
+    let without: Vec<String> = {
+        let mut a = rig.base();
+        let at = a.iter().position(|x| x == "--observe").unwrap();
+        a.drain(at..=at + 1);
+        a
+    };
+    let host = rig.host(true);
+    let (code, out, err) = rig.go_with(without.clone(), &["--apply"], b"", &host);
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(err.contains("--observe is required"), "{err}");
+    let (code, _, err) = rig.go_with(without, &[], b"", &host);
+    assert_ne!(code, 2, "a plan needs no --observe: {err}");
+    for bad in ["0.0.0.0:2", "not-an-address"] {
+        let mut a = rig.base();
+        let at = a.iter().position(|x| x == "--observe").unwrap();
+        a[at + 1] = bad.to_owned();
+        let (code, _, err) = rig.go_with(a, &["--apply"], b"", &host);
+        assert_eq!(code, 2, "{bad}: {err}");
+        assert!(err.contains("--observe"), "{bad}: {err}");
+    }
+    let (code, _, err) = rig.go(&["--observe-token-file", "/no/such/token"], b"", false);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--observe-token-file"), "{err}");
 }
 
 /// Proves the host config is read only when a flag is missing, and is refused when it is not

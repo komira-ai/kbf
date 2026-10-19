@@ -27,7 +27,7 @@ pub const CONFIG: &str = "/etc/kbf-installer/deploy.json";
 pub const RESULT: &str = "/var/lib/kbf-installer/deploy-result.json";
 
 pub const USAGE: &str = "usage: kbf-installer deploy --commit <40hex> [--api <127.0.0.1:port>] \
-[--token-file <path>] [--config <path>] [--result <path>] [--set-hash <64hex>] [--settle-timeout-s N] [--cas http(s)://127.0.0.1:port] [--cas-ca <pem>] [--cas-server-name <dns>] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
+[--token-file <path>] [--observe <127.0.0.1:port>] [--observe-token-file <path>] [--config <path>] [--result <path>] [--set-hash <64hex>] [--settle-timeout-s N] [--cas http(s)://127.0.0.1:port] [--cas-ca <pem>] [--cas-server-name <dns>] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
 [--allow-offline <id>[,<id>...]] [--node-timeout-s N] [--handover-timeout-s N] [--smoke-timeout-s N] \
 [--lock <path>] [--platform linux-x86_64|linux-arm64|darwin-arm64]";
 
@@ -43,6 +43,9 @@ pub(super) struct CasFlags {
 struct Args {
     options: Options,
     api: SocketAddr,
+    /// The frontend the gates observe; required with `--apply`.
+    observe: Option<SocketAddr>,
+    observe_token_file: Option<PathBuf>,
     cas: CasFlags,
     token_file: PathBuf,
     bundle: Option<String>,
@@ -53,8 +56,10 @@ struct Args {
 /// that got here through `sudo` (a deploy account that may only run `deploy`) must not set
 /// them: root would read a file of the caller's choosing and send it to an address of the
 /// caller's choosing. Those values come from the root-owned config.
-const HOST_FLAGS: [&str; 9] = [
+const HOST_FLAGS: [&str; 11] = [
     "--api",
+    "--observe",
+    "--observe-token-file",
     "--result",
     "--token-file",
     "--config",
@@ -70,6 +75,8 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     let mut api = None;
     let mut cas = CasFlags::default();
     let mut token_file = None;
+    let mut observe = None;
+    let mut observe_token_file = None;
     let mut bundle = None;
     let mut apply = false;
     let mut order = Order::NodesFirst;
@@ -98,6 +105,10 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
             "--cas" => cas.url = Some(value("--cas")?),
             "--cas-ca" => cas.ca = Some(PathBuf::from(value("--cas-ca")?)),
             "--cas-server-name" => cas.server_name = Some(value("--cas-server-name")?),
+            "--observe" => observe = Some(value("--observe")?),
+            "--observe-token-file" => {
+                observe_token_file = Some(PathBuf::from(value("--observe-token-file")?));
+            }
             "--token-file" => token_file = Some(PathBuf::from(value("--token-file")?)),
             "--bundle" => bundle = Some(value("--bundle")?),
             "--config" => config = PathBuf::from(value("--config")?),
@@ -145,12 +156,15 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
         owner,
         api.is_none()
             || token_file.is_none()
+            || (apply && observe.is_none())
             || cas.url.is_none()
             || cas.ca.is_none()
             || cas.server_name.is_none(),
     )?;
     let api = api.or(conf.api);
     let token_file = token_file.or(conf.token_file);
+    let observe = observe.or(conf.observe);
+    let observe_token_file = observe_token_file.or(conf.observe_token_file);
     let result = result
         .or(conf.result)
         .unwrap_or_else(|| PathBuf::from(RESULT));
@@ -172,6 +186,22 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     if let Some(url) = &cas.url {
         CasSmoke::new(url, Duration::from_secs(secs[2])).map_err(|e| format!("--cas {e}"))?;
     }
+    // The gates read the frontend, not the update API; an applied deploy that is not told where
+    // would either read the wrong listener or skip its gates, so it does not start.
+    let observe: Option<SocketAddr> = match observe {
+        Some(text) => Some(
+            text.parse()
+                .map_err(|_| format!("--observe {text:?} is not host:port"))?,
+        ),
+        None if apply => {
+            return Err(
+                "--observe is required with --apply (or `observe` in the config): the address of \
+                 the frontend whose /metrics and /v1/invocations the gates read"
+                    .to_owned(),
+            );
+        }
+        None => None,
+    };
     let mut options = Options::new(commit, &platform);
     options.apply = apply;
     options.order = order;
@@ -185,6 +215,8 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     Ok(Args {
         options,
         api,
+        observe,
+        observe_token_file,
         cas,
         token_file: token_file.ok_or("--token-file is required (or `token_file` in the config)")?,
         bundle,
@@ -197,6 +229,9 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
 struct HostConfig {
     api: Option<String>,
     token_file: Option<PathBuf>,
+    /// The frontend the gates observe, and the file of its token (else the update API's).
+    observe: Option<String>,
+    observe_token_file: Option<PathBuf>,
     /// Where the result document goes.
     result: Option<PathBuf>,
     /// The local REAPI listener the CAS smoke uses.
@@ -237,6 +272,8 @@ fn read_config(path: &Path, owner: u32, needed: bool) -> Result<HostConfig, Stri
     Ok(HostConfig {
         api: get("api"),
         token_file: get("token_file").map(PathBuf::from),
+        observe: get("observe"),
+        observe_token_file: get("observe_token_file").map(PathBuf::from),
         result: get("result").map(PathBuf::from),
         cas: get("cas"),
         cas_ca: get("cas_ca").map(PathBuf::from),
@@ -423,7 +460,21 @@ pub(super) fn run(
         }
         Err(e) => return usage(err, &format!("the lock: {e}")),
     };
-    let api = match Http::new(parsed.api, token, Duration::from_secs(60)) {
+    // The observed frontend has its own token file when the flags give one; the operator
+    // token guards both listeners otherwise.
+    let observe_token = match &parsed.observe_token_file {
+        Some(path) => match read_token(path) {
+            Ok(t) => t,
+            Err(why) => return usage(err, &format!("--observe-token-file: {why}")),
+        },
+        None => token.clone(),
+    };
+    let timeout = Duration::from_secs(60);
+    let observe = match Http::new(parsed.observe.unwrap_or(parsed.api), observe_token, timeout) {
+        Ok(a) => a,
+        Err(e) => return usage(err, &format!("--observe: {e}")),
+    };
+    let api = match Http::new(parsed.api, token, timeout) {
         Ok(a) => a,
         Err(e) => return usage(err, &e.to_string()),
     };
@@ -445,6 +496,7 @@ pub(super) fn run(
     let (clock, check) = (SystemClock, NoCheck);
     let env = Env {
         api: &api,
+        observe: &observe,
         clock: &clock,
         smoke: &*smoke,
         check: &check as &dyn Check,
