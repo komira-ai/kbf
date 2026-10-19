@@ -906,6 +906,58 @@ async fn the_generation_follows_each_endpoint_the_node_is_told() {
     }
 }
 
+/// The generation is the first 8 bytes of the SHA-256 of the encoded configuration (its own
+/// generation zeroed), big-endian, with the low bit set.
+///
+/// Catches: a digest cut to fewer than 8 bytes (a 1-byte generation collides for 1 change
+/// in 128, so a node would keep a stale configuration), a different hash or byte order, a
+/// digest that includes the generation field itself, and a low bit left clear (0 is the
+/// number of a node that holds nothing).
+#[tokio::test]
+async fn the_generation_is_eight_digest_bytes_with_the_low_bit_set() {
+    let farm = farm("enroll-generation-width");
+    let base = crate::enroll::testkit::settings();
+    let variants = [
+        base.clone(),
+        NodeSettings {
+            worker_endpoint: "https://proxy.test:443".to_owned(),
+            ..base.clone()
+        },
+        NodeSettings {
+            cas_endpoint: "https://proxy.test:443".to_owned(),
+            ..base.clone()
+        },
+        NodeSettings {
+            storage_port: 8984,
+            ..base
+        },
+    ];
+    let mut wide = false;
+    for (index, settings) in variants.into_iter().enumerate() {
+        let service = crate::enroll::testkit::service_with(&farm.store, &farm.ca, settings);
+        let bits = u64::try_from(index).expect("small") + 1;
+        let tok = token(&farm, bits, &spec(&[Role::Daemon]));
+        let (request, _) = enroll_request(&tok, &format!("node-{bits:02}"), &[Role::Daemon], "");
+        let config = service
+            .enroll_now(&request)
+            .expect("enrolled")
+            .config
+            .expect("config");
+        let digest = Sha256::digest(prost::Message::encode_to_vec(&pb::NodeConfig {
+            generation: 0,
+            ..config.clone()
+        }));
+        let head: [u8; 8] = digest[..8].try_into().expect("8 bytes");
+        assert_eq!(
+            config.generation,
+            u64::from_be_bytes(head) | 1,
+            "variant {index}: the first 8 digest bytes, low bit set"
+        );
+        wide |= config.generation > u64::from(u32::MAX);
+    }
+    assert!(wide, "no generation used more than 32 bits");
+}
+
 /// A registry that cannot be read refuses the enrollment before the token is spent.
 ///
 /// Catches: a token consumed by an enrollment whose answer could not say where the store
