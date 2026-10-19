@@ -45,7 +45,8 @@ flate2 = { version = "1.1.10", default-features = false, features = ["rust_backe
 form_urlencoded = "1.2.2"
 futures = "0.3.34"
 hex = "0.4.3"
-# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`).
+# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`)
+# and of the installer's loopback calls to a child (kbf-installer: `proxy::child_http`).
 # Already in the tree through hyper.
 httparse = "1.10.1"
 # The frontend proxy's pass-through bodies (kbf-front); already in the tree through tonic.

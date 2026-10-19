@@ -1781,6 +1781,7 @@ dependencies = [
  "clap",
  "flate2",
  "hex",
+ "httparse",
  "hyper",
  "kbf-host",
  "kbf-installer",
