@@ -113,6 +113,8 @@ pub mod replication;
 pub mod rollout;
 mod run_record;
 pub mod serve;
+#[cfg(test)]
+mod serve_remote_tests;
 pub mod stamp;
 mod start;
 mod start_exit;
@@ -128,6 +130,7 @@ pub mod token;
 pub mod update;
 pub mod update_hosts;
 pub mod update_status;
+pub mod verbs;
 pub mod worker;
 pub mod worker_roles;
 pub mod write_tier;

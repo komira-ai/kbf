@@ -244,6 +244,39 @@ fn a_bad_deny_list_is_refused_at_open() {
     );
 }
 
+/// Catches: `certificate_entries` (the count behind the warning of `Args::proxy`) reading a
+/// file that changed after `open` as though it were still good: a list removed or rewritten
+/// as garbage is an error naming the path (and the line), not a count of zero.
+///
+/// Mutants seen red: the read error mapped to an empty list; the parse result unwrapped to
+/// its default (`unwrap_or_default`).
+#[test]
+fn a_list_that_goes_bad_after_open_is_an_error_when_its_certificate_entries_are_counted() {
+    let path = scratch("counted.deny");
+    std::fs::write(
+        &path,
+        "node a\nserial 0a\nspki-sha256 {}\n".replace("{}", &"0".repeat(64)),
+    )
+    .expect("write");
+    let list = DenyList::open(&path).expect("open");
+    assert_eq!(list.certificate_entries().expect("two"), 2);
+
+    std::fs::write(&path, "node a\nserial zz\n").expect("garbage");
+    let error = list.certificate_entries().expect_err("garbage");
+    assert!(
+        matches!(error, DenyListError::Parse { line: 2, .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("counted.deny:2"), "{error}");
+
+    std::fs::remove_file(&path).expect("remove");
+    let error = list.certificate_entries().expect_err("removed");
+    assert!(
+        matches!(&error, DenyListError::Read { path: p, .. } if *p == path),
+        "{error}"
+    );
+}
+
 /// Catches: plain text that asks for a certificate (every test cell would be refused),
 /// mutual TLS that lets a stream through without one or with one it cannot read, and
 /// a certificate that is read but not returned for the stream.
