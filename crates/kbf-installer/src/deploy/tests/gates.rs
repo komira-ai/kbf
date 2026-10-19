@@ -281,9 +281,10 @@ fn the_preflight_refuses_storage_that_is_not_healthy_or_not_known() {
 }
 
 /// Proves an under-replicated count that returns to 0 inside the settle window after a node
-/// step is green, and that the deploy does not end before it has returned (the document's
-/// row carries the 0 that was read after the last node). Catches a gate that looks only
-/// before the deploy.
+/// step is green, and that the deploy does not go on to the frontend before it has returned.
+/// Catches a gate that looks only before the deploy, and a wait that is not made.
+///
+/// Mutants planted: the wait for repair after the last node skipped.
 #[test]
 fn storage_that_is_repaired_inside_the_settle_window_is_green() {
     let mut f = farm(two_nodes());
@@ -295,8 +296,10 @@ fn storage_that_is_repaired_inside_the_settle_window_is_green() {
     let (s, doc) = run_gated(&f, "repaired");
     assert_eq!((s.exit, s.reason.as_str()), (0, ""), "{}", s.line());
     assert_eq!(gate(&doc, name::UNDER_REPLICATED).verdict, Verdict::Green);
-    // The deploy waited out the second repair: the frontend step came after t = 240.
     assert!(s.nodes.iter().all(|n| n.state == "confirmed"));
+    // The deploy waited out the second repair (which ends at 240) before it went on to the
+    // frontend; a deploy that does not wait is done by about 215.
+    assert!(f.now.get() >= 240, "ended at {}", f.now.get());
 }
 
 /// Proves the deploy ends red when the next node's step has begun (it shows
@@ -373,6 +376,8 @@ fn storage_not_repaired_when_the_settle_window_ends_is_red() {
         ": 1,",
         "not repaired within the 60s settle window",
     );
+    // The window is 60 s after the node at 100, not the 1800 s of the node timeout.
+    assert!(f.now.get() <= 170, "ended at {}", f.now.get());
 }
 
 // ---- gate A and C ------------------------------------------------------------------
