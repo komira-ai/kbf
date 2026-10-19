@@ -433,10 +433,9 @@ mod tests {
         let mounts = config["mounts"].as_array().expect("mounts");
         for name in ["hosts", "hostname", "resolv.conf"] {
             let dest = format!("/etc/{name}");
-            let mount = mounts
-                .iter()
-                .find(|m| m["destination"] == dest)
-                .unwrap_or_else(|| panic!("no mount of {dest}"));
+            let found = mounts.iter().find(|m| m["destination"] == dest);
+            assert!(found.is_some(), "no mount of {dest}");
+            let mount = found.expect("checked");
             assert_eq!(mount["type"], "bind");
             assert_eq!(
                 mount["source"],
