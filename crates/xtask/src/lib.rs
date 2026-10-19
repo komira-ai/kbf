@@ -25,6 +25,11 @@
 //! - `pkg-config`, `pkg-build`, `pkg-install-test` ([`pkg_linux`], [`pkg_install`]): the
 //!   `kbf-installer` deb and rpm: the nfpm configuration from the inputs, the packages
 //!   built twice to prove the bytes, and an install, remove and purge in a container.
+//! - `pkg-trust` and `pkg-asset` ([`pkg_trust`], [`pkg_asset`]): the trust directory of the
+//!   package from the pinned `gh`, `gh`'s trusted root and the branch the package is
+//!   attested on, and the built deb as the release asset
+//!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
+//!   attested tarball and trusts the branch it is attested for.
 //! - `pkg build --binary <path> --launchd-plist <path> [--trust <path>]... --version <v>
 //!   --out <dir>` and `pkg cask` ([`pkg`]): kbf-installer for a Mac, a `.pkg` that is
 //!   the same bytes on every host and installs a root-owned tree and a LaunchDaemon that
@@ -69,8 +74,10 @@ pub mod fetch;
 pub mod installer_tarball;
 pub mod package;
 pub mod pkg;
+pub mod pkg_asset;
 pub mod pkg_install;
 pub mod pkg_linux;
+pub mod pkg_trust;
 pub mod proxy_loom;
 pub mod release;
 pub mod sudo_test;
@@ -218,8 +225,15 @@ enum Verb {
         #[arg(long, value_enum)]
         platform: package::Platform,
         /// The package version.
+        #[arg(
+            long,
+            required_unless_present = "version_of",
+            conflicts_with = "version_of"
+        )]
+        version: Option<String>,
+        /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
         #[arg(long)]
-        version: String,
+        version_of: Option<PathBuf>,
         /// The directory `nfpm.yaml` and `listing.txt` go in; created when missing.
         #[arg(long)]
         out: PathBuf,
@@ -239,9 +253,58 @@ enum Verb {
         #[arg(long, default_value_t = pkg_linux::SOURCE_DATE_EPOCH)]
         source_date_epoch: u64,
     },
+    /// Write the trust directory of the kbf-installer packages: the pinned `gh`, the
+    /// Sigstore trusted root, and an `installer.conf` trusting the branch given.
+    PkgTrust {
+        /// The pinned `gh` program (copied, mode 0755).
+        #[arg(long)]
+        gh: PathBuf,
+        /// The trusted root `gh attestation trusted-root` wrote (JSON lines).
+        #[arg(long)]
+        trusted_root: PathBuf,
+        /// The branch the package is attested on: `refs/heads/<branch>`.
+        #[arg(long)]
+        source_ref: String,
+        /// The directory the three files go in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The kbf-installer deb as a release asset, refused unless it holds the attested
+    /// binary and trusts the branch it is attested for.
+    PkgAsset {
+        /// The deb nfpm built, or the directory holding the one (with `--verify-only`: the
+        /// asset itself).
+        #[arg(long)]
+        package: PathBuf,
+        /// The platform it was built for (`linux-x86_64`, `linux-arm64`).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The `kbf-installer-<commit>-<platform>.tar.gz` whose binary the deb must hold.
+        #[arg(long)]
+        binary_tarball: PathBuf,
+        /// The branch the deb must trust, and is attested for (`$GITHUB_REF`).
+        #[arg(long)]
+        expect_ref: String,
+        /// The pinned `gh` the deb's must be byte for byte (optional with --verify-only).
+        #[arg(long)]
+        gh: Option<PathBuf>,
+        /// The directory the asset and its line of `SHA256SUMS.<platform>` go in.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        out: Option<PathBuf>,
+        /// Only check `--package`, which must be named as the asset; write nothing.
+        #[arg(long)]
+        verify_only: bool,
+    },
     /// Install a package into a fresh container and check it never starts or enables.
     PkgInstallTest {
-        /// The package.
+        /// The package, or the directory holding the one package of its format.
         #[arg(long)]
         package: PathBuf,
         /// Its format.
@@ -256,6 +319,10 @@ enum Verb {
         /// A packaged unit and the file it needs to start: `<unit>=<file>`.
         #[arg(long)]
         gate: Vec<pkg_install::Gate>,
+        /// A command to run in the container after the install and what its output must
+        /// contain: `<program> <argument>..::<text>` (the command exits 0).
+        #[arg(long)]
+        probe: Vec<pkg_install::Probe>,
         /// The docker program.
         #[arg(long, default_value = "docker")]
         docker: PathBuf,
@@ -673,19 +740,27 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             tmpfiles,
             platform,
             version,
+            version_of,
             out,
-        } => pkg_linux::write_config(
-            &pkg_linux::Inputs {
-                binary: &binary,
-                units: &units,
-                trust: &trust,
-                sysusers: &sysusers,
-                tmpfiles: &tmpfiles,
-                platform,
-                version: &version,
-            },
-            &out,
-        ),
+        } => {
+            let version = match (version, version_of) {
+                (Some(version), _) => version,
+                (None, Some(of)) => pkg_asset::binary_version(&of)?,
+                (None, None) => return Err(Error::Usage("--version or --version-of".to_owned())),
+            };
+            pkg_linux::write_config(
+                &pkg_linux::Inputs {
+                    binary: &binary,
+                    units: &units,
+                    trust: &trust,
+                    sysusers: &sysusers,
+                    tmpfiles: &tmpfiles,
+                    platform,
+                    version: &version,
+                },
+                &out,
+            )
+        }
         Verb::PkgBuild {
             nfpm,
             config,
@@ -699,21 +774,58 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 epoch: source_date_epoch,
             },
         ),
+        Verb::PkgTrust {
+            gh,
+            trusted_root,
+            source_ref,
+            out,
+        } => pkg_trust::write(&gh, &trusted_root, &source_ref, &out),
+        Verb::PkgAsset {
+            package,
+            platform,
+            commit,
+            binary_tarball,
+            expect_ref,
+            gh,
+            out,
+            verify_only,
+        } => pkg_asset::asset(
+            &pkg_asset::sole(&package, "deb")?,
+            &commit,
+            &match (&out, verify_only) {
+                (Some(out), false) => pkg_asset::Mode::Add(out),
+                _ => pkg_asset::Mode::VerifyOnly,
+            },
+            &pkg_asset::Check {
+                platform,
+                binary_tarball: &binary_tarball,
+                expect_ref: &expect_ref,
+                gh: gh.as_deref(),
+            },
+        ),
         Verb::PkgInstallTest {
             package,
             format,
             listing,
             image_dir,
             gate,
+            probe,
             docker,
         } => pkg_install::run(
             &mut pkg_install::process(&docker),
             &pkg_install::InstallTest {
-                package: &package,
+                package: &pkg_asset::sole(
+                    &package,
+                    match format {
+                        pkg_install::Format::Deb => "deb",
+                        pkg_install::Format::Rpm => "rpm",
+                    },
+                )?,
                 format,
                 listing: &listing,
                 image_dir: &image_dir,
                 gates: &gate,
+                probes: &probe,
                 container: &format!("kbf-pkg-test-{}", std::process::id()),
             },
         ),

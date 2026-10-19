@@ -22,6 +22,9 @@
 //!   (default `refs/heads/main`; a value that is not `refs/heads/<branch>` is a usage
 //!   error), on a GitHub-hosted runner, and every tarball has an SBOM attestation from
 //!   the same workflow: the `gh attestation verify` commands docs/artifacts.md gives.
+//!   A `.deb` (the `kbf-installer` package, [`crate::pkg_asset`]) is listed and verified
+//!   like a tarball except that it has no SBOM attestation: build provenance and its own
+//!   bundle.
 //!   First, before `gh` is run, `<dir>` holds exactly one bundle per listed tarball and
 //!   no other, each the bundle of that tarball ([`bundles::pairing`]). Every tarball
 //!   also verifies against its own bundle, as a host's installer does it (`--bundle`,
@@ -32,7 +35,10 @@
 //!   Controls: the first tarball must not verify as signed by `ci.yml`, the flipped
 //!   copy must not verify, the second tarball's bundle must not verify the first (a
 //!   bundle is one tarball's own), the first's bundle must not verify for another
-//!   commit, and the flipped copy must not verify against its bundle.
+//!   commit, and the flipped copy must not verify against its bundle. With a package
+//!   listed, first the same across kinds: the package must not verify under the first
+//!   tarball's bundle, that tarball not under the package's, and the package's bundle
+//!   not for another commit.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -400,6 +406,45 @@ impl Attestations<'_> {
         )))
     }
 
+    /// The controls on the packages' bundles, each a verification that must be refused: the
+    /// first package against the bundle of the first tarball, and that tarball against
+    /// the package's bundle (a bundle is its own asset's, whatever the extension), and
+    /// the package for another commit. Nothing to do when no package is listed.
+    fn package_controls(&self, dir: &Path, lines: &[Line], signer: &str) -> Result<(), Error> {
+        let Some(package) = lines.iter().find(|l| l.name.ends_with(".deb")) else {
+            return Ok(());
+        };
+        let Some(tarball) = lines.iter().find(|l| l.name.ends_with(".tar.gz")) else {
+            return Ok(());
+        };
+        let (deb, tgz) = (dir.join(&package.name), dir.join(&tarball.name));
+        let (deb_bundle, tgz_bundle) = (
+            dir.join(bundles::name_of(&package.name)),
+            dir.join(bundles::name_of(&tarball.name)),
+        );
+        if self.bundle_run(&deb, &tgz_bundle, signer, self.commit)?.0 {
+            return Err(Error::Failed(format!(
+                "control failed: the bundle of {} verified the package {}",
+                tarball.name, package.name
+            )));
+        }
+        if self.bundle_run(&tgz, &deb_bundle, signer, self.commit)?.0 {
+            return Err(Error::Failed(format!(
+                "control failed: the bundle of the package {} verified {}",
+                package.name, tarball.name
+            )));
+        }
+        let other = bundles::other_commit(self.commit);
+        if self.bundle_run(&deb, &deb_bundle, signer, &other)?.0 {
+            return Err(Error::Failed(format!(
+                "control failed: the bundle of {} verified for commit {other}, not the commit \
+                 it attests",
+                package.name
+            )));
+        }
+        Ok(())
+    }
+
     /// The controls on the bundle check, each a verification that must be refused:
     /// the tarball `first` against the bundle of the tarball `second` (when there is
     /// one: a bundle is one tarball's own), against its own for another commit, and
@@ -478,12 +523,18 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
             a.require(&file, workflow, Some(SBOM_PREDICATE))?;
             a.require_bundle(dir, &l.name, workflow)?;
             printed.push(format!("verified: {} (provenance, SBOM, bundle)", l.name));
+        } else if l.name.ends_with(".deb") {
+            // A package has build provenance and its own bundle, and no SBOM attestation
+            // (docs/artifacts.md): what it holds is the tarball's binary, which has one.
+            a.require(&file, workflow, None)?;
+            a.require_bundle(dir, &l.name, workflow)?;
+            printed.push(format!("verified: {} (provenance, bundle)", l.name));
         } else if l.name.ends_with(".cdx.json") {
             a.require(&file, workflow, None)?;
             printed.push(format!("verified: {} (provenance)", l.name));
         } else {
             return Err(Error::Failed(format!(
-                "{SUMS} lists {}, neither a tarball nor an SBOM",
+                "{SUMS} lists {}, neither a tarball, a package nor an SBOM",
                 l.name
             )));
         }
@@ -509,6 +560,7 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
         .filter(|l| l.name.ends_with(".tar.gz"))
         .nth(1)
         .map(|l| l.name.as_str());
+    a.package_controls(dir, &lines, workflow)?;
     a.bundle_controls(dir, &first.name, second, &flipped_path, workflow)?;
     printed.push(
         "attestations: every asset verifies; another signer workflow, another tarball's \

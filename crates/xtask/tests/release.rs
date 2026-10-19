@@ -1171,3 +1171,114 @@ fn publish_refuses_a_set_hash_that_is_not_a_hash() {
     let (code, _, err) = publish_set(&root, "abc", None);
     assert_eq!(code, Some(2), "{err}");
 }
+
+/// The deb of `platform` named `name`, added to `dist` as `pkg-asset` and the attest job
+/// leave it: the file, its line in `SHA256SUMS`, and its bundle when `bundle`.
+fn add_deb(dist: &Path, name: &str, bundle: bool) {
+    let bytes = format!("{name} bytes");
+    std::fs::write(dist.join(name), &bytes).expect("deb");
+    let sha = sha_of(&bytes);
+    let mut sums = std::fs::read_to_string(dist.join("SHA256SUMS")).expect("sums");
+    sums.push_str(&format!("{sha}  {name}\n"));
+    std::fs::write(dist.join("SHA256SUMS"), sums).expect("sums");
+    if bundle {
+        std::fs::write(
+            dist.join(format!("{name}.sigstore.json")),
+            bundle_text(&sha),
+        )
+        .expect("bundle");
+    }
+}
+
+fn deb(commit: &str, platform: &str) -> String {
+    format!("kbf-installer-{commit}-{platform}.deb")
+}
+
+#[test]
+fn check_accepts_the_installer_package_of_the_commit_with_its_bundle() {
+    // Catches: a `.deb` in SHA256SUMS refused as "not an asset of <commit>" (the release
+    // of the first main push that lists one fails), or accepted with no bundle, and the
+    // bundles line not saying that a package was counted.
+    let root = scratch("check-deb");
+    let dist = dist(&root, COMMIT);
+    add_deb(&dist, &deb(COMMIT, "linux-x86_64"), true);
+    add_deb(&dist, &deb(COMMIT, "linux-arm64"), true);
+    let (code, out, err) = check(&dist, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        out,
+        format!(
+            "sums: 8 files match; the flipped copy does not\n\
+             names: every listed file is an asset of {COMMIT}\n\
+             bundles: each of the 3 tarballs and 2 package(s) has one provenance bundle\n"
+        )
+    );
+}
+
+#[test]
+fn check_refuses_a_package_with_no_bundle_a_stray_package_bundle_and_a_foreign_package() {
+    // Catches: a package released with no bundle a host can verify it with; a bundle of
+    // a package that is not listed; and a `.deb` that is not an asset of this commit:
+    // another commit's, an unknown platform's, and nfpm's own name
+    // (`kbf-installer_<version>_<arch>.deb`), which names no commit.
+    let root = scratch("check-deb-refusals");
+    let held = dist(&root, COMMIT);
+    let name = deb(COMMIT, "linux-x86_64");
+    add_deb(&held, &name, false);
+    let (code, out, err) = check(&held, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {name}: no provenance bundle {name}.sigstore.json\n")
+    );
+    let stray = format!("{}.sigstore.json", deb(COMMIT, "linux-arm64"));
+    std::fs::write(
+        held.join(format!("{name}.sigstore.json")),
+        bundle_text(&sha_of(&format!("{name} bytes"))),
+    )
+    .expect("bundle");
+    std::fs::write(held.join(&stray), bundle_text(&sha_of("x"))).expect("stray");
+    let (code, out, err) = check(&held, COMMIT);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        err,
+        format!("xtask: {stray}: not the bundle of a listed tarball\n")
+    );
+    for foreign in [
+        deb(OTHER, "linux-arm64"),
+        deb(COMMIT, "linux-riscv"),
+        "kbf-installer_0.1.0_amd64.deb".to_owned(),
+        format!("-{COMMIT}-linux-arm64.deb"),
+    ] {
+        let root = scratch("check-deb-foreign");
+        let dist = dist(&root, COMMIT);
+        add_deb(&dist, &foreign, true);
+        let (code, out, err) = check(&dist, COMMIT);
+        assert_eq!(code, Some(1), "{foreign}: {out}");
+        assert_eq!(
+            err,
+            format!("xtask: {foreign}: not an asset of {COMMIT}\n"),
+            "{foreign}"
+        );
+    }
+}
+
+#[test]
+fn publish_releases_the_package_and_its_bundle() {
+    // Catches: a release that lists the package in SHA256SUMS and uploads neither it
+    // nor its bundle (the names are the checked set plus the bundles of each file that
+    // has one), so the operator path (verify the deb offline, then dpkg -i) has nothing
+    // to start from.
+    let root = scratch("publish-deb");
+    let dist = dist(&root, COMMIT);
+    let name = deb(COMMIT, "linux-arm64");
+    add_deb(&dist, &name, true);
+    let (code, _, err) = publish(&root, None);
+    assert_eq!(code, Some(0), "{err}");
+    let names: Vec<String> = released(&root).into_iter().map(|(n, _)| n).collect();
+    assert!(names.contains(&name), "{names:?}");
+    assert!(
+        names.contains(&format!("{name}.sigstore.json")),
+        "{names:?}"
+    );
+}

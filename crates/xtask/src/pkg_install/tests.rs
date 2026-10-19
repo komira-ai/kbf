@@ -31,6 +31,8 @@ enum Defect {
     PurgeDeletesConfig,
     PurgeLeavesRecord,
     BuildFails,
+    GhWrongVersion,
+    GhNotRunnable,
 }
 
 /// A model of a container: the files that exist, the users, what is installed, the
@@ -152,6 +154,15 @@ impl World {
             } else {
                 ""
             }),
+            [gh, "--version"] if gh.ends_with("/trust/gh") => {
+                if self.is(Defect::GhNotRunnable) {
+                    fail("exec format error")
+                } else if self.is(Defect::GhWrongVersion) {
+                    ok("gh version 9.9.9 (2020-01-01)\n")
+                } else {
+                    ok("gh version 2.102.0 (2026-09-01)\n")
+                }
+            }
             ["stat", "-c", _, path] => self.stat(path),
             ["sha256sum", path] => {
                 let sha = self
@@ -378,6 +389,14 @@ fn gates() -> Vec<Gate> {
         .collect()
 }
 
+fn probes() -> Vec<Probe> {
+    vec![
+        "/usr/share/kbf-installer/trust/gh --version::gh version 2.102.0"
+            .parse()
+            .expect("probe"),
+    ]
+}
+
 /// The verb over a model with `defect`: the world after, and the result.
 fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error>) {
     let dir = std::env::current_exe()
@@ -394,6 +413,7 @@ fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error
     std::fs::write(&listing, pkg_linux::listing(&entries())).expect("listing");
     let world = std::cell::RefCell::new(World::new(defect));
     let gates = gates();
+    let probes = probes();
     let result = run(
         &mut |args| Ok(world.borrow_mut().docker(args)),
         &InstallTest {
@@ -402,6 +422,7 @@ fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error
             listing: &listing,
             image_dir: Path::new("/p/image"),
             gates: &gates,
+            probes: &probes,
             container: "c1",
         },
     );
@@ -607,6 +628,7 @@ fn a_listing_that_is_not_there_is_an_error_before_docker_runs() {
             listing: Path::new("/nonexistent/listing.txt"),
             image_dir: Path::new("/i"),
             gates: &[],
+            probes: &[],
             container: "c",
         },
     )
@@ -622,4 +644,43 @@ fn the_docker_process_runs_the_program_with_the_arguments() {
     let mut echo = process(Path::new("/usr/bin/echo"));
     let out = echo(&["a", "b"]).expect("echo");
     assert_eq!(out.stdout, "a b\n");
+}
+
+#[test]
+fn a_probe_runs_in_the_container_and_its_output_must_hold_the_text() {
+    // Catches: probes parsed and never run (a package whose packaged gh is for the wrong
+    // architecture, or prints another version, would install and pass), a probe that
+    // fails (exit status) taken as a pass, and a probe whose text is not checked.
+    let (world, result) = run_with(Format::Deb, Defect::None);
+    result.expect("a good gh passes");
+    assert!(
+        world
+            .log
+            .contains(&"exec c1 /usr/share/kbf-installer/trust/gh --version".to_owned()),
+        "{:#?}",
+        world.log
+    );
+    let got = problems(Format::Deb, Defect::GhNotRunnable);
+    assert!(
+        got.contains("`/usr/share/kbf-installer/trust/gh --version` failed in the container: exec format error"),
+        "{got}"
+    );
+    let got = problems(Format::Deb, Defect::GhWrongVersion);
+    assert!(
+        got.contains("printed \"gh version 9.9.9 (2020-01-01)\", which does not contain \"gh version 2.102.0\""),
+        "{got}"
+    );
+}
+
+#[test]
+fn a_probe_is_a_command_and_the_text_it_must_print() {
+    // Catches: a probe with no text (it would pass on any output) or no command.
+    let p: Probe = "kbf-installer --version --json::abc123"
+        .parse()
+        .expect("probe");
+    assert_eq!(p.argv, ["kbf-installer", "--version", "--json"]);
+    assert_eq!(p.contains, "abc123");
+    for bad in ["kbf-installer --version", "::text", "gh --version::"] {
+        assert!(bad.parse::<Probe>().is_err(), "{bad:?}");
+    }
 }

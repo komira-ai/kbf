@@ -166,3 +166,63 @@ fn pkg_build_and_pkg_install_test_report_a_program_that_fails() {
         text(&install.stderr)
     );
 }
+
+#[test]
+fn pkg_config_takes_the_version_from_the_binary_or_from_the_flag_and_not_both() {
+    // Catches: `--version-of` ignored (the package version then has no commit in it), a
+    // binary that is not the installer (the stub prints another line) accepted as the
+    // source of the version, and both flags, or neither, accepted.
+    let dir = scratch("config-version-of");
+    copy_inputs(&dir);
+    // The fake, run as `kbf-installer` with a stamp, names itself as the real one does.
+    let installer = dir.join("named").join("kbf-installer");
+    std::fs::create_dir(dir.join("named")).expect("dir");
+    std::fs::hard_link(env!("CARGO_BIN_EXE_xtask-fake"), &installer).expect("link the fake");
+    let base = |dir: &Path, out: &str| {
+        vec![
+            "pkg-config".to_owned(),
+            "--binary".to_owned(),
+            s(&dir.join("kbf-installer")).to_owned(),
+            "--units".to_owned(),
+            s(&dir.join("testdata/units")).to_owned(),
+            "--trust".to_owned(),
+            s(&dir.join("testdata/trust")).to_owned(),
+            "--sysusers".to_owned(),
+            s(&dir.join("sysusers.d-kbf-installer.conf")).to_owned(),
+            "--tmpfiles".to_owned(),
+            s(&dir.join("tmpfiles.d-kbf-installer.conf")).to_owned(),
+            "--platform".to_owned(),
+            "linux-x86_64".to_owned(),
+            "--out".to_owned(),
+            s(&dir.join(out)).to_owned(),
+        ]
+    };
+    let run = |extra: &[&str], out: &str| {
+        let mut args = base(&dir, out);
+        args.extend(extra.iter().map(|a| (*a).to_owned()));
+        Command::new(XTASK)
+            .args(&args)
+            .env("XTASK_FAKE_INSTALLER_VERSION", "0123456789ab")
+            .output()
+            .expect("run xtask")
+    };
+    let ok = run(&["--version-of", s(&installer)], "of");
+    assert_eq!(ok.status.code(), Some(0), "{}", text(&ok.stderr));
+    let yaml = std::fs::read_to_string(dir.join("of/nfpm.yaml")).expect("yaml");
+    assert!(yaml.contains("version: \"0.1.0+0123456789ab\""), "{yaml}");
+    let stub = run(&["--version-of", s(&dir.join("kbf-installer"))], "stub");
+    assert_eq!(stub.status.code(), Some(1));
+    assert!(
+        text(&stub.stderr).contains("not `kbf-installer <version>+<commit>`"),
+        "{}",
+        text(&stub.stderr)
+    );
+    assert!(!dir.join("stub").exists());
+    let both = run(
+        &["--version", "1.0.0", "--version-of", s(&installer)],
+        "both",
+    );
+    assert_eq!(both.status.code(), Some(2), "{}", text(&both.stderr));
+    let neither = run(&[], "neither");
+    assert_eq!(neither.status.code(), Some(2), "{}", text(&neither.stderr));
+}
