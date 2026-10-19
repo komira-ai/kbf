@@ -38,6 +38,7 @@ clap.workspace = true
 flate2.workspace = true
 futures.workspace = true
 hex.workspace = true
+httparse.workspace = true
 hyper.workspace = true
 kbf-host.workspace = true
 kbf-proto.workspace = true

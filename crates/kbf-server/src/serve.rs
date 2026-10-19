@@ -764,6 +764,7 @@ where
         // A server with no frontend role has no enrollment.
         None,
     )
+    .merge(crate::verbs::routes(token.clone(), members.clone()))
     .merge(crate::release::router(releases.clone(), token.clone()))
     .merge(crate::update_hosts::router(
         Arc::clone(&farm),
