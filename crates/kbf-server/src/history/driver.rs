@@ -171,7 +171,7 @@ pub fn over<O: ObjectStore>(
     options: Options,
 ) -> History {
     let queue = Arc::new(EventQueue::new(options.queue));
-    let minter = Arc::new(Minter::new(0));
+    let minter = Arc::new(Minter::for_writer(options.writer.0));
     // The writer's own rows are written around the store's generation check, so a process
     // that a successor has superseded still records the calls it kept.
     let index = HistoryIndex::new(state, index_root, Arc::new(Blocking)).exempting(options.writer);

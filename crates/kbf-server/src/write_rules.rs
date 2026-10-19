@@ -10,7 +10,7 @@
 //! |---|---|---|
 //! | [`Rule::Fenced`] | the generation holder only; every write is checked against the generation in its own transaction | the scheduler's rows, the member map, `update/*`, enrollment and object-store registrations, and the history index rows that every writer shares (the stream counter, the shape and status rows) |
 //! | [`Rule::OwnInstance`] | the process whose id the key carries, unchecked | a history chunk row and a history header row, keyed by the writer id (`WriterId::from_instance` of the process's instance id) |
-//! | [`Rule::ContentKeyed`] | any process, unchecked, as an insert | a history stream row, object row and list entry: a row that is created and never changed, under a key that names what it points to (or with an empty value), so the same row from two writers is one row |
+//! | [`Rule::UniqueInsert`] | any process, unchecked, as an insert (`Cond::Absent`) | a history stream row and object row, unique by allocation (the key holds a stream id from a counter block, or a run id, which no other process is given), and a list entry, whose value is empty so the same row from two writers is one row |
 //!
 //! The history rows follow from `kbf_history::RowKind`; [`classify`] asks it. A history
 //! writer writes its rows through a handle that applies exactly the unchecked rules above
@@ -32,8 +32,9 @@ pub enum Rule {
     Fenced,
     /// Written unchecked, by the process whose id the key carries.
     OwnInstance,
-    /// Written unchecked by any process, as an insert that two writers cannot disagree on.
-    ContentKeyed,
+    /// Written unchecked by any process, as an insert whose key no other process is given
+    /// (or whose value is empty).
+    UniqueInsert,
 }
 
 impl Rule {
@@ -247,7 +248,7 @@ pub fn classify(key: &str, index: &IndexRoot) -> Option<Classified> {
     if let Some(kind) = index.kind(key) {
         let (rule, family) = match kind.ownership() {
             Ownership::Writer(_) => (Rule::OwnInstance, "history row of one writer"),
-            Ownership::Insert => (Rule::ContentKeyed, "history insert"),
+            Ownership::Insert => (Rule::UniqueInsert, "history insert"),
             Ownership::Fenced => (Rule::Fenced, "history shared row"),
         };
         return Some(Classified { rule, family });
@@ -287,7 +288,7 @@ mod tests {
 
     // Catches: a history row put in the wrong class: an own-instance row that is fenced
     // (the old child would lose its history again), a shared row that is not (two
-    // children racing on one counter or status row), a content-keyed row that is not an
+    // children racing on one counter or status row), a unique-insert row that is not an
     // insert, and a key of no family classified as something.
     #[test]
     fn history_rows_follow_their_kind_and_unknown_keys_have_no_rule() {
@@ -314,7 +315,7 @@ mod tests {
         ];
         for (keys, rule) in [
             (&own[..], Rule::OwnInstance),
-            (&inserts[..], Rule::ContentKeyed),
+            (&inserts[..], Rule::UniqueInsert),
             (&shared[..], Rule::Fenced),
         ] {
             for key in keys {

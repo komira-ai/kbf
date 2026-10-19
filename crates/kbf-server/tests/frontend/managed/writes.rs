@@ -221,7 +221,7 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
 /// key of a fenced family. A runs a build and holds its record; B takes the generation;
 /// A stops and its writer flushes. Everything A's store saw after the takeover is judged by
 /// the table of `kbf_server::write_rules`: each committed write is of A's own writer id
-/// (`WriterId::from_instance` of the id `role` reports) or content-keyed, and the shared
+/// (`WriterId::from_instance` of the id `role` reports) or a unique insert, and the shared
 /// rows A also tries (the shape row) are refused by the fence and are not committed. Then
 /// every key in the store, the scheduler's included, is named by the table, and the next
 /// generation reads A's build: its header row, chunk row and objects.
@@ -258,7 +258,7 @@ async fn the_old_child_writes_only_keys_that_carry_its_id_after_a_takeover() {
                 );
                 own += 1;
             }
-            (Rule::ContentKeyed, true) => inserts += 1,
+            (Rule::UniqueInsert, true) => inserts += 1,
             // A write the fence refused, with the rest of its transaction.
             (Rule::Fenced, false) => refused_shared += 1,
             (_, false) => {}

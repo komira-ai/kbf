@@ -5,9 +5,11 @@
 //!
 //! - **a writer's own row**: the key carries the writing process's [`WriterId`], so no
 //!   other process writes it (`ichunk` and the per-writer header);
-//! - **an insert**: a row that is created and never changed, under a key that names what
-//!   it points to (`stream`, `obj`) or whose value is empty (`inv`), so the same row from
-//!   either of two writers is one row;
+//! - **an insert**: a row that is created and never changed (`Cond::Absent`). A `stream`
+//!   or `obj` row is unique by allocation: its key holds a stream id (from a counter
+//!   block, or from the writer's own fallback range) or a run id, which no other writer
+//!   is given. A list entry (`inv`) has an empty value, so the same entry from either of
+//!   two writers is one row;
 //! - **a shared row**: every writer reads and writes it, by counter or by
 //!   read-modify-write (the stream counter, the shape and status rows and the by-status
 //!   index). Two writers racing on one would lose an update, so only the generation
@@ -49,7 +51,7 @@ pub enum RowKind {
 pub enum Ownership {
     /// Only the writer whose id the key carries.
     Writer(WriterId),
-    /// Any writer: an insert that two writers cannot disagree on.
+    /// Any writer: an insert under a key no other writer is given, or with an empty value.
     Insert,
     /// Only the generation holder, behind the fence.
     Fenced,
