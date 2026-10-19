@@ -42,8 +42,17 @@ pub struct InstallerStatus {
     /// `<word>: <message>`, or empty (`helper/cycle.rs` writes the word first).
     #[serde(default)]
     pub refusal: String,
+    /// The id of the last `activate`, `confirm` or `revert` order the installer acted on.
+    /// A `frontend_update` order has a floor of its own and a refused one moves none, so
+    /// this cannot say whose refusal `refusal` is: see `refused_order_id`.
     #[serde(default)]
     pub acked_order_id: u64,
+    /// The id of the order that `refusal` answers, when the root half writes it. A refused
+    /// state is an update's own only when this names that update's order; without it (the
+    /// root half writes no such field yet) no refusal is attributed to any update, and an
+    /// order the installer refuses ends at the staging deadline instead.
+    #[serde(default)]
+    pub refused_order_id: Option<u64>,
     #[serde(default)]
     pub staged: Option<StagedWire>,
 }
