@@ -88,7 +88,6 @@ impl Drop for Keeper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     fn dir(name: &str) -> kbf_testkit::dir::TestDir {
