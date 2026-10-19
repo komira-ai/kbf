@@ -43,20 +43,26 @@ xtask.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
+# `tests/proxy_identity.rs`: a real kbf-proxy in front of the real kbf-server gate.
+h2.workspace = true
 hex.workspace = true
+http.workspace = true
 kbf-front.workspace = true
 # The Envoy render the real-Envoy tests (tests/envoy_box, tests/envoy_check.rs) run.
 kbf-installer.workspace = true
 kbf-proto.workspace = true
+kbf-proxy.workspace = true
 kbf-server.workspace = true
 kbf-threads.workspace = true
 proc-macro2.workspace = true
 prost.workspace = true
+rustls.workspace = true
 saphyr-parser.workspace = true
 sha2.workspace = true
 syn.workspace = true
 # The real-Envoy tests (tests/envoy_box): stub servers and Envoy as a child process.
 tokio = { workspace = true, features = ["io-util", "net", "process", "sync", "time"] }
+tokio-rustls.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
 
 [lints]

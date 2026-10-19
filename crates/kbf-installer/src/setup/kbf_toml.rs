@@ -1,6 +1,7 @@
 //! The `/etc/kbf/kbf.toml` that `setup` writes: the host's mode, the frontend URL and the
 //! enrollment token's path (the keys enrollment reads, `kbf-enroll`'s `KEYS`), and on a host
-//! that serves the operator API, the path of its token (`api-token-file`, group `tls`).
+//! that serves the operator API, the path of its token (`api-token-file`, group `tls`) and, on a
+//! host that keeps its state in Postgres, the database (`state-store`, group `scheduler`).
 //! Everything else in the file is the mode's own flags, which the operator or the package
 //! adds; `setup` never writes an update or installer key (those are `installer.toml`).
 //!
@@ -18,6 +19,8 @@ pub struct Ours<'a> {
     pub frontend_url: Option<&'a str>,
     pub token_file: Option<&'a str>,
     pub api_token_file: Option<&'a str>,
+    /// The state database of a frontend or all-in-one host: `[scheduler] state-store`.
+    pub state_store: Option<&'a str>,
 }
 
 impl Ours<'_> {
@@ -38,6 +41,9 @@ impl Ours<'_> {
         if let Some(path) = self.api_token_file {
             out.push_str(&format!("\n[tls]\napi-token-file = \"{path}\"\n"));
         }
+        if let Some(url) = self.state_store {
+            out.push_str(&format!("\n[scheduler]\nstate-store = \"{url}\"\n"));
+        }
         out
     }
 
@@ -48,6 +54,7 @@ impl Ours<'_> {
             ("frontend", "url", self.frontend_url),
             ("enroll", "token_file", self.token_file),
             ("tls", "api-token-file", self.api_token_file),
+            ("scheduler", "state-store", self.state_store),
         ];
         for (table, key, value) in optional {
             if let Some(v) = value {
@@ -79,11 +86,12 @@ fn lookup<'t>(table: &'t Table, at: &str, key: &str) -> Option<&'t Value> {
 
 /// Whether `table` holds a key that is not one `setup` might write.
 fn has_other_settings(table: &Table) -> bool {
-    const MINE: [(&str, &str); 4] = [
+    const MINE: [(&str, &str); 5] = [
         ("", "mode"),
         ("frontend", "url"),
         ("enroll", "token_file"),
         ("tls", "api-token-file"),
+        ("scheduler", "state-store"),
     ];
     table.iter().any(|(k, v)| match v {
         Value::Table(inner) => {

@@ -2,14 +2,11 @@
 //! plays the host and never needs root. The trait only answers questions; the changes are
 //! steps of a `kbf-host` plan, so a dry look and an apply agree.
 
-use std::io;
+use std::io::{self, Read};
 
 use kbf_host::{Cmd, Exec, HostPath, Kind, RunUser, Untrusted};
 
-use super::paths;
-use crate::envoy::{EnvoyVersion, VersionError, check_installed};
 use crate::layout::Platform;
-use crate::run::SystemRunner;
 
 pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
 pub const LAUNCHCTL: &str = "/bin/launchctl";
@@ -41,9 +38,6 @@ pub trait Os {
     fn launchd_loaded(&self, label: &str) -> io::Result<bool>;
     /// `dscl . -list <what>` (macOS): `/Users UniqueID` or `/Groups PrimaryGroupID`.
     fn dscl_list(&self, what: &str) -> io::Result<String>;
-    /// The installed Envoy's version, or why it is refused (missing, unreadable, outside the
-    /// tested range).
-    fn envoy(&self) -> Result<EnvoyVersion, VersionError>;
     /// `len` bytes from the system's random source.
     fn random(&self, len: usize) -> io::Result<Vec<u8>>;
 }
@@ -172,20 +166,10 @@ impl Os for SystemOs<'_> {
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
     }
 
-    fn envoy(&self) -> Result<EnvoyVersion, VersionError> {
-        check_installed(&SystemRunner, std::path::Path::new(paths::ENVOY))
-    }
-
     fn random(&self, len: usize) -> io::Result<Vec<u8>> {
+        // The kernel's source, on Linux and macOS alike (`getrandom` is Linux-only in rustix).
         let mut bytes = vec![0u8; len];
-        let mut filled = 0;
-        while filled < len {
-            let n = rustix::rand::getrandom(
-                &mut bytes[filled..],
-                rustix::rand::GetRandomFlags::empty(),
-            )?;
-            filled += n;
-        }
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
         Ok(bytes)
     }
 }

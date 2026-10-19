@@ -2,26 +2,91 @@
 //! pull request builds say so (`not implemented (P<n>)`, exit 1) after the checks every verb
 //! shares (root, `--json`, `--apply`).
 //!
-//! `run` and `boot-check` are the helper's, folded in unchanged; `P5` replaces them.
+//! `run`, `boot-check` and the operator's verbs (`confirm`, `revert`, `rollback`, `gc`,
+//! `quiesce`) keep their own checks: they work on a scratch root as an ordinary user.
 
+use std::ffi::CString;
+use std::io;
 use std::io::Write;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use kbf_host::{HostExec, Root};
+use kbf_host::{HostExec, HostPath, Root};
 
 use crate::activate;
 use crate::cli::{BootArgs, Cli, RunArgs, Verb};
+use crate::database::Database;
 use crate::exit::Exit;
-use crate::helper::cycle::{Config, Helper};
+use crate::helper::cycle::{Config, Helper, HelperError};
+use crate::helper::operator::{self, Operator};
 use crate::helper::restart::Restart;
+use crate::helper::serve::{FileIdentity, Flow, PASS_INTERVAL, Serve};
+use crate::helper::service::HostProcs;
+use crate::helper::{fetcher, leases};
 use crate::layout::{Layout, Platform};
-use crate::release;
-use crate::run::SystemRunner;
-use crate::settings::Settings;
+use crate::release::ReleaseError;
 use crate::setup;
-use crate::stage::{Context, Limits, stage_from_inbox};
+
+/// Why a verb failed and the exit it ends with: `Failed`, or `NeedsOperator` when only an
+/// operator can go on (the state files are both unusable).
+struct Failure {
+    exit: Exit,
+    why: String,
+}
+
+impl From<String> for Failure {
+    fn from(why: String) -> Failure {
+        Failure {
+            exit: Exit::Failed,
+            why,
+        }
+    }
+}
+
+impl From<operator::Failure> for Failure {
+    fn from(f: operator::Failure) -> Failure {
+        let exit = match &f {
+            operator::Failure::Failed(_) => Exit::Failed,
+            operator::Failure::Refused(_) => Exit::Refused,
+            operator::Failure::Busy(_) => Exit::Busy,
+            operator::Failure::NeedsOperator(_) => Exit::NeedsOperator,
+        };
+        Failure {
+            exit,
+            why: f.to_string(),
+        }
+    }
+}
+
+impl From<HelperError> for Failure {
+    fn from(e: HelperError) -> Failure {
+        let operator = matches!(&e, HelperError::State(s) if s.needs_operator());
+        Failure {
+            exit: if operator {
+                Exit::NeedsOperator
+            } else {
+                Exit::Failed
+            },
+            why: e.to_string(),
+        }
+    }
+}
+
+impl From<ReleaseError> for Failure {
+    fn from(e: ReleaseError) -> Failure {
+        let operator = matches!(&e, ReleaseError::State(s) if s.needs_operator());
+        Failure {
+            exit: if operator {
+                Exit::NeedsOperator
+            } else {
+                Exit::Failed
+            },
+            why: e.to_string(),
+        }
+    }
+}
 
 fn now() -> u64 {
     SystemTime::now()
@@ -37,49 +102,92 @@ fn host(root: PathBuf) -> Result<(Layout, HostExec), String> {
     ))
 }
 
-fn run(root: PathBuf, args: &RunArgs) -> Result<(), String> {
-    let (layout, exec) = host(root)?;
-    // clap makes exactly one of the two flags present (`required_unless_present`,
-    // `conflicts_with`), so the label is there whenever the unit is not.
-    let restart = match &args.unit {
-        Some(unit) => Restart::Systemd(unit.clone()),
-        None => Restart::Launchd(args.launchd_label.clone().unwrap_or_default()),
+/// `path` (an absolute path on the host) under the host root.
+fn under(root: &Path, path: &HostPath) -> Result<PathBuf, Failure> {
+    let root = Root::new(root).map_err(|e| Failure::from(e.to_string()))?;
+    Ok(root.join(path))
+}
+
+fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
+    // A running program has a file, and the file can be read: neither can be told otherwise.
+    let me = std::env::current_exe().expect("a running program has a file");
+    let watch = FileIdentity::of(&me).expect("the file I run from can be read");
+    run_from(root, args, &me, watch)
+}
+
+/// The helper `run` drives: the host's, with the schema step of `--installer-config` attached
+/// when the flag is given.
+fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failure> {
+    let database = match &args.installer_config {
+        Some(config) => Some(
+            Database::from_installer_toml(&under(&root, config)?)
+                .map_err(|e| Failure::from(e.to_string()))?,
+        ),
+        None => None,
     };
+    let (layout, exec) = host(root)?;
+    let platform = layout.platform();
     let cfg = Config {
         update_dir: args.update_dir.clone(),
-        restart,
+        orders_dir: args.orders_dir.clone(),
+        restart: args.service.restart(),
         window_secs: args.window_secs,
         starts: args.starts,
+        min_activation_interval_secs: args.min_activation_interval_secs,
     };
-    let mut helper = Helper::new(layout.clone(), exec, cfg);
-    let trust = HostExec::new(layout.root().clone());
-    let mut stager = move |exec: &mut HostExec, entry: &std::path::Path| {
-        let settings = Settings::load(&trust, &layout)?;
-        let mut ctx = Context {
-            host: &layout,
-            settings: &settings,
-            exec,
-            trust: &trust,
-            runner: &SystemRunner,
-            owner: release::ROOT,
-            limits: Limits::DEFAULT,
-        };
-        stage_from_inbox(&mut ctx, entry)
-    };
-    helper.recover().map_err(|e| e.to_string())?;
+    // The release fetcher and the lease source are wired by later changes; until then an
+    // activation of a release that is not installed, and every activation, is refused.
+    let mut helper = Helper::new(
+        layout,
+        exec,
+        cfg,
+        Box::new(fetcher::NotWired),
+        Box::new(leases::NotWired),
+        Box::new(HostProcs::new(platform)),
+    );
+    if let Some(database) = database {
+        helper.set_schema_step(Box::new(database));
+    }
+    Ok(helper)
+}
+
+/// The service loop of `me`, the file this program runs from, whose identity `watch` holds:
+/// once the file is replaced the loop starts the new one in this process's place.
+fn run_from(root: PathBuf, args: &RunArgs, me: &Path, watch: FileIdentity) -> Result<(), Failure> {
+    // A frontend or all-in-one unit activates a release only after the database is migrated
+    // for it; without the installer.toml that names the database the step would be silently
+    // absent, so the service does not start.
+    if args.installer_config.is_none() && args.service.runs_database_mode() {
+        return Err(Failure {
+            exit: Exit::Usage,
+            why: "run needs --installer-config on a frontend or all-in-one host (the \
+                  database is migrated before a release is activated)"
+                .to_owned(),
+        });
+    }
+    let helper = build_helper(root, args)?;
+    let mut serve = Serve::new(helper, Box::new(watch));
+    serve.helper().recover()?;
     let mut left = args.passes;
     while left != Some(0) {
-        helper
-            .cycle(now(), &mut stager)
-            .map_err(|e| e.to_string())?;
-        helper.drain_log(&mut std::io::stderr());
+        match serve.turn(now())? {
+            Flow::Continue => {}
+            Flow::Reexec => {
+                eprintln!("kbf-installer: my file was replaced; starting the new one");
+                let err = reexec(me);
+                return Err(format!("cannot start {}: {err}", me.display()).into());
+            }
+        }
+        serve.helper().drain_log(&mut std::io::stderr());
         left = left.map(|n| n - 1);
-        sleep(Duration::from_secs(args.interval_secs));
+        if left != Some(0) {
+            sleep(PASS_INTERVAL);
+        }
     }
     Ok(())
 }
 
-fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {
+fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), Failure> {
     let (layout, mut exec) = host(root)?;
     let mut out = Vec::new();
     let result = activate::boot_check(&mut exec, &layout, now(), args.window_secs, &mut out);
@@ -89,8 +197,49 @@ fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), String> {
             eprintln!("kbf-installer: boot check: {decision:?}");
             Ok(())
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e.into()),
     }
+}
+
+/// A verb of the operator, run inline under the lock.
+fn operate(
+    root: PathBuf,
+    apply: bool,
+    restart: Restart,
+    verb: impl FnOnce(&mut Operator<'_, HostExec>) -> Result<(), operator::Failure>,
+) -> Result<(), Failure> {
+    let (layout, mut exec) = host(root)?;
+    let procs = HostProcs::new(layout.platform());
+    let mut err = std::io::stderr();
+    verb(&mut Operator {
+        host: &layout,
+        exec: &mut exec,
+        restart: &restart,
+        procs: &procs,
+        out: &mut err,
+        apply,
+        wait: operator::LOCK_WAIT,
+    })
+    .map_err(Failure::from)
+}
+
+fn gc(root: PathBuf, apply: bool, keep: usize) -> Result<(), Failure> {
+    let (layout, mut exec) = host(root)?;
+    let procs = HostProcs::new(layout.platform());
+    operator::gc(
+        &mut exec,
+        &layout,
+        &procs,
+        keep,
+        apply,
+        &mut std::io::stderr(),
+    )
+    .map_err(Failure::from)
+}
+
+fn quiesce(root: PathBuf) -> Result<(), Failure> {
+    let (layout, _) = host(root)?;
+    operator::quiesce(&layout, operator::LOCK_WAIT).map_err(Failure::from)
 }
 
 /// The directory the host's paths are under: `/`, except in a build with the sandbox flag.
@@ -147,9 +296,9 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         code
     };
     // `run` and `boot-check` keep the helper's own checks (they work on a scratch root as an
-    // ordinary user) until P5 replaces them; every other verb is gated here.
-    let gated = !matches!(cli.verb, Verb::Run(_) | Verb::BootCheck(_));
-    if gated && cli.verb.needs_root() && euid != 0 {
+    // ordinary user) until P5 replaces them; every other verb that is not built is gated
+    // here. The verb table says which are built (`built_by`).
+    if cli.verb.built_by().is_some() && cli.verb.needs_root() && euid != 0 {
         return say(
             Exit::Usage,
             format!("kbf-installer: {name} needs root: run it with sudo (effective uid is {euid})"),
@@ -157,13 +306,23 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         );
     }
     let result = match &cli.verb {
-        Verb::Run(args) => run(root_of(cli), args),
-        Verb::BootCheck(args) => boot_check(root_of(cli), args),
+        // `setup` checks for root itself and prints its steps ahead of its own result.
         Verb::Setup(args) => {
             let mut steps = Vec::new();
             let result = setup::cli(root_of(cli), args, cli.apply, &mut steps);
             return finish_setup(cli.json, result, &steps, out, err);
         }
+        Verb::Run(args) => run(root_of(cli), args),
+        Verb::BootCheck(args) => boot_check(root_of(cli), args),
+        Verb::Confirm(n) => operate(root_of(cli), cli.apply, n.service.restart(), |o| {
+            o.confirm(&n.id.to_string())
+        }),
+        Verb::Revert(n) => operate(root_of(cli), cli.apply, n.service.restart(), |o| {
+            o.revert(&n.id.to_string())
+        }),
+        Verb::Rollback(s) => operate(root_of(cli), cli.apply, s.restart(), |o| o.rollback()),
+        Verb::Gc(g) => gc(root_of(cli), cli.apply, g.keep),
+        Verb::Quiesce => quiesce(root_of(cli)),
         other => {
             let phase = other.built_by().unwrap_or("?");
             return say(
@@ -180,8 +339,8 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
     };
     match result {
         Ok(()) => Exit::Ok,
-        Err(why) => say(
-            Exit::Failed,
+        Err(Failure { exit, why }) => say(
+            exit,
             format!("kbf-installer: {why}"),
             serde_json::json!({"verb": name, "error": "failed", "message": why}),
         ),
@@ -191,3 +350,23 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;
+
+/// Start `me` in this process's place with this process's arguments; returns only the error
+/// of a start that failed. Not `Command::exec`: the standard library puts SIGPIPE back to its
+/// default in the calling process before it execs, and when the exec then fails that process
+/// carries on with the default (a write to a pipe nobody reads ends it by a signal instead of
+/// failing with an error). `execv` changes no disposition, and the program that starts is
+/// this one, which ignores SIGPIPE itself.
+fn reexec(me: &Path) -> io::Error {
+    // A path and the arguments the kernel passed this process are C strings already, so
+    // none holds a NUL byte.
+    let arg = |s: &std::ffi::OsStr| CString::new(s.as_bytes()).expect("no NUL byte in an argument");
+    let mut argv = vec![arg(me.as_os_str())];
+    argv.extend(std::env::args_os().skip(1).map(|a| arg(&a)));
+    let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    // SAFETY: `ptrs` is a null-terminated array of pointers to NUL-terminated strings that
+    // live (in `argv`) across the call; execv returns only on failure.
+    unsafe { libc::execv(ptrs[0], ptrs.as_ptr()) };
+    io::Error::last_os_error()
+}

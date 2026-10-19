@@ -250,3 +250,60 @@ fn a_members_boot_round_trips_and_an_older_map_without_it_reads_as_zero() {
         "field 6 on the wire"
     );
 }
+
+// Catches: the cold-store registration fields moved to other numbers (a node and a frontend
+// of two builds would read each other's generation as something else), a generation
+// that is not a varint, and an apply status the frontend cannot tell from "not sent". The
+// bytes are pinned: the answers carry the generation on 5 (Register) and 3 (Heartbeat); the
+// heartbeat carries the applied generation on 7 and the status on 8.
+#[test]
+fn the_cold_store_registration_fields_are_pinned() {
+    let register = pb::RegisterResponse {
+        objstore_generation: 9,
+        ..Default::default()
+    };
+    assert_eq!(register.encode_to_vec(), [0x28, 9], "field 5");
+    let answer = pb::HeartbeatResponse {
+        objstore_generation: 9,
+        ..Default::default()
+    };
+    assert_eq!(answer.encode_to_vec(), [0x18, 9], "field 3");
+    let beat = pb::HeartbeatRequest {
+        applied_objstore_generation: 4,
+        apply_status: pb::ApplyStatus::ProbeFailed as i32,
+        ..Default::default()
+    };
+    assert_eq!(beat.encode_to_vec(), [0x38, 4, 0x40, 3], "fields 7 and 8");
+}
+
+// Catches: a status enum whose zero is a real outcome (an older node's heartbeat, which
+// has no such field, would then read as a report) and an unknown number that decodes
+// (the frontend must be able to refuse a status it does not know).
+#[test]
+fn the_apply_status_is_closed_and_an_older_node_reports_none() {
+    assert_eq!(pb::ApplyStatus::Unspecified as i32, 0);
+    assert_eq!(pb::ApplyStatus::Ok as i32, 1);
+    assert_eq!(pb::ApplyStatus::Pending as i32, 2);
+    assert_eq!(pb::ApplyStatus::ProbeFailed as i32, 3);
+    assert_eq!(pb::ApplyStatus::IdentityMismatch as i32, 4);
+    assert_eq!(pb::ApplyStatus::Unsupported as i32, 5);
+    assert!(pb::ApplyStatus::try_from(6).is_err());
+    assert!(pb::ApplyStatus::try_from(-1).is_err());
+    let old = pb::HeartbeatRequest::decode(&[0x08, 1, 0x10, 2][..]).expect("decodes");
+    assert_eq!(old.apply_status, pb::ApplyStatus::Unspecified as i32);
+    assert_eq!(old.applied_objstore_generation, 0);
+}
+
+// Catches: a node that fails on a Register or Heartbeat answer from a newer frontend (it
+// updates first): fields of unknown numbers and wire types after the known ones decode, and
+// an objstore generation the node has never seen is a plain number to compare with its own.
+#[test]
+fn a_newer_frontends_membership_answers_decode() {
+    let unknown = [0x78, 0x01, 0x72, 0x02, b'h', b'i'];
+    let register = [&[0x28, 0xff, 0xff, 0xff, 0xff, 0x0f][..], &unknown].concat();
+    let got = pb::RegisterResponse::decode(register.as_slice()).expect("decodes");
+    assert_eq!(got.objstore_generation, u64::from(u32::MAX));
+    let beat = [&[0x18, 9][..], &unknown].concat();
+    let got = pb::HeartbeatResponse::decode(beat.as_slice()).expect("decodes");
+    assert_eq!(got.objstore_generation, 9);
+}

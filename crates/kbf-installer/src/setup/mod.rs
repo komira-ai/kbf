@@ -8,18 +8,23 @@
 //! (`--commit`), `/etc/kbf/kbf.toml`, and last the units enabled for the mode.
 //!
 //! - It is root's: [`Os::euid`] is checked first, so only a fake that says 0 gets past it
-//!   without root. On a frontend or all-in-one host the installed Envoy is checked against
-//!   the tested range before anything else (`envoy_range`).
+//!   without root. It refuses while the retired `kbf-helper`/`kbf-deploy` layout is on the
+//!   host (the migration is a later change). Envoy is not its business: the bundled proxy owns
+//!   a frontend's port, and a load balancer in front is the operator's.
 //! - Files are written by `kbf-host` steps, each a temporary name, fsync, rename and a sync
 //!   of the directory. Without `--apply` the steps are printed as `DRY-RUN:` and nothing
 //!   changes.
 //! - Idempotent: steps are planned only where the host differs. The same flags again is an
 //!   empty plan; changed flags rewrite the files atomically and never restart a running
 //!   service. An operator floor (`min_generation`) only goes up.
-//! - The first release comes through [`Releases`], the installer's one downloader (the fetch
-//!   child and the verify pipeline); the binary's own is [`NoReleases`] until those land.
+//! - The first release comes through [`Releases`], the installer's one downloader (the
+//!   [`Fetcher`](crate::helper::fetcher::Fetcher); the binary has none wired in yet, so
+//!   `--commit` stops before `kbf.toml` with that reason). On a frontend or all-in-one host the
+//!   state database's schema is created or brought forward ([`Schemas`]) once `installer.toml`
+//!   is written, and a unit that makes a frontend is enabled and never started.
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
 
+pub mod backend;
 pub mod kbf_toml;
 pub mod os;
 pub mod paths;
@@ -36,14 +41,16 @@ use std::path::PathBuf;
 
 use kbf_host::{Entry, Exec, HostError, HostExec, HostPath, PathError, Root, Untrusted};
 
+use self::backend::{Backend, Fetching, Postgres};
 use self::os::{Os, SystemOs};
-use self::validate::{Raw, Valid};
-use crate::CommitId;
+use self::validate::{Raw, Valid, mode_name};
 use crate::cli::{Mode, SetupArgs};
-use crate::envoy::VersionError;
+use crate::database::database_step;
 use crate::exit::Exit;
+use crate::helper::fetcher::{FetchError, NotWired};
 use crate::installer_toml::{InstallerToml, Source};
-use crate::layout::Platform;
+use crate::layout::{Layout, Platform};
+use crate::release::ReleaseError;
 
 /// Why setup stopped.
 #[derive(Debug, thiserror::Error)]
@@ -66,14 +73,19 @@ pub enum SetupError {
     SubIdSpace(&'static str),
     #[error("no free id between 300 and 399 for the fetch account")]
     NoFreeId,
-    #[error("envoy_range: {0}")]
-    EnvoyRange(VersionError),
+    #[error(
+        "the old layout is still on this host ({0}): kbf-installer and the retired kbf-helper/kbf-deploy never both manage a host, and the migration is not built; setup stops"
+    )]
+    OldLayout(String),
+    #[error("{0}")]
+    Fetch(#[from] FetchError),
+    #[error("{0}")]
+    Release(#[from] ReleaseError),
+    #[error("database step: {0}")]
+    Database(String),
     /// Only a person can go on: the reason, and what to do about it.
     #[error("{0}")]
     NeedsOperator(String),
-    /// A step the installer does not have yet.
-    #[error("{0}")]
-    NotBuilt(String),
     #[error("{0}")]
     Path(#[from] PathError),
     #[error("{0}")]
@@ -92,11 +104,13 @@ impl SetupError {
             | SetupError::Token(_)
             | SetupError::Unsupported(_)
             | SetupError::NoUser { .. } => Exit::Usage,
-            SetupError::EnvoyRange(_) => Exit::Refused,
-            SetupError::NeedsOperator(_) => Exit::NeedsOperator,
+            SetupError::Fetch(FetchError::Rejected(_)) => Exit::Refused,
+            SetupError::NeedsOperator(_) | SetupError::OldLayout(_) => Exit::NeedsOperator,
             SetupError::SubIdSpace(_)
             | SetupError::NoFreeId
-            | SetupError::NotBuilt(_)
+            | SetupError::Fetch(_)
+            | SetupError::Release(_)
+            | SetupError::Database(_)
             | SetupError::Path(_)
             | SetupError::Io(_)
             | SetupError::Host(_) => Exit::Failed,
@@ -113,40 +127,14 @@ impl SetupError {
             SetupError::Unsupported(_) => "unsupported",
             SetupError::NoUser { .. } => "no_user",
             SetupError::SubIdSpace(_) | SetupError::NoFreeId => "no_room",
-            SetupError::EnvoyRange(_) => "envoy_range",
             SetupError::NeedsOperator(_) => "needs_operator",
-            SetupError::NotBuilt(_) => "not_implemented",
+            SetupError::OldLayout(_) => "old_layout",
+            SetupError::Fetch(FetchError::NotWired) => "not_implemented",
+            SetupError::Fetch(_) => "fetch",
+            SetupError::Release(_) => "release",
+            SetupError::Database(_) => "database",
             SetupError::Path(_) | SetupError::Io(_) | SetupError::Host(_) => "failed",
         }
-    }
-}
-
-/// The installer's one downloader, as `setup` uses it: fetch the release for `commit` from
-/// `source`, verify it as an update is verified, and install it as `releases/<commit>`
-/// with `releases/current` pointing at it.
-pub trait Releases {
-    fn install_first(
-        &self,
-        host: &mut dyn Exec,
-        commit: &CommitId,
-        source: &Source,
-    ) -> Result<(), SetupError>;
-}
-
-/// The downloader of a build without the fetch child (contract P7) and the verify pipeline
-/// (P8): it installs nothing, and says so.
-pub struct NoReleases;
-
-impl Releases for NoReleases {
-    fn install_first(
-        &self,
-        _: &mut dyn Exec,
-        commit: &CommitId,
-        _: &Source,
-    ) -> Result<(), SetupError> {
-        Err(SetupError::NotBuilt(format!(
-            "cannot install release {commit}: fetching a release needs the fetch child (contract P7) and the verify pipeline (P8), which this build does not have; setup stopped before it wrote kbf.toml"
-        )))
     }
 }
 
@@ -197,6 +185,7 @@ pub fn installer_file(
         settings.min_generation = floor;
     }
     settings.source = v.source.clone();
+    settings.database = v.database.clone();
     (settings.node_cert, settings.node_key) = match (&v.source, node_role(v.mode)) {
         (Source::Frontend, Some(role)) => {
             let (cert, key) = paths::node_identity(platform, role);
@@ -218,9 +207,23 @@ fn node_role(mode: Mode) -> Option<&'static str> {
 }
 
 /// Whether a release is installed: `releases/current` is there (a link counts).
-fn released(exec: &dyn Exec, platform: Platform) -> Result<bool, SetupError> {
-    let current = HostPath::new(&paths::current_release(platform))?;
-    Ok(exec.stat(&current)?.is_some() || exec.inspect(&current)?.is_some())
+fn released(exec: &dyn Exec, layout: &Layout) -> Result<bool, SetupError> {
+    present(exec, &layout.current())
+}
+
+/// Whether anything is at `path`: a link counts, whether or not it points at something.
+fn present(exec: &dyn Exec, path: &HostPath) -> Result<bool, SetupError> {
+    Ok(exec.stat(path)?.is_some() || exec.inspect(path)?.is_some())
+}
+
+/// Stops `setup` where the retired layout is: the one of `kbf-helper` and `kbf-deploy host`.
+fn refuse_old_layout(exec: &dyn Exec) -> Result<(), SetupError> {
+    for old in paths::OLD_LAYOUT {
+        if present(exec, &HostPath::new(old)?)? {
+            return Err(SetupError::OldLayout(old.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 /// Print the steps of `plan` and, when applying, carry them out. Returns how many there were.
@@ -250,7 +253,7 @@ fn emit(
 pub fn run(
     os: &dyn Os,
     exec: &mut dyn Exec,
-    releases: &dyn Releases,
+    backend: &Backend<'_>,
     raw: &Raw,
     options: Options,
     out: &mut dyn Write,
@@ -264,28 +267,31 @@ pub fn run(
     }
     let valid = raw.validate().map_err(SetupError::Invalid)?;
     let ctx = plan::context(os, valid.mode)?;
-    if matches!(valid.mode, Mode::Frontend | Mode::AllInOne) {
-        os.envoy().map_err(SetupError::EnvoyRange)?;
-    }
+    refuse_old_layout(&*exec)?;
     let mut notes = Vec::new();
 
     let before = plan::before_release(os, &*exec, &valid, &ctx)?;
     let mut steps = emit(&before.plan, exec, options.apply, out)?;
     notes.extend(before.notes);
 
-    let mut have_release = released(&*exec, ctx.platform)?;
+    // The schema is made after `installer.toml` is in place and before anything is fetched or
+    // enabled: a database that cannot be reached stops setup with no release and no unit.
+    if let Some(url) = &valid.database {
+        let schema = backend.schemas.of(url)?;
+        let line = database_step(&*schema, mode_name(valid.mode), options.apply)
+            .map_err(SetupError::Database)?;
+        writeln!(out, "{line}")?;
+    }
+
+    let mut have_release = released(&*exec, &ctx.layout)?;
     match (&valid.commit, have_release) {
         (Some(commit), false) => {
             steps += 1;
             if options.apply {
                 writeln!(out, "+ fetch and verify release {commit}")?;
-                releases.install_first(&mut *exec, commit, &valid.source)?;
-                have_release = released(&*exec, ctx.platform)?;
-                if !have_release {
-                    return Err(SetupError::NotBuilt(format!(
-                        "release {commit} was fetched but releases/current is not there: setup stopped before it wrote kbf.toml"
-                    )));
-                }
+                // It returns only once the release is installed, verified and current.
+                backend.releases.install_first(commit)?;
+                have_release = true;
             } else {
                 writeln!(out, "DRY-RUN: fetch and verify release {commit}")?;
                 have_release = true;
@@ -319,10 +325,11 @@ pub fn cli(
     apply: bool,
     out: &mut dyn Write,
 ) -> Result<(), SetupError> {
-    let mut exec = HostExec::new(Root::new(root)?);
+    let platform = Platform::current();
+    let mut exec = HostExec::new(Root::new(&root)?);
     // `os` reads through its own copy of the host, so `run` can change the real one.
     let reader = exec.clone();
-    let os = SystemOs::new(&reader, Platform::current());
+    let os = SystemOs::new(&reader, platform);
     let raw = Raw {
         mode: args.mode,
         frontend_url: args.frontend_url.clone(),
@@ -331,10 +338,20 @@ pub fn cli(
         release_url: args.release_url.clone(),
         min_generation: args.min_generation,
         commit: args.commit.clone(),
+        database: args.database.clone(),
+        installer_config: args.installer_config.to_string(),
     };
     let options = Options {
         apply,
         no_start: args.no_start,
     };
-    run(&os, &mut exec, &NoReleases, &raw, options, out)
+    // The installer has no release fetcher wired in yet (the fetch child is a later change):
+    // `--commit` says so and stops before it writes `kbf.toml`.
+    let layout = Layout::new(Root::new(&root)?, platform);
+    let releases = Fetching::new(&NotWired, layout, HostExec::new(Root::new(&root)?));
+    let backend = Backend {
+        releases: &releases,
+        schemas: &Postgres,
+    };
+    run(&os, &mut exec, &backend, &raw, options, out)
 }

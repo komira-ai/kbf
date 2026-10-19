@@ -15,7 +15,7 @@ use super::paths;
 use super::validate::{Valid, mode_name};
 use super::{SetupError, installer_file};
 use crate::cli::Mode;
-use crate::layout::Platform;
+use crate::layout::{Layout, Platform};
 
 const USERADD: &str = "/usr/sbin/useradd";
 const USERMOD: &str = "/usr/sbin/usermod";
@@ -63,11 +63,11 @@ fn file(
 /// whatever the mode.
 pub fn mode_units(mode: Mode) -> &'static [&'static str] {
     match mode {
-        Mode::Frontend => &["kbf-envoy.service", "kbf-frontend@a.service"],
+        Mode::Frontend => &["kbf-frontend@a.service"],
         Mode::Storage => &["kbf-storage.service"],
         Mode::Daemon => &["kbf-daemon.service"],
         Mode::StorageAndDaemon => &["kbf-storage-and-daemon.service"],
-        Mode::AllInOne => &["kbf-envoy.service", "kbf-all-in-one.service"],
+        Mode::AllInOne => &["kbf-all-in-one.service"],
     }
 }
 
@@ -99,6 +99,8 @@ fn fetch_user(platform: Platform) -> &'static str {
 /// What the plans share: who root and the service user are.
 pub struct Ctx {
     pub platform: Platform,
+    /// The installer's tree, for its paths.
+    pub layout: Layout,
     pub root: Owner,
     /// The user the mode's unit runs as (Linux); a Mac runs the daemon as root.
     pub service: Option<RunUser>,
@@ -131,6 +133,7 @@ pub fn context(os: &dyn Os, mode: Mode) -> Result<Ctx, SetupError> {
     };
     Ok(Ctx {
         platform,
+        layout: Layout::new(kbf_host::Root::new("/")?, platform),
         root: os.root_owner(),
         service,
     })
@@ -313,8 +316,9 @@ pub fn before_release(
     // daemon is root, so it is root's).
     let (root, service) = (ctx.root, ctx.service_owner());
     dir(&mut p, paths::ETC_DIR, 0o755, root)?;
-    dir(&mut p, paths::installer_dir(platform), 0o755, root)?;
-    dir(&mut p, &paths::orders_dir(platform), 0o700, service)?;
+    let state_dir = ctx.layout.state_dir().to_string();
+    dir(&mut p, &state_dir, 0o755, root)?;
+    dir(&mut p, &format!("{state_dir}/orders"), 0o700, service)?;
 
     // The tokens belong to the user whose process reads them: both loaders refuse a token
     // file another user owns, or one with a mode other than 0600 or 0400.
@@ -384,6 +388,7 @@ pub fn after_release(
         frontend_url: v.frontend_url.as_deref(),
         token_file: v.token_file.as_ref().map(|_| paths::ENROLL_TOKEN),
         api_token_file: serves_api(v.mode).then_some(paths::API_TOKEN),
+        state_store: v.database.as_deref(),
     };
     let current = match exec.inspect(&hp(paths::KBF_TOML)?)? {
         Some(Entry::File { bytes, .. }) => Some(String::from_utf8_lossy(&bytes).into_owned()),
@@ -435,8 +440,16 @@ fn units(
     notes: &mut Vec<String>,
 ) -> Result<(), SetupError> {
     // The mode's units are started when the operator did not forbid it and a release is
-    // there to run. The installer's own service has nothing to wait for.
-    let start_mode = if no_start {
+    // there to run. The installer's own service has nothing to wait for. A unit that makes a
+    // frontend is never started here: starting one takes the state database and the public
+    // port, which only the operator decides.
+    let start_mode = if v.mode.keeps_state_in_database() {
+        notes.push(
+            "the frontend unit is enabled, not started: start it when the database, the TLS files and the port are ready"
+                .to_owned(),
+        );
+        false
+    } else if no_start {
         notes.push("--no-start: units are enabled, not started".to_owned());
         false
     } else if !released {

@@ -1,5 +1,5 @@
 //! `kbf-keeper-swap`, for `tests/keeper.rs` only: a process that starts a keeper after
-//! its own binary was renamed over, as kbf-updater's swap does while a daemon runs.
+//! its own binary was renamed over, as an update's swap does while a daemon runs.
 //!
 //! `kbf-keeper-swap <replacement> <cgroup.kill>` renames `replacement` over this
 //! binary, then starts a `cgroup` keeper of `cgroup.kill` (one try) from

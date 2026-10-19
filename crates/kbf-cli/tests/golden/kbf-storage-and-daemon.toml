@@ -60,6 +60,8 @@ daemon-user = "_kbf"
 # driver = []
 # A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 # image = []
+# The order spool (owned by the service user, mode 0700): where the daemon writes the order records the root installer reads. With `--update-dir` only; default `<update-dir>/orders`
+# orders-dir = "DIR"
 # The longest wait between rounds of connection attempts, in milliseconds. Each wait is jittered down by up to half
 reconnect-max-ms = 30000
 # The wait, in milliseconds, after a session ends and after the first round of connection attempts that all failed. It doubles with each further failed round
@@ -68,7 +70,7 @@ reconnect-ms = 1000
 # reserve-cpus = "N"
 # How many of the farm's processes on this host share the reserve: the daemon sizes its pools from `reserve / share` CPUs. Default 1
 # reserve-share = "N"
-# The update directory: the daemon fetches the release the frontend offers into its `inbox/`, over the connection `--cas` names, and reads the root helper's `status.json` there. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
+# The root installer's directory: the daemon reads its `status.json` there. The frontend's orders are written to `orders/` beneath it unless `--orders-dir` says otherwise. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
 # update-dir = "DIR"
 
 [identity]
@@ -190,6 +192,12 @@ write-bytes-in-flight = 2147483648
 write-linger = 2
 # Blobs of this many bytes or more are written as a segment of their own, past the group, so they neither wait for the linger nor hold up small writes
 write-own-segment-bytes = 16777216
+# The most blobs waiting for a write-pool writer. A blob that finds the queue full goes straight to the object store, as one does when the write tier has no room. At least 1
+write-pool-queue = 4096
+# How long, in seconds, a streamed blob may go without sending a chunk before its write-pool writer is taken back and the upload fails UNAVAILABLE (the client sends it again). Without it, a stalled but connected large upload would hold a writer for ever, and with all writers held every other blob would wait. It limits stalls only: an upload that sends a chunk more often than this (a trickle) can still hold a writer. At least 1
+write-pool-stream-idle = 30
+# The writers of the write pool: the ByteStream and storage `Write`s of a node with a write tier are appended to shared segment files by this many writers, each holding one range open, so the node keeps at most this many block files (plus the open grouped block) open for writing for those blobs, however many uploads are in flight. At least 1
+write-pool-writers = 8
 # The most segment PUTs, each with its footer read-back, in flight at once. A segment sealed while all are busy waits; new blobs go to a new open segment
 write-puts-in-flight = 4
 

@@ -1,6 +1,6 @@
 //! Where `setup` puts things, as the contract names them (docs/design/kbf-installer.md
-//! section 3). These are the paths of files `setup` itself writes or reads; the release tree
-//! and the state file are `layout.rs`'s.
+//! section 3). These are the paths of files `setup` itself writes or reads; the installer's
+//! tree (releases, links, state, `orders/`) is `layout.rs`'s, the one source of those.
 
 use crate::layout::Platform;
 
@@ -14,24 +14,6 @@ pub const INSTALLER_TOML: &str = "/etc/kbf/installer.toml";
 pub const ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
 /// The first operator token, written once on a frontend or all-in-one host.
 pub const API_TOKEN: &str = "/etc/kbf/api-token";
-
-/// The installer tree: root's; only `orders/` inside it is the service user's.
-pub fn installer_dir(platform: Platform) -> &'static str {
-    match platform {
-        Platform::Linux => "/var/lib/kbf-installer",
-        Platform::MacOs => "/var/db/kbf-installer",
-    }
-}
-
-/// `orders/` in the installer tree: where `kbf` writes order records.
-pub fn orders_dir(platform: Platform) -> String {
-    format!("{}/orders", installer_dir(platform))
-}
-
-/// The link to the release that runs. `setup` only asks whether it is there.
-pub fn current_release(platform: Platform) -> String {
-    format!("{}/releases/current", installer_dir(platform))
-}
 
 /// kbf's own state directory, where enrollment keeps the node's certificates (`pki/`).
 pub fn kbf_state_dir(platform: Platform) -> &'static str {
@@ -47,5 +29,7 @@ pub fn node_identity(platform: Platform, role: &str) -> (String, String) {
     (format!("{pki}/{role}.pem"), format!("{pki}/{role}.key"))
 }
 
-/// Where the Envoy that fronts a frontend is installed.
-pub const ENVOY: &str = "/usr/bin/envoy";
+/// What the retired `kbf-helper` and `kbf-deploy host` left on a host: their release tree and
+/// state. `kbf-installer` and they never both manage one host (contract section 8), and the
+/// migration is not built, so `setup` stops where either is there.
+pub const OLD_LAYOUT: [&str; 2] = ["/usr/local/kbf", "/var/lib/kbf-deploy"];

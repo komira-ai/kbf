@@ -112,7 +112,7 @@ On `main`, `kbf-driver-native` runs an action without the network under
 (deny lsopen) (deny network*)` plus loopback and Unix-socket allows; an action that
 asks for the network runs **without** `sandbox-exec`
 (`crates/kbf-driver-native/src/network.rs`) **[V]**. Open
-[#77](https://github.com/komira-ai/komira-build-farm/pull/77) sandboxes every action.
+[#77](https://github.com/komira-ai/kbf/pull/77) sandboxes every action.
 Each lease gets its own scratch directory, its process tree is killed at the end, and
 removal gives back permissions the action took away and clears the immutable and
 append-only flags (`crates/kbf-driver-native/src/lib.rs`) **[V]**. Clearing ACLs on
@@ -640,17 +640,17 @@ Rules for all four layers:
 
 Done on `main`: the native driver with `sandbox-exec`, per-lease scratch, process-tree
 kill and removal that clears the immutable and append-only flags
-([#64](https://github.com/komira-ai/komira-build-farm/pull/64)), and platform routing
-([#71](https://github.com/komira-ai/komira-build-farm/pull/71)), sandbox every action and ACL-proof removal
-([#77](https://github.com/komira-ai/komira-build-farm/pull/77)), and the Mac node provisioning design
+([#64](https://github.com/komira-ai/kbf/pull/64)), and platform routing
+([#71](https://github.com/komira-ai/kbf/pull/71)), sandbox every action and ACL-proof removal
+([#77](https://github.com/komira-ai/kbf/pull/77)), and the Mac node provisioning design
 ([mac-node-provisioning.md](mac-node-provisioning.md)).
-Open: the fence clock during suspend ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)),
-the node id checked against the certificate ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)).
+Open: the fence clock during suspend ([#78](https://github.com/komira-ai/kbf/issues/78)),
+the node id checked against the certificate ([#79](https://github.com/komira-ai/kbf/issues/79)).
 
 | Crate | Change |
 |---|---|
-| `kbf-front`, `kbf-caps` | done on `main` ([#90](https://github.com/komira-ai/komira-build-farm/pull/90)): the size keys `kbf-book-cpus` and `kbf-book-mem-gib` ([section 5.1](#51-platform-properties-partly-planned)) set what an `action` lease books in place of the default 1 core and 1 GiB (`DEFAULT_RESOURCES`, `crates/kbf-front/src/execution.rs`), and the native driver's memory kill, 150% + 512 MiB of the booking (`crates/kbf-driver-native/src/config.rs`), follows the booking **[V]**; an action without `kbf-book-mem-gib` is still killed at 2 GiB, which large `swiftc` and `ld` steps exceed |
-| `kbf-caps` | done on `main` ([#90](https://github.com/komira-ai/komira-build-farm/pull/90)): `xcode` is a set the node reports, one entry per Xcode build, and a request names one build, matched by membership; a request naming two `xcode` entries, or an empty one, is refused (`crates/kbf-caps/src/matching.rs`) **[V]** |
+| `kbf-front`, `kbf-caps` | done on `main` ([#90](https://github.com/komira-ai/kbf/pull/90)): the size keys `kbf-book-cpus` and `kbf-book-mem-gib` ([section 5.1](#51-platform-properties-partly-planned)) set what an `action` lease books in place of the default 1 core and 1 GiB (`DEFAULT_RESOURCES`, `crates/kbf-front/src/execution.rs`), and the native driver's memory kill, 150% + 512 MiB of the booking (`crates/kbf-driver-native/src/config.rs`), follows the booking **[V]**; an action without `kbf-book-mem-gib` is still killed at 2 GiB, which large `swiftc` and `ld` steps exceed |
+| `kbf-caps` | done on `main` ([#90](https://github.com/komira-ai/kbf/pull/90)): `xcode` is a set the node reports, one entry per Xcode build, and a request names one build, matched by membership; a request naming two `xcode` entries, or an empty one, is refused (`crates/kbf-caps/src/matching.rs`) **[V]** |
 | `kbf-driver-native` | deny file writes outside the lease, `TMPDIR` and a per-lease `HOME`; set `HOME`, `TMPDIR`, the module cache paths and the per-user cache folder per lease; per-lease user; fill usage |
 | `kbf-daemon` | report each Xcode build (several `xcode` entries) and SDKs; set `DEVELOPER_DIR` from the action |
 | `kbf-server`, `kbf-sched` | subtract the host floor from capacity, not from the report (the planned "Protected floors"); lease kind in placement from `drivers` (the planned "Drivers in placement") |

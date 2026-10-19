@@ -2,7 +2,12 @@ use clap::{CommandFactory, Parser};
 use serde_json::Value;
 
 use super::*;
-use crate::testkit::B;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::layout::{Layout, Platform};
+use crate::state::{Locked, PendingConfirm, State};
+use crate::testkit::{A, B, c, host_root_on};
 
 fn parse(args: &[&str]) -> Cli {
     let mut full = vec!["kbf-installer"];
@@ -21,7 +26,7 @@ fn run_as(euid: u32, args: &[&str]) -> (Exit, String, String) {
 }
 
 /// Every verb of the contract's table and the pull request that builds it. The verbs that
-/// are not built say so with the phase; the three that are built (`run`, `boot-check`, `setup`) are not here.
+/// are not built say so with the phase; the ones that are built (`run`, `setup` and the operator's) are not here.
 fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
     let commit: &'static str = B;
     vec![
@@ -31,11 +36,6 @@ fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
             "update",
             "P13",
         ),
-        (vec!["confirm", "--id=3-42"], "confirm", "P5"),
-        (vec!["revert", "--id=3-42"], "revert", "P5"),
-        (vec!["rollback"], "rollback", "P5"),
-        (vec!["gc"], "gc", "P5"),
-        (vec!["quiesce"], "quiesce", "P5"),
         (vec!["check"], "check", "P10"),
         (vec!["stage"], "stage", "P8"),
         (vec!["activate"], "activate", "P5"),
@@ -57,130 +57,6 @@ fn every_unbuilt_verb_says_which_pull_request_builds_it() {
             format!("kbf-installer: {name}: not implemented ({phase})\n")
         );
     }
-}
-
-/// Catches `setup` answering like a stub, or running without the flags its mode needs: the
-/// verb is built, so it never says "not implemented"; a bare `--mode=daemon` (no frontend URL,
-/// no token) is a usage error, exit 2, whoever runs it, and nothing is changed (no `--apply`).
-#[test]
-fn setup_is_built_and_refuses_flags_that_do_not_make_a_host() {
-    let (exit, out, err) = run_as(0, &["setup", "--mode=daemon"]);
-    assert_eq!(exit, Exit::Usage, "{err}");
-    assert!(out.is_empty(), "{out}");
-    assert!(!err.contains("not implemented"), "{err}");
-    let (exit, _, err) = run_as(1000, &["setup", "--mode=daemon"]);
-    assert_eq!(exit, Exit::Usage);
-    assert!(err.contains("setup needs root"), "{err}");
-    let (_, out, _) = run_as(0, &["--json", "setup", "--mode=daemon"]);
-    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
-    assert_eq!(v["verb"], "setup");
-    assert!(
-        ["invalid_flags", "needs_root"].contains(&v["error"].as_str().expect("a word")),
-        "{v}"
-    );
-}
-
-/// Catches `setup`'s ending wrong: a success prints its steps where a person reads them
-/// (standard output, or standard error under `--json`, whose standard output is one object)
-/// and exits 0; a failure prints them ahead of its own line, or as the one object, with the
-/// failure's exit code.
-#[test]
-fn setup_ends_with_its_steps_and_its_exit_code() {
-    use crate::setup::SetupError;
-    let steps = b"+ mkdir /etc/kbf\n";
-    let end = |json: bool, result: Result<(), SetupError>| {
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let exit = finish_setup(json, result, steps, &mut out, &mut err);
-        (
-            exit,
-            String::from_utf8(out).expect("text"),
-            String::from_utf8(err).expect("text"),
-        )
-    };
-    assert_eq!(
-        end(false, Ok(())),
-        (Exit::Ok, "+ mkdir /etc/kbf\n".to_owned(), String::new())
-    );
-    assert_eq!(
-        end(true, Ok(())),
-        (Exit::Ok, String::new(), "+ mkdir /etc/kbf\n".to_owned())
-    );
-    let failed = || Err(SetupError::NeedsOperator("fix it".to_owned()));
-    assert_eq!(
-        end(false, failed()),
-        (
-            Exit::NeedsOperator,
-            String::new(),
-            "+ mkdir /etc/kbf\nkbf-installer: setup: fix it\n".to_owned()
-        )
-    );
-    let (exit, out, err) = end(true, failed());
-    assert_eq!((exit, err.as_str()), (Exit::NeedsOperator, ""));
-    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
-    assert_eq!(
-        v,
-        serde_json::json!({"verb": "setup", "error": "needs_operator", "message": "fix it"})
-    );
-}
-
-/// Catches a built verb that names a phase: `run`, `boot-check` and `setup` exist, so none
-/// says which pull request builds it; every other verb does.
-#[test]
-fn only_the_built_verbs_name_no_phase() {
-    for args in [
-        vec!["run", "--unit", "kbf.service"],
-        vec!["boot-check"],
-        vec!["setup", "--mode=daemon"],
-    ] {
-        assert_eq!(parse(&args).verb.built_by(), None, "{args:?}");
-    }
-    assert_eq!(parse(&["check"]).verb.built_by(), Some("P10"));
-}
-
-/// Catches `run` and `boot-check` not being reached from the command line, and their
-/// results not being the exit codes: on a scratch host (`--root`) a boot check with no state
-/// and one pass of `run` with an empty spool end well (exit 0, nothing printed here); a
-/// boot check on a root that has no state directory, and a `run` that cannot make its
-/// scratch, fail (exit 1) with the reason.
-#[test]
-fn run_and_boot_check_are_dispatched_and_their_failure_is_exit_1() {
-    let (_, root) = crate::testkit::host_root("app-dispatch-ok");
-    std::fs::create_dir_all(root.join("var/lib/kbf-updater/inbox/orders")).expect("inbox");
-    let root = root.to_str().expect("path").to_owned();
-    let (exit, out, err) = run_as(0, &["--root", &root, "boot-check"]);
-    assert_eq!((exit, out.as_str()), (Exit::Ok, ""), "{err}");
-    let pass = [
-        "--root",
-        &root,
-        "run",
-        "--unit",
-        "kbf.service",
-        "--passes",
-        "1",
-        "--interval-secs",
-        "0",
-    ];
-    let (exit, out, err) = run_as(0, &pass);
-    assert_eq!((exit, out.as_str()), (Exit::Ok, ""), "{err}");
-
-    let bare = kbf_host::testkit::scratch("app-dispatch-bare");
-    let bare = bare.to_str().expect("path").to_owned();
-    let (exit, _, err) = run_as(0, &["--root", &bare, "boot-check"]);
-    assert_eq!(exit, Exit::Failed, "{err}");
-    assert!(err.starts_with("kbf-installer: "), "{err}");
-    let pass = [
-        "--root",
-        &bare,
-        "run",
-        "--unit",
-        "kbf.service",
-        "--passes",
-        "1",
-        "--interval-secs",
-        "0",
-    ];
-    let (exit, _, err) = run_as(0, &pass);
-    assert_eq!(exit, Exit::Failed, "{err}");
 }
 
 /// Catches a verb that skips the root check, or one that needs root and does not need to:
@@ -206,18 +82,93 @@ fn only_status_and_check_run_without_root() {
 /// script reading standard output would miss it.
 #[test]
 fn json_is_one_object_on_standard_output() {
-    let (exit, out, err) = run_as(0, &["--json", "--apply", "gc"]);
+    let (exit, out, err) = run_as(0, &["--json", "--apply", "status"]);
     assert_eq!((exit, err.as_str()), (Exit::Failed, ""));
     let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
     assert_eq!(
         v,
-        serde_json::json!({"verb": "gc", "apply": true, "error": "not_implemented", "phase": "P5"})
+        serde_json::json!({"verb": "status", "apply": true, "error": "not_implemented", "phase": "P4"})
     );
-    let (_, out, _) = run_as(1000, &["--json", "gc"]);
+    let (_, out, _) = run_as(1000, &["--json", "activate"]);
     let v: Value = serde_json::from_str(out.trim_end()).expect("json");
     assert_eq!(
         (v["error"].as_str(), v["euid"].as_u64()),
         (Some("needs_root"), Some(1000))
+    );
+}
+
+/// Catches `setup` skipping the root check or reporting in the wrong shape: as an ordinary
+/// user it stops before any step with exit 2, as text on standard error or, with `--json`, as
+/// one object on standard output naming the word `needs_root`.
+#[test]
+fn setup_is_root_only_and_says_so_as_text_or_json() {
+    let args = [
+        "setup",
+        "--mode=daemon",
+        "--frontend-url=https://f.example",
+        "--token-file=/t",
+    ];
+    let (exit, out, err) = run_as(1000, &args);
+    assert_eq!(exit, Exit::Usage);
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.starts_with(
+            "kbf-installer: setup: setup writes /etc and manages services: run it with sudo"
+        ),
+        "{err}"
+    );
+    let mut json = vec!["--json"];
+    json.extend_from_slice(&args);
+    let (exit, out, err) = run_as(1000, &json);
+    assert_eq!((exit, err.as_str()), (Exit::Usage, ""));
+    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
+    assert_eq!(
+        (v["verb"].as_str(), v["error"].as_str()),
+        (Some("setup"), Some("needs_root"))
+    );
+}
+
+/// Catches the steps of `setup` going to the wrong stream: they are for a person, so on
+/// standard output, or with `--json` (where standard output is the one object) on standard
+/// error; a failure prints them ahead of its own line, as text, and as the object with the
+/// word and the message in JSON.
+#[test]
+fn setup_steps_go_to_the_person_and_the_object_to_the_script() {
+    let steps = b"+ step one\n";
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        finish_setup(false, Ok(()), steps, &mut out, &mut err),
+        Exit::Ok
+    );
+    assert_eq!((out.as_slice(), err.as_slice()), (&steps[..], &b""[..]));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        finish_setup(true, Ok(()), steps, &mut out, &mut err),
+        Exit::Ok
+    );
+    assert_eq!((out.as_slice(), err.as_slice()), (&b""[..], &steps[..]));
+
+    let fail = || Err(setup::SetupError::Database("down".to_owned()));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        finish_setup(false, fail(), steps, &mut out, &mut err),
+        Exit::Failed
+    );
+    assert_eq!(
+        String::from_utf8(err).expect("text"),
+        "+ step one\nkbf-installer: setup: database step: down\n"
+    );
+    assert!(out.is_empty());
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        finish_setup(true, fail(), steps, &mut out, &mut err),
+        Exit::Failed
+    );
+    assert!(err.is_empty());
+    let v: Value = serde_json::from_slice(&out).expect("one object");
+    assert_eq!(
+        v,
+        serde_json::json!({"verb": "setup", "error": "database", "message": "database step: down"})
     );
 }
 
@@ -309,5 +260,374 @@ fn flags_are_required_and_checked_by_the_parser() {
 #[test]
 fn global_flags_may_follow_the_verb() {
     let cli = parse(&["setup", "--mode=all-in-one", "--apply", "--json"]);
-    assert!(cli.apply && cli.json);
+    assert_eq!((cli.apply, cli.json), (true, true));
+}
+
+/// A host root with release A current and its order spool in place, as the installer finds a host.
+/// The installer under test lays a host out for the platform it was built for, so the
+/// scratch host is laid out for that platform too (`/var/db/kbf-installer` on macOS).
+fn seeded(name: &str) -> (Layout, PathBuf) {
+    let (layout, root) = host_root_on(&format!("app-{name}"), Platform::current());
+    fs::create_dir_all(root.join("var/lib/kbf-installer/orders")).expect("order spool");
+    let release = layout.join(&layout.release_dir(&c(A)));
+    fs::create_dir_all(&release).expect("release");
+    fs::write(release.join("kbf"), b"x").expect("binary");
+    Locked::acquire(&layout)
+        .expect("lock")
+        .write(&State {
+            current: Some(c(A)),
+            ..State::default()
+        })
+        .expect("state");
+    (layout, root)
+}
+
+fn on(root: &Path, args: &[&str]) -> (Exit, String) {
+    let mut full = vec!["--root", root.to_str().expect("text")];
+    full.extend_from_slice(args);
+    let (exit, _, err) = run_as(1000, &full);
+    (exit, err)
+}
+
+const RUN: [&str; 5] = ["run", "--passes", "1", "--unit", "kbf.service"];
+
+/// Catches `run` not doing a pass in this build of the crate (the real binary does; this is
+/// the same code run in the unit tests, so a change to it is seen by both): a pass on a host
+/// reports and exits 0 even as an ordinary user, with an order record that is not one the
+/// pass still ends, an unreadable state stops it before any pass (exit 1), and a memory file
+/// it cannot read stops the loop with the file named.
+///
+/// Mutants planted: the pass count ignored (the test would hang); `recover` errors dropped
+/// (the ruined state is then not an exit 1); the cycle error dropped (helper.json is then not
+/// reported).
+#[test]
+fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
+    let (layout, root) = seeded("run");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(exit, Exit::Ok, "{err}");
+    let status = fs::read(root.join("var/lib/kbf-installer/status.json")).expect("status.json");
+    let status: Value = serde_json::from_slice(&status).expect("json");
+    assert_eq!(status["state"], "refused", "not root: the pass says so");
+    let record = kbf_update::record::file_name(1, 2);
+    fs::write(
+        root.join("var/lib/kbf-installer/orders").join(record),
+        b"not an order",
+    )
+    .expect("record");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(exit, Exit::Ok, "{err}");
+    fs::write(
+        layout.join(&layout.state_dir()).join("helper.json"),
+        b"not json",
+    )
+    .expect("ruin");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(exit, Exit::Failed);
+    assert!(err.contains("helper.json"), "{err}");
+    fs::remove_file(layout.join(&layout.state_dir()).join("helper.json")).expect("remove");
+    fs::write(layout.join(&layout.state_file()), b"not json").expect("ruin");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(
+        exit,
+        Exit::NeedsOperator,
+        "no usable state: only an operator goes on"
+    );
+    assert!(err.starts_with("kbf-installer:"), "{err}");
+}
+
+/// Catches `run` not waiting between passes, or not stopping after the last: two passes on a
+/// host take one `PASS_INTERVAL` (the only wait, none after the last pass) and exit 0.
+///
+/// Mutants to plant: the wait dropped (the test finishes in well under the interval); the
+/// wait taken after the last pass too (it takes two intervals).
+#[test]
+fn run_waits_one_interval_between_two_passes_and_not_after_the_last() {
+    let (_, root) = seeded("run-two-passes");
+    let began = std::time::Instant::now();
+    let (exit, err) = on(&root, &["run", "--passes", "2", "--unit", "kbf.service"]);
+    let took = began.elapsed();
+    assert_eq!(exit, Exit::Ok, "{err}");
+    assert!(took >= PASS_INTERVAL, "{took:?}");
+    assert!(took < PASS_INTERVAL * 2, "{took:?}");
+}
+
+/// Catches a boot check that does not count a start or that guesses on a state it cannot
+/// read: with a swap on trial the first start is counted (exit 0), the last start's revert
+/// needs root and so refuses an ordinary user (exit 1), a ruined state refuses (exit 1), and
+/// a relative root is refused for both verbs before anything is read.
+///
+/// Mutant planted: the decision printed but the error arm returning `Ok` (the refusals
+/// above are then exit 0).
+#[test]
+fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
+    let (layout, root) = seeded("boot");
+    let release = root.join("var/lib/kbf-installer/releases").join(B);
+    fs::create_dir_all(&release).expect("release");
+    fs::write(release.join("kbf"), b"x").expect("binary");
+    let lock = Locked::acquire(&layout).expect("lock");
+    lock.write(&State {
+        current: Some(c(B)),
+        previous: Some(c(A)),
+        pending_confirm: Some(PendingConfirm {
+            commit: c(B),
+            previous: Some(c(A)),
+            activation: "5".to_owned(),
+            deadline_wall: None,
+            deadline_mono_s: None,
+            starts_left: Some(1),
+        }),
+        ..State::default()
+    })
+    .expect("state");
+    drop(lock);
+    let (exit, err) = on(&root, &["boot-check", "--window-secs", "600"]);
+    assert_eq!(exit, Exit::Ok, "{err}");
+    let (exit, err) = on(&root, &["boot-check"]);
+    assert_eq!(exit, Exit::Failed);
+    assert!(err.contains("as root"), "{err}");
+    for file in [layout.state_file(), layout.state_backup()] {
+        fs::write(layout.join(&file), b"not json").expect("ruin");
+    }
+    let (exit, err) = on(&root, &["boot-check"]);
+    assert_eq!(exit, Exit::NeedsOperator, "{err}");
+    for verb in [&RUN[..], &["boot-check"][..]] {
+        let mut full = vec!["--root", "relative"];
+        full.extend_from_slice(verb);
+        let (exit, _, _) = run_as(1000, &full);
+        assert_eq!(exit, Exit::Failed, "{verb:?}");
+    }
+}
+
+/// Catches an exit that does not tell an operator's job from a retry: only an unusable state
+/// (both files damaged) ends `needs an operator` (5); every other state error, a memory file
+/// that cannot be read, and a plain message end `failed` (1). Both of the error types a verb
+/// can end with are checked.
+///
+/// Mutant planted: the guard dropped (every state error asks for an operator).
+#[test]
+fn only_an_unusable_state_asks_for_an_operator() {
+    use crate::helper::cycle::HelperError;
+    use crate::release::ReleaseError;
+    use crate::state::StateError;
+    let unusable = || StateError::Unusable {
+        primary: "p".to_owned(),
+        backup: "b".to_owned(),
+    };
+    let other = || StateError::NoSchema {
+        path: PathBuf::from("/x"),
+    };
+    let exit = |f: Failure| f.exit;
+    assert_eq!(
+        exit(HelperError::State(unusable()).into()),
+        Exit::NeedsOperator
+    );
+    assert_eq!(exit(HelperError::State(other()).into()), Exit::Failed);
+    assert_eq!(
+        exit(HelperError::Memory("m".to_owned()).into()),
+        Exit::Failed
+    );
+    assert_eq!(
+        exit(ReleaseError::State(unusable()).into()),
+        Exit::NeedsOperator
+    );
+    assert_eq!(exit(ReleaseError::State(other()).into()), Exit::Failed);
+    assert_eq!(exit(ReleaseError::Pending(c(A)).into()), Exit::Failed);
+    assert_eq!(exit("message".to_owned().into()), Exit::Failed);
+}
+
+/// Catches the loop of `run` going on with a file that was replaced under it: the file it
+/// watches is another file (here one that is no program), so the turn says re-exec, the
+/// loop tries to start it, and the failure is the reason it ends with (exit 1).
+///
+/// Mutants planted: the watch never consulted; the failed start taken for a success.
+#[test]
+fn a_loop_whose_file_was_replaced_tries_the_new_one_and_ends_when_it_cannot_start() {
+    let (_, root) = seeded("replaced");
+    let dir = root.join("copy");
+    fs::create_dir_all(&dir).expect("dir");
+    let me = dir.join("kbf-installer");
+    fs::write(&me, b"the program").expect("the program");
+    let watch = FileIdentity::of(&me).expect("identity");
+    let other = dir.join("other");
+    fs::write(&other, b"not a program").expect("a file that is no program");
+    fs::rename(&other, &me).expect("replaced");
+    let cli = parse(&["run", "--passes", "3", "--unit", "kbf.service"]);
+    let Verb::Run(args) = &cli.verb else {
+        panic!("a run");
+    };
+    let Err(failure) = run_from(root, args, &me, watch) else {
+        panic!("the new file cannot start");
+    };
+    assert_eq!(failure.exit, Exit::Failed);
+    assert!(failure.why.contains("cannot start"), "{}", failure.why);
+    // A start that fails leaves this process as it was: `Command::exec` would have put
+    // SIGPIPE back to its default (the standard library does that before it execs), and a
+    // later write to a pipe nobody reads would then end the whole process by a signal
+    // instead of failing with an error. Nothing else in the lib tests reaches the re-exec.
+    assert_eq!(sigpipe_handler(), libc::SIG_IGN, "SIGPIPE is ignored again");
+}
+
+/// The disposition of SIGPIPE in this process.
+fn sigpipe_handler() -> libc::sighandler_t {
+    // SAFETY: sigaction with a null new action only reads the current one into `old`, which
+    // a zeroed `sigaction` is valid for.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        assert_eq!(
+            libc::sigaction(libc::SIGPIPE, std::ptr::null(), &raw mut old),
+            0
+        );
+        old.sa_sigaction
+    }
+}
+
+/// Catches the operator's verbs not being wired to the dispatcher, or their exits being
+/// remapped on the way: through the dispatcher on a host with nothing on trial, `confirm`,
+/// `revert` and `rollback` need the operator (5), `quiesce` is at rest (0) and a dry-run `gc`
+/// succeeds; each failure of the operator keeps its exit code through the conversion.
+///
+/// Mutants planted: a verb dispatched to another verb's function; the refused exit folded
+/// into failed.
+#[test]
+fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
+    use crate::helper::operator::Failure as Operator;
+    let (_, root) = seeded("operator-verbs");
+    let with = |verb: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = verb.iter().map(ToString::to_string).collect();
+        v.extend(["--unit".to_owned(), "kbf.service".to_owned()]);
+        v
+    };
+    let run = |args: Vec<String>| {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        on(&root, &refs).0
+    };
+    assert_eq!(run(with(&["confirm", "--id=1-5"])), Exit::NeedsOperator);
+    assert_eq!(run(with(&["revert", "--id=1-5"])), Exit::NeedsOperator);
+    assert_eq!(run(with(&["rollback"])), Exit::NeedsOperator);
+    assert_eq!(run(vec!["quiesce".to_owned()]), Exit::Ok);
+    assert_eq!(run(vec!["gc".to_owned()]), Exit::Ok);
+    let exit = |f: Operator| Failure::from(f).exit;
+    assert_eq!(exit(Operator::Failed("x".to_owned())), Exit::Failed);
+    assert_eq!(exit(Operator::Refused("x".to_owned())), Exit::Refused);
+    assert_eq!(exit(Operator::Busy("x".to_owned())), Exit::Busy);
+    assert_eq!(
+        exit(Operator::NeedsOperator("x".to_owned())),
+        Exit::NeedsOperator
+    );
+}
+
+/// Catches a frontend or all-in-one unit that activates releases with no database migration
+/// and no warning: `run` for the unit of either mode refuses (exit 2, one line) unless
+/// `--installer-config` is given, before it touches the host; a unit of a mode with no
+/// database (or a launchd label, which names no mode) still runs without one; and a config
+/// that cannot be read stops the service rather than starting it without the step.
+///
+/// Mutants seen red: the unit check removed (the all-in-one unit ran its pass); the unit
+/// check matching `kbf-frontend` without the `@` (the plain `kbf-frontend.service` refused);
+/// the all-in-one template (`kbf-all-in-one@1.service`) is in the test list.
+#[test]
+fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
+    let (_, root) = seeded("run-database");
+    for unit in [
+        "kbf-all-in-one.service",
+        "kbf-all-in-one@1.service",
+        "kbf-frontend@main.service",
+    ] {
+        let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
+        assert_eq!(exit, Exit::Usage, "{unit}: {err}");
+        assert_eq!(
+            err,
+            "kbf-installer: run needs --installer-config on a frontend or all-in-one host \
+             (the database is migrated before a release is activated)\n",
+            "{unit}"
+        );
+        assert!(
+            !root.join("var/lib/kbf-installer/status.json").exists(),
+            "{unit}: nothing was done before the refusal"
+        );
+    }
+    for unit in ["kbf.service", "kbf-daemon.service", "kbf-frontend.service"] {
+        let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
+        assert_eq!(exit, Exit::Ok, "{unit}: {err}");
+    }
+    let (exit, err) = on(
+        &root,
+        &["run", "--passes", "1", "--launchd-label", "com.example.kbf"],
+    );
+    assert_eq!(exit, Exit::Ok, "a label names no mode: {err}");
+    let (exit, err) = on(
+        &root,
+        &[
+            "run",
+            "--passes",
+            "1",
+            "--unit",
+            "kbf-all-in-one.service",
+            "--installer-config",
+            "/etc/kbf/missing.toml",
+        ],
+    );
+    assert_eq!(exit, Exit::Failed, "{err}");
+    assert!(err.contains("missing.toml"), "{err}");
+}
+
+/// Catches a relative `--installer-config` (on `run` or `setup`) being quietly re-rooted
+/// under `/` and read from somewhere the operator did not name: both flags take a host path
+/// like `--update-dir` does, so a relative one is a usage error (clap, exit 2), not a read.
+#[test]
+fn the_installer_config_flag_must_be_an_absolute_host_path() {
+    for args in [
+        &[
+            "run",
+            "--unit",
+            "kbf.service",
+            "--installer-config",
+            "etc/kbf/installer.toml",
+        ][..],
+        &[
+            "setup",
+            "--mode=frontend",
+            "--installer-config",
+            "./installer.toml",
+        ][..],
+    ] {
+        let mut full = vec!["kbf-installer"];
+        full.extend_from_slice(args);
+        assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
+    }
+}
+
+/// Catches `run --installer-config` not attaching the schema step to the helper it drives
+/// (the helper tests attach a fake directly, and the Postgres tests never go through `run`):
+/// the helper `run` builds from a config naming a database refuses a release's schema with
+/// the database's own error (the socket directory does not exist, so no server is needed),
+/// and one built without the flag has no step.
+///
+/// Mutants seen red: the `set_schema_step` call removed from `build_helper`.
+#[test]
+fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
+    let (_, root) = seeded("run-schema-step");
+    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
+    fs::write(
+        root.join("etc/kbf/installer.toml"),
+        "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n",
+    )
+    .expect("config");
+    let with = |extra: &[&str]| {
+        let mut argv = vec!["--root", root.to_str().expect("text")];
+        argv.extend_from_slice(&RUN);
+        argv.extend_from_slice(extra);
+        let Verb::Run(args) = parse(&argv).verb else {
+            panic!("a run");
+        };
+        match build_helper(root.clone(), &args) {
+            Ok(helper) => helper,
+            Err(f) => panic!("{}", f.why),
+        }
+    };
+    let mut helper = with(&["--installer-config", "/etc/kbf/installer.toml"]);
+    let step = helper.schema_step_mut().expect("the step is attached");
+    let why = step.before_start(1).expect_err("no server to migrate");
+    assert!(!why.is_empty());
+    assert!(with(&[]).schema_step_mut().is_none(), "no flag, no step");
 }

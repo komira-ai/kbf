@@ -1,5 +1,4 @@
-//! A host that answers `setup`'s questions from fields, so a test needs no root, no accounts
-//! and no Envoy.
+//! A host that answers `setup`'s questions from fields, so a test needs no root and no accounts.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -7,7 +6,6 @@ use std::io;
 use kbf_host::{Owner, RunUser, Untrusted};
 
 use super::os::Os;
-use crate::envoy::{EnvoyVersion, VersionError, check_output};
 use crate::layout::Platform;
 
 pub struct FakeOs {
@@ -23,16 +21,9 @@ pub struct FakeOs {
     pub dscl_groups: String,
     pub root: Owner,
     pub untrusted: bool,
-    /// What `envoy --version` printed, or `None` for no Envoy installed.
-    pub envoy_says: Option<String>,
     /// The bytes `random` returns, repeated to the length asked.
     pub random_byte: u8,
 }
-
-pub const ENVOY_IN_RANGE: &str =
-    "envoy  version: 0123456789abcdef0123456789abcdef01234567/1.39.3/Clean/RELEASE/BoringSSL";
-pub const ENVOY_TOO_NEW: &str =
-    "envoy  version: 0123456789abcdef0123456789abcdef01234567/1.40.0/Clean/RELEASE/BoringSSL";
 
 pub fn user(name: &str, id: u32) -> RunUser {
     RunUser {
@@ -45,8 +36,8 @@ pub fn user(name: &str, id: u32) -> RunUser {
 }
 
 impl FakeOs {
-    /// A Linux host, as root, with the users the package's sysusers entries make and an
-    /// Envoy in range, and nothing else set up.
+    /// A Linux host, as root, with the users the package's sysusers entries make and
+    /// nothing else set up.
     pub fn linux() -> FakeOs {
         FakeOs {
             euid: 0,
@@ -61,7 +52,6 @@ impl FakeOs {
             dscl_groups: String::new(),
             root: Owner { uid: 0, gid: 0 },
             untrusted: false,
-            envoy_says: Some(ENVOY_IN_RANGE.to_owned()),
             random_byte: 0xab,
         }
     }
@@ -70,7 +60,6 @@ impl FakeOs {
         FakeOs {
             platform: Platform::MacOs,
             users: Vec::new(),
-            envoy_says: None,
             ..FakeOs::linux()
         }
     }
@@ -129,16 +118,6 @@ impl Os for FakeOs {
         } else {
             self.dscl_groups.clone()
         })
-    }
-
-    fn envoy(&self) -> Result<EnvoyVersion, VersionError> {
-        match &self.envoy_says {
-            Some(text) => check_output(text),
-            None => Err(VersionError::Run {
-                path: super::paths::ENVOY.to_owned(),
-                source: io::Error::from(io::ErrorKind::NotFound),
-            }),
-        }
     }
 
     fn random(&self, len: usize) -> io::Result<Vec<u8>> {

@@ -7,9 +7,11 @@
 //! `frontend` and `all-in-one` hosts do not enroll, so they take neither and fetch from a
 //! file server.
 
+use super::paths;
 use crate::CommitId;
 use crate::cli::{Mode, ReleaseSource};
 use crate::installer_toml::{Source, https_base_named};
+use kbf_state::postgres::PostgresConfig;
 
 /// The flags as the command line gave them.
 #[derive(Clone, Debug)]
@@ -21,6 +23,10 @@ pub struct Raw {
     pub release_url: Option<String>,
     pub min_generation: Option<u64>,
     pub commit: Option<CommitId>,
+    /// `--database`: the state database's URL.
+    pub database: Option<String>,
+    /// `--installer-config`, as the host path it names.
+    pub installer_config: String,
 }
 
 /// The flags, valid.
@@ -36,6 +42,9 @@ pub struct Valid {
     pub min_generation: Option<u64>,
     /// The first release to install.
     pub commit: Option<CommitId>,
+    /// The state database's `postgres://` URL, for the modes that keep their state there. It
+    /// has no password and no character a TOML string would escape. No message quotes it.
+    pub database: Option<String>,
 }
 
 /// Whether the mode enrolls with a frontend: its start does, with the token.
@@ -83,6 +92,13 @@ impl Raw {
             (None, false) => None,
         };
 
+        let database = self.database(&mut problems);
+        if self.installer_config != paths::INSTALLER_TOML {
+            problems.push(format!(
+                "setup writes {}, where the installer's unit reads it: --installer-config is for run",
+                paths::INSTALLER_TOML
+            ));
+        }
         let source = self.source(node, &mut problems);
         if self.commit.is_some() && source.as_ref().is_some_and(|s| *s == Source::Frontend) {
             problems.push(
@@ -102,8 +118,50 @@ impl Raw {
                 source,
                 min_generation: self.min_generation,
                 commit: self.commit.clone(),
+                database,
             }),
             _ => Err(problems),
+        }
+    }
+
+    /// The state database: required where the mode keeps its state in one, refused elsewhere.
+    /// The file it goes into is world-readable, so a password is refused, and the text of a
+    /// URL is never part of a message.
+    fn database(&self, problems: &mut Vec<String>) -> Option<String> {
+        let name = mode_name(self.mode);
+        let Some(url) = &self.database else {
+            if self.mode.keeps_state_in_database() {
+                problems.push(format!(
+                    "--mode={name} keeps its state in Postgres: --database is required, as postgres:///kbf?host=/run/postgresql"
+                ));
+            }
+            return None;
+        };
+        if !self.mode.keeps_state_in_database() {
+            problems.push(format!(
+                "--database is for the modes that keep their state in Postgres; --mode={name} keeps none"
+            ));
+            return None;
+        }
+        let plain = url
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\');
+        let postgres = url.starts_with("postgres://") || url.starts_with("postgresql://");
+        let parsed = PostgresConfig::parse(url);
+        match (plain && postgres, parsed) {
+            (true, Ok(config)) if !config.has_password() => Some(url.clone()),
+            (true, Ok(_)) => {
+                problems.push(
+                    "--database carries a password, and installer.toml is world-readable: use a Unix socket and peer authentication".to_owned(),
+                );
+                None
+            }
+            _ => {
+                problems.push(
+                    "--database is not a usable Postgres URL of plain characters, as in postgres:///kbf?host=/run/postgresql".to_owned(),
+                );
+                None
+            }
         }
     }
 

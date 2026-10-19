@@ -1,5 +1,5 @@
 //! [`Backend`]: what Execute and the scheduler need of the store, and nothing more. Three
-//! implementations: a [`Cache`] in this process (what `kbf-server` and `kbf-all-in-one`
+//! implementations: a [`Cache`] in this process (what `kbf-server` and `kbf all-in-one`
 //! have always run), a [`Storage`] reached over gRPC (`kbf frontend` without members,
 //! which holds no blobs of its own: `docs/design/architecture-v2.md`, sections 2 and 7),
 //! and the storage nodes of a map ([`Backend::routed`], `kbf frontend` with members),

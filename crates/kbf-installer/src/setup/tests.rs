@@ -2,20 +2,27 @@
 //! see them go red are in the pull request.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::rc::Rc;
 
 use kbf_host::testkit::{FakeExec, RUNNER};
 use kbf_host::{Entry, Exec, HostPath, Owner, Perms, Step};
 
-use super::fake::{ENVOY_TOO_NEW, FakeOs, user};
-use super::paths::{API_TOKEN, ENROLL_TOKEN, INSTALLER_TOML, KBF_TOML, current_release};
+use kbf_state::postgres::schema::Outcome;
+
+use super::backend::{Backend, Releases, Schemas};
+use super::fake::{FakeOs, user};
+use super::paths::{API_TOKEN, ENROLL_TOKEN, INSTALLER_TOML, KBF_TOML};
 use super::validate::Raw;
-use super::{NoReleases, Options, Releases, SetupError, run};
+use super::{Options, SetupError, run};
 use crate::CommitId;
 use crate::cli::{Mode, ReleaseSource};
+use crate::database::SchemaOps;
 use crate::exit::Exit;
+use crate::helper::fetcher::FetchError;
 use crate::installer_toml::Source;
-use crate::layout::Platform;
+use crate::layout::{Layout, Platform};
+
+const DATABASE: &str = "postgres:///kbf?host=/run/postgresql";
 
 const SRC: &str = "/root/kbf.token";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -35,7 +42,16 @@ fn raw(mode: Mode) -> Raw {
         release_url: (!node).then(|| "https://releases.example/kbf".to_owned()),
         min_generation: None,
         commit: None,
+        database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
+        installer_config: INSTALLER_TOML.to_owned(),
     }
+}
+
+/// `releases/current` on a host of `platform`.
+fn current_release(platform: Platform) -> String {
+    Layout::new(kbf_host::Root::new("/").expect("root"), platform)
+        .current()
+        .to_string()
 }
 
 fn hp(p: &str) -> HostPath {
@@ -75,19 +91,107 @@ const APPLY: Options = Options {
     no_start: false,
 };
 
+/// A downloader that has no fetcher behind it, as the binary's own has none yet.
+struct Unwired;
+
+impl Releases for Unwired {
+    fn install_first(&self, _: &CommitId) -> Result<(), SetupError> {
+        Err(SetupError::Fetch(FetchError::NotWired))
+    }
+}
+
+/// What the fake server was asked, in order: `plan` and `setup`, each with the URL.
+type Asked = Rc<RefCell<Vec<String>>>;
+
+/// A server at schema version `found` (`None`: a fresh database) that answers as told.
+struct Server {
+    found: Option<u32>,
+    down: bool,
+    asked: Asked,
+}
+
+impl Server {
+    fn fresh() -> Server {
+        Server {
+            found: None,
+            down: false,
+            asked: Asked::default(),
+        }
+    }
+}
+
+struct Session {
+    found: Option<u32>,
+    down: bool,
+    url: String,
+    asked: Asked,
+}
+
+impl SchemaOps for Session {
+    fn setup(&self) -> Result<Outcome, String> {
+        self.asked.borrow_mut().push(format!("setup {}", self.url));
+        if self.down {
+            return Err("no server".to_owned());
+        }
+        Ok(Outcome {
+            from: self.found,
+            to: 3,
+            ran: if self.found == Some(3) {
+                vec![]
+            } else {
+                vec![3]
+            },
+        })
+    }
+
+    fn plan(&self) -> Result<(Option<u32>, u32), String> {
+        self.asked.borrow_mut().push(format!("plan {}", self.url));
+        if self.down {
+            return Err("no server".to_owned());
+        }
+        Ok((self.found, 3))
+    }
+}
+
+impl Schemas for Server {
+    fn of(&self, url: &str) -> Result<Box<dyn SchemaOps>, SetupError> {
+        Ok(Box::new(Session {
+            found: self.found,
+            down: self.down,
+            url: url.to_owned(),
+            asked: self.asked.clone(),
+        }))
+    }
+}
+
 fn go(os: &FakeOs, exec: &mut FakeExec, raw: &Raw, options: Options) -> Result<String, SetupError> {
-    go_with(os, exec, &NoReleases, raw, options)
+    go_with(os, exec, &Unwired, raw, options)
 }
 
 fn go_with(
     os: &FakeOs,
     exec: &mut FakeExec,
-    releases: &impl Releases,
+    releases: &dyn Releases,
+    raw: &Raw,
+    options: Options,
+) -> Result<String, SetupError> {
+    go_on(os, exec, releases, &Server::fresh(), raw, options)
+}
+
+fn go_on(
+    os: &FakeOs,
+    exec: &mut FakeExec,
+    releases: &dyn Releases,
+    server: &Server,
     raw: &Raw,
     options: Options,
 ) -> Result<String, SetupError> {
     let mut out = Vec::new();
-    run(os, exec, releases, raw, options, &mut out)?;
+    let backend = Backend {
+        releases,
+        schemas: server,
+    };
+    run(os, exec, &backend, raw, options, &mut out)?;
     Ok(String::from_utf8(out).expect("text"))
 }
 
@@ -158,6 +262,9 @@ mode = \"frontend\"
 
 [tls]
 api-token-file = \"/etc/kbf/api-token\"
+
+[scheduler]
+state-store = \"postgres:///kbf?host=/run/postgresql\"
 ";
 
 const DAEMON_INSTALLER_TOML: &str = "release_source = \"frontend\"
@@ -357,40 +464,6 @@ fn a_dry_run_prints_the_steps_and_changes_nothing() {
     assert!(!out.contains(SECRET), "{out}");
 }
 
-/// Catches a frontend or all-in-one host set up beside an Envoy that is missing or outside
-/// the tested range (contract 5.1): it refuses with `envoy_range` before any step, exit 3;
-/// and that a node mode does not look at Envoy at all.
-#[test]
-fn the_envoy_is_checked_on_a_frontend_and_an_all_in_one_host_only() {
-    for mode in [Mode::Frontend, Mode::AllInOne] {
-        for says in [
-            None,
-            Some(ENVOY_TOO_NEW.to_owned()),
-            Some("nonsense".to_owned()),
-        ] {
-            let mut os = FakeOs::linux();
-            os.envoy_says = says.clone();
-            let mut exec = host();
-            let err = go(&os, &mut exec, &raw(mode), APPLY).expect_err("refused");
-            assert!(
-                matches!(err, SetupError::EnvoyRange(_)),
-                "{mode:?} {says:?}: {err:?}"
-            );
-            assert_eq!(err.exit(), Exit::Refused);
-            assert_eq!(err.code(), "envoy_range");
-            assert!(err.to_string().starts_with("envoy_range: "), "{err}");
-            assert!(exec.log.is_empty(), "{mode:?} {says:?}");
-        }
-    }
-    let err = go(&FakeOs::linux(), &mut host(), &raw(Mode::Frontend), APPLY);
-    assert!(err.is_ok(), "{err:?}");
-    for mode in [Mode::Storage, Mode::Daemon, Mode::StorageAndDaemon] {
-        let mut os = FakeOs::linux();
-        os.envoy_says = None;
-        go(&os, &mut host(), &raw(mode), APPLY).unwrap_or_else(|e| panic!("{mode:?}: {e}"));
-    }
-}
-
 /// Catches the first operator token being made wrong: on a frontend host it is a 64-hex
 /// secret in `/etc/kbf/api-token`, mode 0600, owned by the user whose process reads it
 /// (`kbf-server`; the server refuses a token file another user owns), `kbf.toml` names it,
@@ -538,17 +611,11 @@ fn a_missing_service_user_is_refused_before_any_write() {
 #[test]
 fn each_mode_enables_its_own_units() {
     let want: [(Mode, &[&str]); 5] = [
-        (
-            Mode::Frontend,
-            &["kbf-envoy.service", "kbf-frontend@a.service"],
-        ),
+        (Mode::Frontend, &["kbf-frontend@a.service"]),
         (Mode::Storage, &["kbf-storage.service"]),
         (Mode::Daemon, &["kbf-daemon.service"]),
         (Mode::StorageAndDaemon, &["kbf-storage-and-daemon.service"]),
-        (
-            Mode::AllInOne,
-            &["kbf-envoy.service", "kbf-all-in-one.service"],
-        ),
+        (Mode::AllInOne, &["kbf-all-in-one.service"]),
     ];
     for (mode, units) in want {
         let mut exec = released(host(), Platform::Linux);
@@ -557,10 +624,16 @@ fn each_mode_enables_its_own_units() {
             .into_iter()
             .filter(|c| c.contains("systemctl"))
             .collect();
+        // A unit that makes a frontend is enabled and left stopped, whatever is installed.
+        let now = if mode.keeps_state_in_database() {
+            ""
+        } else {
+            " --now"
+        };
         let expected: Vec<String> = units
             .iter()
-            .chain(&["kbf-installer.service"])
-            .map(|u| format!("run /usr/bin/systemctl enable --now -- {u}"))
+            .map(|u| format!("run /usr/bin/systemctl enable{now} -- {u}"))
+            .chain(["run /usr/bin/systemctl enable --now -- kbf-installer.service".to_owned()])
             .collect();
         assert_eq!(enables, expected, "{mode:?}");
     }
@@ -881,19 +954,8 @@ fn a_config_with_the_right_text_and_the_wrong_mode_is_corrected() {
 struct Installs(RefCell<Vec<String>>);
 
 impl Releases for Installs {
-    fn install_first(
-        &self,
-        host: &mut dyn Exec,
-        commit: &CommitId,
-        source: &Source,
-    ) -> Result<(), SetupError> {
-        self.0
-            .borrow_mut()
-            .push(format!("{commit} from {source:?}"));
-        host.apply(&Step::Symlink {
-            path: hp(&current_release(Platform::Linux)),
-            target: PathBuf::from(commit.to_string()),
-        })?;
+    fn install_first(&self, commit: &CommitId) -> Result<(), SetupError> {
+        self.0.borrow_mut().push(commit.to_string());
         Ok(())
     }
 }
@@ -921,22 +983,14 @@ fn the_first_release_is_installed_between_the_settings_and_the_config() {
         APPLY,
     )
     .expect("setup");
-    assert_eq!(
-        *installs.0.borrow(),
-        [format!(
-            "{COMMIT} from Url(\"https://releases.example/kbf\")"
-        )]
-    );
-    let order: Vec<String> = exec
-        .log
-        .iter()
-        .filter_map(|s| match s {
-            Step::WriteFile { path, .. } => Some(path.as_str().to_owned()),
-            Step::Symlink { .. } => Some("release".to_owned()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(order, [ENROLL_TOKEN, INSTALLER_TOML, "release", KBF_TOML]);
+    assert_eq!(*installs.0.borrow(), [COMMIT]);
+    // The order the output shows: the settings, the fetch, then the config.
+    let at = |needle: &str| {
+        out.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {out}"))
+    };
+    let fetch = at(&format!("+ fetch and verify release {COMMIT}"));
+    assert!(at(INSTALLER_TOML) < fetch && fetch < at(KBF_TOML), "{out}");
     assert!(
         cmds(&exec)
             .contains(&"run /usr/bin/systemctl enable --now -- kbf-daemon.service".to_owned())
@@ -948,7 +1002,7 @@ fn the_first_release_is_installed_between_the_settings_and_the_config() {
 }
 
 /// Catches a setup that says it is done when the release could not be installed: this
-/// build has no fetch child, so `--commit` fails (exit 1, saying why) after the settings and
+/// build has no fetcher, so `--commit` fails (exit 1, saying why) after the settings and
 /// before `kbf.toml`, and no unit is enabled.
 #[test]
 fn a_failed_first_release_leaves_no_config_and_no_unit() {
@@ -960,44 +1014,14 @@ fn a_failed_first_release_leaves_no_config_and_no_unit() {
         APPLY,
     )
     .expect_err("fails");
-    assert!(matches!(err, SetupError::NotBuilt(_)), "{err:?}");
-    assert_eq!(err.exit(), Exit::Failed);
+    assert!(
+        matches!(err, SetupError::Fetch(FetchError::NotWired)),
+        "{err:?}"
+    );
+    assert_eq!((err.exit(), err.code()), (Exit::Failed, "not_implemented"));
     assert!(exec.entries.contains_key(&hp(INSTALLER_TOML)));
     assert!(!exec.entries.contains_key(&hp(KBF_TOML)));
     assert!(cmds(&exec).iter().all(|c| !c.contains("systemctl")));
-}
-
-/// Catches a downloader that says it installed a release and did not: setup stops (exit 1)
-/// before it writes `kbf.toml`, since a start would have nothing to run.
-#[test]
-fn a_release_that_was_not_installed_stops_before_the_config() {
-    struct Lazy;
-    impl Releases for Lazy {
-        fn install_first(
-            &self,
-            _: &mut dyn Exec,
-            _: &CommitId,
-            _: &Source,
-        ) -> Result<(), SetupError> {
-            Ok(())
-        }
-    }
-    let mut exec = host();
-    let err = go_with(
-        &FakeOs::linux(),
-        &mut exec,
-        &Lazy,
-        &first_release(Mode::Daemon),
-        APPLY,
-    )
-    .expect_err("fails");
-    assert!(
-        err.to_string()
-            .contains("was fetched but releases/current is not there"),
-        "{err}"
-    );
-    assert_eq!(err.exit(), Exit::Failed);
-    assert!(!exec.entries.contains_key(&hp(KBF_TOML)));
 }
 
 /// Catches a release fetched twice or replaced by setup: with one installed, `--commit` is
@@ -1062,13 +1086,15 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         release_url: None,
         min_generation: Some(0),
         commit: None,
+        database: Some(DATABASE.to_owned()),
+        installer_config: "/tmp/i.toml".to_owned(),
     };
     let mut exec = host();
     let err = go(&FakeOs::linux(), &mut exec, &bad, APPLY).expect_err("refused");
     let SetupError::Invalid(found) = &err else {
         panic!("{err:?}");
     };
-    assert_eq!(found.len(), 4, "{found:#?}");
+    assert_eq!(found.len(), 6, "{found:#?}");
     assert_eq!(err.exit(), Exit::Usage);
     assert!(exec.log.is_empty() && exec.queries.borrow().is_empty());
 }
@@ -1192,10 +1218,31 @@ fn each_failure_has_its_exit_code_and_word() {
             "needs_operator",
         ),
         (
-            SetupError::NotBuilt("x".into()),
+            SetupError::Fetch(FetchError::NotWired),
             Exit::Failed,
             "not_implemented",
         ),
+        (
+            SetupError::Fetch(FetchError::Rejected("x".into())),
+            Exit::Refused,
+            "fetch",
+        ),
+        (
+            SetupError::Fetch(FetchError::Unavailable("x".into())),
+            Exit::Failed,
+            "fetch",
+        ),
+        (
+            SetupError::OldLayout("/x".into()),
+            Exit::NeedsOperator,
+            "old_layout",
+        ),
+        (
+            SetupError::Release(crate::release::ReleaseError::NoPrevious),
+            Exit::Failed,
+            "release",
+        ),
+        (SetupError::Database("x".into()), Exit::Failed, "database"),
         (SetupError::NoFreeId, Exit::Failed, "no_room"),
     ];
     for (err, exit, code) in cases {
@@ -1297,7 +1344,7 @@ fn answer(exec: &mut FakeExec) {
             ("getent", _) => reply(2, "", ""),
             ("id", ["-G", "--", "kbf"]) => reply(0, "990\n", ""),
             ("systemctl", ["is-enabled", "--", "kbf-daemon.service"]) => reply(0, "enabled\n", ""),
-            ("systemctl", ["is-enabled", "--", "kbf-envoy.service"]) => reply(0, "static\n", ""),
+            ("systemctl", ["is-enabled", "--", "kbf-static.service"]) => reply(0, "static\n", ""),
             ("systemctl", _) => reply(1, "disabled\n", ""),
             ("launchctl", ["print", "system/com.komira.kbf-daemon"]) => reply(0, "", ""),
             ("launchctl", _) => reply(113, "", "not found"),
@@ -1341,7 +1388,7 @@ fn the_system_os_reads_the_host_through_exec() {
     assert!(!os.lingers("nobody-here").expect("stat"));
     assert!(os.unit_enabled("kbf-daemon.service").expect("query"));
     assert!(
-        !os.unit_enabled("kbf-envoy.service")
+        !os.unit_enabled("kbf-static.service")
             .expect("a static unit is not enabled")
     );
     assert!(!os.unit_enabled("kbf-storage.service").expect("query"));
@@ -1374,24 +1421,6 @@ fn the_system_os_draws_random_bytes() {
     assert!(os.random(0).expect("random").is_empty());
 }
 
-/// The production Envoy probe runs the binary at `/usr/bin/envoy`. A test host may have none
-/// (then it is `cannot run`) or one in or out of range; whichever it is, the answer is the
-/// check's own and names the path, which the operator needs to fix it.
-#[test]
-fn the_system_os_asks_the_installed_envoy() {
-    use super::os::{Os, SystemOs};
-    let exec = FakeExec::new(0);
-    let os = SystemOs::new(&exec, Platform::Linux);
-    let said = os.envoy().map(|v| v.to_string()).map_err(|e| e.to_string());
-    assert!(
-        said.is_ok()
-            || said
-                .as_ref()
-                .is_err_and(|e| e.contains("/usr/bin/envoy") || e.contains("Envoy")),
-        "{said:?}"
-    );
-}
-
 /// Every way setup stops says what is wrong in a line a person can act on.
 #[test]
 fn every_failure_reads_as_a_sentence() {
@@ -1414,7 +1443,19 @@ fn every_failure_reads_as_a_sentence() {
         (SetupError::SubIdSpace("subuid"), "subuid range"),
         (SetupError::NoFreeId, "between 300 and 399"),
         (SetupError::NeedsOperator("fix it".into()), "fix it"),
-        (SetupError::NotBuilt("later".into()), "later"),
+        (
+            SetupError::Fetch(FetchError::NotWired),
+            "no release fetcher",
+        ),
+        (
+            SetupError::OldLayout("/usr/local/kbf".into()),
+            "/usr/local/kbf",
+        ),
+        (
+            SetupError::Release(crate::release::ReleaseError::NoPrevious),
+            "no previous release",
+        ),
+        (SetupError::Database("down".into()), "database step: down"),
         (
             SetupError::Path(kbf_host::HostPath::new("rel").expect_err("relative")),
             "rel",
@@ -1430,14 +1471,6 @@ fn every_failure_reads_as_a_sentence() {
         let _ = err.code();
         let _ = err.exit();
     }
-    let err = NoReleases
-        .install_first(
-            &mut FakeExec::new(0),
-            &COMMIT.parse().expect("commit"),
-            &Source::Frontend,
-        )
-        .expect_err("no fetch child");
-    assert!(err.to_string().contains("fetch child"), "{err}");
 }
 
 /// Catches the view a plan reads the host through forwarding wrongly: every read goes to the
@@ -1461,3 +1494,6 @@ fn a_view_forwards_reads_and_refuses_steps() {
     let step = Step::Remove { path: hp("/etc/x") };
     assert!(view.apply(&step).is_err());
 }
+
+#[path = "tests_more.rs"]
+mod more;

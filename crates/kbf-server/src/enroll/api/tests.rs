@@ -142,14 +142,14 @@ impl Route {
 async fn call(state: &Arc<EnrollState>, route: &Route, peer: SocketAddr, h: HeaderMap) -> Response {
     let st = State(Arc::clone(state));
     match route {
-        Route::Create(body) => create(st, ConnectInfo(peer), h, Bytes::from(body.clone())).await,
-        Route::List => list(st, ConnectInfo(peer), h).await,
+        Route::Create(body) => create(st, Caller::direct(peer), h, Bytes::from(body.clone())).await,
+        Route::List => list(st, Caller::direct(peer), h).await,
         Route::RevokeToken(id) => {
-            revoke_token_route(st, ConnectInfo(peer), Path(id.clone()), h).await
+            revoke_token_route(st, Caller::direct(peer), Path(id.clone()), h).await
         }
-        Route::Nodes => nodes(st, ConnectInfo(peer), h).await,
+        Route::Nodes => nodes(st, Caller::direct(peer), h).await,
         Route::RevokeNode(id) => {
-            revoke_node_route(st, ConnectInfo(peer), Path(id.clone()), h, Bytes::new()).await
+            revoke_node_route(st, Caller::direct(peer), Path(id.clone()), h, Bytes::new()).await
         }
     }
 }
@@ -512,7 +512,7 @@ async fn a_node_revoke_writes_deny_rows_and_burns_the_id() {
     let with = |body: &'static str| {
         revoke_node_route(
             st.clone(),
-            ConnectInfo(loopback()),
+            Caller::direct(loopback()),
             Path("n9".into()),
             operator(),
             Bytes::from_static(body.as_bytes()),
