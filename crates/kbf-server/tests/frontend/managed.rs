@@ -550,6 +550,19 @@ async fn the_admin_port_refuses_a_non_loopback_address() {
     .err()
     .expect("a start on a public address is refused");
     assert!(error.to_string().contains("loopback"), "{error}");
+
+    // A start with no admin port at all is refused before anything is bound or opened.
+    let mut none = managed_flags(&node, &[]);
+    none.admin = None;
+    let error = Managed::start(
+        &none,
+        StoreSource::Shared(shared()),
+        std::future::pending::<()>(),
+    )
+    .await
+    .err()
+    .expect("a start without --admin-listen is refused");
+    assert!(error.to_string().contains("--admin-listen"), "{error}");
 }
 
 /// Catches: an epoch that does not follow the rule. A takeover from a live holder keeps
@@ -951,6 +964,23 @@ async fn a_managed_process_opens_the_store_its_flags_name() {
     );
     assert_eq!(waiting.stopped().await, Ok(()));
     assert_eq!(cold.stopped().await, Ok(()));
+
+    // The same cold start with a shutdown that never comes: the instance of `start` the
+    // other tests use for it (`std::future::pending`) must itself run the flags path, or
+    // coverage of the function is split between two instances.
+    let never = Managed::start(
+        &managed_flags(&node, &[&state("never")]),
+        StoreSource::Flags,
+        std::future::pending::<()>(),
+    )
+    .await
+    .expect("a cold start over a file");
+    assert!(
+        never.start_line().contains("role=active"),
+        "{}",
+        never.start_line()
+    );
+    drop(never);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
