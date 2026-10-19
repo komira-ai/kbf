@@ -15,19 +15,20 @@ use kbf_server::members::{
     Members, MembershipConfig, PROTOCOL, Progress, Registrant, Registration,
 };
 use kbf_server::storage_health::Debts;
-use kbf_state::Store;
+use kbf_state::{Cond, Store, Txn};
 use kbf_types::{Digest, DigestFunction};
 use sha2::{Digest as _, Sha256};
 
+fn config_of() -> MembershipConfig {
+    MembershipConfig {
+        ttl: Duration::from_secs(3600),
+        dwell: Duration::from_secs(7200),
+        replication: 2,
+    }
+}
+
 fn members(store: &Arc<Hooked>) -> Members {
-    Members::new(
-        Arc::clone(store) as Arc<dyn Store>,
-        MembershipConfig {
-            ttl: Duration::from_secs(3600),
-            dwell: Duration::from_secs(7200),
-            replication: 2,
-        },
-    )
+    Members::new(Arc::clone(store) as Arc<dyn Store>, config_of())
 }
 
 fn node(i: u32, progress: Progress) -> Registrant {
@@ -123,6 +124,7 @@ fn a_promoted_joiner_is_primary_and_keeps_active_across_a_restart() {
     let m = members(&s);
     let _ = old_farm(&s, &m);
     let c = m.register(&node(3, Progress::CaughtUp)).expect("c");
+    assert_eq!(state(&c.map, c.id), Some(MemberState::Joining));
     let map = m.set_state(c.id, MemberState::Active).expect("promote");
     assert_eq!(state(&map, c.id), Some(MemberState::Active));
     assert!(primaries(&map, c.id) > 0);
@@ -161,4 +163,128 @@ fn a_restarted_active_member_of_a_farm_with_data_stays_active() {
     let again = m.register(&node(1, Progress::CaughtUp)).expect("restart");
     assert_eq!(again.id, a.id);
     assert_eq!(state(&again.map, a.id), Some(MemberState::Active));
+}
+
+/// Catches: the real new node, which registers `CatchingUp` (a new meta log has not
+/// rebuilt its index) and then beats caught up as soon as the empty rebuild is done, being
+/// made `Active` by that beat: it must be `Joining` from its first registration and stay
+/// so, primary for nothing. Mutant: the rebuilding check before the join check turns it red.
+#[test]
+fn a_new_node_that_registers_rebuilding_joins_and_is_not_promoted_by_its_beat() {
+    let s = Hooked::new();
+    let m = members(&s);
+    let _ = old_farm(&s, &m);
+    let c = m.register(&node(3, Progress::CatchingUp)).expect("c");
+    assert_eq!(state(&c.map, c.id), Some(MemberState::Joining));
+    m.heartbeat(c.id, c.boot, Progress::CaughtUp, Debts::Unknown, None)
+        .expect("beat");
+    let map = m.current_map().expect("read").expect("a map");
+    assert_eq!(state(&map, c.id), Some(MemberState::Joining));
+    assert_eq!(primaries(&map, c.id), 0);
+}
+
+/// Catches: a join decided apart from the creation of the instance: the registration
+/// creates `instance/<id>` and then fails to write the row (a store that conflicts on
+/// `member/`), and the node's retry finds a known instance and is `Active` with no mark.
+#[test]
+fn a_registration_that_fails_after_the_instance_is_created_retries_as_joining() {
+    let s = Hooked::new();
+    let m = members(&s);
+    let _ = old_farm(&s, &m);
+    s.conflict_on(Some("member/"));
+    assert!(m.register(&node(3, Progress::CaughtUp)).is_err());
+    s.conflict_on(None);
+    let c = m.register(&node(3, Progress::CaughtUp)).expect("retry");
+    assert_eq!(state(&c.map, c.id), Some(MemberState::Joining));
+}
+
+/// Catches: two registrations of one new instance ending `Active` and unmarked: the
+/// second (not fresh) runs between the first's reading of the mark and its write, and the
+/// first then loses to its larger boot. The mark is written with the instance, so the
+/// second reads it.
+#[test]
+fn two_registrations_of_one_new_instance_end_joining() {
+    let s = Hooked::new();
+    let m = members(&s);
+    let _ = old_farm(&s, &m);
+    let rival = Members::new(Arc::clone(&s.fake) as Arc<dyn Store>, config_of());
+    s.after_get("unfilled/", move || {
+        let _ = rival.register(&node(3, Progress::CaughtUp));
+    });
+    let _ = m.register(&node(3, Progress::CaughtUp));
+    let map = m.current_map().expect("read").expect("a map");
+    let id = map
+        .members()
+        .iter()
+        .find(|x| x.addr.starts_with("192.0.2.3"))
+        .expect("the member")
+        .id;
+    assert_eq!(state(&map, id), Some(MemberState::Joining));
+}
+
+/// Catches: a restart that read the mark as present overwriting the operator's promotion
+/// (a 200 that reverts to `Joining`): the promotion lands between the read and the write.
+#[test]
+fn a_promotion_between_a_restarts_read_and_write_is_not_reverted() {
+    let s = Hooked::new();
+    let m = members(&s);
+    let _ = old_farm(&s, &m);
+    let c = m.register(&node(3, Progress::CaughtUp)).expect("c");
+    let operator = Members::new(Arc::clone(&s.fake) as Arc<dyn Store>, config_of());
+    let id = c.id;
+    s.after_get("unfilled/", move || {
+        operator
+            .set_state(id, MemberState::Active)
+            .expect("promote");
+    });
+    let again = m.register(&node(3, Progress::CaughtUp)).expect("restart");
+    assert_eq!(state(&again.map, c.id), Some(MemberState::Active));
+    let map = m.current_map().expect("read").expect("a map");
+    assert_eq!(state(&map, c.id), Some(MemberState::Active));
+}
+
+/// Catches: a repeated promotion that leaves a stale mark (one an older frontend's promotion
+/// never deleted), which would demote a working primary at its next restart.
+#[test]
+fn promoting_an_active_member_deletes_a_stale_mark() {
+    let s = Hooked::new();
+    let m = members(&s);
+    let _ = old_farm(&s, &m);
+    let c = m.register(&node(3, Progress::CaughtUp)).expect("c");
+    m.set_state(c.id, MemberState::Active).expect("promote");
+    let stale = s
+        .fake
+        .txn(Txn::new().put(format!("unfilled/{}", c.id.0), Vec::new(), Cond::Any));
+    assert!(stale.expect("store").is_ok());
+    m.set_state(c.id, MemberState::Active).expect("again");
+    let again = m.register(&node(3, Progress::CaughtUp)).expect("restart");
+    assert_eq!(state(&again.map, c.id), Some(MemberState::Active));
+}
+
+/// Catches: the bootstrap window moved: a node 59 s after the farm's first member is
+/// `Active` (nodes starting together), one 61 s after is `Joining`.
+#[test]
+fn the_bootstrap_window_is_sixty_seconds() {
+    for (after, want) in [(59, MemberState::Active), (61, MemberState::Joining)] {
+        let s = Hooked::new();
+        let m = members(&s);
+        m.register(&node(1, Progress::CaughtUp)).expect("a");
+        s.clock.advance(Duration::from_secs(after));
+        let c = m.register(&node(3, Progress::CaughtUp)).expect("c");
+        assert_eq!(state(&c.map, c.id), Some(want), "after {after} s");
+    }
+}
+
+/// Catches: the window sliding: a restart of an `Active` member at 50 s must not give the
+/// farm a new minute, so a new node at 61 s is `Joining`.
+#[test]
+fn a_restart_does_not_extend_the_bootstrap_window() {
+    let s = Hooked::new();
+    let m = members(&s);
+    m.register(&node(1, Progress::CaughtUp)).expect("a");
+    s.clock.advance(Duration::from_secs(50));
+    m.register(&node(1, Progress::CaughtUp)).expect("a again");
+    s.clock.advance(Duration::from_secs(11));
+    let c = m.register(&node(3, Progress::CaughtUp)).expect("c");
+    assert_eq!(state(&c.map, c.id), Some(MemberState::Joining));
 }
