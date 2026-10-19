@@ -418,9 +418,9 @@ async fn a_node_given_its_old_member_id_opens_only_after_one_restart_per_old_boo
 }
 
 /// The design's claim as a requirement: the first registration on a fresh store opens the
-/// node. FAILS today for a node that gets its old member id (see the test above).
+/// node, with no restart. FAILS before the fix for a node that gets its old member id (see
+/// the test above).
 #[tokio::test]
-#[ignore = "U0 red: a node that gets its old member id from a fresh store exits 75 once per old boot before it opens; U9 must seed the fresh store's counters or the node must tolerate it"]
 async fn the_first_registration_on_a_fresh_store_opens_a_node_that_had_run_before() {
     let dir = meta_dir("fresh-first");
     let bucket = Bucket::default();
