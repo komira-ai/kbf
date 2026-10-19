@@ -10,8 +10,36 @@
 # Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use on the server; `max(2, reserve/2)`, at most the physical cores, on the daemon
 # cpu-threads = "N"
 
+[enroll-service]
+# Keep the CA key as a file in this process (development and tests only; production uses --ca-signer and refuses to start without it).
+ca-dev-file-signer = false
+# The CA directory (ca.key mode 0600, ca.pem). With --ca-dev-file-signer an empty directory gets a new CA and a directory holding one is loaded, never overwritten; with --ca-signer it must hold ca.pem, which the signer made.
+# ca-dir = "DIR"
+# The socket of the kbf-signer process that holds the CA key (production). This process holds no CA key.
+# ca-signer = "SOCKET"
+# Allow --enroll-listen although this build's storage does not enforce the deny rows a node revocation writes: a revoked node is refused renewal at once but storage serves it until its certificate expires.
+enroll-allow-unenforced-deny = false
+# What --cas is for a daemon-only node, told to every node. Empty: none.
+# enroll-cas-endpoint = "URL"
+# How long the certificates the CA issues live (3600 to 2592000); a node renews at half. The signer's own --lifetime-secs must be at least this.
+enroll-cert-lifetime-secs = 604800
+# Serve kbf.enroll.v1 (Enroll and Renew) on this address, over TLS with the frontend's own certificate from the CA. Off unless given. It needs --state-store, --ca-dir, --frontend-name, and --ca-signer (or, for development, --ca-dev-file-signer). While this build does not enforce deny rows in storage it also needs --enroll-allow-unenforced-deny.
+# enroll-listen = "ADDR"
+# Calls the listener works on at once, from all sources; the next is refused `rate limited`.
+enroll-max-in-flight = 64
+# Calls one TCP peer address may make at once (behind the bundled kbf-proxy, the whole listener).
+enroll-rate-burst = 30
+# Enroll and Renew calls per minute from one TCP peer address, once its burst is spent. Behind the bundled kbf-proxy every peer is loopback, so this is one limit for the listener and the proxy limits per client address. The count is in memory and starts again at a restart.
+enroll-rate-per-minute = 60
+# The port a storage node serves on, told to every node.
+# enroll-storage-port = "PORT"
+# The https URL a daemon dials (--server), told to every node. Empty: none.
+# enroll-worker-endpoint = "URL"
+# A name this frontend serves, a DNS name or an IP address; repeat it for each. The enroll listener's certificate carries these names, and no node may advertise one or a host under one.
+# frontend-name = []
+
 [handover]
-# Serve the admin calls (GET role, POST quiesce, resume, takeover, stand-down) on this loopback address. Anything that is not a loopback address is refused at start: the calls move the scheduler's role and carry no credential. Needs --state-store.
+# Serve the admin calls (GET role, POST quiesce, resume, takeover, stand-down) on this loopback address. Anything that is not a loopback address is refused at start: the calls move the scheduler's role. With --proxy-auth-file every call must present the proxy's secret (x-kbf-proxy-auth) or is refused 403; without it the calls take no credential, which is for a host with no proxy. Needs --state-store.
 # admin-listen = "ADDR"
 # Open the state store without taking its generation, bump no epoch and run no scheduler, reconciler or worker listener: serve /readyz, the health service and GetCapabilities until `POST takeover` makes this process the writer. Needs --admin-listen. A SQLite state file is held by one process (an exclusive lock), so a candidate cannot run beside the process that holds it: side by side needs the Postgres store.
 await-takeover = false

@@ -151,7 +151,7 @@ fn the_modes_are_listed_with_the_sets_the_rules_use() {
 
 /// Catches rule `stop` skipped for a mode that drains (a storage node finishes its large
 /// Writes at stop; systemd's 90 s default would cut them) or applied to the daemon,
-/// which abandons its leases on SIGTERM.
+/// whose drain ends at its own deadline and whose stop timeout is finite.
 #[test]
 fn every_mode_but_the_daemon_drains() {
     let drains: Vec<_> = Mode::ALL.iter().filter(|m| m.drains()).collect();
@@ -270,9 +270,9 @@ fn each_planted_defect_turns_its_rule_red() {
         ),
         (
             Mode::Frontend,
-            "--state-store=sqlite://@KBF_STATE_DIR@/state.db",
-            "--state-store=postgres://db.example/kbf",
-            "FAIL state-store: kbf-frontend@.service: --state-store is a postgres URI: postgres is not wired yet; the state store is sqlite:///<absolute path>",
+            "--state-store=@KBF_STATE_STORE@",
+            "--state-store=postgres://db.example/${PGDB}",
+            "FAIL state-store: kbf-frontend@.service: --state-store names ${PGDB}: systemd expands it into kbf's command line, which every user on the node can read in /proc, and the rule cannot read the store it names; write the URI itself",
         ),
         (
             Mode::StorageAndDaemon,

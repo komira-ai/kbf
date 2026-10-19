@@ -44,6 +44,8 @@ xtask.workspace = true
 [dev-dependencies]
 futures.workspace = true
 # `tests/proxy_identity.rs`: a real kbf-proxy in front of the real kbf-server gate.
+# `tests/deploy_through_proxy.rs`: the client of `kbf-installer deploy` against a real
+# kbf-proxy and a child's operator port (an h2 server) behind it.
 h2.workspace = true
 hex.workspace = true
 http.workspace = true

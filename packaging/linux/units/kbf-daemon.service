@@ -46,9 +46,11 @@ ExecStartPre=+/usr/bin/kbf-installer boot-check
 # that runs before the bind retry never leaves the unit down for good (kbf#998, #1000).
 ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=daemon --check
 ExecStart=/var/lib/kbf-installer/current/kbf --mode=daemon
-# A daemon does not drain on SIGTERM (its leases are abandoned; the operator API empties a
-# node before it is stopped), so it keeps systemd's stop timeout: an infinite one would
-# only hold a reboot on a daemon that hangs.
+# The daemon drains on SIGTERM for up to --drain-deadline-secs (600 by default), then
+# stops. The stop timeout is that plus 60 s, so systemd never SIGKILLs a drain; it stays
+# finite, so a hung daemon still lets a reboot through (check-units rule `stop`).
+TimeoutStopSec=660
+KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=5
 # Exit 2 is a command line kbf refused (or a config or an image it cannot parse): a

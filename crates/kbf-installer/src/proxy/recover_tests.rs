@@ -37,7 +37,7 @@ fn draining_world() -> (World, ProcIdent) {
     let (w, old) = World::with_old();
     w.permits(Slot::A, 3, Some(secs(400)));
     w.busy(Slot::A, 2, Some(secs(500)));
-    w.queued(Slot::A, 1, Some(secs(600)));
+    w.sessions(Slot::A, 1, Some(secs(600)));
     (w, old)
 }
 

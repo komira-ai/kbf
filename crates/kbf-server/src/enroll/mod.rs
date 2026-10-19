@@ -3,11 +3,33 @@
 //! (`kbf-enroll-registry`).
 //!
 //! Two things the API needs are not here, and are traits so it can be built and tested
-//! without them: the CA pin that goes into a token string ([`PinSource`]; the CA's owner
-//! implements it) and the random bytes of a token ([`Random`]; [`OsRandom`] in production,
-//! a fixed sequence in tests).
+//! without them: the CA pin that goes into a token string ([`PinSource`]; [`ca::CaPins`]
+//! implements it from the CA the frontend loaded) and the random bytes of a token
+//! ([`Random`]; [`OsRandom`] in production, a fixed sequence in tests).
+//!
+//! The other half is the enroll listener a node calls (`--enroll-listen`):
+//!
+//! - [`service`] and [`renew`]: `Enroll` and `Renew` over the registry and the CA;
+//! - [`ca`]: the CA at first start (`--ca-dir`, `--ca-signer`);
+//! - [`tls`]: the listener's own certificate, renewed at half its life;
+//! - [`listener`] and [`limits`]: the socket, and what bounds it (body size, rate per
+//!   source address, calls in flight);
+//! - [`gate`]: the start gate on deny rows (design section 8.3);
+//! - [`flags`] and [`start`]: the flags and the start.
 
 pub mod api;
+pub mod ca;
+pub mod flags;
+pub mod gate;
+pub mod limits;
+pub mod listener;
+mod renew;
+pub mod service;
+pub mod start;
+pub mod tls;
+
+#[cfg(test)]
+mod testkit;
 
 use std::io::Read as _;
 
