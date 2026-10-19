@@ -180,6 +180,114 @@ fn a_stray_descriptor_is_named() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_file_that_fails_to_read_is_refused() {
-    let got = read_pem(Path::new("/proc/self/mem"));
+    // By number: `/proc/self` is itself a link, which `read_pem` refuses for another reason.
+    let mem = PathBuf::from(format!("/proc/{}/mem", std::process::id()));
+    let got = read_pem(&mem);
+    assert!(
+        matches!(&got, Err(IdentityFault::File { why, .. }) if !why.contains("link")),
+        "{got:?}"
+    );
+}
+
+/// A link anywhere in the path is refused, not only one at the end: `kbf` owns the directory the
+/// key is in, and a directory of its that it swaps for a link to another directory would have
+/// root read (and lend to the child) a file of that other directory.
+///
+/// Catches a path walked through a link in a directory component (only the last component was
+/// checked), and a plain path refused with it.
+///
+/// Mutant: `NO_SYMLINKS` left out of the resolve flags of `read_pem`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pem_behind_a_linked_directory_is_not_followed() {
+    let dir = scratch_dir("identity-dirlink");
+    let real = dir.join("real");
+    fs::create_dir(&real).expect("directory");
+    file(&real, "key.pem", b"secret that is not the key");
+    symlink(&real, dir.join("alias")).expect("link");
+    assert_eq!(
+        read_pem(&real.join("key.pem")).expect("the plain path reads"),
+        b"secret that is not the key"
+    );
+    let got = read_pem(&dir.join("alias").join("key.pem"));
     assert!(matches!(got, Err(IdentityFault::File { .. })), "{got:?}");
+}
+
+/// A file with another name is refused: a hard link `kbf` made to a file it could not read
+/// itself would have root lend that file, and a link cannot be told from the file it links to
+/// except by the count. With the other name gone the same file is read, so it was the count.
+///
+/// Catches the link count not asked.
+///
+/// Mutant: the `nlink` check removed from `read_pem`.
+#[test]
+fn a_pem_with_another_name_is_refused() {
+    let dir = scratch_dir("identity-hardlink");
+    let first = file(&dir, "a.pem", b"pem");
+    let second = dir.join("b.pem");
+    fs::hard_link(&first, &second).expect("hard link");
+    for path in [&first, &second] {
+        let got = read_pem(path);
+        assert!(
+            matches!(&got, Err(IdentityFault::File { why, .. }) if why.contains("link")),
+            "{}: {got:?}",
+            path.display()
+        );
+    }
+    fs::remove_file(&second).expect("unlink");
+    assert_eq!(read_pem(&first).expect("one name now"), b"pem");
+}
+
+/// The path is absolute: a relative one would be resolved against whatever directory the
+/// helper happens to be in, and settings only ever hold absolute paths.
+///
+/// Catches a relative path opened (this crate's own manifest is a readable file of a sane size).
+///
+/// Mutant: the absolute-path check removed from `read_pem`.
+#[test]
+fn a_relative_path_is_refused() {
+    assert!(
+        Path::new("Cargo.toml").exists(),
+        "the test runs in the crate's directory"
+    );
+    let got = read_pem(Path::new("Cargo.toml"));
+    assert!(
+        matches!(&got, Err(IdentityFault::File { why, .. }) if why.contains("absolute")),
+        "{got:?}"
+    );
+}
+
+/// Where the resolving open is not there (`ENOSYS` before Linux 5.6, `EPERM` from a sandbox that
+/// filters the call) the file is opened the old way, its last component not followed; any other
+/// failure of it is the answer, not a reason to open some other way.
+///
+/// Catches a fallback that is missing (a host with an old kernel could not lend an identity), a
+/// fallback that follows a final link, and a fallback taken for a real refusal (the old way would
+/// then open a file the resolving open refused).
+///
+/// Mutants: `PERM` dropped from the fallback's errors; the fallback taken for every error.
+#[cfg(target_os = "linux")]
+#[test]
+fn without_the_resolving_open_the_last_component_is_still_not_followed() {
+    use rustix::io::Errno;
+    let dir = scratch_dir("identity-fallback");
+    let plain = file(&dir, "plain.pem", b"pem");
+    let link = dir.join("link.pem");
+    symlink(&plain, &link).expect("link");
+    for gone in [Errno::NOSYS, Errno::PERM] {
+        let read = |path: &Path| open_plain_with(path, |_| Err(gone));
+        assert!(read(&plain).is_ok(), "{gone:?}: the plain file opens");
+        let got = read(&link);
+        assert_eq!(
+            got.err().and_then(|e| e.raw_os_error()),
+            Some(libc::ELOOP),
+            "{gone:?}: a final link is refused"
+        );
+    }
+    let got = open_plain_with(&plain, |_| Err(Errno::ACCESS));
+    assert_eq!(
+        got.err().and_then(|e| e.raw_os_error()),
+        Some(libc::EACCES),
+        "another failure is the answer"
+    );
 }

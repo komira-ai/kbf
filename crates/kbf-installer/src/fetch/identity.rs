@@ -3,7 +3,8 @@
 //! For the `frontend` release source the child needs the node's client certificate and key
 //! for the mutual TLS of `ReleaseService.Fetch`, and the pinned CA that authenticates the
 //! frontend. The root parent reads the three PEM files itself (each opened without following
-//! a link, a regular file, at most [`MAX_PEM_BYTES`]) and lends them as one small blob over a
+//! a link in any component of its path, a regular file with one hard link, at most
+//! [`MAX_PEM_BYTES`]) and lends them as one small blob over a
 //! descriptor, never on disk: on Linux a sealed anonymous memory file, elsewhere a socket pair
 //! fed by a thread. The child reads the blob to its end, once.
 //!
@@ -49,22 +50,28 @@ pub enum IdentityFault {
     Stray(i32),
 }
 
-/// Read one PEM file for lending: opened without following a final link, a regular file, not
-/// empty, at most [`MAX_PEM_BYTES`]. The path's owner is `kbf` (the files are written by
-/// enrollment), so ownership is not asked.
+/// Read one PEM file for lending: an absolute path, opened without following a link in any
+/// component (see [`open_plain`]), a regular file with one hard link, not empty, at most
+/// [`MAX_PEM_BYTES`]. The files are written by enrollment, as `kbf`, who is the party these
+/// checks are for: it owns the directories, so it could swap one for a link, or hard-link a
+/// file it cannot read, to have root read a file of someone else's and lend it. Who owns the
+/// file is not asked (the owner is not fixed yet).
 pub fn read_pem(path: &Path) -> Result<Vec<u8>, IdentityFault> {
+    use std::os::unix::fs::MetadataExt as _;
     let fault = |why: String| IdentityFault::File {
         path: path.to_path_buf(),
         why,
     };
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|e| fault(e.to_string()))?;
+    if !path.is_absolute() {
+        return Err(fault("not an absolute path".to_owned()));
+    }
+    let file = open_plain(path).map_err(|e| fault(e.to_string()))?;
     let meta = file.metadata().map_err(|e| fault(e.to_string()))?;
     if !meta.is_file() {
         return Err(fault("not a regular file".to_owned()));
+    }
+    if meta.nlink() > 1 {
+        return Err(fault("has more than one hard link".to_owned()));
     }
     // One more than the most, so a file that is too large is seen and not silently cut.
     let mut bytes = Vec::new();
@@ -78,6 +85,49 @@ pub fn read_pem(path: &Path) -> Result<Vec<u8>, IdentityFault> {
         )));
     }
     Ok(bytes)
+}
+
+/// Open the absolute `path` for reading, refusing a link in any component of it. On Linux that
+/// is `openat2` with `NO_SYMLINKS` and `NO_MAGICLINKS`, which resolves the whole path itself
+/// (no race with a directory swapped between two steps). Where the call is not there or not
+/// allowed (before Linux 5.6, a sandbox that filters it) or off Linux, only the last component
+/// is checked, as the order spool does ([`crate::spool::OpenMode`]); a link in a directory above
+/// it is then followed. Not blocking, so a FIFO is not waited for.
+#[cfg(target_os = "linux")]
+fn open_plain(path: &Path) -> io::Result<File> {
+    open_plain_with(path, |path| {
+        use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+        let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let resolve = ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
+        openat2(CWD, path, flags, Mode::empty(), resolve)
+    })
+}
+
+/// [`open_plain`] given the resolving open, so a test can hand it one that is not there.
+#[cfg(target_os = "linux")]
+fn open_plain_with(
+    path: &Path,
+    resolve: impl FnOnce(&Path) -> rustix::io::Result<OwnedFd>,
+) -> io::Result<File> {
+    use rustix::io::Errno;
+    match resolve(path) {
+        Ok(fd) => Ok(File::from(fd)),
+        Err(Errno::NOSYS | Errno::PERM) => open_last_not_followed(path),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_plain(path: &Path) -> io::Result<File> {
+    open_last_not_followed(path)
+}
+
+/// Open `path` for reading without following a link as its last component.
+fn open_last_not_followed(path: &Path) -> io::Result<File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
 }
 
 impl Identity {
