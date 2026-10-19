@@ -360,3 +360,29 @@ fn an_unusable_state_ends_the_install_after_the_checks() {
     let err = rig.activate(&honest()).expect_err("unusable");
     assert_eq!(err.code(), "install-failed", "{err}");
 }
+
+/// Catches the fetch child's own count of the stream being ignored: the file on disk hashes to
+/// the order's digest, but the digest the parent computed while it read the stream from the
+/// child does not, so the child handed over something other than it read; the stage ends as
+/// `hash` and runs nothing.
+///
+/// Mutant planted: the parent's digest not compared with the order's (the on-disk hash alone
+/// decides).
+#[test]
+fn a_stream_the_parent_hashed_differently_from_the_file_is_a_hash_refusal() {
+    let rig = Rig::new("stream-digest");
+    let (locator, mut fetched) = rig.fetch(&tarball());
+    fetched.files[0].sha256 = "0".repeat(64);
+    let runner = honest();
+    let err = rig
+        .verify(
+            &runner,
+            OrderKind::Activate,
+            &[locator],
+            Some(&facts()),
+            fetched,
+        )
+        .expect_err("different digests");
+    assert_eq!(err.word(), Some("hash"), "{err}");
+    assert!(runner.calls().is_empty());
+}

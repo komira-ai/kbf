@@ -50,6 +50,30 @@ fn the_two_required_values_make_a_config_with_every_default() {
     assert_eq!(c.data_dir, Path::new(DEFAULT_STATE_DIR).join("data"));
     assert_eq!(c.reserve_cpus, None);
     assert_eq!(c.trust, Trust::Pin, "pin unless public is written down");
+    assert_eq!(
+        c.mode, None,
+        "the mode is the command line's unless written"
+    );
+}
+
+/// Catches a `mode` key that is refused (the file could not say what the host is), read
+/// from the wrong table, or accepted as anything: it is a top-level name of lower-case
+/// letters and hyphens, and the line of a bad one is reported.
+#[test]
+fn the_mode_is_a_top_level_name() {
+    let c = ok(&format!("mode = \"storage-and-daemon\"\n{MINIMAL}"));
+    assert_eq!(c.mode.as_deref(), Some("storage-and-daemon"));
+    let got = one(&format!("mode = \"Storage\"\n{MINIMAL}"));
+    assert!(got.starts_with("mode@1: a mode is a name"), "{got}");
+    let got = one(&format!("mode = \"\"\n{MINIMAL}"));
+    assert!(got.starts_with("mode@1: "), "{got}");
+    let got = one(&format!("mode = 3\n{MINIMAL}"));
+    assert!(
+        got.starts_with("mode@1: ") || got.contains("invalid type"),
+        "{got}"
+    );
+    let got = one(&format!("{MINIMAL}[node]\nmode = \"daemon\"\n"));
+    assert!(got.contains("unknown field `mode`"), "{got}");
 }
 
 #[test]
@@ -542,5 +566,44 @@ fn hot_and_data_dirs_must_share_a_file_system() {
             got[0].message,
             "must be on the same file system as daemon.data_dir"
         );
+    }
+}
+
+/// Catches a key that `kbf.toml` puts in `[daemon]` or `[tls]` and that is not enrollment's
+/// being accepted by an enrollment-only file (a typo of `trust` would start the node
+/// with the default), or reported without its table in the key, or only the first of
+/// several reported; and the same file read as a shared one (the flags' parser checks
+/// those keys) being refused.
+#[test]
+fn an_unknown_key_in_daemon_or_tls_is_refused_unless_the_file_is_shared() {
+    let text = format!("{MINIMAL}[daemon]\nbogus = 1\n[tls]\ntrsut = \"pin\"\n");
+    let got: Vec<(String, String)> = problems(&text)
+        .into_iter()
+        .map(|p| (p.key, p.message))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (
+                "daemon.bogus".to_owned(),
+                "unknown field `bogus`".to_owned()
+            ),
+            ("tls.trsut".to_owned(), "unknown field `trsut`".to_owned()),
+        ]
+    );
+    let shared = Config::parse_shared(&text, &host()).unwrap_or_else(|e| panic!("refused: {e}"));
+    assert_eq!(shared.trust, Trust::Pin);
+}
+
+/// Catches `is_own_table` answering for a table the flags also use (`daemon`, `tls`), for
+/// the top level (the empty name) or for a name that is no table of ours: the shared
+/// file's flag check would then refuse a legitimate flag or let a stray table by.
+#[test]
+fn only_a_table_wholly_enrollments_is_its_own() {
+    for own in ["frontend", "enroll", "node", "dirs", "storage"] {
+        assert!(is_own_table(own), "{own}");
+    }
+    for not_own in ["", "daemon", "tls", "no-such-table", "mode"] {
+        assert!(!is_own_table(not_own), "{not_own:?}");
     }
 }
