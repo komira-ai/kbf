@@ -145,6 +145,39 @@ mod tests {
     use super::recording::Recorded;
     use super::*;
 
+    /// A log held in memory: what a test's subscriber writes to.
+    #[derive(Clone, Default)]
+    struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Log {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            let log = self.clone();
+            tracing_subscriber::fmt()
+                .with_writer(move || {
+                    let mut writer = log.clone();
+                    std::io::Write::flush(&mut writer).unwrap();
+                    writer
+                })
+                .with_ansi(false)
+                .finish()
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
     #[test]
     fn events_are_appended_and_alerts_sent() {
         let dir = crate::testkit::scratch("journal");
@@ -180,5 +213,34 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
         assert!(Journal::open(&dir, Box::new(LogAlerts)).is_err());
+    }
+
+    /// Catches: an alert that never reaches the host's log (the default sink), or one
+    /// that drops the verb, serial, outcome or detail an operator pages on. The test
+    /// installs its own subscriber, so the event is seen (and its field lines count as
+    /// run) whatever else ran in the process.
+    #[test]
+    fn log_alerts_write_the_event_to_the_log() {
+        let log = Log::default();
+        let subscriber = log.subscriber();
+        let dir = crate::testkit::scratch("journal-log");
+        let journal = Journal::open(&dir.join("audit.log"), Box::new(LogAlerts)).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            journal
+                .record(&Event::new(0, "erase", "S9", "refused", "no touch", true))
+                .unwrap();
+        });
+        let text = log.text();
+        for want in [
+            "ERROR",
+            "kbf_mdm_gate::alert",
+            "verb=erase",
+            "serial=S9",
+            "outcome=refused",
+            "detail=no touch",
+            "kbf-mdm-gate alert",
+        ] {
+            assert!(text.contains(want), "{want:?} missing from {text:?}");
+        }
     }
 }
