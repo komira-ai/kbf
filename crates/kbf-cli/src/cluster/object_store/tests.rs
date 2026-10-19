@@ -7,12 +7,8 @@ use crate::cluster::Verb;
 
 const SENTINEL: &str = "SENTINEL-unit-4d1e9b02c7";
 
-fn dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join(format!("kbf-cluster-unit-{}", std::process::id()))
-        .join(name);
-    std::fs::create_dir_all(&dir).expect("a directory");
-    dir
+fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(std::env::temp_dir(), &format!("kbf-cluster-unit-{name}"))
 }
 
 fn source(file: Option<PathBuf>) -> SecretSource {
@@ -109,7 +105,9 @@ fn a_secret_file_is_a_private_regular_file() {
     let link = dir.join("link");
     std::os::unix::fs::symlink(&wide, &link).expect("symlink");
     assert!(read(&link).is_err(), "the mode is the target's");
-    let err = read(&dir).expect_err("directory").to_string();
+    let err = read(&dir.path().to_path_buf())
+        .expect_err("directory")
+        .to_string();
     assert!(err.ends_with("it is not a regular file"), "{err}");
     let err = read(&dir.join("absent")).expect_err("absent").to_string();
     assert!(

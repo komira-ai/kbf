@@ -278,7 +278,8 @@ fn a_racing_refresh_gives_one_winner_and_one_retry() {
 
     let map = m.current_map().expect("read").expect("map");
     assert_eq!(state(&map, d.id), None, "d left and stayed gone");
-    assert_eq!(state(&map, b.id), Some(MemberState::Active));
+    // The farm is over a minute old by now, and b is new to it: a joiner, not an Active member.
+    assert_eq!(state(&map, b.id), Some(MemberState::Joining));
     assert_eq!(map.generation(), down.generation() + 1);
     assert_eq!(b.map, map, "the loser answers with the winner's map");
     assert_eq!(
