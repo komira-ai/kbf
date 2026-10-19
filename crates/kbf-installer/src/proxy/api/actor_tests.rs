@@ -56,6 +56,32 @@ async fn the_actor_ticks_a_staging_update_forward_with_nobody_asking() {
 }
 
 #[tokio::test]
+async fn a_tick_of_zero_waits_on_the_timer_and_does_not_spin() {
+    let rig = Rig::new("u8b-a-zero-tick");
+    let timing = ActorTiming {
+        tick: Duration::ZERO,
+        ..ActorTiming::default()
+    };
+    let api = spawn(rig.core(), timing, || {}).unwrap();
+    // The update is staging from here on, so every tick reads status.json.
+    api.post(req(B, "r1")).await.unwrap();
+    let stall = rig.status.stall();
+    let before = stall.reads();
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let reads = stall.reads() - before;
+    let millis = started.elapsed().as_millis();
+    // The runtime's timer has a granularity of a millisecond and a deadline is rounded up
+    // to it, so even a tick of zero allows one read per millisecond at most (and one in
+    // flight, and one between the two counts). A loop that does not wait on the timer
+    // reads as fast as the thread can, which is thousands in the same time.
+    assert!(
+        reads as u128 <= millis + 2,
+        "{reads} reads of status.json in {millis} ms"
+    );
+}
+
+#[tokio::test]
 async fn a_full_queue_is_a_503_at_once() {
     let rig = Rig::new("u8b-a-full");
     let stall = rig.status.stall();

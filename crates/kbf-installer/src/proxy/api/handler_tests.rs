@@ -257,6 +257,17 @@ async fn a_stuck_actor_stalls_neither_the_callers_runtime_nor_past_the_deadline(
     assert_eq!(post.await.unwrap().status, 503);
     stall.open();
     wait_until(|| written(&h.rig).len() == 1).await;
+    // The 503 did not mean "not done": the retry with the same request id is answered with
+    // the update the first call opened, and no second order is written.
+    let open = json_of(&h.handler.handle(call("GET", U, &Value::Null)).await);
+    let retry = h.handler.handle(call("POST", U, &post_body(B, "r1"))).await;
+    assert!(
+        (200..300).contains(&retry.status),
+        "{}",
+        String::from_utf8_lossy(&retry.body)
+    );
+    assert_eq!(json_of(&retry)["update_id"], open["update_id"]);
+    assert_eq!(written(&h.rig).len(), 1);
 }
 
 #[tokio::test]

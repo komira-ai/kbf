@@ -109,6 +109,11 @@ impl Stall {
         self.0.opened.notify_all();
     }
 
+    /// How many reads have reached the door so far.
+    pub fn reads(&self) -> usize {
+        *self.0.arrived.borrow()
+    }
+
     /// Waits, without blocking the runtime, until `n` reads have reached the door.
     pub async fn arrived(&self, n: usize) {
         let mut count = self.0.arrived.subscribe();

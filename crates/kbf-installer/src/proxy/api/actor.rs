@@ -56,7 +56,11 @@ pub(super) const QUEUE: usize = 64;
 /// How the actor and its callers keep time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActorTiming {
-    /// How long the actor waits for a call before it reads `status.json` on its own.
+    /// How long the actor waits, with no call, before it reads `status.json` on its own.
+    /// The wait starts again after every call, which is no loss: `POST`, `abort`,
+    /// `rollback` and the status read each move a staging update along before they act on
+    /// it, so the tick is for the time nobody asks. Zero means as often as the
+    /// runtime's timer fires (once a millisecond), not a busy loop.
     pub tick: Duration,
     /// The longest a caller waits for its answer, in the queue and being handled together.
     /// Keep it under the deadline of whoever calls the API, so the caller gets this 503

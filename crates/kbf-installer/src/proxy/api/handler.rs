@@ -100,6 +100,11 @@ impl Handler {
 
     /// Answers one request. Never waits on the actor longer than the deadline of
     /// [`ActorTiming`], and never blocks the task it runs on.
+    ///
+    /// **A 503 does not say the request did not happen.** A `POST` the actor had already
+    /// begun when its deadline passed finishes and writes its order; the caller retries
+    /// with the same `request_id` and is answered with that update, not with a second one.
+    /// (A call that was still queued when its caller left is dropped unrun.)
     pub async fn handle(&self, call: HandlerRequest) -> HandlerReply {
         let response = match request(call) {
             Ok(request) => self.router.call(request).await,
