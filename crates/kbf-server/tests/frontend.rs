@@ -356,6 +356,52 @@ async fn execute_reads_and_writes_the_storage_node() {
     drop(front);
 }
 
+/// Catches: `--default-platform` not reaching the Execution service of a frontend process
+/// (`kbf frontend`, which builds it apart from `kbf-server`): an action that names no
+/// platform going to the first daemon by name, the Mac, as it did; and `none` not
+/// restoring that. The Mac registers first and sorts first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_places_an_action_that_names_no_platform_on_its_default() {
+    for (flag, goes_to_linux) in [
+        ("--default-platform=linux/x86_64", true),
+        ("--default-platform=none", false),
+    ] {
+        let node = Node::start().await;
+        let url = format!("--storage=http://{}", node.addr);
+        let front =
+            Front::start(&flags(&[&url, flag, "--heartbeat-interval-ms=100"]).expect("flags"))
+                .await;
+        let client = front.client().await;
+        let mut mac = support::FakeDaemon::connect(
+            client.worker_addr,
+            support::hello_on("node-a", 4, 8, &[("arch", "arm64"), ("os", "macos")]),
+        )
+        .await
+        .expect("registered");
+        let mut linux = client.daemon("node-b", 4, 8).await;
+
+        let job = Job::new("names nothing", &[]);
+        client.upload(&job.blobs()).await;
+        let mut ops = client.execute(&job.action).await;
+        let (taker, other) = if goes_to_linux {
+            (&mut linux, &mut mac)
+        } else {
+            (&mut mac, &mut linux)
+        };
+        let start = taker.start().await;
+        assert_eq!(
+            start.action_digest.as_ref(),
+            Some(&job.action.proto),
+            "{flag}"
+        );
+        other.no_work().await;
+        let result = support::output(&client, "names nothing", 0).await;
+        assert!(taker.report(ran(start.lease_id, &result)).await.accepted);
+        done(&mut ops).await;
+        drop(front);
+    }
+}
+
 // ------------------------------------------------------------------- health
 
 /// Catches `/readyz` and the health service ignoring the storage node: a frontend whose
