@@ -214,11 +214,6 @@ pub struct RunArgs {
     /// The fewest seconds between one activation and the next.
     #[arg(long, default_value_t = 60)]
     pub min_activation_interval_secs: u64,
-    /// This host runs a frontend (kbf.toml mode `frontend` or `all-in-one`): the helper takes
-    /// the frontend proxy's `frontend_update`, `confirm` and `revert` orders and restarts no
-    /// unit for them. Without it `frontend_update` is refused.
-    #[arg(long)]
-    pub frontend_host: bool,
     /// Stop after this many passes (a rehearsal or a test); without it, run until stopped.
     #[arg(long)]
     pub passes: Option<u64>,

@@ -93,8 +93,6 @@ Options:
           The starts a release on trial gets before it is reverted (Linux) [default: 3]
       --min-activation-interval-secs <MIN_ACTIVATION_INTERVAL_SECS>
           The fewest seconds between one activation and the next [default: 60]
-      --frontend-host
-          This host runs a frontend (kbf.toml mode `frontend` or `all-in-one`): the helper takes the frontend proxy's `frontend_update`, `confirm` and `revert` orders and restarts no unit for them. Without it `frontend_update` is refused
       --passes <PASSES>
           Stop after this many passes (a rehearsal or a test); without it, run until stopped
       --installer-config <INSTALLER_CONFIG>

@@ -73,8 +73,6 @@ struct World {
     counter: Rc<Cell<usize>>,
     crash_at: Rc<Cell<usize>>,
     fetcher: FakeFetcher,
-    /// Whether the helper is set up as a frontend host's.
-    frontend: Cell<bool>,
 }
 
 impl World {
@@ -112,7 +110,6 @@ impl World {
             layout,
             counter: Rc::new(Cell::new(0)),
             crash_at: Rc::new(Cell::new(0)),
-            frontend: Cell::new(false),
         }
     }
     fn helper(&self) -> Helper<Crashy> {
@@ -123,7 +120,6 @@ impl World {
             window_secs: 600,
             starts: 3,
             min_activation_interval_secs: 0,
-            frontend_host: self.frontend.get(),
         };
         Helper::new(
             self.layout.clone(),
@@ -231,7 +227,11 @@ fn steps_in_clean_pass(scn: &str) -> usize {
 
 fn prep(scn: &str, tag: &str) -> World {
     let w = World::new(&format!("{scn}-{tag}"));
-    w.frontend.set(scn.starts_with("frontend"));
+    if scn.starts_with("frontend") {
+        let dir = w.root.join("etc/kbf");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("kbf.toml"), "mode = \"frontend\"\n").unwrap();
+    }
     pass(&w, T0 - 100);
     match scn {
         // The proxy's three orders; the host starts with B staged except for the update,

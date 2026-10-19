@@ -126,6 +126,9 @@ impl Rig {
         );
         host.answer = service.answer();
         let layout = Layout::new(Root::new(&root).expect("absolute"), platform);
+        if frontend_host {
+            write_kbf_toml(&layout, "mode = \"frontend\"\n");
+        }
         Locked::acquire(&layout)
             .expect("lock")
             .write(&State {
@@ -140,7 +143,6 @@ impl Rig {
             window_secs: 600,
             starts: 3,
             min_activation_interval_secs: min_interval,
-            frontend_host,
         };
         let fetcher = FakeFetcher::new(&layout);
         let leases = FakeLeases::default();
@@ -253,6 +255,13 @@ impl Rig {
     fn current(&self) -> Option<crate::CommitId> {
         self.state().current
     }
+}
+
+/// Writes the host's `kbf.toml` (where its platform keeps it) with `text`.
+fn write_kbf_toml(layout: &Layout, text: &str) {
+    let path = layout.join(&layout.kbf_toml());
+    fs::create_dir_all(path.parent().expect("a parent")).expect("config dir");
+    fs::write(path, text).expect("kbf.toml");
 }
 
 fn link(rig: &Rig, name: &str) -> PathBuf {

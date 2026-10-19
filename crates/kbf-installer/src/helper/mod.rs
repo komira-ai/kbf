@@ -10,7 +10,7 @@
 //!    link and read once, and acts on them in (epoch, id) order, once each: `activate`
 //!    checks the order, has the [`fetcher::Fetcher`] pull and verify the release if its
 //!    directory is not there, swaps it in on trial and restarts the one configured
-//!    service; `confirm` keeps it; `revert` goes back; on a frontend host (`--frontend-host`)
+//!    service; `confirm` keeps it; `revert` goes back; on a frontend host (`kbf.toml` mode `frontend` or `all-in-one`)
 //!    the frontend proxy's `frontend_update` stages a release without moving a link, and its
 //!    `confirm` and `revert` flip to the staged release or drop it ([`cycle`], `frontend.rs`);
 //! 3. collects the releases nothing needs once a swap was confirmed (`gc` keeps current,
@@ -34,6 +34,7 @@
 
 pub mod cycle;
 pub mod fetcher;
+pub mod host_mode;
 pub mod leases;
 pub mod memory;
 pub mod operator;

@@ -531,3 +531,115 @@ fn a_state_lock_that_cannot_be_opened_is_a_refusal_of_each_of_the_three_orders()
         assert_eq!(rig.state(), before, "{verb:?}");
     }
 }
+
+/// Catches a host taking the proxy's `frontend_update` on its flag, a guess or a different
+/// key: whether the order is accepted is the top-level `mode` of the host's `kbf.toml` and
+/// nothing else (design section 4). `frontend` and `all-in-one` stage the release, on Linux
+/// and on macOS (where the file is elsewhere); `daemon`, no file, a file that is not TOML, a
+/// `mode` that is not a string, a `mode` only inside a table and no `mode` are refused as
+/// `denied` with the reason in `status.json`, the pass goes on, no floor moves and nothing is
+/// staged.
+///
+/// Mutant planted: `frontend_host` ignoring the mode (always `Ok`) fails every refused row;
+/// always `Err` fails every accepted row.
+#[test]
+fn a_frontend_update_is_taken_by_the_mode_in_the_hosts_kbf_toml() {
+    let accepted = [
+        (Platform::Linux, "mode = \"frontend\"\n"),
+        (
+            Platform::Linux,
+            "mode = \"all-in-one\"\n[listener]\nlisten = \"x\"\n",
+        ),
+        (Platform::MacOs, "mode = \"frontend\"\n"),
+    ];
+    for (index, (platform, text)) in accepted.into_iter().enumerate() {
+        let mut rig = Rig::on(&format!("mode-ok-{index}"), platform);
+        write_kbf_toml(&rig.layout, text);
+        rig.order(1, Verb::FrontendUpdate, B);
+        rig.cycle(T0);
+        assert_eq!(
+            rig.state().staged,
+            Some(c(B)),
+            "{text:?}: {}",
+            rig.refusal()
+        );
+    }
+    let refused: [(Option<&str>, &str); 6] = [
+        (Some("mode = \"daemon\"\n"), "\"daemon\""),
+        (None, "is not there"),
+        (Some("mode = [unclosed\n"), "is not TOML"),
+        (Some("mode = 3\n"), "has no mode"),
+        (Some("[x]\nmode = \"frontend\"\n"), "has no mode"),
+        (Some("listen = \"x\"\n"), "has no mode"),
+    ];
+    for (index, (text, why)) in refused.into_iter().enumerate() {
+        let mut rig = Rig::new(&format!("mode-no-{index}"));
+        if let Some(text) = text {
+            write_kbf_toml(&rig.layout, text);
+        }
+        rig.order(1, Verb::FrontendUpdate, B);
+        rig.cycle(T0);
+        assert_eq!(word(&rig), "denied", "{text:?}: {}", rig.refusal());
+        assert!(rig.refusal().contains(why), "{text:?}: {}", rig.refusal());
+        assert_eq!(rig.state().staged, None, "{text:?}");
+        let memory = fs::read(rig.root.join("var/lib/kbf-installer/helper.json")).expect("memory");
+        let memory: serde_json::Value = serde_json::from_slice(&memory).expect("json");
+        assert_eq!(memory["frontend_order_id"], 0, "{text:?}: no floor moves");
+    }
+}
+
+/// Catches a replayed `confirm` that trusts the state and leaves a lagging link: the state
+/// says B is current (A previous) but `current` still points at A (a crash after the state
+/// write and before the link). A new confirm order for B reports it kept, makes `current`
+/// point at B, and leaves `previous` on A, in the state and on disk.
+///
+/// Mutant planted: `converge` removed from the repeat-confirm path of `confirm_frontend`
+/// (`current` stays on A).
+#[test]
+fn a_replayed_frontend_confirm_makes_a_lagging_link_match_the_state() {
+    let mut rig = staged("confirm-lag", B, 1);
+    rig.order(2, Verb::Confirm, B);
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.current(), Some(c(B)), "{}", rig.refusal());
+    assert_eq!(rig.state().previous, Some(c(A)));
+    let current = rig.root.join("var/lib/kbf-installer/releases/current");
+    fs::remove_file(&current).expect("unlink");
+    symlink(A, &current).expect("lag");
+    assert_eq!(link(&rig, "current"), PathBuf::from(A));
+    let before = rig.state();
+    rig.order(3, Verb::Confirm, B);
+    rig.cycle(T0 + 6);
+    assert_eq!(link(&rig, "current"), PathBuf::from(B), "{}", rig.refusal());
+    assert_eq!(link(&rig, "previous"), PathBuf::from(A));
+    assert_eq!(rig.state(), before, "the state is what it was");
+}
+
+/// Catches a `kbf.toml` the helper cannot read whole taking the pass down or passing for a
+/// frontend: bytes that are not text, a file over the cap and a directory where the file
+/// should be are each `denied` with their own reason, and the pass goes on.
+///
+/// Mutant planted: the size check dropped (the oversized file, a comment, parses and is
+/// refused for having no mode, not for its size).
+#[test]
+fn a_kbf_toml_that_cannot_be_read_whole_is_denied_with_its_reason() {
+    let big = format!("mode = \"frontend\"\n#{}\n", "x".repeat(1 << 20));
+    let rows: [(&[u8], &str); 3] = [
+        (b"mode = \"frontend\"\n\xff\xfe", "is not UTF-8 text"),
+        (big.as_bytes(), "is over 1048576 bytes"),
+        (b"", "cannot be read"),
+    ];
+    for (index, (bytes, why)) in rows.into_iter().enumerate() {
+        let mut rig = Rig::new(&format!("mode-unread-{index}"));
+        let path = rig.layout.join(&rig.layout.kbf_toml());
+        fs::create_dir_all(&path).expect("config dir");
+        if !bytes.is_empty() {
+            fs::remove_dir(&path).expect("a directory to replace");
+            fs::write(&path, bytes).expect("kbf.toml");
+        }
+        rig.order(1, Verb::FrontendUpdate, B);
+        rig.cycle(T0);
+        assert_eq!(word(&rig), "denied", "{}", rig.refusal());
+        assert!(rig.refusal().contains(why), "{}", rig.refusal());
+        assert_eq!(rig.state().staged, None);
+    }
+}

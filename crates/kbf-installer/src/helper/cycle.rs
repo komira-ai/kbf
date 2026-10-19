@@ -25,6 +25,7 @@ mod frontend;
 
 use crate::database::SchemaStep;
 use crate::helper::fetcher::{Fetcher, InstalledRelease, ReleaseLocator};
+use crate::helper::host_mode;
 use crate::helper::leases::LeaseSource;
 use crate::helper::memory::{Event, Memory, StagedFacts};
 use crate::helper::order::{self, Claims, Order, Verb};
@@ -49,11 +50,6 @@ pub struct Config {
     pub starts: u32,
     /// The fewest seconds between one activation and the next (`min_activation_interval_s`).
     pub min_activation_interval_secs: u64,
-    /// This host runs a frontend (`kbf.toml` mode `frontend` or `all-in-one`, by the
-    /// `--frontend-host` flag): it takes `frontend_update` records, and a `confirm` or `revert`
-    /// that is not about a node swap on trial is the proxy's, carried out on the staged
-    /// release without restarting a unit. Elsewhere those records are refused.
-    pub frontend_host: bool,
 }
 
 /// How many releases `gc` keeps besides current, previous, staged and pending.
@@ -185,13 +181,13 @@ impl<E: Exec> Helper<E> {
     /// A link that moved means the service may still run the old release: restart it.
     pub fn recover(&mut self) -> Result<(), HelperError> {
         let mut memory = self.load()?;
+        let runs_frontend = host_mode::frontend_host(&self.host).is_ok();
         match activate::reconcile(&mut self.exec, &self.host, &mut self.log) {
             // A frontend host owes the unit a restart only for a node swap on trial: the
             // proxy owns the frontend's children, and reads `installed_commit` itself. `|`,
             // not `||`: no short-circuit for a test to have to reach.
             Ok(true) => {
-                memory.restart_due |=
-                    !self.cfg.frontend_host | self.state()?.pending_confirm.is_some();
+                memory.restart_due |= !runs_frontend | self.state()?.pending_confirm.is_some();
             }
             Ok(false) => {}
             Err(e) => refuse(&mut memory, &e.to_string()),
@@ -396,7 +392,9 @@ impl<E: Exec> Helper<E> {
         memory: &mut Memory,
     ) -> Result<(), HelperError> {
         let state = self.state()?;
-        let frontend_host = self.cfg.frontend_host;
+        // Read each pass's orders afresh: the file is the host's, and may change under us.
+        let not_frontend = host_mode::frontend_host(&self.host).err();
+        let frontend_host = not_frontend.is_none();
         // Each kind of order is ordered against its own floor.
         let floor = |o: &Order, memory: &Memory| match kind_of(o, &state, frontend_host) {
             Kind::Frontend(_) => (memory.frontend_epoch, memory.frontend_order_id),
@@ -413,8 +411,9 @@ impl<E: Exec> Helper<E> {
             Ok(o) if !frontend_host && o.verb == Verb::FrontendUpdate => refuse(
                 memory,
                 &format!(
-                    "denied: order {}: this host runs no frontend (frontend_update is refused)",
-                    o.id
+                    "denied: order {}: this host runs no frontend (frontend_update is refused): {}",
+                    o.id,
+                    not_frontend.as_deref().unwrap_or_default()
                 ),
             ),
             Ok(o)
