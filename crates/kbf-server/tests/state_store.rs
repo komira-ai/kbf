@@ -1447,6 +1447,59 @@ async fn a_request_while_the_finish_is_held_does_not_retake_the_finished_operati
     assert_eq!((disk.rows("op/"), disk.rows("inflight/")), (1, 1));
 }
 
+/// Catches: a held finish that outlives the scheduler's retention of finished operations.
+/// The scheduler retires a finished operation after `FINISHED_RETENTION` whether or not its
+/// finish was written; a request after that finds the store's pin, no operation in the
+/// scheduler, and takes the rows up again: a second run, and the held finish then deletes
+/// the new operation's rows. The request is refused UNAVAILABLE for as long as the finish
+/// is held, no second `Start` goes out, and the rows are right once the store is back.
+#[tokio::test(start_paused = true)]
+async fn a_request_after_the_retention_of_a_held_finish_does_not_retake_the_operation() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    let ticket = farm
+        .submit(Submission {
+            request: request(1),
+            call: None,
+            described: Described::default(),
+        })
+        .expect("submitted");
+    let leases = starts(&mut inbox);
+    assert_eq!(leases.len(), 1);
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, leases[0]).await, "the store was down");
+
+    // The scheduler retires its finished operation while the finish is still held: a
+    // feed after the retention moves its clock past it, the store still refusing.
+    tokio::time::advance(kbf_sched::FINISHED_RETENTION + Duration::from_secs(1)).await;
+    farm.tick().await;
+    assert_eq!(disk.rows("op/"), 1, "the finish was written");
+    disk.store.set_down(false);
+    let held = submit(&farm, request(1));
+    assert_eq!(
+        held.err().map(|status| status.code()),
+        Some(Code::Unavailable),
+        "the request re-took an operation whose finish is held"
+    );
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "the action ran a second time"
+    );
+
+    for _ in 0..3 {
+        farm.tick().await;
+    }
+    let Finished::Failed(status) = ended(&ticket) else {
+        panic!("the caller was answered with something else");
+    };
+    assert_eq!(status.message, "test");
+    assert_eq!(
+        (disk.rows("op/"), disk.rows("inflight/"), disk.rows("done/")),
+        (0, 0, 1)
+    );
+}
+
 /// Catches: a retry that goes on after a newer writer holds the store (the old scheduler
 /// would write its stale rows over its successor's the moment a write landed, or keep the
 /// store busy for ever): the first refusal that says `Fenced` ends it. No write is tried

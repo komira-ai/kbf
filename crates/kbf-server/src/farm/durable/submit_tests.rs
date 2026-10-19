@@ -694,3 +694,69 @@ fn a_request_for_an_operation_the_scheduler_finished_is_refused_until_the_rows_g
     assert!(submit(&farm, 1).is_ok(), "the retry after the rows went");
     assert_eq!(unfinished(&farm), [OperationId(1)]);
 }
+
+/// Catches: a request that re-takes a finished operation the scheduler has already
+/// retired while its finish is still held. The scheduler drops a finished operation after
+/// `FINISHED_RETENTION` whether or not the finish was written, so `state()` no longer
+/// guards; the held finish does. The request is refused UNAVAILABLE and nothing is queued
+/// until the held finish goes, and then it queues afresh. Also covers every effect kind
+/// `finish_held` looks at, in this crate's own test binary.
+#[test]
+fn a_request_is_refused_while_the_finish_of_a_retired_operation_is_held() {
+    let store = LostAck::new();
+    let farm = farm_over(&store);
+    assert!(submit(&farm, 1).is_ok());
+    let refusal = kbf_types::ControlRecord::Refusal(kbf_types::RefusalRecord {
+        operation: OperationId(0),
+        reason: "no worker".to_owned(),
+    });
+    let at = |millis, event| kbf_sched::Input::new(kbf_types::FarmTime::from_millis(millis), event);
+    let effects = {
+        let mut state = farm.lock();
+        kbf_types::StateMachine::apply(
+            &mut state.sched,
+            at(0, kbf_sched::Event::Committed(refusal)),
+        )
+    };
+    assert_eq!(effects.len(), 1);
+    let past = u64::try_from(kbf_sched::FINISHED_RETENTION.as_millis()).expect("millis") + 1;
+    {
+        let mut state = farm.lock();
+        state.unwritten.push_back(
+            [
+                // An answer of another operation does not hold this one's rows.
+                kbf_types::Effect::Answer(kbf_types::Answer {
+                    operation: OperationId(7),
+                    lease: kbf_types::LeaseId::new(5, 1),
+                    waiters: Vec::new(),
+                    outcome: kbf_types::Outcome::Failed(kbf_types::Failure::Invalid),
+                    memory_runs: Vec::new(),
+                    farm_runs: Vec::new(),
+                }),
+                kbf_types::Effect::Waiting(kbf_types::Waiting {
+                    operation: OperationId(0),
+                    reason: None,
+                }),
+                effects[0].clone(),
+            ]
+            .into(),
+        );
+        kbf_types::StateMachine::apply(&mut state.sched, at(past, kbf_sched::Event::Tick));
+        assert!(state.sched.state(OperationId(0)).is_none(), "not retired");
+    }
+    assert_eq!((rows(&store, "op/"), rows(&store, "inflight/")), (1, 1));
+
+    let refused = submit(&farm, 1);
+
+    assert_eq!(refused.map(|_| ()).unwrap_err().code(), Code::Unavailable);
+    assert!(unfinished(&farm).is_empty(), "the operation came back");
+
+    farm.lock().unwritten.clear();
+    let gone = Txn::new()
+        .delete("op/0000000000000000", Cond::Any)
+        .delete("queue/0000000000000000", Cond::Any)
+        .delete("subject/0000000000000000", Cond::Any);
+    store.txn(gone).expect("store").expect("delete");
+    assert!(submit(&farm, 1).is_ok(), "the retry after the finish went");
+    assert_eq!(unfinished(&farm), [OperationId(1)]);
+}

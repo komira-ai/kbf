@@ -31,6 +31,10 @@ pub struct Hooked {
     pub panic_gets: AtomicUsize,
     /// How many of the next transactions fail with a store error.
     pub fail_txns: AtomicUsize,
+    /// How many of the next `scan_prefix` calls fail with a store error.
+    pub fail_scans: AtomicUsize,
+    /// How many of the next `scan_prefix` calls panic.
+    pub panic_scans: AtomicUsize,
 }
 
 impl Hooked {
@@ -47,6 +51,8 @@ impl Hooked {
             panic_gets: AtomicUsize::new(0),
             fail_reaps: AtomicUsize::new(0),
             fail_txns: AtomicUsize::new(0),
+            fail_scans: AtomicUsize::new(0),
+            panic_scans: AtomicUsize::new(0),
         })
     }
 
@@ -181,6 +187,19 @@ impl Store for Hooked {
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        if self
+            .fail_scans
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(StoreError::Failed("injected".to_owned()));
+        }
+        assert!(
+            self.panic_scans
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_err(),
+            "injected panic"
+        );
         let answer = self.fake.scan_prefix(prefix)?;
         self.fire(prefix);
         Ok(answer)
