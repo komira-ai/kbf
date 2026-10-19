@@ -175,3 +175,41 @@ fn a_huge_reported_boot_is_clamped() {
     assert_eq!(r.id, MemberId(2));
     assert_eq!(r.boot, kbf_server::members::MAX_SEED + 1);
 }
+
+/// Catches: a creating transaction that loses a race to the same instance's other
+/// registration (it claims the id between this one's read and its write) taken as a failure,
+/// or that overwrites the winner's claim. The rival gets member 5 at boot 4; the call that
+/// lost reads the known instance and takes the next boot, 5, of the same member.
+#[test]
+fn a_registration_that_loses_the_race_to_create_its_instance_reads_it_known() {
+    let s = Hooked::new();
+    let m = members(&s);
+    let rival = Members::new(
+        Arc::clone(&s.fake) as Arc<dyn Store>,
+        MembershipConfig::default(),
+    );
+    s.after_get("member-owner/", move || {
+        let _ = after(&rival, "mine", 5, 3);
+    });
+    let lost = after(&m, "mine", 5, 3);
+    assert_eq!((lost.id, lost.boot), (MemberId(5), 5));
+}
+
+/// Catches: a known instance's boot taken when the instance row changed between the read and
+/// the write (the check on its version fails): the call reads it again and still gets a
+/// boot above the last, and the counter is not spent twice for one registration.
+#[test]
+fn a_known_instance_that_changes_under_a_registration_is_read_again() {
+    let s = Hooked::new();
+    let m = members(&s);
+    assert_eq!(after(&m, "mine", 0, 0).boot, 1);
+    let fake = Arc::clone(&s.fake);
+    s.after_get("instance/mine", move || {
+        let same = 1_u64.to_be_bytes();
+        fake.txn(Txn::new().put("instance/mine", same, Cond::Any))
+            .expect("store")
+            .expect("commit");
+    });
+    let again = after(&m, "mine", 0, 0);
+    assert_eq!((again.id, again.boot), (MemberId(1), 2));
+}

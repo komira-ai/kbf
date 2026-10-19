@@ -161,7 +161,8 @@ impl Members {
         let lifted = self
             .store
             .txn(txn)?
-            .map_err(|_| MembershipError::Contended)?;
+            .ok()
+            .ok_or(MembershipError::Contended)?;
         let boot = lifted.counters.last().copied().unwrap_or(boot);
         tracing::info!(
             member = id.0,
