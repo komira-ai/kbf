@@ -26,7 +26,7 @@ const CRUN: &str = "/usr/bin/crun";
 pub(super) struct Fake {
     files: BTreeMap<PathBuf, (Stat, Vec<u8>)>,
     stat_errors: BTreeMap<PathBuf, io::ErrorKind>,
-    read_errors: BTreeMap<PathBuf, io::ErrorKind>,
+    pub(super) read_errors: BTreeMap<PathBuf, io::ErrorKind>,
     vars: BTreeMap<String, String>,
     euid: u32,
     nofile: u64,

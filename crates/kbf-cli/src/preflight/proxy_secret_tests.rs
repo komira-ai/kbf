@@ -113,6 +113,30 @@ fn a_secret_the_owner_cannot_read_is_refused_once() {
     }
 }
 
+/// Catches: a secret that passes the mode checks but fails its read (a root-owned 0600 file
+/// after a root-run renewal) reported as well as, or instead of, its size: the read error is
+/// the one problem, it says why, and no length is made up for bytes never read.
+///
+/// Mutants seen red: the read failure ignored (no problem at all); the size check run on an
+/// empty read (a second problem, "holds 0 bytes").
+#[test]
+fn a_secret_that_stats_but_cannot_be_read_is_refused_once_with_the_read_error() {
+    let mut fake = host(&[7; 32], 0o600);
+    fake.read_errors
+        .insert(PathBuf::from(SECRET), std::io::ErrorKind::PermissionDenied);
+    let report = check(&frontend(), &fake);
+    refused(
+        &report,
+        &[
+            "--proxy-auth-file",
+            SECRET,
+            "cannot be read",
+            "permission denied",
+        ],
+    );
+    assert!(!report.render("frontend").contains("bytes"), "{report:#?}");
+}
+
 #[test]
 fn a_secret_owned_by_another_user_is_refused() {
     refused(
