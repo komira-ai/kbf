@@ -35,6 +35,7 @@ use kbf_proxy::Proxy;
 use kbf_proxy::config::ProxyConfig;
 use kbf_proxy::control::NoUpdates;
 use rustix::io::{Errno, FdFlags, fcntl_getfd, fcntl_setfd};
+#[cfg(target_os = "linux")]
 use rustix::net::sockopt::socket_acceptconn;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -134,7 +135,7 @@ pub fn activated(
     // it) and nothing else here has opened it; it is only borrowed for the checks.
     let borrowed = unsafe { BorrowedFd::borrow_raw(first) };
     fcntl_getfd(borrowed).map_err(|_| usage("the descriptor is not open"))?;
-    if !socket_acceptconn(borrowed).unwrap_or(false) {
+    if !is_listening(borrowed) {
         return Err(usage("the descriptor is not a listening socket"));
     }
     // SAFETY: as above, and the checks show it is an open descriptor; this is its one owner.
@@ -146,6 +147,34 @@ pub fn activated(
     let owned = OwnedFd::from(listener);
     fcntl_setfd(owned.as_fd(), FdFlags::CLOEXEC)?;
     Ok(owned)
+}
+
+/// Whether `SO_ACCEPTCONN` says the socket is listening; a descriptor that is not a socket
+/// answers no.
+#[cfg(target_os = "linux")]
+fn is_listening(fd: BorrowedFd<'_>) -> bool {
+    socket_acceptconn(fd).unwrap_or(false)
+}
+
+/// The same question as on Linux. rustix has `socket_acceptconn` only on Linux-like targets,
+/// but macOS has `SO_ACCEPTCONN` at the libc level, so ask `getsockopt` directly.
+#[cfg(not(target_os = "linux"))]
+fn is_listening(fd: BorrowedFd<'_>) -> bool {
+    use std::os::fd::AsRawFd as _;
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` is open for the call; `value` and `len` are live and `len` is the size of
+    // `value`, which is all `getsockopt` writes to.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            (&raw mut value).cast(),
+            &raw mut len,
+        )
+    };
+    rc == 0 && value != 0
 }
 
 /// How long after the first stop signal the process may live. The proxy drains open streams
