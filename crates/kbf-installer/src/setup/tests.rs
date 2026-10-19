@@ -43,6 +43,7 @@ fn raw(mode: Mode) -> Raw {
         min_generation: None,
         commit: None,
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
+        kbf: super::kbf_settings::KbfFlags::default(),
         installer_config: INSTALLER_TOML.to_owned(),
     }
 }
@@ -248,11 +249,11 @@ const DAEMON_TOML: &str =
 # keys it writes; run setup again to change these.
 mode = \"daemon\"
 
-[frontend]
-url = \"https://farm.example:8443\"
-
 [enroll]
 token_file = \"/etc/kbf/enroll.token\"
+
+[frontend]
+url = \"https://farm.example:8443\"
 ";
 
 const FRONTEND_TOML: &str =
@@ -260,11 +261,11 @@ const FRONTEND_TOML: &str =
 # keys it writes; run setup again to change these.
 mode = \"frontend\"
 
-[tls]
-api-token-file = \"/etc/kbf/api-token\"
-
 [scheduler]
 state-store = \"postgres:///kbf?host=/run/postgresql\"
+
+[tls]
+api-token-file = \"/etc/kbf/api-token\"
 ";
 
 const DAEMON_INSTALLER_TOML: &str = "release_source = \"frontend\"
@@ -859,38 +860,35 @@ fn an_invalid_installer_toml_is_left_for_the_operator() {
 
 // kbf.toml
 
-/// Catches setup clobbering settings it cannot see: a kbf.toml that holds the mode's own
-/// flags is left alone when the keys setup writes already match, and is refused (exit 5,
-/// the differing keys named) when they do not; an invalid file is refused too. A file that
-/// holds only setup's keys is rewritten.
+/// Catches setup clobbering settings it cannot see, or leaving a key different from its flag:
+/// a kbf.toml that holds the mode's own flags is left byte for byte when the keys the flags
+/// give already match; when one differs it is rewritten with the flag's value, every other
+/// setting kept, and the result names the key and never the value.
 #[test]
-fn a_kbf_toml_with_other_settings_is_kept_or_refused_never_rewritten() {
+fn a_kbf_toml_with_other_settings_is_kept_when_it_matches_and_rewritten_by_key_when_not() {
     let with_flags = format!("{DAEMON_TOML}\n[listener]\nstorage-listen = \"0.0.0.0:7000\"\n");
     let mut exec = released(host(), Platform::Linux);
     put(&mut exec, KBF_TOML, 0o640, ROOT, &with_flags);
     let out = go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
     assert_eq!(text(&exec, KBF_TOML), with_flags);
-    assert!(out.contains("other settings"), "{out}");
+    assert!(!out.contains("kbf.toml changed"), "{out}");
 
     let mut changed = raw(Mode::Daemon);
     changed.frontend_url = Some("https://other.example".to_owned());
     let mut exec = released(host(), Platform::Linux);
     let other_mode = with_flags.replace("mode = \"daemon\"", "mode = \"storage\"");
     put(&mut exec, KBF_TOML, 0o640, ROOT, &other_mode);
-    let err = go(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err("refused");
-    assert!(
-        err.to_string().contains("mode should be \"daemon\""),
-        "{err}"
-    );
+    let out = go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
+    assert!(out.contains("changed in these keys: mode"), "{out}");
+    let now = text(&exec, KBF_TOML);
+    assert!(now.contains("mode = \"daemon\"") && now.contains("storage-listen = \"0.0.0.0:7000\""), "{now}");
+
     put(&mut exec, KBF_TOML, 0o640, ROOT, &with_flags);
-    let err = go(&FakeOs::linux(), &mut exec, &changed, APPLY).expect_err("refused");
-    assert_eq!(err.exit(), Exit::NeedsOperator);
-    assert!(
-        err.to_string()
-            .contains("[frontend] url should be \"https://other.example\""),
-        "{err}"
-    );
-    assert_eq!(text(&exec, KBF_TOML), with_flags);
+    let out = go_ok(&FakeOs::linux(), &mut exec, &changed);
+    assert!(out.contains("changed in these keys: [frontend] url;"), "{out}");
+    assert!(!out.contains("other.example"), "{out}");
+    let now = text(&exec, KBF_TOML);
+    assert!(now.contains("url = \"https://other.example\"") && now.contains("storage-listen"), "{now}");
 
     let mut exec = released(host(), Platform::Linux);
     put(&mut exec, KBF_TOML, 0o640, ROOT, "mode = [");
@@ -1087,6 +1085,7 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         min_generation: Some(0),
         commit: None,
         database: Some(DATABASE.to_owned()),
+        kbf: super::kbf_settings::KbfFlags::default(),
         installer_config: "/tmp/i.toml".to_owned(),
     };
     let mut exec = host();
@@ -1497,3 +1496,6 @@ fn a_view_forwards_reads_and_refuses_steps() {
 
 #[path = "more_tests.rs"]
 mod more;
+
+#[path = "kbf_settings_tests.rs"]
+mod kbf_settings_tests;

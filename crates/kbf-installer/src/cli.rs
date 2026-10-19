@@ -128,6 +128,10 @@ pub struct SetupArgs {
     /// Enable the units without starting them.
     #[arg(long)]
     pub no_start: bool,
+    /// The kbf.toml settings of a frontend or all-in-one host (listeners, certificates,
+    /// storage): each sets the kbf flag of its name.
+    #[command(flatten)]
+    pub kbf: crate::setup::kbf_settings::KbfFlags,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
     /// host root. The same flag, with the same meaning, as on `run`.
     #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]

@@ -1,0 +1,28 @@
+# Written by `kbf-installer setup`. The mode's other settings are added below the
+# keys it writes; run setup again to change these.
+mode = "frontend"
+
+[handover]
+admin-listen = "127.0.0.1:8984"
+
+[listener]
+api-listen = "127.0.0.1:8982"
+listen = "0.0.0.0:8980"
+worker-listen = "0.0.0.0:8981"
+
+[scheduler]
+state-store = "postgres:///kbf?host=/run/postgresql"
+
+[storage-client]
+storage = "https://storage.example:8983"
+storage-ca = "/etc/kbf/ca.pem"
+storage-client-cert = "/etc/kbf/worker.pem"
+storage-client-key = "/etc/kbf/worker.key"
+
+[tls]
+api-token-file = "/etc/kbf/api-token"
+reapi-tls-cert = "/etc/kbf/reapi.pem"
+reapi-tls-key = "/etc/kbf/reapi.key"
+worker-client-ca = "/etc/kbf/ca.pem"
+worker-tls-cert = "/etc/kbf/worker.pem"
+worker-tls-key = "/etc/kbf/worker.key"

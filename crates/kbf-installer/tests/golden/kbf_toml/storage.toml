@@ -1,0 +1,9 @@
+# Written by `kbf-installer setup`. The mode's other settings are added below the
+# keys it writes; run setup again to change these.
+mode = "storage"
+
+[enroll]
+token_file = "/etc/kbf/enroll.token"
+
+[frontend]
+url = "https://farm.example:8443"
