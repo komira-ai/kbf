@@ -913,6 +913,18 @@ pub fn s3_store(uri: &S3Uri, env: impl Fn(&str) -> Option<String>) -> Result<S3S
     Ok(S3Store::new(s3_config(uri, credentials))?)
 }
 
+/// The store `uri` names, signed with `credentials` that did not come from the
+/// environment (the key pair a frontend registered).
+///
+/// # Errors
+/// The configuration is refused.
+pub(crate) fn s3_store_keyed(
+    uri: &S3Uri,
+    credentials: Credentials,
+) -> Result<S3Store, ConfigError> {
+    Ok(S3Store::new(s3_config(uri, credentials))?)
+}
+
 /// The store configuration of `uri`.
 fn s3_config(uri: &S3Uri, credentials: Credentials) -> S3Config {
     S3Config {

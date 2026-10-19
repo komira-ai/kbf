@@ -169,7 +169,10 @@ fn server_files(n: &mut Needs, a: &Args) {
 }
 
 fn storage(n: &mut Needs, flags: &kbf_server::storage_node::StorageFlags) {
-    n.s3 = s3(&flags.server);
+    // A node that registers with a frontend may be given the key pair by it
+    // (`kbf_server::cold_apply`); the start says which variable is missing if the
+    // frontend has no store registered either.
+    n.s3 = s3(&flags.server) && flags.frontend.is_none();
     if let Some([cert, key, ca]) = &flags.tls {
         n.cert(
             ("--storage-tls-cert", cert),
