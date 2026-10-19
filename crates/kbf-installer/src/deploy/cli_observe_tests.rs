@@ -348,7 +348,7 @@ fn both_slots(a: &'static str, b: &'static str) -> (u16, Fake, Fake) {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = probe.local_addr().unwrap().port().saturating_sub(2);
         drop(probe);
-        if base < 1024 || base > 60_000 {
+        if !(1024..=60_000).contains(&base) {
             continue;
         }
         let (Ok(la), Ok(lb)) = (
