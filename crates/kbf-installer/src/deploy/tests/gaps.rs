@@ -373,3 +373,22 @@ fn a_reply_whose_head_is_not_text_is_refused() {
     let err = parse_reply(b"HTTP/1.1 200 OK\r\nX: \xff\xfe\r\n\r\nbody").unwrap_err();
     assert!(err.to_string().contains("headers are not text"), "{err}");
 }
+
+/// Proves the deploy lock is free again as soon as it is dropped, even when a child
+/// forked while it was held still has a copy of the descriptor: an `flock` belongs to
+/// the open file description, which that copy keeps alive, so a lock released by the
+/// close alone stays held until the child execs.
+/// Catches a `Lock` that relies on the close to release the `flock`.
+///
+/// Mutant seen red: no `Drop` for `Lock` (the second take finds it held).
+#[test]
+fn the_lock_is_free_at_once_when_a_forked_child_has_a_copy() {
+    let (_, dir) = crate::testkit::host_root("deploy-lock-forked");
+    let path = dir.join("run/lock");
+    let held = lock(&path).unwrap().expect("taken");
+    let child = kbf_testkit::forked::ForkedChild::before_exec();
+    drop(held);
+    let again = lock(&path).unwrap();
+    child.finish();
+    assert!(again.is_some(), "the lock outlived its drop");
+}
