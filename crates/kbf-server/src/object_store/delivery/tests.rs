@@ -117,6 +117,17 @@ fn a_snapshot_is_the_binding_the_connection_and_the_secret_at_one_generation() {
 struct Interleaved {
     inner: Arc<dyn Store>,
     hook: Box<dyn Fn() + Send + Sync>,
+    /// Reads fail while set.
+    down: Arc<AtomicBool>,
+}
+
+impl Interleaved {
+    fn up(&self) -> Result<(), StoreError> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(StoreError::Failed("injected".to_owned()));
+        }
+        Ok(())
+    }
 }
 
 impl Store for Interleaved {
@@ -124,9 +135,11 @@ impl Store for Interleaved {
         self.inner.apply_batch(batch)
     }
     fn get(&self, key: &str) -> Result<Option<Versioned>, StoreError> {
+        self.up()?;
         self.inner.get(key)
     }
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        self.up()?;
         let rows = self.inner.scan_prefix(prefix);
         (self.hook)();
         rows
@@ -177,6 +190,7 @@ fn raced(dir: &Path, writes: Option<u64>) -> (RegistrySource, Arc<AtomicU64>) {
     let store = Arc::new(Interleaved {
         inner,
         hook: Box::new(hook),
+        down: Arc::new(AtomicBool::new(false)),
     }) as Arc<dyn Store>;
     // Opening sweeps through the store too: the rotations start after it.
     armed.store(false, Ordering::SeqCst);
@@ -211,6 +225,28 @@ fn a_registry_that_never_holds_still_is_a_store_failure() {
     let err = source.snapshot().expect_err("it never settles");
     assert_eq!(err, SourceError::Store);
     assert_eq!(turns.load(Ordering::SeqCst), READINGS as u64);
+}
+
+// Catches a state store that fails read as a registration of generation 0: both the cheap
+// generation a heartbeat announces and the whole reading are `Store` errors, so a node is
+// told "cannot say" and retries, and never "nothing is registered".
+#[test]
+fn a_failing_state_store_is_an_error_not_an_empty_registration() {
+    let inner = as_store(&fake());
+    let dir = scratch("src-down").join("s");
+    let (registry, _) = source(&inner, &dir);
+    bound(&registry);
+    let down = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(Interleaved {
+        inner,
+        hook: Box::new(|| {}),
+        down: Arc::clone(&down),
+    }) as Arc<dyn Store>;
+    let (_, source) = source(&store, &dir);
+    assert_eq!(source.generation().expect("up"), 2);
+    down.store(true, Ordering::SeqCst);
+    assert_eq!(source.generation().expect_err("down"), SourceError::Store);
+    assert_eq!(source.snapshot().expect_err("down"), SourceError::Store);
 }
 
 // Catches a missing secret file read as a store failure (or as no registration): the node

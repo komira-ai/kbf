@@ -37,7 +37,7 @@ const SECRET: &str = "frontend-test-secret-key";
 //   the heartbeat that says generation 2 `ok`, the status shows one expected, one applied,
 //   converged, the node named by the address it registered and standing `active`.
 //
-// Mutants seen red: the API's acks left as `NoAcks` (the status never converges); the
+// Mutants seen red: the API's acks left as a source that knows no node, the wiring this replaced (the status lists no node and never converges); the
 // `ColdStore` service not added to the worker listener (the fetch is UNIMPLEMENTED);
 // `Membership` built without the delivery (every answer carries generation 0).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -147,6 +147,11 @@ async fn a_registered_store_reaches_a_storage_node_and_its_report_reaches_the_op
 
     let status = status_of(&operator).await;
     assert_eq!(status.generation, 2);
+    assert_eq!(
+        status.convergence.nodes.len(),
+        1,
+        "the status lists the node"
+    );
     assert!(!status.convergence.converged, "the node has not reported");
     assert_eq!(status.convergence.nodes[0].status, NodeStatus::Pending);
 
