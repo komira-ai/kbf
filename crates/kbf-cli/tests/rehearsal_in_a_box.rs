@@ -178,7 +178,6 @@ fn settings(
         ("KBF_DATA_DIR", at("data")),
         ("KBF_META_DIR", at("meta")),
         ("KBF_HOT_DIR", at("hot")),
-        ("KBF_STATE_DIR", at("state")),
         ("KBF_IMAGES", image.to_owned()),
     ])
 }
@@ -279,7 +278,17 @@ impl Farm {
         // in the temporary directory.
         let socket = farm._sockets.join("control.sock");
         let control = format!("--handover-socket={}", socket.display());
-        farm.launch(&dir, &root, "frontend", unit.replace(&[control]), None);
+        // The unit's state store is the host's Postgres and it has no control socket (kbf
+        // refuses the two together); the box has no Postgres, so the rehearsal gives the
+        // frontend a SQLite file and its socket.
+        let state = format!("--state-store=sqlite://{}/state/state.db", root.display());
+        farm.launch(
+            &dir,
+            &root,
+            "frontend",
+            unit.replace(&[state]).add(&[control]),
+            None,
+        );
         let line = farm.start_line(0, "kbf-frontend ");
         farm.reapi = field(&line, "reapi=").to_owned();
 

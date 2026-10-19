@@ -130,21 +130,11 @@ impl StatusReader for JsonFileStatus {
     }
 }
 
-/// The marker the package's postinst writes when the proxy itself has been upgraded and
-/// not restarted (FP section 10). Its path is not named by the design: the proxy state
-/// directory is assumed.
-pub struct RestartMarker {
-    path: PathBuf,
-}
-
-impl RestartMarker {
-    pub fn new(path: impl Into<PathBuf>) -> RestartMarker {
-        RestartMarker { path: path.into() }
-    }
-
-    pub fn is_set(&self) -> bool {
-        self.path.exists()
-    }
+/// Whether the running proxy is no longer the installed program (FP section 10): the
+/// package manager replaced the binary and nothing restarted the proxy. There is no marker
+/// file; [`crate::proxy::RunningBinary`] compares file identities.
+pub trait RestartPending: Send {
+    fn restart_pending(&self) -> bool;
 }
 
 /// One update's facts as the supervisor (U7) reports them.

@@ -78,6 +78,12 @@
 mod stages;
 mod yaml;
 
+mod jobs;
+pub use jobs::{
+    dispatch_inputs, job_env, job_environment, job_needs, job_outputs, job_permission_levels,
+    push_filters,
+};
+
 use yaml::{Node, Value};
 
 /// The keys GitHub reads at the top of a workflow file.

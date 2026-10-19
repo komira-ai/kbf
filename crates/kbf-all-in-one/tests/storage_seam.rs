@@ -6,7 +6,7 @@
 //! plane knowing the store only as the trait, and [`every_call_crosses_the_boundary`]
 //! shows the plane's calls arrive there.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -20,6 +20,7 @@ use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_server::LocalStore;
 use kbf_storage::{Answer, PutStream, ReadStream, Storage};
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas, Record, digest_of};
 use kbf_types::Digest;
 
@@ -130,15 +131,12 @@ fn plane() -> (LocalDataPlane, Arc<Calls>) {
 }
 
 struct Seam {
-    scratch: PathBuf,
+    scratch: TestDir,
 }
 
 impl Seam {
     fn new() -> Self {
-        let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-all-in-one-storage-seam")
-            .join(std::process::id().to_string());
-        std::fs::create_dir_all(&scratch).expect("scratch directory");
+        let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-seam");
         Self { scratch }
     }
 }
