@@ -22,7 +22,8 @@
 //! `POST` checks the request (409 and 422 cases), saves its `request_id`, writes a
 //! `frontend_update` order (a locator; the root half fetches, verifies and stages without
 //! flipping, FP section 2) and answers 202 with phase `accepted`. From then on the API
-//! reads `status.json` on every status read and on [`actor::Api::tick`]:
+//! reads `status.json` on every call that matters to it and on the actor's own tick
+//! ([`actor::ActorTiming::tick`]):
 //!
 //! - `state: fetching` is phase `fetching`;
 //! - `state: refused` for an order at or after ours is phase `failed` with the refusal
@@ -78,14 +79,28 @@
 //!   ports.
 //!
 //! U7b implements [`traits::Supervisor`] over the real children and the `confirm`
-//! order; U8b implements [`traits::OrderWriter`] over `orders/` and the counter,
-//! [`traits::Forwarder`] over the operator port, a hyper listener that builds
-//! `Request<Bytes>` (with a [`auth::PeerKey`] extension) and calls [`router::Router::call`],
-//! the timer that calls [`actor::Api::tick`], and the OIDC [`auth::Authorize`] (#1088).
+//! order; U8b implements [`traits::OrderWriter`] over `orders/` and the counter and the
+//! OIDC [`auth::Authorize`] (#1088).
+//!
+//! # How a listener hosts the API
+//!
+//! [`handler::Handler`] is the API behind plain values: a listener that has authenticated
+//! a caller calls [`handler::Handler::handle`] with `{method, path, body}` and gets
+//! `{status, headers, body}`. The router's own token check, rate limit and operator-port
+//! forwarding are not in that path (the listener authenticates, and sends the forwarded
+//! paths on itself). Two promises come with it:
+//!
+//! - **The actor never runs on the listener's runtime** ([`actor`]): it has a thread of
+//!   its own, ticks on it, and a caller waits for it at most [`actor::ActorTiming::deadline`]
+//!   (then 503), so a stalled `status.json` read or fleet read stalls no one else.
+//! - **The actor's death is not silent**: `on_death` of [`handler::Handler::start`] runs
+//!   once on the actor's thread when the actor dies of a crash or a panic, and the
+//!   listener passes what stops its process. Every request after that is a 503.
 
 pub mod actor;
 pub mod auth;
 pub mod core;
+pub mod handler;
 pub mod idempotency;
 pub mod model;
 pub mod refusal;
@@ -93,9 +108,13 @@ pub mod router;
 pub mod traits;
 
 #[cfg(test)]
+mod actor_tests;
+#[cfg(test)]
 mod auth_tests;
 #[cfg(test)]
 mod fakes;
+#[cfg(test)]
+mod handler_tests;
 #[cfg(test)]
 mod idempotency_tests;
 #[cfg(test)]

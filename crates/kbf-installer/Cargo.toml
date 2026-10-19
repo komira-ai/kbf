@@ -46,7 +46,7 @@ sha2.workspace = true
 subtle.workspace = true
 tar.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
 
