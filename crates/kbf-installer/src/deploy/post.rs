@@ -1,4 +1,4 @@
-//! Steps 5 and 7: wait for every node to confirm, then check the farm.
+//! Steps 5 and 6: wait for every node to confirm, then check the farm.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -170,7 +170,7 @@ impl Run<'_> {
         )
     }
 
-    /// Step 7. Every check runs and is recorded, even after one fails.
+    /// Step 6. Every check runs and is recorded, even after one fails.
     pub(super) fn post_checks(&mut self) -> Result<SmokeResult, Fail> {
         let commit = self.opts.commit.to_string();
         let mut good = true;

@@ -119,7 +119,8 @@ pub struct Options {
     /// Without it: read-only steps, then print the plan.
     pub apply: bool,
     pub node_timeout: Duration,
-    /// The whole frontend update: accepted to `done`. It includes the new frontend's bake.
+    /// The whole frontend step: the POST (and its retries) and the wait for `done`. It
+    /// includes the new frontend's bake.
     pub handover_timeout: Duration,
     pub smoke_timeout: Duration,
     pub allow_offline: Vec<String>,

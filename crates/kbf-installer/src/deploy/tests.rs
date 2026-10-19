@@ -1066,7 +1066,7 @@ fn a_node_confirmed_on_another_commit_is_not_confirmed() {
     assert_eq!((s.exit, s.nodes[0].state.as_str()), (1, "timed_out"));
 }
 
-// ---- step 7: post checks ---------------------------------------------------------------
+// ---- step 6: post checks ---------------------------------------------------------------
 
 /// Proves every post check runs after one fails, and any failure is exit 1.
 #[test]
