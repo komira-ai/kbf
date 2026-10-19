@@ -697,7 +697,9 @@ fn the_deny_list_applies_behind_the_proxy() {
 /// (it fails, rather than warn and go on with no list), and the failure carrying the proxy
 /// secret: the error names the flag, the list path and the line, nothing of the secret.
 ///
-/// Mutants seen red: the deny-list error dropped (`.ok()`); the secret appended to the message.
+/// Mutant seen red: the `DenyList::open` error dropped (`.and_then(|p| ...ok())`). The `?` on
+/// `certificate_entries` after it is reached only by a list that goes bad between the two
+/// reads; `tests/identity.rs` covers that call.
 #[test]
 fn a_deny_list_that_cannot_be_read_or_parsed_stops_a_proxied_start_without_the_secret() {
     let secret = file(&SECRET, 0o600);

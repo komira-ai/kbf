@@ -623,7 +623,9 @@ impl Args {
     ///
     /// # Errors
     /// The secret file or the `--worker-deny-list` file cannot be read, or the secret is
-    /// not one the proxy can present ([`ProxySecret::from_file`]).
+    /// not one the proxy can present ([`ProxySecret::from_file`]). A deny list that cannot be
+    /// read or parsed, at open or at the recount for the warning, stops the start (it is
+    /// never ignored); the error names the flag's path and line, never the secret.
     pub fn proxy(&self) -> Result<Option<Behind>, ConfigError> {
         let Some(path) = self.proxy_auth_file.as_deref() else {
             return Ok(None);
