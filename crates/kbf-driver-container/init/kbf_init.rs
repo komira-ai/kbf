@@ -23,6 +23,8 @@
 //!   in `crun`'s words, is written to it, and the exit code is 127 (not found) or 126
 //!   (anything else), as a shell answers; the driver reads the line back
 //!   (`crates/kbf-driver-container/src/program.rs`).
+//! - It is not dumpable, so the program (the same user) cannot reach its stdin through
+//!   `/proc/<pid>/fd`: the report is the init's alone.
 //! - It makes itself the subreaper of its descendants, so that run on a host, outside
 //!   a PID namespace, it reaps what its program orphans (the tests do that).
 //!
@@ -43,6 +45,7 @@ struct SigSet([u64; 16]);
 const SIG_SETMASK: i32 = 2;
 const SIGCHLD: i32 = 17;
 const WNOHANG: i32 = 1;
+const PR_SET_DUMPABLE: i32 = 4;
 const PR_SET_CHILD_SUBREAPER: i32 = 36;
 const ENOENT: i32 = 2;
 const ETXTBSY: i32 = 26;
@@ -87,6 +90,10 @@ fn main() {
         }
         pthread_sigmask(SIG_SETMASK, &set, std::ptr::null_mut());
         prctl(PR_SET_CHILD_SUBREAPER, 1u64);
+        // Not dumpable: another process of the same user, the action, cannot open this
+        // process's descriptors in /proc (the report file on stdin) or trace it. The
+        // program it starts is dumpable again, as every exec makes it.
+        prctl(PR_SET_DUMPABLE, 0u64);
     }
 
     let child = match start(&program, &arguments) {

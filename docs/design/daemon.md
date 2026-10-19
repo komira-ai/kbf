@@ -450,7 +450,9 @@ back; `crun delete --force` closes the lease. That is four `crun` processes.
   `crun`'s own words to its stdin (a file of the lease, `init-report`, which the
   driver opens and only the init holds; the program's stdin is `/dev/null`) and exits
   127 (not found) or 126 (anything else, `ETXTBSY` included), and the driver reads
-  that line where it reads `crun`'s log. So everything above about 127, 126 and the
+  that line where it reads `crun`'s log. The init is not dumpable (`PR_SET_DUMPABLE` 0; the action it execs is
+  dumpable again), so the action, the same user in the same pid namespace, cannot open the report
+  file through `/proc/1/fd/0` to forge a report, or trace the init. So everything above about 127, 126 and the
   `ETXTBSY` retry holds unchanged. Building the daemon needs the C library's static
   archive (`libc.a`).
 - **Namespaces:** pid, network (new, nothing configured: loopback only; `crun` brings

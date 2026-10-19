@@ -255,6 +255,38 @@ fn the_program_has_no_stdin_of_the_inits() {
     assert_eq!(ran.stdout, "", "the program read the init's stdin");
 }
 
+/// Catches the report file being reachable by the program, which runs as the same user:
+/// through `/proc/<init>/fd/0` it could write words of its own for the driver to read as
+/// the init's (a lookup failure it did not have, a farm failure it did not cause). A
+/// process that is not dumpable has its `/proc` entries closed to its own user; this
+/// opens the init's stdin, as the program could, and must be refused. (A superuser has
+/// the capability that opens it, so the check does not apply to one.)
+#[test]
+fn the_program_cannot_open_the_inits_stdin() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let dir = scratch("dumpable");
+    let link = dir.join("kbf-act");
+    let mut running = init(
+        &dir,
+        None,
+        "",
+        link.to_str().expect("utf-8"),
+        &["append", "ready", "x", ";", "sleep", "30"],
+    )
+    .spawn()
+    .expect("init");
+    wait_for(&dir.join("ready"));
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .open(format!("/proc/{}/fd/0", running.id()));
+    signal(&running, Signal::KILL);
+    running.wait().expect("wait");
+    let denied = opened.expect_err("the init's stdin was opened by its own user");
+    assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
 /// Catches no usage check: without `--` and a program the init exits 2 instead of
 /// running something.
 #[test]

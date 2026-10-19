@@ -177,6 +177,26 @@ async fn an_orphan_is_reaped_so_a_killed_group_is_gone() {
     cell.assert_clean(1);
 }
 
+/// Catches the init's report file being reachable by the action (same user, same pid
+/// namespace): through `/proc/1/fd/0` it could forge the words the driver reads as the
+/// init's. The init is not dumpable, so its `/proc` entries are closed to the action, and
+/// it cannot trace it either.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn the_action_cannot_reach_the_inits_report_file() {
+    let cell = Cell::new("reaper-report");
+    let script = r#"
+        (echo forged > /proc/1/fd/0) 2>/dev/null && echo "write opened" || echo "write denied"
+        (cat /proc/1/fd/0 > /dev/null) 2>/dev/null && echo "read opened" || echo "read denied"
+        exit 5
+    "#;
+    let result = cell.run(1, &sh(script)).await.expect("ran");
+    let out = cell.stdout(&result);
+    assert_eq!(result.exit_code, 5, "{out}\n{}", cell.stderr(&result));
+    assert_eq!(out, "write denied\nread denied\n");
+    cell.assert_clean(1);
+}
+
 /// Catches the init outliving or outwaiting the action: a lease ends with the action's
 /// status when the action exits while a background process of it still runs (the
 /// container's other processes die with its first, as they did when that was the
