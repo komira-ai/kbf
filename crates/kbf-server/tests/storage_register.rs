@@ -1607,9 +1607,22 @@ async fn a_started_node_reports_the_writes_it_has_open() {
         (maps.generation() > 0).then_some(())
     })
     .await;
-    let idle = until_node(&f, "none open", |n| n.open_writes == Some(0)).await;
+    // A fresh node registers CatchingUp and is promoted, in a new generation, by the beat
+    // after its rebuild: a write routed by the first map is refused as stale if the
+    // promotion lands between the header being read and the write arriving, and no write
+    // is then ever open. Wait for the node to be Active and to hold the frontend's map
+    // before reading the generation to route by.
+    let idle = until_node(&f, "none open, Active", |n| {
+        n.open_writes == Some(0) && n.state == MemberState::Active
+    })
+    .await;
     assert_eq!(idle.repair_debts, None, "no journal: cannot say");
     drop(client);
+    until("the node to hold the frontend's map", || {
+        let current = f.members.current_map().expect("read")?.generation();
+        (maps.generation() == current).then_some(())
+    })
+    .await;
 
     let blob = format!("held open by run {}", std::process::id()).into_bytes();
     let digest = kbf_segments::sha256(&blob);
