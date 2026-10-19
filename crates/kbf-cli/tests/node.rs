@@ -569,9 +569,15 @@ async fn a_node_enrolled_before_the_store_was_registered_asks_for_it_at_its_next
         .expect("the store was sent");
     assert_eq!(launches.seen(), [names::STORAGE]);
     assert_eq!(h.fake().enrolls().len(), 1, "no second enrollment");
-    assert!(h.node_json().contains("objects.example"), "kept in node.json");
+    assert!(
+        h.node_json().contains("objects.example"),
+        "kept in node.json"
+    );
     let asked = h.fake().renews().len();
-    assert_eq!(asked, 1, "one Renew, to ask; the renewer's first look is not due");
+    assert_eq!(
+        asked, 1,
+        "one Renew, to ask; the renewer's first look is not due"
+    );
 
     start_mode(&h, names::STORAGE, &launches)
         .await
@@ -580,6 +586,54 @@ async fn a_node_enrolled_before_the_store_was_registered_asks_for_it_at_its_next
         h.fake().renews().len(),
         asked,
         "a node that holds a cold store asks for nothing"
+    );
+}
+
+/// Catches a start that dies with the frontend's refusal instead of saying what is missing:
+/// a storage node holding no cold store whose frontend refuses the one `Renew` it sends at
+/// start still gets the plan error naming the cold store, exit 2, and starts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_cold_store_ask_leaves_the_plan_error() {
+    let h = Harness::new("node-cold-ask-refused");
+    h.ready("");
+    let launches = Arc::new(Launches::default());
+    start_mode(&h, names::STORAGE, &launches)
+        .await
+        .expect_err("no cold store yet");
+    h.fake().refuse_with(Some(RefusalReason::StoreUnavailable));
+    let failure = start_mode(&h, names::STORAGE, &launches)
+        .await
+        .expect_err("the frontend refused");
+    assert!(
+        matches!(&failure, Failure::Plan(m) if m.contains("cold store")),
+        "{failure:?}"
+    );
+    assert_eq!(failure.exit_code(), 2);
+    assert_eq!(h.fake().renews().len(), 1, "the second start asked once");
+    assert!(launches.seen().is_empty());
+}
+
+/// Catches a node with no storage role asking the frontend for a cold store at start: a
+/// daemon-only node holds none by design (the frontend sends it none), so a start that
+/// asked would send a `Renew` at every start of every daemon, and reach a frontend that is
+/// down for a node that has no use for the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_only_node_asks_for_no_cold_store_at_start() {
+    let h = Harness::new("node-daemon-no-cold-ask");
+    h.ready("");
+    // The fake sends no cold store until told to: the daemon holds none, as in life.
+    let launches = Arc::new(Launches::default());
+    for _ in 0..2 {
+        start_mode(&h, names::DAEMON, &launches)
+            .await
+            .expect("a daemon starts with no cold store");
+    }
+    assert_eq!(launches.seen(), [names::DAEMON, names::DAEMON]);
+    assert_eq!(h.fake().enrolls().len(), 1);
+    assert_eq!(
+        h.fake().renews().len(),
+        0,
+        "a daemon sends no Renew at start"
     );
 }
 

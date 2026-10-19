@@ -572,7 +572,9 @@ daemon-only node is sent none. `NodeConfig.generation` is 1 plus the registry's 
 so a node that renews after a store was registered, changed or taken back is sent the
 configuration again; a storage node that holds none asks once at its next start. A
 registry that cannot be read refuses the call (`StoreUnavailable`) before the token is
-spent. A storage node must send `advertise` (`host:port`) and no other node
+spent. The node uses the `cold_store` it is sent with its own process credentials, so the
+frontend decides which endpoint receives the node's signed requests: the same trust as the
+worker and CAS endpoints the frontend already sends in `NodeConfig`. A storage node must send `advertise` (`host:port`) and no other node
 may; the host may not be a frontend name, `localhost`, or a loopback, unspecified,
 link-local or multicast address. Set `node.advertise` in `kbf.toml` on a storage node.
 
