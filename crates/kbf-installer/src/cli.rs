@@ -253,6 +253,13 @@ pub struct MigrateArgs {
     /// The unprivileged user the old binaries' `--version --json` runs as.
     #[arg(long, default_value = "kbf-fetch")]
     pub fetch_user: String,
+    /// The kbf mode this host runs (`kbf --mode=...`). A `frontend` or `all-in-one` host also
+    /// crosses to Postgres: the schema step runs, and the `--state-store` of every `--unit` is
+    /// switched from its SQLite file to the host's Postgres, with no state copied. Postgres,
+    /// its `kbf` role and its `kbf` database must exist already. Without it no database step
+    /// is made.
+    #[arg(long, value_enum)]
+    pub mode: Option<Mode>,
 }
 
 #[derive(Args)]

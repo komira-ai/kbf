@@ -261,3 +261,139 @@ fn a_linked_or_writable_unit_is_refused() {
         "ExecStart=/usr/local/kbf/current/kbf\n"
     );
 }
+
+const PG: &str = "postgres:///kbf?host=/run/postgresql";
+
+/// A frontend unit as the kit renders it: the flags continue over lines, the state store is
+/// on a continuation line, and the comments above name the flag too.
+const FRONTEND: &str = "[Service]\n\
+# the state store is --state-store=sqlite:///var/lib/not/a/flag.db in this comment\n\
+ExecStart=/usr/local/kbf/current/kbf frontend \\\n    --listen=127.0.0.1:8980 \\\n    --state-store=sqlite:///var/lib/kbf-server/state/state.db \\\n    --handover-socket=/run/kbf-frontend/control.sock\n\
+Description=--state-store=sqlite:///var/lib/not/a/command.db\n";
+
+/// Catches a store switch that changes more than the store, or misses where the flag is: the
+/// value of `--state-store=sqlite://...` on a line the `Exec*=` setting continues is replaced
+/// and nothing else moves; a comment, another setting, a flag that is not a whole word and a
+/// store that is not SQLite are left as they are; the flag is found in quotes, twice, and in a
+/// launchd `<string>`; a second pass finds nothing to do.
+///
+/// Mutants seen red: continuation lines not followed (the flag of a kit unit is on one); the
+/// word-start check removed; `starts_with("sqlite://")` removed (a Postgres URL replaced).
+#[test]
+fn the_store_flag_is_switched_where_the_command_line_is_and_nowhere_else() {
+    let switched = switch_store_text(Kind::Systemd, FRONTEND, PG).expect("changes");
+    assert_eq!(
+        switched,
+        FRONTEND.replace(
+            "--state-store=sqlite:///var/lib/kbf-server/state/state.db",
+            &format!("--state-store={PG}")
+        )
+    );
+    assert_eq!(switch_store_text(Kind::Systemd, &switched, PG), None);
+
+    // Not a word, not SQLite, not a command line: each stays.
+    for same in [
+        "ExecStart=/bin/kbf x--state-store=sqlite:///a.db\n",
+        "ExecStart=/bin/kbf --state-store=file:///a\n",
+        "ExecStart=/bin/kbf --state-store=postgres://other/db\n",
+        "[Service]\nDescription=kbf --state-store=sqlite:///a.db\n",
+        "# ExecStart=/bin/kbf --state-store=sqlite:///a.db\n",
+        "ExecStart=/bin/kbf --state-store sqlite:///a.db\n",
+    ] {
+        assert_eq!(switch_store_text(Kind::Systemd, same, PG), None, "{same}");
+    }
+
+    // Two settings and a quoted word, and a last line with no newline.
+    let two = "ExecStartPre=/bin/kbf check --state-store=sqlite:///a.db\n\
+               ExecStart=/bin/kbf \"--state-store=sqlite:///a.db\" --x";
+    assert_eq!(
+        switch_store_text(Kind::Systemd, two, PG).expect("changes"),
+        format!(
+            "ExecStartPre=/bin/kbf check --state-store={PG}\n\
+             ExecStart=/bin/kbf \"--state-store={PG}\" --x"
+        )
+    );
+
+    let plist =
+        "<array>\n<string>--state-store=sqlite:///a.db</string>\n<string>--x</string>\n</array>\n";
+    assert_eq!(
+        switch_store_text(Kind::Launchd, plist, PG).expect("changes"),
+        format!("<array>\n<string>--state-store={PG}</string>\n<string>--x</string>\n</array>\n")
+    );
+}
+
+/// Catches a switch that loses the unit's original or reports the wrong thing: the first
+/// switch keeps the original byte for byte (also after the path was rewritten first, as the
+/// migration does), a second pass says `Already` and keeps that original, a unit with no
+/// store is `NotOurs`, a missing file is `Missing`, and `restore` puts the SQLite store back.
+///
+/// Mutants seen red: the backup written on every switch (the path-rewritten text replaces
+/// the original); `Already` reported as `NotOurs`.
+#[test]
+fn a_switched_unit_keeps_its_original_and_a_second_pass_finds_it_done() {
+    let d = dirs("store");
+    fs::write(d.root.join("units/kbf-frontend.service"), FRONTEND).expect("unit");
+    let u = unit("kbf-frontend.service");
+    assert_eq!(
+        rewrite(&rules(), &d.units, &d.backup, &u, NEW).expect("path"),
+        UnitOutcome::Rewritten
+    );
+    let go = || switch_store(&rules(), &d.units, &d.backup, &u, PG).expect("switch");
+    assert_eq!(go(), UnitOutcome::Rewritten);
+    let after = fs::read_to_string(d.root.join("units/kbf-frontend.service")).expect("unit");
+    assert!(after.contains(NEW) && after.contains(&format!("--state-store={PG} ")));
+    assert!(!after.contains("--state-store=sqlite:///var/lib/kbf-server"));
+    assert_eq!(go(), UnitOutcome::Already);
+    assert_eq!(
+        fs::read_to_string(d.root.join("backup/kbf-frontend.service")).expect("backup"),
+        FRONTEND
+    );
+    assert!(restore(&rules(), &d.units, &d.backup, &u).expect("restore"));
+    assert_eq!(
+        fs::read_to_string(d.root.join("units/kbf-frontend.service")).expect("unit"),
+        FRONTEND
+    );
+
+    fs::write(
+        d.root.join("units/kbf-daemon.service"),
+        "[Service]\nExecStart=/usr/local/kbf/current/kbf daemon\n",
+    )
+    .expect("unit");
+    for (name, want) in [
+        ("kbf-daemon.service", UnitOutcome::NotOurs),
+        ("absent.service", UnitOutcome::Missing),
+    ] {
+        let outcome = switch_store(&rules(), &d.units, &d.backup, &unit(name), PG).expect("pass");
+        assert_eq!(outcome, want, "{name}");
+    }
+    assert!(!d.root.join("backup/kbf-daemon.service").exists());
+}
+
+/// Catches a switch that loses the original of a unit the path pass left alone: a unit that
+/// never ran from the old link (`NotOurs` to `rewrite`) is first changed by the switch, which
+/// keeps that original itself.
+///
+/// Mutant seen red: the backup made from the new text instead of the original.
+#[test]
+fn a_unit_the_path_pass_left_alone_keeps_its_original_when_its_store_is_switched() {
+    let d = dirs("store-first");
+    let original = "[Service]\nExecStart=/opt/kbf/bin/kbf frontend --state-store=sqlite:///a.db\n";
+    fs::write(d.root.join("units/kbf-front.service"), original).expect("unit");
+    let u = unit("kbf-front.service");
+    assert_eq!(
+        rewrite(&rules(), &d.units, &d.backup, &u, NEW).expect("path"),
+        UnitOutcome::NotOurs
+    );
+    assert_eq!(
+        switch_store(&rules(), &d.units, &d.backup, &u, PG).expect("switch"),
+        UnitOutcome::Rewritten
+    );
+    assert_eq!(
+        fs::read_to_string(d.root.join("backup/kbf-front.service")).expect("backup"),
+        original
+    );
+    assert_eq!(
+        fs::read_to_string(d.root.join("units/kbf-front.service")).expect("unit"),
+        original.replace("sqlite:///a.db", PG)
+    );
+}

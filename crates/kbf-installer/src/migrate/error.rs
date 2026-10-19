@@ -52,6 +52,17 @@ pub enum MigrateError {
         "this host still has the old layout's state ({0}) and is not migrated: run `kbf-installer migrate --apply` first"
     )]
     Unmigrated(String),
+    /// A frontend or all-in-one host moves to Postgres, and Postgres, the `kbf` role or the
+    /// `kbf` database is not there to be asked. The migration creates none of them.
+    #[error(
+        "the state database cannot be asked ({0}): Postgres, its `kbf` role and its `kbf` database must exist before this runs; \
+         migrate creates none of them"
+    )]
+    NoStateDatabase(String),
+    /// The schema step was refused (a database ahead of this installer, a contract step, a
+    /// server that refused a migration).
+    #[error("the state database's schema step was refused: {0}")]
+    StateSchema(String),
     /// A rollback that would throw away what the installer did since.
     #[error("cannot roll back: {0}")]
     MovedOn(String),
@@ -78,7 +89,8 @@ impl MigrateError {
     /// How the verb ends (docs/design/kbf-installer.md section 2).
     pub fn exit(&self) -> Exit {
         match self {
-            MigrateError::NotRoot { .. } => Exit::Usage,
+            // A missing prerequisite: a root to be, a Postgres to have.
+            MigrateError::NotRoot { .. } | MigrateError::NoStateDatabase(_) => Exit::Usage,
             MigrateError::BadLink { .. }
             | MigrateError::Mislabeled { .. }
             | MigrateError::Probe { .. } => Exit::Refused,
@@ -93,6 +105,7 @@ impl MigrateError {
             | MigrateError::NoJournal => Exit::NeedsOperator,
             MigrateError::State(e) if e.needs_operator() => Exit::NeedsOperator,
             MigrateError::Corrupt { .. }
+            | MigrateError::StateSchema(_)
             | MigrateError::Tree(_)
             | MigrateError::State(_)
             | MigrateError::Io { .. } => Exit::Failed,

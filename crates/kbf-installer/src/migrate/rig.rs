@@ -299,6 +299,7 @@ impl Rig {
                 source: Source::Url,
                 min_generation: Some(17),
             },
+            state_store: None,
         }
     }
 

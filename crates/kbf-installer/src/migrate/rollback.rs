@@ -75,6 +75,19 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
         mode,
         "restore the units' originals, enable the old helper, start what ran before",
     );
+    if journal.state_store.is_some() {
+        // The migration moved the host's state store: the original unit names the SQLite
+        // file, which was never touched. Nothing is copied back from Postgres.
+        report.line(
+            mode,
+            "the units' --state-store names the SQLite file again, as the file was left",
+        );
+        report.warnings.push(
+            "what the farm wrote to Postgres since the migration is not copied back: the host \
+             starts on the SQLite state it had, and the Postgres database is left as it is"
+                .to_owned(),
+        );
+    }
     if mode == Mode::DryRun {
         return Ok(report);
     }

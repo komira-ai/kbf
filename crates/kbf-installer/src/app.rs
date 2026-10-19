@@ -294,6 +294,14 @@ fn user_found(
         })
 }
 
+/// The state store a host of `mode` crosses to Postgres: the frontend and all-in-one modes keep
+/// their state in the database, a node (or a host whose mode was not said) keeps none and has
+/// no database step.
+fn state_store_of(mode: Option<crate::cli::Mode>) -> Option<migrate::StateStore> {
+    mode.filter(|m| m.keeps_state_in_database())
+        .map(|_| migrate::StateStore::local())
+}
+
 /// `migrate`: the report to print, or why it stopped.
 fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String, Failure> {
     let rehearsal = root != Path::new("/");
@@ -317,6 +325,7 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
             },
             min_generation: args.min_generation,
         },
+        state_store: state_store_of(args.mode),
     };
     let mode = if apply {
         kbf_host::Mode::Apply

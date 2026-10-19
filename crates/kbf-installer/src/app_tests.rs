@@ -929,3 +929,43 @@ fn a_path_is_not_joined_to_a_relative_root() {
         PathBuf::from("/srv/root/etc/kbf/installer.toml")
     );
 }
+
+/// Catches the Postgres crossing tied to the wrong hosts: `--mode` parses into `migrate` (an
+/// unknown mode, and a `node` mode that does not exist, are usage errors), the frontend and
+/// all-in-one modes get the host's Postgres as their state store, and a node mode or no mode
+/// gets none, so a node host is never asked for a database.
+///
+/// Mutant seen red: the filter dropped (every mode crosses).
+#[test]
+fn only_the_frontend_and_all_in_one_modes_cross_to_postgres() {
+    use crate::cli::Mode;
+    for (name, mode) in [("frontend", Mode::Frontend), ("all-in-one", Mode::AllInOne)] {
+        let cli = parse(&["migrate", "--mode", name]);
+        let Verb::Migrate(args) = &cli.verb else {
+            panic!("not the migrate verb");
+        };
+        assert_eq!(args.mode, Some(mode));
+        let store = state_store_of(args.mode).expect("a database host");
+        assert_eq!(store.url, migrate::LOCAL_POSTGRES);
+    }
+    for (name, mode) in [
+        ("storage", Mode::Storage),
+        ("daemon", Mode::Daemon),
+        ("storage-and-daemon", Mode::StorageAndDaemon),
+    ] {
+        let cli = parse(&["migrate", "--mode", name]);
+        let Verb::Migrate(args) = &cli.verb else {
+            panic!("not the migrate verb");
+        };
+        assert_eq!(args.mode, Some(mode));
+        assert!(state_store_of(args.mode).is_none(), "{name} keeps no state");
+    }
+    assert!(state_store_of(None).is_none());
+    let Verb::Migrate(args) = &parse(&["migrate"]).verb else {
+        panic!("not the migrate verb");
+    };
+    assert_eq!(args.mode, None);
+    for bad in ["node", "backend"] {
+        assert!(Cli::try_parse_from(["kbf-installer", "migrate", "--mode", bad]).is_err());
+    }
+}

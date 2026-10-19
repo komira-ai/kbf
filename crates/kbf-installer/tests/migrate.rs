@@ -145,3 +145,45 @@ fn a_root_that_is_not_absolute_is_a_failure() {
         text(&out.stderr)
     );
 }
+
+/// Catches the Postgres crossing missing from the binary, or reaching a node: on a host of
+/// the old layout `--mode frontend` and `--mode all-in-one` are refused (a dry run and an
+/// apply) with exit 2, naming the state database and what must exist, before any program
+/// runs or any file is written; a node mode is not asked for a database at all and goes on to
+/// the next step (the old release's rules and version probe, where it stops here: the old
+/// binary cannot be run, so the exit is not 2). Needs no Postgres on the machine: the host's
+/// socket is not there, or has no `kbf` role for this user.
+///
+/// Mutants seen red: the refusal swallowed; the database asked after the version probe; the
+/// refusal ending with exit 1. On a machine with a Postgres on its socket the refusal is
+/// the server's (no `kbf` role for this user), still exit 2.
+#[test]
+fn the_database_modes_need_a_postgres_and_a_node_is_not_asked() {
+    let root = old_host("modes");
+    for mode in ["frontend", "all-in-one"] {
+        for apply in [&[][..], &["--apply"]] {
+            let mut args = vec!["--mode", mode];
+            args.extend_from_slice(apply);
+            let out = migrate(&root, &args);
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{args:?}: {}",
+                text(&out.stderr)
+            );
+            let said = text(&out.stderr);
+            assert!(
+                said.contains("state database") && said.contains("creates none of them"),
+                "{args:?}: {said}"
+            );
+        }
+    }
+    for mode in ["storage", "daemon", "storage-and-daemon"] {
+        let out = migrate(&root, &["--mode", mode]);
+        let said = text(&out.stderr);
+        assert!(!said.contains("state database"), "{mode}: {said}");
+        assert_ne!(out.status.code(), Some(2), "{mode}: {said}");
+    }
+    assert!(!root.join("var/lib/kbf-installer").exists());
+    assert!(!root.join("var/lib/kbf-deploy/MIGRATED").exists());
+}
