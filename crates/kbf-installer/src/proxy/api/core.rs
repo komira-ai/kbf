@@ -5,14 +5,18 @@
 //! One update lives in one of four places: nowhere, [`Active::Staging`] (the order is
 //! written and the installer is fetching, verifying and staging; the API owns these
 //! phases and no child exists), [`Active::Ended`] (it ended there: refused, found
-//! incompatible, or aborted), or with the [`Supervisor`] (it was handed over once the
-//! staged release passed the gate; the supervisor owns every later phase).
+//! incompatible, aborted, or not staged by its [`StagingDeadline`]), or with the
+//! [`Supervisor`] (it was handed over once the staged release passed the gate; the
+//! supervisor owns every later phase).
+//!
+//! A staging update is also in the request map, with the deadline it must stage by
+//! ([`Waiting`]). A restarted `Core` takes it up again with that deadline.
 
 use std::sync::Arc;
 
 use hyper::StatusCode;
 
-use super::idempotency::{Entry, Idempotency};
+use super::idempotency::{Entry, Idempotency, Waiting};
 use super::model::{
     RollbackBlocked, StatusBody, UpdateId, UpdateRequest, abortable, rollback_gate,
 };
@@ -136,18 +140,67 @@ pub enum Reply {
     },
 }
 
+/// How long an accepted update may wait for the installer to stage its release.
+///
+/// It counts from the moment the order is written, whatever the installer reports in
+/// between (a fetch under way does not move it). When it has run out and the release is
+/// not staged, the update ends `failed` at step `stage` with reason `timeout`, and a
+/// `revert` order drops what the installer may still stage.
+///
+/// It is below [`kbf_update::MAX_AGE_SECS`], the age at which the installer drops an
+/// order it has not acted on, so an update never waits on an order that is already gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StagingDeadline(u64);
+
+/// A staging deadline outside `1..=StagingDeadline::MAX_S`.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "a staging deadline is 1 to {} seconds, below the {} seconds an order lives in the spool; got {}",
+    StagingDeadline::MAX_S,
+    kbf_update::MAX_AGE_SECS,
+    .0
+)]
+pub struct DeadlineRange(pub u64);
+
+impl StagingDeadline {
+    /// Fifteen minutes.
+    pub const DEFAULT: StagingDeadline = StagingDeadline(900);
+    /// The longest deadline: one second less than the age an order is dropped at.
+    pub const MAX_S: u64 = kbf_update::MAX_AGE_SECS - 1;
+
+    pub fn from_secs(secs: u64) -> Result<StagingDeadline, DeadlineRange> {
+        if (1..=Self::MAX_S).contains(&secs) {
+            Ok(StagingDeadline(secs))
+        } else {
+            Err(DeadlineRange(secs))
+        }
+    }
+
+    pub fn secs(self) -> u64 {
+        self.0
+    }
+}
+
 /// What the API is told about its host.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     /// The confirm window the proxy asks for in its orders (clamped by the installer).
     pub window_s: u32,
+    /// How long an accepted update waits for its release to be staged.
+    pub staging_deadline: StagingDeadline,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { window_s: 900 }
+        Config {
+            window_s: 900,
+            staging_deadline: StagingDeadline::DEFAULT,
+        }
     }
 }
+
+/// The `failure.reason` of an update that was not staged in time.
+const STAGING_TIMEOUT: &str = "timeout";
 
 /// Everything a `Core` talks to.
 pub struct Parts {
@@ -172,6 +225,8 @@ struct Staging {
     order: Locator,
     phase: Phase,
     since: u64,
+    /// Unix seconds by which the release must be staged; fixed when the order is written.
+    deadline_s: u64,
 }
 
 struct Ended {
@@ -197,15 +252,68 @@ pub struct Core {
 
 impl Core {
     pub fn new(parts: Parts) -> Core {
-        Core {
+        let mut core = Core {
             parts,
             active: Active::None,
+        };
+        core.resume();
+        core
+    }
+
+    /// A process that starts with an update still waiting for the installer (its
+    /// predecessor wrote the order and died before the release was staged) goes on
+    /// waiting for it, with the deadline the predecessor set. An update the supervisor
+    /// already has was handed over before the death: it is no longer the API's.
+    ///
+    /// When the predecessor ended the update but could not save the end of the wait, the
+    /// entry still says waiting: the update is taken up, found past its deadline and
+    /// reverted a second time, for the same commit. The design has the root half check that
+    /// the commit a `revert` names is the staged one, so a second order finds nothing to
+    /// drop; the update ends `failed` as before.
+    fn resume(&mut self) {
+        let Some((entry, waiting)) = self.parts.requests.waiting() else {
+            return;
+        };
+        let (entry, waiting) = (entry.clone(), waiting.clone());
+        let handed_over = self
+            .parts
+            .supervisor
+            .status()
+            .update
+            .is_some_and(|u| u.update_id == entry.update_id);
+        if handed_over {
+            self.stop_waiting(&entry.request_id);
+            return;
         }
+        // No deadline is further off than the deadline is long: one that is (the clock
+        // went back between the two processes) counts from now.
+        let latest = self
+            .parts
+            .clock
+            .wall_s()
+            .saturating_add(self.parts.config.staging_deadline.secs());
+        self.active = Active::Staging(Box::new(Staging {
+            update_id: entry.update_id,
+            request_id: entry.request_id,
+            from: waiting.from,
+            to: entry.commit,
+            nodes: entry.nodes,
+            rollback: entry.rollback,
+            order: waiting.order,
+            phase: Phase::Accepted,
+            since: waiting.since_s,
+            deadline_s: waiting.deadline_s.min(latest),
+        }));
     }
 
     #[cfg(test)]
     pub(super) fn set_hook(&mut self, hook: Box<dyn CrashHook>) {
         self.parts.hook = hook;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_config(&mut self, config: Config) {
+        self.parts.config = config;
     }
 
     /// `POST /v1/update/frontend`.
@@ -330,6 +438,13 @@ impl Core {
             )
             .map_err(|e| ApiError::unavailable("order_unwritable", e.to_string()))?;
         let since = self.parts.clock.wall_s();
+        let deadline_s = since.saturating_add(self.parts.config.staging_deadline.secs());
+        let waiting = Waiting {
+            from: from.clone(),
+            order: order.clone(),
+            since_s: since,
+            deadline_s,
+        };
         self.active = Active::Staging(Box::new(Staging {
             update_id: entry.update_id.clone(),
             request_id: entry.request_id.clone(),
@@ -340,9 +455,10 @@ impl Core {
             order,
             phase: Phase::Accepted,
             since,
+            deadline_s,
         }));
-        if let Err(e) = self.parts.requests.mark_started(&entry.request_id) {
-            // The update is in motion; a retry finds it by its phase.
+        if let Err(e) = self.parts.requests.mark_started(&entry.request_id, waiting) {
+            // The update is in motion; a retry finds it by its phase, but a restart will not.
             tracing::warn!(error = %e, "the request map could not record the start");
         }
         Ok(Reply::Update {
@@ -377,7 +493,8 @@ impl Core {
     }
 
     /// Moves a staging update along by what `status.json` says now. An unreadable file
-    /// changes nothing.
+    /// changes nothing until the deadline, which does not wait for the file: a missing or
+    /// torn `status.json` is one of the ways an update is never staged.
     pub fn advance(&mut self) {
         let Some(mut st) = self.take_staging() else {
             return;
@@ -386,11 +503,17 @@ impl Core {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "status.json is unreadable; the update waits");
-                self.active = Active::Staging(st);
+                if self.parts.clock.wall_s() >= st.deadline_s {
+                    self.time_out(st);
+                } else {
+                    self.active = Active::Staging(st);
+                }
                 return;
             }
         };
-        if status.state == InstallerState::Refused && status.acked_order_id >= st.order.order_id {
+        if status.state == InstallerState::Refused
+            && status.refused_order_id == Some(st.order.order_id)
+        {
             let word = status.refusal_word().to_owned();
             let failure = Failure {
                 step: refusal::step(&word),
@@ -401,7 +524,9 @@ impl Core {
         }
         let facts = status.staged_facts().filter(|f| f.commit == st.to);
         match facts {
+            // A release found staged is used, however late: the work is done.
             Some(facts) => self.active = self.hand_over(st, &facts),
+            None if self.parts.clock.wall_s() >= st.deadline_s => self.time_out(st),
             None => {
                 let phase = if status.state == InstallerState::Fetching {
                     Phase::Fetching
@@ -444,7 +569,10 @@ impl Core {
                     order: st.order.clone(),
                 };
                 match self.parts.supervisor.start(&spec) {
-                    Ok(()) => return Active::Supervised,
+                    Ok(()) => {
+                        self.stop_waiting(&st.request_id);
+                        return Active::Supervised;
+                    }
                     Err(e) => Failure {
                         step: Step::Start,
                         reason: e.to_string(),
@@ -475,7 +603,35 @@ impl Core {
         }
     }
 
-    fn end(&self, st: &Staging, phase: Phase, failure: Option<Failure>) -> Active {
+    /// The installer did not stage the release by the deadline. A `revert` order drops
+    /// what it may still stage (an order it has not read, a fetch under way), so that the
+    /// next update is not refused for a staged release nobody tracks. When that order
+    /// cannot be written the update stays open and the next look tries again: ending it
+    /// would leave a staged release no call of this API can drop.
+    fn time_out(&mut self, st: Box<Staging>) {
+        let window_s = self.parts.config.window_s;
+        if let Err(e) = self.parts.orders.write(Verb::Revert, &st.to, window_s) {
+            tracing::warn!(error = %e, "the revert for a staging timeout could not be written");
+            self.active = Active::Staging(st);
+            return;
+        }
+        let failure = Failure {
+            step: Step::Stage,
+            reason: STAGING_TIMEOUT.to_owned(),
+        };
+        self.active = self.end(&st, Phase::Failed, Some(failure));
+    }
+
+    /// The update no longer waits for the installer (it was handed over or it ended): a
+    /// restarted process must not take it up again.
+    fn stop_waiting(&mut self, request_id: &str) {
+        if let Err(e) = self.parts.requests.finish_waiting(request_id) {
+            tracing::warn!(error = %e, "the request map could not record the end of the wait");
+        }
+    }
+
+    fn end(&mut self, st: &Staging, phase: Phase, failure: Option<Failure>) -> Active {
+        self.stop_waiting(&st.request_id);
         Active::Ended(Box::new(Ended {
             update_id: st.update_id.clone(),
             from: st.from.clone(),
