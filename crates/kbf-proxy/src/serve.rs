@@ -139,7 +139,22 @@ impl<U: UpdateHandler + 'static> Service<U> {
             // Readiness has one writer, the proxy's own poll of the active child (U4b-3).
             Route::Ready => text(StatusCode::SERVICE_UNAVAILABLE, "not ready"),
             Route::Metrics => {
-                let body = self.core.metrics.render(&self.core.slots, &self.core.queue);
+                let child = crate::child_metrics::fetch(
+                    &self.core,
+                    request.headers().get(header::AUTHORIZATION).cloned(),
+                )
+                .await;
+                let mut body = self
+                    .core
+                    .metrics
+                    .render(&self.core.slots, &self.core.queue)
+                    .into_bytes();
+                if let Some(child) = child {
+                    body.extend_from_slice(&child);
+                    if !body.ends_with(b"\n") {
+                        body.push(b'\n');
+                    }
+                }
                 let mut response = text(StatusCode::OK, body);
                 response.headers_mut().insert(
                     header::CONTENT_TYPE,

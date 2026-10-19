@@ -28,6 +28,8 @@
 pub mod auth;
 #[cfg(not(kbf_loom))]
 mod body;
+#[cfg(not(kbf_loom))]
+mod child_metrics;
 pub mod config;
 pub mod control;
 #[cfg(not(kbf_loom))]

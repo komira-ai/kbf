@@ -1,5 +1,8 @@
-//! The proxy's own counters, in Prometheus text. The proxy counts its own streams; a child's
-//! metrics are not forwarded (design note decision C11).
+//! The proxy's own counters, in Prometheus text. The proxy counts its own streams. `GET
+//! /metrics` is these series followed by the active child's operator `/metrics` body
+//! ([`crate::child_metrics`]; design note decision C11): the child's series are appended
+//! as they are, so a scrape of the public port sees both. When the child gives nothing the
+//! proxy's series are served alone and `kbf_proxy_child_metrics_failed_total` counts it.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +36,9 @@ pub(crate) struct Metrics {
     pub(crate) identity_refused: AtomicU64,
     /// Calls refused by the auth rules (a missing or wrong credential, a wrong role, a limit).
     pub(crate) auth_refused: AtomicU64,
+    /// Scrapes served without the child's series: no active child, a hold, an error, a body
+    /// over the cap or no answer in time.
+    pub(crate) child_metrics_failed: AtomicU64,
 }
 
 impl Metrics {
@@ -115,6 +121,12 @@ impl Metrics {
             "counter",
             "Calls refused for a missing or wrong credential, a wrong role or a limit.",
             get(&self.auth_refused),
+        );
+        line(
+            "kbf_proxy_child_metrics_failed_total",
+            "counter",
+            "Scrapes answered without the active child's series.",
+            get(&self.child_metrics_failed),
         );
         line(
             "kbf_proxy_hold_expired_total",

@@ -61,14 +61,15 @@ async fn call(client: &mut Client, path: &str) -> String {
 
 /// One cell of the matrix: a proxy in `mode` whose client presented `role` (a verified
 /// certificate, or none) and `bearer`, calling `path`. Also checks the child saw the call
-/// if and only if it was let through to a child path.
+/// if and only if it was let through to a child path (`/metrics` asks the child too).
 async fn cell(mode: Buck2Auth, role: Option<PeerRole>, bearer: Option<&str>, path: &str) -> String {
     let rig = Rig::start_secure(mode, Access::Plain(role.map(identity))).await;
     let mut client = rig.client().await;
     client.bearer = bearer.map(str::to_owned);
     let got = call(&mut client, path).await;
     let reached = rig.a.state.dispatches();
-    let expected = usize::from(got == "ok" && matches!(route_of(path), Route::Child(_)));
+    let expected =
+        usize::from(got == "ok" && matches!(route_of(path), Route::Child(_) | Route::Metrics));
     assert_eq!(
         reached, expected,
         "{path} {mode:?} {role:?} {bearer:?}: {got}"

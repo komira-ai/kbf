@@ -51,7 +51,7 @@ pub enum Route {
     Health,
     /// `/readyz`.
     Ready,
-    /// `/metrics`, served by the proxy about itself.
+    /// `/metrics`: the proxy's own series, then the active child's operator `/metrics` appended.
     Metrics,
     /// Not in the table: the proxy answers 404 (HTTP) or `UNIMPLEMENTED` (gRPC).
     Unknown,
