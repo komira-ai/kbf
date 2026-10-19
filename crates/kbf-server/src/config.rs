@@ -634,6 +634,17 @@ impl Args {
             .as_deref()
             .map(DenyList::open)
             .transpose()?;
+        if let Some(list) = &deny_list {
+            let inert = list.certificate_entries()?;
+            if inert > 0 {
+                tracing::warn!(
+                    entries = inert,
+                    "--worker-deny-list has serial or spki-sha256 entries, which never match \
+                     a call behind --proxy-auth-file (the proxy forwards a node id, not a \
+                     certificate): only node entries take effect"
+                );
+            }
+        }
         Ok(Some(Behind {
             secret: Arc::new(secret),
             deny_list,

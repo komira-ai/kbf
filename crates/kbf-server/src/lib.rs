@@ -113,6 +113,8 @@ pub mod replication;
 pub mod rollout;
 mod run_record;
 pub mod serve;
+#[cfg(test)]
+mod serve_remote_tests;
 pub mod stamp;
 mod start;
 mod start_exit;

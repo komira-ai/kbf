@@ -100,12 +100,17 @@ listener:
   `x-kbf-node-id` is refused `PERMISSION_DENIED`. A `Membership` registration
   or heartbeat has no certificate names behind the proxy: the one name is the proxied node
   id, so the host of its instance id and its address must be that name (up to ASCII case; an IP
-  address is refused). The proxied role must be `storage`. A `serial` or `spki-sha256` deny entry cannot name a proxied
-  caller, a `node` entry can: revoke by node name while behind the proxy, or have the
-  proxy refuse the certificate.
+  address is refused). The proxied role must be `storage`.
 
 What the flag does not do, and what the proxy must do:
 
+- **Deny-list entries by `serial` or `spki-sha256` do nothing behind the proxy.** The child
+  sees no certificate, only the node id and role the proxy forwarded, so only a `node`
+  entry in `--worker-deny-list` can name a proxied caller. To revoke a certificate, list
+  its node, or have the proxy refuse the certificate. A server started with
+  `--proxy-auth-file` and a deny list holding a `serial` or `spki-sha256` entry logs a
+  warning at start naming the count. (Enforcing them would need the proxy to forward a
+  verified serial and key in a new header; that is the proxy's work, not this flag's.)
 - The storage listener (`kbf storage`, and the in-process one of all-in-one) is not behind
   the proxy: it keeps its own mutual TLS and its own admission.
 - `--reapi-auth-policy mtls` finds no certificate on a proxied REAPI call and refuses every
