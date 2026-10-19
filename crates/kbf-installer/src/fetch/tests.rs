@@ -31,13 +31,23 @@ fn nowhere() -> ChildProgram {
 }
 
 fn pull(source: &Source, sha: &str, size: u64, replaced: u64) -> Result<Received, FetchError> {
+    pull_by(&nowhere(), source, sha, size, replaced)
+}
+
+fn pull_by(
+    child: &ChildProgram,
+    source: &Source,
+    sha: &str,
+    size: u64,
+    replaced: u64,
+) -> Result<Received, FetchError> {
     // One directory per call: the tests run side by side and a scratch directory is wiped when made.
     static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = scratch_dir(&format!("fetch-checks-{n}"));
     let mut out = File::create(dir.join("download")).expect("file");
     fetch_component(
-        &nowhere(),
+        child,
         source,
         limits(),
         &Component { sha256: sha, size },
@@ -369,6 +379,151 @@ fn the_child_is_this_program_as_the_fetch_user_or_a_typed_error() {
     let got = ChildProgram::of_this_program(Platform::MacOs);
     assert!(
         matches!(&got, Err(ProgramFault::User(UserFault::Missing(name))) if name == "_kbf-fetch"),
+        "{got:?}"
+    );
+}
+
+/// Who a child would run as, against who it may: a child that would be root, or in root's
+/// group, is refused, whether it is named so or is only what the process already is (a root
+/// helper with no fetch user named); the fetch user switched to from root is the one case that
+/// passes, and an unprivileged process starting a child as itself (a test) passes too.
+///
+/// Catches a child started with no user by a root helper (the parser of untrusted bytes would be
+/// root, with only the limits left), a named root, and root's group taken for harmless.
+///
+/// Mutants: `None` taken as "no switch, so fine"; the group left out of the check; the check
+/// made on `run_as` alone (a root process with none named passes).
+#[test]
+fn a_child_that_would_run_as_root_is_refused() {
+    let root = RunAs { uid: 0, gid: 0 };
+    let me = RunAs {
+        uid: 1000,
+        gid: 1000,
+    };
+    let refused = [
+        (None, root),
+        (Some(root), me),
+        (Some(root), root),
+        (Some(RunAs { uid: 0, gid: 5 }), me),
+        (Some(RunAs { uid: 5, gid: 0 }), me),
+        (Some(RunAs { uid: 5, gid: 0 }), root),
+    ];
+    for (run_as, own) in refused {
+        let got = pipe::refuse_root(run_as, own);
+        assert!(
+            matches!(got, Err(PipeFault::Root { .. })),
+            "{run_as:?} by {own:?}: {got:?}"
+        );
+    }
+    let fine = [
+        (Some(RunAs { uid: 5, gid: 5 }), root),
+        (Some(RunAs { uid: 5, gid: 5 }), me),
+        (Some(me), me),
+        (None, me),
+    ];
+    for (run_as, own) in fine {
+        let got = pipe::refuse_root(run_as, own);
+        assert!(got.is_ok(), "{run_as:?} by {own:?}: {got:?}");
+    }
+    let got = pipe::refuse_root(Some(RunAs { uid: 0, gid: 7 }), me);
+    assert!(
+        matches!(got, Err(PipeFault::Root { uid: 0, gid: 7 })),
+        "the refusal names the ids: {got:?}"
+    );
+    assert!(
+        got.unwrap_err().to_string().contains("uid 0, gid 7"),
+        "a person reads which ids"
+    );
+}
+
+/// The refusal comes before the node's key is read, not after: a root child is refused with its
+/// own words even when the identity files are not there, so the key never leaves its file for a
+/// child that is not going to start.
+///
+/// Catches the check placed after the identity is read and lent (the key would be read, and held
+/// in memory, on the way to a refusal), and a refusal worded as a missing file.
+///
+/// Mutant: the check removed from `fetch_component` (the error is then the missing file).
+#[test]
+fn a_root_child_is_refused_before_the_identity_is_read() {
+    let source = Source::Frontend(FrontendSource {
+        url: "https://front.example:9000".to_owned(),
+        ca_file: "/nonexistent/ca.pem".into(),
+        node_cert: "/nonexistent/cert.pem".into(),
+        node_key: "/nonexistent/key.pem".into(),
+    });
+    let child = ChildProgram {
+        program: PathBuf::from("/nonexistent/kbf-installer"),
+        run_as: Some(RunAs { uid: 0, gid: 0 }),
+    };
+    let got = pull_by(&child, &source, SHA, 10, 0);
+    assert!(
+        matches!(
+            got,
+            Err(FetchError::Pipe(PipeFault::Root { uid: 0, gid: 0 }))
+        ),
+        "{got:?}"
+    );
+    assert_eq!(got.unwrap_err().word(), "fetch");
+}
+
+/// `forbid_inspection` makes the process not dumpable, which is what takes `/proc/<pid>/fd` and
+/// `ptrace` from the user's other processes. (The real child is looked at from outside in
+/// `tests/fetch_e2e.rs`; this is the call itself.) The setting is put back afterwards, so the
+/// other tests of this process are what they were.
+///
+/// Catches a call that is not `PR_SET_DUMPABLE` with 0 (or not made at all).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_child_makes_itself_not_dumpable() {
+    let dumpable = || {
+        // SAFETY: PR_GET_DUMPABLE reads no memory.
+        unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }
+    };
+    let before = dumpable();
+    child::forbid_inspection();
+    let after = dumpable();
+    // SAFETY: PR_SET_DUMPABLE with a value this process had reads no memory.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, before, 0, 0, 0) };
+    assert_eq!(after, 0);
+    assert_eq!(dumpable(), before, "put back");
+}
+
+/// A description is asked for by the same child as a component, so the same rules come before a
+/// process or a file: a source that is not a plain https URL is refused, and a child that would be
+/// root is refused before the node's key is read (here the files are not there, and the refusal
+/// is still the root one).
+///
+/// Catches the description's call left out of either check (a host's key read and lent to a child
+/// that is not going to start, or a request to a source the settings would not have named).
+///
+/// Mutants: the `refuse_root` call removed from `describe_release` (the error is then the missing
+/// file); the `check_source` call removed (the error is then the child that cannot start).
+#[test]
+fn a_description_is_refused_for_the_same_reasons_before_anything_starts() {
+    use crate::testkit::A;
+    let commit = CommitId::new(A).expect("commit");
+    let platform = ReleasePlatform::LinuxX86_64;
+    let plain_http = Source::Url {
+        base: "http://mirror.example".to_owned(),
+        ca_file: None,
+    };
+    let got = describe_release(&nowhere(), &plain_http, limits(), &commit, platform);
+    assert!(matches!(got, Err(FetchError::Source(..))), "{got:?}");
+
+    let frontend = Source::Frontend(FrontendSource {
+        url: "https://front.example:9000".to_owned(),
+        ca_file: "/nonexistent/ca.pem".into(),
+        node_cert: "/nonexistent/cert.pem".into(),
+        node_key: "/nonexistent/key.pem".into(),
+    });
+    let root = ChildProgram {
+        program: PathBuf::from("/nonexistent/kbf-installer"),
+        run_as: Some(RunAs { uid: 0, gid: 0 }),
+    };
+    let got = describe_release(&root, &frontend, limits(), &commit, platform);
+    assert!(
+        matches!(got, Err(FetchError::Pipe(PipeFault::Root { uid: 0, gid: 0 }))),
         "{got:?}"
     );
 }

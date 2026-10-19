@@ -104,6 +104,26 @@ pub enum ChildFault {
     Out(io::Error),
 }
 
+/// Make this process unreadable to every other process of its user: not dumpable, so
+/// `/proc/<pid>/fd`, `environ` and `mem` are root's alone and `ptrace` is refused. The first
+/// thing `fetch-child` does (`main`), because the `exec` that started it made it dumpable again
+/// (a `prctl` before the `exec` does not last), and a process this user's earlier child left
+/// behind could otherwise open the lent identity through `/proc`. Linux only: macOS has no
+/// such setting, and its confinement of the child is weaker for it (not built, not run).
+///
+/// Panics (so the child ends, holding nothing) if the call fails; it fails only for an argument
+/// other than 0 and 1.
+#[cfg(target_os = "linux")]
+pub fn forbid_inspection() {
+    // SAFETY: prctl with these arguments reads no memory.
+    crate::run::check(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) })
+        .expect("PR_SET_DUMPABLE accepts 0");
+}
+
+/// There is no `PR_SET_DUMPABLE` here.
+#[cfg(not(target_os = "linux"))]
+pub fn forbid_inspection() {}
+
 /// The base URL as settings write it: `https://host[:port][/path]`, nothing else.
 fn plain_url(url: &str, with_path: bool) -> Result<String, ChildFault> {
     let bad = || ChildFault::Url(url.to_owned());

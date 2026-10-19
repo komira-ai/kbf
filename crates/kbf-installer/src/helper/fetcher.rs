@@ -53,6 +53,21 @@ pub enum FetchError {
 }
 
 /// Pulls and installs a release.
+///
+/// Both forms are required, so that no implementor (a decorator, a test double, a merge that
+/// adds one) can answer an activation in the form that checks none of the order's facts:
+///
+/// ```compile_fail,E0046
+/// use kbf_installer::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
+///
+/// struct OnlyFetch;
+///
+/// impl Fetcher for OnlyFetch {
+///     fn fetch(&self, _: &ReleaseLocator) -> Result<InstalledRelease, FetchError> {
+///         Err(FetchError::NotWired)
+///     }
+/// }
+/// ```
 pub trait Fetcher {
     /// Fetch, verify and install the release `rec` names into its directory under
     /// `releases/`. Never moves `current` or `previous`. This is the frontend's own update:
@@ -62,15 +77,14 @@ pub trait Fetcher {
 
     /// [`Fetcher::fetch`] for a node's `activate`, whose order also carries the facts the
     /// release must declare about itself (`expected`): a release that declares others is not
-    /// installed. A fetcher that does not check them leaves this to `fetch`; the cycle
-    /// compares what comes back with the order's claims before a link moves either way.
+    /// installed. The cycle compares what comes back with the order's claims before a link
+    /// moves either way, but a fetcher that ignores `expected` would install a release the
+    /// order never described, so an implementor says what it does with them.
     fn fetch_activation(
         &self,
         rec: &ReleaseLocator,
-        _expected: &Facts,
-    ) -> Result<InstalledRelease, FetchError> {
-        self.fetch(rec)
-    }
+        expected: &Facts,
+    ) -> Result<InstalledRelease, FetchError>;
 }
 
 /// The fetcher of a build that has none: every fetch is refused.
@@ -78,6 +92,14 @@ pub struct NotWired;
 
 impl Fetcher for NotWired {
     fn fetch(&self, _rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError> {
+        Err(FetchError::NotWired)
+    }
+
+    fn fetch_activation(
+        &self,
+        _rec: &ReleaseLocator,
+        _expected: &Facts,
+    ) -> Result<InstalledRelease, FetchError> {
         Err(FetchError::NotWired)
     }
 }

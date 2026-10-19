@@ -15,6 +15,12 @@ fn main() -> ExitCode {
     // `--version --json` is answered before the command line is parsed: it is not a verb's
     // flag (`--version` ends clap's parse by itself, and `--json` is the verbs' global flag).
     let args: Vec<_> = std::env::args_os().collect();
+    // The fetch child holds what its parent lent it (the node's key): before anything else, it
+    // is made unreadable to the other processes of its user. The parent starts it with the
+    // verb first.
+    if args.get(1).is_some_and(|a| a == "fetch-child") {
+        kbf_installer::fetch::child::forbid_inspection();
+    }
     if version::asked(&args) {
         print!("{}", version::line());
         return ExitCode::SUCCESS;

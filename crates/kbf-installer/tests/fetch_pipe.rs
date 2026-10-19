@@ -14,7 +14,7 @@ use kbf_installer::fetch::identity::Identity;
 use kbf_installer::fetch::pipe::{
     Caps, ChildSpec, LOG_BYTES, PipeFault, Received, receive, receive_up_to,
 };
-use kbf_installer::run::Confine;
+use kbf_installer::run::{Confine, RunAs};
 use sha2::{Digest, Sha256};
 
 const STUB: &str = env!("CARGO_BIN_EXE_kbf-fetch-stub");
@@ -435,4 +435,54 @@ fn undeclared_output_that_does_not_end_is_stalled() {
     let (got, out) = run_up_to(&["emit:abc", "sleep:600"], caps);
     assert!(matches!(got, Err(PipeFault::Stalled { got: 3, size: 3, .. })), "{got:?}");
     assert_eq!(out, b"abc");
+}
+
+// ----------------------------------------------------------------- a child that is root
+
+/// `receive` will not start a child as root, whatever its caller says: a spec that names root (or
+/// root's group) is refused as `Root` before any process exists, so the bytes of a source are
+/// never parsed by root.
+///
+/// Catches the pipe trusting its caller to have named the fetch user: the refusal is what keeps a
+/// root helper that built its `ChildSpec` badly (a failed user lookup turned into `None`, or a
+/// user table that says uid 0) from running the child as root with only the limits left.
+///
+/// Mutant: the `refuse_root` call removed from `receive` (the start then fails as a `Spawn`
+/// error, or, run as root, succeeds).
+#[test]
+fn a_child_named_as_root_is_not_started() {
+    let dir = scratch("root-child");
+    for (uid, gid) in [(0, 0), (0, 5), (5, 0)] {
+        let mut s = spec(&["emit:abc"]);
+        s.run_as = Some(RunAs { uid, gid });
+        let mut out = File::create(dir.join("download")).expect("file");
+        let got = receive(&s, &[], None, caps(3), &mut out);
+        assert!(
+            matches!(got, Err(PipeFault::Root { uid: u, gid: g }) if (u, g) == (uid, gid)),
+            "{uid}:{gid}: {got:?}"
+        );
+        assert_eq!(fs::read(dir.join("download")).expect("file"), b"");
+    }
+}
+
+/// The same refusal holds for output of no declared length (a description), since both are
+/// read by the one reader: root is refused before a process exists.
+///
+/// Catches the refusal placed in `receive` alone, which would leave the description's child to
+/// be started as root by a caller that named none.
+///
+/// Mutant: the `refuse_root` call moved out of the shared reader into `receive` (red).
+#[test]
+fn a_description_child_named_as_root_is_not_started() {
+    for (uid, gid) in [(0, 0), (0, 5), (5, 0)] {
+        let mut s = spec(&["emit:abc"]);
+        s.run_as = Some(RunAs { uid, gid });
+        let mut out = Vec::new();
+        let got = receive_up_to(&s, &[], None, caps(3), &mut out);
+        assert!(
+            matches!(got, Err(PipeFault::Root { uid: u, gid: g }) if (u, g) == (uid, gid)),
+            "{uid}:{gid}: {got:?}"
+        );
+        assert!(out.is_empty());
+    }
 }

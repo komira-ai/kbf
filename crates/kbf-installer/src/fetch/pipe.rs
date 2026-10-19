@@ -6,8 +6,12 @@
 //! environment, `/dev/null` for input, the working directory `/`, only descriptors 0, 1, 2 and
 //! (for the frontend source) the one lent identity, and the limits of [`Confine::FETCH`]; it
 //! dies with the parent (Linux) and it is the leader of a process group the parent kills at
-//! the end, so nothing it started outlives it.
+//! the end. A descendant that leaves the group (`setsid`) survives that kill, so the start of
+//! the next child, after its switch of user, kills every other process of the fetch user
+//! before anything is lent to it, and `fetch-child` makes itself unreadable to the user's
+//! other processes as its first act ([`super::child::forbid_inspection`]).
 //! Its exit status is never an input: the bytes are judged by their count and their hash.
+//! A child that would run as root is refused before it starts ([`PipeFault::Root`]).
 //!
 //! Both of its pipes are read with `poll` and non-blocking reads: a child that stalls on one
 //! cannot hold the other, nor the parent past the caps. What it writes to standard error is
@@ -24,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
+use super::user::runs_as_root;
 use crate::run::{
     Confine, Inherited, READ_GRACE, RunAs, before_exec_confined, capture, kill_group, needs_switch,
 };
@@ -40,7 +45,9 @@ pub struct ChildSpec {
     pub program: PathBuf,
     /// The arguments before the fixed flags (`fetch-child` on a host).
     pub args: Vec<OsString>,
-    /// Who it runs as. `None` is for a test; a host always names the fetch user.
+    /// Who it runs as. `None` is for a test (the child is then whoever the caller is); a host
+    /// always names the fetch user. [`receive`] and [`receive_up_to`] refuse root here, named or
+    /// inherited.
     pub run_as: Option<RunAs>,
     pub confine: Confine,
 }
@@ -69,6 +76,11 @@ pub struct Received {
 /// Why the read ended without the declared bytes.
 #[derive(Debug, thiserror::Error)]
 pub enum PipeFault {
+    #[error(
+        "the fetch child would run as uid {uid}, gid {gid}: untrusted bytes are never handled \
+         as root (name the fetch user)"
+    )]
+    Root { uid: u32, gid: u32 },
     #[error("cannot start the fetch child: {0}")]
     Spawn(io::Error),
     #[error("cannot read the fetch child's output: {0}")]
@@ -89,6 +101,29 @@ pub enum PipeFault {
     },
     #[error("the fetch took more than {} s; the child was killed", .after.as_secs())]
     TimedOut { after: Duration },
+}
+
+/// The ids this process runs as: those a child started without a switch of user would have.
+pub(crate) fn own_ids() -> RunAs {
+    RunAs {
+        uid: rustix::process::geteuid().as_raw(),
+        gid: rustix::process::getegid().as_raw(),
+    }
+}
+
+/// Refuse a child that would run as root (or in root's group): the one that parses what a
+/// source sends must never be, whatever the caller built. It runs as `run_as` when that is
+/// named, else as the process that starts it (`own`), so a root helper that names no user, or
+/// names root, is refused here and not left to each caller to remember.
+pub(crate) fn refuse_root(run_as: Option<RunAs>, own: RunAs) -> Result<(), PipeFault> {
+    let child = run_as.unwrap_or(own);
+    if runs_as_root(child.uid, child.gid) {
+        return Err(PipeFault::Root {
+            uid: child.uid,
+            gid: child.gid,
+        });
+    }
+    Ok(())
 }
 
 fn log_suffix(log: &str) -> String {
@@ -263,6 +298,7 @@ fn drain(
     length: Length,
     out: &mut impl Write,
 ) -> Result<Received, PipeFault> {
+    refuse_root(spec.run_as, own_ids())?;
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)

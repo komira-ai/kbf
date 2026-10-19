@@ -111,7 +111,11 @@ pub struct Component<'a> {
 pub struct ChildProgram {
     /// The installer's own binary (an absolute path).
     pub program: PathBuf,
-    /// The fetch user. `None` is for a test that cannot switch user; a host always names it.
+    /// The fetch user, whom the child is switched to and whose other processes are killed at
+    /// each start, so it must be an account that runs nothing else (`kbf-fetch`: a system user
+    /// that owns nothing). `None` is for a test that cannot switch user (the child is then
+    /// whoever the caller is); a host always names it. A child that would be root, named or
+    /// not, is refused ([`pipe::PipeFault::Root`]).
     pub run_as: Option<RunAs>,
 }
 
@@ -341,6 +345,9 @@ pub fn fetch_component(
         });
     }
     check_source(source)?;
+    // Before the room is measured and the identity read: no key is read for a child that
+    // would be root. (`receive` asks again; this is the earlier place.)
+    pipe::refuse_root(child.run_as, pipe::own_ids())?;
     ensure_room(room.0, room_needed(component.size, room.1))?;
     let lent = lend_identity(source)?;
     let flags = child_flags(source, component, lent.as_ref());
@@ -384,6 +391,8 @@ pub fn describe_release(
     platform: ReleasePlatform,
 ) -> Result<Vec<Described>, FetchError> {
     check_source(source)?;
+    // Before the identity is read: no key is read for a child that would be root.
+    pipe::refuse_root(child.run_as, pipe::own_ids())?;
     let lent = lend_identity(source)?;
     let flags = describe_flags(source, commit, platform, lent.as_ref());
     let caps = Caps {

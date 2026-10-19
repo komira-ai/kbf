@@ -688,6 +688,83 @@ fn a_source_that_stalls_is_cut_off() {
     assert!(took < Duration::from_secs(20), "{took:?}");
 }
 
+/// The real child cannot be looked into by another process of its user: `/proc/<pid>/fd` of the
+/// running child is refused to this test (same user, no privilege). A process a compromised child
+/// left behind outside its process group is such a process, and the child of the next fetch holds
+/// the renewed key on its descriptor 4: readable through `/proc` unless the child has made itself
+/// non-dumpable. (Root reads any process, so the test says so and stops there when run as root.)
+///
+/// Catches a child that leaves itself dumpable after its `exec`, which a `prctl` before the exec
+/// cannot prevent (the exec makes it dumpable again).
+///
+/// Mutant: the `forbid_inspection` call removed from `main`.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_fetch_child_cannot_be_looked_into_by_its_users_other_processes() {
+    use std::process::{Command, Stdio};
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped: root can look into every process, so the check proves nothing");
+        return;
+    }
+    let (pki, leaf) = pki_and_server();
+    let bytes = body(10_000);
+    let server = Https::start(
+        &leaf,
+        Plan::Stall {
+            declared: 10_000,
+            sent: 3_000,
+        },
+    );
+    let rig = Rig::new("url-dumpable");
+    let ca = rig.write("ca.pem", &pki.ca_pem());
+    let mut command = Command::new(BIN);
+    command
+        .args(["fetch-child", "--kind", "url", "--url", &server.url()])
+        .args(["--sha256", &sha(&bytes), "--limit", "10001", "--ca-file"])
+        .arg(&ca)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // The child refuses to run holding a descriptor it was not lent, and other tests of this
+    // binary leave one open on purpose while they run. The parent's start marks them all
+    // close-on-exec; so does this one (best effort: before Linux 5.11 the call is not there).
+    // SAFETY: the closure makes one system call, on numbers, between fork and exec.
+    unsafe {
+        use std::os::unix::process::CommandExt as _;
+        command.pre_exec(|| {
+            let _ = libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 4_u32);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("the child starts");
+    // The server was asked for the file: the child is past its start-up and is waiting for more.
+    let until = Instant::now() + Duration::from_secs(60);
+    let mut ended = None;
+    while server.hits().is_empty() && Instant::now() < until {
+        ended = child.try_wait().expect("the child can be waited for");
+        if ended.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let seen = std::fs::read_link(format!("/proc/{}/fd/0", child.id()));
+    let _ = child.kill();
+    let mut said = String::new();
+    let _ = child
+        .stderr
+        .take()
+        .expect("standard error is piped")
+        .read_to_string(&mut said);
+    let _ = child.wait();
+    assert!(
+        !server.hits().is_empty(),
+        "the child never asked the server (ended: {ended:?}); it said: {said}"
+    );
+    let err = seen.expect_err("another process of the user must not be able to look into it");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+}
+
 /// A server whose certificate the client's roots do not vouch for is not talked to: the
 /// transport is authenticated even though the bytes are trusted by verification.
 ///
