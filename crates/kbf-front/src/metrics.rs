@@ -313,7 +313,7 @@ impl Drop for Request<'_> {
 }
 
 /// The metadata commands the cache commits, as the `command` label names them.
-pub const COMMANDS: [&str; 15] = [
+pub const COMMANDS: [&str; 19] = [
     "tick",
     "alloc_epoch",
     "put_blob",
@@ -329,6 +329,10 @@ pub const COMMANDS: [&str; 15] = [
     "object_flushed",
     "flush_conflict",
     "evict_objects",
+    "set_writer",
+    "adopt_segment",
+    "rebuild_progress",
+    "rebuild_done",
 ];
 
 /// The index into [`COMMANDS`] of `command`'s label.
@@ -350,6 +354,10 @@ pub const fn command_label(command: &Command) -> usize {
         Command::ObjectFlushed { .. } => 12,
         Command::FlushConflict { .. } => 13,
         Command::EvictObjects { .. } => 14,
+        Command::SetWriter(_) => 15,
+        Command::AdoptSegment { .. } => 16,
+        Command::RebuildProgress { .. } => 17,
+        Command::RebuildDone => 18,
     }
 }
 
@@ -418,16 +426,31 @@ pub struct CacheMetrics {
     pub sched_queued: Level,
     /// Leases granted or running, as of the last scheduler input.
     pub sched_leases: Level,
-    /// Callers of a frontend that handed its work to a successor and were told UNAVAILABLE
-    /// because the state store held no trace of their operation
-    /// (`kbf_frontend_relay_lost_total`).
-    pub frontend_relay_lost: Counter,
+    /// Operations a frontend that handed its work to a successor follows, whose callers
+    /// still wait, and of which the state store held no trace at the last looks
+    /// (`kbf_frontend_relay_untraced`). They are not ended: each waits until the
+    /// operation shows up in the store, its caller cancels, or the process stops.
+    pub frontend_relay_untraced: Level,
+    /// Execute and WaitExecution calls a frontend that handed its roles over forwarded to
+    /// its successor (`kbf_handover_relayed_total`).
+    pub handover_relayed: Counter,
+    /// Relayed calls open now: each keeps the frontend alive until its action ends
+    /// (`kbf_handover_relays_open`).
+    pub handover_relays_open: Gauge,
     /// Write-tier calls queued on or running on the blocking pool.
     pub tier_in_flight: Gauge,
     /// The wait of one write-tier call for a blocking-pool thread.
     pub tier_wait: Histogram,
     /// One write-tier call, from its hand-over to the blocking pool to its answer.
     pub tier_call: Histogram,
+    /// Block files the write tier holds open for writing, as of the last write-pool
+    /// step (`kbf_storage_open_write_fds`).
+    pub open_write_fds: Level,
+    /// Blobs waiting for a write-pool writer (`kbf_storage_write_pool_queue`).
+    pub write_pool_queue: Gauge,
+    /// Blobs the full write-pool queue sent straight to the object store, or that the
+    /// tier did not take (`kbf_storage_write_pool_direct_total`).
+    pub write_pool_direct: Counter,
     /// Directories the input check took from the decoded-directory cache, touching the
     /// blob but reading nothing.
     pub input_dirs_cached: Counter,
@@ -469,10 +492,15 @@ impl Default for CacheMetrics {
             sched_lock_wait: Histogram::new(Unit::Seconds),
             sched_queued: Level::default(),
             sched_leases: Level::default(),
-            frontend_relay_lost: Counter::default(),
+            frontend_relay_untraced: Level::default(),
+            handover_relayed: Counter::default(),
+            handover_relays_open: Gauge::default(),
             tier_in_flight: Gauge::default(),
             tier_wait: Histogram::new(Unit::Seconds),
             tier_call: Histogram::new(Unit::Seconds),
+            open_write_fds: Level::default(),
+            write_pool_queue: Gauge::default(),
+            write_pool_direct: Counter::default(),
             input_dirs_cached: Counter::default(),
             input_dirs_skipped: Counter::default(),
             input_dirs_joined: Counter::default(),
@@ -646,16 +674,43 @@ impl CacheMetrics {
             "Leases granted or running, as of the last scheduler input",
             self.sched_leases.get(),
         );
+        out.gauge(
+            "kbf_frontend_relay_untraced",
+            "Operations a frontend that handed its work over follows that the state store \
+             held no trace of at the last looks (their callers keep waiting)",
+            self.frontend_relay_untraced.get(),
+        );
         out.counter(
-            "kbf_frontend_relay_lost_total",
-            "Callers of a frontend that handed its work over, told UNAVAILABLE because the \
-             state store held no trace of their operation",
-            self.frontend_relay_lost.get(),
+            "kbf_handover_relayed_total",
+            "Execute and WaitExecution calls forwarded to the successor of a frontend that \
+             handed its roles over",
+            self.handover_relayed.get(),
+        );
+        out.gauge(
+            "kbf_handover_relays_open",
+            "Relayed Execute and WaitExecution calls open now",
+            self.handover_relays_open.get(),
         );
         out.gauge(
             "kbf_tier_in_flight",
             "Write-tier calls queued on or running on the blocking pool",
             self.tier_in_flight.get(),
+        );
+        out.gauge(
+            "kbf_storage_open_write_fds",
+            "Block files the write tier holds open for writing, as of the last write-pool step",
+            self.open_write_fds.get(),
+        );
+        out.gauge(
+            "kbf_storage_write_pool_queue",
+            "Blobs waiting for a write-pool writer",
+            self.write_pool_queue.get(),
+        );
+        out.counter(
+            "kbf_storage_write_pool_direct_total",
+            "Blobs the write pool sent straight to the object store: its queue was full, or \
+             the tier did not take them",
+            self.write_pool_direct.get(),
         );
         let name = "kbf_meta_commit_seconds";
         out.head(

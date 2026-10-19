@@ -1,7 +1,8 @@
 //! The one table of modes: their names and what each runs.
 //!
 //! Every place in this crate that spells a mode reads it from here: the clap commands,
-//! the dispatch, the help and the tests. The names follow the arch-v2 design; renaming
+//! the dispatch, the help and the tests. A mode is named by `--mode`; its name is also the
+//! hidden alias word of the old command lines. The names follow the arch-v2 design; renaming
 //! a mode is changing its constant.
 
 /// The frontend (the REAPI front end).
@@ -15,13 +16,21 @@ pub const STORAGE_AND_DAEMON: &str = "storage-and-daemon";
 /// Frontend, storage and build node in one process.
 pub const ALL_IN_ONE: &str = "all-in-one";
 
+/// Whether `name` is a mode that can read `kbf.toml` and enroll its host: the storage node,
+/// the build node and the two in one process. The frontend and all-in-one take their
+/// files as flags.
+#[must_use]
+pub fn is_registered(name: &str) -> bool {
+    matches!(name, STORAGE | DAEMON | STORAGE_AND_DAEMON)
+}
+
 /// What a mode runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entry {
     /// The worker daemon: `kbf_node::run`, the flags of `kbf-daemon`.
     Daemon,
     /// The server and the daemon in one process: `kbf_all_in_one::run`, the flags of
-    /// `kbf-all-in-one`.
+    /// `kbf-server` and of `kbf-daemon`.
     AllInOne,
     /// The storage node: `kbf_server::storage_node::run`, `kbf-server`'s store, write and
     /// log flags and its own listener flags.

@@ -868,15 +868,18 @@ fn the_key_is_in_no_error() {
 /// would start it (the test harness may hand its own children descriptors, which the child
 /// rightly refuses).
 fn child_command(args: &[&str]) -> std::process::Command {
-    use std::os::unix::process::CommandExt as _;
     let mut command = std::process::Command::new(BIN);
     command.arg("fetch-child").args(args).env_clear();
-    // SAFETY: the closure runs between fork and exec and makes one system call.
-    unsafe {
-        command.pre_exec(|| {
-            libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32);
-            Ok(())
-        });
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: the closure runs between fork and exec and makes one system call.
+        unsafe {
+            command.pre_exec(|| {
+                libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32);
+                Ok(())
+            });
+        }
     }
     command
 }
@@ -1016,4 +1019,57 @@ fn an_unreachable_source_is_one_line_on_standard_error() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(err.trim().lines().count(), 1, "{err}");
     assert!(err.contains("source unreachable"), "{err}");
+}
+
+/// A proxy named in the environment is not used: the url source goes straight to the server.
+///
+/// Rule: "No proxy environment" (the parent starts the child with an empty environment; the child
+/// must not depend on that). A proxy would see the request path and could answer for the mirror.
+///
+/// Mutant seen red: `.proxy(None)` removed from the ureq agent (the child then connects to the
+/// listener named by `HTTPS_PROXY` and the fetch fails).
+#[test]
+fn a_proxy_in_the_environment_is_not_used() {
+    let (pki, leaf) = pki_and_server();
+    let bytes = body(1000);
+    let server = Https::start(&leaf, Plan::Body(bytes.clone()));
+    let proxy = TcpListener::bind("127.0.0.1:0").expect("bind");
+    proxy.set_nonblocking(true).expect("nonblocking");
+    let proxy_url = format!(
+        "http://127.0.0.1:{}",
+        proxy.local_addr().expect("addr").port()
+    );
+    let rig = Rig::new("no-proxy");
+    let ca = rig.write("ca.pem", &pki.ca_pem());
+    let digest = sha(&bytes);
+    let mut command = child_command(&[
+        "--kind",
+        "url",
+        "--url",
+        &server.url(),
+        "--sha256",
+        &digest,
+        "--limit",
+        "1001",
+        "--ca-file",
+        ca.to_str().expect("utf-8"),
+    ]);
+    for name in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+    ] {
+        command.env(name, &proxy_url);
+    }
+    let out = command.output().expect("runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, bytes);
+    assert!(proxy.accept().is_err(), "the proxy was contacted");
+    assert_eq!(server.hits(), [format!("/files/{digest}")]);
 }

@@ -3,8 +3,8 @@
 use kbf_meta::{ActionRecord, Closure, Role};
 use kbf_proto::storage::action_store_server::ActionStore;
 use kbf_proto::storage::{
-    CommitRequest, CommitResponse, Entry, GetRequest, GetResponse, PrepareRequest, PrepareResponse,
-    Record, Writer, prepare_response,
+    ClosureDigests, CommitRequest, CommitResponse, Entry, GetRequest, GetResponse, PrepareRequest,
+    PrepareResponse, Record, Writer, prepare_response,
 };
 use tonic::{Request, Response, Status};
 
@@ -27,19 +27,24 @@ fn record_of(record: Option<&Record>) -> Result<ActionRecord, Status> {
 #[tonic::async_trait]
 impl ActionStore for StorageService {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
-        self.admission.check(&request, Endpoint::ActionGet)?;
+        self.guard(&request, Endpoint::ActionGet)?;
         let request = request.into_inner();
         self.check_map(request.map_generation).await?;
         let action = wire::digest(request.action.as_ref())?;
         let catching_up = self.catching_up();
-        let entry = self.storage.action_result(&action).await?;
+        let entry = self.storage.action_entry(&action).await?;
         if let Some(status) = catch_up::entry_miss(catching_up, entry.is_some(), &action) {
             return Err(status);
         }
         Ok(Response::new(GetResponse {
-            entry: entry.map(|(digest, result)| Entry {
-                result_digest: Some(wire::to_proto(&digest)),
-                result: Some(result),
+            entry: entry.map(|entry| Entry {
+                result_digest: Some(wire::to_proto(&entry.result_digest)),
+                result: Some(entry.result),
+                // Unset when the storage did not report it: the reader treats that as
+                // "unchecked", which is what an older node's answer looks like too.
+                closure: entry.closure.map(|digests| ClosureDigests {
+                    digests: digests.iter().map(wire::to_proto).collect(),
+                }),
             }),
         }))
     }
@@ -48,7 +53,7 @@ impl ActionStore for StorageService {
         &self,
         request: Request<PrepareRequest>,
     ) -> Result<Response<PrepareResponse>, Status> {
-        self.admission.check(&request, Endpoint::ActionPrepare)?;
+        self.guard(&request, Endpoint::ActionPrepare)?;
         let request = request.into_inner();
         self.check_map(request.map_generation).await?;
         let result = request
@@ -77,7 +82,7 @@ impl ActionStore for StorageService {
         &self,
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
-        self.admission.check(&request, Endpoint::ActionCommit)?;
+        self.guard(&request, Endpoint::ActionCommit)?;
         let request = request.into_inner();
         self.check_map(request.map_generation).await?;
         let role = match Writer::try_from(request.writer) {

@@ -7,12 +7,31 @@
 //! role may call the endpoint. A DNS name that looks like a role is not one, and the
 //! subject's common name is not read.
 //!
+//! A certificate also names the host it speaks for, as DNS and IP subjectAltNames.
+//! [`names_of`] reads them as [`PeerNames`], and [`PeerNames::covers`] says whether one
+//! of them is a given host (the host of a `host:port` address, [`host_of`]): DNS names
+//! match exactly up to ASCII case, IP names as parsed addresses, and a wildcard name
+//! covers nothing. The role URI, other URIs and the common name are never names.
+//!
+//! A certificate is also judged against a deny list (`kbf_map::DenyEntry`: a serial, a
+//! public-key hash or a node id). [`identity_of`] reads what such an entry is compared
+//! with, as a [`PeerIdentity`] (the names above, the serial and the SHA-256 of the
+//! SubjectPublicKeyInfo, each in the entry's canonical spelling), and
+//! [`PeerIdentity::denied_by`] says which entry of a list, if any, names it. A node id names
+//! a certificate by one of its DNS names, up to ASCII case ([`PeerNames::has_dns_name`]).
+//! It is the one reader: the frontend's worker listener and membership service and every
+//! storage node use it, so they cannot disagree about which certificate an entry names.
+//!
 //! The certificate is not verified here: TLS has already verified it against the
 //! listener's client CA. Which gRPC status a refusal is belongs to the caller (see
 //! [`RoleError`]).
 
 use std::fmt;
+use std::net::{IpAddr, Ipv6Addr};
 
+use kbf_map::{DenyEntry, normalize_serial};
+use sha2::{Digest as _, Sha256};
+use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
 /// How a certificate names a role: this, then the role's [`PeerRole::name`].
@@ -56,7 +75,8 @@ impl fmt::Display for PeerRole {
     }
 }
 
-/// Why a certificate names no role.
+/// Why a certificate names no role (and, for [`names_of`], that the bytes are no
+/// certificate: the only variant it answers).
 ///
 /// A listener answers [`RoleError::NotACertificate`] UNAUTHENTICATED (there is no
 /// identity to judge) and the others PERMISSION_DENIED (the peer is known, its
@@ -82,16 +102,8 @@ pub enum RoleError {
 /// # Errors
 /// See [`RoleError`].
 pub fn role_of(der: &[u8]) -> Result<PeerRole, RoleError> {
-    let (_, cert) = x509_parser::parse_x509_certificate(der)
-        .map_err(|e| RoleError::NotACertificate(e.to_string()))?;
-    let names: Vec<&str> = cert
-        .extensions()
-        .iter()
-        .filter_map(|e| match e.parsed_extension() {
-            ParsedExtension::SubjectAlternativeName(san) => Some(&san.general_names),
-            _ => None,
-        })
-        .flatten()
+    let cert = parse(der)?;
+    let names: Vec<&str> = alt_names(&cert)
         .filter_map(|name| match name {
             GeneralName::URI(uri) => uri.strip_prefix(ROLE_URI_PREFIX),
             _ => None,
@@ -101,4 +113,223 @@ pub fn role_of(der: &[u8]) -> Result<PeerRole, RoleError> {
         return Err(RoleError::Count(names.len()));
     };
     PeerRole::from_name(name).ok_or_else(|| RoleError::Unknown((*name).to_owned()))
+}
+
+fn parse(der: &[u8]) -> Result<X509Certificate<'_>, RoleError> {
+    x509_parser::parse_x509_certificate(der)
+        .map(|(_, cert)| cert)
+        .map_err(|e| RoleError::NotACertificate(e.to_string()))
+}
+
+/// Every entry of the certificate's subjectAltName extensions.
+fn alt_names<'c, 'd>(cert: &'c X509Certificate<'d>) -> impl Iterator<Item = &'c GeneralName<'d>> {
+    cert.extensions()
+        .iter()
+        .filter_map(|e| match e.parsed_extension() {
+            ParsedExtension::SubjectAlternativeName(san) => Some(&san.general_names),
+            _ => None,
+        })
+        .flatten()
+}
+
+/// The hosts a certificate speaks for: its DNS and IP subjectAltNames.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PeerNames {
+    dns: Vec<String>,
+    ips: Vec<IpAddr>,
+}
+
+impl PeerNames {
+    /// Every name as written: the DNS names, then the IP addresses.
+    #[must_use]
+    pub fn all(&self) -> Vec<String> {
+        self.dns
+            .iter()
+            .cloned()
+            .chain(self.ips.iter().map(ToString::to_string))
+            .collect()
+    }
+
+    /// The DNS names as written, in the order the certificate lists them.
+    #[must_use]
+    pub fn dns(&self) -> &[String] {
+        &self.dns
+    }
+
+    /// Whether one of the names is `host`: a bare host, without port or brackets (see
+    /// [`host_of`]). A host that parses as an IP address is covered by an IP name of
+    /// the same address and by no DNS name; any other host is covered by a DNS name equal
+    /// to it up to ASCII case and by no IP name. A DNS name with a `*` in it covers
+    /// nothing, not even itself, and the empty host is covered by nothing.
+    #[must_use]
+    pub fn covers(&self, host: &str) -> bool {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return self.ips.contains(&ip);
+        }
+        !host.is_empty()
+            && self
+                .dns
+                .iter()
+                .any(|name| !name.contains('*') && name.eq_ignore_ascii_case(host))
+    }
+
+    /// Whether a `node` deny entry with the value `node` names these names: a DNS name equal
+    /// to it up to ASCII case, which is how DNS compares names and how [`PeerNames::covers`]
+    /// does. IP names are never matched, so an entry holding an IP address names nothing (a
+    /// deny writer refuses one), and a wildcard name is matched by the entry that spells it,
+    /// since a deny errs towards denying. A name with a trailing dot is another string and is
+    /// not matched, nor is a `host:port`.
+    #[must_use]
+    pub fn has_dns_name(&self, node: &str) -> bool {
+        self.dns.iter().any(|name| name.eq_ignore_ascii_case(node))
+    }
+}
+
+/// The DNS names as written, then the IPs, comma separated; `no DNS or IP name` for none.
+impl fmt::Display for PeerNames {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.dns.is_empty() && self.ips.is_empty() {
+            return f.write_str("no DNS or IP name");
+        }
+        let all: Vec<String> = self
+            .dns
+            .iter()
+            .cloned()
+            .chain(self.ips.iter().map(ToString::to_string))
+            .collect();
+        f.write_str(&all.join(", "))
+    }
+}
+
+/// The DNS and IP names a DER certificate carries in its subjectAltName extensions.
+///
+/// # Errors
+/// [`RoleError::NotACertificate`]: the bytes are not an X.509 certificate.
+pub fn names_of(der: &[u8]) -> Result<PeerNames, RoleError> {
+    Ok(names_in(&parse(der)?))
+}
+
+fn names_in(cert: &X509Certificate<'_>) -> PeerNames {
+    let mut names = PeerNames::default();
+    for name in alt_names(cert) {
+        match name {
+            GeneralName::DNSName(dns) => names.dns.push((*dns).to_owned()),
+            GeneralName::IPAddress(raw) => names.ips.extend(ip_of(raw)),
+            _ => {}
+        }
+    }
+    names
+}
+
+/// What a deny list entry is compared with: the certificate's names, its serial and the
+/// hash of its public key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerIdentity {
+    names: PeerNames,
+    /// Lower-case hex without leading zeros, as `DenyEntry::Serial` spells it.
+    serial: String,
+    /// SHA-256 of the DER SubjectPublicKeyInfo, lower-case hex.
+    spki_sha256: String,
+}
+
+impl PeerIdentity {
+    /// The identity of a caller whose certificate a TLS-terminating proxy verified and
+    /// which names only `node_id`: that one DNS name, and no serial or key hash (the proxy
+    /// does not forward them), so a `serial` or `spki-sha256` deny entry cannot name it and
+    /// an IP address is covered by no name.
+    #[must_use]
+    pub fn proxied(node_id: &str) -> Self {
+        Self {
+            names: PeerNames {
+                dns: vec![node_id.to_owned()],
+                ips: Vec::new(),
+            },
+            serial: String::new(),
+            spki_sha256: String::new(),
+        }
+    }
+
+    /// The DNS and IP names.
+    #[must_use]
+    pub fn names(&self) -> &PeerNames {
+        &self.names
+    }
+
+    /// The serial, as a deny entry spells it.
+    #[must_use]
+    pub fn serial(&self) -> &str {
+        &self.serial
+    }
+
+    /// The SHA-256 of the SubjectPublicKeyInfo, as a deny entry spells it.
+    #[must_use]
+    pub fn spki_sha256(&self) -> &str {
+        &self.spki_sha256
+    }
+
+    /// The first entry of `denied` that names this certificate: its serial, its key hash,
+    /// or a node id that is one of its DNS names ([`PeerNames::has_dns_name`], up to ASCII
+    /// case). IP names, the role URI and the common name never match a `node` entry.
+    #[must_use]
+    pub fn denied_by<'a>(&self, denied: &'a [DenyEntry]) -> Option<&'a DenyEntry> {
+        denied.iter().find(|entry| match entry {
+            DenyEntry::Serial(serial) => *serial == self.serial,
+            DenyEntry::SpkiSha256(hash) => *hash == self.spki_sha256,
+            DenyEntry::Node(node) => self.names.has_dns_name(node),
+        })
+    }
+}
+
+/// The identity a DER certificate gives a deny list.
+///
+/// # Errors
+/// [`RoleError::NotACertificate`]: the bytes are not an X.509 certificate.
+pub fn identity_of(der: &[u8]) -> Result<PeerIdentity, RoleError> {
+    let cert = parse(der)?;
+    Ok(PeerIdentity {
+        names: names_in(&cert),
+        serial: normalize_serial(&hex(cert.raw_serial())),
+        spki_sha256: hex(&Sha256::digest(cert.public_key().raw)),
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The address an IP subjectAltName holds: four bytes (IPv4) or sixteen (IPv6).
+fn ip_of(raw: &[u8]) -> Option<IpAddr> {
+    match <[u8; 4]>::try_from(raw) {
+        Ok(v4) => Some(IpAddr::from(v4)),
+        Err(_) => <[u8; 16]>::try_from(raw).ok().map(IpAddr::from),
+    }
+}
+
+/// The host of an address `host`, `host:port`, `[v6]` or `[v6]:port`: the port is cut
+/// (digits that make a port, after the last colon, and only when no other colon is in the
+/// host) and the brackets of an IPv6 literal come off. Anything else is returned whole, so
+/// it can only match a name that is spelled exactly like it: an unbracketed IPv6 address
+/// (its colons are not a port), a bracketed name that is no IPv6 literal, a path or
+/// userinfo in the address.
+#[must_use]
+pub fn host_of(addr: &str) -> &str {
+    if let Some(inner) = addr.strip_prefix('[') {
+        return match inner.split_once(']') {
+            Some((literal, rest))
+                if literal.parse::<Ipv6Addr>().is_ok()
+                    && (rest.is_empty() || rest.strip_prefix(':').is_some_and(is_port)) =>
+            {
+                literal
+            }
+            _ => addr,
+        };
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && is_port(port) => host,
+        _ => addr,
+    }
+}
+
+fn is_port(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) && text.parse::<u16>().is_ok()
 }

@@ -47,8 +47,8 @@ pub const KEYS: &[&str] = &[
     "KBF_LEASE_PLACEMENT",
 ];
 
-/// The converged units' S3 endpoint when `MINIO_S3_ENDPOINT` is not set: the host's own
-/// MinIO.
+/// The `@MINIO_S3_ENDPOINT@` value of a unit when `MINIO_S3_ENDPOINT` is not set: the
+/// host's own MinIO. (`--mode storage` refuses to render without the setting.)
 pub const LOOPBACK_MINIO: &str = "http://127.0.0.1:9000";
 
 /// Where a daemon puts each lease among the node's CPUs: kbf-daemon's `--lease-placement`
@@ -101,12 +101,12 @@ pub struct LinuxConfig {
     pub daemon_memory_min_mib: u64,
     /// RAM minus what MinIO, kbf-server and the OS keep: the daemon's
     /// `--actions-memory-max-gib` (docs/deploy/storage-node.md, "Memory on a converged
-    /// host"). At least 1.
+    /// host", a node that runs the storage half beside its builds). At least 1.
     pub actions_gib: u64,
     pub minio_unit: String,
-    /// The S3 endpoint of the bucket, when `MINIO_S3_ENDPOINT` is set. The converged
-    /// units default to the host's own MinIO ([`LOOPBACK_MINIO`]); `--mode storage`
-    /// refuses without it ([`LinuxConfig::for_mode`]).
+    /// The S3 endpoint of the bucket, when `MINIO_S3_ENDPOINT` is set. Unset, a
+    /// unit that names the endpoint gets the host's own MinIO ([`LOOPBACK_MINIO`]);
+    /// `--mode storage` refuses without it ([`LinuxConfig::for_mode`]).
     pub minio_s3_endpoint: Option<String>,
     pub s3_bucket: String,
     /// The key prefix in the bucket, empty (kbf's own default, `kbf/`) or `a/b/` with a
@@ -115,10 +115,11 @@ pub struct LinuxConfig {
     /// kbf-server's `--meta-dir`: its metadata log, a single-voter Raft log.
     pub meta_dir: HostPath,
     /// `kbf storage`'s `--hot-store` directory: the SSD tier in front of the cold store.
+    /// Defaults to `<data_dir>/hot`.
     pub hot_dir: HostPath,
     /// kbf-daemon's `--data-dir`: lease directories, the input cache and the trees.
     pub data_dir: HostPath,
-    /// The pinned images, in podman's bare `<repo>@sha256:<digest>` form.
+    /// The pinned images, in the bare `<repo>@sha256:<digest>` form (no `docker://`).
     pub images: Vec<ImageRef>,
     pub user: String,
     pub server_user: String,
@@ -202,7 +203,7 @@ pub enum LinuxError {
         left: i128,
     },
     #[error(
-        "image '{0}': write the bare <repo>@sha256:<digest> (podman's form); render-units adds docker:// for kbf-daemon"
+        "image '{0}': write the bare <repo>@sha256:<digest>; render-units adds docker:// for kbf-daemon"
     )]
     ImageScheme(String),
     #[error(transparent)]
@@ -300,6 +301,10 @@ impl LinuxConfig {
             v if v.strip_prefix("https://").is_some_and(|h| !h.is_empty()) => Some(v.to_owned()),
             v => return Err(LinuxError::StorageUrl(v.to_owned())),
         };
+        // The hot store defaults beside the daemon's data: the same filesystem (the one
+        // cache) and a path the unit's user can reach, which `/var/lib/kbf-server` (the
+        // frontend account's, 0700) is not for the units that run as `KBF_USER`.
+        let data_dir = path("KBF_DATA_DIR", "/var/lib/kbf")?;
         Ok(LinuxConfig {
             frontend_name: or("KBF_FRONTEND_NAME", &host_name),
             storage_url,
@@ -330,8 +335,8 @@ impl LinuxConfig {
                 .map(str::to_owned),
             s3_bucket: or("KBF_S3_BUCKET", "kbf-cas"),
             meta_dir: path("KBF_META_DIR", "/var/lib/kbf-server/raft")?,
-            hot_dir: path("KBF_HOT_DIR", "/var/lib/kbf-server/hot")?,
-            data_dir: path("KBF_DATA_DIR", "/var/lib/kbf")?,
+            hot_dir: path("KBF_HOT_DIR", &format!("{data_dir}/hot"))?,
+            data_dir,
             images,
             user: or("KBF_USER", "kbf"),
             server_user: or("KBF_SERVER_USER", "kbf-server"),
@@ -343,8 +348,8 @@ impl LinuxConfig {
     }
 
     /// Refuse settings that leave out a key `mode`'s unit needs: `MINIO_S3_ENDPOINT` for
-    /// `storage`, whose cold store is a bucket on MinIO elsewhere (the converged units'
-    /// default, the host's own MinIO, is a guess there).
+    /// `storage`, whose cold store is a bucket on MinIO elsewhere (the host's own MinIO,
+    /// the default of [`LOOPBACK_MINIO`], is a guess there).
     ///
     /// # Errors
     /// [`LinuxError::Required`] for the first key left out.
@@ -448,7 +453,7 @@ fn port(key: &'static str, value: &str) -> Result<u16, LinuxError> {
         })
 }
 
-/// A `KBF_IMAGES` entry: podman's bare `<repo>@sha256:<digest>`, which must pass
+/// A `KBF_IMAGES` entry: the bare `<repo>@sha256:<digest>`, which must pass
 /// kbf-daemon's own `--image` parser once `docker://` is put in front.
 pub fn image(entry: &str) -> Result<ImageRef, LinuxError> {
     if entry.starts_with("docker://") {

@@ -83,6 +83,9 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                     ))
                 );
             }
+            Invocation::Registered(_) => {
+                panic!("{mode}: a rendered unit gives flags, so it is not a start that enrolls")
+            }
             Invocation::Storage(flags) => {
                 assert_eq!(mode, Mode::Storage);
                 // The unit's certificate flags are read as the paths they spell (not
@@ -128,24 +131,97 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
     }
 }
 
-/// The all-in-one unit gives no `--state-store`, and kbf all-in-one, parsing the rendered
-/// command line, takes the SQLite file `state.db` in the unit's `--data-dir`: the state
-/// the template's comment promises, and one rule `state-store` passes. Catches the unit
-/// growing a `--state-store` (a Postgres URI, say) or kbf's default moving out of the
-/// data directory, or off SQLite.
+/// A host where every path exists as a file and a directory alike, empty and mode 0600.
+struct EverythingExists;
+
+impl kbf_cli::preflight::Host for EverythingExists {
+    fn stat(&self, _: &std::path::Path) -> std::io::Result<kbf_cli::preflight::host::Stat> {
+        Ok(kbf_cli::preflight::host::Stat {
+            kind: kbf_cli::preflight::host::Kind::File,
+            uid: 0,
+            mode: 0o600,
+        })
+    }
+    fn read(&self, _: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+    fn var(&self, _: &str) -> Option<String> {
+        Some("x".to_owned())
+    }
+    fn euid(&self) -> u32 {
+        0
+    }
+    fn nofile(&self) -> u64 {
+        1 << 20
+    }
+    fn run(
+        &self,
+        _: &std::path::Path,
+        _: &[&str],
+    ) -> std::io::Result<kbf_cli::preflight::host::Output> {
+        Ok(kbf_cli::preflight::host::Output {
+            success: true,
+            stdout: "crun version 1.14.0\n".to_owned(),
+        })
+    }
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now()
+    }
+}
+
+/// Catches a startup preflight rule refusing a layout `kbf-deploy` renders: every mode
+/// unit, with the settings' default metadata directory and with the test farm's (the
+/// metadata log under the node's own data root), is read by `kbf <mode>`'s own parser and
+/// checked against a host where every file exists. The files may still fail their own
+/// checks (these are empty); no problem may be about the two directories.
 #[test]
-fn the_all_in_one_unit_leaves_its_state_store_to_kbfs_sqlite_default() {
+fn no_rendered_mode_unit_is_refused_over_where_its_directories_are() {
+    let farm = EXAMPLE.replace(
+        "KBF_META_DIR=/var/lib/kbf-server/raft",
+        "KBF_META_DIR=/var/lib/kbf/av2-meta",
+    );
+    assert_ne!(farm, EXAMPLE, "config.example moved KBF_META_DIR");
+    for text in [EXAMPLE.to_owned(), farm] {
+        let c = LinuxConfig::parse(&text).expect("valid settings");
+        for mode in Mode::ALL {
+            let unit = render(&c, Some(1500), mode).expect("renders");
+            let unit = UnitFile::parse(&unit).expect("a unit");
+            let invocation = parse_from(unit.exec_start().iter().copied()).expect("parses");
+            let needs = kbf_cli::preflight::needs(&invocation);
+            let report = kbf_cli::preflight::check(&needs, &EverythingExists);
+            let text = report.render(needs.mode);
+            assert!(
+                !text.contains("--meta-dir") && !text.contains("--data-dir"),
+                "{mode}: {text}"
+            );
+        }
+    }
+}
+
+/// The all-in-one unit names the SQLite file `state.db` in its `--data-dir` as its
+/// `--state-store`, and kbf all-in-one, parsing the rendered command line, takes that file:
+/// kbf's own default is Postgres, so a unit that left the flag out would change store when
+/// its binary is replaced. One rule `state-store` passes. Catches the unit leaving the
+/// flag out (the farm would need Postgres at its next restart), or naming a file outside
+/// the data directory.
+#[test]
+fn the_all_in_one_unit_names_its_sqlite_state_file_in_the_data_directory() {
     let text = render(&config(), Some(1500), Mode::AllInOne).expect("renders");
     let unit = UnitFile::parse(&text).expect("a unit");
     let argv = unit.exec_start();
-    assert!(
-        !argv.iter().any(|a| a.starts_with("--state-store")),
-        "{argv:?}"
-    );
     let data_dir = argv
         .iter()
         .find_map(|a| a.strip_prefix("--data-dir="))
         .expect("the all-in-one unit gives --data-dir");
+    let stores: Vec<&&str> = argv
+        .iter()
+        .filter(|a| a.starts_with("--state-store"))
+        .collect();
+    assert_eq!(
+        stores,
+        [&format!("--state-store=sqlite://{data_dir}/state.db").as_str()],
+        "{argv:?}"
+    );
     match parse_from(argv.iter().copied()) {
         Ok(Invocation::AllInOne(flags)) => assert_eq!(
             flags.server.state_store,
@@ -339,11 +415,12 @@ fn check_units_parses_a_modes_flags_with_this_kbf() {
             ],
             _ => Vec::new(),
         };
-        assert_eq!(
-            check_units(&format!("clean_{mode}"), mode, &text),
-            (Vec::new(), notes),
-            "{mode}"
-        );
+        // Rule `traverse` reads this machine's accounts: it notes a SKIP where the unit's
+        // user is absent (a CI runner) and is silent where it exists, so that note is not
+        // compared here (traverse_tests and install_mode_tests cover the rule).
+        let (failures, mut said) = check_units(&format!("clean_{mode}"), mode, &text);
+        said.retain(|n| !n.starts_with("SKIP traverse: no user "));
+        assert_eq!((failures, said), (Vec::new(), notes), "{mode}");
     }
     let bin = env!("CARGO_BIN_EXE_kbf");
     let text = render(&c, Some(1500), Mode::Daemon).expect("renders");

@@ -1,5 +1,5 @@
 //! Stopping the `kbf-server` binary with open REAPI streams (issue #168, and
-//! komira-build-farm#791): SIGTERM keeps open Execute and WaitExecution streams until
+//! kbf#791): SIGTERM keeps open Execute and WaitExecution streams until
 //! their action is done, because Buck2 does not recover a stream that breaks; when
 //! `--shutdown-timeout-secs` runs out they end UNAVAILABLE and the server exits 0 once
 //! its REAPI connections close. The same file holds the stream-liveness flags: an
@@ -189,7 +189,7 @@ async fn sigterm_ends_open_execute_streams_unavailable() {
     assert!(status.success(), "kbf-server exited with {status}");
 }
 
-/// Catches (komira-build-farm#791): a SIGTERM that ends open streams or exits while an
+/// Catches (kbf#791): a SIGTERM that ends open streams or exits while an
 /// action is in flight (Buck2 never reconnects, so the action would fail). With no
 /// deadline (the default) the stream stays open and the server keeps running after the
 /// signal; here it is still there after a pause and nothing has been sent on it. The
@@ -227,7 +227,7 @@ async fn sigterm_keeps_an_open_stream_when_there_is_no_deadline() {
     assert!(status.success(), "kbf-server exited with {status}");
 }
 
-/// Catches (komira-build-farm#791): a server that sends nothing on an idle Execute
+/// Catches (kbf#791): a server that sends nothing on an idle Execute
 /// stream, so a load balancer's idle timeout cuts it. With `--progress-interval-secs 1`
 /// an operation waiting for a worker is sent again, same name, not done. The planted
 /// mutant is a server that never runs the progress ticker (the read times out).
@@ -318,7 +318,7 @@ async fn expects_a_ping_from(addr: SocketAddr, what: &str) {
         .unwrap_or_else(|_| panic!("{what}: a PING frame within the bound (no keepalive?)"));
 }
 
-/// Catches (komira-build-farm#791): a REAPI listener built without HTTP/2 keepalive.
+/// Catches (kbf#791): a REAPI listener built without HTTP/2 keepalive.
 /// A client that connects, says nothing and answers nothing is sent a PING frame by
 /// the server within `--http2-keepalive-interval-secs`. The planted mutant is
 /// `keepalive` not applied to the REAPI builder (no PING arrives).

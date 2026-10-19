@@ -17,14 +17,30 @@
 //!   cannot: on the macOS runner (Xcode 16.4) both XCUITest fixtures of
 //!   `docs/spikes/macos-p0.md` failed to build under the profile without it (the
 //!   one-file C tool `tests/user_folders.rs` builds did not). The name is Swift
-//!   Build's own random one, so it cannot be one per lease.
+//!   Build's own random one, so it cannot be one per lease;
+//! - SwiftPM's package resolution (`xcodebuild` runs it for a Swift package with a
+//!   dependency) makes `T/TemporaryDirectory.<random>` and, with a failure to report,
+//!   `T/ResultBundle_<date>.xcresult`; the asset service stages the Metal toolchain it
+//!   mounts in `T/cryptex.personalize.<random>`. On the macOS runner (Xcode 26.5) the
+//!   sandbox log named all three as denied while `xcodebuild -scheme hello` on a
+//!   package with a local dependency ended with `permissionDenied` and the toolchain
+//!   was never mounted. `CFFIXED_USER_HOME` moves `~` for these tools but not
+//!   `confstr`'s folders, so a rule it is, like the others here;
+//! - the Metal compiler (`xcrun metal`) keeps its module cache in
+//!   `C/clang/ModuleCache/<hash>` and ignores `CLANG_MODULE_CACHE_PATH`, which moves
+//!   clang's own (issue #183; on the macOS runner, Xcode 26.6, `metal -c` failed with
+//!   "unable to open output file .../metal_types-<hash>.pcm" until the rule below).
+//!   A lease cannot point it elsewhere without a flag on its command line.
 //!
 //! The sandbox profile ([`UserFolders::rules`]) lets an action write below
 //! `T/TemporaryItems` (not the folder itself: an action that could replace it with a
 //! symlink would aim the daemon's sweep anywhere), to those `xcrun` names, and to an
-//! entry named `swbuild.tmp.` and at least one more character, and what is below it
-//! (one regular expression without an end anchor), and nothing else in the two
-//! folders, the folders themselves included. The daemon finds
+//! entry named by one of `MKDTEMP_PREFIXES` and at least one more character, and what
+//! is below it (one regular expression without an end anchor each), below `C/clang/ModuleCache/`
+//! (not the folder itself, which the sweep makes, mode 0700, when it is missing) and
+//! `C/com.apple.dt.xcodebuild/` (`xcodebuild`'s `Cache.db` and `fsCachedData`), to
+//! `xcodebuild`'s plug-in cache file (and its temporary name) in
+//! `C/com.apple.DeveloperTools/<version>/Xcode/`, and nothing else in the two folders, the folders themselves included. The daemon finds
 //! the folders once, at start ([`UserFolders::detect`]), with every link resolved: the
 //! sandbox compares the real paths of the files written. The sweep makes
 //! `TemporaryItems` (mode 0700) when it is missing, since an action cannot.
@@ -33,7 +49,10 @@
 //! each lease its own `/var/folders` entry): leases of the daemon's user share these
 //! names, so a lease can see, change or remove the temporary files another lease has
 //! open there, and can rewrite `xcrun_db`, which the next lease's compiler shims read
-//! to find their tools. The daemon runs no developer tool outside the sandbox while it
+//! to find their tools, or leave a `.pcm` in `ModuleCache` that the next Metal compile
+//! reads (clang checks a module file against its sources and flags, not against who
+//! wrote it), or change the `Cache.db` and plug-in cache the next lease's `xcodebuild`
+//! reads. The daemon runs no developer tool outside the sandbox while it
 //! serves, so what a lease wrote there reaches only sandboxed tools: every survey of
 //! the Xcodes, the first and those it repeats while the node serves
 //! ([`crate::xcode_watch`]), asks each question under the actions' sandbox, where
@@ -58,7 +77,7 @@
 //! opens `T` and `TemporaryItems` with `O_NOFOLLOW`, takes each only when it is a
 //! directory of the daemon's user, and removes entries by name relative to it,
 //! never following a symlink at any level ([`kbf_outputs::remove_tree_at`]).
-//! A `swbuild.tmp.*` directory is not swept: Swift Build removes its own when it
+//! A directory named by `MKDTEMP_PREFIXES` is not swept: its tool removes its own when it
 //! ends, and one a running build still uses can go untouched for longer than
 //! [`LEFTOVER_AGE`] (a long build), so the age rule could remove it under the build.
 //! One a killed lease left stays: the daemon does not remove it.
@@ -82,9 +101,38 @@ const TEMPORARY_ITEMS: &str = "TemporaryItems";
 /// `xcrun`'s cache in the temporary folder; it writes `<XCRUN_DB>-<random>` first.
 const XCRUN_DB: &str = "xcrun_db";
 
-/// What Swift Build's scratch directory in the temporary folder is named: this, then
-/// `mkdtemp`'s random characters.
-const SWBUILD_TMP: &str = "swbuild.tmp.";
+/// Where in the cache folder clang (and the Metal compiler, which ignores
+/// `CLANG_MODULE_CACHE_PATH`) keep their module caches: a directory per compiler
+/// configuration, holding the `.pcm` files.
+const MODULE_CACHE: [&str; 2] = ["clang", "ModuleCache"];
+
+/// The folder in the cache folder where `xcodebuild` keeps its `NSURLCache`
+/// (`Cache.db`, `fsCachedData`), found through `DARWIN_USER_CACHE_DIR`, not `HOME`.
+const XCODEBUILD_CACHE: &str = "com.apple.dt.xcodebuild";
+
+/// The tail of what `xcodebuild` writes to
+/// `C/com.apple.DeveloperTools/<Xcode version>-<build>/Xcode/` in the cache folder: its
+/// plug-in cache, and the temporary name it writes before the rename (any suffix).
+const PLUGIN_CACHE: &str = "PlugInCache-xcodebuild.xcplugincache";
+
+/// The names in the temporary folder that a tool makes with `mkdtemp` (or a result
+/// path of its own), each a prefix and then the tool's random characters, and the tool
+/// that makes it:
+/// - `swbuild.tmp.`: Swift Build's scratch directory;
+/// - `TemporaryDirectory.`: SwiftPM's (and `xcodebuild`'s package resolution's)
+///   temporary directories, made with `confstr`'s temporary folder, not `TMPDIR`;
+/// - `cryptex.personalize.`: the asset service's staging while it mounts the Metal
+///   toolchain. On the current Xcode that toolchain is a system cryptex outside the
+///   lease's home; the sandbox log of the macOS runner (Xcode 26.5) still named this
+///   path as denied, which is the only reason the allowance stays;
+/// - `ResultBundle_`: the `.xcresult` `xcodebuild` writes for an error (without the
+///   rule it prints "Failed saving result bundle" over the error it meant to report).
+const MKDTEMP_PREFIXES: [&str; 4] = [
+    "swbuild.tmp.",
+    "TemporaryDirectory.",
+    "cryptex.personalize.",
+    "ResultBundle_",
+];
 
 /// How the sweep opens a folder: a directory, never through a symlink.
 const FOLDER: OFlags = OFlags::RDONLY
@@ -158,15 +206,22 @@ impl UserFolders {
     }
 
     /// The sandbox profile rules that let an action write the names the module lists
-    /// (below `TemporaryItems`, never the folder itself; a `swbuild.tmp.<random>`
-    /// entry and what is below it) and nothing else in these folders; they follow the
-    /// profile's `(deny file-write*)`, which they narrow.
+    /// (below `TemporaryItems`, never the folder itself; an entry of
+    /// `MKDTEMP_PREFIXES` and what is below it) and nothing else in these folders;
+    /// they follow the profile's `(deny file-write*)`, which they narrow.
     #[must_use]
     pub fn rules(&self) -> String {
         let temp = regex_quote(&self.temp.to_string_lossy());
-        let swbuild = regex_quote(SWBUILD_TMP);
+        let cache = regex_quote(&self.cache.to_string_lossy());
+        let modules = MODULE_CACHE.join("/");
+        let xcodebuild_cache = regex_quote(XCODEBUILD_CACHE);
+        let plugin_cache = regex_quote(PLUGIN_CACHE);
+        let prefixed: String = MKDTEMP_PREFIXES
+            .iter()
+            .map(|prefix| format!("  (regex #\"^{temp}/{}[^/]+\")\n", regex_quote(prefix)))
+            .collect();
         format!(
-            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n  (regex #\"^{temp}/{swbuild}[^/]+\"))\n",
+            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n{prefixed}  (regex #\"^{cache}/{modules}/\")\n  (regex #\"^{cache}/{xcodebuild_cache}/\")\n  (regex #\"^{cache}/com\\.apple\\.DeveloperTools/[^/]+/Xcode/{plugin_cache}[^/]*$\"))\n",
         )
     }
 
@@ -197,6 +252,31 @@ impl UserFolders {
             }
         }
         sweep_in(&temp, format!("{XCRUN_DB}-").as_bytes(), age, now, remove);
+        self.make_module_cache(uid);
+    }
+
+    /// Makes the module cache folder (`clang/ModuleCache` in the cache folder, mode
+    /// 0700) if it is missing, one directory at a time through descriptors: an action
+    /// cannot make the folders above it, and the rule opens only what is below.
+    fn make_module_cache(&self, uid: u32) {
+        let mut dir = match open_own(CWD, &self.cache, uid) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!(cache = %self.cache.display(), "module cache not made: {e}");
+                return;
+            }
+        };
+        for name in MODULE_CACHE {
+            // An error shows when the folder is opened next.
+            let _ = rustix::fs::mkdirat(&dir, name, Mode::RWXU);
+            match open_own(dir.as_fd(), Path::new(name), uid) {
+                Ok(next) => dir = next,
+                Err(e) => {
+                    tracing::warn!(cache = %self.cache.display(), "{name} not made: {e}");
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -383,10 +463,11 @@ mod tests {
     /// `TemporaryItems` itself (an action could swap it for a symlink the daemon's
     /// sweep then follows), miss one of the names the tools write, or let a
     /// regular-expression character in the path (`+` and `.` are common in
-    /// `/var/folders` names) match other paths; and a Swift Build rule wider than one
-    /// `swbuild.tmp.<random>` entry and what is below it: a prefix without the dots
-    /// escaped (`swbuildXtmpX..`), one that takes an empty suffix (`swbuild.tmp.`
-    /// itself), or the folder whole.
+    /// `/var/folders` names) match other paths; and a rule for a `MKDTEMP_PREFIXES`
+    /// name (`swbuild.tmp.`, `TemporaryDirectory.`, `cryptex.personalize.`,
+    /// `ResultBundle_`) wider than one `<prefix><random>` entry and what is below it: a
+    /// prefix without the dots escaped (`swbuildXtmpX..`), one that takes an empty
+    /// suffix (`swbuild.tmp.` itself), or the folder whole.
     #[test]
     fn the_rules_name_only_the_few_names_the_tools_write() {
         let folders = UserFolders::new(
@@ -399,7 +480,13 @@ mod tests {
             "(allow file-write*\n  \
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/TemporaryItems/\")\n  \
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/xcrun_db(-[^/]*)?$\")\n  \
-             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/swbuild\\.tmp\\.[^/]+\"))\n"
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/swbuild\\.tmp\\.[^/]+\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/TemporaryDirectory\\.[^/]+\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/cryptex\\.personalize\\.[^/]+\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/ResultBundle_[^/]+\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/C/clang/ModuleCache/\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/C/com\\.apple\\.dt\\.xcodebuild/\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/C/com\\.apple\\.DeveloperTools/[^/]+/Xcode/PlugInCache-xcodebuild\\.xcplugincache[^/]*$\"))\n"
         );
         assert_eq!(
             regex_quote("a.^$*+?()[]{}|b/-"),
@@ -565,6 +652,66 @@ mod tests {
             std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
             0o700
         );
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches a sweep that does not make `clang/ModuleCache` in the cache folder (the
+    /// Metal compiler cannot make it under the sandbox, and fails at its first
+    /// module), makes it in a folder another user owns, makes it with a mode others
+    /// may use, empties it on a later sweep, or replaces a file that is in the way.
+    #[test]
+    fn the_sweep_makes_the_module_cache_for_the_daemon_user_alone() {
+        let dir = scratch("modules");
+        let f = folders(&dir);
+        let modules = f.cache().join("clang/ModuleCache");
+        assert!(!modules.exists());
+        let me = rustix::process::geteuid().as_raw();
+        let now = SystemTime::now();
+        f.sweep_as(me + 1, Duration::ZERO, now, &kbf_outputs::remove_tree_at);
+        assert!(!f.cache().join("clang").exists(), "made in another user's");
+        f.sweep(Duration::ZERO, now, &kbf_outputs::remove_tree_at);
+        for folder in [f.cache().join("clang"), modules.clone()] {
+            let mode = std::fs::symlink_metadata(&folder)
+                .expect("made")
+                .permissions();
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+                0o700,
+                "{}",
+                folder.display()
+            );
+        }
+        std::fs::write(modules.join("keep"), b"x").expect("write");
+        f.sweep(Duration::ZERO, now, &kbf_outputs::remove_tree_at);
+        assert!(modules.join("keep").exists());
+        kbf_outputs::remove_tree(&dir).expect("clean");
+
+        let dir = scratch("modules-file");
+        let f = folders(&dir);
+        std::fs::write(f.cache().join("clang"), b"not a folder").expect("file");
+        f.sweep(Duration::ZERO, now, &kbf_outputs::remove_tree_at);
+        assert!(f.cache().join("clang").is_file());
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches a sweep that makes the cache folder itself when it is missing (the rule
+    /// opens only what is below it, and the daemon never makes the folders `confstr`
+    /// names), or that stops sweeping the temporary folder because the cache folder
+    /// cannot be opened.
+    #[test]
+    fn a_missing_cache_folder_is_left_missing_and_the_temporary_folder_is_swept() {
+        let dir = scratch("no-cache");
+        let f = folders(&dir);
+        std::fs::remove_dir(f.cache()).expect("remove C");
+        let old = LEFTOVER_AGE + Duration::from_secs(60);
+        let leftover = made("old-file", &f.temp().join(TEMPORARY_ITEMS), old);
+        f.sweep(
+            LEFTOVER_AGE,
+            SystemTime::now(),
+            &kbf_outputs::remove_tree_at,
+        );
+        assert!(!leftover.exists(), "the temporary folder was not swept");
+        assert!(!f.cache().exists(), "the cache folder was made");
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 

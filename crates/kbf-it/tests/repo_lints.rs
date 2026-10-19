@@ -23,19 +23,29 @@
 //! - an asset `.github/workflows/artifacts.yml` packages with no `actions/attest-sbom`
 //!   step for it and its own SBOM in the attest job, or such a step for an asset no
 //!   job packages (module `attested_assets`);
+//! - a tarball `.github/workflows/artifacts.yml` packages that is not attested as its
+//!   own subject, whose bundle is not named after it, uploaded, downloaded by the verify
+//!   job and the release workflow, and listed by `release locate`, or a release verify
+//!   that does not check the bundles offline for the release's commit (module
+//!   `attested_bundles`);
 //! - the artifacts workflow no longer building the pinned release set (`kbf` for
 //!   three platforms, `kbf-deploy` for macOS too), signing and attesting only on pushes
-//!   to `main` and `feature/arch-v2`, checking `kbf --version --json`, signing and
+//!   to `main` and `feature/arch-v2`, checking `kbf --version --json` (on the binary
+//!   built, and again on the packaged tarball with `build-commit check-asset`), signing and
 //!   `darwin-asset`-checking every macOS binary, or docs/artifacts.md describing
 //!   another set (module `release_artifacts`);
 //! - the coverage job's `kbf-coverage --run-id/--repo/--artifact` flags drifting from
 //!   the run and the artifact the job uploads, which breaks the download command the
 //!   ratchet prints (module `coverage_wiring`);
+//! - the bake evaluator named anywhere under `.github/` (a workflow, a local action or any
+//!   other file): it runs on the operator's side, never in Actions (module `bake_operator_side`);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
 mod attested_assets;
+mod attested_bundles;
+mod bake_operator_side;
 mod coverage_wiring;
 mod interpreters;
 mod release_artifacts;
@@ -569,7 +579,7 @@ mod budget {
 /// The workflow paths `docs/artifacts.md` gives as `--signer-workflow`, relative to the
 /// repository root.
 fn documented_signer_workflows(doc: &str) -> Vec<&str> {
-    const FLAG: &str = "--signer-workflow komira-ai/komira-build-farm/";
+    const FLAG: &str = "--signer-workflow komira-ai/kbf/";
     doc.match_indices(FLAG)
         .map(|(at, _)| {
             doc[at + FLAG.len()..]
@@ -624,7 +634,7 @@ mod selection {
         // Catches: a signer path read with the line's trailing `\` or the next flag, so
         // the repository test opens the wrong file; another repository's workflow
         // taken as ours; a flag at the very end of the text read as a path.
-        let doc = "gh attestation verify x \\\n  --signer-workflow komira-ai/komira-build-farm/.github/workflows/a.yml \\\n  --source-ref refs/heads/main\nalso --signer-workflow komira-ai/komira-build-farm/.github/workflows/b.yml";
+        let doc = "gh attestation verify x \\\n  --signer-workflow komira-ai/kbf/.github/workflows/a.yml \\\n  --source-ref refs/heads/main\nalso --signer-workflow komira-ai/kbf/.github/workflows/b.yml";
         assert_eq!(
             documented_signer_workflows(doc),
             vec![".github/workflows/a.yml", ".github/workflows/b.yml"]
@@ -634,7 +644,7 @@ mod selection {
                 .is_empty()
         );
         assert_eq!(
-            documented_signer_workflows("--signer-workflow komira-ai/komira-build-farm/"),
+            documented_signer_workflows("--signer-workflow komira-ai/kbf/"),
             vec![""]
         );
     }

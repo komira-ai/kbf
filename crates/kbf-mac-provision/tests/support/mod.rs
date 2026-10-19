@@ -19,15 +19,17 @@ use sha2::{Digest as _, Sha256};
 
 mod golden;
 mod pool;
-pub use golden::{golden_plist, golden_plist_as};
+pub use golden::{golden_config, golden_plist, golden_plist_as};
 
 /// The example profile the tests start from.
 pub const EXAMPLE: &str = include_str!("../../example.profile");
 
+pub const CONFIG: &str = "/usr/local/etc/kbf/kbf.toml";
 pub const PLIST: &str = "/Library/LaunchDaemons/org.example.kbf-daemon.plist";
 pub const DROPIN: &str = "/etc/ssh/sshd_config.d/000-kbf.conf";
 pub const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
 pub const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
+pub const XCODE: &str = "/Library/Preferences/com.apple.dt.Xcode";
 pub const COMMERCE: &str = "/Library/Preferences/com.apple.commerce";
 pub const LOGINWINDOW: &str = "/Library/Preferences/com.apple.loginwindow";
 pub const INTENT: &str = "/var/db/kbf-mac-session/session-intent";
@@ -258,6 +260,7 @@ impl FakeMac {
             s.default_set(SOFTWARE_UPDATE, k, v);
         }
         s.default_set(COMMERCE, "AutoUpdate", "0");
+        s.default_set(XCODE, "IDEPackageSupportDisableManifestSandbox", "1");
         s.firewall = "1".into();
         s.time_server = "time.example.net".into();
         s.xcode_select = Some("/Applications/Xcode-27.0.app/Contents/Developer".into());
@@ -274,6 +277,15 @@ impl FakeMac {
         mac.write(PLIST, &golden_plist(&sha256_hex(profile.as_bytes())[..12]));
         mac.chmod(PLIST, 0o644);
         mac.own(PLIST, 0, 0);
+        mac.mkdir("/usr/local/etc/kbf");
+        mac.chmod("/usr/local/etc/kbf", 0o755);
+        mac.own("/usr/local/etc/kbf", 0, 0);
+        mac.write(
+            CONFIG,
+            &golden_config(&sha256_hex(profile.as_bytes())[..12]),
+        );
+        mac.chmod(CONFIG, 0o644);
+        mac.own(CONFIG, 0, 0);
         mac.mkdir("/Library/Logs/kbf");
         mac.chmod("/Library/Logs/kbf", 0o755);
         mac.own("/Library/Logs/kbf", 0, 0);

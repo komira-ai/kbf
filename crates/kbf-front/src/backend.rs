@@ -1,5 +1,5 @@
 //! [`Backend`]: what Execute and the scheduler need of the store, and nothing more. Three
-//! implementations: a [`Cache`] in this process (what `kbf-server` and `kbf-all-in-one`
+//! implementations: a [`Cache`] in this process (what `kbf-server` and `kbf all-in-one`
 //! have always run), a [`Storage`] reached over gRPC (`kbf frontend` without members,
 //! which holds no blobs of its own: `docs/design/architecture-v2.md`, sections 2 and 7),
 //! and the storage nodes of a map ([`Backend::routed`], `kbf frontend` with members),
@@ -127,7 +127,11 @@ impl Backend {
         self.0.find_missing(digests).await
     }
 
-    pub(crate) async fn read_blob(&self, digest: &Digest) -> Result<bytes::Bytes, StorageError> {
+    /// The blob `digest`, read whole and verified against its digest.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] if it is not held, or as the store answers.
+    pub async fn read_blob(&self, digest: &Digest) -> Result<bytes::Bytes, StorageError> {
         self.0.read_blob(digest).await
     }
 

@@ -22,7 +22,8 @@ use kbf_meta::ServerId;
 use kbf_threads::disk::FreeSpace;
 
 use crate::identity::{DenyList, DenyListError};
-use crate::serve::{Api, Listeners, StreamTiming, WorkerTls};
+use crate::proxy_auth::{ProxySecret, ProxySecretError};
+use crate::serve::{Api, Behind, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
 
@@ -52,7 +53,7 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
     /// The node's one cache, when a daemon in this process shares the hot store's disk
-    /// (`kbf-all-in-one`, `kbf_storage::local_cache`). No flag sets it.
+    /// (`kbf all-in-one`, `kbf_storage::local_cache`). No flag sets it.
     #[arg(skip)]
     pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The durable object store, where every blob ends up: `file:///absolute/path` (a
@@ -234,15 +235,33 @@ pub struct Args {
     /// PEM CA that client certificates must chain to. Each must also name the role the
     /// method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker
     /// session and blob calls, the storage role (`urn:kbf:role:storage`) for
-    /// `kbf.map.v1.Membership`; a frontend certificate may call nothing here.
+    /// `kbf.map.v1.Membership`, with DNS or IP names that cover the host of the instance
+    /// id and of the address it registers; a frontend certificate may call nothing here.
     #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key"])]
     pub worker_client_ca: Option<PathBuf>,
     /// The worker listener's deny list: certificate serials, public keys and node ids
     /// it refuses (format in the `identity` module docs). Read at start, then again at
-    /// every `Hello` and `Heartbeat`, so an edit takes effect without a restart. Needs
-    /// mutual TLS.
-    #[arg(long, requires_all = ["worker_tls_cert", "worker_tls_key", "worker_client_ca"])]
+    /// every check (a daemon's `Hello`, `Heartbeat`, `Result`, `NodeStatus` and blob
+    /// calls, a storage node's `Register` and `Heartbeat`), so an edit takes effect
+    /// without a restart. A `node` entry also refuses a storage certificate with that DNS
+    /// name. A list that cannot be read after start refuses all of those calls. Needs
+    /// mutual TLS, or `--proxy-auth-file` (then only `node` entries can name a caller: the
+    /// proxy forwards a node id, not a certificate, so a `serial` or `spki-sha256` entry
+    /// never matches).
+    #[arg(long)]
     pub worker_deny_list: Option<PathBuf>,
+    /// A file holding the per-boot secret of the TLS-terminating proxy in front of this
+    /// server (`docs/design/frontend-proxy.md`, section 3): exactly 32 bytes, owned by the
+    /// server's user with mode 0600 or 0400, read at start. The proxy presents them as 64
+    /// lower-case hex digits in `x-kbf-proxy-auth`. With it, the REAPI, worker and operator
+    /// listeners take calls from loopback only, and believe `x-kbf-node-id` and
+    /// `x-kbf-role` only from a call that presents the secret; every other `x-kbf-*` header is dropped. The worker listener then
+    /// takes the proxy's identity in place of a client certificate (it needs no TLS flags),
+    /// and the operator API's writes must come through the proxy as well as carry the token (a
+    /// local `curl` write is refused). The storage listener is not covered: it keeps its own
+    /// mutual TLS. Without it, behavior is as before.
+    #[arg(long, value_name = "PATH")]
+    pub proxy_auth_file: Option<PathBuf>,
     /// How often, in seconds, a TLS listener looks at its certificate, key and client CA
     /// files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is
     /// applied to the next TLS handshake, with no restart and without ending a connection
@@ -399,6 +418,30 @@ pub struct Args {
     /// segment sealed while all are busy waits; new blobs go to a new open segment.
     #[arg(long, default_value_t = kbf_front::WriteConfig::DEFAULT.puts_in_flight)]
     pub write_puts_in_flight: NonZeroUsize,
+    /// The writers of the write pool: the ByteStream and storage `Write`s of a node with a
+    /// write tier are appended to shared segment files by this many writers, each holding
+    /// one range open, so the node keeps at most this many block files (plus the open
+    /// grouped block) open for writing for those blobs, however many uploads are in
+    /// flight. At least 1.
+    #[arg(long, default_value_t = kbf_front::PoolConfig::DEFAULT.writers)]
+    pub write_pool_writers: NonZeroUsize,
+    /// The most blobs waiting for a write-pool writer. A blob that finds the queue full goes
+    /// straight to the object store, as one does when the write tier has no room. At
+    /// least 1.
+    #[arg(long, default_value_t = kbf_front::PoolConfig::DEFAULT.queue)]
+    pub write_pool_queue: NonZeroUsize,
+    /// How long, in seconds, a streamed blob may go without sending a chunk before its
+    /// write-pool writer is taken back and the upload fails UNAVAILABLE (the client
+    /// sends it again). Without it, a stalled but connected large upload would hold a
+    /// writer for ever, and with all writers held every other blob would wait. It limits
+    /// stalls only: an upload that sends a chunk more often than this (a trickle) can still
+    /// hold a writer. At least 1.
+    #[arg(
+        long,
+        default_value_t = kbf_front::PoolConfig::DEFAULT.stream_idle.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub write_pool_stream_idle: u64,
     /// How many times a segment PUT is tried. Only a PUT that did not complete
     /// (connect, reset, timeout) or that the store answered 5xx is tried again, after
     /// 100 ms and then four times longer each time, under a new object key; if every
@@ -422,12 +465,15 @@ pub struct Args {
     #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
     pub input_tree_reads_in_flight: NonZeroUsize,
     /// Where the scheduler keeps its state, written before each change is acknowledged and
-    /// replayed at start: `sqlite:///absolute/path`, a file on a local disk that this
-    /// process owns. Every start is a new epoch, so daemons kill the runs of the leases
-    /// they held before. The file is created, with its directory, if missing (0600, and
-    /// 0700 for a directory it makes) and held by one process: a second frontend on it
-    /// refuses to start. Any other value, `postgres://` included, is refused (Postgres is
-    /// not wired yet). Left out, the scheduler's state is in memory and a restart loses it
+    /// replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a
+    /// local Unix socket, reached as this process's own user (peer authentication; a URL
+    /// with a password is refused, as the command line is world-readable). The server must
+    /// flush commits before it acknowledges them (`synchronous_commit` on) or the start is
+    /// refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on
+    /// a local disk that this process owns (created, with its directory, if missing: 0600,
+    /// and 0700 for a directory it makes; a second frontend on it refuses to start). Every
+    /// start is a new epoch, so daemons kill the runs of the leases they held before. Left
+    /// out, the scheduler's state is in memory and a restart loses it
     // Listed beside `--meta-dir`, whose place in the help it takes without moving the
     // flags declared after it.
     #[arg(
@@ -488,6 +534,15 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// The proxy's secret file is refused.
+    #[error("--proxy-auth-file: {0}")]
+    ProxyAuth(#[from] ProxySecretError),
+    /// `--worker-deny-list` with neither mutual TLS nor a proxy: nothing would read it.
+    #[error(
+        "--worker-deny-list needs mutual TLS (--worker-tls-cert, --worker-tls-key, \
+         --worker-client-ca) or --proxy-auth-file"
+    )]
+    DenyListWithoutIdentity,
     /// The release store's directory cannot be made.
     #[error("--releases-dir {dir}: {source}", dir = dir.display())]
     Releases {
@@ -563,6 +618,41 @@ impl Args {
         .resolve(space)
     }
 
+    /// The proxy in front of every listener, if `--proxy-auth-file` names its secret
+    /// ([`Behind`]; `None`: the server is reached directly).
+    ///
+    /// # Errors
+    /// The secret file or the `--worker-deny-list` file cannot be read, or the secret is
+    /// not one the proxy can present ([`ProxySecret::from_file`]). A deny list that cannot be
+    /// read or parsed, at open or at the recount for the warning, stops the start (it is
+    /// never ignored); the error names the flag's path and line, never the secret.
+    pub fn proxy(&self) -> Result<Option<Behind>, ConfigError> {
+        let Some(path) = self.proxy_auth_file.as_deref() else {
+            return Ok(None);
+        };
+        let secret = ProxySecret::from_file(path)?;
+        let deny_list = self
+            .worker_deny_list
+            .as_deref()
+            .map(DenyList::open)
+            .transpose()?;
+        if let Some(list) = &deny_list {
+            let inert = list.certificate_entries()?;
+            if inert > 0 {
+                tracing::warn!(
+                    entries = inert,
+                    "--worker-deny-list has serial or spki-sha256 entries, which never match \
+                     a call behind --proxy-auth-file (the proxy forwards a node id, not a \
+                     certificate): only node entries take effect"
+                );
+            }
+        }
+        Ok(Some(Behind {
+            secret: Arc::new(secret),
+            deny_list,
+        }))
+    }
+
     /// The listeners these flags describe.
     ///
     /// # Errors
@@ -571,6 +661,11 @@ impl Args {
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
         let reload = Duration::from_secs(self.tls_reload_interval_secs);
+        let deny_list = self
+            .worker_deny_list
+            .as_deref()
+            .map(DenyList::open)
+            .transpose()?;
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
@@ -586,14 +681,13 @@ impl Args {
                     },
                     reload,
                 )?,
-                deny_list: self
-                    .worker_deny_list
-                    .as_deref()
-                    .map(DenyList::open)
-                    .transpose()?,
+                deny_list: deny_list.clone(),
             }),
             _ => None,
         };
+        if deny_list.is_some() && worker_tls.is_none() && self.proxy_auth_file.is_none() {
+            return Err(ConfigError::DenyListWithoutIdentity);
+        }
         let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
             (Some(cert), Some(key)) => Some(TlsSource::files(
                 "reapi",
@@ -780,6 +874,17 @@ impl Args {
             max_entries: self.input_tree_cache_entries,
             max_bytes: self.input_tree_cache_bytes,
             reads_in_flight: self.input_tree_reads_in_flight,
+        }
+    }
+
+    /// The write pool of the node's write tier: `--write-pool-writers` and
+    /// `--write-pool-queue` and `--write-pool-stream-idle`.
+    #[must_use]
+    pub const fn write_pool_config(&self) -> kbf_front::PoolConfig {
+        kbf_front::PoolConfig {
+            writers: self.write_pool_writers,
+            queue: self.write_pool_queue,
+            stream_idle: Duration::from_secs(self.write_pool_stream_idle),
         }
     }
 

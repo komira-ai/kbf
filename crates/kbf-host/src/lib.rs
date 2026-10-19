@@ -1,5 +1,5 @@
-//! `kbf-host`: the one way kbf changes a host. `kbf-deploy`'s kits and `kbf-updater`'s
-//! applier both build a [`Plan`] and carry it out with [`execute`].
+//! `kbf-host`: the one way kbf changes a host. `kbf-deploy`'s kits and `kbf-installer`'s
+//! host verbs both build a [`Plan`] and carry it out with [`execute`].
 //!
 //! A caller asks the host what is there and builds a [`Plan`] of [`Step`]s that brings
 //! the host to what it wants. By default [`execute`] prints each step as

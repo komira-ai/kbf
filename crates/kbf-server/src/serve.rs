@@ -12,7 +12,7 @@ use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
+    Backend, ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
     RECORDER_CHANNEL, Recorder, RequestMetadataLayer, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
@@ -34,11 +34,13 @@ use crate::drain::Drain;
 use crate::farm::{Farm, StateError};
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::Readiness;
-use crate::http_blobs::BlobReaders;
+use crate::http_blobs::{BlobReaders, ReadBudget};
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
+use crate::listen::Binder;
 use crate::members::{Members, MembershipError};
 use crate::members_rpc::MembershipService;
+use crate::proxy_auth::{ProxyAuthLayer, ProxySecret, gate_requests};
 use crate::state_store::StateStore;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
@@ -106,7 +108,7 @@ pub struct Listeners {
 
 /// What keeps a long-lived stream from looking idle to a load balancer, a proxy or the
 /// peer: Buck2 sends one Execute per action and never reconnects a broken one, so an
-/// idle-timeout cut fails the action (komira-build-farm#791). Zero turns each off.
+/// idle-timeout cut fails the action (kbf#791). Zero turns each off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamTiming {
     /// How often every open Execute and WaitExecution stream is sent its operation
@@ -145,6 +147,18 @@ pub struct WorkerTls {
     pub deny_list: Option<DenyList>,
 }
 
+/// A server that sits behind a TLS-terminating proxy ([`crate::proxy_auth`]). It takes calls
+/// from loopback only, and believes the identity the proxy forwards under `secret`.
+#[derive(Clone, Debug)]
+pub struct Behind {
+    /// The per-boot secret the proxy presents.
+    pub secret: Arc<ProxySecret>,
+    /// The worker listener's deny list, applied to the nodes the proxy names when the
+    /// listener has no TLS of its own to carry one ([`WorkerTls::deny_list`]); that has
+    /// no certificate to compare, so only a `node` entry can name a caller.
+    pub deny_list: Option<DenyList>,
+}
+
 /// The operator API ([`crate::api`]): where it listens, and the token its writes need.
 #[derive(Clone, Debug)]
 pub struct Api {
@@ -154,7 +168,7 @@ pub struct Api {
     pub token: Option<ApiToken>,
     /// The node's one cache, whose fill `/metrics` reports, when the process runs a
     /// daemon whose input cache shares the disk with this server's store
-    /// (`kbf-all-in-one`).
+    /// (`kbf all-in-one`).
     pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The release store (`--releases-dir`), whose upload route is mounted here and whose
     /// `ReleaseService` the worker listener serves. `None`: the update endpoints answer 503.
@@ -183,6 +197,9 @@ pub enum ServeError {
     /// The storage map could not be read from the state store.
     #[error("storage map: {0}")]
     Map(#[from] MembershipError),
+    /// A frontend that was handing its work to a successor could not stand down.
+    #[error("handover: {0}")]
+    Handover(String),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
@@ -223,8 +240,13 @@ impl Drop for AbortOnDrop {
 /// unacknowledged waits for the client's delayed ACK, about 40 ms on Linux, so each
 /// sequential small call pays that. tonic's `Server::tcp_nodelay` does not apply here:
 /// `serve_with_incoming` takes the options of the incoming stream it is given.
-pub(crate) fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
-    let bound = TcpIncoming::bind(addr).and_then(|incoming| {
+pub(crate) fn bind(
+    addr: SocketAddr,
+    binder: &Binder,
+) -> Result<(TcpIncoming, SocketAddr), ServeError> {
+    let bound = binder.bind(addr).and_then(|listener| {
+        listener.set_nonblocking(true)?;
+        let incoming = TcpIncoming::from(tokio::net::TcpListener::from_std(listener)?);
         let local = incoming.local_addr()?;
         Ok((incoming.with_nodelay(Some(true)), local))
     });
@@ -233,11 +255,17 @@ pub(crate) fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeE
 
 /// Serves `routes` on `listener` until it fails, or until `stop` completes and the
 /// requests in flight are answered; without a listener, it only waits for `stop`.
-pub(crate) fn serve_api(
-    listener: Option<tokio::net::TcpListener>,
+pub(crate) fn serve_api<L>(
+    listener: Option<L>,
     routes: axum::Router,
     stop: impl Future<Output = ()> + Send + 'static,
-) -> impl Future<Output = std::io::Result<()>> {
+    proxy: Option<Arc<ProxySecret>>,
+) -> impl Future<Output = std::io::Result<()>>
+where
+    L: axum::serve::Listener<Io = tokio::net::TcpStream, Addr = SocketAddr>,
+{
+    // Every route, the fallback too, sees only a call that passed the proxy check.
+    let routes = routes.layer(axum::middleware::from_fn_with_state(proxy, gate_requests));
     match listener {
         Some(listener) => Either::Left(
             axum::serve(
@@ -264,8 +292,9 @@ fn set_nodelay(tcp: &mut tokio::net::TcpStream) {
 
 pub(crate) fn bind_api(
     addr: SocketAddr,
+    binder: &Binder,
 ) -> Result<(tokio::net::TcpListener, SocketAddr), ServeError> {
-    let bound = std::net::TcpListener::bind(addr).and_then(|listener| {
+    let bound = binder.bind(addr).and_then(|listener| {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(listener)?;
         let local = listener.local_addr()?;
@@ -274,28 +303,48 @@ pub(crate) fn bind_api(
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
-/// The worker listener's server: every call goes through the per-method role table
-/// ([`crate::worker_roles`]) before it is routed.
-pub(crate) type WorkerListener = Server<Stack<WorkerRolesLayer, Identity>>;
+/// The worker listener's server: every call goes through the proxy check
+/// ([`crate::proxy_auth`]), then the per-method role table ([`crate::worker_roles`]), before
+/// it is routed. (`Server::layer` makes the first layer added the outermost.)
+pub(crate) type WorkerListener = Server<Stack<WorkerRolesLayer, Stack<ProxyAuthLayer, Identity>>>;
 
 /// The worker listener's role table, its TLS source, and the way its peers are told
 /// apart. Every worker listener is made here, so none serves a call the table does not
 /// list. Not generic, so both arms are one set of lines whatever the cache types (a
 /// per-instantiation copy that misses one arm would count as missed lines).
+///
+/// Behind a proxy without TLS of its own the listener is still `Certified`: the identity is
+/// the proxy's, and the proxy terminates the TLS that carried the certificate.
 pub(crate) fn worker_peers(
     server: Server,
     tls: Option<WorkerTls>,
+    behind: Option<&Behind>,
 ) -> (WorkerListener, Peers, Option<TlsSource>) {
-    match tls {
-        Some(tls) => (
-            server.layer(WorkerRolesLayer::new(Admission::Certified)),
+    let secret = behind.map(|behind| Arc::clone(&behind.secret));
+    let proxy = ProxyAuthLayer::new(secret);
+    match (tls, behind) {
+        (Some(tls), _) => (
+            server
+                .layer(proxy)
+                .layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: tls.deny_list,
             },
             Some(tls.server),
         ),
-        None => (
-            server.layer(WorkerRolesLayer::new(Admission::Open)),
+        (None, Some(behind)) => (
+            server
+                .layer(proxy)
+                .layer(WorkerRolesLayer::new(Admission::Certified)),
+            Peers::Certified {
+                deny_list: behind.deny_list.clone(),
+            },
+            None,
+        ),
+        (None, None) => (
+            server
+                .layer(proxy)
+                .layer(WorkerRolesLayer::new(Admission::Open)),
             Peers::Unauthenticated,
             None,
         ),
@@ -373,18 +422,22 @@ pub(crate) fn map_of(
 }
 
 /// The membership service storage nodes register with, when there are members to keep:
-/// under worker TLS only the storage role may call it. Not generic, for the same reason
+/// under worker TLS only the storage role may call it, each certificate for the names it
+/// holds and not if the listener's deny list refuses it. Not generic, for the same reason
 /// as [`sweeping`].
 pub(crate) fn membership(
     members: Option<Arc<Members>>,
-    certified: bool,
+    peers: &Peers,
 ) -> Option<MembershipServer<MembershipService>> {
-    let admission = if certified {
-        Admission::Certified
-    } else {
-        Admission::Open
+    let (admission, deny_list) = match peers {
+        Peers::Certified { deny_list } => (Admission::Certified, deny_list.clone()),
+        Peers::Unauthenticated => (Admission::Open, None),
     };
-    Some(MembershipService::new(members?, admission).server())
+    Some(
+        MembershipService::new(members?, admission)
+            .with_deny_list(deny_list)
+            .server(),
+    )
 }
 
 /// Expires members while the server runs. Never completes; with no state store there
@@ -478,7 +531,7 @@ where
 /// are refused UNAVAILABLE, which Buck2 retries when it opens the call; and the REAPI
 /// listener stops accepting and every connection on it is sent GOAWAY. Open Execute and
 /// WaitExecution streams are kept until their action is done: Buck2 does not recover a
-/// stream that breaks (komira-build-farm#791), so ending one fails its action. The
+/// stream that breaks (kbf#791), so ending one fails its action. The
 /// serving future returns once the REAPI connections have closed. Only
 /// `listeners.shutdown_timeout` (when it is not [`Duration::MAX`]) or [`Drain::close`]
 /// (a second stop signal) ends the streams that are not done, UNAVAILABLE, after which
@@ -528,7 +581,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, None, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, None, None, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
@@ -548,7 +603,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, state, None, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, state, None, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_state`], sending daemons the storage map `map` holds if given: in
@@ -569,7 +626,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, state, None, map, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, state, None, map, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`], and with a `storage` node (`--storage`) the REAPI
@@ -590,13 +649,17 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, storage, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, None, storage, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`] with all of its options: the scheduler's state in
 /// `state` ([`bind_server_with_state`]), the client's CAS, ByteStream and
 /// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]), and
-/// the storage map `map` sent to daemons ([`bind_server_with_map`]).
+/// the storage map `map` sent to daemons ([`bind_server_with_map`]), and a TLS-terminating
+/// `proxy` in front of every listener (`--proxy-auth-file`, [`crate::proxy_auth`]; `None`:
+/// the server is reached directly).
 ///
 /// # Errors
 /// As [`bind_server_with_state`].
@@ -612,6 +675,7 @@ pub fn bind_server_with_options<M, O>(
     state: Option<StateStore>,
     storage: Option<tonic::transport::Endpoint>,
     map: Option<Arc<dyn MapSource>>,
+    proxy: Option<Behind>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -620,6 +684,13 @@ where
 {
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
     let (state, history) = crate::history::take(state);
+    // One read budget for every reader of blobs and logs in this process: the blob route,
+    // the failure-log route and the history writer's tail reads.
+    let budget = ReadBudget::default();
+    let history = history.map(|history| {
+        let blobs = Arc::new(Backend::from(Arc::clone(&cache)));
+        history.with_blobs(blobs, budget.clone())
+    });
     let recording = crate::history::install(recording, history.as_ref());
     let default_memory = listeners.memory_ladder.first();
     let farm = Farm::new(
@@ -633,16 +704,23 @@ where
     // Storage nodes register with a frontend that has a state store to keep them in.
     let members = members_of(state.as_ref());
     let map = map_of(map, members.as_ref())?;
+    // The update rows live in the same store, whose handle is shared.
+    let update_rows = state
+        .as_ref()
+        .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
+    let update_store = state.as_ref().map(|s| Arc::clone(&s.store));
     let farm = Arc::new(farm.with_state(state)?);
-    let (reapi_incoming, reapi) = bind(listeners.reapi)?;
-    let (worker_incoming, worker) = bind(listeners.worker)?;
-    let peers_certified = listeners.worker_tls.is_some();
+    // One start, one bind budget: the three listeners wait for a late interface together.
+    let binder = Binder::new();
+    let (reapi_incoming, reapi) = bind(listeners.reapi, &binder)?;
+    let (worker_incoming, worker) = bind(listeners.worker, &binder)?;
     let (mut worker_server, peers, worker_tls) = worker_peers(
         keepalive(
             flow_control(Server::builder(), listeners.stream_limits.worker),
             listeners.streams,
         ),
         listeners.worker_tls,
+        proxy.as_ref(),
     );
     let tls_sources: Vec<TlsSource> = listeners
         .reapi_tls
@@ -656,7 +734,9 @@ where
     let (api_listen, token, local, releases) = api.map_or((None, None, None, None), |api| {
         (Some(api.listen), api.token, api.local_cache, api.releases)
     });
-    let api_listener = api_listen.map(bind_api).transpose()?;
+    // One line: a `?` alone on its own line is a never-taken error region, a missed
+    // line in the coverage ratchet (it counts lines per generic copy, best copy wins).
+    let api_listener = api_listen.map(|l| bind_api(l, &binder)).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let readiness = Arc::new(Readiness::default());
     let (closer, closing) = kbf_front::closing();
@@ -664,37 +744,66 @@ where
     let drain = Arc::new(drain);
     let health_routes =
         crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
-    let blob_routes =
-        crate::http_blobs::router(Arc::clone(&cache), BlobReaders::from_policy(&policy));
+    let blob_routes = crate::http_blobs::router(
+        Arc::clone(&cache),
+        BlobReaders::from_policy(&policy),
+        budget.clone(),
+    );
     let page_routes = crate::http_invocations::router(
         recorder.clone(),
         Arc::clone(&cache),
         InvocationReaders::from_policy(&policy),
+        history.as_ref().map(crate::history::History::reads),
+        budget,
     );
+    let offers =
+        crate::release::offers::offers_of(releases.clone(), update_rows.clone(), listeners.tick);
     let api_routes = crate::api::router(
         Arc::clone(&farm),
         token.clone(),
         Arc::clone(&drain),
         members.clone(),
+        update_rows.clone(),
+        // A server with no frontend role has no enrollment.
+        None,
     )
-    .merge(crate::release::router(releases.clone(), token))
+    .merge(crate::verbs::routes(token.clone(), members.clone()))
+    .merge(crate::release::router(releases.clone(), token.clone()))
+    .merge(crate::update_hosts::router(
+        Arc::clone(&farm),
+        update_rows.clone(),
+        crate::update_hosts::FarmReaders::from_policy(&policy),
+    ))
+    .merge(crate::release::desired::router(
+        releases.clone(),
+        update_rows,
+        token,
+        Arc::clone(&farm),
+    ))
     .merge(health_routes)
     .merge(crate::metrics::router(
         Arc::clone(&cache),
         local,
         history.as_ref().map(crate::history::History::stats),
+        members.clone(),
         tls_sources,
     ))
     .merge(blob_routes)
     .merge(page_routes);
+    // The storage health, if there are members: no branch in this generic function.
+    let api_routes = members.iter().fold(api_routes, |routes, members| {
+        routes.merge(crate::storage_health::router(Arc::clone(members)))
+    });
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
+    let proxy_secret = proxy.as_ref().map(|behind| Arc::clone(&behind.secret));
     let mut reapi_server = keepalive(
         flow_control(Server::builder(), listeners.stream_limits.reapi),
         listeners.streams,
-    );
+    )
+    .layer(ProxyAuthLayer::new(proxy_secret.clone()));
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),
@@ -718,6 +827,7 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let membership = membership(members.clone(), &peers);
     let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -726,10 +836,13 @@ where
     );
     // The map, if there is one: no branch in this generic function.
     let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+    // The offers, if there are a release store and a state store: no branch here either.
+    let sessions = offers
+        .into_iter()
+        .fold(sessions, WorkerService::with_offers);
     let worker_service = WorkerServer::new(sessions)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let membership = membership(members.clone(), peers_certified);
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
@@ -777,6 +890,10 @@ where
         // and they never delay it. It stops when the serving future does.
         let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
+        // The rolling-update controller; it starts no host until `auto_nodes` is set.
+        let _updates =
+            crate::update::spawn_controller(Arc::clone(&farm), update_store, listeners.tick)
+                .map(AbortOnDrop);
         // `reapi_incoming` carries the REAPI TLS when there is any, so the health
         // service is served over the same TLS as the REAPI routes; the authenticator is
         // already applied to those routes alone (above).
@@ -803,6 +920,7 @@ where
             async {
                 let _ = api_stopped.await;
             },
+            proxy_secret,
         );
         tokio::pin!(api_serve);
         let sweeping = sweeping(members);
@@ -932,7 +1050,51 @@ pub fn bind_service(
     ),
     ServeError,
 > {
-    let (incoming, addr) = bind(listen)?;
+    serve_service(service, bind_storage_socket(listen)?, tls, shutdown)
+}
+
+/// A storage listener's socket: bound, so its address is known and callers queue on it,
+/// and not yet serving ([`bind_storage_socket`], then [`serve_service`]).
+pub struct StorageSocket {
+    incoming: TcpIncoming,
+    addr: SocketAddr,
+}
+
+impl StorageSocket {
+    /// Where the socket is bound.
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+/// Binds `listen`, serving nothing yet: a storage node registers with its frontend from
+/// the bound address before it opens the cache it serves.
+///
+/// # Errors
+/// The listener cannot be bound.
+pub fn bind_storage_socket(listen: SocketAddr) -> Result<StorageSocket, ServeError> {
+    let (incoming, addr) = bind(listen, &Binder::new())?;
+    Ok(StorageSocket { incoming, addr })
+}
+
+/// [`bind_service`] over a socket already bound ([`bind_storage_socket`]).
+///
+/// # Errors
+/// As [`bind_storage`].
+pub fn serve_service(
+    service: kbf_storage::service::StorageService,
+    socket: StorageSocket,
+    tls: Option<TlsSource>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<
+    (
+        BoundStorage<impl Future<Output = Result<(), ServeError>>>,
+        kbf_storage::service::InProcess,
+    ),
+    ServeError,
+> {
+    let StorageSocket { incoming, addr } = socket;
     let mut server = flow_control(
         Server::builder(),
         crate::streams::StreamLimits::DEFAULT.worker,

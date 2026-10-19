@@ -297,6 +297,7 @@ where
     let cache = Cache::open(meta, store, prefix)
         .await?
         .with_writes(args.write_config())
+        .with_write_pool(args.write_pool_config())
         .with_input_trees(args.input_tree_config());
     let local = args.local_cache.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
@@ -311,8 +312,9 @@ where
     let shutdown = shutdown()?;
     let api = args.api()?;
     let storage = args.storage()?;
+    let proxy = args.proxy()?;
     let bound = bind_server_with_options(
-        cache, listeners, api, policy, state, storage, None, shutdown,
+        cache, listeners, api, policy, state, storage, None, proxy, shutdown,
     )?;
     let plain = args.plain_text_off_loopback();
     Ok(ServerHandle {

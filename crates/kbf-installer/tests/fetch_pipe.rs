@@ -4,10 +4,12 @@
 //! child against real servers is in `tests/fetch_e2e.rs`.
 
 use std::fs::{self, File};
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use kbf_installer::fetch::identity::Identity;
 use kbf_installer::fetch::pipe::{Caps, ChildSpec, LOG_BYTES, PipeFault, Received, receive};
 use kbf_installer::run::Confine;

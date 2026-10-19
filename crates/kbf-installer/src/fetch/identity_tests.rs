@@ -3,6 +3,7 @@
 //! travel: no link followed, no file but a regular one, nothing printed, nothing on disk.
 
 use std::fs::{self, File};
+#[cfg(target_os = "linux")]
 use std::io::{Read, Write};
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;

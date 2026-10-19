@@ -13,8 +13,13 @@ Description=kbf build farm, all in one process
 Wants=network-online.target
 After=network-online.target
 
+# A failure that repeats quickly (the cold store or a disk not ready) must not use up
+# systemd's start limit of 5 starts in 10 s and leave the unit down (check-units rule
+# `restart`).
+StartLimitIntervalSec=0
+
 [Service]
-# The daemon half runs rootless Podman as the kbf user.
+# The daemon half runs rootless containers (crun) as the kbf user.
 User=@KBF_USER@
 Slice=kbf.slice
 # The daemon half manages its own cgroup: supervisor/ for itself, actions/ for builds.
@@ -24,14 +29,19 @@ Delegate=yes
 # kbf-server's peak use (KBF_SERVER_RESERVATION_GIB).
 MemoryMin=@SERVER_MEMORY_MIN@
 OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
 CPUWeight=300
 # No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
 Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
 # The single box's cold store is a directory beside the daemon's data (design section
 # 11), so the unit holds no cold-store key (check-units rule `credential`).
-# The scheduler's state is a SQLite file, `state.db` in the data directory: the
-# default of `kbf all-in-one`, so the unit gives no --state-store.
+# The scheduler's state is a SQLite file, `state.db` in the data directory, named here:
+# the default of `kbf all-in-one` is Postgres on the host's socket, and a farm that has
+# not been moved to Postgres (a held script, with the owner's go) must not change store
+# when its binary is replaced.
 ExecStart=@KBF_BIN_DIR@/kbf all-in-one \
+    --state-store=sqlite://@KBF_DATA_DIR@/state.db \
     --cold-store=file://@KBF_DATA_DIR@/cold \
     --meta-dir=@KBF_META_DIR@ \
     --listen=@KBF_LISTEN_HOST@:@KBF_REAPI_PORT@ \
@@ -45,6 +55,7 @@ ExecStart=@KBF_BIN_DIR@/kbf all-in-one \
     --api-listen=127.0.0.1:@KBF_API_PORT@ \
     --api-token-file=@KBF_API_TOKEN_FILE@ \
     --driver=container \
+    --oci-runtime=/usr/bin/crun \
     --server=https://@KBF_HOST_NAME@:@KBF_WORKER_PORT@ \
     --ca-cert=@KBF_ETC@/ca.pem \
     --cert=@KBF_ETC@/node.pem \
@@ -67,7 +78,10 @@ ExecStart=@KBF_BIN_DIR@/kbf all-in-one \
 KillSignal=SIGTERM
 TimeoutStopSec=infinity
 Restart=on-failure
-# Exit 2 is a command line kbf refused: a restart cannot fix it.
+RestartSec=5
+# Exit 2 is a start kbf refused (a flag, a file, a directory that is not a log): a
+# restart cannot fix it. Exit 75 is a start that can pass on a later try (the data
+# directory still held by the process that is stopping): restarted after RestartSec.
 RestartPreventExitStatus=2
 
 [Install]

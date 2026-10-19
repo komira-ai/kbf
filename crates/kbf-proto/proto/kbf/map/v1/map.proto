@@ -51,6 +51,11 @@ message Member {
   // Relative share of the digests, at least 1.
   uint32 weight = 4;
   MemberState state = 5;
+  // The boot counter of the registration this entry stands for (RegisterResponse.boot). The
+  // map's generation moves whenever it does, so a restart inside the lease is visible to
+  // every reader of the map. 0 is "unknown": an older frontend does not send it, and an
+  // older reader ignores it.
+  uint64 boot = 6;
 }
 
 enum MemberState {
@@ -80,7 +85,8 @@ service Membership {
   // as JOINING, or CATCHING_UP when the request says it is rebuilding its index.
   rpc Register(RegisterRequest) returns (RegisterResponse);
   // Keeps the member's row alive, and carries the end of a rebuild (CATCHING_UP to
-  // ACTIVE). NOT_FOUND means the row expired (or never was): register again.
+  // ACTIVE). NOT_FOUND means the row expired (or never was): register again. Under mutual
+  // TLS PERMISSION_DENIED means the caller's certificate does not name the member's address.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
@@ -91,9 +97,13 @@ enum Role {
 
 message RegisterRequest {
   Role role = 1;
-  // Stable across restarts of one node; the key of its member id.
+  // Stable across restarts of one node; the key of its member id. Under mutual TLS the
+  // host of it (`host` or `host:port`) must be one of the DNS or IP names in the caller's
+  // certificate, or the registration is PERMISSION_DENIED.
   string instance_id = 2;
-  // The address callers dial.
+  // The address callers dial. Under mutual TLS its host must be named by the caller's
+  // certificate the same way, and a Heartbeat for the member must come from a
+  // certificate that names it.
   string addr = 3;
   // Relative capacity: its share of the digests, at least 1.
   uint32 weight = 4;
@@ -112,6 +122,11 @@ message RegisterResponse {
   // How often to heartbeat, in milliseconds: well under the row's time to live.
   uint64 heartbeat_interval_ms = 3;
   Map map = 4;
+  // The generation of the cold-store registration the frontend holds (kbf.enroll.v1
+  // `ColdStore.GetStoreConfig`); 0: none, or the frontend cannot say now. The node
+  // fetches the registration when this differs from the one it applied. Only this
+  // service, which storage nodes call, carries it: no daemon message does.
+  uint64 objstore_generation = 5;
 }
 
 message HeartbeatRequest {
@@ -123,6 +138,37 @@ message HeartbeatRequest {
   // Whether the node is still rebuilding its index. A member that is CATCHING_UP becomes
   // ACTIVE at the first heartbeat that says false; no other state is changed by it.
   bool catching_up = 4;
+  // The copies this node owes: blobs it holds that a second owner does not, its open
+  // repair-journal records. Read only when debts_known is true.
+  uint64 repair_debts = 5;
+  // Whether this node has read its repair journal since it started. False says "I cannot
+  // say", never "none": an older node, which sends neither field, reads as false, and so
+  // does a node that has no journal. The frontend sums repair_debts over the members to
+  // judge the farm's under-replicated blobs (docs/design/architecture-v2.md, section 11).
+  bool debts_known = 6;
+  // The cold-store registration generation the node's open store runs on (0: none). Read
+  // together with apply_status.
+  uint64 applied_objstore_generation = 7;
+  // How the node's latest attempt to apply the registration went. UNSPECIFIED (what an
+  // older node sends, having neither field) is recorded as "does not report", never as
+  // success or as "not yet".
+  ApplyStatus apply_status = 8;
+}
+
+// A closed set: a node never sends free text about its store, so a credential cannot ride
+// in it. Every value is in the frontend's convergence answer under the same name.
+enum ApplyStatus {
+  APPLY_STATUS_UNSPECIFIED = 0;
+  // The node runs on `applied_objstore_generation` (or has nothing to apply).
+  APPLY_STATUS_OK = 1;
+  // The node has not applied the generation it was told of yet.
+  APPLY_STATUS_PENDING = 2;
+  // The registered keys failed the node's own put/get/delete probe.
+  APPLY_STATUS_PROBE_FAILED = 3;
+  // The node runs on a `--cold-store` flag naming another store than the registered one.
+  APPLY_STATUS_IDENTITY_MISMATCH = 4;
+  // The node cannot use a registration (no S3 client in this build).
+  APPLY_STATUS_UNSUPPORTED = 5;
 }
 
 message HeartbeatResponse {
@@ -131,4 +177,6 @@ message HeartbeatResponse {
   // The current map, when its generation is above the request's have_generation: a node
   // that missed a bump learns it from its next beat, with no other call.
   Map map = 2;
+  // As RegisterResponse.objstore_generation.
+  uint64 objstore_generation = 3;
 }

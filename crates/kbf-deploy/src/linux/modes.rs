@@ -18,6 +18,8 @@
 //! - `continuation`: no comment line inside a continued directive. systemd 241 and
 //!   later skip one (systemd.syntax(7)); 240 skips one only at the start of the line,
 //!   and 239 and older join it into the value, so its words become arguments.
+//! - `runtime`: a mode that runs builds passes `--oci-runtime=` and no
+//!   `--container-runtime` ([`super::runtime`]).
 //! - `exec`: `ExecStart=` is `<KBF_BIN_DIR>/kbf <mode>`, this unit's mode (a unit
 //!   that starts another mode, or an old binary, under this mode's name).
 //! - `slice`: the unit is in `kbf.slice`.
@@ -30,6 +32,12 @@
 //!   (`yes` sets the whole set, `no` clears it), a list adds its controllers to what
 //!   earlier lines gave (so `Delegate=yes` then `Delegate=memory` still delegates all),
 //!   an empty value starts over with none.
+//! - `caps`, `swap`, `oom`: a mode that runs builds sets no `MemoryMax=`, `MemoryHigh=`,
+//!   `CPUQuota=` or `AllowedCPUs=` and no `MemorySwapMax=` on its unit (its leases live in
+//!   the unit's cgroup), and an `OOMScoreAdjust=` below 0, the containers' score
+//!   ([`super::limits`]).
+//! - `meta-dir`: the metadata directory of `storage-and-daemon` and `all-in-one` is not
+//!   under `--data-dir` ([`super::stores`]).
 //! - `credential`: the units of a mode without a storage half (`daemon`, `all-in-one`)
 //!   do not give it the cold store's key; [`super::credential`] says what the rule reads
 //!   and what it cannot see. The unit that holds the key (`storage`) runs as a user of
@@ -48,6 +56,9 @@
 //! - `handover`: the frontend's unit is the template `kbf-frontend@.service` whose two
 //!   instances hand over to one another: `Type=notify`, a control socket in a preserved
 //!   `RuntimeDirectory=`, no `Conflicts=` ([`super::handover`]).
+//! - `restart`: a node unit (`storage`, `daemon`, `storage-and-daemon`) has
+//!   `RestartSec=5` and `StartLimitIntervalSec=0`, so a failure that repeats quickly
+//!   never ends in `start-limit-hit` ([`super::restart`]).
 //! - `stop`: a mode that drains on SIGTERM (every mode but `daemon`) has
 //!   `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`, so systemd never kills it
 //!   mid-drain and fails the builds in flight ([`super::stop`]).
@@ -89,10 +100,9 @@ use kbf_host::exec::Exec;
 use kbf_host::path::HostPath;
 use kbf_host::step::Cmd;
 
-use super::check::{Failure, Report, angle_placeholder};
 use super::config::{LinuxConfig, LinuxError};
-use super::render::{SLICE, values};
-use super::{cpuset, credential, handover, stop, stores};
+use super::shared::{Failure, Report, SLICE, angle_placeholder, values};
+use super::{cpuset, credential, handover, limits, restart, runtime, stop, stores, traverse};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -145,6 +155,19 @@ impl Mode {
         }
     }
 
+    /// Whether the mode's unit retries a repeating failure for as long as it lasts (rule
+    /// `restart`): `storage`, `daemon`, `storage-and-daemon` and `all-in-one`, whose
+    /// starts can fail with exit 75 until the environment is ready. The frontend keeps
+    /// its own policy. (`Restart=on-failure` never restarts a clean exit, so an old
+    /// process that drained after a handover and exited 0 stays down either way.)
+    #[must_use]
+    pub fn is_node(self) -> bool {
+        matches!(
+            self,
+            Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne
+        )
+    }
+
     /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`).
     #[must_use]
     pub fn runs_builds(self) -> bool {
@@ -179,6 +202,13 @@ impl Mode {
     #[must_use]
     pub fn holds_key(self) -> bool {
         self == Mode::Storage
+    }
+
+    /// Whether the mode's unit gives both a metadata directory and the daemon's data
+    /// directory (rule `meta-dir`).
+    #[must_use]
+    pub fn has_meta_and_data(self) -> bool {
+        matches!(self, Mode::StorageAndDaemon | Mode::AllInOne)
     }
 
     /// The unit's file name: `kbf-<mode>.service`, and for the frontend the template
@@ -313,6 +343,51 @@ pub fn check(
     ))
 }
 
+/// Rule `traverse`: a `file://` `--hot-store` the unit's `User=` can reach. Skipped, with
+/// a note, where the user or a directory cannot be read.
+fn hot_store_reachable<E: Exec>(
+    exec: &E,
+    unit: &UnitFile,
+    failures: &mut Vec<Failure>,
+    notes: &mut Vec<String>,
+) {
+    let Some(dir) = unit
+        .flag("hot-store")
+        .and_then(|v| v.strip_prefix("file://"))
+        .and_then(|v| HostPath::new(v).ok())
+    else {
+        return;
+    };
+    let Some(name) = unit.get_in("Service", "User").filter(|u| !u.is_empty()) else {
+        return;
+    };
+    let user = match kbf_host::user::lookup(exec, name) {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            notes.push(format!(
+                "SKIP traverse: no user {name} on this host, so the path to --hot-store was not read"
+            ));
+            return;
+        }
+        Err(e) => {
+            notes.push(format!("SKIP traverse: {e}"));
+            return;
+        }
+    };
+    // root enters every directory.
+    if user.uid == 0 {
+        return;
+    }
+    match traverse::blocked_by(&user, &dir, |p| exec.stat(p)) {
+        Ok(None) => {}
+        Ok(Some((above, meta))) => failures.push(Failure {
+            rule: "traverse",
+            message: traverse::message(&user, &dir, &above, &meta),
+        }),
+        Err(e) => notes.push(format!("SKIP traverse: {e}")),
+    }
+}
+
 /// [`check`] on `unit` and its drop-ins, `kbf.slice` (`slice`, with its drop-ins), and
 /// then the rules that read the host `exec` runs on: `parse` (`kbf_bin`, or the unit's
 /// own binary when `exec` shows it there, run as `<kbf> check-args <mode> <flags...>`
@@ -381,6 +456,7 @@ pub fn check_on_host<E: Exec>(
         }
         notes.extend(found.notes);
     }
+    hot_store_reachable(exec, &merged, &mut failures, &mut notes);
     let argv = merged.exec_start();
     if runs_this_mode(config, mode, &argv) {
         let found = match kbf_bin {
@@ -599,6 +675,13 @@ fn rules(
         );
     }
 
+    // runtime
+    if mode.runs_builds() {
+        for how in runtime::check(&name, unit) {
+            fail("runtime", how);
+        }
+    }
+
     // slice
     if unit.get_in("Service", "Slice") != Some(SLICE) {
         fail("slice", format!("{name} is not in {SLICE}"));
@@ -638,6 +721,13 @@ fn rules(
         );
     }
 
+    // caps, swap, oom
+    if mode.runs_builds() {
+        for (rule, how) in limits::check(unit) {
+            fail(rule, format!("{name} {how}"));
+        }
+    }
+
     // credential
     if mode.holds_no_key() || mode.holds_key_beside_builds() {
         let allowed = mode.holds_key_beside_builds();
@@ -657,6 +747,13 @@ fn rules(
         }
     }
 
+    // meta-dir
+    if mode.has_meta_and_data() {
+        for how in stores::meta_dir(unit) {
+            fail("meta-dir", format!("{name} {how}"));
+        }
+    }
+
     // state-store
     for how in stores::state_store(unit) {
         fail("state-store", format!("{name}: {how}"));
@@ -671,6 +768,13 @@ fn rules(
     if mode == Mode::Frontend {
         for how in handover::check(unit) {
             fail("handover", format!("{name} {how}"));
+        }
+    }
+
+    // restart
+    if mode.is_node() {
+        for how in restart::check(unit) {
+            fail("restart", format!("{name} {how}"));
         }
     }
 

@@ -10,8 +10,9 @@ use kbf_sched::{
     RequeueReason, Scheduler,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseId, LeaseKind,
-    MemoryKill, MemoryRun, OperationId, Qos, Resources, StateMachine, WaiterId, WorkerId,
+    ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun,
+    FarmTime, LeaseId, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos,
+    Resources, ResultRecord, StateMachine, WaiterId, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -322,6 +323,7 @@ fn a_fate_restores_the_booking_and_the_memory_runs() {
             booked: GIB,
             kill: MemoryKill::NodePressure,
         }],
+        ..Fate::default()
     };
     let mut small = queued(3, request(3));
     small.fate = Some(fate.clone());
@@ -347,6 +349,73 @@ fn a_fate_restores_the_booking_and_the_memory_runs() {
     );
 }
 
+/// Catches: a farm run, an avoided node or a not-started count a successor drops (the
+/// operation gets `FARM_RERUNS` more reruns, placement offers it the node that lost it,
+/// and a node that drops every `Start` gets `NOT_STARTED_RERUNS` more); and `fate()`
+/// giving back less than it took up, so the next write loses it. Also an operation with
+/// no fault: no fate to write.
+#[test]
+fn a_fate_restores_the_budgets() {
+    let fate = Fate {
+        booked_bytes: GIB,
+        farm_runs: vec![
+            FarmRun {
+                worker: node("node-a"),
+                fault: FarmFault::Lost(LostWhy::Fenced),
+            },
+            FarmRun {
+                worker: node("node-b"),
+                fault: FarmFault::Infra,
+            },
+        ],
+        avoid: [node("node-a"), node("node-b")].into_iter().collect(),
+        not_started: 2,
+        ..Fate::default()
+    };
+    let mut faulted = queued(3, request(3));
+    faulted.fate = Some(fate.clone());
+    let s = recovered(vec![faulted, queued(4, request(4))]);
+    assert_eq!(s.fate(OperationId(3)), Some(fate.clone()));
+    assert_eq!(s.farm_runs(OperationId(3)), Some(fate.farm_runs.as_slice()));
+    assert_eq!(s.fate(OperationId(4)), None);
+    assert_eq!(s.farm_runs(OperationId(4)), Some(&[][..]));
+}
+
+/// Catches: `is_empty` calling a fate empty while one of its parts holds something (a
+/// row never written for it), or non-empty for a fate that changed nothing (a row
+/// written at every requeue).
+#[test]
+fn a_fate_is_empty_only_when_every_part_is() {
+    assert!(Fate::default().is_empty());
+    let run = FarmRun {
+        worker: node("node-a"),
+        fault: FarmFault::Infra,
+    };
+    let parts = [
+        Fate {
+            memory_runs: vec![MemoryRun {
+                worker: node("node-a"),
+                booked: GIB,
+                kill: MemoryKill::NodePressure,
+            }],
+            ..Fate::default()
+        },
+        Fate {
+            farm_runs: vec![run],
+            ..Fate::default()
+        },
+        Fate {
+            avoid: [node("node-a")].into_iter().collect(),
+            ..Fate::default()
+        },
+        Fate {
+            not_started: 1,
+            ..Fate::default()
+        },
+    ];
+    assert!(parts.iter().all(|part| !part.is_empty()));
+}
+
 /// Catches: `fate()` answering for an operation the scheduler does not hold, and a fate
 /// with no runs that books memory it should not or that leaves a phantom entry of runs
 /// behind (a raised booking is kept; no kills are held).
@@ -356,9 +425,75 @@ fn a_fate_without_runs_raises_the_booking_and_holds_no_kills() {
     raised.fate = Some(Fate {
         booked_bytes: 8 * GIB,
         memory_runs: Vec::new(),
+        ..Fate::default()
     });
     let s = recovered(vec![raised]);
     assert_eq!(s.fate(OperationId(99)), None, "an operation not held");
     assert_eq!(s.fate(OperationId(6)), None, "no kills to hand on");
     assert!(s.memory_state().runs_by_operation().is_empty());
+}
+
+/// Catches: an operation taken in while the scheduler runs (the store holds one another
+/// writer queued) that does not move the ids past its own (the next operation would
+/// take its id), that is not joined by a request for its action (a second run), or
+/// that is not placed like a recovered one; and a skip that moves the ids back.
+#[test]
+fn an_operation_taken_in_while_running_is_joined_and_the_ids_move_past_it() {
+    let mut s = recovered(Vec::new());
+    s.take_in(queued(12, request(3)));
+    assert_eq!(s.state(OperationId(12)), Some(&OpState::Queued));
+    assert_eq!(s.next_operation(), OperationId(13));
+    assert_eq!(s.queued_len(), 1);
+
+    let again = Event::Submit {
+        waiter: WaiterId(99),
+        request: request(3),
+    };
+    assert!(feed(&mut s, 0, again).is_empty());
+    assert_eq!(
+        s.waiters(OperationId(12)),
+        Some(&[WaiterId(12), WaiterId(99)][..])
+    );
+    assert_eq!(s.next_operation(), OperationId(13), "a joiner took an id");
+
+    s.skip_to(OperationId(20));
+    assert_eq!(s.next_operation(), OperationId(20));
+    s.skip_to(OperationId(15));
+    assert_eq!(s.next_operation(), OperationId(20), "the ids went back");
+}
+
+/// Catches: `take_in` of an operation the scheduler holds that takes it up again: the
+/// store's rows of a finished operation outlive its finish while the write is held, and
+/// a request that finds them must not queue the finished operation afresh (a second
+/// run, a new waiter over the answered ones, the twin entry set again). The state, the
+/// queue, the waiters and the twin stay as the scheduler holds them; one it does not
+/// hold is taken.
+#[test]
+fn an_operation_the_scheduler_holds_is_not_taken_in_again() {
+    let mut s = recovered(vec![leased(12, request(3), 5, "node-a")]);
+    up(&mut s, 0, "node-a");
+    heartbeat(&mut s, 1, "node-a", vec![LeaseId::new(TERM, 5)]);
+    let done = Event::Committed(ControlRecord::Result(ResultRecord {
+        lease: LeaseId::new(TERM, 5),
+        operation: OperationId(12),
+        outcome: Outcome::Failed(Failure::Invalid),
+    }));
+    assert!(matches!(
+        feed(&mut s, 2, done).as_slice(),
+        [Effect::Answer(_)]
+    ));
+    let finished = s.state(OperationId(12)).cloned();
+    assert!(finished.as_ref().is_some_and(OpState::is_done));
+    assert_eq!(s.twin(&request(3)), None);
+
+    assert!(
+        !s.take_in(queued(12, request(3))),
+        "a held operation was taken"
+    );
+
+    assert_eq!(s.state(OperationId(12)), finished.as_ref());
+    assert_eq!(s.queued_len(), 0);
+    assert_eq!(s.waiters(OperationId(12)), Some(&[WaiterId(12)][..]));
+    assert_eq!(s.twin(&request(3)), None, "a finished operation is a twin");
+    assert!(s.take_in(queued(13, request(4))), "a new one was refused");
 }

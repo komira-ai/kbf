@@ -9,8 +9,9 @@
 //!
 //! Unknown keys and duplicate keys are refused (serde's derived parser does both), a record
 //! larger than [`MAX_RECORD_BYTES`] is refused before it is parsed, and the key set a verb
-//! carries is checked: `activate` and `frontend_update` have components and the expected facts,
-//! `confirm` and `revert` have neither.
+//! carries is checked: `activate` has components and the expected facts; `confirm`, `revert`
+//! and `frontend_update` have neither (a `frontend_update` is a locator: the installer fetches
+//! the commit from its own source).
 
 use std::fmt;
 use std::str::FromStr;
@@ -33,9 +34,10 @@ pub enum OrderVerb {
     Activate,
     Confirm,
     Revert,
-    /// The frontend host's own update: accepted only on a frontend host, from `orders/`, and
-    /// carries components and expected facts like `activate` (built from the frontend's own
-    /// release store).
+    /// The frontend host's own update: accepted only on a frontend host, from `orders/`. A
+    /// locator and nothing else, like `confirm`: no components and no expected facts, because
+    /// the proxy that writes it has no release store; the installer fetches the commit from
+    /// the source in `installer.toml`, takes the attestation from there and probes the binary.
     FrontendUpdate,
 }
 
@@ -202,7 +204,7 @@ impl OrderRecord {
 
     fn check_shape(&self) -> Result<(), String> {
         match self.verb {
-            OrderVerb::Confirm | OrderVerb::Revert => {
+            OrderVerb::Confirm | OrderVerb::Revert | OrderVerb::FrontendUpdate => {
                 if !self.components.is_empty() || self.expected.is_some() {
                     return Err(format!(
                         "a {:?} record carries no components and no expected facts",
@@ -211,19 +213,16 @@ impl OrderRecord {
                 }
                 return Ok(());
             }
-            OrderVerb::Activate | OrderVerb::FrontendUpdate => {}
+            OrderVerb::Activate => {}
         }
         if self.components.is_empty() || self.components.len() > MAX_COMPONENTS {
             return Err(format!(
-                "a {:?} record carries 1 to {MAX_COMPONENTS} components, not {}",
-                self.verb,
+                "an activate record carries 1 to {MAX_COMPONENTS} components, not {}",
                 self.components.len()
             ));
         }
         let Some(expected) = &self.expected else {
-            return Err(
-                "an activate or frontend_update record carries the expected facts".to_owned(),
-            );
+            return Err("an activate record carries the expected facts".to_owned());
         };
         if !name_ok(&expected.profile, 32) || expected.profile.contains('.') {
             return Err(format!("profile {:?} is not [a-z0-9_-]", expected.profile));

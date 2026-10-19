@@ -14,6 +14,7 @@ prost-types.workspace = true
 thiserror.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+zeroize.workspace = true
 
 [build-dependencies]
 protox.workspace = true
@@ -21,6 +22,8 @@ tonic-prost-build.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+# tests/enroll.rs ties the refusal codes and token parts of kbf-types to this wire.
+kbf-types.workspace = true
 # Compiles the protos for tests/daemon_wire.rs's walk of the daemon's messages.
 protox.workspace = true
 sha2.workspace = true

@@ -127,6 +127,11 @@ fn the_deny_list_parses_every_entry_or_names_the_bad_line() {
         Some("node mac-07".to_owned())
     );
     assert_eq!(denied.refuses(None, "mac-08"), None);
+    assert_eq!(
+        denied.refuses(None, "MAC-07"),
+        Some("node mac-07".to_owned()),
+        "a node id is compared up to ASCII case"
+    );
     let other = peer(vec![dns("node-a")]);
     assert_eq!(denied.refuses(Some(&other), "node-a"), None);
 
@@ -161,6 +166,62 @@ fn the_deny_list_parses_every_entry_or_names_the_bad_line() {
     }
 }
 
+/// Catches: a storage node's certificate judged by one name only, or by none. A storage
+/// certificate carries several names, and a `node` entry denies it when any DNS name in
+/// it is listed, up to ASCII case (an IP name is no node id, and a listed name that is only
+/// a prefix is not that node); its serial and key are judged as for a daemon, a listed node
+/// being reported before them.
+///
+/// Mutants seen red: only the first DNS name looked at; names compared with `==`.
+#[test]
+fn a_storage_certificate_is_denied_by_any_of_its_names_its_serial_or_its_key() {
+    let several = PeerCert::from_der(&cert(
+        vec![
+            SanType::IpAddress([192, 0, 2, 1].into()),
+            dns("node-a"),
+            dns("node-a.farm.example"),
+            role("storage"),
+        ],
+        "cn",
+        &[0x0a],
+    ))
+    .expect("certificate");
+    let denied = |text: &str| Denied::parse(text).expect("a list");
+    assert_eq!(
+        denied("node node-a.farm.example").refuses_cert(&several),
+        Some("node node-a.farm.example".to_owned())
+    );
+    assert_eq!(
+        denied("node node-a").refuses_cert(&several),
+        Some("node node-a".to_owned())
+    );
+    for not_listed in ["node node-b", "node node-", "node 192.0.2.1", ""] {
+        assert_eq!(
+            denied(not_listed).refuses_cert(&several),
+            None,
+            "{not_listed}"
+        );
+    }
+    assert_eq!(
+        denied("node NODE-A.Farm.Example").refuses_cert(&several),
+        Some("node NODE-A.Farm.Example".to_owned()),
+        "up to ASCII case, and the entry is reported as listed"
+    );
+    assert_eq!(
+        denied("serial 0A").refuses_cert(&several),
+        Some("certificate serial a".to_owned())
+    );
+    let key = format!("spki-sha256 {}", several.spki_sha256());
+    assert_eq!(
+        denied(&key).refuses_cert(&several),
+        Some(format!("public key {}", several.spki_sha256()))
+    );
+    assert_eq!(
+        denied(&format!("{key}\nserial 0a\nnode node-a")).refuses_cert(&several),
+        Some("node node-a".to_owned())
+    );
+}
+
 /// Catches: a server that starts with a deny list it cannot read or parse (the first
 /// daemon would find out instead of the operator).
 #[test]
@@ -179,6 +240,39 @@ fn a_bad_deny_list_is_refused_at_open() {
         error
             .to_string()
             .ends_with("bad.deny:2: a serial is hex digits, colons allowed: \"zz\""),
+        "{error}"
+    );
+}
+
+/// Catches: `certificate_entries` (the count behind the warning of `Args::proxy`) reading a
+/// file that changed after `open` as though it were still good: a list removed or rewritten
+/// as garbage is an error naming the path (and the line), not a count of zero.
+///
+/// Mutants seen red: the read error mapped to an empty list; the parse result unwrapped to
+/// its default (`unwrap_or_default`).
+#[test]
+fn a_list_that_goes_bad_after_open_is_an_error_when_its_certificate_entries_are_counted() {
+    let path = scratch("counted.deny");
+    std::fs::write(
+        &path,
+        "node a\nserial 0a\nspki-sha256 {}\n".replace("{}", &"0".repeat(64)),
+    )
+    .expect("write");
+    let list = DenyList::open(&path).expect("open");
+    assert_eq!(list.certificate_entries().expect("two"), 2);
+
+    std::fs::write(&path, "node a\nserial zz\n").expect("garbage");
+    let error = list.certificate_entries().expect_err("garbage");
+    assert!(
+        matches!(error, DenyListError::Parse { line: 2, .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("counted.deny:2"), "{error}");
+
+    std::fs::remove_file(&path).expect("remove");
+    let error = list.certificate_entries().expect_err("removed");
+    assert!(
+        matches!(&error, DenyListError::Read { path: p, .. } if *p == path),
         "{error}"
     );
 }

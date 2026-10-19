@@ -84,7 +84,7 @@ use kbf_proto::worker::{
 use kbf_types::{LeaseId, NodePhase};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout};
-use tonic::transport::{ClientTlsConfig, Endpoint};
+use tonic::transport::Endpoint;
 
 use crate::clock::{Clock, SystemClock};
 use crate::config::{ConfigError, DaemonConfig};
@@ -153,6 +153,8 @@ pub enum Event {
 pub enum SessionError {
     #[error("connect: {0}")]
     Connect(#[from] tonic::transport::Error),
+    #[error("client identity: {0}")]
+    Identity(#[from] ConfigError),
     #[error("connect: no connection within {0:?}")]
     ConnectTimeout(Duration),
     #[error("stream: {0}")]
@@ -192,8 +194,6 @@ pub struct Daemon {
     config: DaemonConfig,
     /// The `--server` URLs, parsed.
     servers: Vec<Server>,
-    /// The client TLS every connection uses, before its server name is set.
-    tls: ClientTlsConfig,
     /// How server names become addresses, asked again every round.
     resolver: Arc<dyn Resolve>,
     /// Whether the current (or the last) stream got its Welcome.
@@ -300,13 +300,15 @@ impl Daemon {
         if servers.is_empty() {
             return Err(ConfigError::NoServer);
         }
-        let tls = config.tls.load()?;
+        // Read once here so that unreadable files fail the start; every connection reads
+        // them again (`endpoint`), so a certificate renewed while the daemon runs is the
+        // one the next connection presents.
+        config.tls.load()?;
         let (done_tx, done) = mpsc::unbounded_channel();
         let contact = Contact::new(config.fence_after);
         Ok(Self {
             config,
             servers,
-            tls,
             resolver: Arc::new(SystemResolver),
             welcomed: false,
             base: report.clone(),
@@ -590,9 +592,12 @@ impl Daemon {
 
     /// The endpoint for one attempt: `target`'s address, with the URL's host as the
     /// HTTP/2 authority and, unless `--tls-server-name` names another, as the name the
-    /// server's certificate must carry; with the configured HTTP/2 keepalive.
+    /// server's certificate must carry; with the configured HTTP/2 keepalive. The
+    /// client identity is read from its files for each attempt: a node's certificate is
+    /// replaced every few days, and a connection made after that must present the new one
+    /// (a stream already up keeps the certificate it was made with).
     fn endpoint(&self, target: &Target) -> Result<Endpoint, SessionError> {
-        let mut tls = self.tls.clone();
+        let mut tls = self.config.tls.load()?;
         if self.config.tls.server_name.is_none() {
             tls = tls.domain_name(target.server.host.clone());
         }
@@ -1130,9 +1135,7 @@ mod tests {
     /// that repeats the wrapped error.
     #[tokio::test]
     async fn a_connect_error_names_its_cause() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = closed.local_addr().expect("addr").port();
-        drop(closed);
+        let port = kbf_testkit::port::dead_addr().port();
         let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{port}")).expect("url");
         let error = SessionError::from(endpoint.connect().await.expect_err("nothing listens"));
         let text = error.with_causes();

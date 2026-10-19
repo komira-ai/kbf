@@ -147,6 +147,8 @@ fn fetch_url(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
         .build();
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .https_only(true)
+        // No proxy, whatever the environment says.
+        .proxy(None)
         // No redirect, ever: a 3xx is a failed fetch.
         .max_redirects(0)
         .http_status_as_error(false)

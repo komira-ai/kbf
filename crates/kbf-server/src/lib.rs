@@ -13,7 +13,8 @@
 //!   reads and writes ([`blobs`]), each call admitted by the same rules.
 //! - The operator API ([`api`]): HTTP/JSON under `/v1` on a third listener, off unless
 //!   `--api-listen` is given; `GET /v1/nodes`, and cordon, drain and uncordon, which
-//!   need the token of `--api-token-file` ([`token`]). On the same listener,
+//!   need the token of `--api-token-file` ([`token`]), and, behind the farm's proxy
+//!   (`--proxy-auth-file`, [`proxy_auth`]), a call that came through it. On the same listener,
 //!   `GET /healthz` and `GET /readyz` for a front's health check ([`health`]), and
 //!   `GET /metrics`, the cache's upload-path metrics for Prometheus ([`metrics`]).
 //!   The REAPI listener answers `/readyz`'s readiness over `grpc.health.v1`
@@ -26,6 +27,9 @@
 //!   begins, a second signal escalates, and `kbf cluster` calls through [`api_client`].
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
 //!   cordons, drains and hands drained nodes their update, as far as `updating`.
+//! - Node rolling ([`update`]): the pure picker and node step of a split-mode update
+//!   (`docs/design/split-mode-updates.md`, sections 2.6 to 2.11), which host goes next and
+//!   its one next move. No controller drives them yet.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
 //!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
 //!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by
@@ -72,6 +76,7 @@ pub mod blobs;
 mod build_commit;
 pub mod config;
 pub mod drain;
+pub mod enroll;
 pub mod farm;
 mod fault;
 mod flag_set;
@@ -83,6 +88,7 @@ pub mod handover;
 pub mod health;
 pub mod history;
 pub mod http_blobs;
+mod http_history;
 pub mod http_invocations;
 pub mod identity;
 pub mod join;
@@ -90,6 +96,7 @@ mod listen;
 mod local;
 pub mod log_file;
 pub mod machine;
+pub mod managed;
 mod map_push;
 pub mod mdm;
 pub mod members;
@@ -98,22 +105,34 @@ mod memory;
 pub mod metrics;
 mod missing;
 pub mod node_map;
+pub mod object_store;
+pub mod proxy_auth;
 pub mod raft_log;
+mod rebuild;
 pub mod release;
 pub mod replication;
 pub mod rollout;
 mod run_record;
 pub mod serve;
+#[cfg(test)]
+mod serve_remote_tests;
 pub mod stamp;
 mod start;
+mod start_exit;
 mod startup_pass;
 pub mod state_store;
 pub mod storage_half;
+pub mod storage_health;
 pub mod storage_node;
+pub mod store_config;
 pub mod stores;
 pub mod streams;
 mod timeout;
 pub mod token;
+pub mod update;
+pub mod update_hosts;
+pub mod update_status;
+pub mod verbs;
 pub mod worker;
 pub mod worker_roles;
 pub mod write_tier;
@@ -129,12 +148,15 @@ pub use local::LocalStore;
 pub use node_map::NodeMap;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
-    Api, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming, WorkerTls,
-    bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_options,
+    Api, Behind, Bound, BoundStorage, Listeners, ServeError, StorageListener, StreamTiming,
+    WorkerTls, bind_server, bind_server_with_api, bind_server_with_map, bind_server_with_options,
     bind_server_with_policy, bind_server_with_state, bind_server_with_storage, bind_service,
     bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_interruptible};
+pub use start_exit::{
+    NOT_READY, REFUSED, STALE_WRITER_HINT, StartFailure, hint as start_hint, said as start_said,
+};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};
 pub use streams::{StreamArgs, StreamLimits};
 pub use worker::WorkerService;

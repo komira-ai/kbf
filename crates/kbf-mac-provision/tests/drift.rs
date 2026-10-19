@@ -7,8 +7,8 @@ mod support;
 use std::fs;
 
 use support::{
-    COMMERCE, DROPIN, ERR_LOG, FakeMac, HOMES, INTENT, LOGINWINDOW, PLIST, SOFTWARE_UPDATE, VOLUME,
-    apply, check, lines, only_fails,
+    COMMERCE, CONFIG, DROPIN, ERR_LOG, FakeMac, HOMES, INTENT, LOGINWINDOW, PLIST, SOFTWARE_UPDATE,
+    VOLUME, XCODE, apply, check, lines, only_fails,
 };
 
 type Drift = (&'static str, &'static str, fn(&mut FakeMac), &'static str);
@@ -360,6 +360,15 @@ const DRIFTS: &[Drift] = &[
                 .default_set(SOFTWARE_UPDATE, "ConfigDataInstall", "0")
         },
         "ConfigDataInstall is 0",
+    ),
+    (
+        "xcode_disable_manifest_sandbox",
+        "SwiftPM's manifest sandbox on again",
+        |m| {
+            m.state_mut()
+                .default_set(XCODE, "IDEPackageSupportDisableManifestSandbox", "0")
+        },
+        "com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox is 0, want 1",
     ),
     (
         "appstore_auto_update",
@@ -714,6 +723,39 @@ const DRIFTS: &[Drift] = &[
         "the property list's owner",
         |m| m.own(PLIST, 1000, 1000),
         "org.example.kbf-daemon.plist is -rw-r--r-- 1000 1000, want -rw-r--r-- 0 0",
+    ),
+    (
+        "launchd_label",
+        "no node config",
+        |m| m.remove(CONFIG),
+        "/usr/local/etc/kbf/kbf.toml is missing or differs from the profile",
+    ),
+    (
+        "launchd_label",
+        "a node config without the driver",
+        |m| {
+            let t = fs::read_to_string(m.path(CONFIG)).unwrap();
+            m.write(CONFIG, &t.replace("driver = [\"native\"]\n", ""));
+        },
+        "/usr/local/etc/kbf/kbf.toml is missing or differs from the profile",
+    ),
+    (
+        "launchd_label",
+        "the node config's owner",
+        |m| m.own(CONFIG, 1000, 1000),
+        "/usr/local/etc/kbf/kbf.toml is -rw-r--r-- 1000 1000, want -rw-r--r-- 0 0",
+    ),
+    (
+        "launchd_label",
+        "the node config writable by its group",
+        |m| m.chmod(CONFIG, 0o664),
+        "/usr/local/etc/kbf/kbf.toml is -rw-rw-r-- 0 0, want -rw-r--r-- 0 0",
+    ),
+    (
+        "launchd_label",
+        "the config directory's owner",
+        |m| m.own("/usr/local/etc/kbf", 480, 480),
+        "/usr/local/etc/kbf is drwxr-xr-x 480 480, want drwxr-xr-x 0 0",
     ),
     (
         "launchd_label",

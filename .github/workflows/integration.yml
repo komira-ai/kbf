@@ -12,6 +12,52 @@ name: integration
 
 on:
   pull_request:
+    # Only a change to what the job builds and runs: the crates of kbf-server, kbf-it,
+    # kbf-testkit, kbf-objstore and xtask, with their workspace dependencies (the closure
+    # of their Cargo.toml files), and the build inputs. The merge queue and pushes to main
+    # always run it.
+    paths:
+      - crates/kbf-auth/**
+      - crates/kbf-caps/**
+      - crates/kbf-daemon/**
+      - crates/kbf-deploy/**
+      - crates/kbf-front/**
+      - crates/kbf-history/**
+      - crates/kbf-host/**
+      - crates/kbf-invocation/**
+      - crates/kbf-it/**
+      - crates/kbf-log/**
+      - crates/kbf-mac-session/**
+      - crates/kbf-map/**
+      - crates/kbf-mapsync/**
+      - crates/kbf-mdm/**
+      - crates/kbf-mdm-api/**
+      - crates/kbf-meta/**
+      - crates/kbf-objstore/**
+      - crates/kbf-peer/**
+      - crates/kbf-proto/**
+      - crates/kbf-raft/**
+      - crates/kbf-route/**
+      - crates/kbf-sched/**
+      - crates/kbf-segments/**
+      - crates/kbf-server/**
+      - crates/kbf-sim/**
+      - crates/kbf-state/**
+      - crates/kbf-storage/**
+      - crates/kbf-store/**
+      - crates/kbf-testkit/**
+      - crates/kbf-threads/**
+      - crates/kbf-tier/**
+      - crates/kbf-tls/**
+      - crates/kbf-transfer/**
+      - crates/kbf-types/**
+      - crates/kbf-ui/**
+      - crates/xtask/**
+      - .cargo/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain*
+      - .github/workflows/integration.yml
   merge_group:
   push:
     branches: [main]

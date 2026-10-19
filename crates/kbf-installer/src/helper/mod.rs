@@ -1,35 +1,46 @@
-//! The root helper of the pull-based updates (`docs/design/pull-updates.md`, section 7),
-//! run as `kbf-installer run` and `kbf-installer boot-check`.
+//! The root half of the pull-based updates (`docs/design/pull-updates.md`, section 7), run
+//! as `kbf-installer run` and `kbf-installer boot-check`.
 //!
-//! It has no socket and no network. The unprivileged `kbf` leaves two kinds of file in the
-//! inbox under `--update-dir`: an entry directory per offer (`<generation>-<commit>/`,
-//! with `offer.json`, the tarballs and the attestation bundle) and, in `orders/`, one
-//! file per order. Each pass the helper
+//! It has no socket. The unprivileged `kbf` leaves one kind of file in the order spool: a
+//! small order record per order ([`order`]), and no release bytes. Each pass the helper
 //!
 //! 1. finishes a restart it owes and reverts a swap whose confirm window ran out;
-//! 2. stages the newest entry through [`crate::stage::stage_from_inbox`] (the
-//!    attestation, hashes and binary checks all live there; the helper trusts nothing in
-//!    the inbox);
-//! 3. acts on orders, in id order, once each: `activate` swaps the staged release in on
-//!    trial and restarts the one configured service, `confirm` keeps it, `revert` goes
-//!    back;
+//! 2. takes the records in the spool, at most [`kbf_update::MAX_RECORDS`], none older than
+//!    [`kbf_update::MAX_AGE_SECS`] since root first saw it, each opened without following a
+//!    link and read once, and acts on them in (epoch, id) order, once each: `activate`
+//!    checks the order, has the [`fetcher::Fetcher`] pull and verify the release if its
+//!    directory is not there, swaps it in on trial and restarts the one configured
+//!    service; `confirm` keeps it; `revert` goes back;
+//! 3. collects the releases nothing needs once a swap was confirmed (`gc` keeps current,
+//!    previous, staged, the swap on trial and any release a process executes from, and
+//!    takes the lock);
 //! 4. writes `status.json` (root's, world-readable) for the node to report.
 //!
-//! `kbf-installer boot-check` runs as the service's `ExecStartPre` on Linux: it counts the
-//! starts of a release on trial and reverts one that keeps failing before it starts
-//! again, which needs no timer. It also starts the confirm window at the first start.
+//! The loop ([`serve`]) makes a pass every five seconds (fixed) and, between passes,
+//! starts the new program in place of itself if its own file was replaced. A confirm is
+//! kept only if the new release is what runs ([`service::accept_confirm`]); one activation
+//! is on trial at a time and activations are `min_activation_interval_s` apart. The
+//! operator's `confirm`, `revert`, `rollback`, `gc` and `quiesce` ([`operator`]) run inline
+//! as root under the same lock.
 //!
-//! Nothing here takes a path, a command or a unit from the inbox: the unit and the
+//! `kbf-installer boot-check` runs as the service's `ExecStartPre` on Linux: it counts the
+//! starts of a release on trial and reverts one that keeps failing before it starts again,
+//! which needs no timer. It also starts the confirm window at the first start.
+//!
+//! Nothing here takes a path, a command or a unit from a record: the unit and the
 //! directories are the helper's own flags.
 
 pub mod cycle;
+pub mod fetcher;
+pub mod leases;
 pub mod memory;
+pub mod operator;
 pub mod order;
 pub mod restart;
+pub mod serve;
+pub mod service;
 pub mod status;
 
-#[cfg(test)]
-mod contract_tests;
 #[cfg(test)]
 mod crash_tests;
 #[cfg(test)]
