@@ -3,6 +3,7 @@
 //! on a wall clock.
 
 mod bypass;
+mod frames;
 mod hold;
 mod kit;
 mod lifetime;
