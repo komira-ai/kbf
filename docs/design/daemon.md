@@ -448,12 +448,21 @@ back; `crun delete --force` closes the lease. That is four `crun` processes.
   (`lowerdir` the input root, `upperdir` the lease's upper, options pinned to
   `userxattr,metacopy=off,redirect_dir=nofollow,index=off,xino=off`); `/tmp`, `/var/tmp`,
   `/run` and `/root` are directories of the lease on disk (not tmpfs, which would count
-  against the lease's memory); `/etc/hosts` and `/etc/hostname` are small read-only
-  files. An action that writes to another place in the image fails with `EROFS`. Shared read-only
+  against the lease's memory); `/etc/hosts` (`localhost` for IPv4 and IPv6), `/etc/hostname` and `/etc/resolv.conf`
+  (`nameserver 127.0.0.1` and `options timeout:1 attempts:1`; nothing listens: a name outside
+  `hosts` fails at once with glibc's `EAI_AGAIN`, as on a worker without a reachable resolver,
+  and musl, which sends on an unconnected socket, waits at most about 2 s) are small read-only
+  files the lease writes. The action runs as uid and gid 1000, subordinate id 1000 of the
+  range, so permission checks are real (a mode-000 file is refused); the lease's writable
+  directories and the overlay are owned by that id while it runs. The image's own
+  `nsswitch.conf` is left as it is (the images the farm names have `hosts: files dns`). Uid 1000 has no passwd entry in most
+  images, so `whoami` and `getpwuid` fail; `HOME=/root` is the action's own writable directory. Image
+  files of mode 0700 or 0600 owned by the image's root are no longer readable by actions (the same
+  as on a worker that runs actions as an unprivileged user). An action that writes to another place in the image fails with `EROFS`. Shared read-only
   trees (`SharedMount`: a host directory and a destination below `/kbf/root`) are bound
   read-only after the overlay; the tree store that fills them is the daemon's.
 - **Helper containers** (`oci/helper.rs`) do the work that needs a user namespace with
-  the daemon user as id 0 and the range as ids `1..` (so the action's root is `1:1`), or,
+  the daemon user as id 0 and the range as ids `1..` (so the action's user, uid 1000, is `1001:1001`), or,
   for an image's unpack, an action's own mapping. A helper runs one program, never a
   shell: this daemon's binary in its `__chown-dirs` mode (with `--whole` trees, so the
   whole hand-over is one process and walks by descriptor, never following a symlink) or

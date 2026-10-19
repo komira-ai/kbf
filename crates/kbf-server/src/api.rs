@@ -45,14 +45,21 @@
 //! page. The gates: a loopback peer, no `Origin` header (no browser page), the bearer
 //! token of `--api-token-file` ([`ApiToken`]; without one, writes are off), and a JSON
 //! content type. The roles of `fleet-updates-security.md` section S9 are planned.
+//!
+//! **Behind the farm's proxy** (`--proxy-auth-file`, [`crate::proxy_auth`]) a loopback peer
+//! is not enough: every route, reads too, takes calls from loopback only, and a write whose
+//! caller did not present the proxy's secret is refused 403 even with the token (the first
+//! gate becomes "loopback, and the proxy's secret"). The secret says who forwarded the
+//! request, not that it may write: the token is still required. Handlers take a [`Caller`]
+//! (the peer address and what the proxy layer decided), never the `x-kbf-*` headers, which
+//! the layer removes.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -66,6 +73,7 @@ use crate::enroll::api::EnrollApi;
 use crate::farm::{Farm, NodeAction};
 use crate::fleet::ProtocolSummary;
 use crate::members::{Members, MembershipError};
+use crate::proxy_auth::{Caller, Trust};
 use crate::release::desired::blocking;
 use crate::token::ApiToken;
 use crate::update::Rows;
@@ -175,11 +183,11 @@ struct NoBody {}
 
 async fn begin_drain(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     if !body.is_empty()
@@ -306,13 +314,13 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
 
 async fn act(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     Path(target): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let request = Write {
-        peer,
+        peer: &peer,
         headers: &headers,
         target: &target,
         body: &body,
@@ -330,7 +338,7 @@ async fn act(
 }
 
 /// The body of `POST /v1/members/{id}`: the state to put the member in. `Down` is the
-/// store's verdict and `joining`/`catching_up` are the registration's, so none of them
+/// store's verdict and `joining`/`catching_up` are the registration's (a new node in a farm with data is `joining`), so none of them
 /// is accepted.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -347,12 +355,12 @@ enum MemberTarget {
 
 async fn set_member_state(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(members) = api.members.clone() else {
@@ -442,11 +450,11 @@ fn entry_of(text: &str) -> Result<DenyEntry, (StatusCode, String)> {
 
 async fn deny_entry(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(members) = api.members.clone() else {
@@ -482,11 +490,11 @@ async fn deny_entry(
 
 async fn allow_entry(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(members) = api.members.clone() else {
@@ -568,7 +576,7 @@ const fn denied_failure(e: &MembershipError) -> StatusCode {
 }
 
 /// The answer of a server that keeps no storage members.
-fn no_members() -> Response {
+pub(crate) fn no_members() -> Response {
     error(
         StatusCode::NOT_FOUND,
         "this server keeps no storage members: it has no --state-store",
@@ -578,8 +586,8 @@ fn no_members() -> Response {
 /// A write as it arrived.
 #[derive(Clone, Copy, Debug)]
 pub struct Write<'a> {
-    /// Who sent it.
-    pub peer: SocketAddr,
+    /// Who sent it, and how far the proxy vouches for it.
+    pub peer: &'a Caller,
     /// Its headers.
     pub headers: &'a HeaderMap,
     /// The last path segment: `{node}:{verb}`.
@@ -598,7 +606,9 @@ struct DrainBody {
 /// The gates every write passes, in order:
 ///
 /// 1. the peer is loopback, so the token never crosses a network in clear (a remote
-///    operator comes through a TLS-terminating proxy on the host): else 403;
+///    operator comes through a TLS-terminating proxy on the host); and, when a proxy is
+///    configured (`--proxy-auth-file`), the request presented the proxy's secret
+///    ([`Trust::Unverified`] is refused): else 403;
 /// 2. no `Origin` header: a browser sends one with every cross-origin POST, and a
 ///    page must not act with an operator's token or from the host: else 403;
 /// 3. writes are on (`token` is given): else 403;
@@ -607,7 +617,7 @@ struct DrainBody {
 ///    send cross-origin without a preflight the API never answers: else 415.
 pub(crate) fn gate(
     token: Option<&ApiToken>,
-    peer: SocketAddr,
+    peer: &Caller,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
     operator_gate(token, peer, headers)?;
@@ -625,13 +635,24 @@ pub(crate) fn gate(
 /// tarball) passes these and answers for its own content type.
 pub(crate) fn operator_gate(
     token: Option<&ApiToken>,
-    peer: SocketAddr,
+    peer: &Caller,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
-    if !peer.ip().to_canonical().is_loopback() {
+    if !peer.addr.ip().to_canonical().is_loopback() {
         return Err((
             StatusCode::FORBIDDEN,
-            format!("writes are accepted only from the server's own host, not {peer}"),
+            format!(
+                "writes are accepted only from the server's own host, not {}",
+                peer.addr
+            ),
+        ));
+    }
+    if peer.trust == Trust::Unverified {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "this server is behind a proxy: a write must come through it, presenting the \
+             proxy's secret (--proxy-auth-file)"
+                .to_owned(),
         ));
     }
     if headers.contains_key(ORIGIN) {

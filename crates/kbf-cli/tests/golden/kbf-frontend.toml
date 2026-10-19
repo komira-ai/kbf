@@ -11,6 +11,10 @@
 # cpu-threads = "N"
 
 [handover]
+# Serve the admin calls (GET role, POST quiesce, resume, takeover, stand-down) on this loopback address. Anything that is not a loopback address is refused at start: the calls move the scheduler's role and carry no credential. Needs --state-store.
+# admin-listen = "ADDR"
+# Open the state store without taking its generation, bump no epoch and run no scheduler, reconciler or worker listener: serve /readyz, the health service and GetCapabilities until `POST takeover` makes this process the writer. Needs --admin-listen. A SQLite state file is held by one process (an exclusive lock), so a candidate cannot run beside the process that holds it: side by side needs the Postgres store.
+await-takeover = false
 # The time between two of Envoy's health checks of a frontend (the cluster's `interval`).
 envoy-check-interval-ms = 1000
 # How long Envoy's health check waits for an answer (the cluster's `timeout`).
@@ -102,9 +106,15 @@ member-dwell-secs = 300
 # How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
 member-ttl-secs = 15
 
+[stores]
+# Turns on the object-store registration routes of the operator API (/v1/object-stores, docs/api.md) and names the directory where the secret key of each registered connection is kept, one file of mode 0600 each, in a directory made 0700. The directory must be readable by every frontend child that serves at once and left out of any backup of the host. The registration itself (endpoints, buckets, the audit log) is kept in the state store. Without it those routes answer 404.
+# object-store-secrets-dir = "DIR"
+
 [tls]
 # A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the daemon's, whose builds could read it. Without it, writes are refused
 # api-token-file = "API_TOKEN_FILE"
+# A file holding the per-boot secret of the TLS-terminating proxy in front of this server (`docs/design/frontend-proxy.md`, section 3): exactly 32 bytes, owned by the server's user with mode 0600 or 0400, read at start. The proxy presents them as 64 lower-case hex digits in `x-kbf-proxy-auth`. With it, the REAPI, worker and operator listeners take calls from loopback only, and believe `x-kbf-node-id` and `x-kbf-role` only from a call that presents the secret; every other `x-kbf-*` header is dropped. The worker listener then takes the proxy's identity in place of a client certificate (it needs no TLS flags), and the operator API's writes must come through the proxy as well as carry the token (a local `curl` write is refused). The storage listener is not covered: it keeps its own mutual TLS. Without it, behavior is as before
+# proxy-auth-file = "PATH"
 # A JSON file with the REAPI listener's authentication policy and authorizers (`docs/reapi-auth.md`), read once at start; a file that is not a valid policy stops the server. Without it every REAPI call is accepted and allowed. The worker listener does not read it; on the operator API only the build pages and the blob route do, and they are off unless it names their authorizers
 # reapi-auth-policy = "REAPI_AUTH_POLICY"
 # PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves TLS with this server certificate only; clients present no certificate. It is meant for a certificate from the farm's own internal CA, trusted by the front's proxy (its hop to this server) and by clients that dial this server directly; TLS for the farm's client-facing name still ends at the front. `--reapi-auth-policy` applies over TLS as over plain text
@@ -113,7 +123,7 @@ member-ttl-secs = 15
 # reapi-tls-key = "REAPI_TLS_KEY"
 # PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`, with DNS or IP names that cover the host of the instance id and of the address it registers; a frontend certificate may call nothing here
 # worker-client-ca = "WORKER_CLIENT_CA"
-# The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every check (a daemon's `Hello`, `Heartbeat`, `Result`, `NodeStatus` and blob calls, a storage node's `Register` and `Heartbeat`), so an edit takes effect without a restart. A `node` entry also refuses a storage certificate with that DNS name. A list that cannot be read after start refuses all of those calls. Needs mutual TLS
+# The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every check (a daemon's `Hello`, `Heartbeat`, `Result`, `NodeStatus` and blob calls, a storage node's `Register` and `Heartbeat`), so an edit takes effect without a restart. A `node` entry also refuses a storage certificate with that DNS name. A list that cannot be read after start refuses all of those calls. Needs mutual TLS, or `--proxy-auth-file` (then only `node` entries can name a caller: the proxy forwards a node id, not a certificate, so a `serial` or `spki-sha256` entry never matches)
 # worker-deny-list = "WORKER_DENY_LIST"
 # PEM certificate of the worker listener. With `--worker-tls-key` and `--worker-client-ca` it serves mutual TLS; without all three, plain text
 # worker-tls-cert = "WORKER_TLS_CERT"

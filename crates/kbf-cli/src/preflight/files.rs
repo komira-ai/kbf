@@ -29,7 +29,12 @@ pub(super) fn check(needs: &Needs, host: &dyn Host, report: &mut Report) {
 }
 
 fn one(f: &FileNeed, host: &dyn Host, report: &mut Report) {
-    let FileNeed { flag, path, secret } = f;
+    let FileNeed {
+        flag,
+        path,
+        secret,
+        exact_len,
+    } = f;
     let path_text = path.display();
     let why = if *secret {
         "kbf cannot prove its identity without it"
@@ -96,6 +101,22 @@ fn one(f: &FileNeed, host: &dyn Host, report: &mut Report) {
             format!("{flag} {path_text} has mode {:04o}", stat.mode),
             "the group or others can read the secret",
             format!("chmod 600 {path_text}"),
+        );
+    }
+    if let Some(len) = *exact_len
+        && let Some(bytes) = read(host, flag, path, why, report)
+        && bytes.len() != len
+    {
+        report.refuse(
+            format!(
+                "{flag} {path_text} holds {} bytes, not exactly {len}",
+                bytes.len()
+            ),
+            "the server refuses to start on a secret of another size",
+            format!(
+                "write exactly {len} random bytes with no newline: \
+                 head -c {len} /dev/urandom > {path_text}; chmod 600 {path_text}"
+            ),
         );
     }
 }

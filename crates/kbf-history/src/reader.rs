@@ -450,11 +450,9 @@ impl<O: ObjectStore> Reader<O> {
         &self,
         inv: &InvKey,
     ) -> Result<Option<Vec<String>>, ReadError> {
-        let key = self.index.root().invid(inv);
-        let Some(row) = self.index.get(key.clone()).await? else {
+        let Some(header) = self.stored_header(inv).await? else {
             return Ok(None);
         };
-        let header = decode_row::<InvocationHeader>(&key, &row.value)?;
         Ok(listed_whole(&header).then_some(header.instances))
     }
 
@@ -502,11 +500,9 @@ impl<O: ObjectStore> Reader<O> {
         inv: &InvKey,
         allow: Allow<'_>,
     ) -> Result<Option<InvocationHeader>, ReadError> {
-        let key = self.index.root().invid(inv);
-        let Some(row) = self.index.get(key.clone()).await? else {
+        let Some(header) = self.stored_header(inv).await? else {
             return Ok(None);
         };
-        let header = decode_row::<InvocationHeader>(&key, &row.value)?;
         Ok(all_allow(&header, allow).then_some(header))
     }
 

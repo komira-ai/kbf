@@ -124,6 +124,11 @@ async fn serve_with(limits: Limits, configured: bool, token: Option<ApiToken>) -
     let store = configured
         .then(|| Arc::new(ReleaseStore::open(&dir.store(), limits).expect("open the store")));
     let app = release::router(store.clone(), token);
+    // As `serve_api` does: the handlers read the gate's `Trust`.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        None::<Arc<kbf_server::proxy_auth::ProxySecret>>,
+        kbf_server::proxy_auth::gate_requests,
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {

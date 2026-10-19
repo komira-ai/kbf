@@ -6,11 +6,12 @@
 //! children.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use kbf_cas_conformance::Subject;
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{TransferConfig, Transfers};
 use tonic::transport::Endpoint;
 
@@ -30,10 +31,23 @@ impl Proc {
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn kbf");
-        let mut line = String::new();
-        BufReader::new(child.stdout.take().expect("stdout"))
-            .read_line(&mut line)
-            .expect("a start line");
+        // Read on a thread so that a child that never prints its start line fails the
+        // test instead of hanging it.
+        let stdout = child.stdout.take().expect("stdout");
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(stdout).read_line(&mut line);
+            let _ = sent.send(line);
+        });
+        let line = match received.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(line) => line,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("kbf {args:?} printed no start line within 60 seconds");
+            }
+        };
         Self { child, line }
     }
 
@@ -100,8 +114,10 @@ fn frontend(storage: &str, more: &[&str]) -> Proc {
 
 /// One node and one frontend process per [`Subject::fresh`].
 struct Through {
-    scratch: PathBuf,
+    // The processes come first: fields drop in order, and the directory they write in
+    // must outlive them.
     procs: Mutex<Vec<Proc>>,
+    scratch: TestDir,
 }
 
 impl Subject for Through {
@@ -120,20 +136,16 @@ impl Subject for Through {
     }
 
     fn scratch(&self) -> &Path {
-        std::fs::create_dir_all(&self.scratch).expect("scratch");
-        &self.scratch
+        self.scratch.path()
     }
 }
 
 impl Through {
     /// A subject with a scratch directory of its own: each test makes one.
     fn new() -> Self {
-        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self {
-            scratch: Path::new(env!("CARGO_TARGET_TMPDIR"))
-                .join(format!("frontend-process-{}-{n}", std::process::id())),
             procs: Mutex::new(Vec::new()),
+            scratch: TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-process"),
         }
     }
 }
@@ -143,6 +155,9 @@ kbf_cas_conformance::tests!(Through::new());
 /// One `GET` on the operator API: the status code and the body.
 fn get(api: &str, path: &str) -> (u16, String) {
     let mut stream = std::net::TcpStream::connect(api).expect("connect to the API");
+    let bound = Some(std::time::Duration::from_secs(30));
+    stream.set_read_timeout(bound).expect("a read timeout");
+    stream.set_write_timeout(bound).expect("a write timeout");
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n"
@@ -160,8 +175,7 @@ fn get(api: &str, path: &str) -> (u16, String) {
 /// `storage` once it is stopped) or does not exit 0 on SIGTERM.
 #[test]
 fn the_frontend_process_is_ready_with_its_node_and_stops_on_sigterm() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("frontend-health-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-health");
     let mut node = node(&dir);
     let mut front = frontend(&node.field("storage="), &["--readyz-store-timeout-ms=500"]);
     let api = front.field("api=");
@@ -221,8 +235,7 @@ fn a_refused_frontend_start_exits_2() {
 /// holder, prints no start line.
 #[test]
 fn a_frontend_process_with_a_sqlite_state_store_is_ready_and_holds_the_file() {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("frontend-state-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-state");
     let node = node(&dir);
     let state = dir.join("state").join("state.db");
     let flag = format!("--state-store=sqlite://{}", state.display());
@@ -248,6 +261,58 @@ fn a_frontend_process_with_a_sqlite_state_store_is_ready_and_holds_the_file() {
     assert!(front.stop().is_some_and(|status| status.success()));
 }
 
+/// Catches a frontend process that takes `--admin-listen` and does not serve it: one
+/// started with it is the active writer (`GET /v1/admin/role`, which names the version
+/// protocol the proxy reads), one started with `--await-takeover` over another state file
+/// is a candidate that holds no generation, and both exit 0 on SIGTERM (a candidate
+/// would otherwise hold its ports for ever).
+#[test]
+fn a_frontend_process_serves_the_admin_calls_as_active_or_as_candidate() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-admin");
+    let node = node(&dir);
+    let storage = format!("--storage=http://{}", node.field("storage="));
+    let start = |state: &str, more: &[&str]| {
+        let state = format!("--state-store=sqlite://{}", dir.join(state).display());
+        let mut args = vec![
+            "frontend",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+            "--api-listen=127.0.0.1:0",
+            "--admin-listen=127.0.0.1:0",
+            storage.as_str(),
+            state.as_str(),
+        ];
+        args.extend_from_slice(more);
+        Proc::start(&args)
+    };
+    let mut active = start("active.db", &[]);
+    assert!(
+        active.line.starts_with("kbf-frontend-admin "),
+        "{}",
+        active.line
+    );
+    let (code, body) = get(&active.field("admin="), "/v1/admin/role");
+    assert_eq!(code, 200, "{body}");
+    let role: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(role["role"], "active", "{body}");
+    assert_eq!(role["held_generation"], 1, "{body}");
+    assert_eq!(role["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
+
+    let mut candidate = start("waiting.db", &["--await-takeover"]);
+    assert!(
+        candidate.line.contains("role=candidate"),
+        "{}",
+        candidate.line
+    );
+    let (code, body) = get(&candidate.field("admin="), "/v1/admin/role");
+    assert_eq!(code, 200, "{body}");
+    let role: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(role["role"], "candidate", "{body}");
+    assert_eq!(role["held_generation"], serde_json::Value::Null, "{body}");
+    assert!(candidate.stop().is_some_and(|status| status.success()));
+    assert!(active.stop().is_some_and(|status| status.success()));
+}
+
 /// `url` with the password of its user information removed.
 fn without_password(url: &str) -> String {
     let (scheme, rest) = url.split_once("://").expect("a URL");
@@ -262,27 +327,60 @@ fn without_password(url: &str) -> String {
 
 /// Catches a frontend process started with a Postgres `--state-store` that dies at start
 /// (the blocking client run inside the server's tokio runtime panicked with "Cannot start
-/// a runtime from within a runtime"), or that starts and does not create its tables in
-/// the database (the `kv` table is read back), or whose `/readyz` is not 200 over the
-/// store. Needs a Postgres server: `KBF_TEST_POSTGRES_URL` names a database the test may
-/// create the `kbf_state` schema in.
+/// a runtime from within a runtime"), or whose `/readyz` is not 200 over the schema the
+/// installer made, or that creates the tables itself: started on a database nobody ran
+/// `setup` on it must exit with the one line that says what to run, and leave no schema.
+/// Needs a Postgres server: `KBF_TEST_POSTGRES_URL` names a database the test may create
+/// the `kbf_state` schema in.
 #[test]
 #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
-fn a_frontend_process_with_a_postgres_state_store_is_ready_and_has_made_its_tables() {
+fn a_frontend_process_with_a_postgres_state_store_is_ready_over_the_installers_schema() {
     let url = std::env::var("KBF_TEST_POSTGRES_URL")
         .expect("KBF_TEST_POSTGRES_URL names a database the test may create schemas in");
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("frontend-postgres-{}", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-postgres");
     let node = node(&dir);
     // The flag refuses a password (the command line is world-readable), so the process
     // gets the URL without one; the server the job runs trusts its loopback clients.
     let flag = format!("--state-store={}", without_password(&url));
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
+    client
+        .batch_execute("DROP SCHEMA IF EXISTS kbf_state CASCADE")
+        .expect("start from a database with no schema");
+
+    let storage = format!("--storage=http://{}", node.field("storage="));
+    let refused = Command::new(BIN)
+        .args([
+            "frontend",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+        ])
+        .args([storage.as_str(), flag.as_str()])
+        .output()
+        .expect("run kbf");
+    assert!(
+        !refused.status.success(),
+        "a start with no schema must fail"
+    );
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("kbf-installer setup"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+    let made = client
+        .query(
+            "SELECT 1 FROM pg_namespace WHERE nspname = 'kbf_state'",
+            &[],
+        )
+        .expect("catalog");
+    assert!(made.is_empty(), "the refused start created the schema");
+
+    let config = kbf_state::postgres::PostgresConfig::parse(&url).expect("the URL parses");
+    let set = kbf_state::postgres::schema::embedded();
+    kbf_state::postgres::schema::apply(&config, &set, kbf_state::postgres::schema::latest())
+        .expect("the installer's step");
     let mut front = frontend(&node.field("storage="), &[&flag]);
     let (code, body) = get(&front.field("api="), "/readyz");
     assert_eq!(code, 200, "{body}");
-    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
     client
         .query_one("SELECT count(*) FROM kbf_state.kv", &[])
-        .expect("the frontend created its tables in the database");
+        .expect("the installer's tables are there");
     assert!(front.stop().is_some_and(|status| status.success()));
 }
