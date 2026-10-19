@@ -611,8 +611,7 @@ fn register_cold(farm: &Farm) -> (&'static str, &'static str) {
     (KEY_ID, SECRET)
 }
 
-const STORE: &str =
-    "s3://farm/cold/?endpoint=http%3A%2F%2Fobjects.test%3A9000&region=us-east-1";
+const STORE: &str = "s3://farm/cold/?endpoint=http%3A%2F%2Fobjects.test%3A9000&region=us-east-1";
 
 /// A storage node enrolled over TLS while a store is registered holds the store in the
 /// `node.json` its client wrote, and no key.

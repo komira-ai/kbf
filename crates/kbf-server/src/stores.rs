@@ -508,7 +508,9 @@ mod tests {
     fn a_node_uri_reads_back_as_the_store_it_names() {
         let stores = [
             s3("s3://b/?endpoint=http://h:9000"),
-            s3("s3://b/a/b/?endpoint=http://h:9000&region=eu-1&conditional-put=true&min-put-rate=7"),
+            s3(
+                "s3://b/a/b/?endpoint=http://h:9000&region=eu-1&conditional-put=true&min-put-rate=7",
+            ),
             S3Uri {
                 prefix: "x-y_z.~1/a/".to_owned(),
                 ..s3("s3://b/?endpoint=http://h:9000")

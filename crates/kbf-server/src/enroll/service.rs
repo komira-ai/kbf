@@ -329,11 +329,7 @@ impl Core {
             worker_endpoint: self.settings.worker_endpoint.clone(),
             cas_endpoint: self.settings.cas_endpoint.clone(),
             storage_port: self.settings.storage_port,
-            cold_store: cold
-                .uri
-                .clone()
-                .filter(|_| storage)
-                .unwrap_or_default(),
+            cold_store: cold.uri.clone().filter(|_| storage).unwrap_or_default(),
             min_protocol: 0,
             tls_reload_interval_s: TLS_RELOAD_INTERVAL_S,
             frontend_url: String::new(),
