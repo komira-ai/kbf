@@ -459,6 +459,9 @@ fn a_failure_that_is_not_the_confirm_does_not_end_a_finished_drain_as_failed() {
         step: Step::Start,
         reason: "an earlier note".into(),
     });
+    // The gate routes to B, where the swap says it does: the gate refuses to retire A
+    // only while A is the active slot.
+    w.st.borrow_mut().active = Slot::B;
     let mut s = Swap::resumed(w.ports(), p, intent, Slot::B, true, false);
     assert_eq!(s.run(), Ok(Phase::Done));
 }

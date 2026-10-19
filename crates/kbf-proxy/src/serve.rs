@@ -136,7 +136,8 @@ impl<U: UpdateHandler + 'static> Service<U> {
             }
             Route::Update => self.update(request).await,
             Route::Health => text(StatusCode::OK, "ok"),
-            // Readiness has one writer, the proxy's own poll of the active child (U4b-3).
+            // Readiness has one writer, the proxy's own poll of the active child.
+            Route::Ready if self.core.is_ready() => text(StatusCode::OK, "ok"),
             Route::Ready => text(StatusCode::SERVICE_UNAVAILABLE, "not ready"),
             Route::Metrics => {
                 let body = self.core.metrics.render(&self.core.slots, &self.core.queue);

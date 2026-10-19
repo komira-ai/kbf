@@ -5,6 +5,7 @@ use super::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::cli::ProxyArgs;
 use crate::layout::{Layout, Platform};
 use crate::state::{Locked, PendingConfirm, State};
 use crate::testkit::{A, B, c, host_root_on};
@@ -76,6 +77,51 @@ fn only_status_and_check_run_without_root() {
             );
         }
     }
+}
+
+/// Catches the proxy verb asking for root (it runs as the service user), a refused table
+/// leaving as anything but a usage error with its path, and `--json` losing the reason.
+#[test]
+fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
+    let dir = crate::testkit::host_root("proxy-dispatch").1;
+    let file = dir.join("installer.toml");
+    fs::write(&file, "min_generation = 1\n").expect("write");
+    let path = file.display().to_string();
+    let (exit, out, err) = run_as(1000, &["proxy", "--check", "--config", &path]);
+    assert_eq!(exit, Exit::Usage);
+    assert!(out.is_empty());
+    assert!(
+        err.starts_with(&format!("kbf-installer: proxy: {path}: ")) && err.contains("no [proxy]"),
+        "{err}"
+    );
+    let (exit, out, _) = run_as(1000, &["--json", "proxy", "--check", "--config", &path]);
+    assert_eq!(exit, Exit::Usage);
+    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
+    assert_eq!(
+        (v["verb"].as_str(), v["error"].as_str()),
+        (Some("proxy"), Some("usage"))
+    );
+    assert!(
+        v["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no [proxy]"))
+    );
+
+    fs::write(
+        &file,
+        "[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[proxy.upstream]\nbase_port = 18000\n",
+    )
+    .expect("write");
+    let (exit, out, err) = run_as(1000, &["proxy", "--check", "--config", &path]);
+    assert_eq!((exit, out.as_str(), err.as_str()), (Exit::Ok, "", ""));
+    // Not a mutating verb: it has no dry run to leave out.
+    assert!(
+        !Verb::Proxy(ProxyArgs {
+            config: file,
+            check: true
+        })
+        .needs_root()
+    );
 }
 
 /// Catches `--json` printing prose, or putting the object on the error stream where a
@@ -222,7 +268,8 @@ fn the_visible_verbs_are_the_contracts() {
             "gc",
             "boot-check",
             "quiesce",
-            "check"
+            "check",
+            "proxy"
         ]
     );
     let hidden: Vec<_> = cmd

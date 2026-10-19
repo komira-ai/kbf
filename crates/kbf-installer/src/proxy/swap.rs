@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use super::model::{
-    Failure, Halt, Intent, Phase, Plan, ProcIdent, Request, RoleInfo, RoleState, Slot, Step,
+    Failure, Halt, Intent, Phase, Plan, ProcIdent, Request, RoleInfo, RoleState, Slot, Start, Step,
 };
 use super::ports::Ports;
 
@@ -324,7 +324,11 @@ impl<'a> Swap<'a> {
         self.set_phase(Phase::Starting)?;
         let first = self.now();
         let new_slot = self.intent.new_slot;
-        match self.ports.child.spawn(new_slot, &self.plan.to) {
+        match self
+            .ports
+            .child
+            .spawn(new_slot, &self.plan.to, Start::Candidate)
+        {
             Ok(ident) => self.hold_candidate(ident)?,
             Err(e) => return self.fail(Step::Start, format!("spawn: {e}")),
         }
@@ -367,7 +371,11 @@ impl<'a> Swap<'a> {
                 if early && !self.intent.respawned {
                     self.intent.respawned = true;
                     self.save()?;
-                    match self.ports.child.spawn(new_slot, &self.plan.to) {
+                    match self
+                        .ports
+                        .child
+                        .spawn(new_slot, &self.plan.to, Start::Candidate)
+                    {
                         Ok(again) => {
                             self.hold_candidate(again)?;
                             spawned_at = self.now();

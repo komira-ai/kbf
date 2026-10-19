@@ -26,6 +26,7 @@ use crate::helper::serve::{FileIdentity, Flow, PASS_INTERVAL, Serve};
 use crate::helper::service::HostProcs;
 use crate::helper::{fetcher, leases};
 use crate::layout::{Layout, Platform};
+use crate::proxy_verb;
 use crate::release::ReleaseError;
 use crate::setup;
 
@@ -304,6 +305,16 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
             format!("kbf-installer: {name} needs root: run it with sudo (effective uid is {euid})"),
             serde_json::json!({"verb": name, "error": "needs_root", "euid": euid}),
         );
+    }
+    if let Verb::Proxy(args) = &cli.verb {
+        return match proxy_verb::run(args) {
+            Ok(()) => Exit::Ok,
+            Err(e) => say(
+                e.exit(),
+                format!("kbf-installer: {name}: {e}"),
+                serde_json::json!({"verb": name, "error": e.code(), "message": e.to_string()}),
+            ),
+        };
     }
     let result = match &cli.verb {
         // `setup` checks for root itself and prints its steps ahead of its own result.

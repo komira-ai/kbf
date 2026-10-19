@@ -126,6 +126,30 @@ pub fn verify_ident(recorded: &ProcIdent, live: &ProcIdent) -> Result<(), AdoptE
     }
 }
 
+/// What the gate answers to [`super::ports::Gate::retire`], the proxy's commit on a slot.
+/// Only `Closed` (this call retired it) lets the supervisor signal the child: the other
+/// answers either mean an earlier call did, or that the slot is not safe to retire yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retired {
+    /// This call closed the slot: no stream is bound to it and none can bind.
+    Closed,
+    /// An earlier call closed it and nothing opened it since.
+    AlreadyClosed,
+    /// The slot was never opened: nothing to retire, and no proof a child is gone.
+    NeverOpened,
+    /// The slot is the active one.
+    Current,
+    /// This many streams are still bound to it.
+    Busy(u64),
+}
+
+impl Retired {
+    /// The slot is closed to new streams, by this call or an earlier one.
+    pub fn is_closed(self) -> bool {
+        matches!(self, Retired::Closed | Retired::AlreadyClosed)
+    }
+}
+
 /// What a child says about itself on `GET role`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoleState {
@@ -142,6 +166,14 @@ pub struct RoleInfo {
     /// This child holds the store's generation. The store wins every disagreement.
     pub holder: bool,
     pub state: RoleState,
+}
+
+/// How a child is started: the one that serves from its first moment (all-in-one hosts, a
+/// release put back), or a candidate that waits for `POST takeover` (`--await-takeover`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    Active,
+    Candidate,
 }
 
 /// Readiness of a candidate: `/readyz`, a `grpc.health.v1` check and one synthetic

@@ -61,6 +61,8 @@ pub enum Verb {
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
     Check,
+    /// Serve the frontend host's public port: route each stream to the active child frontend.
+    Proxy(ProxyArgs),
     #[command(hide = true)]
     Stage,
     #[command(hide = true)]
@@ -232,6 +234,16 @@ pub struct RunArgs {
 }
 
 #[derive(Args)]
+pub struct ProxyArgs {
+    /// The installer.toml whose `[proxy]` table configures the proxy.
+    #[arg(long, default_value = "/etc/kbf/installer.toml")]
+    pub config: std::path::PathBuf,
+    /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
+    #[arg(long)]
+    pub check: bool,
+}
+
+#[derive(Args)]
 pub struct BootArgs {
     #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
@@ -252,23 +264,26 @@ impl Verb {
             Verb::BootCheck(_) => "boot-check",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
+            Verb::Proxy(_) => "proxy",
             Verb::Stage => "stage",
             Verb::Activate => "activate",
             Verb::FetchChild => "fetch-child",
         }
     }
 
-    /// Every verb but `status` and `check` needs root.
+    /// Every verb but `status`, `check` and `proxy` (which runs as the unprivileged service
+    /// user) needs root.
     pub fn needs_root(&self) -> bool {
-        !matches!(self, Verb::Status | Verb::Check)
+        !matches!(self, Verb::Status | Verb::Check | Verb::Proxy(_))
     }
 
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
-    /// verbs that exist (`run`, `boot-check`, the operator's verbs and `setup`).
+    /// verbs that exist (`run`, `boot-check`, `proxy`, the operator's verbs and `setup`).
     pub fn built_by(&self) -> Option<&'static str> {
         match self {
             Verb::Run(_)
             | Verb::BootCheck(_)
+            | Verb::Proxy(_)
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)

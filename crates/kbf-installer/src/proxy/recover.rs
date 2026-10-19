@@ -7,7 +7,7 @@
 //! A recorded process that is gone or whose pid now belongs to another process is not
 //! ours: nothing signals it.
 
-use super::model::{Failure, Halt, Intent, Phase, Plan, Slot, Step};
+use super::model::{Failure, Halt, Intent, Phase, Plan, Slot, Start, Step};
 use super::ports::Ports;
 use super::swap::{Flow, Swap};
 use crate::CommitId;
@@ -199,7 +199,7 @@ impl<'a> Swap<'a> {
     /// it did not come up.
     fn cold_start(&mut self, slot: Slot, release: &CommitId) -> Result<Result<(), String>, Halt> {
         let t = self.plan.timing;
-        let ident = match self.ports.child.spawn(slot, release) {
+        let ident = match self.ports.child.spawn(slot, release, Start::Candidate) {
             Ok(i) => i,
             Err(e) => return Ok(Err(format!("spawn: {e}"))),
         };

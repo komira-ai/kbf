@@ -1,0 +1,22 @@
+# The public port of a frontend host, held by systemd so it is never closed while the proxy
+# restarts: a connection that arrives meanwhile waits in the backlog, and kbf-proxy.service
+# takes the one listening socket from fd 3 (LISTEN_FDS=1, close-on-exec, so the frontend
+# children the proxy starts never hold it). Accept=no: the proxy accepts and speaks TLS
+# itself; systemd does not start an instance per connection.
+# kbf docs/design/frontend-proxy.md, sections 1 and 2. Static unit, installed disabled under
+# /usr/lib/systemd/system/ with the package; `kbf-installer setup` enables it with the
+# service. A host that needs another address or port gives a drop-in an empty
+# ListenStream= (which clears this one) and its own.
+[Unit]
+Description=kbf frontend proxy, the public port
+ConditionPathExists=/etc/kbf/installer.toml
+
+[Socket]
+ListenStream=8980
+Accept=no
+# The proxy sets its own limits (connections per address, pre-stream timeouts); the
+# backlog is only what waits while it restarts.
+Backlog=4096
+
+[Install]
+WantedBy=sockets.target

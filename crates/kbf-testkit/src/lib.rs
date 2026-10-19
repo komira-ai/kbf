@@ -16,6 +16,8 @@
 //!   start fails with `ETXTBSY` because such a child still holds the file open.
 //! - [`m2`]: the verbs of `kbf-m2-act`, the program every action of the M2 sample
 //!   project runs (the M2 image has no shell).
+//! - [`reaped`]: a child a test starts, stopped and reaped when the guard drops (SIGTERM,
+//!   then SIGKILL), holding only the descriptors the test gave it.
 //!
 //! A test runs [`act`] and the fakes in one of two ways:
 //! - through a bin of its own package, because Cargo sets `CARGO_BIN_EXE_<name>` only
@@ -41,6 +43,7 @@ pub mod fake;
 pub mod forked;
 pub mod m2;
 pub mod port;
+pub mod reaped;
 pub mod spawn;
 
 /// Why a program here stopped short.

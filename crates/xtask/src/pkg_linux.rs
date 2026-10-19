@@ -5,7 +5,7 @@
 //!
 //! - [`plan`] lists the files from the inputs and refuses what the contract
 //!   (docs/design/kbf-installer.md, section 3) does not ship: a unit that is not
-//!   `kbf-*.service`, a trust file other than the three, an empty unit directory;
+//!   `kbf-*.service` or `kbf-*.socket`, a trust file other than the three, an empty unit directory;
 //! - [`config`] renders the list as the nfpm configuration, with the dependencies as
 //!   constants here (never Podman, never Envoy), no maintainer script, every file
 //!   `root:root`, and no time (nfpm takes it from `SOURCE_DATE_EPOCH`);
@@ -27,7 +27,7 @@ pub const NAME: &str = "kbf-installer";
 pub const BINARY_PATH: &str = "/usr/bin/kbf-installer";
 /// Where the unit files go.
 pub const UNIT_DIR: &str = "/usr/lib/systemd/system";
-/// The one packaged unit that is not a `kbf-*.service`: the slice the units run in.
+/// The one packaged unit that is not a `kbf-*.service` or `kbf-*.socket`: the slice the units run in.
 pub const SLICE: &str = "kbf.slice";
 /// The directory the package owns, holding [`TRUST_DIR`].
 pub const SHARE_DIR: &str = "/usr/share/kbf-installer";
@@ -227,9 +227,10 @@ fn entries(i: &Sources, mut problems: Vec<String>) -> Result<Vec<Entry>, Error> 
         problems.push(format!("no unit files in {}", i.units.display()));
     }
     for (name, src) in units {
-        if !(name == SLICE || (name.starts_with("kbf-") && name.ends_with(".service"))) {
+        let kbf = name.starts_with("kbf-");
+        if !(name == SLICE || (kbf && (name.ends_with(".service") || name.ends_with(".socket")))) {
             problems.push(format!(
-                "{name}: a package unit is named kbf-*.service (or is {SLICE})"
+                "{name}: a package unit is named kbf-*.service or kbf-*.socket (or is {SLICE})"
             ));
         }
         entries.push(file(

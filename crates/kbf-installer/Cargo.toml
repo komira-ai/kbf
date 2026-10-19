@@ -19,7 +19,9 @@ publish.workspace = true
 # `boot-check`) are the root half of the pull-based updates: they read the order spool the
 # unprivileged `kbf` writes, stage and swap releases through this crate, restart the one
 # configured service and write the world-readable status.json the node reads. There is no
-# socket and no network, and a staged binary is never run as root.
+# socket and no network, and a staged binary is never run as root. The one exception is the
+# `proxy` verb (the `kbf-proxy` runtime: the frontend host's public port), which runs as the
+# unprivileged service user and shares nothing with the root half (tests/layering.rs in kbf-it).
 # `deploy`'s CAS smoke is a small gRPC client of the local REAPI listener (kbf-proto, tonic, a
 # current-thread tokio runtime built for the one check); toml and x509-parser read the
 # frontend's own config for the listener's address and certificate name. Its other calls (the
@@ -43,12 +45,13 @@ hex.workspace = true
 httparse.workspace = true
 hyper.workspace = true
 kbf-host.workspace = true
+kbf-proxy.workspace = true
 kbf-proto.workspace = true
 # `postgres`: the schema's migrations and the client that applies them (`database` module).
 kbf-state = { workspace = true, features = ["postgres"] }
 kbf-update.workspace = true
 libc.workspace = true
-rustix = { workspace = true, features = ["fs", "process"] }
+rustix = { workspace = true, features = ["event", "fs", "net", "process"] }
 # `deploy` speaks HTTP/1.1 over TLS to the frontend's public port (the proxy): the client
 # connection is rustls over a std socket, on the ring provider tonic's `tls-ring` already
 # builds, trusting the system's roots (rustls-native-certs, as tonic's `tls-native-roots`
@@ -61,23 +64,38 @@ sha2.workspace = true
 subtle.workspace = true
 tar.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+# The proxy verb's signal handlers run on kbf-proxy's runtime.
+tokio = { workspace = true, features = ["net", "rt", "signal", "sync", "time"] }
 tonic = { workspace = true, features = ["tls-native-roots", "tls-ring"] }
 toml.workspace = true
 tracing.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
-rcgen.workspace = true
+# The proxy verb's process test is an h2c client of the real binary.
+bytes.workspace = true
+h2.workspace = true
+http.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
 kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
-# A child held between fork and exec (kbf_testkit::forked), and a start that waits out a
-# program still open for writing (kbf_testkit::spawn).
+# The proxy verb's process test starts the binary under a guard that reaps it
+# (kbf_testkit::reaped); a child held between fork and exec (kbf_testkit::forked), and a
+# start that waits out a program still open for writing (kbf_testkit::spawn).
 kbf-testkit.workspace = true
 kbf-update.workspace = true
+# The proxy verb serves TLS: its process test makes a CA and a server certificate, and is a
+# TLS client of the real binary.
+rcgen.workspace = true
 postgres.workspace = true
+rustls.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+tokio-rustls.workspace = true
 tracing-subscriber.workspace = true
+
+# The proxy's child command line is parsed by the `kbf` binary's own parser (Linux only: the
+# spawner is). kbf-cli does not depend on the installer.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+kbf-cli.workspace = true
 
 [lints]
 workspace = true

@@ -107,7 +107,7 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.put("units/other.service", "x");
                 t.inputs()
             },
-            "other.service: a package unit is named kbf-*.service",
+            "other.service: a package unit is named kbf-*.service or kbf-*.socket",
         ),
         (
             "a unit that is a timer",
@@ -115,7 +115,7 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.put("units/kbf-gc.timer", "x");
                 t.inputs()
             },
-            "kbf-gc.timer: a package unit is named kbf-*.service",
+            "kbf-gc.timer: a package unit is named kbf-*.service or kbf-*.socket",
         ),
         (
             "a directory among the units",
@@ -676,6 +676,36 @@ fn a_unit_that_is_neither_a_service_nor_the_slice_is_refused() {
     let got = refused(plan(&t.inputs()));
     assert!(got.contains("kbf-x.timer"), "{got}");
     assert!(!got.contains("kbf.slice:"), "{got}");
+}
+
+/// A `kbf-*.socket` is packaged beside its service, in the same directory and mode.
+#[test]
+fn a_socket_unit_is_packaged_beside_the_services_with_the_same_mode() {
+    let t = Tree::new("socket");
+    t.put("units/kbf-x.socket", "[Socket]");
+    t.put("units/other.socket", "[Socket]");
+    let got = refused(plan(&t.inputs()));
+    assert!(
+        got.contains("other.socket: a package unit is named"),
+        "{got}"
+    );
+    assert!(!got.contains("kbf-x.socket:"), "{got}");
+    std::fs::remove_file(t.dir.join("units/other.socket")).expect("rm");
+    let entries = plan(&t.inputs()).expect("a socket is a plan");
+    let find = |n: &str| {
+        entries
+            .iter()
+            .find(|e| e.dst.ends_with(&format!("/{n}")))
+            .map(|e| (e.dst.clone(), e.mode))
+            .expect(n)
+    };
+    let (sock, sock_mode) = find("kbf-x.socket");
+    let (svc, svc_mode) = find("kbf-node.service");
+    assert_eq!(sock_mode, svc_mode);
+    assert_eq!(
+        sock.rsplit_once('/').map(|p| p.0),
+        svc.rsplit_once('/').map(|p| p.0)
+    );
 }
 
 #[test]

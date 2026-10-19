@@ -575,3 +575,29 @@ fn a_confirm_that_never_landed_is_not_a_confirm_even_in_the_drain() {
     );
     assert_eq!(w.holders(), vec![Slot::A]);
 }
+
+/// Catches a cold start that starts the release serving: no child holds the generation, so
+/// the release is started waiting and then told to take over.
+#[test]
+fn a_cold_start_starts_the_release_waiting_and_then_takes_over() {
+    let w = draining();
+    w.kill_pid(100);
+    w.kill_pid(101);
+    w.st.borrow_mut().starts.clear();
+    w.proxy_restart();
+    let intent = w.last_intent();
+    let mut swap = Swap::adopt(
+        w.ports(),
+        Plan::resumed(&intent, Timing::frontend()),
+        intent,
+    );
+    assert_eq!(swap.run(), Ok(Phase::Done), "{:#?}", w.log());
+    assert_eq!(since_restart(&w, "admin:takeover B"), 1, "{:#?}", w.log());
+    assert_eq!(
+        since_restart(&w, "admin:takeover B limit 10000 ms"),
+        1,
+        "the cold start passes the plan's limit"
+    );
+    assert_eq!(w.holders(), vec![Slot::B]);
+    assert_eq!(w.st.borrow().starts, vec![(Slot::B, Start::Candidate)]);
+}
