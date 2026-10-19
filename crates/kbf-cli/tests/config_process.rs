@@ -588,6 +588,21 @@ fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
             .replace("/etc/kbf/", &format!("{}/", etc.display()))
             .replace("/var/lib/kbf-meta", &dir.join("meta").display().to_string())
             .replace("/var/lib/kbf", &dir.join("data").display().to_string());
+        // A node's directories default to places only a service user may make; the test's own
+        // are the operator's keys that `setup` leaves to the operator.
+        let here = dir.display();
+        let mut text = text;
+        if [names::DAEMON, names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name) {
+            text.push_str(&format!("\n[dirs]\nstate = \"{here}/state\"\n"));
+        }
+        if [names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name) {
+            text.push_str(&format!(
+                "\n[storage]\nhot_dir = \"{here}/hot\"\nmeta_dir = \"{here}/meta\"\n"
+            ));
+        }
+        if [names::DAEMON, names::STORAGE_AND_DAEMON].contains(&mode.name) {
+            text.push_str(&format!("\n[daemon]\ndata_dir = \"{here}/data\"\n"));
+        }
         let file = dir.join("kbf.toml");
         write(&file, &text, 0o600);
         let mut args = vec![

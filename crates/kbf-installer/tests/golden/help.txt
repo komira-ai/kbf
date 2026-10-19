@@ -61,6 +61,44 @@ Options:
           The state database, as postgres:///NAME?host=SOCKET_DIR (no password). Required for `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. The server, the database and the role exist before setup runs
       --no-start
           Enable the units without starting them
+      --listen <LISTEN>
+          The public REAPI listener, as IP:PORT (kbf's --listen). frontend, all-in-one
+      --worker-listen <WORKER_LISTEN>
+          The worker listener (daemons and storage nodes dial it), as IP:PORT. frontend, all-in-one
+      --api-listen <API_LISTEN>
+          The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend, all-in-one
+      --reapi-tls-cert <REAPI_TLS_CERT>
+          The REAPI listener's certificate (PEM file, absolute path); needs --reapi-tls-key
+      --reapi-tls-key <REAPI_TLS_KEY>
+          The REAPI listener's private key (a file of mode 0600 owned by the service user)
+      --worker-tls-cert <WORKER_TLS_CERT>
+          The worker listener's certificate; needs --worker-tls-key and --worker-client-ca
+      --worker-tls-key <WORKER_TLS_KEY>
+          The worker listener's private key (a file of mode 0600 owned by the service user)
+      --worker-client-ca <WORKER_CLIENT_CA>
+          The CA that daemons' and storage nodes' certificates must chain to
+      --storage-url <STORAGE_URL>
+          The storage node the frontend proxies blobs to (kbf's --storage), as http(s)://host[:port] with nothing after it. Required for frontend. https needs --storage-ca, --storage-client-cert and --storage-client-key; http is for a loopback host only
+      --storage-ca <STORAGE_CA>
+          The CA the storage node's certificate chains to. frontend
+      --storage-client-cert <STORAGE_CLIENT_CERT>
+          The frontend's certificate toward the storage node. frontend
+      --storage-client-key <STORAGE_CLIENT_KEY>
+          The private key of --storage-client-cert (a file of mode 0600 owned by the service user). frontend
+      --cold-store <COLD_STORE>
+          The cold store, as file:///absolute/path. Required for all-in-one
+      --meta-dir <META_DIR>
+          The directory of the metadata log, an absolute path outside the data directory. Required for all-in-one
+      --daemon-server <DAEMON_SERVER>
+          The worker listener the daemon half dials, as https://host[:port] (kbf's --server); the host must be a name of the worker certificate. Required for all-in-one
+      --daemon-ca-cert <DAEMON_CA_CERT>
+          The CA of the worker certificate, for the daemon half (kbf's --ca-cert). Required for all-in-one
+      --daemon-cert <DAEMON_CERT>
+          The daemon half's client certificate (kbf's --cert), role daemon. Required for all-in-one
+      --daemon-key <DAEMON_KEY>
+          The private key of --daemon-cert (a file of mode 0600 owned by the service user). Required for all-in-one
+      --node-id <NODE_ID>
+          The daemon half's node name, a DNS label unique in the cell. Required for all-in-one
       --installer-config <INSTALLER_CONFIG>
           The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root. The same flag, with the same meaning, as on `run` [default: /etc/kbf/installer.toml]
   -h, --help
