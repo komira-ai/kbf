@@ -6,6 +6,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::cli::{self, FrontendConfig, Host, current_uid, platform_of};
 
@@ -14,6 +15,8 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef\n";
 struct Rig {
     dir: PathBuf,
     token: PathBuf,
+    /// The CA the API's certificate would be verified against.
+    ca: PathBuf,
     commit: String,
 }
 
@@ -23,9 +26,12 @@ impl Rig {
         let token = dir.join("token");
         fs::write(&token, TOKEN).unwrap();
         fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+        let ca = dir.join("ca.pem");
+        fs::write(&ca, crate::deploy::smoke_tests::pki("farm.example").0).unwrap();
         Rig {
             dir,
             token,
+            ca,
             commit: "a".repeat(40),
         }
     }
@@ -49,6 +55,10 @@ impl Rig {
             &self.commit,
             "--api",
             "127.0.0.1:1",
+            "--api-ca",
+            self.ca.to_str().unwrap(),
+            "--api-server-name",
+            "farm.example",
             "--token-file",
             self.token.to_str().unwrap(),
             "--lock",
@@ -89,11 +99,13 @@ fn absent_frontend(rig: &Rig) -> FrontendConfig {
 }
 
 /// Proves each timeout flag reaches its own parse (a zero is a usage error naming the flag)
-/// and a positive value, the order names and a list of offline nodes are accepted. Catches a
-/// flag whose value is dropped, parsed as another flag's, or not parsed.
+/// and a positive value and a list of offline nodes are accepted, and that `--order` is gone:
+/// the frontend is always updated first, so a caller that still sends it is told. Catches a
+/// flag whose value is dropped, parsed as another flag's, or not parsed, and an order flag
+/// that is quietly ignored.
 ///
 /// Mutants planted: `--handover-timeout-s` or `--smoke-timeout-s` ignoring its value (the
-/// zero passes); `frontend-first` refused.
+/// zero passes); `--order` accepted again.
 #[test]
 fn every_flag_takes_its_value() {
     let rig = Rig::new("values");
@@ -109,11 +121,39 @@ fn every_flag_takes_its_value() {
         assert_ne!(code, 2, "{flag}: {err}");
     }
     for order in ["nodes-first", "frontend-first"] {
-        let (code, _, err) = rig.go(&["--order", order], b"", false);
-        assert_ne!(code, 2, "{order}: {err}");
+        let (code, out, err) = rig.go(&["--order", order], b"", false);
+        assert_eq!((code, out.as_str()), (2, ""), "{order}");
+        assert!(err.contains("unknown flag \"--order\""), "{order}: {err}");
     }
     let (code, _, err) = rig.go(&["--allow-offline", "n1,n2"], b"", false);
     assert_ne!(code, 2, "{err}");
+}
+
+/// Proves each run has a request id of its own, in the form the update API accepts (1 to 128
+/// letters, digits and `- _ . :`), and that the defaults are the documented ones: a node's
+/// budget, the update's (which covers the new frontend's bake), the smoke's and the poll.
+/// Catches an id that is the same for every run (the API would answer a new deploy with the
+/// update of an old one) and a default that no longer covers the bake.
+///
+/// Mutants planted: a fixed request id; the handover default 900 s; the node default 600 s.
+#[test]
+fn each_run_has_its_own_request_id_and_the_documented_timeouts() {
+    let rig = Rig::new("request-id");
+    let owner = current_uid();
+    let a = cli::parse(&rig.base(), false, owner).unwrap().options;
+    let b = cli::parse(&rig.base(), false, owner).unwrap().options;
+    assert_ne!(a.request_id, b.request_id);
+    for id in [&a.request_id, &b.request_id] {
+        let hex = id.strip_prefix("deploy-").unwrap();
+        assert!(
+            hex.len() == 32 && hex.bytes().all(|c| c.is_ascii_hexdigit()),
+            "{id}"
+        );
+    }
+    assert_eq!(a.handover_timeout, Duration::from_secs(3600));
+    assert_eq!(a.node_timeout, Duration::from_secs(1800));
+    assert_eq!(a.smoke_timeout, Duration::from_secs(60));
+    assert_eq!(a.poll, Duration::from_secs(5));
 }
 
 /// Proves the host config is read only when a flag is missing, and is refused when it is not
@@ -132,6 +172,8 @@ fn the_config_is_read_only_when_a_flag_is_missing_and_must_be_a_file() {
         let lock = rig.dir.join("deploy.lock");
         let all = [
             ("--api", "127.0.0.1:1"),
+            ("--api-ca", rig.ca.to_str().unwrap()),
+            ("--api-server-name", "farm.example"),
             ("--token-file", rig.token.to_str().unwrap()),
             ("--cas", "http://127.0.0.1:1"),
             ("--cas-ca", "/no/such/ca.pem"),
@@ -156,6 +198,8 @@ fn the_config_is_read_only_when_a_flag_is_missing_and_must_be_a_file() {
     assert_ne!(code, 2, "every flag given, so no config is read: {err}");
     for skip in [
         "--api",
+        "--api-ca",
+        "--api-server-name",
         "--token-file",
         "--cas",
         "--cas-ca",
@@ -189,10 +233,18 @@ fn what_stops_a_deploy_before_it_starts_is_a_usage_error() {
         args
     };
     let host = rig.host(false);
+    let not_a_ca = rig.dir.join("not-a-ca.pem");
+    fs::write(&not_a_ca, "not a certificate").unwrap();
     for (args, want) in [
         (with("--token-file", "/no/such/token"), "token file"),
         (with("--lock", "/dev/null/deploy.lock"), "the lock"),
         (with("--api", "0.0.0.0:1"), "loopback"),
+        (with("--api-ca", "/no/such/ca.pem"), "--api-ca /no/such"),
+        (
+            with("--api-ca", not_a_ca.to_str().unwrap()),
+            "holds no PEM certificate",
+        ),
+        (with("--api-server-name", "not a name!"), "not a DNS name"),
     ] {
         let (code, out, err) = rig.go_with(args, &[], b"", &host);
         assert_eq!((code, out.as_str()), (2, ""), "{want}");

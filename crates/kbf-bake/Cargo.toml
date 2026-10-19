@@ -24,6 +24,8 @@ kbf-gate.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# RFC 3339 times for the invocation list's `since` and `until`.
+time.workspace = true
 # The metrics scrape: a blocking GET of a plain-HTTP endpoint.
 ureq.workspace = true
 

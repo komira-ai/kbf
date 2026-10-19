@@ -1387,6 +1387,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "time",
  "ureq",
 ]
 
@@ -1484,6 +1485,7 @@ dependencies = [
  "kbf-enroll",
  "kbf-front",
  "kbf-host",
+ "kbf-installer",
  "kbf-node",
  "kbf-peer",
  "kbf-proto",
@@ -1827,6 +1829,7 @@ dependencies = [
  "rcgen",
  "rustix",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.11.0",
