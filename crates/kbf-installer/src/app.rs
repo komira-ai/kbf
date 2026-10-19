@@ -115,13 +115,38 @@ fn under(root: &Path, path: &HostPath) -> Result<PathBuf, Failure> {
 fn setup_database(root: &Path, apply: bool, args: &SetupArgs) -> Result<String, Failure> {
     let database = Database::from_installer_toml(&under(root, &args.installer_config)?)
         .map_err(|e| Failure::from(e.to_string()))?;
-    let mode = args.mode.name();
-    if apply {
-        let outcome = database.setup().map_err(|e| Failure::from(e.to_string()))?;
-        return Ok(apply_line(&mode, &outcome));
+    database_step(&database, &args.mode.name(), apply)
+}
+
+/// What the database step needs of the schema: `Database` is the one real implementation; a
+/// test's fake stands in for a server, so the lines `setup` prints after the schema runner
+/// answers are tested without one. The errors are their text: that is all `setup` prints.
+trait SchemaOps {
+    /// Creates or brings forward the schema.
+    fn setup(&self) -> Result<Outcome, String>;
+
+    /// The schema's version (`None` before the first setup) and this build's newest.
+    fn plan(&self) -> Result<(Option<u32>, u32), String>;
+}
+
+impl SchemaOps for Database {
+    fn setup(&self) -> Result<Outcome, String> {
+        Database::setup(self).map_err(|e| e.to_string())
     }
-    let (found, newest) = database.plan().map_err(|e| Failure::from(e.to_string()))?;
-    Ok(dry_run_line(&mode, found, newest))
+
+    fn plan(&self) -> Result<(Option<u32>, u32), String> {
+        Database::plan(self).map_err(|e| e.to_string())
+    }
+}
+
+/// The line the database step prints for `mode`: `--apply` runs the schema, a dry run asks.
+fn database_step(database: &dyn SchemaOps, mode: &str, apply: bool) -> Result<String, Failure> {
+    if apply {
+        let outcome = database.setup().map_err(Failure::from)?;
+        return Ok(apply_line(mode, &outcome));
+    }
+    let (found, newest) = database.plan().map_err(Failure::from)?;
+    Ok(dry_run_line(mode, found, newest))
 }
 
 /// The line `setup --apply` prints for what the database step did.

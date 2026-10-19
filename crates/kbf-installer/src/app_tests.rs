@@ -261,6 +261,22 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
     assert!(err.starts_with("kbf-installer:"), "{err}");
 }
 
+/// Catches `run` not waiting between passes, or not stopping after the last: two passes on a
+/// host take one `PASS_INTERVAL` (the only wait, none after the last pass) and exit 0.
+///
+/// Mutants to plant: the wait dropped (the test finishes in well under the interval); the
+/// wait taken after the last pass too (it takes two intervals).
+#[test]
+fn run_waits_one_interval_between_two_passes_and_not_after_the_last() {
+    let (_, root) = seeded("run-two-passes");
+    let began = std::time::Instant::now();
+    let (exit, err) = on(&root, &["run", "--passes", "2", "--unit", "kbf.service"]);
+    let took = began.elapsed();
+    assert_eq!(exit, Exit::Ok, "{err}");
+    assert!(took >= PASS_INTERVAL, "{took:?}");
+    assert!(took < PASS_INTERVAL * 2, "{took:?}");
+}
+
 /// Catches a boot check that does not count a start or that guesses on a state it cannot
 /// read: with a swap on trial the first start is counted (exit 0), the last start's revert
 /// needs root and so refuses an ordinary user (exit 1), a ruined state refuses (exit 1), and
@@ -644,4 +660,89 @@ fn the_database_step_refuses_a_relative_host_root() {
     let (exit, err) = on(Path::new("relative-root"), &["setup", "--mode", "frontend"]);
     assert_eq!(exit, Exit::Failed, "{err}");
     assert!(err.starts_with("kbf-installer: "), "{err}");
+}
+
+/// A schema runner that answers as told, standing in for a server.
+struct FakeSchema {
+    setup: Result<Outcome, String>,
+    plan: Result<(Option<u32>, u32), String>,
+}
+
+impl SchemaOps for FakeSchema {
+    fn setup(&self) -> Result<Outcome, String> {
+        self.setup.clone()
+    }
+
+    fn plan(&self) -> Result<(Option<u32>, u32), String> {
+        self.plan.clone()
+    }
+}
+
+/// Catches the database step printing the wrong line once the schema runner answers, or
+/// swallowing its error: `--apply` prints the outcome, a dry run prints create, migrate or
+/// nothing to do, and a runner's error is the failure. The fake answers an error to
+/// the question the step must not ask, so asking it fails the test.
+///
+/// Mutants to plant: `apply` flipped; the error mapped to an empty line.
+#[test]
+fn the_database_step_prints_what_the_schema_runner_answered() {
+    let outcome = Outcome {
+        from: None,
+        to: 2,
+        ran: vec![1, 2],
+    };
+    let fake = |plan| FakeSchema {
+        setup: Ok(outcome.clone()),
+        plan,
+    };
+    assert_eq!(
+        database_step(&fake(Err("unused".into())), "frontend", true)
+            .unwrap_or_else(|f| panic!("applied: {}", f.why)),
+        "kbf-installer setup (frontend): database step: created the schema at version 2"
+    );
+    for (found, tail) in [
+        (None, "would create the schema at version 3"),
+        (Some(1), "would migrate the schema from 1 to 3"),
+        (Some(3), "the schema is at 3, nothing to do"),
+    ] {
+        assert_eq!(
+            database_step(&fake(Ok((found, 3))), "all-in-one", false)
+                .unwrap_or_else(|f| panic!("planned: {}", f.why)),
+            format!("kbf-installer setup (all-in-one): database step: dry run: {tail}")
+        );
+    }
+    let broken = FakeSchema {
+        setup: Err("no server".into()),
+        plan: Err("cannot ask".into()),
+    };
+    let apply = database_step(&broken, "frontend", true).expect_err("setup failed");
+    assert_eq!(apply.why, "no server");
+    assert!(matches!(apply.exit, Exit::Failed));
+    let plan = database_step(&broken, "frontend", false).expect_err("plan failed");
+    assert_eq!(plan.why, "cannot ask");
+}
+
+/// Catches the real `Database` not being what `setup`'s database step asks (the fake tests
+/// drive `database_step` alone): with an installer.toml naming a socket directory that does
+/// not exist, both `setup --mode frontend` and `setup --mode frontend --apply` reach the
+/// database and fail with its own error (exit 1), as the ordinary user the step needs no
+/// server to be tested for. No server is started.
+///
+/// Mutants to plant: `Database::plan` or `Database::setup` swapped in `impl SchemaOps`.
+#[test]
+fn setup_asks_the_real_database_and_reports_its_error() {
+    let (_, root) = seeded("setup-real-database");
+    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
+    fs::write(
+        root.join("etc/kbf/installer.toml"),
+        "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n",
+    )
+    .expect("config");
+    for extra in [&[][..], &["--apply"][..]] {
+        let mut argv = vec!["setup", "--mode", "frontend"];
+        argv.extend_from_slice(extra);
+        let (exit, err) = on(&root, &argv);
+        assert_eq!(exit, Exit::Failed, "{extra:?}: {err}");
+        assert!(!err.contains("installer.toml"), "{extra:?}: {err}");
+    }
 }
