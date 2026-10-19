@@ -7,6 +7,7 @@ use std::rc::Rc;
 use kbf_host::testkit::{FakeExec, RUNNER};
 use kbf_host::{Entry, Exec, HostPath, Owner, Perms, Step};
 
+use kbf_state::postgres::Unreached;
 use kbf_state::postgres::schema::Outcome;
 
 use super::backend::{Backend, Releases, Schemas};
@@ -22,7 +23,7 @@ use crate::helper::fetcher::FetchError;
 use crate::installer_toml::Source;
 use crate::layout::{Layout, Platform};
 
-const DATABASE: &str = "postgres:///kbf?host=/run/postgresql";
+const DATABASE: &str = "postgres:///kbf?host=/run/postgresql&user=kbf-server";
 
 const SRC: &str = "/root/kbf.token";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -43,6 +44,7 @@ fn raw(mode: Mode) -> Raw {
         min_generation: None,
         commit: None,
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
+        create_local_database: false,
         installer_config: INSTALLER_TOML.to_owned(),
     }
 }
@@ -107,6 +109,8 @@ type Asked = Rc<RefCell<Vec<String>>>;
 struct Server {
     found: Option<u32>,
     down: bool,
+    /// What a login is refused with, when it is.
+    unreached: Option<Unreached>,
     asked: Asked,
 }
 
@@ -115,6 +119,7 @@ impl Server {
         Server {
             found: None,
             down: false,
+            unreached: None,
             asked: Asked::default(),
         }
     }
@@ -123,11 +128,17 @@ impl Server {
 struct Session {
     found: Option<u32>,
     down: bool,
+    unreached: Option<Unreached>,
     url: String,
     asked: Asked,
 }
 
 impl SchemaOps for Session {
+    fn reach(&self) -> Result<(), Unreached> {
+        self.asked.borrow_mut().push(format!("reach {}", self.url));
+        self.unreached.clone().map_or(Ok(()), Err)
+    }
+
     fn setup(&self) -> Result<Outcome, String> {
         self.asked.borrow_mut().push(format!("setup {}", self.url));
         if self.down {
@@ -158,6 +169,7 @@ impl Schemas for Server {
         Ok(Box::new(Session {
             found: self.found,
             down: self.down,
+            unreached: self.unreached.clone(),
             url: url.to_owned(),
             asked: self.asked.clone(),
         }))
@@ -264,7 +276,7 @@ mode = \"frontend\"
 api-token-file = \"/etc/kbf/api-token\"
 
 [scheduler]
-state-store = \"postgres:///kbf?host=/run/postgresql\"
+state-store = \"postgres:///kbf?host=/run/postgresql&user=kbf-server\"
 ";
 
 const DAEMON_INSTALLER_TOML: &str = "release_source = \"frontend\"
@@ -1087,6 +1099,7 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         min_generation: Some(0),
         commit: None,
         database: Some(DATABASE.to_owned()),
+        create_local_database: false,
         installer_config: "/tmp/i.toml".to_owned(),
     };
     let mut exec = host();
@@ -1497,3 +1510,6 @@ fn a_view_forwards_reads_and_refuses_steps() {
 
 #[path = "more_tests.rs"]
 mod more;
+
+#[path = "provision_tests.rs"]
+mod provision;

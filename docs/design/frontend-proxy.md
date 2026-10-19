@@ -208,7 +208,7 @@ Stated limits, written in the docs rather than enforced in v1: the member-map fl
 
 ## 11. Postgres, SQLite removal, fresh start
 
-**Placement.** One Postgres from the OS package per frontend host, on a Unix socket only, role and database `kbf`, peer authentication (no password in argv or env), URL `postgres:///kbf?host=/run/postgresql`. `synchronous_commit` stays on and the store checks it at open. `kbf-installer` declares `Depends: postgresql` and `setup` creates the role and database. Off-host Postgres (client TLS) is out of scope until a second frontend host is planned. All-in-one gets the same dependency; the SQLite default and `STATE_FILE` go away.
+**Placement.** One Postgres from the OS package per frontend host, on a Unix socket only, role and database `kbf`, peer authentication (no password in argv or env), URL `postgres:///kbf?host=/run/postgresql&user=kbf`. `synchronous_commit` stays on and the store checks it at open. `kbf-installer` has `Suggests: postgresql`, not `Depends`: the package is shared by node hosts, and apt installs `Recommends` by default; `setup --mode=frontend|all-in-one` refuses clearly when no server answers. `setup --create-local-database` creates the role and database as the server's superuser over the socket (peer, no password); it never edits `pg_hba.conf` and refuses with the exact lines to add (`docs/deploy/kbf-installer-setup.md`, "The state database"). Off-host Postgres (client TLS) is out of scope until a second frontend host is planned. All-in-one gets the same dependency; the SQLite default and `STATE_FILE` go away.
 
 **Backup.** A systemd timer running `pg_dump` replaces `VACUUM INTO`. The first backup must succeed and be restore-tested.
 

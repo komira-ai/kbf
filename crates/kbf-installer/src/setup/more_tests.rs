@@ -54,7 +54,10 @@ fn the_database_goes_to_both_files_and_its_schema_is_made_between_them() {
         text(&exec, INSTALLER_TOML)
     );
     assert_eq!(text(&exec, KBF_TOML), FRONTEND_TOML);
-    assert_eq!(*server.asked.borrow(), [format!("setup {DATABASE}")]);
+    assert_eq!(
+        *server.asked.borrow(),
+        [format!("reach {DATABASE}"), format!("setup {DATABASE}")]
+    );
     let at = |needle: &str| {
         out.find(needle)
             .unwrap_or_else(|| panic!("{needle}: {out}"))
@@ -85,7 +88,10 @@ fn a_dry_run_asks_the_server_and_changes_nothing() {
         dry,
     )
     .expect("dry run");
-    assert_eq!(*server.asked.borrow(), [format!("plan {DATABASE}")]);
+    assert_eq!(
+        *server.asked.borrow(),
+        [format!("reach {DATABASE}"), format!("plan {DATABASE}")]
+    );
     assert!(
         out.contains("database step: dry run: would create the schema at version 3"),
         "{out}"
@@ -227,7 +233,7 @@ fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_passwor
         assert!(!why.contains(bad), "{why}");
     }
     let mut ok = raw(Mode::Frontend);
-    ok.database = Some("postgresql:///kbf?host=/run/postgresql".to_owned());
+    ok.database = Some("postgresql:///kbf?host=/run/postgresql&user=kbf".to_owned());
     assert!(ok.validate().is_ok());
 }
 

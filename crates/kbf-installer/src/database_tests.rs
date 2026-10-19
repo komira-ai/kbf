@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kbf_state::postgres::schema::{self, Migration, Outcome, SchemaError};
-use kbf_state::postgres::{PostgresConfig, PostgresStore};
+use kbf_state::postgres::{PostgresConfig, PostgresStore, Unreached};
 use kbf_state::{Cond, Store, Txn};
 
 use super::{
@@ -61,7 +61,7 @@ fn the_database_setting_is_read_and_every_fault_is_refused_without_quoting_the_u
             .unwrap_err();
         assert!(matches!(err, DatabaseError::Password(_)), "{url}");
         assert!(
-            !err.to_string().contains(secret) && !err.to_string().contains("postgres"),
+            !err.to_string().contains(secret) && !err.to_string().contains("postgres://"),
             "{err}"
         );
     }
@@ -258,6 +258,10 @@ struct FakeSchema {
 }
 
 impl SchemaOps for FakeSchema {
+    fn reach(&self) -> Result<(), Unreached> {
+        Ok(())
+    }
+
     fn setup(&self) -> Result<Outcome, String> {
         self.setup.clone()
     }
@@ -330,5 +334,250 @@ fn the_real_database_answers_the_schema_ops_with_its_own_error() {
             !why.is_empty() && !why.contains("nonexistent-kbf-test-socket"),
             "{why}"
         );
+    }
+}
+
+/// Catches the real `Database` answering `reach` with something else than the login's own
+/// outcome, and a server's words reaching `setup`'s lines: with no server behind the socket,
+/// `reach` is `NoServer`; and a statement the server refused (its message quotes the role and
+/// the database) is printed without them, while every error about versions is kept whole.
+///
+/// Mutants to plant: `reach` made to return `Ok`; the `Database` arm of `redacted` removed.
+#[test]
+fn the_real_database_reaches_or_says_why_and_redacts_the_servers_words() {
+    let url = "postgres:///kbf?host=/nonexistent-kbf-test-socket&user=kbf";
+    let db = Database::new(
+        PostgresConfig::parse(url).expect("a url"),
+        schema::embedded(),
+    );
+    assert_eq!(SchemaOps::reach(&db), Err(Unreached::NoServer));
+
+    let said = SchemaError::Database(
+        "FATAL: role \"secretrole\" cannot connect to database \"secretdb\" (SQLSTATE 42501)"
+            .to_owned(),
+    );
+    let shown = super::redacted(said);
+    assert!(
+        !shown.contains("secretrole") && !shown.contains("secretdb") && !shown.is_empty(),
+        "{shown}"
+    );
+    assert_eq!(
+        super::redacted(SchemaError::NotInitialised),
+        SchemaError::NotInitialised.to_string()
+    );
+}
+
+// ---- the role and database `--create-local-database` makes, on a real server -----------------
+
+mod provisioned {
+    use std::sync::Mutex;
+
+    use kbf_host::{Exec, HostExec, Root};
+    use postgres::NoTls;
+
+    use super::{NEXT, Ordering, url};
+    use crate::database::Database;
+    use crate::setup::provision::{Connection, plan};
+    use crate::setup::validate::LocalDatabase;
+    use kbf_state::postgres::schema;
+    use kbf_state::postgres::{PostgresConfig, reach};
+
+    /// Roles and databases belong to the whole server, and these tests make and drop them:
+    /// one at a time, like the farm's other tests on the shared server.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    /// The server `KBF_TEST_POSTGRES_URL` names, in the pieces psql takes.
+    struct Server {
+        host: String,
+        port: String,
+        user: String,
+        password: String,
+    }
+
+    fn server() -> Server {
+        let url = url();
+        let rest = url.strip_prefix("postgres://").expect("a postgres:// URL");
+        let (login, place) = rest.split_once('@').expect("user:password@host");
+        let (user, password) = login.split_once(':').unwrap_or((login, ""));
+        let (hostport, _db) = place.split_once('/').unwrap_or((place, ""));
+        let (host, port) = hostport.split_once(':').unwrap_or((hostport, "5432"));
+        Server {
+            host: host.to_owned(),
+            port: port.to_owned(),
+            user: user.to_owned(),
+            password: password.to_owned(),
+        }
+    }
+
+    fn admin() -> Connection {
+        let s = server();
+        Connection::with_env(vec![
+            ("PGHOST".into(), s.host),
+            ("PGPORT".into(), s.port),
+            ("PGUSER".into(), s.user),
+            ("PGPASSWORD".into(), s.password),
+            ("PGDATABASE".into(), "postgres".into()),
+        ])
+    }
+
+    fn sql(statement: &str) {
+        postgres::Client::connect(&url(), NoTls)
+            .expect("the test server")
+            .batch_execute(statement)
+            .expect("statement");
+    }
+
+    /// A role and a database name unique to one test; both are dropped with it.
+    struct Names {
+        local: LocalDatabase,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Names {
+        fn new() -> Names {
+            let lock = ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let name = format!("kbf_b5_{}_{n}", std::process::id());
+            let s = server();
+            let names = Names {
+                local: LocalDatabase {
+                    role: format!("{name}_r"),
+                    name: format!("{name}_d"),
+                    socket_dir: "/unused".to_owned(),
+                    port: s.port.parse().ok(),
+                },
+                _lock: lock,
+            };
+            names.drop_all();
+            names
+        }
+
+        fn drop_all(&self) {
+            let (role, db) = (&self.local.role, &self.local.name);
+            sql(&format!(
+                "DROP DATABASE IF EXISTS \"{db}\"; DROP ROLE IF EXISTS \"{role}\";"
+            ));
+        }
+
+        fn url(&self) -> String {
+            let s = server();
+            format!(
+                "postgres://{}@{}:{}/{}",
+                self.local.role, s.host, s.port, self.local.name
+            )
+        }
+
+        /// The steps `plan` makes, carried out for real.
+        fn make(&self) -> usize {
+            let steps = plan(&host(), &admin(), &self.local).expect("plan");
+            let mut exec = host();
+            for (_, step) in &steps {
+                exec.apply(step).expect("the step runs");
+            }
+            steps.len()
+        }
+    }
+
+    impl Drop for Names {
+        fn drop(&mut self) {
+            self.drop_all();
+        }
+    }
+
+    fn host() -> HostExec {
+        HostExec::new(Root::new("/").expect("root"))
+    }
+
+    fn one(query: &str) -> Vec<String> {
+        postgres::Client::connect(&url(), NoTls)
+            .expect("the test server")
+            .query(query, &[])
+            .expect("query")
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect()
+    }
+
+    /// Catches provisioning that leaves a server kbf cannot use, or one that is not
+    /// repeatable: on a server with neither, `plan` and its steps (psql, run for real) make a
+    /// login role with no password and no privilege and a database it owns; a second plan is
+    /// empty; the role then logs in to its database, and `setup`'s schema step creates the
+    /// schema there and again changes nothing.
+    ///
+    /// Mutants seen red: the role made `SUPERUSER`; `OWNER` dropped from the database; the
+    /// role-exists test inverted (the second plan makes the role again).
+    #[test]
+    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+    fn fresh_create_then_rerun_changes_nothing_and_the_schema_follows() {
+        let names = Names::new();
+        assert_eq!(names.make(), 2, "a role and a database");
+        let (role, db) = (&names.local.role, &names.local.name);
+        let state = one(&format!(
+            "SELECT rolcanlogin::text || rolsuper::text || rolcreatedb::text || rolcreaterole::text \
+             || (rolpassword IS NULL)::text FROM pg_authid WHERE rolname = '{role}'"
+        ));
+        assert_eq!(state, ["truefalsefalsefalsetrue"]);
+        let owner = one(&format!(
+            "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{db}'"
+        ));
+        assert_eq!(owner, std::slice::from_ref(role));
+
+        assert_eq!(names.make(), 0, "everything is there: nothing to make");
+
+        let config = PostgresConfig::parse(&names.url()).expect("parses");
+        assert_eq!(reach(&config), Ok(()), "the role logs in to its database");
+        let database = Database::new(config, schema::embedded());
+        let first = database.setup().expect("schema");
+        assert_eq!(first.from, None);
+        assert!(database.setup().expect("again").ran.is_empty());
+    }
+
+    /// Catches setup altering what an operator made: a role that cannot log in and a
+    /// superuser role are each refused, a database another role owns is refused, and in each
+    /// case nothing is created and the refusal names neither the role nor the database.
+    ///
+    /// Mutants seen red: the superuser check removed; the owner check removed; the login
+    /// check removed.
+    #[test]
+    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+    fn a_role_that_is_not_plain_or_a_database_owned_by_another_is_refused_and_left_alone() {
+        let names = Names::new();
+        let (role, db) = (names.local.role.clone(), names.local.name.clone());
+        let refused = |names: &Names| {
+            let err = plan(&host(), &admin(), &names.local).expect_err("refused");
+            let text = err.to_string();
+            assert!(
+                !text.contains(&names.local.role) && !text.contains(&names.local.name),
+                "{text}"
+            );
+            text
+        };
+
+        sql(&format!("CREATE ROLE \"{role}\" NOLOGIN"));
+        assert!(refused(&names).contains("not a plain login role"));
+        assert_eq!(
+            one(&format!(
+                "SELECT datname FROM pg_database WHERE datname = '{db}'"
+            ))
+            .len(),
+            0
+        );
+        sql(&format!(
+            "DROP ROLE \"{role}\"; CREATE ROLE \"{role}\" LOGIN SUPERUSER"
+        ));
+        assert!(refused(&names).contains("not a plain login role"));
+        sql(&format!("DROP ROLE \"{role}\""));
+
+        // The database exists and the server's own account owns it.
+        sql(&format!(
+            "CREATE ROLE \"{role}\" LOGIN; CREATE DATABASE \"{db}\""
+        ));
+        assert!(refused(&names).contains("another role owns it"));
+        let owner = one(&format!(
+            "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{db}'"
+        ));
+        assert_ne!(owner, std::slice::from_ref(&role), "setup changed no owner");
     }
 }

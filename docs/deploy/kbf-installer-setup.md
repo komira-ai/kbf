@@ -12,7 +12,7 @@ sudo kbf-installer setup --mode=daemon \
 sudo kbf-installer --apply setup ...                                                    # do it
 
 sudo kbf-installer setup --mode=frontend --release-url=https://releases.example/kbf \
-    --database='postgres:///kbf?host=/run/postgresql'
+    --database='postgres:///kbf?host=/run/postgresql&user=kbf' --create-local-database
 ```
 
 Without `--apply` it prints each step as `DRY-RUN: <step>` and changes nothing. With it, it
@@ -27,8 +27,10 @@ prints `+ <step>` and does the step. It never prints a token.
 
 The modes in the first row enroll with a frontend when they start, so they need its URL and
 an enrollment token. The other two do not enroll; they keep their state in Postgres. The
-server, the database and the role exist before `setup` runs (the operator provides them);
-`--database` says where, as `postgres:///NAME?host=SOCKET_DIR`. A URL with a password is
+server exists before `setup` runs (the operator provides it); the role and the database
+exist too, or `--create-local-database` makes them (see "The state database" below).
+`--database` says where, as `postgres:///NAME?host=SOCKET_DIR&user=ROLE`; the role is
+required, because `setup` runs as root and the service as its own account. A URL with a password is
 refused (`installer.toml` is world-readable), and no message quotes a URL. `--commit` installs
 the first release before the host has enrolled, so it needs `--release-source=url`.
 `--min-generation` is the operator floor for orders; a re-run may raise it and never lowers it.
@@ -60,11 +62,13 @@ installer's unit reads it, and refuses another path. A Mac is a node only (`--mo
    file that does not parse (it is closed: an unknown key, a wrong type or a value out of
    bounds is refused) is left alone (exit 5). The release source is read only from this file.
 7. Frontend and all-in-one: the state database's schema is created, or brought forward, by the
-   installer's own migrations; a dry run asks the server and says what it would do. `setup`
-   connects as the user running it (root) unless the URL names a role with `user=`, so the
-   server must let that role in from root (peer authentication through a `pg_ident` map, or a
-   local `trust` rule). A server that cannot be reached stops `setup` here (exit 1), with
-   `installer.toml` written and no release, `kbf.toml` or unit; running it again finishes.
+   installer's own migrations; a dry run asks the server and says what it would do. With
+   `--create-local-database` the role and the database are made first. `setup` then logs in
+   as root with the URL's role and, when the service account exists, as that account, so a
+   server that would admit one and not the other is refused here and not at the first start.
+   A server that cannot be reached, or that refuses a login, stops `setup` here (exit 1)
+   with the recipe below, `installer.toml` written and no release, `kbf.toml` or unit;
+   running it again finishes.
 8. `--commit`: the first release, through the installer's `Fetcher` (the fetch child and the
    verify pipeline) and nothing else, then made `releases/current` with no trial. This build
    has no fetcher wired in, so it stops here with exit 1, before `kbf.toml` and the units.
@@ -96,6 +100,57 @@ with exit 5.
 **Proxy units.** The bundled proxy's units (`kbf-proxy.service` and `.socket`) are not on
 `feature/arch-v2` yet (kbf#1153), so a frontend or all-in-one host enables the units that exist
 (`mode_units` in `src/setup/plan.rs` is the one place to change when they land).
+
+## The state database
+
+`frontend` and `all-in-one` keep their state in one Postgres database on the host. The
+package only suggests the server (`Suggests: postgresql`, rpm `postgresql-server`): the
+package is shared by node hosts, which use none, and apt installs `Recommends` by default,
+which would start a database on every node. `setup` for these two modes refuses clearly when
+no server answers at the URL's socket, and says what to install.
+
+Install the server, then one of these.
+
+**Local server, setup makes the role and database (`--create-local-database`).** `setup` asks
+the server as its superuser, by running `/usr/bin/psql` as the operating-system user
+`postgres` over the Unix socket the URL names: peer authentication, no password anywhere. It
+creates, if missing, a login role (no password, not a superuser, no CREATEDB, CREATEROLE or
+REPLICATION) and a database owned by it, both named by the URL. A re-run creates only what is
+missing. It alters nothing that exists: a role that cannot log in or is a superuser, and a
+database another role owns, are refused (exit 1) and left as they are. The names must be
+letters, digits, `_` and `-` (at most 63), the role neither `postgres` nor `pg_`-prefixed,
+and the host a Linux host with a `postgres` account. The server's socket directory comes from
+`host=` and must be absolute; a remote server is never reached this way.
+
+**`setup` never edits `pg_hba.conf` or `pg_ident.conf`.** It logs in the way kbf will and,
+when the server refuses, prints the rules to add. For a role `<role>` in database
+`<database>` and a service account `<service>` (`kbf-server` for `frontend` and `all-in-one`),
+above the first `local` line of `pg_hba.conf`:
+
+```text
+local  <database>  <role>  peer map=kbf
+```
+
+and in `pg_ident.conf`:
+
+```text
+kbf  root       <role>
+kbf  <service>  <role>
+```
+
+then reload the server (`pg_ctl reload`, or `systemctl reload postgresql`; a restart is not
+needed) and run `setup` again. If the role is named like the service account, the first
+`pg_ident` line alone is the missing part for root.
+
+**Remote or managed server, or a role and database the operator makes.** `setup` does not
+reach a remote server's superuser and holds no password. Create the role (login, no
+superuser) and a database it owns, make the server admit the logins above (with a server over
+TCP, client certificates are out of scope, see `docs/design/frontend-proxy.md` section 11),
+and run `setup` without `--create-local-database`: it only checks that it can log in, then
+creates or brings forward the schema.
+
+No refusal quotes the URL, the role, the database or the socket directory; the server's own
+words, which do, stay in its log.
 
 ## Exit codes
 
