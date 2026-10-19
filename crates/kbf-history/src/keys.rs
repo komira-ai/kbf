@@ -76,6 +76,20 @@ const MAX_YEAR: u64 = 429_495;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WriterId(pub u64);
 
+impl WriterId {
+    /// The writer id of the process whose instance id is `instance`: the first eight
+    /// bytes of its SHA-256. A process that names its history writer by its instance id
+    /// can be told apart from every other by the keys it writes, and the keys of two
+    /// children of one swap never meet.
+    #[must_use]
+    pub fn from_instance(instance: &str) -> WriterId {
+        let digest = Sha256::digest(instance.as_bytes());
+        let mut first = [0u8; 8];
+        first.copy_from_slice(&digest[..8]);
+        WriterId(u64::from_be_bytes(first))
+    }
+}
+
 impl fmt::Display for WriterId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:016x}", self.0)
@@ -341,9 +355,28 @@ impl IndexRoot {
         format!("{}streams", self.0)
     }
 
-    /// The header row of an invocation.
+    /// The header row an invocation had before each writer kept its own
+    /// ([`IndexRoot::header`]): one row for every writer. Nothing writes it now; a reader
+    /// still counts one that an earlier build left, as one more writer's.
     #[must_use]
     pub fn invid(&self, inv: &InvKey) -> String {
+        format!("{}invid/{inv}", self.0)
+    }
+
+    /// `writer`'s header row of an invocation: the counts of the records `writer` wrote.
+    /// Each writer owns one row and no other writer touches it, so two writers never
+    /// race on a header and the row of a replaced process is still written by it. A
+    /// reader merges the rows of every writer.
+    #[must_use]
+    pub fn header(&self, inv: &InvKey, writer: WriterId) -> String {
+        format!("{}invid/{inv}/{writer}", self.0)
+    }
+
+    /// The prefix of every header row of an invocation, the legacy one
+    /// ([`IndexRoot::invid`]) and each writer's. An invocation key is a fixed 16 hex
+    /// digits, so no other invocation's row starts with it.
+    #[must_use]
+    pub fn header_rows(&self, inv: &InvKey) -> String {
         format!("{}invid/{inv}", self.0)
     }
 
@@ -866,5 +899,33 @@ mod tests {
                 .statusx("failing", "i", 1, "c")
                 .starts_with(&rows.status_prefix("i"))
         );
+    }
+
+    #[test]
+    fn a_writer_id_follows_from_the_instance_and_a_header_row_from_the_writer() {
+        // Catches: a writer id that is not a function of the instance (the test and the
+        // rows could not name the child that wrote them), two instances sharing one, a
+        // header key that lacks the writer (two writers on one row) and a header prefix
+        // that misses the legacy row or reaches another invocation's.
+        let a = WriterId::from_instance("5d0c6f2e-7a41-4f0b-8f0e-9a3d6b1c2e77");
+        assert_eq!(
+            a,
+            WriterId::from_instance("5d0c6f2e-7a41-4f0b-8f0e-9a3d6b1c2e77")
+        );
+        assert_ne!(
+            a,
+            WriterId::from_instance("5d0c6f2e-7a41-4f0b-8f0e-9a3d6b1c2e78")
+        );
+        let root = IndexRoot::default();
+        let (one, two) = (InvKey::from_record_id("one"), InvKey::from_record_id("two"));
+        assert_eq!(root.header(&one, a), format!("ui/invid/{one}/{a}"));
+        for key in [
+            root.invid(&one),
+            root.header(&one, a),
+            root.header(&one, WriterId(1)),
+        ] {
+            assert!(key.starts_with(&root.header_rows(&one)), "{key}");
+        }
+        assert!(!root.header(&two, a).starts_with(&root.header_rows(&one)));
     }
 }

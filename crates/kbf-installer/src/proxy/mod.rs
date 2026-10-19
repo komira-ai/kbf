@@ -15,14 +15,16 @@
 //! - [`runtime::SystemClock`] and [`runtime::RequestQueue`], the `Clock` and the `Requests`;
 //! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left.
 //!
-//! Still fakes, stated: `ChildAdmin` (the trait is the shape the swap was built on; the
-//! adapter from it to the child's admin API, `admin_protocol` 1, is #1162, in `proxy/admin.rs`;
-//! it would send the proxy secret header on every call, over [`child_http`], the blocking
-//! loopback client that the fleet read will use too), `Migrator` (who migrates is open),
-//! `RootOrders` (the orders spool and `status.json` reader belong to the update API's unit,
-//! U8b). Until `ChildAdmin` has an adapter the proxy verb cannot run a swap or resume one,
-//! start a first child or choose between two live ones, so [`supervisor::adopt_children`]
-//! adopts a child only when no update is in flight.
+//! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
+//! child control and the fleet read call a child's ports with (U8b); [`admin`] is the
+//! `ChildAdmin` built on it (`admin_protocol` 1, sending the proxy secret header on every
+//! call), and nothing else calls it yet.
+//!
+//! Still fakes, stated: `Migrator` (who migrates is open), `RootOrders` (the orders spool
+//! and `status.json` reader belong to the update API's unit, U8b). Until the proxy verb
+//! wires [`admin`] in, it cannot run a swap or resume one, start a first child or choose
+//! between two live ones, so [`supervisor::adopt_children`] adopts a child only when no
+//! update is in flight.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -75,6 +77,7 @@
 //!   again, takes the generation (no live holder, so the child bumps the epoch) and is
 //!   recorded. A live child that does not answer `role` is not reconciled.
 
+pub mod admin;
 mod aio;
 pub mod api;
 pub mod child_http;
@@ -91,6 +94,8 @@ pub mod runtime;
 pub mod supervisor;
 mod swap;
 
+#[cfg(test)]
+mod admin_tests;
 #[cfg(test)]
 mod aio_tests;
 #[cfg(test)]

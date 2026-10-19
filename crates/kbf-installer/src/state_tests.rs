@@ -56,31 +56,23 @@ fn the_lock_is_held_while_a_locked_lives() {
     free_once_dropped(&other);
 }
 
-/// Takes the lock on `other` once the holder is dropped, waiting out a child forked meanwhile.
+/// The lock on `other` is free the moment the holder is dropped: one try, no wait.
 ///
-/// Other tests of this binary spawn processes. A child forked while the lock's descriptor was
-/// open holds a duplicate of it until it execs (`CLOEXEC` closes at exec, not at fork), and
-/// `flock` is released only when the last duplicate closes, so for those microseconds a
-/// dropped lock still looks held. The wait is bounded; a lock that stays held fails.
+/// `Locked`'s `Drop` unlocks explicitly, so a child forked meanwhile and still holding a
+/// duplicate of the descriptor does not keep the `flock` held.
 fn free_once_dropped(other: &File) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        match other.try_lock() {
-            Ok(()) => return,
-            Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(e) => panic!("still held 2 s after it was dropped: {e}"),
-        }
-    }
+    other
+        .try_lock()
+        .expect("the lock is free once its holder is dropped");
 }
 
 /// Catches a lock that is not released once its holder is dropped while processes are being
 /// spawned: the drop must free it for good, though a forked child briefly keeps a duplicate
 /// of the descriptor.
 ///
-/// Mutant seen red: the strict check in the test above (`try_lock` once, no wait) failed 6 of
-/// 300 rounds with a spawner thread running; the bounded wait never fails.
+/// Mutant: the `Drop` of `Locked` removed (the close alone releases the lock): with the
+/// spawner thread running, the single `try_lock` failed 6 of 300 rounds before the unlock
+/// on drop. `tests/state_lock.rs` holds the deterministic version with a forked child.
 #[test]
 fn the_lock_is_free_after_a_drop_while_children_are_spawned() {
     let (root, dir) = host_root("deploy-host-state-lock-spawn");
