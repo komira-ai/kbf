@@ -1203,7 +1203,9 @@ for the whole of its retries is `503` with `Retry-After: 1`: send it again.
   `rollback` false, and **any other commit is `409` unless the body has `"rollback": true`**, in
   which case it is written with `rollback` true and a line is logged. A server whose build
   commit is `unknown` (built with no git checkout) has no own release and needs `"rollback":
-  true` for every offer. A rollback gets a higher generation like any other change; a repeat of
+  true` for every offer. `rollback` means "not the frontend's own", not "older" (commits have
+  no order): a forward upgrade to a commit that is not the frontend's own is recorded as a
+  rollback too, so the field is not a downgrade indicator. A rollback gets a higher generation like any other change; a repeat of
   the desired commit with the other `rollback` than the row records changes that field and keeps
   the generation. The row is what the controller reads: it drives nodes to a release other than
   the frontend's own only for a row that is a rollback (`docs/design/frontend-proxy.md` section

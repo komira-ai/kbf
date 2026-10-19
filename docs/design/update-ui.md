@@ -30,7 +30,9 @@ everything the page shows.
   No per-host update state is served.
 - **[F]** #976 serves `GET /v1/update` **open** as `{desired, releases}` (`desired` is `{generation, commit, set_at_ms,
   paused}`), `POST /v1/update/desired` with `Offer` = `deny_unknown_fields {commit}`, and `POST /v1/update/pause` and
-  `/resume` (`release/desired.rs`). Writes pass `operator_gate`. Its owner says it is gaining an optional `expect_generation`
+  `/resume` (`release/desired.rs`). **Today** (R4, `frontend-proxy.md` section 9) the offer is `deny_unknown_fields {commit,
+  expect_generation?, rollback?}` and the desired view is `{generation, commit, set_at_ms, rollback}`; the text of this bullet
+  below is #976's head, kept for the reasoning that follows it. Writes pass `operator_gate`. Its owner says it is gaining an optional `expect_generation`
   (409 on mismatch, no write) and a `policy` object in `GET /v1/update`; **this file builds on both and says so**:
   `GET /v1/update` = `{desired, releases, policy?}`, `Offer` = `{commit, expect_generation?}`. **Where pause lives.** At #976's head `policy_view` has no `paused` field: pause is `desired.paused`, and `policy` is null until a
   policy row exists. The page's rule: **use `policy.paused` only if that key is present, else `desired.paused`**, so a policy row
@@ -103,7 +105,12 @@ none. `expect_generation` is the generation the page read, so a second operator'
 overwriting it. **Downgrades are allowed, and a downgrade is a rollback** (`frontend-proxy.md` section 9, R4): a commit other
 than the serving process's own build commit (the frontend row's) is refused with 409 unless the body also has
 `"rollback":true`, and the row records it (`desired.rollback`). The page never writes, so it posts nothing; it says this
-beside the command, pointing at the frontend row's commit, and shows a desired row that is a rollback as one. When the `kbf update set` verb exists (PR 6, optional) the page shows that instead. A blocker that makes the
+beside the command, pointing at the frontend row's commit, and shows a desired row that is a rollback as one. The `rollback`
+field says the commit is not the frontend's own, not that it is older (commits have no order): a forward upgrade to another
+commit is recorded as a rollback too. A controller held back by this rule (an old child after a frontend rollback, with
+a non-rollback row for a release that is not its own) logs one line and is on no route, so the page cannot show it; a host
+the new child had already cordoned stays cordoned until the desired row is one that controller may drive: its own commit
+offered (the host is given back) or a row that is a rollback. When the `kbf update set` verb exists (PR 6, optional) the page shows that instead. A blocker that makes the
 server refuse (no complete platform) is shown as a reason above the command, and the command is omitted.
 
 Every URL the page read is listed below it, as links.

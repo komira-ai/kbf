@@ -17,7 +17,7 @@ operator's real usage as the canary. The bake ends in a verdict document.
 
 A commit with a passing bake can be published: **prod** is the existing attested-artifact release (tag, files, notes), gated
 in GitHub on the verdict. **Rollback** is the updater walking back through the same mechanism it walked forward with: the
-desired commit is set to the older release under a higher generation.
+desired commit is set to the older release under a higher generation, with `"rollback": true` in the call (section 8).
 
 ```
  merge ──> artifacts (build once, attest) ──> beta (Actions, ephemeral farm)
@@ -484,7 +484,8 @@ Rollback is the updater walking back, and it is the forward mechanism with the o
   red makes the evaluator write a red verdict and **set the rollback automatically** when the release is reversible
   (8.3); when it is not, it pages and offers nothing. A soft gate never rolls back by itself.
 - **Prod rollback** is the same move on each farm that runs the public release: its desired commit goes to the older release
-  under a higher generation. The GitHub release is not rewritten (the published files are permanent, as kci's names are);
+  under a higher generation, with `"rollback": true` in the call (a pipeline that posts any commit other than the farm's
+  frontend's own without it gets `409`). The GitHub release is not rewritten (the published files are permanent, as kci's names are);
   the notes of the next release say what was withdrawn, and the release poller does not propose a withdrawn commit.
 - **When a rollback lands mid-roll [P].** A process mid-step is not interrupted: the updater finishes that step to its
   phase boundary (T13), then walks back from the current state. The first node step and the frontend handover are each a
