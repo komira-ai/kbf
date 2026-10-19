@@ -195,10 +195,10 @@ fn the_kill_is_never_made_as_root() {
 #[test]
 fn nothing_to_kill_is_not_a_failure_and_another_error_is() {
     let errno = |n: i32| move || io::Error::from_raw_os_error(n);
-    assert!(signalled(0, || unreachable!("no failure")).is_ok());
-    assert!(signalled(-1, errno(libc::ESRCH)).is_ok());
-    assert!(signalled(-1, errno(libc::EPERM)).is_ok());
-    let got = signalled(-1, errno(libc::EINVAL));
+    assert!(signalled(0, &|| unreachable!("no failure")).is_ok());
+    assert!(signalled(-1, &errno(libc::ESRCH)).is_ok());
+    assert!(signalled(-1, &errno(libc::EPERM)).is_ok());
+    let got = signalled(-1, &errno(libc::EINVAL));
     assert_eq!(got.map_err(|e| e.raw_os_error()), Err(Some(libc::EINVAL)));
 }
 

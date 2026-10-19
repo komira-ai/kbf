@@ -494,15 +494,16 @@ impl Confiner for Libc {
         // SAFETY: kill reads no memory; -1 names every process the caller may signal except
         // init and (on Linux and macOS) the caller itself.
         let rc = unsafe { libc::kill(-1, signal) };
-        signalled(rc, io::Error::last_os_error)
+        signalled(rc, &io::Error::last_os_error)
     }
 }
 
 /// What the result `rc` of `kill(-1, ..)` says: `Ok` when it signalled something, and when
 /// there was nothing it may signal (`ESRCH`: no other process; `EPERM`: only other users'
 /// processes, which is the usual answer on a host where nothing of the fetch user is left).
-/// `last` is read only for a failure.
-pub(crate) fn signalled(rc: libc::c_int, last: impl FnOnce() -> io::Error) -> io::Result<()> {
+/// `last` is read only for a failure. A `&dyn`, not a generic: there is one copy of this
+/// function, and the tests that hand it each answer cover the arms the real call does not reach.
+pub(crate) fn signalled(rc: libc::c_int, last: &dyn Fn() -> io::Error) -> io::Result<()> {
     if rc == 0 {
         return Ok(());
     }

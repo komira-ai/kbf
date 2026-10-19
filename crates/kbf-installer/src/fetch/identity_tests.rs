@@ -275,7 +275,7 @@ fn without_the_resolving_open_the_last_component_is_still_not_followed() {
     let link = dir.join("link.pem");
     symlink(&plain, &link).expect("link");
     for gone in [Errno::NOSYS, Errno::PERM] {
-        let read = |path: &Path| open_plain_with(path, |_| Err(gone));
+        let read = |path: &Path| open_plain_with(path, &|_| Err(gone));
         assert!(read(&plain).is_ok(), "{gone:?}: the plain file opens");
         let got = read(&link);
         assert_eq!(
@@ -284,7 +284,7 @@ fn without_the_resolving_open_the_last_component_is_still_not_followed() {
             "{gone:?}: a final link is refused"
         );
     }
-    let got = open_plain_with(&plain, |_| Err(Errno::ACCESS));
+    let got = open_plain_with(&plain, &|_| Err(Errno::ACCESS));
     assert_eq!(
         got.err().and_then(|e| e.raw_os_error()),
         Some(libc::EACCES),

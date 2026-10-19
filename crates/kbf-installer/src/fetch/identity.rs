@@ -95,7 +95,7 @@ pub fn read_pem(path: &Path) -> Result<Vec<u8>, IdentityFault> {
 /// it is then followed. Not blocking, so a FIFO is not waited for.
 #[cfg(target_os = "linux")]
 fn open_plain(path: &Path) -> io::Result<File> {
-    open_plain_with(path, |path| {
+    open_plain_with(path, &|path| {
         use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
         let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
         let resolve = ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
@@ -103,11 +103,13 @@ fn open_plain(path: &Path) -> io::Result<File> {
     })
 }
 
-/// [`open_plain`] given the resolving open, so a test can hand it one that is not there.
+/// [`open_plain`] given the resolving open, so a test can hand it one that is not there. A
+/// `&dyn`, not a generic: there is one copy of this function, and the tests that hand it other
+/// opens cover the arms the real one does not reach here.
 #[cfg(target_os = "linux")]
 fn open_plain_with(
     path: &Path,
-    resolve: impl FnOnce(&Path) -> rustix::io::Result<OwnedFd>,
+    resolve: &dyn Fn(&Path) -> rustix::io::Result<OwnedFd>,
 ) -> io::Result<File> {
     use rustix::io::Errno;
     match resolve(path) {
