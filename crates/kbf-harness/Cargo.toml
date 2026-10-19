@@ -28,6 +28,13 @@ name = "kbf-harness-fake-buck2"
 path = "tests/bin/fake_buck2.rs"
 test = false
 
+# The watcher of the farm's scratch-order test (src/farm_tests.rs): polls for a marker file
+# and records that it saw it gone. A test tool of this package, built like the `buck2` above.
+[[bin]]
+name = "kbf-harness-watcher"
+path = "tests/bin/watcher.rs"
+test = false
+
 [dependencies]
 clap.workspace = true
 flate2.workspace = true

@@ -628,13 +628,15 @@ fn a_farm_reaps_its_processes_before_it_removes_the_scratch() {
         std::fs::write(path.join(format!("f{n}")), b"x").expect("write a filler");
     }
     let (up, saw_gone) = (outside.join("up"), outside.join("saw_gone"));
-    let script = format!(
-        "echo > {up}; while [ -e {marker} ]; do :; done; echo > {saw_gone}",
-        up = up.display(),
-        marker = marker.display(),
-        saw_gone = saw_gone.display(),
+    let bin = crate::stand_in::sibling_bin("kbf-harness-watcher");
+    let argv = [&up, &marker, &saw_gone].map(|p| p.display().to_string());
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let watcher = spec(
+        Role::Node(1),
+        bin.to_str().expect("utf-8 path"),
+        &argv,
+        &path,
     );
-    let watcher = spec(Role::Node(1), "sh", &["-c", &script], &path);
     let farm = Farm::supervise(&path, vec![watcher]).owning(scratch);
     let until = std::time::Instant::now() + Duration::from_secs(30);
     while !up.exists() {
