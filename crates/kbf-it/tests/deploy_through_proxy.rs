@@ -14,7 +14,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,6 +26,7 @@ use kbf_proxy::config::ProxyConfig;
 use kbf_proxy::control::{UpdateHandler, UpdateReply, UpdateRequest};
 use kbf_proxy::slot::Slot;
 use kbf_proxy::{Proxy, ProxyHandle};
+use kbf_testkit::dir::TestDir;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, SanType,
@@ -161,11 +162,12 @@ fn private(path: &Path, content: &[u8]) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
 }
 
-fn dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("deploy-proxy-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a directory");
-    dir
+/// A fresh directory for one run of the test, removed when it drops.
+fn dir(name: &str) -> TestDir {
+    TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("deploy-proxy-{name}"),
+    )
 }
 
 /// A proxy over `base`'s ports with slot A active, serving `api` on its update route.
