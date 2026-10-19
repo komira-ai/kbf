@@ -609,7 +609,14 @@ fn action_with_nothing_else(argv: &str, props: &[(&str, &str)]) -> Blob {
         arguments: vec![argv.to_owned()],
         ..Default::default()
     });
-    let root = Blob::of(&Directory::default());
+    let root = Blob::of(&Directory {
+        files: vec![FileNode {
+            name: "in".to_owned(),
+            digest: Some(Blob::new("an input nobody uploaded").proto),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
     Blob::of(&Action {
         command_digest: Some(command.proto.clone()),
         input_root_digest: Some(root.proto.clone()),
@@ -647,7 +654,16 @@ async fn a_bad_platform_is_refused_before_the_inputs_are_read() {
         }),
         ..Default::default()
     });
-    let root = Blob::of(&Directory::default());
+    // An input tree that is not there (the empty directory would be: the CAS holds the
+    // empty blob), so reading the inputs before the platform would answer MISSING.
+    let root = Blob::of(&Directory {
+        files: vec![FileNode {
+            name: "in".to_owned(),
+            digest: Some(Blob::new("an input nobody uploaded").proto),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
     let in_command = Blob::of(&Action {
         command_digest: Some(command.proto.clone()),
         input_root_digest: Some(root.proto.clone()),
