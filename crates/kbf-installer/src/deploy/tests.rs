@@ -1168,8 +1168,8 @@ mod cli_tests {
         for (flag, value) in [
             ("--api", "127.0.0.1:1"),
             ("--token-file", "/etc/shadow"),
-            ("--config", "/home/x/deploy.json"),
-            ("--lock", "/home/x/lock"),
+            ("--config", "/var/tmp/x/deploy.json"),
+            ("--lock", "/var/tmp/x/lock"),
             ("--platform", "linux-x86_64"),
             ("--cas", "http://127.0.0.1:1"),
         ] {
