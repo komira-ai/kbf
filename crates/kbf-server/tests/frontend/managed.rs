@@ -18,6 +18,9 @@ use super::*;
 #[path = "managed/proxy.rs"]
 mod proxy;
 
+#[path = "managed/writes.rs"]
+mod writes;
+
 /// Waits until `look` says yes, for at most twenty seconds.
 async fn until(what: &str, mut look: impl AsyncFnMut() -> bool) {
     for _ in 0..1000 {
