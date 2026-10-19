@@ -22,7 +22,13 @@
 //!    report and in `status.json`, and never mark it verified. Re-run: a release with
 //!    `VERIFIED` is skipped, a copy with the source's digest is kept, any other leftover
 //!    is replaced, scratch is swept.
-//! 5. **Stop, repoint, start.** The old helper's unit and the kbf units that run are
+//! 5. **Lock, look again, stop, repoint, start.** An apply takes the old tools' lock and the
+//!    installer's and does step 1 and the seeding of step 2 again under them: what it read
+//!    before may have moved (a verb of the old tools, the old helper acting on an order,
+//!    another run finishing), and every write below is made from this second look alone. A
+//!    `current` or `previous` that is not what step 3 probed ends the run with
+//!    [`MigrateError::Changed`], nothing migrated; a migration another run finished is
+//!    reported as done. The old helper's unit and the kbf units that run are
 //!    stopped (the list is journalled first), the helper is disabled so only one tool
 //!    manages the host, then `state.json` and `helper.json` (the replay floor), then
 //!    `releases/current` and `previous`, `status.json` and the units' `Exec*=` lines are
@@ -200,6 +206,8 @@ pub fn guard(layout: &Layout, owner_uid: u32) -> Result<(), MigrateError> {
 mod coverage_tests;
 #[cfg(test)]
 mod floor_tests;
+#[cfg(test)]
+mod moved_tests;
 #[cfg(test)]
 mod refusal_tests;
 #[cfg(test)]

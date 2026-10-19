@@ -251,27 +251,19 @@ impl Rig {
         staged: Option<&str>,
         pending: Option<&str>,
     ) {
-        let dir = self.under(&self.roots().old_state);
-        let pending = pending.map(|commit| {
-            serde_json::json!({
-                "commit": commit, "previous": previous, "deadline": null,
-                "order_id": null, "starts_left": 3,
-            })
-        });
-        let state = serde_json::json!({
-            "schema": 1, "current": current, "previous": previous, "staged": staged,
-            "pending_confirm": pending, "order_floor": 0,
-        });
-        put(&dir.join("state.json"), &state.to_string(), 0o600);
+        self.old_hand().state(current, previous, staged, pending);
     }
 
     pub fn write_memory(&self, memory: &Memory) {
-        let dir = self.at(self.roots().old_state.as_str().trim_start_matches('/'));
-        put(
-            &dir.join("helper.json"),
-            &serde_json::to_string(memory).expect("json"),
-            0o600,
-        );
+        self.old_hand().memory(memory);
+    }
+
+    /// The old tools' files, for a closure that outlives the borrow of the rig.
+    pub fn old_hand(&self) -> OldHand {
+        OldHand {
+            state: self.under(&self.roots().old_state),
+            tree: self.under(&self.roots().old_tree),
+        }
     }
 
     pub fn daemon(&self) -> Unit {
@@ -349,18 +341,91 @@ impl Rig {
     }
 }
 
+/// What a verb of the old tools does to their files: a hand on the old state, memory and
+/// links that a closure can hold (it needs no borrow of the rig).
+#[derive(Clone)]
+pub struct OldHand {
+    state: PathBuf,
+    tree: PathBuf,
+}
+
+impl OldHand {
+    /// The old tools' `state.json` (schema 1): the releases the links name, a release
+    /// staged, and the commit of a swap on trial.
+    pub fn state(
+        &self,
+        current: Option<&str>,
+        previous: Option<&str>,
+        staged: Option<&str>,
+        pending: Option<&str>,
+    ) {
+        let pending = pending.map(|commit| {
+            serde_json::json!({
+                "commit": commit, "previous": previous, "deadline": null,
+                "order_id": null, "starts_left": 3,
+            })
+        });
+        let state = serde_json::json!({
+            "schema": 1, "current": current, "previous": previous, "staged": staged,
+            "pending_confirm": pending, "order_floor": 0,
+        });
+        put(&self.state.join("state.json"), &state.to_string(), 0o600);
+    }
+
+    pub fn memory(&self, memory: &Memory) {
+        put(
+            &self.state.join("helper.json"),
+            &serde_json::to_string(memory).expect("json"),
+            0o600,
+        );
+    }
+
+    /// Point the old tree's link `name` at `releases/<commit>`.
+    pub fn link(&self, name: &str, commit: &str) {
+        let link = self.tree.join(name);
+        fs::remove_file(&link).expect("the link was there");
+        std::os::unix::fs::symlink(format!("releases/{commit}"), link).expect("link");
+    }
+
+    /// The old tool's swap back, as it leaves the old layout whole: `previous` (`B`) is
+    /// `current` now, `A` is `previous`, in the state and in the links.
+    pub fn swap_back(&self) {
+        self.state(Some(B), Some(A), None, None);
+        self.link("current", B);
+        self.link("previous", A);
+    }
+}
+
+/// What `kbf --version --json` of the build in the directory the program is in says, as
+/// that directory's commit's release build.
+fn probe_answer(spawn: &Spawn) -> io::Result<crate::run::Ran> {
+    let commit = spawn
+        .program
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .expect("a release directory")
+        .to_owned();
+    Ok(ran(0, &version_json(&commit, "release"), ""))
+}
+
 /// A runner that answers `--version --json` for the build in the directory the program is
 /// in, as `commit`'s release build, and records every spawn.
 pub fn runner() -> FakeRunner {
-    FakeRunner::new(|spawn: &Spawn| {
-        let commit = spawn
-            .program
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|n| n.to_str())
-            .expect("a release directory")
-            .to_owned();
-        Ok(ran(0, &version_json(&commit, "release"), ""))
+    FakeRunner::new(probe_answer)
+}
+
+/// [`runner`], which first does `between` (once, at the first probe). The probe is the one
+/// place the migration runs foreign code after its look at the old layout and before it
+/// takes its locks, so this is where a test plays whatever else touches the host in that
+/// window: a verb of the old tools, another run of the migration.
+pub fn runner_between(between: impl Fn() + 'static) -> FakeRunner {
+    let done = Cell::new(false);
+    FakeRunner::new(move |spawn: &Spawn| {
+        if !done.replace(true) {
+            between();
+        }
+        probe_answer(spawn)
     })
 }
 

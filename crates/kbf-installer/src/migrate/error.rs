@@ -21,6 +21,13 @@ pub enum MigrateError {
     /// old tool): the migration will not guess which is right.
     #[error("the old layout disagrees with itself: {0}")]
     Disagree(String),
+    /// The old layout moved between the migration's first look and its locks (a verb of the
+    /// old tools, or another run of this verb): what was probed and planned is not what is
+    /// there now. Nothing was migrated; a run again starts from what is there.
+    #[error(
+        "the old layout changed while the migration waited for its locks ({0}): nothing was migrated, run it again"
+    )]
+    Changed(String),
     /// A link of the old layout that is not `releases/<40 hex>`.
     #[error("{link} points at {target:?}, not at releases/<commit>")]
     BadLink { link: &'static str, target: String },
@@ -78,6 +85,7 @@ impl MigrateError {
             // A swap of the old tool on trial, and the disagreements only a person settles.
             MigrateError::Pending { .. }
             | MigrateError::Disagree(_)
+            | MigrateError::Changed(_)
             | MigrateError::FloorUnavailable(_)
             | MigrateError::Conflict(_)
             | MigrateError::Unmigrated(_)

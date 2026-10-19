@@ -420,6 +420,7 @@ fn every_error_has_the_contract_exit_code() {
             1,
         ),
         (MigrateError::Disagree(String::new()), 5),
+        (MigrateError::Changed(String::new()), 5),
         (MigrateError::FloorUnavailable(String::new()), 5),
         (MigrateError::Conflict(String::new()), 5),
         (MigrateError::Unmigrated(String::new()), 5),

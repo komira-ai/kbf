@@ -37,8 +37,15 @@ Without `--apply` it prints what it would do and changes nothing. With it, as ro
    group- or other-writable, no file capabilities, no `VERIFIED` marker) and adopted **unverified**:
    no `VERIFIED` marker, listed in `status.json` under `unverified`, printed as a warning, and a rollback
    to it is refused until a verified copy replaces it.
-5. It takes the old tools' lock and the installer's, stops the old helper's unit and the kbf units that
-   run, disables the helper (so the helper and the installer never both manage the host), writes
+5. It takes the old tools' lock and the installer's and looks at the old layout a second time under
+   them, because what it read before the locks may have moved (a verb of the old tools, the old helper
+   acting on an order, another run of this verb finishing). The second look is judged like the first (a
+   swap on trial, links that disagree with the state, the installer's state beside the old one, a
+   finished journal), the floor is seeded from the memory it read, and every write below is made from it
+   alone. If `current` or `previous` is no longer what step 2 probed, or the old state has gone, nothing
+   is migrated and it ends with exit 5 (`the old layout changed while the migration waited for its
+   locks`): run it again. A migration another run finished meanwhile is reported as done. Then it stops
+   the old helper's unit and the kbf units that run, disables the helper (so the helper and the installer never both manage the host), writes
    `state.json` (the installer's own type, under its lock, so the next write keeps a `.bak`),
    `helper.json`, then `releases/current` and `releases/previous` (after the state: a link with no
    state beside it reads as a lost state), `status.json` (the shape the node reads, with `unverified`

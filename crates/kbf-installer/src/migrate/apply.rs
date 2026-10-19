@@ -40,15 +40,27 @@ const MARKER: &str = "MIGRATED";
 const MARKER_TEXT: &str = "This host is managed by kbf-installer. This directory and /usr/local/kbf \
 are kept as the rollback path (`kbf-installer migrate --rollback`); nothing here is read any more.\n";
 
-/// Migrate the host, or (in a dry run) say what would be done.
-pub fn migrate<E: Exec>(
-    m: &Migration,
-    exec: &mut E,
-    hooks: &Hooks<'_>,
-    mode: Mode,
-) -> Result<Report, MigrateError> {
-    let rules = rules(m);
-    let existing = StateDir::open(&m.layout, &rules)?;
+/// What a look at the host found: the journal of a migration begun, the old layout's state
+/// and memory, the old tree, and the floor seeded from that memory.
+struct Seen {
+    journal: Option<Journal>,
+    old: Old,
+    old_tree: OldTree,
+    seeded: Seeded,
+}
+
+/// What a look at the host came to.
+enum Look {
+    /// There is nothing to migrate (it is done, or never was old): the report says so.
+    Settled(Report),
+    Old(Box<Seen>),
+}
+
+/// Look at the host: read the old state and memory, judge them and the links, seed the
+/// floor. Changes nothing. An apply looks twice, once to plan and once under its locks,
+/// because only what is read under the locks is still true when it is written.
+fn look(m: &Migration, hooks: &Hooks<'_>, rules: &Rules) -> Result<Look, MigrateError> {
+    let existing = StateDir::open(&m.layout, rules)?;
     let journal = existing
         .as_ref()
         .map(StateDir::journal)
@@ -59,9 +71,9 @@ pub fn migrate<E: Exec>(
         report
             .lines
             .push("already migrated: nothing to do".to_owned());
-        return Ok(report);
+        return Ok(Look::Settled(report));
     }
-    let Some(old) = old::read(&m.layout, &m.roots, &rules)? else {
+    let Some(old) = old::read(&m.layout, &m.roots, rules)? else {
         if journal.is_some() {
             return Err(MigrateError::Disagree(
                 "a migration was begun, and the old state it read is gone".to_owned(),
@@ -71,7 +83,7 @@ pub fn migrate<E: Exec>(
         report
             .lines
             .push("no old layout here: nothing to migrate".to_owned());
-        return Ok(report);
+        return Ok(Look::Settled(report));
     };
     let earlier_state = state::read_unlocked(&m.layout)?;
     if journal.is_none() && earlier_state.is_some() {
@@ -89,12 +101,22 @@ pub fn migrate<E: Exec>(
     let old_tree = OldTree::open(&m.layout, &m.roots)?;
     check_links(&old, &old_tree)?;
     let seeded = floor::seed(&old.memory, &m.seed, hooks.frontend)?;
-    let found = find(m, hooks, &rules, &old_tree, &old)?;
+    Ok(Look::Old(Box::new(Seen {
+        journal,
+        old,
+        old_tree,
+        seeded,
+    })))
+}
 
-    let mut report = Report::new(match mode {
-        Mode::DryRun => Outcome::Planned,
-        Mode::Apply => Outcome::Migrated,
-    });
+/// What the plan says of the floor, the staged release and the releases found.
+fn report_plan(
+    report: &mut Report,
+    mode: Mode,
+    seeded: &Seeded,
+    staged: Option<&CommitId>,
+    found: &[Found],
+) {
     report.warnings.extend(seeded.warnings.iter().cloned());
     report.min_generation = seeded.min_generation;
     if let Some(generation) = seeded.min_generation {
@@ -103,12 +125,12 @@ pub fn migrate<E: Exec>(
             format!("min_generation = {generation} is the floor setup writes into installer.toml"),
         );
     }
-    if let Some(staged) = &old.state.staged {
+    if let Some(staged) = staged {
         report.warnings.push(format!(
             "release {staged} was staged and is not carried over: stage it again"
         ));
     }
-    for f in &found {
+    for f in found {
         report.line(
             mode,
             format!(
@@ -117,10 +139,62 @@ pub fn migrate<E: Exec>(
             ),
         );
     }
-    if mode == Mode::DryRun {
-        plan(m, exec, &mut report)?;
-        return Ok(report);
+}
+
+/// `current` and `previous` as the first look found and probed them must still be what the
+/// old state names under the locks: a release probed is not one adopted in its place.
+fn unchanged(probed: &[Option<CommitId>; 2], old: &Old) -> Result<(), MigrateError> {
+    let shown = |c: &Option<CommitId>| c.as_ref().map_or("none".to_owned(), ToString::to_string);
+    for (role, was, now) in [
+        ("current", &probed[0], &old.state.current),
+        ("previous", &probed[1], &old.state.previous),
+    ] {
+        if was != now {
+            return Err(MigrateError::Changed(format!(
+                "{role} was {} and is now {}",
+                shown(was),
+                shown(now)
+            )));
+        }
     }
+    Ok(())
+}
+
+/// Migrate the host, or (in a dry run) say what would be done.
+pub fn migrate<E: Exec>(
+    m: &Migration,
+    exec: &mut E,
+    hooks: &Hooks<'_>,
+    mode: Mode,
+) -> Result<Report, MigrateError> {
+    let rules = rules(m);
+    // The first look takes no lock. It is all of a dry run, and an apply's chance to refuse
+    // and to probe the releases before it waits for anything. Only what it probed goes on
+    // (`found`, and the names it probed them under); what it read is not written from.
+    let (found, probed) = {
+        let first = match look(m, hooks, &rules)? {
+            Look::Settled(report) => return Ok(report),
+            Look::Old(seen) => seen,
+        };
+        let found = find(m, hooks, &rules, &first.old_tree, &first.old)?;
+        if mode == Mode::DryRun {
+            let mut report = Report::new(Outcome::Planned);
+            report_plan(
+                &mut report,
+                mode,
+                &first.seeded,
+                first.old.state.staged.as_ref(),
+                &found,
+            );
+            plan(m, exec, &mut report)?;
+            return Ok(report);
+        }
+        let probed = [
+            first.old.state.current.clone(),
+            first.old.state.previous.clone(),
+        ];
+        (found, probed)
+    };
     if exec.euid() != m.owner_uid {
         return Err(MigrateError::NotRoot {
             have: exec.euid(),
@@ -131,6 +205,34 @@ pub fn migrate<E: Exec>(
     // its state while this one does.
     let _old_lock = OldLock::take(&m.layout, &m.roots)?;
     let lock = Locked::acquire(&m.layout)?;
+    // Everything read before the locks may be stale by now: a verb of the old tools (or the
+    // old helper) between the look and the locks moves `current`, puts a swap on trial or
+    // acts on an order, and another run of this verb may have finished while this one
+    // waited. So the old layout is read and judged again, and every write below is made
+    // from this look alone. A different `current` or `previous` is not adopted in place of
+    // the releases probed: the run is refused, nothing migrated, to be run again.
+    let seen = match look(m, hooks, &rules)? {
+        Look::Old(seen) => seen,
+        Look::Settled(report) if report.outcome == Outcome::AlreadyMigrated => return Ok(report),
+        Look::Settled(_) => {
+            return Err(MigrateError::Changed("the old state is gone".to_owned()));
+        }
+    };
+    unchanged(&probed, &seen.old)?;
+    let Seen {
+        journal,
+        old,
+        seeded,
+        ..
+    } = *seen;
+    let mut report = Report::new(Outcome::Migrated);
+    report_plan(
+        &mut report,
+        mode,
+        &seeded,
+        old.state.staged.as_ref(),
+        &found,
+    );
     let tree = NewTree::create(&m.layout, &rules)?;
     tree.sweep_partials()?;
     let mut journal = journal.unwrap_or_else(|| Journal::new(Vec::new(), None));
