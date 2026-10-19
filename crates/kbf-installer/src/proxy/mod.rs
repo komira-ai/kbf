@@ -20,6 +20,8 @@
 //! `status.json` reader belong to the update API's unit, U8b). Until `ChildAdmin` exists
 //! the proxy verb cannot run a swap or resume one, so [`supervisor::adopt_children`] adopts
 //! a child only when no update is in flight.
+//! [`child_http`] is the blocking loopback client the future real `ChildAdmin`
+//! adapter and the fleet read will call a child's ports with (U8b); nothing calls it yet.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -71,6 +73,7 @@ pub mod api;
 #[cfg(target_os = "linux")]
 pub mod child_real;
 pub mod gate_real;
+pub mod child_http;
 pub mod model;
 pub mod ports;
 pub mod record;
@@ -85,6 +88,8 @@ mod swap;
 mod aio_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod child_rig;
+#[cfg(test)]
+mod child_http_tests;
 #[cfg(test)]
 mod confirm_boundary_tests;
 #[cfg(test)]

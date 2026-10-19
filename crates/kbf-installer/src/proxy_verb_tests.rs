@@ -279,3 +279,10 @@ fn a_second_stop_signal_ends_the_process_at_once() {
     assert!(second.is_err());
     assert_eq!(SECOND_EXIT.load(Ordering::SeqCst), 1);
 }
+
+/// Pins the production bound: longer than the proxy's 5 s drain (so a clean drain is never
+/// cut) and short enough that a stop signal ends the process within seconds.
+#[test]
+fn the_production_stop_bound_is_ten_seconds() {
+    assert_eq!(STOP_BOUND, Duration::from_secs(10));
+}

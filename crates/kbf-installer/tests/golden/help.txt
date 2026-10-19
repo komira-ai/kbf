@@ -13,7 +13,7 @@ Commands:
   confirm     Keep the pending swap, naming its activation
   revert      Undo the pending swap, naming its activation
   rollback    Point `current` at `previous`, with no confirm window
-  gc          Remove releases beyond current, previous and one more
+  gc          Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
   boot-check  Run before each start of a release on trial; counts the start
   quiesce     For maintainer scripts: take the lock; exit 5 while a swap is pending
   check       Validate the installer's configuration, trust files and path chain
@@ -74,17 +74,28 @@ Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swa
 Usage: kbf-installer run [OPTIONS]
 
 Options:
-      --json                           Print the result as one JSON object on standard output
-      --update-dir <UPDATE_DIR>        Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it [default: /var/lib/kbf-installer]
-      --apply                          Do what the verb says. Without it a mutating verb is a dry run
-      --orders-dir <ORDERS_DIR>        The order spool: owned by the service user, mode 0700, inside a root-owned parent [default: /var/lib/kbf-installer/orders]
-      --unit <UNIT>                    The systemd unit to restart after a swap (Linux)
-      --launchd-label <LAUNCHD_LABEL>  The launchd label to kickstart after a swap (macOS)
-      --interval-secs <INTERVAL_SECS>  Seconds between passes [default: 3]
-      --window-secs <WINDOW_SECS>      The confirm window the boot check gives a release on trial (120 to 1800) [default: 900]
-      --starts <STARTS>                The starts a release on trial gets before it is reverted (Linux) [default: 3]
-      --passes <PASSES>                Stop after this many passes (a rehearsal or a test); without it, run until stopped
-  -h, --help                           Print help
+      --json
+          Print the result as one JSON object on standard output
+      --update-dir <UPDATE_DIR>
+          Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it [default: /var/lib/kbf-installer]
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --orders-dir <ORDERS_DIR>
+          The order spool: owned by the service user, mode 0700, inside a root-owned parent [default: /var/lib/kbf-installer/orders]
+      --unit <UNIT>
+          The systemd unit to restart after a swap (Linux)
+      --launchd-label <LAUNCHD_LABEL>
+          The launchd label to kickstart after a swap (macOS)
+      --window-secs <WINDOW_SECS>
+          The confirm window the boot check gives a release on trial (120 to 1800) [default: 900]
+      --starts <STARTS>
+          The starts a release on trial gets before it is reverted (Linux) [default: 3]
+      --min-activation-interval-secs <MIN_ACTIVATION_INTERVAL_SECS>
+          The fewest seconds between one activation and the next [default: 60]
+      --passes <PASSES>
+          Stop after this many passes (a rehearsal or a test); without it, run until stopped
+  -h, --help
+          Print help
 
 === kbf-installer update --help ===
 Order an update of this host's own frontend (root, inline)
@@ -104,10 +115,12 @@ Keep the pending swap, naming its activation
 Usage: kbf-installer confirm [OPTIONS] --id <ID>
 
 Options:
-      --id <ID>  The activation: `<epoch>-<order id>`
-      --json     Print the result as one JSON object on standard output
-      --apply    Do what the verb says. Without it a mutating verb is a dry run
-  -h, --help     Print help
+      --id <ID>                        The activation: `<epoch>-<order id>`
+      --json                           Print the result as one JSON object on standard output
+      --apply                          Do what the verb says. Without it a mutating verb is a dry run
+      --unit <UNIT>                    The systemd unit to restart after a swap (Linux)
+      --launchd-label <LAUNCHD_LABEL>  The launchd label to kickstart after a swap (macOS)
+  -h, --help                           Print help
 
 === kbf-installer revert --help ===
 Undo the pending swap, naming its activation
@@ -115,10 +128,12 @@ Undo the pending swap, naming its activation
 Usage: kbf-installer revert [OPTIONS] --id <ID>
 
 Options:
-      --id <ID>  The activation: `<epoch>-<order id>`
-      --json     Print the result as one JSON object on standard output
-      --apply    Do what the verb says. Without it a mutating verb is a dry run
-  -h, --help     Print help
+      --id <ID>                        The activation: `<epoch>-<order id>`
+      --json                           Print the result as one JSON object on standard output
+      --apply                          Do what the verb says. Without it a mutating verb is a dry run
+      --unit <UNIT>                    The systemd unit to restart after a swap (Linux)
+      --launchd-label <LAUNCHD_LABEL>  The launchd label to kickstart after a swap (macOS)
+  -h, --help                           Print help
 
 === kbf-installer rollback --help ===
 Point `current` at `previous`, with no confirm window
@@ -126,19 +141,22 @@ Point `current` at `previous`, with no confirm window
 Usage: kbf-installer rollback [OPTIONS]
 
 Options:
-      --json   Print the result as one JSON object on standard output
-      --apply  Do what the verb says. Without it a mutating verb is a dry run
-  -h, --help   Print help
+      --json                           Print the result as one JSON object on standard output
+      --unit <UNIT>                    The systemd unit to restart after a swap (Linux)
+      --apply                          Do what the verb says. Without it a mutating verb is a dry run
+      --launchd-label <LAUNCHD_LABEL>  The launchd label to kickstart after a swap (macOS)
+  -h, --help                           Print help
 
 === kbf-installer gc --help ===
-Remove releases beyond current, previous and one more
+Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
 
 Usage: kbf-installer gc [OPTIONS]
 
 Options:
-      --json   Print the result as one JSON object on standard output
-      --apply  Do what the verb says. Without it a mutating verb is a dry run
-  -h, --help   Print help
+      --json         Print the result as one JSON object on standard output
+      --keep <KEEP>  The releases to keep besides the ones that must stay [default: 1]
+      --apply        Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help         Print help
 
 === kbf-installer boot-check --help ===
 Run before each start of a release on trial; counts the start

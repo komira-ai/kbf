@@ -58,8 +58,13 @@ tracing.workspace = true
 rustix = { workspace = true, features = ["process", "system"] }
 # The schema version of the SQLite state file, which `kbf --version --json` reports.
 kbf-state.workspace = true
-# The identity `kbf --version --json` prints (src/version.rs).
+# The identity `kbf --version --json` prints (src/version.rs), and the bodies of
+# `kbf cluster` (src/cluster.rs).
 serde_json.workspace = true
+# The request bodies of `kbf cluster object-store` (src/cluster/object_store.rs), and the
+# secret key read for one, which is zeroed when dropped.
+serde.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 # The REAPI conformance suite, run against a `kbf storage` process (tests/storage_process.rs):

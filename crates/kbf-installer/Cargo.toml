@@ -36,6 +36,7 @@ bytes.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
+httparse.workspace = true
 hyper.workspace = true
 kbf-host.workspace = true
 kbf-proxy.workspace = true
@@ -49,7 +50,7 @@ subtle.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 # The proxy verb's signal handlers run on kbf-proxy's runtime.
-tokio = { workspace = true, features = ["rt", "signal", "sync"] }
+tokio = { workspace = true, features = ["rt", "signal", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
 
