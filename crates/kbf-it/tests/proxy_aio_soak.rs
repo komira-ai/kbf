@@ -304,8 +304,8 @@ impl ChildAdmin for Stand {
 
     fn open_counts(&self, slot: Slot) -> Result<OpenCounts, PortError> {
         Ok(OpenCounts {
-            open_executions: open_executions(&operator_api(self.base, slot)),
-            queued_operations: 0,
+            open_streams: open_executions(&operator_api(self.base, slot)),
+            open_sessions: 0,
         })
     }
 
