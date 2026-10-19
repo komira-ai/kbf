@@ -9,6 +9,7 @@
 
 use super::kbf_settings::{KbfFlags, Setting};
 use super::paths;
+use super::proxy::{ProxyFlags, ProxyPlan};
 use crate::CommitId;
 use crate::cli::{Mode, ReleaseSource};
 use crate::installer_toml::{Source, https_base_named};
@@ -28,6 +29,8 @@ pub struct Raw {
     pub database: Option<String>,
     /// The listener, certificate and storage-client flags of a frontend or all-in-one host.
     pub kbf: KbfFlags,
+    /// `--proxy` and what goes with it.
+    pub proxy: ProxyFlags,
     /// `--installer-config`, as the host path it names.
     pub installer_config: String,
 }
@@ -50,6 +53,8 @@ pub struct Valid {
     pub database: Option<String>,
     /// The `kbf.toml` settings the listener, certificate and storage flags give.
     pub kbf: Vec<Setting>,
+    /// The proxy host's settings: `Some` for `--proxy`. The files it names are not in `kbf`.
+    pub proxy: Option<ProxyPlan>,
 }
 
 /// Whether the mode enrolls with a frontend: its start does, with the token.
@@ -98,7 +103,12 @@ impl Raw {
         };
 
         let database = self.database(&mut problems);
-        let kbf = self.kbf.validate(self.mode, &mut problems);
+        let mut kbf = self
+            .kbf
+            .validate(self.mode, self.proxy.proxy, &mut problems);
+        let proxy = self
+            .proxy
+            .validate(self.mode, &self.kbf, &mut kbf, &mut problems);
         if self.installer_config != paths::INSTALLER_TOML {
             problems.push(format!(
                 "setup writes {}, where the installer's unit reads it: --installer-config is for run",
@@ -126,6 +136,7 @@ impl Raw {
                 commit: self.commit.clone(),
                 database,
                 kbf,
+                proxy,
             }),
             _ => Err(problems),
         }

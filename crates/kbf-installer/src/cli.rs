@@ -134,6 +134,9 @@ pub struct SetupArgs {
     /// storage): each sets the kbf flag of its name.
     #[command(flatten)]
     pub kbf: crate::setup::kbf_settings::KbfFlags,
+    /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
+    #[command(flatten)]
+    pub proxy: crate::setup::proxy::ProxyFlags,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
     /// host root. The same flag, with the same meaning, as on `run`.
     #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]

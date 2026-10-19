@@ -44,6 +44,7 @@ fn raw(mode: Mode) -> Raw {
         commit: None,
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
         kbf: serving_flags(mode),
+        proxy: Default::default(),
         installer_config: INSTALLER_TOML.to_owned(),
     }
 }
@@ -1122,6 +1123,7 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         commit: None,
         database: Some(DATABASE.to_owned()),
         kbf: super::kbf_settings::KbfFlags::default(),
+        proxy: Default::default(),
         installer_config: "/tmp/i.toml".to_owned(),
     };
     let mut exec = host();
@@ -1535,3 +1537,6 @@ mod more;
 
 #[path = "kbf_settings_tests.rs"]
 mod kbf_settings_tests;
+
+#[path = "proxy_tests.rs"]
+mod proxy_tests;

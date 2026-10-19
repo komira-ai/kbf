@@ -30,6 +30,7 @@ pub mod kbf_toml;
 pub mod os;
 pub mod paths;
 pub mod plan;
+pub mod proxy;
 pub mod validate;
 
 #[cfg(test)]
@@ -150,12 +151,13 @@ pub struct Options {
 
 /// The `installer.toml` this run leaves: the file that is there with the flags' settings put
 /// in, or the defaults with them. A file that is not valid is not overwritten (the operator
-/// decides), and a floor never goes down.
+/// decides), and a floor never goes down. Its `[proxy]` table is kept; on a `--proxy` host the
+/// keys the flags give are put in it ([`proxy::ProxyPlan::merge`]).
 pub fn installer_file(
     exec: &dyn Exec,
     v: &Valid,
     platform: Platform,
-) -> Result<String, SetupError> {
+) -> Result<InstallerToml, SetupError> {
     let path = HostPath::new(paths::INSTALLER_TOML)?;
     let mut settings = match exec.inspect(&path)? {
         None => InstallerToml::default(),
@@ -194,7 +196,10 @@ pub fn installer_file(
         }
         _ => (None, None),
     };
-    Ok(settings.render())
+    if let Some(plan) = &v.proxy {
+        settings.proxy = Some(plan.merge(settings.proxy.take())?);
+    }
+    Ok(settings)
 }
 
 /// The role whose certificate and key the fetch child is lent: the daemon's if the host has
@@ -271,6 +276,9 @@ pub fn run(
     refuse_old_layout(&*exec)?;
     let service_uid = ctx.service.as_ref().map(|u| u.uid);
     kbf_settings::check_files(&*exec, &valid.kbf, service_uid)?;
+    if let Some(proxy) = &valid.proxy {
+        kbf_settings::check_files(&*exec, &proxy.files(), service_uid)?;
+    }
     let mut notes = Vec::new();
 
     let before = plan::before_release(os, &*exec, &valid, &ctx)?;
@@ -343,6 +351,7 @@ pub fn cli(
         commit: args.commit.clone(),
         database: args.database.clone(),
         kbf: args.kbf.clone(),
+        proxy: args.proxy.clone(),
         installer_config: args.installer_config.to_string(),
     };
     let options = Options {

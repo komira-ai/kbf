@@ -29,6 +29,10 @@ const MAC_ID_TO: u32 = 400;
 /// The launchd labels: the installer's plist is the package's; the daemon's is the release's.
 pub const MAC_INSTALLER_LABEL: &str = "com.komira.kbf-installer";
 pub const MAC_DAEMON_LABEL: &str = "com.komira.kbf-daemon";
+/// The units of a frontend host behind the proxy.
+pub const PROXY_UNITS: &[&str] = &["kbf-proxy.socket", "kbf-proxy.service"];
+/// The frontend instance a host without the proxy runs.
+const FRONTEND_UNIT: &str = "kbf-frontend@a.service";
 pub const INSTALLER_UNIT: &str = "kbf-installer.service";
 /// The longest token file setup reads.
 const MAX_TOKEN_BYTES: u64 = 4096;
@@ -61,9 +65,14 @@ fn file(
 /// The units a mode is run by. The names are the static unit files of the package
 /// (`packaging/linux/units`); the installer's own service is separate, since it runs
 /// whatever the mode.
-pub fn mode_units(mode: Mode) -> &'static [&'static str] {
+///
+/// A frontend behind the proxy (`proxy`) is run by the proxy's units, which start the frontend
+/// children themselves: `kbf-frontend@a.service` is never enabled beside them. The socket is
+/// first, so it holds the public port before the service takes it.
+pub fn mode_units(mode: Mode, proxy: bool) -> &'static [&'static str] {
     match mode {
-        Mode::Frontend => &["kbf-frontend@a.service"],
+        Mode::Frontend if proxy => PROXY_UNITS,
+        Mode::Frontend => &[FRONTEND_UNIT],
         Mode::Storage => &["kbf-storage.service"],
         Mode::Daemon => &["kbf-daemon.service"],
         Mode::StorageAndDaemon => &["kbf-storage-and-daemon.service"],
@@ -295,10 +304,16 @@ pub fn before_release(
         .map(|file| read_token(exec, file))
         .transpose()?;
     let settings = installer_file(exec, v, platform)?;
+    let mut notes = Vec::new();
+    if v.proxy.is_none() && settings.proxy.is_some() {
+        notes.push(
+            "installer.toml has a [proxy] table and --proxy was not given: the table is kept, and the frontend unit is enabled as on a host without the proxy; give --proxy if this host runs the proxy"
+                .to_owned(),
+        );
+    }
 
     let view = View(exec);
     let mut p = Planner::new(&view);
-    let mut notes = Vec::new();
 
     let fetch = fetch_user(platform);
     if os.user(fetch)?.is_none() {
@@ -334,7 +349,7 @@ pub fn before_release(
         paths::INSTALLER_TOML,
         0o644,
         root,
-        settings.into_bytes(),
+        settings.render().into_bytes(),
     )?;
     Ok(Outcome {
         plan: p.finish(),
@@ -445,10 +460,12 @@ fn units(
     // frontend is never started here: starting one takes the state database and the public
     // port, which only the operator decides.
     let start_mode = if v.mode.keeps_state_in_database() {
-        notes.push(
+        notes.push(if v.proxy.is_some() {
+            "the proxy units are enabled, not started: start kbf-proxy.socket and kbf-proxy.service when the database, the TLS files and the port are ready"
+        } else {
             "the frontend unit is enabled, not started: start it when the database, the TLS files and the port are ready"
-                .to_owned(),
-        );
+        }
+        .to_owned());
         false
     } else if no_start {
         notes.push("--no-start: units are enabled, not started".to_owned());
@@ -480,7 +497,12 @@ fn units(
             }
         }
         Platform::Linux => {
-            let wanted = mode_units(v.mode)
+            if v.proxy.is_some() && os.unit_enabled(FRONTEND_UNIT)? {
+                notes.push(format!(
+                    "{FRONTEND_UNIT} is enabled and the proxy starts the frontend itself: setup does not stop or disable it; do both (systemctl disable --now) before starting the proxy, since the two never run together"
+                ));
+            }
+            let wanted = mode_units(v.mode, v.proxy.is_some())
                 .iter()
                 .map(|u| (*u, start_mode))
                 .chain([(INSTALLER_UNIT, !no_start)]);

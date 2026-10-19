@@ -202,7 +202,13 @@ impl ProxyConfig {
         Ok(config)
     }
 
-    fn check(&self) -> Result<(), ConfigError> {
+    /// The rules between keys that a parse cannot see: the same checks
+    /// [`ProxyConfig::from_toml_str`] makes, for a caller (`kbf-installer setup`) that builds
+    /// a table from flags and must refuse what the proxy would refuse at start.
+    ///
+    /// # Errors
+    /// [`ConfigError::Invalid`].
+    pub fn check(&self) -> Result<(), ConfigError> {
         if !(1024..=MAX_BASE_PORT).contains(&self.upstream.base_port) {
             return Err(ConfigError::Invalid(
                 "upstream.base_port must be 1024 to 65521 so both slots fit",

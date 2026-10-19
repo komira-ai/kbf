@@ -47,6 +47,18 @@ pub enum Buck2Auth {
     Mtls,
 }
 
+impl Buck2Auth {
+    /// The spelling of the `buck2_auth` key.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bearer => "bearer",
+            Self::Mtls => "mtls",
+        }
+    }
+}
+
 /// Why a call is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
