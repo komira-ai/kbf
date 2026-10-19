@@ -390,7 +390,6 @@ pub fn after_release(
         api_token_file: serves_api(v.mode).then_some(paths::API_TOKEN),
         state_store: v.database.as_deref(),
         extra: &v.kbf,
-        takes: super::kbf_settings::taken(v.mode),
     };
     let current = match exec.inspect(&hp(paths::KBF_TOML)?)? {
         Some(Entry::File { bytes, .. }) => Some(String::from_utf8_lossy(&bytes).into_owned()),
@@ -403,21 +402,25 @@ pub fn after_release(
         None => None,
     };
     match kbf_toml::decide(current.as_deref(), &ours) {
-        Decision::Write { text, changed } => {
+        Decision::Write(text) => {
+            let existed = current.is_some();
             // root:<service group> 0640: the service reads it, nobody else; only root writes.
             let owner = Owner {
                 uid: ctx.root.uid,
                 gid: ctx.service_owner().gid,
             };
-            file(&mut p, paths::KBF_TOML, 0o640, owner, text.into_bytes())?;
-            if !changed.is_empty() {
-                // Key names only: a value can be a path or a URL the operator typed.
-                notes.push(format!(
-                    "kbf.toml changed in these keys: {}; a running kbf keeps the old file until it is restarted, and setup does not restart it",
-                    changed.join(", ")
-                ));
+            let changed = file(&mut p, paths::KBF_TOML, 0o640, owner, text.into_bytes())?;
+            if changed && existed {
+                notes.push(
+                    "kbf.toml changed: a running kbf keeps the old one until it is restarted; setup does not restart it"
+                        .to_owned(),
+                );
             }
         }
+        Decision::Keep => notes.push(
+            "kbf.toml holds other settings and the keys setup writes already match: left as it is"
+                .to_owned(),
+        ),
         Decision::Refuse(why) => return Err(SetupError::NeedsOperator(why)),
     }
 

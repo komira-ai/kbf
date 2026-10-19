@@ -2,8 +2,8 @@
 # keys it writes; run setup again to change these.
 mode = "daemon"
 
-[enroll]
-token_file = "/etc/kbf/enroll.token"
-
 [frontend]
 url = "https://farm.example:8443"
+
+[enroll]
+token_file = "/etc/kbf/enroll.token"

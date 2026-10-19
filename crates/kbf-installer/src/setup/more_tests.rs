@@ -365,7 +365,6 @@ fn another_scheduler_key_makes_the_file_the_operators() {
         api_token_file: None,
         state_store: Some(DATABASE),
         extra: &[],
-        takes: Vec::new(),
     };
     let theirs = format!(
         "mode = \"frontend\"\n[scheduler]\nstate-store = \"{DATABASE}\"\nheartbeat-interval-ms = 500\n"
@@ -527,7 +526,6 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
         api_token_file: None,
         state_store: Some(DATABASE),
         extra: &[],
-        takes: Vec::new(),
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = \"postgres:///other?host=/run/postgresql\"\nheartbeat-interval-ms = 500\n";
     let Decision::Refuse(why) = decide(Some(theirs), &ours) else {
@@ -556,7 +554,6 @@ fn an_invalid_config_file_is_refused_without_its_text() {
         api_token_file: None,
         state_store: Some(DATABASE),
         extra: &[],
-        takes: Vec::new(),
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = postgres://u:PW@h/x\n";
     let Decision::Refuse(why) = decide(Some(theirs), &ours) else {

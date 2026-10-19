@@ -12,7 +12,12 @@ sudo kbf-installer setup --mode=daemon \
 sudo kbf-installer --apply setup ...                                                    # do it
 
 sudo kbf-installer setup --mode=frontend --release-url=https://releases.example/kbf \
-    --database='postgres:///kbf?host=/run/postgresql'
+    --database='postgres:///kbf?host=/run/postgresql' \
+    --listen=0.0.0.0:8980 --worker-listen=0.0.0.0:8981 \
+    --worker-tls-cert=/etc/kbf/worker.pem --worker-tls-key=/etc/kbf/worker.key \
+    --worker-client-ca=/etc/kbf/ca.pem \
+    --storage-url=https://storage.example:8983 --storage-ca=/etc/kbf/ca.pem \
+    --storage-client-cert=/etc/kbf/worker.pem --storage-client-key=/etc/kbf/worker.key
 ```
 
 Without `--apply` it prints each step as `DRY-RUN: <step>` and changes nothing. With it, it
@@ -34,6 +39,40 @@ the first release before the host has enrolled, so it needs `--release-source=ur
 `--min-generation` is the operator floor for orders; a re-run may raise it and never lowers it.
 `--installer-config` is a flag of `run`; `setup` writes `/etc/kbf/installer.toml`, where the
 installer's unit reads it, and refuses another path. A Mac is a node only (`--mode=daemon`).
+
+### The `kbf.toml` flags of a frontend and an all-in-one host
+
+A node's listeners, certificates and storage URL come from enrollment, so its `kbf.toml` is
+complete with the three keys above. A `frontend` or `all-in-one` host does not enroll; the
+certificates and addresses are the operator's, and `setup` takes them as flags and writes each
+as the key of the `kbf` flag it sets, in the table of that flag's group. The flag names that
+differ from the key are marked.
+
+| flag | `[table] key` | frontend | all-in-one |
+|---|---|---|---|
+| `--listen`, `--worker-listen` | `[listener]` | optional | optional |
+| `--api-listen` | `[listener] api-listen` | default `127.0.0.1:8982` | default `127.0.0.1:8982` |
+| `--reapi-tls-cert`, `--reapi-tls-key` | `[tls]` | both or none | both or none |
+| `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` | `[tls]` | all three or none | all three or none |
+| `--storage-url` (key `storage`) | `[storage-client] storage` | required | refused |
+| `--storage-ca`, `--storage-client-cert`, `--storage-client-key` | `[storage-client]` | all three with `https`, none with `http` | refused |
+| `--cold-store` | `[stores] cold-store` | refused | required, `file:///absolute/path` |
+| `--meta-dir` | `[stores] meta-dir` | refused | required, absolute path |
+| `--daemon-server` (key `server`), `--daemon-ca-cert` (`ca-cert`), `--daemon-cert` (`cert`), `--daemon-key` (`key`), `--node-id` | `[identity]` | refused | required |
+| (none) | `[daemon] driver = "container"` | | always: the only driver `all-in-one` accepts |
+
+A node mode refuses all of them. The rules, all checked before anything is written (exit 2,
+the flag and the rule named, a value never quoted): an address is `IP:PORT`; a file flag is an
+absolute path of plain characters, never the file's text; a URL has no user name, password,
+path or query; `http://` storage is for a loopback host only (as `kbf` refuses any other); the
+files named exist, are regular files (a link is not followed), and a key is owned by the user
+the mode's unit runs as with no group or other permission bit and readable by its owner, as
+`kbf`'s own start-up check requires, and a certificate or CA is owned by root or that user and
+not writable by group or others; an `s3://` cold store is refused because its credentials are
+in the environment, which `setup` does not manage; `--node-id` is a DNS label. Setting what
+`kbf` accepts but `setup` has no flag for (`releases-dir`, `reapi-auth-policy`,
+`worker-deny-list`, `proxy-auth-file`, the tuning keys) stays by hand: such keys survive a
+re-run under the rule below.
 
 ## What it does, in this order
 
@@ -71,9 +110,13 @@ installer's unit reads it, and refuses another path. A Mac is a node only (`--mo
    When a release is installed already, `--commit` is not fetched.
 9. `/etc/kbf/kbf.toml` (root:service group, 0640): `mode`, `[frontend] url`, `[enroll]
    token_file`, on a frontend or all-in-one host `[tls] api-token-file` and `[scheduler]
-   state-store` (the database URL). A file that holds other settings is kept when these keys
-   match, and refused (exit 5, the keys named) when they differ. A file of only these keys is
-   rewritten.
+   state-store` (the database URL), and the flags of the table above, in the order mode, `[frontend]`,
+   `[enroll]`, `[listener]`, `[tls]`, `[storage-client]`, `[stores]`, `[identity]`, `[daemon]`,
+   `[scheduler]`. A file that holds other settings is kept when the keys this run writes
+   match, and refused (exit 5, the keys named, never a value) when they differ. A file of only
+   the keys this run writes is rewritten. What counts as another setting is relative to the run:
+   a `listen` in the file that this run gives no `--listen` for is the operator's, and the file
+   is kept or refused, never rewritten without it.
 10. The units, last: the mode's unit and `kbf-installer.service`, `systemctl enable`, with
    `--now` for a node's unit when a release is installed and `--no-start` is not given (the
    installer's own service does not wait for either). A unit that makes a frontend
@@ -109,6 +152,14 @@ missing user); 3 a release the fetcher rejected; 5 only a person can go on (a `k
 The contract (`docs/design/kbf-installer.md`) is normative; these are the places `setup` does
 something the text does not say or says differently, so a reader can change one or the other.
 
+- **The `kbf.toml` flags (W10 gap B7).** The contract's `kbf.toml` holds the mode and the
+  frontend URL only; a frontend or all-in-one file written so was a file `kbf` refused at start
+  (`--storage` required, no cold store, no daemon identity). `--storage-url` is not
+  `--storage`, which reads as the mode's name beside `--mode=storage`; the daemon half's flags carry
+  `daemon-` because `--cert` and `--server` mean nothing on `setup`'s line. The operator API
+  address has a default because `api-token-file`, which `setup` always writes, requires
+  `api-listen` in `kbf`. `--admin-listen` (the handover port) is not a flag: it belongs to a
+  frontend run under the proxy and needs that unit.
 - **New flags.** The contract's flag list has no way to give the frontend URL it says goes into
   `kbf.toml`, so there is `--frontend-url`. `--token-file` is added to the CLI of P1.
 - **The token's owner.** The contract says 0600 root:kbf. kbf's own loaders (`kbf-enroll`'s

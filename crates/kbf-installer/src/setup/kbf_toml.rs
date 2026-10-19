@@ -1,22 +1,23 @@
-//! The `/etc/kbf/kbf.toml` that `setup` writes: the host's mode; for a node mode the frontend
-//! URL and the enrollment token's path (the keys enrollment reads, `kbf-enroll`'s `KEYS`); for
-//! a host that serves the operator API the path of its token (`api-token-file`, group `tls`) and
-//! the state database (`state-store`, group `scheduler`); and the listener, certificate and
-//! storage-client settings the named flags give ([`super::kbf_settings`]). Everything else in
-//! the file is the mode's other flags, which the operator adds; `setup` never writes an update
-//! or installer key (those are `installer.toml`).
+//! The `/etc/kbf/kbf.toml` that `setup` writes: the host's mode, the frontend URL and the
+//! enrollment token's path (the keys enrollment reads, `kbf-enroll`'s `KEYS`), and on a host
+//! that serves the operator API, the path of its token (`api-token-file`, group `tls`) and, on a
+//! host that keeps its state in Postgres, the database (`state-store`, group `scheduler`). A
+//! `frontend` or `all-in-one` host also has the listener, certificate, storage and daemon-half
+//! keys the flags of [`super::kbf_settings`] give. Everything else in the file is the mode's own
+//! flags, which the operator or the package adds; `setup` never writes an update or installer
+//! key (those are `installer.toml`).
 //!
-//! `setup` owns the keys it can write ([`owned`]). A file that exists is kept as it is when
-//! every key the flags give already has the flag's value. Otherwise it is rewritten, whole and
-//! atomically, with the flags' values in those keys and every other key as it was; the keys
-//! that changed are named in the result (names only, never values). A key `setup` owns that the
-//! mode takes no flag for (a frontend URL left over from another mode) is removed and named; a
-//! key it owns that this run's flags leave out is left as it is. A rewrite does not keep the
-//! comments of the old file. A file that is not TOML is not touched (exit 5).
+//! A file that exists is not overwritten blindly: when every key in it is one `setup`
+//! writes, `setup` rewrites it; when it holds other settings, `setup` leaves it alone if
+//! its own keys already say what the flags say, and refuses (exit 5) if they differ, naming
+//! them, since rewriting would lose settings it cannot see. What counts as another setting is
+//! relative to this run: a key is `setup`'s when it is one of the five above or one the flags
+//! of this run give, so a file that holds a listener `setup` has no flag for in this run is
+//! the operator's and is never rewritten.
 
 use toml::{Table, Value};
 
-use super::kbf_settings::{self, Setting};
+use super::kbf_settings::Setting;
 
 /// What `setup` says goes in the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,28 +28,54 @@ pub struct Ours<'a> {
     pub api_token_file: Option<&'a str>,
     /// The state database of a frontend or all-in-one host: `[scheduler] state-store`.
     pub state_store: Option<&'a str>,
-    /// The listener, certificate and storage-client settings the flags gave.
+    /// The listener, certificate, storage and daemon-half settings of this run.
     pub extra: &'a [Setting],
-    /// The `(table, key)` pairs of [`owned`] this mode takes a flag for; the other owned keys
-    /// are removed from a file that has them.
-    pub takes: Vec<(&'static str, &'static str)>,
 }
 
-/// Every key `setup` can write: `(table, key)`, the table empty for a top-level key.
-pub fn owned() -> Vec<(&'static str, &'static str)> {
-    let mut all = vec![
-        ("", "mode"),
-        ("frontend", "url"),
-        ("enroll", "token_file"),
-        ("tls", "api-token-file"),
-        ("scheduler", "state-store"),
-    ];
-    all.extend(kbf_settings::keys());
-    all
-}
+/// The tables of the file, in the order they are written. A table not listed follows them.
+const TABLE_ORDER: [&str; 9] = [
+    "frontend",
+    "enroll",
+    "listener",
+    "tls",
+    "storage-client",
+    "stores",
+    "identity",
+    "daemon",
+    "scheduler",
+];
 
 impl Ours<'_> {
-    /// The keys the flags give, as `(table, key, value)`.
+    /// The canonical file: `mode`, then each table in [`TABLE_ORDER`] with its keys in the order
+    /// of [`Ours::keys`]. Every value is validated text with no character that needs a TOML
+    /// escape (a URL of plain characters, an absolute path, a mode name).
+    pub fn render(&self) -> String {
+        let keys = self.keys();
+        let mut out = String::from(
+            "# Written by `kbf-installer setup`. The mode's other settings are added below the\n\
+             # keys it writes; run setup again to change these.\n",
+        );
+        out.push_str(&format!("mode = \"{}\"\n", self.mode));
+        let mut tables: Vec<&str> = TABLE_ORDER.to_vec();
+        for (at, _, _) in &keys {
+            if !at.is_empty() && !tables.contains(at) {
+                tables.push(*at);
+            }
+        }
+        for at in tables {
+            let mut first = true;
+            for (_, key, value) in keys.iter().filter(|(t, _, _)| *t == at) {
+                if first {
+                    out.push_str(&format!("\n[{at}]\n"));
+                    first = false;
+                }
+                out.push_str(&format!("{key} = \"{value}\"\n"));
+            }
+        }
+        out
+    }
+
+    /// The keys, as `(table, key, value)`; `table` is empty for a top-level key.
     fn keys(&self) -> Vec<(&'static str, &'static str, String)> {
         let mut keys = vec![("", "mode", self.mode.to_owned())];
         let optional = [
@@ -65,32 +92,16 @@ impl Ours<'_> {
         keys.extend(self.extra.iter().map(|s| (s.table, s.key, s.value.clone())));
         keys
     }
-
-    /// The `(table, key)` pairs this run owns a value for or takes a flag for.
-    fn takes(&self) -> Vec<(&'static str, &'static str)> {
-        let mut out: Vec<_> = self.keys().into_iter().map(|(t, k, _)| (t, k)).collect();
-        out.extend(self.takes.iter().copied());
-        out
-    }
-
-    /// The canonical file for a host with no `kbf.toml`.
-    pub fn render(&self) -> String {
-        let mut table = Table::new();
-        for (at, key, value) in self.keys() {
-            set(&mut table, at, key, &value);
-        }
-        render_table(&table)
-    }
 }
 
 /// What to do about the file that is there.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decision {
-    /// Make the file this text. `changed` names the keys of a file that was there which
-    /// this differs in (`[table] key`, or `key` at the top level); empty when the text is
-    /// the file's own or the file is new.
-    Write { text: String, changed: Vec<String> },
-    /// Only a person can go on; the reason, one line, with no value in it.
+    /// Make the file this text.
+    Write(String),
+    /// Leave it as it is: it holds other settings, and the keys setup writes match.
+    Keep,
+    /// Only a person can go on; the reason, one line.
     Refuse(String),
 }
 
@@ -102,55 +113,39 @@ fn lookup<'t>(table: &'t Table, at: &str, key: &str) -> Option<&'t Value> {
     }
 }
 
-/// `table[at][key] = value`, making `at` a table if it is not one.
-fn set(table: &mut Table, at: &str, key: &str, value: &str) {
-    let value = Value::String(value.to_owned());
-    if at.is_empty() {
-        table.insert(key.to_owned(), value);
-        return;
-    }
-    let slot = table
-        .entry(at.to_owned())
-        .or_insert_with(|| Value::Table(Table::new()));
-    if !slot.is_table() {
-        *slot = Value::Table(Table::new());
-    }
-    if let Value::Table(inner) = slot {
-        inner.insert(key.to_owned(), value);
-    }
-}
-
-/// Remove `table[at][key]`, and `at` if that leaves it empty.
-fn remove(table: &mut Table, at: &str, key: &str) {
-    if at.is_empty() {
-        table.remove(key);
-        return;
-    }
-    if let Some(Value::Table(inner)) = table.get_mut(at) {
-        inner.remove(key);
-        if inner.is_empty() {
-            table.remove(at);
+/// Whether `table` holds a key that is not one `setup` writes in this run: the five it can
+/// always write, or one of `ours.extra`.
+fn has_other_settings(table: &Table, ours: &Ours<'_>) -> bool {
+    const MINE: [(&str, &str); 5] = [
+        ("", "mode"),
+        ("frontend", "url"),
+        ("enroll", "token_file"),
+        ("tls", "api-token-file"),
+        ("scheduler", "state-store"),
+    ];
+    let mine = |at: &str, key: &str| {
+        MINE.contains(&(at, key)) || ours.extra.iter().any(|s| s.table == at && s.key == key)
+    };
+    table.iter().any(|(k, v)| match v {
+        Value::Table(inner) => {
+            let known = MINE.iter().any(|(t, _)| *t == k.as_str())
+                || ours.extra.iter().any(|s| s.table == k.as_str());
+            !known || inner.keys().any(|key| !mine(k, key))
         }
-    }
-}
-
-fn name(at: &str, key: &str) -> String {
-    if at.is_empty() {
-        key.to_owned()
-    } else {
-        format!("[{at}] {key}")
-    }
+        _ => !mine("", k),
+    })
 }
 
 /// Decide what `setup` does with the existing file `current` (`None`: there is none).
 pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
+    let wanted = ours.render();
     let Some(text) = current else {
-        return Decision::Write {
-            text: ours.render(),
-            changed: Vec::new(),
-        };
+        return Decision::Write(wanted);
     };
-    let mut table: Table = match text.parse() {
+    if text == wanted {
+        return Decision::Write(wanted);
+    }
+    let table: Table = match text.parse() {
         Ok(t) => t,
         Err(e) => {
             return Decision::Refuse(format!(
@@ -160,126 +155,35 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
             ));
         }
     };
-    let mut changed = Vec::new();
-    for (at, key, value) in ours.keys() {
-        if lookup(&table, at, key).and_then(Value::as_str) != Some(value.as_str()) {
-            set(&mut table, at, key, &value);
-            changed.push(name(at, key));
-        }
+    if !has_other_settings(&table, ours) {
+        return Decision::Write(wanted);
     }
-    let takes = ours.takes();
-    for (at, key) in owned() {
-        if !takes.contains(&(at, key)) && lookup(&table, at, key).is_some() {
-            remove(&mut table, at, key);
-            changed.push(name(at, key));
-        }
-    }
-    if changed.is_empty() {
-        return Decision::Write {
-            text: text.to_owned(),
-            changed,
-        };
-    }
-    Decision::Write {
-        text: render_table(&table),
-        changed,
-    }
-}
-
-const HEADER: &str = "# Written by `kbf-installer setup`. The mode's other settings are added below the\n\
-                      # keys it writes; run setup again to change these.\n";
-
-/// The file for `table`: the header, the top-level keys with `mode` first, then each table.
-fn render_table(table: &Table) -> String {
-    let mut out = String::from(HEADER);
-    if let Some(mode) = table.get("mode") {
-        out.push_str(&format!("mode = {}\n", value(mode)));
-    }
-    for (key, v) in table {
-        if key != "mode" && !v.is_table() {
-            out.push_str(&format!("{} = {}\n", bare(key), value(v)));
-        }
-    }
-    for (key, v) in table {
-        if let Value::Table(inner) = v {
-            tables(&mut out, &bare(key), inner);
-        }
-    }
-    out
-}
-
-/// `[path]` and its keys, then its sub-tables as `[path.sub]`.
-fn tables(out: &mut String, path: &str, table: &Table) {
-    out.push_str(&format!("\n[{path}]\n"));
-    for (key, v) in table {
-        if !v.is_table() {
-            out.push_str(&format!("{} = {}\n", bare(key), value(v)));
-        }
-    }
-    for (key, v) in table {
-        if let Value::Table(inner) = v {
-            tables(out, &format!("{path}.{}", bare(key)), inner);
-        }
-    }
-}
-
-/// A key as TOML writes it: bare when it can be, else quoted.
-fn bare(key: &str) -> String {
-    if !key.is_empty()
-        && key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        key.to_owned()
-    } else {
-        string(key)
-    }
-}
-
-fn string(text: &str) -> String {
-    let mut out = String::from("\"");
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04X}", u32::from(c))),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// A value on one line (a table inside an array is an inline table).
-fn value(v: &Value) -> String {
-    match v {
-        Value::String(s) => string(s),
-        Value::Integer(i) => i.to_string(),
-        Value::Float(f) if f.is_nan() => "nan".to_owned(),
-        Value::Float(f) if f.is_infinite() => if *f > 0.0 { "inf" } else { "-inf" }.to_owned(),
-        Value::Float(f) => {
-            let text = f.to_string();
-            if text.contains('.') || text.contains('e') {
-                text
+    let differ: Vec<String> = ours
+        .keys()
+        .into_iter()
+        .filter(|(at, key, value)| lookup(&table, at, key).and_then(Value::as_str) != Some(value))
+        .map(|(at, key, value)| {
+            if at.is_empty() {
+                format!("{key} should be {value:?}")
+            } else if ours.extra.iter().any(|s| s.table == at && s.key == key) {
+                // Paths and URLs the operator typed stay out of the message, as the database
+                // URL does: the key is named and the flag it came from is the way to see it.
+                format!("[{at}] {key} differs from its flag")
+            } else if at == "scheduler" {
+                // The database URL is never printed, not even one without a password.
+                format!("[{at}] {key} should be the --database URL")
             } else {
-                format!("{text}.0")
+                format!("[{at}] {key} should be {value:?}")
             }
-        }
-        Value::Boolean(b) => b.to_string(),
-        Value::Datetime(d) => d.to_string(),
-        Value::Array(items) => format!(
-            "[{}]",
-            items.iter().map(value).collect::<Vec<_>>().join(", ")
-        ),
-        Value::Table(t) => format!(
-            "{{ {} }}",
-            t.iter()
-                .map(|(k, v)| format!("{} = {}", bare(k), value(v)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        })
+        .collect();
+    if differ.is_empty() {
+        Decision::Keep
+    } else {
+        Decision::Refuse(format!(
+            "{} holds other settings and these keys differ from the flags ({}): edit them by hand",
+            super::paths::KBF_TOML,
+            differ.join("; ")
+        ))
     }
 }

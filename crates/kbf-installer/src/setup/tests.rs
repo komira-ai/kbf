@@ -43,8 +43,31 @@ fn raw(mode: Mode) -> Raw {
         min_generation: None,
         commit: None,
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
-        kbf: super::kbf_settings::KbfFlags::default(),
+        kbf: serving_flags(mode),
         installer_config: INSTALLER_TOML.to_owned(),
+    }
+}
+
+/// The `kbf.toml` flags a frontend or all-in-one host cannot be set up without, with nothing
+/// else (the files they name are in [`host`]); none for a node.
+fn serving_flags(mode: Mode) -> super::kbf_settings::KbfFlags {
+    let some = |s: &str| Some(s.to_owned());
+    match mode {
+        Mode::Frontend => super::kbf_settings::KbfFlags {
+            storage_url: some("http://127.0.0.1:8990"),
+            ..Default::default()
+        },
+        Mode::AllInOne => super::kbf_settings::KbfFlags {
+            cold_store: some("file:///var/lib/kbf/cold"),
+            meta_dir: some("/var/lib/kbf-meta"),
+            daemon_server: some("https://farm.example:8981"),
+            daemon_ca_cert: some("/etc/kbf/ca.pem"),
+            daemon_cert: some("/etc/kbf/node.pem"),
+            daemon_key: some("/etc/kbf/node.key"),
+            node_id: some("farm-1"),
+            ..Default::default()
+        },
+        _ => Default::default(),
     }
 }
 
@@ -73,6 +96,10 @@ fn put(exec: &mut FakeExec, path: &str, perms: u32, owner: Owner, bytes: &str) {
 fn host() -> FakeExec {
     let mut exec = FakeExec::new(0);
     put(&mut exec, SRC, 0o600, RUNNER, "tok-abc123\n");
+    // The all-in-one daemon half's CA, certificate and key (`serving_flags`).
+    put(&mut exec, "/etc/kbf/ca.pem", 0o644, ROOT, "ca");
+    put(&mut exec, "/etc/kbf/node.pem", 0o644, ROOT, "cert");
+    put(&mut exec, "/etc/kbf/node.key", 0o600, KBF, "key");
     exec
 }
 
@@ -261,8 +288,14 @@ const FRONTEND_TOML: &str =
 # keys it writes; run setup again to change these.
 mode = \"frontend\"
 
+[listener]
+api-listen = \"127.0.0.1:8982\"
+
 [tls]
 api-token-file = \"/etc/kbf/api-token\"
+
+[storage-client]
+storage = \"http://127.0.0.1:8990\"
 
 [scheduler]
 state-store = \"postgres:///kbf?host=/run/postgresql\"
@@ -1499,3 +1532,6 @@ fn a_view_forwards_reads_and_refuses_steps() {
 
 #[path = "more_tests.rs"]
 mod more;
+
+#[path = "kbf_settings_tests.rs"]
+mod kbf_settings_tests;
