@@ -107,6 +107,9 @@ use tokio::sync::watch;
 use crate::storage_health::{Debts, MemberReport, Report, StorageHealth, storage_health};
 use crate::worker::named_protocol;
 
+mod denials;
+pub use denials::Denial;
+
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
 const ID_COUNTER: &str = "member-id";

@@ -1462,7 +1462,7 @@ fn a_replaced_binary_is_re_executed_before_the_next_order_is_read() {
 }
 
 /// Catches a frontend update crashing the reader or moving the floor: the record parses (it
-/// carries claims like an activation), is refused in status.json with "not implemented
+/// is a locator: no components, no facts), is refused in status.json with "not implemented
 /// (P13)", changes nothing, is removed, and does not advance the acknowledged id or epoch, so
 /// a real order of a lower id in the same epoch still runs.
 ///
@@ -1471,8 +1471,9 @@ fn a_replaced_binary_is_re_executed_before_the_next_order_is_read() {
 #[test]
 fn a_frontend_update_record_is_refused_not_implemented_and_moves_no_floor() {
     let mut rig = Rig::new("frontend-update");
-    let mut r = rig.rec(9, 1, 1, Verb::Activate, B);
-    r.verb = Verb::FrontendUpdate;
+    let r = rig.rec(9, 1, 1, Verb::FrontendUpdate, B);
+    assert!(r.components.is_empty(), "a locator");
+    assert!(r.expected.is_none(), "a locator");
     rig.put(&r);
     rig.cycle(T0);
     assert_eq!(rig.status()["state"], "refused");
@@ -1508,9 +1509,7 @@ fn node_and_frontend_orders_have_separate_floors() {
     rig.order(7, Verb::Confirm, A);
     rig.cycle(T0);
     assert_eq!(rig.status()["acked_order_id"], 7);
-    let mut r = rig.rec(3, 1, 1, Verb::Activate, B);
-    r.verb = Verb::FrontendUpdate;
-    rig.put(&r);
+    rig.put(&rig.rec(3, 1, 1, Verb::FrontendUpdate, B));
     rig.cycle(T0 + 3);
     assert!(
         rig.refusal().contains("not implemented (P13)"),

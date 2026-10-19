@@ -6,7 +6,9 @@
 //! side) and for an all-in-one host (stop, hold, start); recovery after a proxy restart
 //! ([`Swap::adopt`]); the operator's rollback; the retire rule; and [`FileRecorder`], the
 //! fsynced `update.json`. What is not: the proxy itself, the real child control and the
-//! orders spool (U4b, U7b), the update API ([`api`], U8a).
+//! orders spool (U4b, U7b), the update API ([`api`], U8a). [`child_http`] is the blocking
+//! loopback client that the real child control and the fleet read will call a child's
+//! ports with (U8b); nothing calls it yet.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -55,6 +57,7 @@
 
 mod aio;
 pub mod api;
+pub mod child_http;
 pub mod model;
 pub mod ports;
 pub mod record;
@@ -64,6 +67,8 @@ mod swap;
 
 #[cfg(test)]
 mod aio_tests;
+#[cfg(test)]
+mod child_http_tests;
 #[cfg(test)]
 mod confirm_boundary_tests;
 #[cfg(test)]
