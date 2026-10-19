@@ -10,11 +10,13 @@ use kbf_enroll::client::{CallError, Enrollment, connect, enroll};
 use kbf_enroll::keys::{KeysError, fetch};
 use kbf_enroll::pin::Anchor;
 use kbf_enroll::store::Store;
+use kbf_testkit::dir::TestDir;
 use kbf_types::{Role, RoleSet};
 use support::fake::{self, Running};
 use support::{config_for, facts, scratch};
 
-async fn enrolled(name: &str, roles: &[Role]) -> (Running, Store, PathBuf) {
+/// The scratch directory is first so that, bound by a pattern, it drops after the rest.
+async fn enrolled(name: &str, roles: &[Role]) -> (TestDir, Running, Store) {
     let running = fake::start();
     let root = scratch(name);
     let config = config_for(&root, running.enroll_addr.port(), "");
@@ -39,7 +41,7 @@ async fn enrolled(name: &str, roles: &[Role]) -> (Running, Store, PathBuf) {
     )
     .await
     .expect("enrolled");
-    (running, store, root)
+    (root, running, store)
 }
 
 fn worker(running: &Running) -> String {
@@ -59,7 +61,7 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 #[tokio::test]
 async fn a_storage_node_gets_the_store_over_its_certificate_and_it_reaches_no_file() {
-    let (running, store, root) = enrolled("keys", &[Role::Storage, Role::Daemon]).await;
+    let (root, running, store) = enrolled("keys", &[Role::Storage, Role::Daemon]).await;
     let got = fetch(&store, &worker(&running), 0)
         .await
         .expect("the store");
@@ -95,7 +97,7 @@ async fn a_storage_node_gets_the_store_over_its_certificate_and_it_reaches_no_fi
 /// that does not: the node holds 3 and the frontend is at 3, then at 2 (a restored state).
 #[tokio::test]
 async fn the_node_sends_the_generation_it_holds_and_is_told_when_it_is_current() {
-    let (running, store, _) = enrolled("keys-have", &[Role::Storage]).await;
+    let (_root, running, store) = enrolled("keys-have", &[Role::Storage]).await;
     let same = fetch(&store, &worker(&running), 3).await.expect("same");
     assert_eq!(running.fake.last_have(), 3);
     assert_eq!((same.generation, same.config.is_none()), (3, true));
@@ -113,7 +115,7 @@ async fn the_node_sends_the_generation_it_holds_and_is_told_when_it_is_current()
 
 #[tokio::test]
 async fn a_revoked_node_is_refused_the_keys() {
-    let (running, store, _) = enrolled("keys-revoked", &[Role::Storage]).await;
+    let (_root, running, store) = enrolled("keys-revoked", &[Role::Storage]).await;
     running.fake.revoke_keys();
     let err = fetch(&store, &worker(&running), 0).await.unwrap_err();
     assert!(
@@ -124,7 +126,7 @@ async fn a_revoked_node_is_refused_the_keys() {
 
 #[tokio::test]
 async fn a_node_without_a_storage_identity_has_nothing_to_ask_with() {
-    let (running, store, _) = enrolled("keys-daemon-only", &[Role::Daemon]).await;
+    let (_root, running, store) = enrolled("keys-daemon-only", &[Role::Daemon]).await;
     let err = fetch(&store, &worker(&running), 0).await.unwrap_err();
     assert!(
         matches!(&err, KeysError::Identity(m) if m.contains("storage.pem")),
@@ -135,7 +137,7 @@ async fn a_node_without_a_storage_identity_has_nothing_to_ask_with() {
 
 #[tokio::test]
 async fn an_endpoint_that_is_not_a_url_or_not_listening_is_a_transport_error() {
-    let (running, store, _) = enrolled("keys-endpoint", &[Role::Storage]).await;
+    let (_root, running, store) = enrolled("keys-endpoint", &[Role::Storage]).await;
     let err = fetch(&store, "not a url", 0).await.unwrap_err();
     assert!(matches!(err, KeysError::Transport(_)), "{err}");
     let closed = kbf_testkit::port::dead_addr().port();

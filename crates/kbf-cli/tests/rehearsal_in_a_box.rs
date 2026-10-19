@@ -35,6 +35,7 @@ use kbf_proto::reapi::{
     Action, ActionResult, Command as ReapiCommand, Digest, Directory, DirectoryNode,
     ExecuteRequest, ExecuteResponse, FileNode, GetActionResultRequest, Platform,
 };
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
 use prost::Message as _;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
@@ -46,26 +47,27 @@ kbf_testkit::act_test_hook!();
 /// The bytes the action writes to its one output file.
 const OUTPUT: &[u8] = b"a file\n";
 
-/// A fresh directory for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = kbf_harness::node_support::scratch_root(PathBuf::from(env!("CARGO_TARGET_TMPDIR")))
-        .join("kbf-rehearsal")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A fresh directory for one test, removed when the farm that owns it drops.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        kbf_harness::node_support::scratch_root(PathBuf::from(env!("CARGO_TARGET_TMPDIR")))
+            .join("kbf-rehearsal"),
+        name,
+    )
 }
 
 /// The rehearsal's farm of `storage_nodes` nodes and a daemon, started from the units
 /// `kbf-deploy` renders, over the stand-in `crun`.
 fn start(name: &str, storage_nodes: usize) -> Farm {
-    let dir = scratch(name);
+    let scratch = scratch(name);
+    let dir = scratch.path().to_path_buf();
     let bins = Bins {
         kbf: PathBuf::from(env!("CARGO_BIN_EXE_kbf")),
         fake_crun: Some(PathBuf::from(env!("CARGO_BIN_EXE_kbf-cli-fake-crun"))),
     };
     Farm::start(&dir, &dir, &bins, &Topology::rehearsal(storage_nodes))
         .unwrap_or_else(|e| panic!("{e}"))
+        .owning(scratch)
 }
 
 /// Waits until the frontend is ready and lists every node as connected.

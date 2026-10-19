@@ -599,3 +599,15 @@ fn a_wait_ends_at_once_when_the_run_is_asked_to_stop() {
     );
     assert!(error.report.contains("--- processes ---"));
 }
+
+#[test]
+fn a_farm_removes_the_scratch_it_owns_when_it_drops() {
+    // Catches: a farm that leaves its scratch directory behind (every run left one per
+    // test), and one that removes it before its processes are reaped.
+    let scratch = kbf_testkit::dir::TestDir::under(dir("owned"), "own");
+    let path = scratch.path().to_path_buf();
+    let farm = Farm::supervise(&path, vec![sleeper(Role::Node(1), &path)]).owning(scratch);
+    assert!(path.is_dir());
+    drop(farm);
+    assert!(!path.exists(), "{} is left behind", path.display());
+}

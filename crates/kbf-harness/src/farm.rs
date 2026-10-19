@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kbf_deploy::linux::Mode;
 use kbf_deploy::linux::verify_cert::Row;
+use kbf_testkit::dir::TestDir;
 
 use crate::api;
 use crate::interrupt::Interrupt;
@@ -77,6 +78,10 @@ pub struct Farm {
     /// The block of ports the farm's processes bind, held while the farm lives, and the
     /// ports of it that the processes were told.
     claim: Option<(Claim, Ports)>,
+    /// A scratch directory the farm removes when it drops. The last field: fields drop in
+    /// order, so every process (each [`Proc`] kills and reaps its group as it drops) is
+    /// gone before the directory they write into.
+    scratch: Option<TestDir>,
 }
 
 /// A loopback address of its own for each process (the whole of `127/8` is loopback on
@@ -402,12 +407,20 @@ impl Farm {
             interrupt: Interrupt::new(),
             socket: None,
             claim: None,
+            scratch: None,
         };
         for (role, spec) in specs {
             let root = spec.cwd.clone();
             farm.launch_spec(role, &root, spec);
         }
         farm
+    }
+
+    /// The farm owning `scratch`: it is removed when the farm drops, after every process.
+    #[must_use]
+    pub fn owning(mut self, scratch: TestDir) -> Self {
+        self.scratch = Some(scratch);
+        self
     }
 
     /// The farm with `hang` as how long it waits before giving up (a test's, shorter than

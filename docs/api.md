@@ -219,9 +219,9 @@ The registration is judged against the map's floor once, when it is made
 ([design/frontend-proxy.md](design/frontend-proxy.md) section 9); `protocol` is what it
 named, and nothing judges it again.
 
-A registered member is `joining` until something promotes it with `Members::set_state`;
-the server does not promote on its own yet, so a script that waits for `active` waits
-for that. A server without a state store keeps no members and answers `404`; a state
+A node that registers for the first time in a farm formed more than a minute ago is
+`joining` until the operator promotes it with `POST /v1/members/{id}`; the server does not
+promote on its own, so a script that waits for `active` waits for that. A server without a state store keeps no members and answers `404`; a state
 store that cannot be read answers `503`. The view reads the map and then the member rows
 (for `protocol`), so a stored map or a stored member row that does not decode answers
 `500` for the whole view, not a list without that member's version: the store is up and
@@ -262,7 +262,7 @@ message yet: the daemon is not told, and the server simply sends it no new `Star
 An operator sets a storage member's state. The body is `{"state": "active"}` or
 `{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
 the map's generation after the change. `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
-the join handoff's, so none of them is accepted (`400`, as is
+written by a registration (a new node in a farm with data), so none of them is accepted (`400`, as is
 any other body). `404` for an id that has no live row (it expired, or never
 registered) or is not a number, or on a server without a state store; `503` when the
 state store cannot be written; `401`, `403` or `415` from the gates of
@@ -277,9 +277,18 @@ index is whole enters `active`, in a fresh cluster and in a formed one alike: it
 first start of a cluster, or a restart of a node whose meta log already has its rebuild,
 so a rolling restart leaves every member `active`. The registration also writes the
 `meta/members_formed` mark. A registration that says the node is rebuilding its index
-enters `catching_up` and becomes `active` by its own first beat that says it is done. No
-registration writes `joining`; that state is set by the join handoff in code
-(`Members::set_state`), and a `joining` member is promoted by this call.
+enters `catching_up` and becomes `active` by its own first beat that says it is done.
+The exception is a node the farm has not seen before (a new instance id) that registers
+more than a minute after the first `active` member: its store is empty, so it enters
+`joining` and an `unfilled/<id>` mark is written with it. While the mark is there every
+registration of that member is `joining` whatever it says, and no beat promotes it; this call
+(which removes the mark) does. A member that was `active` and restarts, and a
+returning instance, are `active` again. Nothing copies the blobs that existed before the
+node joined: promoting it says the operator knows it holds what it owns. A replacement host at the
+address of a node the farm has seen is a known instance, so it registers `active` with an
+empty store (the instance id is the address). A farm whose nodes start more than a minute
+apart leaves the later ones `joining` until promoted; `down` members cannot be promoted
+until they register again.
 
 **The risk of promoting a joiner.** `active` makes the member a settled owner: it
 takes the rank-1 slots of the digests it wins in the rendezvous order, and it is read
