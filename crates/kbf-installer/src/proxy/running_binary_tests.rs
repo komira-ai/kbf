@@ -5,8 +5,11 @@ use super::*;
 
 /// A copy of a real program, made not executable: the scratch directory lies under the
 /// target directory, where `cargo llvm-cov` takes every executable for a test binary.
+/// The program is this test binary itself, which exists on every host (macOS has no
+/// `/bin/true`).
 fn copy_program(to: &Path) {
-    fs::copy("/bin/true", to).expect("copy a real program");
+    let me = std::env::current_exe().expect("the test binary's path");
+    fs::copy(me, to).expect("copy a real program");
     fs::set_permissions(to, fs::Permissions::from_mode(0o644)).expect("not executable");
 }
 
