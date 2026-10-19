@@ -20,6 +20,8 @@ use std::time::Duration;
 
 use kbf_map::{Map, MemberId};
 use kbf_mapsync::MapHolder;
+use kbf_proto::kbf::enroll::v1::cold_store_client::ColdStoreClient;
+use kbf_proto::kbf::enroll::v1::{GetStoreConfigRequest, GetStoreConfigResponse};
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_storage::repair::Repairs;
@@ -28,6 +30,7 @@ use tokio::sync::watch;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
+use crate::cold_apply::Applied;
 use crate::members::PROTOCOL;
 use crate::node_map::NodeMap;
 use crate::storage_health::Debts;
@@ -61,6 +64,9 @@ pub struct Joined {
     pub interval: Duration,
     /// The generation of the map the frontend answered with.
     pub generation: u64,
+    /// The generation of the cold-store registration the frontend holds; 0: none, or it
+    /// cannot say now ([`crate::cold_apply`]).
+    pub objstore_generation: u64,
 }
 
 /// The wait after `failures` failures in a row: [`RETRY_BASE`] doubling to [`RETRY_MAX`].
@@ -90,12 +96,19 @@ pub fn unit_random() -> f64 {
 /// A node's registration with one frontend.
 pub struct Joiner {
     client: MembershipClient<Channel>,
+    /// The cold-store service of the same frontend, on the same channel and so the same
+    /// certificate.
+    cold: ColdStoreClient<Channel>,
     identity: Identity,
     retry: Duration,
     unit: fn() -> f64,
     repairs: Option<Arc<Repairs>>,
     catch_up: CatchUp,
     node: Arc<NodeMap>,
+    /// What the heartbeats say about the cold-store registration.
+    applied: Applied,
+    /// The registration generation the frontend last announced.
+    announced: u64,
 }
 
 impl Joiner {
@@ -104,13 +117,16 @@ impl Joiner {
     #[must_use]
     pub fn new(channel: Channel, identity: Identity, retry: Duration) -> Self {
         Self {
-            client: MembershipClient::new(channel),
+            client: MembershipClient::new(channel.clone()),
+            cold: ColdStoreClient::new(channel),
             identity,
             retry,
             unit: unit_random,
             repairs: None,
             catch_up: CatchUp::caught_up(),
             node: Arc::new(NodeMap::new(Arc::new(MapHolder::new()))),
+            applied: Applied::unreported(),
+            announced: 0,
         }
     }
 
@@ -123,7 +139,7 @@ impl Joiner {
     }
 
     /// The wait after `failures` failures in a row: [`backoff`], jittered.
-    fn pause(&self, failures: u32) -> Duration {
+    pub(crate) fn pause(&self, failures: u32) -> Duration {
         jittered(backoff(self.retry, failures), (self.unit)())
     }
 
@@ -148,6 +164,28 @@ impl Joiner {
             .await
             .ok()
             .map_or(Debts::Unknown, Debts::Known)
+    }
+
+    /// The joiner of a node that applied the cold-store registration as `applied` says:
+    /// every heartbeat reports it. Without this a node reports nothing, which the frontend
+    /// shows as `unsupported`.
+    #[must_use]
+    pub fn with_applied(mut self, applied: Applied) -> Self {
+        self.applied = applied;
+        self
+    }
+
+    /// Asks the frontend for the registered cold store, holding generation `have` (0:
+    /// none). The answer holds the keys: it prints them as `Secret(..)`.
+    ///
+    /// # Errors
+    /// The frontend's refusal, or the call failing.
+    pub async fn fetch_store_config(&self, have: u64) -> Result<GetStoreConfigResponse, Status> {
+        let mut cold = self.cold.clone();
+        let asked = GetStoreConfigRequest {
+            have_generation: have,
+        };
+        Ok(cold.get_store_config(asked).await?.into_inner())
     }
 
     /// Keeps the maps this node is sent in `node`'s holder, which whatever else the node
@@ -204,11 +242,13 @@ impl Joiner {
             .into_inner();
         self.take(answer.map.clone());
         self.node.registered(MemberId(answer.member_id));
+        self.announced = answer.objstore_generation;
         Ok(Joined {
             member_id: answer.member_id,
             boot: answer.boot,
             interval: Duration::from_millis(answer.heartbeat_interval_ms),
             generation: answer.map.map_or(0, |map| map.generation),
+            objstore_generation: answer.objstore_generation,
         })
     }
 
@@ -219,6 +259,7 @@ impl Joiner {
     /// NOT_FOUND when the row lapsed (register again); the call failing.
     pub async fn beat(&mut self, joined: &Joined) -> Result<u64, Status> {
         let (debts_known, repair_debts) = self.debts().await.to_wire();
+        let (applied_objstore_generation, apply_status) = self.applied.for_beat(self.announced);
         let answer = self
             .client
             .heartbeat(pb::HeartbeatRequest {
@@ -228,12 +269,12 @@ impl Joiner {
                 debts_known,
                 have_generation: self.node.maps().generation(),
                 catching_up: self.catch_up.is_catching_up(),
-                // The node does not apply a registration yet: it reports no generation and
-                // status 0, which the frontend shows as `unsupported`.
-                ..Default::default()
+                applied_objstore_generation,
+                apply_status: apply_status.into(),
             })
             .await?
             .into_inner();
+        self.announced = answer.objstore_generation;
         self.take(answer.map);
         Ok(answer.map_generation)
     }

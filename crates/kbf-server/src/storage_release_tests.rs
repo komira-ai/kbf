@@ -12,6 +12,7 @@ use kbf_objstore::{Capabilities, Floor, FsStore, MemoryStore, Released};
 
 use super::{COLD_RELEASE_DEADLINE, StorageHandle, assemble, command, parse};
 use crate::RaftMetaLog;
+use crate::cold_apply::Fixed;
 use crate::replication::REPAIR_DIR;
 
 /// What the subscriber wrote.
@@ -81,7 +82,7 @@ async fn node(dir: &std::path::Path, cold: Option<Released>) -> StorageHandle {
         &flags,
         flags.listener().expect("a listener"),
         None,
-        (log, store, prefix, id),
+        (log, Fixed(store), prefix, id),
         (|| Ok(ready(())), &meta_dir.join(REPAIR_DIR)),
         (None, cold),
         kbf_front::RebuildConfig::default(),

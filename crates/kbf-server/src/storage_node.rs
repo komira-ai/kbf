@@ -64,6 +64,7 @@ use kbf_threads::disk::Statvfs;
 use kbf_tls::{TlsFiles, TlsSource};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
+use crate::cold_apply::{ColdPick, Fixed, Registrable};
 use crate::join::{self, Joined, Joiner};
 use crate::listen::Binder;
 use crate::metrics::bind_node_sockets;
@@ -75,9 +76,7 @@ use crate::start::{AbortOnDrop, open_cold_file};
 use crate::startup_pass::StartPass;
 use crate::stores::{FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{
-    Args, ConfigError, RaftMetaLog, SERVER_VERSION, StartFailure, interrupted, s3_store, sizes_on,
-};
+use crate::{Args, ConfigError, RaftMetaLog, SERVER_VERSION, StartFailure, interrupted, sizes_on};
 
 /// The flags of [`Args`] a storage node takes, besides the thread flags
 /// ([`kbf_threads::PoolArgs`]): where its bytes are and how they are written.
@@ -142,6 +141,15 @@ pub struct StorageFlags {
     pub weight: u32,
     /// How the repair worker of a node that registered with a frontend is paced.
     pub repair: RepairConfig,
+    /// Where the S3 key pair comes from (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`):
+    /// the process environment, unless a test says otherwise.
+    pub env: fn(&str) -> Option<String>,
+}
+
+/// The process environment, as [`StorageFlags::env`] reads it.
+#[must_use]
+pub fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
 /// The long names of the flags of [`Args`] that `kbf storage` hides and refuses by name
@@ -299,6 +307,7 @@ pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
         zone: text(REGISTRATION[2]).unwrap_or_default(),
         weight: m.get_one::<u32>(REGISTRATION[3]).copied().unwrap_or(1),
         repair: RepairConfig::default(),
+        env: process_env,
     })
 }
 
@@ -388,6 +397,14 @@ impl StorageFlags {
         };
         let joiner = Joiner::new(endpoint.connect_lazy(), identity, join::RETRY_BASE);
         Ok(Some(joiner.with_node(node)))
+    }
+
+    /// Whether the node may hold the keys of a registered cold store: it registers with a
+    /// frontend and its cold store is an `s3://` bucket. Such a node turns off core dumps
+    /// before it starts ([`crate::cold_apply::harden_process`]).
+    #[must_use]
+    pub fn may_hold_keys(&self) -> bool {
+        self.frontend.is_some() && matches!(self.server.cold_store, Some(StoreUri::S3(_)))
     }
 
     /// The `Segments` uploads the node keeps: `--segment-upload-*`.
@@ -561,19 +578,19 @@ where
                 flags,
                 listener,
                 &stores,
-                (store, files),
+                (Fixed(store), files),
                 FILE_PREFIX_ROOT,
                 shutdown,
             )
             .await
         }
         StoreUri::S3(uri) => {
-            let store = s3_store(uri, |name| std::env::var(name).ok())?;
+            let cold = Registrable::new(uri, flags.env)?;
             over(
                 flags,
                 listener,
                 &stores,
-                (store, None),
+                (cold, None),
                 &uri.prefix,
                 shutdown,
             )
@@ -583,16 +600,16 @@ where
 }
 
 /// [`start_storage`] over the object store the cold store's URI named.
-async fn over<O, S, F>(
+async fn over<C, S, F>(
     flags: &StorageFlags,
     listener: StorageListener,
     stores: &Stores,
-    (store, files): (O, Option<kbf_objstore::FsStore>),
+    (cold, files): (C, Option<kbf_objstore::FsStore>),
     prefix_root: &str,
     shutdown: S,
 ) -> Result<StorageHandle, Box<dyn Error>>
 where
-    O: ObjectStore + 'static,
+    C: ColdPick,
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
@@ -608,7 +625,7 @@ where
         flags,
         listener,
         stores.hot.as_ref(),
-        (meta, store, prefix, log),
+        (meta, cold, prefix, log),
         (shutdown, &repair_dir),
         (pass, cold_released),
         RebuildConfig::default(),
@@ -619,11 +636,11 @@ where
 /// The cache, its write tier, flusher and pass, and the listener over them. With
 /// `--frontend` the listener is bound and the node registered before the cache opens,
 /// so the cache writes as the registration's member and boot ([`open_registered`]).
-async fn assemble<O, S, F>(
+async fn assemble<C, S, F>(
     flags: &StorageFlags,
     listener: StorageListener,
     hot: Option<&Hot>,
-    (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
+    (meta, cold, prefix, log): (RaftMetaLog<StdFs>, C, KeyPrefix, FarmLogId),
     (shutdown, repair_dir): (S, &Path),
     (pass, cold_released): (
         Option<StartPass<RaftMetaLog<StdFs>>>,
@@ -632,14 +649,14 @@ async fn assemble<O, S, F>(
     rebuild: RebuildConfig,
 ) -> Result<StorageHandle, Box<dyn Error>>
 where
-    O: ObjectStore + 'static,
+    C: ColdPick,
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
     // One start, one bind budget for both listeners, spent before the first await (a
     // `Binder` is not `Send`).
     let (socket, metrics) = bind_node_sockets(listener.listen, flags.metrics, &Binder::new())?;
-    let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
+    let (cache, registered) = open_cache(flags, socket, (meta, cold, prefix, log)).await?;
     let cache = cache
         .with_writes(flags.server.write_config())
         .with_write_pool(flags.server.write_pool_config());
@@ -692,11 +709,11 @@ where
 /// # Errors
 /// A TLS file or the frontend URL is refused, or the cache cannot be opened
 /// ([`open_registered`]).
-pub(crate) async fn open_cache<O: ObjectStore>(
+pub(crate) async fn open_cache<C: ColdPick>(
     flags: &StorageFlags,
     socket: StorageSocket,
-    (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
-) -> Result<(Cache<RaftMetaLog<StdFs>, O>, Registered), Box<dyn Error>> {
+    (meta, cold, prefix, log): (RaftMetaLog<StdFs>, C, KeyPrefix, FarmLogId),
+) -> Result<(Cache<RaftMetaLog<StdFs>, C::Store>, Registered), Box<dyn Error>> {
     let keys = ObjectKeys {
         root: prefix_root(&prefix, log)?,
         legacy: prefix,
@@ -712,6 +729,11 @@ pub(crate) async fn open_cache<O: ObjectStore>(
             };
             let mut joiner = joiner.with_catch_up(catch_up.clone());
             let joined = joiner.join().await;
+            // The store is chosen after the registration and before the cache opens: the
+            // keys the frontend registered are probed first (`crate::cold_apply`), and the
+            // heartbeats report what became of them from the first one.
+            let (store, applied) = cold.registered(&joiner, &joined).await?;
+            let joiner = joiner.with_applied(applied);
             let cache = open_registered(meta, store, keys, &joined).await?;
             let joiner = Some((joiner, joined));
             (
@@ -725,7 +747,7 @@ pub(crate) async fn open_cache<O: ObjectStore>(
             )
         }
         None => (
-            Cache::open_under(meta, store, keys).await?,
+            Cache::open_under(meta, cold.alone()?, keys).await?,
             Registered {
                 socket,
                 node,
@@ -811,13 +833,24 @@ fn one_voter(voters: usize) -> Result<(), String> {
 #[must_use]
 pub fn run(flags: &StorageFlags) -> ExitCode {
     crate::log_file::init(&flags.server);
-    match serve(flags) {
+    match harden(flags).and_then(|()| serve(flags)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprint!("{}", crate::start_said("kbf storage", e.as_ref()));
             StartFailure::of(e.as_ref()).code()
         }
     }
+}
+
+/// Turns off core dumps for a node that may hold registered keys.
+///
+/// # Errors
+/// The process cannot be hardened: the node does not start holding keys it cannot protect.
+pub fn harden(flags: &StorageFlags) -> Result<(), Box<dyn Error>> {
+    if flags.may_hold_keys() {
+        crate::cold_apply::harden_process()?;
+    }
+    Ok(())
 }
 
 fn serve(flags: &StorageFlags) -> Result<(), Box<dyn Error>> {

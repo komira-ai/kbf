@@ -28,6 +28,7 @@ use kbf_proto::worker::segments_server::Segments;
 use kbf_server::{LocalStore, StorageListener};
 use kbf_storage::service::RemoteStorage;
 use kbf_storage::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas as _, CasError, digest_of, label};
 use kbf_types::Digest;
 
@@ -242,15 +243,16 @@ async fn plane(arm: Arm, damage: Damage) -> (LocalDataPlane, Arc<Seen>) {
     (plane, seen)
 }
 
-/// A file to read a blob into, new and empty, under this test binary's scratch.
-async fn file(name: &str) -> (tokio::fs::File, PathBuf) {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-all-in-one-storage-plane")
-        .join(std::process::id().to_string());
-    std::fs::create_dir_all(&dir).expect("scratch");
+/// A file to read a blob into, new and empty, in a directory of its own; the directory
+/// is removed when the returned [`TestDir`] drops, so bind it for the test's length.
+async fn file(name: &str) -> (tokio::fs::File, PathBuf, TestDir) {
+    let dir = TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("storage-plane-{name}"),
+    );
     let path = dir.join(name);
     let file = tokio::fs::File::create(&path).await.expect("create");
-    (file, path)
+    (file, path, dir)
 }
 
 /// A blob larger than any chunk or buffer of the read path: four chunks of
@@ -272,7 +274,7 @@ async fn a_large_blob_streams_into_its_file(arm: Arm) {
     let blob = large();
     let digest = plane.put(blob.clone()).await.expect("put");
     assert_eq!(digest, digest_of(&blob));
-    let (mut into, path) = file(&format!("large-{arm:?}")).await;
+    let (mut into, path, _dir) = file(&format!("large-{arm:?}")).await;
     plane.read_to(&digest, &mut into).await.expect("read_to");
     drop(into);
     assert!(std::fs::read(&path).expect("read") == blob, "other bytes");
@@ -298,7 +300,7 @@ async fn a_large_blob_streams_into_its_file(arm: Arm) {
 async fn an_absent_blob_is_missing(arm: Arm) {
     let (plane, _) = plane(arm, Damage::None).await;
     let digest = digest_of(b"never stored");
-    let (mut into, path) = file(&format!("absent-{arm:?}")).await;
+    let (mut into, path, _dir) = file(&format!("absent-{arm:?}")).await;
     let read = plane.read_to(&digest, &mut into).await;
     assert_eq!(read, Err(CasError::Missing(label(&digest))));
     assert_eq!(
@@ -316,7 +318,7 @@ async fn a_read_cut_short_is_unavailable(arm: Arm) {
     let (plane, _) = plane(arm, Damage::Cut).await;
     let blob = large();
     let digest = plane.put(blob).await.expect("put");
-    let (mut into, path) = file(&format!("cut-{arm:?}")).await;
+    let (mut into, path, _dir) = file(&format!("cut-{arm:?}")).await;
     let read = plane.read_to(&digest, &mut into).await;
     assert!(
         matches!(&read, Err(CasError::Unavailable(blob, _)) if *blob == label(&digest)),
@@ -340,7 +342,7 @@ async fn read_both(
 ) -> (kbf_proto::reapi::Digest, [Result<(), CasError>; 2], u64) {
     let (plane, _) = plane(arm, damage).await;
     let digest = plane.put(large()).await.expect("put");
-    let (mut into, path) = file(&format!("{damage:?}-{arm:?}")).await;
+    let (mut into, path, _dir) = file(&format!("{damage:?}-{arm:?}")).await;
     let read = plane.read_to(&digest, &mut into).await;
     drop(into);
     let written = std::fs::metadata(&path).expect("stat").len();
@@ -413,15 +415,12 @@ on_both_arms!(
 /// The conformance suite's subject: a plane over a [`RemoteStorage`] to a new
 /// in-memory cache served on a loopback socket.
 struct Remote {
-    scratch: PathBuf,
+    scratch: TestDir,
 }
 
 impl Remote {
     fn new() -> Self {
-        let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-all-in-one-storage-plane-conformance")
-            .join(std::process::id().to_string());
-        std::fs::create_dir_all(&scratch).expect("scratch directory");
+        let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "storage-plane-conformance");
         Self { scratch }
     }
 }

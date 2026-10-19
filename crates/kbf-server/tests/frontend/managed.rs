@@ -15,6 +15,9 @@ use tokio::task::JoinHandle;
 
 use super::*;
 
+#[path = "managed/admin_client.rs"]
+mod admin_client;
+
 #[path = "managed/admin_secret.rs"]
 mod admin_secret;
 
