@@ -326,7 +326,7 @@ async fn a_member_lists_the_protocol_it_registered_naming() {
 
     // A heartbeat and an administrator's state change rewrite the row, and keep it.
     frontend
-        .heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+        .heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("beat");
     frontend.set_state(b.id, MemberState::Draining).expect("b");
     let view = members(server.api).await;
@@ -472,7 +472,7 @@ async fn a_member_whose_row_lapsed_names_no_protocol() {
                 registered.id,
                 registered.boot,
                 Progress::CaughtUp,
-                Debts::Unknown,
+                Reported::default(),
                 None,
             )
             .expect("beat");

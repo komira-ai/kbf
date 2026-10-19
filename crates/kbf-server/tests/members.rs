@@ -943,7 +943,7 @@ fn heartbeats_of_the_same_boot_do_not_bump_the_generation() {
     for round in 0..10 {
         s.clock.advance(10 * SECOND);
         for r in [&restarted, &b] {
-            m.heartbeat(r.id, r.boot, Progress::CaughtUp, Debts::Unknown, None)
+            m.heartbeat(r.id, r.boot, Progress::CaughtUp, Reported::default(), None)
                 .expect("beat");
         }
         for frontend in [&m, &other] {
@@ -974,7 +974,7 @@ fn a_down_member_keeps_its_boot_and_a_return_publishes_the_next() {
     let a = m.register(&node(1)).expect("a");
     let b = m.register(&node(2)).expect("b");
     s.clock.advance(20 * SECOND);
-    m.heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+    m.heartbeat(b.id, b.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("b");
     s.clock.advance(11 * SECOND);
     let down = m.refresh().expect("refresh").expect("map");
