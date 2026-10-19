@@ -1354,6 +1354,7 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
+ "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
@@ -1388,6 +1389,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "time",
  "ureq",
 ]
 
@@ -1485,6 +1487,7 @@ dependencies = [
  "kbf-enroll",
  "kbf-front",
  "kbf-host",
+ "kbf-installer",
  "kbf-node",
  "kbf-peer",
  "kbf-proto",
@@ -1817,11 +1820,14 @@ dependencies = [
  "kbf-installer",
  "kbf-proto",
  "kbf-state",
+ "kbf-testkit",
  "kbf-update",
  "libc",
  "postgres",
  "rcgen",
  "rustix",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2170,6 +2176,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2203,10 +2211,13 @@ dependencies = [
  "hex",
  "hyper-util",
  "kbf-auth",
+ "kbf-ca",
  "kbf-caps",
+ "kbf-enroll",
  "kbf-enroll-registry",
  "kbf-front",
  "kbf-history",
+ "kbf-installer",
  "kbf-invocation",
  "kbf-log",
  "kbf-map",
@@ -2220,6 +2231,7 @@ dependencies = [
  "kbf-route",
  "kbf-sched",
  "kbf-segments",
+ "kbf-signer",
  "kbf-sim",
  "kbf-state",
  "kbf-storage",
@@ -2262,6 +2274,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "kbf-ca",
+ "kbf-testkit",
  "kbf-types",
  "rcgen",
  "rustix",
@@ -2305,6 +2318,7 @@ name = "kbf-state"
 version = "0.1.0"
 dependencies = [
  "kbf-state",
+ "kbf-testkit",
  "postgres",
  "rusqlite",
  "rustix",

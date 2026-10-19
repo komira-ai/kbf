@@ -21,8 +21,11 @@ use crate::state::{self, Locked, State, StateError};
 use kbf_host::plan::Mode;
 use kbf_host::{Exec, HostPath, Perms, Step};
 
+mod frontend;
+
 use crate::database::SchemaStep;
 use crate::helper::fetcher::{Fetcher, InstalledRelease, ReleaseLocator};
+use crate::helper::host_mode;
 use crate::helper::leases::LeaseSource;
 use crate::helper::memory::{Event, Memory, StagedFacts};
 use crate::helper::order::{self, Claims, Order, Verb};
@@ -178,8 +181,14 @@ impl<E: Exec> Helper<E> {
     /// A link that moved means the service may still run the old release: restart it.
     pub fn recover(&mut self) -> Result<(), HelperError> {
         let mut memory = self.load()?;
+        let runs_frontend = host_mode::frontend_host(&self.host).is_ok();
         match activate::reconcile(&mut self.exec, &self.host, &mut self.log) {
-            Ok(true) => memory.restart_due = true,
+            // A frontend host owes the unit a restart only for a node swap on trial: the
+            // proxy owns the frontend's children, and reads `installed_commit` itself. `|`,
+            // not `||`: no short-circuit for a test to have to reach.
+            Ok(true) => {
+                memory.restart_due |= !runs_frontend | self.state()?.pending_confirm.is_some();
+            }
             Ok(false) => {}
             Err(e) => refuse(&mut memory, &e.to_string()),
         }
@@ -382,14 +391,31 @@ impl<E: Exec> Helper<E> {
         now: u64,
         memory: &mut Memory,
     ) -> Result<(), HelperError> {
+        let state = self.state()?;
+        // Read each pass's orders afresh: the file is the host's, and may change under us.
+        let not_frontend = host_mode::frontend_host(&self.host).err();
+        let frontend_host = not_frontend.is_none();
         // Each kind of order is ordered against its own floor.
-        let floor = |o: &Order, memory: &Memory| match o.verb {
-            Verb::FrontendUpdate => (memory.frontend_epoch, memory.frontend_order_id),
-            Verb::Activate | Verb::Confirm | Verb::Revert => {
-                (memory.acked_epoch, memory.acked_order_id)
-            }
+        let floor = |o: &Order, memory: &Memory| match kind_of(o, &state, frontend_host) {
+            Kind::Frontend(_) => (memory.frontend_epoch, memory.frontend_order_id),
+            Kind::Node => (memory.acked_epoch, memory.acked_order_id),
+        };
+        // A frontend order's refusals say their word first (KI section 5).
+        let word = |o: &Order| match kind_of(o, &state, frontend_host) {
+            Kind::Frontend(_) => "floor: ",
+            Kind::Node => "",
         };
         match parsed {
+            // A frontend order on a host that runs no frontend: refused, and like any
+            // refusal of a record it does not move a floor.
+            Ok(o) if !frontend_host && o.verb == Verb::FrontendUpdate => refuse(
+                memory,
+                &format!(
+                    "denied: order {}: this host runs no frontend (frontend_update is refused): {}",
+                    o.id,
+                    not_frontend.as_deref().unwrap_or_default()
+                ),
+            ),
             Ok(o)
                 if floor(&o, memory).0 != 0
                     && o.epoch > floor(&o, memory).0.saturating_add(order::MAX_EPOCH_JUMP) =>
@@ -397,8 +423,9 @@ impl<E: Exec> Helper<E> {
                 refuse(
                     memory,
                     &format!(
-                        "order {} is from epoch {}, more than {} above the last acted on ({}): \
+                        "{}order {} is from epoch {}, more than {} above the last acted on ({}): \
                          not acted on",
+                        word(&o),
                         o.id,
                         o.epoch,
                         order::MAX_EPOCH_JUMP,
@@ -410,7 +437,8 @@ impl<E: Exec> Helper<E> {
                 refuse(
                     memory,
                     &format!(
-                        "order {} is from epoch {}, older than the last acted on ({})",
+                        "{}order {} is from epoch {}, older than the last acted on ({})",
+                        word(&o),
                         o.id,
                         o.epoch,
                         floor(&o, memory).0
@@ -419,17 +447,21 @@ impl<E: Exec> Helper<E> {
             }
             // The same epoch and an id not above the last: a replay, dropped silently.
             Ok(o) if o.epoch == floor(&o, memory).0 && o.id <= floor(&o, memory).1 => {}
-            // The frontend swap is a later change (P13). It is refused here with that reason
-            // and, like any refusal of a record, does not move its floor (nor the node's):
-            // the next real order still runs.
-            Ok(o) if o.verb == Verb::FrontendUpdate => refuse(
-                memory,
-                &format!("order {}: frontend_update is not implemented (P13)", o.id),
-            ),
             Ok(o) => {
-                self.act(&o, now, memory)?;
-                memory.acked_order_id = o.id;
-                memory.acked_epoch = o.epoch;
+                // Acted on includes refused: the floor moves either way.
+                match kind_of(&o, &state, frontend_host) {
+                    Kind::Frontend(step) => {
+                        self.frontend(step, &o, memory);
+                        memory.frontend_order_id = o.id;
+                        memory.frontend_epoch = o.epoch;
+                    }
+                    Kind::Node => {
+                        self.act(&o, now, memory)?;
+                        memory.acked_order_id = o.id;
+                        memory.acked_epoch = o.epoch;
+                    }
+                }
+                memory.last_acted_id = o.id;
             }
             // Not acknowledged: a garbage file must not move the floor.
             Err(why) => refuse(memory, &format!("order file {name}: {why}")),
@@ -463,7 +495,8 @@ impl<E: Exec> Helper<E> {
             Verb::Activate => self.activate(order, now, memory),
             Verb::Confirm => self.confirm(order, &before),
             Verb::Revert => self.revert(),
-            Verb::FrontendUpdate => Err("frontend_update is not implemented (P13)".to_owned()),
+            // Taken before this point, by `kind_of`; never carried out as a node verb.
+            Verb::FrontendUpdate => Err("frontend_update is not a node order".to_owned()),
         };
         let moved = self.moved(&before)?;
         match result {
@@ -503,10 +536,7 @@ impl<E: Exec> Helper<E> {
         };
         // `kbf` is the one component a release of either platform carries that an order may
         // name (a Mac is given no `kbf-daemon`).
-        let prefix = match self.host.platform() {
-            Platform::Linux => "linux-",
-            Platform::MacOs => "darwin-",
-        };
+        let prefix = platform_prefix(&self.host);
         let needs = ["kbf"].as_slice();
         if !claims.platform.starts_with(prefix) {
             return Err(format!(
@@ -573,6 +603,7 @@ impl<E: Exec> Helper<E> {
             ));
         }
         memory.staged = Some(facts(&got));
+        memory.staged_profile = Some(got.profile.clone());
         Ok(())
     }
 
@@ -703,6 +734,39 @@ impl<E: Exec> Helper<E> {
     }
 }
 
+/// Whose order a record is: the node's (acted on against `acked_*`, restarting the unit) or
+/// the frontend proxy's (against the `frontend_*` floor, never restarting a unit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Node,
+    Frontend(FrontendStep),
+}
+
+/// The three orders of the frontend proxy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrontendStep {
+    Update,
+    Confirm,
+    Revert,
+}
+
+/// The kind of `order` on a host in `state`. `frontend_update` is the proxy's always. On a
+/// frontend host a `confirm` or `revert` is the proxy's unless it names the release a node
+/// swap has on trial (then it is that swap's). Elsewhere they are the node's.
+fn kind_of(order: &Order, state: &State, frontend_host: bool) -> Kind {
+    let on_trial = state
+        .pending_confirm
+        .as_ref()
+        .is_some_and(|p| p.commit == order.commit);
+    match order.verb {
+        Verb::Activate => Kind::Node,
+        Verb::FrontendUpdate => Kind::Frontend(FrontendStep::Update),
+        Verb::Confirm if frontend_host & !on_trial => Kind::Frontend(FrontendStep::Confirm),
+        Verb::Revert if frontend_host & !on_trial => Kind::Frontend(FrontendStep::Revert),
+        Verb::Confirm | Verb::Revert => Kind::Node,
+    }
+}
+
 /// What an order did.
 struct Done {
     event: Event,
@@ -733,6 +797,14 @@ impl Done {
             swapped: false,
             kept: false,
         }
+    }
+}
+
+/// What a release for this host's platform declares its platform starts with.
+fn platform_prefix(host: &Layout) -> &'static str {
+    match host.platform() {
+        Platform::Linux => "linux-",
+        Platform::MacOs => "darwin-",
     }
 }
 

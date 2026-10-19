@@ -108,6 +108,17 @@ impl Headers {
         Headers::default()
     }
 
+    /// `Content-Type: application/json`, which a child's JSON writes require.
+    pub fn json() -> Headers {
+        Headers(b"Content-Type: application/json\r\n".to_vec())
+    }
+
+    /// These headers, then `other`'s.
+    pub fn and(mut self, other: &Headers) -> Headers {
+        self.0.extend_from_slice(&other.0);
+        self
+    }
+
     /// Add `name: value`. Refused: an empty name or one with a character a header name
     /// cannot have, a name the client owns (see the module doc), and a value with
     /// anything but printable ASCII, space and tab (a CR or LF would end the header).

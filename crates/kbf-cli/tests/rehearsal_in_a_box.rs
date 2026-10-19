@@ -44,6 +44,7 @@ use kbf_proto::reapi::{
     Action, ActionResult, Command as ReapiCommand, Digest, Directory, DirectoryNode,
     ExecuteRequest, ExecuteResponse, FileNode, GetActionResultRequest, Platform,
 };
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas as _, TransferConfig, Transfers, digest_of};
 use node::{cgroup_tree, crun, files_holding, id_files, image_path, input_bytes};
 use pki::Pki;
@@ -75,22 +76,10 @@ fn loopback(n: usize) -> String {
     format!("127.0.0.{}", n + 1)
 }
 
-/// A fresh directory for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = node::scratch_root()
-        .join("kbf-rehearsal")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
-}
-
-/// The last component of `dir`.
-fn file_name(dir: &Path) -> String {
-    dir.file_name()
-        .expect("a name")
-        .to_string_lossy()
-        .into_owned()
+/// A fresh directory for one test, removed when it drops (declare it before the
+/// processes that write into it).
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(node::scratch_root().join("kbf-rehearsal"), name)
 }
 
 /// `n` distinct ports nothing listens on now.
@@ -189,7 +178,6 @@ fn settings(
         ("KBF_DATA_DIR", at("data")),
         ("KBF_META_DIR", at("meta")),
         ("KBF_HOT_DIR", at("hot")),
-        ("KBF_STATE_DIR", at("state")),
         ("KBF_IMAGES", image.to_owned()),
     ])
 }
@@ -219,6 +207,11 @@ struct Farm {
     /// The processes (by index) a test has killed: [`Farm::wait`] does not take their
     /// exit for a crash.
     killed: Vec<usize>,
+    /// The frontend's control socket directory and the farm's scratch directory: the
+    /// last fields, so they drop after `procs` (struct fields drop in order) has
+    /// killed and reaped every process that writes into them.
+    _sockets: TestDir,
+    _scratch: TestDir,
 }
 
 impl Farm {
@@ -233,7 +226,9 @@ impl Farm {
     ///
     /// Every other flag is the unit's.
     fn start(name: &str, storage_nodes: usize) -> Self {
-        let dir = scratch(name);
+        let scratch = scratch(name);
+        let dir = scratch.path().to_path_buf();
+        let sockets = TestDir::under(std::env::temp_dir(), "kbf-rehearsal-sock");
         let uid = rustix::process::getuid().as_raw();
         let p = ports(storage_nodes + 4);
         let (storage, spare) = (&p[3..3 + storage_nodes], p[3 + storage_nodes]);
@@ -257,6 +252,8 @@ impl Farm {
                 .chain((1..=storage_nodes).map(node_id))
                 .collect(),
             killed: Vec::new(),
+            _sockets: sockets,
+            _scratch: scratch,
         };
 
         // The frontend: its unit as rendered, a state directory made.
@@ -277,12 +274,21 @@ impl Farm {
         let unit = rendered(&cfg, uid, Mode::Frontend);
         // The unit's control socket is in a `RuntimeDirectory=` systemd makes; a test box
         // has no such directory, and the scratch directory's path is too long for a
-        // socket's (`SUN_LEN`), so the socket is in the temporary directory, named for
-        // the test.
-        let socket = std::env::temp_dir().join(format!("{}.sock", file_name(&dir)));
-        let _ = std::fs::remove_file(&socket);
+        // socket's (`SUN_LEN`), so the socket is in a short-named directory of its own
+        // in the temporary directory.
+        let socket = farm._sockets.join("control.sock");
         let control = format!("--handover-socket={}", socket.display());
-        farm.launch(&dir, &root, "frontend", unit.replace(&[control]), None);
+        // The unit's state store is the host's Postgres and it has no control socket (kbf
+        // refuses the two together); the box has no Postgres, so the rehearsal gives the
+        // frontend a SQLite file and its socket.
+        let state = format!("--state-store=sqlite://{}/state/state.db", root.display());
+        farm.launch(
+            &dir,
+            &root,
+            "frontend",
+            unit.replace(&[state]).add(&[control]),
+            None,
+        );
         let line = farm.start_line(0, "kbf-frontend ");
         farm.reapi = field(&line, "reapi=").to_owned();
 

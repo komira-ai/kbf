@@ -96,8 +96,12 @@ pub(super) struct ChildState {
     /// with a DATA frame on stream 0, a protocol error of the connection that the proxy's h2
     /// library detects itself.
     pub raw_garbage_first: AtomicBool,
-    /// Set: the next connection is served by hand, sends its SETTINGS and never answers a PING.
-    pub raw_mute_first: AtomicBool,
+    /// Set to `Some(n)`: the next connection is served by hand, answers its first `n` PINGs
+    /// (the pool's dial check is the first; `Some(0)` fails the dial), never answers a stream,
+    /// and then goes silent.
+    pub raw_pongs_first: Mutex<Option<usize>>,
+    /// PINGs received by hand-served connections, answered or not.
+    pub pings: AtomicUsize,
     /// Set: the next connection (after a `raw_goaway_first` one) is served by hand and only
     /// records the frames of each stream, in `frames`; it never answers.
     pub raw_record: AtomicBool,
@@ -356,31 +360,143 @@ pub(super) fn start_child_on(listeners: Vec<std::net::TcpListener>, script: Scri
     }
 }
 
-/// An h2 frame by hand.
+/// An h2 frame by hand on connection stream 0.
 fn frame(kind: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
+    frame_on(kind, flags, 0, payload)
+}
+
+/// An h2 frame by hand on `stream`.
+pub(super) fn frame_on(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     let len = u32::try_from(payload.len())
         .expect("a small frame")
         .to_be_bytes();
-    let mut out = vec![len[1], len[2], len[3], kind, flags, 0, 0, 0, 0];
+    let id = stream.to_be_bytes();
+    let mut out = vec![
+        len[1], len[2], len[3], kind, flags, id[0], id[1], id[2], id[3],
+    ];
     out.extend_from_slice(payload);
     out
 }
 
+/// One frame read from the proxy by a [`RawPeer`].
+#[derive(Debug)]
+pub(super) struct RawFrame {
+    pub kind: u8,
+    pub flags: u8,
+    pub stream: u32,
+    pub payload: Vec<u8>,
+}
+
+impl RawFrame {
+    pub(super) const PING: u8 = 6;
+    pub(super) const GOAWAY: u8 = 7;
+    pub(super) const HEADERS: u8 = 1;
+    pub(super) const RST_STREAM: u8 = 3;
+    pub(super) const CONTINUATION: u8 = 9;
+    /// END_STREAM on HEADERS and DATA.
+    pub(super) const END_STREAM: u8 = 1;
+
+    /// The error code of a GOAWAY.
+    pub(super) fn goaway_code(&self) -> u32 {
+        u32::from_be_bytes([
+            self.payload[4],
+            self.payload[5],
+            self.payload[6],
+            self.payload[7],
+        ])
+    }
+}
+
+/// An HTTP/2 client written by hand, for what a real client will not do: stay silent when
+/// pinged, or reset streams faster than any library would.
+pub(super) struct RawPeer {
+    io: DuplexStream,
+}
+
+impl RawPeer {
+    /// Connects to the rig from `CLIENT_IP`, with the preface and an empty SETTINGS sent.
+    pub(super) async fn connect(rig: &Rig) -> Self {
+        let (near, far) = tokio::io::duplex(PIPE_BYTES);
+        rig.feed_raw(far, CLIENT_IP);
+        let mut peer = Self { io: near };
+        let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        hello.extend(frame(4, 0, &[]));
+        peer.send(&hello).await;
+        peer
+    }
+
+    pub(super) async fn send(&mut self, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        self.io.write_all(bytes).await.expect("the proxy reads");
+    }
+
+    /// The request HEADERS of `stream` (`POST /`, END_HEADERS, body to follow).
+    pub(super) fn request(stream: u32) -> Vec<u8> {
+        // HPACK static table: 3 is `:method: POST`, 6 `:scheme: http`, 4 `:path: /`.
+        frame_on(1, 4, stream, &[0x83, 0x86, 0x84])
+    }
+
+    /// The HPACK block of the request fields of a gRPC call to `path`.
+    pub(super) fn grpc_block(path: &str) -> Vec<u8> {
+        let mut block = vec![
+            0x83,
+            0x86,
+            0x44,
+            u8::try_from(path.len()).expect("a short path"),
+        ];
+        block.extend_from_slice(path.as_bytes());
+        // `:authority` (static table 1), value literal.
+        block.extend([0x41, 13]);
+        block.extend_from_slice(b"frontend.test");
+        // `content-type: application/grpc`, name from the static table (31), value literal.
+        block.extend([0x5f, 16]);
+        block.extend_from_slice(b"application/grpc");
+        block
+    }
+
+    /// The request HEADERS of a gRPC call to `path` on `stream`, headers only (END_STREAM).
+    pub(super) fn grpc_request(stream: u32, path: &str) -> Vec<u8> {
+        frame_on(1, 4 | RawFrame::END_STREAM, stream, &Self::grpc_block(path))
+    }
+
+    /// `RST_STREAM(CANCEL)` of `stream`.
+    pub(super) fn cancel(stream: u32) -> Vec<u8> {
+        frame_on(3, 0, stream, &8_u32.to_be_bytes())
+    }
+
+    /// The next frame, or nothing once the proxy has closed the connection.
+    pub(super) async fn next(&mut self) -> Option<RawFrame> {
+        use tokio::io::AsyncReadExt;
+        let mut head = [0_u8; 9];
+        self.io.read_exact(&mut head).await.ok()?;
+        let mut payload = vec![0_u8; u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize];
+        self.io.read_exact(&mut payload).await.ok()?;
+        Some(RawFrame {
+            kind: head[3],
+            flags: head[4],
+            stream: u32::from_be_bytes([head[5] & 0x7f, head[6], head[7], head[8]]),
+            payload,
+        })
+    }
+}
+
 /// Speaks just enough h2 to take the proxy's SETTINGS and answer the first HEADERS with
-/// `on_headers` (a frame), and PINGs if `pong`; then keeps the connection open and reads until
-/// the proxy closes it.
+/// `on_headers` (a frame), and the first `pongs` PINGs; then keeps the connection open and
+/// reads until the proxy closes it.
 async fn raw_child(
     mut io: impl AsyncRead + AsyncWrite + Unpin + Send,
     on_headers: Vec<u8>,
-    pong: bool,
+    pongs: usize,
+    pings: &AtomicUsize,
 ) {
-    let _ = raw_frames(&mut io, &on_headers, pong).await;
+    let _ = raw_frames(&mut io, &on_headers, pongs, pings).await;
 }
 
 async fn raw_frames(
     io: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
     on_headers: &[u8],
-    pong: bool,
+    mut pongs: usize,
+    pings: &AtomicUsize,
 ) -> io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     io.read_exact(&mut [0_u8; 24]).await?;
@@ -392,7 +508,13 @@ async fn raw_frames(
         io.read_exact(&mut payload).await?;
         match (head[3], head[4] & 1) {
             (4, 0) => io.write_all(&frame(4, 1, &[])).await?,
-            (6, 0) if pong => io.write_all(&frame(6, 1, &payload)).await?,
+            (6, 0) => {
+                pings.fetch_add(1, Ordering::AcqRel);
+                if pongs > 0 {
+                    pongs -= 1;
+                    io.write_all(&frame(6, 1, &payload)).await?;
+                }
+            }
             (1, _) => io.write_all(on_headers).await?,
             _ => {}
         }
@@ -444,16 +566,21 @@ async fn connection(
     script: Script,
 ) {
     if state.raw_goaway_first.swap(false, Ordering::AcqRel) {
-        return raw_child(io, frame(7, 0, &[0; 8]), true).await;
+        return raw_child(io, frame(7, 0, &[0; 8]), usize::MAX, &state.pings).await;
     }
     if state.raw_garbage_first.swap(false, Ordering::AcqRel) {
-        return raw_child(io, frame(0, 0, &[1, 2, 3]), true).await;
+        return raw_child(io, frame(0, 0, &[1, 2, 3]), usize::MAX, &state.pings).await;
     }
     if state.raw_record.swap(false, Ordering::AcqRel) {
         return raw_record(io, &state).await;
     }
-    if state.raw_mute_first.swap(false, Ordering::AcqRel) {
-        return raw_child(io, Vec::new(), false).await;
+    let pongs = state
+        .raw_pongs_first
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some(pongs) = pongs {
+        return raw_child(io, Vec::new(), pongs, &state.pings).await;
     }
     let mut builder = h2::server::Builder::new();
     builder
@@ -552,6 +679,14 @@ impl Reply {
     pub(super) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+}
+
+/// Sends the last DATA of a request. A server may answer, and so close the stream, before it
+/// reads the body (RFC 9113 section 8.1: a refusal does), and the send then fails with
+/// `InactiveStreamId`. That is not the client's error: the answer is already there, so the
+/// caller reads it with [`finish`], which reports a stream that really failed.
+pub(super) fn send_end(body: &mut SendStream<Bytes>, data: Bytes) {
+    let _answered_first = body.send_data(data, true);
 }
 
 /// Reads a response to its end.
@@ -694,9 +829,7 @@ impl Client {
             .send_request(request, body.is_empty())
             .expect("send_request");
         if !body.is_empty() {
-            stream
-                .send_data(Bytes::from_static(body), true)
-                .expect("body");
+            send_end(&mut stream, Bytes::from_static(body));
         }
         finish(response).await
     }
@@ -704,8 +837,16 @@ impl Client {
     /// A whole unary call: headers, one message, END_STREAM.
     pub(super) async fn unary(&mut self, path: &str) -> Reply {
         let (response, mut body) = self.start(path, false).await;
-        body.send_data(Bytes::from_static(b"ping"), true)
-            .expect("body");
+        send_end(&mut body, Bytes::from_static(b"ping"));
+        finish(response).await
+    }
+
+    /// [`Client::unary`] with the message held back for `pause` of the test's clock after the
+    /// headers: a proxy that answers from the headers has finished the stream by then.
+    pub(super) async fn unary_after(&mut self, path: &str, pause: std::time::Duration) -> Reply {
+        let (response, mut body) = self.start(path, false).await;
+        tokio::time::sleep(pause).await;
+        send_end(&mut body, Bytes::from_static(b"ping"));
         finish(response).await
     }
 

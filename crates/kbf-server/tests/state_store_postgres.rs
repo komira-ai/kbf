@@ -4,10 +4,10 @@
 //! `state-postgres` job in ci.yml runs them with `--include-ignored` against a service
 //! container. `KBF_TEST_POSTGRES_URL` names a database they may create and drop the
 //! `kbf_state` schema in (the schema a flag-opened store lives in, as the flag takes no
-//! other). One test holds that schema from start to end, so the checks that need the same
-//! rows run in order inside it.
+//! other). The tests share that one schema and cargo runs them on threads of one process, so
+//! each takes `exclusive()` first: one test holds the schema from start to end.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use kbf_front::Cache;
 use kbf_server::{EpochPolicy, Farm, StateError, StateStore, StateStoreUri};
@@ -19,6 +19,18 @@ fn url() -> String {
     std::env::var(URL_VAR).unwrap_or_else(|_| {
         panic!("{URL_VAR} must name a postgres:// URL the tests may create schemas in")
     })
+}
+
+static SCHEMA: Mutex<()> = Mutex::new(());
+
+/// The right to use the `kbf_state` schema. Without it a test that drops the schema and
+/// expects a start to be refused sees the tables another test is applying at that moment.
+/// A test that panicked while holding it leaves nothing the next one relies on (each starts
+/// by dropping or applying the schema), so a poisoned lock is taken as it is.
+fn exclusive() -> MutexGuard<'static, ()> {
+    SCHEMA
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn uri(url: &str) -> StateStoreUri {
@@ -63,6 +75,7 @@ fn fresh_database() {
 #[test]
 #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_start_on_a_database_without_the_installers_schema_is_refused() {
+    let _schema = exclusive();
     empty_database();
     let refused = uri(&url()).open().err().expect("refused");
     let said = refused.to_string();
@@ -90,6 +103,7 @@ fn a_start_on_a_database_without_the_installers_schema_is_refused() {
 #[test]
 #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_flag_opened_postgres_store_takes_generations_and_epochs_as_sqlite_does() {
+    let _schema = exclusive();
     fresh_database();
     let uri = uri(&url());
     assert_eq!(uri.epoch_policy(), EpochPolicy::Bump);
@@ -169,6 +183,7 @@ fn a_flag_opened_postgres_store_takes_generations_and_epochs_as_sqlite_does() {
 #[test]
 #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn a_server_that_does_not_flush_commits_refuses_the_start() {
+    let _schema = exclusive();
     let base = url();
     let sep = if base.contains('?') { '&' } else { '?' };
     for setting in ["off", "local", "remote_write"] {

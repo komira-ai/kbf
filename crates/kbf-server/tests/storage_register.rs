@@ -1999,3 +1999,40 @@ async fn a_wiped_node_of_either_kind_never_reuses_its_keys() {
         assert_ne!(before, after, "{name}: the wiped node is the same writer");
     }
 }
+
+/// Catches: a real new node (empty store: it registers `CatchingUp`, rebuilds, and beats
+/// caught up) joining a farm that is over a minute old being made `Active` by its first
+/// caught-up beat: it must stay `Joining`, and rank 1 of no digest, until promoted.
+#[tokio::test]
+async fn a_new_node_joining_an_old_farm_stays_joining_through_its_first_beats() {
+    let f = frontend(None);
+    f.members
+        .register(&kbf_server::members::Registrant {
+            instance_id: "198.51.100.9:8982".to_owned(),
+            addr: "198.51.100.9:8982".to_owned(),
+            zone: String::new(),
+            weight: 1,
+            protocol: kbf_server::members::PROTOCOL,
+            progress: kbf_server::members::Progress::CaughtUp,
+        })
+        .expect("the farm's first member");
+    f.store.clock.advance(Duration::from_secs(120));
+    let url = format!("--frontend=http://{}", f.worker);
+    let node = start_storage(
+        &flags(&dir("joins-old-farm"), &[url]).expect("flags"),
+        never,
+    )
+    .await
+    .expect("starts");
+    let caught_up = node.catch_up();
+    let _serving = tokio::spawn(node.serve());
+    let mut seen = until("the node to register", || row(&f, 2)).await.version;
+    caught_up.finished().await;
+    for _ in 0..3 {
+        seen = until("a beat", || {
+            row(&f, 2).filter(|r| r.version != seen).map(|r| r.version)
+        })
+        .await;
+        assert_eq!(state(&f, 2), Some(MemberState::Joining));
+    }
+}
