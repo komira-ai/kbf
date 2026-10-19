@@ -4,7 +4,7 @@ Status: design for review, 2026-10-18, revised to the owner's answers of that da
 
 ## 1. Decisions
 
-1. **One public port per frontend host** (above 1024), owned by `kbf-proxy`, shipped in the `kbf-installer` package as the `kbf-installer proxy` verb. It is a separate unprivileged service (user `kbf`), not part of the root helper.
+1. **One public port per frontend host** (above 1024), owned by `kbf-proxy`, shipped in the `kbf-installer` package as the `kbf-installer proxy` verb. It is a separate unprivileged service (user `kbf-server`, the frontend's own; the first draft said `kbf`), not part of the root helper.
 2. **The proxy terminates TLS for everything on that port**: REAPI, operator API and worker sessions. It verifies a client certificate when one is presented (farm CA, role URI, node id in SAN, EKU), and forwards every stream to the ACTIVE child over loopback with the verified identity (node id, role) as metadata. Routing is per HTTP/2 stream and never sends GOAWAY to a client. No daemon or node release is a prerequisite.
 3. **Children are plain `kbf --mode frontend` processes** that the proxy starts as its own processes and supervises, on loopback ports at fixed per-slot offsets. They trust identity metadata only from the proxy (section 3).
 4. **Side by side on Postgres means one writer for scheduling.** The store-wide generation fence decides who schedules. The old child is read-only for scheduling, may write only its own metadata (section 8), and finishes its open streams from `done/` rows.
@@ -17,11 +17,11 @@ Status: design for review, 2026-10-18, revised to the owner's answers of that da
 | Process | User | Listens | Job |
 |---|---|---|---|
 | `kbf-installer run` (root helper) | root | nothing | Verifies and stages releases under `/var/lib/kbf-installer/releases/<commit>/`, reads `orders/`, spawns the unprivileged fetch child. Contract unchanged. |
-| `kbf-installer proxy` (`kbf-proxy.service` + `.socket`) | `kbf` | the public port, from systemd socket activation (`O_CLOEXEC`) | TLS, client-certificate identity, routing, hold, update API, child supervision, open-stream accounting. |
-| `kbf --mode frontend`, slot `a` or `b` | `kbf` | loopback ports at slot offsets; admin calls on a separate loopback port | The frontend. Plain h2, identity from the proxy only. |
+| `kbf-installer proxy` (`kbf-proxy.service` + `.socket`) | `kbf-server` | the public port, from systemd socket activation (`O_CLOEXEC`) | TLS, client-certificate identity, routing, hold, update API, child supervision, open-stream accounting. |
+| `kbf --mode frontend`, slot `a` or `b` | `kbf-server` | loopback ports at slot offsets; admin calls on a separate loopback port | The frontend. Plain h2, identity from the proxy only. |
 | Postgres | `postgres` | Unix socket | Shared state (section 11). |
 
-- **The proxy runs as the unprivileged `kbf` user** and is installed by the kbf-installer package. Only the root part of kbf-installer stages verified releases. The root helper keeps its "no socket, no network" property; the proxy talks to it only through the `kbf`-owned `orders/` directory and `status.json` (the existing spool contract). No new control socket.
+- **The proxy runs as the unprivileged `kbf-server` user** (the frontend's: the children it starts hold the state store and run as that user, as `kbf-frontend@.service` does) and is installed by the kbf-installer package. Only the root part of kbf-installer stages verified releases. The root helper keeps its "no socket, no network" property; the proxy talks to it only through the `kbf`-owned `orders/` directory and `status.json` (the existing spool contract). No new control socket.
 - **Doc change:** `kbf-installer.md` "no installer network listener" becomes "the root helper has no listener; the `proxy` verb is a separate unprivileged service". Hardening applies per service.
 - **Order to the root half (decided).** The proxy writes a `frontend_update` record into `orders/` carrying only `{order_id, epoch, generation, verb, commit, window_s}` (well under the 4096-byte limit). It carries no components, no attestation and no expected facts: the proxy has no release store. The root half fetches that commit from the `release_source` in `installer.toml` (a `url` source on a frontend host), takes the attestation from the source, runs the existing verify pipeline and the `--version --json` probe, and **stages without flipping**. Facts (`protocol`, `min_protocol`, `state_schema`, `profile`) appear in `status.json` under `staged{}`; the proxy runs the R1/R4 gate on them. The record cannot name a path or URL, a stolen token can deploy only a signed release, and a downgrade needs `rollback: true` and is recorded.
 - **Supervision.**

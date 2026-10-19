@@ -12,7 +12,7 @@ Description=kbf frontend proxy, the public port
 ConditionPathExists=/etc/kbf/installer.toml
 
 [Socket]
-ListenStream=8443
+ListenStream=8980
 Accept=no
 # The proxy sets its own limits (connections per address, pre-stream timeouts); the
 # backlog is only what waits while it restarts.

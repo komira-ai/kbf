@@ -10,7 +10,7 @@ use kbf_deploy::unit::UnitFile;
 use super::{INSTALLER, INSTALLER_CONFIG, all, read, rules_of, trim, violations};
 
 /// The rules of this module, by the tag a violation starts with.
-pub(super) const RULES: [&str; 11] = [
+pub(super) const RULES: [&str; 12] = [
     "proxy-socket-pair",
     "proxy-socket-accept",
     "proxy-socket-port",
@@ -22,6 +22,7 @@ pub(super) const RULES: [&str; 11] = [
     "proxy-restart",
     "proxy-state",
     "proxy-stop",
+    "proxy-type",
 ];
 
 /// `kbf-proxy.socket`: the unit that holds the public port.
@@ -47,20 +48,15 @@ pub(super) fn socket_rules(unit: &UnitFile, v: &mut impl FnMut(&str, String)) {
             format!("Accept= is {:?}, not no", get("Socket", "Accept")),
         );
     }
-    // Catches a public port in the privileged range (the proxy is not root and the design
-    // says above 1024), a second listener (the verb takes exactly one descriptor) and
-    // anything that is not a TCP stream.
+    // Catches a public port that is not the shipped 8980 (a port in the privileged range is
+    // out too: the proxy is not root; a drop-in `listen.conf` is how a host differs), a
+    // second listener (the verb takes exactly one descriptor) and anything that is not a
+    // TCP stream.
     let listens: Vec<&str> = all(unit, "Socket", "ListenStream");
-    let port_ok = |l: &str| {
-        l.rsplit(':')
-            .next()
-            .and_then(|p| p.parse::<u32>().ok())
-            .is_some_and(|p| (1025..=65_535).contains(&p))
-    };
-    if listens.len() != 1 || !port_ok(listens[0]) {
+    if listens != ["8980"] {
         v(
             "proxy-socket-port",
-            format!("ListenStream= is {listens:?}, not one port above 1024"),
+            format!("ListenStream= is {listens:?}, not 8980 alone"),
         );
     }
     for other in [
@@ -122,6 +118,15 @@ pub(super) fn service_rules(
         v(
             "proxy-kill",
             format!("KillMode= is {:?}, not process", get("KillMode")),
+        );
+    }
+    // Catches a notify unit: the verb never sends READY=1, so systemd would wait out the
+    // start timeout and kill a proxy that is serving, and the socket's backlog would drain
+    // into a restart loop. Also `exec`/`forking`, which would change what systemd waits for.
+    if get("Type") != Some("simple") {
+        v(
+            "proxy-type",
+            format!("Type= is {:?}, not simple", get("Type")),
         );
     }
     // Catches a proxy that runs as root (the front door parses bytes from the internet) or
@@ -233,14 +238,14 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-proxy.socket",
-        "ListenStream=8443\n",
+        "ListenStream=8980\n",
         "ListenStream=443\n",
         "proxy-socket-port",
     ),
     (
         "kbf-proxy.socket",
-        "ListenStream=8443\n",
-        "ListenStream=8443\nListenStream=8444\n",
+        "ListenStream=8980\n",
+        "ListenStream=8980\nListenStream=8981\n",
         "proxy-socket-port",
     ),
     (
@@ -260,6 +265,24 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "\nKillMode=process\n",
         "\n",
         "proxy-kill",
+    ),
+    (
+        "kbf-proxy.socket",
+        "ListenStream=8980\n",
+        "ListenStream=8443\n",
+        "proxy-socket-port",
+    ),
+    (
+        "kbf-proxy.service",
+        "\nType=simple\n",
+        "\nType=notify\n",
+        "proxy-type",
+    ),
+    (
+        "kbf-proxy.service",
+        "RuntimeDirectory=kbf-proxy\n",
+        "RuntimeDirectory=kbf\n",
+        "proxy-state",
     ),
     (
         "kbf-proxy.service",

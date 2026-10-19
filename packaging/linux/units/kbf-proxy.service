@@ -10,7 +10,8 @@
 # service runs as the frontend's own user and only executes the releases the root half
 # staged (/var/lib/kbf-installer/releases/<commit>/kbf, world-readable). It replaces the
 # kbf-frontend@.service instances on a host that uses it: the proxy starts slot a and slot b
-# itself (`kbf --mode=frontend --instance=a|b`), so enable one or the other, never both.
+# itself (`kbf --mode=frontend`, each slot on its own loopback ports; no `--instance`: the
+# two slots do not hand over to each other), so enable one or the other, never both.
 #
 # The children are this unit's processes but not its main process. KillMode=process makes a
 # stop or restart of the proxy signal the proxy alone: the frontends keep serving the
@@ -33,6 +34,8 @@ ConditionPathExists=/etc/kbf/installer.toml
 StartLimitIntervalSec=0
 
 [Service]
+# simple, not notify: the verb never sends READY=1, so a notify unit would never finish
+# starting. The socket is already held, so a client that arrives meanwhile waits in the backlog.
 Type=simple
 # Not the daemon's user: the children it starts are frontends, which hold the state store
 # and the operator token, and run as kbf-server (as kbf-frontend@.service does). The state
