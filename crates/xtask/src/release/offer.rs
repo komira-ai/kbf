@@ -38,7 +38,7 @@ use kbf_gate::{
 
 use super::{ARTIFACTS_WORKFLOW, MAIN, verdict};
 use crate::Error;
-use crate::build_commit::full_commit;
+use crate::build_commit::not_full_commit;
 use crate::package::Platform;
 use crate::sums::{self, SUMS};
 
@@ -280,10 +280,8 @@ fn incomplete(dir: &Path, listed: &[String], commit: &str, platform: Platform) -
 
 /// Runs every check; the offer, or every problem found. Nothing is written.
 pub fn plan(r: &Request, attester: &dyn Attester) -> Result<OfferDoc, Error> {
-    full_commit("--commit", r.commit)?;
-    if let Some(p) = r.previous {
-        full_commit("--previous", p)?;
-    }
+    let commit = full_id("--commit", r.commit)?;
+    let previous = r.previous.map(|p| full_id("--previous", p)).transpose()?;
     if r.platforms.is_empty() {
         return Err(Error::Usage("at least one --platform is needed".to_owned()));
     }
@@ -390,12 +388,12 @@ pub fn plan(r: &Request, attester: &dyn Attester) -> Result<OfferDoc, Error> {
         version: kbf_gate::OFFER_VERSION,
         created: r.now,
         target: r.target,
-        commit: parse_id(r.commit)?,
+        commit,
         set_hash,
         platforms,
         beta,
         meta_log,
-        previous: r.previous.map(parse_id).transpose()?,
+        previous,
         previous_meta_log,
         reversible: reversible(meta_log, previous_meta_log),
     };
@@ -404,8 +402,13 @@ pub fn plan(r: &Request, attester: &dyn Attester) -> Result<OfferDoc, Error> {
     Ok(doc)
 }
 
-fn parse_id(s: &str) -> Result<CommitId, Error> {
-    CommitId::parse(s).map_err(|e| Error::Usage(e.to_string()))
+/// `s` as a commit id, if it is a full commit SHA (40 lowercase hex digits; a
+/// [`CommitId`] may also be 64, which a Git commit here is not).
+fn full_id(flag: &str, s: &str) -> Result<CommitId, Error> {
+    CommitId::parse(s)
+        .ok()
+        .filter(|_| s.len() == 40)
+        .ok_or_else(|| not_full_commit(flag, s))
 }
 
 fn read_beta(path: &Path) -> Result<ResultDoc, String> {
@@ -415,9 +418,14 @@ fn read_beta(path: &Path) -> Result<ResultDoc, String> {
         .map_err(|e| format!("--beta-result {} is no usable result: {e}", path.display()))
 }
 
+/// The bytes of `offer.json`; a document a reader would refuse is not rendered.
+fn render(doc: &OfferDoc) -> Result<Vec<u8>, Error> {
+    doc.to_bytes().map_err(|e| Error::Failed(e.to_string()))
+}
+
 /// Writes the offer to `out`, atomically.
 pub fn write(out: &Path, doc: &OfferDoc) -> Result<(), Error> {
-    let bytes = doc.to_bytes().map_err(|e| Error::Failed(e.to_string()))?;
+    let bytes = render(doc)?;
     write_atomic(out, &bytes).map_err(Error::spawn(format!("write {}", out.display())))
 }
 
@@ -548,7 +556,7 @@ pub fn run(a: &OfferArgs) -> Result<Vec<String>, Error> {
     let doc = planned?;
     let mut lines = summary(&doc);
     if a.plan {
-        let text = doc.to_bytes().map_err(|e| Error::Failed(e.to_string()))?;
+        let text = render(&doc)?;
         lines.push(format!("plan: would write {}:", a.out.display()));
         lines.push(String::from_utf8_lossy(&text).trim_end().to_owned());
     } else {

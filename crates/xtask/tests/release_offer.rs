@@ -628,6 +628,81 @@ fn usage_errors_are_refused_before_anything_is_read() {
     assert!(matches!(plan(&r, &a), Err(Error::Usage(_))));
 }
 
+#[test]
+fn a_commit_that_is_not_forty_lowercase_hex_digits_is_a_usage_error_naming_its_flag() {
+    // Mutants: the length filter dropped (a 64-digit id, valid for a CommitId, passes);
+    // `--previous` not checked; the flag left out of the message.
+    let f = fx("usage-commit");
+    let a = Recorded::all(C);
+    let usage = |r: Request| match plan(&r, &a) {
+        Err(Error::Usage(m)) => m,
+        Err(e) => panic!("expected a usage error, got {e}"),
+        Ok(_) => panic!("expected a usage error, got an offer"),
+    };
+    let long = "0".repeat(64);
+    let mut r = request(&f.dist, Evidence::Missing);
+    r.commit = &long;
+    let m = usage(r);
+    assert!(
+        m.starts_with("--commit ") && m.contains("40 lowercase hex"),
+        "{m}"
+    );
+    let upper = C.to_uppercase();
+    let mut r = request(&f.dist, Evidence::Missing);
+    r.previous = Some(&upper);
+    let m = usage(r);
+    assert!(m.starts_with("--previous ") && m.contains(&upper), "{m}");
+}
+
+#[test]
+fn an_identity_file_that_is_missing_or_not_json_is_refused_naming_the_flag_and_the_file() {
+    // Mutants: an open error read as "unknown" (the offer would be made, not reversible);
+    // a parse error read as "no meta_log".
+    let f = fx("rev-missing-or-junk");
+    let a = Recorded::all(C);
+    let w = Evidence::Waived {
+        reason: "r",
+        operator: "o",
+    };
+    let mut r = request(&f.dist, w);
+    let gone = f.root.join("gone.json");
+    r.version_json = Some(&gone);
+    let why = refused(plan(&r, &a));
+    assert!(
+        why.contains("--version-json") && why.contains("gone.json"),
+        "{why}"
+    );
+    let junk = f.root.join("junk.json");
+    std::fs::write(&junk, "not json at all").unwrap();
+    r.version_json = Some(&junk);
+    let why = refused(plan(&r, &a));
+    assert!(
+        why.contains("--version-json") && why.contains("not JSON"),
+        "{why}"
+    );
+}
+
+#[test]
+fn a_document_a_reader_would_refuse_is_not_written() {
+    // Mutants: `write` skipping the check (a refused document would reach the file);
+    // the error swallowed.
+    let f = fx("write-invalid");
+    let a = Recorded::all(C);
+    let w = Evidence::Waived {
+        reason: "r",
+        operator: "o",
+    };
+    let mut doc = plan(&request(&f.dist, w), &a).unwrap();
+    doc.platforms.clear();
+    let out = f.root.join("offer.json");
+    match write(&out, &doc) {
+        Err(Error::Failed(m)) => assert!(m.contains("no platform"), "{m}"),
+        Err(e) => panic!("expected Failed, got {e}"),
+        Ok(()) => panic!("an invalid document was written"),
+    }
+    assert!(!out.exists());
+}
+
 // ---- the CLI, against the fake gh ----
 
 struct Cli {
