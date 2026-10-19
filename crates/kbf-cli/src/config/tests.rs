@@ -134,3 +134,54 @@ fn the_template_refuses_a_flag_in_no_group() {
     let own = clap::Command::new("t").arg(clap::Arg::new("zz-ungrouped").long("zz-ungrouped"));
     let _ = template("t", &own, &BTreeSet::new());
 }
+
+fn refusals(text: &str) -> Result<(), String> {
+    check_own_tables(std::path::Path::new("/etc/kbf.toml"), text)
+}
+
+/// Catches a value where enrollment's table belongs being let through, or refused without
+/// naming the key and the file: each of the keys is reported on its own line, in the
+/// file's order, with the path.
+#[test]
+fn a_value_where_an_enrollment_table_belongs_is_refused_naming_key_and_file() {
+    let err =
+        refusals("node = 1\nstorage = \"http://x\"\ndaemon = true\n[enroll]\ntoken_file = \"t\"\n")
+            .unwrap_err();
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 3, "{err}");
+    for (line, key) in lines.iter().zip(["daemon", "node", "storage"]) {
+        assert_eq!(
+            *line,
+            format!(
+                "key `{key}` in /etc/kbf.toml is a value, but [{key}] is the enrollment's table: \
+                 it holds keys, not a value"
+            )
+        );
+    }
+}
+
+/// Catches the refusal reaching a key that is no table of enrollment (a mode's own flag
+/// written outside its table is another check's to report) or a real table of enrollment.
+#[test]
+fn a_value_outside_enrollments_tables_and_enrollments_tables_themselves_pass() {
+    assert_eq!(
+        refusals("listen = \"0.0.0.0:1\"\n[node]\nid = \"a\"\n"),
+        Ok(())
+    );
+    assert_eq!(refusals(""), Ok(()));
+}
+
+/// Catches the empty group name being taken for a table of enrollment: `KEYS` lists the
+/// top-level keys under the empty name, and a quoted empty key is a value like any other
+/// stray one, not "the enrollment's table []".
+#[test]
+fn an_empty_key_is_not_an_enrollment_table() {
+    assert_eq!(refusals("\"\" = 1\n"), Ok(()));
+}
+
+/// Catches text that is not TOML being refused here: the parser that reads it next names
+/// the syntax error, with its line; this check says nothing, so it cannot hide it.
+#[test]
+fn text_that_is_not_toml_is_left_to_the_parser_that_reads_it_next() {
+    assert_eq!(refusals("node = = 1\n[unclosed\n"), Ok(()));
+}

@@ -42,7 +42,11 @@
 //! - an `Offer` from a daemon is not read: offers go the other way.
 //!
 //! A server given a [`MapSource`] ([`WorkerService::with_map`]) names its map in
-//! `Welcome`, and sends a `MapUpdate` each time the source's map changes.
+//! `Welcome`, and sends a `MapUpdate` each time the source's map changes. A server given
+//! [`Offers`] ([`WorkerService::with_offers`]) sends each node an `UpdateOffer` for its
+//! platform right after `Welcome` (when a complete release is desired for it) and again at
+//! each change; a node on a platform no release is built for is sent none. The platform is
+//! read from the first `Hello`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -64,6 +68,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::farm::{Farm, Outbound, Reported, StreamId};
 use crate::identity::{PeerCert, Peers, presented};
 use crate::map_push::MapFeed;
+use crate::release::offers::{OfferFeed, Offers, platform_of};
 
 /// The `kbf.worker.v1` version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -71,6 +76,16 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// The oldest version it accepts. The protocol promises N-1 and N; version 1 is the
 /// first, so there is no N-1 yet.
 pub const OLDEST_PROTOCOL_VERSION: u32 = 1;
+
+/// The protocol version a wire field names: `None` for 0. Versions start at 1, and
+/// proto3 cannot tell a 0 from a field the sender never set (a `Hello` or a storage
+/// registration from a build that predates the field, or a stored row written before
+/// the field existed), so a 0 is a node whose version is not known and not a node that
+/// speaks version 0.
+#[must_use]
+pub const fn named_protocol(wire: u32) -> Option<u32> {
+    if wire == 0 { None } else { Some(wire) }
+}
 
 /// The `Worker` service over a [`Farm`].
 #[derive(Debug)]
@@ -80,6 +95,7 @@ pub struct WorkerService {
     heartbeat_interval: Duration,
     hello_wait: Duration,
     map: MapFeed,
+    offers: OfferFeed,
 }
 
 impl WorkerService {
@@ -98,6 +114,7 @@ impl WorkerService {
             heartbeat_interval,
             hello_wait,
             map: MapFeed::NONE,
+            offers: OfferFeed::NONE,
         }
     }
 
@@ -106,6 +123,13 @@ impl WorkerService {
     #[must_use]
     pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
         self.map = MapFeed::new(map);
+        self
+    }
+
+    /// The service sending each node the `UpdateOffer` `offers` gives its platform.
+    #[must_use]
+    pub fn with_offers(mut self, offers: Arc<Offers>) -> Self {
+        self.offers = OfferFeed::new(offers);
         self
     }
 }
@@ -131,13 +155,11 @@ impl Worker for WorkerService {
                 "the first message of a session must be Hello",
             ));
         };
-        let version = hello.protocol_version;
-        if !(OLDEST_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
-            return Err(Status::failed_precondition(format!(
-                "protocol version {version} is not accepted; this server speaks \
-                 {OLDEST_PROTOCOL_VERSION} to {PROTOCOL_VERSION}"
-            )));
-        }
+        let version = negotiate(
+            hello.protocol_version,
+            OLDEST_PROTOCOL_VERSION,
+            PROTOCOL_VERSION,
+        )?;
         if hello.node_id.is_empty() {
             return Err(Status::invalid_argument("Hello has no node_id"));
         }
@@ -158,6 +180,7 @@ impl Worker for WorkerService {
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;
+        let platform = platform_of(&reported.caps);
         let stream = self.farm.register(
             &worker,
             instance,
@@ -169,6 +192,7 @@ impl Worker for WorkerService {
         tracing::info!(%worker, ?capacity, "worker registered");
         // After `register`, which queued the `Welcome`: the first update follows it.
         self.map.push(changes, &outbound);
+        self.offers.push(platform, &outbound);
         let session = Session {
             map: self.map.clone(),
             farm: Arc::clone(&self.farm),
@@ -183,6 +207,22 @@ impl Worker for WorkerService {
             |mut responses| async move { responses.recv().await.map(|m| (m, responses)) },
         ))))
     }
+}
+
+/// The version a session speaks, which `Welcome` names: the version the `Hello` names
+/// (`hello`), when it lies in `oldest..=newest` (so it is also the lesser of `hello`
+/// and `newest`). A daemon checks that `Welcome` names the version it sent, so naming
+/// `newest` instead would end every session of an older daemon this server accepts.
+///
+/// # Errors
+/// FAILED_PRECONDITION: `hello` is below `oldest` or above `newest`.
+fn negotiate(hello: u32, oldest: u32, newest: u32) -> Result<u32, Status> {
+    if !(oldest..=newest).contains(&hello) {
+        return Err(Status::failed_precondition(format!(
+            "protocol version {hello} is not accepted; this server speaks {oldest} to {newest}"
+        )));
+    }
+    Ok(hello)
 }
 
 /// One stream after its first `Hello`.
@@ -320,7 +360,8 @@ pub(crate) fn message(message: server_message::Message) -> ServerMessage {
     }
 }
 
-/// What a `Hello` reports: [`capacity`], [`caps`] and [`phase`].
+/// What a `Hello` reports: [`capacity`], [`caps`] and [`phase`], and the version it
+/// speaks ([`named_protocol`] of `protocol_version`).
 ///
 /// # Errors
 /// Any of the three is malformed.
@@ -329,6 +370,7 @@ pub fn reported(hello: &Hello) -> Result<Reported, String> {
         capacity: capacity(hello)?,
         caps: caps(hello)?,
         phase: phase(hello)?,
+        protocol: named_protocol(hello.protocol_version),
     })
 }
 
@@ -410,4 +452,53 @@ fn entry(capabilities: &[Capability], key: &str) -> Result<Option<u64>, String> 
         })
     })
     .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::Code;
+
+    use super::{named_protocol, negotiate};
+
+    /// Catches: a wire 0 (a field its sender never set) taken for a version, so that a
+    /// node naming none would read as speaking version 0 and pull the oldest version of
+    /// a list down to it; and a version that is changed or dropped on the way.
+    #[test]
+    fn a_wire_zero_names_no_protocol_and_any_other_number_is_itself() {
+        assert_eq!(named_protocol(0), None);
+        assert_eq!(named_protocol(1), Some(1));
+        assert_eq!(named_protocol(u32::MAX), Some(u32::MAX));
+    }
+
+    /// Catches: a `Welcome` that names the server's newest version (the integration
+    /// tests speak version 1 to a server of version 1, so they cannot tell it from the
+    /// `Hello`'s own), or the greater of the two; and an accepted range with a bound
+    /// moved in (the oldest or the newest version refused).
+    #[test]
+    fn a_hello_in_range_is_answered_with_its_own_version() {
+        for hello in 1..=3 {
+            assert_eq!(negotiate(hello, 1, 3).expect("in range"), hello);
+        }
+        assert_eq!(negotiate(1, 1, 1).expect("the only version"), 1);
+    }
+
+    /// Catches: a version below the oldest or above the newest accepted (a bound moved
+    /// out by one, or the check dropped), the wrong code, and a message that does not
+    /// name the version refused and the range the server speaks.
+    #[test]
+    fn a_hello_out_of_range_is_refused_naming_the_range() {
+        for hello in [0, 4, u32::MAX] {
+            let status = negotiate(hello, 1, 3).expect_err("out of range");
+            assert_eq!(status.code(), Code::FailedPrecondition, "{hello}");
+            let said = format!("protocol version {hello} is not accepted");
+            assert!(status.message().contains(&said), "{}", status.message());
+            assert!(status.message().contains("1 to 3"), "{}", status.message());
+        }
+        assert_eq!(
+            negotiate(2, 1, 1)
+                .expect_err("above the only version")
+                .code(),
+            Code::FailedPrecondition
+        );
+    }
 }

@@ -3,7 +3,7 @@
 //!
 //! A drain refuses every new Execute UNAVAILABLE and lets the open streams run until
 //! their action is done (Buck2 does not recover a stream that breaks, so ending one
-//! fails its action: komira-build-farm#791). It takes the server out of `/readyz` and
+//! fails its action: kbf#791). It takes the server out of `/readyz` and
 //! the health service, and sends GOAWAY to the REAPI listener's connections, which then
 //! stop accepting. The serving future returns once the REAPI connections have closed.
 //!

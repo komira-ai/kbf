@@ -522,7 +522,6 @@ impl Cell {
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
             reapi_tls: None,
             worker_tls: None,
-            proxy: None,
             heartbeat_interval: INTERVAL,
             hello_wait: HELLO_WAIT,
             tick: Duration::from_millis(50),

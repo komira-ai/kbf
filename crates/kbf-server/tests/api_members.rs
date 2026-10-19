@@ -3,10 +3,13 @@
 
 #[path = "support/hooked.rs"]
 mod hooked;
+#[path = "support/looks.rs"]
+mod looks;
 mod support;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use hooked::Hooked;
@@ -18,6 +21,7 @@ use kbf_server::storage_health::Debts;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{Cond, ManualClock, Store, Txn};
+use prost::Message as _;
 use serde_json::{Value, json};
 use support::{HELLO_WAIT, INTERVAL};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,6 +29,11 @@ use tokio::net::TcpStream;
 
 const TTL: Duration = Duration::from_secs(30);
 const DWELL: Duration = Duration::from_secs(120);
+
+/// The tick of every server here: one that does not come within a test. The update controller
+/// looks at every tick, and its reads of the store meet the faults that a test arms for a
+/// request (`support/looks.rs` says why). No test here waits for a tick.
+const TICK: Duration = Duration::from_secs(3600);
 
 fn config() -> MembershipConfig {
     MembershipConfig {
@@ -41,10 +50,9 @@ fn listeners() -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        proxy: None,
         heartbeat_interval: INTERVAL,
         hello_wait: HELLO_WAIT,
-        tick: Duration::from_millis(50),
+        tick: TICK,
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
@@ -146,6 +154,12 @@ async fn http(api: SocketAddr, method: &str, path: &str, headers: &str) -> (u16,
     (code, head.to_owned(), body.to_owned())
 }
 
+/// The view before the first member has registered: no map, so no version known and none
+/// unknown.
+fn empty() -> Value {
+    json!({ "generation": 0, "members": [], "oldest_protocol": null, "protocol_unknown": 0 })
+}
+
 async fn members(api: SocketAddr) -> Value {
     let (code, head, body) = http(api, "GET", "/v1/members", "").await;
     assert_eq!(code, 200, "{body}");
@@ -165,10 +179,7 @@ async fn members(api: SocketAddr) -> Value {
 async fn no_map_is_empty_and_no_state_store_is_not_found() {
     let (_clock, _fake, state) = store();
     let with = start(Some(state));
-    assert_eq!(
-        members(with.api).await,
-        json!({ "generation": 0, "members": [] })
-    );
+    assert_eq!(members(with.api).await, empty());
 
     let without = start(None);
     let (code, _, body) = http(without.api, "GET", "/v1/members", "").await;
@@ -204,8 +215,10 @@ async fn a_registered_member_is_listed_and_active_once_promoted() {
     assert_eq!(
         joined["members"],
         json!([
-            { "id": a.id.0, "addr": "192.0.2.1:8982", "state": "joining", "weight": 1 },
-            { "id": b.id.0, "addr": "192.0.2.2:8982", "state": "joining", "weight": 3 },
+            { "id": a.id.0, "addr": "192.0.2.1:8982", "state": "joining", "weight": 1,
+              "protocol": PROTOCOL },
+            { "id": b.id.0, "addr": "192.0.2.2:8982", "state": "joining", "weight": 3,
+              "protocol": PROTOCOL },
         ])
     );
 
@@ -270,6 +283,203 @@ async fn a_draining_or_expired_member_shows_its_state_until_it_leaves() {
     assert_eq!(state_of(&view, c.id), None, "{view}");
 }
 
+/// Storage node `i` whose newest protocol is `protocol`. Only the oldest end of a build's
+/// range judges a registration, so a node newer than the frontend's own constant is
+/// accepted, and the versions a test registers can differ from it and from each other.
+fn speaking(i: u32, protocol: u32) -> Registrant {
+    Registrant {
+        protocol,
+        ..registrant(i, 1)
+    }
+}
+
+/// What each member's entry says of its protocol, in the map's order.
+fn protocols_of(view: &Value) -> Value {
+    let members = view["members"].as_array().expect("a list");
+    Value::Array(members.iter().map(|m| m["protocol"].clone()).collect())
+}
+
+/// Catches: a registration's protocol not written to the row (every member would show
+/// none), shown for another member, or shown as the frontend's own constant; a heartbeat
+/// or a state change that rewrites the row without it; a new registration of the same
+/// member that does not replace it (a node restarted on a newer build keeps its old
+/// number); the envelope's oldest taken as the greatest, the first or the last; and the
+/// envelope fields nested under a key of their own. The least is the middle member's.
+#[tokio::test]
+async fn a_member_lists_the_protocol_it_registered_naming() {
+    let (_clock, fake, state) = store();
+    let server = start(Some(state));
+    let frontend = other_frontend(&fake);
+    frontend.register(&speaking(1, 3)).expect("a");
+    let b = frontend.register(&speaking(2, 2)).expect("b");
+    frontend.register(&speaking(3, 5)).expect("c");
+    let view = members(server.api).await;
+    assert_eq!(protocols_of(&view), json!([3, 2, 5]), "{view}");
+    assert_eq!(view["oldest_protocol"], json!(2), "{view}");
+    assert_eq!(view["protocol_unknown"], json!(0), "{view}");
+
+    // A heartbeat and an administrator's state change rewrite the row, and keep it.
+    frontend
+        .heartbeat(b.id, b.boot, Progress::CaughtUp, Debts::Unknown, None)
+        .expect("beat");
+    frontend.set_state(b.id, MemberState::Draining).expect("b");
+    let view = members(server.api).await;
+    assert_eq!(protocols_of(&view), json!([3, 2, 5]), "{view}");
+
+    // The node restarts on a newer build: its registration replaces the number.
+    let again = frontend.register(&speaking(2, 4)).expect("b again");
+    assert_eq!((again.id, again.boot > b.boot), (b.id, true));
+    let view = members(server.api).await;
+    assert_eq!(protocols_of(&view), json!([3, 4, 5]), "{view}");
+    assert_eq!(view["oldest_protocol"], json!(3), "{view}");
+}
+
+/// A member row as a build that predates the protocol field wrote it: the same fields
+/// without tag 4.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RowBeforeProtocol {
+    #[prost(message, optional, tag = "1")]
+    member: Option<kbf_proto::kbf::map::v1::Member>,
+    #[prost(uint64, tag = "2")]
+    boot: u64,
+    /// The debts report, whose layout this test does not read.
+    #[prost(bytes = "vec", optional, tag = "3")]
+    report: Option<Vec<u8>>,
+}
+
+/// Catches: a row written before the field existed shown as a node that speaks version 0
+/// (it would be the oldest, below every real version, and not counted), shown as the
+/// frontend's own version, left out of the unknown count, or counted as known; and a
+/// fixture that is not the old layout (the row must differ from the one a registration
+/// writes now, or the test proves nothing).
+#[tokio::test]
+async fn a_row_written_before_the_field_is_unknown_and_never_the_oldest() {
+    let (_clock, fake, state) = store();
+    let server = start(Some(state));
+    let frontend = other_frontend(&fake);
+    frontend.register(&speaking(1, 3)).expect("a");
+    let b = frontend.register(&speaking(2, 2)).expect("b");
+    frontend.register(&speaking(3, 5)).expect("c");
+
+    let key = format!("member/{}", b.id.0);
+    let row = fake.get(&key).expect("store").expect("a live row");
+    let old = RowBeforeProtocol::decode(row.value.as_slice()).expect("a row");
+    assert_ne!(old.encode_to_vec(), row.value, "the field is on the row");
+    fake.txn(Txn::new().put_ttl(&key, old.encode_to_vec(), TTL, Cond::Version(row.version)))
+        .expect("store")
+        .expect("no conflict");
+
+    let view = members(server.api).await;
+    assert_eq!(protocols_of(&view), json!([3, null, 5]), "{view}");
+    assert_eq!(view["oldest_protocol"], json!(3), "{view}");
+    assert_eq!(view["protocol_unknown"], json!(1), "{view}");
+}
+
+/// Catches: the protocol moved to another tag, or to another wire type, of the stored
+/// row. The rows live in the store across builds, so the number one build writes is the
+/// number the next reads; only bytes spelled out by hand pin that, because a test that
+/// writes and reads through the same `Row` follows the tag wherever it goes (a row
+/// written at tag 5 round-trips, and reads as unknown to every build that has tag 4).
+/// The protocol is field 4 as a plain varint: the key byte is `4 << 3 | 0`, 0x20.
+#[test]
+fn the_protocol_is_field_four_of_the_stored_row_as_a_plain_varint() {
+    let (_clock, fake, _state) = store();
+    let frontend = other_frontend(&fake);
+    frontend.register(&speaking(1, 3)).expect("a");
+    let b = frontend.register(&speaking(2, 2)).expect("b");
+    let key = format!("member/{}", b.id.0);
+    let row = fake.get(&key).expect("store").expect("a live row");
+    let old = RowBeforeProtocol::decode(row.value.as_slice()).expect("a row");
+
+    // What a registration writes: the fields of the old layout, then field 4 holding 2.
+    let mut written = old.encode_to_vec();
+    written.extend_from_slice(&[0x20, 2]);
+    assert_eq!(row.value, written, "the protocol is not field 4 of the row");
+
+    // What a row with field 4 holding 5 is read as, whatever wrote it.
+    let mut by_hand = old.encode_to_vec();
+    by_hand.extend_from_slice(&[0x20, 5]);
+    fake.txn(Txn::new().put_ttl(&key, by_hand, TTL, Cond::Version(row.version)))
+        .expect("store")
+        .expect("no conflict");
+    let read = frontend.protocols().expect("rows");
+    assert_eq!(read.get(&b.id), Some(&Some(5)), "{read:?}");
+}
+
+/// Catches: a stored member row that does not decode skipped by the view, which would
+/// list the members and name every version it could read as if the farm were whole. A
+/// row the other readers of the rows fail on is wrong content in a store that is up:
+/// the whole view is `500`, as for a map that does not decode, and the one reading it
+/// is `200` again once the row is right.
+#[tokio::test]
+async fn a_member_row_that_does_not_decode_is_500_for_the_whole_view() {
+    let (_clock, fake, state) = store();
+    let server = start(Some(state));
+    let frontend = other_frontend(&fake);
+    frontend.register(&speaking(1, 3)).expect("a");
+    let b = frontend.register(&speaking(2, 2)).expect("b");
+    assert_eq!(
+        members(server.api).await["members"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    let key = format!("member/{}", b.id.0);
+    let row = fake.get(&key).expect("store").expect("a live row");
+    fake.txn(Txn::new().put_ttl(&key, b"not a row".to_vec(), TTL, Cond::Version(row.version)))
+        .expect("store")
+        .expect("no conflict");
+    let (code, _, body) = http(server.api, "GET", "/v1/members", "").await;
+    assert_eq!(code, 500, "{body}");
+    let why = serde_json::from_str::<Value>(&body).expect("JSON")["error"]
+        .as_str()
+        .expect("an error")
+        .to_owned();
+    assert!(why.contains("member row"), "{why}");
+
+    let fixed = fake.get(&key).expect("store").expect("the bad row");
+    fake.txn(Txn::new().put_ttl(&key, row.value, TTL, Cond::Version(fixed.version)))
+        .expect("store")
+        .expect("no conflict");
+    let view = members(server.api).await;
+    assert_eq!(protocols_of(&view), json!([3, 2]), "{view}");
+}
+
+/// Catches: a member the map still holds as `down`, whose row has expired with its
+/// heartbeats, shown with a number it no longer has (a default, or the frontend's own),
+/// or left out of the unknown count: it is in the map for the dwell and may come back.
+#[tokio::test]
+async fn a_member_whose_row_lapsed_names_no_protocol() {
+    let (clock, fake, state) = store();
+    let server = start(Some(state));
+    let frontend = other_frontend(&fake);
+    let a = frontend.register(&speaking(1, 3)).expect("a");
+    let b = frontend.register(&speaking(2, 2)).expect("b");
+    frontend.register(&speaking(3, 1)).expect("c");
+
+    // Only `a` and `b` keep beating: `c` lapses and is `down` in the map.
+    clock.advance(TTL - Duration::from_secs(1));
+    for registered in [&a, &b] {
+        frontend
+            .heartbeat(
+                registered.id,
+                registered.boot,
+                Progress::CaughtUp,
+                Debts::Unknown,
+                None,
+            )
+            .expect("beat");
+    }
+    clock.advance(Duration::from_secs(2));
+    frontend.refresh().expect("refreshed");
+    let view = members(server.api).await;
+    assert_eq!(view["members"][2]["state"], json!("down"), "{view}");
+    assert_eq!(protocols_of(&view), json!([3, 2, null]), "{view}");
+    assert_eq!(view["oldest_protocol"], json!(2), "{view}");
+    assert_eq!(view["protocol_unknown"], json!(1), "{view}");
+}
+
 /// Catches `/v1/members` behind a gate `/v1/nodes` does not have (the operator scripts
 /// call both the same way), and a write verb answered on a read path. The server has no
 /// token, so a read that needed one could not succeed.
@@ -290,35 +500,36 @@ async fn members_is_read_like_nodes_and_takes_no_write() {
     assert_eq!(code, 405);
 }
 
+/// The reads of `(update/desired, deny/)` the server makes by itself as it starts, with no
+/// release store: the update controller reads `update/desired` once (no release is desired),
+/// and the sweeper's refresh reads `deny/` ([`looks::Looks`]). A test that arms a fault first
+/// waits for them; the test at the end holds the numbers.
+const START_LOOKS: (usize, usize) = (1, 1);
+
 /// A server whose state store is the hooked fake, which the test makes fail.
-fn failing() -> (Arc<Hooked>, Server) {
-    let hooked = Hooked::new();
+fn failing(hooked: &Arc<Hooked>) -> Server {
     let state = StateStore {
-        store: Arc::clone(&hooked) as Arc<dyn Store>,
+        store: Arc::clone(hooked) as Arc<dyn Store>,
         epoch: EpochPolicy::Keep,
         members: config(),
         history: None,
     };
-    (hooked, start(Some(state)))
+    start(Some(state))
 }
 
-/// The error `GET /v1/members` answers once `arm` has set a fault. The server reads the
-/// store on its own timers too, and one of those reads can take the armed fault first;
-/// the fault is armed again until the request itself meets it.
+/// The error `GET /v1/members` answers once `arm` has set a fault. The fault is for the
+/// request: the server's own readers of the store have read all they do at start, which
+/// the caller has waited for (`START_LOOKS`), and not again within the test (`TICK` and the
+/// sweeper's beat).
 async fn error_of(api: SocketAddr, arm: impl Fn()) -> (u16, String) {
-    for _ in 0..200 {
-        arm();
-        let (code, _, body) = http(api, "GET", "/v1/members", "").await;
-        if code != 200 {
-            let why = serde_json::from_str::<Value>(&body).expect("JSON")["error"]
-                .as_str()
-                .expect("an error")
-                .to_owned();
-            return (code, why);
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the fault never reached the request");
+    arm();
+    let (code, _, body) = http(api, "GET", "/v1/members", "").await;
+    assert_ne!(code, 200, "the fault never reached the request: {body}");
+    let why = serde_json::from_str::<Value>(&body).expect("JSON")["error"]
+        .as_str()
+        .expect("an error")
+        .to_owned();
+    (code, why)
 }
 
 /// Catches a store that cannot be read answered as an empty farm or as a server bug:
@@ -328,7 +539,10 @@ async fn error_of(api: SocketAddr, arm: impl Fn()) -> (u16, String) {
 /// is gone.
 #[tokio::test]
 async fn a_store_that_fails_is_503_and_a_map_that_is_wrong_or_a_panic_is_500() {
-    let (hooked, server) = failing();
+    let hooked = Hooked::new();
+    let looks = looks::Looks::count(&hooked);
+    let server = failing(&hooked);
+    looks.done(START_LOOKS).await;
 
     let (code, why) = error_of(server.api, || {
         hooked
@@ -338,10 +552,7 @@ async fn a_store_that_fails_is_503_and_a_map_that_is_wrong_or_a_panic_is_500() {
     .await;
     assert_eq!(code, 503, "{why}");
     assert!(why.contains("injected"), "{why}");
-    assert_eq!(
-        members(server.api).await,
-        json!({ "generation": 0, "members": [] })
-    );
+    assert_eq!(members(server.api).await, empty());
 
     let (code, why) = error_of(server.api, || {
         hooked
@@ -359,4 +570,26 @@ async fn a_store_that_fails_is_503_and_a_map_that_is_wrong_or_a_panic_is_500() {
         .expect("no conflict");
     let (code, why) = error_of(server.api, || ()).await;
     assert_eq!(code, 500, "{why}");
+}
+
+/// Catches the wait of `Looks::done` being wrong, which the failing-store test above cannot
+/// show by itself (it would flake, or hang): the server's own reads of `update/desired` and
+/// `deny/` are `START_LOOKS` at start, and it reads nothing at all by itself after the wait,
+/// for as long as a test runs. A reader added beside the controller and the sweeper, a read
+/// added to one's look, or a tick that comes, makes the total more, and a fault armed after
+/// the wait would be met by one of them and not by its request; a read fewer makes a count
+/// less, and the wait never ends.
+///
+/// Mutants seen red: `START_LOOKS` of `(0, 1)` and of `(1, 0)` (the counts after the wait).
+#[tokio::test]
+async fn the_server_reads_the_store_by_itself_only_at_start() {
+    let hooked = Hooked::new();
+    let looks = looks::Looks::count(&hooked);
+    let every_read = hooked.count("");
+    let _server = failing(&hooked);
+    looks.done(START_LOOKS).await;
+    let at_start = every_read.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(looks.seen(), START_LOOKS);
+    assert_eq!(every_read.load(Ordering::SeqCst), at_start);
 }

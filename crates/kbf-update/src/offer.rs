@@ -51,39 +51,46 @@ impl Offer {
         }
         let mut names = BTreeSet::new();
         for c in &self.components {
-            if !COMPONENT_NAMES.contains(&c.name.as_str()) {
-                return Err(Refusal::UnknownComponent(c.name.clone()));
-            }
-            if !names.insert(c.name.as_str()) {
-                return Err(Refusal::DuplicateComponent(c.name.clone()));
-            }
-            if !is_hex(&c.sha256, 64) {
-                return Err(Refusal::Digest {
-                    name: c.name.clone(),
-                    sha256: c.sha256.clone(),
-                });
-            }
-            if c.size == 0 || c.size > MAX_COMPONENT_BYTES {
-                return Err(Refusal::Size {
-                    name: c.name.clone(),
-                    size: c.size,
-                });
-            }
-            if c.attestation.is_empty() || c.attestation.len() > MAX_ATTESTATION_BYTES {
-                return Err(Refusal::Attestation {
-                    name: c.name.clone(),
-                    len: c.attestation.len(),
-                });
-            }
+            check_component(&c.name, &c.sha256, c.size, c.attestation.len(), &mut names)?;
         }
         Ok(())
     }
+}
 
-    /// The bytes of every tarball together.
-    #[must_use]
-    pub fn total_size(&self) -> u64 {
-        self.components.iter().map(|c| c.size).sum()
+/// The limits on one component, shared by the offer and the order record built from it.
+/// `seen` holds the names already checked.
+pub(crate) fn check_component<'a>(
+    name: &'a str,
+    sha256: &str,
+    size: u64,
+    attestation_len: usize,
+    seen: &mut BTreeSet<&'a str>,
+) -> Result<(), Refusal> {
+    if !COMPONENT_NAMES.contains(&name) {
+        return Err(Refusal::UnknownComponent(name.to_owned()));
     }
+    if !seen.insert(name) {
+        return Err(Refusal::DuplicateComponent(name.to_owned()));
+    }
+    if !is_hex(sha256, 64) {
+        return Err(Refusal::Digest {
+            name: name.to_owned(),
+            sha256: sha256.to_owned(),
+        });
+    }
+    if size == 0 || size > MAX_COMPONENT_BYTES {
+        return Err(Refusal::Size {
+            name: name.to_owned(),
+            size,
+        });
+    }
+    if attestation_len == 0 || attestation_len > MAX_ATTESTATION_BYTES {
+        return Err(Refusal::Attestation {
+            name: name.to_owned(),
+            len: attestation_len,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -100,7 +107,6 @@ mod tests {
         let mut both = offer();
         both.components.push(component("kbf-daemon"));
         assert_eq!(both.check(PLATFORM), Ok(()));
-        assert_eq!(both.total_size(), 2000);
     }
 
     /// Catches (each case on its own) a check that is missing: every refusal must

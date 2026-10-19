@@ -294,7 +294,7 @@ pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
          priority: \"optional\"\n\
          maintainer: \"Komira <noreply@komira.com>\"\n\
          description: \"Root setup and update tool for the kbf build farm.\"\n\
-         homepage: \"https://github.com/komira-ai/komira-build-farm\"\n\
+         homepage: \"https://github.com/komira-ai/kbf\"\n\
          license: \"Apache-2.0\"\n\
          depends:\n{deb}\
          overrides:\n  rpm:\n    depends:\n{rpm}\

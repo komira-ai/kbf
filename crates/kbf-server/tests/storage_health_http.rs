@@ -57,7 +57,6 @@ fn start() -> Server {
         worker: loopback(),
         reapi_tls: None,
         worker_tls: None,
-        proxy: None,
         heartbeat_interval: Duration::from_secs(5),
         hello_wait: Duration::from_secs(10),
         tick: Duration::from_millis(50),

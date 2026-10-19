@@ -1,50 +1,32 @@
 //! The update client on the session: the node's status goes out after each Welcome and on
-//! every change; offers are fetched and orders written through the client; and while an
-//! accepted activation holds the update gate the node offers no capacity and refuses every
-//! Start. The client and the helper's status file are real; the release bytes come from
-//! memory and the helper is the test.
+//! every change; offers are remembered and orders written to the order spool through the
+//! client; and while an accepted activation holds the update gate the node offers no
+//! capacity and refuses every Start. The client and the installer's status file are real;
+//! the installer is the test.
 
 mod support;
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::future::BoxFuture;
 use kbf_daemon::{BUILD_COMMIT, UpdateLink};
 use kbf_proto::google::rpc::Code;
 use kbf_proto::update::update_order::Verb;
 use kbf_proto::update::update_status::State;
 use kbf_proto::update::{Component, UpdateOffer, UpdateOrder};
 use kbf_proto::worker::{Phase, daemon_message::Message};
-use kbf_update::{Chunks, Config, FetchError, Source, start};
-use sha2::{Digest as _, Sha256};
+use kbf_update::{Config, start};
 use support::{Harness, PROMPT, Peer};
 use tokio::task::JoinHandle;
 
 const PLATFORM: &str = "linux-x86_64";
 const LONG: Duration = Duration::from_secs(60);
 
-/// Release bytes in memory, by digest.
-#[derive(Default)]
-struct Blobs(Mutex<BTreeMap<String, Vec<u8>>>);
-
-impl Source for Blobs {
-    fn fetch(&self, sha256: &str) -> BoxFuture<'_, Result<Chunks, FetchError>> {
-        let data = self.0.lock().expect("lock")[sha256].clone();
-        let chunks: Vec<Result<Vec<u8>, FetchError>> =
-            data.chunks(100).map(|c| Ok(c.to_vec())).collect();
-        Box::pin(async move { Ok(Box::pin(futures::stream::iter(chunks)) as Chunks) })
-    }
-}
-
 /// A daemon with the update client over a scratch directory.
 struct Node {
     h: Harness,
     dir: PathBuf,
-    blobs: Arc<Blobs>,
     worker: JoinHandle<()>,
 }
 
@@ -63,7 +45,7 @@ fn commit(digit: char) -> String {
 fn helper_says(dir: &Path, state: &str, installed: &str, staged: &str, acked: u64) {
     let quote = |c: &str| format!("\"{c}\"").replace("\"\"", "null");
     let text = format!(
-        "{{\"schema\":1,\"installed_commit\":{},\"previous_commit\":null,\"staged_commit\":{},\
+        "{{\"schema\":2,\"installed_commit\":{},\"previous_commit\":null,\"staged_commit\":{},\
          \"state\":\"{state}\",\"refusal\":\"\",\"acked_order_id\":{acked},\"staged\":null}}",
         quote(installed),
         quote(staged)
@@ -78,41 +60,42 @@ impl Node {
         helper_says(&dir, "idle", "", "", 0);
         let mut config = Config::new(dir.clone(), PLATFORM.to_owned(), BUILD_COMMIT.to_owned());
         config.poll_every = Duration::from_millis(20);
-        let blobs = Arc::new(Blobs::default());
-        let (handle, worker) = start(config, Arc::clone(&blobs) as Arc<dyn Source>).expect("start");
+        let (handle, worker) = start(config).expect("start");
         let link = UpdateLink::new(handle);
         Self {
             h: Harness::with_update(name, run_for, link).await,
             dir,
-            blobs,
             worker: tokio::spawn(worker.run()),
         }
     }
 
-    /// The offer of `generation` for a tarball of `size` bytes, which the blobs hold.
-    fn offer(&self, generation: u64, size: usize) -> UpdateOffer {
-        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-        let sha256 = hex::encode(Sha256::digest(&data));
-        self.blobs
-            .0
-            .lock()
-            .expect("lock")
-            .insert(sha256.clone(), data);
+    /// The offer of `generation` for `commit`.
+    fn offer(&self, generation: u64, commit: &str) -> UpdateOffer {
         UpdateOffer {
             generation,
-            commit: commit('1'),
+            commit: commit.to_owned(),
             platform: PLATFORM.to_owned(),
             components: vec![Component {
                 name: "kbf".to_owned(),
-                sha256,
-                size: size as u64,
+                sha256: "ab".repeat(32),
+                size: 450,
                 attestation: b"{}\n".to_vec(),
             }],
+            protocol: 7,
+            min_protocol: 6,
+            state_schema: 3,
+            profile: "release".to_owned(),
         }
     }
 
+    /// The order record of `id` in `epoch`.
+    fn record(&self, epoch: u64, id: u64) -> PathBuf {
+        self.dir.join(format!("orders/{epoch:020}-{id:020}.json"))
+    }
+
+    /// The order record of `id` in epoch 0, the epoch of a bare Welcome.
     fn order_file(&self, id: u64) -> PathBuf {
-        self.dir.join(format!("inbox/orders/{id:020}.json"))
+        self.record(0, id)
     }
 }
 
@@ -123,6 +106,7 @@ fn order(id: u64, epoch: u64, verb: Verb, commit: &str) -> UpdateOrder {
         verb: verb as i32,
         commit: commit.to_owned(),
         window_s: 600,
+        generation: 3,
     }
 }
 
@@ -170,15 +154,20 @@ async fn the_status_is_sent_after_each_welcome_and_on_every_change() {
     assert!(first.helper_present);
     assert_eq!(first.offered_generation, 0);
 
-    peer.update_offer(node.offer(3, 450));
+    peer.update_offer(node.offer(3, &commit('1')));
     let fetched = peer
         .update_status(|s| s.offered_generation == 3 && s.state == State::Idle as i32)
         .await;
     assert_eq!(fetched.refusal, "");
-    let dir = node.dir.join(format!("inbox/{:020}-{}", 3, commit('1')));
-    assert!(
-        dir.join("offer.json").is_file(),
-        "the offer is in the inbox"
+    let written: Vec<_> = fs::read_dir(node.dir.join("orders"))
+        .expect("spool")
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(
+        written,
+        ["client.json"],
+        "an offer writes no record and no release bytes"
     );
 
     // A new stream: the same status again, after Welcome.
@@ -196,7 +185,7 @@ async fn the_status_is_sent_after_each_welcome_and_on_every_change() {
 async fn a_refused_offer_is_reported_with_its_reason() {
     let mut node = Node::new("update-refused", LONG).await;
     let mut peer = node.h.welcomed().await;
-    let mut offer = node.offer(1, 100);
+    let mut offer = node.offer(1, &commit('1'));
     offer.platform = "darwin-arm64".to_owned();
     peer.update_offer(offer);
     let refused = peer
@@ -255,6 +244,8 @@ async fn an_accepted_activation_closes_the_gate_until_the_helper_settles_it() {
     helper_says(&node.dir, "staged", &commit('8'), &target, 0);
     let mut peer = node.h.welcomed().await;
     peer.update_status(|s| s.helper_present).await;
+    peer.update_offer(node.offer(1, &target));
+    peer.update_status(|s| s.offered_generation == 1).await;
 
     peer.update_order(order(1, 0, Verb::Activate, &target));
     let accepted = peer.update_status(|s| s.acked_order_id == 1).await;
@@ -290,6 +281,8 @@ async fn an_activation_waits_for_every_lease_and_every_unacknowledged_result() {
     helper_says(&node.dir, "staged", &commit('8'), &target, 0);
     let mut peer = node.h.welcomed().await;
     peer.update_status(|s| s.helper_present).await;
+    peer.update_offer(node.offer(1, &target));
+    peer.update_status(|s| s.offered_generation == 1).await;
 
     // One lease running.
     peer.start(1, 1, "action");
@@ -315,6 +308,8 @@ async fn an_unacknowledged_result_counts_as_a_live_lease() {
     helper_says(&node.dir, "staged", &commit('8'), &target, 0);
     let mut peer = node.h.welcomed().await;
     peer.update_status(|s| s.helper_present).await;
+    peer.update_offer(node.offer(1, &target));
+    peer.update_status(|s| s.offered_generation == 1).await;
     peer.start(1, 1, "action");
     peer.result(PROMPT).await.expect("a Result");
 
@@ -352,18 +347,18 @@ async fn an_order_must_carry_the_epoch_of_the_session() {
         .update_status(|s| s.state == State::Refused as i32)
         .await;
     assert_eq!(stale.refusal, "order 1 is of epoch 6; this session's is 7");
-    assert!(!node.order_file(1).exists());
+    assert!(!node.record(7, 1).exists());
 
     first.update_order(order(1, 7, Verb::Confirm, &target));
     let accepted = first.update_status(|s| s.acked_order_id == 1).await;
     assert_eq!(accepted.refusal, "");
     // A replay: nothing is written again.
-    fs::write(node.order_file(1), "marker").expect("mark");
+    fs::write(node.record(7, 1), "marker").expect("mark");
     first.update_order(order(1, 7, Verb::Confirm, &target));
     first.update_order(order(2, 7, Verb::Confirm, &target));
     first.update_status(|s| s.acked_order_id == 2).await;
     assert_eq!(
-        fs::read_to_string(node.order_file(1)).expect("file"),
+        fs::read_to_string(node.record(7, 1)).expect("file"),
         "marker"
     );
 
@@ -390,6 +385,8 @@ async fn a_revert_opens_the_gate() {
     helper_says(&node.dir, "staged", &commit('8'), &target, 0);
     let mut peer = node.h.welcomed().await;
     peer.update_status(|s| s.helper_present).await;
+    peer.update_offer(node.offer(1, &target));
+    peer.update_status(|s| s.offered_generation == 1).await;
     peer.update_order(order(1, 0, Verb::Activate, &target));
     hello_in(&mut peer, Some(Phase::Quarantined)).await;
     peer.update_order(order(2, 0, Verb::Revert, &commit('8')));

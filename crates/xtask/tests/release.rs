@@ -11,7 +11,7 @@ use sha2::Digest;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
-const REPO: &str = "komira-ai/komira-build-farm";
+const REPO: &str = "komira-ai/kbf";
 /// The kind of attestation of a bundle a host verifies a tarball with.
 const PROVENANCE: &str = "https://slsa.dev/provenance/v1";
 const COMMIT: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";

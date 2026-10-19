@@ -63,7 +63,6 @@ fn listeners() -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        proxy: None,
         heartbeat_interval: INTERVAL,
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),

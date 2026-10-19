@@ -111,80 +111,109 @@ impl Scheduler {
         self.term = term;
         self.next_op = next_operation.0;
         self.next_seq = next_seq;
-        let until = self.now.saturating_add(LEASE_GRACE);
         for recovered in operations {
-            let Recovered {
-                operation: id,
+            self.take_up(recovered);
+        }
+    }
+
+    /// Takes up one operation a running scheduler does not hold, as [`Scheduler::recover`]
+    /// does at start: the store holds it (another writer queued it, or this one queued it
+    /// and never learned the write landed), and a request for the same action joins it. The
+    /// ids handed out from now on are past its id.
+    ///
+    /// An operation this scheduler already holds is left as it is, and `false` is
+    /// returned: the store's rows of an operation are removed when its finish is written,
+    /// which can be later than the scheduler finishing it, so a row that outlives the
+    /// scheduler's own copy is no news. Taking it up again would put a finished
+    /// operation back in the queue (a second run) over the answer held for it.
+    pub fn take_in(&mut self, recovered: Recovered) -> bool {
+        self.skip_to(OperationId(recovered.operation.0 + 1));
+        if self.ops.contains_key(&recovered.operation) {
+            return false;
+        }
+        self.take_up(recovered);
+        true
+    }
+
+    /// Hands out ids from `next` on, if that is past the next one: the store's counter
+    /// is ahead of this scheduler's (it holds an operation this scheduler never saw).
+    pub fn skip_to(&mut self, next: OperationId) {
+        self.next_op = self.next_op.max(next.0);
+    }
+
+    fn take_up(&mut self, recovered: Recovered) {
+        let until = self.now.saturating_add(LEASE_GRACE);
+        let Recovered {
+            operation: id,
+            request,
+            waiter,
+            lease,
+            losses,
+            fate,
+        } = recovered;
+        let mut request = request;
+        let Fate {
+            booked_bytes,
+            memory_runs,
+            farm_runs,
+            avoid,
+            not_started,
+        } = fate.unwrap_or_default();
+        if booked_bytes > 0 {
+            // A booking never falls: the store's request may carry a larger one than
+            // the row (a floor applied at submit).
+            let memory = &mut request.resources.memory_bytes;
+            *memory = (*memory).max(booked_bytes);
+        }
+        self.memory.restore(id, memory_runs);
+        if request.joinable() {
+            self.in_flight.insert(request.key.clone(), id);
+        }
+        let committed_lease = lease.as_ref().map(|l| l.lease);
+        let state = match lease {
+            Some(RecoveredLease { lease, worker }) => {
+                // A session no worker has: the heartbeat reconcile takes the lease
+                // for one that went to an earlier session of the process.
+                let sent = StartSent {
+                    at: self.now,
+                    session: u64::MAX,
+                    process: 0,
+                };
+                let held = Held {
+                    operation: id,
+                    booked: request.resources,
+                    device: None,
+                    start_sent: Some(sent),
+                };
+                self.held.insert(lease, held);
+                self.awaited.entry(worker.clone()).or_insert(until);
+                OpState::Leased {
+                    lease,
+                    worker,
+                    committed: true,
+                }
+            }
+            None => {
+                self.queue.insert((Reverse(request.qos.clone()), id));
+                OpState::Queued
+            }
+        };
+        self.ops.insert(
+            id,
+            Operation {
                 request,
-                waiter,
-                lease,
-                losses,
-                fate,
-            } = recovered;
-            let mut request = request;
-            let Fate {
-                booked_bytes,
-                memory_runs,
+                waiters: vec![waiter],
+                state,
+                committed_lease,
+                result_proposed: false,
+                gave_up: false,
+                unservable: None,
                 farm_runs,
                 avoid,
                 not_started,
-            } = fate.unwrap_or_default();
-            if booked_bytes > 0 {
-                // A booking never falls: the store's request may carry a larger one than
-                // the row (a floor applied at submit).
-                let memory = &mut request.resources.memory_bytes;
-                *memory = (*memory).max(booked_bytes);
-            }
-            self.memory.restore(id, memory_runs);
-            if request.joinable() {
-                self.in_flight.insert(request.key.clone(), id);
-            }
-            let committed_lease = lease.as_ref().map(|l| l.lease);
-            let state = match lease {
-                Some(RecoveredLease { lease, worker }) => {
-                    // A session no worker has: the heartbeat reconcile takes the lease
-                    // for one that went to an earlier session of the process.
-                    let sent = StartSent {
-                        at: self.now,
-                        session: u64::MAX,
-                        process: 0,
-                    };
-                    let held = Held {
-                        operation: id,
-                        booked: request.resources,
-                        device: None,
-                        start_sent: Some(sent),
-                    };
-                    self.held.insert(lease, held);
-                    self.awaited.entry(worker.clone()).or_insert(until);
-                    OpState::Leased {
-                        lease,
-                        worker,
-                        committed: true,
-                    }
-                }
-                None => {
-                    self.queue.insert((Reverse(request.qos.clone()), id));
-                    OpState::Queued
-                }
-            };
-            self.ops.insert(
-                id,
-                Operation {
-                    request,
-                    waiters: vec![waiter],
-                    state,
-                    committed_lease,
-                    result_proposed: false,
-                    gave_up: false,
-                    unservable: None,
-                    farm_runs,
-                    avoid,
-                    not_started,
-                    losses,
-                },
-            );
-        }
+                losses,
+            },
+        );
     }
 
     /// Books the recovered leases of `id`, which is registering as `worker`, on it.

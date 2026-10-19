@@ -7,7 +7,7 @@
 //! | key | value | lives |
 //! |---|---|---|
 //! | `instance/<instance id>` | the member id | for ever: a node that returns keeps its id |
-//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter and its newest debts report | `ttl` after the last heartbeat |
+//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter, its newest debts report and the protocol version it registered naming | `ttl` after the last heartbeat |
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
 //! | `meta/members_formed` | nothing | for ever: the cluster has had an `Active` member |
@@ -38,12 +38,31 @@
 //! and a registration (which rewrites the row) starts without one. A promotion keeps it.
 //! [`Members::storage_health`] judges the rows ([`crate::storage_health`]).
 //!
+//! **Protocol.** The row keeps the protocol version the node named when it registered, for
+//! the operator view ([`Members::protocols`], `GET /v1/members`): a heartbeat and a state
+//! change keep it, a new registration replaces it, and nothing judges it after the
+//! registration. A row written before the field existed names none and reads as a node
+//! whose version is not known, never as version 0. The row lives `ttl` after the last
+//! heartbeat, so a member that went `Down` has no version either.
+//!
 //! **The map** is a function of the rows: [`Members::refresh`] reads `map`, `member/` and
 //! the `down/` marks, builds the next member list, and if it differs commits generation
 //! `g + 1` with the compare-and-set on `map`'s version and a check on every row it read,
 //! so a row that changed meanwhile fails the commit rather than being decided on stale
 //! reads. A conflict is read again; two frontends racing give one winner and one retry.
 //! Anyone may call it; the frontend does so after every change and on a timer.
+//!
+//! **The floor.** The map carries `min_protocol`, the oldest protocol a registration may name.
+//! The first map of an empty store has [`OLDEST_PROTOCOL`] (the oldest this build accepts,
+//! not its own newest [`PROTOCOL`]: a fresh store must not lock out the nodes a build still
+//! accepts), and every later map has the larger of the stored floor and this build's oldest,
+//! so the floor only rises. [`Members::register`] judges a node against that floor, read from
+//! the store. Nothing lowers it: a frontend rolled back to a build with a lower oldest keeps
+//! the stored floor and refuses the nodes the floor excludes, though that build would accept
+//! them (a rollback across a protocol bump is a flag day,
+//! `docs/design/frontend-proxy.md` section 9). Only registration judges the floor: storage
+//! nodes do not enforce `min_protocol` themselves, and a floor this build lifts reaches the
+//! stored map with the next change of members, not on its own.
 //!
 //! **Promotion.** A node's own request moves it in two ways only. A registration saying the
 //! index is whole ([`Progress::CaughtUp`]) writes `Active`, so a rolling restart leaves
@@ -86,6 +105,7 @@ use prost::Message as _;
 use tokio::sync::watch;
 
 use crate::storage_health::{Debts, MemberReport, Report, StorageHealth, storage_health};
+use crate::worker::named_protocol;
 
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
@@ -105,9 +125,14 @@ const MAX_VALUE: usize = 253;
 /// The longest reason a deny entry is stored with, in bytes.
 const MAX_REASON: usize = 512;
 
-/// The newest protocol version this build speaks, and the lowest a registration may
-/// name (the map's `min_protocol`).
-pub const PROTOCOL: u32 = 1;
+/// The newest protocol version this build speaks: the worker protocol's, so the two
+/// cannot drift (`kbf --version --json` reports one number for the whole binary).
+pub const PROTOCOL: u32 = crate::worker::PROTOCOL_VERSION;
+
+/// The oldest protocol version this build accepts from a storage node: the worker
+/// protocol's, for the same reason. It is the floor (the map's `min_protocol`) of the
+/// first map a build makes.
+pub const OLDEST_PROTOCOL: u32 = crate::worker::OLDEST_PROTOCOL_VERSION;
 
 /// How long rows live and how many owners a digest has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,8 +286,8 @@ pub enum MembershipError {
     Map(#[from] MapError),
 }
 
-/// A stored member row: the member as the map will hold it, its boot counter and the
-/// newest debts report.
+/// A stored member row: the member as the map will hold it, its boot counter, the newest
+/// debts report and the protocol version its node registered with.
 #[derive(Clone, PartialEq, prost::Message)]
 struct Row {
     #[prost(message, optional, tag = "1")]
@@ -271,6 +296,11 @@ struct Row {
     boot: u64,
     #[prost(message, optional, tag = "3")]
     report: Option<StoredReport>,
+    /// The `protocol` of the registration that wrote the row. 0 is absent: a row written
+    /// before this field existed (or by a registration that named none) reads as a node
+    /// whose version is not known ([`named_protocol`]).
+    #[prost(uint32, tag = "4")]
+    protocol: u32,
 }
 
 /// [`Report`] as stored.
@@ -310,6 +340,8 @@ struct Live {
     member: Member,
     boot: u64,
     report: Option<Report>,
+    /// What its registration named; `None` for a row that names none.
+    protocol: Option<u32>,
     version: Version,
 }
 
@@ -325,15 +357,24 @@ fn decode_row(stored: &Versioned) -> Result<Live, MembershipError> {
         member,
         boot: row.boot,
         report: row.report.as_ref().map(Report::from),
+        protocol: named_protocol(row.protocol),
         version: stored.version,
     })
 }
 
-fn encode_row(member: &Member, boot: u64, report: Option<&Report>) -> Vec<u8> {
+/// The value of the row of `member` at `boot`, for a node that registered naming
+/// `protocol`, with `report` as its newest debts report.
+fn encode_row(
+    member: &Member,
+    boot: u64,
+    protocol: Option<u32>,
+    report: Option<&Report>,
+) -> Vec<u8> {
     Row {
         member: Some(pb::Member::from(member)),
         boot,
         report: report.map(StoredReport::from),
+        protocol: protocol.unwrap_or(0),
     }
     .encode_to_vec()
 }
@@ -381,15 +422,25 @@ struct Plan {
     guards: Vec<(MemberId, Cond)>,
 }
 
+/// The floor (`min_protocol`) of the map a change of `current` makes, for a build that
+/// accepts nodes from protocol `oldest` on: `oldest` for the first map; after it the stored
+/// floor, lifted to `oldest` if that is higher. It never falls, so a build with a lower
+/// `oldest` (a rolled-back frontend) keeps the floor the map has. Pure.
+fn next_floor(current: Option<&Map>, oldest: u32) -> u32 {
+    current.map_or(oldest, |map| map.min_protocol().max(oldest))
+}
+
 /// The next map from the current one, the live rows, the live `down/` marks and the deny
-/// list the `deny/` rows give (`denied`: every entry once, sorted); `None` when it would
-/// not change (or there is no member to put in one). A change of `denied` alone is a change.
-/// Pure.
+/// list the `deny/` rows give (`denied`: every entry once, sorted), carrying `floor`
+/// ([`next_floor`]); `None` when it would not change (or there is no member to put in one). A
+/// change of `denied` alone is a change, and a `floor` that differs from the map's is not:
+/// it is lifted by the next change. Pure.
 fn plan(
     current: Option<&Map>,
     rows: &BTreeMap<MemberId, Live>,
     marks: &BTreeSet<MemberId>,
     denied: &[DenyEntry],
+    floor: u32,
     config: &MembershipConfig,
 ) -> Result<Option<Plan>, MapError> {
     let mut members: BTreeMap<MemberId, Member> = rows
@@ -432,7 +483,7 @@ fn plan(
         members,
         Rule::Rendezvous,
         r,
-        current.map_or(PROTOCOL, Map::min_protocol),
+        floor,
         denied.to_vec(),
     )?;
     Ok(Some(Plan {
@@ -467,17 +518,34 @@ pub struct Members {
     seen: Mutex<Seen>,
     /// Its generation (0 before any): [`MapSource::changes`].
     generation: watch::Sender<u64>,
+    /// The oldest protocol this build accepts: the least floor of any map it makes.
+    oldest: u32,
 }
 
 impl Members {
-    /// Membership kept in `store`.
+    /// Membership kept in `store`, for a build that accepts storage nodes from
+    /// [`OLDEST_PROTOCOL`] on.
     #[must_use]
     pub fn new(store: Arc<dyn Store>, config: MembershipConfig) -> Self {
+        Self::with_oldest_protocol(store, config, OLDEST_PROTOCOL)
+    }
+
+    /// Membership for a build that accepts storage nodes from protocol `oldest` on. Every
+    /// protocol constant is 1 today, so this is how a test stands in for a later build. Only
+    /// the oldest end of the range judges anything: a node that speaks newer than the
+    /// frontend speaks down to it, so the newest end has no role here.
+    #[must_use]
+    pub fn with_oldest_protocol(
+        store: Arc<dyn Store>,
+        config: MembershipConfig,
+        oldest: u32,
+    ) -> Self {
         Self {
             store,
             config,
             seen: Mutex::default(),
             generation: watch::Sender::new(0),
+            oldest,
         }
     }
 
@@ -530,20 +598,32 @@ impl Members {
     /// larger boot counter, writes its row as `Active` (`CatchingUp` if it is rebuilding
     /// its index, see the module docs), and rebuilds the map.
     ///
+    /// The node is judged against the floor of the map this registration makes
+    /// ([`next_floor`]: the stored map's, lifted to this build's oldest), so what the store
+    /// holds decides, not the build's constants. The map is read first, then the node's
+    /// protocol compared, and only then is an identity assigned: a refused node leaves no
+    /// row. The read is [`Members::current_map`], so it also publishes the stored map to
+    /// [`Members::view`] and [`MapSource::changes`], refused or not, and a registration costs
+    /// one more store read than it did. The read and the commit are not one transaction: a
+    /// floor another frontend raises between them is not applied to this call.
+    ///
     /// # Errors
-    /// [`MembershipError::Invalid`] or [`MembershipError::Protocol`] for a bad request;
-    /// [`MembershipError::Superseded`] if a newer registration of the instance won;
-    /// the store failing; [`MembershipError::Contended`].
+    /// [`MembershipError::Invalid`] for a bad request; the store failing (the map is read
+    /// before the protocol is judged, so a store that fails is this and not
+    /// [`MembershipError::Protocol`]); [`MembershipError::Protocol`] for a node below the
+    /// floor; [`MembershipError::Superseded`] if a newer registration of the instance won;
+    /// [`MembershipError::Contended`].
     pub fn register(&self, who: &Registrant) -> Result<Registration, MembershipError> {
         if who.instance_id.is_empty() || who.addr.is_empty() || who.weight == 0 {
             return Err(MembershipError::Invalid(
                 "an instance id, an address and a weight of at least 1 are required",
             ));
         }
-        if who.protocol < PROTOCOL {
+        let floor = next_floor(self.current_map()?.as_ref(), self.oldest);
+        if who.protocol < floor {
             return Err(MembershipError::Protocol {
                 got: who.protocol,
-                min: PROTOCOL,
+                min: floor,
             });
         }
         let (id, boot) = self.assign(&who.instance_id)?;
@@ -560,7 +640,7 @@ impl Members {
             // generation) even when nothing else about it did.
             boot,
         };
-        self.write_row(&member, boot)?;
+        self.write_row(&member, boot, named_protocol(who.protocol))?;
         let map = self.refresh()?.ok_or(MembershipError::NoMap)?;
         Ok(Registration { id, boot, map })
     }
@@ -591,9 +671,15 @@ impl Members {
     }
 
     /// Stores `member`'s row with a whole time to live, unless a newer boot is there, and
-    /// clears its `down/` mark. An `Active` row also writes `meta/members_formed`, in the
-    /// same transaction.
-    fn write_row(&self, member: &Member, boot: u64) -> Result<(), MembershipError> {
+    /// clears its `down/` mark. The row names the `protocol` this registration did, in
+    /// place of any an earlier boot wrote. An `Active` row also writes
+    /// `meta/members_formed`, in the same transaction.
+    fn write_row(
+        &self,
+        member: &Member,
+        boot: u64,
+        protocol: Option<u32>,
+    ) -> Result<(), MembershipError> {
         let key = member_key(member.id);
         for _ in 0..ATTEMPTS {
             let cond = match self.store.get(&key)? {
@@ -615,7 +701,12 @@ impl Members {
                 txn = txn.put(FORMED, Vec::new(), Cond::Any);
             }
             let txn = txn
-                .put_ttl(&key, encode_row(member, boot, None), self.config.ttl, cond)
+                .put_ttl(
+                    &key,
+                    encode_row(member, boot, protocol, None),
+                    self.config.ttl,
+                    cond,
+                )
                 .delete(down_key(member.id), Cond::Any);
             if self.store.txn(txn)?.is_ok() {
                 return Ok(());
@@ -715,7 +806,7 @@ impl Members {
             };
             let mut put = Txn::new().put_ttl(
                 &key,
-                encode_row(&live.member, live.boot, live.report.as_ref()),
+                encode_row(&live.member, live.boot, live.protocol, live.report.as_ref()),
                 ttl,
                 Cond::Version(stored.version),
             );
@@ -860,7 +951,16 @@ impl Members {
             // A deny written after this read is in the next refresh's map (the sweeper's,
             // within a beat): a row that is not there yet cannot be a precondition.
             let denied = self.denied()?;
-            let Some(plan) = plan(current.as_ref(), &rows, &marks, &denied, &self.config)? else {
+            let floor = next_floor(current.as_ref(), self.oldest);
+            let Some(plan) = plan(
+                current.as_ref(),
+                &rows,
+                &marks,
+                &denied,
+                floor,
+                &self.config,
+            )?
+            else {
                 current.iter().for_each(|m| self.publish(m));
                 return Ok(current);
             };
@@ -914,6 +1014,21 @@ impl Members {
         let now = self.store.now();
         let members: Vec<MemberReport> = members.into_values().collect();
         Ok(storage_health(&members, now, self.config.freshness()))
+    }
+
+    /// The protocol version each member with a live row registered naming (`None`: the row
+    /// names none, as a row written before the field existed). A member the map holds
+    /// whose row has lapsed (`Down`) is not here: its row, which held the version, expired
+    /// with the heartbeats, so a reader treats it as not known.
+    ///
+    /// # Errors
+    /// The store failing; a stored row not decoding.
+    pub fn protocols(&self) -> Result<BTreeMap<MemberId, Option<u32>>, MembershipError> {
+        Ok(self
+            .read_rows()?
+            .into_iter()
+            .map(|(id, live)| (id, live.protocol))
+            .collect())
     }
 
     fn read_rows(&self) -> Result<BTreeMap<MemberId, Live>, MembershipError> {

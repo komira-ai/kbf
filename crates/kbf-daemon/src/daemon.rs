@@ -1135,9 +1135,7 @@ mod tests {
     /// that repeats the wrapped error.
     #[tokio::test]
     async fn a_connect_error_names_its_cause() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = closed.local_addr().expect("addr").port();
-        drop(closed);
+        let port = kbf_testkit::port::dead_addr().port();
         let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{port}")).expect("url");
         let error = SessionError::from(endpoint.connect().await.expect_err("nothing listens"));
         let text = error.with_causes();
