@@ -41,6 +41,7 @@ Status: design for review, 2026-10-18, revised to the owner's answers of that da
 **Identity to the child.** The proxy strips every inbound `x-kbf-*` header, then sets `x-kbf-node-id`, `x-kbf-role` (from the verified certificate; absent when none) and `x-kbf-proxy-auth`, a per-boot secret.
 - The secret is 32 random bytes in a `0600` file under `/run/kbf-proxy/` (tmpfs, so per boot, and it survives a proxy restart so adopted children keep working). It is read at child start. Not argv, not env.
 - A child accepts identity headers only from a loopback peer that presents the secret (constant-time compare). Otherwise it ignores them and treats the caller as anonymous, so a local process without the secret cannot claim a node id. The child's own `Hello.node_id` check compares against `x-kbf-node-id` instead of the peer certificate.
+- The child's side of this contract (the flag, the gates, what is refused, and the limits) is `docs/api.md`, ["Who may write"](../api.md#who-may-write), section "Behind the farm's proxy".
 - Later alternative (U6): children on a Unix socket in a `kbf`-only directory, trusting `SO_PEERCRED`. It removes the secret, not the headers.
 - **Operator-API trust.** Any "Who may write" gate in `docs/api.md` that relies on "peer is loopback" is open to the public once a proxy forwards. Making those gates identity-header- or token-based is a **hard prerequisite of the proxy merging** (U4a).
 - **Pre-stream limits.** "No timeouts" applies to streams, not to the front door. There are handshake, preface and header timeouts (about 10 s), connection and per-IP caps, and rate limiting before any token check.
@@ -155,13 +156,14 @@ Open streams of the old process end when it exits; Execute clients retry and att
 | Key family | Old child (after takeover) | New child | Why no conflict |
 |---|---|---|---|
 | `lease/`, `op/` (queue, claim, requeue, assignment state), `epoch`, generation row | none (fenced) | writes | Every write checks the generation in its transaction; the old child's sticky flag stops it after the first `Fenced`. |
+| `inflight/<hex instance>/<action digest>` (the pin of the operation that runs an action) | none (fenced) | writes | Scheduler-owned and fenced like `op/`: written in the transaction that queues the operation, removed in the one that finishes it. The `<hex instance>` is the instance name of the request (the action's cache instance, any name a client sends), not the writing child's own instance id, so the own-instance-key rule below does not apply to it and a write-recording test must classify it with `op/`, not with the own-instance families. |
 | Member map, cordons, `update/*`, `desired`, release index, reconciler and controller state | none (fenced) | writes | Same fence. |
 | Run history and log rows for the streams the old child still serves (`history/<instance_id>/...`, `log/<instance_id>/...`) | appends | never writes under the old instance id | Keys are prefixed by the writing child's own instance id (a UUID per process). The new child never owns an old instance id, so the key sets are disjoint and each row has one writer. Appends are insert-only with a unique key, so a retry cannot clash. |
 | Its own heartbeat row (`frontend/<instance_id>`) | writes | writes its own | Keyed by instance id, as above. |
 | `done/` rows | reads only | writes | The old child follows them to finish its streams. |
 | CAS blob ownership, ByteStream metadata | idempotent inserts | idempotent inserts | Content-keyed, the same value from either writer. |
 
-The rule in code: a child after `Fenced` or `stand-down` may write only keys carrying its own instance id, plus the content-keyed data path. A test asserts this by running a write-recording store wrapper through a swap and failing on any other key from the old child.
+The rule in code: a child after `Fenced` or `stand-down` may write only keys carrying its own instance id, plus the content-keyed data path (`inflight/` carries the request's instance, not the child's, and is fenced with the scheduler rows). A test asserts this by running a write-recording store wrapper through a swap and failing on any other key from the old child.
 
 **Fence scope.** Scheduler, lease, requeue, reconcile, controller, `update/*` and `desired` writes are fenced. The rows above marked "appends"/"idempotent inserts" are exempt so streams on A do not fail mid-flight after takeover. A `QueryWriteStatus` for an upload that B does not know returns `committed_size = 0` so the client restarts cleanly.
 

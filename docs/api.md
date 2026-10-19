@@ -9,7 +9,7 @@ own address, given with `--api-listen`; without the flag there is no API. The st
 line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in clear
 text (h2c, with prior knowledge); every rule below holds for both.
 
-Reads answer anyone who reaches the address: bind it where only operators do. The
+Reads answer anyone who reaches the address: bind it where only operators do. (Behind the farm's proxy, `--proxy-auth-file`, only a loopback peer reaches it at all: [Who may write](#behind-the-farms-proxy).) The
 exceptions are the [enrollment routes](#v1enrolltokens-and-v1enrollnodes), which pass every
 gate of a write even to be read, and the build pages, [`GET /v1/invocations/{id}`](#get-v1invocationsid-and-below)
 and below, and [`GET /v1/blobs`](#get-v1blobsdigest), which run the REAPI policy and are
@@ -36,11 +36,13 @@ it must come from an operator. Where a request comes from does not show that:
   without a preflight, if the API accepts a "simple" request (`text/plain` or a form
   body, or no body).
 
-So a write must pass every one of these gates, in this order:
+So a write must pass every one of these gates, in this order (the loopback gate is first
+because the token must not cross a network, and it is not an identity: it never lets a
+write through without the token):
 
 | Gate | Refused with |
 |---|---|
-| the peer is loopback, so the token never crosses a network in clear | `403` |
+| the peer is loopback, so the token never crosses a network in clear; with `--proxy-auth-file`, the request must also present the proxy's secret (see [Behind the farm's proxy](#behind-the-farms-proxy)) | `403` |
 | the request has no `Origin` header (browsers send one with a cross-origin POST) | `403` |
 | the server was started with `--api-token-file` (without it, writes are off) | `403` |
 | `Authorization: Bearer <token>` with the file's token (the SHA-256 digests of both are compared in constant time, so neither the token's bytes nor its length show through timing) | `401`, with `WWW-Authenticate: Bearer` |
@@ -67,7 +69,62 @@ server's host that terminates TLS (`tailscale serve`, nginx). The proxy is what 
 the loopback gate pass, so the token is what stands between the network and the
 writes: forward the `Authorization` header unchanged, and expose only what the
 operators' network should reach. A proxy that adds an `Origin` header to every
-request turns writes off.
+request turns writes off. A server started without `--proxy-auth-file` cannot tell such
+a proxy from a local process: both are loopback peers. The farm's own proxy (below)
+is told apart by a secret.
+
+### Behind the farm's proxy
+
+`--proxy-auth-file <path>` says the server sits behind the farm's TLS-terminating proxy
+(`docs/design/frontend-proxy.md`, section 3). The file holds a per-boot secret of exactly
+32 bytes, owned by the server's user with mode `0600` or `0400` (the token file's checks);
+the server refuses to start otherwise. It is read at start, and never taken from the
+command line or the environment. The proxy presents the 32 bytes as 64 lower-case hex
+digits in `x-kbf-proxy-auth`. Then, on the operator API, the worker listener and the REAPI
+listener:
+
+- A request from an address that is not loopback is refused before anything reads it
+  (`403` on this API; `UNAUTHENTICATED` on gRPC).
+- A loopback request that does not present the secret, or presents a wrong one (compared in
+  constant time), is a local caller: its `x-kbf-*` headers mean nothing. On this API it may
+  read, as before, but **a write is refused `403` even with the token**: a write must come
+  through the proxy.
+- A loopback request that presents the secret is the proxy's. A write still needs every
+  other gate, the token included: the secret says who forwarded the request, not that the
+  caller may write.
+- Every `x-kbf-*` header is removed from every request, whatever the result, so nothing
+  past this check can read one. The proxy sets `x-kbf-node-id` and `x-kbf-role` for a call
+  whose client certificate it verified; the worker listener takes those (and no TLS flag)
+  in place of a certificate: the role table, the `Hello.node_id` binding, the blob calls
+  and `Membership`'s role check use them. A `Hello` whose node id is not the proxy's
+  `x-kbf-node-id` is refused `PERMISSION_DENIED`. A `Membership` registration
+  or heartbeat has no certificate names behind the proxy: the one name is the proxied node
+  id, so the host of its instance id and its address must be that name (up to ASCII case; an IP
+  address is refused). The proxied role must be `storage`.
+
+What the flag does not do, and what the proxy must do:
+
+- **Deny-list entries by `serial` or `spki-sha256` do nothing behind the proxy.** The child
+  sees no certificate, only the node id and role the proxy forwarded, so only a `node`
+  entry in `--worker-deny-list` can name a proxied caller. To revoke a certificate, list
+  its node, or have the proxy refuse the certificate. A server started with
+  `--proxy-auth-file` and a deny list holding a `serial` or `spki-sha256` entry logs a
+  warning at start naming the count. (Enforcing them would need the proxy to forward a
+  verified serial and key in a new header; that is the proxy's work, not this flag's.)
+- The storage listener (`kbf storage`, and the in-process one of all-in-one) is not behind
+  the proxy: it keeps its own mutual TLS and its own admission.
+- `--reapi-auth-policy mtls` finds no certificate on a proxied REAPI call and refuses every
+  call; use another policy behind the proxy until the proxy forwards the identity to it.
+- With the flag, `/metrics` and `/healthz` answer a loopback peer only, and a local `curl`
+  write is refused (see above).
+- The server cannot tell the proxy's `x-kbf-node-id` from a client's if the proxy forwards
+  a client's headers: the proxy must remove every client-supplied `x-kbf-*` header before
+  it adds its own. A call from a Unix-socket peer has no address and is refused. The
+  secret file must be owned by the user the server runs as, so the proxy and the server run
+  as one user.
+
+Without the flag, nothing changes: the headers do nothing (they are removed all the same),
+and the gates are the ones in the table.
 
 ## `GET /v1/nodes`
 
@@ -249,7 +306,7 @@ rebuild (a new cluster, a cache), or have it hold the slice first; and promote o
 member at a time. `draining` is the reverse: the member takes no new writes, its
 successor takes its slot at once, and it is read first.
 
-## `POST /v1/denied` and `DELETE /v1/denied`
+## `GET /v1/denied`, `POST /v1/denied` and `DELETE /v1/denied`
 
 An operator adds an entry to the storage deny list, or takes one off. A denied
 certificate is refused by every storage node on every method, and by the membership
@@ -280,11 +337,21 @@ map that holds it, which the call builds before it answers (`0` before any membe
 registered; the entry is in the first map then). An entry that is listed already answers
 `200` and keeps its first reason.
 
+`GET /v1/denied` lists the entries with the reasons they were added with:
+`{"denied": [{"entry": "serial a1b", "reason": "a lost laptop", "at_ms": 1791371800000}, ...]}`,
+serials first, then key hashes, then node ids, each in order, as the store's rows hold them
+now (the map the nodes hold lags the rows by up to a beat, and holds no reasons). `at_ms` is
+the store clock's milliseconds, Unix time on a running frontend. The list is empty
+(`{"denied": []}`) when nothing is denied. It passes the same gates as a write, the `GET`
+included, so the reasons reach only an operator, and its answer is `Cache-Control: no-store`.
+It assumes no single writer: every frontend over the store answers from the same rows, a
+frontend that is not the newest included. `404` on a server without a state store.
+
 `DELETE /v1/denied?entry=<entry>` takes the entry off (percent-encode it, or use `+` for the
 space): `200` with the same answer, `404` if it is not listed, `400` with no `entry` or one
 that is not an entry.
 
-Both need a token, a loopback peer, no `Origin` and `Content-Type: application/json` (a
+Both need a token, a loopback peer (one that presents the proxy's secret, with `--proxy-auth-file`), no `Origin` and `Content-Type: application/json` (a
 `DELETE` sends the header and no body), as every write does ([Who may
 write](#who-may-write)); `404` on a server without a state store; `503` when the state
 store cannot be written. A `503` that comes after the row was written leaves the row, and
@@ -308,8 +375,7 @@ storage access but keeps its work stream, and goes on receiving actions (their c
 environments and input digests), and its blob calls on that listener are served, until it
 is listed in `--worker-deny-list`, the file that listener reads
 ([worker-protocol.md](design/worker-protocol.md)). To take a daemon off the farm, list it in
-both. There is no `GET /v1/denied` either: the reasons are kept in the store, and the list
-itself is in the map.
+both. `GET /v1/denied` shows the list; `GET /v1/members` does not.
 
 **Locking yourself out.** An entry that names the frontend's own certificate (by serial or
 key, or a `node` that is the name in it) makes every storage node refuse the frontend. The
@@ -369,7 +435,9 @@ the drain, and the unit templates in `kbf-deploy` set it.
 --frontend --token-file F` and `kbf cluster undrain <node> --token-file F` (the API's
 `:uncordon`). It prints the answer's JSON, exits 0 on a 2xx and 1 otherwise, and takes
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
-restart it.
+restart it. `kbf cluster member <id> --state active|draining --token-file F` calls
+`POST /v1/members/{id}`, and `kbf cluster denied --token-file F` calls `GET /v1/denied`.
+`kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
 
 ## `/v1/enroll/tokens` and `/v1/enroll/nodes`
 
@@ -379,7 +447,7 @@ store, so a frontend that has no enrollment (until the enroll service lands, eve
 frontend) answers every one of these routes with `404` once the call passes the gates.
 
 **Every route here, a GET included, passes every gate of [Who may write](#who-may-write):**
-a loopback peer, no `Origin` header, the bearer token, and `Content-Type: application/json`
+a loopback peer (one that presents the proxy's secret, with `--proxy-auth-file`), no `Origin` header, the bearer token, and `Content-Type: application/json`
 (send it on a GET and a DELETE too, with no body). The list of tokens and nodes is the farm's
 door, so unlike `GET /v1/nodes` it is not open to whoever reaches the address. A refused
 call changes nothing. Every answer carries `Cache-Control: no-store`.
@@ -447,29 +515,6 @@ curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json'
 
 A UI comes later.
 
-## `/v1/object-stores/...` (**planned**)
-
-**Not built: every route here answers 404 today.** The routes register the farm's object
-store with the frontend, which keeps it as durable desired state and lets the storage nodes
-fetch it ([the design](design/object-store-registration.md)). Planned, each passing every
-gate of [Who may write](#who-may-write) on a GET too, with `Cache-Control: no-store`, and off
-(404) unless the frontend has a secrets directory:
-
-| Route | Does |
-|---|---|
-| `PUT /v1/object-stores/connections/{name}` | create or replace a connection (an endpoint and a key pair); idempotent |
-| `GET /v1/object-stores/connections` | list the connections, never a secret |
-| `GET /v1/object-stores/connections/{name}` | one connection, never a secret |
-| `DELETE /v1/object-stores/connections/{name}` | delete; `409 in_use` while bound |
-| `POST /v1/object-stores/connections/{name}:verify` | probe the store, change nothing |
-| `PUT /v1/object-stores/bindings/{role}` | bind the role `cold` to a connection, a bucket and a prefix |
-| `DELETE /v1/object-stores/bindings/{role}` | unbind; `409 in_use` once a node has applied it |
-| `GET /v1/object-stores` | the desired state, and which storage nodes have applied it |
-| `GET /v1/object-stores/audit?limit=` | the audit rows |
-
-The design page has the bodies, the error codes and the rotation runbook. Every verb of the
-API, built, open or planned, is in [the verbs table](design/operator-verbs.md).
-
 ## `GET /v1/storage`
 
 Whether every blob is known to have its copies elsewhere: the number a rollout asks
@@ -507,6 +552,274 @@ The number is as old as the newest heartbeat. A copy owed since then is not in i
 whoever acts on a zero keeps new writes away from the node first (drains it), then reads
 again. A member that left the map (a `DOWN` member leaves after the dwell) is not counted.
 `503` with `{"error": ...}` when the membership cannot be read.
+
+## The admin calls: `GET /v1/admin/role` and `POST /v1/admin/{quiesce,resume,takeover,stand-down}`
+
+A `kbf --mode frontend` started with `--admin-listen <addr>` serves these on a port of
+their own, separate from the operator API. The address must be a loopback address (any
+other is refused at start, in the flags and again when the port is bound), and the calls
+carry no credential: they move the scheduler's role, so nothing but the host's own
+processes may reach them. The port needs `--state-store`. The calls and the `role` answer
+are versioned by `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`).
+
+**`GET /v1/admin/role`**:
+
+```json
+{
+  "role": "active",
+  "instance_id": "5d1c4a52-8b0e-4f64-9a27-3c0e4f8d9a10",
+  "admin_protocol": 1,
+  "generation": 7,
+  "held_generation": 7,
+  "superseded": false,
+  "open_streams": 3,
+  "open_sessions": 2,
+  "reapi": "127.0.0.1:8980",
+  "worker": "127.0.0.1:8981",
+  "api": "127.0.0.1:8982"
+}
+```
+
+- `role`: `candidate` (started with `--await-takeover`: holds no generation and schedules
+  nothing), `active` (holds the generation and schedules), `quiesced` (holds it and has
+  stopped scheduling, assigning and requeueing) or `stood-down` (another process holds the
+  generation).
+- `instance_id`: a UUID, new for each process.
+- `generation`: the generation the state store is at now (`null` if it cannot be read);
+  `held_generation`: the one this process took (`null` for a candidate). A takeover passes
+  the holder's `generation` as `expect`.
+- `superseded`: the store has refused a write of this process because another writer holds
+  the generation.
+- `open_streams`: Execute and WaitExecution streams open; `open_sessions`: worker streams
+  open.
+- `reapi`, `worker`, `api`: the listeners. A candidate has no worker listener, and a
+  stood-down process has none again.
+
+Every call below answers `200` with this object after the call. A call that does not apply
+answers `409` with the object and an `error` naming why (`role`, or a generation); a body
+that is not what the call takes is `400`.
+
+**`POST /v1/admin/quiesce`** (active or quiesced): waits, for at most 10 seconds, for the
+Execute calls between their request and their queueing and the results being taken, then
+fences the farm: it feeds the scheduler nothing, so nothing is granted, assigned or
+requeued, a call that would queue is refused `UNAVAILABLE`, and a worker's result or
+heartbeat is not applied. It writes the requeues the store refused. Idempotent. Open
+streams and worker sessions stay open. While quiesced, a worker's heartbeat or result is not
+applied, so a quiesce is meant to last seconds (a takeover's limit is 10): one longer than
+the leases' expiry lets the scheduler expire the leases of work still running and requeue it
+when the process resumes. Nothing bounds it.
+
+**`POST /v1/admin/resume`** (quiesced or active): undoes a quiesce, for a takeover that did
+not happen. Refused with `409` when the store is no longer at `held_generation` or the
+store has refused a write of this process (another writer holds it: only `stand-down`
+applies). The farm fed the scheduler nothing while it was quiesced, so its memory is the
+store's as of the quiesce; nothing is reloaded.
+
+**`POST /v1/admin/takeover`**, body `{"expect": N}` (candidate only): takes the generation,
+which must be exactly `N` (a store at another generation is refused with `409` and nothing
+is written), keeps the epoch (daemons that redial keep the runs of their leases), reads all
+state from the store, and starts the scheduler, the reconciler and the worker listener on
+the sockets the candidate already bound. `500` if the generation was taken and the
+frontend could not start; the process then ends.
+
+**`POST /v1/admin/stand-down`** (active, quiesced or stood-down): the old holder's step
+after a takeover elsewhere. It ends the worker streams with `UNAVAILABLE` ("connect
+again"), stops the worker listener, goes not ready (`/readyz`, the health service) and
+answers the Execute and WaitExecution streams it kept from the `done/` rows the new
+holder writes, with no GOAWAY and no timeout. It does not give up the state store. It is
+not undone. A process that is never told to stand down but finds it is fenced (the store
+refused a write of its own: `superseded` turns true) fences its farm and answers its kept
+calls from the `done/` rows the same way. The process exits only when told to (`open_streams` and `open_sessions` say
+when it holds nothing).
+
+**A candidate** (`--await-takeover`, which needs `--admin-listen`) opens the state store
+without taking the generation, touches no epoch and writes nothing; it serves `/readyz`,
+`grpc.health.v1` and `GetCapabilities`, and no other REAPI call (`UNIMPLEMENTED`). It runs
+no scheduler or reconciler and binds no worker listener. It makes and changes no schema.
+A SQLite state file is held by one process (an exclusive file lock), so a candidate cannot
+run beside the process that holds the file: side by side needs the Postgres store.
+A start without `--await-takeover` takes the next generation and bumps the epoch, as any
+start does.
+
+## `/v1/object-stores/...`
+
+Registers the farm's object store with the frontend, which keeps it as durable desired state
+with a generation. A
+**connection** is a named endpoint plus a key pair; a **binding** maps a role to a
+connection, a bucket and a prefix. The only role is `cold`, today's `--cold-store`; `history`
+and `backup` answer `422 role_not_supported` until something consumes them. A role here is
+neither an IAM role nor an enrollment role.
+Every verb of the API is in [the verbs table](design/operator-verbs.md); the bodies, the error
+codes and the rotation runbook are in [the design](design/object-store-registration.md).
+
+The routes exist when the frontend is started with `--object-store-secrets-dir DIR` (which
+needs `--api-listen`, `--api-token-file` and `--state-store`). `DIR` holds one file of mode
+0600 per connection, `<name>.<version>.json`, in a directory made 0700; every frontend child
+that serves at once must be able to read it, and it must stay out of any backup of the host
+(the state store, and so `state-backup`, never holds a secret key). Without the flag every
+route answers `404` `not_enabled` to a caller who passed the gate.
+
+**Every route, a GET included, passes the whole gate of [Who may write](#who-may-write)**
+(loopback peer, no `Origin`, the bearer token, `Content-Type: application/json`), because
+the routes list and change the farm's store and the key to it. One token, no roles. A TLS
+proxy on the host reaches them from loopback and passes the gate: whether the proxy carries
+these routes is the operator's decision. Every answer, errors and `405` included, carries
+`Cache-Control: no-store`. A body is at most 16 KiB (`413 payload_too_large`) and refuses
+unknown fields. No route is fenced: two frontend children on one state store both serve them,
+and a lost race is `409 conflict`, never a lost write.
+
+| Route | Does |
+|---|---|
+| `PUT /v1/object-stores/connections/{name}` | create or replace; `201` created, `200` changed or unchanged |
+| `GET /v1/object-stores/connections` | `{connections: [...]}`, never a secret |
+| `GET /v1/object-stores/connections/{name}` | one connection, never a secret |
+| `DELETE /v1/object-stores/connections/{name}` | `{generation}`; `409 in_use` while a binding names it |
+| `POST /v1/object-stores/connections/{name}:verify` | probe the store, change nothing |
+| `PUT /v1/object-stores/bindings/{role}` | bind `cold`; `201` created, `200` changed or unchanged |
+| `DELETE /v1/object-stores/bindings/{role}` | `{generation}`; `409 in_use` once a node has applied it |
+| `GET /v1/object-stores` | the desired state and the nodes' convergence |
+| `GET /v1/object-stores/audit?limit=N` | the newest `N` audit rows (default 50, at most 500) |
+
+The design ([object-store-registration](design/object-store-registration.md)) has the rotation
+runbook; every verb of the API is in [the verbs table](design/operator-verbs.md).
+
+**Names.** `{name}` is `[a-z0-9][a-z0-9_-]{0,62}`, else `400 bad_name`: it becomes a file name
+and a URL segment, so `/`, `.`, `:` and NUL never reach the file system. `{role}` is `cold`.
+
+**`PUT .../connections/{name}`** takes `{endpoint, region?, access_key_id,
+secret_access_key, conditional_put?, min_put_rate?, expect_generation?, verify?}`.
+
+- `endpoint` is `http://host[:port]`: `https` answers `422 tls_unsupported` (the S3 client
+  speaks no TLS yet, so a registration would be accepted and fail on every node); anything
+  else that is not that answers `422 invalid_endpoint`. `access_key_id` and
+  `secret_access_key` are visible ASCII (at most 256 and 1024 characters), `region` is
+  `[a-z0-9-]` (at most 64): else `422 invalid_field`.
+- Changing `endpoint` of a bound connection answers `409 identity_change`; credentials,
+  region, `conditional_put` and `min_put_rate` change freely. The same body again changes
+  nothing (`200`, `changed: false`, the generation stays).
+- `expect_generation` that is not the registry's answers `409 generation_mismatch` and writes
+  nothing; without it the last writer wins and both are in the audit log.
+- `verify` (default `true`): when the connection is the one the `cold` binding names, the
+  frontend probes that bucket and prefix with the key being registered before it writes
+  anything, and a failed probe answers `422 probe_failed` with no row and no file. When no
+  binding names the connection there is no bucket to probe: `verified` is `null`, and the
+  connection is probed when it is bound and by `:verify`.
+- Answer: `{name, generation, changed, access_key_id, secret_set, verified}`, never the
+  secret or a digest of it.
+
+**`PUT .../bindings/{role}`** takes `{connection, bucket, prefix?, expect_generation?,
+verify?}`; `verify` (default `true`) probes the bucket with the connection's stored key
+first. `422 unknown_connection`, `invalid_bucket`, `invalid_prefix` and `probe_failed` write
+nothing. The store identity `(endpoint, bucket, prefix)` is immutable once bound
+(`409 identity_change`): moving to another store is a migration this API has no verb for.
+Answer: `{role, generation, changed, verified}`.
+
+**`POST .../connections/{name}:verify`** takes nothing, or `{bucket?, prefix?}`; without a
+bucket it uses the `cold` binding's, else `422 no_bucket`. It puts one small object under
+`<prefix>.kbf-probe/`, reads it back, checks that a second write is refused when the
+connection says `conditional_put`, and deletes it. `200 {name, verified}`, or `422
+probe_failed` with `verified` (`{ok, put, get, delete, conditional_put}`): the steps, never
+the store's words. The probe proves that *this frontend* can reach the store with this key;
+the frontend connects to an endpoint an operator typed, so it is bounded (20 seconds in all)
+and operator-only behind the token.
+
+**`GET /v1/object-stores`** answers `{generation, connections, bindings, convergence}`;
+`convergence` is `{converged, expected, applied, unsupported, nodes: [{id, state,
+applied_generation, status, last_seen_secs}]}`.
+
+- `status` is one of `ok`, `pending`, `probe_failed`, `identity_mismatch`, `unsupported`: a
+  closed code, never a node's own text. A node that reports `ok` at another generation is
+  shown `pending`.
+- `expected` counts active nodes that report the registration; draining and denied nodes
+  are listed but not counted. A node whose build does not report it at all is `unsupported`,
+  counted in `unsupported` and not in `expected`, and named in `nodes`, so version skew is not
+  mistaken for "not fetched yet".
+- `converged` is true only when at least one node is expected, every expected node has
+  applied the current generation with status `ok`, and none is `unsupported`. It never claims
+  more than the frontend knows: a frontend that has heard from no node says `false`.
+  **This build wires no source of node reports yet: `nodes` is empty and `converged` is `false`.**
+
+**`GET /v1/object-stores/audit`** answers `{entries: [{seq, at, action, subject, outcome,
+generation}]}`, newest first. A row names what was touched and what happened, never a body
+field; the actor is always "the API token", the gate knows no finer identity. Only writes
+leave rows (a refused call, a failed probe and `:verify` leave none), an unchanged repeat leaves
+one with `outcome` `unchanged`.
+
+**Errors** are `{"error": "...", "code": "..."}` (a `probe_failed` also has `verified`). The
+text names no value of the request: a body that does not parse says where, not what.
+
+| Status | `code` |
+|---|---|
+| 400 | `bad_name`, `bad_body`, `bad_query` |
+| 401, 403, 415 | `unauthorized`, `forbidden`, `unsupported_media_type` (the gate's) |
+| 404 | `not_enabled`, `no_such_connection`, `no_such_binding`, `unknown_action` |
+| 409 | `identity_change`, `in_use`, `generation_mismatch`, `conflict` |
+| 413 | `payload_too_large` |
+| 422 | `invalid_field`, `tls_unsupported`, `invalid_endpoint`, `invalid_bucket`, `invalid_prefix`, `role_not_supported`, `unknown_connection`, `no_bucket`, `probe_failed` |
+| 500 | `secret_missing` (the file a row names is missing or not 0600: fail closed, PUT again to repair), `secret_io`, `corrupt_rows`, `internal` |
+| 503 | `state_unavailable` |
+
+`DELETE .../bindings/{role}` answers `409 in_use` when a node reports `ok` at a generation
+at or after the binding's `updated_generation`: it runs on that store, and the API cannot take
+a store back from a running node. (A binding re-PUT with another connection of the same
+endpoint moves `updated_generation`; a node that applied only the earlier version is not
+counted.)
+
+**Rotating the key** (the API never revokes a key at the store):
+
+1. Add the new key at the store.
+2. `PUT` the connection with the new secret. The frontend probes the bound bucket with it
+   first.
+3. Restart the storage nodes through the installer: a running node does not swap
+   credentials in v1, and picks the registration up at its next start.
+4. Poll `GET /v1/object-stores` until `converged` is `true` (a node still on the old key is
+   `pending`).
+5. Only then revoke the old key at the store.
+
+```sh
+T=$(cat <token file>); API=http://127.0.0.1:<port>
+# the body is a file, never an inline secret; the content type is required on every call
+curl -X PUT -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  --data @connection.json $API/v1/object-stores/connections/cold
+curl -X PUT -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  --data '{"connection":"cold","bucket":"farm-cold","prefix":"cold/"}' \
+  $API/v1/object-stores/bindings/cold
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' $API/v1/object-stores
+```
+
+**`kbf cluster object-store`** is a client of these routes on the frontend's host, one call a
+verb, printing the answer's JSON (exit 0 on a 2xx, 1 on anything else, 2 for a command line
+that does not parse). Every verb needs `--token-file F`, a read included, because every route
+passes the whole gate; `--api ADDR` names the listener (default `127.0.0.1:8982`).
+
+| Verb | Call |
+|---|---|
+| `object-store status` | `GET /v1/object-stores` |
+| `object-store audit [--limit N]` | `GET /v1/object-stores/audit[?limit=N]` |
+| `object-store connection list` | `GET /v1/object-stores/connections` |
+| `object-store connection show NAME` | `GET /v1/object-stores/connections/NAME` |
+| `object-store connection put NAME --endpoint URL --access-key-id ID (--secret-file F \| --secret-stdin) [--region R] [--conditional-put] [--min-put-rate BYTES] [--expect-generation N] [--no-verify]` | `PUT /v1/object-stores/connections/NAME` |
+| `object-store connection delete NAME` | `DELETE /v1/object-stores/connections/NAME` |
+| `object-store bind --connection NAME --bucket B [--role cold] [--prefix P] [--expect-generation N] [--no-verify]` | `PUT /v1/object-stores/bindings/cold` |
+| `object-store unbind [--role cold]` | `DELETE /v1/object-stores/bindings/cold` |
+| `object-store verify NAME [--bucket B] [--prefix P]` | `POST /v1/object-stores/connections/NAME:verify` |
+
+The secret key is never a flag or an environment variable: `connection put` reads it from
+standard input (`--secret-stdin`) or from a file (`--secret-file F`) that must be a regular
+file whose mode gives its group and others no access (0600 or 0400), else it exits 1 and
+calls nothing. Only the final line ending is cut. Names and the role are checked before any
+call (`bind --role history` exits 2). The key is in none of the command's output or errors.
+
+```sh
+kbf cluster object-store connection put cold --endpoint http://127.0.0.1:9000 \
+  --access-key-id AKID --secret-file key.txt --token-file T   # key.txt is mode 0600
+kbf cluster object-store bind --connection cold --bucket farm-cold --prefix cold/ --token-file T
+kbf cluster object-store status --token-file T
+```
+
+The request body is read into memory and parsed; the buffers are not zeroized, so the
+secret key sits in the frontend's memory for as long as the allocator keeps those pages.
+The key is never logged, never in a state row and never in an answer.
 
 ## `GET /healthz` and `GET /readyz`
 
@@ -1155,7 +1468,7 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
   `.attestation` (its build attestation bundle). Anything else is `400`; no segment is ever joined
   into a path as it arrived.
 - `PUT` takes the file as the body, with the write gates of the section "Who may write" except
-  the JSON content type (loopback peer, no `Origin`, the bearer token). A tarball is at most
+  the JSON content type (loopback peer, and the proxy's secret with `--proxy-auth-file`, no `Origin`, the bearer token). A tarball is at most
   512 MiB (`413` past it), a bundle at most 256 KiB; an empty body is `400`. The body is written to
   a `.partial` file, synced, and renamed into place, so an interrupted upload leaves nothing
   visible.

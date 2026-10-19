@@ -21,13 +21,12 @@
 //! the blocking pool. The CA pin comes from a [`PinSource`] and the bytes of a token from a
 //! [`Random`]; nothing here reads the CA or draws its own randomness.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{Path, State};
 use axum::http::header::CACHE_CONTROL;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -45,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{PinSource, Random};
 use crate::api::{error, gate, json};
+use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 
 /// The path of `POST` (create) and `GET` (list) tokens.
@@ -134,11 +134,7 @@ pub(crate) struct EnrollState {
 
 impl EnrollState {
     /// The enrollment, if the caller passed the gate and there is one.
-    fn admit(
-        &self,
-        peer: SocketAddr,
-        headers: &HeaderMap,
-    ) -> Result<Arc<EnrollApi>, Box<Response>> {
+    fn admit(&self, peer: &Caller, headers: &HeaderMap) -> Result<Arc<EnrollApi>, Box<Response>> {
         gate(self.token.as_ref(), peer, headers)
             .map_err(|(code, why)| Box::new(error(code, &why)))?;
         self.enroll.clone().ok_or_else(|| {
@@ -192,11 +188,11 @@ async fn blocking<T: Send + 'static>(
 
 pub(crate) async fn create(
     State(state): State<Arc<EnrollState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let api = match state.admit(peer, &headers) {
+    let api = match state.admit(&peer, &headers) {
         Ok(api) => api,
         Err(refusal) => return *refusal,
     };
@@ -212,10 +208,10 @@ pub(crate) async fn create(
 
 pub(crate) async fn list(
     State(state): State<Arc<EnrollState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
 ) -> Response {
-    let api = match state.admit(peer, &headers) {
+    let api = match state.admit(&peer, &headers) {
         Ok(api) => api,
         Err(refusal) => return *refusal,
     };
@@ -224,11 +220,11 @@ pub(crate) async fn list(
 
 pub(crate) async fn revoke_token_route(
     State(state): State<Arc<EnrollState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let api = match state.admit(peer, &headers) {
+    let api = match state.admit(&peer, &headers) {
         Ok(api) => api,
         Err(refusal) => return *refusal,
     };
@@ -237,10 +233,10 @@ pub(crate) async fn revoke_token_route(
 
 pub(crate) async fn nodes(
     State(state): State<Arc<EnrollState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
 ) -> Response {
-    let api = match state.admit(peer, &headers) {
+    let api = match state.admit(&peer, &headers) {
         Ok(api) => api,
         Err(refusal) => return *refusal,
     };
@@ -254,12 +250,12 @@ struct NoBody {}
 
 pub(crate) async fn revoke_node_route(
     State(state): State<Arc<EnrollState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let api = match state.admit(peer, &headers) {
+    let api = match state.admit(&peer, &headers) {
         Ok(api) => api,
         Err(refusal) => return *refusal,
     };

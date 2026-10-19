@@ -1,0 +1,155 @@
+{
+  "schema": 1,
+  "stage": "gamma",
+  "commit": "abababababababababababababababababababab",
+  "set_hash": "642f342d9a4b38dc5f6ea6e0b18a80cf7d3b9b941354ab936a2a4c100311e11f",
+  "run_id": "bake-0001",
+  "attempt": 1,
+  "status": "green",
+  "started": 3600000,
+  "finished": 3614400,
+  "desired_generation": 7,
+  "deploy": {
+    "start": 3599100,
+    "end": 3599940
+  },
+  "bake": {
+    "start": 3600000,
+    "end": 3614400
+  },
+  "load": {
+    "actions": {
+      "measured": 2400,
+      "required": 1000
+    },
+    "builds": {
+      "measured": 12,
+      "required": 10
+    },
+    "hours": {
+      "measured": 5,
+      "required": 3
+    }
+  },
+  "waivers": [],
+  "gates": [
+    {
+      "name": "farm-class-failures",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 0.0
+      },
+      "verdict": "green",
+      "started": 3600000,
+      "finished": 3614400
+    },
+    {
+      "name": "lost-blobs",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 0.0
+      },
+      "verdict": "green",
+      "started": 3600000,
+      "finished": 3614400
+    },
+    {
+      "name": "blob-losses-delta",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 0.0
+      },
+      "verdict": "green",
+      "started": 3600000,
+      "finished": 3614400
+    },
+    {
+      "name": "under-replicated",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 0.0
+      },
+      "verdict": "green",
+      "started": 3600000,
+      "finished": 3614400
+    },
+    {
+      "name": "under-replicated-secs",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 600.0
+      },
+      "verdict": "green",
+      "started": 3600000,
+      "finished": 3614400
+    },
+    {
+      "name": "relay-untraced",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 0.0
+      },
+      "verdict": "green",
+      "started": 3600000,
+      "finished": 3614400
+    },
+    {
+      "name": "error-rate",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 0.005
+      },
+      "verdict": "green",
+      "started": 3600000,
+      "finished": 3614400
+    },
+    {
+      "name": "latency-p99-ratio",
+      "measured": 1.0,
+      "threshold": {
+        "band": {
+          "warn": 1.5,
+          "red": 3.0
+        }
+      },
+      "verdict": "green",
+      "started": 3600000,
+      "finished": 3614400
+    },
+    {
+      "name": "write-tier-flush-failures",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 0.0
+      },
+      "verdict": "green",
+      "started": 3600000,
+      "finished": 3614400
+    },
+    {
+      "name": "write-tier-digest-mismatches",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 0.0
+      },
+      "verdict": "green",
+      "started": 3600000,
+      "finished": 3614400
+    },
+    {
+      "name": "restarts",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 0.0
+      },
+      "verdict": "green",
+      "started": 3600000,
+      "finished": 3614400
+    }
+  ],
+  "note": null,
+  "tag": null,
+  "not_reversible": [],
+  "escapes": [],
+  "withdrawn": []
+}

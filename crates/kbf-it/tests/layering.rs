@@ -61,6 +61,18 @@ const PURE: &[&str] = &[
     "kbf-map",
 ];
 
+/// Crates that do a little file I/O (so they are not `PURE`) but are shared by every CI/CD
+/// stage and by xtask: they may reach no `FORBIDDEN` crate and no other kbf crate.
+const LEAF: &[&str] = &["kbf-gate"];
+
+/// The bake evaluator runs beside the farm, not inside it: it reads the farm over a blocking
+/// HTTP client, so it links no async runtime and no kbf crate but the gate library it writes
+/// its verdict with. (The client's TLS code reaches a random source, so `FORBIDDEN` is too
+/// wide for it; `ASYNC_STACK` is the part that matters.)
+const OPERATOR_SIDE: &[(&str, &[&str])] = &[("kbf-bake", &["kbf-gate"])];
+
+const ASYNC_STACK: &[&str] = &["tokio", "tonic", "hyper", "reqwest", "mio"];
+
 const FORBIDDEN: &[&str] = &[
     "tokio",
     "tonic",
@@ -201,6 +213,64 @@ fn pure_crates_have_no_impure_dependencies() {
     assert!(
         violations.is_empty(),
         "pure crates reach impure crates:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn leaf_crates_reach_no_async_stack_and_no_other_kbf_crate() {
+    let g = load_graph();
+    let mut violations = Vec::new();
+    for &leaf in LEAF {
+        let (id, _) = g
+            .members
+            .get(leaf)
+            .unwrap_or_else(|| panic!("{leaf} is not a workspace member"));
+        for (dep, chain) in normal_closure(&g, id) {
+            let name = g.names[&dep].as_str();
+            if name != leaf && (FORBIDDEN.contains(&name) || g.members.contains_key(name)) {
+                violations.push(chain);
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "leaf crates reach the async stack or other kbf crates:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn the_bake_evaluator_reaches_no_async_stack_and_no_kbf_crate_but_the_gate_library() {
+    let g = load_graph();
+    let mut violations = Vec::new();
+    for &(krate, allowed) in OPERATOR_SIDE {
+        let (id, _) = g
+            .members
+            .get(krate)
+            .unwrap_or_else(|| panic!("{krate} is not a workspace member"));
+        let closure = normal_closure(&g, id);
+        for (dep, chain) in &closure {
+            let name = g.names[dep].as_str();
+            let other_kbf = g.members.contains_key(name) && !allowed.contains(&name);
+            if ASYNC_STACK.contains(&name) || other_kbf {
+                violations.push(chain.clone());
+            }
+        }
+        // The walk must see what the crate is allowed: a renamed gate library would
+        // otherwise let this pass with nothing checked.
+        for &want in allowed {
+            assert!(
+                closure
+                    .values()
+                    .any(|chain| chain.ends_with(&format!("-> {want}"))),
+                "{krate} no longer reaches {want}: update OPERATOR_SIDE"
+            );
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "operator-side crates reach the async stack or other kbf crates:\n{}",
         violations.join("\n")
     );
 }

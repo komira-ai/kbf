@@ -290,7 +290,7 @@ node and ignored from a replaced stream, exactly as `NodeStatus` is.
 `POST /v1/update/frontend {commit}` (write gate as the other writes; admin) is the one route that updates the frontend. Gamma calls it. The commit must have a complete platform for the frontend host (else 409), and no frontend
 update may be in flight (409). The frontend then **writes an order record into its own host's `orders/` directory**, by the same mechanism as
 `kbf-update` uses for nodes (a dot-prefixed temporary name, then rename; section 7), with `verb=frontend_update`, the `commit`, a `generation` from the
-store counter, the store `epoch` and an `order_id`, and the components and expected facts of the release from its own store. The route returns the order id; the installer refuses a second order while one is in flight (`frontend_busy`) and one whose installed Envoy is outside the tested range (`envoy_range`). The root CLI `kbf-installer update --commit SHA --frontend` stays as the **local fallback** and runs the same code. It does not go
+store counter, the store `epoch` and an `order_id`. The record is a locator: it carries no components and no expected facts, and the root half fetches and verifies the release itself ([kbf-installer.md](kbf-installer.md) section 6). The route returns the order id; the installer refuses a second order while one is in flight (`frontend_busy`) and one whose installed Envoy is outside the tested range (`envoy_range`). The root CLI `kbf-installer update --commit SHA --frontend` stays as the **local fallback** and runs the same code. It does not go
 through a node session, and nothing is sent on the wire. The installer's reply is the host's `status.json`, which the route's status
 read (`GET /v1/update`) reports.
 
