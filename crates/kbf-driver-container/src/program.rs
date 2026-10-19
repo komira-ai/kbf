@@ -88,6 +88,10 @@ pub(crate) struct Said {
     source: PathBuf,
     /// The action's stderr file, which a lookup report is rewritten into.
     stderr: PathBuf,
+    /// What the container's init wrote when it could not start the program
+    /// (`oci::init`), if there is such a file: read as `crun`'s words are, in the same
+    /// words.
+    report: Option<PathBuf>,
 }
 
 impl Said {
@@ -97,20 +101,51 @@ impl Said {
         Self {
             source: log.to_owned(),
             stderr: stderr.to_owned(),
+            report: None,
         }
     }
 
-    /// At most [`SAID_MAX`] bytes of the log, as its error records.
-    pub(crate) async fn read(&self) -> std::io::Result<String> {
-        use tokio::io::AsyncReadExt as _;
-        let mut bytes = Vec::new();
-        tokio::fs::File::open(&self.source)
-            .await?
-            .take(SAID_MAX)
-            .read_to_end(&mut bytes)
-            .await?;
-        Ok(crun_words(&String::from_utf8_lossy(&bytes)))
+    /// The same, and the init's report `file` read after the log. It need not exist: the
+    /// init writes it only when the program cannot be started.
+    pub(crate) fn with_report(mut self, file: &Path) -> Self {
+        self.report = Some(file.to_owned());
+        self
     }
+
+    /// At most [`SAID_MAX`] bytes of the log, as its error records, then the init's
+    /// report, if any, in the same words. A log that is not there is an error, unless a
+    /// report is configured: the words of the init alone then answer.
+    pub(crate) async fn read(&self) -> std::io::Result<String> {
+        let log = match (read_capped(&self.source).await, &self.report) {
+            (Err(e), Some(_)) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            (read, _) => read?,
+        };
+        let mut words = crun_words(&String::from_utf8_lossy(&log));
+        if let Some(file) = &self.report {
+            let report = match read_capped(file).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                read => read?,
+            };
+            let init = init_words(&String::from_utf8_lossy(&report));
+            if !words.is_empty() && !init.is_empty() {
+                words.push_str("; ");
+            }
+            words.push_str(&init);
+        }
+        Ok(words)
+    }
+}
+
+/// At most [`SAID_MAX`] bytes of the file at `path`.
+async fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(path)
+        .await?
+        .take(SAID_MAX)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
 }
 
 /// The error records of a `crun --log-format=json` log, as `crun: <message>` joined by
@@ -120,6 +155,18 @@ pub(crate) fn crun_words(log: &str) -> String {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|record| record["level"] == "error" || record["level"] == "fatal")
         .filter_map(|record| record["msg"].as_str().map(|msg| format!("crun: {msg}")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The lines of the container init's report, as `crun: <message>` joined by `; `: the
+/// messages are `crun`'s own words for the same failures (`init/kbf_init.rs`), so
+/// [`classify`] reads both.
+pub(crate) fn init_words(report: &str) -> String {
+    report
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| format!("crun: {line}"))
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -323,6 +370,49 @@ mod tests {
         )
         .expect("log");
         assert!(text_file_busy(&said).await);
+    }
+
+    /// Catches the init's report being read as anything but `crun`'s words for the same
+    /// failure (the classifier must serve both), lost behind the log's own words, or a
+    /// missing file (no report: the init writes one only on failure) an error.
+    #[tokio::test]
+    async fn the_inits_report_is_read_after_the_log_in_cruns_words() {
+        assert_eq!(init_words(""), "");
+        assert_eq!(
+            init_words(
+                "open executable: Permission denied\n\nexec container process `x`: Text file busy\n"
+            ),
+            "crun: open executable: Permission denied; \
+             crun: exec container process `x`: Text file busy"
+        );
+        let dir = scratch("init-report");
+        let (log, report, stderr) = (dir.join("crun.log"), dir.join("report"), dir.join("stderr"));
+        let said = Said::crun(&log, &stderr).with_report(&report);
+        std::fs::write(&log, "").expect("log");
+        assert_eq!(said.read().await.expect("no report file"), "");
+        std::fs::write(
+            &report,
+            "executable file `env` not found in $PATH: No such file or directory\n",
+        )
+        .expect("report");
+        assert_eq!(
+            said.read().await.expect("report"),
+            "crun: executable file `env` not found in $PATH: No such file or directory"
+        );
+        std::fs::write(&log, LOG).expect("log");
+        let both = said.read().await.expect("both");
+        assert!(both.starts_with("crun: executable file `env` not found in $PATH: No such file or directory; crun: open executable"), "{both}");
+        assert!(both.ends_with("directory"), "{both}");
+        // The report alone answers when crun left no log; without a report configured the
+        // missing log is still an error.
+        std::fs::remove_file(&log).expect("remove log");
+        assert!(said.read().await.is_ok());
+        assert!(Said::crun(&log, &stderr).read().await.is_err());
+        // The classifier reads the init's words as `crun`'s.
+        let mut spec = crate::container::tests::spec();
+        spec.argv = vec!["env".to_owned()];
+        std::fs::write(&stderr, b"").expect("stderr");
+        assert_eq!(not_run(&spec, &said, "exited 127").await.expect("127"), 127);
     }
 
     /// Catches a report that opens but cannot be read, and a rewritten stderr that cannot

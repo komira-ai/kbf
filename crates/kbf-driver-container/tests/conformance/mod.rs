@@ -153,6 +153,66 @@ async fn a_busy_program_is_started_once_more() {
     fake.assert_clean(1);
 }
 
+/// Catches the container init's report of a program it could not start being lost (the
+/// farm's failure instead of the action's, a lookup failure the init and not `crun`
+/// made): the lookup report becomes exit 127 or 126 with kbf's message, a report of
+/// anything else is the farm's failure, and an exec the init found busy is started once
+/// more, like one `crun` did.
+#[tokio::test]
+async fn the_inits_report_is_read_like_cruns() {
+    let mut spec = Spec::new(&image(), "unused");
+    spec.argv = vec!["no-such-tool".to_owned()];
+
+    let fake = Fake::new("conf-init-not-found");
+    fake.init_says(
+        "executable file `no-such-tool` not found in $PATH: No such file or directory",
+        127,
+        false,
+    );
+    let result = fake.run(1, &spec, &["exit", "0"]).await.expect("ran");
+    assert_eq!(result.exit_code, 127);
+    let stderr = String::from_utf8(blob(&fake.cas, result.stderr_digest.as_ref())).expect("utf-8");
+    assert!(
+        stderr.starts_with("kbf: the action's program `no-such-tool` was not found"),
+        "{stderr}"
+    );
+    fake.assert_clean(1);
+
+    let fake = Fake::new("conf-init-not-executable");
+    fake.init_says("open executable: Permission denied", 126, false);
+    let result = fake.run(1, &spec, &["exit", "0"]).await.expect("ran");
+    assert_eq!(result.exit_code, 126);
+    fake.assert_clean(1);
+
+    // Not a lookup: the init has only these words, so anything else is a failure of the
+    // farm (and an exit 127 of the action itself, with no report, is the action's).
+    let fake = Fake::new("conf-init-other");
+    fake.init_says("something else broke", 126, false);
+    let outcome = fake.run(1, &spec, &["exit", "0"]).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Failed(_))),
+        "{outcome:?}"
+    );
+    let fake = Fake::new("conf-exit-127");
+    let result = fake.run(1, &spec, &["exit", "127"]).await.expect("ran");
+    assert_eq!(result.exit_code, 127);
+    assert!(
+        blob(&fake.cas, result.stderr_digest.as_ref()).is_empty(),
+        "no rewrite of an action's own 127"
+    );
+
+    let fake = Fake::new("conf-init-busy");
+    fake.init_says(
+        "exec container process `no-such-tool`: Text file busy",
+        126,
+        true,
+    );
+    let result = fake.run(1, &spec, &["echo", "ran"]).await.expect("ran");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(fake.starts(), 2, "{:?}", fake.calls());
+    fake.assert_clean(1);
+}
+
 /// Catches a restarted daemon that leaves its killed predecessor's action running, or its
 /// lease cgroup or scratch directory behind. The killed daemon is modelled by forgetting
 /// its run: nothing of it is dropped, so nothing of it is cleaned.

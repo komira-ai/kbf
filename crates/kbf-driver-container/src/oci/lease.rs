@@ -6,10 +6,10 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use super::crun::{RunEnd, log_path};
-use super::{JobError, Mapping, Oci, at, helper, spec};
+use super::{JobError, Mapping, Oci, at, helper, init, spec};
 use crate::container::{CONTAINER_OWNER, ContainerSpec, Dirs, Ended};
 use crate::image::{ImageCheckError, ImageRef};
-use crate::program::{Said, crun_words};
+use crate::program::{Said, crun_words, init_words};
 use crate::running::Running;
 
 /// The mode of the lease directory and of the small files in it the container reads:
@@ -84,6 +84,7 @@ impl Oci {
             cgroup: &spec.cgroup_parent,
             ids: &self.ids,
             arch: self.arch,
+            init: &self.init,
         };
         let bytes = spec::render(&spec::action_config(spec, &placement)?)?;
         let bundle = spec.dir.join("bundle");
@@ -122,7 +123,10 @@ impl Oci {
         let (dir, name) = (spec.dir.clone(), spec.name.clone());
         let bundle = dir.join("bundle");
         let thread = format!("crun-{name}");
-        let run = async move { crun.run(&dir, &name, &bundle, stdout, stderr).await };
+        // The init's stdin: where it says why the program could not be started.
+        let report = std::fs::File::create(init::report_path(&dir))
+            .map_err(|e| format!("{}: {e}", init::report_path(&dir).display()))?;
+        let run = async move { crun.run(&dir, &name, &bundle, report, stdout, stderr).await };
         Running::spawn(thread, run)
     }
 
@@ -137,7 +141,10 @@ impl Oci {
             RunEnd::Exited(0) => Ok(Ended::Exited(0)),
             RunEnd::Exited(code) => {
                 let log = tokio::fs::read_to_string(log_path(&spec.dir)).await;
-                if crun_words(&log.unwrap_or_default()).is_empty() {
+                let report = tokio::fs::read_to_string(init::report_path(&spec.dir)).await;
+                if crun_words(&log.unwrap_or_default()).is_empty()
+                    && init_words(&report.unwrap_or_default()).is_empty()
+                {
                     Ok(Ended::Exited(code))
                 } else {
                     Ok(Ended::NotRun(format!("exited {code}")))
@@ -148,7 +155,7 @@ impl Oci {
     }
 
     pub(crate) fn said(&self, spec: &ContainerSpec, stderr: &Path) -> Said {
-        Said::crun(&log_path(&spec.dir), stderr)
+        Said::crun(&log_path(&spec.dir), stderr).with_report(&init::report_path(&spec.dir))
     }
 
     pub(crate) async fn terminate(&self, name: &str) -> Result<(), String> {

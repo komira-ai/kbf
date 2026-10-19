@@ -28,6 +28,10 @@
 //!   record in the `--log` file and `crun-error-code` (default 1) as its status.
 //! - `busy-once`: the next run fails as crun does when the program's exec finds it busy
 //!   (ETXTBSY), once.
+//! - `init-says`, `init-says-code`, `init-says-once`: the container's init cannot start the
+//!   program: the text is written to the run's stdin (the driver's report file, which
+//!   the real init writes to) and `init-says-code` (default 127) is the status. With
+//!   `init-says-once` present only the next run does it.
 //! - `kill-fails`, `delete-fails`: that verb fails.
 //! - `delete-vanished`: `delete` finds the container's state already gone and fails, as crun does
 //!   when the `crun run` of a killed container removed it first.
@@ -310,6 +314,14 @@ impl Fake {
     }
 
     fn action(&self, call: &Call<'_>, config: &Value, id: &[u8]) -> u8 {
+        // `crun` opens its `--log` file as it starts, so it exists, empty, when nothing
+        // went wrong; the driver reads the words of a run that failed from it.
+        if let Some(log) = &call.log {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log);
+        }
         self.write_line("start-pid", std::process::id().to_string().as_bytes());
         self.write_line("id", id);
         // The container's cgroup is `<lease cgroup>/ctr`.
@@ -351,6 +363,23 @@ impl Fake {
             self.log_error(call, String::from_utf8_lossy(&text).trim());
             remove_state();
             self.append("events", b"run ended");
+            return code;
+        }
+        if let Some(text) = self.read("init-says") {
+            if self.has("init-says-once") {
+                let _ = std::fs::remove_file(self.file("init-says"));
+            }
+            if let Ok(mut report) = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/proc/self/fd/0")
+            {
+                let _ = writeln!(report, "{}", String::from_utf8_lossy(&text).trim());
+            }
+            remove_state();
+            self.append("events", b"run ended");
+            let code = String::from_utf8_lossy(&self.cat("init-says-code"))
+                .parse()
+                .unwrap_or(127);
             return code;
         }
         if self.has("busy-once") {

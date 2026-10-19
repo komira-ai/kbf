@@ -161,6 +161,17 @@
       "type": "cgroup"
     },
     {
+      "destination": "/dev/kbf-init",
+      "options": [
+        "rbind",
+        "ro",
+        "nosuid",
+        "nodev"
+      ],
+      "source": "/scratch/oci-bin/kbf-init",
+      "type": "bind"
+    },
+    {
       "destination": "/etc/hosts",
       "options": [
         "rbind",
@@ -254,6 +265,8 @@
   "ociVersion": "1.0.0",
   "process": {
     "args": [
+      "/dev/kbf-init",
+      "--",
       "tool",
       "--flag",
       "a b"

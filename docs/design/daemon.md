@@ -424,7 +424,35 @@ back; `crun delete --force` closes the lease. That is four `crun` processes.
   moment at which the container is stopped but its exit code is not recorded (#658). A
   non-zero status is the farm's failure rather than the action's only if `crun` wrote an
   error record to its `--log` (JSON) file; the lookup failures of `program.rs` (exit 127
-  and 126) and `ETXTBSY` are read from that log (`crun: <message>`).
+  and 126) and `ETXTBSY` are read from that log (`crun: <message>`) and from the init's report
+  (below).
+- **The container's first process is `kbf-init`, not the action** (`init/kbf_init.rs`,
+  built by `crates/kbf-driver-container/build.rs`, embedded in the daemon, installed
+  at `<scratch>/oci-bin/kbf-init` and bound read-only at `/dev/kbf-init`, in the
+  container's own `/dev` tmpfs, so the image is never written to). `process.args` is
+  `/dev/kbf-init -- <argv>`. In a pid namespace pid 1 adopts every orphan, and a pid 1
+  that never waits leaves each one a zombie: a test that kills its process group and
+  asks `kill(-pgid, 0)` is told the group lives (the mopm pilot, `test_proc.zig`). A
+  host's init and Buildbarn's runner reap, so the sandbox must. The init (about 200
+  lines, standard library only, linked statically so it runs in any image whatever its
+  libc) runs the action as its child with `/dev/null` for stdin, passes every signal it
+  can catch to the child, reaps every process that ends, and exits when the child
+  does, with the child's exit code or `128 + n` for signal `n`: the same status
+  `crun run` gave when the action was pid 1, and the kernel ends the rest of the
+  namespace as before. It costs one more process (one pid of `pids.max`, about a
+  megabyte). The action is pid 2 (`$$` shows it), and a signal it sends itself is now
+  delivered (pid 1 ignores signals without a handler). Other options were refused: no
+  OCI or `crun` setting makes a runtime init; a subreaper in the daemon cannot catch
+  the orphans, because they are reparented inside the namespace, to its pid 1.
+  Looking the program up is the init's work now, with `crun`'s rules: a name with a
+  slash as it is (relative to the working directory), a bare name on the `Command`'s
+  `PATH` only (no `PATH`: not found). It cannot start the program: it writes one line in
+  `crun`'s own words to its stdin (a file of the lease, `init-report`, which the
+  driver opens and only the init holds; the program's stdin is `/dev/null`) and exits
+  127 (not found) or 126 (anything else, `ETXTBSY` included), and the driver reads
+  that line where it reads `crun`'s log. So everything above about 127, 126 and the
+  `ETXTBSY` retry holds unchanged. Building the daemon needs the C library's static
+  archive (`libc.a`).
 - **Namespaces:** pid, network (new, nothing configured: loopback only; `crun` brings
   `lo` up), ipc, uts, mount, cgroup and user. Container ids `0..65536` map to the first
   range of at least 65,536 in the daemon user's `/etc/subuid` and `/etc/subgid`; the

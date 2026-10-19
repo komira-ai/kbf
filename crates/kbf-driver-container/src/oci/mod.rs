@@ -43,6 +43,7 @@ pub(crate) mod crun;
 pub(crate) mod hardening;
 pub(crate) mod helper;
 pub(crate) mod image;
+pub(crate) mod init;
 mod lease;
 pub(crate) mod spec;
 
@@ -223,6 +224,8 @@ pub(crate) fn at<T>(path: &Path, result: std::io::Result<T>) -> Result<T, JobErr
 pub(crate) struct Oci {
     crun: crun::Crun,
     daemon: PathBuf,
+    /// The container init (`init`), installed under the scratch directory.
+    init: PathBuf,
     registry: kbf_image::Registry,
     ids: DaemonIds,
     arch: &'static str,
@@ -281,9 +284,11 @@ impl Oci {
         at(&helper_root, helper::prepare_rootfs(&helper_root)).map_err(prepare)?;
         let daemon =
             at(scratch, helper::install_daemon(scratch, &config.daemon)).map_err(prepare)?;
+        let init = at(scratch, init::install(scratch)).map_err(prepare)?;
         let oci = Arc::new(Self {
             crun: crun::Crun::new(config.runtime.clone()),
             daemon,
+            init,
             registry,
             ids,
             arch,

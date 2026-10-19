@@ -75,7 +75,8 @@ async fn the_sandbox_is_what_the_config_says() {
     let out = cell.stdout(&result);
     assert_eq!(result.exit_code, 0, "{out}\n{}", cell.stderr(&result));
     let subuid = first_subordinate_id();
-    assert!(out.contains("uid 1000:1000 pid 1 host localhost"), "{out}");
+    // Pid 1 is the container's init (`init/kbf_init.rs`), and the action is its child.
+    assert!(out.contains("uid 1000:1000 pid 2 host localhost"), "{out}");
     assert!(
         out.contains(&format!("map          0 {subuid:>10}      65536")),
         "{out}"
@@ -130,14 +131,68 @@ async fn every_exit_code_is_the_actions_own() {
         cell.assert_clean(seq);
     }
     eprintln!("50 leases in {:?}", started.elapsed());
-    // The action is pid 1 of its namespace, which ignores a signal from inside it, so a
-    // death by signal is shown through a child: its status as the shell reports it.
+    // A death by signal is the shell's `128 + n`, whether the action dies of it itself
+    // (it is the init's child, not pid 1, so the signal is delivered) or a child does.
+    for (seq, (script, code)) in (51..).zip([
+        ("kill -KILL $$", 137),
+        ("kill -TERM $$", 143),
+        ("sh -c 'kill -KILL $$'; exit $(($? - 128))", 9),
+    ]) {
+        let result = cell.run(seq, &sh(script)).await.expect("ran");
+        assert_eq!(result.exit_code, code, "{script}");
+        cell.assert_clean(seq);
+    }
+}
+
+/// Catches an orphaned process staying a zombie, which the mopm pilot found
+/// (`src/core/test_proc.zig`: a test kills its process group and `kill(-pgid, 0)` still
+/// finds it, because the orphan was adopted by a container's pid 1 that never waits).
+/// The action starts a session leader in the background from a subshell that exits
+/// at once, so the leader is an orphan; the action kills it, and 2 s later it must not
+/// be in `/proc` at all (a zombie is, and so is a group that `kill(-pgid, 0)` finds).
+/// Pid 1 must be the init and the leader its child. The mutant: an init that waits only
+/// for the action leaves `Z` and exit 3.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn an_orphan_is_reaped_so_a_killed_group_is_gone() {
+    let cell = Cell::new("reaper");
+    let script = r#"
+        ( /bin/setsid /bin/sh -c 'echo $$ > /tmp/leader; exec /bin/sleep 300' & )
+        n=0
+        while [ ! -s /tmp/leader ] && [ $n -lt 50 ]; do /bin/sleep 1; n=$((n + 1)); done
+        leader=$(cat /tmp/leader)
+        echo "pid1 $(tr '\0' ' ' < /proc/1/cmdline)"
+        echo "parent $(sed -n 's/^PPid:[[:space:]]*//p' /proc/$leader/status)"
+        kill -9 $leader
+        /bin/sleep 2
+        if [ -e /proc/$leader ]; then echo "leftover $(cat /proc/$leader/stat)"; exit 3; fi
+        echo reaped
+    "#;
+    let result = cell.run(1, &sh(script)).await.expect("ran");
+    let out = cell.stdout(&result);
+    assert_eq!(result.exit_code, 0, "{out}\n{}", cell.stderr(&result));
+    assert!(out.contains("pid1 /dev/kbf-init -- /bin/sh -c "), "{out}");
+    assert!(out.contains("\nparent 1\n"), "{out}");
+    assert!(out.ends_with("reaped\n"), "{out}");
+    cell.assert_clean(1);
+}
+
+/// Catches the init outliving or outwaiting the action: a lease ends with the action's
+/// status when the action exits while a background process of it still runs (the
+/// container's other processes die with its first, as they did when that was the
+/// action), within seconds and not the background process's 300.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn the_lease_ends_with_the_action_whatever_it_left_running() {
+    let cell = Cell::new("reaper-ends");
+    let started = Instant::now();
     let result = cell
-        .run(51, &sh("sh -c 'kill -KILL $$'; echo status=$?"))
+        .run(1, &sh("sleep 300 & sleep 300 & exit 4"))
         .await
         .expect("ran");
-    assert_eq!(result.exit_code, 0);
-    assert_eq!(cell.stdout(&result), "status=137\n");
+    assert_eq!(result.exit_code, 4, "{}", cell.stderr(&result));
+    assert!(started.elapsed().as_secs() < 60, "{:?}", started.elapsed());
+    cell.assert_clean(1);
 }
 
 /// Catches a program crun cannot start being the farm's failure, not the action's:

@@ -220,6 +220,16 @@ impl Fake {
         self.knob("busy-once", "");
     }
 
+    /// The container's init cannot start the program: it says `words` (in `crun`'s) on
+    /// the report file and the run ends `code`; every run, or only the next if `once`.
+    pub fn init_says(&self, words: &str, code: i32, once: bool) {
+        self.knob("init-says", words);
+        self.knob("init-says-code", &code.to_string());
+        if once {
+            self.knob("init-says-once", "");
+        }
+    }
+
     /// The pid of the last action, as the stand-in published it.
     pub fn action_pid(&self) -> String {
         std::fs::read_to_string(self.state.join("pid"))
