@@ -50,6 +50,22 @@ pub enum DatabaseError {
     Password(String),
 }
 
+/// The `database` URL of the file `shown`, parsed and refused when it carries a password. The
+/// one place the rule lives: `setup`, `run` and `backup` all hold the file's URL to it.
+///
+/// # Errors
+/// [`DatabaseError::BadUrl`] or [`DatabaseError::Password`]; neither quotes the URL.
+pub(crate) fn check_url(shown: &str, url: &str) -> Result<PostgresConfig, DatabaseError> {
+    let config = PostgresConfig::parse(url).map_err(|why| DatabaseError::BadUrl {
+        path: shown.to_owned(),
+        why,
+    })?;
+    if config.has_password() {
+        return Err(DatabaseError::Password(shown.to_owned()));
+    }
+    Ok(config)
+}
+
 /// What runs before a release starts, so the installer's helper can be tested without a
 /// server.
 pub trait SchemaStep {
@@ -86,13 +102,7 @@ impl Database {
         let Some(url) = table.get("database").and_then(toml::Value::as_str) else {
             return Err(DatabaseError::NoDatabase(shown));
         };
-        let config = PostgresConfig::parse(url).map_err(|why| DatabaseError::BadUrl {
-            path: shown.clone(),
-            why,
-        })?;
-        if config.has_password() {
-            return Err(DatabaseError::Password(shown));
-        }
+        let config = check_url(&shown, url)?;
         Ok(Database::new(config, schema::embedded()))
     }
 

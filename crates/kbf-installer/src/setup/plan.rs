@@ -30,6 +30,10 @@ const MAC_ID_TO: u32 = 400;
 pub const MAC_INSTALLER_LABEL: &str = "com.komira.kbf-installer";
 pub const MAC_DAEMON_LABEL: &str = "com.komira.kbf-daemon";
 pub const INSTALLER_UNIT: &str = "kbf-installer.service";
+/// The daily backup of the state database (`kbf-backup.service` is what it starts): enabled on
+/// the modes that keep their state in Postgres, started with them when `--no-start` is absent
+/// (the schema it dumps is made earlier in the same run).
+pub const BACKUP_TIMER: &str = "kbf-backup.timer";
 /// The longest token file setup reads.
 const MAX_TOKEN_BYTES: u64 = 4096;
 
@@ -479,9 +483,14 @@ fn units(
             }
         }
         Platform::Linux => {
+            let backup = v
+                .mode
+                .keeps_state_in_database()
+                .then_some((BACKUP_TIMER, !no_start));
             let wanted = mode_units(v.mode)
                 .iter()
                 .map(|u| (*u, start_mode))
+                .chain(backup)
                 .chain([(INSTALLER_UNIT, !no_start)]);
             for (unit, now) in wanted {
                 if !os.unit_enabled(unit)? {

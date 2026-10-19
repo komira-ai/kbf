@@ -12,14 +12,14 @@ inputs, and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes
 |---|---|
 | `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-verify` (no login); installed to `/usr/lib/sysusers.d` |
 | `tmpfiles.d/kbf-installer.conf` | `/run/kbf-installer` (0755), `/var/cache/kbf-fetch` (0711); the units author's file, packaged unchanged; installed to `/usr/lib/tmpfiles.d` |
-| `units/` | the unit files (`kbf-*.service`, `kbf.slice`), installed to `/usr/lib/systemd/system`; `testdata/units` is the fixture for the unit tests only |
+| `units/` | the unit files (`kbf-*.service`, `kbf-*.timer`, `kbf.slice`), installed to `/usr/lib/systemd/system`; `testdata/units` is the fixture for the unit tests only |
 | `testdata/` | fixtures for the install test only: two gated units and three stand-in trust files |
 | `test/ubuntu`, `test/fedora` | the fresh systems the install test uses, systemd as PID 1, pinned by digest |
 
 ## What the package holds
 
 - `/usr/bin/kbf-installer` (0755);
-- every file of `packaging/linux/units` (the `kbf-*.service` files and `kbf.slice`; the
+- every file of `packaging/linux/units` (the `kbf-*.service` and `kbf-*.timer` files and `kbf.slice`; the
   unit files are packaging's input from the units author, packaged unchanged) in
   `/usr/lib/systemd/system` (0644);
 - `/usr/share/kbf-installer/trust/`: `gh` (0755), `trusted_root.jsonl`, `installer.conf` (0644);
@@ -27,7 +27,7 @@ inputs, and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes
   unchanged; `/var/lib/kbf-installer` is made by `kbf-installer setup`, not at install);
 - all of it `root:root`, with one time (`SOURCE_DATE_EPOCH`) on every file and the package.
 
-It refuses anything else (a unit named neither `kbf-*.service` nor `kbf.slice`, a fourth trust file, no unit).
+It refuses anything else (a unit named none of `kbf-*.service`, `kbf-*.timer` and `kbf.slice`, a fourth trust file, no unit).
 
 Dependencies: deb `crun, uidmap, systemd, ca-certificates`; rpm the same with Fedora's name
 for `uidmap`, `shadow-utils`. Never Podman, never Envoy (a test pins it): Envoy

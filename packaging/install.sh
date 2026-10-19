@@ -16,8 +16,8 @@
 # daemon hosts do not need it.
 #
 # The payload (`cargo xtask installer-tarball`) is the Debian package's file list, made
-# from the same Rust list: usr/bin/kbf-installer, usr/lib/systemd/system/kbf-*.service
-# and kbf.slice, usr/share/kbf-installer/trust/{gh,installer.conf,trusted_root.jsonl},
+# from the same Rust list: usr/bin/kbf-installer, usr/lib/systemd/system/kbf-*.service and
+# kbf-*.timer, kbf.slice, usr/share/kbf-installer/trust/{gh,installer.conf,trusted_root.jsonl},
 # usr/lib/sysusers.d/kbf-installer.conf and usr/lib/tmpfiles.d/kbf-installer.conf, and
 # no kbf release: `sudo kbf-installer setup` installs the first one. After placing, the
 # script makes the users and directories from those two files (systemd-sysusers and
@@ -149,7 +149,7 @@ while read -r entry; do
   case $entry in
     /* | ../* | */../* | */..) die "$name holds the path '$entry'" ;;
     usr/lib/systemd/system/*/*) die "$name holds '$entry', which the package does not" ;;
-    usr/bin/kbf-installer | usr/lib/systemd/system/kbf-?*.service | usr/lib/systemd/system/kbf.slice) ;;
+    usr/bin/kbf-installer | usr/lib/systemd/system/kbf-?*.service | usr/lib/systemd/system/kbf-?*.timer | usr/lib/systemd/system/kbf.slice) ;;
     usr/share/kbf-installer/trust/gh | usr/share/kbf-installer/trust/installer.conf) ;;
     usr/share/kbf-installer/trust/trusted_root.jsonl) ;;
     usr/lib/sysusers.d/kbf-installer.conf | usr/lib/tmpfiles.d/kbf-installer.conf) ;;

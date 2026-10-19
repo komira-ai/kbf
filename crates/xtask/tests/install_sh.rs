@@ -33,8 +33,9 @@ const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
 const COMMIT: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
 const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/install.sh");
 /// Where the package puts things, and so the payload.
-const PAYLOAD: [&str; 9] = [
+const PAYLOAD: [&str; 10] = [
     "usr/bin/kbf-installer",
+    "usr/lib/systemd/system/kbf-backup.timer",
     "usr/lib/systemd/system/kbf-frontend@.service",
     "usr/lib/systemd/system/kbf-installer.service",
     "usr/lib/systemd/system/kbf.slice",
@@ -99,6 +100,7 @@ fn release() -> &'static Release {
         std::fs::create_dir_all(&trust).expect("trust");
         for (d, name) in [
             (&units, "kbf-installer.service"),
+            (&units, "kbf-backup.timer"),
             (&units, "kbf-frontend@.service"),
             (&units, "kbf.slice"),
             (&trust, "gh"),
@@ -430,7 +432,7 @@ fn the_host_payload_is_placed_where_the_package_puts_it_and_nothing_else() {
         std::fs::read(installer_binary()).expect("stub"),
     );
     assert_eq!(
-        std::fs::read_to_string(r.root.join(PAYLOAD[2])).expect("unit"),
+        std::fs::read_to_string(r.root.join(PAYLOAD[3])).expect("unit"),
         "stub kbf-installer.service\n"
     );
     assert!(
@@ -874,8 +876,8 @@ fn a_payload_with_a_file_outside_the_packages_paths_is_refused_and_places_nothin
             "which the package does not",
         ),
         (
-            "timer",
-            vec![good, ("usr/lib/systemd/system/kbf-a.timer", reg, b"x")],
+            "socket",
+            vec![good, ("usr/lib/systemd/system/kbf-a.socket", reg, b"x")],
             "which the package does not",
         ),
         (

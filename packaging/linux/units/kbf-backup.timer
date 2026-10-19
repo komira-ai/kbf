@@ -1,0 +1,15 @@
+# Runs kbf-backup.service every day. Static unit, installed disabled; `kbf-installer setup`
+# enables it with the frontend (and all-in-one) units. Persistent=: a host that was down at the
+# time takes its backup when it starts. The delay spreads the hosts of a fleet. A new host's
+# first backup is the operator's: `systemctl start kbf-backup.service`, then a restore test.
+[Unit]
+Description=kbf state database backup, daily
+ConditionPathExists=/etc/kbf/installer.toml
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -315,6 +315,8 @@ jobs:
         options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
+      # Where the PostgreSQL 17 client tools the backup test needs are installed.
+      KBF_TEST_PG_BIN: /usr/lib/postgresql/17/bin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -329,10 +331,19 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # pg_dump and pg_restore for the installer's backup test: as new as the server above
+      # (17), because a dump tool older than its server refuses to run. The runner image
+      # already has the PostgreSQL apt repository.
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y --no-install-recommends postgresql-client-17
       - run: cargo clippy -p kbf-state --features postgres --all-targets --locked -- -D warnings
       - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored
       # The installer's `setup` and update step over a real schema (src/database_tests.rs).
       - run: 'cargo test -p kbf-installer --locked --lib --test binary -- --include-ignored database:: setup_creates_the_schema'
+      # The installer's backup and restore over a real server: the schema made as setup makes it,
+      # rows through the state store, `backup`, a restore into a second database as a role that
+      # is not a superuser, and the store opened on it (src/backup_tests.rs).
+      - run: cargo test -p kbf-installer --locked --lib -- --include-ignored backup::tests::real_server_round_trip
       # The server over Postgres: the flag opens it (tests/state_store_postgres.rs), and the
       # farm's restart tests run on a schema of their own (`over_postgres` in tests/state_store.rs).
       - run: cargo test -p kbf-server --locked --test state_store_postgres -- --include-ignored
@@ -373,6 +384,8 @@ jobs:
         options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
+      # Where the PostgreSQL 17 client tools the backup test needs are installed.
+      KBF_TEST_PG_BIN: /usr/lib/postgresql/17/bin
       RUSTFLAGS: ""
       COVERAGE_TOOLCHAIN: nightly-2026-10-01
       LLVM_COV_VERSION: 0.9.1
@@ -432,6 +445,12 @@ jobs:
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-cli --test frontend_process -- --include-ignored postgres_state_store
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y --no-install-recommends postgresql-client-17
+      - name: Run the installer's backup round trip under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-installer --lib -- --include-ignored backup::tests::real_server_round_trip
       - name: Report
         env:
           LLVM_COV_FLAGS: -skip-functions

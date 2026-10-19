@@ -16,7 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kbf_host::{HostExec, HostPath, Root};
 
 use crate::activate;
-use crate::cli::{BootArgs, Cli, RunArgs, Verb};
+use crate::backup;
+use crate::cli::{BackupArgs, BootArgs, Cli, RestoreArgs, RunArgs, Verb};
 use crate::database::Database;
 use crate::exit::Exit;
 use crate::helper::cycle::{Config, Helper, HelperError};
@@ -31,6 +32,7 @@ use crate::setup;
 
 /// Why a verb failed and the exit it ends with: `Failed`, or `NeedsOperator` when only an
 /// operator can go on (the state files are both unusable).
+#[derive(Debug)]
 struct Failure {
     exit: Exit,
     why: String,
@@ -242,6 +244,86 @@ fn quiesce(root: PathBuf) -> Result<(), Failure> {
     operator::quiesce(&layout, operator::LOCK_WAIT).map_err(Failure::from)
 }
 
+/// What `backup` and `restore` say when they work, on the error stream (standard output is
+/// for `--json`).
+fn progress(err: &mut dyn Write, text: &str) {
+    // A closed pipe is the reader's business; the exit code still tells.
+    let _ = writeln!(err, "kbf-installer: {text}");
+}
+
+/// `kbf-installer backup`: without `--apply` it says what it would do and touches nothing.
+fn run_backup(
+    tool: &dyn backup::Tool,
+    root: PathBuf,
+    apply: bool,
+    args: &BackupArgs,
+    err: &mut dyn Write,
+) -> Result<(), Failure> {
+    let settings = backup::Settings::read(&under(&root, &args.installer_config)?)?;
+    let dir = under(&root, &args.dir)?;
+    if !apply {
+        progress(
+            err,
+            &format!(
+                "backup: dry run: would dump the state database into {}, keeping the newest {}",
+                dir.display(),
+                settings.keep
+            ),
+        );
+        return Ok(());
+    }
+    let spec = backup::Spec {
+        dir: &dir,
+        url: &settings.url,
+        keep: settings.keep,
+        pg_dump: &args.pg_dump,
+        pg_restore: &args.pg_restore,
+    };
+    let done = backup::backup(tool, &spec, now())?;
+    progress(
+        err,
+        &format!(
+            "backup: wrote {} ({} bytes); removed {} old",
+            done.file.display(),
+            done.bytes,
+            done.removed.len()
+        ),
+    );
+    Ok(())
+}
+
+/// `kbf-installer restore`: without `--apply` it says what it would do and touches nothing.
+fn run_restore(
+    tool: &dyn backup::Tool,
+    root: PathBuf,
+    apply: bool,
+    args: &RestoreArgs,
+    err: &mut dyn Write,
+) -> Result<(), Failure> {
+    let url = match &args.database {
+        Some(url) => {
+            crate::database::check_url("the --database flag", url)
+                .map_err(|e| Failure::from(e.to_string()))?;
+            url.clone()
+        }
+        None => backup::Settings::read(&under(&root, &args.installer_config)?)?.url,
+    };
+    let file = under(&root, &args.file)?;
+    if !apply {
+        progress(
+            err,
+            &format!(
+                "restore: dry run: would restore {} into the state database",
+                file.display()
+            ),
+        );
+        return Ok(());
+    }
+    backup::restore(tool, &args.pg_restore, &url, &file)?;
+    progress(err, &format!("restore: restored {}", file.display()));
+    Ok(())
+}
+
 /// The directory the host's paths are under: `/`, except in a build with the sandbox flag.
 fn root_of(cli: &Cli) -> PathBuf {
     #[cfg(feature = "test-sandbox")]
@@ -305,6 +387,8 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
             serde_json::json!({"verb": name, "error": "needs_root", "euid": euid}),
         );
     }
+    // What `backup` and `restore` report when they work; written once `say` is done with `err`.
+    let mut said = Vec::new();
     let result = match &cli.verb {
         // `setup` checks for root itself and prints its steps ahead of its own result.
         Verb::Setup(args) => {
@@ -323,6 +407,12 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         Verb::Rollback(s) => operate(root_of(cli), cli.apply, s.restart(), |o| o.rollback()),
         Verb::Gc(g) => gc(root_of(cli), cli.apply, g.keep),
         Verb::Quiesce => quiesce(root_of(cli)),
+        Verb::Backup(args) => {
+            run_backup(&backup::Process, root_of(cli), cli.apply, args, &mut said)
+        }
+        Verb::Restore(args) => {
+            run_restore(&backup::Process, root_of(cli), cli.apply, args, &mut said)
+        }
         other => {
             let phase = other.built_by().unwrap_or("?");
             return say(
@@ -338,7 +428,10 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         }
     };
     match result {
-        Ok(()) => Exit::Ok,
+        Ok(()) => {
+            let _ = err.write_all(&said);
+            Exit::Ok
+        }
         Err(Failure { exit, why }) => say(
             exit,
             format!("kbf-installer: {why}"),

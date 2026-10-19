@@ -51,6 +51,7 @@ pub mod activate;
 pub mod app;
 pub mod archive;
 pub mod attest;
+pub mod backup;
 pub mod binary;
 pub mod cli;
 pub mod darwin;

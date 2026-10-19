@@ -50,8 +50,10 @@ const INSTALLER_CONFIG: &str = "/etc/kbf/installer.toml";
 const ENVOY_CONFIG: &str = "/etc/kbf/envoy/envoy.json";
 
 /// The files of the package, and nothing else.
-const FILES: [&str; 8] = [
+const FILES: [&str; 10] = [
     "kbf-all-in-one.service",
+    "kbf-backup.service",
+    "kbf-backup.timer",
     "kbf-daemon.service",
     "kbf-envoy.service",
     "kbf-frontend@.service",
@@ -72,7 +74,7 @@ const RUNTIME: [&str; 6] = [
 ];
 
 /// The rules, by the tag a violation starts with.
-const RULES: [&str; 30] = [
+const RULES: [&str; 31] = [
     "install",
     "network",
     "positional",
@@ -103,6 +105,7 @@ const RULES: [&str; 30] = [
     "reload",
     "installer",
     "runtime",
+    "backup",
 ];
 
 fn units_dir() -> PathBuf {
@@ -114,12 +117,12 @@ fn read(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// The mode a unit file starts: the word after `kbf`. Envoy's and the installer's units
-/// start no mode.
+/// The mode a unit file starts: the word after `kbf`. Envoy's, the installer's and the
+/// backup's units start no mode.
 fn mode_of(name: &str) -> Option<&str> {
     let stem = name.strip_suffix(".service")?;
     let mode = stem.strip_prefix("kbf-")?.trim_end_matches('@');
-    (!["envoy", "installer"].contains(&mode)).then_some(mode)
+    (!["envoy", "installer", "backup"].contains(&mode)).then_some(mode)
 }
 
 fn trim(v: &str) -> &str {
@@ -199,6 +202,10 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     // command line.
     for line in comments_in_continuations(text) {
         v("continuation", format!("line {line}"));
+    }
+    if name == "kbf-backup.service" || name == "kbf-backup.timer" {
+        backup_rules(name, text, &mut v);
+        return out;
     }
     if name == "kbf.slice" {
         let unit = UnitFile::parse(text).expect("kbf.slice parses");
@@ -642,6 +649,86 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     out
 }
 
+/// Rule `backup`: the state database's backup, a oneshot service and the timer that starts it
+/// (docs/design/frontend-proxy.md section 11). Neither is a runtime unit, so none of the
+/// runtime rules (network, slice, the checks, the restart policy) apply; these do.
+fn backup_rules(name: &str, text: &str, v: &mut impl FnMut(&str, String)) {
+    let unit = UnitFile::parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let mut bad = |why: String| v("backup", why);
+    // Catches a backup that runs on a host with no installer.toml (no database to dump).
+    if !all(&unit, "Unit", "ConditionPathExists").contains(&INSTALLER_CONFIG) {
+        bad(format!(
+            "no ConditionPathExists={INSTALLER_CONFIG} in [Unit]"
+        ));
+    }
+    if name == "kbf-backup.timer" {
+        // Catches a timer that never fires (no schedule), one that skips the run of a host that
+        // was down, one nothing links at boot, and one that starts another unit.
+        if all(&unit, "Timer", "OnCalendar")
+            .iter()
+            .all(|c| trim(c).is_empty())
+        {
+            bad("no OnCalendar= in [Timer]".into());
+        }
+        if unit.get_in("Timer", "Persistent").map(trim) != Some("true") {
+            bad("no Persistent=true in [Timer]".into());
+        }
+        if !all(&unit, "Install", "WantedBy").contains(&"timers.target") {
+            bad("no WantedBy=timers.target in [Install]".into());
+        }
+        if let Some(other) = unit.get_in("Timer", "Unit").map(trim)
+            && other != "kbf-backup.service"
+        {
+            bad(format!("Unit= is {other}, not kbf-backup.service"));
+        }
+        return;
+    }
+    let get = |s: &str, k: &str| unit.get_in(s, k).map(trim);
+    // Catches a service that is not run to completion (a forking or simple backup would be
+    // `active` the moment it starts, and a failure after that would not fail the unit).
+    if get("Service", "Type") != Some("oneshot") {
+        bad("Type= is not oneshot".into());
+    }
+    // Catches a backup run as root or as the user builds run as: peer authentication makes
+    // the user the database role, which is kbf-server's, and the backups are that user's alone.
+    if get("Service", "User") != Some("kbf-server") {
+        bad("User= is not kbf-server".into());
+    }
+    // Catches a backup that runs something else than the verb, or one that only says what it
+    // would do (`--apply` is what makes the verb act).
+    let start = unit.exec_start();
+    if start != [INSTALLER, "--apply", "backup"] {
+        bad(format!(
+            "ExecStart= is {start:?}, not {INSTALLER} --apply backup"
+        ));
+    }
+    // Catches a pre- or post-step, which would be a second thing the unit does as kbf-server.
+    for key in ["ExecStartPre", "ExecStartPost", "ExecStop", "ExecCondition"] {
+        if !all(&unit, "Service", key).is_empty() {
+            bad(format!("{key}= in [Service]"));
+        }
+    }
+    // Catches files made readable to others (the dump is the whole state, tokens included),
+    // and a lost hardening key.
+    for (k, want) in [
+        ("UMask", "0077"),
+        ("NoNewPrivileges", "yes"),
+        ("ProtectSystem", "strict"),
+        ("PrivateTmp", "yes"),
+        ("StateDirectory", "kbf-server"),
+        ("StateDirectoryMode", "0750"),
+    ] {
+        if get("Service", k) != Some(want) {
+            bad(format!("{k}= is {:?}, not {want}", get("Service", k)));
+        }
+    }
+    // Catches a service that is enabled on its own: it is started by its timer, and a
+    // `systemctl enable` that linked it into multi-user.target would run a backup at every boot.
+    if unit.directives().iter().any(|d| d.section == "Install") {
+        bad("an [Install] section: the timer starts it".into());
+    }
+}
+
 /// Rule `installer`: kbf-installer's own unit (contract section 7).
 fn installer_rules(
     unit: &UnitFile,
@@ -746,7 +833,7 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
     let mut n = 0;
     for name in FILES.iter().filter(|n| n.ends_with(".service")) {
         let unit = UnitFile::parse(&read(name)).expect("parses");
-        let config = if *name == "kbf-installer.service" {
+        let config = if ["kbf-installer.service", "kbf-backup.service"].contains(name) {
             INSTALLER_CONFIG
         } else {
             CONFIG
@@ -757,7 +844,9 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
         );
         // Envoy is the host's own (no kbf check of it at start yet: the supported version
         // range is checked by host preparation); every kbf unit runs its checks first.
-        if *name != "kbf-envoy.service" {
+        // The backup is a oneshot of the installer's own verb: its gate is the file alone (the
+        // `backup` rule says what it may run).
+        if !["kbf-envoy.service", "kbf-backup.service"].contains(name) {
             assert!(
                 !all(&unit, "Service", "ExecStartPre").is_empty(),
                 "{name}: no ExecStartPre= check"
@@ -765,7 +854,7 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
         }
         n += 1;
     }
-    assert_eq!(n, 7, "a unit was not checked");
+    assert_eq!(n, 8, "a unit was not checked");
 }
 
 /// The modes whose units `files` hold, sorted.
@@ -797,6 +886,43 @@ fn the_kbf_modes_are_exactly_the_five() {
         .filter(|f| *f != "kbf-storage.service")
         .collect();
     assert_ne!(modes_in(&fewer), want, "a missing mode unit must not pass");
+}
+
+/// Catches the backup unit and the verb drifting apart: the unit's command line must parse
+/// as the installer's own, as the verb `backup` with `--apply`, and its default directory must
+/// be the one the unit's `StateDirectory=` makes (a backup written where systemd made no
+/// directory would fail on the first run, or be written outside the unit's reach).
+#[test]
+fn the_backup_unit_runs_a_verb_the_installer_has() {
+    use clap::Parser;
+    use kbf_installer::cli::{Cli, Verb};
+
+    let text = read("kbf-backup.service");
+    let unit = UnitFile::parse(&text).expect("parses");
+    let start = unit.exec_start();
+    assert_eq!(start.first().copied(), Some(INSTALLER));
+    let cli =
+        Cli::try_parse_from(std::iter::once("kbf-installer").chain(start[1..].iter().copied()))
+            .expect("the unit's command line is the installer's");
+    assert!(
+        cli.apply,
+        "without --apply the verb only says what it would do"
+    );
+    let Verb::Backup(args) = cli.verb else {
+        panic!("the unit does not run the backup verb");
+    };
+    let state = unit
+        .get_in("Service", "StateDirectory")
+        .map(trim)
+        .expect("StateDirectory=");
+    assert!(
+        args.dir
+            .to_string()
+            .starts_with(&format!("/var/lib/{state}/")),
+        "the backup directory {} is not under /var/lib/{state}",
+        args.dir
+    );
+    assert_eq!(args.installer_config.to_string(), INSTALLER_CONFIG);
 }
 
 /// Catches the per-instance block of the frontend going missing from the template: the
@@ -1047,6 +1173,75 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "NoNewPrivileges=yes\n",
         "",
         "installer",
+    ),
+    (
+        "kbf-backup.service",
+        "ConditionPathExists=/etc/kbf/installer.toml\n",
+        "",
+        "backup",
+    ),
+    (
+        "kbf-backup.service",
+        "Type=oneshot\n",
+        "Type=simple\n",
+        "backup",
+    ),
+    (
+        "kbf-backup.service",
+        "User=kbf-server\n",
+        "User=root\n",
+        "backup",
+    ),
+    (
+        "kbf-backup.service",
+        "ExecStart=/usr/bin/kbf-installer --apply backup\n",
+        "ExecStart=/usr/bin/kbf-installer backup\n",
+        "backup",
+    ),
+    (
+        "kbf-backup.service",
+        "ExecStart=/usr/bin/kbf-installer --apply backup\n",
+        "ExecStartPre=/usr/bin/kbf-installer check\nExecStart=/usr/bin/kbf-installer --apply backup\n",
+        "backup",
+    ),
+    (
+        "kbf-backup.service",
+        "UMask=0077\n",
+        "UMask=0022\n",
+        "backup",
+    ),
+    ("kbf-backup.service", "NoNewPrivileges=yes\n", "", "backup"),
+    (
+        "kbf-backup.service",
+        "StateDirectoryMode=0750\n",
+        "StateDirectoryMode=0755\n",
+        "backup",
+    ),
+    (
+        "kbf-backup.service",
+        "CapabilityBoundingSet=\n",
+        "CapabilityBoundingSet=\n\n[Install]\nWantedBy=multi-user.target\n",
+        "backup",
+    ),
+    ("kbf-backup.timer", "Persistent=true\n", "", "backup"),
+    ("kbf-backup.timer", "OnCalendar=daily\n", "", "backup"),
+    (
+        "kbf-backup.timer",
+        "WantedBy=timers.target\n",
+        "WantedBy=multi-user.target\n",
+        "backup",
+    ),
+    (
+        "kbf-backup.timer",
+        "[Timer]\n",
+        "[Timer]\nUnit=kbf-daemon.service\n",
+        "backup",
+    ),
+    (
+        "kbf-backup.timer",
+        "ConditionPathExists=/etc/kbf/installer.toml\n",
+        "",
+        "backup",
     ),
 ];
 

@@ -107,15 +107,15 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.put("units/other.service", "x");
                 t.inputs()
             },
-            "other.service: a package unit is named kbf-*.service",
+            "other.service: a package unit is named kbf-*.service or kbf-*.timer",
         ),
         (
-            "a unit that is a timer",
+            "a unit that is a socket",
             |t| {
-                t.put("units/kbf-gc.timer", "x");
+                t.put("units/kbf-gc.socket", "x");
                 t.inputs()
             },
-            "kbf-gc.timer: a package unit is named kbf-*.service",
+            "kbf-gc.socket: a package unit is named kbf-*.service or kbf-*.timer",
         ),
         (
             "a directory among the units",
@@ -666,16 +666,32 @@ fn no_dependency_of_either_package_names_envoy() {
     }
 }
 
-/// The slice is the one non-`.service` unit; any other name is still refused.
+/// The slice and the `kbf-*.timer` files (the backup timer) are the units that are not
+/// services; any other name is still refused, and a timer not named `kbf-` is too.
+///
+/// Mutants seen red: the `.timer` suffix not accepted (the backup timer would not package);
+/// any `.timer` accepted.
 #[test]
-fn a_unit_that_is_neither_a_service_nor_the_slice_is_refused() {
+fn a_unit_that_is_neither_a_service_a_timer_nor_the_slice_is_refused() {
     let t = Tree::new("slice");
     t.put("units/kbf.slice", "[Slice]");
-    assert!(plan(&t.inputs()).is_ok(), "the slice is packaged");
     t.put("units/kbf-x.timer", "[Timer]");
+    let planned = plan(&t.inputs()).expect("the slice and a kbf timer are packaged");
+    assert!(
+        planned
+            .iter()
+            .any(|e| e.dst == "/usr/lib/systemd/system/kbf-x.timer" && e.mode == 0o644),
+        "{planned:?}"
+    );
+    t.put("units/kbf-x.socket", "[Socket]");
+    t.put("units/other.timer", "[Timer]");
     let got = refused(plan(&t.inputs()));
-    assert!(got.contains("kbf-x.timer"), "{got}");
-    assert!(!got.contains("kbf.slice:"), "{got}");
+    assert!(got.contains("kbf-x.socket"), "{got}");
+    assert!(got.contains("other.timer"), "{got}");
+    assert!(
+        !got.contains("kbf.slice:") && !got.contains("kbf-x.timer:"),
+        "{got}"
+    );
 }
 
 #[test]

@@ -61,6 +61,11 @@ pub enum Verb {
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
     Check,
+    /// Dump the state database to the backup directory and keep the newest few; run by
+    /// kbf-backup.timer as the database's role (kbf-server).
+    Backup(BackupArgs),
+    /// Restore a backup into an empty state database, as the database's role (kbf-server).
+    Restore(RestoreArgs),
     #[command(hide = true)]
     Stage,
     #[command(hide = true)]
@@ -232,6 +237,41 @@ pub struct RunArgs {
 }
 
 #[derive(Args)]
+pub struct BackupArgs {
+    /// installer.toml, under the host root: its `database` key names the database to dump and
+    /// its `backup_keep` how many backups stay (default 7).
+    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
+    pub installer_config: kbf_host::HostPath,
+    /// The backup directory: made 0700 when it is not there, owned by the user that runs this.
+    #[arg(long, default_value = "/var/lib/kbf-server/backups", value_parser = kbf_host::HostPath::new)]
+    pub dir: kbf_host::HostPath,
+    /// The `pg_dump` program (a name looked up in PATH, or a path).
+    #[arg(long, default_value = "pg_dump")]
+    pub pg_dump: String,
+    /// The `pg_restore` program, which checks the dump can be read.
+    #[arg(long, default_value = "pg_restore")]
+    pub pg_restore: String,
+}
+
+#[derive(Args)]
+pub struct RestoreArgs {
+    /// The backup to restore (a file `backup` wrote).
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub file: kbf_host::HostPath,
+    /// installer.toml, under the host root: its `database` key names the database to restore
+    /// into (unless --database does), which must be empty of kbf's schema.
+    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
+    pub installer_config: kbf_host::HostPath,
+    /// Restore into this database instead (postgres:///NAME?host=SOCKET_DIR, no password): a
+    /// scratch database for a restore test.
+    #[arg(long)]
+    pub database: Option<String>,
+    /// The `pg_restore` program (a name looked up in PATH, or a path).
+    #[arg(long, default_value = "pg_restore")]
+    pub pg_restore: String,
+}
+
+#[derive(Args)]
 pub struct BootArgs {
     #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
@@ -252,15 +292,22 @@ impl Verb {
             Verb::BootCheck(_) => "boot-check",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
+            Verb::Backup(_) => "backup",
+            Verb::Restore(_) => "restore",
             Verb::Stage => "stage",
             Verb::Activate => "activate",
             Verb::FetchChild => "fetch-child",
         }
     }
 
-    /// Every verb but `status` and `check` needs root.
+    /// Every verb but `status`, `check`, `backup` and `restore` needs root. The last two run as
+    /// the user that is the database's role under peer authentication (`kbf-server`), which
+    /// root is not.
     pub fn needs_root(&self) -> bool {
-        !matches!(self, Verb::Status | Verb::Check)
+        !matches!(
+            self,
+            Verb::Status | Verb::Check | Verb::Backup(_) | Verb::Restore(_)
+        )
     }
 
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
@@ -274,6 +321,8 @@ impl Verb {
             | Verb::Rollback(_)
             | Verb::Gc(_)
             | Verb::Quiesce
+            | Verb::Backup(_)
+            | Verb::Restore(_)
             | Verb::Setup(_) => None,
             Verb::Check => Some("P10"),
             Verb::Status => Some("P4"),

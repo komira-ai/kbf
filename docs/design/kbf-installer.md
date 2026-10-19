@@ -32,7 +32,7 @@ One binary (**to build**; today a library plus `kbf-helper`). Mutating verbs are
 Three roots, never nested: kbf's own state `/var/lib/kbf` (user `kbf`, systemd StateDirectory, untouched by the installer); the installer tree `/var/lib/kbf-installer` (root:root 0755, not kbf's StateDirectory; everything the root side reads as authority lives here); package files. Only `orders/` in the installer tree is writable by `kbf`.
 
 Package-owned (root:root, no group/other write, changed by package upgrade only):
-- `/usr/bin/kbf-installer`, `/usr/lib/systemd/system/kbf-*.service`.
+- `/usr/bin/kbf-installer`, `/usr/lib/systemd/system/kbf-*.service` and `kbf-*.timer`.
 - `/usr/share/kbf-installer/trust/`: pinned `gh`, `trusted_root.jsonl` (with `valid_until`), `installer.conf` (signer workflow, OIDC issuer, repo, allowed source refs, `deny` commit list, and the tested Envoy version range of section 5.1). Replaces `/usr/local/libexec/kbf-deploy`. Allowed source refs live **only** here; `installer.toml` may narrow them, never widen (set intersection).
 
 Installer-owned (root:root):

@@ -79,7 +79,8 @@ installer's unit reads it, and refuses another path. A Mac is a node only (`--mo
    installer's own service does not wait for either). A unit that makes a frontend
    (`kbf-frontend@a.service`, `kbf-all-in-one.service`) is enabled and never started by
    `setup`: starting it takes the database, the TLS files and the port. A unit already
-   enabled is left alone. Nothing is restarted.
+   enabled is left alone. Nothing is restarted. Those two modes also get `kbf-backup.timer`,
+   enabled and started (the schema it dumps was made in step 7; see "Backup and restore").
 
 Every step is planned only where the host differs, so the same flags again is "nothing to do"
 (the database step reports the schema as current). A run that stopped part way is finished by
@@ -96,6 +97,78 @@ with exit 5.
 **Proxy units.** The bundled proxy's units (`kbf-proxy.service` and `.socket`) are not on
 `feature/arch-v2` yet (kbf#1153), so a frontend or all-in-one host enables the units that exist
 (`mode_units` in `src/setup/plan.rs` is the one place to change when they land).
+
+## Backup and restore
+
+A frontend or all-in-one host keeps all of kbf's state in its Postgres database, so that
+database is backed up. `kbf-backup.timer` starts `kbf-backup.service` every day (a host that
+was down then runs it when it starts, and each run is delayed by up to an hour), and the
+service runs `kbf-installer --apply backup` as `kbf-server`. `setup` enables the timer on the
+two modes; the units are in the package like the others (`packaging/linux/units`).
+
+**What the backup is.** `pg_dump` in custom format of the database `installer.toml` names, in
+`/var/lib/kbf-server/backups/kbf-<UTC time>.dump` (for example `kbf-20270115T080000Z.dump`).
+The directory is 0700 and each file 0600, owned by `kbf-server`: a dump holds the whole
+state, tokens and member map included. The role is the OS user running the unit: with peer
+authentication `kbf-server` connects as the Postgres role `kbf-server`, the one that owns the
+database and that the frontend connects as, and no password exists anywhere.
+
+**What one run does, in order.** It makes (or checks) the directory and closes it to other
+users; removes the temp file of an earlier run that crashed; has `pg_dump` write a temp file
+whose name is not a backup's; checks that the file is not empty and that `pg_restore --list`
+can read it; syncs it and renames it to its name (a backup is a whole file or it is not
+there); and only then removes the oldest backups beyond the newest `backup_keep`. Any failure
+ends the run with exit 1, removes its temp file, leaves every older backup alone, and the
+unit is `failed`: `systemctl status kbf-backup.service`, `journalctl -u kbf-backup.service`.
+A second run in the same second refuses rather than replace a backup. Without `--apply` the
+verb only says what it would do.
+
+**How many.** `backup_keep` in `/etc/kbf/installer.toml`, 1 to 365, default 7 when the key is
+not there (one a day is a week). `setup` keeps the key when it rewrites the file; the file is
+closed, so a value out of range is refused by `check`, `run` and `backup` alike. The backups
+are on the host's own disk, next to the database they protect: a copy to another machine is
+the operator's (kbf does not push anywhere), and a disk lost takes both.
+
+**Prerequisites.** `pg_dump` and `pg_restore` of the same major version as the server, or a
+newer one (the `postgresql-client` package; a client older than the server refuses to dump).
+The package does not depend on it yet. Both are found by name in `PATH`; `--pg-dump` and
+`--pg-restore` name other paths.
+
+**The first backup, and its restore test.** The design requires both before the farm depends
+on the database. On a new host, after `setup`, run one backup now and restore it into a
+scratch database, which touches nothing live:
+
+```text
+sudo systemctl start kbf-backup.service        # a oneshot: returns when the backup is done
+sudo ls -l /var/lib/kbf-server/backups         # kbf-<time>.dump, mode -rw-------
+sudo -u postgres createdb --owner=kbf-server kbf_restore_test
+sudo -u kbf-server kbf-installer --apply restore \
+    --file /var/lib/kbf-server/backups/kbf-<time>.dump \
+    --database 'postgres:///kbf_restore_test?host=/run/postgresql'
+sudo -u kbf-server psql 'postgres:///kbf_restore_test?host=/run/postgresql' -c '\dt kbf_state.*'
+sudo -u postgres dropdb kbf_restore_test
+```
+
+`restore` runs `pg_restore` in one transaction that stops at the first error, taking no owner
+or privilege from the dump (the connecting role owns what it makes, as `setup` made it). The
+database must hold no kbf schema: a restore into one that does fails and changes nothing.
+Without `--database` it restores into the database `installer.toml` names.
+
+**Restoring the real state** (the database is lost or damaged). The state is what the backup
+held: builds in flight are gone, and nodes register again.
+
+```text
+sudo systemctl stop kbf-frontend@a.service     # waits for open builds; nothing may write
+sudo -u postgres dropdb kbf
+sudo -u postgres createdb --owner=kbf-server kbf
+sudo -u kbf-server kbf-installer --apply restore --file /var/lib/kbf-server/backups/kbf-<time>.dump
+sudo systemctl start kbf-frontend@a.service    # opens the store: its schema check must accept it
+```
+
+The tests: `src/backup_tests.rs` (retention, atomicity, modes and the arguments, without a
+server) and, in the state-postgres CI job, `real_server_round_trip`: schema made as `setup`
+makes it, rows written through the state store, a backup, a restore into a second database as
+a role that is not a superuser, and the store opened on it reading every row back.
 
 ## Exit codes
 

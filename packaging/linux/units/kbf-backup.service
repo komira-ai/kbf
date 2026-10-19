@@ -1,0 +1,44 @@
+# kbf state database backup: `kbf-installer backup` runs `pg_dump` (custom format) of the
+# database installer.toml names into /var/lib/kbf-server/backups, keeps the newest
+# `backup_keep` (default 7) and exits non-zero on any failure, so systemd marks the unit
+# failed. Started by kbf-backup.timer; `systemctl start kbf-backup.service` takes one now.
+# Static unit: shipped by the kbf-installer package (installed under /usr/lib/systemd/system/),
+# disabled, with no rendering and no @PLACEHOLDER@ in it. `kbf-installer setup` enables the
+# timer on the hosts that keep their state in Postgres (frontend, all-in-one).
+#
+# It runs as kbf-server, the role of the database: the socket is peer-authenticated, so the
+# user the process runs as is the role it connects as, and no password exists anywhere. The
+# backups are that user's alone (the directory is 0700, each file 0600, both set by the verb).
+# StateDirectory= is the frontend's, with the same mode, so the two units agree on it.
+# docs/deploy/kbf-installer-setup.md, "Backup and restore"; docs/design/frontend-proxy.md,
+# section 11.
+[Unit]
+Description=kbf state database backup (pg_dump)
+# Gated on its own configuration, which `setup` writes with the database.
+ConditionPathExists=/etc/kbf/installer.toml
+# The server on this host, when it is started by systemd (the name is the Debian and the
+# Fedora one); no Wants=: a database that is down fails the backup, which is what a failed
+# unit is for.
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=kbf-server
+StateDirectory=kbf-server
+StateDirectoryMode=0750
+UMask=0077
+ExecStart=/usr/bin/kbf-installer --apply backup
+# A dump of a large state must be allowed to finish; one that never does must not hold the
+# timer for ever.
+TimeoutStartSec=2h
+# A backup must never slow the farm's builds.
+Nice=10
+IOSchedulingClass=idle
+# Only the dump's own reach: the socket, the backup directory, nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX

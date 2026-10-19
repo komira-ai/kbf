@@ -17,6 +17,8 @@ Commands:
   boot-check  Run before each start of a release on trial; counts the start
   quiesce     For maintainer scripts: take the lock; exit 5 while a swap is pending
   check       Validate the installer's configuration, trust files and path chain
+  backup      Dump the state database to the backup directory and keep the newest few; run by kbf-backup.timer as the database's role (kbf-server)
+  restore     Restore a backup into an empty state database, as the database's role (kbf-server)
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -197,4 +199,46 @@ Options:
       --json   Print the result as one JSON object on standard output
       --apply  Do what the verb says. Without it a mutating verb is a dry run
   -h, --help   Print help
+
+=== kbf-installer backup --help ===
+Dump the state database to the backup directory and keep the newest few; run by kbf-backup.timer as the database's role (kbf-server)
+
+Usage: kbf-installer backup [OPTIONS]
+
+Options:
+      --installer-config <INSTALLER_CONFIG>
+          installer.toml, under the host root: its `database` key names the database to dump and its `backup_keep` how many backups stay (default 7) [default: /etc/kbf/installer.toml]
+      --json
+          Print the result as one JSON object on standard output
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --dir <DIR>
+          The backup directory: made 0700 when it is not there, owned by the user that runs this [default: /var/lib/kbf-server/backups]
+      --pg-dump <PG_DUMP>
+          The `pg_dump` program (a name looked up in PATH, or a path) [default: pg_dump]
+      --pg-restore <PG_RESTORE>
+          The `pg_restore` program, which checks the dump can be read [default: pg_restore]
+  -h, --help
+          Print help
+
+=== kbf-installer restore --help ===
+Restore a backup into an empty state database, as the database's role (kbf-server)
+
+Usage: kbf-installer restore [OPTIONS] --file <FILE>
+
+Options:
+      --file <FILE>
+          The backup to restore (a file `backup` wrote)
+      --json
+          Print the result as one JSON object on standard output
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --installer-config <INSTALLER_CONFIG>
+          installer.toml, under the host root: its `database` key names the database to restore into (unless --database does), which must be empty of kbf's schema [default: /etc/kbf/installer.toml]
+      --database <DATABASE>
+          Restore into this database instead (postgres:///NAME?host=SOCKET_DIR, no password): a scratch database for a restore test
+      --pg-restore <PG_RESTORE>
+          The `pg_restore` program (a name looked up in PATH, or a path) [default: pg_restore]
+  -h, --help
+          Print help
 

@@ -35,6 +35,31 @@ fn the_database_key_is_accepted_and_rendered() {
     assert_eq!(InstallerToml::default().database, None);
 }
 
+/// Catches the `backup_keep` bound drifting: `kbf-installer backup` deletes every backup
+/// beyond this many, so 0 (which would delete the one just written) and an absurd count are
+/// refused, 1 and 365 are accepted, a default file leaves the key out of its canonical form,
+/// and a set value survives `render`.
+///
+/// Mutants seen red: the lower bound 0 (`0` accepted); `render` dropping the key.
+#[test]
+fn backup_keep_is_bounded_and_rendered_only_when_set() {
+    for ok in [1, 7, 365] {
+        let parsed = InstallerToml::parse(&format!("backup_keep = {ok}\n")).expect("parses");
+        assert_eq!(parsed.backup_keep, Some(ok));
+        assert!(parsed.render().ends_with(&format!("backup_keep = {ok}\n")));
+    }
+    for bad in ["0", "366", "-1", "\"7\""] {
+        assert!(
+            InstallerToml::parse(&format!("backup_keep = {bad}\n")).is_err(),
+            "{bad}"
+        );
+    }
+    let default = InstallerToml::default();
+    assert_eq!(default.backup_keep, None);
+    assert!(!default.render().contains("backup_keep"));
+    assert_eq!(DEFAULT_BACKUP_KEEP, 7);
+}
+
 /// Catches `render` writing the database URL with Rust's Debug escaping, which is not TOML
 /// (a `'` came out as `\'` and a non-ASCII character as `\u{..}`): the rendered file must
 /// parse back to the same URL.
