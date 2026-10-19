@@ -10,8 +10,8 @@ use kbf_enroll_registry::{TokenSpec, create_token};
 use kbf_proto::kbf::enroll::v1 as pb;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
-use kbf_types::{NodeId, Role, RoleSet, TokenId, TokenSecret};
 use kbf_testkit::dir::TestDir;
+use kbf_types::{NodeId, Role, RoleSet, TokenId, TokenSecret};
 use rcgen::{Attribute, CertificateParams, DistinguishedName, KeyPair};
 
 use super::ca::{Ca, SignerChoice};
@@ -24,7 +24,7 @@ pub const FRONTEND: &str = "front.test";
 
 /// A new, empty scratch directory no other test uses, removed when it drops.
 pub fn scratch(name: &str) -> TestDir {
-    TestDir::under(std::env::temp_dir(), &format!("kbf-enroll-svc-{name}"))
+    crate::test_dir::scratch_dir(&format!("kbf-enroll-svc-{name}"))
 }
 
 /// A state store, a CA and the service over them.

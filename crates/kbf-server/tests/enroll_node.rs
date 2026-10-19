@@ -23,9 +23,9 @@ use kbf_server::enroll::flags::EnrollFlags;
 use kbf_server::enroll::limits::Limits;
 use kbf_server::enroll::service::NodeSettings;
 use kbf_server::enroll::start::prepare;
-use kbf_testkit::dir::TestDir;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
+use kbf_testkit::dir::TestDir;
 use kbf_types::{CaPin, RefusalReason, Role, RoleSet, Token, TokenId, TokenSecret};
 
 fn unix_now() -> i64 {
@@ -40,7 +40,10 @@ fn unix_now() -> i64 {
 
 /// A new, empty scratch directory, removed when it drops.
 fn scratch(name: &str) -> TestDir {
-    TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("kbf-enroll-e2e-{name}"))
+    TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-enroll-e2e-{name}"),
+    )
 }
 
 /// A running enroll listener over a fresh store and CA.
