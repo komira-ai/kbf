@@ -26,8 +26,8 @@
 //! The crate also holds `kbf storage-and-daemon` ([`storage_and_daemon`]): the same
 //! daemon half and the same plane, beside the storage node in place of the server.
 //!
-//! The scheduler's state is a SQLite file, `<data-dir>/state.db` unless `--state-store`
-//! names one ([`cli`]).
+//! The scheduler's state is in Postgres, on the local socket `postgres:///kbf?host=/run/postgresql`
+//! unless `--state-store` names another store ([`cli`]).
 //!
 //! Not done yet (the README lists it): the in-process plane's admission; the `--reserve-cpus` split
 //! between the halves; the whole-process

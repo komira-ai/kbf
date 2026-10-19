@@ -233,7 +233,7 @@ impl State {
     /// # Errors
     /// UNAVAILABLE if the farm is fenced or the store did not take it.
     pub(super) fn admit(
-        &self,
+        &mut self,
         request: &kbf_sched::Request,
         subject: &crate::action_usage::Subject,
     ) -> Result<(), Status> {

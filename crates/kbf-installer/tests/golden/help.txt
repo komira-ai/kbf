@@ -74,8 +74,9 @@ Usage: kbf-installer run [OPTIONS]
 
 Options:
       --json                           Print the result as one JSON object on standard output
-      --update-dir <UPDATE_DIR>        Root's directory: status.json goes here; `inbox/` (the service user's) is beneath it [default: /var/lib/kbf-updater]
+      --update-dir <UPDATE_DIR>        Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it [default: /var/lib/kbf-installer]
       --apply                          Do what the verb says. Without it a mutating verb is a dry run
+      --orders-dir <ORDERS_DIR>        The order spool: owned by the service user, mode 0700, inside a root-owned parent [default: /var/lib/kbf-installer/orders]
       --unit <UNIT>                    The systemd unit to restart after a swap (Linux)
       --launchd-label <LAUNCHD_LABEL>  The launchd label to kickstart after a swap (macOS)
       --interval-secs <INTERVAL_SECS>  Seconds between passes [default: 3]

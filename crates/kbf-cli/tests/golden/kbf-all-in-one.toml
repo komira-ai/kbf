@@ -60,6 +60,8 @@ daemon-user = "_kbf"
 # driver = []
 # A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
 # image = []
+# The order spool (owned by the service user, mode 0700): where the daemon writes the order records the root installer reads. With `--update-dir` only; default `<update-dir>/orders`
+# orders-dir = "DIR"
 # The longest wait between rounds of connection attempts, in milliseconds. Each wait is jittered down by up to half
 reconnect-max-ms = 30000
 # The wait, in milliseconds, after a session ends and after the first round of connection attempts that all failed. It doubles with each further failed round
@@ -70,7 +72,7 @@ reconnect-ms = 1000
 # reserve-share = "N"
 # The roles to run
 role = "all"
-# The update directory: the daemon fetches the release the frontend offers into its `inbox/`, over the connection `--cas` names, and reads the root helper's `status.json` there. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
+# The root installer's directory: the daemon reads its `status.json` there. The frontend's orders are written to `orders/` beneath it unless `--orders-dir` says otherwise. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
 # update-dir = "DIR"
 
 [history]
@@ -192,7 +194,7 @@ input-tree-reads-in-flight = 64
 progress-interval-secs = 30
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready
 readyz-store-timeout-ms = 2000
-# Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing; the file is 0600 and a directory it makes 0700; every start is a new epoch, so the daemon kills the runs of the leases it held before). Left out, it is `<data-dir>/state.db`. Any other value, `postgres://` included, is refused (Postgres is not wired yet)
+# Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a URL with a password is refused, and the server must flush commits before it acknowledges them, `synchronous_commit` on, or the start is refused), or `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing; the file is 0600 and a directory it makes 0700). Every start is a new epoch, so the daemon kills the runs of the leases it held before. Left out, it is `postgres:///kbf?host=/run/postgresql`
 # state-store = "URI"
 # How long, in seconds, queued work waits while no connected daemon can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can
 unservable-wait-secs = 300

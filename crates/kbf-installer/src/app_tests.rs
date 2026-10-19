@@ -194,13 +194,13 @@ fn global_flags_may_follow_the_verb() {
     assert_eq!((cli.apply, cli.json), (true, true));
 }
 
-/// A host root with release A current and its inbox in place, as the installer finds a host.
+/// A host root with release A current and its order spool in place, as the installer finds a host.
 /// The installer under test lays a host out for the platform it was built for, so the
-/// scratch host is laid out for that platform too (`/var/db/kbf-deploy` on macOS).
+/// scratch host is laid out for that platform too (`/var/db/kbf-installer` on macOS).
 fn seeded(name: &str) -> (Layout, PathBuf) {
     let (layout, root) = host_root_on(&format!("app-{name}"), Platform::current());
-    fs::create_dir_all(root.join("var/lib/kbf-updater/inbox/orders")).expect("inbox");
-    let release = root.join("var/lib/kbf-installer/releases").join(A);
+    fs::create_dir_all(root.join("var/lib/kbf-installer/orders")).expect("order spool");
+    let release = layout.join(&layout.release_dir(&c(A)));
     fs::create_dir_all(&release).expect("release");
     fs::write(release.join("kbf"), b"x").expect("binary");
     Locked::acquire(&layout)
@@ -232,7 +232,7 @@ const RUN: [&str; 7] = [
 
 /// Catches `run` not doing a pass in this build of the crate (the real binary does; this is
 /// the same code run in the unit tests, so a change to it is seen by both): a pass on a host
-/// reports and exits 0 even as an ordinary user, with an inbox entry the stage refuses the
+/// reports and exits 0 even as an ordinary user, with an order record that is not one the
 /// pass still ends, an unreadable state stops it before any pass (exit 1), and a memory file
 /// it cannot read stops the loop with the file named.
 ///
@@ -244,10 +244,15 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
     let (layout, root) = seeded("run");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Ok, "{err}");
-    let status = fs::read(root.join("var/lib/kbf-updater/status.json")).expect("status.json");
+    let status = fs::read(root.join("var/lib/kbf-installer/status.json")).expect("status.json");
     let status: Value = serde_json::from_slice(&status).expect("json");
     assert_eq!(status["state"], "refused", "not root: the pass says so");
-    fs::create_dir(root.join(format!("var/lib/kbf-updater/inbox/{:020}-{B}", 2))).expect("entry");
+    let record = kbf_update::record::file_name(1, 2);
+    fs::write(
+        root.join("var/lib/kbf-installer/orders").join(record),
+        b"not an order",
+    )
+    .expect("record");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Ok, "{err}");
     fs::write(

@@ -3,7 +3,9 @@
 //!
 //! The store is the in-memory fake, which keeps a durable copy a restart reopens, and
 //! the farm's clock is tokio's, paused: nothing here waits. The tests that restart the
-//! farm over its store run a second time over a real SQLite file, closed and reopened.
+//! farm over its store run a second time over a real SQLite file, closed and reopened, and
+//! a third time over a real Postgres schema when `KBF_TEST_POSTGRES_URL` names a server
+//! (those are `#[ignore]`d; the `state-postgres` CI job runs them).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use kbf_sched::{DaemonInstance, Request};
 use kbf_server::farm::{Reported, StreamId};
 use kbf_server::{EpochPolicy, Farm, Listeners, ServeError, StateError, StateStore};
 use kbf_state::fake::{Fake, Flaw};
+use kbf_state::postgres::{Flaw as PgFlaw, PostgresBackend, PostgresStore};
 use kbf_state::sqlite::{Options, SqliteStore};
 use kbf_state::{
     Changes, Commit, CommitStats, Conflict, Fenced, ManualClock, Revision, ScanPage, ScanRange,
@@ -75,22 +78,25 @@ enum Backing {
     Fake,
     /// A SQLite file in a directory of the test's own.
     Sqlite,
+    /// A schema of its own in the Postgres database `KBF_TEST_POSTGRES_URL` names.
+    Postgres,
 }
 
 enum Inner {
     Fake(Fake),
-    Sqlite(Tracked),
+    Sqlite(Tracked<SqliteStore>),
+    Postgres(Box<Tracked<PostgresStore>>),
 }
 
-/// A SQLite store that records when it is closed, so a test can tell a restart that
-/// closed the store and opened the file again from one that kept the same object.
-struct Tracked {
-    store: SqliteStore,
+/// A store that records when it is closed, so a test can tell a restart that closed the
+/// store and opened it again from one that kept the same object.
+struct Tracked<S> {
+    store: S,
     closed: Arc<AtomicBool>,
 }
 
-impl Tracked {
-    fn new(store: SqliteStore) -> Self {
+impl<S> Tracked<S> {
+    fn new(store: S) -> Self {
         Self {
             store,
             closed: Arc::new(AtomicBool::new(false)),
@@ -98,7 +104,7 @@ impl Tracked {
     }
 }
 
-impl Drop for Tracked {
+impl<S> Drop for Tracked<S> {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::SeqCst);
     }
@@ -109,6 +115,7 @@ impl Inner {
         match self {
             Inner::Fake(store) => store,
             Inner::Sqlite(tracked) => &tracked.store,
+            Inner::Postgres(tracked) => &tracked.store,
         }
     }
 }
@@ -171,6 +178,7 @@ impl Flaky {
     fn closed(&self) -> Option<Arc<AtomicBool>> {
         match &self.inner {
             Inner::Sqlite(tracked) => Some(Arc::clone(&tracked.closed)),
+            Inner::Postgres(tracked) => Some(Arc::clone(&tracked.closed)),
             Inner::Fake(_) => None,
         }
     }
@@ -197,6 +205,14 @@ impl Flaky {
                 let path = tracked.store.path().to_owned();
                 drop(tracked);
                 Inner::Sqlite(Tracked::new(open_sqlite(&path)))
+            }
+            Inner::Postgres(tracked) => {
+                // The connections are dropped and opened again on the same schema, as a
+                // new process does; what the old store committed is what it finds.
+                let config = tracked.store.config().clone();
+                drop(tracked);
+                let reopened = PostgresStore::open(&config).expect("the Postgres store reopens");
+                Inner::Postgres(Box::new(Tracked::new(reopened)))
             }
         };
         Self::over(inner)
@@ -268,7 +284,13 @@ struct Disk {
     store: Arc<Flaky>,
     /// Kept for the SQLite file, and removed after the store is closed.
     _dir: Option<Scratch>,
+    /// Kept for the Postgres schema, dropped with it after the store is closed. Declared
+    /// after `store`, so the store goes first.
+    _postgres: Option<PostgresBackend>,
 }
+
+/// The variable naming a Postgres database the tests may create and drop schemas in.
+const POSTGRES_URL: &str = "KBF_TEST_POSTGRES_URL";
 
 impl Disk {
     fn new() -> Self {
@@ -283,11 +305,25 @@ impl Disk {
                 let store = open_sqlite(&dir.0.join("state.db"));
                 (Some(Inner::Sqlite(Tracked::new(store))), Some(dir))
             }
+            Backing::Postgres => (None, None),
+        };
+        let postgres = (matches!(backing, Backing::Postgres)).then(|| {
+            let url = std::env::var(POSTGRES_URL)
+                .unwrap_or_else(|_| panic!("{POSTGRES_URL} must name a database to test in"));
+            PostgresBackend::new(&url, PgFlaw::None)
+        });
+        let inner = match &postgres {
+            Some(backend) => {
+                let store = PostgresStore::open(&backend.fresh_config()).expect("a Postgres store");
+                Some(Inner::Postgres(Box::new(Tracked::new(store))))
+            }
+            None => inner,
         };
         let store = inner.map_or_else(Flaky::new, Flaky::over);
         Self {
             store: Arc::new(store),
             _dir: dir,
+            _postgres: postgres,
         }
     }
 
@@ -982,7 +1018,7 @@ async fn a_store_with_an_unreadable_row_refuses_the_farm() {
     assert!(matches!(refused, StateError::Corrupt { .. }), "{refused:?}");
 }
 
-/// Runs each restart test over the fake and over a SQLite file: what the fake keeps
+/// Runs each restart test over the fake, over a SQLite file and over a Postgres schema: what the fake keeps
 /// across a crash is what the real store must.
 macro_rules! restarts {
     ($($name:ident),* $(,)?) => {$(
@@ -997,6 +1033,12 @@ macro_rules! restarts {
             #[tokio::test(start_paused = true)]
             async fn over_sqlite() {
                 super::$name(Backing::Sqlite).await;
+            }
+
+            #[tokio::test(start_paused = true)]
+            #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+            async fn over_postgres() {
+                super::$name(Backing::Postgres).await;
             }
         }
     )*};
@@ -1349,6 +1391,60 @@ async fn a_committed_result_the_store_refused_is_written_and_answered_when_it_re
         Some(Finished::Failed(status)),
         "the row is not what the caller was sent"
     );
+}
+
+/// Catches: a request for an action whose finish the store has not taken yet that joins
+/// the finished operation. The scheduler finished it in memory, but its `op/` row and
+/// `inflight/` pin stay until the finish lands, so the submit finds a pin whose
+/// operation exists and takes it up again: the finished operation is queued afresh over
+/// itself, granted a second time (two runs), and the held answer and the new grant
+/// disagree. The request is refused UNAVAILABLE while the finish is held, no second
+/// `Start` goes out, and a request after the finish landed queues a fresh operation.
+#[tokio::test(start_paused = true)]
+async fn a_request_while_the_finish_is_held_does_not_retake_the_finished_operation() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    let ticket = farm
+        .submit(Submission {
+            request: request(1),
+            call: None,
+            described: Described::default(),
+        })
+        .expect("submitted");
+    let leases = starts(&mut inbox);
+    assert_eq!(leases.len(), 1);
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, leases[0]).await, "the store was down");
+    assert_eq!((disk.rows("op/"), disk.rows("inflight/")), (1, 1));
+
+    let again = submit(&farm, request(1));
+    assert_eq!(
+        again.err().map(|status| status.code()),
+        Some(Code::Unavailable),
+        "the request joined an operation the scheduler finished"
+    );
+
+    disk.store.set_down(false);
+    for _ in 0..3 {
+        farm.tick().await;
+    }
+    let Finished::Failed(status) = ended(&ticket) else {
+        panic!("the caller was answered with something else");
+    };
+    assert_eq!(status.message, "test");
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "the action ran a second time"
+    );
+    assert_eq!(
+        (disk.rows("op/"), disk.rows("inflight/"), disk.rows("done/")),
+        (0, 0, 1)
+    );
+
+    submit(&farm, request(1)).expect("a request after the finish landed");
+    assert_eq!(starts(&mut inbox).len(), 1, "a fresh run is granted");
+    assert_eq!((disk.rows("op/"), disk.rows("inflight/")), (1, 1));
 }
 
 /// Catches: a retry that goes on after a newer writer holds the store (the old scheduler

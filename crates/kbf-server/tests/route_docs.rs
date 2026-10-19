@@ -251,8 +251,32 @@ fn expand_verbs(routes: Vec<Route>, verbs: &[String]) -> Vec<Route> {
         .collect()
 }
 
+/// The one `POST` of `/v1/object-stores/connections/{target}` is the probe `{name}:verify`: the
+/// router captures the whole segment and the handler splits the verb off, so the documents name
+/// it with the `:verify`.
+const VERIFY_ROUTE: &str = "/v1/object-stores/connections/{}";
+
+/// Renames the `POST` of `VERIFY_ROUTE` to `POST VERIFY_ROUTE:verify`.
+fn name_verify(routes: Vec<Route>) -> Vec<Route> {
+    let post = ("POST".to_string(), VERIFY_ROUTE.to_string());
+    assert!(
+        routes.contains(&post),
+        "the router has no `POST {VERIFY_ROUTE}` any more: update this guard"
+    );
+    routes
+        .into_iter()
+        .map(|r| {
+            if r == post {
+                ("POST".to_string(), format!("{VERIFY_ROUTE}:verify"))
+            } else {
+                r
+            }
+        })
+        .collect()
+}
+
 /// The exact number of `(method, path)` routes, verbs expanded. A new route moves it.
-const ROUTES: usize = 44;
+const ROUTES: usize = 53;
 
 fn server_routes() -> Vec<Route> {
     let mut files = Vec::new();
@@ -270,7 +294,7 @@ fn server_routes() -> Vec<Route> {
         ["cordon", "drain", "uncordon"],
         "write_request accepts other verbs: the guard and the documents need a row each"
     );
-    let mut routes = expand_verbs(routes, &verbs);
+    let mut routes = name_verify(expand_verbs(routes, &verbs));
     routes.sort();
     routes.dedup();
     routes

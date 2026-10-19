@@ -3,7 +3,7 @@ use kbf_host::step::{Owner, Perms};
 use kbf_host::testkit::FakeExec;
 
 use super::*;
-use crate::fixtures::trusted_host;
+use crate::fixtures::{trusted_host, trusted_host_on};
 use crate::layout;
 
 fn gh() -> HostPath {
@@ -146,4 +146,23 @@ fn the_parent_of_a_path_is_its_directory_and_a_top_level_path_has_none() {
     assert_eq!(parent(&p("/usr/local/kbf")), Some(p("/usr/local")));
     assert_eq!(parent(&p("/usr/local")), Some(p("/usr")));
     assert_eq!(parent(&p("/usr")), None);
+}
+
+/// Catches the macOS trust list moving away from the package's directory (the fixtures and
+/// the layout then disagree about where `gh` is, and a Mac host is judged on a path nothing
+/// installs to): on a Mac the pinned `gh` and the trusted root are under
+/// `/usr/local/kbf-installer/trust`, and a host laid out as the package leaves it is trusted.
+///
+/// Mutant planted: the layout's macOS trust directory made `/usr/local/share/kbf-installer/trust`.
+#[test]
+fn the_macs_trust_list_is_the_packages_and_is_trusted() {
+    let exec = trusted_host_on(crate::layout::Platform::MacOs);
+    let host = crate::layout::Layout::new(
+        kbf_host::path::Root::new("/").expect("absolute"),
+        crate::layout::Platform::MacOs,
+    );
+    assert_eq!(host.gh().as_str(), "/usr/local/kbf-installer/trust/gh");
+    trusted_chain(&exec, &host.gh(), Kind::File).expect("gh");
+    trusted_chain(&exec, &host.trusted_root(), Kind::File).expect("the trusted root");
+    trusted_chain(&exec, &host.trust_dir(), Kind::Dir).expect("the directory");
 }

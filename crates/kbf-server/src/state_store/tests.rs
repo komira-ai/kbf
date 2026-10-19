@@ -13,11 +13,13 @@ fn parse(value: &str) -> Result<StateStoreUri, StateStoreUriError> {
 }
 
 /// Catches: a value the design does not admit accepted (a `file://` store the server
-/// could not open, a `postgres://` one nothing opens yet), a relative or empty SQLite
-/// path (a database created wherever the process happens to run), and a refusal that
-/// carries any of the value (a mistyped Postgres URL holds its password).
+/// could not open), a relative or empty SQLite path (a database created wherever the
+/// process happens to run), a Postgres URL that this client cannot use (no host, TLS asked
+/// for) taken and failing only at the first connection, a Postgres URL not taken when it
+/// is a Unix-socket one, and a refusal that carries any of the value (a mistyped
+/// Postgres URL holds its password).
 #[test]
-fn only_a_sqlite_path_is_accepted() {
+fn a_sqlite_path_and_a_postgres_url_are_accepted_and_nothing_else() {
     assert_eq!(
         parse("sqlite:///var/lib/kbf/state.db"),
         Ok(StateStoreUri::Sqlite(PathBuf::from(
@@ -27,19 +29,119 @@ fn only_a_sqlite_path_is_accepted() {
     for relative in ["sqlite://state.db", "sqlite://", "sqlite:///"] {
         assert_eq!(parse(relative), Err(StateStoreUriError::SqlitePath));
     }
-    for other in [
+    for url in [
+        "postgres:///kbf?host=/run/postgresql",
+        "postgresql:///kbf?host=/run/postgresql",
+        "postgres://kbf@/kbf?host=/run/postgresql",
+        "postgres://db.example/kbf",
+    ] {
+        assert!(
+            matches!(parse(url), Ok(StateStoreUri::Postgres(_))),
+            "{url}: {:?}",
+            parse(url)
+        );
+    }
+    for unusable in [
         "postgres://",
-        "postgres://kbf@db.example/state",
-        "postgres://kbf:hunter2@db/state",
+        "postgres:///kbf",
+        "postgres://kbf:hunter2@db/state?sslmode=require",
+        "postgres://kbf:hunter2@db:notaport/state",
+    ] {
+        let refused = parse(unusable).expect_err(unusable);
+        assert_eq!(refused, StateStoreUriError::PostgresUrl, "{unusable}");
+        assert!(!format!("{refused} {refused:?}").contains("hunter2"));
+    }
+    for other in [
         "postgres:kbf:hunter2@db/state",
         "file:///var/lib/kbf",
         "/var/lib/kbf/state.db",
+        "mysql://kbf:hunter2@db/state",
         "",
     ] {
         let refused = parse(other).expect_err(other);
         assert_eq!(refused, StateStoreUriError::Unsupported, "{other}");
         assert!(!format!("{refused} {refused:?}").contains("hunter2"));
     }
+}
+
+/// Catches: the default Postgres store of an all-in-one drifting from the URL the design
+/// names (`postgres:///kbf?host=/run/postgresql`, role and database `kbf`, the OS
+/// package's socket directory), or being a value the parser would refuse.
+#[test]
+fn the_local_postgres_store_is_the_designs_socket_url() {
+    assert_eq!(
+        StateStoreUri::local_postgres(),
+        parse("postgres:///kbf?host=/run/postgresql").expect("parses")
+    );
+    assert_eq!(
+        StateStoreUri::local_postgres().identity(),
+        PathBuf::from("postgres:///kbf?host=/run/postgresql")
+    );
+}
+
+/// Catches: a Postgres store whose epoch is not bumped by an open (a restored database
+/// could resume the leases of an earlier incarnation; the daemon would keep runs the
+/// scheduler no longer knows), and a SQLite one that stopped being bumped.
+#[test]
+fn every_open_of_either_store_bumps_the_epoch() {
+    for uri in [
+        StateStoreUri::local_postgres(),
+        StateStoreUri::Sqlite(PathBuf::from("/x.db")),
+    ] {
+        assert_eq!(uri.epoch_policy(), EpochPolicy::Bump, "{uri:?}");
+    }
+}
+
+/// Catches: the password of a URL printed by anything that prints the flags (`Debug` of
+/// `Args` is logged), and the handover's store identity carrying it to the other process.
+/// A URL with user information, a `password` parameter, and both.
+#[test]
+fn a_postgres_urls_password_is_in_neither_its_debug_text_nor_its_identity() {
+    for url in [
+        "postgres://kbf:hunter2@db.example/kbf",
+        "postgres://db.example/kbf?password=hunter2",
+        "postgres://kbf:hunter2@db.example/kbf?password=hunter2&connect_timeout=3",
+    ] {
+        let uri = parse(url).expect(url);
+        assert!(!format!("{uri:?}").contains("hunter2"), "{uri:?}");
+        let identity = uri.identity();
+        let identity = identity.to_str().expect("text");
+        assert!(!identity.contains("hunter2"), "{identity}");
+        assert!(!identity.contains("kbf:"), "{identity}");
+        assert!(identity.contains("db.example/kbf"), "{identity}");
+    }
+    // Two spellings of one database agree; two databases do not.
+    let one = parse("postgres://kbf:hunter2@db.example/kbf").expect("one");
+    let other = parse("postgres://kbf@db.example/kbf").expect("other");
+    let elsewhere = parse("postgres://kbf@db.example/other").expect("elsewhere");
+    assert_eq!(one.identity(), other.identity());
+    assert_ne!(one.identity(), elsewhere.identity());
+    let connect = parse("postgres://db.example/kbf?connect_timeout=3").expect("timeout");
+    assert!(
+        connect
+            .identity()
+            .to_string_lossy()
+            .ends_with("?connect_timeout=3"),
+        "other parameters stay: {connect:?}"
+    );
+}
+
+/// Catches: an open of a Postgres store that cannot be reached succeeding (the
+/// scheduler would run in memory behind a flag that promises durability), failing
+/// with anything but [`StateError::Open`], or saying the URL's password. The socket
+/// directory is one that does not exist.
+#[test]
+fn an_unreachable_postgres_store_refuses_the_open_without_the_password() {
+    let dir = scratch("no-socket");
+    let url = format!("postgres://kbf:hunter2@/kbf?host={}", dir.display());
+    let uri = parse(&url).expect("parses");
+    let refused = uri.open().err().expect("nothing listens");
+    assert!(matches!(&refused, StateError::Open(_)), "{refused:?}");
+    let said = format!("{refused} {refused:?}");
+    assert!(!said.contains("hunter2"), "{said}");
+    let after = uri.open_after_handover(1).err().expect("nothing listens");
+    assert!(matches!(&after, StateError::Open(_)), "{after:?}");
+    assert!(!format!("{after} {after:?}").contains("hunter2"));
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -122,7 +224,7 @@ fn a_store_opened_after_a_handover_expects_its_generation_and_keeps_the_epoch() 
     use kbf_state::GENERATION;
     let dir = scratch("handover");
     let uri = StateStoreUri::Sqlite(dir.join("state.db"));
-    assert_eq!(uri.path(), dir.join("state.db"));
+    assert_eq!(uri.identity(), dir.join("state.db"));
     let holder = uri.open().expect("opened");
     assert_eq!(holder.epoch, EpochPolicy::Bump);
     drop(holder);
@@ -218,10 +320,11 @@ fn a_sqlite_value_that_cannot_be_opened_names_the_path() {
 }
 
 /// Catches: the flag not reaching the server's arguments, a default other than the
-/// in-memory scheduler, and a value other than a SQLite path accepted by the command
-/// line.
+/// in-memory scheduler, a Postgres socket URL the command line refuses, a URL with a
+/// password accepted on the command line (it is world-readable), and a value of another
+/// kind accepted.
 #[test]
-fn the_flag_takes_a_sqlite_path_and_defaults_to_none() {
+fn the_flag_takes_a_sqlite_path_or_a_postgres_socket_url_and_defaults_to_none() {
     let args = Args::try_parse_from(["kbf-server"]).expect("no flag");
     assert_eq!(args.state_store, None);
     assert!(args.open_state_store().expect("none").is_none());
@@ -230,14 +333,30 @@ fn the_flag_takes_a_sqlite_path_and_defaults_to_none() {
         args.state_store,
         Some(StateStoreUri::Sqlite(PathBuf::from("/x.db")))
     );
+    let args = Args::try_parse_from([
+        "kbf-server",
+        "--state-store=postgres:///kbf?host=/run/postgresql",
+    ])
+    .expect("flag");
+    assert_eq!(args.state_store, Some(StateStoreUri::local_postgres()));
     let refused =
         Args::try_parse_from(["kbf-server", "--state-store=file:///x"]).expect_err("scheme");
     assert!(
         refused
             .to_string()
-            .contains("only sqlite:///<absolute path>"),
+            .contains("only postgres:///<database>?host=<socket directory> or sqlite:///"),
         "{refused}"
     );
+    for password in [
+        "postgres://kbf:hunter2@db.example/kbf",
+        "postgres://db.example/kbf?password=hunter2",
+    ] {
+        let refused = Args::try_parse_from(["kbf-server", &format!("--state-store={password}")])
+            .expect_err(password);
+        let said = refused.to_string();
+        assert!(said.contains("must carry no password"), "{said}");
+        assert!(!said.contains("hunter2"), "{said}");
+    }
 }
 
 /// Catches: a refused `--state-store` that quotes its value back. clap echoes the value of
@@ -254,6 +373,7 @@ fn a_refused_state_store_never_echoes_its_value() {
         "postgres:kbf:hunter2@db://x",
         "postgres://db/x?user=kbf&password=hunter2",
         "postgres://db/x?password=hunter2",
+        "postgres://kbf:hunter2@db/x?sslmode=require",
         "sqlite://hunter2",
     ] {
         let refused = Args::try_parse_from(["kbf-server", &format!("--state-store={value}")])

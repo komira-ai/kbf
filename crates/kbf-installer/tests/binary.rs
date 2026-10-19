@@ -1,6 +1,6 @@
 //! `kbf-installer` as the unit runs it, on a scratch root. Nothing here restarts a service or
-//! runs a staged binary: the passes see an empty inbox, an inbox entry the stage refuses
-//! (no `gh` is pinned under the scratch root), and a release on trial.
+//! runs a fetched binary: the passes see an empty order spool, an order record the binary
+//! refuses (it has no release fetcher yet), and a release on trial.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ fn root(name: &str) -> PathBuf {
     // The platform the binary was built for, as the binary lays the host out.
     let (_, dir) =
         kbf_installer::testkit::host_root_on(&format!("helper-bin-{name}"), Platform::current());
-    fs::create_dir_all(dir.join("var/lib/kbf-updater/inbox/orders")).expect("inbox");
+    fs::create_dir_all(dir.join("var/lib/kbf-installer/orders")).expect("order spool");
     dir
 }
 
@@ -44,16 +44,16 @@ fn helper(root: &Path, args: &[&str]) -> Output {
 }
 
 fn status(root: &Path) -> serde_json::Value {
-    let bytes = fs::read(root.join("var/lib/kbf-updater/status.json")).expect("status.json");
+    let bytes = fs::read(root.join("var/lib/kbf-installer/status.json")).expect("status.json");
     serde_json::from_slice(&bytes).expect("json")
 }
 
 /// Catches a helper that cannot do one pass of its own: it writes a world-readable
-/// status.json and exits 0 (here as a non-root user, so with the installer's refusal); with an inbox entry it
-/// cannot stage (nothing is pinned under this root), the pass ends and the refusal is the
-/// node's to read, not a crash.
+/// status.json and exits 0 (here as a non-root user, so with the installer's refusal); with an order it cannot
+/// carry out (the binary has no fetcher yet), the pass ends and the refusal is the node's to
+/// read, not a crash.
 #[test]
-fn one_pass_reports_the_host_and_a_refused_entry() {
+fn one_pass_reports_the_host_and_a_refused_order() {
     let root = root("pass");
     let host = layout(&root);
     Locked::acquire(&host)
@@ -63,14 +63,9 @@ fn one_pass_reports_the_host_and_a_refused_entry() {
             ..State::default()
         })
         .expect("state");
-    fs::create_dir_all(root.join("var/lib/kbf-installer/releases").join(A)).expect("release");
-    fs::write(
-        root.join("var/lib/kbf-installer/releases")
-            .join(A)
-            .join("kbf"),
-        b"x",
-    )
-    .expect("binary");
+    let release = host.join(&host.release_dir(&c(A)));
+    fs::create_dir_all(&release).expect("release");
+    fs::write(release.join("kbf"), b"x").expect("binary");
 
     let run = [
         "run",
@@ -98,13 +93,47 @@ fn one_pass_reports_the_host_and_a_refused_entry() {
     );
     assert_eq!(status(&root)["installed_commit"], A);
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(root.join("var/lib/kbf-updater/status.json"))
+    let mode = fs::metadata(root.join("var/lib/kbf-installer/status.json"))
         .expect("meta")
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o644, "the node reads it as the service user");
 
-    fs::create_dir(root.join(format!("var/lib/kbf-updater/inbox/{:020}-{B}", 2))).expect("entry");
+    // An activation: the binary has no lease source and no fetcher yet, so it is refused
+    // with that reason (fail closed), and the pass ends.
+    let record = kbf_update::OrderRecord {
+        order_id: 2,
+        epoch: 1,
+        generation: 1,
+        verb: kbf_update::Verb::Activate,
+        commit: B.to_owned(),
+        window_s: 600,
+        components: vec![kbf_update::Locator {
+            name: "kbf".to_owned(),
+            sha256: "ab".repeat(32),
+            size: 1000,
+            attestation: "{}".to_owned(),
+        }],
+        expected: Some(kbf_update::Facts {
+            // The platform of the host the binary was built for.
+            platform: if cfg!(target_os = "macos") {
+                "darwin-arm64"
+            } else {
+                "linux-x86_64"
+            }
+            .to_owned(),
+            protocol: 7,
+            min_protocol: 6,
+            state_schema: 3,
+            profile: "release".to_owned(),
+        }),
+    };
+    fs::write(
+        root.join("var/lib/kbf-installer/orders")
+            .join(record.file_name()),
+        record.to_bytes().expect("bytes"),
+    )
+    .expect("record");
     let out = helper(&root, &run);
     assert!(
         out.status.success(),
@@ -114,10 +143,9 @@ fn one_pass_reports_the_host_and_a_refused_entry() {
     assert_eq!(status(&root)["state"], "refused");
     let why = status(&root)["refusal"].as_str().expect("text").to_owned();
     assert!(
-        !why.contains("as root"),
-        "the stage's own refusal now: {why}"
+        why.contains("lease source"),
+        "the order's own refusal now: {why}"
     );
-    assert!(why.contains(':'), "{why}");
 }
 
 /// Catches the start check that does not count: with a release on trial, the unit's
@@ -131,7 +159,7 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     let root = root("boot");
     let host = layout(&root);
     for commit in [A, B] {
-        let dir = root.join("var/lib/kbf-installer/releases").join(commit);
+        let dir = host.join(&host.release_dir(&c(commit)));
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"x").expect("binary");
     }
@@ -186,12 +214,9 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
     );
     // With the backup damaged too, nobody can say what the host runs: exit 5, needs an
     // operator, and nothing is written.
-    fs::write(root.join("var/lib/kbf-installer/state.json"), b"not json").expect("ruin");
-    fs::write(
-        root.join("var/lib/kbf-installer/state.json.bak"),
-        b"not json",
-    )
-    .expect("ruin");
+    for name in ["state.json", "state.json.bak"] {
+        fs::write(in_state_dir(&root, name), b"not json").expect("ruin");
+    }
     let out = helper(&root, &["boot-check"]);
     assert_eq!(out.status.code(), Some(5));
     let err = String::from_utf8_lossy(&out.stderr);
@@ -200,7 +225,7 @@ fn the_boot_check_counts_the_starts_and_reverts_the_last() {
         "{err}"
     );
     assert_eq!(
-        fs::read(root.join("var/lib/kbf-installer/state.json")).expect("kept"),
+        fs::read(in_state_dir(&root, "state.json")).expect("kept"),
         b"not json"
     );
 }
@@ -279,43 +304,6 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
     let out = helper(&root, &elsewhere);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-installer:"));
-}
-
-/// Catches settings the host cannot trust being ignored: with an inbox entry to stage and an
-/// installer.conf that root does not own, the stage is refused with the reason in
-/// status.json, not run on defaults.
-#[test]
-fn settings_that_are_not_roots_refuse_the_stage() {
-    let root = root("settings");
-    fs::create_dir_all(root.join("usr/share/kbf-installer/trust")).expect("dir");
-    fs::write(
-        root.join("usr/share/kbf-installer/trust/installer.conf"),
-        "SOURCE_REFS=refs/heads/main\n",
-    )
-    .expect("settings");
-    fs::create_dir(root.join(format!("var/lib/kbf-updater/inbox/{:020}-{B}", 1))).expect("entry");
-    let out = helper(
-        &root,
-        &[
-            "run",
-            "--passes",
-            "1",
-            "--interval-secs",
-            "0",
-            "--unit",
-            "kbf.service",
-        ],
-    );
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let why = status(&root)["refusal"].as_str().expect("text").to_owned();
-    assert!(
-        why.to_ascii_lowercase().contains("settings") || why.contains("trust"),
-        "{why}"
-    );
 }
 
 /// Catches the gate in front of the verbs being absent from the shipped binary (the unit tests

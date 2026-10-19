@@ -789,65 +789,44 @@ fn with_old_key() -> String {
     edited(replace("kbf_data_dir=", "kbf_scratch="))
 }
 
-/// The daemon's arguments without the node label (it holds the profile's SHA-256, which
+/// The node's `kbf.toml` without the node label (it holds the profile's SHA-256, which
 /// differs when the file's bytes do).
-fn args_without_node_label(p: &Profile) -> Vec<String> {
-    let label = p.node_label();
-    kbf_mac_provision::launchd::daemon_args(p)
-        .into_iter()
-        .filter(|a| *a != label)
-        .collect()
+fn config_without_node_label(p: &Profile) -> String {
+    kbf_mac_provision::launchd::render_config(p).replace(&p.node_label(), "NODE-LABEL")
 }
 
-/// Catches: the job not running `kbf daemon` (a plist that still says `kbf node`, a mode
-/// that is going away, or `kbf-daemon`, a binary that is not in the package), the flags
-/// not in the Mac kit's order (driver, server, cas, ca-cert, cert, key, node-id, data-dir,
-/// labels), two words in one argument,
-/// the profile's `kbf_data_dir` not rendered as `--data-dir`, or the removed `--scratch`
-/// and `--cache-dir` flags.
+/// Catches: the job not running `kbf --mode=daemon --config <kbf.toml>` and nothing
+/// else (a flag after `--config` could not be told from the file's key, and the labels,
+/// the server and the certificates would be set twice), a plist that still names
+/// `kbf-daemon`, the word `node` (removed) back, or the removed `--scratch` and
+/// `--cache-dir` flags.
 #[test]
-fn the_job_runs_kbf_daemon_with_the_kits_flags() {
+fn the_job_runs_the_daemon_mode_with_its_config_and_nothing_else() {
     let p = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
     assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     let args = kbf_mac_provision::launchd::daemon_args(&p);
-    let label = p.node_label();
     assert_eq!(
         args,
         [
             "/usr/local/kbf-installer/releases/current/kbf",
-            "daemon",
-            "--driver",
-            "native",
-            "--server",
-            "https://farm.example.net:8981",
-            "--cas",
-            "https://farm.example.net:8981",
-            "--ca-cert",
-            "/usr/local/kbf/etc/ca.pem",
-            "--cert",
-            "/usr/local/kbf/etc/node.pem",
-            "--key",
-            "/usr/local/kbf/etc/node.key",
-            "--node-id",
-            p.get("hostname"),
-            "--data-dir",
-            "/Volumes/kbf/data",
-            "--label",
-            label.as_str(),
-            "--label",
-            "pool=mac",
-            "--label",
-            "rack=r2",
+            "--mode=daemon",
+            "--config",
+            "/usr/local/etc/kbf/kbf.toml",
         ]
     );
     let plist = kbf_mac_provision::launchd::render_plist(&p);
     for absent in [
         "<string>node</string>",
-        "--config",
         "--scratch",
         "--cache-dir",
         "--cache-",
         "--tree-",
+        "--server",
+        "--cert",
+        "--data-dir",
+        "--node-id",
+        "--label",
+        "--driver",
         "current/kbf-daemon",
     ] {
         assert!(!plist.contains(absent), "{absent} in\n{plist}");
@@ -868,7 +847,10 @@ fn the_old_key_is_accepted_with_a_warning_and_renders_the_same() {
         "{}",
         old.warnings[0]
     );
-    assert_eq!(args_without_node_label(&old), args_without_node_label(&new));
+    assert_eq!(
+        config_without_node_label(&old),
+        config_without_node_label(&new)
+    );
     assert!(!kbf_mac_provision::launchd::render_plist(&old).contains("--scratch"));
 }
 

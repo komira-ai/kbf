@@ -42,10 +42,10 @@ Thirteen tarballs, each with its SBOM and (once the push is attested) its proven
 | `kbf-<commit>-linux-x86_64.tar.gz`, `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz`, `kbf-installer-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
 | `kbf-<commit>-linux-arm64.tar.gz`, `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz`, `kbf-installer-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
 
-`kbf` is the one binary with all five modes (`kbf daemon`, `kbf all-in-one`, `kbf
-storage`, and the two modes not built yet; [cluster.md](design/cluster.md) sections 1
+`kbf` is the one binary with all five modes (`kbf --mode=daemon`, `kbf --mode=all-in-one`,
+`kbf --mode=storage`, and the two modes not built yet; [cluster.md](design/cluster.md) sections 1
 and 5.1), the one a host runs. `kbf-daemon` and `kbf-server` are the separate daemon
-and server binaries (Linux only: a Mac runs `kbf daemon`, and darwin has no
+and server binaries (Linux only: a Mac runs `kbf --mode=daemon`, and darwin has no
 `kbf-daemon` tarball; the ones of earlier commits stay where they were published).
 `kbf-deploy` is the deploy tool (its kits are listed in
 [ARCHITECTURE.md](../ARCHITECTURE.md)), shipped so an operator installs the tool the
