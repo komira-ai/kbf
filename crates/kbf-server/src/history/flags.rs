@@ -104,11 +104,10 @@ impl HistoryFlags {
         let store = Arc::clone(&state.store);
         let (place, rows) = (describe(uri), index_root.as_str());
         tracing::info!("history: objects in {place}, index {rows}");
-        let defaults = Options::default();
-        let options = Options {
-            writer: writer.unwrap_or(defaults.writer),
-            ..defaults
-        };
+        let mut options = Options::default();
+        if let Some(writer) = writer {
+            options.writer = writer;
+        }
         match uri {
             StoreUri::File(dir) => {
                 let objects = FsStore::open(dir, Floor::KeepFree)?;
