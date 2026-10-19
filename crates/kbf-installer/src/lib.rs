@@ -55,6 +55,7 @@ pub mod binary;
 pub mod cli;
 pub mod darwin;
 pub mod database;
+pub mod deploy;
 pub mod envoy;
 pub mod exit;
 #[cfg(test)]
