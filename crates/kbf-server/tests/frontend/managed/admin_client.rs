@@ -620,11 +620,11 @@ async fn child_over(node: &Node, holding: &Arc<Holding>) -> (Child, SocketAddr) 
 ///   Execute is through the role is still `active`, and a new Execute is queued, not
 ///   refused. So a `Timeout` from `quiesce` means the child is still serving, and the swap
 ///   may go on to a `resume` or a second `quiesce` from there. The child drops the call
-///   when it next polls the connection: with the held write stalling its runtime that is
-///   only once the write is let go, and until then the quiesce is alive. (Whether the
-///   connection's closing cancels the call in every state, and not only while it waits, is
-///   not shown: a cancel between the fence and the role change would leave a fenced farm
-///   that says `active`.)
+///   when it next polls the connection: with the held write stalling its runtime that was,
+///   in 9 of 10 traced runs, only once the write was let go, and until then the quiesce
+///   is alive. (Whether the connection's closing cancels the call in every state, and not
+///   only while it waits, is not shown: a cancel between the fence and the role change
+///   would leave a fenced farm that says `active`.)
 ///
 /// U2c ask: answer `202` and report `Quiescing` until the farm is quiet, or bound the wait
 /// by what the swap gives it.
@@ -737,13 +737,15 @@ async fn a_quiesce_blocks_while_a_call_is_queueing_and_is_dropped_with_a_client_
         "the client's deadline, not the child's: {waited:?}"
     );
     // The client is gone (its socket closed when the call returned) and the Execute is still
-    // held. There is nothing to wait for before letting it go: while the write is held the
-    // child cannot show that it has seen the close (the write holds the farm's lock and a
-    // runtime thread, and the quiet look of the quiesce was seen to stop ticking some 100 ms
-    // into a hold), and a pause here would only be a guess. What decides the outcome is the
-    // order of the child's first poll of the connection after the write is let go: hyper
-    // reads the connection (and finds the close) before it polls the handler, whose next
-    // quiet look would otherwise finish the quiesce.
+    // held. There is nothing to wait for before letting it go: while the write is held no
+    // answer of the child can tell that it has seen the close (every admin answer takes the
+    // farm's lock the write holds), and a pause here would only be a guess. Seen with
+    // tracing in the child, in 10 runs: in 9 it dropped the quiesce when the write was let
+    // go, within a few milliseconds, and in 1 as soon as the client left (in a traced run the
+    // quiet look of the quiesce had stopped ticking some 100 ms into the hold). So the
+    // outcome rests on the order of the child's first poll of the connection after the
+    // release: hyper reads the connection (and finds the close) before it polls the handler,
+    // whose next quiet look would otherwise finish the quiesce.
     holding.open();
     tokio::time::timeout(Duration::from_secs(5), held)
         .await
