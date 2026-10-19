@@ -114,6 +114,7 @@ use kbf_invocation::{CallKind, ExecuteAnswer};
 use crate::backend::Backend;
 use crate::described::Described;
 use crate::metrics::{CacheMetrics, OpenExecute};
+use crate::platform_alias::PlatformAliases;
 use crate::recorder::{ActionLabel, ExecuteCall, Recorder, listing};
 use crate::request_metadata::CallMetadata;
 use crate::wire;
@@ -426,6 +427,8 @@ pub struct ExecutionService<D> {
     recorder: Recorder,
     /// The memory an `action` that names no size books, in bytes.
     default_memory: u64,
+    /// The client properties that stand for others when placement reads the platform.
+    aliases: PlatformAliases,
 }
 
 /// The gRPC path of Execute, as calls are logged.
@@ -452,7 +455,26 @@ impl<D> ExecutionService<D> {
             authorizers,
             recorder: Recorder::off(),
             default_memory: DEFAULT_RESOURCES.memory_bytes,
+            aliases: PlatformAliases::default(),
         }
+    }
+
+    /// This service, expanding `aliases` in the platform of every action before
+    /// placement reads it ([`PlatformAliases::expand`]). The action itself, and so its
+    /// digest, is the client's. The aliases are logged here, once, at start.
+    #[must_use]
+    pub fn with_platform_aliases(mut self, aliases: PlatformAliases) -> Self {
+        for alias in aliases.describe() {
+            tracing::info!(%alias, "platform alias configured");
+        }
+        if aliases.is_empty() {
+            tracing::info!(
+                "no platform alias configured: a `pool` property is ignored, as is any \
+                 property kbf does not read"
+            );
+        }
+        self.aliases = aliases;
+        self
     }
 
     /// This service, booking `bytes` of memory for an `action` that names no size
@@ -672,7 +694,7 @@ impl<D> ExecutionService<D> {
             return Err(missing(&absent));
         }
 
-        let platform = properties(platform(&decoded, command.as_ref()))?;
+        let platform = properties(platform(&decoded, command.as_ref()), &self.aliases)?;
         let kind = lease_kind(&platform)?;
         let booked = booking(&platform, kind, self.default_memory)?;
         let needs = needs(&platform)?;
@@ -729,9 +751,20 @@ fn required(d: Option<&reapi::Digest>, field: &str) -> Result<Digest, Status> {
 /// The platform's properties that kbf reads, each under the name kbf reads it by
 /// (`kbf_caps::property_name`), or INVALID_ARGUMENT for a repeated one, also when
 /// repeated in another spelling (`gpu` and `GPU`).
-fn properties(platform: Option<&reapi::Platform>) -> Result<Platform, Status> {
+///
+/// `aliases` are expanded first, before any name is filtered or read: the OS and
+/// architecture an alias stands for then count for the macOS GPU rule, [`needs`] and the
+/// duplicate check as if the client had sent them. The platform in the `Action` is not
+/// touched, so its digest is the client's.
+fn properties(
+    platform: Option<&reapi::Platform>,
+    aliases: &PlatformAliases,
+) -> Result<Platform, Status> {
     let properties = platform.map_or(&[][..], |p| p.properties.as_slice());
     let sent = Platform::from_properties(properties.iter().map(|p| (&*p.name, &*p.value)))
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    let sent = aliases
+        .expand(sent)
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
     let mut read = Platform::new();
     for (name, value) in sent.canonical() {

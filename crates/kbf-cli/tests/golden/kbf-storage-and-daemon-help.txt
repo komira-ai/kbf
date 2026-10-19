@@ -32,7 +32,7 @@ Options:
           [default: 30000]
 
       --label <KEY=VALUE>
-          A node label, `key=value`, reported as `label.<key>`; repeatable. A Mac in komira's pool runs with `--label pool=darwin-sized`
+          A node label, `key=value`, reported as `label.<key>`; repeatable. A request matches a label only if it names `label.<key>`; a label never makes a node match a client's `pool=...` property (the frontend's `--platform-alias` does)
 
       --storage-dial-timeout-ms <STORAGE_DIAL_TIMEOUT_MS>
           The longest, in milliseconds, that dialling a storage node may take: for its TCP connection and for its TLS handshake each. Must be 1 to 3600000 (one hour)

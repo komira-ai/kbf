@@ -94,7 +94,7 @@ invocations-open = false
 # cert = "CERT"
 # PEM file of this daemon's private key
 # key = "KEY"
-# A node label, `key=value`, reported as `label.<key>`; repeatable. A Mac in komira's pool runs with `--label pool=darwin-sized`
+# A node label, `key=value`, reported as `label.<key>`; repeatable. A request matches a label only if it names `label.<key>`; a label never makes a node match a client's `pool=...` property (the frontend's `--platform-alias` does)
 # label = []
 # A stable name for this node, unique within the cell
 # node-id = "NODE_ID"
@@ -190,6 +190,8 @@ input-tree-cache-bytes = 268435456
 input-tree-cache-entries = 1048576
 # The most Directory blobs the input check reads from the store at once, across all Executes
 input-tree-reads-in-flight = 64
+# A platform alias, `NAME=VALUE:KEY=VALUE[,KEY=VALUE...]` (repeatable): a request that sends the property `NAME=VALUE` is placed as if it had sent the `KEY=VALUE` properties instead, and `NAME` itself is dropped. For example `pool=darwin-sized:OSFamily=Darwin,ISA=arm64` places an action that carries only `pool=darwin-sized` on a Mac with an Apple-silicon CPU and never on a Linux node. Only placement changes: the action, its digest and its cache key are the client's. A request that also sends a property the alias sets, with another value (or another spelling), is refused INVALID_ARGUMENT. `NAME` must be a property kbf does not read; every `KEY` one it does (`OSFamily`, `ISA`, `os`, `arch`, ...). A `NAME=VALUE` with no alias is ignored, as is every property kbf does not read. An alias is never inferred from a node's `--label`
+# platform-alias = []
 # How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
 progress-interval-secs = 30
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready

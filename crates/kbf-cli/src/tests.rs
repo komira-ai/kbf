@@ -999,3 +999,56 @@ fn check_args_takes_the_mode_flag_and_the_file_flags() {
         assert!(check(&["kbf", CHECK_ARGS, word]).is_err(), "{word}");
     }
 }
+
+/// Catches a malformed `--platform-alias` that starts anyway (and then constrains
+/// nothing: the bug the flag exists to fix, silently back), and one that is refused
+/// without saying what the flag takes. `kbf frontend` and the all-in-one mode both take
+/// it; a good alias is read, repeated.
+#[test]
+fn a_malformed_platform_alias_is_refused_at_start() {
+    for argv in [
+        FRONTEND,
+        &[
+            "kbf",
+            names::ALL_IN_ONE,
+            "--driver=container",
+            "--server=https://127.0.0.1:8981",
+            "--ca-cert=ca.pem",
+            "--cert=node.pem",
+            "--key=node.key",
+            "--node-id=node-1",
+        ],
+    ] {
+        for bad in [
+            "pool=darwin-sized",
+            "pool:OSFamily=Darwin",
+            "pool=darwin-sized:",
+            ":OSFamily=Darwin",
+            "=x:OSFamily=Darwin",
+            "pool=darwin-sized:OSFamily=Darwin:ISA=arm64",
+            "pool=darwin-sized:OSFamily=Darwin,",
+            "pool=darwin-sized:OSFamily",
+            "pool=darwin-sized:flavour=Darwin",
+            "OSFamily=x:ISA=arm64",
+            "pool=darwin-sized:OSFamily=Windows",
+            "pool=darwin-sized:OSFamily=Darwin,os=macos",
+        ] {
+            let err = refusal(with(argv, &[&format!("--platform-alias={bad}")]));
+            assert_eq!(err.exit_code(), 2, "{bad}");
+            let text = err.to_string();
+            assert!(text.contains("--platform-alias"), "{bad}: {text}");
+            assert!(
+                text.contains(bad) || text.contains("alias"),
+                "{bad}: {text}"
+            );
+        }
+        let good = with(
+            argv,
+            &[
+                "--platform-alias=pool=darwin-sized:OSFamily=Darwin,ISA=arm64",
+                "--platform-alias=pool=mojo-sized:OSFamily=Linux,ISA=x86_64",
+            ],
+        );
+        parse_from(good).expect("two good aliases parse");
+    }
+}

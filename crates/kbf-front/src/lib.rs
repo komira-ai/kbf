@@ -65,6 +65,7 @@ mod finished_row;
 mod input_tree;
 mod meta_log;
 pub mod metrics;
+mod platform_alias;
 mod proxy;
 mod recorder;
 mod relay;
@@ -110,6 +111,7 @@ pub use crate::execution::{
 };
 pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
+pub use crate::platform_alias::{AliasError, Conflict, PlatformAlias, PlatformAliases};
 pub use crate::proxy::{Direction, Meter, Method, Owner, Owners, Proxy};
 pub use crate::recorder::{
     ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
@@ -233,12 +235,15 @@ where
         authorizers,
         &Recorder::off(),
         DEFAULT_RESOURCES.memory_bytes,
+        PlatformAliases::default(),
     )
 }
 
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
 /// `recorder`, open streams re-sent at each tick of `progress`, and an `action` that
-/// names no memory size booking `default_memory` bytes ([`ExecutionService::with_default_memory`]).
+/// names no memory size booking `default_memory` bytes ([`ExecutionService::with_default_memory`]),
+/// its platform read through `aliases` ([`ExecutionService::with_platform_aliases`]).
+#[allow(clippy::too_many_arguments)] // eight: each is a setting of the service.
 pub fn routes_recorded<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
@@ -247,6 +252,7 @@ pub fn routes_recorded<M, O, D>(
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
     default_memory: u64,
+    aliases: PlatformAliases,
 ) -> Routes
 where
     M: MetaLog,
@@ -262,7 +268,8 @@ where
         )
         .recording(recorder.clone())
         .with_progress(progress)
-        .with_default_memory(default_memory),
+        .with_default_memory(default_memory)
+        .with_platform_aliases(aliases),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -283,6 +290,7 @@ pub struct OpenStreams {
 /// by the storage nodes of `proxy` ([`Proxy`]), and `Execution` over `backend`: a cache
 /// in this process (`kbf-server --storage`, which still holds one) or a storage node
 /// ([`Backend::remote`], which is what `kbf frontend` runs).
+#[allow(clippy::too_many_arguments)] // eight: each is a setting of the service.
 pub fn routes_proxied<D>(
     proxy: &Proxy,
     backend: impl Into<Backend>,
@@ -291,6 +299,7 @@ pub fn routes_proxied<D>(
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
     default_memory: u64,
+    aliases: PlatformAliases,
 ) -> Routes
 where
     D: Dispatch,
@@ -303,6 +312,7 @@ where
         authorizers,
         recorder,
         default_memory,
+        aliases,
         |execution, _, _| execution,
     )
 }
@@ -320,7 +330,7 @@ pub struct Relaying {
 
 /// [`routes_proxied`] with the `Execution` service behind a [`Relay`]: calls are the
 /// wrapped service's until `relaying.farm` has handed over, and the successor's after.
-#[allow(clippy::too_many_arguments)] // `routes_proxied`'s seven, and the relay's.
+#[allow(clippy::too_many_arguments)] // `routes_proxied`'s eight, and the relay's.
 pub fn routes_relayed<D>(
     proxy: &Proxy,
     backend: impl Into<Backend>,
@@ -329,6 +339,7 @@ pub fn routes_relayed<D>(
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
     default_memory: u64,
+    aliases: PlatformAliases,
     relaying: Relaying,
 ) -> Routes
 where
@@ -344,6 +355,7 @@ where
         authorizers,
         recorder,
         default_memory,
+        aliases,
         move |execution, closing, progress| {
             let streams = OpenStreams { closing, progress };
             Relay::new(execution, relaying.farm, relaying.successor, counted)
@@ -355,7 +367,7 @@ where
 
 /// The routes of [`routes_proxied`], the `Execution` service made by `wrap` from the
 /// service and the two halves of the open streams' wiring.
-#[allow(clippy::too_many_arguments)] // `routes_proxied`'s seven, and the wrap.
+#[allow(clippy::too_many_arguments)] // `routes_proxied`'s eight, and the wrap.
 fn proxied<D, E>(
     proxy: &Proxy,
     backend: Backend,
@@ -364,6 +376,7 @@ fn proxied<D, E>(
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
     default_memory: u64,
+    aliases: PlatformAliases,
     wrap: impl FnOnce(ExecutionService<D>, Closing, Progress) -> E,
 ) -> Routes
 where
@@ -379,7 +392,8 @@ where
     )
     .recording(recorder.clone())
     .with_progress(progress.clone())
-    .with_default_memory(default_memory);
+    .with_default_memory(default_memory)
+    .with_platform_aliases(aliases);
     let execution = ExecutionServer::new(wrap(service, closing, progress))
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);

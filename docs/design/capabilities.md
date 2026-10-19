@@ -225,7 +225,30 @@ matches every node. (`vm.slots` and the other report-only keys are known, and re
 see [Planned VM entries](#planned-vm-entries). Every `ios.device.<attribute>` key is
 known, so one kbf does not match on, such as `ios.device.os`, is refused rather than
 ignored. `ios.devices` and `ios.simulator` are unknown, and ignored.) Refusing an unknown property at `Execute` is
-**planned** (see [Planned](#planned)).
+**planned** (see [Planned](#planned)). One kind of unknown property can be given a
+meaning by the operator: a [platform alias](#platform-aliases) (`pool=darwin-sized`, for
+example). With none configured, `pool` is ignored like any other unknown name.
+
+### Platform aliases
+
+`--platform-alias NAME=VALUE:KEY=VALUE[,KEY=VALUE...]` on the frontend (repeatable)
+makes a request that sends the property `NAME=VALUE` placed as if it had sent the
+`KEY=VALUE` properties instead. komira's farm config sends `pool=darwin-sized` and
+`pool=mojo-sized` and nothing else, so the farm sets
+`pool=darwin-sized:OSFamily=Darwin,ISA=arm64` and `pool=mojo-sized:OSFamily=Linux,ISA=x86_64`.
+
+- The alias is expanded first: before names are filtered, before `needs` is read, before
+  the macOS GPU rule, so an aliased Mac request gets that rule. The alias property itself
+  is consumed.
+- Only placement reads the expansion. The action, its platform and its digest are the
+  client's, so the action cache is not re-keyed.
+- A request that also sends a property setting what the alias sets, to a different
+  value, is refused INVALID_ARGUMENT; the same thing in another spelling
+  (`os=macos` beside `OSFamily=Darwin`) stands.
+- `NAME` must be a property kbf does not read and every `KEY` one it does; an expansion
+  no daemon can run (`OSFamily=Windows`) is refused at start, as is a malformed flag.
+- An alias is never inferred from a node's `--label`: `--label pool=darwin-sized` makes a
+  node report `label.pool`, which only a request naming `label.pool` matches.
 
 **Reserved keys** ask for a kind or a size of capacity, not a hardware fact, and are
 skipped by the matcher (`kbf_caps::RESERVED_KEYS`; names read in any case):
@@ -343,9 +366,10 @@ naming no `container-image`.
 - **Re-detection:** the daemon re-detects its software keys after an update step and
   every 10 minutes, and sends a changed report mid-session
   ([fleet-updates.md](fleet-updates.md#31-observed)); today it detects once, at start.
-- **Platform aliases:** named, immutable sets of properties (for example an
-  architecture plus a default image), so a client can name a platform briefly and an
-  alias's bytes, and so its action digests, never change once used.
+- **Platform aliases, beyond `--platform-alias`:** named, immutable sets of properties
+  (for example an architecture plus a default image) stored with the farm, so a client
+  can name a platform briefly. `--platform-alias` is the operator-set form
+  ([above](#platform-aliases)).
 - **Protected floors:** capacity a machine keeps for other services, subtracted from
   `cpus` and `mem_gib` before placement sees them.
 - **Report changes noticed by hash:** heartbeats already carry the report hash; the

@@ -13,13 +13,17 @@
 //! serve the same kind. The two real drivers read and write blobs over mutual TLS
 //! through the server's worker listener named by `--cas` (normally the same address
 //! as `--server`), with the daemon's own certificate, and make lease directories
-//! under `<--data-dir>/leases`. A Mac in komira's pool runs, for example:
+//! under `<--data-dir>/leases`. A Mac runs, for example:
 //!
 //! ```text
 //! kbf-daemon --driver native --server https://kbf-server:8981 --cas https://kbf-server:8981 \
 //!   --ca-cert ca.pem --cert node.pem --key node.key --node-id mac-studio-1 \
-//!   --data-dir /var/kbf --label pool=darwin-sized
+//!   --data-dir /var/kbf
 //! ```
+//!
+//! Which actions the Mac takes follows from what it detects (`os`, `arch`, ...), not from
+//! a label: the frontend's `--platform-alias` turns a client's `pool=darwin-sized` into
+//! the OS and architecture it stands for.
 //!
 //! Exits non-zero when the node cannot be detected or the configuration cannot be
 //! loaded; otherwise runs until SIGTERM or SIGINT, then exits zero. Leases still

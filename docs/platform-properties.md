@@ -20,7 +20,9 @@ Any other value of `kbf-lease`, `gpu`, `kbf-book-cpus` or `kbf-book-mem-gib` is 
 with `INVALID_ARGUMENT`. kbf's own
 capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, `label.<k>`, ...; see
 [capabilities.md](design/capabilities.md#matching)) are matched too. Other properties
-(`container-image`, `Pool`, ...) are accepted and not acted on by the scheduler.
+(`container-image`, `Pool`, ...) are accepted and not acted on by the scheduler, unless the
+frontend runs with a `--platform-alias` for them: `pool=darwin-sized` then stands for the OS and
+architecture the alias names (see [Platform aliases](design/capabilities.md#platform-aliases)).
 
 ### Property names are read in any case
 
