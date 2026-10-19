@@ -139,9 +139,14 @@ impl RealFetcher {
                 os.name()
             ))
         })?;
-        let described =
-            fetch::describe_release(&self.child, &self.source, self.limits, &rec.commit, platform)
-                .map_err(fetch_error)?;
+        let described = fetch::describe_release(
+            &self.child,
+            &self.source,
+            self.limits,
+            &rec.commit,
+            platform,
+        )
+        .map_err(fetch_error)?;
         Ok(described
             .into_iter()
             .map(|d| Piece {
@@ -182,7 +187,8 @@ impl RealFetcher {
             }
             // The bundle first: it is small, and the tarball is not worth a download without it.
             if let Some(bundle) = &piece.bundle {
-                locator.attestation = self.pull_bundle(&partial, &locator.name, bundle, replaced)?;
+                locator.attestation =
+                    self.pull_bundle(&partial, &locator.name, bundle, replaced)?;
             }
             files.push(self.pull_one(&partial, &locator, replaced)?);
             components.push(locator);

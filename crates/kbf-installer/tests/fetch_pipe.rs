@@ -390,7 +390,10 @@ fn undeclared_output_is_taken_whole_up_to_the_cap() {
     assert_eq!(got.sha256, hex::encode(Sha256::digest(b"abc")));
     // Exactly the cap is fine too.
     let (got, out) = run_up_to(&["emit:abcde"], caps(5));
-    assert_eq!((got.expect("received").count, out.as_slice()), (5, b"abcde".as_slice()));
+    assert_eq!(
+        (got.expect("received").count, out.as_slice()),
+        (5, b"abcde".as_slice())
+    );
 }
 
 /// A child that closes without a byte has said nothing: that is not an empty answer, and the
@@ -418,7 +421,10 @@ fn a_child_that_says_nothing_is_a_fault_with_its_words() {
 #[test]
 fn undeclared_output_over_the_cap_is_refused() {
     let (got, out) = run_up_to(&["emit:abcdef"], caps(5));
-    assert!(matches!(got, Err(PipeFault::Oversize { size: 5 })), "{got:?}");
+    assert!(
+        matches!(got, Err(PipeFault::Oversize { size: 5 })),
+        "{got:?}"
+    );
     assert!(out.len() <= 5, "{} bytes kept", out.len());
 }
 
@@ -433,7 +439,17 @@ fn undeclared_output_that_does_not_end_is_stalled() {
     let mut caps = caps(3);
     caps.no_byte = Duration::from_millis(500);
     let (got, out) = run_up_to(&["emit:abc", "sleep:600"], caps);
-    assert!(matches!(got, Err(PipeFault::Stalled { got: 3, size: 3, .. })), "{got:?}");
+    assert!(
+        matches!(
+            got,
+            Err(PipeFault::Stalled {
+                got: 3,
+                size: 3,
+                ..
+            })
+        ),
+        "{got:?}"
+    );
     assert_eq!(out, b"abc");
 }
 

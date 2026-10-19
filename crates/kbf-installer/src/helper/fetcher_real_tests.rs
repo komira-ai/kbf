@@ -143,9 +143,18 @@ fn only_one_plain_file_name_is_a_component_name() {
 #[test]
 fn a_hosts_release_platform_is_its_os_and_cpu() {
     use ReleasePlatform::{DarwinArm64, LinuxArm64, LinuxX86_64};
-    assert_eq!(host_platform(Platform::Linux, Arch::X86_64), Some(LinuxX86_64));
-    assert_eq!(host_platform(Platform::Linux, Arch::Aarch64), Some(LinuxArm64));
-    assert_eq!(host_platform(Platform::MacOs, Arch::Aarch64), Some(DarwinArm64));
+    assert_eq!(
+        host_platform(Platform::Linux, Arch::X86_64),
+        Some(LinuxX86_64)
+    );
+    assert_eq!(
+        host_platform(Platform::Linux, Arch::Aarch64),
+        Some(LinuxArm64)
+    );
+    assert_eq!(
+        host_platform(Platform::MacOs, Arch::Aarch64),
+        Some(DarwinArm64)
+    );
     assert_eq!(host_platform(Platform::MacOs, Arch::X86_64), None);
 }
 

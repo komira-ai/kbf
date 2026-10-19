@@ -142,7 +142,11 @@ impl Answers {
     fn runner(self) -> FakeRunner {
         FakeRunner::new(move |spawn| {
             if spawn.program.file_name().is_some_and(|n| n == "gh") {
-                let at = spawn.args.iter().position(|a| a == "--bundle").expect("--bundle");
+                let at = spawn
+                    .args
+                    .iter()
+                    .position(|a| a == "--bundle")
+                    .expect("--bundle");
                 let bundle = fs::read(&spawn.args[at + 1]).expect("the bundle gh is given");
                 self.bundles.lock().expect("lock").push(bundle);
                 Ok(ran(self.gh.0, "", self.gh.1))
@@ -449,7 +453,11 @@ fn a_binary_that_declares_other_facts_is_refused() {
 fn a_frontend_update_is_described_fetched_verified_and_installed() {
     let rig = Rig::new("update-good");
     let tar = tarball();
-    let ops = rig.stock(vec![entry_for("kbf", "linux-x86_64", &tar, BUNDLE)], &tar, BUNDLE);
+    let ops = rig.stock(
+        vec![entry_for("kbf", "linux-x86_64", &tar, BUNDLE)],
+        &tar,
+        BUNDLE,
+    );
     let answers = Answers::honest();
     let seen = Arc::clone(&answers.bundles);
     let fetcher = rig.fetcher(Some(&ops), answers);
@@ -457,7 +465,11 @@ fn a_frontend_update_is_described_fetched_verified_and_installed() {
     assert_eq!(got, installed());
     assert!(rig.release().join("kbf").is_file(), "the binary");
     assert!(rig.release().join("VERIFIED").is_file(), "the marker");
-    assert_eq!(*seen.lock().expect("lock"), [BUNDLE.to_vec()], "the bundle gh checked");
+    assert_eq!(
+        *seen.lock().expect("lock"),
+        [BUNDLE.to_vec()],
+        "the bundle gh checked"
+    );
     assert_eq!(rig.work_left(), Vec::<String>::new(), "no scratch");
 }
 
@@ -548,7 +560,10 @@ fn a_description_that_is_not_the_hosts_release_is_refused() {
         (rig.from_the_shelf(), rig)
     };
     let cases = [
-        (wrong_commit, format!("it describes commit {B}, and the order names {COMMIT}")),
+        (
+            wrong_commit,
+            format!("it describes commit {B}, and the order names {COMMIT}"),
+        ),
         (only_arm, "it has no kbf for linux-x86_64".to_owned()),
     ];
     for ((ops, rig), why) in cases {
@@ -586,8 +601,16 @@ fn bytes_that_do_not_match_the_described_digest_are_refused() {
         let rig = Rig::new(&format!("update-digest-{bundle_is_wrong}"));
         let entry = entry_for("kbf", "linux-x86_64", &tar, BUNDLE);
         rig.shelve("describe", described_as(COMMIT, vec![entry]).as_bytes());
-        let served_tar = if bundle_is_wrong { tar.clone() } else { flipped(&tar) };
-        let served_bundle = if bundle_is_wrong { flipped(BUNDLE) } else { BUNDLE.to_vec() };
+        let served_tar = if bundle_is_wrong {
+            tar.clone()
+        } else {
+            flipped(&tar)
+        };
+        let served_bundle = if bundle_is_wrong {
+            flipped(BUNDLE)
+        } else {
+            BUNDLE.to_vec()
+        };
         rig.shelve(&sha(&tar), &served_tar);
         rig.shelve(&sha(BUNDLE), &served_bundle);
         let ops = rig.from_the_shelf();
@@ -595,7 +618,11 @@ fn bytes_that_do_not_match_the_described_digest_are_refused() {
         match fetcher.fetch(&rec(Vec::new())) {
             Err(FetchError::Rejected(why)) => {
                 assert!(why.starts_with("hash: the download has sha256 "), "{why}");
-                let want = if bundle_is_wrong { sha(BUNDLE) } else { sha(&tar) };
+                let want = if bundle_is_wrong {
+                    sha(BUNDLE)
+                } else {
+                    sha(&tar)
+                };
                 assert!(why.ends_with(&format!("the order names {want}")), "{why}");
             }
             other => panic!("{other:?}"),
@@ -617,7 +644,11 @@ fn a_bundle_that_is_not_text_is_refused() {
     let rig = Rig::new("update-binary-bundle");
     let tar = tarball();
     let bundle = [0xff, 0xfe, 0x00, b'{', b'}', b'\n'];
-    let ops = rig.stock(vec![entry_for("kbf", "linux-x86_64", &tar, &bundle)], &tar, &bundle);
+    let ops = rig.stock(
+        vec![entry_for("kbf", "linux-x86_64", &tar, &bundle)],
+        &tar,
+        &bundle,
+    );
     let fetcher = rig.fetcher(Some(&ops), Answers::honest());
     match fetcher.fetch(&rec(Vec::new())) {
         Err(FetchError::Rejected(why)) => {

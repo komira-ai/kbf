@@ -1411,12 +1411,7 @@ fn frontend_by_hand(url: &str, digest: &str, limit: u64, lent: &Lent<'_>) -> std
 /// A by-hand frontend child asked for `what` (`--sha256 <digest>`, or `--describe <commit>`
 /// and the like).
 #[cfg(target_os = "linux")]
-fn frontend_asked(
-    url: &str,
-    what: &[&str],
-    limit: u64,
-    lent: &Lent<'_>,
-) -> std::process::Output {
+fn frontend_asked(url: &str, what: &[&str], limit: u64, lent: &Lent<'_>) -> std::process::Output {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
     let fd = lent.id.lend().expect("lends");
@@ -1732,7 +1727,10 @@ fn a_url_source_that_has_no_such_release_says_so() {
         let source = rig.url_source(&format!("{}/mirror", server.url()), &pki.ca_pem());
         match rig.describe(&source, ReleasePlatform::LinuxX86_64) {
             Err(FetchError::Describe(DescribeFault::Refused(why))) => {
-                assert!(why.contains(&format!("{} answered {status}", json_path())), "{why}");
+                assert!(
+                    why.contains(&format!("{} answered {status}", json_path())),
+                    "{why}"
+                );
             }
             other => panic!("{status}: {other:?}"),
         }
@@ -1760,7 +1758,10 @@ fn a_url_file_that_cannot_be_used_is_refused_with_the_reason() {
         (json_file(2, COMMIT, &mine), "schema 2"),
         (b"<html>not json</html>".to_vec(), "no schema"),
         (json_file(1, &"b".repeat(40), &mine), "it describes commit"),
-        (json_file(1, COMMIT, &[entry("linux-arm64")]), "it has no kbf for linux-x86_64"),
+        (
+            json_file(1, COMMIT, &[entry("linux-arm64")]),
+            "it has no kbf for linux-x86_64",
+        ),
     ];
     for (n, (file, said)) in cases.into_iter().enumerate() {
         let server = Https::start(&leaf, Plan::Files(vec![(json_path(), file)]));
@@ -1813,8 +1814,16 @@ fn a_frontend_that_will_not_describe_is_a_refusal_or_a_failure_by_its_status() {
     let rig = Rig::new("describe-frontend-status");
     let source = |grpc: &Grpc| rig.frontend(&grpc.url(), &pki.ca_pem(), &pki.client());
     let verdicts = [
-        (Code::NotFound, "no tarball of the commit is stored", "NotFound"),
-        (Code::FailedPrecondition, "linux-x86_64 has no attestation of kbf", "FailedPrecondition"),
+        (
+            Code::NotFound,
+            "no tarball of the commit is stored",
+            "NotFound",
+        ),
+        (
+            Code::FailedPrecondition,
+            "linux-x86_64 has no attestation of kbf",
+            "FailedPrecondition",
+        ),
     ];
     for (code, message, name) in verdicts {
         let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Status(code, message));
@@ -1873,7 +1882,11 @@ fn a_hostile_field_cannot_become_a_second_line() {
     let (pki, server) = pki_and_server();
     let mut evil = entry("linux-x86_64");
     evil.name = "kbf\ncomponent kbf-daemon linux-x86_64".to_owned();
-    let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Of(proto_of(COMMIT, &[evil])));
+    let grpc = Grpc::describing(
+        &server,
+        &pki.ca_pem(),
+        Describing::Of(proto_of(COMMIT, &[evil])),
+    );
     let rig = Rig::new("describe-frontend-hostile");
     let source = rig.frontend(&grpc.url(), &pki.ca_pem(), &pki.client());
     match rig.describe(&source, ReleasePlatform::LinuxX86_64) {
@@ -1914,7 +1927,10 @@ fn describe_args(url: &str, ca: &std::path::Path, limit: u64) -> Vec<String> {
 fn the_child_writes_the_description_in_the_form() {
     let (pki, leaf) = pki_and_server();
     let file = json_file(1, COMMIT, &[entry("linux-arm64"), entry("linux-x86_64")]);
-    let server = Https::start(&leaf, Plan::Files(vec![("/releases/".to_owned() + COMMIT + ".json", file)]));
+    let server = Https::start(
+        &leaf,
+        Plan::Files(vec![("/releases/".to_owned() + COMMIT + ".json", file)]),
+    );
     let rig = Rig::new("hand-describe");
     let ca = rig.write("ca.pem", &pki.ca_pem());
     let out = by_hand(&describe_args(&server.url(), &ca, 16 * 1024 + 1));
@@ -1941,14 +1957,20 @@ fn the_child_writes_the_description_in_the_form() {
 fn a_file_longer_than_the_limit_is_read_only_that_far() {
     let (pki, leaf) = pki_and_server();
     let file = json_file(1, COMMIT, &[entry("linux-x86_64")]);
-    let server = Https::start(&leaf, Plan::Files(vec![("/releases/".to_owned() + COMMIT + ".json", file)]));
+    let server = Https::start(
+        &leaf,
+        Plan::Files(vec![("/releases/".to_owned() + COMMIT + ".json", file)]),
+    );
     let rig = Rig::new("hand-describe-cut");
     let ca = rig.write("ca.pem", &pki.ca_pem());
     // Shorter than the file, longer than the refusal it comes to.
     let out = by_hand(&describe_args(&server.url(), &ca, 250));
     assert!(out.status.success(), "{}", said(&out));
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.starts_with("refused the file has no schema: "), "{text}");
+    assert!(
+        text.starts_with("refused the file has no schema: "),
+        "{text}"
+    );
     assert_eq!(text.matches('\n').count(), 1);
 }
 
@@ -1965,14 +1987,21 @@ fn the_child_writes_a_refusal_for_404_and_409_and_fails_for_the_rest() {
         let server = Https::start(&leaf, Plan::Status(status));
         let out = by_hand(&describe_args(&server.url(), &ca, 16 * 1024 + 1));
         assert!(out.status.success(), "{}", said(&out));
-        let want = format!("refused {}/releases/{COMMIT}.json answered {status}\n", server.url());
+        let want = format!(
+            "refused {}/releases/{COMMIT}.json answered {status}\n",
+            server.url()
+        );
         assert_eq!(String::from_utf8_lossy(&out.stdout), want);
     }
     let server = Https::start(&leaf, Plan::Status(500));
     let out = by_hand(&describe_args(&server.url(), &ca, 16 * 1024 + 1));
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
-    assert!(said(&out).contains("the source answered 500"), "{}", said(&out));
+    assert!(
+        said(&out).contains("the source answered 500"),
+        "{}",
+        said(&out)
+    );
 }
 
 /// A `url` source that is not there is the same failed start as for a blob.
@@ -1984,7 +2013,11 @@ fn a_url_source_that_is_not_there_fails_the_describing_child() {
     };
     let rig = Rig::new("hand-describe-gone");
     let ca = rig.write("ca.pem", &Pki::new().ca_pem());
-    let out = by_hand(&describe_args(&format!("https://localhost:{port}"), &ca, 100));
+    let out = by_hand(&describe_args(
+        &format!("https://localhost:{port}"),
+        &ca,
+        100,
+    ));
     assert!(!out.status.success());
     assert!(said(&out).contains("source unreachable"), "{}", said(&out));
 }
@@ -2032,7 +2065,13 @@ fn the_frontend_child_writes_what_describe_answered() {
         .iter()
         .map(|(commit, platform)| format!("{commit} {platform:?}"))
         .collect();
-    assert_eq!(asked, [format!("{COMMIT} \"linux-x86_64\""), format!("{COMMIT} \"\"")]);
+    assert_eq!(
+        asked,
+        [
+            format!("{COMMIT} \"linux-x86_64\""),
+            format!("{COMMIT} \"\"")
+        ]
+    );
 }
 
 /// `NOT_FOUND` and `FAILED_PRECONDITION` are written as refusals with the status named, and the
@@ -2044,8 +2083,15 @@ fn the_frontend_child_writes_what_describe_answered() {
 fn the_frontend_child_writes_a_refusal_for_two_statuses() {
     use tonic::Code;
     let (pki, server) = pki_and_server();
-    for (code, name) in [(Code::NotFound, "NotFound"), (Code::FailedPrecondition, "FailedPrecondition")] {
-        let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Status(code, "it is not there"));
+    for (code, name) in [
+        (Code::NotFound, "NotFound"),
+        (Code::FailedPrecondition, "FailedPrecondition"),
+    ] {
+        let grpc = Grpc::describing(
+            &server,
+            &pki.ca_pem(),
+            Describing::Status(code, "it is not there"),
+        );
         let out = frontend_describes(&grpc.url(), Some("linux-arm64"), &pki);
         assert!(out.status.success(), "{}", said(&out));
         assert_eq!(
@@ -2053,7 +2099,11 @@ fn the_frontend_child_writes_a_refusal_for_two_statuses() {
             format!("refused {name}: it is not there\n")
         );
     }
-    let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Status(Code::Internal, "it broke"));
+    let grpc = Grpc::describing(
+        &server,
+        &pki.ca_pem(),
+        Describing::Status(Code::Internal, "it broke"),
+    );
     let out = frontend_describes(&grpc.url(), Some("linux-arm64"), &pki);
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
@@ -2148,7 +2198,10 @@ fn a_frontend_update_is_installed_from_a_url_source_end_to_end() {
     };
     let got = fetcher.fetch(&locator).map_err(|e: Refused| e.to_string());
     let got = got.expect("installed");
-    assert_eq!((got.commit.as_str(), got.platform.as_str()), (COMMIT, "linux-x86_64"));
+    assert_eq!(
+        (got.commit.as_str(), got.platform.as_str()),
+        (COMMIT, "linux-x86_64")
+    );
     let release = host.join(&host.release_dir(&locator.commit));
     assert!(release.join("kbf").is_file() && release.join("VERIFIED").is_file());
     assert_eq!(

@@ -523,7 +523,10 @@ fn a_description_is_refused_for_the_same_reasons_before_anything_starts() {
     };
     let got = describe_release(&root, &frontend, limits(), &commit, platform);
     assert!(
-        matches!(got, Err(FetchError::Pipe(PipeFault::Root { uid: 0, gid: 0 }))),
+        matches!(
+            got,
+            Err(FetchError::Pipe(PipeFault::Root { uid: 0, gid: 0 }))
+        ),
         "{got:?}"
     );
 }

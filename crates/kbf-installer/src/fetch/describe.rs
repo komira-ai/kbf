@@ -203,8 +203,16 @@ impl Answer {
         let mut components = Vec::new();
         for line in lines {
             let fields: Vec<&str> = line.split(' ').collect();
-            let [first, name, platform, tarball, sha256, size, bundle_sha256, bundle_size] =
-                fields[..]
+            let [
+                first,
+                name,
+                platform,
+                tarball,
+                sha256,
+                size,
+                bundle_sha256,
+                bundle_size,
+            ] = fields[..]
             else {
                 return Err(unusable("a component line has not seven fields"));
             };
@@ -244,7 +252,10 @@ impl Described {
         }
         let tarball = format!("{name}-{commit}-{platform}.tar.gz");
         if self.tarball != tarball {
-            return unusable(format!("the file of {name} is {:?}, not {tarball}", self.tarball));
+            return unusable(format!(
+                "the file of {name} is {:?}, not {tarball}",
+                self.tarball
+            ));
         }
         if !is_digest(&self.sha256) || !is_digest(&self.bundle_sha256) {
             return unusable(format!("a digest of {name} is not 64 lowercase hex digits"));

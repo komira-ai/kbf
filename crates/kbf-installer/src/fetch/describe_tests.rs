@@ -96,7 +96,10 @@ fn a_refusal_is_one_plain_line() {
     let line = Answer::Refused(rude.clone()).render();
     assert_eq!(line.matches('\n').count(), 1, "{line:?}");
     assert!(line.ends_with('\n') && line.starts_with("refused a?b?[31m?x"));
-    assert!(line.bytes().all(|b| b == b'\n' || (b' '..=b'~').contains(&b)));
+    assert!(
+        line.bytes()
+            .all(|b| b == b'\n' || (b' '..=b'~').contains(&b))
+    );
     assert_eq!(line.len(), "refused ".len() + 300 + 1);
     // A child that writes the raw text is read the same way.
     let raw = format!("refused {}\n", "y".repeat(1000));
@@ -128,7 +131,10 @@ fn a_field_that_is_not_one_word_is_written_as_a_refusal() {
         let mut bad = entry("kbf", "linux-x86_64");
         spoil(&mut bad);
         let line = Answer::Described(description(vec![bad])).render();
-        assert!(line.starts_with("refused the description is not usable"), "{line}");
+        assert!(
+            line.starts_with("refused the description is not usable"),
+            "{line}"
+        );
         assert_eq!(line.matches('\n').count(), 1);
         assert!(matches!(
             Answer::parse(line.as_bytes()),
@@ -148,9 +154,8 @@ fn a_field_that_is_not_one_word_is_written_as_a_refusal() {
 #[test]
 fn the_parent_refuses_anything_but_the_form() {
     let head = format!("description 1 {A}");
-    let comp = format!(
-        "component kbf linux-x86_64 kbf-{A}-linux-x86_64.tar.gz {SHA} 1000 {BUNDLE} 500"
-    );
+    let comp =
+        format!("component kbf linux-x86_64 kbf-{A}-linux-x86_64.tar.gz {SHA} 1000 {BUNDLE} 500");
     let cases: Vec<(Vec<u8>, &str)> = vec![
         (Vec::new(), "newline"),
         (head.clone().into_bytes(), "newline"),
@@ -160,12 +165,18 @@ fn the_parent_refuses_anything_but_the_form() {
         (format!("description 2 {A}\n").into_bytes(), "first line"),
         (format!("description 01 {A}\n").into_bytes(), "not a count"),
         (format!("description x {A}\n").into_bytes(), "not a count"),
-        (format!("description 1 {A} more\n").into_bytes(), "first line"),
+        (
+            format!("description 1 {A} more\n").into_bytes(),
+            "first line",
+        ),
         (b"description 1\n".to_vec(), "first line"),
         (format!("descriptions 1 {A}\n").into_bytes(), "first line"),
         (format!("description  1 {A}\n").into_bytes(), "first line"),
         (format!("{head}\n\n").into_bytes(), "seven fields"),
-        (format!("{head}\n{comp} extra\n").into_bytes(), "seven fields"),
+        (
+            format!("{head}\n{comp} extra\n").into_bytes(),
+            "seven fields",
+        ),
         (
             format!("{head}\n{}\n", comp.replace("component ", "")).into_bytes(),
             "seven fields",
@@ -174,12 +185,28 @@ fn the_parent_refuses_anything_but_the_form() {
             format!("{head}\n{}\n", comp.replacen("component", "components", 1)).into_bytes(),
             "not a component",
         ),
-        (format!("{head}\n{}\n", comp.replace(" 1000 ", " +1000 ")).into_bytes(), "not a count"),
-        (format!("{head}\n{}\n", comp.replace(" 1000 ", " 01000 ")).into_bytes(), "not a count"),
-        (format!("{head}\n{}\n", comp.replace(" 1000 ", " 1e3 ")).into_bytes(), "not a count"),
-        (format!("{head}\n{}\n", comp.replace(" 500", " -5")).into_bytes(), "not a count"),
         (
-            format!("{head}\n{}\n", comp.replace(" 500", " 99999999999999999999999")).into_bytes(),
+            format!("{head}\n{}\n", comp.replace(" 1000 ", " +1000 ")).into_bytes(),
+            "not a count",
+        ),
+        (
+            format!("{head}\n{}\n", comp.replace(" 1000 ", " 01000 ")).into_bytes(),
+            "not a count",
+        ),
+        (
+            format!("{head}\n{}\n", comp.replace(" 1000 ", " 1e3 ")).into_bytes(),
+            "not a count",
+        ),
+        (
+            format!("{head}\n{}\n", comp.replace(" 500", " -5")).into_bytes(),
+            "not a count",
+        ),
+        (
+            format!(
+                "{head}\n{}\n",
+                comp.replace(" 500", " 99999999999999999999999")
+            )
+            .into_bytes(),
             "not a count",
         ),
         (b"refused why\nmore\n".to_vec(), "one line"),
@@ -187,7 +214,11 @@ fn the_parent_refuses_anything_but_the_form() {
     for (bytes, said) in cases {
         match Answer::parse(&bytes) {
             Err(DescribeFault::Unusable(why)) => {
-                assert!(why.contains(said), "{:?}: {why}", String::from_utf8_lossy(&bytes));
+                assert!(
+                    why.contains(said),
+                    "{:?}: {why}",
+                    String::from_utf8_lossy(&bytes)
+                );
             }
             other => panic!("{:?}: {other:?}", String::from_utf8_lossy(&bytes)),
         }
@@ -204,9 +235,7 @@ fn the_parent_refuses_anything_but_the_form() {
 #[test]
 fn the_urls_json_is_read_by_schema() {
     let json = |schema: &str, extra: &str, components: &str| {
-        format!(
-            "{{\"schema\":{schema},\"commit\":\"{A}\"{extra},\"components\":{components}}}"
-        )
+        format!("{{\"schema\":{schema},\"commit\":\"{A}\"{extra},\"components\":{components}}}")
     };
     let one = format!(
         "[{{\"name\":\"kbf\",\"platform\":\"linux-x86_64\",\"tarball\":\"kbf-{A}-linux-x86_64.tar.gz\",\
@@ -323,7 +352,10 @@ fn a_platform_must_be_complete_and_exact() {
         fault_text(none.select(&commit(), host, MAX)),
         "it has no kbf for linux-x86_64"
     );
-    let twice = description(vec![entry("kbf", "linux-x86_64"), entry("kbf", "linux-x86_64")]);
+    let twice = description(vec![
+        entry("kbf", "linux-x86_64"),
+        entry("kbf", "linux-x86_64"),
+    ]);
     assert_eq!(
         fault_text(twice.select(&commit(), host, MAX)),
         "it has kbf for linux-x86_64 twice"
@@ -365,7 +397,9 @@ fn every_field_of_the_hosts_entry_is_held_to_its_shape() {
         fault_text(description(vec![bad]).select(&commit(), host, MAX))
     };
     assert!(spoilt(|d| d.name = "../kbf".to_owned()).contains("not a component"));
-    assert!(spoilt(|d| d.tarball = format!("kbf-{B}-linux-x86_64.tar.gz")).contains("the file of kbf"));
+    assert!(
+        spoilt(|d| d.tarball = format!("kbf-{B}-linux-x86_64.tar.gz")).contains("the file of kbf")
+    );
     assert!(spoilt(|d| d.tarball = "../kbf.tar.gz".to_owned()).contains("the file of kbf"));
     assert!(spoilt(|d| d.sha256 = SHA.to_uppercase()).contains("64 lowercase hex"));
     assert!(spoilt(|d| d.sha256 = SHA[1..].to_owned()).contains("64 lowercase hex"));

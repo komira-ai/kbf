@@ -55,7 +55,11 @@ pub struct ChildArgs {
     #[arg(long)]
     pub url: String,
     /// The lowercase hex sha256 that names the blob. Not with `--describe`.
-    #[arg(long, required_unless_present = "describe", conflicts_with = "describe")]
+    #[arg(
+        long,
+        required_unless_present = "describe",
+        conflicts_with = "describe"
+    )]
     pub sha256: Option<String>,
     /// Say what the release of this commit (40 lowercase hex digits) holds, instead of
     /// fetching a blob.

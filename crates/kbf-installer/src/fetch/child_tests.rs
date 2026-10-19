@@ -48,7 +48,14 @@ fn a_blob_or_a_release_but_not_both_or_neither() {
 /// Catches a commit or a digest of another shape being put into a URL or a request.
 #[test]
 fn what_is_asked_for_is_checked_again() {
-    for bad in ["", "abc", &A.to_uppercase(), &A[1..], &format!("{A}0"), "../x"] {
+    for bad in [
+        "",
+        "abc",
+        &A.to_uppercase(),
+        &A[1..],
+        &format!("{A}0"),
+        "../x",
+    ] {
         let mut ask = args(Kind::Url);
         ask.describe = Some(bad.to_owned());
         assert!(said(&ask).contains("is not a commit"), "{bad:?}");
@@ -109,7 +116,13 @@ fn the_platform_is_for_a_frontend_and_is_one_of_the_three() {
     let mut frontend = args(Kind::Frontend);
     frontend.describe = Some(B.to_owned());
     frontend.identity_fd = None;
-    for bad in ["", "linux", "Linux-x86_64", "linux-aarch64", "linux-x86_64 "] {
+    for bad in [
+        "",
+        "linux",
+        "Linux-x86_64",
+        "linux-aarch64",
+        "linux-x86_64 ",
+    ] {
         frontend.platform = Some(bad.to_owned());
         assert!(said(&frontend).contains("is not a platform"), "{bad:?}");
     }
@@ -137,7 +150,10 @@ fn an_answer_is_written_within_the_limit() {
         (1, 1),
     ] {
         let mut out = Vec::new();
-        assert_eq!(write_answer(&answer, limit, &mut out).expect("written"), want as u64);
+        assert_eq!(
+            write_answer(&answer, limit, &mut out).expect("written"),
+            want as u64
+        );
         assert_eq!(out, text.as_bytes()[..want], "limit {limit}");
     }
 }
@@ -146,7 +162,9 @@ fn an_answer_is_written_within_the_limit() {
 #[test]
 fn a_status_is_its_code_and_message() {
     assert_eq!(
-        status_line(&tonic::Status::failed_precondition("linux-arm64 has no tarball of kbf")),
+        status_line(&tonic::Status::failed_precondition(
+            "linux-arm64 has no tarball of kbf"
+        )),
         "FailedPrecondition: linux-arm64 has no tarball of kbf"
     );
 }

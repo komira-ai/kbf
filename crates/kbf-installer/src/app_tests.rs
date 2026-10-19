@@ -120,7 +120,15 @@ fn the_fetch_child_is_no_root_verb_and_reports_in_one_line() {
 #[test]
 fn the_fetch_child_takes_a_blob_or_a_release() {
     let digest = "a".repeat(64);
-    let base = ["fetch-child", "--kind", "url", "--url", "https://h.example", "--limit", "10"];
+    let base = [
+        "fetch-child",
+        "--kind",
+        "url",
+        "--url",
+        "https://h.example",
+        "--limit",
+        "10",
+    ];
     let with = |extra: &[&str]| {
         let mut full = vec!["kbf-installer"];
         full.extend(base);
@@ -131,8 +139,14 @@ fn the_fetch_child_takes_a_blob_or_a_release() {
     assert!(with(&["--describe", A]).is_ok());
     assert!(with(&["--describe", A, "--platform", "linux-x86_64"]).is_ok());
     assert!(with(&[]).is_err(), "neither");
-    assert!(with(&["--sha256", &digest, "--describe", A]).is_err(), "both");
-    assert!(with(&["--platform", "linux-x86_64"]).is_err(), "a platform alone");
+    assert!(
+        with(&["--sha256", &digest, "--describe", A]).is_err(),
+        "both"
+    );
+    assert!(
+        with(&["--platform", "linux-x86_64"]).is_err(),
+        "a platform alone"
+    );
 }
 
 /// Catches `--json` printing prose, or putting the object on the error stream where a
