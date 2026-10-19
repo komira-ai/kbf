@@ -1086,6 +1086,114 @@ fn a_revert_with_nothing_to_go_back_to_is_refused() {
     assert_eq!(rig.restarts(), 0);
 }
 
+/// A schema step that records what it was asked and answers as told.
+struct FakeStep {
+    asked: std::rc::Rc<std::cell::RefCell<Vec<u32>>>,
+    answer: Result<String, String>,
+}
+
+impl crate::database::SchemaStep for FakeStep {
+    fn before_start(&mut self, release_schema: u32) -> Result<String, String> {
+        self.asked.borrow_mut().push(release_schema);
+        self.answer.clone()
+    }
+}
+
+/// Catches a release being activated before its database is ready, and a refused migration
+/// being ignored. The step is asked for the schema the fetched release reports (3 here)
+/// before the links move; when it refuses, the links, the restart count and the state stay
+/// as they were and the status says why; an order for the release that is already current
+/// (nothing staged for it) asks nothing.
+///
+/// Mutants seen red: the step's error dropped (the swap went through); the staged-commit
+/// filter removed (the current release asked for a schema); the skip's log line removed.
+#[test]
+fn the_database_is_migrated_before_the_links_move_and_a_refusal_stops_the_swap() {
+    let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut rig = Rig::new("schema-step");
+    rig.helper.set_schema_step(Box::new(FakeStep {
+        asked: asked.clone(),
+        answer: Err("migration 3 is a contract step".to_owned()),
+    }));
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0 + 3);
+    assert_eq!(
+        *asked.borrow(),
+        vec![3],
+        "asked for the fetched release's schema"
+    );
+    assert_eq!(rig.state().current, Some(c(A)), "the links did not move");
+    assert_eq!(rig.restarts(), 0);
+    assert_eq!(rig.status()["state"], "refused");
+    let why = rig.status()["refusal"].as_str().expect("text").to_owned();
+    assert!(
+        why.contains("state schema: migration 3 is a contract step"),
+        "{why}"
+    );
+
+    rig.helper.set_schema_step(Box::new(FakeStep {
+        asked: asked.clone(),
+        answer: Ok("migrated".to_owned()),
+    }));
+    rig.order(6, Verb::Activate, B);
+    rig.cycle(T0 + 6);
+    assert_eq!(*asked.borrow(), vec![3, 3]);
+    assert_eq!(rig.state().current, Some(c(B)));
+    assert_eq!(rig.restarts(), 1);
+
+    rig.order(7, Verb::Revert, B);
+    rig.cycle(T0 + 9);
+    rig.order(8, Verb::Activate, A);
+    rig.cycle(T0 + 12);
+    assert_eq!(
+        *asked.borrow(),
+        vec![3, 3],
+        "a release that was not fetched for this order asks nothing"
+    );
+    // ... and the log says it was skipped, and why, instead of saying nothing.
+    let mut log = Vec::new();
+    rig.helper.drain_log(&mut log);
+    let log = String::from_utf8(log).expect("text");
+    let skipped = format!(
+        "state schema: no migration for order 8: {} was not fetched for it (the staged release is {})",
+        &A[..12],
+        &B[..12]
+    );
+    assert!(log.contains(&skipped), "{log}");
+    assert_eq!(
+        log.matches("state schema: no migration").count(),
+        1,
+        "only the order that skipped says so: {log}"
+    );
+}
+
+/// Pins the rule the activate filter really has: "the staged commit equals the order's". The
+/// staged release stays staged after its swap, so a repeat order for it asks the step again
+/// (the same schema, idempotent) and does not skip with the "no migration" line.
+#[test]
+fn a_repeat_order_for_the_staged_release_asks_the_step_again() {
+    let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut rig = Rig::new("schema-repeat");
+    rig.helper.set_schema_step(Box::new(FakeStep {
+        asked: asked.clone(),
+        answer: Ok("migrated".to_owned()),
+    }));
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0 + 3);
+    rig.first_start(B, T0 + 4);
+    rig.order(6, Verb::Confirm, B);
+    rig.cycle(T0 + 6);
+    assert_eq!(rig.state().current, Some(c(B)));
+    assert_eq!(rig.state().pending_confirm, None);
+    rig.order(7, Verb::Activate, B);
+    rig.cycle(T0 + 9);
+    assert_eq!(*asked.borrow(), vec![3, 3], "{}", rig.status());
+    let mut log = Vec::new();
+    rig.helper.drain_log(&mut log);
+    let log = String::from_utf8(log).expect("text");
+    assert!(!log.contains("state schema: no migration"), "{log}");
+}
+
 /// Catches two swaps in quick succession (S13): with a 60 s minimum, an activation 10 s
 /// after the last one is refused before the fetch and moves nothing, and one 61 s after it
 /// goes through.

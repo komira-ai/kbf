@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::conn::Conn;
+use super::schema;
 use super::{Flaw, PostgresConfig, PostgresStore};
 use crate::clock::ManualClock;
 use crate::conformance::Backend;
@@ -48,17 +49,20 @@ impl PostgresBackend {
     #[must_use]
     pub fn fresh_config(&self) -> PostgresConfig {
         let n = NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed);
-        let schema = format!("kbf_t{}_{n}", process::id());
+        let name = format!("kbf_t{}_{n}", process::id());
         let config = self
             .base
             .clone()
-            .with_schema(&schema)
+            .with_schema(&name)
             .expect("the generated schema name is plain")
-            .with_application_name(&schema);
+            .with_application_name(&name);
+        // The installer creates the schema in a deployment; a test plays the installer.
+        schema::apply(&config, &schema::embedded(), schema::latest())
+            .expect("the test database takes the schema");
         self.schemas
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(schema);
+            .push(name);
         config
     }
 

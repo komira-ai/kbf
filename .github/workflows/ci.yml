@@ -323,6 +323,8 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo clippy -p kbf-state --features postgres --all-targets --locked -- -D warnings
       - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored
+      # The installer's `setup` and update step over a real schema (src/database_tests.rs).
+      - run: 'cargo test -p kbf-installer --locked --lib --test binary -- --include-ignored database:: setup_creates_the_schema'
       # The server over Postgres: the flag opens it (tests/state_store_postgres.rs), and the
       # farm's restart tests run on a schema of their own (`over_postgres` in tests/state_store.rs).
       - run: cargo test -p kbf-server --locked --test state_store_postgres -- --include-ignored
