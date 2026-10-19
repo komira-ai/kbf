@@ -16,6 +16,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use super::*;
 
@@ -52,6 +53,8 @@ struct Fake {
     /// task leaves its cgroup only at the end of exit). Enabling controllers in the
     /// cgroup is EBUSY this many more times, then works.
     exiting: RefCell<Option<(String, u32)>>,
+    /// Every pause asked for; none is waited.
+    pauses: RefCell<Vec<Duration>>,
 }
 
 fn parent(cgroup: &str) -> &str {
@@ -278,6 +281,10 @@ impl CgroupFs for Fake {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         Ok(())
+    }
+
+    fn pause(&self, how_long: Duration) {
+        self.pauses.borrow_mut().push(how_long);
     }
 
     fn path(&self, cgroup: &str, file: &str) -> PathBuf {
@@ -520,6 +527,8 @@ fn a_cgroup_held_by_an_exiting_thread_is_waited_for() {
     delegate_in(&fake, SELF, MIN, None).expect("delegated");
     assert_eq!(fake.procs(UNIT), Vec::<u32>::new());
     assert!(!fake.enabled(UNIT).is_empty(), "{:?}", fake.log());
+    // One pause per refusal, none before the first try.
+    assert_eq!(fake.pauses.borrow().len(), 25);
 }
 
 /// Catches a failed move or enable read as done (leases would then fail making their
@@ -554,8 +563,14 @@ fn a_move_or_enable_that_fails_stops_the_start() {
         err.contains(&format!("enable controllers in /sys/fs/cgroup{UNIT}")),
         "{err}"
     );
+    // Every refusal was followed by a pause and a new listing and move (the process
+    // that appeared is moved on the next try), until the pauses add up to the bound.
+    let pauses = busy.pauses.borrow();
     let moves = busy.log().iter().filter(|l| l.ends_with("<- 43")).count();
-    assert_eq!(moves, MOVE_TRIES as usize - 1, "{:?}", busy.log());
+    assert_eq!(moves, pauses.len(), "{:?}", busy.log());
+    assert!(pauses.iter().sum::<Duration>() >= MOVE_PAUSE_TOTAL);
+    assert!(pauses.windows(2).all(|w| w[0] <= w[1]));
+    assert!(pauses.iter().all(|p| *p <= MOVE_PAUSE_MAX));
 }
 
 /// Catches `--cgroup-parent` taken without a check (every lease would fail making its
