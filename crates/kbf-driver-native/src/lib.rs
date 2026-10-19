@@ -152,6 +152,18 @@ pub mod xcode_watch;
 // The keepers this crate's unit tests start come from the test binary.
 #[cfg(test)]
 kbf_daemon::keeper_test_hook!();
+
+/// A scratch directory for one unit test, beside the test binary (inside the target
+/// directory), removed when it is dropped. Declare it before anything that runs in it.
+#[cfg(test)]
+pub(crate) fn unit_dir(name: &str) -> kbf_testkit::dir::TestDir {
+    let exe = std::env::current_exe().expect("test binary");
+    let root = exe
+        .parent()
+        .expect("deps directory")
+        .join("kbf-driver-native-unit");
+    kbf_testkit::dir::TestDir::under(root, name)
+}
 // So do the act steps and the fake Xcode tools they run (src/xcode_tests.rs).
 #[cfg(test)]
 kbf_testkit::act_test_hook!();

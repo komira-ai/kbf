@@ -241,16 +241,8 @@ mod tests {
         assert!(message(Unstartable::NotFound, "/x", &[], "").ends_with("directory /kbf/root)"));
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps directory")
-            .join("kbf-driver-container-unit")
-            .join(format!("program-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        dir
+    fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+        crate::unit_dir(&format!("program-{name}"))
     }
 
     const LOG: &str = concat!(

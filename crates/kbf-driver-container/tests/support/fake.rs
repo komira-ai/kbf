@@ -74,7 +74,6 @@ pub fn private_runtime(config: &mut ContainerConfig) {
 
 /// One test's fake `crun`, fake cgroup mount, scratch directory and runtime.
 pub struct Fake {
-    pub dir: PathBuf,
     /// The stand-in `crun`'s state and knobs.
     pub state: PathBuf,
     /// The registry in this process, for a fake made with [`Fake::fetching`].
@@ -85,6 +84,8 @@ pub struct Fake {
     pub cas: Arc<MemoryCas>,
     pub runtime: Arc<ContainerRuntime<MemoryCas>>,
     nonce: String,
+    /// Last: removed after the runtime and the rest of the fake are gone.
+    pub dir: super::Scratch,
 }
 
 /// The id files of a daemon user with one range of 65,536 subordinate ids at 100000.
@@ -175,7 +176,6 @@ impl Fake {
         let runtime =
             Arc::new(ContainerRuntime::new(config.clone(), Arc::clone(&cas)).expect("runtime"));
         Self {
-            dir,
             state,
             registry,
             cgroup,
@@ -184,6 +184,7 @@ impl Fake {
             cas,
             runtime,
             nonce,
+            dir,
         }
     }
 
@@ -446,7 +447,6 @@ impl Drop for Fake {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             self.wait_until_nothing_runs();
-            super::force_remove(&self.dir);
         }
     }
 }

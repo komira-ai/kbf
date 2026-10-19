@@ -4,16 +4,8 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
-fn scratch(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().expect("test binary");
-    let dir = exe
-        .parent()
-        .expect("deps directory")
-        .join("kbf-driver-container-unit")
-        .join(format!("numa-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::unit_dir(&format!("numa-{name}"))
 }
 
 fn set(text: &str) -> CpuSet {

@@ -61,7 +61,7 @@ static ALLOCATOR: Counting = Counting;
 static ALONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A tree of `files` small files, 100 to a directory, in a fresh directory.
-fn tree(name: &str, files: usize) -> std::path::PathBuf {
+fn tree(name: &str, files: usize) -> support::Scratch {
     let upper = support::scratch(name);
     for dir in 0..files.div_ceil(100) {
         let path = upper.join(format!("out/d{dir:04}"));

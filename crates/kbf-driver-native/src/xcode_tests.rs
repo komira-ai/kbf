@@ -9,17 +9,8 @@ use kbf_proto::reapi::platform::Property;
 
 use super::*;
 
-pub(crate) fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("kbf-driver-native-unit")
-        .join(format!("xcode-{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = kbf_outputs::remove_tree(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+pub(crate) fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::unit_dir(&format!("xcode-{name}"))
 }
 
 /// Catches: a build read from the wrong line, kept with its spacing, or made up

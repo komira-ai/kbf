@@ -56,14 +56,13 @@ async fn no_round_of_kill_and_restart_races_the_removal() {
         }
         // What the fake's checks need from it, taken before it is gone.
         let probe = support::fake::Probe::of(&fake);
-        let dir = fake.dir.clone();
+        let dir = fake.dir.display().to_string();
         fake.restart().expect("the restarted runtime starts");
         drop(fake);
         let left = probe.processes();
         assert!(
             left.is_empty(),
-            "round {round}: pids {left:?} of {} run after its removal",
-            dir.display()
+            "round {round}: pids {left:?} of {dir} run after its removal"
         );
     }
 }

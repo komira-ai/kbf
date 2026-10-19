@@ -102,6 +102,18 @@ pub mod unpack_layers;
 #[cfg(test)]
 kbf_daemon::keeper_test_hook!();
 
+/// A scratch directory for one unit test, beside the test binary (inside the target
+/// directory), removed when it is dropped. Declare it before anything that runs in it.
+#[cfg(test)]
+pub(crate) fn unit_dir(name: &str) -> kbf_testkit::dir::TestDir {
+    let exe = std::env::current_exe().expect("test binary");
+    let root = exe
+        .parent()
+        .expect("deps directory")
+        .join("kbf-driver-container-unit");
+    kbf_testkit::dir::TestDir::under(root, name)
+}
+
 pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{SwapKill, cpu_weight, memory_max};
 pub use container::{ContainerLimits, EXEC_ROOT};

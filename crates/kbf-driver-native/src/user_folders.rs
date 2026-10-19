@@ -387,16 +387,8 @@ mod tests {
 
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit")
-            .join(format!("user-folders-{name}-{}", std::process::id()));
-        // Absent unless a run with this pid left it.
-        let _ = kbf_outputs::remove_tree(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
+    fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+        let dir = crate::unit_dir(&format!("user-folders-{name}"));
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         dir
     }

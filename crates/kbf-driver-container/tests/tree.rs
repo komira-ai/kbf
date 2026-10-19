@@ -283,7 +283,7 @@ async fn inputs_named_as_outputs_move_whole_to_the_upper_layer() {
     );
     assert_eq!(
         std::fs::read_link(upper.join("pkg/escape")).expect("link"),
-        outside
+        outside.to_path_buf()
     );
     for gone in ["pkg/in.txt", "pkg/sub", "pkg/escape"] {
         assert!(!exists(&root.join(gone)), "{gone} left in the lower layer");
@@ -368,7 +368,7 @@ async fn a_working_directory_that_is_not_an_input_directory_is_refused() {
 const SECRET: &[u8] = b"host secret, never an output";
 
 /// A directory standing for a host path the action must never read: holds `key.pem`.
-fn host_dir(name: &str) -> std::path::PathBuf {
+fn host_dir(name: &str) -> support::Scratch {
     let dir = support::scratch(name);
     std::fs::write(dir.join("key.pem"), SECRET).expect("plant the host file");
     dir

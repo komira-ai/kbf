@@ -32,6 +32,8 @@ pub struct Cell {
     pub config: ContainerConfig,
     pub cas: Arc<MemoryCas>,
     pub runtime: Arc<ContainerRuntime<MemoryCas>>,
+    /// Last: removed after the runtime is gone.
+    dir: super::Scratch,
 }
 
 static TERMS: AtomicU64 = AtomicU64::new(1);
@@ -127,9 +129,8 @@ impl Cell {
     /// [`Cell::new`], with `configure` applied to the runtime's configuration last.
     pub fn with(name: &str, configure: impl FnOnce(&mut ContainerConfig)) -> Self {
         let uid = rustix::process::getuid().as_raw();
-        let scratch = std::env::temp_dir().join(format!("kbf-oci-{uid}-{name}"));
-        super::force_remove(&scratch);
-        std::fs::create_dir_all(&scratch).expect("create scratch");
+        let dir = super::scratch_in(std::env::temp_dir(), &format!("kbf-oci-{uid}-{name}"));
+        let scratch = dir.to_path_buf();
         // The helper containers run this test binary in its `__chown-dirs` and
         // `__unpack-layers` modes (its `chown_dirs_test_hook!`); a copy in the scratch
         // directory, since the checkout's ancestors may be closed to the container's ids.
@@ -142,7 +143,7 @@ impl Cell {
         let images = shared_images();
         std::fs::create_dir_all(&images).expect("the shared image store");
         std::os::unix::fs::symlink(&images, scratch.join("oci-images")).expect("link the store");
-        Self::in_scratch(name, scratch, |config| {
+        Self::in_scratch(name, dir, |config| {
             config.oci.runtime = crun();
             config.oci.daemon = daemon;
             configure(config);
@@ -151,9 +152,10 @@ impl Cell {
 
     fn in_scratch(
         name: &str,
-        scratch: PathBuf,
+        dir: super::Scratch,
         configure: impl FnOnce(&mut ContainerConfig),
     ) -> Self {
+        let scratch = dir.to_path_buf();
         trace();
         let term = TERMS.fetch_add(1, Ordering::Relaxed);
         let parent = format!("{}/{name}", delegation().actions);
@@ -181,6 +183,7 @@ impl Cell {
             config,
             cas,
             runtime,
+            dir,
         }
     }
 
@@ -237,9 +240,9 @@ impl Drop for Cell {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             let _ = std::fs::remove_dir(&self.cgroup);
-            // What a lease leaves is the driver's to remove (the files in it are owned
-            // by the container's ids); what is left here is the daemon user's own.
-            super::force_remove(&self.scratch);
+            // The scratch directory goes with the cell (`dir`, dropped after this and
+            // the runtime): what a lease leaves is the driver's to remove (the files in
+            // it are owned by the container's ids), what is left is the daemon user's own.
         }
     }
 }

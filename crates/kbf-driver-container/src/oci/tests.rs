@@ -10,16 +10,8 @@ use serde_json::json;
 use super::*;
 use crate::subids::IdFiles;
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps directory")
-        .join("kbf-driver-container-unit")
-        .join(format!("oci-{name}-{}", std::process::id()));
-    let _ = crate::remove::remove_tree(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::unit_dir(&format!("oci-{name}"))
 }
 
 /// A configuration whose runtime exits `ok` (0 or 1) whatever it is asked, with ids in
@@ -209,11 +201,10 @@ fn the_backend_refuses_a_node_without_usable_id_tools() {
 #[test]
 fn a_scratch_directory_others_can_reach_is_accepted() {
     let dir = scratch("searchable");
-    let under_tmp = std::env::temp_dir().join(format!("kbf-oci-unit-{}", std::process::id()));
+    let under_tmp = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-oci-unit");
     let mut config = config(&dir, true);
     config.check_search = true;
     let said = started(&config, &under_tmp);
-    std::fs::remove_dir_all(&under_tmp).expect("remove");
     assert_eq!(said, "started");
 }
 

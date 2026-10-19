@@ -1,20 +1,11 @@
 //! Unit tests of the `__chown-dirs` mode: what the walk visits, and its answers.
 
 use std::os::unix::fs::MetadataExt as _;
-use std::path::PathBuf;
 
 use super::*;
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps directory")
-        .join("kbf-driver-container-unit")
-        .join(format!("chown-dirs-{name}-{}", std::process::id()));
-    let _ = crate::remove::remove_tree(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::unit_dir(&format!("chown-dirs-{name}"))
 }
 
 /// Catches a walk that changes a file's or a symlink's owner (every cached inode
@@ -59,7 +50,7 @@ fn the_mode_changes_owners_or_says_why_not() {
         rustix::process::geteuid().as_raw(),
         rustix::process::getegid().as_raw()
     );
-    let path = dir.clone().into_os_string();
+    let path = dir.to_path_buf().into_os_string();
     assert_eq!(run(&[ids.clone().into(), path.clone()]), 0);
     for bad in [
         vec![ids.clone().into()],
@@ -124,7 +115,7 @@ fn the_whole_mode_gives_entries_and_says_why_not() {
         rustix::process::geteuid().as_raw(),
         rustix::process::getegid().as_raw()
     );
-    let tree = dir.clone().into_os_string();
+    let tree = dir.to_path_buf().into_os_string();
     // A dangling link would fail a `chown` that follows it.
     assert_eq!(
         run(&[ids.clone().into(), "-".into(), WHOLE.into(), tree.clone()]),
