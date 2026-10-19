@@ -13,7 +13,10 @@
 //!   never starts a second update.
 //! - **Only our update counts.** The status shows one update at a time, the last one after
 //!   it ended. A status of another update (the one before, or one a person started) is not
-//!   this deploy's verdict, whatever its phase.
+//!   this deploy's verdict, whatever its phase. So when a person aborts this update and starts
+//!   another, the deploy cannot know ours ended: it reads on until the deadline, and the
+//!   error then names the update the API shows. It does not give up sooner, because a status
+//!   that has not caught up with the POST looks the same.
 //! - **Only `done` is success.** An earlier phase is a frontend update still going on; the
 //!   deploy reads on until the deadline ([`super::Options::handover_timeout`], which covers
 //!   the bake).
@@ -138,6 +141,14 @@ fn verdict(status: &StatusBody, id: &UpdateId) -> Verdict {
     }
 }
 
+/// What a status that is not of our update shows instead, for the text of a deadline.
+fn shown_instead(status: &StatusBody) -> String {
+    match (&status.update_id, status.phase) {
+        (Some(other), Some(phase)) => format!("the API shows update {}, {}", other.0, word(&phase)),
+        _ => "the API shows no update".to_owned(),
+    }
+}
+
 /// The failure of an update that ended `failed` or `rolled_back`, with the step and the
 /// reason as the API gave them.
 fn ended(id: &UpdateId, phase: Phase, failure: Option<&Failure>) -> Fail {
@@ -218,20 +229,22 @@ impl Run<'_> {
     /// Read the status until the update `id` ends. A status that cannot be had right now is
     /// asked for again: the children behind the proxy swap during the update.
     fn follow(&mut self, start: u64, id: &UpdateId) -> Result<(), Fail> {
+        // The latest phase of our update the status showed, and why the latest read did not
+        // show it going on (`None` when it did).
         let mut seen = None;
-        let mut last = "the status has not been read".to_owned();
+        // Every read sets it before the deadline is looked at.
+        let mut last: Option<String>;
         loop {
             match self.frontend_status() {
                 Err(Unseen::Unreadable(text)) => {
                     return Err(fail(Exit::Failed, "api_error", text));
                 }
-                Err(Unseen::Unanswered(text)) => last = text,
+                Err(Unseen::Unanswered(text)) => last = Some(text),
                 Ok(status) => match verdict(&status, id) {
-                    Verdict::NotOurs => {
-                        last = format!("the API shows another update, not {}", id.0);
-                    }
+                    Verdict::NotOurs => last = Some(shown_instead(&status)),
                     Verdict::Going(phase) => {
                         seen = Some(phase);
+                        last = None;
                         self.record(id, phase, None);
                     }
                     Verdict::Done => {
@@ -245,9 +258,15 @@ impl Run<'_> {
                 },
             }
             if self.out_of_time(start) {
-                let state = match seen {
-                    Some(phase) => format!("was in phase {} when", word(&phase)),
-                    None => format!("was not shown ({last}) when"),
+                let state = match (seen, last) {
+                    (Some(phase), None) => format!("was in phase {} when", word(&phase)),
+                    (Some(phase), Some(why)) => {
+                        format!(
+                            "was in phase {}, then not shown ({why}), when",
+                            word(&phase)
+                        )
+                    }
+                    (None, why) => format!("was not shown ({}) when", why.unwrap_or_default()),
                 };
                 return Err(fail(
                     Exit::Failed,

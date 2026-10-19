@@ -399,6 +399,21 @@ fn an_update_that_hangs_ends_at_the_deadline_naming_its_phase() {
     assert_eq!(f.now.get(), 120);
     assert_eq!(f.requests("GET /v1/nodes"), 1);
     assert_eq!(s.post, PostResult::default());
+
+    // A status read that failed and then worked again is not the last word: the deadline
+    // names the phase and no failed read.
+    let mut f = with_fate(FrontendFate::Hang);
+    f.broken.push(
+        Broken::new("GET /v1/update/frontend", Breaks::Status(503))
+            .after_post()
+            .times(2),
+    );
+    let s = tls(&f, &o);
+    assert_eq!(s.reason, "frontend_timeout");
+    assert_eq!(
+        s.detail,
+        "update u-1 was in phase baking when the 120 s ran out"
+    );
 }
 
 /// Proves only `done` ends the step well: an update the API shows in any earlier phase,
@@ -454,13 +469,47 @@ fn the_status_of_another_update_is_not_ours() {
     o.handover_timeout = Duration::from_secs(60);
     let s = tls(&f, &o);
     assert_eq!((s.exit, s.reason.as_str()), (1, "frontend_timeout"));
-    assert!(
-        s.detail
-            .contains("was not shown (the API shows another update, not u-1)"),
-        "{}",
-        s.detail
+    assert_eq!(
+        s.detail,
+        "update u-1 was not shown (the API shows update u-0, done) when the 60 s ran out"
     );
     assert!(s.frontend.is_none());
+
+    // A status with no update at all is not ours either, and the deadline says so.
+    let mut f = with_fate(FrontendFate::Lagging(1_000_000));
+    f.previous = None;
+    let s = tls(&f, &o);
+    assert_eq!((s.exit, s.reason.as_str()), (1, "frontend_timeout"));
+    assert_eq!(
+        s.detail,
+        "update u-1 was not shown (the API shows no update) when the 60 s ran out"
+    );
+}
+
+/// Proves a deploy whose update was replaced (a person aborted it and started another, which
+/// the one-update-at-a-time rule allows once ours has ended) does not take the other update
+/// for its own, and names it at the deadline next to the phase ours was last seen in. Catches
+/// a deadline that only repeats the last phase of our update, which tells the operator the
+/// update is still baking while the API shows another one, and a deploy that follows whatever
+/// update the status shows.
+///
+/// Mutants planted: the other update's status taken for ours (the id not compared); the
+/// reason of the last read dropped from the text.
+#[test]
+fn an_update_replaced_by_another_is_named_at_the_deadline() {
+    let f = with_fate(FrontendFate::Replaced(30));
+    let mut o = opts(true);
+    o.handover_timeout = Duration::from_secs(60);
+    let s = tls(&f, &o);
+    assert_eq!((s.exit, s.reason.as_str()), (1, "frontend_timeout"));
+    assert_eq!(
+        s.detail,
+        "update u-1 was in phase baking, then not shown (the API shows update u-2, baking), \
+         when the 60 s ran out"
+    );
+    // The summary keeps the last phase of our own update, not the other one's.
+    assert_eq!(s.frontend.unwrap().update_id.as_deref(), Some("u-1"));
+    assert_eq!(f.requests("GET /v1/nodes"), 1);
 }
 
 /// Proves a status that cannot be had right now is asked for again (the children behind the

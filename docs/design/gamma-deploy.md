@@ -23,6 +23,12 @@ the CA certificates of the PEM file `--api-ca`, if given. A host whose certifica
 the farm's own CA names that file; a host with no root at all (no system roots, no file)
 refuses to start. The token is sent only to a server that has proved the name.
 
+The system's roots are what the platform's loader finds, which includes the file `SSL_CERT_FILE`
+and the directory `SSL_CERT_DIR` name when the environment has them. A deploy run as root
+must therefore not inherit those variables: `sudo`'s default `env_reset` drops them, and a
+sudoers rule for `deploy` must not list them in `env_keep`. Anyone who can set them for root
+chooses which servers root sends the token to. (The `cas` calls take their roots the same way.)
+
 `--api <127.0.0.1:port>`, `--api-ca <pem>`, `--api-server-name <dns>` and `--token-file <path>`
 default to the `api`, `api_ca`, `api_server_name` and `token_file` keys of
 `/etc/kbf-installer/deploy.json` (`--config`), so a caller that may only run `deploy` names
@@ -71,7 +77,11 @@ Each is a named entry in the summary's `steps`, with its duration.
      update. A new run has a new id.
    - **Only our update counts.** The status shows one update at a time, the last one after it
      ended. A status of another update (the one before, or one a person started) is not this
-     deploy's verdict, whatever its phase.
+     deploy's verdict, whatever its phase. So if a person aborts our update and starts another,
+     the deploy cannot tell that ours ended: it reads on until the deadline (`--handover-timeout-s`),
+     and `frontend_timeout` then names the update the API shows, next to the phase ours was last
+     seen in. It does not give up sooner because a status that has not caught up with the
+     POST looks the same.
    - **Only `done` is success.** Any earlier phase is an update still going on. `failed` and
      `rolled_back` are failures (exit 1, `frontend_failed`, `frontend_rolled_back`) whose
      detail and `frontend.failure` carry the step and the reason the API gave. A status that
@@ -174,6 +184,10 @@ instance name is empty. The blob stays in the store until eviction.
 - The installer's `check` (with the Envoy range). Until it exists the summary has
   `check_skipped: true`.
 - A bundle directory for `--bundle`; only `-` is read.
+- **A deploy that can end `0` against the real proxy.** The post checks need `GET /readyz` to
+  answer 200, and the proxy answers a constant 503 until its poll of the active child writes
+  its readiness (unit U4b-3, `docs/design/kbf-proxy-api.md`, sections 15 and 18). Until then every
+  real run ends `postcheck_failed`, exit 1, and a gamma host stays inert.
 - A run of the whole deploy against the real proxy and the real children. The deploy's tests
   play the API (a fake that answers with the API's own types, served over TLS from a test CA).
   The client's transport is proved against the real proxy by `crates/kbf-it/tests/deploy_through_proxy.rs`

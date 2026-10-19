@@ -104,7 +104,9 @@ fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, what.to_owned())
 }
 
-/// The roots the host trusts (the system store, or the file `SSL_CERT_FILE` names).
+/// The roots the host trusts (the system store, or the file `SSL_CERT_FILE` or the directory
+/// `SSL_CERT_DIR` names). A root deploy must not inherit those variables, which is what
+/// `sudo`'s default `env_reset` sees to (`docs/design/gamma-deploy.md`).
 fn system_roots() -> Vec<CertificateDer<'static>> {
     rustls_native_certs::load_native_certs().certs
 }

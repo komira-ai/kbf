@@ -111,6 +111,9 @@ enum FrontendFate {
     Lagging(u64),
     /// Shows our update in `nodes` and never goes on.
     StuckInNodes,
+    /// Shows our update going on for this many seconds after the POST, then another one
+    /// (`u-2`, `baking`): a person aborted ours and started it.
+    Replaced(u64),
 }
 
 /// How one call of the API is made to go wrong.
@@ -304,6 +307,9 @@ impl Farm {
     /// `GET /v1/update/frontend`.
     fn frontend_status(&self) -> StatusBody {
         let (id, phase, failure) = match self.since_post() {
+            Some(e) if matches!(self.frontend_fate, FrontendFate::Replaced(n) if e >= n) => {
+                (Some("u-2"), Some(Phase::Baking), None)
+            }
             Some(e) if !matches!(self.frontend_fate, FrontendFate::Lagging(n) if e < n) => {
                 let (phase, failure) = self.phase_at(e);
                 (Some("u-1"), Some(phase), failure)
