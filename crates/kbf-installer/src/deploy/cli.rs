@@ -15,6 +15,7 @@ use super::summary::Exit;
 use super::summary::Summary;
 use super::{
     Check, Clock, Env, NoCheck, NoSmoke, Options, Order, Smoke, SystemClock, deploy, lock, summary,
+    why,
 };
 use crate::CommitId;
 
@@ -60,7 +61,7 @@ const HOST_FLAGS: [&str; 8] = [
     "--cas-server-name",
 ];
 
-fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
+fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     let mut commit = None;
     let mut api = None;
     let mut cas = CasFlags::default();
@@ -123,6 +124,7 @@ fn parse(args: &[String], via_sudo: bool) -> Result<Args, String> {
     // both flags are given.
     let conf = read_config(
         &config,
+        owner,
         api.is_none()
             || token_file.is_none()
             || cas.url.is_none()
@@ -181,7 +183,7 @@ struct HostConfig {
 /// `cas_server_name`). Read
 /// only when a flag is missing; it must be a regular file owned by root and writable by no
 /// one else.
-fn read_config(path: &Path, needed: bool) -> Result<HostConfig, String> {
+fn read_config(path: &Path, owner: u32, needed: bool) -> Result<HostConfig, String> {
     if !needed {
         return Ok(HostConfig::default());
     }
@@ -196,12 +198,11 @@ fn read_config(path: &Path, needed: bool) -> Result<HostConfig, String> {
             path.display()
         ));
     }
-    #[cfg(not(test))]
-    if meta.uid() != 0 {
+    if meta.uid() != owner {
         return Err(format!("config {} must be owned by root", path.display()));
     }
-    let text = fs::read_to_string(path).map_err(|e| format!("config: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("config: {e}"))?;
+    let text = fs::read_to_string(path).map_err(why("config"))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(why("config"))?;
     let get = |key: &str| {
         v.get(key)
             .and_then(serde_json::Value::as_str)
@@ -227,7 +228,12 @@ fn number(name: &str, text: &str) -> Result<u64, String> {
 
 /// The platform this binary runs on, in the store's spelling.
 pub fn host_platform() -> &'static str {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+    platform_of(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// [`host_platform`] for the named OS and CPU (the spellings of `std::env::consts`).
+pub(super) fn platform_of(os: &str, arch: &str) -> &'static str {
+    match (os, arch) {
         ("macos", _) => "darwin-arm64",
         (_, "aarch64") => "linux-arm64",
         _ => "linux-x86_64",
@@ -285,14 +291,14 @@ pub(super) fn smoke_for(
 
 /// The token: a regular file owned by root, mode 0600 or 0400, one token of visible ASCII.
 pub fn read_token(path: &Path) -> Result<String, String> {
-    let meta = fs::symlink_metadata(path).map_err(|e| format!("token file: {e}"))?;
+    let meta = fs::symlink_metadata(path).map_err(why("token file"))?;
     if !meta.file_type().is_file() {
         return Err("the token file is not a regular file".to_owned());
     }
     if !matches!(meta.mode() & 0o7777, 0o600 | 0o400) {
         return Err("the token file must be mode 0600 or 0400".to_owned());
     }
-    let text = fs::read_to_string(path).map_err(|e| format!("token file: {e}"))?;
+    let text = fs::read_to_string(path).map_err(why("token file"))?;
     let token = text.trim();
     if token.len() < 32 || !token.bytes().all(|b| b.is_ascii_graphic()) {
         return Err("the token file does not hold a token".to_owned());
@@ -301,8 +307,7 @@ pub fn read_token(path: &Path) -> Result<String, String> {
 }
 
 fn is_root() -> bool {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() == 0 }
+    current_uid() == 0
 }
 
 /// Run `kbf-installer deploy <args>`. The summary goes to `out` (one line, the only
@@ -326,15 +331,52 @@ pub fn main_as(
     err: &mut dyn Write,
     via_sudo: bool,
 ) -> i32 {
+    run(args, stdin, out, err, via_sudo, &Host::current())
+}
+
+/// What the deploy needs to know about the machine it runs on.
+pub(super) struct Host {
+    /// Running as root.
+    pub root: bool,
+    /// The uid that must own the host's config. Root's, except in the unit tests, whose
+    /// files belong to whoever runs them.
+    pub config_owner: u32,
+    pub frontend: FrontendConfig,
+}
+
+impl Host {
+    pub(super) fn current() -> Host {
+        Host {
+            root: is_root(),
+            config_owner: if cfg!(test) { current_uid() } else { 0 },
+            frontend: FrontendConfig::host(),
+        }
+    }
+}
+
+pub(super) fn current_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// [`main_as`], told too about the machine.
+pub(super) fn run(
+    args: &[String],
+    stdin: &mut dyn Read,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    via_sudo: bool,
+    host: &Host,
+) -> i32 {
     let usage = |err: &mut dyn Write, why: &str| {
         let _ = writeln!(err, "kbf-installer deploy: {why}\n{USAGE}");
         Exit::Usage.code()
     };
-    let parsed = match parse(args, via_sudo) {
+    let parsed = match parse(args, via_sudo, host.config_owner) {
         Ok(p) => p,
         Err(why) => return usage(err, &why),
     };
-    if parsed.options.apply && !is_root() {
+    if parsed.options.apply && !host.root {
         return usage(err, "--apply must run as root");
     }
     let token = match read_token(&parsed.token_file) {
@@ -366,8 +408,7 @@ pub fn main_as(
     };
     // A plan runs no smoke, so it reads none of the frontend's config either.
     let smoke: Box<dyn Smoke> = if parsed.options.apply {
-        let frontend = FrontendConfig::host();
-        match smoke_for(&parsed.cas, parsed.options.smoke_timeout, &frontend) {
+        match smoke_for(&parsed.cas, parsed.options.smoke_timeout, &host.frontend) {
             Ok(s) => s,
             Err(why) => return usage(err, &why),
         }

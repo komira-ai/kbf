@@ -59,6 +59,26 @@ enum FrontendFate {
     NoOrderId,
 }
 
+/// How one call of the API is made to go wrong.
+#[derive(Clone, Copy)]
+enum Breaks {
+    /// The request cannot be sent.
+    Io,
+    /// Answered with this status and an empty object.
+    Status(u16),
+    /// Answered 200 with this body.
+    Body(&'static str),
+}
+
+/// Calls (`"METHOD path"`, as a prefix) that go wrong, from the start or only once the desired release
+/// is set.
+#[derive(Clone, Copy)]
+struct Broken {
+    call: &'static str,
+    how: Breaks,
+    after_desired: bool,
+}
+
 /// A farm the operator API plays, driven by a clock that only moves when the deploy sleeps.
 struct Farm {
     now: Rc<Cell<u64>>,
@@ -83,6 +103,7 @@ struct Farm {
     nodes_key_missing: bool,
     /// `/v1/nodes` lists no node once the desired release is set.
     empty_after_desired: bool,
+    broken: Vec<Broken>,
 }
 
 impl Farm {
@@ -107,6 +128,7 @@ impl Farm {
             cordoned: None,
             nodes_key_missing: false,
             empty_after_desired: false,
+            broken: Vec::new(),
         }
     }
 
@@ -176,6 +198,19 @@ impl Operator for Farm {
             .borrow_mut()
             .push(format!("{} {}", r.method, r.path));
         let now = self.now.get();
+        let call = format!("{} {}", r.method, r.path);
+        if let Some(b) = self.broken.iter().find(|b| {
+            call.starts_with(b.call) && (!b.after_desired || self.desired_at.get().is_some())
+        }) {
+            return match b.how {
+                Breaks::Io => Err(io::Error::other("the API is down")),
+                Breaks::Status(s) => Farm::reply(s, json!({})),
+                Breaks::Body(text) => Ok(Reply {
+                    status: 200,
+                    body: text.as_bytes().to_vec(),
+                }),
+            };
+        }
         match (r.method, r.path.as_str()) {
             ("PUT", _) => Farm::reply(self.upload_status, json!({"sha256": "x", "size": 1})),
             ("GET", "/v1/nodes") => {
@@ -338,6 +373,8 @@ fn go(farm: &Farm) -> Summary {
 fn farm(nodes: Vec<NodeScript>) -> Farm {
     Farm::new(Rc::new(Cell::new(0)), nodes)
 }
+
+mod gaps;
 
 // ---- the whole deploy --------------------------------------------------------------
 

@@ -328,3 +328,57 @@ fn the_shipped_binary_refuses_a_verb_that_needs_root_and_names_the_unbuilt_ones(
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("status: not implemented (P4)"));
 }
+
+/// Catches `deploy` not being the first word the binary looks at (the installer's own parser
+/// would refuse its flags), a caller through sudo being able to aim the deploy, and a
+/// host config that is not root's being read: a bad flag is exit 2 with the usage on standard
+/// error and nothing on standard output; with `SUDO_UID` set to another user `--api` is
+/// refused; a config the running user owns is refused as not root's.
+///
+/// Mutants planted: the `deploy` arm removed from `main`; the `SUDO_UID` check dropped; the
+/// owner check of the config dropped.
+#[test]
+fn deploy_is_the_first_word_and_refuses_what_the_host_does_not_own() {
+    let deploy = |args: &[&str], sudo: Option<&str>| {
+        let mut cmd = Command::new(BIN);
+        cmd.arg("deploy").args(args);
+        if let Some(uid) = sudo {
+            cmd.env("SUDO_UID", uid);
+        }
+        cmd.output().expect("runs")
+    };
+    let commit = "a".repeat(40);
+
+    let out = deploy(&["--frobnicate"], None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("usage: kbf-installer deploy"), "{err}");
+
+    let out = deploy(&["--commit", &commit, "--api", "127.0.0.1:1"], Some("1000"));
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not accepted through sudo"), "{err}");
+
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        let dir = root("deploy-config");
+        let config = dir.join("deploy.json");
+        fs::write(&config, "{}").expect("config");
+        fs::set_permissions(&config, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("mode");
+        let out = deploy(
+            &[
+                "--commit",
+                &commit,
+                "--config",
+                config.to_str().expect("utf8"),
+            ],
+            None,
+        );
+        assert_eq!(out.status.code(), Some(2));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("must be owned by root"), "{err}");
+        assert!(out.stdout.is_empty());
+    }
+}

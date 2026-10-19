@@ -63,6 +63,12 @@ struct Knobs {
     long_reads: bool,
     /// A read never answers.
     hang_reads: bool,
+    /// FindMissing answers INTERNAL.
+    find_errors: bool,
+    /// A read answers INTERNAL.
+    read_errors: bool,
+    /// A read starts and then fails in the middle of the stream.
+    read_stream_breaks: bool,
     ac: Ac,
 }
 
@@ -100,6 +106,9 @@ impl ByteStream for Fake {
         if self.knobs.hang_reads {
             std::future::pending::<()>().await;
         }
+        if self.knobs.read_errors {
+            return Err(Status::internal("read"));
+        }
         let name = request.into_inner().resource_name;
         // `blobs/{hash}/{size}`
         let hash = name.split('/').nth(1).unwrap_or_default();
@@ -120,10 +129,12 @@ impl ByteStream for Fake {
             bytes.push(0);
         }
         let (a, b) = bytes.split_at(bytes.len() / 2);
-        let messages = vec![
-            Ok(ReadResponse { data: a.to_vec() }),
-            Ok(ReadResponse { data: b.to_vec() }),
-        ];
+        let second = if self.knobs.read_stream_breaks {
+            Err(Status::internal("mid-stream"))
+        } else {
+            Ok(ReadResponse { data: b.to_vec() })
+        };
+        let messages = vec![Ok(ReadResponse { data: a.to_vec() }), second];
         Ok(Response::new(Box::pin(futures::stream::iter(messages))))
     }
 
@@ -175,6 +186,9 @@ impl ContentAddressableStorage for Fake {
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
         self.call("find_missing");
+        if self.knobs.find_errors {
+            return Err(Status::internal("find"));
+        }
         let held = self
             .state
             .blobs
@@ -477,6 +491,41 @@ fn an_action_cache_error_is_not_a_miss() {
     }
 }
 
+/// Proves each failing leg of the smoke is named: a FindMissingBlobs that errors, a read that
+/// errors, and a read that breaks in the middle of its stream. Catches a smoke that reads an
+/// error as success, or fails without saying which call failed.
+///
+/// Mutants planted: the FindMissingBlobs error mapped to an empty answer; the read error
+/// swallowed; the stream error ended the loop as a clean end.
+#[test]
+fn an_erroring_find_missing_or_read_names_the_call() {
+    for (knobs, what) in [
+        (
+            Knobs {
+                find_errors: true,
+                ..Knobs::default()
+            },
+            "FindMissingBlobs",
+        ),
+        (
+            Knobs {
+                read_errors: true,
+                ..Knobs::default()
+            },
+            "ByteStream.Read",
+        ),
+        (
+            Knobs {
+                read_stream_breaks: true,
+                ..Knobs::default()
+            },
+            "ByteStream.Read",
+        ),
+    ] {
+        fails_with(knobs, what);
+    }
+}
+
 /// Proves the time bound: a server that never answers a read fails the smoke in about the
 /// timeout, naming it. Catches a smoke with no bound (this test would hang).
 #[test]
@@ -624,4 +673,39 @@ fn tls_options_belong_to_an_https_url() {
     let https = CasSmoke::new("https://127.0.0.1:8980", t).unwrap();
     assert!(https.clone().tls(None, Some(b"not pem".to_vec())).is_err());
     assert!(https.tls(Some("farm.example".into()), None).is_ok());
+}
+
+/// Proves a TLS URL with a CA but no name is dialled under the name it was given in the URL
+/// (an address, which the certificate does not name), so it fails rather than skipping the
+/// name check; and the URL forms that are not `scheme://host:port` are refused one by one.
+/// Catches a smoke that treats a missing name as "do not verify the name".
+///
+/// Mutants planted: a missing name replaced by the empty name (the check dropped).
+#[test]
+fn a_tls_url_without_a_name_is_verified_against_its_address() {
+    let (served, ca) = serve_tls("farm.example");
+    let result = tls_smoke(&served, None, Some(ca));
+    assert!(matches!(result, SmokeResult::Fail(_)), "{result:?}");
+    let t = Duration::from_secs(1);
+    for url in [
+        "http://",
+        "https://",
+        "ftp://127.0.0.1:1",
+        "127.0.0.1:1",
+        "http://127.0.0.1:1/",
+        "http://127.0.0.1:1?x",
+        "http://127.0.0.1:1#x",
+        "http://127.0.0.1 :1",
+    ] {
+        assert!(CasSmoke::new(url, t).is_err(), "{url}");
+    }
+}
+
+/// Proves the error text of a failed step names the step and its cause. Catches a smoke that
+/// reports a bare cause, which does not say which call failed.
+///
+/// Mutants planted: the step's name dropped.
+#[test]
+fn an_error_names_the_step_and_its_cause() {
+    assert_eq!(super::why("no random bytes")("EOF"), "no random bytes: EOF");
 }

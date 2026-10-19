@@ -186,3 +186,93 @@ fn no_config_derives_nothing_and_a_broken_file_is_an_error() {
     let t = toml(&d, "[listener]\nlisten = \"not an address\"\n");
     assert!(derive(&t, &[]).unwrap_err().contains("listen"));
 }
+
+/// A certificate signed for these subject alternative names and this common name, as PEM.
+fn cert_for(sans: &[&str], common_name: Option<&str>) -> String {
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+    let mut params =
+        CertificateParams::new(sans.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+            .expect("params");
+    params.distinguished_name = DistinguishedName::new();
+    if let Some(cn) = common_name {
+        params.distinguished_name.push(DnType::CommonName, cn);
+    }
+    params
+        .self_signed(&KeyPair::generate().expect("key"))
+        .expect("sign")
+        .pem()
+}
+
+/// The name derived from a `[tls]` certificate with these names.
+fn name_of(d: &Path, pem: &str) -> Result<Option<String>, String> {
+    let cert = write(d, "reapi.pem", pem);
+    let t = toml(
+        d,
+        &format!("[tls]\nreapi-tls-cert = {:?}\n", cert.to_str().unwrap()),
+    );
+    derive(&t, &[]).map(|d| d.and_then(|d| d.server_name))
+}
+
+/// Proves the name a certificate is dialled under is its first DNS name, else its common
+/// name, and a certificate that names a host in neither way (an IP address alone) is an
+/// error; a PEM block that is no certificate is refused as such, and a listener on one
+/// loopback address of the other family is dialled as written. Catches a derivation that
+/// takes an IP SAN for a name, ignores the common name, or reads anything with a PEM frame.
+///
+/// Mutants planted: the common-name fallback dropped; an IP SAN returned as the name; the
+/// non-certificate refusal turned into "no name".
+#[test]
+fn a_certificates_name_is_its_dns_name_else_its_common_name() {
+    let d = dir("fa-names");
+    assert_eq!(
+        name_of(&d, &cert_for(&["127.0.0.1", "farm.example"], None)).unwrap(),
+        Some("farm.example".to_owned()),
+        "the DNS name after an IP SAN"
+    );
+    assert_eq!(
+        name_of(&d, &cert_for(&[], Some("cn.example"))).unwrap(),
+        Some("cn.example".to_owned()),
+        "no SAN: the common name"
+    );
+    let err = name_of(&d, &cert_for(&["127.0.0.1"], None)).unwrap_err();
+    assert!(err.contains("names no host"), "{err}");
+    let err = name_of(
+        &d,
+        "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap_err();
+    assert!(err.contains("not an X.509 certificate"), "{err}");
+
+    let t = toml(&d, "[listener]\nlisten = \"[::1]:9000\"\n");
+    assert_eq!(
+        url(derive(&t, &[]).unwrap()).as_deref(),
+        Some("http://[::1]:9000")
+    );
+}
+
+/// Proves a config that is there but cannot be read (a directory in its place) is an error
+/// naming it, not an absent config. Catches an error other than not-found read as "no config".
+///
+/// Mutants planted: every read error treated as not-found.
+#[test]
+fn a_config_that_cannot_be_read_is_an_error_not_an_absent_one() {
+    let d = dir("fa-unreadable");
+    let err = derive(&d, &[]).unwrap_err();
+    assert!(err.contains(d.to_str().unwrap()), "{err}");
+}
+
+/// Proves a unit without an `ExecStart` (a template that only has `[Install]`, say) says
+/// nothing about the listener, so the next unit is read. Catches a derivation that stops at
+/// a unit it cannot read an address from.
+///
+/// Mutants planted: a unit with no `ExecStart` ending the search with no answer.
+#[test]
+fn a_unit_without_execstart_is_passed_over() {
+    let d = dir("fa-no-exec");
+    let empty = write(&d, "a.service", "[Install]\nWantedBy=multi-user.target\n");
+    let real = unit_named(&d, "b.service", "--listen 127.0.0.1:8123");
+    assert_eq!(
+        url(derive(&d.join("absent.toml"), &[empty, real]).unwrap()).as_deref(),
+        Some("http://127.0.0.1:8123")
+    );
+}

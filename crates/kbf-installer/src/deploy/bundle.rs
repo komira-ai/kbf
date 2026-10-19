@@ -9,6 +9,7 @@
 
 use std::io::Read;
 
+use super::why;
 use crate::CommitId;
 
 /// The most a tarball may be (the store's cap).
@@ -38,16 +39,21 @@ impl Entry {
 }
 
 /// Read the whole bundle. Every entry must be for `commit`.
-pub fn read(input: impl Read, commit: &CommitId) -> Result<Vec<Entry>, String> {
+pub fn read(mut input: impl Read, commit: &CommitId) -> Result<Vec<Entry>, String> {
+    read_from(&mut input, commit)
+}
+
+/// [`read`], from one reader type whatever the caller's (so one copy of the code).
+fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Vec<Entry>, String> {
     let mut archive = tar::Archive::new(input);
     let mut out = Vec::new();
-    let entries = archive.entries().map_err(|e| format!("not a tar: {e}"))?;
+    let entries = archive.entries().map_err(why("not a tar"))?;
     for entry in entries {
         let mut entry = entry.map_err(|e| format!("bad tar entry: {e}"))?;
         if !entry.header().entry_type().is_file() {
             continue;
         }
-        let path = entry.path().map_err(|e| format!("bad entry name: {e}"))?;
+        let path = entry.path().map_err(why("bad entry name"))?;
         let file = path
             .file_name()
             .and_then(|n| n.to_str())

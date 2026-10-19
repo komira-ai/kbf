@@ -17,6 +17,8 @@
 pub mod api;
 pub mod bundle;
 pub mod cli;
+#[cfg(test)]
+mod cli_flag_tests;
 mod frontend_addr;
 #[cfg(test)]
 mod frontend_addr_tests;
@@ -170,11 +172,24 @@ pub fn lock(path: &Path) -> std::io::Result<Option<Lock>> {
         .truncate(false)
         .mode(0o600)
         .open(path)?;
-    match file.try_lock() {
+    take(file, std::fs::File::try_lock)
+}
+
+/// `file` locked by `try_lock`: the lock, `None` when another holds it, else the error.
+fn take(
+    file: std::fs::File,
+    try_lock: fn(&std::fs::File) -> Result<(), std::fs::TryLockError>,
+) -> std::io::Result<Option<Lock>> {
+    match try_lock(&file) {
         Ok(()) => Ok(Some(Lock(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
+}
+
+/// The error `what: cause`, for `map_err`.
+pub(crate) fn why<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> String {
+    move |cause| format!("{what}: {cause}")
 }
 
 /// A failure that ends the deploy.
@@ -477,9 +492,10 @@ impl Run<'_> {
                 .ok()
                 .and_then(|u| nodes::frontend_state(&u, order_id));
             if let Some(state) = state {
-                if let Some(f) = self.sum.frontend.as_mut() {
-                    f.state.clone_from(&state);
-                }
+                self.sum.frontend = Some(summary::Frontend {
+                    order_id,
+                    state: state.clone(),
+                });
                 match state.as_str() {
                     "confirmed" => return Ok(()),
                     "reverted" => {

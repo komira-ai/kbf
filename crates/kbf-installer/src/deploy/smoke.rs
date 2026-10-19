@@ -33,7 +33,7 @@ use sha2::{Digest as _, Sha256};
 use tonic::Code;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
-use super::{Smoke, SmokeResult};
+use super::{Smoke, SmokeResult, why};
 
 /// The bytes of the blob the smoke writes.
 const BLOB_BYTES: usize = 64;
@@ -98,19 +98,21 @@ impl CasSmoke {
 
 impl Smoke for CasSmoke {
     fn run(&self) -> SmokeResult {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(r) => r,
-            Err(e) => return SmokeResult::Fail(format!("no runtime: {e}")),
-        };
         let this = self.clone();
         let bounded = async move { tokio::time::timeout(this.timeout, check(&this)).await };
-        match runtime.block_on(bounded) {
-            Ok(Ok(())) => SmokeResult::Pass,
-            Ok(Err(why)) => SmokeResult::Fail(why),
-            Err(_) => SmokeResult::Fail(format!("timed out after {} s", self.timeout.as_secs())),
+        let secs = self.timeout.as_secs();
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(why("no runtime"))
+            .and_then(|runtime| {
+                runtime
+                    .block_on(bounded)
+                    .unwrap_or_else(|_| Err(format!("timed out after {secs} s")))
+            });
+        match outcome {
+            Ok(()) => SmokeResult::Pass,
+            Err(why) => SmokeResult::Fail(why),
         }
     }
 }
@@ -120,7 +122,7 @@ fn random(n: usize) -> Result<Vec<u8>, String> {
     let mut bytes = vec![0; n];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut bytes))
-        .map_err(|e| format!("no random bytes: {e}"))?;
+        .map_err(why("no random bytes"))?;
     Ok(bytes)
 }
 
@@ -138,8 +140,7 @@ async fn check(target: &CasSmoke) -> Result<(), String> {
     let action = digest_of(&random(BLOB_BYTES)?);
     let upload = hex::encode(random(16)?);
 
-    let mut endpoint =
-        Endpoint::from_shared(target.url.clone()).map_err(|e| format!("the address: {e}"))?;
+    let mut endpoint = Endpoint::from_shared(target.url.clone()).map_err(why("the address"))?;
     if target.url.starts_with("https://") {
         // The system roots, the extra CA, and the certificate's own name.
         let mut tls = ClientTlsConfig::new().with_native_roots();
@@ -149,9 +150,7 @@ async fn check(target: &CasSmoke) -> Result<(), String> {
         if let Some(name) = &target.server_name {
             tls = tls.domain_name(name.clone());
         }
-        endpoint = endpoint
-            .tls_config(tls)
-            .map_err(|e| format!("TLS config: {e}"))?;
+        endpoint = endpoint.tls_config(tls).map_err(why("TLS config"))?;
     }
     let channel: Channel = endpoint
         .connect()

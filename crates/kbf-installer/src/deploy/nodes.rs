@@ -137,3 +137,44 @@ pub fn frontend_state(update: &Value, order_id: u64) -> Option<String> {
 pub fn same_commit(running: &str, commit: &str) -> bool {
     running.len() >= 12 && commit.starts_with(running)
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::platform_of;
+
+    /// Proves a node's platform is the one it reports, else its OS and CPU in the store's
+    /// spelling (`macos` is `darwin`), and a platform the store does not know is none.
+    /// Catches a Mac node read as Linux, a node with half its software facts given a
+    /// platform, and an unknown platform passed on to the preflight.
+    ///
+    /// Mutants planted: the `macos` rename dropped; the reported platform ignored; the
+    /// filter on known platforms dropped.
+    #[test]
+    fn the_platform_is_reported_or_derived_and_must_be_known() {
+        let of = |v: serde_json::Value| platform_of(&v);
+        assert_eq!(
+            of(
+                json!({"update": {"platform": "linux-arm64"}, "software": {"os": "macos", "arch": "arm64"}})
+            ),
+            Some("linux-arm64".to_owned())
+        );
+        assert_eq!(
+            of(json!({"software": {"os": "macos", "arch": "arm64"}})),
+            Some("darwin-arm64".to_owned())
+        );
+        assert_eq!(
+            of(json!({"software": {"os": "linux", "arch": "x86_64"}})),
+            Some("linux-x86_64".to_owned())
+        );
+        assert_eq!(
+            of(json!({"software": {"os": "linux", "arch": "riscv"}})),
+            None
+        );
+        assert_eq!(of(json!({"software": {"os": "linux"}})), None);
+        assert_eq!(of(json!({"software": {"arch": "arm64"}})), None);
+        assert_eq!(of(json!({"update": {"platform": "beos-ppc"}})), None);
+        assert_eq!(of(json!({})), None);
+    }
+}
