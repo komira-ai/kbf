@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::child_real::{ProcChild, ident_of};
-use super::model::ProcIdent;
+use super::model::{PortError, ProcIdent};
 use super::ports::Child as _;
 use crate::testkit::{A, B, c, host_root_on};
 
@@ -98,6 +98,19 @@ impl Drop for Cleanup<'_> {
         let leaked = !orphans.is_empty() & !std::thread::panicking();
         assert!(!leaked, "children left running by the test: {orphans:?}");
     }
+}
+
+/// The error of a spawn the test expects to fail. A spawn that wrongly succeeds is stopped
+/// by a [`Cleanup`] while the test panics, so a defect cannot leave a child running. No
+/// branch: the same line serves the pass and the panic.
+pub(super) fn refused(
+    child: &ProcChild,
+    spawned: Result<ProcIdent, PortError>,
+    what: &str,
+) -> PortError {
+    let started: Vec<ProcIdent> = spawned.as_ref().ok().cloned().into_iter().collect();
+    let _stop = Cleanup(child, started);
+    spawned.expect_err(what)
 }
 
 pub(super) fn wait_for(what: &str, mut done: impl FnMut() -> bool) {

@@ -15,31 +15,23 @@
 //! - [`runtime::SystemClock`] and [`runtime::RequestQueue`], the `Clock` and the `Requests`;
 //! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left.
 //!
-//! Still fakes, stated: `ChildAdmin` (the child's admin port, `admin_protocol` 1, is on
-//! feature; the adapter that calls it is not written: it would send the proxy secret header
-//! on every call, over [`child_http`], the blocking loopback client that the fleet read will
-//! use too, and nothing calls that yet), `Migrator` (who migrates is open), `RootOrders`
-//! (the orders spool and `status.json` reader belong to the update API's unit, U8b). Until
-//! `ChildAdmin` has an adapter the proxy verb cannot run a swap or resume one, start a first
-//! child or choose between two live ones, so [`supervisor::adopt_children`] adopts a child
-//! only when no update is in flight.
+//! Still fakes, stated: `ChildAdmin` (the trait is the shape the swap was built on; the
+//! adapter from it to the child's admin API, `admin_protocol` 1, is #1162, in `proxy/admin.rs`;
+//! it would send the proxy secret header on every call, over [`child_http`], the blocking
+//! loopback client that the fleet read will use too), `Migrator` (who migrates is open),
+//! `RootOrders` (the orders spool and `status.json` reader belong to the update API's unit,
+//! U8b). Until `ChildAdmin` has an adapter the proxy verb cannot run a swap or resume one,
+//! start a first child or choose between two live ones, so [`supervisor::adopt_children`]
+//! adopts a child only when no update is in flight.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
 //!   [`ports::ChildAdmin::resume`].
-//! - **Takeover and quiesce** (`admin_protocol` 1). `takeover` names the generation the
-//!   old child holds, read from its quiesced `role` view (`held_generation`); with no live
-//!   holder (a cold start) the candidate's own `generation` is named. `quiesce` is
-//!   synchronous in the protocol, yet the swap still reads `role` until `Quiesced`: that read
-//!   gives the generation, bounds a child that answered before it flushed, and is where an
-//!   abort is noticed. From the phase `quiescing` on an `active` view is not taken as proof
-//!   that the child serves, so a failed switch resumes it ([`swap::Swap::resume_old`]).
 //! - **Start.** A frontend host starts the new child as a candidate (`--await-takeover`,
 //!   [`model::Start`]); an all-in-one host starts the new process, and the old release put
 //!   back after a failed start, to serve at once, because no takeover is ever sent there.
-//! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); the child's
-//!   own Execute/WaitExecution streams and worker streams from its `role` view
-//!   ([`model::RoleInfo::idle`]).
+//! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); open
+//!   executions and queued operations from the child ([`ports::ChildAdmin::open_counts`]).
 //! - **Migration** (open): who runs the forward Postgres migration, and with which
 //!   credential, is undecided; the swap only calls [`ports::Migrator::migrate_forward`]
 //!   before the candidate starts. For an all-in-one host it runs after the old process

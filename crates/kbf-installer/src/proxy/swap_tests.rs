@@ -112,8 +112,8 @@ fn an_old_child_that_never_drains_is_never_signalled_in_24_hours() {
             Box::new(|w: &World| w.queued(Slot::A, 1, None)),
         ),
         (
-            "the stood-down child cannot be asked",
-            Box::new(|w: &World| w.st.borrow_mut().stood_down_silent = true),
+            "the child cannot be asked",
+            Box::new(|w: &World| w.st.borrow_mut().open_counts_err = true),
         ),
     ] {
         let (w, old) = World::with_old();
@@ -628,109 +628,36 @@ fn an_old_child_that_cannot_resume_leaves_the_new_child_serving_and_fails_the_ro
     assert_eq!(w.count("terminate"), 0, "neither child is retired");
 }
 
-/// Catches a takeover that does not name the generation the old child holds: the store (the
-/// fake refuses a takeover whose `expect` is not its generation, with 409 and nothing
-/// written) leaves the candidate a candidate and the swap fails. The store starts at 7, so a
-/// constant, a zero or a guess cannot pass, and the candidate is started waiting.
+/// Catches a frontend swap that starts the new child serving: it must wait (`--await-takeover`)
+/// so that the takeover, after the old child quiesced, is the only moment it holds the
+/// generation.
 #[test]
-fn the_takeover_names_the_generation_the_old_child_holds() {
+fn the_new_child_of_a_frontend_swap_is_started_to_wait_for_the_takeover() {
     let (w, old) = World::with_old();
-    w.st.borrow_mut().generation = 7;
     assert_eq!(
         go(&w, plan(Mode::Frontend), old),
         Ok(Phase::Done),
         "{:#?}",
         w.log()
     );
-    assert_eq!(w.count("admin:takeover B expect 7"), 1, "{:#?}", w.log());
-    assert_eq!(w.st.borrow().generation, 8, "the takeover bumped the store");
+    assert_eq!(w.count("admin:takeover B"), 1, "{:#?}", w.log());
+    assert_eq!(w.st.borrow().starts, vec![(Slot::B, Start::Candidate)]);
     assert_eq!(w.holders(), vec![Slot::B]);
-    assert_eq!(
-        w.st.borrow().starts,
-        vec![(Slot::B, Start::Candidate)],
-        "the new child waits for the takeover"
-    );
 }
 
-/// Catches a swap that goes on after the store refuses the takeover (409: the generation the
-/// old child reports is not the store's, nothing written): the candidate is killed unserved,
-/// the old child resumes, the held streams go back to it and the update fails at `switch`.
+/// Catches a takeover sent without the plan's limit (the child's own deadline): a swap that
+/// passes zero or a constant leaves the child with a bound the plan did not choose, so both
+/// the switch and the cold start after a restart must pass `timing.takeover`.
 #[test]
-fn a_takeover_the_store_refuses_kills_the_candidate_and_resumes_the_old_child() {
+fn the_takeover_carries_the_plans_limit() {
     let (w, old) = World::with_old();
-    // The store moved on to 5 behind the old child, whose view still says it holds 4.
-    w.st.borrow_mut().generation = 5;
-    w.st.borrow_mut().procs[0].holder = false;
+    let mut p = plan(Mode::Frontend);
+    p.timing.takeover = Duration::from_millis(7_321);
+    assert_eq!(go(&w, p, old), Ok(Phase::Done), "{:#?}", w.log());
     assert_eq!(
-        go(&w, plan(Mode::Frontend), old),
-        Ok(Phase::Failed),
+        w.count("admin:takeover B limit 7321 ms"),
+        1,
         "{:#?}",
         w.log()
-    );
-    assert_eq!(w.count("admin:takeover B expect 4"), 1, "{:#?}", w.log());
-    assert_eq!(
-        w.holders(),
-        vec![Slot::A],
-        "the candidate never held it; the old child re-took it"
-    );
-    seq(
-        &w,
-        &[
-            "admin:takeover B",
-            "kill pid 101",
-            "admin:resume A",
-            "release_into A",
-        ],
-    );
-    assert_eq!(w.last_intent().failure.map(|f| f.step), Some(Step::Switch));
-}
-
-/// Catches a `RoleInfo` that drifts from the `admin_protocol` 1 answer: every field of the
-/// object the child serves (`GET /v1/admin/role`, kbf-server's `RoleView`) is read by its
-/// wire name, the four roles are the kebab-case words (there is no `quiescing`), and the
-/// holder is derived (`held_generation == generation` and not superseded), never read.
-#[test]
-fn the_admin_protocol_1_view_parses_and_the_holder_is_derived() {
-    let view = |role: &str, held: &str, superseded: bool| {
-        format!(
-            r#"{{"role":"{role}","instance_id":"3f2a","admin_protocol":1,"generation":7,
-            "held_generation":{held},"superseded":{superseded},"open_streams":4,
-            "open_sessions":2,"reapi":"127.0.0.1:18000","worker":null,"api":"127.0.0.1:18002"}}"#
-        )
-    };
-    let parse = |text: String| serde_json::from_str::<RoleInfo>(&text);
-    let active = parse(view("active", "7", false)).expect("an active view");
-    assert_eq!(active.state, RoleState::Active);
-    assert_eq!(active.instance_id, "3f2a");
-    assert_eq!(
-        (active.generation, active.held_generation),
-        (Some(7), Some(7))
-    );
-    assert_eq!((active.open_streams, active.open_sessions), (4, 2));
-    assert_eq!(active.reapi, Some("127.0.0.1:18000".parse().expect("addr")));
-    assert!(active.worker.is_none() && active.api.is_some());
-    assert!(active.holder() && !active.idle());
-    for (word, state) in [
-        ("candidate", RoleState::Candidate),
-        ("quiesced", RoleState::Quiesced),
-        ("stood-down", RoleState::StoodDown),
-    ] {
-        assert_eq!(parse(view(word, "7", false)).expect(word).state, state);
-    }
-    assert!(
-        parse(view("quiescing", "7", false)).is_err(),
-        "no Quiescing role"
-    );
-    // Not the holder: an older generation, a superseded writer, a candidate that took none.
-    assert!(!parse(view("quiesced", "6", false)).expect("older").holder());
-    assert!(
-        !parse(view("active", "7", true))
-            .expect("superseded")
-            .holder()
-    );
-    assert!(
-        !parse(view("candidate", "null", false))
-            .expect("candidate")
-            .holder()
     );
 }

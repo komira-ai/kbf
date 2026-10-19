@@ -425,21 +425,19 @@ impl<'a> Swap<'a> {
             return self.fail(Step::Hold, e.to_string());
         }
         self.set_phase(Phase::Quiescing)?;
-        // The old child holds the generation; the takeover names it.
-        let expect = match self.quiesce_old()? {
-            Ok(held) => held,
-            Err((step, reason)) => return self.switch_failed(step, reason),
-        };
+        if let Err((step, reason)) = self.quiesce_old()? {
+            return self.switch_failed(step, reason);
+        }
         self.set_phase(Phase::Switching)?;
         let t0 = self.now();
-        let result = self.ports.admin.takeover(new, expect);
+        let result = self.ports.admin.takeover(new, t.takeover);
         self.ports
             .recorder
             .crash_point(super::model::CrashPoint::BeforeTakeoverReturns)?;
         let took = self.now().saturating_sub(t0);
         match result {
             Err(e) => return self.switch_failed(Step::Switch, format!("takeover: {e}")),
-            Ok(_) if took > t.takeover => {
+            Ok(()) if took > t.takeover => {
                 return self.switch_failed(
                     Step::Switch,
                     format!(
@@ -449,7 +447,7 @@ impl<'a> Swap<'a> {
                     ),
                 );
             }
-            Ok(_) => {}
+            Ok(()) => {}
         }
         self.ports
             .recorder
@@ -466,8 +464,7 @@ impl<'a> Swap<'a> {
 
     /// Ask the old child to quiesce and wait for `Quiesced` inside the budget. An abort
     /// that arrives during the wait ends the update as `abort`, not `switch`.
-    /// `Ok` is the generation the old child holds (`held_generation` of its quiesced view).
-    fn quiesce_old(&mut self) -> Result<Result<u64, (Step, String)>, Halt> {
+    fn quiesce_old(&mut self) -> Result<Result<(), (Step, String)>, Halt> {
         let t = self.plan.timing;
         let old = self.intent.old_slot;
         let t0 = self.now();
@@ -477,19 +474,14 @@ impl<'a> Swap<'a> {
         loop {
             self.expire_held();
             let waited = self.now().saturating_sub(t0);
-            let quiesced =
-                (self.ports.admin.role(old).ok()).filter(|v| v.state == RoleState::Quiesced);
-            if let Some(view) = quiesced {
+            if matches!(self.ports.admin.role(old), Ok(r) if r.state == RoleState::Quiesced) {
                 return Ok(if waited > t.quiesce {
                     Err((
                         Step::Switch,
                         format!("quiesce took {} ms", waited.as_millis()),
                     ))
                 } else {
-                    view.held_generation.ok_or((
-                        Step::Switch,
-                        "the quiesced old child reports no held generation".to_owned(),
-                    ))
+                    Ok(())
                 });
             }
             if waited >= t.quiesce {
@@ -521,13 +513,9 @@ impl<'a> Swap<'a> {
         self.fail(step, reason)
     }
 
-    /// Resume `slot` unless it already serves as the active child. From the phase `quiescing`
-    /// on, an `active` view proves nothing: the quiesce was asked, and a call that failed or
-    /// timed out may have left the child half way, so it is resumed (the call is idempotent).
+    /// Resume `slot` unless it already serves as the active child.
     pub(super) fn resume_old(&mut self, role: Option<RoleInfo>, slot: Slot) {
-        let asked = self.intent.phase >= Phase::Quiescing;
-        let looks_serving = role.as_ref().is_some_and(RoleInfo::serving);
-        let serving = looks_serving && !asked;
+        let serving = matches!(role, Some(r) if r.state == RoleState::Active && r.holder);
         if serving || !self.slot_alive(slot) {
             return;
         }

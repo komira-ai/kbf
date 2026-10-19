@@ -10,22 +10,19 @@ use kbf_proxy::{Proxy, ProxyRunner};
 use super::*;
 use crate::proxy::child_rig::{Cleanup, alive, rig, wait_for};
 use crate::proxy::fakes::plan;
+use crate::proxy::gate_real_tests::proxy_table;
 use crate::proxy::model::{Intent, Mode, Phase};
 use crate::proxy::ports::Recorder as _;
 use crate::testkit::{A, B, c};
 
-const TABLE: &str = r#"
-operator_token_file = "/etc/kbf/operator.token"
-server_cert_file = "/etc/kbf/tls/server.pem"
-server_key_file = "/etc/kbf/tls/server.key"
-client_ca_file = "/etc/kbf/tls/ca.pem"
-[upstream]
-base_port = 18000
-"#;
-
 fn gate() -> (ProxyGate, ProxyRunner) {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let name = format!(
+        "supervisor-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let config = ProxyConfig::from_toml_str(TABLE).expect("config");
+    let config = ProxyConfig::from_toml_str(&proxy_table(&name, "")).expect("config");
     let (handle, runner) = Proxy::bind(config, OwnedFd::from(listener)).expect("proxy");
     (ProxyGate::new(handle), runner)
 }

@@ -12,8 +12,8 @@ use std::time::Duration;
 use crate::CommitId;
 
 use super::model::{
-    AdoptError, CrashPoint, Halt, Intent, Locator, PortError, ProcIdent, Readiness, Request,
-    Retired, RoleInfo, Slot, StagedFacts, Start,
+    AdoptError, CrashPoint, Halt, Intent, Locator, OpenCounts, PortError, ProcIdent, Readiness,
+    Request, Retired, RoleInfo, Slot, StagedFacts, Start,
 };
 
 /// The process side of the children. The proxy starts them as its own processes.
@@ -39,38 +39,30 @@ pub trait Child {
     fn kill_unserved(&self, ident: &ProcIdent) -> Result<(), PortError>;
 }
 
-/// The admin calls on a child (`admin_protocol` 1: `GET role`, `POST quiesce`, `resume`,
-/// `takeover`, `stand-down`) and the two reads the swap needs besides (`ready`,
-/// `post_desired`), addressed by slot.
-///
-/// Every call answers 200 with the child's view ([`RoleInfo`]), 409 with an error when it
-/// does not apply to the child's role, 400 for a bad body; all of those but the 200 are
-/// `Err` here. A real adapter sends the proxy secret header on every call (the admin port
-/// will require it), over [`super::child_http`]'s loopback client; it is not built yet (the
-/// child's admin port, #1103, is not merged here), so only the fake implements this trait.
+/// The admin calls on a child (`role`, `takeover`, `quiesce`, `stand-down`, `resume`) and
+/// the two reads the swap needs besides (`ready`, `open_counts`), addressed by slot.
 pub trait ChildAdmin {
     fn role(&self, slot: Slot) -> Result<RoleInfo, PortError>;
 
-    /// Take the generation: atomically, reload all state, start the schedulers. Candidate
-    /// only. `expect` is the generation the holder holds (`held_generation` of its view),
-    /// or the store's (`generation` of the candidate's own view) when no child holds it.
-    /// 409: the child is not a candidate or the store is not at `expect`, nothing written.
-    /// 500: it took the generation and could not start; the child exits. The swap measures
-    /// the elapsed time itself.
-    fn takeover(&self, slot: Slot, expect: u64) -> Result<RoleInfo, PortError>;
+    /// Take the generation: atomically, reload all state, start the schedulers. `limit`
+    /// is the child's own deadline; the swap also measures the elapsed time itself.
+    fn takeover(&self, slot: Slot, limit: Duration) -> Result<(), PortError>;
 
-    /// Stop scheduling, assigning and requeueing and flush. Synchronous, up to 10 s: the
-    /// view says `Quiesced`. Idempotent. It does not wait for running work.
-    fn quiesce(&self, slot: Slot) -> Result<RoleInfo, PortError>;
+    /// Ask the child to stop scheduling, assigning and requeueing and to flush. It does
+    /// not wait for running work. Returns once the request is accepted; `role` reports
+    /// `Quiescing` and then `Quiesced`.
+    fn quiesce(&self, slot: Slot) -> Result<(), PortError>;
 
-    fn stand_down(&self, slot: Slot) -> Result<RoleInfo, PortError>;
+    fn stand_down(&self, slot: Slot) -> Result<(), PortError>;
 
     /// The inverse of `quiesce` and `stand-down` while the process lives: a full reload
     /// from the store, then a re-take of the generation if the holder is dead or agrees.
-    /// Idempotent.
-    fn resume(&self, slot: Slot) -> Result<RoleInfo, PortError>;
+    /// Assumed by Q3 and built in U2. Idempotent.
+    fn resume(&self, slot: Slot) -> Result<(), PortError>;
 
     fn ready(&self, slot: Slot) -> Result<Readiness, PortError>;
+
+    fn open_counts(&self, slot: Slot) -> Result<OpenCounts, PortError>;
 
     /// `POST /v1/update/desired {commit}` on the child's operator port; idempotent
     /// (FP section 5 step 9).

@@ -16,20 +16,56 @@ use super::model::*;
 use super::ports::{Gate, Ports};
 use super::swap::Swap;
 
-const TABLE: &str = r#"
-operator_token_file = "/etc/kbf/operator.token"
-server_cert_file = "/etc/kbf/tls/server.pem"
-server_key_file = "/etc/kbf/tls/server.key"
-client_ca_file = "/etc/kbf/tls/ca.pem"
-hold_max_s = 15
-[upstream]
-base_port = 18000
-"#;
+/// A `[proxy]` table (the keys, without the header) over real files in a scratch directory:
+/// a CA, a server certificate, the operator token and a secret path, as `Proxy::bind` reads
+/// them. `extra` is more top-level keys.
+pub(super) fn proxy_table(name: &str, extra: &str) -> String {
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose, SanType,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = kbf_host::testkit::scratch(&format!("proxy-gate-{name}"));
+    let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
+    let mut server = CertificateParams::new(Vec::<String>::new()).expect("params");
+    server.subject_alt_names = vec![SanType::DnsName("localhost".try_into().expect("ia5"))];
+    server.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let key = KeyPair::generate().expect("key");
+    let cert = server.signed_by(&key, &ca).expect("server certificate");
+    let private = |file: &str, text: &str| {
+        let path = dir.join(file);
+        std::fs::write(&path, text).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        path
+    };
+    let cert = private("server.pem", &cert.pem());
+    let key = private("server.key", &key.serialize_pem());
+    let ca = private("ca.pem", &ca.pem());
+    let token = private("operator.token", "operator-token-0123456789-abcdefghijkl");
+    format!(
+        "operator_token_file = {token:?}\nserver_cert_file = {cert:?}\n\
+         server_key_file = {key:?}\nclient_ca_file = {ca:?}\n\
+         proxy_auth_file = {:?}\n{extra}[upstream]\nbase_port = 18000\n",
+        dir.join("proxy-auth"),
+    )
+}
 
 /// A proxy that is bound and not serving, so the gate is real and no socket is needed.
 fn proxy() -> (ProxyGate, ProxyRunner) {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let name = format!(
+        "real-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let config = ProxyConfig::from_toml_str(TABLE).expect("config");
+    let config =
+        ProxyConfig::from_toml_str(&proxy_table(&name, "hold_max_s = 15\n")).expect("config");
     let (handle, runner) = Proxy::bind(config, OwnedFd::from(listener)).expect("proxy");
     (ProxyGate::new(handle), runner)
 }

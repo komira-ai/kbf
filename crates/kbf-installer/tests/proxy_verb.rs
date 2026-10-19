@@ -496,17 +496,18 @@ async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
     )
     .expect("record");
 
-    let table = TABLE.replacen(
+    let (path, ca) = served_config("adopt");
+    let table = fs::read_to_string(&path).expect("config text").replacen(
         "[proxy]\n",
         &format!("[proxy]\nstate_dir = \"{}\"\n", state.display()),
         1,
     );
-    let path = config("adopt", &table);
+    fs::write(&path, table).expect("write");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let mut proxy = start(&path, &listener);
     drop(listener);
-    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, "/healthz"))
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
         .await
         .expect("the proxy answers");
     assert_eq!(status, 200);

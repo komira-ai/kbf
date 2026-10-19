@@ -18,9 +18,9 @@ fn aio(w: &World, old: ProcIdent) -> (Result<Phase, Halt>, Vec<String>) {
 }
 
 #[test]
-fn a_child_whose_own_counts_are_zero_is_not_signalled_while_the_gate_says_busy() {
+fn a_child_whose_own_counts_are_zero_is_not_signalled_while_streams_are_bound_to_its_slot() {
     // The child is idle at once; the proxy still has streams bound to its slot until 700 s.
-    // The permits clear last, so only the gate's answer can hold the SIGTERM back.
+    // The permits clear last, so only the proxy's permits can hold the SIGTERM back.
     let (w, old) = World::with_old();
     w.permits(Slot::A, 3, Some(secs(700)));
     assert_eq!(frontend(&w, old), Ok(Phase::Done));
@@ -31,7 +31,9 @@ fn a_child_whose_own_counts_are_zero_is_not_signalled_while_the_gate_says_busy()
         signalled >= secs(700),
         "SIGTERM at {signalled:?} with streams still bound"
     );
-    assert!(w.count("gate:retire A Busy(3)") > 0, "{:#?}", w.log());
+    // The proxy's permits are part of the idle rule, read before the gate is asked to close
+    // the slot: a busy slot is never offered to `retire`.
+    assert_eq!(w.count("gate:retire A Busy"), 0, "{:#?}", w.log());
 }
 
 #[test]

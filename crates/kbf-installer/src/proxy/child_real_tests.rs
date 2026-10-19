@@ -2,7 +2,7 @@
 //! child port.
 
 use super::*;
-use crate::proxy::child_rig::{Cleanup, Rig, alive, rig, wait_for};
+use crate::proxy::child_rig::{Cleanup, Rig, alive, refused, rig, wait_for};
 use crate::testkit::{A, B, c};
 
 /// Catches a spawn that runs another file than the release's (the `current` link, a stale
@@ -206,11 +206,12 @@ fn a_slot_with_a_live_child_refuses_a_second_and_is_free_once_it_exited() {
         .spawn(Slot::A, &c(A), Start::Active)
         .expect("first");
     let _stop = Cleanup(&rig.child, vec![first.clone()]);
-    let refused = rig
-        .child
-        .spawn(Slot::A, &c(B), Start::Active)
-        .expect_err("occupied");
-    assert!(refused.0.contains("live child already"), "{refused}");
+    let busy = refused(
+        &rig.child,
+        rig.child.spawn(Slot::A, &c(B), Start::Active),
+        "occupied",
+    );
+    assert!(busy.0.contains("live child already"), "{busy}");
     rig.child.terminate(&first).expect("signal");
     wait_for("exit", || !alive(first.pid));
     rig.set(&["sleep", "600"]);
@@ -228,10 +229,11 @@ fn a_slot_with_a_live_child_refuses_a_second_and_is_free_once_it_exited() {
 fn a_release_without_a_program_is_a_spawn_error_and_records_nothing() {
     let rig = rig("child-real-missing");
     let release = CommitId::new(&"c".repeat(40)).expect("a commit");
-    let e = rig
-        .child
-        .spawn(Slot::A, &release, Start::Active)
-        .expect_err("no program");
+    let e = refused(
+        &rig.child,
+        rig.child.spawn(Slot::A, &release, Start::Active),
+        "no program",
+    );
     assert!(e.0.contains("kbf-act"), "{e}");
     assert_eq!(rig.child.recorded(Slot::A), None);
 }
@@ -244,10 +246,11 @@ fn a_child_whose_record_cannot_be_written_is_killed_and_the_spawn_fails() {
     // The record directory is a file, so the record cannot be made.
     fs::write(&rig.dir, b"in the way").expect("block");
     rig.set(&["sleep", "31337"]);
-    let e = rig
-        .child
-        .spawn(Slot::A, &c(A), Start::Active)
-        .expect_err("no record");
+    let e = refused(
+        &rig.child,
+        rig.child.spawn(Slot::A, &c(A), Start::Active),
+        "no record",
+    );
     assert!(e.0.contains("record the new child"), "{e}");
     let running = || {
         fs::read_dir("/proc")
@@ -418,10 +421,12 @@ fn a_slot_held_by_an_adopted_child_refuses_a_spawn_until_that_child_exits() {
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     let recorded = after.recorded(Slot::A).expect("record");
     after.adopt(Slot::A, &recorded.ident).expect("adopt");
-    let refused = after
-        .spawn(Slot::A, &c(B), Start::Active)
-        .expect_err("held by the adopted child");
-    assert!(refused.0.contains("live child already"), "{refused}");
+    let busy = refused(
+        &after,
+        after.spawn(Slot::A, &c(B), Start::Active),
+        "held by the adopted child",
+    );
+    assert!(busy.0.contains("live child already"), "{busy}");
     after.terminate(&ident).expect("signal");
     wait_for("the adopted child to exit", || {
         after.exited(&ident).is_some()
@@ -440,9 +445,11 @@ fn a_started_child_that_cannot_be_identified_is_killed_and_the_spawn_fails() {
     let rig = rig("child-real-noident");
     rig.set(&["sleep", "31338"]);
     let port = rig.restarted().with_identify(|_| Err("no pidfd".into()));
-    let e = port
-        .spawn(Slot::A, &c(A), Start::Active)
-        .expect_err("not identified");
+    let e = refused(
+        &port,
+        port.spawn(Slot::A, &c(A), Start::Active),
+        "not identified",
+    );
     assert!(
         e.0.contains("identify the new child") && e.0.contains("no pidfd"),
         "{e}"
