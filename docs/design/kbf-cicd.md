@@ -90,7 +90,7 @@ Where kbf differs, and why:
 4. **There is a time gate.** kci has no bake, soak or metric gate, and no rollback verb. All three are new here.
 5. **Code is not shared.** kci is Mojo on Buck2; kbf is Rust with `xtask`. The stage file is plain data checked by a Rust lint.
 6. **kci's DEPLOY step** (a cloud resource graph apply) does not describe restarting kbf processes on a host. The
-   deploy here is the pull updater and the frontend-ordered node steps of `split-mode-updates.md`.
+   deploy here is the frontend update of `frontend-proxy.md`, then the pull updater's node steps.
 
 ### 2.1 The stage file [P]
 
@@ -340,8 +340,10 @@ Offering is dry-run by default (`--plan`): it prints what would change and which
 
 ### 5.2 The deploy is a test
 
-The pull updater, the node steps and the frontend handover in the order of `split-mode-updates.md` run on the real farm
-with real builds in flight. The deploy is a test because it is checked as one:
+The deploy (`kbf-installer deploy`, `gamma-deploy.md`) runs on the real farm with real builds in flight: it updates the
+frontend through the proxy's update API first (`frontend-proxy.md` sections 4, 5 and 9: a swap that drops no stream, a
+bake, then the new frontend offers the commit), and then watches the pull updater roll the nodes, one storage node at a
+time. The deploy is a test because it is checked as one:
 
 - **No build failed from a dropped connection**: `kbf_frontend_relay_untraced` is 0 at every scrape of the deploy, and every
   build that was in flight at any point of the deploy (the evaluator records the invocation ids at deploy start and at every
