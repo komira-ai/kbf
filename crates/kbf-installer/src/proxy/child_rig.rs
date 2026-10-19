@@ -86,14 +86,19 @@ impl Drop for Cleanup<'_> {
 pub(super) fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
-        assert!(start.elapsed() < Duration::from_secs(10), "timed out: {what}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out: {what}"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
 pub(super) fn alive(pid: u32) -> bool {
     // A zombie counts as gone: its state is Z.
-    fs::read_to_string(format!("/proc/{pid}/stat"))
-        .is_ok_and(|s| s.rsplit(')').next().is_some_and(|r| !r.trim_start().starts_with('Z')))
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+        s.rsplit(')')
+            .next()
+            .is_some_and(|r| !r.trim_start().starts_with('Z'))
+    })
 }
-

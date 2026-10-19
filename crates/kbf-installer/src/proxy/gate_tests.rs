@@ -24,7 +24,9 @@ fn a_child_whose_own_counts_are_zero_is_not_signalled_while_the_gate_says_busy()
     let (w, old) = World::with_old();
     w.permits(Slot::A, 3, Some(secs(700)));
     assert_eq!(frontend(&w, old), Ok(Phase::Done));
-    let signalled = w.when("terminate pid 100").expect("the old child is retired");
+    let signalled = w
+        .when("terminate pid 100")
+        .expect("the old child is retired");
     assert!(
         signalled >= secs(700),
         "SIGTERM at {signalled:?} with streams still bound"
@@ -37,8 +39,14 @@ fn the_sigterm_follows_the_gates_close_and_is_sent_once() {
     let (w, old) = World::with_old();
     assert_eq!(frontend(&w, old), Ok(Phase::Done));
     let log = w.log();
-    let closed = log.iter().position(|l| l == "gate:retire A Closed").expect("closed");
-    let term = log.iter().position(|l| l == "terminate pid 100").expect("signalled");
+    let closed = log
+        .iter()
+        .position(|l| l == "gate:retire A Closed")
+        .expect("closed");
+    let term = log
+        .iter()
+        .position(|l| l == "terminate pid 100")
+        .expect("signalled");
     assert!(closed < term, "{log:#?}");
     assert_eq!(w.count("terminate pid 100"), 1);
 }
@@ -73,7 +81,10 @@ fn an_all_in_one_host_clears_the_active_slot_and_waits_for_the_close_before_it_s
     assert!(at("gate:retire A Closed") < at("migrate"));
     assert!(at("migrate") < at("spawn B"));
     let spawned = w.when("spawn B").expect("started");
-    assert!(spawned >= secs(25), "started at {spawned:?}, streams still bound");
+    assert!(
+        spawned >= secs(25),
+        "started at {spawned:?}, streams still bound"
+    );
 }
 
 #[test]
@@ -87,7 +98,10 @@ fn a_stopped_slot_that_stays_busy_past_the_hold_bound_is_reported_and_still_wait
         "{notes:?}"
     );
     assert_eq!(
-        notes.iter().filter(|n| n.contains("still has streams bound")).count(),
+        notes
+            .iter()
+            .filter(|n| n.contains("still has streams bound"))
+            .count(),
         1,
         "reported once, not on every poll"
     );
@@ -107,8 +121,14 @@ fn a_new_process_that_fails_leaves_the_old_slot_closed_until_the_old_release_is_
     let (end, _) = aio(&w, old);
     assert_eq!(end, Ok(Phase::Failed));
     let log = w.log();
-    let closed = log.iter().position(|l| l == "gate:retire A Closed").expect("closed");
-    let back = log.iter().rposition(|l| l.starts_with("release_into A")).expect("released");
+    let closed = log
+        .iter()
+        .position(|l| l == "gate:retire A Closed")
+        .expect("closed");
+    let back = log
+        .iter()
+        .rposition(|l| l.starts_with("release_into A"))
+        .expect("released");
     assert!(closed < back, "{log:#?}");
     assert!(w.st.borrow().retired.is_empty(), "A is open again");
     assert_eq!(w.st.borrow().active, Slot::A);

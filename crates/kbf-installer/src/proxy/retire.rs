@@ -52,8 +52,7 @@ impl Swap<'_> {
     /// The child's own counts are zero and the slot is not the active one. The proxy's
     /// half, the permits, is the gate's `retire`: it is the commit, so it runs last.
     fn idle(&self, slot: Slot) -> bool {
-        slot != self.active
-            && matches!(self.ports.admin.open_counts(slot), Ok(c) if c.idle())
+        slot != self.active && matches!(self.ports.admin.open_counts(slot), Ok(c) if c.idle())
     }
 
     pub(super) fn mark_gone(&mut self, slot: Slot) {

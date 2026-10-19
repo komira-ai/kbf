@@ -11,10 +11,10 @@ use kbf_proxy::slot::Bind;
 use kbf_proxy::{Proxy, ProxyRunner};
 
 use super::fakes::*;
+use super::gate_real::ProxyGate;
 use super::model::*;
 use super::ports::{Gate, Ports};
 use super::swap::Swap;
-use super::gate_real::ProxyGate;
 
 const TABLE: &str = r#"
 operator_token_file = "/etc/kbf/operator.token"
@@ -42,10 +42,7 @@ fn serving_a() -> (ProxyGate, ProxyRunner) {
 }
 
 fn ports<'a>(w: &'a World, gate: &'a ProxyGate) -> Ports<'a> {
-    Ports {
-        gate,
-        ..w.ports()
-    }
+    Ports { gate, ..w.ports() }
 }
 
 fn run(w: &World, gate: &ProxyGate, mode: Mode, old: ProcIdent) -> Result<Phase, Halt> {
@@ -134,7 +131,12 @@ fn every_swap_exit_that_holds_ends_in_an_explicit_release_before_the_guard_drops
 
     let all_in_one: Vec<(&str, Setup, Phase, Slot)> = vec![
         ("success", |_| {}, Phase::Done, Slot::B),
-        ("new process never ready", never_ready, Phase::Failed, Slot::A),
+        (
+            "new process never ready",
+            never_ready,
+            Phase::Failed,
+            Slot::A,
+        ),
         (
             "migration fails after the stop",
             |w| w.st.borrow_mut().migrate_err = Some("lock timeout".into()),
@@ -177,7 +179,10 @@ fn a_swap_that_halts_inside_its_hold_ends_it_into_nothing_when_the_gate_drops() 
         run(&w, &gate, Mode::Frontend, old),
         Err(Halt::Crashed(_))
     ));
-    assert!(handle.snapshot().holding, "the hold is in force at the halt");
+    assert!(
+        handle.snapshot().holding,
+        "the hold is in force at the halt"
+    );
     assert_eq!(handle.snapshot().holds_abandoned, 0);
     drop(gate);
     let snap = handle.snapshot();
@@ -196,7 +201,10 @@ fn a_hold_the_proxy_refuses_fails_the_update_before_the_old_child_is_touched() {
     assert_eq!(run(&w, &gate, Mode::Frontend, old), Ok(Phase::Failed));
     assert_eq!(w.last_intent().failure.map(|f| f.step), Some(Step::Hold));
     assert_eq!(w.count("admin:quiesce"), 0);
-    assert!(gate.handle.snapshot().holding, "the startup hold is untouched");
+    assert!(
+        gate.handle.snapshot().holding,
+        "the startup hold is untouched"
+    );
 }
 
 /// Adoption after a proxy restart starts held (design section 3): until the children are
@@ -206,16 +214,27 @@ fn a_hold_the_proxy_refuses_fails_the_update_before_the_old_child_is_touched() {
 fn adoption_after_a_proxy_restart_starts_held_and_ends_into_the_active_slot() {
     let (gate, _runner) = proxy();
     let slots = gate.handle.slots();
-    assert!(matches!(slots.bind(), Bind::Held { .. }), "held before adoption");
+    assert!(
+        matches!(slots.bind(), Bind::Held { .. }),
+        "held before adoption"
+    );
     assert_eq!(gate.active(), None);
     gate.adopt(Slot::B, Some(Slot::A)).expect("adopt");
     assert!(!gate.handle.snapshot().holding);
     assert_eq!(gate.active(), Some(Slot::B));
     assert!(matches!(slots.bind(), Bind::Bound(p) if p.slot() == kbf_proxy::slot::Slot::B));
-    assert_eq!(slots.generation(kbf_proxy::slot::Slot::A), 1, "the other slot is open");
+    assert_eq!(
+        slots.generation(kbf_proxy::slot::Slot::A),
+        1,
+        "the other slot is open"
+    );
     let again = gate.adopt(Slot::A, None).expect_err("once only");
     assert!(again.0.contains("already ran"), "{again}");
-    assert_eq!(gate.active(), Some(Slot::B), "the second call changed nothing");
+    assert_eq!(
+        gate.active(),
+        Some(Slot::B),
+        "the second call changed nothing"
+    );
 }
 
 /// The gate's adapter is a thin map; these pin each answer to the proxy's own.
@@ -230,7 +249,11 @@ fn retire_and_open_streams_are_the_proxys_answers() {
         other => panic!("not bound: {other:?}"),
     };
     assert_eq!(gate.open_streams(Slot::A), 1);
-    assert_eq!(gate.open_streams(Slot::B), 0, "a permit is counted on its own slot");
+    assert_eq!(
+        gate.open_streams(Slot::B),
+        0,
+        "a permit is counted on its own slot"
+    );
     gate.clear_active();
     assert_eq!(gate.active(), None);
     assert_eq!(gate.retire(Slot::A), Retired::Busy(1));

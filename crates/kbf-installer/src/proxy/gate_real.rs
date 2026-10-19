@@ -107,7 +107,12 @@ impl Gate for ProxyGate {
             .release_into(gate_slot)
             .map_err(|e| PortError(e.to_string()))?;
         // The hold ended into `slot`: the guard is inert, and dropping it says so.
-        drop(self.guard.lock().unwrap_or_else(PoisonError::into_inner).take());
+        drop(
+            self.guard
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
         Ok(())
     }
 

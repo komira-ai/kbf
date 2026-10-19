@@ -50,7 +50,10 @@ fn a_live_recorded_child_is_adopted_and_the_startup_hold_ends_into_its_slot() {
     let after = rig.restarted();
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     let (gate, _runner) = gate();
-    assert!(matches!(gate.handle.slots().bind(), Bind::Held { .. }), "held at first");
+    assert!(
+        matches!(gate.handle.slots().bind(), Bind::Held { .. }),
+        "held at first"
+    );
     assert_eq!(
         adopt_children(&gate, &after, &state_dir(&rig)),
         Startup::Adopted { active: Slot::B }
@@ -73,7 +76,10 @@ fn a_recorded_child_that_is_gone_is_not_adopted_and_the_hold_stays() {
         panic!("adopted a dead child");
     };
     assert!(why.contains("no frontend child is running"), "{why}");
-    assert!(gate.handle.snapshot().holding, "the startup hold is untouched");
+    assert!(
+        gate.handle.snapshot().holding,
+        "the startup hold is untouched"
+    );
     assert_eq!(gate.active(), None);
 }
 
@@ -94,7 +100,10 @@ fn an_update_in_flight_or_a_corrupt_record_leaves_the_hold_with_a_live_child() {
     let Startup::Held(why) = adopt_children(&gate, &after, &state) else {
         panic!("adopted under an update");
     };
-    assert!(why.contains("update is in flight") && why.contains("Staged"), "{why}");
+    assert!(
+        why.contains("update is in flight") && why.contains("Staged"),
+        "{why}"
+    );
 
     std::fs::write(state.join("update.json"), b"{not json").expect("corrupt");
     let Startup::Held(why) = adopt_children(&gate, &after, &state) else {
@@ -143,7 +152,11 @@ fn a_frontend_is_started_with_its_mode_slot_and_the_proxys_secret_file() {
     };
     assert_eq!(
         words(Slot::A),
-        ["--mode=frontend", "--instance=a", "--proxy-auth-file=/run/kbf-proxy/proxy-auth"]
+        [
+            "--mode=frontend",
+            "--instance=a",
+            "--proxy-auth-file=/run/kbf-proxy/proxy-auth"
+        ]
     );
     assert_eq!(words(Slot::B)[1], "--instance=b");
     assert_eq!(

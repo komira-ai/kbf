@@ -426,7 +426,10 @@ async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
     assert_eq!(status, 200);
 
     // SAFETY: `kill` of our own child.
-    assert_eq!(unsafe { libc::kill(proxy.id().cast_signed(), libc::SIGTERM) }, 0);
+    assert_eq!(
+        unsafe { libc::kill(proxy.id().cast_signed(), libc::SIGTERM) },
+        0
+    );
     let (status, _) = exited(&mut proxy, Duration::from_secs(20));
     assert_eq!(status.and_then(|s| s.code()), Some(0), "a clean stop");
     let mut err = String::new();

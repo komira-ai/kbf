@@ -103,11 +103,17 @@ pub(super) fn service_rules(
     // not the gate in front of the start.
     let verb = [INSTALLER, "proxy", "--config", INSTALLER_CONFIG];
     if start != verb {
-        v("proxy-exec", format!("ExecStart= is {start:?}, not {verb:?}"));
+        v(
+            "proxy-exec",
+            format!("ExecStart= is {start:?}, not {verb:?}"),
+        );
     }
     let check: Vec<&str> = verb.iter().copied().chain(["--check"]).collect();
     if pre != [check.join(" ")] {
-        v("proxy-exec", format!("ExecStartPre= is {pre:?}, not {check:?}"));
+        v(
+            "proxy-exec",
+            format!("ExecStartPre= is {pre:?}, not {check:?}"),
+        );
     }
     // Catches a stop or restart that kills the children: with KillMode=control-group (the
     // default) or mixed, every frontend dies with the proxy and every build in flight
@@ -129,7 +135,9 @@ pub(super) fn service_rules(
     // Catches configuration by environment: the table is `installer.toml`, passed by flag.
     // The service manager's own activation variables are not set in the unit.
     for d in unit.directives() {
-        if d.section == "Service" && ["Environment", "EnvironmentFile", "PassEnvironment"].contains(&d.key.as_str()) {
+        if d.section == "Service"
+            && ["Environment", "EnvironmentFile", "PassEnvironment"].contains(&d.key.as_str())
+        {
             v("proxy-env", format!("{}={}", d.key, d.value));
         }
     }
@@ -156,7 +164,10 @@ pub(super) fn service_rules(
         v("proxy-restart", "no RestartPreventExitStatus=2".into());
     }
     if unit.get_in("Unit", "StartLimitIntervalSec").map(trim) != Some("0") {
-        v("proxy-restart", "no StartLimitIntervalSec=0 in [Unit]".into());
+        v(
+            "proxy-restart",
+            "no StartLimitIntervalSec=0 in [Unit]".into(),
+        );
     }
     // Catches the proxy's directories missing, or its secret lost at a restart: the
     // runtime directory must outlive the service (RuntimeDirectoryPreserve=yes) or the
@@ -171,7 +182,8 @@ pub(super) fn service_rules(
             format!("StateDirectory= is {dirs:?}, not kbf-proxy and kbf-server"),
         );
     }
-    if get("RuntimeDirectory") != Some("kbf-proxy") || get("RuntimeDirectoryPreserve") != Some("yes")
+    if get("RuntimeDirectory") != Some("kbf-proxy")
+        || get("RuntimeDirectoryPreserve") != Some("yes")
     {
         v(
             "proxy-state",
@@ -185,11 +197,17 @@ pub(super) fn service_rules(
     if timeout.is_none_or(|t| !(10..=60).contains(&t)) {
         v(
             "proxy-stop",
-            format!("TimeoutStopSec= is {:?}, not 10 to 60 s", get("TimeoutStopSec")),
+            format!(
+                "TimeoutStopSec= is {:?}, not 10 to 60 s",
+                get("TimeoutStopSec")
+            ),
         );
     }
     if !matches!(get("KillSignal"), Some("SIGTERM" | "TERM" | "15")) {
-        v("proxy-stop", format!("KillSignal= is {:?}", get("KillSignal")));
+        v(
+            "proxy-stop",
+            format!("KillSignal= is {:?}", get("KillSignal")),
+        );
     }
 }
 
@@ -207,7 +225,12 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "",
         "proxy-socket-pair",
     ),
-    ("kbf-proxy.socket", "Accept=no\n", "Accept=yes\n", "proxy-socket-accept"),
+    (
+        "kbf-proxy.socket",
+        "Accept=no\n",
+        "Accept=yes\n",
+        "proxy-socket-accept",
+    ),
     (
         "kbf-proxy.socket",
         "ListenStream=8443\n",
@@ -232,15 +255,30 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "",
         "proxy-exec",
     ),
-    ("kbf-proxy.service", "\nKillMode=process\n", "\n", "proxy-kill"),
-    ("kbf-proxy.service", "\nUser=kbf-server\n", "\nUser=root\n", "proxy-user"),
+    (
+        "kbf-proxy.service",
+        "\nKillMode=process\n",
+        "\n",
+        "proxy-kill",
+    ),
+    (
+        "kbf-proxy.service",
+        "\nUser=kbf-server\n",
+        "\nUser=root\n",
+        "proxy-user",
+    ),
     (
         "kbf-proxy.service",
         "\nStateDirectoryMode=0750\n",
         "\nStateDirectoryMode=0750\nEnvironment=LISTEN_FDS=1\n",
         "proxy-env",
     ),
-    ("kbf-proxy.service", "NoNewPrivileges=yes\n", "", "proxy-harden"),
+    (
+        "kbf-proxy.service",
+        "NoNewPrivileges=yes\n",
+        "",
+        "proxy-harden",
+    ),
     (
         "kbf-proxy.service",
         "OOMScoreAdjust=-900\n",
@@ -303,7 +341,10 @@ fn each_proxy_defect_is_reported_by_its_rule() {
 #[test]
 fn every_proxy_rule_has_a_mutant() {
     for rule in RULES {
-        assert!(MUTANTS.iter().any(|m| m.3 == rule), "rule {rule} has no mutant");
+        assert!(
+            MUTANTS.iter().any(|m| m.3 == rule),
+            "rule {rule} has no mutant"
+        );
     }
     for m in MUTANTS {
         assert!(RULES.contains(&m.3), "mutant names no rule: {}", m.3);

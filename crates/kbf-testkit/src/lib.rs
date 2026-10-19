@@ -35,8 +35,8 @@ use std::io::Write;
 pub mod act;
 pub mod fake;
 pub mod m2;
-pub mod reaped;
 pub mod port;
+pub mod reaped;
 
 /// Why a program here stopped short.
 #[derive(Debug, PartialEq, Eq)]

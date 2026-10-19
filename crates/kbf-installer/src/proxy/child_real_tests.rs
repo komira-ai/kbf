@@ -16,7 +16,10 @@ fn a_spawned_child_runs_the_release_and_its_identity_is_recorded_before_spawn_re
     assert_eq!(ident, ident_of(ident.pid).expect("live"));
     assert_eq!(
         ident.exe,
-        std::env::current_exe().expect("exe").canonicalize().expect("canonical"),
+        std::env::current_exe()
+            .expect("exe")
+            .canonicalize()
+            .expect("canonical"),
         "the program is the one the release's file links to"
     );
     assert_eq!(
@@ -74,11 +77,15 @@ fn a_live_child_is_adopted_after_a_restart_then_watched_and_terminated() {
     let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
     let _stop = Cleanup(&rig.child, vec![ident.clone()]);
     let after = rig.restarted();
-    let recorded = after.recorded(Slot::A).expect("the record survives the restart");
+    let recorded = after
+        .recorded(Slot::A)
+        .expect("the record survives the restart");
     assert_eq!(after.adopt(Slot::A, &recorded.ident), Ok(()));
     assert_eq!(after.exited(&ident), None);
     after.terminate(&ident).expect("signal");
-    wait_for("the adopted child to exit", || after.exited(&ident).is_some());
+    wait_for("the adopted child to exit", || {
+        after.exited(&ident).is_some()
+    });
     assert_eq!(after.exited(&ident), Some(UNKNOWN_EXIT));
     // The first port reaps its zombie, as the kernel hands the orphan to init in life.
     wait_for("the reap", || rig.child.exited(&ident).is_some());
@@ -117,12 +124,18 @@ fn a_recycled_pid_is_never_adopted_or_signalled() {
         assert!(rig.child.kill_unserved(forged).is_err());
         assert_eq!(rig.child.exited(forged), Some(UNKNOWN_EXIT));
     }
-    assert!(alive(ident.pid), "the process behind the pid was left alone");
+    assert!(
+        alive(ident.pid),
+        "the process behind the pid was left alone"
+    );
     assert_eq!(rig.child.exited(&ident), None);
     // A pid that is gone is gone, not recycled.
     rig.child.terminate(&ident).expect("signal");
     wait_for("exit", || rig.child.exited(&ident).is_some());
-    assert_eq!(after.adopt(Slot::A, &ident), Err(AdoptError::Gone(ident.pid)));
+    assert_eq!(
+        after.adopt(Slot::A, &ident),
+        Err(AdoptError::Gone(ident.pid))
+    );
 }
 
 /// Catches a `kill_unserved` that signals the wrong process: the candidate dies, the serving
@@ -135,7 +148,17 @@ fn kill_unserved_kills_the_candidate_alone_and_reaps_it() {
     // The candidate ignores SIGTERM, so only the SIGKILL ends it; it says when it does.
     let up = rig.layout_root.join("candidate-up");
     let up_path = up.to_string_lossy().into_owned();
-    rig.set(&["ignore-signal", "15", ";", "append", &up_path, "up", ";", "sleep", "600"]);
+    rig.set(&[
+        "ignore-signal",
+        "15",
+        ";",
+        "append",
+        &up_path,
+        "up",
+        ";",
+        "sleep",
+        "600",
+    ]);
     let candidate = rig.child.spawn(Slot::B, &c(B)).expect("candidate");
     wait_for("the candidate to ignore SIGTERM", || up.exists());
     rig.child.kill_unserved(&candidate).expect("kill");
@@ -144,7 +167,10 @@ fn kill_unserved_kills_the_candidate_alone_and_reaps_it() {
     assert_eq!(rig.child.exited(&old), None);
     assert_eq!(rig.child.recorded(Slot::B), None, "its record is cleared");
     assert!(rig.child.recorded(Slot::A).is_some());
-    assert!(rig.child.kill_unserved(&candidate).is_err(), "no longer held");
+    assert!(
+        rig.child.kill_unserved(&candidate).is_err(),
+        "no longer held"
+    );
 }
 
 /// Catches a second child started into a slot that has a live one (the swap spawns only
@@ -190,7 +216,10 @@ fn a_child_whose_record_cannot_be_written_is_killed_and_the_spawn_fails() {
             .expect("proc")
             .flatten()
             .filter_map(|e| fs::read(e.path().join("cmdline")).ok())
-            .any(|cmd| cmd.windows(5).any(|w| w == b"31337") && cmd.starts_with(rig.layout_root.as_os_str().as_encoded_bytes()))
+            .any(|cmd| {
+                cmd.windows(5).any(|w| w == b"31337")
+                    && cmd.starts_with(rig.layout_root.as_os_str().as_encoded_bytes())
+            })
     };
     wait_for("the child to be killed", || !running());
 }
@@ -218,8 +247,16 @@ fn a_child_leads_its_own_process_group_and_gets_no_activation_variables() {
         .filter(|(_, value)| value.is_none())
         .map(|(name, _)| name.to_string_lossy().into_owned())
         .collect();
-    for name in ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES", "NOTIFY_SOCKET"] {
-        assert!(removed.iter().any(|n| n == name), "{name} is kept: {removed:?}");
+    for name in [
+        "LISTEN_PID",
+        "LISTEN_FDS",
+        "LISTEN_FDNAMES",
+        "NOTIFY_SOCKET",
+    ] {
+        assert!(
+            removed.iter().any(|n| n == name),
+            "{name} is kept: {removed:?}"
+        );
     }
 }
 
@@ -227,7 +264,8 @@ fn a_child_leads_its_own_process_group_and_gets_no_activation_variables() {
 /// parentheses, which `/proc/<pid>/stat` does not escape.
 #[test]
 fn the_start_time_is_field_22_whatever_the_command_name_holds() {
-    let tail = "S 1 1 1 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 424242 1000 10 18446744073709551615";
+    let tail =
+        "S 1 1 1 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 424242 1000 10 18446744073709551615";
     for comm in ["kbf", "a b", "x) S 9 (y", "((("] {
         let line = format!("123 ({comm}) {tail}");
         assert_eq!(start_time_of(&line), Some(424_242), "{comm}");
@@ -245,7 +283,10 @@ fn dropping_the_port_leaves_the_child_running_for_the_next_proxy_to_adopt() {
     let after = rig.restarted();
     let Rig { child, .. } = rig;
     drop(child);
-    assert!(alive(ident.pid), "the child outlives the port that started it");
+    assert!(
+        alive(ident.pid),
+        "the child outlives the port that started it"
+    );
     let recorded = after.recorded(Slot::A).expect("record");
     assert_eq!(after.adopt(Slot::A, &recorded.ident), Ok(()));
     let _stop = Cleanup(&after, vec![ident.clone()]);
@@ -269,7 +310,11 @@ fn a_pid_recycled_between_the_check_and_the_open_is_refused() {
     let reads = Cell::new(0);
     let identity = |_: u32| {
         reads.set(reads.get() + 1);
-        Ok(if reads.get() == 1 { recorded.clone() } else { other.clone() })
+        Ok(if reads.get() == 1 {
+            recorded.clone()
+        } else {
+            other.clone()
+        })
     };
     let open = |_: u32| Ok(OwnedFd::from(fs::File::open("/dev/null").expect("open")));
     assert_eq!(
