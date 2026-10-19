@@ -45,7 +45,7 @@ pub fn euid() -> u32 {
 /// through symlinks.
 pub struct Scratch {
     pub path: PathBuf,
-    _dir: TestDir,
+    _dir: Option<TestDir>,
 }
 
 impl std::ops::Deref for Scratch {
@@ -62,7 +62,10 @@ impl std::ops::Deref for Scratch {
 pub fn scratch(name: &str) -> Scratch {
     let dir = TestDir::under(std::env::temp_dir(), &format!("kbf-signer-{name}"));
     let path = std::fs::canonicalize(&dir).expect("canonical scratch dir");
-    Scratch { path, _dir: dir }
+    Scratch {
+        path,
+        _dir: Some(dir),
+    }
 }
 
 /// A splitmix64 stream: deterministic serials.
@@ -88,6 +91,15 @@ pub struct Ca {
     pub spki: Vec<u8>,
     pub root_subject: Vec<u8>,
     pub scratch: Scratch,
+}
+
+impl Ca {
+    /// Removes the CA's files now, keeping only what was read from them. For a CA held in
+    /// a `static`, which is never dropped and would leave its directory behind.
+    pub fn without_files(mut self) -> Ca {
+        self.scratch._dir = None;
+        self
+    }
 }
 
 pub fn make_ca(name: &str) -> Ca {
