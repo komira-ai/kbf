@@ -116,6 +116,14 @@ impl OperatorClient {
         self.call("DELETE", path, Some(""))
     }
 
+    /// `PUT path` with `body`, sent as JSON.
+    ///
+    /// # Errors
+    /// As [`OperatorClient::post`].
+    pub fn put(&self, path: &str, body: &str) -> Result<Reply, ClientError> {
+        self.call("PUT", path, Some(body))
+    }
+
     /// `POST path` with `body` (empty for none), sent as JSON.
     ///
     /// # Errors
@@ -252,10 +260,7 @@ mod tests {
             .expect_err("garbage");
         assert!(matches!(err, ClientError::Malformed { .. }), "{err:?}");
 
-        let gone = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            listener.local_addr().expect("addr")
-        };
+        let gone = kbf_testkit::port::dead_addr();
         let err = OperatorClient::new(gone, None)
             .get("/")
             .expect_err("nothing there");

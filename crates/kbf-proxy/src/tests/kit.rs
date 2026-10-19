@@ -98,6 +98,10 @@ pub(super) struct ChildState {
     pub raw_garbage_first: AtomicBool,
     /// Set: the next connection is served by hand, sends its SETTINGS and never answers a PING.
     pub raw_mute_first: AtomicBool,
+    /// Set: the next connection (after a `raw_goaway_first` one) is served by hand and only
+    /// records the frames of each stream, in `frames`; it never answers.
+    pub raw_record: AtomicBool,
+    pub frames: Mutex<Vec<Seen>>,
     pub dispatches: AtomicUsize,
     pub conns_open: AtomicUsize,
     pub conns_total: AtomicUsize,
@@ -121,6 +125,40 @@ impl ChildState {
             .filter(|(p, _)| p == path)
             .map(|(_, h)| h.clone())
             .collect()
+    }
+}
+
+/// One request frame as the recording child saw it on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Seen {
+    pub stream: u32,
+    pub kind: u8,
+    pub flags: u8,
+    pub len: usize,
+}
+
+pub(super) const DATA: u8 = 0;
+pub(super) const HEADERS: u8 = 1;
+pub(super) const END_STREAM: u8 = 1;
+
+impl Seen {
+    pub(super) const fn ends(&self) -> bool {
+        self.flags & END_STREAM != 0
+    }
+}
+
+impl ChildState {
+    /// The DATA and HEADERS frames the recording child saw, in order.
+    pub(super) fn recorded(&self) -> Vec<Seen> {
+        self.frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the recording child has seen a stream end.
+    pub(super) fn recorded_end(&self) -> bool {
+        self.recorded().iter().any(Seen::ends)
     }
 }
 
@@ -361,6 +399,45 @@ async fn raw_frames(
     }
 }
 
+/// Speaks just enough h2 to take SETTINGS and PINGs, and records every DATA and HEADERS
+/// frame. It never answers a stream.
+async fn raw_record(mut io: impl AsyncRead + AsyncWrite + Unpin + Send, state: &ChildState) {
+    let _ = record_frames(&mut io, state).await;
+}
+
+async fn record_frames(
+    io: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
+    state: &ChildState,
+) -> io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    io.read_exact(&mut [0_u8; 24]).await?;
+    io.write_all(&frame(4, 0, &[])).await?;
+    loop {
+        let mut head = [0_u8; 9];
+        io.read_exact(&mut head).await?;
+        let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let mut payload = vec![0_u8; len];
+        io.read_exact(&mut payload).await?;
+        match (head[3], head[4] & 1) {
+            (4, 0) => io.write_all(&frame(4, 1, &[])).await?,
+            (6, 0) => io.write_all(&frame(6, 1, &payload)).await?,
+            (kind @ (DATA | HEADERS), _) => {
+                state
+                    .frames
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(Seen {
+                        stream: u32::from_be_bytes([head[5], head[6], head[7], head[8]]),
+                        kind,
+                        flags: head[4],
+                        len,
+                    });
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn connection(
     io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     state: Arc<ChildState>,
@@ -371,6 +448,9 @@ async fn connection(
     }
     if state.raw_garbage_first.swap(false, Ordering::AcqRel) {
         return raw_child(io, frame(0, 0, &[1, 2, 3]), true).await;
+    }
+    if state.raw_record.swap(false, Ordering::AcqRel) {
+        return raw_record(io, &state).await;
     }
     if state.raw_mute_first.swap(false, Ordering::AcqRel) {
         return raw_child(io, Vec::new(), false).await;

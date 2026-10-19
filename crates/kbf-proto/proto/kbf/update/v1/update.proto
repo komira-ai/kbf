@@ -46,13 +46,23 @@ message UpdateOffer {
   string platform = 3;
   // The tarballs the host needs for that platform.
   repeated Component components = 4;
+  // What the frontend's preflight recorded about the release (what its `kbf --version
+  // --json` declares; the platform is field 3). They are claims: the installer runs the
+  // fetched binary and requires its own report to equal them. Zeros and "" (a frontend
+  // that predates the fields, or a release never preflighted) are refused: fail closed.
+  uint32 protocol = 5;
+  uint32 min_protocol = 6;
+  uint32 state_schema = 7;
+  // The build profile (for example `release`).
+  string profile = 8;
 }
 
 // The frontend's order of the rollout to one host.
 message UpdateOrder {
   enum Verb {
     VERB_UNSPECIFIED = 0;
-    // Switch to the staged `commit` and restart; the host reverts by itself if it is not
+    // Install `commit` (the installer fetches it unless it is installed), switch to it and
+    // restart; the host reverts by itself if it is not
     // confirmed within `window_s`.
     VERB_ACTIVATE = 1;
     // The activated `commit` is healthy at the frontend: keep it.
@@ -69,6 +79,11 @@ message UpdateOrder {
   string commit = 4;
   // The confirm window of VERB_ACTIVATE, in seconds; the host clamps it to its own limits.
   uint32 window_s = 5;
+  // The generation of the desired release this order belongs to (the `generation` of the
+  // `UpdateOffer` that named `commit`). The installer checks it against the newest it has
+  // acted on, so a replayed or reordered order of an older desired state cannot undo a
+  // newer one. 0 when a frontend predates the field.
+  uint64 generation = 6;
 }
 
 // What a host reports about its update, resent on every change. Its own message of the

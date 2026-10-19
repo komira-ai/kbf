@@ -32,12 +32,12 @@ fn status_prints_the_state_and_the_link_verdict() {
     assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""));
     assert_eq!(
         out,
-        "state: /var/lib/kbf-deploy/state.json (none yet)\n\
+        "state: /var/lib/kbf-installer/state.json (none yet)\n\
          current: none\n\
          previous: none\n\
          staged: none\n\
          pending confirm: none\n\
-         order floor: 0\n\
+         floor: epoch 0, order 0, generation 0\n\
          current link: missing (matches the state)\n"
     );
     let (code, out, _) = status_cli(&dir, &["--json"]);
@@ -45,29 +45,32 @@ fn status_prints_the_state_and_the_link_verdict() {
     assert_eq!(
         out,
         "{\"current_link\":{\"kind\":\"missing\",\"matches_state\":true,\"target\":null},\
-         \"exists\":false,\"schema\":1,\"state\":{\"current\":null,\"order_floor\":0,\
-         \"pending_confirm\":null,\"previous\":null,\"staged\":null},\
-         \"state_file\":\"/var/lib/kbf-deploy/state.json\"}\n"
+         \"exists\":false,\"schema\":2,\"state\":{\"current\":null,\
+                  \"floor\":{\"epoch\":0,\"generation\":0,\"order_id\":0},\
+         \"last_acked_order_id\":0,\"pending_confirm\":null,\"previous\":null,\
+         \"serving_instance\":null,\"staged\":null,\"unacked\":[]},\
+         \"state_file\":\"/var/lib/kbf-installer/state.json\"}\n"
     );
 
     Locked::acquire(&root)
         .expect("lock")
         .write(&full_state())
         .expect("write");
-    let link = dir.join("usr/local/kbf/current");
-    std::os::unix::fs::symlink(format!("releases/{A}"), &link).expect("link");
+    let link = dir.join("var/lib/kbf-installer/releases/current");
+    fs::create_dir_all(link.parent().expect("a directory")).expect("releases");
+    std::os::unix::fs::symlink(A, &link).expect("link");
     let (code, out, _) = status_cli(&dir, &[]);
     assert_eq!(code, ExitCode::SUCCESS);
     assert_eq!(
         out,
         format!(
-            "state: /var/lib/kbf-deploy/state.json\n\
+            "state: /var/lib/kbf-installer/state.json\n\
              current: {A}\n\
              previous: {B}\n\
              staged: {C}\n\
              pending confirm: {A} by 1800000000 (unix seconds), else back to {B}\n\
-             order floor: 7\n\
-             current link: releases/{A} (matches the state)\n"
+             floor: epoch 3, order 9, generation 7\n\
+             current link: {A} (matches the state)\n"
         )
     );
     let (code, out, _) = status_cli(&dir, &["--json"]);
@@ -76,21 +79,22 @@ fn status_prints_the_state_and_the_link_verdict() {
         out,
         format!(
             "{{\"current_link\":{{\"kind\":\"link\",\"matches_state\":true,\
-             \"target\":\"releases/{A}\"}},\"exists\":true,\"schema\":1,\"state\":{{\
-             \"current\":\"{A}\",\"order_floor\":7,\"pending_confirm\":{{\"commit\":\"{A}\",\
-             \"deadline\":1800000000,\"previous\":\"{B}\"}},\"previous\":\"{B}\",\
-             \"staged\":\"{C}\"}},\"state_file\":\"/var/lib/kbf-deploy/state.json\"}}\n"
+             \"target\":\"{A}\"}},\"exists\":true,\"schema\":2,\"state\":{{\
+             \"current\":\"{A}\",\"floor\":{{\"epoch\":3,\"generation\":7,\"order_id\":9}},\
+             \"last_acked_order_id\":9,\"pending_confirm\":{{\"activation\":\"3-9\",\
+             \"commit\":\"{A}\",\"deadline_mono_s\":86400,\"deadline_wall\":1800000000,\
+             \"previous\":\"{B}\",\"starts_left\":2}},\"previous\":\"{B}\",\
+             \"serving_instance\":\"a\",\"staged\":\"{C}\",\"unacked\":[{{\"epoch\":3,\
+             \"first_seen\":1700000000,\"order_id\":10,\"record\":\"{{}}\"}}]}},\"state_file\":\"/var/lib/kbf-installer/state.json\"}}\n"
         )
     );
 
     fs::remove_file(&link).expect("remove");
-    std::os::unix::fs::symlink(format!("releases/{B}"), &link).expect("link");
+    std::os::unix::fs::symlink(B, &link).expect("link");
     let (code, out, _) = status_cli(&dir, &[]);
     assert_eq!(code, ExitCode::FAILURE);
     assert!(
-        out.ends_with(&format!(
-            "current link: releases/{B} (the state says releases/{A})\n"
-        )),
+        out.ends_with(&format!("current link: {B} (the state says {A})\n")),
         "{out}"
     );
 
@@ -135,8 +139,8 @@ fn status_says_when_the_window_to_confirm_has_not_started() {
     let (root, dir) = host_root("deploy-host-status-window");
     let mut state = full_state();
     let pending = state.pending_confirm.as_mut().expect("pending");
-    pending.deadline = None;
-    pending.order_id = Some("order-1".to_owned());
+    pending.deadline_wall = None;
+    pending.activation = "order-1".to_owned();
     pending.starts_left = Some(3);
     Locked::acquire(&root)
         .expect("lock")
@@ -152,8 +156,8 @@ fn status_says_when_the_window_to_confirm_has_not_started() {
     let (_, out, _) = status_cli(&dir, &["--json"]);
     assert!(
         out.contains(&format!(
-            "\"pending_confirm\":{{\"commit\":\"{A}\",\"order_id\":\"order-1\",\
-             \"previous\":\"{B}\",\"starts_left\":3}}"
+            "\"pending_confirm\":{{\"activation\":\"order-1\",\"commit\":\"{A}\",\
+             \"deadline_mono_s\":86400,\"previous\":\"{B}\",\"starts_left\":3}}"
         )),
         "{out}"
     );
@@ -164,11 +168,12 @@ fn status_says_when_the_window_to_confirm_has_not_started() {
 #[test]
 fn status_refuses_a_broken_state_and_a_relative_root() {
     let (_root, dir) = host_root("deploy-host-status-refused");
-    fs::write(dir.join("var/lib/kbf-deploy/state.json"), "{").expect("seed");
+    fs::write(dir.join("var/lib/kbf-installer/state.json"), "{").expect("seed");
     let (code, out, err) = status_cli(&dir, &[]);
     assert_eq!((code, out.as_str()), (ExitCode::from(2), ""));
     assert!(
-        err.starts_with("REFUSED: ") && err.contains("is not a deploy state"),
+        err.starts_with("REFUSED: ")
+            && err.contains("the state is unusable and nothing was changed"),
         "{err}"
     );
 
@@ -220,21 +225,20 @@ fn install_plans_a_release_only_root_can_change() {
     let (code, out, err) = host_cli(&args);
     assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""));
     let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"kbf A"));
-    let r = format!("/usr/local/kbf/releases/{A}");
+    let r = format!("/var/lib/kbf-installer/releases/{A}");
     assert_eq!(
         out,
         format!(
             "release {A}: {r} (5 bytes, sha256 {sha}), 1 unit(s)\n\
-             DRY-RUN: mkdir /var/lib/kbf-deploy (0755, owner 0:0)\n\
-             DRY-RUN: mkdir /usr/local/kbf (0755, owner 0:0)\n\
-             DRY-RUN: mkdir /usr/local/kbf/releases (0755, owner 0:0)\n\
+             DRY-RUN: mkdir /var/lib/kbf-installer (0755, owner 0:0)\n\
+             DRY-RUN: mkdir /var/lib/kbf-installer/releases (0755, owner 0:0)\n\
              DRY-RUN: mkdir {r} (0755, owner 0:0)\n\
              DRY-RUN: mkdir {r}/units (0755, owner 0:0)\n\
              DRY-RUN: write {r}/kbf (0755, owner 0:0, 5 bytes)\n\
              DRY-RUN: write {r}/units/kbf.slice (0644, owner 0:0, 8 bytes)\n\
              dry run: nothing changed. Re-run with --apply.\n\
              links: current none -> {A}, previous none -> none\n\
-             DRY-RUN: link /usr/local/kbf/current -> releases/{A}\n\
+             DRY-RUN: link /var/lib/kbf-installer/releases/current -> {A}\n\
              dry run: nothing changed. Re-run with --apply.\n"
         )
     );
@@ -274,4 +278,41 @@ fn rollback_and_gc_run_from_the_command_line() {
         (args(false).mode(), args(true).mode()),
         (Mode::DryRun, Mode::Apply)
     );
+}
+
+/// A process table that cannot be read.
+struct Blind;
+
+impl Procs for Blind {
+    fn exe_of(&self, _: u32) -> std::io::Result<std::path::PathBuf> {
+        Err(std::io::Error::other("no process table"))
+    }
+
+    fn executables(&self) -> std::io::Result<Vec<std::path::PathBuf>> {
+        Err(std::io::Error::other("no process table"))
+    }
+}
+
+/// Catches a `gc` that removes releases on a host where it cannot tell which ones run: it
+/// fails (exit 1), says so on standard error, prints no plan and leaves a stray release in
+/// place; with a readable table the same release goes.
+///
+/// Mutants planted: the in-use error treated as "nothing runs" (the release is removed).
+#[test]
+fn gc_removes_nothing_where_it_cannot_tell_what_runs() {
+    let (layout, dir) = host_root("deploy-host-gc-blind");
+    let stray = dir
+        .join("var/lib/kbf-installer/releases")
+        .join("dddddddddddddddddddddddddddddddddddddddd");
+    fs::create_dir_all(&stray).unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = gc(&Blind, &layout, 0, Mode::Apply, &mut out, &mut err);
+    assert_eq!(code, ExitCode::FAILURE);
+    assert!(out.is_empty());
+    let err = String::from_utf8(err).unwrap();
+    assert!(
+        err.contains("cannot tell which releases run: no process table"),
+        "{err}"
+    );
+    assert!(stray.exists());
 }

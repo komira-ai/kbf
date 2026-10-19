@@ -576,7 +576,7 @@ mod budget {
 /// The workflow paths `docs/artifacts.md` gives as `--signer-workflow`, relative to the
 /// repository root.
 fn documented_signer_workflows(doc: &str) -> Vec<&str> {
-    const FLAG: &str = "--signer-workflow komira-ai/komira-build-farm/";
+    const FLAG: &str = "--signer-workflow komira-ai/kbf/";
     doc.match_indices(FLAG)
         .map(|(at, _)| {
             doc[at + FLAG.len()..]
@@ -631,7 +631,7 @@ mod selection {
         // Catches: a signer path read with the line's trailing `\` or the next flag, so
         // the repository test opens the wrong file; another repository's workflow
         // taken as ours; a flag at the very end of the text read as a path.
-        let doc = "gh attestation verify x \\\n  --signer-workflow komira-ai/komira-build-farm/.github/workflows/a.yml \\\n  --source-ref refs/heads/main\nalso --signer-workflow komira-ai/komira-build-farm/.github/workflows/b.yml";
+        let doc = "gh attestation verify x \\\n  --signer-workflow komira-ai/kbf/.github/workflows/a.yml \\\n  --source-ref refs/heads/main\nalso --signer-workflow komira-ai/kbf/.github/workflows/b.yml";
         assert_eq!(
             documented_signer_workflows(doc),
             vec![".github/workflows/a.yml", ".github/workflows/b.yml"]
@@ -641,7 +641,7 @@ mod selection {
                 .is_empty()
         );
         assert_eq!(
-            documented_signer_workflows("--signer-workflow komira-ai/komira-build-farm/"),
+            documented_signer_workflows("--signer-workflow komira-ai/kbf/"),
             vec![""]
         );
     }

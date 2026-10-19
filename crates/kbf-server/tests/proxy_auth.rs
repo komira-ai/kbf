@@ -188,7 +188,7 @@ fn only_loopback_with_the_secret_is_believed() {
         Ok(believed)
     );
 
-    for refused in [REMOTE, "[2001:db8::1]:4000", "10.0.0.1:1"] {
+    for refused in [REMOTE, "[2001:db8::1]:4000", "198.51.100.1:1"] {
         assert_eq!(
             ok(refused, &proxied_headers()),
             Err(Refusal::NotLoopback),
@@ -647,7 +647,7 @@ fn a_secret_file_with_mode_0644_stops_the_start() {
     let open = file(&SECRET, 0o644);
     let open = open.to_str().expect("UTF-8");
     let refused = args(&["--proxy-auth-file", open])
-        .listeners()
+        .proxy()
         .expect_err("a readable secret");
     assert!(matches!(
         refused,
@@ -664,13 +664,15 @@ fn a_secret_file_with_mode_0644_stops_the_start() {
     );
 
     let good = file(&SECRET, 0o600);
-    let listeners = args(&["--proxy-auth-file", good.to_str().expect("UTF-8")])
-        .listeners()
-        .expect("a good secret");
-    let behind = listeners.proxy.expect("behind a proxy");
+    let behind_args = args(&["--proxy-auth-file", good.to_str().expect("UTF-8")]);
+    let behind = behind_args
+        .proxy()
+        .expect("a good secret")
+        .expect("behind a proxy");
     assert!(behind.secret.admits(presented_secret().as_bytes()));
+    let listeners = behind_args.listeners().expect("listeners behind a proxy");
     assert!(listeners.worker_tls.is_none() && behind.deny_list.is_none());
-    assert!(args(&[]).listeners().expect("no flag").proxy.is_none());
+    assert!(args(&[]).proxy().expect("no flag").is_none());
 }
 
 /// Catches: the deny list dropped behind a proxy that has no TLS of its own (a denied node
@@ -681,10 +683,10 @@ fn the_deny_list_applies_behind_the_proxy() {
     let list = list.to_str().expect("UTF-8");
     let secret = file(&SECRET, 0o600);
     let secret = secret.to_str().expect("UTF-8");
-    let listeners = args(&["--proxy-auth-file", secret, "--worker-deny-list", list])
-        .listeners()
-        .expect("a deny list behind a proxy");
-    assert!(listeners.proxy.expect("proxy").deny_list.is_some());
+    let behind = args(&["--proxy-auth-file", secret, "--worker-deny-list", list]);
+    behind.listeners().expect("a deny list behind a proxy");
+    let proxy = behind.proxy().expect("the proxy").expect("proxy");
+    assert!(proxy.deny_list.is_some());
     assert!(matches!(
         args(&["--worker-deny-list", list]).listeners(),
         Err(ConfigError::DenyListWithoutIdentity)

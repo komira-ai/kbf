@@ -22,6 +22,7 @@
 //! - [`flog`]: failed runs' logs copied into `r30/flog` objects that outlive the CAS blobs,
 //!   and [`Reader::failure_log`] to read a range of one back.
 //! - [`Scoped`]: an object store that refuses every key outside `history/`.
+//! - [`Today`]: the runs of today in memory, bounded, by action digest and by node.
 //! - [`status`] and the shape and status rows ([`ShapeRow`], [`StatusRow`]): what a test's
 //!   runs say of it (outcome rules, the flaky proof, a ring of its last runs).
 //! - The cross-build reads on the [`Reader`]: [`Reader::list_invocations`],
@@ -46,6 +47,7 @@ mod rows;
 pub mod run_id;
 mod scoped;
 pub mod status;
+mod today;
 mod writer;
 
 pub use derived::DerivedLimits;
@@ -65,4 +67,7 @@ pub use reader::{
 pub use rows::{Mark, RingRun, ShapeKind, ShapeRow, StatusKind, StatusRow, Verdict};
 pub use run_id::{Minted, Minter, RunId, StreamId};
 pub use scoped::Scoped;
+pub use today::{
+    ActionKey, MAX_EXAMINED, TODAY_BYTES, Today, TodayCursor, TodayPage, TodayQuery, TodayRun,
+};
 pub use writer::{Drops, Limits, SLOWEST, Writer};

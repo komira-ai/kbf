@@ -12,8 +12,36 @@ kbf-deploy linux render-units --config node.conf --out units --kbf-uid 1500 --mo
 kbf-deploy linux check-units --config node.conf --dir units --installable --mode daemon
 ```
 
-Exit codes are those of the converged verbs ([storage-node.md](storage-node.md#rendering-the-converged-units)):
-0 rendered or every rule holds, 1 a rule is broken, 2 refused.
+Exit codes: 0 rendered or every rule holds, 1 a rule is broken, 2 refused (a bad setting,
+a missing `--mode`, a file that cannot be read or written), with a `REFUSED:` line on
+stderr.
+
+## Choosing the mode: `--mode`, `kbf.toml`, enrollment
+
+A `kbf` process takes its mode from a flag, never from a word: `kbf --mode=frontend|storage|daemon|storage-and-daemon|all-in-one`,
+or `mode = "..."` in `/etc/kbf/kbf.toml` (`kbf` alone reads it). The flag wins over the file and
+the start says so on stderr; with neither the start exits 2 naming both. `kbf --mode=<mode> --help`
+lists the mode's flags. There is no `node` mode and no `enroll` word.
+
+- **Flags.** A start that gives flags of its mode (`--cold-store`, `--server`, ...) runs on them
+  and does not read the file. The units that `render-units` writes still run the old subcommand
+  forms (`kbf storage ...`, `kbf daemon ...`): they are hidden aliases of the same modes, kept
+  until the units move.
+- **`kbf.toml`.** `kbf --mode=storage|daemon|storage-and-daemon` with at most `--config FILE` and
+  `--label` reads the host's file. On the first start, with the token file `enroll.token_file`
+  names, it makes its keys, sends the token and a request for the roles the mode needs
+  (`storage` the storage role, `daemon` the daemon role, `storage-and-daemon` both) and writes
+  `node.json`; later starts renew the certificates without the token. `[storage]` and `[daemon]`
+  in the file are settings only.
+- **Exit 2** (a restart cannot fix it): a bad `kbf.toml`, a missing or open token file, a token
+  that does not grant a role the mode needs (the frontend's typed reason is printed), and a
+  `node.json` whose roles do not cover the mode (the mode changed after enrollment; the node is
+  never enrolled again on its own). **Exit 1** (may pass): the frontend is down or busy, the
+  clock is off; the start waits 5 seconds, doubling to 5 minutes, and tries again.
+- **`--check`** (`storage`, `daemon`, `storage-and-daemon`): checks the host and exits without
+  starting or enrolling anything. 0 for a valid `kbf.toml` with its token file and no `node.json`
+  yet, or an enrolled node that covers the mode; 2 for a bad config, a missing token file or a
+  `node.json` that does not cover the mode.
 
 ## What check-units reads
 
@@ -44,6 +72,10 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `slice` | a unit not in `kbf.slice` |
 | `delegate` | a mode that runs builds without `cpu`, `cpuset`, `memory` and `pids` delegated, or with one of them in `DisableControllers=` (the unit's, or `kbf.slice`'s) |
 | `cpuset` | `AllowedCPUs=` or `AllowedMemoryNodes=` on a mode that runs builds, or on `kbf.slice`, narrower than the node's CPUs or NUMA nodes |
+| `caps` | a mode that runs builds (`daemon`, `storage-and-daemon`, `all-in-one`) with `MemoryMax=`, `MemoryHigh=`, `CPUQuota=` or `AllowedCPUs=` on its unit: builds are capped by the daemon's own `actions/memory.max`, and a limit on the unit caps the supervisor with them |
+| `swap` | a mode that runs builds with `MemorySwapMax=` on its unit: its leases live in the unit's cgroup and may swap |
+| `oom` | a mode that runs builds without an integer `OOMScoreAdjust=` below 0, the build containers' score (a host-wide OOM kill takes the highest score first) |
+| `meta-dir` | `storage-and-daemon` or `all-in-one` with `--meta-dir` equal to `--data-dir` or under it (compared after resolving `.` and `..`) |
 | `credential` | the cold store's key reaching a mode without a storage half (`daemon`, `all-in-one`); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user; in the `storage-and-daemon` unit, any way of giving the key but the one `EnvironmentFile=<KBF_ETC>/s3.env` (below), and on the node that file not a plain file of root's with mode 0600 |
 | `storage` | a `storage` or `storage-and-daemon` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` (for `storage-and-daemon`, exactly that path: no `-`, quotes or wildcard) |
 | `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
@@ -252,7 +284,8 @@ its registration put it in the frontend's map; calls routed to it fail.
 
 ### The state store: SQLite only
 
-The only state store kbf opens today is a SQLite file; Postgres is a later backend. Rule
+kbf opens a SQLite file or Postgres (`postgres:///kbf?host=/run/postgresql`), but no unit
+is rendered for Postgres yet: that comes with the cutover. Rule
 `state-store` fails a `--state-store` that is not `sqlite:///<absolute path>`: a
 `postgres://` or `postgresql://` URI (postgres is not wired yet), any other scheme, a
 SQLite path that is empty, relative or not normal, and a `--state-store=${VAR}`
@@ -334,9 +367,11 @@ WARN trusted: kbf all-in-one runs builds beside the farm's state and its cold st
 
 Its cold store is `file://<KBF_DATA_DIR>/cold`, the single box's shape (section 11), so
 the unit holds no cold-store key and rule `credential` applies to it. Its scheduler
-state is the SQLite file `<KBF_DATA_DIR>/state.db`, the default of `kbf all-in-one` (a
-`--state-store=sqlite:///...` names another; any other value is refused), so the unit
-gives no state store flag.
+state is the SQLite file `<KBF_DATA_DIR>/state.db`, which the unit names with
+`--state-store=sqlite://<KBF_DATA_DIR>/state.db`. The default of `kbf all-in-one` is
+now Postgres on the host's socket (`postgres:///kbf?host=/run/postgresql`), so a unit that
+left the flag out would change store when its binary is replaced; the move to Postgres is
+the farm cutover, a held script run with the owner's go.
 
 ## A node's certificate
 
@@ -422,12 +457,35 @@ is not ready yet (a restart may help). `kbf check-args <mode> ...` stays for
 `kbf-deploy linux check-units`: it parses the flags only (no file, no host checks, as
 before) and prints a one-line deprecation note as the last line on standard error.
 
+## Enrollment is part of the start
+
+`kbf --mode=storage`, `--mode=daemon` and `--mode=storage-and-daemon` (or `kbf` alone with
+`mode = "..."` in the file; a flag overrides the file and the start says so) enroll the host
+themselves. There is no `node` mode and no `enroll` word.
+
+- First start, with `enroll.token_file` set and no `node.json`: the start makes the key,
+  sends the token and a CSR for the roles the mode needs (storage: storage; daemon: daemon;
+  storage-and-daemon: both) and writes `node.json`. The tables `[storage]` and `[daemon]`
+  are settings only; they never choose roles.
+- Later starts renew without the token. A token that lacks a needed role, or a `node.json`
+  whose roles do not cover the mode, exits 2 and names both; the host is never enrolled
+  again by itself.
+- `--check` passes on a configured host that is not enrolled yet and exits 2 for a bad
+  config, a missing token file or an uncovered `node.json`. It enrolls nothing.
+- Exit 2: a restart cannot fix it. Exit 1: it may pass (the frontend is down or busy, the
+  clock is off); the start retries with a backoff of 5 seconds doubling to 5 minutes.
+
 ## Installing a mode's unit
 
 `kbf-deploy linux install-units --config node.conf --mode MODE [--bin-dir DIR]
 [--apply]` installs one mode's unit on the node, as root:
 
-1. It checks the host, read only: the unit's
+1. It checks the host, read only: the cgroup v2 memory controller is there
+   (`/sys/fs/cgroup/cgroup.controllers` lists `memory`); no listener of the unit
+   (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) is on a port
+   something else listens on (a running instance of the unit keeps its own ports); a mode
+   that runs builds on a host with no active swap prints a `WARN:` line (`linux swap`
+   makes the swapfile); the unit's
    `User=` exists and is not root; for a mode that runs builds, the kbf user has subuid
    and subgid ranges and lingers; `kbf` is an executable in `--bin-dir` (or
    `KBF_BIN_DIR`); the rendered unit passes `check-units --mode MODE --installable` on
@@ -451,7 +509,8 @@ before) and prints a one-line deprecation note as the last line on standard erro
 
 There is no `--uninstall` for a mode's unit yet. A node moving from the converged units
 (`kbf-server.service`) to `kbf-storage.service` stops the old ones first
-(`install-units --uninstall`): both would hold the same directories.
+(`systemctl disable --now kbf-daemon.service kbf-server.service`): both would hold the
+same directories.
 
 ## Upgrade kbf before kbf-deploy
 

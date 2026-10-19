@@ -91,7 +91,6 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls,
-        proxy: None,
         heartbeat_interval: Duration::from_secs(5),
         hello_wait: Duration::from_secs(10),
         tick: Duration::from_millis(50),
@@ -1354,10 +1353,7 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
     .await;
 
     // The partner: a member whose address nothing listens on.
-    let gone = {
-        let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        socket.local_addr().expect("address")
-    };
+    let gone = kbf_testkit::port::dead_addr();
     let member = |id, addr: SocketAddr| kbf_map::Member {
         id: MemberId(id),
         addr: addr.to_string(),

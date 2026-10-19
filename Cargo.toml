@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
-repository = "https://github.com/komira-ai/komira-build-farm"
+repository = "https://github.com/komira-ai/kbf"
 publish = false
 
 # Every external dependency is declared here once and used from a member as

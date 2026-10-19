@@ -18,7 +18,7 @@ use kbf_proto::kbf::map::v1 as pb;
 use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
 use kbf_server::proxy_auth::ProxySecret;
-use kbf_server::{Behind, EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_state};
+use kbf_server::{Behind, EpochPolicy, Listeners, StateStore, WorkerTls, bind_server_with_options};
 use kbf_state::Store;
 use kbf_storage::service::ROLE_URI_PREFIX;
 use kbf_tls::TlsSource;
@@ -144,14 +144,13 @@ fn beat(joined: &pb::RegisterResponse) -> pb::HeartbeatRequest {
     }
 }
 
-fn listeners(worker_tls: WorkerTls, proxy: Option<Behind>) -> Listeners {
+fn listeners(worker_tls: WorkerTls) -> Listeners {
     let loopback: SocketAddr = "127.0.0.1:0".parse().expect("addr");
     Listeners {
         reapi: loopback,
         worker: loopback,
         reapi_tls: None,
         worker_tls: Some(worker_tls),
-        proxy,
         heartbeat_interval: Duration::from_secs(5),
         hello_wait: Duration::from_secs(10),
         tick: Duration::from_millis(50),
@@ -183,12 +182,15 @@ fn frontend_behind(pki: &Pki, proxy: Option<Behind>) -> (SocketAddr, Arc<Hooked>
         members: config(),
         history: None,
     };
-    let bound = bind_server_with_state(
+    let bound = bind_server_with_options(
         Arc::new(Cache::memory()),
-        listeners(pki.worker_tls(), proxy),
+        listeners(pki.worker_tls()),
         None,
         kbf_auth::Policy::allow_all(),
         Some(state),
+        None,
+        None,
+        proxy,
         std::future::pending::<()>(),
     )
     .expect("binds");

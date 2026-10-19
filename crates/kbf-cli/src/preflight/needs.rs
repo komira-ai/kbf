@@ -13,6 +13,9 @@ use crate::Invocation;
 #[must_use]
 pub fn needs(invocation: &Invocation) -> Needs {
     match invocation {
+        // The flags of a start that enrolls are made after it has: the start checks them
+        // then (`node::run`).
+        Invocation::Registered(start) => Needs::new(start.mode.unwrap_or("kbf")),
         Invocation::Daemon(cli) => {
             let mut n = Needs::new("daemon");
             daemon(&mut n, cli);
