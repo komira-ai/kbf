@@ -30,7 +30,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
 use crate::config::UpstreamTable;
-use crate::hold::STREAM_WINDOW_BYTES;
+use crate::keepalive;
+use crate::limits::h2_client_builder;
 use crate::metrics::Metrics;
 use crate::replay::Failure;
 use crate::route::Target;
@@ -42,8 +43,6 @@ pub(crate) const MAX_CONNECTIONS: usize = 256;
 pub(crate) const MAX_DIALS: usize = 16;
 /// The child's listener must accept within this, or the stream fails `UNAVAILABLE`.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// The connection window of an upstream connection, in streams' worth of window.
-pub(crate) const UPSTREAM_CONNECTION_STREAMS: u32 = 1000;
 
 /// Where a child listens: always loopback, whatever the table says.
 pub(crate) const fn upstream_addr(table: UpstreamTable, slot: Slot, target: Target) -> SocketAddr {
@@ -61,6 +60,9 @@ struct Conn {
     /// task holds nothing else of the pool, so dropping the pool drops every `SendRequest` and
     /// the connection closes.
     dead: Arc<AtomicBool>,
+    /// Set by the keepalive while the child has left a PING unanswered: no new stream goes
+    /// here, the streams already on it are untouched, and the answer clears it.
+    suspect: Arc<AtomicBool>,
 }
 
 impl Conn {
@@ -122,15 +124,7 @@ async fn connect(connector: &Connector, addr: SocketAddr) -> Option<Handshaken> 
         .await
         .ok()?
         .ok()?;
-    h2::client::Builder::new()
-        .initial_window_size(STREAM_WINDOW_BYTES)
-        .initial_connection_window_size(
-            STREAM_WINDOW_BYTES.saturating_mul(UPSTREAM_CONNECTION_STREAMS),
-        )
-        .enable_push(false)
-        .handshake::<_, Bytes>(io)
-        .await
-        .ok()
+    h2_client_builder().handshake::<_, Bytes>(io).await.ok()
 }
 
 /// One of the pool's dial slots, held for the length of one dial.
@@ -147,7 +141,7 @@ pub(crate) struct TargetPool {
     addr: SocketAddr,
     conns: Mutex<Vec<Arc<Conn>>>,
     dialing: AtomicUsize,
-    notify: Notify,
+    notify: Arc<Notify>,
     metrics: Arc<Metrics>,
     connector: Connector,
 }
@@ -159,7 +153,7 @@ impl TargetPool {
             connector,
             conns: Mutex::new(Vec::new()),
             dialing: AtomicUsize::new(0),
-            notify: Notify::new(),
+            notify: Arc::new(Notify::new()),
             metrics,
         })
     }
@@ -172,7 +166,9 @@ impl TargetPool {
     fn pick(&self) -> Option<Arc<Conn>> {
         self.lock()
             .iter()
-            .find(|c| !c.dead.load(Ordering::Acquire) && c.reserve())
+            .find(|c| {
+                !c.dead.load(Ordering::Acquire) && !c.suspect.load(Ordering::Acquire) && c.reserve()
+            })
             .map(Arc::clone)
     }
 
@@ -201,12 +197,19 @@ impl TargetPool {
             send,
             inflight: AtomicUsize::new(0),
             dead: Arc::clone(&dead),
+            suspect: Arc::new(AtomicBool::new(false)),
         });
         let pool = Arc::downgrade(self);
         let ping = connection.ping_pong();
+        let close = Arc::new(Notify::new());
+        let closing = Arc::clone(&close);
         tokio::spawn(async move {
-            // The connection ends when the child closes it, or every handle is dropped.
-            let _ = connection.await;
+            // The connection ends when the child closes it, or every handle is dropped, or the
+            // keepalive gives up on it (dropping it resets what is left on it).
+            tokio::select! {
+                _ = &mut connection => {}
+                () = closing.notified() => {}
+            }
             dead.store(true, Ordering::Release);
             if let Some(pool) = pool.upgrade() {
                 pool.notify.notify_waiters();
@@ -217,17 +220,26 @@ impl TargetPool {
         // before it answers a PING, so one round trip makes the advertised limit the real one.
         // A child that does not answer is not there: running on h2's assumed 100 streams is the
         // very thing the PING is for.
-        let ponged =
-            OptionFuture::from(ping.map(|mut p| async move { p.ping(h2::Ping::opaque()).await }));
-        let answered = matches!(
-            tokio::time::timeout(CONNECT_TIMEOUT, ponged).await,
-            Ok(Some(Ok(_)))
-        );
-        if !answered {
+        let ponged = OptionFuture::from(ping.map(|mut p| async move {
+            let pong = p.ping(h2::Ping::opaque()).await;
+            (p, pong)
+        }));
+        let Ok(Some((ping, Ok(_)))) = tokio::time::timeout(CONNECT_TIMEOUT, ponged).await else {
             conn.dead.store(true, Ordering::Release);
             Metrics::inc(&self.metrics.upstream_dial_failed);
             return Err(Failure::Connect);
-        }
+        };
+        // From here the connection pings itself; the keepalive ends it, if it has to, through
+        // the driver task above.
+        // It holds the flag, the pool's bell and the PING handle (which does not keep the
+        // connection open), so it does not keep the pool or the connection alive; after the
+        // connection is gone it ends at its next PING.
+        let suspect = Arc::clone(&conn.suspect);
+        let bell = Arc::clone(&self.notify);
+        tokio::spawn(async move {
+            keepalive::upstream(ping, &suspect, &bell).await;
+            close.notify_one();
+        });
         Ok(conn)
     }
 

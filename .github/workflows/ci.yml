@@ -337,6 +337,9 @@ jobs:
       # farm's restart tests run on a schema of their own (`over_postgres` in tests/state_store.rs).
       - run: cargo test -p kbf-server --locked --test state_store_postgres -- --include-ignored
       - run: cargo test -p kbf-server --locked --test state_store -- --include-ignored over_postgres
+      # Two frontend children on one Postgres schema hand over 50 builds
+      # (tests/frontend/managed/two_children.rs; its in-memory twin runs in every test run).
+      - run: cargo test -p kbf-server --locked --test frontend -- --include-ignored two_children::fifty_builds_across_a_takeover_over_postgres
       # A frontend process started with a Postgres --state-store reaches /readyz.
       - run: cargo test -p kbf-cli --locked --test frontend_process -- --include-ignored postgres_state_store
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -374,6 +377,9 @@ jobs:
       COVERAGE_TOOLCHAIN: nightly-2026-10-01
       LLVM_COV_VERSION: 0.9.1
       LLVM_COV_SHA256: b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a
+      # `cargo llvm-cov nextest` runs the tests as test-x86 does.
+      NEXTEST_VERSION: 0.9.146
+      NEXTEST_SHA256: 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -383,6 +389,8 @@ jobs:
       - name: Install cargo-llvm-cov (pinned version and checksum)
         run: cargo "+$COVERAGE_TOOLCHAIN" xtask fetch --url "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$LLVM_COV_VERSION/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz" --sha256 "$LLVM_COV_SHA256" --out "$HOME/.cargo/bin/cargo-llvm-cov" --extract tar.gz --member cargo-llvm-cov
       - run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --version
+      - name: Install cargo-nextest (pinned version and checksum)
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask fetch --url "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/cargo-nextest-$NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz" --sha256 "$NEXTEST_SHA256" --out "$HOME/.cargo/bin/cargo-nextest" --extract tar.gz --member cargo-nextest
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -392,11 +400,10 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      # Not `cargo llvm-cov nextest`: a test's process-wide state decides which lines count.
-      # A `tracing` macro evaluates its fields only when a subscriber is installed, and under
-      # `cargo test` an earlier test in the process has installed one, so the field lines of
-      # kbf-mdm (journal.rs), kbf-mac-session (ledger.rs) and kbf-server (rebuild.rs) are hit
-      # there and missed in a process per test (10 more missed lines on the ratchet).
+      # nextest runs a process per test, so a test's line coverage must not rest on another
+      # test of the process: a `tracing` macro evaluates its fields only when a subscriber is
+      # registered, so a test that runs one installs its own (`tracing::subscriber::set_default`
+      # or `with_default`). Equal ratchet numbers to `cargo test` depend on it.
       # `-skip-functions` leaves the per-function records (FN, FNDA) out of the lcov
       # export. With branch coverage on, llvm-cov's lcov exporter segfaults while
       # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
@@ -406,9 +413,13 @@ jobs:
       - name: Run the workspace tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch --no-report
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast
       # The tests that need the server, as the state-postgres job runs them; their
       # counters join the workspace run's in the report below.
+      # The steps after the kbf-state one select tests of the workspace build by filter, not by
+      # `-p ... --test`: a build of one package leaves out the dev-dependency features of the
+      # others, so it would build kbf-installer again without `test-sandbox` and put a copy of
+      # its code in the report that no test runs (app.rs `root_of`: 1 missed line).
       - name: Run the Postgres tests of kbf-state under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
@@ -416,15 +427,19 @@ jobs:
       - name: Run the server's Postgres tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store_postgres -- --include-ignored
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-server) & binary(state_store_postgres)'
       - name: Run the server's restart tests over Postgres under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store -- --include-ignored over_postgres
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-server) & binary(state_store) & test(over_postgres)'
+      - name: Run the two-children swap over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-server) & binary(frontend) & test(two_children::fifty_builds_across_a_takeover_over_postgres)'
       - name: Run the frontend process test over Postgres under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-cli --test frontend_process -- --include-ignored postgres_state_store
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-cli) & binary(frontend_process) & test(postgres_state_store)'
       - name: Report
         env:
           LLVM_COV_FLAGS: -skip-functions

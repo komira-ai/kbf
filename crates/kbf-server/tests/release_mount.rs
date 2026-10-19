@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::MemoryStore;
-use kbf_proto::update::FetchRequest;
 use kbf_proto::update::release_service_client::ReleaseServiceClient;
+use kbf_proto::update::{DescribeRequest, FetchRequest};
 use kbf_server::release::{Limits, ReleaseStore};
 use kbf_server::token::ApiToken;
 use kbf_server::{Api, Listeners, bind_server_with_state};
@@ -194,4 +194,80 @@ async fn without_a_store_the_update_endpoints_say_so() {
         .await
         .expect_err("refused");
     assert_ne!(refused.code(), Code::Ok);
+    let route = format!("/v1/releases/{COMMIT}");
+    assert_eq!(http(running.api, "GET", &route, false, b"").await, 503);
+    let refused = client
+        .describe(DescribeRequest {
+            commit: COMMIT.to_owned(),
+            platform: String::new(),
+        })
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.code(), Code::Unavailable);
+}
+
+/// Catches `Describe` and the description route not mounted where the frontend starts, or
+/// mounted over another store than the upload's: a tarball and its bundle put on the
+/// operator API are described by the worker listener's `ReleaseService` (a release without
+/// its bundle is FAILED_PRECONDITION, with it the digests of both files), the route answers
+/// 200, and the bundle digest the description names is served by `Fetch`.
+///
+/// Mutants seen red: the `Describe` row left out of the worker role table (the call is
+/// PERMISSION_DENIED, "not served"); the bundle omitted from the description.
+#[tokio::test]
+async fn a_release_put_on_the_api_is_described_on_both_listeners() {
+    let dir = Dir::new();
+    let store =
+        Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
+    let running = start(Some(store), &dir);
+    let (tarball, bundle) = (b"a tarball".to_vec(), b"a bundle".to_vec());
+    let path = format!("/v1/releases/{COMMIT}/linux-x86_64/kbf");
+    assert_eq!(http(running.api, "PUT", &path, true, &tarball).await, 201);
+    let describe = || async {
+        let mut client = ReleaseServiceClient::connect(format!("http://{}", running.worker))
+            .await
+            .expect("connect");
+        client
+            .describe(DescribeRequest {
+                commit: COMMIT.to_owned(),
+                platform: "linux-x86_64".to_owned(),
+            })
+            .await
+    };
+    // Not complete until the bundle is there.
+    assert_eq!(
+        describe().await.expect_err("no bundle").code(),
+        Code::FailedPrecondition
+    );
+    let attestation = format!("{path}.attestation");
+    assert_eq!(
+        http(running.api, "PUT", &attestation, true, &bundle).await,
+        201
+    );
+    let described = describe().await.expect("described").into_inner();
+    let [component] = &described.components[..] else {
+        panic!("one component: {described:?}");
+    };
+    assert_eq!(component.sha256, hex::encode(Sha256::digest(&tarball)));
+    assert_eq!(
+        component.bundle_sha256,
+        hex::encode(Sha256::digest(&bundle))
+    );
+    let route = format!("/v1/releases/{COMMIT}");
+    assert_eq!(http(running.api, "GET", &route, false, b"").await, 200);
+    let mut client = ReleaseServiceClient::connect(format!("http://{}", running.worker))
+        .await
+        .expect("connect");
+    let mut stream = client
+        .fetch(FetchRequest {
+            sha256: component.bundle_sha256.clone(),
+        })
+        .await
+        .expect("a bundle is fetched")
+        .into_inner();
+    let mut got = Vec::new();
+    while let Some(chunk) = stream.message().await.expect("chunk") {
+        got.extend_from_slice(&chunk.data);
+    }
+    assert_eq!(got, bundle);
 }

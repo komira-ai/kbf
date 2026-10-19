@@ -646,6 +646,7 @@ impl Harness<FakeRuntime> {
             None,
             None,
             Some(update),
+            None,
         )
         .await
     }
@@ -730,6 +731,7 @@ impl<R: Runtime> Harness<R> {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -755,6 +757,7 @@ impl<R: Runtime> Harness<R> {
             None,
             None,
             Some(phase),
+            None,
             None,
             None,
             None,
@@ -789,8 +792,77 @@ impl<R: Runtime> Harness<R> {
             Some((stall, above)),
             None,
             None,
+            None,
         )
         .await
+    }
+
+    /// Starts a server and a daemon run by [`Daemon::run_draining`]: each `()` sent on
+    /// the returned sender is one stop signal (SIGTERM). `deadline` is the drain's.
+    pub async fn with_drain(
+        name: &str,
+        runtime: Arc<R>,
+        deadline: Duration,
+    ) -> (Self, mpsc::UnboundedSender<()>) {
+        Self::with_drain_phase(name, runtime, deadline, None).await
+    }
+
+    /// [`Harness::with_drain`], whose runtime reports the phase `phase` holds.
+    pub async fn with_drain_phase(
+        name: &str,
+        runtime: Arc<R>,
+        deadline: Duration,
+        phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
+    ) -> (Self, mpsc::UnboundedSender<()>) {
+        let (signals_tx, signals) = mpsc::unbounded_channel();
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        let h = Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            phase,
+            None,
+            None,
+            None,
+            Some((signals, Some(deadline))),
+        )
+        .await;
+        (h, signals_tx)
+    }
+
+    /// Starts a server and a daemon run by [`Daemon::run`] with a shutdown that completes
+    /// at the first `()` sent on the returned sender.
+    pub async fn with_shutdown(name: &str, runtime: Arc<R>) -> (Self, mpsc::UnboundedSender<()>) {
+        let (signals_tx, signals) = mpsc::unbounded_channel();
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let h = Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            |_| {},
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some((signals, None)),
+        )
+        .await;
+        (h, signals_tx)
+    }
+
+    /// Whether the daemon's `run_draining` returned within `within`.
+    pub async fn exited(&mut self, within: Duration) -> bool {
+        timeout(within, &mut self.daemon).await.is_ok()
     }
 
     /// Starts a server and a daemon that give a stream up when its connection, its open
@@ -806,6 +878,7 @@ impl<R: Runtime> Harness<R> {
             runtime,
             Duration::from_secs(40),
             configure,
+            None,
             None,
             None,
             None,
@@ -839,6 +912,7 @@ impl<R: Runtime> Harness<R> {
             None,
             Some(holder),
             None,
+            None,
         )
         .await
     }
@@ -856,6 +930,7 @@ impl<R: Runtime> Harness<R> {
         pressure: Option<(tokio::sync::watch::Receiver<Option<f64>>, f64)>,
         map: Option<Arc<kbf_mapsync::MapHolder>>,
         update: Option<UpdateLink>,
+        drain: Option<(mpsc::UnboundedReceiver<()>, Option<Duration>)>,
     ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -917,7 +992,13 @@ impl<R: Runtime> Harness<R> {
         if let Some(update) = update {
             daemon = daemon.with_update(update);
         }
-        let daemon = tokio::spawn(daemon.run(std::future::pending()));
+        let daemon = match drain {
+            Some((signals, Some(deadline))) => tokio::spawn(daemon.run_draining(signals, deadline)),
+            Some((mut signals, None)) => tokio::spawn(daemon.run(async move {
+                signals.recv().await;
+            })),
+            None => tokio::spawn(daemon.run(std::future::pending())),
+        };
         Self {
             runtime,
             sessions,

@@ -159,17 +159,22 @@ impl Down {
             Some(data) => data.map(|d| Some(Item::Data(d))),
             None => ready!(self.recv.poll_trailers(cx)).map(|t| t.map(Item::Trailers)),
         };
+        // `Ok(None)` is the end of the stream: no data and no trailers left. (When the last DATA
+        // frame carries END_STREAM, `is_end_stream` ends the body before this is polled again.)
         Poll::Ready(match next {
-            Ok(Some(Item::Data(data))) => {
-                let _ = self.recv.flow_control().release_capacity(data.len());
-                self.activity.touch();
-                Some(Ok(Frame::data(data)))
-            }
-            Ok(Some(Item::Trailers(mut trailers))) => {
-                strip_reserved(&mut trailers);
-                Some(Ok(Frame::trailers(trailers)))
-            }
-            Ok(None) => None,
+            Ok(item) => item.map(|item| {
+                Ok(match item {
+                    Item::Data(data) => {
+                        let _ = self.recv.flow_control().release_capacity(data.len());
+                        self.activity.touch();
+                        Frame::data(data)
+                    }
+                    Item::Trailers(mut trailers) => {
+                        strip_reserved(&mut trailers);
+                        Frame::trailers(trailers)
+                    }
+                })
+            }),
             Err(_) => self.fail(),
         })
     }
@@ -212,7 +217,12 @@ impl Body for ProxyBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        matches!(self, Self::Full(None))
+        match self {
+            Self::Full(bytes) => bytes.is_none(),
+            // True for a trailers-only answer, so its HEADERS carry END_STREAM and a client
+            // that reads `grpc-status` from the last HEADERS frame finds it.
+            Self::Up(down) => down.recv.is_end_stream(),
+        }
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -297,7 +307,14 @@ impl Source {
         may_retry(path, failure, &self.state().buffer, attempts)
     }
 
-    /// The upstream answered: the request may have had an effect, so it is never replayed.
+    /// Reads the upstream's first response head: true if it is the fenced answer (the window
+    /// stays open for [`Source::may_retry`]), else the request may have had an effect and the
+    /// window is closed for good. See [`ReplayBuffer::on_first_response`].
+    pub(crate) fn on_first_response(&self, headers: &HeaderMap, end_stream: bool) -> bool {
+        self.state().buffer.on_first_response(headers, end_stream)
+    }
+
+    /// Closes the window: the request is never replayed again.
     pub(crate) fn close_window(&self) {
         self.state().buffer.close();
     }

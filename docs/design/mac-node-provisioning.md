@@ -60,8 +60,9 @@ This design builds on the code on `main`, read at the time of writing.
   `--driver fake|container|native`. On a Mac it runs `--driver native` with `--server`,
   `--cas`, `--ca-cert`, `--cert`, `--key`, `--node-id`, `--data-dir` and repeatable
   `--label key=value` (reported as `label.<key>`). It is configured by flags only. On
-  SIGTERM it abandons running leases (their processes are killed and their directories
-  removed) and exits zero.
+  SIGTERM it drains (no new lease; running ones finish and report) and exits zero. A
+  second signal, or `--drain-deadline-secs` after the first, abandons the leases still
+  running (their processes are killed and their directories removed).
 - **The native driver** (`kbf-driver-native`) runs each action as a process tree in a
   fresh lease directory. It gives the action the network unless the action turns it off
   (`network=off`, enforced with `sandbox-exec`), and denies job submission to launchd

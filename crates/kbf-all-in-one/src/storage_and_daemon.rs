@@ -146,6 +146,8 @@ fn serve(flags: Flags) -> Result<(), crate::run::Failed> {
     let sizes = kbf_server::sizes_on(&flags.storage.server, kbf_threads::Topology::detect());
     sizes.log();
     let tokio = sizes.runtime().map_err(Failed::server)?;
+    // Before the half can hold the keys of a registered cold store.
+    kbf_server::storage_node::harden(&flags.storage).map_err(Failed::server)?;
     let start = kbf_server::storage_half::start(&flags.storage, kbf_server::interrupted);
     let half = tokio.block_on(start);
     let half = half.map_err(Failed::server)?;
