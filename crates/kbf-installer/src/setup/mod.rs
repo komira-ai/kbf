@@ -22,6 +22,9 @@
 //!   `--commit` stops before `kbf.toml` with that reason). On a frontend or all-in-one host the
 //!   state database's schema is created or brought forward ([`Schemas`]) once `installer.toml`
 //!   is written, and a unit that makes a frontend is enabled and never started.
+//! - `[proxy] listen` of `installer.toml` (the operator's key) becomes the drop-in
+//!   `kbf-proxy.socket.d/listen.conf` on Linux, and no key removes the drop-in. Setup never
+//!   reloads systemd or restarts the socket: it says that is needed.
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
 
 pub mod backend;
@@ -150,11 +153,11 @@ pub struct Options {
 /// The `installer.toml` this run leaves: the file that is there with the flags' settings put
 /// in, or the defaults with them. A file that is not valid is not overwritten (the operator
 /// decides), and a floor never goes down.
-pub fn installer_file(
+pub fn installer_settings(
     exec: &dyn Exec,
     v: &Valid,
     platform: Platform,
-) -> Result<String, SetupError> {
+) -> Result<InstallerToml, SetupError> {
     let path = HostPath::new(paths::INSTALLER_TOML)?;
     let mut settings = match exec.inspect(&path)? {
         None => InstallerToml::default(),
@@ -193,7 +196,7 @@ pub fn installer_file(
         }
         _ => (None, None),
     };
-    Ok(settings.render())
+    Ok(settings)
 }
 
 /// The role whose certificate and key the fetch child is lent: the daemon's if the host has

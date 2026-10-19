@@ -35,7 +35,7 @@ use crate::identity::Identity;
 use crate::route::AuthClass;
 
 /// How REAPI and Buck2 callers authenticate (`buck2_auth` of `installer.toml`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Buck2Auth {
     /// Network-level trust (for example a private overlay network).
