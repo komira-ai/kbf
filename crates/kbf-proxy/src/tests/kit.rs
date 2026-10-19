@@ -555,6 +555,14 @@ impl Reply {
 }
 
 /// Reads a response to its end.
+/// Sends the last DATA of a request. A server may answer, and so close the stream, before it
+/// reads the body (RFC 9113 section 8.1: a refusal does), and the send then fails with
+/// `InactiveStreamId`. That is not the client's error: the answer is already there, so the
+/// caller reads it with [`finish`], which reports a stream that really failed.
+pub(super) fn send_end(body: &mut SendStream<Bytes>, data: Bytes) {
+    let _answered_first = body.send_data(data, true);
+}
+
 pub(super) async fn finish(response: ResponseFuture) -> Reply {
     let mut reply = Reply {
         status: None,
@@ -694,9 +702,7 @@ impl Client {
             .send_request(request, body.is_empty())
             .expect("send_request");
         if !body.is_empty() {
-            stream
-                .send_data(Bytes::from_static(body), true)
-                .expect("body");
+            send_end(&mut stream, Bytes::from_static(body));
         }
         finish(response).await
     }
@@ -704,8 +710,16 @@ impl Client {
     /// A whole unary call: headers, one message, END_STREAM.
     pub(super) async fn unary(&mut self, path: &str) -> Reply {
         let (response, mut body) = self.start(path, false).await;
-        body.send_data(Bytes::from_static(b"ping"), true)
-            .expect("body");
+        send_end(&mut body, Bytes::from_static(b"ping"));
+        finish(response).await
+    }
+
+    /// [`Client::unary`] with the message held back for `pause` of the test's clock after the
+    /// headers: a proxy that answers from the headers has finished the stream by then.
+    pub(super) async fn unary_after(&mut self, path: &str, pause: std::time::Duration) -> Reply {
+        let (response, mut body) = self.start(path, false).await;
+        tokio::time::sleep(pause).await;
+        send_end(&mut body, Bytes::from_static(b"ping"));
         finish(response).await
     }
 
