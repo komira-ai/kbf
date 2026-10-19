@@ -1,43 +1,91 @@
 //! The helper's passes on a scratch host: the real installer verbs over a real file tree,
-//! with the one thing a test cannot run (the attestation check of a stage) played by a
-//! closure, and the service restart recorded as a step.
+//! with the fetch played by a fake that installs a directory (or fails as told), the lease
+//! source set by the test, and the service restart recorded as a step. Orders are the
+//! records `kbf-update` writes into the spool.
 
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
-use crate::activate;
-use crate::attest::SourceRef;
-use crate::layout::{Layout, Platform};
-use crate::refusal::{InboxFault, Refusal};
-use crate::stage::Staged;
-use crate::state::{Locked, State};
-use crate::testkit::{A, B, c};
 use kbf_host::testkit::{ScratchHost, reply};
 use kbf_host::{Root, Step};
+use kbf_update::record::file_name;
+use kbf_update::{Facts, Locator, OrderRecord, Verb};
+
+use crate::activate;
+use crate::layout::{Layout, Platform};
+use crate::state::{Locked, State};
+use crate::testkit::{A, B, C, c};
 
 use crate::helper::cycle::{Config, Helper};
+use crate::helper::fetcher::fake::FakeFetcher;
+use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, NotWired, ReleaseLocator};
+use crate::helper::leases::fake::FakeLeases;
+use crate::helper::memory::{Event, Memory};
+use crate::helper::order::{Order, Verb as OrderVerb};
 use crate::helper::restart::Restart;
+use crate::helper::service::fake::ServiceRecorder;
+use crate::spool::Entry;
 
 const UNIT: &str = "kbf.service";
 const T0: u64 = 1_800_000_000;
+const UPDATE: &str = "var/lib/kbf-installer";
 
 struct Rig {
     helper: Helper<ScratchHost>,
     root: PathBuf,
     layout: Layout,
+    fetcher: FakeFetcher,
+    leases: FakeLeases,
     /// The restarts the start-up made (the links were missing and were made).
     base: usize,
+    platform: Platform,
+    /// The service manager and the process table.
+    service: ServiceRecorder,
 }
 
-fn order_json(id: u64, verb: &str, commit: &str) -> String {
-    format!(
-        "{{\"order_id\":{id},\"epoch\":1,\"verb\":\"{verb}\",\"commit\":\"{commit}\",\"window_s\":600}}"
-    )
+/// The record `kbf-update` would write for `verb` on `commit`.
+fn record(
+    id: u64,
+    epoch: u64,
+    generation: u64,
+    verb: Verb,
+    commit: &str,
+    platform: Platform,
+) -> OrderRecord {
+    let activate = verb == Verb::Activate;
+    OrderRecord {
+        order_id: id,
+        epoch,
+        generation,
+        verb,
+        commit: commit.to_owned(),
+        window_s: 600,
+        components: if activate {
+            vec![Locator {
+                name: "kbf".to_owned(),
+                sha256: "ab".repeat(32),
+                size: 1000,
+                attestation: "{\"bundle\":1}".to_owned(),
+            }]
+        } else {
+            Vec::new()
+        },
+        expected: activate.then(|| Facts {
+            platform: match platform {
+                Platform::Linux => "linux-x86_64".to_owned(),
+                Platform::MacOs => "darwin-arm64".to_owned(),
+            },
+            protocol: 7,
+            min_protocol: 6,
+            state_schema: 3,
+            profile: "release".to_owned(),
+        }),
+    }
 }
 
 impl Rig {
-    /// A host running release A, with release B installed beside it, an empty inbox, and
+    /// A host running release A, with release B not installed, an empty spool, no lease and
     /// the service restart recorded.
     fn new(name: &str) -> Rig {
         Rig::on(name, Platform::Linux)
@@ -45,6 +93,11 @@ impl Rig {
 
     /// The same host on `platform`: macOS keeps its state and lock elsewhere.
     fn on(name: &str, platform: Platform) -> Rig {
+        Rig::build(name, platform, 0)
+    }
+
+    /// The same host with `min_activation_interval_secs` set.
+    fn build(name: &str, platform: Platform, min_interval: u64) -> Rig {
         let mut host = ScratchHost::new(&format!("helper-{name}"));
         let root = host.root.clone();
         for sub in [
@@ -52,7 +105,7 @@ impl Rig {
             "var/run",
             "var/db/kbf-installer",
             "var/lib/kbf-installer",
-            "var/lib/kbf-updater/inbox/orders",
+            &format!("{UPDATE}/orders"),
             "var/lib/kbf-installer/releases",
         ] {
             fs::create_dir_all(root.join(sub)).expect("seed");
@@ -60,7 +113,13 @@ impl Rig {
         let dir = root.join("var/lib/kbf-installer/releases").join(A);
         fs::create_dir_all(&dir).expect("release");
         fs::write(dir.join("kbf"), b"binary").expect("binary");
-        host.answer = Box::new(|_| Ok(reply(0, "", "")));
+        let service = ServiceRecorder::running(
+            4242,
+            root.join("var/lib/kbf-installer/releases")
+                .join(A)
+                .join("kbf"),
+        );
+        host.answer = service.answer();
         let layout = Layout::new(Root::new(&root).expect("absolute"), platform);
         Locked::acquire(&layout)
             .expect("lock")
@@ -70,18 +129,33 @@ impl Rig {
             })
             .expect("state");
         let cfg = Config {
-            update_dir: kbf_host::HostPath::new("/var/lib/kbf-updater").expect("path"),
+            update_dir: kbf_host::HostPath::new("/var/lib/kbf-installer").expect("path"),
+            orders_dir: kbf_host::HostPath::new("/var/lib/kbf-installer/orders").expect("path"),
             restart: Restart::Systemd(UNIT.to_owned()),
             window_secs: 600,
             starts: 3,
+            min_activation_interval_secs: min_interval,
         };
-        let mut helper = Helper::new(layout.clone(), host, cfg);
+        let fetcher = FakeFetcher::new(&layout);
+        let leases = FakeLeases::default();
+        let mut helper = Helper::new(
+            layout.clone(),
+            host,
+            cfg,
+            Box::new(fetcher.clone()),
+            Box::new(leases.clone()),
+            Box::new(service.clone()),
+        );
         helper.recover().expect("recover");
         let mut rig = Rig {
             helper,
             root,
             layout,
+            fetcher,
+            leases,
             base: 0,
+            platform,
+            service,
         };
         rig.cycle(T0 - 100);
         rig.base = rig.restarts();
@@ -89,16 +163,49 @@ impl Rig {
     }
 
     fn orders(&self) -> PathBuf {
-        self.root.join("var/lib/kbf-updater/inbox/orders")
+        self.root.join(UPDATE).join("orders")
     }
 
-    fn put_order(&self, id: u64, body: &str) {
-        fs::write(self.orders().join(format!("{id:020}.json")), body).expect("order");
+    fn rec(&self, id: u64, epoch: u64, generation: u64, verb: Verb, commit: &str) -> OrderRecord {
+        record(id, epoch, generation, verb, commit, self.platform)
+    }
+
+    /// Puts the record in the spool under its own name.
+    fn put(&self, r: &OrderRecord) {
+        let bytes = serde_json::to_vec(r).expect("json");
+        fs::write(self.orders().join(r.file_name()), bytes).expect("record");
+    }
+
+    /// An order in epoch 1, generation 1.
+    fn order(&self, id: u64, verb: Verb, commit: &str) {
+        self.put(&self.rec(id, 1, 1, verb, commit));
+    }
+
+    fn put_raw(&self, epoch: u64, id: u64, body: &[u8]) {
+        fs::write(self.orders().join(file_name(epoch, id)), body).expect("record");
+    }
+
+    fn left(&self) -> usize {
+        fs::read_dir(self.orders()).expect("dir").count()
+    }
+
+    /// Release `commit` as a fetch would leave it.
+    fn install(&self, commit: &str) {
+        let dir = self
+            .root
+            .join("var/lib/kbf-installer/releases")
+            .join(commit);
+        fs::create_dir_all(&dir).expect("release");
+        fs::write(dir.join("kbf"), b"binary").expect("binary");
     }
 
     fn status(&self) -> serde_json::Value {
-        let bytes = fs::read(self.root.join("var/lib/kbf-updater/status.json")).expect("status");
+        let bytes = fs::read(self.root.join(UPDATE).join("status.json")).expect("status");
         serde_json::from_slice(&bytes).expect("json")
+    }
+
+    fn refusal(&self) -> String {
+        self.status()["refusal"].as_str().expect("text").to_owned()
     }
 
     fn state(&self) -> State {
@@ -117,164 +224,235 @@ impl Rig {
             - self.base
     }
 
+    /// The service starts `commit`: the Linux boot check runs (the window starts), and the
+    /// unit's main process runs a file of that release.
+    fn first_start(&mut self, commit: &str, now: u64) {
+        let layout = self.layout.clone();
+        let mut out = Vec::new();
+        activate::boot_check(self.helper.exec_mut(), &layout, now, 600, &mut out)
+            .expect("boot check");
+        self.service.0.borrow_mut().exes = vec![(
+            4242,
+            self.root
+                .join("var/lib/kbf-installer/releases")
+                .join(commit)
+                .join("kbf"),
+        )];
+    }
+
     fn cycle(&mut self, now: u64) {
-        let mut never = |_: &mut ScratchHost, _: &std::path::Path| -> Result<Staged, Refusal> {
-            panic!("no offer is expected")
-        };
-        self.helper.cycle(now, &mut never).expect("a pass");
+        self.helper.cycle(now).expect("a pass");
     }
 
-    /// An inbox entry for `commit`, as the node's client names it.
-    fn put_offer(&self, generation: u64, commit: &str) -> String {
-        let name = format!("{generation:020}-{commit}");
-        fs::create_dir_all(self.root.join("var/lib/kbf-updater/inbox").join(&name)).expect("entry");
-        name
+    fn current(&self) -> Option<crate::CommitId> {
+        self.state().current
     }
 }
 
-fn staged(commit: &str) -> Staged {
-    Staged {
-        commit: c(commit),
-        components: vec!["kbf"],
-        source_ref: SourceRef::new("refs/heads/main").expect("ref"),
-        protocol: 7,
-        min_protocol: 6,
-        state_schema: 3,
-        version: "0.1.0".to_owned(),
-        log: String::new(),
-    }
+fn link(rig: &Rig, name: &str) -> PathBuf {
+    fs::read_link(rig.root.join("var/lib/kbf-installer/releases").join(name)).expect("link")
 }
 
-/// A staged release B: the stage's own work is the installer's (its tests); here it marks
-/// B staged in the state, as `release::stage` does.
-fn stage_b(
-    layout: Layout,
-) -> impl FnMut(&mut ScratchHost, &std::path::Path) -> Result<Staged, Refusal> {
-    move |_, _| {
-        let dir = layout.join(&layout.release_dir(&c(B)));
-        fs::create_dir_all(&dir).expect("release");
-        fs::write(dir.join("kbf"), b"binary").expect("binary");
-        let lock = Locked::acquire(&layout).expect("lock");
-        let mut state = lock.read().expect("reads").unwrap_or_default();
-        state.staged = Some(c(B));
-        lock.write(&state).expect("writes");
-        Ok(staged(B))
-    }
-}
-
-/// Catches an offer staged more than once: a refused entry would otherwise be fetched,
-/// verified and refused again every few seconds, and an accepted one re-installed.
+/// Catches the swap being skipped, the restart being skipped or repeated, a release that
+/// is not installed not being fetched (once), and an order acted on twice: the activation
+/// of a commit that is not on the host has the fetcher install it with the order's locators,
+/// moves the links, restarts the unit once and reports a swap on trial; the same record put
+/// back (a replay) fetches nothing and restarts nothing.
 ///
-/// Mutant seen red: `handled_entry` not recorded (the stager runs on every pass).
+/// Mutants planted: no restart step; the acknowledged id not recorded (the replay restarts
+/// again); the record not removed; the fetch skipped (the swap is refused as not installed).
 #[test]
-fn the_newest_entry_is_staged_once_and_a_refusal_is_reported_not_retried() {
-    let mut rig = Rig::new("stage-once");
-    let older = rig.put_offer(1, A);
-    let newest = rig.put_offer(2, B);
-    assert_ne!(older, newest);
-    let mut calls = Vec::new();
-    let mut inner = stage_b(rig.layout.clone());
-    let mut stager = |exec: &mut ScratchHost, entry: &std::path::Path| {
-        calls.push(
-            entry
-                .file_name()
-                .expect("name")
-                .to_string_lossy()
-                .into_owned(),
-        );
-        inner(exec, entry)
-    };
-    rig.helper.cycle(T0, &mut stager).expect("pass");
-    rig.helper.cycle(T0 + 3, &mut stager).expect("pass");
-    assert_eq!(
-        calls,
-        std::slice::from_ref(&newest),
-        "only the newest, and only once"
-    );
-    assert_eq!(rig.status()["state"], "staged");
-    assert_eq!(rig.status()["staged_commit"], B);
-    assert_eq!(rig.status()["staged"]["protocol"], 7);
-
-    let mut refuse = |_: &mut ScratchHost, _: &std::path::Path| -> Result<Staged, Refusal> {
-        Err(Refusal::Inbox {
-            name: "offer.json".to_owned(),
-            fault: InboxFault::Missing,
-        })
-    };
-    let newer = format!("{:020}-{}", 3, "d".repeat(40));
-    fs::create_dir(rig.root.join("var/lib/kbf-updater/inbox").join(&newer)).expect("entry");
-    rig.helper.cycle(T0 + 6, &mut refuse).expect("pass");
-    assert_eq!(rig.status()["state"], "refused");
-    assert!(
-        rig.status()["refusal"]
-            .as_str()
-            .expect("text")
-            .contains("inbox")
-    );
-    // The same entry again: not looked at (a refuse that panicked would show it).
-    let mut again = |_: &mut ScratchHost, _: &std::path::Path| -> Result<Staged, Refusal> {
-        panic!("a refused entry is not staged again")
-    };
-    rig.helper.cycle(T0 + 9, &mut again).expect("pass");
-}
-
-/// Catches the swap being skipped, the restart being skipped or repeated, and an order
-/// acted on twice: the activate order moves the links, restarts the unit once, reports a
-/// swap on trial, and the same order file put back (a replay) does nothing.
-///
-/// Mutants seen red: no restart step; the acknowledged id not recorded (the replay
-/// restarts again); the order file not removed.
-#[test]
-fn an_activate_order_swaps_restarts_once_and_is_not_replayed() {
+fn an_activate_order_fetches_swaps_restarts_once_and_is_not_replayed() {
     let mut rig = Rig::new("activate");
-    rig.put_offer(1, B);
-    let mut stager = stage_b(rig.layout.clone());
-    rig.helper.cycle(T0, &mut stager).expect("stage");
-    rig.put_order(5, &order_json(5, "activate", B));
-    rig.cycle(T0 + 3);
-    let links = |rig: &Rig, name: &str| {
-        fs::read_link(rig.root.join("var/lib/kbf-installer/releases").join(name)).expect("link")
-    };
-    assert_eq!(links(&rig, "current"), PathBuf::from(B));
-    assert_eq!(links(&rig, "previous"), PathBuf::from(A));
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(link(&rig, "current"), PathBuf::from(B));
+    assert_eq!(link(&rig, "previous"), PathBuf::from(A));
     assert_eq!(rig.restarts(), 1);
+    assert_eq!(rig.fetcher.count(), 1);
+    let call = rig.fetcher.calls.lock().expect("lock")[0].clone();
+    assert_eq!(call.commit, c(B));
+    assert_eq!(call.components[0].size, 1000);
     assert_eq!(rig.status()["state"], "activated_unconfirmed");
     assert_eq!(rig.status()["installed_commit"], B);
     assert_eq!(rig.status()["acked_order_id"], 5);
-    assert!(
-        !rig.orders().join(format!("{:020}.json", 5)).exists(),
-        "taken"
+    assert_eq!(
+        rig.status()["staged"]["protocol"],
+        7,
+        "the fetched release's facts"
     );
-    rig.put_order(5, &order_json(5, "activate", B));
-    rig.cycle(T0 + 6);
+    assert_eq!(rig.left(), 0, "taken");
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0 + 3);
     assert_eq!(rig.restarts(), 1, "a replayed order restarts nothing");
+    assert_eq!(rig.fetcher.count(), 1, "and fetches nothing");
+    assert_eq!(rig.left(), 0, "removed unread");
+}
+
+/// Catches a release directory on the host being taken as proof: a rollback to a release
+/// that is already installed is still handed to the fetcher, which verifies the directory
+/// (or says it is unverified) instead of the cycle trusting that it is there.
+///
+/// Mutant planted: the fetch skipped when the directory exists (the fetcher is not called).
+#[test]
+fn an_installed_release_is_still_handed_to_the_fetcher() {
+    let mut rig = Rig::new("installed");
+    rig.install(B);
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.fetcher.count(), 1);
+    assert_eq!(rig.current(), Some(c(B)));
+    // A fetcher that finds the directory unverified refuses, and nothing moves.
+    let mut other = Rig::new("installed-unverified");
+    other.install(B);
+    *other.fetcher.fail.lock().expect("lock") = Some(FetchError::Rejected(
+        "unverified: rollback refused".to_owned(),
+    ));
+    other.order(5, Verb::Activate, B);
+    other.cycle(T0);
+    assert_eq!(other.current(), Some(c(A)));
     assert!(
-        !rig.orders().join(format!("{:020}.json", 5)).exists(),
-        "removed unread"
+        other.refusal().contains("unverified"),
+        "{}",
+        other.refusal()
     );
 }
 
-/// Catches a confirm that does not keep the swap, and one that names the wrong swap: the
-/// confirm order carries the commit, the helper finds the activation's own id.
+/// Catches a failed fetch changing the host: the source is unreachable, so `current` is
+/// where it was, no link moved, nothing restarted, no swap is pending; the node is told
+/// REFUSED with the fetch's reason, the order is spent (a person re-issues it, with a new
+/// id) and the next order still runs.
 ///
-/// Mutant seen red: the confirm passing the confirm order's id instead of the pending
-/// swap's (NotPending-style refusal).
+/// Mutants planted: the restart owed before the fetch (a restart with nothing swapped);
+/// the error swallowed (the swap goes ahead with no release).
+#[test]
+fn a_failed_fetch_leaves_current_alone_and_reports_refused() {
+    let mut rig = Rig::new("fetch-fails");
+    *rig.fetcher.fail.lock().expect("lock") =
+        Some(FetchError::Unavailable("source unreachable".to_owned()));
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(A)));
+    assert_eq!(link(&rig, "current"), PathBuf::from(A));
+    assert_eq!(rig.restarts(), 0);
+    assert_eq!(rig.state().pending_confirm, None);
+    assert_eq!(rig.status()["state"], "refused");
+    assert!(
+        rig.refusal().contains("source unreachable"),
+        "{}",
+        rig.refusal()
+    );
+    assert_eq!(rig.status()["acked_order_id"], 5);
+    assert_eq!(rig.left(), 0);
+    // A fresh order (the person re-issues it) fetches again and goes through.
+    rig.order(6, Verb::Activate, B);
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.current(), Some(c(B)));
+    assert_eq!(rig.fetcher.count(), 2);
+}
+
+/// Catches a fetched release that is not the one ordered being swapped in: a fetcher whose
+/// installed binary declares another protocol, another profile or another commit than the
+/// order expected is refused before any link moves.
+///
+/// Mutants planted: the comparison dropped; only the protocol compared.
+#[test]
+fn a_fetched_release_that_declares_other_facts_is_refused_before_the_flip() {
+    let cases: [(&str, crate::helper::fetcher::fake::Tamper); 4] = [
+        ("protocol", |r| r.protocol = 8),
+        ("profile", |r| r.profile = "debug".to_owned()),
+        ("state schema", |r| r.state_schema = 9),
+        ("commit", |r| r.commit = c(C)),
+    ];
+    for (what, change) in cases {
+        let mut rig = Rig::new(&format!("facts-{}", what.replace(' ', "-")));
+        *rig.fetcher.tamper.lock().expect("lock") = Some(change);
+        rig.order(5, Verb::Activate, B);
+        rig.cycle(T0);
+        assert_eq!(rig.current(), Some(c(A)), "{what}");
+        assert_eq!(rig.restarts(), 0, "{what}");
+        assert_eq!(rig.status()["state"], "refused", "{what}");
+        assert!(
+            rig.refusal().contains("not the one ordered"),
+            "{what}: {}",
+            rig.refusal()
+        );
+    }
+}
+
+/// Catches the checks before the fetch being skipped: an activation while a trial is
+/// pending, while a lease is live (read from the installer's own source), while the lease
+/// source cannot answer is not even fetched. The one pending trial is another order's, so a
+/// second timer is never started.
+///
+/// Mutants planted: the pending check dropped (the second activation reaches the installer's
+/// own refusal after a wasted fetch); the live count compared with `> 1`.
+#[test]
+fn an_activation_is_refused_before_the_fetch_during_a_trial_or_with_leases_live() {
+    let mut rig = Rig::new("pending");
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.fetcher.count(), 1);
+    // B is on trial, unconfirmed. Another activation, of a third release.
+    rig.put(&rig.rec(6, 1, 2, Verb::Activate, C));
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.fetcher.count(), 1, "nothing fetched");
+    assert_eq!(rig.current(), Some(c(B)));
+    assert!(rig.refusal().contains("on trial"), "{}", rig.refusal());
+    assert_eq!(rig.restarts(), 1);
+
+    let mut rig = Rig::new("leases");
+    rig.leases.set(1);
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.fetcher.count(), 0);
+    assert_eq!(rig.current(), Some(c(A)));
+    assert!(
+        rig.refusal().contains("1 leases are live"),
+        "{}",
+        rig.refusal()
+    );
+    // A confirm or revert takes no lease check.
+    rig.leases.set(4);
+    rig.order(6, Verb::Revert, A);
+    rig.cycle(T0 + 3);
+    assert!(!rig.refusal().contains("leases"), "{}", rig.refusal());
+}
+
+/// Catches an unreadable lease source being read as "none": the installer refuses, and
+/// fetches nothing.
+///
+/// Mutant planted: the error arm treated as zero leases (the activation goes through).
+#[test]
+fn a_lease_source_that_cannot_answer_refuses_the_activation() {
+    let mut rig = Rig::new("leases-unknown");
+    rig.leases.set(usize::MAX);
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.fetcher.count(), 0);
+    assert_eq!(rig.current(), Some(c(A)));
+    assert!(rig.refusal().contains("cannot tell"), "{}", rig.refusal());
+}
+
+/// Catches a confirm that does not keep the swap, one that names the wrong swap, and a
+/// revert that does not go back and restart: the confirm record carries the commit, the
+/// helper finds the activation's own id.
+///
+/// Mutant planted: the confirm passing the confirm order's id instead of the pending swap's.
 #[test]
 fn a_confirm_order_keeps_the_swap_and_a_revert_order_goes_back() {
     let mut rig = Rig::new("confirm");
-    rig.put_offer(1, B);
-    let mut stager = stage_b(rig.layout.clone());
-    rig.helper.cycle(T0, &mut stager).expect("stage");
-    rig.put_order(5, &order_json(5, "activate", B));
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    rig.first_start(B, T0 + 1);
+    rig.order(6, Verb::Confirm, B);
     rig.cycle(T0 + 3);
-    rig.put_order(6, &order_json(6, "confirm", B));
-    rig.cycle(T0 + 6);
     assert_eq!(rig.state().pending_confirm, None);
     assert_eq!(rig.status()["state"], "confirmed");
     assert_eq!(rig.restarts(), 1);
 
-    rig.put_order(7, &order_json(7, "revert", A));
-    rig.cycle(T0 + 9);
+    rig.order(7, Verb::Revert, A);
+    rig.cycle(T0 + 6);
     assert_eq!(rig.state().current, Some(c(A)));
     assert_eq!(rig.restarts(), 2, "a revert restarts the unit");
     assert_eq!(rig.status()["state"], "reverted");
@@ -283,14 +461,11 @@ fn a_confirm_order_keeps_the_swap_and_a_revert_order_goes_back() {
 /// Catches a swap left on trial forever: the Linux boot check starts the window at the
 /// first start; the pass after the window reverts and restarts the unit.
 ///
-/// Mutant seen red: `expire` not called in the pass.
+/// Mutant planted: `expire` not called in the pass.
 #[test]
 fn a_swap_not_confirmed_in_its_window_is_reverted() {
     let mut rig = Rig::new("expire");
-    rig.put_offer(1, B);
-    let mut stager = stage_b(rig.layout.clone());
-    rig.helper.cycle(T0, &mut stager).expect("stage");
-    rig.put_order(5, &order_json(5, "activate", B));
+    rig.order(5, Verb::Activate, B);
     rig.cycle(T0 + 3);
     // The first start of B (the unit's ExecStartPre) starts the window.
     let layout = rig.layout.clone();
@@ -309,17 +484,13 @@ fn a_swap_not_confirmed_in_its_window_is_reverted() {
 /// Catches a restart lost on the way: when the restart fails, the owed restart stays in
 /// `helper.json` and the next pass retries, and the node is told why in the meantime.
 ///
-/// Mutant seen red: `restart_due` cleared before the restart is tried.
+/// Mutant planted: `restart_due` cleared before the restart is tried.
 #[test]
 fn a_failed_restart_is_owed_until_it_succeeds() {
     let mut rig = Rig::new("restart-owed");
-    rig.put_offer(1, B);
-    let mut stager = stage_b(rig.layout.clone());
-    rig.helper.cycle(T0, &mut stager).expect("stage");
-    // Fail the first restart only.
     let tries = std::rc::Rc::new(std::cell::Cell::new(0));
     let seen = tries.clone();
-    rig.helper_exec_mut().answer = Box::new(move |_| {
+    rig.helper.exec_mut().answer = Box::new(move |_| {
         seen.set(seen.get() + 1);
         if seen.get() == 1 {
             Ok(reply(1, "", "unit not found"))
@@ -327,66 +498,194 @@ fn a_failed_restart_is_owed_until_it_succeeds() {
             Ok(reply(0, "", ""))
         }
     });
-    rig.put_order(5, &order_json(5, "activate", B));
+    rig.order(5, Verb::Activate, B);
     rig.cycle(T0 + 3);
     assert_eq!(rig.status()["state"], "activated_unconfirmed");
-    assert!(
-        rig.status()["refusal"]
-            .as_str()
-            .expect("text")
-            .contains("restart failed")
-    );
+    assert!(rig.refusal().contains("restart failed"));
     rig.cycle(T0 + 6);
     assert_eq!(tries.get(), 2, "retried on the next pass, once");
     rig.cycle(T0 + 9);
     assert_eq!(tries.get(), 2, "and not again");
 }
 
-impl Rig {
-    fn helper_exec_mut(&mut self) -> &mut ScratchHost {
-        self.helper.exec_mut()
-    }
-}
-
-/// Catches a floor moved by garbage: a file that is not an order is refused, removed and
-/// does not acknowledge anything, so the real order after it (a lower id) still runs. A
-/// link in the orders directory is removed as a link; what it points at is untouched.
+/// Catches a floor moved by garbage, and a record trusted for what it is not. Each of these
+/// is refused, removed and acknowledges nothing, so the real order after it (a lower id)
+/// still runs: text that is not JSON; a record with a field the writer never makes; a file
+/// named for another order than it holds; a verb that is none of three; a commit that is not
+/// a commit; an activation with no release claims; one over the size cap; a directory. A link
+/// in the spool is refused as a link and removed as a link; what it points at is untouched.
 ///
-/// Mutants seen red: acknowledging an unparsable file's id (the real order is then
-/// ignored as old); removing through the link's target (the secret goes).
+/// Mutants planted: acknowledging an unparsable file's id (the real order is then ignored as
+/// old); removing through the link's target (the secret goes); `deny_unknown_fields` dropped
+/// (the extra field is accepted).
 #[test]
 fn a_file_that_is_not_an_order_moves_nothing() {
     let mut rig = Rig::new("garbage");
-    rig.put_offer(1, B);
-    let mut stager = stage_b(rig.layout.clone());
-    rig.helper.cycle(T0, &mut stager).expect("stage");
     let secret = rig.root.join("secret");
     fs::write(&secret, b"not yours").expect("secret");
-    rig.put_order(900, "not json");
-    symlink(&secret, rig.orders().join(format!("{:020}.json", 901))).expect("link");
-    rig.put_order(902, &order_json(903, "activate", B));
-    rig.put_order(903, &order_json(903, "reboot", B));
+    let good = rig.rec(1, 1, 1, Verb::Confirm, B);
+    let text = serde_json::to_string(&good).expect("json");
+    rig.put_raw(1, 900, b"not json");
+    rig.put_raw(1, 902, text.replace('}', ",\"path\":\"/etc\"}").as_bytes());
+    rig.put_raw(
+        1,
+        903,
+        text.replace("\"order_id\":1", "\"order_id\":9").as_bytes(),
+    );
+    rig.put_raw(1, 904, text.replace("confirm", "reboot").as_bytes());
+    rig.put_raw(1, 905, text.replace(B, "NOT-A-COMMIT").as_bytes());
+    let no_claims = serde_json::to_string(&rig.rec(1, 1, 1, Verb::Confirm, B))
+        .expect("json")
+        .replace("confirm", "activate");
+    rig.put_raw(1, 906, no_claims.as_bytes());
+    rig.put_raw(
+        1,
+        907,
+        &vec![b' '; (kbf_update::MAX_RECORD_BYTES + 1) as usize],
+    );
+    fs::create_dir(rig.orders().join(file_name(1, 908))).expect("dir");
+    symlink(&secret, rig.orders().join(file_name(1, 901))).expect("link");
     rig.cycle(T0 + 3);
     assert_eq!(rig.status()["state"], "refused");
     assert_eq!(rig.status()["acked_order_id"], 0);
     assert_eq!(fs::read(&secret).expect("kept"), b"not yours");
-    assert_eq!(
-        fs::read_dir(rig.orders()).expect("dir").count(),
-        0,
-        "all removed"
-    );
-    rig.put_order(5, &order_json(5, "activate", B));
+    // All gone but the directory, which cannot be unlinked as a file and is reported.
+    assert_eq!(rig.left(), 1);
+    assert!(rig.orders().join(file_name(1, 908)).is_dir());
+    rig.order(2, Verb::Activate, B);
+    fs::remove_dir(rig.orders().join(file_name(1, 908))).expect("clear");
     rig.cycle(T0 + 6);
     assert_eq!(rig.state().current, Some(c(B)));
     assert_eq!(rig.restarts(), 1);
 }
 
-/// Catches the node never reading the helper: what the helper writes is what `kbf-update`
-/// reads, in every state the helper reports.
+/// Catches a symlinked record being followed: the link is refused as a link with the
+/// secret behind it never read (the refusal says symlink, not a parse error of the secret's
+/// content), and the order it would have been is not acted on.
+///
+/// Mutant planted: `O_NOFOLLOW` dropped from the open (the secret is read; the reason is a
+/// parse error, not a symlink).
+#[test]
+fn a_symlinked_record_is_refused_as_a_link_and_not_read() {
+    let mut rig = Rig::new("symlink");
+    let target = rig.root.join("real-record.json");
+    fs::write(
+        &target,
+        serde_json::to_vec(&rig.rec(5, 1, 1, Verb::Activate, B)).expect("json"),
+    )
+    .expect("record");
+    symlink(&target, rig.orders().join(file_name(1, 5))).expect("link");
+    rig.cycle(T0);
+    assert_eq!(
+        rig.current(),
+        Some(c(A)),
+        "the link's order was not acted on"
+    );
+    assert_eq!(rig.status()["state"], "refused");
+    assert!(
+        rig.refusal().to_ascii_lowercase().contains("link"),
+        "{}",
+        rig.refusal()
+    );
+    assert!(target.exists(), "the target is untouched");
+    assert_eq!(rig.left(), 0, "the link itself is removed");
+}
+
+/// Catches an unbounded spool: 70 valid records are in it, only the first 64 (by epoch and
+/// id) are acted on and the rest are deleted unread with a reason, so a stuck or hostile
+/// writer cannot grow the directory or the work of a pass.
+///
+/// Mutants planted: the cap raised to 100 (the excess is acted on); the excess left on disk.
+#[test]
+fn the_spool_holds_at_most_64_records_and_the_excess_is_deleted() {
+    let mut rig = Rig::new("count-cap");
+    for id in 1..=70 {
+        rig.order(id, Verb::Confirm, A);
+    }
+    rig.cycle(T0);
+    assert_eq!(rig.left(), 0, "all taken or deleted");
+    assert_eq!(
+        rig.status()["acked_order_id"],
+        64,
+        "the 64th is the last acted on"
+    );
+    assert!(
+        rig.refusal().contains("more than 64 records"),
+        "{}",
+        rig.refusal()
+    );
+}
+
+/// Catches a stale record acted on after a long stop, and expiry measured by something the
+/// writer controls. A record is good for 1800 s from the moment root first saw it, kept in
+/// `helper.json`: one whose file time is ancient but which root saw a second ago is acted on;
+/// one root saw 1801 s ago and which is still there is deleted unread.
+///
+/// Mutants planted: expiry by the file's mtime (the ancient-mtime record is dropped and the
+/// stale one acted on); first-seen reset every pass (the stale record is acted on); the bound
+/// `>` made `>=` (the record exactly 1800 s old is dropped).
+#[test]
+fn a_record_expires_by_roots_first_seen_time_not_the_files() {
+    let mut rig = Rig::new("expiry");
+    rig.order(5, Verb::Activate, B);
+    // The writer sets the file's time far in the past.
+    let file = fs::File::options()
+        .write(true)
+        .open(rig.orders().join(file_name(1, 5)))
+        .expect("open");
+    file.set_modified(std::time::UNIX_EPOCH).expect("mtime");
+    drop(file);
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(B)), "root saw it just now: acted on");
+
+    // A record root first sees at T1 and is still in the spool 1801 s later (here: the
+    // installer was held, so it was seen but not taken) is expired.
+    let mut rig = Rig::new("expiry-stale");
+    rig.leases.set(0);
+    rig.put(&rig.rec(5, 1, 1, Verb::Activate, B));
+    let memory_path = rig.root.join("var/lib/kbf-installer/helper.json");
+    // Root has seen it at T0 - 1801 already (as a persisted first-seen time).
+    let mut memory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&memory_path).expect("memory")).expect("json");
+    memory["first_seen"] = serde_json::json!({ file_name(1, 5): T0 - 1801 });
+    fs::write(&memory_path, serde_json::to_vec(&memory).expect("json")).expect("seed");
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(A)), "expired: not acted on");
+    assert_eq!(rig.fetcher.count(), 0);
+    assert!(rig.refusal().contains("expired"), "{}", rig.refusal());
+    assert_eq!(rig.left(), 0, "and deleted");
+
+    // Exactly 1800 s is still good: a record expires when it is *more than* that old.
+    let mut rig = Rig::new("expiry-edge");
+    rig.put(&rig.rec(5, 1, 1, Verb::Activate, B));
+    let memory_path = rig.root.join("var/lib/kbf-installer/helper.json");
+    let mut memory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&memory_path).expect("memory")).expect("json");
+    memory["first_seen"] = serde_json::json!({ file_name(1, 5): T0 - 1800 });
+    fs::write(&memory_path, serde_json::to_vec(&memory).expect("json")).expect("seed");
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(B)), "1800 s old is not expired");
+}
+
+/// Catches an activation for another platform than this host's: the record claims a macOS
+/// release on a Linux host, so nothing is fetched.
+#[test]
+fn an_order_for_another_platform_is_refused_before_the_fetch() {
+    let mut rig = Rig::new("platform");
+    let mut r = rig.rec(1, 1, 1, Verb::Activate, B);
+    r.expected.as_mut().expect("facts").platform = "darwin-arm64".to_owned();
+    rig.put(&r);
+    rig.cycle(T0);
+    assert_eq!(rig.fetcher.count(), 0);
+    assert!(rig.refusal().contains("platform"), "{}", rig.refusal());
+}
+
+/// Catches a status.json the node cannot read in a state the helper reports: what the helper
+/// writes is what `kbf-update` reads, with the facts of the fetched release.
 #[test]
 fn status_json_is_read_by_the_node_client() {
     let mut rig = Rig::new("status-contract");
-    let status = rig.root.join("var/lib/kbf-updater/status.json");
+    let status = rig.root.join(UPDATE).join("status.json");
     let read = || kbf_update::helper::read(&status);
     rig.cycle(T0);
     let kbf_update::helper::Helper::Reported(idle) = read() else {
@@ -394,16 +693,7 @@ fn status_json_is_read_by_the_node_client() {
     };
     assert_eq!(idle.state, kbf_update::helper::HelperState::Idle);
     assert_eq!(idle.installed.as_deref(), Some(A));
-    rig.put_offer(1, B);
-    let mut stager = stage_b(rig.layout.clone());
-    rig.helper.cycle(T0 + 3, &mut stager).expect("stage");
-    let kbf_update::helper::Helper::Reported(staged) = read() else {
-        panic!("reported")
-    };
-    assert_eq!(staged.state, kbf_update::helper::HelperState::Staged);
-    assert_eq!(staged.staged.as_deref(), Some(B));
-    assert_eq!(staged.staged_facts.expect("facts").protocol, 7);
-    rig.put_order(5, &order_json(5, "activate", B));
+    rig.order(5, Verb::Activate, B);
     rig.cycle(T0 + 6);
     let kbf_update::helper::Helper::Reported(on_trial) = read() else {
         panic!("reported")
@@ -413,14 +703,67 @@ fn status_json_is_read_by_the_node_client() {
         kbf_update::helper::HelperState::ActivatedUnconfirmed
     );
     assert_eq!(on_trial.acked_order_id, 5);
+    assert_eq!(on_trial.staged_facts.expect("facts").protocol, 7);
     assert!(on_trial.holds(B) && on_trial.holds(A));
 }
 
+/// Catches what the writer makes and the reader refuses disagreeing: the record
+/// `kbf-update` builds from an order and an offer is read by this side as the same order,
+/// claims and all.
+#[test]
+fn the_record_kbf_update_writes_is_the_order_this_side_reads() {
+    use crate::helper::order::{self, Verb as OrderVerb};
+    let offer = kbf_update_offer();
+    let order_in = kbf_update::Order {
+        order_id: 5,
+        epoch: 2,
+        generation: 9,
+        verb: Some(Verb::Activate),
+        commit: B.to_owned(),
+        window_s: 600,
+    };
+    let r = OrderRecord::for_order(&order_in, Verb::Activate, Some(&offer)).expect("record");
+    let bytes = r.to_bytes().expect("bytes");
+    let (epoch, id) = order::key_of(&r.file_name()).expect("name");
+    let read = order::parse(epoch, id, &bytes).expect("read");
+    assert_eq!((read.id, read.epoch, read.generation), (5, 2, 9));
+    assert_eq!(read.verb, OrderVerb::Activate);
+    assert_eq!(read.commit, c(B));
+    let claims = read.claims.expect("claims");
+    assert_eq!(
+        (claims.protocol, claims.min_protocol, claims.state_schema),
+        (7, 6, 3)
+    );
+    assert_eq!(claims.components[0].sha256, "ab".repeat(32));
+    // The name must be the pair inside.
+    assert!(order::parse(2, 6, &bytes).is_err());
+    assert!(order::parse(3, 5, &bytes).is_err());
+}
+
+fn kbf_update_offer() -> kbf_update::Offer {
+    kbf_update::Offer {
+        generation: 9,
+        commit: B.to_owned(),
+        platform: "linux-x86_64".to_owned(),
+        components: vec![kbf_update::Component {
+            name: "kbf".to_owned(),
+            sha256: "ab".repeat(32),
+            size: 1000,
+            attestation: b"{\"bundle\":1}".to_vec(),
+        }],
+        expected: kbf_update::Expected {
+            protocol: 7,
+            min_protocol: 6,
+            state_schema: 3,
+            profile: "release".to_owned(),
+        },
+    }
+}
+
 /// Catches a restart that runs the wrong program or the wrong unit: argv is fixed by the
-/// helper's own flag, an absolute program, and nothing else (a unit name with a space or
-/// an option-looking prefix stays one argument).
+/// helper's own flag, an absolute program, and nothing else.
 ///
-/// Mutant seen red: the step returned as `None` (also `a_failed_restart_is_owed...`).
+/// Mutant planted: the step returned as `None`.
 #[test]
 fn the_restart_is_one_fixed_command() {
     let program = |r: Restart| match r.step() {
@@ -452,20 +795,16 @@ fn the_restart_is_one_fixed_command() {
 }
 
 /// Catches a confirm window the order chooses: on macOS the window starts at the swap and
-/// the helper clamps the order's `window_s` to its own 120..=1800 seconds, so neither a
-/// tiny window (reverts a healthy update) nor a year (never reverts a bad one) gets
-/// through.
+/// the helper clamps the order's `window_s` to its own 120..=1800 seconds.
 ///
-/// Mutants seen red: the clamp dropped; the bounds swapped.
+/// Mutants planted: the clamp dropped; the bounds swapped.
 #[test]
 fn the_window_an_order_asks_for_is_clamped_on_macos() {
-    for (asked, kept) in [(5, 120), (600, 600), (99_999, 1800)] {
+    for (asked, kept) in [(5_u32, 120_u64), (600, 600), (99_999, 1800)] {
         let mut rig = Rig::on(&format!("window-{asked}"), Platform::MacOs);
-        rig.put_offer(1, B);
-        let mut stager = stage_b(rig.layout.clone());
-        rig.helper.cycle(T0, &mut stager).expect("stage");
-        let body = order_json(5, "activate", B).replace("600", &asked.to_string());
-        rig.put_order(5, &body);
+        let mut r = rig.rec(5, 1, 1, Verb::Activate, B);
+        r.window_s = asked;
+        rig.put(&r);
         rig.cycle(T0 + 3);
         let pending = rig.state().pending_confirm.expect("on trial");
         assert_eq!(pending.deadline_wall, Some(T0 + 3 + kept), "asked {asked}");
@@ -473,18 +812,15 @@ fn the_window_an_order_asks_for_is_clamped_on_macos() {
 }
 
 /// Catches orders taken in the order the directory lists them: three orders in one pass
-/// (activate, confirm, revert) end on the old release only if run by id.
+/// (activate, confirm, revert) end on the old release only if run by (epoch, id).
 ///
-/// Mutant seen red: the sort dropped (with the files made in reverse id order).
+/// Mutant planted: the sort dropped (with the files made in reverse id order).
 #[test]
 fn orders_are_acted_on_in_id_order() {
     let mut rig = Rig::new("order-sort");
-    rig.put_offer(1, B);
-    let mut stager = stage_b(rig.layout.clone());
-    rig.helper.cycle(T0, &mut stager).expect("stage");
-    rig.put_order(7, &order_json(7, "revert", A));
-    rig.put_order(6, &order_json(6, "confirm", B));
-    rig.put_order(5, &order_json(5, "activate", B));
+    rig.order(7, Verb::Revert, A);
+    rig.order(6, Verb::Confirm, B);
+    rig.order(5, Verb::Activate, B);
     rig.cycle(T0 + 3);
     assert_eq!(rig.state().current, Some(c(A)));
     assert_eq!(rig.status()["acked_order_id"], 7);
@@ -495,54 +831,42 @@ fn orders_are_acted_on_in_id_order() {
     );
 }
 
-fn order_in_epoch(id: u64, epoch: u64, verb: &str, commit: &str) -> String {
-    order_json(id, verb, commit).replace("\"epoch\":1", &format!("\"epoch\":{epoch}"))
-}
-
-/// Catches an order refused for how far its id is from this host's last: ids come from one
-/// counter in the frontend's store, so a host that was not ordered for a long while sees a
-/// big gap. A gap of two million in the same epoch is acted on; an order from an older
-/// epoch is refused whatever its id (a restored store cannot replay old orders); an order
-/// from a newer epoch is acted on even with a lower id (the restored store counts again).
+/// Catches a stale order acted on, or refused for the wrong reason. Orders are ordered by
+/// (epoch, then id): a gap of two million ids in one epoch is acted on; an order of an older
+/// epoch is refused whatever its id; the same pair again, and a lower id of the same epoch,
+/// are replays dropped without a word (they move nothing); a newer epoch's lower id is
+/// acted on (the restored store counts again).
 ///
-/// Mutants seen red: a jump cap on the id (the gap is refused); the epoch ignored (the
-/// stale order runs, the newer epoch's lower id is dropped as a replay).
+/// Mutants planted: a jump cap on the id (the gap is refused); the epoch ignored (the stale
+/// order runs, the newer epoch's lower id is dropped as a replay).
 #[test]
 fn orders_are_ordered_by_epoch_then_id_and_a_gap_is_no_reason_to_refuse() {
     let mut rig = Rig::new("order-epoch");
-    rig.put_offer(1, B);
-    let mut stager = stage_b(rig.layout.clone());
-    rig.helper.cycle(T0, &mut stager).expect("stage");
     let big = 2_000_000;
-    rig.put_order(big, &order_in_epoch(big, 7, "activate", B));
+    rig.put(&rig.rec(big, 7, 1, Verb::Activate, B));
     rig.cycle(T0 + 3);
     assert_eq!(
-        rig.state().current,
+        rig.current(),
         Some(c(B)),
         "a gap of two million is acted on"
     );
     assert_eq!(rig.status()["acked_order_id"], big);
     // An older epoch with a higher id: refused, nothing moves.
-    rig.put_order(big + 5, &order_in_epoch(big + 5, 6, "revert", A));
+    rig.put(&rig.rec(big + 5, 6, 1, Verb::Revert, A));
     rig.cycle(T0 + 6);
-    assert_eq!(rig.state().current, Some(c(B)));
-    // The swap is still on trial, which outranks the refusal in the word; the reason shows.
+    assert_eq!(rig.current(), Some(c(B)));
     assert_eq!(rig.status()["state"], "activated_unconfirmed");
-    assert!(
-        rig.status()["refusal"]
-            .as_str()
-            .expect("text")
-            .contains("epoch")
-    );
+    assert!(rig.refusal().contains("epoch"));
     assert_eq!(rig.status()["acked_order_id"], big);
-    // The same epoch and the same id again: a replay, dropped without a word.
-    rig.put_order(big, &order_in_epoch(big, 7, "revert", A));
+    // The same epoch and the same id again, and a lower id: replays, dropped.
+    rig.put(&rig.rec(big, 7, 1, Verb::Revert, A));
+    rig.put(&rig.rec(big - 1, 7, 1, Verb::Revert, A));
     rig.cycle(T0 + 9);
-    assert_eq!(rig.state().current, Some(c(B)));
+    assert_eq!(rig.current(), Some(c(B)));
     // A newer epoch counts from its own start: a lower id is acted on.
-    rig.put_order(3, &order_in_epoch(3, 8, "revert", A));
+    rig.put(&rig.rec(3, 8, 1, Verb::Revert, A));
     rig.cycle(T0 + 12);
-    assert_eq!(rig.state().current, Some(c(A)));
+    assert_eq!(rig.current(), Some(c(A)));
     assert_eq!(rig.status()["acked_order_id"], 3);
 }
 
@@ -550,7 +874,7 @@ fn orders_are_ordered_by_epoch_then_id_and_a_gap_is_no_reason_to_refuse() {
 /// it as that user). The modes are set by the write itself, not by the umask of whoever
 /// runs the helper.
 ///
-/// Mutant seen red: either mode swapped.
+/// Mutant planted: either mode swapped.
 #[test]
 fn the_helpers_files_have_their_modes() {
     use std::os::unix::fs::PermissionsExt;
@@ -563,16 +887,15 @@ fn the_helpers_files_have_their_modes() {
             & 0o777
     };
     assert_eq!(mode("var/lib/kbf-installer/helper.json"), 0o600);
-    assert_eq!(mode("var/lib/kbf-updater/status.json"), 0o644);
+    assert_eq!(mode(&format!("{UPDATE}/status.json")), 0o644);
 }
 
-/// Catches staged facts shown for a release that is not the staged one (an old fact kept
-/// after the staged slot was cleared or replaced): only the release the state says is
-/// staged brings its protocol numbers.
+/// Catches fetched facts shown for a release that is neither current nor staged (an old
+/// fact kept after another release took over): only those bring their protocol numbers.
 ///
-/// Mutant seen red: the filter dropped.
+/// Mutant planted: the filter dropped.
 #[test]
-fn staged_facts_are_shown_only_for_the_staged_release() {
+fn fetched_facts_are_shown_only_for_the_current_or_staged_release() {
     use crate::helper::memory::{Memory, StagedFacts};
     let memory = Memory {
         staged: Some(StagedFacts {
@@ -583,9 +906,9 @@ fn staged_facts_are_shown_only_for_the_staged_release() {
         }),
         ..Memory::default()
     };
-    let render = |staged: Option<&str>| {
+    let render = |current: &str, staged: Option<&str>| {
         let state = State {
-            current: Some(c(A)),
+            current: Some(c(current)),
             staged: staged.map(c),
             ..State::default()
         };
@@ -593,148 +916,40 @@ fn staged_facts_are_shown_only_for_the_staged_release() {
             serde_json::from_slice(&crate::helper::status::render(&state, &memory)).expect("json");
         json
     };
-    assert_eq!(render(Some(B))["staged"]["protocol"], 7);
-    assert!(render(None)["staged"].is_null());
-    assert!(render(Some(A))["staged"].is_null());
+    assert_eq!(render(A, Some(B))["staged"]["protocol"], 7);
+    assert_eq!(render(B, None)["staged"]["protocol"], 7);
+    assert!(render(A, None)["staged"].is_null());
+    assert!(render(A, Some(A))["staged"].is_null());
 }
 
-/// Catches an order file accepted in a shape the client never writes: an extra field, a
-/// missing one, a name that is not twenty digits and `.json` (a shorter or longer number,
-/// a letter, another suffix), or an id the file's name does not carry.
-///
-/// Mutants seen red: `deny_unknown_fields` dropped; the 20-digit length check dropped.
+/// Catches a helper that dies on a spool it cannot make sense of: no spool, an empty one,
+/// names that are not records (the client's state file, a half-written `.partial-` file).
+/// Each is quietly skipped and left.
 #[test]
-fn only_the_clients_shape_of_order_is_read() {
-    use crate::helper::order::{id_of, parse};
-    let ok = order_json(5, "activate", B);
-    assert!(parse(5, ok.as_bytes()).is_ok());
-    let extra = ok.replace('}', ",\"path\":\"/etc\"}");
-    assert!(parse(5, extra.as_bytes()).is_err());
-    assert!(
-        parse(
-            5,
-            br#"{"order_id":5,"epoch":1,"verb":"activate","commit":"x"}"#
-        )
-        .is_err()
-    );
-    // Every field there, and the commit not a commit: its own refusal.
-    let bad_commit = ok.replace(B, "NOT-A-COMMIT");
-    assert_eq!(
-        parse(5, bad_commit.as_bytes()),
-        Err(crate::helper::order::OrderFault::BadCommit(
-            "NOT-A-COMMIT".to_owned()
-        ))
-    );
-    // And a verb that is none of the three.
-    let bad_verb = ok.replace("activate", "reboot");
-    assert!(matches!(
-        parse(5, bad_verb.as_bytes()),
-        Err(crate::helper::order::OrderFault::UnknownVerb(v)) if v == "reboot"
-    ));
-    assert!(parse(6, ok.as_bytes()).is_err(), "named for another id");
-    assert_eq!(id_of("00000000000000000005.json"), Some(5));
-    for bad in [
-        "5.json",
-        "000000000000000000005.json",
-        "0000000000000000005.json",
-        "0000000000000000000a.json",
-        "00000000000000000005.txt",
-        "00000000000000000005",
-        "99999999999999999999.json",
-    ] {
-        assert_eq!(id_of(bad), None, "{bad}");
-    }
-}
-
-/// A stager that must not run.
-fn no_stage() -> impl FnMut(&mut ScratchHost, &std::path::Path) -> Result<Staged, Refusal> {
-    |_, _| panic!("nothing is to be staged")
-}
-
-fn inbox_of(rig: &Rig) -> PathBuf {
-    rig.root.join("var/lib/kbf-updater/inbox")
-}
-
-/// Catches a helper that dies, or acts, on an inbox it cannot make sense of: no inbox, an
-/// inbox without orders, an inbox the service user stuffed with entries (more than the
-/// installer reads), an entry for the release already running, an entry whose name is
-/// not `<generation>-<commit>`. Each is quietly skipped or refused with a reason; none is
-/// staged.
-///
-/// Mutants seen red: the entry-count refusal turned into a panic; the already-running
-/// entry staged.
-#[test]
-fn an_inbox_that_is_missing_stuffed_or_for_the_running_release_stages_nothing() {
-    let mut rig = Rig::new("odd-inbox");
-    let inbox = inbox_of(&rig);
-    // An entry for the running release, and names that are not offers.
-    fs::create_dir(inbox.join(format!("{:020}-{A}", 3))).expect("entry");
-    fs::create_dir(inbox.join(format!("short-{B}"))).expect("entry");
-    rig.helper.cycle(T0, &mut no_stage()).expect("pass");
-    assert_eq!(rig.status()["state"], "idle");
-    // More entries than the installer reads.
-    for n in 0..20 {
-        fs::create_dir(inbox.join(format!("junk{n}"))).expect("entry");
-    }
-    rig.helper.cycle(T0 + 3, &mut no_stage()).expect("pass");
-    assert_eq!(rig.status()["state"], "refused");
-    assert!(
-        rig.status()["refusal"]
-            .as_str()
-            .expect("text")
-            .contains("inbox")
-    );
-    // No orders directory, then no inbox at all.
-    fs::remove_dir_all(inbox.join("orders")).expect("remove");
-    rig.helper.cycle(T0 + 6, &mut no_stage()).expect("pass");
-    fs::remove_dir_all(&inbox).expect("remove");
-    rig.helper.cycle(T0 + 9, &mut no_stage()).expect("pass");
-}
-
-/// Catches the same for orders: a directory stuffed past the installer's file limit is
-/// refused as a whole (and says so), and an order file that is a directory is neither
-/// read nor removed through, and is reported.
-#[test]
-fn an_orders_directory_that_is_stuffed_or_holds_a_directory_is_refused() {
-    let mut rig = Rig::new("odd-orders");
-    fs::create_dir(rig.orders().join(format!("{:020}.json", 904))).expect("dir");
+fn a_missing_spool_and_names_that_are_not_records_are_skipped() {
+    let mut rig = Rig::new("odd-spool");
+    fs::write(rig.orders().join("client.json"), b"{}").expect("state");
+    fs::write(rig.orders().join(".partial-abc.json"), b"{").expect("partial");
     rig.cycle(T0);
-    assert_eq!(rig.status()["state"], "refused");
-    assert!(
-        rig.orders().join(format!("{:020}.json", 904)).is_dir(),
-        "left alone"
-    );
-    for n in 0..20 {
-        fs::write(rig.orders().join(format!("{:020}.json", 100 + n)), "x").expect("file");
-    }
+    assert_eq!(rig.status()["state"], "idle");
+    assert_eq!(rig.left(), 2, "left alone");
+    fs::remove_dir_all(rig.orders()).expect("remove");
     rig.cycle(T0 + 3);
-    assert_eq!(rig.status()["state"], "refused");
-    assert!(
-        rig.status()["refusal"]
-            .as_str()
-            .expect("text")
-            .contains("inbox")
-    );
 }
 
 /// Catches the helper's own files being wrong ending the run in silence or in a guess:
-/// a state.json that cannot be read is a refusal the node can read (at start), a
-/// helper.json that cannot be read stops the pass with an error.
+/// a state.json that cannot be read stops the pass with an error, a helper.json that cannot
+/// be read or parsed stops the pass too.
 #[test]
 fn unreadable_state_is_reported_and_unreadable_memory_stops_the_pass() {
     let mut rig = Rig::new("unreadable");
-    // Links already as the state says: nothing moved, nothing owed.
     rig.helper.recover().expect("recovers");
     fs::write(
         rig.root.join("var/lib/kbf-installer/state.json"),
         b"not json",
     )
     .expect("ruin");
-    // A pass over a state it cannot read stops with the error (it acts on nothing).
-    let error = rig
-        .helper
-        .cycle(T0, &mut no_stage())
-        .expect_err("cannot read the state");
+    let error = rig.helper.cycle(T0).expect_err("cannot read the state");
     assert!(error.to_string().contains("host state"), "{error}");
     rig.helper.recover().expect("recovers into a refusal");
     let memory =
@@ -742,38 +957,25 @@ fn unreadable_state_is_reported_and_unreadable_memory_stops_the_pass() {
     assert!(memory.contains("refused"), "{memory}");
     let path = rig.root.join("var/lib/kbf-installer/helper.json");
     fs::write(&path, b"not json").expect("ruin");
-    let error = rig
-        .helper
-        .cycle(T0, &mut no_stage())
-        .expect_err("cannot parse it");
+    let error = rig.helper.cycle(T0).expect_err("cannot parse it");
     assert!(error.to_string().contains("helper.json"), "{error}");
     fs::remove_file(&path).expect("remove");
     fs::create_dir(&path).expect("a directory where the file belongs");
-    let error = rig
-        .helper
-        .cycle(T0, &mut no_stage())
-        .expect_err("cannot read it");
-    assert!(
-        error.to_string().contains("Is a directory") || error.to_string().contains("directory"),
-        "{error}"
-    );
+    let error = rig.helper.cycle(T0).expect_err("cannot read it");
+    assert!(error.to_string().contains("directory"), "{error}");
 }
 
-/// Catches orders that claim more than they can: an activate of the release already
-/// running changes nothing and restarts nothing; one for a release that is not installed
-/// is refused; a confirm with nothing on trial is refused.
+/// Catches orders that claim more than they can: an activate of the release already running
+/// changes nothing and restarts nothing; a confirm with nothing on trial is refused.
 #[test]
 fn orders_the_host_cannot_carry_out_are_refused_and_change_nothing() {
     let mut rig = Rig::new("cannot");
-    rig.put_order(5, &order_json(5, "activate", A));
+    rig.order(5, Verb::Activate, A);
     rig.cycle(T0);
     assert_eq!(rig.restarts(), 0);
+    assert_eq!(rig.fetcher.count(), 0, "it is the running one");
     assert_eq!(rig.status()["acked_order_id"], 5);
-    rig.put_order(6, &order_json(6, "activate", B));
-    rig.cycle(T0 + 3);
-    assert_eq!(rig.status()["state"], "refused");
-    assert_eq!(rig.state().current, Some(c(A)));
-    rig.put_order(7, &order_json(7, "confirm", B));
+    rig.order(7, Verb::Confirm, B);
     rig.cycle(T0 + 6);
     assert_eq!(rig.status()["state"], "refused");
     assert_eq!(rig.restarts(), 0);
@@ -785,10 +987,7 @@ fn orders_the_host_cannot_carry_out_are_refused_and_change_nothing() {
 #[test]
 fn an_expiry_that_cannot_revert_is_reported() {
     let mut rig = Rig::new("expire-fails");
-    rig.put_offer(1, B);
-    let mut stager = stage_b(rig.layout.clone());
-    rig.helper.cycle(T0, &mut stager).expect("stage");
-    rig.put_order(5, &order_json(5, "activate", B));
+    rig.order(5, Verb::Activate, B);
     rig.cycle(T0 + 3);
     let layout = rig.layout.clone();
     activate::boot_check(
@@ -810,82 +1009,66 @@ fn an_expiry_that_cannot_revert_is_reported() {
     rig.cycle(T0 + 10 + 601);
     assert_eq!(rig.state().current, Some(c(B)));
     assert_eq!(rig.status()["state"], "activated_unconfirmed");
-    assert!(!rig.status()["refusal"].as_str().expect("text").is_empty());
+    assert!(!rig.refusal().is_empty());
     assert_eq!(rig.restarts(), before);
 }
 
-/// Catches an epoch that wedges the helper: epochs move only when a store is restored, so
-/// an order more than a thousand epochs above the last acted on is refused with a reason in
-/// status.json and NOT acknowledged, and the next real order (epoch 8) still runs. The first
-/// order a host acts on is measured from nothing and is taken at any epoch.
+/// Catches an epoch that wedges the helper: an order more than a thousand epochs above the
+/// last acted on is refused with a reason in status.json and NOT acknowledged, and the next
+/// real order still runs. The first order a host acts on is measured from nothing.
 ///
-/// Mutants seen red: the check dropped (the huge epoch is acknowledged and epoch 8 is then
-/// refused as older); the first-order exemption dropped (a host whose store is at epoch
-/// 5000 never takes an order).
+/// Mutants planted: the check dropped; the first-order exemption dropped.
 #[test]
 fn an_epoch_far_above_the_last_is_refused_without_moving_the_floor() {
     let mut rig = Rig::new("epoch-jump");
-    rig.put_offer(1, B);
-    let mut stager = stage_b(rig.layout.clone());
-    rig.helper.cycle(T0, &mut stager).expect("stage");
-    // The first order, at an epoch of 5000: taken.
-    rig.put_order(1, &order_in_epoch(1, 5000, "activate", B));
+    rig.put(&rig.rec(1, 5000, 1, Verb::Activate, B));
     rig.cycle(T0 + 3);
-    assert_eq!(rig.state().current, Some(c(B)));
+    assert_eq!(rig.current(), Some(c(B)));
     assert_eq!(rig.status()["acked_order_id"], 1);
-    // Far above: refused, said so, not acknowledged.
-    rig.put_order(
+    rig.put(&rig.rec(
         2,
-        &order_in_epoch(
-            2,
-            5000 + crate::helper::order::MAX_EPOCH_JUMP + 1,
-            "revert",
-            A,
-        ),
-    );
+        5000 + crate::helper::order::MAX_EPOCH_JUMP + 1,
+        1,
+        Verb::Revert,
+        A,
+    ));
     rig.cycle(T0 + 6);
-    assert_eq!(rig.state().current, Some(c(B)));
-    let refusal = rig.status()["refusal"].as_str().expect("text").to_owned();
+    assert_eq!(rig.current(), Some(c(B)));
+    let refusal = rig.refusal();
     assert!(
         refusal.contains("more than") && refusal.contains("epoch"),
         "{refusal}"
     );
     assert_eq!(rig.status()["acked_order_id"], 1);
-    // Exactly at the limit, and a real next epoch, are taken.
-    rig.put_order(
+    rig.put(&rig.rec(
         3,
-        &order_in_epoch(3, 5000 + crate::helper::order::MAX_EPOCH_JUMP, "revert", A),
-    );
+        5000 + crate::helper::order::MAX_EPOCH_JUMP,
+        1,
+        Verb::Revert,
+        A,
+    ));
     rig.cycle(T0 + 9);
-    assert_eq!(rig.state().current, Some(c(A)));
+    assert_eq!(rig.current(), Some(c(A)));
     assert_eq!(rig.status()["acked_order_id"], 3);
 }
 
 /// Catches an activation named by its id alone: the same commit ordered under the same id
-/// in two epochs (a restored store counts again) must be two different activations. With a
-/// swap of the first still on trial, the second is refused as another order's swap pending
-/// and restarts nothing; named by the id alone it would pass for the first's repeat.
+/// in two epochs must be two different activations. With a swap of the first still on trial,
+/// the second is refused (a trial is pending) and restarts nothing.
 ///
-/// Mutant seen red: `order_id: order.id.to_string()` (no refusal; the repeat restarts again).
+/// Mutant planted: `order_id: order.id.to_string()` (the second passes for the first's repeat).
 #[test]
 fn the_same_id_in_two_epochs_is_two_activations() {
     let mut rig = Rig::new("same-id");
-    rig.put_offer(1, B);
-    let mut stager = stage_b(rig.layout.clone());
-    rig.helper.cycle(T0, &mut stager).expect("stage");
-    rig.put_order(5, &order_in_epoch(5, 7, "activate", B));
+    rig.put(&rig.rec(5, 7, 1, Verb::Activate, B));
     rig.cycle(T0 + 3);
     assert_eq!(rig.restarts(), 1);
     let pending = rig.state().pending_confirm.expect("on trial");
     assert_eq!(pending.activation, "7-5");
-    rig.put_order(5, &order_in_epoch(5, 8, "activate", B));
+    rig.put(&rig.rec(5, 8, 1, Verb::Activate, B));
     rig.cycle(T0 + 6);
     assert_eq!(rig.restarts(), 1, "not the first one's repeat");
-    let refusal = rig.status()["refusal"].as_str().expect("text").to_owned();
-    assert!(
-        refusal.contains("pending") || refusal.contains("swap"),
-        "{refusal}"
-    );
+    assert!(rig.refusal().contains("on trial"), "{}", rig.refusal());
     assert_eq!(rig.status()["acked_order_id"], 5);
 }
 
@@ -895,10 +1078,524 @@ fn the_same_id_in_two_epochs_is_two_activations() {
 #[test]
 fn a_revert_with_nothing_to_go_back_to_is_refused() {
     let mut rig = Rig::new("revert-nothing");
-    rig.put_order(5, &order_json(5, "revert", A));
+    rig.order(5, Verb::Revert, A);
     rig.cycle(T0);
     assert_eq!(rig.status()["state"], "refused");
     assert_eq!(rig.status()["acked_order_id"], 5);
     assert_eq!(rig.state().current, Some(c(A)));
     assert_eq!(rig.restarts(), 0);
+}
+
+/// Catches two swaps in quick succession (S13): with a 60 s minimum, an activation 10 s
+/// after the last one is refused before the fetch and moves nothing, and one 61 s after it
+/// goes through.
+///
+/// Mutants planted: the interval check removed (the second swap goes through at +10);
+/// `last_activation_at` never recorded (same); `<` turned into `>` (the +61 swap refused).
+#[test]
+fn a_second_activation_inside_the_minimum_interval_is_refused() {
+    let mut rig = Rig::build("interval", Platform::Linux, 60);
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    rig.first_start(B, T0 + 1);
+    rig.order(6, Verb::Confirm, B);
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.state().pending_confirm, None);
+    let fetched = rig.fetcher.count();
+
+    rig.put(&rig.rec(7, 1, 2, Verb::Activate, C));
+    rig.cycle(T0 + 10);
+    assert_eq!(rig.fetcher.count(), fetched, "nothing fetched");
+    assert_eq!(rig.current(), Some(c(B)));
+    assert!(
+        rig.refusal().contains("at least 60 s between activations"),
+        "{}",
+        rig.refusal()
+    );
+
+    rig.put(&rig.rec(8, 1, 3, Verb::Activate, C));
+    rig.cycle(T0 + 61);
+    assert_eq!(rig.current(), Some(c(C)));
+}
+
+/// Catches a clock that stepped back holding an activation up: the last swap is "in the
+/// future" of the pass, and the order is not held by the minimum interval.
+///
+/// Mutant planted: the `last <= now` test dropped (the future swap holds every order for
+/// the difference).
+#[test]
+fn a_clock_that_stepped_back_does_not_hold_an_activation_up() {
+    let mut rig = Rig::build("interval-back", Platform::Linux, 60);
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0 + 100);
+    rig.first_start(B, T0 + 101);
+    rig.order(6, Verb::Confirm, B);
+    rig.cycle(T0 + 103);
+    assert_eq!(rig.state().pending_confirm, None);
+    rig.put(&rig.rec(7, 1, 2, Verb::Activate, C));
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(C)));
+}
+
+/// Catches a confirm kept on the service user's word alone: a confirm order is refused
+/// while the unit's main process still runs the old release, and while the first boot
+/// check has not run; it is kept once the new release runs.
+///
+/// Mutants planted: `accept_confirm` not called; the executable compared with the old
+/// release's directory; the boot-check condition dropped (the not-started confirm is kept).
+#[test]
+fn a_confirm_order_is_kept_only_when_the_new_release_runs() {
+    let mut rig = Rig::new("confirm-accept");
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+
+    // Not started yet: no boot check has run.
+    rig.order(6, Verb::Confirm, B);
+    rig.cycle(T0 + 3);
+    assert!(rig.state().pending_confirm.is_some());
+    assert!(
+        rig.refusal().contains("first boot check has not run"),
+        "{}",
+        rig.refusal()
+    );
+
+    // Started by the boot check, but the main process still runs the old release.
+    let layout = rig.layout.clone();
+    let mut out = Vec::new();
+    activate::boot_check(rig.helper.exec_mut(), &layout, T0 + 4, 600, &mut out).expect("boot");
+    rig.order(7, Verb::Confirm, B);
+    rig.cycle(T0 + 6);
+    assert!(rig.state().pending_confirm.is_some());
+    assert!(rig.refusal().contains("not a file in"), "{}", rig.refusal());
+
+    // The unit is not active.
+    rig.service.0.borrow_mut().active = "failed".to_owned();
+    rig.order(8, Verb::Confirm, B);
+    rig.cycle(T0 + 9);
+    assert!(rig.state().pending_confirm.is_some());
+    assert!(rig.refusal().contains("not active"), "{}", rig.refusal());
+
+    // The new release runs.
+    rig.service.0.borrow_mut().active = "active".to_owned();
+    rig.first_start(B, T0 + 10);
+    rig.order(9, Verb::Confirm, B);
+    rig.cycle(T0 + 12);
+    assert_eq!(rig.state().pending_confirm, None);
+}
+
+/// Catches `gc` removing what must stay: after a confirm the releases nothing needs go,
+/// and current, previous, the newest other and every release a process executes from stay.
+/// A confirm that is refused collects nothing.
+///
+/// Mutants planted: the in-use set ignored (the oldest release, run by a process, is
+/// removed); `gc_due` set by a refused confirm; previous not kept.
+#[test]
+fn a_confirm_collects_old_releases_but_not_one_a_process_runs() {
+    let mut rig = Rig::new("gc-after-confirm");
+    let others = [
+        "1111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222",
+        "3333333333333333333333333333333333333333",
+        "4444444444444444444444444444444444444444",
+    ];
+    for o in others {
+        rig.install(o);
+    }
+    // The first is the oldest by far, and a stray process runs it.
+    let old = rig
+        .root
+        .join("var/lib/kbf-installer/releases")
+        .join(others[0]);
+    let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+    fs::File::open(&old)
+        .expect("dir")
+        .set_modified(epoch)
+        .expect("mtime");
+    rig.service.0.borrow_mut().exes.push((77, old.join("kbf")));
+
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    let releases = rig.root.join("var/lib/kbf-installer/releases");
+    let there = |c: &str| releases.join(c).exists();
+    assert!(there(others[1]), "nothing is collected before the confirm");
+
+    rig.first_start(B, T0 + 1);
+    rig.service.0.borrow_mut().exes.push((77, old.join("kbf")));
+    rig.order(6, Verb::Confirm, B);
+    rig.cycle(T0 + 3);
+    assert!(there(A) && there(B), "previous and current stay");
+    assert!(there(others[0]), "a release a process runs stays");
+    let left = others[1..].iter().filter(|o| there(o)).count();
+    assert_eq!(left, 1, "only the newest other stays");
+}
+
+/// Catches a collection that cannot run ending the pass or refusing the confirm: when the
+/// process table cannot be read, and when the releases directory cannot be listed, the
+/// confirm is still kept, nothing is removed, and the reason is in the log.
+///
+/// Mutants planted: the `in_use` error treated as an empty set (everything unneeded goes);
+/// the collection's error returned from the pass.
+#[test]
+fn a_collection_that_cannot_run_is_logged_and_the_confirm_is_kept() {
+    use std::os::unix::fs::PermissionsExt;
+    for (name, why) in [
+        ("blind", "cannot tell which releases run"),
+        ("unlistable", "gc: "),
+    ] {
+        let mut rig = Rig::new(&format!("gc-fails-{name}"));
+        rig.install("1111111111111111111111111111111111111111");
+        rig.order(5, Verb::Activate, B);
+        rig.cycle(T0);
+        rig.first_start(B, T0 + 1);
+        let releases = rig.root.join("var/lib/kbf-installer/releases");
+        if name == "blind" {
+            rig.service.0.borrow_mut().blind = true;
+        } else {
+            fs::set_permissions(&releases, fs::Permissions::from_mode(0o100)).expect("close");
+        }
+        rig.order(6, Verb::Confirm, B);
+        rig.cycle(T0 + 3);
+        fs::set_permissions(&releases, fs::Permissions::from_mode(0o755)).expect("open");
+        let mut log = Vec::new();
+        rig.helper.drain_log(&mut log);
+        let log = String::from_utf8_lossy(&log).into_owned();
+        assert!(log.contains(why), "{name}: {log}");
+        assert_eq!(
+            rig.state().pending_confirm,
+            None,
+            "{name}: the confirm is kept"
+        );
+        assert!(
+            releases
+                .join("1111111111111111111111111111111111111111")
+                .exists(),
+            "{name}: nothing was removed"
+        );
+    }
+}
+
+/// Catches a restart owed by an operator verb being lost, or done under that verb's lock: the
+/// marker is there and a verb holds the lock when the pass starts, so the pass first leaves
+/// the restart; once the verb lets go the same pass restarts the service once and removes the
+/// marker. A lock file that cannot be opened ends the pass with the error.
+///
+/// Mutants planted: the busy arm restarting anyway; the marker left after the restart.
+#[test]
+fn a_restart_an_operator_left_owed_waits_for_its_lock_then_is_done_and_cleared() {
+    let mut rig = Rig::new("owed-marker");
+    let marker = rig
+        .layout
+        .join(&crate::helper::restart::owed_marker(&rig.layout));
+    fs::write(&marker, b"owed\n").expect("marker");
+    let held = Locked::acquire(&rig.layout).expect("a verb holds the lock");
+    let verb = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(held);
+    });
+    rig.cycle(T0);
+    verb.join().expect("the verb ends");
+    assert_eq!(rig.restarts(), 1, "done once the verb let go");
+    assert!(!marker.exists(), "and cleared");
+
+    let mut rig = Rig::new("owed-marker-no-lock");
+    let marker = rig
+        .layout
+        .join(&crate::helper::restart::owed_marker(&rig.layout));
+    fs::write(&marker, b"owed\n").expect("marker");
+    let lock_dir = rig.layout.join(&rig.layout.lock());
+    fs::remove_dir_all(lock_dir.parent().expect("a directory")).expect("no lock directory");
+    assert!(rig.helper.cycle(T0).is_err());
+}
+
+struct Flag(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl crate::helper::serve::BinaryWatch for Flag {
+    fn replaced(&self) -> bool {
+        self.0.get()
+    }
+}
+
+/// Catches a replaced program going unnoticed and a pass made by the old code after it:
+/// while the file is the one that started, a turn makes a pass and acts on the order; once
+/// replaced, the turn says re-exec and the next order is left in the spool for the new
+/// program.
+///
+/// Mutants planted: the watch consulted after the pass (the order is acted on);
+/// `Flow::Reexec` never returned.
+#[test]
+fn a_replaced_binary_is_re_executed_before_the_next_order_is_read() {
+    use crate::helper::serve::{Flow, Serve};
+    let rig = Rig::new("serve");
+    let replaced = std::rc::Rc::new(std::cell::Cell::new(false));
+    rig.order(5, Verb::Activate, B);
+    let orders = rig.orders();
+    let layout = rig.layout.clone();
+    let Rig { helper, .. } = rig;
+    let mut serve = Serve::new(helper, Box::new(Flag(replaced.clone())));
+    assert_eq!(serve.turn(T0).expect("a pass"), Flow::Continue);
+    assert_eq!(fs::read_dir(&orders).expect("dir").count(), 0, "acted on");
+    let first = crate::state::read_unlocked(&layout)
+        .expect("reads")
+        .expect("there");
+    assert_eq!(first.current, Some(c(B)));
+
+    replaced.set(true);
+    fs::write(
+        orders.join(kbf_update::record::file_name(1, 6)),
+        serde_json::to_vec(&record(6, 1, 2, Verb::Confirm, B, Platform::Linux)).expect("json"),
+    )
+    .expect("record");
+    assert_eq!(serve.turn(T0 + 5).expect("no pass"), Flow::Reexec);
+    assert_eq!(
+        fs::read_dir(&orders).expect("dir").count(),
+        1,
+        "left for the new program"
+    );
+}
+
+/// Catches a frontend update crashing the reader or moving the floor: the record parses (it
+/// carries claims like an activation), is refused in status.json with "not implemented
+/// (P13)", changes nothing, is removed, and does not advance the acknowledged id or epoch, so
+/// a real order of a lower id in the same epoch still runs.
+///
+/// Mutant planted: the early arm in `take` removed (the order falls through to `act`, which
+/// refuses it but acknowledges it, and the lower real order is then dropped as a replay).
+#[test]
+fn a_frontend_update_record_is_refused_not_implemented_and_moves_no_floor() {
+    let mut rig = Rig::new("frontend-update");
+    let mut r = rig.rec(9, 1, 1, Verb::Activate, B);
+    r.verb = Verb::FrontendUpdate;
+    rig.put(&r);
+    rig.cycle(T0);
+    assert_eq!(rig.status()["state"], "refused");
+    assert!(
+        rig.refusal().contains("not implemented (P13)"),
+        "{}",
+        rig.refusal()
+    );
+    assert_eq!(rig.status()["acked_order_id"], 0, "the floor did not move");
+    assert_eq!(rig.current(), Some(c(A)));
+    assert_eq!(rig.fetcher.count(), 0);
+    assert_eq!(rig.restarts(), 0);
+    assert_eq!(rig.left(), 0);
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0 + 3);
+    assert_eq!(
+        rig.current(),
+        Some(c(B)),
+        "order 5 is below 9 but 9 was never taken"
+    );
+}
+
+/// Catches the two kinds of order sharing a floor. The node floor is at (1, 7); a frontend
+/// record of the same epoch and a lower id is not a replay of it (it reaches its own
+/// refusal), and with the frontend floor seeded at (1, 7) a node order of id 3 is not
+/// dropped as a replay of the frontend's: each kind is ordered against its own pair.
+///
+/// Mutants planted: the floor taken from the node pair whatever the kind (the frontend
+/// record is dropped silently, and the node order after the seeded frontend floor too).
+#[test]
+fn node_and_frontend_orders_have_separate_floors() {
+    let mut rig = Rig::new("floors-per-kind");
+    rig.order(7, Verb::Confirm, A);
+    rig.cycle(T0);
+    assert_eq!(rig.status()["acked_order_id"], 7);
+    let mut r = rig.rec(3, 1, 1, Verb::Activate, B);
+    r.verb = Verb::FrontendUpdate;
+    rig.put(&r);
+    rig.cycle(T0 + 3);
+    assert!(
+        rig.refusal().contains("not implemented (P13)"),
+        "a lower id of another kind is not a replay: {}",
+        rig.refusal()
+    );
+
+    let mut rig = Rig::new("floors-per-kind-reverse");
+    let path = rig.root.join("var/lib/kbf-installer/helper.json");
+    let mut memory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("memory")).expect("json");
+    memory["frontend_epoch"] = 1.into();
+    memory["frontend_order_id"] = 7.into();
+    fs::write(&path, serde_json::to_vec(&memory).expect("json")).expect("seed");
+    rig.order(3, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(
+        rig.current(),
+        Some(c(B)),
+        "the node order is above the node floor"
+    );
+    assert_eq!(rig.status()["acked_order_id"], 3);
+}
+
+/// Catches a spool that cannot be listed being read as an empty one (orders silently never
+/// acted on), and a crowded spool going unsaid: a directory descriptor that cannot be read
+/// is a refusal with the entry's name and the stable code, and a spool of more than 256
+/// entries says so (the first 256 are looked at, the rest are not).
+///
+/// Mutants planted: the listing error ignored (no refusal is recorded); the `crowded` flag
+/// dropped (the spool of 257 junk files says nothing).
+#[test]
+fn a_spool_that_cannot_be_listed_is_refused_and_a_crowded_one_is_said() {
+    let mut rig = Rig::new("scan");
+    let file = rig.root.join("not-a-dir");
+    fs::write(&file, b"x").expect("file");
+    let mut memory = Memory::default();
+    rig.helper
+        .orders_in(&Entry::over_file(&file), T0, &mut memory)
+        .expect("a pass");
+    assert_eq!(memory.event, Event::Refused);
+    assert!(
+        memory.refusal.contains("not-a-directory"),
+        "{}",
+        memory.refusal
+    );
+    for n in 0..257 {
+        fs::write(rig.orders().join(format!("junk-{n}")), b"").expect("junk");
+    }
+    rig.cycle(T0);
+    assert!(
+        rig.refusal().contains("more than 256 entries"),
+        "{}",
+        rig.refusal()
+    );
+}
+
+fn plain_order(verb: OrderVerb) -> Order {
+    Order {
+        id: 1,
+        epoch: 1,
+        generation: 1,
+        verb,
+        commit: c(B),
+        window_s: 600,
+        claims: None,
+    }
+}
+
+/// Catches the two defences that the parse already makes being relied on alone: an activation
+/// with no release claims is refused by the vetting itself (fail closed), and a
+/// `frontend_update` that reached the act step is refused, not carried out as a node verb.
+///
+/// Mutants planted: the claims check removed (the vetting panics or passes); the frontend arm
+/// of `act` made a revert (the links move).
+#[test]
+fn vetting_and_acting_refuse_what_parsing_already_refuses() {
+    let mut rig = Rig::new("defence");
+    let mut memory = Memory::default();
+    let before = rig.state();
+    let why = rig
+        .helper
+        .prepare(&plain_order(OrderVerb::Activate), &before, T0, &mut memory)
+        .unwrap_err();
+    assert!(why.contains("no release claims"), "{why}");
+    rig.helper
+        .act(&plain_order(OrderVerb::FrontendUpdate), T0, &mut memory)
+        .expect("refused, not failed");
+    assert_eq!(memory.event, Event::Refused);
+    assert!(
+        memory
+            .refusal
+            .contains("frontend_update is not implemented"),
+        "{}",
+        memory.refusal
+    );
+    assert_eq!(rig.current(), Some(c(A)));
+}
+
+/// Catches an activation naming a component set the platform does not take: a Linux host takes
+/// exactly `kbf`; a second component is refused before the fetch, with both names in the
+/// reason.
+///
+/// Mutant planted: the set compared as a prefix (an extra component passes).
+#[test]
+fn an_activation_with_other_components_than_the_platform_takes_is_refused() {
+    let mut rig = Rig::new("components");
+    let mut r = rig.rec(1, 1, 1, Verb::Activate, B);
+    let mut extra = r.components[0].clone();
+    extra.name = "kbf-daemon".to_owned();
+    r.components.push(extra);
+    rig.put(&r);
+    rig.cycle(T0);
+    assert_eq!(rig.fetcher.count(), 0);
+    assert!(
+        rig.refusal().contains("names components"),
+        "{}",
+        rig.refusal()
+    );
+}
+
+/// A fetcher that reports a good release and installs nothing, as one whose directory was
+/// removed between the fetch and the swap.
+struct Hollow;
+
+impl Fetcher for Hollow {
+    fn fetch(&self, rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError> {
+        Ok(crate::helper::fetcher::fake::honest(rec))
+    }
+}
+
+/// Catches an activation that fails at the swap (the release is not on the host after all)
+/// being reported as done: the order is refused with the installer's reason, the links stay
+/// where they were, and no restart is owed. Also the fetcher of a build that has none refuses
+/// every fetch.
+///
+/// Mutants planted: the swap error turned into `Ok(Done::quiet(..))` (the order is
+/// acknowledged without a swap); `NotWired` returning an empty release.
+#[test]
+fn a_swap_that_fails_is_refused_and_moves_nothing() {
+    let mut rig = Rig::new("hollow");
+    rig.helper.set_fetcher(Box::new(Hollow));
+    rig.order(1, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.status()["state"], "refused");
+    assert_eq!(rig.current(), Some(c(A)));
+    assert_eq!(rig.restarts(), 0);
+    let loc = ReleaseLocator {
+        commit: c(B),
+        components: Vec::new(),
+    };
+    assert!(matches!(NotWired.fetch(&loc), Err(FetchError::NotWired)));
+}
+
+/// Catches an activation that goes on to fetch while the node cannot be told a fetch is under
+/// way (status.json cannot be written): the order is refused before the fetch, nothing moves,
+/// and the pass reports the failure to write instead of ending as if it had reported.
+///
+/// Mutant planted: the report error ignored in the vetting (the fetch happens anyway).
+#[test]
+fn an_activation_stops_before_the_fetch_when_status_cannot_be_written() {
+    let mut rig = Rig::new("status-unwritable");
+    fs::remove_file(rig.root.join(UPDATE).join("status.json")).expect("status.json");
+    fs::create_dir(rig.root.join(UPDATE).join("status.json")).expect("a directory in its place");
+    rig.order(1, Verb::Activate, B);
+    assert!(rig.helper.cycle(T0).is_err());
+    assert_eq!(rig.fetcher.count(), 0);
+    assert_eq!(rig.current(), Some(c(A)));
+}
+
+/// Catches the second timer: an activation whose swap is on trial may come again (the pass that
+/// made the swap died before its acknowledgement was saved), and it is the same activation, not
+/// a refusal for a trial pending and not a second trial. The vetting lets it by; `activate`
+/// calls it a repeat.
+///
+/// Mutant planted: the pending trial refused whatever its activation (the repeat is refused).
+#[test]
+fn the_same_activation_again_while_on_trial_is_a_repeat() {
+    let mut rig = Rig::new("repeat");
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    assert_eq!(rig.current(), Some(c(B)));
+    let trial = rig.state().pending_confirm.expect("on trial");
+    assert_eq!(trial.activation, "1-5");
+    let path = rig.root.join("var/lib/kbf-installer/helper.json");
+    let mut memory: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("memory")).expect("json");
+    memory["acked_order_id"] = 0.into();
+    memory["acked_epoch"] = 0.into();
+    fs::write(&path, serde_json::to_vec(&memory).expect("json")).expect("seed");
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0 + 3);
+    assert_eq!(rig.current(), Some(c(B)));
+    assert_eq!(rig.state().pending_confirm, Some(trial));
+    assert_eq!(rig.left(), 0);
 }

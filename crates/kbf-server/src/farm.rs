@@ -160,6 +160,10 @@ struct Link {
     /// The `os` and `arch` its newest `Hello` reported (empty if it named none).
     os: String,
     arch: &'static str,
+    /// The version its first `Hello` named, the one `Welcome` answered (`None` if it
+    /// named none). Like the link, it is the newest stream's: a daemon that returns on
+    /// another version replaces it, and a `Hello` resent on the stream does not.
+    protocol: Option<u32>,
 }
 
 /// The `os` and `arch` entries of a node report.
@@ -520,6 +524,7 @@ impl Farm {
             newest_beat: 0,
             os,
             arch,
+            protocol: reported.protocol,
         };
         let replaced = state.links.insert(worker.clone(), link);
         state.machine.register(worker);
@@ -553,7 +558,8 @@ impl Farm {
 
     /// A `Hello` resent on `stream`: the node report or the node's phase changed.
     /// Changes the worker's capacity, capabilities and phase, and opens no session;
-    /// ignored if `stream` was replaced.
+    /// ignored if `stream` was replaced. The protocol version `reported` names is not
+    /// taken: the stream's is the first `Hello`'s, which `Welcome` answered.
     ///
     /// A `Preparing` or `Restoring` phase naming a lease the scheduler holds on the
     /// worker, whose `Start` went to an earlier session, sends that `Start` again (the
@@ -713,7 +719,8 @@ impl Farm {
         FarmTime::from_millis(unix_ms())
     }
 
-    /// This build, and every node registered since this farm started, in node-id order.
+    /// This build, and every node registered since this farm started, in node-id order,
+    /// with the oldest protocol version among them ([`NodesView::of_this_build`]).
     pub fn nodes(&self) -> NodesView {
         let mut state = self.lock();
         state.note_closed_streams();
@@ -792,6 +799,7 @@ impl Farm {
         NodeView {
             node_id: worker.as_str().to_owned(),
             connected,
+            protocol: state.links.get(worker).and_then(|link| link.protocol),
             needs_attention: needs_attention(software.as_ref(), &phase),
             software,
             update: UpdateSummary::new(

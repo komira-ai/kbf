@@ -16,6 +16,33 @@ Exit codes: 0 rendered or every rule holds, 1 a rule is broken, 2 refused (a bad
 a missing `--mode`, a file that cannot be read or written), with a `REFUSED:` line on
 stderr.
 
+## Choosing the mode: `--mode`, `kbf.toml`, enrollment
+
+A `kbf` process takes its mode from a flag, never from a word: `kbf --mode=frontend|storage|daemon|storage-and-daemon|all-in-one`,
+or `mode = "..."` in `/etc/kbf/kbf.toml` (`kbf` alone reads it). The flag wins over the file and
+the start says so on stderr; with neither the start exits 2 naming both. `kbf --mode=<mode> --help`
+lists the mode's flags. There is no `node` mode and no `enroll` word.
+
+- **Flags.** A start that gives flags of its mode (`--cold-store`, `--server`, ...) runs on them
+  and does not read the file. The units that `render-units` writes still run the old subcommand
+  forms (`kbf storage ...`, `kbf daemon ...`): they are hidden aliases of the same modes, kept
+  until the units move.
+- **`kbf.toml`.** `kbf --mode=storage|daemon|storage-and-daemon` with at most `--config FILE` and
+  `--label` reads the host's file. On the first start, with the token file `enroll.token_file`
+  names, it makes its keys, sends the token and a request for the roles the mode needs
+  (`storage` the storage role, `daemon` the daemon role, `storage-and-daemon` both) and writes
+  `node.json`; later starts renew the certificates without the token. `[storage]` and `[daemon]`
+  in the file are settings only.
+- **Exit 2** (a restart cannot fix it): a bad `kbf.toml`, a missing or open token file, a token
+  that does not grant a role the mode needs (the frontend's typed reason is printed), and a
+  `node.json` whose roles do not cover the mode (the mode changed after enrollment; the node is
+  never enrolled again on its own). **Exit 1** (may pass): the frontend is down or busy, the
+  clock is off; the start waits 5 seconds, doubling to 5 minutes, and tries again.
+- **`--check`** (`storage`, `daemon`, `storage-and-daemon`): checks the host and exits without
+  starting or enrolling anything. 0 for a valid `kbf.toml` with its token file and no `node.json`
+  yet, or an enrolled node that covers the mode; 2 for a bad config, a missing token file or a
+  `node.json` that does not cover the mode.
+
 ## What check-units reads
 
 - `kbf-<mode>.service` and `kbf.slice` in `--dir`, and their drop-ins: every `*.conf`
@@ -257,7 +284,8 @@ its registration put it in the frontend's map; calls routed to it fail.
 
 ### The state store: SQLite only
 
-The only state store kbf opens today is a SQLite file; Postgres is a later backend. Rule
+kbf opens a SQLite file or Postgres (`postgres:///kbf?host=/run/postgresql`), but no unit
+is rendered for Postgres yet: that comes with the cutover. Rule
 `state-store` fails a `--state-store` that is not `sqlite:///<absolute path>`: a
 `postgres://` or `postgresql://` URI (postgres is not wired yet), any other scheme, a
 SQLite path that is empty, relative or not normal, and a `--state-store=${VAR}`
@@ -339,9 +367,11 @@ WARN trusted: kbf all-in-one runs builds beside the farm's state and its cold st
 
 Its cold store is `file://<KBF_DATA_DIR>/cold`, the single box's shape (section 11), so
 the unit holds no cold-store key and rule `credential` applies to it. Its scheduler
-state is the SQLite file `<KBF_DATA_DIR>/state.db`, the default of `kbf all-in-one` (a
-`--state-store=sqlite:///...` names another; any other value is refused), so the unit
-gives no state store flag.
+state is the SQLite file `<KBF_DATA_DIR>/state.db`, which the unit names with
+`--state-store=sqlite://<KBF_DATA_DIR>/state.db`. The default of `kbf all-in-one` is
+now Postgres on the host's socket (`postgres:///kbf?host=/run/postgresql`), so a unit that
+left the flag out would change store when its binary is replaced; the move to Postgres is
+the farm cutover, a held script run with the owner's go.
 
 ## A node's certificate
 
@@ -426,6 +456,24 @@ stops the start (standard output says `kbf <mode>: ok`), 2 when it is refused, 7
 is not ready yet (a restart may help). `kbf check-args <mode> ...` stays for
 `kbf-deploy linux check-units`: it parses the flags only (no file, no host checks, as
 before) and prints a one-line deprecation note as the last line on standard error.
+
+## Enrollment is part of the start
+
+`kbf --mode=storage`, `--mode=daemon` and `--mode=storage-and-daemon` (or `kbf` alone with
+`mode = "..."` in the file; a flag overrides the file and the start says so) enroll the host
+themselves. There is no `node` mode and no `enroll` word.
+
+- First start, with `enroll.token_file` set and no `node.json`: the start makes the key,
+  sends the token and a CSR for the roles the mode needs (storage: storage; daemon: daemon;
+  storage-and-daemon: both) and writes `node.json`. The tables `[storage]` and `[daemon]`
+  are settings only; they never choose roles.
+- Later starts renew without the token. A token that lacks a needed role, or a `node.json`
+  whose roles do not cover the mode, exits 2 and names both; the host is never enrolled
+  again by itself.
+- `--check` passes on a configured host that is not enrolled yet and exits 2 for a bad
+  config, a missing token file or an uncovered `node.json`. It enrolls nothing.
+- Exit 2: a restart cannot fix it. Exit 1: it may pass (the frontend is down or busy, the
+  clock is off); the start retries with a backoff of 5 seconds doubling to 5 minutes.
 
 ## Installing a mode's unit
 

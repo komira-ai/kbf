@@ -1466,6 +1466,7 @@ dependencies = [
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "postgres",
  "prost",
  "rcgen",
  "rustix",
@@ -1701,6 +1702,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-gate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-guest"
 version = "0.1.0"
 dependencies = [
@@ -1852,6 +1863,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hex",
+ "kbf-cli",
  "rustix",
  "sha2 0.11.0",
  "thiserror",
@@ -2142,6 +2154,7 @@ dependencies = [
  "kbf-update",
  "libc",
  "percent-encoding",
+ "postgres",
  "prost",
  "prost-types",
  "rcgen",
@@ -2156,6 +2169,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tower-layer",
+ "tower-service",
  "tracing",
  "tracing-core",
  "tracing-subscriber",
@@ -2216,6 +2230,7 @@ dependencies = [
  "rusqlite",
  "rustix",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -2343,16 +2358,11 @@ dependencies = [
 name = "kbf-update"
 version = "0.1.0"
 dependencies = [
- "futures",
- "hex",
  "kbf-proto",
- "kbf-threads",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "thiserror",
  "tokio",
- "tonic",
  "tracing",
 ]
 

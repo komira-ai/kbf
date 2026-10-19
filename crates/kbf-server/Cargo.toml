@@ -33,7 +33,7 @@ kbf-proto.workspace = true
 kbf-raft.workspace = true
 kbf-route.workspace = true
 kbf-sched.workspace = true
-kbf-state.workspace = true
+kbf-state = { workspace = true, features = ["postgres"] }
 kbf-storage.workspace = true
 kbf-store.workspace = true
 kbf-threads.workspace = true
@@ -73,10 +73,14 @@ kbf-update.workspace = true
 kbf-sim.workspace = true
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/).
 kbf-state = { workspace = true, features = ["test-support"] }
+# A router called as a service with a chosen peer address (tests/object_store_api.rs).
+tower-service.workspace = true
 # The pages, rendered over this server's real routes (tests/ui_pages.rs).
 kbf-ui.workspace = true
 # fcntl and kill for the test that holds the server at its start line (tests/binary.rs).
 libc.workspace = true
+# Drops the default schema before the Postgres flag test (tests/state_store_postgres.rs).
+postgres.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }

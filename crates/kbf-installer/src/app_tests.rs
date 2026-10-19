@@ -37,11 +37,6 @@ fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
             "update",
             "P13",
         ),
-        (vec!["confirm", "--id=3-42"], "confirm", "P5"),
-        (vec!["revert", "--id=3-42"], "revert", "P5"),
-        (vec!["rollback"], "rollback", "P5"),
-        (vec!["gc"], "gc", "P5"),
-        (vec!["quiesce"], "quiesce", "P5"),
         (vec!["check"], "check", "P10"),
         (vec!["stage"], "stage", "P8"),
         (vec!["activate"], "activate", "P5"),
@@ -88,14 +83,14 @@ fn only_status_and_check_run_without_root() {
 /// script reading standard output would miss it.
 #[test]
 fn json_is_one_object_on_standard_output() {
-    let (exit, out, err) = run_as(0, &["--json", "--apply", "gc"]);
+    let (exit, out, err) = run_as(0, &["--json", "--apply", "status"]);
     assert_eq!((exit, err.as_str()), (Exit::Failed, ""));
     let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
     assert_eq!(
         v,
-        serde_json::json!({"verb": "gc", "apply": true, "error": "not_implemented", "phase": "P5"})
+        serde_json::json!({"verb": "status", "apply": true, "error": "not_implemented", "phase": "P4"})
     );
-    let (_, out, _) = run_as(1000, &["--json", "gc"]);
+    let (_, out, _) = run_as(1000, &["--json", "setup", "--mode=daemon"]);
     let v: Value = serde_json::from_str(out.trim_end()).expect("json");
     assert_eq!(
         (v["error"].as_str(), v["euid"].as_u64()),
@@ -194,13 +189,13 @@ fn global_flags_may_follow_the_verb() {
     assert_eq!((cli.apply, cli.json), (true, true));
 }
 
-/// A host root with release A current and its inbox in place, as the installer finds a host.
+/// A host root with release A current and its order spool in place, as the installer finds a host.
 /// The installer under test lays a host out for the platform it was built for, so the
-/// scratch host is laid out for that platform too (`/var/db/kbf-deploy` on macOS).
+/// scratch host is laid out for that platform too (`/var/db/kbf-installer` on macOS).
 fn seeded(name: &str) -> (Layout, PathBuf) {
     let (layout, root) = host_root_on(&format!("app-{name}"), Platform::current());
-    fs::create_dir_all(root.join("var/lib/kbf-updater/inbox/orders")).expect("inbox");
-    let release = root.join("var/lib/kbf-installer/releases").join(A);
+    fs::create_dir_all(root.join("var/lib/kbf-installer/orders")).expect("order spool");
+    let release = layout.join(&layout.release_dir(&c(A)));
     fs::create_dir_all(&release).expect("release");
     fs::write(release.join("kbf"), b"x").expect("binary");
     Locked::acquire(&layout)
@@ -220,19 +215,11 @@ fn on(root: &Path, args: &[&str]) -> (Exit, String) {
     (exit, err)
 }
 
-const RUN: [&str; 7] = [
-    "run",
-    "--passes",
-    "1",
-    "--interval-secs",
-    "0",
-    "--unit",
-    "kbf.service",
-];
+const RUN: [&str; 5] = ["run", "--passes", "1", "--unit", "kbf.service"];
 
 /// Catches `run` not doing a pass in this build of the crate (the real binary does; this is
 /// the same code run in the unit tests, so a change to it is seen by both): a pass on a host
-/// reports and exits 0 even as an ordinary user, with an inbox entry the stage refuses the
+/// reports and exits 0 even as an ordinary user, with an order record that is not one the
 /// pass still ends, an unreadable state stops it before any pass (exit 1), and a memory file
 /// it cannot read stops the loop with the file named.
 ///
@@ -244,10 +231,15 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
     let (layout, root) = seeded("run");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Ok, "{err}");
-    let status = fs::read(root.join("var/lib/kbf-updater/status.json")).expect("status.json");
+    let status = fs::read(root.join("var/lib/kbf-installer/status.json")).expect("status.json");
     let status: Value = serde_json::from_slice(&status).expect("json");
     assert_eq!(status["state"], "refused", "not root: the pass says so");
-    fs::create_dir(root.join(format!("var/lib/kbf-updater/inbox/{:020}-{B}", 2))).expect("entry");
+    let record = kbf_update::record::file_name(1, 2);
+    fs::write(
+        root.join("var/lib/kbf-installer/orders").join(record),
+        b"not an order",
+    )
+    .expect("record");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Ok, "{err}");
     fs::write(
@@ -351,4 +343,66 @@ fn only_an_unusable_state_asks_for_an_operator() {
     assert_eq!(exit(ReleaseError::State(other()).into()), Exit::Failed);
     assert_eq!(exit(ReleaseError::Pending(c(A)).into()), Exit::Failed);
     assert_eq!(exit("message".to_owned().into()), Exit::Failed);
+}
+
+/// Catches the loop of `run` going on with a file that was replaced under it: the file it
+/// watches is another file (here one that is no program), so the turn says re-exec, the
+/// loop tries to start it, and the failure is the reason it ends with (exit 1).
+///
+/// Mutants planted: the watch never consulted; the failed start taken for a success.
+#[test]
+fn a_loop_whose_file_was_replaced_tries_the_new_one_and_ends_when_it_cannot_start() {
+    let (_, root) = seeded("replaced");
+    let dir = root.join("copy");
+    fs::create_dir_all(&dir).expect("dir");
+    let me = dir.join("kbf-installer");
+    fs::write(&me, b"the program").expect("the program");
+    let watch = FileIdentity::of(&me).expect("identity");
+    let other = dir.join("other");
+    fs::write(&other, b"not a program").expect("a file that is no program");
+    fs::rename(&other, &me).expect("replaced");
+    let cli = parse(&["run", "--passes", "3", "--unit", "kbf.service"]);
+    let Verb::Run(args) = &cli.verb else {
+        panic!("a run");
+    };
+    let Err(failure) = run_from(root, args, &me, watch) else {
+        panic!("the new file cannot start");
+    };
+    assert_eq!(failure.exit, Exit::Failed);
+    assert!(failure.why.contains("cannot start"), "{}", failure.why);
+}
+
+/// Catches the operator's verbs not being wired to the dispatcher, or their exits being
+/// remapped on the way: through the dispatcher on a host with nothing on trial, `confirm`,
+/// `revert` and `rollback` need the operator (5), `quiesce` is at rest (0) and a dry-run `gc`
+/// succeeds; each failure of the operator keeps its exit code through the conversion.
+///
+/// Mutants planted: a verb dispatched to another verb's function; the refused exit folded
+/// into failed.
+#[test]
+fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
+    use crate::helper::operator::Failure as Operator;
+    let (_, root) = seeded("operator-verbs");
+    let with = |verb: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = verb.iter().map(ToString::to_string).collect();
+        v.extend(["--unit".to_owned(), "kbf.service".to_owned()]);
+        v
+    };
+    let run = |args: Vec<String>| {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        on(&root, &refs).0
+    };
+    assert_eq!(run(with(&["confirm", "--id=1-5"])), Exit::NeedsOperator);
+    assert_eq!(run(with(&["revert", "--id=1-5"])), Exit::NeedsOperator);
+    assert_eq!(run(with(&["rollback"])), Exit::NeedsOperator);
+    assert_eq!(run(vec!["quiesce".to_owned()]), Exit::Ok);
+    assert_eq!(run(vec!["gc".to_owned()]), Exit::Ok);
+    let exit = |f: Operator| Failure::from(f).exit;
+    assert_eq!(exit(Operator::Failed("x".to_owned())), Exit::Failed);
+    assert_eq!(exit(Operator::Refused("x".to_owned())), Exit::Refused);
+    assert_eq!(exit(Operator::Busy("x".to_owned())), Exit::Busy);
+    assert_eq!(
+        exit(Operator::NeedsOperator("x".to_owned())),
+        Exit::NeedsOperator
+    );
 }
