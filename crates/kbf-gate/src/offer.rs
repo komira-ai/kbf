@@ -50,8 +50,11 @@ pub fn reversible(meta_log: Option<u64>, previous_meta_log: Option<u64>) -> bool
 }
 
 /// `offer.json`.
+///
+/// Every way to deserialize it (`from_bytes`, or plain `serde` on this type) runs
+/// [`OfferDoc::validate`]; there is no way to read a document it would refuse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawOfferDoc")]
 pub struct OfferDoc {
     /// [`OFFER_VERSION`].
     pub version: u32,
@@ -77,6 +80,44 @@ pub struct OfferDoc {
     pub previous_meta_log: Option<u64>,
     /// [`reversible`] of the two numbers above.
     pub reversible: bool,
+}
+
+/// The fields as read, before validation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOfferDoc {
+    version: u32,
+    created: u64,
+    target: Target,
+    commit: CommitId,
+    set_hash: SetHash,
+    platforms: Vec<String>,
+    beta: Beta,
+    meta_log: Option<u64>,
+    previous: Option<CommitId>,
+    previous_meta_log: Option<u64>,
+    reversible: bool,
+}
+
+impl TryFrom<RawOfferDoc> for OfferDoc {
+    type Error = DocError;
+    fn try_from(r: RawOfferDoc) -> Result<Self, DocError> {
+        let doc = Self {
+            version: r.version,
+            created: r.created,
+            target: r.target,
+            commit: r.commit,
+            set_hash: r.set_hash,
+            platforms: r.platforms,
+            beta: r.beta,
+            meta_log: r.meta_log,
+            previous: r.previous,
+            previous_meta_log: r.previous_meta_log,
+            reversible: r.reversible,
+        };
+        doc.validate()?;
+        Ok(doc)
+    }
 }
 
 fn bad(why: &str) -> DocError {
@@ -127,8 +168,7 @@ impl OfferDoc {
 
     /// Reads a document, refusing everything [`OfferDoc::validate`] does and an unknown field.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DocError> {
-        let doc: Self = serde_json::from_slice(bytes)?;
-        doc.validate()?;
-        Ok(doc)
+        let raw: RawOfferDoc = serde_json::from_slice(bytes)?;
+        Self::try_from(raw)
     }
 }

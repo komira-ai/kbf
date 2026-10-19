@@ -25,7 +25,7 @@
 //!   `publish --set-hash` must be given.
 //! - `release offer <dir> --repo <owner/repo> --commit <sha> --platform <p>... (--beta-result
 //!   <file> | --waive-beta <reason> --operator <name>) [--previous <sha> --version-json <file>
-//!   --previous-version-json <file>] [--plan] [--out offer.json]` ([`offer`]): the checks
+//!   --previous-version-json <file>] [--plan] --out <offer.json>` ([`offer`]): the checks
 //!   that make a commit offerable, and `offer.json`, the record a deploy reads. It sets
 //!   nothing on any farm.
 //! - `release notes <dir> ... --out <file>` ([`notes`]): the same checks, then the

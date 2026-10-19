@@ -124,3 +124,62 @@ fn a_prod_offer_cannot_carry_a_waiver_and_a_waiver_needs_its_reason() {
     none.platforms.clear();
     assert!(offer_err(&none).contains("platform"));
 }
+
+#[test]
+fn plain_serde_refuses_what_from_bytes_refuses() {
+    // The type cannot be read around its validation: a prod waiver with a blank reason,
+    // no platform and a forged `reversible`, through serde_json::from_slice directly.
+    // Mutant: drop `try_from = "RawOfferDoc"`.
+    let text = String::from_utf8(doc().to_bytes().unwrap()).unwrap();
+    let forged = text
+        .replace("\"gamma\"", "\"prod\"")
+        .replace(
+            "\"kind\": \"attested\",\n    \"run_id\": \"beta-0001\"",
+            "\"kind\": \"waived\", \"waiver\": {\"what\":\"beta\",\"by\":\"\",\"reason\":\"\"}",
+        )
+        .replace("\"darwin-arm64\",\n    \"linux-x86_64\"", "")
+        .replace(
+            "\"previous\": \"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\"",
+            "\"previous\": null",
+        );
+    assert_ne!(forged, text);
+    assert!(serde_json::from_slice::<OfferDoc>(forged.as_bytes()).is_err());
+    assert!(OfferDoc::from_bytes(forged.as_bytes()).is_err());
+    // Each single edit is refused by both readers, and the good one by both accepted.
+    for edit in [
+        text.replace(
+            "\"previous\": \"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\"",
+            "\"previous\": null",
+        ),
+        text.replace("\"run_id\": \"beta-0001\"", "\"run_id\": \" \""),
+        text.replace("\"gamma\"", "\"prod\"")
+            .replace("\"attested\"", "\"waived\""),
+    ] {
+        assert_ne!(edit, text);
+        assert!(
+            serde_json::from_slice::<OfferDoc>(edit.as_bytes()).is_err(),
+            "{edit}"
+        );
+        assert!(OfferDoc::from_bytes(edit.as_bytes()).is_err(), "{edit}");
+    }
+    assert_eq!(
+        serde_json::from_slice::<OfferDoc>(text.as_bytes()).unwrap(),
+        doc()
+    );
+}
+
+#[test]
+fn a_previous_meta_log_needs_a_previous_commit_and_an_attested_beta_needs_a_run() {
+    // Mutants: drop each check in `validate`.
+    let mut d = doc();
+    d.previous = None;
+    d.reversible = false;
+    assert!(offer_err(&d).contains("previous meta_log without a previous commit"));
+    d.previous_meta_log = None;
+    assert!(d.validate().is_ok());
+    let mut blank = doc();
+    blank.beta = Beta::Attested {
+        run_id: "  ".to_owned(),
+    };
+    assert!(offer_err(&blank).contains("names no run"));
+}

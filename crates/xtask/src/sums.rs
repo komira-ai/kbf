@@ -337,7 +337,7 @@ impl Attestations<'_> {
     /// Returns whether it accepted the file, and what it printed on stderr. With a
     /// trusted root, the proxies point at nothing, so an acceptance used no network.
     /// An error when `gh` cannot be run.
-    fn bundle_run(
+    pub(crate) fn bundle_run(
         &self,
         file: &Path,
         bundle: &Path,

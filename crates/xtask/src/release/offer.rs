@@ -23,13 +23,13 @@
 //!    the document says `reversible: false`;
 //! 5. the artifacts' provenance and SBOM attestations for the commit
 //!    ([`Attester::artifacts`]: `verify-assets attestations`);
-//! 6. the beta result's attestation, for the same commit ([`Attester::beta`]).
+//! 6. the beta result's attestation, for the same commit ([`Attester::beta`]): the
+//!    bundle `<result>.sigstore.json` beside it, verified as a host verifies a tarball.
 //!
 //! The beta attestation does not exist yet (the beta workflow signs nothing): until it
 //! does, check 6 refuses every result and `--waive-beta` is the only way past, for gamma.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use kbf_gate::{
     Beta, CommitId, Limit, OfferDoc, ResultDoc, Sample, SetHash, Stage, Target, Verdict, Waiver,
@@ -86,24 +86,41 @@ impl Attester for Gh<'_> {
     }
 
     fn beta(&self, result: &Path, commit: &str) -> Result<(), Error> {
+        // As strict as a host's check of a tarball: the result's own bundle beside it,
+        // offline with a trusted root, the issuer, the predicate type, the commit.
         let signer = format!("{}/.github/workflows/{BETA_WORKFLOW}", self.repo);
-        let out = Command::new(self.gh)
-            .args(["attestation", "verify"])
-            .arg(result)
-            .args(["--repo", self.repo, "--signer-workflow", &signer])
-            .args(["--source-ref", &format!("refs/heads/{MAIN}")])
-            .args(["--source-digest", commit, "--deny-self-hosted-runners"])
-            .output()
-            .map_err(Error::spawn(self.gh.display().to_string()))?;
-        if out.status.success() {
-            return Ok(());
+        let source_ref = format!("refs/heads/{MAIN}");
+        let a = sums::Attestations {
+            repo: self.repo,
+            workflow_ref: &signer,
+            source_ref: &source_ref,
+            commit,
+            trusted_root: self.trusted_root,
+            gh: self.gh,
+            scratch: self.scratch,
+        };
+        let name = result
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let bundle = result.with_file_name(crate::bundles::name_of(&name));
+        let (verified, said) = a.bundle_run(result, &bundle, &signer, commit)?;
+        if !verified {
+            return Err(Error::Failed(format!(
+                "{} is not attested by {BETA_WORKFLOW} for {commit} (bundle {}): {said}",
+                result.display(),
+                bundle.display()
+            )));
         }
-        let said = String::from_utf8_lossy(&out.stderr);
-        Err(Error::Failed(format!(
-            "{} is not attested by {BETA_WORKFLOW} for {commit}: {}",
-            result.display(),
-            said.trim_end()
-        )))
+        // The control: the same result and bundle must not verify for another commit.
+        let other = crate::bundles::other_commit(commit);
+        if a.bundle_run(result, &bundle, &signer, &other)?.0 {
+            return Err(Error::Failed(format!(
+                "control failed: the beta bundle of {} verified for commit {other}, not the \
+                 commit it attests",
+                result.display()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -476,8 +493,9 @@ pub struct OfferArgs {
     /// Run every check and print the offer; write nothing.
     #[arg(long)]
     pub plan: bool,
-    /// Where the offer is written.
-    #[arg(long, default_value = "offer.json")]
+    /// Where the offer is written (no default: a refusal never leaves a stale file with
+    /// a default name that looks current).
+    #[arg(long)]
     pub out: PathBuf,
     /// The `gh` program.
     #[arg(long, default_value = "gh")]

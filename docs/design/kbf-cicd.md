@@ -339,7 +339,7 @@ runs with attestation verification off; that is a test-farm setting, not a defau
 Offering is dry-run by default (`--plan`): it prints what would change and which gates it read.
 
 The verb is `cargo xtask release offer` (`crates/xtask/src/release/offer.rs`), not a `kbf` subcommand: the pinned `gh` and the
-online verification belong to the operator side. It makes no network write. Its output is `offer.json`
+online verification belong to the operator side. It makes no network write. Its output is the file `--out <path>` names (no default, so a refusal cannot leave a stale default-named file): `offer.json`
 (`kbf_gate::OfferDoc`: commit, set hash, the beta run or a recorded waiver, `reversible`, the previous commit, the platforms found
 complete), which the deploy reads; the desired-state write stays the deploy's. Until a beta result is attested, `--waive-beta
 <reason> --operator <name>` is the only way past, for gamma only, and the waiver is recorded in `offer.json`. `reversible` is true

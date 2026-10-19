@@ -666,13 +666,23 @@ impl Cli {
             }
         }
         if let Some(b) = beta {
-            let sha = sha_of(&std::fs::read(b).unwrap());
-            store.push_str(&format!(
-                "{sha} --repo {REPO} --signer-workflow {BETA} --source-ref refs/heads/main \
-                 --source-digest {C} --deny-self-hosted-runners\n"
-            ));
+            self.beta_bundle(b, C);
         }
         std::fs::write(self.gh.with_file_name("attested"), store).unwrap();
+    }
+
+    /// The bundle beside the beta result `b`, attesting it for `commit` under the flags
+    /// a host-grade check passes: offline, issuer, predicate type, commit.
+    fn beta_bundle(&self, b: &Path, commit: &str) {
+        let flags = format!(
+            "--repo {REPO} --signer-workflow {BETA} --cert-oidc-issuer \
+             https://token.actions.githubusercontent.com --source-ref refs/heads/main \
+             --source-digest {commit} --predicate-type https://slsa.dev/provenance/v1 \
+             --deny-self-hosted-runners"
+        );
+        let sha = sha_of(&std::fs::read(b).unwrap());
+        let name = format!("{}.sigstore.json", b.file_name().unwrap().to_str().unwrap());
+        std::fs::write(b.with_file_name(name), bundle(&sha, Some(&flags))).unwrap();
     }
 
     fn run(&self, extra: &[&str]) -> (Option<i32>, String, String) {
@@ -785,4 +795,52 @@ fn the_cli_records_a_waiver_for_gamma() {
     let doc = OfferDoc::from_bytes(&std::fs::read(&c.out).unwrap()).unwrap();
     assert!(matches!(doc.beta, Beta::Waived { .. }));
     assert_eq!(doc.target, Target::Gamma);
+}
+
+#[test]
+fn the_cli_refuses_a_beta_bundle_of_another_commit_and_one_without_flags_pinned() {
+    // The beta check is as strict as the tarball check: the fake gh accepts only the
+    // exact flag set (issuer, predicate type, source digest, offline root), so a bundle
+    // attesting another commit is refused, and the accepting run above pins the flags.
+    // Mutant: the beta call drops --cert-oidc-issuer / --predicate-type / the commit.
+    let c = cli("cli-beta-other");
+    let beta = put_beta(&c.fx.root, &beta_doc(C, &c.fx.set));
+    c.attest(None);
+    c.beta_bundle(&beta, PREV);
+    let (code, _, err) = c.run(&["--beta-result", beta.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("is not attested by beta.yml"), "{err}");
+    assert!(!c.out.exists());
+}
+
+#[test]
+fn the_beta_attestation_is_asked_with_a_previous_commit_too() {
+    // Mutant: the beta attester asked for `previous.unwrap_or(commit)`.
+    let f = fx("beta-with-previous");
+    let beta = put_beta(&f.root, &beta_doc(C, &f.set));
+    let a = Recorded::all(C);
+    let new = identity(&f.root, "new.json", C, Some("4"));
+    let old = identity(&f.root, "old.json", PREV, Some("4"));
+    let mut r = request(&f.dist, Evidence::Result(&beta));
+    r.version_json = Some(&new);
+    r.previous = Some(PREV);
+    r.previous_version_json = Some(&old);
+    let doc = plan(&r, &a).unwrap();
+    assert!(doc.reversible);
+    assert_eq!(a.asked(), [format!("artifacts {C}"), format!("beta {C}")]);
+}
+
+#[test]
+fn the_cli_has_no_default_out() {
+    let c = cli("cli-no-out");
+    let out = Command::new(XTASK)
+        .args(["release", "offer"])
+        .arg(&c.fx.dist)
+        .args(["--repo", REPO, "--commit", C, "--platform", "linux-x86_64"])
+        .args(["--waive-beta", "x", "--operator", "adi", "--plan"])
+        .current_dir(&c.fx.root)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!c.fx.root.join("offer.json").exists());
 }
