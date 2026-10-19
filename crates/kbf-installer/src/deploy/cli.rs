@@ -8,14 +8,13 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::api::Http;
+use super::api::{Https, Trust};
 use super::frontend_addr::derive;
-use super::smoke::CasSmoke;
+use super::smoke::{CasSmoke, random};
 use super::summary::Exit;
 use super::summary::Summary;
 use super::{
-    Check, Clock, Env, NoCheck, NoSmoke, Options, Order, Smoke, SystemClock, deploy, lock, summary,
-    why,
+    Check, Clock, Env, NoCheck, NoSmoke, Options, Smoke, SystemClock, deploy, lock, summary, why,
 };
 use crate::CommitId;
 
@@ -24,9 +23,14 @@ use crate::CommitId;
 pub const CONFIG: &str = "/etc/kbf-installer/deploy.json";
 
 pub const USAGE: &str = "usage: kbf-installer deploy --commit <40hex> [--api <127.0.0.1:port>] \
-[--token-file <path>] [--config <path>] [--cas http(s)://127.0.0.1:port] [--cas-ca <pem>] [--cas-server-name <dns>] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
+[--api-ca <pem>] [--api-server-name <dns>] [--token-file <path>] [--config <path>] \
+[--cas http(s)://127.0.0.1:port] [--cas-ca <pem>] [--cas-server-name <dns>] [--apply] [--json] [--bundle -|DIR] \
 [--allow-offline <id>[,<id>...]] [--node-timeout-s N] [--handover-timeout-s N] [--smoke-timeout-s N] \
 [--lock <path>] [--platform linux-x86_64|linux-arm64|darwin-arm64]";
+
+/// How long one call to the API may take, a release upload included (each read and write
+/// of the connection is held to it).
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Where the CAS smoke dials and how it verifies a TLS listener; from the flags, else the
 /// host's config. With no address the frontend's own config names it ([`smoke_for`]).
@@ -37,9 +41,16 @@ pub(super) struct CasFlags {
     pub(super) server_name: Option<String>,
 }
 
-struct Args {
-    options: Options,
-    api: SocketAddr,
+/// Where the API is and how its certificate is verified, from the flags and the host config.
+struct Api {
+    addr: SocketAddr,
+    ca: Option<PathBuf>,
+    server_name: Option<String>,
+}
+
+pub(super) struct Args {
+    pub(super) options: Options,
+    api: Api,
     cas: CasFlags,
     token_file: PathBuf,
     bundle: Option<String>,
@@ -50,8 +61,10 @@ struct Args {
 /// that got here through `sudo` (a deploy account that may only run `deploy`) must not set
 /// them: root would read a file of the caller's choosing and send it to an address of the
 /// caller's choosing. Those values come from the root-owned config.
-const HOST_FLAGS: [&str; 8] = [
+const HOST_FLAGS: [&str; 10] = [
     "--api",
+    "--api-ca",
+    "--api-server-name",
     "--token-file",
     "--config",
     "--lock",
@@ -61,19 +74,21 @@ const HOST_FLAGS: [&str; 8] = [
     "--cas-server-name",
 ];
 
-fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
+pub(super) fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     let mut commit = None;
     let mut api = None;
+    let mut api_ca = None;
+    let mut api_server_name = None;
     let mut cas = CasFlags::default();
     let mut token_file = None;
     let mut bundle = None;
     let mut apply = false;
-    let mut order = Order::NodesFirst;
     let mut allow = Vec::new();
     let mut lock_path = PathBuf::from(super::LOCK);
     let mut platform = host_platform().to_owned();
     let mut config = PathBuf::from(CONFIG);
-    let mut secs = [1800u64, 900, 60];
+    // The nodes' budget each, the whole frontend update (it includes the bake), a smoke.
+    let mut secs = [1800u64, 3600, 60];
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         if via_sudo && HOST_FLAGS.contains(&flag.as_str()) {
@@ -88,6 +103,8 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
             "--json" => {}
             "--commit" => commit = Some(value("--commit")?),
             "--api" => api = Some(value("--api")?),
+            "--api-ca" => api_ca = Some(PathBuf::from(value("--api-ca")?)),
+            "--api-server-name" => api_server_name = Some(value("--api-server-name")?),
             "--cas" => cas.url = Some(value("--cas")?),
             "--cas-ca" => cas.ca = Some(PathBuf::from(value("--cas-ca")?)),
             "--cas-server-name" => cas.server_name = Some(value("--cas-server-name")?),
@@ -96,15 +113,6 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
             "--config" => config = PathBuf::from(value("--config")?),
             "--lock" => lock_path = PathBuf::from(value("--lock")?),
             "--platform" => platform = value("--platform")?,
-            "--order" => {
-                order = match value("--order")?.as_str() {
-                    "nodes-first" => Order::NodesFirst,
-                    "frontend-first" => Order::FrontendFirst,
-                    other => {
-                        return Err(format!("--order {other:?}: nodes-first or frontend-first"));
-                    }
-                }
-            }
             "--allow-offline" => {
                 allow.extend(value("--allow-offline")?.split(',').map(str::to_owned));
             }
@@ -120,18 +128,21 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
             other => return Err(format!("unknown flag {other:?}")),
         }
     }
-    // The host's config fills what the flags leave out. A missing config file is fine when
-    // both flags are given.
-    let conf = read_config(
-        &config,
-        owner,
-        api.is_none()
-            || token_file.is_none()
-            || cas.url.is_none()
-            || cas.ca.is_none()
-            || cas.server_name.is_none(),
-    )?;
+    // The host's config fills what the flags leave out. It is not read at all when the flags
+    // give everything it could.
+    let missing = [
+        api.is_none(),
+        api_ca.is_none(),
+        api_server_name.is_none(),
+        token_file.is_none(),
+        cas.url.is_none(),
+        cas.ca.is_none(),
+        cas.server_name.is_none(),
+    ];
+    let conf = read_config(&config, owner, missing.contains(&true))?;
     let api = api.or(conf.api);
+    let api_ca = api_ca.or(conf.api_ca);
+    let api_server_name = api_server_name.or(conf.api_server_name);
     let token_file = token_file.or(conf.token_file);
     cas.url = cas.url.or(conf.cas);
     cas.ca = cas.ca.or(conf.cas_ca);
@@ -139,7 +150,7 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     let commit = commit.ok_or("--commit is required")?;
     let commit = CommitId::new(&commit).map_err(|e| e.to_string())?;
     let api = api.ok_or("--api is required (or `api` in the config)")?;
-    let api: SocketAddr = api
+    let addr: SocketAddr = api
         .parse()
         .map_err(|_| format!("--api {api:?} is not host:port"))?;
     if !matches!(
@@ -151,16 +162,21 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     if let Some(url) = &cas.url {
         CasSmoke::new(url, Duration::from_secs(secs[2])).map_err(|e| format!("--cas {e}"))?;
     }
-    let mut options = Options::new(commit, &platform);
+    // One id for the whole run: every retry of the frontend update carries it.
+    let request_id = format!("deploy-{}", hex::encode(random(16)?));
+    let mut options = Options::new(commit, &platform, request_id);
     options.apply = apply;
-    options.order = order;
     options.allow_offline = allow;
     options.node_timeout = Duration::from_secs(secs[0]);
     options.handover_timeout = Duration::from_secs(secs[1]);
     options.smoke_timeout = Duration::from_secs(secs[2]);
     Ok(Args {
         options,
-        api,
+        api: Api {
+            addr,
+            ca: api_ca,
+            server_name: api_server_name,
+        },
         cas,
         token_file: token_file.ok_or("--token-file is required (or `token_file` in the config)")?,
         bundle,
@@ -171,7 +187,12 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
 /// What the host's config file says.
 #[derive(Default)]
 struct HostConfig {
+    /// The proxy's public port, which serves every call of the deploy.
     api: Option<String>,
+    /// CA certificates (PEM) the API's certificate is verified against, besides the system's.
+    api_ca: Option<PathBuf>,
+    /// The name the API's certificate carries.
+    api_server_name: Option<String>,
     token_file: Option<PathBuf>,
     /// The local REAPI listener the CAS smoke uses.
     cas: Option<String>,
@@ -179,10 +200,9 @@ struct HostConfig {
     cas_server_name: Option<String>,
 }
 
-/// `{"api": "127.0.0.1:port", "token_file": "/path", "cas": "http://127.0.0.1:port"}` (and `cas_ca`,
-/// `cas_server_name`). Read
-/// only when a flag is missing; it must be a regular file owned by root and writable by no
-/// one else.
+/// `{"api": "127.0.0.1:port", "token_file": "/path", "cas": "http://127.0.0.1:port"}` (and
+/// `api_ca`, `api_server_name`, `cas_ca`, `cas_server_name`). Read only when a flag is
+/// missing; it must be a regular file owned by root and writable by no one else.
 fn read_config(path: &Path, owner: u32, needed: bool) -> Result<HostConfig, String> {
     if !needed {
         return Ok(HostConfig::default());
@@ -210,6 +230,8 @@ fn read_config(path: &Path, owner: u32, needed: bool) -> Result<HostConfig, Stri
     };
     Ok(HostConfig {
         api: get("api"),
+        api_ca: get("api_ca").map(PathBuf::from),
+        api_server_name: get("api_server_name"),
         token_file: get("token_file").map(PathBuf::from),
         cas: get("cas"),
         cas_ca: get("cas_ca").map(PathBuf::from),
@@ -287,6 +309,20 @@ pub(super) fn smoke_for(
         .and_then(|s| s.tls(name, ca_pem))
         .map_err(|e| format!("--cas {e}"))?;
     Ok(Box::new(smoke))
+}
+
+/// The client of the API at `api`, with the CA file read.
+fn api_client(api: &Api, token: String) -> Result<Https, String> {
+    let ca_pem = api
+        .ca
+        .as_ref()
+        .map(|p| fs::read(p).map_err(|e| format!("--api-ca {}: {e}", p.display())))
+        .transpose()?;
+    let trust = Trust {
+        server_name: api.server_name.clone(),
+        ca_pem,
+    };
+    Https::new(api.addr, &trust, token, CALL_TIMEOUT).map_err(|e| format!("--api: {e}"))
 }
 
 /// The token: a regular file owned by root, mode 0600 or 0400, one token of visible ASCII.
@@ -396,9 +432,9 @@ pub(super) fn run(
         }
         Err(e) => return usage(err, &format!("the lock: {e}")),
     };
-    let api = match Http::new(parsed.api, token, Duration::from_secs(60)) {
+    let api = match api_client(&parsed.api, token) {
         Ok(a) => a,
-        Err(e) => return usage(err, &e.to_string()),
+        Err(why) => return usage(err, &why),
     };
     // A bundle directory is not read yet; only a stream on standard input is.
     let input: Option<&mut dyn Read> = match parsed.bundle.as_deref() {

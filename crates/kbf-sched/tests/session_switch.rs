@@ -336,6 +336,46 @@ fn a_quarantined_worker_is_offered_nothing_and_its_work_waits() {
     assert_eq!(placed.len(), 1, "{grants:?}");
 }
 
+/// Catches a draining worker (its daemon was told to stop and finishes its leases) that
+/// is treated as dead or as serving: while it heartbeats naming its leases, none is
+/// given up however long the drain takes (the restart drill's defect: 174 runs lost),
+/// and it is offered no new lease, work that only it could run waits and says why.
+#[test]
+fn a_draining_worker_keeps_its_leases_while_it_heartbeats_and_is_offered_nothing() {
+    let mut h = Harness::new();
+    h.register("mac", "one");
+    h.submit(1, request(1, LeaseKind::Action));
+    let (grants, _) = h.tick();
+    let [grant] = grants.as_slice() else {
+        panic!("{grants:?}");
+    };
+    h.start(grant);
+    assert_eq!(h.phase("mac", NodePhase::Draining), []);
+    h.submit(2, request(2, LeaseKind::Action));
+
+    let begun = h.now;
+    for beat in 1..=40 {
+        // Ten times the lease grace in all, a heartbeat every quarter of it.
+        h.at(begun + beat * millis(LEASE_GRACE) / 4)
+            .heartbeat("mac", &[grant.lease]);
+        let (grants, reasons) = h.tick();
+        assert_eq!(grants, [], "a draining worker was offered a lease");
+        // The reason is given when it first holds, not again at every tick.
+        let said: &[&str] = if beat == 1 {
+            &["every live worker that can run it is cordoned or not serving: mac (draining)"]
+        } else {
+            &[]
+        };
+        assert_eq!(reasons, said);
+        assert_eq!(h.held(), [grant.lease], "its lease was given up");
+    }
+    assert_eq!(h.requeues(), []);
+    assert!(matches!(
+        h.sched.state(grant.operation),
+        Some(OpState::Running { .. })
+    ));
+}
+
 /// Catches a quarantine that reads as a plain cordon when it is the only connected
 /// worker and serves no request kind: the reason names that a worker is not serving.
 #[test]

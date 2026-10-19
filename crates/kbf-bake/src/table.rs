@@ -13,6 +13,11 @@
 
 /// How long the bake lasts: 24 hours.
 pub const BAKE_SECS: u64 = 24 * 3600;
+/// The baseline window: the 7 days before the deploy.
+pub const BASELINE_SECS: u64 = 7 * 24 * 3600;
+/// How far short of the window's edges the evaluator's own earlier scrapes may fall and still
+/// be taken to cover it. (Not a threshold of the page.)
+pub const BASELINE_SLACK_SECS: u64 = 3600;
 /// The minimum load, section 7: executed actions across the window.
 pub const MIN_ACTIONS: u64 = 1000;
 /// The minimum load: builds across the window.
@@ -152,6 +157,10 @@ pub fn prose() -> Vec<String> {
         format!("## 7. The {} hour bake", BAKE_SECS / 3600),
         format!(
             "at least **[P]** {MIN_ACTIONS} executed actions and {MIN_BUILDS} builds across the window, and at least {MIN_HOURS} distinct hours with load"
+        ),
+        format!(
+            "the same ratios over the {} days before the deploy",
+            BASELINE_SECS / 86400
         ),
     ]
 }

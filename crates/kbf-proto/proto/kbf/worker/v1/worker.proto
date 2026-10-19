@@ -158,6 +158,12 @@ enum Phase {
   // falls or its last lease ends. A server that does not know this value reads it as a
   // quarantine, which also takes no lease.
   PHASE_MEMORY_PRESSURE = 4;
+  // The daemon was told to stop (SIGTERM or SIGINT) and is draining: it takes no new
+  // lease, runs the ones it holds to their end, reports their Results and waits for
+  // their ResultAcks, then exits. The server keeps its leases, and its heartbeats keep
+  // the node in contact as usual; it is not lost and nothing is requeued. A server that
+  // does not know this value reads it as a quarantine, which also takes no lease.
+  PHASE_DRAINING = 5;
 }
 
 message NodePhase {

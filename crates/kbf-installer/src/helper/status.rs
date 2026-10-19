@@ -16,6 +16,7 @@ struct Staged {
     protocol: u32,
     min_protocol: u32,
     state_schema: u32,
+    profile: Option<String>,
 }
 
 /// The pinned Envoy, once the installer manages one (a later change); today neither is set.
@@ -71,6 +72,7 @@ pub fn render(state: &State, memory: &Memory) -> Vec<u8> {
             protocol: f.protocol,
             min_protocol: f.min_protocol,
             state_schema: f.state_schema,
+            profile: memory.staged_profile.clone(),
         });
     let file = File {
         schema: SCHEMA,
@@ -79,7 +81,7 @@ pub fn render(state: &State, memory: &Memory) -> Vec<u8> {
         staged_commit: state.staged.as_ref(),
         state: word(state, memory),
         refusal: &memory.refusal,
-        acked_order_id: memory.acked_order_id,
+        acked_order_id: memory.acked_order_id.max(memory.last_acted_id),
         staged,
         envoy: Envoy {
             current: None,

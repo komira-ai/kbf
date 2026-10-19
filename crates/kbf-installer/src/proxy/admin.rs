@@ -13,7 +13,7 @@
 //! | `stand_down` | `POST /v1/admin/stand-down` | admin | [`Deadlines::call`] |
 //! | `resume` | `POST /v1/admin/resume` | admin | [`Deadlines::call`] |
 //! | `ready` | `GET /readyz` | operator | [`Deadlines::call`] |
-//! | `open_counts` | `GET /v1/frontend/drain` | operator | [`Deadlines::call`] |
+//! | `open_counts` | `GET /v1/admin/role` (`open_streams`, `open_sessions`) | admin | [`Deadlines::call`] |
 //! | `post_desired` | `POST /v1/update/desired {"commit": ...}` | operator | [`Deadlines::call`], all tries together |
 //!
 //! Each method is in the trait and, with a typed error, as `try_<name>`; the trait flattens
@@ -99,7 +99,7 @@
 //!
 //! The admin calls carry the caller's secret headers. The child does not read them today
 //! (the admin calls carry no credential), and a child that gates the port on them later
-//! needs no change here. Reads of the operator port (`/readyz`, the drain read) carry
+//! needs no change here. Reads of the operator port (`/readyz`) carry
 //! nothing: they are open, and a secret is sent only where it can be needed.
 //!
 //! Every call blocks the calling thread for up to its deadline: the swap runs on a thread of
@@ -284,11 +284,13 @@ struct Reason {
     code: Option<String>,
 }
 
-/// `GET /v1/frontend/drain`, the two counts the swap waits on.
+/// The two counts of the child's `role` answer the swap waits on. Both are required: a
+/// missing count must not read as zero (idle).
 #[derive(Deserialize)]
-struct Drain {
-    open_executions: u64,
-    queued_operations: u64,
+struct Counted {
+    admin_protocol: u32,
+    open_streams: u64,
+    open_sessions: u64,
 }
 
 /// A child's admin and operator ports, addressed by slot.
@@ -395,20 +397,25 @@ impl Admin {
     }
 
     pub fn try_open_counts(&self, slot: Slot) -> Result<OpenCounts, AdminError> {
-        let addr = (self.operator)(slot);
-        let headers = Headers::new();
-        get(
-            "open_counts",
-            addr,
+        const CALL: &str = "open_counts";
+        let counted: Counted = get(
+            CALL,
+            (self.admin)(slot),
             self.deadlines.call,
-            "/v1/frontend/drain",
-            &headers,
+            "/v1/admin/role",
+            &self.secret,
         )
-        .and_then(|answer| judge("open_counts", answer))
-        .and_then(|body| parse::<Drain>("open_counts", &body))
-        .map(|drain| OpenCounts {
-            open_executions: drain.open_executions,
-            queued_operations: drain.queued_operations,
+        .and_then(|answer| judge(CALL, answer))
+        .and_then(|body| parse(CALL, &body))?;
+        if counted.admin_protocol != ADMIN_PROTOCOL {
+            return Err(AdminError::Protocol {
+                call: CALL,
+                found: counted.admin_protocol,
+            });
+        }
+        Ok(OpenCounts {
+            open_streams: counted.open_streams,
+            open_sessions: counted.open_sessions,
         })
     }
 

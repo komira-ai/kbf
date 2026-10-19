@@ -282,6 +282,14 @@ impl kbf_proto::update::release_service_server::ReleaseService for Svc {
             }
         }
     }
+
+    /// The fetch child pulls one file by its digest and never asks what a release holds.
+    async fn describe(
+        &self,
+        _request: tonic::Request<kbf_proto::update::DescribeRequest>,
+    ) -> Result<tonic::Response<kbf_proto::update::ReleaseDescription>, tonic::Status> {
+        Err(tonic::Status::unimplemented("this worker serves Fetch only"))
+    }
 }
 
 use futures::StreamExt as _;

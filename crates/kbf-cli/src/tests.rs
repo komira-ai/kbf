@@ -905,6 +905,23 @@ fn only_version_and_json_ask_for_the_identity() {
     }
 }
 
+/// Catches `meta_log` written as a literal: a literal equal to the constant today passes
+/// the value check above and goes stale the day the constant is bumped, and a rollout
+/// then calls an irreversible step reversible. The one place the number may come from is
+/// `kbf_server::raft_log::RUNS`, so the source of `identity` must read it.
+#[test]
+fn meta_log_is_read_from_the_log_constant_not_written_down() {
+    let source = include_str!("version.rs");
+    let at = source
+        .find("\"meta_log\".to_owned()")
+        .expect("meta_log is inserted");
+    let insert = &source[at..source[at..].find(");").map_or(source.len(), |e| at + e)];
+    assert!(
+        insert.contains("kbf_server::raft_log::RUNS"),
+        "meta_log must be read from kbf_server::raft_log::RUNS: {insert}"
+    );
+}
+
 /// An empty protocol range is a build error.
 const _: () =
     assert!(kbf_server::worker::OLDEST_PROTOCOL_VERSION <= kbf_server::worker::PROTOCOL_VERSION);
@@ -927,6 +944,7 @@ fn the_identity_is_the_libraries_own_and_both_halves_speak_one_protocol() {
         v["min_protocol"],
         kbf_server::worker::OLDEST_PROTOCOL_VERSION
     );
+    assert_eq!(v["meta_log"], kbf_server::raft_log::RUNS.get());
     assert_eq!(v["state_schema"], kbf_state::postgres::schema::latest());
     assert_eq!(v["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));

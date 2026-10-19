@@ -19,7 +19,7 @@ use kbf_proto::worker::segments_client::SegmentsClient;
 use kbf_server::NodeMap;
 use kbf_server::join::{Identity as NodeIdentity, Joiner};
 use kbf_server::members::{Members, MembershipConfig};
-use kbf_server::storage_health::Debts;
+use kbf_server::storage_health::Reported;
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
 use kbf_server::{
     EpochPolicy, Listeners, StateStore, TlsSource, WorkerTls, bind_server_with_state,
@@ -27,7 +27,7 @@ use kbf_server::{
 use kbf_state::{Store, Versioned};
 use kbf_storage::Storage as _;
 use kbf_storage::repair::{NoLedger, Options, RepairRecord, Repairs};
-use kbf_storage::service::{CatchUp, ROLE_URI_PREFIX, RemoteStorage};
+use kbf_storage::service::{CatchUp, OpenWrites, ROLE_URI_PREFIX, RemoteStorage};
 use kbf_store::FaultFs;
 use kbf_types::{Digest, DigestFunction};
 use rcgen::{
@@ -244,7 +244,7 @@ async fn a_node_whose_row_lapsed_registers_again() {
                 MemberId(1),
                 2,
                 kbf_server::members::Progress::CaughtUp,
-                Debts::Unknown,
+                Reported::default(),
                 None,
             )
             .ok()
@@ -858,7 +858,7 @@ async fn a_node_with_a_journal_reports_the_copies_it_owes_across_a_restart() {
                 MemberId(1),
                 2,
                 kbf_server::members::Progress::CaughtUp,
-                Debts::Unknown,
+                Reported::default(),
                 None,
             )
             .ok()
@@ -892,6 +892,71 @@ async fn a_node_without_a_journal_says_it_cannot_say() {
         None
     );
     joiner.abort();
+}
+
+/// The frontend's view of member 1, polled until `ready` holds for it.
+async fn until_node(
+    f: &Frontend,
+    what: &str,
+    ready: impl Fn(&kbf_server::storage_health::NodeHealth) -> bool,
+) -> kbf_server::storage_health::NodeHealth {
+    until(what, || {
+        let health = f.members.storage_health().expect("health");
+        health
+            .nodes
+            .iter()
+            .copied()
+            .find(|n| n.id == MemberId(1) && ready(n))
+    })
+    .await
+}
+
+/// Catches: a node that does not tell the frontend how many writes it has open, tells it a
+/// count that is not the handle's, or says nothing about the map it held when it counted.
+/// Through the real joiner and membership service: 2 open is 2 at the frontend, one ending
+/// is 1, none is 0 (known, not unknown), and the generation is the one the frontend's map
+/// has. A node whose joiner has no handle cannot say, and the frontend reads "unknown", not
+/// zero. Mutant: the joiner reports `Known(0)` without a handle.
+#[tokio::test]
+async fn a_node_reports_the_writes_it_has_open_and_the_map_it_holds() {
+    let f = frontend(None);
+    let open = OpenWrites::new();
+    let (first, second) = (open.begin(), open.begin());
+    let joiner = tokio::spawn(joiner_of(&f).with_open_writes(open.clone()).run());
+    until("the node to register", || row(&f, 1)).await;
+    f.members
+        .set_state(MemberId(1), MemberState::Active)
+        .expect("promoted");
+    let node = until_node(&f, "two open writes", |n| n.open_writes == Some(2)).await;
+    let map = f.members.current_map().expect("read").expect("a map");
+    assert_eq!(node.generation, Some(map.generation()));
+    assert_ne!(map.generation(), 0, "the node was sent a map");
+
+    drop(first);
+    until_node(&f, "one open write", |n| n.open_writes == Some(1)).await;
+    drop(second);
+    until_node(&f, "none open", |n| n.open_writes == Some(0)).await;
+    joiner.abort();
+
+    let silent = tokio::spawn(joiner_of(&f).run());
+    until("the node to register again", || {
+        f.members
+            .heartbeat(
+                MemberId(1),
+                2,
+                kbf_server::members::Progress::CaughtUp,
+                Reported::default(),
+                None,
+            )
+            .ok()
+    })
+    .await;
+    let node = until_node(&f, "a report without a count", |n| {
+        n.repair_debts.is_none() && n.generation.is_some_and(|g| g != 0)
+    })
+    .await;
+    assert_eq!(node.open_writes, None, "no handle: cannot say");
+    silent.abort();
 }
 
 /// A node started with `--frontend` that the frontend admits but sends no map it can read
@@ -1521,6 +1586,116 @@ async fn a_node_that_copies_nothing_keeps_no_repair_journal() {
     let f = frontend(None);
     let (plain, _) = waiting_node(&f, "plain-no-journal").await;
     assert!(plain.repairs().is_none());
+}
+
+/// Catches: a started node whose service and registration do not share the writes-open
+/// count, so the frontend reads "cannot say" or 0 whatever the node is taking in. A node
+/// started with `--frontend` (plain text: it copies nothing, so it keeps no journal and its
+/// debts are "cannot say") reports its open writes through the real service and the real
+/// joiner: 0, then 1 while a `Write` is held open by a caller that has sent part of a blob,
+/// then 0 again. Mutants: the service not given the handle; the joiner not given it.
+#[tokio::test]
+async fn a_started_node_reports_the_writes_it_has_open() {
+    use kbf_proto::google::bytestream::WriteRequest;
+    use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+
+    let f = frontend(None);
+    let (node, client) = waiting_node(&f, "reports-writes").await;
+    let (maps, here) = (node.maps(), node.addr);
+    let _serving = tokio::spawn(node.serve());
+    until("the node to hold a map", || {
+        (maps.generation() > 0).then_some(())
+    })
+    .await;
+    let idle = until_node(&f, "none open", |n| n.open_writes == Some(0)).await;
+    assert_eq!(idle.repair_debts, None, "no journal: cannot say");
+    drop(client);
+
+    let blob = format!("held open by run {}", std::process::id()).into_bytes();
+    let digest = kbf_segments::sha256(&blob);
+    let name = format!(
+        "uploads/u-1/blobs/{}/{}",
+        digest.hash_hex(),
+        digest.size_bytes
+    );
+    let (send, receive) = tokio::sync::mpsc::channel::<WriteRequest>(2);
+    let mut write = ByteStreamClient::new(
+        Endpoint::from_shared(format!("http://{here}"))
+            .expect("endpoint")
+            .connect_lazy(),
+    );
+    let mut request = tonic::Request::new(futures::stream::unfold(receive, |mut r| async move {
+        r.recv().await.map(|m| (m, r))
+    }));
+    request.metadata_mut().insert(
+        kbf_storage::service::MAP_GENERATION_HEADER,
+        maps.generation().to_string().parse().expect("a header"),
+    );
+    let answer = tokio::spawn(async move { write.write(request).await });
+    let half = blob.len() / 2;
+    send.send(WriteRequest {
+        resource_name: name,
+        write_offset: 0,
+        finish_write: false,
+        data: blob[..half].to_vec(),
+    })
+    .await
+    .expect("first message");
+    until_node(&f, "one open", |n| n.open_writes == Some(1)).await;
+    send.send(WriteRequest {
+        resource_name: String::new(),
+        write_offset: half as i64,
+        finish_write: true,
+        data: blob[half..].to_vec(),
+    })
+    .await
+    .expect("last message");
+    answer.await.expect("joins").expect("the write is taken");
+    until_node(&f, "none open again", |n| n.open_writes == Some(0)).await;
+}
+
+/// Catches: a started node with a repair journal that does not give it to its registration,
+/// so the frontend can never read the debts of a real farm: a mutual-TLS node (it keeps a
+/// journal) is read as owing 0, known, and as having 0 writes open, not "cannot say".
+/// Mutant: the joiner not given the journal.
+#[tokio::test]
+async fn a_started_node_with_a_journal_reports_what_it_owes() {
+    let pki = Pki::new();
+    let (frontend_cert, frontend_key) = pki.cert("frontend");
+    let worker_tls = WorkerTls {
+        server: TlsSource::fixed(
+            "worker",
+            frontend_cert.as_bytes(),
+            frontend_key.as_bytes(),
+            Some(pki.ca.pem().as_bytes()),
+        )
+        .expect("the worker listener's TLS"),
+        deny_list: None,
+    };
+    let f = frontend(Some(worker_tls));
+    let d = dir("reports-debts");
+    let write = |name: &str, text: String| {
+        let path = d.join(name);
+        std::fs::write(&path, text).expect("write");
+        path.display().to_string()
+    };
+    let (cert, key) = pki.cert("storage");
+    let more = [
+        format!("--frontend=https://localhost:{}", f.worker.port()),
+        format!("--storage-tls-cert={}", write("node.pem", cert)),
+        format!("--storage-tls-key={}", write("node.key", key)),
+        format!("--storage-client-ca={}", write("ca.pem", pki.ca.pem())),
+    ];
+    let half = kbf_server::storage_half::start(&flags(&d, &more).expect("flags"), never)
+        .await
+        .expect("starts");
+    let _serving = tokio::spawn(half.serve());
+    until("the node to register", || row(&f, 1)).await;
+    let node = until_node(&f, "debts and writes known", |n| {
+        n.repair_debts.is_some() && n.open_writes.is_some()
+    })
+    .await;
+    assert_eq!((node.repair_debts, node.open_writes), (Some(0), Some(0)));
 }
 
 /// Catches a node that calls its peers without the certificate it registers with, or that
