@@ -5,7 +5,8 @@
 //! What is here: the [`Swap`] phase machine for a frontend host (two children side by
 //! side) and for an all-in-one host (stop, hold, start); recovery after a proxy restart
 //! ([`Swap::adopt`]); the operator's rollback; the retire rule; and [`FileRecorder`], the
-//! fsynced `update.json`. The update API is in [`api`] (U8a).
+//! fsynced `update.json`; and [`orders::OrderSpool`], the one writer of every order the
+//! proxy puts in `orders/`. The update API is in [`api`] (U8a).
 //!
 //! Real implementations of the ports (U7b), each behind the trait it implements:
 //! - [`gate_real::ProxyGate`], the `Gate` on `kbf-proxy`'s hold gate (it keeps the
@@ -85,6 +86,7 @@ pub mod child_http;
 pub mod child_real;
 pub mod gate_real;
 pub mod model;
+pub mod orders;
 pub mod ports;
 pub mod record;
 mod recover;
@@ -112,6 +114,8 @@ mod fault_tests;
 mod gate_real_tests;
 #[cfg(test)]
 mod gate_tests;
+#[cfg(test)]
+mod orders_tests;
 #[cfg(test)]
 mod reconcile_tests;
 #[cfg(test)]

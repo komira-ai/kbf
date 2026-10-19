@@ -32,7 +32,7 @@ fn run_with(args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, String, String
 /// directory of `name`: the `--ca-cert`, `--cert` and `--key` flags. The tests below that
 /// reach the mode's own start need a host the self-checks pass.
 #[cfg(target_os = "linux")]
-fn daemon_files(name: &str) -> [String; 3] {
+fn daemon_files(name: &str) -> ([String; 3], kbf_testkit::dir::TestDir) {
     use std::os::unix::fs::PermissionsExt as _;
 
     use rcgen::{ExtendedKeyUsagePurpose, KeyUsagePurpose, SanType};
@@ -59,11 +59,12 @@ fn daemon_files(name: &str) -> [String; 3] {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode");
         path.display().to_string()
     };
-    [
+    let flags = [
         format!("--ca-cert={}", write("ca.pem", ca.pem(), 0o644)),
         format!("--cert={}", write("node.pem", cert.pem(), 0o644)),
         format!("--key={}", write("node.key", key.serialize_pem(), 0o600)),
-    ]
+    ];
+    (flags, dir)
 }
 
 /// Catches a build node that starts with a flag of another mode (exit 0 or 1 instead of
@@ -299,7 +300,7 @@ fn the_readmes_smoke_test_runs() {
 /// directory cannot be made exits 1 with the daemon's message.
 #[test]
 fn daemon_runs_the_daemons_start() {
-    let [ca, cert, key] = daemon_files("daemon_runs_the_daemons_start");
+    let ([ca, cert, key], _files) = daemon_files("daemon_runs_the_daemons_start");
     let (code, _, err) = run(&[
         names::DAEMON,
         "--driver=native",
@@ -320,7 +321,7 @@ fn daemon_runs_the_daemons_start() {
 /// refuses a cold store that cannot be made (exit 2, as in `kbf-all-in-one`).
 #[test]
 fn all_in_one_runs_both_halves_start() {
-    let [ca, cert, key] = daemon_files("all_in_one_runs_both_halves_start");
+    let ([ca, cert, key], _files) = daemon_files("all_in_one_runs_both_halves_start");
     // The container driver's host, as the self-checks want it: a `crun` that answers
     // `--version` (never run otherwise; the start stops at the cold store).
     let dir = scratch("all_in_one_runs_both_halves_start_host");
@@ -362,12 +363,9 @@ fn the_binary_answers_as_a_keeper_before_it_reads_its_command_line() {
     assert!(out.is_empty(), "{out}");
 }
 
-/// The scratch directory a test may write under (the workspace's `target/`).
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A fresh scratch directory under the workspace's `target/`, removed when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 /// Catches `kbf check-args` starting the mode it checks (the daemon's start makes its

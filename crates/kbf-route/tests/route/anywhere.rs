@@ -462,6 +462,43 @@ async fn at_most_four_copies_run_at_once_and_a_digest_runs_once() {
     until(|| cluster.node(1).put_log().len() == kbf_route::MAX_REPAIRS_IN_FLIGHT).await;
 }
 
+/// Catches a repair that copies to an owner that has the blob by the time it runs (a second
+/// copy of what is already there, and a write to a node that did not need one): the primary
+/// lacks the blob at find time and the replica holds it, so a repair is queued; the primary
+/// gets the blob before the repair task first runs (it runs only when the test next waits,
+/// on this test's single-threaded runtime). The repair must ask the primary again and send
+/// it nothing.
+#[tokio::test]
+async fn a_repair_does_not_copy_to_an_owner_that_got_the_blob_meanwhile() {
+    let map = map(1, 2, active(&[1, 2]));
+    let cluster = Cluster::of(2);
+    let router =
+        Router::new(Cell::with(view(&map)), cluster.clone()).with_background_repair(limit());
+    let (blob, digest) = blob_read_from(&map, &[1, 2]);
+    cluster.node(2).hold(&blob);
+
+    assert!(
+        router
+            .find_missing_anywhere(&[digest])
+            .await
+            .expect("answer")
+            .is_empty()
+    );
+    assert_eq!(cluster.node(1).find_log(), [vec![digest]], "the find's ask");
+    cluster.node(1).hold(&blob);
+
+    until(|| cluster.node(1).find_log().len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        cluster.node(1).find_log(),
+        [vec![digest], vec![digest]],
+        "the repair asked the primary again"
+    );
+    assert!(cluster.node(1).put_log().is_empty(), "nothing copied to it");
+    assert!(cluster.node(2).put_log().is_empty());
+    assert_eq!(cluster.node(2).read_count(), 0, "the blob was not read");
+}
+
 /// Catches a repair that fails the question or panics when the owner it was to fill cannot
 /// be dealt with: just after the find, the process loses its map; the owner leaves the map;
 /// the owner has no node to dial; the owner cannot answer whether it lacks the blob. Each
