@@ -66,6 +66,7 @@ pub mod ports;
 pub mod record;
 mod recover;
 mod retire;
+pub mod root_orders;
 mod swap;
 
 #[cfg(test)]
@@ -88,6 +89,8 @@ mod reconcile_tests;
 mod record_tests;
 #[cfg(test)]
 mod recover_tests;
+#[cfg(test)]
+mod root_orders_tests;
 #[cfg(test)]
 mod swap_tests;
 
