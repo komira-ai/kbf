@@ -180,9 +180,8 @@ impl SniCerts {
 
     /// The certificate a ClientHello carrying `name` (or none) is served.
     fn pick(&self, name: Option<&str>) -> Arc<CertifiedKey> {
-        // PLANTED: the old behavior, one certificate for every name.
-        let _ignored = name.and_then(|n| self.inner.by_name.get(&normal(n)));
-        Arc::clone(&self.inner.default)
+        let found = name.and_then(|n| self.inner.by_name.get(&normal(n)));
+        Arc::clone(found.unwrap_or(&self.inner.default))
     }
 }
 
