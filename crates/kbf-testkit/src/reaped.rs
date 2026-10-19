@@ -126,8 +126,31 @@ fn cloexec_hook(keep_below: i32) -> impl FnMut() -> io::Result<()> + Send + Sync
 #[cfg(test)]
 mod tests {
     use std::os::fd::AsRawFd as _;
+    use std::sync::{Mutex, MutexGuard};
 
     use super::*;
+
+    /// Every test here marks descriptors "from N up" in this process, which flips the flag of
+    /// any other test's descriptor above N. Held for a test's whole body, so they run one at
+    /// a time. A poisoned lock (another test failed) is still a lock.
+    static FD_TESTS: Mutex<()> = Mutex::new(());
+
+    fn exclusive() -> MutexGuard<'static, ()> {
+        FD_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Catches a lock that turns one failed test into a failure of all the others: after a
+    /// test panicked holding it, the next one still gets it.
+    #[test]
+    fn a_test_that_panicked_holding_the_lock_does_not_block_the_next() {
+        let panicked = std::thread::spawn(|| {
+            let _held = exclusive();
+            panic!("a test failed holding the lock");
+        })
+        .join();
+        assert!(panicked.is_err());
+        drop(exclusive());
+    }
 
     /// Catches a walk that marks the wrong range when the kernel's one-call way is not there
     /// (before Linux 5.11, or not Linux): a descriptor below the first stays inheritable, one
@@ -135,6 +158,7 @@ mod tests {
     /// the other tests here open.
     #[test]
     fn the_walk_marks_only_descriptors_from_the_first_up() {
+        let _fd_tests = exclusive();
         let null = std::fs::File::open("/dev/null").expect("open");
         let dup_from = |base: i32| {
             // SAFETY: duplicates a descriptor this test holds, without close-on-exec.
@@ -165,6 +189,7 @@ mod tests {
     /// then, so a descriptor above the first stays inheritable. Placed from 1300.
     #[test]
     fn the_walk_does_not_run_when_the_range_call_did_the_work() {
+        let _fd_tests = exclusive();
         let null = std::fs::File::open("/dev/null").expect("open");
         // SAFETY: duplicates a descriptor this test holds, without close-on-exec.
         let fd = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 1300) };
@@ -182,6 +207,7 @@ mod tests {
     /// and leaves a lower descriptor alone. Placed from 1400 and 1500.
     #[test]
     fn the_spawn_hook_marks_from_keep_below_up() {
+        let _fd_tests = exclusive();
         let null = std::fs::File::open("/dev/null").expect("open");
         let dup_from = |base: i32| {
             // SAFETY: duplicates a descriptor this test holds, without close-on-exec.
