@@ -1,4 +1,5 @@
-//! `kbf-cell`: the M1 and M2 integration harnesses (see the `kbf_it` library docs).
+//! `kbf-cell`: the M1, M2 and cross-version integration harnesses (see the `kbf_it`
+//! library docs).
 //!
 //! Exit codes: 0 done (or the check passed), 1 the check failed, 2 the command could
 //! not run.
@@ -38,6 +39,11 @@ enum Cli {
     /// and a daemon killed mid-lease (the `kbf_it::m2` docs say what is checked).
     #[cfg(target_os = "linux")]
     M2(kbf_it::m2::M2Args),
+    /// Runs the cross-version test: a frontend from one directory of binaries and a
+    /// daemon from another over the real worker protocol (the `kbf_it::cross_version`
+    /// docs say what is checked).
+    #[cfg(target_os = "linux")]
+    CrossVersion(kbf_it::cross_version::CrossVersionArgs),
     /// Checks a build and its rebuild after a clean: all remote, then all cache hits.
     Check {
         #[arg(long, value_enum)]
@@ -66,6 +72,8 @@ fn main() -> ExitCode {
         Cli::M1(args) => cell(kbf_it::m1::run(&args)),
         #[cfg(target_os = "linux")]
         Cli::M2(args) => cell(kbf_it::m2::run(&args)),
+        #[cfg(target_os = "linux")]
+        Cli::CrossVersion(args) => cell(kbf_it::cross_version::run(&args)),
         Cli::Check {
             tool,
             first,

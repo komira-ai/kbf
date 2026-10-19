@@ -696,6 +696,54 @@ jobs:
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
+  # The cross-version test: a frontend (kbf-server) from one directory of binaries and a
+  # daemon (kbf-daemon --driver fake) from another, over the real worker protocol on
+  # loopback (`kbf-cell cross-version`, crates/kbf-it/src/cross_version.rs, says what is
+  # checked; docs/design/frontend-proxy.md, section 9). Both directories are this build
+  # for now, the self-test: it shows the harness works on the tip and that the tip's own
+  # protocol facts agree. Release N enters through SERVER_DIR and DAEMON_DIR below: a
+  # directory holding that release's `kbf`, `kbf-server` and `kbf-daemon`, set by a step
+  # before the run (both directions are two runs, one with each variable set to it).
+  # x86_64 only, like m2-container, whose build it shares.
+  cross-version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      SERVER_DIR: target/debug
+      DAEMON_DIR: target/debug
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      - run: cargo build -p kbf-server -p kbf-node -p kbf-cli -p kbf-it --bin kbf-server --bin kbf-daemon --bin kbf --bin kbf-cell --locked
+      - run: target/debug/kbf-cell cross-version --server-dir "$SERVER_DIR" --daemon-dir "$DAEMON_DIR" --work "$RUNNER_TEMP/cross-version"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: cross-version-logs
+          path: ${{ runner.temp }}/cross-version/logs
+          if-no-files-found: warn
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   crun-arm:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30

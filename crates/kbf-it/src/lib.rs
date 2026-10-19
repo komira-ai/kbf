@@ -23,11 +23,20 @@
 //! image), twice, then checks the daemon's cgroup layout, an own-limit memory kill's
 //! doubled rerun, a lease held in a container, and a daemon killed mid-lease ([`m2`]
 //! says what it checks; docs/design/daemon.md, "End to end"). The image has no shell,
-//! so every action runs the `kbf-m2-act` binary. Both cells share the private `cell`
-//! module.
+//! so every action runs the `kbf-m2-act` binary.
+//!
+//! And the cross-version harness, `kbf-cell cross-version` ([`cross_version`], Linux
+//! only): the frontend (`kbf-server`) of one directory of binaries and the daemon
+//! (`kbf-daemon --driver fake`) of another, over the real worker protocol on loopback,
+//! with the protocol ranges both builds state, a probe `Hello` inside and outside the
+//! server's range, the daemon's `welcomed` and the operator API's node list
+//! ([`cross_version`] says what it checks; docs/design/frontend-proxy.md, section 9).
+//! All three cells share the private `cell` module.
 
 #[cfg(target_os = "linux")]
 mod cell;
+#[cfg(target_os = "linux")]
+pub mod cross_version;
 #[cfg(target_os = "linux")]
 pub mod daemon;
 pub mod deploy_units;

@@ -7,9 +7,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# `kbf-cell`, the M1 and M2 integration harnesses: the M1 and M2 tests themselves
-# (`kbf-cell m1`, `kbf-cell m2`), test certificates, the test-only daemon (the daemon
-# library with its local runtime) and the build-summary check; see the library docs.
+# `kbf-cell`, the M1, M2 and cross-version integration harnesses: the tests themselves
+# (`kbf-cell m1`, `kbf-cell m2`, `kbf-cell cross-version`), test certificates, the
+# test-only daemon (the daemon library with its local runtime) and the build-summary
+# check; see the library docs.
 [[bin]]
 name = "kbf-cell"
 path = "src/bin/kbf-cell.rs"
@@ -23,9 +24,13 @@ path = "src/bin/kbf-m2-act.rs"
 
 [dependencies]
 clap.workspace = true
+# `kbf-cell cross-version`'s probe stream (a Hello of its own, as a fake daemon sends it).
+futures.workspace = true
 kbf-deploy.workspace = true
 kbf-daemon.workspace = true
 kbf-objstore.workspace = true
+# The worker protocol's messages and client, for the same probe.
+kbf-proto.workspace = true
 kbf-testkit.workspace = true
 kbf-transfer.workspace = true
 rcgen.workspace = true
@@ -42,14 +47,15 @@ tracing-subscriber.workspace = true
 xtask.workspace = true
 
 [dev-dependencies]
-futures.workspace = true
 hex.workspace = true
 kbf-front.workspace = true
 # The Envoy render the real-Envoy tests (tests/envoy_box, tests/envoy_check.rs) run.
 kbf-installer.workspace = true
-kbf-proto.workspace = true
 kbf-server.workspace = true
 kbf-threads.workspace = true
+# SIGPIPE ignored by the fake `kbf-server` of tests/cross_version.rs, which runs before
+# the Rust runtime has (a write to a socket the peer closed would end the process).
+libc.workspace = true
 proc-macro2.workspace = true
 prost.workspace = true
 saphyr-parser.workspace = true
