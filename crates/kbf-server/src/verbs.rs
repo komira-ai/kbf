@@ -6,11 +6,10 @@
 //! through the [`kbf_state::Store`] trait and assumes no single writer: any frontend over the
 //! store answers from the same rows.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::http::header::CACHE_CONTROL;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
@@ -18,8 +17,9 @@ use axum::routing::get;
 use kbf_state::StoreError;
 use kbf_types::operator_api::{DeniedEntry, DeniedList};
 
-use crate::api::{DENIED, error, gate, json, no_members};
+use crate::api::{error, gate, json, no_members};
 use crate::members::{Members, MembershipError};
+use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 
 /// What the handler shares: the token the gate checks (`None`: writes are off) and the
@@ -29,12 +29,13 @@ struct Verbs {
     members: Option<Arc<Members>>,
 }
 
-/// The route. `token` is the operator API token the gate checks. Serve it with
-/// `into_make_service_with_connect_info`, as [`crate::api::router`] is; the router merges
-/// with it, the `GET` joining the `POST` and `DELETE` of the same path.
+/// The route. `token` is the operator API token the gate checks. Serve it
+/// behind the proxy-auth layer, as [`crate::api::router`] is: the handler takes the [`Caller`]
+/// that layer decided. The router merges with it, the `GET` joining the `POST` and `DELETE` of the same path.
 pub fn routes(token: Option<ApiToken>, members: Option<Arc<Members>>) -> Router {
     Router::new()
-        .route(DENIED, get(list_denied))
+        // A literal, the same path as [`crate::api::DENIED`]: the route-docs guard reads literals.
+        .route("/v1/denied", get(list_denied))
         .with_state(Arc::new(Verbs { token, members }))
 }
 
@@ -61,10 +62,10 @@ fn store_failure(e: &MembershipError) -> (StatusCode, &'static str) {
 
 async fn list_denied(
     State(verbs): State<Arc<Verbs>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
 ) -> Response {
-    if let Err((code, why)) = gate(verbs.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(verbs.token.as_ref(), &peer, &headers) {
         return no_store(error(code, &why));
     }
     let Some(members) = verbs.members.clone() else {

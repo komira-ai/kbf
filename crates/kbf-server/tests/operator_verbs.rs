@@ -15,6 +15,7 @@ use std::time::Duration;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::MemoryStore;
 use kbf_server::members::{Members, MembershipConfig};
+use kbf_server::proxy_auth::{ProxySecret, gate_requests};
 use kbf_server::token::ApiToken;
 use kbf_server::verbs::routes;
 use kbf_server::{Api, EpochPolicy, Listeners, StateStore, bind_server_with_state};
@@ -139,11 +140,22 @@ fn store_on(clock: Arc<ManualClock>) -> Arc<dyn Store> {
 
 /// Just the route over `members`, on a listener of their own.
 async fn serve_routes(token: Option<ApiToken>, members: Option<Arc<Members>>) -> SocketAddr {
+    serve_routes_behind(token, members, None).await
+}
+
+/// [`serve_routes`] with the proxy secret the API listener was started with (`None`: no proxy).
+async fn serve_routes_behind(
+    token: Option<ApiToken>,
+    members: Option<Arc<Members>>,
+    proxy: Option<Arc<ProxySecret>>,
+) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let app = routes(token, members);
+    // Behind the layer the frontend's API listener has: the handler reads the `Trust` it decides.
+    let app =
+        routes(token, members).layer(axum::middleware::from_fn_with_state(proxy, gate_requests));
     tokio::spawn(async move {
         let service = app.into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, service).await.expect("serve");
@@ -306,6 +318,36 @@ async fn the_listing_passes_the_write_gate() {
     let answer = request(off, "GET", "/v1/denied", OPERATOR, "").await;
     assert_eq!(answer.code, 403, "writes off: {}", answer.body);
     assert_no_store(&answer);
+}
+
+/// Catches a listing that reads its peer from the connection alone, and so never sees the
+/// proxy layer's verdict: behind a proxy, a `GET` that reaches the loopback port without the
+/// proxy's secret, with the right token and forged `x-kbf-*` identity headers, is refused 403
+/// and lists nothing; with the secret and the token it passes.
+///
+/// Mutant to see red: the handler's `Caller` replaced by `Caller::direct(peer.addr)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn behind_a_proxy_the_listing_needs_the_proxy_secret() {
+    let members = live_members();
+    members
+        .deny(&"node mac-07".parse().expect("an entry"), "SECRET-REASON")
+        .expect("deny");
+    let path = scratch("proxy").join("secret");
+    std::fs::write(&path, [0x5a_u8; 32]).expect("write the secret");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let secret = Arc::new(ProxySecret::from_file(&path).expect("a usable secret"));
+    let api = serve_routes_behind(Some(token()), Some(members), Some(secret)).await;
+    let forged = format!("{OPERATOR}x-kbf-node-id: node-a\r\nx-kbf-role: daemon\r\n");
+    let refused = request(api, "GET", "/v1/denied", &forged, "").await;
+    assert_eq!(refused.code, 403, "{}", refused.body);
+    assert_no_store(&refused);
+    assert!(!refused.body.contains("SECRET-REASON"), "{}", refused.body);
+    let proxied = format!(
+        "{OPERATOR}x-kbf-proxy-auth: {}\r\n",
+        hex::encode([0x5a_u8; 32])
+    );
+    let passed = request(api, "GET", "/v1/denied", &proxied, "").await;
+    assert_eq!(passed.code, 200, "{}", passed.body);
 }
 
 /// Catches a server without members answering anything but 404 (after the gate), and a
