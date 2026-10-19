@@ -83,6 +83,7 @@ impl ActionStore for StorageService {
         request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
         self.guard(&request, Endpoint::ActionCommit)?;
+        let _open = self.open_writes.begin();
         let request = request.into_inner();
         self.check_map(request.map_generation).await?;
         let role = match Writer::try_from(request.writer) {

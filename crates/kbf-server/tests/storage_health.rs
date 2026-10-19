@@ -23,7 +23,8 @@ use kbf_server::members::{
     Members, MembershipConfig, MembershipError, PROTOCOL, Progress, Registrant,
 };
 use kbf_server::storage_health::{
-    Debts, MemberReport, NotReady, Report, StorageGate, StorageHealth, render, storage_health,
+    Debts, MemberReport, NotReady, Report, Reported, StorageGate, StorageHealth, render,
+    storage_health,
 };
 use kbf_state::{Store, StoreTime};
 
@@ -38,8 +39,9 @@ fn reported(id: u64, state: MemberState, debts: Debts, seconds: u64) -> MemberRe
     MemberReport {
         id: MemberId(id),
         state,
+        planned: kbf_server::storage_health::Planned::No,
         report: Some(Report {
-            debts,
+            said: Reported::debts(debts),
             at: at(seconds),
         }),
     }
@@ -79,6 +81,7 @@ fn every_member_active_and_reporting_is_the_sum_of_their_debts() {
 #[test]
 fn a_member_that_is_down_makes_the_number_unknown_however_little_the_others_owe() {
     let down = MemberReport {
+        planned: kbf_server::storage_health::Planned::No,
         id: MemberId(2),
         state: MemberState::Down,
         report: None,
@@ -139,6 +142,7 @@ fn a_member_that_stopped_reporting_is_silent() {
     );
 
     let never = MemberReport {
+        planned: kbf_server::storage_health::Planned::No,
         report: None,
         ..on_the_edge
     };
@@ -194,6 +198,7 @@ fn the_debts_of_those_who_answered_are_shown_when_the_total_is_unknown() {
 fn every_reason_is_listed_and_named() {
     let down = reported(3, MemberState::Down, Debts::Known(0), 100);
     let silent = MemberReport {
+        planned: kbf_server::storage_health::Planned::No,
         report: None,
         ..active(2, 0)
     };
@@ -275,13 +280,25 @@ impl Pair {
 
     fn beat_a(&self, debts: Debts) {
         self.members
-            .heartbeat(self.a.0, self.a.1, Progress::CaughtUp, debts, None)
+            .heartbeat(
+                self.a.0,
+                self.a.1,
+                Progress::CaughtUp,
+                Reported::debts(debts),
+                None,
+            )
             .expect("a beats");
     }
 
     fn beat_b(&self, debts: Debts) {
         self.members
-            .heartbeat(self.b.0, self.b.1, Progress::CaughtUp, debts, None)
+            .heartbeat(
+                self.b.0,
+                self.b.1,
+                Progress::CaughtUp,
+                Reported::debts(debts),
+                None,
+            )
             .expect("b beats");
     }
 
@@ -403,7 +420,7 @@ fn a_member_that_registers_again_starts_without_a_report() {
             again.id,
             again.boot,
             Progress::CaughtUp,
-            Debts::Known(0),
+            Reported::debts(Debts::Known(0)),
             None,
         )
         .expect("beats");
@@ -423,7 +440,7 @@ fn the_report_of_a_superseded_boot_is_refused() {
         pair.a.0,
         pair.a.1,
         Progress::CaughtUp,
-        Debts::Known(0),
+        Reported::debts(Debts::Known(0)),
         None,
     );
     assert!(matches!(refused, Err(MembershipError::Superseded { .. })));

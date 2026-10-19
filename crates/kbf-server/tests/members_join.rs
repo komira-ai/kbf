@@ -14,7 +14,7 @@ use kbf_map::{Map, MemberId, MemberState};
 use kbf_server::members::{
     Members, MembershipConfig, PROTOCOL, Progress, Registrant, Registration,
 };
-use kbf_server::storage_health::Debts;
+use kbf_server::storage_health::Reported;
 use kbf_state::{Cond, Store, Txn};
 use kbf_types::{Digest, DigestFunction};
 use sha2::{Digest as _, Sha256};
@@ -142,7 +142,7 @@ fn an_unfilled_joiner_stays_joining_through_a_restart_and_a_beat() {
     let m = members(&s);
     let _ = old_farm(&s, &m);
     let c = m.register(&node(3, Progress::CaughtUp)).expect("c");
-    m.heartbeat(c.id, c.boot, Progress::CaughtUp, Debts::Unknown, None)
+    m.heartbeat(c.id, c.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("beat");
     let map = m.current_map().expect("read").expect("a map");
     assert_eq!(state(&map, c.id), Some(MemberState::Joining));
@@ -176,7 +176,7 @@ fn a_new_node_that_registers_rebuilding_joins_and_is_not_promoted_by_its_beat() 
     let _ = old_farm(&s, &m);
     let c = m.register(&node(3, Progress::CatchingUp)).expect("c");
     assert_eq!(state(&c.map, c.id), Some(MemberState::Joining));
-    m.heartbeat(c.id, c.boot, Progress::CaughtUp, Debts::Unknown, None)
+    m.heartbeat(c.id, c.boot, Progress::CaughtUp, Reported::default(), None)
         .expect("beat");
     let map = m.current_map().expect("read").expect("a map");
     assert_eq!(state(&map, c.id), Some(MemberState::Joining));
