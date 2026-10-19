@@ -9,8 +9,9 @@
 //! node, checks the token's policy (revoked, expired, used up, the roles, the node id,
 //! the advertise names), the node id and the advertise host, and only then calls the
 //! signing closure built here; the closure parses each CSR with [`kbf_ca::parse_csr`]
-//! (P-256, `ecdsa-with-SHA256`, 2 KiB, a signature that verifies), refuses an advertise
-//! host the frontend will not certify, and builds each certificate with
+//! (P-256, `ecdsa-with-SHA256`, 2 KiB, a signature that verifies), refuses a node id that
+//! is `localhost` or a name the frontend serves ([`RefusalReason::NodeIdNotAllowed`]) and an
+//! advertise host the frontend will not certify, and builds each certificate with
 //! [`kbf_ca::Authority::issue_node`]. A CSR is therefore parsed for a caller who has
 //! proved the token secret, never for a guess.
 //!
@@ -151,6 +152,21 @@ pub(super) fn advertise_refused(host: &str, frontend_names: &[String]) -> bool {
         || frontend_names
             .iter()
             .any(|name| host == name || host.ends_with(&format!(".{name}")))
+}
+
+/// Whether `node` is a name no node may hold: `localhost`, a name under it, or a name the
+/// frontend serves. A node id is a DNS label, and every certificate carries it, so a node
+/// holding one of these could be taken for the host itself.
+///
+/// The comparison ignores case, though a [`NodeId`] is already lower-case, so the rule
+/// holds if that ever changes.
+pub(super) fn node_id_refused(node: &str, frontend_names: &[String]) -> bool {
+    let id = node.to_ascii_lowercase();
+    id == "localhost"
+        || id.ends_with(".localhost")
+        || frontend_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&id))
 }
 
 /// What both calls share.
@@ -332,6 +348,9 @@ impl Core {
         csrs: &[(Role, &[u8])],
         advertise: &str,
     ) -> Result<Vec<IssuedRole>, RefusalReason> {
+        if node_id_refused(node.as_str(), &self.frontend_names) {
+            return Err(RefusalReason::NodeIdNotAllowed);
+        }
         let host = advertise
             .to_ascii_lowercase()
             .rsplit_once(':')

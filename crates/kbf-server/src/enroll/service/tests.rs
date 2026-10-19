@@ -630,3 +630,92 @@ fn an_advertise_host_on_a_daemon_certificate_is_advertise_invalid() {
         .expect_err("refused");
     assert_eq!(error, RefusalReason::AdvertiseInvalid);
 }
+
+/// A node id that is `localhost` or a single-label name the frontend serves is refused
+/// `NodeIdNotAllowed` with a token that is otherwise good, and nothing is enrolled or used;
+/// an ordinary id still enrolls. `LOCALHOST` and `x.localhost` are not node ids at all
+/// (upper case and dots) and are refused as malformed before anything is read.
+///
+/// Catches: a token holder enrolling as `localhost` (or as the frontend's one-label name)
+/// and getting a farm-CA certificate whose DNS name is that host's, serverAuth and clientAuth.
+#[tokio::test]
+async fn a_node_id_that_is_localhost_or_a_frontend_name_is_refused() {
+    let farm = farm("enroll-node-id-names");
+    let service = EnrollService::new(
+        Arc::clone(&farm.store),
+        Arc::clone(&farm.ca),
+        &["Front".to_owned(), FRONTEND.to_owned()],
+        NodeSettings::default(),
+    );
+    let ask = |service: &EnrollService, bits: u64, id: &str| {
+        let tok = token(&farm, bits, &spec(&[Role::Daemon]));
+        let (request, _) = enroll_request(&tok, id, &[Role::Daemon], "");
+        service.enroll_now(&request)
+    };
+    for (bits, id) in [(1, "localhost"), (2, "front")] {
+        assert_eq!(
+            ask(&service, bits, id),
+            Err(RefusalReason::NodeIdNotAllowed),
+            "{id}"
+        );
+    }
+    for (bits, id) in [(3, "LOCALHOST"), (4, "x.localhost"), (5, "FRONT")] {
+        assert_eq!(
+            ask(&service, bits, id),
+            Err(RefusalReason::MalformedRequest),
+            "{id}"
+        );
+    }
+    assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
+    assert!(
+        list_tokens(&*farm.store)
+            .expect("tokens")
+            .iter()
+            .all(|t| t.uses == 0)
+    );
+    assert!(ask(&service, 6, "node-01").is_ok());
+    assert_eq!(list_nodes(&*farm.store).expect("nodes").len(), 1);
+}
+
+/// The rule itself, case-insensitive, for what a [`NodeId`] cannot spell today: `.localhost`
+/// names and upper-case spellings of `localhost` and of a frontend name.
+///
+/// Catches: a comparison that is case-sensitive or misses names under `localhost`, which
+/// would let a later widening of the node id grammar reopen the hole.
+#[test]
+fn the_node_id_rule_ignores_case_and_covers_names_under_localhost() {
+    let names = vec!["front".to_owned()];
+    for refused in [
+        "localhost",
+        "LOCALHOST",
+        "x.localhost",
+        "X.LocalHost",
+        "FRONT",
+    ] {
+        assert!(node_id_refused(refused, &names), "{refused}");
+    }
+    for allowed in ["node-01", "localhost2", "front-2", "xlocalhost"] {
+        assert!(!node_id_refused(allowed, &names), "{allowed}");
+    }
+}
+
+/// A token past its `expires_at` on the store's clock is refused `TokenExpired` by the
+/// service, uses nothing and enrolls nothing.
+///
+/// Catches: the service never reaching the registry's expiry check (the registry crate's
+/// own test passes whatever the service does with it).
+#[tokio::test]
+async fn a_token_past_its_expiry_is_refused_token_expired() {
+    let farm = farm("enroll-token-expiry");
+    let mut short = spec(&[Role::Daemon]);
+    short.ttl = Some(std::time::Duration::from_secs(600));
+    let tok = token(&farm, 1, &short);
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Daemon], "");
+    farm.advance(601);
+    assert_is(
+        &refused(call(&farm, request).await),
+        RefusalReason::TokenExpired,
+    );
+    assert_eq!(uses(&farm), 0);
+    assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
+}
