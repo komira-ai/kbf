@@ -276,3 +276,120 @@ fn actions_stay_pinned_and_the_token_starts_empty() {
         "self-hosted",
     );
 }
+
+#[test]
+fn the_verify_env_must_bind_the_tag_and_commit_it_was_triggered_for() {
+    // Catches: every step checking a tag or commit other than the one released (it fails
+    // closed only on a real tag push). Mutants: TAG from `github.sha`; COMMIT from
+    // `inputs.tag`; either dropped.
+    red(
+        &plant("github.ref_name || inputs.tag", "github.sha || inputs.tag"),
+        "does not set `TAG:",
+    );
+    red(
+        &plant("github.sha || inputs.commit", "github.sha || inputs.tag"),
+        "does not set `COMMIT:",
+    );
+    red(
+        &plant(
+            "      COMMIT: ${{ github.event_name",
+            "      COMMITX: ${{ github.event_name",
+        ),
+        "does not set `COMMIT:",
+    );
+}
+
+#[test]
+fn the_notes_must_be_for_this_tag_and_commit() {
+    // Catches: notes for another release reaching the approver. Mutants: the commit
+    // dropped; the tag a constant; the tag dropped.
+    red(
+        &plant(
+            "release notes dist --tag \"$TAG\" --commit \"$COMMIT\"",
+            "release notes dist --tag \"$TAG\"",
+        ),
+        "`release notes` is not given `--commit \"$COMMIT\"`",
+    );
+    red(
+        &plant(
+            "release notes dist --tag \"$TAG\"",
+            "release notes dist --tag v0.0.0",
+        ),
+        "`release notes` is not given `--tag \"$TAG\"`",
+    );
+    red(
+        &plant(
+            "release notes dist --tag \"$TAG\" --commit",
+            "release notes dist --commit",
+        ),
+        "`release notes` is not given `--tag \"$TAG\"`",
+    );
+}
+
+#[test]
+fn the_dry_run_must_take_a_required_commit_and_tag() {
+    // Catches: a dispatch with an empty TAG or COMMIT. Mutants: the `tag` input renamed;
+    // the `commit` input renamed; `tag` no longer required.
+    red(
+        &plant("      tag:\n", "      tagx:\n"),
+        "required input `tag`",
+    );
+    red(
+        &plant("      commit:\n", "      commitx:\n"),
+        "required input `commit`",
+    );
+    red(
+        &plant(
+            "checked as a release would check it\n        required: true\n        type: string\n\npermissions",
+            "checked as a release would check it\n        required: false\n        type: string\n\npermissions",
+        ),
+        "required input `tag`",
+    );
+}
+
+#[test]
+fn the_notes_upload_must_fail_when_the_file_is_missing() {
+    // Catches: a dry run that shows no notes and still passes. Mutant: the first
+    // upload's `if-no-files-found` set to `ignore`.
+    red(
+        &plant(
+            "path: release-notes.md\n          retention-days: 7\n          if-no-files-found: error",
+            "path: release-notes.md\n          retention-days: 7\n          if-no-files-found: ignore",
+        ),
+        "are not uploaded",
+    );
+}
+
+#[test]
+fn a_dispatch_or_env_of_another_shape_is_an_error_not_an_empty_answer() {
+    // Catches: a lint that passes because a rewritten key read as nothing. Mutants: the
+    // dispatch without `inputs`; without a mapping; an input that is not a mapping; the
+    // verify `env` a string.
+    let text = real();
+    for (from, to, want) in [
+        (
+            "  workflow_dispatch:\n    inputs:",
+            "  workflow_dispatch:\n    inputz:",
+            "no `inputs:` mapping",
+        ),
+        (
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch: yes\n  zzz:\n",
+            "no `workflow_dispatch:` mapping",
+        ),
+        (
+            "      tag:\n        description",
+            "      tag: x\n      zz:\n        description",
+            "is not a mapping",
+        ),
+        (
+            "    env:\n      # The tag's",
+            "    env: x\n    zz:\n      # The tag's",
+            "is not a mapping",
+        ),
+    ] {
+        assert!(text.contains(from), "no `{from}`");
+        let err = problems(&text.replace(from, to)).expect_err(want);
+        assert!(err.contains(want), "want `{want}`: {err}");
+    }
+}

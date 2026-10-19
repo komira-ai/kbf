@@ -116,3 +116,50 @@ pub fn push_filters(text: &str) -> Result<Vec<(String, Vec<String>)>, String> {
         })
         .collect()
 }
+
+/// The job `job`'s own `env:` as `(name, value)`; empty without one. An error when it is
+/// not a mapping of strings.
+pub fn job_env(text: &str, job: &str) -> Result<Vec<(String, String)>, String> {
+    let root = yaml::load(text)?;
+    let found = job_of(&root, job)?;
+    match get(found, "env").map(|e| &e.value) {
+        None => Ok(Vec::new()),
+        Some(Value::Map(env)) => env
+            .iter()
+            .map(|(k, v)| match (k.as_str(), v.as_str()) {
+                (Some(k), Some(v)) => Ok((k.to_owned(), v.to_owned())),
+                _ => Err(format!(
+                    "an `env` entry of job `{job}` is not a string pair"
+                )),
+            })
+            .collect(),
+        Some(_) => Err(format!("the `env` of job `{job}` is not a mapping")),
+    }
+}
+
+/// The inputs of the `workflow_dispatch` trigger as `(name, required)`. An error when
+/// `on:` has no `workflow_dispatch` mapping with an `inputs:` mapping of mappings.
+pub fn dispatch_inputs(text: &str) -> Result<Vec<(String, bool)>, String> {
+    let root = yaml::load(text)?;
+    let on = get(top_of(&root)?, "on").ok_or("the workflow has no `on:`")?;
+    let Value::Map(on) = &on.value else {
+        return Err("`on:` is not a mapping".to_owned());
+    };
+    let Some(Value::Map(dispatch)) = get(on, "workflow_dispatch").map(|d| &d.value) else {
+        return Err("`on:` has no `workflow_dispatch:` mapping".to_owned());
+    };
+    let Some(Value::Map(inputs)) = get(dispatch, "inputs").map(|i| &i.value) else {
+        return Err("`workflow_dispatch:` has no `inputs:` mapping".to_owned());
+    };
+    inputs
+        .iter()
+        .map(|(k, v)| {
+            let name = k.as_str().ok_or("a dispatch input name is not a string")?;
+            let Value::Map(spec) = &v.value else {
+                return Err(format!("the dispatch input `{name}` is not a mapping"));
+            };
+            let required = get(spec, "required").and_then(Node::as_str) == Some("true");
+            Ok((name.to_owned(), required))
+        })
+        .collect()
+}

@@ -13,7 +13,10 @@
 //!   `set-hash` it prints out of the job; `publish` hands it to `release publish
 //!   --set-hash`, so only the files the verdict names are released.
 //! - **The notes.** `verify` writes the notes (`release notes --out <file>`) and uploads
-//!   that file as the artifact `release-notes`, so a dry run shows them.
+//!   that file as the artifact `release-notes` (`if-no-files-found: error`), so a dry run shows them;
+//!   the notes are for the same `--tag "$TAG"` and `--commit "$COMMIT"` as the verdict. The dispatch
+//!   declares required inputs `commit` and `tag`, and `verify` binds `COMMIT` and `TAG` to the
+//!   push (`github.sha`, `github.ref_name`) or dispatch (`inputs.*`) value.
 //! - **Who may write.** Only `publish` holds a write scope (`contents`), under the exact
 //!   tag-push `if:`, so a dry run (a dispatch) publishes nothing; it also runs in the
 //!   `prod` environment and needs `verify`. The kbf.dev upload (an OIDC role step) is to
@@ -40,6 +43,11 @@ pub const TAG_PUSH_ONLY: &str =
 
 /// The `(job, scope)` pairs that may be `write`. Add the kbf.dev upload's scope here.
 const WRITERS: &[(&str, &str)] = &[(PUBLISH, "contents")];
+
+/// The required inputs of a dry run, and what the verify job binds to its env.
+const DISPATCH_INPUTS: &[&str] = &["commit", "tag"];
+const COMMIT_EXPR: &str = "${{ github.event_name == 'push' && github.sha || inputs.commit }}";
+const TAG_EXPR: &str = "${{ github.event_name == 'push' && github.ref_name || inputs.tag }}";
 
 /// The artifact the notes are uploaded as.
 const NOTES_ARTIFACT: &str = "release-notes";
@@ -109,6 +117,14 @@ fn triggers(release: &str, out: &mut Vec<String>) -> Result<(), String> {
     for event in EVENTS {
         if !events.iter().any(|e| e == event) {
             out.push(format!("the workflow does not run on `{event}`"));
+        }
+    }
+    let inputs = workflows::dispatch_inputs(release)?;
+    for name in DISPATCH_INPUTS {
+        if !inputs.iter().any(|(n, required)| n == name && *required) {
+            out.push(format!(
+                "the `workflow_dispatch` trigger does not declare the required input `{name}`: a dry run would check nothing for it"
+            ));
         }
     }
     let filters = workflows::push_filters(release)?;
@@ -194,6 +210,14 @@ fn verify_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
         Some(_) => out.push(format!("the `release locate` step of `{VERIFY}` is under `if:` or `continue-on-error:`")),
         None => out.push(format!("the job `{VERIFY}` does not run `cargo xtask release locate`, so a commit not on main is not refused")),
     }
+    let env = workflows::job_env(release, VERIFY)?;
+    for (name, wanted) in [("COMMIT", COMMIT_EXPR), ("TAG", TAG_EXPR)] {
+        if !env.iter().any(|(k, v)| k == name && v == wanted) {
+            out.push(format!(
+                "the job `{VERIFY}` does not set `{name}: {wanted}`: the tag and commit every step checks would not be the ones released"
+            ));
+        }
+    }
     let checked = command(&steps, "cargo xtask release check ").map(|(at, ..)| at);
     match command(&steps, "cargo xtask release verdict ") {
         None => out.push(format!("the job `{VERIFY}` does not run `cargo xtask release verdict`: a tag without a gamma verdict would release")),
@@ -225,6 +249,11 @@ fn verify_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
             "the job `{VERIFY}` does not run `cargo xtask release notes`"
         )),
         Some((at, _, words)) => {
+            for (flag, var) in [("--tag", "$TAG"), ("--commit", "$COMMIT")] {
+                if value(&words, flag) != Some(var) {
+                    out.push(format!("`release notes` is not given `{flag} \"{var}\"`: the approver would read notes for another release"));
+                }
+            }
             let notes = value(&words, "--out").unwrap_or("");
             let uploaded = steps.iter().skip(at + 1).any(|s| {
                 s.uses
@@ -236,6 +265,9 @@ fn verify_job(release: &str, out: &mut Vec<String>) -> Result<(), String> {
                     && s.with
                         .iter()
                         .any(|(k, v)| k == "path" && !notes.is_empty() && v == notes)
+                    && s.with
+                        .iter()
+                        .any(|(k, v)| k == "if-no-files-found" && v == "error")
                     && !s.conditional
             });
             if !uploaded {
