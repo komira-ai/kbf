@@ -1663,6 +1663,14 @@ impl Fetcher for Hollow {
     fn fetch(&self, rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError> {
         Ok(crate::helper::fetcher::fake::honest(rec))
     }
+
+    fn fetch_activation(
+        &self,
+        rec: &ReleaseLocator,
+        _expected: &Facts,
+    ) -> Result<InstalledRelease, FetchError> {
+        self.fetch(rec)
+    }
 }
 
 /// Catches an activation that fails at the swap (the release is not on the host after all)
