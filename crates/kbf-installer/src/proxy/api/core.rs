@@ -22,7 +22,7 @@ use super::model::{
 };
 use super::refusal;
 use super::traits::{
-    Clock, Compat, CompatGate, InstallerState, InstallerStatus, OrderWriter, RestartMarker,
+    Clock, Compat, CompatGate, InstallerState, InstallerStatus, OrderWriter, RestartPending,
     RunningUpdate, StatusReader, Supervisor, SupervisorError, UpdateSpec,
 };
 use crate::CommitId;
@@ -209,7 +209,7 @@ pub struct Parts {
     pub status: Box<dyn StatusReader>,
     pub compat: Box<dyn CompatGate>,
     pub clock: Arc<dyn Clock>,
-    pub marker: RestartMarker,
+    pub restart: Box<dyn RestartPending>,
     pub requests: Idempotency,
     pub hook: Box<dyn CrashHook>,
     pub config: Config,
@@ -645,7 +645,7 @@ impl Core {
     /// `GET /v1/update/frontend`.
     pub fn status(&mut self) -> Reply {
         self.advance();
-        let restart_pending = self.parts.marker.is_set();
+        let restart_pending = self.parts.restart.restart_pending();
         let mut body = StatusBody {
             update_id: None,
             from: None,
