@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_update::MAX_RECORDS;
 use kbf_update::record::{file_name, parse_file_name};
+use kbf_update::{MAX_RECORDS, RecordError, Verb as RecordVerb};
 
 use super::api::traits::OrderWriter;
 use super::model::{Locator, Verb};
-use super::orders::{EPOCH, MAX_PENDING, OrderSpool, SpoolError};
+use super::orders::{EPOCH, MAX_PENDING, OrderSpool, SpoolError, record};
 use super::record::{Durable, Fsync};
 use crate::CommitId;
 use crate::helper::order;
@@ -610,16 +610,16 @@ fn an_activate_is_never_written() {
 }
 
 /// Catches a record the root half cannot read as the proxy meant it: every id, epoch,
-/// generation, verb, commit and window comes back from the root half's own parser
-/// (`helper::order::parse`) as it was written, under the file name its scan keys on, and
-/// with no claims. The `frontend_update` is compared to its bytes instead: it is a locator
-/// and nothing else, which the parser of this tree does not accept yet (it still asks a
-/// `frontend_update` record for components). When it does, the record belongs in the
-/// parsed table below.
+/// generation, verb, commit and window of all four kinds written (a `frontend_update` and a
+/// `revert` through the update API, a `confirm` and a `revert` through the swap's methods)
+/// comes back from the root half's own parser (`helper::order::parse`) as it was written,
+/// under the file name its scan keys on, and with no claims. The `frontend_update`'s bytes
+/// are pinned as well: a locator and nothing else, the six keys.
 ///
 /// Mutants planted: `generation` written as 0 (the parsed order differs); the confirm
 /// written with the revert verb; the epoch written as 2 (the file is not under its key);
-/// a `components` key written (the frontend_update bytes differ).
+/// a `components` key written (the reader refuses the record, and the bytes differ);
+/// `window_s` written as 0 for every record (the parsed windows differ).
 #[test]
 fn what_the_root_half_reads_is_what_was_written() {
     let d = dirs("cross");
@@ -656,6 +656,7 @@ fn what_the_root_half_reads_is_what_was_written() {
         )
     );
     for (id, verb, c, window_s) in [
+        (4242, order::Verb::FrontendUpdate, 'a', 900),
         (4243, order::Verb::Revert, 'b', 900),
         (4244, order::Verb::Confirm, 'c', 0),
         (4245, order::Verb::Revert, 'd', 0),
@@ -668,16 +669,51 @@ fn what_the_root_half_reads_is_what_was_written() {
     assert_eq!(ids(&d), [4242, 4243, 4244, 4245]);
 }
 
+/// Catches a record being built without the root half's shape rules (`OrderRecord::check`)
+/// run on it. The proxy's own verbs and `CommitId` can never fail the check, so the one
+/// input that does is built by hand: an activation, which needs components and facts that
+/// a locator does not carry. The three verbs the proxy writes pass.
+///
+/// Mutant planted: the `check` call removed from `record` (the activation is built).
+#[test]
+fn a_record_the_reader_would_refuse_is_not_built() {
+    let locator = |verb| Locator {
+        order_id: 7,
+        epoch: EPOCH,
+        generation: 7,
+        verb,
+        commit: commit('a'),
+        window_s: 0,
+    };
+    let err = record(&locator(Verb::Activate), RecordVerb::Activate).unwrap_err();
+    assert!(
+        matches!(err, SpoolError::Record(RecordError::NoComponents)),
+        "{err:?}"
+    );
+    for (verb, record_verb) in [
+        (Verb::FrontendUpdate, RecordVerb::FrontendUpdate),
+        (Verb::Confirm, RecordVerb::Confirm),
+        (Verb::Revert, RecordVerb::Revert),
+    ] {
+        let built = record(&locator(verb), record_verb).expect("a record the reader takes");
+        assert_eq!(built.order_id, 7);
+    }
+}
+
 /// Catches `frontend_update` (the swap's write of a locator the API already issued)
 /// misbehaving: a record that is there is left alone, one that is gone is written again
-/// as it was, nothing takes a new id, a locator this spool did not issue (an id above the
-/// counter, another verb, another epoch) is refused, and a full `orders/` refuses it.
+/// as it was, nothing takes a new id, a locator that cannot be one of this spool's (an id
+/// above the counter, another verb, another epoch) is refused, and a full `orders/` refuses
+/// it. The id at the counter is accepted (the locator just issued) and the id one above it
+/// is not; the spool does not claim more than that, since it keeps no list of what it
+/// issued.
 ///
 /// Mutants planted: the `has` check dropped (the sentinel is overwritten); the guard on the
-/// id dropped (101 is written); the guard on the verb dropped (the confirm locator is
-/// written); the guard on the epoch dropped; the room check dropped from the rewrite.
+/// id dropped (101 is written); the id guard `>` turned into `>=` (the locator just issued
+/// is refused); the guard on the verb dropped (the confirm locator is written); the guard
+/// on the epoch dropped; the room check dropped from the rewrite.
 #[test]
-fn frontend_update_writes_a_missing_locator_once_and_refuses_one_not_issued() {
+fn frontend_update_writes_a_missing_locator_once_and_refuses_a_foreign_one() {
     let d = dirs("reissue");
     let mut spool = open(&d, &Clock::at(100));
     let issued = frontend(&mut spool);
@@ -709,7 +745,7 @@ fn frontend_update_writes_a_missing_locator_once_and_refuses_one_not_issued() {
         let err = spool.frontend_update(&bad).unwrap_err();
         assert!(
             err.0
-                .contains("not a frontend_update locator this spool issued"),
+                .contains("not a frontend_update locator of epoch 1 at or below the order counter"),
             "{err:?}"
         );
     }

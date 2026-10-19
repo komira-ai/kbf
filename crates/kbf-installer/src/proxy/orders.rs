@@ -33,6 +33,12 @@
 //! Allocating, syncing the counter and writing the record happen under one lock, because
 //! the update API's actor and the swap's thread write at the same time.
 //!
+//! Every record is built and checked with [`OrderRecord::check`], the shape rules the root
+//! half's reader holds, before the counter moves, so a record the reader would refuse
+//! reserves nothing. The proxy's own types already satisfy those rules (a [`CommitId`] is
+//! the commit shape the check asks for, and the three verbs carry no claims), so the call
+//! pins the contract of the two ends rather than catching a case that arises today.
+//!
 //! # Limits and assumptions
 //!
 //! - The root half reads at most [`MAX_RECORDS`] records and deletes the rest unread,
@@ -55,7 +61,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use kbf_update::record::parse_file_name;
 use kbf_update::spool::Spool;
-use kbf_update::{MAX_RECORDS, OrderRecord, Verb as RecordVerb};
+use kbf_update::{MAX_RECORDS, OrderRecord, RecordError, Verb as RecordVerb};
 use serde::{Deserialize, Serialize};
 
 use super::api::traits::{OrderError, OrderWriter};
@@ -111,10 +117,12 @@ pub enum SpoolError {
     Exhausted,
     #[error("the record cannot be written to orders/: {0}")]
     Write(io::Error),
+    #[error("the root half would not read this record: {0}")]
+    Record(RecordError),
     #[error("the proxy never writes an activate order")]
     NoActivate,
-    #[error("that is not a frontend_update locator this spool issued")]
-    NotIssued,
+    #[error("that is not a frontend_update locator of epoch {EPOCH} at or below the order counter")]
+    BadLocator,
 }
 
 impl From<SpoolError> for OrderError {
@@ -208,8 +216,6 @@ impl OrderSpool {
         inner.make_room()?;
         let next = high_water.checked_add(1).ok_or(SpoolError::Exhausted)?;
         let id = (inner.wall_ms)().max(next);
-        inner.persist(id).map_err(SpoolError::Counter)?;
-        *high_water = id;
         let locator = Locator {
             order_id: id,
             epoch: EPOCH,
@@ -218,20 +224,28 @@ impl OrderSpool {
             commit: commit.clone(),
             window_s,
         };
-        inner
-            .spool
-            .write(&record(&locator, record_verb))
-            .map_err(SpoolError::Write)?;
+        let record = record(&locator, record_verb)?;
+        inner.persist(id).map_err(SpoolError::Counter)?;
+        *high_water = id;
+        inner.spool.write(&record).map_err(SpoolError::Write)?;
         Ok(locator)
     }
 
-    /// Makes sure the record of a `frontend_update` locator this spool issued is in
-    /// `orders/`: writes it if it is not there, and does nothing if it is. The shape of
+    /// Makes sure the record of a `frontend_update` locator is in `orders/`: writes it if
+    /// it is not there, and does nothing if it is. The shape of
     /// [`RootOrders::frontend_update`](super::ports::RootOrders::frontend_update).
     ///
+    /// The locator is one this spool handed out, and the check is only that it could be:
+    /// a `frontend_update` of [`EPOCH`] whose id is at or below the counter. The spool keeps
+    /// no list of the ids it issued (a restart would lose it, and ids are not dense: the
+    /// clock jumps and a crash leaves gaps), so a made-up locator below the counter is
+    /// written as given. What the check does keep out is an id above the counter, which the
+    /// next order could be handed again. The root half drops a record at or below the last
+    /// one it acted on, so rewriting one it already consumed is harmless.
+    ///
     /// # Errors
-    /// The locator is not a `frontend_update` of this spool's epoch with an id it issued,
-    /// or `orders/` is full or cannot be written.
+    /// The locator is not a `frontend_update` of this spool's epoch at or below the
+    /// counter, or `orders/` is full or cannot be written.
     pub fn frontend_update(&self, locator: &Locator) -> Result<(), PortError> {
         Ok(self.reissue(locator)?)
     }
@@ -246,16 +260,14 @@ impl OrderSpool {
             || locator.epoch != EPOCH
             || locator.order_id > *high_water
         {
-            return Err(SpoolError::NotIssued);
+            return Err(SpoolError::BadLocator);
         }
         if inner.spool.has(locator.epoch, locator.order_id) {
             return Ok(());
         }
+        let record = record(locator, RecordVerb::FrontendUpdate)?;
         inner.make_room()?;
-        inner
-            .spool
-            .write(&record(locator, RecordVerb::FrontendUpdate))
-            .map_err(SpoolError::Write)
+        inner.spool.write(&record).map_err(SpoolError::Write)
     }
 
     /// Writes a `confirm` for `commit`. The shape of
@@ -328,9 +340,10 @@ impl Inner {
 }
 
 /// The record of `locator`: the six keys of every record and nothing else (no components,
-/// no facts), as the root half's `frontend_update`, `confirm` and `revert` are.
-fn record(locator: &Locator, verb: RecordVerb) -> OrderRecord {
-    OrderRecord {
+/// no facts), as the root half's `frontend_update`, `confirm` and `revert` are, checked by
+/// the rules the root half's reader holds.
+pub(super) fn record(locator: &Locator, verb: RecordVerb) -> Result<OrderRecord, SpoolError> {
+    let record = OrderRecord {
         order_id: locator.order_id,
         epoch: locator.epoch,
         generation: locator.generation,
@@ -339,7 +352,9 @@ fn record(locator: &Locator, verb: RecordVerb) -> OrderRecord {
         window_s: locator.window_s,
         components: Vec::new(),
         expected: None,
-    }
+    };
+    record.check().map_err(SpoolError::Record)?;
+    Ok(record)
 }
 
 /// The high-water mark `orders.json` holds; `None` when there is no file.
