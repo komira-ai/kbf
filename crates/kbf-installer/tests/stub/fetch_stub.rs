@@ -47,7 +47,12 @@ fn report(out: &mut impl Write) {
     let _ = writeln!(out, "core={}", limit(libc::RLIMIT_CORE as libc::c_int));
     let _ = writeln!(out, "nofile={}", limit(libc::RLIMIT_NOFILE as libc::c_int));
     let _ = writeln!(out, "nonewprivs={no_new_privs}");
-    let _ = writeln!(out, "env={}", std::env::vars().count());
+    // An instrumented build (coverage) has the profile runtime put its own variable in; the
+    // parent's empty environment is what is being checked.
+    let env = std::env::vars()
+        .filter(|(name, _)| !name.contains("LLVM_"))
+        .count();
+    let _ = writeln!(out, "env={env}");
     let _ = writeln!(out, "stdin={}", link("/proc/self/fd/0"));
     let _ = writeln!(
         out,
@@ -57,6 +62,14 @@ fn report(out: &mut impl Write) {
     for fd in open_descriptors() {
         let _ = writeln!(out, "fd={fd}");
     }
+}
+
+/// End now, without the exit handlers: an instrumented stub confined to write no file would
+/// print a profile-write error on standard error, which the tests read.
+fn leave(code: i32) -> ! {
+    let _ = std::io::stdout().flush();
+    // SAFETY: _exit takes no pointers and never returns.
+    unsafe { libc::_exit(code) }
 }
 
 fn main() {
@@ -75,11 +88,11 @@ fn main() {
             "flood" => {
                 let chunk = [b'y'; 8192];
                 while out.write_all(&chunk).is_ok() {}
-                return;
+                leave(0);
             }
             "trickle" => loop {
                 if out.write_all(b"a").and_then(|()| out.flush()).is_err() {
-                    return;
+                    leave(0);
                 }
                 std::thread::sleep(Duration::from_millis(200));
             },
@@ -90,7 +103,7 @@ fn main() {
                 }
             }
             "sleep" => std::thread::sleep(Duration::from_secs_f64(arg.parse().expect("seconds"))),
-            "exit" => std::process::exit(arg.parse().expect("a code")),
+            "exit" => leave(arg.parse().expect("a code")),
             "pid" => {
                 let mut fifo = std::fs::OpenOptions::new()
                     .write(true)
@@ -114,4 +127,5 @@ fn main() {
             other => panic!("no such operation: {other}"),
         }
     }
+    leave(0);
 }
