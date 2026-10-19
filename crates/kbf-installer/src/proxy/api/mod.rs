@@ -71,7 +71,8 @@
 //!   [`super::ports::Requests`] queue and answer with the phase read from
 //!   [`super::Swap::intent`]; the swap decides later whether it can honor them.
 //! - `status` is built from the intent record (`phase`, `phase_started`, slots) plus
-//!   [`super::ports::Gate::open_streams`] and [`super::ports::ChildAdmin::open_counts`].
+//!   [`super::ports::Gate::open_streams`] and [`super::ports::ChildAdmin::open_counts`]
+//!   (`open_streams` and `open_sessions` of the child's role view).
 //!   The intent keeps `nodes_posted` as a bool, the API wants a count: the adapter maps
 //!   it to 0 or 1, which is all [`model::rollback_gate`] reads.
 //! - `force_retire` has no counterpart in the swap, which leaves a draining old child

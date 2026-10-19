@@ -187,15 +187,15 @@ impl Host {
 /// `expect`; the roles after it (the holder moves: B holds, A does not, and A is still
 /// quiesced); a `resume` of A, which the child refuses because the store moved on, as
 /// `Superseded`; `stand_down` of A; and what a stood-down child reports (`StoodDown`, not
-/// ready, still answering the drain read).
+/// ready, still answering the admin role view, which `open_counts` reads).
 ///
 /// Also pins that the takeover keeps the epoch (daemons that redial keep their leases) and
 /// takes exactly one generation, read from the store and not from the client.
 ///
 /// Mutants seen red: `StoodDown` and `Superseded` swapped in `admin.rs`; `holder` derived
 /// from the generation alone; the takeover sent without `expect`; the slot ignored by the
-/// admin reads (every read from A's port); `ready` or `open_counts` asked on the admin port
-/// instead of the operator port; in the child, a takeover that bumps the epoch.
+/// admin reads (every read from A's port); `ready` asked on the admin port instead of the
+/// operator port; in the child, a takeover that bumps the epoch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_swap_driven_through_the_admin_calls_moves_the_generation_and_the_holder() {
     let host = Host::start("admin-swap").await;
@@ -217,8 +217,8 @@ async fn a_swap_driven_through_the_admin_calls_moves_the_generation_and_the_hold
         })
     );
     let idle = OpenCounts {
-        open_executions: 0,
-        queued_operations: 0,
+        open_streams: 0,
+        open_sessions: 0,
     };
     assert_eq!(host.run(|admin| admin.open_counts(Slot::A)).await, Ok(idle));
 
@@ -274,25 +274,25 @@ async fn a_swap_driven_through_the_admin_calls_moves_the_generation_and_the_hold
 }
 
 /// Catches a client that reads a refusal as an answer, or a call to a child that does not
-/// serve it as a success: the candidate has the admin port and `/readyz`, and no drain route
-/// (the operator API a candidate serves is `/readyz` alone), so `open_counts` of a
-/// candidate is `NotFound`, not zeros; a `takeover` of an active child is a `Conflict` that
+/// serve it as a success: a `takeover` of an active child is a `Conflict` that
 /// says the call needs a candidate, and moves nothing; and `quiesce`, `resume` and
-/// `stand_down` of a candidate are `Conflict`s too, each naming its call.
+/// `stand_down` of a candidate are `Conflict`s too, each naming its call. (`open_counts` of
+/// a candidate is an answer, not a refusal: the admin role view says 0 streams and 0
+/// sessions.)
 ///
 /// Mutant seen red: the takeover sent without `expect` (the refusal is then a `400`, not
-/// the child's "needs a candidate"). Not red: `open_counts` asked on the admin port (the
-/// admin port has no drain route either, and answers `404` as well).
+/// the child's "needs a candidate").
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_that_does_not_apply_to_the_child_is_a_typed_refusal() {
     let host = Host::start("admin-refusals").await;
 
     assert_eq!(
         host.run(|admin| admin.try_open_counts(Slot::B)).await,
-        Err(AdminError::NotFound {
-            call: "open_counts"
+        Ok(OpenCounts {
+            open_streams: 0,
+            open_sessions: 0
         }),
-        "a candidate serves no drain route"
+        "a candidate has nothing open, and says so on the admin port"
     );
     let refused = host.run(|admin| admin.try_takeover(Slot::A, CALL)).await;
     assert!(
@@ -864,30 +864,28 @@ async fn a_takeover_over_a_dead_holder_keeps_the_epoch_and_only_a_cold_start_bum
     assert_eq!(c.role().await["held_generation"], held + 2);
 }
 
-/// Catches an `open_counts` that does not read the child's drain route: the counts of the
-/// child's own streams and queue, from the operator port. One Execute with no worker to run
-/// it is one open execution and one queued operation; the same counts are what `GET
-/// /v1/frontend/drain` says.
+/// Catches an `open_counts` that does not read the child's own streams and sessions from
+/// its admin role view. One Execute with no worker to run it is one open stream, and no
+/// session; `GET /v1/frontend/drain` of the operator port says the same Execute as one
+/// open execution and one queued operation.
 ///
-/// Also pins what the swap's drain waits on after it stood the old child down. The swap
-/// retires the old child (SIGTERM, with no timeout behind it) only when `OpenCounts::idle`
-/// holds for it. Here A holds an operation that was queued and not yet granted a lease,
-/// stands down, and B takes over and runs the operation; A's caller is answered from B's
-/// result, `open_executions` falls to 0, and `queued_operations` stays 1 for good: the
-/// operation stays in the scheduler's queue of a child that feeds its scheduler nothing,
-/// and nothing removes it. So `idle` never holds for a stood-down child that had an
-/// operation queued at the takeover, and the swap would wait for it in `draining` until the
-/// operator steps in. (`DrainStatus` counts the operations not yet leased to a worker, so
-/// an operation that holds a lease is not in the count.)
+/// REGRESSION: the swap retires the old child (SIGTERM, with no timeout behind it) only
+/// when `OpenCounts::idle` holds for it (design §5 step 10: the proxy's count on the old
+/// slot is 0 and the child reports no open stream and no open session). Queued operations
+/// live in the shared store and the new holder serves them, so they must not gate the
+/// retire. Here A holds an operation that was queued and not yet granted a lease, stands
+/// down, and B takes over and runs the operation; A's caller is answered from B's result,
+/// `open_streams` falls to 0, and the child is idle. A's own scheduler still counts the
+/// operation as queued for good (the drain route says `queued_operations` 1, asserted
+/// below as the precondition), and that is what hung the retire when `open_counts` read the
+/// drain route: `idle` never held for a stood-down child that had an operation queued at
+/// the takeover. (Red with `open_counts` pointed back at the drain route, which reports
+/// `queued_operations` 1 for good.)
 ///
-/// U2c ask: a stood-down child counts only what it still has to answer (report 0 queued
-/// once stood down), or the drain wait leaves `queued_operations` out for a child that
-/// is not the active one.
-///
-/// Mutants seen red: `open_counts` asked on the admin port; the takeover sent without
-/// `expect`.
+/// Mutants seen red: `open_counts` asked on the operator port's drain route (the
+/// stood-down child never idle); the takeover sent without `expect`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn open_counts_are_the_childs_own_and_a_stood_down_child_keeps_its_queue() {
+async fn open_counts_are_the_childs_own_streams_and_a_stood_down_child_with_a_queue_is_idle() {
     let host = Host::start("admin-counts").await;
     let worker = Child::worker_of(&host.a.role().await).expect("a worker listener");
     let client = Client::connect(host.a.reapi, worker).await;
@@ -896,8 +894,8 @@ async fn open_counts_are_the_childs_own_and_a_stood_down_child_keeps_its_queue()
     let mut ops = client.execute(&job.action).await;
 
     let busy = OpenCounts {
-        open_executions: 1,
-        queued_operations: 1,
+        open_streams: 1,
+        open_sessions: 0,
     };
     until("the child counts its Execute", async || {
         host.run(|admin| admin.open_counts(Slot::A)).await == Ok(busy)
@@ -916,7 +914,7 @@ async fn open_counts_are_the_childs_own_and_a_stood_down_child_keeps_its_queue()
     assert_eq!(
         after,
         Ok(busy),
-        "a stood-down child still counts the operation it holds"
+        "a stood-down child still counts the stream it holds"
     );
     assert!(!after.expect("counts").idle());
 
@@ -935,23 +933,31 @@ async fn open_counts_are_the_childs_own_and_a_stood_down_child_keeps_its_queue()
     until("the stood-down child has no open Execute", async || {
         host.run(|admin| admin.open_counts(Slot::A))
             .await
-            .is_ok_and(|counts| counts.open_executions == 0)
+            .is_ok_and(|counts| counts.open_streams == 0)
     })
     .await;
-    // The caller is answered; the queue is not emptied, however long it is given (the
-    // follower looks every 200 ms).
-    let stuck = OpenCounts {
-        open_executions: 0,
-        queued_operations: 1,
+    // The caller is answered; A's own queue is not emptied, however long it is given (the
+    // follower looks every 200 ms): the precondition of the regression. The child is idle
+    // all the same, because a queued operation is not what the retire waits on.
+    let idle = OpenCounts {
+        open_streams: 0,
+        open_sessions: 0,
     };
     for _ in 0..6 {
+        let (code, drain) = get(host.a.api, "/v1/frontend/drain").await;
+        assert_eq!(code, 200, "{drain}");
+        assert_eq!(
+            drain["queued_operations"], 1,
+            "precondition: the stood-down child still counts the operation as queued: {drain}"
+        );
         assert_eq!(
             host.run(|admin| admin.open_counts(Slot::A)).await,
-            Ok(stuck),
-            "a stood-down child answered its caller and counts the operation it queued"
+            Ok(idle),
+            "a stood-down child that answered its caller is idle, a queued operation or not"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert!(idle.idle());
 }
 
 /// Catches an offer that goes to the wrong child or carries the wrong gates: `post_desired`
