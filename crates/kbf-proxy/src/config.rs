@@ -173,9 +173,7 @@ fn listen_address<'de, D: serde::Deserializer<'de>>(
 ) -> Result<Option<SocketAddr>, D::Error> {
     use serde::de::Error;
     const WHY: &str = "listen: must be a socket address, host:port with a port from 1 to 65535 (an IPv6 host in brackets)";
-    let value = Option::<toml::Value>::deserialize(deserializer)?;
-    let Some(value) = value else { return Ok(None) };
-    match value {
+    match toml::Value::deserialize(deserializer)? {
         toml::Value::String(text) => match text.parse::<SocketAddr>() {
             Ok(addr) if addr.port() != 0 => Ok(Some(addr)),
             _ => Err(D::Error::custom(WHY)),
@@ -342,8 +340,9 @@ base_port = 18000
             // source line to a parse error, which is the reader of a bare table's to decide.
             let table: toml::Value =
                 toml::from_str(&format!("listen = {bad}\n{MIN}")).expect("toml");
-            let Err(ConfigError::Parse(why)) = ProxyConfig::from_value(table) else {
-                panic!("{bad} was accepted");
+            let why = match ProxyConfig::from_value(table) {
+                Err(ConfigError::Parse(why)) => why,
+                other => format!("{bad} was not a parse error: {other:?}"),
             };
             assert!(why.contains("listen"), "{why}");
             for piece in ["farm.example", "192.0.2.10", "2001:db8"] {
