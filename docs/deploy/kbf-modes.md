@@ -82,7 +82,7 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `traverse` | on the node, a `file://` `--hot-store` with an existing directory above it that the unit's `User=` cannot enter (no execute bit for it as owner, group member or other); the message names the directory, its mode and owner, and the user. `install-units --mode` refuses it too, before any step |
 | `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
 | `restart` | a node unit (`storage`, `daemon`, `storage-and-daemon`) without `RestartSec=5` and, in `[Unit]`, `StartLimitIntervalSec=0`: systemd's defaults (100 ms, 5 starts in 10 s) end a quickly repeating failure in `start-limit-hit` with the unit down. The frontend keeps `Restart=on-failure` without them: an old frontend that drained after a handover exits 0 and must stay down |
-| `stop` | a mode that drains on SIGTERM (every mode but `daemon`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
+| `stop` | a mode that drains on SIGTERM (every mode but `daemon`, whose finite stop the `package_units` test checks) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 | `parse` | flags that `kbf <mode>` refuses |
 
 **`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
@@ -331,9 +331,10 @@ runs out, 90 s (`DefaultTimeoutStopSec=`) when the unit gives none. So both unit
 90 s default would cut them), and rule `stop` refuses either
 missing or changed: it reads `TimeoutSec=` too (it sets the stop timeout as well; the
 last of the two wins) and the drop-ins. It asks for the word `infinity`: `0` means no
-timeout to systemd as well, but reads as "at once" to a person. A daemon is not held:
-it does not drain on SIGTERM (the operator API's `POST /v1/nodes/{node}:drain` empties a
-node before it is stopped).
+timeout to systemd as well, but reads as "at once" to a person. A daemon is not held for ever:
+it drains on SIGTERM up to `--drain-deadline-secs` (600 by default), then stops, so its
+unit has `KillSignal=SIGTERM` and a finite `TimeoutStopSec=660` (the deadline plus 60 s);
+a hung daemon still lets a reboot through.
 
 ### storage-and-daemon and the cold store's key
 

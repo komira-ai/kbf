@@ -175,7 +175,8 @@ impl Mode {
     }
 
     /// Whether the mode drains on SIGTERM (rule `stop`): a frontend finishes its open
-    /// streams, a storage half finishes the Writes in flight. Only `daemon` does not.
+    /// streams, a storage half finishes the Writes in flight. `daemon` drains too but only to
+    /// its `--drain-deadline-secs`, so it has a finite stop timeout, not the infinite one.
     #[must_use]
     pub fn drains(self) -> bool {
         !matches!(self, Mode::Daemon)
