@@ -124,8 +124,7 @@ impl Oci {
         let bundle = dir.join("bundle");
         let thread = format!("crun-{name}");
         // The init's stdin: where it says why the program could not be started.
-        let report = std::fs::File::create(init::report_path(&dir))
-            .map_err(|e| format!("{}: {e}", init::report_path(&dir).display()))?;
+        let report = init::create_report(&dir)?;
         let run = async move { crun.run(&dir, &name, &bundle, report, stdout, stderr).await };
         Running::spawn(thread, run)
     }

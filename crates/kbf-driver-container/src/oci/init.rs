@@ -22,6 +22,12 @@ pub(crate) fn report_path(lease: &Path) -> PathBuf {
     lease.join("init-report")
 }
 
+/// Makes the report file of the lease in `lease`, empty, for the init to write to.
+pub(crate) fn create_report(lease: &Path) -> Result<std::fs::File, String> {
+    let path = report_path(lease);
+    std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// Writes the program into `<scratch>/oci-bin/kbf-init` (mode 0755, replaced
 /// atomically) and returns that path.
 pub(crate) fn install(scratch: &Path) -> std::io::Result<PathBuf> {
@@ -82,6 +88,15 @@ mod tests {
             .map(|e| e.expect("entry").file_name())
             .collect();
         assert_eq!(names, ["kbf-init"], "no staged file left");
+        // The report file: empty each time, and an error naming the file when the lease
+        // directory is not there.
+        let lease = scratch.join("lease");
+        std::fs::create_dir(&lease).expect("lease");
+        std::fs::write(report_path(&lease), b"left over").expect("old report");
+        create_report(&lease).expect("report");
+        assert_eq!(std::fs::read(report_path(&lease)).expect("read"), b"");
+        let why = create_report(&scratch.join("gone")).expect_err("no lease directory");
+        assert!(why.contains("gone/init-report: "), "{why}");
         let empty = install_bytes(&scratch, b"").expect_err("empty");
         assert!(empty.to_string().contains("no container init"), "{empty}");
     }

@@ -408,6 +408,12 @@ mod tests {
         std::fs::remove_file(&log).expect("remove log");
         assert!(said.read().await.is_ok());
         assert!(Said::crun(&log, &stderr).read().await.is_err());
+        // Only a missing file is excused: one that cannot be read (a directory opens, and
+        // fails to be read) is an error, the log's or the report's.
+        let by_dir = Said::crun(&dir, &stderr).with_report(&report);
+        assert!(by_dir.read().await.is_err(), "an unreadable log");
+        let unreadable = Said::crun(&dir.join("crun.log"), &stderr).with_report(&dir);
+        assert!(unreadable.read().await.is_err(), "an unreadable report");
         // The classifier reads the init's words as `crun`'s.
         let mut spec = crate::container::tests::spec();
         spec.argv = vec!["env".to_owned()];
