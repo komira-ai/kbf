@@ -1106,7 +1106,7 @@ impl crate::database::SchemaStep for FakeStep {
 /// (nothing fetched, so nothing staged for it) asks nothing.
 ///
 /// Mutants seen red: the step's error dropped (the swap went through); the staged-commit
-/// filter removed (the current release asked for a schema).
+/// filter removed (the current release asked for a schema); the skip's log line removed.
 #[test]
 fn the_database_is_migrated_before_the_links_move_and_a_refusal_stops_the_swap() {
     let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -1149,6 +1149,21 @@ fn the_database_is_migrated_before_the_links_move_and_a_refusal_stops_the_swap()
         *asked.borrow(),
         vec![3, 3],
         "a release that was not fetched for this order asks nothing"
+    );
+    // ... and the log says it was skipped, and why, instead of saying nothing.
+    let mut log = Vec::new();
+    rig.helper.drain_log(&mut log);
+    let log = String::from_utf8(log).expect("text");
+    let skipped = format!(
+        "state schema: no migration for order 8: {} was not fetched for it (the staged release is {})",
+        &A[..12],
+        &B[..12]
+    );
+    assert!(log.contains(&skipped), "{log}");
+    assert_eq!(
+        log.matches("state schema: no migration").count(),
+        1,
+        "only the order that skipped says so: {log}"
     );
 }
 

@@ -166,6 +166,17 @@ pub struct ServiceArgs {
 }
 
 impl ServiceArgs {
+    /// Whether the service this installer restarts is the unit of a mode that keeps its state
+    /// in the database (`kbf-frontend@<instance>.service`, `kbf-all-in-one.service`): the
+    /// installer is not told the host's mode, the unit it restarts is the one place that
+    /// names it. A launchd label names no mode.
+    pub fn runs_database_mode(&self) -> bool {
+        self.unit.as_deref().is_some_and(|u| {
+            u == "kbf-all-in-one.service"
+                || (u.starts_with("kbf-frontend@") && u.ends_with(".service"))
+        })
+    }
+
     /// How to restart the service. clap makes exactly one of the two flags present
     /// (`required_unless_present`, `conflicts_with`), so the label is there whenever the
     /// unit is not.
@@ -207,9 +218,9 @@ pub struct RunArgs {
     /// Stop after this many passes (a rehearsal or a test); without it, run until stopped.
     #[arg(long)]
     pub passes: Option<u64>,
-    /// installer.toml, under the host root: on a frontend or all-in-one host, its `database`
-    /// key is the state database the installer migrates to what a release needs before that
-    /// release is activated.
+    /// installer.toml, under the host root: its `database` key is the state database the
+    /// installer migrates to what a release needs before that release is activated. Required
+    /// when the unit restarted after a swap is a frontend's or the all-in-one's.
     #[arg(long)]
     pub installer_config: Option<std::path::PathBuf>,
 }

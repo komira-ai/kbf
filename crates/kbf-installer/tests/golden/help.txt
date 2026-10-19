@@ -96,7 +96,7 @@ Options:
       --passes <PASSES>
           Stop after this many passes (a rehearsal or a test); without it, run until stopped
       --installer-config <INSTALLER_CONFIG>
-          installer.toml, under the host root: on a frontend or all-in-one host, its `database` key is the state database the installer migrates to what a release needs before that release is activated
+          installer.toml, under the host root: its `database` key is the state database the installer migrates to what a release needs before that release is activated. Required when the unit restarted after a swap is a frontend's or the all-in-one's
   -h, --help
           Print help
 

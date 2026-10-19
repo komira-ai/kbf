@@ -584,16 +584,32 @@ impl<E: Exec> Helper<E> {
 
     fn activate(&mut self, order: &Order, now: u64, memory: &Memory) -> Result<Done, String> {
         // Before the links move: a release must not start on a schema it cannot run on.
-        // A commit this helper did not stage (an older release ordered again) has no
-        // known schema here; its own start check is what guards it.
-        if let (Some(step), Some(staged)) = (
-            self.schema.as_mut(),
-            memory.staged.as_ref().filter(|f| f.commit == order.commit),
-        ) {
-            let note = step
-                .before_start(staged.state_schema)
-                .map_err(|why| format!("state schema: {why}"))?;
-            let _ = writeln!(self.log, "state schema: {note}");
+        // Only a release this order fetched has a schema known here (its own report). An
+        // order for the release already running, or for one this pass did not fetch, asks
+        // for no migration and says so in the log: kbf's own start check is what guards it.
+        if let Some(step) = self.schema.as_mut() {
+            match memory.staged.as_ref().filter(|f| f.commit == order.commit) {
+                Some(staged) => {
+                    let note = step
+                        .before_start(staged.state_schema)
+                        .map_err(|why| format!("state schema: {why}"))?;
+                    let _ = writeln!(self.log, "state schema: {note}");
+                }
+                None => {
+                    let _ = writeln!(
+                        self.log,
+                        "state schema: no migration for order {}: {} was not fetched for it \
+                         (the staged release is {}), so the schema it needs is not known \
+                         here; its own start check guards it",
+                        order.id,
+                        &order.commit.as_str()[..12],
+                        memory
+                            .staged
+                            .as_ref()
+                            .map_or("none", |f| &f.commit.as_str()[..12]),
+                    );
+                }
+            }
         }
         let ordered = activate::Order {
             commit: order.commit.clone(),

@@ -37,12 +37,24 @@ use super::{PostgresConfig, describe};
 
 /// The oldest schema version this build runs against. Raise it in the release that follows
 /// a `contract` migration, in the same commit.
+///
+/// The start check accepts every version from here up to the newest this build embeds, not
+/// only the newest: a schema that is behind (in range, older than [`latest`]) is served as it
+/// is, because each migration since this one is an expand step and the installer brings the
+/// schema forward before it activates a release that needs more. The test
+/// `a_schema_behind_the_newest_but_in_range_is_accepted` pins it.
 pub const MIN_SUPPORTED: u32 = 1;
 
 /// The migrations shipped in this build: version, name, file.
 const EMBEDDED: [(u32, &str, &str); 1] = [(1, "state", include_str!("migrations/0001_state.sql"))];
 
-/// Taken (transaction-scoped) by every schema change.
+/// Taken (transaction-scoped) by every schema change: the installer's `apply` and `setup`
+/// serialise on it, so two installers racing apply a migration once. The key is
+/// `hashtext('kbf-state-schema')`, a 32-bit hash widened to the `bigint` key space; it is a
+/// fixed string, so every installer and every release computes the same key, and nothing
+/// else in the database may take an advisory lock on that value. Changing the string splits
+/// the lock between releases (an old and a new installer would no longer exclude each
+/// other), so it never changes.
 const LOCK: &str = "SELECT pg_advisory_xact_lock(hashtext('kbf-state-schema'))";
 
 /// Whether a migration leaves the previous release working.
@@ -370,6 +382,15 @@ fn words(sql: &str) -> Vec<Vec<String>> {
                 flush(&mut word, &mut statements);
                 statements.push(Vec::new());
             }
+            // Kept as words of their own: the lint reads clauses (split at a comma outside
+            // parentheses) and what comes after an opening parenthesis.
+            (b',' | b'(' | b')', _) => {
+                flush(&mut word, &mut statements);
+                statements
+                    .last_mut()
+                    .expect("one statement")
+                    .push(char::from(c).to_string());
+            }
             (c, _) if c.is_ascii_alphanumeric() || c == b'_' => word.push(char::from(c)),
             _ => flush(&mut word, &mut statements),
         }
@@ -380,15 +401,50 @@ fn words(sql: &str) -> Vec<Vec<String>> {
     statements
 }
 
+/// The clauses of an `ALTER`-style statement: split at the commas outside parentheses.
+fn clauses(stmt: &[String]) -> Vec<&[String]> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0_usize, 0);
+    for (i, w) in stmt.iter().enumerate() {
+        match w.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            "," if depth == 0 => {
+                out.push(&stmt[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&stmt[start..]);
+    out
+}
+
+/// The words that name a table after `from` (an index of the word before the name), up to
+/// the first of `stops`. Empty when a quoted name left nothing there: the caller then
+/// cannot tell which table it is and fails closed.
+fn table_name(stmt: &[String], from: usize, stops: &[&str]) -> String {
+    stmt[from..]
+        .iter()
+        .take_while(|w| !stops.contains(&w.as_str()))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn lint(sql: &str) -> Found {
     let mut always = None;
     let mut breaking = None;
+    // The tables this file creates: an index on one of them cannot lock out the release
+    // that is still serving, a unique index on any other can.
+    let mut created: Vec<String> = Vec::new();
     for stmt in words(sql) {
         let has = |w: &str| stmt.iter().any(|t| t == w);
         let seq = |words: [&str; 3]| {
             stmt.windows(3)
                 .any(|w| w.iter().zip(words).all(|(a, b)| a == b))
         };
+        let pair = |a: &str, b: &str| stmt.windows(2).any(|w| w[0] == a && w[1] == b);
         if ["COMMIT", "ROLLBACK", "ABORT", "SAVEPOINT"]
             .iter()
             .any(|w| has(w))
@@ -414,9 +470,75 @@ fn lint(sql: &str) -> Found {
         if seq(["SET", "NOT", "NULL"]) {
             breaking.get_or_insert("SET NOT NULL");
         }
-        let not_null = stmt.windows(2).any(|w| w[0] == "NOT" && w[1] == "NULL");
-        if has("ADD") && not_null && !has("DEFAULT") {
-            breaking.get_or_insert("a NOT NULL column added without a default");
+        if pair("SET", "DEFAULT") {
+            breaking.get_or_insert("SET DEFAULT");
+        }
+        // Per clause: `ADD COLUMN a int DEFAULT 0, ADD COLUMN b text NOT NULL` must not let
+        // the first clause's default excuse the second.
+        for clause in clauses(&stmt) {
+            let in_clause = |w: &str| clause.iter().any(|t| t == w);
+            let not_null = clause.windows(2).any(|w| w[0] == "NOT" && w[1] == "NULL");
+            if in_clause("ADD") && not_null && !in_clause("DEFAULT") {
+                breaking.get_or_insert("a NOT NULL column added without a default");
+            }
+            if clause.windows(2).any(|w| {
+                w[0] == "ADD"
+                    && [
+                        "CONSTRAINT",
+                        "PRIMARY",
+                        "UNIQUE",
+                        "CHECK",
+                        "FOREIGN",
+                        "EXCLUDE",
+                    ]
+                    .contains(&w[1].as_str())
+            }) {
+                breaking.get_or_insert("ADD CONSTRAINT on an existing table");
+            }
+        }
+        if seq(["CREATE", "OR", "REPLACE"]) {
+            breaking.get_or_insert("CREATE OR REPLACE");
+        }
+        // An UPDATE that does something to rows: it starts a statement, or follows what
+        // starts one inside a body (`BEGIN`, `THEN`, `ELSE`, `LOOP`) or a parenthesis (a
+        // CTE). `ON CONFLICT DO UPDATE`, `ON UPDATE CASCADE`, `FOR UPDATE` and `GRANT UPDATE`
+        // do not rewrite rows of their own.
+        if stmt.iter().enumerate().any(|(i, w)| {
+            w == "UPDATE"
+                && (i == 0
+                    || ["BEGIN", "THEN", "ELSE", "LOOP", "("].contains(&stmt[i - 1].as_str()))
+        }) {
+            breaking.get_or_insert("an UPDATE of rows");
+        }
+        if let Some(i) = stmt.iter().position(|w| w == "TABLE")
+            && stmt.first().is_some_and(|f| f == "CREATE")
+        {
+            let skip = if stmt[i + 1..].starts_with(&["IF".into(), "NOT".into(), "EXISTS".into()]) {
+                3
+            } else {
+                0
+            };
+            let name = table_name(&stmt, i + 1 + skip, &["(", "AS", "PARTITION", "OF"]);
+            if !name.is_empty() {
+                created.push(name);
+            }
+        }
+        if let Some(i) = stmt
+            .windows(3)
+            .position(|w| w == ["CREATE", "UNIQUE", "INDEX"])
+        {
+            let on = stmt[i..].iter().position(|w| w == "ON").map(|k| i + k + 1);
+            let on = on.map(|k| {
+                if stmt.get(k).is_some_and(|w| w == "ONLY") {
+                    k + 1
+                } else {
+                    k
+                }
+            });
+            let table = on.map(|k| table_name(&stmt, k, &["(", "USING"]));
+            if !table.is_some_and(|t| !t.is_empty() && created.contains(&t)) {
+                breaking.get_or_insert("a CREATE UNIQUE INDEX on a table not created in this file");
+            }
         }
     }
     Found { always, breaking }
@@ -475,7 +597,18 @@ pub(super) fn check_conn(
     schema: &str,
     supported: Supported,
 ) -> Result<u32, SchemaError> {
-    let rows = rows(conn, schema)?;
+    judge(&rows(conn, schema)?, supported)
+}
+
+/// The start check on the rows of `schema_version`, oldest first.
+///
+/// **Behind is accepted.** A version in `min..max` (older than the newest this build embeds
+/// but not older than [`MIN_SUPPORTED`]) passes: every migration since `min` is an expand
+/// step, so this build still runs on it, and the installer brings the schema forward when
+/// it activates a release that needs more. Refusing `found < max` instead would stop a
+/// release from starting on the schema its predecessor left, which is every update. Only
+/// below `min`, nothing at all, or a `contract` row above `max` is refused.
+fn judge(rows: &[(u32, String)], supported: Supported) -> Result<u32, SchemaError> {
     let Some(&(found, _)) = rows.last() else {
         return Err(SchemaError::NotInitialised);
     };

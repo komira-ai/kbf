@@ -407,6 +407,56 @@ fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
     );
 }
 
+/// Catches a frontend or all-in-one unit that activates releases with no database migration
+/// and no warning: `run` for the unit of either mode refuses (exit 2, one line) unless
+/// `--installer-config` is given, before it touches the host; a unit of a mode with no
+/// database (or a launchd label, which names no mode) still runs without one; and a config
+/// that cannot be read stops the service rather than starting it without the step.
+///
+/// Mutants seen red: the unit check removed (the all-in-one unit ran its pass); the unit
+/// check matching `kbf-frontend` without the `@` (the plain `kbf-frontend.service` refused).
+#[test]
+fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
+    let (_, root) = seeded("run-database");
+    for unit in ["kbf-all-in-one.service", "kbf-frontend@main.service"] {
+        let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
+        assert_eq!(exit, Exit::Usage, "{unit}: {err}");
+        assert_eq!(
+            err,
+            "kbf-installer: run needs --installer-config on a frontend or all-in-one host \
+             (the database is migrated before a release is activated)\n",
+            "{unit}"
+        );
+        assert!(
+            !root.join("var/lib/kbf-installer/status.json").exists(),
+            "{unit}: nothing was done before the refusal"
+        );
+    }
+    for unit in ["kbf.service", "kbf-daemon.service", "kbf-frontend.service"] {
+        let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
+        assert_eq!(exit, Exit::Ok, "{unit}: {err}");
+    }
+    let (exit, err) = on(
+        &root,
+        &["run", "--passes", "1", "--launchd-label", "com.example.kbf"],
+    );
+    assert_eq!(exit, Exit::Ok, "a label names no mode: {err}");
+    let (exit, err) = on(
+        &root,
+        &[
+            "run",
+            "--passes",
+            "1",
+            "--unit",
+            "kbf-all-in-one.service",
+            "--installer-config",
+            "/etc/kbf/missing.toml",
+        ],
+    );
+    assert_eq!(exit, Exit::Failed, "{err}");
+    assert!(err.contains("missing.toml"), "{err}");
+}
+
 /// Catches `setup` taking the database step for a mode with no database, or demanding root
 /// for the step that does not need it: as an ordinary user `--mode frontend` and
 /// `all-in-one` read installer.toml (a missing file is a failure that names it, exit 1),
