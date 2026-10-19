@@ -21,11 +21,14 @@
 //! `ChildAdmin` built on it (`admin_protocol` 1, sending the proxy secret header on every
 //! call), and nothing else calls it yet.
 //!
-//! Still fakes, stated: `Migrator` (who migrates is open), `RootOrders` (the orders spool
-//! and `status.json` reader belong to the update API's unit, U8b). Until the proxy verb
-//! wires [`admin`] in, it cannot run a swap or resume one, start a first child or choose
-//! between two live ones, so [`supervisor::adopt_children`] adopts a child only when no
-//! update is in flight.
+//! The update API's seams are bound in [`handover`]: the order spool, `status.json`, the
+//! request map and the restart answer are real there, and the supervisor is a refusal until a
+//! swap is run behind the API.
+//!
+//! Still fakes, stated: `Migrator` (who migrates is open). [`root_orders::SpoolRootOrders`]
+//! is real and nothing builds it yet. Until the proxy verb wires [`admin`] in, it cannot run
+//! a swap or resume one, start a first child or choose between two live ones, so
+//! [`supervisor::adopt_children`] adopts a child only when no update is in flight.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -86,6 +89,7 @@ pub mod child_http;
 #[cfg(target_os = "linux")]
 pub mod child_real;
 pub mod gate_real;
+pub mod handover;
 pub mod model;
 pub mod orders;
 pub mod ports;
