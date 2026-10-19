@@ -110,7 +110,9 @@ fn absolute(key: &str, value: &Option<String>, problems: &mut Vec<String>) -> Op
     if plain && v.starts_with('/') && v.split('/').skip(1).all(|c| !matches!(c, "" | "." | "..")) {
         Some(PathBuf::from(v))
     } else {
-        problems.push(format!("{key} = {v:?}: must be an absolute path of plain characters with no empty, . or .. part"));
+        problems.push(format!(
+            "{key}: must be an absolute path of plain characters with no empty, . or .. part"
+        ));
         None
     }
 }
@@ -123,15 +125,19 @@ pub(crate) fn https_base(url: &str) -> Result<String, String> {
 
 /// [`https_base`], with `label` (the key or flag the text came from) in each message.
 pub(crate) fn https_base_named(label: &str, url: &str) -> Result<String, String> {
-    let bad = |why: &str| format!("{label} {url:?}: {why}");
+    // No message repeats the URL: a credential can be in any part of it, and the scheme
+    // check runs first, so even a URL that is not https can hold one.
+    let bad = |why: &str| format!("{label}: {why}");
     let rest = url
         .strip_prefix("https://")
         .ok_or_else(|| bad("must start with https://"))?;
+    // These two parts are where a credential goes (`user:password@`, `?token=`): the message
+    // names the rule and never repeats the text.
     if rest.contains('@') {
-        return Err(bad("must not carry user information"));
+        return Err(format!("{label}: must not carry user information"));
     }
     if rest.contains('?') || rest.contains('#') {
-        return Err(bad("must not carry a query or a fragment"));
+        return Err(format!("{label}: must not carry a query or a fragment"));
     }
     let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
     let path = path.trim_end_matches('/');
@@ -200,12 +206,40 @@ fn bounded<T: PartialOrd + std::fmt::Display + Copy>(
     v
 }
 
+/// A parser message without the text of the file in it: serde and the parser quote the value
+/// or key they met (between backticks or quotes), and that text can be a password typed
+/// into the wrong place. Everything from the first quote on is dropped.
+pub(crate) fn redact(message: &str) -> String {
+    let kept = message
+        .find(['`', '"', '\''])
+        .map_or(message, |at| &message[..at]);
+    let kept = kept.trim_end_matches([' ', ',', ':']);
+    format!("{kept} (the text is not shown)")
+}
+
+/// Where and what the parser objected to, without its quote of the offending line: that line
+/// can be a `database` URL, and a password a person typed into it must not reach a log.
+fn syntax_line(text: &str, error: &toml::de::Error) -> String {
+    match error.span() {
+        Some(span) => {
+            let before = text.get(..span.start).unwrap_or_default();
+            format!(
+                "line {}: {}",
+                before.matches('\n').count() + 1,
+                redact(error.message())
+            )
+        }
+        None => redact(error.message()),
+    }
+}
+
 impl InstallerToml {
     pub fn parse(text: &str) -> Result<InstallerToml, ConfigError> {
         if text.len() > MAX_FILE_BYTES {
             return Err(ConfigError::TooLarge(text.len()));
         }
-        let raw: Raw = toml::from_str(text).map_err(|e| ConfigError::Syntax(e.to_string()))?;
+        let raw: Raw =
+            toml::from_str(text).map_err(|e| ConfigError::Syntax(syntax_line(text, &e)))?;
         let d = InstallerToml::default();
         let mut problems = Vec::new();
 
@@ -226,16 +260,14 @@ impl InstallerToml {
                 .map(Source::Url)
                 .map_err(|e| problems.push(e))
                 .ok(),
-            (other, _) => {
-                problems.push(format!(
-                    "release_source = {other:?}: must be \"url\" or \"frontend\""
-                ));
+            (_, _) => {
+                problems.push("release_source: must be \"url\" or \"frontend\"".to_owned());
                 None
             }
         };
         let refs = raw.source_refs.unwrap_or_default();
-        for r in refs.iter().filter(|r| !ref_ok(r)) {
-            problems.push(format!("source_refs: {r:?} is not a refs/... name"));
+        for _ in refs.iter().filter(|r| !ref_ok(r)) {
+            problems.push("source_refs: an entry is not a refs/... name".to_owned());
         }
         let confirm_window_s = bounded(
             "confirm_window_s",
