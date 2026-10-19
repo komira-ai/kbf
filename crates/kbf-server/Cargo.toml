@@ -33,7 +33,7 @@ kbf-proto.workspace = true
 kbf-raft.workspace = true
 kbf-route.workspace = true
 kbf-sched.workspace = true
-kbf-state.workspace = true
+kbf-state = { workspace = true, features = ["postgres"] }
 kbf-storage.workspace = true
 kbf-store.workspace = true
 kbf-threads.workspace = true
@@ -55,21 +55,32 @@ tonic = { workspace = true, features = ["tls-ring"] }
 tower-layer.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The wipe of a secret file's bytes after they are read or written (object_store/secrets.rs).
+zeroize.workspace = true
 
 [dev-dependencies]
-# A connector that fails its first lookups, under a lazy channel (tests/storage_register.rs).
+# Loopback ports nothing can take (kbf_testkit::port).
+kbf-testkit.workspace = true
+# A connector that fails its first lookups, under a lazy channel (tests/storage_register.rs),
+# and the TLS reload tests' connector that dials once per attempt (tests/tls_reload.rs).
 hyper-util = { workspace = true, features = ["tokio"] }
 # A test certificate's public-key hash and names, read independently of kbf-peer.
 x509-parser.workspace = true
 kbf-segments.workspace = true
+# The node's update client the offer tests hand the offers to (tests/update_offers.rs).
+kbf-update.workspace = true
 # The deterministic simulation kernel's seeded random stream (tests/sim_rollout.rs).
 kbf-sim.workspace = true
 # The in-memory state store (src/start.rs, src/frontend, src/farm/durable and tests/).
 kbf-state = { workspace = true, features = ["test-support"] }
+# A router called as a service with a chosen peer address (tests/object_store_api.rs).
+tower-service.workspace = true
 # The pages, rendered over this server's real routes (tests/ui_pages.rs).
 kbf-ui.workspace = true
 # fcntl and kill for the test that holds the server at its start line (tests/binary.rs).
 libc.workspace = true
+# Drops the default schema before the Postgres flag test (tests/state_store_postgres.rs).
+postgres.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }

@@ -370,6 +370,69 @@ async fn with_a_registry_an_unenrolled_node_is_refused_and_a_failing_registry_is
     assert_eq!(panicked.message(), "the store config call failed");
 }
 
+/// Catches: the cold-store check reading the peer certificate itself instead of asking
+/// the one who-is-calling function ([`kbf_server::identity::presented`]). Behind the farm's
+/// proxy there is no certificate, so the node and role the proxy forwarded must decide:
+/// a storage identity naming an enrolled node is admitted, one naming an unenrolled node
+/// reaches the registry and is refused, a missing node or role is UNAUTHENTICATED, another
+/// role is PERMISSION_DENIED, and plain text refuses a proxied identity too.
+///
+/// Mutant seen red: `admit_presented` treating a proxied identity as a certificate with
+/// no leaf (every proxied call UNAUTHENTICATED).
+#[tokio::test]
+async fn a_proxied_identity_is_admitted_by_its_node_and_role_not_by_a_certificate() {
+    use kbf_server::identity::Presented;
+    use kbf_server::proxy_auth::Identity;
+    use kbf_server::store_config::service::ColdStoreService;
+    use kbf_storage::service::{Admission, PeerRole};
+    let farm = farm(Source::new(7), true).await;
+    farm.store
+        .clock
+        .advance(std::time::Duration::from_secs(1_000_000));
+    enroll(&*farm.store, "node-a");
+    let service = ColdStoreService::new(Source::new(7), Admission::Certified)
+        .with_registry(Some(Arc::clone(&farm.store) as Arc<dyn kbf_state::Store>));
+    let proxied = |node: Option<&str>, role: Option<PeerRole>| {
+        Presented::Proxy(Identity {
+            node_id: node.map(str::to_owned),
+            role,
+        })
+    };
+
+    let admitted = service
+        .admit_presented(&proxied(Some("node-a"), Some(PeerRole::Storage)))
+        .await
+        .expect("an enrolled storage node")
+        .expect("a peer");
+    assert_eq!(admitted.node().expect("a node"), "node-a");
+    let stranger = service
+        .admit_presented(&proxied(Some("node-b"), Some(PeerRole::Storage)))
+        .await
+        .expect_err("unenrolled");
+    assert_eq!(stranger.code(), Code::PermissionDenied);
+    assert_eq!(stranger.message(), "the node is not enrolled or is revoked");
+    for (node, role) in [(None, Some(PeerRole::Storage)), (Some("node-a"), None)] {
+        let refused = service
+            .admit_presented(&proxied(node, role))
+            .await
+            .expect_err("incomplete identity");
+        assert_eq!(refused.code(), Code::Unauthenticated, "{node:?} {role:?}");
+    }
+    let daemon = service
+        .admit_presented(&proxied(Some("node-a"), Some(PeerRole::Daemon)))
+        .await
+        .expect_err("a daemon");
+    assert_eq!(daemon.code(), Code::PermissionDenied);
+    assert_eq!(daemon.message(), "role daemon may not fetch the cold store");
+
+    let plain = ColdStoreService::new(Source::new(7), Admission::Open);
+    let refused = plain
+        .admit_presented(&proxied(Some("node-a"), Some(PeerRole::Storage)))
+        .await
+        .expect_err("plain text");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+}
+
 /// Catches: a heartbeat or a registration that fails because the frontend cannot say its
 /// registration generation (the state store failed): the node must keep its membership. The
 /// answer carries 0, "none or cannot say", and the map as ever.

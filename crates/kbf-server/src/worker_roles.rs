@@ -23,6 +23,11 @@
 //! plain text a listed call goes on, as there is no identity to read (for tests and
 //! trials on one machine).
 //!
+//! Behind the farm's proxy ([`crate::proxy_auth`]) the role is the one the proxy forwarded in
+//! `x-kbf-role` for a call whose certificate it verified ([`admit_presented`]); a call with
+//! none is UNAUTHENTICATED, as one without a certificate is. [`crate::serve::worker_peers`]
+//! puts the proxy layer before this one.
+//!
 //! A node that runs both storage and a daemon holds two certificates and presents one on
 //! each connection: its daemon half's connection is a daemon's, its storage half's a
 //! storage node's.
@@ -38,6 +43,8 @@ use kbf_storage::service::{Admission, PeerRole, role_of};
 use tonic::Status;
 use tonic::codegen::{Service, http};
 use tower_layer::Layer;
+
+use crate::identity::{Presented, presented};
 
 const DAEMON: &[PeerRole] = &[PeerRole::Daemon];
 const STORAGE: &[PeerRole] = &[PeerRole::Storage];
@@ -113,15 +120,22 @@ pub fn roles_for(path: &str) -> Option<&'static [PeerRole]> {
 /// [`Admission::Certified`], no certificate, or one that does not parse.
 pub fn admit(admission: Admission, path: &str, leaf: Option<&[u8]>) -> Result<(), Status> {
     let Some(roles) = roles_for(path) else {
-        return Err(Status::permission_denied(format!(
-            "{path} is not served on the worker listener"
-        )));
+        return Err(not_served(path));
     };
     if admission == Admission::Open {
         return Ok(());
     }
     let der = leaf.ok_or_else(|| Status::unauthenticated("no client certificate"))?;
-    let role = role_of(der)?;
+    allowed(roles, role_of(der)?, path)
+}
+
+/// The refusal for a method the listener does not serve.
+fn not_served(path: &str) -> Status {
+    Status::permission_denied(format!("{path} is not served on the worker listener"))
+}
+
+/// Whether `role` is one of `roles`, the roles `path` takes.
+fn allowed(roles: &[PeerRole], role: PeerRole, path: &str) -> Result<(), Status> {
     if roles.contains(&role) {
         return Ok(());
     }
@@ -130,6 +144,32 @@ pub fn admit(admission: Admission, path: &str, leaf: Option<&[u8]>) -> Result<()
         "role {role} may not call {path} on the worker listener; it takes {}",
         takes.join(", ")
     )))
+}
+
+/// [`admit`] for what a call presents: a proxied identity is judged by the role the proxy
+/// forwarded, a certificate as [`admit`] says.
+///
+/// # Errors
+/// As [`admit`]; and, under [`Admission::Certified`], UNAUTHENTICATED for a proxied identity
+/// that names no role.
+pub fn admit_presented(
+    admission: Admission,
+    path: &str,
+    presented: &Presented,
+) -> Result<(), Status> {
+    let Presented::Proxy(identity) = presented else {
+        return admit(admission, path, presented.leaf());
+    };
+    let Some(roles) = roles_for(path) else {
+        return Err(not_served(path));
+    };
+    if admission == Admission::Open {
+        return Ok(());
+    }
+    let role = identity
+        .role
+        .ok_or_else(|| Status::unauthenticated("no client identity from the proxy"))?;
+    allowed(roles, role, path)
 }
 
 /// Applies [`admit`] to every call of the server it is added to (with
@@ -180,10 +220,8 @@ where
     }
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
-        let certs = kbf_tls::peer_certs_of(request.extensions());
-        let leaf = certs.as_deref().and_then(|chain| chain.first());
         let path = request.uri().path();
-        match admit(self.admission, path, leaf.map(AsRef::as_ref)) {
+        match admit_presented(self.admission, path, &presented(request.extensions())) {
             Ok(()) => Either::Right(self.inner.call(request)),
             Err(refused) => {
                 let (code, reason) = (refused.code(), refused.message());

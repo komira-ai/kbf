@@ -3,9 +3,13 @@
 //! `docs/api.md`).
 //!
 //! - `GET /v1/nodes`: every node registered since the server started, with the newest
-//!   software status each sent and where it is in placement ([`crate::fleet`]).
+//!   software status each sent, where its update is (state, `up_to_date` against the
+//!   desired commit, availability: [`crate::update_status`]) and where it is in
+//!   placement ([`crate::fleet`]), the protocol version each speaks, and the oldest of
+//!   those ([`ProtocolSummary`]).
 //! - `GET /v1/members`: the storage members of the current map, as the gRPC
-//!   `Membership` service keeps them ([`crate::members::Members`]).
+//!   `Membership` service keeps them ([`crate::members::Members`]), the protocol version
+//!   each registered naming, and the oldest of those.
 //! - `GET /v1/storage`: whether every blob is known to have its copies elsewhere, from the
 //!   storage members' heartbeats ([`crate::storage_health`]); on a frontend with a state
 //!   store.
@@ -41,14 +45,21 @@
 //! page. The gates: a loopback peer, no `Origin` header (no browser page), the bearer
 //! token of `--api-token-file` ([`ApiToken`]; without one, writes are off), and a JSON
 //! content type. The roles of `fleet-updates-security.md` section S9 are planned.
+//!
+//! **Behind the farm's proxy** (`--proxy-auth-file`, [`crate::proxy_auth`]) a loopback peer
+//! is not enough: every route, reads too, takes calls from loopback only, and a write whose
+//! caller did not present the proxy's secret is refused 403 even with the token (the first
+//! gate becomes "loopback, and the proxy's secret"). The secret says who forwarded the
+//! request, not that it may write: the token is still required. Handlers take a [`Caller`]
+//! (the peer address and what the proxy layer decided), never the `x-kbf-*` headers, which
+//! the layer removes.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -60,8 +71,12 @@ use serde::{Deserialize, Serialize};
 use crate::drain::{Drain, DrainStatus};
 use crate::enroll::api::EnrollApi;
 use crate::farm::{Farm, NodeAction};
+use crate::fleet::ProtocolSummary;
 use crate::members::{Members, MembershipError};
+use crate::proxy_auth::{Caller, Trust};
+use crate::release::desired::blocking;
 use crate::token::ApiToken;
+use crate::update::Rows;
 
 /// The media type of every body this API returns, and of every write it accepts.
 pub const JSON: &str = "application/json";
@@ -108,12 +123,16 @@ struct ApiState {
     token: Option<ApiToken>,
     drain: Arc<Drain>,
     members: Option<Arc<Members>>,
+    /// Where the desired release is read for each node's `update.up_to_date` (`None`:
+    /// no state store, so no desired release).
+    update: Option<Rows>,
 }
 
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
 /// `drain` is what `POST /v1/frontend/drain` begins; `members` is what
 /// `GET /v1/members` reads and `POST /v1/members/{id}` changes (the same value the
-/// `Membership` service registers into). `enroll` is what the `/v1/enroll/...` routes
+/// `Membership` service registers into). `update` is where the desired release is read
+/// to judge each node's `update.up_to_date`. `enroll` is what the `/v1/enroll/...` routes
 /// call ([`crate::enroll::api`]); `None` when this server has no enrollment, which those
 /// routes answer, behind the gate, with 404.
 /// Writes read the peer address from
@@ -123,6 +142,7 @@ pub fn router(
     token: Option<ApiToken>,
     drain: Arc<Drain>,
     members: Option<Arc<Members>>,
+    update: Option<Rows>,
     enroll: Option<Arc<EnrollApi>>,
 ) -> Router {
     let enrollment = crate::enroll::api::routes(token.clone(), enroll);
@@ -138,6 +158,7 @@ pub fn router(
             token,
             drain,
             members,
+            update,
         }))
         .merge(enrollment)
 }
@@ -162,11 +183,11 @@ struct NoBody {}
 
 async fn begin_drain(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     if !body.is_empty()
@@ -181,8 +202,27 @@ async fn begin_drain(
     json(StatusCode::OK, &status(&api))
 }
 
+/// The commit the farm wants, for judging each node's `update.up_to_date`; `None` when
+/// there is none, there is no state store, or the row cannot be read (logged: a node
+/// list that names no verdict is better than none).
+async fn desired_commit(api: &ApiState) -> Option<String> {
+    let rows = api.update.clone()?;
+    match blocking(move || rows.desired()).await {
+        Ok(stored) => stored.value.map(|d| d.commit.as_str().to_owned()),
+        Err(e) => {
+            tracing::warn!("update rows: the desired release is not read for the node list: {e}");
+            None
+        }
+    }
+}
+
 async fn nodes(State(api): State<Arc<ApiState>>) -> Response {
-    json(StatusCode::OK, &api.farm.nodes())
+    let desired = desired_commit(&api).await;
+    let mut view = api.farm.nodes();
+    for node in &mut view.nodes {
+        node.update.judge(desired.as_deref());
+    }
+    json(StatusCode::OK, &view)
 }
 
 /// One storage member of the map.
@@ -192,6 +232,8 @@ struct MemberView {
     addr: String,
     state: &'static str,
     weight: u32,
+    /// What its registration named; `None` if its row names none or has lapsed.
+    protocol: Option<u32>,
 }
 
 /// The storage members of the current map.
@@ -199,6 +241,8 @@ struct MemberView {
 struct MembersView {
     generation: u64,
     members: Vec<MemberView>,
+    #[serde(flatten)]
+    protocols: ProtocolSummary,
 }
 
 /// A member's state as `GET /v1/members` names it. Exhaustive: a new state fails to
@@ -217,9 +261,15 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
     let Some(members) = api.members.clone() else {
         return no_members();
     };
-    // The store's calls block (its trait says so).
-    let map = match tokio::task::spawn_blocking(move || members.current_map()).await {
-        Ok(Ok(map)) => map,
+    // The store's calls block (its trait says so). The map is read, then the rows that
+    // say which protocol each member registered naming: not one snapshot, so a member
+    // whose row lapses between the two is listed without a version.
+    let read = tokio::task::spawn_blocking(move || {
+        let map = members.current_map()?;
+        Ok::<_, MembershipError>((map, members.protocols()?))
+    });
+    let (map, protocols) = match read.await {
+        Ok(Ok(read)) => read,
         Ok(Err(e)) => {
             let code = match e {
                 MembershipError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -237,10 +287,11 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
         MembersView {
             generation: 0,
             members: Vec::new(),
+            protocols: ProtocolSummary::of([]),
         },
-        |map| MembersView {
-            generation: map.generation(),
-            members: map
+        |map| {
+            // A member whose row has lapsed (`Down`) has no version to show.
+            let members: Vec<MemberView> = map
                 .members()
                 .iter()
                 .map(|m| MemberView {
@@ -248,8 +299,14 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
                     addr: m.addr.clone(),
                     state: state_name(m.state),
                     weight: m.weight,
+                    protocol: protocols.get(&m.id).copied().flatten(),
                 })
-                .collect(),
+                .collect();
+            MembersView {
+                generation: map.generation(),
+                protocols: ProtocolSummary::of(members.iter().map(|m| m.protocol)),
+                members,
+            }
         },
     );
     json(StatusCode::OK, &view)
@@ -257,20 +314,23 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
 
 async fn act(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     Path(target): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let request = Write {
-        peer,
+        peer: &peer,
         headers: &headers,
         target: &target,
         body: &body,
     };
     match write_request(api.token.as_ref(), &request) {
         Ok((node, action)) => match api.farm.place(&node, action) {
-            Ok(view) => json(StatusCode::OK, &view),
+            Ok(mut view) => {
+                view.update.judge(desired_commit(&api).await.as_deref());
+                json(StatusCode::OK, &view)
+            }
             Err(unknown) => error(StatusCode::NOT_FOUND, &unknown.to_string()),
         },
         Err((code, why)) => error(code, &why),
@@ -295,12 +355,12 @@ enum MemberTarget {
 
 async fn set_member_state(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(members) = api.members.clone() else {
@@ -390,11 +450,11 @@ fn entry_of(text: &str) -> Result<DenyEntry, (StatusCode, String)> {
 
 async fn deny_entry(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(members) = api.members.clone() else {
@@ -430,11 +490,11 @@ async fn deny_entry(
 
 async fn allow_entry(
     State(api): State<Arc<ApiState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(api.token.as_ref(), &peer, &headers) {
         return error(code, &why);
     }
     let Some(members) = api.members.clone() else {
@@ -526,8 +586,8 @@ fn no_members() -> Response {
 /// A write as it arrived.
 #[derive(Clone, Copy, Debug)]
 pub struct Write<'a> {
-    /// Who sent it.
-    pub peer: SocketAddr,
+    /// Who sent it, and how far the proxy vouches for it.
+    pub peer: &'a Caller,
     /// Its headers.
     pub headers: &'a HeaderMap,
     /// The last path segment: `{node}:{verb}`.
@@ -546,7 +606,9 @@ struct DrainBody {
 /// The gates every write passes, in order:
 ///
 /// 1. the peer is loopback, so the token never crosses a network in clear (a remote
-///    operator comes through a TLS-terminating proxy on the host): else 403;
+///    operator comes through a TLS-terminating proxy on the host); and, when a proxy is
+///    configured (`--proxy-auth-file`), the request presented the proxy's secret
+///    ([`Trust::Unverified`] is refused): else 403;
 /// 2. no `Origin` header: a browser sends one with every cross-origin POST, and a
 ///    page must not act with an operator's token or from the host: else 403;
 /// 3. writes are on (`token` is given): else 403;
@@ -555,7 +617,7 @@ struct DrainBody {
 ///    send cross-origin without a preflight the API never answers: else 415.
 pub(crate) fn gate(
     token: Option<&ApiToken>,
-    peer: SocketAddr,
+    peer: &Caller,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
     operator_gate(token, peer, headers)?;
@@ -573,13 +635,24 @@ pub(crate) fn gate(
 /// tarball) passes these and answers for its own content type.
 pub(crate) fn operator_gate(
     token: Option<&ApiToken>,
-    peer: SocketAddr,
+    peer: &Caller,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
-    if !peer.ip().to_canonical().is_loopback() {
+    if !peer.addr.ip().to_canonical().is_loopback() {
         return Err((
             StatusCode::FORBIDDEN,
-            format!("writes are accepted only from the server's own host, not {peer}"),
+            format!(
+                "writes are accepted only from the server's own host, not {}",
+                peer.addr
+            ),
+        ));
+    }
+    if peer.trust == Trust::Unverified {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "this server is behind a proxy: a write must come through it, presenting the \
+             proxy's secret (--proxy-auth-file)"
+                .to_owned(),
         ));
     }
     if headers.contains_key(ORIGIN) {

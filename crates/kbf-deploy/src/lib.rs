@@ -21,10 +21,10 @@
 //! The kits:
 //! - [`minio`]: `minio buckets` (kbf's buckets, their policy and a service account key
 //!   file) and `minio nodeport` (a NodePort Service for a MinIO's S3 port).
-//! - [`linux`]: a converged storage node's systemd units, rendered from compiled-in
-//!   templates (`linux render-units`) and checked against the host's priorities
-//!   (`linux check-units`); and, as root, the units installed and the services started
-//!   (`linux install-units`) and the swapfile (`linux swap`).
+//! - [`linux`]: the systemd unit of one mode of the one `kbf` binary, rendered from
+//!   compiled-in templates (`linux render-units --mode`) and checked (`linux check-units
+//!   --mode`); and, as root, the unit installed and started (`linux install-units
+//!   --mode`) and the swapfile (`linux swap`).
 //! - [`mdm`]: an Apple MDM on one Linux host: its pinned upstream archives fetched
 //!   (`mdm fetch`), its services installed as root (`mdm install`), and read-only
 //!   checks of what runs (`mdm verify`); and, on an operator's own machine, an erase

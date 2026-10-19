@@ -46,7 +46,7 @@ use kbf_proto::kbf::map::v1::membership_server::{Membership, MembershipServer};
 use kbf_storage::service::{Admission, PeerNames, PeerRole, host_of, role_of};
 use tonic::{Request, Response, Status};
 
-use crate::identity::{DenyList, PeerCert};
+use crate::identity::{DenyList, PeerCert, Presented, presented};
 use crate::members::{Members, MembershipError, Progress, Registrant};
 use crate::storage_health::Debts;
 use crate::store_config::StoreConfigSource;
@@ -102,18 +102,38 @@ impl MembershipService {
     /// that gives its names and what the operator's deny list is compared with (`None` in
     /// plain text).
     async fn admit<T>(&self, request: &Request<T>) -> Result<Option<PeerCert>, Status> {
-        let certs = kbf_tls::peer_certs(request);
-        let leaf = certs
-            .as_deref()
-            .and_then(|chain| chain.first())
-            .map(AsRef::as_ref);
-        let Some(peer) = self.admit_leaf(leaf)? else {
+        let Some(peer) = self.admit_presented(&presented(request.extensions()))? else {
             return Ok(None);
         };
         if let Some(deny_list) = &self.deny_list {
             deny_list.admit_cert(&peer).await?;
         }
         Ok(Some(peer))
+    }
+
+    /// Admits a caller that presents `presented`: as [`Self::admit_leaf`] for a certificate;
+    /// for an identity a proxy forwarded, if its role is `storage` and it names a node, which
+    /// is then the one name it has: a registration or heartbeat whose instance id or address
+    /// has any other host, an IP address included, is refused PERMISSION_DENIED by the check
+    /// of [`covered`], as there is no certificate behind the proxy to cover it.
+    ///
+    /// # Errors
+    /// As [`Self::admit_leaf`]; and UNAUTHENTICATED for a proxied identity with no role or
+    /// no node, under [`Admission::Certified`].
+    pub fn admit_presented(&self, presented: &Presented) -> Result<Option<PeerCert>, Status> {
+        let Presented::Proxy(identity) = presented else {
+            return self.admit_leaf(presented.leaf());
+        };
+        if self.admission == Admission::Open {
+            return Ok(None);
+        }
+        match (identity.role, identity.node_id.as_deref()) {
+            (Some(PeerRole::Storage), Some(node)) => Ok(Some(PeerCert::proxied(node))),
+            (Some(PeerRole::Storage) | None, _) => Err(Status::unauthenticated(
+                "the proxy forwarded no node id and storage role",
+            )),
+            (Some(other), _) => Err(not_storage(other)),
+        }
     }
 
     /// Admits a caller whose verified chain starts with `leaf`; its certificate, or `None`
@@ -131,12 +151,17 @@ impl MembershipService {
             PeerRole::Storage => PeerCert::from_der(der)
                 .map(Some)
                 .map_err(Status::unauthenticated),
-            other => Err(Status::permission_denied(format!(
-                "role {} may not register as a storage node",
-                other.name()
-            ))),
+            other => Err(not_storage(other)),
         }
     }
+}
+
+/// The refusal of a caller whose role is not `storage`.
+fn not_storage(role: PeerRole) -> Status {
+    Status::permission_denied(format!(
+        "role {} may not register as a storage node",
+        role.name()
+    ))
 }
 
 /// Refuses a caller whose certificate an entry of `denied` names.

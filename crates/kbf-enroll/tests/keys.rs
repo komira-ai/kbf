@@ -138,10 +138,7 @@ async fn an_endpoint_that_is_not_a_url_or_not_listening_is_a_transport_error() {
     let (running, store, _) = enrolled("keys-endpoint", &[Role::Storage]).await;
     let err = fetch(&store, "not a url", 0).await.unwrap_err();
     assert!(matches!(err, KeysError::Transport(_)), "{err}");
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        l.local_addr().expect("addr").port()
-    };
+    let closed = kbf_testkit::port::dead_addr().port();
     let err = fetch(&store, &format!("https://localhost:{closed}"), 0)
         .await
         .unwrap_err();
