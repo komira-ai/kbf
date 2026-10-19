@@ -33,15 +33,28 @@ fn last_in_service(text: &str, line: &str) -> String {
 
 /// `value` as the unit's `--state-store`: in the place of the one the unit gives (the last
 /// one wins, so a second flag before it would change nothing), else as a new flag.
+///
+/// A frontend whose store is not Postgres hands over, so its unit gets the control socket
+/// and the preserved directory the rule `handover` then asks for: the defect planted is
+/// the store alone.
 fn with_state_store(mode: Mode, text: &str, value: &str) -> String {
     let flag = format!("--state-store={value}");
-    match text.find("--state-store=") {
+    let text = match text.find("--state-store=") {
         Some(at) => {
             let end = text[at..].find([' ', '\n']).map_or(text.len(), |i| at + i);
             format!("{}{flag}{}", &text[..at], &text[end..])
         }
         None => text.replacen(&format!("/kbf {mode}"), &format!("/kbf {mode} {flag}"), 1),
+    };
+    if mode != Mode::Frontend {
+        return text;
     }
+    let socket = " --handover-socket=/run/kbf-frontend/control.sock";
+    let text = text.replacen(&flag, &format!("{flag}{socket}"), 1);
+    first_in_service(
+        &text,
+        "RuntimeDirectory=kbf-frontend\nRuntimeDirectoryPreserve=yes",
+    )
 }
 
 /// One planted defect: its rule, what it does to a mode's rendered unit, and the modes

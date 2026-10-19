@@ -83,7 +83,6 @@ fn each_mode_renders_its_full_flag_set() {
             "--storage-client-key=/etc/kbf/worker.key",
             "--storage-ca=/etc/kbf/ca.pem",
             "--state-store=postgres://db.example.internal:5432/kbf?application_name=kbf",
-            "--handover-socket=/run/kbf-frontend/control.sock",
         ])
     );
     assert_eq!(
@@ -479,5 +478,17 @@ fn a_storage_unit_is_not_ordered_after_the_minio_unit() {
             text.contains("\nAfter=network-online.target\n"),
             "{mode}:\n{text}"
         );
+    }
+}
+
+/// The frontend unit gives no `--handover-socket`: its state store is Postgres, which
+/// `kbf frontend` refuses together with the socket (a Postgres store cannot be handed
+/// over). Catches the socket rendered again, whatever the settings.
+#[test]
+fn the_postgres_frontend_unit_gives_no_handover_flag() {
+    for c in [config_with(&[]), config_with(ALL_SET)] {
+        let f = flags(&c, Mode::Frontend);
+        assert!(f.iter().any(|w| w.starts_with("--state-store=postgres://")));
+        assert!(!f.iter().any(|w| w.contains("handover")), "{f:?}");
     }
 }

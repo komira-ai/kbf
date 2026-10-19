@@ -281,14 +281,15 @@ impl Farm {
         let socket = std::env::temp_dir().join(format!("{}.sock", file_name(&dir)));
         let _ = std::fs::remove_file(&socket);
         let control = format!("--handover-socket={}", socket.display());
-        // The unit's state store is the host's Postgres; the box has none, and a frontend
-        // that hands over opens SQLite only, so the rehearsal gives it a file.
+        // The unit's state store is the host's Postgres and it has no control socket (kbf
+        // refuses the two together); the box has no Postgres, so the rehearsal gives the
+        // frontend a SQLite file and its socket.
         let state = format!("--state-store=sqlite://{}/state/state.db", root.display());
         farm.launch(
             &dir,
             &root,
             "frontend",
-            unit.replace(&[control, state]),
+            unit.replace(&[state]).add(&[control]),
             None,
         );
         let line = farm.start_line(0, "kbf-frontend ");

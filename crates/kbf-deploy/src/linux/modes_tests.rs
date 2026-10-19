@@ -271,8 +271,8 @@ fn each_planted_defect_turns_its_rule_red() {
         (
             Mode::Frontend,
             "--state-store=@KBF_STATE_STORE@",
-            "--state-store=sqlite:///var/lib/kbf-server/state/state.db",
-            "FAIL state-store: kbf-frontend@.service: --state-store is sqlite:// in a frontend unit: the frontend's state store is Postgres (postgres://<host>/<db>), and SQLite is dropped for it",
+            "--state-store=postgres://db.example/${PGDB}",
+            "FAIL state-store: kbf-frontend@.service: --state-store names ${PGDB}: systemd expands it into kbf's command line, which every user on the node can read in /proc, and the rule cannot read the store it names; write the URI itself",
         ),
         (
             Mode::StorageAndDaemon,

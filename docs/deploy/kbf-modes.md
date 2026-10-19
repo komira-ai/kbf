@@ -301,10 +301,12 @@ parameter), a `sqlite://` path that is empty, relative or not normal, another sc
 cannot read the store it names, and what it holds is in argv, readable by every user). A
 unit with no `--state-store` passes. No message repeats the value.
 
-Known gap, not this unit's to fix: `kbf frontend` refuses a Postgres `--state-store` together
-with `--handover-socket` (`HandoverError::PostgresStore`: a Postgres store cannot give up its
-writer role yet; the takeover of `docs/design/frontend-proxy.md` replaces the handover). The
-rendered unit carries both flags, so a frontend started from it exits 2 until that lands.
+The unit gives no `--handover-socket` (nor a `RuntimeDirectory=` for one): `kbf frontend`
+refuses a Postgres `--state-store` together with it (`HandoverError::PostgresStore`: a Postgres
+store cannot give up its writer role), and the bundled proxy of `docs/design/frontend-proxy.md`
+replaces the handover. Rule `handover` asks for the socket and the preserved directory only
+when the store is SQLite or absent, and fails a unit that gives the socket beside a Postgres
+store. An update of a Postgres frontend is a restart, not `kbf frontend handover`.
 
 The all-in-one unit still names its SQLite file, so that rule takes `sqlite:///<absolute
 path>` there until the farm is moved (below).

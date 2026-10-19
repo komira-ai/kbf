@@ -82,6 +82,12 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                     flags.server.state_store,
                     Some(kbf_server::StateStoreUri::local_postgres())
                 );
+                // `kbf frontend` refuses a Postgres store together with a control socket
+                // (a start would exit 2), so the unit gives none.
+                assert!(
+                    flags.handover.is_none(),
+                    "the postgres unit gives a handover flag"
+                );
             }
             Invocation::Registered(_) => {
                 panic!("{mode}: a rendered unit gives flags, so it is not a start that enrolls")

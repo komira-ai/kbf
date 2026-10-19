@@ -644,7 +644,9 @@ fn the_frontend_unit_is_installed_with_no_state_directory() {
 }
 
 /// The frontend's unit is a template with two instances, and a serving one is never
-/// restarted: a restart drains it and every new build is refused until the next start.
+/// restarted by the install: a restart drains it and every new build is refused until the
+/// next start. The Postgres unit has no control socket, so the note names the restart and
+/// not `kbf frontend handover`, which would fail.
 /// Catches an update that restarts (or stops) the serving instance instead of leaving the
 /// handover to `kbf frontend handover`, an install that starts the second instance beside
 /// the first (two frontends would ask each other for the listeners), a template enabled
@@ -693,7 +695,8 @@ fn a_serving_frontend_instance_is_not_restarted_by_an_update() {
     );
     assert!(
         out.contains(
-            "kbf-frontend@b.service is serving and is not restarted: run `kbf frontend handover`"
+            "kbf-frontend@b.service is serving and is not restarted: its state store cannot be \
+             handed over: `systemctl restart` it"
         ),
         "{out}"
     );

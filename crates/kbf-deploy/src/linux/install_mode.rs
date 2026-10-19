@@ -171,12 +171,18 @@ fn plan_with<E: Exec>(
             planner.run(systemctl(&["restart", &name]));
             started = true;
         } else if let Some(serving) = serving()? {
+            // A unit with no control socket (a Postgres store) cannot hand over: the
+            // operator restarts it, which drains the builds in flight.
+            let next = if unit.flag("handover-socket").is_some() {
+                "run `kbf frontend handover` to start the other instance on the new unit \
+                 and binary"
+            } else {
+                "its state store cannot be handed over: `systemctl restart` it when its builds \
+                 may drain, to run the new unit and binary"
+            };
             note(
                 out,
-                format_args!(
-                    "{serving} is serving and is not restarted: run `kbf frontend handover` \
-                     to start the other instance on the new unit and binary"
-                ),
+                format_args!("{serving} is serving and is not restarted: {next}"),
             )?;
         } else {
             planner.run(systemctl(&["start", &first]));
