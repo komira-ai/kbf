@@ -439,6 +439,29 @@ The evaluator is deliberately not a dashboard: a person reading a graph is not a
 threshold, the minimum-load numbers and any waiver. It is a record, not a credential: no host reads it. A red verdict triggers
 section 8; a green one makes the commit publishable (the tag of 8.1 carries it).
 
+### 7.2 Hand-off, baseline and automatic rollback
+
+The deploy and the evaluator are separate processes, so one file passes between them, the **hand-off**: commit, set hash, the
+evaluator's run id, the deploy's start (and end, once it has one), the generation the deploy set, whether the release is
+**reversible** (8.3: the offer knows, the evaluator only reads it; the field has no default) and the commit the deploy
+replaced. `kbf-bake run --handoff FILE` takes all of it from there.
+
+The **baseline** is taken at deploy start, for the deploy's start time, by `kbf-bake baseline`. The farm keeps no time
+series, so the error ratio is failed over executed actions across the closed invocations of the seven days before the
+deploy (`GET /v1/invocations?since&until`), and the latency baseline is the p99 of the evaluator's own earlier scrapes
+(`kbf-bake sample`, kept in a ledger file by something that runs it regularly). A baseline the records or the ledger cannot
+give (a partial list, no executed action, a ledger that does not reach back the seven days) is written down as absent with its
+reason, `baseline` exits 4, and the gate that needs it is red. The error ratio of the records is the records' measure and
+not the `kbf_execute_errors_total` ratio the gate holds the bake to; it is the closest the records give.
+
+**Automatic rollback** is off unless `--auto-rollback` is given (with `--handoff`, `--rollback-url` and
+`--rollback-token-file`). It is offered only when the bake ends red on a gate that had a measurement over its limit, the
+hand-off says the release is reversible, and it names the previous commit and the generation. The offer is
+`POST /v1/update/desired` with `expect_generation`, so a desired commit someone else moved since is a `409` and nothing is
+written; it is made once and never retried. A soft gate never ends a bake, a green or extended end never rolls back, a gate
+that is red only for want of a series or a baseline is no evidence against the release, and an irreversible release pages
+and offers nothing. The cancel hold of Q6 is not built: it is the owner's decision.
+
 ## 8. Stage 3: prod, and rollback
 
 ### 8.1 Prod: publish
