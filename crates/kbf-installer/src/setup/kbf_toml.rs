@@ -133,6 +133,9 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
         .map(|(at, key, value)| {
             if at.is_empty() {
                 format!("{key} should be {value:?}")
+            } else if at == "scheduler" {
+                // The database URL is never printed, not even one without a password.
+                format!("[{at}] {key} should be the --database URL")
             } else {
                 format!("[{at}] {key} should be {value:?}")
             }

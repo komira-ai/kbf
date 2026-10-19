@@ -324,3 +324,31 @@ fn a_control_character_in_the_database_url_is_escaped() {
     let back: toml::Table = format!("k = {rendered}").parse().expect("valid TOML");
     assert_eq!(back["k"].as_str(), Some("a\u{1}b\tc"));
 }
+
+/// Catches a message that repeats text a person may have put a credential in. A syntax error
+/// names its line and the parser's reason, not the line; a URL with user information, a query
+/// or a fragment is refused by rule, without the URL. (`password` is what must not appear.)
+///
+/// Mutants to plant: `Syntax(e.to_string())`; the URL back in either refusal.
+#[test]
+fn a_refusal_never_repeats_the_text_that_may_hold_a_password() {
+    let found = problems("confirm_window_s = 900\ndatabase = postgres://u:password@h/db\n");
+    assert!(found.contains("line 2:"), "{found}");
+    for text in [
+        "database = postgres://u:password@h/db\n",
+        "release_source = \"url\"\nrelease_url = \"https://u:password@h/x\"\n",
+        "release_source = \"url\"\nrelease_url = \"https://h/x?token=password\"\n",
+        "release_source = \"url\"\nrelease_url = \"https://h/x#password\"\n",
+    ] {
+        let found = problems(text);
+        assert!(!found.contains("password"), "{text:?}: {found}");
+    }
+    let found = problems("release_source = \"url\"\nrelease_url = \"https://u:password@h/x\"\n");
+    assert!(found.contains("must not carry user information"), "{found}");
+    // The flags go through the same check.
+    let found = https_base_named("--release-url", "https://u:password@h/x").expect_err("refused");
+    assert!(
+        !found.contains("password") && found.starts_with("--release-url"),
+        "{found}"
+    );
+}

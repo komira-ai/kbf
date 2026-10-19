@@ -488,3 +488,50 @@ fn a_failure_at_any_step_is_finished_by_running_again() {
         }
     }
 }
+
+/// Catches a credential reaching the output through an error message. A person who types the
+/// database URL into `installer.toml` unquoted (`database = postgres://u:pw@...`) makes the
+/// file a syntax error, and the parser's own message quotes the offending line; setup tells
+/// the operator which line is wrong and never repeats it. The same holds for the line that
+/// `kbf.toml` refuses over: the database URL in it is not printed.
+///
+/// Mutants to plant: `Syntax` carrying `e.to_string()` again; the `state-store` value back in
+/// the refusal of a differing `kbf.toml`.
+#[test]
+fn an_error_about_a_file_never_repeats_the_database_url() {
+    let mut exec = host();
+    put(
+        &mut exec,
+        INSTALLER_TOML,
+        0o644,
+        ROOT,
+        "confirm_window_s = 900\ndatabase = postgres://kbf:hunter2@db.example/kbf\n",
+    );
+    let err = go(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err("refused");
+    let shown = err.to_string();
+    assert!(
+        !shown.contains("hunter2") && !shown.contains("db.example"),
+        "{shown}"
+    );
+    assert!(shown.contains("installer.toml: line 2:"), "{shown}");
+    assert_eq!(err.exit(), Exit::NeedsOperator);
+    assert!(exec.log.is_empty());
+
+    use crate::setup::kbf_toml::{Decision, Ours, decide};
+    let ours = Ours {
+        mode: "frontend",
+        frontend_url: None,
+        token_file: None,
+        api_token_file: None,
+        state_store: Some(DATABASE),
+    };
+    let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = \"postgres:///other?host=/run/postgresql\"\nheartbeat-interval-ms = 500\n";
+    let Decision::Refuse(why) = decide(Some(theirs), &ours) else {
+        panic!("refused");
+    };
+    assert!(why.contains("[scheduler] state-store"), "{why}");
+    assert!(
+        !why.contains("postgres:") && !why.contains("run/postgresql"),
+        "{why}"
+    );
+}

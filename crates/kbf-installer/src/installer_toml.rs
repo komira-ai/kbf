@@ -127,11 +127,13 @@ pub(crate) fn https_base_named(label: &str, url: &str) -> Result<String, String>
     let rest = url
         .strip_prefix("https://")
         .ok_or_else(|| bad("must start with https://"))?;
+    // These two parts are where a credential goes (`user:password@`, `?token=`): the message
+    // names the rule and never repeats the text.
     if rest.contains('@') {
-        return Err(bad("must not carry user information"));
+        return Err(format!("{label}: must not carry user information"));
     }
     if rest.contains('?') || rest.contains('#') {
-        return Err(bad("must not carry a query or a fragment"));
+        return Err(format!("{label}: must not carry a query or a fragment"));
     }
     let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
     let path = path.trim_end_matches('/');
@@ -200,12 +202,29 @@ fn bounded<T: PartialOrd + std::fmt::Display + Copy>(
     v
 }
 
+/// Where and what the parser objected to, without its quote of the offending line: that line
+/// can be a `database` URL, and a password a person typed into it must not reach a log.
+fn syntax_line(text: &str, error: &toml::de::Error) -> String {
+    match error.span() {
+        Some(span) => {
+            let before = text.get(..span.start).unwrap_or_default();
+            format!(
+                "line {}: {}",
+                before.matches('\n').count() + 1,
+                error.message()
+            )
+        }
+        None => error.message().to_owned(),
+    }
+}
+
 impl InstallerToml {
     pub fn parse(text: &str) -> Result<InstallerToml, ConfigError> {
         if text.len() > MAX_FILE_BYTES {
             return Err(ConfigError::TooLarge(text.len()));
         }
-        let raw: Raw = toml::from_str(text).map_err(|e| ConfigError::Syntax(e.to_string()))?;
+        let raw: Raw =
+            toml::from_str(text).map_err(|e| ConfigError::Syntax(syntax_line(text, &e)))?;
         let d = InstallerToml::default();
         let mut problems = Vec::new();
 
