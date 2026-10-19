@@ -8,7 +8,7 @@ use std::fs;
 
 use support::{
     COMMERCE, DROPIN, ERR_LOG, FakeMac, HOMES, INTENT, LOGINWINDOW, PLIST, SOFTWARE_UPDATE, VOLUME,
-    apply, check, lines, only_fails,
+    XCODE, apply, check, lines, only_fails,
 };
 
 type Drift = (&'static str, &'static str, fn(&mut FakeMac), &'static str);
@@ -360,6 +360,15 @@ const DRIFTS: &[Drift] = &[
                 .default_set(SOFTWARE_UPDATE, "ConfigDataInstall", "0")
         },
         "ConfigDataInstall is 0",
+    ),
+    (
+        "xcode_disable_manifest_sandbox",
+        "SwiftPM's manifest sandbox on again",
+        |m| {
+            m.state_mut()
+                .default_set(XCODE, "IDEPackageSupportDisableManifestSandbox", "0")
+        },
+        "com.apple.dt.Xcode IDEPackageSupportDisableManifestSandbox is 0, want 1",
     ),
     (
         "appstore_auto_update",

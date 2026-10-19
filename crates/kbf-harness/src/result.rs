@@ -57,8 +57,6 @@ impl Status {
 pub struct Runtime {
     /// `native` or `stand-in container`.
     pub driver: String,
-    /// The Envoy binary's path, or `absent: <why>`.
-    pub envoy: String,
     /// What containers ran: `none (native driver)` when no container path is exercised.
     pub container: String,
     /// `buck2 --version`'s first line.
@@ -183,11 +181,8 @@ impl Document {
             out.push_str(&format!("\nerror: {error}\n"));
         }
         out.push_str(&format!(
-            "\nenvoy: {}; driver: {}; container: {}; buck2: {}\n",
-            self.runtime.envoy,
-            self.runtime.driver,
-            self.runtime.container,
-            self.runtime.buck2_version
+            "\ndriver: {}; container: {}; buck2: {}\n",
+            self.runtime.driver, self.runtime.container, self.runtime.buck2_version
         ));
         if let Some(secs) = self.duration_secs {
             out.push_str(&format!("\nduration: {secs:.0} s\n"));

@@ -25,8 +25,6 @@ use std::path::PathBuf;
 
 use rustix::fs::{FlockOperation, flock};
 
-use crate::envoy::BoxPorts;
-
 /// Ports in a block.
 pub const BLOCK: u16 = 64;
 
@@ -36,10 +34,8 @@ const FIRST: u16 = 20_000;
 /// Where the kernel's ephemeral range starts when `/proc` does not say.
 const EPHEMERAL: u16 = 32_768;
 
-/// Offsets in a block. The frontend's three listeners are the box's instance `a` (Envoy's
-/// config also names instance `b`, ten above), so they sit at the start.
+/// Offsets in a block. The frontend's three listeners sit at the start.
 const FRONT: u16 = 0;
-const ENVOY: u16 = 16;
 const SPARE: u16 = 19;
 const STORAGE: u16 = 20;
 const METRICS: u16 = 28;
@@ -164,8 +160,7 @@ impl Claim {
         self.base
     }
 
-    /// The block's number: distinct among the farms that hold blocks together, so a value
-    /// derived from it (Envoy's base id) is too.
+    /// The block's number: distinct among the farms that hold blocks together.
     #[must_use]
     pub fn index(&self) -> u32 {
         self.index
@@ -199,17 +194,15 @@ pub struct Ports {
     pub spare: u16,
     /// Each storage node's `/metrics`, node 1 first.
     pub metrics: Vec<u16>,
-    /// Envoy's three, when it runs: `base` is the frontend's own first port.
-    pub envoy: Option<BoxPorts>,
 }
 
 impl Ports {
-    /// The ports of a farm of `storage_nodes` nodes (with Envoy's, if `envoy`) in `claim`.
+    /// The ports of a farm of `storage_nodes` nodes in `claim`.
     ///
     /// # Panics
     /// When `storage_nodes` is past [`MAX_NODES`].
     #[must_use]
-    pub fn of(claim: &Claim, storage_nodes: usize, envoy: bool) -> Self {
+    pub fn of(claim: &Claim, storage_nodes: usize) -> Self {
         assert!(
             storage_nodes <= MAX_NODES,
             "{storage_nodes} storage nodes: a block holds ports for {MAX_NODES}"
@@ -228,12 +221,6 @@ impl Ports {
             storage: nth(STORAGE),
             spare: claim.port(SPARE),
             metrics: nth(METRICS),
-            envoy: envoy.then(|| BoxPorts {
-                base: claim.base(),
-                reapi: claim.port(ENVOY),
-                worker: claim.port(ENVOY + 1),
-                admin: claim.port(ENVOY + 2),
-            }),
         }
     }
 
@@ -243,9 +230,6 @@ impl Ports {
         let mut all = vec![self.front.0, self.front.1, self.front.2, self.spare];
         all.extend(&self.storage);
         all.extend(&self.metrics);
-        if let Some(b) = &self.envoy {
-            all.extend([b.reapi, b.worker, b.admin]);
-        }
         all
     }
 }

@@ -202,7 +202,9 @@ where
     // `Binder` is not `Send`).
     let (socket, metrics) = bind_node_sockets(listener.listen, flags.metrics, &Binder::new())?;
     let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
-    let cache = cache.with_writes(args.write_config());
+    let cache = cache
+        .with_writes(args.write_config())
+        .with_write_pool(args.write_pool_config());
     let local = args.local_cache.as_ref();
     let hot = stores.hot.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;

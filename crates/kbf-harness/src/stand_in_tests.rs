@@ -40,7 +40,5 @@ fn a_binary_that_was_not_built_says_how_to_build_it() {
 fn the_stand_ins_of_this_package_are_built_beside_its_tests() {
     // Catches: a `[[bin]]` renamed in Cargo.toml and not here (a caller then fails with
     // the message above, only when it runs).
-    for name in [FAKE_BUCK2, FAKE_ENVOY] {
-        assert!(sibling_bin(name).is_file(), "{name}");
-    }
+    assert!(sibling_bin(FAKE_BUCK2).is_file(), "{FAKE_BUCK2}");
 }

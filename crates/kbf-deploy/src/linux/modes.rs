@@ -32,6 +32,12 @@
 //!   (`yes` sets the whole set, `no` clears it), a list adds its controllers to what
 //!   earlier lines gave (so `Delegate=yes` then `Delegate=memory` still delegates all),
 //!   an empty value starts over with none.
+//! - `caps`, `swap`, `oom`: a mode that runs builds sets no `MemoryMax=`, `MemoryHigh=`,
+//!   `CPUQuota=` or `AllowedCPUs=` and no `MemorySwapMax=` on its unit (its leases live in
+//!   the unit's cgroup), and an `OOMScoreAdjust=` below 0, the containers' score
+//!   ([`super::limits`]).
+//! - `meta-dir`: the metadata directory of `storage-and-daemon` and `all-in-one` is not
+//!   under `--data-dir` ([`super::stores`]).
 //! - `credential`: the units of a mode without a storage half (`daemon`, `all-in-one`)
 //!   do not give it the cold store's key; [`super::credential`] says what the rule reads
 //!   and what it cannot see. The unit that holds the key (`storage`) runs as a user of
@@ -94,10 +100,9 @@ use kbf_host::exec::Exec;
 use kbf_host::path::HostPath;
 use kbf_host::step::Cmd;
 
-use super::check::{Failure, Report, angle_placeholder};
 use super::config::{LinuxConfig, LinuxError};
-use super::render::{SLICE, values};
-use super::{cpuset, credential, handover, restart, runtime, stop, stores, traverse};
+use super::shared::{Failure, Report, SLICE, angle_placeholder, values};
+use super::{cpuset, credential, handover, limits, restart, runtime, stop, stores, traverse};
 use crate::template::{self, TemplateError, leftovers};
 use crate::unit::{UnitError, UnitFile, comments_in_continuations};
 
@@ -150,13 +155,17 @@ impl Mode {
         }
     }
 
-    /// Whether the mode is a node unit (rule `restart`): `storage`, `daemon` and
-    /// `storage-and-daemon` retry a repeating failure for as long as it lasts. The
-    /// frontend and `all-in-one` (which runs one) keep their own restart policy: an old
-    /// frontend that drained after a handover exits 0 and stays down.
+    /// Whether the mode's unit retries a repeating failure for as long as it lasts (rule
+    /// `restart`): `storage`, `daemon`, `storage-and-daemon` and `all-in-one`, whose
+    /// starts can fail with exit 75 until the environment is ready. The frontend keeps
+    /// its own policy. (`Restart=on-failure` never restarts a clean exit, so an old
+    /// process that drained after a handover and exited 0 stays down either way.)
     #[must_use]
     pub fn is_node(self) -> bool {
-        matches!(self, Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon)
+        matches!(
+            self,
+            Mode::Storage | Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne
+        )
     }
 
     /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`).
@@ -193,6 +202,13 @@ impl Mode {
     #[must_use]
     pub fn holds_key(self) -> bool {
         self == Mode::Storage
+    }
+
+    /// Whether the mode's unit gives both a metadata directory and the daemon's data
+    /// directory (rule `meta-dir`).
+    #[must_use]
+    pub fn has_meta_and_data(self) -> bool {
+        matches!(self, Mode::StorageAndDaemon | Mode::AllInOne)
     }
 
     /// The unit's file name: `kbf-<mode>.service`, and for the frontend the template
@@ -705,6 +721,13 @@ fn rules(
         );
     }
 
+    // caps, swap, oom
+    if mode.runs_builds() {
+        for (rule, how) in limits::check(unit) {
+            fail(rule, format!("{name} {how}"));
+        }
+    }
+
     // credential
     if mode.holds_no_key() || mode.holds_key_beside_builds() {
         let allowed = mode.holds_key_beside_builds();
@@ -721,6 +744,13 @@ fn rules(
         let exact = mode.holds_key_beside_builds();
         for how in stores::storage(unit, &key_file(config), exact) {
             fail("storage", format!("{name} {how}"));
+        }
+    }
+
+    // meta-dir
+    if mode.has_meta_and_data() {
+        for how in stores::meta_dir(unit) {
+            fail("meta-dir", format!("{name} {how}"));
         }
     }
 

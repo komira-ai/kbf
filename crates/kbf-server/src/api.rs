@@ -3,7 +3,9 @@
 //! `docs/api.md`).
 //!
 //! - `GET /v1/nodes`: every node registered since the server started, with the newest
-//!   software status each sent and where it is in placement ([`crate::fleet`]).
+//!   software status each sent, where its update is (state, `up_to_date` against the
+//!   desired commit, availability: [`crate::update_status`]) and where it is in
+//!   placement ([`crate::fleet`]).
 //! - `GET /v1/members`: the storage members of the current map, as the gRPC
 //!   `Membership` service keeps them ([`crate::members::Members`]).
 //! - `GET /v1/storage`: whether every blob is known to have its copies elsewhere, from the
@@ -61,7 +63,9 @@ use crate::drain::{Drain, DrainStatus};
 use crate::enroll::api::EnrollApi;
 use crate::farm::{Farm, NodeAction};
 use crate::members::{Members, MembershipError};
+use crate::release::desired::blocking;
 use crate::token::ApiToken;
+use crate::update::Rows;
 
 /// The media type of every body this API returns, and of every write it accepts.
 pub const JSON: &str = "application/json";
@@ -108,12 +112,16 @@ struct ApiState {
     token: Option<ApiToken>,
     drain: Arc<Drain>,
     members: Option<Arc<Members>>,
+    /// Where the desired release is read for each node's `update.up_to_date` (`None`:
+    /// no state store, so no desired release).
+    update: Option<Rows>,
 }
 
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
 /// `drain` is what `POST /v1/frontend/drain` begins; `members` is what
 /// `GET /v1/members` reads and `POST /v1/members/{id}` changes (the same value the
-/// `Membership` service registers into). `enroll` is what the `/v1/enroll/...` routes
+/// `Membership` service registers into). `update` is where the desired release is read
+/// to judge each node's `update.up_to_date`. `enroll` is what the `/v1/enroll/...` routes
 /// call ([`crate::enroll::api`]); `None` when this server has no enrollment, which those
 /// routes answer, behind the gate, with 404.
 /// Writes read the peer address from
@@ -123,6 +131,7 @@ pub fn router(
     token: Option<ApiToken>,
     drain: Arc<Drain>,
     members: Option<Arc<Members>>,
+    update: Option<Rows>,
     enroll: Option<Arc<EnrollApi>>,
 ) -> Router {
     let enrollment = crate::enroll::api::routes(token.clone(), enroll);
@@ -138,6 +147,7 @@ pub fn router(
             token,
             drain,
             members,
+            update,
         }))
         .merge(enrollment)
 }
@@ -181,8 +191,27 @@ async fn begin_drain(
     json(StatusCode::OK, &status(&api))
 }
 
+/// The commit the farm wants, for judging each node's `update.up_to_date`; `None` when
+/// there is none, there is no state store, or the row cannot be read (logged: a node
+/// list that names no verdict is better than none).
+async fn desired_commit(api: &ApiState) -> Option<String> {
+    let rows = api.update.clone()?;
+    match blocking(move || rows.desired()).await {
+        Ok(stored) => stored.value.map(|d| d.commit.as_str().to_owned()),
+        Err(e) => {
+            tracing::warn!("update rows: the desired release is not read for the node list: {e}");
+            None
+        }
+    }
+}
+
 async fn nodes(State(api): State<Arc<ApiState>>) -> Response {
-    json(StatusCode::OK, &api.farm.nodes())
+    let desired = desired_commit(&api).await;
+    let mut view = api.farm.nodes();
+    for node in &mut view.nodes {
+        node.update.judge(desired.as_deref());
+    }
+    json(StatusCode::OK, &view)
 }
 
 /// One storage member of the map.
@@ -270,7 +299,10 @@ async fn act(
     };
     match write_request(api.token.as_ref(), &request) {
         Ok((node, action)) => match api.farm.place(&node, action) {
-            Ok(view) => json(StatusCode::OK, &view),
+            Ok(mut view) => {
+                view.update.judge(desired_commit(&api).await.as_deref());
+                json(StatusCode::OK, &view)
+            }
             Err(unknown) => error(StatusCode::NOT_FOUND, &unknown.to_string()),
         },
         Err((code, why)) => error(code, &why),
@@ -558,6 +590,24 @@ pub(crate) fn gate(
     peer: SocketAddr,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
+    operator_gate(token, peer, headers)?;
+    let content_type = headers.get(CONTENT_TYPE).map(|v| v.as_bytes());
+    if !content_type.is_some_and(is_json) {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("a write is sent as Content-Type: {JSON}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Gates 1 to 4 of [`gate`]: who may write. A write whose body is not JSON (a release
+/// tarball) passes these and answers for its own content type.
+pub(crate) fn operator_gate(
+    token: Option<&ApiToken>,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, String)> {
     if !peer.ip().to_canonical().is_loopback() {
         return Err((
             StatusCode::FORBIDDEN,
@@ -581,13 +631,6 @@ pub(crate) fn gate(
         return Err((
             StatusCode::UNAUTHORIZED,
             "a write needs Authorization: Bearer <the --api-token-file token>".to_owned(),
-        ));
-    }
-    let content_type = headers.get(CONTENT_TYPE).map(|v| v.as_bytes());
-    if !content_type.is_some_and(is_json) {
-        return Err((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            format!("a write is sent as Content-Type: {JSON}"),
         ));
     }
     Ok(())

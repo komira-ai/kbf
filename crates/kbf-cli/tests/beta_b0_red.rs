@@ -242,7 +242,7 @@ fn farms_started_together_in_one_process_are_told_ports_of_their_own() {
                 &dir.join("logs"),
                 &dir.join("farm"),
                 &bins,
-                &Topology::beta(None),
+                &Topology::beta(),
             )
             .expect("a farm starts");
             farm_tx.send(farm).expect("the farm is taken");
@@ -279,6 +279,14 @@ fn farms_started_together_in_one_process_are_told_ports_of_their_own() {
                 control_socket(dir).display()
             )),
             "{frontend}"
+        );
+        // Buck2 dials the frontend's REAPI port: the one told to the frontend, the one it
+        // printed. Mutant: `client_port: front.1` (the worker port).
+        assert_eq!(farm.client_port(), ports.front.0);
+        assert!(
+            farm.reapi().ends_with(&format!(":{}", farm.client_port())),
+            "{}",
+            farm.reapi()
         );
         let node = farm.spec(Role::Node(1)).argv.join(" ");
         assert!(

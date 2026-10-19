@@ -12,7 +12,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use kbf_harness::b0::{Ended, run};
-use kbf_harness::envoy::{ENV_VAR, REQUIRE_VAR};
 use kbf_harness::stand_in::{FAKE_BUCK2, sibling_bin};
 
 use support::*;
@@ -133,8 +132,6 @@ fn a_kbf_beta_killed_by_sigkill_leaves_no_daemon_socket_or_farm_process() {
             .arg(&project)
             .arg("--work")
             .arg(&work)
-            .env_remove(ENV_VAR)
-            .env_remove(REQUIRE_VAR)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

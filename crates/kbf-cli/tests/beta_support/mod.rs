@@ -75,8 +75,6 @@ pub(crate) fn b0(name: &str, mode: &str, secs: u64) -> B0 {
         // Any file: the stand-in build runs no action.
         act: fake.clone(),
         buck2: fake,
-        envoy: None,
-        envoy_var: "KBF_TEST_NO_SUCH_ENVOY".to_owned(),
         project,
         work: dir.join("work"),
         duration: Duration::from_secs(secs),
@@ -92,7 +90,6 @@ pub(crate) fn b0(name: &str, mode: &str, secs: u64) -> B0 {
         mutant: None,
         extra_flags: Vec::new(),
         farm_hang: Duration::from_secs(60),
-        require_envoy: false,
         interrupt: Interrupt::new(),
         reaper: None,
     }

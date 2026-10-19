@@ -51,7 +51,7 @@ fn every_build_has_a_salt_of_its_own() {
 fn the_farm_is_dialled_over_tls_under_its_ca_from_the_projects_buckconfig() {
     // Catches: a build that reaches the farm in plain text or without the CA (it would fail
     // on a farm that serves TLS, or pass against a stand-in), one that dials another port
-    // than the one given (Envoy's, not the frontend's), and settings given on a command
+    // than the one given (not the frontend's), and settings given on a command
     // line, where Buck2 ignores them ("No engine address").
     let block = buckconfig_block(&cfg());
     for key in ["engine_address", "action_cache_address", "cas_address"] {

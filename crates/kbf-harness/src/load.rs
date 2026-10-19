@@ -1,6 +1,6 @@
 //! The Buck2 load: builds of the sample project (`crates/kbf-it/beta/buck2`) in a loop,
 //! `concurrency` loops at once, each loop with a Buck2 daemon of its own (an isolation
-//! directory), through the farm's REAPI port (Envoy's when it runs).
+//! directory), through the frontend's REAPI port.
 //!
 //! Three kinds of build, taken in turn by each loop: a short chain of actions that
 //! stands in for a compile, an action that sleeps and so holds a lease, and actions

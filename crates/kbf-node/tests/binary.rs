@@ -197,13 +197,27 @@ fn tls(name: &str) -> PathBuf {
     dir
 }
 
+/// A port on which connecting is refused for as long as the test binary runs, and that
+/// no other test can take (see [`kbf_testkit::port`]): a port bound and released is
+/// free only until another test's `127.0.0.1:0` bind takes it.
+fn dead_port() -> u16 {
+    kbf_testkit::port::dead_addr().port()
+}
+
+/// Catches `dead_port` handing out a number that is free to take (the old bind-and-drop
+/// helper): a thief binding it succeeds.
+#[test]
+fn a_dead_port_cannot_be_taken_by_another_listener() {
+    let port = dead_port();
+    assert!(kbf_testkit::port::is_taken(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        port
+    ))));
+}
+
 /// The flags every run here shares: a front on a port nothing listens on.
 fn base(dir: &Path) -> Vec<String> {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port();
+    let port = dead_port();
     vec![
         format!("--server=https://127.0.0.1:{port}"),
         format!("--ca-cert={}", dir.join("ca.pem").display()),
@@ -1780,7 +1794,16 @@ fn a_container_node_lists_its_pinned_images_in_its_status() {
     let session = front.session(PROMPT);
     session.hello();
     session.welcome();
-    let status = session.next(PROMPT);
+    // After a Welcome the node reports how it updates (a node with no --update-dir says
+    // MANUAL); the NodeStatus is the next message that is not that.
+    let status = std::iter::from_fn(|| Some(session.next(PROMPT)))
+        .find(|m| {
+            !matches!(
+                m,
+                Some(kbf_proto::worker::daemon_message::Message::UpdateStatus(_))
+            )
+        })
+        .flatten();
     let stopped = stop(&mut child, libc::SIGTERM);
     let log = read(&log);
     let Some(kbf_proto::worker::daemon_message::Message::NodeStatus(status)) = status else {

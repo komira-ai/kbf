@@ -6,7 +6,7 @@ fn main() -> std::process::ExitCode {
     // SIGTERM and SIGINT (a CI job's cancel or timeout) end the run through its normal exits:
     // the farm stopped, the Buck2 daemons killed, the result document finished as failed.
     kbf_harness::interrupt::install();
-    kbf_harness::cli::run(std::env::args_os(), kbf_harness::cli::env_var)
+    kbf_harness::cli::run(std::env::args_os())
 }
 
 #[cfg(not(target_os = "linux"))]

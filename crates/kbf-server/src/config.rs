@@ -52,7 +52,7 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
     /// The node's one cache, when a daemon in this process shares the hot store's disk
-    /// (`kbf-all-in-one`, `kbf_storage::local_cache`). No flag sets it.
+    /// (`kbf all-in-one`, `kbf_storage::local_cache`). No flag sets it.
     #[arg(skip)]
     pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The durable object store, where every blob ends up: `file:///absolute/path` (a
@@ -198,6 +198,14 @@ pub struct Args {
     /// are refused.
     #[arg(long, requires = "api_listen")]
     pub api_token_file: Option<PathBuf>,
+    /// The release store (`docs/design/pull-updates.md`, section 6): a directory where the
+    /// tarballs of a release and their build attestations are kept, uploaded with
+    /// `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the
+    /// token) and fetched by the nodes through `ReleaseService.Fetch` on the worker
+    /// listener, behind its mutual TLS. Made if missing. Without it every update endpoint
+    /// answers 503 saying so.
+    #[arg(long, value_name = "DIR", requires = "api_listen")]
+    pub releases_dir: Option<PathBuf>,
     /// Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route
     /// (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy
     /// accepts, with no `invocations` or `blobs` key in the policy file
@@ -395,6 +403,30 @@ pub struct Args {
     /// segment sealed while all are busy waits; new blobs go to a new open segment.
     #[arg(long, default_value_t = kbf_front::WriteConfig::DEFAULT.puts_in_flight)]
     pub write_puts_in_flight: NonZeroUsize,
+    /// The writers of the write pool: the ByteStream and storage `Write`s of a node with a
+    /// write tier are appended to shared segment files by this many writers, each holding
+    /// one range open, so the node keeps at most this many block files (plus the open
+    /// grouped block) open for writing for those blobs, however many uploads are in
+    /// flight. At least 1.
+    #[arg(long, default_value_t = kbf_front::PoolConfig::DEFAULT.writers)]
+    pub write_pool_writers: NonZeroUsize,
+    /// The most blobs waiting for a write-pool writer. A blob that finds the queue full goes
+    /// straight to the object store, as one does when the write tier has no room. At
+    /// least 1.
+    #[arg(long, default_value_t = kbf_front::PoolConfig::DEFAULT.queue)]
+    pub write_pool_queue: NonZeroUsize,
+    /// How long, in seconds, a streamed blob may go without sending a chunk before its
+    /// write-pool writer is taken back and the upload fails UNAVAILABLE (the client
+    /// sends it again). Without it, a stalled but connected large upload would hold a
+    /// writer for ever, and with all writers held every other blob would wait. It limits
+    /// stalls only: an upload that sends a chunk more often than this (a trickle) can still
+    /// hold a writer. At least 1.
+    #[arg(
+        long,
+        default_value_t = kbf_front::PoolConfig::DEFAULT.stream_idle.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub write_pool_stream_idle: u64,
     /// How many times a segment PUT is tried. Only a PUT that did not complete
     /// (connect, reset, timeout) or that the store answered 5xx is tried again, after
     /// 100 ms and then four times longer each time, under a new object key; if every
@@ -484,6 +516,13 @@ pub enum ConfigError {
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
+    /// The release store's directory cannot be made.
+    #[error("--releases-dir {dir}: {source}", dir = dir.display())]
+    Releases {
+        dir: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// The REAPI policy file cannot be read.
     #[error("--reapi-auth-policy: read {path}: {source}")]
     PolicyRead {
@@ -727,10 +766,21 @@ impl Args {
             .map(ApiToken::from_file)
             .transpose()?;
         let local_cache = self.local_cache.clone();
+        let releases = self
+            .releases_dir
+            .as_deref()
+            .map(|dir| crate::release::ReleaseStore::open(dir, crate::release::Limits::default()))
+            .transpose()
+            .map_err(|source| ConfigError::Releases {
+                dir: self.releases_dir.clone().unwrap_or_default(),
+                source,
+            })?
+            .map(Arc::new);
         Ok(Some(Api {
             listen,
             token,
             local_cache,
+            releases,
         }))
     }
 
@@ -758,6 +808,17 @@ impl Args {
             max_entries: self.input_tree_cache_entries,
             max_bytes: self.input_tree_cache_bytes,
             reads_in_flight: self.input_tree_reads_in_flight,
+        }
+    }
+
+    /// The write pool of the node's write tier: `--write-pool-writers` and
+    /// `--write-pool-queue` and `--write-pool-stream-idle`.
+    #[must_use]
+    pub const fn write_pool_config(&self) -> kbf_front::PoolConfig {
+        kbf_front::PoolConfig {
+            writers: self.write_pool_writers,
+            queue: self.write_pool_queue,
+            stream_idle: Duration::from_secs(self.write_pool_stream_idle),
         }
     }
 

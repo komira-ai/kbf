@@ -7,7 +7,7 @@ re-check their state before acting on this page, because the table in section 12
 ## 0. The plan in one page
 
 Every merge runs a **beta**: GitHub Actions stands up a whole farm on loopback (a frontend, three storage-and-daemon nodes,
-one plain daemon, a pinned Envoy in front), runs real Buck2 builds, then updates every role while a build is running and
+one plain daemon; Buck2 dials the frontend's REAPI port directly), runs real Buck2 builds, then updates every role while a build is running and
 kills a node while a build is running. The assertions are numbers, not logs: zero failed actions, zero lost blobs, and
 under-replicated blobs back to zero.
 
@@ -130,8 +130,9 @@ no job; the lint instead checks that `release.yml` verifies the verdict (section
 
 ## 3. The artifact every stage consumes
 
-`artifacts.yml` is the build stage and is not changed in kind. **[F]** It builds `kbf`, `kbf-daemon`, `kbf-server` and
-`kbf-deploy` for linux x86_64, linux arm64 and darwin arm64, deterministic tarballs, SBOMs, `SHA256SUMS`; on a push to main
+`artifacts.yml` is the build stage and is not changed in kind. **[F]** It builds `kbf`, `kbf-daemon`, `kbf-server`,
+`kbf-deploy` and `kbf-installer` for linux x86_64, linux arm64 and darwin arm64 (docs/artifacts.md lists which binary for
+which platform), deterministic tarballs, SBOMs, `SHA256SUMS`; on a push to main
 or feature/arch-v2 `attest` adds provenance and SBOM attestations and `verify` checks them. An attestation names its ref,
 so a feature/arch-v2 asset does not verify as main's.
 
@@ -236,8 +237,8 @@ The proposal is to grow it into a library (`rehearsal`) that two test cells shar
 
 - `procs`: a supervisor with `start(role)`, `term(role)`, `kill(role)` (SIGKILL), `restart(role)`, and logs per process kept as
   artifacts. No role is started any way but the rendered unit line, so the unit text stays under test.
-- **Envoy**: the pinned version (the one `test-x86` already fetches by checksum) started from the `box` topology render
-  (#925), with the frontend as instances `a` and `b`. The Buck2 client goes through Envoy, never straight to a frontend.
+- **Envoy**: dropped from B0 per the no-Envoy ruling (the box Envoy kit is gone). The Buck2 client dials the frontend's
+  REAPI port directly; B0 moves behind the kbf-installer proxy in a follow-up, once the proxy lands.
 - **Cold store**: a directory by default (fast, no service); the `file://`-versus-MinIO difference is covered by the
   existing `objstore-s3` job and is not a beta concern.
 - **Load**: the pinned Buck2 (the `kbf-cell m2` machinery **[F]**) runs builds in a loop for the whole scenario. Three
@@ -252,8 +253,7 @@ The proposal is to grow it into a library (`rehearsal`) that two test cells shar
 
 **Status of the first change (#942).** The helpers above are now the library `crates/kbf-harness`, which `kbf-cli`'s
 rehearsal drives: `Farm` (a supervisor with `kill`, `term`, `restart`, a process table and a report of every process's
-output for a hang), the metrics scraper, the gates, the result document, the Buck2 load, the Envoy launch from the `box`
-render, and `kbf-beta b0`, which runs scenario B0 and writes `beta-result.json`. `.github/workflows/beta.yml` runs it on
+output for a hang), the metrics scraper, the gates, the result document, the Buck2 load, and `kbf-beta b0`, which runs scenario B0 and writes `beta-result.json`. `.github/workflows/beta.yml` runs it on
 the merge queue and on a push; it builds its own binaries, so the result says it is unattested. Running it showed what
 the design did not know:
 
@@ -261,9 +261,8 @@ the design did not know:
   build sends, so B0 runs three `kbf storage` nodes and two plain `kbf daemon` processes with `--driver=native` (the
   result says no container path was exercised). The rehearsal keeps the stand-in over storage-and-daemon nodes.
 - The `kbf storage` unit renders neither `--frontend` nor `--advertise-addr`, so the harness adds both. It registers the
-  nodes with the frontend itself and not through Envoy: a node serves nothing until it has registered, the frontend is not
-  ready until a node serves, and Envoy (panic threshold 0) sends nothing to an unready frontend, so through Envoy no node
-  can register at a cold start.
+  nodes with the frontend. (Envoy is dropped from B0 per the no-Envoy ruling; B0 moves behind the kbf-installer proxy in
+  a follow-up. Buck2 dials the frontend's REAPI port directly.)
 - The frontend holds no cache, so `kbf_cache_lost_blobs` and `kbf_cache_blob_losses_total` are the storage nodes': a
   storage node serves `/metrics` on `--metrics-listen` (plain HTTP, off unless given; no unit renders it, so the harness
   adds it on a port of its own). B0 scrapes each node as well as the frontend, and the two loss gates sum the nodes and
@@ -273,7 +272,7 @@ the design did not know:
 - A farm's processes bind their own ports, so the harness cannot hold the sockets, and a port found by binding port 0 and
   closing is free only until another program takes it. Each farm claims a block of 64 ports below the kernel's ephemeral
   range by holding a file lock named for the block (the kernel drops the lock when the holder dies), skips a block with any
-  port in use, and takes every port, Envoy's and its base id included, from its block: two farms of one process or one host
+  port in use, and takes every port from its block: two farms of one process or one host
   never share a port.
 - A run that is cancelled or times out must leave nothing behind. Every farm process leads a process group of its own,
   ending a process ends its group, and the kernel kills a farm process whose harness dies (SIGKILL included). SIGTERM and
@@ -285,7 +284,7 @@ the design did not know:
   that ends tells it `done`; a run that dies by any means, SIGKILL included, closes the pipe with no `done`, and the
   sentinel kills the daemons of the loops and removes the control socket. Only a SIGKILL of the sentinel too leaves them.
 - Keys are written mode 0600 into directories of mode 0700, and none is under `logs/`, which the workflow uploads (a test
-  scans it). The stand-in `buck2` and Envoy are binaries of `kbf-harness`, not of `kbf-cli`, so no release builds them.
+  scans it). The stand-in `buck2` is a binary of `kbf-harness`, not of `kbf-cli`, so no release builds it.
 
 ### 4.4 Scenarios and gates
 
@@ -340,7 +339,7 @@ useful alone and each required from the day its blocking pull requests land (B-2
 
 | milestone | adds | blocked on |
 |---|---|---|
-| B-0 | harness library, the pinned Envoy, the real Buck2 load, B0, smoke in the merge queue (on the stand-in runtime, section 4.2) | #925 box render; the runner measurement (M21) before smoke is required |
+| B-0 | harness library, the real Buck2 load, B0, smoke in the merge queue (on the stand-in runtime, section 4.2) | #925 box render; the runner measurement (M21) before smoke is required |
 | B-1 | B5, B6, B7 (kill-a-node, kill-a-daemon, crash matrix required) | #900, #939 (write failover) |
 | B-2 | B1, B3 (node and daemon roll) | #912, #913, #914, #917 (the metrics and the picker) |
 | B-3 | B2, B8 (frontend swap through Envoy, all-in-one) | #930, #937, #938, the wiring PR of #901, #925, #934 |
@@ -587,7 +586,7 @@ one issue with one done criterion. "Blocked by" names open pull requests or othe
 
 | # | Missing piece | Done when | Blocked by | Issue |
 |---|---|---|---|---|
-| M1 | Harness library plus B-0: supervisor, pinned Envoy, real Buck2 load, B0, smoke in the merge queue | B0 green on a hosted runner on every merge; smoke measured, then required | #925; M21 |  #942 |
+| M1 | Harness library plus B-0: supervisor, real Buck2 load, B0, smoke in the merge queue | B0 green on a hosted runner on every merge; smoke measured, then required | #925; M21 |  #942 |
 | M2 | Rolling update of every role under a running build (B1 to B4, B8) | each scenario red on its planted mutant and green; 0 failed actions, 0 lost blobs | M1, #912, #913, #914, #917, #930, #937, #938, #934 |  #943 |
 | M3 | Kill a storage node and a daemon during a build (B5, B6); crash matrix (B7) required | scenarios green, matrix a required job | M1, #900, #939 |  #944 |
 | M4 | N/N-1: wire lint, state-store goldens, mixed-version run both ways (B9) | lint refuses a planted removed field; B9 green | M1, M16 |  #945 |

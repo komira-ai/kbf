@@ -1,12 +1,12 @@
 //! Scenario B0 over a real farm: `kbf` processes (a frontend, three storage nodes, two
 //! native daemons, started from the units `kbf-deploy` renders), the harness's supervisor,
 //! scraper, gates and result document, with a stand-in `buck2` for the load (the beta
-//! workflow runs the real one) and, in the first test, a stand-in Envoy.
+//! workflow runs the real one).
 //!
 //! What it catches is the harness failing on a healthy farm (a flag a unit's role refuses, a
 //! certificate, a port, a wait that never ends), and each way a run must go red: a failed
 //! build, a failed action in an event log, a build that never ends, a process that exits, a
-//! farm that never becomes ready, and an Envoy that is required and absent. The real
+//! farm that never becomes ready. The real
 //! Buck2's farm behaviour, and the mutant that shrinks a node's cap, are the workflow's.
 
 #![cfg(target_os = "linux")]
@@ -19,22 +19,20 @@ use std::time::Duration;
 
 use kbf_harness::b0::{B0, Ended, Mutant, run};
 use kbf_harness::farm::Role;
-use kbf_harness::stand_in::{FAKE_ENVOY, sibling_bin};
 
 use support::*;
 
 /// Catches: a harness that fails on a healthy farm, and one that does not use the parts it
 /// reports using. A frontend, three storage nodes and two daemons start from their rendered
-/// units behind the stand-in Envoy (the nodes register with the frontend, the daemons dial
-/// it through Envoy), the farm is ready, builds run in two loops, the scraper reads the
+/// units (the nodes register with the frontend, the daemons dial it, Buck2 dials its REAPI
+/// port), the farm is ready, builds run in two loops, the scraper reads the
 /// frontend's and each storage node's metrics, every process stops with exit 0, and the
 /// document says what ran: every gate passes, the native
-/// driver and no container, the Envoy named, one process-table row per role, the
+/// driver and no container, one process-table row per role, the
 /// unattested note, and the log files of every role and of every build.
 #[test]
-fn a_healthy_farm_passes_every_gate_behind_envoy() {
-    let mut args = b0("healthy", "ok", 6);
-    args.envoy = Some(sibling_bin(FAKE_ENVOY));
+fn a_healthy_farm_passes_every_gate() {
+    let args = b0("healthy", "ok", 6);
     assert_eq!(run(&args).expect("a run"), Ended::Passed);
     let doc = document(&args);
     assert_eq!(failed(&doc), Vec::<String>::new(), "{doc}");
@@ -43,15 +41,11 @@ fn a_healthy_farm_passes_every_gate_behind_envoy() {
     assert_eq!(doc["attested"], false);
     assert_eq!(doc["runtime"]["driver"], "native");
     assert_eq!(doc["runtime"]["container"], "none (native driver)");
-    assert_eq!(
-        doc["runtime"]["envoy"],
-        sibling_bin(FAKE_ENVOY).display().to_string()
-    );
     assert!(doc["builds"]["run"].as_u64().expect("builds") >= 2, "{doc}");
     assert_eq!(doc["builds"]["failed"], 0);
     assert_every_gate_has_a_scenario(&doc);
     assert_keys_are_private(&args);
-    // One start of each of frontend, envoy, three nodes and two daemons, none restarted.
+    // One start of each of frontend, three nodes and two daemons, none restarted.
     let table = doc["processes"].as_array().expect("processes");
     let mut roles: Vec<&str> = table
         .iter()
@@ -61,7 +55,7 @@ fn a_healthy_farm_passes_every_gate_behind_envoy() {
     assert_eq!(
         roles,
         [
-            "daemon-1", "daemon-2", "envoy", "frontend", "node-1", "node-2", "node-3"
+            "daemon-1", "daemon-2", "frontend", "node-1", "node-2", "node-3"
         ]
     );
     assert!(
@@ -73,7 +67,6 @@ fn a_healthy_farm_passes_every_gate_behind_envoy() {
     let logs = args.work.join("logs");
     for file in [
         "frontend.out",
-        "envoy.err",
         "node-3.err",
         "daemon-2.out",
         "metrics.jsonl",
@@ -308,47 +301,6 @@ fn a_node_killed_midway_fails_the_liveness_gate() {
     assert_eq!(node_2.expect("a row")["ended"], "signal 9", "{table:?}");
 }
 
-/// Catches: an Envoy that is required and missing becoming a skip (a green smoke that never
-/// used Envoy), and a farm started before the check: the run fails at once, with the reason
-/// in the document and no process started.
-#[test]
-fn a_required_envoy_that_is_absent_fails_the_run() {
-    let mut args = b0("no-envoy", "ok", 3);
-    args.require_envoy = true;
-    assert_eq!(run(&args).expect("a run"), Ended::Failed);
-    let doc = document(&args);
-    assert_eq!(doc["status"], "FAILED");
-    assert!(
-        doc["error"]
-            .as_str()
-            .expect("error")
-            .contains("Envoy is required"),
-        "{doc}"
-    );
-    assert!(
-        doc["runtime"]["envoy"]
-            .as_str()
-            .expect("envoy")
-            .starts_with("absent: "),
-        "{doc}"
-    );
-    assert!(!args.work.join("farm").exists());
-}
-
-/// Catches: an Envoy that is not required being missed without a word: the run goes on without
-/// one and the document says `absent: <why>`.
-#[test]
-fn an_absent_envoy_is_recorded_when_it_is_not_required() {
-    let args = b0("no-envoy-ok", "ok", 3);
-    assert_eq!(run(&args).expect("a run"), Ended::Passed);
-    let doc = document(&args);
-    assert_eq!(
-        doc["runtime"]["envoy"],
-        "absent: KBF_TEST_NO_SUCH_ENVOY is not set"
-    );
-    assert_eq!(failed(&doc), Vec::<String>::new(), "{doc}");
-}
-
 /// Catches: a farm that cannot start (a `kbf` that exits at once) being reported as a pass,
 /// a panic, or a hang: the run is red with `farm_ready` failing and the exit in the report.
 #[test]
@@ -454,7 +406,7 @@ fn the_command_line_runs_b0_and_exits_1_on_a_failed_gate() {
     .iter()
     .map(Into::into)
     .collect();
-    assert_eq!(kbf_harness::cli::status(words, |_| None), 1);
+    assert_eq!(kbf_harness::cli::status(words), 1);
     let doc = document(&args);
     assert!(
         failed(&doc).contains(&"processes_alive".to_owned()),

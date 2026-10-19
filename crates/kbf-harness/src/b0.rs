@@ -2,7 +2,7 @@
 //! real processes under Buck2 builds for a fixed time, no update and no kill; zero failed
 //! builds, zero failed actions, no blob lost.
 //!
-//! It starts the farm (behind an Envoy when one is available), waits until it is ready,
+//! It starts the farm (Buck2 dials the frontend's REAPI port), waits until it is ready,
 //! runs the build loops while the scraper reads the frontend's `/metrics` every second
 //! and the supervisor watches for a process that exits, waits a short settle time, takes
 //! a last scrape, stops every process (each must exit 0), and applies the gates
@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use crate::envoy::{self, Found};
 use crate::farm::{Bins, Farm, Role, Topology};
 use crate::gates::{BuildResult, Evidence, Gate, all_pass};
 use crate::interrupt::Interrupt;
@@ -58,11 +57,6 @@ pub struct B0 {
     /// `kbf-m2-act`, the program the sample project's actions run.
     pub act: PathBuf,
     pub buck2: PathBuf,
-    /// An Envoy binary; `None` takes the one the variable `envoy_var` names, if any.
-    pub envoy: Option<PathBuf>,
-    /// The variable that names an Envoy binary when `envoy` is `None`
-    /// ([`envoy::ENV_VAR`]; a test names one that is not set).
-    pub envoy_var: String,
     /// The sample project (`crates/kbf-it/beta/buck2`).
     pub project: PathBuf,
     /// The run's directory: the farm, the project's copy, `logs/` and the result.
@@ -89,8 +83,6 @@ pub struct B0 {
     pub extra_flags: Vec<(Role, Vec<String>)>,
     /// How long the farm may take to become ready once its processes have started.
     pub farm_hang: Duration,
-    /// A missing Envoy is a failure (the CI setting), not a skip.
-    pub require_envoy: bool,
     /// Whether the run was asked to stop (SIGTERM, SIGINT): it then stops the farm, kills
     /// the Buck2 daemons and ends `FAILED` instead of running on.
     pub interrupt: Interrupt,
@@ -196,7 +188,6 @@ impl B0 {
             kbf: abs(&self.kbf)?,
             act: abs(&self.act)?,
             buck2: abs(&self.buck2)?,
-            envoy: self.envoy.as_deref().map(abs).transpose()?,
             project: abs(&self.project)?,
             work: abs(&self.work)?,
             summary: self.summary.as_deref().map(abs).transpose()?,
@@ -243,57 +234,7 @@ fn fail(result: &mut Writer, status: Status, why: String) -> Ended {
     Ended::Failed
 }
 
-/// What [`choose_envoy`] decided.
-struct Chosen {
-    binary: Option<PathBuf>,
-    /// Why there is none.
-    absent: Option<String>,
-}
-
-impl Chosen {
-    /// For the document's `runtime.envoy`.
-    fn describe(&self) -> String {
-        match (&self.binary, &self.absent) {
-            (Some(path), _) => path.display().to_string(),
-            (None, why) => format!("absent: {}", why.as_deref().unwrap_or("unknown")),
-        }
-    }
-}
-
-/// Envoy: the binary given, else the one the environment names. A missing one is a skip,
-/// with its reason on the document, or, where the CI says Envoy is required, an error.
-fn choose_envoy(args: &B0) -> Result<Chosen, String> {
-    let found = match &args.envoy {
-        Some(path) => Found::Binary(path.clone()),
-        None => envoy::find(&args.envoy_var),
-    };
-    match found {
-        Found::Binary(path) => Ok(Chosen {
-            binary: Some(path),
-            absent: None,
-        }),
-        Found::Absent(why) if args.require_envoy => Err(format!(
-            "Envoy is required ({}=1) and absent: {why}",
-            envoy::REQUIRE_VAR
-        )),
-        Found::Absent(why) => Ok(Chosen {
-            binary: None,
-            absent: Some(why),
-        }),
-    }
-}
-
 fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
-    let envoy_bin = match choose_envoy(args) {
-        Ok(chosen) => {
-            result.doc.runtime.envoy = chosen.describe();
-            chosen.binary
-        }
-        Err(why) => {
-            result.doc.runtime.envoy = format!("absent: {why}");
-            return fail(result, Status::Failed, why);
-        }
-    };
     result.doc.runtime.driver = "native".to_owned();
     result.doc.runtime.container = "none (native driver)".to_owned();
     result.doc.builds.concurrency = args.concurrency;
@@ -316,7 +257,7 @@ fn scenario(args: &B0, logs: &Path, result: &mut Writer) -> Ended {
     let topology = Topology {
         overrides: flags,
         interrupt: args.interrupt.clone(),
-        ..Topology::beta(envoy_bin)
+        ..Topology::beta()
     };
     let bins = Bins {
         kbf: args.kbf.clone(),

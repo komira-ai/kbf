@@ -11,15 +11,11 @@ fn args(words: &[&str]) -> Vec<OsString> {
         .collect()
 }
 
-fn none(_: &str) -> Option<String> {
-    None
-}
-
 #[test]
 fn help_is_not_a_failure() {
     // Catches: `--help` exiting 2, which a workflow step would show as a failed run.
-    assert_eq!(status(args(&["--help"]), none), 0);
-    assert_eq!(status(args(&["b0", "--help"]), none), 0);
+    assert_eq!(status(args(&["--help"])), 0);
+    assert_eq!(status(args(&["b0", "--help"])), 0);
 }
 
 #[test]
@@ -45,7 +41,7 @@ fn a_refused_command_line_exits_2() {
             "nope",
         ],
     ] {
-        assert_eq!(status(args(words), none), 2, "{words:?}");
+        assert_eq!(status(args(words)), 2, "{words:?}");
     }
 }
 
@@ -64,7 +60,7 @@ fn a_work_directory_that_cannot_be_made_exits_2() {
         "--work",
         "/proc/no/such/work",
     ];
-    assert_eq!(status(args(&words), none), 2);
+    assert_eq!(status(args(&words)), 2);
 }
 
 #[test]
@@ -86,7 +82,7 @@ fn the_mutants_are_the_scenarios() {
 #[test]
 fn the_exit_code_wraps_the_status() {
     // `run` is `status` as an `ExitCode`.
-    let code = run(args(&["--help"]), none);
+    let code = run(args(&["--help"]));
     assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
 }
 

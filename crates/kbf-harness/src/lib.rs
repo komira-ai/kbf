@@ -7,8 +7,7 @@
 //!   `kbf-deploy` renders for its unit
 //!   ([`units`]), on a loopback address of its own, under certificates of the right
 //!   rows ([`pki`]); a supervisor with `term`, `kill`, `restart`, a process table and a
-//!   report of every process's output for a hang ([`procs`]). Optionally an Envoy in
-//!   front of the frontend ([`envoy`]).
+//!   report of every process's output for a hang ([`procs`]).
 //! - [`scrape`] and [`gates`]: the frontend's metrics read every second, and the gates a
 //!   scenario applies to what it measured.
 //! - [`load`] and [`eventlog`]: the Buck2 builds that load the farm, and what their event
@@ -18,8 +17,8 @@
 //!   `kbf-beta` binary that runs it.
 //!
 //! To run B0 by hand, with the binaries built (`cargo build -p kbf-cli -p kbf-harness -p kbf-it
-//! --bins`), a pinned `buck2` and, for the Envoy in front of the frontend, `KBF_TEST_ENVOY` naming an
-//! Envoy binary (the beta workflow fetches both by checksum):
+//! --bins`), and a pinned `buck2` (the beta workflow
+//! fetches it by checksum):
 //!
 //! ```text
 //! kbf-beta b0 --bin-dir target/debug --buck2 <buck2> --project crates/kbf-it/beta/buck2 \
@@ -38,7 +37,6 @@
 pub mod api;
 pub mod b0;
 pub mod cli;
-pub mod envoy;
 pub mod eventlog;
 pub mod farm;
 pub mod gates;

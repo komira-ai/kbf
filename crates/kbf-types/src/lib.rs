@@ -20,6 +20,7 @@ mod lease;
 mod phase;
 mod platform;
 mod qos;
+mod release;
 mod rollout;
 mod state;
 mod time;
@@ -35,6 +36,7 @@ pub use lease::{LeaseId, LeaseKind};
 pub use phase::NodePhase;
 pub use platform::{Platform, PlatformError};
 pub use qos::{CustomQos, Qos, QosError};
+pub use release::ReleasePlatform;
 pub use rollout::{
     Actor, IllegalStep, NodeProgress, NodeStep, Rollout, RolloutId, RolloutState, Selector,
     Strategy, StrategyError,

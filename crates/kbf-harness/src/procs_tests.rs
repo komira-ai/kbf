@@ -244,7 +244,7 @@ fn spec(name: &str, program: &str, argv: &[&str], cwd: &Path) -> Spec {
 #[test]
 fn ending_a_process_ends_what_it_started() {
     // Catches: a role killed while the actions of its native driver (its children) run on,
-    // alone, in the dark: the frontend, nodes, daemons and Envoy of a run that ended would
+    // alone, in the dark: the frontend, nodes and daemons of a run that ended would
     // leave their own children behind. `find` starts `sleep` and stays; killing `find`
     // must kill `sleep`. Mutant: `kill` signals the process alone, not its group.
     let d = crate::scratch("group");
@@ -290,7 +290,7 @@ fn a_process_that_exits_takes_what_it_left_running_with_it() {
 #[test]
 fn a_harness_that_is_killed_leaves_no_process_running() {
     // Catches: a CI job's cancel or timeout (SIGKILL after the grace period) leaving the
-    // frontend, nodes, daemons and Envoy of the run behind, each holding its ports into the
+    // frontend, nodes and daemons of the run behind, each holding its ports into the
     // next job on the runner. The helper is a harness holding one `sleep`; it is killed
     // without a chance to run anything. Mutant: no parent-death signal in `Proc::start`.
     let d = crate::scratch("pdeathsig");

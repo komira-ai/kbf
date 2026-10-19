@@ -182,13 +182,12 @@ fn the_summary_is_a_table_of_the_gates() {
         gate("builds_run", Verdict::Pass),
         gate("hang", Verdict::Fail),
     ];
-    d.runtime.envoy = "absent: not set".to_owned();
     d.duration_secs = Some(412.4);
     let text = d.summary();
     assert!(text.contains("| builds_run | 0 | 0 | PASS |"), "{text}");
     assert!(text.contains("| hang | 0 | 0 | FAIL |"), "{text}");
     assert!(text.contains("unattested"), "{text}");
-    assert!(text.contains("envoy: absent: not set"), "{text}");
+    assert!(text.contains("driver: "), "{text}");
     assert!(text.contains("duration: 412 s"), "{text}");
 }
 

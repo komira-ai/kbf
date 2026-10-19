@@ -1,6 +1,6 @@
-//! The beta smoke workflow (`.github/workflows/beta.yml`) fetches the same Buck2 and Envoy
+//! The beta smoke workflow (`.github/workflows/beta.yml`) fetches the same Buck2
 //! as `ci.yml` and runs the same actions, and its text says so by copying `ci.yml`'s pins:
-//! `BUCK2_VERSION`, `BUCK2_SHA256`, `ENVOY_VERSION`, `ENVOY_SHA256` and each action's commit.
+//! `BUCK2_VERSION`, `BUCK2_SHA256` and each action's commit.
 //! A bump in `ci.yml` that leaves a copy behind would have the smoke test other bytes than
 //! the rest of CI, with nothing red to say so. [`mismatches`] compares them: every pin the
 //! smoke job sets must be set in some job of `ci.yml`, to the same value in every job that
@@ -18,12 +18,7 @@ const CI: &str = ".github/workflows/ci.yml";
 const JOB: &str = "smoke";
 
 /// The environment variables that name a tool and its checksum.
-const PINS: [&str; 4] = [
-    "BUCK2_VERSION",
-    "BUCK2_SHA256",
-    "ENVOY_VERSION",
-    "ENVOY_SHA256",
-];
+const PINS: [&str; 2] = ["BUCK2_VERSION", "BUCK2_SHA256"];
 
 /// `uses:` `action@commit` split at the `@`.
 fn split(uses: &str) -> Option<(&str, &str)> {
@@ -89,7 +84,7 @@ fn mismatches(beta: &str, ci: &str) -> Result<Vec<String>, String> {
 
 #[test]
 fn the_beta_workflow_copies_the_pins_of_ci() {
-    // Catches: a Buck2, Envoy or action bump in ci.yml that leaves beta.yml on the old pin.
+    // Catches: a Buck2 or action bump in ci.yml that leaves beta.yml on the old pin.
     let root = super::repo_root();
     let read = |path: &str| std::fs::read_to_string(root.join(path)).expect(path);
     assert_eq!(mismatches(&read(BETA), &read(CI)), Ok(Vec::new()));
@@ -110,9 +105,7 @@ mod rules {
     }
 
     fn env(version: &str) -> String {
-        format!(
-            "      BUCK2_VERSION: {version}\n      BUCK2_SHA256: aa\n      ENVOY_VERSION: 1.0\n      ENVOY_SHA256: bb\n"
-        )
+        format!("      BUCK2_VERSION: {version}\n      BUCK2_SHA256: aa\n")
     }
 
     fn uses(name: &str, sha: &str) -> String {
@@ -164,7 +157,7 @@ mod rules {
             &uses("actions/checkout", SHA_A),
         );
         let found = mismatches(&beta, &ci).expect("both parse");
-        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(found.len(), 1, "{found:?}");
         assert!(
             found.iter().all(|f| f.contains("does not set")),
             "{found:?}"
@@ -173,7 +166,7 @@ mod rules {
         let bare = workflow("test", "      OTHER: 1\n", &uses("actions/checkout", SHA_A));
         let beta = workflow("smoke", &env("1"), &uses("actions/checkout", SHA_A));
         let found = mismatches(&beta, &bare).expect("both parse");
-        assert_eq!(found.len(), 4, "{found:?}");
+        assert_eq!(found.len(), 2, "{found:?}");
         assert!(found.iter().all(|f| f.contains("no job sets")), "{found:?}");
 
         let beta = workflow("smoke", &env("1"), &uses("actions/new", SHA_A));

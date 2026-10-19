@@ -11,8 +11,6 @@ fn args() -> B0 {
         kbf: PathBuf::from("kbf"),
         act: PathBuf::from("act"),
         buck2: PathBuf::from("buck2"),
-        envoy: None,
-        envoy_var: "KBF_TEST_NO_SUCH_ENVOY".to_owned(),
         project: PathBuf::from("project"),
         work: PathBuf::from("work"),
         duration: Duration::from_secs(1),
@@ -28,7 +26,6 @@ fn args() -> B0 {
         mutant: None,
         extra_flags: Vec::new(),
         farm_hang: Duration::from_secs(1),
-        require_envoy: false,
         interrupt: Interrupt::new(),
         reaper: None,
     }
@@ -38,8 +35,7 @@ fn args() -> B0 {
 fn every_path_is_made_absolute() {
     // Catches: a relative path reaching a unit (the renderer refuses it) or a Buck2 that
     // runs in the project's copy and cannot find a path given relative to ours.
-    let mut a = args();
-    a.envoy = Some(PathBuf::from("envoy"));
+    let a = args();
     let abs = a.absolute().expect("absolute");
     for path in [
         &abs.kbf,
@@ -47,45 +43,11 @@ fn every_path_is_made_absolute() {
         &abs.buck2,
         &abs.project,
         &abs.work,
-        abs.envoy.as_ref().expect("envoy"),
         abs.summary.as_ref().expect("summary"),
     ] {
         assert!(path.is_absolute(), "{}", path.display());
     }
     assert_eq!(abs.duration, a.duration);
-    assert!(args().absolute().expect("absolute").envoy.is_none());
-}
-
-#[test]
-fn an_envoy_that_is_absent_is_a_skip_unless_required() {
-    // Catches: a missing Envoy that is required passing, one that is not required failing,
-    // and a document that does not say why there is none.
-    let a = args();
-    let chosen = choose_envoy(&a).expect("a skip");
-    assert_eq!(chosen.binary, None);
-    assert_eq!(
-        chosen.describe(),
-        "absent: KBF_TEST_NO_SUCH_ENVOY is not set"
-    );
-    let mut required = args();
-    required.require_envoy = true;
-    let err = choose_envoy(&required).err().expect("an error");
-    assert_eq!(
-        err,
-        "Envoy is required (KBF_BETA_REQUIRE_ENVOY=1) and absent: KBF_TEST_NO_SUCH_ENVOY is not set"
-    );
-}
-
-#[test]
-fn an_envoy_given_is_used_as_given() {
-    // Catches: the flag lost to the environment's variable, or required-ness refusing an
-    // Envoy that is there.
-    let mut a = args();
-    a.envoy = Some(PathBuf::from("/opt/envoy"));
-    a.require_envoy = true;
-    let chosen = choose_envoy(&a).expect("the binary");
-    assert_eq!(chosen.binary, Some(PathBuf::from("/opt/envoy")));
-    assert_eq!(chosen.describe(), "/opt/envoy");
 }
 
 #[test]

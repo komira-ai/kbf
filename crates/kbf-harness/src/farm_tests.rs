@@ -318,13 +318,16 @@ fn the_process_list_names_every_role() {
         &d,
         vec![
             sleeper(Role::Frontend, &d),
-            sleeper(Role::Envoy, &d),
+            sleeper(Role::Node(1), &d),
             sleeper(Role::Daemon(2), &d),
         ],
     );
-    assert_eq!(farm.roles(), [Role::Frontend, Role::Envoy, Role::Daemon(2)]);
+    assert_eq!(
+        farm.roles(),
+        [Role::Frontend, Role::Node(1), Role::Daemon(2)]
+    );
     let names: Vec<String> = farm.roles().iter().map(ToString::to_string).collect();
-    assert_eq!(names, ["frontend", "envoy", "daemon-2"]);
+    assert_eq!(names, ["frontend", "node-1", "daemon-2"]);
     assert_eq!(node_id(3), "node-3");
 }
 

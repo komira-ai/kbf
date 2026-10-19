@@ -1,6 +1,6 @@
 //! The farm of real `kbf` processes: a frontend, `storage_nodes` storage nodes (each
-//! with a daemon in the same process, or storage alone), `daemons` plain daemons (and,
-//! when asked, an Envoy in front of the frontend), on loopback addresses of their own,
+//! with a daemon in the same process, or storage alone) and `daemons` plain daemons, on
+//! loopback addresses of their own,
 //! each started from the flags `kbf-deploy` renders into its unit
 //! (`kbf_deploy::linux::modes::render`, the `ExecStart=` line, nothing written by hand),
 //! under certificates of the rows the farm's certificate table has.
@@ -17,7 +17,6 @@ use kbf_deploy::linux::Mode;
 use kbf_deploy::linux::verify_cert::Row;
 
 use crate::api;
-use crate::envoy::{self, BoxPorts};
 use crate::interrupt::Interrupt;
 use crate::node_support::{cgroup_tree, crun, files_holding, id_files, image_path, oci_runtime};
 use crate::pki::Pki;
@@ -47,8 +46,6 @@ struct Wiring {
     /// The frontend's worker listener.
     worker: u16,
     api: u16,
-    /// The worker port the daemons dial: the frontend's own, or Envoy's.
-    node_worker: u16,
     /// The storage URL the frontend dials: node 1's.
     storage_url: String,
 }
@@ -59,7 +56,7 @@ pub struct Farm {
     members: Vec<Member>,
     /// The frontend's REAPI listener.
     reapi: String,
-    /// What a client dials: Envoy's REAPI port when it runs, else the frontend's.
+    /// What a client dials: the frontend's REAPI port.
     client_port: u16,
     api: u16,
     ca: Vec<u8>,
@@ -71,8 +68,6 @@ pub struct Farm {
     metrics_ports: Vec<u16>,
     /// The ids the frontend must list as connected, sorted.
     node_ids: Vec<String>,
-    /// Envoy's ports, when it runs.
-    envoy_ports: Option<BoxPorts>,
     /// How long [`Farm::try_wait`] and [`Farm::stop_all`] wait before giving up.
     hang: Duration,
     /// Whether the run was asked to stop.
@@ -174,10 +169,7 @@ impl Farm {
     /// - a `kbf storage` node (which has no daemon half) is given `--frontend` and
     ///   `--advertise-addr`, which its unit does not render (the storage-and-daemon
     ///   unit renders them), so that it registers with the frontend, and with the
-    ///   frontend itself even when Envoy runs (a node serves nothing until it has
-    ///   registered, the frontend is not ready until a node serves, and Envoy sends
-    ///   nothing to a frontend that is not ready: through Envoy no node could register at
-    ///   a cold start);
+    ///   frontend;
     /// - with [`Driver::StandInContainer`], `--driver=container` stays, over the stand-in
     ///   `crun`: `--oci-runtime=` names it (the unit names `/usr/bin/crun`), the id tools
     ///   are on the daemons' `PATH`, their cgroup tree (`--cgroup-root`, `--self-cgroup`)
@@ -217,17 +209,13 @@ impl Farm {
         let nodes = topo.storage_nodes;
         // Every port is the farm's own, from a block no other farm of the host holds.
         let claim = Claim::new();
-        // Envoy's base id is the block's number: no two live farms have one.
-        let envoy_id = claim.index();
-        let ports = Ports::of(&claim, nodes, topo.envoy.is_some());
+        let ports = Ports::of(&claim, nodes);
         let (storage, spare, metrics) = (&ports.storage, ports.spare, &ports.metrics);
         let front = ports.front;
-        let box_ports = ports.envoy;
         let wiring = Wiring {
             reapi: front.0,
             worker: front.1,
             api: front.2,
-            node_worker: box_ports.as_ref().map_or(front.1, |b| b.worker),
             storage_url: format!("https://{}:{}", loopback(1), storage[0]),
         };
         let pki = Pki::new();
@@ -242,14 +230,13 @@ impl Farm {
             logs: logs.to_owned(),
             members: Vec::new(),
             reapi: String::new(),
-            client_port: box_ports.as_ref().map_or(front.0, |b| b.reapi),
+            client_port: front.0,
             api: wiring.api,
             ca: Vec::new(),
             image: String::new(),
             storage_nodes: nodes,
             metrics_ports: metrics.clone(),
             node_ids,
-            envoy_ports: None,
             hang: HANG,
             interrupt: topo.interrupt.clone(),
             socket: None,
@@ -319,17 +306,6 @@ impl Farm {
         let line = farm.start_line(Role::Frontend, "kbf-frontend ")?;
         farm.reapi = field(&line, "reapi=").to_owned();
 
-        // Envoy, before any node: the nodes and daemons dial the frontend through it.
-        if let (Some(binary), Some(ports)) = (&topo.envoy, &box_ports) {
-            let eroot = dir.join("envoy");
-            std::fs::create_dir_all(&eroot).expect("mkdir");
-            let spec = envoy::launch(binary, &eroot, &frontend_etc(dir), ports, envoy_id);
-            farm.launch_spec(Role::Envoy, &eroot, spec);
-            farm.envoy_ports = Some(*ports);
-            let admin = ports.admin;
-            farm.try_wait("Envoy's admin /ready", |_| answers_200(admin, "/ready"))?;
-        }
-
         // The storage nodes, then the plain daemons.
         for (i, port) in storage.iter().enumerate() {
             let (id, host) = (node_id(i + 1), loopback(i + 1));
@@ -347,7 +323,7 @@ impl Farm {
             } else {
                 stand_in(&mut farm, &bin)
             };
-            let cfg = settings(&root, &host, id, *port, wiring.node_worker, &wiring, &bare);
+            let cfg = settings(&root, &host, id, *port, wiring.worker, &wiring, &bare);
             let cold = format!("--cold-store=file://{}", root.join("cold").display());
             let mode = match topo.node_mode {
                 NodeMode::Storage => Mode::Storage,
@@ -361,9 +337,6 @@ impl Farm {
                 // The `kbf storage` unit renders no registration flags (only the
                 // storage-and-daemon unit does), so a storage node of it is a farm of one
                 // member that no frontend lists: these two make it join as the other does.
-                // It registers with the frontend itself, not through Envoy: a node
-                // serves nothing until it has registered, the frontend is not ready
-                // until a node serves, and Envoy sends nothing to an unready frontend.
                 unit.append(&[
                     format!("--frontend=https://localhost:{}", wiring.worker),
                     format!("--advertise-addr={host}:{port}"),
@@ -389,7 +362,7 @@ impl Farm {
             pki.write_ca(&etc);
             pki.issue(&etc, "node", Row::Daemon, &[&id]);
             let bare = stand_in(&mut farm, &bin);
-            let cfg = settings(&root, &host, &id, spare, wiring.node_worker, &wiring, &bare);
+            let cfg = settings(&root, &host, &id, spare, wiring.worker, &wiring, &bare);
             let unit = Self::driven(rendered(&cfg, uid, Mode::Daemon), topo.driver)
                 .set(&topo.limits.daemon);
             let unit = overrides(Role::Daemon(d), unit);
@@ -425,7 +398,6 @@ impl Farm {
             storage_nodes: 0,
             metrics_ports: Vec::new(),
             node_ids: Vec::new(),
-            envoy_ports: None,
             hang: HANG,
             interrupt: Interrupt::new(),
             socket: None,
@@ -605,11 +577,6 @@ impl Farm {
         self.try_wait("the frontend's /readyz", |f| answers_200(f.api, "/readyz"))?;
         self.try_wait("every node connected to the frontend", Farm::all_connected)?;
         self.try_wait("every storage member active", Farm::all_active)?;
-        // Envoy sends nothing to the frontend until its health checks pass: builds start
-        // only when it does.
-        if let Some(ports) = self.envoy_ports {
-            self.try_wait("Envoy to route to the frontend", |_| envoy_routes(&ports))?;
-        }
         Ok(())
     }
 
@@ -762,8 +729,8 @@ impl Farm {
         &self.reapi
     }
 
-    /// The port a build client dials (`localhost:<port>`, under the farm CA): Envoy's
-    /// REAPI port when it runs, else the frontend's.
+    /// The port a build client dials (`localhost:<port>`, under the farm CA): the
+    /// frontend's REAPI port.
     #[must_use]
     pub fn client_port(&self) -> u16 {
         self.client_port
@@ -812,7 +779,7 @@ impl Farm {
     }
 
     /// SIGTERM to each process still running, last started first (the daemons and nodes,
-    /// then Envoy, before the frontend, which waits for open streams); each role and how it
+    /// before the frontend, which waits for open streams); each role and how it
     /// ended. A role that had ended on its own before its turn is reported as that, with its
     /// status (`exited before the stop: exit 0`), which is never a clean stop: a crash
     /// must not be absent from the evidence, and a role that left with 0 on its own was
@@ -890,12 +857,6 @@ fn answers_200(port: u16, path: &str) -> Option<()> {
     (api::get(port, path)?.0 == 200).then_some(())
 }
 
-/// `Some` once Envoy's admin page lists both of the box's clusters healthy.
-fn envoy_routes(ports: &BoxPorts) -> Option<()> {
-    let (code, text) = api::get(ports.admin, "/clusters")?;
-    (code == 200 && envoy::healthy(&text, ports)).then_some(())
-}
-
 /// How a process ended, as the process table says it.
 fn ended_text(s: std::process::ExitStatus) -> String {
     use std::os::unix::process::ExitStatusExt as _;
@@ -903,11 +864,6 @@ fn ended_text(s: std::process::ExitStatus) -> String {
         || format!("signal {}", s.signal().unwrap_or(0)),
         |c| format!("exit {c}"),
     )
-}
-
-/// The frontend's `etc` directory: its certificates are Envoy's.
-fn frontend_etc(dir: &Path) -> PathBuf {
-    dir.join("frontend").join("etc")
 }
 
 #[cfg(test)]

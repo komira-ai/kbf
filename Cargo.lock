@@ -1339,14 +1339,12 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
- "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
  "prost",
  "rcgen",
  "rustix",
- "serde_json",
  "tokio",
  "tonic",
  "tracing",
@@ -1518,6 +1516,7 @@ dependencies = [
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "kbf-update",
  "libc",
  "prost",
  "prost-types",
@@ -1542,8 +1541,10 @@ dependencies = [
  "hex",
  "httparse",
  "kbf-host",
+ "kbf-installer",
  "kbf-mdm",
  "kbf-state",
+ "kbf-testkit",
  "kbf-types",
  "plist",
  "rcgen",
@@ -1627,6 +1628,7 @@ dependencies = [
  "hyper-util",
  "kbf-peer",
  "kbf-proto",
+ "kbf-testkit",
  "kbf-types",
  "libc",
  "rcgen",
@@ -1781,6 +1783,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-installer"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "flate2",
+ "hex",
+ "kbf-host",
+ "kbf-installer",
+ "kbf-update",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "thiserror",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "kbf-invocation"
 version = "0.1.0"
 dependencies = [
@@ -1796,10 +1819,12 @@ name = "kbf-it"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures",
  "hex",
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
+ "kbf-installer",
  "kbf-objstore",
  "kbf-proto",
  "kbf-server",
@@ -1903,6 +1928,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kbf-mac-session",
+ "kbf-testkit",
  "libc",
  "rcgen",
  "reqwest",
@@ -1962,6 +1988,7 @@ dependencies = [
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
+ "kbf-update",
  "libc",
  "prost",
  "rcgen",
@@ -1986,6 +2013,7 @@ dependencies = [
  "hmac 0.13.0",
  "kbf-objstore",
  "kbf-segments",
+ "kbf-testkit",
  "kbf-threads",
  "kbf-types",
  "md-5",
@@ -2097,6 +2125,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "hex",
+ "hyper-util",
  "kbf-auth",
  "kbf-caps",
  "kbf-enroll-registry",
@@ -2119,6 +2148,7 @@ dependencies = [
  "kbf-state",
  "kbf-storage",
  "kbf-store",
+ "kbf-testkit",
  "kbf-threads",
  "kbf-tier",
  "kbf-tls",
@@ -2143,6 +2173,21 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+ "x509-parser",
+]
+
+[[package]]
+name = "kbf-signer"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-ca",
+ "kbf-types",
+ "rcgen",
+ "rustix",
+ "rustls",
+ "thiserror",
+ "time",
  "x509-parser",
 ]
 
@@ -2307,20 +2352,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "kbf-updater"
+name = "kbf-update"
 version = "0.1.0"
 dependencies = [
- "base64 0.23.1",
- "clap",
+ "futures",
  "hex",
- "kbf-host",
- "libc",
- "ring",
- "rustix",
+ "kbf-proto",
+ "kbf-threads",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -4737,6 +4782,7 @@ dependencies = [
  "tar",
  "thiserror",
  "ureq",
+ "zip",
 ]
 
 [[package]]

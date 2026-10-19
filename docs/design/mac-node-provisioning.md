@@ -46,11 +46,11 @@ The rules this design keeps:
 | Provisioning layer | A plain, idempotent program (`kbf-mac-provision`, a Rust binary; first designed as a shell script) with `apply` and `check` modes, over a declarative key=value profile, that uses only programs macOS ships. Not nix-darwin, not Ansible ([comparison](#2-the-provisioning-layer)). |
 | `kbf-daemon` | Built and attested by CI on every commit to `main`, on a hosted macOS arm64 runner: signed (ad-hoc today; Developer ID if the project gets an Apple Developer account), with a SHA-256, an SBOM and build provenance. The operator's deployment job verifies the attestation and installs that per-commit tarball on each node. A release only tags digests that already ran; it never rebuilds. The profile holds host settings, not the daemon's version. |
 | Toolchains | The pinned Xcodes (several per host, chosen per action with `DEVELOPER_DIR`, as the macOS VMs design proposes) are in the worker profile. Clients route on `xcode` and `os_build`. Client-defined probes (for example a host identity) run per Xcode and are reported, never matched; an Xcode whose probe value differs from the expected one leaves the report until it re-qualifies. Simulator runtimes live only in VM images. |
-| Power | `sleep 0`, `autorestart 1`. The daemon's fence clock stops during sleep or suspend on any OS; that is a code bug ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)), not something a setting fixes ([section 5.1](#51-sleep)). |
+| Power | `sleep 0`, `autorestart 1`. The daemon's fence clock stops during sleep or suspend on any OS; that is a code bug ([#78](https://github.com/komira-ai/kbf/issues/78)), not something a setting fixes ([section 5.1](#51-sleep)). |
 | Updates | Automatic download and install off, security responses included. Updates roll out canary-first as a new profile. MDM is decided: Apple Business Manager plus a self-hosted NanoHUB behind `kbf-mdm-gate` (fleet-updates design, section 7; [section 6](#6-updates-pinned-and-rolled-out)). |
 | FileVault | Off on rack nodes, so a Mac boots unattended after a power loss. Host auto-login is off at rest: GUI work runs in VM guests that log themselves in. The exceptions are bare-metal GPU tests: for one whole-machine lease, the root helper `kbf-mac-session` sets auto-login to that lease's throwaway user (non-admin unless the lease is privileged), and clears it afterwards ([fleet-updates design](fleet-updates.md)). If a VM cannot be started from a launch daemon (an open probe of the macOS VMs design), the fallback is an open decision ([section 5.4](#54-filevault-and-auto-login)). |
 | Admin | SSH only, key only, one admin account. `kbf-daemon` runs as a LaunchDaemon under a hidden role account. |
-| Join and leave | The node's certificate names its node id ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)). Drain is a protocol message. Short certificate lifetimes and a deny list close the revocation gap ([section 9](#9-joining-and-leaving-the-farm)). |
+| Join and leave | The node's certificate names its node id ([#79](https://github.com/komira-ai/kbf/issues/79)). Drain is a protocol message. Short certificate lifetimes and a deny list close the revocation gap ([section 9](#9-joining-and-leaving-the-farm)). |
 
 ## What kbf has today
 
@@ -77,7 +77,7 @@ This design builds on the code on `main`, read at the time of writing.
   `isa_level`, `drivers`, and the driver's `network_isolation`. It reports nothing about
   the macOS build or Xcode yet. ([capabilities.md](capabilities.md) said macOS
   detection was planned; this change brings it up to date.)
-- **Platform routing** ([#71](https://github.com/komira-ai/komira-build-farm/pull/71))
+- **Platform routing** ([#71](https://github.com/komira-ai/kbf/pull/71))
   matches an action's `OSFamily`/`ISA`/`Arch` and kbf keys against node reports;
   properties that are not kbf keys are ignored (refusing them is planned).
 - **CI.** The `native-macos` job builds `kbf-daemon` on a hosted macOS runner and runs
@@ -91,13 +91,13 @@ This design builds on the code on `main`, read at the time of writing.
   leaked or retired certificates without a restart. There is no CRL or OCSP; short
   lifetimes bound what the list misses. See
   [worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list) and
-  [#79](https://github.com/komira-ai/komira-build-farm/issues/79).
+  [#79](https://github.com/komira-ai/kbf/issues/79).
 - **Fencing.** The daemon fences on `tokio::time::Instant`. Rust's `Instant` is
   `CLOCK_MONOTONIC` on Linux and `CLOCK_UPTIME_RAW` on macOS
   ([std::time::Instant](https://doc.rust-lang.org/std/time/struct.Instant.html)).
   Neither advances while the machine is suspended, so on any OS a node that sleeps
   past T wakes up with its leases still running. Tracked in
-  [#78](https://github.com/komira-ai/komira-build-farm/issues/78); see section 5.1.
+  [#78](https://github.com/komira-ai/kbf/issues/78); see section 5.1.
 
 ## 1. The baseline
 
@@ -562,7 +562,7 @@ answered or, if the server is unreachable, until its own fence fires T = 40 s la
 a clock that is running again.
 
 **The fix is in code, on every OS**
-([#78](https://github.com/komira-ai/komira-build-farm/issues/78)):
+([#78](https://github.com/komira-ai/kbf/issues/78)):
 
 - fence against a clock that counts suspend (`CLOCK_BOOTTIME` on Linux;
   `CLOCK_MONOTONIC_RAW` or `mach_continuous_time` on macOS);
@@ -882,7 +882,7 @@ farms' lists and the client's are updated in the same reviewed change.
 
 Steps 1 to 3 and 5 are planned. Step 4, the binding, is in the server
 ([worker-protocol.md](worker-protocol.md#node-identity-and-the-deny-list),
-[#79](https://github.com/komira-ai/komira-build-farm/issues/79)).
+[#79](https://github.com/komira-ai/kbf/issues/79)).
 
 1. `check` passes on the node: the profile is applied, and the identity is the
    expected one.
@@ -911,7 +911,7 @@ Steps 1 to 3 and 5 are planned. Step 4, the binding, is in the server
 - **Fencing during a leave:** a node that disappears keeps running its leases until its
   own fence fires at T = 40 s; the scheduler gives them away at G = 60 s; an action
   never runs on two nodes at once. A node that suspended is the exception until
-  [#78](https://github.com/komira-ai/komira-build-farm/issues/78) is fixed (section
+  [#78](https://github.com/komira-ai/kbf/issues/78) is fixed (section
   5.1).
 - **Deregistration:** remove the node from the cell configuration, delete its key on the
   node, and add its certificate serial to the server's **deny list**
@@ -948,8 +948,8 @@ kbf's rule holds here: every test has been seen failing on a planted defect.
 | Build job | its last step re-downloads its own assets and verifies sums and attestations with the flags of 4.2 | one flipped byte in the asset before the check; an attestation from another workflow file accepted |
 | Node install | `apply` with a wrong SHA-256 refuses before touching `/usr/local/kbf` | the sum compared after the switch, or not at all |
 | `--expect-probe` | two Xcodes with fixture probe outputs; one probe's value changes. That Xcode's `xcode` value and probe entry leave the report, and the other Xcode's stay | the whole node dropped on one mismatch; the mismatched Xcode still reported; the probe run with the daemon's environment or `SDKROOT` set instead of an action's |
-| Fence clock ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)) | an injected clock that jumps forward, as a resume does: the lease is killed and no `Result` is sent | the fence on a clock that does not count suspend |
-| Node-id binding ([#79](https://github.com/komira-ai/komira-build-farm/issues/79)) | server tests: a certificate for node A sending a first `Hello` as node B is refused; on an established stream, a resent `Hello` whose `node_id` differs from the stream's worker is refused and ends the stream (both in `crates/kbf-server/tests/node_binding.rs` and `session.rs`) | the first-`Hello` check removed; a resent `node_id` ignored rather than refused |
+| Fence clock ([#78](https://github.com/komira-ai/kbf/issues/78)) | an injected clock that jumps forward, as a resume does: the lease is killed and no `Result` is sent | the fence on a clock that does not count suspend |
+| Node-id binding ([#79](https://github.com/komira-ai/kbf/issues/79)) | server tests: a certificate for node A sending a first `Hello` as node B is refused; on an established stream, a resent `Hello` whose `node_id` differs from the stream's worker is refused and ends the stream (both in `crates/kbf-server/tests/node_binding.rs` and `session.rs`) | the first-`Hello` check removed; a resent `node_id` ignored rather than refused |
 | Drain | scheduler simulation: a drained node gets no new lease; running leases finish or are re-placed after the deadline | placement that ignores the drained flag |
 | Deny list | a denied serial's `Hello` is refused, also on reconnect; an open stream's next `Heartbeat` or `Result` ends it, and the `Result` never reaches the action cache (`node_binding.rs`) | the list read only at server start; a `Result` not checked |
 

@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
-repository = "https://github.com/komira-ai/komira-build-farm"
+repository = "https://github.com/komira-ai/kbf"
 publish = false
 
 # Every external dependency is declared here once and used from a member as
@@ -94,7 +94,7 @@ rand_chacha = "0.10.0"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 # Plain HTTP only: TLS brings a crypto provider, added with the first TLS endpoint.
 reqwest = { version = "0.13.5", default-features = false }
-# ed25519 checks of software sets and key statements (kbf-updater). Already in the tree
+# ed25519 checks of software sets and key statements. Already in the tree
 # through rustls.
 ring = "0.17.14"
 roxmltree = "0.21.1"
@@ -140,7 +140,7 @@ syn = { version = "2.0.119", default-features = false, features = ["full", "pars
 # no extended attributes.
 tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0.21"
-# `kbf.toml`, the node's config file (kbf-enroll); no datetime or display support.
+# `kbf.toml`, the node's config file (kbf-enroll), and `installer.toml`, the installer's settings (kbf-installer); no datetime or display support.
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 # RFC 3339 times in the MDM gate's signed messages. Already in the tree through
 # x509-parser.
@@ -175,6 +175,7 @@ zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2
 kbf-alert = { path = "crates/kbf-alert" }
 kbf-all-in-one = { path = "crates/kbf-all-in-one" }
 kbf-auth = { path = "crates/kbf-auth" }
+kbf-ca = { path = "crates/kbf-ca" }
 kbf-caps = { path = "crates/kbf-caps" }
 kbf-cas-conformance = { path = "crates/kbf-cas-conformance" }
 kbf-daemon = { path = "crates/kbf-daemon" }
@@ -189,6 +190,7 @@ kbf-harness = { path = "crates/kbf-harness" }
 kbf-history = { path = "crates/kbf-history" }
 kbf-image = { path = "crates/kbf-image" }
 kbf-host = { path = "crates/kbf-host" }
+kbf-installer = { path = "crates/kbf-installer" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-it = { path = "crates/kbf-it" }
 kbf-log = { path = "crates/kbf-log" }
@@ -220,6 +222,7 @@ kbf-tier = { path = "crates/kbf-tier" }
 kbf-transfer = { path = "crates/kbf-transfer" }
 kbf-types = { path = "crates/kbf-types" }
 kbf-ui = { path = "crates/kbf-ui" }
+kbf-update = { path = "crates/kbf-update" }
 # The CI verbs (`cargo xtask`); kbf-it reads the interpreter budget with its parser.
 xtask = { path = "crates/xtask" }
 

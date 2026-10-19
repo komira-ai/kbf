@@ -30,6 +30,8 @@ use kbf_proto::worker::{NodeStatus, XcodeState, XcodeStatus};
 use kbf_sched::NodePhase;
 use serde::Serialize;
 
+use crate::update_status::UpdateSummary;
+
 /// One node, as `GET /v1/nodes` lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NodeView {
@@ -40,6 +42,10 @@ pub struct NodeView {
     /// The newest software status it sent; `None` if it sent none (a daemon that
     /// predates `NodeStatus`).
     pub software: Option<SoftwareView>,
+    /// Where its update is: step state, whether it runs the desired commit and whether
+    /// the report describes it now. Open like the rest of this view; the commits and the
+    /// refusal text are on `GET /v1/update/hosts` ([`crate::update_status`]).
+    pub update: UpdateSummary,
     /// What an operator must do on the node, one line each
     /// ([`SoftwareView::needs_attention`]).
     pub needs_attention: Vec<String>,

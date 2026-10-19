@@ -42,15 +42,15 @@ fn claims_held_at_once_never_share_a_block() {
 }
 
 #[test]
-fn two_farms_started_together_are_told_disjoint_ports_and_distinct_envoy_ids() {
+fn two_farms_started_together_are_told_disjoint_ports_and_distinct_blocks() {
     // Catches: the farms of two tests of one process picking the same ports (the old
-    // `ports()` probed the kernel for each, and `backend_base` walked from the process id),
-    // and the same Envoy base id (derived from the block). Mutant: `Claim::new` gives every
-    // caller block 0.
+    // `ports()` probed the kernel for each, and `backend_base` walked from the process id).
+    // Mutant: `Claim::new` always claims block 0
+    // (the second claim then fails).
     let farm = || {
         std::thread::spawn(|| {
             let claim = Claim::new();
-            let ports = Ports::of(&claim, 3, true);
+            let ports = Ports::of(&claim, 3);
             (claim, ports)
         })
     };
@@ -62,8 +62,7 @@ fn two_farms_started_together_are_told_disjoint_ports_and_distinct_envoy_ids() {
     );
     assert!(all_a.is_disjoint(&all_b), "{pa:?} / {pb:?}");
     assert_ne!(ca.index(), cb.index());
-    let bases = |p: &Ports| p.envoy.as_ref().expect("envoy").base;
-    assert!(bases(&pa).abs_diff(bases(&pb)) >= BLOCK);
+    assert!(pa.front.0.abs_diff(pb.front.0) >= BLOCK);
 }
 
 #[test]
@@ -99,37 +98,28 @@ fn every_port_lies_in_the_block_below_the_ephemeral_range() {
     // yields), where a connection's source port can take one before its role binds it.
     // Mutant: `FIRST` 20000 -> 40000.
     let claim = Claim::starting_at(120);
-    let ports = Ports::of(&claim, MAX_NODES, true);
+    let ports = Ports::of(&claim, MAX_NODES);
     let all = ports.all();
-    assert_eq!(all.len(), 4 + 2 * MAX_NODES + 3);
+    assert_eq!(all.len(), 4 + 2 * MAX_NODES);
     assert_eq!(all.iter().collect::<BTreeSet<_>>().len(), all.len());
     for port in all {
         assert!(port >= claim.base() && port < claim.base() + BLOCK);
         assert!(port >= FIRST && port < floor().min(EPHEMERAL), "{port}");
     }
-    let envoy = ports.envoy.expect("envoy");
     assert_eq!(
-        envoy.base, ports.front.0,
-        "the frontend is the box's instance a"
+        ports.front.0,
+        claim.base(),
+        "the frontend's listeners open the block"
     );
     assert_eq!(ports.front.1, ports.front.0 + 1);
     assert_eq!(ports.front.2, ports.front.0 + 2);
-    // Instance b's three, ten above, are inside the block and are no one else's.
-    assert!(
-        !ports
-            .all()
-            .iter()
-            .any(|p| (envoy.base + 10..envoy.base + 13).contains(p))
-    );
 }
 
 #[test]
-fn a_farm_without_envoy_has_no_envoy_ports_and_one_with_fewer_nodes_fewer() {
-    // Catches: Envoy's ports told to a farm that runs none, or a node count that is not
-    // the port count.
+fn a_farm_of_fewer_nodes_has_fewer_ports() {
+    // Catches: a node count that is not the port count.
     let claim = Claim::starting_at(130);
-    let plain = Ports::of(&claim, 2, false);
-    assert!(plain.envoy.is_none());
+    let plain = Ports::of(&claim, 2);
     assert_eq!((plain.storage.len(), plain.metrics.len()), (2, 2));
     assert_eq!(plain.all().len(), 4 + 4);
 }
@@ -137,9 +127,9 @@ fn a_farm_without_envoy_has_no_envoy_ports_and_one_with_fewer_nodes_fewer() {
 #[test]
 #[should_panic(expected = "a block holds ports for 8")]
 fn more_nodes_than_a_block_holds_ports_for_is_refused() {
-    // Catches: node 9's ports spilling into Envoy's or the next block's.
+    // Catches: node 9's ports spilling into the next block's.
     let claim = Claim::starting_at(140);
-    let _ = Ports::of(&claim, MAX_NODES + 1, false);
+    let _ = Ports::of(&claim, MAX_NODES + 1);
 }
 
 #[test]

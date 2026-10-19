@@ -13,7 +13,7 @@ the command are here.
 Both instances run the same command line but for `--instance=a|b`. Instance a listens where
 `--listen`, `--worker-listen` and `--api-listen` say; instance b listens ten ports above each
 (port 0, which the system chooses, stays 0), so the two blocks are `base+0..2` and `base+10..12`,
-the ones Envoy's configuration (`kbf-deploy envoy render --topology box`) names. A handover
+the ones the installer's Envoy box render (`kbf-installer`, `envoy` module) names. A handover
 goes to the other instance. The two REAPI listeners must be on loopback, since the old one
 forwards the calls that still reach it to the new one. If the REAPI listener has a
 certificate, `--handover-peer-name` (the DNS name the other instance's certificate carries) and
@@ -96,18 +96,21 @@ an `op/` row and a `queue/` row written before the call is queued (a call refuse
 is refused at open, UNAVAILABLE, and is never followed); a leased one keeps its `op/` row; a
 successor that starts cold, with the epoch raised, reruns the leases of the old epoch from
 those same rows, so the operation is queued again, not gone. The writer ends an operation in
-two transactions: the first deletes its `op/` row, the second writes its `done/` row, kept for
-at least `DONE_FLOOR` (600 s) of the store's clock from the write. A look between them finds
-nothing, and the next finds the result. Because every look reads `done/` first and the
+one transaction: it deletes the operation's `op/`, `queue/` and `lease/` rows and writes its
+`done/` row, kept for at least `DONE_FLOOR` (600 s) of the store's clock from the write, so
+the store holds the operation's unfinished rows or its result, never neither, and a process
+killed at any point leaves one of the two. A look reads `done/`, then the `op/` row, and
+`done/` again if the `op/` row is gone, so a finish landing between the reads is found. Because every look reads `done/` first and the
 follower looks every second, a row is read within a second of being written and expires
-unread only if the old frontend could not read the store for ten minutes. The one durable gap
-is a successor killed between the two transactions: the result is then in no row. The old
+unread only if the old frontend could not read the store for ten minutes. The gap that
+remains is a store written by an earlier release, which ended an operation in two
+transactions and could leave the result in no row, and a result read after its row expired. The old
 frontend does not end that stream on a timer either. After two looks in a row with no trace
 it logs a WARN naming the operation and raises `kbf_frontend_relay_untraced`, and the stream
 stays open; it ends when the client cancels (Buck2 does on its own timeouts, interrupts and
 exit; an Envoy or connection drop cancels it too) or the operator stops the old instance. A
 cancelled stream no longer counts as a waiting caller, so the old process can exit once the
-rest have ended. `kbf_frontend_relay_untraced` is 0 unless that gap happened: it replaces
+rest have ended. `kbf_frontend_relay_untraced` is 0 unless one of those gaps happened: it replaces
 `kbf_frontend_relay_lost_total`, which counted builds ended by the old three-look rule.
 
 `WaitExecution`, which Buck2 never calls but other clients may, follows the same rule: a

@@ -13,7 +13,6 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::b0::{self, B0, Ended, Mutant};
-use crate::envoy::{ENV_VAR, REQUIRE_VAR, required};
 use crate::interrupt::Interrupt;
 use crate::procs::HANG;
 use crate::reap::Reap;
@@ -60,9 +59,6 @@ struct B0Flags {
     /// The pinned buck2.
     #[arg(long)]
     buck2: PathBuf,
-    /// An Envoy binary to put in front of the frontend (default: `KBF_TEST_ENVOY`).
-    #[arg(long)]
-    envoy: Option<PathBuf>,
     /// The sample project (`crates/kbf-it/beta/buck2`).
     #[arg(long)]
     project: PathBuf,
@@ -116,41 +112,20 @@ fn wall_bound(duration_secs: u64, build_timeout_secs: u64) -> Duration {
     )
 }
 
-/// Runs `kbf-beta` on `args` (the first is the program's name), with `env` the lookup of
-/// an environment variable.
-pub fn run(
-    args: impl IntoIterator<Item = OsString>,
-    env: impl Fn(&str) -> Option<String>,
-) -> ExitCode {
-    ExitCode::from(status(args, env))
+/// Runs `kbf-beta` on `args` (the first is the program's name).
+pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
+    ExitCode::from(status(args))
 }
 
 /// [`run`]'s exit status: 0 for a run whose gates all passed (and for `--help`), 1 for one
 /// that failed a gate, 2 for a command line refused or a run directory that cannot be made.
-pub fn status(
-    args: impl IntoIterator<Item = OsString>,
-    env: impl Fn(&str) -> Option<String>,
-) -> u8 {
-    status_of(
-        args.into_iter().collect(),
-        &env,
-        &mut std::io::stdin().lock(),
-    )
-}
-
-/// The environment variable `key`, if it is set to text: what the binary gives [`run`].
-#[must_use]
-pub fn env_var(key: &str) -> Option<String> {
-    std::env::var(key).ok()
+pub fn status(args: impl IntoIterator<Item = OsString>) -> u8 {
+    status_of(args.into_iter().collect(), &mut std::io::stdin().lock())
 }
 
 /// [`status`] over trait objects: one copy of the logic, whatever the caller's types, so
 /// that the tests that run it cover it for the binary too. `stdin` is what the sentinel reads.
-fn status_of(
-    args: Vec<OsString>,
-    env: &dyn Fn(&str) -> Option<String>,
-    stdin: &mut dyn BufRead,
-) -> u8 {
+fn status_of(args: Vec<OsString>, stdin: &mut dyn BufRead) -> u8 {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(e) => {
@@ -166,7 +141,6 @@ fn status_of(
     let B0Flags {
         bin_dir,
         buck2,
-        envoy,
         project,
         work,
         duration_secs,
@@ -182,8 +156,6 @@ fn status_of(
         kbf: bin_dir.join("kbf"),
         act: bin_dir.join("kbf-m2-act"),
         buck2,
-        envoy,
-        envoy_var: ENV_VAR.to_owned(),
         project,
         work,
         duration: Duration::from_secs(duration_secs),
@@ -199,7 +171,6 @@ fn status_of(
         mutant: mutant.map(Mutant::from),
         extra_flags: Vec::new(),
         farm_hang: HANG,
-        require_envoy: required(env(REQUIRE_VAR).as_deref()),
         interrupt: Interrupt::process(),
         reaper: std::env::current_exe().ok(),
     };

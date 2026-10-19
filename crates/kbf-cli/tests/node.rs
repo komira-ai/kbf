@@ -311,11 +311,7 @@ async fn a_wrong_pin_is_refused_and_a_frontend_that_is_down_is_retried() {
     assert_eq!(failure.exit_code(), 2);
     assert!(h.fake().enrolls().is_empty(), "the secret was not sent");
 
-    let closed = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port();
+    let closed = kbf_testkit::port::dead_addr().port();
     h.write_config(closed, "[daemon]\n");
     let failure = start(&h, &launches, || {}).await.expect_err("unreachable");
     assert!(

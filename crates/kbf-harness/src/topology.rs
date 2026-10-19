@@ -38,7 +38,6 @@ pub enum Role {
     Node(usize),
     /// A plain daemon, numbered from 1.
     Daemon(usize),
-    Envoy,
 }
 
 impl std::fmt::Display for Role {
@@ -47,7 +46,6 @@ impl std::fmt::Display for Role {
             Role::Frontend => f.write_str("frontend"),
             Role::Node(n) => write!(f, "node-{n}"),
             Role::Daemon(n) => f.write_str(&daemon_id(*n)),
-            Role::Envoy => f.write_str("envoy"),
         }
     }
 }
@@ -113,9 +111,6 @@ pub struct Topology {
     pub daemons: usize,
     pub driver: Driver,
     pub limits: Limits,
-    /// An Envoy to put in front of the frontend (the `box` topology, the frontend as
-    /// instance `a`): the binary's path. `None` runs the frontend alone.
-    pub envoy: Option<PathBuf>,
     /// Flags to set on one role after everything else (a mutant's, or a test's).
     pub overrides: Vec<(Role, Vec<String>)>,
     /// Whether the run was asked to stop: every wait of the farm looks at it.
@@ -124,7 +119,7 @@ pub struct Topology {
 
 impl Topology {
     /// The rehearsal's: `storage_nodes` storage-and-daemon nodes and a daemon, the
-    /// stand-in container driver, no limits, no Envoy.
+    /// stand-in container driver, no limits.
     #[must_use]
     pub fn rehearsal(storage_nodes: usize) -> Self {
         Self {
@@ -133,7 +128,6 @@ impl Topology {
             daemons: 1,
             driver: Driver::StandInContainer,
             limits: Limits::none(),
-            envoy: None,
             overrides: Vec::new(),
             interrupt: Interrupt::new(),
         }
@@ -141,16 +135,15 @@ impl Topology {
 
     /// The beta farm's: three storage nodes, two plain daemons running actions as plain
     /// processes (the native driver, which only a plain daemon takes), a hosted runner's
-    /// limits, and the Envoy given.
+    /// limits.
     #[must_use]
-    pub fn beta(envoy: Option<PathBuf>) -> Self {
+    pub fn beta() -> Self {
         Self {
             storage_nodes: 3,
             node_mode: NodeMode::Storage,
             daemons: 2,
             driver: Driver::Native,
             limits: Limits::small(),
-            envoy,
             overrides: Vec::new(),
             interrupt: Interrupt::new(),
         }
