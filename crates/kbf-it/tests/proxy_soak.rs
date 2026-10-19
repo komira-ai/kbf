@@ -99,9 +99,11 @@ impl Child {
         let mut command = Command::new(dir.join("bin/kbf"));
         command.args(args).stdout(Stdio::piped()).stderr(log);
         let mut process = reaped::spawn(&mut command, 3).expect("spawn kbf");
-        let mut stdout = BufReader::new(process.stdout.take().expect("stdout"));
-        let mut line = String::new();
-        stdout.read_line(&mut line).expect("a start line");
+        let (line, stdout) = reaped::first_line(
+            process.stdout.take().expect("stdout"),
+            Duration::from_secs(60),
+        )
+        .unwrap_or_else(|e| panic!("no start line from {name}: {e}"));
         Self {
             process,
             line,
@@ -170,7 +172,7 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
 /// A base port such that the REAPI, worker, operator and admin ports of slot A (the base plus
 /// 0 to 3) and of slot B (plus 10 to 13), as the proxy's static table has them, are free now.
 fn free_base() -> u16 {
-    let mut base = 20_000 + (std::process::id() % 20_000) as u16;
+    let mut base = 10_000 + (std::process::id() % 20_000) as u16;
     loop {
         let bound: Vec<_> = [0, 1, 2, 3, 10, 11, 12, 13]
             .iter()
@@ -648,4 +650,6 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
     handle.shutdown();
     serving.join().expect("the runner thread").expect("run");
     drop((node_a, node_b));
+    // Passing leaves nothing behind; a failure keeps the keys and logs for the reader.
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -194,3 +194,91 @@ fn a_child_the_test_already_reaped_is_left_alone_on_drop() {
         "waited out the grace for a child that had exited"
     );
 }
+
+/// Catches a `first_line` that waits for ever on a silent child (the test would hang until an
+/// outer timeout killed the harness), and one that loses the line or the reader.
+#[test]
+fn a_silent_child_times_out_and_a_talking_one_gives_its_line() {
+    let mut silent = Command::new("sleep");
+    silent.arg("600").stdout(std::process::Stdio::piped());
+    let mut silent = reaped::spawn(&mut silent, 3).expect("spawn");
+    let began = Instant::now();
+    let err = reaped::first_line(
+        silent.stdout.take().expect("stdout"),
+        Duration::from_millis(200),
+    )
+    .expect_err("silent");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(began.elapsed() < Duration::from_secs(5));
+
+    let mut talking = Command::new("echo");
+    talking.arg("hello").stdout(std::process::Stdio::piped());
+    let mut talking = reaped::spawn(&mut talking, 3).expect("spawn");
+    let (line, _reader) = reaped::first_line(
+        talking.stdout.take().expect("stdout"),
+        Duration::from_secs(10),
+    )
+    .expect("a line");
+    assert_eq!(line, "hello\n");
+}
+
+/// The process is gone or a zombie waiting for its reaper (an orphan's reaper is init).
+fn dead(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit(") ")
+            .next()
+            .is_some_and(|rest| rest.starts_with('Z')),
+    }
+}
+
+/// The helper half of [`a_guarded_child_dies_when_its_parent_dies_without_unwinding`]: runs
+/// only when started by it. Spawns a guarded `sleep`, writes its pid, and ends the process
+/// with `exit`, which runs no destructor (as a kill of the harness would not).
+#[test]
+#[ignore = "started by a_guarded_child_dies_when_its_parent_dies_without_unwinding"]
+fn orphaning_parent_helper() {
+    let Some(file) = std::env::var_os("KBF_REAPED_PIDFILE") else {
+        return;
+    };
+    let mut sleep = Command::new("sleep");
+    sleep.arg("600");
+    let child = reaped::spawn(&mut sleep, 3).expect("spawn");
+    std::fs::write(&file, child.id().to_string()).expect("pid file");
+    std::process::exit(0);
+}
+
+/// Catches a guard that covers only an orderly end: when the process that spawned the child
+/// ends without running destructors (killed harness, `exit`), the child must go too, not run
+/// on holding the build slots.
+#[test]
+fn a_guarded_child_dies_when_its_parent_dies_without_unwinding() {
+    let file = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("reaped-orphan-pid");
+    let _ = std::fs::remove_file(&file);
+    let status = Command::new(std::env::current_exe().expect("this binary"))
+        .args([
+            "--ignored",
+            "--exact",
+            "orphaning_parent_helper",
+            "--test-threads=1",
+        ])
+        .env("KBF_REAPED_PIDFILE", &file)
+        .output()
+        .expect("helper")
+        .status;
+    assert!(status.success());
+    let pid: i32 = std::fs::read_to_string(&file)
+        .expect("pid")
+        .parse()
+        .expect("number");
+    let waited = Instant::now();
+    while !dead(pid) {
+        if waited.elapsed() > Duration::from_secs(10) {
+            // SAFETY: ends the sleeper this test started, so a red run leaks nothing.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("the child outlived its parent");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

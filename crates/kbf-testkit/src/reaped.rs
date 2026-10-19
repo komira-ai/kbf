@@ -13,10 +13,10 @@
 //! [`crate::forked`] (a child held between `fork` and `exec`): they cover the other ways a
 //! forked child touches a test's descriptors.
 
-use std::io;
+use std::io::{self, BufRead as _, BufReader};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::process::CommandExt as _;
-use std::process::{Child, Command};
+use std::process::{Child, ChildStdout, Command};
 use std::time::{Duration, Instant};
 
 /// How long [`Reaped`] waits for a child to exit after SIGTERM before it sends SIGKILL.
@@ -58,6 +58,27 @@ impl Drop for Reaped {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Reads the first line `stdout` delivers, waiting at most `within`, and returns it with the
+/// reader (keep it: dropping it closes the pipe under the child). A child that never prints
+/// fails the test with `TimedOut` instead of hanging it. The read runs on a thread that stays
+/// blocked until the child writes or exits, so the guard must still stop the child.
+///
+/// # Errors
+/// The read error, or `TimedOut`.
+pub fn first_line(
+    stdout: ChildStdout,
+    within: Duration,
+) -> io::Result<(String, BufReader<ChildStdout>)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let _ = tx.send(reader.read_line(&mut line).map(|_| (line, reader)));
+    });
+    rx.recv_timeout(within)
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no line within the deadline"))?
 }
 
 /// Marks every descriptor from `first` up close-on-exec in the calling process. Meant for a
@@ -109,8 +130,34 @@ fn cloexec_from_with(first: i32, range: fn(i32) -> bool) {
     }
 }
 
+/// Asks the kernel to SIGKILL this process when its parent dies, for a `pre_exec` hook. `parent`
+/// is the pid of the process that forked; if it is no longer this process's parent (it died
+/// between `fork` and here, so the signal would never come) the hook fails and the spawn with
+/// it.
+#[cfg(target_os = "linux")]
+fn die_with_parent(parent: i32) -> io::Result<()> {
+    // SAFETY: `prctl` with `PR_SET_PDEATHSIG` takes two integers; `getppid` reads a pid.
+    let (set, now) = unsafe {
+        (
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL),
+            libc::getppid(),
+        )
+    };
+    if set != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if now != parent {
+        return Err(io::Error::other("the parent died before the child started"));
+    }
+    Ok(())
+}
+
 /// Starts `command` with every descriptor from `keep_below` up close-on-exec, and returns
-/// the guarded child. Hooks the caller put on `command` with `pre_exec` run first, so one
+/// the guarded child. On Linux the child is also killed (SIGKILL) when the parent dies
+/// without running destructors, as when the harness is killed. The kernel ties that signal
+/// to the thread that forked, not the process: call this from a thread that outlives the
+/// child (a test's own thread does; a short-lived helper thread would kill the child as it
+/// ends). Hooks the caller put on `command` with `pre_exec` run first, so one
 /// that moves a descriptor into place keeps it by putting it below `keep_below`.
 ///
 /// # Errors
@@ -118,6 +165,12 @@ fn cloexec_from_with(first: i32, range: fn(i32) -> bool) {
 pub fn spawn(command: &mut Command, keep_below: i32) -> io::Result<Reaped> {
     // SAFETY: the hook makes only async-signal-safe calls (`syscall`, `sysconf`, `fcntl`).
     unsafe { command.pre_exec(cloexec_hook(keep_below)) };
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: the hook makes only async-signal-safe calls (`prctl`, `getppid`).
+        let parent = unsafe { libc::getpid() };
+        unsafe { command.pre_exec(move || die_with_parent(parent)) };
+    }
     command.spawn().map(Reaped)
 }
 
@@ -232,5 +285,20 @@ mod tests {
             libc::close(below);
             libc::close(above);
         }
+    }
+
+    /// Catches a hook that accepts a parent that is not the real one (the "parent died before
+    /// the child started" race would then leave an unguarded child): run in the test process,
+    /// a wrong parent pid is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_death_signal_hook_refuses_a_parent_that_is_gone() {
+        // SAFETY: reads this process's own parent pid.
+        let real = unsafe { libc::getppid() };
+        let refused = die_with_parent(real + 1);
+        assert!(refused.is_err());
+        // Clear the signal this call set on the test thread: it must not outlive the check.
+        // SAFETY: `prctl` with `PR_SET_PDEATHSIG` takes two integers.
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0) };
     }
 }

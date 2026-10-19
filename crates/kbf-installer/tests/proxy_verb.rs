@@ -169,16 +169,17 @@ fn start_with(path: &Path, listener: &TcpListener, stderr: Stdio) -> Reaped {
 /// a launcher that blocked them.
 fn start_masked(path: &Path, listener: &TcpListener, stderr: Stdio, block_term: bool) -> Reaped {
     let fd = listener.as_raw_fd();
-    let mut command = Command::new(BIN);
+    // The markers are set by a shell that then execs the verb (same pid), so nothing between
+    // `fork` and `exec` here takes an environment or allocator lock.
+    let mut command = Command::new("sh");
     command
+        .args(["-c", r#"LISTEN_PID=$$ LISTEN_FDS=1 exec "$0" "$@""#, BIN])
         .args(["proxy", "--config"])
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
-    // SAFETY: only async-signal-safe calls (`sigprocmask` family included) and `setenv`, which is safe here: the child is a
-    // fresh fork of a test thread that holds no environment lock, and nothing else in this
-    // file forks with a hook.
+    // SAFETY: only async-signal-safe calls (`sigprocmask` family, `fcntl`, `dup2`).
     unsafe {
         command.pre_exec(move || {
             if block_term {
@@ -193,18 +194,6 @@ fn start_masked(path: &Path, listener: &TcpListener, stderr: Stdio, block_term: 
             } else if libc::dup2(fd, 3) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let mut digits = [0_u8; 12];
-            let mut at = digits.len() - 1;
-            let mut pid = libc::getpid();
-            while pid > 0 {
-                at -= 1;
-                digits[at] = b'0' + (pid % 10) as u8;
-                pid /= 10;
-            }
-            // Through `environ`, not `Command::env`: std passes its own copy of the
-            // environment to `exec` as soon as one variable is set on the command.
-            libc::setenv(c"LISTEN_PID".as_ptr(), digits[at..].as_ptr().cast(), 1);
-            libc::setenv(c"LISTEN_FDS".as_ptr(), c"1".as_ptr(), 1);
             Ok(())
         });
     }

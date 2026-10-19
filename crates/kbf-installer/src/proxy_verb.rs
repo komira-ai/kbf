@@ -207,6 +207,15 @@ struct Stop {
 }
 
 impl Stop {
+    /// The stop the verb runs with: the bound is [`STOP_BOUND`] and the exit is the process's.
+    fn production() -> Arc<Self> {
+        Arc::new(Self {
+            seen: AtomicBool::new(false),
+            bound: STOP_BOUND,
+            exit: std::process::exit,
+        })
+    }
+
     /// A stop signal arrived. `drain` asks the proxy to stop; it runs for the first signal
     /// only. The thread that enforces the bound is returned for a test to join.
     fn signalled(self: &Arc<Self>, drain: impl FnOnce()) -> JoinHandle<()> {
@@ -255,11 +264,7 @@ fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
             signal(SignalKind::interrupt()),
         )
     });
-    let stop = Arc::new(Stop {
-        seen: AtomicBool::new(false),
-        bound: STOP_BOUND,
-        exit: std::process::exit,
-    });
+    let stop = Stop::production();
     for mut signals in [term?, int?] {
         let (handle, stop) = (handle.clone(), Arc::clone(&stop));
         runtime.spawn(async move {
