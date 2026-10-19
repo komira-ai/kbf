@@ -187,3 +187,106 @@ async fn operator_calls_with_no_active_child_are_503() {
     );
     assert!(seen(&la).is_empty() && seen(&lb).is_empty());
 }
+
+/// A child whose `/metrics` answers `status` with `body`, `size` bytes of it when `size` is
+/// set; or never answers when `silent`.
+fn metrics_child(status: u16, body: &'static str, size: usize, silent: bool) -> Script {
+    script(move |mut call| async move {
+        read_all(&mut call.body).await;
+        if silent {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            return;
+        }
+        let data = if size > 0 {
+            Bytes::from(vec![b'x'; size])
+        } else {
+            Bytes::from_static(body.as_bytes())
+        };
+        let response = http::Response::builder()
+            .status(status)
+            .header("content-type", "text/plain; version=0.0.4")
+            .body(())
+            .expect("a response");
+        if let Ok(mut send) = call.respond.send_response(response, false) {
+            let _ = send.send_data(data, true);
+        }
+    })
+}
+
+async fn scrape(rig: &Rig) -> String {
+    let mut client = rig.client().await;
+    let reply = client.plain("GET", "/metrics", b"").await;
+    assert_eq!(reply.status, Some(200));
+    reply.text()
+}
+
+/// `/metrics` is the proxy's series followed by the active child's, so one scrape of the
+/// public port sees both. The child is asked as an operator call: the caller's token and the
+/// proxy secret go with it.
+///
+/// Kills: the child's body not appended; the child asked without the secret; the proxy's own
+/// series lost.
+#[tokio::test(start_paused = true)]
+async fn metrics_carry_the_active_childs_series_after_the_proxys() {
+    let child = metrics_child(200, "kbf_child_series_total 7\n", 0, false);
+    let rig = Rig::start(child, tagged("b")).await;
+    let text = scrape(&rig).await;
+    let own = text.find("kbf_proxy_panics_total 0").expect("proxy series");
+    let theirs = text
+        .find("kbf_child_series_total 7\n")
+        .expect("child series");
+    assert!(own < theirs, "the proxy's series come first:\n{text}");
+    assert!(text.contains("kbf_proxy_child_metrics_failed_total 0"));
+    let asked = rig.a.state.headers_of("/metrics");
+    assert_eq!(asked.len(), 1);
+    assert_eq!(
+        asked[0].get("authorization").and_then(|v| v.to_str().ok()),
+        Some(format!("Bearer {OPERATOR_TOKEN}").as_str())
+    );
+    assert!(asked[0].contains_key("x-kbf-proxy-auth"));
+}
+
+/// After a flip the new active child's series are the ones shown.
+///
+/// Kills: the metrics fetch bound to a fixed slot.
+#[tokio::test(start_paused = true)]
+async fn metrics_follow_the_active_slot() {
+    let a = metrics_child(200, "kbf_child_series_total 1\n", 0, false);
+    let b = metrics_child(200, "kbf_child_series_total 2\n", 0, false);
+    let rig = Rig::start(a, b).await;
+    rig.flip_to_b();
+    let text = scrape(&rig).await;
+    assert!(text.contains("kbf_child_series_total 2\n"), "{text}");
+    assert!(!text.contains("kbf_child_series_total 1\n"));
+}
+
+/// Whatever goes wrong with the child, the proxy's own series are served whole and the
+/// failure is counted.
+///
+/// Kills: a child failure that fails or empties the scrape; an uncounted failure.
+#[tokio::test(start_paused = true)]
+async fn a_child_that_cannot_give_metrics_leaves_the_proxys_series_and_a_count() {
+    let cases: [(&str, Script); 3] = [
+        ("an error status", metrics_child(500, "boom\n", 0, false)),
+        ("a body over 4 MiB", metrics_child(200, "", 5 << 20, false)),
+        ("no answer in 2 s", metrics_child(200, "", 0, true)),
+    ];
+    for (what, child) in cases {
+        let rig = Rig::start(child, tagged("b")).await;
+        let text = scrape(&rig).await;
+        assert!(text.contains("kbf_proxy_panics_total 0"), "{what}");
+        assert!(!text.contains("boom"), "{what}");
+        assert!(!text.contains("xxxx"), "{what}");
+        assert!(
+            text.contains("kbf_proxy_child_metrics_failed_total 1"),
+            "{what}:\n{text}"
+        );
+    }
+    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    rig.core.slots.clear_active();
+    let text = scrape(&rig).await;
+    assert!(
+        text.contains("kbf_proxy_child_metrics_failed_total 1"),
+        "no active child:\n{text}"
+    );
+}
