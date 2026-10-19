@@ -143,7 +143,11 @@ async fn serve_routes(token: Option<ApiToken>, members: Option<Arc<Members>>) ->
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let app = routes(token, members);
+    // As `serve_api` does: the handler reads the gate's `Trust`.
+    let app = routes(token, members).layer(axum::middleware::from_fn_with_state(
+        None::<Arc<kbf_server::proxy_auth::ProxySecret>>,
+        kbf_server::proxy_auth::gate_requests,
+    ));
     tokio::spawn(async move {
         let service = app.into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, service).await.expect("serve");

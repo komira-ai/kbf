@@ -15,6 +15,9 @@ mod handover;
 #[path = "frontend/membership_tls.rs"]
 mod membership_tls;
 
+#[path = "frontend/proxy_auth.rs"]
+mod proxy_auth;
+
 use std::future::pending;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -722,7 +725,7 @@ async fn the_storage_check_asks_the_owners_once_the_frontend_routes_by_the_map()
 /// `postgres://` URL holds a password): it is refused when the flags are read, with the
 /// fixed text, before anything is bound.
 #[test]
-fn a_state_store_that_is_not_sqlite_is_refused() {
+fn a_state_store_that_is_neither_postgres_nor_sqlite_or_holds_a_password_is_refused() {
     for value in [
         "postgres://user:hunter2@db.example/kbf",
         "file:///var/lib/kbf",
@@ -736,7 +739,9 @@ fn a_state_store_that_is_not_sqlite_is_refused() {
         let said = refused.to_string();
         assert!(said.contains("--state-store: "), "{said}");
         assert!(
-            said.contains("only sqlite:///") || said.contains("needs an absolute file path"),
+            said.contains("only postgres:///")
+                || said.contains("needs an absolute file path")
+                || said.contains("must carry no password"),
             "{said}"
         );
         assert!(!said.contains("hunter2"), "{said}");

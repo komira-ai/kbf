@@ -29,6 +29,7 @@ kbf-enroll                0      0
 kbf-enroll-registry       0      0
 kbf-estimator             -      -
 kbf-front                35      7
+kbf-gate                  0      0
 kbf-guest                15      6
 kbf-history               0      0
 kbf-host                  0      0
@@ -57,7 +58,7 @@ kbf-server                0      0
 kbf-signer                0      0
 kbf-sim                   6      3
 kbf-sim-cell              4     12
-kbf-state                 2     13
+kbf-state                 2      1
 kbf-storage               0      0
 kbf-store                 0      0
 kbf-testkit               0      0

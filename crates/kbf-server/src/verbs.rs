@@ -6,11 +6,10 @@
 //! through the [`kbf_state::Store`] trait and assumes no single writer: any frontend over the
 //! store answers from the same rows.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::http::header::CACHE_CONTROL;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
@@ -20,6 +19,7 @@ use kbf_types::operator_api::{DeniedEntry, DeniedList};
 
 use crate::api::{error, gate, json, no_members};
 use crate::members::{Members, MembershipError};
+use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 
 /// The path of the route: `crate::api::DENIED`, spelled out because the drift guard
@@ -66,10 +66,10 @@ fn store_failure(e: &MembershipError) -> (StatusCode, &'static str) {
 
 async fn list_denied(
     State(verbs): State<Arc<Verbs>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    peer: Caller,
     headers: HeaderMap,
 ) -> Response {
-    if let Err((code, why)) = gate(verbs.token.as_ref(), peer, &headers) {
+    if let Err((code, why)) = gate(verbs.token.as_ref(), &peer, &headers) {
         return no_store(error(code, &why));
     }
     let Some(members) = verbs.members.clone() else {

@@ -28,9 +28,9 @@ struct LostAck {
     armed: AtomicBool,
     down: AtomicBool,
     fenced: AtomicBool,
-    /// Applied just before the next transaction that names an `op/` row: a write landing
-    /// between the farm's look at the store and its own write.
-    before_submit: std::sync::Mutex<Option<Txn>>,
+    /// One applied just before each transaction that names an `op/` row, oldest first: a
+    /// write landing between the farm's look at the store and its own write.
+    before_submit: std::sync::Mutex<std::collections::VecDeque<Txn>>,
 }
 
 impl LostAck {
@@ -40,7 +40,7 @@ impl LostAck {
             armed: AtomicBool::new(false),
             down: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
-            before_submit: std::sync::Mutex::new(None),
+            before_submit: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -61,7 +61,7 @@ impl Store for LostAck {
             kbf_state::Op::Put { key, .. } => key.starts_with("op/"),
             _ => false,
         });
-        if submits && let Some(landing) = self.before_submit.lock().expect("lock").take() {
+        if submits && let Some(landing) = self.before_submit.lock().expect("lock").pop_front() {
             self.inner.txn(landing)?.expect("the landing write");
         }
         let applied = self.inner.apply_batch(batch)?;
@@ -437,7 +437,7 @@ fn a_pin_that_lands_after_the_look_is_not_written_over() {
             5_u64.to_be_bytes(),
             Cond::Absent,
         );
-    *store.before_submit.lock().expect("lock") = Some(landing);
+    store.before_submit.lock().expect("lock").push_back(landing);
 
     assert!(submit(&farm, 1).is_ok());
 
@@ -609,4 +609,88 @@ fn a_twin_in_memory_joins_without_a_write_and_a_fenced_farm_refuses_for_good() {
         Code::FailedPrecondition
     );
     assert_eq!(rows(&store, "op/"), 1);
+}
+
+/// Catches: a submit whose looks are not exactly `LOOKS` (3): one that gives up after the
+/// first conflict (a busy store refuses work it could take), or one that looks without
+/// end or once too often. Each of `landed` writers takes the id this submit tried just
+/// before its write, so every try conflicts and the next takes the id after. Three
+/// conflicts and the fourth try is taken, under the fourth id; four conflicts and the
+/// submit is refused with the conflict, having written nothing of its own.
+#[test]
+fn a_submit_takes_three_conflicts_and_is_refused_at_the_fourth() {
+    for (landed, taken) in [(3_u64, true), (4, false)] {
+        let store = LostAck::new();
+        let durable = durable_over(&store);
+        let other = durable_over(&store);
+        for id in 0..landed {
+            let tag = 10 + u8::try_from(id).expect("a small id");
+            let landing = other
+                .submission(OperationId(id), &request(tag), &subject())
+                .expect("encode");
+            store.before_submit.lock().expect("lock").push_back(landing);
+        }
+
+        let submitted = durable.submit(OperationId(0), &request(1), &subject());
+
+        if taken {
+            assert!(
+                matches!(submitted, Ok(Submitted::Queued(OperationId(3)))),
+                "{landed} conflicts: {submitted:?}"
+            );
+            assert_eq!(rows(&store, "inflight/"), 1);
+        } else {
+            assert!(
+                matches!(submitted, Err(StateError::Conflict(_))),
+                "{landed} conflicts: {submitted:?}"
+            );
+            assert_eq!(rows(&store, "inflight/"), 0, "a refused submit pinned");
+        }
+        assert_eq!(rows(&store, "op/"), landed as usize + usize::from(taken));
+    }
+}
+
+/// Catches: a request that joins an operation the scheduler finished while the store still
+/// holds its rows (the finish is held back): it would take the finished operation up
+/// again and run the action twice. The scheduler finishes the queued operation (a
+/// committed refusal, no store write), the rows stay, and the request is refused
+/// UNAVAILABLE with nothing queued and no waiter attached. Once the rows go it queues a
+/// fresh operation. This runs in the crate's own test binary, which also covers the rest
+/// of `queue`, so that function's lines are all covered by one copy of it.
+#[test]
+fn a_request_for_an_operation_the_scheduler_finished_is_refused_until_the_rows_go() {
+    let store = LostAck::new();
+    let farm = farm_over(&store);
+    assert!(submit(&farm, 1).is_ok());
+    let refusal = kbf_types::ControlRecord::Refusal(kbf_types::RefusalRecord {
+        operation: OperationId(0),
+        reason: "no worker".to_owned(),
+    });
+    let input = kbf_sched::Input::new(
+        kbf_types::FarmTime::from_millis(0),
+        kbf_sched::Event::Committed(refusal),
+    );
+    let effects = kbf_types::StateMachine::apply(&mut farm.lock().sched, input);
+    assert_eq!(effects.len(), 1, "the refusal was not taken");
+    assert!(unfinished(&farm).is_empty());
+    assert_eq!((rows(&store, "op/"), rows(&store, "inflight/")), (1, 1));
+
+    let refused = submit(&farm, 1);
+
+    assert_eq!(refused.map(|_| ()).unwrap_err().code(), Code::Unavailable);
+    assert!(
+        unfinished(&farm).is_empty(),
+        "the finished operation came back"
+    );
+    let waiters = farm.lock().sched.waiters(OperationId(0)).map(<[_]>::len);
+    assert_eq!(waiters, Some(1), "a waiter joined a finished operation");
+    assert_eq!(rows(&store, "op/"), 1);
+
+    let gone = Txn::new()
+        .delete("op/0000000000000000", Cond::Any)
+        .delete("queue/0000000000000000", Cond::Any)
+        .delete("subject/0000000000000000", Cond::Any);
+    store.txn(gone).expect("store").expect("delete");
+    assert!(submit(&farm, 1).is_ok(), "the retry after the rows went");
+    assert_eq!(unfinished(&farm), [OperationId(1)]);
 }

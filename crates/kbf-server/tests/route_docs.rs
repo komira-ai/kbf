@@ -251,22 +251,23 @@ fn expand_verbs(routes: Vec<Route>, verbs: &[String]) -> Vec<Route> {
         .collect()
 }
 
-/// The custom-method route of the object-store API: `POST /v1/object-stores/connections/{}`
-/// serves only `:verify` (`object_store/api.rs`), and the documents name it `...{name}:verify`.
-const PROBE_ROUTE: &str = "/v1/object-stores/connections/{}";
+/// The one `POST` of `/v1/object-stores/connections/{target}` is the probe `{name}:verify`: the
+/// router captures the whole segment and the handler splits the verb off, so the documents name
+/// it with the `:verify`.
+const VERIFY_ROUTE: &str = "/v1/object-stores/connections/{}";
 
-/// Replaces the `POST` of [`PROBE_ROUTE`] by `POST` of `PROBE_ROUTE:verify`.
-fn expand_probe(routes: Vec<Route>) -> Vec<Route> {
-    let post = ("POST".to_string(), PROBE_ROUTE.to_string());
+/// Renames the `POST` of `VERIFY_ROUTE` to `POST VERIFY_ROUTE:verify`.
+fn name_verify(routes: Vec<Route>) -> Vec<Route> {
+    let post = ("POST".to_string(), VERIFY_ROUTE.to_string());
     assert!(
         routes.contains(&post),
-        "the router has no `POST {PROBE_ROUTE}` any more: update this guard"
+        "the router has no `POST {VERIFY_ROUTE}` any more: update this guard"
     );
     routes
         .into_iter()
         .map(|r| {
             if r == post {
-                ("POST".to_string(), format!("{PROBE_ROUTE}:verify"))
+                ("POST".to_string(), format!("{VERIFY_ROUTE}:verify"))
             } else {
                 r
             }
@@ -293,7 +294,7 @@ fn server_routes() -> Vec<Route> {
         ["cordon", "drain", "uncordon"],
         "write_request accepts other verbs: the guard and the documents need a row each"
     );
-    let mut routes = expand_probe(expand_verbs(routes, &verbs));
+    let mut routes = name_verify(expand_verbs(routes, &verbs));
     routes.sort();
     routes.dedup();
     routes
@@ -435,7 +436,7 @@ fn the_doc_reader_keeps_verbs_and_strips_queries_and_punctuation() {
 
 #[test]
 fn the_probe_route_needs_its_verify_row() {
-    let code = expand_probe(code_routes(
+    let code = name_verify(code_routes(
         r#"Router::new().route("/v1/object-stores/connections/{target}", get(a).post(b))"#,
     ));
     assert_eq!(

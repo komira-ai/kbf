@@ -9,7 +9,7 @@ own address, given with `--api-listen`; without the flag there is no API. The st
 line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in clear
 text (h2c, with prior knowledge); every rule below holds for both.
 
-Reads answer anyone who reaches the address: bind it where only operators do. The
+Reads answer anyone who reaches the address: bind it where only operators do. (Behind the farm's proxy, `--proxy-auth-file`, only a loopback peer reaches it at all: [Who may write](#behind-the-farms-proxy).) The
 exceptions are the [enrollment routes](#v1enrolltokens-and-v1enrollnodes), which pass every
 gate of a write even to be read, and the build pages, [`GET /v1/invocations/{id}`](#get-v1invocationsid-and-below)
 and below, and [`GET /v1/blobs`](#get-v1blobsdigest), which run the REAPI policy and are
@@ -36,11 +36,13 @@ it must come from an operator. Where a request comes from does not show that:
   without a preflight, if the API accepts a "simple" request (`text/plain` or a form
   body, or no body).
 
-So a write must pass every one of these gates, in this order:
+So a write must pass every one of these gates, in this order (the loopback gate is first
+because the token must not cross a network, and it is not an identity: it never lets a
+write through without the token):
 
 | Gate | Refused with |
 |---|---|
-| the peer is loopback, so the token never crosses a network in clear | `403` |
+| the peer is loopback, so the token never crosses a network in clear; with `--proxy-auth-file`, the request must also present the proxy's secret (see [Behind the farm's proxy](#behind-the-farms-proxy)) | `403` |
 | the request has no `Origin` header (browsers send one with a cross-origin POST) | `403` |
 | the server was started with `--api-token-file` (without it, writes are off) | `403` |
 | `Authorization: Bearer <token>` with the file's token (the SHA-256 digests of both are compared in constant time, so neither the token's bytes nor its length show through timing) | `401`, with `WWW-Authenticate: Bearer` |
@@ -67,17 +69,68 @@ server's host that terminates TLS (`tailscale serve`, nginx). The proxy is what 
 the loopback gate pass, so the token is what stands between the network and the
 writes: forward the `Authorization` header unchanged, and expose only what the
 operators' network should reach. A proxy that adds an `Origin` header to every
-request turns writes off.
+request turns writes off. A server started without `--proxy-auth-file` cannot tell such
+a proxy from a local process: both are loopback peers. The farm's own proxy (below)
+is told apart by a secret.
+
+### Behind the farm's proxy
+
+`--proxy-auth-file <path>` says the server sits behind the farm's TLS-terminating proxy
+(`docs/design/frontend-proxy.md`, section 3). The file holds a per-boot secret of exactly
+32 bytes, owned by the server's user with mode `0600` or `0400` (the token file's checks);
+the server refuses to start otherwise. It is read at start, and never taken from the
+command line or the environment. The proxy presents the 32 bytes as 64 lower-case hex
+digits in `x-kbf-proxy-auth`. Then, on the operator API, the worker listener and the REAPI
+listener:
+
+- A request from an address that is not loopback is refused before anything reads it
+  (`403` on this API; `UNAUTHENTICATED` on gRPC).
+- A loopback request that does not present the secret, or presents a wrong one (compared in
+  constant time), is a local caller: its `x-kbf-*` headers mean nothing. On this API it may
+  read, as before, but **a write is refused `403` even with the token**: a write must come
+  through the proxy.
+- A loopback request that presents the secret is the proxy's. A write still needs every
+  other gate, the token included: the secret says who forwarded the request, not that the
+  caller may write.
+- Every `x-kbf-*` header is removed from every request, whatever the result, so nothing
+  past this check can read one. The proxy sets `x-kbf-node-id` and `x-kbf-role` for a call
+  whose client certificate it verified; the worker listener takes those (and no TLS flag)
+  in place of a certificate: the role table, the `Hello.node_id` binding, the blob calls
+  and `Membership`'s role check use them. A `Hello` whose node id is not the proxy's
+  `x-kbf-node-id` is refused `PERMISSION_DENIED`. A `Membership` registration
+  or heartbeat has no certificate names behind the proxy: the one name is the proxied node
+  id, so the host of its instance id and its address must be that name (up to ASCII case; an IP
+  address is refused). The proxied role must be `storage`. A `serial` or `spki-sha256` deny entry cannot name a proxied
+  caller, a `node` entry can: revoke by node name while behind the proxy, or have the
+  proxy refuse the certificate.
+
+What the flag does not do, and what the proxy must do:
+
+- The storage listener (`kbf storage`, and the in-process one of all-in-one) is not behind
+  the proxy: it keeps its own mutual TLS and its own admission.
+- `--reapi-auth-policy mtls` finds no certificate on a proxied REAPI call and refuses every
+  call; use another policy behind the proxy until the proxy forwards the identity to it.
+- With the flag, `/metrics` and `/healthz` answer a loopback peer only, and a local `curl`
+  write is refused (see above).
+- The server cannot tell the proxy's `x-kbf-node-id` from a client's if the proxy forwards
+  a client's headers: the proxy must remove every client-supplied `x-kbf-*` header before
+  it adds its own. A call from a Unix-socket peer has no address and is refused. The
+  secret file must be owned by the user the server runs as, so the proxy and the server run
+  as one user.
+
+Without the flag, nothing changes: the headers do nothing (they are removed all the same),
+and the gates are the ones in the table.
 
 ## `GET /v1/nodes`
 
 The server that answers, then every node registered since it started, in node-id
-order, with its software and where it is in placement:
+order, with the protocol version it speaks, its software and where it is in
+placement, and, after the list, the oldest protocol version among them:
 
 ```json
 { "server": { "version": "0.1.0+0123456789ab", "commit": "0123456789ab" },
   "nodes": [
-  { "node_id": "mac-1", "connected": true, "software": {
+  { "node_id": "mac-1", "connected": true, "protocol": 1, "software": {
       "os_name": "macOS", "os_version": "15.1", "os_build": "24B83", "kernel": "",
       "daemon_version": "0.1.0", "xcode_builds": ["15F31d", "16C5032a"],
       "xcodes": [
@@ -95,9 +148,10 @@ order, with its software and where it is in placement:
       "Xcode 16B40 (/Applications/Xcode_16.1.app) installed but not ready: /usr/bin/xcodebuild -license check exited with exit status: 69: You have not agreed to the Xcode license agreements.; fix: sudo /Applications/Xcode_16.1.app/Contents/Developer/usr/bin/xcodebuild -license accept" ],
     "placement": { "state": "draining", "deadline_unix_ms": 1791371800000,
                    "leases": ["117399224320012061.42"] } },
-  { "node_id": "old-1", "connected": false, "software": null, "needs_attention": [],
-    "placement": { "state": "serving" } }
-] }
+  { "node_id": "old-1", "connected": false, "protocol": null, "software": null,
+    "needs_attention": [], "placement": { "state": "serving" } }
+],
+  "oldest_protocol": 1, "protocol_unknown": 1 }
 ```
 
 | Field | Meaning |
@@ -106,6 +160,9 @@ order, with its software and where it is in placement:
 | `server.commit` | the commit it was built from, 12 hex digits (`git rev-parse --short=12`), or `unknown` for a build without a git checkout |
 | `node_id` | the id its daemon registered with |
 | `connected` | whether its newest stream is still open |
+| `protocol` | the `kbf.worker.v1` version the `Hello` that opened its newest stream named, which the server answered in `Welcome` ([worker-protocol.md](design/worker-protocol.md)); `null` if that `Hello` named none (the field is 0, which is not a version). A `Hello` resent on the stream does not change it, and a node that returns on another version shows the new one. It stays after the stream closes: it is the version the node last spoke |
+| `oldest_protocol` | the least `protocol` among the listed nodes whose `protocol` is not `null`, connected or not (a node whose stream closed may return on the version it last spoke); `null` if no listed node names one. Nodes that name none are not in it |
+| `protocol_unknown` | how many listed nodes have a `null` `protocol`. They are never counted in `oldest_protocol`, so `oldest_protocol` says "every node but these speaks at least this": a reader that needs every node reads it with `protocol_unknown` equal to 0 |
 | `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a daemon that predates it. An empty string or list is a value the node could not read |
 | `software.received_at_unix_ms` | when the server received it, by the server's clock |
 | `software.xcode_builds` | the Xcode builds actions can use on it: only these route work |
@@ -115,6 +172,14 @@ order, with its software and where it is in placement:
 | `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. An Xcode `not_surveyed` keeps the item the same app had in the node's previous status (as when a restarted daemon sends its first status), until a survey reports it; one with no previous item has none. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when a status reports it gone (its Xcode ready, changed or removed); a status that repeats an item, or lists its Xcode `not_surveyed`, logs nothing. An item is the same while its Xcode's app, build, state and fix are, so a reason that changes alone is shown here but not logged again. The previous status is kept in the server's memory: after a server restart, each item is logged again when its node reports it; kbf has no alert delivery yet (issue #189) |
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
+
+The list is the nodes this server process has seen, so it says nothing of a daemon that has
+not connected to it yet: a server that has just started, or that took over from another
+(the frontend swap, [design/frontend-proxy.md](design/frontend-proxy.md)), lists only those
+that have registered since. `oldest_protocol` and `protocol_unknown` describe that list and
+no more. The check that a release may stop accepting the oldest version
+([design/frontend-proxy.md](design/frontend-proxy.md) section 9, rule R1) reads them; it is
+not made by this server.
 
 ## `GET /v1/members`
 
@@ -127,10 +192,11 @@ frontend, a daemon opens a worker stream.
 ```json
 { "generation": 7,
   "members": [
-    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1 },
-    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1 },
-    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2 }
-] }
+    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1, "protocol": 1 },
+    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1, "protocol": 2 },
+    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2, "protocol": null }
+],
+  "oldest_protocol": 1, "protocol_unknown": 1 }
 ```
 
 | Field | Meaning |
@@ -140,11 +206,21 @@ frontend, a daemon opens a worker stream.
 | `addr` | the address callers dial |
 | `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes) or `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) |
 | `weight` | its share of the digests relative to the others |
+| `protocol` | the protocol version in the `RegisterRequest` that wrote the member's row (a heartbeat and a state change keep it; a new registration of the member replaces it). `null` when the row names none, as a row written before this field existed, and for a `down` member: its row expires with its heartbeats, and the version went with it |
+| `oldest_protocol` | the least `protocol` among the members whose `protocol` is not `null`; `null` if none is |
+| `protocol_unknown` | how many members have a `null` `protocol`. Never counted in `oldest_protocol`: read the two together, as for [`GET /v1/nodes`](#get-v1nodes) |
+
+The registration is judged against the map's floor once, when it is made
+([design/frontend-proxy.md](design/frontend-proxy.md) section 9); `protocol` is what it
+named, and nothing judges it again.
 
 A registered member is `joining` until something promotes it with `Members::set_state`;
 the server does not promote on its own yet, so a script that waits for `active` waits
 for that. A server without a state store keeps no members and answers `404`; a state
-store that cannot be read answers `503`.
+store that cannot be read answers `503`. The view reads the map and then the member rows
+(for `protocol`), so a stored map or a stored member row that does not decode answers
+`500` for the whole view, not a list without that member's version: the store is up and
+its content is wrong, as it is for the other readers of those rows.
 
 ## `POST /v1/nodes/{node}:cordon`, `:drain`, `:uncordon`
 
@@ -270,7 +346,7 @@ frontend that is not the newest included. `404` on a server without a state stor
 space): `200` with the same answer, `404` if it is not listed, `400` with no `entry` or one
 that is not an entry.
 
-Both need a token, a loopback peer, no `Origin` and `Content-Type: application/json` (a
+Both need a token, a loopback peer (one that presents the proxy's secret, with `--proxy-auth-file`), no `Origin` and `Content-Type: application/json` (a
 `DELETE` sends the header and no body), as every write does ([Who may
 write](#who-may-write)); `404` on a server without a state store; `503` when the state
 store cannot be written. A `503` that comes after the row was written leaves the row, and
@@ -366,7 +442,7 @@ store, so a frontend that has no enrollment (until the enroll service lands, eve
 frontend) answers every one of these routes with `404` once the call passes the gates.
 
 **Every route here, a GET included, passes every gate of [Who may write](#who-may-write):**
-a loopback peer, no `Origin` header, the bearer token, and `Content-Type: application/json`
+a loopback peer (one that presents the proxy's secret, with `--proxy-auth-file`), no `Origin` header, the bearer token, and `Content-Type: application/json`
 (send it on a GET and a DELETE too, with no body). The list of tokens and nodes is the farm's
 door, so unlike `GET /v1/nodes` it is not open to whoever reaches the address. A refused
 call changes nothing. Every answer carries `Cache-Control: no-store`.
@@ -510,6 +586,9 @@ and a lost race is `409 conflict`, never a lost write.
 | `DELETE /v1/object-stores/bindings/{role}` | `{generation}`; `409 in_use` once a node has applied it |
 | `GET /v1/object-stores` | the desired state and the nodes' convergence |
 | `GET /v1/object-stores/audit?limit=N` | the newest `N` audit rows (default 50, at most 500) |
+
+The design ([object-store-registration](design/object-store-registration.md)) has the rotation
+runbook; every verb of the API is in [the verbs table](design/operator-verbs.md).
 
 **Names.** `{name}` is `[a-z0-9][a-z0-9_-]{0,62}`, else `400 bad_name`: it becomes a file name
 and a URL segment, so `/`, `.`, `:` and NUL never reach the file system. `{role}` is `cold`.
@@ -1296,7 +1375,7 @@ release and their build attestations, kept as uploaded. Mounted by `--releases-d
   `.attestation` (its build attestation bundle). Anything else is `400`; no segment is ever joined
   into a path as it arrived.
 - `PUT` takes the file as the body, with the write gates of the section "Who may write" except
-  the JSON content type (loopback peer, no `Origin`, the bearer token). A tarball is at most
+  the JSON content type (loopback peer, and the proxy's secret with `--proxy-auth-file`, no `Origin`, the bearer token). A tarball is at most
   512 MiB (`413` past it), a bundle at most 256 KiB; an empty body is `400`. The body is written to
   a `.partial` file, synced, and renamed into place, so an interrupted upload leaves nothing
   visible.

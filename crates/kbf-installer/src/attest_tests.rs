@@ -7,7 +7,7 @@ use super::*;
 use crate::fixtures::{COMMIT, FakeRunner, me, ran, trusted_host};
 use crate::layout::Platform;
 
-fn verifier(refs: &[&str]) -> Verifier {
+fn verifier(refs: &[&str]) -> GhCheck {
     let host = Layout::new(Root::new("/").expect("absolute"), Platform::Linux);
     let mut settings = Settings::defaults(&host);
     settings.run_as = me();
@@ -16,14 +16,14 @@ fn verifier(refs: &[&str]) -> Verifier {
         .map(|r| SourceRef::new(r).expect("ref"))
         .collect();
     settings.timeout = Duration::from_secs(9);
-    Verifier::pinned(&host, &settings)
+    GhCheck::pinned(&host, &settings)
 }
 
 fn commit() -> CommitId {
     CommitId::new(COMMIT).expect("commit")
 }
 
-fn verify(v: &Verifier, runner: &FakeRunner) -> Result<Verified, Refusal> {
+fn verify(v: &GhCheck, runner: &FakeRunner) -> Result<Verified, Refusal> {
     let trust = trusted_host();
     let tools = Tools {
         trust: &trust,

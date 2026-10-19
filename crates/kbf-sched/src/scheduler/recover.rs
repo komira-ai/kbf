@@ -120,9 +120,19 @@ impl Scheduler {
     /// does at start: the store holds it (another writer queued it, or this one queued it
     /// and never learned the write landed), and a request for the same action joins it. The
     /// ids handed out from now on are past its id.
-    pub fn take_in(&mut self, recovered: Recovered) {
+    ///
+    /// An operation this scheduler already holds is left as it is, and `false` is
+    /// returned: the store's rows of an operation are removed when its finish is written,
+    /// which can be later than the scheduler finishing it, so a row that outlives the
+    /// scheduler's own copy is no news. Taking it up again would put a finished
+    /// operation back in the queue (a second run) over the answer held for it.
+    pub fn take_in(&mut self, recovered: Recovered) -> bool {
         self.skip_to(OperationId(recovered.operation.0 + 1));
+        if self.ops.contains_key(&recovered.operation) {
+            return false;
+        }
         self.take_up(recovered);
+        true
     }
 
     /// Hands out ids from `next` on, if that is past the next one: the store's counter
