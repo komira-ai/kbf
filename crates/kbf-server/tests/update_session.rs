@@ -18,6 +18,7 @@ use kbf_objstore::MemoryStore;
 use kbf_proto::update::{UpdateOrder, UpdateStatus};
 use kbf_proto::worker::{ServerMessage, server_message};
 use kbf_server::farm::{Farm, Reported, StreamId};
+use kbf_server::members::{Members, MembershipConfig};
 use kbf_server::update::{Controller, HostPhase, OrderId, Policy, Release, Rows, Transport, ports};
 use kbf_state::Store;
 use kbf_types::{FarmTime, Resources, WorkerId};
@@ -171,8 +172,16 @@ fn hooked_store() -> (Arc<hooked::Hooked>, Arc<dyn Store>) {
     (hooked, store)
 }
 
+fn members(store: &Arc<dyn Store>) -> Arc<Members> {
+    Arc::new(Members::new(Arc::clone(store), MembershipConfig::default()))
+}
+
 fn controller(farm: &Arc<Farm>, store: &Arc<dyn Store>) -> Controller {
-    let (transport, source) = ports(Arc::clone(farm), Rows::new(Arc::clone(store)));
+    let (transport, source) = ports(
+        Arc::clone(farm),
+        Rows::new(Arc::clone(store)),
+        members(store),
+    );
     Controller::new(
         Arc::clone(store),
         farm.lease_epoch(),
@@ -301,7 +310,11 @@ fn an_order_of_another_epoch_is_refused_and_not_sent() {
     let farm = farm();
     let store = store();
     let mut node = Node::new(&farm, "mac-1", "fedcba987654");
-    let (mut transport, _) = ports(Arc::clone(&farm), Rows::new(store));
+    let (mut transport, _) = ports(
+        Arc::clone(&farm),
+        Rows::new(Arc::clone(&store)),
+        members(&store),
+    );
     let epoch = farm.lease_epoch();
     let release = Release::new(A);
     for wrong in [epoch + 1, epoch - 1] {
@@ -335,7 +348,11 @@ fn a_replayed_order_is_dropped_at_the_node() {
     let farm = farm();
     let store = store();
     let mut node = Node::new(&farm, "mac-1", "fedcba987654");
-    let (mut transport, _) = ports(Arc::clone(&farm), Rows::new(store));
+    let (mut transport, _) = ports(
+        Arc::clone(&farm),
+        Rows::new(Arc::clone(&store)),
+        members(&store),
+    );
     let order = OrderId::new(farm.lease_epoch(), 9);
     for _ in 0..2 {
         transport
@@ -374,7 +391,7 @@ fn facts_come_from_the_current_stream_only() {
     let old = Node::new(&farm, "mac-1", &A[..12]);
     helper_says(&old.dir, "confirmed", A, "", 5);
     old.report();
-    let (_, mut source) = ports(Arc::clone(&farm), rows);
+    let (_, mut source) = ports(Arc::clone(&farm), rows, members(&store));
     let look = |source: &mut kbf_server::update::FarmFacts| {
         use kbf_server::update::FactsSource as _;
         source.look(FarmTime::from_millis(0)).expect("a look").hosts
@@ -420,7 +437,7 @@ fn the_ports_read_every_state_and_refuse_the_marks() {
     let farm = farm();
     let store = store();
     let rows = Rows::new(Arc::clone(&store));
-    let (mut transport, mut source) = ports(Arc::clone(&farm), rows);
+    let (mut transport, mut source) = ports(Arc::clone(&farm), rows, members(&store));
     let (mac, mac_rx) = register(&farm, "mac", "macos");
     let (_linux, _linux_rx) = register(&farm, "linux", "linux");
     let (_bsd, _bsd_rx) = register(&farm, "bsd", "freebsd");
@@ -532,7 +549,11 @@ fn a_confirmation_keeps_its_id_for_its_activation() {
     let farm = farm();
     let store = store();
     let mut node = Node::new(&farm, "mac-1", "fedcba987654");
-    let (mut transport, _) = ports(Arc::clone(&farm), Rows::new(store));
+    let (mut transport, _) = ports(
+        Arc::clone(&farm),
+        Rows::new(Arc::clone(&store)),
+        members(&store),
+    );
     let epoch = farm.lease_epoch();
     let release = Release::new(A);
     let mut ids = Vec::new();
@@ -571,7 +592,7 @@ fn an_old_acknowledgement_is_not_the_answer_to_a_new_order_of_the_same_number() 
     let rows = Rows::new(Arc::clone(&store));
     rows.offer(&Release::new(A), farm.wall_now())
         .expect("a run");
-    let (mut transport, mut source) = ports(Arc::clone(&farm), rows);
+    let (mut transport, mut source) = ports(Arc::clone(&farm), rows, members(&store));
     let (stream, _inbound) = register(&farm, "mac-1", "macos");
     let id = WorkerId::new("mac-1");
     let epoch = farm.lease_epoch();
@@ -612,7 +633,11 @@ fn an_old_acknowledgement_is_not_the_answer_to_a_new_order_of_the_same_number() 
     );
     // The same order given again after the host acked it counts as well (a controller
     // that restarted gives its orders again): the baseline is the id itself, the release is in.
-    let (mut again, mut source) = ports(Arc::clone(&farm), Rows::new(store));
+    let (mut again, mut source) = ports(
+        Arc::clone(&farm),
+        Rows::new(Arc::clone(&store)),
+        members(&store),
+    );
     farm.update_status(&id, stream, status(5, A, State::Confirmed));
     again
         .activate(&id, activation, &Release::new(A))
@@ -628,7 +653,11 @@ fn a_look_that_cannot_read_the_run_is_an_error() {
     use kbf_server::update::FactsSource as _;
     let farm = farm();
     let (hooked, store) = hooked_store();
-    let (_, mut source) = ports(Arc::clone(&farm), Rows::new(store));
+    let (_, mut source) = ports(
+        Arc::clone(&farm),
+        Rows::new(Arc::clone(&store)),
+        members(&store),
+    );
     hooked.fail_gets.store(1, Ordering::SeqCst);
     let failed = source
         .look(FarmTime::from_millis(0))
@@ -662,7 +691,7 @@ fn a_repeated_activation_keeps_the_record_of_its_first_sending() {
         let rows = Rows::new(Arc::clone(&store));
         rows.offer(&Release::new(A), farm.wall_now())
             .expect("a run");
-        let (mut transport, mut source) = ports(Arc::clone(&farm), rows);
+        let (mut transport, mut source) = ports(Arc::clone(&farm), rows, members(&store));
         let (stream, _inbound) = register(&farm, "mac-1", "macos");
         let id = WorkerId::new("mac-1");
         let status = |acked: u64, state: State| UpdateStatus {

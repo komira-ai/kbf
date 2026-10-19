@@ -5,13 +5,15 @@ use std::time::Duration;
 
 use super::facts::Platform;
 
-/// Every setting and limit of a node update. [`Policy::default`] is the design's defaults.
+/// Every setting and limit of a node update. [`Policy::default`] is the design's defaults, but
+/// for `auto_nodes`, which the design leaves false until two click-through runs are clean
+/// (`split-mode-updates.md` Q7) and which is true here (see the field).
 ///
 /// **The `update/policy` row** (`pull-updates.md` section 6.2) has nine fields: `auto_nodes`,
 /// `auto_frontend`, `paused`, `idle_wait`, `min_serving`, `max_hosts_out`, `mac_force_after`,
 /// `new_work_only_to_updated` and `accept_failing_builds`. The module reads `paused`,
-/// `idle_wait`, `min_serving`, `max_hosts_out` and `mac_force_after`. The other four are
-/// carried in the row and not acted on: they belong to the poller, the frontend step and the
+/// `idle_wait`, `min_serving`, `max_hosts_out` and `mac_force_after` (the runner reads
+/// `auto_nodes`). The other four are carried in the row and not acted on: they belong to the poller, the frontend step and the
 /// dispatcher. Every other field here is a limit of the node step; the row carries one only
 /// if it differs from the default, and a writer that knows only the nine leaves them at the
 /// default ([`super::Rows::set_policy`]).
@@ -21,9 +23,11 @@ use super::facts::Platform;
 /// helper or a stuck upload holds the run instead of hanging it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
-    /// Whether the node steps run by themselves when the poller finds a clean release;
-    /// false (`manual`, the default) only offers it (`split-mode-updates.md` section 6.2).
-    /// Carried; not read by this module.
+    /// Whether the controller starts hosts for the desired release. True by default, so a
+    /// policy never written starts them: the desired release is written only by an operator
+    /// (the poller only proposes), which is the click, and `paused` is the stop. False only
+    /// where an operator wrote it; hosts already in a step still finish. Read by the
+    /// frontend's runner, not by this module.
     pub auto_nodes: bool,
     /// As `auto_nodes`, for the frontend's own update. Carried; not read by this module.
     pub auto_frontend: bool,
@@ -85,7 +89,7 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            auto_nodes: false,
+            auto_nodes: true,
             auto_frontend: false,
             paused: false,
             new_work_only_to_updated: false,

@@ -7,9 +7,10 @@
 //! newest stream, with the epoch of the order id, which must be the epoch `Welcome` named
 //! ([`Farm::lease_epoch`]): an order of another epoch is refused here, not sent, because the
 //! node would refuse it. A cordon is the scheduler's own ([`Farm::place`]); an alert is a
-//! line under the target `kbf_server::attention`. A planned-down mark needs the members API
-//! of U3 (#914), which this branch does not have: both orders are refused, and no host that
-//! has a storage half is made eligible (below).
+//! line under the target `kbf_server::attention`. A planned-down mark is
+//! [`Members::plan_down`] for as long as the restart deadline of the policy, and its removal
+//! [`Members::undo_plan`], which promotes nothing that is not planned down (a member that
+//! registered again is left as it is). Neither is given by a farm that is handed over.
 //!
 //! **A handed-over farm gives no order.** Once the farm is fenced ([`Handed::handed`]: a
 //! quiesce or a stand-down) a cordon, an uncordon, an activation and a confirmation are
@@ -34,9 +35,19 @@
 //! is no longer mapped; a `CONFIRMED` that names it counts once the new one is acted on.
 //!
 //! **Facts.** A host is a registered node whose `os` is `macos` (a Mac of class
-//! `macos-<arch>`) or `linux`. A Linux host may have a storage half, which the farm cannot
-//! tell without the join of U3, so it is listed as a storage-and-daemon host that is linked to
-//! no member: the picker never starts it. What the node reports comes from its newest
+//! `macos-<arch>`) or `linux`. A Linux host is joined to its storage member by the address it
+//! advertised when it enrolled (`enroll/node/<id>`, the registry's row for the node id of its
+//! `Hello`): the member whose registered address is that text, byte for byte. One member
+//! matching makes the host a storage-and-daemon host linked to it. A node the registry
+//! knows with no advertised address has no storage half and is a daemon-only host. A node
+//! the registry does not know, an address no member registered and an address two members
+//! registered are storage-and-daemon hosts linked to no member: the picker never starts
+//! them, and [`FarmFacts::unlinked`] says why. A linked host's write counts are its
+//! member's newest fresh report: the open writes it made, and no routed write when the
+//! report was made under a map at least as new as the current one (the router keeps no
+//! count of its own; a node that reported under an older map may still be sent a write).
+//! The members' own facts, the boot counter included, are those of [`Members::look`]; the
+//! reason a marked member is not idle yet is [`FarmFacts::not_idle`]. What the node reports comes from its newest
 //! `UpdateStatus` of its current stream (a stream that replaced it has none until it sends
 //! one): the release it runs is the desired release when the 12 digits of its running commit
 //! begin the desired commit, else its own commit (none, if that is not 12 lowercase hex
@@ -48,13 +59,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_front::Handed;
-use kbf_map::MemberId;
+use kbf_map::{MemberId, MemberState};
 use kbf_proto::update::UpdateOrder;
 use kbf_proto::update::update_order::Verb;
 use kbf_proto::update::update_status::State;
 use kbf_types::{FarmTime, WorkerId};
 
 use super::command::{Alert, Severity};
+use super::facts::MemberFacts;
 use super::facts::{
     DaemonLoad, HelperReport, HelperStatus, HostFacts, HostKind, HostRecord, OrderId, Platform,
     PlatformClass, Release, Work,
@@ -62,6 +74,8 @@ use super::facts::{
 use super::ports::{FactsSource, FarmView, SourceError, Transport, TransportError};
 use super::rows::Rows;
 use crate::farm::{Farm, NodeAction, NodeLook};
+use crate::members::{MemberLook, Members, MembersLook, MembershipError};
+use crate::storage_health::{Class, NotIdle};
 
 /// Which confirmation order id went to which host, for which activation.
 #[derive(Debug, Default)]
@@ -115,24 +129,47 @@ fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Issued> {
 
 /// The transport and the facts source over `farm`, with the rows of its state store.
 #[must_use]
-pub fn ports(farm: Arc<Farm>, rows: Rows) -> (SessionTransport, FarmFacts) {
+pub fn ports(farm: Arc<Farm>, rows: Rows, members: Arc<Members>) -> (SessionTransport, FarmFacts) {
     let issued = Shared::default();
     (
         SessionTransport {
             farm: Arc::clone(&farm),
             rows: rows.clone(),
+            members: Arc::clone(&members),
             issued: Arc::clone(&issued),
         },
-        FarmFacts { farm, rows, issued },
+        FarmFacts {
+            farm,
+            rows,
+            members,
+            issued,
+            unlinked: BTreeMap::new(),
+            not_idle: BTreeMap::new(),
+        },
     )
 }
 
 /// The orders, over the sessions.
-#[derive(Debug)]
 pub struct SessionTransport {
     farm: Arc<Farm>,
     rows: Rows,
+    members: Arc<Members>,
     issued: Shared,
+}
+
+impl std::fmt::Debug for SessionTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionTransport").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for FarmFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FarmFacts")
+            .field("unlinked", &self.unlinked)
+            .field("not_idle", &self.not_idle)
+            .finish_non_exhaustive()
+    }
 }
 
 fn failed(why: impl std::fmt::Display) -> TransportError {
@@ -222,16 +259,29 @@ impl Transport for SessionTransport {
         self.place(host, NodeAction::Uncordon)
     }
 
-    fn mark_down(&mut self, host: &WorkerId, _member: MemberId) -> Result<(), TransportError> {
-        Err(failed(format!(
-            "cannot mark {host} down: the planned-down mark (U3, #914) is not in this build"
-        )))
+    /// The member is planned down for the policy's restart deadline: long enough for the
+    /// waits of steps 4 and 5 and the activation, short enough that the dwell's end never
+    /// decides first. A plan that runs out while the old process still beats returns the
+    /// member to `Active` by its next heartbeat.
+    fn mark_down(&mut self, host: &WorkerId, member: MemberId) -> Result<(), TransportError> {
+        self.not_handed()?;
+        let plan = self.rows.policy().map_err(failed)?.restart_deadline();
+        self.members
+            .plan_down(member, plan)
+            .map(drop)
+            .map_err(|e| failed(format!("cannot mark {host} (member {member}) down: {e}")))
     }
 
-    fn undown(&mut self, host: &WorkerId, _member: MemberId) -> Result<(), TransportError> {
-        Err(failed(format!(
-            "cannot undo the mark of {host}: the planned-down mark (U3, #914) is not in this build"
-        )))
+    /// A member that is not planned down is left as it is, and one with no live row has
+    /// nothing to undo: it stopped, and registering again deletes its mark.
+    fn undown(&mut self, host: &WorkerId, member: MemberId) -> Result<(), TransportError> {
+        self.not_handed()?;
+        match self.members.undo_plan(member) {
+            Ok(_) | Err(MembershipError::NotRegistered(_)) => Ok(()),
+            Err(e) => Err(failed(format!(
+                "cannot undo the mark of {host} (member {member}): {e}"
+            ))),
+        }
     }
 
     fn activate(
@@ -311,11 +361,74 @@ impl Transport for SessionTransport {
 }
 
 /// The facts, from the farm.
-#[derive(Debug)]
 pub struct FarmFacts {
     farm: Arc<Farm>,
     rows: Rows,
+    members: Arc<Members>,
     issued: Shared,
+    /// Why each Linux host that has no member is not linked, as of the last look.
+    unlinked: BTreeMap<WorkerId, String>,
+    /// Why each marked member's host is not idle yet, as of the last look.
+    not_idle: BTreeMap<WorkerId, NotIdle>,
+}
+
+/// How a Linux host stands to the storage members.
+enum Link<'a> {
+    /// The registry knows the node and it advertises no address: no storage half.
+    NoStorage,
+    /// Its advertised address is the one `member` registered.
+    Member(&'a MemberLook),
+    /// No member is its own; the text says why.
+    Unlinked(String),
+}
+
+/// The member whose registered address is, byte for byte, the address `host` advertised when
+/// it enrolled (`adverts`: node id to address). No prefix, no case folding, no port
+/// guessing: an address that is not exactly a member's links nothing.
+fn link<'a>(
+    host: &WorkerId,
+    adverts: &BTreeMap<String, String>,
+    members: &'a MembersLook,
+) -> Link<'a> {
+    let Some(advertised) = adverts.get(host.as_str()) else {
+        return Link::Unlinked(format!(
+            "{host} is not in the enrollment registry, so its storage address is not known"
+        ));
+    };
+    if advertised.is_empty() {
+        return Link::NoStorage;
+    }
+    let mut matching = members.members.iter().filter(|m| m.addr == *advertised);
+    match (matching.next(), matching.next()) {
+        (Some(only), None) => Link::Member(only),
+        (None, _) => Link::Unlinked(format!(
+            "{host} advertises {advertised}, which no storage member registered"
+        )),
+        (Some(_), Some(_)) => Link::Unlinked(format!(
+            "{host} advertises {advertised}, which more than one storage member registered"
+        )),
+    }
+}
+
+/// `now` less `ago`.
+fn before(now: FarmTime, ago: std::time::Duration) -> FarmTime {
+    let ms = u64::try_from(ago.as_millis()).unwrap_or(u64::MAX);
+    FarmTime::from_millis(now.as_millis().saturating_sub(ms))
+}
+
+fn member_facts(look: &MembersLook, now: FarmTime) -> Vec<MemberFacts> {
+    look.members
+        .iter()
+        .map(|m| MemberFacts {
+            id: m.id,
+            state: m.state,
+            planned_down: m.planned_down,
+            heard_at: m.heard_ago.map(|ago| before(now, ago)),
+            repair_debt: m.repair_debt,
+            down_since: m.marked_ago.map(|ago| before(now, ago)),
+            boot: (m.boot > 0).then_some(m.boot),
+        })
+        .collect()
 }
 
 /// The release a host runs, given the one desired: its own commit, which the desired one
@@ -352,16 +465,26 @@ impl FarmFacts {
         epoch: u64,
         target: Option<&Release>,
         queue_empty: bool,
+        link: Option<&Link<'_>>,
+        generation: u64,
     ) -> Option<HostFacts> {
         let (platform, kind) = match look.os.as_str() {
             "macos" => (
                 Platform::Mac(PlatformClass::new(format!("macos-{}", look.arch))),
                 HostKind::DaemonOnly,
             ),
-            // Perhaps a storage half; the join to the member is not available (see the
-            // module docs), so the host is unlinked and never started.
-            "linux" => (Platform::Linux, HostKind::StorageAndDaemon),
+            "linux" => (
+                Platform::Linux,
+                match link {
+                    Some(Link::NoStorage) => HostKind::DaemonOnly,
+                    _ => HostKind::StorageAndDaemon,
+                },
+            ),
             _ => return None,
+        };
+        let member = match link {
+            Some(Link::Member(member)) => Some(*member),
+            _ => None,
         };
         let helper = look.update.as_ref().and_then(|u| {
             let status = helper_status(u.kind)?;
@@ -393,7 +516,7 @@ impl FarmFacts {
             id: look.id,
             kind,
             platform,
-            member: None,
+            member: member.map(|m| m.id),
             release: look
                 .update
                 .as_ref()
@@ -405,8 +528,15 @@ impl FarmFacts {
                 undelivered: look.undelivered,
                 whole_machine_hold: look.whole_machine_hold,
             }),
-            open_writes: None,
-            routed_writes: None,
+            open_writes: member.and_then(|m| m.open_writes),
+            // The router keeps no count of the writes it sent a member. A report made under
+            // a map at least as new as the current one is of a node every router has
+            // stopped sending to if it is down in that map, and the same rule as
+            // `Members::node_idle` gives (its `at_generation`). An older or missing report
+            // is unknown, which a gate does not read as zero.
+            routed_writes: member
+                .filter(|m| m.reported_generation.is_some_and(|g| g >= generation))
+                .map(|_| 0),
             helper,
             work: Some(work),
             record: HostRecord::unstarted(),
@@ -414,8 +544,73 @@ impl FarmFacts {
     }
 }
 
+impl FarmFacts {
+    /// Why `host`, a Linux host, is linked to no storage member as of the last look; `None`
+    /// if it is linked or has no storage half.
+    #[must_use]
+    pub fn unlinked(&self, host: &WorkerId) -> Option<&str> {
+        self.unlinked.get(host).map(String::as_str)
+    }
+
+    /// Why the storage member of `host`, which is planned down, is not idle yet as of the
+    /// last look ([`Members::node_idle`]); `None` if it is idle, or not planned down.
+    #[must_use]
+    pub fn not_idle(&self, host: &WorkerId) -> Option<&NotIdle> {
+        self.not_idle.get(host)
+    }
+
+    /// Keeps `now` as the hosts that are unlinked, and says each once, when it first is or its
+    /// reason changes.
+    fn say_unlinked(&mut self, now: BTreeMap<WorkerId, String>) {
+        for (host, why) in &now {
+            if self.unlinked.get(host) != Some(why) {
+                tracing::warn!(
+                    target: "kbf_server::attention",
+                    "update: {why}; the host is not started"
+                );
+            }
+        }
+        self.unlinked = now;
+    }
+
+    /// For each linked member that is planned down, asks `Members::node_idle` and keeps the
+    /// first reason it is not; a wait is said at info and a hold at warn, once per reason.
+    /// The controller's own gate reads the same facts (`writes_quiet`, the member's state);
+    /// this is how a person finds out which it is waiting for.
+    fn say_idle(&mut self, hosts: &[HostFacts], members: &MembersLook) {
+        let mut now = BTreeMap::new();
+        for host in hosts {
+            let Some(id) = host.member else { continue };
+            let marked = members
+                .members
+                .iter()
+                .any(|m| m.id == id && m.planned_down && m.state == MemberState::Down);
+            if !marked {
+                continue;
+            }
+            if let Err(reason) = self.members.node_idle(id, members.generation) {
+                if self.not_idle.get(&host.id) != Some(&reason) {
+                    match reason.class() {
+                        Class::Wait => tracing::info!(
+                            "update: {} is marked down and not idle yet: {reason}",
+                            host.id
+                        ),
+                        Class::Held => tracing::warn!(
+                            target: "kbf_server::attention",
+                            "update: {} is marked down and must not be stopped: {reason}",
+                            host.id
+                        ),
+                    }
+                }
+                now.insert(host.id.clone(), reason);
+            }
+        }
+        self.not_idle = now;
+    }
+}
+
 impl FactsSource for FarmFacts {
-    fn look(&mut self, _now: FarmTime) -> Result<FarmView, SourceError> {
+    fn look(&mut self, now: FarmTime) -> Result<FarmView, SourceError> {
         let target = self
             .rows
             .desired()
@@ -427,13 +622,39 @@ impl FactsSource for FarmFacts {
         let looks = self.farm.update_look();
         let present: Vec<WorkerId> = looks.iter().map(|l| l.id.clone()).collect();
         lock(&self.issued).keep_only(&present);
-        let hosts = looks
-            .into_iter()
-            .filter_map(|look| self.host(look, epoch, target.as_ref(), queue_empty))
-            .collect();
+        let members = self
+            .members
+            .look()
+            .map_err(|e| SourceError(format!("the members could not be read: {e}")))?;
+        let adverts: BTreeMap<String, String> =
+            kbf_enroll_registry::list_nodes(&**self.rows.store())
+                .map_err(|e| {
+                    SourceError(format!("the enrollment registry could not be read: {e}"))
+                })?
+                .into_iter()
+                .map(|node| (node.id.to_string(), node.advertise))
+                .collect();
+        let mut unlinked = BTreeMap::new();
+        let mut hosts = Vec::new();
+        for look in looks {
+            let linked = (look.os == "linux").then(|| link(&look.id, &adverts, &members));
+            if let Some(Link::Unlinked(why)) = &linked {
+                unlinked.insert(look.id.clone(), why.clone());
+            }
+            hosts.extend(self.host(
+                look,
+                epoch,
+                target.as_ref(),
+                queue_empty,
+                linked.as_ref(),
+                members.generation,
+            ));
+        }
+        self.say_unlinked(unlinked);
+        self.say_idle(&hosts, &members);
         Ok(FarmView {
             hosts,
-            members: Vec::new(),
+            members: member_facts(&members, now),
             // An empty queue asks for no class. A queue with work in it is not read by
             // class here, so it is unknown, and the last Mac of a class is never cordoned.
             queued_classes: queue_empty.then(BTreeSet::new),
@@ -465,6 +686,13 @@ mod tests {
         ))
     }
 
+    fn members(rows: &Rows) -> Arc<Members> {
+        Arc::new(Members::new(
+            Arc::clone(rows.store()),
+            crate::members::MembershipConfig::default(),
+        ))
+    }
+
     fn rows() -> Rows {
         let clock = Arc::new(ManualClock::default());
         Rows::new(Arc::new(Fake::with_flaw(clock, Flaw::None)) as Arc<dyn Store>)
@@ -491,7 +719,7 @@ mod tests {
             ServerMessage::default(),
         );
         let rows = rows();
-        let (mut transport, mut source) = ports(Arc::clone(&farm), rows.clone());
+        let (mut transport, mut source) = ports(Arc::clone(&farm), rows.clone(), members(&rows));
         let epoch = farm.lease_epoch();
         let release = Release::new(A);
         let host = WorkerId::new("mac");
@@ -548,7 +776,7 @@ mod tests {
             ServerMessage::default(),
         );
         let rows = rows();
-        let (mut transport, source) = ports(Arc::clone(&farm), rows.clone());
+        let (mut transport, source) = ports(Arc::clone(&farm), rows.clone(), members(&rows));
         let epoch = farm.lease_epoch();
         let (host, release) = (WorkerId::new("mac"), Release::new(A));
         let order = rows.mint_order(epoch).expect("an id");
@@ -598,7 +826,8 @@ mod tests {
         let rows = Rows::new(Arc::clone(&store));
         rows.offer(&Release::new(A), farm.wall_now())
             .expect("a run");
-        let (transport, source) = ports(Arc::clone(&farm), rows);
+        let members = members(&rows);
+        let (transport, source) = ports(Arc::clone(&farm), rows, members);
         let mut controller = Controller::new(
             store,
             farm.lease_epoch(),

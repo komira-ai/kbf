@@ -1016,6 +1016,7 @@ impl<'a> Prepared<'a> {
         let api_listener = api_socket.map(Socket::http).transpose()?;
         let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
         let update_store = state_store.clone();
+        let update_members = members.clone();
         let update_rows = state_store.clone().map(crate::update::Rows::new);
         let object_stores = flags
             .object_store_secrets_dir
@@ -1191,10 +1192,15 @@ impl<'a> Prepared<'a> {
         let serving = async move {
             let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-            // The rolling-update controller; it starts no host until `auto_nodes` is set.
-            let _updates =
-                crate::update::spawn_controller(Arc::clone(&farm), update_store, listeners.tick)
-                    .map(AbortOnDrop);
+            // The rolling-update controller; it starts hosts for the desired release unless the
+            // operator wrote `auto_nodes` false or paused it.
+            let _updates = crate::update::spawn_controller(
+                Arc::clone(&farm),
+                update_store,
+                update_members,
+                listeners.tick,
+            )
+            .map(AbortOnDrop);
             let reapi_serve = reapi_server
                 .add_routes(reapi_routes)
                 .serve_with_incoming_shutdown(reapi_incoming, async {

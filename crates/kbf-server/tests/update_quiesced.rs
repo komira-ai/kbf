@@ -174,6 +174,10 @@ impl Rig {
         spawn_controller(
             Arc::clone(&self.farm),
             Some(Arc::clone(&self.writer)),
+            Some(Arc::new(kbf_server::members::Members::new(
+                Arc::clone(&self.writer),
+                kbf_server::members::MembershipConfig::default(),
+            ))),
             EVERY,
         )
         .expect("a state store")
@@ -270,7 +274,14 @@ async fn a_handed_over_farm_makes_no_look() {
 async fn a_handed_over_farm_cordons_nobody_and_sends_no_order() {
     let mut rig = rig();
     let update_rows = Rows::new(Arc::clone(&rig.writer));
-    let (mut transport, _facts) = ports(Arc::clone(&rig.farm), update_rows.clone());
+    let (mut transport, _facts) = ports(
+        Arc::clone(&rig.farm),
+        update_rows.clone(),
+        Arc::new(kbf_server::members::Members::new(
+            Arc::clone(&rig.writer),
+            kbf_server::members::MembershipConfig::default(),
+        )),
+    );
     let release = Release::new(A);
     // From the store's counter, as the controller's are: the confirmation draws the next.
     let epoch = rig.farm.lease_epoch();
@@ -357,7 +368,14 @@ async fn a_controller_whose_store_handle_is_superseded_ends() {
 async fn a_fence_that_lands_while_an_activation_is_prepared_stops_it() {
     let mut rig = rig();
     let update_rows = Rows::new(Arc::clone(&rig.writer));
-    let (mut transport, _facts) = ports(Arc::clone(&rig.farm), update_rows.clone());
+    let (mut transport, _facts) = ports(
+        Arc::clone(&rig.farm),
+        update_rows.clone(),
+        Arc::new(kbf_server::members::Members::new(
+            Arc::clone(&rig.writer),
+            kbf_server::members::MembershipConfig::default(),
+        )),
+    );
     let activation = update_rows
         .mint_order(rig.farm.lease_epoch())
         .expect("an id");

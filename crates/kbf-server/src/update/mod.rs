@@ -34,11 +34,13 @@
 //!   exception is a host that leaves its step: the orders that undo the step come first
 //!   ([`Controller`]).
 //!
-//! **The farm side.** [`ports`] gives a [`Transport`] over the worker sessions and a
-//! [`FactsSource`] over the `Farm` (`session`), and [`spawn_controller`] runs the controller
-//! where the frontend starts, starting hosts only when `update/policy.auto_nodes` is set.
-//! What it cannot do yet: mark a storage member down and read its facts (U3, #914, is not in
-//! this branch), so no host with a storage half is ever started.
+//! **The farm side.** [`ports`] gives a [`Transport`] over the worker sessions and the
+//! members and a [`FactsSource`] over the `Farm`, the members and the enrollment registry
+//! (`session`), and [`spawn_controller`] runs the controller where the frontend starts,
+//! starting hosts unless an operator wrote `update/policy.auto_nodes` false or paused the run.
+//! A Linux host is joined to its storage member by the address it advertised at enrollment,
+//! matched exactly; a host that matches no member is never started and `FarmFacts::unlinked`
+//! says why.
 
 mod codec;
 mod command;

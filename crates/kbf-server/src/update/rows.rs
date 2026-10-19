@@ -139,6 +139,12 @@ impl Rows {
         Self { store }
     }
 
+    /// The state store the rows live in, for the other families the controller reads (the
+    /// enrollment registry that joins hosts to members).
+    pub(super) fn store(&self) -> &Arc<dyn Store> {
+        &self.store
+    }
+
     /// The run, if one was ever offered.
     ///
     /// # Errors

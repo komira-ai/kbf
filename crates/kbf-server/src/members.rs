@@ -119,6 +119,8 @@ use crate::worker::named_protocol;
 mod denials;
 pub use denials::Denial;
 mod join;
+mod look;
+pub use look::{MemberLook, MembersLook};
 
 /// The value of a `down/<id>` mark written by an operator's planned restart
 /// ([`Members::plan_down`]); the sweeper's marks are empty.
@@ -559,6 +561,9 @@ enum Touch {
     /// An administrator's planned restart of an `Active` member: `Down` in the row, with
     /// the dwell mark, in one transaction.
     PlanDown(Duration),
+    /// An administrator's undoing of a planned restart: `Active` again, only for a member
+    /// that is `Down` on a live row; any other state is left as it is.
+    UndoPlan,
 }
 
 /// The maps a process has seen: the newest, and the generation it replaced.
@@ -864,6 +869,23 @@ impl Members {
         self.refresh()?.ok_or(MembershipError::NoMap)
     }
 
+    /// Ends a planned restart of `id` at once: a live member that is `Down` on its row (only a
+    /// plan makes that) is `Active` again, its `down/` mark deleted, and the map rebuilt.
+    /// Whether it changed anything: a member that is not planned down (it returned by its own
+    /// heartbeat or by registering again, or is `CatchingUp` or `Draining`) is left as it is,
+    /// so the undoing of a restart that happened never promotes a node that is rebuilding.
+    ///
+    /// # Errors
+    /// [`MembershipError::NotRegistered`] if the member has no live row (it stopped: its mark
+    /// is deleted when it registers again, or expires with the dwell); the store failing.
+    pub fn undo_plan(&self, id: MemberId) -> Result<bool, MembershipError> {
+        let changed = self.touch(id, Touch::UndoPlan, None)?;
+        if changed {
+            self.refresh()?;
+        }
+        Ok(changed)
+    }
+
     /// The planned restart of `id`, if there is one: see [`Planned`].
     ///
     /// # Errors
@@ -966,6 +988,16 @@ impl Members {
                 }
                 // Asked again (or by a second controller): the same planned restart, its
                 // end moved to a whole `for_` from now.
+                // Not planned down (it returned by itself, or never went): nothing to undo, and
+                // a member that is rebuilding or draining is not promoted by this.
+                Touch::UndoPlan if before != MemberState::Down => return Ok(false),
+                Touch::UndoPlan => {
+                    live.member.state = MemberState::Active;
+                    live.planned_until = None;
+                    stored
+                        .expires_at
+                        .map_or(self.config.ttl, |at| at.since(self.store.now()))
+                }
                 Touch::PlanDown(for_) => {
                     live.member.state = MemberState::Down;
                     live.planned_until = Some(self.store.now().saturating_add(for_));
