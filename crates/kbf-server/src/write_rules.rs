@@ -153,13 +153,6 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "members",
             "meta/members_formed",
         ),
-        // The forming window and the joiners' marks (`members/join.rs`).
-        fenced(
-            Keys::Exactly("meta/members_forming"),
-            "members",
-            "meta/members_forming",
-        ),
-        fenced(Keys::Under("unfilled/"), "members", "unfilled/1"),
         fenced(
             Keys::Exactly("meta/members_forming"),
             "members (bootstrap window)",
