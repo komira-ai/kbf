@@ -38,7 +38,7 @@ fn build(
     let parts: Parts = rig.parts(requests, move |why| {
         sink.lock().unwrap().push(why.to_owned())
     });
-    let mut config = Rig::config(dir.clone());
+    let mut config = Rig::config(dir.to_path_buf());
     config.timing = timing;
     config.rollback_after_switch = rollback;
     SwapSupervisor::new(parts, config)
