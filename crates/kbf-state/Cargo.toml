@@ -10,7 +10,7 @@ publish.workspace = true
 [features]
 # The Postgres backend (`postgres` module). Off by default: the pure scheduler crates and
 # the single-node build carry no database client.
-postgres = ["dep:postgres"]
+postgres = ["dep:postgres", "dep:tokio"]
 # The in-memory fake with its deliberate defects, the conformance suite and the Postgres
 # suite factory. Test-only: a production build carries none of it. A crate that tests
 # against the fake enables it in its `[dev-dependencies]` entry for kbf-state.
@@ -21,6 +21,8 @@ postgres = { workspace = true, optional = true }
 rusqlite.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 thiserror.workspace = true
+# `rt` only, to ask whether the calling thread is inside a runtime (postgres/conn.rs).
+tokio = { workspace = true, optional = true, features = ["rt"] }
 
 [dev-dependencies]
 # This crate's own tests (unit tests are built with `cfg(test)`, the files in tests/ are
