@@ -131,10 +131,10 @@ fn target_of(root: &Path, args: &RunArgs) -> Result<Target, Failure> {
     }
     let (layout, _) = host(root.to_path_buf()).map_err(usage)?;
     let service = derived_service(&layout, layout.platform())?;
-    let default = (args.installer_config.is_none() && service.runs_database_mode())
-        .then(|| HostPath::new(setup::paths::INSTALLER_TOML))
-        .transpose()
-        .map_err(|e| usage(e.to_string()))?;
+    // INSTALLER_TOML is a constant absolute host path, so it always parses.
+    let default = (args.installer_config.is_none() && service.runs_database_mode()).then(|| {
+        HostPath::new(setup::paths::INSTALLER_TOML).expect("INSTALLER_TOML is an absolute path")
+    });
     let installer_config = args.installer_config.clone().or(default);
     Ok(Target {
         service,
