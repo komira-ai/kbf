@@ -1393,6 +1393,60 @@ async fn a_committed_result_the_store_refused_is_written_and_answered_when_it_re
     );
 }
 
+/// Catches: a request for an action whose finish the store has not taken yet that joins
+/// the finished operation. The scheduler finished it in memory, but its `op/` row and
+/// `inflight/` pin stay until the finish lands, so the submit finds a pin whose
+/// operation exists and takes it up again: the finished operation is queued afresh over
+/// itself, granted a second time (two runs), and the held answer and the new grant
+/// disagree. The request is refused UNAVAILABLE while the finish is held, no second
+/// `Start` goes out, and a request after the finish landed queues a fresh operation.
+#[tokio::test(start_paused = true)]
+async fn a_request_while_the_finish_is_held_does_not_retake_the_finished_operation() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (_, mut inbox) = register(&farm);
+    let ticket = farm
+        .submit(Submission {
+            request: request(1),
+            call: None,
+            described: Described::default(),
+        })
+        .expect("submitted");
+    let leases = starts(&mut inbox);
+    assert_eq!(leases.len(), 1);
+    disk.store.set_down(true);
+    assert!(!accepted(&farm, leases[0]).await, "the store was down");
+    assert_eq!((disk.rows("op/"), disk.rows("inflight/")), (1, 1));
+
+    let again = submit(&farm, request(1));
+    assert_eq!(
+        again.err().map(|status| status.code()),
+        Some(Code::Unavailable),
+        "the request joined an operation the scheduler finished"
+    );
+
+    disk.store.set_down(false);
+    for _ in 0..3 {
+        farm.tick().await;
+    }
+    let Finished::Failed(status) = ended(&ticket) else {
+        panic!("the caller was answered with something else");
+    };
+    assert_eq!(status.message, "test");
+    assert!(
+        starts(&mut inbox).is_empty(),
+        "the action ran a second time"
+    );
+    assert_eq!(
+        (disk.rows("op/"), disk.rows("inflight/"), disk.rows("done/")),
+        (0, 0, 1)
+    );
+
+    submit(&farm, request(1)).expect("a request after the finish landed");
+    assert_eq!(starts(&mut inbox).len(), 1, "a fresh run is granted");
+    assert_eq!((disk.rows("op/"), disk.rows("inflight/")), (1, 1));
+}
+
 /// Catches: a retry that goes on after a newer writer holds the store (the old scheduler
 /// would write its stale rows over its successor's the moment a write landed, or keep the
 /// store busy for ever): the first refusal that says `Fenced` ends it. No write is tried

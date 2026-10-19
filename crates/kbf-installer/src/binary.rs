@@ -110,8 +110,14 @@ impl BinaryKind {
     }
 }
 
-/// What `--version --json` prints.
+/// The most a binary's `--version --json` may print.
+pub const VERSION_CAP: usize = 4096;
+
+/// What `--version --json` prints. Exactly these fields: one missing, one more, or one
+/// named twice is refused (`platform` is the one a build may leave out, since the
+/// installer derives it from the binary's header).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Version {
     pub commit: String,
     pub min_protocol: u64,
@@ -119,12 +125,18 @@ pub struct Version {
     pub profile: String,
     pub state_schema: u64,
     pub version: String,
+    /// `linux-x86_64`, `linux-arm64` or `darwin-arm64`, when the build says.
+    #[serde(default)]
+    pub platform: Option<String>,
 }
 
 impl Version {
-    /// The object a binary printed. Fields beyond these are ignored: a later build may
-    /// report more.
+    /// The object a binary printed, strictly: at most [`VERSION_CAP`] bytes, one JSON
+    /// object of the fields above and nothing after it.
     pub fn parse(stdout: &[u8]) -> Result<Version, VersionFault> {
+        if stdout.len() > VERSION_CAP {
+            return Err(VersionFault::Oversize { cap: VERSION_CAP });
+        }
         serde_json::from_slice(stdout).map_err(|e| VersionFault::Unreadable(e.to_string()))
     }
 

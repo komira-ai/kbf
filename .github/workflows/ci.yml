@@ -546,7 +546,7 @@ jobs:
       - run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
       # The per-binary entitlement allow list (tools/ci/darwin-entitlements.txt): the
       # kbf-vmm stub signed by `cargo xtask sign-darwin` with the virtualization
-      # entitlement, kbf-daemon with none, both accepted by `darwin-asset`, and every
+      # entitlement, kbf with none, both accepted by `darwin-asset`, and every
       # wrong signature refused (crates/kbf-vmm/tests/signing.rs;
       # docs/design/macos-vm-guests.md section 7).
       - run: cargo test -p kbf-vmm --test signing --locked -- --ignored

@@ -13,6 +13,14 @@
 //! node's session. A blob call carries no node id: its certificate must still carry
 //! exactly one DNS name, and that name is the node the deny list is checked against.
 //!
+//! **Behind the farm's proxy** (`--proxy-auth-file`, [`crate::proxy_auth`]) there is no
+//! certificate on the connection: the proxy terminated the TLS and forwards the node and
+//! role it verified. [`presented`] is the one function that says which a call has, and every
+//! check above (the role table, the `Hello` binding, the blob calls, `Membership`) goes
+//! through it: a proxied identity names its node as a certificate would, so the same
+//! `Hello.node_id` rule applies (a mismatch is PERMISSION_DENIED), and a `node` deny entry
+//! names it; it has no serial or key hash, so those entries cannot.
+//!
 //! **The deny list** is a file the server looks at again at every check, so an edit
 //! takes effect without a restart. Each check reads the file's metadata (device,
 //! inode, size, mode, owner, modification and change time) and reads and parses the
@@ -48,6 +56,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use kbf_map::DenyEntry;
 use kbf_peer::PeerIdentity;
 use tonic::Status;
+use tonic::codegen::http::Extensions;
+
+use crate::proxy_auth::{Identity, Trust};
 
 /// What the server takes from a client certificate: the identity a deny entry is compared
 /// with (`kbf-peer`'s reader, which the storage service uses too) and, for a daemon, the
@@ -66,6 +77,16 @@ impl PeerCert {
         kbf_peer::identity_of(der)
             .map(|identity| Self { identity })
             .map_err(|e| e.to_string())
+    }
+
+    /// The caller a proxy verified, which names only `node_id`: no serial or key hash, so a
+    /// `serial` or `spki-sha256` deny entry cannot name it (a `node` entry can), and no IP
+    /// name, so a Membership registration by IP address is refused behind the proxy.
+    #[must_use]
+    pub fn proxied(node_id: &str) -> Self {
+        Self {
+            identity: PeerIdentity::proxied(node_id),
+        }
     }
 
     /// What a deny entry is compared with: the names, the serial and the key hash.
@@ -115,6 +136,43 @@ impl PeerCert {
     }
 }
 
+/// What a call presents as who it is: what a proxy vouched for, or the client certificate
+/// TLS verified on the connection. Made by [`presented`] and nowhere else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Presented {
+    /// The identity a proxy forwarded under its secret ([`crate::proxy_auth`]).
+    Proxy(Identity),
+    /// The leaf of the verified client certificate chain; `None` in plain text or with no
+    /// client certificate.
+    Leaf(Option<Vec<u8>>),
+}
+
+impl Presented {
+    /// The DER of the leaf certificate, if the call presents one.
+    #[must_use]
+    pub fn leaf(&self) -> Option<&[u8]> {
+        match self {
+            Self::Leaf(leaf) => leaf.as_deref(),
+            Self::Proxy(_) => None,
+        }
+    }
+}
+
+/// Who the call whose request extensions are `extensions` presents itself as: the identity a
+/// proxy verified ([`Trust::Proxied`]), else the client certificate. The one function that
+/// decides, so the role check, the `Hello` binding, the blob calls and `Membership` cannot
+/// disagree about it.
+#[must_use]
+pub fn presented(extensions: &Extensions) -> Presented {
+    match extensions.get::<Trust>() {
+        Some(Trust::Proxied(identity)) => Presented::Proxy(identity.clone()),
+        _ => {
+            let chain = kbf_tls::peer_certs_of(extensions);
+            Presented::Leaf(chain.and_then(|chain| chain.first().map(|leaf| leaf.to_vec())))
+        }
+    }
+}
+
 /// How the worker listener knows who is on a stream.
 #[derive(Clone, Debug)]
 pub enum Peers {
@@ -146,6 +204,23 @@ impl Peers {
         }
     }
 
+    /// [`Peers::peer`] for what a call presents: a proxied identity must name its node.
+    ///
+    /// # Errors
+    /// As [`Peers::peer`]; and, for a proxied identity under mutual TLS or behind the proxy,
+    /// UNAUTHENTICATED if it names no node.
+    pub fn peer_of(&self, presented: &Presented) -> Result<Option<PeerCert>, Status> {
+        match (self, presented) {
+            (Self::Unauthenticated, _) => Ok(None),
+            (Self::Certified { .. }, Presented::Proxy(identity)) => identity
+                .node_id
+                .as_deref()
+                .map(|node| Some(PeerCert::proxied(node)))
+                .ok_or_else(|| Status::unauthenticated("no client identity from the proxy")),
+            (Self::Certified { .. }, Presented::Leaf(leaf)) => self.peer(leaf.as_deref()),
+        }
+    }
+
     /// Whether the stream whose certificate is `peer` may speak as `node_id` now: the
     /// certificate names it, and neither is on the deny list.
     ///
@@ -169,17 +244,18 @@ impl Peers {
         }
     }
 
-    /// Whether a blob call on the worker listener, whose verified chain starts with
-    /// `leaf`, may go on now: there is mutual TLS and a certificate, it names exactly
-    /// one node, and neither the certificate nor that node is denied. Returns the node.
+    /// Whether a blob call on the worker listener, presenting `presented` (its verified
+    /// chain's leaf, or the identity a proxy forwarded), may go on now: there is mutual TLS
+    /// and a certificate (or a proxied node), it names exactly one node, and neither the
+    /// certificate nor that node is denied. Returns the node.
     ///
     /// # Errors
     /// UNAUTHENTICATED: plain text, or no certificate (or one that does not parse).
     /// PERMISSION_DENIED: the certificate names no node or several, or it (or its
     /// node) is denied. UNAVAILABLE: the deny list cannot be read or parsed.
-    pub async fn admit_call(&self, leaf: Option<&[u8]>) -> Result<String, Status> {
+    pub async fn admit_call(&self, presented: &Presented) -> Result<String, Status> {
         // Under mutual TLS a missing certificate is an error already; `None` is plain text.
-        let Some(peer) = self.peer(leaf)? else {
+        let Some(peer) = self.peer_of(presented)? else {
             return Err(Status::unauthenticated(
                 "blob calls on the worker listener need mutual TLS, which this server \
                  does not serve there",

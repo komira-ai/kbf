@@ -20,6 +20,21 @@ fn the_golden_files_decode_and_render_to_themselves() {
     }
 }
 
+/// Catches the closed reader refusing the `database` key that `kbf-installer setup` and
+/// `run --installer-config` read (so the `check` verb would call a working host's file
+/// invalid), or the key lost on the way back out.
+#[test]
+fn the_database_key_is_accepted_and_rendered() {
+    let text = "database = \"postgres:///kbf?host=/run/postgresql\"\n";
+    let parsed = InstallerToml::parse(text).expect("parses");
+    assert_eq!(
+        parsed.database.as_deref(),
+        Some("postgres:///kbf?host=/run/postgresql")
+    );
+    assert!(parsed.render().ends_with(text), "{}", parsed.render());
+    assert_eq!(InstallerToml::default().database, None);
+}
+
 /// Catches a default that drifted from the contract (section 3): an empty file is a frontend
 /// source, 900 s window, 900 s fetch, 512 MiB, 60 s between activations.
 #[test]

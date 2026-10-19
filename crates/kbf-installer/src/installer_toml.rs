@@ -38,6 +38,7 @@ struct Raw {
     min_activation_interval_s: Option<u32>,
     node_cert: Option<String>,
     node_key: Option<String>,
+    database: Option<String>,
 }
 
 /// Where releases are fetched from.
@@ -64,6 +65,9 @@ pub struct InstallerToml {
     /// The node identity the fetch child is lent, for the frontend source.
     pub node_cert: Option<PathBuf>,
     pub node_key: Option<PathBuf>,
+    /// The state database of a frontend or all-in-one host: a `postgres://` URL without a
+    /// password (the file is world-readable). `crate::database` checks and uses it.
+    pub database: Option<String>,
 }
 
 impl Default for InstallerToml {
@@ -80,6 +84,7 @@ impl Default for InstallerToml {
             min_activation_interval_s: 60,
             node_cert: None,
             node_key: None,
+            database: None,
         }
     }
 }
@@ -294,6 +299,7 @@ impl InstallerToml {
                 min_activation_interval_s,
                 node_cert,
                 node_key,
+                database: raw.database,
             }),
             _ => Err(ConfigError::Invalid(problems)),
         }
@@ -337,6 +343,9 @@ impl InstallerToml {
         }
         if let Some(p) = &self.node_key {
             out.push_str(&format!("node_key = \"{}\"\n", p.display()));
+        }
+        if let Some(url) = &self.database {
+            out.push_str(&format!("database = {url:?}\n"));
         }
         out
     }

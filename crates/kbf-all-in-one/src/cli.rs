@@ -7,7 +7,7 @@
 //!
 //! Refused, though each half alone takes it: any `--driver` but `container` (the
 //! native drivers run actions as the farm's own user, beside the server's state, and
-//! belong to Macs, which run `kbf-daemon`), and `--cas` (the daemon half reads and
+//! belong to Macs, which run `kbf daemon`), and `--cas` (the daemon half reads and
 //! writes blobs through calls into the server half, not over the network).
 //!
 //! The scheduler's state is Postgres (`docs/design/frontend-proxy.md`, section 11):
@@ -99,7 +99,7 @@ pub(crate) fn refuse_remote_plane(
     let mut drivers = matches.get_raw("drivers").into_iter().flatten();
     if let Some(other) = drivers.find(|d| *d != "container") {
         return Err(refuse(format!(
-            "--driver {}: {name} runs the container driver only; run kbf-daemon for the \
+            "--driver {}: {name} runs the container driver only; run `kbf daemon` for the \
              others",
             other.to_string_lossy()
         )));

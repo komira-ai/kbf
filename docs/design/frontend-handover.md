@@ -13,7 +13,7 @@ the command are here.
 Both instances run the same command line but for `--instance=a|b`. Instance a listens where
 `--listen`, `--worker-listen` and `--api-listen` say; instance b listens ten ports above each
 (port 0, which the system chooses, stays 0), so the two blocks are `base+0..2` and `base+10..12`,
-the ones Envoy's configuration (`kbf-deploy envoy render --topology box`) names. A handover
+the ones the installer's Envoy box render (`kbf-installer`, `envoy` module) names. A handover
 goes to the other instance. The two REAPI listeners must be on loopback, since the old one
 forwards the calls that still reach it to the new one. If the REAPI listener has a
 certificate, `--handover-peer-name` (the DNS name the other instance's certificate carries) and

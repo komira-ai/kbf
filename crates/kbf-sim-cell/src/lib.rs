@@ -16,7 +16,7 @@
 //! server can be taken down at a named point of its write path ([`CrashPlan`]).
 //!
 //! **All-in-one** ([`Kind::WholeProcess`]): one daemon is the daemon half of the
-//! server's process (`kbf all-in-one`; its design, komira-build-farm#657, section 8).
+//! server's process (`kbf all-in-one`; its design, kbf#657, section 8).
 //! It stores each run's output in the server before it reports, and a kill of the
 //! process takes both halves down together, mid-build, and starts both again.
 //!

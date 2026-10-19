@@ -1,8 +1,10 @@
-//! `kbf node` and `kbf enroll` against the in-process frontend of `kbf-enroll`'s tests
-//! (`kbf.enroll.v1` on a loopback listener, the real node library, real files in a scratch
-//! root): the first start enrolls and picks the mode, a restart does not enroll again, a
-//! refused token stops the start with the reason, and the renewer keeps the certificates
-//! fresh while the mode runs.
+//! The start of `storage`, `daemon` and `storage-and-daemon` against the in-process
+//! frontend of `kbf-enroll`'s tests (`kbf.enroll.v1` on a loopback listener, the real node
+//! library, real files in a scratch root): the mode resolves from the flag or the file, the
+//! first start enrolls for exactly the roles of the mode, a restart renews without the
+//! token, a token that lacks a role or an enrollment that does not cover the mode stops the
+//! start with exit 2, a frontend that is down is retried, `--check` enrolls nothing, and the
+//! renewer keeps the certificates fresh while the mode runs.
 //!
 //! The mode itself is not started: `run_with` takes the function that runs an
 //! [`Invocation`], and the tests give it one that records what it was given and looks at
@@ -17,8 +19,8 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kbf_cli::enroll::{Enroll, Env, Failure, enroll_with, ensure_enrolled, load};
-use kbf_cli::node::{Driver, Node, Renewer, run_with};
+use kbf_cli::enroll::{Env, Failure, Want, ensure_enrolled, load};
+use kbf_cli::node::{Driver, Renewer, Start, run_with};
 use kbf_cli::{Invocation, names};
 use kbf_enroll::client::{CallError, ConnectError, EnrollError};
 use kbf_enroll::config::Host;
@@ -30,16 +32,35 @@ use support::scratch;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
+/// Writes a `kbf.toml` that a start accepts whatever the umask of the test run is: the
+/// file may not be writable by group or other.
+fn write_config(path: &Path, text: &str) {
+    std::fs::write(path, text).expect("kbf.toml");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("mode");
+}
+
 struct Harness {
     run: Running,
     root: PathBuf,
+    /// The waits a start asked for before trying again.
+    waits: Arc<Mutex<Vec<Duration>>>,
+    /// How many waits are honoured (the start then tries again); the next one gives up.
+    patience: Arc<Mutex<usize>>,
+    /// Runs on every wait that is honoured, before the start tries again.
+    on_wait: Arc<Mutex<Option<Hook>>>,
 }
+
+/// What runs on a wait that is honoured.
+type Hook = Box<dyn Fn() + Send>;
 
 impl Harness {
     fn new(name: &str) -> Self {
         Self {
             run: fake::start(),
             root: scratch(name),
+            waits: Arc::default(),
+            patience: Arc::default(),
+            on_wait: Arc::default(),
         }
     }
 
@@ -73,7 +94,7 @@ impl Harness {
             self.token_path().display(),
             self.state().display(),
         );
-        std::fs::write(self.config_path(), text).expect("kbf.toml");
+        write_config(&self.config_path(), &text);
     }
 
     /// The fake's own frontend, a one-use token, and the files a start reads.
@@ -92,6 +113,11 @@ impl Harness {
 
     fn env(&self) -> Env {
         let fake = Arc::clone(self.fake());
+        let (waits, patience, on_wait) = (
+            Arc::clone(&self.waits),
+            Arc::clone(&self.patience),
+            Arc::clone(&self.on_wait),
+        );
         Env {
             host: Host {
                 hostname: "node-02".to_owned(),
@@ -99,14 +125,44 @@ impl Harness {
             },
             euid: rustix::process::geteuid().as_raw(),
             now: Arc::new(move || fake.now()),
+            pause: Arc::new(move |wait| {
+                waits.lock().expect("waits").push(wait);
+                let mut left = patience.lock().expect("patience");
+                if *left == 0 {
+                    return false;
+                }
+                *left -= 1;
+                if let Some(hook) = on_wait.lock().expect("hook").as_ref() {
+                    hook();
+                }
+                true
+            }),
         }
     }
 
-    fn node(&self) -> Node {
-        Node {
+    /// A start of `mode` on this host's `kbf.toml`.
+    fn start_of(&self, mode: Option<&'static str>) -> Start {
+        Start {
+            mode,
             config: self.config_path(),
+            check: false,
             labels: Vec::new(),
         }
+    }
+
+    /// Writes `mode = "..."` at the top of `kbf.toml`.
+    fn file_says(&self, mode: &str) {
+        let text = std::fs::read_to_string(self.config_path()).expect("kbf.toml");
+        write_config(&self.config_path(), &format!("mode = \"{mode}\"\n{text}"));
+    }
+
+    /// The roles the frontend was asked for, one list per `Enroll` call.
+    fn asked(&self) -> Vec<Vec<String>> {
+        self.fake()
+            .enrolls()
+            .iter()
+            .map(|e| e.csrs.iter().map(|c| c.role.clone()).collect())
+            .collect()
     }
 
     fn node_json(&self) -> String {
@@ -131,17 +187,28 @@ fn variant(invocation: &Invocation) -> &'static str {
         Invocation::Storage(_) => names::STORAGE,
         Invocation::StorageAndDaemon(_) => names::STORAGE_AND_DAEMON,
         Invocation::Frontend(_) => names::FRONTEND,
+        Invocation::Registered(_) => "registered",
     }
 }
 
-/// Runs `kbf node` on a thread of its own (it makes runtimes of its own), with a launcher
-/// that records the mode and returns exit status 7.
+/// Runs a start of the daemon mode on a thread of its own (it makes runtimes of its own),
+/// with a launcher that records the mode and returns exit status 7.
 async fn start(
     h: &Harness,
     launches: &Arc<Launches>,
     before_exit: impl Fn() + Send + 'static,
 ) -> Result<ExitCode, Failure> {
-    let (node, env) = (h.node(), h.env());
+    start_with(h, h.start_of(Some(names::DAEMON)), launches, before_exit).await
+}
+
+/// As [`start`], for `mode` on a start of the test's own making.
+async fn start_with(
+    h: &Harness,
+    node: Start,
+    launches: &Arc<Launches>,
+    before_exit: impl Fn() + Send + 'static,
+) -> Result<ExitCode, Failure> {
+    let env = h.env();
     let launches = Arc::clone(launches);
     tokio::task::spawn_blocking(move || {
         run_with(&node, &env, Driver::Container, &|invocation| {
@@ -158,16 +225,23 @@ async fn start(
     .expect("the start did not panic")
 }
 
-async fn enrolling(h: &Harness) -> Result<kbf_cli::enroll::Outcome, Failure> {
-    let (args, env) = (
-        Enroll {
-            config: h.config_path(),
-        },
-        h.env(),
-    );
-    tokio::task::spawn_blocking(move || enroll_with(&args, &env))
-        .await
-        .expect("no panic")
+/// Starts `mode` on the host's `kbf.toml`.
+async fn start_mode(
+    h: &Harness,
+    mode: &'static str,
+    launches: &Arc<Launches>,
+) -> Result<ExitCode, Failure> {
+    start_with(h, h.start_of(Some(mode)), launches, || {}).await
+}
+
+async fn enrolling(h: &Harness, mode: &'static str) -> Result<kbf_cli::enroll::Outcome, Failure> {
+    let (config, env) = (h.config_path(), h.env());
+    tokio::task::spawn_blocking(move || {
+        let loaded = load(&config, &env)?;
+        ensure_enrolled(&loaded, Want::of(mode).expect("a mode"), &env)
+    })
+    .await
+    .expect("no panic")
 }
 
 fn is_7(code: ExitCode) -> bool {
@@ -182,13 +256,13 @@ fn mode_of(path: &Path) -> u32 {
         & 0o777
 }
 
-/// Catches a first start that does not enroll, enrolls but starts another mode than the
-/// roles say, leaves the key readable, keeps the token file, or does not hand the mode's
+/// Catches a first start that does not enroll, enrolls but starts another mode than
+/// the one named, leaves the key readable, keeps the token file, or does not hand the mode's
 /// exit status back. The launcher looks at the files at the moment the mode would start:
 /// the certificate and key of the daemon role are there, the key private, and the token
 /// file is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_first_start_enrolls_and_runs_the_mode_the_roles_name() {
+async fn the_first_start_enrolls_and_runs_the_mode() {
     let h = Harness::new("node-first");
     h.ready("[daemon]\n");
     let launches = Arc::new(Launches::default());
@@ -311,11 +385,7 @@ async fn a_wrong_pin_is_refused_and_a_frontend_that_is_down_is_retried() {
     assert_eq!(failure.exit_code(), 2);
     assert!(h.fake().enrolls().is_empty(), "the secret was not sent");
 
-    let closed = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port();
+    let closed = kbf_testkit::port::dead_addr().port();
     h.write_config(closed, "[daemon]\n");
     let failure = start(&h, &launches, || {}).await.expect_err("unreachable");
     assert!(
@@ -339,7 +409,7 @@ async fn files_that_are_not_right_stop_the_start() {
 
     h.ready("[daemon]\nbogus = 1\n");
     let failure = start(&h, &launches, || {}).await.expect_err("bad config");
-    assert!(matches!(failure, Failure::Config(_)), "{failure:?}");
+    assert!(matches!(failure, Failure::Settings(_)), "{failure:?}");
     assert!(failure.to_string().contains("bogus"), "{failure}");
 
     h.ready("[daemon]\n");
@@ -381,7 +451,7 @@ async fn a_node_id_that_changed_since_enrollment_is_refused() {
     start(&h, &launches, || {}).await.expect("first start");
 
     let text = std::fs::read_to_string(h.config_path()).expect("kbf.toml");
-    std::fs::write(h.config_path(), text.replace("node-02", "node-03")).expect("rewrite");
+    write_config(&h.config_path(), &text.replace("node-02", "node-03"));
     let failure = start(&h, &launches, || {}).await.expect_err("renamed");
     assert!(
         matches!(&failure, Failure::RenamedNode { enrolled, configured }
@@ -392,44 +462,64 @@ async fn a_node_id_that_changed_since_enrollment_is_refused() {
     assert_eq!(launches.seen().len(), 1);
 }
 
-/// Catches `kbf enroll` that is not idempotent: the first run enrolls, the next ones
-/// report the node as enrolled and call the frontend no more, so it can run before every
-/// start.
+/// Catches enrollment that is not idempotent: the first call enrolls, the next ones report
+/// the node as enrolled and call the frontend no more, so every start can run it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn enroll_enrolls_once_and_then_does_nothing() {
+async fn enrolling_once_and_then_does_nothing() {
     let h = Harness::new("enroll-twice");
     h.ready("[daemon]\n");
-    let first = enrolling(&h).await.expect("enrolled");
+    let first = enrolling(&h, names::DAEMON).await.expect("enrolled");
     assert!(first.fresh);
     std::fs::remove_file(h.token_path()).ok();
-    let second = enrolling(&h).await.expect("already enrolled");
+    let second = enrolling(&h, names::DAEMON)
+        .await
+        .expect("already enrolled");
     assert!(!second.fresh);
     assert_eq!(second.node, first.node);
     assert_eq!(h.fake().enrolls().len(), 1);
 }
 
-/// Catches the wrong set of roles being asked for: the tables of `kbf.toml` name the
-/// roles, and a file that names neither (or both) asks for both. A request for a role the
-/// token lacks would be refused whole, so asking for no more than the file names is what
-/// lets a token that grants one role enroll.
+/// Catches the wrong set of roles being asked for. The mode names the roles, whatever the
+/// tables of `kbf.toml` say (they are settings only): `storage` asks for storage,
+/// `daemon` for daemon, `storage-and-daemon` for both, and the first start of each
+/// enrolls exactly those and starts exactly that mode. The tables are written to
+/// disagree with the mode on purpose: a `[daemon]` table must not make a storage node
+/// ask for the daemon role, and a file with no table must not make a daemon ask for both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_tables_of_kbf_toml_name_the_roles_asked_for() {
+async fn the_first_start_of_each_mode_enrolls_for_exactly_its_roles() {
     let cases = [
-        ("[daemon]\n", vec!["daemon"]),
-        ("[storage]\n", vec!["storage"]),
-        ("", vec!["storage", "daemon"]),
-        ("[storage]\n[daemon]\n", vec!["storage", "daemon"]),
+        (names::STORAGE, "[daemon]\n", vec!["storage"]),
+        (names::DAEMON, "[storage]\n", vec!["daemon"]),
+        (names::DAEMON, "", vec!["daemon"]),
+        (names::STORAGE, "", vec!["storage"]),
+        (
+            names::STORAGE_AND_DAEMON,
+            "[daemon]\n",
+            vec!["storage", "daemon"],
+        ),
+        (names::STORAGE_AND_DAEMON, "", vec!["storage", "daemon"]),
     ];
-    for (i, (extra, want)) in cases.into_iter().enumerate() {
+    for (i, (mode, extra, want)) in cases.into_iter().enumerate() {
         let h = Harness::new(&format!("enroll-roles-{i}"));
         h.ready(extra);
-        enrolling(&h).await.expect("enrolled");
-        let asked: Vec<String> = h.fake().enrolls()[0]
-            .csrs
-            .iter()
-            .map(|c| c.role.clone())
+        h.fake()
+            .set_cold_store("s3://bucket/prefix/?endpoint=https://objects.example");
+        let launches = Arc::new(Launches::default());
+        start_mode(&h, mode, &launches)
+            .await
+            .unwrap_or_else(|e| panic!("{mode} with {extra:?}: {e}"));
+        assert_eq!(launches.seen(), [mode], "{mode} with {extra:?}");
+        assert_eq!(
+            h.asked(),
+            std::slice::from_ref(&want),
+            "{mode} with {extra:?}"
+        );
+        let on_disk: Vec<String> = ["storage", "daemon"]
+            .into_iter()
+            .filter(|r| h.state().join("pki").join(format!("{r}.pem")).exists())
+            .map(str::to_owned)
             .collect();
-        assert_eq!(asked, want, "{extra:?}");
+        assert_eq!(on_disk, want, "{mode}: certificates on disk");
     }
 }
 
@@ -443,7 +533,7 @@ async fn a_configuration_missing_the_cold_store_is_refused_after_enrolling() {
     h.ready("");
     let launches = Arc::new(Launches::default());
     for _ in 0..2 {
-        let failure = start(&h, &launches, || {})
+        let failure = start_mode(&h, names::STORAGE_AND_DAEMON, &launches)
             .await
             .expect_err("no cold store");
         assert!(
@@ -530,7 +620,7 @@ async fn a_setting_for_a_role_the_node_does_not_hold_is_a_warning_not_a_refusal(
     assert_eq!(launches.seen(), [names::DAEMON]);
 }
 
-/// Catches a mode that refuses the flags `kbf node` built (here a label the daemon does not
+/// Catches a mode that refuses the flags the start built (here a label the daemon does not
 /// accept) starting anyway, or being reported as anything but a usage error: the node is
 /// enrolled, the mode's own parser says what it refused, and nothing runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -539,9 +629,9 @@ async fn a_label_the_mode_refuses_stops_the_start() {
     h.ready("[daemon]\n");
     let launches = Arc::new(Launches::default());
     let (node, env) = (
-        Node {
-            config: h.config_path(),
+        Start {
             labels: vec!["no-equals-sign".to_owned()],
+            ..h.start_of(Some(names::DAEMON))
         },
         h.env(),
     );
@@ -566,7 +656,8 @@ async fn renewing(h: &Harness) -> (Renewer, Store) {
     let (env, config) = (h.env(), h.config_path());
     tokio::task::spawn_blocking(move || {
         let loaded = load(&config, &env).expect("loaded");
-        let outcome = ensure_enrolled(&loaded, &env).expect("enrolled");
+        let outcome = ensure_enrolled(&loaded, Want::of(names::DAEMON).expect("daemon"), &env)
+            .expect("enrolled");
         (Renewer::new(&loaded, &outcome.node, &env, 0), loaded.store)
     })
     .await
@@ -810,5 +901,429 @@ async fn the_mode_runs_beside_a_renewer() {
         "the frontend saw a Renew while the mode ran"
     );
     assert!(is_7(code));
+    assert_eq!(h.fake().enrolls().len(), 1);
+}
+
+/// The cold store the storage half needs, so that a storage mode can start.
+const COLD: &str = "s3://bucket/prefix/?endpoint=https://objects.example";
+
+/// Catches a later start that enrolls again or needs the token (the file is gone after the
+/// first start), and one that does not renew: for each mode that reads `kbf.toml`, the
+/// first start enrolls (one `Enroll`), the token file is removed, the clock moves past
+/// half the certificates' life, and the second start sends one `Renew` while the mode
+/// runs and no second `Enroll`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_start_of_each_mode_renews_without_the_token() {
+    for mode in [names::STORAGE, names::DAEMON, names::STORAGE_AND_DAEMON] {
+        let h = Harness::new(&format!("later-{mode}"));
+        h.ready("");
+        h.fake().set_cold_store(COLD);
+        let launches = Arc::new(Launches::default());
+        start_mode(&h, mode, &launches).await.expect("first start");
+        assert_eq!(h.fake().enrolls().len(), 1, "{mode}");
+        assert!(
+            !h.token_path().exists(),
+            "{mode}: enrolling removes the token file, so the second start has none"
+        );
+        h.fake().set_now(h.fake().now() + LIFE_S / 2 + 10);
+
+        let fake = Arc::clone(h.fake());
+        start_with(&h, h.start_of(Some(mode)), &launches, move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while fake.renews().is_empty() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{mode}: a start with no token file: {e}"));
+
+        assert_eq!(launches.seen(), [mode, mode]);
+        assert_eq!(h.fake().enrolls().len(), 1, "{mode}: one Enroll, ever");
+        let renews = h.fake().renews();
+        assert_eq!(renews.len(), 1, "{mode}");
+        let roles: Vec<&str> = renews[0].csrs.iter().map(|c| c.role.as_str()).collect();
+        let want: &[&str] = match mode {
+            names::STORAGE => &["storage"],
+            names::DAEMON => &["daemon"],
+            _ => &["storage", "daemon"],
+        };
+        assert_eq!(roles, want, "{mode}: the renewal covers the mode's roles");
+    }
+}
+
+/// Catches a token that does not grant a role the mode needs being used anyway, or
+/// retried, or reported as a network failure: the frontend's typed refusal stops the start
+/// with exit 2 (a restart cannot fix it), the reason is in the message, nothing is
+/// launched or installed and the token file stays. A token that grants more than the mode
+/// needs enrolls only what the mode asks for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_lacking_a_needed_role_exits_2_with_the_typed_refusal() {
+    let cases = [
+        (names::DAEMON, vec!["storage"]),
+        (names::STORAGE, vec!["daemon"]),
+        (names::STORAGE_AND_DAEMON, vec!["storage"]),
+        (names::STORAGE_AND_DAEMON, vec!["daemon"]),
+    ];
+    for (i, (mode, granted)) in cases.into_iter().enumerate() {
+        let h = Harness::new(&format!("lacking-{i}"));
+        h.ready("");
+        h.put_token(&h.fake().mint_roles(1, 1, &granted));
+        let launches = Arc::new(Launches::default());
+
+        let failure = start_mode(&h, mode, &launches).await.expect_err("refused");
+
+        assert!(
+            matches!(
+                &failure,
+                Failure::Enroll(EnrollError::Call(CallError::Refused(
+                    RefusalReason::RoleNotGranted
+                )))
+            ),
+            "{mode} with a token for {granted:?}: {failure:?}"
+        );
+        assert_eq!(failure.exit_code(), 2, "{mode}");
+        assert!(
+            failure
+                .to_string()
+                .contains(RefusalReason::RoleNotGranted.message()),
+            "{failure}"
+        );
+        assert!(launches.seen().is_empty());
+        assert!(h.waits.lock().expect("waits").is_empty(), "not retried");
+        assert!(!h.state().join("pki/node.json").exists());
+        assert!(h.token_path().exists());
+    }
+
+    let h = Harness::new("lacking-more");
+    h.ready("");
+    h.put_token(&h.fake().mint_roles(1, 1, &["storage", "daemon"]));
+    let launches = Arc::new(Launches::default());
+    start_mode(&h, names::DAEMON, &launches)
+        .await
+        .expect("a token for more than the mode needs");
+    assert_eq!(h.asked(), [vec!["daemon".to_owned()]]);
+}
+
+/// Catches a mode changed after enrollment running on certificates that do not cover it,
+/// or enrolling again behind the operator's back: a node enrolled for the daemon role,
+/// now configured `storage` or `storage-and-daemon`, exits 2 naming the roles it holds
+/// and the mode, calls the frontend no more and launches nothing; the mode it is
+/// enrolled for, or one that needs less, still starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enrolled_roles_that_do_not_cover_the_mode_exit_2() {
+    let h = Harness::new("not-covered");
+    h.ready("");
+    h.fake().set_cold_store(COLD);
+    let launches = Arc::new(Launches::default());
+    start_mode(&h, names::DAEMON, &launches)
+        .await
+        .expect("daemon");
+    // A fresh token would let a silent re-enrollment succeed, which is the bug.
+    h.put_token(&h.fake().mint(2, 5));
+
+    for mode in [names::STORAGE, names::STORAGE_AND_DAEMON] {
+        let failure = start_mode(&h, mode, &launches)
+            .await
+            .expect_err("not covered");
+        let text = failure.to_string();
+        assert!(
+            matches!(failure, Failure::NotCovered { .. }),
+            "{mode}: {text}"
+        );
+        assert_eq!(failure.exit_code(), 2, "{mode}");
+        assert!(
+            text.contains(mode)
+                && text.contains("enrolled for [daemon]")
+                && text.contains("storage"),
+            "names the mode and what is enrolled: {text}"
+        );
+    }
+    assert_eq!(
+        launches.seen(),
+        [names::DAEMON],
+        "only the first start ran a mode"
+    );
+    assert_eq!(h.fake().enrolls().len(), 1, "no silent re-enrollment");
+    assert!(h.token_path().exists());
+
+    // Enrolled for both, a mode of one role is covered; the file's mode can be changed.
+    let both = Harness::new("covered-by-more");
+    both.ready("");
+    both.fake().set_cold_store(COLD);
+    let launches = Arc::new(Launches::default());
+    start_mode(&both, names::STORAGE_AND_DAEMON, &launches)
+        .await
+        .expect("both");
+    start_mode(&both, names::STORAGE, &launches)
+        .await
+        .expect("storage is covered");
+    start_mode(&both, names::DAEMON, &launches)
+        .await
+        .expect("daemon is covered");
+    assert_eq!(
+        launches.seen(),
+        [names::STORAGE_AND_DAEMON, names::STORAGE, names::DAEMON]
+    );
+    assert_eq!(both.fake().enrolls().len(), 1);
+}
+
+/// Catches the mode's sources being mixed up: the flag alone, the file alone (a start with
+/// no mode flag), the flag beating a file that says another mode (and enrolling for the
+/// flag's roles), and neither source being a refusal that names both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_mode_is_the_flag_else_the_file_else_exit_2() {
+    let h = Harness::new("mode-source");
+    h.ready("");
+    h.file_says("daemon");
+    let launches = Arc::new(Launches::default());
+    start_with(&h, h.start_of(None), &launches, || {})
+        .await
+        .expect("the file's mode");
+    assert_eq!(launches.seen(), [names::DAEMON]);
+    assert_eq!(h.asked(), [vec!["daemon".to_owned()]]);
+
+    let h = Harness::new("mode-flag-wins");
+    h.ready("");
+    h.fake().set_cold_store(COLD);
+    h.file_says("storage-and-daemon");
+    let launches = Arc::new(Launches::default());
+    start_mode(&h, names::STORAGE, &launches)
+        .await
+        .expect("the flag's mode");
+    assert_eq!(launches.seen(), [names::STORAGE]);
+    assert_eq!(
+        h.asked(),
+        [vec!["storage".to_owned()]],
+        "the flag's roles, not the file's"
+    );
+
+    let h = Harness::new("mode-neither");
+    h.ready("");
+    let launches = Arc::new(Launches::default());
+    let failure = start_with(&h, h.start_of(None), &launches, || {})
+        .await
+        .expect_err("no mode");
+    let text = failure.to_string();
+    assert!(matches!(failure, Failure::NoMode { .. }), "{text}");
+    assert_eq!(failure.exit_code(), 2);
+    assert!(
+        text.contains("--mode") && text.contains("mode = ") && text.contains("kbf.toml"),
+        "{text}"
+    );
+    assert!(launches.seen().is_empty() && h.fake().enrolls().is_empty());
+
+    // No file either: the refusal still names both, and why the file does not help.
+    let gone = Start {
+        config: h.root.join("none.toml"),
+        ..h.start_of(None)
+    };
+    let failure = start_with(&h, gone, &launches, || {})
+        .await
+        .expect_err("no file");
+    let text = failure.to_string();
+    assert!(matches!(failure, Failure::NoMode { .. }), "{text}");
+    assert!(
+        text.contains("none.toml") && text.contains("cannot read"),
+        "{text}"
+    );
+
+    // A name in the file that is not a mode.
+    h.file_says("node");
+    let failure = start_with(&h, h.start_of(None), &launches, || {})
+        .await
+        .expect_err("not a mode");
+    assert!(matches!(failure, Failure::BadMode { .. }), "{failure}");
+
+    // A mode that takes flags, not a file.
+    let h = Harness::new("mode-flags-only");
+    h.ready("");
+    h.file_says("frontend");
+    let failure = start_with(&h, h.start_of(None), &launches, || {})
+        .await
+        .expect_err("flags only");
+    assert!(matches!(failure, Failure::FlagsOnly(_)), "{failure}");
+}
+
+/// A start of `mode` that only checks.
+fn checking(h: &Harness, mode: Option<&'static str>) -> Start {
+    Start {
+        check: true,
+        ..h.start_of(mode)
+    }
+}
+
+/// Catches `--check` that fails a host that is configured and not enrolled yet (the unit's
+/// `ExecStartPre` would keep the first start from ever enrolling), or that enrolls,
+/// dials the frontend, reads the token away or starts a mode: for each mode the check
+/// passes with a valid `kbf.toml` and a token file and no `node.json`, and nothing
+/// changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn check_passes_before_enrollment_and_changes_nothing() {
+    for mode in [names::STORAGE, names::DAEMON, names::STORAGE_AND_DAEMON] {
+        let h = Harness::new(&format!("check-before-{mode}"));
+        h.ready("");
+        let launches = Arc::new(Launches::default());
+        let code = start_with(&h, checking(&h, Some(mode)), &launches, || {})
+            .await
+            .unwrap_or_else(|e| panic!("{mode}: {e}"));
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::SUCCESS),
+            "{mode}"
+        );
+        assert!(launches.seen().is_empty(), "{mode}: --check starts nothing");
+        assert!(
+            h.fake().enrolls().is_empty(),
+            "{mode}: --check enrolls nothing"
+        );
+        assert!(
+            h.token_path().exists(),
+            "{mode}: the token file is untouched"
+        );
+        assert!(!h.state().join("pki/node.json").exists(), "{mode}");
+    }
+    // The mode from the file passes the same.
+    let h = Harness::new("check-file-mode");
+    h.ready("");
+    h.file_says("daemon");
+    start_with(
+        &h,
+        checking(&h, None),
+        &Arc::new(Launches::default()),
+        || {},
+    )
+    .await
+    .expect("the file's mode checks");
+}
+
+/// Catches `--check` that passes what a start would refuse: a config that is not right (a
+/// key it does not know, no file), a token file that is missing or open, and an
+/// enrolled `node.json` that does not cover the mode or names another node are each exit 2
+/// with the cause; and one that fails an enrolled host that a start would run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn check_exits_2_for_a_host_that_cannot_start() {
+    let launches = Arc::new(Launches::default());
+    let h = Harness::new("check-bad");
+
+    let failure = start_with(&h, checking(&h, Some(names::DAEMON)), &launches, || {})
+        .await
+        .expect_err("no config");
+    assert!(matches!(failure, Failure::ReadConfig { .. }), "{failure:?}");
+    assert_eq!(failure.exit_code(), 2);
+
+    h.ready("[daemon]\nbogus = 1\n");
+    let failure = start_with(&h, checking(&h, Some(names::DAEMON)), &launches, || {})
+        .await
+        .expect_err("bad config");
+    assert!(matches!(failure, Failure::Settings(_)), "{failure:?}");
+    assert!(failure.to_string().contains("bogus"), "{failure}");
+    assert_eq!(failure.exit_code(), 2);
+
+    h.ready("");
+    std::fs::set_permissions(h.token_path(), std::fs::Permissions::from_mode(0o644)).expect("mode");
+    let failure = start_with(&h, checking(&h, Some(names::DAEMON)), &launches, || {})
+        .await
+        .expect_err("open token");
+    assert!(
+        matches!(failure, Failure::Token(TokenFileError::Mode { .. })),
+        "{failure:?}"
+    );
+    std::fs::remove_file(h.token_path()).expect("rm");
+    let failure = start_with(&h, checking(&h, Some(names::DAEMON)), &launches, || {})
+        .await
+        .expect_err("no token");
+    assert!(
+        matches!(failure, Failure::Token(TokenFileError::Io { .. })),
+        "{failure:?}"
+    );
+    assert_eq!(failure.exit_code(), 2);
+
+    // Enrolled for the daemon only: the daemon checks, the storage modes do not.
+    let h = Harness::new("check-enrolled");
+    h.ready("");
+    h.fake().set_cold_store(COLD);
+    start_mode(&h, names::DAEMON, &launches)
+        .await
+        .expect("enrolled");
+    start_with(&h, checking(&h, Some(names::DAEMON)), &launches, || {})
+        .await
+        .expect("an enrolled host checks");
+    for mode in [names::STORAGE, names::STORAGE_AND_DAEMON] {
+        let failure = start_with(&h, checking(&h, Some(mode)), &launches, || {})
+            .await
+            .expect_err("not covered");
+        assert!(
+            matches!(failure, Failure::NotCovered { .. }),
+            "{mode}: {failure:?}"
+        );
+        assert_eq!(failure.exit_code(), 2);
+    }
+    let text = std::fs::read_to_string(h.config_path()).expect("kbf.toml");
+    write_config(&h.config_path(), &text.replace("node-02", "node-03"));
+    let failure = start_with(&h, checking(&h, Some(names::DAEMON)), &launches, || {})
+        .await
+        .expect_err("renamed");
+    assert!(
+        matches!(failure, Failure::RenamedNode { .. }),
+        "{failure:?}"
+    );
+    assert_eq!(launches.seen(), [names::DAEMON], "no check started a mode");
+    assert_eq!(h.fake().enrolls().len(), 1);
+}
+
+/// Catches a frontend that is down failing the first start for good, or hammering it: the
+/// start waits 5 seconds, then 10, then 20 (it asks the wait to be made through the
+/// environment, so the test does not sleep), and gives up with the failure and exit 1 only
+/// when the environment says so; a frontend that comes back while the start waits is
+/// enrolled with, and the mode starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_that_is_down_is_retried_with_a_backoff() {
+    let h = Harness::new("retry-down");
+    h.ready("");
+    h.fake().refuse_with(Some(RefusalReason::StoreUnavailable));
+    *h.patience.lock().expect("patience") = 2;
+    let launches = Arc::new(Launches::default());
+
+    let failure = start(&h, &launches, || {}).await.expect_err("gives up");
+
+    assert_eq!(failure.exit_code(), 1, "{failure:?}");
+    assert_eq!(
+        *h.waits.lock().expect("waits"),
+        [5, 10, 20].map(Duration::from_secs),
+        "three waits were asked for, two were honoured"
+    );
+    assert_eq!(
+        h.fake().enrolls().len(),
+        3,
+        "one attempt before each wait, and one after"
+    );
+    assert!(launches.seen().is_empty());
+    assert!(h.token_path().exists());
+
+    // It comes back while the start waits.
+    let h = Harness::new("retry-back");
+    h.ready("");
+    h.fake().refuse_with(Some(RefusalReason::RateLimited));
+    *h.patience.lock().expect("patience") = 5;
+    let fake = Arc::clone(h.fake());
+    *h.on_wait.lock().expect("hook") = Some(Box::new(move || fake.refuse_with(None)));
+    let launches = Arc::new(Launches::default());
+    let code = start(&h, &launches, || {})
+        .await
+        .expect("enrolled after a wait");
+    assert!(is_7(code));
+    assert_eq!(*h.waits.lock().expect("waits"), [Duration::from_secs(5)]);
+    assert_eq!(launches.seen(), [names::DAEMON]);
+
+    // A failure a restart cannot fix is never waited on.
+    let h = Harness::new("retry-never");
+    h.ready("");
+    h.fake().refuse_with(Some(RefusalReason::TokenExpired));
+    *h.patience.lock().expect("patience") = 5;
+    let failure = start(&h, &Arc::new(Launches::default()), || {})
+        .await
+        .expect_err("refused");
+    assert_eq!(failure.exit_code(), 2);
+    assert!(h.waits.lock().expect("waits").is_empty());
     assert_eq!(h.fake().enrolls().len(), 1);
 }

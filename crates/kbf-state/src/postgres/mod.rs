@@ -10,7 +10,9 @@
 //!   `Expire` rows. A test injects a clock ([`PostgresStore::with_clock`]) and the same
 //!   statements take its reading instead.
 //! - **C5.** Revisions come from one head row that a writer locks first and holds to its
-//!   commit, so they commit in the order they were taken. [`Store::changes`] reads the
+//!   commit, so they commit in the order they were taken. A writer queues on a table lock
+//!   (`SHARE UPDATE EXCLUSIVE`) before its snapshot, so waiting costs no
+//!   serialization retry. [`Store::changes`] reads the
 //!   committed head, then the rows up to it, and returns the head as its cursor: nothing
 //!   at or below it can still commit. A bare sequence would not do (a later number can
 //!   commit first and a poller steps over the earlier one); [`Flaw::SequenceRevisions`]
@@ -323,6 +325,7 @@ pub struct PostgresStore {
     flaw: Flaw,
     txns: AtomicU64,
     syncs: AtomicU64,
+    retries: AtomicU64,
 }
 
 /// A batch run in a database transaction that is not committed yet. Test support: it is
@@ -372,6 +375,7 @@ impl PostgresStore {
             flaw: Flaw::None,
             txns: AtomicU64::new(0),
             syncs: AtomicU64::new(0),
+            retries: AtomicU64::new(0),
         })
     }
 
@@ -387,6 +391,14 @@ impl PostgresStore {
     pub fn with_flaw(mut self, flaw: Flaw) -> PostgresStore {
         self.flaw = flaw;
         self
+    }
+
+    /// How many times a batch has been run again because the server rolled it back for a
+    /// serialization failure or a deadlock. A writer that waits its turn for the commit
+    /// head costs none.
+    #[must_use]
+    pub fn retries(&self) -> u64 {
+        self.retries.load(Ordering::Relaxed)
     }
 
     /// The configuration this store was opened with.
@@ -436,7 +448,9 @@ impl PostgresStore {
         for _ in 0..MAX_ATTEMPTS {
             match attempt() {
                 Ok(done) => return Ok(done),
-                Err(fail) if fail.retryable() => {}
+                Err(fail) if fail.retryable() => {
+                    self.retries.fetch_add(1, Ordering::Relaxed);
+                }
                 Err(fail) => return Err(fail.into_store()),
             }
         }

@@ -40,6 +40,7 @@ use crate::identity::{DenyList, Peers};
 use crate::listen::Binder;
 use crate::members::{Members, MembershipError};
 use crate::members_rpc::MembershipService;
+use crate::proxy_auth::{ProxyAuthLayer, ProxySecret, gate_requests};
 use crate::state_store::StateStore;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
@@ -107,7 +108,7 @@ pub struct Listeners {
 
 /// What keeps a long-lived stream from looking idle to a load balancer, a proxy or the
 /// peer: Buck2 sends one Execute per action and never reconnects a broken one, so an
-/// idle-timeout cut fails the action (komira-build-farm#791). Zero turns each off.
+/// idle-timeout cut fails the action (kbf#791). Zero turns each off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamTiming {
     /// How often every open Execute and WaitExecution stream is sent its operation
@@ -143,6 +144,18 @@ pub struct WorkerTls {
     /// re-read from their files as they change.
     pub server: TlsSource,
     /// The certificates and nodes refused, read again at every check.
+    pub deny_list: Option<DenyList>,
+}
+
+/// A server that sits behind a TLS-terminating proxy ([`crate::proxy_auth`]). It takes calls
+/// from loopback only, and believes the identity the proxy forwards under `secret`.
+#[derive(Clone, Debug)]
+pub struct Behind {
+    /// The per-boot secret the proxy presents.
+    pub secret: Arc<ProxySecret>,
+    /// The worker listener's deny list, applied to the nodes the proxy names when the
+    /// listener has no TLS of its own to carry one ([`WorkerTls::deny_list`]); that has
+    /// no certificate to compare, so only a `node` entry can name a caller.
     pub deny_list: Option<DenyList>,
 }
 
@@ -246,7 +259,10 @@ pub(crate) fn serve_api(
     listener: Option<tokio::net::TcpListener>,
     routes: axum::Router,
     stop: impl Future<Output = ()> + Send + 'static,
+    proxy: Option<Arc<ProxySecret>>,
 ) -> impl Future<Output = std::io::Result<()>> {
+    // Every route, the fallback too, sees only a call that passed the proxy check.
+    let routes = routes.layer(axum::middleware::from_fn_with_state(proxy, gate_requests));
     match listener {
         Some(listener) => Either::Left(
             axum::serve(
@@ -284,28 +300,48 @@ pub(crate) fn bind_api(
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
-/// The worker listener's server: every call goes through the per-method role table
-/// ([`crate::worker_roles`]) before it is routed.
-pub(crate) type WorkerListener = Server<Stack<WorkerRolesLayer, Identity>>;
+/// The worker listener's server: every call goes through the proxy check
+/// ([`crate::proxy_auth`]), then the per-method role table ([`crate::worker_roles`]), before
+/// it is routed. (`Server::layer` makes the first layer added the outermost.)
+pub(crate) type WorkerListener = Server<Stack<WorkerRolesLayer, Stack<ProxyAuthLayer, Identity>>>;
 
 /// The worker listener's role table, its TLS source, and the way its peers are told
 /// apart. Every worker listener is made here, so none serves a call the table does not
 /// list. Not generic, so both arms are one set of lines whatever the cache types (a
 /// per-instantiation copy that misses one arm would count as missed lines).
+///
+/// Behind a proxy without TLS of its own the listener is still `Certified`: the identity is
+/// the proxy's, and the proxy terminates the TLS that carried the certificate.
 pub(crate) fn worker_peers(
     server: Server,
     tls: Option<WorkerTls>,
+    behind: Option<&Behind>,
 ) -> (WorkerListener, Peers, Option<TlsSource>) {
-    match tls {
-        Some(tls) => (
-            server.layer(WorkerRolesLayer::new(Admission::Certified)),
+    let secret = behind.map(|behind| Arc::clone(&behind.secret));
+    let proxy = ProxyAuthLayer::new(secret);
+    match (tls, behind) {
+        (Some(tls), _) => (
+            server
+                .layer(proxy)
+                .layer(WorkerRolesLayer::new(Admission::Certified)),
             Peers::Certified {
                 deny_list: tls.deny_list,
             },
             Some(tls.server),
         ),
-        None => (
-            server.layer(WorkerRolesLayer::new(Admission::Open)),
+        (None, Some(behind)) => (
+            server
+                .layer(proxy)
+                .layer(WorkerRolesLayer::new(Admission::Certified)),
+            Peers::Certified {
+                deny_list: behind.deny_list.clone(),
+            },
+            None,
+        ),
+        (None, None) => (
+            server
+                .layer(proxy)
+                .layer(WorkerRolesLayer::new(Admission::Open)),
             Peers::Unauthenticated,
             None,
         ),
@@ -492,7 +528,7 @@ where
 /// are refused UNAVAILABLE, which Buck2 retries when it opens the call; and the REAPI
 /// listener stops accepting and every connection on it is sent GOAWAY. Open Execute and
 /// WaitExecution streams are kept until their action is done: Buck2 does not recover a
-/// stream that breaks (komira-build-farm#791), so ending one fails its action. The
+/// stream that breaks (kbf#791), so ending one fails its action. The
 /// serving future returns once the REAPI connections have closed. Only
 /// `listeners.shutdown_timeout` (when it is not [`Duration::MAX`]) or [`Drain::close`]
 /// (a second stop signal) ends the streams that are not done, UNAVAILABLE, after which
@@ -542,7 +578,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, None, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, None, None, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
@@ -562,7 +600,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, state, None, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, state, None, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_state`], sending daemons the storage map `map` holds if given: in
@@ -583,7 +623,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, state, None, map, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, state, None, map, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`], and with a `storage` node (`--storage`) the REAPI
@@ -604,13 +646,17 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, storage, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, None, storage, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`] with all of its options: the scheduler's state in
 /// `state` ([`bind_server_with_state`]), the client's CAS, ByteStream and
 /// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]), and
-/// the storage map `map` sent to daemons ([`bind_server_with_map`]).
+/// the storage map `map` sent to daemons ([`bind_server_with_map`]), and a TLS-terminating
+/// `proxy` in front of every listener (`--proxy-auth-file`, [`crate::proxy_auth`]; `None`:
+/// the server is reached directly).
 ///
 /// # Errors
 /// As [`bind_server_with_state`].
@@ -626,6 +672,7 @@ pub fn bind_server_with_options<M, O>(
     state: Option<StateStore>,
     storage: Option<tonic::transport::Endpoint>,
     map: Option<Arc<dyn MapSource>>,
+    proxy: Option<Behind>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -658,6 +705,7 @@ where
     let update_rows = state
         .as_ref()
         .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
+    let update_store = state.as_ref().map(|s| Arc::clone(&s.store));
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -669,6 +717,7 @@ where
             listeners.streams,
         ),
         listeners.worker_tls,
+        proxy.as_ref(),
     );
     let tls_sources: Vec<TlsSource> = listeners
         .reapi_tls
@@ -704,6 +753,8 @@ where
         history.as_ref().map(crate::history::History::reads),
         budget,
     );
+    let offers =
+        crate::release::offers::offers_of(releases.clone(), update_rows.clone(), listeners.tick);
     let api_routes = crate::api::router(
         Arc::clone(&farm),
         token.clone(),
@@ -743,10 +794,12 @@ where
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
+    let proxy_secret = proxy.as_ref().map(|behind| Arc::clone(&behind.secret));
     let mut reapi_server = keepalive(
         flow_control(Server::builder(), listeners.stream_limits.reapi),
         listeners.streams,
-    );
+    )
+    .layer(ProxyAuthLayer::new(proxy_secret.clone()));
     let worker_blobs = ByteStreamServer::new(WorkerBlobs::new(
         ByteStreamService::new(Arc::clone(&cache)),
         peers.clone(),
@@ -779,6 +832,10 @@ where
     );
     // The map, if there is one: no branch in this generic function.
     let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+    // The offers, if there are a release store and a state store: no branch here either.
+    let sessions = offers
+        .into_iter()
+        .fold(sessions, WorkerService::with_offers);
     let worker_service = WorkerServer::new(sessions)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -829,6 +886,10 @@ where
         // and they never delay it. It stops when the serving future does.
         let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
+        // The rolling-update controller; it starts no host until `auto_nodes` is set.
+        let _updates =
+            crate::update::spawn_controller(Arc::clone(&farm), update_store, listeners.tick)
+                .map(AbortOnDrop);
         // `reapi_incoming` carries the REAPI TLS when there is any, so the health
         // service is served over the same TLS as the REAPI routes; the authenticator is
         // already applied to those routes alone (above).
@@ -855,6 +916,7 @@ where
             async {
                 let _ = api_stopped.await;
             },
+            proxy_secret,
         );
         tokio::pin!(api_serve);
         let sweeping = sweeping(members);

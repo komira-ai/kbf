@@ -69,7 +69,7 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -106,6 +106,7 @@ use crate::handover::{
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::listen::{Binder, Socket};
 use crate::members::Members;
+use crate::proxy_auth::ProxyAuthLayer;
 use crate::serve::{
     AbortOnDrop, ServeError, drain_and_stop, flow_control, keepalive, log_state, map_of,
     members_of, membership, serve_api, stop_api, sweeping, worker_peers,
@@ -132,6 +133,7 @@ pub const ALLOWED: &[&str] = &[
     "worker_client_ca",
     "tls_reload_interval_secs",
     "worker_deny_list",
+    "proxy_auth_file",
     "heartbeat_interval_ms",
     "progress_interval_secs",
     "http2_keepalive_interval_secs",
@@ -167,6 +169,10 @@ const HANDOVER: [&str; 3] = [
     "handover_follow_interval_ms",
 ];
 
+/// The id of the flag that turns on the object-store registration API and names where its
+/// secret files are kept.
+const SECRETS_DIR: &str = "object_store_secrets_dir";
+
 /// The ids of the flags that say which instance this is, how long a holder waits for its
 /// successor to serve, the name the successor's certificate carries, and Envoy's check
 /// settings (interval, timeout, unhealthy threshold).
@@ -180,7 +186,7 @@ const CHECK: [&str; 3] = [
 ];
 
 /// The defaults of the timings: the quiesce wait and follow interval, the watchdog, and
-/// Envoy's check (the box render's: `kbf-deploy envoy render --topology box`).
+/// Envoy's check (the installer's box render).
 const QUIESCE_SECS: &str = "10";
 const FOLLOW_INTERVAL_MS: &str = "200";
 const WATCHDOG_SECS: &str = "15";
@@ -200,6 +206,10 @@ pub struct FrontendFlags {
     /// How this frontend hands over to a successor and takes over from a predecessor;
     /// `None` without `--handover-socket`.
     pub handover: Option<Handover>,
+    /// `--object-store-secrets-dir`: where the secret keys of the registered object-store
+    /// connections are kept (one 0600 file each), which also turns on the
+    /// `/v1/object-stores` routes of the operator API. `None`: they answer 404.
+    pub object_store_secrets_dir: Option<PathBuf>,
 }
 
 /// The long names of the flags of [`Args`] that `kbf frontend` hides and refuses by name
@@ -329,6 +339,22 @@ pub fn command() -> Command {
                  and this name; without it such a frontend refuses a handover.",
             ),
     )
+    .arg(
+        Arg::new(SECRETS_DIR)
+            .long("object-store-secrets-dir")
+            .value_name("DIR")
+            .value_parser(clap::value_parser!(PathBuf))
+            .requires_all(["api_listen", "api_token_file", "state_store"])
+            .help(
+                "Turns on the object-store registration routes of the operator API \
+                 (/v1/object-stores, docs/api.md) and names the directory where the secret \
+                 key of each registered connection is kept, one file of mode 0600 each, in a \
+                 directory made 0700. The directory must be readable by every frontend \
+                 child that serves at once and left out of any backup of the host. The \
+                 registration itself (endpoints, buckets, the audit log) is kept in the \
+                 state store. Without it those routes answer 404.",
+            ),
+    )
     .arg(check_arg(0, "envoy-check-interval-ms", "MILLISECONDS", "The time between two of Envoy's health checks of a frontend (the cluster's `interval`)."))
     .arg(check_arg(1, "envoy-check-timeout-ms", "MILLISECONDS", "How long Envoy's health check waits for an answer (the cluster's `timeout`)."))
     .arg(check_arg(2, "envoy-unhealthy-threshold", "N", "How many of Envoy's checks in a row must fail before it stops choosing a frontend (`unhealthy_threshold`). The three give the settle: a frontend waits interval x threshold + timeout + interval before it goes not ready (Envoy has then seen the successor) and again before it exits (Envoy then sends it nothing)."))
@@ -393,6 +419,7 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         storage,
         tls,
         handover,
+        object_store_secrets_dir: m.get_one::<PathBuf>(SECRETS_DIR).cloned(),
     })
 }
 
@@ -747,6 +774,7 @@ fn state_uri(flags: &FrontendFlags) -> Result<&crate::StateStoreUri, HandoverErr
 struct Prepared<'a> {
     flags: &'a FrontendFlags,
     listeners: crate::serve::Listeners,
+    proxy: Option<crate::serve::Behind>,
     policy: kbf_auth::Policy,
     api: Option<crate::serve::Api>,
     channel: tonic::transport::Channel,
@@ -783,6 +811,7 @@ impl<'a> Prepared<'a> {
     fn new(flags: &'a FrontendFlags) -> Result<Self, Box<dyn Error>> {
         let args = &flags.server;
         let listeners = args.listeners()?;
+        let proxy = args.proxy()?;
         let policy = args.reapi_auth_policy()?;
         let api = args.api()?;
         let channel = flags.storage_endpoint()?.connect_lazy();
@@ -795,6 +824,7 @@ impl<'a> Prepared<'a> {
         Ok(Self {
             flags,
             listeners,
+            proxy,
             policy,
             api,
             channel,
@@ -823,6 +853,7 @@ impl<'a> Prepared<'a> {
         let Self {
             flags,
             listeners,
+            proxy,
             policy,
             api,
             channel,
@@ -879,6 +910,7 @@ impl<'a> Prepared<'a> {
                 listeners.streams,
             ),
             listeners.worker_tls,
+            proxy.as_ref(),
         );
         let tls_sources: Vec<TlsSource> = listeners
             .reapi_tls
@@ -905,7 +937,18 @@ impl<'a> Prepared<'a> {
         worker_stop.closes(worker_latch);
         let api_listener = api_socket.map(Socket::http).transpose()?;
         let (token, releases) = api.map_or((None, None), |api| (api.token, api.releases));
+        let update_store = state_store.clone();
         let update_rows = state_store.clone().map(crate::update::Rows::new);
+        let object_stores = flags
+            .object_store_secrets_dir
+            .as_deref()
+            .map(|dir| open_object_stores(dir, state_store.clone()))
+            .transpose()?;
+        let offers = crate::release::offers::offers_of(
+            releases.clone(),
+            update_rows.clone(),
+            listeners.tick,
+        );
         let api_routes = crate::api::router(
             Arc::clone(&farm),
             token.clone(),
@@ -917,6 +960,10 @@ impl<'a> Prepared<'a> {
             None,
         )
         .merge(crate::release::router(releases.clone(), token.clone()))
+        .merge(crate::object_store::api::routes(
+            token.clone(),
+            object_stores,
+        ))
         .merge(crate::update_hosts::router(
             Arc::clone(&farm),
             update_rows.clone(),
@@ -940,10 +987,12 @@ impl<'a> Prepared<'a> {
             routes.merge(crate::storage_health::router(Arc::clone(members)))
         });
 
+        let proxy_secret = proxy.as_ref().map(|behind| Arc::clone(&behind.secret));
         let mut reapi_server = keepalive(
             flow_control(Server::builder(), listeners.stream_limits.reapi),
             listeners.streams,
-        );
+        )
+        .layer(ProxyAuthLayer::new(proxy_secret.clone()));
         let membership = membership(members.clone(), &peers);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
@@ -953,6 +1002,9 @@ impl<'a> Prepared<'a> {
         );
         // Daemons are sent the members' map: Welcome.map and a MapUpdate at each bump.
         let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+        let sessions = offers
+            .into_iter()
+            .fold(sessions, WorkerService::with_offers);
         let worker_service = WorkerServer::new(sessions)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -1057,6 +1109,10 @@ impl<'a> Prepared<'a> {
         let serving = async move {
             let history = crate::history::spawn(history);
             let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
+            // The rolling-update controller; it starts no host until `auto_nodes` is set.
+            let _updates =
+                crate::update::spawn_controller(Arc::clone(&farm), update_store, listeners.tick)
+                    .map(AbortOnDrop);
             let reapi_serve = reapi_server
                 .add_routes(reapi_routes)
                 .serve_with_incoming_shutdown(reapi_incoming, async {
@@ -1070,9 +1126,14 @@ impl<'a> Prepared<'a> {
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
             // Told when the REAPI listener is done (see `serve::stop_api`).
             let (api_stop_when_done, api_stopped) = tokio::sync::oneshot::channel::<()>();
-            let api_serve = serve_api(api_listener, api_routes, async {
-                let _ = api_stopped.await;
-            })
+            let api_serve = serve_api(
+                api_listener,
+                api_routes,
+                async {
+                    let _ = api_stopped.await;
+                },
+                proxy_secret,
+            )
             .fuse();
             tokio::pin!(api_serve);
             let ticking = async {
@@ -1174,6 +1235,24 @@ fn dial_of(flags: &FrontendFlags) -> Result<crate::handover::Dial, ConfigError> 
 }
 
 /// The store `/readyz` probes: the open state store's, if there is one.
+/// The object-store registration API over the state store, with secret files in `dir`
+/// (`--object-store-secrets-dir`). No node reports yet, so every convergence is `false`.
+fn open_object_stores(
+    dir: &Path,
+    state: Option<Arc<dyn kbf_state::Store>>,
+) -> Result<Arc<crate::object_store::api::ObjectStoreApi>, Box<dyn Error>> {
+    let store = state.ok_or("--object-store-secrets-dir needs --state-store")?;
+    let runtime = tokio::runtime::Handle::try_current()?;
+    crate::object_store::api::ObjectStoreApi::open(
+        store,
+        dir,
+        runtime,
+        Arc::new(crate::object_store::api::NoAcks),
+    )
+    .map(Arc::new)
+    .map_err(|e| format!("--object-store-secrets-dir {}: {e}", dir.display()).into())
+}
+
 fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Store>> {
     state.map(|state| Arc::clone(&state.store))
 }
