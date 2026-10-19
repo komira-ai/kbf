@@ -1227,6 +1227,17 @@ impl State {
         match submitted {
             Some(Submitted::Queued(used)) => self.sched.skip_to(used),
             Some(Submitted::Joined(op)) => {
+                // The store names an operation the scheduler holds and has no twin
+                // for: it finished it, and the finish (which removes the rows) is
+                // held back. The request cannot join a finished operation, and
+                // taking the rows up again would run the action twice. It asks again:
+                // once the finish is written, the rows are gone and it queues afresh
+                // (or the cache answers it).
+                if self.sched.state(op.operation).is_some() {
+                    return Err(Status::unavailable(
+                        "the action's previous run is finishing; the request is not queued",
+                    ));
+                }
                 let recovered = self.take_stored(*op, SystemTime::now());
                 self.sched.take_in(recovered);
             }
