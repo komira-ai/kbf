@@ -554,7 +554,6 @@ impl Reply {
     }
 }
 
-/// Reads a response to its end.
 /// Sends the last DATA of a request. A server may answer, and so close the stream, before it
 /// reads the body (RFC 9113 section 8.1: a refusal does), and the send then fails with
 /// `InactiveStreamId`. That is not the client's error: the answer is already there, so the
@@ -563,6 +562,7 @@ pub(super) fn send_end(body: &mut SendStream<Bytes>, data: Bytes) {
     let _answered_first = body.send_data(data, true);
 }
 
+/// Reads a response to its end.
 pub(super) async fn finish(response: ResponseFuture) -> Reply {
     let mut reply = Reply {
         status: None,
