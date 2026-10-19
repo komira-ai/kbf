@@ -355,3 +355,68 @@ async fn a_forwarded_trailers_only_answer_ends_the_stream_on_its_headers() {
         "the head of a trailers-only answer carries END_STREAM"
     );
 }
+
+/// A fenced re-dispatch is a new bind of the same stream: the child is told the same caller,
+/// with the same secret, on both dispatches, and nothing the client forged under `x-kbf-*`
+/// reaches it on either.
+///
+/// Kills: a retry that clears the identity headers or forwards them as for an anonymous
+/// client; a retry that leaves off the secret; a retry that rebuilds its headers from the
+/// client's own (a forged `x-kbf-*` would survive).
+#[tokio::test(start_paused = true)]
+async fn a_fenced_redispatch_carries_the_same_identity_headers() {
+    use super::kit::{Access, SECRET, security};
+    use super::pki::{Pki, client_config};
+    use super::secure::h2_over_tls;
+    use crate::auth::Buck2Auth;
+    use crate::config::Limits;
+    use crate::control::NoUpdates;
+    use crate::slot::ActiveSlot;
+
+    let pki = Pki::new("farm CA");
+    let paths = pki.write(&crate::scratch::scratch("fenced-identity"), &pki.server());
+    let slots = ActiveSlot::new();
+    slots.open(Slot::A);
+    slots.set_active(Slot::A).expect("A is open");
+    let rig = Rig::build_with(
+        fencing(1, "second"),
+        tagged("b"),
+        NoUpdates,
+        Limits::default(),
+        slots,
+        security(Buck2Auth::None),
+        Access::Tls(paths),
+    )
+    .await;
+    let daemon = pki.client(&["node-7.farm"], Some("daemon"));
+    let mut client = h2_over_tls(&rig, client_config(&pki.ca_pem, Some(&daemon), &["h2"])).await;
+    let forged = [
+        ("x-kbf-node-id", "forged-node"),
+        ("x-kbf-role", "storage"),
+        ("x-kbf-proxy-auth", "guess"),
+        ("x-kbf-extra", "1"),
+    ];
+    let (response, mut send) = client.start_with(CAPS, false, &forged).await;
+    send_end(&mut send, Bytes::from_static(b"ping"));
+    let reply = finish(response).await;
+    assert_eq!(reply.text(), "second");
+    marker_stripped(&reply);
+    assert_eq!(rig.a.state.dispatches(), 2, "fenced once, then answered");
+
+    let seen = rig.a.state.headers_of(CAPS);
+    assert_eq!(seen.len(), 2, "the child saw the request twice");
+    let want = vec![
+        ("x-kbf-node-id".to_owned(), "node-7.farm".to_owned()),
+        ("x-kbf-proxy-auth".to_owned(), hex::encode(SECRET)),
+        ("x-kbf-role".to_owned(), "daemon".to_owned()),
+    ];
+    for (n, headers) in seen.iter().enumerate() {
+        let mut got: Vec<(String, String)> = headers
+            .iter()
+            .filter(|(k, _)| k.as_str().starts_with("x-kbf-"))
+            .map(|(k, v)| (k.to_string(), v.to_str().expect("text").to_owned()))
+            .collect();
+        got.sort();
+        assert_eq!(got, want, "dispatch {}", n + 1);
+    }
+}
