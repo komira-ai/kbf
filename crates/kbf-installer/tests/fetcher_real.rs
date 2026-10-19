@@ -223,8 +223,8 @@ impl Rig {
 /// given no expected facts (an activation without them is refused), the files handed over
 /// under the wrong name, an installed release without its marker, or scratch left behind.
 ///
-/// Mutants: `expected` passed as `None` (this test goes red: the facts are required);
-/// the `Fetched` handed over with no files (red: `kbf was not fetched`).
+/// Mutants: `expected` passed as `None` (red: an activation without facts is refused);
+/// `Pipeline::verify` skipped (red: no `VERIFIED` marker).
 #[test]
 fn an_activation_is_fetched_verified_and_installed() {
     let rig = Rig::new("good");
@@ -247,9 +247,8 @@ fn an_activation_is_fetched_verified_and_installed() {
 /// Catches the digest not compared (the pipeline would refuse later, and still leave the
 /// directory if cleanup failed) and the scratch directory kept after a refusal.
 ///
-/// Mutants: `fetch_component`'s digest comparison removed (red: the refusal then comes from
-/// the pipeline, with its own wording); the partial directory forgotten on a failed pull
-/// (`std::mem::forget`; red: scratch left).
+/// Mutants: a digest mismatch classed as an outage (red); the partial directory forgotten on a
+/// failed pull (`std::mem::forget`; red: scratch left).
 #[test]
 fn a_download_with_the_wrong_digest_is_refused_and_leaves_nothing() {
     let rig = Rig::new("digest");
@@ -321,7 +320,7 @@ fn a_child_that_cannot_start_leaves_nothing() {
 /// Catches a fetcher that installs what the child brought without the pipeline's checks.
 ///
 /// Mutant: `Pipeline::verify` skipped (the partial renamed into `releases/` and the order's
-/// own facts reported as installed): this test and the one below go red.
+/// own facts reported as installed): this test, the facts test and the lease test go red.
 #[test]
 fn a_release_the_attestation_does_not_accept_is_refused_and_not_installed() {
     let rig = Rig::new("attest");
@@ -344,10 +343,12 @@ fn a_release_the_attestation_does_not_accept_is_refused_and_not_installed() {
 /// A binary that declares other facts than the order expected is refused with `facts`, and
 /// not installed: the order's facts reach the pipeline.
 ///
-/// Catches the expected facts dropped on the way (an activation would install whatever the
-/// binary says).
+/// Catches the expected facts dropped or replaced on the way (the refusal must name the field
+/// and the value the order expected, not say that the order carried none), and a binary
+/// installed whatever it says.
 ///
-/// Mutant: the facts handed to the pipeline replaced by those the probe printed (red).
+/// Mutants: `expected` passed as `None` (red: "the order carries no expected facts");
+/// `Pipeline::verify` skipped (red).
 #[test]
 fn a_binary_that_declares_other_facts_is_refused() {
     let rig = Rig::new("facts");
@@ -358,7 +359,13 @@ fn a_binary_that_declares_other_facts_is_refused() {
     expected.protocol = 5;
     let got = fetcher.fetch_activation(&rec(vec![locator("kbf", &bytes)]), &expected);
     match got {
-        Err(FetchError::Rejected(why)) => assert!(why.starts_with("facts: "), "{why}"),
+        Err(FetchError::Rejected(why)) => {
+            assert!(
+                why.contains("protocol is 4, and the order expected 5"),
+                "{why}"
+            );
+            assert!(why.starts_with("facts: "), "{why}");
+        }
         other => panic!("{other:?}"),
     }
     assert_eq!(rig.work_left(), Vec::<String>::new(), "no scratch");
@@ -423,8 +430,7 @@ fn a_frontend_update_with_components_is_verified_without_facts() {
 /// Catches a name with a separator reaching `dl/<name>.tar.gz` (the file would land outside
 /// the directory).
 ///
-/// Mutant: the plain-name check removed (red: the file is made outside, and the stand-in
-/// child is started).
+/// Mutant: the plain-name check removed (red).
 #[test]
 fn a_component_named_by_a_path_is_refused_before_a_file_is_made() {
     let rig = Rig::new("path-name");
@@ -448,7 +454,7 @@ fn a_component_named_by_a_path_is_refused_before_a_file_is_made() {
 ///
 /// Catches the lease step skipped on the real path (a host with work running would be swapped).
 ///
-/// Mutant: `leases` handed to the pipeline as an always-zero source (red).
+/// Mutant: `Pipeline::verify` skipped (red: the release is installed).
 #[test]
 fn a_lease_source_that_cannot_tell_refuses_after_the_download() {
     let rig = Rig::new("leases");
