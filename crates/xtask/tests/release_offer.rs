@@ -14,7 +14,7 @@ use kbf_gate::{
 use sha2::Digest;
 use xtask::Error;
 use xtask::package::Platform;
-use xtask::release::offer::{Attester, Evidence, Request, plan, write};
+use xtask::release::offer::{Attester, Evidence, Request, plan, summary, write};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
@@ -866,4 +866,112 @@ fn the_beta_control_catches_a_gh_that_ignores_the_commit() {
     assert!(!c.out.exists());
     let (code, _, err) = c.run(&["--beta-result", b]);
     assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
+fn a_gate_past_an_at_least_or_band_limit_is_refused_naming_the_limit() {
+    // Proves the refusal text states each limit kind the gate was judged against, so an
+    // operator reads which bound failed. Mutants: the `at least` / `warn .., red ..`
+    // wording changed or swapped (the substring asserts go red).
+    let f = fx("beta-limits");
+    let a = Recorded::all(C);
+    let w = |limit, recorded: f64| {
+        let mut d = beta_doc(C, &f.set);
+        d.gates = vec![GateResult::decide(
+            "g",
+            Sample::Value(recorded),
+            limit,
+            100,
+            200,
+        )];
+        d
+    };
+    // Recorded green; the number the document carries now fails the limit.
+    let ok = w(Limit::AtLeast(5.0), 6.0);
+    let beta = put_raw(&f.root, |v| v["gates"][0]["measured"] = 3.0.into(), &ok);
+    let why = refused(plan(&request(&f.dist, Evidence::Result(&beta)), &a));
+    assert!(why.contains("against at least 5"), "{why}");
+    let ok = w(
+        Limit::Band {
+            warn: 2.0,
+            red: 3.0,
+        },
+        1.0,
+    );
+    let beta = put_raw(&f.root, |v| v["gates"][0]["measured"] = 2.5.into(), &ok);
+    let why = refused(plan(&request(&f.dist, Evidence::Result(&beta)), &a));
+    assert!(why.contains("against warn 2, red 3"), "{why}");
+}
+
+#[test]
+fn an_unreadable_oversized_identity_or_sums_file_or_no_platform_is_refused() {
+    // Proves each refusal is a message, not a pass or a panic. Mutants: the size cap
+    // removed (oversized file parsed); a read error read as "unknown"; an empty sums
+    // file ignored; a beta with no run id offered as attested.
+    let f = fx("rev-unreadable");
+    let a = Recorded::all(C);
+    let w = || Evidence::Waived {
+        reason: "r",
+        operator: "o",
+    };
+    let mut r = request(&f.dist, w());
+    // A directory opens but cannot be read.
+    r.version_json = Some(&f.root);
+    let why = refused(plan(&r, &a));
+    assert!(why.contains("--version-json"), "{why}");
+    // One byte over the cap, though a valid identity otherwise.
+    let big = f.root.join("big.json");
+    let pad = " ".repeat(8193);
+    std::fs::write(&big, format!("{{\"commit\":\"{}\"}}{pad}", &C[..12])).unwrap();
+    r.version_json = Some(&big);
+    let why = refused(plan(&r, &a));
+    assert!(why.contains("over 8192 bytes"), "{why}");
+    // A sums file that lists nothing.
+    let root = scratch("empty-sums");
+    let (dist, _) = make_dist(&root, &["linux-x86_64", "darwin-arm64"]);
+    std::fs::write(dist.join("SHA256SUMS"), "").unwrap();
+    let why = refused(plan(&request(&dist, w()), &a));
+    // Once from the release check and once from the platform pass, which must not go
+    // quiet when it cannot read the sums.
+    assert_eq!(why.matches("lists no file").count(), 2, "{why}");
+    // A green beta result that names no run cannot be offered as attested.
+    let blank = put_raw(&f.root, |v| v["run_id"] = " ".into(), &beta_doc(C, &f.set));
+    let why = refused(plan(&request(&f.dist, Evidence::Result(&blank)), &a));
+    assert!(why.contains("names no run"), "{why}");
+}
+
+#[test]
+fn the_summary_states_whether_and_why_the_offer_is_reversible() {
+    // Proves the lines an operator reads: reversible names the previous commit; not
+    // reversible names it with both meta_log values; no previous says so. Mutants: the
+    // arms swapped; the meta_log numbers left out of the second line.
+    let f = fx("summary");
+    let a = Recorded::all(C);
+    let w = || Evidence::Waived {
+        reason: "r",
+        operator: "o",
+    };
+    let new = identity(&f.root, "new.json", C, Some("5"));
+    let old = identity(&f.root, "old.json", PREV, Some("4"));
+    let mut r = request(&f.dist, w());
+    r.version_json = Some(&new);
+    r.previous = Some(PREV);
+    r.previous_version_json = Some(&old);
+    let text = summary(&plan(&r, &a).unwrap()).join("\n");
+    assert!(
+        text.contains(&format!(
+            "NOT reversible to {PREV} (meta_log Some(5) against Some(4); unknown counts as not)"
+        )),
+        "{text}"
+    );
+    let new = identity(&f.root, "new3.json", C, Some("3"));
+    r.version_json = Some(&new);
+    let text = summary(&plan(&r, &a).unwrap()).join("\n");
+    assert!(text.contains(&format!("reversible to {PREV}")), "{text}");
+    assert!(!text.contains("NOT reversible"), "{text}");
+    let text = summary(&plan(&request(&f.dist, w()), &a).unwrap()).join("\n");
+    assert!(
+        text.contains("NOT reversible: no previous commit given"),
+        "{text}"
+    );
 }
