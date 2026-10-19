@@ -38,7 +38,7 @@ use kbf_types::NodeId;
 use tonic::{Request, Response, Status};
 
 use super::{SourceError, StoreConfigSource};
-use crate::identity::{DenyList, PeerCert};
+use crate::identity::{DenyList, PeerCert, Presented, presented};
 use crate::members::Members;
 use crate::members_rpc::{blocking, refuse_denied};
 
@@ -96,26 +96,53 @@ impl ColdStoreService {
     }
 
     /// Admits a caller whose verified chain starts with `leaf`, by what the module docs
-    /// list; its certificate, or `None` without mutual TLS.
+    /// list; its certificate, or `None` without mutual TLS. A certificate caller of
+    /// [`Self::admit_presented`].
     ///
     /// # Errors
-    /// UNAUTHENTICATED: under mutual TLS, no certificate or one that does not parse.
-    /// PERMISSION_DENIED: plain text ([`Admission::Open`]), not the storage role, denied, or not an active node of the
-    /// registry. UNAVAILABLE: the deny list or a state store cannot be read.
+    /// As [`Self::admit_presented`].
     pub async fn admit_leaf(&self, leaf: Option<&[u8]>) -> Result<Option<PeerCert>, Status> {
+        self.admit_presented(&Presented::Leaf(leaf.map(<[u8]>::to_vec)))
+            .await
+    }
+
+    /// Admits a caller that presents `presented` ([`crate::identity::presented`], the one
+    /// function that says who is calling): the node and role a proxy forwarded under its
+    /// secret, else the client certificate. Then the checks of the module docs run on the
+    /// node it names; a proxied identity names one node and has no serial or key, so only a
+    /// `node` entry of the deny list can name it.
+    ///
+    /// # Errors
+    /// UNAUTHENTICATED: under mutual TLS, no certificate or one that does not parse, or a
+    /// proxied identity with no role or node. PERMISSION_DENIED: plain text
+    /// ([`Admission::Open`]), not the storage role, denied, or not an active node of the
+    /// registry. UNAVAILABLE: the deny list or a state store cannot be read.
+    pub async fn admit_presented(&self, presented: &Presented) -> Result<Option<PeerCert>, Status> {
         if self.admission == Admission::Open {
             return Err(Status::permission_denied(
                 "the cold store is served over mutual TLS only",
             ));
         }
-        let der = leaf.ok_or_else(|| Status::unauthenticated("no client certificate"))?;
-        let peer = match role_of(der)? {
-            PeerRole::Storage => PeerCert::from_der(der).map_err(Status::unauthenticated)?,
-            other => {
-                return Err(Status::permission_denied(format!(
-                    "role {} may not fetch the cold store",
-                    other.name()
-                )));
+        let peer = match presented {
+            Presented::Proxy(identity) => match (identity.role, identity.node_id.as_deref()) {
+                (Some(PeerRole::Storage), Some(node)) => PeerCert::proxied(node),
+                (Some(PeerRole::Storage) | None, _) => {
+                    return Err(Status::unauthenticated(
+                        "the proxy forwarded no node id and storage role",
+                    ));
+                }
+                (Some(other), _) => return Err(not_storage(other)),
+            },
+            Presented::Leaf(_) => {
+                let der = presented
+                    .leaf()
+                    .ok_or_else(|| Status::unauthenticated("no client certificate"))?;
+                match role_of(der)? {
+                    PeerRole::Storage => {
+                        PeerCert::from_der(der).map_err(Status::unauthenticated)?
+                    }
+                    other => return Err(not_storage(other)),
+                }
             }
         };
         if let Some(deny_list) = &self.deny_list {
@@ -179,6 +206,11 @@ fn active(registry: &dyn Store, node: Option<&str>) -> Result<(), Status> {
     }
 }
 
+/// The refusal of a caller whose role is not `storage`.
+fn not_storage(role: PeerRole) -> Status {
+    Status::permission_denied(format!("role {} may not fetch the cold store", role.name()))
+}
+
 /// The status for a source that cannot answer: retry, with fixed text.
 fn unavailable(e: SourceError) -> Status {
     Status::unavailable(e.to_string())
@@ -190,12 +222,8 @@ impl ColdStore for ColdStoreService {
         &self,
         request: Request<pb::GetStoreConfigRequest>,
     ) -> Result<Response<pb::GetStoreConfigResponse>, Status> {
-        let certs = kbf_tls::peer_certs(&request);
-        let leaf = certs
-            .as_deref()
-            .and_then(|chain| chain.first())
-            .map(AsRef::as_ref);
-        self.admit_leaf(leaf).await?;
+        self.admit_presented(&presented(request.extensions()))
+            .await?;
         let have = request.into_inner().have_generation;
         self.answer(have).await.map(Response::new)
     }

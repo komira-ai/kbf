@@ -146,6 +146,13 @@ pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// The long names of the flags of [`Args`] that `kbf storage` hides and refuses by name
+/// ([`parse`]): every flag outside [`ALLOWED`] and the thread flags.
+#[must_use]
+pub fn refused_flags() -> std::collections::BTreeSet<String> {
+    crate::flag_set::refused_names(ALLOWED)
+}
+
 /// The command line of `kbf storage`: [`Args`]'s, those it takes shown and the rest
 /// hidden (so [`parse`] can refuse them by name), and the node's own.
 #[must_use]

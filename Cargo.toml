@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
-repository = "https://github.com/komira-ai/komira-build-farm"
+repository = "https://github.com/komira-ai/kbf"
 publish = false
 
 # Every external dependency is declared here once and used from a member as
@@ -45,7 +45,8 @@ flate2 = { version = "1.1.10", default-features = false, features = ["rust_backe
 form_urlencoded = "1.2.2"
 futures = "0.3.34"
 hex = "0.4.3"
-# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`).
+# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`)
+# and of the installer's loopback calls to a child (kbf-installer: `proxy::child_http`).
 # Already in the tree through hyper.
 httparse = "1.10.1"
 # The frontend proxy's pass-through bodies (kbf-front); already in the tree through tonic.
@@ -94,7 +95,7 @@ rand_chacha = "0.10.0"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 # Plain HTTP only: TLS brings a crypto provider, added with the first TLS endpoint.
 reqwest = { version = "0.13.5", default-features = false }
-# ed25519 checks of software sets and key statements (kbf-updater). Already in the tree
+# ed25519 checks of software sets and key statements. Already in the tree
 # through rustls.
 ring = "0.17.14"
 roxmltree = "0.21.1"
@@ -140,7 +141,7 @@ syn = { version = "2.0.119", default-features = false, features = ["full", "pars
 # no extended attributes.
 tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0.21"
-# `kbf.toml`, the node's config file (kbf-enroll); no datetime or display support.
+# `kbf.toml`, the node's config file (kbf-enroll), and `installer.toml`, the installer's settings (kbf-installer); no datetime or display support.
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "std"] }
 # RFC 3339 times in the MDM gate's signed messages. Already in the tree through
 # x509-parser.

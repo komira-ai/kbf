@@ -289,3 +289,145 @@ async fn a_log_of_several_voters_refuses_the_open_before_it_is_raised() {
     drop(meta);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ---- unit U0 of docs/design/frontend-proxy.md, section 11: a node meets a FRESH state store
+
+/// A frontend over a store with nothing in it: the fresh Postgres of the design.
+fn fresh_frontend() -> crate::members::Members {
+    let clock = Arc::new(kbf_state::ManualClock::default());
+    let fake = kbf_state::fake::Fake::with_flaw(clock, kbf_state::fake::Flaw::None);
+    crate::members::Members::new(
+        Arc::new(fake),
+        crate::members::MembershipConfig {
+            ttl: Duration::from_secs(30),
+            dwell: Duration::from_secs(120),
+            replication: 2,
+        },
+    )
+}
+
+fn register_as(members: &crate::members::Members, instance: &str) -> Joined {
+    let r = members
+        .register(&crate::members::Registrant {
+            instance_id: instance.to_owned(),
+            addr: "192.0.2.1:8982".to_owned(),
+            zone: String::new(),
+            weight: 1,
+            protocol: crate::members::PROTOCOL,
+            progress: crate::members::Progress::CaughtUp,
+        })
+        .expect("register");
+    joined(r.id.0, r.boot)
+}
+
+/// A node that has run as `member` for boots `1..=last_boot`, each writing one blob.
+/// Returns the digests it holds.
+async fn node_that_has_run(
+    dir: &Path,
+    bucket: &Bucket,
+    member: u64,
+    last_boot: u64,
+) -> Vec<kbf_types::Digest> {
+    let mut held = Vec::new();
+    for boot in 1..=last_boot {
+        start_and_write(dir, bucket, &joined(member, boot), 1).await;
+        held.push(VerifiedBlob::hashed(Bytes::from(format!("boot {boot} blob 0"))).digest());
+    }
+    held
+}
+
+async fn open_over(
+    dir: &Path,
+    bucket: &Bucket,
+    who: &Joined,
+) -> Result<kbf_front::Cache<RaftMetaLog<kbf_store::StdFs>, Bucket>, Box<dyn std::error::Error>> {
+    let meta = RaftMetaLog::open_dir(dir, Retention::default(), "kbf/")
+        .await
+        .expect("open the log");
+    let prefix = meta.store_prefix();
+    let keys = ObjectKeys {
+        root: prefix_root(&prefix, meta.log_id()).expect("a root"),
+        legacy: prefix,
+    };
+    open_registered(meta, bucket.clone(), keys, who).await
+}
+
+/// Design section 11 asks U0 to check that "a storage node re-registers its existing blobs
+/// without re-upload" against a fresh store. Holds when the fresh store hands the node a
+/// member id its log never set: the log is the node's own, so its blobs are indexed
+/// already; nothing is uploaded again and the new boot writes under the new member.
+/// Catches an open that rebuilds or re-puts what the log already indexes.
+#[tokio::test]
+async fn a_node_given_a_new_member_id_by_a_fresh_store_keeps_its_blobs() {
+    let dir = meta_dir("fresh-new-id");
+    let bucket = Bucket::default();
+    let held = node_that_has_run(&dir, &bucket, 7, 3).await;
+    let uploaded = bucket.written();
+    let members = fresh_frontend();
+    let _other = register_as(&members, "other");
+    let mine = register_as(&members, "me");
+    assert_eq!((mine.member_id, mine.boot), (2, 1), "ids restart at 1");
+    let cache = open_over(&dir, &bucket, &mine)
+        .await
+        .expect("opens at once");
+    assert_eq!(
+        cache.present(&held).await.expect("present"),
+        vec![true; held.len()]
+    );
+    assert_eq!(bucket.written(), uploaded, "nothing was uploaded again");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// What the same step costs when the fresh store hands the node the member id its log has
+/// set already: boots restart at 1, `SetWriter` refuses every boot up to the latest the log
+/// holds, so the node exits 75 once per boot it ever had and opens on the next one. The
+/// blobs are still there and nothing is uploaded. Pins the cost the design must name: N
+/// boots are N restarts at the unit's `RestartSec=`, each after a registration, during
+/// which the node is in no map. Catches a `SetWriter` that stops refusing an old boot (two
+/// processes could then put under one writer) and a fresh-store registration that starts
+/// above the node's boot.
+#[tokio::test]
+async fn a_node_given_its_old_member_id_opens_only_after_one_restart_per_old_boot() {
+    let dir = meta_dir("fresh-same-id");
+    let bucket = Bucket::default();
+    let held = node_that_has_run(&dir, &bucket, 1, 4).await;
+    let uploaded = bucket.written();
+    let members = fresh_frontend();
+    let mut restarts = 0;
+    let cache = loop {
+        let mine = register_as(&members, "me");
+        assert_eq!(
+            mine.member_id, 1,
+            "the first node of a fresh store is member 1"
+        );
+        match open_over(&dir, &bucket, &mine).await {
+            Ok(cache) => break cache,
+            Err(e) => {
+                assert_eq!(crate::StartFailure::of(e.as_ref()).status(), 75, "{e}");
+                restarts += 1;
+            }
+        }
+        assert!(restarts < 20, "never opened");
+    };
+    assert_eq!(restarts, 4, "one 'not ready' exit per boot the log has set");
+    assert_eq!(
+        cache.present(&held).await.expect("present"),
+        vec![true; held.len()]
+    );
+    assert_eq!(bucket.written(), uploaded, "nothing was uploaded again");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The design's claim as a requirement: the first registration on a fresh store opens the
+/// node. FAILS today for a node that gets its old member id (see the test above).
+#[tokio::test]
+#[ignore = "U0 red: a node that gets its old member id from a fresh store exits 75 once per old boot before it opens; U9 must seed the fresh store's counters or the node must tolerate it"]
+async fn the_first_registration_on_a_fresh_store_opens_a_node_that_had_run_before() {
+    let dir = meta_dir("fresh-first");
+    let bucket = Bucket::default();
+    let _held = node_that_has_run(&dir, &bucket, 1, 4).await;
+    let mine = register_as(&fresh_frontend(), "me");
+    let opened = open_over(&dir, &bucket, &mine).await.map(drop);
+    assert!(opened.is_ok(), "{opened:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}

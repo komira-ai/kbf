@@ -8,20 +8,10 @@ repository.workspace = true
 publish.workspace = true
 
 # The farm server and a worker daemon in one process, the daemon's blobs moving through
-# calls into the server (`LocalDataPlane`). The one crate that links both the server and
-# the node library (crates/kbf-it/tests/layering.rs).
-[[bin]]
-name = "kbf-all-in-one"
-path = "src/main.rs"
-
-# The container driver's stand-in `crun`, which runs each action as a plain process,
-# for tests/binary.rs: the same program the driver's own tests run
-# (crates/kbf-driver-container/tests/bin/fake_crun.rs), built here because a test
-# can run only its own package's binaries. Not shipped.
-[[bin]]
-name = "kbf-fake-crun"
-path = "../kbf-driver-container/tests/bin/fake_crun.rs"
-test = false
+# calls into the server (`LocalDataPlane`). A library: the `kbf` binary runs it as
+# `kbf all-in-one` and `kbf storage-and-daemon` (crates/kbf-cli). The one crate, with
+# kbf-cli, that links both the server and the node library
+# (crates/kbf-it/tests/layering.rs).
 
 [dependencies]
 bytes.workspace = true
@@ -37,9 +27,6 @@ kbf-storage.workspace = true
 kbf-threads.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
-# The stand-in `crun`'s (kbf-fake-crun).
-rustix = { workspace = true, features = ["process"] }
-serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread", "sync"] }
 tonic.workspace = true
 tracing.workspace = true
@@ -56,10 +43,8 @@ kbf-driver-container.workspace = true
 kbf-meta.workspace = true
 # The store a blob is in, to damage one (src/plane_tests.rs).
 kbf-objstore.workspace = true
-# The tree removal a hardened process must still manage (src/storage_and_daemon_tests.rs).
+# The tree removal a hardened process must still manage (tests/hardened_removal.rs).
 kbf-outputs.workspace = true
-# The act steps the stand-in `crun` runs as each action, through this test binary.
-kbf-testkit.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 # inotify, which counts the opens of each output file (tests/one_read.rs).

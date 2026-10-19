@@ -30,6 +30,8 @@ struct TokenRow {
     max_uses: u32,
     uses: u32,
     expired: bool,
+    /// The roles the token grants; `None` grants every role.
+    roles: Option<Vec<String>>,
 }
 
 /// A node the fake registered: the key it holds for each role.
@@ -110,6 +112,8 @@ pub struct Fake {
     next: Pki,
     clock: AtomicI64,
     life_s: i64,
+    /// The cold store the configuration names; empty (a frontend that sends none) at first.
+    cold_store: Mutex<String>,
     state: Mutex<State>,
 }
 
@@ -139,6 +143,7 @@ impl Fake {
             next: Pki::named("kbf test CA next"),
             clock: AtomicI64::new(now()),
             life_s: LIFE_S,
+            cold_store: Mutex::new(String::new()),
             state: Mutex::new(State {
                 tokens: HashMap::new(),
                 nodes: HashMap::new(),
@@ -170,8 +175,22 @@ impl Fake {
         self.clock.store(secs, Ordering::Relaxed);
     }
 
-    /// A token with `uses` uses; returns it as the node reads it.
+    /// A token with `uses` uses that grants every role; returns it as the node reads it.
     pub fn mint(&self, id_bits: u64, uses: u32) -> Token {
+        self.mint_for(id_bits, uses, None)
+    }
+
+    /// A token that grants only `roles`: a request for another role is refused whole
+    /// with `RoleNotGranted`, as the frontend does.
+    pub fn mint_roles(&self, id_bits: u64, uses: u32, roles: &[&str]) -> Token {
+        self.mint_for(
+            id_bits,
+            uses,
+            Some(roles.iter().map(|r| (*r).to_owned()).collect()),
+        )
+    }
+
+    fn mint_for(&self, id_bits: u64, uses: u32, roles: Option<Vec<String>>) -> Token {
         let secret = [id_bits as u8; 32];
         let id = TokenId::from_bits(id_bits);
         self.state().tokens.insert(
@@ -181,6 +200,7 @@ impl Fake {
                 max_uses: uses,
                 uses: 0,
                 expired: false,
+                roles,
             },
         );
         Token::new(id, TokenSecret::from_bytes(secret), self.pki.pin())
@@ -208,6 +228,11 @@ impl Fake {
 
     pub fn spoil(&self, how: Option<Spoil>) {
         self.state().spoil = how;
+    }
+
+    /// Makes the configuration name `uri` as the cold store, so a storage node can start.
+    pub fn set_cold_store(&self, uri: &str) {
+        *self.cold_store.lock().expect("cold store") = uri.to_owned();
     }
 
     pub fn set_generation(&self, generation: u64) {
@@ -257,6 +282,7 @@ impl Fake {
             storage_port: 8983,
             credential_mode: 1,
             tls_reload_interval_s: 30,
+            cold_store: self.cold_store.lock().expect("cold store").clone(),
             ..NodeConfig::default()
         }
     }
@@ -434,6 +460,11 @@ impl Enroll for Svc {
             .ok_or_else(|| status_of(RefusalReason::TokenRefused))?;
         if row.expired {
             return Err(status_of(RefusalReason::TokenExpired));
+        }
+        if let Some(granted) = &row.roles
+            && request.csrs.iter().any(|c| !granted.contains(&c.role))
+        {
+            return Err(status_of(RefusalReason::RoleNotGranted));
         }
         let replay = state.answers.get(&key).cloned();
         let response = match replay {

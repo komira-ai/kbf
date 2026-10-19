@@ -165,6 +165,21 @@ fn version_ok(version: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '+')
 }
 
+/// The files a package or a payload is made of: [`plan`] without the version and the
+/// platform, which only the nfpm configuration needs.
+pub struct Sources<'a> {
+    /// The `kbf-installer` binary.
+    pub binary: &'a Path,
+    /// The directory of `kbf-*.service` files.
+    pub units: &'a Path,
+    /// The directory of the three trust files.
+    pub trust: &'a Path,
+    /// The sysusers.d file.
+    pub sysusers: &'a Path,
+    /// The tmpfiles.d file.
+    pub tmpfiles: &'a Path,
+}
+
 /// Everything the package installs, sorted by path.
 ///
 /// # Errors
@@ -180,6 +195,26 @@ pub fn plan(i: &Inputs) -> Result<Vec<Entry>, Error> {
     if !matches!(i.platform, Platform::LinuxX86_64 | Platform::LinuxArm64) {
         problems.push(format!("{} is not a Linux platform", i.platform.name()));
     }
+    let sources = Sources {
+        binary: i.binary,
+        units: i.units,
+        trust: i.trust,
+        sysusers: i.sysusers,
+        tmpfiles: i.tmpfiles,
+    };
+    entries(&sources, problems)
+}
+
+/// Everything the package installs, sorted by path: the one list the deb, the rpm and
+/// the `install.sh` payload ([`crate::installer_tarball`]) are all made from.
+///
+/// # Errors
+/// [`Error::Refused`] with every problem with the sources.
+pub fn files(i: &Sources) -> Result<Vec<Entry>, Error> {
+    entries(i, Vec::new())
+}
+
+fn entries(i: &Sources, mut problems: Vec<String>) -> Result<Vec<Entry>, Error> {
     let mut entries = vec![
         file(BINARY_PATH.to_owned(), 0o755, i.binary, &mut problems),
         file(SYSUSERS_PATH.to_owned(), 0o644, i.sysusers, &mut problems),
@@ -259,7 +294,7 @@ pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
          priority: \"optional\"\n\
          maintainer: \"Komira <noreply@komira.com>\"\n\
          description: \"Root setup and update tool for the kbf build farm.\"\n\
-         homepage: \"https://github.com/komira-ai/komira-build-farm\"\n\
+         homepage: \"https://github.com/komira-ai/kbf\"\n\
          license: \"Apache-2.0\"\n\
          depends:\n{deb}\
          overrides:\n  rpm:\n    depends:\n{rpm}\

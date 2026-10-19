@@ -285,9 +285,11 @@ jobs:
   # The state store's Postgres backend against a real server in a service container,
   # pinned by digest (postgres 17.9): the conformance suite C1 to C8, the defects it must
   # reject, the startup refusal of a server that does not flush commits, and the claim
-  # path (crates/kbf-state/tests/postgres_conformance.rs). The feature is off in the
-  # workspace jobs, so this job also lints it. The password is a throwaway for this
-  # container, which lives only for this job.
+  # path (crates/kbf-state/tests/postgres_conformance.rs), then the server over it
+  # (crates/kbf-server/tests/state_store_postgres.rs and the `over_postgres` restart tests).
+  # kbf-server enables the feature, so the workspace jobs build and lint it too; they run
+  # none of the tests that need a server. The password is a throwaway for this container,
+  # which lives only for this job.
   state-postgres:
     runs-on: ubuntu-latest
     permissions:
@@ -297,6 +299,9 @@ jobs:
         image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
         env:
           POSTGRES_PASSWORD: kbf-ci-throwaway
+          # The frontend process test reaches the server with no password, as the flag
+          # requires; the container lives only for this job.
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
@@ -318,6 +323,12 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo clippy -p kbf-state --features postgres --all-targets --locked -- -D warnings
       - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored
+      # The server over Postgres: the flag opens it (tests/state_store_postgres.rs), and the
+      # farm's restart tests run on a schema of their own (`over_postgres` in tests/state_store.rs).
+      - run: cargo test -p kbf-server --locked --test state_store_postgres -- --include-ignored
+      - run: cargo test -p kbf-server --locked --test state_store -- --include-ignored over_postgres
+      # A frontend process started with a Postgres --state-store reaches /readyz.
+      - run: cargo test -p kbf-cli --locked --test frontend_process -- --include-ignored postgres_state_store
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -337,7 +348,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # The same throwaway server as the state-postgres job, so the Postgres tests count.
+    services:
+      postgres:
+        image: postgres@sha256:2a0d0fe14825b0939f78a8cad5cd4e6aa68bf94d0e5dd96e24b6d23af4315545
+        env:
+          POSTGRES_PASSWORD: kbf-ci-throwaway
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
+      KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
       RUSTFLAGS: ""
       COVERAGE_TOOLCHAIN: nightly-2026-10-01
       LLVM_COV_VERSION: 0.9.1
@@ -369,7 +391,29 @@ jobs:
       - name: Run the workspace tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch --lcov --output-path target/coverage/lcov.info
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch --no-report
+      # The tests that need the server, as the state-postgres job runs them; their
+      # counters join the workspace run's in the report below.
+      - name: Run the Postgres tests of kbf-state under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-state --features postgres -- --include-ignored
+      - name: Run the server's Postgres tests under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store_postgres -- --include-ignored
+      - name: Run the server's restart tests over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store -- --include-ignored over_postgres
+      - name: Run the frontend process test over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-cli --test frontend_process -- --include-ignored postgres_state_store
+      - name: Report
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov report --branch --lcov --output-path target/coverage/lcov.info
       # When every failure is coverage that improved, the step prints (and puts in the
       # job summary) the `kbf-coverage tighten` command that downloads this run's
       # `coverage` artifact and lowers coverage-baseline; --artifact must name the
@@ -434,7 +478,7 @@ jobs:
   native-macos:
     if: ${{ github.event_name != 'pull_request' || github.base_ref != 'feature/arch-v2' || contains(github.event.pull_request.labels.*.name, 'macos') }}
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -500,7 +544,7 @@ jobs:
       - run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
       # The per-binary entitlement allow list (tools/ci/darwin-entitlements.txt): the
       # kbf-vmm stub signed by `cargo xtask sign-darwin` with the virtualization
-      # entitlement, kbf-daemon with none, both accepted by `darwin-asset`, and every
+      # entitlement, kbf with none, both accepted by `darwin-asset`, and every
       # wrong signature refused (crates/kbf-vmm/tests/signing.rs;
       # docs/design/macos-vm-guests.md section 7).
       - run: cargo test -p kbf-vmm --test signing --locked -- --ignored

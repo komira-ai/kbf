@@ -22,6 +22,7 @@ use crate::types::{
 use crate::{GROUP_COMMIT_WINDOW, TARGET_WRITES_PER_SECOND};
 
 mod c8_snapshot;
+pub mod fence;
 
 pub use c8_snapshot::C8_SNAPSHOT_PREFIX;
 
@@ -135,8 +136,12 @@ pub fn c1_linearizable_cas<B: Backend>(backend: &B) {
     run(&store, Txn::new().put("c1/k", "d", Cond::Absent)).expect("C1 recreate after delete");
     let v3 = value(&store, "c1/k").expect("c1/k exists").version;
     assert!(
-        v3 != v1 && v3 != v2,
-        "C1 aba: a recreated key must not reuse an old version"
+        v3 != v1,
+        "C1 aba: a recreated key must not reuse the version before the delete"
+    );
+    assert!(
+        v3 != v2,
+        "C1 aba: a recreated key must not reuse the version of the delete"
     );
     run(&store, Txn::new().put("c1/k", "e", Cond::Version(v1)))
         .expect_err("C1 aba: a stale holder of a deleted version must not match the new key");
@@ -185,8 +190,12 @@ pub fn c2_atomic_txn<B: Backend>(backend: &B) {
         "C2 commit: each row has its own version"
     );
     assert!(
-        a.version.0 <= commit.revision.0 && b.version.0 <= commit.revision.0,
-        "C2 commit: the commit revision covers every row it wrote"
+        a.version.0 <= commit.revision.0,
+        "C2 commit: the commit revision covers the first row it wrote"
+    );
+    assert!(
+        b.version.0 <= commit.revision.0,
+        "C2 commit: the commit revision covers the second row it wrote"
     );
 
     let (rows_before, _) = drain(&store, Revision::ZERO);
@@ -258,8 +267,17 @@ pub fn c3_monotonic_counter<B: Backend>(backend: &B) {
         last = n;
     }
     let both = run(&store, Txn::new().next("c3/seq").next("c3/seq")).expect("two increments");
+    assert_eq!(
+        both.counters.len(),
+        2,
+        "C3 order: two increments in one transaction give two values"
+    );
     assert!(
-        both.counters.len() == 2 && both.counters[0] > last && both.counters[1] > both.counters[0],
+        both.counters[0] > last,
+        "C3 order: the first increment is above the earlier value"
+    );
+    assert!(
+        both.counters[1] > both.counters[0],
         "C3 order: two increments in one transaction must be distinct and ascending"
     );
     let other = next_value(&store, "c3/other");
@@ -545,8 +563,12 @@ pub fn c5_ordered_feed<B: Backend>(backend: &B) {
     seen.extend(rows);
     let seen_keys: Vec<&str> = seen.iter().map(|row| row.key.as_str()).collect();
     assert!(
-        seen_keys.contains(&"c5/first") && seen_keys.contains(&"c5/second"),
+        seen_keys.contains(&"c5/first"),
         "C5 interleaved: a poller that saw the later revision first skipped the earlier one, saw {seen_keys:?}"
+    );
+    assert!(
+        seen_keys.contains(&"c5/second"),
+        "C5 interleaved: the later revision was never seen, saw {seen_keys:?}"
     );
     assert!(
         seen.windows(2).all(|w| w[0].revision < w[1].revision),
@@ -589,8 +611,12 @@ pub fn c6_durable_ack<B: Backend>(backend: &B) {
         "C6 durable: an acknowledged ttl write was lost"
     );
     assert!(
-        value(&store, "c6/b1").is_some() && value(&store, "c6/b2").is_some(),
-        "C6 durable: an acknowledged batch was lost"
+        value(&store, "c6/b1").is_some(),
+        "C6 durable: the first write of an acknowledged batch was lost"
+    );
+    assert!(
+        value(&store, "c6/b2").is_some(),
+        "C6 durable: the second write of an acknowledged batch was lost"
     );
     assert!(
         next_value(&store, "c6/n") > counter,

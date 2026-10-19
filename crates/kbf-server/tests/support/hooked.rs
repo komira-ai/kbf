@@ -19,6 +19,7 @@ pub struct Hooked {
     pub fake: Arc<Fake>,
     pub clock: Arc<ManualClock>,
     after_get: Mutex<Option<(String, Hook)>>,
+    counts: Mutex<Vec<(String, Arc<AtomicUsize>)>>,
     conflict_on: Mutex<Option<String>>,
     /// Per batch that wrote the `map` key: whether it conflicted.
     pub map_writes: Mutex<Vec<bool>>,
@@ -30,6 +31,10 @@ pub struct Hooked {
     pub panic_gets: AtomicUsize,
     /// How many of the next transactions fail with a store error.
     pub fail_txns: AtomicUsize,
+    /// How many of the next `scan_prefix` calls fail with a store error.
+    pub fail_scans: AtomicUsize,
+    /// How many of the next `scan_prefix` calls panic.
+    pub panic_scans: AtomicUsize,
 }
 
 impl Hooked {
@@ -39,12 +44,15 @@ impl Hooked {
             fake: Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None)),
             clock,
             after_get: Mutex::new(None),
+            counts: Mutex::new(Vec::new()),
             conflict_on: Mutex::new(None),
             map_writes: Mutex::new(Vec::new()),
             fail_gets: AtomicUsize::new(0),
             panic_gets: AtomicUsize::new(0),
             fail_reaps: AtomicUsize::new(0),
             fail_txns: AtomicUsize::new(0),
+            fail_scans: AtomicUsize::new(0),
+            panic_scans: AtomicUsize::new(0),
         })
     }
 
@@ -55,6 +63,20 @@ impl Hooked {
             .after_get
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some((prefix.to_owned(), Box::new(hook)));
+    }
+
+    /// Counts, from now on, the `get`s and scans of a key that starts with `prefix` that
+    /// read their answer (one that failed or panicked first is not counted). Unlike
+    /// [`Hooked::after_get`], which one read takes, every read is counted, whichever
+    /// thread makes it: for a test that has to know the server's own readers are done
+    /// before it arms a fault meant for one request.
+    pub fn count(&self, prefix: &str) -> Arc<AtomicUsize> {
+        let count = Arc::new(AtomicUsize::new(0));
+        self.counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((prefix.to_owned(), Arc::clone(&count)));
+        count
     }
 
     /// Makes every transaction that touches a key (or counter) starting with `prefix`
@@ -68,8 +90,13 @@ impl Hooked {
 }
 
 impl Hooked {
-    /// Runs the hook if a read of `key` is the one it waits for.
+    /// Counts a read of `key`, and runs the hook if it is the one it waits for.
     fn fire(&self, key: &str) {
+        for (prefix, count) in &*self.counts.lock().unwrap_or_else(PoisonError::into_inner) {
+            if key.starts_with(prefix) {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let hook = {
             let mut slot = self
                 .after_get
@@ -160,6 +187,19 @@ impl Store for Hooked {
     }
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
+        if self
+            .fail_scans
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(StoreError::Failed("injected".to_owned()));
+        }
+        assert!(
+            self.panic_scans
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_err(),
+            "injected panic"
+        );
         let answer = self.fake.scan_prefix(prefix)?;
         self.fire(prefix);
         Ok(answer)

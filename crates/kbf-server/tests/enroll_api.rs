@@ -46,6 +46,11 @@ async fn serve(enroll: Option<Arc<EnrollApi>>) -> SocketAddr {
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let app = routes(Some(token_file()), enroll);
+    // As `serve_api` does: the handlers read the gate's `Trust`.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        None::<Arc<kbf_server::proxy_auth::ProxySecret>>,
+        kbf_server::proxy_auth::gate_requests,
+    ));
     tokio::spawn(async move {
         let service = app.into_make_service_with_connect_info::<SocketAddr>();
         axum::serve(listener, service).await.expect("serve");
