@@ -166,3 +166,53 @@ fn the_control_socket_outlives_an_instance_and_no_instance_stops_the_other() {
         assert_eq!(check(&unit(&text)), want, "{text}");
     }
 }
+
+const POSTGRES: &str = "--state-store=postgres:///kbf?host=/run/postgresql";
+
+/// A frontend with a Postgres state store has no control socket, so the rule asks for
+/// neither the socket nor the preserved runtime directory, and refuses the socket given
+/// beside it (kbf exits 2 at start). A SQLite store, or none, still needs both. The other
+/// directives are asked for either way. Catches the socket required of a Postgres unit
+/// (the shipped unit would fail), the combination passed, the socket not required of a
+/// SQLite unit, and a Postgres unit let off `Type=notify`.
+#[test]
+fn a_postgres_frontend_needs_no_control_socket_and_a_sqlite_one_does() {
+    let flags = |store: &str, socket: bool| {
+        let socket = if socket {
+            " --handover-socket=/run/kbf-frontend/control.sock"
+        } else {
+            ""
+        };
+        OK.replace(
+            " --handover-socket=/run/kbf-frontend/control.sock",
+            &format!(" {store}{socket}"),
+        )
+    };
+    let bare = OK
+        .replace("RuntimeDirectory=kbf-frontend\n", "")
+        .replace("RuntimeDirectoryPreserve=yes\n", "")
+        .replace(
+            " --handover-socket=/run/kbf-frontend/control.sock",
+            &format!(" {POSTGRES}"),
+        );
+    assert_eq!(check(&unit(&bare)), Vec::<String>::new());
+    let both = flags(POSTGRES, true);
+    assert_eq!(
+        check(&unit(&both)),
+        [
+            "has --handover-socket with a postgres --state-store: kbf frontend refuses the \
+             two together (a Postgres store cannot be handed over), so the unit would exit 2 \
+             at start; drop the socket"
+        ]
+    );
+    let sqlite = "--state-store=sqlite:///var/lib/kbf/state.db";
+    assert_eq!(check(&unit(&flags(sqlite, true))), Vec::<String>::new());
+    let no_socket = check(&unit(&flags(sqlite, false)));
+    assert_eq!(no_socket.len(), 1, "{no_socket:?}");
+    assert!(
+        no_socket[0].starts_with("gives no --handover-socket"),
+        "{no_socket:?}"
+    );
+    let not_notify = bare.replace("Type=notify", "Type=simple");
+    assert_eq!(check(&unit(&not_notify)).len(), 1);
+}

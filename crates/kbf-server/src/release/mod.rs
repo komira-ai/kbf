@@ -4,14 +4,16 @@
 //!
 //! - The [`ReleaseStore`] is a directory of immutable files keyed by (commit, platform,
 //!   component); see [`store`] for the layout and the write rules.
-//! - The router, [`http::router`], serves `PUT /v1/releases/{commit}/{platform}/{name}` and
-//!   `GET /v1/releases`.
-//! - The service, [`grpc::service`], is `ReleaseService.Fetch`.
+//! - The router, [`http::router`], serves `PUT /v1/releases/{commit}/{platform}/{name}`,
+//!   `GET /v1/releases` and `GET /v1/releases/{commit}`.
+//! - The service, [`grpc::service`], is `ReleaseService.Fetch` and `Describe`; the
+//!   description both `Describe` and `GET /v1/releases/{commit}` give is [`describe`].
 //! - The desired release, [`desired::router`]: `GET /v1/update`, `POST /v1/update/desired`,
 //!   `pause` and `resume`, over the `update/desired` row.
 //!
-//! `GET /v1/releases` and `Fetch` carry no authentication of their own: the wiring puts `Fetch`
-//! behind the worker listener's mutual TLS.
+//! `GET /v1/releases`, `GET /v1/releases/{commit}`, `Fetch` and `Describe` carry no
+//! authentication of their own: the wiring puts `Fetch` and `Describe` behind the worker
+//! listener's mutual TLS and role table.
 //!
 //! - The offers, [`offers::Offers`]: the `UpdateOffer` each platform is to be sent over its
 //!   nodes' sessions, built from the desired release and what the store holds.
@@ -20,6 +22,7 @@
 //! listener where it starts. Trust is the host's: the store neither opens a tarball nor
 //! checks an attestation.
 
+mod describe;
 pub mod desired;
 pub mod grpc;
 pub mod http;

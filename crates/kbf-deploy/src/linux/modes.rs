@@ -4,7 +4,7 @@
 //!
 //! Each unit runs `<KBF_BIN_DIR>/kbf <mode> ...` with the flags that mode's `kbf` takes:
 //! `frontend` its three listeners, the storage URL with the frontend's client
-//! certificate, and the SQLite state store; `storage` its stores, its listen address and
+//! certificate, and the Postgres state store; `storage` its stores, its listen address and
 //! its certificate flags; `daemon` the flags `kbf-daemon`'s unit has; `storage-and-daemon`
 //! the storage unit's flags, its registration with the frontend (`--frontend`,
 //! `--advertise-addr`) and the daemon's; `all-in-one` the frontend's and the daemon's.
@@ -49,9 +49,10 @@
 //! - `storage`: the `storage` and `storage-and-daemon` units give their cold store,
 //!   metadata directory, listen address and the three certificate flags, and an `s3://`
 //!   cold store comes with the key file ([`super::stores`]).
-//! - `state-store`: a `--state-store` the unit gives is `sqlite:///<absolute path>`
-//!   and names no variable (systemd would expand it into kbf's argv); postgres is not
-//!   wired yet, so a Postgres URI fails ([`super::stores`]).
+//! - `state-store`: a `--state-store` the unit gives names no variable (systemd would
+//!   expand it into kbf's argv) and carries no password; in the frontend's unit it is a
+//!   `postgres://` URI (SQLite is dropped for the frontend), in the all-in-one's it may
+//!   still be `sqlite:///<absolute path>` ([`super::stores`]).
 //! - `ports`: no two of the unit's listeners share a port ([`super::stores`]).
 //! - `handover`: the frontend's unit is the template `kbf-frontend@.service` whose two
 //!   instances hand over to one another: `Type=notify`, a control socket in a preserved
@@ -161,7 +162,8 @@ impl Mode {
     }
 
     /// Whether the mode drains on SIGTERM (rule `stop`): a frontend finishes its open
-    /// streams, a storage half finishes the Writes in flight. Only `daemon` does not.
+    /// streams, a storage half finishes the Writes in flight. `daemon` drains too but only to
+    /// its `--drain-deadline-secs`, so it has a finite stop timeout, not the infinite one.
     #[must_use]
     pub fn drains(self) -> bool {
         !matches!(self, Mode::Daemon)
@@ -674,7 +676,7 @@ fn rules(
     }
 
     // state-store
-    for how in stores::state_store(unit) {
+    for how in stores::state_store(unit, mode) {
         fail("state-store", format!("{name}: {how}"));
     }
 

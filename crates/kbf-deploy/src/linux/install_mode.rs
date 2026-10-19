@@ -27,7 +27,7 @@
 //! 4. when a file changed: `daemon-reload`, then enable and restart the unit; otherwise
 //!    it is enabled and started only if it is not (the frontend's template is enabled as
 //!    such and `kbf-frontend@a` started; a serving instance is never restarted, the plan
-//!    says to run `kbf frontend handover`); after any start of a unit with
+//!    says to `systemctl restart` it when its builds may drain); after any start of a unit with
 //!    `--api-listen=127.0.0.1:<port>`, a wait of up to 60 s for its `/readyz`.
 //!
 //! A mode that runs builds on a host with no active swap prints a `WARN:` line first
@@ -153,8 +153,8 @@ fn plan_with<E: Exec>(
     let mut started = false;
     // The frontend's unit is a template: it is enabled by that name (DefaultInstance=
     // makes it the first instance) and started as an instance. A serving instance is
-    // never restarted: a restart drains it and refuses every new build until the next
-    // start, which is what `kbf frontend handover` exists not to do.
+    // never restarted by the install: a restart drains it and refuses every new build until the next
+    // start, so the operator chooses when (its Postgres store cannot be handed over).
     let first = instances[0].clone();
     let serving = || -> Result<Option<String>, HostError> {
         for instance in &instances {
@@ -171,11 +171,14 @@ fn plan_with<E: Exec>(
             planner.run(systemctl(&["restart", &name]));
             started = true;
         } else if let Some(serving) = serving()? {
+            // The rendered unit has no control socket (its store is Postgres, which cannot
+            // be handed over): the operator restarts it, which drains the builds in flight.
             note(
                 out,
                 format_args!(
-                    "{serving} is serving and is not restarted: run `kbf frontend handover` \
-                     to start the other instance on the new unit and binary"
+                    "{serving} is serving and is not restarted: its state store cannot be \
+                     handed over: `systemctl restart` it when its builds may drain, to run \
+                     the new unit and binary"
                 ),
             )?;
         } else {
