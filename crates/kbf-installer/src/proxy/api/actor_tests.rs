@@ -1,6 +1,7 @@
 //! The actor on its thread: its limits, its tick and its death. The routes through it are in
 //! `router_tests.rs`, the whole handler in `handler_tests.rs`.
 
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,26 @@ async fn the_actor_ticks_a_staging_update_forward_with_nobody_asking() {
     // No call is made from here on, so no call reads the status: only the tick can hand
     // the staged update to the supervisor.
     wait_until(|| rig.sup.starts() == 1).await;
+}
+
+#[tokio::test]
+async fn the_actor_ends_an_update_the_installer_never_stages_with_nobody_asking() {
+    let rig = Rig::new("u8b8-a-deadline");
+    let timing = ActorTiming {
+        tick: Duration::from_millis(5),
+        ..ActorTiming::default()
+    };
+    let api = spawn(rig.core(), timing, || {}).unwrap();
+    api.post(req(B, "r1")).await.unwrap();
+    let reverts = || {
+        let written = rig.orders.written.lock().unwrap();
+        written.iter().filter(|l| l.verb == Verb::Revert).count()
+    };
+    assert_eq!(reverts(), 0);
+    // The deadline (900 s on the fake clock) passes. No call is made from here on, so
+    // only the tick can end the update and write the revert.
+    rig.clock.0.store(900_000, Ordering::SeqCst);
+    wait_until(|| reverts() == 1).await;
 }
 
 #[tokio::test]

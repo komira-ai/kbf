@@ -28,6 +28,8 @@ tokio = { workspace = true, optional = true, features = ["rt"] }
 # This crate's own tests (unit tests are built with `cfg(test)`, the files in tests/ are
 # separate crates that see only the features on).
 kbf-state = { workspace = true, features = ["test-support"] }
+# A child held between fork and exec, for the tests of what releases the file lock.
+kbf-testkit.workspace = true
 
 [lints]
 workspace = true

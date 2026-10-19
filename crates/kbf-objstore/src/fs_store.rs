@@ -209,8 +209,25 @@ struct Inner {
     window: usize,
     /// How many times a listing read every header: once per listing, not per page.
     walks: AtomicU64,
-    /// Held for the store's life: closing it releases the lock.
-    _lock: File,
+    /// Held for the store's life.
+    _lock: DirLock,
+}
+
+/// The store directory's `LOCK` file with its `flock` held.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked
+/// while the store is open (any spawn of a child by another thread of this process)
+/// carries a copy until it execs, so closing the file would leave the directory locked
+/// for as long as that takes. Dropping unlocks first, which no copy outlives, so the
+/// directory can be opened again once the last handle's drop returns.
+struct DirLock(File);
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.0.unlock();
+    }
 }
 
 impl FsStore {
@@ -237,16 +254,18 @@ impl FsStore {
     ) -> Result<Self, FsStoreError> {
         fs::create_dir_all(dir).map_err(open_failed("create", dir))?;
         let lock_path = dir.join("LOCK");
-        let lock = File::options()
+        let file = File::options()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&lock_path)
             .map_err(open_failed("open", &lock_path))?;
-        lock.try_lock().map_err(|source| FsStoreError::Locked {
+        file.try_lock().map_err(|source| FsStoreError::Locked {
             path: lock_path.clone(),
             source,
         })?;
+        // From here every way out of the open, an error included, unlocks.
+        let lock = DirLock(file);
         let objects = dir.join("objects");
         for shard in 0..=u8::MAX {
             let path = objects.join(format!("{shard:02x}"));

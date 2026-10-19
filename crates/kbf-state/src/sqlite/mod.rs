@@ -111,7 +111,7 @@ pub struct SqliteStore {
     reader: Mutex<Connection>,
     shared: Arc<Shared>,
     /// Held until the store is dropped or demoted; released after the writer is gone.
-    lock: Mutex<Option<std::fs::File>>,
+    lock: Mutex<Option<guard::LockFile>>,
 }
 
 impl SqliteStore {
