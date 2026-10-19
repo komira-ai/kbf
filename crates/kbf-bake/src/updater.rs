@@ -3,7 +3,6 @@
 //! this crate. The format is this crate's reading of what the evaluator needs (a JSON
 //! document), and it is `deny_unknown_fields` so a writer that grows a field is noticed.
 
-use kbf_gate::Window;
 use serde::Deserialize;
 
 /// Why a log is refused.
@@ -56,14 +55,13 @@ impl UpdaterLog {
             .any(|s| s.start <= at && s.end.is_none_or(|e| at <= e))
     }
 
-    /// The restarts the updater made within `window` up to `until` (a restart the deploy did
-    /// not make: the bake follows the deploy).
-    pub fn restarts_in(&self, window: Window, until: u64) -> u64 {
-        let end = window.end.map_or(until, |e| e.min(until));
+    /// The restarts the updater made from `start` to `until`, both included: the bake follows
+    /// the deploy, so a restart in it is one the deploy did not make.
+    pub fn restarts_in(&self, start: u64, until: u64) -> u64 {
         let n = self
             .restarts
             .iter()
-            .filter(|r| r.at >= window.start && r.at <= end)
+            .filter(|r| r.at >= start && r.at <= until)
             .count();
         u64::try_from(n).unwrap_or(u64::MAX)
     }

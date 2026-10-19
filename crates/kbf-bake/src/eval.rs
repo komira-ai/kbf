@@ -1,7 +1,7 @@
 //! The evaluator: one scrape in, the decision out. It reads no clock and does no I/O; the
 //! time of a scrape is the scrape's own field, so a test pins it.
 
-use kbf_gate::{Floor, GateResult, Limit, Metrics, MinLoad, Sample, Status, Verdict, Window};
+use kbf_gate::{Floor, GateResult, Limit, Metrics, MinLoad, Sample, Status, Verdict};
 
 use crate::state::{BucketCount, Counter, State};
 use crate::table::{
@@ -121,11 +121,9 @@ impl Evaluator {
         self.follow_under_replicated(under, o);
         let stretch = self.state.under_since.map_or(0, |s| o.at.saturating_sub(s));
 
-        let window = Window {
-            start: self.state.bake_start,
-            end: None,
-        };
-        let restarts = o.updater.map(|l| l.restarts_in(window, o.at));
+        let restarts = o
+            .updater
+            .map(|l| l.restarts_in(self.state.bake_start, o.at));
         let ratio = error_ratio(errors, requests);
         let (error_sample, error_limit) = self.error_gate(ratio);
         let p99_ratio = self.latency_ratio().filter(|_| queue_seen);

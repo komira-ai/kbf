@@ -640,6 +640,17 @@ fn a_node_step_is_a_closed_window() {
     assert!(UpdaterLog::parse(br#"{"steps":[],"restarts":[],"extra":1}"#).is_err());
 }
 
+/// A log reads back as itself, copies and prints (the derived impls are part of the type).
+#[test]
+fn a_populated_log_parses_copies_and_prints() {
+    let text = br#"{"steps":[{"host":"a","start":1,"end":null}],"restarts":[{"host":"b","at":5}]}"#;
+    let log = UpdaterLog::parse(text).unwrap();
+    assert_eq!(log.clone(), log);
+    assert_eq!((log.steps[0].end, log.restarts[0].at), (None, 5));
+    assert!(format!("{log:?}").contains("host: \"b\""));
+    assert!(format!("{:?}", UpdaterLog::parse(b"[]").unwrap_err()).contains("LogError"));
+}
+
 /// Catches a latency gate that passes on a farm that never exposed the histogram.
 #[test]
 fn a_farm_without_the_queue_histogram_from_the_start_fails_the_latency_gate() {
