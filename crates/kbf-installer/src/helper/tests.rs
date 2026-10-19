@@ -93,11 +93,16 @@ impl Rig {
 
     /// The same host on `platform`: macOS keeps its state and lock elsewhere.
     fn on(name: &str, platform: Platform) -> Rig {
-        Rig::build(name, platform, 0)
+        Rig::build(name, platform, 0, false)
+    }
+
+    /// A host that runs a frontend: it takes the proxy's three orders.
+    fn frontend(name: &str) -> Rig {
+        Rig::build(name, Platform::Linux, 0, true)
     }
 
     /// The same host with `min_activation_interval_secs` set.
-    fn build(name: &str, platform: Platform, min_interval: u64) -> Rig {
+    fn build(name: &str, platform: Platform, min_interval: u64, frontend_host: bool) -> Rig {
         let mut host = ScratchHost::new(&format!("helper-{name}"));
         let root = host.root.clone();
         for sub in [
@@ -121,6 +126,9 @@ impl Rig {
         );
         host.answer = service.answer();
         let layout = Layout::new(Root::new(&root).expect("absolute"), platform);
+        if frontend_host {
+            write_kbf_toml(&layout, "mode = \"frontend\"\n");
+        }
         Locked::acquire(&layout)
             .expect("lock")
             .write(&State {
@@ -247,6 +255,13 @@ impl Rig {
     fn current(&self) -> Option<crate::CommitId> {
         self.state().current
     }
+}
+
+/// Writes the host's `kbf.toml` (where its platform keeps it) with `text`.
+fn write_kbf_toml(layout: &Layout, text: &str) {
+    let path = layout.join(&layout.kbf_toml());
+    fs::create_dir_all(path.parent().expect("a parent")).expect("config dir");
+    fs::write(path, text).expect("kbf.toml");
 }
 
 fn link(rig: &Rig, name: &str) -> PathBuf {
@@ -1202,7 +1217,7 @@ fn a_repeat_order_for_the_staged_release_asks_the_step_again() {
 /// `last_activation_at` never recorded (same); `<` turned into `>` (the +61 swap refused).
 #[test]
 fn a_second_activation_inside_the_minimum_interval_is_refused() {
-    let mut rig = Rig::build("interval", Platform::Linux, 60);
+    let mut rig = Rig::build("interval", Platform::Linux, 60, false);
     rig.order(5, Verb::Activate, B);
     rig.cycle(T0);
     rig.first_start(B, T0 + 1);
@@ -1233,7 +1248,7 @@ fn a_second_activation_inside_the_minimum_interval_is_refused() {
 /// the difference).
 #[test]
 fn a_clock_that_stepped_back_does_not_hold_an_activation_up() {
-    let mut rig = Rig::build("interval-back", Platform::Linux, 60);
+    let mut rig = Rig::build("interval-back", Platform::Linux, 60, false);
     rig.order(5, Verb::Activate, B);
     rig.cycle(T0 + 100);
     rig.first_start(B, T0 + 101);
@@ -1461,15 +1476,16 @@ fn a_replaced_binary_is_re_executed_before_the_next_order_is_read() {
     );
 }
 
-/// Catches a frontend update crashing the reader or moving the floor: the record parses (it
-/// is a locator: no components, no facts), is refused in status.json with "not implemented
-/// (P13)", changes nothing, is removed, and does not advance the acknowledged id or epoch, so
-/// a real order of a lower id in the same epoch still runs.
+/// Catches a `frontend_update` taken on a host that runs no frontend (KI section 6: only a
+/// frontend or all-in-one host accepts it), or moving a floor: the record parses (it is a
+/// locator: no components, no facts), is refused in status.json with the word `denied`,
+/// changes nothing, is removed, and does not advance the acknowledged id or epoch, so a real
+/// order of a lower id in the same epoch still runs.
 ///
-/// Mutant planted: the early arm in `take` removed (the order falls through to `act`, which
-/// refuses it but acknowledges it, and the lower real order is then dropped as a replay).
+/// Mutants planted: the `denied` arm in `take` removed (the order is staged); the arm placed
+/// after the floors with the floor moved (the lower real order is then dropped as a replay).
 #[test]
-fn a_frontend_update_record_is_refused_not_implemented_and_moves_no_floor() {
+fn a_frontend_update_record_on_a_host_without_a_frontend_is_denied_and_moves_no_floor() {
     let mut rig = Rig::new("frontend-update");
     let r = rig.rec(9, 1, 1, Verb::FrontendUpdate, B);
     assert!(r.components.is_empty(), "a locator");
@@ -1477,13 +1493,10 @@ fn a_frontend_update_record_is_refused_not_implemented_and_moves_no_floor() {
     rig.put(&r);
     rig.cycle(T0);
     assert_eq!(rig.status()["state"], "refused");
-    assert!(
-        rig.refusal().contains("not implemented (P13)"),
-        "{}",
-        rig.refusal()
-    );
+    assert!(rig.refusal().starts_with("denied: "), "{}", rig.refusal());
     assert_eq!(rig.status()["acked_order_id"], 0, "the floor did not move");
     assert_eq!(rig.current(), Some(c(A)));
+    assert_eq!(rig.state().staged, None);
     assert_eq!(rig.fetcher.count(), 0);
     assert_eq!(rig.restarts(), 0);
     assert_eq!(rig.left(), 0);
@@ -1496,23 +1509,24 @@ fn a_frontend_update_record_is_refused_not_implemented_and_moves_no_floor() {
     );
 }
 
-/// Catches the two kinds of order sharing a floor. The node floor is at (1, 7); a frontend
-/// record of the same epoch and a lower id is not a replay of it (it reaches its own
-/// refusal), and with the frontend floor seeded at (1, 7) a node order of id 3 is not
-/// dropped as a replay of the frontend's: each kind is ordered against its own pair.
+/// Catches the two kinds of order sharing a floor. On a frontend host the node floor is at
+/// (1, 7) (an activation); a frontend record of the same epoch and a lower id is not a replay
+/// of it (it is staged), and with the frontend floor seeded at (1, 7) a node order of id 3 is
+/// not dropped as a replay of the frontend's: each kind is ordered against its own pair.
 ///
 /// Mutants planted: the floor taken from the node pair whatever the kind (the frontend
 /// record is dropped silently, and the node order after the seeded frontend floor too).
 #[test]
 fn node_and_frontend_orders_have_separate_floors() {
-    let mut rig = Rig::new("floors-per-kind");
-    rig.order(7, Verb::Confirm, A);
+    let mut rig = Rig::frontend("floors-per-kind");
+    rig.order(7, Verb::Activate, B);
     rig.cycle(T0);
     assert_eq!(rig.status()["acked_order_id"], 7);
-    rig.put(&rig.rec(3, 1, 1, Verb::FrontendUpdate, B));
+    rig.put(&rig.rec(3, 1, 1, Verb::FrontendUpdate, C));
     rig.cycle(T0 + 3);
-    assert!(
-        rig.refusal().contains("not implemented (P13)"),
+    assert_eq!(
+        rig.state().staged,
+        Some(c(C)),
         "a lower id of another kind is not a replay: {}",
         rig.refusal()
     );
@@ -1600,9 +1614,7 @@ fn vetting_and_acting_refuse_what_parsing_already_refuses() {
         .expect("refused, not failed");
     assert_eq!(memory.event, Event::Refused);
     assert!(
-        memory
-            .refusal
-            .contains("frontend_update is not implemented"),
+        memory.refusal.contains("not a node order"),
         "{}",
         memory.refusal
     );
@@ -1706,3 +1718,5 @@ fn the_same_activation_again_while_on_trial_is_a_repeat() {
     assert_eq!(rig.state().pending_confirm, Some(trial));
     assert_eq!(rig.left(), 0);
 }
+
+mod frontend_tests;

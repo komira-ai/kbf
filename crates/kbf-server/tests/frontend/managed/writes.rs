@@ -180,15 +180,27 @@ impl Swap {
     }
 
     /// A reader of history as the next generation has it: the index rows in the shared
-    /// store, and the objects of both children (B's copied beside A's; both have stopped,
-    /// so their directories are free to open).
+    /// store, and the objects of both children (B's copied beside A's). Both have stopped,
+    /// but a child's history writer ends on its own task and lets go of its directory's
+    /// lock a moment after the child's serving task has ended, so the open waits for the
+    /// lock, for at most ten seconds.
     fn reader(&self) -> Reader<FsStore> {
         let dir = |name: &str| self.scratch.0.join(name);
         copy_tree(
             &dir("history-b").join("objects"),
             &dir("history-a").join("objects"),
         );
-        let objects = FsStore::open(&dir("history-a"), Floor::KeepFree).expect("the objects");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let objects = loop {
+            match FsStore::open(&dir("history-a"), Floor::KeepFree) {
+                Err(kbf_objstore::FsStoreError::Locked { .. })
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                opened => break opened.expect("the objects"),
+            }
+        };
         let root = HistoryRoot::under(&KeyPrefix::new("kbf/").expect("prefix")).expect("root");
         let index = HistoryIndex::new(
             Arc::clone(&self.base) as Arc<dyn Store>,
