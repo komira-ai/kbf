@@ -724,6 +724,15 @@ fn a_request_is_refused_while_the_finish_of_a_retired_operation_is_held() {
         let mut state = farm.lock();
         state.unwritten.push_back(
             [
+                // An answer of another operation does not hold this one's rows.
+                kbf_types::Effect::Answer(kbf_types::Answer {
+                    operation: OperationId(7),
+                    lease: kbf_types::LeaseId::new(5, 1),
+                    waiters: Vec::new(),
+                    outcome: kbf_types::Outcome::Failed(kbf_types::Failure::Invalid),
+                    memory_runs: Vec::new(),
+                    farm_runs: Vec::new(),
+                }),
                 kbf_types::Effect::Waiting(kbf_types::Waiting {
                     operation: OperationId(0),
                     reason: None,
