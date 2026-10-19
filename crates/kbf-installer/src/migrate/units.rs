@@ -3,7 +3,7 @@
 //!
 //! The old layout's units ran `/usr/local/kbf/current/kbf ...` (the deploy kit rendered
 //! `KBF_BIN_DIR` as that link, docs/design/pull-updates.md section 3); the new tree keeps
-//! its link under the installer's tree ([`super::roots::Roots::new_bin`]). A systemd
+//! its link under the installer's tree ([`crate::layout::Layout::current`]). A systemd
 //! unit is changed only in the value of an `Exec*=` or `Environment=` line, a launchd
 //! plist only in a `<string>` line, and only where the old path is a whole path (what
 //! precedes it opens a value, what follows it ends the component); every other byte stays.

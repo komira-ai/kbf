@@ -18,7 +18,6 @@ use crate::fixtures::{FakeRunner, ran, version_json};
 use crate::helper::memory::Memory;
 use crate::layout::Platform;
 use crate::run::Spawn;
-use crate::state::{Locked, State};
 use crate::testkit::{A, B, C};
 
 /// The umask a host's root has. Every test of this module makes directories and files that
@@ -181,16 +180,20 @@ impl Rig {
         Roots::new(self.platform)
     }
 
+    fn under(&self, path: &kbf_host::HostPath) -> PathBuf {
+        self.at(path.as_str().trim_start_matches('/'))
+    }
+
     pub fn binary(&self) -> &'static str {
         self.roots().binary()
     }
 
     pub fn new_state_dir(&self) -> PathBuf {
-        self.at(self.roots().new_state.as_str().trim_start_matches('/'))
+        self.under(&self.layout.state_dir())
     }
 
     pub fn new_tree(&self) -> PathBuf {
-        self.at(self.roots().new_tree.as_str().trim_start_matches('/'))
+        self.under(&self.layout.install_root())
     }
 
     /// The old layout: releases `A` (current) and `B` (previous), their links, the state
@@ -208,11 +211,7 @@ impl Rig {
         std::os::unix::fs::symlink(format!("releases/{A}"), old.join("current")).expect("link");
         std::os::unix::fs::symlink(format!("releases/{B}"), old.join("previous")).expect("link");
         fs::create_dir_all(host(&roots.old_state)).expect("state dir");
-        self.write_old_state(&State {
-            current: Some(CommitId::new(A).expect("commit")),
-            previous: Some(CommitId::new(B).expect("commit")),
-            ..State::default()
-        });
+        self.write_old_state(Some(A), Some(B), None, None);
         self.write_memory(&Memory {
             acked_epoch: 3,
             acked_order_id: 42,
@@ -243,11 +242,27 @@ impl Rig {
         }
     }
 
-    pub fn write_old_state(&self, state: &State) {
-        Locked::acquire(&self.layout)
-            .expect("lock")
-            .write(state)
-            .expect("state");
+    /// The old tools' `state.json` (schema 1): the releases the links name, a release staged,
+    /// and the commit of a swap on trial.
+    pub fn write_old_state(
+        &self,
+        current: Option<&str>,
+        previous: Option<&str>,
+        staged: Option<&str>,
+        pending: Option<&str>,
+    ) {
+        let dir = self.under(&self.roots().old_state);
+        let pending = pending.map(|commit| {
+            serde_json::json!({
+                "commit": commit, "previous": previous, "deadline": null,
+                "order_id": null, "starts_left": 3,
+            })
+        });
+        let state = serde_json::json!({
+            "schema": 1, "current": current, "previous": previous, "staged": staged,
+            "pending_confirm": pending, "order_floor": 0,
+        });
+        put(&dir.join("state.json"), &state.to_string(), 0o600);
     }
 
     pub fn write_memory(&self, memory: &Memory) {

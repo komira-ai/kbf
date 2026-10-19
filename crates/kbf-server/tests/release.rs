@@ -124,6 +124,11 @@ async fn serve_with(limits: Limits, configured: bool, token: Option<ApiToken>) -
     let store = configured
         .then(|| Arc::new(ReleaseStore::open(&dir.store(), limits).expect("open the store")));
     let app = release::router(store.clone(), token);
+    // As `serve_api` does: the handlers read the gate's `Trust`.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        None::<Arc<kbf_server::proxy_auth::ProxySecret>>,
+        kbf_server::proxy_auth::gate_requests,
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
@@ -582,6 +587,58 @@ async fn the_list_names_what_is_stored_and_what_is_complete() {
         .await
         .expect("read");
     assert_eq!(none, None);
+}
+
+/// Catches a platform called complete (or incomplete) by a rule that is not the platform's:
+/// a Linux host needs `kbf` and a Mac needs `kbf-daemon` (the tarball of each platform holds
+/// one binary), so each is complete with its own component attested and nothing else, and
+/// neither is complete with the other platform's component alone.
+///
+/// Mutant seen red: every platform wanting both components (a release is never complete).
+#[tokio::test]
+async fn a_platform_is_complete_with_the_tarball_its_hosts_need() {
+    let served = serve().await;
+    let store = served.store.as_ref().expect("store").clone();
+    let put_both = async |k: &Key| {
+        store.put_tarball(k, &mut body(b"t")).await.expect("put");
+        store
+            .put_attestation(k, &mut body(b"bundle"))
+            .await
+            .expect("put");
+    };
+    put_both(&key(COMMIT, ReleasePlatform::LinuxX86_64, Component::Kbf)).await;
+    put_both(&key(
+        COMMIT,
+        ReleasePlatform::DarwinArm64,
+        Component::KbfDaemon,
+    ))
+    .await;
+    put_both(&key(
+        COMMIT,
+        ReleasePlatform::LinuxArm64,
+        Component::KbfDaemon,
+    ))
+    .await;
+    let listing = get_list(&served).await.json();
+    let complete: Vec<(String, bool)> = listing["releases"][0]["platforms"]
+        .as_array()
+        .expect("platforms")
+        .iter()
+        .map(|p| {
+            (
+                p["platform"].as_str().expect("name").to_owned(),
+                p["complete"].as_bool().expect("flag"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        complete,
+        [
+            ("linux-x86_64".to_owned(), true),
+            ("linux-arm64".to_owned(), false),
+            ("darwin-arm64".to_owned(), true),
+        ]
+    );
 }
 
 /// Catches: a failing directory answered as success or as an empty list, and its path

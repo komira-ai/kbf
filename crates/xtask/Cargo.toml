@@ -30,6 +30,8 @@ base64.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
+# The result document a release's gamma verdict is, and the one definition of a set hash.
+kbf-gate.workspace = true
 lzma-rs.workspace = true
 ruzstd.workspace = true
 # The runner user's uid and gid, and `uname -m`, for `crun-tests`.
@@ -46,6 +48,8 @@ zip.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
+# The caller's umask, for the install.sh test.
+rustix = { workspace = true, features = ["fs", "process", "system"] }
 
 [lints]
 workspace = true

@@ -8,7 +8,6 @@ use serde_json::json;
 use super::rig::*;
 use super::*;
 use crate::fixtures::{FakeRunner, ran, version_json};
-use crate::state::{PendingConfirm, State};
 use crate::testkit::{A, B, C};
 
 fn never() -> FnVerifier {
@@ -26,30 +25,19 @@ fn refused(rig: &mut Rig) -> MigrateError {
 }
 
 /// Catches a move that takes a release out from under a swap on trial: with a pending
-/// confirm in the old state the migration refuses (busy, exit 4), whichever release it is.
+/// confirm in the old state the migration refuses (needs the operator, exit 5), whichever release it is.
 ///
 /// Mutant seen red: the `pending_confirm` check removed from `migrate`.
 #[test]
 fn a_swap_on_trial_refuses_the_migration() {
     let mut rig = Rig::linux("pending");
-    rig.write_old_state(&State {
-        current: Some(commit(A)),
-        previous: Some(commit(B)),
-        pending_confirm: Some(PendingConfirm {
-            commit: commit(A),
-            previous: Some(commit(B)),
-            deadline: None,
-            order_id: None,
-            starts_left: Some(3),
-        }),
-        ..State::default()
-    });
+    rig.write_old_state(Some(A), Some(B), None, Some(A));
     let error = refused(&mut rig);
     assert!(
         matches!(error, MigrateError::Pending { ref commit } if commit == A),
         "{error}"
     );
-    assert_eq!(error.exit_code(), 4);
+    assert_eq!(error.exit().code(), 5);
 }
 
 /// Catches a migration that guesses when the old layout disagrees with itself: the state
@@ -60,18 +48,14 @@ fn a_swap_on_trial_refuses_the_migration() {
 #[test]
 fn links_that_disagree_with_the_state_or_are_not_releases_are_refused() {
     let mut rig = Rig::linux("disagree");
-    rig.write_old_state(&State {
-        current: Some(commit(B)),
-        previous: Some(commit(A)),
-        ..State::default()
-    });
+    rig.write_old_state(Some(B), Some(A), None, None);
     let error = refused(&mut rig);
     assert!(matches!(error, MigrateError::Disagree(_)), "{error}");
     assert!(
         error.to_string().contains("state.json says current is"),
         "{error}"
     );
-    assert_eq!(error.exit_code(), 5);
+    assert_eq!(error.exit().code(), 5);
 
     let mut rig = Rig::linux("badlink");
     fs::remove_file(rig.at("usr/local/kbf/current")).expect("rm");
@@ -87,7 +71,7 @@ fn links_that_disagree_with_the_state_or_are_not_releases_are_refused() {
         ),
         "{error}"
     );
-    assert_eq!(error.exit_code(), 3);
+    assert_eq!(error.exit().code(), 3);
 
     let mut rig = Rig::linux("missing-current");
     fs::remove_file(rig.at("usr/local/kbf/previous")).expect("rm");
@@ -111,7 +95,7 @@ fn the_commit_comes_from_the_binary_and_a_failed_probe_refuses() {
         matches!(error, MigrateError::Mislabeled { ref probed, .. } if probed == &C[..12]),
         "{error}"
     );
-    assert_eq!(error.exit_code(), 3);
+    assert_eq!(error.exit().code(), 3);
     assert_eq!(rig.snapshot(""), before);
 
     type Answer = fn() -> std::io::Result<crate::run::Ran>;
@@ -196,7 +180,7 @@ fn only_the_owner_of_the_tree_may_apply() {
     rig.host.euid = me() + 1;
     let error = refused(&mut rig);
     assert!(matches!(error, MigrateError::NotRoot { .. }), "{error}");
-    assert_eq!(error.exit_code(), 2);
+    assert_eq!(error.exit().code(), 2);
     assert!(
         run_migrate(&mut rig, &never(), Mode::DryRun).is_ok(),
         "a dry run needs no root"
@@ -209,12 +193,11 @@ fn only_the_owner_of_the_tree_may_apply() {
 #[test]
 fn a_new_state_without_a_migration_and_a_journal_without_old_state_are_refused() {
     let mut rig = Rig::linux("conflict");
-    let theirs = schema::NewState::migrated(None, None, schema::Floor::default());
-    put(
-        &rig.new_state_dir().join("state.json"),
-        &String::from_utf8(theirs.render()).expect("utf8"),
-        0o600,
-    );
+    fs::create_dir_all(rig.new_state_dir()).expect("the installer's directory");
+    crate::state::Locked::acquire(&rig.layout)
+        .expect("lock")
+        .write(&crate::state::State::default())
+        .expect("the installer's state");
     let error = refused(&mut rig);
     assert!(matches!(error, MigrateError::Conflict(_)), "{error}");
 
@@ -249,7 +232,7 @@ fn damaged_files_stop_the_run_naming_the_file() {
         ),
         "{error}"
     );
-    assert_eq!(error.exit_code(), 1);
+    assert_eq!(error.exit().code(), 1);
 
     let mut rig = Rig::linux("state-bad");
     rig.fail_start.set(true);
@@ -259,13 +242,11 @@ fn damaged_files_stop_the_run_naming_the_file() {
     assert!(
         matches!(
             error,
-            MigrateError::Corrupt {
-                file: "state.json",
-                ..
-            }
+            MigrateError::State(crate::state::StateError::Schema { .. })
         ),
         "{error}"
     );
+    assert_eq!(error.exit().code(), 1);
 
     let mut rig = Rig::linux("memory-bad");
     put(
@@ -307,12 +288,24 @@ fn damaged_files_stop_the_run_naming_the_file() {
     }
 
     let mut rig = Rig::linux("old-state-bad");
-    put(
-        &rig.at("var/lib/kbf-deploy/state.json"),
+    // The installer's own schema in the old directory is not the old tools' state.
+    for text in [
         "{\"schema\": 2}",
-        0o600,
-    );
-    assert!(matches!(refused(&mut rig), MigrateError::State(_)));
+        "{\"schema\": 1, \"current\": null, \"previous\": null, \"staged\": null, \"pending_confirm\": null, \"order_floor\": 0, \"floor\": 1}",
+    ] {
+        put(&rig.at("var/lib/kbf-deploy/state.json"), text, 0o600);
+        let error = refused(&mut rig);
+        assert!(
+            matches!(
+                error,
+                MigrateError::Corrupt {
+                    file: "state.json",
+                    ..
+                }
+            ),
+            "{text}: {error}"
+        );
+    }
 }
 
 /// Catches a floor seeded from nothing: the frontend as the source and unreachable, with no
@@ -341,7 +334,7 @@ fn an_unreachable_frontend_without_a_flag_refuses_before_any_change() {
         matches!(error, MigrateError::FloorUnavailable(_)),
         "{error}"
     );
-    assert_eq!(error.exit_code(), 5);
+    assert_eq!(error.exit().code(), 5);
     assert_eq!(rig.snapshot(""), before);
 }
 
@@ -350,12 +343,7 @@ fn an_unreachable_frontend_without_a_flag_refuses_before_any_change() {
 #[test]
 fn a_staged_release_is_not_carried_and_the_report_says_so() {
     let mut rig = Rig::linux("staged");
-    rig.write_old_state(&State {
-        current: Some(commit(A)),
-        previous: Some(commit(B)),
-        staged: Some(commit(C)),
-        ..State::default()
-    });
+    rig.write_old_state(Some(A), Some(B), Some(C), None);
     let report = run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
     assert!(
         report
@@ -369,8 +357,8 @@ fn a_staged_release_is_not_carried_and_the_report_says_so() {
     );
 }
 
-/// Catches the exit codes drifting from the contract (1 failed, 2 usage, 3 refused, 4
-/// busy, 5 needs the operator): one error of each kind.
+/// Catches the exit codes drifting from the contract (1 failed, 2 usage, 3 refused, 5
+/// needs the operator; a swap of the old tool on trial is one of those, not a busy lock): one error of each kind.
 #[test]
 fn every_error_has_the_contract_exit_code() {
     let io = || std::io::Error::other("x");
@@ -401,7 +389,20 @@ fn every_error_has_the_contract_exit_code() {
             MigrateError::Pending {
                 commit: String::new(),
             },
-            4,
+            5,
+        ),
+        (
+            MigrateError::State(crate::state::StateError::Unusable {
+                primary: String::new(),
+                backup: String::new(),
+            }),
+            5,
+        ),
+        (
+            MigrateError::State(crate::state::StateError::Busy {
+                path: std::path::PathBuf::new(),
+            }),
+            1,
         ),
         (MigrateError::Disagree(String::new()), 5),
         (MigrateError::FloorUnavailable(String::new()), 5),
@@ -425,7 +426,7 @@ fn every_error_has_the_contract_exit_code() {
         ),
     ];
     for (error, code) in cases {
-        assert_eq!(error.exit_code(), code, "{error}");
+        assert_eq!(error.exit().code(), code, "{error}");
     }
 }
 
@@ -439,5 +440,5 @@ fn a_missing_old_tree_is_an_io_error_naming_the_path() {
     let error = refused(&mut rig);
     assert!(matches!(error, MigrateError::Io { .. }), "{error}");
     assert!(error.to_string().contains("/usr/local/kbf"), "{error}");
-    assert_eq!(error.exit_code(), 1);
+    assert_eq!(error.exit().code(), 1);
 }

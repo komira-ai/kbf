@@ -18,7 +18,8 @@ fn rollback_now(rig: &mut Rig, mode: Mode) -> Result<Report, MigrateError> {
 }
 
 fn guard_now(rig: &Rig) -> Result<(), MigrateError> {
-    guard(&rig.migration())
+    let m = rig.migration();
+    guard(&m.layout, m.owner_uid)
 }
 
 /// Catches a `setup` that goes ahead beside an old helper: while the old state exists and no
@@ -32,7 +33,7 @@ fn the_guard_holds_until_the_migration_is_done() {
     let mut rig = Rig::linux("guard");
     let error = guard_now(&rig).expect_err("unmigrated");
     assert!(matches!(error, MigrateError::Unmigrated(_)), "{error}");
-    assert_eq!(error.exit_code(), 5);
+    assert_eq!(error.exit().code(), 5);
     assert!(error.to_string().contains("kbf-installer migrate --apply"));
 
     rig.fail_start.set(true);
@@ -139,7 +140,7 @@ fn a_rollback_after_the_installer_moved_on_is_refused() {
         fs::write(&path, &original).expect("restore");
     }
     let mut state = rig.json(&path);
-    state["pending_confirm"] = json!({"activation": "1-2"});
+    state["pending_confirm"] = json!({"activation": "1-2", "commit": OTHER, "previous": null});
     fs::write(&path, serde_json::to_vec(&state).expect("json")).expect("write");
     assert!(matches!(
         rollback_now(&mut rig, Mode::Apply),

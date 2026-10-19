@@ -78,6 +78,14 @@ pub enum RowError {
     /// The policy cannot be kept.
     #[error(transparent)]
     Policy(#[from] PolicyError),
+    /// An offer expected another generation than the one desired now.
+    #[error("the desired release is at generation {found}, not {expected}")]
+    Stale {
+        /// What the offer expected.
+        expected: u64,
+        /// What the row holds (0 before any offer).
+        found: u64,
+    },
     /// An offer names no release.
     #[error("an offer must name a release")]
     NoRelease,
@@ -161,11 +169,33 @@ impl Rows {
     /// # Errors
     /// [`RowError`]: the store failed, the row cannot be read, or `commit` is empty.
     pub fn offer(&self, commit: &Release, now: FarmTime) -> Result<Desired, RowError> {
+        self.offer_expecting(commit, now, None)
+    }
+
+    /// [`Rows::offer`] that writes only if the desired release is at generation `expected`
+    /// (0 before any offer): a compare-and-set, so a click made on a stale page does not
+    /// replace what another operator has just set. The check and the write are one
+    /// conditional write of the row.
+    ///
+    /// # Errors
+    /// [`RowError::Stale`] when the generation is another; otherwise as [`Rows::offer`].
+    pub fn offer_expecting(
+        &self,
+        commit: &Release,
+        now: FarmTime,
+        expected: Option<u64>,
+    ) -> Result<Desired, RowError> {
         if commit.as_str().is_empty() {
             return Err(RowError::NoRelease);
         }
         for _ in 0..ATTEMPTS {
             let current = self.desired()?;
+            if let Some(expected) = expected {
+                let found = current.value.as_ref().map_or(0, |d| d.generation.0);
+                if found != expected {
+                    return Err(RowError::Stale { expected, found });
+                }
+            }
             if let Some(same) = current.value.as_ref().filter(|d| d.commit == *commit) {
                 return Ok(same.clone());
             }
@@ -211,6 +241,17 @@ impl Rows {
             }
         }
         Err(RowError::Contended(POLICY))
+    }
+
+    /// The policy row, if the operator ever wrote one.
+    ///
+    /// # Errors
+    /// [`RowError`]: the store failed or the row cannot be read.
+    pub fn policy_if_set(&self) -> Result<Option<Policy>, RowError> {
+        self.store
+            .get(POLICY)?
+            .map(|row| read(POLICY, &row, decode_policy))
+            .transpose()
     }
 
     /// The policy: the row if there is one, else the design's defaults.

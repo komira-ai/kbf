@@ -1,9 +1,9 @@
-//! Why a migration stopped, and the exit code each way ends with (contract section 2:
-//! 1 failed, 2 usage, 3 refused, 4 busy, 5 needs the operator).
+//! Why a migration stopped, and the exit each way ends with ([`Exit`]).
 
 use std::io;
 
 use super::tree::TreeError;
+use crate::exit::Exit;
 use crate::state::StateError;
 
 #[derive(Debug, thiserror::Error)]
@@ -68,23 +68,26 @@ impl MigrateError {
         }
     }
 
-    pub fn exit_code(&self) -> u8 {
+    /// How the verb ends (docs/design/kbf-installer.md section 2).
+    pub fn exit(&self) -> Exit {
         match self {
-            MigrateError::NotRoot { .. } => 2,
+            MigrateError::NotRoot { .. } => Exit::Usage,
             MigrateError::BadLink { .. }
             | MigrateError::Mislabeled { .. }
-            | MigrateError::Probe { .. } => 3,
-            MigrateError::Pending { .. } => 4,
-            MigrateError::Disagree(_)
+            | MigrateError::Probe { .. } => Exit::Refused,
+            // A swap of the old tool on trial, and the disagreements only a person settles.
+            MigrateError::Pending { .. }
+            | MigrateError::Disagree(_)
             | MigrateError::FloorUnavailable(_)
             | MigrateError::Conflict(_)
             | MigrateError::Unmigrated(_)
             | MigrateError::MovedOn(_)
-            | MigrateError::NoJournal => 5,
+            | MigrateError::NoJournal => Exit::NeedsOperator,
+            MigrateError::State(e) if e.needs_operator() => Exit::NeedsOperator,
             MigrateError::Corrupt { .. }
             | MigrateError::Tree(_)
             | MigrateError::State(_)
-            | MigrateError::Io { .. } => 1,
+            | MigrateError::Io { .. } => Exit::Failed,
         }
     }
 }

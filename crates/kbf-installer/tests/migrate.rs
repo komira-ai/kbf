@@ -12,9 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use kbf_installer::layout::Layout;
-use kbf_installer::state::{Locked, State};
-use kbf_installer::testkit::{A, B, c};
+use kbf_installer::testkit::{A, B};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-installer");
 
@@ -28,8 +26,9 @@ fn me() -> String {
 }
 
 fn old_host(name: &str) -> PathBuf {
-    let (layout, root): (Layout, PathBuf) =
-        kbf_installer::testkit::host_root(&format!("migrate-bin-{name}"));
+    // Not `host_root`: that makes the installer's directories, and a host to migrate has none.
+    let root = kbf_host::testkit::scratch(&format!("migrate-bin-{name}"));
+    fs::create_dir_all(root.join("run")).expect("run");
     for commit in [A, B] {
         let dir = root.join("usr/local/kbf/releases").join(commit);
         fs::create_dir_all(&dir).expect("release");
@@ -39,14 +38,17 @@ fn old_host(name: &str) -> PathBuf {
     let tree = root.join("usr/local/kbf");
     std::os::unix::fs::symlink(format!("releases/{A}"), tree.join("current")).expect("link");
     std::os::unix::fs::symlink(format!("releases/{B}"), tree.join("previous")).expect("link");
-    Locked::acquire(&layout)
-        .expect("lock")
-        .write(&State {
-            current: Some(c(A)),
-            previous: Some(c(B)),
-            ..State::default()
-        })
-        .expect("state");
+    // The old tools' state: schema 1, which the installer's own reader would refuse.
+    let state = format!(
+        "{{\"schema\": 1, \"current\": \"{A}\", \"previous\": \"{B}\", \"staged\": null, \
+         \"pending_confirm\": null, \"order_floor\": 0}}"
+    );
+    let old = root.join("var/lib/kbf-deploy");
+    fs::create_dir_all(&old).expect("old state dir");
+    fs::write(old.join("state.json"), state).expect("state");
+    // Whatever the umask of whoever runs the test: root's files, as the migration demands.
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).expect("mode");
+    fs::set_permissions(old.join("state.json"), fs::Permissions::from_mode(0o600)).expect("mode");
     root
 }
 

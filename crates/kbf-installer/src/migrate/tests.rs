@@ -10,7 +10,6 @@ use serde_json::json;
 
 use super::rig::*;
 use super::*;
-use crate::state::State;
 use crate::testkit::{A, B};
 
 fn never() -> FnVerifier {
@@ -89,7 +88,7 @@ fn a_dev_installer_host_is_adopted_unverified_and_the_old_layout_is_kept() {
         json!({
             "schema": 2, "current": A, "previous": B, "staged": null, "pending_confirm": null,
             "floor": {"epoch": 3, "order_id": 42, "generation": 17},
-            "serving_instance": null, "last_acked_order_id": 42, "unacked": null
+            "serving_instance": null, "last_acked_order_id": 42, "unacked": []
         })
     );
     assert_eq!(
@@ -100,8 +99,8 @@ fn a_dev_installer_host_is_adopted_unverified_and_the_old_layout_is_kept() {
     assert_eq!(status["unverified"], json!([A, B]));
     assert_eq!(status["installed_commit"], json!(A));
     assert_eq!(status["state"], json!("idle"));
-    assert_eq!(status["probe"]["commit"], json!(A));
-    assert_eq!(status["probe"]["protocol"], json!(4));
+    // The facts the current build reported are the status's `staged` (shown while current).
+    assert_eq!(status["staged"]["protocol"], json!(4));
     assert_eq!(
         fs::metadata(tree.join("status.json")).expect("meta").mode() & 0o777,
         0o644
@@ -214,9 +213,11 @@ fn the_verify_pipeline_decides_and_its_ok_is_checked() {
             (B.to_owned(), B[..12].to_owned())
         ]
     );
-    assert_eq!(
-        rig.json(&rig.new_tree().join("status.json"))["unverified"],
-        json!([])
+    // Nothing unverified: the key is not there, as in every status the helper writes.
+    assert!(
+        rig.json(&rig.new_tree().join("status.json"))
+            .get("unverified")
+            .is_none()
     );
 
     let mut rig = Rig::linux("liar");
@@ -341,26 +342,29 @@ fn a_run_that_died_before_the_start_is_finished_by_the_next() {
     assert!(unit.contains("/var/lib/kbf-installer/releases/current/kbf"));
 }
 
-/// Catches a leftover that survives or is trusted: a half copy in `work/` is swept, and an
+/// Catches a leftover that survives or is trusted: a half copy (`releases/.stage-<commit>.adopt`) is swept, the installer's own stage
+/// directories are not, and an
 /// unreferenced release directory with other content and no marker is replaced by the old
 /// release's bytes; one with the same content is kept as it is.
 ///
-/// Mutants seen red: `sweep_work` removed; the `Some(_)` arm of `adopt` keeping the stale dir.
+/// Mutants seen red: `sweep_partials` removed; the `Some(_)` arm of `adopt` keeping the stale dir.
 #[test]
 fn leftovers_of_an_interrupted_copy_are_swept_or_replaced() {
     let mut rig = Rig::linux("leftover");
     let tree = rig.new_tree();
-    put(&tree.join("work/adopt-leftover.partial/junk"), "x", 0o644);
-    put(&tree.join("work/keep-me"), "x", 0o644);
+    let partial = format!("releases/.stage-{A}.adopt");
+    let theirs = format!("releases/.stage-{A}.k3j2h4g5");
+    put(&tree.join(&partial).join("junk"), "x", 0o644);
+    put(&tree.join(&theirs).join("keep-me"), "x", 0o644);
     put(
         &tree.join("releases").join(A).join("kbf"),
         "a stale half copy",
         0o755,
     );
     run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
-    assert!(!tree.join("work/adopt-leftover.partial").exists());
+    assert!(!tree.join(&partial).exists());
     assert!(
-        tree.join("work/keep-me").exists(),
+        tree.join(&theirs).join("keep-me").exists(),
         "only its own scratch is swept"
     );
     assert_eq!(
@@ -368,32 +372,26 @@ fn leftovers_of_an_interrupted_copy_are_swept_or_replaced() {
         "binary of A"
     );
     assert!(tree.join("releases").join(A).join("manifest.json").exists());
-    assert!(fs::read_dir(tree.join("work")).expect("work").all(|e| {
-        !e.expect("entry")
-            .file_name()
-            .to_string_lossy()
-            .ends_with(".partial")
-    }));
 }
 
 /// Catches a previous release that is invented or dropped: a host with no `previous`
-/// adopts one release, makes no `previous` link, and a stale `previous` link from an earlier
-/// run is removed.
+/// adopts one release, makes no `previous` link, and the `previous` link an earlier,
+/// interrupted run made is removed (the release it named is left for the installer's gc).
 #[test]
 fn a_host_without_a_previous_release_gets_no_previous_link() {
     let mut rig = Rig::linux("noprev");
-    fs::remove_file(rig.at("usr/local/kbf/previous")).expect("rm");
-    rig.write_old_state(&State {
-        current: Some(commit(A)),
-        ..State::default()
-    });
     let tree = rig.new_tree();
-    fs::create_dir_all(tree.join("releases")).expect("releases");
-    std::os::unix::fs::symlink(B, tree.join("releases/previous")).expect("stale link");
+    // An earlier run got as far as the links (and failed to start the units).
+    rig.fail_start.set(true);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect_err("start fails");
+    assert!(tree.join("releases/previous").symlink_metadata().is_ok());
+    // Then the old host lost its `previous`.
+    rig.fail_start.set(false);
+    fs::remove_file(rig.at("usr/local/kbf/previous")).expect("rm");
+    rig.write_old_state(Some(A), None, None, None);
     let report = run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
     assert_eq!(report.unverified, vec![commit(A)]);
     assert!(tree.join("releases/previous").symlink_metadata().is_err());
-    assert!(!tree.join("releases").join(B).exists());
     let state = rig.json(&tree.join("state.json"));
     assert_eq!(
         (state["current"].clone(), state["previous"].clone()),
@@ -501,50 +499,63 @@ fn a_mac_host_comes_over_through_launchd() {
     );
 }
 
-/// Catches the state written beyond what the golden fixtures pin: the bytes of a
-/// migrated `state.json` and `status.json` (key order and all), so the next build reads
-/// what this one wrote.
+/// Catches the files written in a shape the next reader refuses: after a migration the
+/// installer's own reader reads `state.json` (schema 2, `unacked` a list, the floor seeded),
+/// the node's reader reads `status.json` (the string `refusal`, `unverified` named), and the
+/// helper's reader reads `helper.json` with the replay floor in both kinds of order. A
+/// stand-in shape that only looked like the real one (`unacked: null`, `refusal: null`)
+/// fails the first two.
+///
+/// Mutants seen red: `helper.json` not written (an old order replays); the floor of the
+/// frontend kind left at zero.
 #[test]
-fn the_written_files_have_the_golden_shape() {
-    let state = schema::NewState::migrated(
-        Some(commit(A)),
-        None,
-        schema::Floor {
-            epoch: 3,
-            order_id: 42,
-            generation: 17,
-        },
-    );
-    let status = schema::NewStatus::migrated(&state, None, vec![commit(A)]);
+fn the_written_files_are_read_by_the_installer_the_node_and_the_helper() {
+    let mut rig = Rig::linux("readers");
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    let dir = rig.new_state_dir();
+
+    let state = crate::state::read_unlocked(&rig.layout)
+        .expect("the installer reads it")
+        .expect("there is one");
+    assert_eq!(state.current, Some(commit(A)));
+    assert_eq!(state.previous, Some(commit(B)));
     assert_eq!(
-        String::from_utf8(state.render()).expect("utf8"),
-        format!(
-            "{{\n  \"schema\": 2,\n  \"current\": \"{A}\",\n  \"previous\": null,\n  \"staged\": null,\n  \
-             \"pending_confirm\": null,\n  \"floor\": {{\n    \"epoch\": 3,\n    \"order_id\": 42,\n    \
-             \"generation\": 17\n  }},\n  \"serving_instance\": null,\n  \"last_acked_order_id\": 42,\n  \
-             \"unacked\": null\n}}\n"
-        )
+        (
+            state.floor.epoch,
+            state.floor.order_id,
+            state.floor.generation
+        ),
+        (3, 42, 17)
     );
+    assert_eq!(state.last_acked_order_id, 42);
+    assert!(state.unacked.is_empty() && state.pending_confirm.is_none());
+
+    let kbf_update::helper::Helper::Reported(report) =
+        kbf_update::helper::read(&dir.join("status.json"))
+    else {
+        panic!("the node cannot read status.json");
+    };
+    assert_eq!(report.installed.as_deref(), Some(A));
+    assert_eq!(report.previous.as_deref(), Some(B));
+    assert_eq!(report.acked_order_id, 42);
     assert_eq!(
-        String::from_utf8(status.render()).expect("utf8"),
-        format!(
-            "{{\n  \"schema\": 2,\n  \"installed_commit\": \"{A}\",\n  \"previous_commit\": null,\n  \
-             \"staged_commit\": null,\n  \"state\": \"idle\",\n  \"refusal\": null,\n  \"acked_order_id\": 42,\n  \
-             \"staged\": null,\n  \"probe\": null,\n  \"trust_days_left\": null,\n  \"unverified\": [\n    \"{A}\"\n  ]\n}}\n"
-        )
+        rig.json(&dir.join("status.json"))["unverified"],
+        json!([A, B])
     );
+
+    let memory: crate::helper::memory::Memory =
+        serde_json::from_slice(&fs::read(dir.join("helper.json")).expect("helper.json"))
+            .expect("the helper reads it");
+    assert_eq!((memory.acked_epoch, memory.acked_order_id), (3, 42));
+    assert_eq!((memory.frontend_epoch, memory.frontend_order_id), (3, 42));
     assert_eq!(
-        schema::NewState::parse(&state.render()).expect("round trip"),
-        state
+        fs::metadata(dir.join("helper.json")).expect("meta").mode() & 0o777,
+        0o600
     );
-    assert!(schema::NewState::parse(b"{\"schema\": 1}").is_err());
-    let mut other = state.clone();
-    other.schema = 3;
-    assert!(schema::NewState::parse(&other.render()).is_err());
 }
 
 /// Catches a failed copy leaving a half release behind: a source that cannot be copied (a
-/// link inside it) leaves neither the scratch directory in `work/` nor a release directory,
+/// link inside it) leaves neither the `.stage-` directory in `releases/` nor a release directory,
 /// so the next run starts clean and nothing half-written can be linked.
 ///
 /// Mutant seen red: the scratch directory not removed when `fill` fails.
@@ -557,10 +568,13 @@ fn a_copy_that_fails_leaves_no_scratch_and_no_release() {
     )
     .expect("link");
     let rules = tree::Rules::release(me());
-    let new = super::newtree::NewTree::create(&rig.layout, &rig.roots(), &rules).expect("tree");
+    let new = super::newtree::NewTree::create(&rig.layout, &rules).expect("tree");
     let src = tree::open_root(&rig.at(&format!("usr/local/kbf/releases/{A}"))).expect("open");
     assert!(new.copy_in(&commit(A), &src).is_err());
     let tree = rig.new_tree();
-    assert_eq!(fs::read_dir(tree.join("work")).expect("work").count(), 0);
-    assert!(!tree.join("releases").join(A).exists());
+    let left: Vec<_> = fs::read_dir(tree.join("releases"))
+        .expect("releases")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
 }

@@ -152,14 +152,12 @@ fn a_symlink_is_refused_not_followed() {
 fn a_fifo_is_refused_without_blocking() {
     let root = scratch("fifo");
     release(&root.join("src"));
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        root.join("src/pipe"),
-        rustix::fs::FileType::Fifo,
-        Mode::from_raw_mode(0o644),
-        0,
-    )
-    .expect("fifo");
+    // `mknodat` is not on macOS; `mkfifo` is on both.
+    let made = std::process::Command::new("mkfifo")
+        .arg(root.join("src/pipe"))
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "mkfifo");
     let why = refused(digest(&rules(), &open(&root.join("src"))));
     assert!(why.contains("not a regular file or a directory"), "{why}");
 }

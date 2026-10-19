@@ -130,8 +130,9 @@ no job; the lint instead checks that `release.yml` verifies the verdict (section
 
 ## 3. The artifact every stage consumes
 
-`artifacts.yml` is the build stage and is not changed in kind. **[F]** It builds `kbf`, `kbf-daemon`, `kbf-server` and
-`kbf-deploy` for linux x86_64, linux arm64 and darwin arm64, deterministic tarballs, SBOMs, `SHA256SUMS`; on a push to main
+`artifacts.yml` is the build stage and is not changed in kind. **[F]** It builds `kbf`, `kbf-daemon`, `kbf-server`,
+`kbf-deploy` and `kbf-installer` for linux x86_64, linux arm64 and darwin arm64 (docs/artifacts.md lists which binary for
+which platform), deterministic tarballs, SBOMs, `SHA256SUMS`; on a push to main
 or feature/arch-v2 `attest` adds provenance and SBOM attestations and `verify` checks them. An attestation names its ref,
 so a feature/arch-v2 asset does not verify as main's.
 

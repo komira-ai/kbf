@@ -1,13 +1,19 @@
-//! The directories the migration moves between. The old ones are the deploy kit's
-//! ([`crate::layout`]); the new ones are the installer's (contract section 3), kept here,
-//! in one place and small, until `layout.rs` carries them (contract P2) and this table is
-//! replaced by a call to it.
+//! Where the old layout is, and where units are. The old layout is the deploy kit's
+//! (`/usr/local/kbf`, `/var/lib/kbf-deploy`): nothing else names it any more, so it is named
+//! here and only here. The installer's own tree and state are [`crate::layout::Layout`]'s;
+//! the migration asks the layout for them like every other verb.
 
 use kbf_host::path::HostPath;
 
 use crate::layout::{self, Platform};
 
-/// Where the old layout is, where the new one goes, and where units are.
+const OLD_TREE: &str = "/usr/local/kbf";
+const OLD_STATE_LINUX: &str = "/var/lib/kbf-deploy";
+const OLD_STATE_MACOS: &str = "/var/db/kbf-deploy";
+const OLD_LOCK_LINUX: &str = "/run/kbf-deploy.lock";
+const OLD_LOCK_MACOS: &str = "/var/run/kbf-deploy.lock";
+
+/// Where the old layout is, and where unit files are.
 #[derive(Clone, Debug)]
 pub struct Roots {
     pub platform: Platform,
@@ -15,50 +21,25 @@ pub struct Roots {
     pub old_tree: HostPath,
     /// `/var/lib/kbf-deploy` (macOS `/var/db/kbf-deploy`): `state.json`, `helper.json`.
     pub old_state: HostPath,
-    /// The installer's tree: `releases/`, `work/`.
-    pub new_tree: HostPath,
-    /// The installer's state: `state.json`, `status.json`. The same directory as the tree
-    /// on Linux (`/var/lib/kbf-installer`); on macOS the state is in `/var/db/kbf-installer`
-    /// and the tree in `/usr/local/kbf-installer`.
-    pub new_state: HostPath,
+    /// The lock the old tools changed their state under.
+    pub old_lock: HostPath,
     /// Where unit files are: `/etc/systemd/system`, or `/Library/LaunchDaemons`.
     pub unit_dir: HostPath,
 }
 
-fn host(path: &str) -> HostPath {
-    HostPath::new(path).expect("a constant host path")
-}
-
 impl Roots {
     pub fn new(platform: Platform) -> Roots {
-        let (new_tree, new_state, unit_dir) = match platform {
-            Platform::Linux => (
-                "/var/lib/kbf-installer",
-                "/var/lib/kbf-installer",
-                "/etc/systemd/system",
-            ),
-            Platform::MacOs => (
-                "/usr/local/kbf-installer",
-                "/var/db/kbf-installer",
-                "/Library/LaunchDaemons",
-            ),
+        let (state, lock, units) = match platform {
+            Platform::Linux => (OLD_STATE_LINUX, OLD_LOCK_LINUX, "/etc/systemd/system"),
+            Platform::MacOs => (OLD_STATE_MACOS, OLD_LOCK_MACOS, "/Library/LaunchDaemons"),
         };
         Roots {
             platform,
-            old_tree: layout::path(layout::KBF_DIR),
-            old_state: layout::path(match platform {
-                Platform::Linux => layout::STATE_DIR,
-                Platform::MacOs => layout::MACOS_STATE_DIR,
-            }),
-            new_tree: host(new_tree),
-            new_state: host(new_state),
-            unit_dir: host(unit_dir),
+            old_tree: layout::path(OLD_TREE),
+            old_state: layout::path(state),
+            old_lock: layout::path(lock),
+            unit_dir: layout::path(units),
         }
-    }
-
-    /// The link a migrated unit runs the binaries from.
-    pub fn new_bin(&self) -> String {
-        format!("{}/releases/current", self.new_tree)
     }
 
     /// The binary a release's version is asked of.

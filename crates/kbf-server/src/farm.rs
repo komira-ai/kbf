@@ -42,13 +42,14 @@ use kbf_front::{Backend, Dispatch, Finished, Recorder, Stage, Submission, Ticket
 use kbf_meta::ActionRecord;
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::ActionResult;
+use kbf_proto::update::{UpdateOrder, UpdateStatus};
 use kbf_proto::worker::{
     self, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{
     Cordon, DaemonInstance, Event, FARM_RERUNS, Fate, FloorChange, Input, LOSS_REQUEUES,
-    MemoryLadder, OpState, Requeue, Scheduler,
+    MemoryLadder, NodePhase, OpState, Requeue, Scheduler,
 };
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
@@ -79,6 +80,7 @@ use crate::memory;
 use crate::missing;
 use crate::run_record;
 use crate::stamp::Stamp;
+use crate::update_status::{HostUpdate, UpdateReport, UpdateSummary};
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
 /// start in milliseconds since the Unix epoch, times 2^16, plus 16 random bits.
@@ -155,6 +157,53 @@ struct Link {
     /// `Start` names it, and the daemon acts on the `Start` only within
     /// [`START_VALIDITY`] of having sent that heartbeat (or, for 0, its `Hello`).
     newest_beat: u64,
+    /// The `os` and `arch` its newest `Hello` reported (empty if it named none).
+    os: String,
+    arch: &'static str,
+    /// The version its first `Hello` named, the one `Welcome` answered (`None` if it
+    /// named none). Like the link, it is the newest stream's: a daemon that returns on
+    /// another version replaces it, and a `Hello` resent on the stream does not.
+    protocol: Option<u32>,
+}
+
+/// The `os` and `arch` entries of a node report.
+fn identity(caps: &kbf_caps::NodeCaps) -> (String, &'static str) {
+    let os = caps.exact.get("os").cloned().unwrap_or_default();
+    (os, caps.cpu.arch().name())
+}
+
+/// A node as the update controller reads it ([`Farm::update_look`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeLook {
+    /// Its id.
+    pub id: WorkerId,
+    /// Whether its newest stream is open.
+    pub connected: bool,
+    /// The `os` its newest `Hello` reported.
+    pub os: String,
+    /// The `arch` it reported.
+    pub arch: &'static str,
+    /// Whether placement has it cordoned (any cordon, a drain included).
+    pub cordoned: bool,
+    /// Leases the scheduler holds on it.
+    pub leases: u32,
+    /// Of those, leases whose `Start` was not sent.
+    pub undelivered: u32,
+    /// It is switching its session for a whole-machine lease (`Preparing`, `Restoring`).
+    pub whole_machine_hold: bool,
+    /// The newest `UpdateStatus` of its current stream; `None` before one.
+    pub update: Option<UpdateReport>,
+}
+
+/// An order that did not reach a node.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SendError {
+    /// The node never registered.
+    #[error("no node {0} has registered")]
+    Unknown(String),
+    /// Its newest stream is closed.
+    #[error("node {0} is not connected")]
+    NotConnected(String),
 }
 
 /// An OK result and its action-cache record, from the report to the answer.
@@ -370,7 +419,7 @@ impl Farm {
     }
 
     /// Farm time: milliseconds since this farm was built.
-    fn now(&self) -> FarmTime {
+    pub(crate) fn now(&self) -> FarmTime {
         let millis = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
         FarmTime::from_millis(millis)
     }
@@ -465,6 +514,7 @@ impl Farm {
         let mut state = self.lock();
         let stream = StreamId(state.next_stream);
         state.next_stream += 1;
+        let (os, arch) = identity(&reported.caps);
         // The receiver is the stream's own response, alive until the stream ends.
         let _ = outbound.send(Ok(welcome));
         let link = Link {
@@ -472,6 +522,9 @@ impl Farm {
             instance: instance.clone(),
             outbound,
             newest_beat: 0,
+            os,
+            arch,
+            protocol: reported.protocol,
         };
         let replaced = state.links.insert(worker.clone(), link);
         state.machine.register(worker);
@@ -505,7 +558,8 @@ impl Farm {
 
     /// A `Hello` resent on `stream`: the node report or the node's phase changed.
     /// Changes the worker's capacity, capabilities and phase, and opens no session;
-    /// ignored if `stream` was replaced.
+    /// ignored if `stream` was replaced. The protocol version `reported` names is not
+    /// taken: the stream's is the first `Hello`'s, which `Welcome` answered.
     ///
     /// A `Preparing` or `Restoring` phase naming a lease the scheduler holds on the
     /// worker, whose `Start` went to an earlier session, sends that `Start` again (the
@@ -515,7 +569,15 @@ impl Farm {
     pub fn resize(&self, worker: &WorkerId, stream: StreamId, reported: Reported) {
         let now = self.now();
         let mut state = self.lock();
-        if state.is_current(worker, stream) {
+        let (os, arch) = identity(&reported.caps);
+        // The newest stream's link takes the new identity; a replaced stream's is ignored.
+        let current = state
+            .links
+            .get_mut(worker)
+            .filter(|link| link.stream == stream)
+            .map(|link| (link.os, link.arch) = (os, arch))
+            .is_some();
+        if current {
             let event = Event::Capacity {
                 worker: worker.clone(),
                 capacity: reported.capacity,
@@ -563,7 +625,102 @@ impl Farm {
         changes
     }
 
-    /// This build, and every node registered since this farm started, in node-id order.
+    /// An `UpdateStatus` on `stream`: kept as the worker's newest, unless `stream` was
+    /// replaced (a newer stream sends its own), exactly as [`Self::node_status`] keeps a
+    /// `NodeStatus`. Returns whether it was kept.
+    pub fn update_status(&self, worker: &WorkerId, stream: StreamId, status: UpdateStatus) -> bool {
+        let report = UpdateReport::new(status, unix_ms());
+        let mut state = self.lock();
+        if !state.is_current(worker, stream) {
+            return false;
+        }
+        state.machine.report_update(worker, report);
+        true
+    }
+
+    /// Every node registered since this farm started, in node-id order, with what each
+    /// last said about its update (`GET /v1/update/hosts`); judged against no desired
+    /// commit ([`HostUpdate::judge`]).
+    pub fn update_hosts(&self) -> Vec<HostUpdate> {
+        let mut state = self.lock();
+        state.note_closed_streams();
+        state
+            .machine
+            .nodes()
+            .filter_map(|worker| {
+                let node = state.machine.node(worker)?;
+                Some(HostUpdate::new(
+                    worker.as_str().to_owned(),
+                    node.connected,
+                    node.update_live,
+                    node.update.clone(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Sends `order` to `worker` on its newest stream.
+    ///
+    /// # Errors
+    /// [`SendError`]: the node never registered, or its stream is closed.
+    pub fn send_order(&self, worker: &WorkerId, order: UpdateOrder) -> Result<(), SendError> {
+        let state = self.lock();
+        let link = state
+            .links
+            .get(worker)
+            .ok_or_else(|| SendError::Unknown(worker.to_string()))?;
+        let message = server_message::Message::UpdateOrder(order);
+        link.outbound
+            .send(Ok(crate::worker::message(message)))
+            .map_err(|_| SendError::NotConnected(worker.to_string()))
+    }
+
+    /// Every node registered since this farm started, as the update controller reads it, in
+    /// node-id order.
+    pub fn update_look(&self) -> Vec<NodeLook> {
+        let mut state = self.lock();
+        state.note_closed_streams();
+        state
+            .machine
+            .nodes()
+            .map(|worker| {
+                let node = state.machine.node(worker);
+                let held = state.sched.leases_on(worker);
+                let undelivered = held
+                    .iter()
+                    .filter(|lease| state.machine.sent(**lease).is_none())
+                    .count();
+                let link = state.links.get(worker);
+                NodeLook {
+                    id: worker.clone(),
+                    connected: node.is_some_and(|n| n.connected),
+                    os: link.map(|l| l.os.clone()).unwrap_or_default(),
+                    arch: link.map_or("", |l| l.arch),
+                    cordoned: state.sched.cordon(worker).is_some(),
+                    leases: u32::try_from(held.len()).unwrap_or(u32::MAX),
+                    undelivered: u32::try_from(undelivered).unwrap_or(u32::MAX),
+                    whole_machine_hold: matches!(
+                        state.sched.phase(worker),
+                        Some(NodePhase::Preparing(_) | NodePhase::Restoring(_))
+                    ),
+                    // The report is kept across streams for the operator's views; the
+                    // controller reads only one its node's current stream sent.
+                    update: node
+                        .filter(|n| n.update_live)
+                        .and_then(|n| n.update.clone()),
+                }
+            })
+            .collect()
+    }
+
+    /// The wall clock as a farm time: milliseconds since the Unix epoch. The update rows
+    /// store times, and a restart must not reset their origin (unlike [`Farm::now`]).
+    pub fn wall_now(&self) -> FarmTime {
+        FarmTime::from_millis(unix_ms())
+    }
+
+    /// This build, and every node registered since this farm started, in node-id order,
+    /// with the oldest protocol version among them ([`NodesView::of_this_build`]).
     pub fn nodes(&self) -> NodesView {
         let mut state = self.lock();
         state.note_closed_streams();
@@ -638,11 +795,18 @@ impl Farm {
         let node = state.machine.node(worker);
         let software = node.and_then(|n| n.status.clone());
         let phase = state.sched.phase(worker).cloned().unwrap_or_default();
+        let connected = node.is_some_and(|n| n.connected);
         NodeView {
             node_id: worker.as_str().to_owned(),
-            connected: node.is_some_and(|n| n.connected),
+            connected,
+            protocol: state.links.get(worker).and_then(|link| link.protocol),
             needs_attention: needs_attention(software.as_ref(), &phase),
             software,
+            update: UpdateSummary::new(
+                node.and_then(|n| n.update.as_ref()),
+                connected,
+                node.is_some_and(|n| n.update_live),
+            ),
             placement,
             phase: PhaseView::new(&phase),
         }

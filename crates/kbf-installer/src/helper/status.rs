@@ -36,6 +36,10 @@ struct File<'a> {
     acked_order_id: u64,
     staged: Option<Staged>,
     envoy: Envoy,
+    /// Releases a link names that carry no `VERIFIED` marker (adopted by `migrate`); left out
+    /// when there are none, so a status of a host that has none reads as it always did.
+    #[serde(skip_serializing_if = "<[CommitId]>::is_empty")]
+    unverified: &'a [CommitId],
 }
 
 /// The word for what the host is doing. A swap on trial outranks everything; then a
@@ -61,6 +65,12 @@ fn word(state: &State, memory: &Memory) -> &'static str {
 /// The bytes of `status.json` for a host in `state` that remembers `memory`. The facts of
 /// the newest fetched release are shown while it is staged or current.
 pub fn render(state: &State, memory: &Memory) -> Vec<u8> {
+    render_with(state, memory, &[])
+}
+
+/// The same, naming the releases `current` or `previous` hold that were adopted without
+/// verification, so that nothing reading the status takes them for verified.
+pub fn render_with(state: &State, memory: &Memory, unverified: &[CommitId]) -> Vec<u8> {
     let staged = memory
         .staged
         .as_ref()
@@ -85,6 +95,7 @@ pub fn render(state: &State, memory: &Memory) -> Vec<u8> {
             current: None,
             previous: None,
         },
+        unverified,
     };
     let mut bytes = serde_json::to_vec(&file).expect("plain fields serialize");
     bytes.push(b'\n');

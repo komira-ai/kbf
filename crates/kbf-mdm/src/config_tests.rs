@@ -345,10 +345,15 @@ fn main_exits_2_on_bad_flags_or_a_failed_start_and_0_on_sigterm() {
     };
     assert_eq!(main(args(&broken)), ExitCode::from(2));
     // A clean start, stopped by SIGTERM once it listens.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // `main` binds the address itself, so the test cannot hold it: it is one of the
+    // test's own (see `kbf_testkit::port::own_loopback_port`), and the number is taken
+    // on 127.0.0.1 here (the thief) before `main` starts: `main` must still listen,
+    // not fail with "Address already in use".
+    let port = kbf_testkit::port::own_loopback_port();
+    // Only Linux has the per-call loopback address; elsewhere the port is probed on
+    // 127.0.0.1 itself, and binding it here would make `main` fail for real.
+    #[cfg(target_os = "linux")]
+    let _thief = std::net::TcpListener::bind(("127.0.0.1", port.port()));
     cli.listen = port;
     let killer = std::thread::spawn(move || {
         while std::net::TcpStream::connect(port).is_err() {

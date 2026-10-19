@@ -1,0 +1,8 @@
+{
+  "order_id": 45,
+  "epoch": 3,
+  "generation": 18,
+  "verb": "frontend_update",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "window_s": 900
+}

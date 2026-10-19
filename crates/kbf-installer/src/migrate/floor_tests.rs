@@ -34,8 +34,8 @@ fn frontend(min_generation: Option<u64>) -> Seed {
     }
 }
 
-fn floor(epoch: u64, order_id: u64, generation: u64) -> schema::Floor {
-    schema::Floor {
+fn floor(epoch: u64, order_id: u64, generation: u64) -> crate::state::Floor {
+    crate::state::Floor {
         epoch,
         order_id,
         generation,

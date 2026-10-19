@@ -1,11 +1,13 @@
 //! An order record: what the unprivileged `kbf` leaves in the order spool after the
-//! frontend ordered this host to activate, confirm or revert a release.
+//! frontend ordered this host to activate, confirm or revert a release, or (on the
+//! frontend's own host) to update the frontend.
 //!
 //! The format is `kbf_update::OrderRecord`, which the writer builds and this side reads, in
 //! a file named `<epoch:020>-<order_id:020>.json`. The writer is the service user, so the
-//! record is untrusted: the name must be the pair inside, the verb one of three words, the
-//! commit a full commit, an activation's claims complete, and no other or repeated key is
-//! accepted.
+//! record is untrusted: the name must be the pair inside, the verb one of four words, the
+//! commit a full commit, an activation's claims complete, the other three verbs carry no
+//! claims (a `frontend_update` is a locator and nothing else), and no other or repeated key
+//! is accepted.
 
 use kbf_update::{Locator, OrderRecord, RecordError, Verb as RecordVerb};
 
@@ -26,7 +28,8 @@ pub enum Verb {
     Activate,
     Confirm,
     Revert,
-    /// The frontend's own update (a record the frontend writes into its own host's spool).
+    /// The frontend's own update (a record the frontend writes into its own host's spool): a
+    /// locator, so the order has no claims; the commit is fetched from the installer's source.
     FrontendUpdate,
 }
 
@@ -91,9 +94,9 @@ pub fn parse(epoch: u64, id: u64, bytes: &[u8]) -> Result<Order, OrderFault> {
             inside_epoch: record.epoch,
         });
     }
-    // The record checked the commit's shape already; this is the installer's own type.
-    let commit = CommitId::new(&record.commit)
-        .map_err(|e| OrderFault::NotAnOrder(RecordError::Commit(e.0)))?;
+    // The record checked the commit's shape already (the same rule); this is the installer's
+    // own type.
+    let commit = CommitId::new(&record.commit).expect("the record checked the commit");
     let verb = match record.verb {
         RecordVerb::Activate => Verb::Activate,
         RecordVerb::Confirm => Verb::Confirm,

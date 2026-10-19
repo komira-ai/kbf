@@ -10,14 +10,60 @@ use super::tree::{self, Rules};
 use crate::CommitId;
 use crate::helper::memory::Memory;
 use crate::layout::Layout;
-use crate::state::{self, State};
+use serde::Deserialize;
 
 const FILE_CAP: u64 = 1 << 20;
+
+/// The `schema` number of the deploy kit's `state.json`, the only one this reads. The
+/// installer's own is [`crate::state::SCHEMA`] (2), and its type is [`crate::state::State`]:
+/// this one is read here and nowhere else.
+const OLD_SCHEMA: u64 = 1;
+
+/// `state.json` as the deploy kit's tools wrote it (schema 1). Every key it had is named, so
+/// a file with another one is refused rather than half read. Only the swap on trial is
+/// looked into (its commit is named in the refusal); the rest of it is not carried over.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OldState {
+    schema: u64,
+    pub current: Option<CommitId>,
+    pub previous: Option<CommitId>,
+    pub staged: Option<CommitId>,
+    pub pending_confirm: Option<OldPending>,
+    /// Never read by anything: named so that the file parses.
+    #[allow(dead_code)]
+    order_floor: u64,
+}
+
+/// A swap of the old tools on trial. It stops the migration, so only the release it names
+/// is read; its other keys are whatever the old tool wrote.
+#[derive(Debug, Deserialize)]
+pub struct OldPending {
+    pub commit: CommitId,
+    #[serde(flatten)]
+    _rest: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The old state's bytes: schema 1 or refused.
+fn parse_state(bytes: &[u8]) -> Result<OldState, MigrateError> {
+    let corrupt = |why: String| MigrateError::Corrupt {
+        file: "state.json",
+        why,
+    };
+    let state: OldState = serde_json::from_slice(bytes).map_err(|e| corrupt(e.to_string()))?;
+    if state.schema != OLD_SCHEMA {
+        return Err(corrupt(format!(
+            "schema {}, the old layout's is {OLD_SCHEMA}",
+            state.schema
+        )));
+    }
+    Ok(state)
+}
 
 /// What the old tools recorded.
 #[derive(Debug)]
 pub struct Old {
-    pub state: State,
+    pub state: OldState,
     pub memory: Memory,
 }
 
@@ -34,8 +80,16 @@ pub fn read(layout: &Layout, roots: &Roots, rules: &Rules) -> Result<Option<Old>
         return Ok(None);
     }
     let state = match state {
-        Some(bytes) => state::parse(&path.join("state.json"), &bytes)?,
-        None => State::default(),
+        Some(bytes) => parse_state(&bytes)?,
+        // Only the helper's memory is there: an old host with nothing deployed.
+        None => OldState {
+            schema: OLD_SCHEMA,
+            current: None,
+            previous: None,
+            staged: None,
+            pending_confirm: None,
+            order_floor: 0,
+        },
     };
     let memory = match memory {
         Some(bytes) => parse_memory(&bytes)?,
@@ -91,5 +145,29 @@ impl OldTree {
     /// The release directory `name`, opened without following a link.
     pub fn release(&self, name: &CommitId) -> Result<OwnedFd, MigrateError> {
         tree::open_dir(&self.releases, name.as_str()).map_err(MigrateError::io(name.as_str()))
+    }
+}
+
+/// The lock the old tools changed their state under, held: no verb of theirs is mid-way
+/// while the migration reads their state and tree. Dropping it lets go.
+pub struct OldLock {
+    _file: std::fs::File,
+}
+
+impl OldLock {
+    /// Take the lock (made, 0600, when missing), waiting while another holds it.
+    pub fn take(layout: &Layout, roots: &Roots) -> Result<OldLock, MigrateError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let what = roots.old_lock.to_string();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(layout.join(&roots.old_lock))
+            .map_err(MigrateError::io(what.as_str()))?;
+        file.lock().map_err(MigrateError::io(what))?;
+        Ok(OldLock { _file: file })
     }
 }

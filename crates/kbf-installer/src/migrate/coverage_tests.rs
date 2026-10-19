@@ -38,7 +38,7 @@ fn a_host_without_the_old_state_directory_has_nothing_and_a_file_in_its_place_is
     put(&rig.at("var/lib/kbf-deploy"), "not a directory", 0o644);
     let error = run_migrate(&mut rig, &never(), Mode::Apply).expect_err("a file");
     assert!(matches!(error, MigrateError::Io { .. }), "{error}");
-    assert_eq!(error.exit_code(), 1);
+    assert_eq!(error.exit().code(), 1);
 }
 
 /// Catches a helper memory with no state file being read as nothing: a host that kept only
@@ -162,7 +162,7 @@ fn the_guard_names_a_damaged_journal() {
         "not json",
         0o600,
     );
-    let error = guard(&rig.migration()).expect_err("damaged");
+    let error = guard(&rig.layout, me()).expect_err("damaged");
     assert!(
         matches!(
             error,
@@ -182,7 +182,7 @@ fn the_guard_names_a_damaged_journal() {
 fn links_are_made_unmade_and_left_alone_as_asked() {
     let rig = Rig::linux("links");
     let rules = apply::rules(&rig.migration());
-    let tree = newtree::NewTree::create(&rig.layout, &rig.roots(), &rules).expect("tree");
+    let tree = newtree::NewTree::create(&rig.layout, &rules).expect("tree");
     assert!(!tree.set_link("previous", None).expect("nothing to remove"));
     assert!(tree.set_link("previous", Some(&commit(A))).expect("made"));
     assert!(
@@ -228,6 +228,11 @@ fn a_rollback_of_an_unusual_host_still_puts_the_old_layout_back() {
     rig.events.borrow_mut().clear();
     let report = rollback(&m, &mut rig.host, Mode::Apply).expect("rolls back");
     assert_eq!(report.outcome, Outcome::RolledBack);
+    assert!(
+        report.warnings.iter().any(|w| w.contains("unusable")),
+        "{:?}",
+        report.warnings
+    );
     let events = rig.events.borrow().clone();
     assert!(
         events

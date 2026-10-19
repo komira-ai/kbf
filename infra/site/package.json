@@ -1,0 +1,23 @@
+{
+  "name": "kbf-site-infra",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Held AWS infrastructure for the kbf website: Route 53 zone, private S3 bucket behind CloudFront (OAC), publish role",
+  "scripts": {
+    "test": "jest",
+    "typecheck": "tsc --noEmit",
+    "synth": "cdk synth",
+    "held": "ts-node held/main.ts"
+  },
+  "devDependencies": {
+    "@types/jest": "29.5.14",
+    "@types/node": "20.19.43",
+    "aws-cdk": "2.1145.0",
+    "aws-cdk-lib": "2.273.0",
+    "constructs": "10.8.1",
+    "jest": "29.7.0",
+    "ts-jest": "29.4.14",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3"
+  }
+}

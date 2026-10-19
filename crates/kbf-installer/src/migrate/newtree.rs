@@ -1,5 +1,6 @@
-//! The new tree, held open by descriptor: the installer's releases, its scratch, and the
-//! small files the migration writes in its state directory. Everything is opened
+//! The new tree, held open by descriptor: the installer's releases and the small files the
+//! migration writes in its state directory (`status.json`, `helper.json`, its journal;
+//! `state.json` is written through [`crate::state::Locked`]). Everything is opened
 //! relative to a directory held, never by a path that could be swapped meanwhile.
 
 use std::fs::{self, DirBuilder};
@@ -11,27 +12,29 @@ use rustix::fs::{AtFlags, Mode};
 use rustix::io::Errno;
 
 use super::error::MigrateError;
-use super::roots::Roots;
-use super::schema::{Journal, NewState, NewStatus};
+use super::journal::Journal;
 use super::tree::{self, Rules};
 use crate::CommitId;
-use crate::layout::Layout;
+use crate::layout::{self, Layout};
+use crate::stage::VERIFIED;
 
 const JOURNAL: &str = "migration.json";
 const FILE_CAP: u64 = 1 << 20;
+/// What ends the name of the directory a release is copied into (the installer's stage
+/// names are `.stage-<commit>.<rand>`; the migration's `<rand>` is `adopt`).
+const PARTIAL_END: &str = ".adopt";
 
-/// The state directory: `state.json`, `status.json`, `migration.json`.
+/// The state directory: `status.json`, `helper.json`, `migration.json`.
 pub struct StateDir {
     rules: Rules,
     fd: OwnedFd,
 }
 
-/// The new tree: its state directory, the releases and the scratch.
+/// The new tree: its state directory and the releases.
 pub struct NewTree {
     rules: Rules,
     pub state: StateDir,
     releases: OwnedFd,
-    work: OwnedFd,
 }
 
 /// Open the directory at `path` of the layout, making it (and its parents, 0755) when
@@ -79,12 +82,11 @@ fn sub(rules: &Rules, parent: &OwnedFd, name: &str) -> Result<OwnedFd, MigrateEr
 
 impl StateDir {
     /// The state directory of the layout; `None` when it is not there. Nothing is made.
-    pub fn open(
-        layout: &Layout,
-        roots: &Roots,
-        rules: &Rules,
-    ) -> Result<Option<StateDir>, MigrateError> {
-        Ok(dir(layout, rules, &roots.new_state, false)?.map(|fd| StateDir { rules: *rules, fd }))
+    pub fn open(layout: &Layout, rules: &Rules) -> Result<Option<StateDir>, MigrateError> {
+        Ok(
+            dir(layout, rules, &layout.state_dir(), false)?
+                .map(|fd| StateDir { rules: *rules, fd }),
+        )
     }
 
     fn read(&self, name: &'static str) -> Result<Option<Vec<u8>>, MigrateError> {
@@ -110,28 +112,19 @@ impl StateDir {
         )?)
     }
 
-    pub fn state(&self) -> Result<Option<NewState>, MigrateError> {
-        self.read("state.json")?
-            .map(|b| NewState::parse(&b).map_err(Self::corrupt("state.json")))
-            .transpose()
+    /// `status.json`, world-readable: the node reads it.
+    pub fn put_status(&self, bytes: &[u8]) -> Result<(), MigrateError> {
+        Ok(tree::replace_file(&self.fd, "status.json", 0o644, bytes)?)
     }
 
-    pub fn put_state(&self, state: &NewState) -> Result<(), MigrateError> {
-        Ok(tree::replace_file(
-            &self.fd,
-            "state.json",
-            0o600,
-            &state.render(),
-        )?)
+    /// `helper.json`, the installer's replay memory, root's alone.
+    pub fn put_memory(&self, bytes: &[u8]) -> Result<(), MigrateError> {
+        Ok(tree::replace_file(&self.fd, layout::MEMORY, 0o600, bytes)?)
     }
 
-    pub fn put_status(&self, status: &NewStatus) -> Result<(), MigrateError> {
-        Ok(tree::replace_file(
-            &self.fd,
-            "status.json",
-            0o644,
-            &status.render(),
-        )?)
+    /// `helper.json` as it is; `None` when there is none.
+    pub fn memory(&self) -> Result<Option<Vec<u8>>, MigrateError> {
+        self.read(layout::MEMORY)
     }
 
     /// The directory the first originals of the units are kept in (0700, root's).
@@ -147,17 +140,16 @@ impl StateDir {
 
 impl NewTree {
     /// The new tree of the layout, made (0755) where it is not there.
-    pub fn create(layout: &Layout, roots: &Roots, rules: &Rules) -> Result<NewTree, MigrateError> {
-        let state = dir(layout, rules, &roots.new_state, true)?.expect("made");
-        let tree = dir(layout, rules, &roots.new_tree, true)?.expect("made");
+    pub fn create(layout: &Layout, rules: &Rules) -> Result<NewTree, MigrateError> {
+        let state = dir(layout, rules, &layout.state_dir(), true)?.expect("made");
+        let tree = dir(layout, rules, &layout.install_root(), true)?.expect("made");
         Ok(NewTree {
             rules: *rules,
             state: StateDir {
                 rules: *rules,
                 fd: state,
             },
-            releases: sub(rules, &tree, "releases")?,
-            work: sub(rules, &tree, "work")?,
+            releases: sub(rules, &tree, layout::RELEASES)?,
         })
     }
 
@@ -171,7 +163,7 @@ impl NewTree {
         let Some(dir) = self.release(commit)? else {
             return Ok(false);
         };
-        Ok(tree::read_file(&self.rules, &dir, "VERIFIED", FILE_CAP)?.is_some())
+        Ok(tree::read_file(&self.rules, &dir, VERIFIED, FILE_CAP)?.is_some())
     }
 
     /// The digest of `releases/<commit>`; `None` when it is not there.
@@ -188,41 +180,45 @@ impl NewTree {
             .map_err(MigrateError::io(commit.as_str()))
     }
 
-    /// Remove what an interrupted copy left in `work/`.
-    pub fn sweep_work(&self) -> Result<(), MigrateError> {
-        let entries = rustix::fs::Dir::read_from(&self.work).map_err(MigrateError::io("work"))?;
+    /// Remove what an interrupted copy left in `releases/` (a `.stage-<commit>.adopt`).
+    pub fn sweep_partials(&self) -> Result<(), MigrateError> {
+        let entries =
+            rustix::fs::Dir::read_from(&self.releases).map_err(MigrateError::io("releases"))?;
         for item in entries {
             let name = item
-                .map_err(MigrateError::io("work"))?
+                .map_err(MigrateError::io("releases"))?
                 .file_name()
                 .to_owned();
-            if name.to_bytes().starts_with(b"adopt-") {
+            let bytes = name.to_bytes();
+            if bytes.starts_with(layout::STAGE_PREFIX.as_bytes())
+                && bytes.ends_with(PARTIAL_END.as_bytes())
+            {
                 let name = name.to_string_lossy().into_owned();
-                tree::remove_tree(&self.work, &name).map_err(MigrateError::io(name))?;
+                tree::remove_tree(&self.releases, &name).map_err(MigrateError::io(name))?;
             }
         }
         Ok(())
     }
 
-    /// Copy the tree `src` into `releases/<commit>`: into a scratch directory first, read
-    /// synced, then renamed into place. The directory
-    /// `commit` must not exist.
+    /// Copy the tree `src` into `releases/<commit>`: into a `.stage-` directory beside it
+    /// first (the installer's own name for a release being made, so one sweep finds both),
+    /// read synced, then renamed into place. The directory `commit` must not exist.
     pub fn copy_in(&self, commit: &CommitId, src: &OwnedFd) -> Result<(), MigrateError> {
-        let partial = format!("adopt-{commit}.partial");
-        rustix::fs::mkdirat(&self.work, &partial, Mode::from_raw_mode(0o755))
+        let partial = format!("{}{commit}{PARTIAL_END}", layout::STAGE_PREFIX);
+        rustix::fs::mkdirat(&self.releases, &partial, Mode::from_raw_mode(0o755))
             .map_err(MigrateError::io(partial.as_str()))?;
         let result = self.fill(&partial, src);
         if result.is_err() {
-            let _ = tree::remove_tree(&self.work, &partial);
+            let _ = tree::remove_tree(&self.releases, &partial);
             return result;
         }
-        rustix::fs::renameat(&self.work, &partial, &self.releases, commit.as_str())
+        rustix::fs::renameat(&self.releases, &partial, &self.releases, commit.as_str())
             .map_err(MigrateError::io(commit.as_str()))?;
         rustix::fs::fsync(&self.releases).map_err(MigrateError::io("releases"))
     }
 
     fn fill(&self, partial: &str, src: &OwnedFd) -> Result<(), MigrateError> {
-        let dst = tree::open_dir(&self.work, partial).map_err(MigrateError::io(partial))?;
+        let dst = tree::open_dir(&self.releases, partial).map_err(MigrateError::io(partial))?;
         rustix::fs::fchmod(&dst, Mode::from_raw_mode(0o755)).map_err(MigrateError::io(partial))?;
         tree::copy(&self.rules, src, &dst)?;
         rustix::fs::fsync(&dst).map_err(MigrateError::io(partial))

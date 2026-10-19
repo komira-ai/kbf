@@ -5,8 +5,8 @@
 //! A floor only goes up: a repeated migration never lowers it.
 
 use super::error::MigrateError;
-use super::schema::Floor;
 use crate::helper::memory::Memory;
+use crate::state::Floor;
 
 /// Where a host gets its releases, which decides where the floor is seeded from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +47,7 @@ pub struct Seeded {
 }
 
 /// The newer of two (epoch, order id) pairs, by epoch first.
-fn newer(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
+pub(super) fn newer(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
     a.max(b)
 }
 

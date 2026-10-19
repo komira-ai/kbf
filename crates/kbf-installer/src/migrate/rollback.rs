@@ -7,22 +7,24 @@ use kbf_host::{Exec, Mode};
 
 use super::apply::{remove_note, rules};
 use super::error::MigrateError;
+use super::journal::Phase;
 use super::newtree::StateDir;
-use super::schema::Phase;
 use super::services::Services;
 use super::tree;
 use super::units;
 use super::{Migration, Outcome, Report};
+use crate::state;
 
 /// Put the host back on the old layout, or (in a dry run) say what would be done.
 pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Report, MigrateError> {
     let rules = rules(m);
-    let Some(state_dir) = StateDir::open(&m.layout, &m.roots, &rules)? else {
+    let Some(state_dir) = StateDir::open(&m.layout, &rules)? else {
         return Err(MigrateError::NoJournal);
     };
     let Some(mut journal) = state_dir.journal()? else {
         return Err(MigrateError::NoJournal);
     };
+    let mut unknown_state = None;
     if journal.phase == Phase::RolledBack {
         let mut report = Report::new(Outcome::NothingToMigrate);
         report
@@ -30,7 +32,16 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
             .push("already rolled back: nothing to do".to_owned());
         return Ok(report);
     }
-    if let Some(state) = state_dir.state()? {
+    // A state nobody can read cannot say the installer moved on, and a rollback is how a
+    // host gets out of that: it goes ahead and says so.
+    let state = match state::read_unlocked(&m.layout) {
+        Err(e) if e.needs_operator() => {
+            unknown_state = Some(e.to_string());
+            None
+        }
+        read => read?,
+    };
+    if let Some(state) = state {
         let adopted = |role: &str| {
             journal
                 .adopted
@@ -54,6 +65,12 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
         Mode::DryRun => Outcome::Planned,
         Mode::Apply => Outcome::RolledBack,
     });
+    if let Some(why) = unknown_state {
+        report.warnings.push(format!(
+            "the installer's state is unusable, so whether it moved the host on could not be \
+             checked: {why}"
+        ));
+    }
     report.line(
         mode,
         "restore the units' originals, enable the old helper, start what ran before",

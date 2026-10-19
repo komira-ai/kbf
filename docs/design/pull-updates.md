@@ -150,7 +150,7 @@ rules the field comments cannot. Numbers in `kbf.worker.v1`: `DaemonMessage.upda
 `name` is `kbf` or `kbf-daemon`. `sha256` is 64 lowercase hex digits of the tarball and is also its name in
 `ReleaseService.Fetch`. `attestation` is the build-provenance bundle (JSON lines, at most 256 KiB) of the tarball.
 
-**Which components a platform needs.** `linux-x86_64`, `linux-arm64`: `kbf`. `darwin-arm64`: `kbf-daemon`. A
+**Which components a platform needs.** `linux-x86_64`, `linux-arm64`: `kbf`. `darwin-arm64`: `kbf` (no darwin `kbf-daemon` is built; the installer refuses a Mac offer that names it). A
 platform is **complete** for a commit when the frontend holds every component it needs, with their attestations.
 
 **UpdateOffer.**
@@ -267,6 +267,20 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
 
 ### 6.4 Sessions
 
+**As built.** The frontend looks at the desired row and the release store once a farm tick and
+keeps one offer per complete platform; each session sends its node's platform offer after
+`Welcome` and whenever that offer changes (the same offer is never sent twice on a session).
+A look that fails keeps the table. The node's platform is read from its first `Hello`.
+The rollout controller (`kbf-server/src/update`) runs on the frontend with a state store, once a
+farm tick, and starts no host unless `update/policy.auto_nodes` is true (hosts already in a step
+are always moved). Its orders go out as `UpdateOrder` on the host's stream with the `Welcome`
+epoch (an order of another epoch is refused before it is sent); a confirmation carries an id
+of its own, drawn from the order counter, because a node drops a repeated id. Its facts come
+from the farm and each node's `UpdateStatus` of its current stream. **Not yet:** hosts with a
+storage half are never started (the planned-down mark and the member join are U3, #914, in
+`feature/arch-v2`), and no operator action starts a run with `auto_nodes` off.
+`GET /v1/nodes` lists `update` per node and `GET /v1/update/hosts` its detail (`docs/api.md`).
+
 After `Welcome`, and to every connected node at every change of the desired release or of a platform's
 completeness, the frontend sends an `UpdateOffer` for that node's platform. `UpdateStatus` is kept as the newest per
 node and ignored from a replaced stream, exactly as `NodeStatus` is.
@@ -276,7 +290,7 @@ node and ignored from a replaced stream, exactly as `NodeStatus` is.
 `POST /v1/update/frontend {commit}` (write gate as the other writes; admin) is the one route that updates the frontend. Gamma calls it. The commit must have a complete platform for the frontend host (else 409), and no frontend
 update may be in flight (409). The frontend then **writes an order record into its own host's `orders/` directory**, by the same mechanism as
 `kbf-update` uses for nodes (a dot-prefixed temporary name, then rename; section 7), with `verb=frontend_update`, the `commit`, a `generation` from the
-store counter, the store `epoch` and an `order_id`, and the components and expected facts of the release from its own store. The route returns the order id; the installer refuses a second order while one is in flight (`frontend_busy`) and one whose installed Envoy is outside the tested range (`envoy_range`). The root CLI `kbf-installer update --commit SHA --frontend` stays as the **local fallback** and runs the same code. It does not go
+store counter, the store `epoch` and an `order_id`. The record is a locator: it carries no components and no expected facts, and the root half fetches and verifies the release itself ([kbf-installer.md](kbf-installer.md) section 6). The route returns the order id; the installer refuses a second order while one is in flight (`frontend_busy`) and one whose installed Envoy is outside the tested range (`envoy_range`). The root CLI `kbf-installer update --commit SHA --frontend` stays as the **local fallback** and runs the same code. It does not go
 through a node session, and nothing is sent on the wire. The installer's reply is the host's `status.json`, which the route's status
 read (`GET /v1/update`) reports.
 

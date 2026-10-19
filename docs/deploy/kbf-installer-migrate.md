@@ -18,13 +18,16 @@ kbf-installer migrate --rollback [--apply]
 Without `--apply` it prints what it would do and changes nothing. With it, as root:
 
 1. It reads the old state, the helper's memory and the links. A swap on trial (activated, not
-   confirmed) refuses the migration: confirm or revert it first (exit 4). Links that disagree with the
+   confirmed) refuses the migration: confirm or revert it first (exit 5). Links that disagree with the
    state refuse it (exit 5).
 2. It names each release (`current`, `previous`) from `--version --json` of its binary, run as the
    `kbf-fetch` user (`--fetch-user`) with an empty environment and a 10 second limit. The commit is
    never taken from a directory name, a link or the state; a directory that holds another build is
    refused (exit 3).
-3. It seeds the replay floor: the old (epoch, order id) is carried over; the generation comes from the
+3. It seeds the replay floor, in the two places the installer reads it: the old (epoch, order id)
+   is carried over into `helper.json` (the memory `run` orders against, for both kinds of order) and
+   into `state.json`'s `floor`; the generation (`floor.generation`, and the value `setup` writes as
+   `min_generation`) comes from the
    frontend (`--release-source frontend`), else from `--min-generation`, else it is zero and the report
    says so plainly (`NO REPLAY FLOOR`). With the frontend as the source and no answer, and no flag, it
    refuses (exit 5).
@@ -34,20 +37,28 @@ Without `--apply` it prints what it would do and changes nothing. With it, as ro
    group- or other-writable, no file capabilities, no `VERIFIED` marker) and adopted **unverified**:
    no `VERIFIED` marker, listed in `status.json` under `unverified`, printed as a warning, and a rollback
    to it is refused until a verified copy replaces it.
-5. It stops the old helper's unit and the kbf units that run, disables the helper (so the helper and the
-   installer never both manage the host), writes `releases/current` and `releases/previous`,
-   `state.json`, `status.json` and the units' `Exec*=` lines (the first original of each unit is kept in
+5. It takes the old tools' lock and the installer's, stops the old helper's unit and the kbf units that
+   run, disables the helper (so the helper and the installer never both manage the host), writes
+   `state.json` (the installer's own type, under its lock, so the next write keeps a `.bak`),
+   `helper.json`, then `releases/current` and `releases/previous` (after the state: a link with no
+   state beside it reads as a lost state), `status.json` (the shape the node reads, with `unverified`
+   added) and the units' `Exec*=` lines (the first original of each unit is kept in
    `migration-units/`), reloads the unit manager, and starts what it stopped.
 
 Every step can be run again: a finished migration is a no-op; one that stopped half way is finished by
 the next run (the journal `migration.json` remembers what was stopped); a floor only goes up; a copy
-with the source's digest is kept, any other leftover is replaced, scratch is swept. `setup` refuses
-(exit 5) while the old state exists and no migration finished.
+with the source's digest is kept, any other leftover is replaced, scratch is swept. While the old
+state exists and no migration finished, `run`, the operator's verbs (`confirm`, `revert`,
+`rollback`, `gc`) and `setup` of a mode with a database refuse (exit 5) and name this verb; the
+rest of `setup` calls the same check when it is built. `status.json` names `unverified` releases
+until the helper's first pass rewrites it (the helper does not carry the list yet; the journal
+`migration.json` and the missing `VERIFIED` marker do).
 
 `--rollback` restores the unit files, enables the helper again, stops the installer's own unit and starts what
 ran before. The old tree and state are never modified (a note, `MIGRATED`, is added to the old state
 directory and removed again), which is why this works. It is refused once the installer has activated,
-staged or put a release on trial since (exit 5): use `kbf-installer rollback` then.
+staged or put a release on trial since (exit 5): use `kbf-installer rollback` then. If the
+installer's state cannot be read at all, the rollback goes ahead and warns that it could not check.
 
 Not done by the migration: `installer.toml` (the `min_generation` to put there is printed as the
 report's value; `setup` writes the file), the users, and the `orders/` directory (`setup`).

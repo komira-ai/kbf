@@ -21,29 +21,53 @@ publish.workspace = true
 # configured service and write the world-readable status.json the node reads. There is no
 # socket and no network, and a staged binary is never run as root. The `migrate` module (and
 # verb) adopts a host that runs the old layout into the installer's tree.
+# `deploy`'s CAS smoke is a small gRPC client of the local REAPI listener (kbf-proto, tonic, a
+# current-thread tokio runtime built for the one check); toml and x509-parser read the
+# frontend's own config for the listener's address and certificate name.
 
 [features]
 # `testkit`: the scratch host and state helpers other crates' tests of the `host` verbs use.
 testkit = ["kbf-host/testkit"]
+# `test-sandbox`: the global `--root DIR` flag, which puts a host's paths under a scratch directory.
+# Absent from release builds (contract S15); the crate's own tests turn it on.
+test-sandbox = []
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
 clap.workspace = true
 flate2.workspace = true
+futures.workspace = true
 hex.workspace = true
+httparse.workspace = true
+hyper.workspace = true
 kbf-host.workspace = true
+kbf-proto.workspace = true
+# `postgres`: the schema's migrations and the client that applies them (`database` module).
+kbf-state = { workspace = true, features = ["postgres"] }
 kbf-update.workspace = true
 libc.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 tar.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tonic = { workspace = true, features = ["tls-native-roots", "tls-ring"] }
+toml.workspace = true
+tracing.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 kbf-host = { workspace = true, features = ["testkit"] }
-kbf-installer = { workspace = true, features = ["testkit"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
+kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
+kbf-update.workspace = true
+postgres.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

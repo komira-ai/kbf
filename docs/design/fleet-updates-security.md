@@ -80,7 +80,7 @@ without a file name refer to [fleet-updates.md](fleet-updates.md); numbers prefi
 - **A server that skips `Update`** and asks the gate to enforce directly can reboot a
   Mac mid-lease. The gate's caps (S5.2) bound it to one Mac per pool at a time.
 - **A VM guest escape** lands as the uid of the VM host process. `macos-vms.md`
-  section 6 (open PR [#85](https://github.com/komira-ai/komira-build-farm/pull/85))
+  section 6 (open PR [#85](https://github.com/komira-ai/kbf/pull/85))
   states that `kbf-vmm` runs as a dedicated non-admin uid outside the helpers' group,
   started through `kbf-mac-session run` or its own launchd user, never as `_kbf` (S4.3).
 - **Linux join credentials have no hardware attestation.** A Linux node's identity

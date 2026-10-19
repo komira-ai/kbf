@@ -10,7 +10,7 @@
 
 #![cfg(target_os = "linux")]
 
-#[path = "../../kbf-all-in-one/tests/support/node.rs"]
+#[path = "support/node.rs"]
 mod node;
 
 use std::io::{BufRead as _, BufReader};

@@ -38,6 +38,8 @@ mod env;
 mod files;
 mod needs;
 #[cfg(test)]
+mod proxy_secret_tests;
+#[cfg(test)]
 mod tests;
 
 pub mod host;
@@ -145,6 +147,9 @@ pub struct FileNeed {
     /// Whether it holds a secret (a private key, a token): owned by the process's user and
     /// readable by no one else.
     pub secret: bool,
+    /// The exact size the file must have, in bytes, where the flag's value is a fixed-size
+    /// secret (the proxy's, 32 bytes); `None` for any size.
+    pub exact_len: Option<usize>,
 }
 
 /// A row of the farm's certificate table (docs/deploy/kbf-modes.md, "A node's
@@ -218,4 +223,22 @@ pub fn refusal(invocation: &Invocation) -> Option<ExitCode> {
     let report = check(&needs, &System);
     eprint!("{}", report.render(needs.mode));
     report.exit_status().map(ExitCode::from)
+}
+
+/// `kbf <mode> --check`: the checks of a start, printed, and nothing started. Standard
+/// output says `ok` when nothing stops the start (warnings and problems go to standard
+/// error, as a start prints them); the exit status is the one a start would exit with:
+/// 0, [`REFUSED`] or [`NOT_READY`].
+#[must_use]
+pub fn check_only(invocation: &Invocation) -> ExitCode {
+    let needs = needs(invocation);
+    let report = check(&needs, &System);
+    eprint!("{}", report.render(needs.mode));
+    match report.exit_status() {
+        Some(code) => ExitCode::from(code),
+        None => {
+            println!("kbf {}: ok", needs.mode);
+            ExitCode::SUCCESS
+        }
+    }
 }

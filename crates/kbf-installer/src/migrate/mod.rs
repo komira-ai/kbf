@@ -24,9 +24,10 @@
 //!    is replaced, scratch is swept.
 //! 5. **Stop, repoint, start.** The old helper's unit and the kbf units that run are
 //!    stopped (the list is journalled first), the helper is disabled so only one tool
-//!    manages the host, then `releases/current` and `previous`, `state.json`,
-//!    `status.json` and the units' `Exec*=` lines are written, and only then are the
-//!    stopped units started. Re-run: links and units are compared and only what differs
+//!    manages the host, then `state.json` and `helper.json` (the replay floor), then
+//!    `releases/current` and `previous`, `status.json` and the units' `Exec*=` lines are
+//!    written, and only then are the stopped units started. The state comes before the
+//!    links because a link with no state beside it reads as a host whose state is lost. Re-run: links and units are compared and only what differs
 //!    is done; a unit stopped by an earlier run is started by this one.
 //! 6. **Journal** `migration.json` says `done`. From then on `migrate` is a no-op and
 //!    [`guard`] lets `setup` through.
@@ -35,19 +36,24 @@
 //! their originals back, the helper is enabled again, the units are started. The old
 //! tree and state were never touched, which is why this is possible.
 //!
-//! Stand-ins, to be replaced without changing this module's callers: [`Verifier`] by the
-//! verify pipeline (P8), [`floor::FrontendFloor`] by the fetch client (P7), [`schema`]'s
-//! `NewState` and `NewStatus` by P1/P2's types, and [`roots::Roots`] by `layout.rs` (P2).
+//! Stand-ins that remain: [`Verifier`], which asks for a release to be fetched from the
+//! configured source and verified from its commit alone (the migration holds no order, so no
+//! locator: the fetcher of [`crate::helper::fetcher`] takes one), by the verify pipeline
+//! once something can fetch with a bare commit; and [`floor::FrontendFloor`], by the fetch
+//! client (P7). The installer's own types are used as they are: [`crate::layout::Layout`]
+//! for every path of the new tree, [`crate::state::State`] written under
+//! [`crate::state::Locked`], [`crate::helper::memory::Memory`] for the replay memory and
+//! [`crate::helper::status`] for `status.json`.
 
 mod apply;
 pub mod error;
 pub mod floor;
+pub mod journal;
 mod newtree;
 mod old;
 mod probe;
 mod rollback;
 pub mod roots;
-pub mod schema;
 mod services;
 pub mod tree;
 pub mod units;
@@ -172,20 +178,21 @@ impl std::fmt::Display for Report {
 /// The check `setup` and every verb that changes releases makes first: while the old
 /// layout's state is the host's (it exists and no migration finished), they refuse, so
 /// the old helper and the installer never both manage one host.
-pub fn guard(m: &Migration) -> Result<(), MigrateError> {
-    let rules = apply::rules(m);
-    if old::read(&m.layout, &m.roots, &rules)?.is_none() {
+pub fn guard(layout: &Layout, owner_uid: u32) -> Result<(), MigrateError> {
+    let rules = tree::Rules::release(owner_uid);
+    let roots = Roots::new(layout.platform());
+    if old::read(layout, &roots, &rules)?.is_none() {
         return Ok(());
     }
-    let done = newtree::StateDir::open(&m.layout, &m.roots, &rules)?
+    let done = newtree::StateDir::open(layout, &rules)?
         .map(|t| t.journal())
         .transpose()?
         .flatten()
-        .is_some_and(|j| j.phase == schema::Phase::Done);
+        .is_some_and(|j| j.phase == journal::Phase::Done);
     if done {
         Ok(())
     } else {
-        Err(MigrateError::Unmigrated(m.roots.old_state.to_string()))
+        Err(MigrateError::Unmigrated(roots.old_state.to_string()))
     }
 }
 

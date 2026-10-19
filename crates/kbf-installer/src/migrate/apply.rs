@@ -7,18 +7,20 @@ use kbf_host::{Exec, Mode};
 
 use super::error::MigrateError;
 use super::floor::{self, Seeded};
+use super::journal::{Adopted, Journal, Phase};
 use super::newtree::{NewTree, StateDir};
-use super::old::{self, Old, OldTree};
+use super::old::{self, Old, OldLock, OldTree};
 use super::probe::probe;
-use super::schema::{Adopted, Journal, NewState, NewStatus, Phase, ProbeFacts};
 use super::services::Services;
 use super::tree::{self, Rules};
 use super::units::{self, Unit, UnitOutcome};
 use super::{Hooks, Migration, Outcome, Report};
 use crate::CommitId;
-use crate::binary::{Arch, Version};
-use crate::layout::Platform;
-use crate::state::Locked;
+use crate::binary::Version;
+use crate::helper::memory::{Memory, StagedFacts};
+use crate::helper::status;
+use crate::layout;
+use crate::state::{self, Locked, State};
 
 /// The rules every file read and written is judged by.
 pub fn rules(m: &Migration) -> Rules {
@@ -46,7 +48,7 @@ pub fn migrate<E: Exec>(
     mode: Mode,
 ) -> Result<Report, MigrateError> {
     let rules = rules(m);
-    let existing = StateDir::open(&m.layout, &m.roots, &rules)?;
+    let existing = StateDir::open(&m.layout, &rules)?;
     let journal = existing
         .as_ref()
         .map(StateDir::journal)
@@ -71,11 +73,7 @@ pub fn migrate<E: Exec>(
             .push("no old layout here: nothing to migrate".to_owned());
         return Ok(report);
     };
-    let earlier_state = existing
-        .as_ref()
-        .map(StateDir::state)
-        .transpose()?
-        .flatten();
+    let earlier_state = state::read_unlocked(&m.layout)?;
     if journal.is_none() && earlier_state.is_some() {
         return Err(MigrateError::Conflict(
             "the installer's state.json exists beside the old state and no migration ran: \
@@ -129,9 +127,12 @@ pub fn migrate<E: Exec>(
             want: m.owner_uid,
         });
     }
-    let _old_lock = Locked::acquire(&m.layout)?;
-    let tree = NewTree::create(&m.layout, &m.roots, &rules)?;
-    tree.sweep_work()?;
+    // Both locks: no verb of the old tools is mid-way, and no run of the installer changes
+    // its state while this one does.
+    let _old_lock = OldLock::take(&m.layout, &m.roots)?;
+    let lock = Locked::acquire(&m.layout)?;
+    let tree = NewTree::create(&m.layout, &rules)?;
+    tree.sweep_partials()?;
     let mut journal = journal.unwrap_or_else(|| Journal::new(Vec::new(), None));
     journal.phase = Phase::Started;
     journal.units = m.units.clone();
@@ -191,30 +192,41 @@ pub fn migrate<E: Exec>(
         );
     }
 
+    // The state first: a `current` link without a `state.json` beside it is a host whose
+    // state is lost (`state::Files::load`), and a run that stops between the two must be
+    // one a re-run can finish.
     let (current, previous) = (old.state.current.clone(), old.state.previous.clone());
-    tree.set_link("current", current.as_ref())?;
-    tree.set_link("previous", previous.as_ref())?;
+    let state = write_state(&lock, current.clone(), previous.clone(), &seeded)?;
+    let memory = write_memory(
+        &tree,
+        &old.memory,
+        &seeded,
+        found.iter().find(|f| f.role == "current"),
+    )?;
+    tree.set_link(layout::CURRENT, current.as_ref())?;
+    tree.set_link(layout::PREVIOUS, previous.as_ref())?;
     report.line(
         mode,
         "releases/current and releases/previous point at the adopted releases",
     );
-    let state = write_state(&tree, current, previous, &seeded)?;
-    let probe_facts = found
-        .iter()
-        .find(|f| f.role == "current")
-        .map(|f| facts(m, f));
-    tree.state.put_status(&NewStatus::migrated(
-        &state,
-        probe_facts,
-        report.unverified.clone(),
-    ))?;
-    report.line(mode, "state.json (schema 2) and status.json written");
+    tree.state
+        .put_status(&status::render_with(&state, &memory, &report.unverified))?;
+    report.line(
+        mode,
+        "state.json (schema 2), helper.json (the replay floor) and status.json written",
+    );
 
     let backup = tree.state.unit_backup()?;
     let units_dir = tree::open_root(&m.layout.join(&m.roots.unit_dir))
         .map_err(MigrateError::io(m.roots.unit_dir.to_string()))?;
     for unit in &m.units {
-        let outcome = units::rewrite(&rules, &units_dir, &backup, unit, &m.roots.new_bin())?;
+        let outcome = units::rewrite(
+            &rules,
+            &units_dir,
+            &backup,
+            unit,
+            &m.layout.current().to_string(),
+        )?;
         report.line(mode, format!("{unit}: {}", describe(outcome)));
     }
     svc.reload().map_err(MigrateError::io("daemon-reload"))?;
@@ -351,33 +363,71 @@ fn adopt(
 /// Write `state.json`: schema 2, the adopted releases, the seeded floor, raised to what an
 /// interrupted earlier run already wrote.
 fn write_state(
-    tree: &NewTree,
+    lock: &Locked,
     current: Option<CommitId>,
     previous: Option<CommitId>,
     seeded: &Seeded,
-) -> Result<NewState, MigrateError> {
-    let floor = match tree.state.state()? {
+) -> Result<State, MigrateError> {
+    let floor = match lock.read()? {
         Some(earlier) => floor::raise(seeded.floor, earlier.floor),
         None => seeded.floor,
     };
-    let state = NewState::migrated(current, previous, floor);
-    tree.state.put_state(&state)?;
+    let state = State {
+        current,
+        previous,
+        last_acked_order_id: floor.order_id,
+        floor,
+        ..State::default()
+    };
+    lock.write(&state)?;
     Ok(state)
 }
 
-fn facts(m: &Migration, found: &Found) -> ProbeFacts {
-    let os = match m.roots.platform {
-        Platform::Linux => "linux",
-        Platform::MacOs => "darwin",
+/// Write the installer's replay memory (`helper.json`): both kinds of order start at the
+/// seeded (epoch, order id), so no order the old helper acted on or refused as old is acted
+/// on again; whatever an earlier run (or the installer) already remembered stays if higher.
+/// The facts of the current build are what `status.json` shows for it.
+fn write_memory(
+    tree: &NewTree,
+    old: &Memory,
+    seeded: &Seeded,
+    current: Option<&Found>,
+) -> Result<Memory, MigrateError> {
+    let mut memory = match tree.state.memory()? {
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| MigrateError::Corrupt {
+            file: layout::MEMORY,
+            why: e.to_string(),
+        })?,
+        None => Memory::default(),
     };
-    ProbeFacts {
-        commit: found.name.clone(),
-        platform: format!("{os}-{}", Arch::current()),
-        protocol: found.version.protocol,
-        min_protocol: found.version.min_protocol,
-        state_schema: found.version.state_schema,
-        profile: found.version.profile.clone(),
-    }
+    let floor = (seeded.floor.epoch, seeded.floor.order_id);
+    (memory.acked_epoch, memory.acked_order_id) = floor::newer(
+        floor::newer(
+            (memory.acked_epoch, memory.acked_order_id),
+            (old.acked_epoch, old.acked_order_id),
+        ),
+        floor,
+    );
+    (memory.frontend_epoch, memory.frontend_order_id) = floor::newer(
+        floor::newer(
+            (memory.frontend_epoch, memory.frontend_order_id),
+            (old.frontend_epoch, old.frontend_order_id),
+        ),
+        floor,
+    );
+    // Facts that do not fit the status's width are not shown rather than shown wrong.
+    memory.staged = current.and_then(|f| {
+        let v = &f.version;
+        Some(StagedFacts {
+            commit: f.name.clone(),
+            protocol: u32::try_from(v.protocol).ok()?,
+            min_protocol: u32::try_from(v.min_protocol).ok()?,
+            state_schema: u32::try_from(v.state_schema).ok()?,
+        })
+    });
+    tree.state
+        .put_memory(&serde_json::to_vec(&memory).expect("plain fields serialize"))?;
+    Ok(memory)
 }
 
 /// Leave a note in the old state directory (or take it away, for a rollback).
