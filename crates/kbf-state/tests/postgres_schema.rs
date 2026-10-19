@@ -7,7 +7,9 @@
 #![cfg(feature = "postgres")]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use kbf_state::postgres::schema::{self, Migration, SchemaError};
 use kbf_state::postgres::{PostgresConfig, PostgresStore};
@@ -317,13 +319,12 @@ fn a_migration_that_fails_is_rolled_back_whole() {
         )
         .expect("lints"),
     );
-    let SchemaError::Database(why) = schema::apply(&config, &set, 2).unwrap_err() else {
-        panic!("a database error")
+    let SchemaError::Failed { version, name, why } = schema::apply(&config, &set, 2).unwrap_err()
+    else {
+        panic!("a failed migration")
     };
-    assert!(
-        why.contains("migration 2 (broken) failed") && why.contains("nosuch"),
-        "{why}"
-    );
+    assert_eq!((version, name.as_str()), (2, "broken"));
+    assert!(why.contains("nosuch"), "{why}");
     assert_eq!(schema::current(&config), Ok(1));
     assert!(
         s.query("SELECT to_regclass('half')::text")[0]
@@ -398,10 +399,10 @@ fn tables_from_before_the_schema_was_versioned_are_refused() {
         n = s.name
     ))
     .expect("an old store");
-    let SchemaError::Database(why) =
+    let SchemaError::Failed { why, .. } =
         schema::apply(&s.config(), &schema::embedded(), 1).unwrap_err()
     else {
-        panic!("a database error")
+        panic!("a failed migration")
     };
     assert!(
         why.contains("already exists") && why.contains("before the schema was versioned"),
@@ -441,4 +442,131 @@ fn installers_that_race_apply_a_migration_once() {
     });
     assert_eq!(ran.iter().map(Vec::len).sum::<usize>(), 1, "{ran:?}");
     assert_eq!(s.query("SELECT version FROM schema_version").len(), 1);
+}
+
+// ---- bounded waits ----------------------------------------------------------------------
+
+/// The schema lock is one per database, whatever the schema: the tests below hold it on
+/// purpose, so they take turns (one at a time, process-wide).
+static HOLDS_THE_LOCK: Mutex<()> = Mutex::new(());
+
+/// A session that holds the schema lock, as an installer in the middle of a migration does.
+struct LockHolder(Client);
+
+impl LockHolder {
+    fn take() -> LockHolder {
+        let mut client = Client::connect(&url(), NoTls).expect("connects");
+        client
+            .batch_execute("BEGIN; SELECT pg_advisory_xact_lock(hashtext('kbf-state-schema'))")
+            .expect("the lock is free");
+        LockHolder(client)
+    }
+
+    fn release(mut self) {
+        self.0.batch_execute("ROLLBACK").expect("released");
+    }
+}
+
+fn apply_in_thread(
+    config: PostgresConfig,
+    set: Vec<Migration>,
+    upto: u32,
+    wait: Duration,
+) -> mpsc::Receiver<Result<schema::Outcome, SchemaError>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(schema::apply_within(&config, &set, upto, wait));
+    });
+    rx
+}
+
+/// Catches a migration that waits for ever for an installer that holds the schema lock (a
+/// swap would hang with its streams held), and one that gives up and leaves a trace. With
+/// the lock held, a short wait ends in `Busy` after about the wait and creates nothing; a
+/// long wait stays blocked until the holder lets go and then runs; a third call is a no-op.
+///
+/// Mutants seen red: the `SET LOCAL lock_timeout` left out (the short wait never ends: the
+/// 5 s receive times out); `Busy` mapped to a plain database error.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn a_migration_waits_for_the_schema_lock_for_as_long_as_it_is_told() {
+    let _turn = HOLDS_THE_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let s = Scratch::new();
+
+    let holder = LockHolder::take();
+    let started = Instant::now();
+    let short = apply_in_thread(s.config(), two(), 2, Duration::from_millis(300));
+    let gave_up = short.recv_timeout(Duration::from_secs(5));
+    let waited = started.elapsed();
+    holder.release();
+    assert_eq!(
+        gave_up.expect("it gives up").unwrap_err(),
+        SchemaError::Busy
+    );
+    assert!(waited >= Duration::from_millis(250), "{waited:?}");
+    assert!(!s.has_schema(), "a migration that waited left a schema");
+
+    let holder = LockHolder::take();
+    let long = apply_in_thread(s.config(), two(), 2, Duration::from_secs(60));
+    assert!(
+        long.recv_timeout(Duration::from_millis(500)).is_err(),
+        "the migration ran under a held lock"
+    );
+    holder.release();
+    let out = long
+        .recv_timeout(Duration::from_secs(30))
+        .expect("it runs once the lock is free")
+        .expect("it applies");
+    assert_eq!((out.from, out.to, out.ran), (None, 2, vec![1, 2]));
+
+    let again = schema::apply_within(&s.config(), &two(), 2, Duration::from_secs(30)).unwrap();
+    assert!(again.ran.is_empty(), "{again:?}");
+}
+
+/// Catches the wait covering the schema lock only: the old child holds a long read on `kv`
+/// (the table migration 2 alters), so the `ALTER` would queue for an exclusive lock and
+/// stall every query behind it. It must give up as `Busy`, roll back, and leave the schema
+/// at version 1 with the old child's read undisturbed.
+///
+/// Mutant seen red: the lock timeout reset (`SET LOCAL lock_timeout = 0`) right after the
+/// schema lock, so only the advisory wait was bounded: the `ALTER` waited past the 5 s.
+#[test]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+fn a_migration_gives_up_when_a_table_it_alters_is_in_use() {
+    let _turn = HOLDS_THE_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let s = Scratch::new();
+    schema::apply(&s.config(), &schema::embedded(), 1).expect("version 1");
+    let mut reader = Client::connect(&url(), NoTls).expect("connects");
+    reader
+        .batch_execute(&format!(
+            "BEGIN; SET LOCAL search_path TO {}; SELECT count(*) FROM kv",
+            s.name
+        ))
+        .expect("a read in progress");
+    let mut set = schema::embedded();
+    set.push(
+        Migration::new(
+            2,
+            "half",
+            "-- kbf-migration: expand\nCREATE TABLE half (a int);\nALTER TABLE kv ADD COLUMN note text;",
+        )
+        .expect("lints"),
+    );
+    let rx = apply_in_thread(s.config(), set, 2, Duration::from_millis(300));
+    let got = rx.recv_timeout(Duration::from_secs(5));
+    let still_reading = reader.query("SELECT count(*) FROM kv", &[]).is_ok();
+    reader.batch_execute("ROLLBACK").expect("read ends");
+    assert_eq!(got.expect("it gives up").unwrap_err(), SchemaError::Busy);
+    assert!(still_reading);
+    assert_eq!(schema::current(&s.config()), Ok(1));
+    assert_eq!(
+        s.query("SELECT count(*) FROM information_schema.tables WHERE table_name = 'half' AND table_schema = current_schema()")[0]
+            .get::<_, i64>(0),
+        0,
+        "the first statement of the rolled back migration remained"
+    );
 }

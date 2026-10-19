@@ -54,10 +54,10 @@
 //! - **The confirm window** the orders ask for is [`core::Config::window_s`].
 //! - **Operator port forwards.** `/v1/update/pause` and `/v1/update/resume` are the paths
 //!   of the two forwarded verbs (FP names `/pause`, `/resume` under `/v1/update`).
-//! - **Who runs the forward Postgres migration, and with which credential, is still open
-//!   and is not touched here:** it belongs behind the `Migrator` trait of the update
-//!   driver (U7b), before a candidate child starts, and the API only sees its effect as a
-//!   `failed` phase from the supervisor.
+//! - **The forward Postgres migration is not run here:** it is [`super::migrator`], behind
+//!   the `Migrator` trait of the update driver, before a candidate child starts, and the
+//!   API only sees its effect as a `failed` phase (step `migrate`, reason led by a refusal
+//!   word) from the supervisor.
 //!
 //! # What U7b and U8b wire
 //!

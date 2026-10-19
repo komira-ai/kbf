@@ -102,6 +102,8 @@ pub struct State {
     pub installed_err: bool,
     /// `status.json` cannot be read.
     pub staged_err: bool,
+    /// The `state_schema` the staged release reports.
+    pub staged_schema: u32,
     /// How long a resumed child takes to report `Active`.
     pub resume_lag: Duration,
     /// Each call is refused (the process is gone, the root half is down, ...).
@@ -167,6 +169,7 @@ impl World {
                 installed: Some(c(A)),
                 installed_err: false,
                 staged_err: false,
+                staged_schema: 3,
                 resume_lag: Duration::ZERO,
                 terminate_err: false,
                 kill_err: false,
@@ -770,7 +773,7 @@ impl RootOrders for World {
             commit,
             protocol: 7,
             min_protocol: 5,
-            state_schema: 3,
+            state_schema: self.st.borrow().staged_schema,
             profile: Some("frontend".into()),
         }))
     }

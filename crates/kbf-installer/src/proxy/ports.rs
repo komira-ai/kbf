@@ -89,13 +89,13 @@ pub trait Gate {
 }
 
 /// Forward, backward-compatible Postgres migrations. The kbf child never alters tables
-/// (CEO 14:58Z), so this runs before the candidate starts.
-///
-/// OPEN: who implements it (a root-half order or the proxy) and with which database
-/// credential is undecided. The swap needs only this call.
+/// (CEO 14:58Z), so this runs before the candidate starts. The real one is
+/// [`super::migrator::DbMigrator`].
 pub trait Migrator {
     /// Apply every forward migration release `release` needs. Idempotent: running it
-    /// again after a crash changes nothing.
+    /// again after a crash changes nothing. An `Err` text starts with a stable refusal
+    /// word and a colon ([`super::migrator::Refusal::word`]); it never carries the
+    /// database URL.
     fn migrate_forward(&self, release: &CommitId) -> Result<(), PortError>;
 }
 

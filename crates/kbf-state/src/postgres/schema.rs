@@ -29,6 +29,7 @@
 //! at all is refused.
 
 use std::fmt;
+use std::time::Duration;
 
 use postgres::error::SqlState;
 
@@ -276,7 +277,23 @@ pub enum SchemaError {
         /// The row after.
         after: u32,
     },
-    /// The server refused something.
+    /// A migration's own statements failed; its transaction was rolled back.
+    #[error("state database: migration {version} ({name}) failed: {why}")]
+    Failed {
+        /// The migration.
+        version: u32,
+        /// Its name.
+        name: String,
+        /// What the server said, never the connection URL.
+        why: String,
+    },
+    /// Another installer holds the schema lock, or a table is in use, for longer than the
+    /// caller waits ([`apply_within`]). Nothing was changed by the migration that waited.
+    #[error(
+        "the state database is busy: another installer is migrating, or a table is in use, past the wait"
+    )]
+    Busy,
+    /// The server cannot be reached, or refused something outside a migration.
     #[error("state database: {0}")]
     Database(String),
 }
@@ -676,6 +693,35 @@ pub fn apply(
     set: &[Migration],
     upto: u32,
 ) -> Result<Outcome, SchemaError> {
+    apply_with(config, set, upto, None)
+}
+
+/// [`apply`] that does not wait for ever: a connect takes at most [`CONNECT_LIMIT`], and
+/// every lock a migration's transaction waits for (the schema lock, and the table locks of
+/// its DDL) at most `lock_wait`. A longer wait is [`SchemaError::Busy`] with that
+/// migration rolled back, so a caller that holds something (a swap) is not stuck behind
+/// another installer or a long read on the old child.
+///
+/// # Errors
+/// Those of [`apply`], and [`SchemaError::Busy`].
+pub fn apply_within(
+    config: &PostgresConfig,
+    set: &[Migration],
+    upto: u32,
+    lock_wait: Duration,
+) -> Result<Outcome, SchemaError> {
+    apply_with(config, set, upto, Some(lock_wait))
+}
+
+/// The longest [`apply_within`] waits to reach the server.
+pub const CONNECT_LIMIT: Duration = Duration::from_secs(10);
+
+fn apply_with(
+    config: &PostgresConfig,
+    set: &[Migration],
+    upto: u32,
+    lock_wait: Option<Duration>,
+) -> Result<Outcome, SchemaError> {
     numbered(set)?;
     let newest = set.last().map_or(0, |m| m.version);
     if upto > newest {
@@ -685,7 +731,11 @@ pub fn apply(
         });
     }
     let schema = config.schema.as_str();
-    let mut conn = Conn::connect(&config.pg)?;
+    let mut pg = config.pg.clone();
+    if lock_wait.is_some() {
+        pg.connect_timeout(CONNECT_LIMIT);
+    }
+    let mut conn = Conn::connect(&pg)?;
     require_durable(&mut conn)?;
     let have = rows(&mut conn, schema)?;
     contiguous(&have)?;
@@ -703,7 +753,7 @@ pub fn apply(
     }
     let mut ran = Vec::new();
     for m in pending {
-        if run_one(&mut conn, schema, m)? {
+        if run_one(&mut conn, schema, m, lock_wait)? {
             ran.push(m.version);
         }
     }
@@ -716,8 +766,13 @@ pub fn apply(
 
 /// One migration in one transaction with its `schema_version` row. `false` when another
 /// installer applied it while this one waited for the lock.
-fn run_one(conn: &mut Conn, schema: &str, m: &Migration) -> Result<bool, SchemaError> {
-    let result = run_in_transaction(conn, schema, m);
+fn run_one(
+    conn: &mut Conn,
+    schema: &str,
+    m: &Migration,
+    lock_wait: Option<Duration>,
+) -> Result<bool, SchemaError> {
+    let result = run_in_transaction(conn, schema, m, lock_wait);
     if result.is_err() {
         // The caller drops the session; this leaves it clean if it does not.
         let _ = conn.batch_execute("ROLLBACK");
@@ -725,15 +780,31 @@ fn run_one(conn: &mut Conn, schema: &str, m: &Migration) -> Result<bool, SchemaE
     result
 }
 
-fn run_in_transaction(conn: &mut Conn, schema: &str, m: &Migration) -> Result<bool, SchemaError> {
+/// A server refusal as the caller sees it: a lock wait that ran out is [`SchemaError::Busy`].
+fn lock_or(err: &postgres::Error) -> Option<SchemaError> {
+    (err.code() == Some(&SqlState::LOCK_NOT_AVAILABLE)).then_some(SchemaError::Busy)
+}
+
+fn run_in_transaction(
+    conn: &mut Conn,
+    schema: &str,
+    m: &Migration,
+    lock_wait: Option<Duration>,
+) -> Result<bool, SchemaError> {
+    // `SET LOCAL` lasts for this transaction: the wait applies to the schema lock and to
+    // the locks the migration's own DDL takes.
+    let wait = lock_wait.map_or_else(String::new, |d| {
+        format!("SET LOCAL lock_timeout = '{}ms'; ", d.as_millis().max(1))
+    });
     conn.batch_execute(&format!(
-        "BEGIN; {LOCK}; CREATE SCHEMA IF NOT EXISTS {schema}; SET LOCAL search_path TO {schema}; \
+        "BEGIN; {wait}{LOCK}; CREATE SCHEMA IF NOT EXISTS {schema}; SET LOCAL search_path TO {schema}; \
          CREATE TABLE IF NOT EXISTS schema_version (\
              version integer PRIMARY KEY, \
              name text NOT NULL, \
              kind text NOT NULL CHECK (kind IN ('expand', 'contract')), \
              applied_at timestamptz NOT NULL DEFAULT now())"
-    ))?;
+    ))
+    .map_err(|e| lock_or(&e).unwrap_or_else(|| e.into()))?;
     let version = i32::try_from(m.version).unwrap_or(i32::MAX);
     let taken = conn.query(
         "SELECT 1 FROM schema_version WHERE version = $1",
@@ -744,17 +815,19 @@ fn run_in_transaction(conn: &mut Conn, schema: &str, m: &Migration) -> Result<bo
         return Ok(false);
     }
     if let Err(err) = conn.batch_execute(&m.sql) {
+        if let Some(busy) = lock_or(&err) {
+            return Err(busy);
+        }
         let hint = if err.code() == Some(&SqlState::DUPLICATE_TABLE) {
             " (tables from before the schema was versioned? the farm starts fresh: use a new database or schema)"
         } else {
             ""
         };
-        return Err(SchemaError::Database(format!(
-            "migration {} ({}) failed: {}{hint}",
-            m.version,
-            m.name,
-            describe(&err)
-        )));
+        return Err(SchemaError::Failed {
+            version: m.version,
+            name: m.name.clone(),
+            why: format!("{}{hint}", describe(&err)),
+        });
     }
     conn.execute(
         "INSERT INTO schema_version (version, name, kind) VALUES ($1, $2, $3)",

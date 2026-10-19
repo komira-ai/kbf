@@ -16,6 +16,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use kbf_state::postgres::schema::{self, Migration, Outcome, SchemaError};
 use kbf_state::postgres::{ConfigError, PostgresConfig};
@@ -110,6 +111,22 @@ impl Database {
     pub fn setup(&self) -> Result<Outcome, SchemaError> {
         let newest = self.migrations.last().map_or(0, Migration::version);
         schema::apply(&self.config, &self.migrations, newest)
+    }
+
+    /// Brings the database to schema `state_schema` (what a staged release reports) with
+    /// this build's migrations, waiting at most `lock_wait` for any lock and failing as
+    /// [`SchemaError::Busy`] after it. The proxy's swap calls this with its candidate
+    /// not yet started, so it must not wait for ever.
+    ///
+    /// # Errors
+    /// [`SchemaError`]: the installer embeds fewer migrations than the release needs, a
+    /// pending one is a contract step, the server is busy or refuses a migration.
+    pub fn migrate_within(
+        &self,
+        state_schema: u32,
+        lock_wait: Duration,
+    ) -> Result<Outcome, SchemaError> {
+        schema::apply_within(&self.config, &self.migrations, state_schema, lock_wait)
     }
 
     /// What `setup` would do, changing nothing: the database's version (`None` before the

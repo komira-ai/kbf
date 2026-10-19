@@ -16,10 +16,13 @@
 //!   [`ports::ChildAdmin::resume`].
 //! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); open
 //!   executions and queued operations from the child ([`ports::ChildAdmin::open_counts`]).
-//! - **Migration** (open): who runs the forward Postgres migration, and with which
-//!   credential, is undecided; the swap only calls [`ports::Migrator::migrate_forward`]
-//!   before the candidate starts. For an all-in-one host it runs after the old process
-//!   exits.
+//! - **Migration** (decided, FP section 8): the swap calls [`ports::Migrator::migrate_forward`]
+//!   before the candidate starts (for an all-in-one host, after the old process exits).
+//!   [`migrator::DbMigrator`] is the real one: it applies the installer's embedded,
+//!   expand-only migrations up to the `state_schema` the staged release reports, as the
+//!   role `installer.toml` names, and refuses with a stable word (`installer_too_old`,
+//!   `not_additive`, `database_busy`, `migration_failed`, ...) that leads
+//!   `failure.reason` of step `migrate`.
 //! - **update.json** keeps the recorded process identity of both children
 //!   ([`model::Intent::old_proc`], `new_proc`), which FP section 4 does not list: adoption
 //!   needs pid, start time and executable. A candidate spawned and not yet recorded when
@@ -60,6 +63,7 @@ pub mod admin;
 mod aio;
 pub mod api;
 pub mod child_http;
+pub mod migrator;
 pub mod model;
 pub mod orders;
 pub mod ports;
@@ -80,6 +84,8 @@ mod confirm_boundary_tests;
 mod fakes;
 #[cfg(test)]
 mod fault_tests;
+#[cfg(test)]
+mod migrator_tests;
 #[cfg(test)]
 mod orders_tests;
 #[cfg(test)]
