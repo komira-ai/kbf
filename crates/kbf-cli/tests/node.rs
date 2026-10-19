@@ -41,7 +41,7 @@ fn write_config(path: &Path, text: &str) {
 
 struct Harness {
     run: Running,
-    root: PathBuf,
+    root: kbf_testkit::dir::TestDir,
     /// The waits a start asked for before trying again.
     waits: Arc<Mutex<Vec<Duration>>>,
     /// How many waits are honoured (the start then tries again); the next one gives up.

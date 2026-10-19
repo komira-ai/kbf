@@ -20,6 +20,7 @@ use crate::helper::cycle::{Config, Helper};
 use crate::helper::fetcher::fake::FakeFetcher;
 use crate::helper::leases::fake::FakeLeases;
 use crate::helper::restart::Restart;
+use crate::helper::service::fake::ServiceRecorder;
 use kbf_update::{Facts, Locator, OrderRecord, Verb};
 
 const UNIT: &str = "kbf.service";
@@ -118,6 +119,7 @@ impl World {
             restart: Restart::Systemd(UNIT.to_owned()),
             window_secs: 600,
             starts: 3,
+            min_activation_interval_secs: 0,
         };
         Helper::new(
             self.layout.clone(),
@@ -129,6 +131,7 @@ impl World {
             cfg,
             Box::new(self.fetcher.clone()),
             Box::new(FakeLeases::default()),
+            Box::new(ServiceRecorder::default()),
         )
     }
     fn order(&self, id: u64, verb: &str, commit: &str) {

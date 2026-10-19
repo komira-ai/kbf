@@ -197,3 +197,25 @@ fn a_node_entry_names_a_certificate_by_any_of_its_dns_names() {
     );
     assert_eq!(identity.denied_by(&[node("node-a.farm.example")]), None);
 }
+
+/// Catches a proxied identity that is more than the one node a proxy forwarded: it must
+/// name that node (and only it, up to case) and no IP address, and no `serial` or
+/// `spki-sha256` entry may name it, since the proxy forwards neither.
+///
+/// Mutants seen red: the node left out of the names; an IP host covered; a serial entry
+/// that names the empty serial.
+#[test]
+fn a_proxied_identity_is_one_node_and_no_serial_or_key() {
+    let identity = kbf_peer::PeerIdentity::proxied("node-a");
+    assert_eq!(identity.names().dns(), ["node-a"]);
+    assert!(identity.names().covers("NODE-A"));
+    assert!(!identity.names().covers("node-b"));
+    assert!(!identity.names().covers("192.0.2.1"));
+    assert_eq!(identity.denied_by(&[node("node-a")]), Some(&node("node-a")));
+    let by_key = [
+        serial("0"),
+        serial("1"),
+        DenyEntry::SpkiSha256("0".repeat(64)),
+    ];
+    assert_eq!(identity.denied_by(&by_key), None);
+}

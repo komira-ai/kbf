@@ -228,6 +228,9 @@ impl Joiner {
                 debts_known,
                 have_generation: self.node.maps().generation(),
                 catching_up: self.catch_up.is_catching_up(),
+                // The node does not apply a registration yet: it reports no generation and
+                // status 0, which the frontend shows as `unsupported`.
+                ..Default::default()
             })
             .await?
             .into_inner();

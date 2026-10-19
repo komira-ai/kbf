@@ -30,6 +30,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -119,6 +120,9 @@ pub struct PendingConfirm {
 pub enum StateError {
     #[error("cannot lock {path}: {source}")]
     Lock { path: PathBuf, source: io::Error },
+    /// Another run holds the lock and did not let go within the time given.
+    #[error("{path} is held by another run")]
+    Busy { path: PathBuf },
     #[error("cannot read {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
     #[error("{path} is not an installer state: {source}")]
@@ -221,10 +225,24 @@ impl Files {
 
 /// The deploy lock, held: the only way to read the state for a change and to write it.
 /// Dropping it releases the lock.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked while
+/// the lock is held (any spawn of a child by another thread of this process) carries a
+/// copy until it execs, so closing the file would leave the host locked for as long as
+/// that takes. Dropping unlocks first, which no copy outlives, so the lock can be taken
+/// again once the drop returns.
 #[derive(Debug)]
 pub struct Locked {
-    _lock: File,
+    lock: File,
     files: Files,
+}
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.lock.unlock();
+    }
 }
 
 impl Locked {
@@ -255,7 +273,37 @@ impl Locked {
             .map_err(fail)?;
         lock.lock().map_err(fail)?;
         Ok(Locked {
-            _lock: lock,
+            lock,
+            files: Files::of(host),
+        })
+    }
+
+    /// Like [`Locked::acquire`], but gives up with [`StateError::Busy`] if another run still
+    /// holds the lock after `wait`: for the operator's verbs, which report "busy" (exit 4)
+    /// rather than queue behind a pass.
+    pub fn acquire_within(host: &Layout, wait: Duration) -> Result<Locked, StateError> {
+        let path = host.join(&host.lock());
+        let fail = |source| StateError::Lock {
+            path: path.clone(),
+            source,
+        };
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(fail)?;
+        let end = Instant::now() + wait;
+        while lock.try_lock().is_err() {
+            if Instant::now() >= end {
+                return Err(StateError::Busy { path });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(Locked {
+            lock,
             files: Files::of(host),
         })
     }

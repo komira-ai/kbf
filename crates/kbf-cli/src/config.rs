@@ -70,6 +70,7 @@ const GROUPS: &[(&str, &[&str])] = &[
         "tls",
         &[
             "api-token-file",
+            "proxy-auth-file",
             "reapi-auth-policy",
             "reapi-tls-cert",
             "reapi-tls-key",
@@ -108,6 +109,8 @@ const GROUPS: &[(&str, &[&str])] = &[
     (
         "handover",
         &[
+            "admin-listen",
+            "await-takeover",
             "envoy-check-interval-ms",
             "envoy-check-timeout-ms",
             "envoy-unhealthy-threshold",
@@ -142,6 +145,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "hot-store-abandon",
             "hot-store-max-bytes",
             "meta-dir",
+            "object-store-secrets-dir",
             "store-put-attempts",
             "write-bytes-in-flight",
             "write-linger",

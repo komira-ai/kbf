@@ -10,20 +10,24 @@
 //! next pass completes.
 
 use std::io::Write;
+use std::time::Duration;
 
 use crate::CommitId;
 use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
 use crate::layout::{Layout, Platform};
-use crate::release::ReleaseError;
+use crate::release::{self, ReleaseError};
 use crate::spool::{Entry, read_capped};
-use crate::state::{self, State, StateError};
+use crate::state::{self, Locked, State, StateError};
+use kbf_host::plan::Mode;
 use kbf_host::{Exec, HostPath, Perms, Step};
 
+use crate::database::SchemaStep;
 use crate::helper::fetcher::{Fetcher, InstalledRelease, ReleaseLocator};
 use crate::helper::leases::LeaseSource;
 use crate::helper::memory::{Event, Memory, StagedFacts};
 use crate::helper::order::{self, Claims, Order, Verb};
-use crate::helper::restart::Restart;
+use crate::helper::restart::{self, Restart};
+use crate::helper::service::{self, Procs};
 use crate::helper::status;
 
 /// The most names looked at in the order spool in one pass; more is said, not followed.
@@ -41,7 +45,12 @@ pub struct Config {
     pub window_secs: u64,
     /// The starts a swap on trial gets (Linux).
     pub starts: u32,
+    /// The fewest seconds between one activation and the next (`min_activation_interval_s`).
+    pub min_activation_interval_secs: u64,
 }
+
+/// How many releases `gc` keeps besides current, previous, staged and pending.
+pub const GC_KEEP: usize = 1;
 
 /// Something the helper cannot go on from: the host's own files are wrong. A refused
 /// offer or order is not one; it is recorded and reported.
@@ -64,8 +73,14 @@ pub struct Helper<E: Exec> {
     log: Vec<u8>,
     /// The last `status.json` written.
     written: Vec<u8>,
+    /// Brings the state database to what a release needs before it is activated; none on
+    /// a host that has no database (a node).
+    schema: Option<Box<dyn SchemaStep>>,
     fetcher: Box<dyn Fetcher>,
     leases: Box<dyn LeaseSource>,
+    procs: Box<dyn Procs>,
+    /// A swap was confirmed in this pass: the release it replaced may now be collected.
+    gc_due: bool,
 }
 
 fn memory_path(host: &Layout) -> HostPath {
@@ -80,6 +95,7 @@ impl<E: Exec> Helper<E> {
         cfg: Config,
         fetcher: Box<dyn Fetcher>,
         leases: Box<dyn LeaseSource>,
+        procs: Box<dyn Procs>,
     ) -> Helper<E> {
         Helper {
             host,
@@ -87,9 +103,25 @@ impl<E: Exec> Helper<E> {
             cfg,
             log: Vec::new(),
             written: Vec::new(),
+            schema: None,
             fetcher,
             leases,
+            procs,
+            gc_due: false,
         }
+    }
+
+    /// Runs `step` before every activation of the release this helper has staged, so the
+    /// state database is migrated before the new child can start. A refusal keeps the
+    /// links where they are.
+    pub fn set_schema_step(&mut self, step: Box<dyn SchemaStep>) {
+        self.schema = Some(step);
+    }
+
+    /// The schema step, for a test to see what a caller attached.
+    #[cfg(test)]
+    pub(crate) fn schema_step_mut(&mut self) -> Option<&mut (dyn SchemaStep + 'static)> {
+        self.schema.as_deref_mut()
     }
 
     /// The host's executor, for a test to read what was done.
@@ -161,17 +193,59 @@ impl<E: Exec> Helper<E> {
         self.expire(now, &mut memory)?;
         self.orders(now, &mut memory)?;
         self.restart_if_owed(&mut memory)?;
+        self.collect();
         self.report(&memory)
     }
 
+    /// Remove the releases nothing needs, once, after a swap was confirmed. A failure is
+    /// logged, never a refusal: nothing was ordered that it could undo.
+    fn collect(&mut self) {
+        if !std::mem::take(&mut self.gc_due) {
+            return;
+        }
+        let result = service::in_use(&*self.procs, &self.host)
+            .map_err(|e| format!("cannot tell which releases run: {e}"))
+            .and_then(|in_use| {
+                release::gc(
+                    &mut self.exec,
+                    &self.host,
+                    GC_KEEP,
+                    &in_use,
+                    Mode::Apply,
+                    &mut self.log,
+                )
+                .map_err(|e| e.to_string())
+            });
+        if let Err(why) = result {
+            let _ = writeln!(self.log, "gc: {why}");
+        }
+    }
+
     fn restart_if_owed(&mut self, memory: &mut Memory) -> Result<(), HelperError> {
-        if !memory.restart_due {
+        let marker = restart::owed_marker(&self.host);
+        let by_operator = std::fs::symlink_metadata(self.host.join(&marker)).is_ok();
+        // An operator verb that left the marker restarts the service itself while it holds
+        // the lock; one that holds it now is left to finish, and is looked at next pass.
+        let held = if by_operator {
+            match Locked::acquire_within(&self.host, Duration::ZERO) {
+                Ok(lock) => Some(lock),
+                Err(StateError::Busy { .. }) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            None
+        };
+        if !memory.restart_due && !by_operator {
             return Ok(());
         }
         if let Err(e) = self.exec.apply(&self.cfg.restart.step()) {
             refuse(memory, &format!("the restart failed: {e}"));
             return self.save(memory);
         }
+        if by_operator {
+            self.exec.apply(&Step::Remove { path: marker })?;
+        }
+        drop(held);
         memory.restart_due = false;
         self.save(memory)
     }
@@ -375,7 +449,7 @@ impl<E: Exec> Helper<E> {
     ) -> Result<(), HelperError> {
         let before = self.state()?;
         if order.verb == Verb::Activate
-            && let Err(why) = self.prepare(order, &before, memory)
+            && let Err(why) = self.prepare(order, &before, now, memory)
         {
             refuse(memory, &why);
             return self.save(memory);
@@ -386,7 +460,7 @@ impl<E: Exec> Helper<E> {
             self.save(memory)?;
         }
         let result = match order.verb {
-            Verb::Activate => self.activate(order, now),
+            Verb::Activate => self.activate(order, now, memory),
             Verb::Confirm => self.confirm(order, &before),
             Verb::Revert => self.revert(),
             Verb::FrontendUpdate => Err("frontend_update is not implemented (P13)".to_owned()),
@@ -397,6 +471,10 @@ impl<E: Exec> Helper<E> {
                 memory.event = done.event;
                 memory.refusal = done.note;
                 memory.restart_due = prior | done.restart | moved;
+                if done.swapped {
+                    memory.last_activation_at = now;
+                }
+                self.gc_due |= done.kept;
             }
             Err(why) => {
                 refuse(memory, &why);
@@ -413,6 +491,7 @@ impl<E: Exec> Helper<E> {
         &mut self,
         order: &Order,
         before: &State,
+        now: u64,
         memory: &mut Memory,
     ) -> Result<(), String> {
         let id = order.id;
@@ -463,6 +542,16 @@ impl<E: Exec> Helper<E> {
         if before.current.as_ref() == Some(&order.commit) {
             return Ok(());
         }
+        // Not two swaps in quick succession, whatever the frontend orders. A clock that
+        // stepped back (the last swap is "in the future") does not hold an order up.
+        let last = memory.last_activation_at;
+        let min = self.cfg.min_activation_interval_secs;
+        if last != 0 && last <= now && now - last < min {
+            return Err(format!(
+                "order {id}: the last activation was {} s ago; at least {min} s between activations",
+                now - last
+            ));
+        }
         // A directory on the host is not proof: the fetcher verifies the release whether it
         // pulls it or finds it.
         let rec = ReleaseLocator {
@@ -499,7 +588,38 @@ impl<E: Exec> Helper<E> {
         }
     }
 
-    fn activate(&mut self, order: &Order, now: u64) -> Result<Done, String> {
+    fn activate(&mut self, order: &Order, now: u64, memory: &Memory) -> Result<Done, String> {
+        // Before the links move: a release must not start on a schema it cannot run on.
+        // The schema is known here only for the release this helper has staged (its own
+        // report): the rule is "the staged commit equals the order's". An order for any other
+        // release (one fetched by an earlier run, say) asks for no migration and says so in
+        // the log: kbf's own start check guards it. The staged release stays staged after its
+        // swap, so a repeat of its activation asks again (idempotent, but refused while the
+        // database is down).
+        if let Some(step) = self.schema.as_mut() {
+            match memory.staged.as_ref().filter(|f| f.commit == order.commit) {
+                Some(staged) => {
+                    let note = step
+                        .before_start(staged.state_schema)
+                        .map_err(|why| format!("state schema: {why}"))?;
+                    let _ = writeln!(self.log, "state schema: {note}");
+                }
+                None => {
+                    let _ = writeln!(
+                        self.log,
+                        "state schema: no migration for order {}: {} was not fetched for it \
+                         (the staged release is {}), so the schema it needs is not known \
+                         here; its own start check guards it",
+                        order.id,
+                        &order.commit.as_str()[..12],
+                        memory
+                            .staged
+                            .as_ref()
+                            .map_or("none", |f| &f.commit.as_str()[..12]),
+                    );
+                }
+            }
+        }
         let ordered = activate::Order {
             commit: order.commit.clone(),
             // The epoch is part of the name: a restored store counts ids again, and an activation
@@ -515,7 +635,11 @@ impl<E: Exec> Helper<E> {
             now,
             &mut self.log,
         ) {
-            Ok(Activated::Swapped | Activated::Repeat) => Ok(Done::restart()),
+            Ok(Activated::Swapped) => Ok(Done {
+                swapped: true,
+                ..Done::restart()
+            }),
+            Ok(Activated::Repeat) => Ok(Done::restart()),
             Ok(Activated::AlreadyCurrent) => Ok(Done::quiet(Event::Idle)),
             Err(e) => Err(release_err(&e)),
         }
@@ -529,8 +653,21 @@ impl<E: Exec> Helper<E> {
             .filter(|p| p.commit == order.commit)
             .map(|p| p.activation.clone())
             .unwrap_or_default();
+        // The new release must be what runs before it is kept: a record saying so is the
+        // service user's word, and the service user may be the one that is broken.
+        if let Some(p) = state
+            .pending_confirm
+            .as_ref()
+            .filter(|p| p.commit == order.commit)
+        {
+            service::accept_confirm(&self.exec, &*self.procs, &self.host, &self.cfg.restart, p)?;
+        }
         match activate::confirm(&self.host, &activation, &order.commit) {
-            Ok(Confirmed::Kept | Confirmed::AlreadyKept) => Ok(Done::quiet(Event::Confirmed)),
+            Ok(Confirmed::Kept) => Ok(Done {
+                kept: true,
+                ..Done::quiet(Event::Confirmed)
+            }),
+            Ok(Confirmed::AlreadyKept) => Ok(Done::quiet(Event::Confirmed)),
             Err(e) => Err(release_err(&e)),
         }
     }
@@ -541,6 +678,8 @@ impl<E: Exec> Helper<E> {
                 event: Event::Reverted,
                 note: format!("reverted by order: {} is current", r.to),
                 restart: true,
+                swapped: false,
+                kept: false,
             }),
             Err(e) => Err(release_err(&e)),
         }
@@ -569,6 +708,10 @@ struct Done {
     event: Event,
     note: String,
     restart: bool,
+    /// The links moved to a new release on trial.
+    swapped: bool,
+    /// A pending swap was confirmed.
+    kept: bool,
 }
 
 impl Done {
@@ -577,6 +720,8 @@ impl Done {
             event: Event::Idle,
             note: String::new(),
             restart: true,
+            swapped: false,
+            kept: false,
         }
     }
 
@@ -585,6 +730,8 @@ impl Done {
             event,
             note: String::new(),
             restart: false,
+            swapped: false,
+            kept: false,
         }
     }
 }
