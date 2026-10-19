@@ -193,7 +193,19 @@ fn listening_ports(pid: u32) -> Vec<u16> {
 /// exits 0 on SIGTERM.
 #[tokio::test(flavor = "current_thread")]
 async fn the_activated_socket_is_served_alone_and_sigterm_stops_it() {
-    let path = config("serve", TABLE);
+    serve_alone_and_stop_on(libc::SIGTERM).await;
+}
+
+/// Catches a verb whose SIGINT handler is missing: the default action ends the process by
+/// the signal (no exit code) instead of the clean stop a terminal's Ctrl-C is owed. Streams
+/// open at the stop are not part of this test.
+#[tokio::test(flavor = "current_thread")]
+async fn sigint_stops_it_with_exit_0_too() {
+    serve_alone_and_stop_on(libc::SIGINT).await;
+}
+
+async fn serve_alone_and_stop_on(signal: i32) {
+    let path = config(&format!("serve-{signal}"), TABLE);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let mut child = start(&path, &listener);
@@ -213,14 +225,14 @@ async fn the_activated_socket_is_served_alone_and_sigterm_stops_it() {
 
     let stopped = Instant::now();
     // SAFETY: `kill` of our own child.
-    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait") {
             break status;
         }
         assert!(
             stopped.elapsed() < Duration::from_secs(20),
-            "no exit on SIGTERM"
+            "no exit on the signal"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };

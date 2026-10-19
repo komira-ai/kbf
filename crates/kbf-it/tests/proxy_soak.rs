@@ -18,6 +18,13 @@
 //! from that count, and from where the action is: each action is in the store behind one
 //! frontend only, so a stream the proxy sent to the wrong child would be refused.
 //!
+//! What this proves, exactly: the old streams end by the client cancelling them, and each
+//! cancel reaches A (A's own count falls to 0); that is not a `Write` or `Read` completing.
+//! B is ready (polled, `/readyz` 200) before the hold begins, so a release before B is ready
+//! is not exercised. `retire(A)` while the 200 streams are open is `Busy(200)` and leaves
+//! them open and quiet. The proxy runs here at the library level, so SIGINT/SIGTERM are the
+//! verb's own tests (`kbf-installer/tests/proxy_verb.rs`).
+//!
 //! The proxy has no admin listener to poll (U2 builds it); its `/readyz` poll asks each
 //! child's operator listener, which is the `--api-listen` port, so the soak also proves
 //! `/readyz` against the real thing: 200 with A active, and 200 again once B is.
@@ -551,6 +558,21 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
             assert!(open.quiet().await, "a stream ended or spoke");
         }
         assert!(!handle.slots().can_retire(Slot::A));
+        // The supervisor's commit with 200 streams open is refused, and refusing latches
+        // nothing: every stream is still open and quiet afterwards, and A still counts them.
+        assert_eq!(
+            handle.slots().retire(Slot::A),
+            Retire::Busy(OLD as u64),
+            "retire of a slot with open streams"
+        );
+        for open in old.iter_mut().chain(new.iter_mut()) {
+            assert!(
+                open.quiet().await,
+                "a refused retire ended or woke a stream"
+            );
+        }
+        assert_eq!(open_executions(&api_a), OLD as u64, "A's count after it");
+        assert_eq!(handle.snapshot().stats(Slot::A).open_streams, OLD as u64);
 
         // The old streams end (the client cancels them, as Buck2 does) and A sees each one.
         drop(old);

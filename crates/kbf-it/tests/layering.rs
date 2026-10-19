@@ -46,7 +46,7 @@
 //! - the front-door proxy library (`kbf-proxy`) depending, directly or through another crate,
 //!   on a child's, the installer's or the runtime's crates (`PROXY_MUST_NOT_REACH`); and any
 //!   file of `kbf-installer/src` outside `MAY_NAME_THE_PROXY`, the root helper first of all,
-//!   naming `kbf_proxy`: the root half shares the installer's binary with the proxy verb and
+//!   naming `kbf_proxy` or `proxy_verb`: the root half shares the installer's binary with the proxy verb and
 //!   nothing else.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -479,6 +479,11 @@ fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
 /// if it names a proxy type.
 const MAY_NAME_THE_PROXY: &[&str] = &["proxy_verb.rs", "installer_toml.rs"];
 
+/// The files that may name the verb's module (`proxy_verb`): the dispatch and its tests. A path
+/// into the verb from anywhere else, `crate::proxy_verb::FIRST_FD` in the root helper for one,
+/// reaches the proxy without ever writing `kbf_proxy`.
+const MAY_NAME_THE_VERB: &[&str] = &["app.rs", "app_tests.rs", "lib.rs", "proxy_verb.rs"];
+
 /// Source files under `dir`, as paths relative to `base`, with `/` as the separator.
 fn rust_files(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
@@ -512,6 +517,29 @@ fn the_root_half_of_the_installer_names_nothing_of_the_proxy() {
             "{allowed} no longer names kbf_proxy"
         );
     }
+    for allowed in MAY_NAME_THE_VERB {
+        let text = std::fs::read_to_string(src.join(allowed))
+            .unwrap_or_else(|e| panic!("read {allowed}: {e}"));
+        assert!(
+            text.contains("proxy_verb"),
+            "{allowed} no longer names proxy_verb"
+        );
+    }
+    let reaches_verb: Vec<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|f| !MAY_NAME_THE_VERB.contains(f))
+        .filter(|f| {
+            std::fs::read_to_string(src.join(f))
+                .unwrap_or_else(|e| panic!("read {f}: {e}"))
+                .contains("proxy_verb")
+        })
+        .collect();
+    assert!(
+        reaches_verb.is_empty(),
+        "these installer files name proxy_verb, but only {MAY_NAME_THE_VERB:?} may (a path into \
+         the verb is a path to the proxy): {reaches_verb:?}"
+    );
     let violations: Vec<&str> = files
         .iter()
         .map(String::as_str)

@@ -4,13 +4,14 @@
 //! The proxy is the one public port of a frontend host. This verb loads the `[proxy]` table of
 //! `installer.toml`, takes the one listening socket a service manager activated for it,
 //! binds the runtime to it and serves until SIGTERM or SIGINT. It runs as the unprivileged
-//! service user: it needs no root, writes nothing on the host and calls no child. It does not
+//! service user: it needs no root, writes nothing on the host and never calls a child's admin
+//! endpoint or acts on a child; it only polls the active child's `/readyz`. It does not
 //! supervise either: the supervisor that adopts the children and ends the proxy's startup
 //! hold is the update work that follows, and until it exists the proxy answers `UNAVAILABLE`
 //! once the hold is over and `/readyz` says 503.
 //!
 //! This module and the root helper (`helper/`, `run.rs`) share a binary and nothing else:
-//! `kbf-it`'s layering test fails if the root half ever names `kbf_proxy`.
+//! `kbf-it`'s layering test fails if the root half ever names `kbf_proxy` or this module.
 //!
 //! The only environment variables read are the service manager's socket-activation markers,
 //! `LISTEN_PID` and `LISTEN_FDS`; everything else is the `[proxy]` table.

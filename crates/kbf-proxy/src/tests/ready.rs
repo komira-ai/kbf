@@ -4,7 +4,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,8 @@ struct Ctl {
     status: AtomicU16,
     hang: AtomicBool,
     garbage: AtomicBool,
+    /// Milliseconds the answer waits after the request is read.
+    delay_ms: AtomicU64,
     asked: AtomicUsize,
     requests: Mutex<Vec<String>>,
 }
@@ -34,6 +36,7 @@ impl Ctl {
             status: AtomicU16::new(status),
             hang: AtomicBool::new(false),
             garbage: AtomicBool::new(false),
+            delay_ms: AtomicU64::new(0),
             asked: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
         })
@@ -65,6 +68,10 @@ async fn answer(mut io: impl AsyncRead + AsyncWrite + Unpin, ctl: Arc<Ctl>) {
         .push(String::from_utf8_lossy(&head).into_owned());
     if ctl.hang.load(Ordering::Acquire) {
         std::future::pending::<()>().await;
+    }
+    let delay = ctl.delay_ms.load(Ordering::Acquire);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     let reply = if ctl.garbage.load(Ordering::Acquire) {
         "this is not http at all".to_owned()
@@ -209,6 +216,48 @@ async fn a_new_child_is_ready_only_after_its_own_poll() {
     assert_eq!(readyz(&mut client).await, 503, "the new B is unpolled");
     wait_ms(1_000).await;
     assert_eq!(readyz(&mut client).await, 200);
+}
+
+/// Catches a refused connection counted as a pass: the active slot has no listener at all (the
+/// child died), and `/readyz` must be 503 and stay 503, however many polls have run.
+#[tokio::test(start_paused = true)]
+async fn a_dead_child_is_never_ready() {
+    let mut rig = Rig::start(tagged("a"), tagged("b")).await;
+    rig.a.stop_accepting().await;
+    let mut client = rig.client().await;
+    let _poll = polling(&rig);
+    wait_ms(12_500).await;
+    assert_eq!(readyz(&mut client).await, 503, "nothing listens on A");
+    assert!(!rig.core.snapshot().ready);
+}
+
+/// Catches a generation read after the question: the poll of A's first process answers 200
+/// after that process was replaced by a new one in the same slot, and that answer says
+/// nothing about the new process. `/readyz` waits for the new process's own pass.
+#[tokio::test(start_paused = true)]
+async fn a_child_replaced_while_asked_is_not_ready_on_the_old_answer() {
+    let rig = Rig::start(tagged("a"), tagged("b")).await;
+    let a = Ctl::new(200);
+    a.delay_ms.store(2_000, Ordering::Release);
+    let _listener = operator(&rig, Slot::A, &a);
+    let mut client = rig.client().await;
+    let _poll = polling(&rig);
+    // The first poll starts at 1 s and is answered at 3 s.
+    wait_ms(1_500).await;
+    assert_eq!(a.asked(), 1, "the poll is in flight");
+    rig.core.slots.clear_active();
+    assert_eq!(rig.core.slots.retire(Slot::A), Retire::Closed);
+    rig.core.slots.open(Slot::A);
+    rig.core.slots.set_active(Slot::A).expect("A is open again");
+    // The new process answers as slowly: its own poll is answered at 5 s.
+    wait_ms(1_600).await;
+    assert_eq!(
+        readyz(&mut client).await,
+        503,
+        "the old process's answer is not the new one's"
+    );
+    wait_ms(2_100).await;
+    assert_eq!(readyz(&mut client).await, 200, "the new process answered");
 }
 
 /// Catches a poll with no time limit (one hung child would end all polling and `/readyz` would
