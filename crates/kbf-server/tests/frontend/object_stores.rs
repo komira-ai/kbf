@@ -291,3 +291,161 @@ async fn the_store_fetch_is_refused_to_denied_nodes() {
         }
     }
 }
+
+/// One HTTP request to the API with `headers`; the status code.
+async fn http(
+    api: SocketAddr,
+    method: &str,
+    path: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> u16 {
+    let mut stream = TcpStream::connect(api).await.expect("connect to the API");
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: kbf\r\nContent-Length: {}\r\n\
+         Content-Type: application/json\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str(&format!("Connection: close\r\n\r\n{body}"));
+    stream.write_all(request.as_bytes()).await.expect("send");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.expect("read");
+    response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {response:?}"))
+}
+
+/// `GetStoreConfig` on the worker listener at `worker` carrying `claims` as request headers.
+async fn fetch_with(
+    worker: SocketAddr,
+    claims: &[(&str, String)],
+) -> Result<kbf_proto::kbf::enroll::v1::GetStoreConfigResponse, tonic::Status> {
+    let mut request = tonic::Request::new(GetStoreConfigRequest { have_generation: 0 });
+    for (name, value) in claims {
+        let key = tonic::metadata::MetadataKey::from_bytes(name.as_bytes()).expect("a key");
+        request
+            .metadata_mut()
+            .insert(key, value.parse().expect("a value"));
+    }
+    let channel = Endpoint::from_shared(format!("http://{worker}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    ColdStoreClient::new(channel)
+        .get_store_config(request)
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+// Catches a `ColdStore` that works under mutual TLS and not behind the reverse proxy, which
+// is how the farm runs (the proxy terminates TLS; there is no certificate behind it), or one
+// that trusts headers it should not. The frontend has `--proxy-auth-file` and a plain-text
+// worker listener, and a registered store:
+//
+// - the proxy's secret with `x-kbf-node-id` and `x-kbf-role: storage` is served the store,
+//   secret included (the caller is judged by `identity::presented`, not a peer certificate);
+// - the same identity under the wrong secret is refused, and so are forged `x-kbf-*` headers
+//   with no secret, a role other than storage under the right secret, and a storage role with
+//   no node id; no refusal carries the secret.
+//
+// Mutant seen red: the handler reading the peer certificate instead of
+// `identity::presented` (every proxied fetch is refused).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn behind_the_proxy_the_store_fetch_is_judged_by_the_forwarded_identity() {
+    let dir = scratch_dir("frontend-object-stores-proxy");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        path.display().to_string()
+    };
+    let proxy_secret = [0x3c_u8; 32];
+    let secret_file = write("proxy-secret", &proxy_secret);
+    let token_file = write("token", format!("{TOKEN}\n").as_bytes());
+    let front = Front::start(
+        &flags(&[
+            "--storage=http://127.0.0.1:1",
+            &format!("--proxy-auth-file={secret_file}"),
+            &format!("--api-token-file={token_file}"),
+            &format!(
+                "--object-store-secrets-dir={}",
+                dir.join("secrets").display()
+            ),
+            &format!("--state-store=sqlite://{}", dir.join("state.db").display()),
+        ])
+        .expect("parses"),
+    )
+    .await;
+
+    let presented = hex::encode(proxy_secret);
+    let bearer = format!("Bearer {TOKEN}");
+    let write_headers = [
+        ("x-kbf-proxy-auth", presented.as_str()),
+        ("Authorization", bearer.as_str()),
+    ];
+    let put = http(
+        front.api,
+        "PUT",
+        "/v1/object-stores/connections/main",
+        &format!(
+            r#"{{"endpoint":"http://s3.example:9000","access_key_id":"AKID","secret_access_key":"{SECRET}","verify":false}}"#
+        ),
+        &write_headers,
+    )
+    .await;
+    assert_eq!(put, 201);
+    let bound = http(
+        front.api,
+        "PUT",
+        "/v1/object-stores/bindings/cold",
+        r#"{"connection":"main","bucket":"farm-bucket","prefix":"cold/","verify":false}"#,
+        &write_headers,
+    )
+    .await;
+    assert_eq!(bound, 201);
+
+    let claims = |secret: Option<String>, node: Option<&str>, role: &str| {
+        let mut claims = vec![("x-kbf-role", role.to_owned())];
+        claims.extend(secret.map(|s| ("x-kbf-proxy-auth", s)));
+        claims.extend(node.map(|n| ("x-kbf-node-id", n.to_owned())));
+        claims
+    };
+    let served = fetch_with(
+        front.worker,
+        &claims(Some(presented.clone()), Some("node-a"), "storage"),
+    )
+    .await
+    .expect("the proxy vouched for a storage node");
+    assert_eq!(served.generation, 2);
+    assert_eq!(served.config.expect("the store").secret_access_key, SECRET);
+
+    let refusals = [
+        (
+            "wrong secret",
+            claims(Some(hex::encode([0x11_u8; 32])), Some("node-a"), "storage"),
+        ),
+        ("no secret", claims(None, Some("node-a"), "storage")),
+        (
+            "not storage",
+            claims(Some(presented.clone()), Some("node-a"), "daemon"),
+        ),
+        ("no node", claims(Some(presented.clone()), None, "storage")),
+    ];
+    for (what, headers) in refusals {
+        let refused = fetch_with(front.worker, &headers).await.expect_err(what);
+        assert!(
+            matches!(
+                refused.code(),
+                Code::Unauthenticated | Code::PermissionDenied
+            ),
+            "{what}: {refused}"
+        );
+        assert!(!refused.message().contains(SECRET), "{what}: {refused}");
+    }
+}
