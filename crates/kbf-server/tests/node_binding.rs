@@ -175,6 +175,9 @@ fn hello(node: &str) -> daemon_message::Message {
         node_id: node.to_owned(),
         capabilities: vec![
             entry("arch", "x86_64"),
+            // A daemon always reports its OS; the server places an action that names none
+            // on linux/x86_64 (`--default-platform`).
+            entry("os", "linux"),
             entry("cpus", "1"),
             entry("mem_gib", "1"),
             entry("drivers", "fake"),

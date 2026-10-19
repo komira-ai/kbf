@@ -183,8 +183,7 @@ fn the_mode_flag_names_every_mode_like_the_alias_does() {
 
 /// Catches the alias word reading `kbf.toml` when it is given nothing (the old units run
 /// `kbf storage` on their own flags and must go on doing so), and a flag-form start that
-/// carries no flag of its mode not reading it: `--mode=storage` alone, `--mode=daemon
-/// --label`, a bare `kbf` and the alias with `--config` or `--check` are starts that read
+/// carries no flag of its mode not reading it: `--mode=storage` alone, a bare `kbf` and the alias with `--config` or `--check` are starts that read
 /// the file; a start that gives mode flags is never one.
 #[test]
 fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
@@ -198,19 +197,10 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
         start.config,
         std::path::PathBuf::from(enroll::DEFAULT_CONFIG)
     );
-    assert!(!start.check && start.labels.is_empty());
-    let start = registered(&[
-        "kbf",
-        "--mode=daemon",
-        "--config",
-        "/x/kbf.toml",
-        "--label=pool=mac",
-        "--label",
-        "rack=r2",
-    ])
-    .expect("config and labels");
+    assert!(!start.check);
+    let start =
+        registered(&["kbf", "--mode=daemon", "--config", "/x/kbf.toml"]).expect("config alone");
     assert_eq!(start.config, std::path::PathBuf::from("/x/kbf.toml"));
-    assert_eq!(start.labels, ["pool=mac", "rack=r2"]);
     // No mode named: the file's `mode`, and with no file, or none in it, a refusal naming
     // both places.
     let e = error(vec!["kbf".into()]);
@@ -274,19 +264,15 @@ fn a_start_reads_kbf_toml_only_when_it_gives_no_flags_of_its_mode() {
 
 /// Catches `--help` that lists the old words as commands, or misses a mode: the five
 /// modes are the possible values of `--mode`, the hidden aliases are no `Commands:`
-/// section, and `--config`, `--check` and `--label` are listed.
+/// section, and `--config` and `--check` are listed, and `--label` is not.
 #[test]
 fn help_lists_the_modes_under_the_mode_flag_and_no_commands() {
     let help = command().render_long_help().to_string();
     assert!(!help.contains("Commands:"), "{help}");
-    for flag in [
-        "--mode <MODE>",
-        "--config <FILE>",
-        "--check",
-        "--label <KEY=VALUE>",
-    ] {
+    for flag in ["--mode <MODE>", "--config <FILE>", "--check"] {
         assert!(help.contains(flag), "{flag}: {help}");
     }
+    assert!(!help.contains("--label"), "{help}");
     let named: Vec<&str> = MODES.iter().map(|m| m.name).collect();
     let cmd = command();
     let values = cmd
@@ -974,7 +960,6 @@ fn check_args_takes_the_mode_flag_and_the_file_flags() {
             CHECK_ARGS,
             "--mode=daemon",
             "--config=/etc/kbf/kbf.toml",
-            "--label=a=b",
         ],
         &["kbf", CHECK_ARGS, "storage-and-daemon", "--check"],
     ] {
@@ -985,6 +970,9 @@ fn check_args_takes_the_mode_flag_and_the_file_flags() {
     assert_eq!(check(&flags), Ok(()));
     let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--bogus"]).expect_err("refused");
     assert!(e.contains("unexpected argument"), "{e}");
+    // `--label` is gone: a unit that still passes it is refused, naming the flag.
+    let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--label=a=b"]).expect_err("refused");
+    assert!(e.contains("--label"), "{e}");
     // A flag with a file that is not there: the file is what is refused.
     let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--config=/x", "--bogus"])
         .expect_err("refused");

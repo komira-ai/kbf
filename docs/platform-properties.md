@@ -18,10 +18,11 @@ These properties change how kbf schedules an action today:
 
 Any other value of `kbf-lease`, `gpu`, `kbf-book-cpus` or `kbf-book-mem-gib` is refused
 with `INVALID_ARGUMENT`. kbf's own
-capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, `label.<k>`, ...; see
-[capabilities.md](design/capabilities.md#matching)) are matched too, except `label.<k>`
-(below). **Any other property is refused**, see
-[Accepted property names](#accepted-property-names).
+capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, ...; see
+[capabilities.md](design/capabilities.md#matching)) are matched too. **Any other property
+is refused**, see [Accepted property names](#accepted-property-names). An action that names
+no OS, no architecture and no ISA level is placed on the
+[default platform](#the-default-platform).
 
 ### Accepted property names
 
@@ -37,9 +38,25 @@ label an operator gave it. The front accepts exactly these names (any ASCII case
 - `container-image`, exactly so: not read by the scheduler, read by the container driver.
 
 Refused: `pool`, `Pool` and every other name kbf does not read (`dockerNetwork`,
-`Container-Image`, `ios.devices`, ...), and every `label.<k>`. A node's `--label` is
-reported for operators only; no request selects on it. A client whose platform sends
+`Container-Image`, `container-images`, `ios.devices`, ...), every `label.<k>` (nodes have
+no labels: the daemon's `--label` is removed, and no request selects on one), and the
+report-only `vm.slots`, `vm.max_cpus` and `vm.max_mem_gib`. A client whose platform sends
 `pool=...` must send `OSFamily` and `ISA` instead.
+
+`container-image` beside an OS of macOS is refused too, naming the key and the OS: the
+container driver is Linux's, and a Mac runs an action as a process, so the image would be
+silently unused.
+
+**When it is refused.** Before anything else is read. An Action that carries a platform is
+checked as soon as it is decoded, and a Command's platform as soon as the Command is read,
+both before the input tree is walked, so a bad key beside missing blobs is
+`INVALID_ARGUMENT` and not a `MISSING` the client would upload for and retry. An `Execute`
+that the action cache answers is checked as well: if the action (and, when the Action has no
+platform, its Command) is in the CAS, a refused platform is `INVALID_ARGUMENT` and the cached
+result is not served, so a mistyped property is loud also for an action that ran under an
+older frontend. An action the CAS does not hold cannot be checked, and its cached result is
+served. `GetActionResult` is a plain cache read: it never reads the action and returns
+whatever is cached under the digest.
 
 ### Property names are read in any case
 
@@ -49,9 +66,7 @@ meant for kbf is never ignored because of how it is spelled: `osfamily=darwin`,
 names (`OSFamily`, `ISA`, `Arch`) and for every kbf key: the capability keys above
 (`OS` is `os`, `ISA_Level` is `isa_level`), `gpu` (`GPU=1` books a GPU), and the
 reserved `kbf-lease`, `kbf-cpu`, `kbf-mac-admin`, `kbf-book-cpus` and
-`kbf-book-mem-gib`. In `label.<k>` only `label.` is
-read in any case; the label's own name `<k>` is compared exactly, as its value is.
-`arch` spelled exactly so is kbf's own `arch` key (values `x86_64`, `arm64`); in any
+`kbf-book-mem-gib`. `arch` spelled exactly so is kbf's own `arch` key (values `x86_64`, `arm64`); in any
 other spelling (`Arch`, `ARCH`) it is REAPI's `Arch` and takes the values in the
 table. Values are compared as described for each key: `OSFamily`, `ISA` and `Arch`
 values in any case, kbf's own keys' values exactly.
@@ -64,6 +79,50 @@ in any case, is refused (see above).
 `container-image` is the one exception: it is read by the Linux container driver, not
 by the scheduler, and only in exactly that spelling. `Container-Image` is a name kbf
 does not know, so it is refused with `INVALID_ARGUMENT` naming it.
+
+## The default platform
+
+An action that names no platform would match every node, a Mac among them (the scheduler
+takes the first live node that fits, by name). So a request that names **no OS, no
+architecture and no ISA level** (`OSFamily`, `ISA`, `Arch`, `os`, `arch`, `isa_level`, in
+any case), and no `xcode` and no `ios.device*`, is placed on the frontend's
+`--default-platform`, `linux/x86_64` unless the operator sets another `<os>/<arch>`
+(`linux`/`macos`, `x86_64`/`arm64`) or `none`, which restores matching every node. It is
+applied after the refusals above and before a worker is chosen; each application is logged
+with the action digest (at most one line in ten seconds, with the number skipped).
+
+It completes nothing that is half named: `OSFamily=Darwin` alone stays a Mac of any
+architecture, `ISA=arm64` alone stays any OS, an `xcode` or an `ios.device` is Mac work and
+is left to the Macs that report it. Other keys (`kbf-lease`, `gpu`, `cpu.model`,
+`kbf-book-cpus`, ...) do not stop it. The action itself is not changed, so its digest and
+its cache entry are the client's: an action that sends no platform and one that sends
+`OSFamily=Linux, ISA=x86-64` do not share cache entries, and changing the flag later does not
+re-key results already cached.
+
+This is the default [BuildBuddy](https://www.buildbuddy.io/docs/rbe-platforms/) documents
+for its remote executors: `OSFamily` is `linux` and `Arch` is `amd64` when a platform omits
+them (compiled into its server, applied per key, silently). kbf applies it only when neither
+is named, as EngFlow does not complete half of a pair, and logs it. Buildbarn has no default
+and fails a platform no worker matches exactly; the REAPI text leaves the choice to the
+server.
+
+## Rolling this out
+
+The order matters, because a frontend that refuses a property and a client that sends one
+meet in four ways:
+
+| Frontend | Client | Result |
+|---|---|---|
+| new (this change) | old, sends `pool=...` | refused on **every** Execute with `INVALID_ARGUMENT` naming `pool`: the farm is down for that client |
+| old | new, sends `OSFamily`/`ISA` | works: an old frontend reads those names too |
+| old | old | as today: `pool=...` is silently dropped, and the action runs on any worker |
+| any | any, units still passing `--label` | a daemon built without `--label` **does not start**: clap refuses the unknown flag |
+
+So the safe order is: (1) clients move to `OSFamily` and `ISA` (komira-internal#1120), which
+an old frontend accepts; (2) the Mac units drop `--label` (and a `label` key from their
+`kbf.toml`), which an old daemon does not need; (3) then this change's frontend and daemon
+are deployed. A daemon that still reports `label.<k>` (an older one) is read by the new
+server, which skips the entry.
 
 ## Where an action runs
 

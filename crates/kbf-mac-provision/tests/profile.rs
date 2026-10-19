@@ -233,16 +233,6 @@ fn every_malformed_profile_is_refused() {
             "kbf_cert: ",
         ),
         (
-            "bad label",
-            edited(set("kbf_labels", "pool=mac rack")),
-            "is not key=value",
-        ),
-        (
-            "profile label",
-            edited(set("kbf_labels", "profile=x")),
-            "profile label",
-        ),
-        (
             "relative xip dir",
             edited(set("xcode_xip_dir", "xip")),
             "xcode_xip_dir: ",
@@ -409,7 +399,7 @@ fn an_unknown_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("sleep=0")).as_bytes()).unwrap_err(),
         ProfileError::UnknownKey {
-            line: 43,
+            line: 42,
             key: "sleep".into()
         }
     );
@@ -422,7 +412,7 @@ fn a_repeated_key_is_refused() {
     assert_eq!(
         Profile::parse(edited(append("firewall=off")).as_bytes()).unwrap_err(),
         ProfileError::Duplicate {
-            line: 43,
+            line: 42,
             key: "firewall".into()
         }
     );
@@ -448,12 +438,12 @@ fn a_value_outside_the_character_set_is_refused() {
     for bad in [
         "$", "`", ";", "|", "&", "<", "\"", "'", "\\", "\t", "*", "\r",
     ] {
-        let text = edited(set("kbf_labels", &format!("pool=m{bad}c")));
+        let text = edited(set("xcode_xip_dir", &format!("/x{bad}")));
         assert_eq!(
             Profile::parse(text.as_bytes()).unwrap_err(),
             ProfileError::BadCharacter {
-                line: 33,
-                key: "kbf_labels".into()
+                line: 34,
+                key: "xcode_xip_dir".into()
             },
             "{bad:?}"
         );
@@ -469,7 +459,7 @@ fn a_key_with_a_space_or_capital_is_refused() {
         assert_eq!(
             Profile::parse(text.as_bytes()).unwrap_err(),
             ProfileError::UnknownKey {
-                line: 43,
+                line: 42,
                 key: key.into()
             }
         );
@@ -549,7 +539,6 @@ fn print_shows_the_resolved_profile_its_sha256_and_the_node_label() {
         "profile=mac-arm64-test",
         "hostname=kbf-mac-07",
         "xcode_xip_dir=/Library/kbf/xip",
-        "kbf_labels=pool=mac rack=r2",
         "default_developer_dir=/Applications/Xcode-27.0.app/Contents/Developer",
         "expect_probe=host_identity:17A000=26.6-0123456789abcdef",
         "expect_probe=host_identity:18A000=",
@@ -579,16 +568,19 @@ fn print_shows_the_resolved_profile_its_sha256_and_the_node_label() {
 }
 
 /// Catches: an optional key left out of the file printed as `key=` (the script's
-/// `t_print`), or an empty `kbf_labels` printed.
+/// `t_print`), or an empty key printed.
 #[test]
 fn print_leaves_out_empty_and_absent_keys() {
     let text = edited(|l| {
         drop_keys(&["xcode_xip_dir"])(l);
-        set("kbf_labels", "")(l);
+        set("xcode_disable_manifest_sandbox", "")(l);
     });
     let printed = Profile::parse(text.as_bytes()).unwrap().print();
     assert!(!printed.contains("xcode_xip_dir"), "{printed}");
-    assert!(!printed.contains("kbf_labels"), "{printed}");
+    assert!(
+        !printed.contains("xcode_disable_manifest_sandbox"),
+        "{printed}"
+    );
 }
 
 /// Catches: the example profile drifting from the parser's rules, so the example the
@@ -600,7 +592,6 @@ fn the_example_profile_is_accepted() {
     assert_eq!(p.role_id, 480);
     assert_eq!(p.lease_uids, 600..=699);
     assert_eq!(p.time_max_offset_ms, 250);
-    assert_eq!(p.labels, ["pool=mac", "rack=r2"]);
     assert_eq!(p.xcodes[1].app(), "/Applications/Xcode-27.0.app");
     assert_eq!(p.probes[0].key, "host_identity");
 }
@@ -882,7 +873,7 @@ fn the_old_key_twice_is_a_duplicate() {
     let text = format!("{}kbf_scratch=/Volumes/kbf/x\n", with_old_key());
     assert_eq!(
         refusal(&text),
-        "profile line 43: duplicate key: kbf_scratch"
+        "profile line 42: duplicate key: kbf_scratch"
     );
 }
 
@@ -893,4 +884,35 @@ fn neither_data_dir_key_is_missing_key() {
         refusal(&edited(drop_keys(&["kbf_data_dir"]))),
         "missing key: kbf_data_dir"
     );
+}
+
+/// Catches: a profile written before node labels were removed (it still carries
+/// `kbf_labels`) refused, which would stop provisioning of a Mac; its labels silently
+/// accepted with no word said; a label reaching the rendered `kbf.toml` (the daemon
+/// refuses a `label` key); or a second `kbf_labels` line accepted.
+#[test]
+fn the_removed_labels_key_is_ignored_with_a_warning() {
+    let new = Profile::parse(edited(|_| {}).as_bytes()).unwrap();
+    assert!(new.warnings.is_empty(), "{:?}", new.warnings);
+    let text = edited(append("kbf_labels=pool=mac rack=r2"));
+    let old = Profile::parse(text.as_bytes()).unwrap();
+    assert_eq!(old.warnings.len(), 1, "{:?}", old.warnings);
+    assert!(
+        old.warnings[0].contains("kbf_labels is ignored"),
+        "{}",
+        old.warnings[0]
+    );
+    let rendered = kbf_mac_provision::launchd::render_config(&old);
+    assert_eq!(rendered, kbf_mac_provision::launchd::render_config(&new));
+    assert!(!rendered.contains("label"), "{rendered}");
+    assert!(!old.print().contains("kbf_labels"), "{}", old.print());
+
+    let twice = edited(|l| {
+        append("kbf_labels=a=b")(l);
+        append("kbf_labels=c=d")(l);
+    });
+    assert!(matches!(
+        Profile::parse(twice.as_bytes()),
+        Err(ProfileError::Duplicate { .. })
+    ));
 }

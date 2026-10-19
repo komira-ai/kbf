@@ -30,7 +30,6 @@ What a Linux daemon reports today:
 | `isa_level` (repeated) | **every** level the CPU reaches, lowest first | computed from the features |
 | `cpu.features` (repeated) | every CPU feature flag, in the kernel's names | `/proc/cpuinfo` |
 | `drivers` (repeated) | every execution driver this daemon runs, one per runtime: `container`, `native` or `fake` | `kbf-daemon --driver`, once per driver |
-| `label.<k>` | an operator's label, `--label k=v`; report-only, no request matches it | the daemon's flags |
 
 A daemon on an Apple silicon Mac asks `sysctl` instead: `hw.optional` (which `kbf-caps`
 parses into `cpu.features` and `isa_level`), `hw.ncpu` (`cpus`), `hw.memsize`
@@ -199,7 +198,7 @@ Each key has one typed comparison:
 | `isa_level` | at least, within the family: `x86-64-v3` is served by v3 and v4 |
 | `cpu.feature` (may repeat) | every requested feature is present |
 | `cpus`, `mem_gib`, `nvme_gib`, `gpu` | the node has at least this amount (`gpu` is also booked, below) |
-| `os`, `os_image`, `cpu.model`, `page_size` | exact (`label.<k>` is parsed here but the front refuses it: [Unknown keys](#unknown-keys)) |
+| `os`, `os_image`, `cpu.model`, `page_size` | exact |
 | `xcode` | membership: the node reports one `xcode` entry per ready Xcode build, and the request names one of them |
 | `os_build`, `os_version`, `kernel` | **planned**: exact, once they are report entries (see [The node status](#the-node-status)) |
 | `vm.image` | membership on the digest: the request names `<name>@sha256:<64 lowercase hex digits>` and matches a node that reports any name with that digest; a value without a digest is refused. No daemon reports `vm.image` yet, so a request for one matches no node (see [Planned VM entries](#planned-vm-entries)) |
@@ -221,10 +220,15 @@ its report.
 `Request::parse` refuses a key it does not know, and so does the front: a platform
 property kbf does not read (`pool`, `OSFamilly`, `ios.devices`, `Container-Image`) is
 refused at `Execute` with `INVALID_ARGUMENT` naming the key as the client sent it. Nothing
-is dropped. A `label.<k>` key is refused the same way: **labels are never used to place
-an action.** A node's `--label` is reported as `label.<k>` for operators to read; no
-request selects on it. Placement is on what a node reports about itself and its hardware
-(`os`, `arch`, `isa_level`, ...). The one name that passes unread is `container-image`,
+is dropped. A `label.<k>` key is refused the same way: **nodes have no labels.** The
+daemon's `--label` is removed (a daemon started with it does not start), a daemon reports
+no `label.<k>`, and no request selects on one. Placement is on what a node reports about
+itself and its hardware (`os`, `arch`, `isa_level`, ...). A report that still carries a
+`label.<k>` entry (an older daemon) is read and the entry skipped, like any entry the
+matcher does not know; a stored request that names one is refused when it is parsed again
+(`Request::parse` gives `UnknownKey`) rather than read without it, which would let it run
+anywhere. The control-log codec that parses stored requests has no production writer yet,
+so none is stored; a log that gains one needs a machine-version raise first. The one name that passes unread is `container-image`,
 exactly so, which the container driver reads. The accepted keys are listed in
 [platform-properties.md](../platform-properties.md#accepted-property-names).
 
@@ -308,7 +312,9 @@ does not know, so the front refuses it with `INVALID_ARGUMENT` naming `Container
 - The container driver reads `container-image` itself, by that exact name (see
   [daemon.md](daemon.md#the-container-driver)).
 - Unknown platform properties, and `label.<k>` keys, are refused with `INVALID_ARGUMENT` naming
-  the key (see [Unknown keys](#unknown-keys)).
+  the key (see [Unknown keys](#unknown-keys)). A request that names no OS, no architecture
+  and no ISA level is placed on the frontend's `--default-platform`
+  ([platform-properties.md](../platform-properties.md#the-default-platform)).
 - Each daemon sends its `NodeStatus` after `Welcome`, and again when its Xcodes change;
   it routes no work.
 - A Mac's native driver reports one `xcode` entry per ready `Xcode*.app` in

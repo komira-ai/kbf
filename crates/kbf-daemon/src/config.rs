@@ -45,8 +45,7 @@ impl KeepAlive {
     }
 }
 
-/// The session flags of the `kbf-daemon` command line: where to connect, as whom, and
-/// how this node is labelled. The binary (crate `kbf-node`) adds the driver flags.
+/// The session flags of the `kbf-daemon` command line: where to connect, and as whom. The binary (crate `kbf-node`) adds the driver flags.
 #[derive(Clone, Debug, clap::Args)]
 pub struct Args {
     /// A kbf-server worker listener to connect to, as an `https://host:port` URL;
@@ -78,12 +77,6 @@ pub struct Args {
     /// wait is jittered down by up to half.
     #[arg(long, default_value_t = 30_000)]
     pub reconnect_max_ms: u64,
-    /// A node label, `key=value`, reported as `label.<key>` for operators to read;
-    /// repeatable. Report-only: no request selects on a label (a request naming
-    /// `label.<key>`, or `pool`, is refused), so placement never follows it. A node is
-    /// placed by what it detects (`os`, `arch`, ...).
-    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
-    pub labels: Vec<(String, String)>,
     /// The longest, in milliseconds, that dialling a storage node may take: for its TCP
     /// connection and for its TLS handshake each. Must be 1 to 3600000 (one hour).
     #[arg(long, default_value_t = STORAGE_LIVENESS_DEFAULT_MS)]
@@ -139,38 +132,6 @@ impl Args {
             keepalive_timeout: Duration::from_millis(self.storage_ping_timeout_ms),
         })
     }
-
-    /// The node report entries the labels add: `(label.<key>, value)`.
-    #[must_use]
-    pub fn label_entries(&self) -> Vec<(String, String)> {
-        self.labels
-            .iter()
-            .map(|(key, value)| (format!("label.{key}"), value.clone()))
-            .collect()
-    }
-}
-
-/// A `--label` value: `key=value`, the key made of ASCII letters, digits, `.`, `_`
-/// and `-`, the value non-empty and without whitespace.
-fn parse_label(text: &str) -> Result<(String, String), String> {
-    let (key, value) = text
-        .split_once('=')
-        .ok_or_else(|| format!("{text:?} is not key=value"))?;
-    let key_ok = !key.is_empty()
-        && key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if !key_ok {
-        return Err(format!(
-            "label key {key:?} must be ASCII letters, digits, '.', '_' or '-'"
-        ));
-    }
-    if value.is_empty() || value.contains(char::is_whitespace) {
-        return Err(format!(
-            "label value {value:?} must be non-empty and contain no whitespace"
-        ));
-    }
-    Ok((key.to_owned(), value.to_owned()))
 }
 
 /// The TLS files a daemon authenticates with: the server's CA, and its own
@@ -325,23 +286,19 @@ mod tests {
         <Line as clap::Parser>::try_parse_from(base.iter().chain(extra)).map(|l| l.args)
     }
 
-    /// Catches: a label flag that is not repeatable, reports under another key than
-    /// `label.<key>`, or accepts a key or value the matcher could not compare exactly
-    /// (empty, spaced, or without `=`).
+    /// Catches: the `--label` flag accepted again (a node is placed by what it detects,
+    /// never by a name an operator gave it): a daemon started with one must fail to
+    /// start, naming the flag, so a unit that still passes it is found at once.
     #[test]
-    fn labels_are_checked_and_reported_under_label_keys() {
-        let args = parse(&["--label", "pool=darwin-sized", "--label=rack=r1"]).expect("labels");
-        assert_eq!(
-            args.label_entries(),
-            [
-                ("label.pool".to_owned(), "darwin-sized".to_owned()),
-                ("label.rack".to_owned(), "r1".to_owned())
-            ]
-        );
-        assert!(parse(&[]).expect("no labels").label_entries().is_empty());
-        for bad in ["pool", "=x", "po ol=x", "pool=", "pool=a b", "p/l=x"] {
-            assert!(parse(&["--label", bad]).is_err(), "{bad:?}");
+    fn the_label_flag_is_refused() {
+        for extra in [
+            &["--label", "pool=darwin-sized"][..],
+            &["--label=rack=r1"][..],
+        ] {
+            let error = parse(extra).expect_err("--label is gone").to_string();
+            assert!(error.contains("--label"), "{error}");
         }
+        assert!(parse(&[]).is_ok());
     }
 
     /// Catches: flags that do not reach the configuration (a reconnect wait or its

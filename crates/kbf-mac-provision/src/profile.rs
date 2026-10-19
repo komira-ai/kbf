@@ -49,7 +49,6 @@ pub const REQUIRED: &[&str] = &[
     "kbf_cert",
     "kbf_key",
     "kbf_data_dir",
-    "kbf_labels",
     "simulator_runtimes",
 ];
 
@@ -110,6 +109,9 @@ pub enum ProfileError {
 /// The old name of `kbf_data_dir`, accepted with a warning.
 const OLD_DATA_DIR: &str = "kbf_scratch";
 
+/// The key that set the daemon's `--label`s, which kbf no longer has.
+const REMOVED_LABELS: &str = "kbf_labels";
+
 /// A pinned Xcode: `BUILD:/Applications/Xcode*.app/Contents/Developer:SHA256`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Xcode {
@@ -156,8 +158,6 @@ pub struct Profile {
     /// `daemon_user`: the account kbf-daemon's job runs as.
     pub daemon_user: DaemonUser,
     pub time_max_offset_ms: u64,
-    /// The daemon's other `--label`s, from `kbf_labels`.
-    pub labels: Vec<String>,
     /// The SHA-256 of the file, in hex.
     pub sha256: String,
     /// Deprecation warnings, one line each: the profile is accepted, and `load` prints
@@ -202,6 +202,7 @@ impl Profile {
         let mut values = BTreeMap::new();
         let mut warnings = Vec::new();
         let mut old_line = None;
+        let mut labels_line: Option<usize> = None;
         let mut repeated: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for (index, line) in body.split(|&b| b == b'\n').enumerate() {
             let line_no = index + 1;
@@ -243,6 +244,21 @@ impl Profile {
                     "profile line {line_no}: {OLD_DATA_DIR} is deprecated, use kbf_data_dir (treated as kbf_data_dir)"
                 ));
                 values.insert("kbf_data_dir", value);
+                continue;
+            }
+            if key_text == REMOVED_LABELS {
+                // Node labels are gone from kbf (`--label` and `label` in `kbf.toml` are
+                // refused), so the key cannot do anything. A profile written before that
+                // still provisions; its line is ignored and said so, never silently.
+                if labels_line.replace(line_no).is_some() {
+                    return Err(ProfileError::Duplicate {
+                        line: line_no,
+                        key: key_text,
+                    });
+                }
+                warnings.push(format!(
+                    "profile line {line_no}: {REMOVED_LABELS} is ignored: kbf has no node labels any more (remove the line)"
+                ));
                 continue;
             }
             let Some(&name) = REQUIRED.iter().chain(OPTIONAL).find(|&&k| k == key_text) else {
@@ -429,23 +445,6 @@ impl Profile {
         for key in ["kbf_ca_cert", "kbf_cert", "kbf_key", "kbf_data_dir"] {
             want(key, pattern::absolute_path, "an absolute path")?;
         }
-        let labels: Vec<String> = get("kbf_labels")
-            .split(' ')
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect();
-        for label in &labels {
-            if !pattern::daemon_label(label) {
-                return Err(ProfileError::Invalid(format!(
-                    "kbf_labels: {label} is not key=value"
-                )));
-            }
-            if label.starts_with("profile=") {
-                return Err(ProfileError::Invalid(
-                    "kbf_labels: the profile label is kbf-mac-provision's".into(),
-                ));
-            }
-        }
         if !get("xcode_disable_manifest_sandbox").is_empty() {
             want("xcode_disable_manifest_sandbox", pattern::bit, "0 or 1")?;
         }
@@ -468,7 +467,6 @@ impl Profile {
             volume,
             daemon_user,
             time_max_offset_ms,
-            labels,
             sha256,
             warnings: Vec::new(),
         })

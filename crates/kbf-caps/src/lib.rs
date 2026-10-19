@@ -35,7 +35,10 @@ pub use gpu::{PciFunction, gpus_from_linux_pci, gpus_from_macos_sysctl};
 pub use level::{ArmVersion, IsaLevel, UnknownIsaLevel, X86Level};
 pub use matching::{
     Consumable, DEVICE_ATTRIBUTES, NodeCaps, REPORT_ONLY_KEYS, RESERVED_KEYS, Request,
-    RequestError, Unmet,
+    RequestError, Unmet, property_names,
 };
-pub use platform::{DAEMON_OSES, FromPlatformError, REAPI_KEYS, property_name};
+pub use platform::{
+    DAEMON_OSES, DefaultPlatform, DefaultPlatformError, DefaultPlatformSetting, FromPlatformError,
+    REAPI_KEYS, property_name,
+};
 pub use report::ReportError;

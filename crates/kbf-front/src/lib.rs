@@ -104,9 +104,9 @@ pub use crate::cas::CasService;
 pub use crate::described::Described;
 pub use crate::execution::{
     BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, Closer, Closing, DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN,
-    ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON,
-    OperationStream, Progress, ProgressTicker, Stage, Submission, Ticket, closing, missing_status,
-    progress,
+    ExecutionDefaults, ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS,
+    NO_WORKER_REASON, OperationStream, Progress, ProgressTicker, Stage, Submission, Ticket,
+    closing, missing_status, progress,
 };
 pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
@@ -232,13 +232,14 @@ where
         Progress::off(),
         authorizers,
         &Recorder::off(),
-        DEFAULT_RESOURCES.memory_bytes,
+        ExecutionDefaults::default(),
     )
 }
 
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
 /// `recorder`, open streams re-sent at each tick of `progress`, and an `action` that
-/// names no memory size booking `default_memory` bytes ([`ExecutionService::with_default_memory`]).
+/// names no memory size booking `defaults.memory_bytes` bytes, and a request that names no
+/// platform placed on `defaults.platform` ([`ExecutionService::with_defaults`]).
 pub fn routes_recorded<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
@@ -246,7 +247,7 @@ pub fn routes_recorded<M, O, D>(
     progress: Progress,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    default_memory: u64,
+    defaults: ExecutionDefaults,
 ) -> Routes
 where
     M: MetaLog,
@@ -262,7 +263,7 @@ where
         )
         .recording(recorder.clone())
         .with_progress(progress)
-        .with_default_memory(default_memory),
+        .with_defaults(defaults),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -290,7 +291,7 @@ pub fn routes_proxied<D>(
     streams: OpenStreams,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    default_memory: u64,
+    defaults: ExecutionDefaults,
 ) -> Routes
 where
     D: Dispatch,
@@ -302,7 +303,7 @@ where
         streams,
         authorizers,
         recorder,
-        default_memory,
+        defaults,
         |execution, _, _| execution,
     )
 }
@@ -328,7 +329,7 @@ pub fn routes_relayed<D>(
     streams: OpenStreams,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    default_memory: u64,
+    defaults: ExecutionDefaults,
     relaying: Relaying,
 ) -> Routes
 where
@@ -343,7 +344,7 @@ where
         streams,
         authorizers,
         recorder,
-        default_memory,
+        defaults,
         move |execution, closing, progress| {
             let streams = OpenStreams { closing, progress };
             Relay::new(execution, relaying.farm, relaying.successor, counted)
@@ -363,7 +364,7 @@ fn proxied<D, E>(
     streams: OpenStreams,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    default_memory: u64,
+    defaults: ExecutionDefaults,
     wrap: impl FnOnce(ExecutionService<D>, Closing, Progress) -> E,
 ) -> Routes
 where
@@ -379,7 +380,7 @@ where
     )
     .recording(recorder.clone())
     .with_progress(progress.clone())
-    .with_default_memory(default_memory);
+    .with_defaults(defaults);
     let execution = ExecutionServer::new(wrap(service, closing, progress))
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);

@@ -243,24 +243,25 @@ async fn a_flag_that_is_not_known_exits_2() {
 }
 
 /// Catches the mode parser's refusal of what the start built being printed as something
-/// else, or exiting other than 2: an enrolled node given a label the daemon refuses prints
-/// clap's message and exits 2.
+/// else, or exiting other than 2: a start given `--label`, which the daemon no longer has,
+/// prints clap's message, exits 2 and enrolls nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flag_the_mode_refuses_exits_2_with_its_message() {
     let run = fake::start();
     let root = scratch("process-mode-refusal");
     let path = config(&root, run.enroll_addr.port(), "");
     token(&root, &run.fake.mint(1, 1).to_line());
-    // Enrolled by a start that stops at its first refusal: the label has no `=`.
+    // `--label` is not a flag of the daemon (node labels are removed): a unit that still
+    // passes it is refused at once, naming it, before the token is spent.
     let mut words = args(&["--mode=daemon"], &path);
-    words.push("--label=no-equals-sign".to_owned());
+    words.push("--label=pool=mac".to_owned());
     let out = kbf(words).await;
 
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert!(out.stderr.contains("--label"), "{}", out.stderr);
     assert!(
-        root.join("state/pki/node.json").exists(),
-        "enrolled all the same"
+        !root.join("state/pki/node.json").exists(),
+        "enrolled although the mode refused its flags"
     );
 }
 

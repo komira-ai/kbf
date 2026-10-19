@@ -125,7 +125,7 @@ impl Farm {
                 progress,
                 Arc::new(Authorizers::allow_all()),
                 &kbf_front::Recorder::off(),
-                kbf_front::DEFAULT_RESOURCES.memory_bytes,
+                kbf_front::ExecutionDefaults::default(),
             )
         };
         Self::serve(routes).await
@@ -134,6 +134,19 @@ impl Farm {
     /// The cache services and `Execution` over `dispatch` (streams never closed),
     /// where an action that names no memory size books `default_memory` bytes.
     pub async fn with_default_memory<D: Dispatch>(dispatch: Arc<D>, default_memory: u64) -> Self {
+        let defaults = kbf_front::ExecutionDefaults {
+            memory_bytes: default_memory,
+            ..kbf_front::ExecutionDefaults::default()
+        };
+        Self::with_defaults(dispatch, defaults).await
+    }
+
+    /// The cache services and `Execution` over `dispatch` (streams never closed), with
+    /// `defaults` for what an action leaves unsaid (its memory, its platform).
+    pub async fn with_defaults<D: Dispatch>(
+        dispatch: Arc<D>,
+        defaults: kbf_front::ExecutionDefaults,
+    ) -> Self {
         let (_, closing) = kbf_front::closing();
         let routes = |cache| {
             kbf_front::routes_recorded(
@@ -143,7 +156,7 @@ impl Farm {
                 kbf_front::Progress::off(),
                 Arc::new(Authorizers::allow_all()),
                 &kbf_front::Recorder::off(),
-                default_memory,
+                defaults,
             )
         };
         Self::serve(routes).await

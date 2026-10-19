@@ -290,6 +290,15 @@ pub struct Args {
     /// refused FAILED_PRECONDITION. The wait restarts whenever one can.
     #[arg(long, default_value_t = kbf_sched::UNSERVABLE_WAIT.as_secs())]
     pub unservable_wait_secs: u64,
+    /// The platform, `<os>/<arch>`, of an Execute whose action names no OS, no
+    /// architecture and no ISA level (`OSFamily`, `ISA`, `Arch`, `os`, `arch`,
+    /// `isa_level`) and no `xcode` or `ios.device*`: without it, such an action matches
+    /// any worker, a Mac among them. `linux/x86_64` unless `none`, which keeps that. A
+    /// request that names one of those is never completed (`OSFamily=Darwin` alone stays
+    /// any Mac). The action, and so its digest, is not changed; each application is
+    /// logged.
+    #[arg(long, default_value_t = kbf_caps::DefaultPlatformSetting::default())]
+    pub default_platform: kbf_caps::DefaultPlatformSetting,
     /// The memory rungs of an action, in GiB, ascending and each at least 1. The first
     /// is what an action that names no size (`kbf-book-mem-gib`) books. An action that
     /// passes its own memory limit runs again on the next rung above what it booked,
@@ -710,6 +719,7 @@ impl Args {
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
+            default_platform: self.default_platform.0,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
                 0 => Duration::MAX,

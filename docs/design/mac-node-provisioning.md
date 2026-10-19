@@ -7,6 +7,13 @@ headless rack Mac needs, how macOS and Xcode updates are rolled out, how a Mac m
 from a desk to a rack, how it takes over from another farm's worker, and how it
 joins and leaves the farm.
 
+**Node labels are removed.** A daemon has no `--label` and reports no `label.<k>`, and no
+request selects on one. Where this document says a node is put in or back in a "pool
+label", serves "only its qualification label", or carries a rack label, read it as the
+operator's own record of which Macs are in which state (the node id names the Mac); kbf
+places an action on what a node detects about itself (`os`, `arch`, `xcode`, ...), never
+on a name an operator gave it.
+
 It covers the bare-metal host. Simulator, GUI and UI tests run in macOS VMs on that
 host (two guests per Mac), and GPU work runs on bare metal with the whole Mac; both are
 designed in the [macOS VMs design](macos-vms.md), with guest setup and image identity in
@@ -58,8 +65,9 @@ This design builds on the code on `main`, read at the time of writing.
 
 - **The binary.** `kbf-daemon` lives in crate `kbf-node` and takes
   `--driver fake|container|native`. On a Mac it runs `--driver native` with `--server`,
-  `--cas`, `--ca-cert`, `--cert`, `--key`, `--node-id`, `--data-dir` and repeatable
-  `--label key=value` (reported as `label.<key>`). It is configured by flags only. On
+  `--cas`, `--ca-cert`, `--cert`, `--key`, `--node-id` and `--data-dir`. It has no node labels (there was a repeatable `--label`; it
+  is removed, and a daemon started with one does not start): a node is placed by what it
+  detects (`os`, `arch`, ...). It is configured by flags only. On
   SIGTERM it drains (no new lease; running ones finish and report) and exits zero. A
   second signal, or `--drain-deadline-secs` after the first, abandons the leases still
   running (their processes are killed and their directories removed).
@@ -204,9 +212,10 @@ kbf-mac-provision print   --profile FILE   # the profile as resolved, and its SH
   node, or a CI job over SSH), never by hand on a node once the node exists.
 - `apply` ends by running `check`. A run that changes anything prints what it changed;
   a second run must print nothing.
-- The node reports `label.profile=<name>@<first 12 hex digits of the profile's
-  SHA-256>` (a `--label`), so the server and the farm's UI see which profile each node
-  runs.
+- `print` shows `profile=<name>@<first 12 hex digits of the profile's SHA-256>`, the
+  node label of the profile. It is no longer sent to the daemon, since node labels are
+  removed; the server and the farm's UI do not see which profile a node runs until
+  there is a detected property for it.
 - **The profile holds host settings only.** The `kbf-daemon` commit and its SHA-256
   are not in it: they are the deployment job's input for each commit it rolls out
   (section 4.3). A daemon upgrade is then not a profile change, and every green
@@ -245,7 +254,6 @@ expect_probe=host_identity:17A000=26.6-0123456789abcdef
 expect_probe=host_identity:18A000=27.0-fedcba9876543210
 kbf_server=https://farm.example.net:8981
 kbf_cas=https://farm.example.net:8981
-kbf_labels=pool=mac rack=r2
 ```
 
 ## 3. Host profile and worker profile
@@ -634,7 +642,7 @@ daemon starts at boot with nobody logged in
   daemon and the actions it starts must not be throttled.
 - `ExitTimeOut` gives the daemon time to kill its leases on SIGTERM before launchd
   sends SIGKILL.
-- The server's address, the node id, the labels and the certificate paths are flags in
+- The server's address, the node id and the certificate paths are flags in
   `ProgramArguments`, written from the profile. No environment variables.
 
 ### 5.4 FileVault and auto-login
@@ -718,8 +726,9 @@ server with `sntp` (read-only) and fails above an offset the profile names.
   its client certificate.
 - Lower-case ASCII letters, digits and `-`: `<farm>-mac-<nn>` (`kbf-mac-07`). Never a
   person's name, and nothing with an apostrophe or a space.
-- **No location in the name.** Where a node is (desk, rack, slot) is a label
-  (`--label rack=r2`), which changes when the Mac moves. The name does not, so a move
+- **No location in the name.** Where a node is (desk, rack, slot) belongs in the
+  operator's inventory, not in the node's name or any flag (node labels are removed), and
+  changes when the Mac moves. The name does not, so a move
   does not change the node's identity, its certificate or its history.
 
 ### 5.7 Logs (partly planned)

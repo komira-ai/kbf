@@ -28,7 +28,7 @@
 //!
 //! **A start with no mode flags reads `kbf.toml`** ([`node`]): `kbf --mode=storage`,
 //! `daemon` or `storage-and-daemon` with at most `--config FILE` (default where the
-//! packages put it) and `--label`, or `kbf` alone. The start enrolls the host on its first
+//! packages put it), or `kbf` alone. The start enrolls the host on its first
 //! run when the token file is there, for exactly the roles the mode needs, renews without
 //! the token on later runs, and runs the mode on the configuration the frontend sent
 //! ([`node`], [`enroll`]). `--check` checks that host and exits, starting nothing: 0 for
@@ -281,13 +281,6 @@ pub fn command() -> Command {
                      and exit: 0 when it can start, 2 when a restart cannot fix it; \
                      starts and enrolls nothing",
                 ),
-        )
-        .arg(
-            Arg::new("label")
-                .long("label")
-                .value_name("KEY=VALUE")
-                .action(ArgAction::Append)
-                .help("A label the daemon half reports to the frontend (repeatable)"),
         );
     for mode in MODES {
         cmd = cmd.subcommand(mode_command(mode.name, mode.entry));
@@ -365,7 +358,7 @@ pub fn parse_cluster(args: &[std::ffi::OsString]) -> Result<cluster::Cluster, cl
 }
 
 /// What the words of a command line say before any mode parses its flags: the mode
-/// (`--mode`, or the hidden alias word), `kbf.toml`'s path, `--check` and the labels, and
+/// (`--mode`, or the hidden alias word), `kbf.toml`'s path, and `--check`, and
 /// every other word, untouched.
 #[derive(Default)]
 struct Split {
@@ -373,7 +366,6 @@ struct Split {
     mode: Option<OsString>,
     config: Option<PathBuf>,
     check: bool,
-    labels: Vec<OsString>,
     rest: Vec<OsString>,
 }
 
@@ -422,8 +414,6 @@ fn split(args: &[OsString]) -> Result<Split, clap::Error> {
             out.mode = Some(value);
         } else if let Some(value) = value_of("config", text, &mut words)? {
             out.config = Some(PathBuf::from(value));
-        } else if let Some(value) = value_of("label", text, &mut words)? {
-            out.labels.push(value);
         } else {
             out.rest.push(arg.clone());
         }
@@ -528,7 +518,7 @@ fn parse_words(
     args: Vec<OsString>,
     default_config: Option<&std::path::Path>,
 ) -> Result<Parsed, clap::Error> {
-    let mut split = split(&args)?;
+    let split = split(&args)?;
     let mut named = named_mode(&split, &args)?;
     let flag_named = named.is_some();
     let path = split
@@ -561,8 +551,8 @@ fn parse_words(
     // A start that gives no flag of its mode reads the host's file; one whose file is not
     // there is refused by that start, naming the file, not by a list of missing flags. A
     // file that exists and has none of enrollment's tables is the mode's flags alone.
-    // The old alias word with no `--config` and no `--check` (a `--label` is a flag of the
-    // old start) is the old start and wants its flags.
+    // The old alias word with no `--config` and no `--check` is the old start and wants
+    // its flags.
     let bare_alias = split.alias.is_some() && split.config.is_none() && !split.check;
     if split.rest.is_empty()
         && !bare_alias
@@ -576,11 +566,6 @@ fn parse_words(
                 mode: Some(mode.name),
                 config: path.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH)),
                 check: split.check,
-                labels: split
-                    .labels
-                    .iter()
-                    .map(|l| l.to_string_lossy().into_owned())
-                    .collect(),
             })),
             check: false,
         });
@@ -598,12 +583,8 @@ fn parse_words(
             path.display()
         );
     }
-    // The mode's own flags: its subcommand word, the labels the split took out put back.
-    let labels = split.labels.drain(..).map(|mut l| {
-        let mut flag = OsString::from("--label=");
-        flag.push(std::mem::take(&mut l));
-        flag
-    });
+    // The mode's own flags: its subcommand word. A `--label` is not taken out any more: it
+    // stays in `rest`, and the mode refuses it as the unknown flag it is.
     let config = path.as_ref().map(|path| {
         let mut flag = OsString::from("--config=");
         flag.push(path);
@@ -613,7 +594,6 @@ fn parse_words(
         .into_iter()
         .chain(config)
         .chain(split.check.then(|| OsString::from("--check")))
-        .chain(labels)
         .chain(split.rest)
         .collect();
     let check = split.check;

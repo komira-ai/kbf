@@ -65,8 +65,8 @@ use crate::{Invocation, names, parse_with, preflight};
 /// machine that slept) is noticed within this.
 const NAP_MAX_S: u64 = 3600;
 
-/// A start that reads `kbf.toml`: the words `kbf --mode=<mode> --config FILE`, `--check`
-/// and `--label` mean ([`crate::parse_from`] makes it from a command line that carries no
+/// A start that reads `kbf.toml`: the words `kbf --mode=<mode> --config FILE`, and
+/// `--check` mean ([`crate::parse_from`] makes it from a command line that carries no
 /// other flag of a mode).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Start {
@@ -76,8 +76,6 @@ pub struct Start {
     pub config: PathBuf,
     /// Check the host and exit, starting and enrolling nothing.
     pub check: bool,
-    /// Labels the daemon half reports to the frontend (`--label`, repeatable), `key=value`.
-    pub labels: Vec<String>,
 }
 
 /// How the daemon half runs its leases on this platform.
@@ -172,7 +170,6 @@ fn daemon_flags(
     stored: &StoredConfig,
     store: &Store,
     driver: Driver,
-    labels: &[String],
     with_cas: bool,
 ) -> Vec<OsString> {
     let mut out = vec![
@@ -197,7 +194,6 @@ fn daemon_flags(
     if let Some(cpus) = config.reserve_cpus {
         out.push(flag("reserve-cpus", cpus.to_string()));
     }
-    out.extend(labels.iter().map(|label| flag("label", label)));
     out
 }
 
@@ -211,7 +207,6 @@ pub fn plan(
     node: &Enrolled,
     store: &Store,
     driver: Driver,
-    labels: &[String],
     want: Want,
 ) -> Result<Vec<OsString>, Failure> {
     let (mode, roles) = (want.mode, want.roles);
@@ -225,9 +220,7 @@ pub fn plan(
     }
     if roles.contains(Role::Daemon) {
         let with_cas = !roles.contains(Role::Storage);
-        argv.extend(daemon_flags(
-            config, stored, store, driver, labels, with_cas,
-        ));
+        argv.extend(daemon_flags(config, stored, store, driver, with_cas));
     }
     Ok(argv)
 }
@@ -462,7 +455,6 @@ fn check(
     want: Want,
     env: &Env,
     driver: Driver,
-    labels: &[String],
 ) -> Result<ExitCode, Failure> {
     crate::check_settings(want.mode, path).map_err(Failure::Settings)?;
     let Some(node) = enrolled(loaded, want)? else {
@@ -480,7 +472,7 @@ fn check(
         );
         return Ok(ExitCode::SUCCESS);
     };
-    let argv = plan(&loaded.config, &node, &loaded.store, driver, labels, want)?;
+    let argv = plan(&loaded.config, &node, &loaded.store, driver, want)?;
     let invocation = parse_planned(argv, path).map_err(Failure::Mode)?;
     println!(
         "kbf: --check: mode {} is configured and this node is enrolled as {}",
@@ -516,7 +508,7 @@ pub fn run_with(
         eprintln!("kbf: {note}");
     }
     if args.check {
-        return check(&loaded, &args.config, want, env, driver, &args.labels);
+        return check(&loaded, &args.config, want, env, driver);
     }
     // Before the token is spent: a table that is no setting of the mode would be found
     // only after the node had enrolled.
@@ -529,14 +521,7 @@ pub fn run_with(
              build does not, and the object-store client uses the credentials of this process"
         );
     }
-    let argv = plan(
-        &loaded.config,
-        &node,
-        &loaded.store,
-        driver,
-        &args.labels,
-        want,
-    )?;
+    let argv = plan(&loaded.config, &node, &loaded.store, driver, want)?;
     let invocation = parse_planned(argv, &args.config).map_err(Failure::Mode)?;
 
     let renewer = Renewer::new(&loaded, &node, env, jitter());

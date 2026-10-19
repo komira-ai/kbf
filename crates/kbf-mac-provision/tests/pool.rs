@@ -347,7 +347,7 @@ fn setting_daemon_user_root_on_a_role_mac_moves_the_daemon_to_root() {
     mac.chmod(SCRATCH, 0o755);
     add_to_profile(&mut mac, "daemon_user=root\n");
     mac.write(PLIST, &golden_plist(&sha256_hex(old.as_bytes())[..12]));
-    mac.write(CONFIG, &golden_config(&sha256_hex(old.as_bytes())[..12]));
+    mac.write(CONFIG, &golden_config());
     let failed: Vec<String> = lines(&check(&mac), "FAIL")
         .iter()
         .map(|l| l.split(':').next().unwrap().to_owned())
@@ -360,7 +360,8 @@ fn setting_daemon_user_root_on_a_role_mac_moves_the_daemon_to_root() {
         [
             "CHANGE daemon_user: /usr/local/kbf/etc/node.key root's, mode 600",
             "CHANGE daemon_user: /Volumes/kbf/data root's, mode 755",
-            "CHANGE launchd_label: wrote /usr/local/etc/kbf/kbf.toml, root's, mode 644",
+            // The kbf.toml is the same file under both profiles: it no longer carries the
+            // profile's SHA-256 (the node label is gone), so it is not rewritten.
             "CHANGE launchd_label: wrote /Library/LaunchDaemons/org.example.kbf-daemon.plist and restarted the job (error log truncated)",
         ]
     );

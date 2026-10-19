@@ -124,8 +124,8 @@ fn the_overlay_is_written_with_the_marker_and_every_value_and_then_left_alone() 
         "  instance_name = main",
         "  tls = false",
         "  execution_concurrency_limit = 8",
-        "  linux_x86_64_properties = OSFamily=Linux,label.pool=linux",
-        "  darwin_arm64_properties = OSFamily=Darwin,label.pool=mac",
+        "  linux_x86_64_properties = OSFamily=Linux",
+        "  darwin_arm64_properties = OSFamily=Darwin",
         "  darwin_macos_hosts = 26.0-0123456789abcdef",
     ] {
         assert!(text.lines().any(|l| l == line), "{line} in\n{text}");
@@ -284,27 +284,27 @@ fn a_main_checkout_a_non_checkout_or_an_unignored_overlay_is_refused() {
 }
 
 /// Catches a property set kbf would not route as meant written to the overlay: no
-/// OSFamily (it matches every node), two, another OS's, a malformed pair, a darwin
-/// label no daemon carries, the two sets the same, and a value the overlay cannot
+/// OSFamily (it matches every node), two, another OS's, a malformed pair, a
+/// `label.<k>` in either set, the two sets the same, and a value the overlay cannot
 /// carry; and a check that refuses the spellings kbf takes.
 #[test]
 fn each_bad_property_set_is_refused() {
     type Plant = fn(&mut OverlaySettings);
-    let cases: [(Plant, &str); 10] = [
+    let cases: [(Plant, &str); 11] = [
         (
             |s| s.linux_properties = "label.pool=linux".into(),
-            "KBF_LINUX_PROPERTIES (label.pool=linux) names no OSFamily: kbf ignores names it does not know, so it would match every node. Add OSFamily=Linux",
+            "KBF_LINUX_PROPERTIES (label.pool=linux) names no OSFamily, so kbf would place it on its default platform, not on this OS. Add OSFamily=Linux",
         ),
         (
             |s| s.darwin_properties = "pool=mac".into(),
-            "KBF_DARWIN_PROPERTIES (pool=mac) names no OSFamily: kbf ignores names it does not know, so it would match every node. Add OSFamily=Darwin",
+            "KBF_DARWIN_PROPERTIES (pool=mac) names no OSFamily, so kbf would place it on its default platform, not on this OS. Add OSFamily=Darwin",
         ),
         (
             |s| s.linux_properties = "OSFamily=Linux,osfamily=linux".into(),
             "KBF_LINUX_PROPERTIES names OSFamily 2 times (OSFamily=Linux,osfamily=linux); kbf refuses that",
         ),
         (
-            |s| s.linux_properties = "OSFamily=Darwin".into(),
+            |s| s.linux_properties = "OSFamily=Darwin,ISA=x86-64".into(),
             "KBF_LINUX_PROPERTIES: OSFamily=Darwin does not name linux",
         ),
         (
@@ -321,7 +321,11 @@ fn each_bad_property_set_is_refused() {
         ),
         (
             |s| s.darwin_properties = "OSFamily=Darwin,label.pool=big".into(),
-            "KBF_DARWIN_PROPERTIES asks for label.pool=big, but no daemon carries --label pool=big (KBF_DARWIN_LABELS=pool=mac)",
+            "KBF_DARWIN_PROPERTIES holds label.pool=big: node labels are removed, so kbf refuses a label.<k> property; name OSFamily, ISA or Arch",
+        ),
+        (
+            |s| s.linux_properties = "OSFamily=Linux,LABEL.rack=r1".into(),
+            "KBF_LINUX_PROPERTIES holds LABEL.rack=r1: node labels are removed, so kbf refuses a label.<k> property; name OSFamily, ISA or Arch",
         ),
         (
             |s| s.darwin_properties = s.linux_properties.clone(),
@@ -349,16 +353,10 @@ fn each_bad_property_set_is_refused() {
         );
     }
     assert!(routes_to(Os::Linux, "OSFAMILY=LINUX,ISA=x86-64").is_ok());
-    assert!(
-        labels_carried(
-            "OSFamily=Darwin,LABEL.pool=mac,label.x=1",
-            "a=b,pool=mac,x=1"
-        )
-        .is_ok()
-    );
     let bad = ["=x", "x=", "a=b=c", "a b=c"];
     for pair in bad {
         assert!(pair_of("K", pair).is_err(), "{pair}");
     }
-    assert!(labels_carried("pool", "").is_err());
+    assert!(no_labels("K", "pool").is_err());
+    assert!(no_labels("K", "OSFamily=Darwin,isa=arm64").is_ok());
 }

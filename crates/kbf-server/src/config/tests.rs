@@ -174,6 +174,42 @@ fn cpu_threads_reaches_the_hashing_pool() {
     }
 }
 
+/// Catches: `--default-platform` not reaching the listeners, a default other than
+/// linux/x86_64 (the farm's Mac would take actions that name nothing again), `none` not
+/// turning it off, and a value that is no `<os>/<arch>` (a typo) accepted at start.
+#[test]
+fn default_platform_reaches_the_listeners() {
+    let platform = |args: &[&str]| {
+        Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+            .map(|a| a.listeners().expect("listeners").default_platform)
+    };
+    assert_eq!(
+        platform(&[]).expect("parses"),
+        Some(kbf_caps::DefaultPlatform::LINUX_X86_64)
+    );
+    assert_eq!(
+        platform(&["--default-platform=none"]).expect("parses"),
+        None
+    );
+    let mac = platform(&["--default-platform", "macos/arm64"])
+        .expect("parses")
+        .expect("a platform");
+    assert_eq!((mac.os(), mac.arch().name()), ("macos", "arm64"));
+    for bad in [
+        "",
+        "linux",
+        "linux/",
+        "windows/x86_64",
+        "linux/amd64",
+        "None",
+    ] {
+        assert!(
+            platform(&[&format!("--default-platform={bad}")]).is_err(),
+            "{bad:?} accepted"
+        );
+    }
+}
+
 /// Catches a `--segment-upload-*` flag that does not reach the listeners, a default
 /// other than the design's (33 MiB, 60 s), and a cap below it accepted (a daemon's
 /// upload of small files would be refused for good).

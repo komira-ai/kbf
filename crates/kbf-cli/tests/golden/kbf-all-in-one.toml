@@ -96,8 +96,6 @@ invocations-open = false
 # cert = "CERT"
 # PEM file of this daemon's private key
 # key = "KEY"
-# A node label, `key=value`, reported as `label.<key>` for operators to read; repeatable. Report-only: no request selects on a label (a request naming `label.<key>`, or `pool`, is refused), so placement never follows it. A node is placed by what it detects (`os`, `arch`, ...)
-# label = []
 # A stable name for this node, unique within the cell
 # node-id = "NODE_ID"
 # A kbf-server worker listener to connect to, as an `https://host:port` URL; repeatable, or several separated by commas. The host may be a DNS name with a record per server: every round of attempts resolves it again and tries each address. The daemon never stops trying (see `--reconnect-max-ms`)
@@ -182,6 +180,8 @@ segment-upload-streams = 16
 segment-uploads-in-flight = 4
 
 [scheduler]
+# The platform, `<os>/<arch>`, of an Execute whose action names no OS, no architecture and no ISA level (`OSFamily`, `ISA`, `Arch`, `os`, `arch`, `isa_level`) and no `xcode` or `ios.device*`: without it, such an action matches any worker, a Mac among them. `linux/x86_64` unless `none`, which keeps that. A request that names one of those is never completed (`OSFamily=Darwin` alone stays any Mac). The action, and so its digest, is not changed; each application is logged
+default-platform = "linux/x86_64"
 # How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND. Every operation finished within it is held in memory
 finished-retention-secs = 60
 # The heartbeat interval daemons are asked for, in milliseconds, at most half the window in which a daemon may act on a `Start` (each `Start` names the newest heartbeat the server took, so a longer interval would leave it too little)

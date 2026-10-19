@@ -146,7 +146,6 @@ impl Harness {
             mode,
             config: self.config_path(),
             check: false,
-            labels: Vec::new(),
         }
     }
 
@@ -620,34 +619,23 @@ async fn a_setting_for_a_role_the_node_does_not_hold_is_a_warning_not_a_refusal(
     assert_eq!(launches.seen(), [names::DAEMON]);
 }
 
-/// Catches a mode that refuses the flags the start built (here a label the daemon does not
-/// accept) starting anyway, or being reported as anything but a usage error: the node is
-/// enrolled, the mode's own parser says what it refused, and nothing runs.
+/// Catches a `kbf.toml` that still carries `label` (the node labels are removed) being
+/// accepted and its entries dropped: the start is refused with exit 2 naming the key,
+/// before the token is spent, and starts nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_label_the_mode_refuses_stops_the_start() {
+async fn a_label_in_kbf_toml_stops_the_start_before_enrolling() {
     let h = Harness::new("node-bad-label");
-    h.ready("[daemon]\n");
+    h.ready("[identity]\nlabel = [\"pool=mac\"]\n\n[daemon]\n");
     let launches = Arc::new(Launches::default());
-    let (node, env) = (
-        Start {
-            labels: vec!["no-equals-sign".to_owned()],
-            ..h.start_of(Some(names::DAEMON))
-        },
-        h.env(),
-    );
-
-    let failure = tokio::task::spawn_blocking(move || {
-        run_with(&node, &env, Driver::Container, &|_| ExitCode::SUCCESS)
-    })
-    .await
-    .expect("no panic")
-    .expect_err("refused");
-
-    assert!(matches!(failure, Failure::Mode(_)), "{failure:?}");
+    let failure = start(&h, &launches, || {}).await.expect_err("refused");
+    assert!(matches!(failure, Failure::Settings(_)), "{failure:?}");
     assert_eq!(failure.exit_code(), 2);
-    assert!(failure.to_string().contains("--label"), "{failure}");
+    assert!(failure.to_string().contains("label"), "{failure}");
     assert!(launches.seen().is_empty());
-    assert!(h.node_json().contains("node-02"), "enrolled all the same");
+    assert!(
+        !h.state().join("pki/node.json").exists(),
+        "the token was spent"
+    );
 }
 
 /// An enrolled node and a renewer for it, with the clock at the fake's.

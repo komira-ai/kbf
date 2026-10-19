@@ -433,21 +433,21 @@ fn a_stale_refusal_is_dropped() {
 }
 
 /// Catches: capabilities read only at registration, so a node whose report changes
-/// (a label added) keeps being matched on its old report.
+/// (a `cpu.model` added) keeps being matched on its old report.
 #[test]
 fn a_resent_report_changes_what_the_worker_matches() {
     let mut h = Harness::new();
     h.worker("mac", mac());
-    h.submit(1, request(1, &[("label.pool", "darwin")]));
+    h.submit(1, request(1, &[("cpu.model", "darwin")]));
     assert_eq!(h.tick().len(), 1, "waits with a reason");
-    let labelled =
-        NodeCaps::from_report([("arch", "arm64"), ("os", "macos"), ("label.pool", "darwin")])
+    let relabelled =
+        NodeCaps::from_report([("arch", "arm64"), ("os", "macos"), ("cpu.model", "darwin")])
             .unwrap()
             .with_drivers(["native"]);
     let resend = Event::Capacity {
         worker: w("mac"),
         capacity: Resources::new(4_000, 8 * GIB),
-        caps: labelled,
+        caps: relabelled,
     };
     assert!(h.feed(resend).is_empty());
     let (grants, rest) = h.grants();

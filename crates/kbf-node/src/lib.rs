@@ -21,8 +21,8 @@
 //!   --data-dir /var/kbf
 //! ```
 //!
-//! Which actions the Mac takes follows from what it detects (`os`, `arch`, ...), not from
-//! a label: `--label` is reported for operators and never matched by a request.
+//! Which actions the Mac takes follows from what it detects (`os`, `arch`, ...). The node
+//! has no labels: `--label` is gone, and a daemon started with it does not start.
 //!
 //! Exits non-zero when the node cannot be detected or the configuration cannot be
 //! loaded; otherwise runs until SIGTERM or SIGINT, then drains: it takes no new lease,
@@ -748,7 +748,7 @@ impl<C: Cas> Node<C> {
 /// configuration `native` makes and the `xcrun` it surveys with and
 /// warms (a test names its own user folders and sandbox, and an `xcrun` of its own).
 /// Also returns what the native driver's Xcode watch sends the daemon, for a test to
-/// follow. Its node report is the detected entries, the labels and a `drivers` entry
+/// follow. Its node report is the detected entries and a `drivers` entry
 /// per runtime (which `Daemon::new` adds), its `cpus` and `mem_gib` no more than the
 /// container driver allows; the native driver adds its own with
 /// `Daemon::with_driver_report`. Its status lists every `--image`, which only the
@@ -804,10 +804,7 @@ fn node_over<C: Cas>(
     let leases = sizes(cli)?.lease_cpus() as u64;
     node.capacity.cpus = Some(node.capacity.cpus.map_or(leases, |cpus| cpus.min(leases)));
     // `Daemon::new` adds every runtime's driver.
-    let report = offered(
-        NodeReport::detect(&[])?.with_entries(cli.daemon.label_entries()),
-        node.capacity,
-    );
+    let report = offered(NodeReport::detect(&[])?, node.capacity);
     // A node without the whole-machine runtime is always serving: a phase that never
     // changes.
     let phase = node

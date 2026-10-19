@@ -104,19 +104,17 @@ fn state(c: &Case, rest: &str) -> String {
 /// Catches a daemon-only node started with anything but the flags a `kbf daemon` unit
 /// carries (the server and the blob endpoint from the frontend, the three certificate
 /// files of the daemon role, the node id, the data directory), a `--cas` that is not the
-/// worker endpoint when the frontend names none, or labels and the CPU reserve dropped.
+/// worker endpoint when the frontend names none, or the CPU reserve dropped.
 #[test]
 fn a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints() {
     let c = case("daemon");
     let config = config(&c.root, "[daemon]\nreserve_cpus = 2\n");
     let node = enrolled(&["daemon"], sent(&["daemon"]));
-    let labels = ["pool=mac".to_owned(), "rack=r2".to_owned()];
     let argv = plan(
         &config,
         &node,
         &c.store,
         Driver::Native,
-        &labels,
         want(names::DAEMON),
     )
     .expect("a plan");
@@ -134,8 +132,6 @@ fn a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints() {
             "--node-id=node-02".to_owned(),
             format!("--data-dir={}", state(&c, "data")),
             "--reserve-cpus=2".to_owned(),
-            "--label=pool=mac".to_owned(),
-            "--label=rack=r2".to_owned(),
         ]
     );
     assert!(matches!(parse_from(argv), Ok(Invocation::Daemon(_))));
@@ -148,7 +144,6 @@ fn a_daemon_only_node_runs_kbf_daemon_with_the_frontends_endpoints() {
         &node,
         &c.store,
         Driver::Container,
-        &[],
         want(names::DAEMON),
     )
     .expect("a plan");
@@ -171,7 +166,6 @@ fn a_storage_only_node_runs_kbf_storage_registered_with_the_frontend() {
         &node,
         &c.store,
         Driver::Container,
-        &[],
         want(names::STORAGE),
     )
     .expect("a plan");
@@ -200,7 +194,6 @@ fn a_storage_only_node_runs_kbf_storage_registered_with_the_frontend() {
         &node,
         &c.store,
         Driver::Container,
-        &[],
         want(names::STORAGE),
     )
     .expect("a plan");
@@ -232,7 +225,6 @@ fn a_node_with_both_roles_runs_the_converged_mode() {
         &node,
         &c.store,
         Driver::Container,
-        &[],
         want(names::STORAGE_AND_DAEMON),
     )
     .expect("a plan");
@@ -261,7 +253,7 @@ fn a_configuration_the_node_cannot_run_is_refused_by_name() {
     let config = config(&c.root, "");
     let refuse = |mode: &str, held: &[&str], stored: StoredConfig| {
         let node = enrolled(held, stored);
-        match plan(&config, &node, &c.store, Driver::Container, &[], want(mode)) {
+        match plan(&config, &node, &c.store, Driver::Container, want(mode)) {
             Err(Failure::Plan(message)) => message,
             other => panic!("planned: {other:?}"),
         }

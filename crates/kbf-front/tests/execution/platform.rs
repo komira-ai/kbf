@@ -514,6 +514,38 @@ async fn a_property_kbf_does_not_read_is_refused_naming_it() {
             vec![("dockerNetwork", "off")],
             "\"dockerNetwork\"",
         ),
+        // Near misses of the one name that passes unread: only `container-image`, exactly,
+        // does. A prefix test (`starts_with`), a trim, or a case fold would let these in.
+        (
+            "container-image with a suffix letter",
+            vec![("container-images", "docker://img@sha256:00")],
+            "\"container-images\"",
+        ),
+        (
+            "container-image with a trailing space",
+            vec![("container-image ", "docker://img@sha256:00")],
+            "\"container-image \"",
+        ),
+        (
+            "container-image in capitals",
+            vec![("CONTAINER-IMAGE", "docker://img@sha256:00")],
+            "\"CONTAINER-IMAGE\"",
+        ),
+        (
+            "container-image with a suffix",
+            vec![("container-image-x", "docker://img@sha256:00")],
+            "\"container-image-x\"",
+        ),
+        (
+            "container-image with a leading space",
+            vec![(" container-image", "docker://img@sha256:00")],
+            "\" container-image\"",
+        ),
+        (
+            "a prefix of container-image",
+            vec![("container-imag", "docker://img@sha256:00")],
+            "\"container-imag\"",
+        ),
     ] {
         let bad = job(why, &props, false);
         farm.upload(&bad.blobs.iter().collect::<Vec<_>>()).await;
@@ -568,4 +600,400 @@ async fn a_mac_action_is_never_placeable_on_a_linux_node() {
     for (os, arch) in [("linux", "arm64"), ("linux", "x86_64"), ("macos", "x86_64")] {
         assert!(!needs.matches(&node(os, arch)), "placeable on {os}/{arch}");
     }
+}
+
+/// An Action whose platform is `props`, with no Command or input tree uploaded, as the
+/// bare blob `Blob`s of an Action: the Command and the input root it names are absent.
+fn action_with_nothing_else(argv: &str, props: &[(&str, &str)]) -> Blob {
+    let command = Blob::of(&Command {
+        arguments: vec![argv.to_owned()],
+        ..Default::default()
+    });
+    let root = Blob::of(&Directory::default());
+    Blob::of(&Action {
+        command_digest: Some(command.proto.clone()),
+        input_root_digest: Some(root.proto.clone()),
+        platform: Some(Platform {
+            properties: props.iter().map(|(n, v)| property(n, v)).collect(),
+        }),
+        ..Default::default()
+    })
+}
+
+/// Catches: a bad platform found only after the inputs are read, so a bad key beside
+/// missing blobs is FAILED_PRECONDITION (MISSING, which a client answers by uploading and
+/// retrying, and fails again) instead of INVALID_ARGUMENT. Only the Action is uploaded
+/// here: the Command and the input root it names are absent, so a refusal after reading
+/// them would be MISSING. A Command-level platform is read with the Command, so it is
+/// refused before the input tree is walked (the root is absent here); when the Command
+/// itself is absent nothing can be known, and the call is MISSING as it always was.
+#[tokio::test]
+async fn a_bad_platform_is_refused_before_the_inputs_are_read() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+
+    let in_action = action_with_nothing_else("bad action platform", &[("pool", "darwin-sized")]);
+    farm.upload(&[&in_action]).await;
+    let status = start(&farm, &in_action).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(status.message().contains("\"pool\""), "{status:?}");
+
+    // The same, a Command-level platform: the Command is uploaded, the input root is not.
+    #[allow(deprecated)]
+    let command = Blob::of(&Command {
+        arguments: vec!["bad command platform".to_owned()],
+        platform: Some(Platform {
+            properties: vec![property("label.pool", "darwin")],
+        }),
+        ..Default::default()
+    });
+    let root = Blob::of(&Directory::default());
+    let in_command = Blob::of(&Action {
+        command_digest: Some(command.proto.clone()),
+        input_root_digest: Some(root.proto.clone()),
+        ..Default::default()
+    });
+    farm.upload(&[&in_command, &command]).await;
+    let status = start(&farm, &in_command).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(status.message().contains("\"label.pool\""), "{status:?}");
+
+    // A good platform with the same blobs missing is still MISSING: the check does not
+    // refuse what it should not.
+    let fine = action_with_nothing_else("fine", &[("OSFamily", "linux")]);
+    farm.upload(&[&fine]).await;
+    let status = start(&farm, &fine).await.expect_err("inputs missing");
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    assert!(script.submitted().is_empty());
+}
+
+/// Catches: a cached result answered for an action whose platform kbf refuses (a mistyped
+/// `pool=` would be quiet exactly when the action was run before), a Command-level
+/// platform not looked at, and the opposite: a refusal for an action whose platform is
+/// fine, one the CAS does not hold, or `GetActionResult` (a plain cache read) refusing.
+#[tokio::test]
+async fn a_cached_result_does_not_excuse_a_refused_platform() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let result = ActionResult::default();
+
+    // Cached, platform refused: INVALID_ARGUMENT, not the result.
+    let bad = job("cached bad", &[("pool", "darwin-sized")], false);
+    farm.upload(&bad.blobs.iter().collect::<Vec<_>>()).await;
+    farm.cache
+        .write_action_result(Role::Daemon, bad.action.digest, &result)
+        .await
+        .expect("write");
+    let status = start(&farm, &bad.action).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(status.message().contains("\"pool\""), "{status:?}");
+
+    // The Command's platform is looked at when the Action carries none.
+    #[allow(deprecated)]
+    let command = Blob::of(&Command {
+        arguments: vec!["cached bad command platform".to_owned()],
+        platform: Some(Platform {
+            properties: vec![property("Pool", "x")],
+        }),
+        ..Default::default()
+    });
+    let in_command = Blob::of(&Action {
+        command_digest: Some(command.proto.clone()),
+        input_root_digest: Some(Blob::of(&Directory::default()).proto),
+        ..Default::default()
+    });
+    farm.upload(&[&in_command, &command]).await;
+    farm.cache
+        .write_action_result(Role::Daemon, in_command.digest, &result)
+        .await
+        .expect("write");
+    let status = start(&farm, &in_command).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(status.message().contains("\"Pool\""), "{status:?}");
+
+    // Cached, platform fine: answered from the cache, as before.
+    let fine = job("cached fine", &[("OSFamily", "linux")], false);
+    farm.upload(&fine.blobs.iter().collect::<Vec<_>>()).await;
+    farm.cache
+        .write_action_result(Role::Daemon, fine.action.digest, &result)
+        .await
+        .expect("write");
+    let mut ops = start(&farm, &fine.action).await.expect("a hit");
+    let only = next(&mut ops).await.expect("healthy").expect("an update");
+    assert!(response(&only).cached_result);
+
+    // Cached, the action not in the CAS: nothing to check, answered from the cache.
+    let gone = job("cached, action not held", &[("pool", "x")], false);
+    farm.cache
+        .write_action_result(Role::Daemon, gone.action.digest, &result)
+        .await
+        .expect("write");
+    let mut ops = start(&farm, &gone.action).await.expect("a hit");
+    let only = next(&mut ops).await.expect("healthy").expect("an update");
+    assert!(response(&only).cached_result);
+
+    // GetActionResult is a plain cache read: it answers the refused action's result.
+    let got = farm
+        .ac()
+        .get_action_result(kbf_proto::reapi::GetActionResultRequest {
+            action_digest: Some(bad.action.proto.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("a plain cache read answers")
+        .into_inner();
+    assert_eq!(got, result);
+    assert!(script.submitted().is_empty(), "a hit was submitted");
+}
+
+/// The default platform used by these tests, and the nodes they are placed against.
+fn default_farm_defaults(
+    platform: Option<kbf_caps::DefaultPlatform>,
+) -> kbf_front::ExecutionDefaults {
+    kbf_front::ExecutionDefaults {
+        platform,
+        ..kbf_front::ExecutionDefaults::default()
+    }
+}
+
+fn node(os: &str, arch: &str) -> kbf_caps::NodeCaps {
+    kbf_caps::NodeCaps::from_report([("os", os), ("arch", arch)]).expect("a node report")
+}
+
+/// Which of the four nodes of the farm the submitted request of job `n` can be placed on,
+/// named `<os>/<arch>`.
+fn placeable(script: &Script, n: usize) -> Vec<&'static str> {
+    let needs = script.submitted()[n].request.needs.clone();
+    [
+        ("mac-a", "macos", "arm64"),
+        ("mac-intel", "macos", "x86_64"),
+        ("linux-arm", "linux", "arm64"),
+        ("linux-x86", "linux", "x86_64"),
+    ]
+    .into_iter()
+    .filter(|(_, os, arch)| needs.matches(&node(os, arch)))
+    .map(|(name, ..)| name)
+    .collect()
+}
+
+/// Catches: an action that names no platform placeable on a Mac (today the first node by
+/// name, `mac-a`, takes it), the default applied to a request that names an OS, an
+/// architecture, an ISA level, an Xcode or an iOS device (a half-named pair completed, a
+/// Mac request turned into a Linux one), `none` not turning it off, the default changing
+/// the action digest, and a platform kbf refuses defaulted instead of refused.
+#[tokio::test]
+async fn an_action_that_names_no_platform_is_placed_on_the_default() {
+    let script = Arc::new(Script::default());
+    let linux_x86 = Some(kbf_caps::DefaultPlatform::LINUX_X86_64);
+    let farm = Farm::with_defaults(Arc::clone(&script), default_farm_defaults(linux_x86)).await;
+    let mut jobs = Vec::new();
+    for (why, props) in [
+        ("empty", vec![]),
+        ("only a booking", vec![("kbf-book-cpus", "2")]),
+        (
+            "container-image alone",
+            vec![("container-image", "docker://img@sha256:00")],
+        ),
+        ("darwin alone", vec![("OSFamily", "Darwin")]),
+        ("linux alone", vec![("OSFamily", "linux")]),
+        ("arm64 alone", vec![("ISA", "arm64")]),
+        ("amd64 alone", vec![("Arch", "amd64")]),
+        ("isa level alone", vec![("isa_level", "x86-64-v3")]),
+        ("xcode alone", vec![("xcode", "16C5032a")]),
+        ("a device alone", vec![("ios.device", "1")]),
+        (
+            "a mac request",
+            vec![("OSFamily", "Darwin"), ("ISA", "arm64")],
+        ),
+    ] {
+        let job = job(why, &props, false);
+        farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &job.action).await.expect(why);
+        jobs.push((why, job));
+    }
+    let submitted = script.submitted();
+    for (n, (why, job)) in jobs.iter().enumerate() {
+        assert_eq!(
+            submitted[n].request.key.action, job.action.digest,
+            "{why}: digest"
+        );
+    }
+    let on = |n| placeable(&script, n);
+    assert_eq!(
+        on(0),
+        ["linux-x86"],
+        "empty: only a linux/x86_64 node, never mac-a"
+    );
+    assert_eq!(on(1), ["linux-x86"], "a booking alone names no platform");
+    assert_eq!(
+        on(2),
+        ["linux-x86"],
+        "container-image alone names no platform"
+    );
+    assert_eq!(
+        on(3),
+        ["mac-a", "mac-intel"],
+        "OSFamily=Darwin alone is not completed"
+    );
+    assert_eq!(
+        on(4),
+        ["linux-arm", "linux-x86"],
+        "OSFamily=linux alone is not completed"
+    );
+    assert_eq!(
+        on(5),
+        ["mac-a", "linux-arm"],
+        "ISA=arm64 alone is not completed"
+    );
+    assert_eq!(
+        on(6),
+        ["mac-intel", "linux-x86"],
+        "Arch=amd64 alone is not completed"
+    );
+    assert!(
+        !on(7).contains(&"mac-a"),
+        "an isa level alone is not completed: {:?}",
+        on(7)
+    );
+    assert!(
+        submitted[7].request.needs.exact("os").is_none(),
+        "an isa level alone got an os"
+    );
+    assert!(
+        submitted[8].request.needs.exact("os").is_none(),
+        "xcode alone got an os"
+    );
+    assert!(submitted[9].request.needs.wants_device());
+    assert!(
+        submitted[9].request.needs.exact("os").is_none(),
+        "a device alone got an os"
+    );
+    assert_eq!(on(10), ["mac-a"]);
+
+    // A platform kbf refuses is refused, never defaulted.
+    let bad = job("pool", &[("pool", "x")], false);
+    farm.upload(&bad.blobs.iter().collect::<Vec<_>>()).await;
+    let status = start(&farm, &bad.action).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert_eq!(script.submitted().len(), jobs.len());
+
+    // `none`: today's behaviour, an empty platform matches every node.
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_defaults(Arc::clone(&script), default_farm_defaults(None)).await;
+    let empty = job("none: empty", &[], false);
+    farm.upload(&empty.blobs.iter().collect::<Vec<_>>()).await;
+    start(&farm, &empty.action).await.expect("Execute");
+    assert_eq!(
+        script.submitted()[0].request.needs,
+        kbf_caps::Request::default()
+    );
+    assert_eq!(
+        placeable(&script, 0),
+        ["mac-a", "mac-intel", "linux-arm", "linux-x86"]
+    );
+
+    // Another default: macos/arm64.
+    let script = Arc::new(Script::default());
+    let mac = Some("macos/arm64".parse().expect("a platform"));
+    let farm = Farm::with_defaults(Arc::clone(&script), default_farm_defaults(mac)).await;
+    farm.upload(&empty.blobs.iter().collect::<Vec<_>>()).await;
+    start(&farm, &empty.action).await.expect("Execute");
+    assert_eq!(placeable(&script, 0), ["mac-a"]);
+}
+
+/// Catches: `container-image` on a Mac accepted, so the image is silently unused and the
+/// action runs bare on the Mac; the refusal naming something other than the key and the OS;
+/// a Linux or an unplaced `container-image` refused.
+#[tokio::test]
+async fn container_image_on_a_mac_action_is_refused() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let image = ("container-image", "docker://img@sha256:00");
+    for os in [("OSFamily", "Darwin"), ("os", "macos"), ("osfamily", "osx")] {
+        let bad = job(os.1, &[image, os], false);
+        farm.upload(&bad.blobs.iter().collect::<Vec<_>>()).await;
+        let status = start(&farm, &bad.action).await.expect_err(os.1);
+        assert_eq!(status.code(), Code::InvalidArgument, "{os:?}: {status:?}");
+        let message = status.message();
+        assert!(
+            message.contains("\"container-image\"") && message.contains("\"macos\""),
+            "{os:?}: {message}"
+        );
+    }
+    assert!(script.submitted().is_empty());
+    for (why, props) in [
+        ("linux", vec![image, ("OSFamily", "Linux")]),
+        ("no os", vec![image]),
+    ] {
+        let ok = job(why, &props, false);
+        farm.upload(&ok.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &ok.action).await.expect(why);
+    }
+}
+
+/// The names in the backticks of the bullet list under `### Accepted property names` of
+/// docs/platform-properties.md, `ios.device.<attribute>` expanded, and the text of the
+/// paragraph that begins `Refused:`.
+fn documented_names() -> (std::collections::BTreeSet<String>, String) {
+    let docs = include_str!("../../../../docs/platform-properties.md");
+    let section = docs
+        .split("### Accepted property names")
+        .nth(1)
+        .expect("the section")
+        .split("\n### ")
+        .next()
+        .expect("its end");
+    let mut names = std::collections::BTreeSet::new();
+    let mut refused = String::new();
+    let mut in_refused = false;
+    for line in section.lines() {
+        if line.starts_with("Refused:") {
+            in_refused = true;
+        }
+        if in_refused {
+            refused.push_str(line);
+            refused.push('\n');
+            continue;
+        }
+        if !line.starts_with("- ") && !line.starts_with("  ") {
+            continue;
+        }
+        for (i, token) in line.split('`').enumerate() {
+            if i % 2 == 1 {
+                if token == "ios.device.<attribute>" {
+                    names.extend(
+                        kbf_caps::DEVICE_ATTRIBUTES
+                            .iter()
+                            .map(|a| format!("ios.device.{a}")),
+                    );
+                } else {
+                    names.insert(token.to_owned());
+                }
+            }
+        }
+    }
+    (names, refused)
+}
+
+/// Catches: the list of accepted property names in docs/platform-properties.md drifting
+/// from the code: a name added to (or removed from) what `kbf_caps::property_name` reads
+/// and not the docs, a documented name the front refuses, `container-image` missing, or a
+/// report-only key (`vm.slots`, ...) that the docs do not say is refused.
+#[test]
+fn the_documented_accepted_names_are_the_names_the_code_reads() {
+    let (documented, refused) = documented_names();
+    let mut code: std::collections::BTreeSet<String> =
+        kbf_caps::property_names().into_iter().collect();
+    for report_only in kbf_caps::REPORT_ONLY_KEYS {
+        assert!(code.remove(report_only), "{report_only} not read");
+        assert!(
+            refused.contains(&format!("`{report_only}`")),
+            "{report_only} is not in the Refused paragraph:\n{refused}"
+        );
+    }
+    code.insert("container-image".to_owned());
+    assert_eq!(
+        documented, code,
+        "docs/platform-properties.md (left) and the code (right) list different names"
+    );
 }

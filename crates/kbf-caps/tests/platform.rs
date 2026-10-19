@@ -29,7 +29,7 @@ fn linux_v3() -> NodeCaps {
 
 fn mac() -> NodeCaps {
     let cpu = CpuCaps::from_macos_sysctl(include_str!("fixtures/apple_m3_ultra.sysctl")).unwrap();
-    let mut entries = vec![("arch", "arm64"), ("os", "macos"), ("label.pool", "darwin")];
+    let mut entries = vec![("arch", "arm64"), ("os", "macos")];
     for f in cpu.features() {
         entries.push(("cpu.features", f));
     }
@@ -116,7 +116,6 @@ fn own_keys_pass_through_and_others_are_left_alone() {
         ("os", "linux"),
         ("isa_level", "x86-64-v2"),
         ("cpu.feature", "avx2"),
-        ("label.pool", "big"),
         ("cpus", "4"),
         ("gpu", "1"),
         ("container-image", "docker://img@sha256:00"),
@@ -129,7 +128,6 @@ fn own_keys_pass_through_and_others_are_left_alone() {
             ("os", "linux"),
             ("isa_level", "x86-64-v2"),
             ("cpu.feature", "avx2"),
-            ("label.pool", "big"),
             ("cpus", "4"),
         ]))
     );
@@ -138,8 +136,7 @@ fn own_keys_pass_through_and_others_are_left_alone() {
 
 /// Catches: a property name kbf reads ignored because of its case (`osfamily=darwin`,
 /// `isa=arm-a64`, `OS=macos` dropped as unknown, so the action may run on any worker,
-/// Linux included); a label's own name folded to lower case (labels are compared
-/// exactly); and a property kbf does not read taken as one it does.
+/// Linux included); and a property kbf does not read taken as one it does.
 #[test]
 fn property_names_are_read_in_any_case() {
     for (sent, read) in [
@@ -159,9 +156,6 @@ fn property_names_are_read_in_any_case() {
         ("GPU", "gpu"),
         ("gpu", "gpu"),
         ("KBF-Lease", "kbf-lease"),
-        ("label.pool", "label.pool"),
-        ("Label.Pool", "label.Pool"),
-        ("LABEL.x", "label.x"),
     ] {
         assert_eq!(
             kbf_caps::property_name(sent).as_deref(),
@@ -175,6 +169,8 @@ fn property_names_are_read_in_any_case() {
         "dockerNetwork",
         "LABEL.",
         "label.",
+        "label.pool",
+        "Label.Pool",
         "labels",
         "Label",
         "",
@@ -196,10 +192,6 @@ fn property_names_are_read_in_any_case() {
             vec![("arch", "x86_64"), ("isa_level", "x86-64-v3")],
         ),
         (vec![("OS", "macos")], vec![("os", "macos")]),
-        (
-            vec![("Label.Pool", "darwin")],
-            vec![("label.Pool", "darwin")],
-        ),
         (vec![("CPUS", "4"), ("GPU", "1")], vec![("cpus", "4")]),
     ] {
         assert_eq!(from(&props), Ok(req(&want)), "{props:?}");
@@ -283,7 +275,7 @@ fn a_report_becomes_node_caps() {
     assert_eq!(node.cpu.arch(), Arch::X86_64);
     assert!(node.cpu.has("avx2") && node.cpu.has("sse2"));
     assert_eq!(node.exact.get("os").map(String::as_str), Some("linux"));
-    assert_eq!(node.exact.get("label.rack").map(String::as_str), Some("r1"));
+    assert!(!node.exact.contains_key("label.rack"), "a label is skipped");
     assert!(!node.exact.contains_key("drivers"));
     assert_eq!(node.drivers, ["container".to_owned()].into());
     assert_eq!(node.consumables.get(&Consumable::Gpus), Some(&2));
@@ -424,4 +416,90 @@ fn unmet_requirements_read_as_requests() {
             "gpu>=2 (has 1)"
         ]
     );
+}
+
+/// Catches: the default platform flag accepting text no daemon runs on (a typo would
+/// become a startup-time surprise at run time), `none` read as a platform, the default
+/// not being linux/x86_64, or the text not reading back as printed (the flag is shown in
+/// help and in a config file).
+#[test]
+fn the_default_platform_setting_reads_os_slash_arch_or_none() {
+    use kbf_caps::{DefaultPlatform, DefaultPlatformSetting};
+    assert_eq!(
+        DefaultPlatformSetting::default().0,
+        Some(DefaultPlatform::LINUX_X86_64)
+    );
+    assert_eq!(
+        DefaultPlatformSetting::default().to_string(),
+        "linux/x86_64"
+    );
+    assert_eq!("none".parse(), Ok(DefaultPlatformSetting(None)));
+    assert_eq!(DefaultPlatformSetting(None).to_string(), "none");
+    for (text, os, arch) in [
+        ("linux/x86_64", "linux", Arch::X86_64),
+        ("linux/arm64", "linux", Arch::Arm64),
+        ("macos/arm64", "macos", Arch::Arm64),
+    ] {
+        let parsed: DefaultPlatform = text.parse().expect(text);
+        assert_eq!((parsed.os(), parsed.arch()), (os, arch), "{text}");
+        assert_eq!(parsed.to_string(), text);
+    }
+    for bad in [
+        "",
+        "linux",
+        "linux/",
+        "/x86_64",
+        "Linux/x86_64",
+        "windows/x86_64",
+        "linux/amd64",
+        "linux/x86_64/v3",
+        "None",
+        "none/none",
+        " linux/x86_64",
+    ] {
+        assert!(bad.parse::<DefaultPlatformSetting>().is_err(), "{bad:?}");
+    }
+}
+
+/// Catches: `property_names` (the list the docs are checked against) differing from what
+/// `property_name` reads: a listed name that is not read, one read in a form other than
+/// its own spelling, a repeated name, or a name read in any case that the list lacks.
+#[test]
+fn the_listed_property_names_are_the_ones_property_name_reads() {
+    let names = kbf_caps::property_names();
+    let mut sorted = names.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len(), "a name listed twice: {names:?}");
+    for name in &names {
+        let read = kbf_caps::property_name(name);
+        // `arch` is kbf's own key spelled so; `Arch` (REAPI) is another entry.
+        assert_eq!(read.as_deref(), Some(name.as_str()), "{name}");
+        assert_eq!(
+            kbf_caps::property_name(&name.to_ascii_uppercase()).map(|n| n.to_ascii_lowercase()),
+            Some(name.to_ascii_lowercase()),
+            "{name} in capitals"
+        );
+    }
+    for key in [
+        "OSFamily",
+        "ISA",
+        "Arch",
+        "os",
+        "arch",
+        "kbf-lease",
+        "ios.device",
+    ] {
+        assert!(names.iter().any(|n| n == key), "{key} unlisted");
+    }
+    for unread in [
+        "pool",
+        "label.pool",
+        "container-image",
+        "ios.devices",
+        "kbf-node",
+    ] {
+        assert!(!names.iter().any(|n| n == unread), "{unread} listed");
+        assert_eq!(kbf_caps::property_name(unread), None, "{unread}");
+    }
 }

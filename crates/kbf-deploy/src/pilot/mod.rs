@@ -142,7 +142,7 @@ pub enum PilotError {
         props: String,
     },
     #[error(
-        "{key} ({props}) names no OSFamily: kbf ignores names it does not know, so it would match every node. Add OSFamily={want}"
+        "{key} ({props}) names no OSFamily, so kbf would place it on its default platform, not on this OS. Add OSFamily={want}"
     )]
     NoOsFamily {
         key: &'static str,
@@ -156,13 +156,9 @@ pub enum PilotError {
         os: &'static str,
     },
     #[error(
-        "KBF_DARWIN_PROPERTIES asks for {pair}, but no daemon carries --label {want} (KBF_DARWIN_LABELS={labels})"
+        "{key} holds {pair}: node labels are removed, so kbf refuses a label.<k> property; name OSFamily, ISA or Arch"
     )]
-    LabelNotCarried {
-        pair: String,
-        want: String,
-        labels: String,
-    },
+    LabelRefused { key: &'static str, pair: String },
 }
 
 impl PilotError {

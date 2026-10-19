@@ -44,11 +44,97 @@ pub const DAEMON_OSES: [&str; 2] = ["linux", "macos"];
 /// The property names REAPI standardises that kbf reads, in REAPI's spelling.
 pub const REAPI_KEYS: [&str; 3] = ["OSFamily", "ISA", "Arch"];
 
+/// The platform an action is placed on when it names no OS, no architecture and no ISA
+/// level (the frontend's `--default-platform`): one OS a daemon runs on and one
+/// architecture.
+///
+/// Only BuildBuddy documents such a default among the remote executors, and it is
+/// Linux/amd64; kbf's is the same by default and off with `none`
+/// ([`DefaultPlatformSetting`]). It is applied to the request, never to the action: the
+/// action digest is the client's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefaultPlatform {
+    os: &'static str,
+    arch: Arch,
+}
+
+impl DefaultPlatform {
+    /// `linux/x86_64`, the flag's default.
+    pub const LINUX_X86_64: Self = Self {
+        os: "linux",
+        arch: Arch::X86_64,
+    };
+
+    /// The node report's name of the OS: `linux` or `macos` ([`DAEMON_OSES`]).
+    #[must_use]
+    pub const fn os(self) -> &'static str {
+        self.os
+    }
+
+    /// The architecture.
+    #[must_use]
+    pub const fn arch(self) -> Arch {
+        self.arch
+    }
+}
+
+impl std::fmt::Display for DefaultPlatform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.os, self.arch)
+    }
+}
+
+/// Why `--default-platform` text is not `<os>/<arch>` or `none`.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "{0:?} is not <os>/<arch> (os: linux or macos; arch: x86_64 or arm64, e.g. linux/x86_64) or none"
+)]
+pub struct DefaultPlatformError(String);
+
+impl FromStr for DefaultPlatform {
+    type Err = DefaultPlatformError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let bad = || DefaultPlatformError(text.to_owned());
+        let (os, arch) = text.split_once('/').ok_or_else(bad)?;
+        let os = DAEMON_OSES.iter().find(|o| **o == os).ok_or_else(bad)?;
+        let arch = arch.parse().map_err(|_| bad())?;
+        Ok(Self { os, arch })
+    }
+}
+
+/// The value of `--default-platform`: a [`DefaultPlatform`], or `none` for no default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefaultPlatformSetting(pub Option<DefaultPlatform>);
+
+impl Default for DefaultPlatformSetting {
+    fn default() -> Self {
+        Self(Some(DefaultPlatform::LINUX_X86_64))
+    }
+}
+
+impl std::fmt::Display for DefaultPlatformSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(platform) => platform.fmt(f),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+impl FromStr for DefaultPlatformSetting {
+    type Err = DefaultPlatformError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text == "none" {
+            return Ok(Self(None));
+        }
+        text.parse().map(|p| Self(Some(p)))
+    }
+}
+
 /// The property that is booked, not matched.
 const GPU_KEY: &str = "gpu";
-
-/// The prefix of a `label.<k>` key.
-const LABEL_PREFIX: &str = "label.";
 
 /// The name kbf reads platform property `name` by, or `None` for a property kbf does
 /// not read (`container-image`, `Pool`, ...).
@@ -59,9 +145,7 @@ const LABEL_PREFIX: &str = "label.";
 /// `ios.device.<attribute>`, the reserved keys, [`crate::RESERVED_KEYS`], and the keys
 /// it refuses, the report-only keys, [`crate::REPORT_ONLY_KEYS`]). A name
 /// kbf reads comes back in its canonical spelling: `osfamily` is `OSFamily`, `OS` is
-/// `os`, `GPU` is `gpu`, and `Label.Pool` is `label.Pool` (a label's own name keeps its
-/// case: labels are compared exactly). kbf's own spelling of one of its keys is that
-/// key, so `arch` is kbf's `arch`, and every other spelling of it is REAPI's `Arch`.
+/// `os` and `GPU` is `gpu`. kbf's own spelling of one of its keys is that key, so `arch` is kbf's `arch`, and every other spelling of it is REAPI's `Arch`.
 #[must_use]
 pub fn property_name(name: &str) -> Option<Cow<'_, str>> {
     if is_own_key(name) {
@@ -69,13 +153,6 @@ pub fn property_name(name: &str) -> Option<Cow<'_, str>> {
     }
     if let Some(reapi) = REAPI_KEYS.iter().find(|k| k.eq_ignore_ascii_case(name)) {
         return Some(Cow::Borrowed(reapi));
-    }
-    let label = name
-        .get(..LABEL_PREFIX.len())
-        .filter(|prefix| prefix.eq_ignore_ascii_case(LABEL_PREFIX))
-        .map(|_| &name[LABEL_PREFIX.len()..]);
-    if let Some(label) = label.filter(|label| !label.is_empty()) {
-        return Some(Cow::Owned(format!("{LABEL_PREFIX}{label}")));
     }
     let lower = name.to_ascii_lowercase();
     is_own_key(&lower).then_some(Cow::Owned(lower))

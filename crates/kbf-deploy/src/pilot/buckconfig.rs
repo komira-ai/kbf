@@ -13,8 +13,8 @@
 //!
 //! It refuses, too:
 //! - a property set kbf would not route to its OS ([`routes_to`]): one that names no
-//!   `OSFamily`, names it twice, or names another OS; and a darwin `label.<k>=<v>` that
-//!   no daemon carries (not in `KBF_DARWIN_LABELS`). The two sets must differ;
+//!   `OSFamily`, names it twice, or names another OS; and a `label.<k>=<v>` (node labels
+//!   are removed, so kbf refuses the property). The two sets must differ;
 //! - a directory with no `.buckconfig` (not a buck2 checkout);
 //! - the main checkout (`git rev-parse --git-dir` equals `--git-common-dir`): only a
 //!   linked worktree gets the overlay, so the checkout others build from is untouched;
@@ -72,7 +72,8 @@ pub fn plan<E: Exec>(exec: &E, a: &Overlay, out: &mut dyn Write) -> Result<Plan,
     }
     routes_to(Os::Linux, &s.linux_properties)?;
     routes_to(Os::Darwin, &s.darwin_properties)?;
-    labels_carried(&s.darwin_properties, &s.darwin_labels)?;
+    no_labels(Os::Linux.key(), &s.linux_properties)?;
+    no_labels(Os::Darwin.key(), &s.darwin_properties)?;
     let values = [
         ("KBF_SERVER_HOST", s.server_host.clone()),
         ("KBF_REAPI_PORT", s.reapi_port.to_string()),
@@ -190,8 +191,9 @@ impl Os {
     }
 }
 
-/// Refuse a property set kbf would not route to `os`. kbf acts only on the property
-/// names it knows and ignores the rest (docs/platform-properties.md), so a set must
+/// Refuse a property set kbf would not route to `os`. kbf refuses a property name it does
+/// not read (docs/platform-properties.md), and an action that names no OS is placed on the
+/// frontend's default platform, so a set must
 /// name `OSFamily` exactly once (name and value in any case, as kbf reads them), with
 /// a value of that OS: `linux`; `darwin`, `macos`, `macosx` or `osx`.
 pub fn routes_to(os: Os, props: &str) -> Result<(), PilotError> {
@@ -238,21 +240,16 @@ pub fn routes_to(os: Os, props: &str) -> Result<(), PilotError> {
     })
 }
 
-/// Refuse a `label.<k>=<v>` in `props` that is not a `<k>=<v>` of `labels` (the
-/// daemons' `--label` set, comma separated): kbf matches it exactly against a
-/// daemon's labels, so no daemon would serve it.
-pub fn labels_carried(props: &str, labels: &str) -> Result<(), PilotError> {
+/// Refuse a `label.<k>=<v>` in `props`: node labels are removed, no daemon reports one,
+/// and the frontend refuses an action that names one (INVALID_ARGUMENT), so every action
+/// built with it would fail.
+pub fn no_labels(key: &'static str, props: &str) -> Result<(), PilotError> {
     for pair in props.split(',') {
-        let (name, _) = pair_of(Os::Darwin.key(), pair)?;
-        if !name.to_ascii_lowercase().starts_with("label.") {
-            continue;
-        }
-        let want = &pair["label.".len()..];
-        if !labels.split(',').any(|l| l == want) {
-            return Err(PilotError::LabelNotCarried {
+        let (name, _) = pair_of(key, pair)?;
+        if name.to_ascii_lowercase().starts_with("label.") {
+            return Err(PilotError::LabelRefused {
+                key,
                 pair: pair.to_owned(),
-                want: want.to_owned(),
-                labels: labels.to_owned(),
             });
         }
     }

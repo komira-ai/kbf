@@ -27,8 +27,8 @@ lists the mode's flags. There is no `node` mode and no `enroll` word.
   and does not read the file. The units that `render-units` writes still run the old subcommand
   forms (`kbf storage ...`, `kbf daemon ...`): they are hidden aliases of the same modes, kept
   until the units move.
-- **`kbf.toml`.** `kbf --mode=storage|daemon|storage-and-daemon` with at most `--config FILE` and
-  `--label` reads the host's file. On the first start, with the token file `enroll.token_file`
+- **`kbf.toml`.** `kbf --mode=storage|daemon|storage-and-daemon` with at most `--config FILE`
+  reads the host's file. On the first start, with the token file `enroll.token_file`
   names, it makes its keys, sends the token and a request for the roles the mode needs
   (`storage` the storage role, `daemon` the daemon role, `storage-and-daemon` both) and writes
   `node.json`; later starts renew the certificates without the token. `[storage]` and `[daemon]`

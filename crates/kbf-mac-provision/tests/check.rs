@@ -112,7 +112,7 @@ fn the_node_config_renders_as_the_golden_file() {
     let p = kbf_mac_provision::profile::Profile::parse(text.as_bytes()).unwrap();
     assert_eq!(
         kbf_mac_provision::launchd::render_config(&p),
-        support::golden_config(p.short_sha())
+        support::golden_config()
     );
     assert_eq!(kbf_mac_provision::launchd::NODE_CONFIG, support::CONFIG);
 }

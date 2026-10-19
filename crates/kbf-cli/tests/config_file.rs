@@ -276,17 +276,17 @@ fn a_value_gets_the_validation_of_its_flag() {
     }
 }
 
-/// Catches a repeatable flag read as one value, and a switch read as a value: `label`
-/// (given once per label on the command line) is an array in the file, and a switch is
+/// Catches a repeatable flag read as one value, and a switch read as a value: `driver`
+/// (given once per driver on the command line) is an array in the file, and a switch is
 /// `true` to turn it on and `false` to leave it off, refused for anything else.
 #[test]
 fn a_repeatable_flag_is_an_array_and_a_switch_is_a_boolean() {
     let dir = scratch("shapes");
-    let node = "[identity]\nserver = \"https://127.0.0.1:1\"\nca-cert = \"ca.pem\"\ncert = \"node.pem\"\nkey = \"node.key\"\nnode-id = \"n\"\nlabel = [\"a=b\", \"c=d\"]\n\n[daemon]\ndriver = \"native\"\n";
+    let node = "[identity]\nserver = \"https://127.0.0.1:1\"\nca-cert = \"ca.pem\"\ncert = \"node.pem\"\nkey = \"node.key\"\nnode-id = \"n\"\n\n[daemon]\ndriver = [\"native\", \"container\"]\n";
     let path = file(&dir, node, 0o600);
     let parsed = kbf_cli::parse_with(argv(&["kbf", "daemon"], Some(&path)), None).expect("parses");
     let text = format!("{:?}", parsed.invocation);
-    assert!(text.contains(r#"("a", "b"), ("c", "d")"#), "{text}");
+    assert!(text.contains("drivers: [Native, Container]"), "{text}");
     // `require-metal-toolchain` is a switch of the daemon.
     for (value, on) in [("true", true), ("false", false)] {
         let path = file(

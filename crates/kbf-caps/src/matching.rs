@@ -8,7 +8,7 @@
 //! | `isa_level` | at least, within the family (`x86-64-v3` is served by v3 and v4) |
 //! | `cpu.feature` (repeatable) | subset: every requested feature is present |
 //! | `cpus`, `mem_gib`, `nvme_gib`, `gpu` | countable: the node has at least the amount |
-//! | `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` | exact |
+//! | `os`, `os_image`, `cpu.model`, `page_size` | exact |
 //! | `xcode` | membership: the node reports a set (one entry per installed Xcode build) and the request names one |
 //! | `vm.image` | membership on the digest: the request names `<name>@sha256:<64 hex>`, the node reports one entry in that form per image it holds, and only the `sha256:<hex>` parts are compared |
 //! | `ios.device` (`1`) with `ios.device.<attribute>` | one device: the node reports one `ios.device` entry per ready device, and **one** of them must satisfy every attribute (exact) |
@@ -83,7 +83,7 @@ impl fmt::Display for Consumable {
     }
 }
 
-/// Keys compared as exact strings, besides `label.<k>`.
+/// Keys compared as exact strings.
 const EXACT_KEYS: [&str; 4] = ["os", "os_image", "cpu.model", "page_size"];
 
 /// Keys a node reports as a set and a request names one member of.
@@ -129,10 +129,18 @@ pub(crate) fn is_ios_device_key(key: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
-/// Whether `key` is compared as an exact string: one of the exact keys, or
-/// `label.<k>` with a non-empty `<k>`.
+/// Whether `key` is compared as an exact string.
+///
+/// A `label.<k>` key is not one: node labels are gone (an operator's name for a node
+/// never placed anything the node's detected facts did not), so a request naming one is
+/// [`RequestError::UnknownKey`], also when it is read back from a stored request
+/// (`kbf-log`'s control codec calls [`Request::parse`]): it is refused, not dropped,
+/// because a dropped key would let the request run on any node. The codec has no
+/// production writer yet (see docs/design/capabilities.md), so no stored request names
+/// one; a log that gains one needs a machine-version raise first. A node *report* that
+/// still carries `label.<k>` (an older daemon) is read, and the entry skipped.
 pub(crate) fn is_exact_key(key: &str) -> bool {
-    EXACT_KEYS.contains(&key) || key.strip_prefix("label.").is_some_and(|k| !k.is_empty())
+    EXACT_KEYS.contains(&key)
 }
 
 /// Whether `key` names a set the node reports, matched by membership.
@@ -165,18 +173,40 @@ fn image_digest(value: &str) -> Option<&str> {
 /// `ios.device.<anything>` key is one, so an attribute kbf does not know reaches
 /// [`Request::parse`] and is refused there rather than ignored.
 pub(crate) fn is_own_key(key: &str) -> bool {
-    is_capability_key(key)
-        || RESERVED_KEYS.contains(&key)
-        || REPORT_ONLY_KEYS.contains(&key)
-        || is_ios_device_key(key)
+    is_ios_device_key(key) || own_names().any(|own| own == key)
 }
 
-/// Whether [`Request::parse`] reads `key` as a capability (reserved keys are not).
-fn is_capability_key(key: &str) -> bool {
-    matches!(key, "arch" | "isa_level" | "cpu.feature")
-        || Consumable::from_name(key).is_some()
-        || is_exact_key(key)
-        || is_member_key(key)
+/// The keys of kbf's own that [`Request::parse`] reads, skips or refuses, other than
+/// `ios.device` and its attributes: the one list [`is_own_key`] and [`property_names`]
+/// both read, so what is documented as accepted cannot differ from what is accepted.
+fn own_names() -> impl Iterator<Item = &'static str> {
+    ["arch", "isa_level", "cpu.feature"]
+        .into_iter()
+        .chain(Consumable::ALL.map(Consumable::name))
+        .chain(EXACT_KEYS)
+        .chain(MEMBER_KEYS)
+        .chain(RESERVED_KEYS)
+        .chain(REPORT_ONLY_KEYS)
+}
+
+/// Every platform property name [`crate::property_name`] reads, in its canonical
+/// spelling, in this order: [`crate::REAPI_KEYS`], kbf's own keys (the capability keys,
+/// the reserved keys and the report-only keys, which a request that names one is
+/// refused for), `ios.device`, and one `ios.device.<attribute>` for each of
+/// [`DEVICE_ATTRIBUTES`]. A name sent in another ASCII case is read as one of these;
+/// `ios.device.<anything else>` is read too, and refused by [`Request::parse`].
+///
+/// `docs/platform-properties.md` lists these, and a test of `kbf-front` fails when the
+/// two differ.
+#[must_use]
+pub fn property_names() -> Vec<String> {
+    crate::REAPI_KEYS
+        .into_iter()
+        .chain(own_names())
+        .chain([IOS_DEVICE_KEY])
+        .chain(DEVICE_KEYS)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// What a node offers, as the scheduler sees it.
@@ -184,7 +214,7 @@ fn is_capability_key(key: &str) -> bool {
 pub struct NodeCaps {
     /// Detected CPU capabilities.
     pub cpu: CpuCaps,
-    /// Values compared exactly, by request key (`os`, `cpu.model`, `label.rack`, ...).
+    /// Values compared exactly, by request key (`os`, `cpu.model`, ...).
     pub exact: BTreeMap<String, String>,
     /// Sets a request names one member of, by request key (`xcode`: every installed
     /// build; `vm.image`: the `sha256:<hex>` digest of every image).
@@ -441,8 +471,8 @@ impl Request {
         Ok(req)
     }
 
-    /// The value the request asks `key` to have exactly (`os`, `cpu.model`,
-    /// `label.<k>`, ...), if it names one.
+    /// The value the request asks `key` to have exactly (`os`, `cpu.model`, ...), if it
+    /// names one.
     #[must_use]
     pub fn exact(&self, key: &str) -> Option<&str> {
         self.exact.get(key).map(String::as_str)

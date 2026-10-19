@@ -42,14 +42,11 @@ KBF_S3_CONDITIONAL_PUT=1
 # --- the buck2 client (buckconfig) ---------------------------------------------------
 KBF_INSTANCE_NAME=main
 KBF_CONCURRENCY=8
-# The REAPI platform properties of the linux and darwin actions. kbf routes on
-# OSFamily and on label.<k> (a daemon's --label k=v); it ignores a name it does not
-# know, so a set without OSFamily matches every node (docs/platform-properties.md).
-# buckconfig refuses a set without the right OSFamily, and a darwin label.<k> not in
-# KBF_DARWIN_LABELS.
-KBF_LINUX_PROPERTIES=OSFamily=Linux,label.pool=linux
-KBF_DARWIN_PROPERTIES=OSFamily=Darwin,label.pool=mac
-# The daemons' labels (each --label KEY=VALUE), comma separated.
-KBF_DARWIN_LABELS=pool=mac
+# The REAPI platform properties of the linux and darwin actions. kbf routes on what a
+# node reports about itself (OSFamily, ISA, Arch), and refuses a name it does not read,
+# a label.<k> included (docs/platform-properties.md). buckconfig refuses a set without
+# the right OSFamily, and a label.<k>.
+KBF_LINUX_PROPERTIES=OSFamily=Linux
+KBF_DARWIN_PROPERTIES=OSFamily=Darwin
 # The macOS host identities a darwin compile accepts, space separated.
 KBF_DARWIN_MACOS_HOSTS="26.0-0123456789abcdef"

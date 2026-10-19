@@ -11,7 +11,7 @@
 //! `hw.optional` (the text `kbf-caps` parses), `hw.ncpu`, `hw.memsize`, `hw.pagesize`
 //! and `machdep.cpu.brand_string`, and reports `gpu` 0: its integrated GPU is not one
 //! the scheduler books. [`NodeReport::with_entries`] adds what the command line and
-//! the driver add: node labels (`label.<key>`) and driver capabilities.
+//! the driver add: driver capabilities.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -97,7 +97,7 @@ impl NodeReport {
         detect_here(drivers)
     }
 
-    /// This report with `entries` added (node labels, driver capabilities).
+    /// This report with `entries` added (driver capabilities).
     #[must_use]
     pub fn with_entries<K, V>(self, entries: impl IntoIterator<Item = (K, V)>) -> Self
     where
@@ -573,14 +573,14 @@ mod tests {
         );
     }
 
-    /// Catches: labels and driver capabilities dropped, or replacing the detected
+    /// Catches: driver capabilities dropped, or replacing the detected
     /// entries instead of joining them, or a report whose hash ignores them.
     #[test]
     fn added_entries_join_the_report() {
         let r = NodeReport::new([("os", "macos"), ("drivers", "native")]);
         let more = r
             .clone()
-            .with_entries([("label.pool", "darwin-sized"), ("os", "macos")]);
+            .with_entries([("drivers", "container"), ("os", "macos")]);
         let keys: Vec<(&str, &str)> = more
             .capabilities()
             .iter()
@@ -589,8 +589,8 @@ mod tests {
         assert_eq!(
             keys,
             [
+                ("drivers", "container"),
                 ("drivers", "native"),
-                ("label.pool", "darwin-sized"),
                 ("os", "macos")
             ]
         );

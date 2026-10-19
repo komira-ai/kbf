@@ -81,6 +81,9 @@ pub struct Listeners {
     /// books, the others are what it climbs through when it passes its own memory
     /// limit, before a whole host (`--memory-ladder-gib`).
     pub memory_ladder: MemoryLadder,
+    /// The platform of a request that names no OS, no architecture and no ISA level
+    /// (`--default-platform`); `None` leaves such a request to match any worker.
+    pub default_platform: Option<kbf_caps::DefaultPlatform>,
     /// How long a finished operation is kept after its callers are answered, in which
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,
@@ -692,7 +695,10 @@ where
         history.with_blobs(blobs, budget.clone())
     });
     let recording = crate::history::install(recording, history.as_ref());
-    let default_memory = listeners.memory_ladder.first();
+    let defaults = kbf_front::ExecutionDefaults {
+        memory_bytes: listeners.memory_ladder.first(),
+        platform: listeners.default_platform,
+    };
     let farm = Farm::new(
         Arc::clone(&cache),
         listeners.unservable_wait,
@@ -854,7 +860,7 @@ where
             kbf_front::OpenStreams { closing, progress },
             authorizers,
             &recorder,
-            default_memory,
+            defaults,
         ),
         None => kbf_front::routes_recorded(
             cache,
@@ -863,7 +869,7 @@ where
             progress,
             authorizers,
             &recorder,
-            default_memory,
+            defaults,
         ),
     };
     let authenticate = AuthenticateLayer::new(policy.authenticator);

@@ -280,10 +280,7 @@ impl FakeMac {
         mac.mkdir("/usr/local/etc/kbf");
         mac.chmod("/usr/local/etc/kbf", 0o755);
         mac.own("/usr/local/etc/kbf", 0, 0);
-        mac.write(
-            CONFIG,
-            &golden_config(&sha256_hex(profile.as_bytes())[..12]),
-        );
+        mac.write(CONFIG, &golden_config());
         mac.chmod(CONFIG, 0o644);
         mac.own(CONFIG, 0, 0);
         mac.mkdir("/Library/Logs/kbf");

@@ -223,3 +223,49 @@ async fn a_whole_machine_lease_waits_while_no_daemon_serves_it() {
     );
     linux.no_work().await;
 }
+
+/// Catches: the frontend's `--default-platform` not reaching placement, so an action that
+/// names no platform goes to the first daemon by name (the Mac, `node-a`) as before; the
+/// default applied when it should not be (an action naming `OSFamily=Darwin` alone must
+/// still go to the Mac); and `none` not restoring first fit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_action_that_names_no_platform_runs_on_the_default_not_on_the_mac() {
+    for (setting, empty_goes_to_linux) in [
+        (Some(kbf_caps::DefaultPlatform::LINUX_X86_64), true),
+        (None, false),
+    ] {
+        let cell = Cell::start_with_default_platform(setting).await;
+        // The Mac registers first and sorts first by name: first fit gives it any action.
+        let mut mac = FakeDaemon::connect(cell.worker_addr, hello_on("node-a", 4, 8, MAC))
+            .await
+            .expect("registered");
+        let mut linux = cell.daemon("node-b", 4, 8).await;
+
+        let empty = Job::new("names nothing", &[]);
+        let darwin = Job::new("darwin alone", &[("OSFamily", "Darwin")]);
+        cell.upload(&empty.blobs()).await;
+        cell.upload(&darwin.blobs()).await;
+
+        let mut empty_ops = cell.execute(&empty.action).await;
+        let (taker, other) = if empty_goes_to_linux {
+            (&mut linux, &mut mac)
+        } else {
+            (&mut mac, &mut linux)
+        };
+        let start = taker.start().await;
+        assert_eq!(start.action_digest.as_ref(), Some(&empty.action.proto));
+        other.no_work().await;
+        let built = output(&cell, "names nothing", 0).await;
+        assert!(taker.report(ran(start.lease_id, &built)).await.accepted);
+        done(&mut empty_ops).await;
+
+        // A Mac named alone is not completed to Linux: it still goes to the Mac.
+        let mut darwin_ops = cell.execute(&darwin.action).await;
+        let start = mac.start().await;
+        assert_eq!(start.action_digest.as_ref(), Some(&darwin.action.proto));
+        linux.no_work().await;
+        let built = output(&cell, "darwin alone", 0).await;
+        assert!(mac.report(ran(start.lease_id, &built)).await.accepted);
+        done(&mut darwin_ops).await;
+    }
+}

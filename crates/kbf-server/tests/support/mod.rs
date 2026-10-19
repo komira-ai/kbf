@@ -228,6 +228,29 @@ impl Cell {
         Self::start_with(kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION).await
     }
 
+    /// A cell whose frontend places an action that names no OS, no architecture and no ISA
+    /// level on `platform` (`--default-platform`); the other cells leave it to match any
+    /// daemon.
+    pub async fn start_with_default_platform(platform: Option<kbf_caps::DefaultPlatform>) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+            None,
+            None,
+            platform,
+        )
+        .await
+    }
+
     /// A cell whose scheduler refuses queued work no live worker can run after `wait`.
     pub async fn start_with_unservable_wait(wait: Duration) -> Self {
         Self::start_with(wait, kbf_sched::FINISHED_RETENTION).await
@@ -288,6 +311,7 @@ impl Cell {
             StreamLimits::DEFAULT,
             Some(map),
             None,
+            None,
         )
         .await
     }
@@ -316,6 +340,7 @@ impl Cell {
             StreamLimits::DEFAULT,
             None,
             Some(state),
+            None,
         )
         .await
     }
@@ -498,7 +523,7 @@ impl Cell {
         streams: StreamLimits,
     ) -> Self {
         Self::serve_with_map(
-            cache, store, api_config, raft_dir, wait, retention, ladder, streams, None, None,
+            cache, store, api_config, raft_dir, wait, retention, ladder, streams, None, None, None,
         )
         .await
     }
@@ -516,6 +541,7 @@ impl Cell {
         streams: StreamLimits,
         map: Option<Arc<dyn kbf_mapsync::MapSource>>,
         state: Option<kbf_server::StateStore>,
+        default_platform: Option<kbf_caps::DefaultPlatform>,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -527,6 +553,7 @@ impl Cell {
             tick: Duration::from_millis(50),
             unservable_wait: wait,
             memory_ladder: ladder,
+            default_platform,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
             streams: kbf_server::StreamTiming::default(),

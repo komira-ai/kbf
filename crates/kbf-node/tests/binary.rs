@@ -224,7 +224,6 @@ fn base(dir: &Path) -> Vec<String> {
         format!("--key={}", dir.join("node.key").display()),
         "--node-id=node-1".to_owned(),
         "--reconnect-ms=50".to_owned(),
-        "--label=pool=darwin-sized".to_owned(),
     ]
 }
 

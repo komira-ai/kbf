@@ -79,18 +79,39 @@
 //! Every property name kbf reads is read without regard to case
 //! (`kbf_caps::property_name`): `GPU`, `Kbf-Lease` and `osfamily` are `gpu`,
 //! `kbf-lease` and `OSFamily`. One name sent in two spellings is INVALID_ARGUMENT, and a
-//! name kbf does not read (`pool`, `Container-Image`) or a `label.<k>` is INVALID_ARGUMENT
+//! name kbf does not read (`pool`, `Container-Image`, `label.<k>`) is INVALID_ARGUMENT
 //! naming it: nothing is dropped. Only `container-image`, exactly so, passes unread (the
-//! container driver reads it).
+//! container driver reads it), and it is INVALID_ARGUMENT beside an OS of macOS.
+//!
+//! **When the platform is refused.** As early as it is known, before any input blob is
+//! read: an Action that carries a platform is checked right after it is decoded (so a bad
+//! key beside missing blobs is INVALID_ARGUMENT, not FAILED_PRECONDITION), and a Command's
+//! platform as soon as the Command is read. An Execute that the action cache answers is
+//! checked too: when the cache holds a result for the action, the action is read to find
+//! its platform, and a refused one is INVALID_ARGUMENT instead of the cached result, so a
+//! mistyped `pool=` is loud even for an action that ran under an older frontend. An action
+//! the CAS does not hold cannot be checked and is answered from the cache. (`GetActionResult`
+//! is a plain cache read: it never reads the action and answers what is cached.)
+//!
+//! **The default platform.** A request that names no OS, no architecture and no ISA level
+//! (`OSFamily`, `ISA`, `Arch`, `os`, `arch`, `isa_level`, in any case) and no `xcode` and no
+//! `ios.device*` is placed on the platform of
+//! [`ExecutionService::with_default_platform`] (`--default-platform`, `linux/x86_64` unless
+//! the operator says otherwise), after the refusals above and before the worker is chosen.
+//! One OS or one architecture named alone is never completed (`OSFamily=Darwin` stays a
+//! Mac of any architecture). The action is not changed: its digest, and its cache entry,
+//! are the client's. Each application is logged with the action digest, at most once per
+//! [`DEFAULTED_LOG_EVERY`] with the number skipped.
 
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Stream, stream};
 use kbf_auth::{Authorizers, authorize};
-use kbf_caps::FromPlatformError;
+use kbf_caps::{DefaultPlatform, FromPlatformError};
 use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::google::rpc::{
     self, ErrorInfo, PreconditionFailure, precondition_failure::Violation,
@@ -428,6 +449,32 @@ pub struct ExecutionService<D> {
     recorder: Recorder,
     /// The memory an `action` that names no size books, in bytes.
     default_memory: u64,
+    /// The platform a request that names no OS, no architecture and no ISA level gets.
+    default_platform: Option<DefaultPlatform>,
+    /// Keeps the log line about an applied default to one per interval.
+    defaulted_log: DefaultedLog,
+}
+
+/// What Execute assumes for what an action leaves unsaid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionDefaults {
+    /// The memory an `action` that names no size books, in bytes
+    /// ([`ExecutionService::with_default_memory`]).
+    pub memory_bytes: u64,
+    /// The platform of a request that names no OS, no architecture and no ISA level
+    /// ([`ExecutionService::with_default_platform`]); `None` for none.
+    pub platform: Option<DefaultPlatform>,
+}
+
+impl Default for ExecutionDefaults {
+    /// [`DEFAULT_RESOURCES`]' memory and no default platform: a request that names no
+    /// platform matches any worker.
+    fn default() -> Self {
+        Self {
+            memory_bytes: DEFAULT_RESOURCES.memory_bytes,
+            platform: None,
+        }
+    }
 }
 
 /// The gRPC path of Execute, as calls are logged.
@@ -454,7 +501,25 @@ impl<D> ExecutionService<D> {
             authorizers,
             recorder: Recorder::off(),
             default_memory: DEFAULT_RESOURCES.memory_bytes,
+            default_platform: None,
+            defaulted_log: DefaultedLog::default(),
         }
+    }
+
+    /// This service, with `defaults` for what an action leaves unsaid.
+    #[must_use]
+    pub const fn with_defaults(self, defaults: ExecutionDefaults) -> Self {
+        self.with_default_memory(defaults.memory_bytes)
+            .with_default_platform(defaults.platform)
+    }
+
+    /// This service, placing a request that names no OS, no architecture and no ISA
+    /// level (and no `xcode` or `ios.device*`) on `platform`, and logging each time;
+    /// `None` leaves such a request to match any worker. See the module docs.
+    #[must_use]
+    pub const fn with_default_platform(mut self, platform: Option<DefaultPlatform>) -> Self {
+        self.default_platform = platform;
+        self
     }
 
     /// This service, booking `bytes` of memory for an `action` that names no size
@@ -577,6 +642,8 @@ where
                 action.hash_hex(),
                 action.size_bytes
             );
+            // A result is not an excuse for a platform kbf refuses.
+            self.refuse_platform_of(&action).await?;
             tracing::debug!(%action, "answered from the action cache");
             let instance = &request.instance_name;
             self.recorder
@@ -636,6 +703,10 @@ impl<D> ExecutionService<D> {
         let decoded = Action::decode(bytes).map_err(|e| {
             Status::invalid_argument(format!("action {action} does not decode: {e}"))
         })?;
+        // A platform the Action carries is refused before anything else is read.
+        let from_action = platform(&decoded, None)
+            .map(|p| refuse_platform(Some(p)))
+            .transpose()?;
         let command_digest = required(decoded.command_digest.as_ref(), "command_digest")?;
         let root = required(decoded.input_root_digest.as_ref(), "input_root_digest")?;
 
@@ -648,6 +719,11 @@ impl<D> ExecutionService<D> {
                 absent.push(command_digest);
                 None
             }
+        };
+        // And a Command's, as soon as the Command is read: before the input tree is walked.
+        let platform = match from_action {
+            Some(platform) => platform,
+            None => refuse_platform(platform(&decoded, command.as_ref()))?,
         };
         let walking = Instant::now();
         let walked = self.cache.walk_inputs(root).await;
@@ -674,10 +750,9 @@ impl<D> ExecutionService<D> {
             return Err(missing(&absent));
         }
 
-        let platform = properties(platform(&decoded, command.as_ref()))?;
         let kind = lease_kind(&platform)?;
         let booked = booking(&platform, kind, self.default_memory)?;
-        let needs = needs(&platform)?;
+        let needs = self.placed(&platform, action)?;
         let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
         device_kind(kind, &needs)?;
         let submission = Submission {
@@ -695,6 +770,63 @@ impl<D> ExecutionService<D> {
             described: command.map(Described::of).unwrap_or_default(),
         };
         Ok((submission, command_digest))
+    }
+
+    /// What a worker must offer to run an action with `platform`, the default platform
+    /// of this service added where the platform names none ([`wants_default`]).
+    fn placed(&self, platform: &Platform, action: Digest) -> Result<kbf_caps::Request, Status> {
+        let Some(default) = self.default_platform.filter(|_| wants_default(platform)) else {
+            return needs(platform);
+        };
+        let mut defaulted = platform.clone();
+        for (key, value) in [("os", default.os()), ("arch", default.arch().name())] {
+            defaulted.insert(key, value).map_err(|e| {
+                Status::internal(format!("the default platform {default} clashes: {e}"))
+            })?;
+        }
+        let request = needs(&defaulted)?;
+        if let Some(skipped) = self.defaulted_log.admit(Instant::now()) {
+            tracing::info!(
+                %action,
+                os = default.os(),
+                arch = default.arch().name(),
+                skipped,
+                "platform defaulted: the action names no OS, no architecture and no ISA level \
+                 ({skipped} such placements not logged since the last line)"
+            );
+        }
+        Ok(request)
+    }
+
+    /// Refuses, for an Execute that the action cache answers, the platform of the action
+    /// that cached result is for, if the action and its Command are in the CAS: the
+    /// Action's platform, else the Command's, as an Execute that ran would have read it.
+    /// An action or Command the CAS does not hold, or that does not decode, is not
+    /// refused here (an Execute that runs says so); a store that fails is the call's error.
+    async fn refuse_platform_of(&self, action: &Digest) -> Result<(), Status> {
+        let Some(bytes) = self.read_input(action).await? else {
+            return Ok(());
+        };
+        let Ok(decoded) = Action::decode(bytes) else {
+            return Ok(());
+        };
+        if let Some(own) = platform(&decoded, None) {
+            return refuse_platform(Some(own)).map(drop);
+        }
+        let Some(command) = decoded
+            .command_digest
+            .as_ref()
+            .and_then(|d| wire::digest(Some(d)).ok())
+        else {
+            return Ok(());
+        };
+        let Some(bytes) = self.read_input(&command).await? else {
+            return Ok(());
+        };
+        let Ok(command) = Command::decode(bytes) else {
+            return Ok(());
+        };
+        refuse_platform(platform(&decoded, Some(&command))).map(drop)
     }
 
     /// A blob's bytes, or `None` if it is not held. Anything else (unreachable, store
@@ -732,8 +864,68 @@ fn required(d: Option<&reapi::Digest>, field: &str) -> Result<Digest, Status> {
 /// reads `container-image` from the action, in exactly this spelling.
 const CONTAINER_IMAGE_KEY: &str = "container-image";
 
-/// The prefix of a `label.<k>` key.
-const LABEL_PREFIX: &str = "label.";
+/// The platform's properties that kbf reads ([`properties`]), refused also when it asks
+/// for a `container-image` and an OS of macOS: the container driver is Linux's, a Mac
+/// runs an action as processes, so the image would be silently unused.
+fn refuse_platform(platform: Option<&reapi::Platform>) -> Result<Platform, Status> {
+    let read = properties(platform)?;
+    let sent_image =
+        platform.is_some_and(|p| p.properties.iter().any(|p| p.name == CONTAINER_IMAGE_KEY));
+    if sent_image {
+        let wanted = needs(&read)?;
+        if let Some(os @ "macos") = wanted.exact("os") {
+            return Err(Status::invalid_argument(format!(
+                "platform property {CONTAINER_IMAGE_KEY:?} is read by the Linux container \
+                 driver, but the action asks for os {os:?}: a Mac runs an action as a \
+                 process, so the image would be ignored; drop it, or ask for Linux"
+            )));
+        }
+    }
+    Ok(read)
+}
+
+/// Whether `platform` (as [`properties`] returns it) names nothing kbf places an action
+/// on: no OS, no architecture, no ISA level, no `xcode` and no `ios.device*`. Those are
+/// the canonical names of everything that decides an OS, an architecture or a Mac-only
+/// resource, in whatever spelling the client sent them.
+fn wants_default(platform: &Platform) -> bool {
+    !platform.canonical().any(|(name, _)| {
+        matches!(
+            name,
+            "OSFamily" | "ISA" | "Arch" | "os" | "arch" | "isa_level" | "xcode"
+        ) || name == IOS_DEVICE_KEY
+            || name
+                .strip_prefix(IOS_DEVICE_KEY)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
+/// The key of an iOS device request; `ios.device.<attribute>` begins with it and a `.`.
+const IOS_DEVICE_KEY: &str = "ios.device";
+
+/// At most one log line about an applied default per this long.
+pub const DEFAULTED_LOG_EVERY: Duration = Duration::from_secs(10);
+
+/// Rate-limits the line logged when the default platform is applied.
+#[derive(Debug, Default)]
+struct DefaultedLog {
+    last: Mutex<Option<Instant>>,
+    skipped: AtomicU64,
+}
+
+impl DefaultedLog {
+    /// `Some(n)`, `n` the applications left unlogged since the last line, when this one
+    /// is to be logged at `now`; `None` when it is not (and it is counted).
+    fn admit(&self, now: Instant) -> Option<u64> {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.is_some_and(|at| now.saturating_duration_since(at) < DEFAULTED_LOG_EVERY) {
+            self.skipped.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        *last = Some(now);
+        Some(self.skipped.swap(0, Ordering::Relaxed))
+    }
+}
 
 /// The platform's properties that kbf reads, each under the name kbf reads it by
 /// (`kbf_caps::property_name`), or INVALID_ARGUMENT for a repeated one, also when
@@ -742,8 +934,9 @@ const LABEL_PREFIX: &str = "label.";
 /// A property kbf does not read is refused, never dropped: INVALID_ARGUMENT naming it,
 /// so a client that asks for a platform kbf cannot honour (`pool=darwin-sized`) finds
 /// out at once instead of running anywhere. Placement follows what a node reports
-/// (`os`, `arch`, ...), never a name an operator gave it, so a `label.<k>` key is
-/// refused too. [`CONTAINER_IMAGE_KEY`] alone passes unread.
+/// (`os`, `arch`, ...), never a name an operator gave it, so a `label.<k>` key (node
+/// labels are removed) is refused as any unknown name is. [`CONTAINER_IMAGE_KEY`] alone
+/// passes unread.
 fn properties(platform: Option<&reapi::Platform>) -> Result<Platform, Status> {
     let properties = platform.map_or(&[][..], |p| p.properties.as_slice());
     let sent = Platform::from_properties(properties.iter().map(|p| (&*p.name, &*p.value)))
@@ -760,15 +953,6 @@ fn properties(platform: Option<&reapi::Platform>) -> Result<Platform, Status> {
                  isa_level, ...), see docs/platform-properties.md"
             )));
         };
-        if key
-            .get(..LABEL_PREFIX.len())
-            .is_some_and(|p| p.eq_ignore_ascii_case(LABEL_PREFIX))
-        {
-            return Err(Status::invalid_argument(format!(
-                "platform property {name:?} names a label: labels are never used to place \
-                 an action; ask for what the node reports (OSFamily, ISA, Arch, os, arch, ...)"
-            )));
-        }
         read.insert(&*key, value).map_err(|_| {
             Status::invalid_argument(format!(
                 "platform property {key:?} is given twice, in two spellings (one is {name:?})"
@@ -1069,3 +1253,7 @@ fn operations(
 #[cfg(test)]
 #[path = "execution_progress_tests.rs"]
 mod progress_tests;
+
+#[cfg(test)]
+#[path = "execution_defaulted_tests.rs"]
+mod defaulted_tests;

@@ -1,5 +1,5 @@
 //! How the command line is split before a mode parses it: the three flags `kbf` takes
-//! itself (`--mode`, `--config`, `--label`), the end-of-flags word, an argument that is
+//! itself (`--mode`, `--config`), the end-of-flags word, an argument that is
 //! not text, and the mode that comes from the file. Each case is a refusal that exits 2
 //! naming its cause, or a parse to the value the words stand for.
 
@@ -43,7 +43,7 @@ listen = \"127.0.0.1:9980\"
 /// "a value is required for '--<flag>'".
 #[test]
 fn a_flag_of_ours_with_no_value_is_refused_naming_it() {
-    for flag in ["mode", "config", "label"] {
+    for flag in ["mode", "config"] {
         let err = refused(&["kbf", "--mode=daemon", &format!("--{flag}")]);
         assert_eq!(err.exit_code(), 2, "{flag}");
         let msg = err.to_string();
@@ -65,6 +65,7 @@ fn a_flag_that_only_starts_with_one_of_ours_is_an_unknown_flag() {
         "--configfoo=/nonexistent/kbf.toml",
         "--modes=daemon",
         "--labels=a=b",
+        "--label=a=b",
     ] {
         let err = refused(&["kbf", "--mode=daemon", flag]);
         assert_eq!(err.exit_code(), 2, "{flag}");

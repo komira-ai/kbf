@@ -155,17 +155,34 @@ fn a_request_names_one_xcode() {
     );
 }
 
-/// Catches: an arch mismatch ignored, and labels compared loosely.
+/// Catches: an arch mismatch ignored.
 #[test]
-fn arch_and_labels_are_exact() {
-    let mut n = ampere();
-    n.exact.insert("label.rack".to_owned(), "r1".to_owned());
-    assert!(req(&[("arch", "arm64"), ("label.rack", "r1")]).matches(&n));
+fn arch_is_exact() {
+    let n = ampere();
+    assert!(req(&[("arch", "arm64")]).matches(&n));
     assert_eq!(
         req(&[("arch", "x86_64")]).unmet(&n),
         [Unmet::Arch { want: Arch::X86_64 }]
     );
-    assert!(!req(&[("label.rack", "r2")]).matches(&n));
+}
+
+/// Catches: a `label.<k>` request key read again (labels are removed: a node report that
+/// carries one, from an older daemon, is read and the entry skipped, and a request that
+/// names one is refused, not dropped, also when a stored request is parsed on replay).
+#[test]
+fn a_label_key_is_unknown_in_a_request_and_skipped_in_a_report() {
+    for key in ["label.rack", "label.pool", "Label.rack", "label.", "label"] {
+        assert_eq!(
+            Request::parse([("arch", "arm64"), (key, "r1")]),
+            Err(RequestError::UnknownKey(key.to_owned())),
+            "{key}"
+        );
+    }
+    let node =
+        kbf_caps::NodeCaps::from_report([("arch", "arm64"), ("os", "macos"), ("label.rack", "r1")])
+            .expect("an older daemon's report");
+    assert!(!node.exact.contains_key("label.rack"));
+    assert_eq!(node.exact.get("os").map(String::as_str), Some("macos"));
 }
 
 /// Catches: an unknown key or bad value silently ignored (the action would run
@@ -226,7 +243,6 @@ fn a_request_is_written_as_the_properties_it_parses_from() {
     let image = format!("base@sha256:{}", "ab".repeat(32));
     let given = [
         ("vm.image", image.as_str()),
-        ("label.rack", "r1"),
         ("os", "linux"),
         ("mem_gib", "8"),
         ("cpus", "4"),
@@ -246,7 +262,6 @@ fn a_request_is_written_as_the_properties_it_parses_from() {
         ("cpu.feature", "avx2"),
         ("cpus", "4"),
         ("mem_gib", "8"),
-        ("label.rack", "r1"),
         ("os", "linux"),
         ("vm.image", image.as_str()),
         ("xcode", "16C5032a"),

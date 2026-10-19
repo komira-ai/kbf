@@ -71,7 +71,7 @@ impl FakeMac {
             PLIST,
             &golden_plist_as(&sha256_hex(text.as_bytes())[..12], user),
         );
-        self.write(CONFIG, &golden_config(&sha256_hex(text.as_bytes())[..12]));
+        self.write(CONFIG, &golden_config());
         self.profile = text;
     }
 }

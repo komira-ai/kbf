@@ -60,7 +60,7 @@ const PLATFORMS: [&[(&str, &str)]; 6] = [
     &[("OSFamily", "Darwin")],
     &[("ISA", "arm-a64")],
     &[("ISA", "x86-64-v4")],
-    &[("OSFamily", "darwin"), ("label.pool", "darwin")],
+    &[("OSFamily", "darwin"), ("cpu.model", "darwin")],
 ];
 /// The platform index no worker ever satisfies.
 const NEVER: usize = 4;
@@ -91,7 +91,7 @@ fn workers() -> Vec<(&'static str, NodeCaps)> {
         ),
         (
             "mac",
-            NodeCaps::from_report([("arch", "arm64"), ("os", "macos"), ("label.pool", "darwin")])
+            NodeCaps::from_report([("arch", "arm64"), ("os", "macos"), ("cpu.model", "darwin")])
                 .unwrap()
                 .with_drivers(["native"]),
         ),

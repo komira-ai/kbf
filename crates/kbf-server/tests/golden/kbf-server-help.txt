@@ -111,6 +111,11 @@ Options:
           
           [default: 300]
 
+      --default-platform <DEFAULT_PLATFORM>
+          The platform, `<os>/<arch>`, of an Execute whose action names no OS, no architecture and no ISA level (`OSFamily`, `ISA`, `Arch`, `os`, `arch`, `isa_level`) and no `xcode` or `ios.device*`: without it, such an action matches any worker, a Mac among them. `linux/x86_64` unless `none`, which keeps that. A request that names one of those is never completed (`OSFamily=Darwin` alone stays any Mac). The action, and so its digest, is not changed; each application is logged
+          
+          [default: linux/x86_64]
+
       --memory-ladder-gib <MEMORY_LADDER_GIB>
           The memory rungs of an action, in GiB, ascending and each at least 1. The first is what an action that names no size (`kbf-book-mem-gib`) books. An action that passes its own memory limit runs again on the next rung above what it booked, and after the last on a whole host: the memory of the largest node that could run it, so that no other lease fits there. A rung not below that node's memory is skipped for the whole host. An action that does finish keeps its rung: later runs of it start there
           
