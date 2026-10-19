@@ -611,3 +611,43 @@ fn a_farm_removes_the_scratch_it_owns_when_it_drops() {
     drop(farm);
     assert!(!path.exists(), "{} is left behind", path.display());
 }
+
+#[test]
+fn a_farm_reaps_its_processes_before_it_removes_the_scratch() {
+    // Catches: the scratch removed while a process still runs in it (a field order, or a
+    // Drop, that takes the directory first). The watcher spins until the marker it was
+    // started beside is gone, then records that; the directory holds many files, so its
+    // removal takes long enough for a watcher still alive to see it. A farm that kills
+    // first leaves no watcher to write anything.
+    let outside = dir("order");
+    let scratch = kbf_testkit::dir::TestDir::under(&outside, "own");
+    let path = scratch.path().to_path_buf();
+    let marker = path.join("marker");
+    std::fs::write(&marker, b"x").expect("write the marker");
+    for n in 0..3000 {
+        std::fs::write(path.join(format!("f{n}")), b"x").expect("write a filler");
+    }
+    let (up, saw_gone) = (outside.join("up"), outside.join("saw_gone"));
+    let script = format!(
+        "echo > {up}; while [ -e {marker} ]; do :; done; echo > {saw_gone}",
+        up = up.display(),
+        marker = marker.display(),
+        saw_gone = saw_gone.display(),
+    );
+    let watcher = spec(Role::Node(1), "sh", &["-c", &script], &path);
+    let farm = Farm::supervise(&path, vec![watcher]).owning(scratch);
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    while !up.exists() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the watcher never started"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(farm);
+    assert!(!path.exists(), "{} is left behind", path.display());
+    assert!(
+        !saw_gone.exists(),
+        "the scratch was removed while a process still ran in it"
+    );
+}
