@@ -106,6 +106,7 @@ use crate::handover::{
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::listen::{Binder, Socket};
 use crate::members::Members;
+use crate::proxy_auth::ProxyAuthLayer;
 use crate::serve::{
     AbortOnDrop, ServeError, drain_and_stop, flow_control, keepalive, log_state, map_of,
     members_of, membership, serve_api, stop_api, sweeping, worker_peers,
@@ -132,6 +133,7 @@ pub const ALLOWED: &[&str] = &[
     "worker_client_ca",
     "tls_reload_interval_secs",
     "worker_deny_list",
+    "proxy_auth_file",
     "heartbeat_interval_ms",
     "progress_interval_secs",
     "http2_keepalive_interval_secs",
@@ -772,6 +774,7 @@ fn state_uri(flags: &FrontendFlags) -> Result<&crate::StateStoreUri, HandoverErr
 struct Prepared<'a> {
     flags: &'a FrontendFlags,
     listeners: crate::serve::Listeners,
+    proxy: Option<crate::serve::Behind>,
     policy: kbf_auth::Policy,
     api: Option<crate::serve::Api>,
     channel: tonic::transport::Channel,
@@ -808,6 +811,7 @@ impl<'a> Prepared<'a> {
     fn new(flags: &'a FrontendFlags) -> Result<Self, Box<dyn Error>> {
         let args = &flags.server;
         let listeners = args.listeners()?;
+        let proxy = args.proxy()?;
         let policy = args.reapi_auth_policy()?;
         let api = args.api()?;
         let channel = flags.storage_endpoint()?.connect_lazy();
@@ -820,6 +824,7 @@ impl<'a> Prepared<'a> {
         Ok(Self {
             flags,
             listeners,
+            proxy,
             policy,
             api,
             channel,
@@ -848,6 +853,7 @@ impl<'a> Prepared<'a> {
         let Self {
             flags,
             listeners,
+            proxy,
             policy,
             api,
             channel,
@@ -904,6 +910,7 @@ impl<'a> Prepared<'a> {
                 listeners.streams,
             ),
             listeners.worker_tls,
+            proxy.as_ref(),
         );
         let tls_sources: Vec<TlsSource> = listeners
             .reapi_tls
@@ -980,10 +987,12 @@ impl<'a> Prepared<'a> {
             routes.merge(crate::storage_health::router(Arc::clone(members)))
         });
 
+        let proxy_secret = proxy.as_ref().map(|behind| Arc::clone(&behind.secret));
         let mut reapi_server = keepalive(
             flow_control(Server::builder(), listeners.stream_limits.reapi),
             listeners.streams,
-        );
+        )
+        .layer(ProxyAuthLayer::new(proxy_secret.clone()));
         let membership = membership(members.clone(), &peers);
         let sessions = WorkerService::new(
             Arc::clone(&farm),
@@ -1117,9 +1126,14 @@ impl<'a> Prepared<'a> {
                 .serve_with_incoming_shutdown(worker_incoming, worker_stopped);
             // Told when the REAPI listener is done (see `serve::stop_api`).
             let (api_stop_when_done, api_stopped) = tokio::sync::oneshot::channel::<()>();
-            let api_serve = serve_api(api_listener, api_routes, async {
-                let _ = api_stopped.await;
-            })
+            let api_serve = serve_api(
+                api_listener,
+                api_routes,
+                async {
+                    let _ = api_stopped.await;
+                },
+                proxy_secret,
+            )
             .fuse();
             tokio::pin!(api_serve);
             let ticking = async {

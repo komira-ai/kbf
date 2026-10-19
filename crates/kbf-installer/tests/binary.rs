@@ -67,15 +67,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
     fs::create_dir_all(&release).expect("release");
     fs::write(release.join("kbf"), b"x").expect("binary");
 
-    let run = [
-        "run",
-        "--passes",
-        "1",
-        "--interval-secs",
-        "0",
-        "--unit",
-        "kbf.service",
-    ];
+    let run = ["run", "--passes", "1", "--unit", "kbf.service"];
     let out = helper(&root, &run);
     assert!(
         out.status.success(),
@@ -278,15 +270,7 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
             ..State::default()
         })
         .expect("state");
-    let two = [
-        "run",
-        "--passes",
-        "2",
-        "--interval-secs",
-        "0",
-        "--launchd-label",
-        "com.example.kbf",
-    ];
+    let two = ["run", "--passes", "2", "--launchd-label", "com.example.kbf"];
     let out = helper(&root, &two);
     assert!(
         out.status.success(),
@@ -306,19 +290,86 @@ fn passes_end_the_run_and_an_unreadable_memory_stops_it() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("kbf-installer:"));
 }
 
+/// Catches the operator verbs' exit codes (contract section 2) going wrong or a verb run
+/// without `--apply` changing the host: with nothing on trial, `confirm`, `revert` and
+/// `rollback` need the operator (exit 5), `quiesce` is at rest (0); with a swap on trial
+/// `quiesce` is exit 5 and a dry-run `revert` leaves the state alone; `gc` without
+/// `--apply` removes nothing.
+///
+/// Mutants planted: `Failure::exit_code` returning 1 for every case; `quiesce` not reading
+/// the pending swap.
+#[test]
+fn the_operator_verbs_exit_by_the_contract() {
+    let root = root("verbs");
+    let host = layout(&root);
+    let service = ["--unit", "kbf.service"];
+    let state = |pending| State {
+        current: Some(c(B)),
+        previous: Some(c(A)),
+        pending_confirm: pending,
+        ..State::default()
+    };
+    Locked::acquire(&host)
+        .expect("lock")
+        .write(&state(None))
+        .expect("state");
+    for dir in [A, B] {
+        let d = root.join("var/lib/kbf-installer/releases").join(dir);
+        fs::create_dir_all(&d).expect("release");
+        fs::write(d.join("kbf"), b"x").expect("binary");
+    }
+    let code = |verb: &[&str]| helper(&root, verb).status.code();
+    let with = |verb: &str, extra: &[&str]| {
+        let mut v = vec![verb];
+        v.extend(extra);
+        v.extend(service);
+        v.iter().map(ToString::to_string).collect::<Vec<_>>()
+    };
+    let run = |args: Vec<String>| {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        code(&refs)
+    };
+    assert_eq!(run(with("confirm", &["--id", "1-5"])), Some(5));
+    assert_eq!(run(with("revert", &["--id", "1-5"])), Some(5));
+    assert_eq!(code(&["quiesce"]), Some(0));
+
+    let pending = PendingConfirm {
+        commit: c(B),
+        previous: Some(c(A)),
+        activation: "1-5".to_owned(),
+        deadline_wall: Some(2_000_000_000),
+        deadline_mono_s: None,
+        starts_left: Some(3),
+    };
+    Locked::acquire(&host)
+        .expect("lock")
+        .write(&state(Some(pending)))
+        .expect("state");
+    assert_eq!(code(&["quiesce"]), Some(5));
+    assert_eq!(run(with("rollback", &[])), Some(5), "a swap is on trial");
+    assert_eq!(run(with("revert", &["--id", "1-9"])), Some(3));
+    assert_eq!(run(with("revert", &["--id", "1-5"])), Some(0));
+    let kept = kbf_installer::state::read_unlocked(&host)
+        .expect("reads")
+        .expect("there");
+    assert_eq!(kept.current, Some(c(B)), "a dry run moves nothing");
+    assert_eq!(code(&["gc"]), Some(0));
+    assert!(root.join("var/lib/kbf-installer/releases").join(A).exists());
+}
+
 /// Catches the gate in front of the verbs being absent from the shipped binary (the unit tests
 /// run the same code, but the binary is what a host runs): an ordinary user is refused every
 /// verb that needs root with exit 2 and the reason, `--json` puts one object on standard
 /// output, and a verb that needs no root and is not built yet says which pull request builds it.
 ///
-/// Mutant planted: the root check skipped (`gc` then reaches "not implemented", exit 1).
+/// Mutant planted: the root check skipped (`setup` then reaches "not implemented", exit 1).
 #[test]
 fn the_shipped_binary_refuses_a_verb_that_needs_root_and_names_the_unbuilt_ones() {
     let root = root("gate");
-    let out = helper(&root, &["gc"]);
+    let out = helper(&root, &["setup", "--mode=daemon"]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("gc needs root"));
-    let out = helper(&root, &["--json", "gc"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("setup needs root"));
+    let out = helper(&root, &["--json", "setup", "--mode=daemon"]);
     assert_eq!(out.status.code(), Some(2));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one object");
     assert_eq!(v["error"], "needs_root");
@@ -379,4 +430,115 @@ fn deploy_is_the_first_word_and_refuses_what_the_host_does_not_own() {
         assert!(err.contains("must be owned by root"), "{err}");
         assert!(out.stdout.is_empty());
     }
+}
+
+/// Catches a service that goes on running a file that was replaced under it, or that hides
+/// it: once the program's own file is another file, the loop says so and starts the new
+/// one in its place; here the new file is no program, so the start fails and the service
+/// ends with the reason (exit 1) instead of running on or hanging.
+///
+/// Mutants planted: the watch never consulted (the loop runs all its passes and exits 0);
+/// the failed start not reported.
+#[test]
+fn a_service_whose_file_was_replaced_says_so_and_ends_when_the_new_one_cannot_start() {
+    use std::process::Stdio;
+    let root = root("replaced");
+    Locked::acquire(&layout(&root))
+        .expect("lock")
+        .write(&State {
+            current: Some(c(A)),
+            ..State::default()
+        })
+        .expect("state");
+    let dir = root.join("copy");
+    fs::create_dir_all(&dir).expect("dir");
+    let me = dir.join("kbf-installer");
+    fs::copy(BIN, &me).expect("a copy of the program");
+    let child = Command::new(&me)
+        .arg("--root")
+        .arg(&root)
+        .args(["run", "--passes", "4", "--unit", "kbf.service"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starts");
+    let status_file = root.join("var/lib/kbf-installer/status.json");
+    for _ in 0..400 {
+        if status_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(status_file.exists(), "the first pass was made");
+    let other = dir.join("other");
+    fs::write(&other, b"not a program").expect("a file that is no program");
+    fs::rename(&other, &me).expect("replaced");
+    let out = child.wait_with_output().expect("ends");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("my file was replaced"), "{stderr}");
+    assert!(stderr.contains("cannot start"), "{stderr}");
+}
+
+/// Catches a verb that queues behind another run for ever, or hides that it is waiting: with
+/// the lock held by another process, `quiesce` waits its time and then ends busy (exit 4),
+/// which tells a maintainer script to ask again.
+///
+/// Mutant planted: the busy error mapped to a plain failure (exit 1).
+#[test]
+fn a_verb_that_finds_the_lock_held_ends_busy() {
+    let root = root("busy");
+    Locked::acquire(&layout(&root))
+        .expect("lock")
+        .write(&State {
+            current: Some(c(A)),
+            ..State::default()
+        })
+        .expect("state");
+    let held = Locked::acquire(&layout(&root)).expect("held by this test");
+    let out = helper(&root, &["quiesce"]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(held);
+    assert_eq!(helper(&root, &["quiesce"]).status.code(), Some(0));
+}
+
+/// Catches the state errors of an operator's verb landing on the wrong exit in the shipped
+/// binary: both state files damaged is an operator's job (exit 5), and a lock file that cannot
+/// even be opened is a plain failure (exit 1).
+///
+/// Mutants planted: the unusable state mapped to a plain failure; the lock error to busy.
+#[test]
+fn the_operators_verbs_end_by_the_state_error_they_met() {
+    let root = root("state-errors");
+    let host = layout(&root);
+    Locked::acquire(&host)
+        .expect("lock")
+        .write(&State {
+            current: Some(c(A)),
+            ..State::default()
+        })
+        .expect("state");
+    for name in ["state.json", "state.json.bak"] {
+        fs::write(in_state_dir(&root, name), b"not json").expect("ruin");
+    }
+    let out = helper(&root, &["confirm", "--id", "1-5", "--unit", "kbf.service"]);
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = host.join(&host.lock());
+    fs::remove_dir_all(lock.parent().expect("a directory")).expect("no lock directory");
+    let out = helper(&root, &["quiesce"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

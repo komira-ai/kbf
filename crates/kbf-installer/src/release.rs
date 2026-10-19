@@ -617,24 +617,41 @@ pub(crate) fn has_binary<E: Exec>(exec: &E, host: &Layout, commit: &CommitId) ->
 
 /// `host gc --keep N`: remove each release directory but the kept ones: the state's
 /// current, previous and staged, what the `current` and `previous` links point to, and
-/// the `keep` newest others (by the directory's modification time). An entry of
-/// `releases/` that is not a directory named by a commit id is left alone.
+/// the release a pending swap names and the one it came from, every release in `in_use` (a
+/// process executes from it), and the `keep` newest others (by the directory's modification
+/// time). An entry of `releases/` that is not a directory named by a commit id is left alone.
 pub fn gc<E: Exec>(
     exec: &mut E,
     host: &Layout,
     keep: usize,
+    in_use: &BTreeSet<CommitId>,
     mode: Mode,
     out: &mut dyn Write,
 ) -> Result<(), ReleaseError> {
     // Held through the removals, so an install cannot make a release current meanwhile.
-    let (_lock, state) = begin(host, mode)?;
-    if _lock.is_some() {
+    // Unlike an install, `gc` is not refused while a swap is on trial: it keeps both of the
+    // swap's releases (S22).
+    let lock = match mode {
+        Mode::Apply => Some(Locked::acquire(host)?),
+        Mode::DryRun => None,
+    };
+    let state = match &lock {
+        Some(lock) => lock.read()?,
+        None => state::read_unlocked(host)?,
+    };
+    let state = state.unwrap_or_default();
+    if lock.is_some() {
         sweep_stages(host)?;
     }
     let mut kept: BTreeSet<CommitId> = [state.current, state.previous, state.staged]
         .into_iter()
         .flatten()
         .collect();
+    if let Some(p) = &state.pending_confirm {
+        kept.insert(p.commit.clone());
+        kept.extend(p.previous.clone());
+    }
+    kept.extend(in_use.iter().cloned());
     for link in [host.current(), host.previous()] {
         if let Some(Entry::Link { target }) = inspect(exec, &link)? {
             kept.extend(linked(&target));

@@ -1,0 +1,21 @@
+[package]
+name = "kbf-gate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The fail-closed gate library every CI/CD stage shares (docs/design/kbf-cicd.md, sections
+# 5.2, 7 and 10): the result document, a Prometheus text reader whose absent series is red,
+# and the run recorder that writes RUNNING first and FINISHED on every exit it can
+# (crates/kbf-it/tests/layering.rs keeps it free of the async stack and of other kbf crates).
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
