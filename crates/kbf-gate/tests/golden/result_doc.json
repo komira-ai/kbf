@@ -73,5 +73,15 @@
       "finished": 88400
     }
   ],
-  "note": null
+  "note": null,
+  "tag": "v0.1.0",
+  "not_reversible": [
+    "raises the node log version"
+  ],
+  "escapes": [
+    "handover with a build in flight"
+  ],
+  "withdrawn": [
+    "v0.0.9"
+  ]
 }
