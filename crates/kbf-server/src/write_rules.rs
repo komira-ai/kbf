@@ -64,13 +64,17 @@ pub struct Family {
     pub example: &'static str,
 }
 
-const fn fenced(keys: Keys, writer: &'static str, example: &'static str) -> Family {
-    Family {
-        keys,
-        rule: Rule::Fenced,
-        writer,
-        example,
-    }
+/// A fenced family. A macro and not a `const fn`: the table is built when it is compiled,
+/// and a function that runs only then is a function no test runs.
+macro_rules! fenced {
+    ($keys:expr, $writer:expr, $example:expr $(,)?) => {
+        Family {
+            keys: $keys,
+            rule: Rule::Fenced,
+            writer: $writer,
+            example: $example,
+        }
+    };
 }
 
 /// Every family of keys a frontend writes outside the history index: all fenced. The
@@ -78,133 +82,133 @@ const fn fenced(keys: Keys, writer: &'static str, example: &'static str) -> Fami
 /// is a flag.
 pub const FAMILIES: &[Family] = &[
     // The generation row itself: written by `Fenced::take`, which is the fence.
-    fenced(
+    fenced!(
         Keys::Exactly("meta/generation"),
         "kbf-state fence",
         "meta/generation",
     ),
     // The scheduler (`farm/durable.rs`).
-    fenced(Keys::Exactly("meta/epoch"), "farm/durable", "meta/epoch"),
-    fenced(Keys::Exactly("meta/alive"), "farm/durable", "meta/alive"),
-    fenced(
+    fenced!(Keys::Exactly("meta/epoch"), "farm/durable", "meta/epoch"),
+    fenced!(Keys::Exactly("meta/alive"), "farm/durable", "meta/alive"),
+    fenced!(
         Keys::Exactly("meta/next_op"),
         "farm/durable (counter)",
         "meta/next_op",
     ),
-    fenced(
+    fenced!(
         Keys::Exactly("meta/next_seq"),
         "farm/durable (counter)",
         "meta/next_seq",
     ),
-    fenced(Keys::Under("op/"), "farm/durable", "op/0000000000000001"),
-    fenced(
+    fenced!(Keys::Under("op/"), "farm/durable", "op/0000000000000001"),
+    fenced!(
         Keys::Under("queue/"),
         "farm/durable",
         "queue/0000000000000001",
     ),
-    fenced(
+    fenced!(
         Keys::Under("loss/"),
         "farm/durable",
         "loss/0000000000000001",
     ),
-    fenced(
+    fenced!(
         Keys::Under("fate/"),
         "farm/durable",
         "fate/0000000000000001",
     ),
-    fenced(Keys::Under("floor/"), "farm/durable", "floor/main/0000"),
-    fenced(
+    fenced!(Keys::Under("floor/"), "farm/durable", "floor/main/0000"),
+    fenced!(
         Keys::Under("subject/"),
         "farm/durable",
         "subject/0000000000000001",
     ),
-    fenced(
+    fenced!(
         Keys::Under("done/"),
         "farm/durable (read by the old child's follower)",
         "done/0000000000000001",
     ),
-    fenced(Keys::Under("cordon/"), "farm/durable", "cordon/node-a"),
-    fenced(
+    fenced!(Keys::Under("cordon/"), "farm/durable", "cordon/node-a"),
+    fenced!(
         Keys::Under("lease/"),
         "farm/durable",
         "lease/0000000000000001.0000000000000001",
     ),
-    fenced(Keys::Under("session/"), "farm/durable", "session/node-a"),
+    fenced!(Keys::Under("session/"), "farm/durable", "session/node-a"),
     // The pin of the operation that runs an action: the request's instance name, not the
     // writing process's id, so it is fenced with `op/` (`farm/durable/inflight.rs`).
-    fenced(
+    fenced!(
         Keys::Under("inflight/"),
         "farm/durable/inflight",
         "inflight/6d61696e/ab",
     ),
     // The member map and its rows (`members.rs`, `kbf-enroll-registry`).
-    fenced(Keys::Exactly("map"), "members", "map"),
-    fenced(Keys::Under("member/"), "members", "member/1"),
-    fenced(Keys::Exactly("member-id"), "members (counter)", "member-id"),
-    fenced(Keys::Under("boot/"), "members (counter)", "boot/1"),
-    fenced(Keys::Under("instance/"), "members", "instance/node-a"),
-    fenced(Keys::Under("down/"), "members", "down/1"),
-    fenced(
+    fenced!(Keys::Exactly("map"), "members", "map"),
+    fenced!(Keys::Under("member/"), "members", "member/1"),
+    fenced!(Keys::Exactly("member-id"), "members (counter)", "member-id"),
+    fenced!(Keys::Under("boot/"), "members (counter)", "boot/1"),
+    fenced!(Keys::Under("instance/"), "members", "instance/node-a"),
+    fenced!(Keys::Under("down/"), "members", "down/1"),
+    fenced!(
         Keys::Exactly("meta/members_formed"),
         "members",
         "meta/members_formed",
     ),
-    fenced(
+    fenced!(
         Keys::Under("deny/"),
         "members and kbf-enroll-registry",
         "deny/node/a",
     ),
     // Enrollment: tokens, nodes, serials, keys, advertised addresses, requests, renewals
     // and the CA generation, all under one prefix (`kbf-enroll-registry/src/rows.rs`).
-    fenced(
+    fenced!(
         Keys::Under("enroll/"),
         "kbf-enroll-registry",
         "enroll/token/a",
     ),
     // Rolling updates (`update/rows.rs`).
-    fenced(
+    fenced!(
         Keys::Exactly("update/desired"),
         "update/rows",
         "update/desired",
     ),
-    fenced(
+    fenced!(
         Keys::Exactly("update/generation"),
         "update/rows (counter)",
         "update/generation",
     ),
-    fenced(
+    fenced!(
         Keys::Exactly("update/policy"),
         "update/rows",
         "update/policy",
     ),
-    fenced(Keys::Exactly("update/slot"), "update/rows", "update/slot"),
-    fenced(
+    fenced!(Keys::Exactly("update/slot"), "update/rows", "update/slot"),
+    fenced!(
         Keys::Under("update/host/"),
         "update/rows",
         "update/host/node-a",
     ),
-    fenced(
+    fenced!(
         Keys::Under("update/order/"),
         "update/rows (counter)",
         "update/order/0000000000000001",
     ),
     // Object-store registrations (`object_store/rows.rs`).
-    fenced(
+    fenced!(
         Keys::Under("objstore/conn/"),
         "object_store",
         "objstore/conn/cold",
     ),
-    fenced(
+    fenced!(
         Keys::Under("objstore/bind/"),
         "object_store",
         "objstore/bind/cold",
     ),
-    fenced(
+    fenced!(
         Keys::Under("objstore/audit/"),
         "object_store",
         "objstore/audit/1",
     ),
-    fenced(
+    fenced!(
         Keys::Exactly("objstore/gen"),
         "object_store",
         "objstore/gen",

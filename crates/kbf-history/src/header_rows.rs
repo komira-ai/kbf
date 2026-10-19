@@ -158,6 +158,7 @@ mod tests {
         cut.instances_truncated = true;
         cut.idless = true;
         let m = merge_headers(vec![header(1, InvState::Open), cut]).expect("rows");
-        assert!(m.instances_truncated && m.idless);
+        assert!(m.instances_truncated);
+        assert!(m.idless);
     }
 }
