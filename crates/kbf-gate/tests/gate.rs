@@ -166,3 +166,56 @@ fn a_nan_sample_is_recorded_as_not_measured() {
     );
     assert!(!Limit::AtLeast(f64::NAN).is_finite());
 }
+
+const FAILURES: &str = r#"
+kbf_failed_actions_total{class="infra"} 2
+kbf_failed_actions_total{class="lost_input"} 1
+kbf_failed_actions_total{class="user"} 40
+kbf_failed_actions_total{reason="no class"} 9
+kbf_queued_seconds_bucket{le="0.5",lane="a"} 3
+kbf_queued_seconds_bucket{le="0.5",lane="b"} 4
+kbf_queued_seconds_bucket{le="+Inf",lane="a"} 5
+kbf_queued_seconds_bucket{le="+Inf",lane="b"} 6
+kbf_queued_seconds_bucket{le="0.1",lane="a"} 1
+kbf_queued_seconds_sum 9
+"#;
+
+/// Catches a class filter that reads a missing family as zero, or one that sums the classes
+/// it was not asked for, or the series without the label.
+#[test]
+fn sum_by_adds_the_kept_label_values_and_a_missing_family_is_absent() {
+    let m = Metrics::parse(FAILURES).unwrap();
+    let farm = |c: &str| c == "infra" || c.starts_with("lost_");
+    assert_eq!(
+        m.sum_by("kbf_failed_actions_total", "class", &farm),
+        Sample::Value(3.0)
+    );
+    // The family is there and nothing is kept: zero is a measurement.
+    assert_eq!(
+        m.sum_by("kbf_failed_actions_total", "class", &|_| false),
+        Sample::Value(0.0)
+    );
+    assert_eq!(m.sum_by("kbf_nope_total", "class", &farm), Sample::Absent);
+    let odd = Metrics::parse("kbf_f{class=\"infra\"} NaN\nkbf_f{class=\"x\"} 1\n").unwrap();
+    assert_eq!(odd.sum_by("kbf_f", "class", &|_| false), Sample::Absent);
+}
+
+/// Catches buckets left in scrape order, counts of one label set only, an infinite bound
+/// dropped, and a missing histogram read as an empty one.
+#[test]
+fn buckets_are_summed_over_labels_and_sorted_by_bound() {
+    let m = Metrics::parse(FAILURES).unwrap();
+    assert_eq!(
+        m.buckets("kbf_queued_seconds"),
+        Some(vec![(0.1, 1.0), (0.5, 7.0), (f64::INFINITY, 11.0)])
+    );
+    assert_eq!(m.buckets("kbf_other_seconds"), None);
+    for bad in [
+        "kbf_h_bucket{lane=\"a\"} 1\n",
+        "kbf_h_bucket{le=\"x\"} 1\n",
+        "kbf_h_bucket{le=\"NaN\"} 1\n",
+        "kbf_h_bucket{le=\"1\"} NaN\n",
+    ] {
+        assert_eq!(Metrics::parse(bad).unwrap().buckets("kbf_h"), None, "{bad}");
+    }
+}

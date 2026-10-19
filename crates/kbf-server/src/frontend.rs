@@ -58,6 +58,12 @@
 //! seen it, forwards the calls Envoy still sends it ([`kbf_front::Relay`]) and exits when
 //! it holds nothing, without failing a build; [`start_or_take_over`] is its start.
 //!
+//! **Under the admin port** (`--admin-listen`, optionally `--await-takeover`,
+//! [`crate::managed`]): a loopback port answers `GET role` and takes `quiesce`, `resume`,
+//! `takeover` and `stand-down`, so a supervisor can start a candidate beside the serving
+//! frontend and move the state store's generation to it without the Unix-socket handover
+//! above (which stays until the supervisor replaces it).
+//!
 //! **Not served here:** the worker listener's `ByteStream`, CAS and `Segments` (a
 //! daemon's blob traffic; daemons reach storage directly once the map reaches them,
 //! av2-08), the build pages and the blob route of the operator API (they read a local
@@ -210,6 +216,9 @@ pub struct FrontendFlags {
     pub handover: Option<Handover>,
     /// The enroll listener (`--enroll-listen` and its companions); `None` without it.
     pub enroll: Option<EnrollFlags>,
+    /// The admin port and whether to start as a candidate ([`crate::managed`]); `None`
+    /// without `--admin-listen`.
+    pub admin: Option<crate::managed::AdminFlags>,
     /// `--object-store-secrets-dir`: where the secret keys of the registered object-store
     /// connections are kept (one 0600 file each), which also turns on the
     /// `/v1/object-stores` routes of the operator API. `None`: they answer 404.
@@ -344,6 +353,7 @@ pub fn command() -> Command {
             ),
     )
     .args(crate::enroll::flags::args())
+    .args(crate::managed::flags::args())
     .arg(
         Arg::new(SECRETS_DIR)
             .long("object-store-secrets-dir")
@@ -420,12 +430,14 @@ pub fn parse(m: &ArgMatches) -> Result<FrontendFlags, clap::Error> {
         envoy: envoy_check(m),
         peer_name: m.get_one::<String>(PEER_NAME).cloned(),
     });
+    let admin = crate::managed::flags::parse(m).map_err(refuse)?;
     Ok(FrontendFlags {
         server,
         storage,
         tls,
         handover,
         enroll,
+        admin,
         object_store_secrets_dir: m.get_one::<PathBuf>(SECRETS_DIR).cloned(),
     })
 }
@@ -586,7 +598,7 @@ pub struct FrontendHandle {
     drain: Arc<Drain>,
     /// Completes on the second stop signal; [`FrontendHandle::serve`] then closes the
     /// drain ([`Drain::close`]).
-    escalation: Option<Escalation>,
+    pub(crate) escalation: Option<Escalation>,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     /// Tasks that run while the frontend serves and end with it: the one that expires
@@ -594,6 +606,9 @@ pub struct FrontendHandle {
     background: Vec<BoxFuture<'static, ()>>,
     /// Tells the service manager the frontend serves, once its probes pass.
     ready: Ready,
+    /// What gives the roles up and takes them back ([`crate::managed`]); with a state
+    /// store only.
+    stand: Option<Stand>,
 }
 
 impl FrontendHandle {
@@ -610,6 +625,11 @@ impl FrontendHandle {
     #[must_use]
     pub fn enroll_tls(&self) -> Option<kbf_tls::TlsSource> {
         self.enroll_tls.clone()
+    }
+
+    /// What gives this frontend's roles up, if it has a state store.
+    pub(crate) const fn stand(&self) -> Option<&Stand> {
+        self.stand.as_ref()
     }
 
     /// The line the frontend prints once it is bound:
@@ -721,6 +741,31 @@ fn bind_frontend(
         .map(crate::StateStoreUri::open)
         .transpose()?;
     prepared.start(state, shutdown, None)
+}
+
+/// A start over a state store that is already open and held (`state`), with no
+/// predecessor: [`start_frontend`] with the store given instead of opened from
+/// `--state-store`. `stop` completes to stop the frontend.
+pub(crate) fn start_over(
+    flags: &FrontendFlags,
+    state: crate::StateStore,
+    stop: &Stop,
+) -> Result<FrontendHandle, Box<dyn Error>> {
+    let stop = stop.clone();
+    Prepared::new(flags)?.start(Some(state), Box::new(move || Ok(stop.fired())), None)
+}
+
+/// A start over a state store whose generation was just taken, on the REAPI and operator
+/// API sockets a candidate bound ([`crate::managed`]); only the worker listener is bound
+/// here.
+pub(crate) fn start_over_sockets(
+    flags: &FrontendFlags,
+    sockets: crate::managed::Sockets,
+    state: crate::StateStore,
+    stop: Stop,
+) -> Result<FrontendHandle, Box<dyn Error>> {
+    let prepared = Prepared::over(flags, sockets)?;
+    prepared.start(Some(state), Box::new(move || Ok(stop.fired())), None)
 }
 
 /// Starts the frontend the flags describe, taking over from the one serving on
@@ -836,6 +881,39 @@ impl Bound {
 impl<'a> Prepared<'a> {
     /// Reads the flags and binds the listeners.
     fn new(flags: &'a FrontendFlags) -> Result<Self, Box<dyn Error>> {
+        Self::bound(flags, |listeners, api, binder| {
+            Bound::bind(
+                listeners.reapi,
+                listeners.worker,
+                api.map(|api| api.listen),
+                binder,
+            )
+        })
+    }
+
+    /// [`Prepared::new`] on the REAPI and operator API sockets of a candidate: only the
+    /// worker listener is bound.
+    fn over(
+        flags: &'a FrontendFlags,
+        sockets: crate::managed::Sockets,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::bound(flags, |listeners, _, binder| {
+            Ok(Bound {
+                reapi: sockets.reapi,
+                worker: Socket::bind(listeners.worker, binder)?,
+                api: sockets.api,
+            })
+        })
+    }
+
+    fn bound(
+        flags: &'a FrontendFlags,
+        sockets: impl FnOnce(
+            &crate::serve::Listeners,
+            Option<&crate::serve::Api>,
+            &Binder,
+        ) -> Result<Bound, ServeError>,
+    ) -> Result<Self, Box<dyn Error>> {
         let args = &flags.server;
         let listeners = args.listeners()?;
         let proxy = args.proxy()?;
@@ -848,12 +926,7 @@ impl<'a> Prepared<'a> {
             .as_ref()
             .map(|enroll| enroll_start::prepare_with(enroll, &binder))
             .transpose()?;
-        let sockets = Bound::bind(
-            listeners.reapi,
-            listeners.worker,
-            api.as_ref().map(|api| api.listen),
-            &binder,
-        )?;
+        let sockets = sockets(&listeners, api.as_ref(), &binder)?;
         Ok(Self {
             flags,
             listeners,
@@ -1017,6 +1090,7 @@ impl<'a> Prepared<'a> {
             update_rows.clone(),
             enroll_api,
         )
+        .merge(crate::verbs::routes(token.clone(), members.clone()))
         .merge(crate::release::router(releases.clone(), token.clone()))
         .merge(crate::object_store::api::routes(
             token.clone(),
@@ -1126,25 +1200,28 @@ impl<'a> Prepared<'a> {
         // Told by the control socket's task when a handed-over frontend holds nothing and
         // may exit, or could not stand down.
         let (departing, departed) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let stand = state_store.map(|store| Stand {
+            drain: Arc::clone(&drain),
+            farm: Arc::clone(&farm),
+            worker: worker_stop.clone(),
+            sweeper: sweeper.clone(),
+            store,
+            wait: flags
+                .handover
+                .as_ref()
+                .map_or(crate::managed::QUIESCE_WAIT, |handover| handover.quiesce),
+        });
         let holder = flags
             .handover
             .as_ref()
-            .zip(state_store)
-            .map(|(handover, store)| {
+            .zip(stand.clone())
+            .map(|(handover, stand)| {
                 let facts = Facts {
                     instance: handover.instance,
                     state: args
                         .state_store
                         .as_ref()
                         .map_or_else(PathBuf::new, crate::StateStoreUri::identity),
-                };
-                let stand = Stand {
-                    drain: Arc::clone(&drain),
-                    farm: Arc::clone(&farm),
-                    worker: worker_stop.clone(),
-                    sweeper: sweeper.clone(),
-                    store,
-                    wait: handover.quiesce,
                 };
                 let peer = Peer {
                     successor,
@@ -1255,6 +1332,7 @@ impl<'a> Prepared<'a> {
                 notify: None,
                 predecessor,
             },
+            stand,
         })
     }
 }
@@ -1387,6 +1465,18 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
     sizes.log();
     sizes.runtime()?.block_on(async {
         let (first, second) = interruptions()?;
+        if flags.admin.is_some() {
+            let managed =
+                crate::managed::Managed::start(flags, crate::managed::StoreSource::Flags, first)
+                    .await?;
+            println!("{}", managed.start_line());
+            managed
+                .escalating(second)
+                .notifying(std::env::var_os("NOTIFY_SOCKET"))
+                .serve()
+                .await?;
+            return Ok(());
+        }
         let mut frontend = start_or_take_over(flags, move || Ok(first)).await?;
         frontend.escalation = Some(second);
         println!("{}", frontend.start_line());

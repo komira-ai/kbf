@@ -100,12 +100,17 @@ listener:
   `x-kbf-node-id` is refused `PERMISSION_DENIED`. A `Membership` registration
   or heartbeat has no certificate names behind the proxy: the one name is the proxied node
   id, so the host of its instance id and its address must be that name (up to ASCII case; an IP
-  address is refused). The proxied role must be `storage`. A `serial` or `spki-sha256` deny entry cannot name a proxied
-  caller, a `node` entry can: revoke by node name while behind the proxy, or have the
-  proxy refuse the certificate.
+  address is refused). The proxied role must be `storage`.
 
 What the flag does not do, and what the proxy must do:
 
+- **Deny-list entries by `serial` or `spki-sha256` do nothing behind the proxy.** The child
+  sees no certificate, only the node id and role the proxy forwarded, so only a `node`
+  entry in `--worker-deny-list` can name a proxied caller. To revoke a certificate, list
+  its node, or have the proxy refuse the certificate. A server started with
+  `--proxy-auth-file` and a deny list holding a `serial` or `spki-sha256` entry logs a
+  warning at start naming the count. (Enforcing them would need the proxy to forward a
+  verified serial and key in a new header; that is the proxy's work, not this flag's.)
 - The storage listener (`kbf storage`, and the in-process one of all-in-one) is not behind
   the proxy: it keeps its own mutual TLS and its own admission.
 - `--reapi-auth-policy mtls` finds no certificate on a proxied REAPI call and refuses every
@@ -301,7 +306,7 @@ rebuild (a new cluster, a cache), or have it hold the slice first; and promote o
 member at a time. `draining` is the reverse: the member takes no new writes, its
 successor takes its slot at once, and it is read first.
 
-## `POST /v1/denied` and `DELETE /v1/denied`
+## `GET /v1/denied`, `POST /v1/denied` and `DELETE /v1/denied`
 
 An operator adds an entry to the storage deny list, or takes one off. A denied
 certificate is refused by every storage node on every method, and by the membership
@@ -332,6 +337,16 @@ map that holds it, which the call builds before it answers (`0` before any membe
 registered; the entry is in the first map then). An entry that is listed already answers
 `200` and keeps its first reason.
 
+`GET /v1/denied` lists the entries with the reasons they were added with:
+`{"denied": [{"entry": "serial a1b", "reason": "a lost laptop", "at_ms": 1791371800000}, ...]}`,
+serials first, then key hashes, then node ids, each in order, as the store's rows hold them
+now (the map the nodes hold lags the rows by up to a beat, and holds no reasons). `at_ms` is
+the store clock's milliseconds, Unix time on a running frontend. The list is empty
+(`{"denied": []}`) when nothing is denied. It passes the same gates as a write, the `GET`
+included, so the reasons reach only an operator, and its answer is `Cache-Control: no-store`.
+It assumes no single writer: every frontend over the store answers from the same rows, a
+frontend that is not the newest included. `404` on a server without a state store.
+
 `DELETE /v1/denied?entry=<entry>` takes the entry off (percent-encode it, or use `+` for the
 space): `200` with the same answer, `404` if it is not listed, `400` with no `entry` or one
 that is not an entry.
@@ -360,8 +375,7 @@ storage access but keeps its work stream, and goes on receiving actions (their c
 environments and input digests), and its blob calls on that listener are served, until it
 is listed in `--worker-deny-list`, the file that listener reads
 ([worker-protocol.md](design/worker-protocol.md)). To take a daemon off the farm, list it in
-both. There is no `GET /v1/denied` either: the reasons are kept in the store, and the list
-itself is in the map.
+both. `GET /v1/denied` shows the list; `GET /v1/members` does not.
 
 **Locking yourself out.** An entry that names the frontend's own certificate (by serial or
 key, or a `node` that is the name in it) makes every storage node refuse the frontend. The
@@ -421,7 +435,9 @@ the drain, and the unit templates in `kbf-deploy` set it.
 --frontend --token-file F` and `kbf cluster undrain <node> --token-file F` (the API's
 `:uncordon`). It prints the answer's JSON, exits 0 on a 2xx and 1 otherwise, and takes
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
-restart it.
+restart it. `kbf cluster member <id> --state active|draining --token-file F` calls
+`POST /v1/members/{id}`, and `kbf cluster denied --token-file F` calls `GET /v1/denied`.
+`kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
 
 ## `/v1/enroll/tokens` and `/v1/enroll/nodes`
 
@@ -652,6 +668,94 @@ whoever acts on a zero keeps new writes away from the node first (drains it), th
 again. A member that left the map (a `DOWN` member leaves after the dwell) is not counted.
 `503` with `{"error": ...}` when the membership cannot be read.
 
+## The admin calls: `GET /v1/admin/role` and `POST /v1/admin/{quiesce,resume,takeover,stand-down}`
+
+A `kbf --mode frontend` started with `--admin-listen <addr>` serves these on a port of
+their own, separate from the operator API. The address must be a loopback address (any
+other is refused at start, in the flags and again when the port is bound), and the calls
+carry no credential: they move the scheduler's role, so nothing but the host's own
+processes may reach them. The port needs `--state-store`. The calls and the `role` answer
+are versioned by `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`).
+
+**`GET /v1/admin/role`**:
+
+```json
+{
+  "role": "active",
+  "instance_id": "5d1c4a52-8b0e-4f64-9a27-3c0e4f8d9a10",
+  "admin_protocol": 1,
+  "generation": 7,
+  "held_generation": 7,
+  "superseded": false,
+  "open_streams": 3,
+  "open_sessions": 2,
+  "reapi": "127.0.0.1:8980",
+  "worker": "127.0.0.1:8981",
+  "api": "127.0.0.1:8982"
+}
+```
+
+- `role`: `candidate` (started with `--await-takeover`: holds no generation and schedules
+  nothing), `active` (holds the generation and schedules), `quiesced` (holds it and has
+  stopped scheduling, assigning and requeueing) or `stood-down` (another process holds the
+  generation).
+- `instance_id`: a UUID, new for each process.
+- `generation`: the generation the state store is at now (`null` if it cannot be read);
+  `held_generation`: the one this process took (`null` for a candidate). A takeover passes
+  the holder's `generation` as `expect`.
+- `superseded`: the store has refused a write of this process because another writer holds
+  the generation.
+- `open_streams`: Execute and WaitExecution streams open; `open_sessions`: worker streams
+  open.
+- `reapi`, `worker`, `api`: the listeners. A candidate has no worker listener, and a
+  stood-down process has none again.
+
+Every call below answers `200` with this object after the call. A call that does not apply
+answers `409` with the object and an `error` naming why (`role`, or a generation); a body
+that is not what the call takes is `400`.
+
+**`POST /v1/admin/quiesce`** (active or quiesced): waits, for at most 10 seconds, for the
+Execute calls between their request and their queueing and the results being taken, then
+fences the farm: it feeds the scheduler nothing, so nothing is granted, assigned or
+requeued, a call that would queue is refused `UNAVAILABLE`, and a worker's result or
+heartbeat is not applied. It writes the requeues the store refused. Idempotent. Open
+streams and worker sessions stay open. While quiesced, a worker's heartbeat or result is not
+applied, so a quiesce is meant to last seconds (a takeover's limit is 10): one longer than
+the leases' expiry lets the scheduler expire the leases of work still running and requeue it
+when the process resumes. Nothing bounds it.
+
+**`POST /v1/admin/resume`** (quiesced or active): undoes a quiesce, for a takeover that did
+not happen. Refused with `409` when the store is no longer at `held_generation` or the
+store has refused a write of this process (another writer holds it: only `stand-down`
+applies). The farm fed the scheduler nothing while it was quiesced, so its memory is the
+store's as of the quiesce; nothing is reloaded.
+
+**`POST /v1/admin/takeover`**, body `{"expect": N}` (candidate only): takes the generation,
+which must be exactly `N` (a store at another generation is refused with `409` and nothing
+is written), keeps the epoch (daemons that redial keep the runs of their leases), reads all
+state from the store, and starts the scheduler, the reconciler and the worker listener on
+the sockets the candidate already bound. `500` if the generation was taken and the
+frontend could not start; the process then ends.
+
+**`POST /v1/admin/stand-down`** (active, quiesced or stood-down): the old holder's step
+after a takeover elsewhere. It ends the worker streams with `UNAVAILABLE` ("connect
+again"), stops the worker listener, goes not ready (`/readyz`, the health service) and
+answers the Execute and WaitExecution streams it kept from the `done/` rows the new
+holder writes, with no GOAWAY and no timeout. It does not give up the state store. It is
+not undone. A process that is never told to stand down but finds it is fenced (the store
+refused a write of its own: `superseded` turns true) fences its farm and answers its kept
+calls from the `done/` rows the same way. The process exits only when told to (`open_streams` and `open_sessions` say
+when it holds nothing).
+
+**A candidate** (`--await-takeover`, which needs `--admin-listen`) opens the state store
+without taking the generation, touches no epoch and writes nothing; it serves `/readyz`,
+`grpc.health.v1` and `GetCapabilities`, and no other REAPI call (`UNIMPLEMENTED`). It runs
+no scheduler or reconciler and binds no worker listener. It makes and changes no schema.
+A SQLite state file is held by one process (an exclusive file lock), so a candidate cannot
+run beside the process that holds the file: side by side needs the Postgres store.
+A start without `--await-takeover` takes the next generation and bumps the epoch, as any
+start does.
+
 ## `/v1/object-stores/...`
 
 Registers the farm's object store with the frontend, which keeps it as durable desired state
@@ -660,6 +764,8 @@ with a generation. A
 connection, a bucket and a prefix. The only role is `cold`, today's `--cold-store`; `history`
 and `backup` answer `422 role_not_supported` until something consumes them. A role here is
 neither an IAM role nor an enrollment role.
+Every verb of the API is in [the verbs table](design/operator-verbs.md); the bodies, the error
+codes and the rotation runbook are in [the design](design/object-store-registration.md).
 
 The routes exist when the frontend is started with `--object-store-secrets-dir DIR` (which
 needs `--api-listen`, `--api-token-file` and `--state-store`). `DIR` holds one file of mode
@@ -794,6 +900,36 @@ curl -X PUT -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
   --data '{"connection":"cold","bucket":"farm-cold","prefix":"cold/"}' \
   $API/v1/object-stores/bindings/cold
 curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' $API/v1/object-stores
+```
+
+**`kbf cluster object-store`** is a client of these routes on the frontend's host, one call a
+verb, printing the answer's JSON (exit 0 on a 2xx, 1 on anything else, 2 for a command line
+that does not parse). Every verb needs `--token-file F`, a read included, because every route
+passes the whole gate; `--api ADDR` names the listener (default `127.0.0.1:8982`).
+
+| Verb | Call |
+|---|---|
+| `object-store status` | `GET /v1/object-stores` |
+| `object-store audit [--limit N]` | `GET /v1/object-stores/audit[?limit=N]` |
+| `object-store connection list` | `GET /v1/object-stores/connections` |
+| `object-store connection show NAME` | `GET /v1/object-stores/connections/NAME` |
+| `object-store connection put NAME --endpoint URL --access-key-id ID (--secret-file F \| --secret-stdin) [--region R] [--conditional-put] [--min-put-rate BYTES] [--expect-generation N] [--no-verify]` | `PUT /v1/object-stores/connections/NAME` |
+| `object-store connection delete NAME` | `DELETE /v1/object-stores/connections/NAME` |
+| `object-store bind --connection NAME --bucket B [--role cold] [--prefix P] [--expect-generation N] [--no-verify]` | `PUT /v1/object-stores/bindings/cold` |
+| `object-store unbind [--role cold]` | `DELETE /v1/object-stores/bindings/cold` |
+| `object-store verify NAME [--bucket B] [--prefix P]` | `POST /v1/object-stores/connections/NAME:verify` |
+
+The secret key is never a flag or an environment variable: `connection put` reads it from
+standard input (`--secret-stdin`) or from a file (`--secret-file F`) that must be a regular
+file whose mode gives its group and others no access (0600 or 0400), else it exits 1 and
+calls nothing. Only the final line ending is cut. Names and the role are checked before any
+call (`bind --role history` exits 2). The key is in none of the command's output or errors.
+
+```sh
+kbf cluster object-store connection put cold --endpoint http://127.0.0.1:9000 \
+  --access-key-id AKID --secret-file key.txt --token-file T   # key.txt is mode 0600
+kbf cluster object-store bind --connection cold --bucket farm-cold --prefix cold/ --token-file T
+kbf cluster object-store status --token-file T
 ```
 
 The request body is read into memory and parsed; the buffers are not zeroized, so the

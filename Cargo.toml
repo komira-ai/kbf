@@ -44,10 +44,17 @@ flate2 = { version = "1.1.10", default-features = false, features = ["rust_backe
 # a browser encodes it. Already in the tree through url.
 form_urlencoded = "1.2.2"
 futures = "0.3.34"
+# The front-door proxy's upstream client (kbf-proxy): the window, concurrent-stream and
+# GOAWAY facts the pool needs are on h2's own types, not hyper's. Already in the tree
+# through hyper and tonic.
+h2 = "0.4.20"
 hex = "0.4.3"
-# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`).
+# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`)
+# and of the installer's loopback calls to a child (kbf-installer: `proxy::child_http`).
 # Already in the tree through hyper.
 httparse = "1.10.1"
+# Header maps of the front-door proxy (kbf-proxy); already in the tree through hyper.
+http = "1.5.0"
 # The frontend proxy's pass-through bodies (kbf-front); already in the tree through tonic.
 http-body = "1.1.0"
 # The registry client of kbf-image reads response bodies frame by frame. Already in the tree
@@ -66,6 +73,9 @@ postgres = "0.19.10"
 # takes plain TCP only). Both are already in the tree through axum and tonic.
 hyper = { version = "1.12.0", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
+# The model checker behind kbf-proxy's permit and hold-gate models (`--cfg kbf_loom`,
+# `cargo xtask proxy-loom`). A dev-dependency only, and only under that cfg.
+loom = "0.7.2"
 md-5 = "0.11.0"
 # macOS only (kbf-mac-session): OpenDirectory, for the per-lease users.
 objc2 = "0.6.5"
@@ -186,6 +196,7 @@ kbf-enroll-registry = { path = "crates/kbf-enroll-registry" }
 kbf-enroll = { path = "crates/kbf-enroll" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-gate = { path = "crates/kbf-gate" }
 kbf-history = { path = "crates/kbf-history" }
 kbf-image = { path = "crates/kbf-image" }
 kbf-host = { path = "crates/kbf-host" }
@@ -204,6 +215,7 @@ kbf-objstore = { path = "crates/kbf-objstore" }
 kbf-outputs = { path = "crates/kbf-outputs" }
 kbf-peer = { path = "crates/kbf-peer" }
 kbf-proto = { path = "crates/kbf-proto" }
+kbf-proxy = { path = "crates/kbf-proxy" }
 kbf-raft = { path = "crates/kbf-raft" }
 kbf-route = { path = "crates/kbf-route" }
 kbf-sched = { path = "crates/kbf-sched" }
@@ -230,6 +242,11 @@ xtask = { path = "crates/xtask" }
 # crates must not use. They are allowed workspace-wide; each pure crate denies them in
 # its `lib.rs` (an in-source attribute overrides this table), and the layering test in
 # `kbf-it` checks that the deny is present.
+[workspace.lints.rust]
+# `kbf_loom` swaps kbf-proxy's atomics for loom's (`cargo xtask proxy-loom`). Not `loom`:
+# tokio reads `cfg(loom)` too and then needs a loom dependency of its own.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kbf_loom)"] }
+
 [workspace.lints.clippy]
 disallowed_methods = "allow"
 disallowed_types = "allow"
