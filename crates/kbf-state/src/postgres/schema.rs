@@ -314,7 +314,7 @@ impl From<postgres::Error> for SchemaError {
 /// the connection.
 fn describe_refusal(err: &postgres::Error) -> String {
     match err.as_db_error() {
-        Some(db) if db.severity() == "FATAL" || db.severity() == "PANIC" => format!(
+        Some(db) if db.severity() == "FATAL" => format!(
             "the server refused the connection or ended the session (SQLSTATE {})",
             db.code().code()
         ),

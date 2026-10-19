@@ -208,7 +208,6 @@ mod database {
     use kbf_state::postgres::schema::{self, Migration};
     use kbf_state::{Cond, Store, Txn};
 
-    use super::super::fakes::*;
     use super::super::migrator::DbMigrator;
     use super::super::model::{Mode, Phase, PortError, StagedFacts, Step};
     use super::super::ports::{Migrator, RootOrders};
