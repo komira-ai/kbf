@@ -270,7 +270,7 @@ fn kbf(name: &str, stamp: &str, json: &str) -> PathBuf {
 /// The identity `kbf --version --json` prints, as a release build of `commit` makes it.
 fn identity(commit: &str, profile: &str) -> String {
     format!(
-        "{{\"commit\":\"{commit}\",\"min_protocol\":1,\"profile\":\"{profile}\",\"protocol\":1,\"state_schema\":1,\"version\":\"0.1.0\"}}\n"
+        "{{\"admin_protocol\":1,\"commit\":\"{commit}\",\"meta_log\":4,\"min_protocol\":1,\"profile\":\"{profile}\",\"protocol\":1,\"state_schema\":1,\"version\":\"0.1.0\"}}\n"
     )
 }
 
