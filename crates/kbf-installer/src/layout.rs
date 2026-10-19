@@ -43,6 +43,10 @@ const LINUX_LOCK: &str = "/run/kbf-installer/lock";
 const MACOS_LOCK: &str = "/var/run/kbf-installer/lock";
 const LINUX_TRUST: &str = "/usr/share/kbf-installer/trust";
 const MACOS_TRUST: &str = "/usr/local/kbf-installer/trust";
+/// The node's own configuration (`kbf.toml`): `/etc/kbf` on Linux, `/usr/local/etc/kbf` on
+/// macOS, where `installer.toml` is too.
+const LINUX_CONFIG: &str = "/etc/kbf/kbf.toml";
+const MACOS_CONFIG: &str = "/usr/local/etc/kbf/kbf.toml";
 
 /// The files of the trust directory.
 pub const GH: &str = "gh";
@@ -120,6 +124,13 @@ impl Platform {
         match self {
             Platform::Linux => LINUX_LOCK,
             Platform::MacOs => MACOS_LOCK,
+        }
+    }
+
+    fn kbf_toml(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_CONFIG,
+            Platform::MacOs => MACOS_CONFIG,
         }
     }
 
@@ -245,6 +256,11 @@ impl Layout {
     /// The directory a stage makes its scratch directory in (`work/`).
     pub fn work_dir(&self) -> HostPath {
         path_in(self.platform.state_dir(), "work")
+    }
+
+    /// The node's own `kbf.toml`: its `mode` says what this host runs.
+    pub fn kbf_toml(&self) -> HostPath {
+        path(self.platform.kbf_toml())
     }
 
     /// The directory of what offline verification trusts.
