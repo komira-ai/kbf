@@ -1092,14 +1092,14 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         min_generation: Some(0),
         commit: None,
         database: Some(DATABASE.to_owned()),
-        installer_config: Some("/tmp/i.toml".to_owned()),
+        installer_config: None,
     };
     let mut exec = host();
     let err = go(&FakeOs::linux(), &mut exec, &bad, APPLY).expect_err("refused");
     let SetupError::Invalid(found) = &err else {
         panic!("{err:?}");
     };
-    assert_eq!(found.len(), 6, "{found:#?}");
+    assert_eq!(found.len(), 5, "{found:#?}");
     assert_eq!(err.exit(), Exit::Usage);
     assert!(exec.log.is_empty() && exec.queries.borrow().is_empty());
 }
@@ -1288,8 +1288,15 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
         c[7],
         "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist"
     );
-    assert_eq!(file_meta(&exec, ENROLL_TOKEN), (0o600, ROOT));
-    assert_eq!(file_meta(&exec, KBF_TOML), (0o640, ROOT));
+    // The Mac's configuration directory, where its LaunchDaemon waits for `installer.toml`.
+    assert_eq!(
+        file_meta(&exec, "/usr/local/etc/kbf/enroll.token"),
+        (0o600, ROOT)
+    );
+    assert_eq!(
+        file_meta(&exec, "/usr/local/etc/kbf/kbf.toml"),
+        (0o640, ROOT)
+    );
     let orders = exec.entries.get(&hp("/var/db/kbf-installer/orders"));
     assert!(matches!(
         orders,
@@ -1298,7 +1305,10 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
             ..
         })
     ));
-    assert!(text(&exec, INSTALLER_TOML).contains("node_cert = \"/var/db/kbf/pki/daemon.pem\""));
+    assert!(
+        text(&exec, "/usr/local/etc/kbf/installer.toml")
+            .contains("node_cert = \"/var/db/kbf/pki/daemon.pem\"")
+    );
 }
 
 #[test]
