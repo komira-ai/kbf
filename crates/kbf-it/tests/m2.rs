@@ -511,7 +511,7 @@ impl Cell {
             .arg("--cgroup-root")
             .arg(self.dir.join("cgroup"))
             .env("PATH", path)
-            .env(fake::DIR, &self.dir)
+            .env(fake::DIR, self.dir.path())
             .env(fake::DEFECT, &self.defect)
             .env(fake::CGROUP_ROOT, self.dir.join("cgroup"));
         command

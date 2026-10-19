@@ -8,7 +8,7 @@
 
 use std::future::pending;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Output};
 use std::sync::Arc;
 use std::time::Duration;

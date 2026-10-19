@@ -435,7 +435,7 @@ impl Cell {
             .arg(self.http.addr.to_string())
             .env("AWS_ACCESS_KEY_ID", "test-access")
             .env("AWS_SECRET_ACCESS_KEY", "test-secret")
-            .env(fake::DIR, &self.dir)
+            .env(fake::DIR, self.dir.path())
             .env(fake::DEFECT, &self.defect)
             .env(fake::DAEMON_LOG, self.work().join("logs/daemon.err"));
         for tool in tools {
