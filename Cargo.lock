@@ -1379,6 +1379,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-bake"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-gate",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
 name = "kbf-baseline"
 version = "0.1.0"
 dependencies = [
@@ -1796,6 +1808,7 @@ dependencies = [
  "bytes",
  "clap",
  "flate2",
+ "futures",
  "h2",
  "hex",
  "http",
@@ -1804,10 +1817,13 @@ dependencies = [
  "kbf-cli",
  "kbf-host",
  "kbf-installer",
+ "kbf-proto",
  "kbf-proxy",
+ "kbf-state",
  "kbf-testkit",
  "kbf-update",
  "libc",
+ "postgres",
  "rcgen",
  "rustix",
  "rustls",
@@ -1820,8 +1836,10 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "tonic",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2154,6 +2172,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4290,6 +4310,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "rustls-native-certs",
  "socket2",
  "sync_wrapper",
  "tokio",

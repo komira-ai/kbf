@@ -22,6 +22,9 @@ publish.workspace = true
 # socket and no network, and a staged binary is never run as root. The one exception is the
 # `proxy` verb (the `kbf-proxy` runtime: the frontend host's public port), which runs as the
 # unprivileged service user and shares nothing with the root half (tests/layering.rs in kbf-it).
+# `deploy`'s CAS smoke is a small gRPC client of the local REAPI listener (kbf-proto, tonic, a
+# current-thread tokio runtime built for the one check); toml and x509-parser read the
+# frontend's own config for the listener's address and certificate name.
 
 [features]
 # `testkit`: the scratch host and state helpers other crates' tests of the `host` verbs use.
@@ -35,11 +38,15 @@ async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
 flate2.workspace = true
+futures.workspace = true
 hex.workspace = true
 httparse.workspace = true
 hyper.workspace = true
 kbf-host.workspace = true
 kbf-proxy.workspace = true
+kbf-proto.workspace = true
+# `postgres`: the schema's migrations and the client that applies them (`database` module).
+kbf-state = { workspace = true, features = ["postgres"] }
 kbf-update.workspace = true
 libc.workspace = true
 rustix = { workspace = true, features = ["event", "fs", "net", "process"] }
@@ -50,9 +57,11 @@ subtle.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 # The proxy verb's signal handlers run on kbf-proxy's runtime.
-tokio = { workspace = true, features = ["rt", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["net", "rt", "signal", "sync", "time"] }
+tonic = { workspace = true, features = ["tls-native-roots", "tls-ring"] }
 toml.workspace = true
 tracing.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
 # The proxy verb's process test is an h2c client of the real binary.
@@ -67,6 +76,7 @@ kbf-update.workspace = true
 # The proxy verb serves TLS: its process test makes a CA and a server certificate, and is a
 # TLS client of the real binary.
 rcgen.workspace = true
+postgres.workspace = true
 rustls.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
 tokio-rustls.workspace = true

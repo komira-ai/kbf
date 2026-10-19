@@ -81,6 +81,20 @@ pub enum Mode {
     AllInOne,
 }
 
+impl Mode {
+    /// The mode as `--mode` spells it (clap's own name for it, so there is one spelling).
+    pub fn name(self) -> String {
+        self.to_possible_value()
+            .map_or_else(String::new, |v| v.get_name().to_owned())
+    }
+
+    /// Whether this mode keeps its state in the Postgres database the installer owns (the
+    /// frontend and all-in-one modes; the others keep none).
+    pub fn keeps_state_in_database(self) -> bool {
+        matches!(self, Mode::Frontend | Mode::AllInOne)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ReleaseSource {
     Url,
@@ -107,6 +121,12 @@ pub struct SetupArgs {
     /// Enable the units without starting them.
     #[arg(long)]
     pub no_start: bool,
+    /// installer.toml, under the host root: for `--mode frontend` and `all-in-one`, its
+    /// `database` key names the state database whose schema `setup` creates (or brings
+    /// forward); without `--apply` it only reports what it would do. Read for those two modes
+    /// only. The same flag, with the same meaning, as on `run`.
+    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
+    pub installer_config: kbf_host::HostPath,
 }
 
 #[derive(Args)]
@@ -144,6 +164,20 @@ pub struct ServiceArgs {
 }
 
 impl ServiceArgs {
+    /// Whether the service this installer restarts is the unit of a mode that keeps its state
+    /// in the database (`kbf-frontend@<instance>.service`, `kbf-all-in-one.service` or its
+    /// template `kbf-all-in-one@<instance>.service`): the installer is not told the host's
+    /// mode, the unit it restarts is the one place that names it. A launchd label names no mode.
+    pub fn runs_database_mode(&self) -> bool {
+        self.unit.as_deref().is_some_and(|u| {
+            u == "kbf-all-in-one.service"
+                || (["kbf-frontend@", "kbf-all-in-one@"]
+                    .iter()
+                    .any(|p| u.starts_with(p))
+                    && u.ends_with(".service"))
+        })
+    }
+
     /// How to restart the service. clap makes exactly one of the two flags present
     /// (`required_unless_present`, `conflicts_with`), so the label is there whenever the
     /// unit is not.
@@ -185,6 +219,11 @@ pub struct RunArgs {
     /// Stop after this many passes (a rehearsal or a test); without it, run until stopped.
     #[arg(long)]
     pub passes: Option<u64>,
+    /// installer.toml, under the host root: its `database` key is the state database the
+    /// installer migrates to what a release needs before that release is activated. Required
+    /// when the unit restarted after a swap is a frontend's or the all-in-one's.
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub installer_config: Option<kbf_host::HostPath>,
 }
 
 #[derive(Args)]
@@ -232,7 +271,7 @@ impl Verb {
     }
 
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
-    /// verbs that exist (`run`, `boot-check`, `proxy` and the operator's verbs).
+    /// verbs that exist (`run`, `boot-check`, `proxy`, the operator's verbs and `setup` for the modes with a database).
     pub fn built_by(&self) -> Option<&'static str> {
         match self {
             Verb::Run(_)
@@ -243,6 +282,8 @@ impl Verb {
             | Verb::Rollback(_)
             | Verb::Gc(_)
             | Verb::Quiesce => None,
+            // Only its database step is built; the rest of `setup` is not.
+            Verb::Setup(a) if a.mode.keeps_state_in_database() => None,
             Verb::Setup(_) | Verb::Check => Some("P10"),
             Verb::Status => Some("P4"),
             Verb::Update(_) => Some("P13"),

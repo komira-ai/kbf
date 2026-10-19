@@ -160,6 +160,7 @@ pub fn installer_toml_url() -> InstallerToml {
         node_cert: None,
         node_key: None,
         proxy: None,
+        database: None,
     }
 }
 

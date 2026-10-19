@@ -55,6 +55,8 @@ Options:
           The first release to install (40 hex characters)
       --no-start
           Enable the units without starting them
+      --installer-config <INSTALLER_CONFIG>
+          installer.toml, under the host root: for `--mode frontend` and `all-in-one`, its `database` key names the state database whose schema `setup` creates (or brings forward); without `--apply` it only reports what it would do. Read for those two modes only. The same flag, with the same meaning, as on `run` [default: /etc/kbf/installer.toml]
   -h, --help
           Print help
 
@@ -94,6 +96,8 @@ Options:
           The fewest seconds between one activation and the next [default: 60]
       --passes <PASSES>
           Stop after this many passes (a rehearsal or a test); without it, run until stopped
+      --installer-config <INSTALLER_CONFIG>
+          installer.toml, under the host root: its `database` key is the state database the installer migrates to what a release needs before that release is activated. Required when the unit restarted after a swap is a frontend's or the all-in-one's
   -h, --help
           Print help
 
