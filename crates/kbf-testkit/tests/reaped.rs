@@ -175,3 +175,22 @@ fn a_spawned_child_holds_no_descriptor_the_test_left_inheritable() {
         leaked.as_raw_fd()
     );
 }
+
+/// Catches a guard that signals a child it has already waited for (the pid may be reused by
+/// then) or that cannot be waited through: a child the test reaped itself, through the
+/// guard's `&mut Child`, is left alone on drop, and its status is the one the child exited
+/// with.
+#[test]
+fn a_child_the_test_already_reaped_is_left_alone_on_drop() {
+    let mut command = Command::new(ACT);
+    command.args(["exit", "7"]);
+    let mut child = reaped::spawn(&mut command, 3).expect("spawn");
+    let status = child.wait().expect("wait through the guard");
+    assert_eq!(status.code(), Some(7));
+    let dropped = Instant::now();
+    drop(child);
+    assert!(
+        dropped.elapsed() < GRACE,
+        "waited out the grace for a child that had exited"
+    );
+}

@@ -90,6 +90,7 @@ fn close_range_cloexec(_first: i32) -> bool {
 
 /// [`cloexec_from`] with the one-call way as `range`: when it did not do the work, walk the
 /// numbers.
+#[inline(never)]
 fn cloexec_from_with(first: i32, range: fn(i32) -> bool) {
     if range(first) {
         return;
@@ -112,8 +113,14 @@ fn cloexec_from_with(first: i32, range: fn(i32) -> bool) {
 /// The `spawn` error.
 pub fn spawn(command: &mut Command, keep_below: i32) -> io::Result<Reaped> {
     // SAFETY: the hook makes only async-signal-safe calls (`syscall`, `sysconf`, `fcntl`).
-    unsafe { command.pre_exec(move || cloexec_from(keep_below)) };
+    unsafe { command.pre_exec(cloexec_hook(keep_below)) };
     command.spawn().map(Reaped)
+}
+
+/// The `pre_exec` hook [`spawn`] installs. Its own function so a test can run it in the
+/// test process: inside the forked child no coverage is recorded.
+fn cloexec_hook(keep_below: i32) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
+    move || cloexec_from(keep_below)
 }
 
 #[cfg(test)]
@@ -147,6 +154,49 @@ mod tests {
             libc::FD_CLOEXEC,
             "the first"
         );
+        // SAFETY: closing the two duplicates this test made.
+        unsafe {
+            libc::close(below);
+            libc::close(above);
+        }
+    }
+
+    /// Catches a walk that runs although the one-call way did the work: nothing is marked
+    /// then, so a descriptor above the first stays inheritable. Placed from 1300.
+    #[test]
+    fn the_walk_does_not_run_when_the_range_call_did_the_work() {
+        let null = std::fs::File::open("/dev/null").expect("open");
+        // SAFETY: duplicates a descriptor this test holds, without close-on-exec.
+        let fd = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 1300) };
+        assert!(fd >= 1300);
+        cloexec_from_with(1300, |_| true);
+        // SAFETY: reading the flags of a descriptor this test holds.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, 0, "the walk ran");
+        // SAFETY: closing the duplicate this test made.
+        unsafe { libc::close(fd) };
+    }
+
+    /// Catches a hook that marks the wrong range or ignores `keep_below`: the hook `spawn`
+    /// installs, run here (a forked child records no coverage), marks from its number up
+    /// and leaves a lower descriptor alone. Placed from 1400 and 1500.
+    #[test]
+    fn the_spawn_hook_marks_from_keep_below_up() {
+        let null = std::fs::File::open("/dev/null").expect("open");
+        let dup_from = |base: i32| {
+            // SAFETY: duplicates a descriptor this test holds, without close-on-exec.
+            let fd = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, base) };
+            assert!(fd >= base);
+            fd
+        };
+        let (below, above) = (dup_from(1400), dup_from(1500));
+        cloexec_hook(1500)().expect("hook");
+        let flags = |fd: i32| {
+            // SAFETY: reading the flags of a descriptor this test holds.
+            unsafe { libc::fcntl(fd, libc::F_GETFD) }
+        };
+        assert_eq!(flags(below) & libc::FD_CLOEXEC, 0, "below keep_below");
+        assert_eq!(flags(above) & libc::FD_CLOEXEC, libc::FD_CLOEXEC, "from it");
         // SAFETY: closing the two duplicates this test made.
         unsafe {
             libc::close(below);
