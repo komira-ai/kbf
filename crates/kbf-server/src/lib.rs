@@ -97,6 +97,7 @@ mod listen;
 mod local;
 pub mod log_file;
 pub mod machine;
+pub mod managed;
 mod map_push;
 pub mod mdm;
 pub mod members;
@@ -114,6 +115,8 @@ pub mod replication;
 pub mod rollout;
 mod run_record;
 pub mod serve;
+#[cfg(test)]
+mod serve_remote_tests;
 pub mod stamp;
 mod start;
 mod start_exit;

@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use kbf_server::Args;
+use kbf_server::proxy_auth::SECRET_BYTES;
 use kbf_server::stores::StoreUri;
 
 use super::{CertNeed, ContainerNeed, FileNeed, Needs, Row};
@@ -74,6 +75,7 @@ impl Needs {
             flag,
             path: path.to_owned(),
             secret: false,
+            exact_len: None,
         });
     }
 
@@ -82,6 +84,17 @@ impl Needs {
             flag,
             path: path.to_owned(),
             secret: true,
+            exact_len: None,
+        });
+    }
+
+    /// A secret file that must hold exactly `len` bytes.
+    fn secret_of_len(&mut self, flag: &'static str, path: &Path, len: usize) {
+        self.files.push(FileNeed {
+            flag,
+            path: path.to_owned(),
+            secret: true,
+            exact_len: Some(len),
         });
     }
 
@@ -130,7 +143,7 @@ fn server_files(n: &mut Needs, a: &Args) {
         n.secret("--api-token-file", token);
     }
     if let Some(secret) = &a.proxy_auth_file {
-        n.secret("--proxy-auth-file", secret);
+        n.secret_of_len("--proxy-auth-file", secret, SECRET_BYTES);
     }
     if let Some(cert) = &a.worker_tls_cert {
         let ca = a.worker_client_ca.as_deref();

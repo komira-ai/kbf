@@ -56,8 +56,8 @@ tracing.workspace = true
 # The stand-in `crun`'s (kbf-cli-fake-crun); the effective uid and the host name that
 # a start that enrolls reads.
 rustix = { workspace = true, features = ["process", "system"] }
-# The schema version of the SQLite state file, which `kbf --version --json` reports.
-kbf-state.workspace = true
+# The Postgres state schema version, which `kbf --version --json` reports.
+kbf-state = { workspace = true, features = ["postgres"] }
 # The identity `kbf --version --json` prints (src/version.rs), and the bodies of
 # `kbf cluster` (src/cluster.rs).
 serde_json.workspace = true

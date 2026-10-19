@@ -100,12 +100,17 @@ listener:
   `x-kbf-node-id` is refused `PERMISSION_DENIED`. A `Membership` registration
   or heartbeat has no certificate names behind the proxy: the one name is the proxied node
   id, so the host of its instance id and its address must be that name (up to ASCII case; an IP
-  address is refused). The proxied role must be `storage`. A `serial` or `spki-sha256` deny entry cannot name a proxied
-  caller, a `node` entry can: revoke by node name while behind the proxy, or have the
-  proxy refuse the certificate.
+  address is refused). The proxied role must be `storage`.
 
 What the flag does not do, and what the proxy must do:
 
+- **Deny-list entries by `serial` or `spki-sha256` do nothing behind the proxy.** The child
+  sees no certificate, only the node id and role the proxy forwarded, so only a `node`
+  entry in `--worker-deny-list` can name a proxied caller. To revoke a certificate, list
+  its node, or have the proxy refuse the certificate. A server started with
+  `--proxy-auth-file` and a deny list holding a `serial` or `spki-sha256` entry logs a
+  warning at start naming the count. (Enforcing them would need the proxy to forward a
+  verified serial and key in a new header; that is the proxy's work, not this flag's.)
 - The storage listener (`kbf storage`, and the in-process one of all-in-one) is not behind
   the proxy: it keeps its own mutual TLS and its own admission.
 - `--reapi-auth-policy mtls` finds no certificate on a proxied REAPI call and refuses every
@@ -547,6 +552,94 @@ The number is as old as the newest heartbeat. A copy owed since then is not in i
 whoever acts on a zero keeps new writes away from the node first (drains it), then reads
 again. A member that left the map (a `DOWN` member leaves after the dwell) is not counted.
 `503` with `{"error": ...}` when the membership cannot be read.
+
+## The admin calls: `GET /v1/admin/role` and `POST /v1/admin/{quiesce,resume,takeover,stand-down}`
+
+A `kbf --mode frontend` started with `--admin-listen <addr>` serves these on a port of
+their own, separate from the operator API. The address must be a loopback address (any
+other is refused at start, in the flags and again when the port is bound), and the calls
+carry no credential: they move the scheduler's role, so nothing but the host's own
+processes may reach them. The port needs `--state-store`. The calls and the `role` answer
+are versioned by `admin_protocol` in `kbf --version --json` (`docs/artifacts.md`).
+
+**`GET /v1/admin/role`**:
+
+```json
+{
+  "role": "active",
+  "instance_id": "5d1c4a52-8b0e-4f64-9a27-3c0e4f8d9a10",
+  "admin_protocol": 1,
+  "generation": 7,
+  "held_generation": 7,
+  "superseded": false,
+  "open_streams": 3,
+  "open_sessions": 2,
+  "reapi": "127.0.0.1:8980",
+  "worker": "127.0.0.1:8981",
+  "api": "127.0.0.1:8982"
+}
+```
+
+- `role`: `candidate` (started with `--await-takeover`: holds no generation and schedules
+  nothing), `active` (holds the generation and schedules), `quiesced` (holds it and has
+  stopped scheduling, assigning and requeueing) or `stood-down` (another process holds the
+  generation).
+- `instance_id`: a UUID, new for each process.
+- `generation`: the generation the state store is at now (`null` if it cannot be read);
+  `held_generation`: the one this process took (`null` for a candidate). A takeover passes
+  the holder's `generation` as `expect`.
+- `superseded`: the store has refused a write of this process because another writer holds
+  the generation.
+- `open_streams`: Execute and WaitExecution streams open; `open_sessions`: worker streams
+  open.
+- `reapi`, `worker`, `api`: the listeners. A candidate has no worker listener, and a
+  stood-down process has none again.
+
+Every call below answers `200` with this object after the call. A call that does not apply
+answers `409` with the object and an `error` naming why (`role`, or a generation); a body
+that is not what the call takes is `400`.
+
+**`POST /v1/admin/quiesce`** (active or quiesced): waits, for at most 10 seconds, for the
+Execute calls between their request and their queueing and the results being taken, then
+fences the farm: it feeds the scheduler nothing, so nothing is granted, assigned or
+requeued, a call that would queue is refused `UNAVAILABLE`, and a worker's result or
+heartbeat is not applied. It writes the requeues the store refused. Idempotent. Open
+streams and worker sessions stay open. While quiesced, a worker's heartbeat or result is not
+applied, so a quiesce is meant to last seconds (a takeover's limit is 10): one longer than
+the leases' expiry lets the scheduler expire the leases of work still running and requeue it
+when the process resumes. Nothing bounds it.
+
+**`POST /v1/admin/resume`** (quiesced or active): undoes a quiesce, for a takeover that did
+not happen. Refused with `409` when the store is no longer at `held_generation` or the
+store has refused a write of this process (another writer holds it: only `stand-down`
+applies). The farm fed the scheduler nothing while it was quiesced, so its memory is the
+store's as of the quiesce; nothing is reloaded.
+
+**`POST /v1/admin/takeover`**, body `{"expect": N}` (candidate only): takes the generation,
+which must be exactly `N` (a store at another generation is refused with `409` and nothing
+is written), keeps the epoch (daemons that redial keep the runs of their leases), reads all
+state from the store, and starts the scheduler, the reconciler and the worker listener on
+the sockets the candidate already bound. `500` if the generation was taken and the
+frontend could not start; the process then ends.
+
+**`POST /v1/admin/stand-down`** (active, quiesced or stood-down): the old holder's step
+after a takeover elsewhere. It ends the worker streams with `UNAVAILABLE` ("connect
+again"), stops the worker listener, goes not ready (`/readyz`, the health service) and
+answers the Execute and WaitExecution streams it kept from the `done/` rows the new
+holder writes, with no GOAWAY and no timeout. It does not give up the state store. It is
+not undone. A process that is never told to stand down but finds it is fenced (the store
+refused a write of its own: `superseded` turns true) fences its farm and answers its kept
+calls from the `done/` rows the same way. The process exits only when told to (`open_streams` and `open_sessions` say
+when it holds nothing).
+
+**A candidate** (`--await-takeover`, which needs `--admin-listen`) opens the state store
+without taking the generation, touches no epoch and writes nothing; it serves `/readyz`,
+`grpc.health.v1` and `GetCapabilities`, and no other REAPI call (`UNIMPLEMENTED`). It runs
+no scheduler or reconciler and binds no worker listener. It makes and changes no schema.
+A SQLite state file is held by one process (an exclusive file lock), so a candidate cannot
+run beside the process that holds the file: side by side needs the Postgres store.
+A start without `--await-takeover` takes the next generation and bumps the epoch, as any
+start does.
 
 ## `/v1/object-stores/...`
 

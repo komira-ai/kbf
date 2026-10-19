@@ -256,6 +256,14 @@ pub struct ResultDoc {
     pub gates: Vec<GateResult>,
     /// Why a run ended without deciding, or was dropped.
     pub note: Option<String>,
+    /// The release tag a gamma verdict is for; `release verdict` refuses another.
+    pub tag: Option<String>,
+    /// What makes the release not reversible (section 8.3), one line each; the notes carry it.
+    pub not_reversible: Vec<String>,
+    /// The scenarios only gamma found (section 10), one line each; the notes count them.
+    pub escapes: Vec<String>,
+    /// The earlier releases this one withdraws (section 8.2); the notes name them.
+    pub withdrawn: Vec<String>,
 }
 
 impl ResultDoc {
@@ -278,6 +286,10 @@ impl ResultDoc {
             waivers: Vec::new(),
             gates: Vec::new(),
             note: None,
+            tag: None,
+            not_reversible: Vec::new(),
+            escapes: Vec::new(),
+            withdrawn: Vec::new(),
         }
     }
 
