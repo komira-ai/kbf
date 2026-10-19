@@ -1,6 +1,7 @@
 //! Rules `storage`, `state-store` and `ports` read on their own: how a flag and a
-//! variable are read, which `--state-store` values pass (a SQLite file by an absolute
-//! path, nothing else), and which listeners share a port.
+//! variable are read, which `--state-store` values pass (a Postgres URI without a
+//! password in the frontend's unit, and a SQLite file by an absolute path in the
+//! all-in-one's), and which listeners share a port.
 
 use std::path::Path;
 
@@ -115,62 +116,72 @@ fn frontend(service: &str, flags: &str) -> UnitFile {
     ))
 }
 
-const POSTGRES: &str = "--state-store is a postgres URI: postgres is not wired yet; the state store is sqlite:///<absolute path>";
-const NOT_SQLITE: &str =
-    "--state-store is not sqlite:///<absolute path>: SQLite is the only state store kbf opens";
+const SQLITE_FRONTEND: &str = "--state-store is sqlite:// in a frontend unit: the frontend's state store is Postgres (postgres://<host>/<db>), and SQLite is dropped for it";
+const PASSWORD: &str = "--state-store carries a password: kbf's command line is readable by every user on the node, and kbf refuses such a URI; give a socket or a passwordless URI";
+const NOT_FRONTEND: &str =
+    "--state-store is not postgres://<host>/<db>: the frontend's state store is Postgres";
+const NOT_ANY: &str =
+    "--state-store is neither postgres://<host>/<db> nor sqlite:///<absolute path>";
 const BAD_PATH: &str = "--state-store is sqlite:// with an empty, relative or not normal path: give sqlite:///<absolute path>";
 
-/// Catches a SQLite file by an absolute path refused (in either flag form, quoted), a
-/// unit with no `--state-store` failed, and a Postgres URI passed in either scheme, with
-/// or without a password, in either flag form or as the last of two values (the planted
-/// mutant: the postgres branch returning `None` turns this red). No message holds the
-/// value.
+fn unit_of(mode: &str, flags: &str) -> UnitFile {
+    unit(&format!(
+        "[Service]\nExecStart=/usr/local/bin/kbf {mode} {flags}\n"
+    ))
+}
+
+/// Catches a Postgres URI refused in the frontend's unit (either scheme, a socket form,
+/// a host and port, in either flag form, quoted, or as the last of two values), a unit
+/// with no `--state-store` failed, and a SQLite file passed there: the frontend's store
+/// is Postgres and SQLite is dropped for it (planted mutants: the postgres branch
+/// returning a refusal turns the first loop red; the frontend arm allowing sqlite turns
+/// the second red). No message holds the value.
 #[test]
-fn the_state_store_is_a_sqlite_file_and_postgres_is_not_wired_yet() {
+fn the_frontends_state_store_is_postgres_and_sqlite_is_refused() {
     for flags in [
-        "--state-store=sqlite:///var/lib/kbf/state.db",
-        "--state-store sqlite:///var/lib/kbf/state.db",
-        "\"--state-store=sqlite:///var/lib/kbf/state.db\"",
-        "--state-store=postgres://kbf@db/kbf --state-store=sqlite:///s.db",
+        "--state-store=postgres:///kbf?host=/run/postgresql",
+        "--state-store postgres:///kbf?host=/run/postgresql",
+        "\"--state-store=postgres:///kbf?host=/run/postgresql\"",
+        "--state-store=postgresql://kbf@db.example:5432/kbf",
+        "--state-store=postgres://db/kbf",
+        "--state-store=sqlite:///s.db --state-store=postgres://db/kbf",
         "",
     ] {
         assert_eq!(
-            state_store(&frontend("", flags)),
+            state_store(&frontend("", flags), Mode::Frontend),
             Vec::<String>::new(),
             "{flags}"
         );
     }
     for flags in [
-        "--state-store=postgres://kbf@db/kbf",
-        "--state-store=postgresql://kbf@db.example:5432/kbf",
-        "--state-store=postgres://kbf:secret@db/kbf",
-        "--state-store postgres://db/kbf?password=secret",
-        "--state-store=sqlite:///s.db --state-store=postgres://kbf@db/kbf",
+        "--state-store=sqlite:///var/lib/kbf/state.db",
+        "--state-store sqlite:///var/lib/kbf/state.db",
+        "\"--state-store=sqlite:///var/lib/kbf/state.db\"",
+        "--state-store=postgres://db/kbf --state-store=sqlite:///var/lib/kbf/state.db",
+        "--state-store=sqlite://relative/state.db",
+        "--state-store=sqlite://",
     ] {
-        let got = state_store(&frontend("", flags));
-        assert_eq!(got, [POSTGRES], "{flags}");
-        assert!(!got[0].contains("secret") && !got[0].contains("db/kbf"));
+        let got = state_store(&frontend("", flags), Mode::Frontend);
+        assert_eq!(got, [SQLITE_FRONTEND], "{flags}");
+        assert!(!got[0].contains("state.db"));
     }
 }
 
-/// Catches a value of another scheme, or none, passed (or taken for postgres, or for a
-/// bad SQLite path), and a SQLite path that is empty, relative or not normal passed.
+/// The all-in-one unit keeps its SQLite file until the farm is moved (its template says
+/// why), so there the rule takes a SQLite file by an absolute path as well as Postgres,
+/// and judges the path. Catches the frontend's refusal applied to every mode (the
+/// all-in-one's own rendered unit would fail), and a bad SQLite path passed.
 #[test]
-fn any_other_scheme_and_a_relative_or_empty_sqlite_path_fail() {
-    for value in [
+fn the_all_in_one_unit_may_still_name_a_sqlite_file() {
+    for flags in [
+        "--state-store=sqlite:///var/lib/kbf/state.db",
+        "--state-store=postgres:///kbf?host=/run/postgresql",
         "",
-        "state.db",
-        "/var/lib/kbf/state.db",
-        "mysql://kbf@db/kbf",
-        "file:///var/lib/kbf/state.db",
-        "sqlite:/var/lib/kbf/state.db",
-        "postgres:/db/kbf",
-        "SQLITE:///var/lib/kbf/state.db",
     ] {
         assert_eq!(
-            state_store(&frontend("", &format!("--state-store={value}"))),
-            [NOT_SQLITE],
-            "{value}"
+            state_store(&unit_of("all-in-one", flags), Mode::AllInOne),
+            Vec::<String>::new(),
+            "{flags}"
         );
     }
     for value in [
@@ -182,8 +193,82 @@ fn any_other_scheme_and_a_relative_or_empty_sqlite_path_fail() {
         "sqlite:///var/lib/../kbf/state.db",
     ] {
         assert_eq!(
-            state_store(&frontend("", &format!("--state-store={value}"))),
+            state_store(
+                &unit_of("all-in-one", &format!("--state-store={value}")),
+                Mode::AllInOne
+            ),
             [BAD_PATH],
+            "{value}"
+        );
+    }
+}
+
+/// Catches a password in the URI passed (as user information or as a `password`
+/// parameter in any case, among other parameters), a URI without one refused for it
+/// (a user name, a colon in a port or a query), and the secret echoed in the message.
+#[test]
+fn a_password_in_the_state_store_uri_fails_without_echo() {
+    for value in [
+        "postgres://kbf:hunter2@db/kbf",
+        "postgresql://:hunter2@db/kbf",
+        "postgres://db/kbf?password=hunter2",
+        "postgres://db/kbf?sslmode=prefer&PASSWORD=hunter2",
+        "postgres:///kbf?host=/run/postgresql&password=hunter2",
+    ] {
+        for mode in [Mode::Frontend, Mode::AllInOne] {
+            let got = state_store(
+                &unit_of(mode.name(), &format!("--state-store={value}")),
+                mode,
+            );
+            assert_eq!(got, [PASSWORD], "{mode} {value}");
+        }
+    }
+    for value in [
+        "postgres://kbf@db:5432/kbf",
+        "postgres://db/kbf?application_name=a:b",
+        "postgres://db/kbf?passwordless=1",
+        "postgres:///kbf?host=/run/postgresql",
+    ] {
+        assert_eq!(
+            state_store(
+                &frontend("", &format!("--state-store={value}")),
+                Mode::Frontend
+            ),
+            Vec::<String>::new(),
+            "{value}"
+        );
+    }
+}
+
+/// Catches a value of another scheme, or none, passed in either mode (or taken for
+/// postgres or sqlite), and the message that names the wrong set of schemes for the mode.
+#[test]
+fn any_other_scheme_fails() {
+    for value in [
+        "",
+        "state.db",
+        "/var/lib/kbf/state.db",
+        "mysql://kbf@db/kbf",
+        "file:///var/lib/kbf/state.db",
+        "sqlite:/var/lib/kbf/state.db",
+        "postgres:/db/kbf",
+        "postgres://",
+        "SQLITE:///var/lib/kbf/state.db",
+    ] {
+        assert_eq!(
+            state_store(
+                &frontend("", &format!("--state-store={value}")),
+                Mode::Frontend
+            ),
+            [NOT_FRONTEND],
+            "{value}"
+        );
+        assert_eq!(
+            state_store(
+                &unit_of("all-in-one", &format!("--state-store={value}")),
+                Mode::AllInOne
+            ),
+            [NOT_ANY],
             "{value}"
         );
     }
@@ -197,7 +282,7 @@ fn a_state_store_that_names_a_variable_fails() {
     let filed = "EnvironmentFile=/etc/kbf/state-store.env\n";
     let refused = |var: &str| {
         format!(
-            "--state-store names ${{{var}}}: systemd expands it into kbf's command line, which every user on the node can read in /proc, and the rule cannot read the store it names; write sqlite:///<absolute path>"
+            "--state-store names ${{{var}}}: systemd expands it into kbf's command line, which every user on the node can read in /proc, and the rule cannot read the store it names; write the URI itself"
         )
     };
     for (service, value, var) in [
@@ -207,7 +292,10 @@ fn a_state_store_that_names_a_variable_fails() {
         ("", "postgres://$PGUSER@db/kbf", "PGUSER"),
     ] {
         assert_eq!(
-            state_store(&frontend(service, &format!("--state-store={value}"))),
+            state_store(
+                &frontend(service, &format!("--state-store={value}")),
+                Mode::Frontend
+            ),
             [refused(var)],
             "{value}"
         );
