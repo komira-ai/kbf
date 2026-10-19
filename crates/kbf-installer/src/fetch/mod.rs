@@ -21,12 +21,13 @@
 //!
 //! What this module does **not** do is the rest of section 5's order (attestation of the file,
 //! its shape, the binary's own report, the install): those are the verify pipeline's
-//! (`stage`, P8), which takes the file written here. Nothing written here is root's authority
-//! until that pipeline has accepted it.
+//! (`stage`, P8), which takes the file written here; `helper::fetcher_real` is the joint
+//! between the two. Nothing written here is root's authority until that pipeline has accepted it.
 
 pub mod child;
 pub mod identity;
 pub mod pipe;
+pub mod user;
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -35,9 +36,11 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::layout::Platform;
 use crate::run::{Confine, RunAs};
 use identity::{Identity, IdentityFault};
 use pipe::{Caps, ChildSpec, PipeFault, Received};
+use user::UserFault;
 
 /// The file name of the unprivileged account the child runs as (Linux; `_kbf-fetch` on macOS).
 pub const FETCH_USER: &str = "kbf-fetch";
@@ -103,6 +106,30 @@ pub struct ChildProgram {
     pub program: PathBuf,
     /// The fetch user. `None` is for a test that cannot switch user; a host always names it.
     pub run_as: Option<RunAs>,
+}
+
+/// Why the fetch child's program could not be had.
+#[derive(Debug, thiserror::Error)]
+pub enum ProgramFault {
+    #[error("cannot tell which file this program runs from: {0}")]
+    Exe(io::Error),
+    #[error("the fetch user: {0}")]
+    User(#[from] UserFault),
+}
+
+impl ChildProgram {
+    /// This program's own file, to be run as the fetch user of `platform`. A host without
+    /// that user (or with it as root) has no fetch child.
+    pub fn of_this_program(platform: Platform) -> Result<ChildProgram, ProgramFault> {
+        ChildProgram::of_this_program_as(user::name(platform))
+    }
+
+    fn of_this_program_as(user: &str) -> Result<ChildProgram, ProgramFault> {
+        Ok(ChildProgram {
+            program: std::env::current_exe().map_err(ProgramFault::Exe)?,
+            run_as: Some(user::lookup(user)?),
+        })
+    }
 }
 
 /// Why a fetch did not end in a file of exactly the named bytes. Nothing but the file the

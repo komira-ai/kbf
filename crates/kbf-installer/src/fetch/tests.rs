@@ -342,3 +342,33 @@ fn a_read_is_counted_hashed_and_written_or_refused() {
     let got = Tally::new(6, Instant::now()).take(Ok(1), b"a", &mut Refusing);
     assert!(matches!(got, Err(PipeFault::Write(_))), "{got:?}");
 }
+
+/// The fetch child's program is this program's own file, run as the fetch user's ids: a
+/// user that exists gives both, one that does not (or root) is a typed error, not a guess or
+/// a panic. The host's fetch user is named by platform: `_kbf-fetch` is not on a Linux box.
+///
+/// Catches the child started as the wrong file or with no user (it would run as root), a
+/// missing fetch user turned into a default, and the platform's name not used.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_child_is_this_program_as_the_fetch_user_or_a_typed_error() {
+    let exe = std::env::current_exe().expect("a test has a file");
+    let child = ChildProgram::of_this_program_as("nobody").expect("the user nobody exists");
+    assert_eq!(child.program, exe);
+    assert_eq!(child.run_as, user::lookup("nobody").ok());
+    let got = ChildProgram::of_this_program_as("kbf-no-such-user-xyz");
+    assert!(
+        matches!(&got, Err(ProgramFault::User(UserFault::Missing(name))) if name == "kbf-no-such-user-xyz"),
+        "{got:?}"
+    );
+    let got = ChildProgram::of_this_program_as("root");
+    assert!(
+        matches!(got, Err(ProgramFault::User(UserFault::Root(_)))),
+        "root is never the fetch user"
+    );
+    let got = ChildProgram::of_this_program(Platform::MacOs);
+    assert!(
+        matches!(&got, Err(ProgramFault::User(UserFault::Missing(name))) if name == "_kbf-fetch"),
+        "{got:?}"
+    );
+}

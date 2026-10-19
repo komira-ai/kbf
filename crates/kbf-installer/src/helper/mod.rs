@@ -32,6 +32,7 @@
 
 pub mod cycle;
 pub mod fetcher;
+pub mod fetcher_real;
 pub mod leases;
 pub mod memory;
 pub mod operator;

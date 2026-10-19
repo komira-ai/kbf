@@ -1,13 +1,18 @@
 //! A stand-in for the fetch child, for the tests of the parent's end of the pipe
-//! (`tests/fetch_pipe.rs`). Each argument is one operation, done in order:
+//! (`tests/fetch_pipe.rs`) and of the fetcher built on it (`tests/fetcher_real.rs`). Each
+//! argument is one operation, done in order:
 //!
 //! - `emit:TEXT` write TEXT to standard output; `err:TEXT` to standard error;
+//! - `copy:PATH` write the file PATH to standard output; `head:N:PATH` its first N bytes;
 //! - `flood` write to standard output until it breaks; `trickle` one byte every 200 ms;
 //! - `errflood:N` write N bytes to standard error;
-//! - `sleep:SECS` wait; `exit:CODE` end with that status;
+//! - `sleep:SECS` wait; `exit:CODE` end with that status; `kill` end by SIGKILL;
 //! - `pid:FIFO` write this process's id to the named pipe (a file would break `RLIMIT_FSIZE`);
 //! - `readfd:N` copy descriptor N to standard output;
 //! - `report` print the limits and descriptors this process was started with.
+//!
+//! Started the way the parent starts the real child (`fetch-child --sha256 ... --ca-file
+//! FILE`, flags a test cannot choose), the operations are the lines of FILE instead.
 //!
 //! Built only with the `test-sandbox` feature: it is never part of a release.
 
@@ -72,15 +77,54 @@ fn leave(code: i32) -> ! {
     unsafe { libc::_exit(code) }
 }
 
+/// The operations of a run started by `fetch_component`: the lines of the file `--ca-file`
+/// names (the one flag of the child's that a test fills as it likes).
+fn script(args: &[String]) -> Vec<String> {
+    let path = args
+        .iter()
+        .position(|a| a == "--ca-file")
+        .and_then(|at| args.get(at + 1))
+        .expect("--ca-file names the operations");
+    std::fs::read_to_string(path)
+        .expect("the operations")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn main() {
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
-    for op in std::env::args().skip(1) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let ops = if args.first().is_some_and(|a| a == "fetch-child") {
+        script(&args)
+    } else {
+        args
+    };
+    for op in ops {
         let (name, arg) = op.split_once(':').unwrap_or((op.as_str(), ""));
         match name {
             "emit" => {
                 out.write_all(arg.as_bytes()).expect("write");
                 out.flush().expect("flush");
+            }
+            "copy" => {
+                out.write_all(&std::fs::read(arg).expect("the file"))
+                    .expect("write");
+                out.flush().expect("flush");
+            }
+            "head" => {
+                let (count, path) = arg.split_once(':').expect("head:N:PATH");
+                let bytes = std::fs::read(path).expect("the file");
+                let count: usize = count.parse().expect("a count");
+                out.write_all(&bytes[..count]).expect("write");
+                out.flush().expect("flush");
+            }
+            "kill" => {
+                // SAFETY: kill on this process's own id; SIGKILL does not return to the caller.
+                unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+                leave(137);
             }
             "err" => {
                 let _ = err.write_all(arg.as_bytes());

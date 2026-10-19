@@ -289,6 +289,30 @@ fn an_activate_order_fetches_swaps_restarts_once_and_is_not_replayed() {
     assert_eq!(rig.left(), 0, "removed unread");
 }
 
+/// Catches the order's expected facts not reaching the fetcher: an activation is fetched
+/// through `fetch_activation` with exactly the facts the record carries, so the verify
+/// pipeline can hold the binary's own report against them before anything is installed.
+///
+/// Mutants planted: the cycle calling plain `fetch` (the fetcher is given no facts); one fact
+/// of the five taken from the wrong field (`min_protocol` for `protocol`).
+#[test]
+fn an_activation_hands_the_fetcher_the_orders_facts() {
+    let mut rig = Rig::new("facts");
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    let given = rig.fetcher.expected.lock().expect("lock").clone();
+    assert_eq!(
+        given,
+        vec![Facts {
+            platform: "linux-x86_64".to_owned(),
+            protocol: 7,
+            min_protocol: 6,
+            state_schema: 3,
+            profile: "release".to_owned(),
+        }]
+    );
+}
+
 /// Catches a release directory on the host being taken as proof: a rollback to a release
 /// that is already installed is still handed to the fetcher, which verifies the directory
 /// (or says it is unverified) instead of the cycle trusting that it is there.

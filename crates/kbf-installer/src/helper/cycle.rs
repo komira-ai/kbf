@@ -561,7 +561,7 @@ impl<E: Exec> Helper<E> {
         // The node is told a fetch is under way; it may take minutes.
         memory.fetching = true;
         self.report(memory).map_err(|e| e.to_string())?;
-        let fetched = self.fetcher.fetch(&rec);
+        let fetched = self.fetcher.fetch_activation(&rec, &claims.facts());
         memory.fetching = false;
         let got = fetched.map_err(|e| format!("order {id}: {e}"))?;
         // What the fetched binary declared must be what the order expected, before a link

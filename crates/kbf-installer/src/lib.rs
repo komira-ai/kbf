@@ -59,8 +59,8 @@ pub mod deploy;
 pub mod envoy;
 pub mod exit;
 pub mod fetch;
-#[cfg(test)]
-mod fixtures;
+#[cfg(any(test, feature = "testkit"))]
+pub mod fixtures;
 #[cfg(any(test, feature = "testkit"))]
 pub mod golden;
 pub mod helper;
