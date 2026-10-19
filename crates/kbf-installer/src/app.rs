@@ -287,12 +287,11 @@ mod tests;
 /// failing with an error). `execv` changes no disposition, and the program that starts is
 /// this one, which ignores SIGPIPE itself.
 fn reexec(me: &Path) -> io::Error {
-    let arg = |s: &std::ffi::OsStr| CString::new(s.as_bytes());
+    // A path and the arguments the kernel passed this process are C strings already, so
+    // none holds a NUL byte.
+    let arg = |s: &std::ffi::OsStr| CString::new(s.as_bytes()).expect("no NUL byte in an argument");
     let mut argv = vec![arg(me.as_os_str())];
     argv.extend(std::env::args_os().skip(1).map(|a| arg(&a)));
-    let Ok(argv) = argv.into_iter().collect::<Result<Vec<_>, _>>() else {
-        return io::Error::new(io::ErrorKind::InvalidInput, "an argument holds a NUL byte");
-    };
     let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
     ptrs.push(std::ptr::null());
     // SAFETY: `ptrs` is a null-terminated array of pointers to NUL-terminated strings that
