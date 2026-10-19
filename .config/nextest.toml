@@ -1,0 +1,20 @@
+# cargo-nextest's configuration (CI: .github/workflows/ci.yml). nextest runs every test in a
+# process of its own, and test binaries side by side, one thread per core. A test binary
+# whose tests share state on disk across tests, which `cargo test` kept in one process, is
+# run one test at a time: a test group, not a global limit.
+[test-groups]
+# The tests of one binary build one release tree under target/tmp, once per process
+# (crates/xtask/tests/install_sh.rs, `RELEASE`); concurrent processes would build it over
+# each other.
+install-sh-fixture = { max-threads = 1 }
+# `scratch()` numbers its directories by a counter of the process, so two tests that share a
+# name share a directory (crates/kbf-mac-provision/tests/support/mod.rs).
+mac-provision-scratch = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(xtask) & binary(install_sh)'
+test-group = 'install-sh-fixture'
+
+[[profile.default.overrides]]
+filter = 'package(kbf-mac-provision)'
+test-group = 'mac-provision-scratch'

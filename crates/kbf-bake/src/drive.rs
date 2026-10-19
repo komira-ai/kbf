@@ -38,11 +38,13 @@ pub struct Outcome {
     pub status: Status,
     /// Why, in a sentence.
     pub note: String,
+    /// Whether a red end rests on a measurement over a limit ([`crate::eval::End::measured`]).
+    pub measured: bool,
 }
 
 /// What the loop gives the sealing step.
 enum Stop {
-    Decided(Status, String),
+    Decided(Status, String, bool),
     Errored(String),
 }
 
@@ -60,9 +62,9 @@ pub fn drive(
     sleep: &mut dyn FnMut(u64),
 ) -> Result<Outcome, DriveError> {
     let stop = scrape_loop(eval, &mut run, state_path, interval, fetch, updater, sleep);
-    let (status, note) = match stop {
-        Ok(Stop::Decided(status, note)) => (status, note),
-        Ok(Stop::Errored(why)) => (Status::Extended, why),
+    let (status, note, measured) = match stop {
+        Ok(Stop::Decided(status, note, measured)) => (status, note, measured),
+        Ok(Stop::Errored(why)) => (Status::Extended, why, false),
         Err(e) => {
             let _ = run.extend(&format!("the evaluator failed: {e}"));
             return Err(e);
@@ -86,6 +88,7 @@ pub fn drive(
     Ok(Outcome {
         status: sealed,
         note,
+        measured,
     })
 }
 
@@ -126,7 +129,7 @@ fn scrape_loop(
                 record(run, eval, &d, at)?;
                 eval.state().save(state_path)?;
                 if let Some(end) = d.end {
-                    return Ok(Stop::Decided(end.status, end.note));
+                    return Ok(Stop::Decided(end.status, end.note, end.measured));
                 }
             }
         }
