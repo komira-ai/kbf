@@ -117,9 +117,13 @@ words, in either order): one JSON object on one line of stdout, exit 0, the fiel
 sorted by name.
 
 ```text
-{"commit":"0123456789ab","min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
+{"admin_protocol":1,"commit":"0123456789ab","min_protocol":1,"profile":"release","protocol":1,"state_schema":1,"version":"0.1.0"}
 ```
 
+- `admin_protocol`: the version of the admin calls of `kbf --mode frontend` (`GET role`,
+  `POST quiesce`, `resume`, `takeover`, `stand-down`: `docs/api.md`). It is the contract
+  between a proxy and the frontend processes it starts; a call or an answer field that
+  changes meaning raises it.
 - `commit`: the first 12 hex digits of the commit built (`unknown` for a build with no
   git checkout); compare it with the first 12 of the commit in the asset's name.
 - `profile`: `release` for every asset here (the workflow refuses a `debug` one).
@@ -318,6 +322,15 @@ again for the same tag creates no second release and replaces no asset: each ass
 release already holds must be one of the verified files, byte for byte, or the run
 fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
 publish`).
+
+Two further verbs read the annotated `v*` tag, whose message is the gamma verdict
+(`docs/design/kbf-cicd.md`, section 8.1; `release.yml` does not run them yet).
+`cargo xtask release verdict` refuses a lightweight tag, a commit not on main, a message
+that is not a green gamma verdict, a verdict that names another commit, tag or set (the
+set hash is the SHA-256 of `SHA256SUMS`, `kbf_gate::SetHash::of_sums`), a bake under 24
+hours, and a thin bake without a recorded `min-load` waiver; it prints `set-hash=<hex>`.
+`cargo xtask release notes` runs the same checks and writes the notes. `release publish`
+takes that hash as `--set-hash` and publishes nothing when the files are another set.
 
 The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA. Only
 `verify` runs then: every check above, and nothing is published. On every pull request

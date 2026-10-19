@@ -81,8 +81,9 @@ pub const MAX_BINARY: u64 = 1 << 30;
 pub enum OrderKind {
     /// A node's `activate`: the expected facts are required.
     Activate,
-    /// The frontend's own update: the facts may be left out (the frontend builds the
-    /// record from its own release store).
+    /// The frontend's own update: the facts may be left out (`expected` is `None`). Its
+    /// order record is a locator and carries none, so only the commit and the release
+    /// profile are checked.
     FrontendUpdate,
 }
 

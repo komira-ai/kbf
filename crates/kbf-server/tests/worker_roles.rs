@@ -53,10 +53,11 @@ const PROMPT: Duration = Duration::from_secs(5);
 const SESSION: &str = "/kbf.worker.v1.Worker/Session";
 const REGISTER: &str = "/kbf.map.v1.Membership/Register";
 const HEARTBEAT: &str = "/kbf.map.v1.Membership/Heartbeat";
+const GET_STORE_CONFIG: &str = "/kbf.enroll.v1.ColdStore/GetStoreConfig";
 
 /// Every method the worker listener serves and the one role that may call it, spelled
 /// out here and not read from the table.
-const EXPECTED: [(&str, PeerRole); 20] = {
+const EXPECTED: [(&str, PeerRole); 21] = {
     use PeerRole::{Daemon, Storage};
     [
         (SESSION, Daemon),
@@ -103,13 +104,14 @@ const EXPECTED: [(&str, PeerRole); 20] = {
         ("/kbf.worker.v1.Segments/ReadRange", Daemon),
         (REGISTER, Storage),
         (HEARTBEAT, Storage),
+        (GET_STORE_CONFIG, Storage),
     ]
 };
 
 /// Methods the worker listener does not serve: REAPI's others, health, a method of a
 /// served service that does not exist, a served one in another case or with a slash
 /// after it, and no path.
-const UNLISTED: [&str; 7] = [
+const UNLISTED: [&str; 8] = [
     "/build.bazel.remote.execution.v2.Execution/Execute",
     "/build.bazel.remote.execution.v2.ActionCache/GetActionResult",
     "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities",
@@ -117,6 +119,8 @@ const UNLISTED: [&str; 7] = [
     "/kbf.worker.v1.Worker/Nothing",
     "/kbf.worker.v1.worker/session",
     "/kbf.map.v1.Membership/Register/",
+    // The unary the farm's registered store replaced: never served, so never admitted.
+    "/kbf.enroll.v1.ColdStore/GetKeys",
 ];
 
 fn role(name: &str) -> SanType {
