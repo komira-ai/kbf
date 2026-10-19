@@ -31,6 +31,9 @@
 //! - `kill-fails`, `delete-fails`: that verb fails.
 //! - `delete-vanished`: `delete` finds the container's state already gone and fails, as crun does
 //!   when the `crun run` of a killed container removed it first.
+//! - `delete-racing`: `delete` fails as crun does while the `crun run` of a killed container
+//!   is removing the state: `config.json` is gone, the directory still there, which a
+//!   detached remover (this program, `__remove-later`) takes away 300 ms later.
 //! - `chown-fails`: a helper giving to the owner this knob holds (`1001:1001` or `0:0`) fails.
 //! - `chown-sleeps`: a helper giving to the owner this knob holds sleeps 200 ms first (a
 //!   slow hand-over).
@@ -83,6 +86,13 @@ fn main() -> ExitCode {
     // What `kbf`'s start-up self-check runs to learn the runtime's version.
     if args == [b"--version".to_vec()] {
         println!("crun version 1.14.1\ncommit: fake");
+        return ExitCode::SUCCESS;
+    }
+    if let [verb, dir] = args.as_slice()
+        && verb == b"__remove-later"
+    {
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = std::fs::remove_dir_all(path(dir));
         return ExitCode::SUCCESS;
     }
     let fake = Fake {
@@ -686,6 +696,23 @@ impl Fake {
                 add_mode(&dir, 0o200);
                 remove_files(&dir);
             }
+        }
+        if self.has("delete-racing")
+            && let (Some(root), Some(id)) = (&call.root, call.rest.last())
+        {
+            let dir = root.join(String::from_utf8_lossy(id).as_ref());
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = Command::new(&self.link)
+                .arg("__remove-later")
+                .arg(&dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            return refuse(
+                &format!("error loading `{}`", dir.join("config.json").display()),
+                1,
+            );
         }
         if self.has("delete-vanished") {
             // As crun fails when the `crun run` of a killed container deleted the state

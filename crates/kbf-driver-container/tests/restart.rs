@@ -34,6 +34,22 @@ async fn a_restarted_runtime_removes_what_its_predecessor_left() {
     assert!(!exists(&fake.lease_cgroup(1)), "lease cgroup left");
 }
 
+/// Catches a sweep (or a clean) failing because `crun delete` met the state of a killed
+/// container while its own `crun run` was removing it: `config.json` already gone, the
+/// directory still there for a moment (the failure seen on the real-crun job of the same
+/// test). The delete fails then, and the state is gone shortly after: that is a removed
+/// lease, not a failed sweep. The stand-in's `delete-racing` knob does this; without the
+/// wait for the state to go, the start is refused with the delete's words.
+#[test]
+fn a_delete_that_meets_state_being_removed_is_a_removed_lease() {
+    let fake = Fake::new("sweep-racing");
+    std::fs::create_dir(fake.scratch.join("kbf-lease-7-7")).expect("mkdir");
+    fake.knob("delete-racing", "");
+    fake.restart()
+        .expect("the state went while the sweep's delete waited");
+    assert!(!exists(&fake.scratch.join("kbf-lease-7-7")));
+}
+
 /// Catches (issue #194) the test removing a Fake's directory while the killed
 /// daemon's `crun run` still runs: nobody waits for that process, and once the
 /// restarted runtime's sweep has ended its action, it writes its status and events
