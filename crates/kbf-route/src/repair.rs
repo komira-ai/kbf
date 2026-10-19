@@ -125,10 +125,6 @@ impl Background {
 
 impl ReadRepair for Background {
     fn found_elsewhere(&self, digest: &Digest, _found_at: MemberId, missing_at: &[MemberId]) {
-        // The empty blob is held by every node whether or not it was stored.
-        if digest.size_bytes == 0 || missing_at.is_empty() {
-            return;
-        }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };

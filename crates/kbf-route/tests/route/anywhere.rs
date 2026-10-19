@@ -418,9 +418,9 @@ async fn until(done: impl Fn() -> bool) {
     panic!("the condition never held");
 }
 
-/// Catches a repair with no bound: with the replica's reads held shut, six blobs found off
-/// their primary start four copies and no more (the rest wait for a later find), and a
-/// blob found again while its copy is running does not start a second one.
+/// Catches a repair with no bound: a blob found again while its copy is running does not
+/// start a second one, and with the replica's reads held shut, six blobs found off their
+/// primary start four copies in all and no more (the rest wait for a later find).
 #[tokio::test]
 async fn at_most_four_copies_run_at_once_and_a_digest_runs_once() {
     let map = map(1, 2, active(&[1, 2]));
@@ -434,21 +434,85 @@ async fn at_most_four_copies_run_at_once_and_a_digest_runs_once() {
     let gate = cluster.node(2).gate();
     let asked: Vec<_> = blobs.iter().map(|b| b.1).collect();
 
-    router.find_missing_anywhere(&asked).await.expect("answer");
-    until(|| cluster.node(2).read_count() == kbf_route::MAX_REPAIRS_IN_FLIGHT).await;
+    router
+        .find_missing_anywhere(&asked[..1])
+        .await
+        .expect("answer");
+    until(|| cluster.node(2).read_count() == 1).await;
     router
         .find_missing_anywhere(&asked[..1])
         .await
         .expect("answer");
     tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(cluster.node(2).read_count(), 1, "one copy of one digest");
+
+    router
+        .find_missing_anywhere(&asked[1..])
+        .await
+        .expect("answer");
+    until(|| cluster.node(2).read_count() == kbf_route::MAX_REPAIRS_IN_FLIGHT).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         cluster.node(2).read_count(),
         kbf_route::MAX_REPAIRS_IN_FLIGHT,
-        "four copies, none for the digest already being copied, none for the other two"
+        "four copies, the other two wait for a later find"
     );
 
     gate.add_permits(100);
     until(|| cluster.node(1).put_log().len() == kbf_route::MAX_REPAIRS_IN_FLIGHT).await;
+}
+
+/// Catches a repair that fails the question or panics when the owner it was to fill cannot
+/// be dealt with: just after the find, the process loses its map; the owner leaves the map;
+/// the owner has no node to dial; the owner cannot answer whether it lacks the blob. Each
+/// find is answered, and nothing is copied.
+#[tokio::test]
+async fn a_repair_that_cannot_reach_its_owner_copies_nothing() {
+    let map1 = map(1, 2, active(&[1, 2]));
+    let cluster = Cluster::of(2);
+    let cell = Cell::with(view(&map1));
+    let router = Router::new(cell.clone(), cluster.clone()).with_background_repair(limit());
+    let blobs = super::support::blobs_read_from(&map1, &[1, 2], 4);
+    for (bytes, _) in &blobs {
+        cluster.node(2).hold(bytes);
+    }
+
+    // Each find is followed at once by what the repair then meets: it runs only when the
+    // test next waits.
+    router
+        .find_missing_anywhere(&[blobs[0].1])
+        .await
+        .expect("answer");
+    cell.clear();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    cell.set(view(&map1));
+    router
+        .find_missing_anywhere(&[blobs[1].1])
+        .await
+        .expect("answer");
+    cell.set(view(&map(2, 2, active(&[2, 3]))));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    cell.set(view(&map1));
+    router
+        .find_missing_anywhere(&[blobs[2].1])
+        .await
+        .expect("answer");
+    cluster.remove(1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let cluster = Cluster::of(2);
+    cluster.node(2).hold(&blobs[3].0);
+    let router = Router::new(cell.clone(), cluster.clone()).with_background_repair(limit());
+    router
+        .find_missing_anywhere(&[blobs[3].1])
+        .await
+        .expect("answer");
+    cluster
+        .node(1)
+        .fail_next(StorageError::Unavailable(Arc::new(std::fmt::Error)));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(cluster.node(1).put_log().is_empty());
 }
 
 /// Catches a failed copy that is never tried again (the digest left in the set of those

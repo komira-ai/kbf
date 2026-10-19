@@ -85,7 +85,10 @@ impl Routed {
         channels: Arc<dyn Channels>,
     ) -> Self {
         Self {
-            router: Router::new(Arc::clone(&maps), nodes),
+            // A blob a read finds away from its owner is copied to that owner in the
+            // background (at most [`REPAIR_LIMIT`]): this frontend's certificate is what a
+            // node accepts an unowned copy from.
+            router: Router::new(Arc::clone(&maps), nodes).with_background_repair(REPAIR_LIMIT),
             maps,
             channels,
             settled: AtomicBool::new(false),
@@ -119,15 +122,9 @@ impl Routed {
     }
 
     /// Calls routed by `maps` to the members over mutual TLS (`nodes`).
-    ///
-    /// A blob a read finds away from its owner is copied to that owner in the background
-    /// ([`Router::with_background_repair`], at most [`REPAIR_LIMIT`]): this frontend's
-    /// certificate is what a node accepts an unowned copy from.
     #[must_use]
     pub fn over_tls(maps: Arc<dyn MapSource>, nodes: Arc<TlsNodes>) -> Self {
-        let mut routed = Self::new(maps, nodes.clone(), nodes);
-        routed.router = routed.router.with_background_repair(REPAIR_LIMIT);
-        routed
+        Self::new(maps, nodes.clone(), nodes)
     }
 
     /// Whether to route by the map: it has had two members or more. Once true it stays
