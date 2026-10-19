@@ -7,19 +7,17 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
+
+use kbf_testkit::dir::TestDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf");
 
-/// A fresh directory for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-helpers")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A fresh directory for one test, removed when it drops: bind it before any process
+/// that runs in it.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("kbf-helpers-{name}"))
 }
 
 /// Kills the process when dropped, so a failed test leaves nothing running.
