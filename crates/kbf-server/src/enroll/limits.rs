@@ -11,7 +11,7 @@
 //!   address by the IPv4 address. The table is bounded ([`MAX_SOURCES`]); sources that
 //!   have spent nothing recently are dropped to make room, and when every slot is a
 //!   source that is spending, a new source is refused. **It resets when the process
-//!   restarts**, so a handover gives every source a full bucket again.
+//!   restarts**, so a new process gives every source a full bucket again.
 //! - **In flight.** At most `in_flight` calls run at once, from all sources; the next is
 //!   refused with the same `rate limited`.
 //! - **Body.** The request message is decoded under [`MAX_REQUEST_BYTES`] (set on the
@@ -19,8 +19,10 @@
 //!   tonic answers a longer one `OUT_OF_RANGE`, which the guard turns into
 //!   [`RefusalReason::MalformedRequest`] so a caller sees one of the closed set.
 //!
-//! The source address is the TCP peer. Behind an L4 proxy every call has the proxy's
-//! address, and the limit is then the proxy's one bucket.
+//! The source address is the TCP peer, as the socket reports it. Behind the bundled
+//! kbf-proxy every call reaches this listener from the proxy, so every peer is loopback and
+//! the limit is one global bucket for the listener; the per-address limit is then the
+//! proxy's, on its accept path. Nothing here reads a forwarded address.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

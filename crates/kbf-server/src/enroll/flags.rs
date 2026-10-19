@@ -127,8 +127,10 @@ pub fn args() -> Vec<Arg> {
             RATE,
             "enroll-rate-per-minute",
             "N",
-            "Enroll and Renew calls per minute from one source address, once its burst is \
-             spent. The count is in memory and starts again at a restart or a handover.",
+            "Enroll and Renew calls per minute from one TCP peer address, once its burst is \
+             spent. Behind the bundled kbf-proxy every peer is loopback, so this is one \
+             limit for the listener and the proxy limits per client address. The count is \
+             in memory and starts again at a restart.",
         )
         .value_parser(clap::value_parser!(u32).range(1..))
         .default_value("60"),
@@ -136,7 +138,8 @@ pub fn args() -> Vec<Arg> {
             BURST,
             "enroll-rate-burst",
             "N",
-            "Calls one source address may make at once.",
+            "Calls one TCP peer address may make at once (behind the bundled kbf-proxy, the \
+             whole listener).",
         )
         .value_parser(clap::value_parser!(u32).range(1..))
         .default_value("30"),

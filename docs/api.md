@@ -504,11 +504,13 @@ or whose CA cannot sign now (its signer is down, the clock is before the build's
 any other state-store failure is `StoreUnavailable`.
 
 **Limits.** The request body is at most **16 KiB** (a longer message is `MalformedRequest`).
-A token bucket per **source address** (the TCP peer; an IPv6 address counts as its /64;
-behind an L4 proxy every call has the proxy's address) allows the burst, then the per-minute
-rate, and at most `--enroll-max-in-flight` calls run at once; the rest are `RateLimited`.
-The table of sources is bounded (4096). **The counts are in memory: they start again at a
-restart and at a handover**, so a new instance gives every source a full bucket. A call is
+A token bucket per **TCP peer address** (an IPv6 address counts as its /64) allows the
+burst, then the per-minute rate, and at most `--enroll-max-in-flight` calls run at once; the rest are `RateLimited`.
+The table of sources is bounded (4096). Behind the bundled kbf-proxy (which routes
+`kbf.enroll.v1` to the child's `--enroll-listen`) every peer is loopback, so these limits are
+in effect one global bucket for the listener; the per-client-address limit is the proxy's, on
+its accept path. **The counts are in memory: they start again at a restart**, so a new
+process gives every source a full bucket. A call is
 ended after 30 seconds and a TLS handshake after its own deadline.
 
 **Start gate (design section 8.3).** Revoking a node refuses its renewal at once, but the
