@@ -1,5 +1,6 @@
 //! The routes of the update API as a function from a request to a response, with no
-//! socket: [`Router::call`]. U8b puts it behind the proxy's listener.
+//! socket: [`Router::call`]. [`handler::Handler`](super::handler::Handler) puts it behind a
+//! listener.
 //!
 //! ```text
 //! POST /v1/update/frontend                 {commit, request_id, nodes, rollback}
@@ -160,7 +161,7 @@ fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Bytes> 
     resp
 }
 
-fn error(e: &ApiError) -> Response<Bytes> {
+pub(super) fn error(e: &ApiError) -> Response<Bytes> {
     let mut body = json!({"error": e.code, "message": e.message});
     if let Some((key, value)) = &e.extra {
         body[*key] = json!(value);

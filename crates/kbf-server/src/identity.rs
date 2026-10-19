@@ -319,6 +319,18 @@ impl DenyList {
         Ok(list)
     }
 
+    /// How many entries the file holds that name a certificate (`serial` or `spki-sha256`),
+    /// read now. Behind a proxy none of them can match: the proxy forwards a node id, not a
+    /// certificate.
+    ///
+    /// # Errors
+    /// The file cannot be read or parsed.
+    pub fn certificate_entries(&self) -> Result<usize, DenyListError> {
+        let text = std::fs::read_to_string(&self.path).map_err(|source| self.unreadable(source))?;
+        let denied = self.parse(&text)?;
+        Ok(denied.serials.len() + denied.spkis.len())
+    }
+
     /// What the file denies now: what the last read gave if the file's metadata is
     /// unchanged since, else what it holds now.
     ///

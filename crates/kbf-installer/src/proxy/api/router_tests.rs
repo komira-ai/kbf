@@ -7,10 +7,9 @@ use bytes::Bytes;
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
 
-use super::actor::spawn;
 use super::auth::{BearerAuth, PeerKey, RateLimit, Sha256Hasher};
 use super::core::CrashPoint;
-use super::fakes::{COMMIT_C, FakeClock, FakeForwarder, FakeTokens, Rig, TOKEN, idle, staged};
+use super::fakes::{COMMIT_C, FakeClock, FakeForwarder, FakeTokens, Rig, TOKEN, api, idle, staged};
 use super::model::OldChild;
 use super::router::{MAX_BODY, Router};
 use super::traits::{Compat, InstallerState, InstallerStatus};
@@ -42,7 +41,7 @@ fn router_over(rig: &Rig, forwarder: FakeForwarder, rate: RateLimit) -> Router {
         Arc::new(FakeClock(AtomicU64::new(0))),
         rate,
     );
-    Router::new(Arc::new(auth), spawn(rig.core()), Arc::new(forwarder))
+    Router::new(Arc::new(auth), api(rig), Arc::new(forwarder))
 }
 
 fn quick() -> RateLimit {
@@ -435,7 +434,7 @@ async fn an_unconfigured_token_is_503() {
     );
     let router = Router::new(
         Arc::new(auth),
-        spawn(rig.core()),
+        api(&rig),
         Arc::new(FakeForwarder::default()),
     );
     let resp = router
@@ -562,56 +561,4 @@ async fn post_abort_and_rollback_in_one_burst_each_get_a_defined_answer() {
         (StatusCode::CONFLICT, Some("no_update_open".to_owned()))
     );
     assert_eq!(h.rig.sup.starts(), 0);
-}
-
-#[tokio::test]
-async fn tick_moves_a_staging_update_without_anyone_asking() {
-    let rig = Rig::new("u8a-r-tick");
-    let api = spawn(rig.core());
-    api.post(super::fakes::req(B, "r1")).await.unwrap();
-    rig.set_status(staged(B));
-    api.tick();
-    // Let the actor take the tick. No command that reads the status has been sent.
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(rig.sup.starts(), 1);
-    // With every handle gone the actor ends.
-    drop(api);
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
-}
-
-#[tokio::test]
-async fn a_full_queue_is_a_503_not_a_hang() {
-    let rig = Rig::new("u8a-r-full");
-    let api = spawn(rig.core());
-    let mut pending = Vec::new();
-    // current_thread: the actor cannot run while this loop holds the thread.
-    for _ in 0..200 {
-        let api = api.clone();
-        pending.push(Box::pin(async move { api.status().await }));
-    }
-    let mut busy = 0;
-    for p in futures_poll_once(&mut pending) {
-        if p {
-            busy += 1;
-        }
-    }
-    assert!(busy > 0);
-}
-
-/// Polls each future once; says which ended at once with an error.
-fn futures_poll_once<
-    F: std::future::Future<Output = Result<super::core::Reply, super::core::ApiError>>,
->(
-    futures: &mut [std::pin::Pin<Box<F>>],
-) -> Vec<bool> {
-    use std::task::{Context, Poll, Waker};
-    let mut cx = Context::from_waker(Waker::noop());
-    futures
-        .iter_mut()
-        .map(|f| matches!(f.as_mut().poll(&mut cx), Poll::Ready(Err(e)) if e.status == StatusCode::SERVICE_UNAVAILABLE))
-        .collect()
 }

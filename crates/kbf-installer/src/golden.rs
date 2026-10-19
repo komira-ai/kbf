@@ -61,14 +61,14 @@ pub fn order_revert() -> OrderRecord {
     }
 }
 
-/// The frontend's own update: the same components and facts as an `activate`, a later order.
+/// The frontend's own update: a locator and nothing else, like a `confirm`, a later order.
+/// The root half fetches the commit itself; the record names no file, digest or fact.
 pub fn order_frontend_update() -> OrderRecord {
     OrderRecord {
         order_id: 45,
-        epoch: 3,
         generation: 18,
         verb: OrderVerb::FrontendUpdate,
-        ..order_activate()
+        ..order_confirm()
     }
 }
 
@@ -159,6 +159,7 @@ pub fn installer_toml_url() -> InstallerToml {
         min_activation_interval_s: 120,
         node_cert: None,
         node_key: None,
+        database: None,
     }
 }
 
