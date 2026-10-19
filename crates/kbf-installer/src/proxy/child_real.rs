@@ -75,14 +75,40 @@ pub struct ProcChild {
     held: Mutex<BTreeMap<u32, Held>>,
 }
 
-type Identify = fn(u32) -> Result<(OwnedFd, ProcIdent), String>;
+type Identify = fn(u32, &Path) -> Result<(OwnedFd, ProcIdent), String>;
 
-/// The pidfd and identity of the process `pid`, which this process just started and has not
-/// reaped, so the pid is still its own.
-fn identify_started(pid: u32) -> Result<(OwnedFd, ProcIdent), String> {
+/// The pidfd and identity of the process `pid`, which this process just started from
+/// `program` and has not reaped, so the pid is still its own.
+///
+/// A child that exits before this reads it is a zombie: its `stat` stays readable but its
+/// `exe` link is gone. Its identity is then the start time it had and the file it was
+/// started from, so the spawn succeeds and the exit is reported through `exited` like any
+/// other, instead of being a failure to start.
+fn identify_started(pid: u32, program: &Path) -> Result<(OwnedFd, ProcIdent), String> {
     let pidfd = pidfd_of(pid).map_err(|e| e.to_string())?;
-    let ident = ident_of(pid).map_err(|e| e.to_string())?;
+    let ident = match ident_of(pid) {
+        Ok(ident) => ident,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            zombie_ident(pid, program).ok_or_else(|| e.to_string())?
+        }
+        Err(e) => return Err(e.to_string()),
+    };
     Ok((pidfd, ident))
+}
+
+/// The identity of the zombie `pid` (state `Z` in its `stat`), whose program is `program`.
+/// `None` for anything that is not a zombie, so a vanished pid is never given an identity.
+fn zombie_ident(pid: u32, program: &Path) -> Option<ProcIdent> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let state = stat.get(stat.rfind(')')? + 1..)?.trim_start();
+    if !state.starts_with('Z') {
+        return None;
+    }
+    Some(ProcIdent {
+        pid,
+        start_time: start_time_of(&stat)?,
+        exe: program.canonicalize().ok()?,
+    })
 }
 
 impl ProcChild {
@@ -267,7 +293,7 @@ impl Child for ProcChild {
             .spawn()
             .map_err(|e| PortError(format!("start {}: {e}", program.display())))?;
         let pid = process.id();
-        let (pidfd, ident) = match (self.identify)(pid) {
+        let (pidfd, ident) = match (self.identify)(pid, &program) {
             Ok(v) => v,
             Err(e) => {
                 let mut process = process;

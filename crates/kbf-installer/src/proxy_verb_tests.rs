@@ -72,8 +72,14 @@ fn a_file_that_is_not_a_proxy_config_is_refused_with_its_path_and_reason() {
     );
     refused(
         &file("outside", format!("surprise = 1\n{PROXY}").as_bytes()),
-        "unknown field `surprise`",
+        "line 1: unknown field (the text is not shown)",
     );
+    // The parser quotes the key it met; the message must not carry it.
+    let text = usage_of(load(&file(
+        "outside-redacted",
+        format!("surprise = 1\n{PROXY}").as_bytes(),
+    )));
+    assert!(!text.contains("surprise"), "{text}");
     refused(
         &file("port", PROXY.replace("18000", "80").as_bytes()),
         "proxy: upstream.base_port must be 1024 to 65521 so both slots fit",
