@@ -21,6 +21,9 @@ mod admin_secret;
 #[path = "managed/proxy.rs"]
 mod proxy;
 
+#[path = "managed/two_children.rs"]
+mod two_children;
+
 #[path = "managed/writes.rs"]
 mod writes;
 
