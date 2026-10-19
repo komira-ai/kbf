@@ -107,6 +107,37 @@ fn the_verb_refuses_without_exactly_one_listen_fd_for_this_process() {
     }
 }
 
+/// What the OS reports for `fd`, for a failure message: on Linux `SO_ACCEPTCONN`, elsewhere
+/// the result of `getsockopt(TCP_CONNECTION_INFO)` (return code, errno, `tcpi_state`).
+fn seen_by_the_os(fd: &impl std::os::fd::AsRawFd) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fd;
+        "SO_ACCEPTCONN is read through rustix".to_owned()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: all-zero is a valid `tcp_connection_info` (integers only).
+        let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+        // SAFETY: `fd` is open; `info` and `len` are live and `len` is the size of `info`.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_CONNECTION_INFO,
+                (&raw mut info).cast(),
+                &raw mut len,
+            )
+        };
+        let errno = std::io::Error::last_os_error();
+        format!(
+            "TCP_CONNECTION_INFO rc={rc} errno={errno} len={len} tcpi_state={}",
+            info.tcpi_state
+        )
+    }
+}
+
 /// Catches a descriptor taken without being looked at: a closed number, a pipe, a socket that
 /// does not listen and a listening socket that is not TCP are each refused, and a TCP
 /// listener comes back as the same socket, close-on-exec.
@@ -126,6 +157,17 @@ fn only_a_listening_tcp_socket_is_taken_and_it_is_made_close_on_exec() {
     let stream =
         std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
     let text = usage_of(take(stream.into_raw_fd()));
+    assert!(text.contains("not a listening socket"), "{text}");
+
+    // A TCP socket that is bound but never listens: the state check must say no.
+    let bound = rustix::net::socket(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::STREAM,
+        None,
+    )
+    .expect("socket");
+    rustix::net::bind(&bound, &std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let text = usage_of(take(bound.into_raw_fd()));
     assert!(text.contains("not a listening socket"), "{text}");
 
     // A listening socket that is not TCP. (An abstract name: a path in the scratch directory
@@ -163,7 +205,10 @@ fn only_a_listening_tcp_socket_is_taken_and_it_is_made_close_on_exec() {
     let addr = TcpListener::from(inherited.try_clone().expect("dup"))
         .local_addr()
         .expect("addr");
-    let taken = take(inherited.into_raw_fd()).expect("a listening TCP socket");
+    let seen = seen_by_the_os(&inherited);
+    let taken = take(inherited.into_raw_fd()).unwrap_or_else(|e| {
+        panic!("a listening TCP socket was refused: {e:?}; the OS says {seen}")
+    });
     assert!(
         fcntl_getfd(&taken)
             .expect("flags")
