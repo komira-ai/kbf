@@ -149,6 +149,7 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
         capacity: Resources::new(8_000, 16 << 30),
         caps: caps(),
         phase,
+        protocol: None,
     };
     let quarantined = |why: &str| NodePhase::Quarantined(why.to_owned());
     farm.resize(&node, stream, reported(quarantined("user-delete failed")));
