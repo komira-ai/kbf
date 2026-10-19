@@ -631,3 +631,19 @@ fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
     assert!(!why.is_empty());
     assert!(with(&[]).schema_step_mut().is_none(), "no flag, no step");
 }
+
+/// Catches `run --installer-config` reading the config under a host root that is not an
+/// absolute path (the root is the sandbox flag's; a relative one is refused with its reason
+/// rather than reading from the working directory).
+///
+/// Mutants to plant: the `Root::new` error in `under` swallowed.
+#[test]
+fn run_with_an_installer_config_refuses_a_relative_host_root() {
+    let mut argv = RUN.to_vec();
+    argv.extend_from_slice(&["--installer-config", "/etc/kbf/installer.toml"]);
+    let Verb::Run(args) = parse(&argv).verb else {
+        panic!("a run");
+    };
+    let refused = build_helper(PathBuf::from("relative-root"), &args).err();
+    assert!(refused.is_some_and(|f| !f.why.is_empty()));
+}
