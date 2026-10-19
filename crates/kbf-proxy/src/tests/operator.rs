@@ -4,6 +4,7 @@
 //! `docs/design/frontend-proxy.md` section 3 at the wire, not only in `route_of`.
 
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -289,4 +290,111 @@ async fn a_child_that_cannot_give_metrics_leaves_the_proxys_series_and_a_count()
         text.contains("kbf_proxy_child_metrics_failed_total 1"),
         "no active child:\n{text}"
     );
+}
+
+/// A child whose `/metrics` answers 200 with exactly `body`, which need not be UTF-8.
+fn raw_metrics_child(body: &'static [u8]) -> Script {
+    script(move |mut call| async move {
+        read_all(&mut call.body).await;
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-type", "text/plain; version=0.0.4")
+            .body(())
+            .expect("a response");
+        if let Ok(mut send) = call.respond.send_response(response, false) {
+            let _ = send.send_data(Bytes::from_static(body), true);
+        }
+    })
+}
+
+/// The child cannot speak for the proxy: its `kbf_proxy_*` samples and `# HELP`/`# TYPE`
+/// lines are dropped, and so is a `# EOF` terminator (it would end the scrape early). The
+/// proxy's own series appear once; a normal child series survives.
+///
+/// Kills: the child's body appended unfiltered (a duplicate or forged proxy series, a
+/// conflicting `# TYPE`, a stray `# EOF`); a filter that drops the child's own series.
+#[tokio::test(start_paused = true)]
+async fn the_childs_proxy_series_and_eof_are_not_appended() {
+    let child = raw_metrics_child(
+        b"# HELP kbf_proxy_panics_total forged\n\
+          kbf_proxy_panics_total 0\n\
+          # TYPE kbf_proxy_held_streams counter\n\
+          kbf_proxy_slot_open_streams{slot=\"A\"} 99\n\
+          # TYPE kbf_child_series_total counter\n\
+          kbf_child_series_total 7\n\
+          # EOF\n",
+    );
+    let rig = Rig::start(child, tagged("b")).await;
+    let text = scrape(&rig).await;
+    assert_eq!(
+        text.matches("kbf_proxy_panics_total 0").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(text.matches("# TYPE kbf_proxy_held_streams").count(), 1);
+    assert!(!text.contains("kbf_proxy_held_streams counter"), "{text}");
+    assert!(!text.contains("forged"), "{text}");
+    assert!(!text.contains("} 99"), "{text}");
+    assert!(!text.contains("# EOF"), "{text}");
+    assert!(text.contains("# TYPE kbf_child_series_total counter\n"));
+    assert!(text.contains("kbf_child_series_total 7\n"), "{text}");
+    assert!(text.contains("kbf_proxy_child_metrics_failed_total 0"));
+}
+
+/// A body that is not UTF-8 is not text to append: the proxy's series are served alone and
+/// the scrape counts as a failure.
+///
+/// Kills: invalid bytes appended to the scrape; an uncounted failure.
+#[tokio::test(start_paused = true)]
+async fn a_childs_non_utf8_metrics_are_dropped_and_counted() {
+    let rig = Rig::start(
+        raw_metrics_child(b"kbf_child_series_total 7\n\xff\xfe\n"),
+        tagged("b"),
+    )
+    .await;
+    let mut client = rig.client().await;
+    let reply = client.plain("GET", "/metrics", b"").await;
+    assert_eq!(reply.status, Some(200));
+    assert!(std::str::from_utf8(&reply.body).is_ok(), "own series only");
+    let text = reply.text();
+    assert!(text.contains("kbf_proxy_panics_total 0"));
+    assert!(!text.contains("kbf_child_series_total"), "{text}");
+    assert!(
+        text.contains("kbf_proxy_child_metrics_failed_total 1"),
+        "{text}"
+    );
+}
+
+/// A scrape during a swap hold does not wait for the hold: the child is not asked, the
+/// proxy's series come back at once with the failure counted. Time is paused, so a scrape
+/// that waited would only return by the clock running on; the bound here is far under
+/// `DEADLINE`.
+///
+/// Kills: the metrics fetch waiting on a held slot instead of giving up; a dispatch to a
+/// child during a hold.
+#[tokio::test(start_paused = true)]
+async fn a_scrape_during_a_swap_hold_does_not_wait() {
+    let rig = Rig::start(
+        metrics_child(200, "kbf_child_series_total 7\n", 0, false),
+        tagged("b"),
+    )
+    .await;
+    let _guard = rig
+        .core
+        .slots
+        .hold(Duration::from_secs(20))
+        .expect("no hold in force");
+    let began = tokio::time::Instant::now();
+    let text = tokio::time::timeout(Duration::from_millis(100), scrape(&rig))
+        .await
+        .expect("the scrape did not wait on the hold");
+    assert!(began.elapsed() < Duration::from_millis(100));
+    assert!(text.contains("kbf_proxy_panics_total 0"), "{text}");
+    assert!(!text.contains("kbf_child_series_total"), "{text}");
+    assert!(
+        text.contains("kbf_proxy_child_metrics_failed_total 1"),
+        "{text}"
+    );
+    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(rig.b.state.dispatches(), 0);
 }
