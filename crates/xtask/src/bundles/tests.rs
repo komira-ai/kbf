@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 

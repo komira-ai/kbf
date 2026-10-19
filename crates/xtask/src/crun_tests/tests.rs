@@ -1,5 +1,4 @@
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
 
 use super::*;
 use kbf_testkit::dir::TestDir;

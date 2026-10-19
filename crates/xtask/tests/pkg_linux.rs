@@ -15,11 +15,10 @@ const FALSE: &str = "/usr/bin/false";
 
 /// An empty directory of its own for one test.
 fn scratch(name: &str) -> TestDir {
-    let dir = TestDir::under(
+    TestDir::under(
         Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-pkg"),
         name,
-    );
-    dir
+    )
 }
 
 /// Copies the repository's packaging inputs and the stub into `dir`.

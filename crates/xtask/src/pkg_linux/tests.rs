@@ -13,7 +13,7 @@ fn scratch(name: &str) -> TestDir {
 
 /// The inputs a package is built from, in `dir`.
 struct Tree {
-    dir: PathBuf,
+    dir: TestDir,
 }
 
 impl Tree {
@@ -447,7 +447,7 @@ impl Model {
 fn built(
     name: &str,
     leave: impl Fn(&str, &str) -> Vec<(String, String)>,
-) -> (Result<Vec<String>, Error>, PathBuf, Model) {
+) -> (Result<Vec<String>, Error>, TestDir, Model) {
     let dir = scratch(name);
     let source = dir.join("kbf-installer");
     std::fs::write(&source, "binary").expect("source");
@@ -465,7 +465,8 @@ fn built(
         epoch: 77,
     };
     let result = super::build(&mut model.nfpm(&source, leave), &build);
-    (result, out, model)
+    // The caller holds the directory, which the output is in, until it is done.
+    (result, dir, model)
 }
 
 /// Package bytes that depend on the environment's time only.
@@ -479,7 +480,8 @@ fn by_epoch(format: &str, seen: &str) -> Vec<(String, String)> {
 
 #[test]
 fn a_package_that_depends_on_the_epoch_alone_is_built_twice_and_the_same() {
-    let (result, out, model) = built("build-same", by_epoch);
+    let (result, dir, model) = built("build-same", by_epoch);
+    let out = dir.join("out");
     let printed = result.expect("reproducible");
     assert_eq!(printed.len(), 2);
     assert!(printed[0].ends_with("kbf-installer.deb"), "{printed:?}");

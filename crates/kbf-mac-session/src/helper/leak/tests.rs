@@ -42,7 +42,7 @@ fn write_private(path: &Path, text: &str) {
 
 /// Opens the baseline window as the apply in boot `boot-1` would.
 fn open_window(rig: &Rig) {
-    write_private(rig.dir.path().join("baseline-window"), "boot-1\n");
+    write_private(&rig.dir.join("baseline-window"), "boot-1\n");
 }
 
 /// A Mac with something in every class but auto-login (off at rest): a launch agent,

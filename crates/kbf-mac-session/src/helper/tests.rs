@@ -201,7 +201,7 @@ fn host_failures_during_create_are_reported() {
 fn a_ledger_that_cannot_record_stops_the_verb() {
     let rig = rig("ledger-fail", 2);
     rig.helper.user_create("4.2", None).unwrap();
-    rig.helper.lock().fail_writes(rig.dir.path().join("ledger"));
+    rig.helper.lock().fail_writes(&rig.dir.join("ledger"));
     let error = rig.helper.user_create("4.3", None).unwrap_err();
     assert!(error.starts_with("recording lease 4.3"), "{error}");
     assert!(!rig.host.state().users.contains_key("kbf-lease-4-3"));
