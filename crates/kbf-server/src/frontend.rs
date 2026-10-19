@@ -152,7 +152,6 @@ pub const ALLOWED: &[&str] = &[
     "worker_max_streams",
     "unservable_wait_secs",
     "memory_ladder_gib",
-    "platform_alias",
     "finished_retention_secs",
     "shutdown_timeout_secs",
     "invocation_memory",
@@ -1169,7 +1168,6 @@ impl<'a> Prepared<'a> {
                 authorizers,
                 &recorder,
                 default_memory,
-                listeners.platform_aliases.clone(),
                 Relaying {
                     farm: Arc::clone(&farm) as Arc<dyn Handed>,
                     successor: successor.clone(),
@@ -1184,7 +1182,6 @@ impl<'a> Prepared<'a> {
                 authorizers,
                 &recorder,
                 default_memory,
-                listeners.platform_aliases.clone(),
             ),
         };
         let reapi_routes = Routes::from(

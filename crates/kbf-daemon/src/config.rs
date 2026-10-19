@@ -78,9 +78,10 @@ pub struct Args {
     /// wait is jittered down by up to half.
     #[arg(long, default_value_t = 30_000)]
     pub reconnect_max_ms: u64,
-    /// A node label, `key=value`, reported as `label.<key>`; repeatable. A request
-    /// matches a label only if it names `label.<key>`; a label never makes a node match
-    /// a client's `pool=...` property (the frontend's `--platform-alias` does).
+    /// A node label, `key=value`, reported as `label.<key>` for operators to read;
+    /// repeatable. Report-only: no request selects on a label (a request naming
+    /// `label.<key>`, or `pool`, is refused), so placement never follows it. A node is
+    /// placed by what it detects (`os`, `arch`, ...).
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_label)]
     pub labels: Vec<(String, String)>,
     /// The longest, in milliseconds, that dialling a storage node may take: for its TCP

@@ -111,9 +111,6 @@ Options:
           
           [default: 300]
 
-      --platform-alias <NAME=VALUE:KEY=VALUE[,KEY=VALUE...]>
-          A platform alias, `NAME=VALUE:KEY=VALUE[,KEY=VALUE...]` (repeatable): a request that sends the property `NAME=VALUE` is placed as if it had sent the `KEY=VALUE` properties instead, and `NAME` itself is dropped. For example `pool=darwin-sized:OSFamily=Darwin,ISA=arm64` places an action that carries only `pool=darwin-sized` on a Mac with an Apple-silicon CPU and never on a Linux node. Only placement changes: the action, its digest and its cache key are the client's. A request that also sends a property the alias sets, with another value (or another spelling), is refused INVALID_ARGUMENT. `NAME` must be a property kbf does not read; every `KEY` one it does (`OSFamily`, `ISA`, `os`, `arch`, ...). A `NAME=VALUE` with no alias is ignored, as is every property kbf does not read. An alias is never inferred from a node's `--label`
-
       --memory-ladder-gib <MEMORY_LADDER_GIB>
           The memory rungs of an action, in GiB, ascending and each at least 1. The first is what an action that names no size (`kbf-book-mem-gib`) books. An action that passes its own memory limit runs again on the next rung above what it booked, and after the last on a whole host: the memory of the largest node that could run it, so that no other lease fits there. A rung not below that node's memory is skipped for the whole host. An action that does finish keeps its rung: later runs of it start there
           

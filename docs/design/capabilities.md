@@ -30,7 +30,7 @@ What a Linux daemon reports today:
 | `isa_level` (repeated) | **every** level the CPU reaches, lowest first | computed from the features |
 | `cpu.features` (repeated) | every CPU feature flag, in the kernel's names | `/proc/cpuinfo` |
 | `drivers` (repeated) | every execution driver this daemon runs, one per runtime: `container`, `native` or `fake` | `kbf-daemon --driver`, once per driver |
-| `label.<k>` | an operator's label, `--label k=v` | the daemon's flags |
+| `label.<k>` | an operator's label, `--label k=v`; report-only, no request matches it | the daemon's flags |
 
 A daemon on an Apple silicon Mac asks `sysctl` instead: `hw.optional` (which `kbf-caps`
 parses into `cpu.features` and `isa_level`), `hw.ncpu` (`cpus`), `hw.memsize`
@@ -199,7 +199,7 @@ Each key has one typed comparison:
 | `isa_level` | at least, within the family: `x86-64-v3` is served by v3 and v4 |
 | `cpu.feature` (may repeat) | every requested feature is present |
 | `cpus`, `mem_gib`, `nvme_gib`, `gpu` | the node has at least this amount (`gpu` is also booked, below) |
-| `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` | exact |
+| `os`, `os_image`, `cpu.model`, `page_size` | exact (`label.<k>` is parsed here but the front refuses it: [Unknown keys](#unknown-keys)) |
 | `xcode` | membership: the node reports one `xcode` entry per ready Xcode build, and the request names one of them |
 | `os_build`, `os_version`, `kernel` | **planned**: exact, once they are report entries (see [The node status](#the-node-status)) |
 | `vm.image` | membership on the digest: the request names `<name>@sha256:<64 lowercase hex digits>` and matches a node that reports any name with that digest; a value without a digest is refused. No daemon reports `vm.image` yet, so a request for one matches no node (see [Planned VM entries](#planned-vm-entries)) |
@@ -218,37 +218,15 @@ its report.
 
 ### Unknown keys
 
-`Request::parse` refuses a key it does not know. But a client's platform reaches it
-through `Request::from_platform` (below), which passes on only the names kbf reads, so
-**an unknown platform property is ignored today**: `OSFamilly=darwin` or `os_build=24B83`
-matches every node. (`vm.slots` and the other report-only keys are known, and refused:
-see [Planned VM entries](#planned-vm-entries). Every `ios.device.<attribute>` key is
-known, so one kbf does not match on, such as `ios.device.os`, is refused rather than
-ignored. `ios.devices` and `ios.simulator` are unknown, and ignored.) Refusing an unknown property at `Execute` is
-**planned** (see [Planned](#planned)). One kind of unknown property can be given a
-meaning by the operator: a [platform alias](#platform-aliases) (`pool=darwin-sized`, for
-example). With none configured, `pool` is ignored like any other unknown name.
-
-### Platform aliases
-
-`--platform-alias NAME=VALUE:KEY=VALUE[,KEY=VALUE...]` on the frontend (repeatable)
-makes a request that sends the property `NAME=VALUE` placed as if it had sent the
-`KEY=VALUE` properties instead. komira's farm config sends `pool=darwin-sized` and
-`pool=mojo-sized` and nothing else, so the farm sets
-`pool=darwin-sized:OSFamily=Darwin,ISA=arm64` and `pool=mojo-sized:OSFamily=Linux,ISA=x86_64`.
-
-- The alias is expanded first: before names are filtered, before `needs` is read, before
-  the macOS GPU rule, so an aliased Mac request gets that rule. The alias property itself
-  is consumed.
-- Only placement reads the expansion. The action, its platform and its digest are the
-  client's, so the action cache is not re-keyed.
-- A request that also sends a property setting what the alias sets, to a different
-  value, is refused INVALID_ARGUMENT; the same thing in another spelling
-  (`os=macos` beside `OSFamily=Darwin`) stands.
-- `NAME` must be a property kbf does not read and every `KEY` one it does; an expansion
-  no daemon can run (`OSFamily=Windows`) is refused at start, as is a malformed flag.
-- An alias is never inferred from a node's `--label`: `--label pool=darwin-sized` makes a
-  node report `label.pool`, which only a request naming `label.pool` matches.
+`Request::parse` refuses a key it does not know, and so does the front: a platform
+property kbf does not read (`pool`, `OSFamilly`, `ios.devices`, `Container-Image`) is
+refused at `Execute` with `INVALID_ARGUMENT` naming the key as the client sent it. Nothing
+is dropped. A `label.<k>` key is refused the same way: **labels are never used to place
+an action.** A node's `--label` is reported as `label.<k>` for operators to read; no
+request selects on it. Placement is on what a node reports about itself and its hardware
+(`os`, `arch`, `isa_level`, ...). The one name that passes unread is `container-image`,
+exactly so, which the container driver reads. The accepted keys are listed in
+[platform-properties.md](../platform-properties.md#accepted-property-names).
 
 **Reserved keys** ask for a kind or a size of capacity, not a hardware fact, and are
 skipped by the matcher (`kbf_caps::RESERVED_KEYS`; names read in any case):
@@ -296,14 +274,13 @@ property is not a capability and is left to whoever reads it (`kbf-lease`,
 Property names are read without regard to ASCII case (`kbf_caps::property_name`): the
 REAPI names above and every kbf key (`osfamily`, `OS`, `GPU`, `Kbf-Lease`), so a
 property meant for kbf is never dropped for its spelling and the action run anywhere.
-A label's own name keeps its case. `arch` spelled exactly so is kbf's key; any other
+`arch` spelled exactly so is kbf's key; any other
 spelling is REAPI's `Arch`. One name in two spellings is refused. The native driver
 reads `xcode` in any case too.
 
 **`container-image` is the exception: it is matched exactly.** The front does not read
 it; the container driver looks for that exact name. `Container-Image=...` is a name kbf
-does not know, so the front ignores it and the container driver refuses the action as
-naming no `container-image`.
+does not know, so the front refuses it with `INVALID_ARGUMENT` naming `Container-Image`.
 
 ## What the code enforces today
 
@@ -330,7 +307,8 @@ naming no `container-image`.
   on `main` serves `action` only.
 - The container driver reads `container-image` itself, by that exact name (see
   [daemon.md](daemon.md#the-container-driver)).
-- Unknown platform properties are ignored, not refused (see [Unknown keys](#unknown-keys)).
+- Unknown platform properties, and `label.<k>` keys, are refused with `INVALID_ARGUMENT` naming
+  the key (see [Unknown keys](#unknown-keys)).
 - Each daemon sends its `NodeStatus` after `Welcome`, and again when its Xcodes change;
   it routes no work.
 - A Mac's native driver reports one `xcode` entry per ready `Xcode*.app` in
@@ -347,9 +325,8 @@ naming no `container-image`.
 
 ## Planned
 
-- **Unknown keys refused.** An unknown property is refused at `Execute` with
-  `INVALID_ARGUMENT` naming the closest known key; today it is ignored, so a misspelt
-  `OSFamilly` matches every worker.
+- **Closest-key hint:** the refusal of an unknown key could also name the closest known
+  one (`OSFamilly` -> `OSFamily`).
 - **`kbf-node`** reserved, and refused from every client (above).
 - **More report entries:** `os_version` (both platforms), `os_build` (Mac) and
   `kernel` (Linux), matched exactly; `cpu.model` on Linux (a human name for the
@@ -366,10 +343,9 @@ naming no `container-image`.
 - **Re-detection:** the daemon re-detects its software keys after an update step and
   every 10 minutes, and sends a changed report mid-session
   ([fleet-updates.md](fleet-updates.md#31-observed)); today it detects once, at start.
-- **Platform aliases, beyond `--platform-alias`:** named, immutable sets of properties
-  (for example an architecture plus a default image) stored with the farm, so a client
-  can name a platform briefly. `--platform-alias` is the operator-set form
-  ([above](#platform-aliases)).
+- **Platform aliases:** named, immutable sets of properties (for example an
+  architecture plus a default image), so a client can name a platform briefly and an
+  alias's bytes, and so its action digests, never change once used.
 - **Protected floors:** capacity a machine keeps for other services, subtracted from
   `cpus` and `mem_gib` before placement sees them.
 - **Report changes noticed by hash:** heartbeats already carry the report hash; the

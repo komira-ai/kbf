@@ -290,19 +290,6 @@ pub struct Args {
     /// refused FAILED_PRECONDITION. The wait restarts whenever one can.
     #[arg(long, default_value_t = kbf_sched::UNSERVABLE_WAIT.as_secs())]
     pub unservable_wait_secs: u64,
-    /// A platform alias, `NAME=VALUE:KEY=VALUE[,KEY=VALUE...]` (repeatable): a request
-    /// that sends the property `NAME=VALUE` is placed as if it had sent the `KEY=VALUE`
-    /// properties instead, and `NAME` itself is dropped. For example
-    /// `pool=darwin-sized:OSFamily=Darwin,ISA=arm64` places an action that carries only
-    /// `pool=darwin-sized` on a Mac with an Apple-silicon CPU and never on a Linux node.
-    /// Only placement changes: the action, its digest and its cache key are the
-    /// client's. A request that also sends a property the alias sets, with another value
-    /// (or another spelling), is refused INVALID_ARGUMENT. `NAME` must be a property kbf
-    /// does not read; every `KEY` one it does (`OSFamily`, `ISA`, `os`, `arch`, ...). A
-    /// `NAME=VALUE` with no alias is ignored, as is every property kbf does not read.
-    /// An alias is never inferred from a node's `--label`.
-    #[arg(long, value_name = "NAME=VALUE:KEY=VALUE[,KEY=VALUE...]")]
-    pub platform_alias: Vec<kbf_front::PlatformAlias>,
     /// The memory rungs of an action, in GiB, ascending and each at least 1. The first
     /// is what an action that names no size (`kbf-book-mem-gib`) books. An action that
     /// passes its own memory limit runs again on the next rung above what it booked,
@@ -594,9 +581,6 @@ pub enum ConfigError {
     /// `--memory-ladder-gib` is empty, holds a 0, does not ascend, or overflows.
     #[error("--memory-ladder-gib: {0}")]
     MemoryLadder(#[from] kbf_sched::LadderError),
-    /// Two `--platform-alias` flags alias one name and value.
-    #[error("--platform-alias: {0}")]
-    PlatformAlias(#[from] kbf_front::AliasError),
     /// The REAPI policy file is not a policy.
     #[error("--reapi-auth-policy: {path}: {source}")]
     Policy {
@@ -673,8 +657,7 @@ impl Args {
     ///
     /// # Errors
     /// A TLS file cannot be read; `--segment-upload-max-bytes` is over
-    /// `--write-bytes-in-flight`; `--memory-ladder-gib` is not a ladder;
-    /// `--platform-alias` names one name and value twice.
+    /// `--write-bytes-in-flight`; `--memory-ladder-gib` is not a ladder.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
         let reload = Duration::from_secs(self.tls_reload_interval_secs);
@@ -727,7 +710,6 @@ impl Args {
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
-            platform_aliases: kbf_front::PlatformAliases::new(self.platform_alias.clone())?,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {
                 0 => Duration::MAX,

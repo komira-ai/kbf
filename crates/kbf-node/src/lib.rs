@@ -22,8 +22,7 @@
 //! ```
 //!
 //! Which actions the Mac takes follows from what it detects (`os`, `arch`, ...), not from
-//! a label: the frontend's `--platform-alias` turns a client's `pool=darwin-sized` into
-//! the OS and architecture it stands for.
+//! a label: `--label` is reported for operators and never matched by a request.
 //!
 //! Exits non-zero when the node cannot be detected or the configuration cannot be
 //! loaded; otherwise runs until SIGTERM or SIGINT, then exits zero. Leases still

@@ -166,7 +166,7 @@ async fn a_daemon_that_can_run_it_ends_the_wait() {
 }
 
 /// Catches: a node report without an architecture accepted (it could never be matched
-/// safely), a resent report whose platform entries are dropped (a label added later is
+/// safely), a resent report whose platform entries are dropped (a `cpu.model` added later is
 /// never matched), and a malformed resent report taken anyway.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_hello_carries_what_placement_matches() {
@@ -183,7 +183,7 @@ async fn the_hello_carries_what_placement_matches() {
     let mut mac = FakeDaemon::connect(cell.worker_addr, hello_on("node-m", 4, 8, MAC))
         .await
         .expect("registered");
-    let job = Job::new("pool", &[("label.pool", "darwin")]);
+    let job = Job::new("pool", &[("cpu.model", "m1")]);
     cell.upload(&job.blobs()).await;
     let mut ops = cell.execute(&job.action).await;
     mac.no_work().await;
@@ -197,7 +197,7 @@ async fn the_hello_carries_what_placement_matches() {
         "node-m",
         4,
         8,
-        &[("arch", "arm64"), ("os", "macos"), ("label.pool", "darwin")],
+        &[("arch", "arm64"), ("os", "macos"), ("cpu.model", "m1")],
     );
     mac.send(daemon_message::Message::Hello(labelled));
     let start = mac.start().await;

@@ -527,7 +527,6 @@ impl Cell {
             tick: Duration::from_millis(50),
             unservable_wait: wait,
             memory_ladder: ladder,
-            platform_aliases: Default::default(),
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
             streams: kbf_server::StreamTiming::default(),

@@ -19,10 +19,27 @@ These properties change how kbf schedules an action today:
 Any other value of `kbf-lease`, `gpu`, `kbf-book-cpus` or `kbf-book-mem-gib` is refused
 with `INVALID_ARGUMENT`. kbf's own
 capability keys (`os`, `arch`, `isa_level`, `cpu.feature`, `label.<k>`, ...; see
-[capabilities.md](design/capabilities.md#matching)) are matched too. Other properties
-(`container-image`, `Pool`, ...) are accepted and not acted on by the scheduler, unless the
-frontend runs with a `--platform-alias` for them: `pool=darwin-sized` then stands for the OS and
-architecture the alias names (see [Platform aliases](design/capabilities.md#platform-aliases)).
+[capabilities.md](design/capabilities.md#matching)) are matched too, except `label.<k>`
+(below). **Any other property is refused**, see
+[Accepted property names](#accepted-property-names).
+
+### Accepted property names
+
+Placement follows what a node reports about itself and its devices, never a name or
+label an operator gave it. The front accepts exactly these names (any ASCII case, except
+`container-image`), and refuses every other with `INVALID_ARGUMENT` naming the property:
+
+- `OSFamily`, `ISA`, `Arch` (REAPI);
+- kbf's capability keys: `os`, `arch`, `isa_level`, `cpu.feature`, `cpu.model`, `cpus`,
+  `mem_gib`, `nvme_gib`, `gpu`, `page_size`, `os_image`, `xcode`, `vm.image`,
+  `ios.device`, `ios.device.<attribute>` (see capabilities.md);
+- the reserved `kbf-lease`, `kbf-cpu`, `kbf-mac-admin`, `kbf-book-cpus`, `kbf-book-mem-gib`;
+- `container-image`, exactly so: not read by the scheduler, read by the container driver.
+
+Refused: `pool`, `Pool` and every other name kbf does not read (`dockerNetwork`,
+`Container-Image`, `ios.devices`, ...), and every `label.<k>`. A node's `--label` is
+reported for operators only; no request selects on it. A client whose platform sends
+`pool=...` must send `OSFamily` and `ISA` instead.
 
 ### Property names are read in any case
 
@@ -42,12 +59,11 @@ values in any case, kbf's own keys' values exactly.
 One property sent under two spellings of its name (`gpu` and `GPU`, `OSFamily` and
 `osfamily`) is refused with `INVALID_ARGUMENT`, as is one requirement named twice
 through two names (`OSFamily` and `os`, `ISA` and `arch`). A name kbf does not know,
-in any case, is not acted on.
+in any case, is refused (see above).
 
 `container-image` is the one exception: it is read by the Linux container driver, not
 by the scheduler, and only in exactly that spelling. `Container-Image` is a name kbf
-does not know, so the action is scheduled as if it named no image, and the container
-driver then refuses it ("the action names no container-image platform property").
+does not know, so it is refused with `INVALID_ARGUMENT` naming it.
 
 ## Where an action runs
 

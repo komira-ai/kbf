@@ -289,7 +289,6 @@ async fn property_names_are_read_in_any_case() {
         ("isa", "arm-a64"),
         ("GPU", "1"),
         ("KBF-Lease", "whole_machine"),
-        ("Pool", "default"),
     ];
     let any_case = job("any case", &props, false);
     farm.upload(&any_case.blobs.iter().collect::<Vec<_>>())
@@ -324,8 +323,8 @@ async fn property_names_are_read_in_any_case() {
 /// device refusal the design names let through to the scheduler: a device on a
 /// `whole_machine` lease, an attribute without `ios.device=1`, an attribute kbf does
 /// not know, a count other than 1, and a device on Linux. Also catches names that only
-/// begin like a device key (`ios.devices`, `ios.simulator`, `iosx`) refused instead of
-/// left alone.
+/// begin like a device key (`ios.devices`, `ios.simulator`, `iosx`) read as device keys
+/// instead of refused as unknown.
 #[tokio::test]
 async fn ios_device_requests_reach_the_scheduler_and_bad_ones_are_refused() {
     let script = Arc::new(Script::default());
@@ -386,16 +385,15 @@ async fn ios_device_requests_reach_the_scheduler_and_bad_ones_are_refused() {
     }
     assert_eq!(script.submitted().len(), 1);
 
+    // Not device keys, so not read at all: refused naming them, not dropped.
     for name in ["ios.devices", "ios.simulator", "iosx"] {
         let other = job(name, &[(name, "1")], false);
         farm.upload(&other.blobs.iter().collect::<Vec<_>>()).await;
-        start(&farm, &other.action).await.expect(name);
+        let status = start(&farm, &other.action).await.expect_err(name);
+        assert_eq!(status.code(), Code::InvalidArgument, "{name}: {status:?}");
+        assert!(status.message().contains(name), "{name}: {status:?}");
     }
-    let submitted = script.submitted();
-    assert_eq!(submitted.len(), 4);
-    for submission in &submitted[1..] {
-        assert_eq!(submission.request.needs, kbf_caps::Request::default());
-    }
+    assert_eq!(script.submitted().len(), 1);
 }
 
 /// Catches a GPU on macOS booked on top of a whole-machine lease (no Mac reports one,
@@ -480,253 +478,94 @@ async fn the_default_memory_is_the_one_the_service_is_given() {
     assert_eq!(submitted[2].request.resources.memory_bytes, 1 << 30);
 }
 
-// Platform aliases (`--platform-alias`): komira sends `pool=darwin-sized` and
-// `pool=mojo-sized` and nothing else.
-
-const MAC_ALIAS: &str = "pool=darwin-sized:OSFamily=Darwin,ISA=arm64";
-const LINUX_ALIAS: &str = "pool=mojo-sized:OSFamily=Linux,ISA=x86_64";
-
-fn aliases(list: &[&str]) -> kbf_front::PlatformAliases {
-    kbf_front::PlatformAliases::new(list.iter().map(|a| a.parse().expect("an alias")).collect())
-        .expect("aliases")
-}
-
-/// The farm the farm's frontend is: both aliases configured.
-async fn aliased_farm(script: &Arc<Script>) -> Farm {
-    Farm::with_platform_aliases(Arc::clone(script), aliases(&[MAC_ALIAS, LINUX_ALIAS])).await
-}
-
-fn node(entries: &[(&str, &str)]) -> kbf_caps::NodeCaps {
-    kbf_caps::NodeCaps::from_report(entries.iter().copied()).expect("a node report")
-}
-
-/// Runs `props` as an action and returns what the scheduler was asked for.
-async fn needs_of(farm: &Farm, script: &Script, argv: &str, props: &[(&str, &str)]) -> Submission {
-    let before = script.submitted().len();
-    let job = job(argv, props, false);
-    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
-    start(farm, &job.action).await.expect("Execute");
-    let mut submitted = script.submitted();
-    assert_eq!(submitted.len(), before + 1, "{argv}");
-    submitted.pop().expect("one")
-}
-
-/// Catches the bug the alias exists for: komira's only property, `pool=darwin-sized`,
-/// read as no requirement, so a Mac action may be placed on a Linux node and a Mojo
-/// compile on a Mac. With the aliases configured a `pool=darwin-sized` action fits a
-/// macOS arm64 node and no Linux node, a `pool=mojo-sized` action fits Linux x86_64 and
-/// neither a Mac nor a Linux arm64 node, and a node that merely carries
-/// `--label pool=darwin-sized` does not attract the Mac action (the alias is never
-/// inferred from a label). Mutants: the alias skipped (the property is dropped as
-/// today), expansion after the names are filtered, an alias that swaps the OS.
+/// Catches: a property kbf does not read dropped (so `pool=darwin-sized` placed the
+/// action on any worker), a `label.<k>` key passing to be matched against node labels,
+/// and a refusal that does not name the key. Each refusal must be INVALID_ARGUMENT
+/// naming the property as sent, and nothing may reach the scheduler.
 #[tokio::test]
-async fn an_aliased_pool_is_placed_only_on_its_os_and_arch() {
+async fn a_property_kbf_does_not_read_is_refused_naming_it() {
     let script = Arc::new(Script::default());
-    let farm = aliased_farm(&script).await;
-    let mac = node(&[("os", "macos"), ("arch", "arm64"), ("cpus", "12")]);
-    let linux = node(&[("os", "linux"), ("arch", "x86_64"), ("cpus", "64")]);
-    let linux_arm = node(&[("os", "linux"), ("arch", "arm64")]);
-    let labelled_linux = node(&[
-        ("os", "linux"),
-        ("arch", "x86_64"),
-        ("label.pool", "darwin-sized"),
-    ]);
-
-    let darwin = needs_of(&farm, &script, "mac", &[("pool", "darwin-sized")]).await;
-    let fits = |s: &Submission, n: &kbf_caps::NodeCaps| s.request.needs.unmet(n).is_empty();
-    assert!(fits(&darwin, &mac), "{:?}", darwin.request.needs);
-    assert!(!fits(&darwin, &linux), "a Mac action on a Linux node");
-    assert!(!fits(&darwin, &linux_arm));
-    assert!(!fits(&darwin, &labelled_linux), "placed by a node label");
-
-    let mojo = needs_of(&farm, &script, "mojo", &[("pool", "mojo-sized")]).await;
-    assert!(fits(&mojo, &linux), "{:?}", mojo.request.needs);
-    assert!(!fits(&mojo, &mac), "a Mojo compile on a Mac");
-    assert!(!fits(&mojo, &linux_arm));
-
-    // The expansion is the request an OSFamily/ISA client would have made.
-    let direct = needs_of(
-        &farm,
-        &script,
-        "direct",
-        &[("OSFamily", "darwin"), ("ISA", "arm64")],
-    )
-    .await;
-    assert_eq!(darwin.request.needs, direct.request.needs);
-    // The property is consumed: nothing else about the request changes.
-    assert_eq!(darwin.request.kind, LeaseKind::Action);
-}
-
-/// Catches an alias that is on by default or a `pool` that is refused: with no alias
-/// configured `pool=darwin-sized` asks for nothing (any worker may take it), as before
-/// this flag; and with aliases configured a `pool` value no alias names is the same, and
-/// so is another property beside an aliased one. Mutants: an unknown pool refused, a
-/// built-in alias for the two komira values.
-#[tokio::test]
-async fn without_an_alias_pool_is_ignored_as_before() {
-    let script = Arc::new(Script::default());
-    let plain = Farm::with_execution(Arc::clone(&script)).await;
-    for (argv, props) in [
-        ("none", vec![("pool", "darwin-sized")]),
-        ("mojo", vec![("pool", "mojo-sized")]),
-        ("upper", vec![("Pool", "darwin-sized")]),
-    ] {
-        let s = needs_of(&plain, &script, argv, &props).await;
-        assert_eq!(s.request.needs, kbf_caps::Request::default(), "{argv}");
-    }
-    let aliased = aliased_farm(&script).await;
-    for (argv, props) in [
-        ("unknown value", vec![("pool", "linux-arm64-sized")]),
-        ("other value case", vec![("pool", "Darwin-Sized")]),
-    ] {
-        let s = needs_of(&aliased, &script, argv, &props).await;
-        assert_eq!(s.request.needs, kbf_caps::Request::default(), "{argv}");
-    }
-    // The name is read in any case, as every property name is.
-    let upper = needs_of(&aliased, &script, "Pool", &[("Pool", "darwin-sized")]).await;
-    assert_eq!(upper.request.needs.exact("os"), Some("macos"));
-}
-
-/// Catches the alias expanded after the macOS GPU rule (an aliased Mac action would
-/// then book a GPU no Mac reports, or run beside other work with it) and after the lease
-/// kind and booking are read. `pool=darwin-sized` with a GPU needs a whole-machine
-/// lease exactly as `OSFamily=darwin` does, and then books none on top. Mutant:
-/// `mac_gpus` reading the platform before the expansion.
-#[tokio::test]
-async fn the_alias_is_expanded_before_the_macos_gpu_rule() {
-    let script = Arc::new(Script::default());
-    let farm = aliased_farm(&script).await;
-
-    let shared = job("shared", &[("pool", "darwin-sized"), ("gpu", "1")], false);
-    farm.upload(&shared.blobs.iter().collect::<Vec<_>>()).await;
-    let status = start(&farm, &shared.action)
-        .await
-        .expect_err("a shared GPU on an aliased Mac");
-    assert_eq!(status.code(), Code::InvalidArgument);
-    assert!(
-        status.message().contains("kbf-lease=whole_machine"),
-        "{status:?}"
-    );
-
-    let whole = needs_of(
-        &farm,
-        &script,
-        "whole",
-        &[
-            ("pool", "darwin-sized"),
-            ("gpu", "1"),
-            ("kbf-lease", "whole_machine"),
-        ],
-    )
-    .await;
-    assert_eq!(whole.request.kind, LeaseKind::WholeMachine);
-    assert_eq!(whole.request.resources, Resources::new(1_000, 1 << 30));
-
-    // On Linux a GPU is booked as asked.
-    let linux = needs_of(
-        &farm,
-        &script,
-        "linux gpu",
-        &[("pool", "mojo-sized"), ("gpu", "1")],
-    )
-    .await;
-    assert_eq!(linux.request.resources.gpus, 1);
-}
-
-/// Catches an alias that overrides what the client says, or a client that contradicts
-/// its alias run on a node neither asked for. `pool=darwin-sized` beside `OSFamily=Linux`
-/// (or `os=linux`, `ISA=x86_64`) is INVALID_ARGUMENT naming both; beside `OSFamily=Darwin`
-/// or `os=macos` (same thing, any spelling) it is accepted. Mutants: the conflict
-/// allowed (the explicit value wins, or the alias wins), an equal value refused.
-#[tokio::test]
-async fn an_alias_that_contradicts_the_request_is_refused() {
-    let script = Arc::new(Script::default());
-    let farm = aliased_farm(&script).await;
-    for (why, props) in [
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    for (why, props, named) in [
+        ("pool", vec![("pool", "darwin-sized")], "\"pool\""),
+        ("Pool", vec![("Pool", "mojo-sized")], "\"Pool\""),
         (
-            "OSFamily",
-            vec![("pool", "darwin-sized"), ("OSFamily", "Linux")],
+            "pool beside a read key",
+            vec![("OSFamily", "Darwin"), ("pool", "darwin-sized")],
+            "\"pool\"",
         ),
-        ("os", vec![("pool", "darwin-sized"), ("os", "linux")]),
-        ("isa", vec![("pool", "darwin-sized"), ("ISA", "x86_64")]),
-        ("arch", vec![("pool", "darwin-sized"), ("arch", "x86_64")]),
-        ("mojo", vec![("pool", "mojo-sized"), ("OSFamily", "darwin")]),
+        (
+            "a label",
+            vec![("label.pool", "darwin-sized")],
+            "\"label.pool\"",
+        ),
+        (
+            "a label in any case",
+            vec![("LABEL.rack", "r1")],
+            "\"LABEL.rack\"",
+        ),
+        (
+            "container-image in another case",
+            vec![("Container-Image", "docker://img@sha256:00")],
+            "\"Container-Image\"",
+        ),
+        (
+            "a made-up key",
+            vec![("dockerNetwork", "off")],
+            "\"dockerNetwork\"",
+        ),
     ] {
         let bad = job(why, &props, false);
         farm.upload(&bad.blobs.iter().collect::<Vec<_>>()).await;
         let status = start(&farm, &bad.action).await.expect_err(why);
         assert_eq!(status.code(), Code::InvalidArgument, "{why}: {status:?}");
-        assert!(
-            status.message().contains("platform alias pool=")
-                && status.message().contains("conflicts with"),
-            "{why}: {status:?}"
-        );
-        assert!(status.details().is_empty());
+        assert!(status.message().contains(named), "{why}: {status:?}");
+        assert!(status.details().is_empty(), "{why}: nothing to upload");
     }
-    assert!(script.submitted().is_empty());
+    assert!(
+        script.submitted().is_empty(),
+        "a refused action reached the scheduler"
+    );
 
-    for (why, props) in [
-        (
-            "same",
-            vec![("pool", "darwin-sized"), ("OSFamily", "Darwin")],
-        ),
-        (
-            "other spelling",
-            vec![("pool", "darwin-sized"), ("os", "macos")],
-        ),
-        (
-            "arch spelling",
-            vec![("pool", "darwin-sized"), ("Arch", "aarch64")],
-        ),
-        ("with cpus", vec![("pool", "darwin-sized"), ("cpus", "8")]),
-    ] {
-        let s = needs_of(&farm, &script, why, &props).await;
-        assert_eq!(s.request.needs.exact("os"), Some("macos"), "{why}");
+    // Everything kbf reads, and `container-image` (read by the container driver), is
+    // accepted: this is the accepted list in docs/platform-properties.md.
+    let accepted = [
+        ("container-image", "docker://img@sha256:00"),
+        ("OSFamily", "linux"),
+        ("ISA", "x86-64"),
+        ("kbf-book-cpus", "2"),
+        ("kbf-book-mem-gib", "2"),
+        ("cpu.model", "epyc"),
+    ];
+    let ok = job("accepted", &accepted, false);
+    farm.upload(&ok.blobs.iter().collect::<Vec<_>>()).await;
+    start(&farm, &ok.action).await.expect("accepted keys");
+    for (key, value) in [("gpu", "0"), ("kbf-lease", "action"), ("Arch", "amd64")] {
+        let ok = job(key, &[(key, value)], false);
+        farm.upload(&ok.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &ok.action).await.expect(key);
     }
 }
 
-/// Catches an alias that changes what the client's bytes mean to the cache: the
-/// expansion is for placement only. The key a submission carries (instance and action
-/// digest, which is what the action cache and the scheduler's join of twins are keyed
-/// by) is the digest of the client's action, with the alias configured or not, and the
-/// action blob stored is not rewritten. Mutant: the digest taken from the expanded
-/// platform.
+/// Catches: a Mac action (`OSFamily=Darwin`, `ISA=arm64`) whose OS or architecture is
+/// lost between the request and the scheduler, so a Linux node could take it. The
+/// needs the front hands the scheduler must be satisfied by a Mac node and by no Linux
+/// node (either architecture) and no Intel Mac.
 #[tokio::test]
-async fn the_alias_does_not_touch_the_action_digest() {
+async fn a_mac_action_is_never_placeable_on_a_linux_node() {
     let script = Arc::new(Script::default());
-    let plain = Farm::with_execution(Arc::clone(&script)).await;
-    let aliased = aliased_farm(&script).await;
-    let job = job("digest", &[("pool", "darwin-sized")], false);
-    let bytes = job.action.data.clone();
-    for farm in [&plain, &aliased] {
-        farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
-        start(farm, &job.action).await.expect("Execute");
-        let stored = farm
-            .cache
-            .read_blob(&job.action.digest)
-            .await
-            .expect("the action is still held");
-        assert_eq!(
-            stored.as_ref(),
-            bytes.as_slice(),
-            "the action was rewritten"
-        );
-    }
-    let [a, b] = script.submitted().try_into().expect("two submissions");
-    assert_eq!(a.request.key, b.request.key);
-    assert_eq!(a.request.key.action, job.action.digest);
-    assert_ne!(
-        a.request.needs, b.request.needs,
-        "the alias must act on placement"
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let mac = job("mac", &[("OSFamily", "Darwin"), ("ISA", "arm64")], false);
+    farm.upload(&mac.blobs.iter().collect::<Vec<_>>()).await;
+    start(&farm, &mac.action).await.expect("Execute");
+    let needs = script.submitted()[0].request.needs.clone();
+
+    let node = |os, arch| kbf_caps::NodeCaps::from_report([("os", os), ("arch", arch)]).unwrap();
+    assert!(
+        needs.matches(&node("macos", "arm64")),
+        "the Mac it asked for"
     );
-    // The platform the client sent still names the pool, and nothing else.
-    let decoded = Action::decode(bytes.as_slice()).unwrap();
-    let sent: Vec<_> = decoded
-        .platform
-        .unwrap()
-        .properties
-        .into_iter()
-        .map(|p| (p.name, p.value))
-        .collect();
-    assert_eq!(sent, [("pool".to_owned(), "darwin-sized".to_owned())]);
+    for (os, arch) in [("linux", "arm64"), ("linux", "x86_64"), ("macos", "x86_64")] {
+        assert!(!needs.matches(&node(os, arch)), "placeable on {os}/{arch}");
+    }
 }

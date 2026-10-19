@@ -109,8 +109,6 @@ memory-ladder-gib = [4, 16, 32]
 finished-retention-secs = 60
 # The heartbeat interval daemons are asked for, in milliseconds, at most half the window in which a daemon may act on a `Start` (each `Start` names the newest heartbeat the server took, so a longer interval would leave it too little)
 heartbeat-interval-ms = 5000
-# A platform alias, `NAME=VALUE:KEY=VALUE[,KEY=VALUE...]` (repeatable): a request that sends the property `NAME=VALUE` is placed as if it had sent the `KEY=VALUE` properties instead, and `NAME` itself is dropped. For example `pool=darwin-sized:OSFamily=Darwin,ISA=arm64` places an action that carries only `pool=darwin-sized` on a Mac with an Apple-silicon CPU and never on a Linux node. Only placement changes: the action, its digest and its cache key are the client's. A request that also sends a property the alias sets, with another value (or another spelling), is refused INVALID_ARGUMENT. `NAME` must be a property kbf does not read; every `KEY` one it does (`OSFamily`, `ISA`, `os`, `arch`, ...). A `NAME=VALUE` with no alias is ignored, as is every property kbf does not read. An alias is never inferred from a node's `--label`
-# platform-alias = []
 # How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
 progress-interval-secs = 30
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready

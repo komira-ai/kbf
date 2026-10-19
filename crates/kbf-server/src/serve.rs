@@ -81,8 +81,6 @@ pub struct Listeners {
     /// books, the others are what it climbs through when it passes its own memory
     /// limit, before a whole host (`--memory-ladder-gib`).
     pub memory_ladder: MemoryLadder,
-    /// The client properties placement reads as others (`--platform-alias`).
-    pub platform_aliases: kbf_front::PlatformAliases,
     /// How long a finished operation is kept after its callers are answered, in which
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,
@@ -857,7 +855,6 @@ where
             authorizers,
             &recorder,
             default_memory,
-            listeners.platform_aliases.clone(),
         ),
         None => kbf_front::routes_recorded(
             cache,
@@ -867,7 +864,6 @@ where
             authorizers,
             &recorder,
             default_memory,
-            listeners.platform_aliases.clone(),
         ),
     };
     let authenticate = AuthenticateLayer::new(policy.authenticator);

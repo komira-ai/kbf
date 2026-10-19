@@ -84,7 +84,7 @@ reconnect-ms = 1000
 # frontend = "URL"
 # PEM file of this daemon's private key
 # key = "KEY"
-# A node label, `key=value`, reported as `label.<key>`; repeatable. A request matches a label only if it names `label.<key>`; a label never makes a node match a client's `pool=...` property (the frontend's `--platform-alias` does)
+# A node label, `key=value`, reported as `label.<key>` for operators to read; repeatable. Report-only: no request selects on a label (a request naming `label.<key>`, or `pool`, is refused), so placement never follows it. A node is placed by what it detects (`os`, `arch`, ...)
 # label = []
 # A stable name for this node, unique within the cell
 # node-id = "NODE_ID"

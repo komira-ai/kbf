@@ -197,7 +197,7 @@ Two facts on `main` decide the order in which these pieces may ship:
   that does not know it matches every node, Linux included. The server must know
   `ios.device` before any client sends it. The server first refused every device key;
   it now matches and books them (sections 5.3 and 5.4). A name that only begins like
-  one (`ios.devices`, `ios.simulator`) is an unknown property, ignored.
+  one (`ios.devices`, `ios.simulator`) is an unknown property, refused with `INVALID_ARGUMENT`.
 - **An old daemon would drop `device_id` silently.** `Start` is proto3; a daemon that
   predates field 8 decodes the message without it and would run the action without
   knowing its device. The guard is the report: only a daemon that reports
