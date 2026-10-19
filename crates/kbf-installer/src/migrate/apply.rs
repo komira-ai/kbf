@@ -158,6 +158,28 @@ fn unchanged(probed: &[Option<CommitId>; 2], old: &Old) -> Result<(), MigrateErr
     Ok(())
 }
 
+/// The old layout once the services are stopped: judged like the looks before it, `current`
+/// and `previous` as probed, and the floor raised to what the old helper remembers now
+/// (a floor only goes up).
+fn settle(
+    m: &Migration,
+    rules: &Rules,
+    probed: &[Option<CommitId>; 2],
+    claim: &floor::Claim,
+    seeded: Seeded,
+) -> Result<(Old, Seeded), MigrateError> {
+    let seen = match look(m, rules)? {
+        Look::Old(seen) => seen,
+        Look::Settled(_) => {
+            return Err(MigrateError::Changed("the old state is gone".to_owned()));
+        }
+    };
+    let Seen { old, .. } = *seen;
+    unchanged(probed, &old)?;
+    let floor = floor::raise(seeded.floor, floor::seed(&old.memory, claim).floor);
+    Ok((old, Seeded { floor, ..seeded }))
+}
+
 /// Migrate the host, or (in a dry run) say what would be done.
 pub fn migrate<E: Exec>(
     m: &Migration,
@@ -284,6 +306,24 @@ pub fn migrate<E: Exec>(
             report.line(mode, format!("stopped {unit}"));
         }
     }
+    // The old helper is stopped now, so what it remembers is final. It acts on orders until
+    // its unit stops, which is after the look above: the floor is raised to what it
+    // remembers now. A swap it made meanwhile is not the host that was probed: the services
+    // run again as they were and the run ends before the installer's state, the links or the
+    // units are written (the journal and the copies made are in the new tree, and a run again
+    // starts from what is there).
+    let (old, seeded) = match settle(m, &rules, &probed, &claim, seeded) {
+        Ok(settled) => settled,
+        Err(error) => {
+            for unit in &journal.stopped {
+                // The error to report is the change; a unit that will not start is the
+                // operator's to see in the unit manager, and `migrate --rollback` starts
+                // what the journal says was stopped.
+                let _ = svc.start(unit);
+            }
+            return Err(error);
+        }
+    };
     if let Some(helper) = &m.helper_unit {
         svc.disable(helper)
             .map_err(MigrateError::io(helper.as_str()))?;

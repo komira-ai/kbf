@@ -2,6 +2,7 @@
 //! verb, that lands after the migration looked at the old layout and before it holds its
 //! locks. The probe is where the tests play it ([`runner_between`]).
 
+use std::cell::Cell;
 use std::fs;
 
 use serde_json::json;
@@ -199,6 +200,95 @@ fn an_installer_state_that_appeared_after_the_look_is_not_overwritten() {
     let state = rig.json(&rig.new_state_dir().join("state.json"));
     assert_eq!(state["current"], json!(C), "the installer's state is kept");
     assert!(rig.events.borrow().is_empty(), "no service was touched");
+}
+
+/// Catches a replay floor that is below an order the old helper acted on after the look
+/// under the locks: the helper is still running until its unit is stopped, and acts on order
+/// 90 as it stops (`helper.json` is written, then it exits). The floor written to
+/// `state.json` and `helper.json` is read again once it is stopped and must be 90, not the
+/// 42 of the look before; with 42 the installer would act on order 90 again.
+///
+/// Mutant seen red: the floor and the memory written from the look under the locks.
+#[test]
+fn an_order_the_old_helper_acts_on_as_it_stops_is_not_below_the_floor() {
+    let mut rig = Rig::linux("floor-at-stop");
+    let hand = rig.old_hand();
+    let helper = rig.helper().as_str().to_owned();
+    rig.on_command(move |verb, unit| {
+        if verb == "stop" && unit == helper {
+            hand.memory(&Memory {
+                acked_epoch: 3,
+                acked_order_id: 90,
+                ..Memory::default()
+            });
+        }
+    });
+    let report = run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    assert_eq!(report.outcome, Outcome::Migrated);
+
+    let state = rig.json(&rig.new_state_dir().join("state.json"));
+    assert_eq!(
+        state["floor"],
+        json!({"epoch": 3, "order_id": 90, "generation": 17})
+    );
+    assert_eq!(state["last_acked_order_id"], json!(90));
+    let memory = rig.json(&rig.new_state_dir().join("helper.json"));
+    assert_eq!(memory["acked_order_id"], json!(90));
+    assert_eq!(memory["frontend_order_id"], json!(90));
+}
+
+/// Catches a swap made by the old helper as it stops (it acts on an order that activates
+/// a release: `current` is `B`, `A` is `previous`): the host is not the one probed and
+/// planned for, so the run ends `Changed` (exit 5) before the installer's state, the links
+/// or the units are written, and the services it had stopped run again, in the order they
+/// were stopped: the old layout is running as the swap left it, not stopped until somebody
+/// notices. A run again adopts what is there.
+///
+/// Mutants seen red: the old layout not compared again after the stops; the stopped
+/// services not started again on that error.
+#[test]
+fn a_swap_the_old_helper_makes_as_it_stops_ends_the_run_with_the_services_running() {
+    let mut rig = Rig::linux("swap-at-stop");
+    let hand = rig.old_hand();
+    let helper = rig.helper().as_str().to_owned();
+    let once = Cell::new(false);
+    rig.on_command(move |verb, unit| {
+        if verb == "stop" && unit == helper && !once.replace(true) {
+            hand.swap_back();
+        }
+    });
+    let error = run_migrate(&mut rig, &never(), Mode::Apply).expect_err("refused");
+    assert!(
+        matches!(&error, MigrateError::Changed(why) if why.contains(&format!("current was {A} and is now {B}"))),
+        "{error}"
+    );
+    assert_eq!(error.exit().code(), 5);
+
+    assert_eq!(
+        *rig.events.borrow(),
+        [
+            "stop kbf-helper.service links=false",
+            "stop kbf-daemon.service links=false",
+            "start kbf-helper.service links=false",
+            "start kbf-daemon.service links=false",
+        ]
+    );
+    let active = rig.active.borrow().clone();
+    assert!(active.contains("kbf-daemon.service") && active.contains("kbf-helper.service"));
+    assert!(!rig.new_state_dir().join("state.json").exists());
+    assert_eq!(
+        fs::read_to_string(rig.at("etc/systemd/system/kbf-daemon.service")).expect("unit"),
+        OLD_UNIT,
+        "the unit is as it was"
+    );
+
+    let report = run_migrate(&mut rig, &never(), Mode::Apply).expect("a run again");
+    assert_eq!(report.outcome, Outcome::Migrated);
+    let state = rig.json(&rig.new_state_dir().join("state.json"));
+    assert_eq!(
+        (&state["current"], &state["previous"]),
+        (&json!(B), &json!(A))
+    );
 }
 
 /// Catches an old layout that is gone in the window (someone removed the old state): it
