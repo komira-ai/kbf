@@ -5,7 +5,7 @@
 
 use std::io;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use kbf_map::MemberState;
@@ -278,7 +278,10 @@ struct Captured(Arc<Mutex<Vec<u8>>>);
 
 impl io::Write for Captured {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(bytes);
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -295,10 +298,24 @@ impl MakeWriter<'_> for Captured {
     }
 }
 
-impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().expect("lock")).into_owned()
-    }
+/// The warnings logged so far by every test of this binary, from a subscriber installed
+/// for the whole process on first use (a subscriber set for one test only is not seen by
+/// a log call that another test's thread registered first: the line goes missing now and
+/// then). A test finds its own lines by the digests it made.
+fn warnings() -> String {
+    static LOG: OnceLock<Captured> = OnceLock::new();
+    let log = LOG.get_or_init(|| {
+        let log = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("the only subscriber");
+        log
+    });
+    let bytes = log.0.lock().unwrap_or_else(PoisonError::into_inner);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Catches a refusal that leaves no trace (the only sign was a counter): a blob nobody
@@ -306,32 +323,29 @@ impl Captured {
 /// were asked about it (the primary and the replica); a blob that was found is not named.
 #[tokio::test]
 async fn a_blob_nobody_holds_is_logged_with_the_owners_asked() {
-    let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    let _logging = tracing::subscriber::set_default(subscriber);
+    let _ = warnings();
     let map = map(1, 2, active(&[1, 2]));
     let cluster = Cluster::of(2);
     let (router, _) = router(&map, &cluster);
-    let blobs = super::support::blobs_read_from(&map, &[1, 2], 2);
-    cluster.node(2).hold(&blobs[1].0);
+    let nobody = sha(b"a blob the log test asks for and nobody holds");
+    let found = sha(b"a blob the log test asks for and a replica holds");
+    cluster.node(1).hold_as(found, b"x");
+    cluster.node(2).hold_as(found, b"x");
 
     let missing = router
-        .find_missing_anywhere(&[blobs[0].1, blobs[1].1])
+        .find_missing_anywhere(&[nobody, found])
         .await
         .expect("answer");
-    assert_eq!(missing, [blobs[0].1]);
-    let log = captured.text();
-    assert!(log.contains("WARN"), "{log}");
-    assert!(log.contains("count=1"), "{log}");
-    assert!(
-        log.contains(&format!("{} (asked m1,m2)", blobs[0].1)),
-        "{log}"
-    );
-    assert!(!log.contains(&blobs[1].1.to_string()), "{log}");
+    assert_eq!(missing, [nobody]);
+    let log = warnings();
+    let line = log
+        .lines()
+        .find(|l| l.contains(&nobody.to_string()))
+        .unwrap_or_else(|| panic!("no line names it: {log}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("count=1"), "{line}");
+    assert!(line.contains("m1") && line.contains("m2"), "{line}");
+    assert!(!log.contains(&found.to_string()), "{log}");
 }
 
 /// Catches a fallback that sends a node more digests than it takes in one call: seventy
