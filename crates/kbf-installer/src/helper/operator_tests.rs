@@ -347,6 +347,18 @@ fn a_change_that_fails_leaves_no_marker_and_moves_nothing() {
     assert!(!rig.marker());
     assert_eq!(rig.restarts(), 0);
 
+    // A change that fails after the state moved keeps the marker: the links are behind the
+    // state, and the service's next pass completes them and restarts.
+    let mut rig = Rig::new("change-fails-late", true);
+    let releases = rig.exec.root.join("var/lib/kbf-installer/releases");
+    fs::set_permissions(&releases, fs::Permissions::from_mode(0o555)).expect("close");
+    let err = rig.op(true).revert(ACTIVATION);
+    fs::set_permissions(&releases, fs::Permissions::from_mode(0o755)).expect("open");
+    let err = err.expect_err("the links cannot be flipped");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    assert_eq!(rig.state().current, Some(c(A)), "the state moved");
+    assert!(rig.marker(), "and the restart is owed");
+
     let mut rig = Rig::new("rollback-gone", false);
     lose_previous_binary(&rig);
     let err = rig.op(true).rollback().expect_err("nothing to go back to");
@@ -434,4 +446,34 @@ fn errors_land_on_the_exit_of_the_contract() {
     };
     assert_eq!(code(other_order.into()), 3);
     assert_eq!(code(ReleaseError::NotUtf8(PathBuf::from("/x")).into()), 1);
+}
+
+/// Catches a `rollback` whose links cannot be flipped reporting success or dropping the
+/// marker (the state has moved, so the service's next pass owes the restart), and a
+/// `quiesce` that calls a host at rest when its state cannot be read: with the releases
+/// directory closed, `rollback` is exit 1 with the state moved and the marker kept; with a
+/// state file of another schema `quiesce` is a failure.
+///
+/// Mutants planted: the rollback error swallowed (success reported); the read error of
+/// `quiesce` treated as an empty state.
+#[test]
+fn a_rollback_that_fails_late_keeps_the_marker_and_quiesce_needs_a_readable_state() {
+    let mut rig = Rig::new("rollback-late", false);
+    let releases = rig.exec.root.join("var/lib/kbf-installer/releases");
+    fs::set_permissions(&releases, fs::Permissions::from_mode(0o555)).expect("close");
+    let err = rig.op(true).rollback();
+    fs::set_permissions(&releases, fs::Permissions::from_mode(0o755)).expect("open");
+    let err = err.expect_err("the links cannot be flipped");
+    assert_eq!(err.exit_code(), 1, "{err}");
+    assert_eq!(rig.state().current, Some(c(A)), "the state moved");
+    assert!(rig.marker(), "and the restart is owed");
+
+    let rig = Rig::new("quiesce-schema", false);
+    fs::write(
+        rig.exec.root.join("var/lib/kbf-installer/state.json"),
+        "{\"schema\": 99}",
+    )
+    .expect("another schema");
+    let err = operator::quiesce(&rig.layout, Duration::ZERO).expect_err("unreadable");
+    assert_eq!(err.exit_code(), 1, "{err}");
 }

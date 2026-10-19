@@ -347,9 +347,11 @@ fn the_recorder_records_and_answers_unknown_commands() {
 #[test]
 fn a_launchd_job_is_read_by_launchctl_print() {
     let release = format!("usr/local/kbf-installer/releases/{B}/kbf");
-    let (_, dir, svc, host) = world("svc-launchd", &release);
+    let (_, dir, svc, mut host) = world("svc-launchd", &release);
     let mac = Layout::new(Root::new(&dir).unwrap(), Platform::MacOs);
     let job = Restart::Launchd("com.example.kbf".to_owned());
+    // The restart of a job is another `launchctl` call than the one that reads it.
+    kbf_host::Exec::apply(&mut host, &job.step()).expect("a restart answers");
     assert_eq!(main_pid(&host, &job), Ok(77));
     assert_eq!(
         accept_confirm(&host, &svc, &mac, &job, &pending(B, None)),

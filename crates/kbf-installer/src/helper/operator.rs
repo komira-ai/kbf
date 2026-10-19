@@ -43,6 +43,9 @@ pub enum Failure {
 }
 
 impl Failure {
+    /// The exit code of the contract's table, for the tests of the mapping (the dispatcher
+    /// maps the variants to [`crate::exit::Exit`] itself).
+    #[cfg(test)]
     pub fn exit_code(&self) -> u8 {
         match self {
             Failure::Failed(_) => 1,

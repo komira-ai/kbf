@@ -427,3 +427,67 @@ fn a_service_whose_file_was_replaced_says_so_and_ends_when_the_new_one_cannot_st
     assert!(stderr.contains("my file was replaced"), "{stderr}");
     assert!(stderr.contains("cannot start"), "{stderr}");
 }
+
+/// Catches a verb that queues behind another run for ever, or hides that it is waiting: with
+/// the lock held by another process, `quiesce` waits its time and then ends busy (exit 4),
+/// which tells a maintainer script to ask again.
+///
+/// Mutant planted: the busy error mapped to a plain failure (exit 1).
+#[test]
+fn a_verb_that_finds_the_lock_held_ends_busy() {
+    let root = root("busy");
+    Locked::acquire(&layout(&root))
+        .expect("lock")
+        .write(&State {
+            current: Some(c(A)),
+            ..State::default()
+        })
+        .expect("state");
+    let held = Locked::acquire(&layout(&root)).expect("held by this test");
+    let out = helper(&root, &["quiesce"]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(held);
+    assert_eq!(helper(&root, &["quiesce"]).status.code(), Some(0));
+}
+
+/// Catches the state errors of an operator's verb landing on the wrong exit in the shipped
+/// binary: both state files damaged is an operator's job (exit 5), and a lock file that cannot
+/// even be opened is a plain failure (exit 1).
+///
+/// Mutants planted: the unusable state mapped to a plain failure; the lock error to busy.
+#[test]
+fn the_operators_verbs_end_by_the_state_error_they_met() {
+    let root = root("state-errors");
+    let host = layout(&root);
+    Locked::acquire(&host)
+        .expect("lock")
+        .write(&State {
+            current: Some(c(A)),
+            ..State::default()
+        })
+        .expect("state");
+    for name in ["state.json", "state.json.bak"] {
+        fs::write(in_state_dir(&root, name), b"not json").expect("ruin");
+    }
+    let out = helper(&root, &["confirm", "--id", "1-5", "--unit", "kbf.service"]);
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = host.join(&host.lock());
+    fs::remove_dir_all(lock.parent().expect("a directory")).expect("no lock directory");
+    let out = helper(&root, &["quiesce"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
