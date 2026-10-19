@@ -156,8 +156,20 @@ pub struct Env<'a> {
 }
 
 /// The installer lock, held while a deploy runs. Dropping it releases it.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a child
+/// forked while the lock is held carries a copy until it execs, so closing the file alone
+/// would leave the lock held as long as that takes. Dropping unlocks first, which no copy
+/// outlives.
 #[derive(Debug)]
-pub struct Lock(#[allow(dead_code)] std::fs::File);
+pub struct Lock(std::fs::File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.0.unlock();
+    }
+}
 
 /// Take the lock without waiting; `None` when another run holds it.
 pub fn lock(path: &Path) -> std::io::Result<Option<Lock>> {

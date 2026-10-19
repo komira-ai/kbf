@@ -125,8 +125,13 @@ fn absolute(key: &str, value: &Option<String>, problems: &mut Vec<String>) -> Op
 
 /// `https://host[:port][/path]` with no user information, query or fragment, lower-cased
 /// host, no trailing `/`.
-fn https_base(url: &str) -> Result<String, String> {
-    let bad = |why: &str| format!("release_url = {url:?}: {why}");
+pub(crate) fn https_base(url: &str) -> Result<String, String> {
+    https_base_named("release_url =", url)
+}
+
+/// [`https_base`], with `label` (the key or flag the text came from) in each message.
+pub(crate) fn https_base_named(label: &str, url: &str) -> Result<String, String> {
+    let bad = |why: &str| format!("{label} {url:?}: {why}");
     let rest = url
         .strip_prefix("https://")
         .ok_or_else(|| bad("must start with https://"))?;
