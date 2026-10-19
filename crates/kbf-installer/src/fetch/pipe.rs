@@ -79,6 +79,8 @@ pub enum PipeFault {
     Oversize { size: u64 },
     #[error("the child ended after {got} of the {size} bytes declared{}", log_suffix(.log))]
     Short { got: u64, size: u64, log: String },
+    #[error("the child ended without sending a byte{}", log_suffix(.log))]
+    Silent { log: String },
     #[error("the child sent no byte for {} s after {got} of {size} bytes; it was killed", .after.as_secs())]
     Stalled {
         got: u64,
@@ -225,6 +227,42 @@ pub fn receive(
     caps: Caps,
     out: &mut File,
 ) -> Result<Received, PipeFault> {
+    let got = drain(spec, flags, lend, caps, Length::Exactly, out)?;
+    out.sync_all().map_err(PipeFault::Write)?;
+    Ok(got)
+}
+
+/// [`receive`] for output whose length nobody declared: whatever the child sends before it
+/// closes its output, at least one byte and at most `caps.size`. A child that sends more is
+/// ended, as for a component; one that has sent a byte and then stalls is stalled, since there
+/// is no count to judge it by.
+pub fn receive_up_to(
+    spec: &ChildSpec,
+    flags: &[OsString],
+    lend: Option<BorrowedFd<'_>>,
+    caps: Caps,
+    out: &mut Vec<u8>,
+) -> Result<Received, PipeFault> {
+    drain(spec, flags, lend, caps, Length::UpTo, out)
+}
+
+/// What `caps.size` means to [`drain`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Length {
+    /// The child is to send this many bytes.
+    Exactly,
+    /// The child is to send at least one and at most this many.
+    UpTo,
+}
+
+fn drain(
+    spec: &ChildSpec,
+    flags: &[OsString],
+    lend: Option<BorrowedFd<'_>>,
+    caps: Caps,
+    length: Length,
+    out: &mut impl Write,
+) -> Result<Received, PipeFault> {
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -261,7 +299,7 @@ pub fn receive(
         let quiet = tally.last_byte + caps.no_byte;
         if now >= whole.min(quiet) {
             // Having all the bytes, a child that will not close its output is judged on them.
-            if tally.count == caps.size {
+            if length == Length::Exactly && tally.count == caps.size {
                 break;
             }
             return Err(if now >= whole {
@@ -282,7 +320,6 @@ pub fn receive(
         }
     }
     let (count, hash) = (tally.count, tally.hash);
-    out.sync_all().map_err(PipeFault::Write)?;
     // The child is done, or judged on the bytes it gave: end it and what it started, then take
     // what it said.
     drop(guard);
@@ -292,7 +329,10 @@ pub fn receive(
     let log = String::from_utf8_lossy(&log[..log.len().min(LOG_BYTES)])
         .trim()
         .to_owned();
-    if count < caps.size {
+    if length == Length::UpTo && count == 0 {
+        return Err(PipeFault::Silent { log });
+    }
+    if length == Length::Exactly && count < caps.size {
         return Err(PipeFault::Short {
             got: count,
             size: caps.size,

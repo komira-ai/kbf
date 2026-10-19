@@ -18,6 +18,9 @@
 //! - [`fetch_component`]: the parent's whole step: the checks that need no byte (digest and
 //!   size well formed, size within the host's cap, room on the disk), the child, and the
 //!   comparison of what arrived with what the order named.
+//! - [`describe_release`]: what a `frontend_update` order, which names a commit and nothing
+//!   else, needs first: the same child, asked what the commit holds ([`describe`]). The
+//!   source's bytes are decoded in the child and the parent reads a small fixed form.
 //!
 //! What this module does **not** do is the rest of section 5's order (attestation of the file,
 //! its shape, the binary's own report, the install): those are the verify pipeline's
@@ -25,6 +28,7 @@
 //! between the two. Nothing written here is root's authority until that pipeline has accepted it.
 
 pub mod child;
+pub mod describe;
 pub mod identity;
 pub mod pipe;
 pub mod user;
@@ -32,13 +36,16 @@ pub mod user;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::CommitId;
 use crate::layout::Platform;
 use crate::run::{Confine, RunAs};
+use describe::{Answer, DescribeFault, Described};
 use identity::{Identity, IdentityFault};
+use kbf_types::ReleasePlatform;
 use pipe::{Caps, ChildSpec, PipeFault, Received};
 use user::UserFault;
 
@@ -150,6 +157,8 @@ pub enum FetchError {
     Pipe(#[from] PipeFault),
     #[error("the download has sha256 {actual}; the order names {want}")]
     Digest { actual: String, want: String },
+    #[error("{0}")]
+    Describe(#[from] DescribeFault),
 }
 
 impl FetchError {
@@ -159,7 +168,10 @@ impl FetchError {
             FetchError::BadDigest(_) | FetchError::Digest { .. } => "hash",
             FetchError::Size { .. } => "size",
             FetchError::Disk { .. } => "disk",
-            FetchError::Source(..) | FetchError::Identity(_) | FetchError::Pipe(_) => "fetch",
+            FetchError::Source(..)
+            | FetchError::Identity(_)
+            | FetchError::Pipe(_)
+            | FetchError::Describe(_) => "fetch",
         }
     }
 }
@@ -190,13 +202,37 @@ pub fn ensure_room(dir: &Path, need: u64) -> Result<(), FetchError> {
     Ok(())
 }
 
-/// The flags of `fetch-child` for `source`, and the identity to lend (frontend only).
-fn child_flags(
-    source: &Source,
-    c: &Component<'_>,
-    lend: Option<&std::os::fd::OwnedFd>,
-) -> Result<Vec<OsString>, FetchError> {
+/// The flags of `fetch-child` that name where the bytes come from: the kind and address of
+/// `source`, the roots a `url` source is checked against, the identity to lend (frontend only).
+fn source_flags(source: &Source, lend: Option<&OwnedFd>) -> Vec<OsString> {
     use std::os::fd::AsRawFd;
+    match source {
+        Source::Url { base, ca_file } => {
+            let mut flags: Vec<OsString> =
+                vec!["--kind".into(), "url".into(), "--url".into(), base.into()];
+            if let Some(ca) = ca_file {
+                flags.extend(["--ca-file".into(), ca.into()]);
+            }
+            flags
+        }
+        Source::Frontend(f) => {
+            let fd = lend
+                .expect("a frontend fetch lends the identity")
+                .as_raw_fd();
+            vec![
+                "--kind".into(),
+                "frontend".into(),
+                "--url".into(),
+                f.url.clone().into(),
+                "--identity-fd".into(),
+                fd.to_string().into(),
+            ]
+        }
+    }
+}
+
+/// The flags of `fetch-child` for a component of `source`.
+fn child_flags(source: &Source, c: &Component<'_>, lend: Option<&OwnedFd>) -> Vec<OsString> {
     // One byte more than the declared size, so that a source that sends more is seen to.
     let limit = c.size + 1;
     let mut flags: Vec<OsString> = vec![
@@ -205,28 +241,51 @@ fn child_flags(
         "--limit".into(),
         limit.to_string().into(),
     ];
-    match source {
-        Source::Url { base, ca_file } => {
-            flags.extend(["--kind".into(), "url".into(), "--url".into(), base.into()]);
-            if let Some(ca) = ca_file {
-                flags.extend(["--ca-file".into(), ca.into()]);
-            }
-        }
-        Source::Frontend(f) => {
-            let fd = lend
-                .expect("a frontend fetch lends the identity")
-                .as_raw_fd();
-            flags.extend([
-                "--kind".into(),
-                "frontend".into(),
-                "--url".into(),
-                f.url.clone().into(),
-                "--identity-fd".into(),
-                fd.to_string().into(),
-            ]);
-        }
+    flags.extend(source_flags(source, lend));
+    flags
+}
+
+/// The flags of `fetch-child` that ask `source` what `commit` holds. A frontend is also told
+/// the platform (it describes only that one); a `url` source's file lists them all.
+fn describe_flags(
+    source: &Source,
+    commit: &CommitId,
+    platform: ReleasePlatform,
+    lend: Option<&OwnedFd>,
+) -> Vec<OsString> {
+    let mut flags: Vec<OsString> = vec![
+        "--describe".into(),
+        commit.as_str().into(),
+        "--limit".into(),
+        // One byte more than the most, so that a child that writes more is seen to.
+        (describe::MAX_BYTES + 1).to_string().into(),
+    ];
+    if matches!(source, Source::Frontend(_)) {
+        flags.extend(["--platform".into(), platform.as_str().into()]);
     }
-    Ok(flags)
+    flags.extend(source_flags(source, lend));
+    flags
+}
+
+/// The identity a `frontend` source presents, read now (so a renewed certificate is used)
+/// and lent on a descriptor; none for a `url` source.
+fn lend_identity(source: &Source) -> Result<Option<OwnedFd>, FetchError> {
+    match source {
+        Source::Frontend(f) => Ok(Some(
+            Identity::read(&f.node_cert, &f.node_key, &f.ca_file)?.lend()?,
+        )),
+        Source::Url { .. } => Ok(None),
+    }
+}
+
+/// The child as `Confine::FETCH` confines it: the installer's own program, `fetch-child`.
+fn child_spec(child: &ChildProgram) -> ChildSpec {
+    ChildSpec {
+        program: child.program.clone(),
+        args: vec!["fetch-child".into()],
+        run_as: child.run_as,
+        confine: Confine::FETCH,
+    }
 }
 
 /// Validate `source` as the settings would have: https, no user information, query or fragment;
@@ -283,23 +342,20 @@ pub fn fetch_component(
     }
     check_source(source)?;
     ensure_room(room.0, room_needed(component.size, room.1))?;
-    let lent = match source {
-        Source::Frontend(f) => Some(Identity::read(&f.node_cert, &f.node_key, &f.ca_file)?.lend()?),
-        Source::Url { .. } => None,
-    };
-    let flags = child_flags(source, component, lent.as_ref())?;
-    let spec = ChildSpec {
-        program: child.program.clone(),
-        args: vec!["fetch-child".into()],
-        run_as: child.run_as,
-        confine: Confine::FETCH,
-    };
+    let lent = lend_identity(source)?;
+    let flags = child_flags(source, component, lent.as_ref());
     let caps = Caps {
         size: component.size,
         no_byte: NO_BYTE_TIMEOUT.min(limits.fetch_timeout),
         total: limits.fetch_timeout,
     };
-    let got = pipe::receive(&spec, &flags, lent.as_ref().map(AsFd::as_fd), caps, out)?;
+    let got = pipe::receive(
+        &child_spec(child),
+        &flags,
+        lent.as_ref().map(AsFd::as_fd),
+        caps,
+        out,
+    )?;
     // The lent descriptor is closed as soon as the child is done with it.
     drop(lent);
     if got.sha256 != component.sha256 {
@@ -309,6 +365,48 @@ pub fn fetch_component(
         });
     }
     Ok(got)
+}
+
+/// Ask `source` what `commit` holds, through the confined child, and give back the components
+/// a host of `platform` is to fetch (a tarball and the bundle that attests it, each by digest).
+///
+/// The child decodes the source's answer and the parent reads the fixed form it writes
+/// ([`describe`]); the parent holds that to the order's commit, the host's platform and the
+/// bounds of a release before it names a file. `limits.max_component_bytes` is the most a
+/// tarball may be, as for [`fetch_component`]. A source that says it will not describe the
+/// commit, or an answer that cannot be used, is [`FetchError::Describe`]. A source that cannot
+/// be reached is a pipe fault.
+pub fn describe_release(
+    child: &ChildProgram,
+    source: &Source,
+    limits: Limits,
+    commit: &CommitId,
+    platform: ReleasePlatform,
+) -> Result<Vec<Described>, FetchError> {
+    check_source(source)?;
+    let lent = lend_identity(source)?;
+    let flags = describe_flags(source, commit, platform, lent.as_ref());
+    let caps = Caps {
+        size: describe::MAX_BYTES,
+        no_byte: NO_BYTE_TIMEOUT.min(limits.fetch_timeout),
+        total: limits.fetch_timeout,
+    };
+    let mut said = Vec::new();
+    pipe::receive_up_to(
+        &child_spec(child),
+        &flags,
+        lent.as_ref().map(AsFd::as_fd),
+        caps,
+        &mut said,
+    )?;
+    drop(lent);
+    match Answer::parse(&said)? {
+        Answer::Refused(why) => Err(DescribeFault::Refused(why).into()),
+        Answer::Described(description) => {
+            let cap = limits.max_component_bytes.min(MAX_COMPONENT_CEILING);
+            Ok(description.select(commit, platform, cap)?)
+        }
+    }
 }
 
 #[cfg(test)]

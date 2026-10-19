@@ -13,10 +13,25 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use kbf_installer::CommitId;
+use kbf_installer::binary::Arch;
+use kbf_installer::fetch::describe::{DescribeFault, Described};
 use kbf_installer::fetch::pipe::{PipeFault, Received};
 use kbf_installer::fetch::{
-    ChildProgram, Component, FetchError, FrontendSource, Limits, Source, fetch_component,
+    ChildProgram, Component, FetchError, FrontendSource, Limits, Source, describe_release,
+    fetch_component,
 };
+use kbf_installer::fixtures::{
+    COMMIT, FakeRunner, elf, file, me, ran, tar_gz, trusted_host_on, version_json,
+};
+use kbf_installer::helper::fetcher::{FetchError as Refused, Fetcher, ReleaseLocator};
+use kbf_installer::helper::fetcher_real::RealFetcher;
+use kbf_installer::helper::leases::LeaseSource;
+use kbf_installer::layout::Platform;
+use kbf_installer::settings::Settings;
+use kbf_installer::stage::{Policy, Supported, Timeouts};
+use kbf_installer::testkit::host_root_on;
+use kbf_types::ReleasePlatform;
 use sha2::{Digest, Sha256};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-installer");
@@ -98,6 +113,8 @@ enum Plan {
     Short { declared: usize, sent: usize },
     /// 200 with the first `sent` bytes of the body, then nothing, for as long as the test runs.
     Stall { declared: usize, sent: usize },
+    /// A tree of files: 200 with the bytes of the path asked for, 404 for any other.
+    Files(Vec<(String, Vec<u8>)>),
 }
 
 struct Https {
@@ -171,11 +188,18 @@ fn answer(
         .nth(1)
         .unwrap_or_default()
         .to_owned();
-    seen.lock().expect("lock").push(path);
+    seen.lock().expect("lock").push(path.clone());
     let reply = |status: &str, extra: &str, len: usize| {
         format!("HTTP/1.1 {status}\r\n{extra}Content-Length: {len}\r\nConnection: close\r\n\r\n")
     };
     match plan {
+        Plan::Files(files) => match files.iter().find(|(at, _)| *at == path) {
+            Some((_, bytes)) => {
+                tls.write_all(reply("200 OK", "", bytes.len()).as_bytes())?;
+                tls.write_all(bytes)?;
+            }
+            None => tls.write_all(reply("404 Not Found", "", 0).as_bytes())?,
+        },
         Plan::Body(bytes) => {
             tls.write_all(reply("200 OK", "", bytes.len()).as_bytes())?;
             tls.write_all(bytes)?;
@@ -221,18 +245,31 @@ enum Serve {
     },
 }
 
+/// What the gRPC server does with a `Describe`.
+#[derive(Clone)]
+enum Describing {
+    /// This description.
+    Of(kbf_proto::update::ReleaseDescription),
+    /// This status.
+    Status(tonic::Code, &'static str),
+}
+
 struct Grpc {
     port: u16,
     /// The DER certificates the client presented, per call.
     peers: Arc<Mutex<Vec<usize>>>,
     asked: Arc<Mutex<Vec<String>>>,
+    /// The commit and platform of each `Describe`.
+    described: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 #[derive(Clone)]
 struct Svc {
     serve: Serve,
+    describing: Describing,
     peers: Arc<Mutex<Vec<usize>>>,
     asked: Arc<Mutex<Vec<String>>>,
+    described: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 type Chunks = std::pin::Pin<
@@ -242,6 +279,25 @@ type Chunks = std::pin::Pin<
 #[tonic::async_trait]
 impl kbf_proto::update::release_service_server::ReleaseService for Svc {
     type FetchStream = Chunks;
+
+    async fn describe(
+        &self,
+        request: tonic::Request<kbf_proto::update::DescribeRequest>,
+    ) -> Result<tonic::Response<kbf_proto::update::ReleaseDescription>, tonic::Status> {
+        self.peers
+            .lock()
+            .expect("lock")
+            .push(request.peer_certs().map_or(0, |c| c.len()));
+        let ask = request.get_ref();
+        self.described
+            .lock()
+            .expect("lock")
+            .push((ask.commit.clone(), ask.platform.clone()));
+        match &self.describing {
+            Describing::Of(description) => Ok(tonic::Response::new(description.clone())),
+            Describing::Status(code, message) => Err(tonic::Status::new(*code, *message)),
+        }
+    }
 
     async fn fetch(
         &self,
@@ -287,15 +343,29 @@ impl kbf_proto::update::release_service_server::ReleaseService for Svc {
 use futures::StreamExt as _;
 
 impl Grpc {
-    /// A worker listener that wants a client certificate signed by `client_ca`.
+    /// A worker listener that wants a client certificate signed by `client_ca`, and does not
+    /// describe.
     fn start(server: &Leaf, client_ca: &str, serve: Serve) -> Grpc {
+        let no = Describing::Status(tonic::Code::Unimplemented, "this server does not describe");
+        Grpc::start_with(server, client_ca, serve, no)
+    }
+
+    /// The same, answering `Describe` as `describing` says.
+    fn describing(server: &Leaf, client_ca: &str, describing: Describing) -> Grpc {
+        Grpc::start_with(server, client_ca, Serve::NotFound, describing)
+    }
+
+    fn start_with(server: &Leaf, client_ca: &str, serve: Serve, describing: Describing) -> Grpc {
         use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
         let peers = Arc::new(Mutex::new(Vec::new()));
         let asked = Arc::new(Mutex::new(Vec::new()));
+        let described = Arc::new(Mutex::new(Vec::new()));
         let svc = Svc {
             serve,
+            describing,
             peers: Arc::clone(&peers),
             asked: Arc::clone(&asked),
+            described: Arc::clone(&described),
         };
         let tls = ServerTlsConfig::new()
             .identity(Identity::from_pem(&server.cert, &server.key))
@@ -322,7 +392,12 @@ impl Grpc {
                     .await;
             });
         });
-        Grpc { port, peers, asked }
+        Grpc {
+            port,
+            peers,
+            asked,
+            described,
+        }
     }
 
     fn url(&self) -> String {
@@ -1253,6 +1328,18 @@ struct Lent<'a> {
 
 #[cfg(target_os = "linux")]
 fn frontend_by_hand(url: &str, digest: &str, limit: u64, lent: &Lent<'_>) -> std::process::Output {
+    frontend_asked(url, &["--sha256", digest], limit, lent)
+}
+
+/// A by-hand frontend child asked for `what` (`--sha256 <digest>`, or `--describe <commit>`
+/// and the like).
+#[cfg(target_os = "linux")]
+fn frontend_asked(
+    url: &str,
+    what: &[&str],
+    limit: u64,
+    lent: &Lent<'_>,
+) -> std::process::Output {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
     let fd = lent.id.lend().expect("lends");
@@ -1260,7 +1347,8 @@ fn frontend_by_hand(url: &str, digest: &str, limit: u64, lent: &Lent<'_>) -> std
     let mut command = std::process::Command::new(BIN);
     command
         .args(["fetch-child", "--kind", "frontend", "--url", url])
-        .args(["--sha256", digest, "--limit", &limit.to_string()])
+        .args(what)
+        .args(["--limit", &limit.to_string()])
         .args(["--identity-fd", &at.to_string()])
         .env_clear();
     if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
@@ -1443,4 +1531,555 @@ fn a_frontend_child_checks_what_it_was_given() {
     ]);
     assert!(!ok);
     assert!(err.contains("Bad file descriptor"), "{err}");
+}
+
+// ------------------------------------------------------------------ describing a release
+//
+// A `frontend_update` order names a commit and nothing else: the child asks the source what the
+// commit holds (`GET <base>/releases/<commit>.json`, or `ReleaseService.Describe`), decodes the
+// answer, and the parent reads the small form it writes (`fetch::describe`).
+
+/// What an honest source lists for `platform`.
+fn entry(platform: &str) -> Described {
+    Described {
+        name: "kbf".to_owned(),
+        platform: platform.to_owned(),
+        tarball: format!("kbf-{COMMIT}-{platform}.tar.gz"),
+        sha256: sha(platform.as_bytes()),
+        size: 1000,
+        bundle_sha256: sha(b"bundle"),
+        bundle_size: 500,
+    }
+}
+
+/// The JSON file of `docs/api.md` for `entries`, with keys the reader does not know.
+fn json_file(schema: u64, commit: &str, entries: &[Described]) -> Vec<u8> {
+    let components: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "name": e.name, "platform": e.platform, "tarball": e.tarball,
+                "sha256": e.sha256, "size": e.size,
+                "bundle_sha256": e.bundle_sha256, "bundle_size": e.bundle_size,
+                "added_later": true,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "schema": schema, "commit": commit, "components": components, "generated": "later",
+    })
+    .to_string()
+    .into_bytes()
+}
+
+fn proto_of(commit: &str, entries: &[Described]) -> kbf_proto::update::ReleaseDescription {
+    kbf_proto::update::ReleaseDescription {
+        commit: commit.to_owned(),
+        components: entries
+            .iter()
+            .map(|e| kbf_proto::update::ReleaseComponent {
+                name: e.name.clone(),
+                platform: e.platform.clone(),
+                tarball: e.tarball.clone(),
+                sha256: e.sha256.clone(),
+                size: e.size,
+                bundle_sha256: e.bundle_sha256.clone(),
+                bundle_size: e.bundle_size,
+            })
+            .collect(),
+    }
+}
+
+fn json_path() -> String {
+    format!("/mirror/releases/{COMMIT}.json")
+}
+
+impl Rig {
+    /// Ask `source` what `COMMIT` holds for `platform`, through the confined child.
+    fn describe(
+        &self,
+        source: &Source,
+        platform: ReleasePlatform,
+    ) -> Result<Vec<Described>, FetchError> {
+        let child = ChildProgram {
+            program: PathBuf::from(BIN),
+            run_as: None,
+        };
+        let limits = Limits {
+            max_component_bytes: 1 << 20,
+            fetch_timeout: LONG,
+        };
+        let commit = CommitId::new(COMMIT).expect("commit");
+        describe_release(&child, source, limits, &commit, platform)
+    }
+}
+
+/// The `url` source is described from `<base>/releases/<commit>.json`: the one request, the
+/// entries of the host's platform, and the file's other platforms and keys the reader does not
+/// know are no obstacle.
+///
+/// Rule: the description of a `url` source is the JSON of schema 1, whose reader "ignores keys it
+/// does not know". Catches a URL assembled other than `releases/<commit>.json` under the base's
+/// path, a reader that fails on an added key, and another platform's entry leaking into the
+/// answer.
+///
+/// Mutants: `releases/` spelt `release/` in the child (red: 404); `deny_unknown_fields` on the
+/// JSON types (red: refused).
+#[test]
+fn the_url_source_is_described_from_its_json() {
+    let (pki, leaf) = pki_and_server();
+    let file = json_file(1, COMMIT, &[entry("linux-arm64"), entry("linux-x86_64")]);
+    let server = Https::start(&leaf, Plan::Files(vec![(json_path(), file)]));
+    let rig = Rig::new("describe-url");
+    let source = rig.url_source(&format!("{}/mirror", server.url()), &pki.ca_pem());
+    let got = rig.describe(&source, ReleasePlatform::LinuxX86_64);
+    assert_eq!(got.expect("described"), [entry("linux-x86_64")]);
+    assert_eq!(server.hits(), [json_path()]);
+}
+
+/// A `url` source that answers `404` or `409` for the file (the route of `docs/api.md` does, for a
+/// commit it holds nothing of or nothing complete of) has said there is nothing to describe: the
+/// source's answer, naming the file, and not a failure of the child. Any other status is a
+/// failed fetch of the child.
+///
+/// Catches a refusal of the source taken for a failure of the child, and a server error taken
+/// for a refusal.
+///
+/// Mutant: the `404 | 409` arm of the child removed (red: both are failures of the child).
+#[test]
+fn a_url_source_that_has_no_such_release_says_so() {
+    let (pki, leaf) = pki_and_server();
+    let rig = Rig::new("describe-url-status");
+    for status in [404, 409] {
+        let server = Https::start(&leaf, Plan::Status(status));
+        let source = rig.url_source(&format!("{}/mirror", server.url()), &pki.ca_pem());
+        match rig.describe(&source, ReleasePlatform::LinuxX86_64) {
+            Err(FetchError::Describe(DescribeFault::Refused(why))) => {
+                assert!(why.contains(&format!("{} answered {status}", json_path())), "{why}");
+            }
+            other => panic!("{status}: {other:?}"),
+        }
+    }
+    let server = Https::start(&leaf, Plan::Status(500));
+    let source = rig.url_source(&format!("{}/mirror", server.url()), &pki.ca_pem());
+    match rig.describe(&source, ReleasePlatform::LinuxX86_64) {
+        Err(FetchError::Pipe(PipeFault::Silent { log })) => {
+            assert!(log.contains("the source answered 500"), "{log}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A file of another schema, one that is not JSON, one of another commit and one that lacks the
+/// host's platform are each refused with what is wrong with them.
+///
+/// Catches a file of a schema this reader does not know being read as schema 1, and a mirror's
+/// file for one release being taken for another.
+#[test]
+fn a_url_file_that_cannot_be_used_is_refused_with_the_reason() {
+    let (pki, leaf) = pki_and_server();
+    let mine = [entry("linux-x86_64")];
+    let cases: Vec<(Vec<u8>, &str)> = vec![
+        (json_file(2, COMMIT, &mine), "schema 2"),
+        (b"<html>not json</html>".to_vec(), "no schema"),
+        (json_file(1, &"b".repeat(40), &mine), "it describes commit"),
+        (json_file(1, COMMIT, &[entry("linux-arm64")]), "it has no kbf for linux-x86_64"),
+    ];
+    for (n, (file, said)) in cases.into_iter().enumerate() {
+        let server = Https::start(&leaf, Plan::Files(vec![(json_path(), file)]));
+        let rig = Rig::new(&format!("describe-url-bad-{n}"));
+        let source = rig.url_source(&format!("{}/mirror", server.url()), &pki.ca_pem());
+        match rig.describe(&source, ReleasePlatform::LinuxX86_64) {
+            Err(FetchError::Describe(
+                DescribeFault::Refused(why) | DescribeFault::Unusable(why),
+            )) => assert!(why.contains(said), "{said}: {why}"),
+            other => panic!("{said}: {other:?}"),
+        }
+    }
+}
+
+/// The frontend source is described over mutual TLS: the call carries the node's certificate,
+/// names the commit and the host's platform, and the entries come back.
+///
+/// Catches the platform not being asked for (a frontend would describe every one), and a
+/// describe sent without the identity.
+///
+/// Mutants: `platform` left empty in the child's request (red: asked for ""); the identity not
+/// presented (red).
+#[test]
+fn the_frontend_source_is_described_over_mutual_tls() {
+    let (pki, server) = pki_and_server();
+    let said = proto_of(COMMIT, &[entry("linux-x86_64")]);
+    let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Of(said));
+    let rig = Rig::new("describe-frontend");
+    let source = rig.frontend(&grpc.url(), &pki.ca_pem(), &pki.client());
+    let got = rig.describe(&source, ReleasePlatform::LinuxX86_64);
+    assert_eq!(got.expect("described"), [entry("linux-x86_64")]);
+    let asked = (COMMIT.to_owned(), "linux-x86_64".to_owned());
+    assert_eq!(*grpc.described.lock().expect("lock"), [asked]);
+    assert_eq!(*grpc.peers.lock().expect("lock"), [1]);
+}
+
+/// `NOT_FOUND` and `FAILED_PRECONDITION` from `Describe` are the answer that there is no
+/// description to be had, and arrive with the server's words; every other status (the role
+/// table's `PERMISSION_DENIED`, a store that fails, a server that does not describe) is a failed
+/// fetch of the child.
+///
+/// Catches the two refusals taken for failures of the child, a failure taken for a refusal, and
+/// the server's message (which names what is lacking) lost.
+///
+/// Mutant: `Code::FailedPrecondition` removed from the child's match (red).
+#[test]
+fn a_frontend_that_will_not_describe_is_a_refusal_or_a_failure_by_its_status() {
+    use tonic::Code;
+    let (pki, server) = pki_and_server();
+    let rig = Rig::new("describe-frontend-status");
+    let source = |grpc: &Grpc| rig.frontend(&grpc.url(), &pki.ca_pem(), &pki.client());
+    let verdicts = [
+        (Code::NotFound, "no tarball of the commit is stored", "NotFound"),
+        (Code::FailedPrecondition, "linux-x86_64 has no attestation of kbf", "FailedPrecondition"),
+    ];
+    for (code, message, name) in verdicts {
+        let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Status(code, message));
+        match rig.describe(&source(&grpc), ReleasePlatform::LinuxX86_64) {
+            Err(FetchError::Describe(DescribeFault::Refused(why))) => {
+                assert_eq!(why, format!("{name}: {message}"));
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    let outages = [
+        (Code::PermissionDenied, "PermissionDenied"),
+        (Code::Internal, "Internal"),
+        (Code::Unimplemented, "Unimplemented"),
+    ];
+    for (code, name) in outages {
+        let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Status(code, "no"));
+        match rig.describe(&source(&grpc), ReleasePlatform::LinuxX86_64) {
+            Err(FetchError::Pipe(PipeFault::Silent { log })) => {
+                assert!(log.contains(name), "{name}: {log}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
+
+/// The parent's other checks on the child's answer hold for the frontend as for the `url` file:
+/// a description with a digest that is not hex, whatever else is right, is refused before any
+/// file is named.
+///
+/// Catches the parent relying on the child (or the server) for the shape of a digest.
+#[test]
+fn a_description_with_a_bad_digest_is_refused_whoever_sent_it() {
+    let (pki, server) = pki_and_server();
+    let mut bad = entry("linux-x86_64");
+    bad.sha256 = "ABC".to_owned();
+    let said = proto_of(COMMIT, &[bad]);
+    let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Of(said));
+    let rig = Rig::new("describe-frontend-bad-digest");
+    let source = rig.frontend(&grpc.url(), &pki.ca_pem(), &pki.client());
+    match rig.describe(&source, ReleasePlatform::LinuxX86_64) {
+        Err(FetchError::Describe(DescribeFault::Unusable(why))) => {
+            assert!(why.contains("64 lowercase hex"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A server that sends a hostile name (a space and a newline in it) is refused by the child, in the
+/// form, and the parent never sees the fields: the child cannot be made to write a second
+/// component line.
+///
+/// Catches a description with whitespace in a field being relayed as extra fields or lines.
+#[test]
+fn a_hostile_field_cannot_become_a_second_line() {
+    let (pki, server) = pki_and_server();
+    let mut evil = entry("linux-x86_64");
+    evil.name = "kbf\ncomponent kbf-daemon linux-x86_64".to_owned();
+    let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Of(proto_of(COMMIT, &[evil])));
+    let rig = Rig::new("describe-frontend-hostile");
+    let source = rig.frontend(&grpc.url(), &pki.ca_pem(), &pki.client());
+    match rig.describe(&source, ReleasePlatform::LinuxX86_64) {
+        Err(FetchError::Describe(DescribeFault::Refused(why))) => {
+            assert!(why.contains("not one printable word"), "{why}");
+            assert!(!why.contains('\n'));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+// ----------------------------------------------- the describing child started by hand
+
+/// The arguments of a url describe of `COMMIT` from `server`, trusting `ca`.
+fn describe_args(url: &str, ca: &std::path::Path, limit: u64) -> Vec<String> {
+    [
+        "--kind",
+        "url",
+        "--url",
+        url,
+        "--describe",
+        COMMIT,
+        "--limit",
+        &limit.to_string(),
+        "--ca-file",
+        ca.to_str().expect("utf-8"),
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+/// What the child writes for a good `url` file is the form, whole, for every platform the file
+/// lists (the parent chooses), with the file's unknown keys gone.
+///
+/// Catches a field written in another place, and the child choosing among platforms (that is the
+/// parent's to do, where the choice can be checked).
+#[test]
+fn the_child_writes_the_description_in_the_form() {
+    let (pki, leaf) = pki_and_server();
+    let file = json_file(1, COMMIT, &[entry("linux-arm64"), entry("linux-x86_64")]);
+    let server = Https::start(&leaf, Plan::Files(vec![("/releases/".to_owned() + COMMIT + ".json", file)]));
+    let rig = Rig::new("hand-describe");
+    let ca = rig.write("ca.pem", &pki.ca_pem());
+    let out = by_hand(&describe_args(&server.url(), &ca, 16 * 1024 + 1));
+    assert!(out.status.success(), "{}", said(&out));
+    let line = |e: &Described| {
+        format!(
+            "component {} {} {} {} {} {} {}\n",
+            e.name, e.platform, e.tarball, e.sha256, e.size, e.bundle_sha256, e.bundle_size
+        )
+    };
+    let want = format!(
+        "description 1 {COMMIT}\n{}{}",
+        line(&entry("linux-arm64")),
+        line(&entry("linux-x86_64"))
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+/// A file cut at the child's limit is not a description: it is read as far as the limit and
+/// refused, with the child's words, as one line and success.
+///
+/// Mutant: `.take(args.limit)` removed from the body read (red: the whole file is read).
+#[test]
+fn a_file_longer_than_the_limit_is_read_only_that_far() {
+    let (pki, leaf) = pki_and_server();
+    let file = json_file(1, COMMIT, &[entry("linux-x86_64")]);
+    let server = Https::start(&leaf, Plan::Files(vec![("/releases/".to_owned() + COMMIT + ".json", file)]));
+    let rig = Rig::new("hand-describe-cut");
+    let ca = rig.write("ca.pem", &pki.ca_pem());
+    // Shorter than the file, longer than the refusal it comes to.
+    let out = by_hand(&describe_args(&server.url(), &ca, 250));
+    assert!(out.status.success(), "{}", said(&out));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("refused the file has no schema: "), "{text}");
+    assert_eq!(text.matches('\n').count(), 1);
+}
+
+/// The `404` and `409` of a `url` source are written as refusals (and the child succeeds: it
+/// did what it was asked, and the answer is no); a `500` is a failure with the status named.
+///
+/// Mutant: the `404 | 409` arm removed (red: both fail).
+#[test]
+fn the_child_writes_a_refusal_for_404_and_409_and_fails_for_the_rest() {
+    let (pki, leaf) = pki_and_server();
+    let rig = Rig::new("hand-describe-status");
+    let ca = rig.write("ca.pem", &pki.ca_pem());
+    for status in [404, 409] {
+        let server = Https::start(&leaf, Plan::Status(status));
+        let out = by_hand(&describe_args(&server.url(), &ca, 16 * 1024 + 1));
+        assert!(out.status.success(), "{}", said(&out));
+        let want = format!("refused {}/releases/{COMMIT}.json answered {status}\n", server.url());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+    }
+    let server = Https::start(&leaf, Plan::Status(500));
+    let out = by_hand(&describe_args(&server.url(), &ca, 16 * 1024 + 1));
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(said(&out).contains("the source answered 500"), "{}", said(&out));
+}
+
+/// A `url` source that is not there is the same failed start as for a blob.
+#[test]
+fn a_url_source_that_is_not_there_fails_the_describing_child() {
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    };
+    let rig = Rig::new("hand-describe-gone");
+    let ca = rig.write("ca.pem", &Pki::new().ca_pem());
+    let out = by_hand(&describe_args(&format!("https://localhost:{port}"), &ca, 100));
+    assert!(!out.status.success());
+    assert!(said(&out).contains("source unreachable"), "{}", said(&out));
+}
+
+/// A by-hand frontend describe: the child lent an identity on descriptor 4.
+#[cfg(target_os = "linux")]
+fn frontend_describes(url: &str, platform: Option<&str>, pki: &Pki) -> std::process::Output {
+    let id = identity_of(pki, &pki.client());
+    let lent = Lent {
+        id: &id,
+        at: 4,
+        tidy: true,
+    };
+    let mut what = vec!["--describe", COMMIT];
+    if let Some(platform) = platform {
+        what.extend(["--platform", platform]);
+    }
+    frontend_asked(url, &what, 16 * 1024 + 1, &lent)
+}
+
+/// The frontend child writes what `Describe` answered, in the form, and asks for the platform it
+/// was given (or for none).
+///
+/// Catches the platform dropped from the request, and a field of the message in another's place.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_frontend_child_writes_what_describe_answered() {
+    let (pki, server) = pki_and_server();
+    let said_by_server = proto_of(COMMIT, &[entry("linux-x86_64")]);
+    let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Of(said_by_server));
+    for platform in [Some("linux-x86_64"), None] {
+        let out = frontend_describes(&grpc.url(), platform, &pki);
+        assert!(out.status.success(), "{}", said(&out));
+        let e = entry("linux-x86_64");
+        let want = format!(
+            "description 1 {COMMIT}\ncomponent {} {} {} {} {} {} {}\n",
+            e.name, e.platform, e.tarball, e.sha256, e.size, e.bundle_sha256, e.bundle_size
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+    }
+    let asked: Vec<String> = grpc
+        .described
+        .lock()
+        .expect("lock")
+        .iter()
+        .map(|(commit, platform)| format!("{commit} {platform:?}"))
+        .collect();
+    assert_eq!(asked, [format!("{COMMIT} \"linux-x86_64\""), format!("{COMMIT} \"\"")]);
+}
+
+/// `NOT_FOUND` and `FAILED_PRECONDITION` are written as refusals with the status named, and the
+/// child succeeds; any other status fails it.
+///
+/// Mutant: either code removed from the match (red).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_frontend_child_writes_a_refusal_for_two_statuses() {
+    use tonic::Code;
+    let (pki, server) = pki_and_server();
+    for (code, name) in [(Code::NotFound, "NotFound"), (Code::FailedPrecondition, "FailedPrecondition")] {
+        let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Status(code, "it is not there"));
+        let out = frontend_describes(&grpc.url(), Some("linux-arm64"), &pki);
+        assert!(out.status.success(), "{}", said(&out));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("refused {name}: it is not there\n")
+        );
+    }
+    let grpc = Grpc::describing(&server, &pki.ca_pem(), Describing::Status(Code::Internal, "it broke"));
+    let out = frontend_describes(&grpc.url(), Some("linux-arm64"), &pki);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(said(&out).contains("Internal: it broke"), "{}", said(&out));
+}
+
+// ------------------------------------------------------ the whole of it, on the real child
+
+struct NoLeases;
+
+impl LeaseSource for NoLeases {
+    fn live(&self) -> Result<usize, String> {
+        Ok(0)
+    }
+}
+
+/// A `frontend_update` that names a commit and nothing else, on a `url` source, with the real child
+/// and the real pipeline (only `gh` and the binary's own report are played): the file
+/// `releases/<commit>.json` is read, the bundle and then the tarball are fetched from
+/// `files/<digest>`, and the release is installed. Each request is the contract's: the
+/// description once, each file once, by digest.
+///
+/// Catches the three pieces not agreeing with one another (the form the child writes, what the
+/// fetcher reads, the layout of the `url` source), a bundle fetched under another name than its
+/// digest, and a file fetched twice.
+///
+/// Mutant: the bundle fetched by the tarball's digest (red: 404 on a second tarball fetch).
+#[test]
+fn a_frontend_update_is_installed_from_a_url_source_end_to_end() {
+    let (pki, leaf) = pki_and_server();
+    let tar = tar_gz(&[file("kbf", &elf(0x3e, "payload"))]);
+    let bundle = b"{\"mediaType\":\"application/vnd.dev.sigstore.bundle+json\"}\n".to_vec();
+    let mut entry = entry("linux-x86_64");
+    (entry.sha256, entry.size) = (sha(&tar), tar.len() as u64);
+    (entry.bundle_sha256, entry.bundle_size) = (sha(&bundle), bundle.len() as u64);
+    let server = Https::start(
+        &leaf,
+        Plan::Files(vec![
+            (json_path(), json_file(1, COMMIT, &[entry.clone()])),
+            (format!("/mirror/files/{}", sha(&tar)), tar.clone()),
+            (format!("/mirror/files/{}", sha(&bundle)), bundle.clone()),
+        ]),
+    );
+    let rig = Rig::new("whole-url");
+    let source = rig.url_source(&format!("{}/mirror", server.url()), &pki.ca_pem());
+    let (host, _) = host_root_on("fetch-e2e-whole-url-host", Platform::Linux);
+    let ids = me();
+    let mut settings = Settings::defaults(&host);
+    settings.run_as = ids;
+    settings.arch = Arch::X86_64;
+    let probe = version_json(COMMIT, "release");
+    let fetcher = RealFetcher {
+        host: host.clone(),
+        settings,
+        policy: Policy {
+            max_component_bytes: 1 << 20,
+            max_binary_bytes: 1 << 20,
+            min_protocol: 0,
+            supported: Supported {
+                protocol: 10,
+                min_protocol: 10,
+                state_schema: 10,
+            },
+            timeouts: Timeouts::DEFAULT,
+        },
+        trust: Box::new(trusted_host_on(host.platform())),
+        runner: Box::new(FakeRunner::new(move |spawn| {
+            if spawn.program.file_name().is_some_and(|n| n == "gh") {
+                Ok(ran(0, "", ""))
+            } else {
+                Ok(ran(0, &probe, ""))
+            }
+        })),
+        leases: Box::new(NoLeases),
+        owner: kbf_host::step::Owner {
+            uid: ids.uid,
+            gid: ids.gid,
+        },
+        child: ChildProgram {
+            program: PathBuf::from(BIN),
+            run_as: None,
+        },
+        source,
+        limits: Limits {
+            max_component_bytes: 1 << 20,
+            fetch_timeout: LONG,
+        },
+    };
+    let locator = ReleaseLocator {
+        commit: CommitId::new(COMMIT).expect("commit"),
+        components: Vec::new(),
+    };
+    let got = fetcher.fetch(&locator).map_err(|e: Refused| e.to_string());
+    let got = got.expect("installed");
+    assert_eq!((got.commit.as_str(), got.platform.as_str()), (COMMIT, "linux-x86_64"));
+    let release = host.join(&host.release_dir(&locator.commit));
+    assert!(release.join("kbf").is_file() && release.join("VERIFIED").is_file());
+    assert_eq!(
+        server.hits(),
+        [
+            json_path(),
+            format!("/mirror/files/{}", sha(&bundle)),
+            format!("/mirror/files/{}", sha(&tar)),
+        ]
+    );
 }

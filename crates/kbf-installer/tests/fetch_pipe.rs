@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use kbf_installer::fetch::identity::Identity;
-use kbf_installer::fetch::pipe::{Caps, ChildSpec, LOG_BYTES, PipeFault, Received, receive};
+use kbf_installer::fetch::pipe::{
+    Caps, ChildSpec, LOG_BYTES, PipeFault, Received, receive, receive_up_to,
+};
 use kbf_installer::run::Confine;
 use sha2::{Digest, Sha256};
 
@@ -360,4 +362,77 @@ fn the_lent_descriptor_reaches_the_child_and_no_other_does() {
         .collect();
     // The stub closed the lent descriptor when it had read it; nothing else was there.
     assert_eq!(fds, ["0", "1", "2"], "{report}");
+}
+
+// ----------------------------------------------------------- output of no declared length
+
+/// Run the stub with `ops`, reading what it sends with `receive_up_to`: the result and what was
+/// collected.
+fn run_up_to(ops: &[&str], caps: Caps) -> (Result<Received, PipeFault>, Vec<u8>) {
+    let mut out = Vec::new();
+    let result = receive_up_to(&spec(ops), &[], None, caps, &mut out);
+    (result, out)
+}
+
+/// Output nobody declared the length of (a description) is whatever the child sends before it
+/// closes, whatever its length up to the cap: nothing is asked of its count but that it be
+/// at most the cap and at least a byte.
+///
+/// Catches a reader that still wants the cap's worth of bytes (a short description would be a
+/// short read).
+///
+/// Mutant: `Length::UpTo` read as `Exactly` (red: a "short body" for three bytes of ten).
+#[test]
+fn undeclared_output_is_taken_whole_up_to_the_cap() {
+    let (got, out) = run_up_to(&["emit:abc"], caps(10));
+    let got = got.expect("received");
+    assert_eq!((got.count, out.as_slice()), (3, b"abc".as_slice()));
+    assert_eq!(got.sha256, hex::encode(Sha256::digest(b"abc")));
+    // Exactly the cap is fine too.
+    let (got, out) = run_up_to(&["emit:abcde"], caps(5));
+    assert_eq!((got.expect("received").count, out.as_slice()), (5, b"abcde".as_slice()));
+}
+
+/// A child that closes without a byte has said nothing: that is not an empty answer, and the
+/// words it left on standard error come with the fault.
+///
+/// Catches silence taken for an answer (an empty description), and the child's reason lost.
+///
+/// Mutant: the `count == 0` check removed (red: `Ok` with no bytes).
+#[test]
+fn a_child_that_says_nothing_is_a_fault_with_its_words() {
+    let (got, out) = run_up_to(&["err:the source is down", "exit:1"], caps(10));
+    assert!(out.is_empty());
+    match got {
+        Err(PipeFault::Silent { log }) => assert_eq!(log, "the source is down"),
+        other => panic!("{other:?}"),
+    }
+    let (got, _) = run_up_to(&["kill"], caps(10));
+    assert!(matches!(got, Err(PipeFault::Silent { .. })), "{got:?}");
+}
+
+/// More than the cap is refused as for a component: the child is ended and not a byte past the
+/// cap is kept.
+///
+/// Catches the cap not being applied to undeclared output (a description could be a gigabyte).
+#[test]
+fn undeclared_output_over_the_cap_is_refused() {
+    let (got, out) = run_up_to(&["emit:abcdef"], caps(5));
+    assert!(matches!(got, Err(PipeFault::Oversize { size: 5 })), "{got:?}");
+    assert!(out.len() <= 5, "{} bytes kept", out.len());
+}
+
+/// With no count to judge by, a child that has sent a byte and will not close is stalled, not
+/// accepted: even when what it sent is exactly the cap, which would complete a declared fetch.
+///
+/// Catches a truncated description being taken as whole because the child went quiet.
+///
+/// Mutant: the early completion at `count == size` applied to undeclared output (red: `Ok`).
+#[test]
+fn undeclared_output_that_does_not_end_is_stalled() {
+    let mut caps = caps(3);
+    caps.no_byte = Duration::from_millis(500);
+    let (got, out) = run_up_to(&["emit:abc", "sleep:600"], caps);
+    assert!(matches!(got, Err(PipeFault::Stalled { got: 3, size: 3, .. })), "{got:?}");
+    assert_eq!(out, b"abc");
 }

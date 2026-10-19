@@ -51,6 +51,9 @@ kbf-host.workspace = true
 kbf-proto.workspace = true
 # `postgres`: the schema's migrations and the client that applies them (`database` module).
 kbf-state = { workspace = true, features = ["postgres"] }
+# `ReleasePlatform`: the platform names and the components a host of each needs, which is what
+# a described release is held to (the server's own table, so there is one).
+kbf-types.workspace = true
 kbf-update.workspace = true
 libc.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }

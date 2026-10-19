@@ -1817,6 +1817,7 @@ dependencies = [
  "kbf-proto",
  "kbf-state",
  "kbf-testkit",
+ "kbf-types",
  "kbf-update",
  "libc",
  "postgres",

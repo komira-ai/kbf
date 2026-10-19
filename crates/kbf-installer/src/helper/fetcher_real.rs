@@ -6,19 +6,28 @@
 //!
 //! For one release it
 //!
-//! 1. refuses an order that names no component (nothing is made);
+//! 1. learns what to pull. An order that carries its components (an activation, from the
+//!    offer the node holds) is taken as it stands. A `frontend_update` order carries a commit and
+//!    nothing else, so the release source is asked what the commit holds for this host's
+//!    platform ([`fetch::describe_release`], through the confined child: the root half does not
+//!    read the source's bytes); an activation that names no component is refused. Nothing is
+//!    made before this;
 //! 2. makes `work/<commit>.partial/` ([`Partial`]);
-//! 3. pulls each component into a new file in its `dl/`, with the digest and size the order
-//!    names ([`fetch::fetch_component`]);
+//! 3. pulls each component into a new file in its `dl/`, with the digest and size the order (or
+//!    the description) names ([`fetch::fetch_component`]), and for a described component first
+//!    its attestation bundle by the digest the description names, which becomes the component's
+//!    attestation text as an offer's would be;
 //! 4. hands the files to [`Pipeline::verify`], with the order's kind and, for an
 //!    activation, the facts it expects;
 //! 5. reports what the installed binary declared ([`crate::stage::Staged::installed`]).
 //!
+//! A description is a claim, as an offer is: it names which digests to fetch and the sizes that
+//! bound them, and nothing it says is believed. Every file is counted and hashed as it arrives
+//! and held to the digest that named it, and the pipeline then re-derives the rest (the
+//! attestation of each tarball against its bundle, the shape, the binary's own report).
+//!
 //! The scratch directory is removed on every way out but a success: a [`Partial`] removes
 //! itself when dropped, and the pipeline takes it (and drops it on a refusal).
-//!
-//! Only an activation is complete. A `frontend_update` order names no component and nothing
-//! yet looks a release up by its commit, so its fetch ends with a message that says so.
 //!
 //! The binary does not build a [`RealFetcher`] yet: `build_helper` still gives the helper
 //! [`NotWired`](super::fetcher::NotWired). A real one is unreachable until the helper has a
@@ -35,22 +44,20 @@ use std::path::Path;
 
 use kbf_host::exec::Exec;
 use kbf_host::step::Owner;
+use kbf_types::ReleasePlatform;
 use kbf_update::{Facts, Locator};
 
-use crate::fetch::pipe::PipeFault;
+use crate::binary::Arch;
+use crate::fetch::pipe::{PipeFault, Received as Pulled};
 use crate::fetch::{self, ChildProgram, Component, Limits, Source};
 use crate::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
 use crate::helper::leases::LeaseSource;
-use crate::layout::Layout;
+use crate::layout::{Layout, Platform};
 use crate::refusal::Refusal;
 use crate::run::Runner;
 use crate::settings::Settings;
 use crate::stage::{Fetched, Order, OrderKind, Partial, Pipeline, Policy, Received, Verifier};
 use crate::state;
-
-/// Why a `frontend_update` is not fetched yet.
-pub const NO_COMPONENT_LIST: &str = "a frontend_update names no component, and nothing yet \
-     looks up a release's components by its commit (the release-describe design is open)";
 
 /// What pulling and verifying a release needs from the host. The fields are the pipeline's
 /// own, plus where the bytes come from.
@@ -84,33 +91,106 @@ impl Fetcher for RealFetcher {
     }
 }
 
+/// A component to pull: its locator (the attestation text empty until its bundle is pulled,
+/// for a described one) and the bundle that is to become that text.
+struct Piece {
+    locator: Locator,
+    bundle: Option<Bundle>,
+}
+
+/// An attestation bundle a description names, to be fetched by its digest.
+struct Bundle {
+    sha256: String,
+    size: u64,
+}
+
+/// The release platform of a host of `os` on `arch`; `None` for a pair no release is built for
+/// (a Mac on x86-64).
+fn host_platform(os: Platform, arch: Arch) -> Option<ReleasePlatform> {
+    ReleasePlatform::from_report(os.name(), &arch.to_string())
+}
+
 impl RealFetcher {
+    /// What to pull for `rec`: the order's own components as they stand, or, for a
+    /// `frontend_update` that carries none, the components the release source describes for
+    /// this host. Nothing is made on the host first.
+    fn plan(&self, kind: OrderKind, rec: &ReleaseLocator) -> Result<Vec<Piece>, FetchError> {
+        if !rec.components.is_empty() {
+            return Ok(rec
+                .components
+                .iter()
+                .map(|locator| Piece {
+                    locator: locator.clone(),
+                    bundle: None,
+                })
+                .collect());
+        }
+        // The pipeline has no release to name without a component, and an activation's come
+        // with it.
+        if kind == OrderKind::Activate {
+            return Err(FetchError::Rejected(
+                "the order names no component to fetch".to_owned(),
+            ));
+        }
+        let (os, arch) = (self.host.platform(), self.settings.arch);
+        let platform = host_platform(os, arch).ok_or_else(|| {
+            FetchError::Rejected(format!(
+                "platform: no release is built for {} on {arch}",
+                os.name()
+            ))
+        })?;
+        let described =
+            fetch::describe_release(&self.child, &self.source, self.limits, &rec.commit, platform)
+                .map_err(fetch_error)?;
+        Ok(described
+            .into_iter()
+            .map(|d| Piece {
+                locator: Locator {
+                    name: d.name,
+                    sha256: d.sha256,
+                    size: d.size,
+                    attestation: String::new(),
+                },
+                bundle: Some(Bundle {
+                    sha256: d.bundle_sha256,
+                    size: d.bundle_size,
+                }),
+            })
+            .collect())
+    }
+
     fn pull(
         &self,
         kind: OrderKind,
         rec: &ReleaseLocator,
         expected: Option<&Facts>,
     ) -> Result<InstalledRelease, FetchError> {
-        // Before anything exists: the pipeline has no release to name without a component.
-        if rec.components.is_empty() {
-            return Err(match kind {
-                OrderKind::FrontendUpdate => FetchError::Unavailable(NO_COMPONENT_LIST.to_owned()),
-                OrderKind::Activate => {
-                    FetchError::Rejected("the order names no component to fetch".to_owned())
-                }
-            });
-        }
+        let plan = self.plan(kind, rec)?;
         let replaced = replaced_bytes(&self.host);
         let partial = Partial::create(&self.host, &rec.commit, self.owner).map_err(refused)?;
-        let mut files = Vec::with_capacity(rec.components.len());
-        for locator in &rec.components {
+        let mut components = Vec::with_capacity(plan.len());
+        let mut files = Vec::with_capacity(plan.len());
+        for piece in plan {
             // A failure drops `partial`, which removes the directory.
-            files.push(self.pull_one(&partial, locator, replaced)?);
+            let mut locator = piece.locator;
+            // The name becomes a file name in root's directory.
+            if !is_plain_name(&locator.name) {
+                return Err(FetchError::Rejected(format!(
+                    "{:?} is not a plain file name",
+                    locator.name
+                )));
+            }
+            // The bundle first: it is small, and the tarball is not worth a download without it.
+            if let Some(bundle) = &piece.bundle {
+                locator.attestation = self.pull_bundle(&partial, &locator.name, bundle, replaced)?;
+            }
+            files.push(self.pull_one(&partial, &locator, replaced)?);
+            components.push(locator);
         }
         let order = Order {
             kind,
             commit: &rec.commit,
-            components: &rec.components,
+            components: &components,
             expected,
         };
         let pipeline = Pipeline {
@@ -128,49 +208,86 @@ impl RealFetcher {
             .map_err(refused)
     }
 
-    /// One component through the child into `dl/<name>.tar.gz`.
+    /// One component through the child into `dl/<name>.tar.gz`. `locator.name` is a plain name.
     fn pull_one(
         &self,
         partial: &Partial,
         locator: &Locator,
         replaced: u64,
     ) -> Result<Received, FetchError> {
-        // The name becomes a file name in root's directory.
-        if !is_plain_name(&locator.name) {
-            return Err(FetchError::Rejected(format!(
-                "{:?} is not a plain file name",
-                locator.name
-            )));
-        }
-        let dl = partial.dl();
-        let tarball = dl.join(format!("{}.tar.gz", locator.name));
-        // The file is the parent's: made here, new, in a directory only its owner enters.
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tarball)
-            .map_err(|e| {
-                FetchError::Unavailable(format!("cannot create {}: {e}", tarball.display()))
-            })?;
-        let got = fetch::fetch_component(
-            &self.child,
-            &self.source,
-            self.limits,
-            &Component {
+        let tarball = partial.dl().join(format!("{}.tar.gz", locator.name));
+        let got = self.pull_into(
+            partial,
+            &tarball,
+            Component {
                 sha256: &locator.sha256,
                 size: locator.size,
             },
-            (&dl, replaced),
-            &mut out,
-        )
-        .map_err(fetch_error)?;
+            replaced,
+        )?;
         Ok(Received {
             name: locator.name.clone(),
             tarball,
             bytes: got.count,
             sha256: got.sha256,
         })
+    }
+
+    /// The attestation bundle of the described component `name`, through the child into
+    /// `dl/<name>.bundle`, as the text the pipeline takes in an offer's place. It is held to
+    /// the digest and size the description names, like any file; whether it attests the
+    /// tarball is for the pipeline's attestation step.
+    fn pull_bundle(
+        &self,
+        partial: &Partial,
+        name: &str,
+        bundle: &Bundle,
+        replaced: u64,
+    ) -> Result<String, FetchError> {
+        let file = partial.dl().join(format!("{name}.bundle"));
+        self.pull_into(
+            partial,
+            &file,
+            Component {
+                sha256: &bundle.sha256,
+                size: bundle.size,
+            },
+            replaced,
+        )?;
+        // Read back from the file the parent made, in a directory only root enters.
+        std::fs::read_to_string(&file).map_err(|e| {
+            FetchError::Rejected(format!(
+                "attestation: the bundle of {name} cannot be read as text: {e}"
+            ))
+        })
+    }
+
+    /// `component` through the child into the new file `path` in `partial`'s `dl/`.
+    fn pull_into(
+        &self,
+        partial: &Partial,
+        path: &Path,
+        component: Component<'_>,
+        replaced: u64,
+    ) -> Result<Pulled, FetchError> {
+        // The file is the parent's: made here, new, in a directory only its owner enters.
+        let mut out = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| {
+                FetchError::Unavailable(format!("cannot create {}: {e}", path.display()))
+            })?;
+        fetch::fetch_component(
+            &self.child,
+            &self.source,
+            self.limits,
+            &component,
+            (&partial.dl(), replaced),
+            &mut out,
+        )
+        .map_err(fetch_error)
     }
 }
 
@@ -214,7 +331,10 @@ fn with_word(word: &str, text: &dyn std::fmt::Display) -> String {
 }
 
 /// A fetch step's failure as the trait reports it: a verdict on what was named or what
-/// arrived is `Rejected`; a source or host that could not deliver is `Unavailable`.
+/// arrived is `Rejected`; a source or host that could not deliver is `Unavailable`. A source
+/// that will not describe a release, or whose description cannot be used, is the second: the
+/// release could not be had, and its refusal word is `fetch` (`Unavailable` is what the
+/// frontend's cycle words `fetch`; a `Rejected` it words `stage`).
 fn fetch_error(e: fetch::FetchError) -> FetchError {
     use fetch::FetchError as Step;
     let said = with_word(e.word(), &e);
@@ -223,9 +343,11 @@ fn fetch_error(e: fetch::FetchError) -> FetchError {
         | Step::Size { .. }
         | Step::Digest { .. }
         | Step::Pipe(PipeFault::Oversize { .. }) => FetchError::Rejected(said),
-        Step::Disk { .. } | Step::Source(..) | Step::Identity(_) | Step::Pipe(_) => {
-            FetchError::Unavailable(said)
-        }
+        Step::Disk { .. }
+        | Step::Source(..)
+        | Step::Identity(_)
+        | Step::Describe(_)
+        | Step::Pipe(_) => FetchError::Unavailable(said),
     }
 }
 

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::*;
+use crate::fetch::describe::DescribeFault;
 use crate::fetch::identity::IdentityFault;
 use crate::state::{Locked, State};
 use crate::testkit::{A, B, c, host_root};
@@ -44,6 +45,22 @@ fn fetch_failures_are_told_apart_and_carry_the_contract_word() {
     classed(Step::Pipe(PipeFault::Oversize { size: 5 }), |s| {
         FetchError::Rejected(s)
     });
+    // A source that will not describe a release, or a description that cannot be used, is a
+    // release that could not be had under the word `fetch`, which `Unavailable` already begins
+    // with (the frontend's cycle words an `Unavailable` `fetch` and a `Rejected` `stage`).
+    classed(
+        Step::Describe(DescribeFault::Refused("NotFound: x".to_owned())),
+        FetchError::Unavailable,
+    );
+    classed(
+        Step::Describe(DescribeFault::Unusable("no kbf".to_owned())),
+        FetchError::Unavailable,
+    );
+    // A child that said nothing, whatever the reason, is an outage.
+    classed(
+        Step::Pipe(PipeFault::Silent { log: String::new() }),
+        FetchError::Unavailable,
+    );
     let disk = Step::Disk {
         need: 10,
         free: 1,
@@ -113,6 +130,20 @@ fn only_one_plain_file_name_is_a_component_name() {
     for bad in ["", ".", "..", "a/b", "/a", "../a", "a/", "a/.."] {
         assert!(!is_plain_name(bad), "{bad:?}");
     }
+}
+
+/// The release platform of a host is its operating system and CPU as the server names them,
+/// and a Mac on x86-64 has none (no release is built for it).
+///
+/// Catches the CPU spelt as the OS spells it (`aarch64` for `arm64`), and a host given a
+/// platform no release exists for.
+#[test]
+fn a_hosts_release_platform_is_its_os_and_cpu() {
+    use ReleasePlatform::{DarwinArm64, LinuxArm64, LinuxX86_64};
+    assert_eq!(host_platform(Platform::Linux, Arch::X86_64), Some(LinuxX86_64));
+    assert_eq!(host_platform(Platform::Linux, Arch::Aarch64), Some(LinuxArm64));
+    assert_eq!(host_platform(Platform::MacOs, Arch::Aarch64), Some(DarwinArm64));
+    assert_eq!(host_platform(Platform::MacOs, Arch::X86_64), None);
 }
 
 /// The disk check counts the release that is current: the sizes of its files, and nothing

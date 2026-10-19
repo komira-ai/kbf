@@ -39,8 +39,8 @@ pub struct InstalledRelease {
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FetchError {
     /// The release could not be had, and nothing says it is bad: the source could not be
-    /// reached or ended early, the host had no room or could not do the work, or there is
-    /// no list of what to fetch.
+    /// reached or ended early, said it will not describe the release or described it
+    /// unusably, or the host had no room or could not do the work.
     #[error("fetch: {0}")]
     Unavailable(String),
     /// What arrived failed a check (size, digest, attestation, shape, the binary's report).

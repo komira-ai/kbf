@@ -17,17 +17,28 @@
 //!
 //! It writes at most `--limit` bytes. The parent passes the declared size plus one, so a source
 //! that sends more than it declared is seen to (and the parent kills the child).
+//!
+//! With `--describe <commit>` in place of `--sha256` it asks the same source what the commit
+//! holds (`GET <url>/releases/<commit>.json`, or `ReleaseService.Describe`) and writes the
+//! answer in the small form of [`super::describe`]. The decoding of the source's JSON or
+//! protobuf is done here, in the confined child, so that the parent reads the form and not the
+//! source's bytes. A source that answers that it has no such release, or not a complete one,
+//! is not a failure of the child: it is the answer, written as a refusal. Any other failure is
+//! one line on standard error, as for a fetch.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Args, ValueEnum};
+use kbf_types::ReleasePlatform;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject as _;
 
+use super::describe::{self, Answer};
 use super::identity::{self, Identity, IdentityFault};
 use super::{CONNECT_TIMEOUT, MAX_COMPONENT_CEILING, is_digest};
+use crate::CommitId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Kind {
@@ -43,10 +54,19 @@ pub struct ChildArgs {
     /// `url`: the https base URL of the file server. `frontend`: `https://host[:port]`.
     #[arg(long)]
     pub url: String,
-    /// The lowercase hex sha256 that names the blob.
+    /// The lowercase hex sha256 that names the blob. Not with `--describe`.
+    #[arg(long, required_unless_present = "describe", conflicts_with = "describe")]
+    pub sha256: Option<String>,
+    /// Say what the release of this commit (40 lowercase hex digits) holds, instead of
+    /// fetching a blob.
     #[arg(long)]
-    pub sha256: String,
-    /// The most bytes written to standard output.
+    pub describe: Option<String>,
+    /// `frontend` with `--describe`: the one platform to ask about (a `url` source's file
+    /// lists every platform).
+    #[arg(long, requires = "describe")]
+    pub platform: Option<String>,
+    /// The most bytes written to standard output (a description: at most
+    /// [`describe::MAX_BYTES`] plus one).
     #[arg(long)]
     pub limit: u64,
     /// `url` only: a PEM file of the roots to trust instead of the system's.
@@ -64,8 +84,12 @@ pub enum ChildFault {
     Url(String),
     #[error("{0:?} is not a sha256 (64 lowercase hex digits)")]
     Digest(String),
-    #[error("the limit {0} is not 1 to {max}", max = MAX_COMPONENT_CEILING + 1)]
-    Limit(u64),
+    #[error("{0:?} is not a commit (40 lowercase hex digits)")]
+    Commit(String),
+    #[error("{0:?} is not a platform kbf is released for")]
+    Platform(String),
+    #[error("the limit {limit} is not 1 to {max}")]
+    Limit { limit: u64, max: u64 },
     #[error("flags do not fit the kind: {0}")]
     Flags(&'static str),
     #[error("{0}")]
@@ -136,7 +160,9 @@ fn copy_limited(body: impl io::Read, limit: u64, out: &mut dyn Write) -> Result<
     })
 }
 
-fn fetch_url(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
+/// The https client of a `url` source and the base URL it is to ask: no redirect followed, no
+/// proxy, only the roots it was given.
+fn url_agent(args: &ChildArgs) -> Result<(ureq::Agent, String), ChildFault> {
     let base = plain_url(&args.url, true)?;
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::Rustls)
@@ -156,10 +182,25 @@ fn fetch_url(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
         .tls_config(tls)
         .build()
         .into();
-    let mut response = agent
-        .get(format!("{base}/files/{}", args.sha256))
+    Ok((agent, base))
+}
+
+/// `GET <base>/<path>` of a `url` source; the response, whatever its status.
+fn url_get(
+    args: &ChildArgs,
+    path: &str,
+) -> Result<(ureq::http::Response<ureq::Body>, String), ChildFault> {
+    let (agent, base) = url_agent(args)?;
+    let url = format!("{base}/{path}");
+    let response = agent
+        .get(&url)
         .call()
         .map_err(|e| ChildFault::Unreachable(e.to_string()))?;
+    Ok((response, url))
+}
+
+fn fetch_url(args: &ChildArgs, sha256: &str, out: &mut dyn Write) -> Result<u64, ChildFault> {
+    let (mut response, _) = url_get(args, &format!("files/{sha256}"))?;
     let status = response.status().as_u16();
     if status != 200 {
         return Err(ChildFault::Status(status.to_string()));
@@ -167,19 +208,59 @@ fn fetch_url(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
     copy_limited(response.body_mut().as_reader(), args.limit, out)
 }
 
-fn fetch_frontend(
-    args: &ChildArgs,
-    identity: &Identity,
-    out: &mut dyn Write,
-) -> Result<u64, ChildFault> {
-    use kbf_proto::update::FetchRequest;
-    use kbf_proto::update::release_service_client::ReleaseServiceClient;
+/// Write `answer` in the form of [`describe`], at most `limit` bytes of it (a longer one is cut
+/// at the limit, which the parent, who allows one byte fewer, sees and refuses).
+fn write_answer(answer: &Answer, limit: u64, out: &mut dyn Write) -> Result<u64, ChildFault> {
+    let text = answer.render();
+    let kept = &text.as_bytes()[..text.len().min(usize::try_from(limit).unwrap_or(usize::MAX))];
+    out.write_all(kept).map_err(ChildFault::Out)?;
+    Ok(kept.len() as u64)
+}
+
+/// What the `url` source's file `releases/<commit>.json` says. A `404` or a `409` is the
+/// answer that there is no description to be had (the route of `docs/api.md` answers those for
+/// a commit it holds nothing of, or nothing complete of); any other status is a failure.
+fn describe_url(args: &ChildArgs, commit: &str, out: &mut dyn Write) -> Result<u64, ChildFault> {
+    let (mut response, url) = url_get(args, &format!("releases/{commit}.json"))?;
+    let status = response.status().as_u16();
+    let answer = match status {
+        200 => {
+            let mut file = Vec::new();
+            response
+                .body_mut()
+                .as_reader()
+                .take(args.limit)
+                .read_to_end(&mut file)
+                .map_err(|e| ChildFault::Unreachable(e.to_string()))?;
+            Answer::from_json(&file)
+        }
+        404 | 409 => Answer::Refused(format!("{url} answered {status}")),
+        _ => return Err(ChildFault::Status(status.to_string())),
+    };
+    write_answer(&answer, args.limit, out)
+}
+
+/// The channel to a frontend's worker listener and the runtime that drives it.
+struct Session {
+    runtime: tokio::runtime::Runtime,
+    endpoint: tonic::transport::Endpoint,
+}
+
+fn unreachable(e: &dyn std::fmt::Display) -> ChildFault {
+    ChildFault::Unreachable(e.to_string())
+}
+
+/// `status` as the one line the child says: the code and the server's words.
+fn status_line(s: &tonic::Status) -> String {
+    format!("{:?}: {}", s.code(), s.message())
+}
+
+fn frontend_session(args: &ChildArgs, identity: &Identity) -> Result<Session, ChildFault> {
     use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity as TlsIdentity};
 
     let url = plain_url(&args.url, false)?;
     let host = url[8..].rsplit_once(':').map_or(&url[8..], |(h, _)| h);
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    let unreachable = |e: &dyn std::fmt::Display| ChildFault::Unreachable(e.to_string());
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(&identity.ca))
         .identity(TlsIdentity::from_pem(&identity.cert, &identity.key))
@@ -192,27 +273,65 @@ fn fetch_frontend(
         .enable_all()
         .build()
         .map_err(ChildFault::Out)?;
+    Ok(Session { runtime, endpoint })
+}
+
+/// What `ReleaseService.Describe` says. `NOT_FOUND` and `FAILED_PRECONDITION` are the answer
+/// that there is no description to be had (the message names what is lacking); any other
+/// status is a failure.
+fn describe_frontend(
+    args: &ChildArgs,
+    identity: &Identity,
+    commit: &str,
+    out: &mut dyn Write,
+) -> Result<u64, ChildFault> {
+    use kbf_proto::update::DescribeRequest;
+    use kbf_proto::update::release_service_client::ReleaseServiceClient;
+    use tonic::Code;
+
+    let Session { runtime, endpoint } = frontend_session(args, identity)?;
+    let answer = runtime.block_on(async {
+        let channel = endpoint.connect().await.map_err(|e| unreachable(&e))?;
+        let asked = DescribeRequest {
+            commit: commit.to_owned(),
+            platform: args.platform.clone().unwrap_or_default(),
+        };
+        match ReleaseServiceClient::new(channel).describe(asked).await {
+            Ok(said) => Ok(Answer::from_proto(said.into_inner())),
+            Err(s) if matches!(s.code(), Code::NotFound | Code::FailedPrecondition) => {
+                Ok(Answer::Refused(status_line(&s)))
+            }
+            Err(s) => Err(ChildFault::Status(status_line(&s))),
+        }
+    })?;
+    write_answer(&answer, args.limit, out)
+}
+
+fn fetch_frontend(
+    args: &ChildArgs,
+    identity: &Identity,
+    sha256: &str,
+    out: &mut dyn Write,
+) -> Result<u64, ChildFault> {
+    use kbf_proto::update::FetchRequest;
+    use kbf_proto::update::release_service_client::ReleaseServiceClient;
+
+    let Session { runtime, endpoint } = frontend_session(args, identity)?;
     runtime.block_on(async {
         let channel = endpoint.connect().await.map_err(|e| unreachable(&e))?;
         let mut stream = ReleaseServiceClient::new(channel)
             .fetch(FetchRequest {
-                sha256: args.sha256.clone(),
+                sha256: sha256.to_owned(),
             })
             .await
-            .map_err(|s| ChildFault::Status(format!("{:?}: {}", s.code(), s.message())))?
+            .map_err(|s| ChildFault::Status(status_line(&s)))?
             .into_inner();
         let mut written = 0_u64;
         while written < args.limit {
             let chunk = match stream.message().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
-                Err(s) => {
-                    return Err(ChildFault::Status(format!(
-                        "{:?}: {}",
-                        s.code(),
-                        s.message()
-                    )));
-                }
+                Err(s) => return Err(ChildFault::Status(status_line(&s))),
             };
             let room = usize::try_from(args.limit - written).unwrap_or(usize::MAX);
             let data = &chunk.data[..chunk.data.len().min(room)];
@@ -223,18 +342,63 @@ fn fetch_frontend(
     })
 }
 
-/// Fetch what `args` name and write at most `args.limit` bytes of it to `out`; the count.
+/// What the child was asked for, once the flags that say so are checked.
+enum Ask<'a> {
+    /// The blob with this sha256.
+    Blob(&'a str),
+    /// What the release of this commit holds.
+    Release(&'a str),
+}
+
+/// Fetch what `args` name, or say what the release they name holds, and write at most
+/// `args.limit` bytes of it to `out`; the count.
 pub fn fetch(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
-    if !is_digest(&args.sha256) {
-        return Err(ChildFault::Digest(args.sha256.clone()));
+    let (ask, most) = match (&args.sha256, &args.describe) {
+        (Some(sha256), None) => {
+            if !is_digest(sha256) {
+                return Err(ChildFault::Digest(sha256.clone()));
+            }
+            // The parser lets this through (it drops a requirement that a conflict rules out).
+            if args.platform.is_some() {
+                return Err(ChildFault::Flags("a platform belongs to a description"));
+            }
+            (Ask::Blob(sha256), MAX_COMPONENT_CEILING + 1)
+        }
+        (None, Some(commit)) => {
+            if CommitId::new(commit).is_err() {
+                return Err(ChildFault::Commit(commit.clone()));
+            }
+            (Ask::Release(commit), describe::MAX_BYTES + 1)
+        }
+        _ => {
+            return Err(ChildFault::Flags(
+                "it is asked for a blob or for a release, not both",
+            ));
+        }
+    };
+    if args.limit == 0 || args.limit > most {
+        return Err(ChildFault::Limit {
+            limit: args.limit,
+            max: most,
+        });
     }
-    if args.limit == 0 || args.limit > MAX_COMPONENT_CEILING + 1 {
-        return Err(ChildFault::Limit(args.limit));
+    if let Some(platform) = &args.platform {
+        if args.kind == Kind::Url {
+            return Err(ChildFault::Flags(
+                "a url source's file lists every platform",
+            ));
+        }
+        if ReleasePlatform::parse(platform).is_none() {
+            return Err(ChildFault::Platform(platform.clone()));
+        }
     }
     match (args.kind, args.identity_fd) {
         (Kind::Url, None) => {
             identity::ensure_descriptors(&[0, 1, 2])?;
-            fetch_url(args, out)
+            match ask {
+                Ask::Blob(sha256) => fetch_url(args, sha256, out),
+                Ask::Release(commit) => describe_url(args, commit, out),
+            }
         }
         (Kind::Url, Some(_)) => Err(ChildFault::Flags("a url fetch is lent no identity")),
         (Kind::Frontend, None) => Err(ChildFault::Flags("a frontend fetch needs --identity-fd")),
@@ -246,7 +410,14 @@ pub fn fetch(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
             }
             let lent = identity::adopt(fd)?;
             let identity = Identity::decode(lent)?;
-            fetch_frontend(args, &identity, out)
+            match ask {
+                Ask::Blob(sha256) => fetch_frontend(args, &identity, sha256, out),
+                Ask::Release(commit) => describe_frontend(args, &identity, commit, out),
+            }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "child_tests.rs"]
+mod tests;

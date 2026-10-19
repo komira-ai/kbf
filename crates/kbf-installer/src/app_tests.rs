@@ -110,6 +110,31 @@ fn the_fetch_child_is_no_root_verb_and_reports_in_one_line() {
     }
 }
 
+/// The fetch child is asked for a blob (`--sha256`) or for what a release holds (`--describe`),
+/// one of the two; `--platform` belongs to a description.
+///
+/// Catches a child started with both (it would not know which to do), with neither, or with a
+/// platform and nothing to apply it to: all refused by the parser, before the child's own
+/// check of its flags. (A platform with a blob passes the parser, which drops a requirement a
+/// conflict rules out; the child refuses it itself.)
+#[test]
+fn the_fetch_child_takes_a_blob_or_a_release() {
+    let digest = "a".repeat(64);
+    let base = ["fetch-child", "--kind", "url", "--url", "https://h.example", "--limit", "10"];
+    let with = |extra: &[&str]| {
+        let mut full = vec!["kbf-installer"];
+        full.extend(base);
+        full.extend_from_slice(extra);
+        Cli::try_parse_from(full)
+    };
+    assert!(with(&["--sha256", &digest]).is_ok());
+    assert!(with(&["--describe", A]).is_ok());
+    assert!(with(&["--describe", A, "--platform", "linux-x86_64"]).is_ok());
+    assert!(with(&[]).is_err(), "neither");
+    assert!(with(&["--sha256", &digest, "--describe", A]).is_err(), "both");
+    assert!(with(&["--platform", "linux-x86_64"]).is_err(), "a platform alone");
+}
+
 /// Catches `--json` printing prose, or putting the object on the error stream where a
 /// script reading standard output would miss it.
 #[test]

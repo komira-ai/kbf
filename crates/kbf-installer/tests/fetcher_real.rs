@@ -6,11 +6,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kbf_host::step::Owner;
 use kbf_installer::CommitId;
 use kbf_installer::binary::Arch;
+use kbf_installer::fetch::describe::{Answer, Described, Description};
 use kbf_installer::fetch::{ChildProgram, Limits, Source};
 use kbf_installer::fixtures::{
     COMMIT, FakeRunner, elf, file, me, ran, tar_gz, trusted_host_on, version_json,
@@ -18,12 +20,12 @@ use kbf_installer::fixtures::{
 use kbf_installer::helper::fetcher::{
     FetchError, Fetcher, InstalledRelease, NotWired, ReleaseLocator,
 };
-use kbf_installer::helper::fetcher_real::{NO_COMPONENT_LIST, RealFetcher};
+use kbf_installer::helper::fetcher_real::RealFetcher;
 use kbf_installer::helper::leases::LeaseSource;
-use kbf_installer::layout::Layout;
+use kbf_installer::layout::{Layout, Platform};
 use kbf_installer::settings::Settings;
 use kbf_installer::stage::{Policy, Supported, Timeouts};
-use kbf_installer::testkit::host_root;
+use kbf_installer::testkit::{B, host_root_on};
 use kbf_update::{Facts, Locator};
 use sha2::{Digest, Sha256};
 
@@ -82,6 +84,32 @@ fn rec(components: Vec<Locator>) -> ReleaseLocator {
     }
 }
 
+/// The attestation bundle of an honest release (the fake `gh` accepts any).
+const BUNDLE: &[u8] = b"{\"mediaType\":\"application/vnd.dev.sigstore.bundle+json\"}\n";
+
+/// The entry a source lists for `name` on `platform`, as the honest source lists it: the
+/// tarball `tar` and the bundle `bundle`.
+fn entry_for(name: &str, platform: &str, tar: &[u8], bundle: &[u8]) -> Described {
+    Described {
+        name: name.to_owned(),
+        platform: platform.to_owned(),
+        tarball: format!("{name}-{COMMIT}-{platform}.tar.gz"),
+        sha256: sha(tar),
+        size: tar.len() as u64,
+        bundle_sha256: sha(bundle),
+        bundle_size: bundle.len() as u64,
+    }
+}
+
+/// What the stand-in child writes for a description of `commit`: the form the real child writes.
+fn described_as(commit: &str, components: Vec<Described>) -> String {
+    Answer::Described(Description {
+        commit: commit.to_owned(),
+        components,
+    })
+    .render()
+}
+
 /// A host on which no lease is live.
 struct NoLeases;
 
@@ -97,6 +125,9 @@ struct Answers {
     gh: (i32, &'static str),
     /// `<binary> --version --json`: its stdout.
     probe: String,
+    /// The content of the file `gh` is given as the bundle, at each call (the fake runner
+    /// reads it while the file is there).
+    bundles: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl Answers {
@@ -104,12 +135,16 @@ impl Answers {
         Answers {
             gh: (0, ""),
             probe: version_json(COMMIT, "release"),
+            bundles: Arc::default(),
         }
     }
 
     fn runner(self) -> FakeRunner {
         FakeRunner::new(move |spawn| {
             if spawn.program.file_name().is_some_and(|n| n == "gh") {
+                let at = spawn.args.iter().position(|a| a == "--bundle").expect("--bundle");
+                let bundle = fs::read(&spawn.args[at + 1]).expect("the bundle gh is given");
+                self.bundles.lock().expect("lock").push(bundle);
                 Ok(ran(self.gh.0, "", self.gh.1))
             } else {
                 Ok(ran(0, &self.probe, ""))
@@ -126,9 +161,34 @@ struct Rig {
 
 impl Rig {
     fn new(name: &str) -> Rig {
-        let (host, dir) = host_root(&format!("fetcher-real-{name}"));
+        Rig::on(name, Platform::Linux)
+    }
+
+    fn on(name: &str, platform: Platform) -> Rig {
+        let (host, dir) = host_root_on(&format!("fetcher-real-{name}"), platform);
         fs::create_dir_all(dir.join("served")).expect("served");
         Rig { host, dir }
+    }
+
+    /// Put `bytes` on the shelf the stand-in child serves described releases from: under the
+    /// digest it is asked for, or `describe` for the description.
+    fn shelve(&self, key: &str, bytes: &[u8]) {
+        let shelf = self.dir.join("shelf");
+        fs::create_dir_all(&shelf).expect("shelf");
+        fs::write(shelf.join(key), bytes).expect("shelved");
+    }
+
+    /// The child's operations for a shelf: serve what it is asked for from it.
+    fn from_the_shelf(&self) -> PathBuf {
+        self.ops(&[format!("serve:{}", self.dir.join("shelf").display())])
+    }
+
+    /// Shelve the honest release `tar` and `bundle`, and the description that lists `entries`.
+    fn stock(&self, entries: Vec<Described>, tar: &[u8], bundle: &[u8]) -> PathBuf {
+        self.shelve("describe", described_as(COMMIT, entries).as_bytes());
+        self.shelve(&sha(tar), tar);
+        self.shelve(&sha(bundle), bundle);
+        self.from_the_shelf()
     }
 
     /// A file the child can serve.
@@ -372,28 +432,258 @@ fn a_binary_that_declares_other_facts_is_refused() {
     assert!(!rig.release().exists(), "nothing installed");
 }
 
-/// A `frontend_update` order names no component and nothing yet says where to get them: the
-/// fetch says so, makes nothing (no scratch directory, no child) and does not panic.
+/// A `frontend_update` names a commit and nothing else: the source is asked what the commit holds
+/// (through the child), each described file is fetched by its digest (the bundle of a component,
+/// then its tarball), the bundle's text is what the attestation check is given, and the
+/// pipeline installs what it accepts. This is the whole of ruling B1 on the `url`-shaped
+/// stand-in; the child's own reading of the real JSON and protobuf is in `tests/fetch_e2e.rs`.
 ///
-/// Catches a frontend update with no components going on into the pipeline, which has no
-/// release to name.
+/// Catches the description not reaching the fetch (no component, or the wrong digests), a bundle
+/// that is fetched and then not handed to `gh` (an empty attestation would be checked), and
+/// scratch left behind.
 ///
-/// Mutant: the empty-components check removed (red: the pipeline panics on the empty set).
+/// Mutants: the bundle text dropped (`attestation` left empty; red: `gh` was given nothing);
+/// the describe step in the root process instead of the child (`child::fetch` called in place:
+/// red, as the stand-in is never asked); `plan` returning no pieces (red).
 #[test]
-fn a_frontend_update_without_components_says_so_and_makes_nothing() {
-    let rig = Rig::new("update");
+fn a_frontend_update_is_described_fetched_verified_and_installed() {
+    let rig = Rig::new("update-good");
+    let tar = tarball();
+    let ops = rig.stock(vec![entry_for("kbf", "linux-x86_64", &tar, BUNDLE)], &tar, BUNDLE);
+    let answers = Answers::honest();
+    let seen = Arc::clone(&answers.bundles);
+    let fetcher = rig.fetcher(Some(&ops), answers);
+    let got = fetcher.fetch(&rec(Vec::new())).expect("installed");
+    assert_eq!(got, installed());
+    assert!(rig.release().join("kbf").is_file(), "the binary");
+    assert!(rig.release().join("VERIFIED").is_file(), "the marker");
+    assert_eq!(*seen.lock().expect("lock"), [BUNDLE.to_vec()], "the bundle gh checked");
+    assert_eq!(rig.work_left(), Vec::<String>::new(), "no scratch");
+}
+
+/// The source lists every platform (the `url` file does) and the host takes its own: another
+/// platform's files are not fetched, though they are listed first and nothing serves them.
+///
+/// Catches the platform filter missing (the arm64 tarball would be asked for, and the stand-in
+/// has none), or the first listed component taken whatever its platform.
+///
+/// Mutant: the platform filter removed in `Description::select` (red: kbf twice, or a refusal
+/// of the arm64 entry).
+#[test]
+fn only_the_hosts_platform_is_fetched() {
+    let rig = Rig::new("update-platform");
+    let tar = tarball();
+    let other = elf(0xb7, "arm payload");
+    let other_bundle = b"{\"other\":true}\n";
+    let ops = rig.stock(
+        vec![
+            entry_for("kbf", "linux-arm64", &other, other_bundle),
+            entry_for("kbf", "linux-x86_64", &tar, BUNDLE),
+        ],
+        &tar,
+        BUNDLE,
+    );
+    let answers = Answers::honest();
+    let seen = Arc::clone(&answers.bundles);
+    let fetcher = rig.fetcher(Some(&ops), answers);
+    assert_eq!(fetcher.fetch(&rec(Vec::new())), Ok(installed()));
+    assert_eq!(*seen.lock().expect("lock"), [BUNDLE.to_vec()]);
+}
+
+/// A source that says it will not describe the commit (unknown, or not complete) is a release
+/// that could not be had, in the source's words and under the word `fetch` (an `Unavailable`:
+/// the frontend's cycle words that `fetch` and a `Rejected` `stage`); nothing is made on the
+/// host, and no file is asked for.
+///
+/// Catches the refusal taken for a verdict on what arrived (the frontend would report `stage`),
+/// the source's words lost, and scratch made before the answer is known.
+///
+/// Mutant: `FetchError::Describe` classed with the verdicts (`Rejected`; red).
+#[test]
+fn a_commit_the_source_will_not_describe_is_refused_with_its_words() {
+    for said in [
+        "NotFound: no tarball of the commit is stored",
+        "FailedPrecondition: linux-x86_64 has no attestation of kbf",
+    ] {
+        let rig = Rig::new("update-refused");
+        rig.shelve("describe", format!("refused {said}\n").as_bytes());
+        let ops = rig.from_the_shelf();
+        let fetcher = rig.fetcher(Some(&ops), Answers::honest());
+        assert_eq!(
+            fetcher.fetch(&rec(Vec::new())),
+            Err(FetchError::Unavailable(format!(
+                "the release source will not describe it: {said}"
+            )))
+        );
+        assert!(!rig.work().exists(), "nothing was made");
+    }
+}
+
+/// A description that is not complete for the host (only another platform's component), of
+/// another commit, or with a component the host cannot use, is refused with what is wrong
+/// (`fetch`, as a source's refusal is) and nothing is made.
+///
+/// Catches an incomplete or foreign description reaching the pipeline (a release with no binary
+/// for this host, or another release installed under this commit's name).
+///
+/// Mutants: the completeness check removed (red: no refusal, then an empty set reaches the
+/// pipeline); the commit check removed (red).
+#[test]
+fn a_description_that_is_not_the_hosts_release_is_refused() {
+    let tar = tarball();
+    let wrong_commit = {
+        let rig = Rig::new("update-wrong-commit");
+        rig.shelve(
+            "describe",
+            described_as(B, vec![entry_for("kbf", "linux-x86_64", &tar, BUNDLE)]).as_bytes(),
+        );
+        (rig.from_the_shelf(), rig)
+    };
+    let only_arm = {
+        let rig = Rig::new("update-only-arm");
+        rig.shelve(
+            "describe",
+            described_as(COMMIT, vec![entry_for("kbf", "linux-arm64", &tar, BUNDLE)]).as_bytes(),
+        );
+        (rig.from_the_shelf(), rig)
+    };
+    let cases = [
+        (wrong_commit, format!("it describes commit {B}, and the order names {COMMIT}")),
+        (only_arm, "it has no kbf for linux-x86_64".to_owned()),
+    ];
+    for ((ops, rig), why) in cases {
+        let fetcher = rig.fetcher(Some(&ops), Answers::honest());
+        assert_eq!(
+            fetcher.fetch(&rec(Vec::new())),
+            Err(FetchError::Unavailable(format!(
+                "the description is not usable: {why}"
+            )))
+        );
+        assert!(!rig.work().exists(), "nothing was made");
+    }
+}
+
+/// The source's word about a digest is a claim: bytes that do not hash to the digest the
+/// description gave are refused as `hash`, for the tarball and for the bundle alike, and what
+/// was made goes. (The attestation check passes any bundle here, so only the digest of the
+/// bundle stands between a substituted one and the pipeline.)
+///
+/// Catches a described digest trusted without hashing what arrived (the tarball, which the
+/// pipeline would catch later with another word, and the bundle, which nothing else checks).
+///
+/// Mutants: the digest comparison removed from `fetch_component` (red: the tarball case reports
+/// the pipeline's refusal, the bundle case installs); the bundle pulled with the digest of what
+/// arrived (red: installed).
+#[test]
+fn bytes_that_do_not_match_the_described_digest_are_refused() {
+    let tar = tarball();
+    let flipped = |bytes: &[u8]| {
+        let mut wrong = bytes.to_vec();
+        *wrong.last_mut().expect("bytes") ^= 0xff;
+        wrong
+    };
+    for bundle_is_wrong in [false, true] {
+        let rig = Rig::new(&format!("update-digest-{bundle_is_wrong}"));
+        let entry = entry_for("kbf", "linux-x86_64", &tar, BUNDLE);
+        rig.shelve("describe", described_as(COMMIT, vec![entry]).as_bytes());
+        let served_tar = if bundle_is_wrong { tar.clone() } else { flipped(&tar) };
+        let served_bundle = if bundle_is_wrong { flipped(BUNDLE) } else { BUNDLE.to_vec() };
+        rig.shelve(&sha(&tar), &served_tar);
+        rig.shelve(&sha(BUNDLE), &served_bundle);
+        let ops = rig.from_the_shelf();
+        let fetcher = rig.fetcher(Some(&ops), Answers::honest());
+        match fetcher.fetch(&rec(Vec::new())) {
+            Err(FetchError::Rejected(why)) => {
+                assert!(why.starts_with("hash: the download has sha256 "), "{why}");
+                let want = if bundle_is_wrong { sha(BUNDLE) } else { sha(&tar) };
+                assert!(why.ends_with(&format!("the order names {want}")), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(rig.work_left(), Vec::<String>::new(), "no scratch");
+        assert!(!rig.release().exists(), "nothing installed");
+    }
+}
+
+/// A bundle that is not text cannot be the attestation text the pipeline takes; it is refused as
+/// `attestation`, not installed and not passed on mangled.
+///
+/// Catches a lossy conversion of the bundle (the replacement characters would be checked in its
+/// place).
+///
+/// Mutant: `read_to_string` replaced by a lossy read (red: installed).
+#[test]
+fn a_bundle_that_is_not_text_is_refused() {
+    let rig = Rig::new("update-binary-bundle");
+    let tar = tarball();
+    let bundle = [0xff, 0xfe, 0x00, b'{', b'}', b'\n'];
+    let ops = rig.stock(vec![entry_for("kbf", "linux-x86_64", &tar, &bundle)], &tar, &bundle);
+    let fetcher = rig.fetcher(Some(&ops), Answers::honest());
+    match fetcher.fetch(&rec(Vec::new())) {
+        Err(FetchError::Rejected(why)) => {
+            assert!(
+                why.starts_with("attestation: the bundle of kbf cannot be read as text: "),
+                "{why}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(rig.work_left(), Vec::<String>::new(), "no scratch");
+}
+
+/// A source that cannot be asked (the child will not start, or ends without a word) is an outage
+/// that makes nothing: the describe goes through the child, not around it.
+///
+/// Catches the describe step done in the root process (a program path that does not exist would
+/// not matter to it), and a silent child taken for an empty answer.
+///
+/// Mutant: the describe done in-process (red: no "cannot start" message).
+#[test]
+fn a_source_that_cannot_be_asked_is_an_outage_and_makes_nothing() {
+    let rig = Rig::new("update-outage");
+    let fetcher = rig.fetcher(None, Answers::honest());
+    match fetcher.fetch(&rec(Vec::new())) {
+        Err(FetchError::Unavailable(why)) => {
+            assert!(why.starts_with("cannot start the fetch child"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!rig.work().exists(), "nothing was made");
+    // The child runs and has nothing to serve: it says why on standard error and ends.
+    let ops = rig.from_the_shelf();
+    let fetcher = rig.fetcher(Some(&ops), Answers::honest());
+    assert_eq!(
+        fetcher.fetch(&rec(Vec::new())),
+        Err(FetchError::Unavailable(
+            "the child ended without sending a byte (fetch-child: nothing is served as describe)"
+                .to_owned()
+        ))
+    );
+    assert!(!rig.work().exists(), "nothing was made");
+}
+
+/// A host no release is built for (a Mac on x86-64) is told so before the source is asked.
+///
+/// Catches a request for a platform that does not exist (the source would answer with a
+/// different complaint, or the host would install another platform's binary).
+#[test]
+fn a_host_no_release_is_built_for_is_refused_before_anything_is_asked() {
+    let rig = Rig::on("update-mac-x86", Platform::MacOs);
     let fetcher = rig.fetcher(None, Answers::honest());
     assert_eq!(
         fetcher.fetch(&rec(Vec::new())),
-        Err(FetchError::Unavailable(NO_COMPONENT_LIST.to_owned()))
+        Err(FetchError::Rejected(
+            "platform: no release is built for macos on x86_64".to_owned()
+        ))
     );
-    assert!(!rig.work().exists(), "not even the work directory");
+    assert!(!rig.work().exists(), "nothing was made");
 }
 
-/// An activation that names no component is refused the same way (the cycle never sends one,
-/// but the fetcher does not rely on that).
+/// An activation that names no component is refused (the cycle never sends one, but the
+/// fetcher does not rely on that, and it does not ask the source: an activation's components
+/// come from its offer).
 ///
-/// Mutant: the empty-components check removed (red: a panic in the pipeline).
+/// Mutant: the empty-components check removed (red: a panic in the pipeline, or a describe).
 #[test]
 fn an_activation_without_components_is_refused_and_makes_nothing() {
     let rig = Rig::new("empty-activation");
