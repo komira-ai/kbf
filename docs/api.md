@@ -262,7 +262,7 @@ message yet: the daemon is not told, and the server simply sends it no new `Star
 An operator sets a storage member's state. The body is `{"state": "active"}` or
 `{"state": "draining"}`; the answer is `{"id": N, "state": "...", "generation": G}`,
 the map's generation after the change. `down` is the store's verdict, `catching_up` is what a registration says and `joining` is
-the join handoff's, so none of them is accepted (`400`, as is
+written by a registration (a new node in a farm with data), so none of them is accepted (`400`, as is
 any other body). `404` for an id that has no live row (it expired, or never
 registered) or is not a number, or on a server without a state store; `503` when the
 state store cannot be written; `401`, `403` or `415` from the gates of
@@ -284,7 +284,11 @@ more than a minute after the first `active` member: its store is empty, so it en
 registration of that member is `joining` whatever it says, and no beat promotes it; this call
 (which removes the mark) does. A member that was `active` and restarts, and a
 returning instance, are `active` again. Nothing copies the blobs that existed before the
-node joined: promoting it says the operator knows it holds what it owns.
+node joined: promoting it says the operator knows it holds what it owns. A replacement host at the
+address of a node the farm has seen is a known instance, so it registers `active` with an
+empty store (the instance id is the address). A farm whose nodes start more than a minute
+apart leaves the later ones `joining` until promoted; `down` members cannot be promoted
+until they register again.
 
 **The risk of promoting a joiner.** `active` makes the member a settled owner: it
 takes the rank-1 slots of the digests it wins in the rendezvous order, and it is read
