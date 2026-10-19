@@ -336,7 +336,7 @@ fn wrong_commands_and_inputs_are_usage_errors() {
         let (code, _, err) = exec(&missing(flag));
         assert_eq!(code, EXIT_USAGE, "{flag}");
         assert!(
-            err.contains("a new bake needs --commit, --sha256sums and --run-id"),
+            err.contains("a new bake needs --handoff, or --commit, --sha256sums and --run-id"),
             "{err}"
         );
     }

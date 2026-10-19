@@ -45,7 +45,10 @@ const ALL_SET: &[(&str, &str)] = &[
     ("KBF_REAPI_CERT", "/etc/kbf/front.example.ts.net.crt"),
     ("KBF_REAPI_KEY", "/etc/kbf/front.example.ts.net.key"),
     ("KBF_API_TOKEN_FILE", "/run/secrets/kbf-api-token"),
-    ("KBF_STATE_DIR", "/srv/kbf/state"),
+    (
+        "KBF_STATE_STORE",
+        "postgres://db.example.internal:5432/kbf?application_name=kbf",
+    ),
     ("KBF_RESERVE_CPUS", "4"),
     ("KBF_LEASE_PLACEMENT", "numa-node"),
 ];
@@ -55,7 +58,7 @@ fn words(list: &[&str]) -> Vec<String> {
 }
 
 /// Each mode's whole command line with every setting given: the frontend's three
-/// listeners, certificates, storage URL and SQLite state store; the storage-and-daemon
+/// listeners, certificates, storage URL and Postgres state store; the storage-and-daemon
 /// unit's cold store (with the prefix), meta dir, hot store, listener, registration and
 /// advertised name; the daemons' frontend name and tuning flags. Catches a flag dropped,
 /// renamed or given another key's value (the node's own name where the frontend's
@@ -79,8 +82,7 @@ fn each_mode_renders_its_full_flag_set() {
             "--storage-client-cert=/etc/kbf/worker.pem",
             "--storage-client-key=/etc/kbf/worker.key",
             "--storage-ca=/etc/kbf/ca.pem",
-            "--state-store=sqlite:///srv/kbf/state/state.db",
-            "--handover-socket=/run/kbf-frontend/control.sock",
+            "--state-store=postgres://db.example.internal:5432/kbf?application_name=kbf",
         ])
     );
     assert_eq!(
@@ -182,7 +184,11 @@ fn each_new_key_reaches_exactly_the_units_that_read_it() {
             "/etc/kbf/other-token",
             &[Frontend, AllInOne],
         ),
-        ("KBF_STATE_DIR", "/srv/other", &[Frontend]),
+        (
+            "KBF_STATE_STORE",
+            "postgres://other.example/kbf",
+            &[Frontend],
+        ),
         (
             "KBF_RESERVE_CPUS",
             "7",
@@ -284,17 +290,37 @@ fn the_new_keys_refuse_values_a_unit_cannot_carry() {
             "{bad}"
         );
     }
-    let state = refuses("KBF_STATE_DIR", "relative/dir");
-    assert!(
-        matches!(
-            state,
-            LinuxError::Path {
-                key: "KBF_STATE_DIR",
-                ..
-            }
-        ),
-        "{state}"
-    );
+    // The state store: a postgres URI that carries no password, no variable and no
+    // character a unit line cannot hold. The rule `state-store` judges the rest.
+    for bad in [
+        "sqlite:///var/lib/kbf/state.db",
+        "mysql://db/kbf",
+        "postgres://",
+        "postgresql://",
+        "postgres://u:hunter2@db/kbf",
+        "postgres://db/kbf?password=hunter2",
+        "postgres://db/kbf?PassWord=hunter2",
+        "postgres://db/kbf?sslmode=prefer&password=hunter2",
+        "postgres://$PGUSER@db/kbf",
+        "postgres://db/kbf%20x",
+        "postgres://db/kbf;x",
+    ] {
+        let state = refuses("KBF_STATE_STORE", bad);
+        assert!(
+            matches!(state, LinuxError::StateStore { .. })
+                || matches!(state, LinuxError::Chars { .. }),
+            "{bad}: {state}"
+        );
+        assert!(!state.to_string().contains("hunter2"), "{bad}: {state}");
+    }
+    for ok in [
+        "postgres:///kbf?host=/run/postgresql",
+        "postgresql://kbf@db.example:5432/kbf",
+        "postgres://db/kbf?sslmode=prefer&application_name=kbf",
+    ] {
+        let c = config_with(&[("KBF_STATE_STORE", ok)]);
+        assert_eq!(c.state_store, ok);
+    }
     // Taken: each placement, a zero, a nested prefix with or without its slash.
     for (key, value) in [
         ("KBF_LEASE_PLACEMENT", "none"),
@@ -452,5 +478,17 @@ fn a_storage_unit_is_not_ordered_after_the_minio_unit() {
             text.contains("\nAfter=network-online.target\n"),
             "{mode}:\n{text}"
         );
+    }
+}
+
+/// The frontend unit gives no `--handover-socket`: its state store is Postgres, which
+/// `kbf frontend` refuses together with the socket (a Postgres store cannot be handed
+/// over). Catches the socket rendered again, whatever the settings.
+#[test]
+fn the_postgres_frontend_unit_gives_no_handover_flag() {
+    for c in [config_with(&[]), config_with(ALL_SET)] {
+        let f = flags(&c, Mode::Frontend);
+        assert!(f.iter().any(|w| w.starts_with("--state-store=postgres://")));
+        assert!(!f.iter().any(|w| w.contains("handover")), "{f:?}");
     }
 }

@@ -42,7 +42,7 @@ pub const KEYS: &[&str] = &[
     "KBF_REAPI_CERT",
     "KBF_REAPI_KEY",
     "KBF_API_TOKEN_FILE",
-    "KBF_STATE_DIR",
+    "KBF_STATE_STORE",
     "KBF_RESERVE_CPUS",
     "KBF_LEASE_PLACEMENT",
 ];
@@ -50,6 +50,11 @@ pub const KEYS: &[&str] = &[
 /// The `@MINIO_S3_ENDPOINT@` value of a unit when `MINIO_S3_ENDPOINT` is not set: the
 /// host's own MinIO. (`--mode storage` refuses to render without the setting.)
 pub const LOOPBACK_MINIO: &str = "http://127.0.0.1:9000";
+
+/// The `@KBF_STATE_STORE@` value of the frontend's unit when `KBF_STATE_STORE` is not set:
+/// the database `kbf` on the host's own Postgres, by its socket (kbf's own default for the
+/// all-in-one).
+pub const LOCAL_POSTGRES: &str = "postgres:///kbf?host=/run/postgresql";
 
 /// Where a daemon puts each lease among the node's CPUs: kbf-daemon's `--lease-placement`
 /// values, a closed set.
@@ -142,8 +147,9 @@ pub struct LinuxConfig {
     /// The operator API's bearer token (`--api-token-file`): a file the operator puts
     /// there, the server user's alone. install-units never makes it.
     pub api_token_file: HostPath,
-    /// The directory of the frontend's SQLite state store, `state.db` in it.
-    pub state_dir: HostPath,
+    /// The frontend's `--state-store`: a `postgres://` URI without a password. The database
+    /// and its schema are kbf-installer's.
+    pub state_store: String,
     /// The daemon's `--reserve-cpus`; none leaves kbf's default.
     pub reserve_cpus: Option<u64>,
     /// The daemon's `--lease-placement`; none leaves kbf's default.
@@ -161,6 +167,10 @@ pub enum LinuxError {
     NotNumber { key: &'static str, value: String },
     #[error("KBF_LEASE_PLACEMENT={0}: must be none or numa-node")]
     Placement(String),
+    /// The state store's URI is not one the frontend's unit can carry. It never holds the
+    /// value: a mistyped one may carry a password.
+    #[error("KBF_STATE_STORE: {0}")]
+    StateStore(&'static str),
     #[error("KBF_S3_PREFIX={value}: {why}")]
     S3Prefix { value: String, why: &'static str },
     #[error(
@@ -223,6 +233,11 @@ impl LinuxConfig {
 
     fn from_config(c: &Config) -> Result<LinuxConfig, LinuxError> {
         for &key in KEYS {
+            // The state store has its own check: a URI holds `?` and `&`, and a refusal of it
+            // must not echo a password.
+            if key == "KBF_STATE_STORE" {
+                continue;
+            }
             if let Some(value) = c.get(key) {
                 plain(key, value)?;
             }
@@ -311,7 +326,7 @@ impl LinuxConfig {
             reapi_cert: path("KBF_REAPI_CERT", &format!("{etc}/reapi.pem"))?,
             reapi_key: path("KBF_REAPI_KEY", &format!("{etc}/reapi.key"))?,
             api_token_file: path("KBF_API_TOKEN_FILE", &format!("{etc}/api-token"))?,
-            state_dir: path("KBF_STATE_DIR", "/var/lib/kbf-server/state")?,
+            state_store: state_store(&or("KBF_STATE_STORE", LOCAL_POSTGRES))?,
             reserve_cpus,
             lease_placement,
             s3_prefix: s3_prefix(&or("KBF_S3_PREFIX", ""))?,
@@ -426,6 +441,38 @@ fn plain(key: &'static str, value: &str) -> Result<(), LinuxError> {
     } else {
         Err(LinuxError::Chars {
             key,
+            value: value.to_owned(),
+        })
+    }
+}
+
+/// `KBF_STATE_STORE`: a Postgres URI that carries no password and nothing a unit line
+/// cannot (a space, `$` or `%`, which systemd expands, a `;` or a quote). It is judged
+/// before its characters so that a refusal never repeats a password.
+fn state_store(value: &str) -> Result<String, LinuxError> {
+    let postgres = ["postgres://", "postgresql://"].iter().any(|scheme| {
+        value
+            .strip_prefix(scheme)
+            .is_some_and(|rest| !rest.is_empty())
+    });
+    if !postgres {
+        return Err(LinuxError::StateStore(
+            "must be a postgres:// URI: SQLite is dropped for the frontend",
+        ));
+    }
+    if super::stores::has_password(value) {
+        return Err(LinuxError::StateStore(
+            "carries a password: kbf refuses one (its command line is readable by every user on the node); give a socket or a passwordless URI",
+        ));
+    }
+    let ok = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._:/=,+@-?&".contains(c));
+    if ok {
+        Ok(value.to_owned())
+    } else {
+        Err(LinuxError::Chars {
+            key: "KBF_STATE_STORE",
             value: value.to_owned(),
         })
     }
