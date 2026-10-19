@@ -379,7 +379,8 @@ fn what_a_mode_cannot_start_without_is_required() {
 /// plain text; each refusal names the flags and every problem is said at once.
 #[test]
 fn flags_that_come_together_are_refused_alone() {
-    let cases: [(fn(&mut KbfFlags), &str); 5] = [
+    type Clear = fn(&mut KbfFlags);
+    let cases: [(Clear, &str); 5] = [
         (
             |k| k.reapi_tls_key = None,
             "--reapi-tls-cert, --reapi-tls-key: give all of them or none",

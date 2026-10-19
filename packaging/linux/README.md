@@ -44,6 +44,12 @@ user or directory is created by a script.
   `/etc/kbf/kbf.toml` for a node unit, `/etc/kbf/installer.toml` for
   `kbf-installer.service`); the test starts each `--gate` unit without its file (skipped,
   `ConditionResult=no`, no `ExecStart` run) and with it (condition holds).
+- `/etc/kbf/kbf.toml`, the file those gates test, is written by `kbf-installer setup`, not by
+  the package: for a frontend or all-in-one host from flags that name the listeners, the
+  certificates and keys (which the operator provides, owned by the unit's user) and, for a
+  frontend, the storage node, for an all-in-one host the cold store and the daemon half's
+  identity (`docs/deploy/kbf-installer-setup.md`, "The `kbf.toml` flags"). The unit's
+  `ExecStartPre=... --check` reads that file, so a file `setup` wrote is one `kbf --check` accepts.
 - The users and directories come from `systemd-sysusers` and `systemd-tmpfiles`, which
   run at boot, and from `kbf-installer setup`. After `dpkg -i` and before either, they do
   not exist; the test runs both commands as boot does and checks the result.
