@@ -63,11 +63,10 @@ fn installer_binary() -> &'static str {
 
 /// An empty directory of its own for one test.
 fn scratch(name: &str) -> TestDir {
-    let dir = TestDir::under(
+    TestDir::under(
         Path::new(env!("CARGO_TARGET_TMPDIR")).join("install-sh"),
         name,
-    );
-    dir
+    )
 }
 
 fn xtask(args: &[&str]) {

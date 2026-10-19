@@ -16,7 +16,7 @@ fn switch_rig(name: &str) -> Rig {
 }
 
 fn intent(rig: &Rig) -> Option<LeaseId> {
-    read_intent(&rig.dir.join("session-intent")).unwrap()
+    read_intent(rig.dir.path().join("session-intent")).unwrap()
 }
 
 fn domain(rig: &Rig) -> String {

@@ -25,11 +25,10 @@ const OTHER: &str = "badbad0123456789badbad0123456789badbad01";
 
 /// An empty directory of its own for one test.
 fn scratch(name: &str) -> TestDir {
-    let dir = TestDir::under(
+    TestDir::under(
         Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-assets"),
         name,
-    );
-    dir
+    )
 }
 
 /// The exit code, stdout and stderr of `cargo xtask <args>`.

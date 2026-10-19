@@ -6,7 +6,7 @@
 //! `src/pkg_install/tests.rs`.
 
 use kbf_testkit::dir::TestDir;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");

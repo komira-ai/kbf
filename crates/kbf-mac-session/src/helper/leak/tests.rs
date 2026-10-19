@@ -42,7 +42,7 @@ fn write_private(path: &Path, text: &str) {
 
 /// Opens the baseline window as the apply in boot `boot-1` would.
 fn open_window(rig: &Rig) {
-    write_private(&rig.dir.join("baseline-window"), "boot-1\n");
+    write_private(rig.dir.path().join("baseline-window"), "boot-1\n");
 }
 
 /// A Mac with something in every class but auto-login (off at rest): a launch agent,
@@ -351,11 +351,11 @@ fn an_unreadable_file_is_an_error() {
     let dir = rig.dir.clone();
     rig.host.state().on_command = Some(Box::new(move |command: &str| {
         if command.starts_with("/usr/bin/defaults read") {
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
         }
     }));
     let report = rig.helper.scan().unwrap();
-    std::fs::set_permissions(&rig.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(rig.dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
         report
             .errors
