@@ -58,6 +58,9 @@ pub enum MemberState {
     Active,
     /// Takes no new writes.
     Draining,
+    /// Out of the write path for a planned restart, at once; `active` undoes it.
+    #[value(name = "planned-down")]
+    PlannedDown,
 }
 
 /// What `kbf cluster` does.
@@ -102,6 +105,10 @@ pub enum Verb {
         /// The state to set. `active` promotes a joining member to a full owner.
         #[arg(long, value_enum)]
         state: MemberState,
+        /// With `planned-down`: how long the restart may last before the member returns by
+        /// its next heartbeat (default 15 minutes, at most a day).
+        #[arg(long, value_name = "SECONDS")]
+        for_secs: Option<u64>,
         /// The file holding the server's operator API token.
         #[arg(long, value_name = "FILE")]
         token_file: PathBuf,
@@ -218,15 +225,22 @@ impl Verb {
             Self::Undrain { node, .. } => {
                 Call::Post(kbf_server::api::node_path(node, "uncordon"), Body::empty())
             }
-            Self::Member { id, state, .. } => {
+            Self::Member {
+                id,
+                state,
+                for_secs,
+                ..
+            } => {
                 let state = match state {
                     MemberState::Active => "active",
                     MemberState::Draining => "draining",
+                    MemberState::PlannedDown => "planned_down",
                 };
-                Call::Post(
-                    format!("/v1/members/{id}"),
-                    Body::json(&serde_json::json!({ "state": state })),
-                )
+                let body = match for_secs {
+                    Some(secs) => serde_json::json!({ "state": state, "for_secs": secs }),
+                    None => serde_json::json!({ "state": state }),
+                };
+                Call::Post(format!("/v1/members/{id}"), Body::json(&body))
             }
             Self::Denied { .. } => Call::GetGated(DENIED.to_owned()),
             Self::ObjectStore { verb } => verb.call(stdin)?,
