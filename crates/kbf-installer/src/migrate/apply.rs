@@ -197,12 +197,8 @@ pub fn migrate<E: Exec>(
     // one a re-run can finish.
     let (current, previous) = (old.state.current.clone(), old.state.previous.clone());
     let state = write_state(&lock, current.clone(), previous.clone(), &seeded)?;
-    let memory = write_memory(
-        &tree,
-        &old.memory,
-        &seeded,
-        found.iter().find(|f| f.role == "current"),
-    )?;
+    let current_found = found.iter().find(|f| f.role == "current");
+    let memory = write_memory(&tree, &old.memory, &seeded, current_found)?;
     tree.set_link(layout::CURRENT, current.as_ref())?;
     tree.set_link(layout::PREVIOUS, previous.as_ref())?;
     report.line(

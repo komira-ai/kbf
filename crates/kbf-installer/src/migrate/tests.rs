@@ -554,6 +554,52 @@ fn the_written_files_are_read_by_the_installer_the_node_and_the_helper() {
     );
 }
 
+/// Catches a re-run that lowers the replay memory, or reads a damaged one as empty: a
+/// `helper.json` an earlier run (or the installer) left with higher floors keeps them, in
+/// both kinds of order; one that does not parse stops the run naming the file.
+///
+/// Mutants seen red: the earlier memory ignored (zero start); the earlier pair replaced by
+/// the seeded one.
+#[test]
+fn an_earlier_replay_memory_is_raised_never_lowered_and_a_damaged_one_stops_the_run() {
+    let mut rig = Rig::linux("memory-rerun");
+    rig.fail_start.set(true);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect_err("start fails");
+    let path = rig.new_state_dir().join("helper.json");
+    let mut earlier: crate::helper::memory::Memory =
+        serde_json::from_slice(&fs::read(&path).expect("written")).expect("memory");
+    assert_eq!((earlier.acked_epoch, earlier.acked_order_id), (3, 42));
+    earlier.acked_epoch = 9;
+    earlier.acked_order_id = 100;
+    earlier.frontend_epoch = 3;
+    earlier.frontend_order_id = 77;
+    fs::write(&path, serde_json::to_vec(&earlier).expect("json")).expect("write");
+
+    rig.fail_start.set(false);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    let now: crate::helper::memory::Memory =
+        serde_json::from_slice(&fs::read(&path).expect("read")).expect("memory");
+    assert_eq!((now.acked_epoch, now.acked_order_id), (9, 100));
+    assert_eq!((now.frontend_epoch, now.frontend_order_id), (3, 77));
+
+    let mut rig = Rig::linux("memory-damaged");
+    rig.fail_start.set(true);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect_err("start fails");
+    fs::write(rig.new_state_dir().join("helper.json"), "not json").expect("write");
+    rig.fail_start.set(false);
+    let error = run_migrate(&mut rig, &never(), Mode::Apply).expect_err("stops");
+    assert!(
+        matches!(
+            error,
+            MigrateError::Corrupt {
+                file: "helper.json",
+                ..
+            }
+        ),
+        "{error}"
+    );
+}
+
 /// Catches a failed copy leaving a half release behind: a source that cannot be copied (a
 /// link inside it) leaves neither the `.stage-` directory in `releases/` nor a release directory,
 /// so the next run starts clean and nothing half-written can be linked.

@@ -247,6 +247,19 @@ fn damaged_files_stop_the_run_naming_the_file() {
         "{error}"
     );
     assert_eq!(error.exit().code(), 1);
+    // A rollback is not held up by a state of another schema either: it is the installer's
+    // to judge, so the rollback says what it is and changes nothing.
+    let m = rig.migration();
+    let before = rig.snapshot("");
+    let error = rollback(&m, &mut rig.host, Mode::Apply).expect_err("refused");
+    assert!(
+        matches!(
+            error,
+            MigrateError::State(crate::state::StateError::Schema { .. })
+        ),
+        "{error}"
+    );
+    assert_eq!(rig.snapshot(""), before);
 
     let mut rig = Rig::linux("memory-bad");
     put(
@@ -288,9 +301,11 @@ fn damaged_files_stop_the_run_naming_the_file() {
     }
 
     let mut rig = Rig::linux("old-state-bad");
-    // The installer's own schema in the old directory is not the old tools' state.
+    // The installer's own schema in the old directory is not the old tools' state, whether
+    // the file has the old keys or not.
     for text in [
         "{\"schema\": 2}",
+        "{\"schema\": 2, \"current\": null, \"previous\": null, \"staged\": null, \"pending_confirm\": null, \"order_floor\": 0}",
         "{\"schema\": 1, \"current\": null, \"previous\": null, \"staged\": null, \"pending_confirm\": null, \"order_floor\": 0, \"floor\": 1}",
     ] {
         put(&rig.at("var/lib/kbf-deploy/state.json"), text, 0o600);
