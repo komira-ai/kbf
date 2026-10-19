@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 use crate::closure::{DEFAULT_CLOSURE_ENTRIES, DEFAULT_CLOSURE_TTL, Verified};
 use crate::flights::Flights;
 use crate::nodes::Nodes;
-use crate::repair::{Limiter, ReadRepair, RepairLimit};
+use crate::repair::{Background, Limiter, ReadRepair, RepairLimit};
 use crate::source::{MapSource, MapView};
 
 /// What [`Router::commit_with_closure`] holds in memory, across all its calls, unless
@@ -101,6 +101,28 @@ impl Router {
             limiter: Limiter::new(limit),
         }));
         self
+    }
+
+    /// The same router, copying a blob a read or [`Router::find_missing_anywhere`] found
+    /// away from the owner that should hold it to that owner, in the background, at most
+    /// as often as `limit` lets a find through ([`Router::with_read_repair`] with the
+    /// router's own hook).
+    ///
+    /// The copy never delays the call that found the blob: it runs in a task of its own
+    /// (so the call that finds a blob must run inside a Tokio runtime, or the find is
+    /// not repaired), at most [`crate::MAX_REPAIRS_IN_FLIGHT`] at a time, one per digest, and a
+    /// find that arrives while the copies are all busy is dropped: a later read finds the
+    /// blob away from its owner again and tells the hook again. A copy is read from
+    /// wherever the map has it, hashed against its digest, and written with
+    /// [`kbf_storage::Storage::put_unowned`]; the owner is asked first whether it still
+    /// lacks the blob.
+    #[must_use]
+    pub fn with_background_repair(self, limit: RepairLimit) -> Self {
+        // The task reads through a router without the hook, so a repair's own read is
+        // never reported as a find.
+        let mut plain = self.clone();
+        plain.repair = None;
+        self.with_read_repair(Arc::new(Background::new(plain)), limit)
     }
 
     /// Who holds `digest` in the map as it is now.
