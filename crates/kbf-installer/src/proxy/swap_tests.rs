@@ -112,6 +112,10 @@ fn an_old_child_that_never_drains_is_never_signalled_in_24_hours() {
             Box::new(|w: &World| w.queued(Slot::A, 1, None)),
         ),
         (
+            "the gate never opened the slot, so it cannot be retired",
+            Box::new(|w: &World| w.st.borrow_mut().never_opened.push(Slot::A)),
+        ),
+        (
             "the child cannot be asked",
             Box::new(|w: &World| w.st.borrow_mut().open_counts_err = true),
         ),

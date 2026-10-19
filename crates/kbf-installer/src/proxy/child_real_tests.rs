@@ -2,8 +2,9 @@
 //! child port.
 
 use super::*;
-use crate::proxy::child_rig::{Cleanup, Rig, alive, refused, rig, wait_for};
+use crate::proxy::child_rig::{Cleanup, Rig, alive, await_gone, refused, rig, running, wait_for};
 use crate::testkit::{A, B, c};
+use std::time::{Duration, Instant};
 
 /// Catches a spawn that runs another file than the release's (the `current` link, a stale
 /// path), that records a different identity than the live process's, or that leaves the
@@ -486,4 +487,90 @@ fn a_signal_the_kernel_refuses_is_an_error() {
     );
     let e = rig.child.terminate(&ident).expect_err("not a pidfd");
     assert!(e.0.contains("signal 31339"), "{e}");
+}
+
+/// Catches a guard that cannot tell a running process from a gone one, and one that gives up
+/// at once or never: the test's own process is running (and a recycled pid, the same pid with
+/// another start time, is not), and the wait sleeps its polls while it runs. Deterministic:
+/// the guard's own wait only sleeps when a killed child has not quite gone yet.
+#[test]
+fn the_cleanup_guard_sees_a_running_process_and_waits_a_bounded_time_for_it() {
+    let me = ident_of(std::process::id()).expect("own identity");
+    assert_eq!(running(std::slice::from_ref(&me)), vec![me.pid]);
+    let recycled = ProcIdent {
+        start_time: me.start_time + 1,
+        ..me.clone()
+    };
+    assert!(
+        running(std::slice::from_ref(&recycled)).is_empty(),
+        "another process"
+    );
+    let started = Instant::now();
+    await_gone(std::slice::from_ref(&me), 3, Duration::from_millis(20));
+    assert!(
+        started.elapsed() >= Duration::from_millis(60),
+        "three polls"
+    );
+    let started = Instant::now();
+    await_gone(&[recycled], 50, Duration::from_millis(100));
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "nothing to wait for"
+    );
+}
+
+/// Catches an adoption of a pid that is not a process, or of a vanished one: through the real
+/// reads, a pid with no entry is `Gone` at the first identity read, and a thread id (its entry
+/// is there, so its identity reads; `pidfd_open` refuses a thread that leads no group) is
+/// `Gone` at the open.
+#[test]
+fn the_real_reads_refuse_a_missing_pid_and_a_thread_id() {
+    let missing = ProcIdent {
+        pid: u32::MAX - 1,
+        start_time: 1,
+        exe: PathBuf::from("/x/kbf"),
+    };
+    assert_eq!(
+        open_verified(&missing).err(),
+        Some(AdoptError::Gone(missing.pid))
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (done, wait) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        // SAFETY: `gettid` has no arguments and cannot fail.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+        tx.send(tid).expect("send");
+        wait.recv().expect("held until the test is done");
+    });
+    let tid = rx.recv().expect("tid");
+    let ident = ident_of(tid).expect("a thread has a stat entry");
+    assert_eq!(open_verified(&ident).err(), Some(AdoptError::Gone(tid)));
+    done.send(()).expect("release");
+    thread.join().expect("thread");
+}
+
+/// Catches a pid the kernel API cannot take being passed on: 0 and a number above `i32::MAX`
+/// are `EINVAL` before any syscall, and `identify_started` names which read failed (the
+/// pidfd of a pid that is not a process; the identity of a process that is a zombie, whose
+/// `exe` is gone while its pidfd still opens).
+#[test]
+fn identify_started_and_pidfd_of_refuse_what_is_not_a_live_process() {
+    assert_eq!(pidfd_of(0).err(), Some(Errno::INVAL));
+    assert_eq!(pidfd_of(u32::MAX).err(), Some(Errno::INVAL));
+    assert!(identify_started(u32::MAX - 1).is_err(), "no such process");
+
+    let mut zombie = std::process::Command::new("true")
+        .spawn()
+        .expect("a short-lived process");
+    let pid = zombie.id();
+    wait_for("the process to exit", || {
+        fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+            s.rsplit(')')
+                .next()
+                .is_some_and(|r| r.trim_start().starts_with('Z'))
+        })
+    });
+    let e = identify_started(pid).expect_err("a zombie has no identity");
+    assert!(!e.is_empty(), "the reason is kept");
+    zombie.wait().expect("reaped");
 }

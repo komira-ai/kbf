@@ -82,22 +82,30 @@ impl Drop for Cleanup<'_> {
         for ident in &self.1 {
             let _ = self.0.kill_unserved(ident);
         }
-        // The same process, not whatever took its pid since (a pid is also a thread id).
-        let left = |ids: &[ProcIdent]| {
-            ids.iter()
-                .filter(|i| ident_of(i.pid).is_ok_and(|now| now == **i))
-                .map(|i| i.pid)
-                .collect::<Vec<_>>()
-        };
-        // Up to 10 s for the killed processes to go; no branch, so no uncovered one.
-        (0..2000)
-            .take_while(|_| !left(&self.1).is_empty())
-            .for_each(|_| std::thread::sleep(Duration::from_millis(5)));
-        let orphans = left(&self.1);
+        // Up to 10 s for the killed processes to go.
+        await_gone(&self.1, 2000, Duration::from_millis(5));
+        let orphans = running(&self.1);
         // `&`, not `&&`: no short-circuit branch for the coverage ratchet to count.
         let leaked = !orphans.is_empty() & !std::thread::panicking();
         assert!(!leaked, "children left running by the test: {orphans:?}");
     }
+}
+
+/// The pids of `ids` that are still those processes: the same pid and start time, not
+/// whatever took the pid since (a pid is also a thread id).
+pub(super) fn running(ids: &[ProcIdent]) -> Vec<u32> {
+    ids.iter()
+        .filter(|i| ident_of(i.pid).is_ok_and(|now| now == **i))
+        .map(|i| i.pid)
+        .collect()
+}
+
+/// Sleeps `pause` up to `polls` times while any of `ids` still runs. No branch, so no
+/// uncovered one.
+pub(super) fn await_gone(ids: &[ProcIdent], polls: u32, pause: Duration) {
+    (0..polls)
+        .take_while(|_| !running(ids).is_empty())
+        .for_each(|_| std::thread::sleep(pause));
 }
 
 /// The error of a spawn the test expects to fail. A spawn that wrongly succeeds is stopped
