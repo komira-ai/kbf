@@ -4,7 +4,7 @@
 //! counts one build of it.
 
 use kbf_testkit::dir::TestDir;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 
 fn act(args: &[&str]) -> Output {

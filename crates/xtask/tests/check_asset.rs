@@ -149,7 +149,7 @@ fn check_asset_runs_the_binary_it_took_out_of_the_tarball_inside_the_workspace()
     std::fs::copy(root.join("bin/kbf"), root.join("dist/kbf")).expect("copy");
     let out = Command::new(XTASK)
         .arg("--root")
-        .arg(&root)
+        .arg(&*root)
         .args(["build-commit", "check-asset"])
         .arg(&tarball)
         .arg(COMMIT)

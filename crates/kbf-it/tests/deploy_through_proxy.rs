@@ -164,10 +164,7 @@ fn private(path: &Path, content: &[u8]) {
 
 /// A fresh directory for one run of the test, removed when it drops.
 fn dir(name: &str) -> TestDir {
-    TestDir::under(
-        env!("CARGO_TARGET_TMPDIR"),
-        &format!("deploy-proxy-{name}"),
-    )
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("deploy-proxy-{name}"))
 }
 
 /// A proxy over `base`'s ports with slot A active, serving `api` on its update route.

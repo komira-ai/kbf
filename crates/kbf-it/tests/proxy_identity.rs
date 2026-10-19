@@ -232,7 +232,7 @@ async fn child_accepts_proxy_headers() {
     let incoming = TcpIncoming::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind");
     let child = incoming.local_addr().expect("address");
     let base = child.port() - 1;
-    let started = dir.clone();
+    let started = dir.path().to_path_buf();
     // The proxy builds its own runtime, which must not be built or dropped inside this one.
     let (handle, proxy, secret_file) =
         tokio::task::spawn_blocking(move || start_proxy(&started, &for_proxy, base))
