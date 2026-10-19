@@ -452,8 +452,8 @@ restart it. `kbf cluster member <id> --state active|draining --token-file F` cal
 
 The operator's side of enrollment (`design/install-and-enrollment.md`):
 the tokens a node enrolls with, and the registry of nodes that did. They live in the state
-store, so a frontend that has no enrollment (until the enroll service lands, every
-frontend) answers every one of these routes with `404` once the call passes the gates.
+store, so a frontend that has no enrollment (one started without `--enroll-listen`)
+answers every one of these routes with `404` once the call passes the gates.
 
 **Every route here, a GET included, passes every gate of [Who may write](#who-may-write):**
 a loopback peer (one that presents the proxy's secret, with `--proxy-auth-file`), no `Origin` header, the bearer token, and `Content-Type: application/json`
@@ -523,6 +523,121 @@ curl -X DELETE -H "Authorization: Bearer $T" -H 'Content-Type: application/json'
 ```
 
 A UI comes later.
+
+## `kbf.enroll.v1`: `Enroll` and `Renew` on `--enroll-listen`
+
+The node's side of enrollment: a gRPC service (`kbf.enroll.v1.Enroll`, two methods) on a
+listener of its own, **off unless `--enroll-listen=<addr>` is given**. It is served over
+TLS that authenticates the server only (a node with no certificate yet cannot present
+one). The server certificate is the frontend's own, issued by the farm CA for the
+`--frontend-name` list and held in memory (never written), replaced at half its life; the
+chain it sends is the leaf and then the root. A node learns the CA from its token, which
+carries the SHA-256 of the root, and pins it.
+
+**Flags** (all are the frontend's alone, and every one but `--enroll-listen` needs it):
+
+| Flag | Meaning |
+|---|---|
+| `--enroll-listen=ADDR` | serve `Enroll` and `Renew` here; needs `--state-store`, `--ca-dir`, `--frontend-name` and a signer flag |
+| `--ca-dir=DIR` | the CA directory (`ca.key` mode `0600`, `ca.pem`). Empty or missing: a new CA is made once. Holding a CA: it is loaded and **nothing is overwritten**. Holding anything else, or half a CA: refused, untouched |
+| `--ca-signer=SOCKET` | **production.** The CA key lives in a `kbf-signer` process; this process holds none. `--ca-dir` must hold the `ca.pem` the signer made, and the signer's public key must match it |
+| `--ca-dev-file-signer` | development and tests only: the key is a file in this process. A start with neither signer flag fails, so production cannot end up holding the key by default |
+| `--frontend-name=NAME` | a DNS name or address this frontend serves (repeat). The listener's certificate carries them; no node may advertise one, or a host under one |
+| `--enroll-cert-lifetime-secs=N` | certificate life, 3600 to 2592000 (default 604800); nodes renew at half. The signer's own `--lifetime-secs` must be at least this |
+| `--enroll-rate-per-minute=N`, `--enroll-rate-burst=N`, `--enroll-max-in-flight=N` | the limits below (defaults 60, 30, 64) |
+| `--enroll-worker-endpoint`, `--enroll-cas-endpoint`, `--enroll-storage-port` | what every node is told (`NodeConfig`) |
+| `--enroll-allow-unenforced-deny` | see the start gate |
+
+With `--instance=b` the enroll port moves ten above, as the others do.
+
+
+**Order of an `Enroll`.** The shape (ids, role names, the size of each CSR) is checked
+first and reads nothing. Then, in one registry transaction: the token **secret** (an
+unknown id and a wrong secret are the same refusal after the same work, byte for byte);
+**idempotency** (a request already served is answered from the stored node); the token's
+**policy** (revoked, expired, used up, roles, node id, advertise names; the roles asked
+must be a subset of the token's); and only then the CA: each CSR is parsed
+(`kbf_ca::parse_csr`: ECDSA P-256, `ecdsa-with-SHA256`, at most 2 KiB, a signature that
+verifies) and a certificate is issued for it. A CSR is therefore parsed only for a caller
+who proved the secret. The answer carries one certificate per role, the CA bundle (PEM),
+the frontend's clock (`server_time`), `renew_after` (half-way through the shortest life)
+and the `NodeConfig`. A storage node must send `advertise` (`host:port`) and no other node
+may; the host may not be a frontend name, `localhost`, or a loopback, unspecified,
+link-local or multicast address. Set `node.advertise` in `kbf.toml` on a storage node.
+
+**`Renew`** needs no token: the node signs a CSR per role with the key the registry holds
+and puts `issued_at` among the signed attributes. Checked: the node exists and is not
+revoked; it asks for exactly the roles it holds, each with the **same key**; the CSR's
+`issued_at` attribute **equals** `RenewRequest.issued_at` (the field is not signed, so a
+captured CSR replayed under a new field is refused `MalformedRequest`); `issued_at` is
+within five minutes of the frontend's clock; the same CSR was not seen in the last ten
+minutes and the node did not renew in the last minute. Certificates are issued for the
+same keys. The answer carries `config` only when the node's `config_generation` differs.
+
+**Refusals** are exactly a `RefusalReason`: the gRPC status code is `reason.code()` and
+the message is `reason.message()`, byte for byte, with no detail. The node client
+recognises a refusal only by both. `NotSigner` is a frontend that lost the writer role,
+or whose CA cannot sign now (its signer is down, the clock is before the build's floor);
+any other state-store failure is `StoreUnavailable`.
+
+**Limits.** The request body is at most **16 KiB** (a longer message is `MalformedRequest`).
+A token bucket per **TCP peer address** (an IPv6 address counts as its /64) allows the
+burst, then the per-minute rate, and at most `--enroll-max-in-flight` calls run at once; the rest are `RateLimited`.
+The table of sources is bounded (4096). Behind the bundled kbf-proxy (which routes
+`kbf.enroll.v1` to the child's `--enroll-listen`) every peer is loopback, so these limits are
+in effect one global bucket for the listener; the per-client-address limit is the proxy's, on
+its accept path. **The counts are in memory: they start again at a restart**, so a new
+process gives every source a full bucket. A call is
+ended after 30 seconds and a TLS handshake after its own deadline.
+
+**Start gate (design section 8.3).** Revoking a node refuses its renewal at once, but the
+deny rows it writes are enforced by storage and the worker listener only when the
+revocation unit lands (`enroll::gate::DENY_ENFORCED`, `false` in this build). Until then
+`--enroll-listen` is **refused at start** unless `--enroll-allow-unenforced-deny` is also
+given, which accepts that a revoked node is still served by storage until its certificate
+expires (at most `--enroll-cert-lifetime-secs`). The refusal happens before the CA
+directory or any socket is touched.
+
+### Operator steps
+
+1. Start the frontend with the listener (development shown; production replaces the signer
+   flag with `--ca-signer=/run/kbf-signer/signer.sock`):
+
+   ```sh
+   kbf --mode=frontend ... --state-store=<uri> --api-token-file /etc/kbf/api.token \
+     --enroll-listen=0.0.0.0:7444 --frontend-name=kbf.example.com \
+     --ca-dir=/var/lib/kbf/ca --ca-dev-file-signer --enroll-allow-unenforced-deny
+   ```
+
+2. Make a token, on the frontend's host (the answer holds the token string once):
+
+   ```sh
+   T=$(cat /etc/kbf/api.token); API=http://127.0.0.1:<api port>
+   curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+     -d '{"roles": ["storage","daemon"], "max_uses": 1, "expires_in": 3600, "node_id": "node-07", "label": "rack 4"}' \
+     $API/v1/enroll/tokens
+   # {"token": "kbft1.<id>.<secret>.<pin>", ...}
+   ```
+
+3. On the node, place `/etc/kbf/kbf.toml` and the token file (mode `0600`, owned by the
+   service user, one line), then start it:
+
+   ```toml
+   [frontend]
+   url = "https://kbf.example.com:7444"
+   [node]
+   id = "node-07"
+   advertise = "node-07.nodes.example.com:8983"   # storage nodes only
+   [enroll]
+   token_file = "/var/lib/kbf/enroll.token"
+   ```
+
+   The node enrolls, installs its keys and certificates, removes the token file, and
+   renews at half life. The token limits the roles; the mode the node runs is the
+   operator's choice.
+
+4. Revoke a node or a token with the routes above. A revoked node is refused `NodeRevoked`
+   on its next renewal.
 
 ## `GET /v1/storage`
 
