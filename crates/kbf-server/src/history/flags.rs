@@ -69,7 +69,7 @@ impl HistoryFlags {
     /// # Errors
     /// [`HistoryError`]: no state store, or a store that cannot be opened.
     pub fn open(&self, state: Option<&StateStore>) -> Result<Option<History>, HistoryError> {
-        self.open_with(state, &|name| std::env::var(name).ok())
+        self.open_with(state, &process_env)
     }
 
     /// [`HistoryFlags::open`], reading an `s3://` store's key pair through `env` (the
@@ -123,6 +123,11 @@ impl HistoryFlags {
     }
 }
 
+/// The process environment, where an `s3://` store's key pair is read from.
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
 /// `uri` as the start log names it: the scheme and place, no query.
 fn describe(uri: &StoreUri) -> String {
     match uri {
@@ -152,6 +157,6 @@ pub fn with_history_as(
     flags: &HistoryFlags,
     writer: Option<WriterId>,
 ) -> Result<Option<StateStore>, HistoryError> {
-    let history = flags.open_as(state.as_ref(), &|name| std::env::var(name).ok(), writer)?;
+    let history = flags.open_as(state.as_ref(), &process_env, writer)?;
     Ok(state.map(|state| StateStore { history, ..state }))
 }

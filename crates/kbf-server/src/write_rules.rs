@@ -319,9 +319,8 @@ mod tests {
             (&shared[..], Rule::Fenced),
         ] {
             for key in keys {
-                let got = classify(key, &root).unwrap_or_else(|| panic!("{key}"));
-                assert_eq!(got.rule, rule, "{key}");
-                assert_eq!(got.rule.survives_a_takeover(), rule != Rule::Fenced);
+                assert_eq!(classify(key, &root).map(|c| c.rule), Some(rule), "{key}");
+                assert_eq!(rule.survives_a_takeover(), rule != Rule::Fenced);
             }
         }
         assert_eq!(classify("ui/streams", &root), None, "another root's row");
