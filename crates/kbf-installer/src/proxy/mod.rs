@@ -14,18 +14,23 @@
 //!   startup hold);
 //! - [`child_real::ProcChild`] (Linux), the `Child` on processes watched by pidfd;
 //! - [`runtime::SystemClock`] and [`runtime::RequestQueue`], the `Clock` and the `Requests`;
-//! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left.
+//! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left;
+//! - [`supervisor_swap`], the update API's `Supervisor`: the swap on its own thread.
 //!
 //! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
 //! child control and the fleet read call a child's ports with (U8b); [`admin`] is the
 //! `ChildAdmin` built on it (`admin_protocol` 1, sending the proxy secret header on every
-//! call), and nothing else calls it yet.
+//! call). [`supervisor_swap::SwapSupervisor`] is the update API's `Supervisor` over all of
+//! it: it runs [`Swap`] on a thread of its own, resumes an update that was in flight when the
+//! proxy stopped, and builds the status the API serves. Its seams are in its module
+//! documentation: [`ports::Migrator`] is [`supervisor_swap::ExpandOnlyDefault`] until a real
+//! migrator exists, and the compatibility gate is the API's.
 //!
-//! Still fakes, stated: `Migrator` (who migrates is open), `RootOrders` (the orders spool
-//! and `status.json` reader belong to the update API's unit, U8b). Until the proxy verb
-//! wires [`admin`] in, it cannot run a swap or resume one, start a first child or choose
-//! between two live ones, so [`supervisor::adopt_children`] adopts a child only when no
-//! update is in flight.
+//! Not built, stated: [`supervisor::adopt_children`] still adopts a child only when no update
+//! is in flight (the startup hold stays otherwise); starting a first child on a host that has
+//! none and choosing between two live children are not done. `Admin::ready` reports `health`
+//! and `capabilities` as not ready until their probes exist, so a swap on a real child stops
+//! at `ready`.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -97,6 +102,7 @@ pub mod running_binary;
 pub mod runtime;
 #[cfg(target_os = "linux")]
 pub mod supervisor;
+pub mod supervisor_swap;
 mod swap;
 
 #[cfg(test)]
