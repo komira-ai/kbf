@@ -48,6 +48,8 @@ rcgen.workspace = true
 # inotify, which counts the opens of each output file (tests/one_read.rs).
 rustix = { workspace = true, features = ["fs"] }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "time"] }
+# The scratch directories every test owns and removes (TestDir).
+kbf-testkit.workspace = true
 
 [lints]
 workspace = true

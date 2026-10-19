@@ -15,7 +15,8 @@
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
 //!   [`ports::ChildAdmin::resume`].
 //! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); open
-//!   executions and queued operations from the child ([`ports::ChildAdmin::open_counts`]).
+//!   streams and open worker sessions from the child's admin role view
+//!   ([`ports::ChildAdmin::open_counts`]); queued operations do not gate retire.
 //! - **Migration** (decided, FP section 8): the swap calls [`ports::Migrator::migrate_forward`]
 //!   before the candidate starts (for an all-in-one host, after the old process exits).
 //!   [`migrator::DbMigrator`] is the real one: it applies the installer's embedded,
@@ -70,6 +71,8 @@ pub mod ports;
 pub mod record;
 mod recover;
 mod retire;
+pub mod root_orders;
+pub mod running_binary;
 mod swap;
 
 #[cfg(test)]
@@ -95,9 +98,12 @@ mod record_tests;
 #[cfg(test)]
 mod recover_tests;
 #[cfg(test)]
+mod root_orders_tests;
+#[cfg(test)]
 mod swap_tests;
 
 pub use model::{Halt, Intent, Phase, Plan, Timing};
 pub use ports::Ports;
 pub use record::FileRecorder;
+pub use running_binary::RunningBinary;
 pub use swap::Swap;

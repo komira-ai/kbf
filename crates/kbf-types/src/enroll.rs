@@ -518,7 +518,8 @@ pub enum RefusalReason {
     BadRoles,
     /// A role the token does not grant.
     RoleNotGranted,
-    /// The node id is not the exact id or prefix the token allows.
+    /// The node id is not the exact id or prefix the token allows, or is `localhost` or a
+    /// name the frontend serves.
     NodeIdNotAllowed,
     /// The node id is already enrolled and the token cannot replace it.
     NodeIdInUse,

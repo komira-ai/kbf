@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,6 +24,7 @@ use kbf_all_in_one::LocalDataPlane;
 use kbf_daemon::cpu_pool::CpuPool;
 use kbf_driver_container::tree::{OutputLimits, collect};
 use kbf_proto::reapi::{ActionResult, Digest, Tree};
+use kbf_testkit::dir::TestDir;
 use kbf_transfer::{Cas, Record, Source, fetch};
 use kbf_types::LeaseId;
 use prost::Message as _;
@@ -32,14 +33,10 @@ use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
 /// Servers started by this binary so far: each directory is one server's alone.
 static STARTED: AtomicU64 = AtomicU64::new(0);
 
-/// A fresh, empty directory under Cargo's temporary directory for this target.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-all-in-one-one-read")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch directory");
-    dir
+/// A fresh, empty directory under Cargo's temporary directory for this target, removed
+/// when it drops.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("one-read-{name}"))
 }
 
 /// The plane over a server started in this runtime on the stores under `dir`, with a
@@ -179,7 +176,6 @@ async fn each_output_file_is_read_once(tier: bool) {
     let root = tree.root.expect("a root");
     assert_eq!(root.files.len(), 1, "{root:?}");
     assert_eq!(read(&lease, root.files[0].digest.as_ref()).await, nested);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches an output file read twice on the in-process plane (once by the walk that
@@ -231,7 +227,6 @@ async fn a_file_over_1_gib_is_read_once(tier: bool) {
     collected.expect("collect");
     let digest = result.output_files[0].digest.clone().expect("a digest");
     assert!(lease.missing(&[digest]).await.is_empty(), "not held");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches a file over 1 GiB not taken by the plane (read again, or refused): with a
@@ -269,5 +264,4 @@ async fn a_blob_over_5_gib_is_not_refused_for_its_size() {
     let why = why.to_string();
     assert!(why.contains("could not be read"), "{why}");
     assert!(!why.contains("largest blob"), "{why}");
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -70,8 +70,8 @@ pub struct Proc {
     pub quiesce_at: Option<Duration>,
     /// A resumed child reports `Active` from this time on (it holds the generation at once).
     pub active_at: Option<Duration>,
-    pub executions: Until,
-    pub queued: Until,
+    pub streams: Until,
+    pub sessions: Until,
 }
 
 pub struct State {
@@ -226,8 +226,8 @@ impl World {
             holder: false,
             quiesce_at: None,
             active_at: None,
-            executions: Until(0, None),
-            queued: Until(0, None),
+            streams: Until(0, None),
+            sessions: Until(0, None),
         });
         ProcIdent {
             pid,
@@ -298,18 +298,19 @@ impl World {
         self.st.borrow_mut().scripts.push_back(s);
     }
 
-    /// Make the serving child hold `n` open executions until `until` (since START).
+    /// Make the serving child report `n` open streams until `until` (since START).
     pub fn busy(&self, slot: Slot, n: u64, until: Option<Duration>) {
         let mut st = self.st.borrow_mut();
         for p in st.procs.iter_mut().filter(|p| p.slot == slot) {
-            p.executions = Until(n, until.map(|d| START + d));
+            p.streams = Until(n, until.map(|d| START + d));
         }
     }
 
-    pub fn queued(&self, slot: Slot, n: u64, until: Option<Duration>) {
+    /// The same for open worker sessions.
+    pub fn sessions(&self, slot: Slot, n: u64, until: Option<Duration>) {
         let mut st = self.st.borrow_mut();
         for p in st.procs.iter_mut().filter(|p| p.slot == slot) {
-            p.queued = Until(n, until.map(|d| START + d));
+            p.sessions = Until(n, until.map(|d| START + d));
         }
     }
 
@@ -655,8 +656,8 @@ impl ChildAdmin for World {
             return Err(PortError("admin port closed".into()));
         }
         self.with_slot(slot, |p, now| OpenCounts {
-            open_executions: p.executions.at(now),
-            queued_operations: p.queued.at(now),
+            open_streams: p.streams.at(now),
+            open_sessions: p.sessions.at(now),
         })
         .ok_or_else(|| gone(slot))
     }
