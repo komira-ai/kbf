@@ -66,6 +66,9 @@ fn fetch_failures_are_told_apart_and_carry_the_contract_word() {
         after: Duration::from_secs(3),
     };
     classed(Step::Pipe(slow), FetchError::Unavailable);
+    // A host that would run the child as root is a host set up wrong, not a bad release.
+    let root = PipeFault::Root { uid: 0, gid: 0 };
+    classed(Step::Pipe(root), FetchError::Unavailable);
 }
 
 /// What `refused` makes of `r`, against `want` given the refusal's own words.

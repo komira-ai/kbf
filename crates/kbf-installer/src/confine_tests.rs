@@ -83,6 +83,10 @@ impl Confiner for Played {
     fn keep_open(&self, fd: libc::c_int) -> io::Result<()> {
         self.call(format!("keep {fd}"))
     }
+
+    fn signal_others(&self, signal: libc::c_int) -> io::Result<()> {
+        self.call(format!("signal {signal}"))
+    }
 }
 
 const USER: RunAs = RunAs { uid: 7, gid: 8 };
@@ -103,6 +107,7 @@ fn full() -> Vec<String> {
         "groups".to_owned(),
         "gid 8".to_owned(),
         "uid 7".to_owned(),
+        format!("signal {}", libc::SIGKILL),
         limit(libc::RLIMIT_NPROC as libc::c_int, PROCESSES),
         "pdeathsig".to_owned(),
         "ppid".to_owned(),
@@ -127,11 +132,14 @@ fn start(
 /// Catches a confinement that is incomplete or in the wrong order: the lent descriptor kept,
 /// the limits that need root (file size, core, descriptors, address space) and
 /// `no_new_privs` set while still root, then the supplementary groups, group and user, then
-/// the process limit (it counts every process of the user it is set for) and the parent-death
-/// signal (a change of user clears it), then the check that the parent is still there.
+/// the kill of the user's other processes (what an earlier child left behind; it must be after
+/// the switch, or it would be root signalling every process on the host), then the process
+/// limit (it counts every process of the user it is set for) and the parent-death signal (a
+/// change of user clears it), then the check that the parent is still there.
 ///
 /// Mutants seen red: the parent-death signal set before the switch of user; any one call left
-/// out; `RLIMIT_NPROC` set before the switch.
+/// out; `RLIMIT_NPROC` set before the switch; the kill of the user's processes before the
+/// switch of user.
 #[test]
 fn the_confined_start_makes_every_call_in_its_order() {
     let sys = Played::new(None, 100);
@@ -140,20 +148,58 @@ fn the_confined_start_makes_every_call_in_its_order() {
 }
 
 /// Catches a process limit set for a program that was not switched to a user of its own (it
-/// counts the caller's processes, so the program could not start a thread), and a start that
-/// changes the user when told not to.
+/// counts the caller's processes, so the program could not start a thread), a start that
+/// changes the user when told not to, and a kill of "the user's other processes" when the
+/// program is still the caller's own user (it would kill the caller's session, or, from a root
+/// helper, every process on the host).
 ///
 /// Mutant seen red: `if switched` removed.
 #[test]
-fn without_a_user_there_is_no_switch_and_no_process_limit() {
+fn without_a_user_there_is_no_switch_no_process_limit_and_no_kill() {
     let sys = Played::new(None, 100);
     start(&sys, None, Some(Confine::FETCH), Some(9)).expect("starts");
     let want: Vec<String> = full()
         .into_iter()
-        .filter(|c| !["groups", "gid 8", "uid 7"].contains(&c.as_str()))
+        .filter(|c| !["groups", "gid 8", "uid 7", "signal 9"].contains(&c.as_str()))
         .filter(|c| *c != limit(libc::RLIMIT_NPROC as libc::c_int, PROCESSES))
         .collect();
     assert_eq!(sys.seen(), want);
+}
+
+/// The kill of a user's other processes is never made for root: a start that was switched to
+/// uid 0 (a caller that skipped the refusal of a root child) fails before the signal, because
+/// `kill(-1)` as root reaches every process on the host.
+///
+/// Catches the signal sent whoever the user is.
+///
+/// Mutant: the uid check in `after_switch` removed.
+#[test]
+fn the_kill_is_never_made_as_root() {
+    let sys = Played::new(None, 100);
+    let root = RunAs { uid: 0, gid: 8 };
+    let err = start(&sys, Some(root), Some(Confine::FETCH), Some(9)).expect_err("refused");
+    assert!(err.to_string().contains("root"), "{err}");
+    assert!(
+        !sys.seen().iter().any(|c| c.starts_with("signal")),
+        "{:?}",
+        sys.seen()
+    );
+}
+
+/// What `kill(-1, ..)` answering means: success is success; no other process, and only other
+/// users' processes (the usual answer on a host with nothing of the fetch user left), are
+/// "nothing to kill" and not failures; any other failure is one.
+///
+/// Catches the usual answer (`EPERM`) failing every fetch, and a real failure (a signal number
+/// the kernel refuses) passing for success.
+#[test]
+fn nothing_to_kill_is_not_a_failure_and_another_error_is() {
+    let errno = |n: i32| move || io::Error::from_raw_os_error(n);
+    assert!(signalled(0, || unreachable!("no failure")).is_ok());
+    assert!(signalled(-1, errno(libc::ESRCH)).is_ok());
+    assert!(signalled(-1, errno(libc::EPERM)).is_ok());
+    let got = signalled(-1, errno(libc::EINVAL));
+    assert_eq!(got.map_err(|e| e.raw_os_error()), Err(Some(libc::EINVAL)));
 }
 
 /// Catches an unconfined start that applies a limit or keeps a descriptor anyway.
@@ -238,6 +284,10 @@ fn the_real_calls_are_the_system_calls_they_name() {
     Libc.keep_open(held).expect("keeps it");
     // SAFETY: closing the descriptor made above.
     unsafe { libc::close(held) };
+    // Signal 0 is the permission check of `kill`: it reaches every process the caller could
+    // signal and sends none. (The real signal is only ever sent after a switch of user.)
+    Libc.signal_others(0).expect("the null signal");
+    assert!(Libc.signal_others(9999).is_err(), "no such signal");
     assert!(Libc.limit(9999, 0).is_err(), "no such resource");
     assert!(Libc.keep_open(-1).is_err(), "no such descriptor");
 }

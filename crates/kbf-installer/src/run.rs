@@ -294,8 +294,9 @@ fn before_exec(
 /// [`before_exec`] for a program that handles bytes nobody has vouched for: it also keeps the
 /// descriptor `keep` (the lent identity) open across the exec, and applies `confine` (limits,
 /// `no_new_privs`, the parent-death signal). The limits that need root are set before the
-/// switch of user and `RLIMIT_NPROC` and the parent-death signal after it (a change of user
-/// clears the signal, and the process limit counts every process of the user it is set for).
+/// switch of user; after it the user's other processes are killed (`Confine::after_switch`),
+/// then `RLIMIT_NPROC` and the parent-death signal are set (a change of user clears the
+/// signal, and the process limit counts every process of the user it is set for).
 pub(crate) fn before_exec_confined(
     user: Option<RunAs>,
     inherited: Inherited,
@@ -333,7 +334,7 @@ pub(crate) fn before_exec_with<S: Creds + Confiner + Send + Sync + 'static>(
             switch_user(&sys, user)?;
         }
         match confine {
-            Some(confine) => confine.after_switch(&sys, parent, user.is_some()),
+            Some(confine) => confine.after_switch(&sys, parent, user),
             None => Ok(()),
         }
     }
@@ -369,17 +370,31 @@ impl Confine {
         sys.no_new_privs()
     }
 
-    /// After the switch of user: at most [`PROCESSES`] processes (set only for a user the
-    /// program was switched to, who has none besides), and death with the parent on Linux.
-    /// `parent` is the pid of the process that started this one; if it is already gone the
-    /// start fails (the signal would never come).
+    /// After the switch of user (`switched`, the user it was switched to): every other process
+    /// of that user is killed, at most [`PROCESSES`] processes are allowed (both only for a
+    /// user the program was switched to, who has none besides), and the program dies with the
+    /// parent on Linux. `parent` is the pid of the process that started this one; if it is
+    /// already gone the start fails (the signal would never come).
+    ///
+    /// The kill is of what an earlier program of the user left behind: a descendant that
+    /// left its process group (`setsid`) outlives the group kill that ends a fetch, and once
+    /// this program has exec'd it is dumpable by the user's other processes, so such a
+    /// survivor could read what this one is lent. After the switch, so the signal is the
+    /// user's own and never root's (`kill(-1)` as root reaches every process on the host); a
+    /// switch to uid 0 is refused for that reason.
     fn after_switch(
         self,
         sys: &dyn Confiner,
         parent: libc::pid_t,
-        switched: bool,
+        switched: Option<RunAs>,
     ) -> io::Result<()> {
-        if switched {
+        if let Some(user) = switched {
+            if user.uid == 0 {
+                return Err(io::Error::other(
+                    "refusing to signal every process of root's: a confined program is never root",
+                ));
+            }
+            sys.signal_others(libc::SIGKILL)?;
             sys.limit(libc::RLIMIT_NPROC as libc::c_int, PROCESSES)?;
         }
         sys.die_with_parent()?;
@@ -408,6 +423,9 @@ pub trait Confiner {
     fn die_with_parent(&self) -> io::Result<()>;
     /// Keep `fd` open across exec.
     fn keep_open(&self, fd: libc::c_int) -> io::Result<()>;
+    /// Send `signal` to every other process this process may signal: after a switch of user,
+    /// the other processes of that user. None to signal is not an error.
+    fn signal_others(&self, signal: libc::c_int) -> io::Result<()>;
 }
 
 impl Confiner for Libc {
@@ -470,6 +488,28 @@ impl Confiner for Libc {
     fn keep_open(&self, fd: libc::c_int) -> io::Result<()> {
         // SAFETY: fcntl on a descriptor this process holds; this one stays open on exec.
         check(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) })
+    }
+
+    fn signal_others(&self, signal: libc::c_int) -> io::Result<()> {
+        // SAFETY: kill reads no memory; -1 names every process the caller may signal except
+        // init and (on Linux and macOS) the caller itself.
+        let rc = unsafe { libc::kill(-1, signal) };
+        signalled(rc, io::Error::last_os_error)
+    }
+}
+
+/// What the result `rc` of `kill(-1, ..)` says: `Ok` when it signalled something, and when
+/// there was nothing it may signal (`ESRCH`: no other process; `EPERM`: only other users'
+/// processes, which is the usual answer on a host where nothing of the fetch user is left).
+/// `last` is read only for a failure.
+pub(crate) fn signalled(rc: libc::c_int, last: impl FnOnce() -> io::Error) -> io::Result<()> {
+    if rc == 0 {
+        return Ok(());
+    }
+    let e = last();
+    match e.raw_os_error() {
+        Some(libc::ESRCH | libc::EPERM) => Ok(()),
+        _ => Err(e),
     }
 }
 

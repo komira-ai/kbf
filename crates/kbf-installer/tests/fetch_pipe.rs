@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use kbf_installer::fetch::identity::Identity;
 use kbf_installer::fetch::pipe::{Caps, ChildSpec, LOG_BYTES, PipeFault, Received, receive};
-use kbf_installer::run::Confine;
+use kbf_installer::run::{Confine, RunAs};
 use sha2::{Digest, Sha256};
 
 const STUB: &str = env!("CARGO_BIN_EXE_kbf-fetch-stub");
@@ -360,4 +360,30 @@ fn the_lent_descriptor_reaches_the_child_and_no_other_does() {
         .collect();
     // The stub closed the lent descriptor when it had read it; nothing else was there.
     assert_eq!(fds, ["0", "1", "2"], "{report}");
+}
+
+/// `receive` will not start a child as root, whatever its caller says: a spec that names root (or
+/// root's group) is refused as `Root` before any process exists, so the bytes of a source are
+/// never parsed by root.
+///
+/// Catches the pipe trusting its caller to have named the fetch user: the refusal is what keeps a
+/// root helper that built its `ChildSpec` badly (a failed user lookup turned into `None`, or a
+/// user table that says uid 0) from running the child as root with only the limits left.
+///
+/// Mutant: the `refuse_root` call removed from `receive` (the start then fails as a `Spawn`
+/// error, or, run as root, succeeds).
+#[test]
+fn a_child_named_as_root_is_not_started() {
+    let dir = scratch("root-child");
+    for (uid, gid) in [(0, 0), (0, 5), (5, 0)] {
+        let mut s = spec(&["emit:abc"]);
+        s.run_as = Some(RunAs { uid, gid });
+        let mut out = File::create(dir.join("download")).expect("file");
+        let got = receive(&s, &[], None, caps(3), &mut out);
+        assert!(
+            matches!(got, Err(PipeFault::Root { uid: u, gid: g }) if (u, g) == (uid, gid)),
+            "{uid}:{gid}: {got:?}"
+        );
+        assert_eq!(fs::read(dir.join("download")).expect("file"), b"");
+    }
 }

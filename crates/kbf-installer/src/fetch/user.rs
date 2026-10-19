@@ -72,7 +72,7 @@ fn lookup_with(name: &str, buffer_len: usize) -> Result<RunAs, UserFault> {
 
 /// Whether an account is root or in root's group: either is a way to read what only root
 /// should.
-fn runs_as_root(uid: u32, gid: u32) -> bool {
+pub(crate) fn runs_as_root(uid: u32, gid: u32) -> bool {
     uid == 0 || gid == 0
 }
 
