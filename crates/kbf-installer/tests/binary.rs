@@ -505,13 +505,28 @@ fn a_service_whose_file_was_replaced_says_so_and_ends_when_the_new_one_cannot_st
     fs::create_dir_all(&dir).expect("dir");
     let me = dir.join("kbf-installer");
     fs::copy(BIN, &me).expect("a copy of the program");
-    let child = Command::new(&me)
-        .arg("--root")
-        .arg(&root)
-        .args(["run", "--passes", "4", "--unit", "kbf.service"])
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("starts");
+    // Another test thread that forks while the copy is open for writing holds the write
+    // descriptor until its child execs, and the start meanwhile fails with ETXTBSY: try
+    // again for a moment rather than fail the test on that race.
+    let start = || {
+        Command::new(&me)
+            .arg("--root")
+            .arg(&root)
+            .args(["run", "--passes", "4", "--unit", "kbf.service"])
+            .stderr(Stdio::piped())
+            .spawn()
+    };
+    let mut child = start();
+    for _ in 0..100 {
+        match &child {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                child = start();
+            }
+            _ => break,
+        }
+    }
+    let child = child.expect("starts");
     let status_file = root.join("var/lib/kbf-installer/status.json");
     for _ in 0..400 {
         if status_file.exists() {
