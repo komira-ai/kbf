@@ -6,8 +6,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use kbf_testkit::forked::ForkedChild;
+
 use super::guard::{
-    canonical_db, filesystem_type, held, lock_failed, lock_path, network_filesystem,
+    canonical_db, filesystem_type, held, lock_failed, lock_path, network_filesystem, probe_lock,
     refuse_network_filesystem,
 };
 use super::read::changes_after_head;
@@ -155,6 +157,28 @@ fn a_probe_tells_a_held_lock_from_a_free_one_and_a_failure() {
     )
     .expect_err("failed");
     assert!(matches!(failed, SqliteError::Io(_)), "got {failed}");
+}
+
+// Catches a probe that keeps the lock it took until its file closes: a process forked by
+// another thread in that instant (here, held between fork and exec) carries a copy of the
+// probe's descriptor, and a store started meanwhile, in any process, is refused with
+// `Locked` until the child execs. The probe must let go as soon as it has its answer.
+// Mutant: the `Drop` of `LockFile` removed.
+#[test]
+fn a_probe_lets_go_of_the_lock_it_took_though_a_forked_child_has_a_copy() {
+    let dir = unit_dir("probe-forked");
+    let db = dir.join("state.db");
+    let lock = lock_path(&canonical_db(&db).expect("the file's name"));
+    fs::File::create(&lock).expect("the lock file");
+    let mut child = None;
+    let answer = probe_lock(&db, || child = Some(ForkedChild::before_exec()));
+    assert!(!answer.expect("probe"), "nobody holds the lock");
+    let other = fs::File::open(&lock).expect("open the lock file");
+    assert!(
+        other.try_lock().is_ok(),
+        "the probe's lock outlived its answer"
+    );
+    child.expect("the child was forked").finish();
 }
 
 // Catches a file's one name that is not its resolved path: a name without a file name
