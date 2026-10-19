@@ -17,6 +17,7 @@ pub mod footers;
 mod fs_store;
 pub mod listing;
 mod memory;
+mod released;
 pub mod s3;
 mod types;
 
@@ -27,11 +28,12 @@ use bytes::Bytes;
 
 pub use body::{BodyStream, gather};
 pub use fs_store::{
-    Floor, FsStore, FsStoreError, Released, Room, Scanned, ShardScan, SpaceSource, objects_source,
+    Floor, FsStore, FsStoreError, Room, Scanned, ShardScan, SpaceSource, objects_source,
     statvfs_source,
 };
 pub use kbf_threads::disk::Space;
 pub use memory::MemoryStore;
+pub use released::{Released, StillHeld};
 pub use types::{
     ByteRange, Capabilities, KeyError, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey,
     ObjectStoreError, PageSize,

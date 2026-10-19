@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use kbf_server::storage_half;
-use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
+use kbf_server::storage_node::{
+    COLD_RELEASE_DEADLINE, StorageFlags, command, parse, start_storage,
+};
 use kbf_storage::Storage as _;
 use kbf_storage::service::RemoteStorage;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -163,7 +165,7 @@ async fn first_life(d: &Path, hot: &str) {
     .await
     .expect("starts");
     let addr = first.addr;
-    let serving = tokio::spawn(first.serve());
+    let serving = tokio::spawn(first.serve_checked(COLD_RELEASE_DEADLINE));
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .expect("endpoint")
         .connect()
@@ -174,7 +176,10 @@ async fn first_life(d: &Path, hot: &str) {
         .await
         .expect("put");
     stop.send(()).expect("stop");
-    serving.await.expect("task").expect("serves to the end");
+    let (served, released) = serving.await.expect("task");
+    served.expect("serves to the end");
+    // The same bounded wait as the node's: a handle leaked fails here, it does not hang.
+    released.expect("the cold store is released within the deadline");
 }
 
 /// Catches a `/metrics` route that renders another cache than the node's, or a fresh one

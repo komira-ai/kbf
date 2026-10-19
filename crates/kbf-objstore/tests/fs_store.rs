@@ -3,8 +3,8 @@
 //! files that are not what it wrote and failing file system calls.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -204,7 +204,7 @@ async fn released_completes_when_the_last_handle_is_dropped_and_the_directory_is
         polled_rx.recv().expect("the waiter polled");
         drop(clone);
     });
-    let waiting = released.wait();
+    let waiting = released.wait_within(Duration::from_secs(60));
     tokio::pin!(waiting);
     // One poll that finds the handle still open: it is pending.
     assert!(
@@ -212,7 +212,7 @@ async fn released_completes_when_the_last_handle_is_dropped_and_the_directory_is
         "completed with a handle open"
     );
     polled_tx.send(()).expect("the dropper waits");
-    waiting.await;
+    waiting.await.expect("released");
     dropper.join().expect("dropper");
     FsStore::open(&dir, FLOOR).expect("the directory is free when the wait returns");
 }
@@ -224,7 +224,110 @@ async fn released_of_a_closed_store_returns_at_once() {
     let store = FsStore::open(&dir, FLOOR).expect("open");
     let released = store.released();
     drop(store);
-    released.wait().await;
+    released.wait_within(Duration::ZERO).await.expect("closed");
+}
+
+/// Catches a wait that outlives its limit when a clone is leaked (a hang in a stop that
+/// must end), and one that reports the wrong count: the limit passes in virtual time, to
+/// the instant, and the error names the directory and the two live handles.
+#[tokio::test(start_paused = true)]
+async fn released_with_a_leaked_clone_ends_at_the_limit_and_counts_the_handles() {
+    let dir = scratch("released-leaked");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let leaked = store.clone();
+    let released = store.released();
+    let limit = Duration::from_secs(10);
+    let start = tokio::time::Instant::now();
+    let held = released.wait_within(limit).await.expect_err("still held");
+    assert_eq!(start.elapsed(), limit);
+    assert_eq!((held.clones, &held.dir, held.limit), (2, &dir, limit));
+    assert!(held.to_string().contains("2 live handle"), "{held}");
+    drop((store, leaked));
+}
+
+/// Catches a store that tells its watchers the directory is free while it is still
+/// locked, on every run: a hook on the dropping thread, just before the unlock, polls the
+/// wait registered earlier, starts a fresh wait and tries the directory. Both waits must be
+/// pending and the directory must still refuse a second open; after the drop the first
+/// wait is over and the open works. Mutants: `Inner::drop` sets the flag before the unlock
+/// (the fresh wait sees it), opens and wakes before it (both see it), or wakes before the
+/// unlock and sets the flag after (the registered wait looks, sleeps again and is never
+/// woken: it ends at its limit).
+#[test]
+fn the_wait_is_pending_and_the_directory_refused_until_the_unlock() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::Context;
+
+    type Wait = Pin<Box<dyn Future<Output = Result<(), kbf_objstore::StillHeld>> + Send>>;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let _entered = runtime.enter();
+    let dir = scratch("released-hook");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let released = store.released();
+    let wait: Arc<Mutex<Option<Wait>>> = Arc::new(Mutex::new(None));
+    let seen: Arc<Mutex<Vec<(bool, bool, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let fresh = Arc::new(Mutex::new(Some(store.released())));
+    {
+        let (wait, seen, dir, fresh) = (
+            Arc::clone(&wait),
+            Arc::clone(&seen),
+            dir.clone(),
+            Arc::clone(&fresh),
+        );
+        released.before_unlock(move || {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut guard = wait.lock().expect("wait");
+            let pending = guard
+                .as_mut()
+                .expect("armed")
+                .as_mut()
+                .poll(&mut cx)
+                .is_pending();
+            let mut again = Box::pin(
+                fresh
+                    .lock()
+                    .expect("fresh")
+                    .take()
+                    .expect("once")
+                    .wait_within(Duration::from_secs(30)),
+            );
+            let fresh_pending = again.as_mut().poll(&mut cx).is_pending();
+            let refused = FsStore::open(&dir, FLOOR).is_err();
+            seen.lock()
+                .expect("seen")
+                .push((pending, fresh_pending, refused));
+        });
+    }
+    *wait.lock().expect("wait") = Some(Box::pin(released.wait_within(Duration::from_secs(30))));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(
+        wait.lock()
+            .expect("wait")
+            .as_mut()
+            .expect("armed")
+            .as_mut()
+            .poll(&mut cx)
+            .is_pending(),
+        "pending while the store is open"
+    );
+    drop(store);
+    assert_eq!(*seen.lock().expect("seen"), vec![(true, true, true)]);
+    let done = wait
+        .lock()
+        .expect("wait")
+        .as_mut()
+        .expect("armed")
+        .as_mut()
+        .poll(&mut cx);
+    assert!(
+        matches!(done, std::task::Poll::Ready(Ok(()))),
+        "released after the unlock"
+    );
+    FsStore::open(&dir, FLOOR).expect("the directory is free");
 }
 
 /// Catches two stores sharing one directory: the second would empty `tmp/` under the

@@ -55,7 +55,7 @@ use kbf_front::{Cache, CacheStorage, MetaLog as _, ObjectKeys, RebuildConfig, Se
 use kbf_log::{FarmLogId, MachineVersion};
 use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
-use kbf_objstore::{KeyPrefix, ObjectStore};
+use kbf_objstore::{KeyPrefix, ObjectStore, StillHeld};
 use kbf_storage::repair::{RepairConfig, Repairs};
 use kbf_storage::service::CatchUp;
 use kbf_store::StdFs;
@@ -399,6 +399,12 @@ impl StorageFlags {
     }
 }
 
+/// How long [`StorageHandle::serve`] waits for the cold store's lock after serving ends.
+/// A stop that works finishes it in milliseconds (the abort of the cache's tasks and the
+/// end of its writer threads); ten seconds is far past that and short of any supervisor's
+/// patience. Past it the lock is left to the process's exit.
+pub const COLD_RELEASE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// A started storage node: bound, its write tier attached and its flusher (and any
 /// start-up pass) running, not yet serving.
 pub struct StorageHandle {
@@ -452,16 +458,46 @@ impl StorageHandle {
     }
 
     /// Serves until the shutdown future given to [`start_storage`] completes and the
-    /// calls in flight end. With a `file://` cold store it returns once the store's
-    /// lock is released too: the node's tasks are aborted, and the cache they and the
-    /// service held is closed (its own background tasks and writer threads end after
-    /// it is dropped, not before), so a start over the same directories can follow at
-    /// once. It waits for that without a clock; a task that never lets go of the cache
-    /// would hold it here.
+    /// calls in flight end. With a `file://` cold store it then waits for the store's
+    /// lock to be released, so a start over the same directories can follow at once: the
+    /// node's tasks are aborted and the cache they and the service held is closed, but
+    /// its own background tasks and writer threads end after it is dropped, not before.
+    /// The wait is bounded by [`COLD_RELEASE_DEADLINE`]; past it this logs one warning
+    /// (the store's directory and how many handles are alive) and returns, because the
+    /// process's exit releases the lock whatever still holds it, and the units run this
+    /// with `TimeoutStopSec=infinity`, where a wait with no end would be a stop with none.
+    ///
+    /// The other serve paths (`storage_half::serve`, `start::serve`) wait for nothing: the
+    /// process exits when they return, and its exit frees the lock.
+    ///
+    /// The tasks that hold handles on the cold store, to look at when the warning shows:
+    /// the cache's touch flusher (`kbf-front`, `cache/touches.rs`) and its write-pool
+    /// threads (`cache/pool.rs`).
     ///
     /// # Errors
     /// The listener fails while serving.
     pub async fn serve(self) -> Result<(), ServeError> {
+        let (served, released) = self.serve_checked(COLD_RELEASE_DEADLINE).await;
+        if let Err(held) = released {
+            tracing::warn!(
+                dir = %held.dir.display(),
+                clones = held.clones,
+                limit = ?held.limit,
+                "the cold store is still open after serving ended; its lock is released when the process exits"
+            );
+        }
+        served
+    }
+
+    /// [`StorageHandle::serve`] without the warning, saying whether the cold store was
+    /// released within `limit` (on the runtime's clock): what the tests call, so a
+    /// handle leaked by the node fails a test instead of hanging it or passing unseen.
+    /// The result of serving comes first.
+    #[doc(hidden)]
+    pub async fn serve_checked(
+        self,
+        limit: Duration,
+    ) -> (Result<(), ServeError>, Result<(), StillHeld>) {
         let Self {
             addr: _,
             metrics: _,
@@ -489,10 +525,11 @@ impl StorageHandle {
             _repair,
             _metrics,
         ));
-        if let Some(released) = cold_released {
-            released.wait().await;
-        }
-        served
+        let released = match cold_released {
+            Some(released) => released.wait_within(limit).await,
+            None => Ok(()),
+        };
+        (served, released)
     }
 }
 
@@ -800,3 +837,7 @@ mod tests;
 #[cfg(test)]
 #[path = "storage_rebuild_tests.rs"]
 mod rebuild_tests;
+
+#[cfg(test)]
+#[path = "storage_release_tests.rs"]
+mod release_tests;
