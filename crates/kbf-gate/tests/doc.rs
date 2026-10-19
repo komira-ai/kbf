@@ -64,6 +64,10 @@ fn full() -> ResultDoc {
             88_400,
         ),
     ];
+    d.tag = Some("v0.1.0".to_owned());
+    d.not_reversible = vec!["raises the node log version".to_owned()];
+    d.escapes = vec!["handover with a build in flight".to_owned()];
+    d.withdrawn = vec!["v0.0.9".to_owned()];
     d
 }
 
@@ -96,6 +100,10 @@ fn the_fields_the_later_stages_need_are_in_the_document() {
         "\"set_hash\"",
         "\"run_id\"",
         "\"attempt\"",
+        "\"tag\"",
+        "\"not_reversible\"",
+        "\"escapes\"",
+        "\"withdrawn\"",
     ] {
         assert!(text.contains(key), "{key} is missing:\n{text}");
     }

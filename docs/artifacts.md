@@ -323,6 +323,15 @@ release already holds must be one of the verified files, byte for byte, or the r
 fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
 publish`).
 
+Two further verbs read the annotated `v*` tag, whose message is the gamma verdict
+(`docs/design/kbf-cicd.md`, section 8.1; `release.yml` does not run them yet).
+`cargo xtask release verdict` refuses a lightweight tag, a commit not on main, a message
+that is not a green gamma verdict, a verdict that names another commit, tag or set (the
+set hash is the SHA-256 of `SHA256SUMS`, `kbf_gate::SetHash::of_sums`), a bake under 24
+hours, and a thin bake without a recorded `min-load` waiver; it prints `set-hash=<hex>`.
+`cargo xtask release notes` runs the same checks and writes the notes. `release publish`
+takes that hash as `--set-hash` and publishes nothing when the files are another set.
+
 The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA. Only
 `verify` runs then: every check above, and nothing is published. On every pull request
 into `main`, CI asks GitHub the same on-`main` question for the pull request's base
