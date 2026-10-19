@@ -47,6 +47,11 @@ struct Fake {
     denied: Vec<String>,
     /// Whether [`Fake::late`] comes back after each move: a cgroup that never empties.
     respawn: bool,
+    /// An exiting thread: the cgroup stays populated while `cgroup.procs` lists nothing
+    /// (the kernel skips a task that has begun exit when it moves a process, and the
+    /// task leaves its cgroup only at the end of exit). Enabling controllers in the
+    /// cgroup is EBUSY this many more times, then works.
+    exiting: RefCell<Option<(String, u32)>>,
 }
 
 fn parent(cgroup: &str) -> &str {
@@ -216,7 +221,14 @@ impl CgroupFs for Fake {
                         .procs
                         .push(pid);
                 }
-                if cgroup != "/" && !self.procs(cgroup).is_empty() {
+                let exiting = match self.exiting.borrow_mut().as_mut() {
+                    Some((at, left)) if at == cgroup && *left > 0 => {
+                        *left -= 1;
+                        true
+                    }
+                    _ => false,
+                };
+                if exiting || (cgroup != "/" && !self.procs(cgroup).is_empty()) {
                     return Err(errno(rustix::io::Errno::BUSY));
                 }
                 let offered = self.controllers(cgroup);
@@ -495,6 +507,19 @@ fn hosts_and_units_that_cannot_delegate_are_refused_with_the_fix() {
         err.contains("may not write its cgroup") && err.contains("User="),
         "{err}"
     );
+}
+
+/// Catches the set-up giving up on a cgroup that is still populated by a thread that
+/// has begun to exit: `cgroup.procs` lists nothing, the kernel answers EBUSY until the
+/// thread has left, and that takes longer than a fixed number of immediate tries (a
+/// test binary's second test thread ends as the daemon's set-up starts).
+#[test]
+fn a_cgroup_held_by_an_exiting_thread_is_waited_for() {
+    let fake = Fake::host(UNIT, "cpu memory pids", &[41]);
+    *fake.exiting.borrow_mut() = Some((UNIT.into(), 25));
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    assert_eq!(fake.procs(UNIT), Vec::<u32>::new());
+    assert!(!fake.enabled(UNIT).is_empty(), "{:?}", fake.log());
 }
 
 /// Catches a failed move or enable read as done (leases would then fail making their
