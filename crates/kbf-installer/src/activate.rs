@@ -210,7 +210,8 @@ pub fn activate<E: Exec>(
 /// Make `commit`, installed and verified, the release that runs on a host that has none:
 /// `setup`'s first release. There is no trial (nothing to go back to) and no confirm. The
 /// state is written first and the links follow, as in [`activate`]; a repeat for the same
-/// commit only makes the links agree.
+/// commit only makes the links agree. A `staged` that names the commit is cleared, as in
+/// [`activate`]: a release that is current is not waiting for a decision.
 pub fn first<E: Exec>(
     exec: &mut E,
     host: &Layout,
@@ -228,8 +229,10 @@ pub fn first<E: Exec>(
     if !has_binary(exec, host, commit) {
         return Err(ReleaseError::NotInstalled(commit.clone()));
     }
+    // As in `activate`: a release that is current is not staged.
     let next = State {
         current: Some(commit.clone()),
+        staged: state.staged.filter(|c| c != commit),
         ..state
     };
     lock.write(&next)?;

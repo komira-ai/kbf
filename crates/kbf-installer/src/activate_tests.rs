@@ -840,3 +840,28 @@ fn a_first_release_never_replaces_one_and_must_be_installed() {
     );
     assert!(state::read_unlocked(&layout).expect("read").is_none());
 }
+
+/// Catches a first release that stays staged once it is current, as an `activate` of a staged
+/// release does not: a `staged` that names the first release (the operator staged it before
+/// setup made it current) is cleared, and a `staged` that names another release stays (it
+/// is another decision's).
+///
+/// Mutants to plant: `staged` carried over unchanged; `staged` cleared whatever it names.
+#[test]
+fn a_first_release_that_was_staged_is_current_and_no_longer_staged() {
+    for (staged, want) in [(A, None), (B, Some(c(B)))] {
+        let (mut exec, layout) = host(&format!("first-staged-{staged}"));
+        seed(&exec, A, 1_000);
+        Locked::acquire(&layout)
+            .expect("lock")
+            .write(&State {
+                staged: Some(c(staged)),
+                ..State::default()
+            })
+            .expect("state");
+        first(&mut exec, &layout, &c(A), &mut Vec::new()).expect("first");
+        let state = state_of(&layout);
+        assert_eq!(state.current, Some(c(A)), "{staged}");
+        assert_eq!(state.staged, want, "{staged}");
+    }
+}

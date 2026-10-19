@@ -247,9 +247,11 @@ fn switch<E: Exec>(
     // The state is the truth and goes first: a crash before the links move leaves a state the
     // next run's reconcile carries out, never links the state does not know (S23).
     if let Some(lock) = &lock {
+        // A release that is current is not staged (as `activate` and `first` keep it).
         let next = State {
             current: Some(current.clone()),
             previous: previous.clone(),
+            staged: was.staged.clone().filter(|c| *c != current),
             ..was.clone()
         };
         lock.write(&next)?;

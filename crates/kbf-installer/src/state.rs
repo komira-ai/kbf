@@ -49,7 +49,11 @@ pub struct State {
     /// The release `previous` should point to: what a rollback goes back to. Only ever a
     /// confirmed release.
     pub previous: Option<CommitId>,
-    /// A release verified and ready to swap in.
+    /// The one release installed and waiting for a decision: a frontend update staged by the
+    /// proxy's order (until its confirm makes it current or its revert drops it) or by the
+    /// operator's `stage`. `activate`, `first`, the frontend's confirm and the operator's
+    /// `install` clear it when they make that release current. The verify pipeline does not
+    /// write it; whoever keeps a verified release does.
     pub staged: Option<CommitId>,
     /// A release swapped in and not yet confirmed.
     pub pending_confirm: Option<PendingConfirm>,
