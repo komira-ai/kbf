@@ -5,8 +5,13 @@
 mod bypass;
 mod fenced;
 mod flood;
+mod frames;
+mod h1;
 mod hold;
 mod keepalive;
 mod kit;
 mod lifetime;
+pub(crate) mod pki;
+mod reload;
 mod routing;
+mod secure;

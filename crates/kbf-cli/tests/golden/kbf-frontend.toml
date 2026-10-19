@@ -11,6 +11,10 @@
 # cpu-threads = "N"
 
 [handover]
+# Serve the admin calls (GET role, POST quiesce, resume, takeover, stand-down) on this loopback address. Anything that is not a loopback address is refused at start: the calls move the scheduler's role and carry no credential. Needs --state-store.
+# admin-listen = "ADDR"
+# Open the state store without taking its generation, bump no epoch and run no scheduler, reconciler or worker listener: serve /readyz, the health service and GetCapabilities until `POST takeover` makes this process the writer. Needs --admin-listen. A SQLite state file is held by one process (an exclusive lock), so a candidate cannot run beside the process that holds it: side by side needs the Postgres store.
+await-takeover = false
 # The time between two of Envoy's health checks of a frontend (the cluster's `interval`).
 envoy-check-interval-ms = 1000
 # How long Envoy's health check waits for an answer (the cluster's `timeout`).
@@ -81,7 +85,7 @@ heartbeat-interval-ms = 5000
 progress-interval-secs = 30
 # How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready
 readyz-store-timeout-ms = 2000
-# Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `sqlite:///absolute/path`, a file on a local disk that this process owns. Every start is a new epoch, so daemons kill the runs of the leases they held before. The file is created, with its directory, if missing (0600, and 0700 for a directory it makes) and held by one process: a second frontend on it refuses to start. Any other value, `postgres://` included, is refused (Postgres is not wired yet). Left out, the scheduler's state is in memory and a restart loses it
+# Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a URL with a password is refused, as the command line is world-readable). The server must flush commits before it acknowledges them (`synchronous_commit` on) or the start is refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing: 0600, and 0700 for a directory it makes; a second frontend on it refuses to start). Every start is a new epoch, so daemons kill the runs of the leases they held before. Left out, the scheduler's state is in memory and a restart loses it
 # state-store = "URI"
 # How long, in seconds, queued work waits while no connected daemon can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can
 unservable-wait-secs = 300
@@ -101,6 +105,10 @@ unservable-wait-secs = 300
 member-dwell-secs = 300
 # How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
 member-ttl-secs = 15
+
+[stores]
+# Turns on the object-store registration routes of the operator API (/v1/object-stores, docs/api.md) and names the directory where the secret key of each registered connection is kept, one file of mode 0600 each, in a directory made 0700. The directory must be readable by every frontend child that serves at once and left out of any backup of the host. The registration itself (endpoints, buckets, the audit log) is kept in the state store. Without it those routes answer 404.
+# object-store-secrets-dir = "DIR"
 
 [tls]
 # A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the daemon's, whose builds could read it. Without it, writes are refused

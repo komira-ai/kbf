@@ -91,7 +91,6 @@ fn listeners(worker_tls: Option<WorkerTls>) -> Listeners {
         worker: loopback,
         reapi_tls: None,
         worker_tls,
-        proxy: None,
         heartbeat_interval: Duration::from_secs(5),
         hello_wait: Duration::from_secs(10),
         tick: Duration::from_millis(50),
@@ -1095,6 +1094,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
             boot: 1,
             heartbeat_interval_ms: 1,
             map: Some(self.map()),
+            ..Default::default()
         }))
     }
 
@@ -1105,6 +1105,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
         Ok(tonic::Response::new(pb::HeartbeatResponse {
             map_generation: 9,
             map: Some(self.map()),
+            ..Default::default()
         }))
     }
 }
@@ -1354,10 +1355,7 @@ async fn a_write_through_the_halfs_in_process_view_is_judged_by_the_map_and_owes
     .await;
 
     // The partner: a member whose address nothing listens on.
-    let gone = {
-        let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        socket.local_addr().expect("address")
-    };
+    let gone = kbf_testkit::port::dead_addr();
     let member = |id, addr: SocketAddr| kbf_map::Member {
         id: MemberId(id),
         addr: addr.to_string(),
@@ -1580,6 +1578,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for SharedHourly {
             boot: 1,
             heartbeat_interval_ms: 3_600_000,
             map: Some(a_map(1)),
+            ..Default::default()
         }))
     }
 
@@ -1594,6 +1593,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for SharedHourly {
         Ok(tonic::Response::new(pb::HeartbeatResponse {
             map_generation: 2,
             map: behind.then(|| a_map(2)),
+            ..Default::default()
         }))
     }
 }
@@ -1678,6 +1678,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for FlakyService {
             boot: 1,
             heartbeat_interval_ms: 1,
             map: None,
+            ..Default::default()
         }))
     }
 
@@ -1692,6 +1693,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for FlakyService {
         Ok(tonic::Response::new(pb::HeartbeatResponse {
             map_generation: 1,
             map: None,
+            ..Default::default()
         }))
     }
 }

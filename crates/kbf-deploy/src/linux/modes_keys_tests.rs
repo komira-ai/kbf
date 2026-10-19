@@ -395,9 +395,7 @@ fn on_the_node_a_copy_of_the_key_beside_the_allowed_file_is_refused() {
         );
     let slice = UnitText::new(
         SLICE,
-        crate::linux::render::render(&c, Some(1500), &crate::linux::render::Templates::BUILT_IN)
-            .expect("renders")
-            .slice,
+        crate::linux::shared::render_slice(&c, Some(1500)).expect("renders"),
     );
     let mut exec = FakeExec::new(0);
     let file = |bits: u32, uid: u32, text: &str| Entry::File {

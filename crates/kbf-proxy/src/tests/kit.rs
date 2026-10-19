@@ -18,18 +18,51 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::auth::{Buck2Auth, Token, Tokens};
 use crate::config::{Limits, UpstreamTable};
 use crate::control::{NoUpdates, UpdateHandler};
 use crate::core::Core;
+use crate::identity::Identity;
+use crate::identity::ProxySecret;
 use crate::pool::{BoxIo, Connector, upstream_addr};
 use crate::route::Target;
+use crate::security::Security;
 use crate::serve::{Listen, serve};
 use crate::slot::{ActiveSlot, Slot};
+use crate::tls::{Acceptor, TlsPaths, TlsReloader};
 
 pub(super) const EXECUTE: &str = "/build.bazel.remote.execution.v2.Execution/Execute";
 pub(super) const CAPS: &str = "/build.bazel.remote.execution.v2.Capabilities/GetCapabilities";
 pub(super) const WRITE: &str = "/google.bytestream.ByteStream/Write";
 pub(super) const OPERATOR: &str = "/v1/status";
+/// The operator token of every test rig; the clients send it unless a test says otherwise.
+pub(super) const OPERATOR_TOKEN: &str = "operator-token-0123456789-abcdefghijkl";
+/// The Buck2 key of a rig in `bearer` mode.
+pub(super) const BUCK2_TOKEN: &str = "buck2-api-key-0123456789-abcdefghijklmn";
+/// The secret every rig tells its children.
+pub(super) const SECRET: [u8; 32] = [0x5a; 32];
+
+/// How a rig's listener accepts connections.
+pub(super) enum Access {
+    /// HTTP/2 in the clear; every connection's peer is `identity` (a verified certificate's,
+    /// as the test wants it).
+    Plain(Option<Identity>),
+    /// The TLS terminator over these files.
+    Tls(TlsPaths),
+}
+
+/// What a rig authenticates with, in `mode`.
+pub(super) fn security(mode: Buck2Auth) -> Security {
+    let tokens = Tokens {
+        buck2: Some(Token::new(BUCK2_TOKEN.as_bytes())),
+        operator: Some(Token::new(OPERATOR_TOKEN.as_bytes())),
+    };
+    Security::new(
+        mode,
+        tokens,
+        ProxySecret::from_slice(&SECRET).expect("32 bytes"),
+    )
+}
 
 /// What a fake child is asked to do with one stream.
 pub(super) struct Call {
@@ -69,6 +102,10 @@ pub(super) struct ChildState {
     pub raw_pongs_first: Mutex<Option<usize>>,
     /// PINGs received by hand-served connections, answered or not.
     pub pings: AtomicUsize,
+    /// Set: the next connection (after a `raw_goaway_first` one) is served by hand and only
+    /// records the frames of each stream, in `frames`; it never answers.
+    pub raw_record: AtomicBool,
+    pub frames: Mutex<Vec<Seen>>,
     pub dispatches: AtomicUsize,
     pub conns_open: AtomicUsize,
     pub conns_total: AtomicUsize,
@@ -92,6 +129,40 @@ impl ChildState {
             .filter(|(p, _)| p == path)
             .map(|(_, h)| h.clone())
             .collect()
+    }
+}
+
+/// One request frame as the recording child saw it on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Seen {
+    pub stream: u32,
+    pub kind: u8,
+    pub flags: u8,
+    pub len: usize,
+}
+
+pub(super) const DATA: u8 = 0;
+pub(super) const HEADERS: u8 = 1;
+pub(super) const END_STREAM: u8 = 1;
+
+impl Seen {
+    pub(super) const fn ends(&self) -> bool {
+        self.flags & END_STREAM != 0
+    }
+}
+
+impl ChildState {
+    /// The DATA and HEADERS frames the recording child saw, in order.
+    pub(super) fn recorded(&self) -> Vec<Seen> {
+        self.frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the recording child has seen a stream end.
+    pub(super) fn recorded_end(&self) -> bool {
+        self.recorded().iter().any(Seen::ends)
     }
 }
 
@@ -450,6 +521,45 @@ async fn raw_frames(
     }
 }
 
+/// Speaks just enough h2 to take SETTINGS and PINGs, and records every DATA and HEADERS
+/// frame. It never answers a stream.
+async fn raw_record(mut io: impl AsyncRead + AsyncWrite + Unpin + Send, state: &ChildState) {
+    let _ = record_frames(&mut io, state).await;
+}
+
+async fn record_frames(
+    io: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
+    state: &ChildState,
+) -> io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    io.read_exact(&mut [0_u8; 24]).await?;
+    io.write_all(&frame(4, 0, &[])).await?;
+    loop {
+        let mut head = [0_u8; 9];
+        io.read_exact(&mut head).await?;
+        let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let mut payload = vec![0_u8; len];
+        io.read_exact(&mut payload).await?;
+        match (head[3], head[4] & 1) {
+            (4, 0) => io.write_all(&frame(4, 1, &[])).await?,
+            (6, 0) => io.write_all(&frame(6, 1, &payload)).await?,
+            (kind @ (DATA | HEADERS), _) => {
+                state
+                    .frames
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(Seen {
+                        stream: u32::from_be_bytes([head[5], head[6], head[7], head[8]]),
+                        kind,
+                        flags: head[4],
+                        len,
+                    });
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn connection(
     io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     state: Arc<ChildState>,
@@ -460,6 +570,9 @@ async fn connection(
     }
     if state.raw_garbage_first.swap(false, Ordering::AcqRel) {
         return raw_child(io, frame(0, 0, &[1, 2, 3]), usize::MAX, &state.pings).await;
+    }
+    if state.raw_record.swap(false, Ordering::AcqRel) {
+        return raw_record(io, &state).await;
     }
     let pongs = state
         .raw_pongs_first
@@ -608,7 +721,7 @@ pub(super) async fn finish(response: ResponseFuture) -> Reply {
 
 /// Big windows, as a real gRPC client has: with h2's defaults, a few hundred small unread
 /// responses exhaust the client's own data-frame budget and the client closes the connection.
-fn client_builder() -> h2::client::Builder {
+pub(super) fn client_builder() -> h2::client::Builder {
     let mut builder = h2::client::Builder::new();
     builder
         .initial_window_size(4 << 20)
@@ -620,6 +733,8 @@ fn client_builder() -> h2::client::Builder {
 pub(super) struct Client {
     pub send: SendRequest<Bytes>,
     pub driver: JoinHandle<Result<(), h2::Error>>,
+    /// Sent as `Authorization: Bearer` on every request; the operator token by default.
+    pub bearer: Option<String>,
 }
 
 impl Client {
@@ -634,22 +749,32 @@ impl Client {
             .handshake(near)
             .await
             .expect("h2 handshake");
+        Self::new(send, tokio::spawn(connection))
+    }
+
+    pub(super) fn new(send: SendRequest<Bytes>, driver: JoinHandle<Result<(), h2::Error>>) -> Self {
         Self {
             send,
-            driver: tokio::spawn(connection),
+            driver,
+            bearer: Some(OPERATOR_TOKEN.to_owned()),
         }
     }
 
-    /// A connection to a proxy on a real socket.
-    pub(super) async fn connect_tcp(addr: SocketAddr) -> Self {
+    /// A TLS connection to a proxy on a real socket.
+    pub(super) async fn connect_tcp_tls(
+        addr: SocketAddr,
+        config: Arc<rustls::ClientConfig>,
+    ) -> Self {
         let tcp = tokio::net::TcpStream::connect(addr)
             .await
             .expect("connect to the proxy");
-        let (send, connection) = client_builder().handshake(tcp).await.expect("h2 handshake");
-        Self {
-            send,
-            driver: tokio::spawn(connection),
-        }
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
+        let tls = tokio_rustls::TlsConnector::from(config)
+            .connect(name, tcp)
+            .await
+            .expect("the handshake");
+        let (send, connection) = client_builder().handshake(tls).await.expect("h2 handshake");
+        Self::new(send, tokio::spawn(connection))
     }
 
     /// Starts a gRPC request; `end` sends it as headers only.
@@ -671,6 +796,9 @@ impl Client {
             .method("POST")
             .uri(format!("http://frontend.test{path}"))
             .header("content-type", "application/grpc");
+        if let Some(bearer) = &self.bearer {
+            builder = builder.header("authorization", format!("Bearer {bearer}"));
+        }
         for (name, value) in extra {
             builder = builder.header(*name, *value);
         }
@@ -681,11 +809,13 @@ impl Client {
 
     /// A plain HTTP request (no gRPC content type).
     pub(super) async fn plain(&mut self, method: &str, path: &str, body: &'static [u8]) -> Reply {
-        let request = Request::builder()
+        let mut builder = Request::builder()
             .method(method)
-            .uri(format!("http://frontend.test{path}"))
-            .body(())
-            .expect("a request");
+            .uri(format!("http://frontend.test{path}"));
+        if let Some(bearer) = &self.bearer {
+            builder = builder.header("authorization", format!("Bearer {bearer}"));
+        }
+        let request = builder.body(()).expect("a request");
         let mut send = self.send.clone().ready().await.expect("capacity");
         let (response, mut stream) = send
             .send_request(request, body.is_empty())
@@ -716,7 +846,12 @@ pub(super) fn addr_of(table: UpstreamTable, slot: Slot, target: Target) -> Socke
     upstream_addr(table, slot, target)
 }
 
-const TARGETS: [Target; 3] = [Target::Reapi, Target::Worker, Target::Operator];
+const TARGETS: [Target; 4] = [
+    Target::Reapi,
+    Target::Worker,
+    Target::Operator,
+    Target::Enroll,
+];
 
 /// The address the tests give the proxy's clients.
 pub(super) const CLIENT_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
@@ -728,6 +863,8 @@ pub(super) struct Rig {
     pub a: Child,
     pub b: Child,
     pub table: UpstreamTable,
+    /// The TLS reloader of a rig built with [`Access::Tls`].
+    pub tls: Option<Arc<TlsReloader>>,
     feed: mpsc::UnboundedSender<(DuplexStream, IpAddr)>,
     stop: watch::Sender<bool>,
     pub serving: JoinHandle<()>,
@@ -756,6 +893,16 @@ impl Rig {
         Self::start_with(a, b, NoUpdates, Limits::default()).await
     }
 
+    /// Two tagging children behind a proxy with A active, under `mode` and `access`.
+    pub(super) async fn start_secure(mode: Buck2Auth, access: Access) -> Self {
+        let slots = ActiveSlot::new();
+        slots.open(Slot::A);
+        slots.set_active(Slot::A).expect("A is open");
+        let (a, b) = (tagged("a"), tagged("b"));
+        let (updates, limits) = (NoUpdates, Limits::default());
+        Self::build_with(a, b, updates, limits, slots, security(mode), access).await
+    }
+
     pub(super) async fn start_with<U: UpdateHandler + 'static>(
         a: Script,
         b: Script,
@@ -776,15 +923,39 @@ impl Rig {
         limits: Limits,
         slots: ActiveSlot,
     ) -> Self {
+        let security = security(Buck2Auth::None);
+        Self::build_with(a, b, updates, limits, slots, security, Access::Plain(None)).await
+    }
+
+    /// A rig with its own authentication and its own way of accepting connections.
+    pub(super) async fn build_with<U: UpdateHandler + 'static>(
+        a: Script,
+        b: Script,
+        updates: U,
+        limits: Limits,
+        slots: ActiveSlot,
+        security: Security,
+        access: Access,
+    ) -> Self {
         let table = UpstreamTable { base_port: 18_000 };
         let net = Arc::new(MemNet::default());
-        let core = Core::new(table, limits, slots, net.connector());
+        let core = Core::new(table, limits, slots, net.connector(), security);
+        let (tls, acceptor) = match access {
+            Access::Plain(identity) => (None, Acceptor::Plain(identity)),
+            Access::Tls(paths) => {
+                let reloader =
+                    TlsReloader::load(paths, Arc::clone(&core.metrics)).expect("TLS files");
+                let reloader = Arc::new(reloader);
+                (Some(Arc::clone(&reloader)), Acceptor::Tls(reloader))
+            }
+        };
         let (feed, incoming) = mpsc::unbounded_channel();
         let (stop, stopped) = watch::channel(false);
         let serving = tokio::spawn(serve(
             Arc::clone(&core),
             updates,
             MemListen { rx: incoming },
+            acceptor,
             stopped,
         ));
         let child = |slot, script: &Script| {
@@ -800,6 +971,7 @@ impl Rig {
             b: child(Slot::B, &b),
             net,
             table,
+            tls,
             feed,
             stop,
             serving,

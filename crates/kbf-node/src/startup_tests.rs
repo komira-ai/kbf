@@ -181,7 +181,6 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
             server: pki(&dir),
             deny_list: None,
         }),
-        proxy: None,
         heartbeat_interval: Duration::from_millis(100),
         hello_wait: Duration::from_secs(2),
         tick: Duration::from_millis(50),

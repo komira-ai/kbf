@@ -11,7 +11,7 @@ use sha2::Digest;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
-const REPO: &str = "komira-ai/komira-build-farm";
+const REPO: &str = "komira-ai/kbf";
 /// The kind of attestation of a bundle a host verifies a tarball with.
 const PROVENANCE: &str = "https://slsa.dev/provenance/v1";
 const COMMIT: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
@@ -828,6 +828,12 @@ fn check_refuses_a_changed_file() {
 }
 
 fn publish(root: &Path, defect: Option<&str>) -> (Option<i32>, String, String) {
+    // The set hash a verdict names for the files in `dist`: sha256 of its SHA256SUMS.
+    let sums = std::fs::read_to_string(root.join("dist/SHA256SUMS")).unwrap_or_default();
+    publish_set(root, &sha_of(&sums), defect)
+}
+
+fn publish_set(root: &Path, set_hash: &str, defect: Option<&str>) -> (Option<i32>, String, String) {
     let dist = root.join("dist");
     let run = RUN.to_string();
     xtask(
@@ -844,6 +850,8 @@ fn publish(root: &Path, defect: Option<&str>) -> (Option<i32>, String, String) {
             COMMIT,
             "--run-id",
             &run,
+            "--set-hash",
+            set_hash,
         ],
         defect,
     )
@@ -1130,4 +1138,36 @@ fn a_failed_gh_release_fails_the_run() {
         err,
         "xtask: gh release create: xtask-fake: release failed\n"
     );
+}
+
+#[test]
+fn publish_refuses_files_whose_set_differs_from_the_verdicts_before_asking_github() {
+    // Catches: a publish that trusts the verified files without comparing their set to
+    // the one gamma ran (kbf-cicd.md 8.1: "if anything is rebuilt, verify fails"). The
+    // files pass `check` in every case, so only the set hash can refuse them.
+    let root = scratch("publish-other-set");
+    let dist = dist(&root, COMMIT);
+    // Gamma ran another set than these files.
+    let other = sha_of("what gamma ran");
+    let (code, _, err) = publish_set(&root, &other, None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("gamma ran other bytes"), "{err}");
+    assert!(err.contains(&other), "{err}");
+    assert!(released(&root).is_empty(), "nothing was released");
+    assert!(
+        !gh_args(&root).contains("release create"),
+        "GitHub was asked to create a release"
+    );
+    // The same files under their own set hash publish.
+    let sums = std::fs::read_to_string(dist.join("SHA256SUMS")).unwrap();
+    let (code, _, err) = publish_set(&root, &sha_of(&sums), None);
+    assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
+fn publish_refuses_a_set_hash_that_is_not_a_hash() {
+    let root = scratch("publish-bad-hash");
+    dist(&root, COMMIT);
+    let (code, _, err) = publish_set(&root, "abc", None);
+    assert_eq!(code, Some(2), "{err}");
 }

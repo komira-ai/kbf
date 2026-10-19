@@ -14,12 +14,11 @@ use http::{HeaderMap, HeaderValue, Response};
 use tokio::sync::Semaphore;
 
 use super::kit::{
-    CAPS, RawFrame, RawPeer, Reply, Rig, Script, WRITE, finish, grpc_ok, read_all, script, tagged,
-    until,
+    CAPS, EXECUTE, RawFrame, RawPeer, Reply, Rig, Script, WRITE, finish, grpc_ok, read_all, script,
+    tagged, until,
 };
 use crate::slot::Slot;
 
-const SESSION: &str = "/kbf.worker.v1.Worker/Session";
 const HOLD: Duration = Duration::from_secs(20);
 
 /// The fenced answer: headers with END_STREAM, status 14, one marker.
@@ -147,7 +146,7 @@ async fn an_open_bidirectional_request_is_not_redispatched() {
         });
         let rig = Rig::start(a, tagged("b")).await;
         let mut client = rig.client().await;
-        let (response, mut body) = client.start(SESSION, false).await;
+        let (response, mut body) = client.start(EXECUTE, false).await;
         body.send_data(Bytes::from_static(b"hello"), false)
             .expect("body");
         // A bound, not a hang: a pump left running would never let the stream go.

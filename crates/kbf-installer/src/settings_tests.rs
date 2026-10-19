@@ -14,7 +14,7 @@ fn host(platform: Platform) -> Layout {
 fn with_settings(text: &str) -> FakeExec {
     let mut exec = trusted_host();
     exec.entries.insert(
-        layout::path(layout::SETTINGS),
+        crate::layout::path(crate::fixtures::SETTINGS_PATH),
         Entry::File {
             perms: Perms::new(0o644),
             owner: Owner { uid: 0, gid: 0 },
@@ -107,11 +107,11 @@ fn a_settings_file_is_closed_and_strict() {
     let message = load("FOO=1\n").expect_err("refused").to_string();
     assert_eq!(
         message,
-        "settings /usr/local/libexec/kbf-deploy/installer.conf: line 1: \"FOO\" is not a setting"
+        "settings /usr/share/kbf-installer/trust/installer.conf: line 1: \"FOO\" is not a setting"
     );
     let mut exec = trusted_host();
     exec.entries.insert(
-        layout::path(layout::SETTINGS),
+        crate::layout::path(crate::fixtures::SETTINGS_PATH),
         Entry::File {
             perms: Perms::new(0o644),
             owner: Owner { uid: 0, gid: 0 },
@@ -137,7 +137,7 @@ fn a_settings_file_others_could_write_is_refused() {
     ] {
         let mut exec = with_settings("RUN_AS_UID=9\n");
         exec.entries.insert(
-            layout::path(layout::SETTINGS),
+            crate::layout::path(crate::fixtures::SETTINGS_PATH),
             Entry::File {
                 perms: Perms::new(mode),
                 owner: Owner { uid, gid: 0 },
@@ -146,11 +146,14 @@ fn a_settings_file_others_could_write_is_refused() {
         );
         let err = Settings::load(&exec, &host(Platform::Linux)).expect_err("refused");
         assert_eq!(err.code(), want);
-        assert!(err.to_string().starts_with(layout::SETTINGS), "{err}");
+        assert!(
+            err.to_string().starts_with(crate::fixtures::SETTINGS_PATH),
+            "{err}"
+        );
     }
     let mut exec = with_settings("");
     exec.entries.insert(
-        layout::path(layout::SETTINGS),
+        crate::layout::path(crate::fixtures::SETTINGS_PATH),
         Entry::Link {
             target: "elsewhere".into(),
         },
@@ -178,7 +181,7 @@ fn a_settings_file_that_cannot_be_read_is_refused_not_ignored() {
 
     let mut exec = with_settings("");
     exec.entries.insert(
-        layout::path(layout::SETTINGS),
+        crate::layout::path(crate::fixtures::SETTINGS_PATH),
         Entry::Dir {
             perms: Perms::new(0o755),
             owner: Owner { uid: 0, gid: 0 },

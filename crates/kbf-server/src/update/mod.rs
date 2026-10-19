@@ -34,9 +34,11 @@
 //!   exception is a host that leaves its step: the orders that undo the step come first
 //!   ([`Controller`]).
 //!
-//! **What is not here.** The farm: no [`Transport`] to the helpers, no [`FactsSource`] over
-//! the `Farm`, the members and the heartbeats, no metrics, and no call from the frontend.
-//! Nothing outside the tests runs a [`Controller`] yet.
+//! **The farm side.** [`ports`] gives a [`Transport`] over the worker sessions and a
+//! [`FactsSource`] over the `Farm` (`session`), and [`spawn_controller`] runs the controller
+//! where the frontend starts, starting hosts only when `update/policy.auto_nodes` is set.
+//! What it cannot do yet: mark a storage member down and read its facts (U3, #914, is not in
+//! this branch), so no host with a storage half is ever started.
 
 mod codec;
 mod command;
@@ -50,6 +52,8 @@ mod policy;
 mod ports;
 mod report;
 mod rows;
+mod runner;
+mod session;
 mod slot;
 mod steps;
 
@@ -67,4 +71,6 @@ pub use policy::{Policy, PolicyError};
 pub use ports::{FactsSource, FarmView, SourceError, Transport, TransportError};
 pub use report::{CommandError, ControllerError, Moved, Tick};
 pub use rows::{RowError, Rows, Stored};
+pub use runner::spawn as spawn_controller;
+pub use session::{FarmFacts, SessionTransport, ports};
 pub use slot::{Holder, Slot, SlotClass};

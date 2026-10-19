@@ -493,13 +493,26 @@ async fn create_bucket_asks_for_object_lock_and_accepts_its_own_bucket() {
     assert!(!second.contains("object-lock"), "{second}");
 }
 
-/// A loopback port with nothing listening on it (bound, then released).
-async fn free_port() -> std::net::SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
+/// A loopback port on which connecting is refused until [`serve_held`] turns it into a
+/// listener: its socket is kept bound, so no other test can take the number meanwhile
+/// (see [`kbf_testkit::port`]).
+fn held_port() -> kbf_testkit::port::Reserved {
+    kbf_testkit::port::Reserved::new()
+}
+
+/// The held port, listening now.
+fn serve_held(held: kbf_testkit::port::Reserved) -> TcpListener {
+    let listener = held.listen();
+    listener.set_nonblocking(true).unwrap();
+    TcpListener::from_std(listener).unwrap()
+}
+
+/// Catches a held port that is free to take (the old bind-and-drop helper): a thief
+/// binding the number succeeds, and the store would be the thief.
+#[test]
+fn a_held_port_cannot_be_taken_by_another_listener() {
+    let held = held_port();
+    assert!(kbf_testkit::port::is_taken(held.addr()));
 }
 
 /// Catches: `wait_answering` returning before the store answers (no wait at all, or a
@@ -509,7 +522,8 @@ async fn free_port() -> std::net::SocketAddr {
 /// the wait must still be running then, and end once a server answers 403.
 #[tokio::test]
 async fn wait_answering_waits_for_a_late_store_and_takes_403_as_an_answer() {
-    let addr = free_port().await;
+    let held = held_port();
+    let addr = held.addr();
     let s = store(format!("http://{addr}"), Capabilities::default());
     let wait = tokio::spawn(async move { s.wait_answering(Duration::from_secs(20)).await });
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -518,7 +532,7 @@ async fn wait_answering_waits_for_a_late_store_and_takes_403_as_an_answer() {
         "the wait ended while nothing listened: {:?}",
         wait.await
     );
-    let listener = TcpListener::bind(addr).await.unwrap();
+    let listener = serve_held(held);
     let server = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut chunk = [0u8; 4096];
@@ -542,7 +556,7 @@ async fn wait_answering_waits_for_a_late_store_and_takes_403_as_an_answer() {
 /// never starts, which hangs the CI job until its timeout) or reporting success.
 #[tokio::test]
 async fn wait_answering_gives_up_at_its_deadline() {
-    let addr = free_port().await;
+    let addr = kbf_testkit::port::dead_addr();
     let s = store(format!("http://{addr}"), Capabilities::default());
     let started = std::time::Instant::now();
     // Bounded here, so a wait that ignores its deadline fails this test, not hangs it.

@@ -465,12 +465,15 @@ pub struct Args {
     #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
     pub input_tree_reads_in_flight: NonZeroUsize,
     /// Where the scheduler keeps its state, written before each change is acknowledged and
-    /// replayed at start: `sqlite:///absolute/path`, a file on a local disk that this
-    /// process owns. Every start is a new epoch, so daemons kill the runs of the leases
-    /// they held before. The file is created, with its directory, if missing (0600, and
-    /// 0700 for a directory it makes) and held by one process: a second frontend on it
-    /// refuses to start. Any other value, `postgres://` included, is refused (Postgres is
-    /// not wired yet). Left out, the scheduler's state is in memory and a restart loses it
+    /// replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a
+    /// local Unix socket, reached as this process's own user (peer authentication; a URL
+    /// with a password is refused, as the command line is world-readable). The server must
+    /// flush commits before it acknowledges them (`synchronous_commit` on) or the start is
+    /// refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on
+    /// a local disk that this process owns (created, with its directory, if missing: 0600,
+    /// and 0700 for a directory it makes; a second frontend on it refuses to start). Every
+    /// start is a new epoch, so daemons kill the runs of the leases they held before. Left
+    /// out, the scheduler's state is in memory and a restart loses it
     // Listed beside `--meta-dir`, whose place in the help it takes without moving the
     // flags declared after it.
     #[arg(
@@ -615,6 +618,41 @@ impl Args {
         .resolve(space)
     }
 
+    /// The proxy in front of every listener, if `--proxy-auth-file` names its secret
+    /// ([`Behind`]; `None`: the server is reached directly).
+    ///
+    /// # Errors
+    /// The secret file or the `--worker-deny-list` file cannot be read, or the secret is
+    /// not one the proxy can present ([`ProxySecret::from_file`]). A deny list that cannot be
+    /// read or parsed, at open or at the recount for the warning, stops the start (it is
+    /// never ignored); the error names the flag's path and line, never the secret.
+    pub fn proxy(&self) -> Result<Option<Behind>, ConfigError> {
+        let Some(path) = self.proxy_auth_file.as_deref() else {
+            return Ok(None);
+        };
+        let secret = ProxySecret::from_file(path)?;
+        let deny_list = self
+            .worker_deny_list
+            .as_deref()
+            .map(DenyList::open)
+            .transpose()?;
+        if let Some(list) = &deny_list {
+            let inert = list.certificate_entries()?;
+            if inert > 0 {
+                tracing::warn!(
+                    entries = inert,
+                    "--worker-deny-list has serial or spki-sha256 entries, which never match \
+                     a call behind --proxy-auth-file (the proxy forwards a node id, not a \
+                     certificate): only node entries take effect"
+                );
+            }
+        }
+        Ok(Some(Behind {
+            secret: Arc::new(secret),
+            deny_list,
+        }))
+    }
+
     /// The listeners these flags describe.
     ///
     /// # Errors
@@ -628,15 +666,6 @@ impl Args {
             .as_deref()
             .map(DenyList::open)
             .transpose()?;
-        let proxy = self
-            .proxy_auth_file
-            .as_deref()
-            .map(ProxySecret::from_file)
-            .transpose()?
-            .map(|secret| Behind {
-                secret: Arc::new(secret),
-                deny_list: deny_list.clone(),
-            });
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
@@ -656,7 +685,7 @@ impl Args {
             }),
             _ => None,
         };
-        if deny_list.is_some() && worker_tls.is_none() && proxy.is_none() {
+        if deny_list.is_some() && worker_tls.is_none() && self.proxy_auth_file.is_none() {
             return Err(ConfigError::DenyListWithoutIdentity);
         }
         let reapi_tls = match (&self.reapi_tls_cert, &self.reapi_tls_key) {
@@ -676,7 +705,6 @@ impl Args {
             reapi_tls,
             worker: self.worker_listen,
             worker_tls,
-            proxy,
             heartbeat_interval: Duration::from_millis(self.heartbeat_interval_ms),
             hello_wait: Duration::from_secs(10),
             tick: Duration::from_secs(1),

@@ -122,6 +122,11 @@ message RegisterResponse {
   // How often to heartbeat, in milliseconds: well under the row's time to live.
   uint64 heartbeat_interval_ms = 3;
   Map map = 4;
+  // The generation of the cold-store registration the frontend holds (kbf.enroll.v1
+  // `ColdStore.GetStoreConfig`); 0: none, or the frontend cannot say now. The node
+  // fetches the registration when this differs from the one it applied. Only this
+  // service, which storage nodes call, carries it: no daemon message does.
+  uint64 objstore_generation = 5;
 }
 
 message HeartbeatRequest {
@@ -141,6 +146,29 @@ message HeartbeatRequest {
   // does a node that has no journal. The frontend sums repair_debts over the members to
   // judge the farm's under-replicated blobs (docs/design/architecture-v2.md, section 11).
   bool debts_known = 6;
+  // The cold-store registration generation the node's open store runs on (0: none). Read
+  // together with apply_status.
+  uint64 applied_objstore_generation = 7;
+  // How the node's latest attempt to apply the registration went. UNSPECIFIED (what an
+  // older node sends, having neither field) is recorded as "does not report", never as
+  // success or as "not yet".
+  ApplyStatus apply_status = 8;
+}
+
+// A closed set: a node never sends free text about its store, so a credential cannot ride
+// in it. Every value is in the frontend's convergence answer under the same name.
+enum ApplyStatus {
+  APPLY_STATUS_UNSPECIFIED = 0;
+  // The node runs on `applied_objstore_generation` (or has nothing to apply).
+  APPLY_STATUS_OK = 1;
+  // The node has not applied the generation it was told of yet.
+  APPLY_STATUS_PENDING = 2;
+  // The registered keys failed the node's own put/get/delete probe.
+  APPLY_STATUS_PROBE_FAILED = 3;
+  // The node runs on a `--cold-store` flag naming another store than the registered one.
+  APPLY_STATUS_IDENTITY_MISMATCH = 4;
+  // The node cannot use a registration (no S3 client in this build).
+  APPLY_STATUS_UNSUPPORTED = 5;
 }
 
 message HeartbeatResponse {
@@ -149,4 +177,6 @@ message HeartbeatResponse {
   // The current map, when its generation is above the request's have_generation: a node
   // that missed a bump learns it from its next beat, with no other call.
   Map map = 2;
+  // As RegisterResponse.objstore_generation.
+  uint64 objstore_generation = 3;
 }

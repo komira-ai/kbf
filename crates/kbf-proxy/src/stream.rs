@@ -11,14 +11,15 @@ use http::{HeaderMap, Method, Request, Response, Uri, Version};
 use hyper::body::Incoming;
 use tokio::sync::watch;
 
+use crate::auth::Refusal as AuthRefusal;
 use crate::body::{Activity, Down, Lifetime, ProxyBody, Source, idle_expired, pump};
 use crate::core::{Core, StreamCount, now};
 use crate::hold::Wake;
-use crate::identity::strip_reserved;
+use crate::identity::{Identity, forward_headers, strip_reserved};
 use crate::metrics::Metrics;
 use crate::pool::TargetPool;
 use crate::replay::Failure;
-use crate::reply::unavailable;
+use crate::reply::{refused, unavailable};
 use crate::route::{Idle, Target, idle_of};
 use crate::slot::{Bind, Pending, Permit};
 
@@ -58,11 +59,14 @@ struct Stream {
 }
 
 /// Serves a request that goes to a backend. `pending` counts the stream from accept.
+/// `identity` is the verified certificate's, if the client presented one: the child is told
+/// it in `x-kbf-*` headers, and nothing the client sent under those names.
 pub(crate) async fn proxy_child(
     core: Arc<Core>,
     pending: Pending,
     target: Target,
     request: Request<Incoming>,
+    identity: Option<Identity>,
 ) -> Response<ProxyBody> {
     let grpc = target != Target::Operator;
     let Some(count) = core.enter_stream() else {
@@ -71,7 +75,11 @@ pub(crate) async fn proxy_child(
     };
     let (parts, body) = request.into_parts();
     let mut headers = parts.headers;
-    strip_reserved(&mut headers);
+    // Strips every inbound `x-kbf-*`, then sets the secret and, with a certificate, the
+    // identity. A node id that cannot be a header value never reaches the child as one.
+    if forward_headers(&mut headers, identity.as_ref(), &core.security.secret).is_err() {
+        return refused(grpc, AuthRefusal::PermissionDenied);
+    }
     let path = parts.uri.path().to_owned();
     let stream = Stream {
         idle: idle_of(&path),

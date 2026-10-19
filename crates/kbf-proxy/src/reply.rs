@@ -3,11 +3,18 @@
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Response, StatusCode, header};
 
+use crate::auth::Refusal;
 use crate::body::ProxyBody;
 use crate::control::UpdateReply;
 
 /// `grpc-status` of `UNAVAILABLE`.
 pub(crate) const GRPC_UNAVAILABLE: &str = "14";
+/// `grpc-status` of `UNAUTHENTICATED`.
+pub(crate) const GRPC_UNAUTHENTICATED: &str = "16";
+/// `grpc-status` of `PERMISSION_DENIED`.
+pub(crate) const GRPC_PERMISSION_DENIED: &str = "7";
+/// `grpc-status` of `RESOURCE_EXHAUSTED`.
+pub(crate) const GRPC_RESOURCE_EXHAUSTED: &str = "8";
 /// `grpc-status` of `UNIMPLEMENTED`.
 pub(crate) const GRPC_UNIMPLEMENTED: &str = "12";
 /// The content type gRPC clients send and expect.
@@ -58,8 +65,66 @@ pub(crate) fn unavailable(grpc: bool, message: &'static str) -> Response<ProxyBo
     if grpc {
         grpc_only(GRPC_UNAVAILABLE, message)
     } else {
-        text(StatusCode::SERVICE_UNAVAILABLE, message)
+        let mut response = text(StatusCode::SERVICE_UNAVAILABLE, message);
+        // A held HTTP/1.1 request that outlives its bound is told when to come back.
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        response
     }
+}
+
+/// The answer to a call the auth rules refused: the gRPC status in a trailers-only response,
+/// or 401, 403 or 429. Nothing says which credential was wrong.
+pub(crate) fn refused(grpc: bool, refusal: Refusal) -> Response<ProxyBody> {
+    let (status, code, message) = match refusal {
+        Refusal::Unauthenticated => (
+            StatusCode::UNAUTHORIZED,
+            GRPC_UNAUTHENTICATED,
+            "authentication required",
+        ),
+        Refusal::PermissionDenied => (
+            StatusCode::FORBIDDEN,
+            GRPC_PERMISSION_DENIED,
+            "this identity may not call this",
+        ),
+        Refusal::RateLimited => (
+            StatusCode::TOO_MANY_REQUESTS,
+            GRPC_RESOURCE_EXHAUSTED,
+            "too many wrong credentials from this address",
+        ),
+    };
+    if grpc {
+        return grpc_only(code, message);
+    }
+    let mut response = text(status, message);
+    if refusal == Refusal::Unauthenticated {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    }
+    response
+}
+
+/// A malformed HTTP/1.1 request head: 400, and the connection is not reused.
+pub(crate) fn bad_request(message: &'static str) -> Response<ProxyBody> {
+    let mut response = text(StatusCode::BAD_REQUEST, message);
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    response
+}
+
+/// A gRPC path asked for over HTTP/1.1: 426, naming the protocol that serves it.
+pub(crate) fn upgrade_required() -> Response<ProxyBody> {
+    let mut response = text(
+        StatusCode::UPGRADE_REQUIRED,
+        "this path is served over HTTP/2",
+    );
+    let headers = response.headers_mut();
+    headers.insert(header::UPGRADE, HeaderValue::from_static("h2"));
+    headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+    response
 }
 
 /// The answer to a path outside the route table: `UNIMPLEMENTED` for gRPC, 404 otherwise.

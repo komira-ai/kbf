@@ -66,9 +66,6 @@ pub struct Listeners {
     /// Mutual TLS for the worker listener; `None` serves it in plain text, where no
     /// node is bound to a certificate and every blob call is refused.
     pub worker_tls: Option<WorkerTls>,
-    /// A TLS-terminating proxy in front of every listener (`--proxy-auth-file`,
-    /// [`crate::proxy_auth`]); `None`: the server is reached directly.
-    pub proxy: Option<Behind>,
     /// The heartbeat interval `Welcome` names.
     pub heartbeat_interval: Duration,
     /// How long a new worker stream may take to send its `Hello`.
@@ -111,7 +108,7 @@ pub struct Listeners {
 
 /// What keeps a long-lived stream from looking idle to a load balancer, a proxy or the
 /// peer: Buck2 sends one Execute per action and never reconnects a broken one, so an
-/// idle-timeout cut fails the action (komira-build-farm#791). Zero turns each off.
+/// idle-timeout cut fails the action (kbf#791). Zero turns each off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamTiming {
     /// How often every open Execute and WaitExecution stream is sent its operation
@@ -258,12 +255,15 @@ pub(crate) fn bind(
 
 /// Serves `routes` on `listener` until it fails, or until `stop` completes and the
 /// requests in flight are answered; without a listener, it only waits for `stop`.
-pub(crate) fn serve_api(
-    listener: Option<tokio::net::TcpListener>,
+pub(crate) fn serve_api<L>(
+    listener: Option<L>,
     routes: axum::Router,
     stop: impl Future<Output = ()> + Send + 'static,
     proxy: Option<Arc<ProxySecret>>,
-) -> impl Future<Output = std::io::Result<()>> {
+) -> impl Future<Output = std::io::Result<()>>
+where
+    L: axum::serve::Listener<Io = tokio::net::TcpStream, Addr = SocketAddr>,
+{
     // Every route, the fallback too, sees only a call that passed the proxy check.
     let routes = routes.layer(axum::middleware::from_fn_with_state(proxy, gate_requests));
     match listener {
@@ -531,7 +531,7 @@ where
 /// are refused UNAVAILABLE, which Buck2 retries when it opens the call; and the REAPI
 /// listener stops accepting and every connection on it is sent GOAWAY. Open Execute and
 /// WaitExecution streams are kept until their action is done: Buck2 does not recover a
-/// stream that breaks (komira-build-farm#791), so ending one fails its action. The
+/// stream that breaks (kbf#791), so ending one fails its action. The
 /// serving future returns once the REAPI connections have closed. Only
 /// `listeners.shutdown_timeout` (when it is not [`Duration::MAX`]) or [`Drain::close`]
 /// (a second stop signal) ends the streams that are not done, UNAVAILABLE, after which
@@ -581,7 +581,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, None, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, None, None, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
@@ -601,7 +603,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, state, None, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, state, None, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_state`], sending daemons the storage map `map` holds if given: in
@@ -622,7 +626,9 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, state, None, map, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, state, None, map, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`], and with a `storage` node (`--storage`) the REAPI
@@ -643,13 +649,17 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_options(cache, listeners, api, policy, None, storage, None, shutdown)
+    bind_server_with_options(
+        cache, listeners, api, policy, None, storage, None, None, shutdown,
+    )
 }
 
 /// [`bind_server_with_policy`] with all of its options: the scheduler's state in
 /// `state` ([`bind_server_with_state`]), the client's CAS, ByteStream and
 /// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]), and
-/// the storage map `map` sent to daemons ([`bind_server_with_map`]).
+/// the storage map `map` sent to daemons ([`bind_server_with_map`]), and a TLS-terminating
+/// `proxy` in front of every listener (`--proxy-auth-file`, [`crate::proxy_auth`]; `None`:
+/// the server is reached directly).
 ///
 /// # Errors
 /// As [`bind_server_with_state`].
@@ -665,6 +675,7 @@ pub fn bind_server_with_options<M, O>(
     state: Option<StateStore>,
     storage: Option<tonic::transport::Endpoint>,
     map: Option<Arc<dyn MapSource>>,
+    proxy: Option<Behind>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -697,6 +708,7 @@ where
     let update_rows = state
         .as_ref()
         .map(|s| crate::update::Rows::new(Arc::clone(&s.store)));
+    let update_store = state.as_ref().map(|s| Arc::clone(&s.store));
     let farm = Arc::new(farm.with_state(state)?);
     // One start, one bind budget: the three listeners wait for a late interface together.
     let binder = Binder::new();
@@ -708,7 +720,7 @@ where
             listeners.streams,
         ),
         listeners.worker_tls,
-        listeners.proxy.as_ref(),
+        proxy.as_ref(),
     );
     let tls_sources: Vec<TlsSource> = listeners
         .reapi_tls
@@ -744,6 +756,8 @@ where
         history.as_ref().map(crate::history::History::reads),
         budget,
     );
+    let offers =
+        crate::release::offers::offers_of(releases.clone(), update_rows.clone(), listeners.tick);
     let api_routes = crate::api::router(
         Arc::clone(&farm),
         token.clone(),
@@ -753,6 +767,7 @@ where
         // A server with no frontend role has no enrollment.
         None,
     )
+    .merge(crate::verbs::routes(token.clone(), members.clone()))
     .merge(crate::release::router(releases.clone(), token.clone()))
     .merge(crate::update_hosts::router(
         Arc::clone(&farm),
@@ -783,10 +798,7 @@ where
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
-    let proxy_secret = listeners
-        .proxy
-        .as_ref()
-        .map(|behind| Arc::clone(&behind.secret));
+    let proxy_secret = proxy.as_ref().map(|behind| Arc::clone(&behind.secret));
     let mut reapi_server = keepalive(
         flow_control(Server::builder(), listeners.stream_limits.reapi),
         listeners.streams,
@@ -824,6 +836,10 @@ where
     );
     // The map, if there is one: no branch in this generic function.
     let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
+    // The offers, if there are a release store and a state store: no branch here either.
+    let sessions = offers
+        .into_iter()
+        .fold(sessions, WorkerService::with_offers);
     let worker_service = WorkerServer::new(sessions)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -874,6 +890,10 @@ where
         // and they never delay it. It stops when the serving future does.
         let history = crate::history::spawn(history);
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
+        // The rolling-update controller; it starts no host until `auto_nodes` is set.
+        let _updates =
+            crate::update::spawn_controller(Arc::clone(&farm), update_store, listeners.tick)
+                .map(AbortOnDrop);
         // `reapi_incoming` carries the REAPI TLS when there is any, so the health
         // service is served over the same TLS as the REAPI routes; the authenticator is
         // already applied to those routes alone (above).

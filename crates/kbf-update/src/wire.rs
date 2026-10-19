@@ -7,7 +7,7 @@ use kbf_proto::update as wire;
 use kbf_proto::update::update_order::Verb as WireVerb;
 use kbf_proto::update::update_status::State as WireState;
 
-use crate::types::{Component, Offer, Order, State, Status, Verb};
+use crate::types::{Component, Expected, Offer, Order, State, Status, Verb};
 
 impl From<wire::Component> for Component {
     fn from(c: wire::Component) -> Self {
@@ -27,6 +27,12 @@ impl From<wire::UpdateOffer> for Offer {
             commit: o.commit,
             platform: o.platform,
             components: o.components.into_iter().map(Component::from).collect(),
+            expected: Expected {
+                protocol: o.protocol,
+                min_protocol: o.min_protocol,
+                state_schema: o.state_schema,
+                profile: o.profile,
+            },
         }
     }
 }
@@ -42,6 +48,7 @@ impl From<wire::UpdateOrder> for Order {
         Self {
             order_id: o.order_id,
             epoch: o.epoch,
+            generation: o.generation,
             verb,
             commit: o.commit,
             window_s: o.window_s,
@@ -102,6 +109,10 @@ mod tests {
                 size: 77,
                 attestation: b"bundle".to_vec(),
             }],
+            protocol: 5,
+            min_protocol: 4,
+            state_schema: 3,
+            profile: "release".to_owned(),
         };
         let offer = Offer::from(message);
         assert_eq!(offer.generation, 9);
@@ -116,6 +127,15 @@ mod tests {
                 attestation: b"bundle".to_vec(),
             }]
         );
+        assert_eq!(
+            offer.expected,
+            Expected {
+                protocol: 5,
+                min_protocol: 4,
+                state_schema: 3,
+                profile: "release".to_owned()
+            }
+        );
     }
 
     /// Catches a verb mapped to another, and an unspecified or unknown verb taken for one:
@@ -126,6 +146,7 @@ mod tests {
             Order::from(wire::UpdateOrder {
                 order_id: 4,
                 epoch: 5,
+                generation: 6,
                 verb,
                 commit: "e".repeat(40),
                 window_s: 600,
@@ -138,6 +159,7 @@ mod tests {
         assert_eq!(order(99).verb, None);
         let o = order(1);
         assert_eq!((o.order_id, o.epoch, o.window_s), (4, 5, 600));
+        assert_eq!(o.generation, 6, "the generation is carried to the record");
         assert_eq!(o.commit, "e".repeat(40));
     }
 

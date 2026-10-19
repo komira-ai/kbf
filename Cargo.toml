@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
-repository = "https://github.com/komira-ai/komira-build-farm"
+repository = "https://github.com/komira-ai/kbf"
 publish = false
 
 # Every external dependency is declared here once and used from a member as
@@ -49,7 +49,8 @@ futures = "0.3.34"
 # through hyper and tonic.
 h2 = "0.4.20"
 hex = "0.4.3"
-# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`).
+# The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`)
+# and of the installer's loopback calls to a child (kbf-installer: `proxy::child_http`).
 # Already in the tree through hyper.
 httparse = "1.10.1"
 # Header maps of the front-door proxy (kbf-proxy); already in the tree through hyper.
@@ -195,6 +196,7 @@ kbf-enroll-registry = { path = "crates/kbf-enroll-registry" }
 kbf-enroll = { path = "crates/kbf-enroll" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-gate = { path = "crates/kbf-gate" }
 kbf-history = { path = "crates/kbf-history" }
 kbf-image = { path = "crates/kbf-image" }
 kbf-host = { path = "crates/kbf-host" }

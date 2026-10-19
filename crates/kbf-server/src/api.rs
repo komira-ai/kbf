@@ -5,9 +5,11 @@
 //! - `GET /v1/nodes`: every node registered since the server started, with the newest
 //!   software status each sent, where its update is (state, `up_to_date` against the
 //!   desired commit, availability: [`crate::update_status`]) and where it is in
-//!   placement ([`crate::fleet`]).
+//!   placement ([`crate::fleet`]), the protocol version each speaks, and the oldest of
+//!   those ([`ProtocolSummary`]).
 //! - `GET /v1/members`: the storage members of the current map, as the gRPC
-//!   `Membership` service keeps them ([`crate::members::Members`]).
+//!   `Membership` service keeps them ([`crate::members::Members`]), the protocol version
+//!   each registered naming, and the oldest of those.
 //! - `GET /v1/storage`: whether every blob is known to have its copies elsewhere, from the
 //!   storage members' heartbeats ([`crate::storage_health`]); on a frontend with a state
 //!   store.
@@ -69,6 +71,7 @@ use serde::{Deserialize, Serialize};
 use crate::drain::{Drain, DrainStatus};
 use crate::enroll::api::EnrollApi;
 use crate::farm::{Farm, NodeAction};
+use crate::fleet::ProtocolSummary;
 use crate::members::{Members, MembershipError};
 use crate::proxy_auth::{Caller, Trust};
 use crate::release::desired::blocking;
@@ -229,6 +232,8 @@ struct MemberView {
     addr: String,
     state: &'static str,
     weight: u32,
+    /// What its registration named; `None` if its row names none or has lapsed.
+    protocol: Option<u32>,
 }
 
 /// The storage members of the current map.
@@ -236,6 +241,8 @@ struct MemberView {
 struct MembersView {
     generation: u64,
     members: Vec<MemberView>,
+    #[serde(flatten)]
+    protocols: ProtocolSummary,
 }
 
 /// A member's state as `GET /v1/members` names it. Exhaustive: a new state fails to
@@ -254,9 +261,15 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
     let Some(members) = api.members.clone() else {
         return no_members();
     };
-    // The store's calls block (its trait says so).
-    let map = match tokio::task::spawn_blocking(move || members.current_map()).await {
-        Ok(Ok(map)) => map,
+    // The store's calls block (its trait says so). The map is read, then the rows that
+    // say which protocol each member registered naming: not one snapshot, so a member
+    // whose row lapses between the two is listed without a version.
+    let read = tokio::task::spawn_blocking(move || {
+        let map = members.current_map()?;
+        Ok::<_, MembershipError>((map, members.protocols()?))
+    });
+    let (map, protocols) = match read.await {
+        Ok(Ok(read)) => read,
         Ok(Err(e)) => {
             let code = match e {
                 MembershipError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -274,10 +287,11 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
         MembersView {
             generation: 0,
             members: Vec::new(),
+            protocols: ProtocolSummary::of([]),
         },
-        |map| MembersView {
-            generation: map.generation(),
-            members: map
+        |map| {
+            // A member whose row has lapsed (`Down`) has no version to show.
+            let members: Vec<MemberView> = map
                 .members()
                 .iter()
                 .map(|m| MemberView {
@@ -285,8 +299,14 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
                     addr: m.addr.clone(),
                     state: state_name(m.state),
                     weight: m.weight,
+                    protocol: protocols.get(&m.id).copied().flatten(),
                 })
-                .collect(),
+                .collect();
+            MembersView {
+                generation: map.generation(),
+                protocols: ProtocolSummary::of(members.iter().map(|m| m.protocol)),
+                members,
+            }
         },
     );
     json(StatusCode::OK, &view)
@@ -556,7 +576,7 @@ const fn denied_failure(e: &MembershipError) -> StatusCode {
 }
 
 /// The answer of a server that keeps no storage members.
-fn no_members() -> Response {
+pub(crate) fn no_members() -> Response {
     error(
         StatusCode::NOT_FOUND,
         "this server keeps no storage members: it has no --state-store",

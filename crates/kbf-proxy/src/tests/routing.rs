@@ -368,10 +368,18 @@ async fn inbound_identity_headers_never_reach_the_child() {
 
     let seen = rig.a.state.headers_of(CAPS);
     assert_eq!(seen.len(), 1);
-    assert!(
-        seen[0].keys().all(|k| !k.as_str().starts_with("x-kbf-")),
-        "{:?}",
-        seen[0]
+    let reserved: Vec<_> = seen[0]
+        .iter()
+        .filter(|(k, _)| k.as_str().starts_with("x-kbf-"))
+        .collect();
+    assert_eq!(
+        reserved.len(),
+        1,
+        "nothing the client forged survives, and only the proxy's own secret is set: {reserved:?}"
+    );
+    assert_eq!(
+        seen[0].get("x-kbf-proxy-auth").map(HeaderValue::as_bytes),
+        Some(hex::encode(super::kit::SECRET).as_bytes())
     );
     assert_eq!(
         seen[0].get("x-trace").map(HeaderValue::as_bytes),

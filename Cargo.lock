@@ -1379,6 +1379,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-bake"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-gate",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ureq",
+]
+
+[[package]]
 name = "kbf-baseline"
 version = "0.1.0"
 dependencies = [
@@ -1481,10 +1493,12 @@ dependencies = [
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "postgres",
  "prost",
  "rcgen",
  "rustix",
  "rustls",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
@@ -1494,6 +1508,7 @@ dependencies = [
  "tonic",
  "tracing",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -1557,6 +1572,7 @@ dependencies = [
  "kbf-installer",
  "kbf-mdm",
  "kbf-state",
+ "kbf-testkit",
  "kbf-types",
  "plist",
  "rcgen",
@@ -1640,6 +1656,7 @@ dependencies = [
  "hyper-util",
  "kbf-peer",
  "kbf-proto",
+ "kbf-testkit",
  "kbf-types",
  "libc",
  "rcgen",
@@ -1658,7 +1675,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "x509-parser",
- "zeroize",
 ]
 
 [[package]]
@@ -1711,6 +1727,16 @@ dependencies = [
  "tower-layer",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "kbf-gate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
 ]
 
 [[package]]
@@ -1778,21 +1804,30 @@ dependencies = [
 name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "clap",
  "flate2",
  "hex",
+ "httparse",
+ "hyper",
  "kbf-host",
  "kbf-installer",
+ "kbf-state",
  "kbf-update",
  "libc",
+ "postgres",
  "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "subtle",
  "tar",
  "thiserror",
  "tokio",
  "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1812,13 +1847,16 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "futures",
+ "h2",
  "hex",
+ "http",
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
  "kbf-installer",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-proxy",
  "kbf-server",
  "kbf-testkit",
  "kbf-threads",
@@ -1828,12 +1866,14 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustix",
+ "rustls",
  "saphyr-parser",
  "serde_json",
  "sha2 0.11.0",
  "syn 2.0.119",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tracing-subscriber",
  "xtask",
@@ -1859,6 +1899,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hex",
+ "kbf-cli",
  "rustix",
  "sha2 0.11.0",
  "thiserror",
@@ -1920,6 +1961,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kbf-mac-session",
+ "kbf-testkit",
  "libc",
  "rcgen",
  "reqwest",
@@ -2004,6 +2046,7 @@ dependencies = [
  "hmac 0.13.0",
  "kbf-objstore",
  "kbf-segments",
+ "kbf-testkit",
  "kbf-threads",
  "kbf-types",
  "md-5",
@@ -2057,6 +2100,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zeroize",
 ]
 
 [[package]]
@@ -2073,15 +2117,20 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kbf-peer",
+ "kbf-tls",
  "loom",
  "rcgen",
+ "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "subtle",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -2163,13 +2212,16 @@ dependencies = [
  "kbf-state",
  "kbf-storage",
  "kbf-store",
+ "kbf-testkit",
  "kbf-threads",
  "kbf-tier",
  "kbf-tls",
  "kbf-types",
  "kbf-ui",
+ "kbf-update",
  "libc",
  "percent-encoding",
+ "postgres",
  "prost",
  "prost-types",
  "rcgen",
@@ -2184,10 +2236,12 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tower-layer",
+ "tower-service",
  "tracing",
  "tracing-core",
  "tracing-subscriber",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -2243,6 +2297,7 @@ dependencies = [
  "rusqlite",
  "rustix",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -2351,6 +2406,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -2369,16 +2425,11 @@ dependencies = [
 name = "kbf-update"
 version = "0.1.0"
 dependencies = [
- "futures",
- "hex",
  "kbf-proto",
- "kbf-threads",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "thiserror",
  "tokio",
- "tonic",
  "tracing",
 ]
 
@@ -4826,6 +4877,7 @@ dependencies = [
  "clap",
  "flate2",
  "hex",
+ "kbf-gate",
  "lzma-rs",
  "rcgen",
  "rustix",
