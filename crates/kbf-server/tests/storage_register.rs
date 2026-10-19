@@ -1603,8 +1603,14 @@ async fn a_started_node_reports_the_writes_it_has_open() {
     let (node, client) = waiting_node(&f, "reports-writes").await;
     let (maps, here) = (node.maps(), node.addr);
     let _serving = tokio::spawn(node.serve());
-    until("the node to hold a map", || {
-        (maps.generation() > 0).then_some(())
+    // The write is routed by the generation the node holds when it is sent, and a node
+    // refuses (STALE_MAP) a write routed by an older map and so never counts it. The map
+    // turns once more when the node's first beat promotes it from CatchingUp to Active, so
+    // the generation is read only after that promotion has reached the node: its map is the
+    // frontend's current one and the frontend's row for it is Active.
+    until("the node to be Active and hold the frontend's map", || {
+        let current = f.members.current_map().expect("read")?.generation();
+        (state(&f, 1) == Some(MemberState::Active) && maps.generation() == current).then_some(())
     })
     .await;
     let idle = until_node(&f, "none open", |n| n.open_writes == Some(0)).await;
