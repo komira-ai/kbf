@@ -404,7 +404,6 @@ Options:
           
           [default: 600]
 
-
       --write-pool-queue <WRITE_POOL_QUEUE>
           The most blobs waiting for a write-pool writer. A blob that finds the queue full goes straight to the object store, as one does when the write tier has no room. At least 1
           
