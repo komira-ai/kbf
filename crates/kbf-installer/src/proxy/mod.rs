@@ -5,8 +5,21 @@
 //! What is here: the [`Swap`] phase machine for a frontend host (two children side by
 //! side) and for an all-in-one host (stop, hold, start); recovery after a proxy restart
 //! ([`Swap::adopt`]); the operator's rollback; the retire rule; and [`FileRecorder`], the
-//! fsynced `update.json`. What is not: the proxy itself, the real child control and the
-//! orders spool (U4b, U7b), the update API ([`api`], U8a).
+//! fsynced `update.json`. The update API is in [`api`] (U8a).
+//!
+//! Real implementations of the ports (U7b), each behind the trait it implements:
+//! - [`gate_real::ProxyGate`], the `Gate` on `kbf-proxy`'s hold gate (it keeps the
+//!   `HoldGuard`, opens a slot at its first release, adopts running children out of the
+//!   startup hold);
+//! - [`child_real::ProcChild`] (Linux), the `Child` on processes watched by pidfd;
+//! - [`runtime::SystemClock`] and [`runtime::RequestQueue`], the `Clock` and the `Requests`;
+//! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left.
+//!
+//! Still fakes, stated: `ChildAdmin` (the child's admin port is U2, `proxy/u2b-admin`,
+//! not merged), `Migrator` (who migrates is open), `RootOrders` (the orders spool and
+//! `status.json` reader belong to the update API's unit, U8b). Until `ChildAdmin` exists
+//! the proxy verb cannot run a swap or resume one, so [`supervisor::adopt_children`] adopts
+//! a child only when no update is in flight.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:

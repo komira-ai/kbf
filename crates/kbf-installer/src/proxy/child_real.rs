@@ -23,7 +23,7 @@ use std::fs;
 use std::io::Write as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child as Process, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, PoisonError};
 
@@ -70,7 +70,19 @@ pub struct ProcChild {
     dir: PathBuf,
     argv: Argv,
     binary: &'static str,
+    /// Names a process this port just started: a pidfd and the identity to record.
+    identify: Identify,
     held: Mutex<BTreeMap<u32, Held>>,
+}
+
+type Identify = fn(u32) -> Result<(OwnedFd, ProcIdent), String>;
+
+/// The pidfd and identity of the process `pid`, which this process just started and has not
+/// reaped, so the pid is still its own.
+fn identify_started(pid: u32) -> Result<(OwnedFd, ProcIdent), String> {
+    let pidfd = pidfd_of(pid).map_err(|e| e.to_string())?;
+    let ident = ident_of(pid).map_err(|e| e.to_string())?;
+    Ok((pidfd, ident))
 }
 
 impl ProcChild {
@@ -81,6 +93,7 @@ impl ProcChild {
             dir,
             argv,
             binary: RELEASE_BINARY,
+            identify: identify_started,
             held: Mutex::new(BTreeMap::new()),
         }
     }
@@ -89,6 +102,13 @@ impl ProcChild {
     #[cfg(test)]
     pub(super) fn with_binary(mut self, binary: &'static str) -> ProcChild {
         self.binary = binary;
+        self
+    }
+
+    /// The same, naming a started process by `identify` (tests make it fail).
+    #[cfg(test)]
+    pub(super) fn with_identify(mut self, identify: Identify) -> ProcChild {
+        self.identify = identify;
         self
     }
 
@@ -153,10 +173,17 @@ fn slot_name(slot: Slot) -> &'static str {
 
 /// The identity of the live process `pid`, from `/proc`.
 pub fn ident_of(pid: u32) -> std::io::Result<ProcIdent> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let start_time = start_time_of(&stat)
-        .ok_or_else(|| std::io::Error::other(format!("unreadable /proc/{pid}/stat")))?;
-    let exe = fs::read_link(format!("/proc/{pid}/exe"))?;
+    ident_in(Path::new("/proc"), pid)
+}
+
+/// [`ident_of`] over a `/proc` at `proc`, so a test can give it a table of its own.
+fn ident_in(proc: &Path, pid: u32) -> std::io::Result<ProcIdent> {
+    let dir = proc.join(pid.to_string());
+    let stat = fs::read_to_string(dir.join("stat"))?;
+    let start_time = start_time_of(&stat).ok_or_else(|| {
+        std::io::Error::other(format!("unreadable {}", dir.join("stat").display()))
+    })?;
+    let exe = fs::read_link(dir.join("exe"))?;
     Ok(ProcIdent {
         pid,
         start_time,
@@ -240,13 +267,7 @@ impl Child for ProcChild {
             .spawn()
             .map_err(|e| PortError(format!("start {}: {e}", program.display())))?;
         let pid = process.id();
-        // The process is not reaped yet, so the pid is ours until `try_wait` says otherwise.
-        let started = pidfd_of(pid).map_err(|e| e.to_string()).and_then(|pidfd| {
-            ident_of(pid)
-                .map(|ident| (pidfd, ident))
-                .map_err(|e| e.to_string())
-        });
-        let (pidfd, ident) = match started {
+        let (pidfd, ident) = match (self.identify)(pid) {
             Ok(v) => v,
             Err(e) => {
                 let mut process = process;
@@ -298,63 +319,68 @@ impl Child for ProcChild {
     }
 
     fn exited(&self, ident: &ProcIdent) -> Option<i32> {
-        let verdict = self.lookup(ident, |h| match &mut h.process {
-            Some(p) => match p.try_wait() {
-                Ok(Some(status)) => Some(code_of(status)),
-                Ok(None) | Err(_) => None,
-            },
-            None => gone(&h.pidfd).then_some(UNKNOWN_EXIT),
+        let verdict = self.lookup(ident, |h| {
+            let code = match &mut h.process {
+                Some(p) => match p.try_wait() {
+                    Ok(Some(status)) => Some(code_of(status)),
+                    Ok(None) | Err(_) => None,
+                },
+                None => gone(&h.pidfd).then_some(UNKNOWN_EXIT),
+            };
+            (code, h.slot)
         });
         match verdict {
             // Not a process this port holds (never spawned or adopted, or the pid now
             // belongs to another): it is not ours, so for the swap it is gone and untouched.
             None => Some(UNKNOWN_EXIT),
-            Some(None) => None,
-            Some(Some(code)) => {
-                let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-                if let Some(h) = held.remove(&ident.pid) {
-                    drop(held);
-                    self.clear_record(h.slot, ident.pid);
-                }
+            Some((None, _)) => None,
+            Some((Some(code), slot)) => {
+                drop(self.forget(ident, slot));
                 Some(code)
             }
         }
     }
 
     fn terminate(&self, ident: &ProcIdent) -> Result<(), PortError> {
-        self.signal(ident, Signal::TERM)
+        self.signal(ident, Signal::TERM).map(drop)
     }
 
     fn kill_unserved(&self, ident: &ProcIdent) -> Result<(), PortError> {
-        self.signal(ident, Signal::KILL)?;
-        let entry = self
-            .held
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&ident.pid);
-        if let Some(h) = entry {
-            self.clear_record(h.slot, ident.pid);
-            if let Some(process) = h.process {
-                reap(process);
-            }
-        }
+        let slot = self.signal(ident, Signal::KILL)?;
+        // A child of ours is reaped on a thread; an adopted one is not ours to wait for.
+        self.forget(ident, slot)
+            .and_then(|held| held.process)
+            .into_iter()
+            .for_each(reap);
         Ok(())
     }
 }
 
 impl ProcChild {
-    /// `signal` to exactly the process `ident` names, through its pidfd. A process this port
-    /// does not hold is refused; one that is already gone is not an error.
-    fn signal(&self, ident: &ProcIdent, signal: Signal) -> Result<(), PortError> {
-        let sent = self.lookup(ident, |h| pidfd_send_signal(&h.pidfd, signal));
+    /// `signal` to exactly the process `ident` names, through its pidfd; the slot it is
+    /// held in. A process this port does not hold is refused; one that is already gone is
+    /// not an error.
+    fn signal(&self, ident: &ProcIdent, signal: Signal) -> Result<Slot, PortError> {
+        let sent = self.lookup(ident, |h| (pidfd_send_signal(&h.pidfd, signal), h.slot));
         match sent {
             None => Err(PortError(format!(
                 "process {} is not held by this proxy",
                 ident.pid
             ))),
-            Some(Ok(())) | Some(Err(Errno::SRCH)) => Ok(()),
-            Some(Err(e)) => Err(PortError(format!("signal {}: {e}", ident.pid))),
+            Some((Ok(()) | Err(Errno::SRCH), slot)) => Ok(slot),
+            Some((Err(e), _)) => Err(PortError(format!("signal {}: {e}", ident.pid))),
         }
+    }
+
+    /// Stop holding `ident`, and clear its record: it exited, or it was killed unserved.
+    fn forget(&self, ident: &ProcIdent, slot: Slot) -> Option<Held> {
+        let held = self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&ident.pid);
+        self.clear_record(slot, ident.pid);
+        held
     }
 }
 

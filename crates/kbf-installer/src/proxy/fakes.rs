@@ -126,6 +126,8 @@ pub struct State {
     pub cleared: bool,
     /// Slots the gate closed (`retire` answered `Closed`) and no release opened again.
     pub retired: Vec<Slot>,
+    /// Slots the gate never opened: `retire` answers `NeverOpened`.
+    pub never_opened: Vec<Slot>,
     pub requests: Vec<(Duration, Request)>,
     pub events: Vec<(Duration, String)>,
     pub limit: Duration,
@@ -189,6 +191,7 @@ impl World {
                 active: Slot::A,
                 cleared: false,
                 retired: Vec::new(),
+                never_opened: Vec::new(),
                 requests: Vec::new(),
                 events: Vec::new(),
                 limit: START + secs(48 * 3600),
@@ -738,7 +741,9 @@ impl Gate for World {
     fn retire(&self, slot: Slot) -> Retired {
         let open = self.open_streams(slot);
         let mut st = self.st.borrow_mut();
-        let answer = if st.retired.contains(&slot) {
+        let answer = if st.never_opened.contains(&slot) {
+            Retired::NeverOpened
+        } else if st.retired.contains(&slot) {
             Retired::AlreadyClosed
         } else if slot == st.active && !st.cleared {
             Retired::Current

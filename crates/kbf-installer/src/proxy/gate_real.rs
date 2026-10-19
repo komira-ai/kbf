@@ -36,6 +36,11 @@ fn swap_slot(slot: GateSlot) -> Slot {
     }
 }
 
+/// A refusal of the proxy's gate, as the port reports it.
+fn refused(why: impl std::fmt::Display) -> PortError {
+    PortError(why.to_string())
+}
+
 /// [`Gate`] over a running proxy.
 pub struct ProxyGate {
     pub(super) handle: ProxyHandle,
@@ -72,27 +77,17 @@ impl ProxyGate {
             .ok_or_else(|| PortError("the startup hold is gone: adoption already ran".into()))?;
         let slots = self.handle.slots();
         slots.adopt(gate_slot(active), other.map(gate_slot));
-        let ended = slots
-            .release_into(gate_slot(active))
-            .map_err(|e| PortError(format!("release into {active:?}: {e}")));
-        if ended.is_ok() {
-            drop(guard);
-        } else {
-            // A hold that was not released must not be dropped: park it so the failure
-            // stays visible (held, then expired by bound) instead of ending into nothing.
-            *self.guard.lock().unwrap_or_else(PoisonError::into_inner) = Some(guard);
-        }
-        ended
+        // `adopt` opened `active`, and a closed slot is the only refusal, so this cannot be
+        // refused; the guard then drops inert.
+        slots.release_into(gate_slot(active)).map_err(refused)?;
+        drop(guard);
+        Ok(())
     }
 }
 
 impl Gate for ProxyGate {
     fn hold(&self, max: Duration) -> Result<(), PortError> {
-        let guard = self
-            .handle
-            .slots()
-            .hold(max)
-            .map_err(|e| PortError(e.to_string()))?;
+        let guard = self.handle.slots().hold(max).map_err(refused)?;
         // The previous guard, if any, belongs to a hold that has ended: dropping it does
         // nothing. (`hold` refuses while a hold is in force, so it cannot be a live one.)
         *self.guard.lock().unwrap_or_else(PoisonError::into_inner) = Some(guard);
@@ -103,9 +98,7 @@ impl Gate for ProxyGate {
         let slots = self.handle.slots();
         let gate_slot = gate_slot(slot);
         slots.open(gate_slot);
-        slots
-            .release_into(gate_slot)
-            .map_err(|e| PortError(e.to_string()))?;
+        slots.release_into(gate_slot).map_err(refused)?;
         // The hold ended into `slot`: the guard is inert, and dropping it says so.
         drop(
             self.guard

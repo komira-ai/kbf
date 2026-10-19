@@ -151,3 +151,15 @@ fn a_restart_after_the_stop_clears_the_active_slot_and_waits_for_the_close_again
     assert!(w.count("clear_active") >= 1);
     assert!(w.pos("gate:retire A Closed").unwrap() < w.pos("spawn B").unwrap());
 }
+
+#[test]
+fn an_old_slot_the_gate_never_opened_does_not_stall_the_all_in_one_swap() {
+    // `NeverOpened` is no proof the process is gone, but it is proof no stream was ever
+    // bound to the slot: there is nothing to wait for before the next process starts.
+    let (w, old) = World::with_old();
+    w.st.borrow_mut().never_opened.push(Slot::A);
+    let (end, _) = aio(&w, old);
+    assert_eq!(end, Ok(Phase::Done));
+    assert!(w.count("gate:retire A NeverOpened") >= 1, "{:#?}", w.log());
+    assert!(w.when("spawn B").is_some_and(|t| t < secs(10)));
+}

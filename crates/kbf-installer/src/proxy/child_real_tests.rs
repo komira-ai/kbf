@@ -163,6 +163,9 @@ fn kill_unserved_kills_the_candidate_alone_and_reaps_it() {
     wait_for("the candidate to ignore SIGTERM", || up.exists());
     rig.child.kill_unserved(&candidate).expect("kill");
     wait_for("the candidate to go", || !alive(candidate.pid));
+    wait_for("the candidate to be reaped", || {
+        !Path::new(&format!("/proc/{}", candidate.pid)).exists()
+    });
     assert!(alive(old.pid), "the serving child is untouched");
     assert_eq!(rig.child.exited(&old), None);
     assert_eq!(rig.child.recorded(Slot::B), None, "its record is cleared");
@@ -332,4 +335,100 @@ fn a_pid_recycled_between_the_check_and_the_open_is_refused() {
         verified_open(&recorded, |_| Ok(recorded.clone()), no_pidfd).err(),
         Some(AdoptError::Gone(4242))
     );
+}
+
+/// Catches an identity read that takes a malformed `stat` for a start time, and one that
+/// reads the executable of another entry: over a `/proc` of the test's own.
+#[test]
+fn an_identity_is_the_start_time_and_the_executable_of_that_entry() {
+    let proc = kbf_host::testkit::scratch("child-real-proc");
+    let entry = proc.join("77");
+    fs::create_dir_all(&entry).expect("entry");
+    let tail = "S 1 1 1 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 31337 1000 10 1844";
+    fs::write(entry.join("stat"), format!("77 (kbf) {tail}")).expect("stat");
+    std::os::unix::fs::symlink("/usr/lib/kbf", entry.join("exe")).expect("exe");
+    assert_eq!(
+        ident_in(&proc, 77).expect("identity"),
+        ProcIdent {
+            pid: 77,
+            start_time: 31_337,
+            exe: PathBuf::from("/usr/lib/kbf"),
+        }
+    );
+    fs::write(entry.join("stat"), "77 (kbf)").expect("short stat");
+    let e = ident_in(&proc, 77).expect_err("short");
+    assert!(
+        e.to_string().contains("unreadable") && e.to_string().contains("77"),
+        "{e}"
+    );
+    assert!(ident_in(&proc, 78).is_err(), "no such entry");
+}
+
+/// Catches a slot that an adopted child holds being given a second child: the occupancy
+/// check watches an adopted process by its pidfd, as it watches its own by `try_wait`.
+#[test]
+fn a_slot_held_by_an_adopted_child_refuses_a_spawn_until_that_child_exits() {
+    let rig = rig("child-real-adopted-slot");
+    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let after = rig.restarted();
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
+    let recorded = after.recorded(Slot::A).expect("record");
+    after.adopt(Slot::A, &recorded.ident).expect("adopt");
+    let refused = after
+        .spawn(Slot::A, &c(B))
+        .expect_err("held by the adopted child");
+    assert!(refused.0.contains("live child already"), "{refused}");
+    after.terminate(&ident).expect("signal");
+    wait_for("the adopted child to exit", || {
+        after.exited(&ident).is_some()
+    });
+    rig.set(&["sleep", "600"]);
+    let next = after.spawn(Slot::A, &c(B)).expect("free again");
+    let _stop2 = Cleanup(&after, vec![next]);
+}
+
+/// Catches a started process that cannot be named being left running: when the pidfd or the
+/// identity fails, the spawn fails and the child is killed.
+#[test]
+fn a_started_child_that_cannot_be_identified_is_killed_and_the_spawn_fails() {
+    let rig = rig("child-real-noident");
+    rig.set(&["sleep", "31338"]);
+    let port = rig.restarted().with_identify(|_| Err("no pidfd".into()));
+    let e = port.spawn(Slot::A, &c(A)).expect_err("not identified");
+    assert!(
+        e.0.contains("identify the new child") && e.0.contains("no pidfd"),
+        "{e}"
+    );
+    assert_eq!(port.recorded(Slot::A), None);
+    let root = rig.layout_root.as_os_str().as_encoded_bytes().to_vec();
+    wait_for("the child to be killed", || {
+        !fs::read_dir("/proc")
+            .expect("proc")
+            .flatten()
+            .filter_map(|e| fs::read(e.path().join("cmdline")).ok())
+            .any(|cmd| cmd.starts_with(&root) && cmd.windows(5).any(|w| w == b"31338"))
+    });
+}
+
+/// Catches a signal error being reported as success: a held entry whose descriptor is not a
+/// pidfd fails the signal, and the error names the pid.
+#[test]
+fn a_signal_the_kernel_refuses_is_an_error() {
+    let rig = rig("child-real-badfd");
+    let ident = ProcIdent {
+        pid: 31_339,
+        start_time: 1,
+        exe: PathBuf::from("/x/kbf"),
+    };
+    rig.child.held.lock().expect("lock").insert(
+        ident.pid,
+        Held {
+            slot: Slot::A,
+            ident: ident.clone(),
+            pidfd: OwnedFd::from(fs::File::open("/dev/null").expect("open")),
+            process: None,
+        },
+    );
+    let e = rig.child.terminate(&ident).expect_err("not a pidfd");
+    assert!(e.0.contains("signal 31339"), "{e}");
 }
