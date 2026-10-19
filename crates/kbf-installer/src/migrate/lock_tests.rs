@@ -1,8 +1,8 @@
-//! The two locks of an apply (the old tools', then the installer's): the look the writes are
-//! made from is taken while both are held, they are held to the end, they are waited for only
-//! so long, and nothing is asked of the frontend while they are held. The first two tests
-//! hold a lock from another thread while the verb waits for it, which is the only way to see
-//! on which side of the lock the second look falls.
+//! The two locks of an apply and of a rollback (the old tools', then the installer's): the
+//! look the writes are made from is taken while both are held, they are held to the end, they
+//! are waited for only so long, and nothing is asked of the frontend while they are held. The
+//! tests that hold a lock from another thread while the verb waits for it are the only way
+//! to see on which side of the lock the second look falls.
 
 use std::cell::{Cell, RefCell};
 use std::fs::{self, File, TryLockError};
@@ -193,6 +193,31 @@ fn an_installers_lock_held_past_the_wait_ends_the_run_busy_and_lets_go_of_the_ol
     assert_nothing_migrated(&rig);
 }
 
+/// Catches the installer's lock directory being passed over when it cannot be made: its
+/// lock lives in a directory of its own (on a tmpfs, so a host the installer never ran on
+/// has none), and with a file in its place the run ends (exit 1) naming the lock, with the
+/// old tools' lock let go and nothing migrated.
+///
+/// It pins the result, not the line: a directory whose failure was ignored would end in the
+/// open of the lock, with the same error naming the same path. (It is also what runs the
+/// error arm of `state::make_lock_dir`, which the coverage ratchet counts.)
+#[test]
+fn a_lock_directory_that_cannot_be_made_ends_the_run_and_lets_go_of_the_old_lock() {
+    let mut rig = Rig::linux("lock-dir");
+    fs::write(rig.at("run/kbf-installer"), "").expect("a file where the directory goes");
+    let result = run_migrate(&mut rig, &never(), Mode::Apply);
+    let old_free = is_free(&old_lock_path(&rig));
+
+    let error = result.expect_err("no directory for the lock");
+    assert!(
+        matches!(&error, MigrateError::State(StateError::Lock { path, .. }) if path.ends_with("kbf-installer/lock")),
+        "{error}"
+    );
+    assert_eq!(error.exit().code(), 1);
+    assert!(old_free, "the old tools' lock was let go");
+    assert_nothing_migrated(&rig);
+}
+
 /// Catches an old-tools lock that is not the one the deploy kit takes. The kit's `Locked`
 /// (kbf-deploy `host/state.rs`, and the dev installer's `state.rs` that took over from it)
 /// opens `/run/kbf-deploy.lock` (macOS: `/var/run/kbf-deploy.lock`) and takes `flock(2)` on
@@ -323,6 +348,175 @@ fn both_locks_are_held_for_every_service_command() {
 
     let seen = seen.borrow();
     for verb in ["is-active", "stop", "disable", "daemon-reload", "start"] {
+        assert!(
+            seen.iter().any(|line| line.starts_with(verb)),
+            "{verb} was not seen: {seen:?}"
+        );
+    }
+    for line in seen.iter() {
+        assert!(
+            line.ends_with("old held=true installer held=true"),
+            "{line}"
+        );
+    }
+}
+
+/// A migrated host with the installer's unit running, the service log empty.
+fn migrated(name: &str) -> Rig {
+    let mut rig = Rig::linux(name);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    rig.active
+        .borrow_mut()
+        .insert("kbf-installer.service".to_owned());
+    rig.events.borrow_mut().clear();
+    rig
+}
+
+fn rollback_now(rig: &mut Rig) -> Result<Report, MigrateError> {
+    let m = rig.migration();
+    rollback(&m, &mut rig.host, Mode::Apply)
+}
+
+/// Catches a rollback that decides before it holds the installer's lock: a run of the
+/// installer holds it and activates a release while the rollback waits. What the rollback
+/// judges must be the state after the wait, so it ends `MovedOn` (exit 5) with the installer
+/// still running; a decision made before the lock finds the migration's state, stops the
+/// installer and puts the old units back over a host that runs the new release.
+///
+/// Mutants seen red: the state read before the installer's lock; no installer's lock.
+#[test]
+fn a_rollback_judges_the_state_after_the_wait_for_the_installers_lock() {
+    let mut rig = migrated("rollback-look-after-lock");
+    let held = Locked::acquire(&rig.layout).expect("the installer's lock");
+    let installer = thread::spawn(move || {
+        thread::sleep(PAUSE);
+        let mut state = held.read().expect("read").expect("the migrated state");
+        state.current = Some(commit(OTHER));
+        held.write(&state)
+            .expect("the installer activates a release");
+        drop(held);
+    });
+    let started = Instant::now();
+    let result = rollback_now(&mut rig);
+    installer.join().expect("the installer ends");
+
+    let error = result.expect_err("the release the installer activated was seen");
+    assert!(matches!(error, MigrateError::MovedOn(_)), "{error}");
+    assert_eq!(error.exit().code(), 5);
+    assert!(
+        started.elapsed() >= PAUSE,
+        "the rollback waited for the lock"
+    );
+    assert!(rig.events.borrow().is_empty(), "no service was touched");
+    assert!(rig.active.borrow().contains("kbf-installer.service"));
+}
+
+/// Catches a rollback that is run twice: another rollback holds the installer's lock and
+/// finishes (the journal says `rolled_back`) while this one waits. This one must read the
+/// journal after the wait and have nothing to do; read before it, it restores the units and
+/// starts the services a second time.
+///
+/// Mutant seen red: the journal read before the installer's lock.
+#[test]
+fn a_rollback_another_run_finished_while_this_one_waited_is_not_run_again() {
+    let mut rig = migrated("rollback-finished-meanwhile");
+    let path = rig.new_state_dir().join("migration.json");
+    let mut journal = rig.json(&path);
+    journal["phase"] = json!("rolled_back");
+    journal["stopped"] = json!([]);
+    let held = Locked::acquire(&rig.layout).expect("the installer's lock");
+    let other = thread::spawn(move || {
+        thread::sleep(PAUSE);
+        fs::write(&path, serde_json::to_vec(&journal).expect("json")).expect("the journal");
+        drop(held);
+    });
+    let result = rollback_now(&mut rig);
+    other.join().expect("the other rollback ends");
+
+    let report = result.expect("nothing to do");
+    assert!(
+        report.to_string().contains("already rolled back"),
+        "{report}"
+    );
+    assert!(rig.events.borrow().is_empty(), "no service was touched");
+}
+
+/// Catches a rollback that queues for ever behind a holder of either lock: with the
+/// installer's lock held past its wait the verb ends busy (exit 4) naming it and lets go of
+/// the old tools' lock; with the old tools' lock held it ends busy naming that one; nothing
+/// is changed either time.
+///
+/// Red before the rollback took the locks (it went ahead and put the old layout back).
+/// Mutant seen red: the old tools' lock not let go with the error.
+#[test]
+fn a_rollback_waits_only_so_long_for_each_lock() {
+    let mut rig = migrated("rollback-busy");
+    rig.lock_wait = Duration::from_millis(200);
+    let before = rig.snapshot("");
+
+    let held = Locked::acquire(&rig.layout).expect("the installer's lock");
+    let started = Instant::now();
+    let result = rollback_now(&mut rig);
+    let waited = started.elapsed();
+    let old_free = is_free(&old_lock_path(&rig));
+    drop(held);
+    let error = result.expect_err("busy");
+    assert!(
+        matches!(&error, MigrateError::State(StateError::Busy { path }) if path.ends_with("kbf-installer/lock")),
+        "{error}"
+    );
+    assert_eq!(error.exit().code(), 4);
+    assert!(waited >= Duration::from_millis(200), "waited {waited:?}");
+    assert!(waited < Duration::from_secs(3), "waited {waited:?}");
+    assert!(old_free, "the old tools' lock was let go");
+
+    let held = OldLock::take(&rig.layout, &rig.roots(), Duration::from_secs(5)).expect("old lock");
+    let result = rollback_now(&mut rig);
+    drop(held);
+    let error = result.expect_err("busy");
+    assert!(
+        matches!(&error, MigrateError::State(StateError::Busy { path }) if path.ends_with("kbf-deploy.lock")),
+        "{error}"
+    );
+    assert_eq!(error.exit().code(), 4);
+
+    assert_eq!(rig.snapshot(""), before, "nothing changed");
+    assert!(rig.events.borrow().is_empty(), "no service was touched");
+}
+
+/// Catches a rollback that stops, restores and starts without the locks: every service
+/// command of it (the installer's unit stopped first, the others, the reload, the helper
+/// enabled, the starts) is made with both locks held, so the installer cannot activate a
+/// release half way and no old verb runs while the old layout comes back.
+///
+/// Mutants seen red: the installer's lock taken only after the first stop; the old tools'
+/// lock let go as soon as it is taken.
+#[test]
+fn both_locks_are_held_for_every_service_command_of_a_rollback() {
+    let mut rig = migrated("rollback-locks-held");
+    let (old, installer) = (old_lock_path(&rig), installer_lock_path(&rig));
+    let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+    rig.on_command({
+        let seen = seen.clone();
+        move |verb, unit| {
+            seen.borrow_mut().push(format!(
+                "{verb} {unit}: old held={} installer held={}",
+                !is_free(&old),
+                !is_free(&installer)
+            ));
+        }
+    });
+    rollback_now(&mut rig).expect("rollback");
+
+    let seen = seen.borrow();
+    for verb in [
+        "is-active",
+        "stop",
+        "disable",
+        "daemon-reload",
+        "enable",
+        "start",
+    ] {
         assert!(
             seen.iter().any(|line| line.starts_with(verb)),
             "{verb} was not seen: {seen:?}"

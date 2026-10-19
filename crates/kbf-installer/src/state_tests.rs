@@ -201,6 +201,20 @@ fn a_state_this_build_does_not_know_is_refused() {
     }
 }
 
+/// Catches a lock file that cannot be opened being read as a lock that was taken: with the
+/// lock's directory made and a directory where the file goes, `acquire` ends with the lock
+/// error naming the lock file.
+#[test]
+fn a_lock_file_that_cannot_be_opened_is_a_lock_error_naming_it() {
+    let (root, dir) = host_root("lock-file-is-a-directory");
+    fs::create_dir_all(dir.join("run/kbf-installer/lock")).expect("a directory for the file");
+    let err = Locked::acquire(&root).expect_err("cannot open");
+    assert!(
+        matches!(&err, StateError::Lock { path, .. } if path.ends_with("kbf-installer/lock")),
+        "{err}"
+    );
+}
+
 /// Catches errors read as "no state" or passed over: a lock whose directory is missing,
 /// a state directory that is missing (or holds a stale copy the write cannot clear), and
 /// a state path that is a directory.

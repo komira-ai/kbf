@@ -2,7 +2,7 @@
 //! old helper remembered (`helper.json`), and the releases the `current` and `previous`
 //! links name.
 
-use std::fs::{File, TryLockError};
+use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
@@ -186,18 +186,16 @@ impl OldLock {
             .open(&path)
             .map_err(MigrateError::io(what.as_str()))?;
         let end = Instant::now() + wait;
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(OldLock { file }),
-                Err(TryLockError::WouldBlock) if Instant::now() < end => {
-                    std::thread::sleep(POLL);
-                }
-                Err(TryLockError::WouldBlock) => {
-                    return Err(StateError::Busy { path }.into());
-                }
-                Err(TryLockError::Error(e)) => return Err(MigrateError::io(what)(e)),
+        // A lock that cannot be taken is tried again until the wait is over, as the
+        // installer's own does ([`crate::state::Locked::acquire_within`]): the one thing
+        // that happens is that somebody else holds it.
+        while file.try_lock().is_err() {
+            if Instant::now() >= end {
+                return Err(StateError::Busy { path }.into());
             }
+            std::thread::sleep(POLL);
         }
+        Ok(OldLock { file })
     }
 }
 
