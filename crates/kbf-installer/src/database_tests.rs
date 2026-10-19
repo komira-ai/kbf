@@ -309,3 +309,26 @@ fn the_database_step_prints_what_the_schema_runner_answered() {
     let plan = database_step(&broken, "frontend", false).expect_err("plan failed");
     assert_eq!(plan, "cannot ask");
 }
+
+/// Catches the real `Database` not being what `setup`'s database step asks (the fake-runner
+/// tests drive `database_step` alone): through `SchemaOps`, with a socket directory that does
+/// not exist (so no server is needed), both the plan and the setup reach the database and
+/// answer with its own reason, never the URL.
+///
+/// Mutants to plant: `Database::plan` or `Database::setup` swapped in `impl SchemaOps`.
+#[test]
+fn the_real_database_answers_the_schema_ops_with_its_own_error() {
+    let url = "postgres:///kbf?host=/nonexistent-kbf-test-socket";
+    let db = Database::new(
+        PostgresConfig::parse(url).expect("a url"),
+        schema::embedded(),
+    );
+    let planned = SchemaOps::plan(&db).expect_err("no server to ask");
+    let applied = SchemaOps::setup(&db).expect_err("no server to apply to");
+    for why in [planned, applied] {
+        assert!(
+            !why.is_empty() && !why.contains("nonexistent-kbf-test-socket"),
+            "{why}"
+        );
+    }
+}

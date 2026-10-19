@@ -1495,5 +1495,5 @@ fn a_view_forwards_reads_and_refuses_steps() {
     assert!(view.apply(&step).is_err());
 }
 
-#[path = "tests_more.rs"]
+#[path = "more_tests.rs"]
 mod more;

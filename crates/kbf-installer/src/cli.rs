@@ -80,12 +80,6 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The mode as `--mode` spells it (clap's own name for it, so there is one spelling).
-    pub fn name(self) -> String {
-        self.to_possible_value()
-            .map_or_else(String::new, |v| v.get_name().to_owned())
-    }
-
     /// Whether this mode keeps its state in the Postgres database the installer owns (the
     /// frontend and all-in-one modes; the others keep none).
     pub fn keeps_state_in_database(self) -> bool {
