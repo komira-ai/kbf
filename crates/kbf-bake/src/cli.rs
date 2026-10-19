@@ -111,6 +111,15 @@ struct TagArgs {
     verdict: PathBuf,
 }
 
+/// A message the command line prints before it exits 2; any error converts into one.
+struct Failure(String);
+
+impl<E: std::error::Error> From<E> for Failure {
+    fn from(e: E) -> Self {
+        Self(e.to_string())
+    }
+}
+
 /// Run the command line `args` (the program name first), writing to `out` and `err`; the exit code.
 pub fn execute(args: Vec<OsString>, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     let cli = match Cli::try_parse_from(args) {
@@ -133,29 +142,30 @@ pub fn execute(args: Vec<OsString>, out: &mut dyn Write, err: &mut dyn Write) ->
         Cmd::Run(a) => run(&a, out, err),
         Cmd::TagMessage(a) => tag_message(&a, out),
     };
-    result.unwrap_or_else(|why| {
+    result.unwrap_or_else(|Failure(why)| {
         let _ = writeln!(err, "kbf-bake: {why}");
         EXIT_USAGE
     })
 }
 
-fn tag_message(a: &TagArgs, out: &mut dyn Write) -> Result<u8, String> {
-    let bytes =
-        std::fs::read(&a.verdict).map_err(|e| format!("read {}: {e}", a.verdict.display()))?;
-    let doc = ResultDoc::from_bytes(&bytes).map_err(|e| format!("{}: {e}", a.verdict.display()))?;
+fn tag_message(a: &TagArgs, out: &mut dyn Write) -> Result<u8, Failure> {
+    let bytes = std::fs::read(&a.verdict)
+        .map_err(|e| Failure(format!("read {}: {e}", a.verdict.display())))?;
+    let doc = ResultDoc::from_bytes(&bytes)
+        .map_err(|e| Failure(format!("{}: {e}", a.verdict.display())))?;
     if doc.stage != Stage::Gamma || !doc.passed() {
-        return Err(format!(
+        return Err(Failure(format!(
             "{} is not a finished green gamma verdict (stage {:?}, status {:?}): a tag carries only that",
             a.verdict.display(),
             doc.stage,
             doc.status
-        ));
+        )));
     }
-    out.write_all(&bytes).map_err(|e| e.to_string())?;
+    out.write_all(&bytes)?;
     Ok(EXIT_GREEN)
 }
 
-fn run(a: &RunArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, String> {
+fn run(a: &RunArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Failure> {
     let waiver = waiver_of(a)?;
     for (flag, v, least) in [
         ("--baseline-error-ratio", a.baseline_error_ratio, 0.0),
@@ -166,11 +176,13 @@ fn run(a: &RunArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Stri
         ),
     ] {
         if let Some(v) = v.filter(|v| !v.is_finite() || *v < least) {
-            return Err(format!("{flag} {v} is not a usable baseline"));
+            return Err(Failure(format!("{flag} {v} is not a usable baseline")));
         }
     }
     if a.bake_seconds == 0 || a.interval_seconds == 0 {
-        return Err("--bake-seconds and --interval-seconds must be above zero".to_owned());
+        return Err(Failure(
+            "--bake-seconds and --interval-seconds must be above zero".to_owned(),
+        ));
     }
     let mut state = open_state(a)?;
     if let Some(done) = state.ended {
@@ -207,11 +219,11 @@ fn run(a: &RunArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Stri
     if let Some(w) = waiver {
         eval.waive(w);
     }
-    eval.state().save(&a.state).map_err(|e| e.to_string())?;
-    let run = Run::start(&a.verdict, header, system_clock).map_err(|e| e.to_string())?;
+    eval.state().save(&a.state)?;
+    let run = Run::start(&a.verdict, header, system_clock)?;
     let url = a.metrics_url.clone();
     let log_path = a.updater_log.clone();
-    let outcome = drive(
+    let driven = drive(
         &mut eval,
         run,
         &a.state,
@@ -222,13 +234,13 @@ fn run(a: &RunArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Stri
             UpdaterLog::parse(&bytes).ok()
         },
         &mut |secs| std::thread::sleep(Duration::from_secs(secs)),
-    )
-    .map_err(|e| e.to_string())?;
+    );
+    let outcome = driven?;
     Ok(report(outcome.status, &outcome.note, out, err))
 }
 
 /// The waiver the flags ask for: refused without an operator and a reason.
-fn waiver_of(a: &RunArgs) -> Result<Option<Waiver>, String> {
+fn waiver_of(a: &RunArgs) -> Result<Option<Waiver>, Failure> {
     if !a.waive_min_load {
         return Ok(None);
     }
@@ -236,46 +248,41 @@ fn waiver_of(a: &RunArgs) -> Result<Option<Waiver>, String> {
         a.waive_by.as_deref().unwrap_or(""),
         a.waive_reason.as_deref().unwrap_or(""),
     );
-    Waiver::new(WAIVE_MIN_LOAD, by, why)
-        .map(Some)
-        .map_err(|_| "a waiver needs --waive-by and --waive-reason, and both recorded".to_owned())
+    Waiver::new(WAIVE_MIN_LOAD, by, why).map(Some).map_err(|_| {
+        Failure("a waiver needs --waive-by and --waive-reason, and both recorded".to_owned())
+    })
 }
 
 /// The state to run on: the file's, checked against the identity flags, or a new one.
-fn open_state(a: &RunArgs) -> Result<State, String> {
-    let commit = a
-        .commit
-        .as_deref()
-        .map(CommitId::parse)
-        .transpose()
-        .map_err(|e| e.to_string())?;
+fn open_state(a: &RunArgs) -> Result<State, Failure> {
+    let commit = a.commit.as_deref().map(CommitId::parse).transpose()?;
     let set_hash = a
         .sha256sums
         .as_ref()
         .map(|p| {
             std::fs::read(p)
                 .map(|b| SetHash::of_sums(&b))
-                .map_err(|e| format!("read {}: {e}", p.display()))
+                .map_err(|e| Failure(format!("read {}: {e}", p.display())))
         })
         .transpose()?;
-    if let Some(state) = State::load(&a.state).map_err(|e| e.to_string())? {
+    if let Some(state) = State::load(&a.state)? {
         let same = commit.as_ref().is_none_or(|c| *c == state.commit)
             && set_hash.as_ref().is_none_or(|h| *h == state.set_hash)
             && a.run_id.as_ref().is_none_or(|r| *r == state.run_id);
         if !same {
-            return Err(format!(
+            return Err(Failure(format!(
                 "{} holds the bake of commit {}, run {}: the flags name another",
                 a.state.display(),
                 state.commit.as_str(),
                 state.run_id
-            ));
+            )));
         }
         return Ok(state);
     }
     let (Some(commit), Some(set_hash), Some(run_id)) = (commit, set_hash, a.run_id.clone()) else {
-        return Err(
+        return Err(Failure(
             "a new bake needs --commit, --sha256sums and --run-id (no state file yet)".to_owned(),
-        );
+        ));
     };
     Ok(State::new(
         commit,
@@ -290,7 +297,7 @@ fn report(status: Status, note: &str, out: &mut dyn Write, err: &mut dyn Write) 
     let (word, code) = match status {
         Status::Green => ("green", EXIT_GREEN),
         Status::Red => ("red", EXIT_RED),
-        Status::Extended | Status::Running => ("extended", EXIT_EXTENDED),
+        _ => ("extended", EXIT_EXTENDED),
     };
     let _ = writeln!(
         out,

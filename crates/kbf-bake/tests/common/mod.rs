@@ -39,6 +39,7 @@ pub struct Farm {
     pub untraced: f64,
     pub failed_infra: f64,
     pub failed_user: f64,
+    pub failed_lost: f64,
     pub flush_failures: f64,
     pub mismatches: f64,
     /// Cumulative queue histogram: (le, count); `+Inf` last.
@@ -58,6 +59,7 @@ impl Farm {
             untraced: 0.0,
             failed_infra: 0.0,
             failed_user: 3.0,
+            failed_lost: 0.0,
             flush_failures: 0.0,
             mismatches: 0.0,
             queue: vec![("0.5", requests), ("+Inf", requests)],
@@ -86,7 +88,10 @@ impl Farm {
                 "kbf_failed_actions_total{{class=\"user\"}} {}",
                 self.failed_user
             ),
-            "kbf_failed_actions_total{class=\"lost_input\"} 0".to_owned(),
+            format!(
+                "kbf_failed_actions_total{{class=\"lost_input\"}} {}",
+                self.failed_lost
+            ),
             format!(
                 "kbf_write_tier_flush_failures_total {}",
                 self.flush_failures

@@ -75,7 +75,7 @@ impl Metrics {
     /// without the label is not kept). `Absent` only when no series is named `name` at all,
     /// or one of its series is not finite: a counter family that exists and has no kept member sums
     /// to zero, which is a measurement.
-    pub fn sum_by(&self, name: &str, key: &str, keep: impl Fn(&str) -> bool) -> Sample {
+    pub fn sum_by(&self, name: &str, key: &str, keep: &dyn Fn(&str) -> bool) -> Sample {
         let family = || self.series.iter().filter(|s| s.name == name);
         if family().next().is_none() || family().any(|s| !s.value.is_finite()) {
             return Sample::Absent;

@@ -76,15 +76,8 @@ pub struct Row {
     pub threshold_has: Vec<String>,
 }
 
-/// How the page words a factor: twice, or `N times`.
-fn times(factor: f64) -> String {
-    let n = format!("{factor}");
-    if n == "2" {
-        "twice".to_owned()
-    } else {
-        format!("{n} times")
-    }
-}
+// The page says "twice the baseline"; a different factor is a change to the page's words too.
+const _: () = assert!(ERROR_BASELINE_FACTOR == 2.0);
 
 /// The rows of the page's table, in its order.
 pub fn rows() -> Vec<Row> {
@@ -126,8 +119,7 @@ pub fn rows() -> Vec<Row> {
             hard: yes(),
             measure_has: vec![metric::EXECUTE_ERRORS, metric::EXECUTE_REQUESTS],
             threshold_has: vec![format!(
-                "at most the larger of {} the baseline and the baseline plus **[P]** {ERROR_ADD_POINTS} percentage points",
-                times(ERROR_BASELINE_FACTOR)
+                "at most the larger of twice the baseline and the baseline plus **[P]** {ERROR_ADD_POINTS} percentage points"
             )],
         },
         Row {

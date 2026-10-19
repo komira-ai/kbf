@@ -22,6 +22,9 @@ pub enum StateError {
         /// The error.
         source: std::io::Error,
     },
+    /// The state does not serialise.
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     /// The bytes are not a state file.
     #[error("state file {path} is not a bake state: {why}")]
     Parse {
@@ -43,6 +46,13 @@ pub struct Counter {
 }
 
 impl Counter {
+    /// Take the value `v`: a rise adds the difference, a fall is a restart of the counter and
+    /// adds `v`.
+    pub fn advance(&mut self, v: f64) {
+        self.increase += if v >= self.last { v - self.last } else { v };
+        self.last = v;
+    }
+
     /// Follow `sample` in `slot`; the total increase, or `None` when the series is absent now.
     pub fn follow(slot: &mut Option<Counter>, sample: Sample) -> Option<f64> {
         let Sample::Value(v) = sample else {
@@ -52,8 +62,7 @@ impl Counter {
             last: v,
             increase: 0.0,
         });
-        c.increase += if v >= c.last { v - c.last } else { v };
-        c.last = v;
+        c.advance(v);
         Some(c.increase)
     }
 }
@@ -206,10 +215,7 @@ impl State {
 
     /// Write the state to `path`, atomically.
     pub fn save(&self, path: &Path) -> Result<(), StateError> {
-        let mut bytes = serde_json::to_vec_pretty(self).map_err(|e| StateError::Parse {
-            path: path.display().to_string(),
-            why: e.to_string(),
-        })?;
+        let mut bytes = serde_json::to_vec_pretty(self)?;
         bytes.push(b'\n');
         write_atomic(path, &bytes).map_err(|source| StateError::Io {
             op: "write",

@@ -187,17 +187,17 @@ fn sum_by_adds_the_kept_label_values_and_a_missing_family_is_absent() {
     let m = Metrics::parse(FAILURES).unwrap();
     let farm = |c: &str| c == "infra" || c.starts_with("lost_");
     assert_eq!(
-        m.sum_by("kbf_failed_actions_total", "class", farm),
+        m.sum_by("kbf_failed_actions_total", "class", &farm),
         Sample::Value(3.0)
     );
     // The family is there and nothing is kept: zero is a measurement.
     assert_eq!(
-        m.sum_by("kbf_failed_actions_total", "class", |_| false),
+        m.sum_by("kbf_failed_actions_total", "class", &|_| false),
         Sample::Value(0.0)
     );
-    assert_eq!(m.sum_by("kbf_nope_total", "class", farm), Sample::Absent);
+    assert_eq!(m.sum_by("kbf_nope_total", "class", &farm), Sample::Absent);
     let odd = Metrics::parse("kbf_f{class=\"infra\"} NaN\nkbf_f{class=\"x\"} 1\n").unwrap();
-    assert_eq!(odd.sum_by("kbf_f", "class", |_| false), Sample::Absent);
+    assert_eq!(odd.sum_by("kbf_f", "class", &|_| false), Sample::Absent);
 }
 
 /// Catches buckets left in scrape order, counts of one label set only, an infinite bound

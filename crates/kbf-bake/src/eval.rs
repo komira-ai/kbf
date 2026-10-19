@@ -103,7 +103,7 @@ impl Evaluator {
         let m = o.metrics;
         let failed = Counter::follow(
             &mut c.failed,
-            m.sum_by(metric::FAILED_BY_CLASS, metric::CLASS_LABEL, is_farm_class),
+            m.sum_by(metric::FAILED_BY_CLASS, metric::CLASS_LABEL, &is_farm_class),
         );
         let losses = Counter::follow(&mut c.losses, m.sum(metric::BLOB_LOSSES));
         let errors = Counter::follow(&mut c.errors, m.sum(metric::EXECUTE_ERRORS));
@@ -305,11 +305,7 @@ fn follow_histogram(acc: &mut Vec<BucketCount>, m: &Metrics) -> bool {
                 acc.len() - 1
             }
         };
-        let mut slot = Some(acc[at].count);
-        Counter::follow(&mut slot, Sample::Value(count));
-        if let Some(c) = slot {
-            acc[at].count = c;
-        }
+        acc[at].count.advance(count);
     }
     true
 }

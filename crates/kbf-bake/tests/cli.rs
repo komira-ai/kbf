@@ -201,7 +201,13 @@ fn thin_usage_extends_and_a_second_run_keeps_the_clock() {
     let before = State::load(&f.state).unwrap().unwrap();
 
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    let (code, _, _) = exec(&run_args(&f, &farm.url, &[]));
+    // A later run needs only the files and the endpoint: the identity is in the state.
+    let mut again = run_args(&f, &farm.url, &[]);
+    for flag in ["--commit", "--sha256sums", "--run-id"] {
+        let at = again.iter().position(|x| x == flag).unwrap();
+        again.drain(at..at + 2);
+    }
+    let (code, _, _) = exec(&again);
     assert_eq!(code, EXIT_EXTENDED);
     let after = State::load(&f.state).unwrap().unwrap();
     assert_eq!(after.bake_start, before.bake_start);
@@ -255,6 +261,18 @@ fn a_state_file_of_another_bake_is_refused() {
     let at = args.iter().position(|a| *a == "ab".repeat(20)).unwrap();
     args[at] = "cd".repeat(20);
     assert_eq!(exec(&args).0, EXIT_USAGE);
+    // Another release set: the same commit and run, other bytes in SHA256SUMS.
+    let other = f.sums.with_file_name("SHA256SUMS.other");
+    std::fs::write(&other, b"4567  other.tar.gz\n").unwrap();
+    let mut args = run_args(&f, &farm.url, &[]);
+    let at = args
+        .iter()
+        .position(|a| *a == f.sums.to_str().unwrap())
+        .unwrap();
+    args[at] = other.to_str().unwrap().to_owned();
+    let (code, _, err) = exec(&args);
+    assert_eq!(code, EXIT_USAGE);
+    assert!(err.contains("holds the bake of commit"), "{err}");
     assert_eq!(std::fs::read(&f.state).unwrap(), before);
 }
 
@@ -262,10 +280,9 @@ fn a_state_file_of_another_bake_is_refused() {
 #[test]
 fn a_farm_that_is_down_extends_the_bake_and_pages() {
     let f = files("cli-down");
-    let dead = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/metrics", dead.local_addr().unwrap());
-    drop(dead);
-    let (code, _, err) = exec(&run_args(&f, &url, &WAIVE));
+    // Port 1 has no listener; a port bound and dropped here could be taken by another test's server.
+    let url = "http://127.0.0.1:1/metrics";
+    let (code, _, err) = exec(&run_args(&f, url, &WAIVE));
     assert_eq!(code, EXIT_EXTENDED);
     assert!(
         err.starts_with("PAGE: the gamma bake is extended: the farm could not be read 3 times"),
@@ -293,15 +310,35 @@ fn wrong_commands_and_inputs_are_usage_errors() {
             "{err}"
         );
     }
-    for bad in [
-        &["--baseline-error-ratio=-0.5"][..],
-        &["--baseline-error-ratio=NaN"],
-        &["--baseline-queue-p99=0"],
-        &["--bake-seconds=0"],
-        &["--interval-seconds=0"],
-        &["--no-such-flag"],
-        &["--deploy-start=5"],
+    for (flag, value, want) in [
+        (
+            "--baseline-error-ratio",
+            "-0.5",
+            "--baseline-error-ratio -0.5 is not a usable baseline",
+        ),
+        (
+            "--baseline-error-ratio",
+            "NaN",
+            "--baseline-error-ratio NaN is not a usable baseline",
+        ),
+        (
+            "--baseline-queue-p99",
+            "0",
+            "--baseline-queue-p99 0 is not a usable baseline",
+        ),
+        ("--bake-seconds", "0", "must be above zero"),
+        ("--interval-seconds", "0", "must be above zero"),
+        ("--state", "/no/such/dir/state.json", "write state file"),
     ] {
+        let mut a = run_args(&f, &farm.url, &[]);
+        let at = a.iter().position(|x| x == flag).unwrap();
+        a.drain(at..at + 2);
+        a.push(format!("{flag}={value}"));
+        let (code, _, err) = exec(&a);
+        assert_eq!(code, EXIT_USAGE, "{flag} {value}");
+        assert!(err.contains(want), "{flag} {value}: {err}");
+    }
+    for bad in [&["--no-such-flag"][..], &["--deploy-start=5"]] {
         let (code, _, _) = exec(&run_args(&f, &farm.url, bad));
         assert_eq!(code, EXIT_USAGE, "{bad:?}");
     }
@@ -347,4 +384,20 @@ fn the_deploy_window_and_generation_are_in_the_verdict() {
     assert_eq!(doc.desired_generation, Some(7));
     let d = doc.deploy.unwrap();
     assert_eq!((d.start, d.end), (100, Some(900)));
+}
+
+/// Catches a missing baseline passing: a bake started without the two baselines has a red error
+/// gate and a red latency gate, and ends red.
+#[test]
+fn a_bake_without_baselines_ends_red() {
+    let f = files("cli-no-baseline");
+    let farm = serve(Farm::healthy(0.0).text());
+    let mut a = run_args(&f, &farm.url, &WAIVE);
+    for flag in ["--baseline-error-ratio", "--baseline-queue-p99"] {
+        let at = a.iter().position(|x| x == flag).unwrap();
+        a.drain(at..at + 2);
+    }
+    let (code, _, err) = exec(&a);
+    assert_eq!(code, EXIT_RED);
+    assert!(err.contains("`error-rate` is red"), "{err}");
 }

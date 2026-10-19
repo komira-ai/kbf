@@ -541,3 +541,127 @@ fn a_state_file_with_a_waiver_without_a_reason_is_refused() {
             .contains("not a bake state")
     );
 }
+
+/// Catches a zero-failure gate wired to the wrong series, or to the wrong classes: each series
+/// moving by one ends the bake red naming its own gate, and a user's failing action is not the
+/// farm's failure.
+#[test]
+fn each_zero_gate_reads_its_own_series() {
+    type Break = fn(&mut Farm);
+    let cases: [(&str, Break); 7] = [
+        ("farm-class-failures", |f| f.failed_infra = 1.0),
+        ("lost-blobs", |f| f.lost_blobs = 1.0),
+        ("blob-losses-delta", |f| f.losses = 1.0),
+        ("relay-untraced", |f| f.untraced = 1.0),
+        ("write-tier-flush-failures", |f| f.flush_failures = 1.0),
+        ("write-tier-digest-mismatches", |f| f.mismatches = 1.0),
+        ("farm-class-failures", |f| f.failed_lost = 1.0),
+    ];
+    for (name, change) in cases {
+        let mut e = evaluator(86_400);
+        first(&mut e);
+        let mut farm = Farm::healthy(10.0);
+        change(&mut farm);
+        let d = observe(&mut e, T0 + 60, &farm, 12, Some(&quiet_log()));
+        assert!(
+            ended(&d).note.contains(&format!("`{name}` is red")),
+            "{name}: {}",
+            ended(&d).note
+        );
+        let also: Vec<&str> = d
+            .gates
+            .iter()
+            .filter(|g| g.name != name && g.verdict == Verdict::Red)
+            .map(|g| g.name.as_str())
+            .collect();
+        assert!(also.is_empty(), "{name}: {also:?} are red as well");
+    }
+    // The user's own failures are not the farm's.
+    let mut e = evaluator(86_400);
+    first(&mut e);
+    let d = observe(
+        &mut e,
+        T0 + 60,
+        &Farm {
+            failed_user: 500.0,
+            ..Farm::healthy(10.0)
+        },
+        12,
+        Some(&quiet_log()),
+    );
+    assert_eq!(d.end, None);
+}
+
+/// Catches a waiver recorded twice when the operator repeats the flag on a restart.
+#[test]
+fn the_same_waiver_is_recorded_once() {
+    let mut e = evaluator(60);
+    for reason in ["holiday week", "again"] {
+        e.waive(Waiver::new("min-load", "operator", reason).unwrap());
+    }
+    assert_eq!(e.state().waivers.len(), 1);
+    assert_eq!(e.state().waivers[0].reason, "holiday week");
+    e.waive(Waiver::new("something-else", "operator", "x").unwrap());
+    assert_eq!(e.state().waivers.len(), 2);
+}
+
+/// Catches a node step whose edges are off: both ends are inside, one second either side is
+/// outside, and a step with no end runs from its start on.
+#[test]
+fn a_node_step_is_a_closed_window() {
+    let log = UpdaterLog {
+        steps: vec![Step {
+            host: "a".into(),
+            start: 100,
+            end: Some(200),
+        }],
+        restarts: vec![],
+    };
+    let inside: Vec<bool> = [99, 100, 150, 200, 201].map(|t| log.in_step(t)).to_vec();
+    assert_eq!(inside, [false, true, true, true, false]);
+    let open = UpdaterLog {
+        steps: vec![Step {
+            host: "a".into(),
+            start: 100,
+            end: None,
+        }],
+        restarts: vec![],
+    };
+    assert_eq!(
+        [99, 100, 9_999].map(|t| open.in_step(t)),
+        [false, true, true]
+    );
+    assert!(
+        UpdaterLog::parse(b"{\"steps\": 3}")
+            .unwrap_err()
+            .to_string()
+            .starts_with("updater log:")
+    );
+    assert!(UpdaterLog::parse(br#"{"steps":[],"restarts":[],"extra":1}"#).is_err());
+}
+
+/// Catches a latency gate that passes on a farm that never exposed the histogram.
+#[test]
+fn a_farm_without_the_queue_histogram_from_the_start_fails_the_latency_gate() {
+    let mut e = evaluator(86_400);
+    let none = Farm::healthy(0.0).without("kbf_execute_queued_seconds");
+    observe(&mut e, T0, &none, 0, Some(&quiet_log()));
+    let d = observe(
+        &mut e,
+        T0 + 60,
+        &Farm::healthy(1000.0).without("kbf_execute_queued_seconds"),
+        12,
+        Some(&quiet_log()),
+    );
+    assert_eq!(gate(&d, "latency-p99-ratio").verdict, Verdict::Red);
+    assert_eq!(gate(&d, "latency-p99-ratio").measured, None);
+}
+
+/// Catches a state file that cannot be read being taken for no state file: a directory where
+/// the file should be is an error, not a new bake.
+#[test]
+fn a_state_path_that_cannot_be_read_is_an_error_not_a_new_bake() {
+    let dir = scratch("state-unreadable");
+    let err = State::load(&dir).unwrap_err().to_string();
+    assert!(err.starts_with("read state file"), "{err}");
+}
