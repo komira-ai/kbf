@@ -257,6 +257,7 @@ impl Membership for MembershipService {
             protocol: req.protocol,
             progress: Progress::from_wire(req.catching_up),
         };
+        let last = crate::members::LastBoot::from_wire(req.last_member_id, req.last_boot);
         let members = Arc::clone(&self.members);
         let source = self
             .store_config
@@ -268,7 +269,7 @@ impl Membership for MembershipService {
             if let Some(peer) = &peer {
                 refuse_denied(peer, &members.denied()?)?;
             }
-            let joined = members.register(&who)?;
+            let joined = members.register_after(&who, last)?;
             Ok((joined, announced(source.as_ref())))
         })
         .await?;

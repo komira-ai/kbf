@@ -1650,6 +1650,7 @@ async fn a_frontend_with_a_state_store_shows_the_storage_health() {
             zone: String::new(),
             catching_up: true,
             protocol: kbf_server::members::PROTOCOL,
+            ..Default::default()
         })
         .await
         .expect("registers");
@@ -1848,6 +1849,7 @@ async fn a_frontend_with_members_writes_where_the_map_says() {
         zone: String::new(),
         protocol: kbf_server::members::PROTOCOL,
         catching_up: false,
+        ..Default::default()
     };
     // One member: still that node, whatever address it advertises.
     membership

@@ -113,6 +113,13 @@ message RegisterRequest {
   // The node is rebuilding its index: it enters the map as CATCHING_UP, not JOINING, and
   // answers what it cannot find UNAVAILABLE until a heartbeat reports the rebuild done.
   bool catching_up = 7;
+  // The member id and boot the node's metadata log last wrote as (0, 0: none, or an older
+  // node that does not say). The frontend gives a node it has not seen the member id named
+  // here when no instance holds it, and a boot above last_boot, so a node whose log has run
+  // before is not refused for a boot it already used and restarted once per old boot. A
+  // known instance keeps the id the frontend holds for it; the report only raises its boot.
+  uint64 last_member_id = 8;
+  uint64 last_boot = 9;
 }
 
 message RegisterResponse {

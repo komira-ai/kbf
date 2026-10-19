@@ -260,27 +260,33 @@ units carry `RestartPreventExitStatus=2` and `RestartSec=5`, so exit 2 stays dow
 - **Exit 75, not ready.** Named by the failure's type, never by its text: the metadata
   or cold-store directory held by a process that is still stopping (its `LOCK`), a file
   system call that failed because the device was busy, read-only or full, and a
-  registration whose boot the node's metadata log has set already (`StaleWriter`, below).
+  registration whose boot the node's metadata log has set already (`StaleWriter`, below: only a node that did not report its history, or one past the clamp).
   A frontend or daemon that fails to start is not covered: `frontend` and `kbf-server`
   exit 2 for every start error, and the daemon half's own codes are unchanged.
 
-**After restoring the frontend's state store from an older copy.** The frontend hands each
-node its member id and a boot counter from the store (`boot/<id>`, one more at every
-registration); a node's metadata log remembers the latest boot it wrote as. A restored
-store's counters are behind the nodes' logs, so a node registers, is given a boot its log
-has set already, refuses to open ("member M boot B is not after boot C, the latest set",
-no object is written), says on stderr that the state store is older than its log and to
-wait, and exits 75. systemd starts it again; that start registers again
-and takes the next boot, and the node opens as soon as its boot is past its log's. A gap
-of N boots therefore takes N restarts, about N times five seconds plus the start, each
-node on its own counter and all in parallel; nothing needs to be done but wait, and a node
-is not up before that. Restarting the unit by hand only spends one boot sooner. A node's
-boot rises at every registration (each restart, each lapsed heartbeat row), so a node
-that has run for months can have a gap of hundreds. Do not wipe a node's `--meta-dir` to
-skip the wait: that throws its index away. The frontend cannot refuse to start from a
-store older than its nodes' boots, because it learns a node's boot only when the node
-registers, after the frontend is up. Until a node has opened it serves nothing, though
-its registration put it in the frontend's map; calls routed to it fail.
+**A new or restored state store, and the nodes' boots.** The frontend hands each node its
+member id and a boot counter from the store (`boot/<id>`, one more at every registration);
+a node's metadata log remembers the latest boot it wrote as, per member, and refuses a boot
+that is not after it ("member M boot B is not after boot C, the latest set", no object is
+written). A store that counts from 1 (a fresh Postgres, a copy restored from before the
+node's later boots) would hand a node that has run before a boot its log has set already.
+So a registration carries the member id and boot the node's log last wrote as, and the
+store answers with a boot above it: a new instance is given the member id its log names if
+no other instance holds it, with its counter raised past the reported boot in the same
+transaction that creates the instance (and its joiner mark, when the farm holds data); a
+known instance keeps its id and its counter is raised above the log's if it was behind.
+The node opens on its first registration, with no restart, and counters are only ever
+raised. Two cases still cost restarts: a node that names an id another instance holds is
+given a new id (which its log has not set, so it opens at once, but its history under the
+old id is not continued), and a node of a build before the report, or one whose boot is
+past the clamp of 4096 the frontend raises a counter by in one registration, is refused a
+boot its log has set, says on stderr that the state store is older than its log and to
+wait, and exits 75. systemd starts it again; that start registers again and takes the next
+boot, so a gap of N boots takes N restarts, about N times five seconds plus the start, each
+node on its own counter and all in parallel. Restarting the unit by hand only spends one
+boot sooner. Do not wipe a node's `--meta-dir` to skip the wait: that throws its index
+away. The frontend cannot refuse to start from a store older than its nodes' boots,
+because it learns a node's boot only when the node registers, after the frontend is up.
 
 ### The state store: Postgres for the frontend
 

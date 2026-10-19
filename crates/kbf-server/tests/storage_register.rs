@@ -760,6 +760,7 @@ async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
         zone: String::new(),
         protocol: kbf_server::members::PROTOCOL,
         catching_up: false,
+        ..Default::default()
     };
     let found = until_async("the node in the frontend's map", || {
         let (mut probe, request) = (probe.clone(), request.clone());

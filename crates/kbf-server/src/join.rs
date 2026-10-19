@@ -28,7 +28,7 @@ use tokio::sync::watch;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
-use crate::members::PROTOCOL;
+use crate::members::{LastBoot, PROTOCOL};
 use crate::node_map::NodeMap;
 use crate::storage_health::Debts;
 
@@ -96,6 +96,7 @@ pub struct Joiner {
     repairs: Option<Arc<Repairs>>,
     catch_up: CatchUp,
     node: Arc<NodeMap>,
+    last: Option<LastBoot>,
 }
 
 impl Joiner {
@@ -111,7 +112,16 @@ impl Joiner {
             repairs: None,
             catch_up: CatchUp::caught_up(),
             node: Arc::new(NodeMap::new(Arc::new(MapHolder::new()))),
+            last: None,
         }
+    }
+
+    /// The joiner of a node whose metadata log last wrote as `last`: every registration
+    /// says so, and the frontend gives a boot above it ([`LastBoot`]).
+    #[must_use]
+    pub fn with_last_boot(mut self, last: Option<LastBoot>) -> Self {
+        self.last = last;
+        self
     }
 
     /// Draws the jitter of every wait from `unit` (a number in `[0, 1)`) instead of the
@@ -199,6 +209,8 @@ impl Joiner {
                 zone: who.zone.clone(),
                 protocol: PROTOCOL,
                 catching_up: self.catch_up.is_catching_up(),
+                last_member_id: self.last.map_or(0, |l| l.member),
+                last_boot: self.last.map_or(0, |l| l.boot),
             })
             .await?
             .into_inner();

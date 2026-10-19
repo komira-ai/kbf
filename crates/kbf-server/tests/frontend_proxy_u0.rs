@@ -184,7 +184,7 @@ fn only_the_history_chunk_and_header_rows_carry_the_writer_id() {
 }
 
 /// The families that membership writes to the store, from a registration on a fresh store.
-/// The design's table names none of `instance/`, `member/`, `map`, `member-id`, `boot/`
+/// The design's table names none of `instance/`, `member/`, `member-owner/`, `map`, `member-id`, `boot/`
 /// (the code's module docs list them). Catches a U2 table built from the design's guess.
 #[test]
 fn membership_writes_these_key_families() {
@@ -205,7 +205,7 @@ fn membership_writes_these_key_families() {
         .collect();
     assert_eq!(
         families.into_iter().collect::<Vec<_>>(),
-        ["instance", "map", "member", "meta"],
+        ["instance", "map", "member", "member-owner", "meta"],
         "rows: {keys:?}"
     );
     assert!(keys.contains(&"meta/members_formed".to_owned()), "{keys:?}");

@@ -51,7 +51,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
-use kbf_front::{Cache, CacheStorage, MetaLog as _, ObjectKeys, RebuildConfig, SegmentsConfig};
+use kbf_front::{
+    Cache, CacheStorage, MetaLog as _, MetaLogError, ObjectKeys, RebuildConfig, SegmentsConfig,
+};
 use kbf_log::{FarmLogId, MachineVersion};
 use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
@@ -65,6 +67,7 @@ use kbf_tls::{TlsFiles, TlsSource};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use crate::join::{self, Joined, Joiner};
+use crate::members::LastBoot;
 use crate::node_map::NodeMap;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, Registered, bind_node};
@@ -612,7 +615,10 @@ pub(crate) async fn open_cache<O: ObjectStore>(
             } else {
                 CatchUp::rebuilding()
             };
-            let mut joiner = joiner.with_catch_up(catch_up.clone());
+            // The member and boot the log last wrote as: a store that counts from 1 gives
+            // the node a boot above it, so the open below is not refused.
+            let last = last_boot(&meta).await?;
+            let mut joiner = joiner.with_catch_up(catch_up.clone()).with_last_boot(last);
             let joined = joiner.join().await;
             let cache = open_registered(meta, store, keys, &joined).await?;
             let joiner = Some((joiner, joined));
@@ -636,6 +642,16 @@ pub(crate) async fn open_cache<O: ObjectStore>(
             },
         ),
     })
+}
+
+/// The member and boot `meta` last wrote as (the node writer it set last), which the node
+/// tells the frontend when it registers; `None` for a log that has set none.
+///
+/// # Errors
+/// The log cannot be read.
+async fn last_boot(meta: &RaftMetaLog<StdFs>) -> Result<Option<LastBoot>, MetaLogError> {
+    let writer = meta.query(|state| state.current_writer()).await?;
+    Ok(writer.and_then(|w| LastBoot::from_wire(w.member().get(), w.boot().get())))
 }
 
 /// The prefix a node writer's keys go under: the log's key prefix, `<root><log id>/`,
