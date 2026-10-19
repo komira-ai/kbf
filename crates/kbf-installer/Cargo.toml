@@ -34,6 +34,7 @@ bytes.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
+httparse.workspace = true
 hyper.workspace = true
 kbf-host.workspace = true
 kbf-update.workspace = true
