@@ -50,10 +50,10 @@ async fn serve(routes: Routes) -> SocketAddr {
 /// its blobs go one ByteStream write each, read from their files, so this is also the fallback's test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_tree_costs_one_find_missing_call_per_thousand_digests() {
-    let upper = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-driver-container-find-missing")
-        .join(std::process::id().to_string());
-    let _ = std::fs::remove_dir_all(&upper);
+    let upper = kbf_testkit::dir::TestDir::under(
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-driver-container-find-missing"),
+        "upper",
+    );
     std::fs::create_dir_all(upper.join("out")).expect("mkdir");
     let cache = Arc::new(Cache::memory());
     let mut held = Vec::new();

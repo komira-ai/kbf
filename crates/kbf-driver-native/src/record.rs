@@ -534,16 +534,8 @@ mod tests {
     /// Long enough for any descriptor a test holds to be closed.
     const BUSY_WAIT: Duration = Duration::from_secs(2);
 
-    fn dir(name: &str) -> PathBuf {
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit")
-            .join(format!("record-{name}-{}", std::process::id()));
-        let _ = kbf_outputs::remove_tree(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
+    fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+        crate::unit_dir(&format!("record-{name}"))
     }
 
     /// A gated command running `program` with `args` and no environment.

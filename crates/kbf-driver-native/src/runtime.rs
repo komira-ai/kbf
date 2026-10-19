@@ -1437,13 +1437,8 @@ mod tests {
             !rustix::process::geteuid().is_root(),
             "run this test as a user"
         );
-        let scratch = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit")
-            .join(format!("pool-{}", std::process::id()));
-        let mut config = NativeConfig::new(scratch.clone());
+        let scratch = crate::unit_dir("runtime-pool");
+        let mut config = NativeConfig::new(scratch.to_path_buf());
         config.pool = crate::slots::Pool::provisioned(1, 700).ok();
         let refused = NativeRuntime::new(config, Arc::new(NoCas)).expect_err("started");
         #[cfg(target_os = "macos")]
@@ -1460,14 +1455,8 @@ mod tests {
     /// report, and an installed Xcode missing from the status.
     #[test]
     fn a_survey_changes_the_xcodes_actions_may_name() {
-        let scratch = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit")
-            .join(format!("apply-{}", std::process::id()));
-        let _ = kbf_outputs::remove_tree(&scratch);
-        let mut config = NativeConfig::new(scratch.clone());
+        let scratch = crate::unit_dir("runtime-apply");
+        let mut config = NativeConfig::new(scratch.to_path_buf());
         config.xcodes = BTreeMap::from([("1A".to_owned(), PathBuf::from("/A/Contents/Developer"))]);
         let runtime = NativeRuntime::new(config, Arc::new(NoCas)).expect("runtime");
         let network = (
@@ -1730,13 +1719,7 @@ mod tests {
     /// record once they have all ended.
     #[test]
     fn a_dropped_run_keeps_its_record_only_while_processes_survive() {
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit")
-            .join(format!("group-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dir = crate::unit_dir("runtime-group");
         let record = dir.join("lease-5-5");
         std::fs::write(&record, "x").expect("write");
         let me = i32::try_from(std::process::id()).expect("pid");
@@ -1789,14 +1772,8 @@ mod tests {
     async fn a_busy_program_is_retried() {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let program = dir.join(format!("busy-{}", std::process::id()));
-        let _ = std::fs::remove_file(&program);
+        let dir = crate::unit_dir("runtime-busy");
+        let program = dir.join("busy");
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

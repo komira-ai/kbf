@@ -91,16 +91,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    fn dir(name: &str) -> PathBuf {
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-container-unit")
-            .join(format!("keeper-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
+    fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+        crate::unit_dir(&format!("keeper-{name}"))
     }
 
     /// Whether `file` holds `text` within `within`.

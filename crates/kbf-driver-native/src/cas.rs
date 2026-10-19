@@ -64,13 +64,8 @@ mod tests {
     /// than yielded and ending the stream.
     #[tokio::test]
     async fn a_file_is_read_in_chunks_to_its_end() {
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join(format!("chunks-{}", std::process::id()));
+        let dir = crate::unit_dir("cas-chunks");
+        let path = dir.join("chunks");
         let bytes: Vec<u8> = (0..(2 * WRITE_CHUNK_BYTES + 3))
             .map(|i| (i % 251) as u8)
             .collect();
