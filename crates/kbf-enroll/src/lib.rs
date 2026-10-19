@@ -15,8 +15,8 @@
 //! - [`keys`]: the object-store keys a storage node fetches over its mutual-TLS session
 //!   and holds in memory only.
 //!
-//! This is a library; the `kbf enroll` and `kbf node` verbs that call it are another
-//! crate's (`docs/design/install-and-enrollment.md`, unit B4b). Time is always a
+//! This is a library; the start of a node mode (`kbf --mode=storage|daemon|storage-and-daemon`)
+//! that calls it is another crate's (`docs/design/install-and-enrollment.md`, unit B4b). Time is always a
 //! parameter, so every decision is tested without a clock.
 
 #![forbid(unsafe_code)]

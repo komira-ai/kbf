@@ -618,8 +618,8 @@ fn the_map_clamps_replication_and_reports_its_generation() {
 
 /// Catches: values in the store that the code cannot read being treated as empty or
 /// panicking: a member row that is not a message, a row without a member, a map that is
-/// not a message, a map the domain refuses, and an instance entry that is not an id. Each
-/// is an error that names it.
+/// not a message, a map the domain refuses (also for a registration, which reads the map
+/// for its floor), and an instance entry that is not an id. Each is an error that names it.
 #[test]
 fn unreadable_rows_are_errors_not_defaults() {
     let put = |s: &Arc<Hooked>, key: &str, value: Vec<u8>| {
@@ -647,6 +647,18 @@ fn unreadable_rows_are_errors_not_defaults() {
     put(&s, "map", pb::Map::default().encode_to_vec());
     assert!(corrupt(m.current_map().expect_err("generation 0")).starts_with("map"));
 
+    // A registration is judged by the map's floor, so a map that does not read refuses it
+    // (a floor is never guessed) before it is given an identity.
+    let e = m.register(&node(1)).expect_err("unreadable map");
+    assert!(corrupt(e).starts_with("map"));
+    assert_eq!(
+        s.fake.get("instance/node-1").expect("read"),
+        None,
+        "a registration refused for its map was given an identity"
+    );
+
+    let s = Hooked::new();
+    let m = members(&s, config(30, 120));
     put(&s, "instance/node-1", b"abc".to_vec());
     let e = m.register(&node(1)).expect_err("bad id");
     assert!(corrupt(e).contains("instance"));

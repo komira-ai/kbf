@@ -4,6 +4,8 @@
 
 #[path = "support/hooked.rs"]
 mod hooked;
+#[path = "support/looks.rs"]
+mod looks;
 mod support;
 
 use std::net::SocketAddr;
@@ -27,6 +29,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
+
+/// The tick of every server here: one that does not come within a test. The offers' poll and
+/// the update controller look at every tick, and their reads of the store meet the injections
+/// of [`hooked::Hooked`] that a test arms for a request (`support/looks.rs` says why). No test
+/// here waits for a tick: they are HTTP calls against the rows.
+const TICK: Duration = Duration::from_secs(3600);
+
+/// The reads of `(update/desired, deny/)` the server makes by itself as it starts: the offers'
+/// poll and the update controller read `update/desired` once each (no release is desired yet),
+/// and the sweeper's refresh reads `deny/` ([`looks::Looks`]). A test that arms an injection
+/// first waits for them; the test below it holds the numbers.
+const START_LOOKS: (usize, usize) = (2, 1);
 
 struct Dir(PathBuf);
 
@@ -58,7 +72,7 @@ fn listeners() -> Listeners {
         worker_tls: None,
         heartbeat_interval: INTERVAL,
         hello_wait: HELLO_WAIT,
-        tick: Duration::from_millis(50),
+        tick: TICK,
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
@@ -502,13 +516,20 @@ async fn the_policy_row_is_shown_when_it_exists() {
 /// fails (or panics inside its blocking task) is 500 saying the rows failed, on the view, the
 /// offer and pause, and a policy read that fails after the desired read succeeded is 500
 /// too; nothing is written by the offer that could not read.
+///
+/// Each failure is armed for one read, which must be the handler's: the server's own readers
+/// of the store (the offers' poll, the update controller and the membership sweeper) look
+/// once each at start, which the test waits for (`START_LOOKS`), and not again within the
+/// test (`TICK` and the sweeper's beat).
 #[tokio::test]
 async fn a_state_store_that_fails_is_a_500_not_an_empty_answer() {
     let dir = Dir::new();
     let store =
         Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
     let hooked = hooked::Hooked::new();
+    let looks = looks::Looks::count(&hooked);
     let running = start(Some(store), Some(state_over(hooked.clone())), &dir);
+    looks.done(START_LOOKS).await;
     put(&running, A, true).await;
     let fails = |n: usize| {
         hooked
@@ -553,6 +574,31 @@ async fn a_state_store_that_fails_is_a_500_not_an_empty_answer() {
     // Healthy again: nothing was written meanwhile.
     let (code, view) = http(running.api, "GET", "/v1/update", false, None, b"").await;
     assert_eq!((code, view["desired"].clone()), (200, Value::Null));
+}
+
+/// Catches the wait of `Looks::done` being wrong, which the failing-store test above cannot
+/// show by itself (it would flake, or hang): the server's own reads of `update/desired` and
+/// `deny/` are `START_LOOKS` at start, and it reads nothing at all by itself after the wait,
+/// for as long as a test runs. A reader added beside the poll, the controller and the sweeper,
+/// a read added to one's look, or a tick that comes, makes the total more, and an injection
+/// armed after the wait would be met by one of them and not by its request; a read fewer
+/// makes a count less, and the wait never ends.
+///
+/// Mutants seen red: `START_LOOKS` of `(1, 1)` and of `(2, 0)` (the counts after the wait).
+#[tokio::test]
+async fn the_server_reads_the_rows_by_itself_only_at_start() {
+    let dir = Dir::new();
+    let store =
+        Arc::new(ReleaseStore::open(&dir.0.join("releases"), Limits::default()).expect("open"));
+    let hooked = hooked::Hooked::new();
+    let looks = looks::Looks::count(&hooked);
+    let every_read = hooked.count("");
+    let _running = start(Some(store), Some(state_over(hooked.clone())), &dir);
+    looks.done(START_LOOKS).await;
+    let at_start = every_read.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(looks.seen(), START_LOOKS);
+    assert_eq!(every_read.load(Ordering::SeqCst), at_start);
 }
 
 /// Catches a release store that cannot be listed answered as an empty or complete list:

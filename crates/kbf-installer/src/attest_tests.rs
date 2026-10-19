@@ -63,7 +63,7 @@ fn gh_is_asked_for_exactly_the_pinned_attestation() {
     let call = &calls[0];
     assert_eq!(
         call.program,
-        PathBuf::from("/usr/local/libexec/kbf-deploy/gh")
+        PathBuf::from("/usr/share/kbf-installer/trust/gh")
     );
     assert_eq!(
         strings(&call.args),
@@ -74,11 +74,11 @@ fn gh_is_asked_for_exactly_the_pinned_attestation() {
             "--bundle",
             "/work/in/provenance.jsonl",
             "--custom-trusted-root",
-            "/usr/local/libexec/kbf-deploy/trusted_root.jsonl",
+            "/usr/share/kbf-installer/trust/trusted_root.jsonl",
             "--repo",
-            "komira-ai/komira-build-farm",
+            "komira-ai/kbf",
             "--signer-workflow",
-            "komira-ai/komira-build-farm/.github/workflows/artifacts.yml",
+            "komira-ai/kbf/.github/workflows/artifacts.yml",
             "--cert-oidc-issuer",
             "https://token.actions.githubusercontent.com",
             "--source-ref",
@@ -156,6 +156,61 @@ fn each_allowed_ref_is_tried_in_order_until_one_is_accepted() {
     );
 }
 
+/// `gh` run for the signer pair named in `args` (`--repo`, `--signer-workflow`).
+fn pair(args: &[OsString]) -> (String, String) {
+    let at = |flag: &str| {
+        let i = args.iter().position(|a| a == flag).expect(flag) + 1;
+        args[i].to_str().expect("utf-8").to_owned()
+    };
+    (at("--repo"), at("--signer-workflow"))
+}
+
+/// Catches the rename locking out releases attested before it (and the new name being
+/// refused): the verifier accepts the current repository first, then the former one,
+/// each as a pair (never the repository of one with the workflow of the other); a
+/// release only the former name vouches for is accepted on the second call.
+///
+/// Mutants seen red: the former signer left out of `pinned` (a release attested under
+/// the old name is `not-attested`); the pair's repository taken from one signer and its
+/// workflow from the other.
+#[test]
+fn a_release_attested_under_the_former_name_is_accepted_in_the_transition() {
+    let former = FakeRunner::new(|s| {
+        let accepted = pair(&s.args).0 == FORMER_REPO;
+        Ok(ran(i32::from(!accepted), "", "no matching attestation"))
+    });
+    verify(&verifier(&["refs/heads/main"]), &former).expect("former name accepted");
+    let tried: Vec<(String, String)> = former.calls().iter().map(|c| pair(&c.args)).collect();
+    assert_eq!(
+        tried,
+        [
+            (REPO.to_owned(), SIGNER_WORKFLOW.to_owned()),
+            (FORMER_REPO.to_owned(), FORMER_SIGNER_WORKFLOW.to_owned()),
+        ]
+    );
+
+    let current = FakeRunner::new(|s| Ok(ran(i32::from(pair(&s.args).0 != REPO), "", "")));
+    verify(&verifier(&["refs/heads/main"]), &current).expect("current name accepted");
+    assert_eq!(current.calls().len(), 1);
+}
+
+/// Catches a third name being accepted: a `gh` that vouches only for a repository that is
+/// neither the current nor the former name is never asked for it, so the release is
+/// `not-attested` after exactly the two pinned signers.
+///
+/// Mutant seen red: `signers` taken from the settings or the environment.
+#[test]
+fn a_third_name_is_refused() {
+    let other = FakeRunner::new(|s| {
+        let (repo, workflow) = pair(&s.args);
+        let accepted = repo == "komira-ai/komira" || workflow.starts_with("komira-ai/komira/");
+        Ok(ran(i32::from(!accepted), "", "no matching attestation"))
+    });
+    let err = verify(&verifier(&["refs/heads/main"]), &other).expect_err("refused");
+    assert_eq!(err.code(), "not-attested");
+    assert_eq!(other.calls().len(), 2);
+}
+
 /// Catches a `gh` verdict other than success being accepted: an exit other than 0 for
 /// every ref is `NotAttested`, naming the file and `gh`'s first line of complaint with
 /// control characters replaced; a `gh` killed by a signal (no exit code) is refused too.
@@ -217,7 +272,7 @@ fn an_untrusted_gh_is_refused_before_it_runs() {
     let runner = FakeRunner::new(|_| Ok(ran(0, "", "")));
     let mut trust = trusted_host();
     trust.entries.insert(
-        HostPath::new(layout::INSTALLER_DIR).expect("path"),
+        HostPath::new(crate::fixtures::TRUST_DIR).expect("path"),
         kbf_host::exec::Entry::Dir {
             perms: kbf_host::step::Perms::new(0o777),
             owner: kbf_host::step::Owner { uid: 0, gid: 0 },
@@ -237,13 +292,16 @@ fn an_untrusted_gh_is_refused_before_it_runs() {
         )
         .expect_err("refused");
     assert_eq!(err.code(), "untrusted-writable");
-    assert!(err.to_string().starts_with(layout::INSTALLER_DIR), "{err}");
+    assert!(
+        err.to_string().starts_with(crate::fixtures::TRUST_DIR),
+        "{err}"
+    );
     assert!(runner.calls().is_empty());
 
     // The trusted root alone being wrong is refused too.
     let mut trust = trusted_host();
     trust.entries.insert(
-        HostPath::new(layout::TRUSTED_ROOT).expect("path"),
+        HostPath::new(crate::fixtures::TRUSTED_ROOT_PATH).expect("path"),
         kbf_host::exec::Entry::File {
             perms: kbf_host::step::Perms::new(0o644),
             owner: kbf_host::step::Owner { uid: 501, gid: 0 },
@@ -254,7 +312,11 @@ fn an_untrusted_gh_is_refused_before_it_runs() {
         .check_trust(&trust)
         .expect_err("refused");
     assert_eq!(err.code(), "untrusted-owner");
-    assert!(err.to_string().starts_with(layout::TRUSTED_ROOT), "{err}");
+    assert!(
+        err.to_string()
+            .starts_with(crate::fixtures::TRUSTED_ROOT_PATH),
+        "{err}"
+    );
 }
 
 /// Catches a ref that is not a branch ref reaching `gh` as an argument: an option, a
@@ -299,9 +361,12 @@ fn only_a_plain_branch_ref_is_a_source_ref() {
 /// Catches the pinned values drifting from the workflow they must name.
 #[test]
 fn the_pinned_values_are_the_artifacts_workflows() {
-    assert_eq!(REPO, "komira-ai/komira-build-farm");
+    assert_eq!(REPO, "komira-ai/kbf");
     assert!(SIGNER_WORKFLOW.starts_with(REPO));
     assert!(SIGNER_WORKFLOW.ends_with("/.github/workflows/artifacts.yml"));
+    assert_eq!(FORMER_REPO, "komira-ai/komira-build-farm");
+    assert!(FORMER_SIGNER_WORKFLOW.starts_with(FORMER_REPO));
+    assert!(FORMER_SIGNER_WORKFLOW.ends_with("/.github/workflows/artifacts.yml"));
     assert_eq!(ISSUER, "https://token.actions.githubusercontent.com");
     assert_eq!(PREDICATE, "https://slsa.dev/provenance/v1");
 }

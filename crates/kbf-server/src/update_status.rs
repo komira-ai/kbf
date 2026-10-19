@@ -52,6 +52,11 @@ pub struct UpdateReport {
     pub offered_generation: u64,
     /// Whether the privileged helper is present on the host.
     pub helper_present: bool,
+    /// The newest order id the host acted on. Kept for the update controller, which reads
+    /// the answer to its orders from it; no view lists it.
+    pub acked_order_id: u64,
+    /// The state as the wire gave it, for the controller (`state` says it for a reader).
+    pub kind: State,
     /// When the server received it: milliseconds since the Unix epoch, server clock.
     pub received_at_unix_ms: u64,
 }
@@ -79,6 +84,8 @@ impl UpdateReport {
             refusal: as_data(&status.refusal, REFUSAL_MAX_BYTES),
             offered_generation: status.offered_generation,
             helper_present: status.helper_present,
+            acked_order_id: status.acked_order_id,
+            kind: State::try_from(status.state).unwrap_or(State::Unspecified),
             received_at_unix_ms,
         }
     }

@@ -432,3 +432,32 @@ fn a_fate_without_runs_raises_the_booking_and_holds_no_kills() {
     assert_eq!(s.fate(OperationId(6)), None, "no kills to hand on");
     assert!(s.memory_state().runs_by_operation().is_empty());
 }
+
+/// Catches: an operation taken in while the scheduler runs (the store holds one another
+/// writer queued) that does not move the ids past its own (the next operation would
+/// take its id), that is not joined by a request for its action (a second run), or
+/// that is not placed like a recovered one; and a skip that moves the ids back.
+#[test]
+fn an_operation_taken_in_while_running_is_joined_and_the_ids_move_past_it() {
+    let mut s = recovered(Vec::new());
+    s.take_in(queued(12, request(3)));
+    assert_eq!(s.state(OperationId(12)), Some(&OpState::Queued));
+    assert_eq!(s.next_operation(), OperationId(13));
+    assert_eq!(s.queued_len(), 1);
+
+    let again = Event::Submit {
+        waiter: WaiterId(99),
+        request: request(3),
+    };
+    assert!(feed(&mut s, 0, again).is_empty());
+    assert_eq!(
+        s.waiters(OperationId(12)),
+        Some(&[WaiterId(12), WaiterId(99)][..])
+    );
+    assert_eq!(s.next_operation(), OperationId(13), "a joiner took an id");
+
+    s.skip_to(OperationId(20));
+    assert_eq!(s.next_operation(), OperationId(20));
+    s.skip_to(OperationId(15));
+    assert_eq!(s.next_operation(), OperationId(20), "the ids went back");
+}

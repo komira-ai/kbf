@@ -185,7 +185,7 @@ cleans up after it.
 Only the newest stream of a node counts, and that stream receives the node's leases,
 with their inputs, and returns results the server writes to the action cache. So a
 stream must not be able to speak for a node other than its own (issue
-[#79](https://github.com/komira-ai/komira-build-farm/issues/79)).
+[#79](https://github.com/komira-ai/kbf/issues/79)).
 
 **The binding rule.** Under mutual TLS the daemon's client certificate must carry
 **exactly one DNS name in its subjectAltName extension**, and that name must equal the
@@ -200,7 +200,7 @@ optional: without the three TLS flags `kbf-server` serves the worker listener in
 plain text on any `--worker-listen`, and off loopback its start line carries a
 one-line warning (` warning=plaintext-off-loopback:worker`). A deployment whose
 daemons run on other machines turns mutual TLS on in its config; today's daemon
-dials only `https://` ([#412](https://github.com/komira-ai/komira-build-farm/issues/412)
+dials only `https://` ([#412](https://github.com/komira-ai/kbf/issues/412)
 tracks plain text). In plain text a resent `Hello` must still carry the stream's
 `node_id`.
 
@@ -485,7 +485,7 @@ to the same node for another operation. The daemon then ignored the new `Start` 
 `Result` was still unacknowledged) or took it as a resend of the old run, and the
 server took the old run's `Result` as the new operation's: its callers got another
 action's result, and it was written to the action cache under their action's digest
-(issue [#137](https://github.com/komira-ai/komira-build-farm/issues/137)). Three rules
+(issue [#137](https://github.com/komira-ai/kbf/issues/137)). Three rules
 close this, each on its own:
 
 1. **A lease id names one lease, ever.** Each server process grants its leases under a

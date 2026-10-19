@@ -68,7 +68,7 @@ pub(crate) struct DataArgs {
     #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
     pub data_max_bytes: Option<u64>,
     /// The node's one cache, when the process runs local storage on the same disk
-    /// (`kbf-all-in-one`, [`crate::Cli::share_cache`]); no flag sets it.
+    /// (`kbf all-in-one`, [`crate::Cli::share_cache`]); no flag sets it.
     #[arg(skip)]
     pub local_cache: Option<std::sync::Arc<kbf_daemon::cache::LocalCache>>,
 }
@@ -76,7 +76,7 @@ pub(crate) struct DataArgs {
 impl crate::Cli {
     /// Makes the input cache the node's one cache with local storage, `local`: for a
     /// binary that runs local storage on the same disk in its own process
-    /// (`kbf-all-in-one`; see `kbf_storage::local_cache`).
+    /// (`kbf all-in-one`; see `kbf_storage::local_cache`).
     pub fn share_cache(&mut self, local: std::sync::Arc<kbf_daemon::cache::LocalCache>) {
         self.data.local_cache = Some(local);
     }

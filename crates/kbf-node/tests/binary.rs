@@ -197,13 +197,27 @@ fn tls(name: &str) -> PathBuf {
     dir
 }
 
+/// A port on which connecting is refused for as long as the test binary runs, and that
+/// no other test can take (see [`kbf_testkit::port`]): a port bound and released is
+/// free only until another test's `127.0.0.1:0` bind takes it.
+fn dead_port() -> u16 {
+    kbf_testkit::port::dead_addr().port()
+}
+
+/// Catches `dead_port` handing out a number that is free to take (the old bind-and-drop
+/// helper): a thief binding it succeeds.
+#[test]
+fn a_dead_port_cannot_be_taken_by_another_listener() {
+    let port = dead_port();
+    assert!(kbf_testkit::port::is_taken(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        port
+    ))));
+}
+
 /// The flags every run here shares: a front on a port nothing listens on.
 fn base(dir: &Path) -> Vec<String> {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port();
+    let port = dead_port();
     vec![
         format!("--server=https://127.0.0.1:{port}"),
         format!("--ca-cert={}", dir.join("ca.pem").display()),
@@ -340,8 +354,13 @@ fn runs_until_sigterm_logged_then(
         .iter()
         .find(|l| l.contains(FIRST_ATTEMPT))
         .expect("seen");
+    // The cause is whatever the OS reports for the dead port: "refused" on Linux, a
+    // reset on macOS. Only its presence is the contract, not its wording.
+    let cause = ended
+        .split_once("connect: transport error: ")
+        .map(|(_, rest)| rest.split(" attempts").next().unwrap_or(rest));
     assert!(
-        ended.contains("connect: transport error: ") && ended.contains("refused"),
+        cause.is_some_and(|c| !c.trim_matches(|ch: char| ch == ' ' || ch == '"').is_empty()),
         "no cause: {ended}"
     );
     let all = all.into_iter().cloned().collect();

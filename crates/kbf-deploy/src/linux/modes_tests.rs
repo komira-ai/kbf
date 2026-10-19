@@ -1,6 +1,5 @@
 //! The mode units: each renders from the example settings into a unit that passes
-//! every rule and matches its golden, each planted defect turns its rule red, and the
-//! converged units `render-units` writes without `--mode` are unchanged.
+//! every rule and matches its golden, and each planted defect turns its rule red.
 
 use std::cell::RefCell;
 use std::os::unix::process::ExitStatusExt as _;
@@ -13,7 +12,7 @@ use kbf_host::step::{Owner, Perms};
 use kbf_host::testkit::{FakeExec, reply};
 
 use super::*;
-use crate::linux::render::{Templates, render as render_converged};
+use crate::linux::shared;
 
 const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
 
@@ -56,6 +55,42 @@ fn each_mode_renders_a_unit_that_passes_every_rule_and_matches_its_golden() {
     }
 }
 
+/// The images a unit that runs builds passes: one `--image=docker://<repo>@sha256:<digest>`
+/// per `KBF_IMAGES` entry, in order (kbf's `--image` parser takes that form only, and
+/// exits 2 at start on a bare one), none in a mode that runs no builds. Catches the
+/// `docker://` prefix dropped or doubled in the rendering, an entry lost or reordered,
+/// and an image flag in a unit of a mode that has no containers.
+#[test]
+fn a_build_units_images_are_passed_in_the_docker_form() {
+    let first = format!("gcr.io/distroless/base-debian12@sha256:{}", "a".repeat(64));
+    let second = format!("registry.example/kbf/ci@sha256:{}", "b".repeat(64));
+    let text = EXAMPLE.replacen(
+        "KBF_IMAGES=\n",
+        &format!("KBF_IMAGES={first} {second}\n"),
+        1,
+    );
+    assert_ne!(text, EXAMPLE, "the example has a KBF_IMAGES= line to set");
+    let c = LinuxConfig::parse(&text).expect("valid settings");
+    let want = [format!("docker://{first}"), format!("docker://{second}")];
+    for mode in Mode::ALL {
+        let rendered = render(&c, Some(1500), mode).expect("renders");
+        let unit = UnitFile::parse(&rendered).expect("a unit");
+        let got: Vec<&str> = unit.flag_values("image");
+        if mode.runs_builds() {
+            assert_eq!(got, want, "{mode}");
+            assert!(
+                rendered.contains(&format!(
+                    "    --image={} \\\n    --image={} \\\n",
+                    want[0], want[1]
+                )),
+                "{mode}: {rendered}"
+            );
+        } else {
+            assert_eq!(got, Vec::<&str>::new(), "{mode}");
+        }
+    }
+}
+
 /// The smallest `LimitNOFILE=` a kbf unit may set. systemd starts a unit that sets none at
 /// a soft limit of 1024, and a storage node under a build's burst of uploads (a file per
 /// open write-tier block, a socket per peer, client and cold-store request) hit EMFILE
@@ -68,7 +103,7 @@ fn nofile(text: &str) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
-/// Catches a kbf unit, mode or converged, with no `LimitNOFILE=` (the process runs at a
+/// Catches a kbf unit with no `LimitNOFILE=` (the process runs at a
 /// soft open-file limit of 1024) or one below `MIN_NOFILE`. Mutant: the line deleted from
 /// one template turns this red for that unit.
 #[test]
@@ -80,34 +115,6 @@ fn every_kbf_unit_sets_an_open_file_limit() {
             nofile(&text).is_some_and(|n| n >= MIN_NOFILE),
             "{mode}: LimitNOFILE= is {:?}",
             nofile(&text)
-        );
-    }
-    let units = render_converged(&c, Some(1500), &Templates::BUILT_IN).expect("renders");
-    let mut seen = 0;
-    for (name, text) in units.files() {
-        if name.contains("kbf-") && name.ends_with(".service") {
-            seen += 1;
-            assert!(
-                nofile(text).is_some_and(|n| n >= MIN_NOFILE),
-                "{name}: LimitNOFILE= is {:?}",
-                nofile(text)
-            );
-        }
-    }
-    assert_eq!(seen, 2, "kbf-server's and kbf-daemon's units");
-}
-
-/// Catches a change to the units `render-units` writes without `--mode` (kbf-server's
-/// and kbf-daemon's, MinIO's drop-in and the slice): the mode units are new files and
-/// leave the converged host's units byte for byte as they were.
-#[test]
-fn the_converged_units_are_unchanged() {
-    let units = render_converged(&config(), Some(1500), &Templates::BUILT_IN).expect("renders");
-    for (name, text) in units.files() {
-        let file = name.replace('/', "_");
-        assert!(
-            text == golden("converged", &file),
-            "{name} differs from tests/golden/linux/converged/{file}:\n{text}"
         );
     }
 }
@@ -362,8 +369,7 @@ fn each_planted_defect_turns_its_rule_red() {
 }
 
 /// Catches `--mode` rendering into another directory than `--out`, writing other files
-/// than the slice and the mode's unit (the converged units would be installed beside
-/// it), check reading another file than render wrote, and a garbled or missing unit
+/// than the slice and the mode's unit, check reading another file than render wrote, and a garbled or missing unit
 /// checked as if it were empty.
 #[test]
 fn the_mode_verbs_write_the_slice_and_one_unit_and_read_it_back() {
@@ -387,7 +393,7 @@ fn the_mode_verbs_write_the_slice_and_one_unit_and_read_it_back() {
     names.sort();
     assert_eq!(names, ["kbf-all-in-one.service", "kbf.slice"]);
     let slice = std::fs::read_to_string(out.join("kbf.slice")).expect("slice");
-    assert_eq!(slice, golden("converged", "kbf.slice"));
+    assert_eq!(slice, golden("modes", "kbf.slice"));
     let r =
         crate::linux::check_mode_unit(&FakeExec::new(501), &cfg, &out, Mode::AllInOne, true, None)
             .expect("checks");
@@ -470,10 +476,7 @@ fn on_host<E: Exec>(
 
 /// The rendered `kbf.slice`.
 fn slice(c: &LinuxConfig) -> UnitText {
-    let text = render_converged(c, Some(1500), &Templates::BUILT_IN)
-        .expect("renders")
-        .slice;
-    UnitText::new(SLICE, text)
+    UnitText::new(SLICE, shared::render_slice(c, Some(1500)).expect("renders"))
 }
 
 fn kbf_at(exec: &mut FakeExec, path: &str) {
@@ -831,8 +834,10 @@ fn a_build_modes_unit_and_slice_keep_every_cpu_of_the_node() {
         "[Service]\nAllowedCPUs=0-3\n",
     );
     let r = check_on_host(&exec, &c, Mode::Daemon, &narrow, &slice(&c), true, None).expect("runs");
-    assert_eq!(r.failures.len(), 1, "{:?}", lines(&r));
-    assert_eq!(r.failures[0].rule, "cpuset");
+    // `caps` refuses any AllowedCPUs= without reading the node; `cpuset` is the one that
+    // reads it (a list of every CPU is no cap, and only this rule can tell).
+    let rules: Vec<&str> = r.failures.iter().map(|f| f.rule).collect();
+    assert_eq!(rules, ["caps", "cpuset"], "{:?}", lines(&r));
     let wide_slice =
         slice(&c).with_drop_in("kbf.slice.d/n.conf", "[Slice]\nAllowedMemoryNodes=1\n");
     let unit = UnitText::new(Mode::Daemon.unit_name(), daemon.as_str());
@@ -916,7 +921,7 @@ fn rule_stop_reads_the_drop_ins() {
     assert_eq!(fails(&restored), Vec::<String>::new());
 }
 
-/// Catches a storage unit rendered with the converged units' loopback MinIO when the
+/// Catches a storage unit rendered with the loopback MinIO when the
 /// settings name no `MINIO_S3_ENDPOINT` (a storage node's bucket is elsewhere), and the
 /// refusal applied to a mode whose unit has no S3 cold store.
 #[test]
@@ -940,4 +945,31 @@ fn the_storage_mode_needs_its_s3_endpoint_set() {
     }
     let set = render(&config(), Some(1500), Mode::Storage).expect("renders");
     assert!(set.contains("?endpoint=http://127.0.0.1:9000&"), "{set}");
+}
+
+/// A listen address with a colon is an IPv6 address and goes into a `--listen=` flag in
+/// brackets (`[2001:db8::10]:8080`); an IPv4 one goes in bare. Catches an IPv6 address
+/// rendered bare (`2001:db8::10:8080`, which kbf cannot split into host and port) and a
+/// bracket put round an IPv4 one.
+#[test]
+fn an_ipv6_listen_address_is_bracketed_in_the_flags_and_an_ipv4_one_is_not() {
+    let mut c = config();
+    assert_eq!(c.listen_host(), c.listen_address, "an IPv4 address is bare");
+    let v4 = render(&c, Some(1500), Mode::Frontend).expect("renders");
+    assert!(
+        v4.contains(&format!("--listen={}:{}", c.listen_address, c.reapi_port)),
+        "{v4}"
+    );
+    c.listen_address = "2001:db8::10".to_owned();
+    assert_eq!(c.listen_host(), "[2001:db8::10]");
+    let v6 = render(&c, Some(1500), Mode::Frontend).expect("renders");
+    assert!(
+        v6.contains(&format!("--listen=[2001:db8::10]:{}", c.reapi_port)),
+        "{v6}"
+    );
+    assert!(
+        v6.contains(&format!("--worker-listen=[2001:db8::10]:{}", c.worker_port)),
+        "{v6}"
+    );
+    assert!(!v6.contains("--listen=2001"), "{v6}");
 }
