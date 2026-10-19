@@ -192,10 +192,9 @@ rough budget, to be measured before it is relied on:
 
 | process | role | expected footprint |
 |---|---|---|
-| frontend (two instances during a swap) | scheduler, state store, Envoy upstream | a few hundred MB each |
+| frontend (two instances during a swap) | scheduler, state store | a few hundred MB each |
 | 3 storage-and-daemon nodes | storage, plus a worker each | the largest; segment size and cache caps set small by the harness |
 | 1 plain daemon | worker | small |
-| Envoy | pinned version | about 100 MB |
 | Buck2 client, plus the actions | the load | the variable part |
 
 The rule that keeps it inside the box: the harness sets segment size, cache and tier limits to test values, and the load is

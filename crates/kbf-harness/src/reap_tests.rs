@@ -268,6 +268,33 @@ fn the_groups_the_files_name_are_killed_and_nothing_else_is() {
 }
 
 #[test]
+fn a_group_named_by_a_file_is_killed_with_the_children_in_it() {
+    // Catches: a sentinel that signals the process a file names and not its group: a role's
+    // children (the actions of a native driver) are in the role's group but are not its
+    // leader, and they would be left running after the harness died. The role leads a group
+    // of its own; the child is started into that group (`process_group(role)`, as a fork of
+    // the role is) and leads none. Mutant: `kill_groups` kills the pid the file names
+    // (`kill_process`), not the group (the child survives).
+    let dir = crate::scratch("kill-groups-child");
+    let mut role = grouped_sleeper();
+    let mut child = Command::new("sleep")
+        .arg("300")
+        .process_group(i32::try_from(role.id()).expect("a pid"))
+        .spawn()
+        .expect("sleep");
+    let child_pid = child.id();
+    assert!(alive(child_pid));
+    std::fs::write(dir.join("role.pgid"), format!("{}\n", role.id())).expect("pgid");
+    kill_groups(&dir);
+    let status = until("the role to end", || role.try_wait().expect("wait"));
+    assert!(!status.success());
+    let status = until("the role's child to end", || {
+        child.try_wait().expect("wait")
+    });
+    assert!(!status.success());
+}
+
+#[test]
 fn the_command_line_names_the_group_directory_only_when_there_is_one() {
     // Catches: `--pgids` lost on the way to the sentinel (a killed harness's grandchildren
     // survive again), or given with no value. Mutant: `args` leaves it out.

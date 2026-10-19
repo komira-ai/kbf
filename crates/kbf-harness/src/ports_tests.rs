@@ -203,18 +203,25 @@ fn the_lock_directory_and_files_are_open_to_every_user_whatever_the_umask() {
     // open and sticky like the temporary directory, and the file of a claimed block is
     // read-write for all, under the umask this process has (022 here and in CI). Both are
     // first made narrow, as an older run (or a lock made by hand) left them, so the test
-    // does not depend on what is in the temporary directory. The last block is claimed: the
-    // other tests claim from the first. Mutants: no mode set on the file; none on the directory.
+    // does not depend on what is in the temporary directory. A block from the end is claimed:
+    // the other tests claim from the first. Mutants: no mode set on the file; none on the directory.
     use std::os::unix::fs::PermissionsExt as _;
     let mode = |p: &std::path::Path| std::fs::metadata(p).expect("stat").permissions().mode();
-    let last = blocks(floor()) - 1;
-    make_lock_dir();
-    let file = lock_dir().join(format!("block-{last}.lock"));
     let narrow = std::fs::Permissions::from_mode(0o600);
-    let _ = std::fs::set_permissions(&file, narrow);
+    make_lock_dir();
     std::fs::set_permissions(lock_dir(), std::fs::Permissions::from_mode(0o755)).expect("chmod");
     make_lock_dir();
-    let claim = Claim::try_block(last).expect("the last block is free");
+    // The block is the last one this process can claim: a host busy with other farms holds
+    // some (a lock, or a bound port), so each block's lock file is narrowed just before it is
+    // tried, and the first one from the end that is free is the one the assertions are about.
+    let (claim, file) = (0..blocks(floor()))
+        .rev()
+        .find_map(|index| {
+            let file = lock_dir().join(format!("block-{index}.lock"));
+            let _ = std::fs::set_permissions(&file, narrow.clone());
+            Claim::try_block(index).map(|claim| (claim, file))
+        })
+        .expect("some block is free");
     assert_eq!(mode(&lock_dir()) & 0o1777, 0o1777);
     assert_eq!(mode(&file) & 0o666, 0o666);
     drop(claim);
