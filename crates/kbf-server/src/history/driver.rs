@@ -172,7 +172,9 @@ pub fn over<O: ObjectStore>(
 ) -> History {
     let queue = Arc::new(EventQueue::new(options.queue));
     let minter = Arc::new(Minter::new(0));
-    let index = HistoryIndex::new(state, index_root, Arc::new(Blocking));
+    // The writer's own rows are written around the store's generation check, so a process
+    // that a successor has superseded still records the calls it kept.
+    let index = HistoryIndex::new(state, index_root, Arc::new(Blocking)).exempting(options.writer);
     let objects = Shared(Arc::new(objects));
     let reader = Reader::new(objects.clone(), root.clone(), index.clone());
     let flog = Arc::new(FlogStore::new(

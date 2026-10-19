@@ -606,8 +606,9 @@ pub enum InvState {
 /// names a client sends.
 pub const MAX_INSTANCES: usize = 64;
 
-/// The `ui/invid/<inv-key>` row: an invocation's header. The newest chunk's footer
-/// carries the same header, so the row can be restored from the object.
+/// A `ui/invid/<inv-key>/<writer>` row: one writer's header of an invocation, counting the
+/// records that writer wrote (a reader merges the rows of every writer). The newest chunk's
+/// footer carries the same header, so the row can be restored from the object.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct InvocationHeader {
     /// The client's invocation id; empty for an id-less pseudo-invocation.

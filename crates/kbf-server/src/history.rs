@@ -38,7 +38,7 @@ mod tap;
 
 pub use driver::{History, Options, STEP_EVERY, over};
 pub(crate) use driver::{finish, spawn};
-pub use flags::{HistoryError, HistoryFlags, with_history};
+pub use flags::{HistoryError, HistoryFlags, with_history, with_history_as};
 pub use reads::HistoryReads;
 #[cfg(test)]
 pub(crate) use reads::Shared;
