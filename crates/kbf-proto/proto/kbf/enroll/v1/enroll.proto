@@ -138,7 +138,10 @@ message NodeConfig {
   // What `--cas` is for a daemon-only node.
   string cas_endpoint = 4;
   uint32 storage_port = 5;
-  // `s3://bucket/prefix/?endpoint=...`; never a key. It stays beside the registration
+  // `s3://bucket/prefix/?endpoint=...`; never a key. The frontend builds it from the
+  // registered `cold` store (bucket, prefix, endpoint, region, `conditional-put`,
+  // `min-put-rate`) and sends it to a node with the storage role; empty when no store is
+  // registered. It stays beside the registration
   // (`ColdStore.GetStoreConfig`) because it is the node's own `--cold-store` identity, which
   // a registration for another store does not replace (the node reports it and keeps
   // running); the registration is the only source of keys.

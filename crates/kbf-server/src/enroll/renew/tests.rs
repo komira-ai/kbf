@@ -350,3 +350,45 @@ fn the_node_client_recognises_the_renewal_refusal_and_does_not_retry_it() {
     );
     assert!(!error.retryable());
 }
+
+/// A node enrolled before a store was registered is sent it at its next renewal, and one
+/// that holds the registry's generation is sent nothing.
+///
+/// Catches: a store registered after a node enrolled never reaching it (the generation of
+/// the configuration not following the registry's, so `Renew` answers "no change"), and a
+/// configuration sent at every renewal once a store is registered.
+#[test]
+fn a_renewal_after_a_store_was_registered_carries_it_once() {
+    let (farm, keys) = enrolled("renew-cold");
+    let registry_generation = crate::enroll::testkit::register_cold(&farm);
+    farm.advance(120);
+    let mut request = renew_request("node-01", &ROLES, &keys, farm.now());
+    request.config_generation = CONFIG_GENERATION;
+    let config = farm
+        .service
+        .renew_now(&request)
+        .expect("renewed")
+        .config
+        .expect("a node on the old generation is sent the configuration");
+    assert_eq!(config.generation, CONFIG_GENERATION + registry_generation);
+    assert!(
+        config.cold_store.starts_with("s3://farm-cold/cold/main/?endpoint="),
+        "{}",
+        config.cold_store
+    );
+    for secret in [
+        crate::enroll::testkit::COLD_SECRET,
+        crate::enroll::testkit::COLD_ACCESS_KEY,
+    ] {
+        assert!(!config.cold_store.contains(secret));
+    }
+
+    farm.advance(120);
+    let mut again = renew_request("node-01", &ROLES, &keys, farm.now());
+    again.config_generation = config.generation;
+    assert_eq!(
+        farm.service.renew_now(&again).expect("renewed").config,
+        None,
+        "the node holds the generation it was sent"
+    );
+}

@@ -42,14 +42,15 @@ use sha2::{Digest as _, Sha256};
 use tonic::{Request, Response, Status};
 
 use super::ca::Ca;
+use crate::object_store::{ColdStoreView, RegistryError, cold_store_view};
 
 /// The longest zone label accepted.
 const MAX_ZONE: usize = 63;
 /// The longest `host:port` accepted (a DNS name, a colon and a port).
 const MAX_ADVERTISE: usize = 260;
-/// The generation of the `NodeConfig` this frontend sends: it changes only when the flags
-/// that make it do, which a restart applies, so it is a constant until the frontend can
-/// push a changed configuration.
+/// The generation of the `NodeConfig` this frontend sends when no object store is
+/// registered: the flags that make the rest of it change only at a restart. A registration
+/// of the cold store (`objstore/gen`) adds its own generation ([`config_generation`]).
 pub const CONFIG_GENERATION: u64 = 1;
 /// Seconds between a node's looks at its certificate files, as the answer tells it.
 const TLS_RELOAD_INTERVAL_S: u32 = 30;
@@ -64,6 +65,13 @@ pub struct NodeSettings {
     pub cas_endpoint: String,
     /// The port a storage node serves on; 0 for none.
     pub storage_port: u32,
+}
+
+/// The generation of the `NodeConfig` told with `cold` in it: [`CONFIG_GENERATION`] plus the
+/// registry's, so a node that renews after a store was registered, changed or taken back
+/// is sent the configuration again.
+pub(super) fn config_generation(cold: &ColdStoreView) -> u64 {
+    CONFIG_GENERATION.saturating_add(cold.generation)
 }
 
 /// The status of a refusal: its code and its message, nothing else.
@@ -233,6 +241,7 @@ impl EnrollService {
             return Err(RefusalReason::MalformedRequest);
         }
         let csrs = csrs_of(&request.csrs)?;
+        let cold = core.cold()?;
         let mut sign = || core.sign_enroll(&node_id, &csrs, &request.advertise);
         let enrolled = registry::enroll_txn(
             &*core.store,
@@ -250,7 +259,7 @@ impl EnrollService {
         Ok(pb::EnrollResponse {
             certs: certs_of(&enrolled.certs),
             ca_bundle_pem: core.ca.bundle_pem().into_bytes(),
-            config: Some(core.config(&enrolled)),
+            config: Some(core.config(&enrolled, &cold)),
             server_time: now,
             renew_after: renew_after(now, &enrolled.certs),
         })
@@ -288,10 +297,30 @@ impl Core {
         i64::try_from(self.store.now().as_duration().as_secs()).unwrap_or(i64::MAX)
     }
 
-    /// The `NodeConfig` of an answer for a node that holds `enrolled`'s roles.
-    pub(super) fn config(&self, enrolled: &Enrolled) -> pb::NodeConfig {
+    /// The registered cold store, as a storage node is told it. Read before a call changes
+    /// anything, so a registry that cannot be read refuses the call and spends no token.
+    ///
+    /// # Errors
+    /// [`RefusalReason::NotSigner`] for a fenced frontend, else
+    /// [`RefusalReason::StoreUnavailable`].
+    pub(super) fn cold(&self) -> Result<ColdStoreView, RefusalReason> {
+        cold_store_view(&*self.store).map_err(|error| {
+            // The text of a registry error names a row family and never a value.
+            tracing::warn!(%error, "the registered cold store could not be read");
+            match error {
+                RegistryError::Store(kbf_state::StoreError::Fenced) => RefusalReason::NotSigner,
+                _ => RefusalReason::StoreUnavailable,
+            }
+        })
+    }
+
+    /// The `NodeConfig` of an answer for a node that holds `enrolled`'s roles. The cold
+    /// store (its URI, with no key in it) goes to a node with the storage role only: a
+    /// daemon has no use for it.
+    pub(super) fn config(&self, enrolled: &Enrolled, cold: &ColdStoreView) -> pb::NodeConfig {
+        let storage = enrolled.certs.iter().any(|cert| cert.role == Role::Storage);
         pb::NodeConfig {
-            generation: CONFIG_GENERATION,
+            generation: config_generation(cold),
             roles: enrolled
                 .certs
                 .iter()
@@ -300,7 +329,11 @@ impl Core {
             worker_endpoint: self.settings.worker_endpoint.clone(),
             cas_endpoint: self.settings.cas_endpoint.clone(),
             storage_port: self.settings.storage_port,
-            cold_store: String::new(),
+            cold_store: cold
+                .uri
+                .clone()
+                .filter(|_| storage)
+                .unwrap_or_default(),
             min_protocol: 0,
             tls_reload_interval_s: TLS_RELOAD_INTERVAL_S,
             frontend_url: String::new(),

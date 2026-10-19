@@ -547,6 +547,42 @@ async fn a_configuration_missing_the_cold_store_is_refused_after_enrolling() {
     assert!(h.node_json().contains("storage"));
 }
 
+/// Catches a node enrolled before the farm registered a cold store staying unable to
+/// start its storage half: the first start is refused (no store), then the store is
+/// registered, and the next start asks the frontend for the configuration (one `Renew`)
+/// and runs the storage mode on the store it was sent. A node that holds one asks nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_enrolled_before_the_store_was_registered_asks_for_it_at_its_next_start() {
+    let h = Harness::new("node-cold-store-late");
+    h.ready("");
+    let launches = Arc::new(Launches::default());
+    start_mode(&h, names::STORAGE, &launches)
+        .await
+        .expect_err("no cold store yet");
+    assert!(launches.seen().is_empty());
+    assert_eq!(h.fake().enrolls().len(), 1);
+
+    h.fake().set_cold_store(COLD);
+    h.fake().set_generation(2);
+    start_mode(&h, names::STORAGE, &launches)
+        .await
+        .expect("the store was sent");
+    assert_eq!(launches.seen(), [names::STORAGE]);
+    assert_eq!(h.fake().enrolls().len(), 1, "no second enrollment");
+    assert!(h.node_json().contains("objects.example"), "kept in node.json");
+    let asked = h.fake().renews().len();
+    assert_eq!(asked, 1, "one Renew, to ask; the renewer's first look is not due");
+
+    start_mode(&h, names::STORAGE, &launches)
+        .await
+        .expect("a node with a store");
+    assert_eq!(
+        h.fake().renews().len(),
+        asked,
+        "a node that holds a cold store asks for nothing"
+    );
+}
+
 /// Catches an answer the node refused being retried as if the network were at fault, or a
 /// node with a wrong clock being given up on for good: a frontend whose clock is ten
 /// minutes off is exit 1 (the clock may be set right and the start tried again), an answer

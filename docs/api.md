@@ -561,7 +561,18 @@ must be a subset of the token's); and only then the CA: each CSR is parsed
 verifies) and a certificate is issued for it. A CSR is therefore parsed only for a caller
 who proved the secret. The answer carries one certificate per role, the CA bundle (PEM),
 the frontend's clock (`server_time`), `renew_after` (half-way through the shortest life)
-and the `NodeConfig`. A storage node must send `advertise` (`host:port`) and no other node
+and the `NodeConfig`. A node granted the `storage` role is told the farm's cold store in
+`NodeConfig.cold_store`: the store registered with `kbf cluster object-store` (the `cold`
+binding), as `s3://bucket/prefix/?endpoint=...&region=...`, with `conditional-put` and
+`min-put-rate` when they are not the defaults. The URI is built from the registered
+endpoint, region, bucket, prefix and settings only: **never** the access key id, the secret
+or any other query key (the key pair reaches a node through `ColdStore.GetStoreConfig`, over
+its storage certificate). A farm with nothing registered sends an empty `cold_store`, and a
+daemon-only node is sent none. `NodeConfig.generation` is 1 plus the registry's generation,
+so a node that renews after a store was registered, changed or taken back is sent the
+configuration again; a storage node that holds none asks once at its next start. A
+registry that cannot be read refuses the call (`StoreUnavailable`) before the token is
+spent. A storage node must send `advertise` (`host:port`) and no other node
 may; the host may not be a frontend name, `localhost`, or a loopback, unspecified,
 link-local or multicast address. Set `node.advertise` in `kbf.toml` on a storage node.
 

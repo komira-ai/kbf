@@ -35,6 +35,15 @@ use kbf_objstore::{Floor, KeyError};
 use kbf_threads::disk::FreeSpace;
 use percent_encoding::percent_decode_str;
 
+/// What a prefix is percent-encoded with in a URI's path: everything but letters, digits
+/// and `/ - _ . ~` (the characters a key prefix may hold).
+const PATH: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
 /// The key prefix of an `s3://bucket` URI with no path.
 pub const DEFAULT_S3_PREFIX: &str = "kbf/";
 
@@ -52,10 +61,10 @@ pub const COLD_FILE_FLOOR: Floor = Floor::KeepFree;
 pub const HOT_STORE_SHARE_PERCENT: u64 = 80;
 
 /// The slowest request body rate an S3 URI gets without `min-put-rate`: 1 MiB/s.
-const DEFAULT_MIN_PUT_RATE: NonZeroU64 = NonZeroU64::new(1 << 20).expect("1 MiB");
+pub(crate) const DEFAULT_MIN_PUT_RATE: NonZeroU64 = NonZeroU64::new(1 << 20).expect("1 MiB");
 
 /// The signing region an S3 URI gets without `region`.
-const DEFAULT_REGION: &str = "us-east-1";
+pub(crate) const DEFAULT_REGION: &str = "us-east-1";
 
 /// A store the server can be pointed at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +193,28 @@ impl StoreUri {
 }
 
 impl S3Uri {
+    /// The URI that names this store to another process (`--cold-store`): the bucket, the
+    /// prefix, and the query keys [`S3Uri::parse`] takes, each percent-encoded, so that
+    /// parsing it gives this store back. It spells out these fields and nothing else, so
+    /// it can carry no key, token or other text a caller put in a field it does not name
+    /// (a store URI has no place for a credential: any other query key is refused by
+    /// the parser). `region` is always given; `conditional-put` and `min-put-rate` only
+    /// when they differ from their defaults.
+    #[must_use]
+    pub fn node_uri(&self) -> String {
+        let path = percent_encoding::utf8_percent_encode(&self.prefix, PATH).to_string();
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        query.append_pair("endpoint", &self.endpoint);
+        query.append_pair("region", &self.region);
+        if self.conditional_put {
+            query.append_pair("conditional-put", "true");
+        }
+        if self.min_put_rate != DEFAULT_MIN_PUT_RATE {
+            query.append_pair("min-put-rate", &self.min_put_rate.to_string());
+        }
+        format!("s3://{}/{path}?{}", self.bucket, query.finish())
+    }
+
     fn parse(text: &str, rest: &str) -> Result<Self, StoreUriError> {
         if rest.contains('#') {
             return Err(StoreUriError::S3Fragment(text.to_owned()));
@@ -467,6 +498,31 @@ mod tests {
             .as_s3()
             .expect("an s3 store")
             .clone()
+    }
+
+    /// Catches a URI for a node that does not read back as the store it was made from:
+    /// a prefix or endpoint with characters a URI treats specially, a default setting
+    /// written out (so a node and the frontend would print different URIs for one store),
+    /// or a non-default one left out.
+    #[test]
+    fn a_node_uri_reads_back_as_the_store_it_names() {
+        let stores = [
+            s3("s3://b/?endpoint=http://h:9000"),
+            s3("s3://b/a/b/?endpoint=http://h:9000&region=eu-1&conditional-put=true&min-put-rate=7"),
+            S3Uri {
+                prefix: "x-y_z.~1/a/".to_owned(),
+                ..s3("s3://b/?endpoint=http://h:9000")
+            },
+        ];
+        for store in stores {
+            let text = store.node_uri();
+            assert_eq!(uri(&text), Ok(StoreUri::S3(store.clone())), "{text}");
+        }
+        let plain = s3("s3://b/?endpoint=http://h:9000").node_uri();
+        assert_eq!(
+            plain,
+            "s3://b/kbf/?endpoint=http%3A%2F%2Fh%3A9000&region=us-east-1"
+        );
     }
 
     /// Catches a `file://` URI read as anything but its absolute path: the host form

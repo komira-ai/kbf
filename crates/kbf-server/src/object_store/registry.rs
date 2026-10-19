@@ -21,6 +21,7 @@ use super::rows::{
 };
 use super::secrets::{SecretError, SecretFiles};
 use crate::enroll::Random;
+use crate::stores::{DEFAULT_MIN_PUT_RATE, DEFAULT_REGION, DEFAULT_S3_PREFIX, S3Uri, StoreUri};
 
 /// How old an unreferenced file must be before a sweep removes it.
 pub const SWEEP_GRACE: Duration = Duration::from_secs(600);
@@ -125,6 +126,97 @@ fn cond_of(row: Option<&Versioned>) -> Cond {
     row.map_or(Cond::Absent, |v| Cond::Version(v.version))
 }
 
+fn read_gen_of(store: &dyn Store) -> Result<Gen, RegistryError> {
+    let stored = store.get(GEN_KEY)?;
+    let row = match &stored {
+        Some(stored) => decode(stored, "gen")?,
+        None => GenRow::default(),
+    };
+    Ok(Gen {
+        row,
+        cond: cond_of(stored.as_ref()),
+    })
+}
+
+/// How often [`cold_store_view`] reads again when a write lands between its reads.
+const VIEW_TRIES: usize = 3;
+
+/// What a storage node is told of the registered cold store: the registry generation the
+/// reading is of, and the store's URI, if a `cold` binding exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColdStoreView {
+    /// The registry generation; 0 until the first change.
+    pub generation: u64,
+    /// `s3://bucket/prefix/?endpoint=...` ([`S3Uri::node_uri`]): the bucket, prefix,
+    /// endpoint, region, `conditional-put` and `min-put-rate` of the registration.
+    /// Never the access key id or the secret: they are not copied into it. `None` when
+    /// no store is bound to `cold`.
+    pub uri: Option<String>,
+}
+
+/// The cold store as a node may be told it, read from one generation of the registry in
+/// `store`. Reads the rows only: no secret file, so it needs no secrets directory.
+///
+/// # Errors
+/// [`RegistryError::Store`]; [`RegistryError::Corrupt`] if a row does not decode, the
+/// binding names a connection that does not exist, or the registered fields do not
+/// make a store URI that reads back as the same store; [`RegistryError::Conflict`] if
+/// the registry kept changing while it was read.
+pub fn cold_store_view(store: &dyn Store) -> Result<ColdStoreView, RegistryError> {
+    for _ in 0..VIEW_TRIES {
+        let generation = read_gen_of(store)?.row.generation;
+        let uri = match store.get(&bind_key(BindingRole::Cold))? {
+            None => None,
+            Some(stored) => {
+                let bind: BindRow = decode(&stored, "bind")?;
+                let name = bind
+                    .connection
+                    .parse::<ConnectionName>()
+                    .map_err(|_| RegistryError::Corrupt("bind"))?;
+                let conn: ConnRow = decode(
+                    &store
+                        .get(&conn_key(&name))?
+                        .ok_or(RegistryError::Corrupt("conn"))?,
+                    "conn",
+                )?;
+                Some(cold_uri(&bind, &conn)?)
+            }
+        };
+        // A change writes the generation row in the same transaction as the rows it
+        // changes, so an unchanged generation means the three reads are of one state.
+        if read_gen_of(store)?.row.generation == generation {
+            return Ok(ColdStoreView { generation, uri });
+        }
+    }
+    Err(RegistryError::Conflict)
+}
+
+/// The URI of the store `bind` and `conn` register, checked to read back as itself.
+fn cold_uri(bind: &BindRow, conn: &ConnRow) -> Result<String, RegistryError> {
+    let prefix = match bind.prefix.as_str() {
+        "" => DEFAULT_S3_PREFIX.to_owned(),
+        p if p.ends_with('/') => p.to_owned(),
+        p => format!("{p}/"),
+    };
+    let s3 = S3Uri {
+        bucket: bind.bucket.clone(),
+        prefix,
+        endpoint: conn.endpoint.clone(),
+        region: if conn.region.is_empty() {
+            DEFAULT_REGION.to_owned()
+        } else {
+            conn.region.clone()
+        },
+        conditional_put: conn.conditional_put,
+        min_put_rate: NonZeroU64::new(conn.min_put_rate).unwrap_or(DEFAULT_MIN_PUT_RATE),
+    };
+    let uri = s3.node_uri();
+    match uri.parse::<StoreUri>() {
+        Ok(StoreUri::S3(back)) if back == s3 => Ok(uri),
+        _ => Err(RegistryError::Corrupt("bind")),
+    }
+}
+
 impl Registry {
     /// The registry over `store` (the frontend's fenced handle, so every write checks
     /// that this frontend still holds the writer role), with secret files in `dir`.
@@ -174,15 +266,7 @@ impl Registry {
     }
 
     fn read_gen(&self) -> Result<Gen, RegistryError> {
-        let stored = self.store.get(GEN_KEY)?;
-        let row = match &stored {
-            Some(stored) => decode(stored, "gen")?,
-            None => GenRow::default(),
-        };
-        Ok(Gen {
-            row,
-            cond: cond_of(stored.as_ref()),
-        })
+        read_gen_of(&*self.store)
     }
 
     fn conn_row(&self, name: &ConnectionName) -> Result<Option<ConnRow>, RegistryError> {
