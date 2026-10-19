@@ -1428,9 +1428,11 @@ async fn a_request_after_the_retention_of_a_held_finish_does_not_retake_the_oper
     disk.store.set_down(true);
     assert!(!accepted(&farm, leases[0]).await, "the store was down");
 
-    // The scheduler retires its finished operation while the finish is still held;
-    // the node's lease is kept alive by the store outage, so only the clock moves.
+    // The scheduler retires its finished operation while the finish is still held: a
+    // feed after the retention moves its clock past it, the store still refusing.
     tokio::time::advance(kbf_sched::FINISHED_RETENTION + Duration::from_secs(1)).await;
+    farm.tick().await;
+    assert_eq!(disk.rows("op/"), 1, "the finish was written");
     disk.store.set_down(false);
     let held = submit(&farm, request(1));
     assert_eq!(
