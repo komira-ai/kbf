@@ -453,10 +453,13 @@ async fn the_takeover_limit_is_the_clients_because_the_wire_has_no_field_for_it(
 
 /// A state store that holds the next write of an operation (an `op/` row, the queueing of
 /// an Execute) until it is opened: the Execute is then between its request and its
-/// queueing, which is what a quiesce waits for.
+/// queueing, which is what a quiesce waits for. It can also refuse those writes the way a
+/// store does for a writer a newer one has replaced ([`StoreError::Fenced`]) while the
+/// generation row is still the writer's own.
 struct Holding {
     inner: Arc<Fake>,
     armed: AtomicBool,
+    refusing: AtomicBool,
     held: Mutex<Stage>,
     changed: Condvar,
 }
@@ -473,6 +476,7 @@ impl Holding {
         Arc::new(Self {
             inner,
             armed: AtomicBool::new(false),
+            refusing: AtomicBool::new(false),
             held: Mutex::new(Stage::Free),
             changed: Condvar::new(),
         })
@@ -482,6 +486,11 @@ impl Holding {
     fn arm(&self) {
         *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Stage::Free;
         self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Refuses, as `Fenced`, every write that queues an operation from now on.
+    fn refuse_submissions(&self) {
+        self.refusing.store(true, Ordering::SeqCst);
     }
 
     fn stage(&self) -> Stage {
@@ -543,8 +552,13 @@ impl Store for Holding {
         &self,
         batch: Vec<Txn>,
     ) -> Result<Vec<Result<kbf_state::Commit, Conflict>>, StoreError> {
-        if batch.iter().any(queues_an_operation) && self.armed.swap(false, Ordering::SeqCst) {
-            self.hold();
+        if batch.iter().any(queues_an_operation) {
+            if self.refusing.load(Ordering::SeqCst) {
+                return Err(StoreError::Fenced);
+            }
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.hold();
+            }
         }
         self.inner.apply_batch(batch)
     }
@@ -571,6 +585,27 @@ impl Store for Holding {
     }
 }
 
+/// A child over `holding`, serving, and the address of its worker listener.
+async fn child_over(node: &Node, holding: &Arc<Holding>) -> (Child, SocketAddr) {
+    let managed = Managed::start(
+        &managed_flags(node, &[]),
+        StoreSource::Shared(Arc::clone(holding) as Arc<dyn Store>),
+        std::future::pending::<()>(),
+    )
+    .await
+    .expect("starts");
+    let view = managed.view();
+    let child = Child {
+        admin: managed.admin(),
+        reapi: view.reapi.expect("a REAPI listener"),
+        api: view.api.expect("an operator API"),
+        id: view.instance_id,
+    };
+    tokio::spawn(managed.serve());
+    let worker = Child::worker_of(&child.role().await).expect("a worker listener");
+    (child, worker)
+}
+
 /// Pins TODAY's `quiesce` against the swap's budget.
 ///
 /// The child answers a quiesce when it is quiesced, and it first waits, for at most ten
@@ -584,10 +619,12 @@ impl Store for Holding {
 ///   its own deadline, and the child DROPS the quiesce with the connection: once the
 ///   Execute is through the role is still `active`, and a new Execute is queued, not
 ///   refused. So a `Timeout` from `quiesce` means the child is still serving, and the swap
-///   may go on to a `resume` or a second `quiesce` from there. (Whether the connection's
-///   closing cancels the call in every state, and not only while it waits, is not shown:
-///   a cancel between the fence and the role change would leave a fenced farm that says
-///   `active`.)
+///   may go on to a `resume` or a second `quiesce` from there. The child drops the call
+///   when it next polls the connection: with the held write stalling its runtime that is
+///   only once the write is let go, and until then the quiesce is alive. (Whether the
+///   connection's closing cancels the call in every state, and not only while it waits, is
+///   not shown: a cancel between the fence and the role change would leave a fenced farm
+///   that says `active`.)
 ///
 /// U2c ask: answer `202` and report `Quiescing` until the farm is quiet, or bound the wait
 /// by what the swap gives it.
@@ -595,29 +632,14 @@ impl Store for Holding {
 /// Mutants seen red: the quiesce given the call's deadline instead of its own; in the child,
 /// a quiesce that does not wait for a call that is queueing (red in the second half: the
 /// farm is then fenced behind the Execute and the quiesce finishes after the client left;
-/// the first half alone does not see it, since the fence waits for the same write).
+/// the first half alone does not see it, since the fence waits for the same write); a
+/// quiesce run in a task of its own, which outlives the connection (second half again); an
+/// idle child that waits before it quiesces (the bound on the idle call, first half).
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn a_quiesce_blocks_while_a_call_is_queueing_and_is_dropped_with_a_client_that_gives_up() {
     let node = Node::start().await;
-    let fake = shared();
-    let holding = Holding::new(Arc::clone(&fake));
-    let flags = managed_flags(&node, &[]);
-    let managed = Managed::start(
-        &flags,
-        StoreSource::Shared(Arc::clone(&holding) as Arc<dyn Store>),
-        std::future::pending::<()>(),
-    )
-    .await
-    .expect("starts");
-    let view = managed.view();
-    let a = Child {
-        admin: managed.admin(),
-        reapi: view.reapi.expect("a REAPI listener"),
-        api: view.api.expect("an operator API"),
-        id: view.instance_id,
-    };
-    tokio::spawn(managed.serve());
-    let worker = Child::worker_of(&a.role().await).expect("a worker listener");
+    let holding = Holding::new(shared());
+    let (a, worker) = child_over(&node, &holding).await;
     let client = Client::connect(a.reapi, worker).await;
     let patient = admin_of(&a, &a, deadlines());
     let hasty = admin_of(
@@ -629,12 +651,18 @@ async fn a_quiesce_blocks_while_a_call_is_queueing_and_is_dropped_with_a_client_
         },
     );
 
-    // The idle child quiesces at once, and the answer is already `quiesced`.
+    // The idle child quiesces at once, and the answer is already `quiesced`. "At once" is
+    // inside what the swap gives the call; the child's wait for a call that is queueing is
+    // up to ten seconds, which this is not.
     let began = Instant::now();
     run(&patient, |admin| admin.quiesce(Slot::A))
         .await
         .expect("an idle child quiesces");
-    assert!(began.elapsed() < Duration::from_millis(400));
+    assert!(
+        began.elapsed() < Deadlines::frontend().quiesce,
+        "an idle child waited: {:?}",
+        began.elapsed()
+    );
     assert_eq!(
         run(&patient, |admin| admin.role(Slot::A)).await,
         Ok(holder(RoleState::Quiesced))
@@ -708,10 +736,14 @@ async fn a_quiesce_blocks_while_a_call_is_queueing_and_is_dropped_with_a_client_
         waited >= Duration::from_millis(400) && waited < Duration::from_secs(5),
         "the client's deadline, not the child's: {waited:?}"
     );
-    // The client is gone and the Execute is still held: time for the child to see the
-    // connection close (a few polls of its runtime), many times over, so that a slow
-    // machine (a coverage build) still finds the call dropped before the write is let go.
-    std::thread::sleep(Duration::from_secs(1));
+    // The client is gone (its socket closed when the call returned) and the Execute is still
+    // held. There is nothing to wait for before letting it go: while the write is held the
+    // child cannot show that it has seen the close (the write holds the farm's lock and a
+    // runtime thread, and the quiet look of the quiesce was seen to stop ticking some 100 ms
+    // into a hold), and a pause here would only be a guess. What decides the outcome is the
+    // order of the child's first poll of the connection after the write is let go: hyper
+    // reads the connection (and finds the close) before it polls the handler, whose next
+    // quiet look would otherwise finish the quiesce.
     holding.open();
     tokio::time::timeout(Duration::from_secs(5), held)
         .await
@@ -732,6 +764,63 @@ async fn a_quiesce_blocks_while_a_call_is_queueing_and_is_dropped_with_a_client_
         execute_refused(&client, &third).await,
         None,
         "the child was fenced by a quiesce that timed out"
+    );
+}
+
+/// The `N / N / superseded` row of the table in `admin.rs`, against a real child: a child
+/// the store refused a write of is no holder, though the generation row still reads as the
+/// one it took.
+///
+/// The child remembers a refusal for good (`superseded` is never cleared, and it takes no
+/// more work), and its `role` answer reads the generation row separately, so for as long as
+/// the row is not yet the new writer's the two answers disagree. The client trusts the
+/// refusal, since the swap must not take a child that can write nothing for the one that
+/// holds the generation. The other rows are the swap test's (`N / N / false` holds, `N /
+/// another` does not) and the resume test's.
+///
+/// Here the store refuses the write that queues an Execute with `Fenced`, which is what the
+/// store answers a writer a newer one replaced; nothing moves the generation row.
+///
+/// Catches: a `holder` derived from the generation alone (a superseded child reported as the
+/// holder, and a swap that stands its successor down for it). Mutant seen red: `holder`
+/// without the `superseded` test in `admin.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_the_store_refused_is_no_holder_though_the_generation_row_is_still_its_own() {
+    let node = Node::start().await;
+    let holding = Holding::new(shared());
+    let (a, worker) = child_over(&node, &holding).await;
+    let client = Client::connect(a.reapi, worker).await;
+    let admin = admin_of(&a, &a, deadlines());
+
+    let view = a.role().await;
+    assert_eq!(view["superseded"], false, "{view}");
+    assert_eq!(
+        run(&admin, |admin| admin.role(Slot::A)).await,
+        Ok(holder(RoleState::Active))
+    );
+
+    holding.refuse_submissions();
+    let job = Job::new("an Execute the store refuses", &[]);
+    client.upload(&job.blobs()).await;
+    assert_eq!(
+        execute_refused(&client, &job).await,
+        Some(Code::FailedPrecondition),
+        "the child went on with a store that refused its write"
+    );
+    until("the child says it was superseded", async || {
+        a.role().await["superseded"] == true
+    })
+    .await;
+
+    let view = a.role().await;
+    assert_eq!(
+        view["generation"], view["held_generation"],
+        "the generation row moved: not the row under test: {view}"
+    );
+    assert_eq!(view["role"], "active", "{view}");
+    assert_eq!(
+        run(&admin, |admin| admin.role(Slot::A)).await,
+        Ok(not_holder(RoleState::Active))
     );
 }
 
