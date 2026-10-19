@@ -6,7 +6,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use kbf_types::object_store_api::{
-    AuditAction, ConnectionPutAnswer, NodeConvergence, NodeStatus, Status,
+    AuditAction, AuditOutcome, ConnectionPutAnswer, NodeConvergence, NodeStatus, Status,
 };
 
 use crate::farm::{Farm, Frontend, NEW, OLD, TOKEN, listing};
@@ -327,8 +327,19 @@ async fn a_put_whose_answer_was_lost_is_retried_without_a_second_generation() {
         rebound.body
     );
     assert_eq!(op.status().await.generation, 2);
-    let kinds: Vec<AuditAction> = op.audit().await.entries.iter().map(|e| e.action).collect();
-    assert_eq!(kinds.len(), 4, "{kinds:?}");
+    let mut entries = op.audit().await.entries;
+    entries.sort_by_key(|e| e.seq);
+    let log: Vec<(AuditAction, AuditOutcome)> =
+        entries.iter().map(|e| (e.action, e.outcome)).collect();
+    assert_eq!(
+        log,
+        vec![
+            (AuditAction::PutConnection, AuditOutcome::Created),
+            (AuditAction::PutBinding, AuditOutcome::Created),
+            (AuditAction::PutConnection, AuditOutcome::Unchanged),
+            (AuditAction::PutBinding, AuditOutcome::Unchanged),
+        ]
+    );
 
     let seat = Seat::new(&farm, "a");
     let a = Node::start(&farm, &frontend, &seat, no_keys).await;
