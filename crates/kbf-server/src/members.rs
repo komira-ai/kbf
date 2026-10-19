@@ -7,7 +7,7 @@
 //! | key | value | lives |
 //! |---|---|---|
 //! | `instance/<instance id>` | the member id | for ever: a node that returns keeps its id |
-//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter and its newest debts report | `ttl` after the last heartbeat |
+//! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter, its newest debts report and the protocol version it registered naming | `ttl` after the last heartbeat |
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
 //! | `meta/members_formed` | nothing | for ever: the cluster has had an `Active` member |
@@ -37,6 +37,13 @@
 //! keeps the newest report with the store's clock at its receipt, so it dies with the row
 //! and a registration (which rewrites the row) starts without one. A promotion keeps it.
 //! [`Members::storage_health`] judges the rows ([`crate::storage_health`]).
+//!
+//! **Protocol.** The row keeps the protocol version the node named when it registered, for
+//! the operator view ([`Members::protocols`], `GET /v1/members`): a heartbeat and a state
+//! change keep it, a new registration replaces it, and nothing judges it after the
+//! registration. A row written before the field existed names none and reads as a node
+//! whose version is not known, never as version 0. The row lives `ttl` after the last
+//! heartbeat, so a member that went `Down` has no version either.
 //!
 //! **The map** is a function of the rows: [`Members::refresh`] reads `map`, `member/` and
 //! the `down/` marks, builds the next member list, and if it differs commits generation
@@ -98,6 +105,7 @@ use prost::Message as _;
 use tokio::sync::watch;
 
 use crate::storage_health::{Debts, MemberReport, Report, StorageHealth, storage_health};
+use crate::worker::named_protocol;
 
 const MAP_KEY: &str = "map";
 const MEMBERS: &str = "member/";
@@ -278,8 +286,8 @@ pub enum MembershipError {
     Map(#[from] MapError),
 }
 
-/// A stored member row: the member as the map will hold it, its boot counter and the
-/// newest debts report.
+/// A stored member row: the member as the map will hold it, its boot counter, the newest
+/// debts report and the protocol version its node registered with.
 #[derive(Clone, PartialEq, prost::Message)]
 struct Row {
     #[prost(message, optional, tag = "1")]
@@ -288,6 +296,11 @@ struct Row {
     boot: u64,
     #[prost(message, optional, tag = "3")]
     report: Option<StoredReport>,
+    /// The `protocol` of the registration that wrote the row. 0 is absent: a row written
+    /// before this field existed (or by a registration that named none) reads as a node
+    /// whose version is not known ([`named_protocol`]).
+    #[prost(uint32, tag = "4")]
+    protocol: u32,
 }
 
 /// [`Report`] as stored.
@@ -327,6 +340,8 @@ struct Live {
     member: Member,
     boot: u64,
     report: Option<Report>,
+    /// What its registration named; `None` for a row that names none.
+    protocol: Option<u32>,
     version: Version,
 }
 
@@ -342,15 +357,24 @@ fn decode_row(stored: &Versioned) -> Result<Live, MembershipError> {
         member,
         boot: row.boot,
         report: row.report.as_ref().map(Report::from),
+        protocol: named_protocol(row.protocol),
         version: stored.version,
     })
 }
 
-fn encode_row(member: &Member, boot: u64, report: Option<&Report>) -> Vec<u8> {
+/// The value of the row of `member` at `boot`, for a node that registered naming
+/// `protocol`, with `report` as its newest debts report.
+fn encode_row(
+    member: &Member,
+    boot: u64,
+    protocol: Option<u32>,
+    report: Option<&Report>,
+) -> Vec<u8> {
     Row {
         member: Some(pb::Member::from(member)),
         boot,
         report: report.map(StoredReport::from),
+        protocol: protocol.unwrap_or(0),
     }
     .encode_to_vec()
 }
@@ -616,7 +640,7 @@ impl Members {
             // generation) even when nothing else about it did.
             boot,
         };
-        self.write_row(&member, boot)?;
+        self.write_row(&member, boot, named_protocol(who.protocol))?;
         let map = self.refresh()?.ok_or(MembershipError::NoMap)?;
         Ok(Registration { id, boot, map })
     }
@@ -647,9 +671,15 @@ impl Members {
     }
 
     /// Stores `member`'s row with a whole time to live, unless a newer boot is there, and
-    /// clears its `down/` mark. An `Active` row also writes `meta/members_formed`, in the
-    /// same transaction.
-    fn write_row(&self, member: &Member, boot: u64) -> Result<(), MembershipError> {
+    /// clears its `down/` mark. The row names the `protocol` this registration did, in
+    /// place of any an earlier boot wrote. An `Active` row also writes
+    /// `meta/members_formed`, in the same transaction.
+    fn write_row(
+        &self,
+        member: &Member,
+        boot: u64,
+        protocol: Option<u32>,
+    ) -> Result<(), MembershipError> {
         let key = member_key(member.id);
         for _ in 0..ATTEMPTS {
             let cond = match self.store.get(&key)? {
@@ -671,7 +701,12 @@ impl Members {
                 txn = txn.put(FORMED, Vec::new(), Cond::Any);
             }
             let txn = txn
-                .put_ttl(&key, encode_row(member, boot, None), self.config.ttl, cond)
+                .put_ttl(
+                    &key,
+                    encode_row(member, boot, protocol, None),
+                    self.config.ttl,
+                    cond,
+                )
                 .delete(down_key(member.id), Cond::Any);
             if self.store.txn(txn)?.is_ok() {
                 return Ok(());
@@ -771,7 +806,7 @@ impl Members {
             };
             let mut put = Txn::new().put_ttl(
                 &key,
-                encode_row(&live.member, live.boot, live.report.as_ref()),
+                encode_row(&live.member, live.boot, live.protocol, live.report.as_ref()),
                 ttl,
                 Cond::Version(stored.version),
             );
@@ -979,6 +1014,21 @@ impl Members {
         let now = self.store.now();
         let members: Vec<MemberReport> = members.into_values().collect();
         Ok(storage_health(&members, now, self.config.freshness()))
+    }
+
+    /// The protocol version each member with a live row registered naming (`None`: the row
+    /// names none, as a row written before the field existed). A member the map holds
+    /// whose row has lapsed (`Down`) is not here: its row, which held the version, expired
+    /// with the heartbeats, so a reader treats it as not known.
+    ///
+    /// # Errors
+    /// The store failing; a stored row not decoding.
+    pub fn protocols(&self) -> Result<BTreeMap<MemberId, Option<u32>>, MembershipError> {
+        Ok(self
+            .read_rows()?
+            .into_iter()
+            .map(|(id, live)| (id, live.protocol))
+            .collect())
     }
 
     fn read_rows(&self) -> Result<BTreeMap<MemberId, Live>, MembershipError> {
