@@ -383,7 +383,7 @@ fn the_leafs_ips_are_a_list_of_canonical_addresses_or_the_call_is_refused() {
 fn the_leafs_ips_are_believed_only_from_loopback_with_the_secret() {
     let secret = secret();
     let wrong = hex::encode([0x5b; 32]);
-    for value in ["10.77.0.1", "junk,,"] {
+    for value in ["10.77.0.1", "junk,,", ""] {
         let claims = [(NODE_ID, "node-a"), (NODE_IPS, value)];
         for pairs in [
             claims.to_vec(),
