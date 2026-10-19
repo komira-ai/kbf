@@ -34,6 +34,8 @@ pub(crate) struct Core {
 }
 
 impl Core {
+    /// A core over fresh metrics: what the tests start from.
+    #[cfg(test)]
     pub(crate) fn new(
         table: UpstreamTable,
         limits: Limits,
@@ -41,7 +43,26 @@ impl Core {
         connector: Connector,
         security: Security,
     ) -> Arc<Self> {
-        let metrics = Arc::new(Metrics::default());
+        Self::with_metrics(
+            table,
+            limits,
+            slots,
+            connector,
+            security,
+            Arc::new(Metrics::default()),
+        )
+    }
+
+    /// As [`Core::new`], over `metrics` made earlier: what must be loaded before the secret
+    /// is created (the TLS files) counts its failures there.
+    pub(crate) fn with_metrics(
+        table: UpstreamTable,
+        limits: Limits,
+        slots: ActiveSlot,
+        connector: Connector,
+        security: Security,
+        metrics: Arc<Metrics>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             slots,
             queue: HoldQueue::new(HoldLimits::default()),

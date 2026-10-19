@@ -576,6 +576,17 @@ mod tests {
         assert_eq!(limit.tracked(), 1);
     }
 
+    /// The numbers the design note and the child promise, as literals: ten wrong tokens in a
+    /// row, one earned back a second, ten thousand addresses, thirty-two bytes of token.
+    #[test]
+    fn the_promised_limits_are_the_constants() {
+        assert_eq!(FAILURE_BURST, 10);
+        assert_eq!(FAILURE_REFILL, Duration::from_secs(1));
+        assert_eq!(MAX_TRACKED, 10_000);
+        assert_eq!(MIN_TOKEN_BYTES, 32);
+        assert_eq!(MAX_TOKEN_FILE_BYTES, 4096);
+    }
+
     #[test]
     fn a_token_file_is_read_under_the_childs_rules() {
         let dir = crate::scratch::scratch("token-files");
@@ -599,6 +610,10 @@ mod tests {
             bad(&write("short", b"too-short", 0o600)),
             TokenError::Content { .. }
         ));
+        // The child's floor is 32 bytes: one fewer is refused, exactly 32 is a token.
+        let below = write("below", &[b'a'; 31], 0o600);
+        assert!(matches!(bad(&below), TokenError::Content { .. }));
+        assert!(Token::from_file(&write("floor", &[b'a'; 32], 0o600)).is_ok());
         let spaced = write("spaced", b"0123456789abcdef 123456789abcdef0", 0o600);
         assert!(matches!(bad(&spaced), TokenError::Content { .. }));
         let big = write("big", &vec![b'a'; MAX_TOKEN_FILE_BYTES + 1], 0o600);

@@ -43,20 +43,7 @@ impl Pki {
     }
 
     fn leaf(&self, sans: Vec<SanType>, usage: ExtendedKeyUsagePurpose, expired: bool) -> Leaf {
-        let mut params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
-        params.subject_alt_names = sans;
-        params.extended_key_usages = vec![usage];
-        if expired {
-            params.not_before = rcgen::date_time_ymd(2026, 9, 2);
-            params.not_after = rcgen::date_time_ymd(2026, 9, 3);
-        }
-        let key = KeyPair::generate().expect("leaf key");
-        let cert = params.signed_by(&key, &self.issuer).expect("sign");
-        Leaf {
-            cert: cert.pem(),
-            key: key.serialize_pem(),
-            der: cert.der().to_vec(),
-        }
+        issue(&self.issuer, sans, usage, expired)
     }
 
     /// The server's certificate, for `localhost`.
@@ -73,15 +60,50 @@ impl Pki {
 
     /// A client certificate naming `dns` and, if given, the role `role` (`urn:kbf:role:...`).
     pub(crate) fn client(&self, dns: &[&str], role: Option<&str>) -> Leaf {
-        let mut sans: Vec<SanType> = dns
-            .iter()
-            .map(|d| SanType::DnsName((*d).try_into().expect("ia5")))
-            .collect();
-        if let Some(role) = role {
-            let uri = format!("{}{role}", kbf_peer::ROLE_URI_PREFIX);
-            sans.push(SanType::URI(uri.try_into().expect("ia5")));
-        }
-        self.leaf(sans, ExtendedKeyUsagePurpose::ClientAuth, false)
+        self.leaf(
+            client_sans(dns, role),
+            ExtendedKeyUsagePurpose::ClientAuth,
+            false,
+        )
+    }
+
+    /// A client certificate whose validity ended before now.
+    pub(crate) fn expired_client(&self, dns: &[&str], role: &str) -> Leaf {
+        self.leaf(
+            client_sans(dns, Some(role)),
+            ExtendedKeyUsagePurpose::ClientAuth,
+            true,
+        )
+    }
+
+    /// A certificate with a client's names and role that is for servers only (its extended
+    /// key usage is `serverAuth`).
+    pub(crate) fn server_only_client(&self, dns: &[&str], role: &str) -> Leaf {
+        self.leaf(
+            client_sans(dns, Some(role)),
+            ExtendedKeyUsagePurpose::ServerAuth,
+            false,
+        )
+    }
+
+    /// An intermediate CA signed by this one.
+    pub(crate) fn intermediate(&self) -> Intermediate {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "farm intermediate");
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let issuer = CertifiedIssuer::signed_by(
+            params,
+            KeyPair::generate().expect("intermediate key"),
+            &self.issuer,
+        )
+        .expect("intermediate certificate");
+        Intermediate { issuer }
     }
 
     /// The files of a proxy in `dir`: this CA's server certificate and key, and this CA as
@@ -107,6 +129,60 @@ impl Pki {
             std::fs::write(&aside, content).expect("write aside");
             std::fs::rename(&aside, path).expect("rename into place");
         }
+    }
+}
+
+fn issue(
+    issuer: &CertifiedIssuer<'static, KeyPair>,
+    sans: Vec<SanType>,
+    usage: ExtendedKeyUsagePurpose,
+    expired: bool,
+) -> Leaf {
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+    params.subject_alt_names = sans;
+    params.extended_key_usages = vec![usage];
+    if expired {
+        params.not_before = rcgen::date_time_ymd(2026, 9, 2);
+        params.not_after = rcgen::date_time_ymd(2026, 9, 3);
+    }
+    let key = KeyPair::generate().expect("leaf key");
+    let cert = params.signed_by(&key, issuer).expect("sign");
+    Leaf {
+        cert: cert.pem(),
+        key: key.serialize_pem(),
+        der: cert.der().to_vec(),
+    }
+}
+
+fn client_sans(dns: &[&str], role: Option<&str>) -> Vec<SanType> {
+    let mut sans: Vec<SanType> = dns
+        .iter()
+        .map(|d| SanType::DnsName((*d).try_into().expect("ia5")))
+        .collect();
+    if let Some(role) = role {
+        let uri = format!("{}{role}", kbf_peer::ROLE_URI_PREFIX);
+        sans.push(SanType::URI(uri.try_into().expect("ia5")));
+    }
+    sans
+}
+
+/// An intermediate CA under the farm CA, as an operator who keeps the root offline has.
+pub(crate) struct Intermediate {
+    issuer: CertifiedIssuer<'static, KeyPair>,
+}
+
+impl Intermediate {
+    /// A client certificate issued by this intermediate, sent as the chain
+    /// `[leaf, intermediate]`.
+    pub(crate) fn client_chain(&self, dns: &[&str], role: Option<&str>) -> Leaf {
+        let mut leaf = issue(
+            &self.issuer,
+            client_sans(dns, role),
+            ExtendedKeyUsagePurpose::ClientAuth,
+            false,
+        );
+        leaf.cert.push_str(&self.issuer.pem());
+        leaf
     }
 }
 

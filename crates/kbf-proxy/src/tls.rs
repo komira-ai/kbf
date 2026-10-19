@@ -20,7 +20,7 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use rustls::ServerConfig;
@@ -69,6 +69,9 @@ fn read(path: &PathBuf) -> Result<Vec<u8>, TlsReloadError> {
 pub(crate) struct TlsReloader {
     paths: TlsPaths,
     current: RwLock<Arc<ServerConfig>>,
+    /// Held from reading the files to swapping the result in: two reloads that overlap would
+    /// otherwise swap in the order they finish, and the one that read older files could win.
+    one_reload: Mutex<()>,
     metrics: Arc<Metrics>,
 }
 
@@ -92,6 +95,7 @@ impl TlsReloader {
         Ok(Self {
             paths,
             current: RwLock::new(config),
+            one_reload: Mutex::new(()),
             metrics,
         })
     }
@@ -122,7 +126,19 @@ impl TlsReloader {
     /// # Errors
     /// [`TlsReloadError`].
     pub(crate) fn reload(&self) -> Result<(), TlsReloadError> {
-        match Self::build(&self.paths, true) {
+        self.reload_between(|| ())
+    }
+
+    /// [`Self::reload`] running `between` once the files are built and before the swap, so a
+    /// test can look at the reload mid-way.
+    fn reload_between(&self, between: impl FnOnce()) -> Result<(), TlsReloadError> {
+        let _alone = self
+            .one_reload
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let built = Self::build(&self.paths, true);
+        between();
+        match built {
             Ok(config) => {
                 *self.current.write().unwrap_or_else(PoisonError::into_inner) = config;
                 tracing::info!("reloaded the proxy's TLS files");
@@ -235,5 +251,38 @@ impl Acceptor {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::pki::Pki;
+
+    /// A reload holds the reload lock from reading the files to the swap, so a second one
+    /// waits for it and the later read is the later swap.
+    ///
+    /// Kills: a reload whose lock is dropped before the swap (or never taken), which lets a
+    /// reload that read older files swap in after one that read newer ones.
+    #[test]
+    fn a_reload_is_alone_from_the_read_to_the_swap() {
+        let pki = Pki::new("serial CA");
+        let paths = pki.write(&crate::scratch::scratch("reload-alone"), &pki.server());
+        let reloader = TlsReloader::load(paths, Arc::new(Metrics::default())).expect("load");
+        let before = reloader.config();
+        let mut looked = 0;
+        reloader
+            .reload_between(|| {
+                looked += 1;
+                assert!(
+                    reloader.one_reload.try_lock().is_err(),
+                    "a second reload would not wait"
+                );
+                assert!(Arc::ptr_eq(&reloader.config(), &before), "not yet swapped");
+            })
+            .expect("reload");
+        assert_eq!(looked, 1);
+        assert!(!Arc::ptr_eq(&reloader.config(), &before), "swapped");
+        assert!(reloader.one_reload.try_lock().is_ok(), "and let go");
     }
 }

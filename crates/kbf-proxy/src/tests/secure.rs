@@ -488,6 +488,57 @@ async fn a_wrong_role_certificate_is_denied_on_a_worker_path() {
     assert_eq!(rig.a.state.dispatches(), 1);
 }
 
+/// A client certificate issued by an intermediate CA, sent with it as `[leaf, intermediate]`,
+/// is the leaf's identity: the child is told the leaf's node and role, never the CA's.
+///
+/// Kills: identity read from another certificate of the chain than the first.
+#[tokio::test(start_paused = true)]
+async fn the_identity_is_the_leafs_when_a_chain_is_sent() {
+    let (rig, pki, _) = tls_rig("chain", Buck2Auth::None).await;
+    let leaf = pki
+        .intermediate()
+        .client_chain(&["node-5.farm"], Some("storage"));
+    let mut client = h2_over_tls(&rig, client_config(&pki.ca_pem, Some(&leaf), &["h2"])).await;
+    assert_eq!(client.unary(WORKER).await.text(), "a");
+    let seen = rig.a.state.headers_of(WORKER);
+    assert_eq!(
+        reserved(&seen[0]),
+        [
+            ("x-kbf-node-id".to_owned(), "node-5.farm".to_owned()),
+            ("x-kbf-proxy-auth".to_owned(), hex::encode(SECRET)),
+            ("x-kbf-role".to_owned(), "storage".to_owned()),
+        ]
+    );
+}
+
+/// A client certificate that is past its validity, or is for servers only, fails the
+/// handshake: it is not served and not taken for an anonymous client.
+///
+/// Kills: a client verifier that ignores validity or extended key usage.
+#[tokio::test(start_paused = true)]
+async fn an_expired_or_server_only_client_certificate_is_not_served() {
+    let (rig, pki, _) = tls_rig("bad-clients", Buck2Auth::None).await;
+    let certs = [
+        pki.expired_client(&["node-6.farm"], "daemon"),
+        pki.server_only_client(&["node-6.farm"], "daemon"),
+    ];
+    for cert in &certs {
+        let config = client_config(&pki.ca_pem, Some(cert), &["h2"]);
+        let tls = connect_tls(&rig, config)
+            .await
+            .expect("the client side completes");
+        assert!(closed_by_the_server(tls).await);
+    }
+    assert_eq!(rig.a.state.dispatches(), 0);
+    assert_eq!(
+        rig.core
+            .metrics
+            .handshake_failed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
 /// What a client sees of a connection the server closed or failed: an error, or end of
 /// stream, and never a byte of HTTP/2.
 async fn closed_by_the_server(mut tls: TlsStream<DuplexStream>) -> bool {

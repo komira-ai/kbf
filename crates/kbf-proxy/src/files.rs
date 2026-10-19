@@ -152,7 +152,25 @@ pub(crate) enum Place {
 /// Writes `bytes` to a temporary file beside `path` (mode 0600, no trailing newline or
 /// anything else), fsyncs it, and puts it at `path` with [`Place`]: a crash leaves the old
 /// file or the whole new one, never an empty one. Then fsyncs the directory.
+///
+/// A failure after a creation (the directory's fsync) takes the new name away again: a
+/// start that reports an error has not made a file that the next start would take for one
+/// it found. A replacement is not undone: the file it replaced did not hold a usable value.
 pub(crate) fn write_new(path: &Path, bytes: &[u8], place: Place) -> io::Result<()> {
+    write_new_with(path, bytes, place, sync_dir)
+}
+
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir).and_then(|dir| dir.sync_all())
+}
+
+/// [`write_new`] with the directory's fsync given, so a test can fail it.
+fn write_new_with(
+    path: &Path,
+    bytes: &[u8],
+    place: Place,
+    sync_dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
@@ -172,7 +190,11 @@ pub(crate) fn write_new(path: &Path, bytes: &[u8], place: Place) -> io::Result<(
         Place::New => std::fs::hard_link(&aside.0, path)?,
         Place::Replace => std::fs::rename(&aside.0, path)?,
     }
-    File::open(dir)?.sync_all()
+    let synced = sync_dir(dir);
+    if synced.is_err() && place == Place::New {
+        let _ = std::fs::remove_file(path);
+    }
+    synced
 }
 
 #[cfg(test)]
@@ -300,6 +322,29 @@ mod tests {
         ));
     }
 
+    /// A FIFO is refused as not a file, without waiting for a writer: a blocking open would
+    /// hang `bind` for ever. The open runs on a thread so that a regression fails the test
+    /// (the bound is only for that; a passing run does not depend on the clock).
+    #[test]
+    fn a_fifo_is_refused_without_waiting_for_a_writer() {
+        let dir = scratch("files-fifo");
+        let path = dir.join("fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .expect("mkfifo");
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(read_owner_only(&path, 4)));
+        let read = result
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the open must not wait for a writer");
+        assert!(matches!(read, Err(FileError::NotAFile { .. })), "{read:?}");
+    }
+
     fn entries(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .expect("list")
@@ -334,6 +379,16 @@ mod tests {
         std::fs::write(&stale, b"half").expect("stale");
         write_new(&path, &[9; 32], Place::Replace).expect("replace");
         assert_eq!(std::fs::read(&path).expect("read"), [9; 32]);
+        assert_eq!(entries(&dir), ["proxy-auth"]);
+
+        // A creation whose directory fsync fails reports it and leaves no file; a replacement
+        // keeps its new content.
+        let fresh = dir.join("fresh");
+        let broken = |_: &Path| Err(io::Error::from(io::ErrorKind::Other));
+        write_new_with(&fresh, &[5; 32], Place::New, broken).expect_err("fsync fails");
+        assert_eq!(entries(&dir), ["proxy-auth"]);
+        write_new_with(&path, &[6; 32], Place::Replace, broken).expect_err("fsync fails");
+        assert_eq!(std::fs::read(&path).expect("read"), [6; 32]);
         assert_eq!(entries(&dir), ["proxy-auth"]);
 
         // A directory that is not there fails and leaves nothing.

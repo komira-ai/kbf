@@ -19,6 +19,7 @@ use crate::config::ProxyConfig;
 use crate::control::{ProxySnapshot, UpdateHandler};
 use crate::core::{Core, now};
 use crate::identity::{ProxySecret, SecretOrigin, admin_headers};
+use crate::metrics::Metrics;
 use crate::pool::tcp_connector;
 use crate::security::Security;
 use crate::serve::serve;
@@ -47,7 +48,6 @@ impl Proxy {
     /// A token or TLS file is refused, the secret file cannot be read or created, the runtime
     /// could not be built, or the socket could not be made non-blocking.
     pub fn bind(cfg: ProxyConfig, listener: OwnedFd) -> io::Result<(ProxyHandle, ProxyRunner)> {
-        let (secret, origin) = ProxySecret::create_or_read(&cfg.proxy_auth_file)?;
         let buck2_token = (cfg.buck2_auth == Buck2Auth::Bearer)
             .then_some(cfg.buck2_token_file.as_deref())
             .flatten();
@@ -67,15 +67,25 @@ impl Proxy {
         };
         let hold_max = cfg.frontend_hold();
         let (slots, startup) = ActiveSlot::starting(hold_max);
-        let security = Security::new(cfg.buck2_auth, tokens, secret.clone());
-        let core = Core::new(cfg.upstream, cfg.limits, slots, tcp_connector(), security);
+        let metrics = Arc::new(Metrics::default());
         let paths = TlsPaths {
             cert: cfg.server_cert_file,
             key: cfg.server_key_file,
             client_ca: cfg.client_ca_file,
         };
-        let tls = Arc::new(
-            TlsReloader::load(paths, Arc::clone(&core.metrics)).map_err(io::Error::other)?,
+        let tls =
+            Arc::new(TlsReloader::load(paths, Arc::clone(&metrics)).map_err(io::Error::other)?);
+        // The last step that can fail: a start that exits earlier has not made a secret that
+        // a child could have read and the supervisor then adopted (`SecretOrigin::Created`).
+        let (secret, origin) = ProxySecret::create_or_read(&cfg.proxy_auth_file)?;
+        let security = Security::new(cfg.buck2_auth, tokens, secret.clone());
+        let core = Core::with_metrics(
+            cfg.upstream,
+            cfg.limits,
+            slots,
+            tcp_connector(),
+            security,
+            metrics,
         );
         let (stop, stopped) = watch::channel(false);
         let handle = ProxyHandle {

@@ -28,11 +28,11 @@ pub enum ConfigError {
 /// Ports of the children: slot `A` starts at `base_port`, slot `B` at `base_port + 10`; in a
 /// slot the REAPI, worker and operator listeners are at offsets 0, 1 and 2, the admin
 /// calls at 3 and enrollment at 4. The offsets are the frozen contract with the children
-/// (design section 10).
+/// (design section 7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTable {
-    /// The first port of slot A (1024 to 65522).
+    /// The first port of slot A (1024 to [`MAX_BASE_PORT`]).
     pub base_port: u16,
 }
 
@@ -40,6 +40,8 @@ pub struct UpstreamTable {
 pub const SLOT_STRIDE: u16 = 10;
 /// The admin port's offset in a slot.
 pub const ADMIN_OFFSET: u16 = 3;
+/// The largest `base_port`: slot B's highest offset (enrollment, 4) must still be a port.
+pub const MAX_BASE_PORT: u16 = u16::MAX - SLOT_STRIDE - 4;
 
 impl UpstreamTable {
     const fn base(self, slot: Slot) -> u16 {
@@ -188,9 +190,9 @@ impl ProxyConfig {
     }
 
     fn check(&self) -> Result<(), ConfigError> {
-        if !(1024..=65_522).contains(&self.upstream.base_port) {
+        if !(1024..=MAX_BASE_PORT).contains(&self.upstream.base_port) {
             return Err(ConfigError::Invalid(
-                "upstream.base_port must be 1024 to 65522 so both slots fit",
+                "upstream.base_port must be 1024 to 65521 so both slots fit",
             ));
         }
         if self.buck2_auth == Buck2Auth::Bearer && self.buck2_token_file.is_none() {
@@ -259,6 +261,35 @@ base_port = 18000
         assert_eq!(t.port(Slot::B, Target::Worker), 18011);
         assert_eq!(t.admin_port(Slot::A), 18003);
         assert_eq!(t.admin_port(Slot::B), 18013);
+    }
+
+    /// The largest accepted `base_port` gives every listener of both slots a port (no
+    /// overflow on the first call to the highest offset), and one more is refused.
+    #[test]
+    fn the_largest_base_port_leaves_room_for_every_port() {
+        assert_eq!(MAX_BASE_PORT, 65_521);
+        let at = |port: u16| MIN.replace("18000", &port.to_string());
+        let config = ProxyConfig::from_toml_str(&at(65_521)).expect("the largest");
+        let ports: Vec<u16> = Slot::ALL
+            .into_iter()
+            .flat_map(|slot| {
+                let t = config.upstream;
+                [
+                    Target::Reapi,
+                    Target::Worker,
+                    Target::Operator,
+                    Target::Enroll,
+                ]
+                .map(|target| t.port(slot, target))
+                .into_iter()
+                .chain([t.admin_port(slot)])
+            })
+            .collect();
+        assert_eq!(ports.iter().max(), Some(&65_535));
+        assert!(matches!(
+            ProxyConfig::from_toml_str(&at(65_522)),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]

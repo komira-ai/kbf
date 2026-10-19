@@ -142,3 +142,15 @@ async fn a_reload_refuses_an_expired_certificate() {
     assert!(rig.tls.as_ref().expect("TLS").reload().is_err());
     assert_eq!(failed(&rig), 1);
 }
+
+/// The first load accepts an expired certificate (a server has always started on one and a
+/// renewal catches up); only a reload refuses it.
+///
+/// Kills: a first load that refuses an expired certificate.
+#[test]
+fn the_first_load_accepts_an_expired_certificate() {
+    let pki = Pki::new("first-load CA");
+    let paths = pki.write(&scratch("first-expired"), &pki.expired_server());
+    let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
+    assert!(crate::tls::TlsReloader::load(paths, metrics).is_ok());
+}

@@ -483,7 +483,8 @@ fn bind_reports_where_the_secret_came_from() {
 
 /// A proxy does not start on a file it cannot use, and says which.
 ///
-/// Kills: a bind that starts without TLS, without the operator token, or on an open secret.
+/// Kills: a bind that starts without TLS, without the operator token, or on an open secret;
+/// one that creates the secret file before the files that can still refuse it.
 #[test]
 fn bind_refuses_files_it_cannot_use() {
     use crate::scratch::write_file;
@@ -494,7 +495,11 @@ fn bind_refuses_files_it_cannot_use() {
     let broken = |name: &str, mode: &str, damage: &dyn Fn(&Files)| {
         let files = files(name, 20_000, &format!("buck2_auth = \"{mode}\""));
         damage(&files);
-        bind(&files).expect_err(name).to_string()
+        let refusal = bind(&files).expect_err(name).to_string();
+        // A start that fails leaves no new secret for a child to read and the supervisor to
+        // adopt; only the file the test itself wrote is there.
+        assert_eq!(files.dir.join("proxy-auth").exists(), name == "open-secret");
+        refusal
     };
     let remove =
         |files: &Files, name: &str| std::fs::remove_file(files.dir.join(name)).expect("rm");
