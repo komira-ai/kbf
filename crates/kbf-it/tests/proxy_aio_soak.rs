@@ -78,6 +78,7 @@ use kbf_proxy::Proxy;
 use kbf_proxy::control::NoUpdates;
 use kbf_proxy::hold::ALL_IN_ONE_HOLD;
 use kbf_proxy::slot::Slot as GateSlot;
+use kbf_testkit::dir::TestDir;
 use kbf_testkit::reaped::{self, Reaped};
 use proxy_support::{
     Open, actions, api_get, connect, free_base, frontend_args, open_executions, proxy_config,
@@ -431,8 +432,9 @@ fn at(log: &[String], step: &str) -> usize {
 
 #[test]
 fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("proxy-aio-soak-{}", std::process::id()));
+    // Declared first, so it drops last: the children are reaped before it is removed.
+    let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "proxy-aio-soak");
+    let dir = scratch.path().to_path_buf();
     std::fs::create_dir_all(dir.join("bin")).expect("scratch");
     std::os::unix::fs::symlink(
         std::env::current_exe().expect("this binary"),
