@@ -676,3 +676,98 @@ fn a_state_path_that_cannot_be_read_is_an_error_not_a_new_bake() {
     let err = State::load(&dir).unwrap_err().to_string();
     assert!(err.starts_with("read state file"), "{err}");
 }
+
+/// Catches load hours counted in a finer unit than hours: five scrapes ten minutes apart, all
+/// inside one hour, with the actions and builds the floor asks for, measure one hour and extend.
+#[test]
+fn many_scrapes_inside_one_hour_are_one_load_hour() {
+    let mut e = sparse(3000);
+    first(&mut e);
+    let log = quiet_log();
+    let mut last = None;
+    for k in 1..=5u64 {
+        last = Some(observe(
+            &mut e,
+            T0 + 600 * k,
+            &Farm::healthy(200.0 * k as f64),
+            10,
+            Some(&log),
+        ));
+    }
+    let d = last.unwrap();
+    assert_eq!(d.load.hours.measured, 1);
+    assert_eq!(d.load.actions.measured, 1000);
+    let end = ended(&d);
+    assert_eq!(end.status, Status::Extended);
+    assert!(end.note.contains("hours 1/3"), "{}", end.note);
+}
+
+/// Catches a restart window open at one edge: a restart exactly at the bake's start counts, one
+/// exactly at the scrape counts, and the second before or after does not.
+#[test]
+fn restarts_at_the_edges_of_the_bake_window_count() {
+    let at = |t: u64| UpdaterLog {
+        steps: vec![],
+        restarts: vec![Restart {
+            host: "node-1".into(),
+            at: t,
+        }],
+    };
+    for (restart, scrape, counted) in [
+        (T0, T0 + 60, 1.0),
+        (T0 + 60, T0 + 60, 1.0),
+        (T0 - 1, T0 + 60, 0.0),
+        (T0 + 61, T0 + 60, 0.0),
+    ] {
+        let mut e = evaluator(86_400);
+        first(&mut e);
+        let d = observe(&mut e, scrape, &Farm::healthy(1.0), 1, Some(&at(restart)));
+        let g = gate(&d, "restarts");
+        assert_eq!(g.measured, Some(counted), "restart at {restart}");
+        let red = if counted > 0.0 {
+            Verdict::Red
+        } else {
+            Verdict::Green
+        };
+        assert_eq!(g.verdict, red, "restart at {restart}");
+    }
+    let log = at(10);
+    assert_eq!(
+        (
+            log.restarts_in(10, 10),
+            log.restarts_in(11, 20),
+            log.restarts_in(0, 9)
+        ),
+        (1, 0, 0)
+    );
+}
+
+/// Catches a gap judged blind one second early: a gap of exactly `max_gap` is watched time, one
+/// second more is not, and only the second moves the end of the bake.
+#[test]
+fn a_gap_of_exactly_the_limit_is_not_blind() {
+    let run = |gap: u64| {
+        let mut e = Evaluator::new(state(600), 180);
+        e.waive(Waiver::new("min-load", "operator", "rehearsal").unwrap());
+        first(&mut e);
+        let log = quiet_log();
+        // One gap of `gap` seconds, then a scrape a minute until the bake's 600 seconds are over.
+        let mut at = T0 + gap;
+        let mut d = observe(&mut e, at, &Farm::healthy(0.0), 0, Some(&log));
+        assert_eq!(d.end, None);
+        while at < T0 + 600 {
+            at = (at + 60).min(T0 + 600);
+            d = observe(&mut e, at, &Farm::healthy(0.0), 0, Some(&log));
+        }
+        (e.state().blind_secs, d.end)
+    };
+    let (blind, end) = run(180);
+    assert_eq!(blind, 0);
+    assert_eq!(end.map(|x| x.status), Some(Status::Green));
+    let (blind, end) = run(181);
+    assert_eq!(blind, 181);
+    assert_eq!(
+        end, None,
+        "the 181 unwatched seconds moved the end of the bake"
+    );
+}

@@ -2,7 +2,8 @@
 //! release tag a green verdict makes).
 //!
 //! Exit codes: 0 green, 1 red, 2 the command or its inputs are wrong (nothing was decided),
-//! 3 extended (no decision: thin usage, or the farm could not be read). A red or extended
+//! 3 extended (no decision: thin usage, the farm could not be read, or the evaluator could not
+//! write its state or verdict). A red or extended
 //! end also prints `PAGE: <why>` on standard error, the documented hook for whatever pages a
 //! person.
 
@@ -235,8 +236,13 @@ fn run(a: &RunArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<u8, Fail
         },
         &mut |secs| std::thread::sleep(Duration::from_secs(secs)),
     );
-    let outcome = driven?;
-    Ok(report(outcome.status, &outcome.note, out, err))
+    // An error of the evaluator's own (the state or the verdict could not be written) was sealed
+    // as extended by `drive`; it is reported as extended and paged, not as a usage error.
+    let (status, note) = match driven {
+        Ok(outcome) => (outcome.status, outcome.note),
+        Err(e) => (Status::Extended, format!("the evaluator failed: {e}")),
+    };
+    Ok(report(status, &note, out, err))
 }
 
 /// The waiver the flags ask for: refused without an operator and a reason.

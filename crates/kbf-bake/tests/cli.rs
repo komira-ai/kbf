@@ -22,6 +22,11 @@ struct Server {
 }
 
 fn serve(text: String) -> Server {
+    serve_with(text, || {})
+}
+
+/// A farm that runs `on_request` when a scrape arrives, before it answers.
+fn serve_with(text: String, on_request: impl Fn() + Send + 'static) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/metrics", listener.local_addr().unwrap());
     let body = Arc::new(Mutex::new(text));
@@ -31,6 +36,7 @@ fn serve(text: String) -> Server {
             let Ok(mut stream) = stream else { continue };
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request);
+            on_request();
             let body = shared.lock().unwrap().clone();
             let _ = write!(
                 stream,
@@ -289,6 +295,30 @@ fn a_farm_that_is_down_extends_the_bake_and_pages() {
         "{err}"
     );
     assert_eq!(verdict(&f).status, Status::Extended);
+}
+
+/// Catches an evaluator error that leaves the command as a usage error (exit 2, nothing decided,
+/// no `PAGE:`): the state file cannot be written after the first scrape, so the verdict is sealed
+/// extended and the command must say so with exit 3 and a `PAGE:` line.
+#[test]
+fn an_evaluator_error_extends_the_bake_and_pages() {
+    let f = files("cli-evaluator-error");
+    let state = f.state.clone();
+    // Once the first scrape arrives the state file becomes a directory: the save cannot rename onto it.
+    let farm = serve_with(Farm::healthy(0.0).text(), move || {
+        let _ = std::fs::remove_file(&state);
+        let _ = std::fs::create_dir(&state);
+    });
+    let (code, out, err) = exec(&run_args(&f, &farm.url, &WAIVE));
+    assert_eq!(code, EXIT_EXTENDED, "{out}{err}");
+    assert!(
+        err.starts_with("PAGE: the gamma bake is extended: the evaluator failed: "),
+        "{err}"
+    );
+    assert!(!err.contains("kbf-bake: "), "{err}");
+    let doc = verdict(&f);
+    assert_eq!(doc.status, Status::Extended);
+    assert!(doc.note.unwrap().contains("the evaluator failed"));
 }
 
 /// Catches commands and inputs accepted that decide nothing.
