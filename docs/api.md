@@ -595,9 +595,7 @@ binding), as `s3://bucket/prefix/?endpoint=...&region=...`, with `conditional-pu
 endpoint, region, bucket, prefix and settings only: **never** the access key id, the secret
 or any other query key (the key pair reaches a node through `ColdStore.GetStoreConfig`, over
 its storage certificate). A farm with nothing registered sends an empty `cold_store`, and a
-daemon-only node is sent none. `NodeConfig.generation` is 1 plus the registry's generation,
-so a node that renews after a store was registered, changed or taken back is sent the
-configuration again; a storage node that holds none asks once at its next start. A
+daemon-only node is sent none. A storage node that holds none asks once at its next start. A
 registry that cannot be read refuses the call (`StoreUnavailable`) before the token is
 spent. The node uses the `cold_store` it is sent with its own process credentials, so the
 frontend decides which endpoint receives the node's signed requests: the same trust as the
@@ -613,6 +611,19 @@ captured CSR replayed under a new field is refused `MalformedRequest`); `issued_
 within five minutes of the frontend's clock; the same CSR was not seen in the last ten
 minutes and the node did not renew in the last minute. Certificates are issued for the
 same keys. The answer carries `config` only when the node's `config_generation` differs.
+
+**When a node gets a new config.** `NodeConfig.generation` is a digest of the rest of the
+config as that node receives it (roles, `worker_endpoint`, `cas_endpoint`, `storage_port`,
+`cold_store`, and the other fields), with the low bit set so it is never 0. It changes
+exactly when something the node is sent changes: a frontend restarted with another
+`--enroll-worker-endpoint`, `--enroll-cas-endpoint` or `--enroll-storage-port`, or a cold
+store registered, changed or taken back (a daemon-only node is not sent the store, so
+that does not change its generation). A restart with the same flags changes nothing. The
+number is **not ordered**: the node keeps it and `Renew` compares it for equality, so a
+frontend put back to an earlier endpoint sends that configuration again. A node stores
+the new config in `node.json` at the renewal that carries it, but the running process
+does not re-dial: it uses the endpoint at its next start. Moving a farm's endpoints is
+therefore "renew, then restart each node within the dwell", and no re-enrollment.
 
 **Refusals** are exactly a `RefusalReason`: the gRPC status code is `reason.code()` and
 the message is `reason.message()`, byte for byte, with no detail. The node client

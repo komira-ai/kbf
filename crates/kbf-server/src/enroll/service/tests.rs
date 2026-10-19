@@ -115,7 +115,10 @@ async fn an_enrollment_answers_a_certificate_per_key_with_the_bundle_and_the_clo
         START + (answer.certs[0].not_after - START) / 2
     );
     let config = answer.config.expect("config");
-    assert_eq!(config.generation, CONFIG_GENERATION);
+    assert_ne!(
+        config.generation, 0,
+        "0 is the number of a node holding nothing"
+    );
     assert_eq!(config.roles, ["storage", "daemon"]);
     assert_eq!(config.worker_endpoint, "https://front.test:7443");
     assert_eq!(config.storage_port, 8983);
@@ -735,7 +738,7 @@ const COLD_URI: &str = "s3://farm-cold/cold/main/?endpoint=http%3A%2F%2Fs3.test%
 #[tokio::test]
 async fn a_storage_node_is_told_the_registered_cold_store() {
     let farm = farm("enroll-cold");
-    let registry_generation = crate::enroll::testkit::register_cold(&farm);
+    crate::enroll::testkit::register_cold(&farm);
     let tok = token(&farm, 1, &spec(&[Role::Storage, Role::Daemon]));
     let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage, Role::Daemon], ADVERTISE);
     let config = call(&farm, request)
@@ -744,8 +747,15 @@ async fn a_storage_node_is_told_the_registered_cold_store() {
         .config
         .expect("config");
     assert_eq!(config.cold_store, COLD_URI);
-    assert_eq!(config.generation, CONFIG_GENERATION + registry_generation);
-    assert_ne!(config.generation, CONFIG_GENERATION);
+    let bare = self::farm("enroll-cold-bare");
+    let tok = token(&bare, 1, &spec(&[Role::Storage, Role::Daemon]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage, Role::Daemon], ADVERTISE);
+    let before = call(&bare, request).await.expect("enrolled").config;
+    assert_ne!(
+        config.generation,
+        before.expect("config").generation,
+        "a registered store changes the generation"
+    );
     // The text is a store URI the server's own parser reads back as the registered store.
     let parsed: crate::stores::StoreUri = config.cold_store.parse().expect("a store URI");
     let s3 = parsed.as_s3().expect("an S3 store");
@@ -810,7 +820,7 @@ async fn only_a_storage_node_with_a_registration_is_told_a_cold_store() {
         .config
         .expect("config");
     assert_eq!(config.cold_store, "", "nothing registered, nothing sent");
-    assert_eq!(config.generation, CONFIG_GENERATION);
+    let storage_before = config.generation;
 
     crate::enroll::testkit::register_cold(&farm);
     let tok = token(&farm, 2, &spec(&[Role::Daemon]));
@@ -821,6 +831,79 @@ async fn only_a_storage_node_with_a_registration_is_told_a_cold_store() {
         .config
         .expect("config");
     assert_eq!(config.cold_store, "", "a daemon is told no store");
+
+    // The generation follows what the node receives: a daemon is told no store, so a
+    // registration changes nothing it holds; a storage node is told it.
+    let bare = self::farm("enroll-cold-roles-bare");
+    let tok = token(&bare, 2, &spec(&[Role::Daemon]));
+    let (request, _) = enroll_request(&tok, "node-02", &[Role::Daemon], "");
+    let daemon_before = call(&bare, request)
+        .await
+        .expect("enrolled")
+        .config
+        .expect("config");
+    assert_eq!(
+        daemon_before.generation, config.generation,
+        "no churn for a node the registration does not concern"
+    );
+    let tok = token(&farm, 3, &spec(&[Role::Storage]));
+    let (request, _) = enroll_request(&tok, "node-03", &[Role::Storage], "s2.nodes.test:8983");
+    let storage_after = call(&farm, request)
+        .await
+        .expect("enrolled")
+        .config
+        .expect("config");
+    assert_ne!(storage_after.generation, storage_before);
+}
+
+/// The generation changes with each of the three endpoint settings and with nothing else
+/// of the frontend's: two frontends with the same flags give the same number to two nodes.
+///
+/// Catches: a generation that leaves out the worker endpoint, the CAS endpoint or the
+/// storage port (a node enrolled before the flag changed would never learn of it), and a
+/// generation that depends on the node or the time (every renewal would re-send the
+/// configuration).
+#[tokio::test]
+async fn the_generation_follows_each_endpoint_the_node_is_told() {
+    let farm = farm("enroll-generation");
+    let base = crate::enroll::testkit::settings();
+    let variants = [
+        base.clone(),
+        NodeSettings {
+            worker_endpoint: "https://proxy.test:443".to_owned(),
+            ..base.clone()
+        },
+        NodeSettings {
+            cas_endpoint: "https://proxy.test:443".to_owned(),
+            ..base.clone()
+        },
+        NodeSettings {
+            storage_port: 8984,
+            ..base.clone()
+        },
+        // The same as the first, from another node: the number is a function of the config.
+        base,
+    ];
+    let mut seen = Vec::new();
+    for (index, settings) in variants.into_iter().enumerate() {
+        let service = crate::enroll::testkit::service_with(&farm.store, &farm.ca, settings);
+        let bits = u64::try_from(index).expect("small") + 1;
+        let tok = token(&farm, bits, &spec(&[Role::Daemon]));
+        let id = format!("node-{bits:02}");
+        let (request, _) = enroll_request(&tok, &id, &[Role::Daemon], "");
+        let config = service
+            .enroll_now(&request)
+            .expect("enrolled")
+            .config
+            .expect("config");
+        seen.push(config.generation);
+    }
+    assert_eq!(seen[0], seen[4], "the same configuration, the same number");
+    for later in 1..4 {
+        for earlier in 0..later {
+            assert_ne!(seen[earlier], seen[later], "variants {earlier} and {later}");
+        }
+    }
 }
 
 /// A registry that cannot be read refuses the enrollment before the token is spent.
