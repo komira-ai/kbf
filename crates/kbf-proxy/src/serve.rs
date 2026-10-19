@@ -13,9 +13,8 @@ use std::time::Duration;
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
-use hyper::server::conn::http2;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -23,8 +22,8 @@ use tokio::task::JoinHandle;
 
 use crate::body::ProxyBody;
 use crate::control::{MAX_UPDATE_BODY, UPDATE_DEADLINE, UpdateHandler, UpdateReply, UpdateRequest};
-use crate::core::{Core, DOWNSTREAM_CONNECTION_STREAMS};
-use crate::hold::STREAM_WINDOW_BYTES;
+use crate::core::Core;
+use crate::limits::h2_server_builder;
 use crate::metrics::Metrics;
 use crate::pool::BoxIo;
 use crate::reply::{from_update, is_grpc, text, unknown};
@@ -205,20 +204,6 @@ impl Drop for ConnPermit {
     }
 }
 
-/// The downstream h2 server's settings. One window for every stream, and a connection window
-/// of [`DOWNSTREAM_CONNECTION_STREAMS`] of them, so held bodies cannot use up a connection's credit.
-fn http_builder(core: &Core) -> http2::Builder<TokioExecutor> {
-    let mut http = http2::Builder::new(TokioExecutor::new());
-    http.initial_stream_window_size(STREAM_WINDOW_BYTES)
-        .initial_connection_window_size(
-            STREAM_WINDOW_BYTES.saturating_mul(DOWNSTREAM_CONNECTION_STREAMS),
-        )
-        .adaptive_window(false)
-        .max_concurrent_streams(DOWNSTREAM_CONNECTION_STREAMS)
-        .max_header_list_size(core.limits.max_header_list_bytes);
-    http
-}
-
 /// Resolves when the shutdown flag is set, or its sender is gone.
 async fn stopped(shutdown: &mut watch::Receiver<bool>) {
     // A closed channel is a shutdown too: nobody is left to send one.
@@ -234,7 +219,7 @@ pub(crate) async fn serve<U: UpdateHandler + 'static>(
     mut listener: impl Listen,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let http = http_builder(&core);
+    let http = h2_server_builder(&core.limits);
     let limits = ConnLimits::new(
         core.limits.max_connections,
         core.limits.max_connections_per_ip,

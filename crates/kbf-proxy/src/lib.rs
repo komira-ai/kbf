@@ -32,6 +32,10 @@ mod core;
 pub mod hold;
 pub mod identity;
 #[cfg(not(kbf_loom))]
+mod keepalive;
+#[cfg(not(kbf_loom))]
+mod limits;
+#[cfg(not(kbf_loom))]
 mod metrics;
 #[cfg(not(kbf_loom))]
 mod pool;

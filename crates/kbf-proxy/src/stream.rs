@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use h2::Reason;
+use h2::{Reason, RecvStream};
 use http::{HeaderMap, Method, Request, Response, Uri, Version};
 use hyper::body::Incoming;
 use tokio::sync::watch;
@@ -95,17 +95,25 @@ impl Stream {
         // every attempt, so it is never in no count between two permits.
         let _pending = pending;
         let mut attempts = 0;
+        // The stream's first hold start, kept across attempts: a retry that is held again waits
+        // out what is left of the first bound, not a new one.
+        let mut since = None;
         loop {
-            let permit = match admit(&self.core).await {
+            let permit = match admit(&self.core, &mut since).await {
                 Ok(permit) => permit,
                 Err(refusal) => return self.refuse(refusal),
             };
             attempts += 1;
-            match self.attempt(permit).await {
+            match self.attempt(permit, attempts).await {
                 Ok(response) => return response,
                 Err(failure) => {
                     if !self.source.may_retry(&self.path, failure, attempts) {
                         return self.refuse(Refusal::Retries);
+                    }
+                    if failure == Failure::Fenced {
+                        // The re-dispatch is decided: the window closes for good. (A second
+                        // fenced answer is refused by the attempt cap before the window matters.)
+                        self.source.close_window();
                     }
                     Metrics::inc(&self.core.metrics.retries);
                 }
@@ -118,8 +126,9 @@ impl Stream {
         unavailable(self.grpc, refusal.message())
     }
 
-    /// One dispatch. On a failure before the upstream's response head it returns the failure.
-    async fn attempt(&self, permit: Permit) -> Result<Response<ProxyBody>, Failure> {
+    /// One dispatch. On a failure before the upstream's response head, or on a fenced head that
+    /// may be dispatched again, it returns the failure.
+    async fn attempt(&self, permit: Permit, attempts: u8) -> Result<Response<ProxyBody>, Failure> {
         let pool = self
             .core
             .pool
@@ -147,13 +156,13 @@ impl Stream {
             response.await
         };
         let head = tokio::select! {
-            head = head => head.map_err(|e| classify(&e)),
+            head = head => head.map_err(|e| classify(&e)).and_then(|r| self.screen(r, attempts)),
             () = idle_expired(Arc::clone(&self.activity), self.idle) => Err(Failure::Other),
         };
         match head {
             Ok(response) => {
-                // The upstream answered: the request may have had an effect.
-                self.source.close_window();
+                // The upstream answered and the window is closed: the request may have had an
+                // effect, or this is the fenced answer that no retry is left for.
                 let (parts, recv) = response.into_parts();
                 let body = Down::new(recv, life, Arc::clone(&self.activity), self.idle, self.grpc);
                 let mut response = Response::from_parts(parts, ProxyBody::Up(Box::new(body)));
@@ -169,6 +178,27 @@ impl Stream {
                 Err(failure)
             }
         }
+    }
+
+    /// Reads the upstream's first response head before the retry window closes. A head that is
+    /// not the fenced answer closes the window and goes on. The fenced answer (nothing
+    /// committed) is a failure to dispatch again if [`Source::may_retry`] allows it, with the
+    /// window left open for that decision; if not, the window closes and the answer goes on
+    /// as the client's `UNAVAILABLE` (its marker is stripped with every other `x-kbf-*`).
+    fn screen(
+        &self,
+        response: Response<RecvStream>,
+        attempts: u8,
+    ) -> Result<Response<RecvStream>, Failure> {
+        let end = response.body().is_end_stream();
+        if !self.source.on_first_response(response.headers(), end) {
+            return Ok(response);
+        }
+        if self.source.may_retry(&self.path, Failure::Fenced, attempts) {
+            return Err(Failure::Fenced);
+        }
+        self.source.close_window();
+        Ok(response)
     }
 }
 
@@ -188,20 +218,19 @@ fn classify(error: &h2::Error) -> Failure {
 
 /// Binds the stream through the gate. While the gate holds it waits in the hold queue; a
 /// release wakes it to bind again, and its bound answers it `UNAVAILABLE`.
-async fn admit(core: &Core) -> Result<Permit, Refusal> {
-    // The first hold's start, kept across holds so chained holds cannot keep one stream longer
-    // than one bound. A stream that dispatched and retries starts a fresh one.
-    let mut since = None;
+async fn admit(core: &Core, since: &mut Option<std::time::Instant>) -> Result<Permit, Refusal> {
+    // `since` is the first hold's start, kept across holds and across retries so chained holds
+    // cannot keep one stream longer than one bound.
     loop {
         match core.slots.bind() {
             Bind::Bound(permit) => return Ok(permit),
             Bind::NoActive => return Err(Refusal::NoActive),
             Bind::Held { epoch, hold_max } => {
-                let ticket = core.queue.admit(now(), hold_max, since).map_err(|_| {
+                let ticket = core.queue.admit(now(), hold_max, *since).map_err(|_| {
                     Metrics::inc(&core.metrics.hold_rejected);
                     Refusal::QueueFull
                 })?;
-                since = Some(ticket.since());
+                *since = Some(ticket.since());
                 let mut bell = core.slots.subscribe();
                 loop {
                     let released = core.slots.epoch() != epoch;

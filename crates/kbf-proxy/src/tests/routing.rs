@@ -569,7 +569,7 @@ async fn a_burst_dials_at_most_16_at_once_and_opens_at_most_256_connections() {
 #[tokio::test(start_paused = true)]
 async fn a_child_that_never_answers_the_ping_is_not_there() {
     let rig = Rig::start(tagged("a"), tagged("b")).await;
-    rig.a.state.raw_mute_first.store(true, Ordering::Release);
+    *rig.a.state.raw_pongs_first.lock().expect("lock") = Some(0);
     let mut client = rig.client().await;
     let (response, _body) = client.start(CAPS, true).await;
     let reply = finish(response).await;
@@ -668,4 +668,29 @@ async fn a_response_that_ends_with_its_data_ends_without_trailers() {
         reply.trailers.is_none(),
         "no status was invented: {reply:?}"
     );
+}
+
+/// Catches a response whose last DATA frame is a separate, empty one (END_STREAM without a
+/// trailer): the body ends there as well, with no status invented, now that the body reports
+/// the end of the upstream stream by itself.
+#[tokio::test(start_paused = true)]
+async fn a_response_ended_by_an_empty_data_frame_ends_without_trailers() {
+    let a = script(|mut call| async move {
+        read_all(&mut call.body).await;
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(())
+            .expect("a response");
+        let mut send = call.respond.send_response(response, false).expect("head");
+        send.send_data(Bytes::from_static(b"part"), false)
+            .expect("data");
+        // After the proxy has passed the data on and is waiting for what follows.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        send.send_data(Bytes::new(), true).expect("END_STREAM");
+    });
+    let rig = Rig::start(a, tagged("b")).await;
+    let reply = rig.client().await.unary(CAPS).await;
+    assert_eq!(reply.text(), "part", "{reply:?}");
+    assert!(reply.trailers.is_none(), "{reply:?}");
 }
