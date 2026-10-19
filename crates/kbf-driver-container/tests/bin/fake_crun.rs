@@ -31,7 +31,7 @@
 //! - `kill-fails`, `delete-fails`: that verb fails.
 //! - `delete-vanished`: `delete` finds the container's state already gone and fails, as crun does
 //!   when the `crun run` of a killed container removed it first.
-//! - `chown-fails`: a helper giving to the owner this knob holds (`1:1` or `0:0`) fails.
+//! - `chown-fails`: a helper giving to the owner this knob holds (`1001:1001` or `0:0`) fails.
 //! - `chown-sleeps`: a helper giving to the owner this knob holds sleeps 200 ms first (a
 //!   slow hand-over).
 //! - `rm-noop`, `rm-fails`: a removing helper does nothing / fails.
@@ -45,7 +45,7 @@
 //!   and exits 1: a `crun` that reports a failure once the container is gone.
 //! - `give-hangs`: the helper that gives directories sleeps 30 seconds first (a slow
 //!   prepare step).
-//! - `block-log`: the helper that gives the directories to the container (`1:1`) makes a
+//! - `block-log`: the helper that gives the directories to the container (`1001:1001`) makes a
 //!   directory where the log file this knob names (`stdout` or `stderr`) goes in the
 //!   lease's directory, so the driver cannot create it.
 //!
@@ -59,7 +59,7 @@
 //! empty mount point in the input root a symlink to the tree.
 //!
 //! The fake changes no owner (the test runs as one user), but models what an owner other
-//! than the daemon's means: when a run ends while the overlay is the container's (`1:1`
+//! than the daemon's means: when a run ends while the overlay is the container's (`1001:1001`
 //! last), it makes the upper directory unreadable (mode 000, the old mode kept in
 //! `upper-mode`); a helper giving `0:0` restores it.
 
@@ -443,7 +443,7 @@ impl Fake {
             remove_state();
         }
         self.append("events", b"run ended");
-        if self.cat("owner") == b"1:1" {
+        if self.cat("owner") == b"1001:1001" {
             let upper = self.cat("upper");
             let upper = path(&upper);
             if let Ok(meta) = std::fs::metadata(upper) {
@@ -598,7 +598,7 @@ impl Fake {
         if self.has("chown-fails") && self.cat("chown-fails") == owner.as_bytes() {
             return refuse("fake crun: chown refused", 1);
         }
-        if owner == "1:1"
+        if owner == "1001:1001"
             && let Some(log) = self.read("block-log")
         {
             // The lease's directory is the parent of the `upper` directory given.
