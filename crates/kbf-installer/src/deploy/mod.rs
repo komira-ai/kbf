@@ -1,24 +1,28 @@
 //! `kbf-installer deploy --commit <sha>`: the gamma trigger (docs/design/kbf-cicd.md,
-//! "The gamma stage"). It runs on the frontend host, as root, and drives the local
-//! operator API through one release: stage the bytes, check the release is complete for
-//! every platform the farm runs, set the desired release, wait for each node to confirm,
-//! update the frontend, then check the farm.
+//! "The gamma stage"). It runs on the frontend host, as root, and drives the frontend's
+//! public port through one release, frontend first (docs/design/frontend-proxy.md, section
+//! 9): stage the bytes, check the release is complete for every platform the farm runs,
+//! ask the update API to swap the frontend and wait for its update to be `done`, then wait
+//! for the nodes the new frontend rolls, and check the farm.
 //!
 //! Everything outside this process is behind a trait ([`api::Operator`], [`Clock`],
 //! [`Smoke`], [`Check`]) so a test plays the farm. The result is a [`Summary`]: one JSON
 //! line, with a step per stage and the state of each node. It holds no token, no path of
 //! one and no host name.
 //!
-//! The deploy never orders a node and never rolls back. The frontend offers the desired
-//! release and the drain system rolls the nodes, one storage node at a time; the first node
-//! that does not confirm stops the deploy and leaves the farm as the drain system leaves it
-//! (mixed, the failed host held until a person acts).
+//! The deploy never orders a node, never sets the desired release and never rolls back. The
+//! update of the frontend ends with the new frontend offering the release (`nodes: true`),
+//! and its controller rolls the nodes one storage node at a time; the deploy only watches
+//! (`GET /v1/nodes`). The first node that does not confirm stops the deploy and leaves the
+//! farm as the controller leaves it (mixed, the failed host held until a person acts). A
+//! frontend update that fails leaves the old frontend serving.
 
 pub mod api;
 pub mod bundle;
 pub mod cli;
 #[cfg(test)]
 mod cli_flag_tests;
+mod frontend;
 mod frontend_addr;
 #[cfg(test)]
 mod frontend_addr_tests;
@@ -31,14 +35,14 @@ mod summary;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::CommitId;
 use api::{Operator, Reply, Request};
@@ -105,23 +109,21 @@ impl Check for NoCheck {
     }
 }
 
-/// Which side updates first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Order {
-    NodesFirst,
-    FrontendFirst,
-}
-
 #[derive(Clone, Debug)]
 pub struct Options {
     pub commit: CommitId,
+    /// Names this run's frontend update to the update API: every retry of the request
+    /// carries it and so starts no second update. A new run needs a new one (the API
+    /// answers a request id it has seen with the update it started then).
+    pub request_id: String,
     /// Without it: read-only steps, then print the plan.
     pub apply: bool,
     pub node_timeout: Duration,
+    /// The whole frontend step: the POST (and its retries) and the wait for `done`. It
+    /// includes the new frontend's bake.
     pub handover_timeout: Duration,
     pub smoke_timeout: Duration,
     pub allow_offline: Vec<String>,
-    pub order: Order,
     /// The frontend host's own platform (`linux-x86_64`, ...).
     pub host_platform: String,
     /// How long to wait between polls.
@@ -131,15 +133,15 @@ pub struct Options {
 }
 
 impl Options {
-    pub fn new(commit: CommitId, host_platform: &str) -> Options {
+    pub fn new(commit: CommitId, host_platform: &str, request_id: String) -> Options {
         Options {
             commit,
+            request_id,
             apply: false,
             node_timeout: Duration::from_secs(1800),
-            handover_timeout: Duration::from_secs(900),
+            handover_timeout: Duration::from_secs(3600),
             smoke_timeout: Duration::from_secs(60),
             allow_offline: Vec::new(),
-            order: Order::NodesFirst,
             host_platform: host_platform.to_owned(),
             poll: Duration::from_secs(5),
             members_timeout: Duration::from_secs(120),
@@ -156,8 +158,20 @@ pub struct Env<'a> {
 }
 
 /// The installer lock, held while a deploy runs. Dropping it releases it.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a child
+/// forked while the lock is held carries a copy until it execs, so closing the file alone
+/// would leave the lock held as long as that takes. Dropping unlocks first, which no copy
+/// outlives.
 #[derive(Debug)]
-pub struct Lock(#[allow(dead_code)] std::fs::File);
+pub struct Lock(std::fs::File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.0.unlock();
+    }
+}
 
 /// Take the lock without waiting; `None` when another run holds it.
 pub fn lock(path: &Path) -> std::io::Result<Option<Lock>> {
@@ -212,6 +226,10 @@ pub(crate) struct Run<'a> {
     pub env: &'a Env<'a>,
     pub opts: &'a Options,
     pub sum: Summary,
+    /// Every node the preflight saw (id to platform): the nodes the roll is waited for on.
+    /// The new frontend lists only the nodes that have reconnected to it, so a list that
+    /// lacks one of these is not a roll that finished.
+    pub expected: BTreeMap<String, String>,
 }
 
 impl Run<'_> {
@@ -256,6 +274,7 @@ pub fn deploy(env: &Env, opts: &Options, bundle: Option<&mut dyn Read>) -> Summa
         env,
         opts,
         sum: Summary::new(&opts.commit, env.clock.now()),
+        expected: BTreeMap::new(),
     };
     let outcome = run.go(bundle);
     run.sum.ended = summary::utc(env.clock.now());
@@ -268,25 +287,16 @@ pub fn deploy(env: &Env, opts: &Options, bundle: Option<&mut dyn Read>) -> Summa
 
 impl Run<'_> {
     fn go(&mut self, bundle: Option<&mut dyn Read>) -> Result<(), Fail> {
-        let commit = self.opts.commit.clone();
         self.step("bundle", |r| r.upload(bundle))?;
-        let platforms = self.step("preflight", |r| r.preflight())?;
+        self.step("preflight", |r| r.preflight())?;
         self.step("baseline", |r| r.baseline())?;
         if !self.opts.apply {
             self.sum.end(Exit::Plan, "", "");
             return Ok(());
         }
-        let _ = platforms;
-        if self.opts.order == Order::FrontendFirst {
-            self.step("frontend", |r| r.update_frontend())?;
-        }
-        self.step("desired", |r| r.set_desired())?;
+        self.step("frontend", |r| r.update_frontend())?;
         self.step("nodes", |r| r.wait_nodes())?;
-        if self.opts.order == Order::NodesFirst {
-            self.step("frontend", |r| r.update_frontend())?;
-        }
         let smoke = self.post_checks()?;
-        let _ = commit;
         if smoke == SmokeResult::Skipped {
             self.sum.end(
                 Exit::NeedsOperator,
@@ -338,7 +348,7 @@ impl Run<'_> {
 
     /// Step 2: the release is complete for every platform the farm runs, nothing is
     /// offline, no frontend update is in flight.
-    fn preflight(&mut self) -> Result<BTreeSet<String>, Fail> {
+    fn preflight(&mut self) -> Result<(), Fail> {
         let io = |e: String| fail(Exit::Failed, "api_error", e);
         let nodes = self.get_json("/v1/nodes").map_err(io)?;
         // A reply with no `nodes` array, or an empty one, is a farm nobody confirmed anything
@@ -352,6 +362,7 @@ impl Run<'_> {
         for node in nodes::list(&nodes) {
             match node.platform {
                 Some(p) => {
+                    self.expected.insert(node.id.clone(), p.clone());
                     wanted.insert(p);
                 }
                 None => unknown.push(node.id.clone()),
@@ -401,15 +412,17 @@ impl Run<'_> {
             Ok(false) => self.sum.check_skipped = true,
             Err(e) => return Err(fail(Exit::Refused, "check_failed", e)),
         }
-        let update = self.get_json("/v1/update").map_err(io)?;
-        if nodes::frontend_in_flight(&update) {
+        let status = self
+            .frontend_status()
+            .map_err(|unseen| io(unseen.into_text()))?;
+        if status.phase.is_some_and(|phase| !phase.is_terminal()) {
             return Err(fail(
                 Exit::Busy,
                 "frontend_busy",
                 "a frontend update is in flight",
             ));
         }
-        Ok(wanted)
+        Ok(())
     }
 
     /// Step 3: what the farm was.
@@ -419,103 +432,5 @@ impl Run<'_> {
         self.sum.previous_desired = nodes::desired(&update);
         self.get_json("/v1/members").map_err(io)?;
         Ok(())
-    }
-
-    /// Step 4.
-    fn set_desired(&mut self) -> Result<(), Fail> {
-        let body = json!({ "commit": self.opts.commit.as_str() });
-        let reply = self
-            .send(&Request::post_json("/v1/update/desired", &body))
-            .map_err(|e| fail(Exit::Failed, "api_error", e))?;
-        match reply.status {
-            200..=202 => {}
-            409 => {
-                return Err(fail(
-                    Exit::Refused,
-                    "release_incomplete",
-                    "the frontend holds no complete platform for the commit",
-                ));
-            }
-            s => {
-                return Err(fail(
-                    Exit::Failed,
-                    "api_error",
-                    format!("POST /v1/update/desired: status {s}"),
-                ));
-            }
-        }
-        let update = self
-            .get_json("/v1/update")
-            .map_err(|e| fail(Exit::Failed, "api_error", e))?;
-        self.sum.generation = nodes::desired(&update).map(|d| d.generation);
-        Ok(())
-    }
-
-    /// Step 6.
-    fn update_frontend(&mut self) -> Result<(), Fail> {
-        let body = json!({ "commit": self.opts.commit.as_str() });
-        let reply = self
-            .send(&Request::post_json("/v1/update/frontend", &body))
-            .map_err(|e| fail(Exit::Failed, "api_error", e))?;
-        match reply.status {
-            200..=202 => {}
-            409 | 423 => return Err(fail(Exit::Busy, "frontend_busy", "an update is in flight")),
-            s => {
-                return Err(fail(
-                    Exit::Failed,
-                    "api_error",
-                    format!("POST /v1/update/frontend: status {s}"),
-                ));
-            }
-        }
-        let order_id = reply
-            .json()
-            .and_then(|v| v.get("order_id").and_then(Value::as_u64))
-            .filter(|&id| id >= 1)
-            .ok_or_else(|| {
-                fail(
-                    Exit::Failed,
-                    "api_error",
-                    "POST /v1/update/frontend: the reply names no order_id",
-                )
-            })?;
-        self.sum.frontend = Some(summary::Frontend {
-            order_id,
-            state: "pending".to_owned(),
-        });
-        let start = self.env.clock.now();
-        loop {
-            // The instance behind the proxy is swapped during the handover; a request
-            // that fails then is not yet an answer.
-            let state = self
-                .get_json("/v1/update")
-                .ok()
-                .and_then(|u| nodes::frontend_state(&u, order_id));
-            if let Some(state) = state {
-                self.sum.frontend = Some(summary::Frontend {
-                    order_id,
-                    state: state.clone(),
-                });
-                match state.as_str() {
-                    "confirmed" => return Ok(()),
-                    "reverted" => {
-                        return Err(fail(
-                            Exit::Failed,
-                            "frontend_reverted",
-                            "the new instance never became ready; the old one is serving",
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-            if self.env.clock.now().saturating_sub(start) >= self.opts.handover_timeout.as_secs() {
-                return Err(fail(
-                    Exit::Failed,
-                    "frontend_timeout",
-                    "the handover did not finish in time",
-                ));
-            }
-            self.env.clock.sleep(self.opts.poll);
-        }
     }
 }

@@ -90,7 +90,7 @@ Where kbf differs, and why:
 4. **There is a time gate.** kci has no bake, soak or metric gate, and no rollback verb. All three are new here.
 5. **Code is not shared.** kci is Mojo on Buck2; kbf is Rust with `xtask`. The stage file is plain data checked by a Rust lint.
 6. **kci's DEPLOY step** (a cloud resource graph apply) does not describe restarting kbf processes on a host. The
-   deploy here is the pull updater and the frontend-ordered node steps of `split-mode-updates.md`.
+   deploy here is the frontend update of `frontend-proxy.md`, then the pull updater's node steps.
 
 ### 2.1 The stage file [P]
 
@@ -340,8 +340,10 @@ Offering is dry-run by default (`--plan`): it prints what would change and which
 
 ### 5.2 The deploy is a test
 
-The pull updater, the node steps and the frontend handover in the order of `split-mode-updates.md` run on the real farm
-with real builds in flight. The deploy is a test because it is checked as one:
+The deploy (`kbf-installer deploy`, `gamma-deploy.md`) runs on the real farm with real builds in flight: it updates the
+frontend through the proxy's update API first (`frontend-proxy.md` sections 4, 5 and 9: a swap that drops no stream, a
+bake, then the new frontend offers the commit), and then watches the pull updater roll the nodes, one storage node at a
+time. The deploy is a test because it is checked as one:
 
 - **No build failed from a dropped connection**: `kbf_frontend_relay_untraced` is 0 at every scrape of the deploy, and every
   build that was in flight at any point of the deploy (the evaluator records the invocation ids at deploy start and at every
@@ -436,6 +438,29 @@ The evaluator is deliberately not a dashboard: a person reading a graph is not a
 `gamma-verdict.json`: commit, set hash, desired generation, deploy start and end, bake start and end, each gate with measured value and
 threshold, the minimum-load numbers and any waiver. It is a record, not a credential: no host reads it. A red verdict triggers
 section 8; a green one makes the commit publishable (the tag of 8.1 carries it).
+
+### 7.2 Hand-off, baseline and automatic rollback
+
+The deploy and the evaluator are separate processes, so one file passes between them, the **hand-off**: commit, set hash, the
+evaluator's run id, the deploy's start (and end, once it has one), the generation the deploy set, whether the release is
+**reversible** (8.3: the offer knows, the evaluator only reads it; the field has no default) and the commit the deploy
+replaced. `kbf-bake run --handoff FILE` takes all of it from there.
+
+The **baseline** is taken at deploy start, for the deploy's start time, by `kbf-bake baseline`. The farm keeps no time
+series, so the error ratio is failed over executed actions across the closed invocations of the seven days before the
+deploy (`GET /v1/invocations?since&until`), and the latency baseline is the p99 of the evaluator's own earlier scrapes
+(`kbf-bake sample`, kept in a ledger file by something that runs it regularly). A baseline the records or the ledger cannot
+give (a partial list, no executed action, a ledger that does not reach back the seven days) is written down as absent with its
+reason, `baseline` exits 4, and the gate that needs it is red. The error ratio of the records is the records' measure and
+not the `kbf_execute_errors_total` ratio the gate holds the bake to; it is the closest the records give.
+
+**Automatic rollback** is off unless `--auto-rollback` is given (with `--handoff`, `--rollback-url` and
+`--rollback-token-file`). It is offered only when the bake ends red on a gate that had a measurement over its limit, the
+hand-off says the release is reversible, and it names the previous commit and the generation. The offer is
+`POST /v1/update/desired` with `expect_generation`, so a desired commit someone else moved since is a `409` and nothing is
+written; it is made once and never retried. A soft gate never ends a bake, a green or extended end never rolls back, a gate
+that is red only for want of a series or a baseline is no evidence against the release, and an irreversible release pages
+and offers nothing. The cancel hold of Q6 is not built: it is the owner's decision.
 
 ## 8. Stage 3: prod, and rollback
 
