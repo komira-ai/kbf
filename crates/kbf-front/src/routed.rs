@@ -21,15 +21,23 @@
 //! reached (dead before the map says so; the raw ByteStream upload does the same while none
 //! of its bytes past the request's first frames has been passed on).
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kbf_map::Member;
-use kbf_route::{MapSource, Nodes, Placement, Router, TlsNodes};
+use kbf_route::{MapSource, Nodes, Placement, RepairLimit, Router, TlsNodes};
 use kbf_storage::StorageError;
 use kbf_storage::service::RemoteStorage;
 use kbf_types::Digest;
 use tonic::transport::Channel;
+
+/// How often read repair may be told of a blob found away from its owner: a burst of 256
+/// (a run's worth of inputs), then 64 a second.
+const REPAIR_LIMIT: RepairLimit = RepairLimit {
+    burst: NonZeroU32::new(256).expect("not zero"),
+    per_second: NonZeroU32::new(64).expect("not zero"),
+};
 
 /// The connection to a member, for a caller that speaks to a node without a
 /// [`kbf_storage::Storage`] (the proxy's raw pass-through of a ByteStream). A trait so a
@@ -111,9 +119,15 @@ impl Routed {
     }
 
     /// Calls routed by `maps` to the members over mutual TLS (`nodes`).
+    ///
+    /// A blob a read finds away from its owner is copied to that owner in the background
+    /// ([`Router::with_background_repair`], at most [`REPAIR_LIMIT`]): this frontend's
+    /// certificate is what a node accepts an unowned copy from.
     #[must_use]
     pub fn over_tls(maps: Arc<dyn MapSource>, nodes: Arc<TlsNodes>) -> Self {
-        Self::new(maps, nodes.clone(), nodes)
+        let mut routed = Self::new(maps, nodes.clone(), nodes);
+        routed.router = routed.router.with_background_repair(REPAIR_LIMIT);
+        routed
     }
 
     /// Whether to route by the map: it has had two members or more. Once true it stays

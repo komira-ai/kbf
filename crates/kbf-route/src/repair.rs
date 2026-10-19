@@ -9,13 +9,16 @@
 //! answers NOT_FOUND for most of what it is asked, and every such read would otherwise
 //! be a repair.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
-use std::sync::Mutex;
-use std::sync::PoisonError;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_map::MemberId;
 use kbf_types::Digest;
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
+
+use crate::router::Router;
 
 /// The repair side's entry point.
 pub trait ReadRepair: Send + Sync {
@@ -72,5 +75,119 @@ impl Limiter {
             return true;
         }
         false
+    }
+}
+
+/// The most blobs [`Router::with_background_repair`] copies at once.
+pub const MAX_REPAIRS_IN_FLIGHT: usize = 4;
+
+/// The router's own [`ReadRepair`]: copies the blob to the owners that lacked it, one task
+/// per digest, never inline.
+pub(crate) struct Background {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    /// A router without a repair hook.
+    router: Router,
+    slots: Arc<Semaphore>,
+    /// The digests being copied now.
+    active: Mutex<BTreeSet<Digest>>,
+}
+
+/// Takes a digest out of the set of those being copied when its task ends, however it ends.
+struct Active {
+    shared: Arc<Shared>,
+    digest: Digest,
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.shared
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.digest);
+    }
+}
+
+impl Background {
+    pub(crate) fn new(router: Router) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                router,
+                slots: Arc::new(Semaphore::new(MAX_REPAIRS_IN_FLIGHT)),
+                active: Mutex::default(),
+            }),
+        }
+    }
+}
+
+impl ReadRepair for Background {
+    fn found_elsewhere(&self, digest: &Digest, _found_at: MemberId, missing_at: &[MemberId]) {
+        // The empty blob is held by every node whether or not it was stored.
+        if digest.size_bytes == 0 || missing_at.is_empty() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let Ok(permit) = Arc::clone(&self.shared.slots).try_acquire_owned() else {
+            return;
+        };
+        let fresh = self
+            .shared
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(*digest);
+        if !fresh {
+            return;
+        }
+        let active = Active {
+            shared: Arc::clone(&self.shared),
+            digest: *digest,
+        };
+        let missing = missing_at.to_vec();
+        runtime.spawn(async move {
+            active.shared.repair(active.digest, &missing).await;
+            drop(permit);
+            drop(active);
+        });
+    }
+}
+
+impl Shared {
+    /// Copies `digest` to each of `missing` that still lacks it. A failure is logged and
+    /// leaves the blob for the next read that finds it away from its owner.
+    async fn repair(&self, digest: Digest, missing: &[MemberId]) {
+        let Ok(view) = self.router.view() else {
+            return;
+        };
+        let generation = view.map.generation();
+        for id in missing {
+            let Some(member) = view.map.member(*id) else {
+                continue;
+            };
+            let Ok(node) = self.router.nodes.node(member, generation) else {
+                continue;
+            };
+            match node.find_missing(&[digest]).await {
+                Ok(lacking) if lacking.is_empty() => continue,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(%digest, owner = %id, error = %e, "read repair could not ask the owner");
+                    continue;
+                }
+            }
+            match self.router.copy_blob_to(&node, digest).await {
+                Ok(()) => {
+                    tracing::debug!(%digest, owner = %id, "read repair copied a blob to its owner")
+                }
+                Err(e) => {
+                    tracing::debug!(%digest, owner = %id, error = %e, "read repair could not copy a blob to its owner")
+                }
+            }
+        }
     }
 }
