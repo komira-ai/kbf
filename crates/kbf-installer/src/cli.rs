@@ -14,7 +14,7 @@ use crate::record::ActivationId;
 #[derive(Parser)]
 #[command(
     name = "kbf-installer",
-    version,
+    version = crate::version::VERSION,
     about = "The one root tool for setting up a kbf host and for updating it",
     long_about = "The one root tool for setting up a kbf host and for updating it.\n\n\
 Mutating verbs only say what they would do unless --apply is given. Exit codes: 0 ok, 1 failed, \
@@ -51,9 +51,10 @@ pub enum Verb {
     /// Undo the pending swap, naming its activation.
     Revert(ActivationArgs),
     /// Point `current` at `previous`, with no confirm window.
-    Rollback,
-    /// Remove releases beyond current, previous and one more.
-    Gc,
+    Rollback(ServiceArgs),
+    /// Remove the releases nothing needs: current, previous, staged, the swap on trial and any a
+    /// process executes from stay, and so do the newest `--keep` others.
+    Gc(GcArgs),
     /// Run before each start of a release on trial; counts the start.
     BootCheck(BootArgs),
     /// For maintainer scripts: take the lock; exit 5 while a swap is pending.
@@ -123,13 +124,13 @@ pub struct ActivationArgs {
     /// The activation: `<epoch>-<order id>`.
     #[arg(long)]
     pub id: ActivationId,
+    #[command(flatten)]
+    pub service: ServiceArgs,
 }
 
+/// The service a swap restarts, by its own flag (never from an order).
 #[derive(Args)]
-pub struct RunArgs {
-    /// Root's directory: status.json goes here; `inbox/` (the service user's) is beneath it.
-    #[arg(long, default_value = "/var/lib/kbf-updater", value_parser = kbf_host::HostPath::new)]
-    pub update_dir: kbf_host::HostPath,
+pub struct ServiceArgs {
     /// The systemd unit to restart after a swap (Linux).
     #[arg(
         long,
@@ -140,15 +141,47 @@ pub struct RunArgs {
     /// The launchd label to kickstart after a swap (macOS).
     #[arg(long)]
     pub launchd_label: Option<String>,
-    /// Seconds between passes.
-    #[arg(long, default_value_t = 3)]
-    pub interval_secs: u64,
+}
+
+impl ServiceArgs {
+    /// How to restart the service. clap makes exactly one of the two flags present
+    /// (`required_unless_present`, `conflicts_with`), so the label is there whenever the
+    /// unit is not.
+    pub fn restart(&self) -> crate::helper::restart::Restart {
+        use crate::helper::restart::Restart;
+        match &self.unit {
+            Some(unit) => Restart::Systemd(unit.clone()),
+            None => Restart::Launchd(self.launchd_label.clone().unwrap_or_default()),
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct GcArgs {
+    /// The releases to keep besides the ones that must stay.
+    #[arg(long, default_value_t = crate::helper::cycle::GC_KEEP)]
+    pub keep: usize,
+}
+
+#[derive(Args)]
+pub struct RunArgs {
+    /// Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it.
+    #[arg(long, default_value = "/var/lib/kbf-installer", value_parser = kbf_host::HostPath::new)]
+    pub update_dir: kbf_host::HostPath,
+    /// The order spool: owned by the service user, mode 0700, inside a root-owned parent.
+    #[arg(long, default_value = "/var/lib/kbf-installer/orders", value_parser = kbf_host::HostPath::new)]
+    pub orders_dir: kbf_host::HostPath,
+    #[command(flatten)]
+    pub service: ServiceArgs,
     /// The confirm window the boot check gives a release on trial (120 to 1800).
-    #[arg(long, default_value_t = 900)]
+    #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
     /// The starts a release on trial gets before it is reverted (Linux).
     #[arg(long, default_value_t = 3)]
     pub starts: u32,
+    /// The fewest seconds between one activation and the next.
+    #[arg(long, default_value_t = 60)]
+    pub min_activation_interval_secs: u64,
     /// Stop after this many passes (a rehearsal or a test); without it, run until stopped.
     #[arg(long)]
     pub passes: Option<u64>,
@@ -166,7 +199,7 @@ pub struct ProxyArgs {
 
 #[derive(Args)]
 pub struct BootArgs {
-    #[arg(long, default_value_t = 900)]
+    #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(120..=1800))]
     pub window_secs: u64,
 }
 
@@ -180,8 +213,8 @@ impl Verb {
             Verb::Update(_) => "update",
             Verb::Confirm(_) => "confirm",
             Verb::Revert(_) => "revert",
-            Verb::Rollback => "rollback",
-            Verb::Gc => "gc",
+            Verb::Rollback(_) => "rollback",
+            Verb::Gc(_) => "gc",
             Verb::BootCheck(_) => "boot-check",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
@@ -199,16 +232,20 @@ impl Verb {
     }
 
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
-    /// verbs that exist (`run`, `boot-check`, `proxy`).
+    /// verbs that exist (`run`, `boot-check`, `proxy` and the operator's verbs).
     pub fn built_by(&self) -> Option<&'static str> {
         match self {
-            Verb::Run(_) | Verb::BootCheck(_) | Verb::Proxy(_) => None,
+            Verb::Run(_)
+            | Verb::BootCheck(_)
+            | Verb::Proxy(_)
+            | Verb::Confirm(_)
+            | Verb::Revert(_)
+            | Verb::Rollback(_)
+            | Verb::Gc(_)
+            | Verb::Quiesce => None,
             Verb::Setup(_) | Verb::Check => Some("P10"),
             Verb::Status => Some("P4"),
             Verb::Update(_) => Some("P13"),
-            Verb::Confirm(_) | Verb::Revert(_) | Verb::Rollback | Verb::Gc | Verb::Quiesce => {
-                Some("P5")
-            }
             Verb::Activate => Some("P5"),
             Verb::Stage => Some("P8"),
             Verb::FetchChild => Some("P7"),

@@ -86,9 +86,12 @@ fn the_kinds_print_for_an_operator() {
     );
 }
 
-/// Catches `--version --json` read loosely: the six fields are read, a later build's
-/// extra field is ignored, and a missing field, a field of the wrong type and text that
-/// is not JSON are refused.
+/// Catches `--version --json` read loosely: the six fields are read (and `platform`, which
+/// a build may add), and a missing field, a field of the wrong type, a field the contract
+/// does not list, one named twice, text that is not JSON and anything after the object
+/// are refused.
+///
+/// Mutant seen red: `deny_unknown_fields` dropped (the extra field is then accepted).
 #[test]
 fn the_version_object_is_read_by_its_fields() {
     let v = Version::parse(version_json(COMMIT, "release").as_bytes()).expect("parses");
@@ -101,11 +104,21 @@ fn the_version_object_is_read_by_its_fields() {
             profile: "release".to_owned(),
             state_schema: 7,
             version: "0.1.0".to_owned(),
+            platform: None,
         }
     );
+    let said = version_json(COMMIT, "release").replace('}', ",\"platform\":\"linux-arm64\"}");
+    assert_eq!(
+        Version::parse(said.as_bytes()).expect("parses").platform,
+        Some("linux-arm64".to_owned())
+    );
     let more = version_json(COMMIT, "release").replace('}', ",\"future\":true}");
-    assert_eq!(Version::parse(more.as_bytes()).expect("parses"), v);
+    let twice = version_json(COMMIT, "release").replace('}', ",\"protocol\":4}");
+    let after = format!("{}{{}}", version_json(COMMIT, "release"));
     for bad in [
+        more.as_str(),
+        twice.as_str(),
+        after.as_str(),
         r#"{"commit":"abc"}"#,
         "kbf 0.1.0",
         "",
@@ -114,6 +127,23 @@ fn the_version_object_is_read_by_its_fields() {
         let err = Version::parse(bad.as_bytes()).expect_err(bad);
         assert_eq!(err.code(), "version-unreadable", "{bad}");
     }
+}
+
+/// Catches an unbounded read of what a not yet trusted binary prints: more than 4 KiB is
+/// refused whatever it holds, and exactly 4 KiB of valid JSON (padded with spaces) is read.
+///
+/// Mutant seen red: the length check dropped.
+#[test]
+fn a_version_object_is_read_up_to_four_kib() {
+    let json = version_json(COMMIT, "release");
+    let fits = format!("{json}{}", " ".repeat(VERSION_CAP - json.len()));
+    assert_eq!(fits.len(), VERSION_CAP);
+    Version::parse(fits.as_bytes()).expect("4 KiB fits");
+    let big = format!("{fits} ");
+    assert_eq!(
+        Version::parse(big.as_bytes()).expect_err("over").code(),
+        "version-oversize"
+    );
 }
 
 /// Catches each check of a version being skipped: the commit (the first 12 digits of the

@@ -233,10 +233,19 @@ fn run(mode: &Mode) -> u8 {
     let _ = io::stdout().write_all(READY);
     // A read error ends the wait as end-of-file does: the daemon cannot be heard.
     let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+    act(mode, rustix::process::Signal::KILL)
+}
+
+/// Step 4 of the module docs; the exit status. `group_end` is the signal `group` mode
+/// sends to the keeper's own group: SIGKILL in [`run`]. It is a parameter so that a test
+/// can run the arm with one that kills nobody: a process SIGKILLed never writes its
+/// coverage counters, so no keeper that dies by it could show those lines run.
+fn act(mode: &Mode, group_end: rustix::process::Signal) -> u8 {
     match mode {
         Mode::Group => {
-            // Kills this process too: it returns only if the kill failed.
-            let _ = rustix::process::kill_current_process_group(rustix::process::Signal::KILL);
+            // With SIGKILL this kills this process too: it returns only if the kill
+            // failed.
+            let _ = rustix::process::kill_current_process_group(group_end);
             1
         }
         Mode::Cgroup { kill, tries } => {
@@ -295,6 +304,16 @@ mod tests {
             assert_eq!(uid.args(), args(&["__keeper", "uid", "601"]));
             assert_eq!(Mode::parse(&args(&["uid", "601"])), Ok(uid));
         }
+    }
+
+    /// Catches a `group` keeper that exits with a status other than 1 (the failed-kill
+    /// status) or that does not return when its signal does not end it. Which signal
+    /// `run` sends is pinned by `a_group_keeper_kills_its_group_when_stdin_closes` in
+    /// `tests/keeper.rs`; this runs the arm itself with one that ends nobody (SIGCHLD
+    /// is ignored by default), as a keeper SIGKILLed never writes its coverage counters.
+    #[test]
+    fn the_group_arm_returns_one_when_its_signal_ends_nobody() {
+        assert_eq!(act(&Mode::Group, rustix::process::Signal::CHILD), 1);
     }
 
     /// Catches a binary that runs as a daemon, or as a keeper, when its arguments do

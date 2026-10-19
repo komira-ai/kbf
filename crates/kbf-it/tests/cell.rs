@@ -184,7 +184,6 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
             server: tls,
             deny_list: None,
         }),
-        proxy: None,
         heartbeat_interval: Duration::from_millis(200),
         hello_wait: Duration::from_secs(5),
         tick: Duration::from_millis(50),

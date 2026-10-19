@@ -1,7 +1,7 @@
 //! `kbf-all-in-one`: the library behind `kbf all-in-one` (the `kbf` binary, crates/kbf-cli),
 //! the farm server and a worker daemon in one process, for a one-node
 //! Linux farm (the README says what it does today and what it does not do yet; the
-//! design is komira-build-farm#657). The daemon's blobs move through calls into
+//! design is kbf#657). The daemon's blobs move through calls into
 //! the server's cache ([`LocalDataPlane`]), not over the network; its control plane
 //! (`Hello`, leases, heartbeats, results) is the remote daemon's, over mutual TLS to the
 //! server half's worker listener on loopback.
@@ -26,8 +26,8 @@
 //! The crate also holds `kbf storage-and-daemon` ([`storage_and_daemon`]): the same
 //! daemon half and the same plane, beside the storage node in place of the server.
 //!
-//! The scheduler's state is a SQLite file, `<data-dir>/state.db` unless `--state-store`
-//! names one ([`cli`]).
+//! The scheduler's state is in Postgres, on the local socket `postgres:///kbf?host=/run/postgresql`
+//! unless `--state-store` names another store ([`cli`]).
 //!
 //! Not done yet (the README lists it): the in-process plane's admission; the `--reserve-cpus` split
 //! between the halves; the whole-process

@@ -155,7 +155,6 @@ fn start_with_prefix(prefix: &str) -> Server {
         worker: loopback,
         reapi_tls: None,
         worker_tls: None,
-        proxy: None,
         heartbeat_interval: INTERVAL,
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),

@@ -192,7 +192,6 @@ async fn build(pki: &Pki, owner: &Node, pushes_map: bool, scratch: &std::path::P
             server: pki.worker_tls(),
             deny_list: None,
         }),
-        proxy: None,
         heartbeat_interval: Duration::from_millis(100),
         hello_wait: Duration::from_secs(2),
         tick: Duration::from_millis(50),

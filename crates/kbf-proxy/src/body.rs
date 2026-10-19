@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
+use futures::FutureExt;
 use h2::{Reason, RecvStream, SendStream};
 use http::HeaderMap;
 use http_body::{Body, Frame, SizeHint};
@@ -234,8 +235,9 @@ const MAX_KEPT_FRAMES: usize = 64;
 
 /// What the pump does next.
 enum Next {
-    Frame(Kept),
-    End,
+    /// A frame, and whether it is the last the request has (the client ended the stream with
+    /// it), so the pump can end the upstream stream on it.
+    Frame(Kept, bool),
     /// The client's request body failed (a reset): the upstream stream is reset too.
     Failed,
 }
@@ -307,28 +309,39 @@ impl Source {
             let state = self.state();
             if let Some(kept) = state.kept.get(*cursor) {
                 *cursor += 1;
-                return Next::Frame(kept.clone());
-            }
-            if state.ended {
-                return Next::End;
+                // (`&`, not `&&`: a replay only happens once the request has ended.)
+                let last = state.ended & (*cursor >= state.kept.len());
+                return Next::Frame(kept.clone(), last);
             }
         }
-        let frame = self.body.lock().await.frame().await;
+        let (frame, body_done) = {
+            let mut body = self.body.lock().await;
+            let frame = body.frame().await;
+            // `None`: the stream ended with no frame left to read; that is an empty frame
+            // that ends it, so the pump has one way to end a request.
+            let done = frame.is_none() | body.is_end_stream();
+            (frame.unwrap_or(Ok(Frame::data(Bytes::new()))), done)
+        };
         let mut state = self.state();
         match frame {
-            None => {
-                state.ended = true;
-                state.buffer.end_request();
-                Next::End
-            }
-            Some(Err(_)) => Next::Failed,
-            Some(Ok(frame)) => {
+            Err(_) => Next::Failed,
+            Ok(frame) => {
+                let mut last = false;
                 let kept = match frame.into_data() {
-                    Ok(data) => Kept::Data(data),
+                    Ok(data) => {
+                        if body_done {
+                            // The stream ended with this very frame.
+                            last = true;
+                            state.ended = true;
+                            state.buffer.end_request();
+                        }
+                        Kept::Data(data)
+                    }
                     Err(frame) => {
                         // Trailers end the request.
                         state.ended = true;
                         state.buffer.end_request();
+                        last = true;
                         Kept::Trailers(frame.into_trailers().unwrap_or_default())
                     }
                 };
@@ -346,21 +359,32 @@ impl Source {
                     state.kept.push(kept.clone());
                     *cursor += 1;
                 }
-                Next::Frame(kept)
+                Next::Frame(kept, last)
             }
         }
     }
 }
 
-/// Sends `data` upstream within the stream's flow-control window.
-async fn send_chunk(send: &mut SendStream<Bytes>, mut data: Bytes) -> Result<(), h2::Error> {
+/// Sends `data` upstream within the stream's flow-control window; `end` sets END_STREAM on
+/// the last piece. An empty `data` is only ever the client's END; the child's h2 counts the
+/// empty DATA frames that do not end a stream, so none is sent for its own sake.
+async fn send_chunk(
+    send: &mut SendStream<Bytes>,
+    mut data: Bytes,
+    end: bool,
+) -> Result<(), h2::Error> {
+    if data.is_empty() {
+        // Only an empty frame that ends the stream gets here: h2 drops the others before
+        // the body sees them.
+        return send.send_data(data, end);
+    }
     while !data.is_empty() {
         send.reserve_capacity(data.len());
         let granted = std::future::poll_fn(|cx| send.poll_capacity(cx)).await;
         // `None`: the stream is no longer in a state that can send (the peer reset it).
         let granted = granted.ok_or(h2::Error::from(Reason::CANCEL))??;
         let chunk = data.split_to(granted.min(data.len()));
-        send.send_data(chunk, false)?;
+        send.send_data(chunk, end && data.is_empty())?;
     }
     Ok(())
 }
@@ -368,6 +392,13 @@ async fn send_chunk(send: &mut SendStream<Bytes>, mut data: Bytes) -> Result<(),
 /// Carries the client's request upstream, frame by frame, until it ends, either side resets,
 /// or the response half cancels. Holds the stream's [`Lifetime`] until then, so the permit
 /// outlives the response when the request is still open.
+///
+/// The upstream stream ends on the last DATA frame (or on the trailers), never on a frame of
+/// its own: the child's h2 counts empty DATA frames over a connection's life and closes it
+/// after about a hundred. A frame is the last when the client ended the stream with it; when
+/// the client ends it with a separate empty frame, the pump looks ahead, without waiting, so
+/// that END can ride on the data when it has already arrived. A frame is never held back for
+/// a later one: a streaming call has to see each message at once.
 pub(crate) async fn pump(
     source: Arc<Source>,
     mut send: SendStream<Bytes>,
@@ -375,17 +406,31 @@ pub(crate) async fn pump(
     life: Arc<Lifetime>,
 ) {
     let mut cursor = 0;
+    // A frame read ahead, to be handled before reading again.
+    let mut ahead = None;
     loop {
-        let next = tokio::select! {
-            () = life.cancel.notified() => Next::Failed,
-            next = source.next(&mut cursor) => next,
+        let next = match ahead.take() {
+            Some(next) => next,
+            None => tokio::select! {
+                () = life.cancel.notified() => Next::Failed,
+                next = source.next(&mut cursor) => next,
+            },
         };
         match next {
-            Next::Frame(Kept::Data(data)) => {
+            Next::Frame(Kept::Data(data), mut last) => {
+                if !last {
+                    match source.next(&mut cursor).now_or_never() {
+                        // The client's END is already here, on an empty frame.
+                        Some(Next::Frame(Kept::Data(empty), true)) if empty.is_empty() => {
+                            last = true;
+                        }
+                        other => ahead = other,
+                    }
+                }
                 // The response half's `cancel` also ends a pump parked on a full window.
                 let cancelled = tokio::select! {
                     () = life.cancel.notified() => true,
-                    sent = send_chunk(&mut send, data) => {
+                    sent = send_chunk(&mut send, data, last) => {
                         if sent.is_err() {
                             return;
                         }
@@ -396,13 +441,12 @@ pub(crate) async fn pump(
                     send.send_reset(Reason::CANCEL);
                     return;
                 }
+                if last {
+                    return;
+                }
             }
-            Next::Frame(Kept::Trailers(trailers)) => {
+            Next::Frame(Kept::Trailers(trailers), _) => {
                 let _ = send.send_trailers(trailers);
-                return;
-            }
-            Next::End => {
-                let _ = send.send_data(Bytes::new(), true);
                 return;
             }
             Next::Failed => {
