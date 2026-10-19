@@ -27,11 +27,10 @@ fn run_as(euid: u32, args: &[&str]) -> (Exit, String, String) {
 }
 
 /// Every verb of the contract's table and the pull request that builds it. The verbs that
-/// are not built say so with the phase; the two that are built are not here.
+/// are not built say so with the phase; the ones that are built (`run`, `setup` and the operator's) are not here.
 fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
     let commit: &'static str = B;
     vec![
-        (vec!["setup", "--mode=daemon"], "setup", "P10"),
         (vec!["status"], "status", "P4"),
         (
             vec!["update", "--commit", commit, "--frontend"],
@@ -136,11 +135,86 @@ fn json_is_one_object_on_standard_output() {
         v,
         serde_json::json!({"verb": "status", "apply": true, "error": "not_implemented", "phase": "P4"})
     );
-    let (_, out, _) = run_as(1000, &["--json", "setup", "--mode=daemon"]);
+    let (_, out, _) = run_as(1000, &["--json", "activate"]);
     let v: Value = serde_json::from_str(out.trim_end()).expect("json");
     assert_eq!(
         (v["error"].as_str(), v["euid"].as_u64()),
         (Some("needs_root"), Some(1000))
+    );
+}
+
+/// Catches `setup` skipping the root check or reporting in the wrong shape: as an ordinary
+/// user it stops before any step with exit 2, as text on standard error or, with `--json`, as
+/// one object on standard output naming the word `needs_root`.
+#[test]
+fn setup_is_root_only_and_says_so_as_text_or_json() {
+    let args = [
+        "setup",
+        "--mode=daemon",
+        "--frontend-url=https://f.example",
+        "--token-file=/t",
+    ];
+    let (exit, out, err) = run_as(1000, &args);
+    assert_eq!(exit, Exit::Usage);
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.starts_with(
+            "kbf-installer: setup: setup writes /etc and manages services: run it with sudo"
+        ),
+        "{err}"
+    );
+    let mut json = vec!["--json"];
+    json.extend_from_slice(&args);
+    let (exit, out, err) = run_as(1000, &json);
+    assert_eq!((exit, err.as_str()), (Exit::Usage, ""));
+    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
+    assert_eq!(
+        (v["verb"].as_str(), v["error"].as_str()),
+        (Some("setup"), Some("needs_root"))
+    );
+}
+
+/// Catches the steps of `setup` going to the wrong stream: they are for a person, so on
+/// standard output, or with `--json` (where standard output is the one object) on standard
+/// error; a failure prints them ahead of its own line, as text, and as the object with the
+/// word and the message in JSON.
+#[test]
+fn setup_steps_go_to_the_person_and_the_object_to_the_script() {
+    let steps = b"+ step one\n";
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        finish_setup(false, Ok(()), steps, &mut out, &mut err),
+        Exit::Ok
+    );
+    assert_eq!((out.as_slice(), err.as_slice()), (&steps[..], &b""[..]));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        finish_setup(true, Ok(()), steps, &mut out, &mut err),
+        Exit::Ok
+    );
+    assert_eq!((out.as_slice(), err.as_slice()), (&b""[..], &steps[..]));
+
+    let fail = || Err(setup::SetupError::Database("down".to_owned()));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        finish_setup(false, fail(), steps, &mut out, &mut err),
+        Exit::Failed
+    );
+    assert_eq!(
+        String::from_utf8(err).expect("text"),
+        "+ step one\nkbf-installer: setup: database step: down\n"
+    );
+    assert!(out.is_empty());
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        finish_setup(true, fail(), steps, &mut out, &mut err),
+        Exit::Failed
+    );
+    assert!(err.is_empty());
+    let v: Value = serde_json::from_slice(&out).expect("one object");
+    assert_eq!(
+        v,
+        serde_json::json!({"verb": "setup", "error": "database", "message": "database step: down"})
     );
 }
 
@@ -570,51 +644,6 @@ fn the_installer_config_flag_must_be_an_absolute_host_path() {
     }
 }
 
-/// Catches the success line of the database step of `setup` going nowhere or in the wrong
-/// shape: text mode prints the bare line, `--json` one object with the verb, `--apply` and
-/// the message. (The step itself needs a Postgres server; CI's state-postgres job runs it.)
-#[test]
-fn the_database_step_prints_its_line_as_text_or_json() {
-    let mut text = Vec::new();
-    print_success(
-        false,
-        true,
-        "setup",
-        "kbf-installer setup (frontend): database step: x",
-        &mut text,
-    );
-    assert_eq!(
-        String::from_utf8(text).expect("text"),
-        "kbf-installer setup (frontend): database step: x\n"
-    );
-    let mut json = Vec::new();
-    print_success(true, false, "setup", "the line", &mut json);
-    let object: serde_json::Value = serde_json::from_slice(&json).expect("one object");
-    assert_eq!(
-        object,
-        serde_json::json!({"verb": "setup", "apply": false, "message": "the line"})
-    );
-}
-
-/// Catches `setup` taking the database step for a mode with no database, or demanding root
-/// for the step that does not need it: as an ordinary user `--mode frontend` and
-/// `all-in-one` read installer.toml (a missing file is a failure that names it, exit 1),
-/// the other modes stay behind the root check (exit 2, config not read).
-#[test]
-fn setup_does_the_database_step_for_two_modes_without_root() {
-    let (_, root) = seeded("setup-database");
-    for mode in ["frontend", "all-in-one"] {
-        let (exit, err) = on(&root, &["setup", "--mode", mode]);
-        assert_eq!(exit, Exit::Failed, "{mode}: {err}");
-        assert!(err.contains("installer.toml"), "{mode}: {err}");
-    }
-    for mode in ["storage", "daemon", "storage-and-daemon"] {
-        let (exit, err) = on(&root, &["setup", "--mode", mode]);
-        assert_eq!(exit, Exit::Usage, "{mode}: {err}");
-        assert!(err.contains("setup needs root"), "{mode}: {err}");
-    }
-}
-
 /// Catches `run --installer-config` not attaching the schema step to the helper it drives
 /// (the helper tests attach a fake directly, and the Postgres tests never go through `run`):
 /// the helper `run` builds from a config naming a database refuses a release's schema with
@@ -650,165 +679,18 @@ fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
     assert!(with(&[]).schema_step_mut().is_none(), "no flag, no step");
 }
 
-/// Catches the database step's three dry-run lines and its apply line going wrong: a fresh
-/// database would be created, an older one migrated, a current one left alone, and an apply
-/// says what the schema runner did (the lines need no server, so they are tested here).
+/// Catches `run --installer-config` reading the config under a host root that is not an
+/// absolute path (the root is the sandbox flag's; a relative one is refused with its reason
+/// rather than reading from the working directory).
 ///
-/// Mutants to plant: the `v < newest` guard flipped (a behind schema says nothing to do).
+/// Mutants to plant: the `Root::new` error in `under` swallowed.
 #[test]
-fn the_database_step_lines_say_create_migrate_or_nothing() {
-    assert_eq!(
-        dry_run_line("frontend", None, 3),
-        "kbf-installer setup (frontend): database step: dry run: would create the schema at version 3"
-    );
-    assert_eq!(
-        dry_run_line("frontend", Some(1), 3),
-        "kbf-installer setup (frontend): database step: dry run: would migrate the schema from 1 to 3"
-    );
-    assert_eq!(
-        dry_run_line("all-in-one", Some(3), 3),
-        "kbf-installer setup (all-in-one): database step: dry run: the schema is at 3, nothing to do"
-    );
-    let outcome = Outcome {
-        from: None,
-        to: 2,
-        ran: vec![1, 2],
+fn run_with_an_installer_config_refuses_a_relative_host_root() {
+    let mut argv = RUN.to_vec();
+    argv.extend_from_slice(&["--installer-config", "/etc/kbf/installer.toml"]);
+    let Verb::Run(args) = parse(&argv).verb else {
+        panic!("a run");
     };
-    assert_eq!(
-        apply_line("frontend", &outcome),
-        "kbf-installer setup (frontend): database step: created the schema at version 2"
-    );
-}
-
-/// Catches a successful verb that returned a line printing nothing or not exiting 0, and one
-/// without a line printing something (the only verb with a line, the database step, needs a
-/// server, so the reporting is tested on its own).
-#[test]
-fn a_successful_verb_prints_its_line_only_when_it_has_one() {
-    let cli = parse(&["setup", "--mode=frontend"]);
-    let mut out = Vec::new();
-    assert_eq!(report(None, &cli, "setup", &mut out), Exit::Ok);
-    assert!(out.is_empty());
-    assert_eq!(
-        report(Some("the line".into()), &cli, "setup", &mut out),
-        Exit::Ok
-    );
-    assert_eq!(String::from_utf8(out).expect("text"), "the line\n");
-}
-
-/// Catches the database step's failures being swallowed: with the socket directory missing
-/// (no server needed), a dry run and an apply as an ordinary user each fail with exit 1 and
-/// the database's own reason, for the mode's name in the line.
-#[test]
-fn the_database_step_fails_with_the_reason_when_the_server_cannot_be_reached() {
-    let (_, root) = seeded("setup-database-down");
-    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
-    fs::write(
-        root.join("etc/kbf/installer.toml"),
-        "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n",
-    )
-    .expect("config");
-    for extra in [&[][..], &["--apply"][..]] {
-        let mut argv = vec!["setup", "--mode", "frontend"];
-        argv.extend_from_slice(extra);
-        let (exit, err) = on(&root, &argv);
-        assert_eq!(exit, Exit::Failed, "{extra:?}: {err}");
-        assert!(err.starts_with("kbf-installer: "), "{extra:?}: {err}");
-        assert!(!err.contains("installer.toml"), "{extra:?}: {err}");
-    }
-}
-
-/// Catches the database step reading `installer.toml` under a host root that is not an
-/// absolute path (the root is the sandbox flag's, and a relative one is refused with its
-/// reason rather than reading from the working directory).
-#[test]
-fn the_database_step_refuses_a_relative_host_root() {
-    let (exit, err) = on(Path::new("relative-root"), &["setup", "--mode", "frontend"]);
-    assert_eq!(exit, Exit::Failed, "{err}");
-    assert!(err.starts_with("kbf-installer: "), "{err}");
-}
-
-/// A schema runner that answers as told, standing in for a server.
-struct FakeSchema {
-    setup: Result<Outcome, String>,
-    plan: Result<(Option<u32>, u32), String>,
-}
-
-impl SchemaOps for FakeSchema {
-    fn setup(&self) -> Result<Outcome, String> {
-        self.setup.clone()
-    }
-
-    fn plan(&self) -> Result<(Option<u32>, u32), String> {
-        self.plan.clone()
-    }
-}
-
-/// Catches the database step printing the wrong line once the schema runner answers, or
-/// swallowing its error: `--apply` prints the outcome, a dry run prints create, migrate or
-/// nothing to do, and a runner's error is the failure. The fake answers an error to
-/// the question the step must not ask, so asking it fails the test.
-///
-/// Mutants to plant: `apply` flipped; the error mapped to an empty line.
-#[test]
-fn the_database_step_prints_what_the_schema_runner_answered() {
-    let outcome = Outcome {
-        from: None,
-        to: 2,
-        ran: vec![1, 2],
-    };
-    let fake = |plan| FakeSchema {
-        setup: Ok(outcome.clone()),
-        plan,
-    };
-    assert_eq!(
-        database_step(&fake(Err("unused".into())), "frontend", true)
-            .unwrap_or_else(|f| panic!("applied: {}", f.why)),
-        "kbf-installer setup (frontend): database step: created the schema at version 2"
-    );
-    for (found, tail) in [
-        (None, "would create the schema at version 3"),
-        (Some(1), "would migrate the schema from 1 to 3"),
-        (Some(3), "the schema is at 3, nothing to do"),
-    ] {
-        assert_eq!(
-            database_step(&fake(Ok((found, 3))), "all-in-one", false)
-                .unwrap_or_else(|f| panic!("planned: {}", f.why)),
-            format!("kbf-installer setup (all-in-one): database step: dry run: {tail}")
-        );
-    }
-    let broken = FakeSchema {
-        setup: Err("no server".into()),
-        plan: Err("cannot ask".into()),
-    };
-    let apply = database_step(&broken, "frontend", true).expect_err("setup failed");
-    assert_eq!(apply.why, "no server");
-    assert!(matches!(apply.exit, Exit::Failed));
-    let plan = database_step(&broken, "frontend", false).expect_err("plan failed");
-    assert_eq!(plan.why, "cannot ask");
-}
-
-/// Catches the real `Database` not being what `setup`'s database step asks (the fake tests
-/// drive `database_step` alone): with an installer.toml naming a socket directory that does
-/// not exist, both `setup --mode frontend` and `setup --mode frontend --apply` reach the
-/// database and fail with its own error (exit 1), as the ordinary user the step needs no
-/// server to be tested for. No server is started.
-///
-/// Mutants to plant: `Database::plan` or `Database::setup` swapped in `impl SchemaOps`.
-#[test]
-fn setup_asks_the_real_database_and_reports_its_error() {
-    let (_, root) = seeded("setup-real-database");
-    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
-    fs::write(
-        root.join("etc/kbf/installer.toml"),
-        "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n",
-    )
-    .expect("config");
-    for extra in [&[][..], &["--apply"][..]] {
-        let mut argv = vec!["setup", "--mode", "frontend"];
-        argv.extend_from_slice(extra);
-        let (exit, err) = on(&root, &argv);
-        assert_eq!(exit, Exit::Failed, "{extra:?}: {err}");
-        assert!(!err.contains("installer.toml"), "{extra:?}: {err}");
-    }
+    let refused = build_helper(PathBuf::from("relative-root"), &args).err();
+    assert!(refused.is_some_and(|f| !f.why.is_empty()));
 }
