@@ -86,14 +86,22 @@ type Identify = fn(u32, &Path) -> Result<(OwnedFd, ProcIdent), String>;
 /// other, instead of being a failure to start.
 fn identify_started(pid: u32, program: &Path) -> Result<(OwnedFd, ProcIdent), String> {
     let pidfd = pidfd_of(pid).map_err(|e| e.to_string())?;
-    let ident = match ident_of(pid) {
-        Ok(ident) => ident,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            zombie_ident(pid, program).ok_or_else(|| e.to_string())?
-        }
-        Err(e) => return Err(e.to_string()),
-    };
+    let ident = decide(ident_of(pid), || zombie_ident(pid, program))?;
     Ok((pidfd, ident))
+}
+
+/// The identity to record from what reading it returned: a read that found the process gone
+/// (`NotFound`) falls back to `zombie` (an exited, unreaped child); any other error is final
+/// and `zombie` is not asked.
+fn decide(
+    read: std::io::Result<ProcIdent>,
+    zombie: impl FnOnce() -> Option<ProcIdent>,
+) -> Result<ProcIdent, String> {
+    match read {
+        Ok(ident) => Ok(ident),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => zombie().ok_or_else(|| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// The identity of the zombie `pid` (state `Z` in its `stat`), whose program is `program`.

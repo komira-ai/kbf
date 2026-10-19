@@ -630,3 +630,54 @@ fn a_child_that_exits_before_it_is_identified_still_spawns_and_reports_its_statu
     assert_eq!(port.exited(&ident), Some(3));
     assert_eq!(port.recorded(Slot::A), None, "the exit clears the record");
 }
+
+fn ident_for_decide(pid: u32) -> ProcIdent {
+    ProcIdent {
+        pid,
+        start_time: 7,
+        exe: PathBuf::from("/x"),
+    }
+}
+
+/// A live process is not a zombie, so it is never given a zombie's identity.
+#[test]
+fn a_live_process_has_no_zombie_identity() {
+    assert_eq!(
+        zombie_ident(std::process::id(), Path::new("/proc/self/exe")),
+        None
+    );
+}
+
+/// Each arm of the identity decision: found passes through; gone falls back to the zombie
+/// identity, or fails with the read's own text when there is none; any other error fails
+/// without asking for a zombie.
+#[test]
+fn the_identity_decision_covers_found_gone_and_other_errors() {
+    use std::io::{Error, ErrorKind};
+    let asked = std::cell::Cell::new(false);
+    let ask = || {
+        asked.set(true);
+        Some(ident_for_decide(9))
+    };
+    assert_eq!(
+        decide(Ok(ident_for_decide(1)), ask),
+        Ok(ident_for_decide(1))
+    );
+    assert!(!asked.get(), "a found process is not asked about");
+
+    let gone = || Error::new(ErrorKind::NotFound, "gone");
+    assert_eq!(decide(Err(gone()), ask), Ok(ident_for_decide(9)));
+    assert!(asked.get());
+
+    assert_eq!(
+        decide(Err(gone()), || None),
+        Err(gone().to_string()),
+        "gone and not a zombie keeps the original error"
+    );
+
+    asked.set(false);
+    let denied = Error::new(ErrorKind::PermissionDenied, "denied");
+    let text = denied.to_string();
+    assert_eq!(decide(Err(denied), ask), Err(text));
+    assert!(!asked.get(), "another error never asks for a zombie");
+}
