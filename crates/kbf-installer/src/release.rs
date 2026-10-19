@@ -95,6 +95,10 @@ pub enum ReleaseError {
         pending: String,
         got: String,
     },
+    #[error(
+        "release {0} is current already: the first release is the only one setup installs, use update"
+    )]
+    NotFirst(CommitId),
     #[error("no swap is pending, and {0} is not the current release")]
     NotPending(CommitId),
     #[error("a confirm window of {0} s is outside the {min} to {max} s the host allows", min = crate::activate::WINDOW_MIN_SECS, max = crate::activate::WINDOW_MAX_SECS)]

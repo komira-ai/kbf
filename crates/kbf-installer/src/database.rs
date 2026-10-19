@@ -153,6 +153,59 @@ impl SchemaStep for Database {
     }
 }
 
+/// What the database step needs of the schema: `Database` is the one real implementation; a
+/// test's fake stands in for a server, so the lines `setup` prints after the schema runner
+/// answers are tested without one. The errors are their text: that is all `setup` prints.
+pub trait SchemaOps {
+    /// Creates or brings forward the schema.
+    fn setup(&self) -> Result<Outcome, String>;
+
+    /// The schema's version (`None` before the first setup) and this build's newest.
+    fn plan(&self) -> Result<(Option<u32>, u32), String>;
+}
+
+impl SchemaOps for Database {
+    fn setup(&self) -> Result<Outcome, String> {
+        Database::setup(self).map_err(|e| e.to_string())
+    }
+
+    fn plan(&self) -> Result<(Option<u32>, u32), String> {
+        Database::plan(self).map_err(|e| e.to_string())
+    }
+}
+
+/// The line the database step prints for `mode`: `--apply` runs the schema, a dry run asks.
+pub fn database_step(database: &dyn SchemaOps, mode: &str, apply: bool) -> Result<String, String> {
+    if apply {
+        let outcome = database.setup()?;
+        return Ok(apply_line(mode, &outcome));
+    }
+    let (found, newest) = database.plan()?;
+    Ok(dry_run_line(mode, found, newest))
+}
+
+/// The line `setup --apply` prints for what the database step did.
+pub(crate) fn apply_line(mode: &str, outcome: &Outcome) -> String {
+    format!("kbf-installer setup ({mode}): database step: {outcome}")
+}
+
+/// The line a `setup` dry run prints: the schema's version (`None` before the first setup)
+/// against this build's newest.
+pub(crate) fn dry_run_line(mode: &str, found: Option<u32>, newest: u32) -> String {
+    match found {
+        None => format!(
+            "kbf-installer setup ({mode}): database step: dry run: would create the schema at version {newest}"
+        ),
+        Some(v) if v < newest => format!(
+            "kbf-installer setup ({mode}): database step: dry run: would migrate the schema from {v} to {newest}"
+        ),
+        Some(v) => format!(
+            "kbf-installer setup ({mode}): database step: dry run: the schema is at {v}, \
+             nothing to do"
+        ),
+    }
+}
+
 #[cfg(test)]
 #[path = "database_tests.rs"]
 mod tests;
