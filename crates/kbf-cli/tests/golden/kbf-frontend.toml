@@ -102,6 +102,10 @@ member-dwell-secs = 300
 # How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
 member-ttl-secs = 15
 
+[stores]
+# Turns on the object-store registration routes of the operator API (/v1/object-stores, docs/api.md) and names the directory where the secret key of each registered connection is kept, one file of mode 0600 each, in a directory made 0700. The directory must be readable by every frontend child that serves at once and left out of any backup of the host. The registration itself (endpoints, buckets, the audit log) is kept in the state store. Without it those routes answer 404.
+# object-store-secrets-dir = "DIR"
+
 [tls]
 # A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the daemon's, whose builds could read it. Without it, writes are refused
 # api-token-file = "API_TOKEN_FILE"

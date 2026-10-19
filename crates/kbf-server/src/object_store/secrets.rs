@@ -114,6 +114,7 @@ impl SecretFiles {
     }
 
     /// The point where the write order passes `step`.
+    #[cfg_attr(not(test), allow(unused_variables))]
     pub(super) fn reach(&self, step: Step) {
         #[cfg(test)]
         {
@@ -126,8 +127,6 @@ impl SecretFiles {
                 hook(step);
             }
         }
-        #[cfg(not(test))]
-        let _ = step;
     }
 
     /// The path of the file of `name` at `version`.
