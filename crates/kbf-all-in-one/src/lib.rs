@@ -1,14 +1,15 @@
-//! `kbf-all-in-one`: the farm server and a worker daemon in one process, for a one-node
+//! `kbf-all-in-one`: the library behind `kbf all-in-one` (the `kbf` binary, crates/kbf-cli),
+//! the farm server and a worker daemon in one process, for a one-node
 //! Linux farm (the README says what it does today and what it does not do yet; the
-//! design is komira-build-farm#657). The daemon's blobs move through calls into
+//! design is kbf#657). The daemon's blobs move through calls into
 //! the server's cache ([`LocalDataPlane`]), not over the network; its control plane
 //! (`Hello`, leases, heartbeats, results) is the remote daemon's, over mutual TLS to the
 //! server half's worker listener on loopback.
 //!
-//! [`main`] is the binary: the daemon's helper re-execs first, before any flag is read
-//! (`kbf_node::dispatch_helpers`: a keeper or `__chown-dirs` run of this binary never
-//! opens the server's directories or starts a runtime); then one command line holding
-//! both halves' flags ([`cli`]); then the server half, started as `kbf-server` starts
+//! [`run`] is the mode, after `kbf` has dispatched the daemon's helper re-execs, before
+//! any flag is read (`kbf_node::dispatch_helpers`: a keeper or `__chown-dirs` run of the
+//! binary never opens the server's directories or starts a runtime), and parsed one
+//! command line holding both halves' flags ([`cli`]); it starts the server half, started as `kbf-server` starts
 //! (`kbf_server::start`, on an async runtime of its own, sized as `kbf-server` sizes
 //! one), its start line printed to stdout; then the daemon half, as `kbf-daemon` starts
 //! (`kbf_node::start_with`, on its own runtime), with the in-process plane in place of
@@ -20,13 +21,13 @@
 //! `EX_TEMPFAIL` (`kbf_server::StartFailure`); one the daemon half refuses exits as
 //! `kbf-daemon` would.
 //!
-//! Linux only, the container driver only: elsewhere [`main`] exits 2 saying so.
+//! Linux only, the container driver only: elsewhere [`run`] exits 2 saying so.
 //!
 //! The crate also holds `kbf storage-and-daemon` ([`storage_and_daemon`]): the same
 //! daemon half and the same plane, beside the storage node in place of the server.
 //!
-//! The scheduler's state is a SQLite file, `<data-dir>/state.db` unless `--state-store`
-//! names one ([`cli`]).
+//! The scheduler's state is in Postgres, on the local socket `postgres:///kbf?host=/run/postgresql`
+//! unless `--state-store` names another store ([`cli`]).
 //!
 //! Not done yet (the README lists it): the in-process plane's admission; the `--reserve-cpus` split
 //! between the halves; the whole-process
@@ -46,18 +47,8 @@ pub use plane::LocalDataPlane;
 
 use std::process::ExitCode;
 
-/// The `kbf-all-in-one` binary, as the module docs say.
-#[cfg(target_os = "linux")]
-#[must_use]
-pub fn main() -> ExitCode {
-    if let Some(code) = kbf_node::dispatch_helpers() {
-        return code;
-    }
-    run::main()
-}
-
-/// The `kbf all-in-one` mode: [`main`] after the command line is parsed (the
-/// daemon's helper re-execs having been dispatched by the caller, first thing).
+/// The `kbf all-in-one` mode, on the command line `kbf` parsed (the daemon's helper
+/// re-execs having been dispatched by the caller, first thing).
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn run(flags: &cli::Flags) -> ExitCode {
@@ -68,16 +59,9 @@ pub fn run(flags: &cli::Flags) -> ExitCode {
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn run(_flags: &cli::Flags) -> ExitCode {
-    main()
-}
-
-/// The `kbf-all-in-one` binary off Linux: it refuses to run.
-#[cfg(not(target_os = "linux"))]
-#[must_use]
-pub fn main() -> ExitCode {
     eprintln!(
-        "kbf-all-in-one runs on Linux only, with the container driver; elsewhere run \
-         kbf-server and kbf-daemon"
+        "kbf all-in-one runs on Linux only, with the container driver; elsewhere run \
+         kbf daemon and a frontend"
     );
     ExitCode::from(2)
 }

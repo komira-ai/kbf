@@ -70,54 +70,55 @@ fn other_drivers_and_cas_are_refused() {
     }
 }
 
-/// Catches an all-in-one that keeps no state file when `--state-store` is left out (the
-/// scheduler would run in memory and a restart lose its queue), one that puts it
-/// anywhere but the daemon's data directory (default `/var/lib/kbf`), and one that
-/// replaces a file the operator named.
+/// Catches an all-in-one that keeps no durable state when `--state-store` is left out
+/// (the scheduler would run in memory and a restart lose its queue), one whose default is
+/// still a SQLite file in the data directory, one that puts the default anywhere but the
+/// local Postgres socket whatever `--data-dir` says, and one that replaces a store the
+/// operator named.
 #[test]
-fn the_state_file_defaults_to_the_data_directory() {
+fn the_state_store_defaults_to_the_local_postgres_socket() {
     let store = |extra: &[&str]| {
         let given = [&["--driver=container"], extra].concat();
         flags(&given).expect("flags").server.state_store
     };
-    let sqlite = |path: &str| Some(kbf_server::StateStoreUri::Sqlite(path.into()));
-    assert_eq!(store(&[]), sqlite("/var/lib/kbf/state.db"));
-    assert_eq!(store(&["--data-dir=/srv/kbf"]), sqlite("/srv/kbf/state.db"));
+    let local = Some(kbf_server::StateStoreUri::local_postgres());
+    assert_eq!(store(&[]), local);
+    assert_eq!(store(&["--data-dir=/srv/kbf"]), local);
     assert_eq!(
         store(&[
             "--data-dir=/srv/kbf",
             "--state-store=sqlite:///elsewhere/s.db"
         ]),
-        sqlite("/elsewhere/s.db")
+        Some(kbf_server::StateStoreUri::Sqlite("/elsewhere/s.db".into()))
+    );
+    assert_eq!(
+        store(&["--state-store=postgres:///other?host=/run/postgresql"]),
+        Some(
+            "postgres:///other?host=/run/postgresql"
+                .parse()
+                .expect("parses")
+        )
     );
 }
 
-/// Catches an all-in-one that takes Postgres (not wired yet: any value but a SQLite path
-/// is refused with a fixed message), and a relative data directory, which the daemon half
-/// refuses after the server half has already made its state file in the working
-/// directory.
+/// Catches an all-in-one that takes a Postgres URL with a password (the command line is
+/// world-readable) or one it cannot use, and a value of another kind.
 #[test]
-fn postgres_and_a_relative_data_directory_are_refused() {
-    let refused = flags(&[
-        "--driver=container",
-        "--state-store=postgres://db.example/kbf",
-    ])
-    .expect_err("refused");
-    let said = refused.to_string();
-    assert!(said.contains("only sqlite:///<absolute path>"), "{said}");
-    let relative = flags(&["--driver=container", "--data-dir=kbf-data"]).expect_err("relative");
-    assert_eq!(relative.kind(), ErrorKind::ArgumentConflict);
-    assert!(
-        relative.to_string().contains("must be absolute"),
-        "{relative}"
-    );
-    // A named state file needs no data directory to hold it.
-    flags(&[
-        "--driver=container",
-        "--data-dir=kbf-data",
-        "--state-store=sqlite:///s.db",
-    ])
-    .expect("named file");
+fn a_password_an_unusable_url_and_another_kind_of_value_are_refused() {
+    for (value, says) in [
+        (
+            "postgres://kbf:hunter2@db.example/kbf",
+            "must carry no password",
+        ),
+        ("postgres://", "needs a URL with a host"),
+        ("file:///x", "only postgres:///"),
+    ] {
+        let arg = format!("--state-store={value}");
+        let refused = flags(&["--driver=container", &arg]).expect_err(value);
+        let said = refused.to_string();
+        assert!(said.contains(says), "{value}: {said}");
+        assert!(!said.contains("hunter2"), "{value}: {said}");
+    }
 }
 
 /// Catches a refused `--state-store` that quotes its value back: clap echoes the value of

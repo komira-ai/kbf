@@ -102,6 +102,21 @@ fn the_job_renders_as_the_golden_property_list() {
     assert_eq!(kbf_mac_provision::launchd::plist_path(&p), PLIST);
 }
 
+/// Catches: a rendering defect in the node's `kbf.toml`: a key in the wrong table, a
+/// missing `mode` or `driver`, a label dropped or reordered, a value of another profile
+/// key. The golden is written by hand (`support/golden.rs`), not by the renderer.
+#[test]
+fn the_node_config_renders_as_the_golden_file() {
+    let mac = FakeMac::fresh("golden-config");
+    let text = mac.profile_text();
+    let p = kbf_mac_provision::profile::Profile::parse(text.as_bytes()).unwrap();
+    assert_eq!(
+        kbf_mac_provision::launchd::render_config(&p),
+        support::golden_config(p.short_sha())
+    );
+    assert_eq!(kbf_mac_provision::launchd::NODE_CONFIG, support::CONFIG);
+}
+
 /// Catches: entries that are not drift reported as drift: an images list beside the
 /// runtime images, a link to a pinned Xcode (the script's mutant "a link to an Xcode
 /// counts as unpinned"), a commented keyword before the Include line, a drop-in that

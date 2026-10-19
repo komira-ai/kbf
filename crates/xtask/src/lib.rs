@@ -17,6 +17,11 @@
 //! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
 //!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
 //!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
+//! - `installer-tarball --binary <path> --platform <platform> --commit <sha> --units
+//!   <dir> --trust <dir> --sysusers <file> --tmpfiles <file> --out <dir>`
+//!   ([`installer_tarball`]): the files the Debian package ships, at the same paths and
+//!   modes (one list, [`pkg_linux::files`]), in a tarball that is the same bytes on every
+//!   runner, for `packaging/install.sh`.
 //! - `pkg-config`, `pkg-build`, `pkg-install-test` ([`pkg_linux`], [`pkg_install`]): the
 //!   `kbf-installer` deb and rpm: the nfpm configuration from the inputs, the packages
 //!   built twice to prove the bytes, and an install, remove and purge in a container.
@@ -59,6 +64,7 @@ pub mod crun_tests;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
+pub mod installer_tarball;
 pub mod package;
 pub mod pkg;
 pub mod pkg_install;
@@ -157,6 +163,34 @@ enum Verb {
         #[arg(long)]
         commit: String,
         /// The directory the assets go in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Write the payload `packaging/install.sh` places (installer, unit files, trust
+    /// files) as a tarball in `--out`.
+    InstallerTarball {
+        /// The `kbf-installer` binary.
+        #[arg(long)]
+        binary: PathBuf,
+        /// The platform it was built for (Linux only).
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (on Actions, `GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The directory of `kbf-*.service` files (and `kbf.slice`).
+        #[arg(long)]
+        units: PathBuf,
+        /// The directory of the three trust files.
+        #[arg(long)]
+        trust: PathBuf,
+        /// The sysusers.d file.
+        #[arg(long)]
+        sysusers: PathBuf,
+        /// The tmpfiles.d file.
+        #[arg(long)]
+        tmpfiles: PathBuf,
+        /// The directory the tarball goes in; created when missing.
         #[arg(long)]
         out: PathBuf,
     },
@@ -552,6 +586,27 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => package::package(&binary, &sbom, platform, &commit, &out),
+        Verb::InstallerTarball {
+            binary,
+            platform,
+            commit,
+            units,
+            trust,
+            sysusers,
+            tmpfiles,
+            out,
+        } => installer_tarball::installer_tarball(
+            platform,
+            &commit,
+            &pkg_linux::Sources {
+                binary: &binary,
+                units: &units,
+                trust: &trust,
+                sysusers: &sysusers,
+                tmpfiles: &tmpfiles,
+            },
+            &out,
+        ),
         Verb::PkgConfig {
             binary,
             units,

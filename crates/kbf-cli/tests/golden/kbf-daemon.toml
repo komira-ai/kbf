@@ -1,0 +1,156 @@
+# kbf daemon: every setting, one table per group; a key is a flag's long name.
+# Generated from the flag definitions (tests/golden). A flag on the command line
+# overrides its key. A secret is the path of the file that holds it.
+
+[containers]
+# Written to the actions cgroup's `memory.max` at start (container): the most memory all leases together may use, in GiB, so the rest stays for what else runs on the node. The node reports the lowest `memory.max` above its leases, or its memory when that is less, and the CPUs of their cpuset
+# actions-memory-max-gib = "ACTIONS_MEMORY_MAX_GIB"
+# The cgroup lease cgroups are made under, from the cgroup root (container). Left out, the daemon sets up its own cgroup, which its systemd unit must delegate (`Delegate=yes`): it moves itself into a `supervisor` leaf there and makes `actions` beside it, with cpu, memory and pids enabled. Given, it must already enable cpu, memory and pids for its children
+# cgroup-parent = "CGROUP_PARENT"
+# Where cgroup v2 is mounted (container). For tests of the cgroup setup only
+# (not in --help)
+cgroup-root = "/sys/fs/cgroup"
+# Each container's open-file limit, soft and hard (container). Rootless, it cannot exceed the daemon's own hard limit
+container-nofile = 65536
+# The process limit, soft and hard, of each container's user (container). Every container's root is the same host id, so it bounds all the node's actions together
+container-nproc = 32768
+# Each container's `pids.max`: its tasks, threads included (container)
+container-pids-limit = 8192
+# The size of each container's `/dev/shm`, in MiB (container)
+container-shm-mib = 64
+# A directory holding `passwd`, `subuid` and `subgid` that the container driver's startup check reads instead of `/etc`'s. For tests of that check only
+# (not in --help)
+# id-files = "ID_FILES"
+# Where each lease runs among the node's CPUs (container, Linux): `none`, the default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus` is a quota on all leases together, so it still applies; it removes no CPU from a node. Needs the `cpuset` controller delegated to the daemon (the start fails and says how when it is not); a host with fewer than two NUMA nodes that hold CPUs runs as `none`, which the start logs. Refused with a driver other than `container` (macOS has no such driver)
+lease-placement = "none"
+# A lease at its own memory cap is killed, and reported out of memory, once it has pushed more than this many MiB into swap at its cap... (container)
+lease-swap-kill-mib = 512
+# ...or this percentage of its booked memory, whichever is more. The kernel caps each lease's RAM at its booking x 1.5 + 512 MiB and lets it swap without limit; a lease is killed by this rule only while its own cap keeps being hit (its `memory.events` `max` grew since the last sample) and its swap rose since the last sample, and only swap that rose so counts, never swap that host pressure moved out of it
+lease-swap-kill-percent = 25
+# How often each lease's `max` events and swap are sampled, in milliseconds (container)
+lease-swap-poll-ms = 1000
+# Where the kernel lists NUMA nodes (container). For tests of the placement only
+# (not in --help)
+numa-dir = "/sys/devices/system/node"
+# The OCI runtime that runs each action's container (container): `crun`, run directly. Each action gets a fresh rootless sandbox. It needs the daemon user's subordinate ids in one range, `newuidmap` and `newgidmap` (package `uidmap`) on `PATH`, and every directory down to `--data-dir` searchable by others
+oci-runtime = "/usr/bin/crun"
+# Where the kernel reports memory pressure stall information. For tests only
+# (not in --help)
+psi-memory-file = "/proc/pressure/memory"
+# The file naming the daemon's own cgroup (container). For tests of the cgroup setup only
+# (not in --help)
+self-cgroup = "/proc/self/cgroup"
+# Written to the daemon's `supervisor` leaf's `memory.min` at start, in MiB (container, without `--cgroup-parent`): memory the kernel does not reclaim from the daemon while it uses no more, so builds short of memory never take it. The kernel protects no more than the unit's and its slice's `MemoryMin=` allow; the daemon warns when one is lower. 0 protects nothing
+supervisor-memory-min-mib = 256
+
+[daemon]
+# Worker threads of the async runtime, which run every task between its waits. Default: every CPU the process may use on the server; `max(2, reserve/4)`, at most the physical cores, on the daemon
+# async-threads = "N"
+# The most threads the runtime's blocking pool runs at once, for calls that wait on a disk or a process (a thread is made when a call needs one and ends when idle). Default: 512 (tokio's) for the server, 64 for the daemon
+# blocking-threads = "N"
+# Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use on the server; `max(2, reserve/2)`, at most the physical cores, on the daemon
+# cpu-threads = "N"
+# This daemon's own user, which keeps read and remove access to what a whole-machine lease's user writes in its lease directory (native-whole-machine)
+daemon-user = "_kbf"
+# The directory the daemon keeps everything in, on a local disk: `leases/` (lease directories, the container and native drivers), and under the container driver (and the native driver on macOS) `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if missing; absolute. The cache and trees are on, sized from the filesystem: half and a quarter of its size less what it keeps free (5%, at least 1 GiB), and the cache evicts entries no running lease links to keep that much free. A directory another daemon owns, or that cannot be used, is left alone: the daemon warns and runs uncached
+# data-dir = "DIR"
+# Lowers the size the cache and the trees are budgeted from (half and a quarter of it), under the filesystem's automatic one
+# data-max-bytes = "BYTES"
+# How leases run; once per runtime. The daemon runs each lease on the driver that serves its kind and refuses to start when two serve the same kind. The node's own driver (native or container) is set up first, whatever the order given
+# driver = []
+# A container image this node is pinned to, as an action names it: `docker://<repo>@sha256:<digest>`, one architecture's manifest digest (container; repeatable). At start the daemon makes sure each is in the node's image store, as the prepare step of every lease does: it fetches the image from its registry by that digest, checks every byte against a digest, and unpacks it once. It exits with status 2 if one cannot be fetched, fails a check, or names an image index. The node's status lists them (`GET /v1/nodes`, `software.container_images`). No work is placed by image yet: an action may still name another image
+# image = []
+# The order spool (owned by the service user, mode 0700): where the daemon writes the order records the root installer reads. With `--update-dir` only; default `<update-dir>/orders`
+# orders-dir = "DIR"
+# The longest wait between rounds of connection attempts, in milliseconds. Each wait is jittered down by up to half
+reconnect-max-ms = 30000
+# The wait, in milliseconds, after a session ends and after the first round of connection attempts that all failed. It doubles with each further failed round
+reconnect-ms = 1000
+# Logical CPUs the farm's own processes keep, in CPUs (hyperthreads count one each). The daemon gives its leases every CPU it may use but these, with no pinning, and sizes its own pools from them. Default: 8 (half the CPUs on a machine of fewer than 16). 0 is allowed; a value that leaves no CPU for leases, or is more than the machine has, is refused. On a host that also runs the server, this covers both; the server has no reserve flag
+# reserve-cpus = "N"
+# How many of the farm's processes on this host share the reserve: the daemon sizes its pools from `reserve / share` CPUs. Default 1
+# reserve-share = "N"
+# The root installer's directory: the daemon reads its `status.json` there. The frontend's orders are written to `orders/` beneath it unless `--orders-dir` says otherwise. Left out, the node updates by hand: it says so and touches no directory. Not taken by the all-in-one binary yet
+# update-dir = "DIR"
+
+[identity]
+# PEM file of the CA certificates that sign server certificates
+# ca-cert = "CA_CERT"
+# The server's worker listener, an `https://` URL (normally `--server`'s), that the container and native drivers read and write blobs through, over mutual TLS with this daemon's `--ca-cert`, `--cert`, `--key` and `--tls-server-name`. Plain `http://` is refused: the worker listener admits each blob call by the daemon's certificate. Every driver's blobs go through one transfer engine, over one connection, within the `--transfer-*` limits
+# cas = "CAS"
+# PEM file of this daemon's client certificate chain
+# cert = "CERT"
+# PEM file of this daemon's private key
+# key = "KEY"
+# A node label, `key=value`, reported as `label.<key>`; repeatable. A Mac in komira's pool runs with `--label pool=darwin-sized`
+# label = []
+# A stable name for this node, unique within the cell
+# node-id = "NODE_ID"
+# A kbf-server worker listener to connect to, as an `https://host:port` URL; repeatable, or several separated by commas. The host may be a DNS name with a record per server: every round of attempts resolves it again and tries each address. The daemon never stops trying (see `--reconnect-max-ms`)
+# server = []
+# The name to verify in the server certificate, when it is not the URL's host
+# tls-server-name = "TLS_SERVER_NAME"
+
+[macos]
+# The socket `kbf-mac-session` serves (native-whole-machine)
+mac-session-socket = "/var/run/kbf-mac-session/socket"
+# The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid` in kbf-mac-provision's profile); at least 600
+# pool-first-uid = "POOL_FIRST_UID"
+# How many lease users the pool has (native, macOS, a daemon run as root): every action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon, which runs no action as root; refused for any other
+# pool-users = "POOL_USERS"
+# This node's actions use Metal (native): an Xcode whose Metal toolchain is not installed (`xcodebuild -showComponent MetalToolchain`) is not ready
+require-metal-toolchain = false
+# The directory searched for `Xcode*.app` (native). Each Xcode whose own `xcodebuild` answers `-version`, `-license check` and `-checkFirstLaunchStatus`, and for which `xcrun --find clang` does (each within a minute, under the actions' sandbox), is ready: it is reported as an `xcode` entry, and an action that names its build runs with it as `DEVELOPER_DIR`. One that is not is listed in the node's status with why and the command that fixes it, and logged at WARN. The daemon says Hello without waiting for its first survey, which runs in the background: until it ends, each Xcode is listed as not surveyed yet and none is reported
+xcode-apps = "/Applications"
+# How often, in seconds, the Xcodes are asked again (native), so one fixed while the daemon runs becomes ready without a restart
+xcode-recheck-secs = 180
+
+[memory]
+# ...plus this many MiB (native). A lease that booked nothing has no limit
+memory-headroom-mib = 512
+# A lease's processes are killed past this percentage of its booked memory...
+memory-limit-percent = 150
+# How often a lease's memory is measured, in milliseconds (native)
+memory-poll-ms = 250
+# The daemon takes no new lease while the node's memory stall time (the `some` line's `avg10` in `/proc/pressure/memory`, as a percentage) is above this and it runs a lease: it says so to the server, which places nothing on it until the stall falls, and the leases it runs go on. With no lease it serves whatever the stall, so it is never left idle for good. Off where the kernel reports no pressure stall information (macOS, a kernel built without it)
+memory-pressure-pause-percent = 10
+
+[outputs]
+# The most bytes one action's output files may hold together
+output-max-bytes = 17179869184
+# The deepest directory an output directory may hold, in levels below it (its own entries are level 1)
+output-max-depth = 512
+# The most entries (files, directories, symlinks and anything else) one action's outputs may hold together, the declared outputs included
+output-max-entries = 1000000
+# The most bytes each of the action's stdout and stderr may hold
+output-max-stdio-bytes = 1073741824
+# How long one lease's whole output upload (its output files, stdout and stderr) may take, in seconds, before the lease fails with a reason naming the upload and the time it ran (container and native drivers). Without it, a store that stops answering holds the lease, and its slot, with no error
+output-upload-deadline-secs = 1800
+# How many `PutRange` calls one segment upload of an action's outputs has in flight at once, as HTTP/2 streams on the one connection to `--cas` (`docs/design/write-path.md`, section 4.1); also the parallel `ReadRange` calls of a segment-range read
+segment-upload-streams = 16
+# How many segment uploads of one action's outputs are in flight at once: the server checks and stages one upload while the next are sending (`docs/design/write-path.md`, section 4.1). Their `PutRange` calls still take permits of `--transfer-in-flight`'s uploads' share
+segment-uploads-in-flight = 4
+
+[storage-client]
+# The longest, in milliseconds, that dialling a storage node may take: for its TCP connection and for its TLS handshake each. Must be 1 to 3600000 (one hour)
+storage-dial-timeout-ms = 10000
+# How often, in milliseconds, a connection to a storage node with a call on it is pinged (HTTP/2 PING). Must be 1 to 3600000 (one hour)
+storage-ping-interval-ms = 10000
+# How long, in milliseconds, a ping to a storage node may go unanswered before the connection is dropped and the calls on it fail over to the next owner. Must be 1 to 3600000 (one hour) and no more than `--storage-ping-interval-ms`
+storage-ping-timeout-ms = 10000
+
+[transfer]
+# The most bytes of blobs read into memory in flight at once, for the whole daemon. A blob larger than this is fetched alone
+transfer-bytes-in-flight = 268435456
+# The most bytes one ByteStream write message carries
+transfer-chunk-bytes = 1048576
+# The most digests one FindMissing call asks about
+transfer-find-missing-chunk = 1000
+# The most blob requests in flight at once, for the whole daemon: ByteStream reads and writes, segment ranges and FindMissing calls, over its one connection to `--cas`. Uploads hold at most all but a quarter of them
+transfer-in-flight = 64
+# The largest input file fetched through memory, where every lease asking for it at once shares one fetch; a larger one is streamed into its file
+transfer-memory-blob-bytes = 1048576
+# How many times a blob request is retried after UNAVAILABLE or a broken connection
+transfer-retries = 3
+# The HTTP/2 window of each stream to `--cas`; the connection's is eight times it
+transfer-stream-window-bytes = 8388608

@@ -72,12 +72,13 @@ request turns writes off.
 ## `GET /v1/nodes`
 
 The server that answers, then every node registered since it started, in node-id
-order, with its software and where it is in placement:
+order, with the protocol version it speaks, its software and where it is in
+placement, and, after the list, the oldest protocol version among them:
 
 ```json
 { "server": { "version": "0.1.0+0123456789ab", "commit": "0123456789ab" },
   "nodes": [
-  { "node_id": "mac-1", "connected": true, "software": {
+  { "node_id": "mac-1", "connected": true, "protocol": 1, "software": {
       "os_name": "macOS", "os_version": "15.1", "os_build": "24B83", "kernel": "",
       "daemon_version": "0.1.0", "xcode_builds": ["15F31d", "16C5032a"],
       "xcodes": [
@@ -95,9 +96,10 @@ order, with its software and where it is in placement:
       "Xcode 16B40 (/Applications/Xcode_16.1.app) installed but not ready: /usr/bin/xcodebuild -license check exited with exit status: 69: You have not agreed to the Xcode license agreements.; fix: sudo /Applications/Xcode_16.1.app/Contents/Developer/usr/bin/xcodebuild -license accept" ],
     "placement": { "state": "draining", "deadline_unix_ms": 1791371800000,
                    "leases": ["117399224320012061.42"] } },
-  { "node_id": "old-1", "connected": false, "software": null, "needs_attention": [],
-    "placement": { "state": "serving" } }
-] }
+  { "node_id": "old-1", "connected": false, "protocol": null, "software": null,
+    "needs_attention": [], "placement": { "state": "serving" } }
+],
+  "oldest_protocol": 1, "protocol_unknown": 1 }
 ```
 
 | Field | Meaning |
@@ -106,14 +108,26 @@ order, with its software and where it is in placement:
 | `server.commit` | the commit it was built from, 12 hex digits (`git rev-parse --short=12`), or `unknown` for a build without a git checkout |
 | `node_id` | the id its daemon registered with |
 | `connected` | whether its newest stream is still open |
+| `protocol` | the `kbf.worker.v1` version the `Hello` that opened its newest stream named, which the server answered in `Welcome` ([worker-protocol.md](design/worker-protocol.md)); `null` if that `Hello` named none (the field is 0, which is not a version). A `Hello` resent on the stream does not change it, and a node that returns on another version shows the new one. It stays after the stream closes: it is the version the node last spoke |
+| `oldest_protocol` | the least `protocol` among the listed nodes whose `protocol` is not `null`, connected or not (a node whose stream closed may return on the version it last spoke); `null` if no listed node names one. Nodes that name none are not in it |
+| `protocol_unknown` | how many listed nodes have a `null` `protocol`. They are never counted in `oldest_protocol`, so `oldest_protocol` says "every node but these speaks at least this": a reader that needs every node reads it with `protocol_unknown` equal to 0 |
 | `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a daemon that predates it. An empty string or list is a value the node could not read |
 | `software.received_at_unix_ms` | when the server received it, by the server's clock |
 | `software.xcode_builds` | the Xcode builds actions can use on it: only these route work |
 | `software.xcodes` | every installed Xcode, ready or not: `app`, `build` (empty if not known), `state` (`ready`, `license_not_accepted`, `first_launch_not_run`, `metal_toolchain_missing`, `failed`, `not_surveyed` from the daemon's start until its first survey of its Xcodes ends (never advertised; the daemon sends its status again when the survey ends), or `unknown` for a state this server does not know), `reason` (the check that failed and its answer, from the daemon's last survey that changed this Xcode's `DEVELOPER_DIR`, build or state; a survey that differs only in its reason is not sent, so when another check later fails with the same build and state, this is still the earlier check's text) and `fix` (the command an administrator runs on the node, when one is known). Empty from a daemon that predates it |
 | `software.container_images` | the container images the node was pinned to (`kbf-daemon --image`, container driver), as `docker://<repo>@sha256:<digest>`, sorted: each was in its image store, as one architecture's manifest, when the daemon started (a daemon that finds one missing does not start). Status only: no work is placed by image. Empty when none is pinned, on a Mac, and from a daemon that predates it |
+| `update` | where its update is: `{"state", "up_to_date", "availability"}` and nothing more (the commits and the refusal text are on [`GET /v1/update/hosts`](#get-v1updatehosts)). `state` is the host's step state from its newest `UpdateStatus` (`idle`, `fetching`, `staged`, `activated_unconfirmed`, `confirmed`, `reverted`, `refused`, `manual`, or `unknown` for a state this server does not know), `null` unless `availability` is `ok`. `availability`: `unsupported` if the node never sent an `UpdateStatus` (never shown as idle), `unavailable` if it sent one but its newest stream is closed or has not sent its own yet (a restarted daemon is not judged by its previous process), `ok` otherwise. `up_to_date` is `true` or `false` against the desired commit of `GET /v1/update`, and `null` whenever the server cannot judge: no desired release (or no `--state-store`, or a row that cannot be read), a host that is not `ok`, or a running commit that is not a hex prefix of 12 digits or more |
 | `needs_attention` | what an operator must do on the node, one line per item: today each installed Xcode that is not ready, as `Xcode <build> (<app>) installed but not ready: <reason>; fix: <command>`. An Xcode `not_surveyed` keeps the item the same app had in the node's previous status (as when a restarted daemon sends its first status), until a survey reports it; one with no previous item has none. The server also logs each item once at `WARN` (target `kbf_server::attention`) when it appears, and at `INFO` when a status reports it gone (its Xcode ready, changed or removed); a status that repeats an item, or lists its Xcode `not_surveyed`, logs nothing. An item is the same while its Xcode's app, build, state and fix are, so a reason that changes alone is shown here but not logged again. The previous status is kept in the server's memory: after a server restart, each item is logged again when its node reports it; kbf has no alert delivery yet (issue #189) |
 | `placement.state` | `serving`; `cordoned` (no new lease, its leases run on); `draining` (cordoned, waiting for its leases until `deadline_unix_ms`); `drained` (cordoned, no lease left: either its leases ended, or the node disconnected and, after the lease grace, its leases were given up and requeued to run elsewhere; check `connected`); `drain_paused` (the deadline passed with leases still running: they run on, and nothing proceeds until an operator acts) |
 | `placement.leases` | while draining or paused: the leases it still holds, as `term.seq` (each server process has its own term, the Raft term under the Raft metadata log: [worker-protocol.md](design/worker-protocol.md#server-restarts-and-the-lease-epoch)) |
+
+The list is the nodes this server process has seen, so it says nothing of a daemon that has
+not connected to it yet: a server that has just started, or that took over from another
+(the frontend swap, [design/frontend-proxy.md](design/frontend-proxy.md)), lists only those
+that have registered since. `oldest_protocol` and `protocol_unknown` describe that list and
+no more. The check that a release may stop accepting the oldest version
+([design/frontend-proxy.md](design/frontend-proxy.md) section 9, rule R1) reads them; it is
+not made by this server.
 
 ## `GET /v1/members`
 
@@ -126,10 +140,11 @@ frontend, a daemon opens a worker stream.
 ```json
 { "generation": 7,
   "members": [
-    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1 },
-    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1 },
-    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2 }
-] }
+    { "id": 1, "addr": "192.0.2.11:8982", "state": "active", "weight": 1, "protocol": 1 },
+    { "id": 2, "addr": "192.0.2.12:8982", "state": "draining", "weight": 1, "protocol": 2 },
+    { "id": 3, "addr": "192.0.2.13:8982", "state": "down", "weight": 2, "protocol": null }
+],
+  "oldest_protocol": 1, "protocol_unknown": 1 }
 ```
 
 | Field | Meaning |
@@ -139,26 +154,36 @@ frontend, a daemon opens a worker stream.
 | `addr` | the address callers dial |
 | `state` | `joining` (registered, a write owner, read last), `catching_up`, `active` (a full owner), `draining` (takes no new writes) or `down` (its lease lapsed; kept in the map for the dwell, then it leaves the list) |
 | `weight` | its share of the digests relative to the others |
+| `protocol` | the protocol version in the `RegisterRequest` that wrote the member's row (a heartbeat and a state change keep it; a new registration of the member replaces it). `null` when the row names none, as a row written before this field existed, and for a `down` member: its row expires with its heartbeats, and the version went with it |
+| `oldest_protocol` | the least `protocol` among the members whose `protocol` is not `null`; `null` if none is |
+| `protocol_unknown` | how many members have a `null` `protocol`. Never counted in `oldest_protocol`: read the two together, as for [`GET /v1/nodes`](#get-v1nodes) |
+
+The registration is judged against the map's floor once, when it is made
+([design/frontend-proxy.md](design/frontend-proxy.md) section 9); `protocol` is what it
+named, and nothing judges it again.
 
 A registered member is `joining` until something promotes it with `Members::set_state`;
 the server does not promote on its own yet, so a script that waits for `active` waits
 for that. A server without a state store keeps no members and answers `404`; a state
-store that cannot be read answers `503`.
+store that cannot be read answers `503`. The view reads the map and then the member rows
+(for `protocol`), so a stored map or a stored member row that does not decode answers
+`500` for the whole view, not a list without that member's version: the store is up and
+its content is wrong, as it is for the other readers of those rows.
 
 ## `POST /v1/nodes/{node}:cordon`, `:drain`, `:uncordon`
 
 An operator takes a node out of placement, drains it, or returns it
 ([fleet-updates.md](design/fleet-updates.md) sections 3.3 and 4.2):
 
-- `:cordon`: the scheduler offers the node no new lease; its leases run on. A drain
+- `:cordon` (`POST /v1/nodes/{node}:cordon`): the scheduler offers the node no new lease; its leases run on. A drain
   already under way is kept.
-- `:drain`: cordons the node and waits for its leases to end. The body may be
+- `:drain` (`POST /v1/nodes/{node}:drain`): cordons the node and waits for its leases to end. The body may be
   `{"deadline_secs": N}`; without a body the deadline is 30 minutes. With no lease
   left the node is `drained`. If the deadline comes first the drain **pauses**: the
   leases run on, nothing is killed or given up, and the node stays `drain_paused`
   even after they end, until an operator drains it again (a new deadline) or
   uncordons it.
-- `:uncordon`: returns the node to placement and ends any drain.
+- `:uncordon` (`POST /v1/nodes/{node}:uncordon`): returns the node to placement and ends any drain.
 
 The answer is the node, as `GET /v1/nodes` lists it, after the action. `404` for a
 node that never registered or an unknown verb, `400` for a drain body of another
@@ -573,6 +598,154 @@ whoever acts on a zero keeps new writes away from the node first (drains it), th
 again. A member that left the map (a `DOWN` member leaves after the dwell) is not counted.
 `503` with `{"error": ...}` when the membership cannot be read.
 
+## `/v1/object-stores/...`
+
+Registers the farm's object store with the frontend, which keeps it as durable desired state
+with a generation. A
+**connection** is a named endpoint plus a key pair; a **binding** maps a role to a
+connection, a bucket and a prefix. The only role is `cold`, today's `--cold-store`; `history`
+and `backup` answer `422 role_not_supported` until something consumes them. A role here is
+neither an IAM role nor an enrollment role.
+
+The routes exist when the frontend is started with `--object-store-secrets-dir DIR` (which
+needs `--api-listen`, `--api-token-file` and `--state-store`). `DIR` holds one file of mode
+0600 per connection, `<name>.<version>.json`, in a directory made 0700; every frontend child
+that serves at once must be able to read it, and it must stay out of any backup of the host
+(the state store, and so `state-backup`, never holds a secret key). Without the flag every
+route answers `404` `not_enabled` to a caller who passed the gate.
+
+**Every route, a GET included, passes the whole gate of [Who may write](#who-may-write)**
+(loopback peer, no `Origin`, the bearer token, `Content-Type: application/json`), because
+the routes list and change the farm's store and the key to it. One token, no roles. A TLS
+proxy on the host reaches them from loopback and passes the gate: whether the proxy carries
+these routes is the operator's decision. Every answer, errors and `405` included, carries
+`Cache-Control: no-store`. A body is at most 16 KiB (`413 payload_too_large`) and refuses
+unknown fields. No route is fenced: two frontend children on one state store both serve them,
+and a lost race is `409 conflict`, never a lost write.
+
+| Route | Does |
+|---|---|
+| `PUT /v1/object-stores/connections/{name}` | create or replace; `201` created, `200` changed or unchanged |
+| `GET /v1/object-stores/connections` | `{connections: [...]}`, never a secret |
+| `GET /v1/object-stores/connections/{name}` | one connection, never a secret |
+| `DELETE /v1/object-stores/connections/{name}` | `{generation}`; `409 in_use` while a binding names it |
+| `POST /v1/object-stores/connections/{name}:verify` | probe the store, change nothing |
+| `PUT /v1/object-stores/bindings/{role}` | bind `cold`; `201` created, `200` changed or unchanged |
+| `DELETE /v1/object-stores/bindings/{role}` | `{generation}`; `409 in_use` once a node has applied it |
+| `GET /v1/object-stores` | the desired state and the nodes' convergence |
+| `GET /v1/object-stores/audit?limit=N` | the newest `N` audit rows (default 50, at most 500) |
+
+The design ([object-store-registration](design/object-store-registration.md)) has the rotation
+runbook; every verb of the API is in [the verbs table](design/operator-verbs.md).
+
+**Names.** `{name}` is `[a-z0-9][a-z0-9_-]{0,62}`, else `400 bad_name`: it becomes a file name
+and a URL segment, so `/`, `.`, `:` and NUL never reach the file system. `{role}` is `cold`.
+
+**`PUT .../connections/{name}`** takes `{endpoint, region?, access_key_id,
+secret_access_key, conditional_put?, min_put_rate?, expect_generation?, verify?}`.
+
+- `endpoint` is `http://host[:port]`: `https` answers `422 tls_unsupported` (the S3 client
+  speaks no TLS yet, so a registration would be accepted and fail on every node); anything
+  else that is not that answers `422 invalid_endpoint`. `access_key_id` and
+  `secret_access_key` are visible ASCII (at most 256 and 1024 characters), `region` is
+  `[a-z0-9-]` (at most 64): else `422 invalid_field`.
+- Changing `endpoint` of a bound connection answers `409 identity_change`; credentials,
+  region, `conditional_put` and `min_put_rate` change freely. The same body again changes
+  nothing (`200`, `changed: false`, the generation stays).
+- `expect_generation` that is not the registry's answers `409 generation_mismatch` and writes
+  nothing; without it the last writer wins and both are in the audit log.
+- `verify` (default `true`): when the connection is the one the `cold` binding names, the
+  frontend probes that bucket and prefix with the key being registered before it writes
+  anything, and a failed probe answers `422 probe_failed` with no row and no file. When no
+  binding names the connection there is no bucket to probe: `verified` is `null`, and the
+  connection is probed when it is bound and by `:verify`.
+- Answer: `{name, generation, changed, access_key_id, secret_set, verified}`, never the
+  secret or a digest of it.
+
+**`PUT .../bindings/{role}`** takes `{connection, bucket, prefix?, expect_generation?,
+verify?}`; `verify` (default `true`) probes the bucket with the connection's stored key
+first. `422 unknown_connection`, `invalid_bucket`, `invalid_prefix` and `probe_failed` write
+nothing. The store identity `(endpoint, bucket, prefix)` is immutable once bound
+(`409 identity_change`): moving to another store is a migration this API has no verb for.
+Answer: `{role, generation, changed, verified}`.
+
+**`POST .../connections/{name}:verify`** takes nothing, or `{bucket?, prefix?}`; without a
+bucket it uses the `cold` binding's, else `422 no_bucket`. It puts one small object under
+`<prefix>.kbf-probe/`, reads it back, checks that a second write is refused when the
+connection says `conditional_put`, and deletes it. `200 {name, verified}`, or `422
+probe_failed` with `verified` (`{ok, put, get, delete, conditional_put}`): the steps, never
+the store's words. The probe proves that *this frontend* can reach the store with this key;
+the frontend connects to an endpoint an operator typed, so it is bounded (20 seconds in all)
+and operator-only behind the token.
+
+**`GET /v1/object-stores`** answers `{generation, connections, bindings, convergence}`;
+`convergence` is `{converged, expected, applied, unsupported, nodes: [{id, state,
+applied_generation, status, last_seen_secs}]}`.
+
+- `status` is one of `ok`, `pending`, `probe_failed`, `identity_mismatch`, `unsupported`: a
+  closed code, never a node's own text. A node that reports `ok` at another generation is
+  shown `pending`.
+- `expected` counts active nodes that report the registration; draining and denied nodes
+  are listed but not counted. A node whose build does not report it at all is `unsupported`,
+  counted in `unsupported` and not in `expected`, and named in `nodes`, so version skew is not
+  mistaken for "not fetched yet".
+- `converged` is true only when at least one node is expected, every expected node has
+  applied the current generation with status `ok`, and none is `unsupported`. It never claims
+  more than the frontend knows: a frontend that has heard from no node says `false`.
+  **This build wires no source of node reports yet: `nodes` is empty and `converged` is `false`.**
+
+**`GET /v1/object-stores/audit`** answers `{entries: [{seq, at, action, subject, outcome,
+generation}]}`, newest first. A row names what was touched and what happened, never a body
+field; the actor is always "the API token", the gate knows no finer identity. Only writes
+leave rows (a refused call, a failed probe and `:verify` leave none), an unchanged repeat leaves
+one with `outcome` `unchanged`.
+
+**Errors** are `{"error": "...", "code": "..."}` (a `probe_failed` also has `verified`). The
+text names no value of the request: a body that does not parse says where, not what.
+
+| Status | `code` |
+|---|---|
+| 400 | `bad_name`, `bad_body`, `bad_query` |
+| 401, 403, 415 | `unauthorized`, `forbidden`, `unsupported_media_type` (the gate's) |
+| 404 | `not_enabled`, `no_such_connection`, `no_such_binding`, `unknown_action` |
+| 409 | `identity_change`, `in_use`, `generation_mismatch`, `conflict` |
+| 413 | `payload_too_large` |
+| 422 | `invalid_field`, `tls_unsupported`, `invalid_endpoint`, `invalid_bucket`, `invalid_prefix`, `role_not_supported`, `unknown_connection`, `no_bucket`, `probe_failed` |
+| 500 | `secret_missing` (the file a row names is missing or not 0600: fail closed, PUT again to repair), `secret_io`, `corrupt_rows`, `internal` |
+| 503 | `state_unavailable` |
+
+`DELETE .../bindings/{role}` answers `409 in_use` when a node reports `ok` at a generation
+at or after the binding's `updated_generation`: it runs on that store, and the API cannot take
+a store back from a running node. (A binding re-PUT with another connection of the same
+endpoint moves `updated_generation`; a node that applied only the earlier version is not
+counted.)
+
+**Rotating the key** (the API never revokes a key at the store):
+
+1. Add the new key at the store.
+2. `PUT` the connection with the new secret. The frontend probes the bound bucket with it
+   first.
+3. Restart the storage nodes through the installer: a running node does not swap
+   credentials in v1, and picks the registration up at its next start.
+4. Poll `GET /v1/object-stores` until `converged` is `true` (a node still on the old key is
+   `pending`).
+5. Only then revoke the old key at the store.
+
+```sh
+T=$(cat <token file>); API=http://127.0.0.1:<port>
+# the body is a file, never an inline secret; the content type is required on every call
+curl -X PUT -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  --data @connection.json $API/v1/object-stores/connections/cold
+curl -X PUT -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  --data '{"connection":"cold","bucket":"farm-cold","prefix":"cold/"}' \
+  $API/v1/object-stores/bindings/cold
+curl -H "Authorization: Bearer $T" -H 'Content-Type: application/json' $API/v1/object-stores
+```
+
+The request body is read into memory and parsed; the buffers are not zeroized, so the
+secret key sits in the frontend's memory for as long as the allocator keeps those pages.
+The key is never logged, never in a state row and never in an answer.
+
 ## `GET /healthz` and `GET /readyz`
 
 For the health check of a front or proxy (a TLS-terminating ingress, Envoy) in front
@@ -721,7 +894,7 @@ watches.
 | `kbf_write_tier_unflushed_bytes`, `kbf_write_tier_unflushed_blocks` | gauge | acknowledged bytes, and the blocks holding them, not yet in the object store |
 | `kbf_write_tier_oldest_unflushed_seconds` | gauge | the age of the oldest of those blocks (since it was created, or since the restart that recovered it); 0 when there is none |
 
-In `kbf-all-in-one`, when the hot store is a directory on the filesystem of `--data-dir`,
+In `kbf all-in-one`, when the hot store is a directory on the filesystem of `--data-dir`,
 the daemon half's input cache and the server half's hot store are one cache
 ([architecture-v2.md](design/architecture-v2.md#10-locality)): the input cache's
 directory is the node's only local copy of a blob, the tier deletes a block once it is
@@ -891,9 +1064,10 @@ copy (it passed, the log was over 16 MiB, or it had none) is `404` `no_log`; an 
 `404` `no_run`; a query string is `400`.
 
 **Across builds** (with `--history-objects`; otherwise these routes do not exist, `404` as
-any unknown path). They are read from the index rows the history writer keeps, never from
-an object, so they answer the same after a restart and cost no object read
-(`docs/design/ui-data.md` 4.3 and 6.2). They run the same policy as the build pages:
+any unknown path). The invocation list and the shape and test routes are read from the index
+rows the history writer keeps, never from an object, so they answer the same after a
+restart and cost no object read; the grid reads the run records of the chunks of the builds
+it names (`docs/design/ui-data.md` 4.3 and 6.2). They run the same policy as the build pages:
 `authenticationPolicy`, then `invocations.getAuthorizer` (`404` with `"off"` when it is not
 named). The authorizer is asked once per request about each instance the request would
 touch, and every answer holds only rows of allowed instances; an invocation is listed only
@@ -910,6 +1084,23 @@ across restarts). An answer over more instances than the index reads at once (25
 | `GET /v1/tests` | the same with `kind=test` |
 | `GET /v1/shapes/{key}?instance=&cfg=` | one `(instance, cfg)` of the key, with `previous_keys: null`; with either absent, `{"shapes": [...]}` of the key's rows (paged) |
 | `GET /v1/shapes/{key}/runs?instance=&cfg=` | the last 16 runs of a test, newest first, each `{run_id, run_href, class, execution_ms, source: "run", digest16}` (`run_href` is `GET /v1/runs/{run_id}`), with `complete: false`, `covers: "recent_16"` (`"none"` for a shape that is not a test) and `needs: "day_index"`: older runs are not answered yet. Both parameters are required |
+| `GET /v1/grid?shapes=<key>,<key>&invocations=<id>,<id>` (or `last=<n>`) | the outcome of shapes in builds: `{"columns": [...], "rows": [...], "shapes": [...]}`. `shapes` is 1 to 50 keys; the builds are named by `invocations` (1 to 50 different ids) or are the newest `last` (1 to 50, of the instances the caller may read, `?instance=` narrows them). A column is `{id, href, first_seen, complete}` (`complete: false` when the build has more than 20,000 records and the read stopped); a row is one `(instance, key, cfg)` some build ran, `{instance, key, cfg, href, cells}`, with one cell for each column: `{status, run_id, run_href}` with `status` `pass`, `fail` (a failure or a timeout), `oom_killed` or `infra`, from the row's last run in that build that is a result, or `{status: "absent"}` where the build has no run of the row. A build that is not held, or that a caller may not read (any of its instances), is `404` `no_record`. `columns=commit` is `400` `needs_report`; there are no `cached_pass` cells yet |
+| `GET /v1/actions/{digest}/runs` | the runs of an action digest (`<64 hex>-<size>`) of today, newest first by end time, `?instance=`, `?class=`; each `{run_id, run_href, instance, worker, class, started, ended, shape}` |
+| `GET /v1/runs?node=&from=&to=&class=&instance=` | the runs of today that overlapped `[from, to]` on `node` (`node` is required; both times are optional), newest first by end time |
+
+The last two read the writer's index of today's runs, in memory (64 MiB, the oldest runs
+forgotten first, empty after a restart), not the day index: their answers always say
+`"partial": true` and `covers_from`, the time from which the index has every run it was
+sent. A run of an instance the caller may not read is never listed.
+
+Both list by end time, newest first; two runs that ended in the same millisecond are
+listed latest arrival first. Runs reach the index in the order the writer receives them,
+and a failed run can arrive after runs that ended later, so the order is the index's own,
+not arrival. `next_page` is a cursor, the end time and arrival number of the last run
+listed (`<ended_ms>.<seq>` in the token); the next page lists the runs that sort before it (older by that key).
+A run that arrives between two pages with an end time older than the cursor is listed on a
+later page; one with a newer end time is not listed by the pages that follow (read the
+first page again to see it). No run is listed twice or skipped by paging.
 
 A shape row is `{instance, key, cfg, kind, target, first_seen, last_seen, href, runs_href}`
 and, for a test, `status` (`passing`, `failing`, `flaky`, `oom_killed`, or `null` while the
@@ -1194,9 +1385,8 @@ node's next push makes the call succeed.
 ## `PUT /v1/releases/{commit}/{platform}/{name}` and `GET /v1/releases`
 
 The frontend's release store (`docs/design/pull-updates.md` section 6.3): the tarballs of a
-release and their build attestations, kept as uploaded. Not served by any listener until the
-frontend mounts `kbf_server::release::router`; without a store both answer `503` naming
-`--releases-dir`.
+release and their build attestations, kept as uploaded. Mounted by `--releases-dir`; without a store both answer
+`503` naming `--releases-dir`.
 
 - `commit` is 40 lowercase hex digits, `platform` is `linux-x86_64`, `linux-arm64` or
   `darwin-arm64`, `name` is `kbf` or `kbf-daemon` (the tarball) or either with the suffix
@@ -1211,14 +1401,79 @@ frontend mounts `kbf_server::release::router`; without a store both answer `503`
   `200` with the same answer, other bytes are `409` and change nothing.
 - `GET` is open and lists `{"releases": [{"commit", "platforms": [{"platform", "complete",
   "components": [{"name", "sha256", "size", "attested"}]}]}]}`: commits sorted, platforms in the
-  order above, a platform `complete` when both tarballs have their attestation. A component is
+  order above, a platform `complete` when it holds, with their attestations, the tarballs its
+  hosts need: `kbf` for a Linux platform, `kbf-daemon` for `darwin-arm64`. A component is
   listed when its tarball is stored.
 - `GET /v1/releases` and the gRPC `ReleaseService.Fetch` are unauthenticated at the router and
-  the service. `Fetch` is mounted on the worker listener behind its mutual TLS and the role
-  table (the daemon role alone may call it). `GET /v1/releases` is open to whoever reaches the
+  the service. `Fetch` is mounted on the worker listener, behind its mutual TLS and the role
+  table (the daemon role alone may call it) when TLS is configured; in plain-text worker mode
+  it is open, like every worker method. `GET /v1/releases` is open to whoever reaches the
   operator API, like `GET /v1/nodes`: it lists commits, platforms and digests, no bytes. The
   store is mounted by `--releases-dir`, which needs `--api-listen`; without the flag every
   update endpoint answers `503`.
+
+## `GET /v1/update` and `POST /v1/update/{desired,pause,resume}`
+
+The desired release (`docs/design/pull-updates.md` section 6.3), kept in the `update/desired`
+row of the state store. Without `--state-store` every answer is `503` naming it; without
+`--releases-dir`, `GET /v1/update` and `POST /v1/update/desired` are `503` naming that flag
+(`pause` and `resume` need only the state store). A write that other writers kept racing
+for the whole of its retries is `503` with `Retry-After: 1`: send it again.
+
+- `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
+  "paused": bool, "policy": null | {...}, "releases": <the body of GET /v1/releases>}`. `policy`
+  is the `update/policy` row when the operator wrote one (`paused`, `auto_nodes`,
+  `auto_frontend`, `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`,
+  `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without
+  a row).
+- `POST /v1/update/desired` with `{"commit": "<40 lowercase hex>"}` and, optionally,
+  `"expect_generation": N` (JSON content type, the write gates) offers the commit. With
+  `expect_generation` it is a compare-and-set: it writes only if the desired release is at
+  generation N (0 before any offer), else `409` naming both and nothing is written. `409` unless the release store holds some platform of it complete
+  (see above); `400` for a body that is not exactly that. The answer is the desired release.
+  The generation moves only when the commit differs from the desired one, so a repeated click is
+  not a new run; a rollback is the older commit offered the same way and gets a higher
+  generation. Generations increase, but may skip numbers: each write that loses a race has
+  already drawn a counter value.
+- `POST /v1/update/pause` and `POST /v1/update/resume` (the write gates, no body) set `paused` of the policy
+  row, by compare-and-set of that field alone, and answer `{"paused": bool}`. No run is
+  needed, and an offer leaves the flag as it is: while set, no host is started.
+
+## `GET /v1/update/hosts`
+
+What each host last said about its update, for the update page and for agents
+(`docs/design/update-ui.md` section 5). **Off unless the policy names `farm.getAuthorizer`**
+([reapi-auth.md](reapi-auth.md)): the request runs the policy's authenticator and then that
+authorizer (asked with the empty instance name), and without the key or a policy file every
+request is `404` with `"off": "farm"`. It carries what the open `GET /v1/nodes` must not: the
+commits a host runs, staged and installed, and its refusal text.
+
+```json
+{ "desired": { "generation": 3, "commit": "<40 hex>", "set_at_ms": 1791370000000 },
+  "paused": false,
+  "hosts": [
+    { "node_id": "linux-1", "connected": true, "availability": "ok", "state": "refused",
+      "up_to_date": false, "desired_commit": "<40 hex>", "running_commit": "0123456789ab",
+      "installed_commit": "<40 hex>", "staged_commit": "", "refusal": "no helper",
+      "offered_generation": 3, "helper_present": false, "reported_at_unix_ms": 1791370000000 } ],
+  "next_page_token": null }
+```
+
+- `desired` is the row of `GET /v1/update` (`null` before any offer, and without `--state-store`).
+  `paused` is the policy row's `paused` (the pause lives there alone), `false` without a policy
+  row (as on `GET /v1/update`), and `null` (unknown, never `false`) if the policy object has no
+  boolean `paused`.
+- Each host has `availability`, `state` and `up_to_date` as on `GET /v1/nodes`. The rest is as
+  the host last reported, even if it is no longer `ok` (`null` for a host that never sent an
+  `UpdateStatus`): `running_commit` (12 hex digits or `unknown`), `installed_commit` and
+  `staged_commit` (`""` if none or not known), `refusal`, `offered_generation`,
+  `helper_present` and `reported_at_unix_ms` (the server's clock).
+- **Text from a host is data.** Each string is kept cut to 64 bytes (a commit) or 512 bytes
+  (`refusal`) on a character boundary, with control characters replaced by U+FFFD. A reader
+  escapes it as it would any string from outside.
+- Hosts are in node-id order. `?page_size=` (100 by default, 1 to 1000) and `?page_token=` (the
+  `next_page_token` of the page before, null on the last page); any other query key or a bad
+  page size is `400`. A state store that fails is `500`, not hosts without a desired commit.
 
 ## `UNAVAILABLE` from a storage node that is catching up
 

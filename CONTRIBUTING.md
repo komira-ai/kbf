@@ -122,7 +122,7 @@ which downloads the run's `coverage` artifact into a new temporary directory and
 rewrites `coverage-baseline` from the measured file in it:
 
 ```sh
-d=$(mktemp -d) && gh run download <run id> --repo komira-ai/komira-build-farm --name coverage --dir "$d" \
+d=$(mktemp -d) && gh run download <run id> --repo komira-ai/kbf --name coverage --dir "$d" \
   && cargo run -p kbf-coverage -- tighten --measured "$d"/coverage-baseline.measured
 ```
 

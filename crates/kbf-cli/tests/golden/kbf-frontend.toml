@@ -1,0 +1,125 @@
+# kbf frontend: every setting, one table per group; a key is a flag's long name.
+# Generated from the flag definitions (tests/golden). A flag on the command line
+# overrides its key. A secret is the path of the file that holds it.
+
+[daemon]
+# Worker threads of the async runtime, which run every task between its waits. Default: every CPU the process may use on the server; `max(2, reserve/4)`, at most the physical cores, on the daemon
+# async-threads = "N"
+# The most threads the runtime's blocking pool runs at once, for calls that wait on a disk or a process (a thread is made when a call needs one and ends when idle). Default: 512 (tokio's) for the server, 64 for the daemon
+# blocking-threads = "N"
+# Threads for CPU-bound work, such as hashing, which never waits and so is held to the CPUs. Default: every CPU the process may use on the server; `max(2, reserve/2)`, at most the physical cores, on the daemon
+# cpu-threads = "N"
+
+[handover]
+# The time between two of Envoy's health checks of a frontend (the cluster's `interval`).
+envoy-check-interval-ms = 1000
+# How long Envoy's health check waits for an answer (the cluster's `timeout`).
+envoy-check-timeout-ms = 1000
+# How many of Envoy's checks in a row must fail before it stops choosing a frontend (`unhealthy_threshold`). The three give the settle: a frontend waits interval x threshold + timeout + interval before it goes not ready (Envoy has then seen the successor) and again before it exits (Envoy then sends it nothing).
+envoy-unhealthy-threshold = 2
+# How often a frontend that has handed over looks in the state store for the results of the Execute and WaitExecution streams it kept open.
+handover-follow-interval-ms = 200
+# The DNS name the REAPI certificate of the other instance carries. A frontend whose REAPI listener has a certificate forwards the calls it still receives after a handover over TLS to the successor, verified against --storage-ca and this name; without it such a frontend refuses a handover.
+# handover-peer-name = "DNS_NAME"
+# The longest a frontend that hands over waits for the Execute calls between their request and their queueing, and the results being taken, before it stands down anyway.
+handover-quiesce-secs = 10
+# The control socket of a handover (mode 0600, this user only). A frontend serving binds it; one started while another serves on the same --state-store (and the other --instance) binds its own listeners, asks the other to hand over its scheduler state and its daemons, and takes them without failing a build. The other goes not ready once Envoy has seen the new one, forwards the calls Envoy still sends it, and exits when it holds nothing.
+# handover-socket = "PATH"
+# How long after it has handed over a frontend waits for its successor to serve. If the successor does not (or its control connection closes), the frontend goes not ready itself, so Envoy answers cleanly instead of choosing a frontend that can start nothing new.
+handover-watchdog-secs = 15
+# Which of the two instances this is. Instance a listens where --listen, --worker-listen and --api-listen say, instance b ten ports above each (port 0 stays 0): the two blocks Envoy's configuration names. A handover goes to the other instance; without --instance a frontend refuses one.
+# instance = "a|b"
+
+[history]
+# Where history's index rows live in the state store: `ui/`, or `<prefix>ui/` for a prefix that ends in `/`, so that one state store can hold several farms' history apart. Left out, it is `ui/`. Needs `--history-objects`
+# history-index-root = "ROOT"
+# Where build history is kept: an object store, `s3://bucket/prefix?endpoint=http://host:port` (the key pair is the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment) or `file:///absolute/path` (a directory this process owns, not the cold store's). The attempts and cache hits of each invocation a client named are recorded under `<prefix>history/` after their results are sent, never before and never delaying one; the index rows go to `--state-store`, which this flag needs. A full queue, a slow object store or a slow state store drops records and counts them (`kbf_history_dropped_total` on `/metrics`), and never fails or delays a call. The writer reads and writes only keys under `history/`. Left out, nothing is recorded
+# history-objects = "URI"
+# The memory, in bytes, the invocation records may take together (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id go first, then idle ones, least recently seen first; with only open builds left, the largest stops taking rows. Records are kept in memory only and lost on restart. Their heap was measured at up to 1.08 times this at 200 kB and above, and 1.12 at 50 kB (section 3.5)
+invocation-memory = 268435456
+
+[listener]
+# The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are open to whoever reaches it: bind it where only operators do
+# api-listen = "API_LISTEN"
+# How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused)
+http2-keepalive-interval-secs = 30
+# How long, in seconds, a PING may go unanswered before the connection is closed
+http2-keepalive-timeout-secs = 20
+# The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves plain text, on any address; off loopback the start line carries a warning
+listen = "127.0.0.1:8980"
+# The most HTTP/2 streams one connection to the REAPI listener may have open. buck2 keeps one Execute stream open per outstanding action, idle until the action finishes, so this bounds how large a backlog one buck2 invocation can show the farm. The connection's flow-control window is this many streams' windows; above about 2000 streams each stream's window is smaller than 1 MiB so that the product stays under HTTP/2's largest window. At least 1, at most 32767
+reapi-max-streams = 10000
+# The release store (`docs/design/pull-updates.md`, section 6): a directory where the tarballs of a release and their build attestations are kept, uploaded with `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the token) and fetched by the nodes through `ReleaseService.Fetch` on the worker listener, behind its mutual TLS. Made if missing. Without it every update endpoint answers 503 saying so
+# releases-dir = "DIR"
+# How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
+shutdown-timeout-secs = 0
+# How often, in seconds, a TLS listener looks at its certificate, key and client CA files (the `--*-tls-cert`, `--*-tls-key` and `--*-client-ca` flags). A change is applied to the next TLS handshake, with no restart and without ending a connection already open: renew a certificate by replacing the files. Files that do not make a working configuration (unreadable, not PEM, a key that is not the certificate's, an expired certificate, a renewal caught between its two writes) are logged and counted in `kbf_tls_reloads_total{outcome="rejected"}`, and the previous files keep serving; the next look finds them whole and applies them. The files must be good at start
+tls-reload-interval-secs = 30
+# The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address; off loopback the start line carries a warning
+worker-listen = "127.0.0.1:8981"
+# The most HTTP/2 streams one connection to the worker listener may have open: a daemon's persistent session stream and its short transfer streams. At least 1, at most 32767
+worker-max-streams = 200
+
+[log]
+# The directory of the durable log file, `kbf-server.log` and its rotated `kbf-server.log.1`, `.2`, ... (created if missing): every event stderr gets, in the same format, kept across restarts. Left out, it is `<hot store directory>/log` when the hot store is a directory; with neither, there is no file and the server logs to stderr alone (the start logs which). A directory or file that cannot be written never stops the server ([`crate::log_file`])
+# log-dir = "DIR"
+# How many log files are kept, the current one included; rotation drops the oldest. The log never exceeds `--log-max-bytes` times this, plus one line
+log-files = 8
+# The most bytes one log file holds before it is rotated; a line longer than this goes alone to a fresh file. With `--log-files` it bounds the log's size on disk
+log-max-bytes = 67108864
+
+[memory]
+# The memory rungs of an action, in GiB, ascending and each at least 1. The first is what an action that names no size (`kbf-book-mem-gib`) books. An action that passes its own memory limit runs again on the next rung above what it booked, and after the last on a whole host: the memory of the largest node that could run it, so that no other lease fits there. A rung not below that node's memory is skipped for the whole host. An action that does finish keeps its rung: later runs of it start there
+memory-ladder-gib = [4, 16, 32]
+
+[scheduler]
+# How long, in seconds, a finished operation is kept after its callers are answered. Within it, WaitExecution on the operation's name streams its result (a client whose Execute stream broke gets a result the action cache does not keep, such as a failure); after it, the name is NOT_FOUND. Every operation finished within it is held in memory
+finished-retention-secs = 60
+# The heartbeat interval daemons are asked for, in milliseconds, at most half the window in which a daemon may act on a `Start` (each `Start` names the newest heartbeat the server took, so a longer interval would leave it too little)
+heartbeat-interval-ms = 5000
+# How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
+progress-interval-secs = 30
+# How long, in milliseconds, `GET /readyz` on the operator API and the REAPI listener's `grpc.health.v1` service wait for the object store to answer their read-only probe before they answer not ready
+readyz-store-timeout-ms = 2000
+# Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `postgres:///kbf?host=/run/postgresql`, the database `kbf` on a local Unix socket, reached as this process's own user (peer authentication; a URL with a password is refused, as the command line is world-readable). The server must flush commits before it acknowledges them (`synchronous_commit` on) or the start is refused; the tables are created if missing. Or `sqlite:///absolute/path`, a file on a local disk that this process owns (created, with its directory, if missing: 0600, and 0700 for a directory it makes; a second frontend on it refuses to start). Every start is a new epoch, so daemons kill the runs of the leases they held before. Left out, the scheduler's state is in memory and a restart loses it
+# state-store = "URI"
+# How long, in seconds, queued work waits while no connected daemon can run it (none satisfies its platform, or none that does is large enough) before it is refused FAILED_PRECONDITION. The wait restarts whenever one can
+unservable-wait-secs = 300
+
+[storage-client]
+# Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then answers a client's CAS, ByteStream and action-cache calls from that node, passing ByteStream through without holding a blob. The local stores are still opened: Execution and the worker listener use them (`kbf frontend` is this mode without them: Execution reads the node too). Plain text (`http://`) only here; `kbf frontend` takes the flags of the mutual TLS to the node. Without it, the server answers those calls itself
+# storage = "URL"
+# The CA the storage node's certificate chains to; the node must present a certificate for the host in the --storage URL.
+# storage-ca = "PATH"
+# The frontend's certificate toward the storage node (PEM); it must name the role `frontend` (a URI subjectAltName urn:kbf:role:frontend).
+# storage-client-cert = "PATH"
+# The private key of --storage-client-cert (PEM).
+# storage-client-key = "PATH"
+
+[storage-node]
+# How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
+member-dwell-secs = 300
+# How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
+member-ttl-secs = 15
+
+[stores]
+# Turns on the object-store registration routes of the operator API (/v1/object-stores, docs/api.md) and names the directory where the secret key of each registered connection is kept, one file of mode 0600 each, in a directory made 0700. The directory must be readable by every frontend child that serves at once and left out of any backup of the host. The registration itself (endpoints, buckets, the audit log) is kept in the state store. Without it those routes answer 404.
+# object-store-secrets-dir = "DIR"
+
+[tls]
+# A file holding the token operator API writes (cordon, drain, uncordon) must present as `Authorization: Bearer <token>`. It must be owned by the server's user with mode 0600 or 0400, or the server refuses to start; run the server as a user other than the daemon's, whose builds could read it. Without it, writes are refused
+# api-token-file = "API_TOKEN_FILE"
+# A JSON file with the REAPI listener's authentication policy and authorizers (`docs/reapi-auth.md`), read once at start; a file that is not a valid policy stops the server. Without it every REAPI call is accepted and allowed. The worker listener does not read it; on the operator API only the build pages and the blob route do, and they are off unless it names their authorizers
+# reapi-auth-policy = "REAPI_AUTH_POLICY"
+# PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves TLS with this server certificate only; clients present no certificate. It is meant for a certificate from the farm's own internal CA, trusted by the front's proxy (its hop to this server) and by clients that dial this server directly; TLS for the farm's client-facing name still ends at the front. `--reapi-auth-policy` applies over TLS as over plain text
+# reapi-tls-cert = "REAPI_TLS_CERT"
+# PEM private key of the REAPI listener; it must match `--reapi-tls-cert`, or the server refuses to start
+# reapi-tls-key = "REAPI_TLS_KEY"
+# PEM CA that client certificates must chain to. Each must also name the role the method it calls takes: the daemon role (`urn:kbf:role:daemon`) for the worker session and blob calls, the storage role (`urn:kbf:role:storage`) for `kbf.map.v1.Membership`, with DNS or IP names that cover the host of the instance id and of the address it registers; a frontend certificate may call nothing here
+# worker-client-ca = "WORKER_CLIENT_CA"
+# The worker listener's deny list: certificate serials, public keys and node ids it refuses (format in the `identity` module docs). Read at start, then again at every check (a daemon's `Hello`, `Heartbeat`, `Result`, `NodeStatus` and blob calls, a storage node's `Register` and `Heartbeat`), so an edit takes effect without a restart. A `node` entry also refuses a storage certificate with that DNS name. A list that cannot be read after start refuses all of those calls. Needs mutual TLS
+# worker-deny-list = "WORKER_DENY_LIST"
+# PEM certificate of the worker listener. With `--worker-tls-key` and `--worker-client-ca` it serves mutual TLS; without all three, plain text
+# worker-tls-cert = "WORKER_TLS_CERT"
+# PEM private key of the worker listener
+# worker-tls-key = "WORKER_TLS_KEY"

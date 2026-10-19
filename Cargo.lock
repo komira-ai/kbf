@@ -1338,14 +1338,12 @@ dependencies = [
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
- "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
  "prost",
  "rcgen",
  "rustix",
- "serde_json",
  "tokio",
  "tonic",
  "tracing",
@@ -1468,6 +1466,7 @@ dependencies = [
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
+ "postgres",
  "prost",
  "rcgen",
  "rustix",
@@ -1544,6 +1543,7 @@ dependencies = [
  "kbf-installer",
  "kbf-mdm",
  "kbf-state",
+ "kbf-testkit",
  "kbf-types",
  "plist",
  "rcgen",
@@ -1627,6 +1627,7 @@ dependencies = [
  "hyper-util",
  "kbf-peer",
  "kbf-proto",
+ "kbf-testkit",
  "kbf-types",
  "libc",
  "rcgen",
@@ -1765,9 +1766,12 @@ dependencies = [
 name = "kbf-installer"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "clap",
  "flate2",
  "hex",
+ "hyper",
  "kbf-host",
  "kbf-installer",
  "kbf-update",
@@ -1776,9 +1780,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "subtle",
  "tar",
  "thiserror",
  "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1845,6 +1853,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hex",
+ "kbf-cli",
  "rustix",
  "sha2 0.11.0",
  "thiserror",
@@ -1906,6 +1915,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kbf-mac-session",
+ "kbf-testkit",
  "libc",
  "rcgen",
  "reqwest",
@@ -1990,6 +2000,7 @@ dependencies = [
  "hmac 0.13.0",
  "kbf-objstore",
  "kbf-segments",
+ "kbf-testkit",
  "kbf-threads",
  "kbf-types",
  "md-5",
@@ -2127,13 +2138,16 @@ dependencies = [
  "kbf-state",
  "kbf-storage",
  "kbf-store",
+ "kbf-testkit",
  "kbf-threads",
  "kbf-tier",
  "kbf-tls",
  "kbf-types",
  "kbf-ui",
+ "kbf-update",
  "libc",
  "percent-encoding",
+ "postgres",
  "prost",
  "prost-types",
  "rcgen",
@@ -2148,10 +2162,12 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tower-layer",
+ "tower-service",
  "tracing",
  "tracing-core",
  "tracing-subscriber",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -2207,6 +2223,7 @@ dependencies = [
  "rusqlite",
  "rustix",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -2315,6 +2332,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -2333,33 +2351,12 @@ dependencies = [
 name = "kbf-update"
 version = "0.1.0"
 dependencies = [
- "futures",
- "hex",
  "kbf-proto",
- "kbf-threads",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "thiserror",
  "tokio",
- "tonic",
  "tracing",
-]
-
-[[package]]
-name = "kbf-updater"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "hex",
- "kbf-host",
- "libc",
- "ring",
- "rustix",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "thiserror",
 ]
 
 [[package]]

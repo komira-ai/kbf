@@ -12,6 +12,8 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use kbf_caps::NodeCaps;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_objstore::MemoryStore;
+use kbf_proto::update::UpdateStatus;
+use kbf_proto::update::update_status::State;
 use kbf_proto::worker::{NodeStatus, ServerMessage, XcodeState, XcodeStatus, daemon_message};
 use kbf_server::api::{DRAIN_DEADLINE, Write, write_request};
 use kbf_server::farm::NodeAction;
@@ -252,7 +254,10 @@ const NOT_READY: &str = "Xcode 16B40 (/Applications/Xcode_16.1.app) installed bu
 /// of `null`, an older status kept over a newer one, a node still listed as connected
 /// after its stream ended, an installed Xcode that is not ready missing from
 /// `xcodes` or from `needs_attention` (issue #164), and a node's pinned container
-/// images (`NodeStatus.container_images`) not listed as `software.container_images`.
+/// images (`NodeStatus.container_images`) not listed as `software.container_images`;
+/// a node's `protocol` other than the version its `Hello` named, through the real worker
+/// service, and an envelope without `oldest_protocol` and `protocol_unknown` at its top
+/// level.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_nodes_lists_each_nodes_newest_software() {
     let server = start();
@@ -264,7 +269,8 @@ async fn get_nodes_lists_each_nodes_newest_software() {
     );
     assert_eq!(
         nodes(api).await,
-        json!({ "server": this_build, "nodes": [] })
+        json!({ "server": this_build, "nodes": [],
+                "oldest_protocol": null, "protocol_unknown": 0 })
     );
 
     let before = now_ms();
@@ -301,18 +307,21 @@ async fn get_nodes_lists_each_nodes_newest_software() {
             );
         }
     }
+    // None of these daemons sent an `UpdateStatus`: never idle, and no verdict.
+    let unsupported = json!({ "state": null, "up_to_date": null, "availability": "unsupported" });
     assert_eq!(
         got,
         json!({ "server": this_build, "nodes": [
-            { "node_id": "linux-1", "connected": true, "software": {
+            { "node_id": "linux-1", "connected": true, "protocol": 1, "software": {
                 "os_name": "Ubuntu", "os_version": "24.04", "os_build": "",
                 "kernel": "6.8.0-45-generic", "daemon_version": "0.1.0",
                 "xcode_builds": [], "xcodes": [],
                 "container_images": [LINUX_IMAGE] },
               "needs_attention": [],
+              "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" } },
-            { "node_id": "mac-1", "connected": true, "software": {
+            { "node_id": "mac-1", "connected": true, "protocol": 1, "software": {
                 "os_name": "macOS", "os_version": "15.1", "os_build": "24B83",
                 "kernel": "", "daemon_version": "0.1.0",
                 "xcode_builds": ["16C5032a"],
@@ -324,13 +333,15 @@ async fn get_nodes_lists_each_nodes_newest_software() {
                       "state": "ready", "reason": "", "fix": "" } ],
                 "container_images": [] },
               "needs_attention": [NOT_READY],
+              "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" } },
-            { "node_id": "old-1", "connected": true, "software": null,
+            { "node_id": "old-1", "connected": true, "protocol": 1, "software": null,
               "needs_attention": [],
+              "update": unsupported,
               "placement": { "state": "serving" },
               "phase": { "state": "serving" } },
-        ] })
+        ], "oldest_protocol": 1, "protocol_unknown": 0 })
     );
 
     linux.send(daemon_message::Message::NodeStatus(linux_status(
@@ -431,6 +442,48 @@ async fn a_status_from_a_replaced_stream_is_ignored() {
         software,
         SoftwareView::new(linux_status("new"), software.received_at_unix_ms)
     );
+}
+
+fn update_status(running: &str, state: State) -> UpdateStatus {
+    UpdateStatus {
+        running_commit: running.to_owned(),
+        state: state as i32,
+        ..UpdateStatus::default()
+    }
+}
+
+/// Catches (`pull-updates.md` 6.4: ignored from a replaced stream exactly as `NodeStatus`
+/// is): an `UpdateStatus` from a replaced stream overwriting the newest stream's (a host
+/// that restarted onto a new release would be shown as running the old one, and judged
+/// out of date), one kept for a node that never registered, and the answer to "was it
+/// kept" being wrong. The newest stream's report is the one the detail lists, live.
+///
+/// Mutants seen red: the stream check dropped (the old stream's report wins); the
+/// report kept for an unregistered node (a ghost host listed).
+#[tokio::test]
+async fn an_update_status_from_a_replaced_stream_is_ignored() {
+    let farm = Farm::new(
+        cache(),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let node = WorkerId::new("linux-1");
+    let (old, _old_rx) = register(&farm, "linux-1");
+    let (new, _new_rx) = register(&farm, "linux-1");
+    assert!(farm.update_status(&node, new, update_status("bbbbbbbbbbbb", State::Idle)));
+    assert!(
+        !farm.update_status(&node, old, update_status("aaaaaaaaaaaa", State::Refused)),
+        "a replaced stream's report was kept"
+    );
+    let ghost = WorkerId::new("ghost");
+    assert!(!farm.update_status(&ghost, new, update_status("cccccccccccc", State::Idle)));
+    let hosts = farm.update_hosts();
+    assert_eq!(hosts.len(), 1, "{hosts:?}");
+    let host = serde_json::to_value(&hosts[0]).expect("json");
+    assert_eq!(host["node_id"], "linux-1");
+    assert_eq!(host["running_commit"], "bbbbbbbbbbbb");
+    assert_eq!(host["state"], "idle");
+    assert_eq!(host["availability"], "ok");
 }
 
 /// Catches: `connected` read from something other than the stream's response side

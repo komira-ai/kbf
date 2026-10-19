@@ -6,12 +6,12 @@
 //!
 //! - [`layout`]: the paths ([`layout::Layout`], a directory tree and its
 //!   [`layout::Platform`]): each release in its own directory under
-//!   `/usr/local/kbf/releases/<commit>/`, the `current` and `previous` links beside them,
-//!   the state under `/var/lib/kbf-deploy/` (Linux) or `/var/db/kbf-deploy/` (macOS) and
-//!   its settings under `/etc/kbf-deploy/`.
-//! - [`state`]: `state.json` (the current, previous and staged commits, the one waiting
-//!   to be confirmed, and the order floor), read and written under an exclusive lock and
-//!   replaced whole by a rename.
+//!   `/var/lib/kbf-installer/releases/<commit>/`, the `current` and `previous` links beside them,
+//!   the state under `/var/lib/kbf-installer/` (Linux) or `/var/db/kbf-installer/` (macOS) and
+//!   its trust files under `/usr/share/kbf-installer/trust/`.
+//! - [`state`]: `state.json` (schema 2: the current, previous and staged commits, the one
+//!   waiting to be confirmed, the order floor and the rest), with `state.json.bak` as the last
+//!   good copy, read and written under an exclusive lock and replaced whole by a rename.
 //! - [`release`]: the `install`, `stage`, `rollback` and `gc` verbs.
 //! - [`activate`]: the swap on trial: `activate`, `confirm`, `revert`, the start check
 //!   and the expiry, and the repair of the links after an interrupted verb.
@@ -19,20 +19,26 @@
 //!   named by.
 //!
 //! The root helper of the pull-based updates is [`helper`], run by the `kbf-installer`
-//! binary (`run`, `boot-check`).
+//! binary (`run`, `boot-check`). The binary says what it is in [`version`]: `--version`
+//! and `--version --json` name the commit and the profile it was built with.
 //!
-//! The offline check ([`stage::stage_from_inbox`] runs them in the order that matters,
-//! documented there):
+//! The offline checks of a release a fetch brought in:
 //!
-//! - [`inbox`] and [`offer`]: an entry the unprivileged process wrote, opened without
-//!   following a link, and the offer that names its files and their sha256.
+//! - [`spool`]: a directory the unprivileged process writes (the order spool), opened
+//!   without following a link, each file judged by its descriptor.
 //! - [`attest`]: `gh attestation verify`, pinned, offline, as an unprivileged user.
 //! - [`trust`] and [`settings`]: what the check believes without looking at its content
 //!   (`gh`, the trusted root, the host's settings) and the root-ownership check on it.
+//! - [`stage`]: the verify pipeline, in the order of the contract: size, digest,
+//!   attestation, shape, the binary's own report, the lease check, then the install behind a
+//!   `VERIFIED` marker; behind the [`stage::Verifier`] trait.
 //! - [`archive`], [`binary`] and [`darwin`]: the tarball, the kind of executable and its
 //!   `--version --json`, and on macOS the quarantine attribute and the code signature.
 //! - [`envoy`]: the Envoy of a frontend host, rendered from settings and checked (a library
 //!   for the frontend-update path, with no command line).
+//! - [`proxy`]: the frontend proxy's update machinery, against traits (no socket, no child):
+//!   the swap orchestrator, and in `proxy::api` the update API (routes, bearer-token check,
+//!   the actor that owns one update, idempotent request ids).
 //! - [`run`]: the one place a process is started, behind a trait a test plays.
 //! - [`refusal`]: every way a stage is refused, one enum with a stable code per case.
 //!
@@ -42,26 +48,36 @@
 //! source ref (docs/deploy/host-releases.md, "What is trusted").
 
 pub mod activate;
+pub mod app;
 pub mod archive;
 pub mod attest;
 pub mod binary;
+pub mod cli;
 pub mod darwin;
 pub mod envoy;
+pub mod exit;
 #[cfg(test)]
 mod fixtures;
+#[cfg(any(test, feature = "testkit"))]
+pub mod golden;
 pub mod helper;
-pub mod inbox;
+pub mod installer_toml;
 pub mod layout;
-pub mod offer;
+pub mod proxy;
+pub mod record;
 pub mod refusal;
 pub mod release;
 pub mod run;
 pub mod settings;
+pub mod spool;
 pub mod stage;
 pub mod state;
+pub mod state_v2;
+pub mod status_v2;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod trust;
+pub mod version;
 
 use std::fmt;
 
