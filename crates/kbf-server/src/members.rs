@@ -730,6 +730,7 @@ impl Members {
                 if member.state == MemberState::Joining {
                     tracing::warn!(
                         member = member.id.0,
+                        addr = %member.addr,
                         "a joiner: it is not primary until promoted by the operator (POST /v1/members, state active)"
                     );
                 }

@@ -288,3 +288,77 @@ fn a_restart_does_not_extend_the_bootstrap_window() {
     let c = m.register(&node(3, Progress::CaughtUp)).expect("c");
     assert_eq!(state(&c.map, c.id), Some(MemberState::Joining));
 }
+
+/// Every log line this test binary writes, from one subscriber for the whole process: a
+/// subscriber set for one thread misses a call site another test's thread met first.
+#[derive(Clone, Default)]
+struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Lines {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("lock").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn process_lines() -> &'static Lines {
+    static LINES: std::sync::OnceLock<Lines> = std::sync::OnceLock::new();
+    LINES.get_or_init(|| {
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("one subscriber");
+        lines
+    })
+}
+
+/// Catches: a joiner admitted without a word to the operator. A node that joins a farm
+/// with data waits as `Joining` until it is promoted (`POST /v1/members`, state active),
+/// so its registration logs a warning that names the member and how to promote it; the
+/// first members of an empty farm, which are `Active` at once, log none. The members
+/// here have addresses no other test uses, so their lines are this test's.
+#[test]
+fn a_joiner_is_logged_with_how_to_promote_it_and_a_first_member_is_not() {
+    let lines = process_lines();
+    let s = Hooked::new();
+    let m = members(&s);
+    m.register(&node(201, Progress::CaughtUp)).expect("a");
+    m.register(&node(202, Progress::CaughtUp)).expect("b");
+    s.clock.advance(Duration::from_secs(120));
+    // Member ids are per store and repeat across tests; the address does not.
+    let mine = |i: u32| {
+        let text = String::from_utf8(lines.0.lock().expect("lock").clone()).expect("UTF-8");
+        let tag = format!("addr={}", node(i, Progress::CaughtUp).addr);
+        text.lines()
+            .filter(|line| line.contains(&tag))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        mine(201).is_empty(),
+        "a first member was logged: {:?}",
+        mine(201)
+    );
+    assert!(
+        mine(202).is_empty(),
+        "a first member was logged: {:?}",
+        mine(202)
+    );
+    let c = m.register(&node(203, Progress::CaughtUp)).expect("c");
+    assert_eq!(state(&c.map, c.id), Some(MemberState::Joining));
+    let logged = mine(203);
+    assert!(
+        logged.iter().any(|line| line.contains("WARN")
+            && line.contains("a joiner")
+            && line.contains("POST /v1/members")
+            && line.contains(&format!("member={}", c.id.0))),
+        "{logged:?}"
+    );
+}
