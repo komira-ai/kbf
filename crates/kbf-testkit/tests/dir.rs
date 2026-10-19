@@ -247,3 +247,29 @@ fn child_locked_dir() {
     std::fs::write(locked.join("file"), b"x").expect("file");
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
 }
+
+/// Catches a drop that reports a removal failure when the test already removed its
+/// directory (nothing is left behind, so nothing may be printed): the child removes its
+/// own dir, drops it, and its stderr must be empty.
+#[test]
+fn a_dir_the_test_already_removed_prints_no_report() {
+    let holder = TestDir::under(ROOT, "dir-gone-msg");
+    let out = Command::new(std::env::current_exe().expect("exe"))
+        .args(["--exact", "child_removed_dir", "--ignored", "--nocapture"])
+        .env("KBF_DIR_ROOT", holder.path())
+        .env_remove(KEEP_ENV)
+        .output()
+        .expect("run child");
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(entries(holder.path()).is_empty());
+}
+
+#[test]
+#[ignore = "run by the cases above, in a child process"]
+fn child_removed_dir() {
+    let root = std::env::var("KBF_DIR_ROOT").expect("root");
+    let dir = TestDir::under(root, "child");
+    std::fs::remove_dir_all(dir.path()).expect("remove");
+}
