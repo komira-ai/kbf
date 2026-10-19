@@ -384,6 +384,32 @@ fn a_timeout_whose_revert_cannot_be_written_keeps_the_update_open_until_it_can()
 }
 
 #[test]
+fn an_unreadable_status_file_does_not_hold_an_update_past_its_deadline() {
+    let rig = Rig::new("u8b8-unreadable-deadline");
+    let (mut core, id) = started(&rig);
+    *rig.status.0.lock().unwrap() = Err("torn".to_owned());
+    at(&rig, 899);
+    assert_eq!(
+        body(&mut core).phase,
+        Some(Phase::Accepted),
+        "one second short"
+    );
+    assert_eq!(written(&rig).len(), 1);
+    at(&rig, 900);
+    let s = body(&mut core);
+    assert_eq!(
+        (s.update_id, s.phase, s.failure),
+        (Some(id), Some(Phase::Failed), Some(timeout()))
+    );
+    assert_eq!(written(&rig), order_then_revert());
+    // The file comes back: the ended update stays ended and nothing more is written.
+    rig.set_status(idle());
+    at(&rig, 1_000);
+    assert_eq!(body(&mut core).phase, Some(Phase::Failed));
+    assert_eq!(written(&rig).len(), 2);
+}
+
+#[test]
 fn the_deadline_is_bounded_below_the_age_an_order_lives_in_the_spool() {
     let max = kbf_update::MAX_AGE_SECS;
     assert_eq!(StagingDeadline::MAX_S, max - 1);

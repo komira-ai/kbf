@@ -264,6 +264,12 @@ impl Core {
     /// predecessor wrote the order and died before the release was staged) goes on
     /// waiting for it, with the deadline the predecessor set. An update the supervisor
     /// already has was handed over before the death: it is no longer the API's.
+    ///
+    /// When the predecessor ended the update but could not save the end of the wait, the
+    /// entry still says waiting: the update is taken up, found past its deadline and
+    /// reverted a second time, for the same commit. The design has the root half check that
+    /// the commit a `revert` names is the staged one, so a second order finds nothing to
+    /// drop; the update ends `failed` as before.
     fn resume(&mut self) {
         let Some((entry, waiting)) = self.parts.requests.waiting() else {
             return;
@@ -487,7 +493,8 @@ impl Core {
     }
 
     /// Moves a staging update along by what `status.json` says now. An unreadable file
-    /// changes nothing.
+    /// changes nothing until the deadline, which does not wait for the file: a missing or
+    /// torn `status.json` is one of the ways an update is never staged.
     pub fn advance(&mut self) {
         let Some(mut st) = self.take_staging() else {
             return;
@@ -496,7 +503,11 @@ impl Core {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "status.json is unreadable; the update waits");
-                self.active = Active::Staging(st);
+                if self.parts.clock.wall_s() >= st.deadline_s {
+                    self.time_out(st);
+                } else {
+                    self.active = Active::Staging(st);
+                }
                 return;
             }
         };

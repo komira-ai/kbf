@@ -35,8 +35,9 @@
 //! - none of these within [`core::StagingDeadline`] of the order (default 15 minutes)
 //!   fails the update with `failure{step: stage, reason: timeout}` and a `revert` order
 //!   drops whatever the installer may still stage. This is the end of an update whose
-//!   order was lost, whose refusal `status.json` does not name, or whose installer is
-//!   dead; without it such an update would stay `accepted` and block every later one.
+//!   order was lost, whose refusal `status.json` does not name, whose installer is dead,
+//!   or whose `status.json` cannot be read (the deadline does not wait for the file);
+//!   without it such an update would stay `accepted` and block every later one.
 //!
 //! The phase `verifying` is never reported by the API: `status.json` has no state between
 //! `fetching` and `staged`.
