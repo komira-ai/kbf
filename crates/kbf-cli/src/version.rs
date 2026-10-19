@@ -14,8 +14,9 @@
 //!   version this binary speaks ([`kbf_server::worker`]); the daemon half speaks exactly
 //!   `protocol` (a test pins the two halves equal);
 //! - `profile`: the Cargo profile, `release` or `debug` ([`PROFILE`]);
-//! - `state_schema`: the schema version of the SQLite state file this binary creates and
-//!   reads ([`kbf_state::sqlite::SCHEMA_VERSION`]);
+//! - `state_schema`: the newest Postgres state schema this binary embeds a migration for
+//!   ([`kbf_state::postgres::schema::latest`]); `kbf-installer` migrates the database to it
+//!   before this release starts;
 //! - `version`: the package version.
 //!
 //! Only the two words `--version --json`, in either order and nothing else, ask for it;
@@ -56,7 +57,7 @@ pub fn identity() -> Value {
     );
     fields.insert(
         "state_schema".to_owned(),
-        kbf_state::sqlite::SCHEMA_VERSION.into(),
+        kbf_state::postgres::schema::latest().into(),
     );
     fields.insert("version".to_owned(), env!("CARGO_PKG_VERSION").into());
     Value::Object(fields)
