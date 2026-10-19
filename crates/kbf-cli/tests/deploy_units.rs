@@ -76,11 +76,11 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                     flags.server.api_token_file.as_deref(),
                     Some(std::path::Path::new("/etc/kbf/api-token"))
                 );
+                // The state store is the Postgres of the settings (the example's is the
+                // host's socket), read by kbf's own URI parser: a password-free URI.
                 assert_eq!(
                     flags.server.state_store,
-                    Some(kbf_server::StateStoreUri::Sqlite(
-                        "/var/lib/kbf-server/state/state.db".into()
-                    ))
+                    Some(kbf_server::StateStoreUri::local_postgres())
                 );
             }
             Invocation::Registered(_) => {

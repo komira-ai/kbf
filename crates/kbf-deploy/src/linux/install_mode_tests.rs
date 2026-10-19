@@ -623,22 +623,18 @@ fn optional_environment_files_are_not_required_and_a_directory_is_no_file() {
     );
 }
 
-/// The frontend on a fresh host: its unit, then the SQLite state store's directory made
-/// the server user's alone before the unit starts, and the wait for `/readyz` on the
-/// operator API it now serves (it was refused as not built). Catches the state directory
-/// left for kbf to make (it runs as a user that cannot write under `/var/lib`), a
-/// frontend unit started with no readiness wait, and the frontend refused again.
+/// The frontend on a fresh host: its unit, then the wait for `/readyz` on the operator
+/// API it serves. Its state store is Postgres, which the installer owns, so no state
+/// directory is made for it. Catches a directory made for a SQLite file the frontend no
+/// longer opens, and a frontend unit started with no readiness wait.
 #[test]
-fn the_frontend_unit_is_installed_with_its_state_directory() {
+fn the_frontend_unit_is_installed_with_no_state_directory() {
     let (exec, _) = host("install-mode-frontend");
-    let (uid, gid) = me();
     let a = install(Mode::Frontend, None);
     let (p, _) = plan_here(&exec, &a).expect("plan");
     assert_eq!(
         tail(&p),
         [
-            "mkdir /var/lib/kbf-server (0755)".to_owned(),
-            format!("mkdir /var/lib/kbf-server/state (0700, owner {uid}:{gid})"),
             "run /usr/bin/systemctl daemon-reload".to_owned(),
             "run /usr/bin/systemctl enable kbf-frontend@.service".to_owned(),
             "run /usr/bin/systemctl start kbf-frontend@a.service".to_owned(),
@@ -788,10 +784,10 @@ fn write_ok(r: &Result<(), HostError>) {
 }
 
 /// The directories each unit's flags make, from the rendered units: the storage-and-daemon
-/// unit's metadata log and hot store beside its data directory, the frontend's state
-/// directory (the parent of the SQLite file, from the flag), the all-in-one's none
-/// beyond its own. Catches a flag whose directory is left to kbf, which makes it as a
-/// user that may not, and a state directory taken from the wrong flag.
+/// unit's metadata log and hot store beside its data directory, the frontend's none (its
+/// state store is Postgres), the all-in-one's none beyond its own. Catches a flag whose
+/// directory is left to kbf, which makes it as a user that may not, and a directory
+/// taken from the wrong flag.
 #[test]
 fn the_directories_come_from_the_flags_the_units_carry() {
     let dirs = |mode: Mode| {
@@ -811,7 +807,7 @@ fn the_directories_come_from_the_flags_the_units_carry() {
             "/var/lib/kbf/hot 700",
         ]
     );
-    assert_eq!(dirs(Mode::Frontend), ["/var/lib/kbf-server/state 700"]);
+    assert_eq!(dirs(Mode::Frontend), Vec::<String>::new());
     assert_eq!(
         dirs(Mode::Storage),
         ["/var/lib/kbf-server/raft 700", "/var/lib/kbf/hot 700"]

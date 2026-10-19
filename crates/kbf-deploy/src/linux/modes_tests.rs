@@ -270,9 +270,9 @@ fn each_planted_defect_turns_its_rule_red() {
         ),
         (
             Mode::Frontend,
-            "--state-store=sqlite://@KBF_STATE_DIR@/state.db",
-            "--state-store=postgres://db.example/kbf",
-            "FAIL state-store: kbf-frontend@.service: --state-store is a postgres URI: postgres is not wired yet; the state store is sqlite:///<absolute path>",
+            "--state-store=@KBF_STATE_STORE@",
+            "--state-store=sqlite:///var/lib/kbf-server/state/state.db",
+            "FAIL state-store: kbf-frontend@.service: --state-store is sqlite:// in a frontend unit: the frontend's state store is Postgres (postgres://<host>/<db>), and SQLite is dropped for it",
         ),
         (
             Mode::StorageAndDaemon,

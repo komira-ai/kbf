@@ -189,7 +189,6 @@ fn settings(
         ("KBF_DATA_DIR", at("data")),
         ("KBF_META_DIR", at("meta")),
         ("KBF_HOT_DIR", at("hot")),
-        ("KBF_STATE_DIR", at("state")),
         ("KBF_IMAGES", image.to_owned()),
     ])
 }
@@ -282,7 +281,16 @@ impl Farm {
         let socket = std::env::temp_dir().join(format!("{}.sock", file_name(&dir)));
         let _ = std::fs::remove_file(&socket);
         let control = format!("--handover-socket={}", socket.display());
-        farm.launch(&dir, &root, "frontend", unit.replace(&[control]), None);
+        // The unit's state store is the host's Postgres; the box has none, and a frontend
+        // that hands over opens SQLite only, so the rehearsal gives it a file.
+        let state = format!("--state-store=sqlite://{}/state/state.db", root.display());
+        farm.launch(
+            &dir,
+            &root,
+            "frontend",
+            unit.replace(&[control, state]),
+            None,
+        );
         let line = farm.start_line(0, "kbf-frontend ");
         farm.reapi = field(&line, "reapi=").to_owned();
 
