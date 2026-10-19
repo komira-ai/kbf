@@ -18,8 +18,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::Instant;
 
-use super::lifecycle::Stoppable;
-
 use kbf_installer::CommitId;
 use kbf_installer::proxy::admin::{Admin, AdminError, Deadlines};
 use kbf_installer::proxy::child_http::Headers;

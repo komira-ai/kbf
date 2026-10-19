@@ -13,6 +13,8 @@ use tonic::Code;
 use support::done_within_quiet;
 use tokio::task::JoinHandle;
 
+use lifecycle::Stoppable;
+
 use super::*;
 
 #[path = "managed/admin_client.rs"]
