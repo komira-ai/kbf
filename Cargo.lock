@@ -1484,6 +1484,7 @@ dependencies = [
  "kbf-enroll",
  "kbf-front",
  "kbf-host",
+ "kbf-installer",
  "kbf-node",
  "kbf-peer",
  "kbf-proto",

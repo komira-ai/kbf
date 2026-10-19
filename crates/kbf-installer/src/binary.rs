@@ -4,7 +4,8 @@
 //! The kind is read from the first bytes of the file, never by running it: an attested
 //! file for another platform is refused before anything executes it. The version is what
 //! `kbf --version --json` prints (crates/kbf-cli/src/version.rs): `commit` (the first 12
-//! hex digits), `min_protocol`, `protocol`, `profile`, `state_schema` and `version`.
+//! hex digits), `min_protocol`, `protocol`, `profile`, `state_schema` and `version`, and
+//! `admin_protocol` and `meta_log` when the build has them.
 //! It is a consistency check on a file the attestation already vouches for, not trust.
 
 use std::fmt;
@@ -119,7 +120,16 @@ pub const VERSION_CAP: usize = 4096;
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Version {
+    /// The version of the admin calls between a proxy and the frontend processes it
+    /// starts. `None` for a build that predates the field.
+    #[serde(default)]
+    pub admin_protocol: Option<u64>,
     pub commit: String,
+    /// The highest metadata-log machine version the build runs. Going from release N to
+    /// N-1 is reversible only if `meta_log(N) <= meta_log(N-1)`; `None` (a build that
+    /// predates the field) is unknown, and unknown is not reversible.
+    #[serde(default)]
+    pub meta_log: Option<u64>,
     pub min_protocol: u64,
     pub protocol: u64,
     pub profile: String,
