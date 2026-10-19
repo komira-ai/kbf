@@ -19,9 +19,15 @@ impl Run<'_> {
         let generation = self.sum.generation;
         let mut done: BTreeMap<String, NodeResult> = BTreeMap::new();
         let mut last = self.env.clock.now();
+        // Gate E: the node that confirmed last and when, until the farm is repaired.
+        let mut repair: Option<(String, u64)> = None;
+        let mut stepped = true;
         loop {
             let seen = self.get_json("/v1/nodes").ok().map(|v| nodes::list(&v));
             let now = self.env.clock.now();
+            let under = self.gate_nodes_tick(seen.as_deref(), &done, &mut repair, stepped)?;
+            stepped = false;
+            let mut all_done = false;
             if let Some(list) = &seen {
                 for node in list {
                     if done.contains_key(&node.id) {
@@ -34,11 +40,17 @@ impl Run<'_> {
                     if node.state == "confirmed"
                         && nodes::same_commit(&node.running_commit, &commit)
                     {
+                        // Still unrepaired from an earlier look: this node's step ran first.
+                        if let Some((before, _)) = repair.as_ref().filter(|(_, s)| *s < now) {
+                            return Err(self.gate_confirmed_unrepaired(&node.id, before, under));
+                        }
                         done.insert(
                             node.id.clone(),
                             result(node, "confirmed", now.saturating_sub(last)),
                         );
                         last = now;
+                        repair = Some((node.id.clone(), now));
+                        stepped = true;
                         continue;
                     }
                     // A state left from an older offer is not this deploy's.
@@ -58,6 +70,9 @@ impl Run<'_> {
                         None
                     };
                     if let Some(state) = verdict {
+                        if state == "reverted" {
+                            self.gate_revert(Some(&node.id));
+                        }
                         done.insert(
                             node.id.clone(),
                             result(node, state, now.saturating_sub(last)),
@@ -65,13 +80,17 @@ impl Run<'_> {
                         return Err(self.stop(list, done, &node.id, state));
                     }
                 }
-                // An empty list confirms nothing.
+                // An empty list confirms nothing. Nor does a farm that is still being repaired.
                 if !list.is_empty() && list.iter().all(|n| done.contains_key(&n.id)) {
-                    self.sum.nodes = done.into_values().collect();
-                    return Ok(());
+                    all_done = true;
+                    if repair.is_none() {
+                        self.sum.nodes = done.into_values().collect();
+                        self.gate_revert(None);
+                        return Ok(());
+                    }
                 }
             }
-            if now.saturating_sub(last) >= self.opts.node_timeout.as_secs() {
+            if !all_done && now.saturating_sub(last) >= self.opts.node_timeout.as_secs() {
                 let list = seen.unwrap_or_default();
                 // The first node, in id order, that is still waited for.
                 let stuck = list.iter().find(|n| !done.contains_key(&n.id));
@@ -109,6 +128,7 @@ impl Run<'_> {
     pub(super) fn post_checks(&mut self) -> Result<SmokeResult, Fail> {
         let commit = self.opts.commit.to_string();
         let mut good = true;
+        self.gate_checkpoint("post")?;
 
         let start = self.env.clock.now();
         let members = loop {

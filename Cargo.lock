@@ -1812,6 +1812,7 @@ dependencies = [
  "hex",
  "httparse",
  "hyper",
+ "kbf-gate",
  "kbf-host",
  "kbf-installer",
  "kbf-proto",

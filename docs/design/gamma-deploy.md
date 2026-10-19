@@ -13,7 +13,7 @@ drain system rolls the nodes, one storage node at a time.
 neither. The config must be a regular file nobody else may write (and root-owned); it is not
 read when both flags are given. The token file must be a regular file, mode 0600 or 0400.
 The address must be loopback. Run through `sudo` (the environment carries `SUDO_UID`, set to the
-caller's uid), `deploy` refuses `--api`, `--token-file`, `--config`, `--lock` and `--platform`
+caller's uid), `deploy` refuses `--api`, `--token-file`, `--config`, `--lock`, `--platform` and `--result`
 with exit 2: the caller would choose where root sends the token and which file it reads. Those
 values then come only from the root-owned config. Scope the sudoers rule to the exact argument
 list too, with no wildcard: `deploy --apply --json --commit` followed by forty `[0-9a-f]`
@@ -56,6 +56,39 @@ upgrade frontend first, so choose by the release's protocol facts until the verb
 
 Without `--apply` steps 1 to 3 run read-only (the bundle is checked, not uploaded) and the
 result is `plan`.
+
+## Gates and the result document
+
+An applied deploy is judged by seven gate rows (six gates) and writes them, with the
+deploy's own outcome, to a `kbf-gate` result document: `--result <path>` (a host flag, like
+`--api`: refused through `sudo`; the config's `result` key; default
+`/var/lib/kbf-installer/deploy-result.json`). The document is written `RUNNING` before the
+first request and `FINISHED` before `deploy` returns; a document that cannot be written ends
+the deploy first (`result_unwritable`). `--set-hash <64hex>` is the hash of the release set
+(`SHA256SUMS`); without it the document carries a hash of what `GET /v1/releases` lists for
+the commit. `--settle-timeout-s` (default 600) is gate E's window.
+
+`/metrics` is scraped through the operator API at the preflight, after `desired`, at every
+poll of the node wait, after the frontend step and at the post checks. A measurement that is
+not there is red: a scrape that fails or cannot be parsed, a series that is missing, a
+listing that is cut off. The first red ends the deploy (`gate_red`; exit 1, or 3 in the
+preflight where nothing has changed) and the detail names the gate, the value and the host step.
+
+| Gate row | Reads | Red when |
+|---|---|---|
+| `a_inflight_ids` | `GET /v1/invocations?state=open` at the preflight, at each node's confirmation and after `desired` and the frontend; then `?since=&until=` over the whole deploy | a listing cannot be read (also when the route is off: it needs `--history-objects`) |
+| `b_relay_untraced` | `kbf_frontend_relay_untraced` at every scrape | any scrape is above 0 or lacks the series |
+| `c_farm_class_failures` | every recorded id's `/actions` pages, after the deploy (also after a failed one) | an attempt ended `infra`, `lost` or `lost_*` (client-side filter), or an id cannot be read |
+| `d_lost_blobs`, `d_blob_losses_delta` | `kbf_cache_lost_blobs`; `kbf_cache_blob_losses_total` minus its first scrape | any scrape is above 0 or lacks the series; the counter went backwards |
+| `e_under_replicated` | `kbf_under_replicated_blobs` | not 0 (or absent) at the preflight; not back to 0 within the settle window after a node's step; the next node's step began (`activated_unconfirmed`) or confirmed before that |
+| `f_auto_revert` | node states and the frontend order | a node or the frontend reverted by its own timer |
+
+The deploy never orders a node, so gate E cannot hold the drain system's next step; it
+watches and fails the deploy when the next step ran before the repair.
+
+The one-line summary on standard output stays beside the document until the callers read the
+document instead, and is removed on 2026-12-01. Exit 0 is a `green` document, exit 5
+(`smoke_skipped`) is `extended` (no decision, not a pass), every other exit is `red`.
 
 ## Exit codes
 

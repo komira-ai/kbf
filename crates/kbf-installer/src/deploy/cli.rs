@@ -23,8 +23,11 @@ use crate::CommitId;
 /// that may only run `deploy` names neither.
 pub const CONFIG: &str = "/etc/kbf-installer/deploy.json";
 
+/// Where an applied deploy writes its result document unless the host's config says another.
+pub const RESULT: &str = "/var/lib/kbf-installer/deploy-result.json";
+
 pub const USAGE: &str = "usage: kbf-installer deploy --commit <40hex> [--api <127.0.0.1:port>] \
-[--token-file <path>] [--config <path>] [--cas http(s)://127.0.0.1:port] [--cas-ca <pem>] [--cas-server-name <dns>] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
+[--token-file <path>] [--config <path>] [--result <path>] [--set-hash <64hex>] [--settle-timeout-s N] [--cas http(s)://127.0.0.1:port] [--cas-ca <pem>] [--cas-server-name <dns>] [--apply] [--json] [--bundle -|DIR] [--order nodes-first|frontend-first] \
 [--allow-offline <id>[,<id>...]] [--node-timeout-s N] [--handover-timeout-s N] [--smoke-timeout-s N] \
 [--lock <path>] [--platform linux-x86_64|linux-arm64|darwin-arm64]";
 
@@ -50,8 +53,9 @@ struct Args {
 /// that got here through `sudo` (a deploy account that may only run `deploy`) must not set
 /// them: root would read a file of the caller's choosing and send it to an address of the
 /// caller's choosing. Those values come from the root-owned config.
-const HOST_FLAGS: [&str; 8] = [
+const HOST_FLAGS: [&str; 9] = [
     "--api",
+    "--result",
     "--token-file",
     "--config",
     "--lock",
@@ -72,6 +76,9 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     let mut allow = Vec::new();
     let mut lock_path = PathBuf::from(super::LOCK);
     let mut platform = host_platform().to_owned();
+    let mut result = None;
+    let mut set_hash = None;
+    let mut settle = 600u64;
     let mut config = PathBuf::from(CONFIG);
     let mut secs = [1800u64, 900, 60];
     let mut it = args.iter();
@@ -96,6 +103,17 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
             "--config" => config = PathBuf::from(value("--config")?),
             "--lock" => lock_path = PathBuf::from(value("--lock")?),
             "--platform" => platform = value("--platform")?,
+            "--result" => result = Some(PathBuf::from(value("--result")?)),
+            "--set-hash" => {
+                let text = value("--set-hash")?;
+                set_hash =
+                    Some(kbf_gate::SetHash::parse(&text).map_err(|_| {
+                        format!("--set-hash {text:?} is not 64 lower-case hex digits")
+                    })?);
+            }
+            "--settle-timeout-s" => {
+                settle = number("--settle-timeout-s", &value("--settle-timeout-s")?)?;
+            }
             "--order" => {
                 order = match value("--order")?.as_str() {
                     "nodes-first" => Order::NodesFirst,
@@ -133,6 +151,9 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     )?;
     let api = api.or(conf.api);
     let token_file = token_file.or(conf.token_file);
+    let result = result
+        .or(conf.result)
+        .unwrap_or_else(|| PathBuf::from(RESULT));
     cas.url = cas.url.or(conf.cas);
     cas.ca = cas.ca.or(conf.cas_ca);
     cas.server_name = cas.server_name.or(conf.cas_server_name);
@@ -158,6 +179,9 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
     options.node_timeout = Duration::from_secs(secs[0]);
     options.handover_timeout = Duration::from_secs(secs[1]);
     options.smoke_timeout = Duration::from_secs(secs[2]);
+    options.settle = Duration::from_secs(settle);
+    options.result = Some(result);
+    options.set_hash = set_hash;
     Ok(Args {
         options,
         api,
@@ -173,6 +197,8 @@ fn parse(args: &[String], via_sudo: bool, owner: u32) -> Result<Args, String> {
 struct HostConfig {
     api: Option<String>,
     token_file: Option<PathBuf>,
+    /// Where the result document goes.
+    result: Option<PathBuf>,
     /// The local REAPI listener the CAS smoke uses.
     cas: Option<String>,
     cas_ca: Option<PathBuf>,
@@ -211,6 +237,7 @@ fn read_config(path: &Path, owner: u32, needed: bool) -> Result<HostConfig, Stri
     Ok(HostConfig {
         api: get("api"),
         token_file: get("token_file").map(PathBuf::from),
+        result: get("result").map(PathBuf::from),
         cas: get("cas"),
         cas_ca: get("cas_ca").map(PathBuf::from),
         cas_server_name: get("cas_server_name"),

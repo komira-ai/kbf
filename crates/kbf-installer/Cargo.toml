@@ -40,6 +40,7 @@ futures.workspace = true
 hex.workspace = true
 httparse.workspace = true
 hyper.workspace = true
+kbf-gate.workspace = true
 kbf-host.workspace = true
 kbf-proto.workspace = true
 # `postgres`: the schema's migrations and the client that applies them (`database` module).

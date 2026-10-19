@@ -35,6 +35,9 @@ struct NodeScript {
     /// A state the node reports from an older offer (its generation) until this many seconds
     /// after the desired release is set.
     stale: Option<(&'static str, u64, u64)>,
+    /// Seconds after the desired release is set from which the node shows
+    /// `activated_unconfirmed` (its step has begun) until it confirms.
+    activated_at: Option<u64>,
 }
 
 fn node(id: &'static str, platform: &'static str, fate: Fate) -> NodeScript {
@@ -44,6 +47,7 @@ fn node(id: &'static str, platform: &'static str, fate: Fate) -> NodeScript {
         connected: true,
         fate,
         stale: None,
+        activated_at: None,
     }
 }
 
@@ -104,6 +108,60 @@ struct Farm {
     /// `/v1/nodes` lists no node once the desired release is set.
     empty_after_desired: bool,
     broken: Vec<Broken>,
+    /// `/metrics` at a farm time (seconds): the text, or `None` for a 503.
+    metrics: Box<dyn Fn(u64) -> Option<String>>,
+    builds: Vec<Build>,
+    /// Rows or invocations per page of a listing; 0 is one page.
+    page: usize,
+    /// Calls the fake does not know. It answers them 404 and notes them here, so a test that
+    /// leans on a call the fake never learned fails instead of passing on a silent default.
+    unknown: RefCell<Vec<String>>,
+}
+
+/// A build the fake farm knows: running from `from` to `to` (seconds), whose actions had
+/// attempts that ended in `classes`.
+#[derive(Clone)]
+struct Build {
+    id: &'static str,
+    from: u64,
+    to: Option<u64>,
+    classes: Vec<&'static str>,
+}
+
+/// What a healthy farm says on `/metrics`.
+fn healthy() -> Gauges {
+    Gauges {
+        relay_untraced: Some(0.0),
+        lost_blobs: Some(0.0),
+        losses_total: Some(3.0),
+        under_replicated: Some(0.0),
+    }
+}
+
+/// The four series the gates read; `None` leaves the series out of the scrape.
+#[derive(Clone, Copy)]
+struct Gauges {
+    relay_untraced: Option<f64>,
+    lost_blobs: Option<f64>,
+    losses_total: Option<f64>,
+    under_replicated: Option<f64>,
+}
+
+impl Gauges {
+    fn text(&self) -> String {
+        let mut out = String::from("# a scrape\nkbf_other_total 5\n");
+        for (name, v) in [
+            ("kbf_frontend_relay_untraced", self.relay_untraced),
+            ("kbf_cache_lost_blobs", self.lost_blobs),
+            ("kbf_cache_blob_losses_total", self.losses_total),
+            ("kbf_under_replicated_blobs", self.under_replicated),
+        ] {
+            if let Some(v) = v {
+                out.push_str(&format!("{name} {v}\n"));
+            }
+        }
+        out
+    }
 }
 
 impl Farm {
@@ -129,7 +187,86 @@ impl Farm {
             nodes_key_missing: false,
             empty_after_desired: false,
             broken: Vec::new(),
+            metrics: Box::new(|_| Some(healthy().text())),
+            builds: Vec::new(),
+            page: 0,
+            unknown: RefCell::new(Vec::new()),
         }
+    }
+
+    /// `/metrics` is the same at every scrape.
+    fn rfc3339(secs: u64) -> String {
+        summary::utc(1_790_000_000 + secs)
+    }
+
+    /// The pages of `all` for `GET path?...&page_token=`, as `{key: [...], next_page}`.
+    fn paged(&self, path: &str, key: &str, query: &str, all: Vec<Value>) -> Value {
+        let token = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("page_token="))
+            .and_then(|t| t.parse::<usize>().ok())
+            .unwrap_or(0);
+        let size = if self.page == 0 {
+            all.len().max(1)
+        } else {
+            self.page
+        };
+        let rest: Vec<Value> = all.iter().skip(token).cloned().collect();
+        let this: Vec<Value> = rest.iter().take(size).cloned().collect();
+        let mut body = json!({ key: this });
+        if rest.len() > size {
+            let base: Vec<&str> = query
+                .split('&')
+                .filter(|kv| !kv.starts_with("page_token="))
+                .collect();
+            body["next_page"] = json!(format!(
+                "{path}?{}&page_token={}",
+                base.join("&"),
+                token + size
+            ));
+        }
+        body
+    }
+
+    fn invocations(&self, r: &Request, now: u64) -> Option<Value> {
+        let (path, query) = r.path.split_once('?').unwrap_or((&r.path, ""));
+        let param = |k: &str| {
+            query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+        };
+        if path == "/v1/invocations" {
+            let (since, until) = (param("since"), param("until"));
+            let open = param("state") == Some("open");
+            if (since.is_none() || until.is_none()) && !open {
+                return None;
+            }
+            let items: Vec<Value> = self
+                .builds
+                .iter()
+                .filter(|b| b.from <= now)
+                .filter(|b| !open || b.to.is_none_or(|t| now < t))
+                .filter(|b| {
+                    let seen = Farm::rfc3339(b.from);
+                    since.is_none_or(|s| s <= seen.as_str())
+                        && until.is_none_or(|u| seen.as_str() <= u)
+                })
+                .map(|b| json!({"id": b.id, "state": "open", "complete": true}))
+                .collect();
+            return Some(self.paged(path, "invocations", query, items));
+        }
+        let id = path
+            .strip_prefix("/v1/invocations/")?
+            .strip_suffix("/actions")?;
+        let build = self.builds.iter().find(|b| b.id == id)?;
+        let mut rows: Vec<Value> = vec![json!({"attempts": [{"end": {"result": "ok"}}]})];
+        rows.extend(
+            build
+                .classes
+                .iter()
+                .map(|c| json!({"attempts": [{"end": {"failure": c, "reason": "x"}}]})),
+        );
+        Some(self.paged(path, "actions", query, rows))
     }
 
     fn requests(&self, prefix: &str) -> usize {
@@ -157,6 +294,9 @@ impl Farm {
             (None, _) => ("confirmed", &OLD[..12], "", 7),
             (Some(_), Fate::ConfirmedOnOld) => ("confirmed", &OLD[..12], "", 8),
             (Some(e), Fate::Confirm(at)) if e >= *at => ("confirmed", &TARGET[..12], "", 8),
+            (Some(e), Fate::Confirm(_)) if n.activated_at.is_some_and(|a| e >= a) => {
+                ("activated_unconfirmed", &TARGET[..12], "", 8)
+            }
             (Some(e), Fate::Revert(at)) if e >= *at => ("reverted", &OLD[..12], "", 8),
             (Some(e), Fate::Refuse(why, at)) if e >= *at => ("refused", &OLD[..12], *why, 8),
             (Some(_), _) => ("staged", &OLD[..12], "", 8),
@@ -301,7 +441,21 @@ impl Operator for Farm {
                 Farm::reply(202, json!({"order_id": 2}))
             }
             ("GET", "/readyz") => Farm::reply(if self.ready { 200 } else { 503 }, json!({})),
-            _ => Farm::reply(404, json!({})),
+            ("GET", "/metrics") => match (self.metrics)(now) {
+                Some(text) => Ok(Reply {
+                    status: 200,
+                    body: text.into_bytes(),
+                }),
+                None => Farm::reply(503, json!({})),
+            },
+            ("GET", p) if p.starts_with("/v1/invocations") => match self.invocations(r, now) {
+                Some(body) => Farm::reply(200, body),
+                None => Farm::reply(404, json!({"error": "no_record"})),
+            },
+            _ => {
+                self.unknown.borrow_mut().push(call);
+                Farm::reply(404, json!({}))
+            }
         }
     }
 }
@@ -375,6 +529,7 @@ fn farm(nodes: Vec<NodeScript>) -> Farm {
 }
 
 mod gaps;
+mod gates;
 
 // ---- the whole deploy --------------------------------------------------------------
 
@@ -1159,7 +1314,7 @@ mod cli_tests {
     }
 
     /// Proves a caller that came through sudo cannot aim the deploy: each of --api,
-    /// --token-file, --config, --lock, --platform and --cas is a usage error (exit 2) before the
+    /// --token-file, --config, --lock, --platform, --cas and --result is a usage error (exit 2) before the
     /// token is read or anything is sent, and the flags the workflow sends are not. Catches
     /// the deploy account sending a root-readable file as a bearer token to its own listener.
     #[test]
@@ -1172,6 +1327,7 @@ mod cli_tests {
             ("--lock", "/var/tmp/x/lock"),
             ("--platform", "linux-x86_64"),
             ("--cas", "http://127.0.0.1:1"),
+            ("--result", "/etc/cron.d/x"),
         ] {
             let list = args(&["--commit", &commit, flag, value]);
             let (mut out, mut err) = (Vec::new(), Vec::new());

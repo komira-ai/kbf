@@ -53,6 +53,8 @@ impl Rig {
             self.token.to_str().unwrap(),
             "--lock",
             lock.to_str().unwrap(),
+            "--result",
+            self.dir.join("result.json").to_str().unwrap(),
         ]
         .map(str::to_owned)
         .to_vec()
@@ -92,8 +94,8 @@ fn absent_frontend(rig: &Rig) -> FrontendConfig {
 /// and a positive value, the order names and a list of offline nodes are accepted. Catches a
 /// flag whose value is dropped, parsed as another flag's, or not parsed.
 ///
-/// Mutants planted: `--handover-timeout-s` or `--smoke-timeout-s` ignoring its value (the
-/// zero passes); `frontend-first` refused.
+/// Mutants planted: `--handover-timeout-s`, `--smoke-timeout-s` or `--settle-timeout-s` ignoring
+/// its value (the zero passes); `--set-hash` accepted unparsed; `frontend-first` refused.
 #[test]
 fn every_flag_takes_its_value() {
     let rig = Rig::new("values");
@@ -101,6 +103,7 @@ fn every_flag_takes_its_value() {
         "--node-timeout-s",
         "--handover-timeout-s",
         "--smoke-timeout-s",
+        "--settle-timeout-s",
     ] {
         let (code, out, err) = rig.go(&[flag, "0"], b"", false);
         assert_eq!((code, out.as_str()), (2, ""), "{flag}");
@@ -113,6 +116,12 @@ fn every_flag_takes_its_value() {
         assert_ne!(code, 2, "{order}: {err}");
     }
     let (code, _, err) = rig.go(&["--allow-offline", "n1,n2"], b"", false);
+    assert_ne!(code, 2, "{err}");
+    // The set hash is 64 lower-case hex digits.
+    let (code, out, err) = rig.go(&["--set-hash", "ABC"], b"", false);
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(err.contains("--set-hash"), "{err}");
+    let (code, _, err) = rig.go(&["--set-hash", &"ab".repeat(32)], b"", false);
     assert_ne!(code, 2, "{err}");
 }
 

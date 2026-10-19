@@ -22,8 +22,10 @@ mod cli_flag_tests;
 mod frontend_addr;
 #[cfg(test)]
 mod frontend_addr_tests;
+mod gates;
 mod nodes;
 mod post;
+mod record;
 pub mod smoke;
 #[cfg(test)]
 pub(super) mod smoke_tests;
@@ -35,13 +37,14 @@ use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::CommitId;
 use api::{Operator, Reply, Request};
+use gates::Gates;
 pub use summary::{Exit, NodeResult, PostResult, Previous, Step, Summary};
 
 /// Where the installer's lock is.
@@ -128,6 +131,13 @@ pub struct Options {
     pub poll: Duration,
     /// How long members have to become active after the roll.
     pub members_timeout: Duration,
+    /// Gate E: how long after a node step the farm has to be fully replicated again.
+    pub settle: Duration,
+    /// Where the result document is written; with `None` none is (a unit test of the logic).
+    pub result: Option<PathBuf>,
+    /// The hash of the release set (`SHA256SUMS`) when the caller has it; else the document
+    /// carries one derived from what the store holds.
+    pub set_hash: Option<kbf_gate::SetHash>,
 }
 
 impl Options {
@@ -143,6 +153,9 @@ impl Options {
             host_platform: host_platform.to_owned(),
             poll: Duration::from_secs(5),
             members_timeout: Duration::from_secs(120),
+            settle: Duration::from_secs(600),
+            result: None,
+            set_hash: None,
         }
     }
 }
@@ -212,6 +225,7 @@ pub(crate) struct Run<'a> {
     pub env: &'a Env<'a>,
     pub opts: &'a Options,
     pub sum: Summary,
+    pub gates: Gates,
 }
 
 impl Run<'_> {
@@ -251,17 +265,41 @@ impl Run<'_> {
 
 /// Run a deploy to its end and return the summary. `bundle` is the tar on standard input,
 /// if there is one.
+///
+/// An applied deploy also writes its result document (`opts.result`): `RUNNING` before the
+/// first request and `FINISHED` before this function returns, whatever the end, so the caller
+/// may `exit` at once. The one-line summary stays beside it until the exit codes 0 to 5 are
+/// mapped to the document's statuses by the callers; it is removed on 2026-12-01 (the
+/// document is the only format after that).
 pub fn deploy(env: &Env, opts: &Options, bundle: Option<&mut dyn Read>) -> Summary {
+    let began = env.clock.now();
     let mut run = Run {
         env,
         opts,
-        sum: Summary::new(&opts.commit, env.clock.now()),
+        sum: Summary::new(&opts.commit, began),
+        gates: Gates::new(opts.apply),
     };
-    let outcome = run.go(bundle);
+    let record = match record::open(&run) {
+        Ok(record) => record,
+        Err(f) => {
+            run.sum.ended = summary::utc(env.clock.now());
+            run.sum.end(f.exit, f.reason, &f.detail);
+            return run.sum;
+        }
+    };
+    let mut outcome = run.go(bundle);
+    // The end of the gates runs after a failed deploy too, so the document is whole.
+    let ended = run.gate_finish();
+    if outcome.is_ok() {
+        outcome = ended;
+    }
     run.sum.ended = summary::utc(env.clock.now());
     match outcome {
         Ok(()) => {}
         Err(f) => run.sum.end(f.exit, f.reason, &f.detail),
+    }
+    if let Some(record) = record {
+        record::seal(&mut run, record, began);
     }
     run.sum
 }
@@ -280,7 +318,10 @@ impl Run<'_> {
         if self.opts.order == Order::FrontendFirst {
             self.step("frontend", |r| r.update_frontend())?;
         }
-        self.step("desired", |r| r.set_desired())?;
+        self.step("desired", |r| {
+            r.set_desired()?;
+            r.gate_checkpoint("desired")
+        })?;
         self.step("nodes", |r| r.wait_nodes())?;
         if self.opts.order == Order::NodesFirst {
             self.step("frontend", |r| r.update_frontend())?;
@@ -409,6 +450,13 @@ impl Run<'_> {
                 "a frontend update is in flight",
             ));
         }
+        self.gates.derived_set_hash = nodes::set_hash(&releases, self.opts.commit.as_str());
+        // The gates start from a farm that is healthy now: storage fully replicated, no lost
+        // blob, nothing untraced. Nothing has been changed yet, so a red is a refusal.
+        self.gate_step("preflight");
+        let under = self.gate_scrape(Exit::Refused)?;
+        self.gate_under_replicated(under, Exit::Refused)?;
+        self.gate_snapshot(Exit::Refused)?;
         Ok(wanted)
     }
 
@@ -497,8 +545,14 @@ impl Run<'_> {
                     state: state.clone(),
                 });
                 match state.as_str() {
-                    "confirmed" => return Ok(()),
+                    "confirmed" => {
+                        self.gate_step("frontend");
+                        self.gate_revert(None);
+                        return self.gate_checkpoint("frontend");
+                    }
                     "reverted" => {
+                        self.gate_step("frontend");
+                        self.gate_revert(Some("frontend"));
                         return Err(fail(
                             Exit::Failed,
                             "frontend_reverted",
