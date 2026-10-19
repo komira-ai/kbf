@@ -161,6 +161,16 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
         ),
         fenced(Keys::Under("unfilled/"), "members", "unfilled/1"),
         fenced(
+            Keys::Exactly("meta/members_forming"),
+            "members (bootstrap window)",
+            "meta/members_forming",
+        ),
+        fenced(
+            Keys::Under("unfilled/"),
+            "members (joiner mark)",
+            "unfilled/3",
+        ),
+        fenced(
             Keys::Under("deny/"),
             "members and kbf-enroll-registry",
             "deny/node/a",
