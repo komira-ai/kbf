@@ -1,4 +1,4 @@
-//! The object-store keys of a storage node: fetched over its mutual-TLS session and held
+//! The registered cold store of a storage node: fetched over its mutual-TLS session and held
 //! in memory only.
 
 mod support;
@@ -60,15 +60,22 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[tokio::test]
-async fn a_storage_node_gets_the_keys_over_its_certificate_and_they_reach_no_file() {
+async fn a_storage_node_gets_the_store_over_its_certificate_and_it_reaches_no_file() {
     let (root, running, store) = enrolled("keys", &[Role::Storage, Role::Daemon]).await;
-    let keys = fetch(&store, &worker(&running)).await.expect("keys");
-    assert_eq!(keys.access_key_id(), "AKIATESTKEY0000");
-    assert_eq!(keys.secret_access_key(), "secret-that-must-stay-in-memory");
+    let got = fetch(&store, &worker(&running), 0)
+        .await
+        .expect("the store");
+    assert_eq!(got.generation, 3);
+    let config = got.config.as_ref().expect("a store");
+    assert_eq!(config.access_key_id, "AKIATESTKEY0000");
+    assert_eq!(config.secret_access_key, "secret-that-must-stay-in-memory");
+    assert_eq!((config.bucket.as_str(), config.secret_version), ("bkt", 3));
     assert_eq!(running.fake.keys_calls(), 1);
 
-    // Catches: a Debug or log line that prints the secret.
-    assert_eq!(format!("{keys:?}"), "Keys(..)");
+    // Catches: a Debug or log line that prints the secret, of the store or of the answer.
+    assert!(!format!("{config:?}").contains("secret-that-must-stay"));
+    assert!(!format!("{got:?}").contains("secret-that-must-stay"));
+    assert!(format!("{got:?}").contains("Secret(..)"));
 
     // Catches: the keys landing in a file (a cache, a state file, a temp file).
     let mut all = Vec::new();
@@ -83,17 +90,34 @@ async fn a_storage_node_gets_the_keys_over_its_certificate_and_they_reach_no_fil
         );
         assert!(!text.contains("AKIATESTKEY0000"), "{}", path.display());
     }
+}
 
-    // They are fetched again on demand (every start, and when the store refuses them).
-    fetch(&store, &worker(&running)).await.expect("again");
-    assert_eq!(running.fake.keys_calls(), 2);
+/// Catches: the node's generation not sent (the frontend would always answer whole), an
+/// unchanged answer that carries the store, and a different generation, lower ones included,
+/// that does not: the node holds 3 and the frontend is at 3, then at 2 (a restored state).
+#[tokio::test]
+async fn the_node_sends_the_generation_it_holds_and_is_told_when_it_is_current() {
+    let (_root, running, store) = enrolled("keys-have", &[Role::Storage]).await;
+    let same = fetch(&store, &worker(&running), 3).await.expect("same");
+    assert_eq!(running.fake.last_have(), 3);
+    assert_eq!((same.generation, same.config.is_none()), (3, true));
+
+    running.fake.set_store_generation(2);
+    let back = fetch(&store, &worker(&running), 3).await.expect("back");
+    assert_eq!(back.generation, 2);
+    assert!(back.config.is_some(), "a lower generation is fetched whole");
+
+    running.fake.set_store_generation(0);
+    let none = fetch(&store, &worker(&running), 0).await.expect("none");
+    assert_eq!((none.generation, none.config.is_none()), (0, true));
+    assert_eq!(running.fake.keys_calls(), 3);
 }
 
 #[tokio::test]
 async fn a_revoked_node_is_refused_the_keys() {
     let (_root, running, store) = enrolled("keys-revoked", &[Role::Storage]).await;
     running.fake.revoke_keys();
-    let err = fetch(&store, &worker(&running)).await.unwrap_err();
+    let err = fetch(&store, &worker(&running), 0).await.unwrap_err();
     assert!(
         matches!(&err, KeysError::Call(CallError::Status(s)) if s.code() == tonic::Code::PermissionDenied),
         "{err:?}"
@@ -103,7 +127,7 @@ async fn a_revoked_node_is_refused_the_keys() {
 #[tokio::test]
 async fn a_node_without_a_storage_identity_has_nothing_to_ask_with() {
     let (_root, running, store) = enrolled("keys-daemon-only", &[Role::Daemon]).await;
-    let err = fetch(&store, &worker(&running)).await.unwrap_err();
+    let err = fetch(&store, &worker(&running), 0).await.unwrap_err();
     assert!(
         matches!(&err, KeysError::Identity(m) if m.contains("storage.pem")),
         "{err}"
@@ -114,10 +138,10 @@ async fn a_node_without_a_storage_identity_has_nothing_to_ask_with() {
 #[tokio::test]
 async fn an_endpoint_that_is_not_a_url_or_not_listening_is_a_transport_error() {
     let (_root, running, store) = enrolled("keys-endpoint", &[Role::Storage]).await;
-    let err = fetch(&store, "not a url").await.unwrap_err();
+    let err = fetch(&store, "not a url", 0).await.unwrap_err();
     assert!(matches!(err, KeysError::Transport(_)), "{err}");
     let closed = kbf_testkit::port::dead_addr().port();
-    let err = fetch(&store, &format!("https://localhost:{closed}"))
+    let err = fetch(&store, &format!("https://localhost:{closed}"), 0)
         .await
         .unwrap_err();
     assert!(matches!(err, KeysError::Transport(_)), "{err}");

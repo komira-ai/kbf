@@ -135,6 +135,7 @@ fn version_json_reports_the_build_identity() {
         assert_eq!(
             fields,
             [
+                "admin_protocol",
                 "commit",
                 "min_protocol",
                 "profile",
@@ -145,6 +146,7 @@ fn version_json_reports_the_build_identity() {
             "{out}"
         );
         assert_eq!(v["commit"], kbf_server::BUILD_COMMIT);
+        assert_eq!(v["admin_protocol"], kbf_server::managed::ADMIN_PROTOCOL);
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         let profile = if cfg!(debug_assertions) {
             "debug"

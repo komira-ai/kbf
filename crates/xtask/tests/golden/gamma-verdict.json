@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "stage": "gamma",
+  "commit": "357494ac6b0fecfa065d6c8fa038cfca9ae9c13f",
+  "set_hash": "4a4b874a1e9776a52e38fd82a053825f309f46187a803a0fc0c6670c6670e768",
+  "run_id": "bake-0001",
+  "attempt": 1,
+  "status": "green",
+  "started": 1000,
+  "finished": 90000,
+  "desired_generation": 7,
+  "deploy": {
+    "start": 1100,
+    "end": 1900
+  },
+  "bake": {
+    "start": 2000,
+    "end": 88400
+  },
+  "load": {
+    "actions": {
+      "measured": 1000,
+      "required": 1000
+    },
+    "builds": {
+      "measured": 12,
+      "required": 10
+    },
+    "hours": {
+      "measured": 3,
+      "required": 3
+    }
+  },
+  "waivers": [],
+  "gates": [
+    {
+      "name": "lost-blobs",
+      "measured": 0.0,
+      "threshold": {
+        "at_most": 0.0
+      },
+      "verdict": "green",
+      "started": 2000,
+      "finished": 88400
+    }
+  ],
+  "note": null,
+  "tag": "v0.10.0",
+  "not_reversible": [],
+  "escapes": [],
+  "withdrawn": []
+}

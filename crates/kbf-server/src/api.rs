@@ -576,7 +576,7 @@ const fn denied_failure(e: &MembershipError) -> StatusCode {
 }
 
 /// The answer of a server that keeps no storage members.
-fn no_members() -> Response {
+pub(crate) fn no_members() -> Response {
     error(
         StatusCode::NOT_FOUND,
         "this server keeps no storage members: it has no --state-store",
