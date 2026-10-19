@@ -131,3 +131,119 @@ fn child_passes_with_a_dir() {
     let dir = TestDir::under(root, "child");
     std::fs::write(dir.join("evidence"), b"e").expect("file");
 }
+
+/// Catches the `AsRef<Path>` impl returning another path than the directory.
+#[test]
+fn a_dir_is_usable_as_a_path_argument() {
+    fn path_of(p: impl AsRef<Path>) -> PathBuf {
+        p.as_ref().to_path_buf()
+    }
+    let dir = TestDir::under(ROOT, "dir-asref");
+    assert_eq!(path_of(&dir), dir.path());
+}
+
+/// Catches a drop that panics when the test already removed its directory (a panic in
+/// a drop during unwinding aborts the process, so this must be a plain return).
+#[test]
+fn a_dir_the_test_already_removed_drops_silently() {
+    let dir = TestDir::under(ROOT, "dir-gone");
+    std::fs::remove_dir_all(dir.path()).expect("remove");
+    let path = dir.path().to_path_buf();
+    drop(dir);
+    assert!(!path.exists());
+}
+
+/// Restores write permission to every `<entry>/locked` under a holder when dropped, so
+/// that the holder's own removal succeeds even when an assertion failed first (a
+/// locked subtree left in the target directory would stop `cargo clean`). Declare it
+/// after the holder, so it drops first.
+struct Unlock<'a>(&'a Path);
+
+impl Drop for Unlock<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        for entry in entries(self.0) {
+            let _ = std::fs::set_permissions(
+                entry.join("locked"),
+                std::fs::Permissions::from_mode(0o700),
+            );
+        }
+    }
+}
+
+/// Catches a removal failure that is swallowed (the person must be told which
+/// directory is left behind) or that panics. A subtree without write permission
+/// cannot be emptied, so the removal fails; the permission is restored afterwards so
+/// that the holder, and its own removal, still succeed.
+#[test]
+fn a_dir_that_cannot_be_removed_is_reported_not_fatal() {
+    use std::os::unix::fs::PermissionsExt;
+    let holder = TestDir::under(ROOT, "dir-stuck");
+    let _unlock = Unlock(holder.path());
+    let dir = TestDir::under(holder.path(), "case");
+    let locked = dir.join("locked");
+    std::fs::create_dir(&locked).expect("locked");
+    std::fs::write(locked.join("file"), b"x").expect("file");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
+    let path = dir.path().to_path_buf();
+    drop(dir);
+    // Running as a user that ignores permissions would have removed it; then there is
+    // nothing to check and the case fails loudly rather than passing without a check.
+    assert!(
+        locked.join("file").exists(),
+        "the removal succeeded despite a read-only subtree (running as root?)"
+    );
+    assert!(path.exists());
+}
+
+/// Catches the report of a failed removal going unprinted: the child case leaves a
+/// locked subtree, and its stderr names the directory.
+#[test]
+fn the_report_of_a_failed_removal_names_the_directory() {
+    let holder = TestDir::under(ROOT, "dir-stuck-msg");
+    let _unlock = Unlock(holder.path());
+    let out = Command::new(std::env::current_exe().expect("exe"))
+        .args(["--exact", "child_locked_dir", "--ignored", "--nocapture"])
+        .env("KBF_DIR_ROOT", holder.path())
+        .output()
+        .expect("run child");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let left = entries(holder.path());
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(
+        stderr.contains(&format!("could not remove test dir {}", left[0].display())),
+        "{stderr}"
+    );
+}
+
+/// Catches a failure to make the directory that does not stop the test with a message
+/// naming the path: the root here is a file, so no directory can be made under it.
+#[test]
+fn a_dir_that_cannot_be_made_panics_naming_the_path() {
+    let holder = TestDir::under(ROOT, "dir-nomake");
+    let file = holder.join("not-a-dir");
+    std::fs::write(&file, b"x").expect("file");
+    let caught = std::panic::catch_unwind(|| TestDir::under(&file, "case"));
+    let payload = caught.expect_err("making a dir under a file must panic");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .expect("a formatted message");
+    assert!(
+        message.starts_with(&format!("make test dir {}", file.display())),
+        "{message}"
+    );
+}
+
+#[test]
+#[ignore = "run by the cases above, in a child process"]
+fn child_locked_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::var("KBF_DIR_ROOT").expect("root");
+    let dir = TestDir::under(root, "child");
+    let locked = dir.join("locked");
+    std::fs::create_dir(&locked).expect("locked");
+    std::fs::write(locked.join("file"), b"x").expect("file");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
+}
