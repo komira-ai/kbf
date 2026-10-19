@@ -11,7 +11,9 @@ use super::{State, wire_lease};
 use crate::fleet::quarantine_change;
 
 /// What a `Hello` says about its node that the scheduler takes: the capacity placement
-/// may book, the capabilities placement matches, and the node's phase.
+/// may book, the capabilities placement matches, and the node's phase. It also carries
+/// the protocol version the node speaks, which the scheduler does not take: the farm
+/// keeps it for `GET /v1/nodes`.
 #[derive(Clone, Debug)]
 pub struct Reported {
     /// What placement may book.
@@ -20,16 +22,22 @@ pub struct Reported {
     pub caps: NodeCaps,
     /// What it is doing besides running leases.
     pub phase: NodePhase,
+    /// The `kbf.worker.v1` version its `Hello` named; `None` if it named none
+    /// ([`crate::worker::named_protocol`]). Only the first `Hello` of a stream counts: it
+    /// is the one `Welcome` answers, and a resent one is not negotiated again
+    /// ([`crate::Farm::resize`]).
+    pub protocol: Option<u32>,
 }
 
 impl Reported {
-    /// A serving node with `capacity` and `caps`.
+    /// A serving node with `capacity` and `caps`, whose protocol version is not named.
     #[must_use]
     pub const fn serving(capacity: Resources, caps: NodeCaps) -> Self {
         Self {
             capacity,
             caps,
             phase: NodePhase::Serving,
+            protocol: None,
         }
     }
 }
