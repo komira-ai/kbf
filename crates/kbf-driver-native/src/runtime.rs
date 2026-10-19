@@ -1437,7 +1437,8 @@ mod tests {
             !rustix::process::geteuid().is_root(),
             "run this test as a user"
         );
-        let scratch = crate::unit_dir("runtime-pool");
+        let dir = crate::unit_dir("runtime-pool");
+        let scratch = dir.join("root");
         let mut config = NativeConfig::new(scratch.to_path_buf());
         config.pool = crate::slots::Pool::provisioned(1, 700).ok();
         let refused = NativeRuntime::new(config, Arc::new(NoCas)).expect_err("started");

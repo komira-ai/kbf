@@ -86,6 +86,8 @@ pub struct Fake {
     nonce: String,
     /// Last: removed after the runtime and the rest of the fake are gone.
     pub dir: super::Scratch,
+    /// More directories the test gives the fake to remove, after `dir`.
+    extras: Vec<super::Scratch>,
 }
 
 /// The id files of a daemon user with one range of 65,536 subordinate ids at 100000.
@@ -185,7 +187,15 @@ impl Fake {
             runtime,
             nonce,
             dir,
+            extras: Vec::new(),
         }
+    }
+
+    /// This fake, removing `dir` too when it is dropped.
+    #[must_use]
+    pub fn owning(mut self, dir: super::Scratch) -> Self {
+        self.extras.push(dir);
+        self
     }
 
     pub fn knob(&self, name: &str, contents: &str) {

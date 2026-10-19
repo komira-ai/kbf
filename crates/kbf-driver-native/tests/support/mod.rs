@@ -106,8 +106,18 @@ impl Cas for MemoryCas {
 pub fn act() -> PathBuf {
     static LINK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     LINK.get_or_init(|| {
-        let link = scratch("act").join(kbf_testkit::act::NAME);
-        kbf_testkit::act::link_self(&link).expect("link");
+        // One directory for every run of this binary (a link that lives as long as the
+        // process cannot be a `TestDir`): remade by rename, so no run leaves another.
+        let exe = std::env::current_exe().expect("test binary");
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("kbf-driver-native-act")
+            .join(exe.file_name().expect("a file name"));
+        std::fs::create_dir_all(&dir).expect("act directory");
+        let link = dir.join(kbf_testkit::act::NAME);
+        let made = dir.join(format!(".act-{}", std::process::id()));
+        let _ = std::fs::remove_file(&made);
+        kbf_testkit::act::link_self(&made).expect("link");
+        std::fs::rename(&made, &link).expect("place the link");
         link
     })
     .clone()

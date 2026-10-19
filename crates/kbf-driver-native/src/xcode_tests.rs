@@ -44,12 +44,8 @@ pub(crate) fn fake(dir: &Path, name: &str, script: &str) -> PathBuf {
 /// runs kbf-testkit's act steps (`kbf_testkit::act`) instead of the tests.
 pub(crate) fn act() -> PathBuf {
     static LINK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    LINK.get_or_init(|| {
-        let link = scratch("act").join(kbf_testkit::act::NAME);
-        kbf_testkit::act::link_self(&link).expect("link");
-        link
-    })
-    .clone()
+    LINK.get_or_init(|| crate::act_link(&crate::unit_root().join("act")))
+        .clone()
 }
 
 /// Makes `path` a link to this test binary, which answers as the fake tool its base

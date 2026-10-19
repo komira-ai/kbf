@@ -35,6 +35,7 @@ fn cached(name: &str) -> Fake {
     Fake::with(name, |config| {
         config.cache = Some(cache(&dir, &config.scratch))
     })
+    .owning(dir)
 }
 
 /// The inode of the cache's entry of `bytes` (plain).
@@ -185,6 +186,7 @@ fn treed(name: &str) -> Fake {
         ));
         config.cache = Some(given);
     })
+    .owning(dir)
 }
 
 /// The bind mounts of shared trees in the last bundle: source, destination and options

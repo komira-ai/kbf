@@ -157,12 +157,30 @@ kbf_daemon::keeper_test_hook!();
 /// directory), removed when it is dropped. Declare it before anything that runs in it.
 #[cfg(test)]
 pub(crate) fn unit_dir(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(unit_root(), name)
+}
+
+/// The directory the unit tests' scratch directories are made in.
+#[cfg(test)]
+pub(crate) fn unit_root() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("test binary");
-    let root = exe
-        .parent()
+    exe.parent()
         .expect("deps directory")
-        .join("kbf-driver-native-unit");
-    kbf_testkit::dir::TestDir::under(root, name)
+        .join("kbf-driver-native-unit")
+}
+
+/// A link to the test binary named for the act steps, in `dir`: one per run of the
+/// binary, which lives as long as the process (so no `TestDir`), remade by rename so
+/// that runs side by side do not race.
+#[cfg(test)]
+pub(crate) fn act_link(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).expect("act directory");
+    let link = dir.join(kbf_testkit::act::NAME);
+    let made = dir.join(format!(".act-{}", std::process::id()));
+    let _ = std::fs::remove_file(&made);
+    kbf_testkit::act::link_self(&made).expect("link");
+    std::fs::rename(&made, &link).expect("place the link");
+    link
 }
 // So do the act steps and the fake Xcode tools they run (src/xcode_tests.rs).
 #[cfg(test)]
