@@ -372,7 +372,9 @@ fn a_renewal_after_a_store_was_registered_carries_it_once() {
         .expect("a node on the old generation is sent the configuration");
     assert_eq!(config.generation, CONFIG_GENERATION + registry_generation);
     assert!(
-        config.cold_store.starts_with("s3://farm-cold/cold/main/?endpoint="),
+        config
+            .cold_store
+            .starts_with("s3://farm-cold/cold/main/?endpoint="),
         "{}",
         config.cold_store
     );
@@ -390,5 +392,97 @@ fn a_renewal_after_a_store_was_registered_carries_it_once() {
         farm.service.renew_now(&again).expect("renewed").config,
         None,
         "the node holds the generation it was sent"
+    );
+}
+
+/// A renewal while only the cold-store rows cannot be read (the node registry reads fine) is
+/// `StoreUnavailable` and changes nothing.
+///
+/// Catches: the cold-store read failing open: a renewal answered with "no store" at the
+/// base generation, which the node would write over its node.json (an empty cold store) and
+/// then be unable to start its storage half; and a node recorded as renewed by an answer
+/// it never got.
+#[test]
+fn a_renewal_while_only_the_cold_store_cannot_be_read_is_store_unavailable() {
+    let (farm, keys) = enrolled("renew-cold-unreadable");
+    crate::enroll::testkit::register_cold(&farm);
+    farm.advance(120);
+    let before = list_nodes(&*farm.store).expect("nodes");
+    let mut request = renew_request("node-01", &ROLES, &keys, farm.now());
+    request.config_generation = CONFIG_GENERATION;
+    farm.store
+        .txn(Txn::new().put("objstore/gen", [0xffu8, 0xff], Cond::Any))
+        .expect("store")
+        .expect("put");
+    assert!(list_nodes(&*farm.store).is_ok(), "the node registry reads");
+    assert_eq!(
+        refused(farm.service.renew_now(&request)),
+        RefusalReason::StoreUnavailable
+    );
+    assert_eq!(list_nodes(&*farm.store).expect("nodes"), before);
+}
+
+/// A store whose cold-store rows answer as a store this frontend no longer writes to.
+struct FencedColdRows(std::sync::Arc<dyn kbf_state::Store>);
+
+impl kbf_state::Store for FencedColdRows {
+    fn apply_batch(
+        &self,
+        batch: Vec<Txn>,
+    ) -> Result<Vec<Result<kbf_state::Commit, kbf_state::Conflict>>, kbf_state::StoreError> {
+        self.0.apply_batch(batch)
+    }
+    fn get(&self, key: &str) -> Result<Option<kbf_state::Versioned>, kbf_state::StoreError> {
+        if key.starts_with("objstore/") {
+            return Err(kbf_state::StoreError::Fenced);
+        }
+        self.0.get(key)
+    }
+    fn scan_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, kbf_state::Versioned)>, kbf_state::StoreError> {
+        self.0.scan_prefix(prefix)
+    }
+    fn scan_range(
+        &self,
+        scan: kbf_state::ScanRange<'_>,
+    ) -> Result<kbf_state::ScanPage, kbf_state::StoreError> {
+        self.0.scan_range(scan)
+    }
+    fn changes(
+        &self,
+        after: kbf_state::Revision,
+        limit: usize,
+    ) -> Result<kbf_state::Changes, kbf_state::StoreError> {
+        self.0.changes(after, limit)
+    }
+    fn reap_expired(&self) -> Result<usize, kbf_state::StoreError> {
+        self.0.reap_expired()
+    }
+    fn commit_stats(&self) -> kbf_state::CommitStats {
+        self.0.commit_stats()
+    }
+    fn now(&self) -> kbf_state::StoreTime {
+        self.0.now()
+    }
+}
+
+/// A renewal by a frontend that lost the writer role while reading the cold store is
+/// `NotSigner` (the node asks the successor), not the retryable `StoreUnavailable`.
+///
+/// Catches: the fence told as an outage, so a node keeps asking a frontend that will never
+/// answer.
+#[test]
+fn a_renewal_by_a_fenced_frontend_reading_the_cold_store_is_not_signer() {
+    let (farm, keys) = enrolled("renew-cold-fenced");
+    farm.advance(120);
+    let fenced: std::sync::Arc<dyn kbf_state::Store> =
+        std::sync::Arc::new(FencedColdRows(std::sync::Arc::clone(&farm.store)));
+    let service = crate::enroll::testkit::service_over(&fenced, &farm.ca);
+    let request = renew_request("node-01", &ROLES, &keys, farm.now());
+    assert_eq!(
+        refused(service.renew_now(&request)),
+        RefusalReason::NotSigner
     );
 }
