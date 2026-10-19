@@ -2203,6 +2203,7 @@ dependencies = [
  "kbf-enroll-registry",
  "kbf-front",
  "kbf-history",
+ "kbf-installer",
  "kbf-invocation",
  "kbf-log",
  "kbf-map",
