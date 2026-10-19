@@ -329,6 +329,9 @@ jobs:
       # farm's restart tests run on a schema of their own (`over_postgres` in tests/state_store.rs).
       - run: cargo test -p kbf-server --locked --test state_store_postgres -- --include-ignored
       - run: cargo test -p kbf-server --locked --test state_store -- --include-ignored over_postgres
+      # Two frontend children on one Postgres schema hand over 50 builds
+      # (tests/frontend/managed/two_children.rs; its in-memory twin runs in every test run).
+      - run: cargo test -p kbf-server --locked --test frontend -- --include-ignored two_children
       # A frontend process started with a Postgres --state-store reaches /readyz.
       - run: cargo test -p kbf-cli --locked --test frontend_process -- --include-ignored postgres_state_store
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -408,6 +411,10 @@ jobs:
         env:
           LLVM_COV_FLAGS: -skip-functions
         run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test state_store -- --include-ignored over_postgres
+      - name: Run the two-children swap over Postgres under coverage
+        env:
+          LLVM_COV_FLAGS: -skip-functions
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-server --test frontend -- --include-ignored two_children
       - name: Run the frontend process test over Postgres under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
