@@ -276,13 +276,22 @@ fn owner_uid(rehearsal: bool, euid: u32) -> u32 {
 }
 
 /// The user the version probe runs as: the failure when the host cannot say, or has no such
-/// user.
+/// user. (The generic part is one call; what it does with the answer is [`user_found`], so
+/// that there is one copy of it to run.)
 fn probe_user<E: kbf_host::Exec>(exec: &E, name: &str) -> Result<kbf_host::RunUser, Failure> {
-    let found = kbf_host::user::lookup(exec, name).map_err(|e| Failure::from(e.to_string()))?;
-    found.ok_or_else(|| Failure {
-        exit: Exit::Usage,
-        why: format!("no user {name:?} to run the version probe as"),
-    })
+    user_found(kbf_host::user::lookup(exec, name), name)
+}
+
+fn user_found(
+    found: Result<Option<kbf_host::RunUser>, kbf_host::user::UserError>,
+    name: &str,
+) -> Result<kbf_host::RunUser, Failure> {
+    found
+        .map_err(|e| Failure::from(e.to_string()))?
+        .ok_or_else(|| Failure {
+            exit: Exit::Usage,
+            why: format!("no user {name:?} to run the version probe as"),
+        })
 }
 
 /// `migrate`: the report to print, or why it stopped.

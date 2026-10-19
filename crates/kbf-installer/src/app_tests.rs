@@ -853,3 +853,79 @@ fn the_probe_user_is_looked_up_with_the_exit_codes_of_the_contract() {
     assert_eq!(broken.exit, Exit::Failed);
     assert!(broken.why.contains("getent"), "{}", broken.why);
 }
+
+/// Catches `migrate` missing from the command line or from the dispatcher: its flags parse
+/// into the verb (every unit flag takes a unit name, and a name that is a path or has no
+/// suffix is a usage error of the parser), the verb runs through `dispatch` on a host with
+/// no old layout, says so on standard output and exits 0, and `--json` makes that one object.
+///
+/// Mutants planted: the `Verb::Migrate` arm of the dispatcher removed (the verb said "not
+/// implemented"); a unit name taken unchecked.
+#[test]
+fn migrate_parses_its_flags_and_runs_through_the_dispatcher() {
+    let cli = parse(&[
+        "migrate",
+        "--unit",
+        "kbf-daemon.service",
+        "--unit",
+        "kbf-other.service",
+        "--helper-unit",
+        "kbf-helper.service",
+        "--installer-unit",
+        "kbf-installer.service",
+        "--min-generation",
+        "5",
+        "--release-source",
+        "frontend",
+        "--rollback",
+    ]);
+    let Verb::Migrate(args) = &cli.verb else {
+        panic!("not the migrate verb");
+    };
+    assert_eq!(args.units.len(), 2);
+    assert!(args.helper_unit.is_some() && args.installer_unit.is_some() && args.rollback);
+    assert_eq!(args.min_generation, Some(5));
+    for bad in ["../x.service", "kbf", "A.service"] {
+        for flag in ["--unit", "--helper-unit", "--installer-unit"] {
+            let tried = Cli::try_parse_from(["kbf-installer", "migrate", flag, bad]);
+            assert!(tried.is_err(), "{flag} {bad}");
+        }
+    }
+
+    // A host with nothing on it: not `host_root_on`, which makes the installer's directories.
+    let root = kbf_host::testkit::scratch("app-migrate");
+    let id = std::process::Command::new("/usr/bin/id")
+        .arg("-un")
+        .output()
+        .expect("id");
+    let me = String::from_utf8(id.stdout)
+        .expect("text")
+        .trim()
+        .to_owned();
+    let root = root.to_str().expect("text");
+    for json in [false, true] {
+        let mut args = vec!["--root", root, "migrate", "--fetch-user", &me];
+        if json {
+            args.push("--json");
+        }
+        let (exit, out, err) = run_as(1000, &args);
+        assert_eq!(exit, Exit::Ok, "{err}");
+        assert!(out.contains("nothing to migrate"), "{out}");
+        assert_eq!(out.trim_start().starts_with('{'), json, "{out}");
+    }
+}
+
+/// Catches a host path joined to a root that is not absolute: `under` refuses it with the
+/// reason. The dispatcher's migration guard looks at the root first, so it is this test, not
+/// a verb's, that reaches the refusal.
+#[test]
+fn a_path_is_not_joined_to_a_relative_root() {
+    let path = HostPath::new("/etc/kbf/installer.toml").expect("a host path");
+    let failure = under(Path::new("relative/root"), &path).expect_err("refused");
+    assert_eq!(failure.exit, Exit::Failed);
+    assert!(!failure.why.is_empty());
+    assert_eq!(
+        under(Path::new("/srv/root"), &path).expect("joined"),
+        PathBuf::from("/srv/root/etc/kbf/installer.toml")
+    );
+}
