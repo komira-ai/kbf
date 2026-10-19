@@ -736,24 +736,27 @@ mod binary {
     const BIN: &str = env!("CARGO_BIN_EXE_kbf-server");
     /// `--cold-store` and `--meta-dir` flags over fresh directories named for `name`, under the
     /// target directory: every start of the binary needs both.
-    fn stores(name: &str) -> [String; 4] {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let next_store = || NEXT.fetch_add(1, Ordering::Relaxed);
-        let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-server-stores")
-            .join(format!("{name}-{}-{}", std::process::id(), next_store()));
-        let _ = std::fs::remove_dir_all(&base);
-        [
+    /// The directory is removed when it drops, so the caller keeps it as long as the server.
+    fn stores(name: &str) -> (kbf_testkit::dir::TestDir, [String; 4]) {
+        let base = kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("kbf-server-stores-{name}"),
+        );
+        let flags = [
             "--cold-store".to_owned(),
             format!("file://{}", base.join("cold").display()),
             "--meta-dir".to_owned(),
             base.join("meta").display().to_string(),
-        ]
+        ];
+        (base, flags)
     }
 
     /// The server, killed and reaped when dropped.
-    struct Running(Child);
+    struct Running(
+        Child,
+        // Held only to be dropped after the server is gone, which removes its directory.
+        #[allow(dead_code)] kbf_testkit::dir::TestDir,
+    );
 
     impl Drop for Running {
         fn drop(&mut self) {
@@ -765,16 +768,18 @@ mod binary {
     /// Starts the binary with the operator API on free loopback ports; it, and the
     /// REAPI and API addresses of its start line.
     fn start(args: &[&str]) -> (Running, SocketAddr, SocketAddr) {
+        let (dir, stores) = stores("health");
         let mut child = Running(
             Command::new(BIN)
                 .args(["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"])
                 .args(["--api-listen", "127.0.0.1:0"])
-                .args(stores("health"))
+                .args(stores)
                 .args(args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn kbf-server"),
+            dir,
         );
         let stdout = child.0.stdout.take().expect("stdout");
         let (tx, rx) = std::sync::mpsc::channel();

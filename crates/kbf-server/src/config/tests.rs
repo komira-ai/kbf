@@ -441,16 +441,7 @@ fn plain_text_off_loopback_checks_each_listener_through_loopback_only() {
 /// Mutant seen red: the open's error dropped (`.ok()`): the API starts store-less.
 #[test]
 fn a_releases_dir_that_cannot_be_made_stops_the_start_naming_it() {
-    // <target>/<profile>/deps/<test binary>: scratch beside it, in the target directory.
-    let exe = std::env::current_exe().expect("the test binary");
-    let target = exe
-        .ancestors()
-        .nth(3)
-        .expect("<target>/<profile>/deps/<binary>");
-    let base = target
-        .join("tmp")
-        .join(format!("config-releases-{}", std::process::id()));
-    std::fs::create_dir_all(&base).expect("dir");
+    let base = crate::test_dir::scratch_dir("config-releases");
     let file = base.join("a-file");
     std::fs::write(&file, b"x").expect("file");
     let under = file.join("store");

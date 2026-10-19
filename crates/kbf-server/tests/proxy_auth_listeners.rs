@@ -11,7 +11,6 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use futures::channel::mpsc::unbounded;
@@ -49,20 +48,34 @@ fn presented_secret() -> String {
     hex::encode(SECRET)
 }
 
-fn dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-proxy-auth");
-    std::fs::create_dir_all(&dir).expect("a directory");
-    dir
+fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-proxy-auth-{name}"),
+    )
+}
+
+/// A file in a directory of its own, removed with it when this drops.
+struct Owned {
+    path: PathBuf,
+    _dir: kbf_testkit::dir::TestDir,
+}
+
+impl std::ops::Deref for Owned {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
 }
 
 /// A file holding `content` with `mode`, unique to this call.
-fn file(content: &[u8], mode: u32) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let path = dir().join(format!("secret-{}-{n}", std::process::id()));
+fn file(content: &[u8], mode: u32) -> Owned {
+    let dir = dir("file");
+    let path = dir.join("secret");
     std::fs::write(&path, content).expect("write the file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-    path
+    Owned { path, _dir: dir }
 }
 
 fn secret() -> Arc<ProxySecret> {
@@ -658,10 +671,10 @@ fn token() -> ApiToken {
 
 // ---- the binary ---------------------------------------------------------------------
 
-/// The server binary with `extra` flags over a file store of its own, on any port.
-fn binary(name: &str, extra: &[&str]) -> std::process::Command {
-    let base = dir().join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+/// The server binary with `extra` flags over a file store of its own, on any port; the
+/// store's directory, which the caller keeps until the server is gone.
+fn binary(name: &str, extra: &[&str]) -> (kbf_testkit::dir::TestDir, std::process::Command) {
+    let base = dir(name);
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kbf-server"));
     command
         .args(["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"])
@@ -672,7 +685,7 @@ fn binary(name: &str, extra: &[&str]) -> std::process::Command {
         .args(extra)
         .env_remove("AWS_ACCESS_KEY_ID")
         .env_remove("AWS_SECRET_ACCESS_KEY");
-    command
+    (base, command)
 }
 
 /// Kills and reaps the child when dropped.
@@ -705,7 +718,7 @@ async fn the_binary_serves_behind_the_proxy_when_given_the_flag() {
     use std::io::BufRead as _;
     let secret = file(&SECRET, 0o600);
     let token = file(format!("{TOKEN}\n").as_bytes(), 0o600);
-    let mut command = binary(
+    let (_base, mut command) = binary(
         "behind",
         &[
             "--api-listen",
@@ -768,7 +781,7 @@ fn the_binary_refuses_a_readable_secret_file() {
     use std::io::Read as _;
     let open = file(&SECRET, 0o644);
     let open = open.to_str().expect("UTF-8");
-    let mut command = binary("open", &["--proxy-auth-file", open]);
+    let (_base, mut command) = binary("open", &["--proxy-auth-file", open]);
     let mut child = Running(
         command
             .stdout(std::process::Stdio::null())

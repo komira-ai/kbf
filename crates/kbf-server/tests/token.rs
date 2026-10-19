@@ -4,7 +4,6 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use std::time::Duration;
 
@@ -12,20 +11,35 @@ use kbf_server::token::{ApiToken, MAX_TOKEN_FILE_BYTES, MIN_TOKEN_BYTES, TokenFi
 
 const TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
-fn dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-token");
-    std::fs::create_dir_all(&dir).expect("a token directory");
-    dir
+/// A directory of its own, removed when it drops.
+fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-token-{name}"),
+    )
+}
+
+/// A file in a directory of its own, removed with it when this drops.
+struct Owned {
+    path: PathBuf,
+    _dir: kbf_testkit::dir::TestDir,
+}
+
+impl std::ops::Deref for Owned {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
 }
 
 /// A file holding `content` with `mode`, unique to this call.
-fn file(content: &[u8], mode: u32) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let path = dir().join(format!("token-{}-{n}", std::process::id()));
+fn file(content: &[u8], mode: u32) -> Owned {
+    let dir = dir("file");
+    let path = dir.join("token");
     std::fs::write(&path, content).expect("write the file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-    path
+    Owned { path, _dir: dir }
 }
 
 fn admitted(path: &Path) -> bool {
@@ -68,11 +82,12 @@ fn a_file_others_can_reach_is_refused() {
 #[test]
 fn a_file_another_user_owns_is_refused() {
     let me = rustix::process::geteuid().as_raw();
+    let owned;
     let (path, other) = if me == 0 {
-        let path = file(TOKEN.as_bytes(), 0o600);
+        owned = file(TOKEN.as_bytes(), 0o600);
         let nobody = rustix::process::Uid::from_raw(65_534);
-        rustix::fs::chown(&path, Some(nobody), None).expect("chown as root");
-        (path, 65_534)
+        rustix::fs::chown(&owned.path, Some(nobody), None).expect("chown as root");
+        (owned.path.clone(), 65_534)
     } else {
         (PathBuf::from("/etc/hosts"), 0)
     };
@@ -87,8 +102,8 @@ fn a_file_another_user_owns_is_refused() {
 /// of refused: the open would hang until something writes to it.
 #[test]
 fn a_fifo_is_refused_at_once() {
-    let path = dir().join(format!("fifo-{}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let dir = dir("fifo");
+    let path = dir.join("fifo");
     rustix::fs::mknodat(
         rustix::fs::CWD,
         &path,
@@ -109,7 +124,6 @@ fn a_fifo_is_refused_at_once() {
         matches!(refused, Err(TokenFileError::NotAFile { .. })),
         "{refused:?}"
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 /// Catches: a token file of any size read whole at start (a mistaken path to a large
@@ -159,12 +173,13 @@ fn a_file_without_a_usable_token_is_refused() {
             "{content:?}: {refused:?}"
         );
     }
-    let missing = dir().join("no-such-token");
+    let d = dir("missing");
+    let missing = d.join("no-such-token");
     assert!(matches!(
         ApiToken::from_file(&missing),
         Err(TokenFileError::Read { .. })
     ));
-    let refused = ApiToken::from_file(&dir());
+    let refused = ApiToken::from_file(&d);
     assert!(
         matches!(refused, Err(TokenFileError::NotAFile { .. })),
         "{refused:?}"

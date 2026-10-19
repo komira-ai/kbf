@@ -27,20 +27,19 @@ const BIN: &str = env!("CARGO_BIN_EXE_kbf-server");
 
 /// `--cold-store` and `--meta-dir` flags over fresh directories named for `name`, under the
 /// target directory: every start of the binary needs both.
-fn stores(name: &str) -> [String; 4] {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let next_store = || NEXT.fetch_add(1, Ordering::Relaxed);
-    let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-server-stores")
-        .join(format!("{name}-{}-{}", std::process::id(), next_store()));
-    let _ = std::fs::remove_dir_all(&base);
-    [
+/// The directory is removed when it drops, so the caller keeps it as long as the server.
+fn stores(name: &str) -> (kbf_testkit::dir::TestDir, [String; 4]) {
+    let base = kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-stores-{name}"),
+    );
+    let flags = [
         "--cold-store".to_owned(),
         format!("file://{}", base.join("cold").display()),
         "--meta-dir".to_owned(),
         base.join("meta").display().to_string(),
-    ]
+    ];
+    (base, flags)
 }
 
 /// How long a test waits for the server to print its start line or to exit.
@@ -57,7 +56,11 @@ fn address(line: &str, key: &str) -> SocketAddr {
 
 /// A running server, killed and reaped when dropped, so a failed assertion never
 /// leaves it running.
-struct Running(Child);
+struct Running(
+    Child,
+    // Held only to be dropped after the server is gone, which removes its directory.
+    #[allow(dead_code)] kbf_testkit::dir::TestDir,
+);
 
 impl Running {
     /// Starts the server with `args` on free loopback ports; it and the REAPI and
@@ -69,15 +72,17 @@ impl Running {
 
     /// [`Running::start`], and the start line itself.
     fn start_line(args: &[&str]) -> (Self, String) {
+        let (dir, stores) = stores("shutdown");
         let mut child = Self(
             Command::new(BIN)
                 .args(["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"])
-                .args(stores("shutdown"))
+                .args(stores)
                 .args(args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn kbf-server"),
+            dir,
         );
         let stdout = child.0.stdout.take().expect("stdout");
         let (tx, rx) = std::sync::mpsc::channel();
@@ -402,15 +407,17 @@ async fn a_stuck_upload_is_cut_off_at_the_shutdown_timeout() {
 }
 
 /// A token file for `--api-token-file`: mode 0600, unique to this call.
-fn token_file(name: &str) -> (String, std::path::PathBuf) {
+fn token_file(name: &str) -> (String, kbf_testkit::dir::TestDir, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let token = "kbf-test-token-0123456789abcdef0123456789".to_owned();
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-shutdown");
-    std::fs::create_dir_all(&dir).expect("a directory");
-    let path = dir.join(format!("{name}-{}", std::process::id()));
+    let dir = kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-shutdown-{name}"),
+    );
+    let path = dir.join("token");
     std::fs::write(&path, format!("{token}\n")).expect("write the token");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-    (token, path)
+    (token, dir, path)
 }
 
 /// A GET or POST of the operator API at `api`, off the async threads.
@@ -500,7 +507,7 @@ async fn a_second_sigterm_ends_the_drain() {
 /// nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_drain_endpoint_drains_the_binary_and_it_exits_when_the_streams_are_done() {
-    let (token, path) = token_file("endpoint");
+    let (token, _token_dir, path) = token_file("endpoint");
     let path = path.display().to_string();
     let (mut server, line) =
         Running::start_line(&["--api-listen", "127.0.0.1:0", "--api-token-file", &path]);

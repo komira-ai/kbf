@@ -11,13 +11,38 @@ use std::sync::{Arc, Mutex, PoisonError};
 use kbf_server::log_file::{FILE_NAME, LogFile, RETRY_BYTES, subscriber};
 use tracing_subscriber::fmt::MakeWriter;
 
-/// A fresh, absent directory for `name`, under the target directory.
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-server-log-file")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    dir
+/// A path in a directory of its own, removed with it when this drops.
+#[derive(Debug)]
+struct Fresh {
+    path: PathBuf,
+    _dir: kbf_testkit::dir::TestDir,
+}
+
+impl std::ops::Deref for Fresh {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for Fresh {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// A fresh, absent directory for `name`, under the target directory, removed (with what
+/// the test made in it) when it drops.
+fn fresh_dir(name: &str) -> Fresh {
+    let dir = kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-log-file-{name}"),
+    );
+    Fresh {
+        path: dir.join("d"),
+        _dir: dir,
+    }
 }
 
 /// The reports a log file made (what it would have told stderr).

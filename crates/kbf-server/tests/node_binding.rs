@@ -6,7 +6,6 @@ mod support;
 
 use std::future::pending;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +31,7 @@ const PROMPT: Duration = Duration::from_secs(5);
 
 /// A cell CA on disk, a server certificate, and client certificates on demand.
 struct Pki {
-    dir: PathBuf,
+    dir: kbf_testkit::dir::TestDir,
     ca: CertifiedIssuer<'static, KeyPair>,
 }
 
@@ -51,10 +50,10 @@ impl Pki {
 
     /// A PKI whose CA is made from `ca`.
     fn with_ca(name: &str, ca: CertificateParams) -> Self {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-server-node-binding")
-            .join(name);
-        std::fs::create_dir_all(&dir).expect("create the TLS directory");
+        let dir = kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("kbf-server-node-binding-{name}"),
+        );
         let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
         let pki = Self { dir, ca };
         let (cert, key) = pki.leaf(

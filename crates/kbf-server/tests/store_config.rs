@@ -475,8 +475,7 @@ async fn a_frontend_that_cannot_say_its_generation_announces_zero_and_still_answ
 /// Mutant seen red: `admit_leaf` not consulting the deny list.
 #[tokio::test]
 async fn the_worker_deny_list_file_applies_at_every_call() {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("store-config");
-    std::fs::create_dir_all(&dir).expect("directory");
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "store-config");
     let path = dir.join("deny.list");
     let replace = |text: &str| {
         let staged = path.with_extension("new");

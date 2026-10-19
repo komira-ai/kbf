@@ -351,7 +351,9 @@ async fn a_denied_member_is_refused_its_beats_and_goes_down_when_its_row_lapses(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flagged_mutual_tls_worker_listener_still_reads_the_proxys_word() {
     const SECRET: [u8; 32] = [0x77; 32];
-    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("members-denied-secret");
+    let dir =
+        kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "members-denied-secret");
+    let path = dir.join("secret");
     std::fs::write(&path, SECRET).expect("write");
     std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
         .expect("chmod");

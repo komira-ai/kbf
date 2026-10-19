@@ -2,7 +2,7 @@
 //! directory, and what it refuses before it opens.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -95,11 +95,9 @@ fn joined(member_id: u64, boot: u64) -> Joined {
     }
 }
 
-/// A fresh, empty metadata directory for `name`.
-fn meta_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-node-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A fresh, empty metadata directory for `name`, removed when it drops.
+fn meta_dir(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::test_dir::scratch_dir(&format!("kbf-node-{name}"))
 }
 
 /// A start of a registered node over a new log in `dir`, as [`super::assemble`] opens
@@ -151,9 +149,6 @@ async fn a_wiped_node_never_reuses_its_keys() {
     ] {
         assert!(keys.iter().all(|k| k.starts_with(prefix)), "{keys:?}");
     }
-    for dir in [first_dir, wiped_dir] {
-        let _ = std::fs::remove_dir_all(dir);
-    }
 }
 
 /// Catches: a registration of member or boot zero taken (no `NodeWriter` can name it,
@@ -199,7 +194,6 @@ async fn a_registration_the_log_cannot_take_refuses_the_open() {
     let refused = refused.map(|e| e.to_string()).unwrap_or_default();
     assert!(refused.contains("is not after boot 3"), "{refused}");
     assert!(bucket.written().is_empty());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Catches a stale boot from a real [`open_registered`] (the frontend's state store
@@ -226,7 +220,6 @@ async fn a_stale_boot_exits_not_ready_and_a_later_boot_opens() {
             (boot, Ok(_)) => panic!("boot {boot} opened over a log at boot 3"),
         }
     }
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Catches: a node root that keeps the log id (node keys would sit under one log's
@@ -286,7 +279,6 @@ async fn a_log_of_several_voters_refuses_the_open_before_it_is_raised() {
         .expect("open the log again");
     assert_eq!(meta.machine_version(), MachineVersion::V1, "nothing raised");
     drop(meta);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 // ---- unit U0 of docs/design/frontend-proxy.md, section 11: a node meets a FRESH state store
@@ -374,7 +366,6 @@ async fn a_node_given_a_new_member_id_by_a_fresh_store_keeps_its_blobs() {
         vec![true; held.len()]
     );
     assert_eq!(bucket.written(), uploaded, "nothing was uploaded again");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// What the same step costs when the fresh store hands the node the member id its log has
@@ -414,7 +405,6 @@ async fn a_node_given_its_old_member_id_opens_only_after_one_restart_per_old_boo
         vec![true; held.len()]
     );
     assert_eq!(bucket.written(), uploaded, "nothing was uploaded again");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The design's claim as a requirement: the first registration on a fresh store opens the
@@ -428,5 +418,4 @@ async fn the_first_registration_on_a_fresh_store_opens_a_node_that_had_run_befor
     let mine = register_as(&fresh_frontend(), "me");
     let opened = open_over(&dir, &bucket, &mine).await.map(drop);
     assert!(opened.is_ok(), "{opened:?}");
-    let _ = std::fs::remove_dir_all(dir);
 }

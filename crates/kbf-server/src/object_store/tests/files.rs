@@ -12,7 +12,8 @@ use crate::object_store::secrets::{SecretError, SecretFiles};
 #[test]
 fn a_wide_mode_file_is_refused_and_a_put_repairs_it() {
     let store = as_store(&fake());
-    let dir = scratch("wide").join("s");
+    let root = scratch("wide");
+    let dir = root.join("s");
     let reg = open(&store, &dir);
     reg.put_connection(&name("cold"), &put(SENTINEL)).unwrap();
     for wide in [0o644, 0o640, 0o604, 0o700, 0o666] {
@@ -54,7 +55,8 @@ fn a_wide_mode_file_is_refused_and_a_put_repairs_it() {
 #[test]
 fn a_missing_file_is_reported_and_a_put_repairs_it() {
     let store = as_store(&fake());
-    let dir = scratch("missing").join("s");
+    let root = scratch("missing");
+    let dir = root.join("s");
     let reg = open(&store, &dir);
     reg.put_connection(&name("cold"), &put(SENTINEL)).unwrap();
     std::fs::remove_file(file_of(&dir, "cold", 1)).unwrap();
@@ -73,7 +75,8 @@ fn a_missing_file_is_reported_and_a_put_repairs_it() {
 #[test]
 fn a_link_a_directory_and_garbage_are_not_secret_files() {
     let store = as_store(&fake());
-    let dir = scratch("kinds").join("s");
+    let root = scratch("kinds");
+    let dir = root.join("s");
     let reg = open(&store, &dir);
     reg.put_connection(&name("cold"), &put(SENTINEL)).unwrap();
     let path = file_of(&dir, "cold", 1);
@@ -110,7 +113,8 @@ fn a_link_a_directory_and_garbage_are_not_secret_files() {
 #[test]
 fn the_sweep_removes_only_unreferenced_versions_and_temp_files() {
     let store = as_store(&fake());
-    let dir = scratch("sweep").join("s");
+    let root = scratch("sweep");
+    let dir = root.join("s");
     let reg = open(&store, &dir);
     reg.put_connection(&name("cold"), &put("one")).unwrap();
     reg.put_connection(&name("hot"), &put("two")).unwrap();
@@ -192,7 +196,8 @@ fn a_secret_directory_that_is_a_file_is_an_error() {
 #[test]
 fn a_write_into_a_removed_directory_fails_and_leaves_nothing() {
     let store = as_store(&fake());
-    let dir = scratch("vanish").join("s");
+    let root = scratch("vanish");
+    let dir = root.join("s");
     let reg = open(&store, &dir);
     std::fs::remove_dir(&dir).unwrap();
     let err = reg.put_connection(&name("cold"), &put("x")).unwrap_err();
@@ -211,7 +216,8 @@ fn a_write_into_a_removed_directory_fails_and_leaves_nothing() {
 // removal that fails on an absent file.
 #[test]
 fn removing_an_absent_file_is_fine_and_a_failing_removal_is_reported() {
-    let dir = scratch("remove").join("s");
+    let root = scratch("remove");
+    let dir = root.join("s");
     let files = SecretFiles::new(&dir).unwrap();
     files.remove(&name("cold"), 1).unwrap();
     let blocker = file_of(&dir, "cold", 2);
@@ -237,7 +243,9 @@ fn two_writers_in_one_directory_never_share_a_temp_file() {
 
     use crate::object_store::Step;
 
-    let dir = scratch("temps").join("s");
+    let root = scratch("temps");
+
+    let dir = root.join("s");
     let files = Arc::new(SecretFiles::new(&dir).unwrap());
     let (reached_tx, reached_rx) = mpsc::channel();
     let (go_tx, go_rx) = mpsc::channel::<()>();

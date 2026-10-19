@@ -94,8 +94,7 @@ fn a_stale_writer_is_not_ready() {
 /// failure a later try can clear (a busy, read-only or full device) that exits 2.
 #[tokio::test]
 async fn a_held_directory_and_a_device_not_ready_are_not_ready() {
-    let dir = std::env::temp_dir().join(format!("kbf-start-exit-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_dir::scratch_dir("kbf-start-exit");
     let _first = RaftMetaLog::open_dir(&dir, Retention::default(), "kbf/")
         .await
         .expect("open the log");
@@ -105,7 +104,6 @@ async fn a_held_directory_and_a_device_not_ready_are_not_ready() {
     };
     assert!(matches!(second, RaftLogError::Locked { .. }), "{second}");
     assert_eq!(class(second), StartFailure::NotReady);
-    let _ = std::fs::remove_dir_all(dir);
     let locked = FsStoreError::Locked {
         path: PathBuf::from("/x/LOCK"),
         source: std::fs::TryLockError::WouldBlock,

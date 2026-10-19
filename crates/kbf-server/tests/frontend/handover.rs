@@ -16,23 +16,15 @@ use tonic::Code;
 
 use super::*;
 
-/// A directory of the test's own: the state file, the control socket.
-struct Dir(PathBuf);
+/// A directory of the test's own, removed when dropped: the state file, the control socket.
+struct Dir(kbf_testkit::dir::TestDir);
 
 impl Dir {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("kbf-frontend-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        Self(dir)
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        Self(kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            "kbf-frontend",
+        ))
     }
 }
 

@@ -5,7 +5,7 @@
 
 use std::future::pending;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
@@ -293,11 +293,9 @@ async fn within<T>(what: &str, wait: impl std::future::Future<Output = T>) -> T 
     }
 }
 
-/// A scratch directory of its own for `name`, empty.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-rebuild-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A scratch directory of its own for `name`, empty, removed when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::test_dir::scratch_dir(&format!("kbf-rebuild-{name}"))
 }
 
 /// Pages of two objects and batches of two, so a rebuild of a few objects is several
@@ -435,7 +433,8 @@ async fn wipe_and_rebuild<O: ObjectStore + Clone>(store: O, dir: &Path) {
 /// pages: 2 of the 5 held).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wipe_rebuild_holds_blobs_in_a_bucket() {
-    wipe_and_rebuild(Bucket::new(), &scratch("wipe-bucket")).await;
+    let dir = scratch("wipe-bucket");
+    wipe_and_rebuild(Bucket::new(), &dir).await;
 }
 
 /// The same over a `file://` cold store: the rebuild lists a directory and reads each

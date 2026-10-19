@@ -8,9 +8,9 @@ mod hooked;
 mod support;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 
 use kbf_caps::NodeCaps;
 use kbf_front::{Cache, MemoryMetaLog};
@@ -28,15 +28,11 @@ const A: &str = "0123456789abcdef0123456789abcdef01234567";
 const OLD: &str = "fedcba9876543210fedcba9876543210fedcba98";
 const PLATFORM: &str = "darwin-arm64";
 
-fn scratch(name: &str) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "kbf-update-session-{name}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-update-session-{name}"),
+    )
 }
 
 /// What the root helper writes: `state`, with `installed` and `staged` as the commits it
@@ -58,10 +54,11 @@ type Inbound = mpsc::UnboundedReceiver<Result<ServerMessage, tonic::Status>>;
 struct Node {
     farm: Arc<Farm>,
     id: WorkerId,
-    dir: PathBuf,
     stream: StreamId,
     inbound: Inbound,
     client: Handle,
+    /// Last, so it is removed after the client that writes into it is gone.
+    dir: kbf_testkit::dir::TestDir,
 }
 
 fn register(farm: &Farm, name: &str, os: &str) -> (StreamId, Inbound) {

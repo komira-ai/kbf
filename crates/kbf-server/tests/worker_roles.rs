@@ -911,11 +911,11 @@ async fn a_storage_certificate_beats_only_for_the_member_whose_address_it_names(
         .expect("B beats its own member");
 }
 
-/// Where a test's deny list lives.
-fn list_path(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("worker-roles");
-    std::fs::create_dir_all(&dir).expect("directory");
-    dir.join(name)
+/// A directory for a test's deny list, removed when it drops, and the list's path in it.
+fn list_path(name: &str) -> (kbf_testkit::dir::TestDir, PathBuf) {
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "worker-roles");
+    let path = dir.join(name);
+    (dir, path)
 }
 
 /// Replaces the list at `path` by renaming a new file over it, as the list's module docs
@@ -939,7 +939,7 @@ fn write_list(path: &Path, text: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_listed_storage_certificate_may_neither_register_nor_heartbeat() {
     let pki = Pki::new();
-    let path = list_path("storage.list");
+    let (_list_dir, path) = list_path("storage.list");
     write_list(&path, "# nobody yet\n");
     let list = DenyList::open(&path).expect("the list");
     let worker = frontend(Some(pki.worker_tls_denying(Some(list))));
@@ -1014,7 +1014,7 @@ async fn a_listed_storage_certificate_may_neither_register_nor_heartbeat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unusable_deny_list_refuses_membership_calls_unavailable() {
     let pki = Pki::new();
-    let path = list_path("broken.list");
+    let (_list_dir, path) = list_path("broken.list");
     write_list(&path, "serial 0a\n");
     let list = DenyList::open(&path).expect("the list");
     let worker = frontend(Some(pki.worker_tls_denying(Some(list))));

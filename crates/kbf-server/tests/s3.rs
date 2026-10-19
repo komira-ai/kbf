@@ -61,13 +61,12 @@ async fn executes_with_blobs_in_s3() {
     .expect("store");
     store.create_bucket().await.expect("create the bucket");
 
-    let meta = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("kbf-server-s3-meta-{}", std::process::id()));
+    let meta = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-s3-meta");
     let uri = format!("s3://{BUCKET}/e2e/?endpoint={endpoint}&conditional-put=true");
     let mut child = Command::new(env!("CARGO_BIN_EXE_kbf-server"))
         .args(["--cold-store", &uri])
         .arg("--meta-dir")
-        .arg(&meta)
+        .arg(meta.path())
         .args(["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"])
         .args(["--heartbeat-interval-ms", "100"])
         .stdout(Stdio::piped())

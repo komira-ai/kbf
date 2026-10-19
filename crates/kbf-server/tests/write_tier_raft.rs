@@ -100,17 +100,20 @@ impl ObjectStore for Store {
 struct Dirs {
     raft: PathBuf,
     tier: PathBuf,
+    /// Last, so it is removed after what the test started in it is gone.
+    _root: kbf_testkit::dir::TestDir,
 }
 
 impl Dirs {
     fn new(name: &str) -> Self {
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-server-write-tier-raft")
-            .join(format!("{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("kbf-server-write-tier-raft-{name}"),
+        );
         Self {
             raft: root.join("raft"),
             tier: root.join("tier"),
+            _root: root,
         }
     }
 
@@ -129,12 +132,6 @@ impl Dirs {
         let fs = StdFs::new(&self.raft)?;
         let no_new_log = || Err(std::io::Error::other("the log exists"));
         RaftMetaLog::open_running(fs, Retention::default(), "kbf/", no_new_log, runs).await
-    }
-}
-
-impl Drop for Dirs {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(self.raft.parent().expect("a root"));
     }
 }
 

@@ -5,7 +5,6 @@
 
 use std::future::pending;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -39,7 +38,7 @@ use tonic::{Code, Status};
 
 /// A cell CA, the worker listener's certificate, and daemon certificates on demand.
 struct Pki {
-    dir: PathBuf,
+    dir: kbf_testkit::dir::TestDir,
     ca: CertifiedIssuer<'static, KeyPair>,
 }
 
@@ -60,10 +59,10 @@ impl Pki {
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::DigitalSignature,
         ];
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-server-worker-blobs")
-            .join(name);
-        std::fs::create_dir_all(&dir).expect("create the TLS directory");
+        let dir = kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("kbf-server-worker-blobs-{name}"),
+        );
         let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
         let pki = Self { dir, ca };
         let mut server = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");

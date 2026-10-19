@@ -95,7 +95,8 @@ fn the_secret_is_only_ever_in_its_file_never_in_the_state_rows() {
 #[test]
 fn nothing_the_registry_returns_or_formats_holds_the_secret() {
     let store = as_store(&fake());
-    let dir = scratch("leak-fmt").join("s");
+    let root = scratch("leak-fmt");
+    let dir = root.join("s");
     let reg = open(&store, &dir);
     let body = put(FIRST);
     let mut shown = vec![format!("{body:?}"), format!("{reg:?}")];
@@ -173,7 +174,8 @@ fn the_logs_never_hold_the_secret() {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let store = as_store(&fake());
-    let dir = scratch("leak-log").join("s");
+    let root = scratch("leak-log");
+    let dir = root.join("s");
     let reg = open(&store, &dir);
     reg.put_connection(&name("cold"), &put(FIRST)).unwrap();
     // The old version's file becomes a non-empty directory: its removal fails and logs.

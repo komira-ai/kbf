@@ -25,27 +25,16 @@ use crate::health::Readiness;
 use crate::state_store::StateStore;
 
 /// A directory of the test's own, removed when dropped.
-pub(super) struct Scratch(pub PathBuf);
+pub(super) struct Scratch(pub kbf_testkit::dir::TestDir);
 
 impl Scratch {
     pub fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("kbf-handover-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        Self(dir)
+        Self(crate::test_dir::scratch_dir("kbf-handover"))
     }
 
     /// Where a control socket is made.
     pub fn socket(&self) -> PathBuf {
         self.0.join("control.sock")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

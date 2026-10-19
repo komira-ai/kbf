@@ -11,7 +11,7 @@
 use std::future::{Future, pending};
 use std::io;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -102,14 +102,13 @@ impl Ca {
     }
 }
 
-/// A directory of this test's own, per process: two runs of the binary at once do not
-/// replace each other's files.
-fn dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("kbf-server-reload-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create the directory");
-    dir
+/// A directory of this test's own, removed when it drops: two runs of the binary at once
+/// do not replace each other's files.
+fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-reload-{name}"),
+    )
 }
 
 /// Replaces `dir/file` whole, as a renewal tool does.
@@ -395,7 +394,6 @@ async fn a_renewed_reapi_certificate_is_served_without_a_restart() {
         "{metrics}"
     );
     assert!(metrics.contains("kbf_tls_leaf_not_after_seconds{listener=\"reapi\"} "));
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// The worker listener's three files: after its client CA is replaced, a daemon with a
@@ -470,7 +468,6 @@ async fn the_worker_listener_reloads_its_client_ca_and_identity() {
         !welcomed(&server_ca, &new_node).await,
         "the replaced server certificate is still served"
     );
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// An attempt on a server that accepts the connection and never answers ends, and says

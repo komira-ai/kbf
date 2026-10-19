@@ -143,14 +143,14 @@ async fn exchange(addr: SocketAddr, request: &str) -> (u16, Value) {
 }
 
 /// A scratch directory of the test's own, removed when dropped.
-struct Scratch(std::path::PathBuf);
+struct Scratch(kbf_testkit::dir::TestDir);
 
 impl Scratch {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("kbf-managed-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        Self(dir)
+        Self(kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("kbf-managed-{name}"),
+        ))
     }
 
     /// The `--api-token-file` flag for a token file of this directory, 0600.
@@ -160,12 +160,6 @@ impl Scratch {
         std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .expect("mode");
         format!("--api-token-file={}", file.display())
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -949,8 +943,7 @@ async fn an_open_health_watch_does_not_hold_up_a_takeover() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_managed_process_opens_the_store_its_flags_name() {
     let node = Node::start().await;
-    let dir = std::env::temp_dir().join(format!("kbf-managed-flags-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-managed-flags");
     let state = |name: &str| format!("--state-store=sqlite://{}/{name}.db", dir.display());
     let cold = Stoppable::start(&managed_flags(&node, &[&state("cold")]), StoreSource::Flags).await;
     let view = cold.child.role().await;
@@ -987,7 +980,6 @@ async fn a_managed_process_opens_the_store_its_flags_name() {
         never.start_line()
     );
     drop(never);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a candidate that needs an operator API (a REAPI-only deployment would not

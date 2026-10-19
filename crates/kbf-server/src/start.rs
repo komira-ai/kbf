@@ -527,9 +527,7 @@ mod tests {
     /// log.
     #[tokio::test(flavor = "current_thread")]
     async fn serve_with_binds_over_a_store_the_caller_opened() {
-        let root =
-            std::env::temp_dir().join(format!("kbf-server-serve-with-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_dir::scratch_dir("kbf-server-serve-with");
         let args = Args::parse_from([
             "kbf-server",
             "--listen=127.0.0.1:0",
@@ -547,7 +545,6 @@ mod tests {
         let line = server.start_line().to_owned();
         assert!(line.ends_with(&format!(" log={id}")), "{line}");
         drop(server);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Catches: `--state-store` accepted by the flags and then ignored at start (the
@@ -557,9 +554,7 @@ mod tests {
     /// opened stops the start before anything is served.
     #[tokio::test(flavor = "current_thread")]
     async fn serve_with_opens_the_state_store_and_refuses_a_second_frontend() {
-        let root =
-            std::env::temp_dir().join(format!("kbf-server-state-flag-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_dir::scratch_dir("kbf-server-state-flag");
         let state = root.join("state").join("state.db");
         let args = Args::parse_from([
             "kbf-server".to_owned(),
@@ -587,7 +582,6 @@ mod tests {
         assert!(said.contains("another kbf process"), "{said}");
         drop(first);
         start("three").await.expect("free once the first is gone");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Catches the server sizing itself from anything but the CPU count: on the 44-core,

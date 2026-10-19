@@ -869,12 +869,9 @@ fn without_the_flag_there_is_no_history() {
     );
 }
 
-/// A scratch directory unique to this call.
-fn scratch(name: &str) -> PathBuf {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("history-wire-{}-{n}-{name}", std::process::id()))
+/// A scratch directory unique to this call, removed when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("history-wire-{name}"))
 }
 
 /// Catches: a `file://` history directory that is not opened and locked (two servers

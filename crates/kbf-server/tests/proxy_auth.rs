@@ -10,7 +10,6 @@ use std::future::{Ready, ready};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -44,20 +43,28 @@ fn presented_secret() -> String {
     hex::encode(SECRET)
 }
 
-fn dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-proxy-auth");
-    std::fs::create_dir_all(&dir).expect("a directory");
-    dir
+/// A file in a directory of its own, removed with it when this drops.
+struct Owned {
+    path: PathBuf,
+    _dir: kbf_testkit::dir::TestDir,
+}
+
+impl std::ops::Deref for Owned {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
 }
 
 /// A file holding `content` with `mode`, unique to this call.
-fn file(content: &[u8], mode: u32) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let path = dir().join(format!("secret-{}-{n}", std::process::id()));
+fn file(content: &[u8], mode: u32) -> Owned {
+    let dir =
+        kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-proxy-auth");
+    let path = dir.join("secret");
     std::fs::write(&path, content).expect("write the file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-    path
+    Owned { path, _dir: dir }
 }
 
 fn secret() -> Arc<ProxySecret> {
@@ -705,8 +712,8 @@ fn a_deny_list_that_cannot_be_read_or_parsed_stops_a_proxied_start_without_the_s
     let secret = file(&SECRET, 0o600);
     let secret = secret.to_str().expect("UTF-8");
     let bad = file(b"node a\nserial zz\n", 0o600);
-    let missing = dir().join("no-such-deny-list");
-    let _ = std::fs::remove_file(&missing);
+    let missing = file(b"", 0o600);
+    std::fs::remove_file(&missing.path).expect("remove the file, so it is missing");
     for (list, words) in [(bad, ["serial", ":2:"]), (missing, ["read", "no-such"])] {
         let list = list.to_str().expect("UTF-8");
         let error = args(&["--proxy-auth-file", secret, "--worker-deny-list", list])

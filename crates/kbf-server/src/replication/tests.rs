@@ -1,6 +1,6 @@
 //! [`replicate`], [`stopping`] and the repair worker's stop, over an in-memory cache.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,11 +39,9 @@ fn node() -> Arc<NodeMap> {
     Arc::new(NodeMap::new(Arc::new(MapHolder::new())))
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-replication-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A scratch directory of its own for `name`, removed when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::test_dir::scratch_dir(&format!("kbf-replication-{name}"))
 }
 
 fn replicated(
@@ -66,7 +64,8 @@ fn replicated(
 /// case taking the plain-text arm (no journal, no worker).
 #[tokio::test]
 async fn a_node_with_a_certificate_keeps_a_repair_journal_and_has_a_worker() {
-    let dir = scratch("chain").join(super::REPAIR_DIR);
+    let root = scratch("chain");
+    let dir = root.join(super::REPAIR_DIR);
     let farm = replicated(Admission::Certified, Some(ClientTlsConfig::new()), &dir)
         .unwrap_or_else(|e| panic!("{e}"));
     assert!(farm.worker.is_some());
@@ -84,7 +83,8 @@ async fn a_node_with_a_certificate_keeps_a_repair_journal_and_has_a_worker() {
 /// case building a chain (the service refuses it, and the directory is made).
 #[tokio::test]
 async fn a_plain_text_node_judges_by_the_map_and_keeps_no_journal() {
-    let dir = scratch("plain").join(super::REPAIR_DIR);
+    let root = scratch("plain");
+    let dir = root.join(super::REPAIR_DIR);
     let farm = replicated(Admission::Open, None, &dir).unwrap_or_else(|e| panic!("{e}"));
     assert!(farm.worker.is_none() && farm.repairs.is_none());
     assert!(!dir.exists());
@@ -112,7 +112,8 @@ async fn a_node_whose_journal_directory_cannot_be_made_does_not_start() {
 /// so the node does not start, and says the journal is the reason.
 #[tokio::test]
 async fn a_node_whose_journal_is_damaged_does_not_start() {
-    let dir = scratch("damaged").join(super::REPAIR_DIR);
+    let root = scratch("damaged");
+    let dir = root.join(super::REPAIR_DIR);
     std::fs::create_dir_all(&dir).expect("dir");
     std::fs::write(dir.join(JOURNAL), b"not a repair journal at all").expect("write");
     let error = replicated(Admission::Certified, Some(ClientTlsConfig::new()), &dir)
@@ -132,7 +133,8 @@ async fn a_node_whose_journal_is_damaged_does_not_start() {
 /// node.
 #[tokio::test]
 async fn a_chain_over_a_service_that_admits_every_caller_is_refused() {
-    let dir = scratch("open-chain").join(super::REPAIR_DIR);
+    let root = scratch("open-chain");
+    let dir = root.join(super::REPAIR_DIR);
     let error = replicated(Admission::Open, Some(ClientTlsConfig::new()), &dir)
         .err()
         .expect("refused");
@@ -173,7 +175,8 @@ async fn the_stop_follows_a_shutdown_that_is_dropped() {
 /// join never ends).
 #[tokio::test]
 async fn the_repair_worker_ends_when_it_is_stopped() {
-    let dir = scratch("worker").join(super::REPAIR_DIR);
+    let root = scratch("worker");
+    let dir = root.join(super::REPAIR_DIR);
     let worker = replicated(Admission::Certified, Some(ClientTlsConfig::new()), &dir)
         .unwrap_or_else(|e| panic!("{e}"))
         .worker
