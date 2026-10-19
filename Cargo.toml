@@ -221,6 +221,7 @@ kbf-route = { path = "crates/kbf-route" }
 kbf-sched = { path = "crates/kbf-sched" }
 kbf-segments = { path = "crates/kbf-segments" }
 kbf-server = { path = "crates/kbf-server" }
+kbf-signer = { path = "crates/kbf-signer" }
 kbf-sim = { path = "crates/kbf-sim" }
 kbf-sim-cell = { path = "crates/kbf-sim-cell" }
 kbf-state = { path = "crates/kbf-state" }
