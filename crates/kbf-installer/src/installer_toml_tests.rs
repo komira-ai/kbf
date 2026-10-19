@@ -35,6 +35,20 @@ fn the_database_key_is_accepted_and_rendered() {
     assert_eq!(InstallerToml::default().database, None);
 }
 
+/// Catches `render` writing the database URL with Rust's Debug escaping, which is not TOML
+/// (a `'` came out as `\'` and a non-ASCII character as `\u{..}`): the rendered file must
+/// parse back to the same URL.
+#[test]
+fn a_database_url_with_quotes_and_non_ascii_renders_as_toml() {
+    let url = "postgres://kbf@db/it's?application_name=caf\u{e9}\"x\\y";
+    let file = InstallerToml {
+        database: Some(url.to_owned()),
+        ..InstallerToml::default()
+    };
+    let back = InstallerToml::parse(&file.render()).expect("the rendered file parses");
+    assert_eq!(back.database.as_deref(), Some(url));
+}
+
 /// Catches a default that drifted from the contract (section 3): an empty file is a frontend
 /// source, 900 s window, 900 s fetch, 512 MiB, 60 s between activations.
 #[test]

@@ -68,7 +68,9 @@ pub struct Database {
 }
 
 impl Database {
-    /// The database `installer.toml` at `path` names, with this build's migrations.
+    /// The database `installer.toml` at `path` names, with this build's migrations. Reads only
+    /// the `database` key, leniently; `crate::installer_toml` is the closed reader of the whole
+    /// file and carries the key only so that it does not reject it.
     ///
     /// # Errors
     /// [`DatabaseError`]: the file, the key or the URL is wrong.

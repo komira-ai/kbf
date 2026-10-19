@@ -54,8 +54,8 @@ Options:
           The first release to install (40 hex characters)
       --no-start
           Enable the units without starting them
-      --config <CONFIG>
-          installer.toml, under the host root: for `--mode frontend` and `all-in-one`, its `database` key names the state database whose schema `setup` creates (or brings forward); without `--apply` it only reports what it would do [default: /etc/kbf/installer.toml]
+      --installer-config <INSTALLER_CONFIG>
+          installer.toml, under the host root: for `--mode frontend` and `all-in-one`, its `database` key names the state database whose schema `setup` creates (or brings forward); without `--apply` it only reports what it would do. Read for those two modes only. The same flag, with the same meaning, as on `run` [default: /etc/kbf/installer.toml]
   -h, --help
           Print help
 

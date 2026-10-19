@@ -584,9 +584,12 @@ impl<E: Exec> Helper<E> {
 
     fn activate(&mut self, order: &Order, now: u64, memory: &Memory) -> Result<Done, String> {
         // Before the links move: a release must not start on a schema it cannot run on.
-        // Only a release this order fetched has a schema known here (its own report). An
-        // order for the release already running, or for one this pass did not fetch, asks
-        // for no migration and says so in the log: kbf's own start check is what guards it.
+        // The schema is known here only for the release this helper has staged (its own
+        // report): the rule is "the staged commit equals the order's". An order for any other
+        // release (one fetched by an earlier run, say) asks for no migration and says so in
+        // the log: kbf's own start check guards it. The staged release stays staged after its
+        // swap, so a repeat of its activation asks again (idempotent, but refused while the
+        // database is down).
         if let Some(step) = self.schema.as_mut() {
             match memory.staged.as_ref().filter(|f| f.commit == order.commit) {
                 Some(staged) => {

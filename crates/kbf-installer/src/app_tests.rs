@@ -414,11 +414,16 @@ fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
 /// that cannot be read stops the service rather than starting it without the step.
 ///
 /// Mutants seen red: the unit check removed (the all-in-one unit ran its pass); the unit
-/// check matching `kbf-frontend` without the `@` (the plain `kbf-frontend.service` refused).
+/// check matching `kbf-frontend` without the `@` (the plain `kbf-frontend.service` refused);
+/// the all-in-one template (`kbf-all-in-one@1.service`) is in the test list.
 #[test]
 fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
     let (_, root) = seeded("run-database");
-    for unit in ["kbf-all-in-one.service", "kbf-frontend@main.service"] {
+    for unit in [
+        "kbf-all-in-one.service",
+        "kbf-all-in-one@1.service",
+        "kbf-frontend@main.service",
+    ] {
         let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
         assert_eq!(exit, Exit::Usage, "{unit}: {err}");
         assert_eq!(
@@ -455,6 +460,58 @@ fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
     );
     assert_eq!(exit, Exit::Failed, "{err}");
     assert!(err.contains("missing.toml"), "{err}");
+}
+
+/// Catches a relative `--installer-config` (on `run` or `setup`) being quietly re-rooted
+/// under `/` and read from somewhere the operator did not name: both flags take a host path
+/// like `--update-dir` does, so a relative one is a usage error (clap, exit 2), not a read.
+#[test]
+fn the_installer_config_flag_must_be_an_absolute_host_path() {
+    for args in [
+        &[
+            "run",
+            "--unit",
+            "kbf.service",
+            "--installer-config",
+            "etc/kbf/installer.toml",
+        ][..],
+        &[
+            "setup",
+            "--mode=frontend",
+            "--installer-config",
+            "./installer.toml",
+        ][..],
+    ] {
+        let mut full = vec!["kbf-installer"];
+        full.extend_from_slice(args);
+        assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
+    }
+}
+
+/// Catches the success line of the database step of `setup` going nowhere or in the wrong
+/// shape: text mode prints the bare line, `--json` one object with the verb, `--apply` and
+/// the message. (The step itself needs a Postgres server; CI's state-postgres job runs it.)
+#[test]
+fn the_database_step_prints_its_line_as_text_or_json() {
+    let mut text = Vec::new();
+    print_success(
+        false,
+        true,
+        "setup",
+        "kbf-installer setup (frontend): database step: x",
+        &mut text,
+    );
+    assert_eq!(
+        String::from_utf8(text).expect("text"),
+        "kbf-installer setup (frontend): database step: x\n"
+    );
+    let mut json = Vec::new();
+    print_success(true, false, "setup", "the line", &mut json);
+    let object: serde_json::Value = serde_json::from_slice(&json).expect("one object");
+    assert_eq!(
+        object,
+        serde_json::json!({"verb": "setup", "apply": false, "message": "the line"})
+    );
 }
 
 /// Catches `setup` taking the database step for a mode with no database, or demanding root
