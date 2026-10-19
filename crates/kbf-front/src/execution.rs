@@ -885,18 +885,17 @@ fn refuse_platform(platform: Option<&reapi::Platform>) -> Result<Platform, Statu
 }
 
 /// Whether `platform` (as [`properties`] returns it) names nothing kbf places an action
-/// on: no OS, no architecture, no ISA level, no `xcode` and no `ios.device*`. Those are
+/// on: no OS, no architecture, no ISA level, no `xcode` and no `ios.device`. Those are
 /// the canonical names of everything that decides an OS, an architecture or a Mac-only
-/// resource, in whatever spelling the client sent them.
+/// resource, in whatever spelling the client sent them. (An `ios.device.<attribute>`
+/// without `ios.device` is refused by [`needs`] whether or not the default was added, so
+/// it needs no word here.)
 fn wants_default(platform: &Platform) -> bool {
     !platform.canonical().any(|(name, _)| {
         matches!(
             name,
             "OSFamily" | "ISA" | "Arch" | "os" | "arch" | "isa_level" | "xcode"
         ) || name == IOS_DEVICE_KEY
-            || name
-                .strip_prefix(IOS_DEVICE_KEY)
-                .is_some_and(|rest| rest.starts_with('.'))
     })
 }
 

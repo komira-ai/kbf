@@ -658,6 +658,22 @@ async fn a_bad_platform_is_refused_before_the_inputs_are_read() {
     assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
     assert!(status.message().contains("\"label.pool\""), "{status:?}");
 
+    // The Action's platform is read before the Command: a Command that does not decode
+    // does not hide a bad key (the refusal names `pool`, not the Command).
+    let garbage = Blob::new(vec![0xff, 0xff, 0xff]);
+    let before_command = Blob::of(&Action {
+        command_digest: Some(garbage.proto.clone()),
+        input_root_digest: Some(Blob::of(&Directory::default()).proto),
+        platform: Some(Platform {
+            properties: vec![property("pool", "x")],
+        }),
+        ..Default::default()
+    });
+    farm.upload(&[&before_command, &garbage]).await;
+    let status = start(&farm, &before_command).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(status.message().contains("\"pool\""), "{status:?}");
+
     // A good platform with the same blobs missing is still MISSING: the check does not
     // refuse what it should not.
     let fine = action_with_nothing_else("fine", &[("OSFamily", "linux")]);

@@ -59,6 +59,7 @@ fn only_a_platform_that_names_no_placement_gets_the_default() {
         &[("XCODE", "16C5032a")],
         &[("ios.device", "1")],
         &[("ios.device", "1"), ("ios.device.class", "iPhone")],
+        &[("ios.device", "1"), ("OSFamily", "darwin")],
         &[("OSFamily", "linux"), ("gpu", "1")],
     ] {
         assert!(!defaulted(names), "{names:?} should not be defaulted");
