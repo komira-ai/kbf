@@ -187,7 +187,7 @@ async fn a_restart_removes_what_its_predecessor_left() {
 
 /// Catches the lease's directories not being given to the container's root before the
 /// action runs, or not being given back after it and before the outputs are read: the
-/// order is `chown 1:1`, the run, `chown 0:0`.
+/// order is `chown 1001:1001`, the run, `chown 0:0`.
 #[tokio::test]
 async fn the_lease_is_handed_to_the_container_and_back() {
     let fake = Fake::new("conf-hand-over");
@@ -207,7 +207,7 @@ async fn the_lease_is_handed_to_the_container_and_back() {
         .iter()
         .position(|e| e == "run ended")
         .expect("the run ended");
-    assert!(at("chown 1:1") < ended, "{events:?}");
+    assert!(at("chown 1001:1001") < ended, "{events:?}");
     assert!(ended < at("chown 0:0"), "{events:?}");
     fake.assert_clean(1);
 }

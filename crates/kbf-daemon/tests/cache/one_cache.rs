@@ -43,6 +43,9 @@ async fn entries_make_room_for_local_storage() {
     let mut config = config(&dir, 300, Arc::clone(&gates), &clock);
     config.local = Some(Arc::clone(&local));
     let cache = Cache::open(config).expect("open");
+    // The start-up drain reads local storage's bytes when it runs; let it finish before
+    // they change, or it may evict beside the `evict` below and the counts tear.
+    gates.wait_started();
     let cas = CountingCas::default();
     for tag in 1..=3_u8 {
         clock.advance(10);

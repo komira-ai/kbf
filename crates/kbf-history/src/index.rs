@@ -16,10 +16,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_state::{
-    Commit, Conflict, Direction, ScanPage, ScanRange, Store, StoreError, Txn, Versioned,
+    Commit, Conflict, Direction, Op, Permit, ScanPage, ScanRange, Store, StoreError, Txn, Versioned,
 };
 
-use crate::keys::IndexRoot;
+use crate::keys::{IndexRoot, WriterId};
 
 /// The future an [`Offload`] returns.
 pub type Offloaded = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -50,6 +50,9 @@ pub struct HistoryIndex {
     store: Arc<dyn Store>,
     root: IndexRoot,
     offload: Arc<dyn Offload>,
+    /// What a writer of this index may write after another process holds the store's
+    /// generation ([`HistoryIndex::exempting`]); `None` when the store has no generation.
+    exempt: Option<Permit>,
 }
 
 impl HistoryIndex {
@@ -60,7 +63,33 @@ impl HistoryIndex {
             store,
             root,
             offload,
+            exempt: None,
         }
+    }
+
+    /// This index for the writer `writer`: the rows [`IndexRoot::permit`] names are
+    /// written without the store's generation check, so a process that a successor has
+    /// superseded still records the runs of the calls it kept. A store with no
+    /// generation to check is used as it is.
+    #[must_use]
+    pub fn exempting(mut self, writer: WriterId) -> HistoryIndex {
+        let permit = self.root.permit(writer);
+        if let Some(own) = self.store.own_keys(Arc::clone(&permit)) {
+            self.store = own;
+            self.exempt = Some(permit);
+        }
+        self
+    }
+
+    /// Whether the store gave this index a handle that writes some rows unchecked.
+    pub(crate) fn is_exempting(&self) -> bool {
+        self.exempt.is_some()
+    }
+
+    /// Whether a write of `op` goes around the generation check: the index is
+    /// [`exempting`](HistoryIndex::exempting) and the permit accepts it.
+    pub(crate) fn exempts(&self, op: &Op) -> bool {
+        self.exempt.as_ref().is_some_and(|permit| permit(op))
     }
 
     /// The root the rows live under.
