@@ -70,10 +70,11 @@ refused, exit 2, before any release is run):
    `storage-and-daemon`) keeps no server state, and a run with no `--mode` makes no database step. The first
    crossing cannot be a swap, and **no state is copied**: the farm starts on an empty database, the SQLite
    file is not read, not copied and not changed, and a Postgres row is never copied back.
-   - Postgres, its `kbf` role and its `kbf` database must exist already (design section 11 has the package
-     depend on Postgres and `setup` create the role and database; while the old state is unmigrated `setup`
-     of this mode refuses, see below, so the order of the two is the host preparation's to settle); the
-     migration creates none of them. Its first look asks the database (the same call as `setup`'s dry
+   - Postgres, its `kbf` role and its `kbf` database must exist already: they are the host preparation's
+     (design section 11 has the package depend on Postgres; `setup` as built needs the database too and
+     creates neither, and it refuses while the old state is unmigrated, so they come first). The migration
+     creates none of them. The URL is section 11's, `postgres:///kbf?host=/run/postgresql`: give `setup
+     --database` the same. Its first look asks the database (the same call as `setup`'s dry
      run) and, when it cannot be asked, refuses with exit 2 naming what must exist, before any program runs
      and in a dry run too. A database whose schema is ahead of this installer is refused (exit 1).
    - A dry run lists the schema step (create, bring forward, or nothing to apply), the units whose

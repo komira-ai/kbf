@@ -479,7 +479,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     }
 
     // Catches a stop that SIGKILLs a drain (every build in flight fails), and a daemon
-    // that holds a stop for ever (it does not drain).
+    // that holds a stop for ever (it drains only to its deadline) or stops before it.
     let timeout = unit
         .directives()
         .iter()
@@ -490,11 +490,22 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         .map(|d| trim(&d.value));
     let signal = unit.get_in("Service", "KillSignal").map(trim);
     if mode == "daemon" {
-        if timeout == Some("infinity") {
-            v(
+        // The default of `--drain-deadline-secs` (kbf-node, `Cli::drain_deadline_secs`);
+        // kbf-it does not depend on kbf-node, so the number is repeated here.
+        const DRAIN_DEADLINE_SECS: u64 = 600;
+        match timeout.map(|t| t.parse::<u64>()) {
+            Some(Ok(secs)) if secs > DRAIN_DEADLINE_SECS => {}
+            _ => v(
                 "stop",
-                "TimeoutStopSec=infinity on a daemon, which does not drain".into(),
-            );
+                format!(
+                    "TimeoutStopSec= is {timeout:?} on a daemon, not a finite number of \
+                     seconds above its {DRAIN_DEADLINE_SECS} s drain deadline (0 and \
+                     infinity mean no timeout, a smaller one SIGKILLs the drain)"
+                ),
+            ),
+        }
+        if !matches!(signal, Some("SIGTERM" | "TERM" | "15")) {
+            v("stop", format!("KillSignal= is {signal:?}, not SIGTERM"));
         }
     } else {
         if timeout != Some("infinity") {
@@ -960,6 +971,18 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "stop",
     ),
     (
+        "kbf-daemon.service",
+        "\nTimeoutStopSec=660\n",
+        "\nTimeoutStopSec=infinity\n",
+        "stop",
+    ),
+    (
+        "kbf-daemon.service",
+        "\nKillSignal=SIGTERM\n",
+        "\nKillSignal=SIGKILL\n",
+        "stop",
+    ),
+    (
         "kbf-storage-and-daemon.service",
         "\nDelegate=yes\n",
         "\nDelegate=memory pids\n",
@@ -1045,6 +1068,34 @@ fn each_planted_defect_is_reported_by_its_rule() {
             "{file}: mutant `{from}` -> `{to}` was not reported by rule {rule}: {found:?}"
         );
     }
+}
+
+/// Catches a daemon stop timeout the rule lets through that cuts a drain short or holds a
+/// stop for ever: none, `infinity`, `0`, the deadline itself (600), and a word that is not
+/// seconds are refused; 601 and the shipped 660 are accepted. Refusing 660 would fail
+/// the real unit; accepting 600 SIGKILLs a drain that runs its whole deadline.
+#[test]
+fn a_daemon_stop_timeout_must_exceed_the_drain_deadline() {
+    let name = "kbf-daemon.service";
+    let text = read(name);
+    let shipped = "\nTimeoutStopSec=660\n";
+    assert!(text.contains(shipped));
+    let stop = |mutant: &str| {
+        violations(name, mutant)
+            .into_iter()
+            .filter(|f| f.starts_with("stop:"))
+            .count()
+    };
+    for ok in ["660", "601"] {
+        let t = text.replacen(shipped, &format!("\nTimeoutStopSec={ok}\n"), 1);
+        assert_eq!(stop(&t), 0, "{ok} was refused");
+    }
+    for bad in ["infinity", "0", "600", "90", "11min"] {
+        let t = text.replacen(shipped, &format!("\nTimeoutStopSec={bad}\n"), 1);
+        assert_eq!(stop(&t), 1, "{bad} was accepted");
+    }
+    let none = text.replacen(shipped, "\n", 1);
+    assert_eq!(stop(&none), 1, "no TimeoutStopSec= was accepted");
 }
 
 /// Catches a rule with no mutant (a check that cannot be shown to fail), and a mutant

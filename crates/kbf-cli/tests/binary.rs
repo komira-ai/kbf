@@ -137,6 +137,7 @@ fn version_json_reports_the_build_identity() {
             [
                 "admin_protocol",
                 "commit",
+                "meta_log",
                 "min_protocol",
                 "profile",
                 "protocol",
@@ -154,6 +155,7 @@ fn version_json_reports_the_build_identity() {
             "release"
         };
         assert_eq!(v["profile"], profile);
+        assert_eq!(v["meta_log"], kbf_server::raft_log::RUNS.get());
         assert_eq!(v["protocol"], kbf_server::worker::PROTOCOL_VERSION);
         assert_eq!(
             v["min_protocol"],

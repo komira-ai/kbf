@@ -43,11 +43,15 @@ kbf-driver-container.workspace = true
 kbf-meta.workspace = true
 # The store a blob is in, to damage one (src/plane_tests.rs).
 kbf-objstore.workspace = true
+# The tree removal a hardened process must still manage (tests/hardened_removal.rs).
+kbf-outputs.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 # inotify, which counts the opens of each output file (tests/one_read.rs).
 rustix = { workspace = true, features = ["fs"] }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "time"] }
+# The scratch directories every test owns and removes (TestDir).
+kbf-testkit.workspace = true
 
 [lints]
 workspace = true

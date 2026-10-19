@@ -8,47 +8,39 @@ use std::time::Duration;
 use serde_json::json;
 
 use super::*;
+use crate::deploy::api::parse_reply;
 
 fn broken(call: &'static str, how: Breaks, after_desired: bool) -> Broken {
-    Broken {
-        call,
-        how,
-        after_desired,
-    }
+    let b = Broken::new(call, how);
+    if after_desired { b.after_desired() } else { b }
 }
 
-fn summary_with(b: Broken) -> Summary {
-    let mut f = farm(two_nodes());
-    f.broken.push(b);
-    go(&f)
-}
-
-/// Proves each call the deploy makes before it touches a node, when it fails, ends the
-/// deploy as an API error (exit 1) naming the step and applying nothing further: the
-/// baseline reads, the desired release, the read-back of it, the frontend order. Catches a
-/// deploy that goes on after an answer it did not get, or ends with another reason.
+/// Proves each call the deploy makes before it touches the frontend, when it fails, ends
+/// the deploy as an API error (exit 1) naming the step and applying nothing further: the
+/// reads of the baseline and of the update status. Catches a deploy that goes on after an
+/// answer it did not get, or ends with another reason.
 ///
-/// Mutants planted: the baseline `members` error ignored; the read-back error ignored; the
-/// frontend POST error mapped to a refusal.
+/// Mutants planted: the baseline `members` error ignored; the status error ignored.
 #[test]
-fn a_call_that_fails_ends_the_deploy_as_an_api_error() {
-    for (call, how, after) in [
-        ("GET /v1/update", Breaks::Io, false),
-        ("GET /v1/update", Breaks::Body("nope"), false),
-        ("GET /v1/members", Breaks::Io, false),
-        ("POST /v1/update/desired", Breaks::Io, false),
-        ("POST /v1/update/desired", Breaks::Status(500), false),
-        ("GET /v1/update", Breaks::Io, true),
-        ("POST /v1/update/frontend", Breaks::Io, false),
-        ("POST /v1/update/frontend", Breaks::Status(500), false),
+fn a_call_that_fails_before_the_update_ends_the_deploy_as_an_api_error() {
+    for (call, how) in [
+        ("GET /v1/update", Breaks::Io),
+        ("GET /v1/update", Breaks::Body("nope")),
+        ("GET /v1/members", Breaks::Io),
+        ("GET /v1/update/frontend", Breaks::Io),
+        ("GET /v1/update/frontend", Breaks::Status(500)),
+        ("GET /v1/update/frontend", Breaks::Body("nope")),
     ] {
-        let s = summary_with(broken(call, how, after));
+        let mut f = farm(two_nodes());
+        f.broken.push(Broken::new(call, how));
+        let s = go(&f);
         assert_eq!(
             (s.exit, s.reason.as_str()),
             (1, "api_error"),
             "{call}: {}",
             s.line()
         );
+        assert_eq!(f.requests("POST"), 0, "{call}");
     }
 }
 
@@ -59,7 +51,8 @@ fn a_call_that_fails_ends_the_deploy_as_an_api_error() {
 #[test]
 fn an_upload_that_cannot_be_sent_is_an_upload_failure() {
     let mut f = farm(two_nodes());
-    f.broken.push(broken("PUT /v1/releases", Breaks::Io, false));
+    f.broken
+        .push(broken("PUT /v1/releases/*", Breaks::Io, false));
     let bundle = tarball(&[(&format!("kbf-{TARGET}-linux-x86_64.tar.gz"), b"t")]);
     let mut input: &[u8] = &bundle;
     let s = run_with(&f, &opts(true), SmokeResult::Pass, Some(&mut input));
@@ -71,27 +64,12 @@ fn an_upload_that_cannot_be_sent_is_an_upload_failure() {
     );
 }
 
-/// Proves a read-back of the desired release that names no desired release leaves the
-/// generation unknown and the deploy still waits for the nodes by commit; and that a nodes
-/// list that cannot be read while waiting is not a confirmation: the deploy times out.
-/// Catches a deploy that treats an unknown generation as a reason to stop, or an unreadable
-/// list as every node confirmed.
+/// Proves a nodes list that cannot be read while waiting is not a confirmation: the deploy
+/// times out. Catches an unreadable list read as every node confirmed.
 ///
-/// Mutants planted: an unknown generation treated as "stale"; an unreadable nodes list
-/// read as an empty list that confirms everyone.
+/// Mutants planted: an unreadable nodes list read as an empty list that confirms everyone.
 #[test]
-fn an_unknown_generation_still_waits_and_an_unreadable_list_times_out() {
-    let s = summary_with(broken("GET /v1/update", Breaks::Body("{}"), true));
-    assert_eq!(s.generation, None, "{}", s.line());
-    // The nodes are still waited for, by commit; the frontend order is what cannot be
-    // followed with this answer.
-    assert_eq!(s.nodes.len(), 2, "{}", s.line());
-    assert!(
-        s.nodes.iter().all(|n| n.state == "confirmed"),
-        "{}",
-        s.line()
-    );
-
+fn an_unreadable_nodes_list_times_out() {
     let mut f = farm(two_nodes());
     f.broken.push(broken("GET /v1/nodes", Breaks::Io, true));
     let mut o = opts(true);
@@ -103,6 +81,38 @@ fn an_unknown_generation_still_waits_and_an_unreadable_list_times_out() {
         "{}",
         s.line()
     );
+}
+
+/// Proves a farm whose every node may be offline and is not listed is no roll that has
+/// finished: an empty list confirms nothing, and the deploy times out with no node to name.
+/// Catches an `all()` over nodes that are all offline passing on an empty list.
+///
+/// Mutants planted: the `!list.is_empty()` check dropped.
+#[test]
+fn nodes_that_may_all_be_offline_and_are_not_listed_confirm_nothing() {
+    let unlisted = |id: &'static str| {
+        let mut n = node(id, "linux-x86_64", Fate::Confirm(100));
+        n.relisted_after = Some(1_000_000);
+        n
+    };
+    let f = farm(vec![unlisted("a-store"), unlisted("b-store")]);
+    let mut o = opts(true);
+    o.allow_offline = vec!["a-store".to_owned(), "b-store".to_owned()];
+    o.node_timeout = Duration::from_secs(60);
+    let s = run_with(&f, &o, SmokeResult::Pass, None);
+    assert_eq!(
+        (s.exit, s.reason.as_str()),
+        (1, "node_not_confirmed"),
+        "{}",
+        s.line()
+    );
+    assert!(
+        s.detail.starts_with("no node listed: timed_out"),
+        "{}",
+        s.detail
+    );
+    let by: Vec<_> = s.nodes.iter().map(|n| n.state.as_str()).collect();
+    assert_eq!(by, ["offline", "offline"]);
 }
 
 /// Proves the post-check's node reader wants every one of: a server on the commit, a
@@ -288,40 +298,6 @@ fn the_system_clock_tells_the_time_and_sleeps() {
     assert!(before.elapsed() >= Duration::from_millis(5));
 }
 
-/// Proves an upload is sent as `application/octet-stream` and a JSON post as
-/// `application/json`. Catches a store upload sent as JSON.
-///
-/// Mutants planted: the two types swapped.
-#[test]
-fn a_raw_body_is_sent_as_octet_stream() {
-    use std::io::{Read, Write};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = std::thread::spawn(move || {
-        let (mut s, _) = listener.accept().unwrap();
-        let mut got = Vec::new();
-        while !got.ends_with(b"\r\n\r\nabc") {
-            let mut buf = [0u8; 256];
-            let n = s.read(&mut buf).unwrap();
-            got.extend_from_slice(&buf[..n]);
-        }
-        s.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}")
-            .unwrap();
-        String::from_utf8_lossy(&got).into_owned()
-    });
-    let http = Http::new(addr, "tok".to_owned(), Duration::from_secs(5)).unwrap();
-    let reply = http
-        .send(&Request::put_raw("/v1/x", b"abc".to_vec()))
-        .unwrap();
-    assert_eq!(reply.status, 201);
-    let seen = server.join().unwrap();
-    assert!(seen.starts_with("PUT /v1/x HTTP/1.1"), "{seen}");
-    assert!(
-        seen.contains("Content-Type: application/octet-stream"),
-        "{seen}"
-    );
-}
-
 /// Proves a node that drops off while the deploy waits for it, and was not allowed to be
 /// offline, is waited for like any unconfirmed node (and the deploy times out), and a farm
 /// that is not ready after everything else is fine fails the post-check on that alone.
@@ -372,4 +348,23 @@ fn an_unallowed_offline_node_is_waited_for_and_readiness_alone_fails_the_post_ch
 fn a_reply_whose_head_is_not_text_is_refused() {
     let err = parse_reply(b"HTTP/1.1 200 OK\r\nX: \xff\xfe\r\n\r\nbody").unwrap_err();
     assert!(err.to_string().contains("headers are not text"), "{err}");
+}
+
+/// Proves the deploy lock is free again as soon as it is dropped, even when a child
+/// forked while it was held still has a copy of the descriptor: an `flock` belongs to
+/// the open file description, which that copy keeps alive, so a lock released by the
+/// close alone stays held until the child execs.
+/// Catches a `Lock` that relies on the close to release the `flock`.
+///
+/// Mutant seen red: no `Drop` for `Lock` (the second take finds it held).
+#[test]
+fn the_lock_is_free_at_once_when_a_forked_child_has_a_copy() {
+    let (_, dir) = crate::testkit::host_root("deploy-lock-forked");
+    let path = dir.join("run/lock");
+    let held = lock(&path).unwrap().expect("taken");
+    let child = kbf_testkit::forked::ForkedChild::before_exec();
+    drop(held);
+    let again = lock(&path).unwrap();
+    child.finish();
+    assert!(again.is_some(), "the lock outlived its drop");
 }

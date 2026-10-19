@@ -144,6 +144,16 @@ pub struct State {
     pub under_since: Option<u64>,
     /// The final status, once the bake has ended green or red. Extended is not final.
     pub ended: Option<Status>,
+    /// The hand-off's word on whether the release can be walked back.
+    #[serde(default)]
+    pub reversible: Option<bool>,
+    /// The commit the deploy replaced: where a rollback goes.
+    #[serde(default)]
+    pub previous_commit: Option<CommitId>,
+    /// What became of the automatic rollback of a red end, in a sentence; absent if none was
+    /// asked for or the bake did not end red.
+    #[serde(default)]
+    pub rollback: Option<String>,
 }
 
 impl State {
@@ -173,6 +183,9 @@ impl State {
             builds: 0,
             under_since: None,
             ended: None,
+            reversible: None,
+            previous_commit: None,
+            rollback: None,
         }
     }
 

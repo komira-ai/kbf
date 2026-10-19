@@ -6,8 +6,9 @@
 //! on an empty database, and the SQLite file is left exactly as it is, which is what a rollback
 //! returns to (a Postgres row is never copied back).
 //!
-//! Postgres, its `kbf` role and its `kbf` database are the host's to have (the package and
-//! `setup`); the migration creates none of them and refuses when the database cannot be asked.
+//! Postgres, its `kbf` role and its `kbf` database are the host preparation's (`setup` creates
+//! neither the role nor the database either); the migration creates none of them and refuses
+//! when the database cannot be asked.
 //! A node (a storage, daemon or storage-and-daemon host) keeps no server state, so it has no
 //! [`StateStore`] and none of these steps.
 

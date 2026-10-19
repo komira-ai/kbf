@@ -167,6 +167,25 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
     ("log", &["log-dir", "log-files", "log-max-bytes"]),
     (
+        // Not `enroll` or `frontend`: those tables are the enrollment client's own.
+        "enroll-service",
+        &[
+            "ca-dev-file-signer",
+            "ca-dir",
+            "ca-signer",
+            "enroll-allow-unenforced-deny",
+            "enroll-cas-endpoint",
+            "enroll-cert-lifetime-secs",
+            "enroll-listen",
+            "enroll-max-in-flight",
+            "enroll-rate-burst",
+            "enroll-rate-per-minute",
+            "enroll-storage-port",
+            "enroll-worker-endpoint",
+            "frontend-name",
+        ],
+    ),
+    (
         "identity",
         &[
             "ca-cert",
@@ -189,6 +208,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "daemon-user",
             "data-dir",
             "data-max-bytes",
+            "drain-deadline-secs",
             "driver",
             "image",
             "orders-dir",

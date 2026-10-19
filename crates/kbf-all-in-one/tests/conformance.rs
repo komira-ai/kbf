@@ -7,17 +7,18 @@
 //! over one without, where each record is hashed as its ranges arrive. The transfer
 //! engine, the remote plane, runs the same checks in `kbf-cas-conformance`'s own tests.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::Parser as _;
 use kbf_all_in_one::LocalDataPlane;
 use kbf_cas_conformance::Subject;
+use kbf_testkit::dir::TestDir;
 
 /// A server per [`Subject::fresh`], with a write tier of its own or none.
 struct Local {
-    scratch: PathBuf,
+    scratch: TestDir,
     tier: bool,
 }
 
@@ -28,10 +29,7 @@ static STARTED: AtomicU64 = AtomicU64::new(0);
 impl Local {
     fn new(tier: bool) -> Self {
         let name = if tier { "local-tier" } else { "local-no-tier" };
-        let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-all-in-one-conformance")
-            .join(format!("{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&scratch).expect("scratch directory");
+        let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("conformance-{name}"));
         Self { scratch, tier }
     }
 }
