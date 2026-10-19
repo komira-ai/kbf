@@ -68,10 +68,10 @@ use std::time::{Duration, Instant};
 use kbf_installer::CommitId;
 use kbf_installer::proxy::gate_real::ProxyGate;
 use kbf_installer::proxy::model::{
-    AdoptError, Locator, Mode, OpenCounts, Phase, Plan, PortError, ProcIdent, Readiness, Retired,
-    RoleInfo, RoleState, Slot, StagedFacts, Start, Timing,
+    AdoptError, Halt, Locator, Mode, OpenCounts, Phase, Plan, PortError, ProcIdent, Readiness,
+    Retired, RoleInfo, RoleState, Slot, StagedFacts, Start, Timing,
 };
-use kbf_installer::proxy::ports::{Child, ChildAdmin, Gate, Migrator, Ports, RootOrders};
+use kbf_installer::proxy::ports::{Child, ChildAdmin, Clock, Gate, Migrator, Ports, RootOrders};
 use kbf_installer::proxy::runtime::{RequestQueue, SystemClock};
 use kbf_installer::proxy::{FileRecorder, Swap};
 use kbf_proxy::Proxy;
@@ -93,6 +93,30 @@ const DWELL: Duration = Duration::from_millis(600);
 
 /// The test's clock for its own waits.
 const WAIT: Duration = Duration::from_secs(30);
+
+/// The most the whole swap may take. A swap stuck in a wait that has no timeout of its own
+/// (the old slot's close, say) is stopped at this bound and the test fails.
+const SWAP_BOUND: Duration = Duration::from_secs(120);
+
+/// The system clock whose `sleep` fails once `stop` is set, so a swap stuck in a poll loop
+/// returns `Halt::Interrupted` instead of holding `thread::scope` open for ever.
+struct Stoppable {
+    inner: SystemClock,
+    stop: AtomicBool,
+}
+
+impl Clock for Stoppable {
+    fn now(&self) -> Duration {
+        self.inner.now()
+    }
+
+    fn sleep(&self, d: Duration) -> Result<(), Halt> {
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(Halt::Interrupted);
+        }
+        self.inner.sleep(d.min(Duration::from_millis(50)))
+    }
+}
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -472,7 +496,11 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
     };
     let state = dir.join("state");
     std::fs::create_dir_all(&state).expect("state dir");
-    let (clock, requests) = (SystemClock::new(), RequestQueue::new());
+    let clock = Stoppable {
+        inner: SystemClock::new(),
+        stop: AtomicBool::new(false),
+    };
+    let requests = RequestQueue::new();
     let plan = Plan {
         update_id: "u-aio-soak".to_owned(),
         request_id: "r-aio-soak".to_owned(),
@@ -505,7 +533,19 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
         until_ready(&client).await;
         (client, driver)
     });
+    let swap_over = AtomicBool::new(false);
     let (end, notes) = std::thread::scope(|scope| {
+        // The deadline: a swap still running at SWAP_BOUND is stopped (its next sleep fails).
+        scope.spawn(|| {
+            let started = Instant::now();
+            while !swap_over.load(Ordering::SeqCst) {
+                if started.elapsed() >= SWAP_BOUND {
+                    clock.stop.store(true, Ordering::SeqCst);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
         let swap = scope.spawn(|| {
             // The recorder is not `Sync`, and only the swap uses it.
             let recorder = FileRecorder::new(&state);
@@ -521,9 +561,12 @@ fn an_all_in_one_swap_feeds_two_hundred_held_streams_to_the_new_child() {
             };
             let mut swap = Swap::begin(ports, plan.clone(), Some(old.clone())).expect("begin");
             let end = swap.run();
+            swap_over.store(true, Ordering::SeqCst);
             (end, swap.notes().to_vec())
         });
-        client_runtime.block_on(async {
+        // A failed check in the body stops the swap before the scope joins it.
+        let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client_runtime.block_on(async {
 
             // The swap has stopped the old process and cleared the active slot, and has not
             // started the new one: it is in the migration.
@@ -647,11 +690,25 @@ child ready, or a hold that ran out, shows here)"
             assert!(!driver.is_finished(), "the client's one connection stayed up");
             drop(served);
             until("B's executions end", || open_executions(&api_b) == 0).await;
-        });
+            });
+        }));
+        if let Err(panic) = body {
+            clock.stop.store(true, Ordering::SeqCst);
+            swap_over.store(true, Ordering::SeqCst);
+            let _ = swap.join();
+            eprintln!("the ports' log when the test failed: {:#?}", log.lines());
+            std::panic::resume_unwind(panic);
+        }
         swap.join().expect("the swap thread")
     });
 
-    assert_eq!(end, Ok(Phase::Done), "the swap's end, notes {notes:?}");
+    let last = log.lines().last().cloned();
+    assert_eq!(
+        end,
+        Ok(Phase::Done),
+        "the swap's end (Interrupted: it was stopped at {SWAP_BOUND:?}, stuck after the port call \
+         {last:?}), notes {notes:?}"
+    );
     assert!(notes.is_empty(), "the swap noted: {notes:?}");
     let steps = log.lines();
     assert!(
