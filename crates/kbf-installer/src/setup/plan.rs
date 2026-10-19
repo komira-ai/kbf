@@ -89,7 +89,7 @@ fn serves_api(mode: Mode) -> bool {
     matches!(mode, Mode::Frontend | Mode::AllInOne)
 }
 
-fn fetch_user(platform: Platform) -> &'static str {
+pub fn fetch_user(platform: Platform) -> &'static str {
     match platform {
         Platform::Linux => "kbf-fetch",
         Platform::MacOs => "_kbf-fetch",

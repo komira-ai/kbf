@@ -74,9 +74,16 @@ pub enum SetupError {
     #[error("no free id between 300 and 399 for the fetch account")]
     NoFreeId,
     #[error(
-        "the old layout is still on this host ({0}): kbf-installer and the retired kbf-helper/kbf-deploy never both manage a host, and the migration is not built; setup stops"
+        "the old layout is still on this host ({path}): kbf-installer and the retired kbf-helper/kbf-deploy never both manage a host; this build cannot migrate it (komira-ai/kbf#1083 builds `kbf-installer migrate --apply --fetch-user {fetch_user} [--unit UNIT]`, and setup will not accept the host before that has finished), so stop the host's units and move /usr/local/kbf and /var/lib/kbf-deploy aside by hand; setup stops"
     )]
-    OldLayout(String),
+    OldLayout {
+        path: String,
+        fetch_user: &'static str,
+    },
+    #[error(
+        "{path} is a regular file and shadows the packaged unit {unit} (systemd reads /etc before /usr/lib, so enabling would keep its old flags): move it aside (mv {path} {path}.old; systemctl daemon-reload) and run setup again; setup never deletes a unit"
+    )]
+    ShadowUnit { path: String, unit: &'static str },
     #[error("{0}")]
     Fetch(#[from] FetchError),
     #[error("{0}")]
@@ -105,7 +112,9 @@ impl SetupError {
             | SetupError::Unsupported(_)
             | SetupError::NoUser { .. } => Exit::Usage,
             SetupError::Fetch(FetchError::Rejected(_)) => Exit::Refused,
-            SetupError::NeedsOperator(_) | SetupError::OldLayout(_) => Exit::NeedsOperator,
+            SetupError::NeedsOperator(_)
+            | SetupError::OldLayout { .. }
+            | SetupError::ShadowUnit { .. } => Exit::NeedsOperator,
             SetupError::SubIdSpace(_)
             | SetupError::NoFreeId
             | SetupError::Fetch(_)
@@ -128,7 +137,8 @@ impl SetupError {
             SetupError::NoUser { .. } => "no_user",
             SetupError::SubIdSpace(_) | SetupError::NoFreeId => "no_room",
             SetupError::NeedsOperator(_) => "needs_operator",
-            SetupError::OldLayout(_) => "old_layout",
+            SetupError::OldLayout { .. } => "old_layout",
+            SetupError::ShadowUnit { .. } => "unit_shadow",
             SetupError::Fetch(FetchError::NotWired) => "not_implemented",
             SetupError::Fetch(_) => "fetch",
             SetupError::Release(_) => "release",
@@ -217,10 +227,35 @@ fn present(exec: &dyn Exec, path: &HostPath) -> Result<bool, SetupError> {
 }
 
 /// Stops `setup` where the retired layout is: the one of `kbf-helper` and `kbf-deploy host`.
-fn refuse_old_layout(exec: &dyn Exec) -> Result<(), SetupError> {
+fn refuse_old_layout(exec: &dyn Exec, platform: Platform) -> Result<(), SetupError> {
     for old in paths::OLD_LAYOUT {
         if present(exec, &HostPath::new(old)?)? {
-            return Err(SetupError::OldLayout(old.to_owned()));
+            return Err(SetupError::OldLayout {
+                path: old.to_owned(),
+                fetch_user: plan::fetch_user(platform),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Stops `setup` where a regular file in `/etc/systemd/system` has the name of the mode's
+/// packaged unit (or of its template): systemd reads `/etc` before `/usr/lib`, and `setup`
+/// does not enable a unit that is already enabled, so the host would go on running the old
+/// file's flags. A link is what `systemctl link` makes and is not a shadow with other flags.
+fn refuse_shadow_unit(exec: &dyn Exec, mode: Mode) -> Result<(), SetupError> {
+    for unit in plan::mode_units(mode) {
+        let template = unit
+            .split_once('@')
+            .map(|(name, _)| format!("{name}@.service"));
+        for name in std::iter::once((*unit).to_owned()).chain(template) {
+            let path = format!("/etc/systemd/system/{name}");
+            if matches!(
+                exec.inspect(&HostPath::new(&path)?)?,
+                Some(Entry::File { .. })
+            ) {
+                return Err(SetupError::ShadowUnit { path, unit });
+            }
         }
     }
     Ok(())
@@ -267,7 +302,10 @@ pub fn run(
     }
     let valid = raw.validate().map_err(SetupError::Invalid)?;
     let ctx = plan::context(os, valid.mode)?;
-    refuse_old_layout(&*exec)?;
+    refuse_old_layout(&*exec, ctx.platform)?;
+    if ctx.platform == Platform::Linux {
+        refuse_shadow_unit(&*exec, valid.mode)?;
+    }
     let mut notes = Vec::new();
 
     let before = plan::before_release(os, &*exec, &valid, &ctx)?;

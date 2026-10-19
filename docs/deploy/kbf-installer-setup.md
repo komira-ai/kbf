@@ -40,7 +40,19 @@ installer's unit reads it, and refuses another path. A Mac is a node only (`--mo
 1. Checks it is root (and, to apply, that its own binary is root's alone), checks the flags
    (every problem is named), and refuses (exit 5) while the old layout of the retired
    `kbf-helper` and `kbf-deploy host` is on the host (`/usr/local/kbf` or
-   `/var/lib/kbf-deploy`): the two never both manage a host, and the migration is not built.
+   `/var/lib/kbf-deploy`): the two never both manage a host. The refusal names the command
+   that is the way out once `kbf-installer migrate` exists (komira-ai/kbf#1083):
+   `kbf-installer migrate --apply --fetch-user kbf-fetch [--unit UNIT]` (`_kbf-fetch` on a
+   Mac). Today `migrate` is not on this build and `setup` refuses on either path whatever
+   was migrated, so the way out today is by hand: stop the host's units and move both roots
+   aside. The target contract is different (see "The old layout" below): `setup` will accept a
+   host exactly when `migrate` has finished it (its journal says `Done`), not by path.
+   On Linux it also refuses (exit 5, `unit_shadow`) when a regular file at
+   `/etc/systemd/system/<the mode's unit>` (for a frontend, also `kbf-frontend@.service`)
+   would shadow the packaged unit: systemd reads `/etc` before `/usr/lib`, and `setup`
+   does not enable a unit that is already enabled, so the host would keep the old flags.
+   Move the file aside (`mv FILE FILE.old; systemctl daemon-reload`) and run `setup` again;
+   `setup` never deletes or rewrites a unit. A link there (`systemctl link`) is not refused.
    Envoy is not checked: the proxy bundled in `kbf-installer` owns a frontend's public port,
    and a load balancer in front of it is the operator's.
 2. The `kbf-fetch` account (`_kbf-fetch` on a Mac); for the modes that run actions, the `kbf`
@@ -124,8 +136,16 @@ something the text does not say or says differently, so a reader can change one 
 - **Who enrolls.** `--token-file` is refused for `frontend` as well as `all-in-one`: the
   frontend creates its CA on first start and enrolls nothing.
 - **The old layout.** The contract says `setup` refuses while the old state exists unmigrated.
-  The migration (P3) is not built, so `setup` refuses while either old root is there; it
-  cannot yet set up a host that ran the retired helper.
+  Today the migration (P3, komira-ai/kbf#1083) is not on this build, so `setup` refuses while
+  either old root is there, even on a host that was migrated (a migrated host keeps both roots
+  as its rollback path); it cannot yet set up a host that ran the retired helper. The target:
+  `setup` accepts the old layout if and only if `migrate` finished the host (its journal
+  phase is `Done`), and otherwise refuses with the `migrate` command; the path check goes
+  when that lands.
+- **A unit file in `/etc/systemd/system` with a packaged unit's name.** Not in the contract.
+  A farm node running the dev installer has `kbf-storage-and-daemon.service` there; `setup`
+  refuses (exit 5, `unit_shadow`) rather than enable nothing and leave the old flags running.
+  Retiring such a file (after `migrate`) waits for #1083.
 - **No Envoy check, no Envoy unit.** The contract has `setup` test the installed Envoy against
   a tested range. The ruling since is that kbf manages no Envoy: the bundled proxy owns the
   frontend's port. `setup` neither checks Envoy nor enables `kbf-envoy.service`.
