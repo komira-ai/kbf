@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::fetch::Sha256;
+use kbf_testkit::dir::TestDir;
 
 /// A defect of the package or of the system, planted in the model of the container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,17 +381,18 @@ fn gates() -> Vec<Gate> {
 
 /// The verb over a model with `defect`: the world after, and the result.
 fn run_with(format: Format, defect: Defect) -> (World, Result<Vec<String>, Error>) {
-    let dir = std::env::current_exe()
-        .expect("exe")
-        .parent()
-        .expect("deps")
-        .join("xtask-pkg-install-unit");
-    std::fs::create_dir_all(&dir).expect("dir");
-    // One file per call: tests run in parallel threads of one process, and a shared
-    // path is truncated by one while another reads it (an empty listing is no entries).
-    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let listing = dir.join(format!("listing-{}-{call}.txt", std::process::id()));
+    let beside = std::env::current_exe().expect("exe");
+    let dir = TestDir::under(
+        beside
+            .parent()
+            .expect("deps")
+            .join("xtask-pkg-install-unit"),
+        "listing",
+    );
+    // One directory per call (a `TestDir` is unique): tests run in parallel threads of
+    // one process, and a shared path is truncated by one while another reads it (an
+    // empty listing is no entries).
+    let listing = dir.join("listing.txt");
     std::fs::write(&listing, pkg_linux::listing(&entries())).expect("listing");
     let world = std::cell::RefCell::new(World::new(defect));
     let gates = gates();

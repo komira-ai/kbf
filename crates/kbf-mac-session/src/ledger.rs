@@ -224,21 +224,19 @@ impl std::fmt::Display for Record {
 mod tests {
     use super::*;
 
-    fn dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kbf-mac-session-ledger-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+        kbf_testkit::dir::TestDir::under(
+            std::env::temp_dir(),
+            &format!("kbf-mac-session-ledger-{name}"),
+        )
     }
 
     /// Catches: a ledger kept only in memory, under which a restart (or reboot)
     /// forgets used lease ids and a grant or a name can be used again.
     #[test]
     fn records_survive_reopening() {
-        let path = dir("reopen").join("ledger");
+        let _path_own = dir("reopen");
+        let path = _path_own.join("ledger");
         let mut ledger = Ledger::open(&path).unwrap();
         ledger.record_created(LeaseId::new(1, 1), 600).unwrap();
         ledger.record_created(LeaseId::new(1, 2), 601).unwrap();
@@ -270,7 +268,8 @@ mod tests {
     /// or a deletion of a lease that is not live.
     #[test]
     fn a_lease_is_created_once_and_deleted_once() {
-        let path = dir("once").join("ledger");
+        let _path_own = dir("once");
+        let path = _path_own.join("ledger");
         let mut ledger = Ledger::open(&path).unwrap();
         ledger.record_created(LeaseId::new(2, 1), 600).unwrap();
         let again = ledger.record_created(LeaseId::new(2, 1), 601).unwrap_err();
@@ -290,7 +289,8 @@ mod tests {
     /// the ledger unreadable), or a corrupt complete line skipped.
     #[test]
     fn a_torn_last_line_is_cut_and_a_corrupt_line_refused() {
-        let path = dir("torn").join("ledger");
+        let _path_own = dir("torn");
+        let path = _path_own.join("ledger");
         std::fs::write(&path, "created 3.1 600\ncreated 3.").unwrap();
         let mut ledger = Ledger::open(&path).unwrap();
         assert_eq!(ledger.get(LeaseId::new(3, 1)).map(|e| e.uid), Some(600));
@@ -326,7 +326,8 @@ mod tests {
     /// Catches: memory updated although the record never reached the disk.
     #[test]
     fn a_failed_write_changes_nothing() {
-        let path = dir("fail").join("ledger");
+        let _path_own = dir("fail");
+        let path = _path_own.join("ledger");
         let mut ledger = Ledger::open(&path).unwrap();
         ledger.record_created(LeaseId::new(5, 1), 600).unwrap();
         ledger.fail_writes(&path);

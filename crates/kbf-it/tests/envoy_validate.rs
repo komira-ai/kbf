@@ -18,6 +18,7 @@ use std::process::Command;
 use kbf_installer::envoy::{BoxSettings, SUPPORTED, check, check_installed, render};
 use kbf_installer::run::SystemRunner;
 use kbf_it::pki;
+use kbf_testkit::dir::TestDir;
 
 /// The pinned Envoy binary CI fetched.
 fn envoy_binary() -> PathBuf {
@@ -26,11 +27,8 @@ fn envoy_binary() -> PathBuf {
     PathBuf::from(path)
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 /// A one-host box: the ports and limits of the installer's golden, the TLS files made

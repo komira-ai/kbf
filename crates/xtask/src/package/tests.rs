@@ -3,22 +3,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use super::*;
+use kbf_testkit::dir::TestDir;
 
 const BINARY: &[u8] = b"kbf-daemon's bytes";
 const COMMIT: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
 
-/// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("xtask-package-unit")
-        .join(format!("{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// An empty directory of its own for one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    let beside = std::env::current_exe().expect("test binary");
+    let deps = beside.parent().expect("deps");
+    TestDir::under(deps.join("xtask-package-unit"), name)
 }
 
 /// `dir/bin/kbf-daemon` holding `BINARY` and `dir/sbom.cdx.json`.

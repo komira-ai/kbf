@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use super::*;
 use kbf_host::testkit::{FakeExec, reply};
+use kbf_testkit::dir::TestDir;
 
 fn argv(args: &[&str]) -> Vec<OsString> {
     std::iter::once("kbf-deploy")
@@ -650,7 +651,8 @@ fn the_mdm_verbs_exit_0_done_1_failed_2_refused() {
     assert!(err.starts_with("kbf-deploy: step 0 ("), "{err}");
 
     // A dry run of a fetch into an empty directory: every pinned archive, exit 0.
-    let dir = std::env::temp_dir().join(format!("kbf-deploy-cli-fetch.{}", std::process::id()));
+    let own = TestDir::under(std::env::temp_dir(), "kbf-deploy-cli-fetch");
+    let dir = own.join("archives");
     let mut exec = FakeExec::new(501);
     let dir_arg = dir.to_string_lossy().into_owned();
     let (code, out, err) = cli(

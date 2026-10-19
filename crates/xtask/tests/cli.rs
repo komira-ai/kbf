@@ -1,6 +1,7 @@
 //! `cargo xtask` run as CI runs it: the real binary, with `xtask-fake` as cargo and as
 //! the built kbf-server, and throwaway git repositories for `budget-diff`.
 
+use kbf_testkit::dir::TestDir;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -10,14 +11,8 @@ const HEAD: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
 const BUILD: &str = "build --locked -p kbf-server --bin kbf-server";
 
 /// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
+fn scratch(name: &str) -> TestDir {
+    let dir = TestDir::under(Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask"), name);
     dir
 }
 

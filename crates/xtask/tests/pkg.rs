@@ -7,6 +7,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 mod support;
+use kbf_testkit::dir::TestDir;
 use support::{BUSY_WAIT, output_unbusy};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -15,14 +16,11 @@ const PLIST: &str = "../../packaging/macos/com.komira.kbf-installer.plist";
 const URL: &str = "https://github.com/komira-ai/kbf/releases/download/v1/x";
 
 /// An empty directory of its own for one test, holding the stub as `kbf-installer`.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-pkg")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
+fn scratch(name: &str) -> TestDir {
+    let dir = TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-pkg"),
+        name,
+    );
     std::fs::copy(FAKE, dir.join("kbf-installer")).expect("the stub");
     dir
 }
@@ -76,7 +74,8 @@ fn the_stub_prints_its_arguments_on_both_outputs_and_exits_0() {
 /// The stub with a descriptor open for writing on it, as a forked child leaves it:
 /// running it is `ETXTBSY` until the descriptor is closed.
 fn held_open(name: &str) -> (PathBuf, std::fs::File) {
-    let stub = scratch(name).join("kbf-installer");
+    let _stub_own = scratch(name);
+    let stub = _stub_own.join("kbf-installer");
     let held = std::fs::OpenOptions::new()
         .append(true)
         .open(&stub)
@@ -115,7 +114,8 @@ fn a_busy_stub_runs_once_the_descriptor_closes() {
 fn an_error_that_is_not_busy_is_returned_at_once() {
     // Catches: a retry on any error (a missing program would be started again for the
     // whole wait instead of failing), which only the busy case may do.
-    let missing = scratch("not-busy").join("no-such-program");
+    let _missing_own = scratch("not-busy");
+    let missing = _missing_own.join("no-such-program");
     let started = Instant::now();
     let err = output_unbusy(&mut Command::new(&missing), Duration::from_secs(3))
         .expect_err("no such program");

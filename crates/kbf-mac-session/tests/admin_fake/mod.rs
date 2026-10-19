@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_mac_session::autologin::CommandOutput;
 use kbf_mac_session::node_admin::{self, AdminHost, Meta, Sudo};
+use kbf_testkit::dir::TestDir;
 
 pub const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
 pub const COMMERCE: &str = "/Library/Preferences/com.apple.commerce";
@@ -93,7 +94,7 @@ pub struct State {
 }
 
 pub struct FakeMac {
-    pub root: PathBuf,
+    pub root: TestDir,
     pub state: RefCell<State>,
 }
 
@@ -151,8 +152,7 @@ impl FakeMac {
     pub fn new(name: &str) -> Self {
         // Files the tests make are not group-writable, whatever umask the runner has.
         rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("node-admin-{name}"));
-        let _ = fs::remove_dir_all(&root);
+        let root = TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("node-admin-{name}"));
         dir(&root, 0o755);
         let base = root.join("usr/local/kbf");
         for sub in ["sbin", "bin", "etc", "log"] {

@@ -19,6 +19,7 @@ use std::process::Command;
 
 use kbf_deploy::envoy::EnvoyConfig;
 use kbf_deploy::envoy::render::{self, CA_FILE};
+use kbf_testkit::dir::TestDir;
 
 /// The pinned Envoy binary CI fetched.
 fn envoy_binary() -> PathBuf {
@@ -65,11 +66,8 @@ fn validate(dir: &Path, name: &str, text: &str) -> (Option<i32>, String) {
     (out.status.code(), text.into_owned())
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 /// Catches a field Envoy does not know or a value of the wrong type in the render (a

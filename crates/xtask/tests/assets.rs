@@ -7,6 +7,7 @@ use std::process::{Command, Output};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use kbf_testkit::dir::TestDir;
 use sha2::Digest;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -23,14 +24,11 @@ const DEAD_PROXY: &str = "http://127.0.0.1:9";
 const OTHER: &str = "badbad0123456789badbad0123456789badbad01";
 
 /// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-assets")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
+fn scratch(name: &str) -> TestDir {
+    let dir = TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-assets"),
+        name,
+    );
     dir
 }
 

@@ -20,6 +20,7 @@ use kbf_proxy::control::NoUpdates;
 use kbf_proxy::slot::Slot;
 use kbf_proxy::{Proxy, ProxyHandle};
 use kbf_server::proxy_auth::{ProxyAuthLayer, ProxySecret, Trust};
+use kbf_testkit::dir::TestDir;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SanType,
@@ -116,11 +117,11 @@ impl Pki {
     }
 }
 
-fn dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("proxy-identity-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a directory");
-    dir
+fn dir(name: &str) -> TestDir {
+    TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("proxy-identity-{name}"),
+    )
 }
 
 fn private(path: &Path, content: &[u8]) {

@@ -2,6 +2,7 @@
 //! (printing the JSON messages each test writes for it) and as sudo (recording what it
 //! was asked to run, and from where).
 
+use kbf_testkit::dir::TestDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -13,6 +14,8 @@ const BUILD: &str = "test --locked --no-run --message-format=json -p kbf-guest -
 struct Run {
     root: PathBuf,
     sudo: PathBuf,
+    /// Last field: the directory is removed after the run is over.
+    _own: TestDir,
 }
 
 impl Run {
@@ -20,10 +23,11 @@ impl Run {
     /// the target's test binary (`<root>/target/debug/deps/as_root-0f1e`, from the
     /// package at `<root>/crates/kbf-guest`) after `before`.
     fn new(name: &str, before: &str) -> Run {
-        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("xtask-sudo-test")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&root);
+        let own = TestDir::under(
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-sudo-test"),
+            name,
+        );
+        let root = own.to_path_buf();
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).expect("scratch");
         let sudo = bin.join("sudo");
@@ -37,7 +41,11 @@ impl Run {
         );
         std::fs::write(root.join("cargo-messages"), format!("{before}{artifact}\n"))
             .expect("messages");
-        Run { root, sudo }
+        Run {
+            root,
+            sudo,
+            _own: own,
+        }
     }
 
     /// `sudo-test -p kbf-guest --test as_root` with `extra` arguments, with the fake

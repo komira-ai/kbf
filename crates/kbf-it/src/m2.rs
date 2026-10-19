@@ -63,6 +63,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use kbf_testkit::dir::TestDir;
 use xtask::crun_tests::host_report;
 
 use crate::cell::{
@@ -208,6 +209,9 @@ struct Cell {
     gid: u32,
     /// The units started, stopped at the end.
     units: Vec<String>,
+    /// The daemon's data directory when `--data-dir` is not given: removed when the cell
+    /// drops, after `stop` has ended the processes that use it.
+    _data_owned: Option<TestDir>,
 }
 
 impl Cell {
@@ -215,9 +219,12 @@ impl Cell {
         let uid = rustix::process::getuid().as_raw();
         let work = absolute(&args.work)?;
         let logs = work.join("logs");
-        let data = match &args.data_dir {
-            Some(dir) => absolute(dir)?,
-            None => std::env::temp_dir().join(format!("kbf-m2-data-{uid}-{}", std::process::id())),
+        let (data, data_owned) = match &args.data_dir {
+            Some(dir) => (absolute(dir)?, None),
+            None => {
+                let own = TestDir::under(std::env::temp_dir(), &format!("kbf-m2-data-{uid}"));
+                (own.to_path_buf(), Some(own))
+            }
         };
         let leases = data.join("leases");
         for dir in [&logs, &leases] {
@@ -240,6 +247,7 @@ impl Cell {
             uid,
             gid: rustix::process::getgid().as_raw(),
             units: Vec::new(),
+            _data_owned: data_owned,
         })
     }
 

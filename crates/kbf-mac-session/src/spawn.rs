@@ -237,9 +237,7 @@ mod tests {
     /// left to the daemon, or a process left in the helper's process group.
     #[test]
     fn the_process_runs_in_the_lease_directory_with_a_clean_environment() {
-        let dir =
-            std::env::temp_dir().join(format!("kbf-mac-session-spawn-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-mac-session-spawn");
         // CARGO_MANIFEST_DIR is in the test's own environment, and must not leak.
         assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
         let argv = crate::testing::act_argv(

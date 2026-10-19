@@ -3,21 +3,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use super::*;
+use kbf_testkit::dir::TestDir;
 
 const TOOL: &[u8] = b"\x7fELF a pinned tool's bytes";
 
-/// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("xtask-fetch-unit")
-        .join(format!("{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// An empty directory of its own for one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    let beside = std::env::current_exe().expect("test binary");
+    let deps = beside.parent().expect("deps");
+    TestDir::under(deps.join("xtask-fetch-unit"), name)
 }
 
 /// A tar of a directory `tool-1.0`, a decoy file, `tool-1.0/tool` holding `TOOL` and a
@@ -95,7 +89,8 @@ fn tar_gz(path: &str) -> Unpack {
 
 /// `install` of `bytes` (pinned at their own digest) into a fresh `out`.
 fn install_own(name: &str, bytes: &[u8], unpack: &Unpack) -> (Result<(), Error>, PathBuf) {
-    let out = scratch(name).join("bin").join("tool");
+    let _out_own = scratch(name);
+    let out = _out_own.join("bin").join("tool");
     (install(bytes, &Sha256::of(bytes), unpack, &out), out)
 }
 
@@ -298,7 +293,8 @@ fn an_install_that_cannot_rename_leaves_no_part_file() {
     // Catches: a part file left behind when the last step fails (the next run, or a
     // reader of the directory, then sees a half-installed tool): --out is a directory,
     // so the rename over it fails after the part file was written.
-    let out = scratch("rename-fails").join("tool");
+    let _out_own = scratch("rename-fails");
+    let out = _out_own.join("tool");
     std::fs::create_dir_all(out.join("inside")).expect("dir");
     let result = install(TOOL, &Sha256::of(TOOL), &Unpack::Raw, &out);
     let Err(Error::Install { path, why }) = result else {
@@ -314,7 +310,8 @@ fn an_install_that_cannot_rename_leaves_no_part_file() {
 fn an_install_replaces_an_old_tool_and_a_stale_part_file() {
     // Catches: refusing to replace an existing --out (a cached older version), or
     // failing on a part file a killed run left.
-    let out = scratch("replace").join("tool");
+    let _out_own = scratch("replace");
+    let out = _out_own.join("tool");
     std::fs::write(&out, b"old").expect("old");
     std::fs::write(part_path(&out), b"half").expect("stale part");
     install(TOOL, &Sha256::of(TOOL), &Unpack::Raw, &out).expect("install");

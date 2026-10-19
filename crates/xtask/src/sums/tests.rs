@@ -1,23 +1,17 @@
 use std::path::{Path, PathBuf};
 
 use super::*;
+use kbf_testkit::dir::TestDir;
 
 const A: &str = "kbf-daemon-c0ffee012345-linux-x86_64.tar.gz";
 const A_SBOM: &str = "kbf-daemon-c0ffee012345-linux-x86_64.cdx.json";
 const B: &str = "kbf-daemon-c0ffee012345-darwin-arm64.tar.gz";
 
-/// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("xtask-sums-unit")
-        .join(format!("{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// An empty directory of its own for one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    let beside = std::env::current_exe().expect("test binary");
+    let deps = beside.parent().expect("deps");
+    TestDir::under(deps.join("xtask-sums-unit"), name)
 }
 
 fn line(name: &str, bytes: &[u8]) -> String {
@@ -340,7 +334,8 @@ fn assemble_refuses_a_name_twice_an_unknown_platform_and_no_files() {
             .starts_with(&format!("append to {}: ", summary.display()))),
         "summary"
     );
-    let missing = scratch("assemble-missing").join("dist");
+    let _missing_own = scratch("assemble-missing");
+    let missing = _missing_own.join("dist");
     assert!(
         assemble(&missing, None, None).is_err_and(|e| e
             .to_string()

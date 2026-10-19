@@ -22,6 +22,7 @@ use kbf_proto::reapi::{
     ExecuteResponse, batch_update_blobs_request,
 };
 use kbf_server::{Listeners, TlsSource, WorkerTls, bind_server};
+use kbf_testkit::dir::TestDir;
 use prost::Message;
 use sha2::{Digest as _, Sha256};
 use tokio::time::timeout;
@@ -32,17 +33,12 @@ const BIN: &str = env!("CARGO_BIN_EXE_kbf-cell");
 /// How long an Execute may take, the daemon's connection included.
 const PROMPT: Duration = Duration::from_secs(30);
 
-/// A fresh directory for one run of one test.
-fn scratch(name: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after 1970")
-        .as_nanos();
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-cell-tests")
-        .join(format!("{name}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create a scratch directory");
-    dir
+/// A fresh directory for one run of one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-cell-tests"),
+        name,
+    )
 }
 
 fn cell(args: &[&str]) -> Output {

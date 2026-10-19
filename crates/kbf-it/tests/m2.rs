@@ -19,10 +19,10 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kbf_it::m2::{IMAGE, has_interpreter};
+use kbf_testkit::dir::TestDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-cell");
 
@@ -416,45 +416,18 @@ const LOAD: u32 = 1;
 const INTERP: u32 = 3;
 const PHDR: u32 = 6;
 
-/// A fresh directory for one run of one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-m2-tests")
-        .join(unique(name));
-    std::fs::create_dir_all(&dir).expect("create a scratch directory");
-    dir
-}
-
-/// A name for one run's directory that no other call returns.
-fn unique(name: &str) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after 1970")
-        .as_nanos();
-    unique_at(name, nanos)
-}
-
-/// [`unique`] at the clock reading `nanos`. The pid parts this run from other live
-/// processes, the count from the other calls of this one (its tests are its threads,
-/// which can read one clock tick), and the clock from earlier runs with this pid.
-fn unique_at(name: &str, nanos: u128) -> String {
-    static CALLS: AtomicU64 = AtomicU64::new(0);
-    let call = CALLS.fetch_add(1, Ordering::Relaxed);
-    format!("{name}-{}-{call}-{nanos}", std::process::id())
-}
-
-/// Catches: a name made of the pid and the clock alone. The tests are threads of one
-/// process, so two of them that read the clock in one tick got the same scratch
-/// directory.
-#[test]
-fn two_names_made_at_one_instant_differ() {
-    assert_ne!(unique_at("m2", 7), unique_at("m2", 7));
+/// A fresh directory for one run of one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-m2-tests"),
+        name,
+    )
 }
 
 /// One fake cell: the fakes in `<dir>/bin`, the daemon's cgroup under `<dir>/cgroup`, and
 /// `kbf-cell m2`'s work directory `<dir>/work`.
 struct Cell {
-    dir: PathBuf,
+    dir: TestDir,
     defect: String,
 }
 

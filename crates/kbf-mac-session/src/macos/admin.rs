@@ -97,11 +97,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = PathBuf::from(format!("/tmp/kms-admin-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+        kbf_testkit::dir::TestDir::under("/tmp", &format!("kms-admin-{name}"))
     }
 
     /// Catches: an ACL check that never sees an access control entry, so a folder an

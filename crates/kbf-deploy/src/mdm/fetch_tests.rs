@@ -4,6 +4,7 @@ use std::fs;
 use super::*;
 use crate::testkit::{TlsServer, http, tls_server};
 use kbf_host::testkit::scratch;
+use kbf_testkit::dir::TestDir;
 
 /// What the test server holds: path -> bytes.
 fn files() -> BTreeMap<String, Vec<u8>> {
@@ -41,10 +42,31 @@ fn setup(
 }
 
 /// A fresh directory outside every git work tree (the system's temporary directory).
-fn outside(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-deploy-fetch.{}.{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    dir
+fn outside(name: &str) -> Outside {
+    let own = TestDir::under(std::env::temp_dir(), &format!("kbf-deploy-fetch-{name}"));
+    let path = own.join("archives");
+    Outside { path, _own: own }
+}
+
+/// A path that does not exist yet (a fetch makes it), inside a directory the test owns
+/// and that is removed, with whatever the fetch left in it, when this drops.
+struct Outside {
+    path: PathBuf,
+    _own: TestDir,
+}
+
+impl AsRef<Path> for Outside {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for Outside {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
 }
 
 fn fetch(
@@ -97,7 +119,6 @@ fn a_dry_run_downloads_nothing_and_an_apply_fetches_each_once() {
     assert_eq!(text.matches("kept: ").count(), 6, "{text}");
     assert!(text.ends_with(&format!("{NOTHING_TO_DO}\n")), "{text}");
     assert_eq!(server.paths.lock().expect("lock").len(), 6);
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// Catches `--only` ignored (every archive fetched) or applied to the wrong tool.
@@ -112,7 +133,6 @@ fn only_fetches_the_named_tools() {
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(names, ["lego.zip"]);
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// Catches a download whose sha256 is not the pin left at its final path (install
@@ -142,7 +162,6 @@ fn a_download_that_is_not_the_pin_is_kept_aside_and_fails() {
     );
     assert!(!dir.join("caddy.zip").exists());
     assert!(!dir.join("caddy.zip.part").exists());
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// Catches an error page saved as the archive, or a failed download that leaves its
@@ -165,7 +184,6 @@ fn a_failed_download_leaves_nothing() {
     let (got, _) = fetch(&dir, &[Tool::Nanohub], &gone, &pins, Mode::Apply);
     assert!(matches!(got, Err(MdmError::Https(_))), "{got:?}");
     assert!(!dir.join("nanohub.zip.part").exists());
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// Catches a part left by an interrupted run appended to (the archive would be
@@ -186,7 +204,6 @@ fn a_leftover_part_is_replaced_and_one_that_cannot_be_is_an_error() {
     fs::create_dir(dir.join("lego.zip.part")).expect("a directory in the way");
     let (got, _) = fetch(&dir, &[Tool::Lego], &server, &pins, Mode::Apply);
     assert!(matches!(got, Err(MdmError::Io { .. })), "{got:?}");
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// Catches a kept archive that differs from its pin taken as fetched (exit 2: the
@@ -205,7 +222,6 @@ fn a_kept_archive_must_be_the_pin() {
     fs::create_dir(dir.join("lego.zip")).expect("a directory in the way");
     let (got, _) = fetch(&dir, &[Tool::Lego], &server, &pins, Mode::DryRun);
     assert!(matches!(got, Err(MdmError::Io { .. })), "{got:?}");
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// Catches a fetch that runs as root, takes a relative directory, or writes into a git
@@ -213,8 +229,9 @@ fn a_kept_archive_must_be_the_pin() {
 #[test]
 fn root_a_relative_directory_and_a_git_tree_are_refused() {
     let (server, pins) = setup(files(), &files());
+    let root = outside("root");
     let f = Fetch {
-        dir: outside("root"),
+        dir: root.to_path_buf(),
         only: Vec::new(),
     };
     let as_root = run(

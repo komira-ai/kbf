@@ -26,6 +26,7 @@ use sha2::Digest;
 use xtask::package::Platform;
 
 mod support;
+use kbf_testkit::dir::TestDir;
 use support::{BUSY_WAIT, output_unbusy};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -61,14 +62,11 @@ fn installer_binary() -> &'static str {
 }
 
 /// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("install-sh")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
+fn scratch(name: &str) -> TestDir {
+    let dir = TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("install-sh"),
+        name,
+    );
     dir
 }
 

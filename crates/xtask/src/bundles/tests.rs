@@ -5,6 +5,7 @@ use base64::engine::general_purpose::STANDARD;
 
 use super::*;
 use crate::fetch::Sha256;
+use kbf_testkit::dir::TestDir;
 
 const TARBALL: &str = "kbf-0123456789abcdef0123456789abcdef01234567-linux-x86_64.tar.gz";
 const SBOM: &str = "kbf-0123456789abcdef0123456789abcdef01234567-linux-x86_64.cdx.json";
@@ -56,18 +57,11 @@ fn good(sha: &Sha256) -> String {
     bundle_with(&[&sha.to_string()], PROVENANCE)
 }
 
-/// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("xtask-bundles-unit")
-        .join(format!("{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// An empty directory of its own for one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    let beside = std::env::current_exe().expect("test binary");
+    let deps = beside.parent().expect("deps");
+    TestDir::under(deps.join("xtask-bundles-unit"), name)
 }
 
 fn line(name: &str) -> Line {

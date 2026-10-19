@@ -3,6 +3,7 @@
 //! with a line on stderr). The code is tested only through the binary, so coverage
 //! counts one build of it.
 
+use kbf_testkit::dir::TestDir;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -14,13 +15,8 @@ fn act(args: &[&str]) -> Output {
 }
 
 /// A fresh directory for one test, under Cargo's per-target temporary directory.
-fn dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("old dir");
-    }
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir
+fn dir(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 fn path(dir: &Path, name: &str) -> String {

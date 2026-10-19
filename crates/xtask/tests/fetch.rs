@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use kbf_testkit::dir::TestDir;
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use xtask::fetch::{self, Sha256, Unpack};
@@ -15,14 +16,11 @@ const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 const TOOL: &[u8] = b"a pinned tool";
 
 /// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-fetch-https")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
+fn scratch(name: &str) -> TestDir {
+    let dir = TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-fetch-https"),
+        name,
+    );
     dir
 }
 
@@ -168,7 +166,8 @@ fn fetch_installs_a_matching_download_and_refuses_a_mismatch() {
     // Catches: `fetch` installing without the hash check, or reporting success for a
     // file it did not write.
     let (base, ca) = serve(true, |_, _| response("200 OK", &[], TOOL));
-    let out = scratch("fetch").join("bin").join("tool");
+    let _out_own = scratch("fetch");
+    let out = _out_own.join("bin").join("tool");
     let url = format!("{base}/tool");
     let line = fetch::fetch(
         &url,
@@ -187,7 +186,8 @@ fn fetch_installs_a_matching_download_and_refuses_a_mismatch() {
         )
     );
     assert_eq!(std::fs::read(&out).expect("read"), TOOL);
-    let other = scratch("fetch-mismatch").join("tool");
+    let _other_own = scratch("fetch-mismatch");
+    let other = _other_own.join("tool");
     let pinned = Sha256::of(b"another tool");
     let result = fetch::fetch(&url, &pinned, &Unpack::Raw, &other, &[ca]);
     assert!(
@@ -216,7 +216,8 @@ const PIN: &str = "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8
 fn the_verb_refuses_plain_http_with_exit_1_and_writes_nothing() {
     // Catches: a verb that downloads over plain HTTP, or exits 0 when it installed
     // nothing (the job would go on without its tool).
-    let out = scratch("cli-http").join("tool");
+    let _out_own = scratch("cli-http");
+    let out = _out_own.join("tool");
     let url = "http://127.0.0.1:9/tool";
     let (code, err) = xtask_fetch(&[
         "--url",
@@ -238,7 +239,8 @@ fn the_verb_refuses_plain_http_with_exit_1_and_writes_nothing() {
 fn flags_that_do_not_fit_together_exit_2() {
     // Catches: a malformed pin, a tar without --member or a --member without a tar
     // accepted (exit 0 or 1 instead of the usage status), before any download.
-    let out = scratch("cli-usage").join("tool");
+    let _out_own = scratch("cli-usage");
+    let out = _out_own.join("tool");
     let out = out.to_str().expect("utf-8");
     let url = "https://127.0.0.1:9/tool";
     for (extra, says) in [

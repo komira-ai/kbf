@@ -2,6 +2,7 @@
 //! tarball `package` wrote, with `xtask-fake` as the `kbf` inside it (its stamp and
 //! identity ride on its own bytes, so the tarball decides what the extracted binary says).
 
+use kbf_testkit::dir::TestDir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -12,14 +13,11 @@ const OTHER: &str = "d0ffee0123456789c0ffee0123456789c0ffee01";
 const PLATFORM: &str = "linux-x86_64";
 
 /// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-check-asset")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
+fn scratch(name: &str) -> TestDir {
+    let dir = TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-check-asset"),
+        name,
+    );
     dir
 }
 

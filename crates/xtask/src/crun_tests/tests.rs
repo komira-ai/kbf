@@ -2,6 +2,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use super::*;
+use kbf_testkit::dir::TestDir;
 
 #[test]
 fn the_machine_names_its_architecture_and_an_unknown_one_is_refused() {
@@ -52,11 +53,8 @@ fn each_architecture_has_its_own_pinned_manifest() {
 }
 
 /// A scratch directory for one unit test, empty.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("xtask-pt-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(std::env::temp_dir(), &format!("xtask-pt-{name}"))
 }
 
 #[test]

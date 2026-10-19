@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use kbf_testkit::dir::TestDir;
 use xtask::crun_tests::{BUSYBOX_AMD64, BUSYBOX_ARM64, TARGETS, arch_for};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -30,6 +31,8 @@ fn this_manifest() -> &'static str {
 struct Run {
     root: PathBuf,
     bin: PathBuf,
+    /// Last field: the directory is removed after the run is over.
+    _own: TestDir,
 }
 
 impl Run {
@@ -37,10 +40,8 @@ impl Run {
     /// each target's test binary (`<root>/target/debug/deps/<target>-0f1e`, from the
     /// package at `<root>/crates/kbf-driver-container`), after a decoy.
     fn new(name: &str) -> Run {
-        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("xpt")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&root);
+        let own = TestDir::under(Path::new(env!("CARGO_TARGET_TMPDIR")).join("xpt"), name);
+        let root = own.to_path_buf();
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).expect("scratch");
         std::fs::hard_link(FAKE, bin.join("sudo")).expect("link the fake");
@@ -61,7 +62,11 @@ impl Run {
             messages.push('\n');
         }
         std::fs::write(root.join("cargo-messages"), messages).expect("messages");
-        Run { root, bin }
+        Run {
+            root,
+            bin,
+            _own: own,
+        }
     }
 
     /// `crun-tests` with the fakes, the cargo `cargo`, and the sudo `program` (`None`:
