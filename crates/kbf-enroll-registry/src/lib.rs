@@ -51,7 +51,7 @@ pub const ATTEMPTS: usize = 16;
 
 pub use enroll::{EnrollRequest, Enrolled, IssuedRole, StoredCert, enroll_txn, request_hash};
 pub use error::RegistryError;
-pub use nodes::{DenyRecord, NodeInfo, NodeState, deny_rows, list_nodes, revoke_node};
+pub use nodes::{DenyRecord, NodeInfo, NodeState, deny_rows, list_nodes, node_state, revoke_node};
 pub use renew::{
     ISSUED_AT_WINDOW, MAX_EXPIRED_AGE, MIN_INTERVAL, REPLAY_TTL, RenewCsr, RenewRequest, renew_txn,
 };

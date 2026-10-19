@@ -12,7 +12,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
 use super::kit::{CAPS, Rig, addr_of, finish, grpc_ok, read_all, reserve_ports, script, tagged};
-use crate::config::ProxyConfig;
 use crate::control::NoUpdates;
 use crate::probe::{FRESH_FOR, POLL_TIMEOUT, Readiness, poll};
 use crate::route::Target;
@@ -342,15 +341,8 @@ fn run_polls_the_active_child_on_real_sockets() {
     let (base, mut listeners) = reserve_ports();
     let public = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
     let public_addr: SocketAddr = public.local_addr().expect("addr");
-    let config = ProxyConfig::from_toml_str(&format!(
-        "operator_token_file = \"/etc/kbf/operator.token\"\n\
-         server_cert_file = \"/etc/kbf/tls/server.pem\"\n\
-         server_key_file = \"/etc/kbf/tls/server.key\"\n\
-         client_ca_file = \"/etc/kbf/tls/ca.pem\"\n\
-         hold_max_s = 600\n\
-         [upstream]\nbase_port = {base}\n"
-    ))
-    .expect("a valid table");
+    let files = super::bypass::files("ready-real", base, "");
+    let config = files.config.clone();
     let (handle, runner) = Proxy::bind(config, OwnedFd::from(public)).expect("bind");
     let serving = std::thread::spawn(move || runner.run(NoUpdates));
     let ctl = Ctl::new(200);
@@ -364,7 +356,8 @@ fn run_polls_the_active_child_on_real_sockets() {
                 tokio::spawn(answer(tcp, Arc::clone(&served)));
             }
         });
-        let mut client = super::kit::Client::connect_tcp(public_addr).await;
+        let tls = super::pki::client_config(&files.pki.ca_pem, None, &["h2"]);
+        let mut client = super::kit::Client::connect_tcp_tls(public_addr, tls).await;
         assert_eq!(readyz(&mut client).await, 503, "no active child yet");
         handle.slots().adopt(Slot::A, None);
         let mut ready = false;

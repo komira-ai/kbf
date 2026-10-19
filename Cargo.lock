@@ -1663,7 +1663,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "x509-parser",
- "zeroize",
 ]
 
 [[package]]
@@ -1809,7 +1808,9 @@ dependencies = [
  "kbf-testkit",
  "kbf-update",
  "libc",
+ "rcgen",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1817,6 +1818,7 @@ dependencies = [
  "tar",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -1860,12 +1862,14 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustix",
+ "rustls",
  "saphyr-parser",
  "serde_json",
  "sha2 0.11.0",
  "syn 2.0.119",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tracing-subscriber",
  "xtask",
@@ -2092,6 +2096,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zeroize",
 ]
 
 [[package]]
@@ -2108,15 +2113,20 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kbf-peer",
+ "kbf-tls",
  "loom",
  "rcgen",
+ "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "subtle",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
+ "tracing",
 ]
 
 [[package]]

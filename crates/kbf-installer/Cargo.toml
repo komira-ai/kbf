@@ -64,7 +64,12 @@ kbf-installer = { workspace = true, features = ["testkit", "test-sandbox"] }
 # The proxy verb's process test starts the binary under a guard that reaps it.
 kbf-testkit.workspace = true
 kbf-update.workspace = true
+# The proxy verb serves TLS: its process test makes a CA and a server certificate, and is a
+# TLS client of the real binary.
+rcgen.workspace = true
+rustls.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+tokio-rustls.workspace = true
 tracing-subscriber.workspace = true
 
 # The proxy's child command line is parsed by the `kbf` binary's own parser (Linux only: the

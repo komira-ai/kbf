@@ -29,11 +29,23 @@ service Enroll {
   rpc Renew(RenewRequest) returns (RenewResponse);
 }
 
-// Served on the worker listener (mutual TLS), storage role only: the cold-store keys of a
-// farm whose frontend holds them (design section 4.3). A node holds the answer in memory
-// only. It is never part of `NodeConfig`.
+// Served on the worker listener (mutual TLS), storage role only: the cold store the
+// farm's operator registered with the frontend, with its keys. A frontend that has a
+// registration says so in the `objstore_generation` of its `Membership` answers
+// (kbf.map.v1); the node calls `GetStoreConfig` when that number differs from the one it
+// applied and reports the outcome in its next `Membership.Heartbeat`. A node holds the
+// answer in memory only. The keys are never part of `NodeConfig`.
+//
+// This replaces `GetKeys`, which no frontend ever served: one atomic answer carries the
+// store's identity and its keys, so a node never pairs one generation's endpoint with
+// another's secret.
 service ColdStore {
-  rpc GetKeys(GetKeysRequest) returns (GetKeysResponse);
+  // The registered cold store, or nothing when the caller already holds `generation`.
+  // PERMISSION_DENIED: the caller is not a storage node, is denied, or (when the
+  // frontend keeps an enrollment registry) is not an active node in it, checked at every
+  // call. UNAVAILABLE: the frontend cannot give a consistent answer now (the state store
+  // failed, the keys are not readable); retry.
+  rpc GetStoreConfig(GetStoreConfigRequest) returns (GetStoreConfigResponse);
 }
 
 message RoleCsr {
@@ -108,7 +120,8 @@ message RenewResponse {
 
 enum CredentialMode {
   CREDENTIAL_MODE_UNSPECIFIED = 0;
-  // The storage node fetches the keys with `ColdStore.GetKeys`.
+  // The storage node fetches the registered store and its keys with
+  // `ColdStore.GetStoreConfig`.
   CREDENTIAL_MODE_KEYS = 1;
   // The node uses its own cloud identity; the frontend sends no key.
   CREDENTIAL_MODE_AMBIENT = 2;
@@ -125,7 +138,10 @@ message NodeConfig {
   // What `--cas` is for a daemon-only node.
   string cas_endpoint = 4;
   uint32 storage_port = 5;
-  // `s3://bucket/prefix/?endpoint=...`; never a key.
+  // `s3://bucket/prefix/?endpoint=...`; never a key. It stays beside the registration
+  // (`ColdStore.GetStoreConfig`) because it is the node's own `--cold-store` identity, which
+  // a registration for another store does not replace (the node reports it and keeps
+  // running); the registration is the only source of keys.
   string cold_store = 6;
   uint32 min_protocol = 7;
   // Seconds between looks at the certificate files (30).
@@ -135,9 +151,41 @@ message NodeConfig {
   CredentialMode credential_mode = 10;
 }
 
-message GetKeysRequest {}
+message GetStoreConfigRequest {
+  // The registration generation the node applied (0: none). The answer is a bare
+  // generation when it equals the frontend's; any other number, a lower one too (a
+  // restored state store goes back), is answered in full.
+  uint64 have_generation = 1;
+}
 
-message GetKeysResponse {
-  string access_key_id = 1;
-  string secret_access_key = 2;
+message GetStoreConfigResponse {
+  // The registration generation this answer is a snapshot of; the same number the
+  // frontend's `Membership` answers carry. 0: nothing is registered.
+  uint64 generation = 1;
+  // Absent when the request's `have_generation` equals `generation`, and when nothing is
+  // registered.
+  StoreConfig config = 2;
+}
+
+// One registered cold store: a connection (endpoint and key pair) bound to the role
+// "cold" with a bucket and prefix. Read from one snapshot of the frontend's state.
+// The Rust type prints its secret as `Secret(..)` in `Debug` and overwrites it when dropped.
+message StoreConfig {
+  // The connection's name.
+  string connection = 1;
+  // The bound role; "cold" is the only one.
+  string role = 2;
+  // `http://host:port` of the S3-compatible endpoint.
+  string endpoint = 3;
+  string region = 4;
+  string bucket = 5;
+  string prefix = 6;
+  bool conditional_put = 7;
+  // Bytes per second below which a put is too slow; 0: no floor.
+  uint64 min_put_rate = 8;
+  string access_key_id = 9;
+  // SECRET. Only this message carries it.
+  string secret_access_key = 10;
+  // Names the secret file the frontend read it from; changes when the secret does.
+  uint64 secret_version = 11;
 }

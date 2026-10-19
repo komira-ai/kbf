@@ -27,6 +27,52 @@ client_ca_file = "/etc/kbf/tls/ca.pem"
 base_port = 18000
 "#;
 
+/// A `[proxy]` table over real files in a scratch directory: a CA, a server certificate for
+/// `localhost`, the operator token (0600, 32 or more characters) and a secret path. Returns
+/// the `installer.toml` and the CA file a client trusts.
+fn served_config(name: &str) -> (PathBuf, PathBuf) {
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose, SanType,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = kbf_host::testkit::scratch(&format!("proxy-bin-{name}"));
+    let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
+    let mut server = CertificateParams::new(Vec::<String>::new()).expect("params");
+    server.subject_alt_names = vec![SanType::DnsName("localhost".try_into().expect("ia5"))];
+    server.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let key = KeyPair::generate().expect("key");
+    let cert = server.signed_by(&key, &ca).expect("server certificate");
+    let private = |file: &str, text: &str| {
+        let path = dir.join(file);
+        fs::write(&path, text).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        path
+    };
+    let (cert, key) = (
+        private("server.pem", &cert.pem()),
+        private("server.key", &key.serialize_pem()),
+    );
+    let ca_file = private("ca.pem", &ca.pem());
+    let token = private("operator.token", "operator-token-0123456789-abcdefghijkl");
+    let text = format!(
+        "[proxy]\noperator_token_file = {token:?}\nserver_cert_file = {cert:?}\n\
+         server_key_file = {key:?}\nclient_ca_file = {ca_file:?}\n\
+         proxy_auth_file = {:?}\n[proxy.upstream]\nbase_port = 18000\n",
+        dir.join("proxy-auth"),
+    );
+    // Not `config`: it makes the directory again, and the files above are in it.
+    let path = dir.join("installer.toml");
+    fs::write(&path, text).expect("write");
+    (path, ca_file)
+}
+
 fn config(name: &str, text: &str) -> PathBuf {
     let path = kbf_host::testkit::scratch(&format!("proxy-bin-{name}")).join("installer.toml");
     fs::write(&path, text).expect("write");
@@ -167,9 +213,36 @@ fn start_masked(path: &Path, listener: &TcpListener, stderr: Stdio, block_term: 
     reaped::spawn(&mut command, 4).expect("spawn kbf-installer")
 }
 
-/// One `GET` over h2c (prior knowledge) to `addr`: the status and the body.
-async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
+/// A TLS stream to the proxy at `addr` that trusts the CA in `ca`, offering `h2`.
+async fn tls(
+    addr: SocketAddr,
+    ca: &Path,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    use rustls::pki_types::pem::PemObject as _;
+    let mut roots = rustls::RootCertStore::empty();
+    for der in rustls::pki_types::CertificateDer::pem_file_iter(ca).expect("CA file") {
+        roots.add(der.expect("CA PEM")).expect("root");
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
     let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").expect("name"),
+            tcp,
+        )
+        .await
+        .expect("TLS handshake")
+}
+
+/// One `GET` over TLS and h2 to `addr`: the status and the body.
+async fn get(addr: SocketAddr, ca: &Path, path: &str) -> (u16, String) {
+    let tcp = tls(addr, ca).await;
     let (send, connection) = h2::client::handshake(tcp).await.expect("h2 handshake");
     tokio::spawn(connection);
     let request = http::Request::builder()
@@ -235,18 +308,18 @@ async fn sigint_stops_it_with_exit_0_too() {
 }
 
 async fn serve_alone_and_stop_on(signal: i32) {
-    let path = config(&format!("serve-{signal}"), TABLE);
+    let (path, ca) = served_config(&format!("serve-{signal}"));
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let mut child = start(&path, &listener);
     drop(listener);
 
-    let (status, body) = tokio::time::timeout(Duration::from_secs(30), get(addr, "/healthz"))
+    let (status, body) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
         .await
         .expect("the proxy answers");
     assert_eq!((status, body.as_str()), (200, "ok"));
-    assert_eq!(get(addr, "/readyz").await.0, 503, "no active child");
-    assert_eq!(get(addr, "/nothing").await.0, 404);
+    assert_eq!(get(addr, &ca, "/readyz").await.0, 503, "no active child");
+    assert_eq!(get(addr, &ca, "/nothing").await.0, 404);
     assert_eq!(
         listening_ports(child.id()),
         [addr.port()],
@@ -284,12 +357,12 @@ async fn no_child_outlives_its_guard_and_it_holds_only_its_socket() {
     // a lock open for its children does.
     unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_SETFD, 0) };
 
-    let path = config("orphan", TABLE);
+    let (path, ca) = served_config("orphan");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let child = start(&path, &listener);
     drop(listener);
-    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, "/healthz"))
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
         .await
         .expect("the proxy answers");
     assert_eq!(status, 200);
@@ -341,12 +414,12 @@ fn exited(child: &mut Reaped, within: Duration) -> (Option<std::process::ExitSta
 /// must still be draining, so the test is not racing a process that already left.
 #[tokio::test(flavor = "current_thread")]
 async fn a_second_sigterm_ends_a_draining_verb_at_once() {
-    let path = config("second-term", TABLE);
+    let (path, ca) = served_config("second-term");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let mut child = start(&path, &listener);
     drop(listener);
-    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, "/healthz"))
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
         .await
         .expect("the proxy answers");
     assert_eq!(status, 200);
@@ -372,7 +445,7 @@ async fn a_second_sigterm_ends_a_draining_verb_at_once() {
 /// serves and still stops on SIGTERM with status 0.
 #[tokio::test(flavor = "current_thread")]
 async fn a_closed_standard_error_does_not_stop_the_verb_serving() {
-    let path = config("closed-stderr", TABLE);
+    let (path, ca) = served_config("closed-stderr");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     // A pipe with no reader: every write to it fails with a broken pipe.
@@ -385,7 +458,7 @@ async fn a_closed_standard_error_does_not_stop_the_verb_serving() {
     drop(reader);
     let mut child = start_with(&path, &listener, Stdio::from(writer));
     drop(listener);
-    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, "/healthz"))
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
         .await
         .expect("the proxy answers");
     assert_eq!(status, 200);
@@ -464,12 +537,12 @@ async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_launcher_that_blocked_the_stop_signals_cannot_make_the_verb_unstoppable() {
     for signal in [libc::SIGTERM, libc::SIGINT] {
-        let path = config(&format!("masked-{signal}"), TABLE);
+        let (path, ca) = served_config(&format!("masked-{signal}"));
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let mut child = start_masked(&path, &listener, Stdio::piped(), true);
         drop(listener);
-        let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, "/healthz"))
+        let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
             .await
             .expect("the proxy answers");
         assert_eq!(status, 200);

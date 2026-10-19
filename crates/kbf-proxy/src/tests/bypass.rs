@@ -329,7 +329,12 @@ fn every_slot_and_target_has_its_own_loopback_port() {
     let table = UpstreamTable { base_port: 18_000 };
     let mut seen = std::collections::BTreeSet::new();
     for slot in Slot::ALL {
-        for target in [Target::Reapi, Target::Worker, Target::Operator] {
+        for target in [
+            Target::Reapi,
+            Target::Worker,
+            Target::Operator,
+            Target::Enroll,
+        ] {
             let addr = crate::pool::upstream_addr(table, slot, target);
             assert!(addr.ip().is_loopback(), "{addr}");
             assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -337,25 +342,63 @@ fn every_slot_and_target_has_its_own_loopback_port() {
         }
         assert!(seen.insert(table.admin_port(slot)));
     }
-    assert_eq!(seen.len(), 8);
+    assert_eq!(seen.len(), 10);
 }
 
-/// `kbf-proxy` through its public entry points, on its own runtime and the real clock.
+/// The files of a proxy: certificates, tokens, a secret, a config over them.
+pub(super) struct Files {
+    pub(super) pki: super::pki::Pki,
+    pub(super) config: ProxyConfig,
+    pub(super) dir: std::path::PathBuf,
+}
+
+pub(super) fn files(name: &str, base: u16, extra: &str) -> Files {
+    use super::pki::Pki;
+    use crate::scratch::{scratch, write_file};
+    let dir = scratch(name);
+    let pki = Pki::new("farm CA");
+    let paths = pki.write(&dir, &pki.server());
+    let token = |file: &str, text: &str| {
+        let path = dir.join(file);
+        write_file(&path, text.as_bytes(), 0o600);
+        path
+    };
+    let operator = token("operator.token", super::kit::OPERATOR_TOKEN);
+    let buck2 = token("buck2.token", super::kit::BUCK2_TOKEN);
+    let config = ProxyConfig::from_toml_str(&format!(
+        "operator_token_file = {operator:?}\n\
+         buck2_token_file = {buck2:?}\n\
+         server_cert_file = {:?}\n\
+         server_key_file = {:?}\n\
+         client_ca_file = {:?}\n\
+         proxy_auth_file = {:?}\n\
+         hold_max_s = 600\n\
+         {extra}\n\
+         [upstream]\nbase_port = {base}\n",
+        paths.cert,
+        paths.key,
+        paths.client_ca,
+        dir.join("proxy-auth"),
+    ))
+    .expect("a valid table");
+    Files { pki, config, dir }
+}
+
+fn listener() -> (std::net::TcpListener, std::net::SocketAddr) {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    (listener, addr)
+}
+
+/// `kbf-proxy` through its public entry points, on its own runtime, real sockets and the real
+/// clock: TLS in, a certificate's identity to the child, and the bearer mode enforced.
 #[test]
 fn bind_run_hold_release_and_shutdown() {
     let (base, mut listeners) = reserve_ports();
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
-    let public = listener.local_addr().expect("addr");
-    let config = ProxyConfig::from_toml_str(&format!(
-        "operator_token_file = \"/etc/kbf/operator.token\"\n\
-         server_cert_file = \"/etc/kbf/tls/server.pem\"\n\
-         server_key_file = \"/etc/kbf/tls/server.key\"\n\
-         client_ca_file = \"/etc/kbf/tls/ca.pem\"\n\
-         hold_max_s = 600\n\
-         [upstream]\nbase_port = {base}\n"
-    ))
-    .expect("a valid table");
-    let (handle, runner) = Proxy::bind(config, OwnedFd::from(listener)).expect("bind");
+    let (socket, public) = listener();
+    let files = files("bind-run", base, "buck2_auth = \"bearer\"");
+    let client = files.pki.client(&["node-3.farm"], Some("daemon"));
+    let (handle, runner) = Proxy::bind(files.config.clone(), OwnedFd::from(socket)).expect("bind");
     assert!(handle.slots().holding(), "starts holding, to adopt");
     let serving = std::thread::spawn(move || runner.run(NoUpdates));
     let guard = handle.startup_hold().expect("the startup hold, once");
@@ -363,7 +406,9 @@ fn bind_run_hold_release_and_shutdown() {
 
     handle.runtime().block_on(async {
         let child = super::kit::start_child_on(listeners.drain(..3).collect(), tagged("real"));
-        let mut client = super::kit::Client::connect_tcp(public).await;
+        let tls = super::pki::client_config(&files.pki.ca_pem, Some(&client), &["h2"]);
+        let mut client = super::kit::Client::connect_tcp_tls(public, tls).await;
+        client.bearer = Some(super::kit::BUCK2_TOKEN.to_owned());
         let (response, mut body) = client.start(CAPS, false).await;
         body.send_data(bytes::Bytes::from_static(b"x"), true)
             .expect("body");
@@ -381,6 +426,24 @@ fn bind_run_hold_release_and_shutdown() {
         assert!(!snapshot.holding && !snapshot.ready);
         assert_eq!(snapshot.holds_abandoned, 0);
         assert_eq!(child.state.dispatches(), 1);
+        let seen = child.state.headers_of(CAPS);
+        let node = seen[0]
+            .get("x-kbf-node-id")
+            .map(http::HeaderValue::as_bytes);
+        assert_eq!(
+            node,
+            Some(&b"node-3.farm"[..]),
+            "the certificate's identity"
+        );
+        let secret = handle.admin_headers();
+        assert_eq!(
+            seen[0].get("x-kbf-proxy-auth"),
+            secret.get("x-kbf-proxy-auth")
+        );
+        // The bearer mode is enforced on the real path: no key, no service.
+        client.bearer = None;
+        let refused = client.unary(CAPS).await;
+        assert_eq!(refused.grpc_status().as_deref(), Some("16"), "{refused:?}");
         eventually(|| handle.open_streams() == 0).await;
         assert!(client.alive());
     });
@@ -388,6 +451,78 @@ fn bind_run_hold_release_and_shutdown() {
     handle.shutdown();
     handle.shutdown();
     serving.join().expect("the runner thread").expect("run");
+}
+
+/// The secret file is created on the first start and read on the next, and the handle says
+/// which; the admin headers carry it, and a reload of unchanged files succeeds.
+///
+/// Kills: a handle that reports `Existing` for a file it wrote; admin calls without the secret.
+#[test]
+fn bind_reports_where_the_secret_came_from() {
+    use crate::identity::SecretOrigin;
+    let files = files("bind-origin", 20_000, "");
+    let secret_file = files.dir.join("proxy-auth");
+    let (socket, _) = listener();
+    let (first, _) = Proxy::bind(files.config.clone(), OwnedFd::from(socket)).expect("bind");
+    assert_eq!(first.secret_origin(), SecretOrigin::Created);
+    let bytes = std::fs::read(&secret_file).expect("the secret file");
+    assert_eq!(bytes.len(), 32);
+    let admin = first.admin_headers();
+    assert_eq!(admin.len(), 1);
+    assert_eq!(
+        admin.get("x-kbf-proxy-auth").expect("secret"),
+        hex::encode(&bytes).as_str()
+    );
+    first.reload_tls().expect("unchanged files reload");
+
+    let (socket, _) = listener();
+    let (second, _) = Proxy::bind(files.config, OwnedFd::from(socket)).expect("bind");
+    assert_eq!(second.secret_origin(), SecretOrigin::Existing);
+    assert_eq!(second.admin_headers(), admin);
+}
+
+/// A proxy does not start on a file it cannot use, and says which.
+///
+/// Kills: a bind that starts without TLS, without the operator token, or on an open secret;
+/// one that creates the secret file before the files that can still refuse it.
+#[test]
+fn bind_refuses_files_it_cannot_use() {
+    use crate::scratch::write_file;
+    let bind = |files: &Files| {
+        let (socket, _) = listener();
+        Proxy::bind(files.config.clone(), OwnedFd::from(socket)).map(|_| ())
+    };
+    let broken = |name: &str, mode: &str, damage: &dyn Fn(&Files)| {
+        let files = files(name, 20_000, &format!("buck2_auth = \"{mode}\""));
+        damage(&files);
+        let refusal = bind(&files).expect_err(name).to_string();
+        // A start that fails leaves no new secret for a child to read and the supervisor to
+        // adopt; only the file the test itself wrote is there.
+        assert_eq!(files.dir.join("proxy-auth").exists(), name == "open-secret");
+        refusal
+    };
+    let remove =
+        |files: &Files, name: &str| std::fs::remove_file(files.dir.join(name)).expect("rm");
+    broken("no-operator-token", "none", &|f| {
+        remove(f, "operator.token")
+    });
+    broken("open-operator-token", "none", &|f| {
+        write_file(
+            &f.dir.join("operator.token"),
+            super::kit::OPERATOR_TOKEN.as_bytes(),
+            0o644,
+        );
+    });
+    broken("no-buck2-token", "bearer", &|f| remove(f, "buck2.token"));
+    broken("no-certificate", "none", &|f| remove(f, "server.pem"));
+    broken("no-client-ca", "none", &|f| remove(f, "ca.pem"));
+    broken("open-secret", "none", &|f| {
+        write_file(&f.dir.join("proxy-auth"), &[1; 32], 0o644);
+    });
+    // The Buck2 key is read only in the mode that uses it.
+    let files = files("buck2-unused", 20_000, "buck2_auth = \"mtls\"");
+    remove(&files, "buck2.token");
+    bind(&files).expect("mtls reads no Buck2 key");
 }
 
 async fn eventually(mut done: impl FnMut() -> bool) {
@@ -426,12 +561,19 @@ async fn shutdown_sends_the_one_goaway_and_lets_a_stream_finish() {
 async fn an_accept_that_keeps_failing_backs_off_and_shutdown_still_ends_it() {
     let table = UpstreamTable { base_port: 18_000 };
     let net = Arc::new(super::kit::MemNet::default());
-    let core = crate::core::Core::new(table, Limits::default(), ActiveSlot::new(), net.connector());
+    let core = crate::core::Core::new(
+        table,
+        Limits::default(),
+        ActiveSlot::new(),
+        net.connector(),
+        super::kit::security(crate::auth::Buck2Auth::None),
+    );
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let serving = tokio::spawn(crate::serve::serve(
         core,
         NoUpdates,
         super::kit::failing_listener(),
+        crate::tls::Acceptor::Plain(None),
         stopped,
     ));
     // A busy loop would never let this virtual second pass; a backed-off one does.
@@ -456,33 +598,4 @@ async fn a_refusal_of_a_grpc_call_is_a_grpc_response() {
         Some("application/grpc"),
         "a client that cannot read the answer sees a malformed response, not UNAVAILABLE"
     );
-}
-
-fn closed_config(extra: &str) -> ProxyConfig {
-    ProxyConfig::from_toml_str(&format!(
-        "operator_token_file = \"/etc/kbf/operator.token\"\n\
-         server_cert_file = \"/etc/kbf/tls/server.pem\"\n\
-         server_key_file = \"/etc/kbf/tls/server.key\"\n\
-         client_ca_file = \"/etc/kbf/tls/ca.pem\"\n\
-         {extra}\n\
-         [upstream]\nbase_port = 20000\n"
-    ))
-    .expect("a valid table")
-}
-
-#[test]
-fn bind_refuses_an_authentication_mode_it_cannot_enforce_yet() {
-    for mode in ["bearer", "mtls"] {
-        let extra = format!("buck2_auth = \"{mode}\"\nbuck2_token_file = \"/etc/kbf/buck2.token\"");
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
-        let error = Proxy::bind(closed_config(&extra), OwnedFd::from(listener))
-            .expect_err("served open instead");
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{mode}");
-    }
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
-    Proxy::bind(
-        closed_config("buck2_auth = \"none\""),
-        OwnedFd::from(listener),
-    )
-    .expect("none is the mode that is built");
 }
