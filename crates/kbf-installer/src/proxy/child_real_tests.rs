@@ -1,0 +1,290 @@
+//! Real processes (the stand-in children of [`crate::proxy::child_rig`]) under the real
+//! child port.
+
+use super::*;
+use crate::proxy::child_rig::{Cleanup, Rig, alive, rig, wait_for};
+use crate::testkit::{A, B, c};
+
+/// Catches a spawn that runs another file than the release's (the `current` link, a stale
+/// path), that records a different identity than the live process's, or that leaves the
+/// record unwritten: the record is what finds a candidate the update file does not know.
+#[test]
+fn a_spawned_child_runs_the_release_and_its_identity_is_recorded_before_spawn_returns() {
+    let rig = rig("child-real-spawn");
+    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
+    assert_eq!(ident, ident_of(ident.pid).expect("live"));
+    assert_eq!(
+        ident.exe,
+        std::env::current_exe().expect("exe").canonicalize().expect("canonical"),
+        "the program is the one the release's file links to"
+    );
+    assert_eq!(
+        rig.child.recorded(Slot::A),
+        Some(Recorded {
+            ident: ident.clone(),
+            commit: c(A)
+        })
+    );
+    assert_eq!(rig.child.recorded(Slot::B), None);
+    assert_eq!(rig.child.exited(&ident), None);
+}
+
+/// Catches a SIGTERM that is really a SIGKILL (status 137), a terminate that does not reach
+/// the child, an exit that is not reaped (the zombie would stay) and a record left behind.
+#[test]
+fn terminate_is_sigterm_and_the_exit_is_reaped_and_clears_the_record() {
+    let rig = rig("child-real-term");
+    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
+    rig.child.terminate(&ident).expect("signal");
+    let mut code = None;
+    wait_for("the child to exit", || {
+        code = rig.child.exited(&ident);
+        code.is_some()
+    });
+    assert_eq!(code, Some(128 + 15), "killed by SIGTERM, not SIGKILL");
+    assert!(!alive(ident.pid), "reaped, not a zombie");
+    assert_eq!(rig.child.recorded(Slot::A), None);
+    // The entry is gone: the pid is not this port's any more.
+    assert_eq!(rig.child.exited(&ident), Some(UNKNOWN_EXIT));
+    assert!(rig.child.terminate(&ident).is_err());
+}
+
+/// Catches a child that reports no exit code, or the wrong one.
+#[test]
+fn a_child_that_exits_reports_its_status() {
+    let rig = rig("child-real-exit");
+    rig.set(&["exit", "3"]);
+    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let mut code = None;
+    wait_for("the exit", || {
+        code = rig.child.exited(&ident);
+        code.is_some()
+    });
+    assert_eq!(code, Some(3));
+}
+
+/// A restarted proxy adopts the live child by its recorded identity, watches it by pidfd
+/// (its exit code is unknown: it is not the new proxy's child) and signals it through that
+/// pidfd. The first port plays the dead proxy and only reaps.
+#[test]
+fn a_live_child_is_adopted_after_a_restart_then_watched_and_terminated() {
+    let rig = rig("child-real-adopt");
+    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
+    let after = rig.restarted();
+    let recorded = after.recorded(Slot::A).expect("the record survives the restart");
+    assert_eq!(after.adopt(Slot::A, &recorded.ident), Ok(()));
+    assert_eq!(after.exited(&ident), None);
+    after.terminate(&ident).expect("signal");
+    wait_for("the adopted child to exit", || after.exited(&ident).is_some());
+    assert_eq!(after.exited(&ident), Some(UNKNOWN_EXIT));
+    // The first port reaps its zombie, as the kernel hands the orphan to init in life.
+    wait_for("the reap", || rig.child.exited(&ident).is_some());
+    assert!(!alive(ident.pid));
+}
+
+/// Catches an adoption that accepts a pid whose start time or executable differs (a recycled
+/// pid), one that accepts a pid that is gone, and the worse failure: a refused process being
+/// signalled afterwards. The refused process is a real one and must keep running.
+#[test]
+fn a_recycled_pid_is_never_adopted_or_signalled() {
+    let rig = rig("child-real-recycled");
+    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
+    let after = rig.restarted();
+    let wrong_start = ProcIdent {
+        start_time: ident.start_time + 1,
+        ..ident.clone()
+    };
+    let wrong_exe = ProcIdent {
+        exe: PathBuf::from("/usr/bin/other"),
+        ..ident.clone()
+    };
+    for forged in [&wrong_start, &wrong_exe] {
+        assert_eq!(
+            after.adopt(Slot::A, forged),
+            Err(AdoptError::Recycled { pid: ident.pid })
+        );
+        assert!(after.terminate(forged).is_err(), "not held, not signalled");
+        assert_eq!(after.exited(forged), Some(UNKNOWN_EXIT), "not ours");
+    }
+    // The port that holds the process refuses a forged identity for the same pid, too: the
+    // pid alone is not enough to be signalled.
+    for forged in [&wrong_start, &wrong_exe] {
+        assert!(rig.child.terminate(forged).is_err());
+        assert!(rig.child.kill_unserved(forged).is_err());
+        assert_eq!(rig.child.exited(forged), Some(UNKNOWN_EXIT));
+    }
+    assert!(alive(ident.pid), "the process behind the pid was left alone");
+    assert_eq!(rig.child.exited(&ident), None);
+    // A pid that is gone is gone, not recycled.
+    rig.child.terminate(&ident).expect("signal");
+    wait_for("exit", || rig.child.exited(&ident).is_some());
+    assert_eq!(after.adopt(Slot::A, &ident), Err(AdoptError::Gone(ident.pid)));
+}
+
+/// Catches a `kill_unserved` that signals the wrong process: the candidate dies, the serving
+/// child in the other slot does not, and a process the port does not hold is refused.
+#[test]
+fn kill_unserved_kills_the_candidate_alone_and_reaps_it() {
+    let rig = rig("child-real-kill");
+    let old = rig.child.spawn(Slot::A, &c(A)).expect("old");
+    let _stop = Cleanup(&rig.child, vec![old.clone()]);
+    // The candidate ignores SIGTERM, so only the SIGKILL ends it; it says when it does.
+    let up = rig.layout_root.join("candidate-up");
+    let up_path = up.to_string_lossy().into_owned();
+    rig.set(&["ignore-signal", "15", ";", "append", &up_path, "up", ";", "sleep", "600"]);
+    let candidate = rig.child.spawn(Slot::B, &c(B)).expect("candidate");
+    wait_for("the candidate to ignore SIGTERM", || up.exists());
+    rig.child.kill_unserved(&candidate).expect("kill");
+    wait_for("the candidate to go", || !alive(candidate.pid));
+    assert!(alive(old.pid), "the serving child is untouched");
+    assert_eq!(rig.child.exited(&old), None);
+    assert_eq!(rig.child.recorded(Slot::B), None, "its record is cleared");
+    assert!(rig.child.recorded(Slot::A).is_some());
+    assert!(rig.child.kill_unserved(&candidate).is_err(), "no longer held");
+}
+
+/// Catches a second child started into a slot that has a live one (the swap spawns only
+/// into an idle slot), and a slot that stays blocked after its child exited.
+#[test]
+fn a_slot_with_a_live_child_refuses_a_second_and_is_free_once_it_exited() {
+    let rig = rig("child-real-occupied");
+    let first = rig.child.spawn(Slot::A, &c(A)).expect("first");
+    let _stop = Cleanup(&rig.child, vec![first.clone()]);
+    let refused = rig.child.spawn(Slot::A, &c(B)).expect_err("occupied");
+    assert!(refused.0.contains("live child already"), "{refused}");
+    rig.child.terminate(&first).expect("signal");
+    wait_for("exit", || !alive(first.pid));
+    rig.set(&["sleep", "600"]);
+    let second = rig.child.spawn(Slot::A, &c(B)).expect("free again");
+    assert_ne!(first.pid, second.pid);
+    let _stop2 = Cleanup(&rig.child, vec![second]);
+}
+
+/// Catches a spawn that reports success for a program that does not exist, and a record
+/// written for a child that never started.
+#[test]
+fn a_release_without_a_program_is_a_spawn_error_and_records_nothing() {
+    let rig = rig("child-real-missing");
+    let release = CommitId::new(&"c".repeat(40)).expect("a commit");
+    let e = rig.child.spawn(Slot::A, &release).expect_err("no program");
+    assert!(e.0.contains("kbf-act"), "{e}");
+    assert_eq!(rig.child.recorded(Slot::A), None);
+}
+
+/// Catches a child left running that nothing can find again: when the record cannot be
+/// written, the spawn fails and the child it started is killed.
+#[test]
+fn a_child_whose_record_cannot_be_written_is_killed_and_the_spawn_fails() {
+    let rig = rig("child-real-norecord");
+    // The record directory is a file, so the record cannot be made.
+    fs::write(&rig.dir, b"in the way").expect("block");
+    rig.set(&["sleep", "31337"]);
+    let e = rig.child.spawn(Slot::A, &c(A)).expect_err("no record");
+    assert!(e.0.contains("record the new child"), "{e}");
+    let running = || {
+        fs::read_dir("/proc")
+            .expect("proc")
+            .flatten()
+            .filter_map(|e| fs::read(e.path().join("cmdline")).ok())
+            .any(|cmd| cmd.windows(5).any(|w| w == b"31337") && cmd.starts_with(rig.layout_root.as_os_str().as_encoded_bytes()))
+    };
+    wait_for("the child to be killed", || !running());
+}
+
+/// Catches children that stay in the proxy's process group (a signal to the group would
+/// reach them) or that inherit the activation variables.
+#[test]
+fn a_child_leads_its_own_process_group_and_gets_no_activation_variables() {
+    let rig = rig("child-real-group");
+    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
+    let stat = fs::read_to_string(format!("/proc/{}/stat", ident.pid)).expect("stat");
+    // After the command name: state, parent, process group.
+    let group: u32 = stat[stat.rfind(')').expect("comm") + 1..]
+        .split_whitespace()
+        .nth(2)
+        .and_then(|g| g.parse().ok())
+        .expect("process group");
+    assert_eq!(group, ident.pid, "the child leads its own group");
+
+    let mut command = Command::new("x");
+    detach(&mut command);
+    let removed: Vec<_> = command
+        .get_envs()
+        .filter(|(_, value)| value.is_none())
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+    for name in ["LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES", "NOTIFY_SOCKET"] {
+        assert!(removed.iter().any(|n| n == name), "{name} is kept: {removed:?}");
+    }
+}
+
+/// Catches a start time read from the wrong field when the command name holds spaces or
+/// parentheses, which `/proc/<pid>/stat` does not escape.
+#[test]
+fn the_start_time_is_field_22_whatever_the_command_name_holds() {
+    let tail = "S 1 1 1 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 424242 1000 10 18446744073709551615";
+    for comm in ["kbf", "a b", "x) S 9 (y", "((("] {
+        let line = format!("123 ({comm}) {tail}");
+        assert_eq!(start_time_of(&line), Some(424_242), "{comm}");
+    }
+    assert_eq!(start_time_of("123 (kbf)"), None);
+    assert_eq!(start_time_of("no parenthesis"), None);
+}
+
+/// Catches a port that kills its children when it goes away: a proxy restart must leave them
+/// serving. The port is dropped, the child lives, and a port of the restarted proxy adopts it.
+#[test]
+fn dropping_the_port_leaves_the_child_running_for_the_next_proxy_to_adopt() {
+    let rig = rig("child-real-drop");
+    let ident = rig.child.spawn(Slot::A, &c(A)).expect("spawn");
+    let after = rig.restarted();
+    let Rig { child, .. } = rig;
+    drop(child);
+    assert!(alive(ident.pid), "the child outlives the port that started it");
+    let recorded = after.recorded(Slot::A).expect("record");
+    assert_eq!(after.adopt(Slot::A, &recorded.ident), Ok(()));
+    let _stop = Cleanup(&after, vec![ident.clone()]);
+    assert_eq!(after.exited(&ident), None);
+}
+
+/// Catches an adoption that trusts the identity it read before it opened the pidfd: a pid
+/// recycled between the two reads would be signalled through a pidfd of another process.
+#[test]
+fn a_pid_recycled_between_the_check_and_the_open_is_refused() {
+    use std::cell::Cell;
+    let recorded = ProcIdent {
+        pid: 4242,
+        start_time: 7,
+        exe: PathBuf::from("/x/kbf"),
+    };
+    let other = ProcIdent {
+        start_time: 8,
+        ..recorded.clone()
+    };
+    let reads = Cell::new(0);
+    let identity = |_: u32| {
+        reads.set(reads.get() + 1);
+        Ok(if reads.get() == 1 { recorded.clone() } else { other.clone() })
+    };
+    let open = |_: u32| Ok(OwnedFd::from(fs::File::open("/dev/null").expect("open")));
+    assert_eq!(
+        verified_open(&recorded, identity, open).err(),
+        Some(AdoptError::Recycled { pid: 4242 })
+    );
+    // The same process on both reads is accepted, and a process that vanished is `Gone`.
+    assert!(verified_open(&recorded, |_| Ok(recorded.clone()), open).is_ok());
+    assert_eq!(
+        verified_open(&recorded, |_| Err(std::io::Error::other("gone")), open).err(),
+        Some(AdoptError::Gone(4242))
+    );
+    let no_pidfd = |_: u32| Err(Errno::SRCH);
+    assert_eq!(
+        verified_open(&recorded, |_| Ok(recorded.clone()), no_pidfd).err(),
+        Some(AdoptError::Gone(4242))
+    );
+}

@@ -41,7 +41,7 @@ kbf-host.workspace = true
 kbf-proxy.workspace = true
 kbf-update.workspace = true
 libc.workspace = true
-rustix = { workspace = true, features = ["fs", "net", "process"] }
+rustix = { workspace = true, features = ["event", "fs", "net", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -55,16 +55,21 @@
 
 mod aio;
 pub mod api;
+#[cfg(target_os = "linux")]
+pub mod child_real;
 pub mod gate_real;
 pub mod model;
 pub mod ports;
 pub mod record;
 mod recover;
 mod retire;
+pub mod runtime;
 mod swap;
 
 #[cfg(test)]
 mod aio_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod child_rig;
 #[cfg(test)]
 mod confirm_boundary_tests;
 #[cfg(test)]
