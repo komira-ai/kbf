@@ -26,6 +26,9 @@ struct Node {
     offered: Option<String>,
     enabled: Vec<String>,
     procs: Vec<u32>,
+    /// Threads that are not their process's leader: `cgroup.threads` lists them,
+    /// `cgroup.procs` does not, and they keep the cgroup populated.
+    strays: Vec<u32>,
     files: BTreeMap<String, String>,
     read_only: bool,
 }
@@ -162,6 +165,12 @@ impl CgroupFs for Fake {
             }
             "cgroup.subtree_control" => Ok(format!("{}\n", node.enabled.join(" "))),
             "cgroup.procs" => Ok(node.procs.iter().map(|p| format!("{p}\n")).collect()),
+            "cgroup.threads" => Ok(node
+                .procs
+                .iter()
+                .chain(&node.strays)
+                .map(|p| format!("{p}\n"))
+                .collect()),
             _ => {
                 let value = node.files.get(file).cloned();
                 drop(nodes);
@@ -190,6 +199,7 @@ impl CgroupFs for Fake {
                     // It ends now, after the listing that named it.
                     for node in self.nodes.borrow_mut().values_mut() {
                         node.procs.retain(|p| *p != pid);
+                        node.strays.retain(|p| *p != pid);
                     }
                     return Err(errno(rustix::io::Errno::SRCH));
                 }
@@ -199,6 +209,7 @@ impl CgroupFs for Fake {
                 let mut nodes = self.nodes.borrow_mut();
                 for node in nodes.values_mut() {
                     node.procs.retain(|p| *p != pid);
+                    node.strays.retain(|p| *p != pid);
                 }
                 nodes.get_mut(cgroup).expect("cgroup").procs.push(pid);
             }
@@ -216,7 +227,11 @@ impl CgroupFs for Fake {
                         .procs
                         .push(pid);
                 }
-                if cgroup != "/" && !self.procs(cgroup).is_empty() {
+                let populated = {
+                    let nodes = self.nodes.borrow();
+                    !nodes[cgroup].procs.is_empty() || !nodes[cgroup].strays.is_empty()
+                };
+                if cgroup != "/" && populated {
                     return Err(errno(rustix::io::Errno::BUSY));
                 }
                 let offered = self.controllers(cgroup);
@@ -495,6 +510,20 @@ fn hosts_and_units_that_cannot_delegate_are_refused_with_the_fix() {
         err.contains("may not write its cgroup") && err.contains("User="),
         "{err}"
     );
+}
+
+/// Catches a thread that is not its process's leader left behind: `cgroup.procs` lists
+/// leaders only, so a thread made in the unit's cgroup as the process moved out (a
+/// test binary's libtest thread, spawned while another thread starts the daemon's
+/// set-up) is listed there never, and every enable is EBUSY while it lives. The set-up
+/// must move what `cgroup.threads` lists (a thread's id moves its whole process).
+#[test]
+fn a_thread_that_cgroup_procs_does_not_list_is_moved_too() {
+    let fake = Fake::host(UNIT, "cpu memory pids", &[41]);
+    fake.nodes.borrow_mut().get_mut(UNIT).expect("unit").strays = vec![77];
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    assert_eq!(fake.procs(UNIT), Vec::<u32>::new());
+    assert!(fake.procs(SUPERVISOR_CG).contains(&77), "{:?}", fake.log());
 }
 
 /// Catches a failed move or enable read as done (leases would then fail making their
