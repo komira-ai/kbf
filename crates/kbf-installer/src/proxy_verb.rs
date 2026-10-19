@@ -285,7 +285,9 @@ fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
             drop(tokio::task::spawn_blocking(move || {
                 let line = match handle.reload_tls() {
                     Ok(()) => "reloaded the TLS files".to_owned(),
-                    Err(error) => format!("TLS files unusable, the previous ones are kept: {error}"),
+                    Err(error) => {
+                        format!("TLS files unusable, the previous ones are kept: {error}")
+                    }
                 };
                 let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {line}");
             }));

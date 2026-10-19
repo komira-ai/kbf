@@ -628,14 +628,20 @@ async fn sighup_serves_the_renewed_certificate_and_cuts_no_stream() {
         fs::rename(dir.join(format!("b-{file}")), dir.join(file)).expect("replace");
     }
     // Before the signal nothing changes: a renewal alone reloads nothing.
-    assert!(try_tls(addr, &ca_b).await.is_err(), "reloaded without a signal");
+    assert!(
+        try_tls(addr, &ca_b).await.is_err(),
+        "reloaded without a signal"
+    );
     send(&child, libc::SIGHUP);
     until_served_by(addr, &ca_b).await;
     assert!(
         try_tls(addr, &ca_a).await.is_err(),
         "the old certificate is still served"
     );
-    assert!(child.try_wait().expect("wait").is_none(), "SIGHUP stopped the verb");
+    assert!(
+        child.try_wait().expect("wait").is_none(),
+        "SIGHUP stopped the verb"
+    );
 
     let request = http::Request::builder()
         .uri("http://proxy.test/healthz")
@@ -690,13 +696,25 @@ async fn a_sighup_with_a_missing_key_keeps_the_old_certificate_and_names_the_fil
         if text.contains("previous ones are kept") {
             break text;
         }
-        assert!(started.elapsed() < Duration::from_secs(20), "no line: {text}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "no line: {text}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert_eq!(said.matches("previous ones are kept").count(), 1, "{said}");
-    assert!(said.contains(&key.display().to_string()), "no file named: {said}");
-    assert!(try_tls(addr, &ca_b).await.is_err(), "the new certificate half-applied");
-    assert!(child.try_wait().expect("wait").is_none(), "a failed reload stopped the verb");
+    assert!(
+        said.contains(&key.display().to_string()),
+        "no file named: {said}"
+    );
+    assert!(
+        try_tls(addr, &ca_b).await.is_err(),
+        "the new certificate half-applied"
+    );
+    assert!(
+        child.try_wait().expect("wait").is_none(),
+        "a failed reload stopped the verb"
+    );
 
     fs::rename(dir.join("b-server.key"), &key).expect("the renewed key");
     send(&child, libc::SIGHUP);
