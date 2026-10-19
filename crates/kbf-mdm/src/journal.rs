@@ -145,6 +145,35 @@ mod tests {
     use super::recording::Recorded;
     use super::*;
 
+    /// A log held in memory: what a test's subscriber writes to.
+    #[derive(Clone, Default)]
+    struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Log {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            let log = self.clone();
+            tracing_subscriber::fmt()
+                .with_writer(move || log.clone())
+                .with_ansi(false)
+                .finish()
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
     #[test]
     fn events_are_appended_and_alerts_sent() {
         let dir = crate::testkit::scratch("journal");
@@ -188,11 +217,8 @@ mod tests {
     /// run) whatever else ran in the process.
     #[test]
     fn log_alerts_write_the_event_to_the_log() {
-        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .finish();
+        let log = Log::default();
+        let subscriber = log.subscriber();
         let dir = crate::testkit::scratch("journal-log");
         let journal = Journal::open(&dir.join("audit.log"), Box::new(LogAlerts)).unwrap();
         tracing::subscriber::with_default(subscriber, || {
@@ -200,7 +226,7 @@ mod tests {
                 .record(&Event::new(0, "erase", "S9", "refused", "no touch", true))
                 .unwrap();
         });
-        let text = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        let text = log.text();
         for want in [
             "ERROR",
             "kbf_mdm_gate::alert",
