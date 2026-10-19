@@ -56,7 +56,7 @@ use clap::{Args, Subcommand};
 use kbf_host::exec::HostExec;
 use kbf_host::path::Root;
 use kbf_host::plan::Mode;
-use kbf_installer::helper::service;
+use kbf_installer::helper::service::{self, Procs};
 use kbf_installer::layout::{Layout, Platform};
 
 use state::{CurrentLink, Status};
@@ -186,28 +186,48 @@ pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
         }
         Host::Gc(a) => {
             let host = a.apply.layout();
-            // A release a process executes from stays (S22); where that cannot be told,
-            // nothing is removed.
-            match service::in_use(&service::HostProcs::new(host.platform()), &host) {
-                Ok(in_use) => release::gc(
-                    &mut HostExec::new(host.root().clone()),
-                    &host,
-                    a.keep,
-                    &in_use,
-                    a.apply.mode(),
-                    out,
-                ),
-                Err(e) => {
-                    let _ = writeln!(err, "kbf-deploy: cannot tell which releases run: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
+            let procs = service::HostProcs::new(host.platform());
+            return gc(&procs, &host, a.keep, a.apply.mode(), out, err);
         }
     };
+    finish(done, err)
+}
+
+/// The exit of a verb: success, or the error on `err` and failure.
+fn finish<E: std::fmt::Display>(done: Result<(), E>, err: &mut dyn Write) -> ExitCode {
     match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "kbf-deploy: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `gc`, keeping every release a process of `procs` executes from (S22); where that cannot
+/// be told, nothing is removed and the verb fails.
+fn gc(
+    procs: &dyn Procs,
+    host: &Layout,
+    keep: usize,
+    mode: Mode,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    match service::in_use(procs, host) {
+        Ok(in_use) => finish(
+            release::gc(
+                &mut HostExec::new(host.root().clone()),
+                host,
+                keep,
+                &in_use,
+                mode,
+                out,
+            ),
+            err,
+        ),
+        Err(e) => {
+            let _ = writeln!(err, "kbf-deploy: cannot tell which releases run: {e}");
             ExitCode::FAILURE
         }
     }
