@@ -648,7 +648,7 @@ fn a_linux_host_is_mapped_to_the_payload_of_its_machine_name() {
         let root = dir.join("root");
         std::fs::create_dir_all(&root).expect("root");
         let (url, seen) = serve(release().clone());
-        let mut path = dir.clone().into_os_string();
+        let mut path = dir.path().as_os_str().to_owned();
         path.push(":");
         path.push(path_with_fake_systemd(&dir));
         let out = Command::new(SCRIPT)
