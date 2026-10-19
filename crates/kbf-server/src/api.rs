@@ -338,7 +338,7 @@ async fn act(
 }
 
 /// The body of `POST /v1/members/{id}`: the state to put the member in. `Down` is the
-/// store's verdict and `joining`/`catching_up` are the registration's, so none of them
+/// store's verdict and `joining`/`catching_up` are the registration's (a new node in a farm with data is `joining`), so none of them
 /// is accepted.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
