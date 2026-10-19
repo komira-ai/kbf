@@ -182,7 +182,7 @@ The rule in code: a child after `Fenced` or `stand-down` may write only keys car
 **Not provided.** Full concurrency (per-session `session_gen`, batch pull-claim, a `draining` role, per-host generations) is sized L to XL in `split-mode-updates.md` and is deferred. `Store::demote` has no Postgres implementation and none is written, because the fence refuses the old child's writes. **Mandatory test:** a result committed through frontend B reaches a waiter on frontend A.
 ## 9. Frontend-first order and compatibility
 
-The frontend host updates via section 5. After bake, the new child writes `desired` and its controller updates the nodes. `kbf-installer deploy` waits on `GET /v1/update/frontend` reaching `done` and no longer posts node updates itself.
+The frontend host updates via section 5. After bake, the new child writes `desired` and its controller updates the nodes. `kbf-installer deploy` waits on `GET /v1/update/frontend` reaching `done` and no longer posts node updates itself; it then watches `GET /v1/nodes` until every node it saw before the swap is on the commit, since the new frontend lists only the nodes that have reconnected to it (`docs/design/gamma-deploy.md`).
 
 | Rule | Statement | Enforced by |
 |---|---|---|

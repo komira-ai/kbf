@@ -1,6 +1,6 @@
 //! Steps 5 and 7: wait for every node to confirm, then check the farm.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -10,13 +10,48 @@ use super::summary::{Exit, NodeResult};
 use super::{Fail, Run, SmokeResult, fail};
 
 impl Run<'_> {
+    /// The generation under which the new frontend offered the commit. The frontend makes
+    /// the offer in the `nodes` phase of its update, so it is there once the update is
+    /// `done`; it is read until it is (a read can fail while the children settle) for the
+    /// budget of one node. The deploy does not make the offer itself: if the desired release
+    /// is not the commit, nothing rolls the nodes and the deploy says so.
+    fn await_offer(&mut self) -> Result<u64, Fail> {
+        let start = self.env.clock.now();
+        let commit = self.opts.commit.as_str();
+        let seen = loop {
+            let seen = match self.get_json("/v1/update") {
+                Ok(update) => match nodes::desired(&update) {
+                    Some(offer) if offer.commit == commit => {
+                        self.sum.generation = Some(offer.generation);
+                        return Ok(offer.generation);
+                    }
+                    Some(offer) => format!("the desired release is {}", offer.commit),
+                    None => "no desired release is set".to_owned(),
+                },
+                Err(e) => e,
+            };
+            let waited = self.env.clock.now().saturating_sub(start);
+            if waited >= self.opts.node_timeout.as_secs() {
+                break seen;
+            }
+            self.env.clock.sleep(self.opts.poll);
+        };
+        Err(fail(
+            Exit::Failed,
+            "nodes_not_offered",
+            format!("the new frontend did not offer the commit to the nodes: {seen}"),
+        ))
+    }
+
     /// Step 5. The clock for a node starts when the previous one confirms (or at the
     /// start), so a slow storage node does not share one budget with the rest. The first
     /// node that does not confirm ends the deploy; no later node is waited for, and none
-    /// is ordered: the drain system owns the roll.
+    /// is ordered: the new frontend's controller owns the roll. Every node the preflight
+    /// saw is waited for, listed or not: the new frontend lists only the nodes that have
+    /// reconnected to it.
     pub(super) fn wait_nodes(&mut self) -> Result<(), Fail> {
         let commit = self.opts.commit.to_string();
-        let generation = self.sum.generation;
+        let generation = self.await_offer()?;
         let mut done: BTreeMap<String, NodeResult> = BTreeMap::new();
         let mut last = self.env.clock.now();
         loop {
@@ -42,10 +77,7 @@ impl Run<'_> {
                         continue;
                     }
                     // A state left from an older offer is not this deploy's.
-                    let current = match (node.offered_generation, generation) {
-                        (Some(offered), Some(g)) => offered >= g,
-                        _ => true,
-                    };
+                    let current = node.offered_generation.is_none_or(|g| g >= generation);
                     let verdict = if !current {
                         None
                     } else if node.state == "reverted" {
@@ -65,23 +97,56 @@ impl Run<'_> {
                         return Err(self.stop(list, done, &node.id, state));
                     }
                 }
+                // A node that may be offline and is not listed is as good as one that is.
+                for id in self.expected.keys() {
+                    if self.opts.allow_offline.contains(id) && !list.iter().any(|n| &n.id == id) {
+                        done.entry(id.clone())
+                            .or_insert_with(|| self.node_result(list, id, "offline", 0));
+                    }
+                }
                 // An empty list confirms nothing.
-                if !list.is_empty() && list.iter().all(|n| done.contains_key(&n.id)) {
+                if !list.is_empty() && self.nodes(list).all(|id| done.contains_key(id)) {
                     self.sum.nodes = done.into_values().collect();
                     return Ok(());
                 }
             }
             if now.saturating_sub(last) >= self.opts.node_timeout.as_secs() {
                 let list = seen.unwrap_or_default();
-                // The first node, in id order, that is still waited for.
-                let stuck = list.iter().find(|n| !done.contains_key(&n.id));
-                let id = stuck.map(|n| n.id.clone()).unwrap_or_default();
-                if let Some(n) = stuck {
-                    done.insert(id.clone(), result(n, "timed_out", now.saturating_sub(last)));
+                // The first node, in id order, that is still waited for. None when every node
+                // may be offline and none is listed: an empty list confirms nothing.
+                let stuck = self.nodes(&list).find(|id| !done.contains_key(*id));
+                let id = stuck.unwrap_or("no node listed").to_owned();
+                if stuck.is_some() {
+                    let late = self.node_result(&list, &id, "timed_out", now.saturating_sub(last));
+                    done.insert(id.clone(), late);
                 }
                 return Err(self.stop(&list, done, &id, "timed_out"));
             }
             self.env.clock.sleep(self.opts.poll);
+        }
+    }
+
+    /// Every node the deploy waits for, in id order: those the preflight saw and those
+    /// `list` has (a node that enrolled since).
+    fn nodes<'n>(&'n self, list: &'n [Node]) -> impl Iterator<Item = &'n str> {
+        let ids: BTreeSet<&str> = self
+            .expected
+            .keys()
+            .map(String::as_str)
+            .chain(list.iter().map(|n| n.id.as_str()))
+            .collect();
+        ids.into_iter()
+    }
+
+    /// The result of node `id`: from `list` when it is there, else from the preflight.
+    fn node_result(&self, list: &[Node], id: &str, state: &str, secs: u64) -> NodeResult {
+        match list.iter().find(|n| n.id == id) {
+            Some(n) => result(n, state, secs),
+            None => NodeResult {
+                platform: self.expected.get(id).cloned().unwrap_or_default(),
+                secs,
+                ..NodeResult::new(id, state)
+            },
         }
     }
 
@@ -93,9 +158,9 @@ impl Run<'_> {
         id: &str,
         state: &str,
     ) -> Fail {
-        for n in list {
-            done.entry(n.id.clone())
-                .or_insert_with(|| result(n, "pending", 0));
+        for waited in self.nodes(list) {
+            done.entry(waited.to_owned())
+                .or_insert_with(|| self.node_result(list, waited, "pending", 0));
         }
         self.sum.nodes = done.into_values().collect();
         fail(
