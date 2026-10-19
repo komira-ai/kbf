@@ -66,7 +66,7 @@ use tokio::time::timeout;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::farm::{Farm, Outbound, Reported, StreamId};
-use crate::identity::{PeerCert, Peers};
+use crate::identity::{PeerCert, Peers, presented};
 use crate::map_push::MapFeed;
 use crate::release::offers::{OfferFeed, Offers, platform_of};
 
@@ -145,9 +145,7 @@ impl Worker for WorkerService {
         &self,
         request: Request<Streaming<DaemonMessage>>,
     ) -> Result<Response<SessionStream>, Status> {
-        let certs = kbf_tls::peer_certs(&request);
-        let leaf = certs.as_deref().and_then(|chain| chain.first());
-        let peer = self.peers.peer(leaf.map(AsRef::as_ref))?;
+        let peer = self.peers.peer_of(&presented(request.extensions()))?;
         let mut inbound = request.into_inner();
         let first = timeout(self.hello_wait, inbound.message())
             .await

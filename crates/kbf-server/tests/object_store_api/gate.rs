@@ -187,8 +187,10 @@ async fn every_route_passes_the_whole_gate_a_get_included() {
 #[tokio::test]
 async fn a_frontend_without_the_feature_answers_404_to_a_caller_past_the_gate() {
     use axum::Router;
-    let router: Router =
-        kbf_server::object_store::api::routes(Some(super::harness::token_file()), None);
+    let router: Router = super::harness::gated(
+        kbf_server::object_store::api::routes(Some(super::harness::token_file()), None),
+        None,
+    );
     let bearer = format!("Bearer {TOKEN}");
     for (method, path, body) in routes() {
         let anonymous = send(
@@ -238,4 +240,87 @@ async fn every_answer_is_no_store_and_a_wrong_method_is_405() {
         .call("POST", "/v1/object-stores/bindings/cold", "{}")
         .await;
     assert_eq!(wrong.status, 405);
+}
+
+// Catches a handler that takes the peer from the connection alone (or builds a `Caller`
+// of its own) and so never sees the proxy gate's `Trust`: behind a proxy, a write that
+// reaches the loopback port without the proxy's secret, however it dresses itself in
+// `x-kbf-*` identity headers and the right bearer token, must be refused 403 on every
+// route, and a call from another host is refused before any handler. With the secret and
+// the token the same calls pass: the proxy's word is not the token, and the token is
+// still required (401 without it).
+//
+// Mutants seen red: each handler's `Caller` replaced by `Caller::direct(peer.addr)` (the
+// forged-header calls were admitted); `operator_gate`'s `Unverified` refusal skipped.
+#[tokio::test]
+async fn behind_a_proxy_only_a_call_with_its_secret_and_the_token_passes_the_gate() {
+    let bearer = format!("Bearer {TOKEN}");
+    let secret = hex::encode(super::harness::PROXY_SECRET);
+    let json = ("content-type", "application/json");
+    let forged = [("x-kbf-node-id", "node-a"), ("x-kbf-role", "daemon")];
+    for (method, path, body) in routes() {
+        let what = |why: &str| format!("{method} {path} {why}");
+        let farm = Farm::behind_proxy();
+
+        let mut no_secret = vec![json, ("authorization", bearer.as_str())];
+        no_secret.extend(forged);
+        let reply = farm.with(method, path, &no_secret, &body).await;
+        assert_refused(
+            &farm,
+            &reply,
+            403,
+            "forbidden",
+            &what("with forged identity headers and no secret"),
+        );
+
+        let not_the_secret = "00".repeat(32);
+        let mut wrong = no_secret.clone();
+        wrong.push(("x-kbf-proxy-auth", not_the_secret.as_str()));
+        let reply = farm.with(method, path, &wrong, &body).await;
+        assert_refused(
+            &farm,
+            &reply,
+            403,
+            "forbidden",
+            &what("with a wrong secret"),
+        );
+
+        let mut proxied = no_secret.clone();
+        proxied.push(("x-kbf-proxy-auth", &secret));
+        let remote = send(
+            &farm.router,
+            "192.0.2.7:40000".parse().expect("addr"),
+            method,
+            path,
+            &proxied,
+            body.as_bytes(),
+        )
+        .await;
+        assert_eq!(remote.status, 403, "{}", what("from another host"));
+        assert_eq!(farm.generation(), 0, "{}", what("from another host"));
+        assert!(farm.files().is_empty(), "{}", what("from another host"));
+        assert!(
+            farm.probe.calls().is_empty(),
+            "{}",
+            what("from another host")
+        );
+
+        let without_token = [json, ("x-kbf-proxy-auth", secret.as_str())];
+        let reply = farm.with(method, path, &without_token, &body).await;
+        assert_refused(
+            &farm,
+            &reply,
+            401,
+            "unauthorized",
+            &what("with the secret and no token"),
+        );
+
+        let reply = farm.with(method, path, &proxied, &body).await;
+        assert!(
+            reply.status != 401 && reply.status != 403,
+            "{}: {}",
+            what("with the secret and the token"),
+            reply.body
+        );
+    }
 }
