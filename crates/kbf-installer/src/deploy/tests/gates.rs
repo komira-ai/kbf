@@ -106,7 +106,11 @@ fn a_plan_neither_scrapes_nor_writes_a_document() {
     o.result = Some(path.clone());
     let s = run_with(&f, &o, SmokeResult::Pass, None);
     assert_eq!(s.exit, 0, "{}", s.line());
-    assert_eq!(f.requests("GET /metrics"), 0);
+    assert!(
+        f.observed_log.borrow().is_empty(),
+        "a plan reads no gate: {:?}",
+        f.observed_log.borrow()
+    );
     assert!(!path.exists());
 }
 
