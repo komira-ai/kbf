@@ -358,10 +358,10 @@ mod tests {
             &["spoolr-node-01"],
             Some("storage"),
             &[
-                "10.77.0.10",
+                "192.0.2.10",
                 "fd00:0:0:0:0:0:0:1",
-                "10.77.0.1",
-                "10.77.0.10",
+                "192.0.2.1",
+                "192.0.2.10",
             ],
         ))
         .expect("identity");
@@ -371,17 +371,17 @@ mod tests {
             "the identity holds them as the leaf lists them"
         );
         let mut h = HeaderMap::new();
-        h.append(NODE_IPS, HeaderValue::from_static("10.99.9.9"));
+        h.append(NODE_IPS, HeaderValue::from_static("198.51.100.9"));
         forward_headers(&mut h, Some(&id), &secret()).expect("forward");
         assert_eq!(h.get_all(NODE_IPS).iter().count(), 1);
         assert_eq!(
             h.get(NODE_IPS).expect("ips"),
-            "10.77.0.1,10.77.0.10,fd00::1"
+            "192.0.2.1,192.0.2.10,fd00::1"
         );
 
         let none = identity_of(&cert(&["spoolr-node-01"], Some("storage"))).expect("identity");
         let mut h = HeaderMap::new();
-        h.append(NODE_IPS, HeaderValue::from_static("10.99.9.9"));
+        h.append(NODE_IPS, HeaderValue::from_static("198.51.100.9"));
         forward_headers(&mut h, Some(&none), &secret()).expect("forward");
         assert!(
             h.get(NODE_IPS).is_none(),
@@ -389,7 +389,7 @@ mod tests {
         );
         // No certificate: none either.
         let mut h = HeaderMap::new();
-        h.append(NODE_IPS, HeaderValue::from_static("10.99.9.9"));
+        h.append(NODE_IPS, HeaderValue::from_static("198.51.100.9"));
         forward_headers(&mut h, None, &secret()).expect("forward");
         assert!(h.get(NODE_IPS).is_none());
     }
@@ -400,7 +400,7 @@ mod tests {
     /// Kills: truncation at the limit; no limit.
     #[test]
     fn a_leaf_with_too_many_ips_gives_no_identity() {
-        let many = |n: u8| -> Vec<String> { (1..=n).map(|i| format!("10.0.0.{i}")).collect() };
+        let many = |n: u8| -> Vec<String> { (1..=n).map(|i| format!("192.0.2.{i}")).collect() };
         fn refs(v: &[String]) -> Vec<&str> {
             v.iter().map(String::as_str).collect()
         }

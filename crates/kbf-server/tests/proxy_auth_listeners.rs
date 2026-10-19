@@ -701,7 +701,7 @@ async fn beat(
     client.heartbeat(request).await.map(drop)
 }
 
-/// Catches: a storage node that registers by IP address (`10.77.0.N:8983`, as the farm's do)
+/// Catches: a storage node that registers by IP address (`<ip>:8983`, as the farm's do)
 /// refused behind the proxy although its leaf certificate holds that address. The proxy
 /// forwards the leaf's IP names in `x-kbf-node-ips`; Membership covers `instance_id` and
 /// `addr` by the node's DNS name and exactly those addresses, for registration and for every
@@ -715,8 +715,8 @@ async fn beat(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn membership_covers_the_ips_the_proxy_forwarded_from_the_leaf() {
     let mut client = membership(secret()).await;
-    let one = forwarded_with_ips("spoolr-node-01", "10.77.0.1");
-    let member = joined(&mut client, &one, "10.77.0.1:8983", "10.77.0.1:8983")
+    let one = forwarded_with_ips("spoolr-node-01", "192.0.2.1");
+    let member = joined(&mut client, &one, "192.0.2.1:8983", "192.0.2.1:8983")
         .await
         .expect("a node registers by the IP its leaf holds");
     beat(&mut client, &one, &member)
@@ -724,7 +724,7 @@ async fn membership_covers_the_ips_the_proxy_forwarded_from_the_leaf() {
         .expect("and beats for the member it registered");
 
     // The same node by a name or by its IPs: both are its own.
-    let named = forwarded_with_ips("spoolr-node-01", "10.77.0.1,fd00::1");
+    let named = forwarded_with_ips("spoolr-node-01", "192.0.2.1,fd00::1");
     joined(&mut client, &named, "spoolr-node-01", "[fd00::1]:8983")
         .await
         .expect("an IPv6 address among several, and its DNS name");
@@ -739,43 +739,43 @@ async fn membership_covers_the_ips_the_proxy_forwarded_from_the_leaf() {
     };
     refuse(
         "another node's address",
-        joined(&mut client, &one, "10.77.0.2:8983", "10.77.0.2:8983").await,
+        joined(&mut client, &one, "192.0.2.2:8983", "192.0.2.2:8983").await,
     );
     refuse(
         "the instance id covered but not the address",
-        joined(&mut client, &one, "10.77.0.1:8983", "10.77.0.2:8983").await,
+        joined(&mut client, &one, "192.0.2.1:8983", "192.0.2.2:8983").await,
     );
     refuse(
         "the address covered but not the instance id",
-        joined(&mut client, &one, "10.77.0.2:8983", "10.77.0.1:8983").await,
+        joined(&mut client, &one, "192.0.2.2:8983", "192.0.2.1:8983").await,
     );
     refuse(
         "a longer address that begins with the leaf's",
-        joined(&mut client, &one, "10.77.0.10:8983", "10.77.0.10:8983").await,
+        joined(&mut client, &one, "192.0.2.10:8983", "192.0.2.10:8983").await,
     );
-    let ten = forwarded_with_ips("spoolr-node-10", "10.77.0.10");
+    let ten = forwarded_with_ips("spoolr-node-10", "192.0.2.10");
     refuse(
         "a shorter address that the leaf's begins with",
-        joined(&mut client, &ten, "10.77.0.1:8983", "10.77.0.1:8983").await,
+        joined(&mut client, &ten, "192.0.2.1:8983", "192.0.2.1:8983").await,
     );
-    let mapped = forwarded_with_ips("spoolr-node-01", "::ffff:10.77.0.1");
+    let mapped = forwarded_with_ips("spoolr-node-01", "::ffff:192.0.2.1");
     refuse(
         "an IPv4-mapped IPv6 name is not the IPv4 address",
-        joined(&mut client, &mapped, "10.77.0.1:8983", "10.77.0.1:8983").await,
+        joined(&mut client, &mapped, "192.0.2.1:8983", "192.0.2.1:8983").await,
     );
     refuse(
         "no header, no address",
         joined(
             &mut client,
             &forwarded("spoolr-node-01", "storage"),
-            "10.77.0.1:8983",
-            "10.77.0.1:8983",
+            "192.0.2.1:8983",
+            "192.0.2.1:8983",
         )
         .await,
     );
 
     // Another node's leaf does not hold this member: its beat is refused.
-    let two = forwarded_with_ips("spoolr-node-02", "10.77.0.2");
+    let two = forwarded_with_ips("spoolr-node-02", "192.0.2.2");
     let status = beat(&mut client, &two, &member)
         .await
         .expect_err("a beat from a leaf that does not hold the member");
@@ -799,34 +799,34 @@ async fn membership_covers_the_ips_the_proxy_forwarded_from_the_leaf() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_forged_or_malformed_ips_header_registers_nothing() {
     let mut client = membership(secret()).await;
-    let mut bare = forwarded_with_ips("spoolr-node-01", "10.77.0.1");
+    let mut bare = forwarded_with_ips("spoolr-node-01", "192.0.2.1");
     bare.remove(0);
-    let status = joined(&mut client, &bare, "10.77.0.1:8983", "10.77.0.1:8983")
+    let status = joined(&mut client, &bare, "192.0.2.1:8983", "192.0.2.1:8983")
         .await
         .expect_err("no secret");
     assert_eq!(status.code(), Code::Unauthenticated, "{status}");
 
     for value in [
-        "10.77.0.1,junk",
-        "junk,10.77.0.1",
-        "10.77.0.1,",
+        "192.0.2.1,junk",
+        "junk,192.0.2.1",
+        "192.0.2.1,",
         "",
-        " 10.77.0.1",
+        " 192.0.2.1",
     ] {
         let status = joined(
             &mut client,
             &forwarded_with_ips("spoolr-node-01", value),
-            "10.77.0.1:8983",
-            "10.77.0.1:8983",
+            "192.0.2.1:8983",
+            "192.0.2.1:8983",
         )
         .await
         .expect_err(value);
         assert_eq!(status.code(), Code::PermissionDenied, "{value:?}: {status}");
         assert!(status.message().contains(NODE_IPS), "{value:?}: {status}");
     }
-    let mut twice = forwarded_with_ips("spoolr-node-01", "10.77.0.1");
-    twice.push((NODE_IPS.to_owned(), "10.77.0.2".to_owned()));
-    let status = joined(&mut client, &twice, "10.77.0.1:8983", "10.77.0.1:8983")
+    let mut twice = forwarded_with_ips("spoolr-node-01", "192.0.2.1");
+    twice.push((NODE_IPS.to_owned(), "192.0.2.2".to_owned()));
+    let status = joined(&mut client, &twice, "192.0.2.1:8983", "192.0.2.1:8983")
         .await
         .expect_err("a repeated header");
     assert_eq!(status.code(), Code::PermissionDenied, "{status}");

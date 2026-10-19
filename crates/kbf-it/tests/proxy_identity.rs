@@ -352,7 +352,7 @@ async fn child_accepts_proxy_headers() {
         ("x-kbf-role", "storage"),
         ("x-kbf-proxy-auth", "guess"),
         ("x-kbf-extra", "1"),
-        ("x-kbf-node-ips", "10.99.9.9"),
+        ("x-kbf-node-ips", "198.51.100.9"),
     ];
     let answer = call(tls(proxy, &pki, &daemon).await, &forged).await;
     assert_eq!(
@@ -412,29 +412,30 @@ async fn the_proxy_forwards_the_leafs_ips_and_no_others() {
             .add_service(Seen)
             .serve_with_incoming(incoming),
     );
-    let forged = [("x-kbf-node-ips", "10.99.9.9")];
+    let forged = [("x-kbf-node-ips", "198.51.100.9")];
 
     let storage = pki.leaf_with_ips(
         "spoolr-node-01",
         "storage",
-        &["10.77.0.10", "fd00:0:0:0:0:0:0:1", "10.77.0.1", "10.77.0.1"],
+        &["192.0.2.10", "fd00:0:0:0:0:0:0:1", "192.0.2.1", "192.0.2.1"],
     );
     let answer = call(tls(proxy, &pki, &storage).await, &forged).await;
     assert_eq!(
         header(&answer, "x-trust"),
-        r#"Proxied(Identity { node_id: Some("spoolr-node-01"), role: Some(Storage), ips: [10.77.0.1, 10.77.0.10, fd00::1] })"#
+        r#"Proxied(Identity { node_id: Some("spoolr-node-01"), role: Some(Storage), ips: [192.0.2.1, 192.0.2.10, fd00::1] })"#
     );
     assert_eq!(header(&answer, "x-left"), "0");
 
-    let via = pki.leaf_via_intermediate("spoolr-node-02", "storage", &["10.77.0.2"], "10.99.0.9");
+    let via =
+        pki.leaf_via_intermediate("spoolr-node-02", "storage", &["192.0.2.2"], "198.51.100.7");
     let answer = call(tls(proxy, &pki, &via).await, &[]).await;
     assert_eq!(
         header(&answer, "x-trust"),
-        r#"Proxied(Identity { node_id: Some("spoolr-node-02"), role: Some(Storage), ips: [10.77.0.2] })"#,
+        r#"Proxied(Identity { node_id: Some("spoolr-node-02"), role: Some(Storage), ips: [192.0.2.2] })"#,
         "the intermediate's own address is not the caller's"
     );
 
-    let none = pki.leaf_via_intermediate("spoolr-node-03", "storage", &[], "10.99.0.9");
+    let none = pki.leaf_via_intermediate("spoolr-node-03", "storage", &[], "198.51.100.7");
     let answer = call(tls(proxy, &pki, &none).await, &[]).await;
     assert_eq!(
         header(&answer, "x-trust"),
@@ -445,7 +446,7 @@ async fn the_proxy_forwards_the_leafs_ips_and_no_others() {
 }
 
 /// The farm's own case, end to end: a storage node whose certificate names its DNS name and
-/// the IP it advertises registers as `10.77.0.N:8983` through the real proxy and the real
+/// the IP it advertises registers as `<ip>:8983` through the real proxy and the real
 /// Membership service, and heartbeats; the node next door, whose certificate names another
 /// address, can neither register as the first node's address nor beat for its member.
 ///
@@ -477,8 +478,8 @@ async fn a_storage_node_registers_by_its_ip_through_the_proxy() {
             .serve_with_incoming(incoming),
     );
 
-    let one = pki.leaf_with_ips("spoolr-node-01", "storage", &["10.77.0.1"]);
-    let two = pki.leaf_with_ips("spoolr-node-02", "storage", &["10.77.0.2"]);
+    let one = pki.leaf_with_ips("spoolr-node-01", "storage", &["192.0.2.1"]);
+    let two = pki.leaf_with_ips("spoolr-node-02", "storage", &["192.0.2.2"]);
     let mut first = MembershipClient::new(channel(proxy, &pki, &one).await);
     let mut second = MembershipClient::new(channel(proxy, &pki, &two).await);
     let by_ip = |at: &str| pb::RegisterRequest {
@@ -491,7 +492,7 @@ async fn a_storage_node_registers_by_its_ip_through_the_proxy() {
         catching_up: false,
     };
     let member = first
-        .register(by_ip("10.77.0.1:8983"))
+        .register(by_ip("192.0.2.1:8983"))
         .await
         .expect("the node registers by the IP its certificate names")
         .into_inner();
@@ -506,7 +507,7 @@ async fn a_storage_node_registers_by_its_ip_through_the_proxy() {
         .expect("and beats for its member");
 
     let taken = second
-        .register(by_ip("10.77.0.1:8983"))
+        .register(by_ip("192.0.2.1:8983"))
         .await
         .expect_err("another node's address");
     assert_eq!(taken.code(), tonic::Code::PermissionDenied, "{taken}");
@@ -516,7 +517,7 @@ async fn a_storage_node_registers_by_its_ip_through_the_proxy() {
         .expect_err("another node's member");
     assert_eq!(stolen.code(), tonic::Code::PermissionDenied, "{stolen}");
     second
-        .register(by_ip("10.77.0.2:8983"))
+        .register(by_ip("192.0.2.2:8983"))
         .await
         .expect("each registers its own");
     handle.shutdown();

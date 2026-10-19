@@ -310,13 +310,13 @@ fn the_leafs_ips_are_a_list_of_canonical_addresses_or_the_call_is_refused() {
                 .collect(),
         }))
     };
-    assert_eq!(with("10.77.0.1"), ips(&["10.77.0.1"]));
+    assert_eq!(with("192.0.2.1"), ips(&["192.0.2.1"]));
     assert_eq!(
-        with("10.77.0.1,10.77.0.10,fd00::1"),
-        ips(&["10.77.0.1", "10.77.0.10", "fd00::1"])
+        with("192.0.2.1,192.0.2.10,fd00::1"),
+        ips(&["192.0.2.1", "192.0.2.10", "fd00::1"])
     );
-    assert_eq!(with("::ffff:10.77.0.1"), ips(&["::ffff:10.77.0.1"]));
-    let sixteen: Vec<String> = (1..=16).map(|n| format!("10.0.0.{n}")).collect();
+    assert_eq!(with("::ffff:192.0.2.1"), ips(&["::ffff:192.0.2.1"]));
+    let sixteen: Vec<String> = (1..=16).map(|n| format!("192.0.2.{n}")).collect();
     assert_eq!(
         with(&sixteen.join(",")),
         ips(&sixteen.iter().map(String::as_str).collect::<Vec<_>>())
@@ -327,28 +327,28 @@ fn the_leafs_ips_are_a_list_of_canonical_addresses_or_the_call_is_refused() {
         "no header, no addresses"
     );
 
-    let seventeen: Vec<String> = (1..=17).map(|n| format!("10.0.0.{n}")).collect();
+    let seventeen: Vec<String> = (1..=17).map(|n| format!("192.0.2.{n}")).collect();
     let too_many = seventeen.join(",");
     for bad in [
         "",
         ",",
         "junk",
-        "10.77.0.1,junk",
-        "junk,10.77.0.1",
-        "10.77.0.1,",
-        ",10.77.0.1",
-        "10.77.0.1,,10.77.0.2",
-        " 10.77.0.1",
-        "10.77.0.1 ",
-        "10.77.0.1, 10.77.0.2",
-        "10.77.0.1;10.77.0.2",
-        "10.77.0.1:8983",
+        "192.0.2.1,junk",
+        "junk,192.0.2.1",
+        "192.0.2.1,",
+        ",192.0.2.1",
+        "192.0.2.1,,192.0.2.2",
+        " 192.0.2.1",
+        "192.0.2.1 ",
+        "192.0.2.1, 192.0.2.2",
+        "192.0.2.1;192.0.2.2",
+        "192.0.2.1:8983",
         "[fd00::1]",
         "fe80::1%eth0",
-        "10.77.0.1,10.77.0.1",
-        "010.077.0.001",
-        "10.77.0",
-        "10.77.0.256",
+        "192.0.2.1,192.0.2.1",
+        "192.0.2.001",
+        "192.0.2",
+        "192.0.2.256",
         "fd00:0:0:0:0:0:0:1",
         "FD00::1",
         "fd00::0:1",
@@ -357,8 +357,8 @@ fn the_leafs_ips_are_a_list_of_canonical_addresses_or_the_call_is_refused() {
     ] {
         assert_eq!(with(bad), Err(Refusal::Malformed(NODE_IPS)), "{bad:?}");
     }
-    let mut twice = headers(&[(PROXY_AUTH, &presented_secret()), (NODE_IPS, "10.77.0.1")]);
-    twice.append(NODE_IPS, HeaderValue::from_static("10.77.0.2"));
+    let mut twice = headers(&[(PROXY_AUTH, &presented_secret()), (NODE_IPS, "192.0.2.1")]);
+    twice.append(NODE_IPS, HeaderValue::from_static("192.0.2.2"));
     assert_eq!(
         run(&twice),
         Err(Refusal::Malformed(NODE_IPS)),
@@ -367,7 +367,7 @@ fn the_leafs_ips_are_a_list_of_canonical_addresses_or_the_call_is_refused() {
     let mut raw = headers(&[(PROXY_AUTH, &presented_secret())]);
     raw.insert(
         NODE_IPS,
-        HeaderValue::from_bytes(b"10.77.0.\xff").expect("a value"),
+        HeaderValue::from_bytes(b"192.0.2.\xff").expect("a value"),
     );
     assert_eq!(run(&raw), Err(Refusal::Malformed(NODE_IPS)), "not ASCII");
 }
@@ -383,7 +383,7 @@ fn the_leafs_ips_are_a_list_of_canonical_addresses_or_the_call_is_refused() {
 fn the_leafs_ips_are_believed_only_from_loopback_with_the_secret() {
     let secret = secret();
     let wrong = hex::encode([0x5b; 32]);
-    for value in ["10.77.0.1", "junk,,", ""] {
+    for value in ["192.0.2.1", "junk,,", ""] {
         let claims = [(NODE_ID, "node-a"), (NODE_IPS, value)];
         for pairs in [
             claims.to_vec(),

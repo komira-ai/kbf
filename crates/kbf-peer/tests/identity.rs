@@ -228,14 +228,14 @@ fn a_proxied_identity_is_one_node_and_no_serial_or_key() {
 /// IPv6 form equated with IPv4.
 #[test]
 fn a_proxied_identity_covers_exactly_its_ips() {
-    let ips: Vec<IpAddr> = ["10.77.0.1", "fd00::1"]
+    let ips: Vec<IpAddr> = ["192.0.2.1", "fd00::1"]
         .iter()
         .map(|t| t.parse().expect("an address"))
         .collect();
     let identity = kbf_peer::PeerIdentity::proxied("node-a", &ips);
     assert_eq!(identity.names().ips(), ips);
     for covered in [
-        "10.77.0.1",
+        "192.0.2.1",
         "fd00::1",
         "FD00:0:0:0:0:0:0:1",
         "node-a",
@@ -244,25 +244,25 @@ fn a_proxied_identity_covers_exactly_its_ips() {
         assert!(identity.names().covers(covered), "{covered}");
     }
     for refused in [
-        "10.77.0.10",
-        "10.77.0.",
-        "10.77.0",
-        "10.77.0.2",
-        "110.77.0.1",
-        "::ffff:10.77.0.1",
+        "192.0.2.10",
+        "192.0.2.",
+        "192.0.2",
+        "192.0.2.2",
+        "192.0.21",
+        "::ffff:192.0.2.1",
         "fd00::",
         "fd00::10",
-        "10.77.0.1x",
+        "192.0.2.1x",
         "node-b",
         "",
     ] {
         assert!(!identity.names().covers(refused), "{refused:?}");
     }
-    let wider: Vec<IpAddr> = vec!["10.77.0.10".parse().expect("an address")];
+    let wider: Vec<IpAddr> = vec!["192.0.2.10".parse().expect("an address")];
     assert!(
         !kbf_peer::PeerIdentity::proxied("node-a", &wider)
             .names()
-            .covers("10.77.0.1")
+            .covers("192.0.2.1")
     );
 }
 
@@ -275,18 +275,18 @@ fn the_ips_header_round_trips_and_refuses_what_the_writer_never_writes() {
     assert_eq!(node_ips_value(&[]), Ok(None));
     let value = node_ips_value(&[
         parse("fd00:0:0:0:0:0:0:1"),
-        parse("10.77.0.1"),
-        parse("10.77.0.1"),
+        parse("192.0.2.1"),
+        parse("192.0.2.1"),
     ])
     .expect("ok")
     .expect("some");
-    assert_eq!(value, "10.77.0.1,fd00::1");
+    assert_eq!(value, "192.0.2.1,fd00::1");
     assert_eq!(
         parse_node_ips(&value),
-        Ok(vec![parse("10.77.0.1"), parse("fd00::1")])
+        Ok(vec![parse("192.0.2.1"), parse("fd00::1")])
     );
     let many: Vec<IpAddr> = (1..=NODE_IPS_MAX + 1)
-        .map(|i| parse(&format!("10.0.0.{i}")))
+        .map(|i| parse(&format!("192.0.2.{i}")))
         .collect();
     assert_eq!(
         node_ips_value(&many),
@@ -295,10 +295,10 @@ fn the_ips_header_round_trips_and_refuses_what_the_writer_never_writes() {
     for bad in [
         "",
         "a",
-        "10.77.0.1,",
-        "10.77.0.1,10.77.0.1",
+        "192.0.2.1,",
+        "192.0.2.1,192.0.2.1",
         "FD00::1",
-        " 10.77.0.1",
+        " 192.0.2.1",
     ] {
         assert_eq!(parse_node_ips(bad), Err(IpsError::Malformed), "{bad:?}");
     }
