@@ -611,7 +611,7 @@ fn a_missing_service_user_is_refused_before_any_write() {
 #[test]
 fn each_mode_enables_its_own_units() {
     let want: [(Mode, &[&str]); 5] = [
-        (Mode::Frontend, &["kbf-frontend@a.service"]),
+        (Mode::Frontend, &["kbf-frontend.service"]),
         (Mode::Storage, &["kbf-storage.service"]),
         (Mode::Daemon, &["kbf-daemon.service"]),
         (Mode::StorageAndDaemon, &["kbf-storage-and-daemon.service"]),

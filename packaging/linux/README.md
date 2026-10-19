@@ -39,7 +39,7 @@ A frontend host enables exactly one of two units; they bind the same ports.
   `releases/<commit>/kbf`): a host **with** the proxy does not enable a frontend unit.
 - `kbf-frontend@.service`: the handover model (instances `a` and `b`, a control socket, a
   slot per instance). It is kept until the proxy work removes it (frontend-proxy units U7c);
-  use it only where `kbf-installer setup` enables `kbf-frontend@a` today.
+  `kbf-installer setup` enables `kbf-frontend.service`, never the template.
 
 It refuses anything else (a unit named neither `kbf-*.service` nor `kbf.slice`, a fourth trust file, no unit).
 
