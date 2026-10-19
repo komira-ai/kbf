@@ -48,7 +48,7 @@ use tonic::{Request, Response, Status};
 
 use crate::identity::{DenyList, PeerCert, Presented, presented};
 use crate::members::{Members, MembershipError, Progress, Registrant};
-use crate::storage_health::Debts;
+use crate::storage_health::{Debts, Reported, Writes};
 use crate::store_config::StoreConfigSource;
 use crate::store_config::acks::Acks;
 
@@ -204,6 +204,7 @@ fn status(e: MembershipError) -> Status {
         MembershipError::Contended => Status::aborted(message),
         MembershipError::Store(_) => Status::unavailable(message),
         MembershipError::NotSettable(_)
+        | MembershipError::NotActive { .. }
         | MembershipError::NoMap
         | MembershipError::Corrupt(_)
         | MembershipError::Map(_) => Status::internal(message),
@@ -299,7 +300,11 @@ impl Membership for MembershipService {
         let id = kbf_map::MemberId(req.member_id);
         let have = req.have_generation;
         let progress = Progress::from_wire(req.catching_up);
-        let debts = Debts::from_wire(req.debts_known, req.repair_debts);
+        let said = Reported {
+            debts: Debts::from_wire(req.debts_known, req.repair_debts),
+            writes: Writes::from_wire(req.writes_known, req.open_writes),
+            generation: have,
+        };
         let source = self
             .store_config
             .as_ref()
@@ -316,7 +321,7 @@ impl Membership for MembershipService {
                 peer.as_ref()
                     .is_none_or(|peer| peer.identity().names().covers(host_of(addr)))
             };
-            let generation = members.heartbeat(id, req.boot, progress, debts, Some(&holds))?;
+            let generation = members.heartbeat(id, req.boot, progress, said, Some(&holds))?;
             // Read only for a node that is behind: most beats carry no map.
             let newer = if generation > have {
                 members.current_map()?.filter(|map| map.generation() > have)
