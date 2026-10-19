@@ -14,7 +14,7 @@
 //! | `resume` | `POST /v1/admin/resume` | admin | [`Deadlines::call`] |
 //! | `ready` | `GET /readyz` | operator | [`Deadlines::call`] |
 //! | `open_counts` | `GET /v1/frontend/drain` | operator | [`Deadlines::call`] |
-//! | `post_desired` | `POST /v1/update/desired {"commit": ...}` | operator | [`Deadlines::call`] |
+//! | `post_desired` | `POST /v1/update/desired {"commit": ...}` | operator | [`Deadlines::call`], all tries together |
 //!
 //! Each method is in the trait and, with a typed error, as `try_<name>`; the trait flattens
 //! [`AdminError`] to the text of a [`PortError`], which is all the swap keeps.
@@ -83,9 +83,17 @@
 //! other than the child's own build, which needs a rollback flag this body does not
 //! carry), and [`AdminError::Conflict`] otherwise. The child's answer today has no `code`,
 //! only an `error` text, so today every `409` is a [`AdminError::Conflict`]; the code is
-//! what a distinct answer is keyed on, not the text. A `503` ("other writers kept racing")
-//! is [`AdminError::Status`]: nothing here retries, since the client returns no response
-//! headers and with them no `Retry-After`.
+//! what a distinct answer is keyed on, not the text.
+//!
+//! A `503` is sent again, at most three times in all, one second apart (`OFFER_TRIES`,
+//! `OFFER_PAUSE`) and only while the pause fits in [`Deadlines::call`]; the last `503` is
+//! then [`AdminError::Status`]. The child answers `503` "the update rows are busy: send it
+//! again" (with `Retry-After: 1`) when other writers kept racing for the write, and nothing
+//! was written, so sending the same commit again is the same offer. The client returns no
+//! response headers, so the pause is that `Retry-After` as a constant. The same status also
+//! answers a child started without a state store or a release store, which no retry
+//! helps: the cost is the pauses, and the swap only notes a failed offer. Only a `503` is
+//! sent again: a timeout may have landed and the budget is spent.
 //!
 //! # Credentials
 //!
@@ -99,6 +107,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -121,6 +130,12 @@ const NOT_OWN: &str = "not_own";
 
 /// The most characters kept of a child's `error` text.
 const MAX_REASON: usize = 200;
+
+/// The most times one `post_desired` is sent: the first, and two more after a `503`.
+const OFFER_TRIES: u32 = 3;
+
+/// The wait before an offer is sent again: the child's own `Retry-After` on that `503`.
+pub(super) const OFFER_PAUSE: Duration = Duration::from_secs(1);
 
 /// How long the calls may take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -400,14 +415,7 @@ impl Admin {
     pub fn try_post_desired(&self, slot: Slot, commit: &CommitId) -> Result<(), AdminError> {
         let headers = self.write_headers()?;
         let body = format!("{{\"commit\":\"{}\"}}", commit.as_str());
-        let answer = post(
-            "post_desired",
-            (self.operator)(slot),
-            self.deadlines.call,
-            "/v1/update/desired",
-            &headers,
-            body.as_bytes(),
-        )?;
+        let answer = self.send_offer((self.operator)(slot), &headers, body.as_bytes())?;
         match answer.status {
             409 if reason(&answer.body).code.as_deref() == Some(NOT_OWN) => {
                 Err(AdminError::NotOwn {
@@ -415,6 +423,37 @@ impl Admin {
                 })
             }
             _ => judge("post_desired", answer).map(drop),
+        }
+    }
+
+    /// The answer to the offer. A `503` is sent again after a pause, up to `OFFER_TRIES` times
+    /// in all, while the pause still fits in the call's deadline. Every try gets what is left
+    /// of the deadline, so the tries together take no longer than [`Deadlines::call`].
+    fn send_offer(
+        &self,
+        addr: SocketAddr,
+        headers: &Headers,
+        body: &[u8],
+    ) -> Result<Response, AdminError> {
+        let began = Instant::now();
+        let mut tries = 1;
+        loop {
+            let left = self.deadlines.call.saturating_sub(began.elapsed());
+            let answer = post(
+                "post_desired",
+                addr,
+                left,
+                "/v1/update/desired",
+                headers,
+                body,
+            )?;
+            let busy = answer.status == 503;
+            if !busy || tries == OFFER_TRIES || began.elapsed() + OFFER_PAUSE >= self.deadlines.call
+            {
+                return Ok(answer);
+            }
+            tries += 1;
+            thread::sleep(OFFER_PAUSE);
         }
     }
 

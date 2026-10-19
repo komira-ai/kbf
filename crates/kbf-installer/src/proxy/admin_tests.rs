@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use crate::CommitId;
 use crate::testkit::{A as COMMIT_A, B as COMMIT_B, c};
 
-use super::admin::{Admin, AdminError, Deadlines};
+use super::admin::{Admin, AdminError, Deadlines, OFFER_PAUSE};
 use super::child_http::{Headers, HttpError};
 use super::model::{OpenCounts, RoleInfo, RoleState, Slot};
 use super::ports::ChildAdmin;
@@ -214,6 +214,9 @@ struct Operator {
     /// Whether a refusal of a commit that is not the child's own names `"code": "not_own"`.
     coded: bool,
     token: String,
+    /// How many offers that pass the gates are still answered `503` ("the update rows are
+    /// busy: send it again") before the child takes one.
+    busy: u32,
 }
 
 fn view(world: &World, store: &Store) -> Value {
@@ -295,7 +298,7 @@ fn takeover(world: &mut World, store: &Store, body: &[u8]) -> Reply {
 
 /// The operator routes: `/readyz` and the drain read are open; the desired offer passes the
 /// gates of a write (the proxy's secret, no `Origin`, the bearer token, JSON).
-fn operator_route(operator: &Operator, request: &Seen) -> Reply {
+fn operator_route(operator: &mut Operator, request: &Seen) -> Reply {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/readyz") if operator.ready => Reply::json(200, json!({"ready": true})),
         ("GET", "/readyz") => Reply::json(503, json!({"ready": false, "failing": []})),
@@ -312,7 +315,7 @@ fn operator_route(operator: &Operator, request: &Seen) -> Reply {
     }
 }
 
-fn offer(operator: &Operator, request: &Seen) -> Reply {
+fn offer(operator: &mut Operator, request: &Seen) -> Reply {
     let error = |status, why: &str| Reply::json(status, json!({"error": why}));
     if request.header("x-kbf-proxy-auth") != Some(SECRET) || request.header("origin").is_some() {
         return error(
@@ -325,6 +328,10 @@ fn offer(operator: &Operator, request: &Seen) -> Reply {
     }
     if request.header("content-type") != Some("application/json") {
         return error(415, "the body must be JSON");
+    }
+    if operator.busy > 0 {
+        operator.busy -= 1;
+        return error(503, "the update rows are busy: send it again");
     }
     let commit = serde_json::from_slice::<BTreeMap<String, String>>(&request.body)
         .ok()
@@ -377,6 +384,7 @@ impl Child {
             own: COMMIT_B.to_owned(),
             coded: true,
             token: TOKEN.to_owned(),
+            busy: 0,
         }));
         let forced = Arc::new(Mutex::new(BTreeMap::new()));
         let slowed = Arc::new(Mutex::new(BTreeMap::new()));
@@ -389,7 +397,7 @@ impl Child {
         let operator_port = {
             let operator = Arc::clone(&operator);
             Server::start(hooked(&forced, &slowed, move |request| {
-                operator_route(&lock(&operator), request)
+                operator_route(&mut lock(&operator), request)
             }))
         };
         Child {
@@ -620,8 +628,10 @@ fn a_port_nobody_listens_on_is_a_transport_error_and_not_a_timeout() {
 #[test]
 fn holder_follows_the_store_and_not_the_role() {
     // Catches: `holder` read from the role word; `superseded` ignored; the store's
-    // generation not compared with the one the child took; a child that cannot read the
-    // store taken for a holder (or for a non-holder: the swap would roll back on it).
+    // generation not compared with the one the child took, or compared as "at least" (a
+    // store restored to an older generation would leave the child a holder); a child that
+    // cannot read the store taken for a holder (or for a non-holder: the swap would roll
+    // back on it).
     // (role, held, store, superseded) -> (state, holder), or None for "cannot say".
     type Row = (
         &'static str,
@@ -630,7 +640,7 @@ fn holder_follows_the_store_and_not_the_role() {
         bool,
         Option<(RoleState, bool)>,
     );
-    let rows: [Row; 9] = [
+    let rows: [Row; 10] = [
         (
             "candidate",
             None,
@@ -663,6 +673,14 @@ fn holder_follows_the_store_and_not_the_role() {
             "active",
             Some(7),
             Some(8),
+            false,
+            Some((RoleState::Active, false)),
+        ),
+        // A store restored to an older generation is not the one the child took.
+        (
+            "active",
+            Some(9),
+            Some(7),
             false,
             Some((RoleState::Active, false)),
         ),
@@ -1051,6 +1069,43 @@ fn a_child_that_does_not_answer_is_a_timeout() {
     assert!(took < Duration::from_millis(1500), "{took:?}");
 }
 
+#[test]
+fn every_call_that_does_not_wait_for_work_gives_up_at_the_per_call_deadline() {
+    // Catches: a call whose deadline is not `Deadlines::call` (a constant, the quiesce
+    // budget, or none): the swap would wait on a hung child as long as that child likes.
+    // The quiesce budget is 5 s here, so a call that took it for its own would answer
+    // after the 2 s the child holds it back, and not time out.
+    type Call = fn(&Admin) -> Result<(), AdminError>;
+    let calls: [(&str, &str, Call); 5] = [
+        ("stand_down", "/v1/admin/stand-down", |admin| {
+            admin.try_stand_down(Slot::A)
+        }),
+        ("resume", "/v1/admin/resume", |admin| {
+            admin.try_resume(Slot::A)
+        }),
+        ("ready", "/readyz", |admin| {
+            admin.try_ready(Slot::A).map(drop)
+        }),
+        ("open_counts", "/v1/frontend/drain", |admin| {
+            admin.try_open_counts(Slot::A).map(drop)
+        }),
+        ("post_desired", "/v1/update/desired", |admin| {
+            admin.try_post_desired(Slot::A, &offered())
+        }),
+    ];
+    // Every call is tried, so a defect in several names all of them.
+    let mut late = Vec::new();
+    for (call, path, run) in calls {
+        let rig = Rig::with(short(200, 5000));
+        rig.a.slow(path, Duration::from_secs(2));
+        let (done, took) = took(|| run(&rig.admin));
+        if done != Err(AdminError::Timeout { call }) || took >= Duration::from_millis(1500) {
+            late.push(format!("{call}: {done:?} after {took:?}"));
+        }
+    }
+    assert!(late.is_empty(), "{late:#?}");
+}
+
 // ----- ready and open_counts -----
 
 #[test]
@@ -1277,18 +1332,114 @@ fn post_desired_refusals_keep_their_status() {
         no_token.try_post_desired(Slot::B, &offered()),
         Err(AdminError::Status { code: 401, .. })
     ));
+    // A status that is not one of the gates' and not a busy child is not sent again.
     rig.b.force(
         "/v1/update/desired",
-        Reply::json(503, json!({"error": "other writers kept racing"})),
+        Reply::json(502, json!({"error": "a proxy in the way"})),
     );
     assert_eq!(
         rig.admin.try_post_desired(Slot::B, &offered()),
         Err(AdminError::Status {
             call: "post_desired",
-            code: 503,
-            error: "other writers kept racing".into()
+            code: 502,
+            error: "a proxy in the way".into()
         })
     );
+    assert_eq!(
+        rig.b.operator_port.seen().len(),
+        3,
+        "403, 401 and 502: one try each"
+    );
+}
+
+#[test]
+fn a_busy_child_is_asked_again_after_a_pause() {
+    // Catches: a `503` ("the update rows are busy: send it again") taken for the end of
+    // the offer, which leaves a node update silently skipped by one lost race; a retry with
+    // no pause (the child asked for one second); a retry sent to the other slot's child.
+    let rig = Rig::new();
+    lock(&rig.b.operator).busy = 2;
+    let (done, took) = took(|| rig.admin.try_post_desired(Slot::B, &offered()));
+    assert_eq!(done, Ok(()));
+    assert!(took >= 2 * OFFER_PAUSE, "{took:?}");
+    assert_eq!(
+        rig.b.operator_port.paths(),
+        ["POST /v1/update/desired"; 3],
+        "two busy answers and the one the child took"
+    );
+    assert!(rig.a.untouched());
+    let seen = rig.b.operator_port.seen();
+    assert!(
+        seen.iter().all(|s| s.body == seen[0].body),
+        "the same offer each time"
+    );
+}
+
+#[test]
+fn a_child_that_stays_busy_is_asked_three_times_and_no_more() {
+    // Catches: a retry without a bound (a child without a state store answers 503 for ever);
+    // the bound off by one either way; the last answer lost for a made-up one.
+    let rig = Rig::new();
+    rig.b.force(
+        "/v1/update/desired",
+        Reply::json(
+            503,
+            json!({"error": "the update rows are busy: send it again"}),
+        ),
+    );
+    let done = rig.admin.try_post_desired(Slot::B, &offered());
+    assert_eq!(
+        done,
+        Err(AdminError::Status {
+            call: "post_desired",
+            code: 503,
+            error: "the update rows are busy: send it again".into()
+        })
+    );
+    assert_eq!(rig.b.operator_port.seen().len(), 3);
+}
+
+#[test]
+fn a_busy_child_is_not_asked_again_when_the_pause_does_not_fit_in_the_deadline() {
+    // Catches: a retry that ignores the call's deadline: with 1.8 s, the first pause fits
+    // (the second try is at 1 s) and the second does not (a third try would start at 2 s),
+    // so the offer ends with the second answer, and not with a third try or a timeout.
+    let rig = Rig::with(short(1800, 1800));
+    rig.b.force(
+        "/v1/update/desired",
+        Reply::json(
+            503,
+            json!({"error": "the update rows are busy: send it again"}),
+        ),
+    );
+    let (done, took) = took(|| rig.admin.try_post_desired(Slot::B, &offered()));
+    assert!(
+        matches!(done, Err(AdminError::Status { code: 503, .. })),
+        "{done:?}"
+    );
+    assert_eq!(rig.b.operator_port.seen().len(), 2);
+    assert!(took < Duration::from_millis(1800), "{took:?}");
+}
+
+#[test]
+fn a_busy_child_is_not_asked_again_when_the_first_pause_does_not_fit() {
+    // Catches: a pause taken when the deadline is shorter than it: the offer would end in
+    // a timeout, which says "may have landed", for an answer that said it did not.
+    let rig = Rig::with(short(500, 500));
+    rig.b.force(
+        "/v1/update/desired",
+        Reply::json(
+            503,
+            json!({"error": "the update rows are busy: send it again"}),
+        ),
+    );
+    let (done, took) = took(|| rig.admin.try_post_desired(Slot::B, &offered()));
+    assert!(
+        matches!(done, Err(AdminError::Status { code: 503, .. })),
+        "{done:?}"
+    );
+    assert_eq!(rig.b.operator_port.seen().len(), 1);
+    assert!(took < OFFER_PAUSE, "{took:?}");
 }
 
 #[test]
