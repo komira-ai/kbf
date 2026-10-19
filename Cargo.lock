@@ -1787,6 +1787,7 @@ dependencies = [
  "kbf-host",
  "kbf-installer",
  "kbf-proxy",
+ "kbf-testkit",
  "kbf-update",
  "libc",
  "rustix",

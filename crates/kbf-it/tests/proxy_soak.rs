@@ -57,6 +57,7 @@ use kbf_proxy::Proxy;
 use kbf_proxy::config::ProxyConfig;
 use kbf_proxy::control::NoUpdates;
 use kbf_proxy::slot::{Retire, Slot};
+use kbf_testkit::reaped::{self, Reaped};
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 
@@ -81,9 +82,10 @@ const _: () = {
     static KBF_HOOK: extern "C" fn() = kbf_hook;
 };
 
-/// A `kbf` child that has printed its start line; stopped when dropped.
+/// A `kbf` child that has printed its start line; stopped and reaped when dropped (SIGTERM,
+/// then SIGKILL after 3 s), and holding only descriptors 0 to 2.
 struct Child {
-    process: std::process::Child,
+    process: Reaped,
     line: String,
     // Held open: a child that wrote to a closed pipe would die.
     _stdout: BufReader<ChildStdout>,
@@ -92,12 +94,9 @@ struct Child {
 impl Child {
     fn start(dir: &Path, name: &str, args: &[String]) -> Self {
         let log = std::fs::File::create(dir.join(format!("{name}.log"))).expect("log file");
-        let mut process = Command::new(dir.join("bin/kbf"))
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(log)
-            .spawn()
-            .expect("spawn kbf");
+        let mut command = Command::new(dir.join("bin/kbf"));
+        command.args(args).stdout(Stdio::piped()).stderr(log);
+        let mut process = reaped::spawn(&mut command, 3).expect("spawn kbf");
         let mut stdout = BufReader::new(process.stdout.take().expect("stdout"));
         let mut line = String::new();
         stdout.read_line(&mut line).expect("a start line");
@@ -128,13 +127,6 @@ impl Child {
             std::thread::sleep(Duration::from_millis(50));
         }
         None
-    }
-}
-
-impl Drop for Child {
-    fn drop(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
     }
 }
 

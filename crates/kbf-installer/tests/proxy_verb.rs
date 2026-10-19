@@ -7,11 +7,13 @@
 
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+use kbf_testkit::reaped::{self, Reaped};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-installer");
 
@@ -55,6 +57,13 @@ fn check_is_exit_0_for_a_valid_table_and_2_for_every_refusal() {
 
     for (name, text, want) in [
         ("check-none", "min_generation = 1\n", "no [proxy] table"),
+        // A valid `[proxy]` next to a bad key of the rest of the file: `--check` is the
+        // whole file's check, as the verb's own load is, not the proxy table's alone.
+        (
+            "check-other-key",
+            &format!("min_generation = \"x\"\n{TABLE}"),
+            "min_generation",
+        ),
         (
             "check-typo",
             &format!("{TABLE}surprise = 1\n"),
@@ -99,8 +108,14 @@ fn without_exactly_one_activated_socket_the_verb_exits_2() {
 }
 
 /// Starts the verb with `listener` as its descriptor 3 and `LISTEN_PID` set to the child's
-/// own pid in the child, as a service manager does.
-fn start(path: &Path, listener: &TcpListener) -> Child {
+/// own pid in the child, as a service manager does. The guard stops and reaps the child when
+/// it drops, so a failed assertion or a panic leaves no process behind.
+fn start(path: &Path, listener: &TcpListener) -> Reaped {
+    start_with(path, listener, Stdio::piped())
+}
+
+/// [`start`] with `stderr` for the verb's standard error.
+fn start_with(path: &Path, listener: &TcpListener, stderr: Stdio) -> Reaped {
     let fd = listener.as_raw_fd();
     let mut command = Command::new(BIN);
     command
@@ -108,7 +123,7 @@ fn start(path: &Path, listener: &TcpListener) -> Child {
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(stderr);
     // SAFETY: only async-signal-safe calls and `setenv`, which is safe here: the child is a
     // fresh fork of a test thread that holds no environment lock, and nothing else in this
     // file forks with a hook.
@@ -134,7 +149,9 @@ fn start(path: &Path, listener: &TcpListener) -> Child {
             Ok(())
         });
     }
-    command.spawn().expect("spawn kbf-installer")
+    // Descriptor 3 is the activated socket; nothing above it is inherited (a build tool's
+    // lock on descriptor 9 would otherwise live as long as this child).
+    reaped::spawn(&mut command, 4).expect("spawn kbf-installer")
 }
 
 /// One `GET` over h2c (prior knowledge) to `addr`: the status and the body.
@@ -241,4 +258,129 @@ async fn serve_alone_and_stop_on(signal: i32) {
     std::io::Read::read_to_string(&mut child.stderr.take().expect("stderr"), &mut err)
         .expect("stderr text");
     assert!(err.contains("proxy serving"), "{err}");
+}
+
+/// Catches a guard that leaves the verb running when the test is over, and a child that
+/// inherits what the test holds: after the drop the pid is gone (`kill(pid, 0)` is ESRCH,
+/// so it was reaped, not left a zombie), and while it ran the child held descriptors 0 to 3
+/// and nothing else, though the test left one open for it to inherit.
+#[tokio::test(flavor = "current_thread")]
+async fn no_child_outlives_its_guard_and_it_holds_only_its_socket() {
+    let leaked = fs::File::open("/dev/null").expect("open");
+    // SAFETY: clearing close-on-exec on a descriptor this test holds, as a tool that keeps
+    // a lock open for its children does.
+    unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_SETFD, 0) };
+
+    let path = config("orphan", TABLE);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let child = start(&path, &listener);
+    drop(listener);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+
+    let pid = child.id().cast_signed();
+    let mut held: Vec<i32> = fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("fds")
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    held.sort_unstable();
+    // 0 to 2 are the standard streams, 3 the socket; the runtime's own epoll, event and
+    // signal descriptors come after and are the verb's, so the leaked number is what is
+    // checked: it must not be there.
+    assert!(held.contains(&3), "{held:?}");
+    let leaked_at = leaked.as_raw_fd();
+    assert!(
+        fs::read_link(format!("/proc/{pid}/fd/{leaked_at}"))
+            .map_or(true, |t| t.to_string_lossy() != "/dev/null"),
+        "the child holds the test's descriptor {leaked_at}: {held:?}"
+    );
+
+    drop(child);
+    // SAFETY: signal 0 only checks that the process exists.
+    let alive = unsafe { libc::kill(pid, 0) };
+    assert_eq!(alive, -1, "the child outlived its guard");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
+/// Waits (at most `within`) for `child` to exit: its status and how long it took.
+fn exited(child: &mut Reaped, within: Duration) -> (Option<std::process::ExitStatus>, Duration) {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            return (Some(status), started.elapsed());
+        }
+        if started.elapsed() > within {
+            return (None, started.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Catches a verb whose second stop signal is ignored: with a client holding a connection
+/// open the first SIGTERM drains for 5 s, and a second one ends it at once with status 1
+/// (an operator who is done waiting), well inside the drain. Before the second signal it
+/// must still be draining, so the test is not racing a process that already left.
+#[tokio::test(flavor = "current_thread")]
+async fn a_second_sigterm_ends_a_draining_verb_at_once() {
+    let path = config("second-term", TABLE);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let mut child = start(&path, &listener);
+    drop(listener);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+    let _idle = std::net::TcpStream::connect(addr).expect("an idle client");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let pid = child.id().cast_signed();
+    // SAFETY: `kill` of our own child.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let (early, _) = exited(&mut child, Duration::from_millis(500));
+    assert!(
+        early.is_none(),
+        "the first SIGTERM drains while a client is connected"
+    );
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let (status, took) = exited(&mut child, Duration::from_secs(3));
+    assert_eq!(status.and_then(|s| s.code()), Some(1), "after {took:?}");
+}
+
+/// Catches a verb that dies because its standard error is closed (`eprintln!` panics on a
+/// broken pipe, exit 101, before it serves): with the read end of its error pipe gone, it
+/// serves and still stops on SIGTERM with status 0.
+#[tokio::test(flavor = "current_thread")]
+async fn a_closed_standard_error_does_not_stop_the_verb_serving() {
+    let path = config("closed-stderr", TABLE);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    // A pipe with no reader: every write to it fails with a broken pipe.
+    let mut ends = [0; 2];
+    // SAFETY: `pipe` fills two descriptors, each owned from here on.
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    // SAFETY: both are fresh, open and owned by nothing else.
+    let (reader, writer) =
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    drop(reader);
+    let mut child = start_with(&path, &listener, Stdio::from(writer));
+    drop(listener);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+    // SAFETY: `kill` of our own child.
+    assert_eq!(
+        unsafe { libc::kill(child.id().cast_signed(), libc::SIGTERM) },
+        0
+    );
+    let (status, took) = exited(&mut child, Duration::from_secs(10));
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "after {took:?}");
 }

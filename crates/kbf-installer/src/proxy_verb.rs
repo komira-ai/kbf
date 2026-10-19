@@ -15,11 +15,19 @@
 //!
 //! The only environment variables read are the service manager's socket-activation markers,
 //! `LISTEN_PID` and `LISTEN_FDS`; everything else is the `[proxy]` table.
+//!
+//! `--check` loads the whole file the way a run does, so a bad key outside `[proxy]` is
+//! refused (exit 2) too. A stop signal drains for at most 5 s; the process ends within
+//! [`STOP_BOUND`] of the first one whatever the runtime is doing, and at once on a second.
 
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::os::fd::{AsFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use kbf_proxy::Proxy;
 use kbf_proxy::config::ProxyConfig;
@@ -138,6 +146,37 @@ pub fn activated(
     Ok(owned)
 }
 
+/// How long after the first stop signal the process may live. The proxy drains open streams
+/// for 5 s (`kbf-proxy`'s `SHUTDOWN_DRAIN`) and then returns; this is that plus a margin for
+/// the runtime to wind down, after which the process exits whatever is left.
+const STOP_BOUND: Duration = Duration::from_secs(10);
+
+/// What a stop signal does. The first asks the proxy to drain and starts a clock on a thread
+/// of its own (the runtime may be the thing that is stuck), so a SIGTERM always ends the
+/// process within [`STOP_BOUND`]; any later signal is an operator who is done waiting and ends
+/// it at once. Both exits are status 1: the stop was not the clean drain.
+struct Stop {
+    seen: AtomicBool,
+    bound: Duration,
+    exit: fn(i32) -> !,
+}
+
+impl Stop {
+    /// A stop signal arrived. `drain` asks the proxy to stop; it runs for the first signal
+    /// only. The thread that enforces the bound is returned for a test to join.
+    fn signalled(self: &Arc<Self>, drain: impl FnOnce()) -> JoinHandle<()> {
+        if self.seen.swap(true, Ordering::SeqCst) {
+            (self.exit)(1);
+        }
+        drain();
+        let (bound, exit) = (self.bound, self.exit);
+        std::thread::spawn(move || {
+            std::thread::sleep(bound);
+            exit(1);
+        })
+    }
+}
+
 /// Serves on `listener` until a stop signal. The signal handlers are registered before the
 /// proxy serves, so none is lost to the default action.
 fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
@@ -149,14 +188,21 @@ fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
             signal(SignalKind::interrupt()),
         )
     });
-    for mut stop in [term?, int?] {
-        let handle = handle.clone();
+    let stop = Arc::new(Stop {
+        seen: AtomicBool::new(false),
+        bound: STOP_BOUND,
+        exit: std::process::exit,
+    });
+    for mut signals in [term?, int?] {
+        let (handle, stop) = (handle.clone(), Arc::clone(&stop));
         runtime.spawn(async move {
-            stop.recv().await;
-            handle.shutdown();
+            while signals.recv().await.is_some() {
+                drop(stop.signalled(|| handle.shutdown()));
+            }
         });
     }
-    eprintln!("kbf-installer: proxy serving");
+    // A closed standard error (a journal that went away) must not stop the proxy from serving.
+    let _ = writeln!(std::io::stderr(), "kbf-installer: proxy serving");
     Ok(runner.run(NoUpdates)?)
 }
 

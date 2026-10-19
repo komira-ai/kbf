@@ -223,3 +223,59 @@ fn check_stops_at_the_table_and_a_run_needs_its_socket() {
     };
     assert!(usage_of(run(&missing)).contains("No such file"));
 }
+
+static BOUND_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static SECOND_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn bound_exit(code: i32) -> ! {
+    BOUND_EXIT.store(code, Ordering::SeqCst);
+    panic!("exit {code}");
+}
+
+fn second_exit(code: i32) -> ! {
+    SECOND_EXIT.store(code, Ordering::SeqCst);
+    panic!("exit {code}");
+}
+
+/// Catches a stop that waits on the proxy alone: with a drain that never returns, the first
+/// signal still ends the process (status 1) once the bound is over, from a thread the
+/// runtime does not run, and the drain was asked for exactly once.
+#[test]
+fn the_first_stop_signal_starts_a_clock_that_ends_the_process() {
+    let stop = Arc::new(Stop {
+        seen: AtomicBool::new(false),
+        bound: Duration::from_millis(30),
+        exit: bound_exit,
+    });
+    let mut drains = 0;
+    let clock = stop.signalled(|| drains += 1);
+    assert_eq!(
+        (drains, BOUND_EXIT.load(Ordering::SeqCst)),
+        (1, -1),
+        "before the bound"
+    );
+    assert!(clock.join().is_err(), "the thread ends in the exit");
+    assert_eq!(BOUND_EXIT.load(Ordering::SeqCst), 1);
+}
+
+/// Catches a second signal that is ignored (an operator's second SIGTERM would wait out the
+/// drain again): it ends the process at once with status 1 and asks for no second drain.
+#[test]
+fn a_second_stop_signal_ends_the_process_at_once() {
+    let stop = Arc::new(Stop {
+        seen: AtomicBool::new(false),
+        bound: Duration::from_secs(60),
+        exit: second_exit,
+    });
+    drop(stop.signalled(|| {}));
+    assert_eq!(
+        SECOND_EXIT.load(Ordering::SeqCst),
+        -1,
+        "the first only drains"
+    );
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(stop.signalled(|| panic!("a second drain")));
+    }));
+    assert!(second.is_err());
+    assert_eq!(SECOND_EXIT.load(Ordering::SeqCst), 1);
+}
