@@ -32,9 +32,19 @@
 //!    then only the commit and the release profile are checked.
 //! 6. **Leases**: root observes ([`crate::helper::leases`]) that none is live.
 //! 7. **Install**: `VERIFIED` is written into the directory, which is renamed to
-//!    `releases/<commit>/`, the parent is synced, and then the state's `staged` names it.
-//!    A directory already there is the same release (the same `VERIFIED` marker and the
-//!    same bytes) or a refusal; a release is never replaced.
+//!    `releases/<commit>/`, and the parent is synced. A directory already there is the
+//!    same release (the same `VERIFIED` marker and the same bytes) or a refusal; a
+//!    release is never replaced.
+//!
+//! The pipeline never writes the state. A verified release is installed, and what it is
+//! for is the asker's decision: the state's `staged` is the one release waiting for a
+//! frontend's confirm or revert (written by [`crate::activate::stage_frontend`]), an
+//! activation or a first release makes it `current` ([`crate::activate::activate`],
+//! [`crate::activate::first`]), and an order refused after the fetch leaves the state as
+//! it was. Until the asker writes, `gc` may remove the release unless it is among the
+//! `keep` newest it does not otherwise keep; each writer checks under the lock that the
+//! directory is there (`NotInstalled`), so the cost is a refused order, never a state
+//! that names nothing.
 //!
 //! Every external step is bounded: `gh` 120 s, unpacking 120 s, the probe 10 s
 //! ([`Timeouts`]); a program is killed with its whole process group. The scratch
@@ -65,7 +75,6 @@ use crate::layout::{Layout, Platform};
 use crate::refusal::{ArchiveFault, FactsFault, Refusal, TrustFault, VersionFault, WHAT_PROBE};
 use crate::run::{Runner, Spawn};
 use crate::settings::Settings;
-use crate::state::{Locked, StateError};
 
 /// The marker written into a release directory once every check has passed.
 pub const VERIFIED: &str = "VERIFIED";
@@ -213,7 +222,9 @@ pub struct Policy {
     pub timeouts: Timeouts,
 }
 
-/// A release that passed every check and is installed in `releases/<commit>/`.
+/// A release that passed every check and is installed in `releases/<commit>/`. The state does
+/// not name it yet (see the module docs): "staged" here is the stage of the checks, not the
+/// state's `staged` field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Staged {
     pub commit: CommitId,
@@ -245,7 +256,8 @@ impl Staged {
 }
 
 /// Verifies what was fetched and installs it, or says why not. Nothing but scratch has
-/// changed when it refuses.
+/// changed when it refuses, and the state has not changed when it does not: the release
+/// directory is all that is new.
 pub trait Verifier {
     fn verify(&self, order: &Order<'_>, fetched: Fetched) -> Result<Staged, Refusal>;
 }
@@ -682,26 +694,22 @@ impl Pipeline<'_> {
         builder.recursive(true).mode(0o755);
         builder.create(&releases).map_err(work_err(&releases))?;
 
-        let already = match fs::symlink_metadata(&target) {
+        // The state is not touched: a verified release is installed, not yet kept. Whoever
+        // asked for it decides what it is (staged for a frontend's confirm, current for an
+        // activation or a first release) and writes that, so a refusal after the fetch
+        // leaves nothing to undo.
+        match fs::symlink_metadata(&target) {
             Ok(_) => {
                 self.same_release(&target, &dir, names)?;
-                true
+                Ok(true)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 fs::rename(&dir, &target).map_err(work_err(&target))?;
                 sync_dir(&releases)?;
-                false
+                Ok(false)
             }
-            Err(e) => return Err(work_err(&target)(e)),
-        };
-
-        // `gc` keeps a staged release; the lock is the one every state change is under.
-        let failed = |e: StateError| Refusal::Install(e.into());
-        let lock = Locked::acquire(self.host).map_err(failed)?;
-        let mut state = lock.read().map_err(failed)?.unwrap_or_default();
-        state.staged = Some(commit.clone());
-        lock.write(&state).map_err(failed)?;
-        Ok(already)
+            Err(e) => Err(work_err(&target)(e)),
+        }
     }
 
     /// The release directory already on the host is this release: a plain directory with
