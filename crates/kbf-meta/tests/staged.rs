@@ -804,3 +804,17 @@ fn a_reseat_with_no_records_only_takes_the_object_out() {
     assert_eq!(state(&m, 1), None);
     assert_eq!(state(&m, 5), None);
 }
+
+/// Catches: a record of the new object that is not indexed at the old one treated as one
+/// that is. A digest not indexed at all is stored at the new object; one indexed at
+/// another object keeps that entry (the new copy is redundant, as for a `PutStaged`).
+#[test]
+fn a_reseat_indexes_the_records_that_were_not_at_the_old_object_as_a_put_does() {
+    let mut m = two_sealed();
+    let new = sealed(part(5, 250, &[(1, 0), (2, 50), (3, 100), (9, 150)]));
+    assert_eq!(reseat(&mut m, 1, new, false), Ok(()));
+    assert_eq!(m.blob(&digest(1)), staged_at(5, 0));
+    assert_eq!(m.blob(&digest(3)), staged_at(2, 0), "kept where it was");
+    assert_eq!(m.blob(&digest(9)), staged_at(5, 150), "indexed by the move");
+    assert_eq!(state(&m, 1), None);
+}

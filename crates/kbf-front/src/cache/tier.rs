@@ -427,7 +427,7 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
 
     /// Commits a `ReseatStaged` of `from` to `to` (in the store when `stored`), tried
     /// up to [`RESEAT_ATTEMPTS`] times when the log cannot answer: the command is a
-    /// no-op when it applied already. A refusal is not tried again.
+    /// no-op when it applied already. A refusal (or any other answer) is not tried again.
     pub(super) async fn reseat(
         &self,
         tier: TierId,
@@ -445,7 +445,6 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         for _ in 0..RESEAT_ATTEMPTS {
             match self.commit(command.clone()).await {
                 Ok(Applied::Tier(Ok(()))) => return Ok(()),
-                Ok(Applied::Tier(Err(e))) => return Err(CacheError::Internal(e.to_string())),
                 Ok(other) => return Err(unexpected(&other)),
                 Err(e) => failed = Some(e),
             }

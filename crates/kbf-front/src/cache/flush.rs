@@ -192,13 +192,10 @@ pub(super) fn flush_backoff(failures: u32) -> Duration {
 /// given up for this round (the block is synced and held while it is tried).
 pub(super) const RESEAT_ATTEMPTS: u32 = 3;
 
-/// Whether `error` says the block file of a staged object is gone.
+/// Whether `error` says the block file of a staged object is gone (the tier maps a
+/// missing file to [`kbf_tier::TierError::UnknownBlock`]).
 fn block_gone(error: &kbf_tier::TierError) -> bool {
-    match error {
-        kbf_tier::TierError::UnknownBlock(_) => true,
-        kbf_tier::TierError::Io { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
-        _ => false,
-    }
+    matches!(error, kbf_tier::TierError::UnknownBlock(_))
 }
 
 /// What one [`Cache::flush_tier`] round did.
