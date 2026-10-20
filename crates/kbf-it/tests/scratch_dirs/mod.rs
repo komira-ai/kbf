@@ -53,6 +53,11 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "product code: the release and verify scratch, removed after the run whatever its result",
     ),
     (
+        "crates/xtask/src/release/bump.rs",
+        1,
+        "product code: the bump verb's clone when no --workdir is given, removed after the run whatever its result",
+    ),
+    (
         "crates/xtask/src/release/offer.rs",
         1,
         "product code: the offer verb's scratch, removed once the plan is made whatever its result",
