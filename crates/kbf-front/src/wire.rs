@@ -158,6 +158,19 @@ mod tests {
 
     const HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+    /// Catches: a digest-function check that refuses SHA-256 named explicitly (a client
+    /// that sets it, as REAPI allows, would be turned away), accepts a function this cache
+    /// does not hash with, or refuses it unset. Mutant seen red: the explicit SHA-256 arm
+    /// removed (the second assertion fails).
+    #[test]
+    fn only_sha256_or_unset_is_an_accepted_digest_function() {
+        let value = |v: reapi::digest_function::Value| v as i32;
+        assert!(check_digest_function(value(reapi::digest_function::Value::Unknown)).is_ok());
+        assert!(check_digest_function(value(reapi::digest_function::Value::Sha256)).is_ok());
+        let refused = check_digest_function(value(reapi::digest_function::Value::Sha1));
+        assert_eq!(refused.unwrap_err().code(), Code::InvalidArgument);
+    }
+
     /// Catches: a parser that misreads the instance name (which authorization checks),
     /// the optional digest function segment or the trailing upload metadata, which
     /// would make a well-formed client read or write the wrong blob or fail, or be
