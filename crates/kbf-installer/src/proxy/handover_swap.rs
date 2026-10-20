@@ -24,6 +24,10 @@
 //! `migrator` is [`ExpandOnlyDefault`] with the schema the host runs unknown (see
 //! [`RUNNING_SCHEMA_UNKNOWN`]); `clock` is the system clock.
 //!
+//! `start_blocked` refuses while the start-up hold is in force ([`Host::held`]: no frontend
+//! child was adopted, so the active slot is a guess) and while the migrator is the unknown-schema
+//! default (every release would fail at step `migrate`, after the root half had fetched it).
+//!
 //! Nothing here names the proxy's types: the verb, which does, builds the [`Host`].
 
 use std::net::SocketAddr;
@@ -89,6 +93,9 @@ pub struct Host {
     pub recorded: Arc<dyn Fn(Slot) -> Option<ProcIdent> + Send + Sync>,
     /// The slot that serves now, from the start-up adoption (a recorded update decides its own).
     pub active: Slot,
+    /// Why no frontend child is serving (the start-up hold is in force), if so; `active` is
+    /// then a guess and no update starts.
+    pub held: Option<String>,
     /// `releases/` of the host's layout.
     pub releases_dir: PathBuf,
     /// The headers every admin call carries: the proxy's secret.
@@ -219,6 +226,8 @@ fn build(cfg: &HandoverConfig, spool: &OrderSpool, host: &Host) -> SwapSuperviso
             active: host.active,
             rollback_after_switch: false,
             releases_dir: host.releases_dir.clone(),
+            startup_hold: host.held.clone(),
+            migrator_blocked: Some(RUNNING_SCHEMA_UNKNOWN.to_owned()),
         },
     )
 }

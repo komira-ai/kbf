@@ -126,6 +126,12 @@ pub struct Config {
     /// Where the releases are installed (`releases/` of the host's layout): a candidate
     /// cannot start when it is not a directory ([`Supervisor::start_blocked`]).
     pub releases_dir: PathBuf,
+    /// Set while the start-up hold is in force (no frontend child was adopted): why. `active`
+    /// is then a guess, so no update can start ([`Supervisor::start_blocked`]).
+    pub startup_hold: Option<String>,
+    /// Set when the migrator can never pass a release (it cannot tell what schema the host
+    /// runs): why. A `POST` is refused before the root half fetches anything.
+    pub migrator_blocked: Option<String>,
 }
 
 /// Starts the swap's thread. The real one is [`thread_spawn`]; a test passes one that refuses.
@@ -299,6 +305,9 @@ impl Supervisor for SwapSupervisor {
     /// - an update that has ended still has its swap thread open (it is draining the old
     ///   child): the `start` of a new one would be refused after its release was fetched;
     /// - the releases directory is missing;
+    /// - the start-up hold is in force (no frontend child was adopted, so the active slot is a
+    ///   guess);
+    /// - the migrator can never pass (the running schema is unknown);
     /// - the slot the candidate would start in is not idle: the process recorded for it is
     ///   still running.
     ///
@@ -327,6 +336,14 @@ impl Supervisor for SwapSupervisor {
                 "the releases directory {} is missing",
                 self.config.releases_dir.display()
             ));
+        }
+        if let Some(why) = &self.config.startup_hold {
+            return Some(format!(
+                "no frontend child is serving; the startup hold is in force: {why}"
+            ));
+        }
+        if let Some(why) = &self.config.migrator_blocked {
+            return Some(format!("every release would fail at step migrate: {why}"));
         }
         let idle = active.other();
         match (self.parts.old_proc)(idle) {

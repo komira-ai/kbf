@@ -60,6 +60,7 @@ fn host_over(rig: &Arc<Rig>, releases: PathBuf, deaths: &Arc<Mutex<Vec<String>>>
         child: rig.clone(),
         recorded: Arc::new(move |slot| by_slot.ident(slot)),
         active: Slot::A,
+        held: None,
         releases_dir: releases,
         secret: Headers::new(),
         on_death: Arc::new(move |why| sink.lock().unwrap().push(why.to_owned())),
@@ -180,7 +181,42 @@ fn the_first_call_after_the_fill_builds_the_swap_supervisor() {
     let (cfg, spool, root) = config("fill-ok");
     let handover = Handover::new(&cfg, spool);
     cfg.gate.fill(host_over(&rig, root.clone(), &deaths));
-    assert_eq!(handover.start_blocked(), None);
+    let why = handover.start_blocked().expect("blocked by the migrator");
+    assert!(why.contains(RUNNING_SCHEMA_UNKNOWN), "{why}");
+}
+
+/// Catches a host whose migrator can never pass (the running schema is unknown) that still
+/// takes a `POST`: every update would be fetched and staged and then end `failed` at step
+/// `migrate`. Fails without the `migrator_blocked` the driver is built with: `start_blocked`
+/// would be `None` here.
+#[test]
+fn a_host_that_cannot_tell_its_schema_refuses_before_anything_is_fetched() {
+    let (cfg, spool, root) = config("blk-migrate");
+    let handover = Handover::new(&cfg, spool);
+    let rig = Rig::new(None);
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate.fill(host_over(&rig, root, &deaths));
+    let why = handover.start_blocked().expect("blocked");
+    assert!(why.contains("step migrate"), "{why}");
+    assert!(why.contains(RUNNING_SCHEMA_UNKNOWN), "{why}");
+}
+
+/// Catches a startup hold that is not seen by `start_blocked`: with no frontend child adopted
+/// the active slot is a guess, and a `POST` would be saved, ordered and fetched against it.
+/// Fails without `Host::held` reaching the supervisor's config.
+#[test]
+fn a_host_with_the_startup_hold_in_force_refuses_with_the_holds_reason() {
+    let (cfg, spool, root) = config("blk-hold");
+    let handover = Handover::new(&cfg, spool);
+    let rig = Rig::new(None);
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate.fill(Host {
+        held: Some("no frontend child is running".to_owned()),
+        ..host_over(&rig, root, &deaths)
+    });
+    let why = handover.start_blocked().expect("blocked");
+    assert!(why.contains("startup hold is in force"), "{why}");
+    assert!(why.contains("no frontend child is running"), "{why}");
 }
 
 /// Catches ports of the swap that are not the real ones, or a counter that is not shared: a
@@ -198,7 +234,6 @@ fn a_start_runs_over_the_real_spool_recorder_and_root_half() {
     let rig = Rig::new(None);
     let deaths = Arc::new(Mutex::new(Vec::new()));
     cfg.gate.fill(host_over(&rig, root.clone(), &deaths));
-    assert_eq!(handover.start_blocked(), None);
     handover.start(&spec("u1")).expect("accepted");
     until("the update to end", || {
         handover
@@ -221,7 +256,9 @@ fn a_start_runs_over_the_real_spool_recorder_and_root_half() {
         ("u1", Phase::Failed)
     );
     until("the swap thread to close", || {
-        handover.start_blocked().is_none()
+        handover
+            .start_blocked()
+            .is_none_or(|why| !why.contains("still finishing"))
     });
     assert!(deaths.lock().unwrap().is_empty());
 }

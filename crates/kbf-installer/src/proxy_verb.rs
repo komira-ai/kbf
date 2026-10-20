@@ -492,14 +492,16 @@ fn supervise(
         children_dir(state_dir),
         frontend_argv(proxy_auth_file, upstream),
     ));
-    let (line, active) = match adopt_children(&gate, &child, state_dir) {
+    let (line, active, held) = match adopt_children(&gate, &child, state_dir) {
         Startup::Adopted { active } => (
             format!("adopted the frontend child in slot {active:?}"),
             active,
+            None,
         ),
         Startup::Held(why) => (
             format!("no frontend child adopted, new streams stay held: {why}"),
             crate::proxy::model::Slot::A,
+            Some(why),
         ),
     };
     let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {line}");
@@ -509,6 +511,7 @@ fn supervise(
         child,
         recorded: recorded_by(&recorder),
         active,
+        held,
         releases_dir,
         secret: admin_secret(&handle.admin_headers()),
         on_death,

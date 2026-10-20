@@ -16,8 +16,11 @@ use super::{
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn toml_file(body: &str) -> PathBuf {
+    // The counter is the process's own, and each test runs in a process of its own under
+    // nextest, so every process would name `database-0` and clear the directory another is
+    // using: the process id makes the name unique.
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = kbf_host::testkit::scratch(&format!("database-{n}"));
+    let dir = kbf_host::testkit::scratch(&format!("database-{}-{n}", std::process::id()));
     let file = dir.join("installer.toml");
     fs::write(&file, body).expect("written");
     file
