@@ -32,6 +32,7 @@ kbf-estimator             -      -
 kbf-front                35      7
 kbf-gate                  0      0
 kbf-guest                15      6
+kbf-harness               0      0
 kbf-history               0      0
 kbf-host                  0      0
 kbf-image                 0      0
