@@ -733,6 +733,60 @@ fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
         !files.iter().any(|p| p.starts_with("/etc/kbf")),
         "a Mac keeps nothing in /etc/kbf: {files:?}"
     );
+    // The configuration directory is made where the files go, and no Linux one is made.
+    let dirs: Vec<String> = exec
+        .entries
+        .iter()
+        .filter(|(_, e)| matches!(e, Entry::Dir { .. }))
+        .map(|(p, _)| p.to_string())
+        .collect();
+    assert!(
+        dirs.iter().any(|d| d == "/usr/local/etc/kbf"),
+        "no Mac config directory: {dirs:?}"
+    );
+    assert!(
+        !dirs.iter().any(|d| d.starts_with("/etc/kbf")),
+        "a Linux config directory on a Mac: {dirs:?}"
+    );
+}
+
+/// Catches one of the config paths left on the Linux directory on one platform (a Mac
+/// `api_token` or `config_dir` at `/etc/kbf` reaches no test that runs the daemon plan):
+/// each file sits directly in its platform's `config_dir`, which is `/etc/kbf` on Linux and
+/// `/usr/local/etc/kbf` on macOS, and the `Layout` paths are the `Platform` ones.
+///
+/// Mutants seen red: the Mac `config_dir` and the Mac `api_token` each set to the Linux path.
+#[test]
+fn every_config_path_lies_in_its_platforms_config_dir() {
+    for (platform, dir) in [
+        (Platform::Linux, "/etc/kbf"),
+        (Platform::MacOs, "/usr/local/etc/kbf"),
+    ] {
+        assert_eq!(platform.config_dir(), dir);
+        let layout = crate::layout::Layout::new(kbf_host::Root::new("/").expect("root"), platform);
+        assert_eq!(layout.config_dir().to_string(), dir);
+        for (file, path, held) in [
+            ("kbf.toml", platform.kbf_toml(), layout.kbf_toml()),
+            (
+                "installer.toml",
+                platform.installer_toml(),
+                layout.installer_toml(),
+            ),
+            (
+                "enroll.token",
+                platform.enroll_token(),
+                layout.enroll_token(),
+            ),
+            ("api-token", platform.api_token(), layout.api_token()),
+        ] {
+            assert_eq!(
+                std::path::Path::new(path).parent(),
+                Some(std::path::Path::new(dir)),
+                "{platform:?} {file}: {path}"
+            );
+            assert_eq!(held.to_string(), path, "{platform:?} {file}");
+        }
+    }
 }
 
 /// Catches `--installer-config` being pinned to the Linux path on a Mac: the only value setup
