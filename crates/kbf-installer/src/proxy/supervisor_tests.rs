@@ -1073,136 +1073,144 @@ mod migration {
         assert!(runner.calls()[0].program.ends_with("kbf-act"));
     }
 
-    /// Real server, own database: a cold start against a fresh database creates the schema
-    /// (kbf opens on it), and the next cold start finds it done and changes nothing. The
-    /// database is created for this test alone, so no other test process shares its schema.
-    /// No part of the URL is in anything the log is given.
-    ///
-    /// Mutants seen red: the hook migrating nothing (no schema; kbf's open refused);
-    /// the `schema_version` row written again on the second start (the row changed).
-    #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
-    fn a_cold_start_creates_the_schema_on_a_fresh_database_and_the_next_changes_nothing() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+    /// The tests that need a Postgres server. The module is named `database` so the CI
+    /// steps that run the `#[ignore]`d tests (they select `database::`) pick them up.
+    mod database {
+        use super::*;
 
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let url = std::env::var("KBF_TEST_POSTGRES_URL").expect("KBF_TEST_POSTGRES_URL");
+        /// Real server, own database: a cold start against a fresh database creates the schema
+        /// (kbf opens on it), and the next cold start finds it done and changes nothing. The
+        /// database is created for this test alone, so no other test process shares its schema.
+        /// No part of the URL is in anything the log is given.
+        ///
+        /// Mutants seen red: the hook migrating nothing (no schema; kbf's open refused);
+        /// the `schema_version` row written again on the second start (the row changed).
+        #[test]
+        #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+        fn a_cold_start_creates_the_schema_on_a_fresh_database_and_the_next_changes_nothing() {
+            use std::sync::atomic::{AtomicU64, Ordering};
 
-        /// A database created for one test and dropped with it.
-        struct Own {
-            name: String,
-            url: String,
-        }
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let url = std::env::var("KBF_TEST_POSTGRES_URL").expect("KBF_TEST_POSTGRES_URL");
 
-        impl Own {
-            fn new(url: &str) -> Own {
-                let name = format!(
-                    "kbf_cold_{}_{}",
-                    std::process::id(),
-                    NEXT.fetch_add(1, Ordering::Relaxed)
-                );
-                let mut admin = postgres::Client::connect(url, postgres::NoTls).expect("connects");
-                admin
-                    .batch_execute(&format!("CREATE DATABASE {name}"))
-                    .expect("creates");
-                let (base, _) = url.rsplit_once('/').expect("a database in the URL");
-                Own {
-                    url: format!("{base}/{name}"),
-                    name,
+            /// A database created for one test and dropped with it.
+            struct Own {
+                name: String,
+                url: String,
+            }
+
+            impl Own {
+                fn new(url: &str) -> Own {
+                    let name = format!(
+                        "kbf_cold_{}_{}",
+                        std::process::id(),
+                        NEXT.fetch_add(1, Ordering::Relaxed)
+                    );
+                    let mut admin =
+                        postgres::Client::connect(url, postgres::NoTls).expect("connects");
+                    admin
+                        .batch_execute(&format!("CREATE DATABASE {name}"))
+                        .expect("creates");
+                    let (base, _) = url.rsplit_once('/').expect("a database in the URL");
+                    Own {
+                        url: format!("{base}/{name}"),
+                        name,
+                    }
                 }
             }
-        }
 
-        impl Drop for Own {
-            fn drop(&mut self) {
-                let base = self.url.rsplit_once('/').map_or("", |(base, _)| base);
-                if let Ok(mut admin) =
-                    postgres::Client::connect(&format!("{base}/postgres"), postgres::NoTls)
-                {
-                    let _ = admin.batch_execute(&format!(
-                        "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-                        self.name
-                    ));
+            impl Drop for Own {
+                fn drop(&mut self) {
+                    let base = self.url.rsplit_once('/').map_or("", |(base, _)| base);
+                    if let Ok(mut admin) =
+                        postgres::Client::connect(&format!("{base}/postgres"), postgres::NoTls)
+                    {
+                        let _ = admin.batch_execute(&format!(
+                            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                            self.name
+                        ));
+                    }
                 }
             }
-        }
 
-        let own = Own::new(&url);
-        let config = PostgresConfig::parse(&own.url).expect("parses");
-        let mut client = postgres::Client::connect(&own.url, postgres::NoTls).expect("connects");
-        let rows = |client: &mut postgres::Client| -> Vec<String> {
-            client
-                .query(
-                    "SELECT version::text || ' ' || applied_at::text FROM kbf_state.schema_version ORDER BY version",
-                    &[],
-                )
-                .expect("the version table")
-                .iter()
-                .map(|r| r.get::<_, String>(0))
-                .collect()
-        };
-        let absent = client
-            .query_one("SELECT to_regclass('kbf_state.schema_version')::text", &[])
-            .expect("catalog");
-        assert_eq!(
-            absent.get::<_, Option<String>>(0),
-            None,
-            "the database is fresh"
-        );
-
-        let rig = rig("supervisor-cold-real-database");
-        let runner = says(declares(A, 1));
-        let facts = StatusFile::new(state_dir(&rig).join("status.json"));
-        let m = host_migrator_with(
-            &runner,
-            Database::new(config.clone(), schema::embedded()),
-            &facts,
-            &rig.child,
-        );
-        let told = Told::default();
-        let start = |child: &ProcChild| {
-            let (gate, _runner) = gate();
-            let env = Env::new(&rig, &gate);
-            env.install(A);
-            verify(&rig, A);
-            let boot = Boot {
-                migrator: &m,
-                report: &told,
-                ..env.boot()
+            let own = Own::new(&url);
+            let config = PostgresConfig::parse(&own.url).expect("parses");
+            let mut client =
+                postgres::Client::connect(&own.url, postgres::NoTls).expect("connects");
+            let rows = |client: &mut postgres::Client| -> Vec<String> {
+                client
+                    .query(
+                        "SELECT version::text || ' ' || applied_at::text FROM kbf_state.schema_version ORDER BY version",
+                        &[],
+                    )
+                    .expect("the version table")
+                    .iter()
+                    .map(|r| r.get::<_, String>(0))
+                    .collect()
             };
-            let outcome = adopt_children(&gate, child, &state_dir(&rig), &boot);
-            (outcome, child.recorded(Slot::A).map(|r| r.ident))
-        };
+            let absent = client
+                .query_one("SELECT to_regclass('kbf_state.schema_version')::text", &[])
+                .expect("catalog");
+            assert_eq!(
+                absent.get::<_, Option<String>>(0),
+                None,
+                "the database is fresh"
+            );
 
-        let (outcome, started) = start(&rig.child);
-        let first = started.expect("the release started");
-        let _stop = Cleanup(&rig.child, vec![first.clone()]);
-        assert_eq!(outcome, Startup::Adopted { active: Slot::A });
-        assert_eq!(schema::current(&config), Ok(1));
-        kbf_state::postgres::PostgresStore::open(&config).expect("kbf opens on what was made");
-        let made = rows(&mut client);
-        assert_eq!(made.len(), 1, "{made:?}");
+            let rig = rig("supervisor-cold-real-database");
+            let runner = says(declares(A, 1));
+            let facts = StatusFile::new(state_dir(&rig).join("status.json"));
+            let m = host_migrator_with(
+                &runner,
+                Database::new(config.clone(), schema::embedded()),
+                &facts,
+                &rig.child,
+            );
+            let told = Told::default();
+            let start = |child: &ProcChild| {
+                let (gate, _runner) = gate();
+                let env = Env::new(&rig, &gate);
+                env.install(A);
+                verify(&rig, A);
+                let boot = Boot {
+                    migrator: &m,
+                    report: &told,
+                    ..env.boot()
+                };
+                let outcome = adopt_children(&gate, child, &state_dir(&rig), &boot);
+                (outcome, child.recorded(Slot::A).map(|r| r.ident))
+            };
 
-        // The host restarts: nothing runs, the next start finds the schema in place.
-        rig.child.terminate(&first).expect("signal");
-        wait_for("exit", || !alive(first.pid));
-        let after = rig.restarted();
-        let (outcome, started) = start(&after);
-        let second = started.expect("started again");
-        let _stop = Cleanup(&after, vec![second.clone()]);
-        assert_eq!(outcome, Startup::Adopted { active: Slot::A });
-        assert_ne!(first, second, "a new process");
-        assert_eq!(
-            rows(&mut client),
-            made,
-            "the second start changed the schema"
-        );
-        for (_, _, detail) in told.0.borrow().iter() {
-            for secret in own.url.split(['/', '@', ':']).filter(|part| part.len() > 4) {
-                assert!(
-                    detail.as_deref().is_none_or(|d| !d.contains(secret)),
-                    "{secret} in {detail:?}"
-                );
+            let (outcome, started) = start(&rig.child);
+            let first = started.expect("the release started");
+            let _stop = Cleanup(&rig.child, vec![first.clone()]);
+            assert_eq!(outcome, Startup::Adopted { active: Slot::A });
+            assert_eq!(schema::current(&config), Ok(1));
+            kbf_state::postgres::PostgresStore::open(&config).expect("kbf opens on what was made");
+            let made = rows(&mut client);
+            assert_eq!(made.len(), 1, "{made:?}");
+
+            // The host restarts: nothing runs, the next start finds the schema in place.
+            rig.child.terminate(&first).expect("signal");
+            wait_for("exit", || !alive(first.pid));
+            let after = rig.restarted();
+            let (outcome, started) = start(&after);
+            let second = started.expect("started again");
+            let _stop = Cleanup(&after, vec![second.clone()]);
+            assert_eq!(outcome, Startup::Adopted { active: Slot::A });
+            assert_ne!(first, second, "a new process");
+            assert_eq!(
+                rows(&mut client),
+                made,
+                "the second start changed the schema"
+            );
+            for (_, _, detail) in told.0.borrow().iter() {
+                for secret in own.url.split(['/', '@', ':']).filter(|part| part.len() > 4) {
+                    assert!(
+                        detail.as_deref().is_none_or(|d| !d.contains(secret)),
+                        "{secret} in {detail:?}"
+                    );
+                }
             }
         }
     }
