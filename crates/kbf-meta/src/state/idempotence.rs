@@ -99,7 +99,7 @@ fn tier(rng: &mut Rng) -> TierId {
 /// A tier command over the generated objects: offsets and ends in hundreds, so a record
 /// (at most 9 bytes) sometimes ends past its commit's end.
 fn tier_command(rng: &mut Rng) -> Command {
-    match rng.below(6) {
+    match rng.below(5) {
         0 => Command::AddTier {
             server: ServerId::new(1 + rng.below(3)),
             tier: tier(rng),
@@ -122,19 +122,6 @@ fn tier_command(rng: &mut Rng) -> Command {
         },
         3 => Command::ObjectFlushed {
             object: object(rng),
-        },
-        4 => Command::ReseatStaged {
-            tier: tier(rng),
-            from: object(rng),
-            to: StagedPut {
-                object: object(rng),
-                end: rng.below(6) * 100 + 9,
-                seal: rng.one_in(3),
-                blobs: (0..rng.below(4))
-                    .map(|_| (digest(rng), rng.below(6) * 100))
-                    .collect(),
-            },
-            stored: rng.one_in(4),
         },
         _ => Command::FlushConflict {
             object: object(rng),
@@ -447,5 +434,5 @@ fn a_forwarded_command_applied_twice_equals_once_but_for_generations_and_next_ep
     assert!(seen.restamped_same_reason > 100, "{counts}");
     assert!(seen.tier_accepted > 200, "{counts}");
     assert!(seen.staged_repeats > 30, "{counts}");
-    assert!(seen.evicted > 30, "{counts}");
+    assert!(seen.evicted > 50, "{counts}");
 }
