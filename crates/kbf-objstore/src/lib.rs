@@ -17,6 +17,7 @@ pub mod footers;
 mod fs_store;
 pub mod listing;
 mod memory;
+pub mod probe;
 pub mod s3;
 mod types;
 
