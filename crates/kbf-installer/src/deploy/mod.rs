@@ -381,7 +381,7 @@ pub fn update_frontend(env: &Env, opts: &Options) -> (Summary, Exit) {
         env,
         opts,
         sum: Summary::new(&opts.commit, env.clock.now()),
-        gates: Gates::new(opts.apply),
+        gates: Gates::new(false),
         observed: None,
         expected: BTreeMap::new(),
     };
