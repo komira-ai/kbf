@@ -601,7 +601,7 @@ fn units(
                     "{FRONTEND_UNIT} is enabled and the proxy starts the frontend itself: setup does not stop or disable it; do both (systemctl disable --now) before starting the proxy, since the two never run together"
                 ));
             }
-                        // The backup runs as the service user, written before the timer is enabled.
+            // The backup runs as the service user, written before the timer is enabled.
             let mut dropin_changed = false;
             if v.mode.keeps_state_in_database() {
                 // The name is the one the frontend unit runs as: `service_user_name`, a fixed set.
