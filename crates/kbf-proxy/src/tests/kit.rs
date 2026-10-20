@@ -68,6 +68,10 @@ pub(super) fn security(mode: Buck2Auth) -> Security {
 pub(super) struct Call {
     pub body: RecvStream,
     pub respond: SendResponse<Bytes>,
+    /// The request's method.
+    pub method: http::Method,
+    /// The request's URI as the child received it: path and query.
+    pub uri: http::Uri,
     /// How many streams this child has accepted so far, this one included.
     pub nth: usize,
     /// Rung to make this stream's connection send a graceful GOAWAY.
@@ -201,7 +205,7 @@ impl Drop for Connecting {
 const PIPE_BYTES: usize = 1 << 20;
 
 impl MemNet {
-    fn listen(&self, addr: SocketAddr) -> mpsc::UnboundedReceiver<DuplexStream> {
+    pub(super) fn listen(&self, addr: SocketAddr) -> mpsc::UnboundedReceiver<DuplexStream> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.listeners
             .lock()
@@ -611,6 +615,8 @@ async fn connection(
                 tokio::spawn((script)(Call {
                     body,
                     respond,
+                    method: parts.method.clone(),
+                    uri: parts.uri.clone(),
                     nth,
                     goaway: Arc::clone(&goaway),
                 }));

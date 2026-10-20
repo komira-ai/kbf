@@ -1,0 +1,56 @@
+[package]
+name = "kbf-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The rehearsal harness as a library (docs/design/kbf-cicd.md, sections 4.2 and 4.3): the
+# farm of real `kbf` processes started from the units `kbf-deploy` renders, its
+# supervisor, certificates, metrics scraper, the Buck2 load, the result document, and
+# `kbf-beta`, the binary that runs a beta scenario (B0, `farm_under_build_load`) and
+# writes `beta-result.json`. It spawns the binaries it is given by path: a library cannot
+# use `CARGO_BIN_EXE_*`, which only the package that owns a binary may, so its callers
+# (kbf-cli's rehearsal test, the beta workflow) pass `kbf` in. It links neither
+# kbf-server nor kbf-node today; tests/layering.rs fails a crate (outside its joiners) that
+# comes to link both.
+[[bin]]
+name = "kbf-beta"
+path = "src/bin/kbf-beta.rs"
+
+# The stand-ins of beta scenario B0's tests (kbf-cli's tests/beta_b0.rs finds them beside the
+# test binary, `cargo test --workspace` builds them), in Rust like the stand-in `crun`: a
+# `buck2` that answers as Buck2 prints and logs. A test tool of this package, not of anything shipped.
+[[bin]]
+name = "kbf-harness-fake-buck2"
+path = "tests/bin/fake_buck2.rs"
+test = false
+
+# The watcher of the farm's scratch-order test (src/farm_tests.rs): polls for a marker file
+# and records that it saw it gone. A test tool of this package, built like the `buck2` above.
+[[bin]]
+name = "kbf-harness-watcher"
+path = "tests/bin/watcher.rs"
+test = false
+
+[dependencies]
+clap.workspace = true
+flate2.workspace = true
+kbf-deploy.workspace = true
+# The Buck2 summary line parser (`Commands: N (cached: N, remote: N, local: N)`).
+kbf-it.workspace = true
+kbf-testkit.workspace = true
+kbf-transfer.workspace = true
+libc.workspace = true
+rcgen = { workspace = true, features = ["x509-parser"] }
+rustix = { workspace = true, features = ["fs", "process"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# RFC 3339 timestamps of the gates' windows.
+time.workspace = true
+
+[lints]
+workspace = true

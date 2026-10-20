@@ -261,7 +261,7 @@ fn an_unmigrated_old_layout_stops_setup_before_any_step() {
         );
         let err = go(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err("refused");
         assert!(
-            matches!(&err, SetupError::OldLayout(p) if p == old),
+            matches!(&err, SetupError::OldLayout { path, .. } if path == old),
             "{err:?}"
         );
         assert_eq!(
@@ -270,6 +270,111 @@ fn an_unmigrated_old_layout_stops_setup_before_any_step() {
         );
         assert!(exec.log.is_empty(), "{old}: {:?}", exec.log);
     }
+}
+
+/// Catches a refusal that leaves the operator guessing: the message of the old-layout stop
+/// names the command that would clear it, with the fetch account of the platform (`kbf-fetch`
+/// on Linux, `_kbf-fetch` on a Mac), says the host is not accepted after it yet (today's
+/// behaviour), and the hand route that works today.
+///
+/// Mutants to plant: the fetch account the same on both platforms; `--apply` left out of the
+/// command; the hand route dropped.
+#[test]
+fn the_old_layout_refusal_names_the_command_and_the_hand_route() {
+    for (os, fetch) in [
+        (FakeOs::linux(), "--fetch-user kbf-fetch"),
+        (FakeOs::mac(), "--fetch-user _kbf-fetch"),
+    ] {
+        let mut exec = host();
+        exec.entries.insert(
+            hp("/usr/local/kbf"),
+            Entry::Dir {
+                perms: Perms::new(0o755),
+                owner: ROOT,
+            },
+        );
+        let err = go(&os, &mut exec, &raw(Mode::Daemon), APPLY).expect_err("refused");
+        let said = err.to_string();
+        assert!(
+            said.contains(&format!(
+                "kbf-installer migrate --apply {fetch} [--unit UNIT]"
+            )),
+            "{said}"
+        );
+        assert!(said.contains("komira-ai/kbf#1083"), "{said}");
+        assert!(
+            said.contains("move /usr/local/kbf and /var/lib/kbf-deploy aside by hand"),
+            "{said}"
+        );
+        assert!(!said.contains('\n'), "one line: {said}");
+    }
+}
+
+/// Catches `setup` skipping the enable of a unit an older file shadows, and so leaving a node
+/// on the old flags: a regular file at `/etc/systemd/system/<the mode's unit>` (systemd reads
+/// `/etc` before `/usr/lib`, and `setup` skips a unit that is already enabled) stops setup
+/// with exit 5 and `unit_shadow` before any step, dry run or apply, naming the file and the
+/// fix. The frontend's instance is shadowed by its template's file too. A link (what
+/// `systemctl link` makes), another mode's file, and no file are not refused.
+///
+/// Mutants to plant: the check dropped; the check on the unit name only (frontend template
+/// missed); the check refusing a link; the check refusing another mode's file; the check after
+/// the first plan is applied.
+#[test]
+fn a_regular_file_shadowing_the_packaged_unit_stops_setup_before_any_step() {
+    let cases = [
+        (Mode::StorageAndDaemon, "kbf-storage-and-daemon.service"),
+        (Mode::Daemon, "kbf-daemon.service"),
+        (Mode::Storage, "kbf-storage.service"),
+        (Mode::AllInOne, "kbf-all-in-one.service"),
+        (Mode::Frontend, "kbf-frontend@a.service"),
+        (Mode::Frontend, "kbf-frontend@.service"),
+    ];
+    for (mode, file) in cases {
+        let path = format!("/etc/systemd/system/{file}");
+        for options in [
+            APPLY,
+            Options {
+                apply: false,
+                no_start: false,
+            },
+        ] {
+            let mut exec = host();
+            put(&mut exec, &path, 0o644, ROOT, "[Service]\nExecStart=/old\n");
+            let err = go(&FakeOs::linux(), &mut exec, &raw(mode), options).expect_err("refused");
+            assert_eq!(
+                (err.exit(), err.code()),
+                (Exit::NeedsOperator, "unit_shadow"),
+                "{file}"
+            );
+            let said = err.to_string();
+            assert!(said.contains(&path), "{said}");
+            assert!(
+                said.contains("mv ") && said.contains("daemon-reload"),
+                "{said}"
+            );
+            assert!(!said.contains('\n'), "one line: {said}");
+            assert!(exec.log.is_empty(), "{file}: {:?}", exec.log);
+        }
+    }
+
+    // Not refused: a link to the packaged unit, a file of another mode, and no file at all.
+    let mut exec = host();
+    exec.entries.insert(
+        hp("/etc/systemd/system/kbf-daemon.service"),
+        Entry::Link {
+            target: "/usr/lib/systemd/system/kbf-daemon.service".into(),
+        },
+    );
+    put(
+        &mut exec,
+        "/etc/systemd/system/kbf-storage.service",
+        0o644,
+        ROOT,
+        "x",
+    );
+    go(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon), APPLY)
+        .expect("a link and another mode's file pass");
 }
 
 /// Catches the first release having a second way in: setup hands a commit to the `Fetcher`
