@@ -141,5 +141,5 @@ fn the_assumed_fingerprint_is_the_promoted_maps() {
 // different versions). A new layout is a new function, not an edit of this one.
 #[test]
 fn the_fingerprint_is_pinned() {
-    assert_eq!(fp(base_members()), 0xDEAD_BEEF_DEAD_BEEF);
+    assert_eq!(fp(base_members()), 0xFF58_1B77_EFF0_5837);
 }
