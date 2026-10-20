@@ -73,7 +73,8 @@ fn look(m: &Migration, rules: &Rules) -> Result<Look, MigrateError> {
             .push("already migrated: nothing to do".to_owned());
         return Ok(Look::Settled(report));
     }
-    let Some(old) = old::read(&m.layout, &m.roots, rules)? else {
+    let resume = journal.as_ref().is_some_and(Journal::kit_begun);
+    let Some(old) = old::read(&m.layout, &m.roots, rules, resume)? else {
         if journal.is_some() {
             return Err(MigrateError::Disagree(
                 "a migration was begun, and the old state it read is gone".to_owned(),
@@ -173,14 +174,18 @@ fn unchanged(probed: &[Option<CommitId>; 2], old: &Old) -> Result<(), MigrateErr
 /// The old layout once the services are stopped: read and judged like the looks before it
 /// (the journal is this run's own by now, and is not read), `current` and `previous` as
 /// probed, and the floor raised to what the old helper remembers now (a floor only goes up).
+///
+/// `kit` is set for a kit host, whose journal this run has written: the plist may be one an
+/// earlier run of it repointed.
 fn settle(
     m: &Migration,
     rules: &Rules,
     probed: &[Option<CommitId>; 2],
     claim: &floor::Claim,
     seeded: Seeded,
+    kit: bool,
 ) -> Result<(Old, Seeded), MigrateError> {
-    let Some(old) = old::read(&m.layout, &m.roots, rules)? else {
+    let Some(old) = old::read(&m.layout, &m.roots, rules, kit)? else {
         return Err(MigrateError::Changed("the old state is gone".to_owned()));
     };
     judge(m, &old)?;
@@ -341,7 +346,7 @@ pub fn migrate<E: Exec>(
     // run again as they were and the run ends before the installer's state, the links or the
     // units are written (the journal and the copies made are in the new tree, and a run again
     // starts from what is there).
-    let (old, seeded) = match settle(m, &rules, &probed, &claim, seeded) {
+    let (old, seeded) = match settle(m, &rules, &probed, &claim, seeded, kit) {
         Ok(settled) => settled,
         Err(error) => {
             for unit in &journal.stopped {

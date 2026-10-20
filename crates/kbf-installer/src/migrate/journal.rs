@@ -65,6 +65,11 @@ impl Journal {
         }
     }
 
+    /// A kit migration was begun and not finished: its plist may be the repointed one.
+    pub fn kit_begun(&self) -> bool {
+        self.kit && self.phase == Phase::Started
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Journal, String> {
         serde_json::from_slice(bytes).map_err(|e| e.to_string())
     }

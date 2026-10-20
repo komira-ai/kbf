@@ -2,6 +2,7 @@
 //! LaunchDaemon plist are the truth, there is no `state.json`, and the release binary is
 //! `kbf`. Docs: design section 8 ("Migration is owned by P3").
 
+use std::collections::BTreeMap;
 use std::fs;
 
 use super::kit_host::{
@@ -259,7 +260,7 @@ fn a_current_link_outside_releases_is_refused() {
     }
 }
 
-/// Catches a plist of no known form being repointed: another program, the new form with a
+/// Catches a plist of no known form being repointed: another program (in either form), the new form with a
 /// flag after the file, a plist with no argument array and one whose array never ends are
 /// each refused (exit 3) and say what the job runs.
 ///
@@ -273,6 +274,7 @@ fn a_plist_of_no_known_form_is_refused() {
         PLIST_NEW.replace("<array>", "<dict>"),
         PLIST_NEW.replace("</array>", "</dict>"),
         PLIST_NEW.replace("--mode=daemon", "serve"),
+        PLIST_OLD.replace("/usr/local/kbf/current/kbf", "/usr/local/bin/other"),
     ];
     for (n, text) in broken.iter().enumerate() {
         let mut rig = Rig::kit(&format!("plist{n}"), Platform::MacOs, Form::New);
@@ -366,5 +368,244 @@ fn a_kit_host_that_becomes_an_old_host_under_the_migration_is_changed() {
 fn the_release_binary_probed_is_kbf_on_both_platforms() {
     for platform in [Platform::Linux, Platform::MacOs] {
         assert_eq!(Roots::new(platform).binary(), "kbf");
+    }
+}
+
+/// What a finished migration leaves, to compare a resumed one with: the plist, the
+/// installer's tree and state directory, and the kit's tree.
+fn whole(rig: &Rig) -> (String, BTreeMap<String, String>, BTreeMap<String, String>) {
+    (
+        fs::read_to_string(at(&rig.host.root, PLIST_PATH)).expect("plist"),
+        rig.snapshot("usr/local/kbf-installer"),
+        rig.snapshot("usr/local/kbf"),
+    )
+}
+
+fn journal_path(rig: &Rig) -> std::path::PathBuf {
+    rig.new_state_dir().join("migration.json")
+}
+
+/// Catches a run that died after it repointed the plist leaving a host no re-run can finish:
+/// `start` fails (the plist is repointed, the journal says `started`), and the next run
+/// reads the plist as the kit's anyway, finishes (`Migrated`, links, state, journal `done`,
+/// the daemon running) and leaves exactly what an uninterrupted run leaves. Both forms.
+///
+/// Mutant seen red: the repointed form not accepted on a resume (the re-run is `UnknownPlist`).
+#[test]
+fn a_kit_run_that_died_at_the_start_is_finished_by_the_next() {
+    for form in [Form::New, Form::Old] {
+        let mut whole_run = Rig::kit(&format!("whole-{form:?}"), Platform::MacOs, form);
+        run_migrate(&mut whole_run, &never(), Mode::Apply).expect("whole");
+
+        let mut rig = Rig::kit(&format!("died-{form:?}"), Platform::MacOs, form);
+        rig.fail_start.set(true);
+        let error = run_migrate(&mut rig, &never(), Mode::Apply).expect_err("start fails");
+        assert!(
+            error.to_string().contains("planted: start failed"),
+            "{error}"
+        );
+        let repointed = plist_of(form).replace("/usr/local/kbf/current", &new_bin(&rig));
+        assert_eq!(
+            fs::read_to_string(at(&rig.host.root, PLIST_PATH)).expect("plist"),
+            repointed,
+            "the plist is repointed when the run dies"
+        );
+        assert_eq!(rig.json(&journal_path(&rig))["phase"], "started");
+        assert!(!rig.active.borrow().contains("com.komira.kbf-daemon.plist"));
+
+        rig.fail_start.set(false);
+        let report = run_migrate(&mut rig, &never(), Mode::Apply)
+            .unwrap_or_else(|e| panic!("{form:?}: {e}"));
+        assert_eq!(report.outcome, Outcome::Migrated, "{form:?}");
+        assert_eq!(rig.json(&journal_path(&rig))["phase"], "done");
+        assert!(rig.active.borrow().contains("com.komira.kbf-daemon.plist"));
+        let links = rig.new_tree().join("releases");
+        for (name, sha) in [("current", CURRENT), ("previous", PREVIOUS)] {
+            assert_eq!(
+                fs::read_link(links.join(name)).expect("link").to_str(),
+                Some(sha)
+            );
+        }
+        assert_eq!(whole(&rig), whole(&whole_run), "{form:?}");
+    }
+}
+
+/// Catches a resume that is not the same migration finished: a run that died at each step
+/// from the journal to the rewrite is simulated by rewinding a finished host by hand (the
+/// files the later steps wrote are removed, the plist is the kit's again where the rewrite
+/// had not happened, the journal says `started`); the next run must finish with the host
+/// byte for byte as the uninterrupted run left it. The points: the journal and the copies
+/// only; the state written; the links made; `status.json` written; the plist repointed.
+/// A real death at the start is the test above, and one after the stop the one below. The
+/// rig cannot fail a step between those, hence the rewind.
+///
+/// Not run as mutants: the state, the links or the status not rewritten on a resume.
+#[test]
+fn a_kit_run_that_died_at_any_step_is_finished_by_the_next() {
+    // What each point has written by then: (state, helper memory, links, status, plist).
+    let points: [(&str, [bool; 5]); 5] = [
+        ("journal", [false, false, false, false, false]),
+        ("state", [true, true, false, false, false]),
+        ("links", [true, true, true, false, false]),
+        ("status", [true, true, true, true, false]),
+        ("plist", [true, true, true, true, true]),
+    ];
+    for form in [Form::New, Form::Old] {
+        let mut rig = Rig::kit(&format!("steps-{form:?}"), Platform::MacOs, form);
+        run_migrate(&mut rig, &never(), Mode::Apply).expect("whole");
+        let finished = whole(&rig);
+        let (state, tree) = (rig.new_state_dir(), rig.new_tree());
+        let journal = fs::read_to_string(journal_path(&rig)).expect("journal");
+        for (point, [has_state, has_memory, has_links, has_status, has_plist]) in points {
+            let kept = |keep: bool, path: std::path::PathBuf| {
+                if !keep && path.symlink_metadata().is_ok() {
+                    fs::remove_file(&path).expect("rm");
+                }
+            };
+            kept(has_state, state.join("state.json"));
+            kept(has_memory, state.join("helper.json"));
+            kept(has_links, tree.join("releases/current"));
+            kept(has_links, tree.join("releases/previous"));
+            kept(has_status, state.join("status.json"));
+            if !has_plist {
+                fs::write(at(&rig.host.root, PLIST_PATH), plist_of(form)).expect("plist");
+            }
+            fs::write(
+                journal_path(&rig),
+                journal.replace("\"phase\": \"done\"", "\"phase\": \"started\""),
+            )
+            .expect("journal");
+            let report = run_migrate(&mut rig, &never(), Mode::Apply)
+                .unwrap_or_else(|e| panic!("{form:?} {point}: {e}"));
+            assert_eq!(report.outcome, Outcome::Migrated, "{form:?} {point}");
+            assert_eq!(whole(&rig), finished, "{form:?} {point}");
+        }
+    }
+}
+
+/// Catches a run that died after the services stopped and before anything was written: the
+/// plist becomes writable by others while the daemon is being stopped, so the re-read of the
+/// host (`settle`) refuses; the daemon is started again as the run ends, nothing but the
+/// journal is written, and once the plist is right the next run migrates. This is the resume
+/// of a journal whose plist is still the kit's.
+///
+/// Not run as a mutant: the services not started again on that refusal (existing code).
+#[test]
+fn a_kit_run_refused_after_the_stop_is_finished_by_the_next() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut rig = Rig::kit("settle", Platform::MacOs, Form::New);
+    let plist = at(&rig.host.root, PLIST_PATH);
+    rig.active
+        .borrow_mut()
+        .insert("com.komira.kbf-daemon.plist".to_owned());
+    let hook_plist = plist.clone();
+    rig.on_command(move |verb, _| {
+        if verb == "stop" {
+            fs::set_permissions(&hook_plist, fs::Permissions::from_mode(0o666)).expect("chmod");
+        }
+    });
+    let error = run_migrate(&mut rig, &never(), Mode::Apply).expect_err("refused");
+    assert!(error.to_string().contains("writable"), "{error}");
+    assert!(!rig.new_state_dir().join("state.json").exists());
+    assert_eq!(rig.json(&journal_path(&rig))["phase"], "started");
+    assert_eq!(fs::read_to_string(&plist).expect("plist"), PLIST_NEW);
+    assert!(rig.active.borrow().contains("com.komira.kbf-daemon.plist"));
+
+    fs::set_permissions(&plist, fs::Permissions::from_mode(0o644)).expect("chmod");
+    rig.on_command(|_, _| {});
+    let report = run_migrate(&mut rig, &never(), Mode::Apply).expect("finish");
+    assert_eq!(report.outcome, Outcome::Migrated);
+}
+
+/// Catches the repointed plist accepted without a kit migration to resume. The same host as
+/// the first test (died at the start), with the journal changed to say what it must not: an
+/// old host's migration (`kit` false), a rolled-back one, and none at all. Each is refused as
+/// `UnknownPlist` (exit 3) and the host is left as it was; with the journal back it resumes,
+/// and a finished journal is `AlreadyMigrated`.
+///
+/// Mutant seen red: the repointed form accepted whatever the journal says.
+#[test]
+fn the_repointed_plist_is_the_kits_only_with_a_kit_journal() {
+    let mut rig = Rig::kit("nojournal", Platform::MacOs, Form::New);
+    rig.fail_start.set(true);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect_err("start fails");
+    rig.fail_start.set(false);
+    let journal = fs::read_to_string(journal_path(&rig)).expect("journal");
+    let others = [
+        journal.replace("\"kit\": true", "\"kit\": false"),
+        journal.replace("\"phase\": \"started\"", "\"phase\": \"rolled_back\""),
+    ];
+    for (n, text) in others.iter().enumerate() {
+        assert_ne!(*text, journal, "{n}");
+        fs::write(journal_path(&rig), text).expect("journal");
+        let error = refused(&mut rig);
+        assert!(
+            matches!(error, MigrateError::UnknownPlist(_)),
+            "{n}: {error}"
+        );
+        assert_eq!(error.exit().code(), Exit::Refused.code());
+    }
+    fs::remove_file(journal_path(&rig)).expect("rm");
+    let error = refused(&mut rig);
+    assert!(matches!(error, MigrateError::UnknownPlist(_)), "{error}");
+
+    fs::write(journal_path(&rig), &journal).expect("journal");
+    let again = run_migrate(&mut rig, &never(), Mode::Apply).expect("resumed");
+    assert_eq!(again.outcome, Outcome::Migrated);
+    assert_eq!(
+        run_migrate(&mut rig, &never(), Mode::Apply)
+            .expect("done")
+            .outcome,
+        Outcome::AlreadyMigrated
+    );
+}
+
+/// Catches `setup`'s guard naming a half-migrated kit host wrongly: after a run that died at
+/// the start the plist is repointed, and the guard must still say the host is unmigrated
+/// (naming the kit's tree), not that the plist is of no known form.
+///
+/// Mutant seen red: `standing` reading the plist without the journal.
+#[test]
+fn a_kit_host_that_died_at_the_start_is_still_unmigrated_to_setup() {
+    let mut rig = Rig::kit("guard", Platform::MacOs, Form::Old);
+    rig.fail_start.set(true);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect_err("start fails");
+    let error = guard(&rig.layout, me()).expect_err("unmigrated");
+    assert!(
+        matches!(&error, MigrateError::Unmigrated(w) if w == "/usr/local/kbf"),
+        "{error}"
+    );
+}
+
+/// Catches a rollback after an interrupted run not putting the kit's plist back: the original
+/// is kept the first time the plist is repointed, and neither the run that died nor the one
+/// that finished it may replace it with the repointed copy. Rolled back from each (both
+/// forms) the plist is the kit's, byte for byte, and the kit's tree is as it was.
+///
+/// Not run as a mutant: the backup overwritten by the second run's rewrite.
+#[test]
+fn rolling_back_after_an_interrupted_kit_run_restores_the_kits_plist() {
+    for form in [Form::New, Form::Old] {
+        for finished in [false, true] {
+            let mut rig = Rig::kit(&format!("rb-{form:?}-{finished}"), Platform::MacOs, form);
+            let kit_tree = rig.snapshot("usr/local/kbf");
+            rig.fail_start.set(true);
+            run_migrate(&mut rig, &never(), Mode::Apply).expect_err("start fails");
+            rig.fail_start.set(false);
+            if finished {
+                run_migrate(&mut rig, &never(), Mode::Apply).expect("finish");
+            }
+            let mut m = rig.migration();
+            m.installer_unit = None;
+            let report = rollback(&m, &mut rig.host, Mode::Apply).expect("rollback");
+            assert_eq!(report.outcome, Outcome::RolledBack);
+            assert_eq!(
+                fs::read_to_string(at(&rig.host.root, PLIST_PATH)).expect("plist"),
+                plist_of(form),
+                "{form:?} finished={finished}: byte for byte"
+            );
+            assert_eq!(rig.snapshot("usr/local/kbf"), kit_tree);
+            assert!(rig.active.borrow().contains("com.komira.kbf-daemon.plist"));
+        }
     }
 }

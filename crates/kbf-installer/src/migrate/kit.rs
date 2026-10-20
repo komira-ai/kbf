@@ -63,17 +63,20 @@ fn program_arguments(plist: &str) -> Vec<String> {
         .collect()
 }
 
-/// The form of the job, or why it is none of the kit's two.
-fn form(plist: &str) -> Result<PlistForm, MigrateError> {
+/// The form of the job, or why it is none of the kit's two. The job runs `PROGRAM`, or, when
+/// `repointed` names the installer's link, that link as well: a run of this migration that
+/// died after it repointed the plist left it so (`units::rewrite`), and its journal says it.
+fn form(plist: &str, repointed: Option<&str>) -> Result<PlistForm, MigrateError> {
     let args = program_arguments(plist);
+    let is_program = |p: &str| p == PROGRAM || repointed == Some(p);
     match args
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>()
         .as_slice()
     {
-        [PROGRAM, "--mode=daemon", "--config", _file] => Ok(PlistForm::ModeFlag),
-        [PROGRAM, "daemon", ..] => Ok(PlistForm::DaemonWord),
+        [p, "--mode=daemon", "--config", _file] if is_program(p) => Ok(PlistForm::ModeFlag),
+        [p, "daemon", ..] if is_program(p) => Ok(PlistForm::DaemonWord),
         _ => Err(MigrateError::UnknownPlist(format!(
             "{PLIST} runs {args:?}, not `{PROGRAM} --mode=daemon --config <file>` or `{PROGRAM} daemon ...`"
         ))),
@@ -87,8 +90,16 @@ fn present(path: &Path) -> Result<bool, MigrateError> {
         .is_some())
 }
 
-/// Read a host with no old state: `None` when it is not a kit host.
-pub fn read(layout: &Layout, roots: &Roots, rules: &Rules) -> Result<Option<Old>, MigrateError> {
+/// Read a host with no old state: `None` when it is not a kit host. `resume` is set when the
+/// migration's journal says a kit migration began here: the plist may then already run the
+/// installer's `current/kbf`, which is what a run that died after repointing it left. Without
+/// that journal the repointed form is refused as any other.
+pub fn read(
+    layout: &Layout,
+    roots: &Roots,
+    rules: &Rules,
+    resume: bool,
+) -> Result<Option<Old>, MigrateError> {
     let path = layout.join(&roots.old_tree);
     let what = roots.old_tree.to_string();
     let Some(tree) = tree::absent(tree::open_root(&path)).map_err(MigrateError::io(&what))? else {
@@ -125,7 +136,8 @@ pub fn read(layout: &Layout, roots: &Roots, rules: &Rules) -> Result<Option<Old>
             roots.unit_dir
         )));
     };
-    let form = form(&String::from_utf8_lossy(&bytes))?;
+    let repointed = resume.then(|| format!("{}/kbf", layout.current()));
+    let form = form(&String::from_utf8_lossy(&bytes), repointed.as_deref())?;
     let old_tree = OldTree::open(layout, roots)?;
     let current = old_tree.linked("current")?;
     if current.is_none() {

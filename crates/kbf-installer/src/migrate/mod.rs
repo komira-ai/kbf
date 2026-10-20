@@ -216,15 +216,15 @@ pub fn guard(layout: &Layout, owner_uid: u32) -> Result<(), MigrateError> {
 pub fn standing(layout: &Layout, owner_uid: u32) -> Result<Vec<Unit>, MigrateError> {
     let rules = tree::Rules::release(owner_uid);
     let roots = Roots::new(layout.platform());
-    let done = newtree::StateDir::open(layout, &rules)?
+    let journal = newtree::StateDir::open(layout, &rules)?
         .map(|t| t.journal())
         .transpose()?
-        .flatten()
-        .filter(|j| j.phase == journal::Phase::Done);
-    if let Some(journal) = done {
-        return Ok(journal.units);
+        .flatten();
+    if let Some(journal) = journal.as_ref().filter(|j| j.phase == journal::Phase::Done) {
+        return Ok(journal.units.clone());
     }
-    match old::read(layout, &roots, &rules)? {
+    let resume = journal.as_ref().is_some_and(journal::Journal::kit_begun);
+    match old::read(layout, &roots, &rules, resume)? {
         None => Ok(Vec::new()),
         Some(old) if old.kit.is_some() => Err(MigrateError::Unmigrated(roots.old_tree.to_string())),
         Some(_) => Err(MigrateError::Unmigrated(roots.old_state.to_string())),

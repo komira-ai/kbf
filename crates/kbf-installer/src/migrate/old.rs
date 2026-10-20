@@ -88,16 +88,23 @@ pub struct Old {
 }
 
 /// Read the old state; `None` when the old layout has neither file (not an old host).
-pub fn read(layout: &Layout, roots: &Roots, rules: &Rules) -> Result<Option<Old>, MigrateError> {
+///
+/// `resume` is set when the journal says a kit migration began (see [`kit::read`]).
+pub fn read(
+    layout: &Layout,
+    roots: &Roots,
+    rules: &Rules,
+    resume: bool,
+) -> Result<Option<Old>, MigrateError> {
     let path = layout.join(&roots.old_state);
     let opened = tree::absent(tree::open_root(&path));
     let Some(dir) = opened.map_err(MigrateError::io(roots.old_state.to_string()))? else {
-        return kit::read(layout, roots, rules);
+        return kit::read(layout, roots, rules, resume);
     };
     let state = tree::read_file(rules, &dir, "state.json", FILE_CAP)?;
     let memory = tree::read_file(rules, &dir, "helper.json", FILE_CAP)?;
     if state.is_none() && memory.is_none() {
-        return kit::read(layout, roots, rules);
+        return kit::read(layout, roots, rules, resume);
     }
     kit::refuse_beside_state(layout, roots)?;
     let state = match state {
