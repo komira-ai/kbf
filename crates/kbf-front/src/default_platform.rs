@@ -112,3 +112,21 @@ impl Quiet {
         Some(std::mem::take(&mut state.1))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches: a value the flag prints (its default in `--help`, the golden files) that
+    /// does not parse back to the same platform, or `none` read as an OS.
+    #[test]
+    fn a_platform_prints_as_it_parses() {
+        for text in ["none", "linux/x86_64", "macos/arm64"] {
+            let parsed: DefaultPlatform = text.parse().unwrap();
+            assert_eq!(parsed.to_string(), text);
+        }
+        assert_eq!(DefaultPlatform::NONE.get(), None);
+        assert!("linux".parse::<DefaultPlatform>().is_err());
+        assert!("windows/x86_64".parse::<DefaultPlatform>().is_err());
+    }
+}
