@@ -1883,6 +1883,7 @@ dependencies = [
 name = "kbf-it"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "clap",
  "futures",
@@ -1894,6 +1895,7 @@ dependencies = [
  "kbf-deploy",
  "kbf-front",
  "kbf-installer",
+ "kbf-map",
  "kbf-objstore",
  "kbf-proto",
  "kbf-proxy",
@@ -1903,6 +1905,7 @@ dependencies = [
  "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
+ "kbf-types",
  "proc-macro2",
  "prost",
  "rcgen",
