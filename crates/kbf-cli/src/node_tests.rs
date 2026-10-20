@@ -177,7 +177,6 @@ fn the_storage_half_starts_on_the_cold_store_the_frontend_sent() {
         &node,
         &c.store,
         Driver::Container,
-        &[],
         want(names::STORAGE),
     )
     .expect("a plan");
