@@ -81,11 +81,12 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
     );
     let args = ProxyArgs {
         config: Some(path),
-        update_dir: "/srv/root-half".into(),
-        orders_dir: "/srv/orders".into(),
+        update_dir: Some("/srv/root-half".into()),
+        orders_dir: Some("/srv/orders".into()),
         check: false,
     };
-    let cfg = handover_config(&args, &loaded);
+    let (layout, _) = crate::testkit::host_root_on("places", Platform::Linux);
+    let cfg = handover_config(&args, &loaded, &layout);
     // The children's ports are the upstream table's: in a slot the operator listener is at
     // offset 2 and the admin calls at 3, slot B ten ports above slot A, all on loopback; and
     // the operator token is the one the proxy checks callers against.
@@ -118,6 +119,55 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
             1200
         )
     );
+}
+
+/// Catches `proxy` watching the Linux state directory on a Mac: without `--update-dir` and
+/// `--orders-dir` the update API's places are the layout's (the ones `setup` and the Mac
+/// provisioner write) on each platform, and the flags still win.
+#[test]
+fn the_update_apis_places_default_to_the_layouts_on_every_platform() {
+    let path = file("default-places", PROXY.as_bytes());
+    let loaded = load(&path).expect("valid");
+    let none = ProxyArgs {
+        config: Some(path.clone()),
+        check: false,
+        update_dir: None,
+        orders_dir: None,
+    };
+    for (platform, state) in [
+        (Platform::Linux, "/var/lib/kbf-installer"),
+        (Platform::MacOs, "/var/db/kbf-installer"),
+    ] {
+        let (layout, _) = crate::testkit::host_root_on("default-places-dirs", platform);
+        let cfg = handover_config(&none, &loaded, &layout);
+        assert_eq!(
+            cfg.status_file,
+            PathBuf::from(format!("{state}/status.json")),
+            "{platform:?}"
+        );
+        assert_eq!(
+            cfg.orders_dir,
+            PathBuf::from(format!("{state}/orders")),
+            "{platform:?}"
+        );
+        assert_eq!(
+            none.update_dir_in(&layout).to_str(),
+            Some(layout.update_dir().as_str())
+        );
+        assert_eq!(
+            none.orders_dir_in(&layout).to_str(),
+            Some(layout.orders_dir().as_str())
+        );
+        let given = ProxyArgs {
+            config: Some(path.clone()),
+            check: false,
+            update_dir: Some("/srv/u".into()),
+            orders_dir: Some("/srv/o".into()),
+        };
+        let cfg = handover_config(&given, &loaded, &layout);
+        assert_eq!(cfg.status_file, PathBuf::from("/srv/u/status.json"));
+        assert_eq!(cfg.orders_dir, PathBuf::from("/srv/o"));
+    }
 }
 
 /// Catches each way a file is refused being accepted, or refused without its path and its
@@ -418,8 +468,8 @@ fn check_stops_at_the_table_and_a_run_needs_its_socket() {
     let path = file("run", PROXY.as_bytes());
     let args = |check| ProxyArgs {
         config: Some(path.clone()),
-        update_dir: path.with_file_name("update"),
-        orders_dir: path.with_file_name("orders"),
+        update_dir: Some(path.with_file_name("update")),
+        orders_dir: Some(path.with_file_name("orders")),
         check,
     };
     assert_eq!(run(&args(true), Path::new("/")), Ok(()));
@@ -439,8 +489,8 @@ fn a_root_that_is_not_absolute_is_a_usage_error() {
     let path = file("rel-root", PROXY.as_bytes());
     let args = ProxyArgs {
         config: Some(path.clone()),
-        update_dir: path.with_file_name("update"),
-        orders_dir: path.with_file_name("orders"),
+        update_dir: Some(path.with_file_name("update")),
+        orders_dir: Some(path.with_file_name("orders")),
         check: false,
     };
     let result = run(&args, Path::new("relative"));
@@ -827,8 +877,8 @@ fn proxy_reads_the_installer_toml_setup_wrote_on_the_platform() {
     let args = |config| ProxyArgs {
         config,
         check: true,
-        update_dir: "/nonexistent".into(),
-        orders_dir: "/nonexistent/orders".into(),
+        update_dir: Some("/nonexistent".into()),
+        orders_dir: Some("/nonexistent/orders".into()),
     };
     assert_eq!(
         config_path(&args(None), Platform::Linux),
@@ -902,8 +952,8 @@ fn check_refuses_a_file_without_a_database() {
     let args = ProxyArgs {
         config: Some(path),
         check: true,
-        update_dir: "/nonexistent".into(),
-        orders_dir: "/nonexistent/orders".into(),
+        update_dir: Some("/nonexistent".into()),
+        orders_dir: Some("/nonexistent/orders".into()),
     };
     assert!(usage_of(run(&args, Path::new("/"))).contains("state database"));
 }

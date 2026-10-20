@@ -4,6 +4,7 @@
 //! The permit rule (design note section 5): a stream binds to the slot active when its
 //! headers arrived and keeps the permit until both upstream halves are finished.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use h2::{Reason, RecvStream};
@@ -67,6 +68,7 @@ pub(crate) async fn proxy_child(
     target: Target,
     request: Request<Incoming>,
     identity: Option<Identity>,
+    client: IpAddr,
 ) -> Response<ProxyBody> {
     let grpc = target != Target::Operator;
     let Some(count) = core.enter_stream() else {
@@ -76,8 +78,16 @@ pub(crate) async fn proxy_child(
     let (parts, body) = request.into_parts();
     let mut headers = parts.headers;
     // Strips every inbound `x-kbf-*`, then sets the secret and, with a certificate, the
-    // identity. A node id that cannot be a header value never reaches the child as one.
-    if forward_headers(&mut headers, identity.as_ref(), &core.security.secret).is_err() {
+    // identity and the client's address (the proxy's own reading of the connection, never a
+    // header). A node id that cannot be a header value never reaches the child as one.
+    if forward_headers(
+        &mut headers,
+        identity.as_ref(),
+        Some(client),
+        &core.security.secret,
+    )
+    .is_err()
+    {
         return refused(grpc, AuthRefusal::PermissionDenied);
     }
     let path = parts.uri.path().to_owned();

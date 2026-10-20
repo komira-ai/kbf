@@ -434,3 +434,22 @@ fn the_registered_nodes_gate_flushes_everything_and_says_the_map_it_holds() {
     holder.offer(map_of(6, &[7, 8]));
     assert_eq!(gate.generation(), Some(6));
 }
+
+/// Catches: a round that does not ask the cache for its tier's health (the beat would say
+/// nothing, or a value kept from before), and a cache with no tier read as numbers: the
+/// node here has no tier, so after a round the beat's health is unknown, even when a test
+/// had set values before it.
+#[tokio::test]
+async fn a_round_reports_the_tier_health_the_cache_says() {
+    use crate::vitals::Vitals;
+
+    let mut n = node().await;
+    assert_eq!(n.fill.beat().vitals, Vitals::NONE, "before any round");
+    n.fill.tiered(Vitals {
+        used_bytes: Some(9),
+        ..Vitals::NONE
+    });
+    assert_eq!(n.fill.beat().vitals.used_bytes, Some(9));
+    n.round(&CatchUp::caught_up()).await;
+    assert_eq!(n.fill.beat().vitals, Vitals::NONE, "a cache with no tier");
+}

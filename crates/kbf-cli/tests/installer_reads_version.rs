@@ -45,3 +45,52 @@ fn the_installer_parses_what_kbf_prints() {
     }
     assert_eq!(parsed.platform, None);
 }
+
+/// The installer refuses a release that declares a `protocol`, `min_protocol` or
+/// `state_schema` above the numbers it understands (`installer_too_old`), and it is put on a
+/// host by hand, never updated by a release. So the numbers `kbf --version --json` declares
+/// must never pass those the installer of the same build understands: the day the worker
+/// protocol moves on, this fails until the installer's numbers move with it (decision D3:
+/// they are the lead's to raise).
+///
+/// Catches a protocol bump or a `min_protocol` raise that would leave every host's installer
+/// refusing the next release as too old. Those two numbers are the real pin: the installer
+/// cannot link `kbf-server`, so `supported()` holds them as literals and this test is where
+/// they meet the server's.
+///
+/// `state_schema` is weaker. `kbf --version --json` and `supported()` both read
+/// `kbf_state::postgres::schema::latest()` in the same build, so a new migration moves both
+/// together and that line cannot go red for it. It only catches `supported()` being changed to
+/// a number below `latest()`.
+///
+/// Mutants planted: `kbf_installer::stage::supported()` with `protocol: 0` (red on the
+/// protocol line); with `state_schema: 0` (red on the schema line); the server's
+/// `PROTOCOL_VERSION` raised to 2 (red on the protocol line).
+#[test]
+fn the_installer_understands_what_kbf_declares() {
+    let said = kbf_cli::version::identity();
+    let num = |k: &str| {
+        said[k]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{k} is a number"))
+    };
+    let understood = kbf_installer::stage::supported();
+    assert!(
+        understood.protocol >= num("protocol"),
+        "kbf speaks protocol {}, the installer understands {}",
+        num("protocol"),
+        understood.protocol
+    );
+    assert!(
+        understood.min_protocol >= num("min_protocol"),
+        "kbf's oldest protocol is {}, the installer understands {}",
+        num("min_protocol"),
+        understood.min_protocol
+    );
+    assert!(
+        understood.state_schema >= num("state_schema"),
+        "kbf embeds schema {}, the installer understands {}",
+        num("state_schema"),
+        understood.state_schema
+    );
+}

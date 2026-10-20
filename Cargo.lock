@@ -2327,6 +2327,7 @@ dependencies = [
 name = "kbf-sim-cell"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "kbf-caps",
  "kbf-daemon",
  "kbf-front",
