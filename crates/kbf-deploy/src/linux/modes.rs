@@ -36,8 +36,6 @@
 //!   `CPUQuota=` or `AllowedCPUs=` and no `MemorySwapMax=` on its unit (its leases live in
 //!   the unit's cgroup), and an `OOMScoreAdjust=` below 0, the containers' score
 //!   ([`super::limits`]).
-//! - `meta-dir`: the metadata directory of `storage-and-daemon` and `all-in-one` is not
-//!   under `--data-dir` ([`super::stores`]).
 //! - `credential`: the units of a mode without a storage half (`daemon`, `all-in-one`)
 //!   do not give it the cold store's key; [`super::credential`] says what the rule reads
 //!   and what it cannot see. The unit that holds the key (`storage`) runs as a user of
@@ -204,13 +202,6 @@ impl Mode {
     #[must_use]
     pub fn holds_key(self) -> bool {
         self == Mode::Storage
-    }
-
-    /// Whether the mode's unit gives both a metadata directory and the daemon's data
-    /// directory (rule `meta-dir`).
-    #[must_use]
-    pub fn has_meta_and_data(self) -> bool {
-        matches!(self, Mode::StorageAndDaemon | Mode::AllInOne)
     }
 
     /// The unit's file name: `kbf-<mode>.service`, and for the frontend the template
@@ -746,13 +737,6 @@ fn rules(
         let exact = mode.holds_key_beside_builds();
         for how in stores::storage(unit, &key_file(config), exact) {
             fail("storage", format!("{name} {how}"));
-        }
-    }
-
-    // meta-dir
-    if mode.has_meta_and_data() {
-        for how in stores::meta_dir(unit) {
-            fail("meta-dir", format!("{name} {how}"));
         }
     }
 
