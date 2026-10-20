@@ -118,8 +118,18 @@ impl Fx {
     }
 
     fn tag_with(&self, sha: &str, tag: &str, extra: &[&str]) -> (Option<i32>, String, String) {
+        self.tag_in(REPO, sha, tag, extra)
+    }
+
+    fn tag_in(
+        &self,
+        repo: &str,
+        sha: &str,
+        tag: &str,
+        extra: &[&str],
+    ) -> (Option<i32>, String, String) {
         let out = Command::new(XTASK)
-            .args(["release", "tag", "--repo", REPO, "--sha", sha, "--tag", tag])
+            .args(["release", "tag", "--repo", repo, "--sha", sha, "--tag", tag])
             .arg("--message-file")
             .arg(self.root.join("message"))
             .arg("--gh")
@@ -249,6 +259,19 @@ fn git_ending_the_message_with_a_line_end_is_the_same_message() {
     fx.existing("v0.0.2", SHA, MESSAGE.trim_end(), BOT_LOGIN);
     let (code, _, err) = fx.tag("v0.0.2");
     assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
+fn a_message_differing_only_by_trailing_cr_or_spaces_is_another_message() {
+    // Catches: the comparison trimming all trailing whitespace, so a tag whose message
+    // gained a `\r` or spaces is adopted as the one this run would make.
+    for (name, tail) in [("cr", "\r"), ("spaces", "  ")] {
+        let fx = fx(&format!("trailing-{name}"));
+        fx.github(&["v0.0.2"], &[("v0.0.2", SHA, "identical")]);
+        let stored = format!("{}{tail}", MESSAGE.trim_end());
+        fx.existing("v0.0.2", SHA, &stored, BOT_LOGIN);
+        refused(&fx, "another message");
+    }
 }
 
 /// A tag that exists but is not what this run would make; the highest tag, so only the
@@ -545,4 +568,27 @@ fn the_tagger_check_reads_the_tag_and_compares_the_login() {
     )]);
     let err = check_tagger(&gh, REPO, "v0.0.3", BOT_LOGIN).unwrap_err();
     assert!(err.to_string().contains("is lightweight"), "{err}");
+}
+
+#[test]
+fn a_repo_that_is_not_owner_slash_name_is_refused_before_anything_is_asked() {
+    // Catches: --repo spliced into an API path unchecked (`../x`, a second slash, a space).
+    let fx = fx("bad-repo");
+    for bad in [
+        "",
+        "kbf",
+        "/kbf",
+        "komira-ai/",
+        "a/b/c",
+        "../x",
+        "a/..",
+        "./x",
+        "a b/c",
+        "a/b c",
+    ] {
+        let (code, _, err) = fx.tag_in(bad, SHA, "v0.0.2", &[]);
+        assert_eq!(code, Some(2), "{bad:?}: {err}");
+        assert!(err.contains("--repo"), "{err}");
+    }
+    assert_eq!(fx.gh_args(), "");
 }

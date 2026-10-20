@@ -275,8 +275,25 @@ fn settle(w: &Want) -> Result<bool, Error> {
     }
 }
 
+/// Whether `repo` is `<owner>/<name>`, each part of `[A-Za-z0-9._-]` and neither `.` nor `..`.
+fn is_repo(repo: &str) -> bool {
+    let part = |p: &str| {
+        !matches!(p, "" | "." | "..")
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    repo.split_once('/')
+        .is_some_and(|(owner, name)| part(owner) && part(name))
+}
+
 /// The `release tag` verb: the lines to print.
 pub fn run(a: &TagArgs) -> Result<Vec<String>, Error> {
+    if !is_repo(&a.repo) {
+        return Err(Error::Usage(format!(
+            "--repo {:?} is not <owner>/<name>",
+            a.repo
+        )));
+    }
     full_commit("--sha", &a.sha)?;
     if Version::parse_tag(&a.tag).is_none() {
         return Err(Error::Usage(format!(
