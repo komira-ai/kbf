@@ -45,6 +45,8 @@ futures.workspace = true
 hex.workspace = true
 httparse.workspace = true
 hyper.workspace = true
+# `deploy --offer` reads `offer.json` through the gate library's validated type.
+kbf-gate.workspace = true
 kbf-host.workspace = true
 kbf-proxy.workspace = true
 kbf-proto.workspace = true
