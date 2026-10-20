@@ -589,3 +589,38 @@ async fn a_block_is_as_old_as_its_first_blob() {
     let report = cache.flush_report().await.expect("report");
     assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 1));
 }
+
+/// Catches: a restart losing the dates of what is staged and then claiming the held
+/// generation: the objects a process finds at its start were staged by an earlier one, at
+/// a generation it cannot tell, so they hold the clear generation at 0 until flushed.
+#[tokio::test]
+async fn objects_found_at_a_restart_hold_the_clear_generation_at_zero() {
+    let farm = Farm::new(Default::default());
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(OneFlusher::new(Node::new(1, &solo(5)) as _));
+    cache
+        .store_blobs(vec![big(1).verified()])
+        .await
+        .expect("stored");
+    assert_eq!(
+        cache.flush_report().await.expect("report").clear_gen,
+        Some(5)
+    );
+    drop(cache);
+    let fs = farm.fs.restart();
+    let (cache, startup) = support::start(&fs, &farm.log, &farm.store, GIB, None)
+        .await
+        .expect("restart");
+    assert_eq!(startup.recovery.sealed.len(), 1, "{startup:?}");
+    let cache = cache.with_flush_gate(OneFlusher::new(Node::new(1, &solo(9)) as _));
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(0), 1));
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed.len(), 1);
+    assert_eq!(
+        cache.flush_report().await.expect("report").clear_gen,
+        Some(9)
+    );
+}
