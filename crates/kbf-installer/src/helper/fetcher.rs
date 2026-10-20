@@ -5,12 +5,12 @@
 //! directory is not proof) and changes nothing else until it returns. A frontend's
 //! `frontend_update` calls it too, with no components: the source is the installer's own.
 //!
-//! The real fetcher (the unprivileged fetch child and the checks of
-//! `docs/design/pull-updates.md` 7.1 and 7.2) is wired in by a later change; until then
-//! the binary uses [`NotWired`], which refuses, so an activation of a commit that is not
-//! installed is refused with that reason and nothing is fetched.
+//! The real fetcher is [`fetcher_real::RealFetcher`](super::fetcher_real::RealFetcher): the
+//! unprivileged fetch child and the verify pipeline behind this trait. The binary does not
+//! build one yet; until it does it uses [`NotWired`], which refuses, so an activation of a
+//! commit that is not installed is refused with that reason and nothing is fetched.
 
-use kbf_update::Locator;
+use kbf_update::{Facts, Locator};
 
 use crate::CommitId;
 
@@ -39,10 +39,13 @@ pub struct InstalledRelease {
 /// Why a release was not installed. Nothing but scratch has changed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FetchError {
-    /// The source could not be reached or ended early.
+    /// The release could not be had, and nothing says it is bad: the source could not be
+    /// reached or ended early, said it will not describe the release or described it
+    /// unusably, or the host had no room or could not do the work.
     #[error("fetch: {0}")]
     Unavailable(String),
     /// What arrived failed a check (size, digest, attestation, shape, the binary's report).
+    /// The message starts with the contract's refusal word and a colon (`hash: ...`).
     #[error("fetch: rejected: {0}")]
     Rejected(String),
     /// This build has no fetcher.
@@ -51,12 +54,40 @@ pub enum FetchError {
 }
 
 /// Pulls and installs a release.
+///
+/// Both forms are required, so that no implementor (a decorator, a test double, a merge that
+/// adds one) can answer an activation in the form that checks none of the order's facts:
+///
+/// ```compile_fail,E0046
+/// use kbf_installer::helper::fetcher::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
+///
+/// struct OnlyFetch;
+///
+/// impl Fetcher for OnlyFetch {
+///     fn fetch(&self, _: &ReleaseLocator) -> Result<InstalledRelease, FetchError> {
+///         Err(FetchError::NotWired)
+///     }
+/// }
+/// ```
 pub trait Fetcher {
     /// Fetch, verify and install the release `rec` names into its directory under
     /// `releases/`. Never moves `current` or `previous`, and never writes the state: the
     /// caller that keeps the release records it (`staged` for a frontend update, `current`
     /// for an activation), so a release it then refuses leaves nothing behind in the state.
+    /// This is the frontend's own update: the order carries no facts to compare with, so
+    /// only the commit and the release profile are checked of what the binary declares.
     fn fetch(&self, rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError>;
+
+    /// [`Fetcher::fetch`] for a node's `activate`, whose order also carries the facts the
+    /// release must declare about itself (`expected`): a release that declares others is not
+    /// installed. The cycle compares what comes back with the order's claims before a link
+    /// moves either way, but a fetcher that ignores `expected` would install a release the
+    /// order never described, so an implementor says what it does with them.
+    fn fetch_activation(
+        &self,
+        rec: &ReleaseLocator,
+        expected: &Facts,
+    ) -> Result<InstalledRelease, FetchError>;
 }
 
 /// The fetcher of a build that has none: every fetch is refused.
@@ -64,6 +95,14 @@ pub struct NotWired;
 
 impl Fetcher for NotWired {
     fn fetch(&self, _rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError> {
+        Err(FetchError::NotWired)
+    }
+
+    fn fetch_activation(
+        &self,
+        _rec: &ReleaseLocator,
+        _expected: &Facts,
+    ) -> Result<InstalledRelease, FetchError> {
         Err(FetchError::NotWired)
     }
 }
@@ -76,6 +115,8 @@ pub(crate) mod fake {
     use std::fs;
     use std::sync::{Arc, Mutex};
 
+    use kbf_update::Facts;
+
     use super::{FetchError, Fetcher, InstalledRelease, ReleaseLocator};
     use crate::layout::Layout;
 
@@ -86,6 +127,8 @@ pub(crate) mod fake {
     pub struct FakeFetcher {
         layout: Layout,
         pub calls: Arc<Mutex<Vec<ReleaseLocator>>>,
+        /// The facts each `fetch_activation` was given, in order (a plain `fetch` adds none).
+        pub expected: Arc<Mutex<Vec<Facts>>>,
         /// What the next fetches do; `None` installs and reports `report`.
         pub fail: Arc<Mutex<Option<FetchError>>>,
         /// Changes the report of the installed release (a binary that says other things).
@@ -97,6 +140,7 @@ pub(crate) mod fake {
             Self {
                 layout: layout.clone(),
                 calls: Arc::default(),
+                expected: Arc::default(),
                 fail: Arc::default(),
                 tamper: Arc::default(),
             }
@@ -136,6 +180,15 @@ pub(crate) mod fake {
                 change(&mut report);
             }
             Ok(report)
+        }
+
+        fn fetch_activation(
+            &self,
+            rec: &ReleaseLocator,
+            expected: &Facts,
+        ) -> Result<InstalledRelease, FetchError> {
+            self.expected.lock().expect("lock").push(expected.clone());
+            self.fetch(rec)
         }
     }
 }

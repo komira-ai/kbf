@@ -163,8 +163,8 @@ struct Link {
     /// The `os` and `arch` its newest `Hello` reported (empty if it named none).
     os: String,
     arch: &'static str,
-    /// The version its first `Hello` named, the one `Welcome` answered (`None` if it
-    /// named none). Like the link, it is the newest stream's: a daemon that returns on
+    /// The version `Welcome` named for its first `Hello`: the lesser of the `Hello`'s and
+    /// the server's newest (`None` if the `Hello` named none). Like the link, it is the newest stream's: a daemon that returns on
     /// another version replaces it, and a `Hello` resent on the stream does not.
     protocol: Option<u32>,
 }

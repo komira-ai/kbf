@@ -9,7 +9,7 @@
 //! claims (a `frontend_update` is a locator and nothing else), and no other or repeated key
 //! is accepted.
 
-use kbf_update::{Locator, OrderRecord, RecordError, Verb as RecordVerb};
+use kbf_update::{Facts, Locator, OrderRecord, RecordError, Verb as RecordVerb};
 
 use crate::CommitId;
 
@@ -43,6 +43,19 @@ pub struct Claims {
     pub min_protocol: u32,
     pub state_schema: u32,
     pub profile: String,
+}
+
+impl Claims {
+    /// The facts the release is expected to declare, as the record wrote them.
+    pub fn facts(&self) -> Facts {
+        Facts {
+            platform: self.platform.clone(),
+            protocol: self.protocol,
+            min_protocol: self.min_protocol,
+            state_schema: self.state_schema,
+            profile: self.profile.clone(),
+        }
+    }
 }
 
 /// A checked order.

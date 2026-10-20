@@ -111,6 +111,7 @@ use crate::report::NodeReport;
 use crate::runtimes::Runtimes;
 use crate::status::{DriverReport, Software};
 use crate::update_link::UpdateLink;
+use crate::welcome;
 use crate::window::StartWindow;
 
 /// The `kbf.worker.v1` protocol version this daemon speaks.
@@ -871,9 +872,15 @@ impl Daemon {
                 "the first server message is not Welcome".into(),
             ));
         };
-        if w.protocol_version != PROTOCOL_VERSION {
+        let oldest = welcome::OLDEST_PROTOCOL_VERSION;
+        if !welcome::acceptable(
+            w.protocol_version,
+            oldest,
+            PROTOCOL_VERSION,
+            PROTOCOL_VERSION,
+        ) {
             return Err(SessionError::Protocol(format!(
-                "server speaks protocol version {}, this daemon {PROTOCOL_VERSION}",
+                "server speaks protocol version {}, this daemon {oldest} to {PROTOCOL_VERSION}",
                 w.protocol_version
             )));
         }

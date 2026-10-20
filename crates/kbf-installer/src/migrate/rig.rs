@@ -76,6 +76,8 @@ pub struct Rig {
     /// How long the migration waits for each lock ([`Migration::lock_wait`]); long, so that a
     /// test which holds a lock for a moment is waited out.
     pub lock_wait: Duration,
+    /// A host the Mac kit installed: it has no old helper, so the migration names none.
+    pub kit: bool,
 }
 
 pub fn put(path: &Path, bytes: &str, mode: u32) {
@@ -87,6 +89,18 @@ pub fn put(path: &Path, bytes: &str, mode: u32) {
 impl Rig {
     pub fn linux(name: &str) -> Rig {
         Rig::new(name, Platform::Linux)
+    }
+
+    /// A host the Mac kit installed (`testdata/kit_host/`), the job in `form`, running: the
+    /// tree, the plist and `kbf.toml` as the kit leaves them, and no old state.
+    pub fn kit(name: &str, platform: Platform, form: super::kit_host::Form) -> Rig {
+        let mut rig = Rig::bare(&format!("kit-{name}"), platform);
+        super::kit_host::lay_out(&rig.host.root, form);
+        rig.kit = true;
+        rig.active
+            .borrow_mut()
+            .insert("com.komira.kbf-daemon.plist".to_owned());
+        rig
     }
 
     pub fn mac(name: &str) -> Rig {
@@ -187,6 +201,7 @@ impl Rig {
             fail_start,
             on_command,
             lock_wait: Duration::from_secs(20),
+            kit: false,
         }
     }
 
@@ -208,7 +223,7 @@ impl Rig {
     }
 
     pub fn binary(&self) -> &'static str {
-        self.roots().binary()
+        self.roots().binary(self.kit, false)
     }
 
     pub fn new_state_dir(&self) -> PathBuf {
@@ -313,7 +328,7 @@ impl Rig {
             },
             owner_uid: me(),
             units: vec![self.daemon()],
-            helper_unit: Some(self.helper()),
+            helper_unit: (!self.kit).then(|| self.helper()),
             installer_unit: Some(match self.platform {
                 Platform::Linux => unit("kbf-installer.service"),
                 Platform::MacOs => unit("com.komira.kbf-installer.plist"),
@@ -423,6 +438,11 @@ impl OldHand {
 /// What `kbf --version --json` of the build in the directory the program is in says, as
 /// that directory's commit's release build.
 fn probe_answer(spawn: &Spawn) -> io::Result<crate::run::Ran> {
+    // A program that is not there cannot be run: a probe of a name the release does not hold
+    // fails here as it does on a host.
+    if !spawn.program.exists() {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
+    }
     let commit = spawn
         .program
         .parent()
@@ -540,8 +560,8 @@ impl Rig {
 
     /// A macOS test-farm host: the same releases with `kbf-daemon`, and the daemon's
     /// LaunchDaemon plist as `kbf-mac-provision` renders it.
-    pub fn testfarm_mac() -> Rig {
-        let rig = Rig::bare("testfarm-mac", Platform::MacOs);
+    pub fn testfarm_mac(name: &str) -> Rig {
+        let rig = Rig::bare(&format!("testfarm-mac-{name}"), Platform::MacOs);
         rig.farm_releases("kbf-daemon");
         put(
             &rig.at("Library/LaunchDaemons/org.example.kbf-daemon.plist"),

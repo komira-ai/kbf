@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use super::api::traits::InstallerStatus;
 use super::model::{Locator, PortError, StagedFacts};
 use super::orders::OrderSpool;
-use super::ports::RootOrders;
+use super::ports::{RootOrders, StatusFacts};
 use crate::CommitId;
 
 /// The most bytes of `status.json` that are read. The writer's file is a few hundred bytes;
@@ -50,10 +50,40 @@ impl SpoolRootOrders {
             status: status.into(),
         }
     }
+}
 
-    fn read(&self) -> Result<Option<InstallerStatus>, PortError> {
-        read_status(&self.status)
+/// The facts of `status.json` and nothing else: what the proxy's start reads before any order
+/// spool exists. The reads are those of [`SpoolRootOrders`].
+pub struct StatusFile {
+    status: PathBuf,
+}
+
+impl StatusFile {
+    /// The facts of the status file at `status`.
+    #[must_use]
+    pub fn new(status: impl Into<PathBuf>) -> StatusFile {
+        StatusFile {
+            status: status.into(),
+        }
     }
+}
+
+impl StatusFacts for StatusFile {
+    fn staged(&self) -> Result<Option<StagedFacts>, PortError> {
+        staged_facts(&self.status)
+    }
+
+    fn installed(&self) -> Result<Option<CommitId>, PortError> {
+        installed_commit(&self.status)
+    }
+}
+
+/// The `staged{}` facts of the `status.json` at `path`, joined with `staged_commit`.
+///
+/// # Errors
+/// As [`installed_commit`].
+fn staged_facts(path: &Path) -> Result<Option<StagedFacts>, PortError> {
+    Ok(read_status(path)?.and_then(|status| status.staged_facts()))
 }
 
 /// The root half's `status.json` at `path`, whole; `None` when there is no file. Errors as
@@ -98,7 +128,7 @@ impl RootOrders for SpoolRootOrders {
     }
 
     fn staged(&self) -> Result<Option<StagedFacts>, PortError> {
-        Ok(self.read()?.and_then(|status| status.staged_facts()))
+        staged_facts(&self.status)
     }
 
     fn installed(&self) -> Result<Option<CommitId>, PortError> {
