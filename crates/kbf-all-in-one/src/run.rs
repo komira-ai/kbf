@@ -364,14 +364,11 @@ mod tests {
         );
     }
 
-    /// Catches `with_draining_daemon` not draining on a signal or not stopping the half
-    /// beside the daemon after it: a daemon half started as `kbf storage-and-daemon`
-    /// starts it, with a SIGTERM sent to this process, returns `Ok` and the half beside it
-    /// has stopped. A start the daemon refuses is its error.
+    /// The flags of a daemon half on the fake driver, with certificates it can read, in a
+    /// directory of `name`, removed when the first returned drops.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_signal_drains_the_daemon_half_and_then_stops_the_half_beside_it() {
-        let dir = crate::one_cache::under_target("draining-daemon");
+    fn fake_daemon(name: &str) -> (kbf_testkit::dir::TestDir, kbf_node::Cli) {
+        let dir = crate::one_cache::under_target(name);
         let at = |name: &str| dir.join(name);
         let ca = rcgen::CertifiedIssuer::self_signed(
             rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params"),
@@ -397,6 +394,17 @@ mod tests {
             format!("--data-dir={}", at("data").display()),
         ])
         .expect("the daemon's flags");
+        (dir, cli)
+    }
+
+    /// Catches `with_draining_daemon` not draining on a signal or not stopping the half
+    /// beside the daemon after it: a daemon half started as `kbf storage-and-daemon`
+    /// starts it, with a SIGTERM sent to this process, returns `Ok` and the half beside it
+    /// has stopped. A start the daemon refuses is its error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_signal_drains_the_daemon_half_and_then_stops_the_half_beside_it() {
+        let (_dir, cli) = fake_daemon("draining-daemon");
         let tokio = Runtime::new().expect("runtime");
         // Installed before the signal is sent: one that arrives before the daemon half
         // serves is kept, as in the deployed mode where the storage half starts first.
@@ -426,16 +434,55 @@ mod tests {
             "the half beside it stopped"
         );
 
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let serving = Box::pin(async move {
-            let _ = stopped.await;
-            Ok(())
-        });
+        let (stop, _stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = Box::pin(std::future::pending());
         let refused: Starter = Box::new(|_| Err("no scratch".into()));
         let failed = with_draining_daemon(&tokio, serving, stop, refused, install(), &cli);
         assert_eq!(
             failed.expect_err("refused").said("storage"),
             "daemon: no scratch"
+        );
+    }
+    /// Catches a daemon half that goes on serving after the half beside it stopped on its
+    /// own (`with_draining_daemon` not firing the daemon's `other`): no signal is sent, the
+    /// half beside it fails after a moment, and the daemon half stops at once and the
+    /// failure is reported as the half's (`the storage half stopped`, not a clean exit).
+    /// The call runs on a thread the test waits on for 30 s, so a daemon that serves on
+    /// fails here instead of hanging the run. Mutant: `other_ended` never awaited.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_half_that_stops_on_its_own_stops_the_daemon_half_and_is_reported() {
+        let (_dir, cli) = fake_daemon("half-stops");
+        let (ended, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let tokio = Runtime::new().expect("runtime");
+            let signals = {
+                let _context = tokio.enter();
+                kbf_node::Signals::install().expect("handlers")
+            };
+            let (stop, _stopped) = tokio::sync::oneshot::channel::<()>();
+            let addr = "127.0.0.1:1".parse().expect("addr");
+            let serving = Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Err(ServeError::Bind {
+                    addr,
+                    source: std::io::Error::other("in use"),
+                })
+            });
+            let start: Starter = Box::new(|cli| {
+                kbf_node::start_with::<LocalDataPlane>(cli, |_| Err("no plane".into()))
+            });
+            let served = with_draining_daemon(&tokio, serving, stop, start, signals, &cli);
+            ended
+                .send(served.expect_err("the half failed").said("storage"))
+                .ok();
+        });
+        let said = result
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the daemon half stopped with the half beside it");
+        assert!(
+            said.starts_with("the storage half stopped: bind 127.0.0.1:1"),
+            "{said}"
         );
     }
 }
