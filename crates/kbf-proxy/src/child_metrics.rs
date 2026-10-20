@@ -8,6 +8,12 @@
 //! body over [`MAX_BYTES`], no complete answer within [`DEADLINE`]) it gives nothing, the
 //! proxy's own series are served alone, and the failure is counted in
 //! `kbf_proxy_child_metrics_failed_total`.
+//!
+//! The body is filtered before it is appended ([`filter`]): the proxy is the only author of
+//! `kbf_proxy_*`, so a child's sample, `# HELP`, `# TYPE` or `# UNIT` line for such a name is
+//! dropped (it would duplicate or contradict the proxy's own), and so is a `# EOF` line (it
+//! would end the scrape before the proxy's series). A body that is not UTF-8 is not text to
+//! append: nothing is appended and it counts as a failure.
 
 use std::time::Duration;
 
@@ -25,16 +31,53 @@ pub(crate) const MAX_BYTES: usize = 4 << 20;
 /// The whole fetch, connect to last byte.
 pub(crate) const DEADLINE: Duration = Duration::from_secs(2);
 
-/// The child's `/metrics` body, or nothing (counted as a failure).
-pub(crate) async fn fetch(core: &Core, authorization: Option<HeaderValue>) -> Option<Vec<u8>> {
+/// The prefix of every series the proxy owns.
+const OWN_PREFIX: &str = "kbf_proxy_";
+
+/// The child's `/metrics` body without the proxy's series and `# EOF`, or nothing (counted
+/// as a failure).
+pub(crate) async fn fetch(core: &Core, authorization: Option<HeaderValue>) -> Option<String> {
     let body = tokio::time::timeout(DEADLINE, ask(core, authorization))
         .await
         .ok()
-        .flatten();
+        .flatten()
+        .and_then(|bytes| filter(bytes).ok());
     if body.is_none() {
         Metrics::inc(&core.metrics.child_metrics_failed);
     }
     body
+}
+
+/// `body` as lines, each ending in a newline, minus the lines the child may not speak for;
+/// `Err` when it is not UTF-8.
+fn filter(body: Vec<u8>) -> Result<String, std::string::FromUtf8Error> {
+    let body = String::from_utf8(body)?;
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        if line.trim() == "# EOF" || names_own_series(line) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Whether `line` is a sample, or a `# HELP`/`# TYPE`/`# UNIT` line, for a `kbf_proxy_` name.
+fn names_own_series(line: &str) -> bool {
+    let line = line.trim_start();
+    let name = match line.strip_prefix('#') {
+        Some(comment) => {
+            let comment = comment.trim_start();
+            ["HELP", "TYPE", "UNIT"]
+                .iter()
+                .find_map(|word| comment.strip_prefix(word))
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+                .map_or("", str::trim_start)
+        }
+        None => line,
+    };
+    name.starts_with(OWN_PREFIX)
 }
 
 async fn ask(core: &Core, authorization: Option<HeaderValue>) -> Option<Vec<u8>> {
@@ -73,4 +116,41 @@ async fn ask(core: &Core, authorization: Option<HeaderValue>) -> Option<Vec<u8>>
     }
     drop(permit);
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter, names_own_series};
+
+    #[test]
+    fn own_series_are_samples_and_metadata_lines_with_the_prefix() {
+        for line in [
+            "kbf_proxy_x 1",
+            "  kbf_proxy_x{a=\"b\"} 1",
+            "# HELP kbf_proxy_x text",
+            "# TYPE kbf_proxy_x counter",
+            "#  UNIT kbf_proxy_x seconds",
+        ] {
+            assert!(names_own_series(line), "{line}");
+        }
+        for line in [
+            "kbf_child_x 1",
+            "kbf_proxyx 1",
+            "# HELP kbf_child_x kbf_proxy_x",
+            "# kbf_proxy_x a plain comment",
+            "# HELPkbf_proxy_x 1",
+            "#",
+            "",
+        ] {
+            assert!(!names_own_series(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn filter_ends_every_kept_line_with_a_newline_and_drops_eof() {
+        let kept = filter(b"a 1\nkbf_proxy_b 2\r\n  # EOF  \nc 3".to_vec()).expect("utf-8");
+        assert_eq!(kept, "a 1\nc 3\n");
+        assert_eq!(filter(Vec::new()).expect("utf-8"), "");
+        assert!(filter(vec![0xff]).is_err());
+    }
 }

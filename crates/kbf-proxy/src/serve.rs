@@ -150,10 +150,7 @@ impl<U: UpdateHandler + 'static> Service<U> {
                     .render(&self.core.slots, &self.core.queue)
                     .into_bytes();
                 if let Some(child) = child {
-                    body.extend_from_slice(&child);
-                    if !body.ends_with(b"\n") {
-                        body.push(b'\n');
-                    }
+                    body.extend_from_slice(child.as_bytes());
                 }
                 let mut response = text(StatusCode::OK, body);
                 response.headers_mut().insert(

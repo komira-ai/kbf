@@ -1,7 +1,7 @@
 //! The proxy's own counters, in Prometheus text. The proxy counts its own streams. `GET
 //! /metrics` is these series followed by the active child's operator `/metrics` body
 //! ([`crate::child_metrics`]; design note decision C11): the child's series are appended
-//! as they are, so a scrape of the public port sees both. When the child gives nothing the
+//! without its own `kbf_proxy_*` lines and `# EOF`, so a scrape of the public port sees both. When the child gives nothing the
 //! proxy's series are served alone and `kbf_proxy_child_metrics_failed_total` counts it.
 
 use std::fmt::Write as _;
