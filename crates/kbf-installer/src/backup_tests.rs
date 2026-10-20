@@ -584,8 +584,7 @@ fn settings_come_from_installer_toml_and_refuse_a_password() {
         err.contains("password") && !err.contains("hunter2"),
         "{err}"
     );
-    // The keyword form passes the URL check but names no role or database the verbs can use,
-    // so it is refused with the file's name, not guessed at.
+    // The keyword form is not a URL: the URL check refuses it with the file's name.
     let kw = conf("database = \"host=/run/postgresql dbname=kbf user=kbf-server\"\n");
     let err = Settings::read(&kw).unwrap_err();
     assert!(
@@ -604,7 +603,7 @@ fn settings_come_from_installer_toml_and_refuse_a_password() {
 /// Mutants seen red: `user=` ignored; the path's database dropped; `host=` ignored.
 #[test]
 fn role_database_and_socket_come_from_the_url() {
-    let t = |url| Target::parse(url).expect("parses");
+    let t = Target::parse;
     let farm = t("postgres:///kbf?host=/run/postgresql&user=kbf-server");
     assert_eq!(farm.role.as_deref(), Some("kbf-server"));
     assert_eq!(farm.database.as_deref(), Some("kbf"));
@@ -628,7 +627,6 @@ fn role_database_and_socket_come_from_the_url() {
         (nothing.role, nothing.database, nothing.host),
         (None, None, None)
     );
-    assert!(Target::parse("mysql:///x").is_err());
     // A key spelled `dbname=` names the database; an empty value and a key nobody here reads
     // change nothing; a broken or truncated escape stays as written.
     let keyed = t("postgres:///first?dbname=second&sslmode=disable&user=&host=");
@@ -643,12 +641,12 @@ fn role_database_and_socket_come_from_the_url() {
 /// Mutants seen red: the role dropped from the scratch URL; the host dropped; the name check removed.
 #[test]
 fn a_scratch_database_is_on_the_same_server_as_the_same_role() {
-    let farm = Target::parse("postgres:///kbf?host=/run/postgresql&user=kbf-server").expect("p");
+    let farm = Target::parse("postgres:///kbf?host=/run/postgresql&user=kbf-server");
     assert_eq!(
         farm.url_for("kbf_restore_test").expect("name"),
         "postgres:///kbf_restore_test?host=/run/postgresql&user=kbf-server"
     );
-    let bare = Target::parse("postgres:///kbf?host=/run/postgresql").expect("p");
+    let bare = Target::parse("postgres:///kbf?host=/run/postgresql");
     assert_eq!(
         bare.url_for("t1").expect("name"),
         "postgres:///t1?host=/run/postgresql"
@@ -673,10 +671,21 @@ fn a_scratch_database_is_on_the_same_server_as_the_same_role() {
         "postgres:///t?host=/a%20b/c&user=a%20b"
     );
     // The round trip is a URL the parser reads back to the same target (database aside).
-    let back = Target::parse(&farm.url_for("scratch").expect("name")).expect("parses");
+    let back = Target::parse(&farm.url_for("scratch").expect("name"));
     assert_eq!(back.role, farm.role);
     assert_eq!(back.host, farm.host);
     assert_eq!(back.database.as_deref(), Some("scratch"));
+}
+
+/// Catches a listing failure reported without the directory's name, or swallowed (a backup
+/// directory that cannot be read must fail the run, not look empty and keep nothing).
+///
+/// Mutant seen red: the listing error replaced by an empty list.
+#[test]
+fn a_directory_that_cannot_be_listed_is_an_error_naming_it() {
+    let missing = scratch().join("no-such-directory");
+    let err = names_where(&missing, is_backup_name).unwrap_err();
+    assert!(err.contains("no-such-directory"), "{err}");
 }
 
 // ---- against a server -----------------------------------------------------------------

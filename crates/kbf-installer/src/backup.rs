@@ -128,15 +128,14 @@ fn escape(text: &str) -> String {
 }
 
 impl Target {
-    /// Reads `url` (`postgres://` or `postgresql://`; a password was already refused).
-    ///
-    /// # Errors
-    /// The URL is not one; the message never quotes it.
-    pub fn parse(url: &str) -> Result<Target, String> {
+    /// Reads `url` (`postgres://` or `postgresql://`, which [`check_url`] has already held to
+    /// be a URL without a password). Whatever it does not say stays `None`.
+    #[must_use]
+    pub fn parse(url: &str) -> Target {
         let rest = url
             .strip_prefix("postgresql://")
             .or_else(|| url.strip_prefix("postgres://"))
-            .ok_or("the database URL does not start with postgres://")?;
+            .unwrap_or(url);
         let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         let (userinfo, host) = authority.rsplit_once('@').unwrap_or(("", authority));
@@ -159,11 +158,11 @@ impl Target {
                 _ => {}
             }
         }
-        Ok(Target {
+        Target {
             role,
             database,
             host,
-        })
+        }
     }
 
     /// The URL of the database `name` on the same server, for the same role: a scratch
@@ -225,7 +224,7 @@ impl Settings {
             ));
         };
         check_url(&shown, &url).map_err(|e| e.to_string())?;
-        let target = Target::parse(&url).map_err(|e| format!("{shown}: {e}"))?;
+        let target = Target::parse(&url);
         Ok(Settings {
             url,
             target,
