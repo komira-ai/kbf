@@ -514,7 +514,7 @@ the drain, and the unit templates in `kbf-deploy` set it.
 --frontend --token-file F` and `kbf cluster undrain <node> --token-file F` (the API's
 `:uncordon`). It prints the answer's JSON, exits 0 on a 2xx and 1 otherwise, and takes
 `--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
-restart it. `kbf cluster member <id> --state active|draining --token-file F` calls
+restart it. `kbf cluster member <id> --state active|draining|planned-down [--for-secs N] --token-file F` calls
 `POST /v1/members/{id}`, and `kbf cluster denied --token-file F` calls `GET /v1/denied`.
 `kbf cluster object-store ...` calls the `/v1/object-stores/...` routes (below).
 

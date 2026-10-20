@@ -237,7 +237,7 @@ Stated limits, written in the docs rather than enforced in v1: the member-map fl
 **No migration (decided).** The current state is dropped and the farm starts fresh on Postgres. There is no `kbf state migrate`. Cached blobs live on storage nodes and are unaffected.
 - **What the owner loses:** the member map and enrollment (nodes enroll again), cordons, `desired`, the release index, run history and `done/` rows. In-flight work is dropped, so the cutover is drain-then-stop: no running builds. U0 checks that a storage node re-registers its existing blobs without re-upload, and that the member-map floor of a fresh store does not lock out N nodes (section 9).
 - **Epoch:** a fresh store starts a new epoch; daemons discard old-epoch work, and nothing is running.
-- **Order.** U0 verifies. U1/U2 wire Postgres (at the tip `kbf-modes.md` says Postgres is "not wired yet", the `state-store` rule refuses `postgres://`, and there is no `Store::demote`) and run the whole test matrix on both backends. The farm cutover is a held script (dry run by default, never forcing) that needs the owner's go per host: stop, install Postgres, start the new layout, re-enroll nodes. Rollback before cutover is restarting the SQLite unit; the file is untouched, and a Postgres row is never copied back.
+- **Order.** U0 verifies. U1/U2 wire Postgres (at the tip `kbf-units.md` says Postgres is "not wired yet", the `state-store` rule refuses `postgres://`, and there is no `Store::demote`) and run the whole test matrix on both backends. The farm cutover is a held script (dry run by default, never forcing) that needs the owner's go per host: stop, install Postgres, start the new layout, re-enroll nodes. Rollback before cutover is restarting the SQLite unit; the file is untouched, and a Postgres row is never copied back.
 - **Delete SQLite last (U3b)**, once the farm runs on Postgres and the owner confirms there is no second host. `Store::demote` and the baton go in that unit. `rusqlite` leaves `cargo tree`.
 
 ## 12. PR plan
@@ -263,7 +263,7 @@ Owners are left blank. Order: U0, then U1/U2, U3a and the farm cutover, then U4a
 | U8b | `kbf-installer`: wire U8a to `orders/`, `status.json` and the proxy; `force-retire`; OIDC seam (#1088 later). | U8a, U7b, P1, P2, P4 | End to end on fake children and a fixture spool. |
 | U9 | R1 and R4 gates, controller generation gate, member-map floor fix, `deploy` default, cross-version test. | U2, U8 | Planted `min_protocol` raise red; two controllers without the gate red. |
 | U3b | Delete SQLite, `STATE_FILE`, baton, `Store::demote`. | farm on Postgres | `rusqlite` gone from `cargo tree`. |
-| U12 | Docs: `frontend-handover.md`, `aio-handover.md`, `kbf-installer.md`, `split-mode-updates.md`, `architecture-v2.md`, `kbf-modes.md`. | all | Wording matches code. |
+| U12 | Docs: `frontend-handover.md`, `aio-handover.md`, `kbf-installer.md`, `split-mode-updates.md`, `architecture-v2.md`, `kbf-units.md`, `kbf-modes.md`. | all | Wording matches code. |
 
 **Cut from v1 (seams only):** off-host Postgres and client TLS, `min_reader` table, auto-rollback, a crash-point harness at every phase, hot proxy restart, multi-host rule.
 
