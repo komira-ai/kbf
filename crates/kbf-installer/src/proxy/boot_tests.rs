@@ -378,3 +378,20 @@ fn the_file_report_replaces_boot_json_with_the_last_progress() {
     assert!(!text.contains("/var/lib/x"), "the detail is for the log");
     assert!(!dir.join("boot.json.tmp").exists());
 }
+
+/// Catches a changed production schedule (the tests use their own `retry()`): `Retry::boot()`
+/// is ten attempts, the first wait 2 s, doubling and capped at 30 s, and the boot run with it
+/// reports exactly that sequence of waits between its ten attempts.
+#[test]
+fn the_production_retry_is_ten_attempts_from_two_seconds_doubling_to_thirty() {
+    let boot = Retry::boot();
+    assert_eq!(boot.attempts, 10);
+    assert_eq!(boot.first_wait, secs(2));
+    assert_eq!(boot.max_wait, secs(30));
+    let run = Run::new();
+    run.world.st.borrow_mut().installed = None;
+    assert_eq!(run.boot(boot), Booted::GaveUp(Reason::NoInstalledRelease));
+    assert_eq!(run.notes.waits(), [2, 4, 8, 16, 30, 30, 30, 30, 30]);
+    assert_eq!(run.notes.last().attempt, 10);
+    assert_eq!(run.notes.last().attempts, 10);
+}

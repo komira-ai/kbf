@@ -612,3 +612,75 @@ fn a_record_whose_pid_was_reused_is_discarded_and_the_cold_start_goes_on() {
     );
     assert_eq!(env.admin.takeovers.get(), 1);
 }
+
+/// Catches a release check that cannot fail: the real source (not a fake) refuses a binary the
+/// proxy's user cannot execute and accepts one it can. A binary with execute bits for the group
+/// only, or for the owner only, is judged by the bits that apply to the user, not by any bit.
+#[test]
+fn the_real_source_runs_only_a_binary_the_proxys_user_can_execute() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let rig = rig("supervisor-source");
+    verify(&rig, A);
+    let status = state_dir(&rig).join("status.json");
+    let source = HostSource {
+        status: &status,
+        child: &rig.child,
+    };
+    let program = rig.child.program(&c(A));
+    // The rig's binary is a link to the test executable: followed, and executable.
+    assert_eq!(source.runnable(&c(A)), Ok(()));
+    std::fs::remove_file(&program).expect("rm link");
+    std::fs::write(&program, b"not run\n").expect("write");
+    let mode = |bits: u32| {
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(bits)).expect("mode");
+    };
+    mode(0o644);
+    assert_eq!(source.runnable(&c(A)), Err(Reason::BinaryNotExecutable));
+    mode(0o755);
+    assert_eq!(source.runnable(&c(A)), Ok(()));
+    mode(0o700);
+    assert_eq!(source.runnable(&c(A)), Ok(()), "the owner is the user");
+    // Only the group may execute: the owner (this user) may not. Root runs anything with an
+    // execute bit.
+    mode(0o070);
+    let root = rustix::process::geteuid().is_root();
+    assert_eq!(
+        source.runnable(&c(A)),
+        root.then_some(()).ok_or(Reason::BinaryNotExecutable)
+    );
+    mode(0o755);
+    std::fs::remove_file(&program).expect("rm");
+    assert_eq!(source.runnable(&c(A)), Err(Reason::BinaryMissing));
+}
+
+/// Catches an adopted candidate whose startup hold is not kept by the gate: while the
+/// recorded candidate is awaited, the gate holds the guard (nobody else can take it) and the
+/// streams stay held at every `/readyz` poll; when it never comes up the gate still holds it.
+#[test]
+fn the_startup_hold_stays_in_force_while_an_adopted_candidate_is_awaited() {
+    let rig = rig("supervisor-adopt-hold");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Candidate)
+        .expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
+    let after = rig.restarted();
+    let (gate, _runner) = gate();
+    let mut env = Env::new(&rig, &gate);
+    env.admin.role = RoleInfo {
+        holder: false,
+        state: RoleState::Candidate,
+    };
+    env.admin.ready_after = 2;
+    env.admin.holding =
+        Box::new(|| gate.handle.startup_hold().is_none() && gate.handle.snapshot().holding);
+    let outcome = adopt_children(&gate, &after, &state_dir(&rig), &env.boot());
+    assert_eq!(outcome, Startup::Adopted { active: Slot::A });
+    assert_eq!(env.admin.polls.get(), 3);
+    assert_eq!(
+        *env.admin.held_at_poll.borrow(),
+        [true, true, true],
+        "the gate held the startup hold at every poll"
+    );
+    assert_eq!(bound_slot(&gate), Some(kbf_proxy::slot::Slot::A));
+}

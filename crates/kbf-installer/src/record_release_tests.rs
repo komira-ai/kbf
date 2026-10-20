@@ -220,3 +220,41 @@ fn a_release_owned_by_another_user_is_refused() {
         record(&mut exec, &layout, other, &c(A), true, &mut Vec::new()).expect_err("not ours");
     assert!(err.to_string().contains("not owned"), "{err}");
 }
+
+/// Catches vouching for a binary the frontend child cannot run. The child runs as the proxy's
+/// user, not root, and the files are root's (the check requires it), so only the execute bit for
+/// others lets it start: a root-owned 0700 `kbf`, or a 0700 release directory, is refused with
+/// the `chmod` that fixes it, and the proxy's own `runnable` source then agrees on the 0755 one.
+#[test]
+fn a_binary_only_its_owner_can_execute_is_refused_with_the_fix() {
+    type Spoil = fn(&std::path::Path);
+    let cases: [(&str, Spoil); 3] = [
+        ("owner-only-binary", |d| {
+            fs::set_permissions(d.join("kbf"), fs::Permissions::from_mode(0o700)).expect("mode");
+        }),
+        ("group-only-binary", |d| {
+            fs::set_permissions(d.join("kbf"), fs::Permissions::from_mode(0o750)).expect("mode");
+        }),
+        ("owner-only-dir", |d| {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o700)).expect("mode");
+        }),
+    ];
+    for (name, spoil) in cases {
+        let (mut exec, layout) = host(name);
+        let dir = place(&exec, A);
+        spoil(&dir);
+        let err = run(&mut exec, &layout, A, true).expect_err(name);
+        let text = err.to_string();
+        assert!(
+            text.contains("not executable by the frontend's user"),
+            "{name}: {text}"
+        );
+        assert!(text.contains("fix: chmod 755"), "{name}: {text}");
+        assert!(!dir.join(VERIFIED).exists(), "{name}");
+        assert_eq!(current(&layout), None, "{name}");
+    }
+    let (mut exec, layout) = host("world-executable");
+    let dir = place(&exec, A);
+    run(&mut exec, &layout, A, true).expect("0755 is recorded");
+    assert!(dir.join(VERIFIED).exists());
+}
