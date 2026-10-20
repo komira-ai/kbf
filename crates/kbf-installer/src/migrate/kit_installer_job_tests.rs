@@ -130,3 +130,82 @@ fn a_loaded_job_is_left_alone_and_the_dry_run_names_it() {
             .any(|e| e == &format!("start {JOB} links=true"))
     );
 }
+
+/// Catches a dry run that offers to enable a job that is running already, and one that
+/// swallows a failed look at the job: a kit host whose installer job is loaded says "leave it",
+/// and a look that cannot run stops the plan with the io error, naming the job.
+///
+/// Mutants seen red: the dry run's wording fixed to "enable it"; the `?` on the look replaced
+/// by `unwrap_or(false)`.
+#[test]
+fn a_dry_run_leaves_a_loaded_job_and_stops_when_it_cannot_look() {
+    let dry = |rig: &mut Rig, m: &Migration| {
+        let runner = runner();
+        migrate(
+            m,
+            &mut rig.host,
+            &Hooks {
+                runner: &runner,
+                verifier: &never(),
+                frontend: &NoFrontend,
+            },
+            Mode::DryRun,
+        )
+    };
+    let (mut rig, m) = kit_without_flag("job-dry-loaded");
+    rig.active.borrow_mut().insert(JOB.to_owned());
+    let shown = dry(&mut rig, &m).expect("plan").to_string();
+    assert!(
+        shown.contains(&format!("{JOB}: it is enabled already: leave it")),
+        "{shown}"
+    );
+    assert!(!shown.contains("enable it and start it"), "{shown}");
+
+    let (mut rig, m) = kit_without_flag("job-dry-error");
+    let answer = std::mem::replace(
+        &mut rig.host.answer,
+        Box::new(|_| Err(std::io::Error::other("planted"))),
+    );
+    let label = JOB.trim_end_matches(".plist");
+    rig.host.answer = Box::new(move |cmd| {
+        if cmd.args.iter().any(|a| a.ends_with(label))
+            && cmd.args.first().is_some_and(|a| a == "print")
+        {
+            Err(std::io::Error::other("planted: cannot look"))
+        } else {
+            answer(cmd)
+        }
+    });
+    let Err(MigrateError::Io { what, source }) = dry(&mut rig, &m) else {
+        panic!("the plan went on");
+    };
+    assert_eq!(what, JOB);
+    assert!(source.to_string().contains("cannot look"), "{source}");
+}
+
+/// Catches a dry run that lists an installer job for an old host with no `--installer-unit`:
+/// that host's units are the operator's, the apply enables nothing, so the plan names no job
+/// and asks nothing about one.
+///
+/// Mutant seen red: the dry run's job defaulting to the kit's whatever the host.
+#[test]
+fn a_dry_run_of_an_old_host_without_the_flag_lists_no_installer_job() {
+    let mut rig = Rig::mac("job-dry-old");
+    let mut m = rig.migration();
+    m.installer_unit = None;
+    let runner = runner();
+    let report = migrate(
+        &m,
+        &mut rig.host,
+        &Hooks {
+            runner: &runner,
+            verifier: &never(),
+            frontend: &NoFrontend,
+        },
+        Mode::DryRun,
+    )
+    .expect("plan");
+    let shown = report.to_string();
+    assert!(!shown.contains("kbf-installer"), "{shown}");
+    assert!(shown.contains("copy or verify each release"), "{shown}");
+}

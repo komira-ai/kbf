@@ -207,6 +207,42 @@ fn a_dry_run_makes_nothing_and_says_how_the_account_comes_to_be() {
     probe_account(&mut exec, &rig.layout, &args, false, false, me()).expect("there");
 }
 
+/// Catches the "a dry run cannot make it" hint on a failure it does not explain: the hint says
+/// `migrate --apply` creates the standard account on a Mac, so a dry run on Linux (the package's
+/// sysusers entry makes it) and a dry run naming another account with `--fetch-user` (never
+/// made by migrate) keep the plain "no user" error.
+///
+/// Mutants seen red: the hint given on any platform; the hint given for any account name.
+#[test]
+fn the_dry_run_hint_is_for_the_standard_account_on_a_mac_only() {
+    let missing = |exec: &mut FakeExec| {
+        exec.answer = Box::new(|_| Ok(reply(2, "", "")));
+    };
+    let rig = Rig::linux("fetch-dry-linux");
+    let mut exec = FakeExec::new(0);
+    missing(&mut exec);
+    let failure = probe_account(
+        &mut exec,
+        &rig.layout,
+        &migrate_args(&[]),
+        false,
+        false,
+        me(),
+    )
+    .expect_err("no package");
+    assert!(failure.why.contains("kbf-fetch"), "{}", failure.why);
+    assert!(!failure.why.contains("migrate --apply"), "{}", failure.why);
+
+    let rig = Rig::kit("fetch-dry-named", Platform::MacOs, Form::New);
+    let mut exec = FakeExec::new(0);
+    missing(&mut exec);
+    let args = migrate_args(&["--fetch-user", "_other"]);
+    let failure =
+        probe_account(&mut exec, &rig.layout, &args, false, false, me()).expect_err("no account");
+    assert!(failure.why.contains("_other"), "{}", failure.why);
+    assert!(!failure.why.contains("migrate --apply"), "{}", failure.why);
+}
+
 /// Catches an account made where it is not the migration's to make: a rollback, a rehearsal
 /// under `--root`, an operator's own `--fetch-user` (even the name `_kbf`), a host with no old
 /// layout and a host whose migration finished make nothing, and the old error stands.

@@ -325,3 +325,22 @@ fn the_real_journal_says_kit_adopted_only_for_a_finished_kit_migration() {
     fs::write(old.new_state_dir().join("migration.json"), "{").expect("damage");
     assert!(journaled.kit_adopted().is_err());
 }
+
+/// Catches an edit that parses but is not what was asked: the kit's file holds a header-looking
+/// line inside a multi-line string, so the text edit puts `url` after the string, as a top-level
+/// key, and the file parses with no `[frontend] url`. It is refused, naming the key, and not
+/// written.
+///
+/// Mutant seen red: the check that each added key reads back where it was asked removed (the
+/// file is written without the key).
+#[test]
+fn an_added_key_that_does_not_read_back_where_asked_is_refused() {
+    let tricky = "mode = \"daemon\"\nnote = \"\"\"\n[frontend]\nbody\n\"\"\"\n";
+    let Decision::Refuse(why) = decide_adopted(tricky, &ours(), PATH) else {
+        panic!("written");
+    };
+    assert!(
+        why.contains("cannot add") && why.contains("[frontend] url"),
+        "{why}"
+    );
+}
