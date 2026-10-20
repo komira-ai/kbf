@@ -2,7 +2,7 @@
 <p class="lede">From a host to your first remote build. Each step is tagged: <span class="tag tag-ok">works today</span> is in the code, <span class="tag tag-planned">specified</span> is decided in the design documents and not built yet.</p>
 
 <div class="notice">
-  <p><strong>One rule for the command line.</strong> A host's role is a flag, <code>--mode=frontend|storage|daemon|storage-and-daemon|all-in-one</code>, or <code>mode = "..."</code> in <code>/etc/kbf/kbf.toml</code>. It is never a subcommand. Today's <code>kbf</code> still takes the mode as a word (<code>kbf all-in-one</code>); that form stays as an alias until the flag lands.</p>
+  <p><strong>One rule for the command line.</strong> A host's role is a flag, <code>--mode=frontend|storage|daemon|storage-and-daemon|all-in-one</code>, or <code>mode = "..."</code> in <code>/etc/kbf/kbf.toml</code>. It is never a subcommand. The word form (<code>kbf all-in-one</code>) still works as a hidden alias, but help and errors name the flag.</p>
 </div>
 
 <ol class="steps">
