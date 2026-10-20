@@ -1133,7 +1133,7 @@ impl<'a> Prepared<'a> {
             token,
             Arc::clone(&farm),
         ))
-        .merge(crate::health::router_of(Arc::clone(&checks)))
+        .merge(crate::health::routes(&checks, &farm, members.as_ref()))
         .merge(metrics_route(
             backend.clone(),
             history.as_ref().map(crate::history::History::stats),
