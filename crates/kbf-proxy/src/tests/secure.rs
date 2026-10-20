@@ -38,6 +38,7 @@ fn identity(role: PeerRole) -> Identity {
     Identity {
         node_id: "node-1.farm".into(),
         role,
+        ips: Vec::new(),
     }
 }
 
@@ -251,6 +252,7 @@ async fn an_identity_that_cannot_be_a_header_is_refused() {
     let bad = Identity {
         node_id: "bad\nname".into(),
         role: PeerRole::Daemon,
+        ips: Vec::new(),
     };
     let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(Some(bad))).await;
     let reply = rig.client().await.unary(WORKER).await;
@@ -347,6 +349,7 @@ async fn http_paths_are_refused_with_http_statuses() {
     let bad = Identity {
         node_id: "bad\nname".into(),
         role: PeerRole::Daemon,
+        ips: Vec::new(),
     };
     let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(Some(bad))).await;
     let reply = rig.client().await.plain("GET", OPERATOR, b"").await;
@@ -360,9 +363,19 @@ pub(super) async fn connect_tls(
     rig: &Rig,
     config: Arc<rustls::ClientConfig>,
 ) -> io::Result<TlsStream<DuplexStream>> {
+    connect_tls_as(rig, config, "localhost").await
+}
+
+/// [`connect_tls`] for the server name `host`: what the client verifies the certificate
+/// against and, unless its config turned SNI off, what it sends in the ClientHello.
+pub(super) async fn connect_tls_as(
+    rig: &Rig,
+    config: Arc<rustls::ClientConfig>,
+    host: &str,
+) -> io::Result<TlsStream<DuplexStream>> {
     let (near, far) = tokio::io::duplex(1 << 20);
     rig.feed_raw(far, super::kit::CLIENT_IP);
-    let name = ServerName::try_from("localhost").expect("a name");
+    let name = ServerName::try_from(host.to_owned()).expect("a name");
     TlsConnector::from(config).connect(name, near).await
 }
 
