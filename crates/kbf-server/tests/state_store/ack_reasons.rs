@@ -133,3 +133,52 @@ async fn a_result_naming_another_action_is_a_mismatch() {
     assert_eq!(disk.rows("done/"), 0);
     assert!(accepted(&farm, lease).await);
 }
+
+/// What the farm logged on this thread while `scenario` ran on a runtime of its own with
+/// the clock paused.
+fn logs(scenario: impl std::future::Future<Output = ()>) -> String {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("a runtime");
+    crate::thread_log::logged(|| runtime.block_on(scenario))
+}
+
+/// Catches: a refusal that logs the same line whatever the reason (an operator reading
+/// the log could not tell a stale attempt, which is normal after a re-grant, from a lease
+/// the server never granted, which is not), or no line at all. Each reason logs its own.
+#[test]
+fn each_refusal_logs_its_own_line() {
+    let duplicate = logs(async {
+        let (_disk, farm, _inbox, lease, _ticket) = started().await;
+        assert!(accepted(&farm, lease).await);
+        assert!(farm.report(&node(), invalid(lease)).await.is_some());
+    });
+    assert!(duplicate.contains("result is a copy"), "{duplicate}");
+
+    let stale = logs(async {
+        let (_disk, farm, _inbox, lease, _ticket) = started().await;
+        let other = WorkerId::new("node-b");
+        assert!(farm.report(&other, invalid(lease)).await.is_some());
+    });
+    assert!(stale.contains("stale attempt"), "{stale}");
+
+    let unknown = logs(async {
+        let (_disk, farm, _inbox, lease, _ticket) = started().await;
+        let foreign = LeaseId::new(lease.term + 1, lease.seq);
+        assert!(farm.report(&node(), invalid(foreign)).await.is_some());
+    });
+    assert!(unknown.contains("unknown lease"), "{unknown}");
+
+    let mismatch = logs(async {
+        let (_disk, farm, _inbox, lease, _ticket) = started().await;
+        let other = Digest::new(DigestFunction::Sha256, [9; 32], 9);
+        let wrong = worker::Result {
+            action_digest: Some(kbf_front::digest_to_proto(&other)),
+            ..invalid(lease)
+        };
+        assert!(farm.report(&node(), wrong).await.is_some());
+    });
+    assert!(mismatch.contains("names another action"), "{mismatch}");
+}
