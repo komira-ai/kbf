@@ -376,7 +376,7 @@ fn an_ignored_sigchld_is_made_the_default() {
 }
 
 /// Catches the program search taking a file the user cannot execute because some
-/// execute bit is set (a mode `0010` file of the user's: group execute only): `crun`
+/// execute bit is set (a mode `0410` file of the user's: group execute only): `crun`
 /// asks `faccessat(X_OK, AT_EACCESS)` and goes on to the next directory. (A superuser
 /// may execute it, so the file is found first, and the test does not apply.)
 #[test]
@@ -392,7 +392,7 @@ fn the_path_search_asks_the_kernel_whether_the_file_can_be_executed() {
     std::fs::write(first.join("kbf-act"), b"not for us").expect("decoy");
     std::fs::set_permissions(
         first.join("kbf-act"),
-        std::fs::Permissions::from_mode(0o010),
+        std::fs::Permissions::from_mode(0o410),
     )
     .expect("mode");
     std::os::unix::fs::symlink(dir.join("kbf-act"), second.join("kbf-act")).expect("link");
@@ -407,6 +407,8 @@ fn the_path_search_asks_the_kernel_whether_the_file_can_be_executed() {
             &["echo", "second"],
         ),
     );
+    // Not left for the coverage tool, which reads every file of the build directory.
+    std::fs::remove_file(first.join("kbf-act")).expect("remove the decoy");
     assert_eq!(ran.code, 0, "{}", ran.report);
     assert_eq!(ran.stdout, "second\n");
 }
