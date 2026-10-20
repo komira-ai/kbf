@@ -121,9 +121,10 @@ async fn two_browsers_behind_the_proxy_each_get_their_own_bound() {
 /// `x-kbf-client-addr` is still one caller (its peer), so it cannot take a fresh bound by
 /// writing one.
 ///
-/// Mutants: `admit` taking the address whatever the trust (the forged values are separate
-/// callers and no fifth read is refused); `caller_of` not checking `Trust::Proxied` is
-/// pinned in `read_limit/tests.rs`.
+/// Mutants: both checks gone at once, `admit` recording the address whatever the trust and
+/// `caller_of` not checking `Trust::Proxied` (the forged values are separate callers and no
+/// fifth read is refused). Each check alone is hidden by the other here, so each has its own
+/// test: `admit` below, `caller_of` in `read_limit/tests.rs`.
 #[tokio::test]
 async fn a_forged_header_on_a_direct_request_does_not_change_the_key() {
     // (what, a proxy configured, the secret the caller presents)
@@ -190,6 +191,45 @@ async fn the_address_is_canonical_and_a_bad_one_is_refused() {
     let twice = get_ui(&router, LOOPBACK, &pairs).await;
     assert_eq!(twice.status(), StatusCode::FORBIDDEN);
     drop(held);
+}
+
+/// What a handler can see of the address: only a proxied call has one in its extensions, and
+/// the header itself is gone for every call.
+///
+/// Mutants: `admit` recording the address whatever the trust (the limiter's own
+/// `Trust::Proxied` check would hide it from the key, so only the extension shows it);
+/// the header left in place for a handler.
+#[tokio::test]
+async fn only_a_proxied_call_has_a_client_address_and_no_call_keeps_the_header() {
+    async fn seen(request: axum::extract::Request) -> String {
+        format!(
+            "{:?} header={}",
+            request
+                .extensions()
+                .get::<kbf_server::proxy_auth::ClientAddr>(),
+            request.headers().contains_key(CLIENT_ADDR)
+        )
+    }
+    let body_of = |response: Response<Body>| async move {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 10)
+            .await
+            .expect("a body");
+        String::from_utf8(bytes.to_vec()).expect("text")
+    };
+    let route = |secret: Option<Arc<ProxySecret>>| {
+        Router::new()
+            .route("/ui", get(seen))
+            .layer(from_fn_with_state(secret, gate_requests))
+    };
+    let proxied = route(Some(secret()));
+    let answer = body_of(as_browser(&proxied, "192.0.2.10").await).await;
+    assert_eq!(answer, "Some(ClientAddr(192.0.2.10)) header=false");
+    let forged = [(CLIENT_ADDR, "203.0.113.9")];
+    let answer = body_of(get_ui(&proxied, LOOPBACK, &forged).await).await;
+    assert_eq!(answer, "None header=false", "a secret-less call");
+    let direct = route(None);
+    let answer = body_of(get_ui(&direct, LOOPBACK, &forged).await).await;
+    assert_eq!(answer, "None header=false", "no proxy configured");
 }
 
 /// `client_addr` on its own: absent is `None`, one address is that address, canonical.
