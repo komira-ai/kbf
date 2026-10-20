@@ -90,6 +90,7 @@ pub mod frontend;
 pub mod grpc_health;
 pub mod handover;
 pub mod health;
+mod health_summary;
 pub mod history;
 pub mod http_blobs;
 mod http_history;
