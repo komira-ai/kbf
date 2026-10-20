@@ -161,6 +161,16 @@ impl Observe for Fixed {
     }
 }
 
+/// No frontend to read: the verbs that run no gate (`update --frontend`). Asking it is an
+/// error, never a guess.
+pub struct NoObserve;
+
+impl Observe for NoObserve {
+    fn resolve(&self, _: Option<Slot>) -> Result<Observed<'_>, String> {
+        Err("this verb observes no frontend".to_owned())
+    }
+}
+
 /// The children of the frontend proxy (`--observe-base-port`): follows the serving slot.
 pub struct Slots {
     pub base_port: u16,
