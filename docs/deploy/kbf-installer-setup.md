@@ -91,7 +91,7 @@ installer's unit reads it, and refuses another path. A Mac is a node only (`--mo
 10. The units, last: the mode's unit and `kbf-installer.service`, `systemctl enable`, with
    `--now` for a node's unit when a release is installed and `--no-start` is not given (the
    installer's own service does not wait for either). A unit that makes a frontend
-   (`kbf-frontend@a.service`, `kbf-all-in-one.service`) is enabled and never started by
+   (`kbf-frontend.service`, `kbf-all-in-one.service`) is enabled and never started by
    `setup`: starting it takes the database, the TLS files and the port. A unit already
    enabled is left alone. Nothing is restarted. Those two modes also get `kbf-backup.timer`,
    enabled and started (the schema it dumps was made in step 7), and a drop-in that gives
@@ -203,11 +203,11 @@ socket are `kbf-server`, `kbf-server` and `/run/postgresql`.
 held: builds in flight are gone, and nodes register again.
 
 ```text
-sudo systemctl stop kbf-frontend@a.service     # waits for open builds; nothing may write
+sudo systemctl stop kbf-frontend.service     # waits for open builds; nothing may write
 sudo -u postgres dropdb <database in the URL>
 sudo -u postgres createdb --owner=<role in the URL> <database in the URL>
 sudo -u <service user> kbf-installer --apply restore --file /var/lib/kbf-server/backups/kbf-<time>.dump
-sudo systemctl start kbf-frontend@a.service    # opens the store: its schema check must accept it
+sudo systemctl start kbf-frontend.service    # opens the store: its schema check must accept it
 ```
 
 The tests: `src/backup_tests.rs` (retention, atomicity, modes and the arguments, reading the

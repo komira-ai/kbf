@@ -120,6 +120,43 @@ async fn a_node_denied_on_a_live_connection_is_refused_at_its_next_call() {
         .expect("node-b is served");
 }
 
+/// Catches a deny-row read that fails OPEN: when the operator's `deny/` rows cannot be read
+/// the node's identity cannot be judged, so the fetch is refused UNAVAILABLE with fixed text
+/// (no secret, no store error) rather than served. The same node is served again once the
+/// store reads, so the refusal is the failed read and not the node.
+///
+/// Mutant seen red: the read's error ignored (`if let Ok(denied) = members.denied()`), which
+/// serves the secret to a node whose revocation could not be checked.
+#[tokio::test]
+async fn a_failed_deny_read_refuses_the_fetch_instead_of_serving_it() {
+    use std::sync::atomic::Ordering;
+    let farm = farm(Source::new(7), false).await;
+    let a = farm
+        .pki
+        .channel(farm.addr, farm.pki.client(Some("storage"), &["node-a"]))
+        .await;
+    farm.store.fail_scans.store(1, Ordering::SeqCst);
+    let refused = cold(&a)
+        .get_store_config(want(0))
+        .await
+        .expect_err("the deny rows could not be read");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert!(
+        !refused.message().contains(SENTINEL),
+        "{}",
+        refused.message()
+    );
+    assert!(
+        !refused.message().contains("injected"),
+        "{}",
+        refused.message()
+    );
+    cold(&a)
+        .get_store_config(want(0))
+        .await
+        .expect("served once the rows read");
+}
+
 /// Catches: an unchanged answer that carries the secret, and a node told "unchanged" when
 /// its number is merely different: the same generation is two numbers, a lower or higher
 /// one gets the whole store (a restored frontend), and nothing registered is generation 0

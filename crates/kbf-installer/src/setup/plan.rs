@@ -73,7 +73,7 @@ fn file(
 /// whatever the mode.
 pub fn mode_units(mode: Mode) -> &'static [&'static str] {
     match mode {
-        Mode::Frontend => &["kbf-frontend@a.service"],
+        Mode::Frontend => &["kbf-frontend.service"],
         Mode::Storage => &["kbf-storage.service"],
         Mode::Daemon => &["kbf-daemon.service"],
         Mode::StorageAndDaemon => &["kbf-storage-and-daemon.service"],

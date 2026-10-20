@@ -223,7 +223,7 @@ fn trusted_files_must_be_the_helpers_own_and_private() {
     linked.grant_keys = Some(dir.join("linked-keys"));
     assert!(prepared(&linked).err().unwrap().contains("linked-keys"));
     let mut a_dir = good.clone();
-    a_dir.grant_keys = Some(dir.clone());
+    a_dir.grant_keys = Some(dir.to_path_buf());
     assert!(
         prepared(&a_dir)
             .err()

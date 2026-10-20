@@ -574,7 +574,8 @@ fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
 /// that cannot be read stops the service rather than starting it without the step.
 ///
 /// Mutants seen red: the unit check removed (the all-in-one unit ran its pass); the unit
-/// check matching `kbf-frontend` without the `@` (the plain `kbf-frontend.service` refused);
+/// check matching only `kbf-frontend@` (the plain `kbf-frontend.service`, the unit setup enables on
+/// a frontend host, ran its pass without the migration);
 /// the all-in-one template (`kbf-all-in-one@1.service`) is in the test list.
 #[test]
 fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
@@ -583,6 +584,7 @@ fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
         "kbf-all-in-one.service",
         "kbf-all-in-one@1.service",
         "kbf-frontend@main.service",
+        "kbf-frontend.service",
     ] {
         let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
         assert_eq!(exit, Exit::Usage, "{unit}: {err}");
@@ -597,7 +599,7 @@ fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
             "{unit}: nothing was done before the refusal"
         );
     }
-    for unit in ["kbf.service", "kbf-daemon.service", "kbf-frontend.service"] {
+    for unit in ["kbf.service", "kbf-daemon.service"] {
         let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
         assert_eq!(exit, Exit::Ok, "{unit}: {err}");
     }
@@ -760,7 +762,7 @@ fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
         target_of(&root, &args)
     };
     for (mode, unit) in [
-        ("frontend", "kbf-frontend@a.service"),
+        ("frontend", "kbf-frontend.service"),
         ("storage", "kbf-storage.service"),
         ("daemon", "kbf-daemon.service"),
         ("storage-and-daemon", "kbf-storage-and-daemon.service"),

@@ -47,6 +47,8 @@ ureq.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+# A scratch directory a test owns and removes (the unit tests).
+kbf-testkit.workspace = true
 rcgen.workspace = true
 # The caller's umask, for the install.sh test.
 rustix = { workspace = true, features = ["fs", "process", "system"] }
