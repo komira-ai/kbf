@@ -363,9 +363,19 @@ pub(super) async fn connect_tls(
     rig: &Rig,
     config: Arc<rustls::ClientConfig>,
 ) -> io::Result<TlsStream<DuplexStream>> {
+    connect_tls_as(rig, config, "localhost").await
+}
+
+/// [`connect_tls`] for the server name `host`: what the client verifies the certificate
+/// against and, unless its config turned SNI off, what it sends in the ClientHello.
+pub(super) async fn connect_tls_as(
+    rig: &Rig,
+    config: Arc<rustls::ClientConfig>,
+    host: &str,
+) -> io::Result<TlsStream<DuplexStream>> {
     let (near, far) = tokio::io::duplex(1 << 20);
     rig.feed_raw(far, super::kit::CLIENT_IP);
-    let name = ServerName::try_from("localhost").expect("a name");
+    let name = ServerName::try_from(host.to_owned()).expect("a name");
     TlsConnector::from(config).connect(name, near).await
 }
 
