@@ -36,10 +36,12 @@ pub fn reach(config: &PostgresConfig) -> Result<(), Unreached> {
 }
 
 fn classify(err: &postgres::Error) -> Unreached {
-    let Some(code) = err.code() else {
-        return Unreached::NoServer;
-    };
-    match code.code() {
+    err.code()
+        .map_or(Unreached::NoServer, |code| classify_code(code.code()))
+}
+
+fn classify_code(code: &str) -> Unreached {
+    match code {
         // Class 28 is invalid authorization (no role, no rule, wrong password); 42501 is a
         // role without CONNECT on the database.
         c if c.starts_with("28") || c == "42501" => Unreached::Login,
@@ -50,7 +52,7 @@ fn classify(err: &postgres::Error) -> Unreached {
 
 #[cfg(test)]
 mod tests {
-    use super::{Unreached, reach};
+    use super::{Unreached, classify_code, reach};
     use crate::postgres::PostgresConfig;
 
     /// Catches a connection failure with no server being reported as anything but
@@ -66,6 +68,20 @@ mod tests {
         for name in ["secretdb", "secretrole", "nonexistent"] {
             assert!(!text.contains(name), "{text}");
         }
+    }
+
+    /// Catches an SQLSTATE sent to the wrong recipe: authorization failures (class 28) and a
+    /// missing CONNECT privilege are a login refusal, a missing database is told apart, and
+    /// any other code is passed on as the code alone.
+    ///
+    /// Mutants seen red: the 42501 operand dropped; `3D000` mapped to `Login`.
+    #[test]
+    fn each_sqlstate_is_told_to_the_recipe_that_fits_it() {
+        for code in ["28000", "28P01", "42501"] {
+            assert_eq!(classify_code(code), Unreached::Login, "{code}");
+        }
+        assert_eq!(classify_code("3D000"), Unreached::NoDatabase);
+        assert_eq!(classify_code("08006"), Unreached::Other("08006".to_owned()));
     }
 
     fn server() -> PostgresConfig {

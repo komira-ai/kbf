@@ -13,6 +13,7 @@ use kbf_host::testkit::reply;
 use kbf_host::{Cmd, Step};
 
 use super::*;
+use crate::setup::os::Os;
 use crate::setup::provision;
 use crate::setup::validate::LocalDatabase;
 
@@ -455,10 +456,17 @@ fn a_role_or_database_that_is_not_the_roles_own_is_refused_and_altered_not() {
 /// Catches an answer setup does not know being taken for a state: a role or a database row it
 /// cannot read refuses instead of creating on a guess.
 ///
-/// Mutants seen red: the catch-all arm of either parser returning a state.
+/// Mutants seen red: the catch-all arm of either parser returning a state; the column-count
+/// or the column-value check of the role's answer removed.
 #[test]
 fn an_answer_it_cannot_read_is_a_refusal() {
-    for (needle, row) in [("pg_roles", "x|y\n"), ("pg_database", "maybe\n")] {
+    for (needle, row) in [
+        ("pg_roles", "x|y\n"),
+        // The old two-column answer, one column short, and a column that is neither t nor f.
+        ("pg_roles", "t|f\n"),
+        ("pg_roles", "t|f|f|f|f|x\n"),
+        ("pg_database", "maybe\n"),
+    ] {
         let mut exec = released(host(), Platform::Linux);
         exec.answer = Box::new(move |cmd| {
             let script = String::from_utf8_lossy(&cmd.stdin).into_owned();
@@ -915,4 +923,63 @@ fn both_schemes_give_the_same_settings_and_no_ident_map_name_is_read() {
         "{:?}",
         w.ran
     );
+}
+
+// ---- what is left to the unit ----------------------------------------------------------------
+
+/// Catches the flag's own platform check being dropped: `provision` itself refuses a Mac, as
+/// a usage error and before it asks anything, whatever the plan did before it.
+///
+/// Mutant seen red: the platform check removed.
+#[test]
+fn provision_refuses_a_mac_by_itself() {
+    let world = Shared::default();
+    let mut exec = exec_on(&world);
+    let mut out = Vec::new();
+    let err = provision::provision(&FakeOs::mac(), &mut exec, &local(), true, &mut out)
+        .expect_err("refused");
+    assert_eq!(err.exit(), Exit::Usage, "{err}");
+    assert!(world.borrow().ran.is_empty());
+}
+
+/// Catches a port in the URL being dropped on the way to psql: provisioning would go to the
+/// default port while the login check uses the URL's.
+///
+/// Mutant seen red: the `PGPORT` variable not set.
+#[test]
+fn the_urls_port_reaches_psql() {
+    let mut r = flags();
+    r.database =
+        Some("postgres:///secretdb?host=/run/secretsock&user=secretrole&port=5433".to_owned());
+    let with_port = r.validate().expect("valid").local_database.expect("local");
+    let world = Shared::default();
+    let exec = exec_on(&world);
+    let superuser = linux()
+        .user(provision::SUPERUSER)
+        .expect("os")
+        .expect("postgres");
+    let conn = provision::Connection::local(&with_port, superuser);
+    provision::plan(&exec, &conn, &with_port).expect("plan");
+    let w = world.borrow();
+    assert!(
+        w.envs[0].contains(&"PGPORT=5433".to_owned()),
+        "{:?}",
+        w.envs[0]
+    );
+}
+
+/// Catches an empty role or database name being taken for a name: each is refused by the flag.
+///
+/// Mutant seen red: the non-empty check removed.
+#[test]
+fn an_empty_role_or_database_name_is_refused() {
+    for url in [
+        "postgres:///secretdb?host=/run/secretsock&user=",
+        "postgres:///?host=/run/secretsock&user=secretrole&dbname=",
+    ] {
+        let mut r = flags();
+        r.database = Some(url.to_owned());
+        let problems = r.validate().expect_err(url).join("; ");
+        no_names(&problems);
+    }
 }
