@@ -99,7 +99,7 @@ fn the_orders_key_names_the_directory_setup_makes() {
 /// file at all, is refused (exit 5) naming the key and `kbf-mac-provision`, and no path.
 ///
 /// Mutants seen red: the Mac writing both keys as Linux does; the check dropped (a wrong key
-/// accepted); `orders-dir` required.
+/// accepted); `orders-dir` required; a non-text `orders-dir` let through.
 #[test]
 fn a_mac_is_checked_and_never_written() {
     let base = "mode = \"daemon\"\n\n[frontend]\nurl = \"https://farm.example:8443\"\n\n[enroll]\ntoken_file = \"/etc/kbf/enroll.token\"\n\n";
@@ -129,6 +129,10 @@ fn a_mac_is_checked_and_never_written() {
         (
             "[daemon]\nupdate-dir = 3\n",
             "[daemon] update-dir is not text",
+        ),
+        (
+            "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\norders-dir = 3\n",
+            "[daemon] orders-dir is not text",
         ),
     ];
     for (daemon, why) in refuse {

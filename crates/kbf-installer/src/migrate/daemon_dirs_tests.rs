@@ -382,7 +382,8 @@ fn a_rollback_puts_the_original_back_unless_the_operator_changed_it() {
 /// no path, in a dry run and in an apply, before anything is written. A Linux node still gets
 /// both keys (`an_adopted_node_gets_both_keys_in_its_daemon_table_and_nothing_else_moves`).
 ///
-/// Mutants seen red: a Mac written like a Linux host; the check dropped; `orders-dir` required.
+/// Mutants seen red: a Mac written like a Linux host; the check dropped; `orders-dir` required;
+/// a non-text `orders-dir` let through.
 #[test]
 fn a_mac_kbf_toml_is_checked_and_never_written() {
     use crate::migrate::kit_host::{Form, KBF_TOML_PATH, at};
@@ -445,6 +446,10 @@ fn a_mac_kbf_toml_is_checked_and_never_written() {
             "[daemon] orders-dir is not the installer's directory",
         ),
         ("update-dir = 7\n", "[daemon] update-dir is not text"),
+        (
+            "update-dir = \"/var/db/kbf-installer\"\norders-dir = 7\n",
+            "[daemon] orders-dir is not text",
+        ),
     ] {
         for mode in [Mode::DryRun, Mode::Apply] {
             let mut rig = Rig::mac("keys-mac-refused");
