@@ -516,7 +516,19 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         blobs: &[(Digest, u64)],
     ) -> Result<(), CacheError> {
         self.writer.leave_numbering();
-        match self.restage(staging, object, blobs, Some(object)).await {
+        let moved = if blobs.is_empty() {
+            // Nothing to copy: the object only leaves the table.
+            let empty = StagedPut {
+                object: self.writer.allocate(),
+                end: 0,
+                seal: true,
+                blobs: Vec::new(),
+            };
+            self.writer.reseat(staging.id, object, empty, true).await
+        } else {
+            self.restage(staging, object, blobs, Some(object)).await
+        };
+        match moved {
             Ok(()) => {}
             Err(CacheError::Tier(e)) if block_gone(&e) => {
                 tracing::error!(%object, error = %e, "the block of a staged object whose key holds another object is gone; its records are lost");
@@ -574,15 +586,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         from: Option<ObjectId>,
     ) -> Result<(), CacheError> {
         if good.is_empty() {
-            // Nothing to move: the object only leaves the table.
-            let Some(from) = from else { return Ok(()) };
-            let empty = StagedPut {
-                object: self.writer.allocate(),
-                end: 0,
-                seal: true,
-                blobs: Vec::new(),
-            };
-            return self.writer.reseat(staging.id, from, empty, true).await;
+            return Ok(());
         }
         let mut spans = Vec::with_capacity(good.len());
         let mut listed = Vec::with_capacity(good.len());

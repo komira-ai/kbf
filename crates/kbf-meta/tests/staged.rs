@@ -818,3 +818,41 @@ fn a_reseat_indexes_the_records_that_were_not_at_the_old_object_as_a_put_does() 
     assert_eq!(m.blob(&digest(9)), staged_at(5, 150), "indexed by the move");
     assert_eq!(state(&m, 1), None);
 }
+
+/// Catches: the new object forced sealed whatever the command says (a move whose records
+/// are still being added to would be closed), and a record listed by the old object but
+/// indexed at another object (it was a duplicate when staged) counted as one the move
+/// must carry: it stays where it is.
+#[test]
+fn a_reseat_keeps_the_seal_it_names_and_leaves_a_duplicate_where_it_is() {
+    let mut m = tiered();
+    stage(&mut m, sealed(part(2, 100, &[(1, 0)]))).expect("staged");
+    stage(&mut m, sealed(part(1, 300, &[(1, 0), (2, 100)]))).expect("staged");
+    assert_eq!(m.blob(&digest(1)), staged_at(2, 0), "a duplicate");
+    assert_eq!(reseat(&mut m, 1, part(5, 100, &[(2, 0)]), false), Ok(()));
+    assert_eq!(state(&m, 5), Some(StagedState::Open));
+    assert_eq!(m.blob(&digest(1)), staged_at(2, 0));
+    assert_eq!(m.blob(&digest(2)), staged_at(5, 0));
+}
+
+/// Catches: a retry accepted on half the evidence. `from` having left is not enough (it
+/// may have been flushed): the new object must be held too, in the table or, for a store
+/// object, as every record's location; and a new object that is held while `from` never
+/// left is refused as the repeat it is.
+#[test]
+fn a_reseat_retry_needs_both_the_old_object_gone_and_the_new_one_held() {
+    let mut m = two_sealed();
+    stage(&mut m, sealed(part(5, 100, &[(7, 0)]))).expect("staged");
+    assert_eq!(
+        reseat(&mut m, 9, sealed(part(5, 100, &[(7, 0)])), false),
+        Err(TierError::NotStaged(object(9)))
+    );
+
+    let mut f = two_sealed();
+    assert_eq!(flushed(&mut f, 1), Ok(()));
+    let stored = sealed(part(9, 300, &[(1, 0), (2, 100)]));
+    assert_eq!(
+        reseat(&mut f, 1, stored, true),
+        Err(TierError::Left(object(1)))
+    );
+}
