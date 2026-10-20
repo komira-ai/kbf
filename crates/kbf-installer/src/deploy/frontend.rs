@@ -209,7 +209,7 @@ impl Run<'_> {
                         already_running: true,
                         ..Frontend::default()
                     });
-                    return Ok(());
+                    return self.gate_frontend_done();
                 }
                 Posted::Stop(stop) => return Err(stop),
                 Posted::Again(why) => {
@@ -250,10 +250,15 @@ impl Run<'_> {
                     }
                     Verdict::Done => {
                         self.record(id, Phase::Done, None);
-                        return Ok(());
+                        return self.gate_frontend_done();
                     }
                     Verdict::Ended(phase, failure) => {
                         self.record(id, phase, failure.clone());
+                        // Failed or rolled back: the new child never served, or was stood
+                        // down. Gate F, and the old child serves, so the gates read it.
+                        self.gate_step("frontend");
+                        self.gate_revert(Some("frontend"));
+                        let _ = self.resolve_observed("frontend", Exit::Failed);
                         return Err(ended(id, phase, failure.as_ref()));
                     }
                 },
@@ -281,6 +286,15 @@ impl Run<'_> {
             }
             self.env.clock.sleep(self.opts.poll);
         }
+    }
+
+    /// The frontend step ended well: no revert; the child that serves now is not the one that
+    /// was read, so find it, and read it.
+    fn gate_frontend_done(&mut self) -> Result<(), Fail> {
+        self.gate_step("frontend");
+        self.gate_revert(None);
+        self.resolve_observed("frontend", Exit::Failed)?;
+        self.gate_checkpoint("frontend")
     }
 
     fn record(&mut self, id: &UpdateId, phase: Phase, failure: Option<Failure>) {

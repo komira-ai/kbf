@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::api::{Operator, Reply, Request};
+use super::observe::Observe;
 use super::*;
 use crate::proxy::api::model::{RollbackBlocked, StatusBody, UpdateId, UpdateRequest};
 use crate::proxy::model::{Failure, Phase, Step as FailedStep};
@@ -71,6 +72,9 @@ struct NodeScript {
     /// A state the node reports from an older offer (its generation) until this many seconds
     /// after the desired release is set.
     stale: Option<(&'static str, u64, u64)>,
+    /// Seconds after the desired release is set from which the node shows
+    /// `activated_unconfirmed` (its step has begun) until it confirms.
+    activated_at: Option<u64>,
     /// The new frontend lists the node only this many seconds after it offered the commit:
     /// the node has to reconnect to it first.
     relisted_after: Option<u64>,
@@ -83,6 +87,7 @@ fn node(id: &'static str, platform: &'static str, fate: Fate) -> NodeScript {
         connected: true,
         fate,
         stale: None,
+        activated_at: None,
         relisted_after: None,
     }
 }
@@ -181,6 +186,81 @@ struct Farm {
     /// `/v1/nodes` lists no node once the commit is offered.
     empty_after_desired: bool,
     broken: Vec<Broken>,
+    /// `/metrics` at a farm time (seconds): the text, or `None` for a 503.
+    metrics: Box<dyn Fn(u64) -> Option<String> + Send + Sync>,
+    builds: Vec<Build>,
+    /// Rows or invocations per page of a listing; 0 is one page.
+    page: usize,
+    /// Calls the fake does not know. It answers them 404 and notes them here, so a test that
+    /// leans on a call the fake never learned fails instead of passing on a silent default.
+    unknown: Mutex<Vec<String>>,
+    /// Every call the observed frontend ([`ObservedApi`]) was asked.
+    observed_log: Mutex<Vec<String>>,
+    /// Both children answer (an ambiguous farm).
+    both_children: bool,
+    /// Seconds the child that handed over goes on answering after the frontend order.
+    old_child_drains: u64,
+    /// What that child says on `/metrics` while it drains; the farm's script when `None`.
+    retiring_metrics: Option<Box<dyn Fn(u64) -> Option<String> + Send + Sync>>,
+    /// The update API names no serving slot after the order (a status that does not say).
+    status_names_no_slot: bool,
+    /// The slot the status names as serving before any update of this deploy (the previous
+    /// update's), when it names one.
+    previous_slot: Option<&'static str>,
+    /// The serving slot each resolution was told.
+    resolves: Mutex<Vec<Option<observe::Slot>>>,
+    /// Calls a child that was not serving refused, and the reads each child answered (with
+    /// whether the frontend order had been posted).
+    refused: Mutex<Vec<String>>,
+    child_reads: Mutex<Vec<(observe::Slot, bool)>>,
+}
+
+/// A build the fake farm knows: running from `from` to `to` (seconds), whose actions had
+/// attempts that ended in `classes`.
+#[derive(Clone)]
+struct Build {
+    id: &'static str,
+    from: u64,
+    to: Option<u64>,
+    classes: Vec<&'static str>,
+    /// Its record stopped at the row bound.
+    capped: bool,
+}
+
+/// What a healthy farm says on `/metrics`.
+fn healthy() -> Gauges {
+    Gauges {
+        relay_untraced: Some(0.0),
+        lost_blobs: Some(0.0),
+        losses_total: Some(3.0),
+        under_replicated: Some(0.0),
+    }
+}
+
+/// The four series the gates read; `None` leaves the series out of the scrape.
+#[derive(Clone, Copy)]
+struct Gauges {
+    relay_untraced: Option<f64>,
+    lost_blobs: Option<f64>,
+    losses_total: Option<f64>,
+    under_replicated: Option<f64>,
+}
+
+impl Gauges {
+    fn text(&self) -> String {
+        let mut out = String::from("# a scrape\nkbf_other_total 5\n");
+        for (name, v) in [
+            ("kbf_frontend_relay_untraced", self.relay_untraced),
+            ("kbf_cache_lost_blobs", self.lost_blobs),
+            ("kbf_cache_blob_losses_total", self.losses_total),
+            ("kbf_under_replicated_blobs", self.under_replicated),
+        ] {
+            if let Some(v) = v {
+                out.push_str(&format!("{name} {v}\n"));
+            }
+        }
+        out
+    }
 }
 
 impl Broken {
@@ -239,7 +319,115 @@ impl Farm {
             nodes_key_missing: false,
             empty_after_desired: false,
             broken: Vec::new(),
+            metrics: Box::new(|_| Some(healthy().text())),
+            builds: Vec::new(),
+            page: 0,
+            unknown: Mutex::new(Vec::new()),
+            observed_log: Mutex::new(Vec::new()),
+            both_children: false,
+            old_child_drains: 100_000,
+            retiring_metrics: None,
+            status_names_no_slot: false,
+            previous_slot: None,
+            resolves: Mutex::new(Vec::new()),
+            refused: Mutex::new(Vec::new()),
+            child_reads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The scripted failure that applies to `call`, if one does; each match uses up one of
+    /// its `times`. A call is named whole, or by a prefix that ends in `*`.
+    fn break_of(&self, call: &str, _r: &Request) -> Option<Breaks> {
+        self.broken
+            .iter()
+            .find(|b| {
+                let named = match b.call.strip_suffix('*') {
+                    Some(prefix) => call.starts_with(prefix),
+                    None => call == b.call,
+                };
+                named
+                    && (!b.after_desired || self.desired_at().is_some())
+                    && (!b.after_post || self.frontend_at.lock().unwrap().is_some())
+                    && b.hits.fetch_add(1, SeqCst) < b.times
+            })
+            .map(|b| b.how)
+    }
+
+    fn rfc3339(secs: u64) -> String {
+        summary::utc(1_790_000_000 + secs)
+    }
+
+    /// The pages of `all` for `GET path?...&page_token=`, as `{key: [...], next_page}`.
+    fn paged(&self, path: &str, key: &str, query: &str, all: Vec<Value>) -> Value {
+        let token = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("page_token="))
+            .and_then(|t| t.parse::<usize>().ok())
+            .unwrap_or(0);
+        let size = if self.page == 0 {
+            all.len().max(1)
+        } else {
+            self.page
+        };
+        let rest: Vec<Value> = all.iter().skip(token).cloned().collect();
+        let this: Vec<Value> = rest.iter().take(size).cloned().collect();
+        let mut body = json!({ key: this });
+        if rest.len() > size {
+            let base: Vec<&str> = query
+                .split('&')
+                .filter(|kv| !kv.starts_with("page_token="))
+                .collect();
+            body["next_page"] = json!(format!(
+                "{path}?{}&page_token={}",
+                base.join("&"),
+                token + size
+            ));
+        }
+        body
+    }
+
+    fn invocations(&self, r: &Request, now: u64) -> Option<Value> {
+        let (path, query) = r.path.split_once('?').unwrap_or((&r.path, ""));
+        let param = |k: &str| {
+            query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+        };
+        if path == "/v1/invocations" {
+            let (since, until) = (param("since"), param("until"));
+            let open = param("state") == Some("open");
+            if (since.is_none() || until.is_none()) && !open {
+                return None;
+            }
+            let items: Vec<Value> = self
+                .builds
+                .iter()
+                .filter(|b| b.from <= now)
+                .filter(|b| !open || b.to.is_none_or(|t| now < t))
+                .filter(|b| {
+                    let seen = Farm::rfc3339(b.from);
+                    since.is_none_or(|s| s <= seen.as_str())
+                        && until.is_none_or(|u| seen.as_str() <= u)
+                })
+                .map(|b| json!({"id": b.id, "state": "open", "complete": true}))
+                .collect();
+            return Some(self.paged(path, "invocations", query, items));
+        }
+        let rest = path.strip_prefix("/v1/invocations/")?;
+        if !rest.ends_with("/actions") {
+            let build = self.builds.iter().find(|b| b.id == rest)?;
+            return Some(json!({"id": build.id, "rows_capped": build.capped, "complete": true}));
+        }
+        let id = rest.strip_suffix("/actions")?;
+        let build = self.builds.iter().find(|b| b.id == id)?;
+        let mut rows: Vec<Value> = vec![json!({"attempts": [{"end": {"result": "ok"}}]})];
+        rows.extend(
+            build
+                .classes
+                .iter()
+                .map(|c| json!({"attempts": [{"end": {"failure": c, "reason": "x"}}]})),
+        );
+        Some(self.paged(path, "actions", query, rows))
     }
 
     fn requests(&self, prefix: &str) -> usize {
@@ -322,7 +510,13 @@ impl Farm {
             to: id.map(|_| c(TARGET)),
             phase,
             since: id.map(|_| 0),
-            active_slot: None,
+            active_slot: self.named_slot().map(|w| {
+                if w == "a" {
+                    crate::proxy::model::Slot::A
+                } else {
+                    crate::proxy::model::Slot::B
+                }
+            }),
             restart_pending: false,
             rollback_allowed: false,
             rollback_blocked_reason: Some(RollbackBlocked::NotSwitched),
@@ -381,6 +575,9 @@ impl Farm {
             (None, _) => ("confirmed", &OLD[..12], "", 7),
             (Some(_), Fate::ConfirmedOnOld) => ("confirmed", &OLD[..12], "", 8),
             (Some(e), Fate::Confirm(at)) if e >= *at => ("confirmed", &TARGET[..12], "", 8),
+            (Some(e), Fate::Confirm(_)) if n.activated_at.is_some_and(|a| e >= a) => {
+                ("activated_unconfirmed", &TARGET[..12], "", 8)
+            }
             (Some(e), Fate::Revert(at)) if e >= *at => ("reverted", &OLD[..12], "", 8),
             (Some(e), Fate::Refuse(why, at)) if e >= *at => ("refused", &OLD[..12], *why, 8),
             (Some(_), _) => ("staged", &OLD[..12], "", 8),
@@ -408,6 +605,22 @@ impl Farm {
         })
     }
 
+    /// The answer a scripted failure gives.
+    fn broken(how: Breaks) -> io::Result<Reply> {
+        match how {
+            Breaks::Io | Breaks::Lost => Err(io::Error::other("the API is down")),
+            Breaks::Status(s) => Farm::reply(s, json!({})),
+            Breaks::Raw(status, body) => Ok(Reply {
+                status,
+                body: body.as_bytes().to_vec(),
+            }),
+            Breaks::Body(text) => Ok(Reply {
+                status: 200,
+                body: text.as_bytes().to_vec(),
+            }),
+        }
+    }
+
     fn reply(status: u16, body: Value) -> io::Result<Reply> {
         Ok(Reply {
             status,
@@ -425,18 +638,8 @@ impl Farm {
             .push(format!("{} {}", r.method, r.path));
         self.times.lock().unwrap().push(self.now.get());
         let call = format!("{} {}", r.method, r.path);
-        let broken = self.broken.iter().find(|b| {
-            // A call is named whole, or by a prefix that ends in `*`.
-            let named = match b.call.strip_suffix('*') {
-                Some(prefix) => call.starts_with(prefix),
-                None => call == b.call,
-            };
-            named
-                && (!b.after_desired || self.desired_at().is_some())
-                && (!b.after_post || self.frontend_at.lock().unwrap().is_some())
-                && b.hits.fetch_add(1, SeqCst) < b.times
-        });
-        match broken.map(|b| b.how) {
+        let broken = self.break_of(&call, r);
+        match broken {
             None => self.serve(r),
             Some(Breaks::Io) => Err(io::Error::other("the API is down")),
             Some(Breaks::Status(s)) => Farm::reply(s, json!({})),
@@ -528,7 +731,178 @@ impl Farm {
             // takes it, so a deploy that does is seen doing it.
             ("POST", "/v1/update/desired") => Farm::reply(200, json!({})),
             ("GET", "/readyz") => Farm::reply(if self.ready { 200 } else { 503 }, json!({})),
-            _ => Farm::reply(404, json!({})),
+            _ => {
+                self.unknown
+                    .lock()
+                    .unwrap()
+                    .push(format!("{} {}", r.method, r.path));
+                Farm::reply(404, json!({}))
+            }
+        }
+    }
+}
+
+/// The frontend the gates observe (`--observe`): `/metrics` and `/v1/invocations`, on the
+/// farm's state and clock but a listener of its own. It answers nothing else (404, noted), and
+/// the update API ([`Farm`]) answers none of these.
+struct ObservedApi<'a>(&'a Farm);
+
+/// The observed frontend as one fixed address (`--observe`).
+struct Obs<'a>(&'a Farm);
+
+impl Observe for Obs<'_> {
+    fn resolve(&self, _: Option<observe::Slot>) -> Result<observe::Observed<'_>, String> {
+        Ok(observe::Observed {
+            label: "fixed".to_owned(),
+            api: Box::new(ObservedApi(self.0)),
+            others: Vec::new(),
+        })
+    }
+}
+
+/// The two children of the frontend proxy (`--observe-base-port`): only the serving one
+/// answers, the other refuses the connection, and the serving one changes with the handover.
+struct SlotObs<'a>(&'a Farm);
+
+struct Child<'a> {
+    farm: &'a Farm,
+    slot: observe::Slot,
+}
+
+/// Seconds after the POST that the proxy switches to the new child (`Switching`).
+const SWITCH_AT: u64 = 20;
+
+impl Farm {
+    /// The farm's time at which the new child begins to serve: when the update reaches
+    /// `switching`, unless it ends before it (failed, rolled back, refused).
+    fn switched_at(&self) -> Option<u64> {
+        let posted = (*self.frontend_at.lock().unwrap())?;
+        let never = matches!(
+            self.frontend_fate,
+            FrontendFate::Failed
+                | FrontendFate::RolledBack
+                | FrontendFate::Busy
+                | FrontendFate::Refuses(_)
+                | FrontendFate::Incomplete
+        );
+        (!never).then_some(posted + SWITCH_AT)
+    }
+
+    /// The child that serves now: slot A until the update switches, slot B after.
+    fn serving_child(&self) -> observe::Slot {
+        match self.switched_at() {
+            Some(t) if self.now.get() >= t => observe::Slot::B,
+            _ => observe::Slot::A,
+        }
+    }
+
+    /// The slot the status names as serving: none while no update is known.
+    fn named_slot(&self) -> Option<&'static str> {
+        if self.status_names_no_slot {
+            return None;
+        }
+        if self.frontend_at.lock().unwrap().is_some() {
+            return Some(match self.serving_child() {
+                observe::Slot::A => "a",
+                observe::Slot::B => "b",
+            });
+        }
+        self.previous_slot
+    }
+
+    /// Whether `slot`'s child answers. The serving one does; the one that handed over keeps
+    /// draining, and answers, until `old_child_drains` seconds after the switch.
+    fn child_alive(&self, slot: observe::Slot) -> bool {
+        if self.both_children || self.serving_child() == slot {
+            return true;
+        }
+        match self.switched_at() {
+            Some(t) if slot == observe::Slot::A => self.now.get() < t + self.old_child_drains,
+            _ => false,
+        }
+    }
+}
+
+impl Observe for SlotObs<'_> {
+    fn resolve(&self, serving: Option<observe::Slot>) -> Result<observe::Observed<'_>, String> {
+        self.0.resolves.lock().unwrap().push(serving);
+        let slot = observe::choose(serving, |s| self.0.child_alive(s))?;
+        let other = if slot == observe::Slot::A {
+            observe::Slot::B
+        } else {
+            observe::Slot::A
+        };
+        Ok(observe::Observed {
+            label: slot.to_string(),
+            api: Box::new(Child { farm: self.0, slot }),
+            others: vec![observe::Other {
+                label: other.to_string(),
+                api: Box::new(Child {
+                    farm: self.0,
+                    slot: other,
+                }),
+            }],
+        })
+    }
+}
+
+impl Operator for Child<'_> {
+    fn send(&self, r: &Request) -> io::Result<Reply> {
+        if !self.farm.child_alive(self.slot) {
+            self.farm
+                .refused
+                .lock()
+                .unwrap()
+                .push(format!("{}: {} {}", self.slot, r.method, r.path));
+            return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+        }
+        self.farm
+            .child_reads
+            .lock()
+            .unwrap()
+            .push((self.slot, self.farm.frontend_at.lock().unwrap().is_some()));
+        // The child that handed over reports its own series, not the farm's script.
+        let retiring = self.slot != self.farm.serving_child();
+        if let (true, "/metrics", Some(script)) =
+            (retiring, r.path.as_str(), &self.farm.retiring_metrics)
+        {
+            return match script(self.farm.now.get()) {
+                Some(text) => Ok(Reply {
+                    status: 200,
+                    body: text.into_bytes(),
+                }),
+                None => Farm::reply(503, json!({})),
+            };
+        }
+        ObservedApi(self.farm).send(r)
+    }
+}
+
+impl Operator for ObservedApi<'_> {
+    fn send(&self, r: &Request) -> io::Result<Reply> {
+        let f = self.0;
+        let call = format!("{} {}", r.method, r.path);
+        f.observed_log.lock().unwrap().push(call.clone());
+        if let Some(how) = f.break_of(&call, r) {
+            return Farm::broken(how);
+        }
+        let now = f.now.get();
+        match (r.method, r.path.as_str()) {
+            ("GET", "/metrics") => match (f.metrics)(now) {
+                Some(text) => Ok(Reply {
+                    status: 200,
+                    body: text.into_bytes(),
+                }),
+                None => Farm::reply(503, json!({})),
+            },
+            ("GET", p) if p.starts_with("/v1/invocations") => match f.invocations(r, now) {
+                Some(body) => Farm::reply(200, body),
+                None => Farm::reply(404, json!({"error": "no_record"})),
+            },
+            _ => {
+                f.unknown.lock().unwrap().push(format!("observe: {call}"));
+                Farm::reply(404, json!({}))
+            }
         }
     }
 }
@@ -587,11 +961,22 @@ fn run_with(
     smoke: SmokeResult,
     bundle: Option<&mut dyn io::Read>,
 ) -> Summary {
+    run_observing(farm, o, smoke, bundle, &Obs(farm))
+}
+
+fn run_observing(
+    farm: &Farm,
+    o: &Options,
+    smoke: SmokeResult,
+    bundle: Option<&mut dyn io::Read>,
+    observe: &dyn Observe,
+) -> Summary {
     let clock = Clk(farm.now.clone());
     let smoke = FixedSmoke(smoke);
     let check = FixedCheck(Ok(true));
     let env = Env {
         api: farm,
+        observe,
         clock: &clock,
         smoke: &smoke,
         check: &check,
@@ -609,6 +994,7 @@ fn farm(nodes: Vec<NodeScript>) -> Farm {
 }
 
 mod gaps;
+mod gates;
 mod offer;
 mod tls;
 mod update_api;
@@ -923,8 +1309,10 @@ fn a_failed_installer_check_refuses_and_an_unavailable_one_is_recorded() {
     let clock = Clk(f.now.clone());
     let smoke = FixedSmoke(SmokeResult::Pass);
     let bad = FixedCheck(Err("envoy is out of range".into()));
+    let observed = Obs(&f);
     let env = Env {
         api: &f,
+        observe: &observed,
         clock: &clock,
         smoke: &smoke,
         check: &bad,
@@ -937,8 +1325,10 @@ fn a_failed_installer_check_refuses_and_an_unavailable_one_is_recorded() {
     let f = farm(two_nodes());
     let clock = Clk(f.now.clone());
     let none = NoCheck;
+    let observed = Obs(&f);
     let env = Env {
         api: &f,
+        observe: &observed,
         clock: &clock,
         smoke: &smoke,
         check: &none,
@@ -1143,8 +1533,10 @@ fn with_step_back(farm: &Farm, at: u64) -> Summary {
     };
     let smoke = FixedSmoke(SmokeResult::Pass);
     let check = FixedCheck(Ok(true));
+    let observed = Obs(farm);
     let env = Env {
         api: farm,
+        observe: &observed,
         clock: &clock,
         smoke: &smoke,
         check: &check,
@@ -1269,7 +1661,7 @@ mod cli_tests {
     }
 
     /// Proves a caller that came through sudo cannot aim the deploy: each of --api,
-    /// --token-file, --config, --lock, --platform and --cas is a usage error (exit 2) before the
+    /// --token-file, --config, --lock, --platform, --cas and --result is a usage error (exit 2) before the
     /// token is read or anything is sent, and the flags the workflow sends are not. Catches
     /// the deploy account sending a root-readable file as a bearer token to its own listener.
     #[test]
@@ -1284,6 +1676,10 @@ mod cli_tests {
             ("--lock", "/var/tmp/x/lock"),
             ("--platform", "linux-x86_64"),
             ("--cas", "http://127.0.0.1:1"),
+            ("--result", "/etc/cron.d/x"),
+            ("--observe", "127.0.0.1:2"),
+            ("--observe-base-port", "18000"),
+            ("--observe-token-file", "/etc/shadow"),
             // The stage binds an offer to this host; the age limit and the waiver loosen it.
             ("--stage", "gamma"),
             ("--no-offer", "x"),

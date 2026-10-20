@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use super::api::{Https, Trust};
 use super::cli::{CALL_TIMEOUT, host_platform, read_token};
+use super::observe::NoObserve;
 use super::smoke::random;
 use super::summary;
 use super::{Check, Env, NoCheck, NoProbe, NoSmoke, Options, SystemClock, update_frontend};
@@ -54,6 +55,7 @@ pub fn run(args: &UpdateArgs, out: &mut dyn Write, err: &mut dyn Write) -> Exit 
     let (clock, check) = (SystemClock, NoCheck);
     let env = Env {
         api: &api,
+        observe: &NoObserve,
         clock: &clock,
         smoke: &NoSmoke,
         check: &check as &dyn Check,
