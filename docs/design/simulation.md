@@ -109,9 +109,9 @@ per-pool slots shared across rollouts, canary and soak, and the rollout steps af
   the replay command; the scenario is fixed in its own PR with a test that failed
   before, or lands `#[ignore = "issue #N"]`.
 - **Coverage.** A new test raises measured coverage of `kbf-sched` and `kbf-server`,
-  and the ratchet in `coverage-baseline` must match the measurement exactly, so each
-  PR lowers the rows with `kbf-coverage tighten`, the command the failing coverage
-  job prints (see CONTRIBUTING.md).
+  and the gate holds every crate to 99% of lines and branches, or its floor in
+  `coverage-floors`; a PR that raises a crate's coverage raises the floor with
+  `kbf-coverage raise` (see CONTRIBUTING.md).
 
 ## 4. Invariants
 

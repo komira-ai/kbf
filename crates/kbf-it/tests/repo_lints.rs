@@ -36,9 +36,9 @@
 //!   another set (module `release_artifacts`);
 //! - the beta smoke workflow's Buck2 pin and its actions' commits drifting from
 //!   the copies they are of `ci.yml`'s (module `beta_pins`);
-//! - the coverage job's `kbf-coverage --run-id/--repo/--artifact` flags drifting from
-//!   the run and the artifact the job uploads, which breaks the download command the
-//!   ratchet prints (module `coverage_wiring`);
+//! - the test job's coverage gate step skipped by a condition, or its no-lowering check on
+//!   pull requests dropped or made conditional on something else, which lets floors fall
+//!   (module `coverage_wiring`);
 //! - the bake evaluator named anywhere under `.github/` (a workflow, a local action or any
 //!   other file): it runs on the operator's side, never in Actions (module `bake_operator_side`);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was

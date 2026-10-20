@@ -422,7 +422,7 @@ None of these is done by a pull request in this series; each needs the owner's e
 ## 17. Units
 
 Each is its own pull request, red first, listing its mutants. Each that adds code also
-tightens `coverage-baseline`.
+meets the coverage gate (`coverage-floors`).
 
 | Unit | Does | After |
 |---|---|---|

@@ -106,7 +106,7 @@ jobs:
 
   # The whole nextest run, the slow tests included (the default profile; a pull request runs
   # the `pr` profile of .config/nextest.toml), then the doc tests and the tests that need a
-  # tool this job fetches. No coverage: the ratchet is measured on the fast set, in ci.yml.
+  # tool this job fetches. No coverage: the 99% gate is measured on the fast set, in ci.yml.
   test-x86:
     runs-on: ubuntu-latest
     timeout-minutes: 90
