@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn only_a_loopback_address_is_observed() {
         let t = Duration::from_secs(1);
-        for addr in ["10.1.2.3:80", "[2001:db8::1]:80", "0.0.0.0:80"] {
+        for addr in ["203.0.113.9:80", "[2001:db8::1]:80", "0.0.0.0:80"] {
             let e = Http::new(addr.parse().expect("addr"), "tok".to_owned(), t)
                 .err()
                 .expect("refused");
