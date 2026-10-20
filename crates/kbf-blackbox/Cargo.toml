@@ -20,6 +20,8 @@ kbf-proto.workspace = true
 kbf-testkit.workspace = true
 kbf-transfer.workspace = true
 prost.workspace = true
+prost-types.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tonic = { workspace = true, features = ["tls-ring"] }
 

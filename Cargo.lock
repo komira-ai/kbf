@@ -1437,6 +1437,8 @@ dependencies = [
  "kbf-testkit",
  "kbf-transfer",
  "prost",
+ "prost-types",
+ "rustix",
  "tokio",
  "tonic",
 ]
