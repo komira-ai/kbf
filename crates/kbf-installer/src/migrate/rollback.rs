@@ -10,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use kbf_host::{Exec, Mode};
 
-use super::apply::{remove_note, rules};
+use super::apply::{KIT_INSTALLER_JOB, remove_note, rules};
+use super::daemon_dirs;
 use super::error::MigrateError;
 use super::journal::{Journal, Phase};
 use super::newtree::StateDir;
@@ -193,10 +194,6 @@ fn plan(mode: Mode, kit: bool, unknown_state: Option<String>) -> Report {
 }
 
 /// Put the host back on the old layout, or (in a dry run) say what would be done.
-/// The package's installer job on a Mac (`packaging/macos`), stopped by a kit-host rollback
-/// when `--installer-unit` names none.
-const KIT_INSTALLER_JOB: &str = "com.komira.kbf-installer.plist";
-
 pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Report, MigrateError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -292,6 +289,7 @@ pub fn rollback_at<E: Exec>(
             );
         }
     }
+    daemon_dirs::restore(m, svc.exec, mode, &mut report)?;
     svc.reload().map_err(MigrateError::io("daemon-reload"))?;
     if let Some(helper) = &journal.helper_unit {
         svc.enable(helper)

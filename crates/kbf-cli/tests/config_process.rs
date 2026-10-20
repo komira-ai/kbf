@@ -604,11 +604,31 @@ fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
                 "\n[storage]\nhot_dir = \"{here}/hot\"\nmeta_dir = \"{here}/meta\"\n"
             ));
         }
+        let mut twice = None;
         if [names::DAEMON, names::STORAGE_AND_DAEMON].contains(&mode.name) {
-            text.push_str(&format!("\n[daemon]\ndata_dir = \"{here}/data\"\n"));
+            // `setup` writes a `[daemon]` table here (the update directories): the key goes into
+            // it, as the file's header says. A second table of the name is the operator's
+            // mistake, tried below.
+            let key = format!("data_dir = \"{here}/data\"\n");
+            let header = "[daemon]\n";
+            let at = text.find(header).expect("setup writes a [daemon] table") + header.len();
+            twice = Some(format!("{text}\n[daemon]\n{key}"));
+            text.insert_str(at, &key);
         }
         let file = dir.join("kbf.toml");
         write(&file, &text, 0o600);
+        if let Some(twice) = twice {
+            let second = dir.join("twice.toml");
+            write(&second, &twice, 0o600);
+            let args = vec![
+                format!("--mode={}", mode.name),
+                "--check".to_owned(),
+                format!("--config={}", second.display()),
+            ];
+            let r = run_in(&args, &host_env(&dir));
+            assert_eq!(r.code, Some(2), "{}: {}", mode.name, r.err);
+            assert!(r.err.contains("duplicate"), "{}: {}", mode.name, r.err);
+        }
         let mut args = vec![
             format!("--mode={}", mode.name),
             "--check".to_owned(),

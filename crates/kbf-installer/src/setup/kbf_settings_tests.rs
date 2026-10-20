@@ -77,14 +77,14 @@ fn with_files(mut exec: FakeExec, service: Owner) -> FakeExec {
     exec
 }
 
-fn frontend() -> Raw {
+pub(super) fn frontend() -> Raw {
     Raw {
         kbf: frontend_flags(),
         ..raw(Mode::Frontend)
     }
 }
 
-fn all_in_one() -> Raw {
+pub(super) fn all_in_one() -> Raw {
     Raw {
         kbf: all_in_one_flags(),
         ..raw(Mode::AllInOne)
@@ -99,7 +99,7 @@ fn service_of(mode: Mode) -> Owner {
     }
 }
 
-fn host_for(raw: &Raw) -> FakeExec {
+pub(super) fn host_for(raw: &Raw) -> FakeExec {
     released(with_files(host(), service_of(raw.mode)), Platform::Linux)
 }
 

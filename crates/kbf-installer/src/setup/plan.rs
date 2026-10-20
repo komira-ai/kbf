@@ -9,7 +9,7 @@
 
 use kbf_host::{Cmd, Entry, Exec, HostPath, Owner, Perms, Plan, Planner, RunUser};
 
-use super::kbf_toml::{self, Decision, Ours};
+use super::kbf_toml::{self, Decision, Ours, UpdateDirs};
 use super::os::{DSCL, LAUNCHCTL, Os, SYSTEMCTL, View};
 use super::paths;
 use super::validate::{Valid, mode_name};
@@ -91,7 +91,7 @@ pub fn mode_units(mode: Mode, proxy: bool) -> &'static [&'static str] {
 }
 
 /// The user a mode's unit runs as on Linux (`User=` of the package's units).
-pub(super) fn service_user_name(mode: Mode) -> &'static str {
+pub(crate) fn service_user_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Frontend | Mode::Storage => "kbf-server",
         Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne => "kbf",
@@ -121,6 +121,13 @@ pub fn backup_user_dropin(user: &str, state: &str) -> String {
 /// Whether the host runs actions in containers: it then needs a subid range and lingering.
 fn runs_actions(mode: Mode) -> bool {
     matches!(mode, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
+}
+
+/// Whether the mode's daemon takes update orders: the one `kbf` starts with a storage map. The
+/// in-process daemon of `all-in-one` refuses `--update-dir` (`kbf-node`'s `start_over`), so it
+/// is not written there.
+pub fn takes_orders(mode: Mode) -> bool {
+    matches!(mode, Mode::Daemon | Mode::StorageAndDaemon)
 }
 
 /// Whether the host serves the operator API, which needs a token.
@@ -460,7 +467,7 @@ pub fn before_release(
     dir(&mut p, paths::etc_dir(platform), 0o755, root)?;
     let state_dir = ctx.layout.state_dir().to_string();
     dir(&mut p, &state_dir, 0o755, root)?;
-    dir(&mut p, &format!("{state_dir}/orders"), 0o700, service)?;
+    dir(&mut p, ctx.layout.orders_dir().as_str(), 0o700, service)?;
 
     // The tokens belong to the user whose process reads them: both loaders refuse a token
     // file another user owns, or one with a mode other than 0600 or 0400.
@@ -581,12 +588,20 @@ pub fn after_release(
 
     let platform = ctx.platform;
     let kbf_toml_path = paths::kbf_toml(platform);
+    let (update_dir, orders_dir) = (
+        ctx.layout.update_dir().to_string(),
+        ctx.layout.orders_dir().to_string(),
+    );
     let ours = Ours {
         mode: mode_name(v.mode),
         frontend_url: v.frontend_url.as_deref(),
         token_file: v.token_file.as_ref().map(|_| paths::enroll_token(platform)),
         api_token_file: serves_api(v.mode).then_some(paths::api_token(platform)),
         state_store: v.database.as_deref(),
+        update: takes_orders(v.mode).then_some(UpdateDirs {
+            update_dir: &update_dir,
+            orders_dir: &orders_dir,
+        }),
         extra: &v.kbf,
     };
     let current = match exec.inspect(&hp(kbf_toml_path)?)? {
@@ -599,9 +614,7 @@ pub fn after_release(
         None => None,
     };
     let decision = match (&current, ctx.kit_adopted) {
-        (Some(text), true) => {
-            kbf_toml::decide_adopted(text, &ours, ctx.layout.state_dir().as_str(), kbf_toml_path)
-        }
+        (Some(text), true) => kbf_toml::decide_adopted(text, &ours, kbf_toml_path),
         _ => kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path),
     };
     match decision {

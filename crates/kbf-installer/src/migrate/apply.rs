@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use kbf_host::{Exec, Mode};
 
+use super::daemon_dirs;
 use super::error::MigrateError;
 use super::floor::{self, Seeded};
 use super::journal::{Adopted, Journal, Phase};
@@ -395,6 +396,8 @@ pub fn migrate<E: Exec>(
         let outcome = units::rewrite(&rules, &units_dir, &backup, unit, &new_bin)?;
         report.line(mode, format!("{unit}: {}", describe(outcome)));
     }
+    // Before the services start again: a node reads its keys when it starts.
+    daemon_dirs::add(m, svc.exec, mode, &mut report)?;
     svc.reload().map_err(MigrateError::io("daemon-reload"))?;
 
     for unit in journal.stopped.clone() {
@@ -423,7 +426,7 @@ pub fn migrate<E: Exec>(
 /// this job, named or not, so a migration enables it when `--installer-unit` names none. (The
 /// same constant, with the same value, is in `rollback.rs`, which stops it; they are to be one
 /// definition.)
-const KIT_INSTALLER_JOB: &str = "com.komira.kbf-installer.plist";
+pub(super) const KIT_INSTALLER_JOB: &str = "com.komira.kbf-installer.plist";
 
 /// The installer's unit this migration enables: the one `--installer-unit` names, else on a kit
 /// host the package's job. An old host without the flag has none (its units are the operator's).
@@ -564,6 +567,7 @@ fn plan<E: Exec>(
         Mode::DryRun,
         "copy or verify each release, repoint the links, rewrite the units",
     );
+    daemon_dirs::add(m, svc.exec, Mode::DryRun, report)?;
     Ok(())
 }
 

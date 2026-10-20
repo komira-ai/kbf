@@ -5,7 +5,7 @@ use std::fs;
 
 use super::backend::{Backend, Migrations, Releases, Schemas};
 use super::fake::FakeOs;
-use super::kbf_toml::{Decision, Ours, decide, decide_adopted};
+use super::kbf_toml::{Decision, Ours, UpdateDirs, decide, decide_adopted};
 use super::validate::Raw;
 use super::{Options, SetupError, run};
 use crate::CommitId;
@@ -17,6 +17,7 @@ use crate::migrate::{MigrateError, Unit};
 
 const PATH: &str = "/usr/local/etc/kbf/kbf.toml";
 const UPDATE_DIR: &str = "/var/db/kbf-installer";
+const ORDERS_DIR: &str = "/var/db/kbf-installer/orders";
 
 fn ours<'a>() -> Ours<'a> {
     Ours {
@@ -25,6 +26,10 @@ fn ours<'a>() -> Ours<'a> {
         token_file: Some("/usr/local/etc/kbf/enroll.token"),
         api_token_file: None,
         state_store: None,
+        update: Some(UpdateDirs {
+            update_dir: UPDATE_DIR,
+            orders_dir: ORDERS_DIR,
+        }),
         extra: &[],
     }
 }
@@ -43,7 +48,7 @@ fn the_kits_keys_are_kept_and_the_missing_ones_added() {
         decide(Some(KBF_TOML), &ours(), PATH),
         Decision::Refuse(_)
     ));
-    let Decision::Write(text) = decide_adopted(KBF_TOML, &ours(), UPDATE_DIR, PATH) else {
+    let Decision::Write(text) = decide_adopted(KBF_TOML, &ours(), PATH) else {
         panic!("adopted arm refused");
     };
     let mut rest = text.lines();
@@ -63,20 +68,18 @@ fn the_kits_keys_are_kept_and_the_missing_ones_added() {
         Some("/usr/local/etc/kbf/enroll.token")
     );
     assert_eq!(table["daemon"]["update-dir"].as_str(), Some(UPDATE_DIR));
+    assert_eq!(table["daemon"]["orders-dir"].as_str(), Some(ORDERS_DIR));
     assert_eq!(table["daemon"]["driver"][0].as_str(), Some("native"));
-    // Only these three keys are new.
+    // Only these four keys are new.
     let was: toml::Table = KBF_TOML.parse().expect("toml");
     let count = |t: &toml::Table| {
         t.values()
             .map(|v| v.as_table().map_or(1, |x| x.len()))
             .sum::<usize>()
     };
-    assert_eq!(count(&table), count(&was) + 3);
+    assert_eq!(count(&table), count(&was) + 4);
     // Run again on the result: nothing to add.
-    assert_eq!(
-        decide_adopted(&text, &ours(), UPDATE_DIR, PATH),
-        Decision::Keep
-    );
+    assert_eq!(decide_adopted(&text, &ours(), PATH), Decision::Keep);
 }
 
 /// Catches a kit key rewritten: a key that is there with another value (the update directory,
@@ -99,7 +102,7 @@ fn a_kit_key_that_differs_is_refused_not_rewritten() {
             "mode",
         ),
     ] {
-        let Decision::Refuse(why) = decide_adopted(&text, &ours(), UPDATE_DIR, PATH) else {
+        let Decision::Refuse(why) = decide_adopted(&text, &ours(), PATH) else {
             panic!("{want}: not refused");
         };
         assert!(
@@ -117,12 +120,12 @@ fn a_kit_key_that_differs_is_refused_not_rewritten() {
 /// Mutants seen red: the parse check of the result removed (a duplicate table is written).
 #[test]
 fn an_edit_that_would_change_a_kit_key_is_refused_and_odd_files_are_handled() {
-    let Decision::Refuse(why) = decide_adopted("mode = [", &ours(), UPDATE_DIR, PATH) else {
+    let Decision::Refuse(why) = decide_adopted("mode = [", &ours(), PATH) else {
         panic!("not refused");
     };
     assert!(why.contains("not valid TOML"), "{why}");
     let inline = "mode = \"daemon\"\ndaemon = { driver = [\"native\"] }\n";
-    let Decision::Refuse(why) = decide_adopted(inline, &ours(), UPDATE_DIR, PATH) else {
+    let Decision::Refuse(why) = decide_adopted(inline, &ours(), PATH) else {
         panic!("not refused");
     };
     assert!(
@@ -130,7 +133,7 @@ fn an_edit_that_would_change_a_kit_key_is_refused_and_odd_files_are_handled() {
         "{why}"
     );
     let bare = "[identity]\nnode-id = \"a\"";
-    let Decision::Write(text) = decide_adopted(bare, &ours(), UPDATE_DIR, PATH) else {
+    let Decision::Write(text) = decide_adopted(bare, &ours(), PATH) else {
         panic!("refused");
     };
     let table: toml::Table = text.parse().expect("toml");
@@ -139,7 +142,7 @@ fn an_edit_that_would_change_a_kit_key_is_refused_and_odd_files_are_handled() {
     assert!(text.starts_with("mode = \"daemon\"\n"), "{text}");
     // Keys go after the table's last line, before a following table and its comment.
     let two = "mode = \"daemon\"\n[frontend]\nx = \"1\"\n\n# next\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n";
-    let Decision::Write(text) = decide_adopted(two, &ours(), UPDATE_DIR, PATH) else {
+    let Decision::Write(text) = decide_adopted(two, &ours(), PATH) else {
         panic!("refused");
     };
     let table: toml::Table = text.parse().expect("toml");
@@ -225,8 +228,8 @@ fn adopt(rig: &mut Rig) {
 
 /// Catches `setup` unusable after a kit-host migration, on jerry's fixtures: adopt the kit Mac
 /// (`testdata/kit_host`), then `setup --mode=daemon` succeeds, every kit line of `kbf.toml` is
-/// still there in order, and the three keys it adds ([frontend] url, [enroll] token_file,
-/// [daemon] update-dir) are the only new ones. Setup also writes `installer.toml`.
+/// still there in order, and the four keys it adds ([frontend] url, [enroll] token_file,
+/// [daemon] update-dir and orders-dir) are the only new ones. Setup also writes `installer.toml`.
 ///
 /// Mutants seen red: the journal's `kit` ignored (the old refusal); `Done` not required.
 #[test]
@@ -255,7 +258,7 @@ fn setup_after_a_kit_host_migration_keeps_the_kits_file_and_adds_its_keys() {
             .map(|v| v.as_table().map_or(1, |x| x.len()))
             .sum::<usize>()
     };
-    assert_eq!(count(&is), count(&was) + 3);
+    assert_eq!(count(&is), count(&was) + 4);
     assert!(rig.at("usr/local/etc/kbf/installer.toml").is_file());
 }
 
