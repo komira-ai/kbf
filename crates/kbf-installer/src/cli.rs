@@ -298,7 +298,10 @@ impl Verb {
     /// user) and `update` (a client of the proxy's update API: it needs whoever can read the
     /// token file, which is the only thing it asks of its user) needs root.
     pub fn needs_root(&self) -> bool {
-        !matches!(self, Verb::Status | Verb::Check | Verb::Proxy(_) | Verb::Update(_))
+        !matches!(
+            self,
+            Verb::Status | Verb::Check | Verb::Proxy(_) | Verb::Update(_)
+        )
     }
 
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
