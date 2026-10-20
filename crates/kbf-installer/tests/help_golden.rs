@@ -13,7 +13,7 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-installer");
 
 /// The visible verbs, in the order the help lists them.
-const VERBS: [&[&str]; 15] = [
+const VERBS: [&[&str]; 16] = [
     &[],
     &["setup"],
     &["status"],
@@ -22,6 +22,7 @@ const VERBS: [&[&str]; 15] = [
     &["confirm"],
     &["revert"],
     &["rollback"],
+    &["record-release"],
     &["gc"],
     &["boot-check"],
     &["quiesce"],

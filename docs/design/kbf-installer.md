@@ -21,6 +21,7 @@ One binary (**to build**; today a library plus `kbf-helper`). Mutating verbs are
 | `update --commit SHA --frontend` | The frontend host's own update (section 6), run as root by whatever external trigger the operator uses. Runs inline under the lock (exit 4 while a `run` pass holds it); no control socket. |
 | `confirm`/`revert ID` | Operator override of a pending swap, naming the activation id; inline under the lock. Exit 5 if none pending. |
 | `rollback` | `current` to `previous`, no window. Operator only; the only verb allowed below the release floor. |
+| `record-release` | Make a release placed by hand the first one: checks `releases/<sha>`, writes `VERIFIED`, makes it `current`. The operator vouches; nothing is fetched or attested (the frontend proxy starts only a `VERIFIED` release). Operator only. |
 | `gc` | Keeps current, previous, one more. State-aware (S22). |
 | `boot-check` | Counts starts of a release on trial; reverts when the budget is spent (**built** logic). |
 | `quiesce` | For maintainer scripts: takes the lock, exit 5 if a swap is pending (S25). |
