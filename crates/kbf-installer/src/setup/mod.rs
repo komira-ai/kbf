@@ -354,7 +354,8 @@ pub fn run(
         let mark = if options.apply { "+" } else { "DRY-RUN:" };
         for shadow in &shadows {
             let path = &shadow.path;
-            writeln!(out, "{mark} retire {path} (shadows the packaged unit; original kept)")?;
+            let line = format!("{mark} retire {path} (shadows the packaged unit; original kept)");
+            writeln!(out, "{line}")?;
         }
         let retire = plan::retire(&*exec, &ctx, &shadows)?;
         steps += emit(&retire, exec, options.apply, out)?;
