@@ -12,7 +12,9 @@
 //! 1. the node says its index rebuild is done (this beat's `catching_up` is false);
 //! 2. the mark is in the adopting phase ([`super::fence`]: the flush barrier held and an
 //!    epoch is open), and the joiner reports `tail_epoch_done` at or above it under the boot
-//!    the fence recorded for it;
+//!    the fence recorded for it, and the map holds every write owner at the boot the fence
+//!    recorded (a restart is published in the map before the sweeper has reopened the
+//!    epoch, and no fingerprint shows it);
 //! 3. its `fill_fp` equals the fingerprint of the current map with it assumed `Active`, and
 //!    the mark's own does (the frontend has not yet opened a newer epoch for a placement
 //!    change);
@@ -32,7 +34,8 @@ use kbf_map::{MemberId, MemberState};
 use kbf_state::{Cond, StoreTime, Txn, Version};
 use prost::Message as _;
 
-use super::handoff::{ADOPTING, Block, Fill, Unfilled, fill_fp};
+use super::fence::write_owner_boots;
+use super::handoff::{ADOPTING, Block, FenceBoot, Fill, Unfilled, fill_fp};
 use super::join::unfilled_key;
 use super::row::Live;
 use super::{MAP_KEY, Members, MembershipError, Progress, decode_map};
@@ -168,11 +171,41 @@ impl Members {
                 fenced,
             });
         }
+        // A write owner's boot is in no fingerprint: the sweeper reopens the epoch for it only
+        // after the map holding it is published, and until then what the joiner
+        // acknowledged was judged against the owner as it was.
+        let boots = write_owner_boots(map);
+        if body.fence_boots != boots {
+            let mut members: Vec<u64> = body
+                .fence_boots
+                .iter()
+                .chain(&boots)
+                .map(|b| b.member)
+                .collect();
+            members.sort_unstable();
+            members.dedup();
+            let boot_of = |list: &[FenceBoot], member| {
+                list.iter().find(|b| b.member == member).map(|b| b.boot)
+            };
+            for member in members {
+                let (have, fenced) = (boot_of(&boots, member), boot_of(&body.fence_boots, member));
+                // The joiner's own boot is said by the check above.
+                if have != fenced && !(member == id.0 && fenced != Some(live.boot)) {
+                    blocks.push(Block::OwnerBoot {
+                        member: MemberId(member),
+                        have,
+                        fenced,
+                    });
+                }
+            }
+        }
         let now_fp = fill_fp(map, id);
         if now_fp != Some(fill.fill_fp) || now_fp != Some(body.fp) {
             blocks.push(Block::Fingerprint);
         }
         if !self.handoff.is_some_and(|h| h.allow_degraded) {
+            // Equivalent to the fingerprint check for the beat's own decision: a member going
+            // `Down` changes the placement. Kept as the plain statement of the rule.
             blocks.extend(
                 map.members()
                     .iter()

@@ -184,6 +184,18 @@ pub enum Block {
         /// The boot the fence recorded; `None` if it recorded none.
         fenced: Option<u64>,
     },
+    /// A write owner other than the joiner has a boot in the map that differs from the one
+    /// the fence recorded (it restarted, registered after the fence, or left the map): what
+    /// the joiner acknowledged was judged against the owner before that, so the frontend
+    /// must open a new epoch first.
+    OwnerBoot {
+        /// The owner.
+        member: MemberId,
+        /// Its boot in the map (`None`: it left the map).
+        have: Option<u64>,
+        /// The boot the fence recorded (`None`: it recorded none).
+        fenced: Option<u64>,
+    },
     /// The joiner's pass began under another placement than the map has now.
     Fingerprint,
     /// All hold; the settle time has not passed.
@@ -228,6 +240,21 @@ impl fmt::Display for Block {
                 f,
                 "boot {have} registered after the fence; a new epoch is to be opened"
             ),
+            Self::OwnerBoot {
+                member,
+                have,
+                fenced,
+            } => {
+                write!(f, "member {} ", member.0)?;
+                match (have, fenced) {
+                    (Some(have), Some(fenced)) => {
+                        write!(f, "is at boot {have}; the fence recorded boot {fenced}")?
+                    }
+                    (Some(have), None) => write!(f, "registered boot {have} after the fence")?,
+                    (None, _) => f.write_str("left the map after the fence")?,
+                }
+                f.write_str("; a new epoch is to be opened")
+            }
             Self::Fingerprint => f.write_str("the pass began under a different placement"),
             Self::Settling(left) => {
                 write!(
