@@ -373,6 +373,8 @@ impl Membership for MembershipService {
             map: map.as_ref().map(pb::Map::from),
             objstore_generation,
             retained_previous,
+            // The frontend opens no tail fence yet.
+            tail_epoch: 0,
         }))
     }
 }
