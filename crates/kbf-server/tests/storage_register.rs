@@ -1614,7 +1614,7 @@ async fn a_started_node_reports_the_writes_it_has_open() {
     use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 
     let f = frontend(None);
-    let (node, client) = waiting_node(&f, "reports-writes").await;
+    let (_node_dir, node, client) = waiting_node(&f, "reports-writes").await;
     let (maps, here) = (node.maps(), node.addr);
     let _serving = tokio::spawn(node.serve());
     until("the node to hold a map", || {
