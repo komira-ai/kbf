@@ -153,7 +153,7 @@ fn a_second_frontend_update_and_one_for_the_installed_release_are_refused_before
 /// Mutant planted: the report error ignored (the fetch happens anyway).
 #[test]
 fn a_frontend_update_stops_before_the_fetch_when_status_cannot_be_written() {
-    let mut rig = Rig::frontend("status-unwritable");
+    let mut rig = Rig::frontend("frontend-status-unwritable");
     fs::remove_file(rig.root.join(UPDATE).join("status.json")).expect("status.json");
     fs::create_dir(rig.root.join(UPDATE).join("status.json")).expect("a directory in its place");
     rig.order(1, Verb::FrontendUpdate, B);
