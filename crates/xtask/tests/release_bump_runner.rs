@@ -217,13 +217,19 @@ fn git_runs_with_the_header_and_what_it_prints_hides_it() {
     let init = p.git(&["init", "-q", dir]).expect("git runs");
     assert!(init.ok, "{}", init.stderr);
     let key = "http.https://github.com/.extraheader";
-    let got = p.git(&["-C", dir, "config", "--get", key]).expect("git runs");
+    let got = p
+        .git(&["-C", dir, "config", "--get", key])
+        .expect("git runs");
     assert!(got.ok, "{}", got.stderr);
     assert_eq!(got.stdout, "AUTHORIZATION: basic ***\n");
     let bad = p.git(&["-C", dir, "config", "--type=int", "--get", key]);
     let bad = bad.expect("git runs");
     assert!(!bad.ok);
-    assert!(bad.stderr.contains("AUTHORIZATION: basic ***"), "{}", bad.stderr);
+    assert!(
+        bad.stderr.contains("AUTHORIZATION: basic ***"),
+        "{}",
+        bad.stderr
+    );
     assert!(!bad.stderr.contains(&credential()), "{}", bad.stderr);
 }
 

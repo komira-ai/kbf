@@ -481,9 +481,8 @@ fn cover(tools: &dyn Tools, b: &Bump, p: &Pr) -> Result<String, Error> {
         return Ok(line);
     }
     let state = if p.open { "open" } else { "merged" };
-    let line = format!(
-        "a bump pull request for {tag} or newer exists ({url}, {state}): nothing to open"
-    );
+    let line =
+        format!("a bump pull request for {tag} or newer exists ({url}, {state}): nothing to open");
     Ok(line)
 }
 

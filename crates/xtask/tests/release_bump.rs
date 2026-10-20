@@ -707,7 +707,10 @@ fn a_full_page_of_pull_requests_is_not_an_error() {
     let said = run(&w).expect("a full page is a list like any other");
     assert!(said[1].starts_with("opened "), "{said:?}");
     let lists = w.starting("gh pr list");
-    assert!(lists[0].contains(" sort:created-desc --limit 100 "), "{lists:?}");
+    assert!(
+        lists[0].contains(" sort:created-desc --limit 100 "),
+        "{lists:?}"
+    );
 }
 
 #[test]
@@ -813,7 +816,10 @@ fn trailing_blank_lines_after_the_pull_request_url_are_not_a_failure() {
     let mut w = world();
     w.created = format!("Creating pull request\n\n{PR_URL}\n\n \n");
     let said = run(&w).expect("a good bump");
-    assert_eq!(said[1], format!("opened {PR_URL} with auto-merge: kbf to v1.2.3"));
+    assert_eq!(
+        said[1],
+        format!("opened {PR_URL} with auto-merge: kbf to v1.2.3")
+    );
 }
 
 #[test]
@@ -835,7 +841,10 @@ fn a_gitlink_that_is_not_the_path_asked_for_or_not_a_full_commit_refuses() {
         let mut w = world();
         w.tree = Some(tree.clone());
         let why = refused(run(&w));
-        assert!(why.starts_with("kbf is not a gitlink at HEAD"), "{tree:?}: {why}");
+        assert!(
+            why.starts_with("kbf is not a gitlink at HEAD"),
+            "{tree:?}: {why}"
+        );
         assert!(!changed(&w), "{tree:?}");
     }
 }
@@ -898,7 +907,10 @@ fn a_failing_close_of_an_older_pull_request_is_an_error_that_names_the_new_one()
     w.prs = listing(&[pr(5, "1.2.0", "OPEN", true)]);
     w.fail = Some(("gh pr close", "boom"));
     let why = failed(run(&w));
-    assert!(why.starts_with("gh pr close: boom (already done: opened "), "{why}");
+    assert!(
+        why.starts_with("gh pr close: boom (already done: opened "),
+        "{why}"
+    );
     assert!(why.contains(PR_URL), "{why}");
 }
 
