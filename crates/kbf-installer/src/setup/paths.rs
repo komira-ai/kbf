@@ -35,8 +35,3 @@ pub fn node_identity(platform: Platform, role: &str) -> (String, String) {
     let pki = format!("{}/pki", kbf_state_dir(platform));
     (format!("{pki}/{role}.pem"), format!("{pki}/{role}.key"))
 }
-
-/// What the retired `kbf-helper` and `kbf-deploy host` left on a host: their release tree and
-/// state. `kbf-installer` and they never both manage one host (contract section 8), and the
-/// migration is not built, so `setup` stops where either is there.
-pub const OLD_LAYOUT: [&str; 2] = ["/usr/local/kbf", "/var/lib/kbf-deploy"];
