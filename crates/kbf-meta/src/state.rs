@@ -113,10 +113,35 @@ pub enum Command {
         object: ObjectId,
     },
     /// The store holds different bytes under a sealed object's key: the object stays
-    /// staged and is read from its block, and the flusher stops retrying it.
+    /// staged and is read from its block. Builds before [`Command::ReseatStaged`]
+    /// committed it and never retried the object; a build that has the reseat commits no
+    /// new one and moves an object in this state.
     FlushConflict {
         /// The object.
         object: ObjectId,
+    },
+    /// Moves a sealed (or conflicting) staged object's records to another object, in one
+    /// step (write-path.md, section 6.4; format 5). The store holds another object under
+    /// `from`'s key, so its records are staged again under a key of their own: `to` is
+    /// the new object, synced on `tier`, with every record of `from` that is still
+    /// indexed there. Each such blob's index entry moves to `to` (nothing is marked
+    /// unreachable or counted as lost, and the blob is never unavailable), `to` is
+    /// marked staged on `tier` as [`Command::PutStaged`] does it (or, with `stored`, is
+    /// an object the store already holds, and is not staged), the flush order follows
+    /// (every object that waited for `from` waits for `to`, and `to` waits for whatever
+    /// `from` did), and `from` leaves the table. Refused, changing nothing, if `from`
+    /// is not staged on `tier` or still open, if `to` fails the checks of a
+    /// [`Command::PutStaged`] or is staged already, or if a blob indexed at `from` is
+    /// not listed in `to`. A retry of a command that applied is a no-op.
+    ReseatStaged {
+        /// The tier `from` is staged on and `to` was synced on.
+        tier: TierId,
+        /// The object whose key holds another object.
+        from: ObjectId,
+        /// The new object and its records.
+        to: StagedPut,
+        /// `to` is in the store already: it is indexed there and not staged.
+        stored: bool,
     },
     /// The store no longer holds `objects`, or is about to delete them: forget what
     /// they held. Every blob whose current location is in one of them leaves the
@@ -192,7 +217,7 @@ pub enum Applied {
     /// [`Command::PutStaged`]: one outcome per blob, object by object, in order.
     Staged(Result<Vec<BlobWrite>, TierError>),
     /// [`Command::AddTier`], [`Command::SealStaged`], [`Command::ObjectFlushed`] or
-    /// [`Command::FlushConflict`].
+    /// [`Command::FlushConflict`] or [`Command::ReseatStaged`].
     Tier(Result<(), TierError>),
     /// [`Command::EvictObjects`].
     Evicted(Evicted),
@@ -492,6 +517,12 @@ impl MetaState {
             Command::SealStaged { object } => Applied::Tier(self.seal_staged(object)),
             Command::ObjectFlushed { object } => Applied::Tier(self.object_flushed(object)),
             Command::FlushConflict { object } => Applied::Tier(self.flush_conflict(object)),
+            Command::ReseatStaged {
+                tier,
+                from,
+                to,
+                stored,
+            } => Applied::Tier(self.reseat_staged(tier, from, to, stored)),
             Command::EvictObjects { objects } => Applied::Evicted(self.evict_objects(&objects)),
             Command::SetWriter(writer) => Applied::Writer(self.set_writer(writer)),
             Command::AdoptSegment { object, entries } => {

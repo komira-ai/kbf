@@ -271,3 +271,140 @@ fn sha256_of(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
 }
+
+const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+const MAIN: &str = "refs/heads/main";
+
+#[test]
+fn pkg_build_takes_the_version_from_the_binary_and_pkg_macos_asset_makes_the_asset() {
+    // Catches: the steps of the macOS artifacts job not fitting each other: `pkg-trust`'s
+    // directory (gh 0755, root, conf) not the `--trust` files `pkg build` wants, `--version-of`
+    // ignored or given with `--version`, a package whose binary is not the tarball's,
+    // or one attested for another branch than it trusts, accepted as the asset; and
+    // `--verify-only` writing, or accepting a file not named as the asset.
+    let dir = scratch("macos-asset");
+    // The fake as `kbf-installer`, which prints `kbf-installer 0.1.0+<stamp>`.
+    let binary = dir.join("named").join("kbf-installer");
+    std::fs::create_dir(dir.join("named")).unwrap();
+    std::fs::hard_link(FAKE, &binary).unwrap();
+    let xtask = |args: &[&str]| {
+        let out = Command::new(XTASK)
+            .args(args)
+            .env("XTASK_FAKE_INSTALLER_VERSION", &COMMIT[..12])
+            .output()
+            .expect("run xtask");
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        (out.status.code(), text(&out.stdout), text(&out.stderr))
+    };
+    // The trust directory as CI makes it.
+    let (gh, root) = (dir.join("gh"), dir.join("root.jsonl"));
+    std::fs::write(&gh, b"the pinned gh").unwrap();
+    std::fs::write(&root, b"{\"mediaType\":\"trustedroot\"}\n").unwrap();
+    let trust = dir.join("trust");
+    let (code, _, stderr) = xtask(&[
+        "pkg-trust",
+        "--gh",
+        s(&gh),
+        "--trusted-root",
+        s(&root),
+        "--source-ref",
+        MAIN,
+        "--out",
+        s(&trust),
+    ]);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""));
+    let plist = plist();
+    let out = dir.join("out");
+    let build = |extra: &[&str]| {
+        let mut args = vec![
+            "pkg",
+            "build",
+            "--binary",
+            s(&binary),
+            "--launchd-plist",
+            s(&plist),
+        ];
+        let files: Vec<PathBuf> = ["gh", "installer.conf", "trusted_root.jsonl"]
+            .iter()
+            .map(|n| trust.join(n))
+            .collect();
+        for f in &files {
+            args.extend(["--trust", s(f)]);
+        }
+        args.extend(["--out", s(&out)]);
+        args.extend_from_slice(extra);
+        xtask(&args)
+    };
+    let (code, _, stderr) = build(&["--version", "1.0.0", "--version-of", s(&binary)]);
+    assert_eq!(code, Some(2), "{stderr}");
+    let (code, _, stderr) = build(&[]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("--version or --version-of"), "{stderr}");
+    let (code, stdout, stderr) = build(&["--version-of", s(&binary)]);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""), "{stdout}");
+    let built = out.join("kbf-installer-0.1.0+0123456789ab-macos-arm64.pkg");
+    assert!(built.is_file(), "{stdout}");
+    // The tarball of the binary, as `xtask package` makes it.
+    let tarball = dir.join(format!("kbf-installer-{COMMIT}-darwin-arm64.tar.gz"));
+    std::fs::write(
+        &tarball,
+        xtask::package::tarball("kbf-installer", &std::fs::read(&binary).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let dist = dir.join("dist");
+    let asset = |package: &Path, expect: &str, mode: &[&str]| {
+        let mut args = vec![
+            "pkg-macos-asset",
+            "--package",
+            s(package),
+            "--commit",
+            COMMIT,
+            "--binary-tarball",
+            s(&tarball),
+            "--expect-ref",
+            expect,
+            "--gh",
+            s(&gh),
+        ];
+        args.extend_from_slice(mode);
+        xtask(&args)
+    };
+    let (code, stdout, stderr) = asset(&out, MAIN, &["--out", s(&dist)]);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""), "{stdout}");
+    let name = format!("kbf-installer-{COMMIT}-darwin-arm64.pkg");
+    assert!(dist.join(&name).is_file());
+    let sums = std::fs::read_to_string(dist.join("SHA256SUMS.darwin-arm64")).unwrap();
+    assert!(sums.trim_end().ends_with(&format!("  {name}")), "{sums}");
+    let before = std::fs::read_dir(&dist).unwrap().count();
+    let (code, stdout, stderr) = asset(&dist.join(&name), MAIN, &["--verify-only"]);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""));
+    assert!(stdout.contains(&name), "{stdout}");
+    assert_eq!(std::fs::read_dir(&dist).unwrap().count(), before);
+    // Attested for another branch than it trusts: refused, in both modes.
+    let (code, _, stderr) = asset(
+        &dist.join(&name),
+        "refs/heads/feature/x",
+        &["--verify-only"],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("attested for refs/heads/feature/x"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = asset(
+        &out,
+        "refs/heads/feature/x",
+        &["--out", s(&dir.join("fresh"))],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(!dir.join("fresh").exists());
+    // Not named as the asset: only `--out` renames it.
+    let (code, _, stderr) = asset(&built, MAIN, &["--verify-only"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("is not named"), "{stderr}");
+    // `--out` and `--verify-only` together, and neither: usage errors.
+    let (code, _, _) = asset(&built, MAIN, &["--verify-only", "--out", s(&dist)]);
+    assert_eq!(code, Some(2));
+    let (code, _, _) = asset(&built, MAIN, &[]);
+    assert_eq!(code, Some(2));
+}
