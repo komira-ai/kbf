@@ -70,8 +70,8 @@ Grafts from two other designs that were considered:
   report, so a stale report is rejected; a settle timer; a `degraded` flag that blocks
   automatic promotion; an in-transaction check that the row is not Draining plus a mark
   version check; a second tail pass; the pin cap.
-- From push-by-previous-owner: a sampled audit, a confirm keyed `(digest, owner, boot)`, a
-  re-confirm just before any drop, the full drop conditions, and the drain surface (`drained`,
+- From push-by-previous-owner: a sampled audit, an epoch barrier, a per-blob
+  `FindMissingBlobs` re-confirm with an owner-boot check just before any drop, the full drop conditions, and the drain surface (`drained`,
   `finish_drain`, `--exit-on-drained`).
 - A fallback for a per-node `file://` cold store (section 9, PR 7).
 
@@ -144,17 +144,32 @@ The `draining/<id>` mark holds `{g_d, fp, phase, epoch}`.
 - **A.** The drainer takes no writes and is read first. P1 makes it flush everything it stages.
 - **A to B.** When its `flush_clear_gen >= g_d` the frontend bumps `tail_epoch` and writes
   `handoff/base`.
-- **B to C (confirmed).** Every fresh Active member has `tail_epoch_done >= e` with a matching
-  fingerprint, none is degraded, and the settle and pin-release conditions hold. The heartbeat
+- **B to C (confirmed).** Every fresh member that takes writes (`takes_writes`, that is every
+  member except Draining: Active, Joining and CatchingUp) has `tail_epoch_done >= e` with a
+  matching fingerprint. Joining and CatchingUp are write owners (`map.rs:55-57`), so they are in
+  the owner set and the drain waits for them. Excluding them as "never read-primary" is unsafe:
+  a blob they own and have not adopted would be dropped, and the next read-primary promotion
+  would find it nowhere but the cold store. A Down member inside its dwell blocks, as for a join.
+  Further, none is degraded, and the settle and pin-release conditions hold. The heartbeat
   response then carries `drain_confirmed`.
 - **C.** The node evicts only objects that meet every drop condition below, reports
   `drained=true`, and the operator runs `finish_drain` (or `--drain-auto-leave` does);
   `--exit-on-drained` exits the process.
 
 Drop conditions, all required: the object is flushed with the read-back confirmed; it is not
-staged; the node is not a write owner of any of its blobs, or is Draining; every blob is
-confirmed in the cold store and adopted by every current owner, keyed `(digest, owner, boot)`;
-a fresh re-confirm just before the drop passes with the same boot; `EVICT_GRACE` has elapsed;
+staged; the node is not a write owner of any of its blobs, or is Draining; and the guarantee is
+epoch-barrier based, with a per-blob check as the re-confirm. The barrier: the B to C condition
+above (every write owner reports `tail_epoch_done >= e`, so each has adopted every blob listed
+at epoch e). The re-confirm, run by the drainer per object just before dropping it: (1) read the
+object back from the cold store and verify its digest; (2) for the object's blob digests, send
+each current owner (from the current map, including Joining and CatchingUp) a `FindMissingBlobs`
+request in batches of at most 1000 digests, and require an empty missing set from every owner;
+(3) require each owner's boot, taken from the map, to equal the boot recorded at the epoch
+fence, so a restarted owner (whose index may be rebuilding) fails the check and the object is
+retried later. Bandwidth bound: at most one cold-store read per dropped object and
+ceil(blobs/1000) x owners small RPCs per object, rate-limited by the drop delay and a per-drain
+cap of 4 concurrent objects; the heartbeat carries no per-blob data. The audit stays a
+probabilistic extra, not part of the guarantee. `EVICT_GRACE` has elapsed;
 and a drop delay has elapsed. The drop never deletes from the cold store. Reclaim outside a
 drain is out of scope; disk-pressure eviction continues as today.
 
@@ -317,7 +332,7 @@ All from `feature/arch-v2`.
   `docs/api.md:594-603`, one store registered for every storage node;
   `architecture-v2.md` section 8, a new owner rebuilds from segments an earlier owner flushed).
   Single-box modes use `file://` (`kbf-modes.md:386`; `docs/deploy/storage-node.md:272`);
-  `file://` is single-writer (`storage-node.md:281`). The test-farm unit uses an `s3://` store
+  `file://` is one process per directory: `FsStore::open` takes an exclusive `flock` on `LOCK` with `try_lock` (`fs_store.rs:294-302`, doc `:7-8`), and a second opener gets `FsStoreError::Locked` instead of sharing the directory. No doc describes a multi-node `file://` farm. The test-farm unit uses an `s3://` store
   that is loopback unless `MINIO_S3_ENDPOINT` is remote; the rehearsal harness defaults to a
   directory (`docs/design/kbf-cicd.md:232,241`). No doc says "every node shares one store".
 
@@ -369,7 +384,7 @@ All from `feature/arch-v2`.
 
 1. **Is the cold store shared in every deployment?** Updated by the facts: farm modes
    (storage, storage-and-daemon) use one `s3://` bucket and the registration API sends one
-   store to every node; the single-box modes use `file://`, which is single-writer. So PR 7
+   store to every node; the single-box modes use `file://`, which allows one opener per directory (`fs_store.rs:294-302`). So PR 7
    (node-pull for `file://`) is needed only if a multi-node farm is ever run with per-node
    `file://` stores, which no doc describes. Confirm that such a deployment does not exist or
    is unsupported.
