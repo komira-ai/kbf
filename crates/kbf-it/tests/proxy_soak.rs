@@ -46,9 +46,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use kbf_proxy::Proxy;
-use kbf_testkit::dir::TestDir;
 use kbf_proxy::control::NoUpdates;
 use kbf_proxy::slot::{Retire, Slot};
+use kbf_testkit::dir::TestDir;
 use proxy_support::{
     Child, Open, actions, api_get, connect, free_base, frontend_args, open_executions,
     proxy_config, proxy_get, storage_node, store, until, until_ready, within,

@@ -81,8 +81,8 @@ use kbf_proxy::slot::Slot as GateSlot;
 use kbf_testkit::dir::TestDir;
 use kbf_testkit::reaped::{self, Reaped};
 use proxy_support::{
-    Open, actions, api_get, connect, free_base, frontend_args, open_executions, proxy_config,
-    proxy_get, storage_node, store, until, until_ready, within,
+    Open, actions, api_get, connect, free_base, frontend_args, open_executions, own_config,
+    proxy_config, proxy_get, storage_node, store, until, until_ready, within,
 };
 
 /// Streams that arrive while the swap holds, between the old process's stop and the new
@@ -191,7 +191,10 @@ impl Child for Procs {
             .map_err(|e| PortError(e.to_string()))?;
         let mut command = Command::new(self.dir.join("bin/kbf"));
         command
-            .args(frontend_args(&self.storage, slot_base(self.base, slot)))
+            .args(own_config(
+                &self.dir,
+                &frontend_args(&self.storage, slot_base(self.base, slot)),
+            ))
             .stdout(Stdio::from(
                 out.try_clone().map_err(|e| PortError(e.to_string()))?,
             ))

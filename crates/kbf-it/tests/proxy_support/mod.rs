@@ -47,11 +47,31 @@ pub struct Child {
     _stdout: BufReader<ChildStdout>,
 }
 
+/// `args` (a mode word, then its flags) with `--config=` pointing at an empty file of the
+/// test's own directory. A `kbf` child with no `--config` reads `/etc/kbf/kbf.toml`, so a
+/// host that has one (or one that denies the read) would decide what a soak serves.
+pub fn own_config(dir: &Path, args: &[String]) -> Vec<String> {
+    if args.iter().any(|a| a.starts_with("--config")) {
+        return args.to_vec();
+    }
+    let file = dir.join("kbf.toml");
+    std::fs::write(&file, "").expect("empty config");
+    // The child refuses a settings file that group or other can write.
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("config mode");
+    let mut own = args.to_vec();
+    own.insert(1, format!("--config={}", file.display()));
+    own
+}
+
 impl Child {
     pub fn start(dir: &Path, name: &str, args: &[String]) -> Self {
         let log = std::fs::File::create(dir.join(format!("{name}.log"))).expect("log file");
         let mut command = Command::new(dir.join("bin/kbf"));
-        command.args(args).stdout(Stdio::piped()).stderr(log);
+        command
+            .args(own_config(dir, args))
+            .stdout(Stdio::piped())
+            .stderr(log);
         let mut process = reaped::spawn(&mut command, 3).expect("spawn kbf");
         let mut stdout = BufReader::new(process.stdout.take().expect("stdout"));
         let mut line = String::new();
