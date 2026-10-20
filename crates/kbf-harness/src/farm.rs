@@ -307,10 +307,13 @@ impl Farm {
         // refuses the two together); the box has no Postgres, so the farm gives the frontend
         // a SQLite file and its socket.
         let state = format!("--state-store=sqlite://{}/state/state.db", root.display());
+        // The farm's actions name no platform and its daemons run on whatever CPU the box
+        // has (an arm64 runner is not the default's x86-64): no default platform.
+        let default_platform = "--default-platform=none".to_owned();
         let unit = overrides(
             Role::Frontend,
             unit.replace(&[state])
-                .append(&[control])
+                .append(&[control, default_platform])
                 .set(&topo.limits.frontend),
         );
         farm.launch(&bins.kbf, Role::Frontend, &root, unit, None);
