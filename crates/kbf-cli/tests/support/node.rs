@@ -6,19 +6,22 @@
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Child;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use rcgen::{CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType};
 
+// The stand-in `crun`, the planted cgroup tree and id files, the disk scan and the large
+// input live in kbf-harness, which the rehearsal farm uses too.
+#[allow(unused_imports)] // Each test binary uses its own part.
+pub(crate) use kbf_harness::node_support::{
+    MANIFEST, cgroup_tree, crun, files_holding, id_files, image_path, input_bytes, oci_runtime,
+};
+
 /// How long the test waits for what should happen promptly.
 pub(crate) const PROMPT: Duration = Duration::from_secs(60);
-
-/// The per-architecture manifest whose digest names the image the node's store holds.
-pub(crate) const MANIFEST: &[u8] =
-    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
 
 /// Where tests that run a container daemon put their directories: Cargo's per-target
 /// temporary directory, unless an ancestor of it is closed to other users (a home
@@ -99,75 +102,6 @@ pub(crate) fn pki(dir: &Path) {
     std::fs::write(dir.join("client.key"), key.serialize_pem()).expect("write");
 }
 
-/// `--id-files`: a passwd naming this test's user `kbf`, with 65,536 subordinate ids.
-pub(crate) fn id_files(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let ids = dir.join("ids");
-    std::fs::create_dir_all(&ids).expect("mkdir");
-    let passwd = ids.join("passwd");
-    std::fs::write(&passwd, "").expect("write");
-    let uid = std::fs::metadata(&passwd).expect("stat").uid();
-    std::fs::write(&passwd, format!("kbf:x:{uid}:{uid}::/:/usr/bin/false\n")).expect("write");
-    for file in ["subuid", "subgid"] {
-        std::fs::write(ids.join(file), "kbf:100000:65536\n").expect("write");
-    }
-    ids
-}
-
-/// The stand-in `crun` in `bin` (a link to `fake`, the package's build of
-/// crates/kbf-driver-container/tests/bin/fake_crun.rs), `kbf-act` beside it, the id tools
-/// the container driver's start-up looks for on `PATH` (setuid files, as `uidmap` installs
-/// them), with the image [`MANIFEST`] names already unpacked in the
-/// node's image store under `data` (the node's `--data-dir`); the stand-in runs `steps`
-/// as each action. Returns the image as an action names it.
-pub(crate) fn crun(bin: &Path, data: &Path, fake: &str, steps: &[&str]) -> String {
-    use std::os::unix::fs::PermissionsExt as _;
-    let state = bin.join("crun-state");
-    std::fs::create_dir_all(&state).expect("mkdir");
-    std::os::unix::fs::symlink(fake, bin.join("crun")).expect("link crun");
-    for tool in ["newuidmap", "newgidmap"] {
-        let path = bin.join(tool);
-        std::fs::write(&path, b"").expect("write the tool");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).expect("chmod");
-    }
-    kbf_testkit::act::link_self(&bin.join(kbf_testkit::act::NAME)).expect("link kbf-act");
-    std::fs::write(state.join("nonce"), format!("{}:", std::process::id())).expect("nonce");
-    let knob: String = steps.iter().map(|s| format!("{s}\n")).collect();
-    std::fs::write(state.join("action"), knob).expect("action");
-    let hex = kbf_transfer::digest_of(MANIFEST).hash;
-    let rootfs = data.join("leases/oci-images").join(&hex).join("rootfs");
-    std::fs::create_dir_all(rootfs.join("kbf/root")).expect("an unpacked image");
-    format!("docker://registry.test/tools/busybox@sha256:{hex}")
-}
-
-/// The flag that points the daemon at the stand-in `crun` [`crun`] put in `bin`.
-pub(crate) fn oci_runtime(bin: &Path) -> String {
-    format!("--oci-runtime={}", bin.join("crun").display())
-}
-
-/// A cgroup v2 mount of plain directories at `bin/cgroup`, where the stand-in `crun`
-/// looks, holding the daemon's unit; the flags that point the daemon at it.
-pub(crate) fn cgroup_tree(bin: &Path) -> Vec<String> {
-    let root = bin.join("cgroup");
-    let unit = root.join("kbf.slice/kbf-all-in-one.service");
-    std::fs::create_dir_all(&unit).expect("mkdir");
-    let plant = |path: PathBuf, text: &str| std::fs::write(path, text).expect("plant");
-    plant(
-        root.join("cgroup.controllers"),
-        "cpuset cpu io memory pids\n",
-    );
-    plant(unit.join("cgroup.controllers"), "cpu memory pids\n");
-    plant(unit.join("cgroup.procs"), "1\n");
-    plant(unit.join("cpuset.cpus.effective"), "0\n");
-    let own = bin.join("self-cgroup");
-    plant(own.clone(), "0::/kbf.slice/kbf-all-in-one.service\n");
-    vec![
-        format!("--cgroup-root={}", root.display()),
-        format!("--self-cgroup={}", own.display()),
-    ]
-}
-
 /// An address nothing listens on now, for a worker listener the binary binds itself,
 /// that no other test or process is likely to take before the binary does. The port
 /// cannot be left to the binary (the daemon half dials it by the `--server` flag), and a
@@ -193,15 +127,6 @@ pub(crate) fn worker_addr() -> SocketAddr {
     SocketAddr::from(([127, a, b, c], port))
 }
 
-/// `PATH` with `bin`, where [`crun`] put the id tools, first.
-pub(crate) fn image_path(bin: &Path) -> String {
-    format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
-}
-
 /// Kills the process when dropped, so a failed test leaves nothing running.
 pub(crate) struct Running(pub(crate) Child);
 
@@ -224,54 +149,4 @@ impl Drop for Running {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-/// An input of more bytes than any chunk or buffer of the read path (a ByteStream chunk
-/// and the input cache's copy buffer are 1 MiB), none of whose 64-byte runs repeats.
-pub(crate) fn input_bytes() -> Vec<u8> {
-    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-    (0..(3 << 20) + 7)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state.to_le_bytes()[3]
-        })
-        .collect()
-}
-
-/// Every file under `dirs` (recursively, not following symlinks) that holds `bytes`
-/// whole, each inode once: its path and size.
-pub(crate) fn files_holding(dirs: &[PathBuf], bytes: &[u8]) -> Vec<(PathBuf, u64)> {
-    use std::os::unix::fs::MetadataExt as _;
-    let mut found = std::collections::BTreeMap::new();
-    let mut todo: Vec<PathBuf> = dirs.to_vec();
-    while let Some(at) = todo.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&at) else {
-            continue;
-        };
-        if meta.is_dir() {
-            let listed = std::fs::read_dir(&at).into_iter().flatten().flatten();
-            todo.extend(listed.map(|entry| entry.path()));
-            continue;
-        }
-        if !meta.is_file() || meta.len() < bytes.len() as u64 {
-            continue;
-        }
-        let Ok(held) = std::fs::read(&at) else {
-            continue;
-        };
-        let anchor = &bytes[..64];
-        let holds = held
-            .windows(64)
-            .enumerate()
-            .filter(|(_, run)| *run == anchor)
-            .any(|(at, _)| held.get(at..at + bytes.len()) == Some(bytes));
-        if holds {
-            found
-                .entry((meta.dev(), meta.ino()))
-                .or_insert((at, meta.len()));
-        }
-    }
-    found.into_values().collect()
 }

@@ -1,7 +1,8 @@
 //! The controller where the frontend starts it (`docs/design/split-mode-updates.md` section
-//! 6.2): with `update/policy.auto_nodes` false, the default, nothing is started however long
-//! it waits; set, the next look starts the host, and an activation order reaches it on its
-//! session.
+//! 6.2): with no `update/policy` written, or `auto_nodes` true, the next look after the
+//! operator's desired write starts the host and an activation order reaches it on its
+//! session; paused, or with `auto_nodes` written false, nothing is started however long it
+//! waits.
 
 #[path = "support/hooked.rs"]
 mod hooked;
@@ -125,18 +126,9 @@ async fn placement(api: SocketAddr, node: &str) -> String {
         .to_owned()
 }
 
-/// Catches a frontend that rolls the fleet by itself, and one that never does. A desired
-/// release is set and a Mac is connected and idle: with `auto_nodes` false nothing is cordoned
-/// and no order is sent for as long as the controller has looked many times; once it is set the
-/// host is cordoned and its activation order arrives, of the epoch `Welcome` named, for the
-/// desired commit.
-///
-/// Mutants seen red: the switch not read (the host is started with it off); the controller not
-/// started by the frontend (no order with it on).
-#[tokio::test]
-async fn nothing_starts_until_auto_nodes_is_set() {
-    let front = start();
-    let mut mac = FakeDaemon::connect(
+/// A Mac that is connected, idle and reports an old release.
+async fn idle_mac(front: &Frontend) -> FakeDaemon {
+    let mac = FakeDaemon::connect(
         front.worker,
         hello_on("mac-1", 4, 8, &[("arch", "arm64"), ("os", "macos")]),
     )
@@ -146,34 +138,98 @@ async fn nothing_starts_until_auto_nodes_is_set() {
         running_commit: "fedcba987654".to_owned(),
         ..UpdateStatus::default()
     }));
-    let front_rows = front.rows.clone();
+    mac
+}
+
+fn activation(m: &server_message::Message) -> Option<kbf_proto::update::UpdateOrder> {
+    match m {
+        server_message::Message::UpdateOrder(order) => Some(order.clone()),
+        _ => None,
+    }
+}
+
+async fn offer(front: &Frontend) {
+    let rows = front.rows.clone();
     tokio::task::spawn_blocking(move || {
-        front_rows
-            .offer(&Release::new(A), kbf_types::FarmTime::from_millis(1_000))
+        rows.offer(&Release::new(A), kbf_types::FarmTime::from_millis(1_000))
             .expect("a run");
     })
     .await
     .expect("offered");
+}
 
-    // The default is off, and a policy row that says nothing of it leaves it off.
-    assert!(!Policy::default().auto_nodes);
-    let activation = |m: &server_message::Message| match m {
-        server_message::Message::UpdateOrder(order) => Some(order.clone()),
-        _ => None,
-    };
+/// Catches a frontend that never starts a run: no `update/policy` row was ever written, and
+/// the operator's write of a desired release is the whole click. The next look cordons the
+/// idle Mac and its activation order arrives, of the epoch `Welcome` named, for the desired
+/// commit. (Before this an unwritten policy read `auto_nodes` false and nothing could set it.)
+///
+/// Mutants seen red: an unwritten policy read as `auto_nodes` false (the runner reading
+/// `policy_if_set`, or `Policy::default` false); the controller not started by the frontend.
+#[tokio::test]
+async fn a_desired_release_with_no_policy_written_starts_the_idle_host() {
+    let front = start();
+    let mut mac = idle_mac(&front).await;
+    assert!(
+        front.rows.policy_if_set().expect("readable").is_none(),
+        "the test needs a policy that was never written"
+    );
+    assert!(Policy::default().auto_nodes);
+    offer(&front).await;
+    let order = mac.expect("an activation order", activation).await;
+    assert_eq!(order.epoch, mac.epoch);
+    assert_eq!(order.commit, A);
+    assert_eq!(placement(front.api, "mac-1").await, "cordoned");
+}
+
+/// Catches a pause that does not stop, and a resume that turns the farm off. The operator
+/// pauses before any policy exists (which writes the row), then offers a release: nothing is
+/// cordoned and no order is sent however long the controller looks. Resumed, the run starts.
+///
+/// Mutants seen red: `paused` not read by the controller (the Mac is started while paused);
+/// a pause that writes the policy with `auto_nodes` false (the run never starts after the
+/// resume).
+#[tokio::test]
+async fn pause_stops_a_run_and_resume_starts_it_without_a_policy_of_the_operators() {
+    let front = start();
+    let mut mac = idle_mac(&front).await;
+    let rows = front.rows.clone();
+    tokio::task::spawn_blocking(move || rows.set_paused(true).expect("paused"))
+        .await
+        .expect("set");
+    offer(&front).await;
     assert!(mac.expect_within(QUIET, activation).await.is_none());
     assert_eq!(placement(front.api, "mac-1").await, "serving");
 
     let rows = front.rows.clone();
+    tokio::task::spawn_blocking(move || rows.set_paused(false).expect("resumed"))
+        .await
+        .expect("set");
+    let order = mac.expect("an activation order", activation).await;
+    assert_eq!(order.commit, A);
+    assert_eq!(placement(front.api, "mac-1").await, "cordoned");
+}
+
+/// Catches a switch that is not read: an operator who wrote `auto_nodes` false (and a floor,
+/// to show the rest of the row is read) has nothing started however long the controller looks,
+/// and writing it true starts the run.
+///
+/// Mutant seen red: the switch not read (the host is started with it off).
+#[tokio::test]
+async fn auto_nodes_written_false_starts_nothing_until_it_is_written_true() {
+    let front = start();
+    let mut mac = idle_mac(&front).await;
+    let rows = front.rows.clone();
     tokio::task::spawn_blocking(move || {
         rows.set_policy(&Policy {
+            auto_nodes: false,
             max_hosts_out: 2,
             ..Policy::default()
         })
-        .expect("a policy row with auto_nodes at its default");
+        .expect("policy");
     })
     .await
     .expect("set");
+    offer(&front).await;
     assert!(mac.expect_within(QUIET, activation).await.is_none());
     assert_eq!(placement(front.api, "mac-1").await, "serving");
 
@@ -188,9 +244,7 @@ async fn nothing_starts_until_auto_nodes_is_set() {
     .await
     .expect("set");
     let order = mac.expect("an activation order", activation).await;
-    assert_eq!(order.epoch, mac.epoch);
     assert_eq!(order.commit, A);
-    assert_eq!(placement(front.api, "mac-1").await, "cordoned");
 }
 
 /// Catches a farm whose load is not read: a Mac holds a lease on a running action, another action

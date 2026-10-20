@@ -261,6 +261,13 @@ pub struct ProxyArgs {
     /// The installer.toml whose `[proxy]` table configures the proxy.
     #[arg(long, default_value = "/etc/kbf/installer.toml")]
     pub config: std::path::PathBuf,
+    /// The root half's directory: the update API reads its status.json. As `run --update-dir`.
+    #[arg(long, default_value = "/var/lib/kbf-installer")]
+    pub update_dir: std::path::PathBuf,
+    /// The order spool the update API writes and the root half reads: owned by the service
+    /// user. As `run --orders-dir`.
+    #[arg(long, default_value = "/var/lib/kbf-installer/orders")]
+    pub orders_dir: std::path::PathBuf,
     /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
     #[arg(long)]
     pub check: bool,

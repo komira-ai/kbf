@@ -2,10 +2,15 @@ use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::fd::{IntoRawFd as _, OwnedFd};
 use std::path::PathBuf;
+use std::sync::mpsc;
 
+use hyper::header::{ALLOW, HeaderValue};
 use rustix::io::{FdFlags, fcntl_getfd};
 
 use super::*;
+use crate::proxy::api::traits::RestartPending;
+use crate::proxy::orders::SpoolError;
+use crate::testkit::A;
 
 const PROXY: &str = r#"
 [proxy]
@@ -36,16 +41,81 @@ fn usage_of(result: Result<impl std::fmt::Debug, VerbError>) -> String {
 /// does not apply the table's own rules.
 #[test]
 fn the_proxy_table_is_read_from_installer_toml() {
-    let config = load(&file(
+    let loaded = load(&file(
         "ok",
         format!("min_generation = 4\n{PROXY}").as_bytes(),
     ))
     .expect("valid");
+    let config = loaded.proxy;
     assert_eq!(config.upstream.base_port, 18_000);
     assert_eq!(config.hold_max_s, 15);
     assert_eq!(
         config.operator_token_file,
         PathBuf::from("/etc/kbf/operator.token")
+    );
+    assert_eq!(
+        (loaded.confirm_window_s, loaded.fetch_timeout_s),
+        (900, 900)
+    );
+}
+
+/// Catches the update API's two numbers read and dropped (they used to be: `load` returned the
+/// `[proxy]` table alone): a file that sets them hands them on, and the places the API reads
+/// and writes are the flags and the proxy's state directory.
+#[test]
+fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
+    let table = PROXY.replacen(
+        "[proxy]\n",
+        "[proxy]\nstate_dir = \"/srv/proxy-state\"\n",
+        1,
+    );
+    let path = file(
+        "places",
+        format!("confirm_window_s = 300\nfetch_timeout_s = 1200\n{table}").as_bytes(),
+    );
+    let loaded = load(&path).expect("valid");
+    assert_eq!(
+        (loaded.confirm_window_s, loaded.fetch_timeout_s),
+        (300, 1200)
+    );
+    let args = ProxyArgs {
+        config: path,
+        update_dir: "/srv/root-half".into(),
+        orders_dir: "/srv/orders".into(),
+        check: false,
+    };
+    let cfg = handover_config(&args, &loaded);
+    // The children's ports are the upstream table's: in a slot the operator listener is at
+    // offset 2 and the admin calls at 3, slot B ten ports above slot A, all on loopback; and
+    // the operator token is the one the proxy checks callers against.
+    let at = |port| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    assert_eq!(
+        cfg.slots,
+        SlotAddrs {
+            admin: [at(18003), at(18013)],
+            operator: [at(18002), at(18012)],
+        }
+    );
+    assert_eq!(
+        cfg.operator_token_file,
+        PathBuf::from("/etc/kbf/operator.token")
+    );
+    assert!(!cfg.gate.is_filled());
+    assert_eq!(
+        (
+            cfg.state_dir,
+            cfg.orders_dir,
+            cfg.status_file,
+            cfg.confirm_window_s,
+            cfg.fetch_timeout_s
+        ),
+        (
+            PathBuf::from("/srv/proxy-state"),
+            PathBuf::from("/srv/orders"),
+            PathBuf::from("/srv/root-half/status.json"),
+            300,
+            1200
+        )
     );
 }
 
@@ -242,18 +312,87 @@ fn errors_map_to_exit_codes_and_words() {
     );
 }
 
+/// Catches the update API's start-up errors mapped to the wrong exit: a spool or counter the
+/// service user cannot use is the operator's (exit 2, which the unit does not restart); a
+/// program that cannot be identified is not (exit 1).
+#[test]
+fn the_update_apis_start_up_errors_map_to_exit_codes() {
+    let spool = HandoverError::Orders {
+        dir: PathBuf::from("/o"),
+        source: SpoolError::Counter(std::io::Error::other("c")),
+    };
+    assert_eq!(
+        VerbError::from(spool),
+        VerbError::Usage(
+            "update API: the order spool at /o: the order counter cannot be read or made durable: c"
+                .to_owned()
+        )
+    );
+    let binary = HandoverError::Binary(std::io::Error::other("proc"));
+    assert_eq!(
+        VerbError::from(binary),
+        VerbError::Failed("update API: cannot tell which program is running: proc".to_owned())
+    );
+}
+
+/// The update API's seams over a scratch directory: the state directory exists, the spool and
+/// the root half's `status.json` do not.
+fn handover(name: &str) -> HandoverConfig {
+    let root = kbf_host::testkit::scratch(&format!("proxy-verb-api-{name}"));
+    let state_dir = root.join("state");
+    fs::create_dir(&state_dir).expect("state dir");
+    HandoverConfig {
+        state_dir,
+        orders_dir: root.join("orders"),
+        status_file: root.join("status.json"),
+        confirm_window_s: 900,
+        fetch_timeout_s: 900,
+        slots: SlotAddrs {
+            admin: [loopback(18003), loopback(18013)],
+            operator: [loopback(18002), loopback(18012)],
+        },
+        operator_token_file: root.join("operator.token"),
+        gate: GateSlot::new(),
+    }
+}
+
+fn loopback(port: u16) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+}
+
 /// Catches a proxy that cannot be bound being reported as served: a descriptor that is not a
 /// socket makes `Proxy::bind` fail, and the verb says so as a failure (exit 1).
 #[test]
 fn a_descriptor_the_runtime_cannot_use_is_a_failure_to_start() {
-    let config = load(&file("serve", PROXY.as_bytes())).expect("valid");
+    let loaded = load(&file("serve", PROXY.as_bytes())).expect("valid");
     let regular = OwnedFd::from(fs::File::open(file("fd", b"x")).expect("open"));
-    match serve(config, regular) {
+    match serve(loaded.proxy, &handover("serve"), regular) {
         Err(VerbError::Failed(text)) => {
             assert!(text.starts_with("cannot start the proxy: "), "{text}");
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// Catches the update API's seams built after the proxy is bound (a spool the service user
+/// cannot open would then be a failed start, exit 1, that systemd restarts every second):
+/// with a file where `orders/` should be and a descriptor that would fail the bind, the
+/// refusal is the spool's, a usage error naming the directory.
+#[test]
+fn a_spool_that_cannot_be_opened_is_a_usage_error_before_anything_is_bound() {
+    let loaded = load(&file("spool", PROXY.as_bytes())).expect("valid");
+    let handover = handover("spool");
+    fs::write(&handover.orders_dir, b"a file").expect("a file in the way");
+    let regular = OwnedFd::from(fs::File::open(file("fd-spool", b"x")).expect("open"));
+    let text = usage_of(serve(loaded.proxy, &handover, regular));
+    assert!(
+        text.starts_with("update API: the order spool at "),
+        "{text}"
+    );
+    assert!(
+        text.contains(&handover.orders_dir.display().to_string()),
+        "{text}"
+    );
 }
 
 /// Catches `run` reading a table and then serving without a socket: `--check` stops after the
@@ -263,6 +402,8 @@ fn check_stops_at_the_table_and_a_run_needs_its_socket() {
     let path = file("run", PROXY.as_bytes());
     let args = |check| ProxyArgs {
         config: path.clone(),
+        update_dir: path.with_file_name("update"),
+        orders_dir: path.with_file_name("orders"),
         check,
     };
     assert_eq!(run(&args(true)), Ok(()));
@@ -270,7 +411,7 @@ fn check_stops_at_the_table_and_a_run_needs_its_socket() {
     assert!(text.contains("LISTEN_PID"), "{text}");
     let missing = ProxyArgs {
         config: path.with_file_name("none.toml"),
-        check: true,
+        ..args(true)
     };
     assert!(usage_of(run(&missing)).contains("No such file"));
 }
@@ -336,4 +477,236 @@ fn a_second_stop_signal_ends_the_process_at_once() {
 #[test]
 fn the_production_stop_bound_is_ten_seconds() {
     assert_eq!(STOP_BOUND, Duration::from_secs(10));
+}
+
+const UPDATE: &str = "/v1/update/frontend";
+const LONG: Duration = Duration::from_secs(10);
+
+fn asked(method: &str, path: &str, body: &str) -> UpdateRequest {
+    UpdateRequest {
+        method: method.to_owned(),
+        path: path.to_owned(),
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+/// The body of a `POST` that asks for an update to `A`.
+fn post_of() -> String {
+    format!(r#"{{"commit":"{A}","request_id":"r1","nodes":false}}"#)
+}
+
+fn json(reply: &UpdateReply) -> serde_json::Value {
+    serde_json::from_slice(&reply.body).unwrap_or(serde_json::Value::Null)
+}
+
+/// The update API started the way `serve` starts it, over seams in a scratch directory (`edit`
+/// changes them first). What stops the proxy is a channel: one message for each drain. The
+/// bound of the stop is an hour, so the test process is never ended by it.
+struct Api {
+    bridge: UpdateBridge,
+    stop: Arc<Stop>,
+    died: Arc<AtomicBool>,
+    drains: mpsc::Receiver<()>,
+}
+
+fn api(name: &str, edit: impl FnOnce(&mut Parts)) -> Api {
+    let mut parts = handover::parts(&handover(name)).expect("the seams");
+    edit(&mut parts);
+    let stop = Arc::new(Stop {
+        seen: AtomicBool::new(false),
+        bound: Duration::from_secs(3600),
+        exit: std::process::exit,
+    });
+    let died = Arc::new(AtomicBool::new(false));
+    let (tx, drains) = mpsc::channel();
+    let drain: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = tx.send(());
+    });
+    let bridge = start_updates(parts, &stop, &died, &drain).expect("the actor");
+    Api {
+        bridge,
+        stop,
+        died,
+        drains,
+    }
+}
+
+/// Catches a bridge that loses a part of the request or of the answer: the method and the path
+/// (a `GET` of the route is the API's status, `abort` is its own path, the proxy's other
+/// update paths are not this API's), the body (a `POST` with a valid body reaches the API's
+/// own refusal, where a body lost on the way is the router's 400 before the API), and the
+/// reply's status, body and headers (a 405 keeps its `Allow`). A healthy API never stops the
+/// proxy.
+#[tokio::test]
+async fn the_bridge_carries_the_request_to_the_api_and_the_answer_back() {
+    let api = api("bridge", |_| {});
+    let reply = api.bridge.handle(asked("GET", UPDATE, "")).await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(json(&reply)["update_id"], serde_json::Value::Null);
+
+    let reply = api.bridge.handle(asked("POST", UPDATE, &post_of())).await;
+    assert_eq!(reply.status, 503);
+    assert_eq!(json(&reply)["error"], "handover_unavailable");
+
+    let reply = api.bridge.handle(asked("PUT", UPDATE, "")).await;
+    assert_eq!(reply.status, 405);
+    assert_eq!(
+        reply.headers,
+        [(ALLOW, HeaderValue::from_static("GET, POST"))]
+    );
+
+    let abort = format!("{UPDATE}/abort");
+    let reply = api.bridge.handle(asked("POST", &abort, "")).await;
+    assert_eq!(reply.status, 409);
+    assert_eq!(json(&reply)["error"], "no_update_open");
+
+    let reply = api
+        .bridge
+        .handle(asked("POST", "/v1/update/desired", ""))
+        .await;
+    assert_eq!(reply.status, 404);
+    assert!(api.drains.try_recv().is_err(), "the proxy was told to stop");
+    assert!(!api.died.load(Ordering::SeqCst));
+}
+
+/// A restart answer that panics. The status read asks it, so a `GET` kills the actor's thread.
+struct Dies;
+
+impl RestartPending for Dies {
+    fn restart_pending(&self) -> bool {
+        panic!("the actor's thread dies")
+    }
+}
+
+/// Catches an actor that dies silently, or that stops the proxy more than once: after its
+/// thread died the request that was in hand is a 503, the proxy was told to stop (once), the
+/// death is remembered, the bound of the stop is running, every later request is a 503 and
+/// asks no second stop, and the verb that returns after that is a failure (exit 1).
+#[tokio::test]
+async fn an_update_api_that_dies_stops_the_proxy_once_and_fails_the_verb() {
+    let api = api("death", |parts| parts.restart = Box::new(Dies));
+    let reply = api.bridge.handle(asked("GET", UPDATE, "")).await;
+    assert_eq!(reply.status, 503);
+    assert_eq!(
+        api.drains.recv_timeout(LONG),
+        Ok(()),
+        "the proxy was not told to stop"
+    );
+    assert!(api.died.load(Ordering::SeqCst));
+    assert!(api.stop.seen.load(Ordering::SeqCst), "no bound is running");
+    for _ in 0..3 {
+        let reply = api.bridge.handle(asked("GET", UPDATE, "")).await;
+        assert_eq!(reply.status, 503);
+    }
+    assert!(
+        api.drains.recv_timeout(Duration::from_millis(100)).is_err(),
+        "the proxy was told to stop twice"
+    );
+    assert_eq!(
+        outcome(Ok(()), &api.died),
+        Err(VerbError::Failed(
+            "the update API stopped: the proxy was stopped to be started again".to_owned()
+        ))
+    );
+}
+
+/// Catches a verb that exits 0 after the update API died (`Restart=on-failure` would not start
+/// it again), and one that lets the death hide the runtime's own error.
+#[test]
+fn a_verb_whose_update_api_died_is_a_failure_though_the_runtime_returned_cleanly() {
+    let (alive, dead) = (AtomicBool::new(false), AtomicBool::new(true));
+    assert_eq!(outcome(Ok(()), &alive), Ok(()));
+    assert_eq!(
+        outcome(Ok(()), &dead),
+        Err(VerbError::Failed(
+            "the update API stopped: the proxy was stopped to be started again".to_owned()
+        ))
+    );
+    for died in [&alive, &dead] {
+        assert_eq!(
+            outcome(Err(std::io::Error::other("run broke")), died),
+            Err(VerbError::Failed("run broke".to_owned()))
+        );
+    }
+}
+
+static DEATH_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn death_exit(code: i32) -> ! {
+    DEATH_EXIT.store(code, Ordering::SeqCst);
+    panic!("exit {code}");
+}
+
+/// Catches an actor death that stops the proxy without the bound a stop signal has (a drain
+/// that never finishes would then never end the process): the first stop of this kind drains
+/// once and starts the clock that ends the process with status 1, and a second is no stop.
+#[test]
+fn an_actors_death_starts_the_clock_a_first_signal_starts() {
+    let stop = Arc::new(Stop {
+        seen: AtomicBool::new(false),
+        bound: Duration::from_millis(30),
+        exit: death_exit,
+    });
+    let mut drains = 0;
+    let clock = stop.failed(Box::new(|| drains += 1)).expect("a first stop");
+    assert_eq!(drains, 1);
+    assert!(clock.join().is_err(), "the thread ends in the exit");
+    assert_eq!(DEATH_EXIT.load(Ordering::SeqCst), 1);
+    assert!(stop.failed(Box::new(|| drains += 1)).is_none());
+    assert_eq!(drains, 1, "a second stop drained again");
+}
+
+/// Catches a death that is taken for a second stop signal: with a drain under way, the actor
+/// dying is remembered and neither drains again nor ends the process at once (which would cut
+/// the drain a signal asked for). A cut would be `exit` called on this thread, and it panics.
+#[test]
+fn a_death_during_a_drain_is_noted_and_does_not_end_the_drain() {
+    let stop = Arc::new(Stop {
+        seen: AtomicBool::new(false),
+        bound: Duration::from_secs(3600),
+        exit: death_exit,
+    });
+    drop(stop.signalled(|| {}));
+    let died = AtomicBool::new(false);
+    actor_died(&stop, &died, || panic!("a second drain"));
+    assert!(died.load(Ordering::SeqCst));
+}
+
+/// Catches a swap thread that dies without stopping the proxy, or that stops it as a second
+/// signal (which ends the process at once): the death is remembered so that `outcome` fails the
+/// verb, it drains once and starts the clock a first signal starts, and with a drain already
+/// under way it is noted and drains nothing more.
+#[test]
+fn a_dead_handover_driver_stops_the_proxy_once_and_fails_the_verb() {
+    let stop = Arc::new(Stop {
+        seen: AtomicBool::new(false),
+        bound: Duration::from_millis(30),
+        exit: death_exit,
+    });
+    let died = AtomicBool::new(false);
+    let mut drains = 0;
+    handover_died("the swap stopped: x", &stop, &died, || drains += 1);
+    assert_eq!(drains, 1);
+    assert!(died.load(Ordering::SeqCst));
+    assert!(outcome(Ok(()), &died).is_err());
+    handover_died("again", &stop, &died, || drains += 1);
+    assert_eq!(drains, 1, "a second death drained again");
+}
+
+/// Catches a start-up line that does not say what the API does: it names the files, the
+/// staging deadline (the fetch limit of 900 s and five minutes) and that a `POST` is refused,
+/// and why.
+#[test]
+fn the_start_up_line_says_what_the_update_api_will_do() {
+    let cfg = handover("line");
+    let parts = handover::parts(&cfg).expect("the seams");
+    assert_eq!(
+        update_line(&parts, &cfg),
+        format!(
+            "update API on (status {}, orders {}, staging deadline 1200 s); \
+             a POST is refused: proxy not bound yet",
+            cfg.status_file.display(),
+            cfg.orders_dir.display()
+        )
+    );
 }

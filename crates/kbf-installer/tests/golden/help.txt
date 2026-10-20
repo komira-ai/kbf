@@ -224,9 +224,11 @@ Serve the frontend host's public port: route each stream to the active child fro
 Usage: kbf-installer proxy [OPTIONS]
 
 Options:
-      --config <CONFIG>  The installer.toml whose `[proxy]` table configures the proxy [default: /etc/kbf/installer.toml]
-      --json             Print the result as one JSON object on standard output
-      --apply            Do what the verb says. Without it a mutating verb is a dry run
-      --check            Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
-  -h, --help             Print help
+      --config <CONFIG>          The installer.toml whose `[proxy]` table configures the proxy [default: /etc/kbf/installer.toml]
+      --json                     Print the result as one JSON object on standard output
+      --apply                    Do what the verb says. Without it a mutating verb is a dry run
+      --update-dir <UPDATE_DIR>  The root half's directory: the update API reads its status.json. As `run --update-dir` [default: /var/lib/kbf-installer]
+      --orders-dir <ORDERS_DIR>  The order spool the update API writes and the root half reads: owned by the service user. As `run --orders-dir` [default: /var/lib/kbf-installer/orders]
+      --check                    Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
+  -h, --help                     Print help
 

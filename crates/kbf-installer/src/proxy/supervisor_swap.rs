@@ -61,11 +61,13 @@ mod mirror;
 mod status;
 
 #[cfg(test)]
+mod blocked_tests;
+#[cfg(test)]
 mod core_tests;
 #[cfg(test)]
 mod migrator_tests;
 #[cfg(test)]
-mod rig;
+pub(in crate::proxy) mod rig;
 #[cfg(test)]
 mod tests;
 
@@ -121,6 +123,9 @@ pub struct Config {
     pub active: Slot,
     /// Allow `rollback` after the switch. Off: see the module's "what does not work".
     pub rollback_after_switch: bool,
+    /// Where the releases are installed (`releases/` of the host's layout): a candidate
+    /// cannot start when it is not a directory ([`Supervisor::start_blocked`]).
+    pub releases_dir: PathBuf,
 }
 
 /// Starts the swap's thread. The real one is [`thread_spawn`]; a test passes one that refuses.
@@ -288,6 +293,51 @@ fn panic_text(panic: &(dyn Any + Send)) -> String {
 }
 
 impl Supervisor for SwapSupervisor {
+    /// Why a `POST` cannot be taken now, asked before anything is saved or written (so the
+    /// root half does not fetch a release nothing can take over). In this order:
+    /// - `update.json` is unreadable (every `start` would refuse);
+    /// - an update that has ended still has its swap thread open (it is draining the old
+    ///   child): the `start` of a new one would be refused after its release was fetched;
+    /// - the releases directory is missing;
+    /// - the slot the candidate would start in is not idle: the process recorded for it is
+    ///   still running.
+    ///
+    /// An update that is still going on is **not** reported here: the API refuses that
+    /// `POST` itself with `409 update_open` (and the busy slot of its candidate with it), which
+    /// `deploy` reads as "busy, not now" (exit 4); a `503` from here would read as a failure.
+    fn start_blocked(&self) -> Option<String> {
+        if let Some(why) = &self.unreadable {
+            return Some(format!(
+                "update.json is unreadable ({why}); both children are left as they are"
+            ));
+        }
+        let (open, intent, active) = {
+            let state = self.shared.lock();
+            (state.open.clone(), state.intent.clone(), state.active)
+        };
+        if let Some(open) = open {
+            return if intent.is_some_and(|i| i.phase.is_terminal()) {
+                Some(format!("update {open} has ended and is still finishing"))
+            } else {
+                None
+            };
+        }
+        if !self.config.releases_dir.is_dir() {
+            return Some(format!(
+                "the releases directory {} is missing",
+                self.config.releases_dir.display()
+            ));
+        }
+        let idle = active.other();
+        match (self.parts.old_proc)(idle) {
+            Some(ident) if self.parts.child.exited(&ident).is_none() => Some(format!(
+                "slot {idle:?} is not idle: process {} still runs in it",
+                ident.pid
+            )),
+            _ => None,
+        }
+    }
+
     fn start(&mut self, spec: &UpdateSpec) -> Result<(), SupervisorError> {
         if let Some(why) = &self.unreadable {
             return Err(SupervisorError::Refused(format!(
