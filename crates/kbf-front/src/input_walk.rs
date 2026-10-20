@@ -168,10 +168,9 @@ impl Trees {
             return;
         }
         let mut inner = self.lock();
-        if inner.epoch != Some(epoch) {
-            inner.reset(epoch);
-        }
-        if inner.floor.is_some_and(|floor| at < floor) {
+        // The memory is under the epoch the walk's lookups adopted; another epoch in
+        // between means this walk's findings are for a map that is gone.
+        if inner.epoch != Some(epoch) || inner.floor.is_some_and(|floor| at < floor) {
             return;
         }
         for dir in dirs {
@@ -182,11 +181,12 @@ impl Trees {
                 inner.recency.remove(&old);
             }
         }
-        while inner.dirs.len() > self.capacity {
-            let Some((_, oldest)) = inner.recency.pop_first() else {
-                break;
-            };
-            inner.dirs.remove(&oldest);
+        let excess = inner.dirs.len().saturating_sub(self.capacity);
+        for _ in 0..excess {
+            let oldest = inner.recency.pop_first();
+            oldest.into_iter().for_each(|(_, dir)| {
+                inner.dirs.remove(&dir);
+            });
         }
     }
 

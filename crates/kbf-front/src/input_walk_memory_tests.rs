@@ -470,3 +470,19 @@ async fn presubmit_of_a_komira_like_action_set() {
 async fn presubmit_of_the_measured_build() {
     presubmit_figures(482).await;
 }
+
+/// Catches: findings written under an epoch the memory has moved on from (a walk of the
+/// old map recording into the new map's memory would make its verdicts believed there).
+/// The memory adopts an epoch at its first lookup; a record for another is refused, one
+/// for the adopted epoch is kept.
+#[tokio::test(start_paused = true)]
+async fn a_finding_for_another_epoch_is_refused() {
+    let trees = Trees::default();
+    let (now, dir) = (Instant::now(), file("some directory"));
+    assert!(trees.fresh(EPOCH, &dir, now).is_none(), "adopts the epoch");
+    trees.record(EPOCH + 1, &[dir], now);
+    assert_eq!(trees.len(), 0);
+    trees.record(EPOCH, &[dir], now);
+    assert_eq!(trees.len(), 1);
+    assert!(trees.fresh(EPOCH, &dir, now).is_some());
+}
