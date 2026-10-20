@@ -652,28 +652,6 @@ fn supervise(
     Supervised { clock, thread }
 }
 
-/// The start itself, over `layout`: [`start_with`] over a child of that layout, reported as the
-/// line the log gets.
-#[cfg(target_os = "linux")]
-fn start_children(
-    handle: &kbf_proxy::ProxyHandle,
-    gate: &crate::proxy::gate_real::ProxyGate,
-    clock: &dyn crate::proxy::ports::Clock,
-    layout: crate::layout::Layout,
-    with: Supervise,
-    retry: crate::proxy::boot::Retry,
-) -> String {
-    use crate::proxy::child_real::ProcChild;
-    use crate::proxy::supervisor::{children_dir, frontend_argv};
-
-    let child = ProcChild::new(
-        layout,
-        children_dir(&with.state_dir),
-        frontend_argv(&with.proxy_auth_file, with.upstream),
-    );
-    startup_line(start_with(handle, gate, clock, &child, with, retry))
-}
-
 /// The start over `child`: the admin client, the migration hook ([`host_migrator`] on the
 /// database of `with`) and the report. The handover driver is handed the same `child`.
 #[cfg(target_os = "linux")]

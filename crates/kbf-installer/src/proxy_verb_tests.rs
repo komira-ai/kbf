@@ -891,8 +891,9 @@ fn check_refuses_a_file_without_a_database() {
         config: Some(path),
         check: true,
         update_dir: "/nonexistent".into(),
+        orders_dir: "/nonexistent/orders".into(),
     };
-    assert!(usage_of(run(&args)).contains("state database"));
+    assert!(usage_of(run(&args, Path::new("/"))).contains("state database"));
 }
 
 /// The verb's start, on a scratch host: the installed release (a stand-in that would fail at
@@ -915,9 +916,11 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
     use kbf_state::postgres::schema;
 
     use crate::proxy::boot::Retry;
+    use crate::proxy::child_real::ProcChild;
     use crate::proxy::gate_real::ProxyGate;
     use crate::proxy::gate_real_tests::proxy_table;
     use crate::proxy::runtime::SystemClock;
+    use crate::proxy::supervisor::{children_dir, frontend_argv};
     use crate::testkit::{A, c, host_root};
 
     let (layout, root) = host_root("proxy-verb-start");
@@ -963,7 +966,13 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
         first_wait: Duration::from_millis(1),
         max_wait: Duration::from_millis(1),
     };
-    let line = start_children(&handle, &gate, &SystemClock::new(), layout, with, retry);
+    let child = ProcChild::new(
+        layout,
+        children_dir(&with.state_dir),
+        frontend_argv(&with.proxy_auth_file, with.upstream),
+    );
+    let started = start_with(&handle, &gate, &SystemClock::new(), &child, with, retry);
+    let line = startup_line(started);
     assert!(
         line.starts_with("no frontend child adopted, new streams stay held: ")
             && line.contains("migration-failed"),
