@@ -133,6 +133,60 @@ pub struct PostResult {
     pub cas_smoke: Option<String>,
 }
 
+/// The offer a deploy ran under, or the `--no-offer` that stood in for one. It holds what
+/// the bake hand-off needs of an offer (`reversible`, `previous`), copied from the validated
+/// document, never from a file name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OfferRecord {
+    /// `offer` or `waived` (`--no-offer`).
+    pub kind: &'static str,
+    pub stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reversible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta_log: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_meta_log: Option<u64>,
+}
+
+impl OfferRecord {
+    pub fn waived(stage: &str) -> OfferRecord {
+        OfferRecord {
+            kind: "waived",
+            stage: stage.to_owned(),
+            commit: None,
+            set_hash: None,
+            created: None,
+            reversible: None,
+            previous: None,
+            meta_log: None,
+            previous_meta_log: None,
+        }
+    }
+
+    pub fn of(stage: &str, doc: &kbf_gate::OfferDoc) -> OfferRecord {
+        OfferRecord {
+            kind: "offer",
+            commit: Some(doc.commit.as_str().to_owned()),
+            set_hash: Some(doc.set_hash.as_str().to_owned()),
+            created: Some(doc.created),
+            reversible: Some(doc.reversible),
+            previous: doc.previous.as_ref().map(|c| c.as_str().to_owned()),
+            meta_log: doc.meta_log,
+            previous_meta_log: doc.previous_meta_log,
+            ..OfferRecord::waived(stage)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Summary {
     pub schema: u32,
@@ -151,6 +205,9 @@ pub struct Summary {
     pub post: PostResult,
     /// The installer's own check was not available, so it did not run.
     pub check_skipped: bool,
+    /// The offer the deploy ran under, or its `--no-offer`; absent when no stage was named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offer: Option<OfferRecord>,
     /// What went wrong, for a person; never a host name or a token.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub detail: String,
@@ -174,6 +231,7 @@ impl Summary {
             frontend: None,
             post: PostResult::default(),
             check_skipped: false,
+            offer: None,
             detail: String::new(),
         }
     }

@@ -37,19 +37,20 @@ impl Drop for Running {
 }
 
 /// A blob directory and a Raft directory for one test, fresh, under the target
-/// directory.
+/// directory, removed when it drops.
 struct Dirs {
-    root: PathBuf,
     blobs: PathBuf,
     raft: PathBuf,
+    /// Last, so it is removed (if a test has not) after what the test started is gone.
+    root: kbf_testkit::dir::TestDir,
 }
 
 impl Dirs {
     fn new(name: &str) -> Self {
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("kbf-server-blob-dir")
-            .join(format!("{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("kbf-server-blob-dir-{name}"),
+        );
         Self {
             blobs: root.join("blobs"),
             raft: root.join("raft"),

@@ -41,6 +41,10 @@
 //! order, then the previous generation's members not yet listed: a blob written before a
 //! join or a drain is found where it was.
 //!
+//! Across several generations, [`Map::read_order_with_history`] does the same over every retained
+//! map. [`Map::owners_assuming`] and [`Map::placement_fingerprint`] answer "what would
+//! placement be if this member were `Active`", for checking a joiner's fill before promotion.
+//!
 //! This is a pure crate: no I/O, async runtime, clock or randomness. The layering test in
 //! `kbf-it` and the lists in `clippy.toml` enforce it.
 

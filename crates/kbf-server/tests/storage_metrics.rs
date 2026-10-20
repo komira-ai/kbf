@@ -4,7 +4,7 @@
 //! exports (`kbf_cache_lost_blobs`, `kbf_cache_blob_losses_total`).
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use bytes::Bytes;
 use kbf_server::storage_half;
@@ -16,13 +16,13 @@ use kbf_storage::service::RemoteStorage;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
-fn dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("storage-metrics")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("directory");
-    dir
+/// A new, empty directory for one test, removed when it drops: bind it before the node
+/// that holds files in it, so it is removed after that node is gone.
+fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("storage-metrics-{name}"),
+    )
 }
 
 /// The flags of `kbf storage` over new stores in `dir`, plain text on a loopback port, and
@@ -81,7 +81,8 @@ fn assert_lost_blob_series(body: &str) {
 /// left out of the route (the scrape would answer 200 without them).
 #[tokio::test]
 async fn a_storage_node_serves_the_lost_blob_series_on_its_metrics_listener() {
-    let flags = flags(&dir("node"), &["--metrics-listen=127.0.0.1:0"]);
+    let node_dir = dir("node");
+    let flags = flags(&node_dir, &["--metrics-listen=127.0.0.1:0"]);
     let node = start_storage(&flags, never).await.expect("starts");
     let addr = node.metrics.expect("a metrics address");
     assert!(addr.ip().is_loopback() && addr.port() != 0, "{addr}");
@@ -107,7 +108,8 @@ async fn a_storage_node_serves_the_lost_blob_series_on_its_metrics_listener() {
 /// pass `Some(secret)` to `serve_api`.
 #[tokio::test]
 async fn the_metrics_listener_admits_a_direct_loopback_call_through_the_gate() {
-    let flags = flags(&dir("gate"), &["--metrics-listen=127.0.0.1:0"]);
+    let gate_dir = dir("gate");
+    let flags = flags(&gate_dir, &["--metrics-listen=127.0.0.1:0"]);
     let node = start_storage(&flags, never).await.expect("starts");
     let addr = node.metrics.expect("a metrics address");
     assert!(addr.ip().is_loopback(), "{addr}");
@@ -120,7 +122,8 @@ async fn the_metrics_listener_admits_a_direct_loopback_call_through_the_gate() {
 /// asked for), and a default address other than none.
 #[tokio::test]
 async fn without_the_flag_there_is_no_metrics_listener() {
-    let flags = flags(&dir("off"), &[]);
+    let off_dir = dir("off");
+    let flags = flags(&off_dir, &[]);
     assert_eq!(flags.metrics, None);
     let node = start_storage(&flags, never).await.expect("starts");
     assert_eq!(node.metrics, None);
@@ -132,7 +135,8 @@ async fn without_the_flag_there_is_no_metrics_listener() {
 async fn a_metrics_address_in_use_fails_the_start() {
     let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = taken.local_addr().expect("addr");
-    let flags = flags(&dir("taken"), &[&format!("--metrics-listen={addr}")]);
+    let taken_dir = dir("taken");
+    let flags = flags(&taken_dir, &[&format!("--metrics-listen={addr}")]);
     let refused = start_storage(&flags, never).await.err().expect("refused");
     assert!(refused.to_string().contains(&addr.to_string()), "{refused}");
 }
@@ -141,13 +145,15 @@ async fn a_metrics_address_in_use_fails_the_start() {
 /// which starts from the same flags.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_storage_half_serves_the_same_series() {
-    let flags = flags(&dir("half"), &["--metrics-listen=127.0.0.1:0"]);
+    let half_dir = dir("half");
+    let flags = flags(&half_dir, &["--metrics-listen=127.0.0.1:0"]);
     let half = storage_half::start(&flags, never).await.expect("starts");
     let addr = half.metrics.expect("a metrics address");
     let (code, head, body) = get(addr, "/metrics").await;
     assert_eq!(code, 200, "{head}\n{body}");
     assert_lost_blob_series(&body);
-    let off = self::flags(&dir("half-off"), &[]);
+    let off_dir = dir("half-off");
+    let off = self::flags(&off_dir, &[]);
     let half = storage_half::start(&off, never).await.expect("starts");
     assert_eq!(half.metrics, None);
 }
