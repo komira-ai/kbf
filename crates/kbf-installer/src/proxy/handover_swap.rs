@@ -197,7 +197,7 @@ fn build(cfg: &HandoverConfig, spool: &OrderSpool, host: &Host) -> SwapSuperviso
         kbf_state::postgres::schema::latest(),
         Box::new(|| Err(RUNNING_SCHEMA_UNKNOWN.to_owned())),
     );
-    let (recorded, on_death) = (Arc::clone(&host.recorded), Arc::clone(&host.on_death));
+    let recorded = Arc::clone(&host.recorded);
     let parts = Parts {
         child: Arc::clone(&host.child),
         admin: Arc::new(admin),
@@ -208,7 +208,7 @@ fn build(cfg: &HandoverConfig, spool: &OrderSpool, host: &Host) -> SwapSuperviso
         clock: Arc::new(SystemClock::new()),
         requests: Arc::new(RequestQueue::new()),
         old_proc: Box::new(move |slot| recorded(slot)),
-        on_death: Box::new(move |why| on_death(why)),
+        on_death: Arc::clone(&host.on_death),
     };
     SwapSupervisor::new(
         parts,

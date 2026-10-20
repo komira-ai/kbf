@@ -226,6 +226,76 @@ fn a_start_runs_over_the_real_spool_recorder_and_root_half() {
     assert!(deaths.lock().unwrap().is_empty());
 }
 
+/// Catches calls that stay with the placeholder after the fill: with no update open, `abort`,
+/// `rollback` and `force_retire` go to the swap supervisor, which is built by the first of them
+/// and says no update is open.
+#[test]
+fn once_the_slot_is_filled_every_call_is_the_swap_supervisors() {
+    let (cfg, spool, root) = config("calls");
+    let mut handover = Handover::new(&cfg, spool);
+    let rig = Rig::new(None);
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate.fill(host_over(&rig, root, &deaths));
+    assert!(!built(&handover));
+    assert_eq!(handover.abort(), Err(SupervisorError::NotOpen));
+    assert!(built(&handover));
+    assert_eq!(handover.rollback(), Err(SupervisorError::NotOpen));
+    assert_eq!(
+        handover.force_retire("because"),
+        Err(SupervisorError::NotOpen)
+    );
+}
+
+/// Catches a migrator that lets an update through that it cannot judge: with the root half's
+/// own `status.json` showing the release kept, the swap goes as far as the migrator and ends
+/// `failed` at step `migrate`, with the refusal's word and the reason the schema is unknown,
+/// and no candidate is started.
+#[test]
+fn a_kept_release_is_refused_at_the_migrator_while_the_running_schema_is_unknown() {
+    let (cfg, spool, root) = config("migrate");
+    let running = State {
+        current: Some(c(A)),
+        staged: Some(c(B)),
+        ..State::default()
+    };
+    let memory = Memory {
+        staged: Some(KeptFacts {
+            state_schema: 1,
+            ..kept(B)
+        }),
+        ..Memory::default()
+    };
+    fs::write(&cfg.status_file, status::render(&running, &memory)).expect("status.json");
+    let mut handover = Handover::new(&cfg, spool);
+    let rig = Rig::new(None);
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate.fill(host_over(&rig, root, &deaths));
+    handover.start(&spec("u1")).expect("accepted");
+    until("the update to end", || {
+        handover
+            .status()
+            .update
+            .is_some_and(|u| u.phase == Phase::Failed)
+    });
+    let failure = handover
+        .status()
+        .update
+        .and_then(|u| u.failure)
+        .expect("a failure");
+    assert_eq!(failure.step, Step::Migrate);
+    assert!(
+        failure.reason.starts_with("not_additive:"),
+        "{}",
+        failure.reason
+    );
+    assert!(
+        failure.reason.contains(RUNNING_SCHEMA_UNKNOWN),
+        "{}",
+        failure.reason
+    );
+    assert_eq!(rig.count("spawn"), 0, "no candidate was started");
+}
+
 /// Catches a supervisor built over a state directory other than the proxy's: an update that
 /// an earlier process recorded in `update.json` is what the first status shows.
 #[test]

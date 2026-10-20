@@ -698,24 +698,65 @@ fn a_death_during_a_drain_is_noted_and_does_not_end_the_drain() {
 }
 
 /// Catches a swap thread that dies without stopping the proxy, or that stops it as a second
-/// signal (which ends the process at once): the death is remembered so that `outcome` fails the
-/// verb, it drains once and starts the clock a first signal starts, and with a drain already
-/// under way it is noted and drains nothing more.
+/// signal (which ends the process at once): through the hook the driver is given, the death
+/// is remembered so that `outcome` fails the verb, the proxy drains once, and a second death
+/// with the drain under way drains nothing more.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_dead_handover_driver_stops_the_proxy_once_and_fails_the_verb() {
     let stop = Arc::new(Stop {
         seen: AtomicBool::new(false),
-        bound: Duration::from_millis(30),
+        bound: Duration::from_secs(3600),
         exit: death_exit,
     });
-    let died = AtomicBool::new(false);
-    let mut drains = 0;
-    handover_died("the swap stopped: x", &stop, &died, || drains += 1);
-    assert_eq!(drains, 1);
+    let died = Arc::new(AtomicBool::new(false));
+    let drains = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let drain: Arc<dyn Fn() + Send + Sync> = {
+        let drains = Arc::clone(&drains);
+        Arc::new(move || {
+            drains.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let hook = death_hook(&stop, &died, &drain);
+    hook("the swap stopped: x");
+    assert_eq!(drains.load(Ordering::SeqCst), 1);
     assert!(died.load(Ordering::SeqCst));
     assert!(outcome(Ok(()), &died).is_err());
-    handover_died("again", &stop, &died, || drains += 1);
-    assert_eq!(drains, 1, "a second death drained again");
+    hook("again");
+    assert_eq!(
+        drains.load(Ordering::SeqCst),
+        1,
+        "a second death drained again"
+    );
+}
+
+/// Catches a lookup of the recorded process that asks the wrong slot or invents one: the slot
+/// the child control recorded gives its process, the other gives none.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_driver_asks_the_child_control_for_the_recorded_process_of_a_slot() {
+    use crate::proxy::child_real::{ProcChild, Recorded};
+    use crate::proxy::model::{ProcIdent, Slot as Own};
+    let dir = kbf_host::testkit::scratch("proxy-verb-recorded");
+    let ident = ProcIdent {
+        pid: 7,
+        start_time: 9,
+        exe: "/x/kbf".into(),
+    };
+    let record = Recorded {
+        ident: ident.clone(),
+        commit: crate::testkit::c(A),
+    };
+    fs::write(
+        dir.join("a.json"),
+        serde_json::to_vec(&record).expect("json"),
+    )
+    .expect("record");
+    let layout = crate::layout::Layout::linux(kbf_host::Root::host());
+    let child = Arc::new(ProcChild::new(layout, dir, Box::new(|_, _| Vec::new())));
+    let recorded = recorded_by(&child);
+    assert_eq!(recorded(Own::A), Some(ident));
+    assert_eq!(recorded(Own::B), None);
 }
 
 /// Catches a start-up line that does not say what the API does: it names the files, the

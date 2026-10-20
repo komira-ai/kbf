@@ -450,21 +450,15 @@ fn serve(
     }
     // A closed standard error (a journal that went away) must not stop the proxy from serving.
     #[cfg(target_os = "linux")]
-    let _supervised = {
-        let on_death: Arc<dyn Fn(&str) + Send + Sync> = {
-            let (stop, died, drain) = (Arc::clone(&stop), Arc::clone(&died), Arc::clone(&drain));
-            Arc::new(move |why| handover_died(why, &stop, &died, &*drain))
-        };
-        supervise(
-            &handle,
-            root,
-            &state_dir,
-            &proxy_auth_file,
-            upstream,
-            &handover.gate,
-            on_death,
-        )
-    };
+    let _supervised = supervise(
+        &handle,
+        root,
+        &state_dir,
+        &proxy_auth_file,
+        upstream,
+        &handover.gate,
+        death_hook(&stop, &died, &drain),
+    );
     let note = update_line(&parts, handover);
     let updates = start_updates(parts, &stop, &died, &drain)?;
     let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {note}");
@@ -513,7 +507,7 @@ fn supervise(
     slot.fill(Host {
         gate: gate.clone(),
         child,
-        recorded: Arc::new(move |slot| recorder.recorded(slot).map(|r| r.ident)),
+        recorded: recorded_by(&recorder),
         active,
         releases_dir,
         secret: admin_secret(&handle.admin_headers()),
@@ -522,9 +516,33 @@ fn supervise(
     gate
 }
 
+/// What the handover driver runs when its swap thread dies: [`handover_died`] over this verb's
+/// stop, death flag and drain.
+#[cfg(target_os = "linux")]
+fn death_hook(
+    stop: &Arc<Stop>,
+    died: &Arc<AtomicBool>,
+    drain: &Arc<dyn Fn() + Send + Sync>,
+) -> Arc<dyn Fn(&str) + Send + Sync> {
+    let (stop, died, drain) = (Arc::clone(stop), Arc::clone(died), Arc::clone(drain));
+    Arc::new(move |why| handover_died(why, &stop, &died, &*drain))
+}
+
+/// The process the children's records name for a slot, as the driver asks for it: what a
+/// restarted proxy adopts.
+#[cfg(target_os = "linux")]
+fn recorded_by(
+    child: &Arc<crate::proxy::child_real::ProcChild>,
+) -> Arc<dyn Fn(crate::proxy::model::Slot) -> Option<crate::proxy::model::ProcIdent> + Send + Sync>
+{
+    let child = Arc::clone(child);
+    Arc::new(move |slot| child.recorded(slot).map(|recorded| recorded.ident))
+}
+
 /// The handover driver's swap thread died: say why, then stop the proxy as the death of the
 /// update API's actor does (the verb exits 1 and the unit restarts it, and the restart
 /// adopts what the swap left).
+#[cfg(target_os = "linux")]
 fn handover_died(why: &str, stop: &Arc<Stop>, died: &AtomicBool, drain: impl FnOnce()) {
     let _ = writeln!(
         std::io::stderr(),
