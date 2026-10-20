@@ -53,7 +53,9 @@ pub enum FetchError {
 /// Pulls and installs a release.
 pub trait Fetcher {
     /// Fetch, verify and install the release `rec` names into its directory under
-    /// `releases/`. Never moves `current` or `previous`.
+    /// `releases/`. Never moves `current` or `previous`, and never writes the state: the
+    /// caller that keeps the release records it (`staged` for a frontend update, `current`
+    /// for an activation), so a release it then refuses leaves nothing behind in the state.
     fn fetch(&self, rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError>;
 }
 
