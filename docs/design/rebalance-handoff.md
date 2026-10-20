@@ -46,17 +46,26 @@ Primitives, all additive:
   harmless: object keys are disjoint (`cas/<member>/<boot>/<seq>`); the cost is PUT bytes,
   bounded by the staged volume.
 - **P2 `flush_clear_gen`.** The highest generation g such that every object the node staged
-  before it held map g is flushed. It is node-local, volatile, and recomputed from the staged
-  set after a restart.
+  before it held map g is flushed. It is node-local and volatile. Objects are dated in memory by
+  the generation the gate held at their first staging; an object nobody dated (staged before a
+  restart, or while no map was held) counts as generation 0, so a restart holds the value back
+  and never lets it run ahead. Only objects this node flushes under its current map count (a
+  replica's copy of a primary's object would otherwise hold it back forever), so the value can
+  go down when a map change makes an object this node's. `flush_known=false` says "cannot say"
+  and blocks the barrier.
 - **P3 tail adoption** (`kbf-front/src/cache/tail.rs`). Lists the cold store for objects
   written by other members and commits `AdoptSegment` through the path the rebuild uses.
   **Corrected:** the rebuild resumes from one lexicographic key, which is sound only because it
-  is one pass. A standing tail cannot keep one global cursor: keys sort by member, then boot,
-  then seq, so a new object of member 2 sorts before a cursor that has reached member 5. The
-  tail keeps one cursor per member (the last key listed under `cas/<member>/`, resumed with
-  `ListToken::after`), takes the member set from the map plus every member that has ever been
-  in it, and lists a member's prefix afresh when its cursor is lost. Boots of one member rise,
-  so a new boot sorts after the cursor.
+  is one pass. A standing tail cannot keep a cursor at all (as built in PR 4): keys sort by
+  member, then boot, then seq, but uploads finish in no seq order (`puts_in_flight`), so a
+  segment numbered below one already listed can appear later, and a cursor past it would never
+  read it. Each pass lists the whole `cas/` prefix and skips what a volatile `TailState` holds
+  (the handled seqs of each writer, kept as ranges), so a pass reads one footer per new object.
+  It never reads an object of its own member (its puts index it; an earlier boot's are the
+  rebuild's) and does not list a frozen old-layout prefix. A restart loses the state and reads
+  every object once, which adopts nothing new for a log that holds them. The listing is not a
+  snapshot, so a second pass that finds nothing it had not handled, after a first that adopted no
+  object, is the signal (`TailReport::quiet`) that a put the first listing missed is not hiding.
 - **P4 epoch fence.** `meta/tail_epoch` in the state store plus per-node acknowledgements
   (`tail_epoch_done`). No clocks are involved in the ordering argument.
 - **P5 durable `handoff/base` pin** of the pre-change map, shipped first and independently.
@@ -143,6 +152,11 @@ A reader that predates this sees a mark and treats the node as unfilled, as toda
   boot that did the pass, and the ack is accepted only if it equals the recorded boot; an
   ack from another boot is stale (the index of a restarted node may be rebuilding). The drop
   re-confirm (below) checks the same recorded boots.
+  Liveness: this does not stall. If an owner's boot in the map differs from `fence_boots` after
+  the fence (a restarted owner, or a joiner that registered after it), the frontend re-bumps
+  `meta/tail_epoch` to e' > e and records the current boots as the new `fence_boots`. Every
+  owner then acks e' under its present boot, and the phase completes under the new epoch. The
+  join's `tail_epoch_done >= e` and the drain's B to C condition use the current epoch.
 - The swap deletes `unfilled/<id>` and writes `meta/members_formed` in one transaction.
 - **Pass 2.** After the first tail pass succeeds the joiner repeats an incremental pass;
   `complete` requires zero new adoptions, or a restart of the pass if the fingerprint changed.
@@ -171,7 +185,10 @@ Drop conditions, all required:
 
 1. The object is flushed and the cold-store read-back (digest verified) succeeded.
 2. The object is not staged.
-3. The node is not a write owner of any of its blobs, or is Draining.
+3. The node is not a write owner of any of its blobs, or is Draining. For a drain the Draining
+   carve-out always holds (a Draining member takes no writes), so this condition is redundant
+   there and adds nothing to the safety argument; it matters only for a drop that is not a
+   drain, which section 8 says this design does not change.
 4. The epoch barrier holds: the B to C condition above (every write owner reports
    `tail_epoch_done >= e` with a matching fingerprint), so each has adopted every blob listed
    at epoch e.
@@ -197,15 +214,21 @@ out of scope (section 8 says what disk-pressure eviction does).
 map is one deep in all five places that hold it, so two quick map bumps lose the generation
 before them. The pin is released on a signal, not a dwell guess: the fence is closed at
 generation >= g_p and every frontend has reported, in a new `seen_gen` field, a generation at
-or beyond g_p. A dwell stays only as a floor. The cap is 4 open handoffs; beyond it a new join
-is refused (it does not register) and a new drain request is refused. Refusing is safe; the
-operator retries after one completes.
+or beyond g_p. A dwell stays only as a floor (PR 2 as built releases on the dwell alone; the
+`seen_gen` signal arrives with PR 6). The cap is 4 pins, not 4 handoffs: each map bump writes
+the map it replaces as `handoff/pin/<generation>` in the same transaction, and the bump past 4
+deletes the oldest, so a register bump and a promote bump of one join use two of the four. While 4 pins
+are open, a new instance joining a farm that holds data, and a drain of a member that is not
+draining yet, are refused (`MembershipError::PinsFull`, gRPC RESOURCE_EXHAUSTED, HTTP 409);
+a refused joiner gets no identity, row or mark. Let through: a known member registering again,
+a repeated drain, a lapsed pin, and any join or drain while the farm holds no data yet.
+Refusing is safe; the operator retries after pins lapse.
 
 ## 5. Protocol and flag changes (all additive)
 
 Optional fields with new numbers; an old peer ignores them.
 
-- `HeartbeatRequest` (today fields 1 to 10, last is `writes_known`): `flush_clear_gen`,
+- `HeartbeatRequest` (today fields 1 to 10, last is `writes_known`; PR 3 takes 11 to 14 for `flush_clear_gen`, `flush_known`, `staged_objects`, `staged_bytes`, so the later fields take 15 and up): `flush_clear_gen`,
   `flush_known`, `tail_epoch_done` (the ack carries the node's boot, which the heartbeat already sends as `boot`), `fill_fp`, `staged_objects`, `staged_bytes`, `drained`,
   `seen_gen` (sent by map consumers that are frontends).
 - `HeartbeatResponse` (today `map_generation`, `map`, `objstore_generation`): `tail_epoch`,
@@ -250,7 +273,7 @@ Spec tests:
    barrier.
 2. **A node holds a blob until the new owner confirms.** Drain with the flush held by fault
    injection: no drop. Release it: the fence closes and the drop happens. Mutants, each red:
-   drop at Draining; ignore one member's ack; drop Joining and CatchingUp owners from the ack set; drop Joining and CatchingUp owners from the confirm set (each separately: a blob only a Joining owner lacks must block the drop); skip the re-confirm; key the confirm without the
+   drop at Draining; ignore one member's ack; drop Joining and CatchingUp owners from the ack set (scenario: a Joining owner holds the blob, so the per-blob confirm passes, but it has not acked the epoch; the test asserts `drain_confirmed` (B to C) is withheld, and the mutant makes it fire); drop Joining and CatchingUp owners from the confirm set (each separately: a blob only a Joining owner lacks must block the drop); skip the re-confirm; key the confirm without the
    boot; skip the release signal.
 3. **A rebuild after a wipe stays catching-up.** Exists today (see Verified facts). Added: the
    tail does not skip the rebuild, and a joiner wiped mid-fill is not reported complete.
@@ -272,11 +295,16 @@ Extra tests:
 - Sampled audit: a planted skipped blob is caught (mutant: audit disabled, promotion wrongly
   proceeds).
 - Mixed frontend: dropped fields cause no auto-promotion; manual `active` works.
-- Pin cap: the fifth concurrent handoff is refused.
+- Pin cap: with 4 pins open a join of a new instance and a drain of a non-draining member are refused and leave no identity, row or mark; a known member re-registering, a repeated drain, a lapsed pin and a forming farm are let through.
 - Orphan flush: the expectation in `flush/tests.rs` that a Draining member stops flushing is
   rewritten (Draining and displaced nodes now flush); duplicate flush is harmless.
-- Per-member tail cursor: an object written by a lower-numbered member after the cursor passed
-  a higher one is adopted (mutant: one global cursor).
+- Late lower-seq segment: a segment numbered below one already handled, uploaded after the
+  first pass, is adopted by the next pass (mutant: `TailState::holds` true for any seq below a
+  range end, which is what a cursor does).
+- Fence boots liveness: an owner restarts (new boot) after the fence; the frontend re-bumps
+  `tail_epoch` and re-records `fence_boots`, the owner acks the new epoch under its new boot,
+  and the join completes (or the drain reaches C) instead of stalling. Mutant: never re-record
+  `fence_boots` (the old-boot ack is rejected forever and the test times out red).
 - Listing conformance: `list_sees_completed_put` on every backend that enables auto-promotion.
 
 ## 8. Risks
@@ -313,7 +341,7 @@ Extra tests:
 | 1b | Digest sampling reader | `kbf-meta` `MetaState::sample_digests` | S | Unit tests: order, bound, resume point | 5 |
 | 2 | Durable previous-map pin | `members.rs`, `front_maps.rs`, `kbf-route` router, `kbf-mapsync` holder, `kbf-daemon` map, `map.proto` | M | Red first: two quick bumps plus a frontend restart gives a false miss; mutant: back to 1-deep; cap enforced. Fixes the hole independent of handoff | 5, 6 |
 | 3 | Orphan flush and `flush_clear_gen` | `kbf-storage` flush, `kbf-front` cache flush, proto fields, staged metric | M | Red first: Draining and r=1 staged blobs never flush today | 5 |
-| 4 | Tail adoption | `kbf-front` cache tail, `kbf-objstore` conformance case, wire fields | M | Red first: a segment flushed by another member after the rebuild is not readable today; per-member cursor mutant | 5 |
+| 4 | Tail adoption | `kbf-front` cache tail, `kbf-objstore` conformance case, wire fields | M | Red first: a segment flushed by another member after the rebuild is not readable today; a mutant that resumes past the last handled key (one cursor) | 5 |
 | 5 | Automatic promotion | `members.rs` (`refresh`, `touch`), `join.rs`, mark phases, rules, audit, `--auto-promote` default off | L | Red first: spec test 1 end to end plus mutants | 6 |
 | 6 | Drain completion and drop | node-to-node `FindMissingBlobs` client on owners (peer addresses and auth from the map; unavailable-owner and retry handling) with its tests, `draining/<id>` phases, `drain_confirmed`, `Cache::drop_confirmed`, `seen_gen`, `finish_drain`, flags; fixes the notes in `update/mod.rs`, `members.rs`, `operator-verbs.md`, `docs/api.md`, the "8.4" cross-reference in `architecture-v2.md`, P6 | L | Red first: spec test 2 with all mutants | 7 |
 | 7 | Node-pull tier (only if the owner answers 1 below with a node-local store) | handoff engine for `file://` | M | default off | none |
@@ -410,8 +438,8 @@ All from `feature/arch-v2`.
    (node-pull for `file://`) is needed only if a multi-node farm is ever run with per-node
    `file://` stores, which no doc describes. Confirm that such a deployment does not exist or
    is unsupported.
-2. **Pin-cap overflow policy.** The design refuses a join or drain beyond 4 open handoffs.
-   Is refusing acceptable to operators, versus deferring write ownership?
+2. **Pin-cap overflow policy.** The design refuses a join or drain while 4 pins are open (PR 2).
+   The cap counts pins, so about two concurrent joins fill it. Is refusing acceptable to operators, versus deferring write ownership, and is 4 the right cap?
 3. **Liveness versus safety on Down members.** Promotion waits while a Down member is inside
    its dwell, and a manual `active` overrides. Confirm that default.
 4. **Is `seen_gen` reporting by frontends acceptable** as the pin release signal (a new field
