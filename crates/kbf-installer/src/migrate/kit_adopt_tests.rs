@@ -360,15 +360,53 @@ fn a_kit_host_that_becomes_an_old_host_under_the_migration_is_changed() {
     assert!(!rig.new_state_dir().join("state.json").exists());
 }
 
-/// Catches the version probe asking a macOS release for `kbf-daemon`, which a macOS release
-/// does not hold (a release holds only `kbf`), and Linux changing: both ask `kbf`.
+/// Catches the version probe asking a release for the wrong binary. A host the kit installed
+/// holds only `kbf` in a release (on either platform), so it is asked `kbf` even where the
+/// release also holds `kbf-daemon`; an old-host Mac is asked `kbf-daemon` when its release
+/// holds one and `kbf` when it does not (the old `state.json` names no binary); Linux is
+/// asked `kbf` whatever else is there.
 ///
-/// Mutant seen red: `Roots::binary` naming `kbf-daemon` on macOS (the old code).
+/// Mutants seen red: `kbf-daemon` on every Mac; `kbf` on every Mac; `holds_daemon` ignored;
+/// `kit` ignored.
 #[test]
-fn the_release_binary_probed_is_kbf_on_both_platforms() {
-    for platform in [Platform::Linux, Platform::MacOs] {
-        assert_eq!(Roots::new(platform).binary(), "kbf");
+fn the_release_binary_probed_depends_on_the_host_not_only_the_platform() {
+    let want = [
+        (Platform::Linux, false, false, "kbf"),
+        (Platform::Linux, false, true, "kbf"),
+        (Platform::Linux, true, true, "kbf"),
+        (Platform::MacOs, true, false, "kbf"),
+        (Platform::MacOs, true, true, "kbf"),
+        (Platform::MacOs, false, false, "kbf"),
+        (Platform::MacOs, false, true, "kbf-daemon"),
+    ];
+    for (platform, kit, daemon, binary) in want {
+        assert_eq!(
+            Roots::new(platform).binary(kit, daemon),
+            binary,
+            "{platform:?} kit={kit} daemon={daemon}"
+        );
     }
+}
+
+/// Catches a kit host probed for `kbf-daemon` because a release happens to hold one: the
+/// kit's releases are asked `kbf` whatever else is in them.
+///
+/// Mutant seen red: `Roots::binary` not told the host is the kit's.
+#[test]
+fn a_kit_host_is_probed_for_kbf_even_where_a_release_holds_kbf_daemon() {
+    let mut rig = Rig::kit("daemon-too", Platform::MacOs, Form::New);
+    for sha in [CURRENT, PREVIOUS] {
+        put(
+            &rig.at(&format!("usr/local/kbf/releases/{sha}/kbf-daemon")),
+            "daemon",
+            0o755,
+        );
+    }
+    let runner = runner();
+    run_with(&mut rig, &runner, &never(), &NoFrontend, Mode::Apply).expect("migrates");
+    let programs: Vec<_> = runner.calls().iter().map(|c| c.program.clone()).collect();
+    assert_eq!(programs.len(), 2);
+    assert!(programs.iter().all(|p| p.ends_with("kbf")), "{programs:?}");
 }
 
 /// What a finished migration leaves, to compare a resumed one with: the plist, the

@@ -19,7 +19,7 @@ use crate::CommitId;
 use crate::binary::Version;
 use crate::helper::memory::{Memory, StagedFacts};
 use crate::helper::status;
-use crate::layout;
+use crate::layout::{self, Platform};
 use crate::state::{self, Locked, State};
 
 /// The rules every file read and written is judged by.
@@ -452,12 +452,20 @@ fn find(
         let Some(name) = name else { continue };
         let dir = tree.release(name)?;
         tree::digest(rules, &dir)?;
+        let holds_daemon = m.roots.platform == Platform::MacOs
+            && tree::absent(rustix::fs::statat(
+                &dir,
+                layout::RELEASE_DAEMON,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            ))
+            .map_err(MigrateError::io(layout::RELEASE_DAEMON))?
+            .is_some();
         let program: PathBuf = m
             .layout
             .join(&m.roots.old_tree)
             .join("releases")
             .join(name.as_str())
-            .join(m.roots.binary());
+            .join(m.roots.binary(old.kit.is_some(), holds_daemon));
         let version = probe(hooks.runner, program, m.run_as, name)?;
         found.push(Found {
             role,

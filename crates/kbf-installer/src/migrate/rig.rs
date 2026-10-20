@@ -223,7 +223,7 @@ impl Rig {
     }
 
     pub fn binary(&self) -> &'static str {
-        self.roots().binary()
+        self.roots().binary(self.kit, false)
     }
 
     pub fn new_state_dir(&self) -> PathBuf {
@@ -438,6 +438,11 @@ impl OldHand {
 /// What `kbf --version --json` of the build in the directory the program is in says, as
 /// that directory's commit's release build.
 fn probe_answer(spawn: &Spawn) -> io::Result<crate::run::Ran> {
+    // A program that is not there cannot be run: a probe of a name the release does not hold
+    // fails here as it does on a host.
+    if !spawn.program.exists() {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
+    }
     let commit = spawn
         .program
         .parent()
@@ -555,8 +560,8 @@ impl Rig {
 
     /// A macOS test-farm host: the same releases with `kbf-daemon`, and the daemon's
     /// LaunchDaemon plist as `kbf-mac-provision` renders it.
-    pub fn testfarm_mac() -> Rig {
-        let rig = Rig::bare("testfarm-mac", Platform::MacOs);
+    pub fn testfarm_mac(name: &str) -> Rig {
+        let rig = Rig::bare(&format!("testfarm-mac-{name}"), Platform::MacOs);
         rig.farm_releases("kbf-daemon");
         put(
             &rig.at("Library/LaunchDaemons/org.example.kbf-daemon.plist"),

@@ -106,7 +106,7 @@ pub fn read(
     if state.is_none() && memory.is_none() {
         return kit::read(layout, roots, rules, resume);
     }
-    kit::refuse_beside_state(layout, roots)?;
+    kit::refuse_beside_state(layout, roots, rules)?;
     let state = match state {
         Some(bytes) => parse_state(&bytes)?,
         // Only the helper's memory is there: an old host with nothing deployed.

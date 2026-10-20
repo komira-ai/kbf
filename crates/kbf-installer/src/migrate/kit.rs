@@ -5,7 +5,11 @@
 //! `previous` names (the kit reads them with `readlink`). So the links are the truth here,
 //! and what runs is the LaunchDaemon `com.komira.kbf-daemon`. A host is a kit host when the
 //! old state is absent and its tree is a whole kit tree on macOS: `releases/`, a `current`
-//! link and that plist. Which of the kit's two argument forms the job is in is read from
+//! link and that plist. Two markers say the kit is there: its settings file
+//! `etc/av2_mac.conf` (the kit dies without it on every verb) and the plist whose
+//! `ProgramArguments` run `/usr/local/kbf/current/...`. With one and not the other the host
+//! is half removed or not the kit's, and the migration refuses and says which is missing
+//! rather than guess; with neither it is not a kit host. Which of the kit's two argument forms the job is in is read from
 //! the plist and is not a difference migrate acts on: the plist is repointed whole-path as
 //! for any old host, and every other byte stays.
 
@@ -24,9 +28,11 @@ pub const PLIST: &str = "com.komira.kbf-daemon.plist";
 const MAC_UNIT_DIR: &str = "/Library/LaunchDaemons";
 /// What the job runs, as the kit writes it.
 const PROGRAM: &str = "/usr/local/kbf/current/kbf";
-/// A file only the kit writes into the tree: the kit's own settings. State beside it is
-/// two managers' state.
+/// A file only the kit writes into the tree: the kit's own settings, which `mac_join` writes
+/// and the kit cannot run without. It is one of the kit's two markers; the job is the other.
 const KIT_MARKER: &str = "etc/av2_mac.conf";
+/// Where the kit's job runs from: a plist pointing into it is the kit's job.
+const CURRENT_DIR: &str = "/usr/local/kbf/current/";
 const PLIST_CAP: u64 = 64 * 1024;
 
 /// How the kit's job passes its settings.
@@ -90,6 +96,28 @@ fn present(path: &Path) -> Result<bool, MigrateError> {
         .is_some())
 }
 
+/// The kit's job file, read; `None` when it or the LaunchDaemons directory is not there.
+fn read_job(
+    layout: &Layout,
+    roots: &Roots,
+    rules: &Rules,
+) -> Result<Option<Vec<u8>>, MigrateError> {
+    let units = tree::absent(tree::open_root(&layout.join(&roots.unit_dir)))
+        .map_err(MigrateError::io(roots.unit_dir.to_string()))?;
+    match &units {
+        Some(dir) => Ok(tree::read_file(rules, dir, PLIST, PLIST_CAP)?),
+        None => Ok(None),
+    }
+}
+
+/// Whether the job's program is one in the kit's `current/` (or `repointed`, the link a
+/// migration that died left it at).
+fn runs_current(plist: &str, repointed: Option<&str>) -> bool {
+    program_arguments(plist)
+        .first()
+        .is_some_and(|p| p.starts_with(CURRENT_DIR) || repointed == Some(p.as_str()))
+}
+
 /// Read a host with no old state: `None` when it is not a kit host. `resume` is set when the
 /// migration's journal says a kit migration began here: the plist may then already run the
 /// installer's `current/kbf`, which is what a run that died after repointing it left. Without
@@ -119,24 +147,36 @@ pub fn read(
         };
     }
     drop(tree);
+    let conf = present(&layout.join(&roots.old_tree).join(KIT_MARKER))?;
+    let repointed = resume.then(|| format!("{}/kbf", layout.current()));
+    let job = read_job(layout, roots, rules)?;
+    let marker = job
+        .as_deref()
+        .is_some_and(|b| runs_current(&String::from_utf8_lossy(b), repointed.as_deref()));
+    let unit_dir = roots.unit_dir.to_string();
+    let bytes = match (conf, job, marker) {
+        // Neither marker: not the kit's tree (a plist that runs something else is not the
+        // kit's job, and the tree alone is no kit).
+        (false, _, false) => return Ok(None),
+        (false, _, true) => {
+            return Err(MigrateError::HalfKit(format!(
+                "{what}/{KIT_MARKER} is missing and {PLIST} running {CURRENT_DIR}... is in \
+                 {unit_dir}: a kit host has both, and the migration will not guess which this is"
+            )));
+        }
+        (true, None, _) => {
+            return Err(MigrateError::HalfKit(format!(
+                "{what}/{KIT_MARKER} is there and {PLIST} is not in {unit_dir}: a kit host has \
+                 both, and the migration will not guess which this is"
+            )));
+        }
+        (true, Some(bytes), _) => bytes,
+    };
     if !releases {
         return Err(MigrateError::HalfKit(format!(
             "{what} has links and no releases/"
         )));
     }
-    let units = tree::absent(tree::open_root(&layout.join(&roots.unit_dir)))
-        .map_err(MigrateError::io(roots.unit_dir.to_string()))?;
-    let bytes = match &units {
-        Some(dir) => tree::read_file(rules, dir, PLIST, PLIST_CAP)?,
-        None => None,
-    };
-    let Some(bytes) = bytes else {
-        return Err(MigrateError::HalfKit(format!(
-            "{what} is there and {PLIST} is not in {}: a kit host has both",
-            roots.unit_dir
-        )));
-    };
-    let repointed = resume.then(|| format!("{}/kbf", layout.current()));
     let form = form(&String::from_utf8_lossy(&bytes), repointed.as_deref())?;
     let old_tree = OldTree::open(layout, roots)?;
     let current = old_tree.linked("current")?;
@@ -152,15 +192,32 @@ pub fn read(
 }
 
 /// Old state beside a kit tree: two managers' state, and the migration does not choose.
-pub fn refuse_beside_state(layout: &Layout, roots: &Roots) -> Result<(), MigrateError> {
+/// The kit's settings file and its job are both there for that; the settings file without
+/// the job is a half-removed kit beside state and is refused as such. The job without the
+/// settings file is the old tools' own job (they ran `current/kbf` too), and is an old host.
+pub fn refuse_beside_state(
+    layout: &Layout,
+    roots: &Roots,
+    rules: &Rules,
+) -> Result<(), MigrateError> {
     let marker = layout.join(&roots.old_tree).join(KIT_MARKER);
-    if roots.platform == Platform::MacOs && present(&marker)? {
-        return Err(MigrateError::Conflict(format!(
-            "{} holds the old tools' state and {} is the kit's: the links are the kit's truth and \
-             state.json is the old tools', and the migration will not choose between them",
+    if roots.platform != Platform::MacOs || !present(&marker)? {
+        return Ok(());
+    }
+    let job = read_job(layout, roots, rules)?;
+    if !job.is_some_and(|b| runs_current(&String::from_utf8_lossy(&b), None)) {
+        return Err(MigrateError::HalfKit(format!(
+            "{} holds the old tools' state, {} is the kit's, and {PLIST} running {CURRENT_DIR}... \
+             is missing from {}: the migration will not guess which manager this host has",
             roots.old_state,
-            marker.display()
+            marker.display(),
+            roots.unit_dir
         )));
     }
-    Ok(())
+    Err(MigrateError::Conflict(format!(
+        "{} holds the old tools' state and {} is the kit's: the links are the kit's truth and \
+         state.json is the old tools', and the migration will not choose between them",
+        roots.old_state,
+        marker.display()
+    )))
 }
