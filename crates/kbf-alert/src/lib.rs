@@ -25,12 +25,7 @@ pub use crate::book::{AlertBook, Hysteresis, Record};
 pub use crate::outbox::{Backoff, Delivery, Outbox, OutboxError};
 pub use crate::webhook::{OUTBOX_FILE, Status, Webhook, WebhookConfig, WebhookError};
 
-#[cfg(test)]
-mod planted {
-    #[test]
-    fn planted_failing_fast_test() {
-        assert_eq!(1 + 1, 3, "planted defect (b): a failing fast unit test");
-    }
+/// Planted defect (c): code no test runs.
+pub fn planted_uncovered(n: u32) -> u32 {
+    if n > 10 { n - 10 } else { n + 10 }
 }
-
-pub fn   planted_fmt_defect( )  ->  u8 {  7 }
