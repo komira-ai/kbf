@@ -297,6 +297,8 @@ impl Joiner {
                 catching_up: self.catch_up.is_catching_up(),
                 applied_objstore_generation,
                 apply_status: apply_status.into(),
+                // No node runs a tail pass on a schedule yet, so none has one to report.
+                tail_epoch_done: 0,
             })
             .await?
             .into_inner();

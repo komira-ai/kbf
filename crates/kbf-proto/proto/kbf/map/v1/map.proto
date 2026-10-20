@@ -161,6 +161,12 @@ message HeartbeatRequest {
   // Whether this node counts its open writes. False says "I cannot say", never "none": an
   // older node, which sends neither field, reads as false.
   bool writes_known = 10;
+  // The highest tail epoch (HeartbeatResponse.tail_epoch) for which this node finished a
+  // pass of its tail ("Cache::tail_pass": every object in the cold store, listed after the
+  // node saw that epoch, is indexed here). Volatile: a restarted node says 0 until it has
+  // finished a pass again. 0 is also what an older node sends, and reads as "no pass done".
+  // Numbers 11 and 12 are left for the flush fields of the same handoff.
+  uint64 tail_epoch_done = 13;
 }
 
 // A closed set: a node never sends free text about its store, so a credential cannot ride
@@ -187,4 +193,8 @@ message HeartbeatResponse {
   Map map = 2;
   // As RegisterResponse.objstore_generation.
   uint64 objstore_generation = 3;
+  // The fence a node's tail pass is acknowledged against: a node reports
+  // HeartbeatRequest.tail_epoch_done >= this once a pass that began after it learned the
+  // value has finished. 0: no fence is open (also what an older frontend sends).
+  uint64 tail_epoch = 4;
 }
