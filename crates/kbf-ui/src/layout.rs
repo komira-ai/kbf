@@ -10,6 +10,7 @@ use crate::{PREFIX, STYLESHEET};
 const NAV: &[(&str, &str)] = &[
     ("Overview", PREFIX),
     ("Builds", "/ui/builds"),
+    ("Targets", "/ui/targets"),
     ("Updates", "/ui/updates"),
 ];
 

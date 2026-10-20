@@ -23,7 +23,10 @@
 //! and they are small; a larger one is a link), and `/ui/updates` (Updates: the
 //! desired release, the releases, and each host's update, from `GET /v1/update`,
 //! `GET /v1/nodes` and, where it answers, `GET /v1/update/hosts`; read-only, with the
-//! operator-API command to set the desired release shown as text).
+//! operator-API command to set the desired release shown as text), `/ui/targets`
+//! (Targets: `GET /v1/tests` and, for the strips, `GET /v1/grid`), and
+//! `/ui/targets/{key}?instance=&cfg=` (Target: `GET /v1/shapes/{key}` and a strip of the
+//! target's last builds, oldest left, from `GET /v1/grid`).
 //!
 //! A mount routes `GET` under [`PREFIX`] to [`respond`], gives it a [`Source`] that asks
 //! the server's own read routes, and sends every header of [`Answer::headers`]
@@ -176,6 +179,8 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
             pages::action(source, id, digest).await
         }
         ["updates"] => pages::updates(source).await,
+        ["targets"] => pages::targets(source, query).await,
+        ["targets", key] if !key.is_empty() => pages::target(source, key, query).await,
         _ => pages::not_found(path),
     }
 }
