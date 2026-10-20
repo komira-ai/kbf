@@ -41,6 +41,7 @@ use super::paths;
 use super::validate::mode_name;
 use crate::cli::Mode;
 use crate::installer_toml::toml_string;
+use crate::layout::Platform;
 
 /// The first port of slot A when `--proxy-base-port` is not given.
 pub const DEFAULT_BASE_PORT: u16 = 18_000;
@@ -108,6 +109,7 @@ impl ProxyFlags {
     /// the proxy owns are moved out of it into the plan. Each problem is pushed to `problems`.
     pub fn validate(
         &self,
+        platform: Platform,
         mode: Mode,
         flags: &KbfFlags,
         kbf: &mut Vec<Setting>,
@@ -124,6 +126,10 @@ impl ProxyFlags {
                     problems.push(format!("{flag} is for --proxy"));
                 }
             }
+            return None;
+        }
+        if platform != Platform::Linux {
+            problems.push("--proxy is for Linux: the proxy runs as systemd units".to_owned());
             return None;
         }
         if mode != Mode::Frontend {
@@ -260,7 +266,7 @@ impl ProxyPlan {
     pub fn table(&self) -> Result<ProxyConfig, kbf_proxy::config::ConfigError> {
         let mut text = format!(
             "operator_token_file = {}\nserver_cert_file = {}\nserver_key_file = {}\nclient_ca_file = {}\nbuck2_auth = \"{}\"\n",
-            toml_string(paths::API_TOKEN),
+            toml_string(paths::api_token(Platform::Linux)),
             toml_string(&self.server_cert),
             toml_string(&self.server_key),
             toml_string(&self.client_ca),
@@ -292,7 +298,7 @@ impl ProxyPlan {
         }
         Err(SetupError::NeedsOperator(format!(
             "{} holds a [proxy] table with other settings and these keys differ from the flags ({}): edit them by hand",
-            paths::INSTALLER_TOML,
+            paths::installer_toml(Platform::Linux),
             differ.join("; ")
         )))
     }
@@ -342,14 +348,12 @@ fn default_cert(c: &ProxyConfig) -> Option<(&std::path::Path, &std::path::Path)>
 }
 
 /// Copy the keys `setup` owns from `from` into `to`. The `[[server_cert]]` list is the
-/// operator's: a table that has one keeps it and keeps its certificates, so a difference in
-/// them is left for the caller to refuse.
+/// operator's and is not copied: a table that has one still differs from the wanted one
+/// afterwards, so [`ProxyPlan::merge`] refuses it.
 fn take_owned(from: &ProxyConfig, to: &mut ProxyConfig) {
     to.operator_token_file = from.operator_token_file.clone();
-    if to.server_cert.is_empty() {
-        to.server_cert_file = from.server_cert_file.clone();
-        to.server_key_file = from.server_key_file.clone();
-    }
+    to.server_cert_file = from.server_cert_file.clone();
+    to.server_key_file = from.server_key_file.clone();
     to.client_ca_file = from.client_ca_file.clone();
     to.buck2_auth = from.buck2_auth;
     to.buck2_token_file = from.buck2_token_file.clone();

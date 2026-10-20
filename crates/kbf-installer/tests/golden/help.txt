@@ -101,7 +101,7 @@ Options:
       --node-id <NODE_ID>
           The daemon half's node name, a DNS label unique in the cell. Required for all-in-one
       --proxy
-          Set this frontend host up behind `kbf-installer proxy`: write the `[proxy]` table of installer.toml and enable kbf-proxy.socket and kbf-proxy.service instead of kbf-frontend@a.service. Only for `--mode=frontend`. The proxy takes --reapi-tls-cert, --reapi-tls-key and --worker-client-ca; the listener flags are not taken
+          Set this frontend host up behind `kbf-installer proxy`: write the `[proxy]` table of installer.toml and enable kbf-proxy.socket and kbf-proxy.service instead of kbf-frontend.service. Only for `--mode=frontend`. The proxy takes --reapi-tls-cert, --reapi-tls-key and --worker-client-ca; the listener flags are not taken
       --proxy-base-port <PROXY_BASE_PORT>
           The first loopback port of the frontend children the proxy starts (1024 to 65521); slot A uses it and the four after, slot B ten above. Default 18000. With --proxy
       --buck2-auth <BUCK2_AUTH>

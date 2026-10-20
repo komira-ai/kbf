@@ -492,4 +492,5 @@ fn the_proxy_table_survives_a_render() {
 fn a_bad_proxy_listen_names_the_key_not_the_value() {
     let why = problems(&PROXY.replace("192.0.2.10:8443", "farm.example:8443"));
     assert!(why.contains("listen"), "{why}");
-    assert!(!why.contains("farm.example"), "{why}");}
+    assert!(!why.contains("farm.example"), "{why}");
+}

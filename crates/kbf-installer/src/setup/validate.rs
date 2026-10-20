@@ -109,7 +109,7 @@ impl Raw {
             .validate(self.mode, self.proxy.proxy, &mut problems);
         let proxy = self
             .proxy
-            .validate(self.mode, &self.kbf, &mut kbf, &mut problems);
+            .validate(platform, self.mode, &self.kbf, &mut kbf, &mut problems);
         let installer_toml = paths::installer_toml(platform);
         if self
             .installer_config

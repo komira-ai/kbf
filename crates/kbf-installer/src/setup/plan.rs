@@ -305,16 +305,16 @@ pub fn before_release(
         .transpose()?;
     let settings = installer_settings(exec, v, platform)?;
     let listen = settings.proxy.as_ref().and_then(|p| p.listen);
-    if v.proxy.is_some() {
-        if let Some(Entry::File { bytes, .. }) = exec.inspect(&hp(paths::KBF_TOML)?)? {
-            let left = super::proxy::leftover_tls_keys(&String::from_utf8_lossy(&bytes));
-            if !left.is_empty() {
-                return Err(SetupError::NeedsOperator(format!(
-                    "{} has [tls] keys ({}) that a --proxy host does not take: the proxy holds the certificates and the children speak plain h2c behind it; remove them by hand, then run setup again",
-                    paths::KBF_TOML,
-                    left.join(", ")
-                )));
-            }
+    if v.proxy.is_some()
+        && let Some(Entry::File { bytes, .. }) = exec.inspect(&hp(paths::kbf_toml(platform))?)?
+    {
+        let left = super::proxy::leftover_tls_keys(&String::from_utf8_lossy(&bytes));
+        if !left.is_empty() {
+            return Err(SetupError::NeedsOperator(format!(
+                "{} has [tls] keys ({}) that a --proxy host does not take: the proxy holds the certificates and the children speak plain h2c behind it; remove them by hand, then run setup again",
+                paths::kbf_toml(platform),
+                left.join(", ")
+            )));
         }
     }
     let mut notes = Vec::new();

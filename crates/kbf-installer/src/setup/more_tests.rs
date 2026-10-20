@@ -703,6 +703,9 @@ fn gate_files(plist: &str) -> Vec<String> {
 #[test]
 fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
     let mut exec = released(host(), Platform::MacOs);
+    // The certificates `host()` already holds are the operator's, in `/etc/kbf`; only what
+    // the run adds says where `setup` keeps things.
+    let before: Vec<String> = exec.entries.keys().map(ToString::to_string).collect();
     go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
 
     let files: Vec<String> = exec
@@ -710,6 +713,7 @@ fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
         .iter()
         .filter(|(_, e)| matches!(e, Entry::File { .. }))
         .map(|(p, _)| p.to_string())
+        .filter(|p| !before.contains(p))
         .collect();
     let written: Vec<&String> = files
         .iter()

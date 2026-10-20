@@ -250,8 +250,8 @@ fn refuse_old_layout(exec: &dyn Exec, platform: Platform) -> Result<(), SetupErr
 /// packaged unit: systemd reads `/etc` before `/usr/lib`, and `setup`
 /// does not enable a unit that is already enabled, so the host would go on running the old
 /// file's flags. A link is what `systemctl link` makes and is not a shadow with other flags.
-fn refuse_shadow_unit(exec: &dyn Exec, mode: Mode) -> Result<(), SetupError> {
-    for unit in plan::mode_units(mode) {
+fn refuse_shadow_unit(exec: &dyn Exec, mode: Mode, proxy: bool) -> Result<(), SetupError> {
+    for unit in plan::mode_units(mode, proxy) {
         let path = format!("/etc/systemd/system/{unit}");
         if matches!(
             exec.inspect(&HostPath::new(&path)?)?,
@@ -306,7 +306,7 @@ pub fn run(
     let ctx = plan::context(os, valid.mode)?;
     refuse_old_layout(&*exec, ctx.platform)?;
     if ctx.platform == Platform::Linux {
-        refuse_shadow_unit(&*exec, valid.mode)?;
+        refuse_shadow_unit(&*exec, valid.mode, valid.proxy.is_some())?;
     }
     let service_uid = ctx.service.as_ref().map(|u| u.uid);
     kbf_settings::check_files(&*exec, &valid.kbf, service_uid)?;

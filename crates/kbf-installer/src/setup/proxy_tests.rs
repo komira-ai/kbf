@@ -190,7 +190,8 @@ fn a_proxy_rerun_keeps_the_keys_it_has_no_flag_for() {
 /// entry is the certificate the flags name, a second one is chosen by name) instead of the
 /// single pair, spelled as `render` writes it.
 fn sni_list() -> String {
-    let single = "server_cert_file = \"/etc/kbf/reapi.pem\"\nserver_key_file = \"/etc/kbf/reapi.key\"\n";
+    let single =
+        "server_cert_file = \"/etc/kbf/reapi.pem\"\nserver_key_file = \"/etc/kbf/reapi.key\"\n";
     assert!(PROXY_GOLDEN.contains(single));
     PROXY_GOLDEN.replace(single, "").replace(
         "\n[proxy.upstream]",
@@ -228,7 +229,8 @@ fn a_rerun_passes_a_server_cert_list_through_unchanged() {
 #[test]
 fn a_differing_owned_key_over_a_server_cert_list_is_refused() {
     let there = sni_list();
-    let edits: [(&str, fn(&mut Raw)); 2] = [
+    type RawEdit = fn(&mut Raw);
+    let edits: [(&str, RawEdit); 2] = [
         ("server_cert_file", |r| {
             r.kbf.reapi_tls_cert = some("/etc/kbf/other.pem")
         }),
@@ -246,9 +248,23 @@ fn a_differing_owned_key_over_a_server_cert_list_is_refused() {
         assert_eq!(err.exit(), Exit::NeedsOperator, "{key}");
         let shown = err.to_string();
         assert!(shown.contains(&format!("({key})")), "{key}: {shown}");
-        assert!(!shown.contains("other.pem") && !shown.contains("19000"), "{shown}");
+        assert!(
+            !shown.contains("other.pem") && !shown.contains("19000"),
+            "{shown}"
+        );
         assert_eq!(text(&exec, INSTALLER_TOML), there, "{key}");
     }
+}
+
+/// Catches `--proxy` on a Mac, where the proxy's systemd units do not exist: refused by
+/// validation, naming the flag.
+#[test]
+fn the_proxy_is_for_linux() {
+    let found = proxy_raw()
+        .validate(Platform::MacOs)
+        .expect_err("refused")
+        .join("; ");
+    assert!(found.contains("--proxy is for Linux"), "{found}");
 }
 
 /// One row per key `setup` owns: the key as the refusal names it, and the golden file with
@@ -493,7 +509,10 @@ fn the_proxy_flags_belong_to_a_frontend_and_to_each_other() {
             ..raw(Mode::Frontend)
         };
         edit(&mut raw.proxy);
-        let found = raw.validate().expect_err("refused").join("; ");
+        let found = raw
+            .validate(Platform::Linux)
+            .expect_err("refused")
+            .join("; ");
         assert!(found.contains(&format!("{flag} is for --proxy")), "{found}");
     }
 }
@@ -525,7 +544,9 @@ fn the_base_port_is_in_range_and_clear_of_the_default_ports() {
     let check = |port: u16| {
         let mut raw = proxy_raw();
         raw.proxy.proxy_base_port = Some(port);
-        raw.validate().map(|_| ()).map_err(|p| p.join("; "))
+        raw.validate(Platform::Linux)
+            .map(|_| ())
+            .map_err(|p| p.join("; "))
     };
     for ok in [1024, 8965, 8975, 8983, 8985, 8991, 18_000, 65_521] {
         assert!(check(ok).is_ok(), "{ok}: {:?}", check(ok));
@@ -554,7 +575,9 @@ fn bearer_needs_its_key_file_and_only_bearer_takes_one() {
         let mut raw = proxy_raw();
         raw.proxy.buck2_auth = auth;
         raw.proxy.buck2_token_file = file.map(str::to_owned);
-        raw.validate().map(|v| v.proxy).map_err(|p| p.join("; "))
+        raw.validate(Platform::Linux)
+            .map(|v| v.proxy)
+            .map_err(|p| p.join("; "))
     };
     assert!(
         found(Some(AuthFlag::Bearer), None)
