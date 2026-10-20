@@ -465,6 +465,13 @@ process is), held by another node, no longer the operation's current lease, when
 A copy of a memory kill already taken is refused: its lease is no longer current.
 A refused result never reaches the action cache.
 
+The ack follows the commit: the server sends it once the state store has taken the row
+that records the result, never before. While the store refuses the write the server
+sends no `ResultAck`, for the `Result` or for a copy of it, and sends the one ack when
+the row is written. A record the server dropped instead (over its held-record cap) is
+never acknowledged. The daemon, which keeps the `Result` until an ack, resends it on
+its next stream, and the copy is answered once.
+
 Until a daemon receives the `ResultAck` for a lease, it keeps the `Result`:
 
 - every `Heartbeat` lists the lease in `running`, so the scheduler does not take the
