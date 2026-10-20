@@ -87,6 +87,9 @@ pub(super) struct Store {
     max_open: AtomicUsize,
     reads: Mutex<BTreeMap<Digest, usize>>,
     asks: Mutex<Vec<usize>>,
+    /// FindMissing calls open now, and the most at once.
+    asks_open: AtomicUsize,
+    max_asks_open: AtomicUsize,
     /// What [`Blobs::epoch`] answers: `None` (the default) remembers nothing.
     epoch: Mutex<Option<u64>>,
     /// Files that have gone since the store was made: held by `tree`, missing now.
@@ -111,6 +114,8 @@ impl Store {
             max_open: AtomicUsize::new(0),
             reads: Mutex::new(BTreeMap::new()),
             asks: Mutex::new(Vec::new()),
+            asks_open: AtomicUsize::new(0),
+            max_asks_open: AtomicUsize::new(0),
             epoch: Mutex::new(None),
             removed: Mutex::new(HashSet::new()),
             ask_delay: Duration::ZERO,
@@ -152,6 +157,10 @@ impl Store {
 
     pub(super) fn fixed(tree: Tree, delay: Duration) -> Self {
         Self::new(tree, move |_| delay)
+    }
+
+    pub(super) fn max_asks_open(&self) -> usize {
+        self.max_asks_open.load(Ordering::SeqCst)
     }
 
     pub(super) fn max_open(&self) -> usize {
@@ -219,6 +228,9 @@ impl Blobs for Store {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> BoxFuture<'a, Answer<Vec<Digest>>> {
         Box::pin(async move {
             self.asks.lock().unwrap().push(digests.len());
+            let now = self.asks_open.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_asks_open.fetch_max(now, Ordering::SeqCst);
+            let _open = Open(&self.asks_open);
             sleep(self.ask_delay).await;
             Ok(digests
                 .iter()
@@ -553,6 +565,42 @@ async fn files_are_asked_in_batches_and_answered_in_order() {
     let mut asks = store.asks.lock().unwrap().clone();
     asks.sort_unstable();
     assert_eq!(asks, vec![1, FILES_PER_ASK, FILES_PER_ASK]);
+}
+
+/// Catches: FindMissing calls issued one at a time (a tree of many thousand files pays a
+/// round trip per 4096 of them in series), and ones issued without a bound (a few
+/// hundred thousand files opening dozens of calls on one node). With 13 chunks, each
+/// taking a second, exactly [`ASKS_IN_FLIGHT`] (4) are open at once, and the whole takes
+/// four rounds (4, 4, 4, 1).
+#[tokio::test(start_paused = true)]
+async fn file_asks_in_flight_reach_the_bound_and_stay_there() {
+    // 13 chunks: three full rounds of the bound and one more. The bound itself is
+    // asserted as a number beside the constant: a test written only in terms of the
+    // constant passes for any value of it (serial, with 4 chunks, also takes 4 s).
+    let chunks = 13;
+    assert_eq!(ASKS_IN_FLIGHT, 4, "the bound the sizing above rests on");
+    let mut tree = Tree::default();
+    let files: Vec<Digest> = (0..chunks * FILES_PER_ASK)
+        .map(|n| file(&format!("file {n}")))
+        .collect();
+    let root = tree.add(dir(&files, &[]));
+    tree.held.extend(files.iter().copied());
+    let store = Store::fixed(tree, Duration::ZERO).with_asks(Duration::from_secs(1));
+    let started = Instant::now();
+    let walked = walk(&store, root, &Trees::default()).await.expect("walk");
+    assert!(walked.absent.is_empty());
+    assert_eq!(walked.file_asks, chunks as u64);
+    assert_eq!(store.asks.lock().unwrap().len(), chunks);
+    assert_eq!(
+        store.max_asks_open(),
+        ASKS_IN_FLIGHT,
+        "exactly the bound: not serial, not more"
+    );
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_secs(4),
+        "4 rounds of 4, 4, 4, 1"
+    );
 }
 
 /// A tree shaped like the test farm's: about 1050 Directories in 11 levels, a file in
