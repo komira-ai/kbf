@@ -101,8 +101,25 @@ impl Rig {
         Rig::build(name, Platform::Linux, 0, true)
     }
 
+    /// A frontend host that has no release yet, as `setup` finds it: no state, no links, no
+    /// service running. The first release comes from `setup`, not from the rig.
+    fn bare_frontend(name: &str) -> Rig {
+        Rig::seeded(name, Platform::Linux, 0, true, false)
+    }
+
     /// The same host with `min_activation_interval_secs` set.
     fn build(name: &str, platform: Platform, min_interval: u64, frontend_host: bool) -> Rig {
+        Rig::seeded(name, platform, min_interval, frontend_host, true)
+    }
+
+    /// The host, running release A or (`running` false) with nothing installed.
+    fn seeded(
+        name: &str,
+        platform: Platform,
+        min_interval: u64,
+        frontend_host: bool,
+        running: bool,
+    ) -> Rig {
         let mut host = ScratchHost::new(&format!("helper-{name}"));
         let root = host.root.clone();
         for sub in [
@@ -115,27 +132,28 @@ impl Rig {
         ] {
             fs::create_dir_all(root.join(sub)).expect("seed");
         }
-        let dir = root.join("var/lib/kbf-installer/releases").join(A);
-        fs::create_dir_all(&dir).expect("release");
-        fs::write(dir.join("kbf"), b"binary").expect("binary");
-        let service = ServiceRecorder::running(
-            4242,
-            root.join("var/lib/kbf-installer/releases")
-                .join(A)
-                .join("kbf"),
-        );
+        let service = if running {
+            let dir = root.join("var/lib/kbf-installer/releases").join(A);
+            fs::create_dir_all(&dir).expect("release");
+            fs::write(dir.join("kbf"), b"binary").expect("binary");
+            ServiceRecorder::running(4242, dir.join("kbf"))
+        } else {
+            ServiceRecorder::default()
+        };
         host.answer = service.answer();
         let layout = Layout::new(Root::new(&root).expect("absolute"), platform);
         if frontend_host {
             write_kbf_toml(&layout, "mode = \"frontend\"\n");
         }
-        Locked::acquire(&layout)
-            .expect("lock")
-            .write(&State {
-                current: Some(c(A)),
-                ..State::default()
-            })
-            .expect("state");
+        if running {
+            Locked::acquire(&layout)
+                .expect("lock")
+                .write(&State {
+                    current: Some(c(A)),
+                    ..State::default()
+                })
+                .expect("state");
+        }
         let cfg = Config {
             update_dir: kbf_host::HostPath::new("/var/lib/kbf-installer").expect("path"),
             orders_dir: kbf_host::HostPath::new("/var/lib/kbf-installer/orders").expect("path"),
@@ -1720,3 +1738,5 @@ fn the_same_activation_again_while_on_trial_is_a_repeat() {
 }
 
 mod frontend_tests;
+mod pipeline_fetcher_tests;
+mod staged_tests;
