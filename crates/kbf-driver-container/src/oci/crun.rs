@@ -287,6 +287,8 @@ fn wait_gone(path: &Path, limit: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// Catches `crun`'s status being read as anything but a shell reads it: an exit code
@@ -303,48 +305,36 @@ mod tests {
     /// Catches a `crun` that is aborted (its future dropped, which `Running::force` does
     /// when the grace after `cgroup.kill` runs out) and is still there, alive or a
     /// zombie, when the drop returns: the clean then ran `crun delete` beside a
-    /// `crun run` that had not been reaped. Each round starts a child that publishes its
-    /// pid through a fifo (the test blocks on the read, no timer), drops the `execute`
-    /// future, and looks for the pid at once. Rounds repeat so a child that dies fast
-    /// enough on its own cannot hide a driver that does not wait.
+    /// `crun run` that had not been reaped. Each round polls `execute` once (which
+    /// spawns `sleep`, no timer: a zero timeout polls its future first), finds the new
+    /// child in the thread's `children` list, drops the future, and looks for the pid at
+    /// once. Rounds repeat so a child that dies fast enough on its own cannot hide a
+    /// driver that does not wait.
     #[test]
     fn a_dropped_crun_is_reaped_before_the_drop_returns() {
-        let dir = crate::unit_dir("crun-dropped-reaped");
-        let fifo = dir.join("pid");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::RWXU,
-            0,
-        )
-        .expect("mkfifo");
+        let children = format!(
+            "/proc/self/task/{}/children",
+            rustix::thread::gettid().as_raw_nonzero()
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
+        let mut seen = std::collections::HashSet::new();
         for round in 0..25 {
-            let mut command = Command::new("sh");
-            command
-                .arg("-c")
-                .arg("echo $$ > \"$1\"; exec sleep 600")
-                .arg("sh")
-                .arg(&fifo);
-            let pid = runtime.block_on(async {
-                let mut run = Box::pin(KillOnDrop.execute(command));
-                let read = fifo.clone();
-                let published = tokio::task::spawn_blocking(move || {
-                    std::fs::read_to_string(read).expect("the child's pid")
-                });
-                let pid = tokio::select! {
-                    _ = &mut run => panic!("round {round}: sleep 600 ended"),
-                    pid = published => pid.expect("reader").trim().to_owned(),
-                };
-                drop(run);
-                pid
-            });
+            let mut command = Command::new("sleep");
+            command.arg("600");
+            let mut run = Box::pin(KillOnDrop.execute(command));
+            let polled = runtime.block_on(tokio::time::timeout(Duration::ZERO, &mut run));
+            assert!(polled.is_err(), "round {round}: sleep 600 ended");
+            let listed = std::fs::read_to_string(&children).expect("the thread's children");
+            let new: Vec<_> = listed.split_whitespace().filter(|p| seen.insert((*p).to_owned())).collect();
+            let [pid] = new[..] else {
+                panic!("round {round}: expected one new child, got {new:?} of {listed:?}");
+            };
+            drop(run);
             assert!(
-                !Path::new("/proc").join(&pid).exists(),
+                !Path::new("/proc").join(pid).exists(),
                 "round {round}: pid {pid} is still there after its future was dropped"
             );
         }
