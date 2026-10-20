@@ -802,6 +802,10 @@ pub struct TierCounters {
     pub digest_mismatch: Counter,
     /// Blobs read from the tier's disk (a block or a flushed copy).
     pub local_reads: Counter,
+    /// Objects staged on the tier and not flushed, as a flusher round found them at its start.
+    pub staged_objects: Level,
+    /// The committed bytes of those objects.
+    pub staged_bytes: Level,
 }
 
 impl TierCounters {
@@ -887,6 +891,16 @@ impl TierCounters {
                 "kbf_write_tier_flushed_copy_bytes",
                 "Bytes of flushed copies kept on the tier for local reads",
                 usage.flushed,
+            ),
+            (
+                "kbf_write_tier_staged_objects",
+                "Objects staged on the write tier and not flushed, at the start of the last flusher round",
+                self.staged_objects.get(),
+            ),
+            (
+                "kbf_write_tier_staged_bytes",
+                "Committed bytes of the staged objects not flushed, at the start of the last flusher round",
+                self.staged_bytes.get(),
             ),
             (
                 "kbf_write_tier_unflushed_bytes",

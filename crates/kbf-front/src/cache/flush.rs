@@ -323,9 +323,15 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             round.sealed.push(object);
         }
         let (tier, waiting, gate) = (staging.id, staging.waiting(now), self.gate.clone());
-        let due = self
+        let (due, (backlog, backlog_bytes)) = self
             .writer
             .query(move |s| {
+                let backlog = s
+                    .staged_objects()
+                    .filter(|(_, o)| o.tier() == tier)
+                    .fold((0u64, 0u64), |(n, b), (_, o)| {
+                        (n + 1, b + o.committed_len())
+                    });
                 let ours = |o: &StagedObject| (o.tier(), o.state()) == (tier, StagedState::Sealed);
                 let sealed = s.staged_objects().filter(|(_, o)| ours(o));
                 let sealed = sealed.filter(|(object, _)| !waiting.contains(object));
@@ -345,9 +351,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                     let blobs: Vec<(Digest, u64)> = o.blobs().map(|(d, at)| (*d, at)).collect();
                     Some((object, o.committed_len(), blobs, first))
                 });
-                due.collect::<Vec<_>>()
+                (due.collect::<Vec<_>>(), backlog)
             })
             .await?;
+        staging.counters.staged_objects.set(backlog);
+        staging.counters.staged_bytes.set(backlog_bytes);
         let mut done = BTreeSet::new();
         for (object, len, blobs, first) in due {
             if !first.is_subset(&done) {

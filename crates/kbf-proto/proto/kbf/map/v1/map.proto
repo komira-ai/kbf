@@ -161,6 +161,19 @@ message HeartbeatRequest {
   // Whether this node counts its open writes. False says "I cannot say", never "none": an
   // older node, which sends neither field, reads as false.
   bool writes_known = 10;
+  // The highest map generation g such that every object this node was to flush that it
+  // staged before it held map g is flushed (docs/design/rebalance-handoff.md, P2). Read
+  // only when flush_known is true. Volatile: a restart recomputes it from the staged set,
+  // counting objects it cannot date as the oldest.
+  uint64 flush_clear_gen = 11;
+  // Whether this node reports flush_clear_gen. False says "I cannot say", never
+  // "generation 0": an older node, which sends neither field, reads as false.
+  bool flush_known = 12;
+  // The objects staged on this node's write tier and not yet flushed, and their committed
+  // bytes: the backlog a loss of the node's disk would take. Read only when flush_known is
+  // true.
+  uint64 staged_objects = 13;
+  uint64 staged_bytes = 14;
 }
 
 // A closed set: a node never sends free text about its store, so a credential cannot ride

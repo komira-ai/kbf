@@ -380,6 +380,8 @@ pub(super) struct Writer<M, O> {
     pub(super) next_seq: Arc<AtomicU64>,
     /// The local write tier, once [`Cache::attach_tier`] attached one.
     pub(super) tier: OnceLock<Arc<Staging>>,
+    /// The generation each staged object was staged under ([`Cache::flush_report`]).
+    pub(super) born: super::clear::Born,
     /// When each object was last used, once [`Cache::track_recency`] turned it on.
     pub(super) recency: Recency,
 }
@@ -394,6 +396,7 @@ impl<M, O> Writer<M, O> {
             metrics: CacheMetrics::default(),
             next_seq: Arc::new(AtomicU64::new(1)),
             tier: OnceLock::new(),
+            born: super::clear::Born::default(),
             recency: Recency::default(),
         }
     }

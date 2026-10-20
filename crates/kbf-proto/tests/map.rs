@@ -341,3 +341,39 @@ fn the_heartbeat_open_writes_are_fields_nine_and_ten() {
     );
     assert_eq!(older.open_writes, 0);
 }
+
+// Catches: the flush report moved to other field numbers or colliding with the open-writes
+// report (9, 10). The bytes are pinned: the clear generation on 11, the known flag on 12,
+// the backlog on 13 and 14, each a varint, beside the fields before them. A node that
+// predates the report cannot say: its decode has no flag set, whatever else is on the wire.
+#[test]
+fn the_heartbeat_flush_report_is_fields_eleven_to_fourteen() {
+    let beat = pb::HeartbeatRequest {
+        member_id: 1,
+        flush_clear_gen: 7,
+        flush_known: true,
+        staged_objects: 3,
+        staged_bytes: 300,
+        ..Default::default()
+    };
+    let bytes = [0x08, 1, 0x58, 7, 0x60, 1, 0x68, 3, 0x70, 0xac, 0x02];
+    assert_eq!(beat.encode_to_vec(), bytes, "fields 1 and 11 to 14");
+    assert_eq!(
+        pb::HeartbeatRequest::decode(&bytes[..]).expect("decodes"),
+        beat
+    );
+
+    let older = pb::HeartbeatRequest::decode(&bytes[..2]).expect("decodes");
+    assert!(
+        !older.flush_known,
+        "a node that predates the report cannot say"
+    );
+    assert_eq!(
+        (
+            older.flush_clear_gen,
+            older.staged_objects,
+            older.staged_bytes
+        ),
+        (0, 0, 0)
+    );
+}
