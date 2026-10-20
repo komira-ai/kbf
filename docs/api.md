@@ -103,7 +103,10 @@ listener:
   `docs/design/frontend-proxy.md` section 3), so the host of its instance id and its address
   must be that name (up to ASCII case) or one of those addresses (exact equality). A
   malformed, repeated or oversized `x-kbf-node-ips` is refused `PERMISSION_DENIED`; without
-  one, an IP host is refused. The proxied role must be `storage`.
+  one, an IP host is refused. The proxied role must be `storage`. The proxy also sets
+  `x-kbf-client-addr`, the address the client connected from (canonical IP text, no
+  port), on every call; only the per-caller read bound uses it, and a value that is not one
+  IP address is refused `PERMISSION_DENIED` (HTTP 403).
 
 What the flag does not do, and what the proxy must do:
 
@@ -1668,7 +1671,10 @@ there is nothing to mount it on.
   routes the pages use (`/v1/blobs`, `/v1/invocations` and below, `/v1/runs` and the history
   routes, `/v1/update/hosts`): the fifth is `429` with `Retry-After: 1`, before its handler
   runs, and a slot is held until the answer's body has been sent or dropped. A caller is
-  the node the proxy named, else the peer address; behind the proxy, browsers share the
+  the node the proxy named, else the client address the proxy forwarded in
+  `x-kbf-client-addr` (believed only of a call that presented the proxy secret; the header
+  on any other call is stripped unread), else the peer address. So behind the proxy each
+  browser has its own bound; behind a proxy that sends no such header, browsers share the
   proxy's address and so share one bound. A path longer than 2048 bytes, or a query longer
   than 4096, is `414`; a path segment longer than 256 bytes, or one that decodes to a
   control character, is `400`.

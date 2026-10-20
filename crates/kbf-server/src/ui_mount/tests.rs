@@ -186,3 +186,40 @@ async fn ui_reads_are_bounded_per_caller_with_the_headers_on_the_429() {
     let after = send(&pages, Method::GET, "/ui", "192.0.2.1").await;
     assert_eq!(after.status(), StatusCode::OK);
 }
+
+/// A `/ui` read as the proxy forwards it: from loopback, proxied, no node id, and the
+/// address the browser connected from.
+async fn send_proxied(router: &Router, browser: &str) -> Response {
+    let mut request = Request::get("/ui").body(Body::empty()).expect("a request");
+    let proxy: SocketAddr = "127.0.0.1:4000".parse().expect("an address");
+    request.extensions_mut().insert(ConnectInfo(proxy));
+    request
+        .extensions_mut()
+        .insert(Trust::Proxied(crate::proxy_auth::Identity::default()));
+    request
+        .extensions_mut()
+        .insert(crate::proxy_auth::ClientAddr(
+            browser.parse().expect("an address"),
+        ));
+    let mut router = router.clone();
+    let Ok(response) = router.call(request).await;
+    response
+}
+
+/// Catches: every browser behind the proxy sharing one bound on `/ui` (mutant: the
+/// client address not read by the limiter: all callers are the proxy's loopback address, and
+/// the second browser's first page is a `429`).
+#[tokio::test]
+async fn browsers_behind_the_proxy_each_have_their_own_ui_bound() {
+    let pages = pages(InProcess::new(api()));
+    let mut held = Vec::new();
+    for browser in ["192.0.2.1", "192.0.2.2"] {
+        for n in 0..PER_CALLER {
+            let page = send_proxied(&pages, browser).await;
+            assert_eq!(page.status(), StatusCode::OK, "{browser} page {n}");
+            held.push(page);
+        }
+        let refused = send_proxied(&pages, browser).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS, "{browser}");
+    }
+}

@@ -11,7 +11,7 @@ use http_body_util::BodyExt as _;
 use tower_service::Service;
 
 use super::*;
-use crate::proxy_auth::Identity;
+use crate::proxy_auth::{ClientAddr, Identity};
 
 /// A router with one route that answers a sized body, behind a limit of `per_caller`.
 fn router(limit: &Arc<ReadLimit>) -> Router {
@@ -236,4 +236,51 @@ async fn a_refusal_is_the_apis_json_error() {
             .as_str()
             .is_some_and(|e| e.contains("too many"))
     );
+}
+
+/// One request from `peer` with `trust` and a `ClientAddr` of `client` in its extensions.
+async fn call_as(router: &Router, peer: &str, trust: Trust, client: &str) -> Response {
+    let mut request = Request::get("/v1/thing/x")
+        .body(Body::empty())
+        .expect("a request");
+    let addr: SocketAddr = format!("{peer}:4000").parse().expect("an address");
+    request.extensions_mut().insert(ConnectInfo(addr));
+    request.extensions_mut().insert(trust);
+    request
+        .extensions_mut()
+        .insert(ClientAddr(client.parse().expect("an address")));
+    let mut router = router.clone();
+    let Ok(response) = router.call(request).await;
+    response
+}
+
+/// Catches: the client address the proxy reported keying a call the proxy did not vouch for
+/// (mutant: the `Trust::Proxied` check dropped, so an `Unverified` or `Direct` call with a
+/// `ClientAddr` in its extensions takes a bound of its own); and a proxied call's bound not
+/// following the address (mutant: the address ignored, so two browsers share the proxy's
+/// peer address).
+#[tokio::test]
+async fn a_client_address_keys_a_proxied_call_and_no_other() {
+    let limit = ReadLimit::new(1);
+    let router = router(&limit);
+    // Not proxied: whatever the extensions hold, the key is the peer, so the second is refused.
+    for trust in [Trust::Unverified, Trust::Direct] {
+        let first = call_as(&router, "192.0.2.50", trust.clone(), "203.0.113.1").await;
+        assert_eq!(first.status(), StatusCode::OK, "{trust:?}");
+        let second = call_as(&router, "192.0.2.50", trust.clone(), "203.0.113.2").await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS, "{trust:?}");
+        drop((first, second));
+    }
+    // Proxied: the address is the key, the peer (the proxy) is not.
+    let one = call_as(&router, "127.0.0.1", proxied(None), "203.0.113.1").await;
+    let two = call_as(&router, "127.0.0.1", proxied(None), "203.0.113.2").await;
+    let again = call_as(&router, "127.0.0.1", proxied(None), "203.0.113.1").await;
+    assert_eq!(one.status(), StatusCode::OK);
+    assert_eq!(two.status(), StatusCode::OK, "another browser");
+    assert_eq!(
+        again.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the same one"
+    );
+    drop((one, two, again));
 }

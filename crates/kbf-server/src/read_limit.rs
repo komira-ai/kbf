@@ -9,9 +9,13 @@
 //!   body has been sent or dropped, not only until the handler returns: a blob streams
 //!   after its handler is done.
 //! - **Who a caller is.** The node id the proxy vouched for ([`Trust::Proxied`]), else
-//!   the peer's IP address. Behind the proxy, callers with no identity (browsers) share
-//!   the proxy's address, so they share one bound; callers that carry an identity (the
-//!   agents of nodes) have their own, and cannot be starved by them.
+//!   the client address the proxy reported (`x-kbf-client-addr`, [`ClientAddr`], again only
+//!   of a proxied call), else the peer's IP address. Behind the proxy every connection
+//!   comes from the proxy's address and an open `/ui` request names no node, so the
+//!   client address is what gives each browser its own bound; a node that carries an
+//!   identity has its own too. Without the proxy's header (an older proxy) browsers fall
+//!   back to sharing the proxy's address. A direct call that sends the header is not
+//!   believed: the key stays its peer address.
 //! - **Two limits, not one.** `/ui` and the `/v1` read routes each have their own
 //!   [`ReadLimit`], so a page holding its reads open cannot starve the API and the
 //!   reverse.
@@ -37,7 +41,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use http_body::{Frame, SizeHint};
 
-use crate::proxy_auth::Trust;
+use crate::proxy_auth::{ClientAddr, Trust};
 
 /// The requests one caller may have open at once in one [`ReadLimit`].
 pub const PER_CALLER: usize = 4;
@@ -128,14 +132,19 @@ impl ReadLimit {
     }
 }
 
-/// Who `request` is from: the node the proxy named, else its peer's address (the
-/// unspecified address for a request that has none, which only a miswired router makes).
+/// Who `request` is from: the node the proxy named, else the client address the proxy
+/// reported, else its peer's address (the unspecified address for a request that has none,
+/// which only a miswired router makes). The first two are believed only of a
+/// [`Trust::Proxied`] call, whatever the extensions hold.
 fn caller_of(request: &Request) -> Caller {
     let extensions = request.extensions();
-    if let Some(Trust::Proxied(identity)) = extensions.get::<Trust>()
-        && let Some(node) = &identity.node_id
-    {
-        return Caller::Node(node.clone());
+    if let Some(Trust::Proxied(identity)) = extensions.get::<Trust>() {
+        if let Some(node) = &identity.node_id {
+            return Caller::Node(node.clone());
+        }
+        if let Some(ClientAddr(ip)) = extensions.get::<ClientAddr>() {
+            return Caller::Peer(*ip);
+        }
     }
     let peer = extensions
         .get::<ConnectInfo<SocketAddr>>()
