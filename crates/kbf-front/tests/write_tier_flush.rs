@@ -67,6 +67,7 @@ fn foreign_segment(len: u64) -> Bytes {
 /// be evicted.
 #[tokio::test]
 async fn a_key_holding_another_well_formed_segment_of_equal_length_is_staged_again() {
+    let _log = quiet();
     let farm = Farm::new(CONDITIONAL);
     let cache = farm.start(GIB).await;
     let blobs = blobs(1, 2, 4096);
@@ -323,6 +324,17 @@ async fn a_lost_put_staged_answer_whose_state_read_fails_counts_the_range_as_fai
 
 // ---- Moving a conflicting object (write-path.md, section 6.4). ----
 
+/// A subscriber that drops what it hears, for the tests that reach a `tracing` macro:
+/// its fields are evaluated (and its branches covered, in a process of its own) only when
+/// a subscriber is registered.
+fn quiet() -> tracing::subscriber::DefaultGuard {
+    tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .finish(),
+    )
+}
+
 /// A farm whose first flush meets another object under the staged object's key.
 async fn conflicting(farm: &Farm) -> (support::TierCache, Vec<TestBlob>, ObjectId) {
     let cache = farm.start(GIB).await;
@@ -459,6 +471,7 @@ async fn a_move_that_fails_is_not_counted_as_a_conflict_until_it_succeeds() {
 /// missing, counted once), and the next round has nothing to do.
 #[tokio::test]
 async fn a_conflict_whose_block_is_gone_ends_as_a_loss() {
+    let _log = quiet();
     let farm = Farm::new(CONDITIONAL);
     let (cache, blobs, object) = conflicting(&farm).await;
     for command in [
