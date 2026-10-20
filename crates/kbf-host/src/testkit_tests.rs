@@ -166,3 +166,59 @@ fn the_fake_flips_links_and_refuses_anything_else() {
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     assert_eq!(exec.entries.get(&p("/kbf/current")), Some(&file));
 }
+
+/// The child half of the test below: does nothing unless the parent set the barrier
+/// directory. It takes `scratch("same-name")`, writes a file, tells the parent it is
+/// ready, waits for the parent to have taken the same name, then reads the file back.
+#[test]
+fn scratch_child_holds_a_directory_while_the_parent_takes_the_same_name() {
+    let Some(barrier) = std::env::var_os("KBF_SCRATCH_BARRIER").map(PathBuf::from) else {
+        return;
+    };
+    let dir = scratch("same-name");
+    std::fs::write(dir.join("mine"), "child").expect("write");
+    std::fs::write(barrier.join("ready"), "").expect("ready");
+    while !barrier.join("go").exists() {
+        std::thread::yield_now();
+    }
+    let read = std::fs::read_to_string(dir.join("mine"));
+    std::fs::write(
+        barrier.join("result"),
+        match read {
+            Ok(text) => text,
+            Err(e) => format!("error: {e}"),
+        },
+    )
+    .expect("result");
+}
+
+/// Catches: a scratch path that two processes of one target share for the same name
+/// (nextest runs each test in its own process, each counting from 0), so one's
+/// `remove_dir_all` deletes the other's files. A child process holds `same-name`
+/// while this process takes it; the two steps are ordered by files, not by time.
+#[test]
+fn two_processes_taking_one_scratch_name_do_not_share_it() {
+    let barrier = scratch("barrier");
+    let me = std::env::current_exe().expect("test binary");
+    let mut child = std::process::Command::new(me)
+        .args([
+            "--exact",
+            "testkit::tests::scratch_child_holds_a_directory_while_the_parent_takes_the_same_name",
+            "--test-threads=1",
+        ])
+        .env("KBF_SCRATCH_BARRIER", &barrier)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the child");
+    while !barrier.join("ready").exists() {
+        std::thread::yield_now();
+    }
+    let mine = scratch("same-name");
+    std::fs::write(barrier.join("go"), "").expect("go");
+    assert!(child.wait().expect("child").success());
+    assert_eq!(
+        std::fs::read_to_string(barrier.join("result")).expect("the child's result"),
+        "child"
+    );
+    assert!(mine.read_dir().expect("mine").next().is_none());
+}

@@ -106,7 +106,7 @@ jobs:
 
   # The whole nextest run, the slow tests included (the default profile; a pull request runs
   # the `pr` profile of .config/nextest.toml), then the doc tests and the tests that need a
-  # tool this job fetches. No coverage: the ratchet is measured on the fast set, in ci.yml.
+  # tool this job fetches. No coverage: the 99% gate is measured on the fast set, in ci.yml.
   test-x86:
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -272,6 +272,8 @@ jobs:
         options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       KBF_TEST_POSTGRES_URL: postgres://postgres:kbf-ci-throwaway@127.0.0.1:5432/postgres
+      # pg_dump and pg_restore for the installer's backup test come from here.
+      KBF_TEST_PG_BIN: /usr/lib/postgresql/17/bin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -286,6 +288,13 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # pg_dump and pg_restore as new as the server above (17), because a dump tool older
+      # than its server refuses to run. The runner image has no PostgreSQL apt repository:
+      # postgresql-common's own script adds the project's (with its signing key) and
+      # updates the package lists.
+      - run: sudo apt-get install -y --no-install-recommends postgresql-common
+      - run: sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+      - run: sudo apt-get install -y --no-install-recommends postgresql-client-17
       - run: cargo clippy -p kbf-state --features postgres --all-targets --locked -- -D warnings
       - run: cargo test -p kbf-state --features postgres --locked -- --include-ignored
       # The installer's `setup` and update step over a real schema (src/database_tests.rs).

@@ -624,9 +624,13 @@ async fn a_restart_mid_action_does_not_run_it_beside_the_first() {
 }
 
 /// The verbs so far without the `wait` of a run left behind by a dropped runtime (its
-/// blocking wait returns whenever that run's processes end).
+/// blocking wait returns whenever that run's processes end, so it logs `wait` before the
+/// restarted runtime's phase is set and `wait (restoring)` after).
 fn verbs_but_wait(fake: &FakeSession) -> Vec<String> {
-    fake.verbs().into_iter().filter(|v| v != "wait").collect()
+    fake.verbs()
+        .into_iter()
+        .filter(|v| v != "wait" && !v.starts_with("wait ("))
+        .collect()
 }
 
 /// A runtime dropped while `action` runs (the daemon died mid-action), and a new one
@@ -644,6 +648,14 @@ async fn restart_mid_action(
         tokio::spawn(async move { before.run(work(action)).await })
     };
     until_logged(fake, "run").await;
+    if fake.state().hold_waits {
+        // The run's `wait` is called only if the abort comes after it was spawned.
+        let deadline = tokio::time::Instant::now() + PROMPT;
+        while fake.state().waits_entered == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "no wait in time");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
     running.abort();
     assert!(running.await.is_err());
     drop(before);
@@ -661,14 +673,32 @@ async fn restart_mid_action(
 /// it would answer INTERNAL.
 #[tokio::test]
 async fn a_restart_mid_action_kills_the_action_at_start_and_fails_the_lease() {
-    let dir = scratch("whole-mid-action");
+    kills_the_action_at_start("whole-mid-action", false).await;
+}
+
+/// The same, with the dropped runtime's `wait` ending only after the restarted runtime
+/// is up and its start-up verbs are read: the late `wait` is logged under the restarted
+/// runtime's phase (`wait (restoring)`) among the restore's verbs, which are no business
+/// of that wait (a held wait, not a sleep, orders it every time).
+#[tokio::test]
+async fn a_dropped_runtimes_wait_ending_after_the_restart_is_not_the_restores() {
+    kills_the_action_at_start("whole-mid-action-late-wait", true).await;
+}
+
+async fn kills_the_action_at_start(name: &str, late_wait: bool) {
+    let dir = scratch(name);
     let cas = Arc::new(MemoryCas::default());
     let fake = FakeSession::default();
     let config = config(&dir);
     let slow = Spec::act("sleep 60").store(&cas);
+    fake.state().hold_waits = late_wait;
     let after = restart_mid_action(&config, &fake, &cas, &slow).await;
     assert_eq!(verbs_but_wait(&fake), ["boot-reset 1.1", "kill-uid 1.1"]);
     assert_eq!(phase(&after), NodePhase::Restoring(lease()));
+    if late_wait {
+        fake.release_waits();
+        until_logged(&fake, "wait").await;
+    }
 
     let error = run(&after, &slow)
         .await

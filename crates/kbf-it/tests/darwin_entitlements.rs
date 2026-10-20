@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kbf_testkit::dir::TestDir;
 use xtask::entitlements::{ALLOWLIST, AllowList, Defect, Error, compare, render, signed_keys};
 
 fn repo_root() -> PathBuf {
@@ -110,8 +111,7 @@ fn every_other_binary_gets_none() {
 /// check would accept for an unentitled binary).
 #[test]
 fn a_missing_or_unreadable_list_is_refused() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("darwin-entitlements");
-    std::fs::create_dir_all(&dir).expect("create the test directory");
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "darwin-entitlements");
     let missing = dir.join("no-such-list.txt");
     let err = AllowList::read(&missing).expect_err("a missing list");
     assert_eq!(err, Error::Missing(missing.clone()));
@@ -123,7 +123,7 @@ fn a_missing_or_unreadable_list_is_refused() {
         )
     );
     assert!(
-        matches!(AllowList::read(&dir), Err(Error::Unreadable { ref path, .. }) if *path == dir),
+        matches!(AllowList::read(&dir), Err(Error::Unreadable { ref path, .. }) if path.as_path() == dir.path()),
         "a directory as the list"
     );
 }
