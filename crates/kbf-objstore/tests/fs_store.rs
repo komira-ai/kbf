@@ -238,7 +238,10 @@ async fn released_with_a_leaked_clone_ends_at_the_limit_and_counts_the_handles()
     let start = tokio::time::Instant::now();
     let held = released.wait_within(limit).await.expect_err("still held");
     assert_eq!(start.elapsed(), limit);
-    assert_eq!((held.clones, &held.dir, held.limit), (2, &dir, limit));
+    assert_eq!(
+        (held.clones, &held.dir, held.limit),
+        (2, &dir.to_path_buf(), limit)
+    );
     assert!(held.to_string().contains("2 live handle"), "{held}");
     drop((store, leaked));
 }
@@ -273,7 +276,7 @@ fn the_wait_is_pending_and_the_directory_refused_until_the_unlock() {
         let (wait, seen, dir, fresh) = (
             Arc::clone(&wait),
             Arc::clone(&seen),
-            dir.clone(),
+            dir.to_path_buf(),
             Arc::clone(&fresh),
         );
         released.before_unlock(move || {
