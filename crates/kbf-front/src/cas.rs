@@ -445,7 +445,10 @@ fn verify_upload(r: batch_update_blobs_request::Request) -> Result<VerifiedBlob,
             r.compressor
         )));
     }
-    Ok(VerifiedBlob::new(digest, Bytes::from(r.data))?)
+    Ok(VerifiedBlob::new(
+        digest,
+        kbf_storage::in_flight::counted(r.data),
+    )?)
 }
 
 fn chunking_unimplemented() -> Status {

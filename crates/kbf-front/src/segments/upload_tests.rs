@@ -328,3 +328,20 @@ async fn a_segment_on_the_tier_is_written_there_and_built_as_its_range() {
         assert_eq!(kbf_segments::sha256(&bytes), entry.digest);
     }
 }
+
+/// Catches: a segment's receive buffer not counted in `kbf_bytes_in_flight` from its
+/// allocation (a declared length is held whether or not its pages are touched), and the
+/// built segment's body dropping the count while the cache still holds it. Bounds from
+/// below only: the gauge is the process's and other tests add to it.
+///
+/// Mutant: `Receiving::new` not holding the buffer.
+#[test]
+fn a_received_segment_is_counted_while_it_is_held() {
+    let (declared, records) = segment(5, 300);
+    let length = declared.length;
+    let received = send(&declared, &records, 64, &in_order(records.len(), 64));
+    assert!(kbf_storage::in_flight::process().current() >= length);
+    let built = received.check(&declared).expect("built");
+    assert!(kbf_storage::in_flight::process().current() >= length);
+    assert_eq!(built.body.len() as u64, length);
+}

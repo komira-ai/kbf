@@ -25,6 +25,7 @@ use kbf_proto::google::bytestream::{
     QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest,
     WriteResponse,
 };
+use kbf_storage::in_flight;
 use tonic::{Request, Response, Status, Streaming};
 
 use kbf_invocation::CallKind;
@@ -123,6 +124,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         // window and the message being sent, not every message of the window at once.
         let messages = stream::unfold((read, Bytes::new()), |(mut read, mut window)| async move {
             while window.is_empty() {
+                // The spent window's count is given back before the next is read, not
+                // after: an empty slice still holds its buffer.
+                drop(std::mem::take(&mut window));
                 match read.next().await? {
                     Ok(next) => window = next,
                     Err(e) => return Some((Err(Status::from(e)), (read, Bytes::new()))),
@@ -268,7 +272,10 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStreamService<M, O> {
         let mut buffering = self.cache.buffering();
         // Allocated at the admitted size, so a growing buffer never holds more than
         // was admitted (`size` is at most `MAX_UNSTAGED_BLOB_BYTES`, checked above).
-        let mut received: Vec<u8> = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
+        // Counted from the allocation (`kbf_bytes_in_flight`), until the cache is done with it.
+        let capacity = usize::try_from(size).unwrap_or_default();
+        let held = in_flight::hold(capacity as u64);
+        let mut received: Vec<u8> = Vec::with_capacity(capacity);
         let mut message = first;
         loop {
             if !message.resource_name.is_empty() && message.resource_name != name {
@@ -300,7 +307,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStreamService<M, O> {
                 Status::invalid_argument("write stream ended without finish_write")
             })?;
         }
-        let received = Bytes::from(received);
+        let received = in_flight::counted_with(received, held);
         // The receive buffer is now the blob's bytes, held under `admitted` until the
         // cache has copied them into a segment.
         drop(buffering);
@@ -384,7 +391,8 @@ fn messages(
             }
             r.received += message.data.len() as u64;
             r.finished = message.finish_write;
-            Some((Ok(Bytes::from(message.data)), r))
+            // Counted until the sink has dropped the piece, whatever it did meanwhile.
+            Some((Ok(in_flight::counted(message.data)), r))
         }
     })
     .boxed()
