@@ -5,7 +5,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use kbf_host::testkit::scratch;
+use kbf_testkit::dir::TestDir;
 
 use super::kit_host::*;
 use super::roots::Roots;
@@ -34,7 +34,8 @@ fn entry(path: &str) -> Entry {
 /// the key at 0644; an absolute link target.
 #[test]
 fn the_tree_is_the_kits() {
-    let root = scratch("kit-host-tree");
+    let dir = TestDir::under(std::env::temp_dir(), "kit-host-tree");
+    let root = dir.path().to_path_buf();
     lay_out(&root, Form::New);
 
     for sha in [PREVIOUS, CURRENT] {
@@ -75,7 +76,8 @@ fn the_tree_is_the_kits() {
 /// Goes red on (not run as mutants): `/var/db/kbf-deploy/state.json` added to the manifest.
 #[test]
 fn a_kit_host_has_no_old_state() {
-    let root = scratch("kit-host-no-state");
+    let dir = TestDir::under(std::env::temp_dir(), "kit-host-no-state");
+    let root = dir.path().to_path_buf();
     lay_out(&root, Form::New);
     let roots = Roots::new(Platform::MacOs);
     assert_eq!(roots.old_tree.as_str(), TREE);
@@ -224,7 +226,8 @@ fn the_kbf_toml_is_the_kits() {
 #[test]
 fn the_form_picks_the_plist_bytes() {
     for form in [Form::New, Form::Old] {
-        let root = scratch(&format!("kit-host-{form:?}"));
+        let dir = TestDir::under(std::env::temp_dir(), &format!("kit-host-{form:?}"));
+        let root = dir.path().to_path_buf();
         lay_out(&root, form);
         let on_disk = fs::read_to_string(at(&root, PLIST_PATH)).expect("plist");
         assert_eq!(on_disk, form.plist());
