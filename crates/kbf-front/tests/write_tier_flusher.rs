@@ -624,3 +624,23 @@ async fn objects_found_at_a_restart_hold_the_clear_generation_at_zero() {
         Some(9)
     );
 }
+
+/// Catches: a report that answers when the log could not (a node saying "clear" because
+/// it could not look): the failed read is an error, not a number, and the next report,
+/// once the log answers, is the real one.
+#[tokio::test]
+async fn a_report_the_log_cannot_answer_is_an_error() {
+    let farm = Farm::new(Default::default());
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(OneFlusher::new(Node::new(1, &solo(5)) as _));
+    cache
+        .store_blobs(vec![big(1).verified()])
+        .await
+        .expect("stored");
+    farm.log.fail_next_read();
+    assert!(cache.flush_report().await.is_err());
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 1));
+}
