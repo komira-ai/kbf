@@ -1,5 +1,5 @@
 //! `pkg-install-test --package <file> --format deb|rpm --listing <file> --image-dir <dir>
-//! --gate <unit>=<path>.. [--docker <program>]`: installs the `kbf-installer` package
+//! --gate <unit>=<path>.. [--probe '<command>::<text>'].. [--docker <program>]`: installs the `kbf-installer` package
 //! into a fresh container with systemd as PID 1 and checks what the contract promises of
 //! it (docs/design/kbf-installer.md, sections 3 and 7; packaging/linux/README.md).
 //!
@@ -14,7 +14,9 @@
 //!    `kbf-installer setup`, do) the three users exist with no login shell and the three
 //!    directories exist, `root:root` 0755;
 //! 5. each `--gate` unit does not start without its file, and its condition passes once
-//!    the file exists.
+//!    the file exists;
+//! 6. each `--probe` command exits 0 in the container and prints its text: the packaged
+//!    `gh` runs on the container's architecture, the binary names the commit.
 //!
 //! Remove must delete every packaged path and keep `/etc/kbf` and the installer tree
 //! (a file `setup` would have written) and the users; a purge (deb only, of a package
@@ -129,6 +131,33 @@ impl FromStr for Gate {
         Ok(Gate {
             unit: unit.to_owned(),
             path: path.to_owned(),
+        })
+    }
+}
+
+/// A command to run in the installed container and what its output must contain, so a
+/// package built from real files is shown to run where it is installed: the packaged
+/// `gh` of the right architecture, the binary that names its commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Probe {
+    pub argv: Vec<String>,
+    pub contains: String,
+}
+
+impl FromStr for Probe {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Probe, String> {
+        let (command, contains) = s
+            .split_once("::")
+            .ok_or_else(|| format!("{s:?}: expected <program> <argument>..::<text>"))?;
+        let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+        if argv.is_empty() || contains.is_empty() {
+            return Err(format!("{s:?}: a command and the text it must print"));
+        }
+        Ok(Probe {
+            argv,
+            contains: contains.to_owned(),
         })
     }
 }
@@ -409,6 +438,24 @@ fn checks(c: &mut Container, t: &InstallTest, entries: &[Entry]) -> Result<Vec<S
     for g in gates {
         gate(c, g, &mut problems)?;
     }
+    for p in t.probes {
+        let argv: Vec<&str> = p.argv.iter().map(String::as_str).collect();
+        let out = c.exec(&argv)?;
+        if !out.ok {
+            problems.push(format!(
+                "`{}` failed in the container: {}",
+                p.argv.join(" "),
+                out.stderr.trim()
+            ));
+        } else if !out.stdout.contains(&p.contains) {
+            problems.push(format!(
+                "`{}` printed {:?}, which does not contain {:?}",
+                p.argv.join(" "),
+                out.stdout.trim(),
+                p.contains
+            ));
+        }
+    }
     // What `setup` would have written, which remove and purge must leave.
     c.must(
         "writing the installer state",
@@ -474,6 +521,8 @@ pub struct InstallTest<'a> {
     pub listing: &'a Path,
     pub image_dir: &'a Path,
     pub gates: &'a [Gate],
+    /// Commands to run after the install, each with the text its output holds.
+    pub probes: &'a [Probe],
     /// A name no other container of the host has.
     pub container: &'a str,
 }

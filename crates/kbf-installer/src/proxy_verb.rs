@@ -29,7 +29,7 @@
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::os::fd::{AsFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -46,6 +46,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::cli::ProxyArgs;
 use crate::exit::Exit;
 use crate::installer_toml::{InstallerToml, MAX_FILE_BYTES};
+use crate::layout::Platform;
 
 /// The first descriptor a service manager passes (`SD_LISTEN_FDS_START`).
 pub const FIRST_FD: RawFd = 3;
@@ -309,9 +310,16 @@ fn supervise(
     gate
 }
 
+/// The table's file: `--config`, else the `installer.toml` `setup` writes on `platform`.
+fn config_path(args: &ProxyArgs, platform: Platform) -> PathBuf {
+    args.config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(platform.installer_toml()))
+}
+
 /// The verb. With `--check`, the table is loaded and nothing is bound.
 pub fn run(args: &ProxyArgs) -> Result<(), VerbError> {
-    let config = load(&args.config)?;
+    let config = load(&config_path(args, Platform::current()))?;
     if args.check {
         return Ok(());
     }

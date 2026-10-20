@@ -150,7 +150,8 @@ pub(crate) fn with_daemon(
     let node = start(daemon).map_err(Failed::Daemon)?;
     node.serve_until(async move {
         let _ = other_ended.await;
-    });
+    })
+    .map_err(Failed::Daemon)?;
     let served = tokio.block_on(serving);
     let served = served.map_err(Failed::stopped)?;
     served.map_err(Failed::stopped)
