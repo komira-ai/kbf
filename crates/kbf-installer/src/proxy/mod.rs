@@ -15,6 +15,7 @@
 //! - [`child_real::ProcChild`] (Linux), the `Child` on processes watched by pidfd;
 //! - [`runtime::SystemClock`] and [`runtime::RequestQueue`], the `Clock` and the `Requests`;
 //! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left;
+//! - [`supervisor_swap`], the update API's `Supervisor`: the swap on its own thread;
 //! - [`migrator::DbMigrator`], the `Migrator` over the state database.
 //!
 //! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
@@ -23,18 +24,23 @@
 //! call). The proxy verb builds it in [`supervisor::child_admin`] and uses it for the start:
 //! [`supervisor::adopt_children`] adopts a child a previous proxy left (an active one at
 //! once, a candidate after it takes the generation) and, where none runs, starts the release
-//! `status.json` calls installed ([`boot`]). It still cannot run a swap or resume one, or
-//! choose between two live children.
+//! `status.json` calls installed ([`boot`]). [`supervisor_swap::SwapSupervisor`] is the update
+//! API's `Supervisor` over all of it: it runs [`Swap`] on a thread of its own, resumes an
+//! update that was in flight when the proxy stopped, and builds the status the API serves.
+//! Its seams are in its module documentation: the compatibility gate is the API's.
 //!
 //! The update API's seams are bound in [`handover`]: the order spool, `status.json`, the
-//! request map and the restart answer are real there, and the supervisor is a refusal until a
-//! swap is run behind the API.
+//! request map and the restart answer are real there, and so is the supervisor
+//! ([`supervisor_swap::SwapSupervisor`]).
 //!
-//! `Migrator` is real in the verb: the cold start's hook is [`supervisor::host_migrator`], a
-//! [`migrator::DbMigrator`] over the database `installer.toml` names. The swap's
-//! `Ports.migrator` has no production caller yet (no swap runs behind the update API); when
-//! one does, it hands the same [`migrator::DbMigrator`] to `Ports`.
-//! [`root_orders::SpoolRootOrders`] is real and nothing builds it yet.
+//! Not built, stated: [`supervisor::adopt_children`] still adopts a child only when no update
+//! is in flight (the startup hold stays otherwise); choosing between two live children is not
+//! done. `Migrator` is real in the verb: the cold start's hook is [`supervisor::host_migrator`],
+//! a [`migrator::DbMigrator`] over the database `installer.toml` names. The swap's migrator is
+//! [`handover_swap::StateDbMigrator`], the same [`migrator::DbMigrator`] built per migration
+//! (see [`handover_swap`]). `Admin::ready` reports `health` and `capabilities` as not ready
+//! until their probes exist, so a swap on a real child stops at `ready`.
+//! [`root_orders::SpoolRootOrders`] is the swap's order port ([`handover_swap`] builds it).
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -122,6 +128,7 @@ pub mod child_real;
 mod cold;
 pub mod gate_real;
 pub mod handover;
+pub mod handover_swap;
 pub mod migrator;
 pub mod model;
 pub mod orders;
@@ -134,6 +141,7 @@ pub mod running_binary;
 pub mod runtime;
 #[cfg(target_os = "linux")]
 pub mod supervisor;
+pub mod supervisor_swap;
 mod swap;
 
 #[cfg(test)]

@@ -1,8 +1,9 @@
 //! `kbf-installer proxy` as a service manager runs it: a process with one activated socket.
 //! Nothing here needs root or a child frontend; the proxy has no active child, so every
 //! backend path is `UNAVAILABLE` and `/readyz` is 503, which is what the supervisor-less verb
-//! promises. The update route (`/v1/update/frontend`) is the update API with no handover driver
-//! behind it: it answers its status and refuses a `POST`, and the tests at the end say how.
+//! promises. The update route (`/v1/update/frontend`) is the update API with the handover driver
+//! behind it: on this host (no `releases/` directory, no child) it answers its status and
+//! refuses a `POST`, and the tests at the end say how.
 
 #![cfg(target_os = "linux")]
 
@@ -232,6 +233,12 @@ fn start(path: &Path, listener: &TcpListener) -> Reaped {
     start_with(path, listener, Stdio::piped())
 }
 
+/// The host root of the verb under test: a directory with no `releases/` in it, so the host's
+/// own install (if any) is not what the driver looks at.
+fn root_of(config: &Path) -> PathBuf {
+    config.with_file_name("root")
+}
+
 /// [`start`] with `stderr` for the verb's standard error.
 fn start_with(path: &Path, listener: &TcpListener, stderr: Stdio) -> Reaped {
     start_masked(path, listener, stderr, false)
@@ -258,6 +265,8 @@ fn start_args(
         .arg(path)
         .arg("--orders-dir")
         .arg(orders_dir_of(path))
+        .arg("--root")
+        .arg(root_of(path))
         .args(flags)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1229,19 +1238,24 @@ async fn the_update_route_is_the_update_api() {
     assert!(state_of(&config).join("orders.json").is_file());
 }
 
-/// Catches a `POST` that goes as far as an order while nothing can take the update over
-/// (the swap is not wired into the verb): the API refuses with 503 and its reason, no order
-/// is in the spool, and no request id was saved, so the same request is a fresh one when the
-/// driver is there.
+/// Catches a `POST` that goes as far as an order while nothing can take the update over: the
+/// verb binds the real handover driver, which is bound to the proxy only once the supervisor's
+/// start has ended (it adopts a child or starts the installed release, and on this host,
+/// which has neither, it waits through its retries with the start-up hold in force). A `POST`
+/// meanwhile is refused with 503 and "proxy not bound yet" before anything is saved: no order
+/// is in the spool and no request id was saved, so the same request is a fresh one on a host
+/// that can take it. (What the driver refuses once bound is the swap supervisor's, tested in
+/// `handover_swap`.)
 #[tokio::test(flavor = "current_thread")]
-async fn a_post_is_refused_while_no_handover_driver_is_wired_and_writes_nothing() {
+async fn a_post_before_the_supervisors_start_ends_is_refused_and_writes_nothing() {
     let (_proxy, addr, ca, config) = serving("update-post").await;
     let body = post_body("r1");
     let (status, text) = call(addr, &ca, "POST", UPDATE, Some(TOKEN), body.as_bytes()).await;
     assert_eq!(status, 503, "{text}");
     let answer = json(&text);
     assert_eq!(answer["error"], "handover_unavailable", "{text}");
-    assert_eq!(answer["message"], "handover driver not wired", "{text}");
+    let message = answer["message"].as_str().unwrap_or_default();
+    assert!(message.contains("proxy not bound yet"), "{text}");
     assert_eq!(names_in(&orders_dir_of(&config)), Vec::<String>::new());
     assert!(!state_of(&config).join("requests.json").exists());
 }

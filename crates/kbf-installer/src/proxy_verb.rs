@@ -7,12 +7,12 @@
 //! service user and needs no root. On Linux it also starts the supervisor's first duty
 //! ([`crate::proxy::supervisor`]): it adopts the frontend children a previous proxy left
 //! running, by pid, start time and executable, and ends the startup hold into the one that
-//! serves. It never calls a child's admin endpoint: resuming an update that was in flight,
-//! choosing between two live children and starting a first child need the child's admin port
-//! and the root half's orders, which are not built yet; in those cases the startup hold stays
-//! in force, the proxy answers `UNAVAILABLE` once its bound is over and `/readyz` says 503,
-//! and the reason is on the standard error. A child outlives the proxy: a stop of the proxy
-//! signals the proxy alone (`KillMode=process` in `kbf-proxy.service`).
+//! serves. The adoption itself never calls a child's admin endpoint: choosing between two
+//! live children and starting a first child are not built; in those cases, and when an update
+//! was in flight (the handover driver below resumes it, and the hold stays until it decides),
+//! the startup hold stays in force, the proxy answers `UNAVAILABLE` once its bound is over and
+//! `/readyz` says 503, and the reason is on the standard error. A child outlives the proxy: a
+//! stop of the proxy signals the proxy alone (`KillMode=process` in `kbf-proxy.service`).
 //!
 //! **The update API.** `/v1/update/frontend` is the update API of [`crate::proxy::api`], run
 //! by an actor on a thread of its own and called through `UpdateBridge`. The proxy
@@ -20,10 +20,13 @@
 //! time, and the API behind it does no check of its own: this verb is the only place the two
 //! meet. Its seams are bound by [`crate::proxy::handover`] (`--update-dir` names the root
 //! half's `status.json`, `--orders-dir` the order spool, the proxy's `state_dir` the request
-//! map and the spool's counter, `confirm_window_s` the window its orders ask for). A swap is
-//! not run behind it yet, so a `POST` is refused with 503 and nothing is written. If the actor
-//! dies the proxy is stopped as a stop signal stops it and the verb exits 1, so the service
-//! manager starts it again.
+//! map and the spool's counter, `confirm_window_s` the window its orders ask for). Behind it is
+//! the handover driver ([`crate::proxy::handover_swap`]): once the proxy is bound and its
+//! children adopted, `supervise` fills the driver's slot with the proxy's gate, the children's
+//! process control and the proxy's secret, and the driver runs the swap on a thread of its own.
+//! A `POST` it cannot take (an update open, no idle slot, no `releases/` directory) is refused
+//! with 503 and nothing is written. If the actor or the swap thread dies the proxy is stopped
+//! as a stop signal stops it and the verb exits 1, so the service manager starts it again.
 //!
 //! The start migrates before it runs anything: the installed release is brought to the
 //! `state_schema` it declares on the database `installer.toml` names (`database`, a URL
@@ -46,7 +49,7 @@
 //! is registered, so a reload asked for the moment the unit is active is delivered, not fatal.
 
 use std::io::{Read as _, Write as _};
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::fd::{AsFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -57,6 +60,8 @@ use std::time::Duration;
 use kbf_proxy::Proxy;
 use kbf_proxy::config::ProxyConfig;
 use kbf_proxy::control::{UpdateHandler, UpdateReply, UpdateRequest};
+use kbf_proxy::route::Target;
+use kbf_proxy::slot::Slot;
 use rustix::io::{Errno, FdFlags, fcntl_getfd, fcntl_setfd};
 #[cfg(target_os = "linux")]
 use rustix::net::sockopt::socket_acceptconn;
@@ -71,6 +76,9 @@ use crate::proxy::api::actor::ActorTiming;
 use crate::proxy::api::core::{Core, Parts};
 use crate::proxy::api::handler::{Handler, HandlerRequest};
 use crate::proxy::handover::{self, HandoverConfig, HandoverError};
+use crate::proxy::handover_swap::{GateSlot, SlotAddrs};
+#[cfg(target_os = "linux")]
+use crate::proxy::handover_swap::{Host, admin_secret};
 
 /// The first descriptor a service manager passes (`SD_LISTEN_FDS_START`).
 pub const FIRST_FD: RawFd = 3;
@@ -183,7 +191,18 @@ fn loaded_from(path: &Path, text: &str) -> Result<Loaded, VerbError> {
 
 /// Where the update API reads and writes: the flags and the file.
 fn handover_config(args: &ProxyArgs, loaded: &Loaded) -> HandoverConfig {
+    let table = loaded.proxy.upstream;
+    let at = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let admin = |slot| at(table.admin_port(slot));
+    let operator = |slot| at(table.port(slot, Target::Operator));
     HandoverConfig {
+        slots: SlotAddrs {
+            admin: [admin(Slot::A), admin(Slot::B)],
+            operator: [operator(Slot::A), operator(Slot::B)],
+        },
+        operator_token_file: loaded.proxy.operator_token_file.clone(),
+        installer_toml: config_path(args, Platform::current()),
+        gate: GateSlot::new(),
         state_dir: loaded.proxy.state_dir.clone(),
         orders_dir: args.orders_dir.clone(),
         status_file: args.update_dir.join("status.json"),
@@ -461,6 +480,7 @@ fn serve(
     database: Database,
     handover: &HandoverConfig,
     listener: OwnedFd,
+    root: &kbf_host::Root,
 ) -> Result<(), VerbError> {
     #[cfg(target_os = "linux")]
     let supervise_with = Supervise {
@@ -485,6 +505,7 @@ fn serve(
         )
     });
     let stop = Stop::production();
+    let died = Arc::new(AtomicBool::new(false));
     // What stops the proxy, for a signal and for the death of the update API alike.
     let drain: Arc<dyn Fn() + Send + Sync> = {
         let handle = handle.clone();
@@ -525,9 +546,14 @@ fn serve(
     release_reload_signal();
     // A closed standard error (a journal that went away) must not stop the proxy from serving.
     #[cfg(target_os = "linux")]
-    let _supervised = supervise(&handle, supervise_with);
+    let _supervised = supervise(
+        &handle,
+        supervise_with,
+        root,
+        &handover.gate,
+        death_hook(&stop, &died, &drain),
+    );
     let note = update_line(&parts, handover);
-    let died = Arc::new(AtomicBool::new(false));
     let updates = start_updates(parts, &stop, &died, &drain)?;
     let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {note}");
     let _ = writeln!(std::io::stderr(), "kbf-installer: proxy serving");
@@ -554,7 +580,7 @@ struct Supervise {
 #[cfg(target_os = "linux")]
 struct Supervised {
     clock: Arc<crate::proxy::runtime::SystemClock>,
-    thread: Option<JoinHandle<crate::proxy::gate_real::ProxyGate>>,
+    thread: Option<JoinHandle<Arc<crate::proxy::gate_real::ProxyGate>>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -569,57 +595,83 @@ impl Drop for Supervised {
 }
 
 /// Adopts the children a previous proxy left, or starts the installed release, and reports
-/// what it did on the standard error.
+/// what it did on the standard error, then tells the handover driver what it needs of the bound
+/// proxy (`slot`, filled once, after the start has ended: until then the driver says the proxy
+/// is not bound). `root` is the host root the layout is over.
 #[cfg(target_os = "linux")]
-fn supervise(handle: &kbf_proxy::ProxyHandle, with: Supervise) -> Supervised {
+fn supervise(
+    handle: &kbf_proxy::ProxyHandle,
+    with: Supervise,
+    root: &kbf_host::Root,
+    slot: &GateSlot,
+    on_death: Arc<dyn Fn(&str) + Send + Sync>,
+) -> Supervised {
     use crate::layout::Layout;
     use crate::proxy::boot::Retry;
+    use crate::proxy::child_real::ProcChild;
     use crate::proxy::runtime::SystemClock;
+    use crate::proxy::supervisor::{Startup, children_dir, frontend_argv};
 
     let clock = Arc::new(SystemClock::new());
     let (handle, wait) = (handle.clone(), Arc::clone(&clock));
+    let (root, slot) = (root.clone(), slot.clone());
     let thread = std::thread::Builder::new()
         .name("supervisor".into())
         .spawn(move || {
-            let gate = crate::proxy::gate_real::ProxyGate::new(handle.clone());
-            let layout = Layout::linux(kbf_host::Root::host());
-            let line = start_children(&handle, &gate, &*wait, layout, with, Retry::boot());
+            let gate = Arc::new(crate::proxy::gate_real::ProxyGate::new(handle.clone()));
+            let layout = Layout::linux(root);
+            let releases_dir = layout.join(&layout.releases());
+            let child = Arc::new(ProcChild::new(
+                layout,
+                children_dir(&with.state_dir),
+                frontend_argv(&with.proxy_auth_file, with.upstream),
+            ));
+            let started = start_with(&handle, &gate, &*wait, &child, with, Retry::boot());
+            let (active, held) = match &started {
+                Ok(Startup::Adopted { active }) => (*active, None),
+                Ok(Startup::Held(why)) | Err(why) => {
+                    (crate::proxy::model::Slot::A, Some(why.clone()))
+                }
+            };
+            let line = startup_line(started);
             let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {line}");
+            let recorder = Arc::clone(&child);
+            slot.fill(Host {
+                gate: gate.clone(),
+                child,
+                recorded: recorded_by(&recorder),
+                active,
+                held,
+                releases_dir,
+                secret: admin_secret(&handle.admin_headers()),
+                on_death,
+            });
             gate
         })
         .ok();
     Supervised { clock, thread }
 }
 
-/// The start itself, over `layout`: the children, the admin client, the migration hook
-/// ([`host_migrator`] on the database of `with`) and the report. What it says is the line
-/// the log gets.
+/// The start over `child`: the admin client, the migration hook ([`host_migrator`] on the
+/// database of `with`) and the report. The handover driver is handed the same `child`.
 #[cfg(target_os = "linux")]
-fn start_children(
+fn start_with(
     handle: &kbf_proxy::ProxyHandle,
     gate: &crate::proxy::gate_real::ProxyGate,
     clock: &dyn crate::proxy::ports::Clock,
-    layout: crate::layout::Layout,
+    child: &crate::proxy::child_real::ProcChild,
     with: Supervise,
     retry: crate::proxy::boot::Retry,
-) -> String {
+) -> Result<crate::proxy::supervisor::Startup, String> {
     use crate::proxy::boot::FileReport;
-    use crate::proxy::child_real::ProcChild;
     use crate::proxy::model::Timing;
     use crate::proxy::root_orders::StatusFile;
-    use crate::proxy::supervisor::{
-        Boot, adopt_children, child_admin, children_dir, frontend_argv, host_migrator,
-    };
+    use crate::proxy::supervisor::{Boot, adopt_children, child_admin, host_migrator};
 
-    let child = ProcChild::new(
-        layout,
-        children_dir(&with.state_dir),
-        frontend_argv(&with.proxy_auth_file, with.upstream),
-    );
-    let started = child_admin(handle, with.upstream, with.operator_token_file).map(|admin| {
+    child_admin(handle, with.upstream, with.operator_token_file).map(|admin| {
         let report = FileReport::new(&with.state_dir);
         let facts = StatusFile::new(&with.status);
-        let migrator = host_migrator(with.database, &facts, &child);
+        let migrator = host_migrator(with.database, &facts, child);
         let boot = Boot {
             admin: &admin,
             clock,
@@ -629,9 +681,8 @@ fn start_children(
             timing: Timing::frontend(),
             retry,
         };
-        adopt_children(gate, &child, &with.state_dir, &boot)
-    });
-    startup_line(started)
+        adopt_children(gate, child, &with.state_dir, &boot)
+    })
 }
 
 /// What the supervisor tells the log about how the start went.
@@ -653,8 +704,43 @@ fn config_path(args: &ProxyArgs, platform: Platform) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(platform.installer_toml()))
 }
 
+/// What the handover driver runs when its swap thread dies: [`handover_died`] over this verb's
+/// stop, death flag and drain.
+#[cfg(target_os = "linux")]
+fn death_hook(
+    stop: &Arc<Stop>,
+    died: &Arc<AtomicBool>,
+    drain: &Arc<dyn Fn() + Send + Sync>,
+) -> Arc<dyn Fn(&str) + Send + Sync> {
+    let (stop, died, drain) = (Arc::clone(stop), Arc::clone(died), Arc::clone(drain));
+    Arc::new(move |why| handover_died(why, &stop, &died, &*drain))
+}
+
+/// The process the children's records name for a slot, as the driver asks for it: what a
+/// restarted proxy adopts.
+#[cfg(target_os = "linux")]
+fn recorded_by(
+    child: &Arc<crate::proxy::child_real::ProcChild>,
+) -> Arc<dyn Fn(crate::proxy::model::Slot) -> Option<crate::proxy::model::ProcIdent> + Send + Sync>
+{
+    let child = Arc::clone(child);
+    Arc::new(move |slot| child.recorded(slot).map(|recorded| recorded.ident))
+}
+
+/// The handover driver's swap thread died: say why, then stop the proxy as the death of the
+/// update API's actor does (the verb exits 1 and the unit restarts it, and the restart
+/// adopts what the swap left).
+#[cfg(target_os = "linux")]
+fn handover_died(why: &str, stop: &Arc<Stop>, died: &AtomicBool, drain: impl FnOnce()) {
+    let _ = writeln!(
+        std::io::stderr(),
+        "kbf-installer: proxy: the handover driver died: {why}"
+    );
+    actor_died(stop, died, drain);
+}
+
 /// The verb. With `--check`, the table is loaded and nothing is bound.
-pub fn run(args: &ProxyArgs) -> Result<(), VerbError> {
+pub fn run(args: &ProxyArgs, root: &Path) -> Result<(), VerbError> {
     hold_reload_signal();
     let path = config_path(args, Platform::current());
     let text = read_config(&path)?;
@@ -666,6 +752,7 @@ pub fn run(args: &ProxyArgs) -> Result<(), VerbError> {
     if args.check {
         return Ok(());
     }
+    let root = kbf_host::Root::new(root).map_err(|e| VerbError::Usage(format!("--root: {e}")))?;
     let listen_pid = std::env::var("LISTEN_PID").ok();
     let listen_fds = std::env::var("LISTEN_FDS").ok();
     let listener = activated(
@@ -675,7 +762,7 @@ pub fn run(args: &ProxyArgs) -> Result<(), VerbError> {
         FIRST_FD,
     )?;
     let handover = handover_config(args, &loaded);
-    serve(loaded.proxy, database, &handover, listener)
+    serve(loaded.proxy, database, &handover, listener, &root)
 }
 
 #[cfg(test)]

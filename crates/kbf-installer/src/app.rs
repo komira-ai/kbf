@@ -622,7 +622,7 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         );
     }
     if let Verb::Proxy(args) = &cli.verb {
-        return match proxy_verb::run(args) {
+        return match proxy_verb::run(args, &root_of(cli)) {
             Ok(()) => Exit::Ok,
             Err(e) => say(
                 e.exit(),

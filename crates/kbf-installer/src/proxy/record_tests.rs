@@ -118,7 +118,7 @@ fn adoption_needs_pid_start_time_and_executable_to_agree() {
     );
 }
 
-type Calls = std::rc::Rc<std::cell::RefCell<Vec<(&'static str, Option<Phase>)>>>;
+type Calls = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, Option<Phase>)>>>;
 
 /// Remembers when each sync ran and what `update.json` held at that moment.
 struct Spy {
@@ -138,7 +138,7 @@ impl Spy {
 
 impl Durable for Spy {
     fn file(&self, _: &fs::File) -> std::io::Result<()> {
-        self.calls.borrow_mut().push(("file", self.on_disk()));
+        self.calls.lock().unwrap().push(("file", self.on_disk()));
         if self.fail_file {
             return Err(std::io::Error::other("disk full"));
         }
@@ -146,7 +146,7 @@ impl Durable for Spy {
     }
 
     fn dir(&self, _: &std::path::Path) -> std::io::Result<()> {
-        self.calls.borrow_mut().push(("dir", self.on_disk()));
+        self.calls.lock().unwrap().push(("dir", self.on_disk()));
         Ok(())
     }
 }
@@ -170,7 +170,7 @@ fn the_temp_file_is_synced_before_the_rename_and_the_directory_after_it() {
     // Before the second rename the file on disk is still the first record; after it,
     // the second. A missing sync, or a directory sync before the rename, shows here.
     assert_eq!(
-        *calls.borrow(),
+        *calls.lock().unwrap(),
         vec![
             ("file", None),
             ("dir", Some(Phase::Starting)),
@@ -188,7 +188,7 @@ fn a_failed_file_sync_leaves_the_old_record_and_stops_the_swap() {
         Err(Halt::Port(_))
     ));
     assert_eq!(
-        *calls.borrow(),
+        *calls.lock().unwrap(),
         vec![("file", None)],
         "no rename, no dir sync"
     );

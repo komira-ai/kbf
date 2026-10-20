@@ -97,9 +97,10 @@
 //!
 //! # Credentials
 //!
-//! The admin calls carry the caller's secret headers. The child does not read them today
-//! (the admin calls carry no credential), and a child that gates the port on them later
-//! needs no change here. Reads of the operator port (`/readyz`) carry
+//! The admin calls carry the caller's secret headers. A frontend child started with
+//! `--proxy-auth-file` refuses an admin call that does not present the proxy's secret
+//! (`x-kbf-proxy-auth`, `kbf-server`'s `managed/http.rs`), so a call without it is
+//! answered with a refusal, not served. Reads of the operator port (`/readyz`) carry
 //! nothing: they are open, and a secret is sent only where it can be needed.
 //!
 //! Every call blocks the calling thread for up to its deadline: the swap runs on a thread of
