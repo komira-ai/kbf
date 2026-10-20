@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::rc::Rc;
 
 use kbf_state::postgres::PostgresConfig;
@@ -17,6 +18,8 @@ use serde_json::json;
 use super::rig::*;
 use super::store::{FRESH_START, applied};
 use super::*;
+use crate::fixtures::{FakeRunner, ran, version_json};
+use crate::testkit::{A, B};
 
 fn never() -> FnVerifier {
     FnVerifier(Box::new(|_, _| Err("no pipeline here".to_owned())))
@@ -294,6 +297,157 @@ fn no_state_is_copied_from_the_sqlite_file() {
     }
 }
 
+/// Every event the kernel has queued on `watch`, as "name flags" lines.
+#[cfg(target_os = "linux")]
+fn events(watch: &std::os::fd::OwnedFd) -> Vec<String> {
+    use rustix::fs::inotify::Reader;
+    let mut buffer = [std::mem::MaybeUninit::uninit(); 8192];
+    let mut reader = Reader::new(watch, &mut buffer);
+    let mut seen = Vec::new();
+    loop {
+        match reader.next() {
+            Ok(event) => seen.push(format!("{:?} {:?}", event.file_name(), event.events())),
+            Err(rustix::io::Errno::AGAIN) => return seen,
+            Err(e) => panic!("reading inotify events: {e}"),
+        }
+    }
+}
+
+/// Catches a read of the SQLite file that copies nothing: the kernel is asked, from outside the
+/// code under test, whether anything opened, read, wrote, closed, created, removed or changed
+/// the attributes of the file or its siblings while a dry run and an apply ran. (Time stamps
+/// cannot tell: a mount that does not keep access times shows no read, and a read that is
+/// thrown away leaves no copy for `no_state_is_copied_from_the_sqlite_file` to find.) The
+/// control comes first: a plain read of the file is seen, so that silence afterwards is a
+/// migration that did not touch it, and not a file system that reports nothing.
+///
+/// Mutants seen red: a read of the file (`fs::read`) planted after the schema step, its result
+/// dropped; the same on the sibling write-ahead file.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sqlite_file_is_not_opened_by_a_dry_run_or_an_apply() {
+    use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
+
+    let (mut rig, db) = frontend("noread", None);
+    put(
+        &rig.at("var/lib/kbf/state.db-wal"),
+        "write-ahead rows",
+        0o600,
+    );
+    let watch = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK).expect("inotify");
+    inotify::add_watch(&watch, rig.at("var/lib/kbf"), WatchFlags::ALL_EVENTS).expect("watch");
+
+    fs::read(rig.at(SQLITE)).expect("the control read");
+    let control = events(&watch);
+    assert!(
+        control
+            .iter()
+            .any(|e| e.contains("state.db") && e.contains("OPEN")),
+        "a read of the file is not seen, so silence would prove nothing: {control:?}"
+    );
+
+    let m = crossing(&rig, &db);
+    for mode in [Mode::DryRun, Mode::Apply] {
+        go(&mut rig, &m, mode).expect("migrate");
+        assert_eq!(events(&watch), Vec::<String>::new(), "{mode:?}");
+    }
+    assert_eq!(db.calls(), ["plan", "plan", "setup"]);
+}
+
+/// What the build of `commit` says to `--version --json`, as the rig's other builds say it
+/// (a release build of that commit) except for its state schema: 0, a build that embeds no
+/// migration and so cannot open a Postgres store.
+fn schema_less(commit: &'static str) -> FakeRunner {
+    FakeRunner::new(move |spawn| {
+        let dir = spawn
+            .program
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .expect("a release directory");
+        let says = version_json(dir, "release");
+        Ok(ran(
+            0,
+            &if dir == commit {
+                says.replace("\"state_schema\":7", "\"state_schema\":0")
+            } else {
+                says
+            },
+            "",
+        ))
+    })
+}
+
+/// Catches a crossing that stops the farm onto a release that cannot open its store: the units
+/// run `current`, and a `current` that reports no state schema (it embeds no Postgres
+/// migration) is refused with exit 3 before the schema step, any stop or any file, in a dry run
+/// too. The database was asked (the refusal of an absent Postgres comes first); it was never set
+/// up.
+///
+/// Mutants seen red: the check skipped; the check on `previous` in place of `current`.
+#[test]
+fn a_current_release_that_embeds_no_postgres_schema_refuses_before_anything_changes() {
+    let (mut rig, db) = frontend("oldcur", None);
+    let m = crossing(&rig, &db);
+    let before = rig.snapshot("");
+    for mode in [Mode::DryRun, Mode::Apply] {
+        let error = go_with(&mut rig, &m, &schema_less(A), mode).expect_err("refused");
+        assert!(
+            matches!(&error, MigrateError::NoPostgresSchema { release } if release == A),
+            "{error}"
+        );
+        assert_eq!(error.exit().code(), 3);
+        let said = error.to_string();
+        assert!(
+            said.contains(&A[..12]) && said.contains("state_schema 0"),
+            "{said}"
+        );
+    }
+    assert_eq!(db.calls(), ["plan", "plan"], "asked twice, never set up");
+    assert_eq!(db.schema(), None);
+    assert_eq!(rig.snapshot(""), before);
+    assert!(rig.events.borrow().is_empty() && rig.host.log.is_empty());
+}
+
+/// Catches a check that is too wide or too narrow: a `previous` that embeds no schema is
+/// adopted and warned of (a revert to it could not open the store), in a dry run and an
+/// apply, and the crossing goes on; a node host (no state store) is not judged by the schema
+/// at all, so its `current` with none migrates and says nothing of it.
+///
+/// Mutants seen red: the `previous` refused like `current`; the warning dropped; the node host
+/// judged.
+#[test]
+fn a_previous_release_with_no_postgres_schema_is_warned_of_and_a_node_is_not_judged() {
+    let (mut rig, db) = frontend("oldprev", None);
+    let m = crossing(&rig, &db);
+    let warned = |report: &Report| {
+        report
+            .warnings
+            .iter()
+            .filter(|w| w.contains(&B[..12]) && w.contains("revert"))
+            .count()
+    };
+    let planned = go_with(&mut rig, &m, &schema_less(B), Mode::DryRun).expect("plan");
+    assert_eq!(warned(&planned), 1, "{planned}");
+    assert!(db.calls() == ["plan"] && rig.events.borrow().is_empty());
+    let report = go_with(&mut rig, &m, &schema_less(B), Mode::Apply).expect("migrate");
+    assert_eq!(report.outcome, Outcome::Migrated);
+    assert_eq!(warned(&report), 1, "{report}");
+    assert_eq!(
+        read(&rig, "etc/systemd/system/kbf-all-in-one.service"),
+        aio_after()
+    );
+
+    let mut node = Rig::linux("pg-oldnode");
+    let plain = node.migration();
+    assert!(plain.state_store.is_none());
+    let planned = go_with(&mut node, &plain, &schema_less(A), Mode::DryRun).expect("plan");
+    assert!(planned.warnings.iter().all(|w| !w.contains("state schema")));
+    let report = go_with(&mut node, &plain, &schema_less(A), Mode::Apply).expect("migrate");
+    assert_eq!(report.outcome, Outcome::Migrated);
+    assert!(report.warnings.iter().all(|w| !w.contains("state schema")));
+}
+
 /// Catches a Postgres step on a node: a migration with no state store (a storage, daemon or
 /// storage-and-daemon host, or one whose mode was not said) asks no database, writes no schema
 /// event, prints no database line, journals no store, and leaves even a `--state-store=sqlite`
@@ -375,6 +529,13 @@ fn a_missing_postgres_refuses_before_anything_changes() {
         assert!(
             said.contains("`kbf` role") && said.contains("creates none of them"),
             "{said}"
+        );
+        // The URL names no role, so the server is asked as the user running the verb (root,
+        // for an apply): a host with a correct `kbf` role is refused too when it lets only
+        // `kbf` in, and the line must say whose connection it is.
+        assert!(
+            said.contains("the user running this verb"),
+            "the line names whose connection is refused: {said}"
         );
         assert!(probe.calls().is_empty(), "no program ran");
     }

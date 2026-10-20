@@ -167,6 +167,27 @@ fn report_store_plan(report: &mut Report, store: &StateStore, schema: &str, unit
     report.warnings.push(store::FRESH_START.to_owned());
 }
 
+/// The releases of a host that moves to Postgres, judged for the store its units are given. A
+/// build whose `--version --json` says `state_schema` 0 embeds no migration and cannot open
+/// it. The units run `current`, which is refused with it; a revert runs `previous`, which is
+/// adopted with a warning.
+fn judge_releases(found: &[Found]) -> Result<Vec<String>, MigrateError> {
+    let mut warnings = Vec::new();
+    for f in found.iter().filter(|f| f.version.state_schema == 0) {
+        if f.role == "current" {
+            return Err(MigrateError::NoPostgresSchema {
+                release: f.name.to_string(),
+            });
+        }
+        warnings.push(format!(
+            "release {} ({}) embeds no state schema (state_schema 0): a revert to it cannot open the \
+             Postgres store the units are switched to",
+            f.name, f.role
+        ));
+    }
+    Ok(warnings)
+}
+
 /// `current` and `previous` as the first look found and probed them must still be what the
 /// old state names under the locks: a release probed is not one adopted in its place.
 fn unchanged(probed: &[Option<CommitId>; 2], old: &Old) -> Result<(), MigrateError> {
@@ -218,7 +239,7 @@ pub fn migrate<E: Exec>(
     // (`found`, and the names it probed them under); what it read is not written from. The
     // source of the floor is asked here too, once: the frontend is a call over the network,
     // not one to make with the locks held.
-    let (found, probed, claim) = {
+    let (found, probed, claim, notes) = {
         let first = match look(m, &rules)? {
             Look::Settled(report) => return Ok(report),
             Look::Old(seen) => seen,
@@ -241,6 +262,13 @@ pub fn migrate<E: Exec>(
             .transpose()?;
         let claim = floor::claim(&m.seed, hooks.frontend)?;
         let found = find(m, hooks, &rules, &first.old_tree, &first.old)?;
+        // The units of such a host run `current`: one that cannot open the store is refused
+        // here, with nothing changed, and what is only a warning is carried to the report.
+        let notes = if schema.is_some() {
+            judge_releases(&found)?
+        } else {
+            Vec::new()
+        };
         if mode == Mode::DryRun {
             let mut report = Report::new(Outcome::Planned);
             report_plan(
@@ -253,6 +281,7 @@ pub fn migrate<E: Exec>(
             if let Some((store, schema)) = &schema {
                 report_store_plan(&mut report, store, schema, &m.units);
             }
+            report.warnings.extend(notes);
             plan(m, exec, &mut report)?;
             return Ok(report);
         }
@@ -260,7 +289,7 @@ pub fn migrate<E: Exec>(
             first.old.state.current.clone(),
             first.old.state.previous.clone(),
         ];
-        (found, probed, claim)
+        (found, probed, claim, notes)
     };
     // Both locks: no verb of the old tools is mid-way, and no run of the installer changes
     // its state while this one does. Each is waited for `m.lock_wait` and no longer (busy,
@@ -292,6 +321,7 @@ pub fn migrate<E: Exec>(
         old.state.staged.as_ref(),
         &found,
     );
+    report.warnings.extend(notes);
     // The schema comes before anything is stopped or written: nothing reads that database
     // yet, so the old frontend keeps serving meanwhile, and a refusal of the step (a database
     // ahead of this installer, a server that will not migrate) leaves the host as it was.
