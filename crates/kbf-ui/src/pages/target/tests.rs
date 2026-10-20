@@ -321,6 +321,18 @@ fn a_key_without_an_instance_lists_its_rows_with_encoded_links() {
         html.contains("More rows exist than this page lists."),
         "{html}"
     );
+    // Either sign alone says so: a next page, or an answer over part of the instances.
+    for doc in [
+        json!({"shapes": [], "next_page": "/v1/shapes/1111111111111111?page_token=t"}),
+        json!({"shapes": [], "partial": true}),
+    ] {
+        let fake = Fake::default().json("/v1/shapes/1111111111111111", &doc);
+        let (_, html) = page(&fake, "/ui/targets/1111111111111111");
+        assert!(
+            html.contains("More rows exist than this page lists."),
+            "{html}"
+        );
+    }
 }
 
 /// Catches: a key or an instance taken from the URL written into an API URL without

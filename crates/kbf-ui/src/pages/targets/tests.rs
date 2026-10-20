@@ -200,6 +200,27 @@ fn the_next_page_keeps_the_filter_and_the_token_encoded() {
     assert!(!html.contains("Next page"), "{html}");
 }
 
+/// Catches: the next-page link of an unfiltered list gaining a `status` of its own, or
+/// losing the token.
+#[test]
+fn the_next_page_of_an_unfiltered_list_has_only_the_token() {
+    let fake = Fake::default()
+        .json(
+            LIST_URL,
+            &json!({"shapes": [shape(FLAKY, None, "failing", false)],
+                "next_page": "/v1/tests?page_size=50&page_token=t"}),
+        )
+        .json(
+            "/v1/grid?shapes=1111111111111111&last=16",
+            &grid(&[(FLAKY, vec!["fail", "fail", "fail", "fail"])]),
+        );
+    let (_, html) = page(&fake, "/ui/targets");
+    assert!(
+        html.contains("<a href=\"/ui/targets?page_token=t\">Next page</a>"),
+        "{html}"
+    );
+}
+
 /// Catches: a partial list shown as the whole one; a grid that cannot be read failing the
 /// list or leaving cells that look like data.
 #[test]
