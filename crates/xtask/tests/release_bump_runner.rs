@@ -24,7 +24,7 @@ const NEW: &str = "2222222222222222222222222222222222222222";
 const OTHER: &str = "3333333333333333333333333333333333333333";
 const TOKEN: &str = "ghs_s3cr3t_t0ken";
 /// What the fake `gh` is asked when the tag is looked up, and nothing else follows.
-const ASKED: &str = "api repos/komira-ai/kbf/commits/v1.2.3\n";
+const ASKED: &str = "api repos/komira-ai/kbf/commits/refs/tags/v1.2.3\n";
 
 fn scratch(name: &str) -> TestDir {
     TestDir::under(
@@ -40,6 +40,12 @@ fn process_with(gh: PathBuf) -> Process {
 /// A `Process` whose `gh` is never started.
 fn process() -> Process {
     process_with(PathBuf::from("gh"))
+}
+
+/// The token as `git` sends it: base64 of `x-access-token:<token>`. Actions masks the token
+/// and not this.
+fn credential() -> String {
+    STANDARD.encode(format!("x-access-token:{TOKEN}"))
 }
 
 fn args_of(cmd: &Command) -> Vec<String> {
@@ -66,7 +72,13 @@ fn a_call_with_the_token_in_its_arguments_is_refused_before_it_runs() {
     // (the programs are never started: `gh` need not even be installed on the test host).
     let p = process();
     let leak = format!("repos/x?access_token={TOKEN}");
-    for ran in [p.gh(&["api", &leak]), p.git(&["clone", &leak])] {
+    let derived = format!("https://x/?h={}", credential());
+    for ran in [
+        p.gh(&["api", &leak]),
+        p.git(&["clone", &leak]),
+        p.gh(&["api", &derived]),
+        p.git(&["clone", &derived]),
+    ] {
         let Err(Error::Failed(why)) = ran else {
             panic!("a call with the token in its arguments ran");
         };
@@ -95,8 +107,7 @@ fn git_gets_the_token_as_a_header_in_its_environment_only() {
     assert_eq!(cmd.get_program(), "git");
     assert_eq!(args_of(&cmd), ["status"]);
     let env = envs_of(&cmd);
-    let credential = STANDARD.encode(format!("x-access-token:{TOKEN}"));
-    let header = format!("AUTHORIZATION: basic {credential}");
+    let header = format!("AUTHORIZATION: basic {}", credential());
     let set = |key: &str| env.get(key).cloned().flatten();
     assert_eq!(env.get("GH_TOKEN"), Some(&None));
     assert_eq!(env.get("GITHUB_TOKEN"), Some(&None));
@@ -134,11 +145,12 @@ fn the_runner_returns_what_the_program_printed_with_the_token_hidden() {
     // Catches: a token a program echoes (in a url, in an error) reaching the job log, a
     // 404 read as success, and a program that cannot be started read as an answer.
     let own = scratch("runner");
-    let answers = json!({ "echo": format!("seen {TOKEN}") });
+    let seen = format!("seen {TOKEN} and {}", credential());
+    let answers = json!({ "echo": seen });
     let p = process_with(fake_gh(&own, &answers));
     let echoed = p.gh(&["api", "echo"]).expect("the fake runs");
     assert!(echoed.ok);
-    assert_eq!(echoed.stdout, "\"seen ***\"\n");
+    assert_eq!(echoed.stdout, "\"seen *** and ***\"\n");
     let missing = p.gh(&["api", "nothing"]).expect("the fake runs");
     assert!(!missing.ok);
     let stderr = missing.stderr;
@@ -191,6 +203,28 @@ fn the_git_checks_read_what_real_git_prints() {
     };
     let want = "not exactly one modified gitlink at kbf";
     assert!(why[0].contains(want), "{why:?}");
+}
+
+#[test]
+fn git_runs_with_the_header_and_what_it_prints_hides_it() {
+    // Catches: a `git` started with the environment of `gh` (real git ignores `GH_TOKEN`, so
+    // only the header it reports proves the environment), and a header that git prints on
+    // standard output or standard error reaching the job log in the base64 form that Actions
+    // does not mask.
+    let own = scratch("header");
+    let dir = own.to_str().expect("a UTF-8 path");
+    let p = process();
+    let init = p.git(&["init", "-q", dir]).expect("git runs");
+    assert!(init.ok, "{}", init.stderr);
+    let key = "http.https://github.com/.extraheader";
+    let got = p.git(&["-C", dir, "config", "--get", key]).expect("git runs");
+    assert!(got.ok, "{}", got.stderr);
+    assert_eq!(got.stdout, "AUTHORIZATION: basic ***\n");
+    let bad = p.git(&["-C", dir, "config", "--type=int", "--get", key]);
+    let bad = bad.expect("git runs");
+    assert!(!bad.ok);
+    assert!(bad.stderr.contains("AUTHORIZATION: basic ***"), "{}", bad.stderr);
+    assert!(!bad.stderr.contains(&credential()), "{}", bad.stderr);
 }
 
 /// `xtask release bump-internal` with `gh` as the program: the exit code, stdout and
@@ -260,16 +294,32 @@ fn a_missing_tag_is_refused_by_the_binary_and_the_token_stays_out_of_argv() {
 }
 
 #[test]
-fn a_tag_on_another_commit_is_refused_by_the_binary_with_a_workdir_given() {
-    // Catches: a tag check that the binary skips, and the workdir flag not reaching the run.
-    let answers = json!({ "repos/komira-ai/kbf/commits/v1.2.3": { "sha": OTHER } });
+fn a_tag_on_another_commit_is_refused_by_the_binary() {
+    // Catches: a tag check that the binary skips, or a tag looked up by its bare name (which
+    // resolves a branch of that name too) and not as `refs/tags/<tag>`.
+    let answers = json!({ "repos/komira-ai/kbf/commits/refs/tags/v1.2.3": { "sha": OTHER } });
     let own = scratch("other-tag");
     let gh = fake_gh(&own, &answers);
-    let clone = own.join("clone");
-    let clone = clone.to_str().expect("a UTF-8 path");
-    let (code, _, stderr) = xtask(&gh, "1.2.3", &["--workdir", clone], Some(TOKEN));
+    let (code, _, stderr) = xtask(&gh, "1.2.3", &[], Some(TOKEN));
     assert_eq!(code, Some(1));
     let want = format!("names {OTHER:?}, not {NEW}");
     assert!(stderr.contains(&want), "{stderr}");
     assert_eq!(gh_args(&own), ASKED);
+}
+
+#[test]
+fn a_workdir_the_caller_gave_survives_a_refused_run() {
+    // Catches: the clean-up of the run deleting a directory it did not make (a `--workdir`
+    // the caller owns, with its content), whatever the result of the run.
+    let answers = json!({ "repos/komira-ai/kbf/commits/refs/tags/v1.2.3": { "sha": OTHER } });
+    let own = scratch("keep-workdir");
+    let gh = fake_gh(&own, &answers);
+    let clone = own.join("clone");
+    std::fs::create_dir_all(&clone).expect("workdir");
+    std::fs::write(clone.join("keep"), "mine\n").expect("a file of the caller");
+    let given = clone.to_str().expect("a UTF-8 path");
+    let (code, _, _) = xtask(&gh, "1.2.3", &["--workdir", given], Some(TOKEN));
+    assert_eq!(code, Some(1));
+    let kept = std::fs::read_to_string(clone.join("keep"));
+    assert_eq!(kept.expect("the file is still there"), "mine\n");
 }

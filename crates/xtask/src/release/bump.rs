@@ -13,12 +13,15 @@
 //!
 //! The steps, each one a `gh` or `git` call without a shell:
 //!
-//! 1. the tag `v<version>` of `--repo` names `--sha`;
-//! 2. the pull requests of the internal repository whose head branch begins
-//!    `bump/<submodule>-v` (`gh pr list`, open, merged and closed): an open or merged one for
-//!    this version or a newer one means there is nothing to open (an open one for this
-//!    version without auto-merge gets it). A list that reaches the limit it was asked for
-//!    (500) is an error, because a newer bump may be hidden behind it;
+//! 1. the tag `v<version>` of `--repo` names `--sha` (`refs/tags/`, so a branch of the same
+//!    name does not count);
+//! 2. the pull requests of the internal repository opened by the release bot whose head
+//!    branch begins `bump/<submodule>-v` (`gh pr list`, open, merged and closed): an open or
+//!    merged one for this version or a newer one means there is nothing to open (an open one
+//!    for this version without auto-merge gets it). The list is a search, newest first and
+//!    cut at 100: the newest bump is on that page, and a bump that covers this version
+//!    can only be hidden behind a newer one that is not. A search lags behind what GitHub
+//!    holds, so the pull requests of this version's own branch are listed again without it;
 //! 3. when the branch `bump/<submodule>-v<version>` already exists (an earlier run stopped
 //!    after its push), its gitlink must be `--sha` and the branch is reused. Otherwise: a
 //!    shallow clone (no submodule is initialised), the gitlink set with `git update-index
@@ -28,12 +31,14 @@
 //!    the old commit and `--sha` is not `ahead`) is refused: the submodule never moves
 //!    backwards;
 //! 4. `gh pr create`, `gh pr merge --auto --merge`, and a check that auto-merge is on;
-//! 5. every older open bump pull request is closed in favour of the new one.
+//! 5. every older open bump pull request of the bot is closed in favour of the new one (one
+//!    that was merged meanwhile is left alone).
 //!
 //! The token is `GH_TOKEN`, the release bot's installation token. `gh` reads it from its
 //! environment; `git` gets it as an HTTP header through `GIT_CONFIG_*` in its environment,
 //! without `GH_TOKEN`. It is never an argument of any process: [`Process`] refuses to run a
-//! command whose arguments hold it, and hides it from what a command printed.
+//! command whose arguments hold it (or the base64 form `git` sends), and hides both from
+//! what a command printed.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -49,12 +54,16 @@ use crate::build_commit::full_commit;
 /// The branch of the internal repository a bump pull request is based on.
 const BASE: &str = "main";
 
-/// How many pull requests one `gh pr list` call is asked for. A list this long may have
-/// more behind it.
-const LIMIT: usize = 500;
+/// How many pull requests the search is asked for, newest first. A page, not the whole
+/// history: every release leaves a merged bump pull request behind for good.
+const LIMIT: usize = 100;
 
 /// The fields of a pull request `gh pr list` is asked for.
-const FIELDS: &str = "number,state,headRefName,url,autoMergeRequest";
+const FIELDS: &str = "number,state,headRefName,url,autoMergeRequest,author";
+
+/// The login `gh` prints for the author of the release bot's pull requests. Only these
+/// count as bumps, and only these are closed.
+const AUTHOR_LOGIN: &str = "app/komira-release-bot";
 
 /// What a version must look like, for the usage error.
 const SEMVER: &str = "<major>.<minor>.<patch> (plain numbers, no leading v)";
@@ -230,15 +239,20 @@ pub struct Process {
     gh_program: PathBuf,
     git_program: PathBuf,
     token: String,
+    /// The token as `git` sends it, base64 of `x-access-token:<token>`: Actions masks the
+    /// token and not this.
+    credential: String,
 }
 
 impl Process {
     /// `gh` and `git` as these programs, with the release bot's installation `token`.
     pub fn new(gh: PathBuf, git: PathBuf, token: String) -> Process {
+        let credential = STANDARD.encode(format!("x-access-token:{token}"));
         Process {
             gh_program: gh,
             git_program: git,
             token,
+            credential,
         }
     }
 
@@ -253,8 +267,7 @@ impl Process {
     /// header `git` sends to github.com; no prompt; https only; the bot as author and
     /// committer.
     pub fn git_command(&self, args: &[&str]) -> Command {
-        let credential = format!("x-access-token:{}", self.token);
-        let header = format!("AUTHORIZATION: basic {}", STANDARD.encode(credential));
+        let header = format!("AUTHORIZATION: basic {}", self.credential);
         let mut cmd = Command::new(&self.git_program);
         cmd.args(args);
         cmd.env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN");
@@ -266,20 +279,23 @@ impl Process {
     }
 
     /// Runs `cmd`, which is `program` with `args`; refuses first when an argument holds the
-    /// token.
+    /// token or its base64 form.
     fn run(&self, program: &Path, mut cmd: Command, args: &[&str]) -> Result<Ran, Error> {
         let name = program.display().to_string();
-        let token = self.token.as_str();
-        if args.iter().any(|a| a.contains(token)) {
+        let secrets = [self.token.as_str(), self.credential.as_str()];
+        if args.iter().any(|a| secrets.iter().any(|s| a.contains(*s))) {
             let why = format!("refusing to run {name}: the token is in its arguments");
             return Err(Error::Failed(why));
         }
         let out = cmd.output().map_err(Error::spawn(name))?;
-        let scrub = |b: &[u8]| String::from_utf8_lossy(b).replace(token, "***");
+        let hide = |b: &[u8]| {
+            let text = String::from_utf8_lossy(b).into_owned();
+            secrets.iter().fold(text, |t, s| t.replace(*s, "***"))
+        };
         Ok(Ran {
             ok: out.status.success(),
-            stdout: scrub(&out.stdout),
-            stderr: scrub(&out.stderr),
+            stdout: hide(&out.stdout),
+            stderr: hide(&out.stderr),
         })
     }
 }
@@ -359,32 +375,40 @@ fn branch_version(prefix: &str, head: &str) -> Option<Version> {
     Version::parse_tag(&format!("v{version}"))
 }
 
-/// The open and merged bump pull requests of the submodule: the pull requests whose head
-/// branch begins `bump/<submodule>-v` (the search), at most [`LIMIT`] of them.
+/// The open and merged bump pull requests of the release bot for the submodule: those whose
+/// head branch begins `bump/<submodule>-v`, newest first and at most [`LIMIT`] of them (the
+/// search), and those of this version's own branch (a list, not a search: the search lags
+/// behind what was opened or merged a moment ago, and the list is the fresher of the two).
 fn pull_requests(tools: &dyn Tools, b: &Bump) -> Result<Vec<Pr>, Error> {
     let repo = b.internal_repo.as_str();
     let prefix = format!("bump/{}-v", b.submodule);
-    let search = format!("head:{prefix}");
+    let search = format!("head:{prefix} sort:created-desc");
     let limit = LIMIT.to_string();
     let mut args = vec!["pr", "list", "-R", repo, "--state", "all"];
     args.extend(["--search", &search, "--limit", &limit]);
     args.extend(["--json", FIELDS]);
-    let printed = gh_must(tools, &args)?;
-    let Ok(Value::Array(listed)) = serde_json::from_str::<Value>(&printed) else {
+    let mut found = parse_prs(&gh_must(tools, &args)?, &prefix)?;
+    let branch = b.branch();
+    let mut own = vec!["pr", "list", "-R", repo, "--state", "all"];
+    own.extend(["--head", &branch, "--json", FIELDS]);
+    for fresh in parse_prs(&gh_must(tools, &own)?, &prefix)? {
+        found.retain(|p| p.number != fresh.number);
+        found.push(fresh);
+    }
+    Ok(found)
+}
+
+/// The bump pull requests of the release bot in `printed`, the JSON `gh pr list` printed:
+/// open and merged ones whose head branch is `<prefix><version>`.
+fn parse_prs(printed: &str, prefix: &str) -> Result<Vec<Pr>, Error> {
+    let Ok(Value::Array(listed)) = serde_json::from_str::<Value>(printed) else {
         let why = format!("gh pr list printed no JSON list: {printed:?}");
         return Err(Error::Failed(why));
     };
-    if listed.len() >= LIMIT {
-        let why = format!(
-            "gh pr list returned {LIMIT} pull requests, the most it is asked for: more may be \
-             hidden, and a hidden newer bump would not be seen"
-        );
-        return Err(Error::Failed(why));
-    }
     let mut found = Vec::new();
     for entry in &listed {
         let head = entry["headRefName"].as_str().unwrap_or_default();
-        let Some(version) = branch_version(&prefix, head) else {
+        let Some(version) = branch_version(prefix, head) else {
             continue;
         };
         let open = match entry["state"].as_str() {
@@ -392,6 +416,9 @@ fn pull_requests(tools: &dyn Tools, b: &Bump) -> Result<Vec<Pr>, Error> {
             Some("MERGED") => false,
             _ => continue,
         };
+        if entry["author"]["login"] != AUTHOR_LOGIN {
+            continue;
+        }
         let (number, url) = (entry["number"].as_u64(), entry["url"].as_str());
         let (Some(number), Some(url)) = (number, url) else {
             let why = format!("gh pr list printed an entry without number or url: {entry}");
@@ -412,7 +439,8 @@ fn pull_requests(tools: &dyn Tools, b: &Bump) -> Result<Vec<Pr>, Error> {
 /// repository names the commit.
 fn tag_names_sha(tools: &dyn Tools, b: &Bump) -> Result<(), Error> {
     let (repo, sha, tag) = (b.repo.as_str(), b.sha.as_str(), b.tag());
-    let found = api(tools, &format!("repos/{repo}/commits/{tag}"))?;
+    // `refs/tags/`: a bare name would resolve a branch of that name as well.
+    let found = api(tools, &format!("repos/{repo}/commits/refs/tags/{tag}"))?;
     let Some(found) = found else {
         let why = format!("the tag {tag} does not exist in {repo}");
         return Err(Error::Refused(vec![why]));
@@ -488,10 +516,12 @@ fn branch_gitlink(tools: &dyn Tools, b: &Bump) -> Result<Option<String>, Error> 
 pub fn gitlink_at(tools: &dyn Tools, dir: &str, path: &str) -> Result<String, Error> {
     let printed = git_in(tools, dir, &["ls-tree", "HEAD", "--", path])?;
     // `<mode> SP <type> SP <sha> TAB <path>`
-    let meta = printed.split('\t').next().unwrap_or_default();
+    let (meta, found) = printed.trim_end().split_once('\t').unwrap_or_default();
     let fields: Vec<&str> = meta.split(' ').collect();
     match fields.as_slice() {
-        ["160000", "commit", sha] => Ok((*sha).to_owned()),
+        ["160000", "commit", sha] if found == path && full_commit("sha", sha).is_ok() => {
+            Ok((*sha).to_owned())
+        }
         _ => {
             let shown = printed.trim_end();
             let why = format!("{path} is not a gitlink at HEAD (git ls-tree says {shown:?})");
@@ -577,8 +607,9 @@ fn create_pr(tools: &dyn Tools, b: &Bump) -> Result<String, Error> {
     let mut args = vec!["pr", "create", "-R", repo, "--base", BASE];
     args.extend(["--head", &branch, "--title", &title, "--body", &body]);
     let printed = gh_must(tools, &args)?;
-    // The url is the last line of what `gh pr create` prints.
-    let url = printed.lines().next_back().unwrap_or_default().trim();
+    // The url is the last line of what `gh pr create` prints, a trailing blank line aside.
+    let last = printed.trim_end().lines().next_back();
+    let url = last.unwrap_or_default().trim();
     if !url.starts_with("https://") {
         let why = format!("gh pr create printed {printed:?}, not a pull request url");
         return Err(Error::Failed(why));
@@ -604,20 +635,39 @@ fn open(tools: &dyn Tools, b: &Bump) -> Result<String, Error> {
         return Ok(line);
     }
     let url = create_pr(tools, b)?;
-    enable_auto_merge(tools, b, &url)?;
+    let done = format!("opened {url}");
+    let on = enable_auto_merge(tools, b, &url);
+    on.map_err(|e| after(&done, e))?;
     let line = format!("opened {url} with auto-merge: {sub} to {tag}");
     Ok(line)
 }
 
-/// Closes the older open bump pull request `old` in favour of this one, and its branch.
-fn close_older(tools: &dyn Tools, b: &Bump, old: &Pr) -> Result<(), Error> {
+/// `error`, saying what was already done when it came: a failure after a pull request was
+/// opened must not hide the pull request.
+fn after(done: &str, error: Error) -> Error {
+    match error {
+        Error::Failed(why) => Error::Failed(format!("{why} (already done: {done})")),
+        other => other,
+    }
+}
+
+/// Closes the older open bump pull request `old` in favour of this one, and its branch: the
+/// line to print. One that was merged since the list was made is left as it is.
+fn close_older(tools: &dyn Tools, b: &Bump, old: &Pr) -> Result<String, Error> {
     let repo = b.internal_repo.as_str();
-    let (number, version) = (old.number.to_string(), b.version);
+    let (number, version, url) = (old.number.to_string(), b.version, &old.url);
     let note = format!("Superseded by the bump to v{version}.");
     let mut args = vec!["pr", "close", number.as_str(), "-R", repo];
     args.extend(["--comment", &note, "--delete-branch"]);
-    gh_must(tools, &args)?;
-    Ok(())
+    let ran = tools.gh(&args)?;
+    if ran.ok {
+        return Ok(format!("closed {url} (older than v{version})"));
+    }
+    if ran.stderr.contains("already merged") {
+        return Ok(format!("{url} was merged meanwhile: left as it is"));
+    }
+    let why = ran.stderr.trim_end();
+    Err(Error::Failed(format!("gh pr close: {why}")))
 }
 
 /// The bump itself: the lines to print. Every refusal comes before the first write.
@@ -635,10 +685,11 @@ pub fn apply(tools: &dyn Tools, b: &Bump) -> Result<Vec<String>, Error> {
         Some(p) => cover(tools, b, p)?,
         None => open(tools, b)?,
     };
+    let done = line.clone();
     said.push(line);
     for old in listed.iter().filter(|p| p.open && p.version < mine) {
-        close_older(tools, b, old)?;
-        said.push(format!("closed {} (older than {tag})", old.url));
+        let closed = close_older(tools, b, old);
+        said.push(closed.map_err(|e| after(&done, e))?);
     }
     Ok(said)
 }

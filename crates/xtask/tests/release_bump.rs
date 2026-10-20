@@ -55,8 +55,12 @@ fn broke(stderr: &str) -> Ran {
 struct World {
     /// GitHub's answers to `gh api <path>`; a path not here is a 404.
     api: BTreeMap<String, Value>,
-    /// What `gh pr list` prints.
+    /// What the search `gh pr list --search` prints.
     prs: String,
+    /// What the list of one head branch, `gh pr list --head`, prints.
+    own: String,
+    /// What `git ls-tree` prints instead of the gitlink at HEAD, when set.
+    tree: Option<String>,
     /// What `gh pr create` prints.
     created: String,
     /// Whether `gh pr view` says auto-merge is on once `gh pr merge` ran.
@@ -90,7 +94,7 @@ struct World {
 }
 
 fn tag_path() -> String {
-    format!("repos/{REPO}/commits/v1.2.3")
+    format!("repos/{REPO}/commits/refs/tags/v1.2.3")
 }
 
 fn compare_path(old: &str) -> String {
@@ -111,6 +115,8 @@ fn world() -> World {
     let mut w = World {
         api: BTreeMap::new(),
         prs: "[]".to_owned(),
+        own: "[]".to_owned(),
+        tree: None,
         created: format!("Creating pull request\n\n{PR_URL}\n"),
         auto_merge_takes: true,
         view: None,
@@ -261,7 +267,14 @@ impl Tools for World {
         }
         let ran = match args {
             ["api", path] => self.api_answer(path),
-            ["pr", "list", ..] => printed(&self.prs),
+            ["pr", "list", rest @ ..] => {
+                let text = if rest.contains(&"--head") {
+                    &self.own
+                } else {
+                    &self.prs
+                };
+                printed(text)
+            }
             ["pr", "create", ..] => printed(&self.created),
             ["pr", "merge", ..] => {
                 self.merged.set(true);
@@ -284,7 +297,10 @@ impl Tools for World {
         }
         let out = match args {
             ["clone", ..] | ["-C", _, "push", ..] => String::new(),
-            ["-C", _, "ls-tree", ..] => format!("160000 commit {}\tkbf\n", self.head.borrow()),
+            ["-C", _, "ls-tree", ..] => match &self.tree {
+                Some(text) => text.clone(),
+                None => format!("160000 commit {}\tkbf\n", self.head.borrow()),
+            },
             ["-C", _, "update-index", "--cacheinfo", info] => {
                 let sha = info.split(',').nth(1).unwrap_or_default();
                 *self.staged.borrow_mut() = Some(sha.to_owned());
@@ -304,8 +320,11 @@ impl Tools for World {
     }
 }
 
-/// One entry of `gh pr list` for the head branch `branch`.
-fn pr_on(number: u64, branch: &str, state: &str, auto: bool) -> Value {
+/// The login `gh` prints for the release bot as the author of a pull request.
+const BOT: &str = "app/komira-release-bot";
+
+/// One entry of `gh pr list` for the head branch `branch`, opened by `login`.
+fn pr_by(login: &str, number: u64, branch: &str, state: &str, auto: bool) -> Value {
     let merge = if auto {
         json!({ "enabledAt": "2026-10-20T00:00:00Z" })
     } else {
@@ -317,7 +336,13 @@ fn pr_on(number: u64, branch: &str, state: &str, auto: bool) -> Value {
         "headRefName": branch,
         "url": format!("https://github.com/{INTERNAL}/pull/{number}"),
         "autoMergeRequest": merge,
+        "author": { "login": login, "is_bot": true },
     })
+}
+
+/// One entry of `gh pr list` for the head branch `branch`, opened by the release bot.
+fn pr_on(number: u64, branch: &str, state: &str, auto: bool) -> Value {
+    pr_by(BOT, number, branch, state, auto)
 }
 
 /// One entry of `gh pr list` for the bump to `version`.
@@ -382,10 +407,14 @@ fn body1() -> String {
 fn golden() -> Vec<String> {
     let body = body1();
     vec![
-        format!("gh api repos/{REPO}/commits/v1.2.3"),
+        format!("gh api repos/{REPO}/commits/refs/tags/v1.2.3"),
         format!(
-            "gh pr list -R {INTERNAL} --state all --search head:bump/kbf-v --limit 500 \
-             --json number,state,headRefName,url,autoMergeRequest"
+            "gh pr list -R {INTERNAL} --state all --search head:bump/kbf-v sort:created-desc \
+             --limit 100 --json number,state,headRefName,url,autoMergeRequest,author"
+        ),
+        format!(
+            "gh pr list -R {INTERNAL} --state all --head {BRANCH} \
+             --json number,state,headRefName,url,autoMergeRequest,author"
         ),
         format!("gh api repos/{INTERNAL}/git/ref/heads/{BRANCH}"),
         format!(
@@ -425,16 +454,6 @@ fn a_bump_clones_commits_pushes_opens_and_turns_auto_merge_on() {
     let tagged = format!("tag v1.2.3 of {REPO} names {NEW}");
     let opened = format!("opened {PR_URL} with auto-merge: kbf to v1.2.3");
     assert_eq!(said, [tagged, opened]);
-}
-
-#[test]
-fn the_commit_and_the_pull_request_name_the_release() {
-    // Catches: a pull request that does not say which release it moves the submodule to.
-    let body = request().body();
-    let link = "https://github.com/komira-ai/kbf/releases/tag/v1.2.3";
-    assert!(body.starts_with(&body1()), "{body}");
-    assert!(body.contains(link), "{body}");
-    assert!(body.contains("bump guard"), "{body}");
 }
 
 #[test]
@@ -669,7 +688,8 @@ fn auto_merge_that_is_not_on_afterwards_is_an_error() {
     let mut w = world();
     w.auto_merge_takes = false;
     let want = format!("auto-merge is not on for {PR_URL} after `gh pr merge --auto --merge`");
-    assert_eq!(failed(run(&w)), want);
+    let why = failed(run(&w));
+    assert_eq!(why, format!("{want} (already done: opened {PR_URL})"));
     let mut w = world();
     w.view = Some("not json".to_owned());
     let why = failed(run(&w));
@@ -677,24 +697,23 @@ fn auto_merge_that_is_not_on_afterwards_is_an_error() {
 }
 
 #[test]
-fn a_pull_request_listing_that_reaches_the_limit_is_an_error() {
-    // Catches: a list cut at the limit read as complete, so a newer bump hidden behind it
-    // is opened over; and a limit that is off by one.
+fn a_full_page_of_pull_requests_is_not_an_error() {
+    // Catches: a list that has reached its page size treated as a failure: every release
+    // leaves a merged bump pull request behind, so the page fills for good, and the verb
+    // would fail on every release from then on. The search is newest first, so a newer bump
+    // cannot be hidden behind the page.
     let mut w = world();
-    w.prs = many(500);
-    let why = failed(run(&w));
-    let start = "gh pr list returned 500 pull requests";
-    assert!(why.starts_with(start), "{why}");
-    assert!(!changed(&w));
-    let mut w = world();
-    w.prs = many(499);
-    let said = run(&w).expect("a list below the limit is complete");
+    w.prs = many(100);
+    let said = run(&w).expect("a full page is a list like any other");
     assert!(said[1].starts_with("opened "), "{said:?}");
+    let lists = w.starting("gh pr list");
+    assert!(lists[0].contains(" sort:created-desc --limit 100 "), "{lists:?}");
 }
 
 #[test]
 fn a_pull_request_listing_that_is_not_a_json_list_is_an_error() {
-    // Catches: a garbled list read as "no pull requests".
+    // Catches: a garbled list read as "no pull requests", from the search or from the list
+    // of the version's own branch.
     for text in ["not json", "{\"a\": 1}"] {
         let mut w = world();
         w.prs = text.to_owned();
@@ -702,14 +721,76 @@ fn a_pull_request_listing_that_is_not_a_json_list_is_an_error() {
         let start = "gh pr list printed no JSON list";
         assert!(why.starts_with(start), "{why}");
         assert!(!changed(&w));
+        let mut w = world();
+        w.own = text.to_owned();
+        let why = failed(run(&w));
+        assert!(why.starts_with(start), "{why}");
+        assert!(!changed(&w));
     }
+}
+
+#[test]
+fn a_pull_request_the_search_has_not_indexed_yet_is_found_by_its_branch() {
+    // Catches: a re-run right after a run that opened the pull request but stopped before
+    // auto-merge, which the search does not list yet: the branch is reused and `gh pr create`
+    // fails with "already exists". The list of the version's own branch finds it, and turns
+    // auto-merge on.
+    let mut w = world();
+    w.own = listing(&[pr(7, "1.2.3", "OPEN", false)]);
+    let said = run(&w).expect("auto-merge turns on");
+    let want = format!("{PR_URL} for v1.2.3 was open without auto-merge: turned it on");
+    assert_eq!(said[1], want);
+    let merge = format!("gh pr merge 7 -R {INTERNAL} --auto --merge");
+    assert_eq!(w.writes(), [merge]);
+}
+
+#[test]
+fn the_list_of_the_own_branch_overrides_a_stale_search() {
+    // Catches: a pull request the search still reads as open after it was merged, taken for
+    // an open one without auto-merge (and given a `gh pr merge` that fails on a merged one):
+    // the fresher state of the same number wins, and nothing is written.
+    let mut w = world();
+    w.prs = listing(&[pr(7, "1.2.3", "OPEN", false)]);
+    w.own = listing(&[pr(7, "1.2.3", "MERGED", false)]);
+    let said = run(&w).expect("covered");
+    let want = format!("exists ({PR_URL}, merged): nothing to open");
+    assert!(said[1].ends_with(&want), "{said:?}");
+    assert_eq!(w.writes(), Vec::<String>::new());
+}
+
+/// An open pull request of a person, not of the release bot, for the bump to `version`.
+fn human(number: u64, version: &str) -> Value {
+    let branch = format!("bump/kbf-v{version}");
+    pr_by("someone", number, &branch, "OPEN", false)
+}
+
+#[test]
+fn only_pull_requests_of_the_release_bot_are_bumps() {
+    // Catches: a stray pull request that happens to be named `bump/kbf-v9.9.9`, opened by
+    // anyone, read as a bump that covers this one (the pin would stop for good, and every
+    // run say "nothing to open"), and a person's older `bump/kbf-v*` pull request closed
+    // and its branch deleted by the bot.
+    let mut w = world();
+    let stray = pr_by("someone", 9, "bump/kbf-v9.9.9", "MERGED", true);
+    w.prs = listing(&[stray, human(5, "1.2.0")]);
+    w.own = listing(&[human(6, "1.2.3")]);
+    let said = run(&w).expect("a good bump");
+    assert!(said[1].starts_with("opened "), "{said:?}");
+    assert!(w.did("gh pr create"));
+    assert!(!w.did("gh pr close"));
+    let mut w = world();
+    w.prs = listing(&[human(4, "1.1.0"), pr(5, "1.2.0", "OPEN", false)]);
+    run(&w).expect("a good bump");
+    assert_eq!(w.starting("gh pr close").len(), 1);
+    assert!(w.did("gh pr close 5 "));
 }
 
 #[test]
 fn a_bump_pull_request_without_number_or_url_is_an_error() {
     // Catches: an entry read with a default number, which would be closed or enabled as #0.
     let mut w = world();
-    w.prs = listing(&[json!({ "headRefName": BRANCH, "state": "OPEN" })]);
+    let bare = json!({ "headRefName": BRANCH, "state": "OPEN", "author": { "login": BOT } });
+    w.prs = listing(&[bare]);
     let why = failed(run(&w));
     let start = "gh pr list printed an entry without number or url";
     assert!(why.starts_with(start), "{why}");
@@ -726,12 +807,47 @@ fn what_gh_pr_create_prints_must_end_in_the_url() {
 }
 
 #[test]
+fn trailing_blank_lines_after_the_pull_request_url_are_not_a_failure() {
+    // Catches: a pull request that was created, and a run that reports failure because the
+    // last line of what `gh pr create` printed is empty.
+    let mut w = world();
+    w.created = format!("Creating pull request\n\n{PR_URL}\n\n \n");
+    let said = run(&w).expect("a good bump");
+    assert_eq!(said[1], format!("opened {PR_URL} with auto-merge: kbf to v1.2.3"));
+}
+
+#[test]
+fn a_gitlink_that_is_not_the_path_asked_for_or_not_a_full_commit_refuses() {
+    // Catches: a `git ls-tree` line read as the gitlink of the submodule when it names
+    // another path, or a commit id that is not 40 lowercase hex digits (the compare and the
+    // commit would be made with it).
+    let upper = OLD.replace('1', "A");
+    let trees = [
+        format!("160000 commit {OLD}\tother\n"),
+        format!("160000 commit {OLD}\n"),
+        format!("160000 commit {}\tkbf\n", &OLD[..39]),
+        format!("160000 commit {upper}\tkbf\n"),
+        format!("160000 commit {OLD}x\tkbf\n"),
+        format!("100644 blob {OLD}\tkbf\n"),
+        String::new(),
+    ];
+    for tree in trees {
+        let mut w = world();
+        w.tree = Some(tree.clone());
+        let why = refused(run(&w));
+        assert!(why.starts_with("kbf is not a gitlink at HEAD"), "{tree:?}: {why}");
+        assert!(!changed(&w), "{tree:?}");
+    }
+}
+
+#[test]
 fn a_failing_command_is_an_error_that_says_what_it_printed() {
     // Catches: a call whose failure is ignored, or read as an empty answer (no tag, no list,
     // no gitlink), which would let the bump go on.
     let needles = [
         "gh api repos/komira-ai/kbf/commits",
         "gh pr list",
+        "--state all --head",
         "gh api repos/example-org/internal/git/ref",
         "git clone",
         "ls-tree",
@@ -741,8 +857,6 @@ fn a_failing_command_is_an_error_that_says_what_it_printed() {
         "commit --quiet",
         "push --quiet",
         "gh pr create",
-        "gh pr merge",
-        "gh pr view",
     ];
     for needle in needles {
         let mut w = world();
@@ -753,33 +867,64 @@ fn a_failing_command_is_an_error_that_says_what_it_printed() {
 }
 
 #[test]
+fn a_failure_after_the_pull_request_is_opened_names_the_pull_request() {
+    // Catches: a failed auto-merge (or its check) after `gh pr create` that leaves a pull
+    // request open and an error that does not say where it is, so the job log hides it.
+    for needle in ["gh pr merge", "gh pr view"] {
+        let mut w = world();
+        w.fail = Some((needle, "boom"));
+        let why = failed(run(&w));
+        let done = format!("(already done: opened {PR_URL})");
+        assert!(why.contains(": boom"), "{needle}: {why}");
+        assert!(why.ends_with(&done), "{needle}: {why}");
+    }
+}
+
+#[test]
 fn an_api_answer_that_is_not_json_is_an_error() {
     // Catches: an answer that cannot be read taken for an answer (an empty one, or "found").
     let mut w = world();
     w.garbage = Some("/commits/");
     let why = failed(run(&w));
-    let start = "gh api repos/komira-ai/kbf/commits/v1.2.3: not JSON";
+    let start = "gh api repos/komira-ai/kbf/commits/refs/tags/v1.2.3: not JSON";
     assert!(why.starts_with(start), "{why}");
 }
 
 #[test]
-fn a_failing_close_of_an_older_pull_request_is_an_error() {
-    // Catches: a close that fails and is passed over, leaving the older bump open.
+fn a_failing_close_of_an_older_pull_request_is_an_error_that_names_the_new_one() {
+    // Catches: a close that fails and is passed over, leaving the older bump open; and an
+    // error that does not say that the new pull request was opened.
     let mut w = world();
     w.prs = listing(&[pr(5, "1.2.0", "OPEN", true)]);
     w.fail = Some(("gh pr close", "boom"));
-    assert_eq!(failed(run(&w)), "gh pr close: boom");
+    let why = failed(run(&w));
+    assert!(why.starts_with("gh pr close: boom (already done: opened "), "{why}");
+    assert!(why.contains(PR_URL), "{why}");
+}
+
+#[test]
+fn an_older_pull_request_merged_meanwhile_is_left_alone() {
+    // Catches: a run that fails on `gh pr close` of a pull request the search still read as
+    // open, after it was merged and the new pull request is open already.
+    let mut w = world();
+    w.prs = listing(&[pr(5, "1.2.0", "OPEN", true)]);
+    let why = "X Pull request #5 can't be closed because it was already merged";
+    w.fail = Some(("gh pr close", why));
+    let said = run(&w).expect("a merged pull request needs no close");
+    let want = "https://github.com/example-org/internal/pull/5 was merged meanwhile";
+    assert!(said[2].starts_with(want), "{said:?}");
 }
 
 #[test]
 fn a_program_that_cannot_be_started_is_an_error() {
     // Catches: a `gh` or `git` that is not there read as an empty answer (no tag, no list,
-    // no clone), at each of the three places that run one.
+    // no clone), at each of the places that run one, and after the pull request is opened.
     let needles = [
         "gh api repos/komira-ai/kbf/commits",
         "gh pr list",
         "git clone",
         "gh pr create",
+        "gh pr merge",
     ];
     for needle in needles {
         let mut w = world();
@@ -788,6 +933,11 @@ fn a_program_that_cannot_be_started_is_an_error() {
         let spawned = matches!(got, Err(Error::Spawn { .. }));
         assert!(spawned, "{needle}: {got:?}");
     }
+    let mut w = world();
+    w.prs = listing(&[pr(5, "1.2.0", "OPEN", true)]);
+    w.spawn_fail = Some("gh pr close");
+    let got = run(&w);
+    assert!(matches!(got, Err(Error::Spawn { .. })), "{got:?}");
 }
 
 #[test]
@@ -821,94 +971,4 @@ fn a_gitlink_that_cannot_be_read_after_the_commit_is_an_error_before_the_push() 
     let why = failed(run(&w));
     assert!(why.ends_with("boom"), "{why}");
     assert!(w.did("commit --quiet") && !w.did("push --quiet"));
-}
-
-fn args_with(flag: &str, value: &str) -> BumpArgs {
-    let mut a = bump_args("1.2.3");
-    match flag {
-        "--version" => a.version = value.to_owned(),
-        "--sha" => a.sha = value.to_owned(),
-        "--repo" => a.repo = value.to_owned(),
-        "--internal-repo" => a.internal_repo = value.to_owned(),
-        "--submodule" => a.submodule = value.to_owned(),
-        _ => panic!("no such flag {flag}"),
-    }
-    a
-}
-
-#[test]
-fn values_the_guard_would_refuse_are_usage_errors() {
-    // Catches: a version, commit, repository or submodule name that is not what the guard
-    // and the GitHub paths built from it assume, accepted and sent on.
-    let upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
-    let bad = [
-        ("--version", "v1.2.3"),
-        ("--version", "1.2"),
-        ("--version", "1.2.3.4.5"),
-        ("--version", "01.2.3"),
-        ("--version", "1.2.3-rc1"),
-        ("--version", ""),
-        ("--sha", "abc"),
-        ("--sha", &NEW[..39]),
-        ("--sha", upper),
-        ("--repo", "kbf"),
-        ("--repo", "a/b/c"),
-        ("--repo", "/kbf"),
-        ("--repo", "x/"),
-        ("--repo", ".x/y"),
-        ("--repo", "x/.y"),
-        ("--repo", "x y/z"),
-        ("--internal-repo", "internal"),
-        ("--internal-repo", "a/b/c"),
-        ("--submodule", ""),
-        ("--submodule", ".kbf"),
-        ("--submodule", "a/b"),
-        ("--submodule", "a b"),
-    ];
-    for (flag, value) in bad {
-        let got = Bump::from_args(&args_with(flag, value));
-        let Err(Error::Usage(why)) = got else {
-            panic!("{flag} {value:?} was accepted");
-        };
-        assert!(why.starts_with(flag), "{flag} {value:?}: {why}");
-    }
-}
-
-#[test]
-fn a_run_with_no_workdir_gets_one_of_its_own() {
-    // Catches: a default clone directory shared by two runs, or none.
-    let mut a = bump_args("10.20.30");
-    a.workdir = None;
-    let b = Bump::from_args(&a).expect("a good request");
-    let dir = b.workdir.to_string_lossy().into_owned();
-    let own = format!("xtask-bump-{}", std::process::id());
-    assert!(dir.contains(&own), "{dir}");
-    assert_eq!(request().workdir, PathBuf::from(DIR));
-}
-
-/// The bump guard's rule for a branch: `bump/<submodule>-v<semver>`, plain numbers.
-fn guard_accepts(branch: &str, submodule: &str) -> bool {
-    let Some(semver) = branch.strip_prefix(&format!("bump/{submodule}-v")) else {
-        return false;
-    };
-    let parts: Vec<&str> = semver.split('.').collect();
-    let plain = |p: &&str| p.parse::<u64>().is_ok_and(|n| n.to_string() == **p);
-    parts.len() == 3 && parts.iter().all(plain)
-}
-
-#[test]
-fn the_branch_and_the_title_are_the_ones_the_bump_guard_accepts() {
-    // Catches: a branch or title that drifts from `bump/<submodule>-v<semver>` and
-    // `chore(<submodule>): bump to v<semver>`: the guard reads the branch, and the pull
-    // requests already merged read the title.
-    for version in ["0.0.1", "1.2.3", "10.20.30"] {
-        let b = Bump::from_args(&bump_args(version)).expect("a good request");
-        assert_eq!(b.branch(), format!("bump/kbf-v{version}"));
-        assert_eq!(b.title(), format!("chore(kbf): bump to v{version}"));
-        assert_eq!(b.tag(), format!("v{version}"));
-        assert!(guard_accepts(&b.branch(), "kbf"), "{}", b.branch());
-    }
-    assert!(!guard_accepts("bump/kbf-v1.2", "kbf"));
-    assert!(!guard_accepts("bump/mopm-v1.2.3", "kbf"));
-    assert!(!guard_accepts("bump/kbf-v01.2.3", "kbf"));
 }
