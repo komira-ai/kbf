@@ -71,9 +71,11 @@ pub enum FetchError {
 /// ```
 pub trait Fetcher {
     /// Fetch, verify and install the release `rec` names into its directory under
-    /// `releases/`. Never moves `current` or `previous`. This is the frontend's own update:
-    /// the order carries no facts to compare with, so only the commit and the release
-    /// profile are checked of what the binary declares.
+    /// `releases/`. Never moves `current` or `previous`, and never writes the state: the
+    /// caller that keeps the release records it (`staged` for a frontend update, `current`
+    /// for an activation), so a release it then refuses leaves nothing behind in the state.
+    /// This is the frontend's own update: the order carries no facts to compare with, so
+    /// only the commit and the release profile are checked of what the binary declares.
     fn fetch(&self, rec: &ReleaseLocator) -> Result<InstalledRelease, FetchError>;
 
     /// [`Fetcher::fetch`] for a node's `activate`, whose order also carries the facts the
