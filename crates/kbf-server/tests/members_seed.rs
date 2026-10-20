@@ -213,3 +213,30 @@ fn a_known_instance_that_changes_under_a_registration_is_read_again() {
     let again = after(&m, "mine", 0, 0);
     assert_eq!((again.id, again.boot), (MemberId(1), 2));
 }
+
+/// Catches: a registrant that squats ids ahead of the member-id counter. 16 instances each
+/// report an id 16 past their draw, a wall on the 16 ids honest nodes would draw next
+/// (`ATTEMPTS` is 16). Every claim raises the counter to its id, so an honest first
+/// registration draws a free id at once instead of failing `Contended`. An id more than
+/// `MAX_SEED` ahead is not named.
+/// Mutant: the counter not raised in the claiming transaction (the `for _ in drawn..id.0`
+/// loop removed), red: the honest node's 16 draws all land on claimed ids.
+#[test]
+fn a_registrant_cannot_squat_ids_ahead_of_the_counter() {
+    let s = Hooked::new();
+    let m = members(&s);
+    for k in 1..=16 {
+        let squat = after(&m, &format!("squat-{k}"), k + 16, 1);
+        assert_eq!(squat.id, MemberId(k + 16));
+    }
+    let far = after(&m, "far", kbf_server::members::MAX_SEED + 1000, 1);
+    assert_ne!(
+        far.id.0,
+        kbf_server::members::MAX_SEED + 1000,
+        "too far ahead"
+    );
+    let honest = m
+        .register(&node("honest"))
+        .expect("an honest node registers");
+    assert!(honest.id.0 > 32, "{:?}", honest.id);
+}

@@ -27,7 +27,9 @@
 //! log is further ahead restarts for the rest, as it did before. A node that lies about its
 //! history can only waste its own boot numbers (and, naming a free id, take it before a
 //! node that would have drawn it): it cannot take an id an instance holds, lower a counter,
-//! or skip the joiner mark.
+//! or skip the joiner mark. A named id is within [`MAX_SEED`] of the counter, and the counter
+//! is raised to it in the claiming transaction, so a claimed id is never ahead of the counter
+//! and a registrant cannot squat ids that honest nodes will draw.
 
 use kbf_map::MemberId;
 use kbf_state::{Cond, Txn};
@@ -105,18 +107,23 @@ impl Members {
         instance: &str,
         last: Option<LastBoot>,
     ) -> Result<(MemberId, Txn), MembershipError> {
+        // A counter has no precondition, so it cannot conflict.
+        let taken = self.store.txn(Txn::new().next(ID_COUNTER))?;
+        let drawn = taken.map_err(|_| MembershipError::Contended)?.counters[0];
+        // A report names an id within MAX_SEED of the draw at most, so the raise below is
+        // bounded like the boot's.
         let named = match last {
-            Some(last) if self.id_is_free(MemberId(last.member))? => Some(last),
+            Some(last)
+                if last.member <= drawn.saturating_add(MAX_SEED)
+                    && self.id_is_free(MemberId(last.member))? =>
+            {
+                Some(last)
+            }
             _ => None,
         };
         let (id, seeds) = match named {
             Some(last) => (MemberId(last.member), last.floor() + 1),
-            None => {
-                // A counter has no precondition, so it cannot conflict.
-                let taken = self.store.txn(Txn::new().next(ID_COUNTER))?;
-                let id = MemberId(taken.map_err(|_| MembershipError::Contended)?.counters[0]);
-                (id, 1)
-            }
+            None => (MemberId(drawn), 1),
         };
         let txn = Txn::new().put(key, id.0.to_be_bytes(), Cond::Absent).put(
             owner_key(id),
@@ -124,6 +131,13 @@ impl Members {
             Cond::Absent,
         );
         let mut txn = self.unfilled_if_data(txn, id)?;
+        // The counter is raised to the claimed id in the claiming transaction (all or
+        // nothing), so every claimed id is at or below the counter and no later draw can
+        // meet it: a registrant cannot squat ids ahead of the draws of honest nodes. These
+        // `next`s come before the boot's, whose last value is the boot.
+        for _ in drawn..id.0 {
+            txn = txn.next(ID_COUNTER);
+        }
         for _ in 0..seeds {
             txn = txn.next(boot_counter(id));
         }
