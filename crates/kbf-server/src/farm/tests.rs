@@ -62,8 +62,11 @@ fn a_result_without_detail_that_is_a_farm_fault_names_the_fault() {
 /// for the state store or was dropped is not acknowledged at all.
 #[test]
 fn only_a_taken_or_a_refused_result_is_acknowledged() {
-    assert_eq!(Taken::Accepted.ack(), Some(true));
-    assert_eq!(Taken::Refused.ack(), Some(false));
+    assert_eq!(Taken::Accepted.ack(), Some((true, Reason::Accepted)));
+    assert_eq!(
+        Taken::Refused(Reason::Stale).ack(),
+        Some((false, Reason::Stale))
+    );
     assert_eq!(Taken::Held.ack(), None);
     assert_eq!(Taken::Dropped.ack(), None);
 }
@@ -123,5 +126,6 @@ fn a_report_the_scheduler_does_not_take_is_refused() {
         .lock()
         .take_report(now, &worker, OperationId(0), report);
     assert!(answers.is_empty());
-    assert_eq!(taken, Taken::Refused);
+    // The lease was never granted by this process.
+    assert_eq!(taken, Taken::Refused(Reason::UnknownLease));
 }

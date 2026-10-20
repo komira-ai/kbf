@@ -17,12 +17,9 @@ use rcgen::{
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
-fn dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("storage-node")
-        .join(name);
-    std::fs::create_dir_all(&dir).expect("directory");
-    dir
+/// A directory of its own, removed when it drops.
+fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("storage-node-{name}"))
 }
 
 /// The flags of `kbf storage` over new stores in `dir`, and these more.
@@ -48,7 +45,8 @@ fn never() -> std::io::Result<std::future::Pending<()>> {
 /// is refused now, so no start line has one.
 #[tokio::test]
 async fn the_start_line_names_the_address_and_the_log() {
-    let local = flags(&dir("line-local"), &[]).expect("flags");
+    let dir = dir("line-local");
+    let local = flags(&dir, &[]).expect("flags");
     let node = start_storage(&local, never).await.expect("starts");
     let line = node.start_line().to_owned();
     let want = format!(
@@ -71,7 +69,7 @@ async fn the_start_line_names_the_address_and_the_log() {
 /// without them (IPv4, IPv6, and IPv4-mapped).
 #[tokio::test]
 async fn plain_text_is_for_loopback_only() {
-    let d = dir(&format!("plain-off-loopback-{}", std::process::id()));
+    let d = dir("plain-off-loopback");
     for addr in ["0.0.0.0:0", "[::]:0", "192.0.2.10:0", "[2001:db8::1]:0"] {
         let f = flags(&d, &[format!("--storage-listen={addr}")]).expect("parses");
         let refused = f.listener().expect_err(addr);
@@ -104,7 +102,8 @@ async fn plain_text_is_for_loopback_only() {
 /// Catches a node that serves past its shutdown future, or never starts serving.
 #[tokio::test]
 async fn it_serves_until_the_shutdown_future_completes() {
-    let f = flags(&dir("shutdown"), &[]).expect("flags");
+    let dir = dir("shutdown");
+    let f = flags(&dir, &[]).expect("flags");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let node = start_storage(&f, || {
         Ok(async move {
