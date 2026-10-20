@@ -1,6 +1,7 @@
 # Build and tests of the website (site/): TypeScript compiled by tsc, a build program that prerenders the pages, and
 # node:test tests over the built tree (golden output, links, the Content-Security-Policy rules, the pinned theme, a
-# public-repo scan). Runs only when site/ (or this file, or the policy it is checked against) changes. The Node version
+# public-repo scan). Runs only when site/ (or this file, or the policy it is checked against) changes, or a file the site
+# renders: the docs, the root Markdown files, the configuration templates (crates/kbf-cli/tests/golden). The Node version
 # is exactly the one in site/.node-version. The network is touched by `npm ci` alone, with install scripts off.
 # GitHub-hosted runner, commit-pinned actions, no token rights beyond reading the checkout.
 name: site
@@ -9,12 +10,24 @@ on:
   pull_request:
     paths:
       - site/**
+      - docs/**
+      - README.md
+      - ARCHITECTURE.md
+      - CONTRIBUTING.md
+      - SECURITY.md
+      - crates/kbf-cli/tests/golden/**
       - infra/site/lib/site-stack.ts
       - .github/workflows/site.yml
   push:
     branches: [main, feature/arch-v2]
     paths:
       - site/**
+      - docs/**
+      - README.md
+      - ARCHITECTURE.md
+      - CONTRIBUTING.md
+      - SECURITY.md
+      - crates/kbf-cli/tests/golden/**
       - infra/site/lib/site-stack.ts
       - .github/workflows/site.yml
 

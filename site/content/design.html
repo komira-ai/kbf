@@ -1,2 +1,118 @@
 <h1>Design</h1>
-<div class="notice notice-warn"><p>This page is written after the Story page. It will cover the three roles, admission, and zero-downtime updates.</p></div>
+<p class="lede">Why kbf is built the way it is. This page is the reasoning and the rules the code keeps; <a href="architecture.html">the architecture page</a> is what runs where, and <a href="story.html">the story</a> is how we got here. <span class="tag tag-ok">works today</span> is in the code; <span class="tag tag-planned">specified</span> is designed and not built.</p>
+
+<p class="toc">On this page: <a href="#roles">three roles</a> <a href="#admission">admission</a> <a href="#failures">failure classes and retries</a> <a href="#placement">placement</a> <a href="#updates">zero-downtime updates</a> <a href="#rules">rules the code keeps</a></p>
+
+<h2 id="roles">Three roles, not one server</h2>
+<p>A build farm has to answer three different questions: who should run this, where are the bytes, and what does this machine do. kbf gives each its own role, so each can fail, scale and be updated on its own.</p>
+<ul>
+  <li><strong>The frontend decides.</strong> One process sees the queue and every worker's free room, so placement is a single decision made in one place, and the scheduler is a pure state machine: it reads no clock and draws no random number, so the same inputs always give the same choices and a simulation replays a failing seed exactly. Its state is in a store it writes before it acknowledges anything, so queued work survives a restart. The frontend holds no blobs, which is what lets it be swapped while builds are running.</li>
+  <li><strong>Storage places by digest.</strong> A blob's two owners are computed from its digest and the member list by rendezvous hashing, so there is no leader to elect and no ring to coordinate, and removing a member moves only what that member held. Two copies mean a storage node can restart without losing a blob, and a writer sends each byte once, to the first owner, which forwards it.</li>
+  <li><strong>The daemon only dials out.</strong> A worker needs outbound connectivity to the frontend and nothing inbound, so a Mac on a desk or a node behind a firewall joins the same way a rack server does. Work arrives on the stream the daemon opened; bytes never do, so a slow blob transfer cannot starve the control stream.</li>
+  <li><strong>Who you are is in the certificate.</strong> Authority comes from a role in a certificate, not from a network location: the same listener refuses a storage certificate that tries to open a worker session, and a daemon certificate speaks for exactly one node.</li>
+  <li><strong>Combined modes are colocation, not another design.</strong> <code>storage-and-daemon</code> and <code>all-in-one</code> run the same roles in one process. On a node that does both, the daemon's input cache and the node's local storage are one cache on one disk, never two copies of a blob.</li>
+</ul>
+<p>The deliberate absences: no leader election among servers, no per-action resource reservations a user must tune, and no client-side kbf component. Buck2 and Bazel speak REAPI to one address.</p>
+
+<h2 id="admission">Admission: how work is admitted, queued and refused</h2>
+<p>An action passes four gates before it runs. Each gate has one outcome for an action it cannot pass, and says why in words a person can act on.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Gate</th><th>An action that fails it</th></tr></thead>
+<tbody>
+<tr><td><strong>1. Is it well formed?</strong> The front reads the platform and the lease kind.</td><td>A malformed platform, a repeated key, or a <code>kbf-lease</code> other than <code>action</code> or <code>whole_machine</code>: <code>INVALID_ARGUMENT</code>. A platform no daemon could ever run (an OS other than Linux or macOS, another architecture's ISA): <code>FAILED_PRECONDITION</code> at once, not queued.</td></tr>
+<tr><td><strong>2. Is it in the cache?</strong> The action cache is read through the closure check.</td><td>Not a failure: a hit answers and nothing runs.</td></tr>
+<tr><td><strong>3. Are its inputs stored?</strong> The Action, the Command and the input tree.</td><td><code>FAILED_PRECONDITION</code> with a <code>MISSING</code> violation per blob, so the client uploads and asks again. It is answered before the action is queued, never run and never counted against the farm.</td></tr>
+<tr><td><strong>4. Can any live daemon run it?</strong> The scheduler checks every queued operation against what live workers could give it once their bookings end.</td><td>It waits in the queue, and its callers see why in the operation's metadata: no worker connected, the closest worker and the requirements it lacks, or a request larger than any node. After <code>--unservable-wait-secs</code>, 300 by default, it is refused with <code>FAILED_PRECONDITION</code>, which neither Bazel nor Buck2 retries.</td></tr>
+</tbody></table></div>
+<ul>
+  <li><strong>Why wait before refusing.</strong> A worker that can run the work is often a moment away: daemons reconnect within seconds of a server restart, and a Mac that reboots is gone for minutes. The wait restarts whenever the operation becomes servable again, and counts from the first unservable round, through changes of reason.</li>
+  <li><strong>Queue order.</strong> By urgency, then by submission. The levels are <code>interactive</code> (300), <code>ci</code> (200) and <code>batch</code> (100). Today the front submits every action at <code>ci</code>; reading the level from a request header and preempting <code>batch</code> work are <span class="tag tag-planned">specified</span>. Urgency is never a platform property, because platform properties are part of the action digest and urgency must not split the cache.</li>
+  <li><strong>Twins join.</strong> A new request for a hermetic action already in flight, under the same instance name, joins it as another waiter instead of queueing a second run.</li>
+  <li><strong>Admission counts CPUs, not memory.</strong> Room on a worker means free whole cores and GPUs and a memory request the node could ever give; what other leases hold of its memory never keeps an action out. An action's memory is the limit its cgroup first runs under, not a booking. The node's memory-pressure backstop pauses new starts, and the memory ladder (below) handles an action that outgrows its limit. This is why there is nothing to tune per action.</li>
+  <li><strong>Shutdown.</strong> A frontend that is stopping refuses new <code>Execute</code> calls with <code>UNAVAILABLE</code>, which Buck2 retries at open, and keeps the streams it has.</li>
+</ul>
+
+<h2 id="failures">Failure classes and retry budgets</h2>
+<p>When an action fails, the person reading the build log needs one answer first: is this mine to fix, or the farm's? The design names four classes:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Class</th><th>Meaning</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>Farm</td><td>The farm could not run the action, or ran it on a node unfit for it, or booked too little memory. The operator's or the farm's to fix.</td><td>Lost contact, a driver that failed around the action, a kill below the action's own limit.</td></tr>
+<tr><td>Request</td><td>The action cannot run as written, on any node. The client's to fix.</td><td>A command with no arguments, an image named by tag, a blob never uploaded.</td></tr>
+<tr><td>Action</td><td>It ran on a fit node and exited non-zero, passed its own timeout, or needs more memory than any node has.</td><td>A compile error, a failed assertion, a timeout.</td></tr>
+<tr><td>Ambiguous</td><td>It ran and failed in a way the farm cannot attribute yet; one rerun on another node decides.</td><td>A SIGKILL kbf did not send. <span class="tag tag-planned">specified</span></td></tr>
+</tbody></table></div>
+<p>The rule behind them is that <em>a farm-side problem never reaches the client as the action's exit code</em>: an answer of OK means a fit node ran the action to the end. A request error is never <code>INTERNAL</code>, because the client would wait for an operator who has nothing to fix. A test failure and a test error are both the action's, and the farm passes them through untouched. The class names are the design; what the code carries today is the set of outcomes and budgets below.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>What happened</th><th>Budget</th><th>When the budget is spent</th></tr></thead>
+<tbody>
+<tr><td>A farm fault: a busy node's memory kill below the action's limit, a run the daemon reports lost, a failure of the driver around the action, a lease given up because its daemon was proven stopped, or given up after silence or replacement</td><td>2 reruns, so at most 3 runs end this way. A rerun prefers a node none of those runs ended on.</td><td><code>INTERNAL</code>, naming the last node, what ended each run and the operator's fix.</td></tr>
+<tr><td>A lease that never started: the node heartbeats but never listed it</td><td>3 per operation, each avoiding that node. It spends none of the farm budget, because a run that never started is always safe to run elsewhere.</td><td>The operation ends as a farm failure.</td></tr>
+<tr><td>A lease lost, by silence, replacement, restart or reconnect</td><td>3 per operation, counted apart from the budgets above, so an action that takes its host down is counted whichever process notices.</td><td>The operation is refused with <code>FAILED_PRECONDITION</code> and the reason, instead of being requeued for ever.</td></tr>
+<tr><td>The action passed its own memory limit</td><td>The memory ladder: rerun one rung up (4, 16, 32 GiB by default), then on a whole host. A rung not below the largest node that could run it is skipped. The raised booking is remembered per action key as a floor, so a known-big action starts where it fit.</td><td><code>FAILED_PRECONDITION</code>, "the action needs more memory than any node offers", with the reason <code>ACTION_OUT_OF_MEMORY</code>. This is the action's class: it needed more than the farm has.</td></tr>
+<tr><td>A missing input blob</td><td>None. Rerunning fails the same way until the client uploads it.</td><td><code>FAILED_PRECONDITION</code> with the <code>MISSING</code> list, at once.</td></tr>
+<tr><td>A timeout</td><td>None. The client set the limit.</td><td><code>DEADLINE_EXCEEDED</code>, with the digests of the partial stdout and stderr when the CAS holds them. A paused or frozen node is not a timeout; it is a lost run.</td></tr>
+<tr><td>An action that cannot run as written</td><td>None.</td><td><code>INVALID_ARGUMENT</code> with the daemon's reason. Never retried, never cached.</td></tr>
+</tbody></table></div>
+<ul>
+  <li><strong>The budgets do not mix.</strong> A rung of the ladder is not a farm rerun and a farm rerun is not a rung, so a long ladder never takes a fault's reruns and faults never stop the ladder short of the cap. With the default ladder an operation runs at most 1 + 3 + 2 times for these causes.</li>
+  <li><strong>What is not charged.</strong> A lease given up for reconnection or a session switch never ran, so it spends no budget.</li>
+  <li><strong>Nothing a lost run produced reaches the action cache.</strong> A killed run sends no result, a lost result never completes an operation, and a late result from a lease that was given up is refused once the operation holds a new lease. Only a successful, cacheable result is written, and before the callers are answered.</li>
+  <li><strong>Execution is at-least-once, with fenced results.</strong> A partitioned daemon can run past its lease, and its result is rejected. Content-addressed outputs make a stale upload junk, never corruption. <span class="tag tag-ok">works today</span></li>
+</ul>
+<p>Ambiguous reruns, flake tracking per action digest, known failure signatures after a run, and alerts for a node that needs a person are in <a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/design/failure-classes.md">the failure-classes design</a> and are <span class="tag tag-planned">specified</span>. So is retrying a failure the daemon cannot classify beyond the farm-fault budget above.</p>
+
+<h2 id="placement">Placement</h2>
+<p>A placement round walks the queue in order and gives each operation to one worker. At most 256 grants are made per round, so one log flush covers a round, and a round runs after every input and once a second when nothing changes.</p>
+<ol class="steps">
+  <li>
+    <h3>Feasible, then room <span class="tag tag-ok">works today</span></h3>
+    <p>A worker is a candidate if it was heard from within the 60-second lease grace, is not cordoned and not paused by its phase, reports a driver that serves the lease kind (<code>container</code>, <code>native</code> or <code>fake</code> for <code>action</code>; <code>native-whole-machine</code> for <code>whole_machine</code>), and its report satisfies the action's platform (<code>OSFamily</code>, ISA, <code>xcode</code>, <code>gpu</code> and the rest). A Mac is never the least loaded worker for Linux work, because the platform is decided first and the load only ranks the workers that pass.</p>
+  </li>
+  <li>
+    <h3>Spread by dominant booked share <span class="tag tag-ok">works today</span></h3>
+    <p>Among the candidates with room, the worker with the least booked as a share of its capacity gets the lease. The share is the larger of its CPU share and its memory share, compared exactly in integers so a replay chooses the same worker. Ties go to the worker with the fewest leases, then to the first by name. A share is not capped at 1: a worker booked past its memory is still more loaded than one booked less.</p>
+    <p>The reason is that a node out of cores runs its actions slowly and a node out of memory kills them, so both count. Spreading keeps work off a node that is about to be the one that hurts. The price, which the scheduler design states, is that a large action is likelier to wait than under first-fit: with eight one-core leases on two eight-core workers, first-fit leaves one worker empty and a six-core action runs at once, while spreading leaves four on each and it waits.</p>
+  </li>
+  <li>
+    <h3>A size, not a reservation <span class="tag tag-ok">works today</span></h3>
+    <p>Every action books one core and 4 GiB, the first rung of the memory ladder, unless it names a size with <code>kbf-book-cpus</code> and <code>kbf-book-mem-gib</code> (whole numbers in plain digits, because <code>+4</code> and <code>04</code> would book the same as <code>4</code> under a different action digest and miss its cache entries). A worker's capacity is read from its own report: <code>cpus</code> times 1000 millicores, memory in GiB, GPUs.</p>
+  </li>
+  <li>
+    <h3>Whole-machine leases <span class="tag tag-ok">works today</span></h3>
+    <p>Some work needs the whole machine: UI tests that need a logged-in session, anything that must not share a Mac. A lease with <code>kbf-lease=whole_machine</code> goes only to a worker that holds no lease and is at least as large as the request, and books all of it. If it fits nowhere, it <em>holds</em> one feasible worker: the one it held last round while that one still could, else the one with the fewest leases. No operation after it in queue order, less urgent or younger, is placed there, so the worker empties as its leases end. Operations before it still are placed. No lease is ever stopped for it.</p>
+    <p>An ordinary action at a worker's whole memory, the last rung of the ladder, also needs a worker with no lease, but it holds no worker. Under sustained spread load that wait can be long, and nothing reserves a worker for it; callers wait. A reservation for large actions is <span class="tag tag-planned">specified</span>.</p>
+  </li>
+  <li>
+    <h3>Reruns avoid the node that failed <span class="tag tag-ok">works today</span></h3>
+    <p>A rerun of a farm fault is placed on a live, serving node that none of its failed runs ended on, and waits for one while any could run it after its bookings end. On a farm of one node it takes the same node.</p>
+  </li>
+</ol>
+<p>Other placement controls: <code>--reserve-cpus</code> leaves CPUs for the farm's own processes, with no pinning of leases; <code>--lease-placement=numa-node</code> puts each lease on one NUMA node's CPUs and memory. <span class="tag tag-planned">specified</span> are scoring beyond the spread (alignment of the request with free room, inputs already on the worker, best fit to keep large holes free), learned action sizes with a margin that shrinks as samples grow, memory that is booked but unused lent to <code>batch</code> work, and protected floors a node keeps for other services.</p>
+
+<h2 id="updates">Zero-downtime updates</h2>
+<p>The constraints came first. A restart of the frontend fails every build in flight, because in our reading Buck2 does not recover an <code>Execute</code> stream that breaks after it started. And a busy farm is never idle, so waiting for a quiet moment does not work. So an update has to move one piece at a time while the rest keeps serving. <a href="updates.html">The updates page</a> has the sequence and what is built; these are the decisions behind it.</p>
+<ul>
+  <li><strong>Frontend first, and every pair of releases is within one step.</strong> A new frontend serves old nodes, so nodes can never be ahead of it on an upgrade, and the order of nodes does not matter for correctness. Going back across a protocol change reverses the order; if no order works, the change is a flag day.</li>
+  <li><strong>One writer decides at a time.</strong> During a frontend swap two processes overlap, so scheduling is fenced by a generation held in the state store: each write checks it in its own transaction, and after takeover the old process can finish its open streams from rows the new one writes but cannot schedule. That is why the overlap needs Postgres, since a SQLite state file is held by one process, and why the proxy that routes streams never sends <code>GOAWAY</code>: a stream stays with the process it started on.</li>
+  <li><strong>Streams are never cut by choice.</strong> A stopping frontend refuses new calls and keeps its open ones, with no deadline by default; the old process is signalled only when it holds nothing, and never killed.</li>
+  <li><strong>A planned restart is not a failure.</strong> A storage node is marked <code>planned_down</code> before it restarts, so writes skip it at once instead of failing for the 15 seconds until its membership row lapses, and reads fail over. It is not <code>draining</code>, which would start moving the node's whole shard for a one-minute restart.</li>
+  <li><strong>One storage node at a time.</strong> With two copies of every blob, two nodes down lose data. A node updates only when every other member is <code>active</code> and fresh, no copy is owed, and the node has no open writes. Daemon-only hosts have no such coupling and go up to a set number at a time.</li>
+  <li><strong>Capacity beats the update.</strong> An operator can set a floor, <code>min_serving</code>, so that a host is cordoned only while that many others of its platform stay; it is 0 by default, which is no floor. The wait for a host's leases ends at a limit, after which it is uncordoned and tried later.</li>
+  <li><strong>Every unknown fails closed.</strong> A missing metric is never zero. A failure after the activate order holds the run for a person instead of retrying or skipping the host.</li>
+  <li><strong>Trial, then keep.</strong> A new release runs on trial. It is kept only if it reports healthy and a confirm lands inside the window; a crash loop reverts it within a few starts. The previous release is only ever one that was confirmed.</li>
+  <li><strong>Root does the little it must.</strong> kbf never installs, downloads or restarts anything. A separate root tool downloads through an unprivileged user, verifies the release against its attestation and the order's commit, and runs the new binary's self-report before it moves a link. The source of releases is read from the installer's own file, never from an order, so a compromised kbf can drop or delay an update and cannot make the host run an unattested one.</li>
+  <li><strong>Rollback is the same mechanism</strong> with the old release as the target. It is not available across a one-way change, which the page names before you start: a metadata-log raise, a schema contract and a protocol floor.</li>
+</ul>
+<p>What is built and what is not is on <a href="updates.html#status">the updates page</a>, including that the installer's downloader is not wired in yet.</p>
+
+<h2 id="rules">Rules the code keeps</h2>
+<ul>
+  <li><strong>Commit before Start.</strong> Placing an operation only proposes the grant. The daemon gets <code>Start</code> after the grant is written, never for a grant that stopped being current. A lease the store does not know can never run.</li>
+  <li><strong>One accepted result per operation,</strong> from the lease the operation currently holds, and only if every output it names is already stored.</li>
+  <li><strong>Two clocks keep copies apart.</strong> The scheduler gives up every lease on a worker it has not heard from for 60 seconds; a worker stops self-fenced work 40 seconds after the newest heartbeat the scheduler acknowledged was sent. A margin covers a change of process, and the constants are checked at compile time so a change cannot break the order.</li>
+  <li><strong>Present means durable.</strong> A blob is acknowledged and reported present only once its bytes are stored and its place is committed; every byte is checked against its digest on upload and on read; a hit never points at missing files.</li>
+  <li><strong>Settings are flags or keys of one file.</strong> A secret is never a value: the key holds the path of a file. The object store's key pair is the one exception, taken from the standard <code>AWS_</code> variables.</li>
+  <li><strong>Nothing asserts a speed.</strong> Tests do not depend on timing, and every test has been seen failing on a planted defect.</li>
+</ul>
+<p>Read <a href="story.html">the story</a> for how a farm of laptops became this one, or <a href="quickstart.html">start a farm</a>.</p>

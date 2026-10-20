@@ -1,6 +1,8 @@
 // Builds dist/: the prerendered pages and the hashed assets, then checks the result (check-dist.ts).
 //
-//   dist/index.html, 404.html, <route>/index.html   the pages (pages.ts), around the copy in content/ (layout.ts)
+//   dist/index.html, 404.html, <route>/index.html   the pages (pages.ts), around the copy in content/ (layout.ts);
+//                                                   /docs/config/ generated from the goldens (config.ts); /docs/ and
+//                                                   /docs/<slug>/ from the docs table and the repo's Markdown (docs.ts)
 //   dist/assets/<id>/                               the browser modules (build/browser, from tsc), the recorded data
 //                                                   as modules (data/<name>.js, from content/data/<name>.json) and
 //                                                   the stylesheets of static/
@@ -13,8 +15,10 @@ import { createHash } from 'crypto';
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { checkDist, importsOf, listFiles } from './check-dist';
-import { renderPage, STYLESHEETS } from './layout';
-import { outPath, PAGES, rewriteLinks } from './pages';
+import { configMain, readGoldens } from './config';
+import { buildDocPages, type DocPage, docsIndexMain } from './docs';
+import { DOCS_STYLESHEET, renderPage, STYLESHEETS } from './layout';
+import { outPath, type Page, PAGES, rewriteLinks } from './pages';
 
 export interface BuildOptions {
   /** tsc's browser output (build/browser): the modules the pages load and what they import. */
@@ -23,6 +27,8 @@ export interface BuildOptions {
   staticDir: string;
   /** site/content: the page copy (<name>.html) and the recorded data (data/<name>.json). */
   contentDir: string;
+  /** The repository root: the Markdown the docs table names and the goldens of the configuration page. */
+  repoRoot: string;
   /** Emptied and rewritten. */
   outDir: string;
   /** Run check-dist on the result (default). The tests turn it off to run each check on its own. */
@@ -70,6 +76,16 @@ function write(path: string, data: string | Buffer): void {
   writeFileSync(path, data);
 }
 
+/** The inside of <main> of a page of pages.ts: its copy in content/, or the generated page. */
+function mainOf(page: Page, opts: BuildOptions, docPages: readonly DocPage[]): string {
+  if (page.generated === 'config') return configMain(readGoldens(opts.repoRoot));
+  if (page.generated === 'docs-index') {
+    const hand = PAGES.filter((p) => p.indexed !== undefined).map((p) => ({ route: p.route, title: p.title, summary: p.description, status: p.indexed as NonNullable<Page['indexed']> }));
+    return docsIndexMain(docPages, hand);
+  }
+  return rewriteLinks(readFileSync(join(opts.contentDir, `${page.source}.html`), 'utf8'), PAGES);
+}
+
 export function buildSite(opts: BuildOptions): { id: string; files: string[] } {
   const compiled = new Map<string, Buffer>();
   for (const f of listFiles(opts.browserDir)) {
@@ -84,16 +100,18 @@ export function buildSite(opts: BuildOptions): { id: string; files: string[] } {
   for (const e of entries) if (!compiled.has(e)) throw new Error(`build: ${e} is missing; run tsc -p tsconfig.browser.json first`);
   const assets = new Map<string, Buffer>();
   for (const m of moduleGraph(compiled, entries)) assets.set(m, compiled.get(m) as Buffer);
-  for (const css of STYLESHEETS) assets.set(css, readFileSync(join(opts.staticDir, css)));
+  for (const css of [...STYLESHEETS, DOCS_STYLESHEET]) assets.set(css, readFileSync(join(opts.staticDir, css)));
 
   const id = assetId(assets);
   const refs = { base: `/assets/${id}/` };
 
   rmSync(opts.outDir, { recursive: true, force: true });
   for (const [path, bytes] of assets) write(join(opts.outDir, 'assets', id, path), bytes);
-  for (const page of PAGES) {
-    const main = rewriteLinks(readFileSync(join(opts.contentDir, `${page.source}.html`), 'utf8'), PAGES);
-    write(join(opts.outDir, outPath(page.route)), renderPage(page, main, refs));
+  const docPages = buildDocPages(opts.repoRoot);
+  for (const page of PAGES) write(join(opts.outDir, outPath(page.route)), renderPage(page, mainOf(page, opts, docPages), refs));
+  for (const d of docPages) {
+    const page: Page = { route: d.route, source: d.entry.slug, title: d.title, description: d.description, nav: 'docs', scripts: ['copy.js'], bands: false, docs: true };
+    write(join(opts.outDir, outPath(d.route)), renderPage(page, d.main, refs));
   }
 
   if (opts.check !== false) checkDist(opts.outDir);
@@ -107,6 +125,7 @@ if (require.main === module) {
     browserDir: join(site, 'build', 'browser'),
     staticDir: join(site, 'static'),
     contentDir: join(site, 'content'),
+    repoRoot: resolve(site, '..'),
     outDir: join(site, 'dist'),
   });
   process.stdout.write(`dist: ${files.length} files, assets/${id}/\n`);

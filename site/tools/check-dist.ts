@@ -16,6 +16,7 @@
 
 import { readdirSync, readFileSync, statSync } from 'fs';
 import { join, posix, relative, sep } from 'path';
+import { DOCS, docRoute } from './docs-table';
 import { outPath, PAGES } from './pages';
 
 /** Relative paths ('/'-separated) of the files under dir, sorted. */
@@ -48,7 +49,7 @@ export const THEME_CSS_MAX_BYTES = 24 * 1024;
 export const SITE_CSS_MAX_BYTES = 16 * 1024;
 export const PAGE_CSS_MAX_BYTES = 40 * 1024;
 
-export const REQUIRED: readonly string[] = PAGES.map((p) => outPath(p.route));
+export const REQUIRED: readonly string[] = [...PAGES.map((p) => p.route), ...DOCS.map(docRoute)].map(outPath);
 
 export class DistError extends Error {
   constructor(problems: string[]) {

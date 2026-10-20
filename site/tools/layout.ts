@@ -8,6 +8,9 @@ import { NAV, type Page, REPO_URL, SITE_NAME } from './pages';
 
 /** The stylesheets every page loads, in order: the theme (byte for byte the shared file), then the site's own. */
 export const STYLESHEETS = ['theme.css', 'site.css'] as const;
+/** The docs layout's own rules, loaded after the two above by the pages that set `docs` (pages.ts). */
+export const DOCS_STYLESHEET = 'docs.css';
+export const stylesheetsOf = (page: Page): readonly string[] => (page.docs ? [...STYLESHEETS, DOCS_STYLESHEET] : STYLESHEETS);
 
 export interface Assets {
   /** '/assets/<id>/' */
@@ -42,7 +45,7 @@ export function renderPage(page: Page, main: string, assets: Assets): string {
     `<title>${escapeText(`${page.title} - ${SITE_NAME}`)}</title>`,
     `<meta name="description" content="${escapeText(page.description)}">`,
     page.noindex ? '<meta name="robots" content="noindex">' : '',
-    ...STYLESHEETS.map((css) => `<link rel="stylesheet" href="${assets.base}${css}">`),
+    ...stylesheetsOf(page).map((css) => `<link rel="stylesheet" href="${assets.base}${css}">`),
     ...page.scripts.map((js) => `<script type="module" src="${assets.base}${js}"></script>`),
   ].filter((l) => l !== '');
   return [

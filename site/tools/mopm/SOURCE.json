@@ -1,0 +1,49 @@
+{
+  "repo": "komira-ai/mopm",
+  "commit": "9873b525ec8ad081b52ec853a2b2f2615ddd9d0d",
+  "root": "site/src",
+  "files": {
+    "doc.ts": {
+      "upstream": "26e65def928ea4b8735a946517ff4643f852109e68400a6a0a917d3e966bc79b"
+    },
+    "markdown/inline.ts": {
+      "upstream": "7c3f1ef3567318861a2960ce7ccc51d2a29a845431c295db3b89545e0ea2d42a"
+    },
+    "markdown/parse.ts": {
+      "upstream": "3e88abd61b3eed945b598c46d7aad2f74979e5b6a90258f99d2f4a794433880a"
+    },
+    "markdown/render.ts": {
+      "upstream": "3bca787cde853296b0b3a19cf199d9bfe88ed33f0618ea634e72128406e79c12"
+    },
+    "links.ts": {
+      "upstream": "d2de1db91b5596a810d4b644c13d708d9a2e6b188bbb850afb128a651fac496f",
+      "local": "68a8260c0073a314c0139dc5adbe328aaad16ff83872c6ef0192f4211a91e28b",
+      "patches": [
+        {
+          "upstream": "import { type SafeHref, URL_UNSAFE_CHAR } from './doc.js';\n",
+          "local": "import { DOCS } from '../docs-table.js';\nimport { type SafeHref, URL_UNSAFE_CHAR } from './doc.js';\n"
+        },
+        {
+          "upstream": "export const REPO_URL = 'https://github.com/komira-ai/mopm';",
+          "local": "export const REPO_URL = 'https://github.com/komira-ai/kbf';"
+        },
+        {
+          "upstream": "export const DOC_PAGES: readonly { slug: string; source: string }[] = [\n  { slug: 'mopm-toml', source: 'spec/mopm-toml.md' },\n  { slug: 'mopm-test', source: 'docs/mopm-test.md' },\n];",
+          "local": "export const DOC_PAGES: readonly { slug: string; source: string }[] = DOCS.map((d) => ({ slug: d.slug, source: d.source }));"
+        },
+        {
+          "upstream": "function repoLink(s: string, source: string): SafeHref | null {",
+          "local": "function repoLink(s: string, source: string, idPrefix: string): SafeHref | null {"
+        },
+        {
+          "upstream": "  return (site ? site + u.hash : u.href) as SafeHref;",
+          "local": "  // A fragment on a site page names a heading id of that page, which carries the prefix the renderer gives its ids.\n  return (site ? site + (fragment(u.hash.slice(1), idPrefix) ?? '') : u.href) as SafeHref;"
+        },
+        {
+          "upstream": "return ctx.mode === 'docs' ? repoLink(s, ctx.source) : null;",
+          "local": "return ctx.mode === 'docs' ? repoLink(s, ctx.source, ctx.idPrefix) : null;"
+        }
+      ]
+    }
+  }
+}

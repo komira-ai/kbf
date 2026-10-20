@@ -1,4 +1,4 @@
-// Copy buttons for command blocks (.cmd and .code). Progressive enhancement: the pages read the same without it.
+// Copy buttons for command blocks (.cmd and .code) and the code blocks of the docs (.copy-box). Progressive enhancement: the pages read the same without it.
 // No inline style, no markup from strings.
 
 function addCopyButton(block: Element): void {
@@ -31,5 +31,5 @@ function addCopyButton(block: Element): void {
 }
 
 if (navigator.clipboard) {
-  for (const block of document.querySelectorAll('.cmd, .code')) addCopyButton(block);
+  for (const block of document.querySelectorAll('.cmd, .code, .copy-box')) addCopyButton(block);
 }

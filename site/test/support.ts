@@ -23,6 +23,7 @@ export function buildReal(name: string): string {
     browserDir: join(SITE, 'build', 'browser'),
     staticDir: join(SITE, 'static'),
     contentDir: join(SITE, 'content'),
+    repoRoot: REPO,
     outDir: out,
     check: false,
   });
