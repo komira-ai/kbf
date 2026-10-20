@@ -36,7 +36,7 @@ fn flags() -> Raw {
 
 fn local() -> LocalDatabase {
     flags()
-        .validate()
+        .validate(Platform::Linux)
         .expect("valid")
         .local_database
         .expect("a local database")
@@ -216,7 +216,11 @@ fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
     );
     let mut r = flags();
     r.database = Some("postgresql:///kbf?host=/run/postgresql&user=kbf&port=5433".to_owned());
-    let with_port = r.validate().expect("valid").local_database.expect("local");
+    let with_port = r
+        .validate(Platform::Linux)
+        .expect("valid")
+        .local_database
+        .expect("local");
     assert_eq!(with_port.port, Some(5433));
     assert_eq!(format!("{with_port:?}"), "LocalDatabase { .. }");
 
@@ -258,7 +262,7 @@ fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
     for (url, why) in cases {
         let mut r = flags();
         r.database = Some(url.to_owned());
-        let problems = r.validate().expect_err(url).join("; ");
+        let problems = r.validate(Platform::Linux).expect_err(url).join("; ");
         assert!(problems.contains(why), "{url}: {problems}");
         no_names(&problems);
     }
@@ -274,7 +278,12 @@ fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
     ] {
         let mut r = flags();
         r.database = Some(url);
-        assert!(r.validate().expect_err("over 63").join("; ").contains(why));
+        assert!(
+            r.validate(Platform::Linux)
+                .expect_err("over 63")
+                .join("; ")
+                .contains(why)
+        );
     }
     let mut at_limit = flags();
     at_limit.database = Some(format!(
@@ -282,19 +291,22 @@ fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
         "d".repeat(63),
         "r".repeat(63)
     ));
-    assert!(at_limit.validate().is_ok());
+    assert!(at_limit.validate(Platform::Linux).is_ok());
 
     let mut r = flags();
     r.database = None;
     assert!(
-        r.validate()
+        r.validate(Platform::Linux)
             .expect_err("no url")
             .join("; ")
             .contains("--create-local-database needs --database")
     );
     let mut r = raw(Mode::Daemon);
     r.create_local_database = true;
-    let why = r.validate().expect_err("a node keeps no state").join("; ");
+    let why = r
+        .validate(Platform::Linux)
+        .expect_err("a node keeps no state")
+        .join("; ");
     assert!(
         why.contains("--create-local-database is for the modes"),
         "{why}"
@@ -302,7 +314,10 @@ fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
     let mut r = raw(Mode::Daemon);
     r.database = Some(URL.to_owned());
     r.create_local_database = true;
-    let why = r.validate().expect_err("a node keeps no state").join("; ");
+    let why = r
+        .validate(Platform::Linux)
+        .expect_err("a node keeps no state")
+        .join("; ");
     assert!(
         why.contains("--create-local-database is for the modes"),
         "{why}"
@@ -317,7 +332,7 @@ fn the_flag_takes_the_recipe_url_and_refuses_what_it_cannot_make() {
 fn a_database_url_names_its_role() {
     let mut r = raw(Mode::Frontend);
     r.database = Some("postgres:///secretdb?host=/run/secretsock".to_owned());
-    let why = r.validate().expect_err("no role").join("; ");
+    let why = r.validate(Platform::Linux).expect_err("no role").join("; ");
     assert!(why.contains("names no role: add user=ROLE"), "{why}");
     no_names(&why);
 }
@@ -816,7 +831,7 @@ fn a_name_that_could_leave_its_quotes_is_refused_for_the_role_and_the_database()
                 let mut r = flags();
                 r.database = Some(url.clone());
                 let problems = r
-                    .validate()
+                    .validate(Platform::Linux)
                     .expect_err(&format!("{what} ({c:?}) accepted in {url:?}"))
                     .join("; ");
                 assert!(!problems.contains("secret"), "{what}: {problems}");
@@ -907,7 +922,7 @@ fn a_database_url_with_more_than_one_host_or_port_is_refused() {
             let mut r = flags();
             r.database = Some(url.to_owned());
             r.create_local_database = create;
-            let problems = r.validate().expect_err(url).join("; ");
+            let problems = r.validate(Platform::Linux).expect_err(url).join("; ");
             assert!(problems.contains("one server"), "{url}: {problems}");
             no_names(&problems);
         }
@@ -928,7 +943,7 @@ fn both_schemes_give_the_same_settings_and_no_ident_map_name_is_read() {
             "{scheme}:///kbf?host=/run/postgresql&user=kbf-server"
         ));
         r.create_local_database = true;
-        let valid = r.validate().expect("valid");
+        let valid = r.validate(Platform::Linux).expect("valid");
         let local = valid.local_database.expect("local");
         (local.role, local.name, local.socket_dir, local.port)
     };
@@ -987,7 +1002,11 @@ fn the_urls_port_reaches_psql() {
     let mut r = flags();
     r.database =
         Some("postgres:///secretdb?host=/run/secretsock&user=secretrole&port=5433".to_owned());
-    let with_port = r.validate().expect("valid").local_database.expect("local");
+    let with_port = r
+        .validate(Platform::Linux)
+        .expect("valid")
+        .local_database
+        .expect("local");
     let world = Shared::default();
     let exec = exec_on(&world);
     let superuser = linux()
@@ -1015,7 +1034,7 @@ fn an_empty_role_or_database_name_is_refused() {
     ] {
         let mut r = flags();
         r.database = Some(url.to_owned());
-        let problems = r.validate().expect_err(url).join("; ");
+        let problems = r.validate(Platform::Linux).expect_err(url).join("; ");
         no_names(&problems);
     }
 }

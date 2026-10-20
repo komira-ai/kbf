@@ -115,13 +115,10 @@ impl Cas for CountingCas {
     }
 }
 
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-driver-container-uploads")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    let root =
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-driver-container-uploads");
+    kbf_testkit::dir::TestDir::under(root, name)
 }
 
 async fn collect_out(cas: &CountingCas, upper: &std::path::Path) -> (ActionResult, Tree) {

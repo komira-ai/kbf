@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use super::*;
 use kbf_host::testkit::{FakeExec, reply};
+use kbf_testkit::dir::TestDir;
 
 fn argv(args: &[&str]) -> Vec<OsString> {
     std::iter::once("kbf-deploy")
@@ -480,64 +481,14 @@ fn render_units_then_check_units_with_a_mode_exit_0_and_a_broken_unit_exits_1() 
     ];
     let (code, out, err) = cli(&mut exec, &no_env, &check);
     assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
-    assert_eq!(
-        out,
-        "SKIP parse: no kbf binary at /usr/local/bin/kbf, so the flags of kbf daemon were \
-         not parsed; give --kbf-bin PATH to parse them with another\n\
-         UNIT OK: kbf-daemon.service runs kbf daemon\n"
-    );
-    // --kbf-bin reaches the parse rule, and needs --mode.
-    let check: Vec<&str> = check
-        .iter()
-        .copied()
-        .chain(["--kbf-bin", "/opt/kbf/kbf"])
-        .collect();
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
     assert_eq!(out, "UNIT OK: kbf-daemon.service runs kbf daemon\n");
-    let asked = exec
-        .queries
-        .borrow()
-        .last()
-        .map(|c| (c.program.to_string(), c.args[..2].to_vec()));
-    assert_eq!(
-        asked,
-        Some((
-            "/opt/kbf/kbf".to_owned(),
-            vec!["check-args".to_owned(), "daemon".to_owned()]
-        ))
-    );
-    let no_mode = [
-        "linux",
-        "check-units",
-        "--config",
-        LINUX_CONFIG,
-        "--dir",
-        units,
-        "--kbf-bin",
-        "/opt/kbf/kbf",
-    ];
-    let (code, _, err) = cli(&mut exec, &no_env, &no_mode);
+    // The kbf is never run: kbf's own tests parse the units (`--kbf-bin` is retired).
+    assert!(exec.queries.borrow().is_empty());
+    let mut retired = check.to_vec();
+    retired.extend(["--kbf-bin", "/opt/kbf/kbf"]);
+    let (code, _, err) = cli(&mut exec, &no_env, &retired);
     assert_eq!(code, ExitCode::from(2), "{err}");
-    assert!(err.contains("--mode"), "{err}");
-    // A --kbf-bin that is not absolute, or cannot be run, is refused: the flags went
-    // unparsed.
-    let relative: Vec<&str> = check[..check.len() - 1]
-        .iter()
-        .copied()
-        .chain(["kbf"])
-        .collect();
-    let (code, _, err) = cli(&mut exec, &no_env, &relative);
-    assert_eq!(code, ExitCode::from(2), "{err}");
-    assert!(err.contains("--kbf-bin: \"kbf\" is not absolute"), "{err}");
-    exec.answer = Box::new(|_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
-    let (code, out, err) = cli(&mut exec, &no_env, &check);
-    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
-    assert!(
-        err.contains("cannot run /opt/kbf/kbf check-args: permission denied"),
-        "{err}"
-    );
-    exec.answer = Box::new(|_| Ok(kbf_host::testkit::reply(0, "", "")));
+    assert!(err.contains("--kbf-bin"), "{err}");
 
     let unit = format!("{units}/kbf-daemon.service");
     let text = std::fs::read_to_string(&unit).expect("rendered");
@@ -650,7 +601,8 @@ fn the_mdm_verbs_exit_0_done_1_failed_2_refused() {
     assert!(err.starts_with("kbf-deploy: step 0 ("), "{err}");
 
     // A dry run of a fetch into an empty directory: every pinned archive, exit 0.
-    let dir = std::env::temp_dir().join(format!("kbf-deploy-cli-fetch.{}", std::process::id()));
+    let own = TestDir::under(std::env::temp_dir(), "kbf-deploy-cli-fetch");
+    let dir = own.join("archives");
     let mut exec = FakeExec::new(501);
     let dir_arg = dir.to_string_lossy().into_owned();
     let (code, out, err) = cli(

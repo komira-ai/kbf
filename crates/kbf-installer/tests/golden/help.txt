@@ -15,6 +15,7 @@ Commands:
   rollback    Point `current` at `previous`, with no confirm window
   gc          Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
   boot-check  Run before each start of a release on trial; counts the start
+  migrate     Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's tree, or put it back with `--rollback`. A dry run without `--apply`
   quiesce     For maintainer scripts: take the lock; exit 5 while a swap is pending
   check       Validate the installer's configuration, trust files and path chain
   proxy       Serve the frontend host's public port: route each stream to the active child frontend
@@ -64,7 +65,7 @@ Options:
       --no-start
           Enable the units without starting them
       --installer-config <INSTALLER_CONFIG>
-          The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root. The same flag, with the same meaning, as on `run` [default: /etc/kbf/installer.toml]
+          The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which is the only value setup accepts. The same flag, with the same meaning, as on `run`
   -h, --help
           Print help
 
@@ -93,7 +94,7 @@ Options:
       --orders-dir <ORDERS_DIR>
           The order spool: owned by the service user, mode 0700, inside a root-owned parent [default: /var/lib/kbf-installer/orders]
       --unit <UNIT>
-          The systemd unit to restart after a swap (Linux)
+          The systemd unit to restart after a swap (Linux). Without it and without `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one packaged kbf-installer.service serves every mode
       --launchd-label <LAUNCHD_LABEL>
           The launchd label to kickstart after a swap (macOS)
       --window-secs <WINDOW_SECS>
@@ -105,7 +106,7 @@ Options:
       --passes <PASSES>
           Stop after this many passes (a rehearsal or a test); without it, run until stopped
       --installer-config <INSTALLER_CONFIG>
-          installer.toml, under the host root: its `database` key is the state database the installer migrates to what a release needs before that release is activated. Required when the unit restarted after a swap is a frontend's or the all-in-one's
+          installer.toml, under the host root: its `database` key is the state database the installer migrates to what a release needs before that release is activated. Required when the unit restarted after a swap is a frontend's or the all-in-one's, unless the unit comes from kbf.toml's mode (no --unit): then the host's installer.toml (/etc/kbf, /usr/local/etc/kbf on a Mac) is the default
   -h, --help
           Print help
 
@@ -207,7 +208,7 @@ Serve the frontend host's public port: route each stream to the active child fro
 Usage: kbf-installer proxy [OPTIONS]
 
 Options:
-      --config <CONFIG>  The installer.toml whose `[proxy]` table configures the proxy [default: /etc/kbf/installer.toml]
+      --config <CONFIG>  The installer.toml whose `[proxy]` table configures the proxy (default: the platform's, `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac)
       --json             Print the result as one JSON object on standard output
       --apply            Do what the verb says. Without it a mutating verb is a dry run
       --check            Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing

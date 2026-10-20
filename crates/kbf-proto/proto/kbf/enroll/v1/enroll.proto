@@ -129,7 +129,8 @@ enum CredentialMode {
 
 // What a node pulls from its frontend; never a secret.
 message NodeConfig {
-  // Strictly increases at every change.
+  // A digest of the rest of this message, never 0: it differs when any other field
+  // does. Not ordered; `RenewRequest.config_generation` is compared for equality.
   uint64 generation = 1;
   // Granted roles, "storage" and "daemon"; they decide the node's mode.
   repeated string roles = 2;
