@@ -421,12 +421,11 @@ mod tests {
                 args.iter().all(|arg| {
                     assert_eq!(arg["index"], 0, "personality has one argument");
                     let value = arg["value"].as_u64().expect("value");
-                    match arg["op"].as_str().expect("op") {
-                        "SCMP_CMP_EQ" => persona == value,
-                        "SCMP_CMP_MASKED_EQ" => {
-                            persona & value == arg["valueTwo"].as_u64().expect("valueTwo")
-                        }
-                        other => panic!("unexpected comparison {other}"),
+                    if arg["op"] == "SCMP_CMP_EQ" {
+                        persona == value
+                    } else {
+                        assert_eq!(arg["op"], "SCMP_CMP_MASKED_EQ");
+                        persona & value == arg["valueTwo"].as_u64().expect("valueTwo")
                     }
                 })
             })
