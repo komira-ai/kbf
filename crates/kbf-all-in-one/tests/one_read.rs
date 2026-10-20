@@ -279,7 +279,10 @@ async fn a_blob_over_5_gib_is_not_refused_for_its_size() {
 
 /// One small output file collected through a lease of a plane without a tier, whose
 /// cold store has the free-space floor `floor`.
-async fn collect_small_file(name: &str, floor: u64) -> Result<(), kbf_driver_container::tree::TreeError> {
+async fn collect_small_file(
+    name: &str,
+    floor: u64,
+) -> Result<(), kbf_driver_container::tree::TreeError> {
     let dir = scratch(name);
     let plane = plane_with_floor(&dir.join("server"), false, Some(floor)).await;
     let upper = dir.join("upper");
