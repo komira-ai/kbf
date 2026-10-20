@@ -314,6 +314,8 @@ fn plain_text_storage_is_for_loopback_only() {
         "http://127.0.0.1:8990",
         "http://localhost:8990",
         "http://[::1]:8990",
+        "http://localhost",
+        "http://[::1]",
     ] {
         let raw = Raw {
             kbf: KbfFlags {
@@ -421,4 +423,97 @@ fn flags_that_come_together_are_refused_alone() {
         panic!("{err:?}");
     };
     assert_eq!(found.len(), 2, "{found:#?}");
+}
+
+/// Catches the edges of a value getting through: a path with a newline and no dashes, a path
+/// longer than 4096 bytes, an empty node id and one a byte too long, a URL with no host, an
+/// empty host with a port, a port that is not a number or does not fit, and a file the host
+/// cannot look at; each is refused naming the flag, never the value.
+#[test]
+fn the_edges_of_a_value_are_refused() {
+    let long_path = format!("/etc/kbf/{}", "a".repeat(5000));
+    let long_id = "a".repeat(64);
+    type Set = fn(&mut KbfFlags, &str);
+    let cases: [(Mode, &str, Set, &str); 8] = [
+        (
+            Mode::Frontend,
+            "reapi-tls-cert",
+            |k, v| k.reapi_tls_cert = some(v),
+            "/etc/kbf/new\nline.pem",
+        ),
+        (
+            Mode::Frontend,
+            "reapi-tls-cert",
+            |k, v| k.reapi_tls_cert = some(v),
+            &long_path,
+        ),
+        (Mode::AllInOne, "node-id", |k, v| k.node_id = some(v), ""),
+        (
+            Mode::AllInOne,
+            "node-id",
+            |k, v| k.node_id = some(v),
+            &long_id,
+        ),
+        (
+            Mode::Frontend,
+            "storage-url",
+            |k, v| k.storage_url = some(v),
+            "https://",
+        ),
+        (
+            Mode::Frontend,
+            "storage-url",
+            |k, v| k.storage_url = some(v),
+            "https://:8983",
+        ),
+        (
+            Mode::Frontend,
+            "storage-url",
+            |k, v| k.storage_url = some(v),
+            "https://host.example:99999",
+        ),
+        (
+            Mode::Frontend,
+            "storage-url",
+            |k, v| k.storage_url = some(v),
+            "https://host.example:port",
+        ),
+    ];
+    for (mode, flag, set, value) in cases {
+        let mut flags = base(mode);
+        set(&mut flags, value);
+        let (err, exec) = refused(mode, flags);
+        let shown = err.to_string();
+        assert!(shown.contains(&format!("--{flag}:")), "{flag}: {shown}");
+        if value.len() > 1 {
+            assert!(!shown.contains(value), "{flag}: {shown}");
+        }
+        assert_eq!(err.exit(), Exit::Usage, "{flag}");
+        assert!(exec.log.is_empty(), "{flag}");
+    }
+    // A host that cannot say what is at a path (the fake's `/unreadable`) is a refusal too.
+    let mut flags = frontend_flags();
+    flags.reapi_tls_cert = some("/unreadable");
+    let (err, _) = refused(Mode::Frontend, flags);
+    assert!(
+        err.to_string()
+            .contains("--reapi-tls-cert: cannot be looked at"),
+        "{err}"
+    );
+}
+
+/// Catches a URL with no port being refused, or one with a port in the wrong place being
+/// accepted: `https://host` is the default port and passes with the client files.
+#[test]
+fn an_https_storage_url_may_leave_the_port_out() {
+    let raw = Raw {
+        kbf: KbfFlags {
+            storage_url: some("https://storage.example"),
+            ..frontend_flags()
+        },
+        ..raw(Mode::Frontend)
+    };
+    let mut exec = host_for(&raw);
+    go_ok(&FakeOs::linux(), &mut exec, &raw);
+    assert!(text(&exec, KBF_TOML).contains("storage = \"https://storage.example\""));
 }

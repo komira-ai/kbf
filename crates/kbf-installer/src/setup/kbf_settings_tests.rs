@@ -481,6 +481,11 @@ fn a_file_that_is_not_what_its_kind_needs_is_refused_before_anything_is_written(
     let mut exec = host_for(&raw);
     put(&mut exec, "/etc/kbf/reapi.key", 0o700, KBF_SERVER, "key");
     go_ok(&FakeOs::linux(), &mut exec, &raw);
+    // A certificate the service user owns passes as root's does.
+    let raw = frontend();
+    let mut exec = host_for(&raw);
+    put(&mut exec, "/etc/kbf/ca.pem", 0o644, KBF_SERVER, "cert");
+    go_ok(&FakeOs::linux(), &mut exec, &raw);
     // The all-in-one daemon half's files get the same look.
     let raw = all_in_one();
     let mut exec = host_for(&raw);
