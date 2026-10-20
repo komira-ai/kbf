@@ -628,6 +628,7 @@ fn a_probe_that_cannot_run_refuses() {
     assert!(NoProbe.meta_log(&commit, &tarball).is_err());
     assert!(HostProbe::at(&dir, false).is_ok());
     assert!(HostProbe::at(&dir, true).is_ok());
+    assert!(HostProbe::at(std::path::Path::new("relative/root"), false).is_err());
 }
 
 /// Proves `SHA256SUMS` is read as `<sha256>  <name>` lines and nothing looser: a binary mark,
@@ -688,4 +689,25 @@ fn the_bundle_reads_one_bounded_checksum_file() {
     assert!(read(&with(&[&big])).is_err());
     let whole = tarball(&[("SHA256SUMS", &[b'x'; 2000][..])]);
     assert!(read(&whole[..512 + 100]).is_err());
+}
+
+/// (c) Proves a bundle whose `SHA256SUMS` is the offer's set (the hash matches) but is not a
+/// checksum file is refused with the set's reason, not waved through: the hash names the
+/// bytes, and the bytes must still say which file is which.
+///
+/// Mutant planted: the parse error of the sums ignored (read as an empty list, so the file
+/// check refuses with another reason).
+#[test]
+fn sums_that_hash_right_but_do_not_parse_are_refused() {
+    let junk = b"this is not a checksum file\n".to_vec();
+    let mut fields = Fields::good();
+    fields.set_hash = SetHash::of_sums(&junk).as_str().to_owned();
+    let bundle = bundle_of(&files(), Some(&junk));
+    let (f, s) = deploy_with(
+        policy(Stage::Gamma, fields.doc()),
+        Some(bundle),
+        Ok(Some(4)),
+    );
+    refused(&f, &s, "offer_set_mismatch");
+    assert!(s.detail.contains("SHA256SUMS line 1"), "{}", s.line());
 }
