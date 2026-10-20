@@ -69,7 +69,7 @@ async fn fetch(
     fake: &FakeRegistry,
     image: &Image,
     name: &str,
-) -> (std::path::PathBuf, Result<Vec<kbf_image::LayerFile>, Error>) {
+) -> (support::Scratch, Result<Vec<kbf_image::LayerFile>, Error>) {
     let dir = scratch(name);
     let got = registry_for(fake)
         .fetch(&image_ref(fake, image), &dir)
