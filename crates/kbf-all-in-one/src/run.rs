@@ -343,7 +343,7 @@ mod tests {
         });
         let failed = drain_then_stop(&tokio, beside, stop, || Err("no scratch".into()));
         assert_eq!(
-            failed.err().expect("failed").said("storage"),
+            failed.expect_err("failed").said("storage"),
             "daemon: no scratch"
         );
 
@@ -356,7 +356,7 @@ mod tests {
             })
         });
         let failed = drain_then_stop(&tokio, beside, stop, || Ok(()));
-        let said = failed.err().expect("failed").said("storage");
+        let said = failed.expect_err("failed").said("storage");
         assert!(
             said.starts_with("the storage half stopped: bind 127.0.0.1:1"),
             "{said}"
@@ -444,7 +444,7 @@ mod tests {
         let refused: Starter = Box::new(|_| Err("no scratch".into()));
         let failed = with_draining_daemon(&tokio, serving, stop, refused, &cli);
         assert_eq!(
-            failed.err().expect("refused").said("storage"),
+            failed.expect_err("refused").said("storage"),
             "daemon: no scratch"
         );
     }
