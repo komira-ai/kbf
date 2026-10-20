@@ -1050,17 +1050,9 @@ fn the_verbs_that_manage_a_host_wait_for_its_migration() {
 /// Mutants to plant: `Verb::FetchChild` or `Verb::Migrate(_)` moved to the `true` arm; `Verb::Setup(_)` to the `false` one.
 #[test]
 fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
-    let held: [&[&str]; 10] = [
+    let held: [&[&str]; 9] = [
         &["setup", "--mode=frontend"],
         &RUN,
-        &[
-            "update",
-            "--commit",
-            B,
-            "--frontend",
-            "--api",
-            "127.0.0.1:1",
-        ],
         &["confirm", "--id=1-5", "--unit", "kbf.service"],
         &["revert", "--id=1-5", "--unit", "kbf.service"],
         &["rollback", "--unit", "kbf.service"],
@@ -1069,7 +1061,17 @@ fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
         &["stage"],
         &["activate"],
     ];
-    let free: [&[&str]; 6] = [
+    let free: [&[&str]; 7] = [
+        // `update` is an unprivileged client of the proxy's API (new-layout hosts only); the
+        // root half it asks for, `run`, is held.
+        &[
+            "update",
+            "--commit",
+            B,
+            "--frontend",
+            "--api",
+            "127.0.0.1:1",
+        ],
         &["status"],
         &["check"],
         &["boot-check"],

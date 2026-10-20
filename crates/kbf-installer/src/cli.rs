@@ -390,7 +390,6 @@ impl Verb {
         match self {
             Verb::Setup(_)
             | Verb::Run(_)
-            | Verb::Update(_)
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
@@ -404,6 +403,10 @@ impl Verb {
             | Verb::Quiesce
             | Verb::Migrate(_)
             | Verb::Proxy(_)
+            // `update` only POSTs to the proxy's API as an unprivileged client, and the proxy
+            // exists only on a new-layout host; the root half of an update (`run`) is guarded.
+            // `dispatch` returns for it before the old-layout guard, so the table says so.
+            | Verb::Update(_)
             | Verb::FetchChild => false,
         }
     }
