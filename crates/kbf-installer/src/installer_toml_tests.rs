@@ -613,6 +613,7 @@ fn the_proxy_table_is_rendered_and_read_back_with_every_key() {
         .replace("/run/kbf-proxy/proxy-auth", "/run/other/auth")
         .replace("/var/lib/kbf-proxy", "/var/lib/other")
         .replace("hold_max_s = 20", "hold_max_s = 7")
+        .replace("ui = true", "ui = false")
         .replace("base_port = 18000", "base_port = 19010")
         .replace("max_streams = 8192", "max_streams = 100")
         .replace("max_connections = 50000", "max_connections = 5000")
@@ -629,8 +630,25 @@ fn the_proxy_table_is_rendered_and_read_back_with_every_key() {
         .replace("keepalive_interval_s = 30", "keepalive_interval_s = 31")
         .replace("keepalive_ack_s = 20", "keepalive_ack_s = 21");
     let back = InstallerToml::parse(&odd).expect("parses");
+    assert_eq!(back.proxy.as_ref().map(|p| p.ui), Some(false));
     assert_eq!(back.render(), odd);
     assert_eq!(InstallerToml::parse(&back.render()).expect("again"), back);
+}
+
+/// Catches a UI that is off unless asked for: the golden says `ui = true` and parses to it, and
+/// a table written before the key existed (no `ui`) reads as on and renders `ui = true`, so the
+/// browser UI is on for a host that never named it.
+#[test]
+fn a_proxy_table_has_the_ui_on_unless_it_says_off() {
+    assert!(PROXY_HOST.contains("\nui = true\n"));
+    let parsed = InstallerToml::parse(PROXY_HOST).expect("parses");
+    assert_eq!(parsed.proxy.as_ref().map(|p| p.ui), Some(true));
+
+    let old = PROXY_HOST.replace("ui = true\n", "");
+    assert!(!old.contains("ui ="));
+    let read = InstallerToml::parse(&old).expect("parses");
+    assert_eq!(read.proxy.as_ref().map(|p| p.ui), Some(true));
+    assert_eq!(read.render(), PROXY_HOST);
 }
 
 /// Catches a file with no `[proxy]` table growing one: a host that has none renders none.
