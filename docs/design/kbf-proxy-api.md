@@ -264,6 +264,7 @@ buck2_token_file = "/etc/kbf/buck2.token"   # required for bearer
 proxy_auth_file = "/run/kbf-proxy/proxy-auth"
 state_dir = "/var/lib/kbf-proxy"     # update.json and the swap state machine are U7a's
 hold_max_s = 20                      # a frontend swap's hold; all-in-one is fixed at 300
+ui = true                            # the read-only web UI at /ui: open (no certificate, no token), GET and HEAD only; false makes /ui a 404 at the proxy
 [proxy.upstream]
 base_port = 18000
 # The list form of the server certificates, in place of server_cert_file/server_key_file:

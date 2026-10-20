@@ -150,3 +150,12 @@ pub(crate) fn from_update(reply: UpdateReply) -> Response<ProxyBody> {
     }
     response
 }
+
+/// The answer to a method the read-only UI does not take: 405, naming the two it does.
+pub(crate) fn method_not_allowed() -> Response<ProxyBody> {
+    let mut response = text(StatusCode::METHOD_NOT_ALLOWED, "the UI is read-only");
+    response
+        .headers_mut()
+        .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+    response
+}

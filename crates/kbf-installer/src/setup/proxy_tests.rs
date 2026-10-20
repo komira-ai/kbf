@@ -69,6 +69,28 @@ fn a_proxy_host_gets_the_proxy_table_and_a_kbf_toml_without_tls_files() {
     let table = parsed.proxy.expect("a proxy table");
     assert_eq!(table.upstream.base_port, DEFAULT_BASE_PORT);
     assert_eq!(table.operator_token_file.to_str(), Some(API_TOKEN));
+    assert!(table.ui, "the browser UI is on by default");
+    assert!(text(&exec, INSTALLER_TOML).contains("\nui = true\n"));
+}
+
+/// Catches a rerun that turns the UI back on after the operator set `ui = false`: `ui` is not a
+/// key `setup` owns, so the table is kept byte for byte and the file is not rewritten.
+#[test]
+fn a_proxy_rerun_keeps_ui_false() {
+    let mut exec = proxy_host();
+    let off = PROXY_GOLDEN.replace("ui = true", "ui = false");
+    assert_ne!(off, PROXY_GOLDEN);
+    put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &off);
+    go_ok(&FakeOs::linux(), &mut exec, &proxy_raw());
+    assert_eq!(text(&exec, INSTALLER_TOML), off);
+    assert!(
+        !exec
+            .log
+            .iter()
+            .any(|s| matches!(s, Step::WriteFile { path, .. } if path.as_str() == INSTALLER_TOML)),
+        "the file was rewritten: {:?}",
+        exec.log
+    );
 }
 
 /// Catches a proxy host that still enables `kbf-frontend.service` (two things would then
