@@ -199,7 +199,32 @@ fn an_absent_mac_user_is_none_and_other_failures_are_errors() {
 /// malformed `dscl` answer (or `id -G` answer), each refused with `Output`.
 #[test]
 fn a_mac_answer_that_is_not_a_user_is_refused() {
-    let rows: [(&str, &'static str, &'static str); 11] = [
+    let rows: [(&str, &'static str, &'static str); 16] = [
+        (
+            "a uid with a trailing space",
+            "NFSHomeDirectory: /h\nPrimaryGroupID: 309\nUniqueID: 309 \nUserShell: /s\n",
+            "309\n",
+        ),
+        (
+            "a uid with a sign",
+            "NFSHomeDirectory: /h\nPrimaryGroupID: 309\nUniqueID: +309\nUserShell: /s\n",
+            "309\n",
+        ),
+        (
+            "a uid past u32",
+            "NFSHomeDirectory: /h\nPrimaryGroupID: 309\nUniqueID: 99999999999999999999\nUserShell: /s\n",
+            "309\n",
+        ),
+        (
+            "CRLF line ends",
+            "NFSHomeDirectory: /h\r\nPrimaryGroupID: 309\r\nUniqueID: 309\r\nUserShell: /s\r\n",
+            "309\n",
+        ),
+        (
+            "a home with a trailing space",
+            "NFSHomeDirectory: /h \nPrimaryGroupID: 309\nUniqueID: 309\nUserShell: /s\n",
+            "309\n",
+        ),
         (
             "no home",
             "PrimaryGroupID: 309\nUniqueID: 309\nUserShell: /bin/sh\n",

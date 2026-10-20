@@ -183,19 +183,30 @@ fn dscl<E: Exec>(exec: &E, name: &str) -> Result<Option<(u32, u32, String)>, Use
         cmd: cmd.to_string(),
         out: text.clone(),
     };
+    // dscl prints `Key: value`, or `Key:` and the value on the next line after one space,
+    // with LF line ends. Anything else (other whitespace, CR, an empty value) is not its
+    // output.
+    let exact = |after: &str| {
+        let value = after.strip_prefix(' ')?;
+        (!value.is_empty() && value.trim() == value).then(|| value.to_owned())
+    };
+    if text.contains('\r') {
+        return Err(bad());
+    }
     let (mut uid, mut gid, mut home, mut shell) = (None, None, None, None);
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
         let Some((key, value)) = line.split_once(':') else {
             return Err(bad());
         };
-        let mut value = value.trim().to_owned();
-        if value.is_empty() {
-            match lines.next() {
-                Some(next) if next.starts_with(' ') => next.trim().clone_into(&mut value),
-                _ => return Err(bad()),
-            }
-        }
+        let value = if value.is_empty() {
+            lines.next().and_then(exact)
+        } else {
+            exact(value)
+        };
+        let Some(value) = value else {
+            return Err(bad());
+        };
         let slot = match key {
             "UniqueID" => &mut uid,
             "PrimaryGroupID" => &mut gid,
@@ -208,6 +219,10 @@ fn dscl<E: Exec>(exec: &E, name: &str) -> Result<Option<(u32, u32, String)>, Use
         }
     }
     let (Some(uid), Some(gid), Some(home), Some(_)) = (uid, gid, home, shell) else {
+        return Err(bad());
+    };
+    let digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
+    let (true, true) = (digits(&uid), digits(&gid)) else {
         return Err(bad());
     };
     let (Ok(uid), Ok(gid)) = (uid.parse(), gid.parse()) else {
