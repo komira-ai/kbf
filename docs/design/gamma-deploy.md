@@ -3,7 +3,7 @@
 Status: built in `crates/kbf-installer/src/deploy/`. It drives the update API the frontend's
 proxy serves (`docs/design/frontend-proxy.md`, sections 4, 5 and 9), frontend first.
 
-`kbf-installer deploy --commit <40hex> --apply [--json] [--bundle -]` runs on the frontend host, as root, and drives the frontend's public port through one release.
+`kbf-installer deploy --commit <40hex> --stage gamma|prod --offer offer.json --apply [--json] [--bundle -]` runs on the frontend host, as root, and drives the frontend's public port through one release.
 It orders no node, sets no desired release and rolls nothing back: it asks the update API to
 swap the frontend, waits for that update to be `done`, and then watches the nodes, which the
 new frontend rolls (one storage node at a time) once it has baked.
@@ -37,11 +37,13 @@ read when the flags give every key it could (`api`, `api_ca`, `api_server_name`,
 `cas`, `cas_ca`, `cas_server_name`). The token file must be a regular file, mode 0600 or 0400.
 The address must be loopback: a deploy drives the proxy of its own host. Run through `sudo` (the
 environment carries `SUDO_UID`, set to the caller's uid), `deploy` refuses `--api`, `--api-ca`,
-`--api-server-name`, `--token-file`, `--config`, `--lock`, `--platform` and the `--cas*` flags
-with exit 2: the caller would choose where root sends the token and which file it reads. Those
+`--api-server-name`, `--token-file`, `--config`, `--lock`, `--platform`, the `--cas*` flags,
+`--stage`, `--no-offer` and `--offer-max-age-h` with exit 2: the caller would choose where root sends the token and which file it reads. Those
 values then come only from the root-owned config. Scope the sudoers rule to the exact argument
 list too, with no wildcard: `deploy --apply --json --commit` followed by forty `[0-9a-f]`
-classes, then `--bundle -`.
+classes, then `--offer <the path of offer.json>` and `--bundle -`. `--offer` is the one new flag
+a sudo caller may give; the rule pins its path, and the file is read only as a regular file of
+at most 64 KiB, through the same validated parse every reader of an offer uses.
 
 The token in the token file is the operator token the proxy checks on every route but its
 probes. Where `setup` puts that file is the proxy's design (`docs/design/frontend-proxy.md`,
@@ -50,6 +52,45 @@ section 4, "Auth"), not this verb's.
 A farm whose `/v1/nodes` lists no node (an empty list, or no `nodes` array) is refused in
 preflight (exit 3, `no_nodes`); the wait for nodes and the post check each need at least one
 node, so an empty list never reads as "every node confirmed".
+
+## The offer
+
+`--offer offer.json` is the document `cargo xtask release offer` writes (`kbf_gate::OfferDoc`).
+It is a record, not a command: the deploy does not act on what it says, it refuses unless the
+release it is about to move is the one the offer is for. Nothing is taken from a file name.
+
+- **Which stage this host is** (`--stage gamma|prod`, else the `stage` key of
+  `/etc/kbf-installer/deploy.json`): the offer's `target` must be it. The stage is the host's
+  own, never read from the offer and never given by a `sudo` caller, so an offer for prod
+  cannot be used to deploy a gamma host or the reverse. An `--apply` with no stage is exit 2
+  (it would skip the rule below); a plan with none checks no offer.
+- **No offer**: a deploy that names a stage and gives no `--offer` is refused (exit 3,
+  `offer_required`) unless `--no-offer` says so. `--no-offer` is logged on standard error and
+  recorded in the summary (`offer.kind: "waived"`); it is for a test farm.
+- **The commit**: the offer's `commit` is `--commit` (`offer_wrong_commit`).
+- **The set**: with an offer the bundle must carry `SHA256SUMS` (one entry, not uploaded). Its
+  SHA-256 is the offer's `set_hash` (`offer_set_mismatch`), and every tarball in the bundle is
+  the file those sums name, by its bytes (`offer_file_mismatch`). A bundle with no
+  `SHA256SUMS`, or no bundle, refuses (`offer_set_unverified`): the deploy cannot say which set
+  it moves. Attestation bundles are not in the sums; they are verified offline downstream.
+- **The `meta_log`**: the `kbf` of the host's platform in the bundle is unpacked to a scratch
+  directory under the installer's work directory and run as `kbf --version --json`, as the
+  installer's `RUN_AS` user (never root; as itself in a plan). Its `meta_log` must equal the
+  offer's, `null` included both ways: a binary naming none where the offer claims one, or the
+  reverse, is refused (`offer_meta_log_mismatch`). This closes the offer's `meta_log` being
+  supplied by an operator as files. The binary is not attested yet when it runs; its answer can
+  only refuse a deploy, and the frontend's own update still verifies the attestation.
+- **Age**: `created` may be at most `--offer-max-age-h` hours old (default 72;
+  `offer_stale`) and at most 300 s ahead of the host's clock (`offer_future`).
+- **Platforms**: every platform the farm runs (the nodes' and the host's) is one the offer found
+  complete (`offer_platform`).
+
+All of them are checked before the first upload, in the steps `offer` (stage, commit, age), then
+`bundle` (set, files, `meta_log`) and `preflight` (platforms); a refusal is exit 3 and the farm
+is untouched. The summary's `offer` object carries the offer's `commit`, `set_hash`, `created`,
+`reversible`, `previous`, `meta_log` and `previous_meta_log`, copied from the validated document,
+for the bake's hand-off file; the deploy does not write that file itself. Not built: the offer
+does not yet bound the generation (`expect_generation`), which stays with the update API.
 
 ## Steps
 

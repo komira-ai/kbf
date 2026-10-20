@@ -17,6 +17,12 @@ pub const MAX_TARBALL: u64 = 512 * 1024 * 1024;
 /// The most an attestation bundle may be.
 pub const MAX_ATTESTATION: u64 = 256 * 1024;
 
+/// The release set's checksum file, which a bundle may carry beside the tarballs. It is not
+/// uploaded: the deploy hashes it to name the set (`SetHash`) and checks each file against it.
+pub const SUMS: &str = "SHA256SUMS";
+/// The most the checksum file may be.
+pub const MAX_SUMS: u64 = 1024 * 1024;
+
 /// The platforms the store knows.
 pub const PLATFORMS: [&str; 3] = ["linux-x86_64", "linux-arm64", "darwin-arm64"];
 /// The components the store takes.
@@ -38,13 +44,27 @@ impl Entry {
     }
 }
 
+/// What a bundle holds: the files to upload and, when it carries one, the set's checksum file.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Bundle {
+    pub entries: Vec<Entry>,
+    /// The exact bytes of `SHA256SUMS`.
+    pub sums: Option<Vec<u8>>,
+}
+
 /// Read the whole bundle. Every entry must be for `commit`.
-pub fn read(mut input: impl Read, commit: &CommitId) -> Result<Vec<Entry>, String> {
+pub fn read(input: impl Read, commit: &CommitId) -> Result<Vec<Entry>, String> {
+    read_bundle(input, commit).map(|b| b.entries)
+}
+
+/// [`read`], with the checksum file too.
+pub fn read_bundle(mut input: impl Read, commit: &CommitId) -> Result<Bundle, String> {
     read_from(&mut input, commit)
 }
 
-/// [`read`], from one reader type whatever the caller's (so one copy of the code).
-fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Vec<Entry>, String> {
+/// [`read_bundle`], from one reader type whatever the caller's (so one copy of the code).
+fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Bundle, String> {
+    let mut sums: Option<Vec<u8>> = None;
     let mut archive = tar::Archive::new(input);
     let mut out = Vec::new();
     let entries = archive.entries().map_err(why("not a tar"))?;
@@ -59,6 +79,22 @@ fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Vec<Entry>, Stri
             .and_then(|n| n.to_str())
             .ok_or("an entry has no usable name")?
             .to_owned();
+        if file == SUMS {
+            if sums.is_some() {
+                return Err(format!("{file} appears twice"));
+            }
+            let mut bytes = Vec::new();
+            entry
+                .by_ref()
+                .take(MAX_SUMS + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("reading {file}: {e}"))?;
+            if bytes.is_empty() || bytes.len() as u64 > MAX_SUMS {
+                return Err(format!("{file} is empty or larger than {MAX_SUMS} bytes"));
+            }
+            sums = Some(bytes);
+            continue;
+        }
         let (platform, name) = classify(&file, commit)?;
         let cap = if name.ends_with(".attestation") {
             MAX_ATTESTATION
@@ -92,7 +128,7 @@ fn read_from(input: &mut dyn Read, commit: &CommitId) -> Result<Vec<Entry>, Stri
     if out.is_empty() {
         return Err("the bundle holds no file".to_owned());
     }
-    Ok(out)
+    Ok(Bundle { entries: out, sums })
 }
 
 /// `(platform, store name)` for a file name, or why it is refused.

@@ -53,6 +53,7 @@ fn a_clean_deploy_runs_over_tls_frontend_first() {
             clock: &clock,
             smoke: &smoke,
             check: &check,
+            probe: &NoProbe,
         };
         let s = deploy(&env, &opts(true), Some(&mut input));
         (s, served.auth.lock().unwrap().clone())
