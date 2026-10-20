@@ -7,7 +7,8 @@
 //! database owned by it. The superuser is reached the way Postgres means it to be on the
 //! host: `psql` run as the operating-system user `postgres` over the Unix socket, peer
 //! authentication, no password anywhere. `setup` alters nothing that exists: a role that
-//! cannot log in or is a superuser, and a database another role owns, are refused. It never
+//! cannot log in or holds a privilege (superuser, CREATEROLE, CREATEDB, REPLICATION,
+//! BYPASSRLS), and a database another role owns, are refused. It never
 //! edits `pg_hba.conf` or `pg_ident.conf`; it tries the logins and, when the server refuses
 //! one, says which rule is missing.
 //!
@@ -107,7 +108,7 @@ fn script(local: &LocalDatabase, sql: &str) -> String {
     )
 }
 
-const ROLE_STATE: &str = "SELECT rolcanlogin, rolsuper FROM pg_roles WHERE rolname = :'role';";
+const ROLE_STATE: &str = "SELECT rolcanlogin, rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls FROM pg_roles WHERE rolname = :'role';";
 const DATABASE_STATE: &str =
     "SELECT pg_get_userbyid(datdba) = :'role' FROM pg_database WHERE datname = :'db';";
 const CREATE_ROLE: &str =
@@ -146,20 +147,53 @@ fn ask(
 /// What the server holds of the role.
 enum Role {
     Missing,
-    /// Can log in, is no superuser.
+    /// Can log in and holds no privilege.
     Plain,
-    Other,
+    /// Anything else: the first reason, as the refusal says it.
+    Other(&'static str),
 }
 
+/// The columns of [`ROLE_STATE`] after `rolcanlogin`, each a privilege a plain role lacks.
+const PRIVILEGES: [&str; 5] = [
+    "is a superuser",
+    "has CREATEROLE",
+    "has CREATEDB",
+    "has REPLICATION",
+    "has BYPASSRLS",
+];
+
 fn role_state(answer: &str) -> Result<Role, SetupError> {
-    match answer {
-        "" => Ok(Role::Missing),
-        "t|f" => Ok(Role::Plain),
-        "f|f" | "t|t" | "f|t" => Ok(Role::Other),
-        _ => Err(needs_operator(
-            "the local Postgres server answered a question about the role in a way setup does not know: update kbf-installer, or create the role and database by hand",
-        )),
+    if answer.is_empty() {
+        return Ok(Role::Missing);
     }
+    let columns: Vec<Option<bool>> = answer
+        .split('|')
+        .map(|c| match c {
+            "t" => Some(true),
+            "f" => Some(false),
+            _ => None,
+        })
+        .collect();
+    let [Some(login), privileges @ ..] = columns.as_slice() else {
+        return Err(unknown_role());
+    };
+    if privileges.len() != PRIVILEGES.len() || privileges.iter().any(Option::is_none) {
+        return Err(unknown_role());
+    }
+    if !login {
+        return Ok(Role::Other("cannot log in"));
+    }
+    Ok(privileges
+        .iter()
+        .zip(PRIVILEGES)
+        .find(|(held, _)| **held == Some(true))
+        .map_or(Role::Plain, |(_, why)| Role::Other(why)))
+}
+
+fn unknown_role() -> SetupError {
+    needs_operator(
+        "the local Postgres server answered a question about the role in a way setup does not know: update kbf-installer, or create the role and database by hand",
+    )
 }
 
 /// The steps that make the role and the database, read from what the server holds; none when
@@ -174,10 +208,10 @@ pub fn plan(
     local: &LocalDatabase,
 ) -> Result<Vec<(&'static str, Step)>, SetupError> {
     let role = role_state(&ask(exec, conn, local, ROLE_STATE)?)?;
-    if matches!(role, Role::Other) {
-        return Err(needs_operator(
-            "the role --database names exists but is not a plain login role (it cannot log in, or it is a superuser) and setup alters no role: name another role, or fix this one by hand",
-        ));
+    if let Role::Other(why) = role {
+        return Err(needs_operator(&format!(
+            "the role --database names exists but is not a plain login role (it {why}) and setup alters no role: name another role, or fix this one by hand"
+        )));
     }
     let owned = match ask(exec, conn, local, DATABASE_STATE)?.as_str() {
         "" => None,

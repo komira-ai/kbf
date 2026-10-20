@@ -116,11 +116,14 @@ the server as its superuser, by running `/usr/bin/psql` as the operating-system 
 `postgres` over the Unix socket the URL names: peer authentication, no password anywhere. It
 creates, if missing, a login role (no password, not a superuser, no CREATEDB, CREATEROLE or
 REPLICATION) and a database owned by it, both named by the URL. A re-run creates only what is
-missing. It alters nothing that exists: a role that cannot log in or is a superuser, and a
-database another role owns, are refused (exit 1) and left as they are. The names must be
+missing. It alters nothing that exists: a role that cannot log in or holds any privilege
+(superuser, CREATEROLE, CREATEDB, REPLICATION, BYPASSRLS), and a database another role owns,
+are refused (exit 1) and left as they are. The names must be
 letters, digits, `_` and `-` (at most 63), the role neither `postgres` nor `pg_`-prefixed,
 and the host a Linux host with a `postgres` account. The server's socket directory comes from
-`host=` and must be absolute; a remote server is never reached this way.
+`host=` and must be absolute; a remote server is never reached this way. `--database` names
+one server: a URL with several hosts or ports is refused, so that the role is never made on
+one server and the login tried on another.
 
 **`setup` never edits `pg_hba.conf` or `pg_ident.conf`.** It logs in the way kbf will and,
 when the server refuses, prints the rules to add. For a role `<role>` in database
@@ -141,6 +144,10 @@ kbf  <service>  <role>
 then reload the server (`pg_ctl reload`, or `systemctl reload postgresql`; a restart is not
 needed) and run `setup` again. If the role is named like the service account, the first
 `pg_ident` line alone is the missing part for root.
+
+`kbf` is the name of the map and any name works, as long as the `pg_hba.conf` line and the
+`pg_ident.conf` lines use the same one (a host that already has a map, `kbfmap` say, keeps
+it): `setup` never reads either file, it only tries the logins, so it does not know the name.
 
 **Remote or managed server, or a role and database the operator makes.** `setup` does not
 reach a remote server's superuser and holds no password. Create the role (login, no

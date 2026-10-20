@@ -541,7 +541,7 @@ mod provisioned {
     /// case nothing is created and the refusal names neither the role nor the database.
     ///
     /// Mutants seen red: the superuser check removed; the owner check removed; the login
-    /// check removed.
+    /// check removed; one of the four privilege columns dropped from the question.
     #[test]
     #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
     fn a_role_that_is_not_plain_or_a_database_owned_by_another_is_refused_and_left_alone() {
@@ -571,6 +571,17 @@ mod provisioned {
         ));
         assert!(refused(&names).contains("not a plain login role"));
         sql(&format!("DROP ROLE \"{role}\""));
+        // Each privilege setup does not give is refused the same way, and altered not.
+        for attribute in ["CREATEROLE", "CREATEDB", "REPLICATION", "BYPASSRLS"] {
+            sql(&format!("CREATE ROLE \"{role}\" LOGIN {attribute}"));
+            let text = refused(&names);
+            assert!(
+                text.contains("not a plain login role"),
+                "{attribute}: {text}"
+            );
+            assert!(text.contains(attribute), "{attribute}: {text}");
+            sql(&format!("DROP ROLE \"{role}\""));
+        }
 
         // The database exists and the server's own account owns it.
         sql(&format!(

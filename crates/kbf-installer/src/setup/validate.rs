@@ -209,6 +209,12 @@ impl Raw {
             );
             return (None, None);
         }
+        if config.host_count() > 1 || config.port_count() > 1 {
+            problems.push(
+                "--database must name one server: with several hosts or ports, setup would make the role on the first and the service could log in to another".to_owned(),
+            );
+            return (None, None);
+        }
         let local = if self.create_local_database {
             local_database(&config, problems)
         } else {

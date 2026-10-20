@@ -45,7 +45,7 @@ fn local() -> LocalDatabase {
 /// (owned by the role), and what has been asked of it.
 #[derive(Default)]
 struct World {
-    role: Option<(bool, bool)>,
+    role: Option<Row>,
     database: Option<bool>,
     /// psql exits with this status, saying the names on stderr.
     broken: Option<i32>,
@@ -56,6 +56,49 @@ struct World {
     /// Every script run, with the account that ran it.
     ran: Vec<(Option<String>, String)>,
     envs: Vec<Vec<String>>,
+}
+
+/// What `pg_roles` holds of a role, by the column the query may ask for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Row {
+    login: bool,
+    superuser: bool,
+    createrole: bool,
+    createdb: bool,
+    replication: bool,
+    bypassrls: bool,
+}
+
+impl Row {
+    /// A login role with no privilege: what setup makes.
+    fn plain() -> Row {
+        Row {
+            login: true,
+            superuser: false,
+            createrole: false,
+            createdb: false,
+            replication: false,
+            bypassrls: false,
+        }
+    }
+
+    /// The server answers with the columns the query names, in the query's order.
+    fn answer(self, script: &str) -> String {
+        let columns = [
+            ("rolcanlogin", self.login),
+            ("rolsuper", self.superuser),
+            ("rolcreaterole", self.createrole),
+            ("rolcreatedb", self.createdb),
+            ("rolreplication", self.replication),
+            ("rolbypassrls", self.bypassrls),
+        ];
+        let asked: Vec<&str> = columns
+            .iter()
+            .filter(|(name, _)| script.contains(name))
+            .map(|(_, v)| flag(*v))
+            .collect();
+        format!("{}\n", asked.join("|"))
+    }
 }
 
 type Shared = Rc<RefCell<World>>;
@@ -90,16 +133,14 @@ fn psql_answer(world: &Shared, cmd: &Cmd) -> io::Result<std::process::Output> {
             return Ok(reply(3, "", "ERROR: role \"secretrole\" already exists"));
         }
         if script.contains("CREATE ROLE") {
-            w.role = Some((true, false));
+            w.role = Some(Row::plain());
         } else {
             w.database = Some(true);
         }
         return Ok(reply(0, "", ""));
     }
     let out = if script.contains("FROM pg_roles") {
-        w.role.map_or(String::new(), |(login, sup)| {
-            format!("{}|{}\n", flag(login), flag(sup))
-        })
+        w.role.map_or(String::new(), |row| row.answer(&script))
     } else {
         w.database
             .map_or(String::new(), |mine| format!("{}\n", flag(mine)))
@@ -319,7 +360,7 @@ fn a_fresh_server_gets_a_plain_login_role_then_its_database() {
         out.contains("+ create the database: run (as postgres) /usr/bin/psql"),
         "{out}"
     );
-    assert_eq!(world.borrow().role, Some((true, false)));
+    assert_eq!(world.borrow().role, Some(Row::plain()));
     assert_eq!(
         exec.log
             .iter()
@@ -345,7 +386,7 @@ fn a_fresh_server_gets_a_plain_login_role_then_its_database() {
 #[test]
 fn a_rerun_creates_only_what_is_missing() {
     let world = Shared::default();
-    world.borrow_mut().role = Some((true, false));
+    world.borrow_mut().role = Some(Row::plain());
     world.borrow_mut().database = Some(true);
     assert!(plan_on(&world).expect("plan").is_empty());
     let (_, out) = setup_on(&world, &Server::fresh(), &flags(), APPLY);
@@ -367,8 +408,20 @@ fn a_rerun_creates_only_what_is_missing() {
 #[test]
 fn a_role_or_database_that_is_not_the_roles_own_is_refused_and_altered_not() {
     for (role, why) in [
-        (Some((false, false)), "not a plain login role"),
-        (Some((true, true)), "not a plain login role"),
+        (
+            Some(Row {
+                login: false,
+                ..Row::plain()
+            }),
+            "not a plain login role",
+        ),
+        (
+            Some(Row {
+                superuser: true,
+                ..Row::plain()
+            }),
+            "not a plain login role",
+        ),
     ] {
         let world = Shared::default();
         world.borrow_mut().role = role;
@@ -383,7 +436,7 @@ fn a_role_or_database_that_is_not_the_roles_own_is_refused_and_altered_not() {
         );
     }
     let world = Shared::default();
-    world.borrow_mut().role = Some((true, false));
+    world.borrow_mut().role = Some(Row::plain());
     world.borrow_mut().database = Some(false);
     let text = refusal(plan_on(&world));
     assert!(text.contains("another role owns it"), "{text}");
@@ -456,7 +509,7 @@ fn a_dry_run_names_the_steps_and_creates_nothing() {
     assert!(server.asked.borrow().is_empty(), "{:?}", server.asked);
 
     // With everything there, a dry run goes on to ask the schema's state.
-    world.borrow_mut().role = Some((true, false));
+    world.borrow_mut().role = Some(Row::plain());
     world.borrow_mut().database = Some(true);
     let (_, out) = setup_on(&world, &server, &flags(), DRY);
     assert!(
@@ -673,4 +726,193 @@ fn the_services_own_login_is_tried_and_its_refusal_is_the_recipe() {
     os.users.retain(|u| u.name != "kbf-server");
     let exec = exec_on(&world);
     provision::check_service_login(&os, &exec, &local(), Mode::Frontend).expect("skipped");
+}
+
+// ---- the barrier between the URL and the script ------------------------------------------
+
+/// The characters that would end a quoted `\set` value, start another psql command, or be
+/// read by SQL or the shell, with their spellings in a URL (raw, and percent-encoded, which
+/// the parser decodes before the name is checked).
+const DANGEROUS: [(&str, &str); 8] = [
+    ("quote", "'"),
+    ("space", " "),
+    ("semicolon", ";"),
+    ("colon", ":"),
+    ("dollar", "$"),
+    ("backslash", "\\"),
+    ("newline", "\n"),
+    ("encoded quote", "%27"),
+];
+
+/// The names reach psql in `\set role '...'` lines on its standard input, so the name check
+/// is the only barrier against a name closing the quote and running its own commands. A
+/// role or a database name holding any of these is refused by the flag, in either place and
+/// in either spelling, and no refusal quotes the name.
+///
+/// Mutant seen red: `'` added to the characters a name may hold.
+#[test]
+fn a_name_that_could_leave_its_quotes_is_refused_for_the_role_and_the_database() {
+    for (what, c) in DANGEROUS {
+        let mut spellings = vec![c.to_owned()];
+        if c.len() == 1 {
+            spellings.push(format!("%{:02X}", c.as_bytes()[0]));
+        }
+        for c in spellings {
+            let urls = [
+                (
+                    format!("postgres:///secretdb?host=/run/secretsock&user=secret{c}role"),
+                    "role in --database",
+                ),
+                (
+                    format!("postgres:///secret{c}db?host=/run/secretsock&user=secretrole"),
+                    "must name a database",
+                ),
+            ];
+            for (url, _) in urls {
+                let mut r = flags();
+                r.database = Some(url.clone());
+                let problems = r
+                    .validate()
+                    .expect_err(&format!("{what} ({c:?}) accepted in {url:?}"))
+                    .join("; ");
+                assert!(!problems.contains("secret"), "{what}: {problems}");
+            }
+        }
+    }
+}
+
+// ---- a role with a privilege is not plain -------------------------------------------------
+
+/// A role that can create roles or databases, replicate, or bypass row security is more than
+/// the state needs; setup refuses it as it does a superuser, saying why and quoting no value,
+/// and alters nothing (no create runs, and no ALTER ever).
+///
+/// Mutants seen red: each of the four columns dropped from the question or the test.
+#[test]
+fn a_role_with_a_privilege_it_does_not_need_is_refused_and_left_alone() {
+    let rows = [
+        (
+            "CREATEROLE",
+            Row {
+                createrole: true,
+                ..Row::plain()
+            },
+        ),
+        (
+            "CREATEDB",
+            Row {
+                createdb: true,
+                ..Row::plain()
+            },
+        ),
+        (
+            "REPLICATION",
+            Row {
+                replication: true,
+                ..Row::plain()
+            },
+        ),
+        (
+            "BYPASSRLS",
+            Row {
+                bypassrls: true,
+                ..Row::plain()
+            },
+        ),
+    ];
+    for (attribute, row) in rows {
+        let world = Shared::default();
+        world.borrow_mut().role = Some(row);
+        let text = refusal(plan_on(&world));
+        assert!(
+            text.contains("not a plain login role"),
+            "{attribute}: {text}"
+        );
+        assert!(text.contains(attribute), "{attribute}: {text}");
+        let (exec, out) = setup_on(&world, &Server::fresh(), &flags(), APPLY);
+        refusal(out);
+        let w = world.borrow();
+        assert!(
+            w.ran
+                .iter()
+                .all(|(_, s)| !s.contains("CREATE") && !s.contains("ALTER")),
+            "{attribute}: {:?}",
+            w.ran
+        );
+        assert_eq!(w.role, Some(row), "{attribute}: the role is as it was");
+        assert!(!exec.entries.contains_key(&hp(KBF_TOML)));
+    }
+}
+
+// ---- one server ----------------------------------------------------------------------------
+
+/// Provisioning goes to the first host and port, and the login check to the whole URL: with
+/// two servers named, setup could make the role on one and log in to the other. The flag
+/// refuses a URL with more than one host or more than one port, with or without
+/// `--create-local-database`.
+///
+/// Mutant seen red: the count check removed.
+#[test]
+fn a_database_url_with_more_than_one_host_or_port_is_refused() {
+    for url in [
+        "postgres://%2Frun%2Fsecretsock,%2Frun%2Fother/secretdb?user=secretrole",
+        "postgres://secrethost,otherhost/secretdb?user=secretrole",
+        "postgres:///secretdb?host=/run/secretsock&port=5432,5433&user=secretrole",
+    ] {
+        for create in [true, false] {
+            let mut r = flags();
+            r.database = Some(url.to_owned());
+            r.create_local_database = create;
+            let problems = r.validate().expect_err(url).join("; ");
+            assert!(problems.contains("one server"), "{url}: {problems}");
+            no_names(&problems);
+        }
+    }
+}
+
+// ---- the live farm's URL ---------------------------------------------------------------------
+
+/// The farm's own spelling: a bare database name, the socket directory and the role in the
+/// query. Either scheme parses to the same settings, and setup tries the logins and prints a
+/// recipe only when one is refused: it never reads `pg_hba.conf` or `pg_ident.conf`, so the
+/// name of the ident map (`kbfmap` there, `kbf` in the recipe) is not something it knows.
+#[test]
+fn both_schemes_give_the_same_settings_and_no_ident_map_name_is_read() {
+    let settings = |scheme: &str| {
+        let mut r = raw(Mode::Frontend);
+        r.database = Some(format!(
+            "{scheme}:///kbf?host=/run/postgresql&user=kbf-server"
+        ));
+        r.create_local_database = true;
+        let valid = r.validate().expect("valid");
+        let local = valid.local_database.expect("local");
+        (local.role, local.name, local.socket_dir, local.port)
+    };
+    let expected = (
+        "kbf-server".to_owned(),
+        "kbf".to_owned(),
+        "/run/postgresql".to_owned(),
+        None,
+    );
+    assert_eq!(settings("postgres"), expected);
+    assert_eq!(settings("postgresql"), expected);
+
+    // The farm admits the service by a map the fake cannot see; the login is simply admitted.
+    let world = Shared::default();
+    world.borrow_mut().role = Some(Row::plain());
+    world.borrow_mut().database = Some(true);
+    let mut r = raw(Mode::Frontend);
+    r.database = Some("postgres:///kbf?host=/run/postgresql&user=kbf-server".to_owned());
+    r.create_local_database = true;
+    let (_, out) = setup_on(&world, &Server::fresh(), &r, APPLY);
+    let out = out.expect("setup");
+    assert!(!out.contains("pg_ident") && !out.contains("map="), "{out}");
+    let w = world.borrow();
+    assert!(
+        w.ran
+            .iter()
+            .all(|(_, s)| !s.contains("pg_ident") && !s.contains("pg_hba")),
+        "{:?}",
+        w.ran
+    );
 }

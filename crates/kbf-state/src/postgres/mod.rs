@@ -253,6 +253,19 @@ impl PostgresConfig {
         }
     }
 
+    /// How many hosts the URL names (a list after `host=`, or comma-separated in the
+    /// authority): each is a server the client may try.
+    #[must_use]
+    pub fn host_count(&self) -> usize {
+        self.pg.get_hosts().len()
+    }
+
+    /// How many ports the URL names.
+    #[must_use]
+    pub fn port_count(&self) -> usize {
+        self.pg.get_ports().len()
+    }
+
     /// The port the URL names, `None` for the server's default.
     #[must_use]
     pub fn port(&self) -> Option<u16> {
