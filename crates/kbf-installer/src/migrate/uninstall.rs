@@ -66,9 +66,9 @@ use super::services::Services;
 use super::tree::Rules;
 use super::units::Unit;
 use super::{Outcome, Report};
-use crate::utc_stamp::utc_stamp;
 use crate::layout::{Layout, Platform};
 use crate::state::{self, Locked, State, StateError};
+use crate::utc_stamp::utc_stamp;
 
 /// The package's identifier, which `pkgutil --forget` takes: the same string as the job's
 /// label (`MAC_INSTALLER_LABEL`; `crates/xtask/src/pkg.rs` makes the package with it).
