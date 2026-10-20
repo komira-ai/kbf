@@ -78,10 +78,10 @@ fn open_descriptors() -> usize {
 /// opening it. The slack is `collect`'s own descriptor (the upper directory).
 #[tokio::test]
 async fn no_output_file_is_open_while_the_stores_are_slow() {
-    let upper = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-driver-container-upload-queue")
-        .join(std::process::id().to_string());
-    let _ = std::fs::remove_dir_all(&upper);
+    let upper = kbf_testkit::dir::TestDir::under(
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-driver-container-upload-queue"),
+        "upper",
+    );
     std::fs::create_dir_all(upper.join("out")).expect("mkdir");
     for f in 0..300 {
         std::fs::write(upper.join(format!("out/f{f:03}")), format!("file {f}")).expect("write");

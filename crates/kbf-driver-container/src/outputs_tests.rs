@@ -3,16 +3,8 @@
 use super::*;
 
 /// A fresh scratch directory for one unit test, beside the test binary.
-fn scratch(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().expect("test binary");
-    let dir = exe
-        .parent()
-        .expect("deps directory")
-        .join("kbf-driver-container-unit")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::unit_dir(&format!("outputs-{name}"))
 }
 
 /// Catches the walk going back up into a directory other than the one it came
@@ -22,7 +14,7 @@ fn scratch(name: &str) -> PathBuf {
 fn the_walk_goes_back_only_where_it_came_from() {
     let dir = scratch("outputs-parent");
     std::fs::create_dir(dir.join("child")).expect("mkdir");
-    let top = rustix::fs::openat(CWD, &dir, DIRECTORY, Mode::empty()).expect("open");
+    let top = rustix::fs::openat(CWD, &*dir, DIRECTORY, Mode::empty()).expect("open");
     let child = rustix::fs::openat(&top, "child", DIRECTORY, Mode::empty()).expect("open");
     let id = identity(&top).expect("identity");
     let back = back_to_parent(&child, id).expect("the same parent");
@@ -163,7 +155,7 @@ fn the_files_together_are_held_to_the_byte_limit_in_job_order() {
 #[tokio::test]
 async fn logs_are_stored_within_their_limit_and_only_if_regular() {
     let dir = scratch("outputs-log");
-    let fd = rustix::fs::openat(CWD, &dir, DIRECTORY, Mode::empty()).expect("open");
+    let fd = rustix::fs::openat(CWD, &*dir, DIRECTORY, Mode::empty()).expect("open");
     rustix::fs::mknodat(&fd, "stdout", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).expect("mkfifo");
     let cas = crate::cas::MemoryCas::new();
     let why = collect_log(&cas, &dir.join("stdout"), 10)
