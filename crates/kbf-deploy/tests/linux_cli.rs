@@ -1,18 +1,15 @@
 //! `kbf-deploy linux render-units` and `check-units` (always with `--mode`) as a user
 //! runs them: the lines printed, where, and the exit codes 0, 1 and 2.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
+
+use kbf_testkit::dir::TestDir;
 
 const EXAMPLE: &str = include_str!("../templates/linux/config.example");
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("linux_cli")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("linux_cli-{name}"))
 }
 
 fn run(args: &[&str]) -> (i32, String, String) {

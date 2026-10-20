@@ -56,6 +56,7 @@ hex.workspace = true
 http.workspace = true
 kbf-cli.workspace = true
 kbf-front.workspace = true
+kbf-host.workspace = true
 # `tests/object_store_e2e`: the registration's journey from an operator PUT to a storage
 # node's heartbeat; the S3 service the nodes and the frontend's probe talk to is the fake.
 kbf-map.workspace = true
