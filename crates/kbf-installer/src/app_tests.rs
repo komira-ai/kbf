@@ -29,18 +29,11 @@ fn run_as(euid: u32, args: &[&str]) -> (Exit, String, String) {
 /// Every verb of the contract's table and the pull request that builds it. The verbs that
 /// are not built say so with the phase; the ones that are built (`run`, `setup` and the operator's) are not here.
 fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
-    let commit: &'static str = B;
     vec![
         (vec!["status"], "status", "P4"),
-        (
-            vec!["update", "--commit", commit, "--frontend"],
-            "update",
-            "P13",
-        ),
         (vec!["check"], "check", "P10"),
         (vec!["stage"], "stage", "P8"),
         (vec!["activate"], "activate", "P5"),
-        (vec!["fetch-child"], "fetch-child", "P7"),
     ]
 }
 
@@ -79,6 +72,107 @@ fn only_status_and_check_run_without_root() {
     }
 }
 
+/// The fetch child is built (P7) and runs as the fetch user, not as root: it is not gated on
+/// root, it prints nothing on standard output but the component's bytes (never JSON, whatever
+/// the global flag), and it says why it fetched nothing in one line on standard error.
+///
+/// Catches the child inheriting the "needs root" gate (it would never start as `kbf-fetch`) and
+/// a child that prints prose where the parent counts bytes.
+#[test]
+fn the_fetch_child_is_no_root_verb_and_reports_in_one_line() {
+    let digest = "a".repeat(64);
+    for json in [false, true] {
+        let mut args = vec!["fetch-child"];
+        if json {
+            args.insert(0, "--json");
+        }
+        args.extend([
+            "--kind",
+            "url",
+            "--url",
+            "http://h.example",
+            "--sha256",
+            &digest,
+            "--limit",
+            "10",
+        ]);
+        let (exit, out, err) = run_as(1000, &args);
+        assert_eq!(exit, Exit::Failed, "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.starts_with("fetch-child: "), "{err}");
+    }
+}
+
+/// The fetch child is asked for a blob (`--sha256`) or for what a release holds (`--describe`),
+/// one of the two; `--platform` belongs to a description.
+///
+/// Catches a child started with both (it would not know which to do), with neither, or with a
+/// platform and nothing to apply it to: all refused by the parser, before the child's own
+/// check of its flags. (A platform with a blob passes the parser, which drops a requirement a
+/// conflict rules out; the child refuses it itself.)
+#[test]
+fn the_fetch_child_takes_a_blob_or_a_release() {
+    let digest = "a".repeat(64);
+    let base = [
+        "fetch-child",
+        "--kind",
+        "url",
+        "--url",
+        "https://h.example",
+        "--limit",
+        "10",
+    ];
+    let with = |extra: &[&str]| {
+        let mut full = vec!["kbf-installer"];
+        full.extend(base);
+        full.extend_from_slice(extra);
+        Cli::try_parse_from(full)
+    };
+    assert!(with(&["--sha256", &digest]).is_ok());
+    assert!(with(&["--describe", A]).is_ok());
+    assert!(with(&["--describe", A, "--platform", "linux-x86_64"]).is_ok());
+    assert!(with(&[]).is_err(), "neither");
+    assert!(
+        with(&["--sha256", &digest, "--describe", A]).is_err(),
+        "both"
+    );
+    assert!(
+        with(&["--platform", "linux-x86_64"]).is_err(),
+        "a platform alone"
+    );
+}
+
+/// Catches `run` watching the Linux state directory on a Mac: without `--update-dir` and
+/// `--orders-dir` the directories are the layout's, the ones `setup` and the Mac provisioner
+/// write, for each platform; the flags still win.
+#[test]
+fn run_defaults_its_directories_to_the_layouts_on_every_platform() {
+    for platform in [Platform::Linux, Platform::MacOs] {
+        let (layout, _) = crate::testkit::host_root_on("run-dirs", platform);
+        let Verb::Run(args) = parse(&["run"]).verb else {
+            panic!("run");
+        };
+        assert_eq!(
+            args.update_dir_in(&layout),
+            layout.update_dir(),
+            "{platform:?}"
+        );
+        assert_eq!(
+            args.orders_dir_in(&layout),
+            layout.orders_dir(),
+            "{platform:?}"
+        );
+    }
+    let Verb::Run(args) = parse(&["run", "--update-dir", "/srv/u", "--orders-dir", "/srv/o"]).verb
+    else {
+        panic!("run");
+    };
+    let (layout, _) = crate::testkit::host_root_on("run-dirs-flags", Platform::MacOs);
+    assert_eq!(args.update_dir_in(&layout).as_str(), "/srv/u");
+    assert_eq!(args.orders_dir_in(&layout).as_str(), "/srv/o");
+}
+
 /// Catches the proxy verb asking for root (it runs as the service user), a refused table
 /// leaving as anything but a usage error with its path, and `--json` losing the reason.
 #[test]
@@ -109,7 +203,7 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
 
     fs::write(
         &file,
-        "[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[proxy.upstream]\nbase_port = 18000\n",
+        "database = \"postgres:///kbf?host=/nonexistent\"\n[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[proxy.upstream]\nbase_port = 18000\n",
     )
     .expect("write");
     let (exit, out, err) = run_as(1000, &["proxy", "--check", "--config", &path]);
@@ -120,6 +214,7 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
             config: Some(file),
             check: true,
             update_dir: "/var/lib/kbf-installer".into(),
+            orders_dir: "/var/lib/kbf-installer/orders".into(),
         })
         .needs_root()
     );
@@ -246,7 +341,8 @@ fn no_command_takes_a_positional_argument() {
     assert!(found.is_empty(), "{found:?}");
 }
 
-/// Catches the public verb list drifting from the contract's table (section 2): the visible
+/// Catches the public verb list drifting from the contract's table (section 2) plus the
+/// state database's `backup` and `restore` (frontend-proxy.md section 11): the visible
 /// verbs, and that the three internal ones stay out of the help.
 #[test]
 fn the_visible_verbs_are_the_contracts() {
@@ -272,6 +368,8 @@ fn the_visible_verbs_are_the_contracts() {
             "migrate",
             "quiesce",
             "check",
+            "backup",
+            "restore",
             "proxy"
         ]
     );
@@ -318,7 +416,7 @@ fn global_flags_may_follow_the_verb() {
 /// scratch host is laid out for that platform too (`/var/db/kbf-installer` on macOS).
 fn seeded(name: &str) -> (Layout, PathBuf) {
     let (layout, root) = host_root_on(&format!("app-{name}"), Platform::current());
-    crate::testkit::mkdirs(&root, &root.join("var/lib/kbf-installer/orders"), 0o755);
+    crate::testkit::mkdirs(&root, &layout.join(&layout.orders_dir()), 0o755);
     let release = layout.join(&layout.release_dir(&c(A)));
     crate::testkit::mkdirs(&root, &release, 0o755);
     fs::write(release.join("kbf"), b"x").expect("binary");
@@ -355,12 +453,13 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
     let (layout, root) = seeded("run");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Ok, "{err}");
-    let status = fs::read(root.join("var/lib/kbf-installer/status.json")).expect("status.json");
+    let status =
+        fs::read(layout.join(&layout.update_dir()).join("status.json")).expect("status.json");
     let status: Value = serde_json::from_slice(&status).expect("json");
     assert_eq!(status["state"], "refused", "not root: the pass says so");
     let record = kbf_update::record::file_name(1, 2);
     fs::write(
-        root.join("var/lib/kbf-installer/orders").join(record),
+        layout.join(&layout.orders_dir()).join(record),
         b"not an order",
     )
     .expect("record");
@@ -411,7 +510,7 @@ fn run_waits_one_interval_between_two_passes_and_not_after_the_last() {
 #[test]
 fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
     let (layout, root) = seeded("boot");
-    let release = root.join("var/lib/kbf-installer/releases").join(B);
+    let release = layout.join(&layout.release_dir(&c(B)));
     crate::testkit::mkdirs(&root, &release, 0o755);
     fs::write(release.join("kbf"), b"x").expect("binary");
     let lock = Locked::acquire(&layout).expect("lock");
@@ -620,7 +719,7 @@ fn record_release_runs_through_the_dispatcher_and_refuses_what_is_not_a_release(
 /// the all-in-one template (`kbf-all-in-one@1.service`) is in the test list.
 #[test]
 fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
-    let (_, root) = seeded("run-database");
+    let (layout, root) = seeded("run-database");
     for unit in [
         "kbf-all-in-one.service",
         "kbf-all-in-one@1.service",
@@ -636,7 +735,10 @@ fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
             "{unit}"
         );
         assert!(
-            !root.join("var/lib/kbf-installer/status.json").exists(),
+            !layout
+                .join(&layout.update_dir())
+                .join("status.json")
+                .exists(),
             "{unit}: nothing was done before the refusal"
         );
     }
@@ -778,10 +880,76 @@ fn run_with_an_installer_config_refuses_a_relative_host_root() {
     assert!(refused.is_some_and(|f| !f.why.is_empty()));
 }
 
-/// Writes `mode = "<mode>"` as the host's `kbf.toml` under `root`.
-fn write_kbf_toml(root: &Path, text: &str) {
-    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
-    fs::write(root.join("etc/kbf/kbf.toml"), text).expect("kbf.toml");
+/// Catches `update` being gated on root (it is a client of the update API and runs as
+/// whoever can read the token file) or not reaching its own code: a bad address is its own
+/// usage error, as an ordinary user, and prints no summary.
+#[test]
+fn update_runs_without_root_and_reports_its_own_usage_errors() {
+    let args = ["update", "--commit", B, "--frontend", "--api", "nowhere"];
+    let (exit, out, err) = run_as(1000, &args);
+    assert_eq!(exit, Exit::Usage);
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.contains("update: --api") && err.contains("host:port"),
+        "{err}"
+    );
+    assert!(!parse(&args).verb.needs_root());
+    assert_eq!(parse(&args).verb.name(), "update");
+}
+
+/// Catches `update` taking a caller-chosen API address and token file as root: through sudo
+/// (`SUDO_UID` of another account) it is refused as a usage error before the token file is
+/// read or any address is dialed, and says why. Fails without the refusal: the run would go to
+/// the address and report the unreadable token file instead.
+#[test]
+fn update_is_refused_through_sudo_before_it_reads_anything() {
+    let Verb::Update(args) = parse(&[
+        "update",
+        "--commit",
+        B,
+        "--frontend",
+        "--api",
+        "127.0.0.1:1",
+        "--token-file",
+        "/nonexistent/token",
+    ])
+    .verb
+    else {
+        panic!("an update");
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(update_verb(&args, true, &mut out, &mut err), Exit::Usage);
+    let err = String::from_utf8(err).expect("text");
+    assert!(out.is_empty());
+    assert!(err.contains("not accepted through sudo"), "{err}");
+    assert!(!err.contains("/nonexistent"), "{err}");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    update_verb(&args, false, &mut out, &mut err);
+    let err = String::from_utf8(err).expect("text");
+    assert!(!err.contains("through sudo"), "{err}");
+}
+
+/// Catches a sudo test that takes root's own `SUDO_UID` or an unset one for another account
+/// (an operator running as root would be refused), or a caller's uid for none.
+#[test]
+fn only_a_sudo_uid_of_another_account_is_a_sudo_caller() {
+    use std::ffi::OsStr;
+    assert!(!is_sudo_uid(None));
+    assert!(!is_sudo_uid(Some(OsStr::new("0"))));
+    assert!(is_sudo_uid(Some(OsStr::new("1000"))));
+}
+
+/// The Linux layout on `root`: the one the tests of the unit `run` derives from the mode pin,
+/// whatever OS runs them, because the derivation is Linux's (a Mac has no unit to derive).
+fn linux_on(root: &Path) -> Layout {
+    Layout::linux(kbf_host::path::Root::new(root).expect("absolute"))
+}
+
+/// Writes `text` as the `kbf.toml` of the host `layout` describes.
+fn write_kbf_toml(layout: &Layout, text: &str) {
+    let file = layout.join(&layout.kbf_toml());
+    fs::create_dir_all(file.parent().expect("a directory")).expect("config dir");
+    fs::write(file, text).expect("kbf.toml");
 }
 
 /// Catches the packaged `kbf-installer.service` (one unit for every mode, no `--unit`) not
@@ -794,13 +962,14 @@ fn write_kbf_toml(root: &Path, text: &str) {
 #[test]
 fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
     let (_, root) = seeded("run-derived-unit");
+    let linux = linux_on(&root);
     let service = |flags: &[&str]| {
         let mut argv = vec!["run", "--passes", "1"];
         argv.extend_from_slice(flags);
         let Verb::Run(args) = parse(&argv).verb else {
             panic!("a run");
         };
-        target_of(&root, &args)
+        target_on(&root, &args, Platform::Linux)
     };
     for (mode, unit) in [
         ("frontend", "kbf-frontend.service"),
@@ -809,7 +978,7 @@ fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
         ("storage-and-daemon", "kbf-storage-and-daemon.service"),
         ("all-in-one", "kbf-all-in-one.service"),
     ] {
-        write_kbf_toml(&root, &format!("mode = \"{mode}\"\n"));
+        write_kbf_toml(&linux, &format!("mode = \"{mode}\"\n"));
         let derived = service(&[])
             .unwrap_or_else(|f| panic!("{mode}: {}", f.why))
             .service;
@@ -820,7 +989,7 @@ fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
         .expect("named")
         .service;
     assert_eq!(named.unit.as_deref(), Some("kbf-daemon.service"));
-    write_kbf_toml(&root, "mode = \"all-in-one\"\n");
+    write_kbf_toml(&linux, "mode = \"all-in-one\"\n");
     let named = service(&["--unit", "kbf-daemon.service"])
         .expect("the flag wins")
         .service;
@@ -844,15 +1013,21 @@ fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
 #[test]
 fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
     let (layout, root) = seeded("run-no-unit");
+    let linux = linux_on(&root);
     let Verb::Run(args) = parse(&["run", "--passes", "1"]).verb else {
         panic!("a run");
     };
-    let refused = |root: &Path| target_of(root, &args).err().expect("refused");
+    let refused = |root: &Path| {
+        target_on(root, &args, Platform::Linux)
+            .err()
+            .expect("refused")
+    };
     let missing = refused(&root);
     assert_eq!(missing.exit, Exit::Usage);
     assert!(missing.why.contains("--unit"), "{}", missing.why);
     assert!(missing.why.contains("is not there"), "{}", missing.why);
     assert!(missing.why.contains("run setup"), "{}", missing.why);
+    let kbf_toml = linux.join(&linux.kbf_toml());
     // Every refusal names the file, says what to do and is a usage exit: no panic, no default.
     let named = |f: &Failure, reason: &str| {
         assert_eq!(f.exit, Exit::Usage, "{reason}: {}", f.why);
@@ -862,45 +1037,57 @@ fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
         assert!(f.why.contains(reason), "{reason}: {}", f.why);
     };
     named(&missing, "is not there");
-    write_kbf_toml(&root, "other = 1\n");
+    write_kbf_toml(&linux, "other = 1\n");
     named(&refused(&root), "has no mode");
-    write_kbf_toml(&root, "mode = 3\n");
+    write_kbf_toml(&linux, "mode = 3\n");
     named(&refused(&root), "has no mode");
-    write_kbf_toml(&root, "mode = [unclosed\n");
+    write_kbf_toml(&linux, "mode = [unclosed\n");
     named(&refused(&root), "is not TOML");
-    fs::write(root.join("etc/kbf/kbf.toml"), [0xff, 0xfe]).expect("bytes");
+    fs::write(&kbf_toml, [0xff, 0xfe]).expect("bytes");
     named(&refused(&root), "is not UTF-8");
-    fs::write(root.join("etc/kbf/kbf.toml"), vec![b'#'; (1 << 20) + 1]).expect("big");
+    fs::write(&kbf_toml, vec![b'#'; (1 << 20) + 1]).expect("big");
     named(&refused(&root), "is over");
-    fs::remove_file(root.join("etc/kbf/kbf.toml")).expect("rm");
-    fs::create_dir(root.join("etc/kbf/kbf.toml")).expect("dir");
+    fs::remove_file(&kbf_toml).expect("rm");
+    fs::create_dir(&kbf_toml).expect("dir");
     named(&refused(&root), "cannot be read");
-    fs::remove_dir(root.join("etc/kbf/kbf.toml")).expect("rmdir");
-    write_kbf_toml(&root, "mode = \"node\"\n");
+    fs::remove_dir(&kbf_toml).expect("rmdir");
+    write_kbf_toml(&linux, "mode = \"node\"\n");
     named(&refused(&root), "no mode of kbf");
-    write_kbf_toml(&root, "mode = \"\"\n");
+    write_kbf_toml(&linux, "mode = \"\"\n");
     named(&refused(&root), "no mode of kbf");
-    write_kbf_toml(&root, "mode = \"daemon\"\n");
+    write_kbf_toml(&linux, "mode = \"daemon\"\n");
     let mac = derived_service(&layout, Platform::MacOs)
         .err()
         .expect("a Mac");
     assert_eq!(mac.exit, Exit::Usage);
     assert!(mac.why.contains("--launchd-label"), "{}", mac.why);
-    let (exit, err) = on(&root, &["run", "--passes", "1"]);
-    assert_eq!(
-        exit,
-        Exit::Ok,
-        "a daemon host does its pass on its unit: {err}"
-    );
-    write_kbf_toml(&root, "mode = \"all-in-one\"\n");
-    let (exit, err) = on(&root, &["run", "--passes", "1"]);
-    assert_eq!(
-        exit,
-        Exit::Failed,
-        "the database mode reads installer.toml: {err}"
-    );
-    assert!(err.contains("installer.toml"), "{err}");
-    assert!(!err.contains("needs --installer-config"), "{err}");
+    // The whole verb, on the platform this test runs on (the `kbf.toml` is that platform's).
+    if Platform::current() == Platform::Linux {
+        write_kbf_toml(&layout, "mode = \"daemon\"\n");
+        let (exit, err) = on(&root, &["run", "--passes", "1"]);
+        assert_eq!(
+            exit,
+            Exit::Ok,
+            "a daemon host does its pass on its unit: {err}"
+        );
+        write_kbf_toml(&layout, "mode = \"all-in-one\"\n");
+        let (exit, err) = on(&root, &["run", "--passes", "1"]);
+        assert_eq!(
+            exit,
+            Exit::Failed,
+            "the database mode reads installer.toml: {err}"
+        );
+        assert!(err.contains("installer.toml"), "{err}");
+        assert!(!err.contains("needs --installer-config"), "{err}");
+    } else {
+        // A Mac derives no label from the mode, whatever its kbf.toml says: it needs the flag.
+        for mode in ["daemon", "all-in-one"] {
+            write_kbf_toml(&layout, &format!("mode = \"{mode}\"\n"));
+            let (exit, err) = on(&root, &["run", "--passes", "1"]);
+            assert_eq!(exit, Exit::Usage, "{mode}: {err}");
+            assert!(err.contains("--launchd-label"), "{mode}: {err}");
+        }
+    }
 }
 
 /// Catches the derived database-mode unit reading no installer.toml (the schema step then
@@ -911,14 +1098,15 @@ fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
 #[test]
 fn a_derived_database_unit_reads_the_default_installer_toml_and_others_none() {
     let (_, root) = seeded("run-derived-config");
+    let linux = linux_on(&root);
     let config = |mode: &str, flags: &[&str]| {
-        write_kbf_toml(&root, &format!("mode = \"{mode}\"\n"));
+        write_kbf_toml(&linux, &format!("mode = \"{mode}\"\n"));
         let mut argv = vec!["run"];
         argv.extend_from_slice(flags);
         let Verb::Run(args) = parse(&argv).verb else {
             panic!("a run");
         };
-        target_of(&root, &args)
+        target_on(&root, &args, Platform::Linux)
             .expect("target")
             .installer_config
             .map(|p| p.to_string())
@@ -945,14 +1133,15 @@ fn a_derived_database_unit_reads_the_default_installer_toml_and_others_none() {
 #[test]
 fn the_verbs_that_manage_a_host_wait_for_its_migration() {
     use std::os::unix::fs::PermissionsExt;
-    let (_, root) = seeded("unmigrated");
+    let (layout, root) = seeded("unmigrated");
     // The installer's directory as a host has it (the guard judges it like every file).
     fs::set_permissions(
-        root.join("var/lib/kbf-installer"),
+        layout.join(&layout.state_dir()),
         fs::Permissions::from_mode(0o755),
     )
     .expect("mode");
-    let old = root.join("var/lib/kbf-deploy");
+    // The old layout's state is where the platform keeps it, as the guard looks.
+    let old = layout.join(&crate::migrate::Roots::new(layout.platform()).old_state);
     fs::create_dir_all(&old).expect("old state dir");
     fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).expect("mode");
     let state = old.join("state.json");
@@ -965,7 +1154,7 @@ fn the_verbs_that_manage_a_host_wait_for_its_migration() {
 
     let held: [&[&str]; 5] = [
         &RUN,
-        &["setup", "--mode=frontend"],
+        &["setup", "--mode=daemon"],
         &["gc"],
         &["confirm", "--id=1-5", "--unit", "kbf.service"],
         &["rollback", "--unit", "kbf.service"],
@@ -996,10 +1185,21 @@ fn the_verbs_that_manage_a_host_wait_for_its_migration() {
 /// Mutants to plant: `Verb::FetchChild` or `Verb::Migrate(_)` moved to the `true` arm; `Verb::Setup(_)` to the `false` one.
 #[test]
 fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
-    let held: [&[&str]; 10] = [
+    let digest = "a".repeat(64);
+    let fetch_child = [
+        "fetch-child",
+        "--kind",
+        "url",
+        "--url",
+        "http://h.example",
+        "--sha256",
+        digest.as_str(),
+        "--limit",
+        "10",
+    ];
+    let held: [&[&str]; 9] = [
         &["setup", "--mode=frontend"],
         &RUN,
-        &["update", "--commit", B, "--frontend"],
         &["confirm", "--id=1-5", "--unit", "kbf.service"],
         &["revert", "--id=1-5", "--unit", "kbf.service"],
         &["rollback", "--unit", "kbf.service"],
@@ -1008,13 +1208,23 @@ fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
         &["stage"],
         &["activate"],
     ];
-    let free: [&[&str]; 6] = [
+    let free: [&[&str]; 7] = [
+        // `update` is an unprivileged client of the proxy's API (new-layout hosts only); the
+        // root half it asks for, `run`, is held.
+        &[
+            "update",
+            "--commit",
+            B,
+            "--frontend",
+            "--api",
+            "127.0.0.1:1",
+        ],
         &["status"],
         &["check"],
         &["boot-check"],
         &["quiesce"],
         &["migrate"],
-        &["fetch-child"],
+        &fetch_child,
     ];
     for args in held {
         assert!(parse(args).verb.manages_host(), "{args:?} is held");
@@ -1050,13 +1260,15 @@ fn the_probe_user_is_looked_up_with_the_exit_codes_of_the_contract() {
         })
     });
     assert_eq!(
-        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        probe_user(&exec, "kbf-fetch", false, Platform::Linux)
+            .expect("found")
+            .uid,
         991
     );
-    let missing = probe_user(&exec, "nobody-here", false).expect_err("unknown");
+    let missing = probe_user(&exec, "nobody-here", false, Platform::Linux).expect_err("unknown");
     assert_eq!(missing.exit, Exit::Usage);
     assert!(missing.why.contains("nobody-here"), "{}", missing.why);
-    let broken = probe_user(&exec, "broken", false).expect_err("broken");
+    let broken = probe_user(&exec, "broken", false, Platform::Linux).expect_err("broken");
     assert_eq!(broken.exit, Exit::Failed);
     assert!(broken.why.contains("getent"), "{}", broken.why);
 }
@@ -1091,7 +1303,7 @@ fn the_version_probe_never_runs_as_root_on_a_host() {
         })
     });
     for name in ["root", "uid-zero", "gid-zero"] {
-        let error = probe_user(&exec, name, false).expect_err(name);
+        let error = probe_user(&exec, name, false, Platform::Linux).expect_err(name);
         assert_eq!(error.exit, Exit::Usage, "{name}");
         assert!(
             error.why.contains(name) && error.why.contains("root"),
@@ -1100,10 +1312,17 @@ fn the_version_probe_never_runs_as_root_on_a_host() {
         );
     }
     assert_eq!(
-        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        probe_user(&exec, "kbf-fetch", false, Platform::Linux)
+            .expect("found")
+            .uid,
         991
     );
-    assert_eq!(probe_user(&exec, "root", true).expect("a rehearsal").uid, 0);
+    assert_eq!(
+        probe_user(&exec, "root", true, Platform::Linux)
+            .expect("a rehearsal")
+            .uid,
+        0
+    );
 }
 
 /// Catches `migrate` missing from the command line or from the dispatcher: its flags parse
@@ -1247,3 +1466,6 @@ fn a_path_is_not_joined_to_a_relative_root() {
         PathBuf::from("/srv/root/etc/kbf/installer.toml")
     );
 }
+
+#[path = "app_backup_tests.rs"]
+mod backup_cli;

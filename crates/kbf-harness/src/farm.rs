@@ -29,6 +29,10 @@ pub use crate::topology::{
     Bins, Driver, FarmError, Limits, NodeMode, ProcRecord, Role, Topology, daemon_id, node_id,
 };
 
+/// The bearer token the frontend of a [`Farm::start`] farm is given (32 or more visible
+/// characters, as the API requires), for the operator calls a scenario makes.
+pub const API_TOKEN: &str = "rehearsal-api-token-of-32-or-more-visible-chars";
+
 struct Member {
     role: Role,
     spec: Spec,
@@ -163,6 +167,11 @@ pub fn control_socket(dir: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("kbf-farm-{:x}.sock", path_tag(dir)))
 }
 
+/// The frontend's `--default-platform` on a test box: every node is this host, whatever
+/// its architecture. The unit's default (`linux/x86_64`) leaves an action that names no
+/// architecture with no worker on an aarch64 host.
+const ONE_HOST_PLATFORM: &str = "--default-platform=none";
+
 impl Farm {
     /// Renders the units and starts a process from each, then waits for each process's
     /// start line. `dir` holds every process's directories (and must be fresh); `logs`
@@ -180,6 +189,7 @@ impl Farm {
     ///   is planted and `--id-files` stands for `/etc/subuid`;
     /// - with [`Driver::Native`], `--driver=native` replaces it and `KBF_IMAGES` is empty
     ///   (only the container driver takes `--image`);
+    /// - the frontend's `--default-platform` is `none` (the nodes are this host);
     /// - the frontend's control socket is in the temporary directory (a `RuntimeDirectory=`
     ///   is systemd's, and a scratch path is too long for a socket's);
     /// - the topology's [`Limits`] and overrides are set on top.
@@ -287,7 +297,7 @@ impl Farm {
         pki.issue_reapi(&etc, &["localhost"]);
         // The unit names `--api-token-file <etc>/api-token`; the harness's API calls only read.
         let token = etc.join("api-token");
-        crate::pki::write_private(&token, b"rehearsal-api-token-of-32-or-more-visible-chars\n");
+        crate::pki::write_private(&token, format!("{API_TOKEN}\n").as_bytes());
         farm.ca = std::fs::read(etc.join("ca.pem")).expect("ca");
         let cfg = settings(
             &root,
@@ -310,6 +320,7 @@ impl Farm {
         let unit = overrides(
             Role::Frontend,
             unit.replace(&[state])
+                .set(&[ONE_HOST_PLATFORM.to_owned()])
                 .append(&[control])
                 .set(&topo.limits.frontend),
         );
@@ -737,6 +748,36 @@ impl Farm {
     pub fn ports(&self) -> Option<(&Ports, std::ops::Range<u16>)> {
         let (claim, ports) = self.claim.as_ref()?;
         Some((ports, claim.base()..claim.base() + crate::ports::BLOCK))
+    }
+
+    /// `POST path` with the JSON `body` to the frontend's operator API, as an operator with
+    /// the farm's token does: the status code and the body, or `None` while nothing answers.
+    #[must_use]
+    pub fn post(&self, path: &str, body: &str) -> Option<(u16, String)> {
+        api::post(self.api, API_TOKEN, path, body)
+    }
+
+    /// The storage members the frontend lists; `None` while it does not answer.
+    #[must_use]
+    pub fn members(&self) -> Option<Vec<api::Member>> {
+        api::members(self.api)
+    }
+
+    /// The member of storage node `n` (a [`Role::Node`]): the one whose address is node
+    /// `n`'s loopback address. `None` while the frontend does not list it.
+    #[must_use]
+    pub fn member_of(&self, n: usize) -> Option<api::Member> {
+        let prefix = format!("{}:", loopback(n));
+        self.members()?
+            .into_iter()
+            .find(|m| m.addr.trim_start_matches("https://").starts_with(&prefix))
+    }
+
+    /// Every line of every process's output, of every generation of it (a restart keeps
+    /// what the process before it printed), that holds `needle`, each as `file: line`.
+    #[must_use]
+    pub fn log_hits(&self, needle: &str) -> Vec<String> {
+        crate::procs::log_hits(&self.logs, needle)
     }
 
     /// The frontend's operator API port (on loopback).

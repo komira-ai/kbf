@@ -8,8 +8,6 @@
 //! cores and a mean of about 26 concurrent leases, the node named first held most of
 //! them and ran at several times its cores while the others were lightly used.
 
-use std::collections::VecDeque;
-
 use kbf_caps::NodeCaps;
 use kbf_sched::{DaemonInstance, Event, Input, Request, Scheduler};
 use kbf_types::{
@@ -395,131 +393,42 @@ fn the_platform_is_matched_before_the_spread() {
     assert_eq!(grant.worker, w("a-mac"));
 }
 
-/// Catches: an action at the whole host's memory (it runs on a node with no other lease)
-/// starved by spreading. Two nodes of 4 cores hold two small leases each (placed by
-/// cordoning the other node, so the setup does not depend on how placement chooses); a
-/// whole-host action is queued, and a small action arrives each time a lease ends, the
-/// oldest lease first. A least-booked choice refills whichever node a lease ended on,
-/// so neither ever empties unless the queued action holds one: the node it holds takes
-/// no work behind it and drains, and it runs within a few rounds.
+/// The contract of an action at a worker's whole memory (the last step of the memory
+/// ladder): it waits while every node has a lease, and nothing reserves a node for it, so
+/// work behind it is placed on the nodes; it runs, alone, once a node has emptied.
+/// Two nodes of 4 cores hold two small leases each (placed by cordoning the other node,
+/// so the setup does not depend on how placement chooses); a whole-host action is
+/// queued, then a small one.
+///
+/// Catches: a hold for whole-memory actions. With a node held, the small action cannot go
+/// to `a` (which the tie in load gives it, being first by name) and goes to `b`.
 #[test]
-fn a_whole_host_action_is_not_starved_by_spread() {
+fn a_whole_memory_action_waits_for_a_node_to_empty_and_holds_none() {
     let mut h = Harness::linux(&[("a", 4), ("b", 4)], 16 * GIB);
-    let mut running: VecDeque<LeaseGrant> = VecDeque::new();
+    let mut running = Vec::new();
     for node in ["a", "b", "a", "b"] {
-        running.push_back(h.place_on(node, Resources::new(1_000, 4 * GIB)));
+        running.push(h.place_on(node, Resources::new(1_000, 4 * GIB)));
     }
     assert_eq!((h.held("a"), h.held("b")), (2, 2));
-    for grant in &running {
-        h.start(grant);
-    }
     h.submit(Resources::new(1_000, 16 * GIB), &[]);
     let [host] = h.s.queued().collect::<Vec<_>>().try_into().unwrap();
-    assert!(h.tick().is_empty(), "beside the small leases");
+    assert!(h.tick().is_empty(), "every node has leases");
 
-    for _ in 0..8 {
-        let ended = running.pop_front().expect("a lease is running");
-        h.finish(&ended);
-        h.submit_many(1, Resources::new(1_000, 4 * GIB));
-        for grant in h.tick() {
-            if grant.operation == host {
-                assert_eq!(
-                    h.held(grant.worker.as_str()),
-                    1,
-                    "the whole-host action runs alone"
-                );
-                return;
-            }
-            h.start(&grant);
-            running.push_back(grant);
-        }
-    }
-    panic!("a whole-host action waited through 8 rounds of small work");
-}
-
-/// A farm of `big` (4 cores, 64 GiB) and `other` (4 cores, `other_gib` GiB). The node
-/// `free` names holds three one-core leases and the other four, so neither has the two
-/// cores a queued action of 2 cores and 32 GiB needs. A one-core action is then
-/// submitted: the workers it is placed on in the next tick.
-fn placed_beside_a_blocked_action(other_gib: u64, free: &str) -> Vec<String> {
-    let mut h = Harness::new();
-    h.worker("big", 4, 64 * GIB, linux());
-    h.worker("other", 4, other_gib * GIB, linux());
-    let mut running = Vec::new();
-    for node in ["big", "other"] {
-        for _ in 0..(if node == free { 3 } else { 4 }) {
-            running.push(h.place_on(node, SMALL));
-        }
-    }
+    h.submit(Resources::new(1_000, 4 * GIB), &[]);
+    let [behind] = h.tick().try_into().expect("the work behind it runs");
+    assert_eq!(behind.worker, w("a"), "no node is held back from it");
+    running.push(behind);
     for grant in &running {
         h.start(grant);
     }
-    h.submit(Resources::new(2_000, 32 * GIB), &[]);
-    assert!(h.tick().is_empty(), "no worker has two cores free");
-    h.submit(SMALL, &[]);
-    h.tick()
-        .iter()
-        .map(|grant| grant.worker.as_str().to_owned())
-        .collect()
-}
+    assert!(h.tick().is_empty(), "both nodes still have leases");
 
-/// Catches: an action holding a worker that is not one it would run alone on. An action
-/// holds only a worker whose whole memory it asks for and that could run it. Here it asks
-/// for 32 GiB, and `big` has 64, so on `big` it runs beside others and is never held.
-/// The one-core action behind it goes to the node with a core free, except where that
-/// node is the one held (32 GiB `other`).
-///
-/// - 64 GiB `other`: no worker is at the action's memory; nothing is held.
-/// - 16 GiB `other`: too small to run the action at all, though "at the whole memory" by
-///   the comparison alone. It once made `big` held, so a one-core action waited with
-///   `big` having a core free; and a hold on `other` itself, which runs nothing of the
-///   action, would keep the one-core action from the core `other` has free.
-/// - 32 GiB `other`: the action is at its whole memory, and `other` is the worker it
-///   would run alone on: `other` is held, not `big` (which once had fewer leases), so the
-///   one-core action goes to `big` if `big` has the core free and waits if `other` does.
-#[test]
-fn a_node_too_small_for_an_action_does_not_make_it_hold_a_worker() {
-    let cases: [(u64, &str, &[&str]); 6] = [
-        (64, "big", &["big"]),
-        (64, "other", &["other"]),
-        (16, "big", &["big"]),
-        (16, "other", &["other"]),
-        (32, "big", &["big"]),
-        (32, "other", &[]),
-    ];
-    for (other_gib, free, want) in cases {
-        assert_eq!(
-            placed_beside_a_blocked_action(other_gib, free),
-            want,
-            "with `other` of {other_gib} GiB and the core free on {free}"
-        );
+    for grant in running.iter().filter(|grant| grant.worker == w("a")) {
+        h.finish(grant);
     }
-}
-
-/// Catches: the hold put on a worker that is not the one the action must run alone on,
-/// and no hold when only some of the farm's workers are at its memory. `big` is the one
-/// node at the action's 64 GiB, and `huge` (128 GiB) has fewer leases, so a hold chosen
-/// by lease count alone takes `huge`; with the hold on `big`, a one-core action goes to
-/// `huge`, where the two have one core free each. Without the hold, or with the hold on
-/// `huge`, `big` has the lower share (3 of 4 cores against 7 of 8) and takes it.
-#[test]
-fn the_hold_is_on_the_worker_the_action_would_run_alone_on() {
-    let mut h = Harness::new();
-    h.worker("big", 4, 64 * GIB, linux());
-    h.worker("huge", 8, 128 * GIB, linux());
-    let mut running = Vec::new();
-    for _ in 0..3 {
-        running.push(h.place_on("big", SMALL));
-    }
-    running.push(h.place_on("huge", Resources::new(7_000, GIB)));
-    for grant in &running {
-        h.start(grant);
-    }
-    h.submit(Resources::new(2_000, 64 * GIB), &[]);
-    assert!(h.tick().is_empty(), "neither worker has two cores free");
-    h.submit(SMALL, &[]);
     let [grant] = h.tick().try_into().expect("one grant");
-    assert_eq!(grant.worker, w("huge"));
+    assert_eq!((grant.operation, grant.worker), (host, w("a")));
+    assert_eq!(h.held("a"), 1, "the whole-host action runs alone");
 }
 
 /// A known limit, which `docs/design/scheduler.md` states (issue #169): an action that

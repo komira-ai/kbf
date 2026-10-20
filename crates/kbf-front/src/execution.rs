@@ -379,6 +379,10 @@ struct Presubmit<'a> {
     /// Of a walk over a store: Directories skipped as verified, the time reading
     /// Directories and the time asking about files, the FindMissing calls and the files.
     dirs_skipped: u64,
+    /// With the content cache: Directories taken without a read, and the cached ones
+    /// put to FindMissing.
+    dir_cache_hits: u64,
+    dirs_present_checked: u64,
     dirs: Duration,
     files: Duration,
     file_asks: u64,
@@ -398,6 +402,8 @@ impl<'a> Presubmit<'a> {
             submit: Duration::ZERO,
             dir_reads: 0,
             dirs_skipped: 0,
+            dir_cache_hits: 0,
+            dirs_present_checked: 0,
             dirs: Duration::ZERO,
             files: Duration::ZERO,
             file_asks: 0,
@@ -423,6 +429,8 @@ impl Drop for Presubmit<'_> {
             submit_ms = self.submit.as_millis(),
             dir_reads = self.dir_reads,
             dirs_skipped = self.dirs_skipped,
+            dir_cache_hits = self.dir_cache_hits,
+            dirs_present_checked = self.dirs_present_checked,
             dirs_ms = self.dirs.as_millis(),
             files_ms = self.files.as_millis(),
             file_asks = self.file_asks,
@@ -690,6 +698,8 @@ impl<D> ExecutionService<D> {
         let walked = walked?;
         window.dir_reads += walked.dirs_read;
         window.dirs_skipped += walked.dirs_skipped;
+        window.dir_cache_hits += walked.dir_cache_hits;
+        window.dirs_present_checked += walked.dirs_present_checked;
         window.dirs += walked.dirs_time;
         window.files += walked.files_time;
         window.file_asks += walked.file_asks;
@@ -759,6 +769,18 @@ impl<D> ExecutionService<D> {
         m.execute_walk_dirs_skipped.add(walked.dirs_skipped);
         m.execute_walk_file_asks.add(walked.file_asks);
         m.execute_walk_files_checked.add(walked.files_checked);
+        for took in &walked.read_times {
+            m.execute_walk_dir_read.observe_duration(*took);
+        }
+        m.execute_dir_cache_hits.add(walked.dir_cache_hits);
+        m.execute_dir_cache_misses.add(walked.dir_cache_misses);
+        m.execute_dir_cache_merged.add(walked.dir_cache_merged);
+        m.execute_dir_cache_evictions.add(walked.dir_cache_evicted);
+        m.execute_dir_cache_present_checked
+            .add(walked.dirs_present_checked);
+        if walked.phased {
+            m.execute_dir_cache_bytes.set(walked.dir_cache_bytes);
+        }
         if walked.phased {
             m.execute_walk_dirs.observe_duration(walked.dirs_time);
             m.execute_walk_files.observe_duration(walked.files_time);

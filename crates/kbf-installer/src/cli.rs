@@ -39,12 +39,12 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Verb {
     /// First install: accounts, directories, installer.toml, the first release.
-    Setup(SetupArgs),
+    Setup(Box<SetupArgs>),
     /// What is installed, staged and pending, and the last refusal.
     Status,
     /// Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap.
     Run(RunArgs),
-    /// Order an update of this host's own frontend (root, inline).
+    /// Swap this host's frontend through the proxy's update API, and wait for it.
     Update(UpdateArgs),
     /// Keep the pending swap, naming its activation.
     Confirm(ActivationArgs),
@@ -69,14 +69,21 @@ pub enum Verb {
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
     Check,
+    /// Dump the state database to the backup directory and keep the newest few; run by
+    /// kbf-backup.timer as the service user, who connects as the role installer.toml's database URL names.
+    Backup(BackupArgs),
+    /// Restore a backup into an empty state database, as the service user, who connects as the role installer.toml's database URL names.
+    Restore(RestoreArgs),
     /// Serve the frontend host's public port: route each stream to the active child frontend.
     Proxy(ProxyArgs),
     #[command(hide = true)]
     Stage,
     #[command(hide = true)]
     Activate,
+    /// Internal: pull one component to standard output. The installer starts it itself, as the
+    /// fetch user, with fixed flags; it is not a command for a person.
     #[command(hide = true)]
-    FetchChild,
+    FetchChild(crate::fetch::child::ChildArgs),
 }
 
 /// The `kbf` modes a host can be set up for. There is no `node` mode.
@@ -129,15 +136,30 @@ pub struct SetupArgs {
     /// kbf reads. For the modes that enroll.
     #[arg(long)]
     pub token_file: Option<String>,
-    /// The state database, as postgres:///NAME?host=SOCKET_DIR (no password). Required for
-    /// `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to
-    /// kbf.toml, and setup creates (or brings forward) its schema. The server, the database
-    /// and the role exist before setup runs.
+    /// The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password).
+    /// Required for `frontend` and `all-in-one`: written to installer.toml and, as
+    /// `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. The
+    /// server exists before setup runs, and so do the role and the database unless
+    /// --create-local-database makes them.
     #[arg(long)]
     pub database: Option<String>,
+    /// For a host whose Postgres runs locally: create the login role and the database the
+    /// `--database` URL names (owned by the role, no password), as the server's superuser over
+    /// its Unix socket (peer authentication, no password), if they are not there. Never
+    /// edits `pg_hba.conf`; refuses, saying which rule to add, when the server does not admit
+    /// the login. Without it, setup only checks that it can log in.
+    #[arg(long)]
+    pub create_local_database: bool,
     /// Enable the units without starting them.
     #[arg(long)]
     pub no_start: bool,
+    /// The kbf.toml settings of a frontend or all-in-one host (listeners, certificates,
+    /// storage): each sets the kbf flag of its name.
+    #[command(flatten)]
+    pub kbf: crate::setup::kbf_settings::KbfFlags,
+    /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
+    #[command(flatten)]
+    pub proxy: crate::setup::proxy::ProxyFlags,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
     /// host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which
     /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.
@@ -150,9 +172,32 @@ pub struct UpdateArgs {
     /// The release to update to (40 hex characters).
     #[arg(long)]
     pub commit: CommitId,
-    /// Update this host's frontend. Node updates come on the frontend's order, not from here.
+    /// Update this host's frontend: ask the update API of the proxy to swap it, and wait.
     #[arg(long, required = true)]
     pub frontend: bool,
+    /// The proxy's public address, `127.0.0.1:port`: the update API is served there.
+    #[arg(long)]
+    pub api: String,
+    /// CA certificates (PEM) the API's certificate is verified against, besides the system's.
+    #[arg(long)]
+    pub api_ca: Option<std::path::PathBuf>,
+    /// The name the API's certificate carries (the address's own IP when none is given).
+    #[arg(long)]
+    pub api_server_name: Option<String>,
+    /// The operator token the API takes: a file of mode 0600 or 0400. `setup` writes it here.
+    #[arg(long, default_value = "/etc/kbf/api-token")]
+    pub token_file: std::path::PathBuf,
+    /// Have the new frontend update the nodes once it has baked. Without it only the
+    /// frontend is swapped.
+    #[arg(long)]
+    pub nodes: bool,
+    /// Names this update to the API, so a run repeated after a lost connection is the same
+    /// update. Random when not given.
+    #[arg(long)]
+    pub request_id: Option<String>,
+    /// How long to wait for the update to end, the new frontend's bake included.
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
+    pub handover_timeout_s: u64,
 }
 
 #[derive(Args)]
@@ -224,11 +269,13 @@ pub struct GcArgs {
 #[derive(Args)]
 pub struct RunArgs {
     /// Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it.
-    #[arg(long, default_value = "/var/lib/kbf-installer", value_parser = kbf_host::HostPath::new)]
-    pub update_dir: kbf_host::HostPath,
+    /// Default: the host's state directory (`/var/lib/kbf-installer`, `/var/db/kbf-installer` on a Mac).
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub update_dir: Option<kbf_host::HostPath>,
     /// The order spool: owned by the service user, mode 0700, inside a root-owned parent.
-    #[arg(long, default_value = "/var/lib/kbf-installer/orders", value_parser = kbf_host::HostPath::new)]
-    pub orders_dir: kbf_host::HostPath,
+    /// Default: `orders` in the state directory.
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub orders_dir: Option<kbf_host::HostPath>,
     /// The systemd unit to restart after a swap (Linux). Without it and without
     /// `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one
     /// packaged kbf-installer.service serves every mode.
@@ -258,6 +305,20 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
+    /// Root's directory, as the flag gives it; else the host's own.
+    pub fn update_dir_in(&self, layout: &crate::layout::Layout) -> kbf_host::HostPath {
+        self.update_dir
+            .clone()
+            .unwrap_or_else(|| layout.update_dir())
+    }
+
+    /// The order spool, as the flag gives it; else the host's own.
+    pub fn orders_dir_in(&self, layout: &crate::layout::Layout) -> kbf_host::HostPath {
+        self.orders_dir
+            .clone()
+            .unwrap_or_else(|| layout.orders_dir())
+    }
+
     /// The service this `run` restarts, when the flags name it; `None` when neither does.
     pub fn named_service(&self) -> Option<ServiceArgs> {
         (self.unit.is_some() || self.launchd_label.is_some()).then(|| ServiceArgs {
@@ -279,7 +340,8 @@ pub struct MigrateArgs {
     /// The old helper's unit: stopped and disabled, so the installer is the only manager.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub helper_unit: Option<crate::migrate::Unit>,
-    /// The installer's own unit, which a rollback stops and disables first.
+    /// The installer's own unit: enabled and started as the last step of a migration, stopped
+    /// and disabled first by a rollback.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub installer_unit: Option<crate::migrate::Unit>,
     /// Where the host gets its releases: decides where the replay floor is seeded from.
@@ -290,9 +352,47 @@ pub struct MigrateArgs {
     /// run says so.
     #[arg(long)]
     pub min_generation: Option<u64>,
-    /// The unprivileged user the old binaries' `--version --json` runs as.
-    #[arg(long, default_value = "kbf-fetch")]
-    pub fetch_user: String,
+    /// The unprivileged user the old binaries' `--version --json` runs as. Without the flag it
+    /// is the fetch account of the platform (`kbf-fetch`; `_kbf-fetch` on a Mac), which on a
+    /// Mac an applying migration creates when it is not there (the way `setup` does).
+    #[arg(long)]
+    pub fetch_user: Option<String>,
+}
+
+#[derive(Args)]
+pub struct BackupArgs {
+    /// installer.toml, under the host root: its `database` key names the database to dump and
+    /// its `backup_keep` how many backups stay (default 7).
+    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
+    pub installer_config: kbf_host::HostPath,
+    /// The backup directory: made 0700 when it is not there, owned by the user that runs this.
+    #[arg(long, default_value = "/var/lib/kbf-server/backups", value_parser = kbf_host::HostPath::new)]
+    pub dir: kbf_host::HostPath,
+    /// The `pg_dump` program (a name looked up in PATH, or a path).
+    #[arg(long, default_value = "pg_dump")]
+    pub pg_dump: String,
+    /// The `pg_restore` program, which checks the dump can be read.
+    #[arg(long, default_value = "pg_restore")]
+    pub pg_restore: String,
+}
+
+#[derive(Args)]
+pub struct RestoreArgs {
+    /// The backup to restore (a file `backup` wrote).
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub file: kbf_host::HostPath,
+    /// installer.toml, under the host root: its `database` key names the database to restore
+    /// into (unless --database does), which must be empty of kbf's schema.
+    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
+    pub installer_config: kbf_host::HostPath,
+    /// Restore into this database instead, for a restore test: a bare NAME (a database on the
+    /// server and socket installer.toml names, for the role it names) or a URL with no
+    /// password.
+    #[arg(long)]
+    pub database: Option<String>,
+    /// The `pg_restore` program (a name looked up in PATH, or a path).
+    #[arg(long, default_value = "pg_restore")]
+    pub pg_restore: String,
 }
 
 #[derive(Args)]
@@ -301,11 +401,16 @@ pub struct ProxyArgs {
     /// `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac).
     #[arg(long)]
     pub config: Option<std::path::PathBuf>,
+    /// The order spool the update API writes and the root half reads: owned by the service
+    /// user. As `run --orders-dir`.
+    #[arg(long, default_value = "/var/lib/kbf-installer/orders")]
+    pub orders_dir: std::path::PathBuf,
     /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
     #[arg(long)]
     pub check: bool,
     /// Root's directory: the proxy reads `status.json` here, to start the installed release
-    /// when no frontend child is running.
+    /// when no frontend child is running, and the update API reads its status. As
+    /// `run --update-dir`.
     #[arg(long, default_value = "/var/lib/kbf-installer")]
     pub update_dir: std::path::PathBuf,
 }
@@ -333,23 +438,36 @@ impl Verb {
             Verb::Migrate(_) => "migrate",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
+            Verb::Backup(_) => "backup",
+            Verb::Restore(_) => "restore",
             Verb::Proxy(_) => "proxy",
             Verb::Stage => "stage",
             Verb::Activate => "activate",
-            Verb::FetchChild => "fetch-child",
+            Verb::FetchChild(_) => "fetch-child",
         }
     }
 
-    /// Every verb but `status`, `check` and `proxy` (which runs as the unprivileged service
-    /// user) needs root.
+    /// Every verb but `status`, `check`, `proxy` (which runs as the unprivileged service
+    /// user), `update` (a client of the proxy's update API: it needs whoever can read the
+    /// token file, which is the only thing it asks of its user), `backup` and `restore` needs
+    /// root. `backup` and `restore` run as the user that is the database's role under peer
+    /// authentication, which root is not.
     pub fn needs_root(&self) -> bool {
-        !matches!(self, Verb::Status | Verb::Check | Verb::Proxy(_))
+        !matches!(
+            self,
+            Verb::Status
+                | Verb::Check
+                | Verb::Proxy(_)
+                | Verb::Update(_)
+                | Verb::Backup(_)
+                | Verb::Restore(_)
+        )
     }
 
     /// Whether the verb changes what a host runs or how it is managed, so it must not run
     /// while the old layout's state is the host's and unmigrated (the old helper and the
     /// installer never both manage one host; `migrate` is how that ends). `status`, `check`,
-    /// `boot-check`, `quiesce` and `migrate` itself change no release; `fetch-child` is the
+    /// `boot-check`, `quiesce`, `backup`, `restore` and `migrate` itself change no release; `fetch-child` is the
     /// unprivileged process a verb that does manage the host starts, and manages nothing.
     ///
     /// Every verb is named (no `_`): a verb added later does not compile until it says
@@ -358,7 +476,6 @@ impl Verb {
         match self {
             Verb::Setup(_)
             | Verb::Run(_)
-            | Verb::Update(_)
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
@@ -372,7 +489,13 @@ impl Verb {
             | Verb::Quiesce
             | Verb::Migrate(_)
             | Verb::Proxy(_)
-            | Verb::FetchChild => false,
+            // `update` only POSTs to the proxy's API as an unprivileged client, and the proxy
+            // exists only on a new-layout host; the root half of an update (`run`) is guarded.
+            // `dispatch` returns for it before the old-layout guard, so the table says so.
+            | Verb::Update(_)
+            | Verb::Backup(_)
+            | Verb::Restore(_)
+            | Verb::FetchChild(_) => false,
         }
     }
 
@@ -384,6 +507,7 @@ impl Verb {
             Verb::Run(_)
             | Verb::BootCheck(_)
             | Verb::Proxy(_)
+            | Verb::Update(_)
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
@@ -391,13 +515,14 @@ impl Verb {
             | Verb::Gc(_)
             | Verb::Migrate(_)
             | Verb::Quiesce
-            | Verb::Setup(_) => None,
+            | Verb::Backup(_)
+            | Verb::Restore(_)
+            | Verb::Setup(_)
+            | Verb::FetchChild(_) => None,
             Verb::Check => Some("P10"),
             Verb::Status => Some("P4"),
-            Verb::Update(_) => Some("P13"),
             Verb::Activate => Some("P5"),
             Verb::Stage => Some("P8"),
-            Verb::FetchChild => Some("P7"),
         }
     }
 }

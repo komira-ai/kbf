@@ -12,6 +12,8 @@ pub struct FakeOs {
     pub euid: u32,
     pub platform: Platform,
     pub users: Vec<RunUser>,
+    /// The login shell of an account named here; any other has the shell `setup` makes.
+    pub shells: Vec<(String, String)>,
     pub subuid: String,
     pub subgid: String,
     pub lingering: BTreeSet<String>,
@@ -43,6 +45,7 @@ impl FakeOs {
             euid: 0,
             platform: Platform::Linux,
             users: vec![user("kbf", 990), user("kbf-server", 989)],
+            shells: Vec::new(),
             subuid: String::new(),
             subgid: String::new(),
             lingering: BTreeSet::new(),
@@ -90,6 +93,19 @@ impl Os for FakeOs {
 
     fn user(&self, name: &str) -> io::Result<Option<RunUser>> {
         Ok(self.users.iter().find(|u| u.name == name).cloned())
+    }
+
+    fn login_shell(&self, name: &str) -> io::Result<String> {
+        let made = match self.platform {
+            Platform::Linux => "/usr/sbin/nologin",
+            Platform::MacOs => "/usr/bin/false",
+        };
+        Ok(self
+            .shells
+            .iter()
+            .find(|(n, _)| n == name)
+            .map_or(made, |(_, s)| s)
+            .to_owned())
     }
 
     fn subuid(&self) -> io::Result<String> {

@@ -9,8 +9,9 @@
 //!   other writes (0755 all the way down): `kbf-installer check` refuses to run from a
 //!   user-owned prefix, which is why there is no formula (a Homebrew prefix is the
 //!   user's) and why the tool is not under `/usr/local/bin`;
-//! - `/usr/local/kbf-installer/trust/<name>` (0644) for each `--trust` file: the
-//!   release's pinned `gh`, trusted root and `installer.conf`;
+//! - `/usr/local/kbf-installer/trust/<name>` for each `--trust` file: the release's
+//!   pinned `gh` (0755, like the Linux package's), `trusted_root.jsonl` and
+//!   `installer.conf` (0644), which `cargo xtask pkg-trust` writes ([`trust_mode`]);
 //! - `/Library/LaunchDaemons/com.komira.kbf-installer.plist` (0644): `--launchd-plist`;
 //! - `/var/db/kbf-installer` (0700), the installer's state directory, empty;
 //! - `/Library/Logs/kbf-installer` (0755), where the job writes.
@@ -44,10 +45,12 @@ use std::path::{Path, PathBuf};
 use crate::Error;
 use crate::fetch::Sha256;
 use crate::package::{read, write_new};
+use crate::pkg_linux::TRUST_FILES;
 
 pub mod bom;
 pub mod brew;
 pub mod cpio;
+pub mod open;
 pub mod sha1;
 pub mod tree;
 pub mod xar;
@@ -190,6 +193,15 @@ pub struct Build<'a> {
     pub out: &'a Path,
 }
 
+/// The mode of the trust file `name`: the Linux package's ([`TRUST_FILES`]), so the
+/// pinned `gh` is executable and the data files are not; another name is data.
+pub fn trust_mode(name: &str) -> u32 {
+    TRUST_FILES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or(0o644, |(_, mode)| *mode)
+}
+
 /// The tree `pkg build` packages.
 fn installed(b: &Build) -> Result<Tree, Error> {
     let binary = read(b.binary)?;
@@ -221,8 +233,12 @@ fn installed(b: &Build) -> Result<Tree, Error> {
                 path.display()
             )));
         };
-        tree.file(&format!("{TRUST_DIR}/{name}"), 0o644, read(path)?)
-            .map_err(fail)?;
+        tree.file(
+            &format!("{TRUST_DIR}/{name}"),
+            trust_mode(name),
+            read(path)?,
+        )
+        .map_err(fail)?;
     }
     Ok(tree)
 }

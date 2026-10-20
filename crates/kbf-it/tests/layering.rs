@@ -547,7 +547,10 @@ fn the_proxy_reaches_no_child_installer_or_runtime_crate() {
 /// settings file whose `[proxy]` table the verb reads, and the swap's real gate over the
 /// proxy's handle (`proxy/gate_real.rs`, with its tests), and the supervisor that starts the
 /// children on the ports of the proxy's upstream table (`proxy/supervisor.rs`, which also
-/// holds the real gate). The rest of `proxy/` is written against traits and names no proxy
+/// holds the real gate), the verb's own tests (`proxy_verb_tests.rs`, which start a real
+/// proxy over a migrated database), and the table `setup --proxy` writes (`setup/proxy.rs`, which
+/// builds the table the proxy would read, with the proxy's own defaults and checks). The rest of
+/// `proxy/` is written against traits and names no proxy
 /// type. Everything else, the root helper
 /// (`helper/`, `run.rs`) first of all, runs as root and links a network stack it never runs
 /// if it names a proxy type.
@@ -557,7 +560,9 @@ const MAY_NAME_THE_PROXY: &[&str] = &[
     "proxy/supervisor.rs",
     "proxy/supervisor_tests.rs",
     "proxy_verb.rs",
+    "proxy_verb_tests.rs",
     "installer_toml.rs",
+    "setup/proxy.rs",
 ];
 
 /// The files that may name the verb's module (`proxy_verb`): the dispatch and its tests. A path

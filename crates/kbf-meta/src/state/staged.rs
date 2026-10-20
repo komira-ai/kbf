@@ -227,6 +227,94 @@ impl MetaState {
         }
     }
 
+    pub(super) fn reseat_staged(
+        &mut self,
+        tier: TierId,
+        from: ObjectId,
+        to: StagedPut,
+        stored: bool,
+    ) -> Result<(), TierError> {
+        self.known(from)?;
+        let Some(old) = self.staged.get(&from) else {
+            // A retry of a reseat that applied: `from` left and `to` is held.
+            let held = if stored {
+                to.blobs.iter().all(|(d, _)| {
+                    self.blobs
+                        .get(d)
+                        .is_some_and(|e| e.location.object == to.object)
+                })
+            } else {
+                self.staged.contains_key(&to.object)
+            };
+            return if held && self.left.contains_key(&from) {
+                Ok(())
+            } else {
+                self.left_already(from, Err(TierError::Left(from)))
+            };
+        };
+        if old.tier != tier {
+            return Err(TierError::OtherTier {
+                object: from,
+                tier: old.tier,
+            });
+        }
+        if old.state == StagedState::Open {
+            return Err(TierError::NotSealed(from));
+        }
+        if to.object == from || self.staged.contains_key(&to.object) {
+            return Err(TierError::Repeated(to.object));
+        }
+        self.stageable(tier, &to)?;
+        let listed: BTreeSet<&Digest> = to.blobs.iter().map(|(d, _)| d).collect();
+        let unlisted = old.blobs.keys().any(|d| {
+            let at_from = self.blobs.get(d).is_some_and(|e| e.location.object == from);
+            at_from && !listed.contains(d)
+        });
+        if unlisted {
+            return Err(TierError::Unlisted(from));
+        }
+        let waits = old.after.clone();
+        let mut moved = StagedObject {
+            tier,
+            len: to.end,
+            state: if to.seal {
+                StagedState::Sealed
+            } else {
+                StagedState::Open
+            },
+            blobs: BTreeMap::new(),
+            after: waits,
+        };
+        for (digest, offset) in to.blobs {
+            let offset = *moved.blobs.entry(digest).or_insert(offset);
+            let location = Location {
+                store: StoreId::CONFIGURED,
+                object: to.object,
+                offset,
+            };
+            match self.blobs.get_mut(&digest) {
+                Some(entry) if entry.location.object == from => {
+                    entry.location = location;
+                    entry.last_touch = self.now;
+                }
+                _ => {
+                    self.put_blob(digest, location);
+                }
+            }
+        }
+        // Whatever waited for `from` waits for the object that holds its records now.
+        for other in self.staged.values_mut() {
+            if other.after.remove(&from) && !stored {
+                other.after.insert(to.object);
+            }
+        }
+        self.unstage(from);
+        if !stored {
+            self.staged.insert(to.object, moved);
+        }
+        Ok(())
+    }
+
     /// The answer for a command naming an object that is not staged: `left` if it left
     /// the table, else [`TierError::NotStaged`].
     fn left_already(&self, object: ObjectId, left: Result<(), TierError>) -> Result<(), TierError> {

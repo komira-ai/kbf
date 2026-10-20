@@ -559,3 +559,29 @@ fn a_group_that_cannot_be_recorded_is_said_and_the_process_still_starts() {
     write_pgid(file, 7);
     assert!(!file.exists());
 }
+
+#[test]
+fn log_hits_names_the_file_and_line_of_every_generation_and_stream() {
+    // Catches: a scan of the current generation only (a restart's predecessor is where a
+    // drop is logged), of stdout only, of lines that do not hold the needle, or of files
+    // that are not logs (a `.pgid`, a directory).
+    // Mutants: `.err` skipped; the generation filter; the needle test inverted.
+    let d = crate::scratch("log-hits");
+    let (out0, err0) = log_files(&d, "node-1", 0);
+    let (out1, err1) = log_files(&d, "node-1", 1);
+    std::fs::write(&out0, "fine\nWARN run dropped; cleaning up\n").expect("write");
+    std::fs::write(&err0, "fine\n").expect("write");
+    std::fs::write(&out1, "").expect("write");
+    std::fs::write(&err1, b"run dropped again\xff\n").expect("write");
+    std::fs::write(d.join("node-1.pgid"), "run dropped\n").expect("write");
+    std::fs::create_dir_all(d.join("node-1.out.d")).expect("dir");
+    assert_eq!(
+        log_hits(&d, "run dropped"),
+        [
+            "node-1.1.err: run dropped again\u{fffd}".to_owned(),
+            "node-1.out: WARN run dropped; cleaning up".to_owned(),
+        ]
+    );
+    assert!(log_hits(&d, "lease failed").is_empty());
+    assert!(log_hits(&d.join("absent"), "x").is_empty());
+}

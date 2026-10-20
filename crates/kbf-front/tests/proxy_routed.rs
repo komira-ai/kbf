@@ -472,6 +472,7 @@ impl MapSource for Switch {
         Some(MapView {
             map: Arc::clone(&self.0.lock().unwrap_or_else(PoisonError::into_inner)),
             previous: None,
+            earlier: Vec::new(),
         })
     }
 

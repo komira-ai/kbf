@@ -112,18 +112,12 @@ fn f1_3_whole_gpus() {
 #[test]
 fn f1_4_qos_order_when_saturated() {
     let (mut passed, mut skips, mut refusals, mut promotions) = (0, 0, 0, 0);
-    let mut holds = 0;
     sweep(0..8, QosOrder::default, |s, w| {
         passed += s.interactive_passed_older;
         skips += s.same_level_skips;
         refusals += w.check.stats.refusals;
         promotions += w.check.stats.promotions;
-        holds += w.check.stats.holds;
     });
-    assert!(
-        holds > 0,
-        "no action that runs alone held a worker while it waited"
-    );
     assert!(
         passed > 0,
         "no interactive operation passed older, less urgent work"

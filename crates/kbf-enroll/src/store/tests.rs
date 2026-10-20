@@ -17,9 +17,11 @@ fn mkdir(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-fn store(name: &str) -> (Store, PathBuf) {
+/// The scratch directory first, so that it is removed after the store is closed.
+fn store(name: &str) -> (kbf_testkit::dir::TestDir, Store) {
     let root = scratch(name);
-    (Store::open(&root.join("state")).unwrap(), root)
+    let store = Store::open(&root.join("state")).unwrap();
+    (root, store)
 }
 
 fn both() -> RoleSet {
@@ -73,8 +75,8 @@ fn pair_matches(store: &Store, role: Role) -> bool {
 use rustls::pki_types::pem::PemObject;
 
 /// An enrolled store: keys and certificates for both roles installed.
-fn enrolled(name: &str) -> (Store, PathBuf, Node) {
-    let (store, root) = store(name);
+fn enrolled(name: &str) -> (kbf_testkit::dir::TestDir, Store, Node) {
+    let (root, store) = store(name);
     store.pending(both()).unwrap();
     let certs = [
         cert_for(&store, Role::Storage, true, "a1"),
@@ -83,7 +85,7 @@ fn enrolled(name: &str) -> (Store, PathBuf, Node) {
     let node = node(&certs, 1);
     store.stage(&certs, b"CA ONE", &node).unwrap();
     store.commit().unwrap();
-    (store, root, node)
+    (root, store, node)
 }
 
 #[test]
@@ -123,7 +125,7 @@ fn open_makes_private_directories_and_refuses_ones_that_are_not() {
 
 #[test]
 fn pending_makes_a_key_and_request_per_role_and_a_retry_gets_the_same() {
-    let (store, _) = store("store-pending");
+    let (_root, store) = store("store-pending");
     let first = store.pending(both()).unwrap();
     assert_eq!(
         first.iter().map(|p| p.role).collect::<Vec<_>>(),
@@ -166,7 +168,7 @@ fn pending_makes_a_key_and_request_per_role_and_a_retry_gets_the_same() {
 fn a_key_without_its_request_is_replaced_not_reused() {
     // A crash between the two writes leaves a request with no key (the request is written
     // first). A key with no request cannot happen; if it did, both are made again.
-    let (store, _) = store("store-pending-half");
+    let (_root, store) = store("store-pending-half");
     let first = store.pending(both()).unwrap();
     std::fs::remove_file(store.staging().join("storage.csr")).unwrap();
     let second = store.pending(both()).unwrap();
@@ -178,7 +180,7 @@ fn a_key_without_its_request_is_replaced_not_reused() {
 
 #[test]
 fn a_damaged_staged_key_is_reported() {
-    let (store, _) = store("store-pending-damaged");
+    let (_root, store) = store("store-pending-damaged");
     store.pending(both()).unwrap();
     std::fs::write(store.staging().join("storage.key"), b"not a key").unwrap();
     let err = store.pending(both()).unwrap_err();
@@ -192,7 +194,7 @@ fn a_damaged_staged_key_is_reported() {
 
 #[test]
 fn a_first_install_puts_every_file_in_place_with_its_mode_and_clears_staging() {
-    let (store, _, node) = enrolled("store-install");
+    let (_root, store, node) = enrolled("store-install");
     for role in Role::ALL {
         assert_eq!(mode(&store.key_path(role)), 0o600);
         assert_eq!(mode(&store.cert_path(role)), 0o644);
@@ -228,7 +230,7 @@ fn a_crash_at_any_point_of_a_renewal_leaves_a_certificate_that_matches_its_key()
     // the pair on disk is a pair; recovery then finishes the install.
     let steps = 1 + 2 + 1; // bundle, two certificates, node.json (keys are not staged)
     for crash_after in 0..=steps {
-        let (store, _, old) = enrolled(&format!("store-crash-renew-{crash_after}"));
+        let (_root, store, old) = enrolled(&format!("store-crash-renew-{crash_after}"));
         let certs = [
             cert_for(&store, Role::Storage, false, "b1"),
             cert_for(&store, Role::Daemon, false, "b2"),
@@ -263,7 +265,7 @@ fn a_crash_at_any_point_of_a_renewal_leaves_a_certificate_that_matches_its_key()
 fn a_crash_during_a_first_install_is_finished_by_the_next_start() {
     let steps = 1 + 2 * 2 + 1; // bundle, key and certificate per role, node.json
     for crash_after in 0..steps {
-        let (store, _) = store(&format!("store-crash-first-{crash_after}"));
+        let (_root, store) = store(&format!("store-crash-first-{crash_after}"));
         store.pending(both()).unwrap();
         let certs = [
             cert_for(&store, Role::Storage, true, "c1"),
@@ -290,7 +292,7 @@ fn a_crash_during_a_first_install_is_finished_by_the_next_start() {
 fn a_new_key_over_an_old_one_is_whole_again_after_recovery() {
     // A re-enrollment (`replace`) changes the key. The two renames of a role cannot be
     // one step, so between them the key and certificate differ; a restart repairs it.
-    let (store, _, _) = enrolled("store-crash-replace");
+    let (_root, store, _) = enrolled("store-crash-replace");
     mkdir(&store.staging(), 0o700);
     let key = csr::new_key().unwrap();
     write_atomic(
@@ -323,7 +325,7 @@ fn a_new_key_over_an_old_one_is_whole_again_after_recovery() {
 
 #[test]
 fn damaged_records_are_reported_with_the_file() {
-    let (store, _, _) = enrolled("store-damaged");
+    let (_root, store, _) = enrolled("store-damaged");
     let json = store.pki.join("node.json");
     std::fs::write(&json, b"{").unwrap();
     assert!(matches!(store.load(), Err(StoreError::Damaged(p)) if p.ends_with("node.json")));
@@ -357,7 +359,7 @@ fn damaged_records_are_reported_with_the_file() {
 
 #[test]
 fn a_commit_that_cannot_move_a_file_says_which() {
-    let (store, _) = store("store-rename-fail");
+    let (_root, store) = store("store-rename-fail");
     store.pending(both()).unwrap();
     let certs = [cert_for(&store, Role::Storage, true, "e1")];
     let n = node(&certs, 1);

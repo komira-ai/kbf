@@ -39,8 +39,8 @@ pub struct NodeView {
     pub node_id: String,
     /// Whether its newest stream is still open.
     pub connected: bool,
-    /// The `kbf.worker.v1` version its newest stream's first `Hello` named; `None` if
-    /// it named none. It is kept after the stream closes, as the version the node last
+    /// The `kbf.worker.v1` version its newest stream's `Welcome` named (the lesser of
+    /// its first `Hello`'s and the server's newest); `None` if no version is known. It is kept after the stream closes, as the version the node last
     /// spoke.
     pub protocol: Option<u32>,
     /// The newest software status it sent; `None` if it sent none (a daemon that

@@ -47,7 +47,7 @@ use kbf_storage::service::{Admission, PeerNames, PeerRole, host_of, role_of};
 use tonic::{Request, Response, Status};
 
 use crate::identity::{DenyList, PeerCert, Presented, presented};
-use crate::members::{Members, MembershipError, Progress, Registrant};
+use crate::members::{Fill, Members, MembershipError, Progress, Registrant};
 use crate::storage_health::{Debts, Reported, Writes};
 use crate::store_config::StoreConfigSource;
 use crate::store_config::acks::Acks;
@@ -211,6 +211,7 @@ fn status(e: MembershipError) -> Status {
         }
         MembershipError::NotRegistered(_) => Status::not_found(message),
         MembershipError::Contended => Status::aborted(message),
+        MembershipError::PinsFull { .. } => Status::resource_exhausted(message),
         MembershipError::Store(_) => Status::unavailable(message),
         MembershipError::NotSettable(_)
         | MembershipError::NotActive { .. }
@@ -228,6 +229,18 @@ fn announced(source: Option<&Arc<dyn StoreConfigSource>>) -> u64 {
     source.generation().unwrap_or_else(|e| {
         tracing::warn!("cold-store registration generation: {e}");
         0
+    })
+}
+
+/// The maps `members` retains from before generation `newest`, newest first, as they go on the
+/// wire (`retained_previous`): what a node that has just started has not seen. Reads no store.
+fn retained(members: &Members, newest: u64) -> Vec<pb::Map> {
+    members.view().map_or_else(Vec::new, |(_, history)| {
+        history
+            .iter()
+            .filter(|map| map.generation() < newest)
+            .map(|map| pb::Map::from(&**map))
+            .collect()
     })
 }
 
@@ -297,6 +310,7 @@ impl Membership for MembershipService {
             member_id: joined.id.0,
             boot: joined.boot,
             heartbeat_interval_ms: u64::try_from(beat.as_millis()).unwrap_or(u64::MAX),
+            retained_previous: retained(&self.members, joined.map.generation()),
             map: Some(pb::Map::from(&joined.map)),
             objstore_generation,
         }))
@@ -317,32 +331,49 @@ impl Membership for MembershipService {
             writes: Writes::from_wire(req.writes_known, req.open_writes),
             generation: have,
         };
+        let fill = Fill::from_wire(
+            req.flush_known,
+            req.flush_clear_gen,
+            req.tail_epoch_done,
+            req.fill_fp,
+        );
         let source = self
             .store_config
             .as_ref()
             .map(|(source, _)| Arc::clone(source));
-        let (map_generation, map, objstore_generation) = blocking(move || {
-            if let Some(peer) = &peer {
-                // The map's list, read before the row is touched: a refused beat must not
-                // renew the row, or a denied node would never lapse.
-                let map = members.current_map()?;
-                refuse_denied(peer, map.as_ref().map_or(&[][..], Map::denied))?;
-            }
-            // In plain text there are no names, and any caller holds any member.
-            let holds = |addr: &str| {
-                peer.as_ref()
-                    .is_none_or(|peer| peer.identity().names().covers(host_of(addr)))
-            };
-            let generation = members.heartbeat(id, req.boot, progress, said, Some(&holds))?;
-            // Read only for a node that is behind: most beats carry no map.
-            let newer = if generation > have {
-                members.current_map()?.filter(|map| map.generation() > have)
-            } else {
-                None
-            };
-            Ok((generation, newer, announced(source.as_ref())))
-        })
-        .await?;
+        let (map_generation, map, objstore_generation, retained_previous, tail_epoch) =
+            blocking(move || {
+                if let Some(peer) = &peer {
+                    // The map's list, read before the row is touched: a refused beat must not
+                    // renew the row, or a denied node would never lapse.
+                    let map = members.current_map()?;
+                    refuse_denied(peer, map.as_ref().map_or(&[][..], Map::denied))?;
+                }
+                // In plain text there are no names, and any caller holds any member.
+                let holds = |addr: &str| {
+                    peer.as_ref()
+                        .is_none_or(|peer| peer.identity().names().covers(host_of(addr)))
+                };
+                let generation =
+                    members.heartbeat_with(id, req.boot, progress, said, fill, Some(&holds))?;
+                // Read only for a node that is behind: most beats carry no map.
+                let newer = if generation > have {
+                    members.current_map()?.filter(|map| map.generation() > have)
+                } else {
+                    None
+                };
+                let earlier = newer
+                    .as_ref()
+                    .map_or_else(Vec::new, |map| retained(&members, map.generation()));
+                Ok((
+                    generation,
+                    newer,
+                    announced(source.as_ref()),
+                    earlier,
+                    members.tail_epoch()?,
+                ))
+            })
+            .await?;
         // Only an accepted heartbeat counts: a refused or superseded one never reaches here.
         if let Some((_, acks)) = &self.store_config {
             let (acks, boot, beat) = (Arc::clone(acks), req.boot, req);
@@ -355,6 +386,8 @@ impl Membership for MembershipService {
             map_generation,
             map: map.as_ref().map(pb::Map::from),
             objstore_generation,
+            retained_previous,
+            tail_epoch,
         }))
     }
 }
