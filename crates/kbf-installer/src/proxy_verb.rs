@@ -43,7 +43,7 @@
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::fd::{AsFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -62,6 +62,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::cli::ProxyArgs;
 use crate::exit::Exit;
 use crate::installer_toml::{InstallerToml, MAX_FILE_BYTES};
+use crate::layout::Platform;
 use crate::proxy::api::actor::ActorTiming;
 use crate::proxy::api::core::{Core, Parts};
 use crate::proxy::api::handler::{Handler, HandlerRequest};
@@ -180,6 +181,7 @@ fn handover_config(args: &ProxyArgs, loaded: &Loaded) -> HandoverConfig {
             operator: [operator(Slot::A), operator(Slot::B)],
         },
         operator_token_file: loaded.proxy.operator_token_file.clone(),
+        installer_toml: config_path(args, Platform::current()),
         gate: GateSlot::new(),
         state_dir: loaded.proxy.state_dir.clone(),
         orders_dir: args.orders_dir.clone(),
@@ -414,11 +416,13 @@ fn serve(
     root: &kbf_host::Root,
 ) -> Result<(), VerbError> {
     #[cfg(target_os = "linux")]
-    let (state_dir, proxy_auth_file, upstream) = (
-        config.state_dir.clone(),
-        config.proxy_auth_file.clone(),
-        config.upstream,
-    );
+    let supervise_with = Supervise {
+        state_dir: config.state_dir.clone(),
+        proxy_auth_file: config.proxy_auth_file.clone(),
+        upstream: config.upstream,
+        operator_token_file: config.operator_token_file.clone(),
+        status: handover.status_file.clone(),
+    };
     let parts = handover::parts(handover)?;
     unblock_stop_signals();
     let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
@@ -452,10 +456,8 @@ fn serve(
     #[cfg(target_os = "linux")]
     let _supervised = supervise(
         &handle,
+        supervise_with,
         root,
-        &state_dir,
-        &proxy_auth_file,
-        upstream,
         &handover.gate,
         death_hook(&stop, &died, &drain),
     );
@@ -466,57 +468,129 @@ fn serve(
     outcome(runner.run(updates), &died)
 }
 
-/// Adopts the children a previous proxy left and reports what it did on the standard error,
-/// then tells the handover driver what it needs of the bound proxy (`gate`, filled once).
-/// The gate it returns must live as long as the proxy: it keeps the hold guard of an adoption
-/// that could not finish.
+/// Where the supervisor finds what it reads.
+#[cfg(target_os = "linux")]
+struct Supervise {
+    state_dir: std::path::PathBuf,
+    proxy_auth_file: std::path::PathBuf,
+    upstream: kbf_proxy::config::UpstreamTable,
+    operator_token_file: std::path::PathBuf,
+    /// The root half's `status.json`.
+    status: std::path::PathBuf,
+}
+
+/// The supervisor, on a thread of its own: starting a first child waits for it to be ready,
+/// and the proxy must already be serving (its `/readyz`, its hold) while it does. Dropping
+/// this ends the wait of a supervisor still running and joins it. The gate the thread returns
+/// is dropped last: it keeps the hold guard of a start that could not finish.
+#[cfg(target_os = "linux")]
+struct Supervised {
+    clock: Arc<crate::proxy::runtime::SystemClock>,
+    thread: Option<JoinHandle<Arc<crate::proxy::gate_real::ProxyGate>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Supervised {
+    fn drop(&mut self) {
+        self.clock.stop();
+        // `None` when the thread never started; the gate is dropped with the join's result.
+        self.thread.take().into_iter().for_each(|thread| {
+            drop(thread.join());
+        });
+    }
+}
+
+/// Adopts the children a previous proxy left, or starts the installed release, and reports
+/// what it did on the standard error, then tells the handover driver what it needs of the bound
+/// proxy (`slot`, filled once, after the start has ended: until then the driver says the proxy
+/// is not bound). `root` is the host root the layout is over.
 #[cfg(target_os = "linux")]
 fn supervise(
     handle: &kbf_proxy::ProxyHandle,
+    with: Supervise,
     root: &kbf_host::Root,
-    state_dir: &Path,
-    proxy_auth_file: &Path,
-    upstream: kbf_proxy::config::UpstreamTable,
     slot: &GateSlot,
     on_death: Arc<dyn Fn(&str) + Send + Sync>,
-) -> Arc<crate::proxy::gate_real::ProxyGate> {
+) -> Supervised {
     use crate::layout::Layout;
+    use crate::proxy::boot::{FileReport, Retry};
     use crate::proxy::child_real::ProcChild;
-    use crate::proxy::supervisor::{Startup, adopt_children, children_dir, frontend_argv};
-
-    let gate = Arc::new(crate::proxy::gate_real::ProxyGate::new(handle.clone()));
-    let layout = Layout::linux(root.clone());
-    let releases_dir = layout.join(&layout.releases());
-    let child = Arc::new(ProcChild::new(
-        layout,
-        children_dir(state_dir),
-        frontend_argv(proxy_auth_file, upstream),
-    ));
-    let (line, active, held) = match adopt_children(&gate, &child, state_dir) {
-        Startup::Adopted { active } => (
-            format!("adopted the frontend child in slot {active:?}"),
-            active,
-            None,
-        ),
-        Startup::Held(why) => (
-            format!("no frontend child adopted, new streams stay held: {why}"),
-            crate::proxy::model::Slot::A,
-            Some(why),
-        ),
+    use crate::proxy::model::Timing;
+    use crate::proxy::runtime::SystemClock;
+    use crate::proxy::supervisor::{
+        Boot, NoMigration, Startup, adopt_children, child_admin, children_dir, frontend_argv,
     };
-    let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {line}");
-    let recorder = Arc::clone(&child);
-    slot.fill(Host {
-        gate: gate.clone(),
-        child,
-        recorded: recorded_by(&recorder),
-        active,
-        held,
-        releases_dir,
-        secret: admin_secret(&handle.admin_headers()),
-        on_death,
-    });
-    gate
+
+    let clock = Arc::new(SystemClock::new());
+    let (handle, wait) = (handle.clone(), Arc::clone(&clock));
+    let (root, slot) = (root.clone(), slot.clone());
+    let thread = std::thread::Builder::new()
+        .name("supervisor".into())
+        .spawn(move || {
+            let gate = Arc::new(crate::proxy::gate_real::ProxyGate::new(handle.clone()));
+            let layout = Layout::linux(root);
+            let releases_dir = layout.join(&layout.releases());
+            let child = Arc::new(ProcChild::new(
+                layout,
+                children_dir(&with.state_dir),
+                frontend_argv(&with.proxy_auth_file, with.upstream),
+            ));
+            let started =
+                child_admin(&handle, with.upstream, with.operator_token_file).map(|admin| {
+                    let report = FileReport::new(&with.state_dir);
+                    let boot = Boot {
+                        admin: &admin,
+                        clock: &*wait,
+                        migrator: &NoMigration,
+                        report: &report,
+                        status: &with.status,
+                        timing: Timing::frontend(),
+                        retry: Retry::boot(),
+                    };
+                    adopt_children(&gate, &child, &with.state_dir, &boot)
+                });
+            let (active, held) = match &started {
+                Ok(Startup::Adopted { active }) => (*active, None),
+                Ok(Startup::Held(why)) | Err(why) => {
+                    (crate::proxy::model::Slot::A, Some(why.clone()))
+                }
+            };
+            let line = startup_line(started);
+            let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {line}");
+            let recorder = Arc::clone(&child);
+            slot.fill(Host {
+                gate: gate.clone(),
+                child,
+                recorded: recorded_by(&recorder),
+                active,
+                held,
+                releases_dir,
+                secret: admin_secret(&handle.admin_headers()),
+                on_death,
+            });
+            gate
+        })
+        .ok();
+    Supervised { clock, thread }
+}
+
+/// What the supervisor tells the log about how the start went.
+#[cfg(target_os = "linux")]
+fn startup_line(started: Result<crate::proxy::supervisor::Startup, String>) -> String {
+    use crate::proxy::supervisor::Startup;
+    match started {
+        Ok(Startup::Adopted { active }) => format!("the frontend child in slot {active:?} serves"),
+        Ok(Startup::Held(why)) | Err(why) => {
+            format!("no frontend child adopted, new streams stay held: {why}")
+        }
+    }
+}
+
+/// The table's file: `--config`, else the `installer.toml` `setup` writes on `platform`.
+fn config_path(args: &ProxyArgs, platform: Platform) -> PathBuf {
+    args.config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(platform.installer_toml()))
 }
 
 /// What the handover driver runs when its swap thread dies: [`handover_died`] over this verb's
@@ -556,7 +630,7 @@ fn handover_died(why: &str, stop: &Arc<Stop>, died: &AtomicBool, drain: impl FnO
 
 /// The verb. With `--check`, the table is loaded and nothing is bound.
 pub fn run(args: &ProxyArgs, root: &Path) -> Result<(), VerbError> {
-    let loaded = load(&args.config)?;
+    let loaded = load(&config_path(args, Platform::current()))?;
     if args.check {
         return Ok(());
     }

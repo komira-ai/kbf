@@ -132,16 +132,6 @@ fn a_startup_hold_blocks_with_its_reason() {
 }
 
 #[test]
-fn a_migrator_that_can_never_pass_blocks_with_its_reason() {
-    let (sup, _dir) = over("blk-migrator", |_, c| {
-        c.migrator_blocked = Some("schema unknown".to_owned());
-    });
-    let why = sup.start_blocked().expect("blocked");
-    assert!(why.contains("step migrate"), "{why}");
-    assert!(why.contains("schema unknown"), "{why}");
-}
-
-#[test]
 fn a_candidate_slot_that_still_runs_a_process_blocks() {
     let (sup, _dir) = over("blk-busy", |rig, _| rig.occupy(Slot::B));
     let why = sup.start_blocked().expect("blocked");

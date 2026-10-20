@@ -1,20 +1,17 @@
-//! The default [`Migrator`]: it migrates nothing and says so.
+//! A [`Migrator`] that migrates nothing and says so: it lets an update through only when no
+//! migration is needed, and refuses every other one with a stable word.
 //!
-//! Who runs the forward Postgres migration, and with which credential, is decided
-//! elsewhere; the swap only calls [`Migrator::migrate_forward`] before the candidate starts.
-//! Until a real migrator is wired in, this one lets an update through only when no
-//! migration is needed, and refuses every other one with a stable word, so the swap records
-//! step `migrate` and starts no candidate. It never opens the database.
+//! The proxy's swap does not use it (the handover driver wires
+//! [`super::super::migrator::DbMigrator`]); it is the migrator of the API tests over a real
+//! supervisor, where a release at the schema the host runs must pass and any other must stop
+//! at step `migrate`. It never opens a database.
 //!
 //! A refusal is `<word>: <message>`, the form of the root half's refusals:
 //! - `not_staged`: the staged release is not the one asked for (or `status.json` cannot say).
 //! - `installer_too_old`: the release needs a state schema this installer build does not
-//!   embed, so no migrator of this build could bring the database there.
-//! - `not_additive`: the release needs a state schema other than the one the host runs, and
-//!   this migrator does not migrate. (A real migrator uses the same word for a step that is
-//!   not an expand step.)
-//!
-//! A real migrator replaces this one where the supervisor's [`super::Parts`] is built.
+//!   embed.
+//! - `not_additive`: the release needs a state schema other than the one the host runs, or
+//!   the running schema cannot be told.
 
 use std::sync::Arc;
 

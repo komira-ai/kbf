@@ -66,6 +66,9 @@ pub struct HandoverConfig {
     pub slots: SlotAddrs,
     /// The operator token the swap presents to a child's operator API (`desired`).
     pub operator_token_file: PathBuf,
+    /// `installer.toml`: the `database` the swap's migrator brings forward before a candidate
+    /// starts.
+    pub installer_toml: PathBuf,
     /// Set once by the verb right after the bind; the supervisor waits for it.
     pub gate: GateSlot,
 }

@@ -12,7 +12,8 @@ use support::{NOW, Stream, make_ca, scratch};
 // orphans every certificate), and a pin that is not the root's.
 #[test]
 fn an_empty_directory_gets_a_ca_and_a_restart_loads_the_same_one() {
-    let dir = scratch("ensure").join("ca");
+    let dir_root = scratch("ensure");
+    let dir = dir_root.join("ca");
     let (made, how) = ensure(&dir, Policy::default(), NOW, &mut Stream(1)).expect("create");
     assert_eq!(how, Started::Created);
     let (again, how) = ensure(&dir, Policy::default(), NOW, &mut Stream(2)).expect("load");
@@ -77,7 +78,8 @@ fn a_half_or_foreign_directory_is_refused_and_nothing_is_written() {
         "{err}"
     );
 
-    let file = scratch("ensure_file").join("f");
+    let file_root = scratch("ensure_file");
+    let file = file_root.join("f");
     std::fs::write(&file, b"x").expect("write");
     assert!(matches!(
         ensure(&file, Policy::default(), NOW, &mut Stream(6)),
@@ -102,7 +104,8 @@ fn two_files_that_are_not_a_ca_and_one_foreign_file_are_refused_untouched() {
             "holds ca.key, notes.txt:",
         ),
     ] {
-        let dir = scratch(name).join("ca");
+        let dir_root = scratch(name);
+        let dir = dir_root.join("ca");
         std::fs::create_dir_all(&dir).expect("mkdir");
         for f in files {
             std::fs::write(dir.join(f), b"x").expect("write");
@@ -121,7 +124,8 @@ fn two_files_that_are_not_a_ca_and_one_foreign_file_are_refused_untouched() {
         }
     }
 
-    let dir = scratch("ensure_lone").join("ca");
+    let dir_root = scratch("ensure_lone");
+    let dir = dir_root.join("ca");
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(dir.join("notes.txt"), b"x").expect("write");
     let err = ensure(&dir, Policy::default(), NOW, &mut Stream(8)).expect_err("lone");

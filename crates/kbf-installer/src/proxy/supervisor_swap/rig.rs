@@ -213,7 +213,6 @@ impl Rig {
             rollback_after_switch: false,
             releases_dir: dir,
             startup_hold: None,
-            migrator_blocked: None,
         }
     }
 

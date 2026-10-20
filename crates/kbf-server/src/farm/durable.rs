@@ -85,6 +85,7 @@ use super::{
     refused_as,
 };
 use crate::action_usage::Subject;
+use crate::machine::Platform;
 use crate::state_store::StateStore;
 
 use self::inflight::Submitted;
@@ -1000,7 +1001,7 @@ impl State {
 
     /// Whether the finish of `operation` (its answer or refusal) is held back, unwritten.
     /// Bounded by what is held, which is capped.
-    fn finish_held(&self, operation: OperationId) -> bool {
+    pub(super) fn finish_held(&self, operation: OperationId) -> bool {
         self.unwritten.iter().flatten().any(|effect| match effect {
             Effect::Answer(answer) => answer.operation == operation,
             Effect::Refuse(refusal) => refusal.operation == operation,
@@ -1015,6 +1016,8 @@ impl State {
         for effect in dropped {
             if let Effect::Answer(answer) = effect {
                 self.parked.remove(&answer.lease);
+                // Never written, so never acknowledged: the daemon keeps the result.
+                self.owed.remove(&answer.lease);
             }
         }
     }
@@ -1152,6 +1155,7 @@ impl State {
             kind: op.request.kind,
             do_not_cache: op.request.do_not_cache,
             queued: now,
+            platform: Platform::of(&op.request.needs),
             // A row from a writer that did not record the subject (an older build)
             // leaves the `action usage:` line naming the empty shape.
             usage: op

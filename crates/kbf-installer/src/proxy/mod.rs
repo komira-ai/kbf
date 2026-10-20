@@ -15,40 +15,59 @@
 //! - [`child_real::ProcChild`] (Linux), the `Child` on processes watched by pidfd;
 //! - [`runtime::SystemClock`] and [`runtime::RequestQueue`], the `Clock` and the `Requests`;
 //! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left;
-//! - [`supervisor_swap`], the update API's `Supervisor`: the swap on its own thread.
+//! - [`supervisor_swap`], the update API's `Supervisor`: the swap on its own thread;
+//! - [`migrator::DbMigrator`], the `Migrator` over the state database.
 //!
 //! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
 //! child control and the fleet read call a child's ports with (U8b); [`admin`] is the
 //! `ChildAdmin` built on it (`admin_protocol` 1, sending the proxy secret header on every
-//! call). [`supervisor_swap::SwapSupervisor`] is the update API's `Supervisor` over all of
-//! it: it runs [`Swap`] on a thread of its own, resumes an update that was in flight when the
-//! proxy stopped, and builds the status the API serves. Its seams are in its module
-//! documentation: [`ports::Migrator`] is [`supervisor_swap::ExpandOnlyDefault`] until a real
-//! migrator exists, and the compatibility gate is the API's.
+//! call). The proxy verb builds it in [`supervisor::child_admin`] and uses it for the start:
+//! [`supervisor::adopt_children`] adopts a child a previous proxy left (an active one at
+//! once, a candidate after it takes the generation) and, where none runs, starts the release
+//! `status.json` calls installed ([`boot`]). [`supervisor_swap::SwapSupervisor`] is the update
+//! API's `Supervisor` over all of it: it runs [`Swap`] on a thread of its own, resumes an
+//! update that was in flight when the proxy stopped, and builds the status the API serves.
+//! Its seams are in its module documentation: the compatibility gate is the API's.
 //!
 //! The update API's seams are bound in [`handover`]: the order spool, `status.json`, the
 //! request map and the restart answer are real there, and so is the supervisor
 //! ([`supervisor_swap::SwapSupervisor`]).
 //!
 //! Not built, stated: [`supervisor::adopt_children`] still adopts a child only when no update
-//! is in flight (the startup hold stays otherwise); starting a first child on a host that has
-//! none and choosing between two live children are not done. `Admin::ready` reports `health`
-//! and `capabilities` as not ready until their probes exist, so a swap on a real child stops
-//! at `ready`.
+//! is in flight (the startup hold stays otherwise); choosing between two live children is not
+//! done. In the verb, `Migrator`: [`supervisor::NoMigration`] is the hook the cold start's
+//! boot calls before it starts a child ([`migrator::DbMigrator`] is not wired into it); the
+//! swap's migrator is [`migrator::DbMigrator`] (see [`handover_swap`]). `Admin::ready`
+//! reports `health` and `capabilities` as not ready until their probes exist, so a swap on a
+//! real child stops at `ready`.
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
 //!   [`ports::ChildAdmin::resume`].
+//! - **Cold start** ([`boot`]). With no live child the proxy starts `installed_commit` of
+//!   `status.json`, running `releases/<sha>/kbf` (never `releases/current`) in slot A as a
+//!   candidate, and makes it take the generation: no live holder, so the child bumps the epoch
+//!   (FP section 8). It starts nothing unless the binary is executable and the release has
+//!   its `VERIFIED` marker. A failed attempt is stopped (SIGKILL only if the process never
+//!   answered ready, SIGTERM otherwise) and tried again after 2, 4, ... 30 s, ten attempts in
+//!   all; then the streams stay held until the proxy restarts. "Ready" for this boot is the
+//!   child's operator `/readyz` alone, because the health and capabilities probes are not built
+//!   ([`cold::ReadyRule`]); the takeover is the final check. The reason of each failed attempt
+//!   is a fixed word in `boot.json` (state directory) and the log.
 //! - **Start.** A frontend host starts the new child as a candidate (`--await-takeover`,
 //!   [`model::Start`]); an all-in-one host starts the new process, and the old release put
 //!   back after a failed start, to serve at once, because no takeover is ever sent there.
 //! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); open
 //!   streams and open worker sessions from the child's admin role view
 //!   ([`ports::ChildAdmin::open_counts`]); queued operations do not gate retire.
-//! - **Migration** (open): who runs the forward Postgres migration, and with which
-//!   credential, is undecided; the swap only calls [`ports::Migrator::migrate_forward`]
-//!   before the candidate starts. For an all-in-one host it runs after the old process
-//!   exits.
+//! - **Migration** (decided, FP section 8): the swap calls [`ports::Migrator::migrate_forward`]
+//!   before the candidate starts (for an all-in-one host, after the old process exits).
+//!   [`migrator::DbMigrator`] is the real one: it applies the installer's embedded,
+//!   expand-only migrations up to the `state_schema` the staged release reports, as the
+//!   role `installer.toml` names, and refuses with a stable word (`installer_too_old`,
+//!   `not_additive`, `database_busy`, `migration_failed`, ...) that leads
+//!   `failure.reason` of step `migrate`. The cold start's boot hook (`Boot.migrator`) still
+//!   gets [`supervisor::NoMigration`]; wiring `DbMigrator` into it is a follow-up.
 //! - **update.json** keeps the recorded process identity of both children
 //!   ([`model::Intent::old_proc`], `new_proc`), which FP section 4 does not list: adoption
 //!   needs pid, start time and executable. A candidate spawned and not yet recorded when
@@ -91,12 +110,16 @@
 pub mod admin;
 mod aio;
 pub mod api;
+#[cfg(target_os = "linux")]
+pub mod boot;
 pub mod child_http;
 #[cfg(target_os = "linux")]
 pub mod child_real;
+mod cold;
 pub mod gate_real;
 pub mod handover;
 pub mod handover_swap;
+pub mod migrator;
 pub mod model;
 pub mod orders;
 pub mod ports;
@@ -129,6 +152,8 @@ mod fault_tests;
 mod gate_real_tests;
 #[cfg(test)]
 mod gate_tests;
+#[cfg(test)]
+mod migrator_tests;
 #[cfg(test)]
 mod orders_tests;
 #[cfg(test)]

@@ -36,6 +36,7 @@ fn config(name: &str) -> HandoverConfig {
             operator: [addr(18002), addr(18012)],
         },
         operator_token_file: root.join("operator.token"),
+        installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     }
 }

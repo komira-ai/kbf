@@ -55,8 +55,9 @@ lists the mode's flags. There is no `node` mode and no `enroll` word.
   `/sys/devices/system/node/online` (rule `cpuset`, only when a unit sets a list), the
   files the unit's `EnvironmentFile=` lines name (rule `credential`), the storage unit's
   `User=` (`getent passwd`, rule `credential`), the owner and mode of each directory above a
-  `file://` `--hot-store` (rule `traverse`), and `kbf check-args` (rule `parse`).
-  Run it on the node, as root, for all of them.
+  `file://` `--hot-store` (rule `traverse`). It does not run `kbf`: whether `kbf` takes a
+  unit's flags is `kbf --mode=<mode> --check` on the node (below). Run it on the node, as
+  root, for all of them.
 
 It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/system`,
 `service.d/` and prefix drop-ins) or changes made with `systemctl set-property` or
@@ -75,7 +76,6 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `caps` | a mode that runs builds (`daemon`, `storage-and-daemon`, `all-in-one`) with `MemoryMax=`, `MemoryHigh=`, `CPUQuota=` or `AllowedCPUs=` on its unit: builds are capped by the daemon's own `actions/memory.max`, and a limit on the unit caps the supervisor with them |
 | `swap` | a mode that runs builds with `MemorySwapMax=` on its unit: its leases live in the unit's cgroup and may swap |
 | `oom` | a mode that runs builds without an integer `OOMScoreAdjust=` below 0, the build containers' score (a host-wide OOM kill takes the highest score first) |
-| `meta-dir` | `storage-and-daemon` or `all-in-one` with `--meta-dir` equal to `--data-dir` or under it (compared after resolving `.` and `..`) |
 | `credential` | the cold store's key reaching a mode without a storage half (`daemon`, `all-in-one`); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user; in the `storage-and-daemon` unit, any way of giving the key but the one `EnvironmentFile=<KBF_ETC>/s3.env` (below), and on the node that file not a plain file of root's with mode 0600 |
 | `storage` | a `storage` or `storage-and-daemon` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` (for `storage-and-daemon`, exactly that path: no `-`, quotes or wildcard) |
 | `state-store` | in the frontend's unit, a `--state-store` that is not a `postgres://` or `postgresql://` URI (a `sqlite://` file is named as dropped); in any unit, a URI that carries a password, an empty or relative SQLite path (the all-in-one's), another scheme, or a value that names a variable (below) |
@@ -83,7 +83,6 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
 | `restart` | a node unit (`storage`, `daemon`, `storage-and-daemon`) without `RestartSec=5` and, in `[Unit]`, `StartLimitIntervalSec=0`: systemd's defaults (100 ms, 5 starts in 10 s) end a quickly repeating failure in `start-limit-hit` with the unit down. The frontend keeps `Restart=on-failure` without them: an old frontend that drained after a handover exits 0 and must stay down |
 | `stop` | a mode that drains on SIGTERM (every mode but `daemon`, whose finite stop the `package_units` test checks) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
-| `parse` | flags that `kbf <mode>` refuses |
 
 **`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
 `config_parse_delegate` in systemd's `src/core/load-fragment.c`): a boolean delegates
@@ -472,9 +471,8 @@ fails a test until it has a group.
 `kbf <mode> --check` parses the flags and the file, runs the startup checks a start runs,
 prints each problem on standard error and exits without starting anything: 0 when nothing
 stops the start (standard output says `kbf <mode>: ok`), 2 when it is refused, 75 when it
-is not ready yet (a restart may help). `kbf check-args <mode> ...` stays for
-`kbf-deploy linux check-units`: it parses the flags only (no file, no host checks, as
-before) and prints a one-line deprecation note as the last line on standard error.
+is not ready yet (a restart may help). `kbf check-args` is gone: `kbf-deploy linux
+check-units` and `install-units` no longer run `kbf`, and `--kbf-bin` is gone with it.
 
 ## Enrollment is part of the start
 
@@ -530,16 +528,3 @@ There is no `--uninstall` for a mode's unit yet. A node moving from the converge
 (`kbf-server.service`) to `kbf-storage.service` stops the old ones first
 (`systemctl disable --now kbf-daemon.service kbf-server.service`): both would hold the
 same directories.
-
-## Upgrade kbf before kbf-deploy
-
-Rule `parse` runs `<kbf> check-args <mode> <flags...>`. A `kbf` older than
-`check-args` refuses the word, so `check-units --mode` fails any mode's unit with:
-
-```text
-FAIL parse: kbf daemon refuses the flags of kbf-daemon.service (/usr/local/bin/kbf check-args: exit 2): error: unrecognized subcommand 'check-args'
-```
-
-(`all-in-one` the same, with its name.) Install the new `kbf` before running the new
-`kbf-deploy` on a node, or check offline: on a machine with no `kbf` at the unit's
-path and no `--kbf-bin`, the rule is skipped with a `SKIP parse:` line.

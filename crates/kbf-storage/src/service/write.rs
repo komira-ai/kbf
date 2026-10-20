@@ -13,6 +13,7 @@ use kbf_types::Digest;
 use tonic::Status;
 
 use super::{STREAM_FROM_BYTES, StorageService};
+use crate::in_flight;
 use crate::replicate::{Plan, ReplicaLeg, Staging, View};
 use crate::{PutStream, StorageError, StreamedPut};
 
@@ -182,7 +183,9 @@ impl StorageService {
             stored?;
             return Ok(());
         }
-        let mut received = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
+        let capacity = usize::try_from(size).unwrap_or_default();
+        let held = in_flight::hold(capacity as u64);
+        let mut received = Vec::with_capacity(capacity);
         let mut message = first;
         loop {
             if (received.len() + message.data.len()) as u64 > size {
@@ -194,7 +197,10 @@ impl StorageService {
             }
             message = next(&mut rest).await?;
         }
-        let stored = self.storage.put(received.into()).await?;
+        let stored = self
+            .storage
+            .put(in_flight::counted_with(received, held))
+            .await?;
         if stored != digest {
             return Err(StorageError::DigestMismatch {
                 claimed: digest,
@@ -248,9 +254,12 @@ async fn receive(
             return Err(more_than(&digest));
         }
         let finish = message.finish_write;
-        let data = Bytes::from(std::mem::take(&mut message.data));
+        // Counted (`kbf_bytes_in_flight`) until the staging and the replica are done with it.
+        let data = in_flight::counted(std::mem::take(&mut message.data));
         staging.push(data.clone()).await?;
         if let Some(leg) = &mut leg {
+            // The copy sent on is a buffer of its own.
+            let _copy = in_flight::hold(data.len() as u64);
             leg.send(WriteRequest {
                 data: data.to_vec(),
                 ..message
@@ -343,7 +352,7 @@ impl Incoming {
                 }
             }
             if !message.data.is_empty() {
-                return Some((Ok(Bytes::from(message.data)), self));
+                return Some((Ok(in_flight::counted(message.data)), self));
             }
         }
     }

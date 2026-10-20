@@ -12,8 +12,8 @@
 //! - `child`: [`super::child_real::ProcChild`];
 //! - `admin`: [`super::admin::Admin`] (`admin_protocol` 1, the proxy secret on every call);
 //! - `gate`: [`super::gate_real::ProxyGate`];
-//! - `migrator`: [`ExpandOnlyDefault`], until the real migrator exists (a one-line change
-//!   where [`Parts`] is built);
+//! - `migrator`: [`super::migrator::DbMigrator`] (the handover driver wraps it as
+//!   `StateDbMigrator`); [`ExpandOnlyDefault`] is the one that migrates nothing, for a test;
 //! - `recorder`: [`super::record::FileRecorder`] over the proxy's state directory;
 //! - `orders`: [`super::root_orders::SpoolRootOrders`] over the order spool the API writes
 //!   with, so the `confirm` and `revert` the swap sends take the same counter;
@@ -129,9 +129,6 @@ pub struct Config {
     /// Set while the start-up hold is in force (no frontend child was adopted): why. `active`
     /// is then a guess, so no update can start ([`Supervisor::start_blocked`]).
     pub startup_hold: Option<String>,
-    /// Set when the migrator can never pass a release (it cannot tell what schema the host
-    /// runs): why. A `POST` is refused before the root half fetches anything.
-    pub migrator_blocked: Option<String>,
 }
 
 /// Starts the swap's thread. The real one is [`thread_spawn`]; a test passes one that refuses.
@@ -307,7 +304,6 @@ impl Supervisor for SwapSupervisor {
     /// - the releases directory is missing;
     /// - the start-up hold is in force (no frontend child was adopted, so the active slot is a
     ///   guess);
-    /// - the migrator can never pass (the running schema is unknown);
     /// - the slot the candidate would start in is not idle: the process recorded for it is
     ///   still running.
     ///
@@ -341,9 +337,6 @@ impl Supervisor for SwapSupervisor {
             return Some(format!(
                 "no frontend child is serving; the startup hold is in force: {why}"
             ));
-        }
-        if let Some(why) = &self.config.migrator_blocked {
-            return Some(format!("every release would fail at step migrate: {why}"));
         }
         let idle = active.other();
         match (self.parts.old_proc)(idle) {

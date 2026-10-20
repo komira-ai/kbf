@@ -15,15 +15,47 @@ use super::{
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+/// A fresh `installer.toml` in a directory of its own. The name carries the test's thread
+/// name (libtest and nextest name it after the test): nextest runs each test in its own
+/// process, where `NEXT` starts at 0 again, and `scratch` empties the directory it hands out.
 fn toml_file(body: &str) -> PathBuf {
-    // The counter is the process's own, and each test runs in a process of its own under
-    // nextest, so every process would name `database-0` and clear the directory another is
-    // using: the process id makes the name unique.
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = kbf_host::testkit::scratch(&format!("database-{}-{n}", std::process::id()));
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .replace("::", "-");
+    let dir = kbf_host::testkit::scratch(&format!("database-{test}-{n}"));
     let file = dir.join("installer.toml");
     fs::write(&file, body).expect("written");
     file
+}
+
+/// Catches two tests sharing one scratch file: under nextest every test is a process of its
+/// own with the counter at 0, so a name from the counter alone made two tests write (and
+/// `scratch` delete) the same `installer.toml`, and each read the other's or none.
+///
+/// Mutant seen red: the thread name dropped from the directory name (the first file is gone).
+#[test]
+fn two_tests_starting_their_count_at_zero_get_their_own_files() {
+    let make = |test: &str, body: &'static str| {
+        std::thread::Builder::new()
+            .name(test.to_owned())
+            .spawn(move || {
+                NEXT.store(0, Ordering::Relaxed);
+                toml_file(body)
+            })
+            .expect("spawned")
+            .join()
+            .expect("joined")
+    };
+    let first = make("database::tests::first", "first = 1\n");
+    let second = make("database::tests::second", "second = 2\n");
+    assert_ne!(first, second);
+    assert_eq!(
+        fs::read_to_string(&first).expect("first kept"),
+        "first = 1\n"
+    );
+    assert_eq!(fs::read_to_string(&second).expect("second"), "second = 2\n");
 }
 
 /// Catches an installer.toml read wrongly: the one key is found among keys other readers

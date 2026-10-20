@@ -10,7 +10,6 @@ use std::future::{Ready, ready};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -23,8 +22,8 @@ use kbf_peer::PeerRole;
 use kbf_server::api::{Write, write_request};
 use kbf_server::identity::{Presented, presented};
 use kbf_server::proxy_auth::{
-    Caller, Identity, NODE_ID, PROXY_AUTH, ProxyAuthLayer, ProxySecret, ProxySecretError, ROLE,
-    Refusal, Trust, classify, gate_requests, strip,
+    Caller, Identity, NODE_ID, NODE_IPS, PROXY_AUTH, ProxyAuthLayer, ProxySecret, ProxySecretError,
+    ROLE, Refusal, Trust, classify, gate_requests, strip,
 };
 use kbf_server::token::{ApiToken, TokenFileError};
 use kbf_server::{Args, ConfigError};
@@ -44,20 +43,33 @@ fn presented_secret() -> String {
     hex::encode(SECRET)
 }
 
-fn dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-proxy-auth");
-    std::fs::create_dir_all(&dir).expect("a directory");
-    dir
+/// A file in a directory of its own, removed with it when this drops.
+struct Owned {
+    path: PathBuf,
+    _dir: kbf_testkit::dir::TestDir,
+}
+
+impl std::ops::Deref for Owned {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
 }
 
 /// A file holding `content` with `mode`, unique to this call.
-fn file(content: &[u8], mode: u32) -> PathBuf {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let path = dir().join(format!("secret-{}-{n}", std::process::id()));
+fn file(content: &[u8], mode: u32) -> Owned {
+    named("secret", content, mode)
+}
+
+/// As [`file`], with the file called `name` (an error that names the path shows it).
+fn named(name: &str, content: &[u8], mode: u32) -> Owned {
+    let dir =
+        kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-proxy-auth");
+    let path = dir.join(name);
     std::fs::write(&path, content).expect("write the file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-    path
+    Owned { path, _dir: dir }
 }
 
 fn secret() -> Arc<ProxySecret> {
@@ -179,6 +191,7 @@ fn only_loopback_with_the_secret_is_believed() {
     let believed = Trust::Proxied(Identity {
         node_id: Some("node-a".to_owned()),
         role: Some(PeerRole::Daemon),
+        ips: Vec::new(),
     });
     let ok = |peer: &str, h: &HeaderMap| classify(Some(&secret), Some(addr(peer)), h);
     assert_eq!(ok(LOOPBACK, &proxied_headers()), Ok(believed.clone()));
@@ -235,6 +248,7 @@ fn the_identity_is_the_node_and_the_role_or_it_is_refused() {
         Ok(Trust::Proxied(Identity {
             node_id: node_id.map(str::to_owned),
             role,
+            ips: Vec::new(),
         }))
     };
     assert_eq!(with(&[]), identity(None, None), "anonymous");
@@ -277,6 +291,138 @@ fn the_identity_is_the_node_and_the_role_or_it_is_refused() {
         Err(Refusal::Malformed(NODE_ID)),
         "a node id that is not ASCII"
     );
+}
+
+/// Catches: the leaf's IP addresses (`x-kbf-node-ips`) read wrongly. A list of canonical
+/// addresses comes through whole and in order, an absent header is none, and anything else
+/// is refused whole, never partly read: an empty value or element, a non-address, a space, a
+/// port, a repeated address, a non-canonical spelling (leading zeros, uncompressed IPv6),
+/// more than 16 addresses, a repeated header, bytes that are not ASCII.
+///
+/// Mutants seen red: a malformed element skipped; a repeated header read as its first
+/// value; the count unbounded; non-canonical spellings accepted; a duplicate kept.
+#[test]
+fn the_leafs_ips_are_a_list_of_canonical_addresses_or_the_call_is_refused() {
+    let secret = secret();
+    let run = |raw: &HeaderMap| classify(Some(&secret), Some(addr(LOOPBACK)), raw);
+    let with = |value: &str| {
+        run(&headers(&[
+            (PROXY_AUTH, &presented_secret()),
+            (NODE_ID, "node-a"),
+            (NODE_IPS, value),
+        ]))
+    };
+    let ips = |texts: &[&str]| {
+        Ok(Trust::Proxied(Identity {
+            node_id: Some("node-a".to_owned()),
+            role: None,
+            ips: texts
+                .iter()
+                .map(|t| t.parse().expect("an address"))
+                .collect(),
+        }))
+    };
+    assert_eq!(with("192.0.2.1"), ips(&["192.0.2.1"]));
+    assert_eq!(
+        with("192.0.2.1,192.0.2.10,fd00::1"),
+        ips(&["192.0.2.1", "192.0.2.10", "fd00::1"])
+    );
+    assert_eq!(with("::ffff:192.0.2.1"), ips(&["::ffff:192.0.2.1"]));
+    let sixteen: Vec<String> = (1..=16).map(|n| format!("192.0.2.{n}")).collect();
+    assert_eq!(
+        with(&sixteen.join(",")),
+        ips(&sixteen.iter().map(String::as_str).collect::<Vec<_>>())
+    );
+    assert_eq!(
+        run(&headers(&[(PROXY_AUTH, &presented_secret())])),
+        Ok(Trust::Proxied(Identity::default())),
+        "no header, no addresses"
+    );
+
+    let seventeen: Vec<String> = (1..=17).map(|n| format!("192.0.2.{n}")).collect();
+    let too_many = seventeen.join(",");
+    for bad in [
+        "",
+        ",",
+        "junk",
+        "192.0.2.1,junk",
+        "junk,192.0.2.1",
+        "192.0.2.1,",
+        ",192.0.2.1",
+        "192.0.2.1,,192.0.2.2",
+        " 192.0.2.1",
+        "192.0.2.1 ",
+        "192.0.2.1, 192.0.2.2",
+        "192.0.2.1;192.0.2.2",
+        "192.0.2.1:8983",
+        "[fd00::1]",
+        "fe80::1%eth0",
+        "192.0.2.1,192.0.2.1",
+        "192.0.2.001",
+        "192.0.2",
+        "192.0.2.256",
+        "fd00:0:0:0:0:0:0:1",
+        "FD00::1",
+        "fd00::0:1",
+        "0:0:0:0:0:0:0:1",
+        too_many.as_str(),
+    ] {
+        assert_eq!(with(bad), Err(Refusal::Malformed(NODE_IPS)), "{bad:?}");
+    }
+    let mut twice = headers(&[(PROXY_AUTH, &presented_secret()), (NODE_IPS, "192.0.2.1")]);
+    twice.append(NODE_IPS, HeaderValue::from_static("192.0.2.2"));
+    assert_eq!(
+        run(&twice),
+        Err(Refusal::Malformed(NODE_IPS)),
+        "two headers"
+    );
+    let mut raw = headers(&[(PROXY_AUTH, &presented_secret())]);
+    raw.insert(
+        NODE_IPS,
+        HeaderValue::from_bytes(b"192.0.2.\xff").expect("a value"),
+    );
+    assert_eq!(run(&raw), Err(Refusal::Malformed(NODE_IPS)), "not ASCII");
+}
+
+/// Catches: `x-kbf-node-ips` believed or even parsed on a call that is not the proxy's: from
+/// a peer that is not loopback it is refused before the header is read, and from a loopback
+/// peer with a wrong, empty or absent secret it is `Unverified` (a malformed value included:
+/// the header is not read at all), with no addresses in it.
+///
+/// Mutants seen red: the header read before the secret is checked; the secret check skipped
+/// when the header is present; the loopback check skipped when it is present.
+#[test]
+fn the_leafs_ips_are_believed_only_from_loopback_with_the_secret() {
+    let secret = secret();
+    let wrong = hex::encode([0x5b; 32]);
+    for value in ["192.0.2.1", "junk,,", ""] {
+        let claims = [(NODE_ID, "node-a"), (NODE_IPS, value)];
+        for pairs in [
+            claims.to_vec(),
+            [&claims[..], &[(PROXY_AUTH, wrong.as_str())]].concat(),
+            [&claims[..], &[(PROXY_AUTH, "")]].concat(),
+        ] {
+            assert_eq!(
+                classify(Some(&secret), Some(addr(LOOPBACK)), &headers(&pairs)),
+                Ok(Trust::Unverified),
+                "{pairs:?}"
+            );
+        }
+        let presented = presented_secret();
+        let right = [&claims[..], &[(PROXY_AUTH, presented.as_str())]].concat();
+        for peer in [REMOTE, "[2001:db8::1]:4000"] {
+            assert_eq!(
+                classify(Some(&secret), Some(addr(peer)), &headers(&right)),
+                Err(Refusal::NotLoopback),
+                "{peer} {value}"
+            );
+        }
+        assert_eq!(
+            classify(None, Some(addr(LOOPBACK)), &headers(&right)),
+            Ok(Trust::Direct),
+            "no proxy configured: never read"
+        );
+    }
 }
 
 /// Catches: a refusal with the wrong gRPC code: a call that came the wrong way is
@@ -397,6 +543,7 @@ async fn the_grpc_layer_applies_the_decision_and_strips_the_headers() {
     let believed = Trust::Proxied(Identity {
         node_id: Some("node-a".to_owned()),
         role: Some(PeerRole::Daemon),
+        ips: Vec::new(),
     });
 
     let (answer, seen) = through_layer(Some(secret()), Some(addr(LOOPBACK)), &claim).await;
@@ -444,6 +591,7 @@ fn presented_prefers_the_proxy_only_when_it_vouched() {
     let identity = Identity {
         node_id: Some("node-a".to_owned()),
         role: Some(PeerRole::Storage),
+        ips: Vec::new(),
     };
     let with = |trust: Option<Trust>| {
         let mut extensions = Extensions::new();
@@ -586,8 +734,9 @@ async fn the_http_layer_applies_the_decision() {
     let (code, body) = call(&mut proxied, Some(LOOPBACK), &proxied_headers()).await;
     assert_eq!(code, StatusCode::OK);
     assert!(
-        body.starts_with("Proxied(Identity { node_id: Some(\"node-a\"), role: Some(Daemon) })")
-            && body.ends_with(" []"),
+        body.starts_with(
+            "Proxied(Identity { node_id: Some(\"node-a\"), role: Some(Daemon), ips: [] })"
+        ) && body.ends_with(" []"),
         "{body}"
     );
     let (code, body) = call(&mut proxied, Some(LOOPBACK), &headers(&[(NODE_ID, "n")])).await;
@@ -705,8 +854,8 @@ fn a_deny_list_that_cannot_be_read_or_parsed_stops_a_proxied_start_without_the_s
     let secret = file(&SECRET, 0o600);
     let secret = secret.to_str().expect("UTF-8");
     let bad = file(b"node a\nserial zz\n", 0o600);
-    let missing = dir().join("no-such-deny-list");
-    let _ = std::fs::remove_file(&missing);
+    let missing = named("no-such-deny-list", b"", 0o600);
+    std::fs::remove_file(&missing.path).expect("remove the file, so it is missing");
     for (list, words) in [(bad, ["serial", ":2:"]), (missing, ["read", "no-such"])] {
         let list = list.to_str().expect("UTF-8");
         let error = args(&["--proxy-auth-file", secret, "--worker-deny-list", list])
@@ -742,6 +891,7 @@ fn the_role_table_judges_a_proxied_call_by_its_forwarded_role() {
         Presented::Proxy(Identity {
             node_id: Some("n".to_owned()),
             role,
+            ips: Vec::new(),
         })
     };
     let certified = |path, role| admit_presented(Admission::Certified, path, &by(role));

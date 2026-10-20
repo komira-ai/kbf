@@ -288,6 +288,14 @@ line to touch and moves only `keys.rs`; if the wire unit lands first, #1049 drop
 `cold_store` reader along with `kbf node`. `GetKeys` is replaced, not kept: the client in
 `keys.rs` moves to `GetStoreConfig`, keeping memory-only storage and zeroize.
 
+**[D] Until the deferred open exists, the frontend does write `cold_store`.** A storage node
+cannot open its metadata log without the store's prefix before it registers, so `kbf node`
+still passes `--cold-store`, and `Enroll` and `Renew` answer it from the registration: the URI
+holds the bucket, prefix, endpoint, region and put settings of the `cold` binding and no key
+(`docs/api.md`, enroll section). A node uses the `cold_store` it is sent with its own process credentials, so
+the frontend picks the endpoint that receives the node's signed requests: the same trust as the worker and CAS endpoints it already sends. The node's registration fetch then finds the same identity
+and applies the keys. When the open is deferred, `cold_store` and the node's refresh of it go.
+
 ## 9. Secrets: where they can leak, and what stops it
 
 | Path | Rule |
@@ -422,7 +430,7 @@ None of these is done by a pull request in this series; each needs the owner's e
 ## 17. Units
 
 Each is its own pull request, red first, listing its mutants. Each that adds code also
-tightens `coverage-baseline`.
+meets the coverage gate (`coverage-floors`).
 
 | Unit | Does | After |
 |---|---|---|

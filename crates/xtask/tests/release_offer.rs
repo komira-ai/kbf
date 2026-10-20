@@ -11,6 +11,7 @@ use kbf_gate::{
     Beta, CommitId, GateResult, Header, Limit, OfferDoc, ResultDoc, Sample, SetHash, Stage, Status,
     Target,
 };
+use kbf_testkit::dir::TestDir;
 use sha2::Digest;
 use xtask::Error;
 use xtask::package::Platform;
@@ -25,15 +26,12 @@ const ARTIFACTS: &str = "komira-ai/kbf/.github/workflows/artifacts.yml";
 const BETA: &str = "komira-ai/kbf/.github/workflows/beta.yml";
 const PLATFORMS: [Platform; 2] = [Platform::LinuxX86_64, Platform::DarwinArm64];
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-offer")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// An empty directory of its own for one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-offer"),
+        name,
+    )
 }
 
 fn sha_of(bytes: &[u8]) -> String {
@@ -225,13 +223,21 @@ struct Fx {
     root: PathBuf,
     dist: PathBuf,
     set: SetHash,
+    /// The directory `root` is: last, so it is removed after the fixture.
+    _own: TestDir,
 }
 
 fn fx(name: &str) -> Fx {
-    let root = scratch(name);
+    let own = scratch(name);
+    let root = own.to_path_buf();
     let (dist, _) = make_dist(&root, &["linux-x86_64", "darwin-arm64"]);
     let set = set_of(&dist);
-    Fx { root, dist, set }
+    Fx {
+        root,
+        dist,
+        set,
+        _own: own,
+    }
 }
 
 #[test]

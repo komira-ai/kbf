@@ -17,10 +17,11 @@ use crate::helper::memory::{Memory, StagedFacts as KeptFacts};
 use crate::helper::status;
 use crate::proxy::api::model::UpdateId;
 use crate::proxy::model::{Intent, Locator, Plan, StagedFacts, Step, Verb};
-use crate::proxy::ports::{Recorder, RootOrders};
+use crate::proxy::ports::{ChildAdmin, Recorder, RootOrders};
 use crate::proxy::supervisor_swap::rig::Rig;
 use crate::state::State;
 use crate::testkit::{A, B, c};
+use kbf_state::postgres::schema::{Outcome, SchemaError};
 
 const SECRET: &str = "abababababababababababababababababababababababababababababababab";
 
@@ -45,8 +46,14 @@ fn config(name: &str) -> (HandoverConfig, OrderSpool, PathBuf) {
         fetch_timeout_s: 900,
         slots: ports_of([addr(1), addr(1)], [addr(1), addr(1)]),
         operator_token_file: root.join("operator.token"),
+        installer_toml: root.join("installer.toml"),
         gate: GateSlot::new(),
     };
+    fs::write(
+        &cfg.installer_toml,
+        "database = \"postgres:///kbf?host=/nonexistent-kbf-test-socket\"\n",
+    )
+    .expect("installer.toml");
     let spool = OrderSpool::open(&cfg.orders_dir, &cfg.state_dir).expect("the spool");
     (cfg, spool, root)
 }
@@ -181,24 +188,25 @@ fn the_first_call_after_the_fill_builds_the_swap_supervisor() {
     let (cfg, spool, root) = config("fill-ok");
     let handover = Handover::new(&cfg, spool);
     cfg.gate.fill(host_over(&rig, root.clone(), &deaths));
-    let why = handover.start_blocked().expect("blocked by the migrator");
-    assert!(why.contains(RUNNING_SCHEMA_UNKNOWN), "{why}");
+    assert_eq!(handover.start_blocked(), None, "nothing blocks a POST here");
 }
 
-/// Catches a host whose migrator can never pass (the running schema is unknown) that still
-/// takes a `POST`: every update would be fetched and staged and then end `failed` at step
-/// `migrate`. Fails without the `migrator_blocked` the driver is built with: `start_blocked`
-/// would be `None` here.
+/// What `start_blocked` reports now that the migrator is the real one: nothing about the
+/// migration (it is judged at step `migrate`, with the release's own schema), the busy slot
+/// when a process still runs in the candidate's. Catches a leftover migrator refusal, which
+/// would turn every `POST` away before the root half fetched anything.
 #[test]
-fn a_host_that_cannot_tell_its_schema_refuses_before_anything_is_fetched() {
+fn start_blocked_names_no_migration_reason_and_still_names_a_busy_slot() {
     let (cfg, spool, root) = config("blk-migrate");
     let handover = Handover::new(&cfg, spool);
     let rig = Rig::new(None);
     let deaths = Arc::new(Mutex::new(Vec::new()));
     cfg.gate.fill(host_over(&rig, root, &deaths));
+    assert_eq!(handover.start_blocked(), None);
+    rig.occupy(Slot::B);
     let why = handover.start_blocked().expect("blocked");
-    assert!(why.contains("step migrate"), "{why}");
-    assert!(why.contains(RUNNING_SCHEMA_UNKNOWN), "{why}");
+    assert!(why.contains("slot B is not idle"), "{why}");
+    assert!(!why.contains("migrate"), "{why}");
 }
 
 /// Catches a startup hold that is not seen by `start_blocked`: with no frontend child adopted
@@ -283,13 +291,8 @@ fn once_the_slot_is_filled_every_call_is_the_swap_supervisors() {
     );
 }
 
-/// Catches a migrator that lets an update through that it cannot judge: with the root half's
-/// own `status.json` showing the release kept, the swap goes as far as the migrator and ends
-/// `failed` at step `migrate`, with the refusal's word and the reason the schema is unknown,
-/// and no candidate is started.
-#[test]
-fn a_kept_release_is_refused_at_the_migrator_while_the_running_schema_is_unknown() {
-    let (cfg, spool, root) = config("migrate");
+/// The root half's `status.json` showing release `B` kept with `state_schema` 3.
+fn kept_b(cfg: &HandoverConfig) {
     let running = State {
         current: Some(c(A)),
         staged: Some(c(B)),
@@ -297,40 +300,157 @@ fn a_kept_release_is_refused_at_the_migrator_while_the_running_schema_is_unknown
     };
     let memory = Memory {
         staged: Some(KeptFacts {
-            state_schema: 1,
+            state_schema: 3,
             ..kept(B)
         }),
         ..Memory::default()
     };
     fs::write(&cfg.status_file, status::render(&running, &memory)).expect("status.json");
-    let mut handover = Handover::new(&cfg, spool);
-    let rig = Rig::new(None);
-    let deaths = Arc::new(Mutex::new(Vec::new()));
-    cfg.gate.fill(host_over(&rig, root, &deaths));
-    handover.start(&spec("u1")).expect("accepted");
+}
+
+/// A migration that records what it was handed and answers `answer`.
+type Seen = Arc<Mutex<Vec<(u32, Duration)>>>;
+
+fn applying(answer: Result<Outcome, SchemaError>) -> (ApplyHook, Seen) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let hook: ApplyHook = Arc::new(move |_db, schema, wait| {
+        sink.lock().unwrap().push((schema, wait));
+        answer.clone()
+    });
+    (hook, seen)
+}
+
+fn migrated() -> Outcome {
+    Outcome {
+        from: Some(2),
+        to: 3,
+        ran: vec![3],
+    }
+}
+
+fn failed_update(handover: &Handover) -> crate::proxy::model::Failure {
     until("the update to end", || {
         handover
             .status()
             .update
             .is_some_and(|u| u.phase == Phase::Failed)
     });
-    let failure = handover
+    handover
         .status()
         .update
         .and_then(|u| u.failure)
-        .expect("a failure");
+        .expect("a failure")
+}
+
+/// Catches a migrator that is not the database's: a refusal of the migration (here the lock
+/// is busy) ends the update `failed` at step `migrate` with the migrator's own word, and no
+/// candidate is started. The migration was asked for the staged release's schema (3) with the
+/// migrator's bounded wait.
+#[test]
+fn a_migration_the_database_refuses_ends_the_update_at_migrate_with_its_word() {
+    let (cfg, spool, root) = config("migrate-busy");
+    kept_b(&cfg);
+    let (hook, seen) = applying(Err(SchemaError::Busy));
+    let mut handover = Handover::with_seams(
+        &cfg,
+        spool,
+        Seams {
+            apply: Some(hook),
+            admin: None,
+        },
+    );
+    let rig = Rig::new(None);
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate.fill(host_over(&rig, root, &deaths));
+    handover.start(&spec("u1")).expect("accepted");
+    let failure = failed_update(&handover);
     assert_eq!(failure.step, Step::Migrate);
     assert!(
-        failure.reason.starts_with("not_additive:"),
+        failure.reason.starts_with("database_busy:"),
         "{}",
         failure.reason
     );
-    assert!(
-        failure.reason.contains(RUNNING_SCHEMA_UNKNOWN),
-        "{}",
-        failure.reason
-    );
+    assert_eq!(*seen.lock().unwrap(), [(3, DbMigrator::LOCK_WAIT)]);
     assert_eq!(rig.count("spawn"), 0, "no candidate was started");
+}
+
+/// Catches an `installer.toml` that is not the one the migrator opens: with no such file the
+/// update ends `failed` at step `migrate` as `database_error`, naming the file, and the old
+/// child is untouched.
+#[test]
+fn an_installer_toml_that_cannot_be_read_ends_the_update_at_migrate() {
+    let (cfg, spool, root) = config("migrate-no-toml");
+    kept_b(&cfg);
+    fs::remove_file(&cfg.installer_toml).expect("remove");
+    let mut handover = Handover::new(&cfg, spool);
+    let rig = Rig::new(None);
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate.fill(host_over(&rig, root, &deaths));
+    handover.start(&spec("u1")).expect("accepted");
+    let failure = failed_update(&handover);
+    assert_eq!(failure.step, Step::Migrate);
+    assert!(
+        failure.reason.starts_with("database_error:") && failure.reason.contains("installer.toml"),
+        "{}",
+        failure.reason
+    );
+    assert_eq!(rig.count("spawn"), 0);
+    assert!(rig.alive(Slot::A));
+}
+
+/// The whole handover over the real supervisor: the real order spool, `status.json`, recorder
+/// and the real migrator (its migration is the only seam, and the admin client is the rig's
+/// instead of HTTP to children), with the rig's children and gate. A kept release goes
+/// through `migrate`, starts a candidate in slot B, takes over, and stands the old child in A
+/// down; the update is then baking in B. Red before the migrator was wired: the update ended
+/// `failed` at step `migrate` (`not_additive`) and nothing after it ran.
+#[test]
+fn a_kept_release_is_migrated_taken_over_and_the_old_child_stood_down() {
+    let (cfg, spool, root) = config("full");
+    kept_b(&cfg);
+    let (hook, seen) = applying(Ok(migrated()));
+    let rig = Rig::new(None);
+    let admin: Arc<dyn ChildAdmin + Send + Sync> = rig.clone();
+    let mut handover = Handover::with_seams(
+        &cfg,
+        spool,
+        Seams {
+            apply: Some(hook),
+            admin: Some(admin),
+        },
+    );
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate.fill(host_over(&rig, root, &deaths));
+    assert_eq!(handover.start_blocked(), None);
+    handover.start(&spec("u1")).expect("accepted");
+    until(
+        "the old child to be stood down and the update to bake",
+        || {
+            handover
+                .status()
+                .update
+                .is_some_and(|u| matches!(u.phase, Phase::Baking | Phase::Failed))
+        },
+    );
+    let update = handover.status().update.expect("shown");
+    assert_eq!(update.phase, Phase::Baking, "{:?}", update.failure);
+    assert_eq!(update.active_slot, Slot::B);
+    assert_eq!(*seen.lock().unwrap(), [(3, DbMigrator::LOCK_WAIT)]);
+    let log = rig.log();
+    let at = |what: &str| {
+        log.iter()
+            .position(|line| line.starts_with(what))
+            .unwrap_or_else(|| panic!("{what} is not in {log:?}"))
+    };
+    assert!(
+        at("spawn B") < at("admin:quiesce A")
+            && at("admin:quiesce A") < at("admin:takeover B")
+            && at("admin:takeover B") < at("admin:stand_down A"),
+        "{log:?}"
+    );
+    assert!(rig.alive(Slot::A) && rig.alive(Slot::B));
+    assert!(deaths.lock().unwrap().is_empty());
 }
 
 /// Catches a supervisor built over a state directory other than the proxy's: an update that

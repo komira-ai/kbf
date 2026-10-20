@@ -21,12 +21,12 @@
 //! secret on every call, the operator token read from its file on each `post_desired`);
 //! `recorder` is [`FileRecorder`] over the state directory; `orders` is [`SpoolRootOrders`]
 //! over a clone of the one order spool (it shares the counter, and never opens `orders/`);
-//! `migrator` is [`ExpandOnlyDefault`] with the schema the host runs unknown (see
-//! [`RUNNING_SCHEMA_UNKNOWN`]); `clock` is the system clock.
+//! `migrator` is [`StateDbMigrator`], the [`DbMigrator`] over the state database `installer.toml`
+//! names, opened at each migration; `clock` is the system clock.
 //!
 //! `start_blocked` refuses while the start-up hold is in force ([`Host::held`]: no frontend
-//! child was adopted, so the active slot is a guess) and while the migrator is the unknown-schema
-//! default (every release would fail at step `migrate`, after the root half had fetched it).
+//! child was adopted, so the active slot is a guess). It does not look at the database: an
+//! unreachable one is the refusal of step `migrate` (`database_error`), recorded in the update.
 //!
 //! Nothing here names the proxy's types: the verb, which does, builds the [`Host`].
 
@@ -38,19 +38,20 @@ use super::admin::{Admin, Deadlines};
 use super::api::traits::{Retired, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec};
 use super::child_http::Headers;
 use super::handover::HandoverConfig;
+use super::migrator::DbMigrator;
+use super::model::PortError;
 use super::model::{Mode, Phase, ProcIdent, Slot, Timing};
 use super::orders::OrderSpool;
 use super::ports::{Child, Gate};
+use super::ports::{ChildAdmin, Migrator, RootOrders};
 use super::record::FileRecorder;
 use super::root_orders::SpoolRootOrders;
 use super::runtime::{RequestQueue, SystemClock};
-use super::supervisor_swap::{Config, ExpandOnlyDefault, Parts, SwapSupervisor};
-
-/// Why the default migrator cannot tell what schema the host runs: the proxy has no read of
-/// it (the database is the installer's, and the proxy never opens it), so a release whose
-/// `state_schema` it cannot compare is refused at step `migrate` with `not_additive`. A real
-/// migrator, or a source for the running schema, replaces this where [`build`] is.
-pub const RUNNING_SCHEMA_UNKNOWN: &str = "the proxy has no read of the database's schema";
+use super::supervisor_swap::{Config, Parts, SwapSupervisor};
+use crate::CommitId;
+use crate::database::Database;
+use kbf_state::postgres::schema::{Outcome, SchemaError};
+use std::time::Duration;
 
 /// The words of a call made before the proxy is bound.
 pub const NOT_BOUND: &str = "proxy not bound yet";
@@ -136,10 +137,20 @@ impl std::fmt::Debug for GateSlot {
     }
 }
 
+/// What a test replaces of the swap's ports; the verb never sets either.
+#[derive(Clone, Default)]
+pub(super) struct Seams {
+    /// Runs the migration in place of the database.
+    pub(super) apply: Option<ApplyHook>,
+    /// The admin client in place of [`Admin`] over the children's ports.
+    pub(super) admin: Option<Arc<dyn ChildAdmin + Send + Sync>>,
+}
+
 /// The supervisor that is the swap once the proxy is bound. See the module documentation.
 pub struct Handover {
     cfg: HandoverConfig,
     spool: OrderSpool,
+    seams: Seams,
     inner: Mutex<Option<SwapSupervisor>>,
 }
 
@@ -150,7 +161,17 @@ impl Handover {
         Handover {
             cfg: cfg.clone(),
             spool,
+            seams: Seams::default(),
             inner: Mutex::new(None),
+        }
+    }
+
+    /// A handover whose ports are replaced by `seams`.
+    #[cfg(test)]
+    pub(super) fn with_seams(cfg: &HandoverConfig, spool: OrderSpool, seams: Seams) -> Handover {
+        Handover {
+            seams,
+            ..Handover::new(cfg, spool)
         }
     }
 
@@ -161,7 +182,7 @@ impl Handover {
             self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if inner.is_none() {
             let host = self.cfg.gate.get()?;
-            *inner = Some(build(&self.cfg, &self.spool, host));
+            *inner = Some(build(&self.cfg, &self.spool, host, &self.seams));
         }
         inner.as_mut().map(call)
     }
@@ -191,23 +212,68 @@ fn admin_of(slots: SlotAddrs, token_file: PathBuf, secret: Headers) -> Admin {
     )
 }
 
+/// What runs the migration in place of the database: only a test sets one, to see what it is
+/// handed instead of reaching a server.
+pub(super) type ApplyHook =
+    Arc<dyn Fn(&Database, u32, Duration) -> Result<Outcome, SchemaError> + Send + Sync>;
+
+/// The swap's [`Migrator`]: a [`DbMigrator`] over the database `installer.toml` names, built
+/// for each migration (the swap runs this once per update, and the proxy never holds a
+/// connection or reads the file before it is asked). A file that cannot be read is the
+/// refusal `database_error: ...` of step `migrate`, with [`DatabaseError`](crate::database::DatabaseError)'s
+/// words (they carry the path, never a password: the file may not carry one).
+pub struct StateDbMigrator {
+    orders: Arc<dyn RootOrders + Send + Sync>,
+    installer_toml: PathBuf,
+    apply: Option<ApplyHook>,
+}
+
+impl StateDbMigrator {
+    #[must_use]
+    pub fn new(orders: Arc<dyn RootOrders + Send + Sync>, installer_toml: PathBuf) -> Self {
+        StateDbMigrator {
+            orders,
+            installer_toml,
+            apply: None,
+        }
+    }
+}
+
+impl Migrator for StateDbMigrator {
+    fn migrate_forward(&self, release: &CommitId) -> Result<(), PortError> {
+        let db = Database::from_installer_toml(&self.installer_toml)
+            .map_err(|e| PortError(format!("database_error: {e}")))?;
+        let migrator = DbMigrator::new(db, &*self.orders);
+        match &self.apply {
+            None => migrator.migrate_forward(release),
+            Some(apply) => {
+                let apply = Arc::clone(apply);
+                migrator
+                    .with_apply(Box::new(move |db, schema, wait| apply(db, schema, wait)))
+                    .migrate_forward(release)
+            }
+        }
+    }
+}
+
 /// The swap supervisor over `host`'s ports. Resumes an update that was in flight.
-fn build(cfg: &HandoverConfig, spool: &OrderSpool, host: &Host) -> SwapSupervisor {
+fn build(cfg: &HandoverConfig, spool: &OrderSpool, host: &Host, seams: &Seams) -> SwapSupervisor {
     let orders = Arc::new(SpoolRootOrders::new(spool.clone(), &cfg.status_file));
-    let admin = admin_of(
-        cfg.slots,
-        cfg.operator_token_file.clone(),
-        host.secret.clone(),
-    );
-    let migrator = ExpandOnlyDefault::new(
-        orders.clone(),
-        kbf_state::postgres::schema::latest(),
-        Box::new(|| Err(RUNNING_SCHEMA_UNKNOWN.to_owned())),
-    );
+    let admin: Arc<dyn ChildAdmin + Send + Sync> = seams.admin.clone().unwrap_or_else(|| {
+        Arc::new(admin_of(
+            cfg.slots,
+            cfg.operator_token_file.clone(),
+            host.secret.clone(),
+        ))
+    });
+    let migrator = StateDbMigrator {
+        apply: seams.apply.clone(),
+        ..StateDbMigrator::new(orders.clone(), cfg.installer_toml.clone())
+    };
     let recorded = Arc::clone(&host.recorded);
     let parts = Parts {
         child: Arc::clone(&host.child),
-        admin: Arc::new(admin),
+        admin,
         gate: Arc::clone(&host.gate),
         migrator: Arc::new(migrator),
         recorder: Arc::new(FileRecorder::new(&cfg.state_dir)),
@@ -227,7 +293,6 @@ fn build(cfg: &HandoverConfig, spool: &OrderSpool, host: &Host) -> SwapSuperviso
             rollback_after_switch: false,
             releases_dir: host.releases_dir.clone(),
             startup_hold: host.held.clone(),
-            migrator_blocked: Some(RUNNING_SCHEMA_UNKNOWN.to_owned()),
         },
     )
 }

@@ -1,0 +1,80 @@
+# kbf build farm frontend on a host without the frontend proxy: `kbf --mode=frontend`.
+# Static unit: shipped by the kbf-installer package (installed under /usr/lib/systemd/system/),
+# disabled, with no rendering and no @PLACEHOLDER@ in it. It starts only once
+# /etc/kbf/kbf.toml exists (ConditionPathExists=), after kbf-installer's `boot-check` (which
+# counts the starts of a release on trial and reverts a release that spends its budget) and
+# `kbf --mode=frontend --check` (which prints every missing prerequisite and exits 2). The
+# checks are ExecStartPre=, not ExecCondition=: ExecCondition= skips the start silently on
+# exit 1 to 254, and a unit that cannot start must fail where an operator sees it.
+#
+# When to use it: on a frontend host that does not run kbf-proxy. The listeners, the state
+# store, the certificates and the cold store are kbf.toml's (--config names it), and the
+# binary is the release `releases/current` points at (docs/design/kbf-installer.md, section
+# 7): there are no slots. A host with the proxy runs the frontend as a child of kbf-proxy
+# instead and does not enable this unit; enable one of the two, never both (they bind the
+# same ports). The template kbf-frontend@.service is the handover model (two instances, a
+# control socket, a slot per instance) that the proxy replaces.
+#
+# No --instance and no --handover-socket: kbf refuses --instance without --handover-socket,
+# and without either the process is a plain frontend. An update is a restart: a stop
+# drains (below), `releases/current` is flipped by kbf-installer's confirm, and the start
+# runs the new release. Builds in flight finish before the old process exits; the
+# listeners are closed from the stop to the next start.
+[Unit]
+Description=kbf build farm frontend
+Wants=network-online.target
+After=network-online.target
+# A listen address on a VPN or overlay interface can appear after network-online.target
+# (kbf#998). Order the frontend after that interface's own service with a drop-in,
+# /etc/systemd/system/kbf-frontend.service.d/listen-after.conf, holding After= and
+# Wants= lines; kbf-installer writes it where kbf.toml names such a service. kbf also
+# retries a bind to an address that is not there yet, within its start budget.
+ConditionPathExists=/etc/kbf/kbf.toml
+# A failure that repeats quickly must not use up systemd's start limit (5 starts in 10 s)
+# and leave the frontend down (check-units rule `restart`).
+StartLimitIntervalSec=0
+
+[Service]
+# kbf sends READY=1 (sd_notify) once it serves and its probes pass, so `systemctl start`
+# returns only when the frontend can take the builds.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=120
+# Not the daemon's user: the frontend holds the state store and the operator token.
+# kbf-server, not kbf: the user builds run as must not read the state store, the operator
+# token or the keys.
+User=kbf-server
+Slice=kbf.slice
+# kbf's own state, created for the unit's user by systemd; kbf-installer never touches it.
+# /var/lib/kbf-server, not /var/lib/kbf: systemd chowns a StateDirectory= to the unit's
+# user, so sharing kbf's would hand it back and forth on a host that runs a kbf unit too.
+# kbf.toml's paths name this directory.
+StateDirectory=kbf-server
+StateDirectoryMode=0750
+# A frontend answering from swap would slow every build at once.
+MemorySwapMax=0
+OOMScoreAdjust=-925
+# systemd starts a unit at a soft open-file limit of 1024; a build burst passes that (EMFILE).
+LimitNOFILE=1048576
+CPUWeight=300
+# boot-check does not depend on slots or instances: it counts the starts of a release on
+# trial in kbf-installer's state and reverts a release that spends its budget.
+ExecStartPre=+/usr/bin/kbf-installer boot-check
+# `--check` validates kbf.toml and what a restart cannot change (a file, a user, a flag)
+# and exits 2 for those. Anything that can become ready later (a listen address, a peer,
+# a DNS name, a mount) is not refused here: it exits 75 (not ready, restarted).
+ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --check
+ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=frontend --config /etc/kbf/kbf.toml
+# kbf drains on SIGTERM: new Execute calls are refused, open streams run until their action
+# is done (Buck2 does not recover a stream that breaks), with no deadline, then the server
+# exits. A stop that ends sooner fails every build in flight, so systemd sends SIGTERM and
+# never kills it for taking long (check-units rule `stop`).
+KillSignal=SIGTERM
+TimeoutStopSec=infinity
+Restart=on-failure
+RestartSec=5
+# Exit 2 is a command line kbf refused (or a config it refused): a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

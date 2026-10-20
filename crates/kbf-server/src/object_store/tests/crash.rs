@@ -54,7 +54,8 @@ fn crash_during(reg: &Registry, step: Step, call: impl FnOnce()) {
 fn a_crash_at_any_step_of_a_first_write_leaves_no_row_and_no_file_after_the_sweep() {
     for step in STEPS {
         let store = as_store(&fake());
-        let dir = scratch("crash-first").join("s");
+        let root = scratch("crash-first");
+        let dir = root.join("s");
         let reg = open(&store, &dir);
         crash_during(&reg, step, || {
             let _ = reg.put_connection(&name("cold"), &put(SENTINEL));
@@ -80,7 +81,8 @@ fn a_crash_at_any_step_of_a_first_write_leaves_no_row_and_no_file_after_the_swee
 fn a_crash_at_any_step_of_a_rotation_keeps_the_live_version_readable() {
     for step in STEPS {
         let store = as_store(&fake());
-        let dir = scratch("crash-rotate").join("s");
+        let root = scratch("crash-rotate");
+        let dir = root.join("s");
         let reg = open(&store, &dir);
         reg.put_connection(&name("cold"), &put("live-secret"))
             .unwrap();
@@ -127,7 +129,8 @@ fn a_crash_at_any_step_of_a_rotation_keeps_the_live_version_readable() {
 #[test]
 fn a_writer_that_lost_a_race_writes_nothing_and_cleans_up() {
     let store = as_store(&fake());
-    let dir = scratch("race").join("s");
+    let root = scratch("race");
+    let dir = root.join("s");
     let loser = open(&store, &dir);
     let winner = Arc::new(open_now(Arc::clone(&store), &dir, Counting::from(100)).unwrap());
     let racer = Arc::clone(&winner);
@@ -166,7 +169,8 @@ fn a_writer_that_lost_a_race_writes_nothing_and_cleans_up() {
 #[test]
 fn an_unchanged_write_also_loses_a_race() {
     let store = as_store(&fake());
-    let dir = scratch("race-same").join("s");
+    let root = scratch("race-same");
+    let dir = root.join("s");
     let first = open(&store, &dir);
     first.put_connection(&name("cold"), &put("s")).unwrap();
     let other = Arc::new(open_now(Arc::clone(&store), &dir, Counting::from(100)).unwrap());
@@ -191,7 +195,8 @@ fn an_unchanged_write_also_loses_a_race() {
 #[test]
 fn a_change_that_keeps_the_secret_and_loses_a_race_leaves_the_live_file() {
     let store = as_store(&fake());
-    let dir = scratch("race-keep").join("s");
+    let root = scratch("race-keep");
+    let dir = root.join("s");
     let loser = open(&store, &dir);
     loser.put_connection(&name("cold"), &put("kept")).unwrap();
     let winner = Arc::new(open_now(Arc::clone(&store), &dir, Counting::from(100)).unwrap());
@@ -237,7 +242,8 @@ fn over_random_interleavings_a_row_always_names_an_existing_file() {
     for seed in 1..=12u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let store = as_store(&fake());
-        let dir = scratch("prop").join("s");
+        let root = scratch("prop");
+        let dir = root.join("s");
         let mut reg = open(&store, &dir);
         let mut model: BTreeMap<&str, String> = BTreeMap::new();
         let mut last_generation = 0;
