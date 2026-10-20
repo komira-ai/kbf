@@ -76,10 +76,13 @@ The server checks the version, the node id, that the client certificate names th
 node id and neither is denied ([below](#node-identity-and-the-deny-list)), the capacity
 entries and the entries placement matches (`arch`; a repeated single-valued entry; a
 countable entry that is not a whole number). If any fails, it ends the stream with an
-error status (`FAILED_PRECONDITION` for an unaccepted version, `PERMISSION_DENIED` for
+error status (`FAILED_PRECONDITION` for a version below the oldest, `PERMISSION_DENIED` for
 a certificate that does not name the node or a denied one, `UNAVAILABLE` while the
 deny list cannot be read, `INVALID_ARGUMENT` otherwise). A stream that sends no `Hello` within 10 seconds ends
-`DEADLINE_EXCEEDED`. On success it answers `Welcome` with the version it will speak,
+`DEADLINE_EXCEEDED`. On success it answers `Welcome` with the version it will speak (the lesser of the
+`Hello`'s and the newest the server speaks: a `Hello` newer than the server is answered
+with the server's newest, not refused, and a daemon accepts a `Welcome` from the oldest
+version it speaks up to the one its `Hello` named),
 the heartbeat interval in milliseconds, and its **lease epoch** (see
 [Server restarts and the lease epoch](#server-restarts-and-the-lease-epoch)).
 

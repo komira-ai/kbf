@@ -249,8 +249,6 @@ pub struct Stats {
     pub grants: u64,
     /// Grants that left their worker with nothing free on some axis the request used.
     pub exact_fills: u64,
-    /// Workers held, in a round, for an operation that runs alone.
-    pub holds: u64,
     /// Submissions that joined a twin.
     pub joins: u64,
     /// Joins that raised the QoS of a queued twin.
@@ -296,9 +294,6 @@ pub struct Checker {
     touched_workers: BTreeSet<WorkerId>,
     /// The grants of the last round, in order.
     pub last_round: Vec<(OperationId, WorkerId)>,
-    /// The worker each queued operation that runs alone held at the last round:
-    /// placement keeps a hold while that worker could still run it.
-    holds: BTreeMap<OperationId, WorkerId>,
     /// Per operation: the farm time (ms) of its first grant.
     pub granted_at: BTreeMap<OperationId, u64>,
     /// Per operation: the farm time (ms) it was finished.
@@ -337,7 +332,6 @@ impl Checker {
             touched_ops: BTreeSet::new(),
             touched_workers: BTreeSet::new(),
             last_round: Vec::new(),
-            holds: BTreeMap::new(),
             granted_at: BTreeMap::new(),
             finished_at: BTreeMap::new(),
             refused_reason: BTreeMap::new(),

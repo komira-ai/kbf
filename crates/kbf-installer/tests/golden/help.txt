@@ -19,6 +19,8 @@ Commands:
   migrate         Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's tree, or put it back with `--rollback`. A dry run without `--apply`
   quiesce         For maintainer scripts: take the lock; exit 5 while a swap is pending
   check           Validate the installer's configuration, trust files and path chain
+  backup          Dump the state database to the backup directory and keep the newest few; run by kbf-backup.timer as the service user, who connects as the role installer.toml's database URL names
+  restore         Restore a backup into an empty state database, as the service user, who connects as the role installer.toml's database URL names
   proxy           Serve the frontend host's public port: route each stream to the active child frontend
   help            Print this message or the help of the given subcommand(s)
 
@@ -222,6 +224,48 @@ Options:
       --json   Print the result as one JSON object on standard output
       --apply  Do what the verb says. Without it a mutating verb is a dry run
   -h, --help   Print help
+
+=== kbf-installer backup --help ===
+Dump the state database to the backup directory and keep the newest few; run by kbf-backup.timer as the service user, who connects as the role installer.toml's database URL names
+
+Usage: kbf-installer backup [OPTIONS]
+
+Options:
+      --installer-config <INSTALLER_CONFIG>
+          installer.toml, under the host root: its `database` key names the database to dump and its `backup_keep` how many backups stay (default 7) [default: /etc/kbf/installer.toml]
+      --json
+          Print the result as one JSON object on standard output
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --dir <DIR>
+          The backup directory: made 0700 when it is not there, owned by the user that runs this [default: /var/lib/kbf-server/backups]
+      --pg-dump <PG_DUMP>
+          The `pg_dump` program (a name looked up in PATH, or a path) [default: pg_dump]
+      --pg-restore <PG_RESTORE>
+          The `pg_restore` program, which checks the dump can be read [default: pg_restore]
+  -h, --help
+          Print help
+
+=== kbf-installer restore --help ===
+Restore a backup into an empty state database, as the service user, who connects as the role installer.toml's database URL names
+
+Usage: kbf-installer restore [OPTIONS] --file <FILE>
+
+Options:
+      --file <FILE>
+          The backup to restore (a file `backup` wrote)
+      --json
+          Print the result as one JSON object on standard output
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --installer-config <INSTALLER_CONFIG>
+          installer.toml, under the host root: its `database` key names the database to restore into (unless --database does), which must be empty of kbf's schema [default: /etc/kbf/installer.toml]
+      --database <DATABASE>
+          Restore into this database instead, for a restore test: a bare NAME (a database on the server and socket installer.toml names, for the role it names) or a URL with no password
+      --pg-restore <PG_RESTORE>
+          The `pg_restore` program (a name looked up in PATH, or a path) [default: pg_restore]
+  -h, --help
+          Print help
 
 === kbf-installer proxy --help ===
 Serve the frontend host's public port: route each stream to the active child frontend

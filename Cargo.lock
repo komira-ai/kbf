@@ -4937,6 +4937,7 @@ dependencies = [
  "flate2",
  "hex",
  "kbf-gate",
+ "kbf-host",
  "kbf-installer",
  "kbf-testkit",
  "lzma-rs",
