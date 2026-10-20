@@ -229,8 +229,8 @@ mod tests {
     /// refuses a directory not made yet.
     #[test]
     fn the_real_source_sums_the_files_under_a_directory() {
-        let own = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-threads-held");
-        let root = own.join("held");
+        let root = std::env::temp_dir().join(format!("kbf-threads-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(Statvfs.held(&root).expect("not made yet"), 0);
         std::fs::create_dir_all(root.join("a/b")).expect("dirs");
         std::fs::write(root.join("top"), [0_u8; 10]).expect("file");
@@ -244,5 +244,6 @@ mod tests {
             Statvfs.held(&root.join("top")).is_err(),
             "a file is no directory"
         );
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

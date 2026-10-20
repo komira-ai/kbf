@@ -191,7 +191,8 @@ mod tests {
     async fn serves_before_pass_finishes() {
         let logs = Capture::waiting_for(PASS_LINES);
         let _default = logs.subscribe();
-        let root = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-server-pass");
+        let root = std::env::temp_dir().join(format!("kbf-server-pass-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let (blobs, raft) = (root.join("blobs"), root.join("raft"));
         let args = Args::parse_from([
             "kbf-server".to_owned(),
@@ -268,6 +269,7 @@ mod tests {
         }
         serving.abort();
         drop(files);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Catches a pass that raises the log's machine version in a cell of more than
@@ -281,7 +283,9 @@ mod tests {
     async fn a_cell_of_three_marks_missing_until_the_operator_raises() {
         let logs = Capture::waiting_for(PASS_LINES);
         let _default = logs.subscribe();
-        let root = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-server-pass-three");
+        let root =
+            std::env::temp_dir().join(format!("kbf-server-pass-three-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let files = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
         let meta = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
             .await
@@ -355,6 +359,7 @@ mod tests {
         let blobs = cache.meta().query(|s| s.blob_count()).await;
         assert_eq!(blobs, Ok(1));
         drop((cache, files));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Catches a readiness that counts the log at version 3 as not ready in a cell of
@@ -362,7 +367,9 @@ mod tests {
     /// or `> 2` for `> 1`): two voters need the operator, one is raised here.
     #[tokio::test(flavor = "current_thread")]
     async fn only_a_single_voter_is_raised_here() {
-        let root = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-server-pass-voters");
+        let root =
+            std::env::temp_dir().join(format!("kbf-server-pass-voters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let log = RaftMetaLog::open_dir(&root, Retention::default(), "kbf/")
             .await
             .expect("open the log");
@@ -373,6 +380,7 @@ mod tests {
         assert_eq!(log.machine_version(), MachineVersion::V3);
         assert_eq!(ready_among(&log, 2), Ok(EvictReady::Ready));
         drop(log);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// What every line the pass ends with says.
@@ -436,7 +444,9 @@ mod tests {
     async fn a_failed_pass_is_logged() {
         let mut logs = Capture::waiting_for(PASS_LINES);
         let _default = logs.subscribe();
-        let root = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-server-pass-fails");
+        let root =
+            std::env::temp_dir().join(format!("kbf-server-pass-fails-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let files = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
         // A Raft log, as in the server: one instantiation of the task covers both arms.
         let meta = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
@@ -476,6 +486,7 @@ mod tests {
         let text = logs.text();
         assert!(text.contains(PASS_FAILED), "{text}");
         assert!(text.contains("not raised"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A cache over a Raft log whose earlier epoch indexed the blob `kept` in object
@@ -483,13 +494,9 @@ mod tests {
     /// floor 1000 bytes): what the pass keeps, and the evictor must then evict.
     async fn short_of_room(
         name: &str,
-    ) -> (
-        kbf_testkit::dir::TestDir,
-        FsStore,
-        Cache<RaftMetaLog, FsStore>,
-    ) {
-        let root =
-            kbf_testkit::dir::TestDir::under(std::env::temp_dir(), &format!("kbf-server-{name}"));
+    ) -> (std::path::PathBuf, FsStore, Cache<RaftMetaLog, FsStore>) {
+        let root = std::env::temp_dir().join(format!("kbf-server-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         // Room to plant the object file, then none.
         let room = Arc::new(AtomicBool::new(true));
         let fake = Arc::clone(&room);
@@ -542,7 +549,7 @@ mod tests {
     async fn the_evictor_runs_after_the_pass() {
         let logs = Capture::waiting_for(b"evicted the least recently used objects");
         let _default = logs.subscribe();
-        let (_root, files, cache) = short_of_room("evictor").await;
+        let (root, files, cache) = short_of_room("evictor").await;
         let key = cache
             .object_key(ObjectId::new(Epoch::new(1), 2))
             .expect("a key");
@@ -564,6 +571,7 @@ mod tests {
             "{text}"
         );
         drop(files);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// How many times [`three_voters_counted`] was asked.
@@ -585,7 +593,7 @@ mod tests {
     async fn the_evictor_of_a_cell_of_three_waits_for_the_operator() {
         let logs = Capture::waiting_for(b"evicted the least recently used objects");
         let _default = logs.subscribe();
-        let (_root, files, cache) = short_of_room("evict-three").await;
+        let (root, files, cache) = short_of_room("evict-three").await;
         let key = cache
             .object_key(ObjectId::new(Epoch::new(1), 2))
             .expect("a key");
@@ -639,6 +647,7 @@ mod tests {
         assert_eq!(cache.present(&[kept]).await.expect("present"), [false]);
         assert_eq!(logs.text().matches(NEEDS_V3).count(), 1);
         drop(files);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Catches a start-up pass that runs before the rebuild of the index is done (mutant:
@@ -657,7 +666,8 @@ mod tests {
         let logs = Capture::waiting_for(PASS_LINES);
         let _default = logs.subscribe();
         let root =
-            kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-server-pass-rebuild");
+            std::env::temp_dir().join(format!("kbf-server-pass-rebuild-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let files = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
         let old_keys = ObjectKeys {
             legacy: KeyPrefix::new(format!("kbf/{:016x}/", 0x11)).expect("prefix"),
@@ -714,6 +724,7 @@ mod tests {
             assert!(text.contains(field), "{field}: {text}");
         }
         drop((cache, old, files));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Catches a failed round of eviction dropped without a word or ending the
@@ -724,7 +735,7 @@ mod tests {
     async fn a_failed_eviction_round_is_logged() {
         let logs = Capture::waiting_for(ROUND_FAILED.as_bytes());
         let _default = logs.subscribe();
-        let (_root, files, cache) = short_of_room("evict-fails").await;
+        let (root, files, cache) = short_of_room("evict-fails").await;
         let key = cache
             .object_key(ObjectId::new(Epoch::new(1), 2))
             .expect("a key");
@@ -742,5 +753,6 @@ mod tests {
         assert!(logs.text().contains("not raised"), "{}", logs.text());
         assert!(files.may_hold(&key).await.expect("may_hold"));
         drop(files);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

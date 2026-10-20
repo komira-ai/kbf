@@ -28,7 +28,6 @@ x509-parser = { workspace = true, features = ["verify"] }
 kbf-map.workspace = true
 kbf-peer.workspace = true
 kbf-proto.workspace = true
-kbf-testkit.workspace = true
 
 [lints]
 workspace = true

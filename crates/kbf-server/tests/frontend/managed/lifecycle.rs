@@ -359,7 +359,8 @@ async fn an_open_health_watch_does_not_hold_up_a_takeover() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_managed_process_opens_the_store_its_flags_name() {
     let node = Node::start().await;
-    let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-managed-flags");
+    let dir = std::env::temp_dir().join(format!("kbf-managed-flags-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     let state = |name: &str| format!("--state-store=sqlite://{}/{name}.db", dir.display());
     let cold = Stoppable::start(&managed_flags(&node, &[&state("cold")]), StoreSource::Flags).await;
     let view = cold.child.role().await;
@@ -396,6 +397,7 @@ async fn a_managed_process_opens_the_store_its_flags_name() {
         never.start_line()
     );
     drop(never);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a candidate that needs an operator API (a REAPI-only deployment would not

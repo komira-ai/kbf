@@ -2,7 +2,7 @@
 //! directory, and what it refuses before it opens.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -97,10 +97,10 @@ fn joined(member_id: u64, boot: u64) -> Joined {
 }
 
 /// A fresh, empty metadata directory for `name`.
-/// The path is not made, and the value removes its directory when it drops.
-fn meta_dir(name: &str) -> kbf_testkit::dir::TestChild {
-    kbf_testkit::dir::TestDir::under(std::env::temp_dir(), &format!("kbf-node-{name}"))
-        .into_child("d")
+fn meta_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("kbf-node-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
 }
 
 /// A start of a registered node over a new log in `dir`, as [`super::assemble`] opens

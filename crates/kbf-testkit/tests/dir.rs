@@ -273,26 +273,3 @@ fn child_removed_dir() {
     let dir = TestDir::under(root, "child");
     std::fs::remove_dir_all(dir.path()).expect("remove");
 }
-
-/// Catches a child path that is made (code that makes its own directory would meet one
-/// that exists), one that does not keep its directory alive (a helper returning it would
-/// drop the directory at once), one that leaves the directory behind, and a path that is
-/// not below the directory.
-#[test]
-fn a_child_is_not_made_and_its_dir_goes_when_it_drops() {
-    let holder = TestDir::under(ROOT, "dir-child");
-    let dir = TestDir::under(holder.path(), "case");
-    let parent = dir.path().to_path_buf();
-    let child = dir.into_child("s");
-    assert_eq!(child.path(), parent.join("s"));
-    assert!(!child.exists(), "the child is not made");
-    assert!(parent.is_dir(), "the directory lives while the child does");
-    std::fs::create_dir(child.path()).expect("the child can be made");
-    assert!(child.is_dir());
-    fn path_of(p: impl AsRef<Path>) -> PathBuf {
-        p.as_ref().to_path_buf()
-    }
-    assert_eq!(path_of(&child), parent.join("s"));
-    drop(child);
-    assert!(!parent.exists(), "{} survived its child", parent.display());
-}

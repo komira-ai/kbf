@@ -186,7 +186,8 @@ mod tests {
     /// registered after its check hangs, and the limit turns that into an error.
     #[tokio::test(start_paused = true)]
     async fn the_last_handle_dropped_between_the_check_and_the_wait_is_seen() {
-        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-released-r3");
+        let dir = std::env::temp_dir().join(format!("kbf-released-r3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let store = crate::FsStore::open(&dir, crate::Floor::Bytes(1)).expect("open");
         let released = store.released();
         released

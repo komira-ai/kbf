@@ -160,14 +160,14 @@ async fn exchange(addr: SocketAddr, request: &str) -> (u16, Value) {
 }
 
 /// A scratch directory of the test's own, removed when dropped.
-struct Scratch(kbf_testkit::dir::TestDir);
+struct Scratch(std::path::PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Self {
-        Self(kbf_testkit::dir::TestDir::under(
-            std::env::temp_dir(),
-            &format!("kbf-managed-{name}"),
-        ))
+        let dir = std::env::temp_dir().join(format!("kbf-managed-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        Self(dir)
     }
 
     /// The `--api-token-file` flag for a token file of this directory, 0600.
@@ -177,6 +177,12 @@ impl Scratch {
         std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .expect("mode");
         format!("--api-token-file={}", file.display())
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

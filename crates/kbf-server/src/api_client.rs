@@ -272,7 +272,7 @@ mod tests {
     /// empty or missing one accepted, and an error that does not name the file.
     #[test]
     fn a_token_is_the_trimmed_content_of_its_file() {
-        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-api-client");
+        let dir = std::env::temp_dir().join(format!("kbf-api-client-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a directory");
         let file = |name: &str, content: &str| {
             let path = dir.join(name);

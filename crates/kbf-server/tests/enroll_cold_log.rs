@@ -5,6 +5,7 @@
 //! run in ten that way).
 
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,7 +25,6 @@ use kbf_server::enroll::start::prepare;
 use kbf_server::object_store::Registry;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
-use kbf_testkit::dir::TestDir;
 use kbf_types::object_store_api::{BindingPut, BindingRole, ConnectionPut, Secret};
 use kbf_types::{Role, RoleSet, Token, TokenId, TokenSecret};
 
@@ -65,16 +65,19 @@ fn unix_now() -> i64 {
     .expect("time")
 }
 
-/// A directory removed when it drops (declare it before what runs in it), its path canonical.
-fn scratch(name: &str) -> TestDir {
-    let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical");
-    TestDir::under(temp, &format!("kbf-enroll-log-{name}"))
+fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("kbf-enroll-log-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch");
+    std::fs::canonicalize(&dir).expect("canonical")
 }
 
 fn register_cold(store: &Arc<dyn Store>) {
-    let secrets = scratch("registry-secrets");
-    let registry =
-        Registry::open(Arc::clone(store), &secrets, Arc::new(OsRandom)).expect("registry");
+    let registry = Registry::open(
+        Arc::clone(store),
+        &scratch("registry-secrets"),
+        Arc::new(OsRandom),
+    )
+    .expect("registry");
     let name = "cold".parse().expect("name");
     registry
         .put_connection(
@@ -128,10 +131,9 @@ async fn the_registered_cold_store_is_in_no_log_line() {
         u64::try_from(unix_now()).expect("time"),
     ));
     let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None));
-    let farm_dir = scratch("farm");
     let flags = EnrollFlags {
         listen: "127.0.0.1:0".parse().expect("addr"),
-        ca_dir: farm_dir.join("ca"),
+        ca_dir: scratch("farm").join("ca"),
         signer: SignerChoice::DevFile,
         frontend_names: vec!["localhost".to_owned()],
         cert_lifetime_secs: 86_400,
@@ -153,8 +155,7 @@ async fn the_registered_cold_store_is_in_no_log_line() {
     // Enrolled first, registered after: the same node then renews into the new store, so
     // the renew path builds a configuration with the store registered; a second node
     // enrolling after the registration runs the enroll path.
-    let (_first_dir, first, frontend, first_store) =
-        join(&store, port, pin, "node-02", 0x7a7).await;
+    let (first, frontend, first_store) = join(&store, port, pin, "node-02", 0x7a7).await;
     assert_eq!(first.config.cold_store, "");
     register_cold(&store);
     clock.advance(Duration::from_secs(120));
@@ -165,7 +166,7 @@ async fn the_registered_cold_store_is_in_no_log_line() {
         renewed.config.cold_store.contains("objects-zq7"),
         "the node was told"
     );
-    let (_second_dir, second, _, _) = join(&store, port, pin, "node-03", 0x7a8).await;
+    let (second, _, _) = join(&store, port, pin, "node-03", 0x7a8).await;
     assert!(
         second.config.cold_store.contains("objects-zq7"),
         "the node was told"
@@ -179,8 +180,7 @@ async fn the_registered_cold_store_is_in_no_log_line() {
     assert!(!log.is_empty(), "the subscriber saw the run");
 }
 
-/// Enrolls storage node `node` with a fresh token and returns what its client installed,
-/// after the directory it lives in (first, so that it is removed last).
+/// Enrolls storage node `node` with a fresh token and returns what its client installed.
 async fn join(
     store: &Arc<dyn Store>,
     port: u16,
@@ -188,7 +188,6 @@ async fn join(
     node: &str,
     bits: u64,
 ) -> (
-    TestDir,
     kbf_enroll::store::Node,
     kbf_enroll::client::Frontend,
     NodeStore,
@@ -253,5 +252,5 @@ async fn join(
     )
     .await
     .expect("enrolled");
-    (root, installed, frontend, node_store)
+    (installed, frontend, node_store)
 }

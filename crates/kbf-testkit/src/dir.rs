@@ -49,47 +49,6 @@ impl TestDir {
     pub fn path(&self) -> &Path {
         &self.path
     }
-
-    /// The path `name` below this directory, which is not made, kept together with the
-    /// directory: the directory is removed when the returned value drops. For code that
-    /// makes its own directory (and may refuse one that exists), and a helper that
-    /// returns the path to a test.
-    #[must_use]
-    pub fn into_child(self, name: &str) -> TestChild {
-        TestChild {
-            path: self.path.join(name),
-            _dir: self,
-        }
-    }
-}
-
-/// A path below a [`TestDir`] that the directory keeps alive: see [`TestDir::into_child`].
-#[derive(Debug)]
-pub struct TestChild {
-    path: PathBuf,
-    _dir: TestDir,
-}
-
-impl TestChild {
-    /// The path.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Deref for TestChild {
-    type Target = Path;
-
-    fn deref(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl AsRef<Path> for TestChild {
-    fn as_ref(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl Deref for TestDir {

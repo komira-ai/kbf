@@ -11,7 +11,6 @@ use kbf_ca::{
     Signer, SystemEntropy,
 };
 use kbf_signer::{SignerServer, bind};
-use kbf_testkit::dir::TestDir;
 use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
@@ -41,11 +40,12 @@ pub fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-/// A scratch directory, new and empty, resolved through symlinks, removed when it drops
-/// (declare it before whatever runs in it).
-pub fn scratch(name: &str) -> TestDir {
-    let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
-    TestDir::under(temp, &format!("kbf-signer-{name}"))
+/// A scratch directory, new and empty, resolved through symlinks.
+pub fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("kbf-signer-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    std::fs::canonicalize(&dir).expect("canonical scratch dir")
 }
 
 /// A splitmix64 stream: deterministic serials.
@@ -71,8 +71,6 @@ pub struct Ca {
     pub spki: Vec<u8>,
     pub root_subject: Vec<u8>,
     pub scratch: PathBuf,
-    /// The guard of `scratch`, when this value made it.
-    pub own: Option<TestDir>,
 }
 
 pub fn make_ca(name: &str) -> Ca {
@@ -91,8 +89,7 @@ pub fn make_ca_at(name: &str, now: i64) -> Ca {
         root_subject: cert.subject().as_raw().to_vec(),
         dir,
         root,
-        scratch: scratch.to_path_buf(),
-        own: Some(scratch),
+        scratch,
     }
 }
 
