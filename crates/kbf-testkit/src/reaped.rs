@@ -301,4 +301,54 @@ mod tests {
         // SAFETY: `prctl` with `PR_SET_PDEATHSIG` takes two integers.
         unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0) };
     }
+
+    fn piped(script: &str) -> Reaped {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script])
+            .stdout(std::process::Stdio::piped());
+        spawn(&mut command, 3).expect("spawn")
+    }
+
+    /// Catches a `first_line` that hangs or mislabels a silent child: no line within the
+    /// deadline is `TimedOut`.
+    #[test]
+    fn first_line_of_a_silent_child_times_out() {
+        let mut child = piped("sleep 30");
+        let out = child.stdout.take().expect("stdout");
+        let err = first_line(out, Duration::from_millis(100)).expect_err("silent");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// Catches a `first_line` that returns a read error as a line or swallows it: bytes that
+    /// are not UTF-8 surface as the read error itself, not as `TimedOut`.
+    #[test]
+    fn first_line_passes_a_read_error_through() {
+        let mut child = piped("printf '\\377\\n'");
+        let out = child.stdout.take().expect("stdout");
+        let err = first_line(out, Duration::from_secs(10)).expect_err("not UTF-8");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Catches a `first_line` that drops the line or the reader: both come back, and the
+    /// reader still holds what follows.
+    #[test]
+    fn first_line_returns_the_line_and_the_reader() {
+        let mut child = piped("echo one; echo two");
+        let out = child.stdout.take().expect("stdout");
+        let (line, mut reader) = first_line(out, Duration::from_secs(10)).expect("line");
+        assert_eq!(line, "one\n");
+        let mut next = String::new();
+        reader.read_line(&mut next).expect("next");
+        assert_eq!(next, "two\n");
+    }
+
+    /// Catches a `spawn` that wraps or hides the start error: a program that does not exist
+    /// is the OS error.
+    #[test]
+    fn spawn_of_a_missing_program_is_the_start_error() {
+        let err =
+            spawn(&mut Command::new("/nonexistent/kbf-testkit-program"), 3).expect_err("missing");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
 }
