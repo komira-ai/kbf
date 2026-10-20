@@ -374,9 +374,12 @@ mod tests {
                 .split_whitespace()
                 .filter(|p| seen.insert((*p).to_owned()))
                 .collect();
-            let [pid] = new[..] else {
-                panic!("round {round}: expected one new child, got {new:?} of {listed:?}");
-            };
+            assert_eq!(
+                new.len(),
+                1,
+                "round {round}: new children {new:?} of {listed:?}"
+            );
+            let pid = new[0];
             drop(run);
             assert!(
                 !Path::new("/proc").join(pid).exists(),
