@@ -1,7 +1,7 @@
-//! The daemon's side of a `ResultAck`: the reason it names and how that is logged. The
-//! daemon forgets a Result on any ack for its lease, accepted or not, and makes no resend
-//! decision from `accepted`: a refused Result (a stale attempt, an unknown lease) is not
-//! worth sending again.
+//! The daemon's side of a `ResultAck`: the reason it names, how that is logged, and the
+//! bound on the Results kept until one arrives. The daemon forgets a Result on any ack
+//! for its lease, accepted or not, and makes no resend decision from `accepted`: a
+//! refused Result (a stale attempt, an unknown lease) is not worth sending again.
 
 use kbf_proto::worker::{ResultAck, ResultAckReason};
 use kbf_types::LeaseId;
@@ -22,4 +22,12 @@ pub(crate) fn log(lease: LeaseId, accepted: bool, reason: ResultAckReason) {
         }
         _ => tracing::info!(%lease, accepted, ?reason, "result acknowledged"),
     }
+}
+
+/// Whether the Result of a lease may be kept for resending when `kept` Results are kept
+/// already, up to `cap`: a Result already kept is replaced, and a new one is kept only
+/// below the cap (the oldest stay: the longest unacknowledged are the likeliest to
+/// have been decided).
+pub(crate) fn has_room(kept: usize, cap: usize, already_kept: bool) -> bool {
+    already_kept || kept < cap
 }
