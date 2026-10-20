@@ -34,6 +34,12 @@ pub const INSTALLER_UNIT: &str = "kbf-installer.service";
 /// the modes that keep their state in Postgres, started with them when `--no-start` is absent
 /// (the schema it dumps is made earlier in the same run).
 pub const BACKUP_TIMER: &str = "kbf-backup.timer";
+/// The unit the timer starts, and the drop-in that gives it its `User=`: the package's file
+/// carries no user, and its `ConditionPathExists=` on this drop-in keeps it from running as
+/// root where setup has not written it.
+pub const BACKUP_SERVICE_DIR: &str = "/etc/systemd/system/kbf-backup.service.d";
+pub const BACKUP_USER_DROPIN: &str =
+    "/etc/systemd/system/kbf-backup.service.d/10-service-user.conf";
 /// The longest token file setup reads.
 const MAX_TOKEN_BYTES: u64 = 4096;
 
@@ -83,6 +89,27 @@ fn service_user_name(mode: Mode) -> &'static str {
     }
 }
 
+/// The drop-in text that makes `kbf-backup.service` run as `user`, the mode's service user (the
+/// one `service_user_name` names, which is the frontend unit's `User=`).
+///
+/// # Errors
+/// `user` is not a plain account name (it goes into a unit file).
+pub fn backup_user_dropin(user: &str) -> Result<String, SetupError> {
+    let plain = !user.is_empty()
+        && user.len() <= 32
+        && user
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c));
+    if !plain {
+        return Err(SetupError::Unsupported(
+            "the service user's name is not one a unit file can carry".to_owned(),
+        ));
+    }
+    Ok(format!(
+        "# Written by `kbf-installer setup`: the user the backup runs as, the service user of the\n# frontend. The package's kbf-backup.service carries none.\n[Service]\nUser={user}\n"
+    ))
+}
+
 /// Whether the host runs actions in containers: it then needs a subid range and lingering.
 fn runs_actions(mode: Mode) -> bool {
     matches!(mode, Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne)
@@ -93,7 +120,7 @@ fn serves_api(mode: Mode) -> bool {
     matches!(mode, Mode::Frontend | Mode::AllInOne)
 }
 
-fn fetch_user(platform: Platform) -> &'static str {
+pub fn fetch_user(platform: Platform) -> &'static str {
     match platform {
         Platform::Linux => "kbf-fetch",
         Platform::MacOs => "_kbf-fetch",
@@ -427,7 +454,7 @@ pub fn after_release(
         Decision::Refuse(why) => return Err(SetupError::NeedsOperator(why)),
     }
 
-    units(&mut p, os, v, ctx.platform, released, no_start, &mut notes)?;
+    units(&mut p, os, v, ctx, released, no_start, &mut notes)?;
     Ok(Outcome {
         plan: p.finish(),
         notes,
@@ -438,7 +465,7 @@ fn units(
     p: &mut Pl<'_, '_>,
     os: &dyn Os,
     v: &Valid,
-    platform: Platform,
+    ctx: &Ctx,
     released: bool,
     no_start: bool,
     notes: &mut Vec<String>,
@@ -465,7 +492,7 @@ fn units(
     } else {
         true
     };
-    match platform {
+    match ctx.platform {
         Platform::MacOs => {
             let wanted = [
                 (MAC_INSTALLER_LABEL, !no_start),
@@ -483,6 +510,24 @@ fn units(
             }
         }
         Platform::Linux => {
+            // The backup runs as the service user, written before the timer is enabled.
+            if v.mode.keeps_state_in_database() {
+                let user = ctx
+                    .service
+                    .as_ref()
+                    .map(|u| u.name.as_str())
+                    .ok_or_else(|| {
+                        SetupError::Unsupported("no service user for the backup unit".to_owned())
+                    })?;
+                dir(p, BACKUP_SERVICE_DIR, 0o755, ctx.root)?;
+                file(
+                    p,
+                    BACKUP_USER_DROPIN,
+                    0o644,
+                    ctx.root,
+                    backup_user_dropin(user)?.into_bytes(),
+                )?;
+            }
             let backup = v
                 .mode
                 .keeps_state_in_database()

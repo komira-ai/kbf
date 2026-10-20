@@ -62,10 +62,12 @@ pub enum Verb {
     /// Validate the installer's configuration, trust files and path chain.
     Check,
     /// Dump the state database to the backup directory and keep the newest few; run by
-    /// kbf-backup.timer as the database's role (kbf-server).
+    /// kbf-backup.timer as the service user, who connects as the role installer.toml's database URL names.
     Backup(BackupArgs),
-    /// Restore a backup into an empty state database, as the database's role (kbf-server).
+    /// Restore a backup into an empty state database, as the service user, who connects as the role installer.toml's database URL names.
     Restore(RestoreArgs),
+    /// Serve the frontend host's public port: route each stream to the active child frontend.
+    Proxy(ProxyArgs),
     #[command(hide = true)]
     Stage,
     #[command(hide = true)]
@@ -262,13 +264,24 @@ pub struct RestoreArgs {
     /// into (unless --database does), which must be empty of kbf's schema.
     #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
     pub installer_config: kbf_host::HostPath,
-    /// Restore into this database instead (postgres:///NAME?host=SOCKET_DIR, no password): a
-    /// scratch database for a restore test.
+    /// Restore into this database instead, for a restore test: a bare NAME (a database on the
+    /// server and socket installer.toml names, for the role it names) or a URL with no
+    /// password.
     #[arg(long)]
     pub database: Option<String>,
     /// The `pg_restore` program (a name looked up in PATH, or a path).
     #[arg(long, default_value = "pg_restore")]
     pub pg_restore: String,
+}
+
+#[derive(Args)]
+pub struct ProxyArgs {
+    /// The installer.toml whose `[proxy]` table configures the proxy.
+    #[arg(long, default_value = "/etc/kbf/installer.toml")]
+    pub config: std::path::PathBuf,
+    /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
+    #[arg(long)]
+    pub check: bool,
 }
 
 #[derive(Args)]
@@ -294,28 +307,30 @@ impl Verb {
             Verb::Check => "check",
             Verb::Backup(_) => "backup",
             Verb::Restore(_) => "restore",
+            Verb::Proxy(_) => "proxy",
             Verb::Stage => "stage",
             Verb::Activate => "activate",
             Verb::FetchChild => "fetch-child",
         }
     }
 
-    /// Every verb but `status`, `check`, `backup` and `restore` needs root. The last two run as
-    /// the user that is the database's role under peer authentication (`kbf-server`), which
-    /// root is not.
+    /// Every verb but `status`, `check`, `proxy` (which runs as the unprivileged service
+    /// user), `backup` and `restore` needs root. `backup` and `restore` run as the user that
+    /// is the database's role under peer authentication, which root is not.
     pub fn needs_root(&self) -> bool {
         !matches!(
             self,
-            Verb::Status | Verb::Check | Verb::Backup(_) | Verb::Restore(_)
+            Verb::Status | Verb::Check | Verb::Proxy(_) | Verb::Backup(_) | Verb::Restore(_)
         )
     }
 
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
-    /// verbs that exist (`run`, `boot-check`, the operator's verbs and `setup`).
+    /// verbs that exist (`run`, `boot-check`, `proxy`, the operator's verbs and `setup`).
     pub fn built_by(&self) -> Option<&'static str> {
         match self {
             Verb::Run(_)
             | Verb::BootCheck(_)
+            | Verb::Proxy(_)
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)

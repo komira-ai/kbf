@@ -27,6 +27,7 @@ use crate::helper::serve::{FileIdentity, Flow, PASS_INTERVAL, Serve};
 use crate::helper::service::HostProcs;
 use crate::helper::{fetcher, leases};
 use crate::layout::{Layout, Platform};
+use crate::proxy_verb;
 use crate::release::ReleaseError;
 use crate::setup;
 
@@ -301,6 +302,11 @@ fn run_restore(
     err: &mut dyn Write,
 ) -> Result<(), Failure> {
     let url = match &args.database {
+        // A bare name: a scratch database on the configured server, for the configured role.
+        Some(name) if !name.contains(['/', ':']) => {
+            let settings = backup::Settings::read(&under(&root, &args.installer_config)?)?;
+            settings.target.url_for(name)?
+        }
         Some(url) => {
             crate::database::check_url("the --database flag", url)
                 .map_err(|e| Failure::from(e.to_string()))?;
@@ -389,6 +395,16 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
     }
     // What `backup` and `restore` report when they work; written once `say` is done with `err`.
     let mut said = Vec::new();
+    if let Verb::Proxy(args) = &cli.verb {
+        return match proxy_verb::run(args) {
+            Ok(()) => Exit::Ok,
+            Err(e) => say(
+                e.exit(),
+                format!("kbf-installer: {name}: {e}"),
+                serde_json::json!({"verb": name, "error": e.code(), "message": e.to_string()}),
+            ),
+        };
+    }
     let result = match &cli.verb {
         // `setup` checks for root itself and prints its steps ahead of its own result.
         Verb::Setup(args) => {

@@ -107,15 +107,15 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.put("units/other.service", "x");
                 t.inputs()
             },
-            "other.service: a package unit is named kbf-*.service or kbf-*.timer",
+            "other.service: a package unit is named kbf-*.service, kbf-*.socket or kbf-*.timer",
         ),
         (
-            "a unit that is a socket",
+            "a unit that is a path",
             |t| {
-                t.put("units/kbf-gc.socket", "x");
+                t.put("units/kbf-gc.path", "x");
                 t.inputs()
             },
-            "kbf-gc.socket: a package unit is named kbf-*.service or kbf-*.timer",
+            "kbf-gc.path: a package unit is named kbf-*.service, kbf-*.socket or kbf-*.timer",
         ),
         (
             "a directory among the units",
@@ -672,7 +672,7 @@ fn no_dependency_of_either_package_names_envoy() {
 /// Mutants seen red: the `.timer` suffix not accepted (the backup timer would not package);
 /// any `.timer` accepted.
 #[test]
-fn a_unit_that_is_neither_a_service_a_timer_nor_the_slice_is_refused() {
+fn a_unit_that_is_not_a_service_socket_timer_or_the_slice_is_refused() {
     let t = Tree::new("slice");
     t.put("units/kbf.slice", "[Slice]");
     t.put("units/kbf-x.timer", "[Timer]");
@@ -684,13 +684,45 @@ fn a_unit_that_is_neither_a_service_a_timer_nor_the_slice_is_refused() {
         "{planned:?}"
     );
     t.put("units/kbf-x.socket", "[Socket]");
+    t.put("units/kbf-x.path", "[Path]");
     t.put("units/other.timer", "[Timer]");
     let got = refused(plan(&t.inputs()));
-    assert!(got.contains("kbf-x.socket"), "{got}");
+    assert!(got.contains("kbf-x.path"), "{got}");
+    assert!(!got.contains("kbf-x.socket:"), "{got}");
     assert!(got.contains("other.timer"), "{got}");
     assert!(
         !got.contains("kbf.slice:") && !got.contains("kbf-x.timer:"),
         "{got}"
+    );
+}
+
+/// A `kbf-*.socket` is packaged beside its service, in the same directory and mode.
+#[test]
+fn a_socket_unit_is_packaged_beside_the_services_with_the_same_mode() {
+    let t = Tree::new("socket");
+    t.put("units/kbf-x.socket", "[Socket]");
+    t.put("units/other.socket", "[Socket]");
+    let got = refused(plan(&t.inputs()));
+    assert!(
+        got.contains("other.socket: a package unit is named"),
+        "{got}"
+    );
+    assert!(!got.contains("kbf-x.socket:"), "{got}");
+    std::fs::remove_file(t.dir.join("units/other.socket")).expect("rm");
+    let entries = plan(&t.inputs()).expect("a socket is a plan");
+    let find = |n: &str| {
+        entries
+            .iter()
+            .find(|e| e.dst.ends_with(&format!("/{n}")))
+            .map(|e| (e.dst.clone(), e.mode))
+            .expect(n)
+    };
+    let (sock, sock_mode) = find("kbf-x.socket");
+    let (svc, svc_mode) = find("kbf-node.service");
+    assert_eq!(sock_mode, svc_mode);
+    assert_eq!(
+        sock.rsplit_once('/').map(|p| p.0),
+        svc.rsplit_once('/').map(|p| p.0)
     );
 }
 

@@ -180,7 +180,7 @@ fn the_same_inputs_are_the_same_bytes_whatever_their_times_and_order() {
 #[test]
 fn a_payload_that_is_not_the_contracts_is_refused() {
     // Catches: a glob that matched nothing shipping a payload that starts or trusts
-    // nothing, a unit that is not kbf-*.service, kbf-*.timer or kbf.slice, a fourth or a missing
+    // nothing, a unit that is not kbf-*.service, kbf-*.socket, kbf-*.timer or kbf.slice, a fourth or a missing
     // trust file, and a sub-directory in a unit directory reaching the host.
     let dir = scratch("refuse");
     let i = inputs(&dir);
@@ -213,14 +213,14 @@ fn a_payload_that_is_not_the_contracts_is_refused() {
         },
         "evil.service",
     );
-    let odd = dir_of(&dir, "odd2", &[("kbf-a.socket", "x")]);
+    let odd = dir_of(&dir, "odd2", &[("kbf-a.path", "x")]);
     refused(
-        "socket",
+        "path",
         pkg_linux::Sources {
             units: &odd,
             ..i.sources()
         },
-        "kbf-a.socket",
+        "kbf-a.path",
     );
     let four = dir_of(
         &dir,

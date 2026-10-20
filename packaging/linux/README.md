@@ -71,7 +71,7 @@ configuration).
 
 ## CI
 
-The `packages` job of `.github/workflows/ci.yml` fetches the pinned nfpm, builds the
+The `packages` job of `.github/workflows/beta.yml` fetches the pinned nfpm, builds the
 test-only `kbf-installer-stub` and the packages, then runs `pkg-install-test` on the deb
 in Ubuntu and the rpm in Fedora. The real binary replaces the stub by one path change:
 the `--binary` of `pkg-config`.

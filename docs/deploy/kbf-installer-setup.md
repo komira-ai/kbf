@@ -40,7 +40,19 @@ installer's unit reads it, and refuses another path. A Mac is a node only (`--mo
 1. Checks it is root (and, to apply, that its own binary is root's alone), checks the flags
    (every problem is named), and refuses (exit 5) while the old layout of the retired
    `kbf-helper` and `kbf-deploy host` is on the host (`/usr/local/kbf` or
-   `/var/lib/kbf-deploy`): the two never both manage a host, and the migration is not built.
+   `/var/lib/kbf-deploy`): the two never both manage a host. The refusal names the command
+   that is the way out once `kbf-installer migrate` exists (komira-ai/kbf#1083):
+   `kbf-installer migrate --apply --fetch-user kbf-fetch [--unit UNIT]` (`_kbf-fetch` on a
+   Mac). Today `migrate` is not on this build and `setup` refuses on either path whatever
+   was migrated, so the way out today is by hand: stop the host's units and move both roots
+   aside. The target contract is different (see "The old layout" below): `setup` will accept a
+   host exactly when `migrate` has finished it (its journal says `Done`), not by path.
+   On Linux it also refuses (exit 5, `unit_shadow`) when a regular file at
+   `/etc/systemd/system/<the mode's unit>` (for a frontend, also `kbf-frontend@.service`)
+   would shadow the packaged unit: systemd reads `/etc` before `/usr/lib`, and `setup`
+   does not enable a unit that is already enabled, so the host would keep the old flags.
+   Move the file aside (`mv FILE FILE.old; systemctl daemon-reload`) and run `setup` again;
+   `setup` never deletes or rewrites a unit. A link there (`systemctl link`) is not refused.
    Envoy is not checked: the proxy bundled in `kbf-installer` owns a frontend's public port,
    and a load balancer in front of it is the operator's.
 2. The `kbf-fetch` account (`_kbf-fetch` on a Mac); for the modes that run actions, the `kbf`
@@ -80,7 +92,9 @@ installer's unit reads it, and refuses another path. A Mac is a node only (`--mo
    (`kbf-frontend@a.service`, `kbf-all-in-one.service`) is enabled and never started by
    `setup`: starting it takes the database, the TLS files and the port. A unit already
    enabled is left alone. Nothing is restarted. Those two modes also get `kbf-backup.timer`,
-   enabled and started (the schema it dumps was made in step 7; see "Backup and restore").
+   enabled and started (the schema it dumps was made in step 7), and a drop-in that gives
+   `kbf-backup.service` its `User=`: the mode's service user, the one the frontend unit runs as
+   (see "Backup and restore").
 
 Every step is planned only where the host differs, so the same flags again is "nothing to do"
 (the database step reports the schema as current). A run that stopped part way is finished by
@@ -103,15 +117,24 @@ with exit 5.
 A frontend or all-in-one host keeps all of kbf's state in its Postgres database, so that
 database is backed up. `kbf-backup.timer` starts `kbf-backup.service` every day (a host that
 was down then runs it when it starts, and each run is delayed by up to an hour), and the
-service runs `kbf-installer --apply backup` as `kbf-server`. `setup` enables the timer on the
-two modes; the units are in the package like the others (`packaging/linux/units`).
+service runs `kbf-installer --apply backup` as the host's service user (`kbf-server` on a
+frontend). The package's `kbf-backup.service` carries no `User=`: `setup` writes it into
+`/etc/systemd/system/kbf-backup.service.d/10-service-user.conf` (root, 0644) from the same
+service user it resolves for the frontend unit, and the unit does not run (it is gated on that
+file) where `setup` has not written it, rather than run as root. `setup` enables the timer on
+the two modes; the units are in the package like the others (`packaging/linux/units`).
 
 **What the backup is.** `pg_dump` in custom format of the database `installer.toml` names, in
 `/var/lib/kbf-server/backups/kbf-<UTC time>.dump` (for example `kbf-20270115T080000Z.dump`).
-The directory is 0700 and each file 0600, owned by `kbf-server`: a dump holds the whole
-state, tokens and member map included. The role is the OS user running the unit: with peer
-authentication `kbf-server` connects as the Postgres role `kbf-server`, the one that owns the
-database and that the frontend connects as, and no password exists anywhere.
+The directory is 0700 and each file 0600, owned by the service user that runs the unit (the
+verb refuses a directory owned by anyone else): a dump holds the whole state, tokens and
+member map included. Nothing about the database is assumed. The role, the database name and
+the socket directory are the `database` URL of `installer.toml`, the one `setup` and the
+frontend read (on the farm
+`postgres:///kbf?host=/run/postgresql&user=kbf-server`: role `kbf-server`, database `kbf`).
+With peer authentication the service user connects as that role, directly when the names are
+the same or through the `pg_ident.conf` map `setup` tells you to add; no password exists
+anywhere. A URL without `user=` leaves the role to libpq, which uses the OS user's name.
 
 **What one run does, in order.** It makes (or checks) the directory and closes it to other
 users; removes the temp file of an earlier run that crashed; has `pg_dump` write a temp file
@@ -141,32 +164,40 @@ scratch database, which touches nothing live:
 ```text
 sudo systemctl start kbf-backup.service        # a oneshot: returns when the backup is done
 sudo ls -l /var/lib/kbf-server/backups         # kbf-<time>.dump, mode -rw-------
-sudo -u postgres createdb --owner=kbf-server kbf_restore_test
-sudo -u kbf-server kbf-installer --apply restore \
+sudo -u postgres createdb --owner=<role in the database URL> kbf_restore_test
+sudo -u <service user> kbf-installer --apply restore \
     --file /var/lib/kbf-server/backups/kbf-<time>.dump \
-    --database 'postgres:///kbf_restore_test?host=/run/postgresql'
-sudo -u kbf-server psql 'postgres:///kbf_restore_test?host=/run/postgresql' -c '\dt kbf_state.*'
+    --database kbf_restore_test
+sudo -u <service user> psql 'postgres:///kbf_restore_test?host=<socket dir>&user=<role>' \
+    -c '\dt kbf_state.*'
 sudo -u postgres dropdb kbf_restore_test
 ```
 
 `restore` runs `pg_restore` in one transaction that stops at the first error, taking no owner
 or privilege from the dump (the connecting role owns what it makes, as `setup` made it). The
 database must hold no kbf schema: a restore into one that does fails and changes nothing.
-Without `--database` it restores into the database `installer.toml` names.
+Without `--database` it restores into the database `installer.toml` names. `--database` takes
+a bare name (as above: a database on the same server and socket, for the same role as
+`installer.toml`'s URL) or a full URL with no password. On a frontend the user, role and
+socket are `kbf-server`, `kbf-server` and `/run/postgresql`.
 
 **Restoring the real state** (the database is lost or damaged). The state is what the backup
 held: builds in flight are gone, and nodes register again.
 
 ```text
 sudo systemctl stop kbf-frontend@a.service     # waits for open builds; nothing may write
-sudo -u postgres dropdb kbf
-sudo -u postgres createdb --owner=kbf-server kbf
-sudo -u kbf-server kbf-installer --apply restore --file /var/lib/kbf-server/backups/kbf-<time>.dump
+sudo -u postgres dropdb <database in the URL>
+sudo -u postgres createdb --owner=<role in the URL> <database in the URL>
+sudo -u <service user> kbf-installer --apply restore --file /var/lib/kbf-server/backups/kbf-<time>.dump
 sudo systemctl start kbf-frontend@a.service    # opens the store: its schema check must accept it
 ```
 
-The tests: `src/backup_tests.rs` (retention, atomicity, modes and the arguments, without a
-server) and, in the state-postgres CI job, `real_server_round_trip`: schema made as `setup`
+The tests: `src/backup_tests.rs` (retention, atomicity, modes and the arguments, reading the
+role, database and socket from the URL, without a server), `src/setup/more_tests.rs` (the
+drop-in's `User=` is the mode's service user), `package_units.rs` (the unit carries no
+`User=`). They run in the PR's `test` job. `real_server_round_trip` needs a server and
+`pg_dump` 17: it is `#[ignore]` and runs, with `KBF_TEST_POSTGRES_URL` set, in the Postgres
+jobs of `beta.yml` after a merge to `feature/arch-v2`, not on a pull request. It makes the schema as `setup`
 makes it, rows written through the state store, a backup, a restore into a second database as
 a role that is not a superuser, and the store opened on it reading every row back.
 
@@ -197,8 +228,16 @@ something the text does not say or says differently, so a reader can change one 
 - **Who enrolls.** `--token-file` is refused for `frontend` as well as `all-in-one`: the
   frontend creates its CA on first start and enrolls nothing.
 - **The old layout.** The contract says `setup` refuses while the old state exists unmigrated.
-  The migration (P3) is not built, so `setup` refuses while either old root is there; it
-  cannot yet set up a host that ran the retired helper.
+  Today the migration (P3, komira-ai/kbf#1083) is not on this build, so `setup` refuses while
+  either old root is there, even on a host that was migrated (a migrated host keeps both roots
+  as its rollback path); it cannot yet set up a host that ran the retired helper. The target:
+  `setup` accepts the old layout if and only if `migrate` finished the host (its journal
+  phase is `Done`), and otherwise refuses with the `migrate` command; the path check goes
+  when that lands.
+- **A unit file in `/etc/systemd/system` with a packaged unit's name.** Not in the contract.
+  A farm node running the dev installer has `kbf-storage-and-daemon.service` there; `setup`
+  refuses (exit 5, `unit_shadow`) rather than enable nothing and leave the old flags running.
+  Retiring such a file (after `migrate`) waits for #1083.
 - **No Envoy check, no Envoy unit.** The contract has `setup` test the installed Envoy against
   a tested range. The ruling since is that kbf manages no Envoy: the bundled proxy owns the
   frontend's port. `setup` neither checks Envoy nor enables `kbf-envoy.service`.

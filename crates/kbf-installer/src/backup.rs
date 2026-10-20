@@ -17,8 +17,10 @@
 //! Any failure removes the temp file, leaves every older backup alone and ends in an error,
 //! which the unit turns into a failed state. The database is named by `installer.toml`'s
 //! `database` key, which never carries a password, so the URL is safe in the command line;
-//! no message here quotes it. Peer authentication means the verb runs as the database's role:
-//! `kbf-server`, the user the unit runs as.
+//! no message here quotes it. Peer authentication means the verb runs as the service user, who connects as the role the
+//! URL names:
+//! the user the unit runs as (its `User=` comes from setup's drop-in), through a
+//! `pg_ident` map or by being the role.
 
 use std::ffi::OsString;
 use std::fs;
@@ -74,11 +76,130 @@ impl Tool for Process {
     }
 }
 
+/// What the `database` URL says about who connects and where: the one source of the role,
+/// the database and the socket directory (setup, the frontend and this verb read the same
+/// URL; nothing here assumes a name). On a real host it is
+/// `postgres:///kbf?host=/run/postgresql&user=kbf-server`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Target {
+    /// The role (`user=` or the user part of the authority); `None` leaves it to libpq, which
+    /// takes the name of the OS user.
+    pub role: Option<String>,
+    /// The database name; `None` leaves it to libpq (the role's name).
+    pub database: Option<String>,
+    /// The socket directory or host (`host=` or the authority's host).
+    pub host: Option<String>,
+}
+
+/// `%XX` decoded; a malformed escape stays as written.
+fn unescape(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| char::from(c).to_digit(16);
+        if b[i] == b'%'
+            && let (Some(h), Some(l)) = (
+                b.get(i + 1).and_then(|c| hex(*c)),
+                b.get(i + 2).and_then(|c| hex(*c)),
+            )
+        {
+            out.push(u8::try_from(h * 16 + l).unwrap_or(b'%'));
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Escapes what a URL path or query value cannot carry as it is.
+fn escape(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.bytes() {
+        if c.is_ascii_alphanumeric() || b"-_.~/".contains(&c) {
+            out.push(char::from(c));
+        } else {
+            out.push_str(&format!("%{c:02X}"));
+        }
+    }
+    out
+}
+
+impl Target {
+    /// Reads `url` (`postgres://` or `postgresql://`; a password was already refused).
+    ///
+    /// # Errors
+    /// The URL is not one; the message never quotes it.
+    pub fn parse(url: &str) -> Result<Target, String> {
+        let rest = url
+            .strip_prefix("postgresql://")
+            .or_else(|| url.strip_prefix("postgres://"))
+            .ok_or("the database URL does not start with postgres://")?;
+        let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let (userinfo, host) = authority.rsplit_once('@').unwrap_or(("", authority));
+        let mut role = userinfo
+            .split(':')
+            .next()
+            .filter(|u| !u.is_empty())
+            .map(unescape);
+        let mut host = Some(unescape(host)).filter(|h| !h.is_empty());
+        let mut database = Some(unescape(path)).filter(|d| !d.is_empty());
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let value = Some(unescape(value)).filter(|v| !v.is_empty());
+            match key {
+                "user" if value.is_some() => role = value,
+                "host" if value.is_some() => host = value,
+                "dbname" if value.is_some() => database = value,
+                _ => {}
+            }
+        }
+        Ok(Target {
+            role,
+            database,
+            host,
+        })
+    }
+
+    /// The URL of the database `name` on the same server, for the same role: a scratch
+    /// database for a restore test. `name` is a plain identifier.
+    ///
+    /// # Errors
+    /// `name` is not 1 to 63 of letters, digits and underscores, not starting with a digit.
+    pub fn url_for(&self, name: &str) -> Result<String, String> {
+        let plain = !name.is_empty()
+            && name.len() <= 63
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+        if !plain {
+            return Err("a database name is 1 to 63 letters, digits and underscores".to_owned());
+        }
+        let mut query = Vec::new();
+        if let Some(host) = &self.host {
+            query.push(format!("host={}", escape(host)));
+        }
+        if let Some(role) = &self.role {
+            query.push(format!("user={}", escape(role)));
+        }
+        let query = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        Ok(format!("postgres:///{name}{query}"))
+    }
+}
+
 /// What `installer.toml` says a backup needs.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Settings {
     /// The `database` URL (no password).
     pub url: String,
+    /// Who connects, to what, where.
+    pub target: Target,
     /// How many backups to keep.
     pub keep: u32,
 }
@@ -102,8 +223,10 @@ impl Settings {
             ));
         };
         check_url(&shown, &url).map_err(|e| e.to_string())?;
+        let target = Target::parse(&url).map_err(|e| format!("{shown}: {e}"))?;
         Ok(Settings {
             url,
+            target,
             keep: file.backup_keep.unwrap_or(DEFAULT_BACKUP_KEEP),
         })
     }

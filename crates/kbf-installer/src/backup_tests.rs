@@ -561,6 +561,11 @@ fn settings_come_from_installer_toml_and_refuse_a_password() {
         Settings::read(&ok),
         Ok(Settings {
             url: URL.to_owned(),
+            target: Target {
+                role: None,
+                database: Some("kbf".to_owned()),
+                host: Some("/run/postgresql".to_owned()),
+            },
             keep: 7
         })
     );
@@ -581,6 +586,67 @@ fn settings_come_from_installer_toml_and_refuse_a_password() {
     );
     let err = Settings::read(&scratch().join("none.toml")).unwrap_err();
     assert!(err.contains("none.toml"), "{err}");
+}
+
+/// Catches the role, database and socket directory taken from somewhere else than the URL
+/// (an assumed `kbf`): the farm's URL gives role `kbf-server`; a URL without `user=` gives no
+/// role (libpq then uses the OS user); another database name is that name; the authority
+/// form and percent escapes read the same.
+///
+/// Mutants seen red: `user=` ignored; the path's database dropped; `host=` ignored.
+#[test]
+fn role_database_and_socket_come_from_the_url() {
+    let t = |url| Target::parse(url).expect("parses");
+    let farm = t("postgres:///kbf?host=/run/postgresql&user=kbf-server");
+    assert_eq!(farm.role.as_deref(), Some("kbf-server"));
+    assert_eq!(farm.database.as_deref(), Some("kbf"));
+    assert_eq!(farm.host.as_deref(), Some("/run/postgresql"));
+    let bare = t("postgres:///kbf?host=/run/postgresql");
+    assert_eq!(bare.role, None);
+    let other = t("postgresql:///state_v2?host=/var/run/pg&user=svc");
+    assert_eq!(other.database.as_deref(), Some("state_v2"));
+    assert_eq!(other.role.as_deref(), Some("svc"));
+    assert_eq!(other.host.as_deref(), Some("/var/run/pg"));
+    let authority = t("postgres://who@db.example:5433/stuff");
+    assert_eq!(authority.role.as_deref(), Some("who"));
+    assert_eq!(authority.host.as_deref(), Some("db.example:5433"));
+    assert_eq!(authority.database.as_deref(), Some("stuff"));
+    let escaped = t("postgres:///a%5Fb?host=%2Frun%2Fpostgresql&user=kbf%2Dserver");
+    assert_eq!(escaped.database.as_deref(), Some("a_b"));
+    assert_eq!(escaped.host.as_deref(), Some("/run/postgresql"));
+    assert_eq!(escaped.role.as_deref(), Some("kbf-server"));
+    let nothing = t("postgres://");
+    assert_eq!(
+        (nothing.role, nothing.database, nothing.host),
+        (None, None, None)
+    );
+    assert!(Target::parse("mysql:///x").is_err());
+}
+
+/// Catches a scratch database made on another role or socket than the configured one, or a
+/// name that is not an identifier.
+///
+/// Mutants seen red: the role dropped from the scratch URL; the host dropped; the name check removed.
+#[test]
+fn a_scratch_database_is_on_the_same_server_as_the_same_role() {
+    let farm = Target::parse("postgres:///kbf?host=/run/postgresql&user=kbf-server").expect("p");
+    assert_eq!(
+        farm.url_for("kbf_restore_test").expect("name"),
+        "postgres:///kbf_restore_test?host=/run/postgresql&user=kbf-server"
+    );
+    let bare = Target::parse("postgres:///kbf?host=/run/postgresql").expect("p");
+    assert_eq!(
+        bare.url_for("t1").expect("name"),
+        "postgres:///t1?host=/run/postgresql"
+    );
+    for bad in ["", "1x", "a-b", "a b", "x?host=/evil", &"n".repeat(64)] {
+        assert!(farm.url_for(bad).is_err(), "{bad}");
+    }
+    // The round trip is a URL the parser reads back to the same target (database aside).
+    let back = Target::parse(&farm.url_for("scratch").expect("name")).expect("parses");
+    assert_eq!(back.role, farm.role);
+    assert_eq!(back.host, farm.host);
+    assert_eq!(back.database.as_deref(), Some("scratch"));
 }
 
 // ---- against a server -----------------------------------------------------------------

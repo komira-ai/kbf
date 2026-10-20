@@ -32,10 +32,14 @@ use std::path::{Path, PathBuf};
 
 use kbf_deploy::unit::{UnitFile, comments_in_continuations};
 
+/// The proxy's two units: `kbf-proxy.socket` and `kbf-proxy.service`.
+#[path = "package_units/proxy.rs"]
+mod proxy;
+
 /// The installer's tree: every program of a kbf unit is under it.
 const TREE: &str = "/var/lib/kbf-installer/";
 /// The release kbf-installer flipped to.
-const CURRENT: &str = "/var/lib/kbf-installer/current/";
+const CURRENT: &str = "/var/lib/kbf-installer/releases/current/";
 /// A frontend instance's slot: the release it runs, until a confirm flips `current`.
 const SLOT: &str = "/var/lib/kbf-installer/slots/%i/";
 /// The pinned Envoy of instance `%i`.
@@ -45,12 +49,13 @@ const INSTALLER: &str = "/usr/bin/kbf-installer";
 /// The configuration every runtime unit is gated on and every mode reads.
 const CONFIG: &str = "/etc/kbf/kbf.toml";
 /// The installer's own configuration, which `setup` writes.
+const BACKUP_USER_DROPIN: &str = "/etc/systemd/system/kbf-backup.service.d/10-service-user.conf";
 const INSTALLER_CONFIG: &str = "/etc/kbf/installer.toml";
 /// Envoy's rendered bootstrap.
 const ENVOY_CONFIG: &str = "/etc/kbf/envoy/envoy.json";
 
 /// The files of the package, and nothing else.
-const FILES: [&str; 10] = [
+const FILES: [&str; 12] = [
     "kbf-all-in-one.service",
     "kbf-backup.service",
     "kbf-backup.timer",
@@ -58,17 +63,20 @@ const FILES: [&str; 10] = [
     "kbf-envoy.service",
     "kbf-frontend@.service",
     "kbf-installer.service",
+    "kbf-proxy.service",
+    "kbf-proxy.socket",
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
     "kbf.slice",
 ];
 
 /// The runtime units kbf-installer starts before (`Before=` of its unit).
-const RUNTIME: [&str; 6] = [
+const RUNTIME: [&str; 7] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
     "kbf-envoy.service",
     "kbf-frontend@.service",
+    "kbf-proxy.service",
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
 ];
@@ -118,11 +126,11 @@ fn read(name: &str) -> String {
 }
 
 /// The mode a unit file starts: the word after `kbf`. Envoy's, the installer's and the
-/// backup's units start no mode.
+/// backup's and proxy's units start no mode.
 fn mode_of(name: &str) -> Option<&str> {
     let stem = name.strip_suffix(".service")?;
     let mode = stem.strip_prefix("kbf-")?.trim_end_matches('@');
-    (!["envoy", "installer", "backup"].contains(&mode)).then_some(mode)
+    (!["envoy", "installer", "backup", "proxy"].contains(&mode)).then_some(mode)
 }
 
 fn trim(v: &str) -> &str {
@@ -207,6 +215,15 @@ fn violations(name: &str, text: &str) -> Vec<String> {
         backup_rules(name, text, &mut v);
         return out;
     }
+    if name.ends_with(".socket") {
+        let unit = UnitFile::parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        proxy::socket_rules(&unit, &mut v);
+        // Catches a socket that runs a program (it only holds a port).
+        if unit.directives().iter().any(|d| d.key.starts_with("Exec")) {
+            v("proxy-socket-pair", "an Exec* directive in a socket".into());
+        }
+        return out;
+    }
     if name == "kbf.slice" {
         let unit = UnitFile::parse(text).expect("kbf.slice parses");
         // Catches a per-host reservation baked into the shared file: MemoryMin= is the
@@ -222,11 +239,12 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     let unit = UnitFile::parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
     let is_envoy = name == "kbf-envoy.service";
     let is_installer = name == "kbf-installer.service";
+    let is_proxy = name == "kbf-proxy.service";
     let mode = mode_of(name);
 
     // Catches a unit that starts with no configuration: ConditionPathExists= skips it.
     let conditions = all(&unit, "Unit", "ConditionPathExists");
-    let own_config = if is_installer {
+    let own_config = if is_installer || is_proxy {
         INSTALLER_CONFIG
     } else {
         CONFIG
@@ -318,6 +336,10 @@ fn violations(name: &str, text: &str) -> Vec<String> {
 
     if is_installer {
         installer_rules(&unit, &start, &pre, &mut v);
+        return out;
+    }
+    if is_proxy {
+        proxy::service_rules(&unit, &start, &pre, &mut v);
         return out;
     }
 
@@ -661,6 +683,15 @@ fn backup_rules(name: &str, text: &str, v: &mut impl FnMut(&str, String)) {
             "no ConditionPathExists={INSTALLER_CONFIG} in [Unit]"
         ));
     }
+    // Catches a service that would run as root where its drop-in is missing: the unit is
+    // gated on the drop-in that carries its User=.
+    if name == "kbf-backup.service"
+        && !all(&unit, "Unit", "ConditionPathExists").contains(&BACKUP_USER_DROPIN)
+    {
+        bad(format!(
+            "no ConditionPathExists={BACKUP_USER_DROPIN} in [Unit]"
+        ));
+    }
     if name == "kbf-backup.timer" {
         // Catches a timer that never fires (no schedule), one that skips the run of a host that
         // was down, one nothing links at boot, and one that starts another unit.
@@ -689,10 +720,10 @@ fn backup_rules(name: &str, text: &str, v: &mut impl FnMut(&str, String)) {
     if get("Service", "Type") != Some("oneshot") {
         bad("Type= is not oneshot".into());
     }
-    // Catches a backup run as root or as the user builds run as: peer authentication makes
-    // the user the database role, which is kbf-server's, and the backups are that user's alone.
-    if get("Service", "User") != Some("kbf-server") {
-        bad("User= is not kbf-server".into());
+    // Catches a user written into the file: it comes from setup's drop-in (the frontend's
+    // service user), so a name here would be a second place that must agree with it.
+    if get("Service", "User").is_some() {
+        bad("User= in the file: setup's drop-in gives it".into());
     }
     // Catches a backup that runs something else than the verb, or one that only says what it
     // would do (`--apply` is what makes the verb act).
@@ -833,7 +864,13 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
     let mut n = 0;
     for name in FILES.iter().filter(|n| n.ends_with(".service")) {
         let unit = UnitFile::parse(&read(name)).expect("parses");
-        let config = if ["kbf-installer.service", "kbf-backup.service"].contains(name) {
+        let config = if [
+            "kbf-installer.service",
+            "kbf-backup.service",
+            "kbf-proxy.service",
+        ]
+        .contains(name)
+        {
             INSTALLER_CONFIG
         } else {
             CONFIG
@@ -854,7 +891,7 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
         }
         n += 1;
     }
-    assert_eq!(n, 8, "a unit was not checked");
+    assert_eq!(n, 9, "a unit was not checked");
 }
 
 /// The modes whose units `files` hold, sorted.
@@ -966,26 +1003,26 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-daemon.service",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=daemon",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=daemon \\\n    # a note\n    ",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon \\\n    # a note\n    ",
         "continuation",
     ),
     (
         "kbf-daemon.service",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=daemon",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=daemon",
         "ExecStart=/usr/local/bin/kbf daemon",
         "exec",
     ),
     (
         "kbf-daemon.service",
-        "ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=daemon --check",
-        "ExecStartPre=-/var/lib/kbf-installer/current/kbf --mode=daemon --check",
+        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=daemon --check",
+        "ExecStartPre=-/var/lib/kbf-installer/releases/current/kbf --mode=daemon --check",
         "exec-prefix",
     ),
     (
         "kbf-storage.service",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=storage\n",
-        "ExecStart=/var/lib/kbf-installer/current/kbf --mode=storage --config=/etc/kbf/kbf.toml\n",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage\n",
+        "ExecStart=/var/lib/kbf-installer/releases/current/kbf --mode=storage --config=/etc/kbf/kbf.toml\n",
         "flags",
     ),
     (
@@ -996,8 +1033,8 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-all-in-one.service",
-        "ExecStartPre=/var/lib/kbf-installer/current/kbf --mode=all-in-one --check",
-        "ExecCondition=/var/lib/kbf-installer/current/kbf --mode=all-in-one --check",
+        "ExecStartPre=/var/lib/kbf-installer/releases/current/kbf --mode=all-in-one --check",
+        "ExecCondition=/var/lib/kbf-installer/releases/current/kbf --mode=all-in-one --check",
         "gate-skip",
     ),
     (
@@ -1153,7 +1190,7 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     (
         "kbf-envoy.service",
         "ExecStart=/usr/bin/envoy ",
-        "ExecStart=/var/lib/kbf-installer/current/envoy ",
+        "ExecStart=/var/lib/kbf-installer/releases/current/envoy ",
         "envoy",
     ),
     (
@@ -1188,8 +1225,14 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-backup.service",
-        "User=kbf-server\n",
-        "User=root\n",
+        "Type=oneshot\n",
+        "Type=oneshot\nUser=kbf-server\n",
+        "backup",
+    ),
+    (
+        "kbf-backup.service",
+        "ConditionPathExists=/etc/systemd/system/kbf-backup.service.d/10-service-user.conf\n",
+        "",
         "backup",
     ),
     (
