@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use kbf_host::{Exec, Mode};
 
+use super::daemon_dirs;
 use super::error::MigrateError;
 use super::floor::{self, Seeded};
 use super::journal::{Adopted, Journal, Phase};
@@ -72,6 +73,9 @@ fn look(m: &Migration, rules: &Rules) -> Result<Look, MigrateError> {
             .lines
             .push("already migrated: nothing to do".to_owned());
         return Ok(Look::Settled(report));
+    }
+    if let Some(journal) = &journal {
+        super::rollback::refuse_if_installer_moved_aside(&m.layout, journal)?;
     }
     let resume = journal.as_ref().is_some_and(Journal::kit_begun);
     let Some(old) = old::read(&m.layout, &m.roots, rules, resume)? else {
@@ -279,6 +283,7 @@ pub fn migrate<E: Exec>(
     tree.sweep_partials()?;
     let mut journal = journal.unwrap_or_else(|| Journal::new(Vec::new(), None));
     journal.phase = Phase::Started;
+    journal.aside = None;
     journal.kit = kit;
     journal.units = m.units.clone();
     journal.helper_unit = m.helper_unit.clone();
@@ -391,6 +396,8 @@ pub fn migrate<E: Exec>(
         let outcome = units::rewrite(&rules, &units_dir, &backup, unit, &new_bin)?;
         report.line(mode, format!("{unit}: {}", describe(outcome)));
     }
+    // Before the services start again: a node reads its keys when it starts.
+    daemon_dirs::add(m, svc.exec, mode, &mut report)?;
     svc.reload().map_err(MigrateError::io("daemon-reload"))?;
 
     for unit in journal.stopped.clone() {
@@ -540,6 +547,7 @@ fn plan<E: Exec>(m: &Migration, exec: &mut E, report: &mut Report) -> Result<(),
         Mode::DryRun,
         "copy or verify each release, repoint the links, rewrite the units",
     );
+    daemon_dirs::add(m, svc.exec, Mode::DryRun, report)?;
     Ok(())
 }
 

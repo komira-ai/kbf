@@ -86,6 +86,22 @@ fn the_update_apis_numbers_and_places_come_from_the_file_and_the_flags() {
         check: false,
     };
     let cfg = handover_config(&args, &loaded);
+    // The children's ports are the upstream table's: in a slot the operator listener is at
+    // offset 2 and the admin calls at 3, slot B ten ports above slot A, all on loopback; and
+    // the operator token is the one the proxy checks callers against.
+    let at = |port| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    assert_eq!(
+        cfg.slots,
+        SlotAddrs {
+            admin: [at(18003), at(18013)],
+            operator: [at(18002), at(18012)],
+        }
+    );
+    assert_eq!(
+        cfg.operator_token_file,
+        PathBuf::from("/etc/kbf/operator.token")
+    );
+    assert!(!cfg.gate.is_filled());
     assert_eq!(
         (
             cfg.state_dir,
@@ -332,7 +348,18 @@ fn handover(name: &str) -> HandoverConfig {
         status_file: root.join("status.json"),
         confirm_window_s: 900,
         fetch_timeout_s: 900,
+        slots: SlotAddrs {
+            admin: [loopback(18003), loopback(18013)],
+            operator: [loopback(18002), loopback(18012)],
+        },
+        operator_token_file: root.join("operator.token"),
+        installer_toml: root.join("installer.toml"),
+        gate: GateSlot::new(),
     }
+}
+
+fn loopback(port: u16) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, port))
 }
 
 /// Catches a proxy that cannot be bound being reported as served: a descriptor that is not a
@@ -342,7 +369,13 @@ fn a_descriptor_the_runtime_cannot_use_is_a_failure_to_start() {
     let loaded = load(&file("serve", PROXY.as_bytes())).expect("valid");
     let regular = OwnedFd::from(fs::File::open(file("fd", b"x")).expect("open"));
     let database = state_database(&file("serve-db", PROXY.as_bytes())).expect("a database");
-    match serve(loaded.proxy, database, &handover("serve"), regular) {
+    match serve(
+        loaded.proxy,
+        database,
+        &handover("serve"),
+        regular,
+        &kbf_host::Root::host(),
+    ) {
         Err(VerbError::Failed(text)) => {
             assert!(text.starts_with("cannot start the proxy: "), "{text}");
         }
@@ -361,7 +394,13 @@ fn a_spool_that_cannot_be_opened_is_a_usage_error_before_anything_is_bound() {
     fs::write(&handover.orders_dir, b"a file").expect("a file in the way");
     let regular = OwnedFd::from(fs::File::open(file("fd-spool", b"x")).expect("open"));
     let database = state_database(&file("spool-db", PROXY.as_bytes())).expect("a database");
-    let text = usage_of(serve(loaded.proxy, database, &handover, regular));
+    let text = usage_of(serve(
+        loaded.proxy,
+        database,
+        &handover,
+        regular,
+        &kbf_host::Root::host(),
+    ));
     assert!(
         text.starts_with("update API: the order spool at "),
         "{text}"
@@ -383,14 +422,29 @@ fn check_stops_at_the_table_and_a_run_needs_its_socket() {
         orders_dir: path.with_file_name("orders"),
         check,
     };
-    assert_eq!(run(&args(true)), Ok(()));
-    let text = usage_of(run(&args(false)));
+    assert_eq!(run(&args(true), Path::new("/")), Ok(()));
+    let text = usage_of(run(&args(false), Path::new("/")));
     assert!(text.contains("LISTEN_PID"), "{text}");
     let missing = ProxyArgs {
         config: Some(path.with_file_name("none.toml")),
         ..args(true)
     };
-    assert!(usage_of(run(&missing)).contains("No such file"));
+    assert!(usage_of(run(&missing, Path::new("/"))).contains("No such file"));
+}
+
+/// Catches a `--root` that is not absolute being taken: with the socket in place the verb
+/// refuses it as a usage error before it binds anything.
+#[test]
+fn a_root_that_is_not_absolute_is_a_usage_error() {
+    let path = file("rel-root", PROXY.as_bytes());
+    let args = ProxyArgs {
+        config: Some(path.clone()),
+        update_dir: path.with_file_name("update"),
+        orders_dir: path.with_file_name("orders"),
+        check: false,
+    };
+    let result = run(&args, Path::new("relative"));
+    assert!(usage_of(result).starts_with("--root: "));
 }
 
 static BOUND_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
@@ -649,6 +703,68 @@ fn a_death_during_a_drain_is_noted_and_does_not_end_the_drain() {
     assert!(died.load(Ordering::SeqCst));
 }
 
+/// Catches a swap thread that dies without stopping the proxy, or that stops it as a second
+/// signal (which ends the process at once): through the hook the driver is given, the death
+/// is remembered so that `outcome` fails the verb, the proxy drains once, and a second death
+/// with the drain under way drains nothing more.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dead_handover_driver_stops_the_proxy_once_and_fails_the_verb() {
+    let stop = Arc::new(Stop {
+        seen: AtomicBool::new(false),
+        bound: Duration::from_secs(3600),
+        exit: death_exit,
+    });
+    let died = Arc::new(AtomicBool::new(false));
+    let drains = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let drain: Arc<dyn Fn() + Send + Sync> = {
+        let drains = Arc::clone(&drains);
+        Arc::new(move || {
+            drains.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let hook = death_hook(&stop, &died, &drain);
+    hook("the swap stopped: x");
+    assert_eq!(drains.load(Ordering::SeqCst), 1);
+    assert!(died.load(Ordering::SeqCst));
+    assert!(outcome(Ok(()), &died).is_err());
+    hook("again");
+    assert_eq!(
+        drains.load(Ordering::SeqCst),
+        1,
+        "a second death drained again"
+    );
+}
+
+/// Catches a lookup of the recorded process that asks the wrong slot or invents one: the slot
+/// the child control recorded gives its process, the other gives none.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_driver_asks_the_child_control_for_the_recorded_process_of_a_slot() {
+    use crate::proxy::child_real::{ProcChild, Recorded};
+    use crate::proxy::model::{ProcIdent, Slot as Own};
+    let dir = kbf_host::testkit::scratch("proxy-verb-recorded");
+    let ident = ProcIdent {
+        pid: 7,
+        start_time: 9,
+        exe: "/x/kbf".into(),
+    };
+    let record = Recorded {
+        ident: ident.clone(),
+        commit: crate::testkit::c(A),
+    };
+    fs::write(
+        dir.join("a.json"),
+        serde_json::to_vec(&record).expect("json"),
+    )
+    .expect("record");
+    let layout = crate::layout::Layout::linux(kbf_host::Root::host());
+    let child = Arc::new(ProcChild::new(layout, dir, Box::new(|_, _| Vec::new())));
+    let recorded = recorded_by(&child);
+    assert_eq!(recorded(Own::A), Some(ident));
+    assert_eq!(recorded(Own::B), None);
+}
+
 /// Catches a start-up line that does not say what the API does: it names the files, the
 /// staging deadline (the fetch limit of 900 s and five minutes) and that a `POST` is refused,
 /// and why.
@@ -660,7 +776,7 @@ fn the_start_up_line_says_what_the_update_api_will_do() {
         update_line(&parts, &cfg),
         format!(
             "update API on (status {}, orders {}, staging deadline 1200 s); \
-             a POST is refused: handover driver not wired",
+             a POST is refused: proxy not bound yet",
             cfg.status_file.display(),
             cfg.orders_dir.display()
         )
@@ -789,7 +905,7 @@ fn check_refuses_a_file_without_a_database() {
         update_dir: "/nonexistent".into(),
         orders_dir: "/nonexistent/orders".into(),
     };
-    assert!(usage_of(run(&args)).contains("state database"));
+    assert!(usage_of(run(&args, Path::new("/"))).contains("state database"));
 }
 
 /// The verb's start, on a scratch host: the installed release (a stand-in that would fail at
@@ -812,9 +928,11 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
     use kbf_state::postgres::schema;
 
     use crate::proxy::boot::Retry;
+    use crate::proxy::child_real::ProcChild;
     use crate::proxy::gate_real::ProxyGate;
     use crate::proxy::gate_real_tests::proxy_table;
     use crate::proxy::runtime::SystemClock;
+    use crate::proxy::supervisor::{children_dir, frontend_argv};
     use crate::testkit::{A, c, host_root};
 
     let (layout, root) = host_root("proxy-verb-start");
@@ -860,7 +978,13 @@ fn the_start_migrates_the_installed_release_before_it_runs_it() {
         first_wait: Duration::from_millis(1),
         max_wait: Duration::from_millis(1),
     };
-    let line = start_children(&handle, &gate, &SystemClock::new(), layout, with, retry);
+    let child = ProcChild::new(
+        layout,
+        children_dir(&with.state_dir),
+        frontend_argv(&with.proxy_auth_file, with.upstream),
+    );
+    let started = start_with(&handle, &gate, &SystemClock::new(), &child, with, retry);
+    let line = startup_line(started);
     assert!(
         line.starts_with("no frontend child adopted, new streams stay held: ")
             && line.contains("migration-failed"),

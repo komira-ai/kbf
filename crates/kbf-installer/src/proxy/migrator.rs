@@ -157,7 +157,6 @@ impl<'a> DbMigrator<'a> {
     }
 
     /// Runs `apply` instead of the database, to see what it is handed.
-    #[cfg(test)]
     pub(super) fn with_apply(mut self, apply: Apply<'a>) -> DbMigrator<'a> {
         self.apply = apply;
         self

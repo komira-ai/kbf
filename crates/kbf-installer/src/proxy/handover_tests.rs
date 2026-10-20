@@ -1,5 +1,5 @@
 //! The update API's seams on scratch directories: each is the real one, bound to the place it
-//! was told, and the one that has no implementation yet refuses.
+//! was told, and the supervisor refuses until the proxy is bound.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,9 +9,10 @@ use kbf_update::record::parse_file_name;
 
 use super::*;
 use crate::proxy::api::core::{Core, CrashPoint, Fault, Reply};
-use crate::proxy::api::model::{UpdateId, UpdateRequest};
+use crate::proxy::api::model::UpdateRequest;
 use crate::proxy::api::traits::Compat;
-use crate::proxy::model::{Locator, StagedFacts, Verb};
+use crate::proxy::handover_swap::NOT_BOUND;
+use crate::proxy::model::Verb;
 use crate::proxy::ports::RootOrders;
 use crate::proxy::record::Fsync;
 use crate::proxy::root_orders::SpoolRootOrders;
@@ -30,7 +31,18 @@ fn config(name: &str) -> HandoverConfig {
         status_file: root.join("update").join("status.json"),
         confirm_window_s: 900,
         fetch_timeout_s: 900,
+        slots: SlotAddrs {
+            admin: [addr(18003), addr(18013)],
+            operator: [addr(18002), addr(18012)],
+        },
+        operator_token_file: root.join("operator.token"),
+        installer_toml: root.join("installer.toml"),
+        gate: GateSlot::new(),
     }
+}
+
+fn addr(port: u16) -> std::net::SocketAddr {
+    std::net::SocketAddr::from(([127, 0, 0, 1], port))
 }
 
 /// The program that is running, installed where `installed` says.
@@ -193,14 +205,14 @@ fn spool_of(cfg: &HandoverConfig) -> OrderSpool {
     OrderSpool::open(&cfg.orders_dir, &cfg.state_dir).expect("the spool")
 }
 
-/// Catches a `POST` that reaches the spool while no driver is wired: the real seams refuse it
+/// Catches a `POST` that reaches the spool while the proxy is not bound: the real seams refuse it
 /// with 503 and the reason, `orders/` stays empty and no request id is saved; the status read
 /// still answers; and `abort` finds no update.
 #[test]
 fn a_post_is_refused_and_nothing_reaches_the_spool_or_the_request_map() {
     let cfg = config("post");
     let mut core = Core::new(parts(&cfg).expect("the seams"));
-    assert_unwired_refusal(&mut core, "r1");
+    assert_unbound_refusal(&mut core, "r1");
     assert_eq!(order_ids(&cfg.orders_dir), Vec::<u64>::new());
     assert!(Idempotency::open(&cfg.state_dir).get("r1").is_none());
     assert!(matches!(core.status(), Reply::Status(_)));
@@ -211,25 +223,25 @@ fn a_post_is_refused_and_nothing_reaches_the_spool_or_the_request_map() {
 }
 
 /// Catches a refusal that holds only because the root half has not written a `status.json`
-/// (the `POST` of the test above would fail with `status_unreadable` without the unwired
+/// (the `POST` of the test above would fail with `status_unreadable` without the unbound
 /// supervisor, and write nothing either way): with a status of an idle host and a commit other
 /// than the installed one, nothing but the supervisor stands in the way, and the `POST` is
 /// still 503 `handover_unavailable`, `orders/` stays empty, no request id is saved, and a
 /// second `POST` of the same id is refused the same way (it is not the replay of an accepted
 /// update).
 #[test]
-fn a_post_is_refused_by_the_unwired_supervisor_when_the_root_half_is_idle() {
+fn a_post_is_refused_by_the_unbound_supervisor_when_the_root_half_is_idle() {
     let cfg = config("post-idle");
     write_idle_status(&cfg);
     let mut core = Core::new(parts(&cfg).expect("the seams"));
-    assert_unwired_refusal(&mut core, "r1");
-    assert_unwired_refusal(&mut core, "r1");
+    assert_unbound_refusal(&mut core, "r1");
+    assert_unbound_refusal(&mut core, "r1");
     assert_eq!(order_ids(&cfg.orders_dir), Vec::<u64>::new());
     assert!(Idempotency::open(&cfg.state_dir).get("r1").is_none());
 }
 
-/// The `POST` of `request_id` is refused as an API with no driver refuses it.
-fn assert_unwired_refusal(core: &mut Core, request_id: &str) {
+/// The `POST` of `request_id` is refused as an API whose proxy is not bound refuses it.
+fn assert_unbound_refusal(core: &mut Core, request_id: &str) {
     let refused = match core.post(request(request_id)) {
         Err(Fault::Api(e)) => e,
         other => panic!("not refused: {other:?}"),
@@ -239,55 +251,8 @@ fn assert_unwired_refusal(core: &mut Core, request_id: &str) {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "handover_unavailable",
-            "handover driver not wired"
+            NOT_BOUND
         )
-    );
-}
-
-/// Catches a supervisor that claims an update or a start it cannot do: the unwired one has
-/// no update, says why it cannot start, fails a `start` that gets past that (an update an
-/// earlier process accepted) with the same words, and finds nothing to abort, roll back or
-/// retire.
-#[test]
-fn the_unwired_supervisor_has_no_update_and_starts_none() {
-    let mut supervisor = NotWired;
-    assert_eq!(supervisor.status(), SupervisorStatus::default());
-    assert_eq!(
-        supervisor.start_blocked().as_deref(),
-        Some("handover driver not wired")
-    );
-    let spec = UpdateSpec {
-        update_id: UpdateId("u1".to_owned()),
-        request_id: "r1".to_owned(),
-        from: None,
-        to: c(B),
-        nodes: false,
-        rollback: false,
-        facts: StagedFacts {
-            commit: c(B),
-            protocol: 5,
-            min_protocol: 3,
-            state_schema: 7,
-            profile: None,
-        },
-        order: Locator {
-            order_id: 1,
-            epoch: 1,
-            generation: 1,
-            verb: Verb::FrontendUpdate,
-            commit: c(B),
-            window_s: 900,
-        },
-    };
-    assert_eq!(
-        supervisor.start(&spec),
-        Err(SupervisorError::Failed(NOT_WIRED.to_owned()))
-    );
-    assert_eq!(supervisor.abort(), Err(SupervisorError::NotOpen));
-    assert_eq!(supervisor.rollback(), Err(SupervisorError::NotOpen));
-    assert_eq!(
-        supervisor.force_retire("because"),
-        Err(SupervisorError::NotOpen)
     );
 }
 

@@ -334,8 +334,8 @@ fn settled(units: &[&str]) -> FakeOs {
 }
 
 const DAEMON_TOML: &str =
-    "# Written by `kbf-installer setup`. The mode's other settings are added below the
-# keys it writes; run setup again to change these.
+    "# Written by `kbf-installer setup`; run setup again to change these keys. Another setting
+# goes into the table it belongs to (add the key there, never a second table of the same name).
 mode = \"daemon\"
 
 [frontend]
@@ -343,11 +343,15 @@ url = \"https://farm.example:8443\"
 
 [enroll]
 token_file = \"/etc/kbf/enroll.token\"
+
+[daemon]
+update-dir = \"/var/lib/kbf-installer\"
+orders-dir = \"/var/lib/kbf-installer/orders\"
 ";
 
 const FRONTEND_TOML: &str =
-    "# Written by `kbf-installer setup`. The mode's other settings are added below the
-# keys it writes; run setup again to change these.
+    "# Written by `kbf-installer setup`; run setup again to change these keys. Another setting
+# goes into the table it belongs to (add the key there, never a second table of the same name).
 mode = \"frontend\"
 
 [listener]
@@ -1670,3 +1674,6 @@ mod proxy_listen;
 
 #[path = "backup_dropin_tests.rs"]
 mod backup_dropin;
+
+#[path = "update_dirs_tests.rs"]
+mod update_dirs;

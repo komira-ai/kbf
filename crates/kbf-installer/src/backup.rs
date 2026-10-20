@@ -284,6 +284,12 @@ pub struct Done {
 /// fixed width, so names sort as times.
 #[must_use]
 pub fn stamp(secs: u64) -> String {
+    format!("kbf-{}.dump", utc_stamp(secs))
+}
+
+/// `YYYYMMDDTHHMMSSZ` for `secs` since the epoch, UTC and fixed width.
+#[must_use]
+pub fn utc_stamp(secs: u64) -> String {
     // Days since the epoch to a civil date (Howard Hinnant's `civil_from_days`).
     let days = i64::try_from(secs / 86_400).unwrap_or(i64::MAX / 2);
     let rest = secs % 86_400;
@@ -298,7 +304,7 @@ pub fn stamp(secs: u64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = year_of_era + era * 400 + i64::from(month <= 2);
     format!(
-        "kbf-{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z.dump",
+        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
         rest / 3600,
         rest % 3600 / 60,
         rest % 60
