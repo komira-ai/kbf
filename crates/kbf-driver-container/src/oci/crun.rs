@@ -52,7 +52,33 @@ pub(crate) fn code_of(status: ExitStatus) -> i32 {
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
-/// The `Spawner` of this driver: [`runc::DefaultExecutor`], with `kill_on_drop`.
+/// How long a dropped child is waited for after its `SIGKILL`. A killed process exits
+/// once it leaves the system call it is in; a child still there at the limit is left
+/// to tokio's orphan queue (`kill_on_drop`).
+const REAP_ON_DROP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A running `crun`, killed and reaped when dropped. tokio's `kill_on_drop` alone sends
+/// the `SIGKILL` and leaves the reaping to its orphan queue, so an aborted `crun run`
+/// could still be there, dying or a zombie, when the lease clean went on to `crun
+/// delete` its container: the delete then raced the run's own removal of its state.
+/// Dropping blocks (microseconds for a process that has the signal pending) on the
+/// thread that polled the future.
+struct Reaped(tokio::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let child = &mut self.0;
+        let _ = child.start_kill();
+        let deadline = std::time::Instant::now() + REAP_ON_DROP;
+        // `Ok(None)`: not exited yet. An error is not a process to wait for.
+        while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+/// The `Spawner` of this driver: [`runc::DefaultExecutor`], with `kill_on_drop` and a
+/// child that is reaped when its future is dropped ([`Reaped`]).
 #[derive(Debug)]
 struct KillOnDrop;
 
@@ -61,19 +87,30 @@ impl Spawner for KillOnDrop {
     async fn execute(&self, mut cmd: Command) -> runc::Result<(ExitStatus, u32, String, String)> {
         cmd.kill_on_drop(true);
         without_credentials(cmd.as_std_mut());
-        let child = cmd.spawn().map_err(Error::ProcessSpawnFailed)?;
+        let mut child = cmd.spawn().map_err(Error::ProcessSpawnFailed)?;
         let pid = child.id().unwrap_or(0);
-        let out = child
-            .wait_with_output()
-            .await
-            .map_err(Error::InvalidCommand)?;
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let mut child = Reaped(child);
+        let waiting = child.0.wait();
+        let (status, out, err) = tokio::join!(waiting, read_all(stdout), read_all(stderr));
+        let status = status.map_err(Error::InvalidCommand)?;
         Ok((
-            out.status,
+            status,
             pid,
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
+            String::from_utf8_lossy(&out.map_err(Error::InvalidCommand)?).into_owned(),
+            String::from_utf8_lossy(&err.map_err(Error::InvalidCommand)?).into_owned(),
         ))
     }
+}
+
+/// Everything `pipe` says until it closes; nothing for a stream that was not piped.
+async fn read_all<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut bytes).await?;
+    }
+    Ok(bytes)
 }
 
 /// `Io` that gives `crun run` the lease's stdout and stderr files, and as stdin the file
