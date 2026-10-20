@@ -135,7 +135,10 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
     // no longer (busy, exit 4), and held to the end: the installer is stopped below with
     // its lock held, so it writes no state while the old layout comes back, and no verb of
     // the old tools runs while its units start.
-    let _old_lock = OldLock::take(&m.layout, &m.roots, m.lock_wait)?;
+    // A kit host's migration took no old lock, so a rollback takes none.
+    let _old_lock = (!first.journal.kit)
+        .then(|| OldLock::take(&m.layout, &m.roots, m.lock_wait))
+        .transpose()?;
     state::make_lock_dir(&m.layout)?;
     let lock = Locked::acquire_within(&m.layout, m.lock_wait)?;
     // What was read before the locks may be stale: the installer may have activated a
@@ -204,7 +207,9 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
     journal.phase = Phase::RolledBack;
     journal.stopped.clear();
     state_dir.put_journal(&journal)?;
-    remove_note(m)?;
+    if !journal.kit {
+        remove_note(m)?;
+    }
     report.warnings.push(
         "rolled back: the old layout runs again. The new tree is kept; `kbf-installer migrate --apply` \
          moves the host over again."

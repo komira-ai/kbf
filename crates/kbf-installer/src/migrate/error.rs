@@ -34,6 +34,16 @@ pub enum MigrateError {
     /// text the binary printed, which nobody has vetted: it is shown quoted and escaped.
     #[error("releases/{dir} holds a build of {probed:?}: its name does not match its binary")]
     Mislabeled { dir: String, probed: String },
+    /// A tree and no plist, or a plist and no `releases/` or `current`: half of what the Mac
+    /// kit installs, so not a host to adopt.
+    #[error("not a whole kit host: {0}")]
+    HalfKit(String),
+    /// The kit's job runs something that is neither of the kit's two argument forms.
+    #[error("the kit's job is in no form this knows: {0}")]
+    UnknownPlist(String),
+    /// The kit's job is on a host that is not a Mac.
+    #[error("{0} is the Mac kit's job file and this is not a Mac")]
+    KitOnLinux(String),
     /// `--version --json` of an old release could not be had.
     #[error("{release}: the version probe failed: {why}")]
     Probe { release: String, why: String },
@@ -81,6 +91,9 @@ impl MigrateError {
             MigrateError::NotRoot { .. } => Exit::Usage,
             MigrateError::BadLink { .. }
             | MigrateError::Mislabeled { .. }
+            | MigrateError::HalfKit(_)
+            | MigrateError::UnknownPlist(_)
+            | MigrateError::KitOnLinux(_)
             | MigrateError::Probe { .. } => Exit::Refused,
             // A swap of the old tool on trial, and the disagreements only a person settles.
             MigrateError::Pending { .. }

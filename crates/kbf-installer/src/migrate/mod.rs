@@ -6,6 +6,9 @@
 //! rollback path. The test-farm hosts that run the dev installer have no `VERIFIED`
 //! markers and no attestations; this is how they come over.
 //!
+//! A Mac the Mac kit installed has no state at all ([`kit`]): its links and its LaunchDaemon
+//! are the old layout, read as such, and the steps below are the same for it.
+//!
 //! The steps, each safe to run again (the re-run rule is stated at each):
 //!
 //! 1. **Read** the old state, memory and links. A swap on trial refuses the migration
@@ -63,6 +66,7 @@ mod apply;
 pub mod error;
 pub mod floor;
 pub mod journal;
+mod kit;
 mod newtree;
 mod old;
 mod probe;
@@ -212,16 +216,17 @@ pub fn guard(layout: &Layout, owner_uid: u32) -> Result<(), MigrateError> {
 pub fn standing(layout: &Layout, owner_uid: u32) -> Result<Vec<Unit>, MigrateError> {
     let rules = tree::Rules::release(owner_uid);
     let roots = Roots::new(layout.platform());
-    let done = newtree::StateDir::open(layout, &rules)?
+    let journal = newtree::StateDir::open(layout, &rules)?
         .map(|t| t.journal())
         .transpose()?
-        .flatten()
-        .filter(|j| j.phase == journal::Phase::Done);
-    if let Some(journal) = done {
-        return Ok(journal.units);
+        .flatten();
+    if let Some(journal) = journal.as_ref().filter(|j| j.phase == journal::Phase::Done) {
+        return Ok(journal.units.clone());
     }
-    match old::read(layout, &roots, &rules)? {
+    let resume = journal.as_ref().is_some_and(journal::Journal::kit_begun);
+    match old::read(layout, &roots, &rules, resume)? {
         None => Ok(Vec::new()),
+        Some(old) if old.kit.is_some() => Err(MigrateError::Unmigrated(roots.old_tree.to_string())),
         Some(_) => Err(MigrateError::Unmigrated(roots.old_state.to_string())),
     }
 }
@@ -231,9 +236,13 @@ mod coverage_tests;
 #[cfg(test)]
 mod floor_tests;
 #[cfg(test)]
+mod kit_adopt_tests;
+#[cfg(test)]
 mod kit_host;
 #[cfg(test)]
 mod kit_host_tests;
+#[cfg(test)]
+mod kit_marker_tests;
 #[cfg(test)]
 mod lock_tests;
 #[cfg(test)]
