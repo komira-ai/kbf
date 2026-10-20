@@ -764,6 +764,36 @@ async fn a_cached_result_does_not_excuse_a_refused_platform() {
     let only = next(&mut ops).await.expect("healthy").expect("an update");
     assert!(response(&only).cached_result);
 
+    // Cached, and nothing there that could name a platform: answered from the cache. An
+    // Action that does not decode, one that names no Command, a Command the CAS does not
+    // hold and one that does not decode.
+    let garbage = Blob::new(vec![0xff, 0xff, 0xff]);
+    let named = |command: &Blob| {
+        Blob::of(&Action {
+            command_digest: Some(command.proto.clone()),
+            input_root_digest: Some(Blob::new("root").proto),
+            ..Default::default()
+        })
+    };
+    let command_missing = named(&Blob::new("a command nobody uploaded"));
+    let command_garbage = named(&garbage);
+    farm.upload(&[&garbage, &command_garbage]).await;
+    let no_command = Blob::new(Vec::new());
+    for (why, action) in [
+        ("an action that does not decode", &garbage),
+        ("an action that names no command", &no_command),
+        ("a command the CAS does not hold", &command_missing),
+        ("a command that does not decode", &command_garbage),
+    ] {
+        farm.cache
+            .write_action_result(Role::Daemon, action.digest, &result)
+            .await
+            .expect("write");
+        let mut ops = start(&farm, action).await.expect(why);
+        let only = next(&mut ops).await.expect("healthy").expect("an update");
+        assert!(response(&only).cached_result, "{why}");
+    }
+
     // GetActionResult is a plain cache read: it answers the refused action's result.
     let got = farm
         .ac()

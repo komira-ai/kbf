@@ -68,6 +68,9 @@ fn scheduler(tokio: &tokio::runtime::Runtime, dir: &Path) -> (SocketAddr, Socket
         format!("--worker-client-ca={}", at("ca.pem")),
         format!("--cold-store=file://{}", at("server-cold")),
         format!("--meta-dir={}", at("server-meta")),
+        // The actions here name no platform and the daemon runs on whatever CPU the box
+        // has (an arm64 runner is not the default's x86-64): no default.
+        "--default-platform=none".to_owned(),
     ])
     .expect("the server's flags");
     let never = || Ok(std::future::pending::<()>());

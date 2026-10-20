@@ -72,6 +72,9 @@ fn farm_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
         format!("--key={}", at("node.key")),
         "--node-id=node-1".to_owned(),
         "--reconnect-ms=50".to_owned(),
+        // The actions here name no platform and the daemon runs on whatever CPU the box
+        // has (an arm64 runner is not the default's x86-64): no default.
+        "--default-platform=none".to_owned(),
         "--driver=container".to_owned(),
         format!("--data-dir={}", at("data")),
         // The default is Postgres on the host's socket; these tests need no server.

@@ -780,20 +780,12 @@ impl<D> ExecutionService<D> {
         };
         let mut defaulted = platform.clone();
         for (key, value) in [("os", default.os()), ("arch", default.arch().name())] {
-            defaulted.insert(key, value).map_err(|e| {
-                Status::internal(format!("the default platform {default} clashes: {e}"))
-            })?;
+            // Neither name is there ([`wants_default`]), so neither insert can clash.
+            let _ = defaulted.insert(key, value);
         }
         let request = needs(&defaulted)?;
         if let Some(skipped) = self.defaulted_log.admit(Instant::now()) {
-            tracing::info!(
-                %action,
-                os = default.os(),
-                arch = default.arch().name(),
-                skipped,
-                "platform defaulted: the action names no OS, no architecture and no ISA level \
-                 ({skipped} such placements not logged since the last line)"
-            );
+            tracing::info!(%action, %default, skipped, "platform defaulted: no os or arch named");
         }
         Ok(request)
     }
@@ -804,29 +796,30 @@ impl<D> ExecutionService<D> {
     /// An action or Command the CAS does not hold, or that does not decode, is not
     /// refused here (an Execute that runs says so); a store that fails is the call's error.
     async fn refuse_platform_of(&self, action: &Digest) -> Result<(), Status> {
-        let Some(bytes) = self.read_input(action).await? else {
+        let Some(decoded) = self.held::<Action>(action).await? else {
             return Ok(());
         };
-        let Ok(decoded) = Action::decode(bytes) else {
-            return Ok(());
-        };
-        if let Some(own) = platform(&decoded, None) {
-            return refuse_platform(Some(own)).map(drop);
-        }
-        let Some(command) = decoded
+        let own = platform(&decoded, None).is_some();
+        let command = match decoded
             .command_digest
             .as_ref()
-            .and_then(|d| wire::digest(Some(d)).ok())
-        else {
-            return Ok(());
+            .map(|d| wire::digest(Some(d)))
+        {
+            Some(Ok(digest)) if !own => self.held::<Command>(&digest).await?,
+            _ => None,
         };
-        let Some(bytes) = self.read_input(&command).await? else {
-            return Ok(());
-        };
-        let Ok(command) = Command::decode(bytes) else {
-            return Ok(());
-        };
-        refuse_platform(platform(&decoded, Some(&command))).map(drop)
+        refuse_platform(platform(&decoded, command.as_ref())).map(drop)
+    }
+
+    /// The message `digest` names, if the CAS holds it and it decodes.
+    async fn held<T: prost::Message + Default>(
+        &self,
+        digest: &Digest,
+    ) -> Result<Option<T>, Status> {
+        Ok(self
+            .read_input(digest)
+            .await?
+            .and_then(|bytes| T::decode(bytes).ok()))
     }
 
     /// A blob's bytes, or `None` if it is not held. Anything else (unreachable, store

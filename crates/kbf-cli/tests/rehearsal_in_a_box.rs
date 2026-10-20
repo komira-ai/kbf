@@ -282,11 +282,14 @@ impl Farm {
         // refuses the two together); the box has no Postgres, so the rehearsal gives the
         // frontend a SQLite file and its socket.
         let state = format!("--state-store=sqlite://{}/state/state.db", root.display());
+        // The rehearsal's actions name no platform and its daemons run on whatever CPU the
+        // box has (an arm64 runner is not the default's x86-64): no default.
+        let default_platform = "--default-platform=none".to_owned();
         farm.launch(
             &dir,
             &root,
             "frontend",
-            unit.replace(&[state]).add(&[control]),
+            unit.replace(&[state]).add(&[control, default_platform]),
             None,
         );
         let line = farm.start_line(0, "kbf-frontend ");

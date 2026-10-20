@@ -638,6 +638,31 @@ async fn a_label_in_kbf_toml_stops_the_start_before_enrolling() {
     );
 }
 
+/// Catches a mode that refuses the flags the start built (here a `kbf.toml` value the
+/// daemon cannot read as a number) starting anyway, or being reported as anything but a
+/// usage error: the node is enrolled, the mode's own parser says what it refused, and
+/// nothing runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_setting_the_mode_refuses_stops_the_start() {
+    let h = Harness::new("node-bad-setting");
+    h.ready("[daemon]\nreconnect-ms = \"soon\"\n");
+    let launches = Arc::new(Launches::default());
+    let (node, env) = (h.start_of(Some(names::DAEMON)), h.env());
+
+    let failure = tokio::task::spawn_blocking(move || {
+        run_with(&node, &env, Driver::Container, &|_| ExitCode::SUCCESS)
+    })
+    .await
+    .expect("no panic")
+    .expect_err("refused");
+
+    assert!(matches!(failure, Failure::Mode(_)), "{failure:?}");
+    assert_eq!(failure.exit_code(), 2);
+    assert!(failure.to_string().contains("reconnect"), "{failure}");
+    assert!(launches.seen().is_empty());
+    assert!(h.node_json().contains("node-02"), "enrolled all the same");
+}
+
 /// An enrolled node and a renewer for it, with the clock at the fake's.
 async fn renewing(h: &Harness) -> (Renewer, Store) {
     h.ready("[daemon]\n");
