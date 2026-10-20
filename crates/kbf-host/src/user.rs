@@ -16,6 +16,10 @@ use crate::step::Cmd;
 
 /// `getent`, which reads the host's user database as a login does (files, LDAP, ...).
 pub const GETENT: &str = "/usr/bin/getent";
+/// `dscl`, which reads a Mac's directory (a Mac has no `getent`).
+pub const DSCL: &str = "/usr/bin/dscl";
+/// What `dscl` prints (to stderr, with `DS Error: -14136`) for a user that is not there.
+const NOT_FOUND: &str = "eDSRecordNotFound";
 /// `id`, for a user's groups (`id -G`).
 pub const ID: &str = "/usr/bin/id";
 
@@ -39,9 +43,76 @@ pub enum UserError {
     Output { cmd: String, out: String },
 }
 
-/// `name` as the host's user database has it: `getent passwd` for the uid, gid and
-/// home, `id -G` for the groups. `None` when there is no such user (`getent` exits 2).
+/// Which tool reads the host's user database. A Mac has no `getent`; its directory is
+/// read with `dscl`. The host picks it by its own OS ([`UserDb::native`]); a caller that
+/// knows the platform it plans for (the installer's layout, a rehearsal under `--root`)
+/// names it, so that a Linux test run exercises the Mac arm through its fake `Exec`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserDb {
+    /// `getent passwd`.
+    Getent,
+    /// `dscl . -read /Users/<name>`.
+    Dscl,
+}
+
+impl UserDb {
+    /// The database of the OS this binary was built for.
+    #[cfg(target_os = "macos")]
+    pub const fn native() -> Self {
+        Self::Dscl
+    }
+
+    /// The database of the OS this binary was built for.
+    #[cfg(not(target_os = "macos"))]
+    pub const fn native() -> Self {
+        Self::Getent
+    }
+}
+
+/// `name` as this host's user database has it: see [`lookup_on`].
 pub fn lookup<E: Exec>(exec: &E, name: &str) -> Result<Option<RunUser>, UserError> {
+    lookup_on(exec, name, UserDb::native())
+}
+
+/// `name` as `db` has it: the uid, gid and home from `getent passwd` or `dscl`, the groups
+/// from `id -G`. `None` when there is no such user (`getent` exits 2; `dscl` fails with
+/// `eDSRecordNotFound`).
+pub fn lookup_on<E: Exec>(exec: &E, name: &str, db: UserDb) -> Result<Option<RunUser>, UserError> {
+    let record = match db {
+        UserDb::Getent => getent(exec, name)?,
+        UserDb::Dscl => dscl(exec, name)?,
+    };
+    let Some((uid, gid, home)) = record else {
+        return Ok(None);
+    };
+    let id = Cmd::new(tool(ID)).arg("-G").arg("--").arg(name);
+    let query = |cmd: &Cmd| {
+        succeeded(cmd, exec.query(cmd)?)
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let text = query(&id).map_err(|source| UserError::Query {
+        cmd: id.to_string(),
+        source,
+    })?;
+    let groups: Result<Vec<u32>, _> = text.split_whitespace().map(str::parse).collect();
+    let groups = groups
+        .ok()
+        .filter(|g| g.contains(&gid))
+        .ok_or(UserError::Output {
+            cmd: id.to_string(),
+            out: text.clone(),
+        })?;
+    Ok(Some(RunUser {
+        name: name.to_owned(),
+        uid,
+        gid,
+        groups,
+        home,
+    }))
+}
+
+/// The uid, gid and home of `name` from `getent passwd`.
+fn getent<E: Exec>(exec: &E, name: &str) -> Result<Option<(u32, u32, String)>, UserError> {
     let getent = Cmd::new(tool(GETENT)).arg("passwd").arg("--").arg(name);
     let out = exec.query(&getent).map_err(|source| UserError::Query {
         cmd: getent.to_string(),
@@ -70,32 +141,79 @@ pub fn lookup<E: Exec>(exec: &E, name: &str) -> Result<Option<RunUser>, UserErro
     if n != name {
         return Err(bad());
     }
-    let home = home.to_owned();
+    Ok(Some((uid, gid, home.to_owned())))
+}
 
-    let id = Cmd::new(tool(ID)).arg("-G").arg("--").arg(name);
-    let query = |cmd: &Cmd| {
-        succeeded(cmd, exec.query(cmd)?)
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    let text = query(&id).map_err(|source| UserError::Query {
-        cmd: id.to_string(),
+/// The uid, gid and home of `name` from `dscl . -read /Users/<name>`. `dscl` prints the
+/// attributes in its own order, not the order asked, one `Key: value` per line, so they are
+/// read by key. A value `dscl` cannot fit on the line (a home with a space) comes as `Key:`
+/// and then one line indented by a space; that is read as the value. Any other indented
+/// line, a repeated or unasked key, a missing key and a non-numeric id are refused.
+fn dscl<E: Exec>(exec: &E, name: &str) -> Result<Option<(u32, u32, String)>, UserError> {
+    let cmd = [
+        "UniqueID",
+        "PrimaryGroupID",
+        "NFSHomeDirectory",
+        "UserShell",
+    ]
+    .into_iter()
+    .fold(
+        Cmd::new(tool(DSCL))
+            .arg(".")
+            .arg("-read")
+            .arg(format!("/Users/{name}")),
+        Cmd::arg,
+    );
+    let out = exec.query(&cmd).map_err(|source| UserError::Query {
+        cmd: cmd.to_string(),
         source,
     })?;
-    let groups: Result<Vec<u32>, _> = text.split_whitespace().map(str::parse).collect();
-    let groups = groups
-        .ok()
-        .filter(|g| g.contains(&gid))
-        .ok_or(UserError::Output {
-            cmd: id.to_string(),
-            out: text.clone(),
-        })?;
-    Ok(Some(RunUser {
-        name: name.to_owned(),
-        uid,
-        gid,
-        groups,
-        home,
-    }))
+    if !out.status.success()
+        && (String::from_utf8_lossy(&out.stderr).contains(NOT_FOUND)
+            || String::from_utf8_lossy(&out.stdout).contains(NOT_FOUND))
+    {
+        return Ok(None);
+    }
+    let out = succeeded(&cmd, out).map_err(|source| UserError::Query {
+        cmd: cmd.to_string(),
+        source,
+    })?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let bad = || UserError::Output {
+        cmd: cmd.to_string(),
+        out: text.clone(),
+    };
+    let (mut uid, mut gid, mut home, mut shell) = (None, None, None, None);
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some((key, value)) = line.split_once(':') else {
+            return Err(bad());
+        };
+        let mut value = value.trim().to_owned();
+        if value.is_empty() {
+            match lines.next() {
+                Some(next) if next.starts_with(' ') => next.trim().clone_into(&mut value),
+                _ => return Err(bad()),
+            }
+        }
+        let slot = match key {
+            "UniqueID" => &mut uid,
+            "PrimaryGroupID" => &mut gid,
+            "NFSHomeDirectory" => &mut home,
+            "UserShell" => &mut shell,
+            _ => return Err(bad()),
+        };
+        if slot.replace(value).is_some() {
+            return Err(bad());
+        }
+    }
+    let (Some(uid), Some(gid), Some(home), Some(_)) = (uid, gid, home, shell) else {
+        return Err(bad());
+    };
+    let (Ok(uid), Ok(gid)) = (uid.parse(), gid.parse()) else {
+        return Err(bad());
+    };
+    Ok(Some((uid, gid, home)))
 }
 
 fn tool(path: &str) -> HostPath {
