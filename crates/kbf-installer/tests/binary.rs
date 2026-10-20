@@ -16,7 +16,8 @@ fn root(name: &str) -> PathBuf {
     // The platform the binary was built for, as the binary lays the host out.
     let (_, dir) =
         kbf_installer::testkit::host_root_on(&format!("helper-bin-{name}"), Platform::current());
-    fs::create_dir_all(dir.join("var/lib/kbf-installer/orders")).expect("order spool");
+    let host = layout(&dir);
+    fs::create_dir_all(host.join(&host.orders_dir())).expect("order spool");
     dir
 }
 
@@ -44,7 +45,7 @@ fn helper(root: &Path, args: &[&str]) -> Output {
 }
 
 fn status(root: &Path) -> serde_json::Value {
-    let bytes = fs::read(root.join("var/lib/kbf-installer/status.json")).expect("status.json");
+    let bytes = fs::read(in_state_dir(root, "status.json")).expect("status.json");
     serde_json::from_slice(&bytes).expect("json")
 }
 
@@ -87,7 +88,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
     );
     assert_eq!(status(&root)["installed_commit"], A);
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(root.join("var/lib/kbf-installer/status.json"))
+    let mode = fs::metadata(in_state_dir(&root, "status.json"))
         .expect("meta")
         .permissions()
         .mode();
@@ -124,8 +125,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
         }),
     };
     fs::write(
-        root.join("var/lib/kbf-installer/orders")
-            .join(record.file_name()),
+        host.join(&host.orders_dir()).join(record.file_name()),
         record.to_bytes().expect("bytes"),
     )
     .expect("record");
@@ -317,7 +317,7 @@ fn the_operator_verbs_exit_by_the_contract() {
         .write(&state(None))
         .expect("state");
     for dir in [A, B] {
-        let d = root.join("var/lib/kbf-installer/releases").join(dir);
+        let d = host.join(&host.releases()).join(dir);
         fs::create_dir_all(&d).expect("release");
         fs::write(d.join("kbf"), b"x").expect("binary");
     }
@@ -357,7 +357,7 @@ fn the_operator_verbs_exit_by_the_contract() {
         .expect("there");
     assert_eq!(kept.current, Some(c(B)), "a dry run moves nothing");
     assert_eq!(code(&["gc"]), Some(0));
-    assert!(root.join("var/lib/kbf-installer/releases").join(A).exists());
+    assert!(host.join(&host.releases()).join(A).exists());
 }
 
 /// Catches the gate in front of the verbs being absent from the shipped binary (the unit tests
@@ -480,7 +480,7 @@ fn a_service_whose_file_was_replaced_says_so_and_ends_when_the_new_one_cannot_st
         }
     }
     let child = child.expect("starts");
-    let status_file = root.join("var/lib/kbf-installer/status.json");
+    let status_file = in_state_dir(&root, "status.json");
     for _ in 0..400 {
         if status_file.exists() {
             break;

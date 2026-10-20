@@ -63,6 +63,9 @@ fn scheduler(tokio: &tokio::runtime::Runtime, dir: &Path) -> (SocketAddr, Socket
         "kbf-server".to_owned(),
         "--listen=127.0.0.1:0".to_owned(),
         "--worker-listen=127.0.0.1:0".to_owned(),
+        // The one node is this host, whatever its architecture: the default
+        // (`linux/x86_64`) would leave an action on an aarch64 host with no worker.
+        "--default-platform=none".to_owned(),
         format!("--worker-tls-cert={}", at("server.pem")),
         format!("--worker-tls-key={}", at("server.key")),
         format!("--worker-client-ca={}", at("ca.pem")),

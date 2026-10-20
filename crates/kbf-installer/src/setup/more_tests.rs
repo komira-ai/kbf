@@ -314,6 +314,9 @@ fn a_migrated_host_keeps_its_old_roots_and_passes_setup() {
         (FakeOs::mac(), Mode::Daemon),
     ] {
         let mut exec = with_old_roots(host());
+        if os.platform == Platform::MacOs {
+            exec = provisioned(exec);
+        }
         let out = after(
             &os,
             &mut exec,
@@ -984,9 +987,11 @@ fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
         gate_files(&plist).iter().collect::<Vec<_>>(),
         "setup wrote installer.toml somewhere the launchd gate does not wait"
     );
-    // The node job reads kbf.toml from the layout; setup wrote it there.
+    // The node job reads kbf.toml from the layout; on a Mac that file is kbf-mac-provision's
+    // (G9), so it was there before setup and setup wrote none.
     assert!(
-        files.iter().any(|p| p == Platform::MacOs.kbf_toml()),
+        planted.iter().any(|p| p == Platform::MacOs.kbf_toml())
+            && !files.iter().any(|p| p == Platform::MacOs.kbf_toml()),
         "{files:?}"
     );
     assert!(
