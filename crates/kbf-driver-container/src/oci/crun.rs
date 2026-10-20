@@ -325,10 +325,14 @@ mod tests {
             let mut command = Command::new("sleep");
             command.arg("600");
             let mut run = Box::pin(KillOnDrop.execute(command));
-            let polled = runtime.block_on(tokio::time::timeout(Duration::ZERO, &mut run));
+            let polled =
+                runtime.block_on(async { tokio::time::timeout(Duration::ZERO, &mut run).await });
             assert!(polled.is_err(), "round {round}: sleep 600 ended");
             let listed = std::fs::read_to_string(&children).expect("the thread's children");
-            let new: Vec<_> = listed.split_whitespace().filter(|p| seen.insert((*p).to_owned())).collect();
+            let new: Vec<_> = listed
+                .split_whitespace()
+                .filter(|p| seen.insert((*p).to_owned()))
+                .collect();
             let [pid] = new[..] else {
                 panic!("round {round}: expected one new child, got {new:?} of {listed:?}");
             };
