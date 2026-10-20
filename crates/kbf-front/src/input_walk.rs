@@ -205,7 +205,6 @@ impl Trees {
     pub(crate) fn len(&self) -> usize {
         self.lock().dirs.len()
     }
-
 }
 
 /// The input check over a store: every Directory under `root` is read
@@ -285,8 +284,13 @@ pub(crate) async fn walk_bounded(
     }
     let files: Vec<Digest> = files.into_iter().collect();
     let files_began = Instant::now();
-    let asked: Vec<Vec<Digest>> = futures::stream::iter(files.chunks(FILES_PER_ASK))
+    // Built before the stream: a closure inside it makes the future not `Send` for every
+    // lifetime of a chunk.
+    let asks: Vec<BoxFuture<'_, Answer<Vec<Digest>>>> = files
+        .chunks(FILES_PER_ASK)
         .map(|chunk| storage.find_missing(chunk))
+        .collect();
+    let asked: Vec<Vec<Digest>> = futures::stream::iter(asks)
         .buffered(ASKS_IN_FLIGHT)
         .try_collect()
         .await?;
@@ -317,3 +321,7 @@ pub(crate) async fn walk_bounded(
 #[cfg(test)]
 #[path = "input_walk_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "input_walk_memory_tests.rs"]
+mod memory_tests;

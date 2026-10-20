@@ -105,9 +105,13 @@ async fn a_placement_lists_the_writers_in_the_order_a_write_tries_them() {
 #[tokio::test]
 async fn the_epoch_moves_with_the_generation_and_every_boot() {
     let base = map(1, 2, active(&[1, 2, 3]));
-    let (router, _) = router_for(&base);
-    let first = router.epoch().expect("an epoch");
-    assert_eq!(router.epoch(), Some(first), "the same map, the same epoch");
+    let (first_router, _) = router_for(&base);
+    let first = first_router.epoch().expect("an epoch");
+    assert_eq!(
+        first_router.epoch(),
+        Some(first),
+        "the same map, the same epoch"
+    );
 
     let (next_generation, _) = router_for(&map(2, 2, active(&[1, 2, 3])));
     assert_ne!(next_generation.epoch(), Some(first));
@@ -115,7 +119,11 @@ async fn the_epoch_moves_with_the_generation_and_every_boot() {
     let mut restarted = active(&[1, 2, 3]);
     restarted[1].boot = 2;
     let (rebooted, _) = router_for(&map(1, 2, restarted));
-    assert_ne!(rebooted.epoch(), Some(first), "a boot moved at the same generation");
+    assert_ne!(
+        rebooted.epoch(),
+        Some(first),
+        "a boot moved at the same generation"
+    );
 
     let (grown, _) = router(&map(1, 2, active(&[1, 2, 3, 4])), &Cluster::of(4));
     assert_ne!(grown.epoch(), Some(first));
