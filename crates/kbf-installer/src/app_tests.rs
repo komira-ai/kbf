@@ -1228,13 +1228,15 @@ fn the_probe_user_is_looked_up_with_the_exit_codes_of_the_contract() {
         })
     });
     assert_eq!(
-        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        probe_user(&exec, "kbf-fetch", false, Platform::Linux)
+            .expect("found")
+            .uid,
         991
     );
-    let missing = probe_user(&exec, "nobody-here", false).expect_err("unknown");
+    let missing = probe_user(&exec, "nobody-here", false, Platform::Linux).expect_err("unknown");
     assert_eq!(missing.exit, Exit::Usage);
     assert!(missing.why.contains("nobody-here"), "{}", missing.why);
-    let broken = probe_user(&exec, "broken", false).expect_err("broken");
+    let broken = probe_user(&exec, "broken", false, Platform::Linux).expect_err("broken");
     assert_eq!(broken.exit, Exit::Failed);
     assert!(broken.why.contains("getent"), "{}", broken.why);
 }
@@ -1269,7 +1271,7 @@ fn the_version_probe_never_runs_as_root_on_a_host() {
         })
     });
     for name in ["root", "uid-zero", "gid-zero"] {
-        let error = probe_user(&exec, name, false).expect_err(name);
+        let error = probe_user(&exec, name, false, Platform::Linux).expect_err(name);
         assert_eq!(error.exit, Exit::Usage, "{name}");
         assert!(
             error.why.contains(name) && error.why.contains("root"),
@@ -1278,10 +1280,17 @@ fn the_version_probe_never_runs_as_root_on_a_host() {
         );
     }
     assert_eq!(
-        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        probe_user(&exec, "kbf-fetch", false, Platform::Linux)
+            .expect("found")
+            .uid,
         991
     );
-    assert_eq!(probe_user(&exec, "root", true).expect("a rehearsal").uid, 0);
+    assert_eq!(
+        probe_user(&exec, "root", true, Platform::Linux)
+            .expect("a rehearsal")
+            .uid,
+        0
+    );
 }
 
 /// Catches `migrate` missing from the command line or from the dispatcher: its flags parse
