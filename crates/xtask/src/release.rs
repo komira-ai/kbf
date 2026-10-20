@@ -36,6 +36,13 @@
 //!   (`VERSION` and the release tags), the push's class (code, site, pipeline), and the
 //!   refusals: a freeze, a base below an existing tag, a superseded commit ([`tags::superseded`]).
 //!   Prints `key=value` lines and appends them to `--output`.
+//! - `release previous --repo <owner/repo> --sha <sha> --platform <p> --binary <name>...
+//!   --out <dir> [--trusted-root <file>] [--output <file>] [--gh <program>]` ([`previous`]):
+//!   the release before `--sha` for the tests that need an N-1: the highest release tag
+//!   that names a strict ancestor of it, its release downloaded and verified as `release
+//!   offer` verifies one, and only then the named binaries taken out into `--out`. With no
+//!   such tag it prints `previous-source=none`; a failed call is an error, never "no tags".
+//!   Prints `key=value` lines and appends them to `--output`.
 //! - `release publish <dir> --repo <owner/repo> --tag <tag> --commit <sha> --run-id <id>
 //!   [--gh <program>]` ([`publish`]): `check`, then creates release `<tag>` with every
 //!   file of `<dir>` (the bundles beside their tarballs). When the release exists,
@@ -48,6 +55,7 @@ mod git;
 pub mod notes;
 pub mod offer;
 pub mod plan;
+pub mod previous;
 pub mod tags;
 pub mod verdict;
 

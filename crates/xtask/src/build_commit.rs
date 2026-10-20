@@ -248,7 +248,7 @@ impl Drop for Scratch {
 }
 
 /// Writes `bytes` to the new file `path`, mode 0755, and closes it, so it can be run.
-fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+pub(crate) fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)
