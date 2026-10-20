@@ -489,9 +489,12 @@ fn invalid(lease: LeaseId) -> worker::Result {
     }
 }
 
+/// Whether the farm answers a result of `lease` with an ack that says accepted. A result
+/// the store has not taken is not acknowledged at all (`Farm::report` is `None`), which is
+/// not accepted either.
 async fn accepted(farm: &TestFarm, lease: LeaseId) -> bool {
     let ack = farm.report(&node(), invalid(lease)).await;
-    ack.expect("an acknowledgement").accepted
+    ack.is_some_and(|ack| ack.accepted)
 }
 
 /// Catches: a farm that forgets a claim it acknowledged (the daemon runs a lease the
