@@ -18,6 +18,7 @@ use oci_spec::runtime::{
 use super::hardening::{
     CAPABILITIES, MASKED_PATHS, READONLY_PATHS, SeccompError, held_capabilities, seccomp,
 };
+use super::init;
 use crate::container::{ACTION_ID, ContainerSpec, EXEC_ROOT};
 use crate::subids::DaemonIds;
 
@@ -104,11 +105,13 @@ pub(crate) struct Placement<'a> {
     pub ids: &'a DaemonIds,
     /// Go's name for the node's architecture, for the seccomp profile.
     pub arch: &'a str,
+    /// The container's first process (`init`), on the node.
+    pub init: &'a Path,
 }
 
 /// The mounts of an action: the standard ones of `crun spec --rootless`, the `hosts`, `hostname` and `resolv.conf` files,
 /// the exec-root overlay, the shared trees read-only inside it, and [`WRITABLE`].
-fn mounts(spec: &ContainerSpec) -> Vec<Mount> {
+fn mounts(spec: &ContainerSpec, init: &Path) -> Vec<Mount> {
     let shm = format!("size={}m", spec.limits.shm_mib);
     let open = ["rbind", "ro", "nosuid", "noexec", "nodev"];
     let mut mounts = vec![
@@ -144,6 +147,9 @@ fn mounts(spec: &ContainerSpec) -> Vec<Mount> {
             "cgroup",
             &["nosuid", "noexec", "nodev", "relatime", "ro"],
         ),
+        // Into the `/dev` above, a `tmpfs` made for this container: no mount point in the
+        // image. Executable (no `noexec`): it is the container's first process.
+        bind(init, init::DEST, &["rbind", "ro", "nosuid", "nodev"]),
         bind(&spec.dir.join("etc/hosts"), "/etc/hosts", &open),
         bind(&spec.dir.join("etc/hostname"), "/etc/hostname", &open),
         bind(&spec.dir.join("etc/resolv.conf"), "/etc/resolv.conf", &open),
@@ -181,6 +187,16 @@ fn mounts(spec: &ContainerSpec) -> Vec<Mount> {
         ));
     }
     mounts
+}
+
+/// The container's `process.args`: the init, then `--` and the action's own argv. The
+/// init runs the action as its child and reaps what the action leaves orphaned.
+fn init_argv(argv: &[String]) -> Vec<String> {
+    [init::DEST, "--"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(argv.iter().cloned())
+        .collect()
 }
 
 fn rlimit(typ: PosixRlimitType, value: u64) -> PosixRlimit {
@@ -260,7 +276,7 @@ pub(crate) fn action_config(
             .user(built(
                 UserBuilder::default().uid(ACTION_ID).gid(ACTION_ID).build(),
             ))
-            .args(spec.argv.clone())
+            .args(init_argv(&spec.argv))
             .env(environment(&spec.env))
             .cwd(PathBuf::from(cwd))
             .capabilities(capabilities)
@@ -309,7 +325,7 @@ pub(crate) fn action_config(
             .root(root)
             .hostname(HOSTNAME)
             .process(process)
-            .mounts(mounts(spec))
+            .mounts(mounts(spec, placement.init))
             .linux(linux)
             .build(),
     ))
@@ -361,6 +377,7 @@ mod tests {
             cgroup: "/kbf.slice/actions/kbf-lease-1-2",
             ids: &ids(),
             arch: "amd64",
+            init: Path::new("/scratch/oci-bin/kbf-init"),
         };
         let config = action_config(spec, &placement).expect("config");
         serde_json::from_slice(&render(&config).expect("render")).expect("json")
@@ -398,6 +415,7 @@ mod tests {
                 cgroup: "/kbf.slice/actions/kbf-lease-1-2",
                 ids: &ids(),
                 arch: "amd64",
+                init: Path::new("/scratch/oci-bin/kbf-init"),
             };
             render(&action_config(&spec(), &placement).expect("config")).expect("render")
         };
@@ -405,6 +423,36 @@ mod tests {
         for _ in 0..30 {
             assert_eq!(build(), first);
         }
+    }
+
+    /// Catches the action being the container's first process again (nothing then reaps
+    /// what it orphans), the init's mount missing, writable or in the image's root (a
+    /// mount point written into the image shared by every lease), or one the action
+    /// cannot execute: `process.args` is the init, `--`, then the action's argv unchanged;
+    /// the init is a read-only bind into `/dev`, after `/dev` is mounted, without `noexec`.
+    #[test]
+    fn the_action_runs_as_the_child_of_a_reaping_init() {
+        let mut spec = spec();
+        spec.argv = vec!["/bin/tool".to_owned(), "-c".to_owned(), "true".to_owned()];
+        let config = config_of(&spec);
+        assert_eq!(
+            config["process"]["args"],
+            json!(["/dev/kbf-init", "--", "/bin/tool", "-c", "true"])
+        );
+        let mounts = config["mounts"].as_array().expect("mounts");
+        let at = |dest: &str| mounts.iter().position(|m| m["destination"] == dest);
+        let init = at("/dev/kbf-init").expect("the init is mounted");
+        assert!(at("/dev").expect("/dev") < init, "into the /dev tmpfs");
+        assert_eq!(mounts[init]["type"], "bind");
+        assert_eq!(mounts[init]["source"], "/scratch/oci-bin/kbf-init");
+        let options: Vec<&str> = mounts[init]["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(options.contains(&"ro"), "{options:?}");
+        assert!(!options.contains(&"noexec"), "{options:?}");
     }
 
     /// Catches the action running as root (a mode-000 file would be readable, a
