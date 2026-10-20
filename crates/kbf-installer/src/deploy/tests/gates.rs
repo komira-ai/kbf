@@ -5,8 +5,9 @@
 //! leased-node acceptance run. The fake answers a call it was not taught with 404 and notes
 //! it, and every test here asserts the note is empty.
 //!
-//! Farm time: the preflight is at 0; the nodes confirm at 100 (`a-store`) and 200 (`b-mac`);
-//! the poll is 5 s.
+//! Farm time: the preflight is at 0; the frontend update is posted at 0, offers the commit at
+//! `OFFER_AT` (35) and is done at 55; the nodes confirm 100 (`a-store`) and 200 (`b-mac`) seconds
+//! after the offer; the poll is 5 s. `N` is the offer.
 
 use std::fs;
 use std::path::PathBuf;
@@ -15,6 +16,9 @@ use kbf_gate::{ResultDoc, Status, Verdict};
 
 use super::*;
 use crate::deploy::gates::name;
+
+/// Farm time at which the new frontend offers the commit: the nodes' clocks start here.
+const N: u64 = OFFER_AT;
 
 fn scratch(name: &str) -> PathBuf {
     let (_, dir) = crate::testkit::host_root(&format!("deploy-gates-{name}"));
@@ -142,7 +146,7 @@ fn the_set_hash_is_the_callers_else_derived_from_the_store() {
 fn an_untraced_relay_mid_deploy_is_red_naming_gate_value_and_step() {
     let mut f = farm(two_nodes());
     script(&mut f, |t, g| {
-        if (40..60).contains(&t) {
+        if (N + 40..N + 60).contains(&t) {
             g.relay_untraced = Some(1.0);
         }
     });
@@ -166,7 +170,7 @@ fn an_untraced_relay_mid_deploy_is_red_naming_gate_value_and_step() {
 #[test]
 fn a_scrape_that_fails_or_lacks_the_series_is_red() {
     let mut f = farm(two_nodes());
-    f.metrics = Box::new(|t| (t < 50).then(|| healthy().text()));
+    f.metrics = Box::new(|t| (t < N + 50).then(|| healthy().text()));
     let (s, doc) = run_gated(&f, "unreadable");
     red_at(
         &s,
@@ -184,7 +188,7 @@ fn a_scrape_that_fails_or_lacks_the_series_is_red() {
     ] {
         let mut f = farm(two_nodes());
         script(&mut f, move |t, g| {
-            if t >= 50 {
+            if t >= N + 50 {
                 match series {
                     "relay" => g.relay_untraced = None,
                     "lost" => g.lost_blobs = None,
@@ -207,7 +211,7 @@ fn a_scrape_that_fails_or_lacks_the_series_is_red() {
 fn a_lost_blob_mid_deploy_is_red() {
     let mut f = farm(two_nodes());
     script(&mut f, |t, g| {
-        if (110..130).contains(&t) {
+        if (N + 110..N + 130).contains(&t) {
             g.lost_blobs = Some(1.0);
         }
     });
@@ -225,7 +229,7 @@ fn a_lost_blob_mid_deploy_is_red() {
 fn a_blob_loss_since_the_start_is_red_by_delta() {
     let mut f = farm(two_nodes());
     script(&mut f, |t, g| {
-        if t >= 50 {
+        if t >= N + 50 {
             g.losses_total = Some(4.0);
         }
     });
@@ -243,7 +247,7 @@ fn a_blob_loss_since_the_start_is_red_by_delta() {
 fn a_loss_counter_that_went_backwards_is_red() {
     let mut f = farm(two_nodes());
     script(&mut f, |t, g| {
-        if t >= 50 {
+        if t >= N + 50 {
             g.losses_total = Some(0.0);
         }
     });
@@ -296,7 +300,7 @@ fn the_preflight_refuses_storage_that_is_not_healthy_or_not_known() {
 fn storage_that_is_repaired_inside_the_settle_window_is_green() {
     let mut f = farm(two_nodes());
     script(&mut f, |t, g| {
-        if (100..130).contains(&t) || (200..240).contains(&t) {
+        if (N + 100..N + 130).contains(&t) || (N + 200..N + 240).contains(&t) {
             g.under_replicated = Some(3.0);
         }
     });
@@ -323,7 +327,7 @@ fn the_next_node_step_may_not_begin_before_the_repair() {
     nodes[1].fate = Fate::Confirm(400);
     let mut f = farm(nodes);
     script(&mut f, |t, g| {
-        if (100..300).contains(&t) {
+        if (N + 100..N + 300).contains(&t) {
             g.under_replicated = Some(2.0);
         }
     });
@@ -345,7 +349,7 @@ fn the_next_node_step_may_not_begin_before_the_repair() {
 fn a_node_that_confirms_before_the_repair_is_red() {
     let mut f = farm(two_nodes());
     script(&mut f, |t, g| {
-        if (100..260).contains(&t) {
+        if (N + 100..N + 260).contains(&t) {
             g.under_replicated = Some(2.0);
         }
     });
@@ -369,7 +373,7 @@ fn storage_not_repaired_when_the_settle_window_ends_is_red() {
     let mut f = farm(vec![node("a-store", "linux-x86_64", Fate::Confirm(100))]);
     f.complete = vec!["linux-x86_64"];
     script(&mut f, |t, g| {
-        if t >= 100 {
+        if t >= N + 100 {
             g.under_replicated = Some(1.0);
         }
     });
@@ -383,8 +387,8 @@ fn storage_not_repaired_when_the_settle_window_ends_is_red() {
         ": 1,",
         "not repaired within the 60s settle window",
     );
-    // The window is 60 s after the node at 100, not the 1800 s of the node timeout.
-    assert!(f.now.get() <= 170, "ended at {}", f.now.get());
+    // The window is 60 s after the node at N + 100, not the 1800 s of the node timeout.
+    assert!(f.now.get() <= N + 170, "ended at {}", f.now.get());
 }
 
 /// Proves a series that goes missing after a node's step (the members stopped reporting) is
@@ -397,7 +401,7 @@ fn storage_that_stops_reporting_after_a_node_step_is_red() {
     let mut f = farm(vec![node("a-store", "linux-x86_64", Fate::Confirm(100))]);
     f.complete = vec!["linux-x86_64"];
     script(&mut f, |t, g| {
-        if t >= 100 {
+        if t >= N + 100 {
             g.under_replicated = None;
         }
     });
@@ -507,7 +511,10 @@ fn every_page_is_read() {
 #[test]
 fn an_unreadable_listing_or_build_is_red() {
     let mut f = farm(two_nodes());
-    f.broken.push(Broken::new("GET /v1/invocations?state=open*", Breaks::Status(404)));
+    f.broken.push(Broken::new(
+        "GET /v1/invocations?state=open*",
+        Breaks::Status(404),
+    ));
     let (s, _) = run_gated(&f, "off");
     assert_eq!((s.exit, s.reason.as_str()), (3, "gate_red"), "{}", s.line());
     for part in [name::INFLIGHT, "absent", "preflight"] {
@@ -520,7 +527,10 @@ fn an_unreadable_listing_or_build_is_red() {
 
     let mut f = farm(two_nodes());
     f.builds = vec![build("b-gone", 22, Some(27), &[])];
-    f.broken.push(Broken::new("GET /v1/invocations/b-gone/actions*", Breaks::Status(404)));
+    f.broken.push(Broken::new(
+        "GET /v1/invocations/b-gone/actions*",
+        Breaks::Status(404),
+    ));
     let (s, doc) = run_gated(&f, "gone");
     red_at(&s, name::FARM_FAILURES, "absent", "b-gone");
     assert_eq!(gate(&doc, name::FARM_FAILURES).measured, None);
@@ -701,7 +711,11 @@ fn a_document_that_cannot_be_started_stops_the_deploy_before_it_begins() {
         "{}",
         s.line()
     );
-    assert!(f.log.lock().unwrap().is_empty(), "{:?}", f.log.lock().unwrap());
+    assert!(
+        f.log.lock().unwrap().is_empty(),
+        "{:?}",
+        f.log.lock().unwrap()
+    );
 }
 
 // ---- where the gates read ----------------------------------------------------------
@@ -736,7 +750,9 @@ fn gate_reads_go_to_the_observed_frontend_and_update_calls_to_the_api() {
         seen.iter().all(on_api),
         "the observed frontend was asked: {seen:?}"
     );
-    assert!(f.requests("POST /v1/update/desired") == 1);
+    // The deploy orders the frontend update and nothing else: the new frontend offers the nodes.
+    assert_eq!(f.requests("POST /v1/update/frontend"), 1);
+    assert_eq!(f.requests("POST /v1/update/desired"), 0);
 }
 
 /// Proves a recorded build whose record stopped at its row bound is red for gate C (not
@@ -765,7 +781,11 @@ fn run_slots(f: &Farm, test: &str) -> (Summary, ResultDoc) {
     let mut o = opts(true);
     o.result = Some(path.clone());
     let s = run_observing(f, &o, SmokeResult::Pass, None, &SlotObs(f));
-    assert!(f.unknown.lock().unwrap().is_empty(), "{:?}", f.unknown.lock().unwrap());
+    assert!(
+        f.unknown.lock().unwrap().is_empty(),
+        "{:?}",
+        f.unknown.lock().unwrap()
+    );
     let doc = ResultDoc::from_bytes(&fs::read(&path).unwrap()).unwrap();
     (s, doc)
 }
@@ -792,7 +812,11 @@ fn the_gates_follow_the_serving_child_across_the_frontend_handover() {
     );
     // Slot B does not exist before the order: those attempts are refused, nothing else is.
     assert!(
-        f.refused.lock().unwrap().iter().all(|l| l.starts_with("slot b: ")),
+        f.refused
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|l| l.starts_with("slot b: ")),
         "{:?}",
         f.refused.lock().unwrap()
     );
@@ -827,7 +851,7 @@ fn a_draining_child_that_reports_untraced_relays_is_red_naming_it() {
     let mut f = farm(two_nodes());
     f.retiring_metrics = Some(Box::new(|t| {
         let mut g = healthy();
-        if t >= 205 {
+        if t >= SWITCH_AT + 10 {
             g.relay_untraced = Some(1.0);
         }
         Some(g.text())
@@ -848,7 +872,7 @@ fn a_draining_child_is_judged_on_lost_blobs_and_a_finished_one_is_not_required()
     let mut f = farm(two_nodes());
     f.retiring_metrics = Some(Box::new(|t| {
         let mut g = healthy();
-        if t >= 205 {
+        if t >= SWITCH_AT + 10 {
             g.lost_blobs = Some(2.0);
         }
         Some(g.text())
@@ -875,7 +899,7 @@ fn a_draining_child_is_judged_on_lost_blobs_and_a_finished_one_is_not_required()
 fn the_loss_counter_has_a_baseline_per_child() {
     let mut f = farm(two_nodes());
     script(&mut f, |t, g| {
-        if t >= 210 {
+        if t >= SWITCH_AT + 10 {
             g.losses_total = Some(0.0);
         }
     });
@@ -885,7 +909,7 @@ fn the_loss_counter_has_a_baseline_per_child() {
 
     let mut f = farm(two_nodes());
     script(&mut f, |t, g| {
-        if t >= 210 {
+        if t >= SWITCH_AT + 10 {
             g.losses_total = Some(4.0);
         }
     });

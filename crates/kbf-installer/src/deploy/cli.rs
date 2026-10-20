@@ -544,9 +544,7 @@ pub(super) fn run(
     };
     let timeout = CALL_TIMEOUT;
     // Nothing is read from it in a plan; the update API's address stands in.
-    let observe: Box<dyn Observe> = match parsed
-        .observe
-        .unwrap_or(Observed::Fixed(parsed.api.addr))
+    let observe: Box<dyn Observe> = match parsed.observe.unwrap_or(Observed::Fixed(parsed.api.addr))
     {
         Observed::Fixed(addr) => {
             if let Err(e) = observe::Http::new(addr, String::new(), timeout) {

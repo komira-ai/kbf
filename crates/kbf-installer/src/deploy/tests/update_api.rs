@@ -536,8 +536,8 @@ fn a_status_call_that_fails_is_repeated_and_one_that_cannot_be_read_stops_the_de
         if !readable {
             assert_eq!(s.reason, "api_error");
             assert!(s.detail.contains("not an update status"), "{}", s.detail);
-            // The preflight's read and the one that failed.
-            assert_eq!(f.requests("GET /v1/update/frontend"), 2);
+            // The preflight's read, the gates' look at the serving child, and the one that failed.
+            assert_eq!(f.requests("GET /v1/update/frontend"), 3);
         }
     }
     let mut f = farm(two_nodes());
@@ -611,8 +611,9 @@ fn a_frontend_that_already_runs_the_commit_goes_on_to_the_nodes() {
     assert_eq!(json["frontend"]["already_running"], true);
     assert_eq!(json["frontend"]["update_id"], Value::Null);
     assert_eq!(f.requests("POST /v1/update/frontend"), 1);
-    // Only the preflight asked for a status: there is no update to follow.
-    assert_eq!(f.requests("GET /v1/update/frontend"), 1);
+    // There is no update to follow. The preflight asked for a status, and the gates asked twice
+    // more which child serves (in the preflight and after the frontend step).
+    assert_eq!(f.requests("GET /v1/update/frontend"), 3);
     assert_eq!(s.nodes.len(), 2);
 
     let f = with_fate(FrontendFate::Refuses("same_commit"));
@@ -738,7 +739,8 @@ fn every_node_the_preflight_saw_is_waited_for_listed_or_not() {
         by,
         [("a-store", "confirmed", 80), ("b-mac", "confirmed", 200)]
     );
-    assert_eq!(f.now.get(), OFFER_AT + 300);
+    // One poll more than the last confirmation: gate E reads the farm repaired at the next look.
+    assert_eq!(f.now.get(), OFFER_AT + 300 + 5);
 
     // A node that never comes back to the new frontend.
     late.relisted_after = Some(1_000_000);

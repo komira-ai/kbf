@@ -12,30 +12,79 @@ use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::{Value, json};
 
 use super::cli::{self, FrontendConfig, Host, current_uid};
 use crate::testkit::{A, B};
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
 
 /// A listener that answers `GET`s from `answer(path)` as `(status, body)` and keeps the
 /// request lines it saw.
 struct Fake {
     addr: SocketAddr,
     seen: Arc<Mutex<Vec<String>>>,
+    /// The CA that vouches for the listener's certificate, when it speaks TLS (the update API
+    /// is TLS only; the observed frontend's operator port is plain HTTP).
+    ca: Option<String>,
 }
+
+/// The name the update API's test certificate carries.
+const API_NAME: &str = "farm.example";
 
 impl Fake {
     fn start(answer: impl Fn(&str) -> (u16, String) + Send + 'static) -> Fake {
         Fake::on(TcpListener::bind("127.0.0.1:0").unwrap(), answer)
     }
 
+    /// The same under TLS, as the update API is served.
+    fn start_tls(answer: impl Fn(&str) -> (u16, String) + Send + 'static) -> Fake {
+        let (ca, cert, key) = super::smoke_tests::pki(API_NAME);
+        let certs = CertificateDer::pem_slice_iter(cert.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut fake = Fake::serve(listener, Some(Arc::new(config)), answer);
+        fake.ca = Some(ca);
+        fake
+    }
+
     fn on(listener: TcpListener, answer: impl Fn(&str) -> (u16, String) + Send + 'static) -> Fake {
+        Fake::serve(listener, None, answer)
+    }
+
+    fn serve(
+        listener: TcpListener,
+        tls: Option<Arc<ServerConfig>>,
+        answer: impl Fn(&str) -> (u16, String) + Send + 'static,
+    ) -> Fake {
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&seen);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
+                let Ok(tcp) = stream else { return };
+                let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                let mut stream: Box<dyn ReadWrite> = match &tls {
+                    Some(config) => match ServerConnection::new(Arc::clone(config)) {
+                        Ok(conn) => Box::new(StreamOwned::new(conn, tcp)),
+                        Err(_) => continue,
+                    },
+                    None => Box::new(tcp),
+                };
                 let mut head = Vec::new();
                 let mut byte = [0u8; 1];
                 while !head.ends_with(b"\r\n\r\n") {
@@ -56,7 +105,27 @@ impl Fake {
                 );
             }
         });
-        Fake { addr, seen }
+        Fake {
+            addr,
+            seen,
+            ca: None,
+        }
+    }
+
+    /// The flags that tell the deploy how to verify this listener's certificate, with the CA
+    /// written under `dir`; none for a plain listener.
+    fn trust_flags(&self, dir: &std::path::Path) -> Vec<String> {
+        let Some(ca) = &self.ca else {
+            return Vec::new();
+        };
+        let file = dir.join("api-ca.pem");
+        fs::write(&file, ca).unwrap();
+        vec![
+            "--api-ca".to_owned(),
+            file.to_str().unwrap().to_owned(),
+            "--api-server-name".to_owned(),
+            API_NAME.to_owned(),
+        ]
     }
 
     fn seen(&self) -> Vec<String> {
@@ -75,7 +144,7 @@ fn update_api() -> Fake {
 
 /// The same, whose frontend status names `serving` (`a` or `b`) as the serving slot.
 fn update_api_serving(serving: Option<&'static str>) -> Fake {
-    Fake::start(move |path| {
+    Fake::start_tls(move |path| {
         let body: Option<Value> = match path {
             "/v1/nodes" => Some(json!({"server": {"commit": &A[..12]}, "nodes": [{
                 "node_id": "n1", "connected": true, "placement": {"state": "serving"},
@@ -86,7 +155,8 @@ fn update_api_serving(serving: Option<&'static str>) -> Fake {
                 "components": [{"name": "kbf", "sha256": "x", "size": 1, "attested": true}]}]}]})),
             "/v1/update" => Some(json!({"desired": {"commit": B, "generation": 7},
                                         "frontend": {"order_id": 1, "state": "confirmed"}})),
-            "/v1/update/frontend" => Some(json!({"active_slot": serving})),
+            "/v1/update/frontend" => Some(json!({"active_slot": serving, "restart_pending": false,
+                                                "rollback_allowed": false})),
             _ => None,
         };
         body.map_or((404, "{}".to_owned()), |b| (200, b.to_string()))
@@ -135,6 +205,7 @@ fn run(name: &str, api: &Fake, observe_flags: &[String]) -> Run {
     ]
     .map(str::to_owned)
     .to_vec();
+    args.extend(api.trust_flags(&dir));
     args.extend(observe_flags.iter().cloned());
     let host = Host {
         root: true,
@@ -241,7 +312,7 @@ fn signal_child_entry() {
         return;
     };
     let marker = dir.join("started");
-    let api = Fake::start(move |_| {
+    let api = Fake::start_tls(move |_| {
         let _ = fs::write(&marker, b"x");
         std::thread::sleep(std::time::Duration::from_secs(120));
         (404, "{}".to_owned())
@@ -268,6 +339,8 @@ fn signal_child_entry() {
     ]
     .map(str::to_owned)
     .to_vec();
+    let mut args = args;
+    args.extend(api.trust_flags(&dir));
     let host = Host {
         root: true,
         config_owner: current_uid(),

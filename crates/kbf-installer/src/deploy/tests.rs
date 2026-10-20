@@ -851,13 +851,15 @@ impl Operator for Child<'_> {
         if !self.farm.child_alive(self.slot) {
             self.farm
                 .refused
-                .lock().unwrap()
+                .lock()
+                .unwrap()
                 .push(format!("{}: {} {}", self.slot, r.method, r.path));
             return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
         }
         self.farm
             .child_reads
-            .lock().unwrap()
+            .lock()
+            .unwrap()
             .push((self.slot, self.farm.frontend_at.lock().unwrap().is_some()));
         // The child that handed over reports its own series, not the farm's script.
         let retiring = self.slot != self.farm.serving_child();
