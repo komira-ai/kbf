@@ -93,20 +93,22 @@ pub fn child_admin(
     table: UpstreamTable,
     token_file: PathBuf,
 ) -> Result<Admin, String> {
-    let secret = secret_headers(
+    let loopback = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    secret_headers(
         handle
             .admin_headers()
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_bytes())),
-    )?;
-    let loopback = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    Ok(Admin::new(
-        move |slot| loopback(table.admin_port(gate_slot(slot))),
-        move |slot| loopback(table.port(gate_slot(slot), Target::Operator)),
-        secret,
-        move || std::fs::read(&token_file),
-        Deadlines::frontend(),
-    ))
+    )
+    .map(|secret| {
+        Admin::new(
+            move |slot| loopback(table.admin_port(gate_slot(slot))),
+            move |slot| loopback(table.port(gate_slot(slot), Target::Operator)),
+            secret,
+            move || std::fs::read(&token_file),
+            Deadlines::frontend(),
+        )
+    })
 }
 
 /// The proxy's secret headers as the child client sends them.
