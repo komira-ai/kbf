@@ -202,13 +202,21 @@ async fn no_index_row_names_an_object_that_was_never_written() {
     failing.objects.put_attempted().await;
     a.stop().await;
     assert_eq!(failing.objects.puts(), 0);
-    for prefix in ["ui/ichunk/", "ui/invid/", "ui/stream/"] {
+    for prefix in ["ui/ichunk/", "ui/stream/"] {
         assert!(
             failing.rows(prefix).is_empty(),
             "{prefix}: {:?}",
             failing.rows(prefix)
         );
     }
+    // The stop came after the writer's cut, so the close found nothing building and
+    // wrote the header row (a closed invocation gets no later chunk to carry it). The
+    // header counts the run it holds and names no chunk: it does not claim a write.
+    // (A close before the cut leaves no header: the failed chunk would carry it. The
+    // test cannot say which order a server's stop takes without this wait.)
+    assert_eq!(failing.rows("ui/invid/").len(), 1, "one writer, one header");
+    let header = failing.header("never");
+    assert_eq!((header.runs, header.chunks), (1, 0), "{header:?}");
     let b = failing.start(PAGES_ONLY);
     assert_eq!(b.get("/v1/invocations/never").await.code, 404);
     b.stop().await;
