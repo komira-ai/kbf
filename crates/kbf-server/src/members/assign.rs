@@ -164,11 +164,7 @@ impl Members {
             .ok()
             .ok_or(MembershipError::Contended)?;
         let boot = lifted.counters.last().copied().unwrap_or(boot);
-        tracing::info!(
-            member = id.0,
-            boot,
-            "boot counter raised above the node's log"
-        );
+        tracing::info!(member = id.0, boot, "boot raised above the log's");
         Ok((id, boot))
     }
 }
