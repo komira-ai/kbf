@@ -134,9 +134,10 @@ pub struct SetupArgs {
     #[arg(long)]
     pub no_start: bool,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
-    /// host root. The same flag, with the same meaning, as on `run`.
-    #[arg(long, default_value = "/etc/kbf/installer.toml", value_parser = kbf_host::HostPath::new)]
-    pub installer_config: kbf_host::HostPath,
+    /// host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which
+    /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.
+    #[arg(long, value_parser = kbf_host::HostPath::new)]
+    pub installer_config: Option<kbf_host::HostPath>,
 }
 
 #[derive(Args)]
@@ -238,7 +239,7 @@ pub struct RunArgs {
     /// installer.toml, under the host root: its `database` key is the state database the
     /// installer migrates to what a release needs before that release is activated. Required
     /// when the unit restarted after a swap is a frontend's or the all-in-one's, unless the
-    /// unit comes from kbf.toml's mode (no --unit): then /etc/kbf/installer.toml is the default.
+    /// unit comes from kbf.toml's mode (no --unit): then the host's installer.toml (/etc/kbf, /usr/local/etc/kbf on a Mac) is the default.
     #[arg(long, value_parser = kbf_host::HostPath::new)]
     pub installer_config: Option<kbf_host::HostPath>,
 }
@@ -283,9 +284,10 @@ pub struct MigrateArgs {
 
 #[derive(Args)]
 pub struct ProxyArgs {
-    /// The installer.toml whose `[proxy]` table configures the proxy.
-    #[arg(long, default_value = "/etc/kbf/installer.toml")]
-    pub config: std::path::PathBuf,
+    /// The installer.toml whose `[proxy]` table configures the proxy (default: the platform's,
+    /// `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac).
+    #[arg(long)]
+    pub config: Option<std::path::PathBuf>,
     /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
     #[arg(long)]
     pub check: bool,

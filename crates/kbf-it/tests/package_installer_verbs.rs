@@ -124,9 +124,7 @@ fn plist_problems(plist: &str) -> Vec<String> {
         ));
     }
     // Catches a gate the layout does not read: the job would wait for a file nothing writes.
-    let config = layout(Platform::MacOs).kbf_toml();
-    let dir = Path::new(config.as_str()).parent().expect("a directory");
-    let gate = format!("<key>{}/installer.toml</key>", dir.display());
+    let gate = format!("<key>{}</key>", layout(Platform::MacOs).installer_toml());
     if !plist.contains(&gate) {
         found.push(format!("gate: KeepAlive is not gated on {gate}"));
     }

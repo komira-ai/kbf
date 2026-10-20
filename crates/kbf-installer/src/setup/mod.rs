@@ -4,8 +4,8 @@
 //! It validates its flags, then makes the host what they say: the fetch account (and for the
 //! modes that run actions, the `kbf` user's subid range and lingering), the installer's tree
 //! with its `orders/` directory, the enrollment token (node modes), the first operator token
-//! (frontend and all-in-one hosts, once), `/etc/kbf/installer.toml`, the first release
-//! (`--commit`), `/etc/kbf/kbf.toml`, and last the units enabled for the mode.
+//! (frontend and all-in-one hosts, once), `installer.toml`, the first release
+//! (`--commit`), `kbf.toml` (both in `/etc/kbf`, `/usr/local/etc/kbf` on a Mac), and last the units enabled for the mode.
 //!
 //! - It is root's: [`Os::euid`] is checked first, so only a fake that says 0 gets past it
 //!   without root. It refuses while the retired `kbf-helper`/`kbf-deploy` layout is on the
@@ -168,22 +168,21 @@ pub fn installer_settings(
     v: &Valid,
     platform: Platform,
 ) -> Result<InstallerToml, SetupError> {
-    let path = HostPath::new(paths::INSTALLER_TOML)?;
+    let installer_toml = paths::installer_toml(platform);
+    let path = HostPath::new(installer_toml)?;
     let mut settings = match exec.inspect(&path)? {
         None => InstallerToml::default(),
         Some(Entry::File { bytes, .. }) => {
             let text = String::from_utf8_lossy(&bytes);
             InstallerToml::parse(&text).map_err(|e| {
                 SetupError::NeedsOperator(format!(
-                    "{e}\nfix {} or remove it, then run setup again",
-                    paths::INSTALLER_TOML
+                    "{e}\nfix {installer_toml} or remove it, then run setup again"
                 ))
             })?
         }
         Some(_) => {
             return Err(SetupError::NeedsOperator(format!(
-                "{} is not a regular file",
-                paths::INSTALLER_TOML
+                "{installer_toml} is not a regular file"
             )));
         }
     };
@@ -191,8 +190,7 @@ pub fn installer_settings(
         if floor < settings.min_generation {
             return Err(SetupError::NeedsOperator(format!(
                 "--min-generation {floor} is below the {} in {}: a floor only goes up; lower it by editing the file",
-                settings.min_generation,
-                paths::INSTALLER_TOML
+                settings.min_generation, installer_toml
             )));
         }
         settings.min_generation = floor;
@@ -303,7 +301,7 @@ pub fn run(
     if options.apply {
         os.trusted_binary()?;
     }
-    let valid = raw.validate().map_err(SetupError::Invalid)?;
+    let valid = raw.validate(os.platform()).map_err(SetupError::Invalid)?;
     let ctx = plan::context(os, valid.mode)?;
     refuse_old_layout(&*exec, ctx.platform)?;
     if ctx.platform == Platform::Linux {
@@ -380,7 +378,7 @@ pub fn cli(
         min_generation: args.min_generation,
         commit: args.commit.clone(),
         database: args.database.clone(),
-        installer_config: args.installer_config.to_string(),
+        installer_config: args.installer_config.as_ref().map(ToString::to_string),
     };
     let options = Options {
         apply,

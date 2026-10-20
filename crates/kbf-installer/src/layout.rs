@@ -16,7 +16,8 @@
 //!   gh, trusted_root.jsonl, installer.conf
 //! ```
 //!
-//! macOS differs in four paths ([`Platform`]): the installer tree is root's
+//! macOS differs in these paths ([`Platform`]): the configuration directory is
+//! `/usr/local/etc/kbf` (`kbf.toml`, `installer.toml`, the tokens), the installer tree is root's
 //! `/usr/local/kbf-installer` (never a user-owned Homebrew prefix), the state is in
 //! `/var/db/kbf-installer` (with `work/`), the lock is `/var/run/kbf-installer/lock`, and the
 //! trust directory is `/usr/local/kbf-installer/trust` (the pkg's PREFIX/trust).
@@ -43,10 +44,19 @@ const LINUX_LOCK: &str = "/run/kbf-installer/lock";
 const MACOS_LOCK: &str = "/var/run/kbf-installer/lock";
 const LINUX_TRUST: &str = "/usr/share/kbf-installer/trust";
 const MACOS_TRUST: &str = "/usr/local/kbf-installer/trust";
-/// The node's own configuration (`kbf.toml`): `/etc/kbf` on Linux, `/usr/local/etc/kbf` on
-/// macOS, where `installer.toml` is too.
+/// The configuration directory, and the files `setup` keeps in it: `/etc/kbf` on Linux,
+/// `/usr/local/etc/kbf` on macOS (the launchd gate of the installer's job waits on the
+/// `installer.toml` there).
+const LINUX_CONFIG_DIR: &str = "/etc/kbf";
+const MACOS_CONFIG_DIR: &str = "/usr/local/etc/kbf";
 const LINUX_CONFIG: &str = "/etc/kbf/kbf.toml";
 const MACOS_CONFIG: &str = "/usr/local/etc/kbf/kbf.toml";
+const LINUX_INSTALLER_TOML: &str = "/etc/kbf/installer.toml";
+const MACOS_INSTALLER_TOML: &str = "/usr/local/etc/kbf/installer.toml";
+const LINUX_ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
+const MACOS_ENROLL_TOKEN: &str = "/usr/local/etc/kbf/enroll.token";
+const LINUX_API_TOKEN: &str = "/etc/kbf/api-token";
+const MACOS_API_TOKEN: &str = "/usr/local/etc/kbf/api-token";
 
 /// The files of the trust directory.
 pub const GH: &str = "gh";
@@ -129,10 +139,43 @@ impl Platform {
         }
     }
 
-    fn kbf_toml(self) -> &'static str {
+    /// kbf's configuration directory.
+    pub fn config_dir(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_CONFIG_DIR,
+            Platform::MacOs => MACOS_CONFIG_DIR,
+        }
+    }
+
+    /// The node's `kbf.toml`.
+    pub fn kbf_toml(self) -> &'static str {
         match self {
             Platform::Linux => LINUX_CONFIG,
             Platform::MacOs => MACOS_CONFIG,
+        }
+    }
+
+    /// The installer's settings, `installer.toml`.
+    pub fn installer_toml(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_INSTALLER_TOML,
+            Platform::MacOs => MACOS_INSTALLER_TOML,
+        }
+    }
+
+    /// The enrollment token `setup` places.
+    pub fn enroll_token(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_ENROLL_TOKEN,
+            Platform::MacOs => MACOS_ENROLL_TOKEN,
+        }
+    }
+
+    /// The first operator token.
+    pub fn api_token(self) -> &'static str {
+        match self {
+            Platform::Linux => LINUX_API_TOKEN,
+            Platform::MacOs => MACOS_API_TOKEN,
         }
     }
 
@@ -263,6 +306,26 @@ impl Layout {
     /// The node's own `kbf.toml`: its `mode` says what this host runs.
     pub fn kbf_toml(&self) -> HostPath {
         path(self.platform.kbf_toml())
+    }
+
+    /// kbf's configuration directory.
+    pub fn config_dir(&self) -> HostPath {
+        path(self.platform.config_dir())
+    }
+
+    /// The installer's settings: the file the launchd gate waits on, on a Mac.
+    pub fn installer_toml(&self) -> HostPath {
+        path(self.platform.installer_toml())
+    }
+
+    /// The enrollment token `setup` places.
+    pub fn enroll_token(&self) -> HostPath {
+        path(self.platform.enroll_token())
+    }
+
+    /// The first operator token.
+    pub fn api_token(&self) -> HostPath {
+        path(self.platform.api_token())
     }
 
     /// The directory of what offline verification trusts.

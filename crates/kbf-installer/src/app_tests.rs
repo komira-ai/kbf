@@ -117,7 +117,7 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
     // Not a mutating verb: it has no dry run to leave out.
     assert!(
         !Verb::Proxy(ProxyArgs {
-            config: file,
+            config: Some(file),
             check: true
         })
         .needs_root()
