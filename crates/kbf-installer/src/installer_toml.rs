@@ -12,6 +12,7 @@
 
 use std::path::PathBuf;
 
+use kbf_proxy::config::ProxyConfig;
 use serde::Deserialize;
 
 /// The largest file read.
@@ -38,6 +39,9 @@ struct Raw {
     min_activation_interval_s: Option<u32>,
     node_cert: Option<String>,
     node_key: Option<String>,
+    /// The proxy's table, checked by `kbf_proxy::config::ProxyConfig::from_value`; its own
+    /// keys are closed the same way.
+    proxy: Option<toml::Value>,
     database: Option<String>,
 }
 
@@ -65,6 +69,9 @@ pub struct InstallerToml {
     /// The node identity the fetch child is lent, for the frontend source.
     pub node_cert: Option<PathBuf>,
     pub node_key: Option<PathBuf>,
+    /// The `[proxy]` table, read by `kbf-installer proxy`. `setup` does not write it (the
+    /// operator does), so [`InstallerToml::render`] leaves it out.
+    pub proxy: Option<ProxyConfig>,
     /// The state database of a frontend or all-in-one host: a `postgres://` URL without a
     /// password (the file is world-readable). `crate::database` reads this file a second time,
     /// leniently (only this key, and it refuses a password); this field exists so that the
@@ -86,6 +93,7 @@ impl Default for InstallerToml {
             min_activation_interval_s: 60,
             node_cert: None,
             node_key: None,
+            proxy: None,
             database: None,
         }
     }
@@ -325,6 +333,11 @@ impl InstallerToml {
             problems
                 .push("node_cert and node_key are for release_source = \"frontend\"".to_owned());
         }
+        let proxy = raw.proxy.and_then(|table| {
+            ProxyConfig::from_value(table)
+                .map_err(|e| problems.push(format!("proxy: {e}")))
+                .ok()
+        });
         match source {
             Some(source) if problems.is_empty() => Ok(InstallerToml {
                 source,
@@ -338,13 +351,16 @@ impl InstallerToml {
                 min_activation_interval_s,
                 node_cert,
                 node_key,
+                proxy,
                 database: raw.database,
             }),
             _ => Err(ConfigError::Invalid(problems)),
         }
     }
 
-    /// The canonical text: every key in a fixed order, the unset optional ones left out.
+    /// The canonical text: every key in a fixed order, the unset optional ones left out. The
+    /// `[proxy]` table is not written: it is the operator's, and a caller that rewrites a
+    /// file keeps it.
     pub fn render(&self) -> String {
         let mut out = String::new();
         match &self.source {
