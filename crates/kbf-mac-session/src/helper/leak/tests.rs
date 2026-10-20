@@ -351,11 +351,11 @@ fn an_unreadable_file_is_an_error() {
     let dir = rig.dir.clone();
     rig.host.state().on_command = Some(Box::new(move |command: &str| {
         if command.starts_with("/usr/bin/defaults read") {
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
         }
     }));
     let report = rig.helper.scan().unwrap();
-    std::fs::set_permissions(&rig.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(rig.dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
         report
             .errors

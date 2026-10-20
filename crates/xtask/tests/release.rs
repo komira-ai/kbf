@@ -7,6 +7,7 @@ use std::process::Command;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use kbf_testkit::dir::TestDir;
 use sha2::Digest;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -29,13 +30,11 @@ const ARTIFACTS: [&str; 6] = [
 
 /// An empty directory of its own for one test, holding the fake as `gh/gh` and an
 /// empty `tmp/`.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-release")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
+fn scratch(name: &str) -> TestDir {
+    let dir = TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-release"),
+        name,
+    );
     std::fs::create_dir_all(dir.join("gh")).expect("scratch");
     std::fs::create_dir_all(dir.join("tmp")).expect("tmp");
     std::fs::hard_link(FAKE, dir.join("gh/gh")).expect("link the fake as gh");
