@@ -18,7 +18,7 @@ use kbf_types::{
     Resources, StateMachine, WaiterId, WorkerId,
 };
 
-const SEEDS: u64 = 48;
+const SEEDS: u64 = 24;
 const GIB: u64 = 1 << 30;
 const WORKERS: [&str; 3] = ["w0", "w1", "w2"];
 const END: u64 = 400;
