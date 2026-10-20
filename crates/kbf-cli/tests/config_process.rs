@@ -557,7 +557,7 @@ fn a_start_with_a_bad_file_exits_2_and_makes_nothing() {
 /// Catches a `kbf.toml` that `kbf-installer setup` writes and `kbf` does not accept. The five
 /// files the installer's tests pin (`kbf-installer/tests/golden/kbf_toml`, one per mode) are
 /// put under a scratch directory with the certificates, keys and token they name, and `kbf
-/// --mode=<mode> --config <file> --check` must exit 0 and print `ok`: a key `kbf` does not
+/// --mode=<mode> --config <file> --check` must exit 0 and print `ok` (a node that enrolls says it is configured and not enrolled yet): a key `kbf` does not
 /// have, a key in the wrong table, a required flag the file lacks, a certificate of the wrong
 /// role and a private key of the wrong mode each fail it (`--check` reads the same flags a
 /// start does and starts nothing).
@@ -616,11 +616,25 @@ fn the_kbf_toml_that_setup_writes_passes_check_in_every_mode() {
             "--check".to_owned(),
             format!("--config={}", file.display()),
         ];
-        if [names::DAEMON, names::STORAGE_AND_DAEMON, names::ALL_IN_ONE].contains(&mode.name) {
+        // The stand-in `crun` for the one mode that runs builds without enrolling; a daemon flag on
+        // the line of a node that enrolls would make it a node that does not.
+        if mode.name == names::ALL_IN_ONE {
             args.push(format!("--oci-runtime={FAKE_CRUN}"));
         }
         let r = run_in(&args, &host_env(&dir));
         assert_eq!(r.code, Some(0), "{}: {}\n{text}", mode.name, r.err);
-        assert_eq!(r.out, format!("kbf {}: ok\n", mode.name), "{}", mode.name);
+        let enrolls =
+            [names::DAEMON, names::STORAGE, names::STORAGE_AND_DAEMON].contains(&mode.name);
+        // A node that enrolls says so instead of `ok`: the file is accepted, the host is not
+        // enrolled yet.
+        if enrolls {
+            let want = format!(
+                "mode {} is configured; this node is not enrolled yet",
+                mode.name
+            );
+            assert!(r.out.contains(&want), "{}: {}", mode.name, r.out);
+        } else {
+            assert_eq!(r.out, format!("kbf {}: ok\n", mode.name), "{}", mode.name);
+        }
     }
 }

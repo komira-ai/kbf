@@ -26,6 +26,7 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use runc::error::Error;
@@ -208,9 +209,12 @@ impl Crun {
         let state = state_dir(lease);
         let deleted = self.blocking(&state, &["delete", "--force", id], "delete");
         // A `crun run` killed with its container (a sweep's case) deletes its own state as
-        // it exits, and a `crun delete` that lost that race fails on the directory it
-        // listed: with the state gone there is nothing left to delete.
-        if deleted.is_err() && !state.join(id).exists() {
+        // it exits, and a `crun delete` that lost that race fails on what it listed or
+        // loaded (the directory, or the `config.json` the other removed first, with the
+        // directory itself still there for a moment): once the state is gone there is
+        // nothing left to delete. The state of a delete that failed for another reason
+        // stays, and that failure is returned after the wait.
+        if deleted.is_err() && wait_gone(&state.join(id), STATE_REMOVAL_WAIT) {
             return Ok(());
         }
         deleted
@@ -252,6 +256,25 @@ impl Crun {
     /// The words for a client `crun` could not be found for.
     fn refused(&self, error: &Error) -> String {
         format!("crun {}: {error}", self.program.display())
+    }
+}
+
+/// How long a failed `crun delete` waits for the container's state to be removed by
+/// the `crun run` that owns it. That run is removing it already; the wait ends the moment
+/// the directory is gone.
+const STATE_REMOVAL_WAIT: Duration = Duration::from_secs(3);
+
+/// Whether `path` is gone, polling until `limit` has passed.
+fn wait_gone(path: &Path, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if !path.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
