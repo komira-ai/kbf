@@ -83,7 +83,7 @@ use kbf_host::Mode;
 pub use apply::migrate;
 pub use error::MigrateError;
 pub use floor::{FrontendFloor, NoFrontend, Seed, Source};
-pub use rollback::rollback;
+pub use rollback::{rollback, rollback_at};
 pub use roots::Roots;
 pub use units::{Unit, retired_name};
 
@@ -222,6 +222,9 @@ pub fn standing(layout: &Layout, owner_uid: u32) -> Result<Vec<Unit>, MigrateErr
         .flatten();
     if let Some(journal) = journal.as_ref().filter(|j| j.phase == journal::Phase::Done) {
         return Ok(journal.units.clone());
+    }
+    if let Some(journal) = &journal {
+        rollback::refuse_if_installer_moved_aside(layout, journal)?;
     }
     let resume = journal.as_ref().is_some_and(journal::Journal::kit_begun);
     match old::read(layout, &roots, &rules, resume)? {

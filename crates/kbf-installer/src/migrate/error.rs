@@ -62,6 +62,13 @@ pub enum MigrateError {
         "this host still has the old layout's state ({0}) and is not migrated: run `kbf-installer migrate --apply` first"
     )]
     Unmigrated(String),
+    /// A kit host was rolled back and the installer's tree was moved aside with it: what is
+    /// asked of the installer cannot be done from here, and the next step is the package.
+    #[error(
+        "this Mac was rolled back to the Mac kit and the installer's tree was moved aside: \
+         reinstall the kbf-installer .pkg to hand the host to the installer again"
+    )]
+    KitRolledBack,
     /// A rollback that would throw away what the installer did since.
     #[error("cannot roll back: {0}")]
     MovedOn(String),
@@ -102,6 +109,7 @@ impl MigrateError {
             | MigrateError::FloorUnavailable(_)
             | MigrateError::Conflict(_)
             | MigrateError::Unmigrated(_)
+            | MigrateError::KitRolledBack
             | MigrateError::MovedOn(_)
             | MigrateError::NoJournal => Exit::NeedsOperator,
             // The old tools' lock or the installer's, held past the wait: ask again.

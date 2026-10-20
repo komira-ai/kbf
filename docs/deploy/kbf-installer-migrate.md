@@ -91,6 +91,18 @@ busy (exit 4), and decides from what it reads under them: a release the installe
 rollback waited is seen and refuses it, a rollback another run finished meanwhile is reported as done,
 and the installer is stopped with its lock held, so it writes no state while the old layout comes back.
 
+A Mac the Mac kit installed (`journal.kit`) is rolled back differently, because the kit refuses to
+manage a Mac while `/usr/local/kbf-installer` exists and two owners of one host is what this verb
+exists to prevent: nothing of the installer may be able to act afterwards. Once the kit's plist and
+job are back, the rollback boots out and disables `system/com.komira.kbf-installer`, moves
+`/usr/local/etc/kbf/installer.toml` aside (the installer job's `KeepAlive` is gated on that path), and
+moves `/usr/local/kbf-installer` aside, both under one suffix `.rolled-back-<UTC YYYYmmddTHHMMSSZ>`
+chosen once and kept in the journal (`aside`), so a run that died part way finishes with the same
+name. A dated name that is taken is refused (exit 5) and nothing is replaced. `/var/db/kbf-installer`,
+the journal, stays. Re-adopting means reinstalling the kbf-installer `.pkg`; until a tree is there
+again `migrate --apply` and `setup` refuse (exit 5) and say so. The old-host rollback above is
+unchanged and keeps the tree.
+
 Not done by the migration: `installer.toml` (the `min_generation` to put there is printed as the
 report's value; `setup` writes the file), the users, and the `orders/` directory (`setup`).
 

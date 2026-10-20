@@ -407,6 +407,18 @@ pub fn replace_file(
     rustix::fs::fsync(dir).at(name)
 }
 
+/// Whether `dir` holds an entry `name` (a link counts, and is not followed).
+pub fn holds(dir: &OwnedFd, name: &str) -> io::Result<bool> {
+    Ok(absent(rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW))?.is_some())
+}
+
+/// Rename the entry `from` of `dir` to `to` in the same directory and sync the directory.
+/// The caller has seen that `to` is not there (this would replace it).
+pub fn rename_within(dir: &OwnedFd, from: &str, to: &str) -> io::Result<()> {
+    rustix::fs::renameat(dir, from, dir, to)?;
+    Ok(rustix::fs::fsync(dir)?)
+}
+
 /// Remove the entry `name` of `parent` and everything below it, never through a link (a
 /// link is removed, not followed). A tree nested deeper than `MAX_DEPTH` is an error.
 pub fn remove_tree(parent: &OwnedFd, name: &str) -> io::Result<()> {
