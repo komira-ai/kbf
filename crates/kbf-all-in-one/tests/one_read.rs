@@ -47,7 +47,7 @@ async fn plane(dir: &Path, tier: bool) -> Arc<LocalDataPlane> {
 
 /// [`plane`], with the cold store's free-space floor `floor` bytes (the server's
 /// test-only `--cold-store-floor-bytes`) in place of 5% of its disk, at least 1 GiB.
-async fn plane_with_floor(dir: &Path, tier: bool, _floor: Option<u64>) -> Arc<LocalDataPlane> {
+async fn plane_with_floor(dir: &Path, tier: bool, floor: Option<u64>) -> Arc<LocalDataPlane> {
     let n = STARTED.fetch_add(1, Ordering::SeqCst);
     let mut argv = vec![
         "kbf-server".to_owned(),
@@ -58,6 +58,9 @@ async fn plane_with_floor(dir: &Path, tier: bool, _floor: Option<u64>) -> Arc<Lo
             dir.join(format!("cold-{n}")).display()
         ),
     ];
+    if let Some(floor) = floor {
+        argv.push(format!("--cold-store-floor-bytes={floor}"));
+    }
     if tier {
         argv.push(format!(
             "--hot-store=file://{}",
