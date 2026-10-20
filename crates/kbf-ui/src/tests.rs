@@ -63,6 +63,11 @@ impl Fake {
     pub(crate) fn seen(&self) -> Vec<String> {
         self.seen.lock().expect("not poisoned").clone()
     }
+
+    /// Forgets the URLs asked so far.
+    pub(crate) fn forget_seen(&self) {
+        self.seen.lock().expect("not poisoned").clear();
+    }
 }
 
 impl Source for Fake {

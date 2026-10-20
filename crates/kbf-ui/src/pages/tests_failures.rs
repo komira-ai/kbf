@@ -328,6 +328,19 @@ fn the_failures_page_of_an_action_is_the_one_named_or_a_bounded_search() {
         html.contains("lists no such action in the 5 page(s) read; the list goes on"),
         "{html}"
     );
+
+    // A named page is the only one read, however long the list goes on after it.
+    fake.forget_seen();
+    let (status, html) = page(
+        &fake,
+        &format!("{}?failures_token=p1", action_path(&target)),
+    );
+    assert_eq!(status, 200, "{html}");
+    assert_eq!(fake.seen().len(), 2, "{:?}", fake.seen());
+    assert!(
+        html.contains("lists no such action in the 1 page(s) read; the list goes on"),
+        "{html}"
+    );
 }
 
 /// Catches: a failed action whose failure class, command or tail is not available shown
