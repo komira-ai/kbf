@@ -14,5 +14,8 @@ rustix = { workspace = true, features = ["fs"] }
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+kbf-testkit.workspace = true
+
 [lints]
 workspace = true

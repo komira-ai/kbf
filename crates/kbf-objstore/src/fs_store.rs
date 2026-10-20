@@ -917,8 +917,7 @@ mod tests {
     /// and a listing that ended keeps nothing for the next.
     #[tokio::test]
     async fn a_paged_listing_reads_the_headers_once() {
-        let dir = std::env::temp_dir().join(format!("kbf-objstore-walks.{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-objstore-walks");
         let store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
         for i in 0..7 {
             for p in ["a", "b"] {
@@ -966,7 +965,6 @@ mod tests {
         assert_eq!(keys, ["b/0", "b/1"]);
         assert_eq!(walks(), 6);
         drop(store);
-        fs::remove_dir_all(&dir).expect("remove");
     }
 
     /// Catches a listing that keeps every key under its prefix (memory growing with the
@@ -977,8 +975,7 @@ mod tests {
     /// a shard directory that is not an object is skipped by every walk.
     #[tokio::test]
     async fn a_listing_longer_than_its_window_keeps_one_window_at_a_time() {
-        let dir = std::env::temp_dir().join(format!("kbf-objstore-window.{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-objstore-window");
         let mut store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
         Arc::get_mut(&mut store.inner).expect("one handle").window = 3;
         for i in 0..7 {
@@ -1013,7 +1010,6 @@ mod tests {
         assert_eq!(store.inner.walks.load(Ordering::Relaxed), 3);
         assert!(store.inner.listing.lock().expect("lock").is_none());
         drop(store);
-        fs::remove_dir_all(&dir).expect("remove");
     }
 
     /// Catches a fresh listing [`ListToken::after`] a key that walks from the start of
@@ -1023,8 +1019,7 @@ mod tests {
     /// the listing is exactly the keys after it, in order.
     #[tokio::test]
     async fn a_file_store_listing_resumed_past_its_window_lists_only_the_rest() {
-        let dir = std::env::temp_dir().join(format!("kbf-objstore-resume.{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = kbf_testkit::dir::TestDir::under(std::env::temp_dir(), "kbf-objstore-resume");
         let mut store = FsStore::open(&dir, Floor::Bytes(1)).expect("open");
         Arc::get_mut(&mut store.inner).expect("one handle").window = 3;
         for i in 0..9 {
@@ -1054,6 +1049,5 @@ mod tests {
             }
         }
         drop(store);
-        fs::remove_dir_all(&dir).expect("remove");
     }
 }

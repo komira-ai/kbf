@@ -5,7 +5,7 @@
 
 use std::future::pending;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
@@ -295,10 +295,10 @@ async fn within<T>(what: &str, wait: impl std::future::Future<Output = T>) -> T 
 }
 
 /// A scratch directory of its own for `name`, empty.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-rebuild-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// The path is not made, and the value removes its directory when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestChild {
+    kbf_testkit::dir::TestDir::under(std::env::temp_dir(), &format!("kbf-rebuild-{name}"))
+        .into_child("d")
 }
 
 /// Pages of two objects and batches of two, so a rebuild of a few objects is several

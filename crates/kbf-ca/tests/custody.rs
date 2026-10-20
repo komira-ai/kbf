@@ -30,8 +30,9 @@ fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-fn init(name: &str) -> (std::path::PathBuf, Authority) {
-    let dir = scratch(name).join("ca");
+/// A CA made in `<scratch>/ca`; the path keeps the scratch directory alive.
+fn init(name: &str) -> (kbf_testkit::dir::TestChild, Authority) {
+    let dir = scratch(name).into_child("ca");
     let ca = Authority::init_dir(&dir, Policy::default(), NOW, &mut Stream(4)).expect("init");
     (dir, ca)
 }
@@ -98,7 +99,8 @@ fn init_overwrites_nothing_and_refuses_an_open_directory() {
         ca.pin()
     );
 
-    let open = scratch("open").join("ca");
+    let open_root = scratch("open");
+    let open = open_root.join("ca");
     fs::create_dir(&open).expect("dir");
     chmod(&open, 0o755);
     let result = Authority::init_dir(&open, Policy::default(), NOW, &mut Stream(4));
@@ -108,12 +110,14 @@ fn init_overwrites_nothing_and_refuses_an_open_directory() {
         "nothing is written into an open directory"
     );
 
-    let closed = scratch("closed").join("ca");
+    let closed_root = scratch("closed");
+    let closed = closed_root.join("ca");
     fs::create_dir(&closed).expect("dir");
     chmod(&closed, 0o700);
     assert!(Authority::init_dir(&closed, Policy::default(), NOW, &mut Stream(4)).is_ok());
 
-    let missing_parent = scratch("orphan").join("nowhere").join("ca");
+    let orphan_root = scratch("orphan");
+    let missing_parent = orphan_root.join("nowhere").join("ca");
     let result = Authority::init_dir(&missing_parent, Policy::default(), NOW, &mut Stream(4));
     assert_eq!(key_fault(result), KeyFileFault::Io(ErrorKind::NotFound));
 }
@@ -122,7 +126,8 @@ fn init_overwrites_nothing_and_refuses_an_open_directory() {
 // stored, in a closed file in a closed directory.
 #[test]
 fn create_in_stores_the_key_it_returns() {
-    let dir = scratch("create-in").join("ca");
+    let root = scratch("create-in");
+    let dir = root.join("ca");
     let signer = FileSigner::create_in(&dir).expect("created");
     assert_eq!(mode(&dir), 0o700);
     assert_eq!(mode(&dir.join("ca.key")), 0o600);

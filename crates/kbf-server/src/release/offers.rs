@@ -251,8 +251,6 @@ async fn push(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use axum::body::Bytes;
     use kbf_proto::worker::ServerMessage;
     use kbf_state::ManualClock;
@@ -269,10 +267,9 @@ mod tests {
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kbf-offers-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        dir
+    /// A scratch directory of the test's own, removed when it drops.
+    fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+        kbf_testkit::dir::TestDir::under(std::env::temp_dir(), &format!("kbf-offers-{name}"))
     }
 
     fn rows() -> Rows {
@@ -280,8 +277,11 @@ mod tests {
         Rows::new(Arc::new(Fake::with_flaw(clock, Flaw::None)) as Arc<dyn Store>)
     }
 
-    fn store(name: &str) -> Arc<ReleaseStore> {
-        Arc::new(ReleaseStore::open(&scratch(name), Limits::default()).expect("a store"))
+    /// A store over a scratch directory, which the caller keeps for as long as the store.
+    fn store(name: &str) -> (Arc<ReleaseStore>, kbf_testkit::dir::TestDir) {
+        let dir = scratch(name);
+        let store = Arc::new(ReleaseStore::open(&dir, Limits::default()).expect("a store"));
+        (store, dir)
     }
 
     /// Catches a platform read from the wrong report entry, a pair no release is built for
@@ -309,9 +309,11 @@ mod tests {
     async fn offers_need_both_a_release_store_and_a_state_store() {
         let every = Duration::from_secs(1);
         assert!(offers_of(None, None, every).is_none());
-        assert!(offers_of(Some(store("half-a")), None, every).is_none());
+        let (half, _half_dir) = store("half-a");
+        assert!(offers_of(Some(half), None, every).is_none());
         assert!(offers_of(None, Some(rows()), every).is_none());
-        let both = offers_of(Some(store("both")), Some(rows()), every).expect("offers");
+        let (full, _full_dir) = store("both");
+        let both = offers_of(Some(full), Some(rows()), every).expect("offers");
         assert!(both.subscribe().borrow().is_empty());
     }
 
@@ -340,7 +342,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_poll_looks_and_ends_when_the_offers_are_dropped() {
         let every = Duration::from_secs(1);
-        let (store, rows) = (store("poll"), rows());
+        let ((store, _dir), rows) = (store("poll"), rows());
         linux_release(&store).await;
         rows.offer(&Release::new(COMMIT), FarmTime::from_millis(1))
             .expect("the row");

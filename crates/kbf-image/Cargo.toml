@@ -30,6 +30,7 @@ tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "time"] }
 tokio-rustls.workspace = true
 
 [dev-dependencies]
+kbf-testkit.workspace = true
 rcgen.workspace = true
 rustix = { workspace = true, features = ["process"] }
 rustls.workspace = true

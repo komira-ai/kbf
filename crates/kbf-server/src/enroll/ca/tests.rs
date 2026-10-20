@@ -36,7 +36,7 @@ fn bytes(dir: &Path, name: &str) -> Vec<u8> {
 /// writes the key with a loose mode.
 #[test]
 fn an_empty_ca_dir_makes_a_ca_and_a_filled_one_is_loaded_untouched() {
-    let dir = scratch("ca-dir");
+    let dir = scratch("ca-dir").into_child("ca");
     let made = open_dev(&dir, START).expect("made");
     assert_eq!(made.started(), Started::Created);
     let (key, root) = (bytes(&dir, "ca.key"), bytes(&dir, "ca.pem"));
@@ -70,7 +70,7 @@ fn a_directory_that_is_not_a_ca_is_refused_and_left_alone() {
     assert!(matches!(open_dev(&stray, START), Err(CaOpenError::Dir(_))));
     assert_eq!(std::fs::read_dir(&stray).expect("dir").count(), 1);
 
-    let source = scratch("ca-half-source");
+    let source = scratch("ca-half-source").into_child("ca");
     open_dev(&source, START).expect("made");
     let half = scratch("ca-half");
     std::fs::create_dir_all(&half).expect("dir");
@@ -88,7 +88,7 @@ fn a_directory_that_is_not_a_ca_is_refused_and_left_alone() {
 /// would refuse the frontend it is told to trust).
 #[test]
 fn the_pin_source_gives_the_roots_pin() {
-    let dir = scratch("ca-pin");
+    let dir = scratch("ca-pin").into_child("ca");
     let ca = Arc::new(open_dev(&dir, START).expect("ca"));
     let pins = CaPins(Arc::clone(&ca));
     assert_eq!(pins.pin().expect("pin"), ca.node().pin());
@@ -103,14 +103,15 @@ fn the_pin_source_gives_the_roots_pin() {
 /// frontend that cannot issue through the signer.
 #[test]
 fn an_external_signer_issues_and_the_frontend_holds_no_key() {
-    let dir = scratch("ca-external");
+    let dir = scratch("ca-external").into_child("ca");
     let (authority, _) =
         kbf_signer::ensure(&dir, policy(), START, &mut SystemEntropy).expect("ensure");
     let uid = rustix::process::geteuid().as_raw();
     let server = SignerServer::from_dir(&dir, uid, policy())
         .expect("server")
         .with_clock(|| START);
-    let socket = scratch("ca-external-sock").join("signer.sock");
+    let socket_dir = scratch("ca-ext-sock").into_child("s");
+    let socket = socket_dir.join("signer.sock");
     let listener = bind(&socket).expect("bind");
     std::thread::spawn(move || {
         let _ = server.serve(&listener);
@@ -153,13 +154,14 @@ fn an_external_signer_issues_and_the_frontend_holds_no_key() {
 /// swapped `ca.pem` changing what the CA is.
 #[test]
 fn an_external_signer_needs_the_signers_root_and_makes_nothing() {
-    let dir = scratch("ca-external-bad");
+    let dir = scratch("ca-external-bad").into_child("ca");
     let (_, _) = kbf_signer::ensure(&dir, policy(), START, &mut SystemEntropy).expect("ensure");
     let uid = rustix::process::geteuid().as_raw();
     let server = SignerServer::from_dir(&dir, uid, policy())
         .expect("server")
         .with_clock(|| START);
-    let socket = scratch("ca-external-bad-sock").join("signer.sock");
+    let socket_dir = scratch("ca-ext-bad-sock").into_child("s");
+    let socket = socket_dir.join("signer.sock");
     let listener = bind(&socket).expect("bind");
     std::thread::spawn(move || {
         let _ = server.serve(&listener);
@@ -178,7 +180,7 @@ fn an_external_signer_needs_the_signers_root_and_makes_nothing() {
         "nothing was made"
     );
 
-    let other = scratch("ca-external-other");
+    let other = scratch("ca-external-other").into_child("ca");
     open_dev(&other, START).expect("another CA");
     let swapped = scratch("ca-external-swapped");
     std::fs::create_dir_all(&swapped).expect("dir");
@@ -194,7 +196,7 @@ fn an_external_signer_needs_the_signers_root_and_makes_nothing() {
 /// a log line.
 #[test]
 fn the_ca_debug_form_names_the_start_and_nothing_more() {
-    let dir = scratch("ca-debug");
+    let dir = scratch("ca-debug").into_child("ca");
     let ca = open_dev(&dir, START).expect("made");
     let text = format!("{ca:?}");
     assert!(text.starts_with("Ca { started: Created"), "{text}");

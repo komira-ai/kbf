@@ -15,9 +15,15 @@ use rcgen::{
 use std::sync::OnceLock;
 use support::{Ca, Evil, NOW, ca_true, custom_extension, dns, make_ca, role_uri};
 
+/// One CA for the file's tests. They read only its root, so its directory is removed at once:
+/// a static is never dropped, and the directory would stay in the temporary directory.
 fn ca() -> &'static Ca {
     static CA: OnceLock<Ca> = OnceLock::new();
-    CA.get_or_init(|| make_ca("refusals"))
+    CA.get_or_init(|| {
+        let mut ca = make_ca("refusals");
+        drop(ca.own.take());
+        ca
+    })
 }
 
 fn check(tbs: &[u8], route: Route) -> Result<(), Refusal> {

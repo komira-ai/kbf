@@ -8,11 +8,11 @@ pub mod answer;
 
 use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kbf_ca::{Algorithm, Custody, Entropy, PublicKey, SignError, Signer};
+use kbf_testkit::dir::TestDir;
 use rcgen::{Attribute, CertificateParams, DistinguishedName, KeyPair, PublicKeyData, SigningKey};
 use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
@@ -107,12 +107,11 @@ impl Signer for External {
     }
 }
 
-/// A scratch directory, new and empty, resolved through symlinks.
-pub fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-ca-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    std::fs::canonicalize(&dir).expect("canonical scratch dir")
+/// A scratch directory, new and empty, resolved through symlinks, removed when it drops
+/// (bind it for as long as the test uses the path).
+pub fn scratch(name: &str) -> TestDir {
+    let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
+    TestDir::under(temp, &format!("kbf-ca-{name}"))
 }
 
 /// The key of a freshly generated rcgen key pair.

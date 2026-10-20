@@ -2,9 +2,7 @@
 //! CA made in a scratch directory, the service over both), tokens, and certificate requests
 //! built the way a node builds them (and some it would not).
 
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use kbf_ca::{CLOCK_FLOOR_UNIX, ISSUED_AT_OID, Policy, SystemEntropy};
@@ -12,6 +10,7 @@ use kbf_enroll_registry::{TokenSpec, create_token};
 use kbf_proto::kbf::enroll::v1 as pb;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
+use kbf_testkit::dir::{TestChild, TestDir};
 use kbf_types::{NodeId, Role, RoleSet, TokenId, TokenSecret};
 use rcgen::{Attribute, CertificateParams, DistinguishedName, KeyPair};
 
@@ -23,14 +22,10 @@ pub const START: i64 = CLOCK_FLOOR_UNIX + 86_400;
 /// The one name this test frontend serves.
 pub const FRONTEND: &str = "front.test";
 
-/// A scratch directory no other test uses (a path that does not exist yet).
-pub fn scratch(name: &str) -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    std::env::temp_dir().join(format!(
-        "kbf-enroll-svc-{}-{}-{name}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
+/// A scratch directory no other test uses, empty, removed when it drops (bind it for as
+/// long as the test uses the path).
+pub fn scratch(name: &str) -> TestDir {
+    TestDir::under(std::env::temp_dir(), &format!("kbf-enroll-svc-{name}"))
 }
 
 /// A state store, a CA and the service over them.
@@ -39,6 +34,8 @@ pub struct Farm {
     pub store: Arc<dyn Store>,
     pub ca: Arc<Ca>,
     pub service: EnrollService,
+    /// The CA's directory, last so that it is removed after everything that reads it.
+    _dir: TestChild,
 }
 
 /// A farm whose store clock reads `start` (unix seconds) and whose CA, made in a new
@@ -47,7 +44,8 @@ pub fn farm_at(name: &str, start: i64) -> Farm {
     let clock = Arc::new(ManualClock::default());
     clock.advance(Duration::from_secs(u64::try_from(start).expect("a time")));
     let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None));
-    let dir = scratch(name);
+    // The CA makes its own directory (it refuses one whose mode is not 0700).
+    let dir = scratch(name).into_child("ca");
     let policy = Policy::new(86_400).expect("policy");
     let ca = Arc::new(
         Ca::open(
@@ -65,6 +63,7 @@ pub fn farm_at(name: &str, start: i64) -> Farm {
         store,
         ca,
         service,
+        _dir: dir,
     }
 }
 
@@ -124,12 +123,9 @@ pub fn register_cold(farm: &Farm) -> u64 {
     use kbf_types::object_store_api::{
         BindingPut, BindingRole, ConnectionName, ConnectionPut, Secret,
     };
-    let registry = Registry::open(
-        Arc::clone(&farm.store),
-        &scratch("registry-secrets"),
-        Arc::new(super::OsRandom),
-    )
-    .expect("a registry");
+    let secrets = scratch("registry-secrets");
+    let registry = Registry::open(Arc::clone(&farm.store), &secrets, Arc::new(super::OsRandom))
+        .expect("a registry");
     let name: ConnectionName = "cold".parse().expect("a name");
     registry
         .put_connection(

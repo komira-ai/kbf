@@ -39,7 +39,8 @@ fn newest_is(
 #[test]
 fn a_binding_needs_its_connection_and_a_repeat_is_unchanged() {
     let store = as_store(&fake());
-    let reg = open(&store, &scratch("bind").join("s"));
+    let sdir = scratch_s("bind");
+    let reg = open(&store, &sdir);
     let err = reg
         .put_binding(BindingRole::Cold, &bind("cold", "b"))
         .unwrap_err();
@@ -90,7 +91,8 @@ fn a_binding_needs_its_connection_and_a_repeat_is_unchanged() {
 #[test]
 fn a_bound_stores_identity_cannot_change_but_its_credentials_can() {
     let store = as_store(&fake());
-    let reg = open(&store, &scratch("identity").join("s"));
+    let sdir = scratch_s("identity");
+    let reg = open(&store, &sdir);
     reg.put_connection(&name("cold"), &put("s1")).unwrap();
     reg.put_binding(BindingRole::Cold, &bind("cold", "b"))
         .unwrap();
@@ -157,7 +159,7 @@ fn a_bound_stores_identity_cannot_change_but_its_credentials_can() {
 #[test]
 fn deletes_refuse_a_bound_connection_and_remove_the_rest() {
     let store = as_store(&fake());
-    let dir = scratch("delete").join("s");
+    let dir = scratch_s("delete");
     let reg = open(&store, &dir);
     assert!(matches!(
         reg.delete_connection(&name("cold")),
@@ -226,7 +228,7 @@ fn deletes_refuse_a_bound_connection_and_remove_the_rest() {
 #[test]
 fn two_frontend_children_share_one_store_and_one_directory() {
     let store = as_store(&fake());
-    let dir = scratch("children").join("s");
+    let dir = scratch_s("children");
     let old = open(&store, &dir);
     let new = open_now(Arc::clone(&store), &dir, Counting::from(100)).unwrap();
     assert_eq!(
@@ -258,7 +260,7 @@ fn two_frontend_children_share_one_store_and_one_directory() {
 #[test]
 fn a_young_unreferenced_file_survives_the_sweep() {
     let store = as_store(&fake());
-    let dir = scratch("grace").join("s");
+    let dir = scratch_s("grace");
     let reg = Registry::open(Arc::clone(&store), &dir, Counting::arc()).unwrap();
     let young = file_of(&dir, "cold", 5);
     std::fs::write(&young, "x").unwrap();
@@ -281,7 +283,7 @@ fn a_young_unreferenced_file_survives_the_sweep() {
 #[test]
 fn a_reader_survives_the_other_child_rotating_under_it() {
     let store = as_store(&fake());
-    let dir = scratch("rotate-under").join("s");
+    let dir = scratch_s("rotate-under");
     let reader = open(&store, &dir);
     let writer = open_now(Arc::clone(&store), &dir, Counting::from(100)).unwrap();
     writer.put_connection(&name("cold"), &put("one")).unwrap();
@@ -366,7 +368,7 @@ fn plant(store: &Arc<dyn Store>, key: &str, value: Vec<u8>) {
 #[test]
 fn rows_with_fields_from_a_newer_binary_are_read_and_rewritten() {
     let store = as_store(&fake());
-    let dir = scratch("newer").join("s");
+    let dir = scratch_s("newer");
     let reg = open(&store, &dir);
     // A secret file the planted row can name.
     reg.put_connection(&name("seed"), &put("planted")).unwrap();
@@ -453,7 +455,8 @@ fn unreadable_rows_are_reported_by_family() {
     ];
     for (key, family) in cases {
         let store = as_store(&fake());
-        let reg = open(&store, &scratch("corrupt").join("s"));
+        let sdir = scratch_s("corrupt");
+        let reg = open(&store, &sdir);
         reg.put_connection(&name("cold"), &put("s")).unwrap();
         reg.put_binding(BindingRole::Cold, &bind("cold", "b"))
             .unwrap();
@@ -531,7 +534,8 @@ fn rows_under_odd_keys_or_codes_are_corrupt_not_skipped() {
     ];
     for (key, value, family) in cases {
         let store = as_store(&fake());
-        let reg = open(&store, &scratch("odd").join("s"));
+        let sdir = scratch_s("odd");
+        let reg = open(&store, &sdir);
         plant(&store, key, value);
         let err = if family == "conn" {
             reg.connections().unwrap_err()
@@ -563,7 +567,8 @@ fn a_rebind_over_an_unreadable_binding_row_is_corrupt() {
         .encode_to_vec(),
     ] {
         let store = as_store(&fake());
-        let reg = open(&store, &scratch("rebind-corrupt").join("s"));
+        let sdir = scratch_s("rebind-corrupt");
+        let reg = open(&store, &sdir);
         reg.put_connection(&name("cold"), &put("s")).unwrap();
         plant(&store, "objstore/bind/cold", planted);
         let err = reg
@@ -601,7 +606,8 @@ fn every_audit_code_round_trips() {
 #[test]
 fn the_audit_log_is_newest_first_and_bounded() {
     let store = as_store(&fake());
-    let reg = open(&store, &scratch("audit").join("s"));
+    let sdir = scratch_s("audit");
+    let reg = open(&store, &sdir);
     for round in 0..12 {
         let mut body = put("s");
         body.region = Some(format!("r{round}"));

@@ -25,6 +25,7 @@ use kbf_server::enroll::service::NodeSettings;
 use kbf_server::enroll::start::prepare;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
+use kbf_testkit::dir::TestDir;
 use kbf_types::{CaPin, RefusalReason, Role, RoleSet, Token, TokenId, TokenSecret};
 
 fn unix_now() -> i64 {
@@ -37,10 +38,10 @@ fn unix_now() -> i64 {
     .expect("time")
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-enroll-e2e-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
-    std::fs::canonicalize(&dir).expect("canonical")
+/// A directory removed when it drops (declare it before what runs in it), its path canonical.
+fn scratch(name: &str) -> TestDir {
+    let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical");
+    TestDir::under(temp, &format!("kbf-enroll-e2e-{name}"))
 }
 
 /// A running enroll listener over a fresh store and CA.
@@ -51,6 +52,8 @@ struct Farm {
     pin: CaPin,
     ca_dir: PathBuf,
     _latch: kbf_server::enroll::start::Serving,
+    /// Last, so that it is removed after the listener has gone.
+    _dir: TestDir,
 }
 
 fn flags(ca_dir: PathBuf, limits: Limits, allow_unenforced_deny: bool) -> EnrollFlags {
@@ -90,7 +93,8 @@ async fn start_with(name: &str, limits: Limits, cert_lifetime_secs: i64) -> Farm
         u64::try_from(unix_now()).expect("time"),
     ));
     let store: Arc<dyn Store> = Arc::new(Fake::with_flaw(Arc::clone(&clock), Flaw::None));
-    let ca_dir = scratch(name).join("ca");
+    let dir = scratch(name);
+    let ca_dir = dir.join("ca");
     let flags = flags_for(ca_dir.clone(), limits, true, cert_lifetime_secs);
     let prepared = prepare(&flags).expect("prepared");
     let (port, pin) = (prepared.local().port(), prepared.ca().pin());
@@ -104,6 +108,7 @@ async fn start_with(name: &str, limits: Limits, cert_lifetime_secs: i64) -> Farm
         pin,
         ca_dir,
         _latch: serving,
+        _dir: dir,
     }
 }
 
@@ -144,6 +149,8 @@ impl Farm {
 struct Node {
     config: Config,
     store: NodeStore,
+    /// Last, so that it is removed after the store is closed.
+    _root: TestDir,
 }
 
 /// A node's files. A storage node says where it can be reached; a node with no storage
@@ -173,7 +180,11 @@ fn node(name: &str, farm: &Farm, token: &Token, storage: bool) -> Node {
     std::fs::set_permissions(&config.token_file, std::fs::Permissions::from_mode(0o600))
         .expect("mode");
     let store = NodeStore::open(&config.state_dir).expect("store");
-    Node { config, store }
+    Node {
+        config,
+        store,
+        _root: root,
+    }
 }
 
 fn facts() -> NodeFacts {
@@ -524,7 +535,8 @@ async fn a_source_over_its_burst_is_rate_limited() {
 /// enforce, and a gate checked after the CA was already written.
 #[tokio::test(flavor = "multi_thread")]
 async fn enroll_listen_without_the_deny_acceptance_is_refused_and_writes_nothing() {
-    let ca_dir = scratch("gate").join("ca");
+    let ca_root = scratch("gate");
+    let ca_dir = ca_root.join("ca");
     let error = prepare(&flags(ca_dir.clone(), Limits::DEFAULT, false))
         .err()
         .expect("refused");
@@ -540,7 +552,8 @@ async fn enroll_listen_without_the_deny_acceptance_is_refused_and_writes_nothing
 /// (their pins and certificates are the old CA's).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restart_loads_the_ca_it_made_and_does_not_overwrite_it() {
-    let ca_dir = scratch("restart").join("ca");
+    let ca_root = scratch("restart");
+    let ca_dir = ca_root.join("ca");
     let first = prepare(&flags(ca_dir.clone(), Limits::DEFAULT, true)).expect("first");
     let pin = first.ca().pin();
     let files = |name: &str| std::fs::read(ca_dir.join(name)).expect("file");
@@ -577,7 +590,8 @@ async fn an_external_signer_start_uses_the_signers_root_and_makes_no_key() {
         let _ = server.serve(&listener);
     });
 
-    let ca_dir = scratch("external-frontend").join("ca");
+    let ca_root = scratch("external-frontend");
+    let ca_dir = ca_root.join("ca");
     std::fs::create_dir_all(&ca_dir).expect("dir");
     std::fs::copy(signer_dir.join("ca.pem"), ca_dir.join("ca.pem")).expect("root");
     let mut f = flags(ca_dir.clone(), Limits::DEFAULT, true);
@@ -598,12 +612,9 @@ fn register_cold(farm: &Farm) -> (&'static str, &'static str) {
     use kbf_types::object_store_api::{BindingPut, BindingRole, ConnectionPut, Secret};
     const KEY_ID: &str = "AKIDE2EKEYID";
     const SECRET: &str = "e2e-secret-access-key-value";
-    let registry = Registry::open(
-        Arc::clone(&farm.store),
-        &scratch("registry-secrets"),
-        Arc::new(OsRandom),
-    )
-    .expect("registry");
+    let secrets = scratch("registry-secrets");
+    let registry =
+        Registry::open(Arc::clone(&farm.store), &secrets, Arc::new(OsRandom)).expect("registry");
     let name = "cold".parse().expect("name");
     registry
         .put_connection(
