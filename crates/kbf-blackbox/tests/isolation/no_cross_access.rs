@@ -19,7 +19,11 @@
 //! Canaries are 16 KiB of unpredictable hex (an incompressible, unmistakable needle). A's
 //! canaries sit in its input root, its output, its upper directory, and the lease's `/tmp`
 //! and `/var/tmp` directories (`rw/tmp`, `rw/var-tmp`); the check scans the whole farm
-//! directory, outside the content stores (which hold bytes by digest by design), for them.
+//! directory, outside the content stores, for them. The stores that are addressed by content
+//! (the daemon's input cache and trees) are scanned too: a canary may be in one only in a file
+//! named for the digest of its bytes, which is the cache doing its work; a copy under any other
+//! name, or under a digest of other bytes, is a leak. (The server's CAS is the one place
+//! the canary is expected and not looked for.)
 
 use kbf_proto::reapi::ExecuteResponse;
 use kbf_transfer::digest_of;
@@ -136,6 +140,14 @@ fn b_saw_nothing(rig: &mut Rig, b: &ExecuteResponse) -> Result<(), String> {
         let rel = hit.strip_prefix(&rig.dir).unwrap_or(&hit);
         bad.push(format!("A's canary is in {}", rel.display()));
     }
+    let stored = probe::canary_outside_digests(&rig.view(), needle.as_bytes())?;
+    for hit in stored {
+        let rel = hit.strip_prefix(&rig.dir).unwrap_or(&hit);
+        bad.push(format!(
+            "A's canary is in {}, a content store file not named for its digest",
+            rel.display()
+        ));
+    }
     if rig.stdout_of(b).contains(&needle) {
         bad.push("A's canary is in B's stdout".to_owned());
     }
@@ -182,6 +194,22 @@ fn a_later_action_finds_nothing_of_an_earlier_one() {
     // The stand-in isolates nothing; a node that does is judged by the tier-R tests.
     assert_eq!(rig.view().isolation(), Isolation::Nothing);
     a_then_b(&mut rig, &[], &[]).unwrap_or_else(|e| panic!("{e}"));
+    // The store scan is not vacuous: A's input IS in the input cache (under its digest,
+    // by design), the scan reaches it, and the digest rule accepts it.
+    let node = rig.view();
+    let needle = canary(1, CANARY_LEN);
+    let cached = probe::scan(&node.content_addressed(), needle.as_bytes(), &|_| false)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !cached.is_empty(),
+        "A's input is not in the cache the scan reads"
+    );
+    let leaks =
+        probe::canary_outside_digests(&node, needle.as_bytes()).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        leaks.is_empty(),
+        "the cache entry was taken for a leak: {leaks:?}"
+    );
 }
 
 /// Red for the check above: A also leaves a copy of its canary in a shared directory
@@ -195,6 +223,46 @@ fn planted_shared_file_between_actions_is_seen() {
     let seen = a_then_b(&mut rig, &extra, &[file]).expect_err("the shared copy was missed");
     assert!(seen.contains("B could see A's data"), "{seen}");
     assert!(seen.contains("A's canary is in shared/canary"), "{seen}");
+}
+
+/// Red for the store scan: A copies its canary into the input cache under a name of its own
+/// (`copy-canary`), as a daemon that kept a copy of an action's data in its cache would. The
+/// farm scan skips the cache; the digest rule must name it, in this suite and not by disk growth.
+#[test]
+fn planted_copy_in_the_input_cache_is_seen() {
+    let mut rig = Rig::start("cross-plant-cache");
+    let file = text(&rig.data().join("cache/copy-canary"));
+    let seen = a_then_b(&mut rig, &steps_write(&file), &[]).expect_err("the cache copy was missed");
+    assert!(
+        seen.contains("cache/copy-canary, a content store file not named for its digest"),
+        "{seen}"
+    );
+}
+
+/// Red for the digest rule itself: a copy of the canary under a name that LOOKS like a digest
+/// but is not the digest of its bytes (and one in `trees/`) is a leak too.
+#[test]
+fn planted_digest_named_copy_with_other_bytes_is_seen() {
+    let mut rig = Rig::start("cross-plant-digest");
+    let lookalike = format!("{}-{}", "0".repeat(64), CANARY_LEN + 1);
+    let in_blobs = text(&rig.data().join("cache/v1/blobs/00").join(&lookalike));
+    let in_trees = text(&rig.data().join("trees").join(&lookalike));
+    let mut extra = steps_write(&in_blobs);
+    extra.push(";".to_owned());
+    extra.extend(steps_write(&in_trees));
+    let seen = a_then_b(&mut rig, &extra, &[]).expect_err("the lookalike was missed");
+    assert!(
+        seen.contains(&format!("cache/v1/blobs/00/{lookalike}")),
+        "{seen}"
+    );
+    assert!(seen.contains(&format!("trees/{lookalike}")), "{seen}");
+}
+
+fn steps_write(file: &str) -> Vec<String> {
+    ["write-lines", file, &canary(1, CANARY_LEN)]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
 }
 
 fn steps_extra_write(dir: &str, file: &str) -> Vec<String> {

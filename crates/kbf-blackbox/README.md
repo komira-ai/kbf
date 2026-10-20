@@ -51,10 +51,12 @@ and its existing knobs.
 | failed / timed-out action leaves nothing | shares the plants above |
 | children in the action's group are killed | `planted_escaping_process_is_seen` |
 | disk: non-kept scratch exactly as before (slack zero), cache +input once, stores bounded, same input adds nothing (`runs_do_not_grow_the_node_beyond_what_it_keeps`) | `planted_growth_of_an_existing_file_is_seen`, `planted_large_stray_file_is_seen_with_its_size`, `planted_runaway_store_growth_is_seen` |
+| kept directories that must be EMPTY between leases hold nothing (`oci-helper-state`, any size); the node directory outside `data/` (config, keys, id maps, binaries) is exactly its expected list and nothing grows (`kept_directories_hold_no_job_leftovers_and_the_node_directory_is_unchanged`) | `planted_leftover_in_the_helper_state_directory_is_seen`, `planted_residue_outside_the_data_dir_is_seen` (incl. lookalikes of the exempt names) |
+| orphans: found by the farm path in cmdline, environment or cwd, by the process group of a farm role, by the group or session of the last action, by `cgroup.procs`, and by parentage (`processes_of`) | `planted_hidden_orphans_are_found_by_group_session_and_cgroup`, `planted_hidden_orphan_in_the_daemons_group_is_seen` |
 | kept-path allow-list is exact, `runs/` and `quarantine/` are residue | `planted_lookalikes_of_kept_paths_are_seen`, `planted_runs_and_quarantine_entries_are_seen` |
 | a walk or read error fails, a missing area fails | `planted_unreadable_directory_fails_the_probe`, `planted_missing_lease_area_fails_the_probe` |
 | daemon SIGKILL + restart: sweep removes the old lease (`a_restarted_daemon_sweeps_the_lease_it_left`) | `planted_stray_file_survives_a_restart_and_is_seen` |
-| B after A cannot name A's data; A's canary in no file outside the stores (`a_later_action_finds_nothing_of_an_earlier_one`) | `planted_shared_file_between_actions_is_seen` |
+| B after A cannot name A's data; A's canary in no file outside the stores, and in the input cache and trees only in a file named for the digest of its bytes (`a_later_action_finds_nothing_of_an_earlier_one`) | `planted_shared_file_between_actions_is_seen`, `planted_copy_in_the_input_cache_is_seen`, `planted_digest_named_copy_with_other_bytes_is_seen` |
 | output collector does not follow links (`outputs_that_are_links_are_not_followed`) | `planted_output_with_a_neighbours_bytes_is_seen` |
 | input links stay links, `..` names refused (`input_links_and_dotdot_names_do_not_escape`) | `planted_escape_file_and_read_through_link_are_seen` |
 | action inherits only fds 0, 1, 2 (`the_action_inherits_only_its_standard_descriptors`) | `planted_inherited_descriptors_are_seen` |
@@ -69,6 +71,14 @@ and its existing knobs.
   `/dev/shm` and `/tmp` being the lease's own (the stand-in's are the host's), a cleared
   environment (the stand-in does not `env_clear`), `cgroup.kill` reaching a setsid'd
   escapee or a killed daemon's action. Tier R tests exist as failing-loudly stubs.
+- An orphan that left the farm's process groups and sessions (`setsid`), cleared its
+  environment, went to `/` and was reparented to init: no probe here can attribute it to the
+  farm (the stand-in's cgroups have no `cgroup.procs`, and a box shared with other users'
+  processes rules out "every new process of the user"). Tier R stub
+  `tier_r_an_orphan_that_hid_is_found_by_its_cgroup`.
+- `children_in_the_actions_group_are_killed` proves the group is gone, not that the PRODUCT's
+  `cgroup.kill` ended it: the stand-in's `crun delete --force` kills the action's group too
+  (dropping the product's explicit `cgroup.kill` leaves this test green). Tier R.
 - Two leases in flight on the stand-in: it keeps ONE record of the last action for the node
   (`pid`, `root`, `upper`), so a second lease would signal the first. A and B are sequential.
 - The sweep's removal of a live lease cgroup: the stand-in's plain directories make it

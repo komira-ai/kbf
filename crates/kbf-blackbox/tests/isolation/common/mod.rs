@@ -106,14 +106,16 @@ impl Rig {
 
     /// The node as the probes see it; the farm's live roles are not residue.
     pub fn view(&mut self) -> node::LinuxNode {
-        let roles = self
-            .farm
-            .process_table()
-            .into_iter()
+        let table = self.farm.process_table();
+        let roles = table
+            .iter()
             .filter(|p| p.ended.is_none())
             .map(|p| p.pid)
             .collect();
-        node::LinuxNode::new(&self.dir, roles)
+        // Every role the farm has had leads a process group of its own: what is left in
+        // one, beside a live role or after it ended, is the farm's.
+        let groups = table.iter().map(|p| p.pid).collect();
+        node::LinuxNode::new(&self.dir, roles).with_groups(groups)
     }
 
     /// The names of the node's lease directories now (the farm's roles do not matter here).

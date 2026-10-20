@@ -102,6 +102,10 @@ fn the_previous_lease_is_gone_before_the_next_one_runs() {
         .join("leases")
         .join(leases.first().expect("one"))
         .join("upper");
+    // The daemon makes the lease directory first and its `upper` a moment later: the walk
+    // below needs it (it is an error on a missing top, by design). Bounded by `HANG`, and
+    // loud on timeout.
+    rig.wait_until("B's upper directory", || upper.is_dir());
     // B's upper may hold the directories its outputs go in, and no file.
     let files: Vec<_> = probe::walk(&upper)
         .expect("B's upper")
@@ -115,6 +119,30 @@ fn the_previous_lease_is_gone_before_the_next_one_runs() {
     std::fs::write(&release, b"").expect("release");
     assert_eq!(code(&rig.join(b)), 0);
     clean(&mut rig, &base).expect("clean after B");
+}
+
+/// Directories the node keeps on purpose and the files inside them: the helper containers'
+/// job directories are removed after each job (kbf-driver-container's `run_jobs` and
+/// `remove_dir_blocking`), so `leases/oci-helper-state` is EMPTY between leases, and a byte
+/// left there is a leak a "kept" allow-list would hide.
+///
+/// Catches a helper job directory (an unpack or a remove) that is not removed, and anything
+/// else a lease or the daemon drops in a kept directory. The node's own directory outside
+/// the scratch directory (configuration, keys, id maps, binaries) is checked in the same
+/// snapshot: nothing new and nothing larger.
+#[test]
+fn kept_directories_hold_no_job_leftovers_and_the_node_directory_is_unchanged() {
+    let (mut rig, base) = warm("residue-kept");
+    assert!(base.left_in_empty.is_empty(), "{:?}", base.left_in_empty);
+    assert!(
+        !base.around.is_empty(),
+        "the node's directory was not looked at"
+    );
+    assert!(base.unexpected.is_empty(), "{:?}", base.unexpected);
+    for seed in 90..92 {
+        assert_eq!(code(&rig.run(&job(seed))), 0);
+        clean(&mut rig, &base).unwrap_or_else(|e| panic!("after run {seed}: {e}"));
+    }
 }
 
 /// R8(a): a failing action (exit 3) leaves nothing; the result carries its exit code.
@@ -208,13 +236,15 @@ fn runs_do_not_grow_the_node_beyond_what_it_keeps() {
     );
 }
 
-/// What one run may add: its input once to the cache (plus directory blocks), and to the
-/// stores its input and its output once each, plus half a MiB of logs and index (measured:
-/// 2 MiB and about 100 KB for a 1 MiB input and output; this farm has one storage node, so
-/// one copy of a blob).
+/// What one run may add: its input once to the cache (plus 16 KiB for directory blocks and
+/// the index), and to the stores its input and its output once each, plus 160 KiB of logs
+/// and index. Measured over six runs of a 1 MiB input and output: the cache grows by exactly
+/// the input, the stores by 2 MiB plus 44 to 81 KB; this farm has one storage node, so one
+/// copy of a blob. A leak of a hundred bytes in a kept directory is caught by the files and
+/// directories that must be empty (`oci-helper-state`), not by this slack.
 fn growth_within(cache: u64, stores: u64, input: u64) -> Result<(), String> {
-    let cache_max = input + 256 * 1024;
-    let stores_max = 2 * input + (512 << 10);
+    let cache_max = input + 16 * 1024;
+    let stores_max = 2 * input + 160 * 1024;
     if cache > cache_max {
         return Err(format!("the cache grew {cache} B for a {input} B input"));
     }
@@ -238,9 +268,21 @@ fn a_restarted_daemon_sweeps_the_lease_it_left() {
     use kbf_harness::farm::Role;
     let (mut rig, base) = warm("residue-restart");
     let release = rig.dir.join("release");
-    rig.plant(&["wait-for", release.to_str().expect("utf-8"), "60"]);
+    let started = rig.dir.join("started");
+    rig.plant(&[
+        "write-lines",
+        started.to_str().expect("utf-8"),
+        "x",
+        ";",
+        "wait-for",
+        release.to_str().expect("utf-8"),
+        "60",
+    ]);
     let run = rig.start_run(&job(60));
-    rig.wait_until("the lease", || !rig.leases().is_empty());
+    // The action is running, not only its lease directory made: killed earlier, the daemon
+    // may be in the middle of a helper job, whose directory in `oci-helper-state` the
+    // start-up sweep does not remove (seen: `kbf-helper-give-<old pid>-N` left behind).
+    rig.wait_until("the action", || started.exists());
     let old = rig.leases();
     rig.farm.kill(Role::Node(1));
     rig.plant(&STANDARD);
@@ -323,6 +365,73 @@ fn planted_lease_directory_is_seen() {
     );
 }
 
+/// S2 red: a file (and an empty directory) left in `oci-helper-state`, which is kept but must
+/// be empty between leases. A hundred bytes is enough: no size slack excuses it.
+#[test]
+fn planted_leftover_in_the_helper_state_directory_is_seen() {
+    let (mut rig, base) = warm("plant-helper-state");
+    let file = data_path(&rig, "leases/oci-helper-state/kbf-helper-unpack-9-9");
+    let dir = data_path(&rig, "leases/oci-helper-state/kbf-helper-rm-9-9");
+    rig.plant(&["write-lines", &file, &"x".repeat(99), ";", "mkdir", &dir]);
+    let _ = rig.run(&job(82));
+    let seen = clean(&mut rig, &base).expect_err("a job leftover");
+    for left in ["kbf-helper-unpack-9-9", "kbf-helper-rm-9-9"] {
+        assert!(
+            seen.contains(&format!("must be empty: oci-helper-state/{left}")),
+            "{left}: {seen}"
+        );
+    }
+}
+
+/// S3 red: a 5 KiB file in the node's directory outside the scratch directory, a file there
+/// that grows (the node's configuration), and lookalikes of the exempt names (`data-evil`,
+/// `hot-x`, `bin/crun-state-x`, `bin/cgroup-x`: the exemption is by whole component).
+#[test]
+fn planted_residue_outside_the_data_dir_is_seen() {
+    let (mut rig, base) = warm("plant-outside");
+    let node = rig.node_dir();
+    let path = |rel: &str| node.join(rel).to_str().expect("utf-8").to_owned();
+    let (spill, config) = (path("spill.bin"), path("kbf.toml"));
+    let names = ["data-evil", "hot-x", "bin/crun-state-x", "bin/cgroup-x"];
+    let mut steps: Vec<String> = [
+        "truncate", &spill, "5120", ";", "append", &config, "more", ";",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    for name in names {
+        steps.extend([
+            "write-lines".to_owned(),
+            path(name),
+            "x".to_owned(),
+            ";".to_owned(),
+        ]);
+    }
+    steps.pop();
+    let refs: Vec<&str> = steps.iter().map(String::as_str).collect();
+    rig.plant(&refs);
+    let _ = rig.run(&job(83));
+    let seen = clean(&mut rig, &base).expect_err("residue outside the scratch dir");
+    assert!(
+        seen.contains("new path outside the scratch dir: spill.bin"),
+        "{seen}"
+    );
+    assert!(
+        seen.contains("unexpected path outside the scratch dir: spill.bin"),
+        "{seen}"
+    );
+    assert!(
+        seen.contains("grew outside the scratch dir: kbf.toml"),
+        "{seen}"
+    );
+    for name in names {
+        assert!(
+            seen.contains(&format!("new path outside the scratch dir: {name}")),
+            "{name}: {seen}"
+        );
+    }
+}
+
 /// R3 red, the real way: `crun delete` fails, so the product turns the lease into a farm
 /// fault ("a dirty node must be loud", infra failure after the reruns) and the lease cgroup
 /// directories stay. The probe must see them; the lease directories, which the daemon
@@ -363,6 +472,118 @@ fn planted_escaping_process_is_seen() {
     );
     let seen = clean(&mut rig, &base).expect_err("a process escaped");
     assert!(seen.contains("process left:"), "{seen}");
+}
+
+/// What an orphan that hid looks like: no farm path in its command line, an empty
+/// environment, working directory `/`, reparented to init (a shell starts it in the
+/// background and ends), and, when `group` is given, in that process group. Its pid.
+fn hidden_orphan(program: &str, group: Option<i32>) -> u32 {
+    use std::os::unix::process::CommandExt as _;
+    let mut shell = std::process::Command::new("/bin/sh");
+    shell
+        .args([
+            "-c",
+            &format!("{program} >/dev/null 2>&1 </dev/null & echo $!"),
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(group.unwrap_or(0));
+    let out = shell.output().expect("the shell");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("the orphan's pid")
+}
+
+/// R4 red, orphans that hid (S6b): a process with an empty environment and working
+/// directory `/`, reparented to init, is found by the process group of a farm role (the
+/// daemon's, which any process it starts inherits), by the group or session an action was
+/// started as, and by a cgroup's `cgroup.procs`; and by none of the farm's paths, which it
+/// does not carry (shown by the control: no group, no cgroup, not found).
+#[test]
+fn planted_hidden_orphans_are_found_by_group_session_and_cgroup() {
+    use std::collections::BTreeSet;
+    let farm = std::path::Path::new("/no/such/farm-directory");
+    let found = |groups: &[u32], members: &[u32], pid: u32| {
+        probe::processes_of(farm, &[], groups, &members.iter().copied().collect())
+            .expect("processes")
+            .iter()
+            .any(|p| p.pid == pid)
+    };
+    // By group: the orphan joins the group of a process that leads one (a sleeping stand-in
+    // for the daemon), then the group leader goes.
+    use std::os::unix::process::CommandExt as _;
+    let mut leader = std::process::Command::new("/bin/sleep")
+        .arg("606")
+        .env_clear()
+        .current_dir("/")
+        .process_group(0)
+        .spawn()
+        .expect("the group leader");
+    let leader_id = leader.id();
+    let by_group = hidden_orphan("sleep 607", Some(i32::try_from(leader_id).expect("pid")));
+    // By session: the orphan leads a session of its own (what a lease's action is started as).
+    let by_session = hidden_orphan("exec setsid sleep 608", None);
+    // By cgroup: no group of ours, no session, nothing in its environment.
+    let by_cgroup = hidden_orphan("sleep 609", None);
+    let _reap = KillOnDrop(vec![by_group, by_session, by_cgroup]);
+    for pid in [by_group, by_session, by_cgroup] {
+        assert!(probe::alive(pid).expect("alive"), "orphan {pid} ended");
+        assert!(!found(&[], &[], pid), "control: {pid} found by nothing");
+    }
+    assert!(
+        found(&[leader_id], &[], by_group),
+        "the group member was missed"
+    );
+    assert!(
+        found(&[by_session], &[], by_session),
+        "the session leader was missed"
+    );
+    assert!(
+        found(&[], &[by_cgroup], by_cgroup),
+        "the cgroup member was missed"
+    );
+    assert!(
+        !found(&[leader_id], &[], by_cgroup),
+        "an unrelated group marked the cgroup member"
+    );
+    leader.kill().expect("kill the leader");
+    leader.wait().expect("reap the leader");
+    // And the membership parser: pids per line, whole tree, error on junk.
+    let scratch = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "cgroup-procs");
+    let tree = scratch.path().join("tree");
+    std::fs::create_dir_all(tree.join("a/b")).expect("mkdir");
+    std::fs::write(tree.join("a/cgroup.procs"), "11\n12\n").expect("procs");
+    std::fs::write(tree.join("a/b/cgroup.procs"), "13\n\n").expect("procs");
+    assert_eq!(
+        probe::cgroup_members(&tree).expect("members"),
+        BTreeSet::from([11, 12, 13])
+    );
+    std::fs::write(tree.join("a/b/cgroup.procs"), "x\n").expect("procs");
+    assert!(probe::cgroup_members(&tree).is_err());
+    assert!(probe::cgroup_members(&tree.join("nowhere")).is_err());
+}
+
+/// R4 red on a whole farm, S6b: an orphan that hid in the daemon's process group (it has
+/// no farm path in its environment, command line or working directory, and its parent is
+/// init) is seen by the check every test ends in.
+#[test]
+fn planted_hidden_orphan_in_the_daemons_group_is_seen() {
+    let (mut rig, base) = warm("plant-hidden");
+    let role = rig
+        .farm
+        .process_table()
+        .into_iter()
+        .find(|p| p.ended.is_none())
+        .expect("a live role")
+        .pid;
+    let orphan = hidden_orphan("sleep 610", Some(i32::try_from(role).expect("pid")));
+    let _reap = KillOnDrop(vec![orphan]);
+    let seen = clean(&mut rig, &base).expect_err("a hidden orphan");
+    assert!(seen.contains(&format!("process left: {orphan}")), "{seen}");
 }
 
 /// R6 red: an action leaves a file in the node's scratch directory outside the lease.
@@ -608,6 +829,19 @@ fn tier_r_no_container_mount_or_kernel_cgroup_is_left() {
 #[ignore = "needs real rootless crun: cargo xtask crun-tests"]
 fn tier_r_a_real_cgroup_kill_reaches_escapees_and_a_killed_daemons_actions() {
     real_crun_needed("cgroup.kill reaching a setsid escapee and a SIGKILLed daemon's action")
+}
+
+/// S6b on a real cgroup: an orphan that left the farm's process groups and sessions
+/// (`setsid`), cleared its environment, went to `/` and was reparented to init is found by the
+/// lease cgroup's `cgroup.procs` (membership the kernel keeps and no process can leave) and
+/// killed by `cgroup.kill`. On the stand-in the cgroup tree is plain directories with no
+/// membership, so such a process is invisible to every probe here: pgid and sid are the most
+/// the stand-in keeps (`planted_hidden_orphans_are_found_by_group_session_and_cgroup` shows
+/// them, and the cgroup path over a planted `cgroup.procs`).
+#[test]
+#[ignore = "needs real rootless crun: cargo xtask crun-tests"]
+fn tier_r_an_orphan_that_hid_is_found_by_its_cgroup() {
+    real_crun_needed("cgroup.procs membership of a process that hid from group and session")
 }
 
 /// R6/S5: `/tmp`, `/var/tmp`, `/run`, `/root` and the 64 MiB `/dev/shm` of an action are the
