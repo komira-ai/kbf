@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_daemon::reach::check_first_map;
+use kbf_daemon::reach::{Plan, check_first_map};
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_mapsync::MapHolder;
 
@@ -43,19 +43,21 @@ async fn an_unreachable_member_is_named_in_a_warning_and_a_healthy_start_is_quie
     let up_addr = up.local_addr().expect("addr").to_string();
     // A low port nothing listens on.
     let gone_addr = "127.0.0.1:1".to_owned();
-    let within = Duration::from_secs(30);
+    let plan = Plan {
+        within: Duration::from_secs(30),
+        attempts: 1,
+        pause: Duration::ZERO,
+    };
 
     let healthy = Arc::new(MapHolder::new());
     assert!(healthy.offer(map_of(&[&up_addr])));
-    check_first_map(healthy, None, within)
-        .await
-        .expect("passes");
+    check_first_map(healthy, None, plan).await.expect("passes");
     assert_eq!(log.count("WARN"), 0);
     assert_eq!(log.count("every storage member is reachable"), 1);
 
     let degraded = Arc::new(MapHolder::new());
     assert!(degraded.offer(map_of(&[&up_addr, &gone_addr])));
-    check_first_map(degraded, None, within)
+    check_first_map(degraded, None, plan)
         .await
         .expect("goes on");
     assert_eq!(log.count("WARN"), 1);
@@ -65,6 +67,18 @@ async fn an_unreachable_member_is_named_in_a_warning_and_a_healthy_start_is_quie
         0,
         "the member that answered is not named"
     );
+
+    // Nobody answers: each failed round but the last is logged, then the refusal.
+    let nobody = Arc::new(MapHolder::new());
+    assert!(nobody.offer(map_of(&[&gone_addr])));
+    let thrice = Plan {
+        attempts: 3,
+        ..plan
+    };
+    check_first_map(nobody, None, thrice)
+        .await
+        .expect_err("refused");
+    assert_eq!(log.count("probing again"), 2);
 }
 
 /// What a subscriber wrote, for the test above.

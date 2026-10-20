@@ -458,18 +458,15 @@ pub struct NodeHandle {
 struct ReachCheck {
     maps: Arc<MapHolder>,
     local: Option<String>,
+    plan: kbf_daemon::reach::Plan,
 }
 
 impl ReachCheck {
     /// Completes with the error when no storage member answers the first map's probe;
     /// never otherwise.
     async fn refused(self) -> Error {
-        let checked = kbf_daemon::reach::check_first_map(
-            self.maps,
-            self.local.as_deref(),
-            kbf_daemon::reach::REACH_WITHIN,
-        )
-        .await;
+        let checked =
+            kbf_daemon::reach::check_first_map(self.maps, self.local.as_deref(), self.plan).await;
         match checked {
             Err(error) => error.into(),
             Ok(()) => std::future::pending().await,
@@ -499,7 +496,11 @@ impl NodeHandle {
     /// This node, ending with an error when the first storage map it holds names members
     /// and none answers a connect (`local`, this process's own member, is not tried).
     fn checking_reach(mut self, maps: Arc<MapHolder>, local: Option<String>) -> Self {
-        self.reach = Some(ReachCheck { maps, local });
+        self.reach = Some(ReachCheck {
+            maps,
+            local,
+            plan: kbf_daemon::reach::Plan::DEFAULT,
+        });
         self
     }
 
@@ -2055,12 +2056,43 @@ mod tests {
         // A low port nothing listens on: refused at once.
         let dead = "127.0.0.1:1".to_owned();
 
-        let node = start(&cli).expect("starts");
-        let maps = Arc::clone(&node.reach.as_ref().expect("armed").maps);
-        assert!(maps.offer(map_at(dead.clone())));
+        // One round, so that the refusal is at once and not after the default window.
+        let once = kbf_daemon::reach::Plan {
+            attempts: 1,
+            ..kbf_daemon::reach::Plan::DEFAULT
+        };
+        let refused = |node: &mut NodeHandle| {
+            let reach = node.reach.as_mut().expect("armed");
+            reach.plan = once;
+            assert!(reach.maps.offer(map_at(dead.clone())));
+        };
+        // The shutdown is bounded: a check that is ignored fails this test in seconds
+        // (the daemon is told to stop and returns Ok) instead of hanging the run.
+        let mut node = start(&cli).expect("starts");
+        refused(&mut node);
         let error = node
-            .serve_until(std::future::pending())
+            .serve_until(async { tokio::time::sleep(Duration::from_secs(5)).await })
             .expect_err("no member answers");
+        assert!(error.to_string().contains(&dead), "{error}");
+
+        // `serve`, the entry the binary and the SIGTERM path use, ends the same way. A
+        // watchdog raises SIGTERM after 5 s so that a `serve` that ignores the check
+        // returns Ok (drained) and fails here, not hangs; it is called off when `serve`
+        // returns in time.
+        let mut node = start(&cli).expect("starts");
+        refused(&mut node);
+        let (done, watch) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            // SAFETY: raise has no preconditions; serve's handler takes the signal. One
+            // line: it runs only when the test is already failing.
+            let _ = watch
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| unsafe { libc::raise(libc::SIGTERM) });
+        });
+        let result = node.serve();
+        drop(done);
+        watchdog.join().expect("watchdog");
+        let error = result.expect_err("serve ends with the refusal");
         assert!(error.to_string().contains(&dead), "{error}");
 
         // The same map with a member that answers: the daemon serves until told to stop.
