@@ -69,7 +69,12 @@ pub struct Entry {
 
 /// The manifest's entries, in an order that makes parents first.
 pub fn entries() -> Vec<Entry> {
-    MANIFEST
+    parse(MANIFEST)
+}
+
+/// `manifest`'s entries (one per non-comment line), in its order.
+pub fn parse(manifest: &str) -> Vec<Entry> {
+    manifest
         .lines()
         .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
         .map(|line| {
@@ -111,7 +116,7 @@ pub fn placeholder(path: &str) -> String {
     }
 }
 
-fn source(name: &str) -> &'static str {
+pub(crate) fn source(name: &str) -> &'static str {
     match name {
         "av2_mac.conf" => KIT_CONF,
         "kbf.toml" => KBF_TOML,
