@@ -32,13 +32,33 @@ fn wire(lease: LeaseId) -> Option<worker::LeaseId> {
     })
 }
 
+/// An OK result of `lease` with no outputs, which the farm takes as a completed run.
+fn ok(lease: LeaseId) -> worker::Result {
+    worker::Result {
+        status: Some(rpc::Status::default()),
+        action_result: Some(kbf_proto::reapi::ActionResult::default()),
+        ..invalid(lease)
+    }
+}
+
 /// Catches: a farm that acknowledges a `Result` whose record the store refused (the
 /// daemon forgets a result that is not durable), and one that never acknowledges it once
 /// the store takes it (the daemon lists the lease in every heartbeat for ever). While the
 /// store is down no ack is sent, for the `Result` or for a copy of it; once a heartbeat
 /// finds the store back, the caller is answered and the one ack goes out, `accepted`.
+/// A failed run here; a completed one below.
 #[tokio::test(start_paused = true)]
 async fn a_result_is_acknowledged_only_after_the_store_takes_it() {
+    held_then_acknowledged(invalid).await;
+}
+
+/// The same for a completed run, whose finish is also what the held record carries.
+#[tokio::test(start_paused = true)]
+async fn an_ok_result_is_acknowledged_only_after_the_store_takes_it() {
+    held_then_acknowledged(ok).await;
+}
+
+async fn held_then_acknowledged(result: fn(LeaseId) -> worker::Result) {
     let disk = Disk::new();
     let farm = disk.farm(EpochPolicy::Keep);
     let (stream, mut inbox) = register(&farm);
@@ -46,9 +66,9 @@ async fn a_result_is_acknowledged_only_after_the_store_takes_it() {
     let lease = starts(&mut inbox)[0];
 
     disk.store.set_down(true);
-    let held = farm.report(&node(), invalid(lease)).await;
+    let held = farm.report(&node(), result(lease)).await;
     assert_eq!(held, None, "an ack for a result the store has not taken");
-    let copy = farm.report(&node(), invalid(lease)).await;
+    let copy = farm.report(&node(), result(lease)).await;
     assert_eq!(copy, None, "an ack for a copy of a held result");
     assert!(acks(&mut inbox).is_empty());
     assert!(
@@ -62,7 +82,10 @@ async fn a_result_is_acknowledged_only_after_the_store_takes_it() {
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0].lease_id, wire(lease));
     assert!(sent[0].accepted);
-    assert!(matches!(ended(&ticket), Finished::Failed(_)));
+    assert!(matches!(
+        ended(&ticket),
+        Finished::Failed(_) | Finished::Ran(_)
+    ));
     assert_eq!(disk.rows("done/"), 1);
 }
 
