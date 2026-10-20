@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use xtask::pkg::sha1::cksum;
 
 mod support;
+use kbf_testkit::dir::TestDir;
 use support::{BUSY_WAIT, output_unbusy};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -108,11 +109,11 @@ fn s(p: &Path) -> &str {
 /// the target's tmp dir, not a shared parent: the `installer` test runs as root first
 /// (`cargo xtask sudo-test`) and a shared parent it created would be root's, so the
 /// `homebrew` test, run as the runner's user after it, could not create its own.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("xtask-pkg-macos-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("xtask-pkg-macos-{name}"),
+    )
 }
 
 /// The stub copied as `kbf-installer`, signed ad hoc as CI signs a release binary

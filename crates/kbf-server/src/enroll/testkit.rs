@@ -111,15 +111,26 @@ pub fn farm(name: &str) -> Farm {
 
 /// The service over `store` and `ca`.
 pub fn service_over(store: &Arc<dyn Store>, ca: &Arc<Ca>) -> EnrollService {
+    service_with(store, ca, settings())
+}
+
+/// What the test frontend tells nodes unless a test starts it with other flags.
+pub fn settings() -> NodeSettings {
+    NodeSettings {
+        worker_endpoint: "https://front.test:7443".to_owned(),
+        cas_endpoint: String::new(),
+        storage_port: 8983,
+    }
+}
+
+/// The service over `store` and `ca` as a frontend started with `settings` makes it: a
+/// restart with other `--enroll-*` flags is a new service over the same store and CA.
+pub fn service_with(store: &Arc<dyn Store>, ca: &Arc<Ca>, settings: NodeSettings) -> EnrollService {
     EnrollService::new(
         Arc::clone(store),
         Arc::clone(ca),
         &[FRONTEND.to_owned()],
-        NodeSettings {
-            worker_endpoint: "https://front.test:7443".to_owned(),
-            cas_endpoint: String::new(),
-            storage_port: 8983,
-        },
+        settings,
     )
 }
 
@@ -133,6 +144,57 @@ impl Farm {
     pub fn now(&self) -> i64 {
         i64::try_from(self.store.now().as_duration().as_secs()).expect("time")
     }
+}
+
+/// What `register_cold` registers: the access key id and the secret an operator sent. They
+/// are what no enroll answer may carry.
+pub const COLD_ACCESS_KEY: &str = "AKIDEXAMPLEKEYID";
+/// See [`COLD_ACCESS_KEY`].
+pub const COLD_SECRET: &str = "wJalrXUtnFEMI-secret-do-not-send";
+
+/// Registers the cold store as an operator does (a connection and the `cold` binding, in
+/// the farm's state store) and returns the registry generation after it. The connection
+/// has a region, `conditional-put` and a put rate, so each shows in the URI.
+pub fn register_cold(farm: &Farm) -> u64 {
+    use crate::object_store::Registry;
+    use kbf_types::object_store_api::{
+        BindingPut, BindingRole, ConnectionName, ConnectionPut, Secret,
+    };
+    let registry = Registry::open(
+        Arc::clone(&farm.store),
+        &scratch("registry-secrets"),
+        Arc::new(super::OsRandom),
+    )
+    .expect("a registry");
+    let name: ConnectionName = "cold".parse().expect("a name");
+    registry
+        .put_connection(
+            &name,
+            &ConnectionPut {
+                endpoint: "http://s3.test:9000".to_owned(),
+                region: Some("eu-west-1".to_owned()),
+                access_key_id: COLD_ACCESS_KEY.to_owned(),
+                secret_access_key: Secret::new(COLD_SECRET.to_owned()),
+                conditional_put: Some(true),
+                min_put_rate: std::num::NonZeroU64::new(2048),
+                expect_generation: None,
+                verify: None,
+            },
+        )
+        .expect("a connection");
+    registry
+        .put_binding(
+            BindingRole::Cold,
+            &BindingPut {
+                connection: name,
+                bucket: "farm-cold".to_owned(),
+                prefix: "cold/main".to_owned(),
+                expect_generation: None,
+                verify: None,
+            },
+        )
+        .expect("a binding")
+        .generation
 }
 
 /// A token spec granting `roles`, one use, with no node id, prefix or names.

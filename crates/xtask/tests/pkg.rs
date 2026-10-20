@@ -7,6 +7,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 mod support;
+use kbf_testkit::dir::TestDir;
 use support::{BUSY_WAIT, output_unbusy};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -15,14 +16,11 @@ const PLIST: &str = "../../packaging/macos/com.komira.kbf-installer.plist";
 const URL: &str = "https://github.com/komira-ai/kbf/releases/download/v1/x";
 
 /// An empty directory of its own for one test, holding the stub as `kbf-installer`.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-pkg")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
+fn scratch(name: &str) -> TestDir {
+    let dir = TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-pkg"),
+        name,
+    );
     std::fs::copy(FAKE, dir.join("kbf-installer")).expect("the stub");
     dir
 }
@@ -75,20 +73,21 @@ fn the_stub_prints_its_arguments_on_both_outputs_and_exits_0() {
 
 /// The stub with a descriptor open for writing on it, as a forked child leaves it:
 /// running it is `ETXTBSY` until the descriptor is closed.
-fn held_open(name: &str) -> (PathBuf, std::fs::File) {
-    let stub = scratch(name).join("kbf-installer");
+fn held_open(name: &str) -> (PathBuf, std::fs::File, TestDir) {
+    let own = scratch(name);
+    let stub = own.join("kbf-installer");
     let held = std::fs::OpenOptions::new()
         .append(true)
         .open(&stub)
         .expect("open the stub for writing");
-    (stub, held)
+    (stub, held, own)
 }
 
 #[test]
 fn a_stub_held_open_for_writing_is_busy_to_a_plain_run() {
     // Catches: the two tests below passing on a file that is not busy at all, which
     // would prove neither the retry nor the deadline.
-    let (stub, _held) = held_open("busy-plain");
+    let (stub, _held, _own) = held_open("busy-plain");
     let err = Command::new(&stub).output().expect_err("the stub is busy");
     assert_eq!(err.kind(), io::ErrorKind::ExecutableFileBusy, "{err}");
 }
@@ -96,7 +95,7 @@ fn a_stub_held_open_for_writing_is_busy_to_a_plain_run() {
 #[test]
 fn a_busy_stub_runs_once_the_descriptor_closes() {
     // Catches: a run that gives up on the first ETXTBSY (the coverage job's failure).
-    let (stub, held) = held_open("busy-closes");
+    let (stub, held, _own) = held_open("busy-closes");
     let closer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
         drop(held);
@@ -115,7 +114,8 @@ fn a_busy_stub_runs_once_the_descriptor_closes() {
 fn an_error_that_is_not_busy_is_returned_at_once() {
     // Catches: a retry on any error (a missing program would be started again for the
     // whole wait instead of failing), which only the busy case may do.
-    let missing = scratch("not-busy").join("no-such-program");
+    let _missing_own = scratch("not-busy");
+    let missing = _missing_own.join("no-such-program");
     let started = Instant::now();
     let err = output_unbusy(&mut Command::new(&missing), Duration::from_secs(3))
         .expect_err("no such program");
@@ -132,7 +132,7 @@ fn a_stub_that_stays_busy_fails_with_busy_at_the_deadline() {
     // Catches: a retry with no end (the test would hang), and one that hides the error
     // it gave up on. The run is in a thread so that a loop without a deadline fails
     // this test instead of hanging the suite.
-    let (stub, _held) = held_open("busy-forever");
+    let (stub, _held, _own) = held_open("busy-forever");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let started = Instant::now();

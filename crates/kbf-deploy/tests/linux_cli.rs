@@ -1,18 +1,15 @@
 //! `kbf-deploy linux render-units` and `check-units` (always with `--mode`) as a user
 //! runs them: the lines printed, where, and the exit codes 0, 1 and 2.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
+
+use kbf_testkit::dir::TestDir;
 
 const EXAMPLE: &str = include_str!("../templates/linux/config.example");
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("linux_cli")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("linux_cli-{name}"))
 }
 
 fn run(args: &[&str]) -> (i32, String, String) {
@@ -156,21 +153,14 @@ fn a_mode_renders_and_checks_and_an_unknown_mode_is_refused() {
         "{stdout}"
     );
     let (code, stdout, _) = check("frontend");
-    // The frontend's flags are parsed by the installed kbf, or the check says it found
-    // none (a machine without kbf, such as CI): a SKIP line, then the verdict.
     assert_eq!(code, 0, "{stdout}");
+    // Other rules may note what this machine lacks (a user, a key file); none is
+    // about parsing, which kbf-cli's tests do.
     assert!(
         stdout.ends_with("UNIT OK: kbf-frontend@.service runs kbf frontend\n"),
         "{stdout}"
     );
-    assert!(
-        stdout
-            .lines()
-            .rev()
-            .skip(1)
-            .all(|l| l.starts_with("SKIP parse: ")),
-        "{stdout}"
-    );
+    assert!(!stdout.contains("parse"), "{stdout}");
 
     let unit = out.join("kbf-frontend@.service");
     let text = std::fs::read_to_string(&unit).expect("unit");
