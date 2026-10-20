@@ -42,11 +42,9 @@ impl Roots {
         }
     }
 
-    /// The binary a release's version is asked of.
+    /// The binary a release's version is asked of: `kbf` on both platforms. A macOS release
+    /// holds only `kbf`, and a Linux release's `kbf` is the one the old units run.
     pub fn binary(&self) -> &'static str {
-        match self.platform {
-            Platform::Linux => layout::RELEASE_BINARY,
-            Platform::MacOs => layout::RELEASE_DAEMON,
-        }
+        layout::RELEASE_BINARY
     }
 }

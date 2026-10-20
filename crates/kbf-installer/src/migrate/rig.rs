@@ -76,6 +76,8 @@ pub struct Rig {
     /// How long the migration waits for each lock ([`Migration::lock_wait`]); long, so that a
     /// test which holds a lock for a moment is waited out.
     pub lock_wait: Duration,
+    /// A host the Mac kit installed: it has no old helper, so the migration names none.
+    pub kit: bool,
 }
 
 pub fn put(path: &Path, bytes: &str, mode: u32) {
@@ -87,6 +89,18 @@ pub fn put(path: &Path, bytes: &str, mode: u32) {
 impl Rig {
     pub fn linux(name: &str) -> Rig {
         Rig::new(name, Platform::Linux)
+    }
+
+    /// A host the Mac kit installed (`testdata/kit_host/`), the job in `form`, running: the
+    /// tree, the plist and `kbf.toml` as the kit leaves them, and no old state.
+    pub fn kit(name: &str, platform: Platform, form: super::kit_host::Form) -> Rig {
+        let mut rig = Rig::bare(&format!("kit-{name}"), platform);
+        super::kit_host::lay_out(&rig.host.root, form);
+        rig.kit = true;
+        rig.active
+            .borrow_mut()
+            .insert("com.komira.kbf-daemon.plist".to_owned());
+        rig
     }
 
     pub fn mac(name: &str) -> Rig {
@@ -187,6 +201,7 @@ impl Rig {
             fail_start,
             on_command,
             lock_wait: Duration::from_secs(20),
+            kit: false,
         }
     }
 
@@ -313,7 +328,7 @@ impl Rig {
             },
             owner_uid: me(),
             units: vec![self.daemon()],
-            helper_unit: Some(self.helper()),
+            helper_unit: (!self.kit).then(|| self.helper()),
             installer_unit: Some(match self.platform {
                 Platform::Linux => unit("kbf-installer.service"),
                 Platform::MacOs => unit("com.komira.kbf-installer.plist"),

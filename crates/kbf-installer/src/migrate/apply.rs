@@ -115,13 +115,18 @@ fn judge(m: &Migration, old: &Old) -> Result<OldTree, MigrateError> {
 }
 
 /// What the plan says of the floor, the staged release and the releases found.
-fn report_plan(
-    report: &mut Report,
-    mode: Mode,
-    seeded: &Seeded,
-    staged: Option<&CommitId>,
-    found: &[Found],
-) {
+fn report_plan(report: &mut Report, mode: Mode, seeded: &Seeded, old: &Old, found: &[Found]) {
+    let staged = old.state.staged.as_ref();
+    if let Some(form) = old.kit {
+        report.line(
+            mode,
+            format!(
+                "a host the Mac kit installed ({}): the links are the state; there is no old \
+                 state or helper memory to carry over",
+                form.describe()
+            ),
+        );
+    }
     report.warnings.extend(seeded.warnings.iter().cloned());
     report.min_generation = seeded.min_generation;
     if let Some(generation) = seeded.min_generation {
@@ -197,7 +202,7 @@ pub fn migrate<E: Exec>(
     // (`found`, and the names it probed them under); what it read is not written from. The
     // source of the floor is asked here too, once: the frontend is a call over the network,
     // not one to make with the locks held.
-    let (found, probed, claim) = {
+    let (found, probed, claim, kit) = {
         let first = match look(m, &rules)? {
             Look::Settled(report) => return Ok(report),
             Look::Old(seen) => seen,
@@ -219,7 +224,7 @@ pub fn migrate<E: Exec>(
                 &mut report,
                 mode,
                 &floor::seed(&first.old.memory, &claim),
-                first.old.state.staged.as_ref(),
+                &first.old,
                 &found,
             );
             plan(m, exec, &mut report)?;
@@ -229,12 +234,15 @@ pub fn migrate<E: Exec>(
             first.old.state.current.clone(),
             first.old.state.previous.clone(),
         ];
-        (found, probed, claim)
+        (found, probed, claim, first.old.kit.is_some())
     };
     // Both locks: no verb of the old tools is mid-way, and no run of the installer changes
     // its state while this one does. Each is waited for `m.lock_wait` and no longer (busy,
     // exit 4), the old tools' first and let go with the error.
-    let _old_lock = OldLock::take(&m.layout, &m.roots, m.lock_wait)?;
+    // A kit host has none: the kit keeps no lock, and none is made for it.
+    let _old_lock = (!kit)
+        .then(|| OldLock::take(&m.layout, &m.roots, m.lock_wait))
+        .transpose()?;
     state::make_lock_dir(&m.layout)?;
     let lock = Locked::acquire_within(&m.layout, m.lock_wait)?;
     // Everything read before the locks may be stale by now: a verb of the old tools (or the
@@ -251,20 +259,22 @@ pub fn migrate<E: Exec>(
         }
     };
     unchanged(&probed, &seen.old)?;
+    if seen.old.kit.is_some() != kit {
+        return Err(MigrateError::Changed(
+            "the host is no longer the kind of host it was: a kit host and an old host \
+             are not each other"
+                .to_owned(),
+        ));
+    }
     let Seen { journal, old, .. } = *seen;
     let seeded = floor::seed(&old.memory, &claim);
     let mut report = Report::new(Outcome::Migrated);
-    report_plan(
-        &mut report,
-        mode,
-        &seeded,
-        old.state.staged.as_ref(),
-        &found,
-    );
+    report_plan(&mut report, mode, &seeded, &old, &found);
     let tree = NewTree::create(&m.layout, &rules)?;
     tree.sweep_partials()?;
     let mut journal = journal.unwrap_or_else(|| Journal::new(Vec::new(), None));
     journal.phase = Phase::Started;
+    journal.kit = kit;
     journal.units = m.units.clone();
     journal.helper_unit = m.helper_unit.clone();
     tree.state.put_journal(&journal)?;
@@ -387,7 +397,10 @@ pub fn migrate<E: Exec>(
     }
     journal.phase = Phase::Done;
     tree.state.put_journal(&journal)?;
-    note_old_state(m)?;
+    // A kit host has no old state directory to leave a note in, and none is made.
+    if !kit {
+        note_old_state(m)?;
+    }
     Ok(report)
 }
 

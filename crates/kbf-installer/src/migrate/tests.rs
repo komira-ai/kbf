@@ -444,7 +444,7 @@ fn each_unit_is_rewritten_left_alone_or_skipped_and_the_report_says_which() {
 
 /// Catches the macOS path using Linux's: a Mac host's plist is rewritten to the Mac tree
 /// (`/usr/local/kbf-installer`), the state goes to `/var/db/kbf-installer`, the probe asks
-/// `kbf-daemon`, launchd is stopped with `bootout`, restarted with `bootstrap`, and the
+/// `kbf` (a macOS release holds only that), launchd is stopped with `bootout`, restarted with `bootstrap`, and the
 /// helper is disabled in the system domain.
 ///
 /// Mutants seen red: the Linux roots used on macOS; `bootstrap` given the label, not the plist.
@@ -456,7 +456,7 @@ fn a_mac_host_comes_over_through_launchd() {
     assert!(
         seen.calls()[0]
             .program
-            .ends_with("releases/".to_owned() + A + "/kbf-daemon")
+            .ends_with("releases/".to_owned() + A + "/kbf")
     );
     let tree = rig.new_tree();
     assert_eq!(tree, rig.at("usr/local/kbf-installer"));

@@ -46,6 +46,10 @@ pub struct Journal {
     /// rollback starts again at its own).
     pub stopped: Vec<Unit>,
     pub adopted: Vec<Adopted>,
+    /// A host the Mac kit installed: it has no old state directory and no old lock, so a
+    /// rollback takes and leaves none.
+    #[serde(default)]
+    pub kit: bool,
 }
 
 impl Journal {
@@ -57,6 +61,7 @@ impl Journal {
             helper_unit,
             stopped: Vec::new(),
             adopted: Vec::new(),
+            kit: false,
         }
     }
 
