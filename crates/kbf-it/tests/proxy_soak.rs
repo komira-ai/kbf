@@ -50,8 +50,8 @@ use kbf_proxy::control::NoUpdates;
 use kbf_proxy::slot::{Retire, Slot};
 use kbf_testkit::dir::TestDir;
 use proxy_support::{
-    Child, Open, actions, api_get, connect, free_base, frontend_args, open_executions,
-    proxy_config, proxy_get, storage_node, store, until, until_ready, within,
+    Child, Open, actions, api_get, connect, free_base, frontend_args, link_kbf, open_executions,
+    own_config, proxy_config, proxy_get, storage_node, store, until, until_ready, within,
 };
 
 pub fn frontend(dir: &Path, name: &str, node: &Child, base: u16) -> Child {
@@ -74,12 +74,7 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
     // Declared first, so it drops last: the children are reaped before it is removed.
     let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "proxy-soak");
     let dir = scratch.path().to_path_buf();
-    std::fs::create_dir_all(dir.join("bin")).expect("scratch");
-    std::os::unix::fs::symlink(
-        std::env::current_exe().expect("this binary"),
-        dir.join("bin/kbf"),
-    )
-    .expect("link kbf");
+    link_kbf(&dir);
 
     let (node_a, node_b) = (storage_node(&dir, "node-a"), storage_node(&dir, "node-b"));
     let base = free_base();
@@ -269,4 +264,24 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
     handle.shutdown();
     serving.join().expect("the runner thread").expect("run");
     drop((node_a, node_b));
+}
+
+/// Catches a child started with no `--config` of its own: it would read /etc/kbf/kbf.toml
+/// on a host that has one, and the soak would then pass or fail by the host it runs on.
+#[test]
+fn every_child_is_started_with_a_config_of_the_tests_own() {
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "soak-config");
+    let own = dir.join("kbf.toml");
+    let argv = own_config(&dir, &["storage".to_owned(), "--x=1".to_owned()]);
+    assert_eq!(
+        argv,
+        [
+            "storage".to_owned(),
+            format!("--config={}", own.display()),
+            "--x=1".to_owned()
+        ]
+    );
+    assert_eq!(std::fs::read(&own).expect("the file"), b"");
+    let given = ["storage".to_owned(), "--config=/elsewhere".to_owned()];
+    assert_eq!(own_config(&dir, &given), given, "a --config given is kept");
 }

@@ -138,6 +138,12 @@ async fn a_registered_store_reaches_a_storage_node_and_its_report_reaches_the_op
             2
         )
     );
+    // The registration names no region and no rate: the node is handed the ones the
+    // frontend verified with, not an empty field it would fill from its own flag.
+    assert_eq!(
+        (config.region.as_str(), config.min_put_rate),
+        ("us-east-1", 1 << 20)
+    );
     let again = cold
         .get_store_config(GetStoreConfigRequest { have_generation: 2 })
         .await
