@@ -338,9 +338,9 @@ fn the_production_stop_bound_is_ten_seconds() {
     assert_eq!(STOP_BOUND, Duration::from_secs(10));
 }
 
-/// Catches `serve` building its stop with another bound or another exit: the stop it uses is
-/// `Stop::production`, whose fields are pinned here. A bound of an hour, or an exit that does
-/// nothing, would leave every other test green and the process alive after a hung drain.
+/// Catches `Stop::production` carrying another bound or another exit than the verb's: its
+/// fields are pinned here. It does not see which `Stop` `serve` builds (a literal `Stop` in
+/// `serve` would pass); `serve` takes its stop from `Stop::production` and reads as such.
 #[test]
 fn the_production_stop_ends_the_process_after_the_bound() {
     let stop = Stop::production();

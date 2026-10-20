@@ -5,6 +5,7 @@ use std::os::fd::AsRawFd as _;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use kbf_testkit::dir::TestDir;
 use kbf_testkit::reaped::{self, GRACE};
 
 const ACT: &str = env!("CARGO_BIN_EXE_kbf-act");
@@ -23,8 +24,8 @@ fn gone(pid: i32) -> bool {
 fn a_child_that_ignores_sigterm_is_killed_and_reaped_on_drop() {
     let mut command = Command::new(ACT);
     // The flag says the signal is ignored already: a SIGTERM that came first would end it.
-    let flag = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("reaped-ignoring");
-    let _ = std::fs::remove_dir(&flag);
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "reaped-ignoring");
+    let flag = dir.join("started");
     command.args(["ignore-signal", "15", ";", "mkdir"]);
     command.arg(&flag).args([";", "sleep", "60"]);
     let child = reaped::spawn(&mut command, 3).expect("spawn");
@@ -243,7 +244,7 @@ fn orphaning_parent_helper() {
         return;
     };
     let mut sleep = Command::new("sleep");
-    sleep.arg("600");
+    sleep.arg("60");
     let child = reaped::spawn(&mut sleep, 3).expect("spawn");
     std::fs::write(&file, child.id().to_string()).expect("pid file");
     std::process::exit(0);
@@ -254,8 +255,11 @@ fn orphaning_parent_helper() {
 /// on holding the build slots.
 #[test]
 fn a_guarded_child_dies_when_its_parent_dies_without_unwinding() {
-    let file = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("reaped-orphan-pid");
-    let _ = std::fs::remove_file(&file);
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "reaped-orphan");
+    let file = dir.join("pid");
+    // The helper's stdout and stderr go nowhere: the sleeper inherits them, and a pipe the
+    // sleeper holds open would keep `output()` waiting until the sleeper ended on its own,
+    // which made this test pass without the hook.
     let status = Command::new(std::env::current_exe().expect("this binary"))
         .args([
             "--ignored",
@@ -264,9 +268,10 @@ fn a_guarded_child_dies_when_its_parent_dies_without_unwinding() {
             "--test-threads=1",
         ])
         .env("KBF_REAPED_PIDFILE", &file)
-        .output()
-        .expect("helper")
-        .status;
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("helper");
     assert!(status.success());
     let pid: i32 = std::fs::read_to_string(&file)
         .expect("pid")
