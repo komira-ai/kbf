@@ -13,14 +13,15 @@ use crate::CommitId;
 
 use super::model::{
     AdoptError, CrashPoint, Halt, Intent, Locator, OpenCounts, PortError, ProcIdent, Readiness,
-    Request, RoleInfo, Slot, StagedFacts,
+    Request, Retired, RoleInfo, Slot, StagedFacts, Start,
 };
 
 /// The process side of the children. The proxy starts them as its own processes.
 pub trait Child {
-    /// Start `releases/<commit>/kbf --mode frontend` in `slot`. The returned identity is
+    /// Start `releases/<commit>/kbf --mode=frontend` in `slot`, listening on the slot's
+    /// ports and, for [`Start::Candidate`], waiting for a takeover. The returned identity is
     /// what the intent record keeps for adoption.
-    fn spawn(&self, slot: Slot, release: &CommitId) -> Result<ProcIdent, PortError>;
+    fn spawn(&self, slot: Slot, release: &CommitId, start: Start) -> Result<ProcIdent, PortError>;
 
     /// Take over a process recorded before a restart. Refuses a recycled pid: the live
     /// process must match pid, start time and executable ([`super::model::verify_ident`]).
@@ -69,7 +70,7 @@ pub trait ChildAdmin {
 }
 
 /// The proxy's routing state for the update: the hold and the per-slot permits. The hold
-/// lives in U4b; the swap only drives it.
+/// lives in `kbf-proxy` (U4b); the swap only drives it ([`super::gate_real::ProxyGate`]).
 pub trait Gate {
     /// Accept new streams and read their headers but open nothing to a backend, for at
     /// most `max`. The update API, `/healthz`, `/readyz` and metrics bypass it.
@@ -80,12 +81,23 @@ pub trait Gate {
     fn release_into(&self, slot: Slot) -> Result<(), PortError>;
 
     /// Fail each held stream that has waited `hold_max` with gRPC `UNAVAILABLE` and count
-    /// it in `kbf_proxy_hold_expired_total`. Returns how many. Does not end the update.
+    /// it in the hold-expired counter of the proxy's metrics. Returns how many. Does not end the update.
     /// The swap calls it on every poll of a wait and before it releases the hold.
     fn expire(&self) -> usize;
 
     /// The proxy's permits on `slot`: client streams bound to it that are still open.
     fn open_streams(&self, slot: Slot) -> u64;
+
+    /// No slot is active; a hold in force stays. The all-in-one swap calls it as soon as
+    /// the old process is stopped, so the release that follows (or a failed start) answers
+    /// `UNAVAILABLE` at once instead of binding streams to a dead child.
+    fn clear_active(&self);
+
+    /// The proxy's commit on `slot`: close it if it is not active and no stream is bound.
+    /// The swap signals a child only when this says [`Retired::Closed`], after the child's
+    /// own counts are zero. A slot closed here is opened again, under a new generation, by
+    /// the next `release_into` it receives.
+    fn retire(&self, slot: Slot) -> Retired;
 }
 
 /// Forward, backward-compatible Postgres migrations. The kbf child never alters tables
