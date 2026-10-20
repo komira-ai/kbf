@@ -189,6 +189,7 @@ fn raw() -> Raw {
         database: None,
         kbf: Default::default(),
         proxy: Default::default(),
+        deploy: Default::default(),
         create_local_database: false,
         installer_config: None,
     }
