@@ -20,9 +20,9 @@
 //!   release already current, changes nothing.
 //! - [`confirm`]: the new release came up and says so; the swap is kept. It must name
 //!   the order that made the swap.
-//! - [`revert`]: `current` goes back to the release that ran before; the state is
-//!   written first. If that release is gone, nothing is changed and the swap stays
-//!   pending, for the operator to see.
+//! - [`revert`]: `current` goes back to the release that ran before (a `staged` that names
+//!   it is cleared, as the rollback does); the state is written first. If that release is
+//!   gone, nothing is changed and the swap stays pending, for the operator to see.
 //! - [`boot_check`] runs before every start of the service. The window to confirm starts
 //!   at the first start after the swap, not at the swap: the frontend's own update can
 //!   wait hours between the two. With a start budget (Linux), a release that was
@@ -210,7 +210,8 @@ pub fn activate<E: Exec>(
 /// Make `commit`, installed and verified, the release that runs on a host that has none:
 /// `setup`'s first release. There is no trial (nothing to go back to) and no confirm. The
 /// state is written first and the links follow, as in [`activate`]; a repeat for the same
-/// commit only makes the links agree.
+/// commit only makes the links agree. A `staged` that names the commit is cleared, as in
+/// [`activate`]: a release that is current is not waiting for a decision.
 pub fn first<E: Exec>(
     exec: &mut E,
     host: &Layout,
@@ -228,8 +229,10 @@ pub fn first<E: Exec>(
     if !has_binary(exec, host, commit) {
         return Err(ReleaseError::NotInstalled(commit.clone()));
     }
+    // As in `activate`: a release that is current is not staged.
     let next = State {
         current: Some(commit.clone()),
+        staged: state.staged.filter(|c| c != commit),
         ..state
     };
     lock.write(&next)?;
@@ -396,6 +399,9 @@ pub(crate) fn revert_in<E: Exec>(
         current: Some(to.clone()),
         previous: None,
         pending_confirm: None,
+        // As in `activate`: a release that is current is not staged (the proxy may have
+        // staged the release that was `previous`).
+        staged: state.staged.filter(|c| *c != to),
         ..state
     };
     lock.write(&next)?;
@@ -419,6 +425,8 @@ pub(crate) fn rollback_in<E: Exec>(
     let next = State {
         current: Some(to.clone()),
         previous: None,
+        // As in `revert_in`: the release put back is not staged.
+        staged: state.staged.filter(|c| *c != to),
         ..state
     };
     lock.write(&next)?;
