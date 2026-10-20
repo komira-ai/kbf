@@ -2,8 +2,9 @@
 //! (`support/fake.rs`): the action's own failure, never the farm's.
 //! `crun_env.rs` runs the same cases against real rootless `crun`.
 //!
-//! The fake refuses a start with its `crun-error` knob: it logs the text as an error
-//! record, as `crun --log-format json` does, and exits before the action runs.
+//! The fake models the container's init refusing the program with its `init-says` knob
+//! (the text on the report file, exit 127 or 126), and `crun` failing itself with its
+//! `crun-error` knob (the text as an error record, as `crun --log-format json` does).
 
 mod support;
 
@@ -11,14 +12,19 @@ use kbf_daemon::RuntimeError;
 use support::fake::{Fake, image};
 use support::{Spec, blob};
 
-/// What `crun` 1.14 logs when it cannot find the program `name`.
+/// What the init reports, in `crun` 1.14's words, when it cannot find the program `name`.
 fn not_found(name: &str) -> String {
     format!("executable file `{name}` not found in $PATH: No such file or directory")
 }
 
-/// The fake's next start is refused with `said`.
+/// The fake's next starts are refused by the init with `said`.
 fn refuse(fake: &Fake, said: &str) {
-    fake.knob("crun-error", said);
+    let code = if said.starts_with("open executable") {
+        126
+    } else {
+        127
+    };
+    fake.init_says(said, code, false);
 }
 
 fn spec(argv: &[&str], env: &[(&str, &str)]) -> Spec {
@@ -102,10 +108,10 @@ async fn a_program_that_cannot_be_executed_is_the_actions_failure() {
     }
 }
 
-/// Catches the classification trusting anything but crun's report of the program
-/// lookup, which would make a farm fault the client's. Any other error of `crun` (a
-/// missing mount source, a cgroup it may not write) stays the farm's; so does crun
-/// naming another program than `argv[0]`. And an action that ran and printed crun's
+/// Catches the classification trusting anything but the init's report of the program
+/// lookup, which would make a farm fault the client's. Any error of `crun` (a missing
+/// mount source, a cgroup it may not write, an exec of the init it words as a lookup)
+/// stays the farm's; so does the init naming another program than `argv[0]`. And an action that ran and printed crun's
 /// words itself keeps its own exit code.
 #[tokio::test]
 async fn only_crun_naming_the_program_makes_it_the_actions() {
@@ -114,9 +120,19 @@ async fn only_crun_naming_the_program_makes_it_the_actions() {
         "mount `/scratch/root` to `/kbf/root`: No such file or directory".to_owned(),
         "write to `/sys/fs/cgroup/kbf/pids.max`: Operation not permitted".to_owned(),
         not_found("other"),
+        // `crun` itself, whatever it says, is about the init: never the action's.
+        not_found("env"),
     ];
     for (seq, said) in (1..).zip(&cases) {
-        refuse(&fake, said);
+        if seq == 4 {
+            std::fs::remove_file(fake.state.join("init-says")).expect("rm knob");
+            fake.knob("crun-error", said);
+        } else if seq <= 2 {
+            fake.knob("crun-error", said);
+        } else {
+            let _ = std::fs::remove_file(fake.state.join("crun-error"));
+            refuse(&fake, said);
+        }
         let outcome = fake.run(seq, &spec(&["env"], &[]), &["exit", "0"]).await;
         assert!(
             matches!(&outcome, Err(RuntimeError::Failed(why))
@@ -127,6 +143,7 @@ async fn only_crun_naming_the_program_makes_it_the_actions() {
     }
 
     std::fs::remove_file(fake.state.join("crun-error")).expect("rm knob");
+    let _ = std::fs::remove_file(fake.state.join("init-says"));
     let said = format!(
         "Error: unable to start container: crun: {}",
         not_found("env")
