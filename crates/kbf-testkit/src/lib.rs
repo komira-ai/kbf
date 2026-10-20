@@ -8,6 +8,8 @@
 //!   have written `sh -c`.
 //! - [`fake`]: the same binary run through a link named `xcrun`, `xcodebuild` or
 //!   `sandbox-exec` answers as that tool, from a rules file the test writes.
+//! - [`config`]: the empty `kbf.toml` a test hands to every `kbf` child it starts, so the child
+//!   never reads the host's settings file.
 //! - [`dir`]: a scratch directory a test owns and that is removed on drop.
 //! - [`port`]: loopback ports a test can rely on (dead ones, and ones held until used).
 //! - [`forked`]: a child held between `fork` and `exec`, to show what a lock or a file
@@ -38,6 +40,7 @@
 use std::io::Write;
 
 pub mod act;
+pub mod config;
 pub mod dir;
 pub mod fake;
 pub mod forked;

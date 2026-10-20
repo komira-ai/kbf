@@ -4,16 +4,33 @@
 
 use crate::layout::Platform;
 
-/// kbf's configuration directory (root:root 0755).
-pub const ETC_DIR: &str = "/etc/kbf";
+/// kbf's configuration directory (root:root 0755): `/etc/kbf`, `/usr/local/etc/kbf` on a Mac.
+pub fn etc_dir(platform: Platform) -> &'static str {
+    platform.config_dir()
+}
 /// kbf's runtime config: mode, the frontend URL, the enrollment token's path.
-pub const KBF_TOML: &str = "/etc/kbf/kbf.toml";
+pub fn kbf_toml(platform: Platform) -> &'static str {
+    platform.kbf_toml()
+}
 /// The installer's settings; `setup` is its only writer.
-pub const INSTALLER_TOML: &str = "/etc/kbf/installer.toml";
+pub fn installer_toml(platform: Platform) -> &'static str {
+    platform.installer_toml()
+}
 /// The enrollment token `setup` places from `--token-file`.
-pub const ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
+pub fn enroll_token(platform: Platform) -> &'static str {
+    platform.enroll_token()
+}
 /// The first operator token, written once on a frontend or all-in-one host.
-pub const API_TOKEN: &str = "/etc/kbf/api-token";
+pub fn api_token(platform: Platform) -> &'static str {
+    platform.api_token()
+}
+
+/// The directory of `kbf-proxy.socket`'s drop-ins (root:root 0755), where systemd reads
+/// what overrides the packaged unit.
+pub const PROXY_SOCKET_DIR: &str = "/etc/systemd/system/kbf-proxy.socket.d";
+/// The drop-in `setup` writes from `[proxy] listen` of `installer.toml`: it is the only file
+/// of that name and its only writer.
+pub const PROXY_LISTEN_DROPIN: &str = "/etc/systemd/system/kbf-proxy.socket.d/listen.conf";
 
 /// kbf's own state directory, where enrollment keeps the node's certificates (`pki/`).
 pub fn kbf_state_dir(platform: Platform) -> &'static str {

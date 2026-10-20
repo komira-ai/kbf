@@ -196,6 +196,7 @@ async fn build(pki: &Pki, owner: &Node, pushes_map: bool, scratch: &std::path::P
         hello_wait: Duration::from_secs(2),
         tick: Duration::from_millis(50),
         unservable_wait: Duration::from_secs(300),
+        default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: Duration::from_secs(60),
         shutdown_timeout: Duration::from_secs(10),

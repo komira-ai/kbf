@@ -13,6 +13,7 @@
 
 #![cfg(target_os = "linux")]
 
+use kbf_testkit::dir::TestDir;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt as _;
@@ -373,25 +374,21 @@ fn answer(request: &Request, defect: &str, counts: &Counts) -> (&'static str, St
     }
 }
 
-/// A fresh directory for one run of one test.
-fn scratch(name: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after 1970")
-        .as_nanos();
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-m1-tests")
-        .join(format!("{name}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create a scratch directory");
-    dir
+/// A fresh directory for one run of one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-m1-tests"),
+        name,
+    )
 }
 
 /// One fake cell: the fakes in `<dir>/bin`, the HTTP fake, and `kbf-cell m1`'s work
 /// directory `<dir>/work`.
 struct Cell {
-    dir: PathBuf,
     defect: String,
     http: Http,
+    /// Last: removed after the fake server is gone.
+    dir: TestDir,
 }
 
 impl Cell {
@@ -438,7 +435,7 @@ impl Cell {
             .arg(self.http.addr.to_string())
             .env("AWS_ACCESS_KEY_ID", "test-access")
             .env("AWS_SECRET_ACCESS_KEY", "test-secret")
-            .env(fake::DIR, &self.dir)
+            .env(fake::DIR, self.dir.path())
             .env(fake::DEFECT, &self.defect)
             .env(fake::DAEMON_LOG, self.work().join("logs/daemon.err"));
         for tool in tools {
