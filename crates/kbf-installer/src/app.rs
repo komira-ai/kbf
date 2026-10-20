@@ -139,17 +139,26 @@ struct Target {
 /// The target of `run`: the service its flags name, else (Linux) the unit of the mode in the
 /// host's `kbf.toml`, which is how the one packaged `kbf-installer.service` serves every mode.
 /// A unit found that way on a frontend or all-in-one host reads the host's `installer.toml`
-/// (`/etc/kbf`, `/usr/local/etc/kbf` on a Mac) when `--installer-config` is not given (`setup`
-/// wrote it there); a Mac names its launchd label in the property list.
+/// (`/etc/kbf`) when `--installer-config` is not given (`setup` wrote it there). A Mac derives
+/// nothing: it is a daemon-only node whose property list always names its launchd label, so
+/// `run` there needs `--launchd-label`.
 fn target_of(root: &Path, args: &RunArgs) -> Result<Target, Failure> {
+    target_on(root, args, Platform::current())
+}
+
+/// [`target_of`] for the host of `platform`, which the layout (the `kbf.toml` it reads, the
+/// `installer.toml` it defaults to) is of: the platform is a parameter so that a test can say
+/// which platform's rule it pins.
+fn target_on(root: &Path, args: &RunArgs, platform: Platform) -> Result<Target, Failure> {
     if let Some(service) = args.named_service() {
         return Ok(Target {
             service,
             installer_config: args.installer_config.clone(),
         });
     }
-    let (layout, _) = host(root.to_path_buf()).map_err(usage)?;
-    let service = derived_service(&layout, layout.platform())?;
+    let root = Root::new(root.to_path_buf()).map_err(|e| usage(e.to_string()))?;
+    let layout = Layout::new(root, platform);
+    let service = derived_service(&layout, platform)?;
     let default = (args.installer_config.is_none() && service.runs_database_mode())
         .then(|| layout.installer_toml());
     let installer_config = args.installer_config.clone().or(default);
