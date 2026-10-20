@@ -1,23 +1,18 @@
-//! The `test` job's ratchet step prints a command that downloads this run's
-//! artifact (`kbf-coverage --run-id ... --artifact ...`), so the step's flags must
-//! name what the job uploads: the run is `$GITHUB_RUN_ID` (the id `gh run download`
-//! takes; `$GITHUB_RUN_NUMBER` is another number), the repository is
-//! `$GITHUB_REPOSITORY`, and `--artifact` is the `name:` of an `actions/upload-artifact`
-//! step after it whose `path:` lists the `--write-baseline` file. That upload must also
-//! run when the ratchet step fails (its `if:` is `!cancelled()` or `always()`), since a
-//! failing step is when the command is printed, and every path it lists must sit in the
-//! measured file's directory: the artifact's top level is the paths' deepest common
-//! directory, and the command reads `"$d"/<file name>`. Nothing else fails when they
-//! drift: the printed command just stops working, and only a contributor whose coverage
-//! improved finds out. [`wiring`] reads them from the workflow.
-
-use std::path::Path;
+//! The `test` job's coverage steps keep the gate whole: the step that runs
+//! `kbf-coverage` against the floors file must not be skipped by an `if:`, and a step
+//! must check on pull requests that no floor is lower than the base's. Nothing else
+//! notices when a refactor of the job drops the second step or gives either a
+//! condition: the gate would pass every pull request, and floors could be lowered. The
+//! rules read the workflow; [`wiring`] returns how it does not meet them.
 
 use super::workflows;
 
-/// The workflow and job that run the ratchet.
+/// The workflow and job that run the gate, and the floors file they name.
 const CI: &str = ".github/workflows/ci.yml";
 const JOB: &str = "test";
+const FLOORS: &str = "coverage-floors";
+/// Where the checkout of the base puts its copy of the floors file.
+const BASE: &str = "base/coverage-floors";
 
 /// The `with:` input `key` of `step`.
 fn input<'a>(step: &'a workflows::Step, key: &str) -> Option<&'a str> {
@@ -27,227 +22,293 @@ fn input<'a>(step: &'a workflows::Step, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// The `kbf-coverage` step of `job` agrees with the upload step after it; an error
-/// says how it does not.
-fn wiring(workflow: &str, job: &str) -> Result<(), String> {
+/// The words of a `run:` script, with quotes stripped.
+fn words(run: &str) -> Vec<&str> {
+    run.split_whitespace()
+        .map(|w| w.trim_matches('"'))
+        .collect()
+}
+
+/// The word after `flag`.
+fn flag<'a>(words: &[&'a str], flag: &str) -> Option<&'a str> {
+    let at = words.iter().position(|w| *w == flag)?;
+    words.get(at + 1).copied()
+}
+
+/// The kbf-coverage steps of `job` meet the rules; an error says how they do not.
+fn wiring(workflow: &str, job: &str, floors_exist: bool) -> Result<(), String> {
     let steps = workflows::job_steps(workflow, job)?;
-    let (at, run) = steps
-        .iter()
-        .enumerate()
-        .find_map(|(i, s)| {
-            Some((i, s.run.as_deref()?)).filter(|(_, r)| r.contains("-p kbf-coverage "))
-        })
-        .ok_or_else(|| format!("the job `{job}` has no step running `-p kbf-coverage`"))?;
-    let words: Vec<&str> = run.split_whitespace().collect();
-    let flag = |f: &str| {
-        let at = words.iter().position(|w| *w == f)?;
-        words.get(at + 1).map(|v| v.trim_matches('"'))
+    let runs = |step: &&workflows::Step| {
+        step.run
+            .as_deref()
+            .is_some_and(|r| r.contains("-p kbf-coverage "))
     };
-    let need = |f: &str| flag(f).ok_or_else(|| format!("the kbf-coverage step has no `{f}`"));
-    for (f, want) in [
-        ("--run-id", "$GITHUB_RUN_ID"),
-        ("--repo", "$GITHUB_REPOSITORY"),
-    ] {
-        let got = need(f)?;
-        if got != want {
-            return Err(format!(
-                "the kbf-coverage step passes `{f} {got}`, not `{f} \"{want}\"`"
-            ));
+    let (gate, lowering): (Vec<_>, Vec<_>) = steps
+        .iter()
+        .filter(runs)
+        .partition(|s| !s.run.as_deref().unwrap_or_default().contains("no-lowering"));
+    let gate = gate.first().ok_or_else(|| {
+        format!("the job `{job}` has no step running the gate (`-p kbf-coverage`)")
+    })?;
+    let gate_words = words(gate.run.as_deref().unwrap_or_default());
+    for f in ["--lcov", "--root"] {
+        if flag(&gate_words, f).is_none() {
+            return Err(format!("the gate step has no `{f}`"));
         }
     }
-    let artifact = need("--artifact")?;
-    let written = need("--write-baseline")?;
-    let upload = steps[at + 1..]
+    if flag(&gate_words, "--floors") != Some(FLOORS) {
+        return Err(format!("the gate step does not pass `--floors {FLOORS}`"));
+    }
+    if let Some(condition) = &gate.condition {
+        return Err(format!(
+            "the gate step runs `if: {condition}`, so a pull request can skip it"
+        ));
+    }
+    if !floors_exist {
+        return Err(format!(
+            "the file `{FLOORS}` does not exist at the repository root"
+        ));
+    }
+    let step = lowering
+        .first()
+        .ok_or_else(|| format!("the job `{job}` has no step running `kbf-coverage no-lowering`"))?;
+    let lw = words(step.run.as_deref().unwrap_or_default());
+    if flag(&lw, "--floors") != Some(FLOORS) || flag(&lw, "--base") != Some(BASE) {
+        return Err(format!(
+            "the no-lowering step needs `--base {BASE}` and `--floors {FLOORS}`"
+        ));
+    }
+    if !lw.contains(&"--allow-missing-base") {
+        return Err(
+            "the no-lowering step lacks `--allow-missing-base`, so the change that \
+                    adds the file (a base without one) would fail"
+                .to_owned(),
+        );
+    }
+    let condition = step
+        .condition
+        .as_deref()
+        .ok_or("the no-lowering step has no `if:`, so it runs on pushes, where there is no base")?;
+    if !condition.contains("github.event_name == 'pull_request'") {
+        return Err(format!(
+            "the no-lowering step runs `if: {condition}`, not only on pull requests"
+        ));
+    }
+    // A failed gate step skips later steps unless the condition says otherwise.
+    if !condition.contains("!cancelled()") && !condition.contains("always()") {
+        return Err(format!(
+            "the no-lowering step runs `if: {condition}`, which a failed gate step skips; \
+             add `!cancelled() &&`"
+        ));
+    }
+    let at = |s: &workflows::Step| steps.iter().position(|o| std::ptr::eq(o, s));
+    if at(step) <= at(gate) {
+        return Err("the no-lowering step comes before the gate step".to_owned());
+    }
+    // The base's copy comes from a checkout of the base commit into `base`.
+    let checkout = steps
         .iter()
-        .filter(|s| {
+        .find(|s| {
             s.uses
                 .as_deref()
-                .is_some_and(|u| u.starts_with("actions/upload-artifact@"))
+                .is_some_and(|u| u.starts_with("actions/checkout@"))
+                && input(s, "path") == Some("base")
         })
-        .find(|s| input(s, "name") == Some(artifact))
-        .ok_or_else(|| {
-            format!(
-                "no actions/upload-artifact step after the kbf-coverage step is named `{artifact}`"
-            )
-        })?;
-    let paths = input(upload, "path").unwrap_or_default();
-    if !paths.lines().any(|p| p.trim() == written) {
-        return Err(format!(
-            "the `{artifact}` upload does not list `{written}` in its path"
-        ));
+        .ok_or("no actions/checkout step puts the base in `path: base`")?;
+    if !input(checkout, "ref").is_some_and(|r| r.contains("github.event.pull_request.base.sha")) {
+        return Err(
+            "the base checkout does not take `ref: ${{ github.event.pull_request.base.sha }}`"
+                .to_owned(),
+        );
     }
-    let dir = Path::new(written).parent();
-    if let Some(other) = paths
-        .lines()
-        .map(str::trim)
-        .find(|p| !p.is_empty() && Path::new(p).parent() != dir)
+    if !checkout
+        .condition
+        .as_deref()
+        .is_some_and(|c| c.contains("github.event_name == 'pull_request'"))
     {
+        return Err(
+            "the base checkout is not conditional on pull requests, where there is a base"
+                .to_owned(),
+        );
+    }
+    // A failed gate step skips later steps unless the condition says otherwise; a skipped
+    // checkout leaves no base file, which `--allow-missing-base` reads as a base without one.
+    let c = checkout.condition.as_deref().unwrap_or_default();
+    if !c.contains("!cancelled()") && !c.contains("always()") {
         return Err(format!(
-            "the `{artifact}` upload lists `{other}` outside the directory of `{written}`, \
-             so the file would not be at the artifact's top level"
+            "the base checkout runs `if: {c}`, which a failed gate step skips, and the \
+             no-lowering step would then find no base file and pass; add `!cancelled() &&`"
         ));
     }
-    // Without an `if:`, a step runs only while every step before it passed.
-    let condition = upload.condition.as_deref().ok_or_else(|| {
-        format!("the `{artifact}` upload has no `if:`, so a failed ratchet step skips it")
-    })?;
-    let bare = condition
-        .trim()
-        .strip_prefix("${{")
-        .and_then(|c| c.strip_suffix("}}"))
-        .unwrap_or(condition)
-        .trim();
-    if !["!cancelled()", "always()"].contains(&bare) {
-        return Err(format!(
-            "the `{artifact}` upload runs `if: {condition}`, which a failed ratchet step \
-             skips; use `!cancelled()` or `always()`"
-        ));
+    if at(checkout) >= at(step) {
+        return Err("the base checkout comes after the no-lowering step".to_owned());
     }
     Ok(())
 }
 
 #[test]
-fn the_coverage_command_downloads_what_the_job_uploads() {
-    // Catches: the artifact renamed on one side only, the run named by another
-    // variable (`$GITHUB_RUN_NUMBER`), or the measured file dropped from the upload,
-    // each of which leaves a printed `gh run download` command that cannot work.
+fn the_test_job_gates_coverage_and_floors() {
+    // Catches: the gate step skipped by a condition, or the no-lowering step dropped,
+    // renamed, run on pushes, or skipped after a failed gate.
     let text = std::fs::read_to_string(super::repo_root().join(CI)).expect(CI);
-    assert_eq!(wiring(&text, JOB), Ok(()), "{CI}");
+    let floors_exist = super::repo_root().join(FLOORS).is_file();
+    assert_eq!(wiring(&text, JOB, floors_exist), Ok(()), "{CI}");
 }
 
 /// The rules [`wiring`] reads the workflow by, on planted workflows.
 mod rules {
     use super::*;
 
-    const PIN: &str = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1";
+    const GATE: &str = "      - run: cargo run -p kbf-coverage --locked -- --lcov l --root r --floors coverage-floors\n";
+    const CHECKOUT: &str = "      - uses: actions/checkout@abc # v7\n        if: ${{ !cancelled() && github.event_name == 'pull_request' }}\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          path: base\n";
+    const LOWERING: &str = "      - if: ${{ !cancelled() && github.event_name == 'pull_request' }}\n        run: cargo run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base base/coverage-floors --floors coverage-floors\n";
+    const PR: &str = "github.event_name == 'pull_request'";
 
-    /// A coverage job: the ratchet step with `flags`, then `after`.
-    fn workflow(flags: &str, after: &str) -> String {
+    fn workflow(steps: &str) -> String {
         format!(
-            "on: push\npermissions: {{}}\njobs:\n  coverage:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Per-crate table and ratchet\n        run: cargo run -p kbf-coverage --locked -- --lcov l --root r --baseline b --write-baseline out/m {flags}\n{after}"
+            "on: push\npermissions: {{}}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n{steps}"
         )
     }
 
-    const FLAGS: &str = "--run-id \"$GITHUB_RUN_ID\" --repo \"$GITHUB_REPOSITORY\" --artifact cov";
+    fn check(steps: &str) -> Result<(), String> {
+        wiring(&workflow(steps), "test", true)
+    }
 
-    fn upload(name: &str, path: &str) -> String {
-        format!(
-            "      - uses: actions/upload-artifact@{PIN}\n        if: ${{{{ !cancelled() }}}}\n        with:\n          name: {name}\n          path: |\n            out/lcov.info\n            {path}\n"
-        )
+    /// An error with `${{ }}` taken off conditions, so the messages read as written.
+    fn plain(e: &str) -> String {
+        e.replace("`if: ${{ ", "`if: ").replace(" }}`", "`")
     }
 
     #[test]
-    fn a_matching_step_and_upload_pass() {
-        // Catches: the rule refusing the workflow shape CI uses (quoted values, a
-        // multi-line path, another upload before the matching one), a blank line in
-        // the path list, or either spelling of "run after a failure", with or
-        // without `${{ }}`.
-        let other = upload("other", "x");
-        let ok = format!("{other}{}", upload("cov", "out/m"));
-        assert_eq!(wiring(&workflow(FLAGS, &ok), "coverage"), Ok(()));
-        for condition in ["${{ always() }}", "always()", "${{!cancelled()}}"] {
-            let ok = upload("cov", "\n            out/m").replace("${{ !cancelled() }}", condition);
-            assert_eq!(
-                wiring(&workflow(FLAGS, &ok), "coverage"),
-                Ok(()),
-                "{condition}"
-            );
-        }
+    fn the_shape_ci_uses_passes() {
+        assert_eq!(check(&format!("{GATE}{CHECKOUT}{LOWERING}")), Ok(()));
+        let always = LOWERING.replace("!cancelled()", "always()");
+        assert_eq!(check(&format!("{GATE}{CHECKOUT}{always}")), Ok(()));
     }
 
     #[test]
     fn each_drift_is_refused() {
-        // Catches: each way the printed command stops working accepted.
-        let ok = upload("cov", "out/m");
-        for (flags, after, want) in [
+        // Catches: each way the gate or the no-lowering check stops binding.
+        let with = |lowering: String| format!("{GATE}{CHECKOUT}{lowering}");
+        let cases = [
             (
-                FLAGS,
-                upload("coverage", "out/m"),
-                "no actions/upload-artifact step after the kbf-coverage step is named `cov`",
-            ),
-            (
-                "--run-id \"$GITHUB_RUN_NUMBER\" --repo \"$GITHUB_REPOSITORY\" --artifact cov",
-                ok.clone(),
-                "the kbf-coverage step passes `--run-id $GITHUB_RUN_NUMBER`, not `--run-id \"$GITHUB_RUN_ID\"`",
-            ),
-            (
-                "--run-id \"$GITHUB_RUN_ID\" --repo o/r --artifact cov",
-                ok.clone(),
-                "the kbf-coverage step passes `--repo o/r`, not `--repo \"$GITHUB_REPOSITORY\"`",
-            ),
-            (
-                "--run-id \"$GITHUB_RUN_ID\" --repo \"$GITHUB_REPOSITORY\"",
-                ok.clone(),
-                "the kbf-coverage step has no `--artifact`",
-            ),
-            (
-                "--repo \"$GITHUB_REPOSITORY\" --artifact cov",
-                ok.clone(),
-                "the kbf-coverage step has no `--run-id`",
-            ),
-            (
-                FLAGS,
-                upload("cov", "out/other"),
-                "the `cov` upload does not list `out/m` in its path",
-            ),
-            (
-                FLAGS,
                 String::new(),
-                "no actions/upload-artifact step after the kbf-coverage step is named `cov`",
-            ),
-            // Another directory in the upload moves the file below the artifact's
-            // top level, where `"$d"/m` does not find it.
-            (
-                FLAGS,
-                ok.replace("out/lcov.info", "target/lcov.info"),
-                "the `cov` upload lists `target/lcov.info` outside the directory of `out/m`, \
-                 so the file would not be at the artifact's top level",
-            ),
-            // An upload a failed ratchet step skips: the command is printed for a run
-            // that uploaded nothing.
-            (
-                FLAGS,
-                ok.replace("${{ !cancelled() }}", "${{ success() }}"),
-                "the `cov` upload runs `if: ${{ success() }}`, which a failed ratchet step \
-                 skips; use `!cancelled()` or `always()`",
+                "the job `test` has no step running the gate (`-p kbf-coverage`)",
             ),
             (
-                FLAGS,
-                ok.replace("        if: ${{ !cancelled() }}\n", ""),
-                "the `cov` upload has no `if:`, so a failed ratchet step skips it",
+                GATE.replace("--floors coverage-floors", "--floors other"),
+                "the gate step does not pass `--floors coverage-floors`",
             ),
-        ] {
+            (
+                GATE.replace("--lcov l ", ""),
+                "the gate step has no `--lcov`",
+            ),
+            (
+                GATE.replace("--root r ", ""),
+                "the gate step has no `--root`",
+            ),
+            (
+                GATE.replace(
+                    "      - run",
+                    "      - if: ${{ github.event_name == 'push' }}\n        run",
+                ),
+                "the gate step runs `if: github.event_name == 'push'`, so a pull request can skip it",
+            ),
+            (
+                GATE.to_owned(),
+                "the job `test` has no step running `kbf-coverage no-lowering`",
+            ),
+            (
+                with(LOWERING.replace("--base base/coverage-floors", "--base b")),
+                "the no-lowering step needs `--base base/coverage-floors` and `--floors coverage-floors`",
+            ),
+            (
+                with(LOWERING.replace("--floors coverage-floors", "--floors x")),
+                "the no-lowering step needs `--base base/coverage-floors` and `--floors coverage-floors`",
+            ),
+            (
+                with(LOWERING.replace("--allow-missing-base ", "")),
+                "the no-lowering step lacks `--allow-missing-base`, so the change that adds the file (a base without one) would fail",
+            ),
+            (
+                with(LOWERING.replace(
+                    &format!("      - if: ${{{{ !cancelled() && {PR} }}}}\n        run"),
+                    "      - run",
+                )),
+                "the no-lowering step has no `if:`, so it runs on pushes, where there is no base",
+            ),
+            (
+                with(LOWERING.replace("!cancelled() && ", "")),
+                "the no-lowering step runs `if: github.event_name == 'pull_request'`, which a failed gate step skips; add `!cancelled() &&`",
+            ),
+            (
+                with(LOWERING.replace(PR, "true")),
+                "the no-lowering step runs `if: !cancelled() && true`, not only on pull requests",
+            ),
+            (
+                format!("{LOWERING}{GATE}"),
+                "the no-lowering step comes before the gate step",
+            ),
+            (
+                format!("{GATE}{LOWERING}"),
+                "no actions/checkout step puts the base in `path: base`",
+            ),
+            (
+                format!(
+                    "{GATE}{}{LOWERING}",
+                    CHECKOUT.replace("path: base", "path: other")
+                ),
+                "no actions/checkout step puts the base in `path: base`",
+            ),
+            (
+                format!(
+                    "{GATE}{}{LOWERING}",
+                    CHECKOUT.replace("github.event.pull_request.base.sha", "github.sha")
+                ),
+                "the base checkout does not take `ref: ${{ github.event.pull_request.base.sha }}`",
+            ),
+            (
+                format!(
+                    "{GATE}{}{LOWERING}",
+                    CHECKOUT.replace(
+                        &format!("        if: ${{{{ !cancelled() && {PR} }}}}\n"),
+                        ""
+                    )
+                ),
+                "the base checkout is not conditional on pull requests, where there is a base",
+            ),
+            (
+                format!(
+                    "{GATE}{}{LOWERING}",
+                    CHECKOUT.replace("!cancelled() && ", "")
+                ),
+                "the base checkout runs `if: github.event_name == 'pull_request'`, which a failed gate step skips, and the no-lowering step would then find no base file and pass; add `!cancelled() &&`",
+            ),
+            (
+                format!("{GATE}{}{LOWERING}", CHECKOUT.replace(PR, "true")),
+                "the base checkout is not conditional on pull requests, where there is a base",
+            ),
+            (
+                format!("{GATE}{LOWERING}{CHECKOUT}"),
+                "the base checkout comes after the no-lowering step",
+            ),
+        ];
+        for (steps, want) in cases {
             assert_eq!(
-                wiring(&workflow(flags, &after), "coverage"),
-                Err(want.to_owned()),
-                "{flags} {after}"
+                check(&steps).map_err(|e| plain(&e)),
+                Err(plain(want)),
+                "{steps}"
             );
         }
-        // The upload must come after the step that writes the file.
-        let before = format!(
-            "on: push\npermissions: {{}}\njobs:\n  coverage:\n    runs-on: ubuntu-latest\n    steps:\n{ok}      - run: cargo run -p kbf-coverage -- --write-baseline out/m {FLAGS}\n"
-        );
-        assert_eq!(
-            wiring(&before, "coverage"),
-            Err(
-                "no actions/upload-artifact step after the kbf-coverage step is named `cov`"
-                    .to_owned()
-            )
-        );
         assert_eq!(
             wiring(
-                &workflow(FLAGS, &ok).replace("-p kbf-coverage", "-p kbf-other"),
-                "coverage"
+                &workflow(&format!("{GATE}{CHECKOUT}{LOWERING}")),
+                "test",
+                false
             ),
-            Err("the job `coverage` has no step running `-p kbf-coverage`".to_owned())
-        );
-        // An upload with no path lists nothing.
-        let no_path = format!(
-            "      - uses: actions/upload-artifact@{PIN}\n        with:\n          name: cov\n"
-        );
-        assert_eq!(
-            wiring(&workflow(FLAGS, &no_path), "coverage"),
-            Err("the `cov` upload does not list `out/m` in its path".to_owned())
+            Err(format!(
+                "the file `{FLOORS}` does not exist at the repository root"
+            ))
         );
     }
 }

@@ -111,10 +111,10 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
     // Not a mutating verb: it has no dry run to leave out.
     assert!(
         !Verb::Proxy(ProxyArgs {
-            config: file,
+            config: Some(file),
+            check: true,
             update_dir: "/var/lib/kbf-installer".into(),
             orders_dir: "/var/lib/kbf-installer/orders".into(),
-            check: true
         })
         .needs_root()
     );
@@ -261,8 +261,10 @@ fn the_visible_verbs_are_the_contracts() {
             "confirm",
             "revert",
             "rollback",
+            "record-release",
             "gc",
             "boot-check",
+            "migrate",
             "quiesce",
             "check",
             "proxy"
@@ -559,6 +561,48 @@ fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
     );
 }
 
+/// Catches `record-release` not running through the dispatcher, or its refusals leaving with
+/// another exit: as root, files that are not a release (a release that was never placed, a
+/// binary that is not the executable this host runs, a host root that is not absolute) end with
+/// the exit of the refusal and the program on the line; a release error keeps the exit of
+/// the release verbs.
+///
+/// Mutants planted: the verb dispatched to `gc`; the refusal folded into the failure exit.
+#[test]
+fn record_release_runs_through_the_dispatcher_and_refuses_what_is_not_a_release() {
+    use crate::record_release::RecordError;
+    use crate::release::ReleaseError;
+    let (_, root) = seeded("record-release");
+    let root_arg = root.to_str().expect("text");
+    for commit in [A, B] {
+        let (exit, _, err) = run_as(
+            0,
+            &[
+                "--root",
+                root_arg,
+                "--apply",
+                "record-release",
+                "--commit",
+                commit,
+            ],
+        );
+        assert_eq!(exit, Exit::Refused, "{commit}: {err}");
+        assert!(err.starts_with("kbf-installer: "), "{err}");
+    }
+    let (exit, _, err) = run_as(0, &["--root", "relative", "record-release", "--commit", A]);
+    assert_eq!(exit, Exit::Failed, "{err}");
+
+    let release = |e: ReleaseError| Failure::from(RecordError::Release(e)).exit;
+    assert_eq!(release(ReleaseError::NotFirst(c(A))), Exit::Failed);
+    let read = io::Error::from(io::ErrorKind::NotFound);
+    let refused = Failure::from(RecordError::Read {
+        path: "p".to_owned(),
+        source: read,
+    });
+    assert_eq!(refused.exit, Exit::Refused);
+    assert!(refused.why.contains("cannot read p"), "{}", refused.why);
+}
+
 /// Catches a frontend or all-in-one unit that activates releases with no database migration
 /// and no warning: `run` for the unit of either mode refuses (exit 2, one line) unless
 /// `--installer-config` is given, before it touches the host; a unit of a mode with no
@@ -566,7 +610,8 @@ fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
 /// that cannot be read stops the service rather than starting it without the step.
 ///
 /// Mutants seen red: the unit check removed (the all-in-one unit ran its pass); the unit
-/// check matching `kbf-frontend` without the `@` (the plain `kbf-frontend.service` refused);
+/// check matching only `kbf-frontend@` (the plain `kbf-frontend.service`, the unit setup enables on
+/// a frontend host, ran its pass without the migration);
 /// the all-in-one template (`kbf-all-in-one@1.service`) is in the test list.
 #[test]
 fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
@@ -575,6 +620,7 @@ fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
         "kbf-all-in-one.service",
         "kbf-all-in-one@1.service",
         "kbf-frontend@main.service",
+        "kbf-frontend.service",
     ] {
         let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
         assert_eq!(exit, Exit::Usage, "{unit}: {err}");
@@ -589,7 +635,7 @@ fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
             "{unit}: nothing was done before the refusal"
         );
     }
-    for unit in ["kbf.service", "kbf-daemon.service", "kbf-frontend.service"] {
+    for unit in ["kbf.service", "kbf-daemon.service"] {
         let (exit, err) = on(&root, &["run", "--passes", "1", "--unit", unit]);
         assert_eq!(exit, Exit::Ok, "{unit}: {err}");
     }
@@ -675,6 +721,42 @@ fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
     assert!(with(&[]).schema_step_mut().is_none(), "no flag, no step");
 }
 
+/// Catches `run` building a helper that cannot tell about leases (the stub every build had
+/// until a lease source was wired): the helper `run` builds reads the lease cgroups of the
+/// unit it restarts, below the host root's `/sys/fs/cgroup`, so a populated lease of
+/// `kbf-daemon.service` is one live lease. A unit that never ran (no cgroup), a unit of no
+/// mode and a launchd label each cannot tell, with the reason: the activation is refused
+/// (fail closed), and `run` itself still starts for them.
+///
+/// Mutants seen red: `leases::NotWired` left in `build_helper` (the daemon's lease reads as
+/// "cannot tell"); the cgroup root taken as the real `/sys/fs/cgroup` instead of the host
+/// root's.
+#[test]
+fn run_builds_a_helper_whose_lease_source_reads_the_restarted_units_cgroup() {
+    let (_, root) = seeded("run-lease-source");
+    let lease = root.join("sys/fs/cgroup/kbf.slice/kbf-daemon.service/actions/kbf-lease-1-1");
+    fs::create_dir_all(&lease).expect("lease cgroup");
+    fs::write(lease.join("cgroup.events"), "populated 1\n").expect("events");
+    let source = |flags: &[&str]| {
+        let mut argv = vec!["--root", root.to_str().expect("text"), "run"];
+        argv.extend_from_slice(flags);
+        let Verb::Run(args) = parse(&argv).verb else {
+            panic!("a run");
+        };
+        match build_helper(root.clone(), &args) {
+            Ok(helper) => helper.leases().live(),
+            Err(f) => panic!("{}", f.why),
+        }
+    };
+    assert_eq!(source(&["--unit", "kbf-daemon.service"]), Ok(1));
+    let err = source(&["--unit", "kbf-frontend@a.service"]).expect_err("never ran");
+    assert!(err.contains("no such cgroup"), "{err}");
+    let err = source(&["--unit", "kbf.service"]).expect_err("no mode's unit");
+    assert!(err.contains("is no unit of any mode"), "{err}");
+    let err = source(&["--launchd-label", "com.example.kbf"]).expect_err("not wired");
+    assert!(err.contains("no lease source wired"), "{err}");
+}
+
 /// Catches `run --installer-config` reading the config under a host root that is not an
 /// absolute path (the root is the sandbox flag's; a relative one is refused with its reason
 /// rather than reading from the working directory).
@@ -748,4 +830,481 @@ fn only_a_sudo_uid_of_another_account_is_a_sudo_caller() {
     assert!(!is_sudo_uid(None));
     assert!(!is_sudo_uid(Some(OsStr::new("0"))));
     assert!(is_sudo_uid(Some(OsStr::new("1000"))));
+}
+
+/// Writes `mode = "<mode>"` as the host's `kbf.toml` under `root`.
+fn write_kbf_toml(root: &Path, text: &str) {
+    fs::create_dir_all(root.join("etc/kbf")).expect("etc");
+    fs::write(root.join("etc/kbf/kbf.toml"), text).expect("kbf.toml");
+}
+
+/// Catches the packaged `kbf-installer.service` (one unit for every mode, no `--unit`) not
+/// learning what to restart: with no flag naming the service, `run` restarts the unit
+/// `setup` enabled for the `mode` of the host's kbf.toml, one per mode, and a flag still
+/// wins over the file.
+///
+/// Mutants planted: `named_service` ignoring the flags; the first unit of the mode taken
+/// from another mode's row.
+#[test]
+fn run_without_a_service_flag_restarts_the_unit_of_the_hosts_mode() {
+    let (_, root) = seeded("run-derived-unit");
+    let service = |flags: &[&str]| {
+        let mut argv = vec!["run", "--passes", "1"];
+        argv.extend_from_slice(flags);
+        let Verb::Run(args) = parse(&argv).verb else {
+            panic!("a run");
+        };
+        target_of(&root, &args)
+    };
+    for (mode, unit) in [
+        ("frontend", "kbf-frontend.service"),
+        ("storage", "kbf-storage.service"),
+        ("daemon", "kbf-daemon.service"),
+        ("storage-and-daemon", "kbf-storage-and-daemon.service"),
+        ("all-in-one", "kbf-all-in-one.service"),
+    ] {
+        write_kbf_toml(&root, &format!("mode = \"{mode}\"\n"));
+        let derived = service(&[])
+            .unwrap_or_else(|f| panic!("{mode}: {}", f.why))
+            .service;
+        assert_eq!(derived.unit.as_deref(), Some(unit), "{mode}");
+        assert_eq!(derived.launchd_label, None, "{mode}");
+    }
+    let named = service(&["--unit", "kbf-daemon.service"])
+        .expect("named")
+        .service;
+    assert_eq!(named.unit.as_deref(), Some("kbf-daemon.service"));
+    write_kbf_toml(&root, "mode = \"all-in-one\"\n");
+    let named = service(&["--unit", "kbf-daemon.service"])
+        .expect("the flag wins")
+        .service;
+    assert_eq!(named.unit.as_deref(), Some("kbf-daemon.service"));
+    let label = service(&["--launchd-label", "com.komira.kbf-daemon"])
+        .expect("label")
+        .service;
+    assert_eq!(label.unit, None);
+    assert_eq!(
+        label.launchd_label.as_deref(),
+        Some("com.komira.kbf-daemon")
+    );
+}
+
+/// Catches a `run` that starts with no service it can restart: no kbf.toml, no `mode`, a
+/// mode kbf does not offer (`node`), or a Mac without a label each end it with exit 2 and the
+/// reason, before any pass.
+///
+/// Mutants planted: the platform check dropped; the unknown mode mapped to a default unit; a
+/// missing, unparseable, unreadable or mode-less kbf.toml mapped to a default unit.
+#[test]
+fn run_with_no_service_and_no_mode_to_derive_one_is_a_usage_error() {
+    let (layout, root) = seeded("run-no-unit");
+    let Verb::Run(args) = parse(&["run", "--passes", "1"]).verb else {
+        panic!("a run");
+    };
+    let refused = |root: &Path| target_of(root, &args).err().expect("refused");
+    let missing = refused(&root);
+    assert_eq!(missing.exit, Exit::Usage);
+    assert!(missing.why.contains("--unit"), "{}", missing.why);
+    assert!(missing.why.contains("is not there"), "{}", missing.why);
+    assert!(missing.why.contains("run setup"), "{}", missing.why);
+    // Every refusal names the file, says what to do and is a usage exit: no panic, no default.
+    let named = |f: &Failure, reason: &str| {
+        assert_eq!(f.exit, Exit::Usage, "{reason}: {}", f.why);
+        assert!(f.why.contains("/etc/kbf/kbf.toml"), "{reason}: {}", f.why);
+        assert!(f.why.contains("--unit"), "{reason}: {}", f.why);
+        assert!(f.why.contains("run setup"), "{reason}: {}", f.why);
+        assert!(f.why.contains(reason), "{reason}: {}", f.why);
+    };
+    named(&missing, "is not there");
+    write_kbf_toml(&root, "other = 1\n");
+    named(&refused(&root), "has no mode");
+    write_kbf_toml(&root, "mode = 3\n");
+    named(&refused(&root), "has no mode");
+    write_kbf_toml(&root, "mode = [unclosed\n");
+    named(&refused(&root), "is not TOML");
+    fs::write(root.join("etc/kbf/kbf.toml"), [0xff, 0xfe]).expect("bytes");
+    named(&refused(&root), "is not UTF-8");
+    fs::write(root.join("etc/kbf/kbf.toml"), vec![b'#'; (1 << 20) + 1]).expect("big");
+    named(&refused(&root), "is over");
+    fs::remove_file(root.join("etc/kbf/kbf.toml")).expect("rm");
+    fs::create_dir(root.join("etc/kbf/kbf.toml")).expect("dir");
+    named(&refused(&root), "cannot be read");
+    fs::remove_dir(root.join("etc/kbf/kbf.toml")).expect("rmdir");
+    write_kbf_toml(&root, "mode = \"node\"\n");
+    named(&refused(&root), "no mode of kbf");
+    write_kbf_toml(&root, "mode = \"\"\n");
+    named(&refused(&root), "no mode of kbf");
+    write_kbf_toml(&root, "mode = \"daemon\"\n");
+    let mac = derived_service(&layout, Platform::MacOs)
+        .err()
+        .expect("a Mac");
+    assert_eq!(mac.exit, Exit::Usage);
+    assert!(mac.why.contains("--launchd-label"), "{}", mac.why);
+    let (exit, err) = on(&root, &["run", "--passes", "1"]);
+    assert_eq!(
+        exit,
+        Exit::Ok,
+        "a daemon host does its pass on its unit: {err}"
+    );
+    write_kbf_toml(&root, "mode = \"all-in-one\"\n");
+    let (exit, err) = on(&root, &["run", "--passes", "1"]);
+    assert_eq!(
+        exit,
+        Exit::Failed,
+        "the database mode reads installer.toml: {err}"
+    );
+    assert!(err.contains("installer.toml"), "{err}");
+    assert!(!err.contains("needs --installer-config"), "{err}");
+}
+
+/// Catches the derived database-mode unit reading no installer.toml (the schema step then
+/// silently absent, the very thing `run` refuses to start without): on a frontend host the
+/// target carries `/etc/kbf/installer.toml`, on a daemon host none, and a flag is kept.
+///
+/// Mutants planted: the default dropped; the default given to every mode.
+#[test]
+fn a_derived_database_unit_reads_the_default_installer_toml_and_others_none() {
+    let (_, root) = seeded("run-derived-config");
+    let config = |mode: &str, flags: &[&str]| {
+        write_kbf_toml(&root, &format!("mode = \"{mode}\"\n"));
+        let mut argv = vec!["run"];
+        argv.extend_from_slice(flags);
+        let Verb::Run(args) = parse(&argv).verb else {
+            panic!("a run");
+        };
+        target_of(&root, &args)
+            .expect("target")
+            .installer_config
+            .map(|p| p.to_string())
+    };
+    let default = Some("/etc/kbf/installer.toml".to_owned());
+    assert_eq!(config("frontend", &[]), default);
+    assert_eq!(config("all-in-one", &[]), default);
+    assert_eq!(config("daemon", &[]), None);
+    assert_eq!(config("storage", &[]), None);
+    let other = Some("/etc/kbf/other.toml".to_owned());
+    assert_eq!(
+        config("all-in-one", &["--installer-config", "/etc/kbf/other.toml"]),
+        other
+    );
+}
+
+/// Catches the old helper and the installer both managing one host: while the old layout's
+/// state is the host's and no migration finished, every verb that manages the host (`setup`,
+/// `run`, the operator's verbs) refuses with exit 5 and names `migrate`, and does nothing
+/// else; the verbs that change no release (`quiesce`, `boot-check`) and `migrate` itself are
+/// not held. A host with no old state is not held at all.
+///
+/// Mutants planted: the guard not called; the guard called for `quiesce` too.
+#[test]
+fn the_verbs_that_manage_a_host_wait_for_its_migration() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_, root) = seeded("unmigrated");
+    // The installer's directory as a host has it (the guard judges it like every file).
+    fs::set_permissions(
+        root.join("var/lib/kbf-installer"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("mode");
+    let old = root.join("var/lib/kbf-deploy");
+    fs::create_dir_all(&old).expect("old state dir");
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).expect("mode");
+    let state = old.join("state.json");
+    fs::write(
+        &state,
+        r#"{"schema":1,"current":null,"previous":null,"staged":null,"pending_confirm":null,"order_floor":0}"#,
+    )
+    .expect("old state");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).expect("mode");
+
+    let held: [&[&str]; 5] = [
+        &RUN,
+        &["setup", "--mode=frontend"],
+        &["gc"],
+        &["confirm", "--id=1-5", "--unit", "kbf.service"],
+        &["rollback", "--unit", "kbf.service"],
+    ];
+    for args in held {
+        let (exit, err) = on(&root, args);
+        assert_eq!(exit, Exit::NeedsOperator, "{args:?}: {err}");
+        assert!(
+            err.contains("kbf-installer migrate --apply"),
+            "{args:?}: {err}"
+        );
+    }
+    for args in [&["quiesce"][..], &["boot-check"]] {
+        let (exit, err) = on(&root, args);
+        assert_ne!(exit, Exit::NeedsOperator, "{args:?}: {err}");
+    }
+
+    fs::remove_file(&state).expect("rm");
+    let (exit, err) = on(&root, &RUN);
+    assert_eq!(exit, Exit::Ok, "{err}");
+}
+
+/// Catches the migration guard's table drifting: a verb that manages the host (`setup`
+/// included, now that all of it is built) left out of it, or one that changes no release put
+/// in it. `fetch-child`, the unprivileged process a verb starts, manages nothing and is never
+/// held. (The compiler makes every new verb say which it is; this pins what it says.)
+///
+/// Mutants to plant: `Verb::FetchChild` or `Verb::Migrate(_)` moved to the `true` arm; `Verb::Setup(_)` to the `false` one.
+#[test]
+fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
+    let held: [&[&str]; 10] = [
+        &["setup", "--mode=frontend"],
+        &RUN,
+        &[
+            "update",
+            "--commit",
+            B,
+            "--frontend",
+            "--api",
+            "127.0.0.1:1",
+        ],
+        &["confirm", "--id=1-5", "--unit", "kbf.service"],
+        &["revert", "--id=1-5", "--unit", "kbf.service"],
+        &["rollback", "--unit", "kbf.service"],
+        &["record-release", "--commit", A],
+        &["gc"],
+        &["stage"],
+        &["activate"],
+    ];
+    let free: [&[&str]; 6] = [
+        &["status"],
+        &["check"],
+        &["boot-check"],
+        &["quiesce"],
+        &["migrate"],
+        &["fetch-child"],
+    ];
+    for args in held {
+        assert!(parse(args).verb.manages_host(), "{args:?} is held");
+    }
+    for args in free {
+        assert!(!parse(args).verb.manages_host(), "{args:?} is not held");
+    }
+}
+
+/// Catches the owner a migration trusts being root's only by accident: on a host it is
+/// uid 0 whoever runs the verb; under `--root` it is the caller, who owns the rehearsal.
+#[test]
+fn the_owner_is_root_on_a_host_and_the_caller_in_a_rehearsal() {
+    assert_eq!(owner_uid(false, 1000), 0);
+    assert_eq!(owner_uid(true, 1000), 1000);
+}
+
+/// Catches the probe user's lookup failing quietly: a host that cannot answer is exit 1
+/// with the reason, an unknown user exit 2 naming the user, a known one its ids.
+#[test]
+fn the_probe_user_is_looked_up_with_the_exit_codes_of_the_contract() {
+    use kbf_host::testkit::{FakeExec, reply};
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|cmd| {
+        let who = cmd.args.last().map(String::as_str);
+        Ok(match (cmd.program.as_str().ends_with("getent"), who) {
+            (true, Some("kbf-fetch")) => {
+                reply(0, "kbf-fetch:x:991:991::/nonexistent:/sbin/nologin\n", "")
+            }
+            (true, Some("broken")) => reply(1, "", "getent: no such service"),
+            (true, _) => reply(2, "", ""),
+            (false, _) => reply(0, "991\n", ""),
+        })
+    });
+    assert_eq!(
+        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        991
+    );
+    let missing = probe_user(&exec, "nobody-here", false).expect_err("unknown");
+    assert_eq!(missing.exit, Exit::Usage);
+    assert!(missing.why.contains("nobody-here"), "{}", missing.why);
+    let broken = probe_user(&exec, "broken", false).expect_err("broken");
+    assert_eq!(broken.exit, Exit::Failed);
+    assert!(broken.why.contains("getent"), "{}", broken.why);
+}
+
+/// Catches a version probe that runs as root: on a host `--fetch-user root`, or any user
+/// whose uid or gid is 0, is a usage error (exit 2) naming the user, for the probe runs a
+/// binary nobody has trusted yet and `run_as` is the whole of what it is run with. A
+/// rehearsal (`--root`, a tree of the caller's own) runs as whoever the caller is.
+///
+/// Mutants seen red: only the uid checked; only the gid checked; the rehearsal not excepted.
+#[test]
+fn the_version_probe_never_runs_as_root_on_a_host() {
+    use kbf_host::testkit::{FakeExec, reply};
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|cmd| {
+        let who = cmd.args.last().map(String::as_str);
+        Ok(match (cmd.program.as_str().ends_with("getent"), who) {
+            (true, Some("root")) => reply(0, "root:x:0:0:root:/root:/bin/bash\n", ""),
+            (true, Some("uid-zero")) => {
+                reply(0, "uid-zero:x:0:991::/nonexistent:/sbin/nologin\n", "")
+            }
+            (true, Some("gid-zero")) => {
+                reply(0, "gid-zero:x:991:0::/nonexistent:/sbin/nologin\n", "")
+            }
+            (true, Some("kbf-fetch")) => {
+                reply(0, "kbf-fetch:x:991:991::/nonexistent:/sbin/nologin\n", "")
+            }
+            (true, _) => reply(2, "", ""),
+            // `id -G`: the groups, which hold the primary one.
+            (false, Some("root" | "gid-zero")) => reply(0, "0\n", ""),
+            (false, _) => reply(0, "991\n", ""),
+        })
+    });
+    for name in ["root", "uid-zero", "gid-zero"] {
+        let error = probe_user(&exec, name, false).expect_err(name);
+        assert_eq!(error.exit, Exit::Usage, "{name}");
+        assert!(
+            error.why.contains(name) && error.why.contains("root"),
+            "{name}: {}",
+            error.why
+        );
+    }
+    assert_eq!(
+        probe_user(&exec, "kbf-fetch", false).expect("found").uid,
+        991
+    );
+    assert_eq!(probe_user(&exec, "root", true).expect("a rehearsal").uid, 0);
+}
+
+/// Catches `migrate` missing from the command line or from the dispatcher: its flags parse
+/// into the verb (every unit flag takes a unit name, and a name that is a path or has no
+/// suffix is a usage error of the parser), the verb runs through `dispatch` on a host with
+/// no old layout, says so on standard output and exits 0, and `--json` makes that one object.
+///
+/// Mutants planted: the `Verb::Migrate` arm of the dispatcher removed (the verb said "not
+/// implemented"); a unit name taken unchecked.
+#[test]
+fn migrate_parses_its_flags_and_runs_through_the_dispatcher() {
+    let cli = parse(&[
+        "migrate",
+        "--unit",
+        "kbf-daemon.service",
+        "--unit",
+        "kbf-other.service",
+        "--helper-unit",
+        "kbf-helper.service",
+        "--installer-unit",
+        "kbf-installer.service",
+        "--min-generation",
+        "5",
+        "--release-source",
+        "frontend",
+        "--rollback",
+    ]);
+    let Verb::Migrate(args) = &cli.verb else {
+        panic!("not the migrate verb");
+    };
+    assert_eq!(args.units.len(), 2);
+    assert!(args.helper_unit.is_some() && args.installer_unit.is_some() && args.rollback);
+    assert_eq!(args.min_generation, Some(5));
+    for bad in ["../x.service", "kbf", "A.service"] {
+        for flag in ["--unit", "--helper-unit", "--installer-unit"] {
+            let tried = Cli::try_parse_from(["kbf-installer", "migrate", flag, bad]);
+            assert!(tried.is_err(), "{flag} {bad}");
+        }
+    }
+
+    // A host with nothing on it: not `host_root_on`, which makes the installer's directories.
+    let root = kbf_host::testkit::scratch("app-migrate");
+    let id = std::process::Command::new("/usr/bin/id")
+        .arg("-un")
+        .output()
+        .expect("id");
+    let me = String::from_utf8(id.stdout)
+        .expect("text")
+        .trim()
+        .to_owned();
+    let root = root.to_str().expect("text");
+    for json in [false, true] {
+        let mut args = vec!["--root", root, "migrate", "--fetch-user", &me];
+        if json {
+            args.push("--json");
+        }
+        let (exit, out, err) = run_as(1000, &args);
+        assert_eq!(exit, Exit::Ok, "{err}");
+        assert!(out.contains("nothing to migrate"), "{out}");
+        assert_eq!(out.trim_start().starts_with('{'), json, "{out}");
+    }
+}
+
+/// Catches the report of `migrate` going to the wrong stream or in the wrong shape: it is the
+/// result of the verb, so it is on standard output, as the text or, with `--json`, as the one
+/// object (`verb`, `apply`, `message`), whatever the lines it holds.
+///
+/// Mutants to plant: the report written to `err`; `apply` or `message` dropped from the object.
+#[test]
+fn the_migrate_report_is_on_standard_output_as_text_or_one_object() {
+    let mut out = Vec::new();
+    assert_eq!(
+        finish_migrate(false, true, "adopted 2 releases\nunits repointed", &mut out),
+        Exit::Ok
+    );
+    assert_eq!(
+        String::from_utf8(out).expect("text"),
+        "adopted 2 releases\nunits repointed\n"
+    );
+    let mut out = Vec::new();
+    assert_eq!(
+        finish_migrate(true, false, "adopted 2 releases\nunits repointed", &mut out),
+        Exit::Ok
+    );
+    let v: Value = serde_json::from_slice(&out).expect("one object");
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "verb": "migrate",
+            "apply": false,
+            "message": "adopted 2 releases\nunits repointed",
+        })
+    );
+}
+
+/// Catches a failed `migrate` (here: a probe user the host does not have) not being said the
+/// way every other verb's failure is: exit 2 for the usage error, the reason after the
+/// program's name on standard error, or with `--json` the object `error: failed` on standard
+/// output; nothing of a report.
+///
+/// Mutants to plant: the failure of the `Migrate` arm printed as a report (exit 0).
+#[test]
+fn a_migrate_that_fails_says_so_like_the_other_verbs() {
+    let root = kbf_host::testkit::scratch("app-migrate-fails");
+    let root = root.to_str().expect("text");
+    let user = "no-such-user-for-kbf-migrate";
+    let (exit, out, err) = run_as(1000, &["--root", root, "migrate", "--fetch-user", user]);
+    assert_eq!(exit, Exit::Usage, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.starts_with("kbf-installer: ") && err.contains(user),
+        "{err}"
+    );
+    let (exit, out, err) = run_as(
+        1000,
+        &["--json", "--root", root, "migrate", "--fetch-user", user],
+    );
+    assert_eq!((exit, err.as_str()), (Exit::Usage, ""));
+    let v: Value = serde_json::from_str(out.trim_end()).expect("one json object");
+    assert_eq!(
+        (v["verb"].as_str(), v["error"].as_str()),
+        (Some("migrate"), Some("failed"))
+    );
+    assert!(
+        v["message"].as_str().is_some_and(|m| m.contains(user)),
+        "{v}"
+    );
+}
+
+/// Catches a host path joined to a root that is not absolute: `under` refuses it with the
+/// reason. The dispatcher's migration guard looks at the root first, so it is this test, not
+/// a verb's, that reaches the refusal.
+#[test]
+fn a_path_is_not_joined_to_a_relative_root() {
+    let path = HostPath::new("/etc/kbf/installer.toml").expect("a host path");
+    let failure = under(Path::new("relative/root"), &path).expect_err("refused");
+    assert_eq!(failure.exit, Exit::Failed);
+    assert!(!failure.why.is_empty());
+    assert_eq!(
+        under(Path::new("/srv/root"), &path).expect("joined"),
+        PathBuf::from("/srv/root/etc/kbf/installer.toml")
+    );
 }

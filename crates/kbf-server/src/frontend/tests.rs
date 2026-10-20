@@ -211,8 +211,7 @@ async fn the_successor_is_dialled_over_tls_only_with_a_ca_and_a_name() {
     dial(addr).expect("a plain channel");
 
     // Storage over TLS does not make the REAPI listener's hop TLS: plain text still.
-    let dir = std::env::temp_dir().join(format!("kbf-dial-plain-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("directory");
+    let dir = crate::test_dir::scratch_dir("kbf-dial-plain");
     let file = |name: &str| {
         let path = dir.join(name);
         std::fs::write(&path, "pem").expect("write");
@@ -231,7 +230,6 @@ async fn the_successor_is_dialled_over_tls_only_with_a_ca_and_a_name() {
     let storage_tls = super::parse(&matches).expect("a frontend's flags");
     let dial = super::dial_of(&storage_tls).expect("a dialler");
     dial(addr).expect("a plain channel");
-    let _ = std::fs::remove_dir_all(&dir);
 
     let tls = parsed(&[
         socket,
@@ -295,8 +293,7 @@ async fn a_successor_over_tls_is_reached_only_under_the_name_its_certificate_has
     use tonic::transport::server::TcpIncoming;
     use tonic::transport::{Identity, Server, ServerTlsConfig};
 
-    let dir = std::env::temp_dir().join(format!("kbf-dial-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("directory");
+    let dir = crate::test_dir::scratch_dir("kbf-dial");
     let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca.key_usages = vec![
@@ -373,7 +370,6 @@ async fn a_successor_over_tls_is_reached_only_under_the_name_its_certificate_has
         .await
         .expect_err("another name is refused");
     assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a frontend that starts with a listener it could not bind, for the operator API

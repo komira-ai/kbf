@@ -24,6 +24,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tonic::{Status, Streaming};
 
 use super::stub::Instance;
+use kbf_testkit::dir::TestDir;
 
 /// A deadline that only ends a hang.
 pub const HANG: Duration = Duration::from_secs(90);
@@ -116,6 +117,8 @@ pub struct Farm {
     launch: Launch,
     /// Epoch 0 of Envoy.
     pub envoy: Child,
+    /// Last: removed once Envoy and the instances are gone.
+    _own: TestDir,
 }
 
 /// What it takes to start an Envoy epoch on this farm's config.
@@ -144,18 +147,16 @@ impl Launch {
     }
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 impl Farm {
     /// Render the box, change the rendered `envoy.json` with `patch`, start the two
     /// instances and Envoy (epoch 0), and wait until Envoy is live.
     pub async fn start(name: &str, opts: &Opts, patch: impl FnOnce(&mut Value)) -> Farm {
-        let dir = scratch(name);
+        let own = scratch(name);
+        let dir = own.to_path_buf();
         let ports = ports();
         let pki = pki::write(&dir, "envoy-box").expect("certificates");
         let path = |p: &Path| p.to_str().expect("utf-8").to_owned();
@@ -209,6 +210,7 @@ impl Farm {
             inst: [pa, pb],
             launch,
             envoy,
+            _own: own,
         };
         farm.wait_live().await;
         farm

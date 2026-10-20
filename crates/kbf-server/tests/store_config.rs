@@ -120,6 +120,43 @@ async fn a_node_denied_on_a_live_connection_is_refused_at_its_next_call() {
         .expect("node-b is served");
 }
 
+/// Catches a deny-row read that fails OPEN: when the operator's `deny/` rows cannot be read
+/// the node's identity cannot be judged, so the fetch is refused UNAVAILABLE with fixed text
+/// (no secret, no store error) rather than served. The same node is served again once the
+/// store reads, so the refusal is the failed read and not the node.
+///
+/// Mutant seen red: the read's error ignored (`if let Ok(denied) = members.denied()`), which
+/// serves the secret to a node whose revocation could not be checked.
+#[tokio::test]
+async fn a_failed_deny_read_refuses_the_fetch_instead_of_serving_it() {
+    use std::sync::atomic::Ordering;
+    let farm = farm(Source::new(7), false).await;
+    let a = farm
+        .pki
+        .channel(farm.addr, farm.pki.client(Some("storage"), &["node-a"]))
+        .await;
+    farm.store.fail_scans.store(1, Ordering::SeqCst);
+    let refused = cold(&a)
+        .get_store_config(want(0))
+        .await
+        .expect_err("the deny rows could not be read");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert!(
+        !refused.message().contains(SENTINEL),
+        "{}",
+        refused.message()
+    );
+    assert!(
+        !refused.message().contains("injected"),
+        "{}",
+        refused.message()
+    );
+    cold(&a)
+        .get_store_config(want(0))
+        .await
+        .expect("served once the rows read");
+}
+
 /// Catches: an unchanged answer that carries the secret, and a node told "unchanged" when
 /// its number is merely different: the same generation is two numbers, a lower or higher
 /// one gets the whole store (a restored frontend), and nothing registered is generation 0
@@ -396,6 +433,7 @@ async fn a_proxied_identity_is_admitted_by_its_node_and_role_not_by_a_certificat
         Presented::Proxy(Identity {
             node_id: node.map(str::to_owned),
             role,
+            ips: Vec::new(),
         })
     };
 
@@ -475,8 +513,7 @@ async fn a_frontend_that_cannot_say_its_generation_announces_zero_and_still_answ
 /// Mutant seen red: `admit_leaf` not consulting the deny list.
 #[tokio::test]
 async fn the_worker_deny_list_file_applies_at_every_call() {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("store-config");
-    std::fs::create_dir_all(&dir).expect("directory");
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "store-config");
     let path = dir.join("deny.list");
     let replace = |text: &str| {
         let staged = path.with_extension("new");

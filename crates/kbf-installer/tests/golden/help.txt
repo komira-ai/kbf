@@ -6,19 +6,21 @@ Mutating verbs only say what they would do unless --apply is given. Exit codes: 
 Usage: kbf-installer [OPTIONS] <COMMAND>
 
 Commands:
-  setup       First install: accounts, directories, installer.toml, the first release
-  status      What is installed, staged and pending, and the last refusal
-  run         Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap
-  update      Swap this host's frontend through the proxy's update API, and wait for it
-  confirm     Keep the pending swap, naming its activation
-  revert      Undo the pending swap, naming its activation
-  rollback    Point `current` at `previous`, with no confirm window
-  gc          Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
-  boot-check  Run before each start of a release on trial; counts the start
-  quiesce     For maintainer scripts: take the lock; exit 5 while a swap is pending
-  check       Validate the installer's configuration, trust files and path chain
-  proxy       Serve the frontend host's public port: route each stream to the active child frontend
-  help        Print this message or the help of the given subcommand(s)
+  setup           First install: accounts, directories, installer.toml, the first release
+  status          What is installed, staged and pending, and the last refusal
+  run             Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap
+  update          Swap this host's frontend through the proxy's update API, and wait for it
+  confirm         Keep the pending swap, naming its activation
+  revert          Undo the pending swap, naming its activation
+  rollback        Point `current` at `previous`, with no confirm window
+  record-release  Record a release placed on the host by hand as its first
+  gc              Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
+  boot-check      Run before each start of a release on trial; counts the start
+  migrate         Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's tree, or put it back with `--rollback`. A dry run without `--apply`
+  quiesce         For maintainer scripts: take the lock; exit 5 while a swap is pending
+  check           Validate the installer's configuration, trust files and path chain
+  proxy           Serve the frontend host's public port: route each stream to the active child frontend
+  help            Print this message or the help of the given subcommand(s)
 
 Options:
       --json
@@ -62,7 +64,7 @@ Options:
       --no-start
           Enable the units without starting them
       --installer-config <INSTALLER_CONFIG>
-          The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root. The same flag, with the same meaning, as on `run` [default: /etc/kbf/installer.toml]
+          The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which is the only value setup accepts. The same flag, with the same meaning, as on `run`
   -h, --help
           Print help
 
@@ -91,7 +93,7 @@ Options:
       --orders-dir <ORDERS_DIR>
           The order spool: owned by the service user, mode 0700, inside a root-owned parent [default: /var/lib/kbf-installer/orders]
       --unit <UNIT>
-          The systemd unit to restart after a swap (Linux)
+          The systemd unit to restart after a swap (Linux). Without it and without `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one packaged kbf-installer.service serves every mode
       --launchd-label <LAUNCHD_LABEL>
           The launchd label to kickstart after a swap (macOS)
       --window-secs <WINDOW_SECS>
@@ -103,7 +105,7 @@ Options:
       --passes <PASSES>
           Stop after this many passes (a rehearsal or a test); without it, run until stopped
       --installer-config <INSTALLER_CONFIG>
-          installer.toml, under the host root: its `database` key is the state database the installer migrates to what a release needs before that release is activated. Required when the unit restarted after a swap is a frontend's or the all-in-one's
+          installer.toml, under the host root: its `database` key is the state database the installer migrates to what a release needs before that release is activated. Required when the unit restarted after a swap is a frontend's or the all-in-one's, unless the unit comes from kbf.toml's mode (no --unit): then the host's installer.toml (/etc/kbf, /usr/local/etc/kbf on a Mac) is the default
   -h, --help
           Print help
 
@@ -176,6 +178,26 @@ Options:
       --launchd-label <LAUNCHD_LABEL>  The launchd label to kickstart after a swap (macOS)
   -h, --help                           Print help
 
+=== kbf-installer record-release --help ===
+Record a release placed on the host by hand as its first
+
+Checks its files, writes its `VERIFIED` marker and makes it current, so the frontend proxy can start it. The operator vouches for the commit; nothing is fetched or attested.
+
+Usage: kbf-installer record-release [OPTIONS] --commit <COMMIT>
+
+Options:
+      --commit <COMMIT>
+          The release to record (40 hex characters): `releases/<commit>/kbf` must be there
+
+      --json
+          Print the result as one JSON object on standard output
+
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+
+  -h, --help
+          Print help (see a summary with '-h')
+
 === kbf-installer gc --help ===
 Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
 
@@ -224,11 +246,11 @@ Serve the frontend host's public port: route each stream to the active child fro
 Usage: kbf-installer proxy [OPTIONS]
 
 Options:
-      --config <CONFIG>          The installer.toml whose `[proxy]` table configures the proxy [default: /etc/kbf/installer.toml]
+      --config <CONFIG>          The installer.toml whose `[proxy]` table configures the proxy (default: the platform's, `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac)
       --json                     Print the result as one JSON object on standard output
       --apply                    Do what the verb says. Without it a mutating verb is a dry run
-      --update-dir <UPDATE_DIR>  The root half's directory: the update API reads its status.json. As `run --update-dir` [default: /var/lib/kbf-installer]
       --orders-dir <ORDERS_DIR>  The order spool the update API writes and the root half reads: owned by the service user. As `run --orders-dir` [default: /var/lib/kbf-installer/orders]
       --check                    Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
+      --update-dir <UPDATE_DIR>  Root's directory: the proxy reads `status.json` here, to start the installed release when no frontend child is running, and the update API reads its status. As `run --update-dir` [default: /var/lib/kbf-installer]
   -h, --help                     Print help
 

@@ -8,7 +8,6 @@ mod support;
 
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,17 +35,12 @@ fn config() -> MembershipConfig {
     }
 }
 
-/// A new empty directory of this test binary's, under the target directory.
-fn scratch(name: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "kbf-server-operator-verbs-{}-{n}-{name}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+/// A new empty directory of this test binary's, under the target directory, removed when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-operator-verbs-{name}"),
+    )
 }
 
 fn token() -> ApiToken {
@@ -68,6 +62,7 @@ fn listeners() -> Listeners {
         hello_wait: HELLO_WAIT,
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),

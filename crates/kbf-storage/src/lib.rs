@@ -26,6 +26,7 @@
 //! authorization (`kbf-auth`). `crates/kbf-it/tests/layering.rs` checks it.
 
 pub mod flush;
+pub mod in_flight;
 pub mod local_cache;
 pub mod repair;
 pub mod replicate;

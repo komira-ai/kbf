@@ -25,13 +25,29 @@ use kbf_server::{Args, Bound, ConfigError, bind_server_with_policy};
 use support::{Client, FakeDaemon, Job, hello};
 use tonic::{Code, Status};
 
+/// A policy file in a directory of its own, removed with it when this drops.
+struct PolicyFile {
+    path: PathBuf,
+    _dir: kbf_testkit::dir::TestDir,
+}
+
+impl std::ops::Deref for PolicyFile {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 /// A policy file holding `json`, unique to `name`.
-fn policy_file(name: &str, json: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-reapi-auth");
-    std::fs::create_dir_all(&dir).expect("a policy directory");
-    let path = dir.join(format!("{name}-{}.json", std::process::id()));
+fn policy_file(name: &str, json: &str) -> PolicyFile {
+    let dir = kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-reapi-auth-{name}"),
+    );
+    let path = dir.join("policy.json");
     std::fs::write(&path, json).expect("write the policy");
-    path
+    PolicyFile { path, _dir: dir }
 }
 
 fn args(extra: &[&str]) -> Args {
