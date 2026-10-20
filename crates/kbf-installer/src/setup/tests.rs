@@ -52,6 +52,7 @@ fn raw(mode: Mode) -> Raw {
         kbf: serving_flags(mode),
         proxy: Default::default(),
         create_local_database: false,
+        deploy: Default::default(),
         installer_config: None,
     }
 }
@@ -1216,6 +1217,7 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         kbf: super::kbf_settings::KbfFlags::default(),
         proxy: Default::default(),
         create_local_database: false,
+        deploy: Default::default(),
         installer_config: Some("/tmp/i.toml".to_owned()),
     };
     let mut exec = host();
@@ -1681,6 +1683,8 @@ fn a_view_forwards_reads_and_refuses_steps() {
 #[path = "more_tests.rs"]
 mod more;
 
+#[path = "deploy_config_tests.rs"]
+mod deploy_config_tests;
 #[path = "kbf_settings_tests.rs"]
 mod kbf_settings_tests;
 #[path = "provision_tests.rs"]

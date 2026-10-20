@@ -22,7 +22,7 @@ fn some(text: &str) -> Option<String> {
 }
 
 /// The flags of a proxy host: the proxy's certificate pair and client CA, and the storage node.
-fn proxy_raw() -> Raw {
+pub(super) fn proxy_raw() -> Raw {
     Raw {
         kbf: KbfFlags {
             storage_url: some("http://127.0.0.1:8990"),
@@ -40,7 +40,7 @@ fn proxy_raw() -> Raw {
 }
 
 /// A host with a release and the files `proxy_raw` names (`ca.pem` is `host()`'s).
-fn proxy_host() -> FakeExec {
+pub(super) fn proxy_host() -> FakeExec {
     let mut exec = released(host(), Platform::Linux);
     put(&mut exec, "/etc/kbf/reapi.key", 0o600, KBF_SERVER, "key");
     put(&mut exec, "/etc/kbf/reapi.pem", 0o644, ROOT, "cert");

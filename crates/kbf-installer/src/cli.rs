@@ -160,6 +160,10 @@ pub struct SetupArgs {
     /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
     #[command(flatten)]
     pub proxy: crate::setup::proxy::ProxyFlags,
+    /// The host's deploy config (`/etc/kbf-installer/deploy.json`) of a frontend or all-in-one
+    /// host: the stage and, if the proxy is not where installer.toml says, where deploy calls.
+    #[command(flatten)]
+    pub deploy: crate::setup::deploy_config::DeployFlags,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
     /// host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which
     /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.
