@@ -61,6 +61,7 @@ mod closure;
 mod cpu;
 mod default_platform;
 mod described;
+mod dir_cache;
 mod execution;
 mod finished_row;
 mod input_tree;

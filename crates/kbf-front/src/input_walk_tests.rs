@@ -142,7 +142,7 @@ impl Store {
         *self.epoch.lock().unwrap() = epoch;
     }
 
-    /// A file the store held is gone (evicted, lost).
+    /// A blob the store held, file or Directory, is gone (evicted, lost).
     pub(super) fn lose(&self, file: Digest) {
         self.removed.lock().unwrap().insert(file);
     }
@@ -157,6 +157,27 @@ impl Store {
 
     pub(super) fn fixed(tree: Tree, delay: Duration) -> Self {
         Self::new(tree, move |_| delay)
+    }
+
+    /// The FindMissing calls made so far.
+    pub(super) fn ask_calls(&self) -> usize {
+        self.asks.lock().unwrap().len()
+    }
+
+    /// The digests named by each FindMissing call so far, in the order they began.
+    pub(super) fn ask_sizes(&self) -> Vec<usize> {
+        self.asks.lock().unwrap().clone()
+    }
+
+    /// The most times any one digest was read from the store.
+    pub(super) fn most_reads_of_one(&self) -> usize {
+        self.reads
+            .lock()
+            .unwrap()
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
     }
 
     pub(super) fn max_asks_open(&self) -> usize {
@@ -208,6 +229,9 @@ impl Blobs for Store {
             let _open = Open(&self.open);
             tokio::time::sleep_until(ends).await;
             match self.tree.fail.get(digest) {
+                None if self.removed.lock().unwrap().contains(digest) => {
+                    Err(StorageError::NotFound(*digest))
+                }
                 Some(Fail::Gone) => Err(StorageError::NotFound(*digest)),
                 Some(Fail::Unreadable) => Err(StorageError::Unreachable(*digest)),
                 Some(Fail::Internal) => Err(StorageError::Internal(format!("disk {digest}"))),
@@ -232,13 +256,13 @@ impl Blobs for Store {
             self.max_asks_open.fetch_max(now, Ordering::SeqCst);
             let _open = Open(&self.asks_open);
             sleep(self.ask_delay).await;
-            Ok(digests
-                .iter()
-                .filter(|d| {
-                    !self.tree.held.contains(*d) || self.removed.lock().unwrap().contains(*d)
-                })
-                .copied()
-                .collect())
+            // A file the store holds, or a Directory it holds (and can still answer for).
+            let held = |d: &Digest| {
+                !self.removed.lock().unwrap().contains(d)
+                    && !matches!(self.tree.fail.get(d), Some(Fail::Gone))
+                    && (self.tree.held.contains(d) || self.tree.blobs.contains_key(d))
+            };
+            Ok(digests.iter().filter(|d| !held(d)).copied().collect())
         })
     }
 }
