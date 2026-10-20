@@ -730,12 +730,36 @@ async fn a_sighup_with_a_missing_key_keeps_the_old_certificate_and_names_the_fil
     assert_eq!(status.and_then(|s| s.code()), Some(0), "after {took:?}");
 }
 
+/// Sends SIGHUP to `child` over and over until its standard error (`log`) says it reloaded,
+/// which only a registered handler does. The flood has no fixed length, so it covers the
+/// exposed window whatever the start-up speed; it fails the test if the verb stops first or
+/// the line never comes within 30 s.
+fn flood_hup_until_reloaded(child: &mut Reaped, log: &Path) {
+    let started = Instant::now();
+    while !fs::read_to_string(log)
+        .unwrap_or_default()
+        .contains("reloaded the TLS files")
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the SIGHUPs never reloaded"
+        );
+        assert!(
+            child.try_wait().expect("wait").is_none(),
+            "an early SIGHUP stopped the verb"
+        );
+        send(child, libc::SIGHUP);
+        std::thread::sleep(Duration::from_micros(200));
+    }
+}
+
 /// Catches a verb that dies of a SIGHUP sent before its handler exists (`ExecReload` can run
 /// as soon as the unit is active, and the default action of SIGHUP ends the process). The
-/// launcher here blocks SIGHUP, so the signals sent right after the spawn stay pending in the
+/// launcher here blocks SIGHUP, so the signals sent from the spawn on stay pending in the
 /// verb until it unblocks them; unblocking before the handler is registered delivers them to
-/// the default action. The verb must survive them, serve, reload once the handler exists
-/// (its standard error says so), and still stop on SIGTERM with 0.
+/// the default action. SIGHUP is sent without pause until the verb has logged a reload, so
+/// the exposed window is covered however slowly it starts. The verb must survive, serve, and
+/// still stop on SIGTERM with 0.
 #[tokio::test(flavor = "current_thread")]
 async fn a_sighup_sent_before_the_handler_exists_does_not_kill_the_verb() {
     let (path, ca) = served_config("hup-early");
@@ -749,30 +773,82 @@ async fn a_sighup_sent_before_the_handler_exists_does_not_kill_the_verb() {
         true,
     );
     drop(listener);
-    // As early as possible, and repeatedly while the verb starts.
-    for _ in 0..20 {
-        send(&child, libc::SIGHUP);
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    flood_hup_until_reloaded(&mut child, &log);
     let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
         .await
         .expect("the proxy answers");
     assert_eq!(status, 200);
+    send(&child, libc::SIGTERM);
+    let (status, took) = exited(&mut child, Duration::from_secs(10));
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "after {took:?}");
+}
+
+/// The start-up window under a service manager, which blocks nothing: the launcher leaves the
+/// mask alone, so only the verb's own `hold_reload_signal` keeps SIGHUP from the default
+/// action until the handler exists. To make that window as long as the test wants, `--config`
+/// is a FIFO: the verb sits in its first read of the configuration, after the hold and long
+/// before any handler, until this test writes it. The test sees the verb open the FIFO (a
+/// non-blocking open for writing fails until a reader exists), sends SIGHUP into the wait,
+/// then writes the configuration and floods SIGHUP until a reload is logged. A verb without
+/// the hold dies of the first one. The limit: a SIGHUP in the instants between `exec` and the
+/// hold cannot be survived by any implementation, so none is sent there.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sighup_in_the_start_up_window_under_an_unmasked_launcher_does_not_kill_the_verb() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let (config, ca) = served_config("hup-unmasked");
+    let text = fs::read(&config).expect("the configuration");
+    let dir = config.parent().expect("dir").to_owned();
+    let fifo = dir.join("fifo.toml");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("a path");
+    // SAFETY: `mkfifo` of a path this test owns.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let log = dir.join("verb.log");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let mut child = start_masked(
+        &fifo,
+        &listener,
+        Stdio::from(fs::File::create(&log).expect("log file")),
+        false,
+    );
+    drop(listener);
     let started = Instant::now();
-    while !fs::read_to_string(&log)
-        .unwrap_or_default()
-        .contains("reloaded the TLS files")
-    {
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "the held SIGHUP never reloaded"
-        );
-        assert!(
-            child.try_wait().expect("wait").is_none(),
-            "an early SIGHUP stopped the verb"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut writer = loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+        {
+            Ok(file) => break file,
+            Err(_) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "the verb never opened its configuration"
+                );
+                assert!(
+                    child.try_wait().expect("wait").is_none(),
+                    "the verb stopped before it read its configuration"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    };
+    for _ in 0..5 {
+        send(&child, libc::SIGHUP);
+        std::thread::sleep(Duration::from_millis(5));
     }
+    assert!(
+        child.try_wait().expect("wait").is_none(),
+        "a SIGHUP while the verb read its configuration stopped it"
+    );
+    std::io::Write::write_all(&mut writer, &text).expect("write the configuration");
+    drop(writer);
+    flood_hup_until_reloaded(&mut child, &log);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
     send(&child, libc::SIGTERM);
     let (status, took) = exited(&mut child, Duration::from_secs(10));
     assert_eq!(status.and_then(|s| s.code()), Some(0), "after {took:?}");
