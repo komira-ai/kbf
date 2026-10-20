@@ -608,8 +608,8 @@ fn supervise(
 ) -> Supervised {
     use crate::layout::Layout;
     use crate::proxy::boot::Retry;
-    use crate::proxy::runtime::SystemClock;
     use crate::proxy::child_real::ProcChild;
+    use crate::proxy::runtime::SystemClock;
     use crate::proxy::supervisor::{Startup, children_dir, frontend_argv};
 
     let clock = Arc::new(SystemClock::new());

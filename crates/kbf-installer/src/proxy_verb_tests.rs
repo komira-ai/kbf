@@ -369,7 +369,13 @@ fn a_descriptor_the_runtime_cannot_use_is_a_failure_to_start() {
     let loaded = load(&file("serve", PROXY.as_bytes())).expect("valid");
     let regular = OwnedFd::from(fs::File::open(file("fd", b"x")).expect("open"));
     let database = state_database(&file("serve-db", PROXY.as_bytes())).expect("a database");
-    match serve(loaded.proxy, database, &handover("serve"), regular, &kbf_host::Root::host()) {
+    match serve(
+        loaded.proxy,
+        database,
+        &handover("serve"),
+        regular,
+        &kbf_host::Root::host(),
+    ) {
         Err(VerbError::Failed(text)) => {
             assert!(text.starts_with("cannot start the proxy: "), "{text}");
         }
@@ -388,7 +394,13 @@ fn a_spool_that_cannot_be_opened_is_a_usage_error_before_anything_is_bound() {
     fs::write(&handover.orders_dir, b"a file").expect("a file in the way");
     let regular = OwnedFd::from(fs::File::open(file("fd-spool", b"x")).expect("open"));
     let database = state_database(&file("spool-db", PROXY.as_bytes())).expect("a database");
-    let text = usage_of(serve(loaded.proxy, database, &handover, regular, &kbf_host::Root::host()));
+    let text = usage_of(serve(
+        loaded.proxy,
+        database,
+        &handover,
+        regular,
+        &kbf_host::Root::host(),
+    ));
     assert!(
         text.starts_with("update API: the order spool at "),
         "{text}"
