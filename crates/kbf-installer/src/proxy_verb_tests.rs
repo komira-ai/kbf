@@ -366,7 +366,12 @@ fn loopback(port: u16) -> SocketAddr {
 fn a_descriptor_the_runtime_cannot_use_is_a_failure_to_start() {
     let loaded = load(&file("serve", PROXY.as_bytes())).expect("valid");
     let regular = OwnedFd::from(fs::File::open(file("fd", b"x")).expect("open"));
-    match serve(loaded.proxy, &handover("serve"), regular) {
+    match serve(
+        loaded.proxy,
+        &handover("serve"),
+        regular,
+        &kbf_host::Root::host(),
+    ) {
         Err(VerbError::Failed(text)) => {
             assert!(text.starts_with("cannot start the proxy: "), "{text}");
         }
@@ -384,7 +389,12 @@ fn a_spool_that_cannot_be_opened_is_a_usage_error_before_anything_is_bound() {
     let handover = handover("spool");
     fs::write(&handover.orders_dir, b"a file").expect("a file in the way");
     let regular = OwnedFd::from(fs::File::open(file("fd-spool", b"x")).expect("open"));
-    let text = usage_of(serve(loaded.proxy, &handover, regular));
+    let text = usage_of(serve(
+        loaded.proxy,
+        &handover,
+        regular,
+        &kbf_host::Root::host(),
+    ));
     assert!(
         text.starts_with("update API: the order spool at "),
         "{text}"
@@ -406,14 +416,29 @@ fn check_stops_at_the_table_and_a_run_needs_its_socket() {
         orders_dir: path.with_file_name("orders"),
         check,
     };
-    assert_eq!(run(&args(true)), Ok(()));
-    let text = usage_of(run(&args(false)));
+    assert_eq!(run(&args(true), Path::new("/")), Ok(()));
+    let text = usage_of(run(&args(false), Path::new("/")));
     assert!(text.contains("LISTEN_PID"), "{text}");
     let missing = ProxyArgs {
         config: path.with_file_name("none.toml"),
         ..args(true)
     };
-    assert!(usage_of(run(&missing)).contains("No such file"));
+    assert!(usage_of(run(&missing, Path::new("/"))).contains("No such file"));
+}
+
+/// Catches a `--root` that is not absolute being taken: with the socket in place the verb
+/// refuses it as a usage error before it binds anything.
+#[test]
+fn a_root_that_is_not_absolute_is_a_usage_error() {
+    let path = file("rel-root", PROXY.as_bytes());
+    let args = ProxyArgs {
+        config: path.clone(),
+        update_dir: path.with_file_name("update"),
+        orders_dir: path.with_file_name("orders"),
+        check: false,
+    };
+    let result = run(&args, Path::new("relative"));
+    assert!(usage_of(result).starts_with("--root: "));
 }
 
 static BOUND_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);

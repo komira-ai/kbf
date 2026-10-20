@@ -184,6 +184,12 @@ fn start(path: &Path, listener: &TcpListener) -> Reaped {
     start_with(path, listener, Stdio::piped())
 }
 
+/// The host root of the verb under test: a directory with no `releases/` in it, so the host's
+/// own install (if any) is not what the driver looks at.
+fn root_of(config: &Path) -> PathBuf {
+    config.with_file_name("root")
+}
+
 /// [`start`] with `stderr` for the verb's standard error.
 fn start_with(path: &Path, listener: &TcpListener, stderr: Stdio) -> Reaped {
     start_masked(path, listener, stderr, false)
@@ -201,6 +207,8 @@ fn start_masked(path: &Path, listener: &TcpListener, stderr: Stdio, block_term: 
         .arg(update_dir_of(path))
         .arg("--orders-dir")
         .arg(orders_dir_of(path))
+        .arg("--root")
+        .arg(root_of(path))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
