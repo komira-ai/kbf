@@ -413,3 +413,23 @@ fn a_shutdown_while_waiting_for_ready_stops_the_boot_and_leaves_the_child() {
     assert_eq!(w.count("terminate") + w.count("kill pid"), 0);
     assert_eq!(run.notes.states(), ["starting"]);
 }
+
+/// Catches a report that stops the boot when it cannot write, or says nothing: with a directory
+/// that is not there, a progress with no reason, fix or wait leaves no file and does not panic.
+#[test]
+fn a_report_that_cannot_write_boot_json_goes_on() {
+    let dir = kbf_host::testkit::scratch("proxy-boot-report-missing").join("absent");
+    let report = FileReport::new(&dir);
+    report.progress(
+        &Progress {
+            state: "starting",
+            attempt: 1,
+            attempts: 3,
+            reason: None,
+            fix: None,
+            next_try_s: None,
+        },
+        None,
+    );
+    assert!(!dir.join(BOOT_FILE).exists());
+}

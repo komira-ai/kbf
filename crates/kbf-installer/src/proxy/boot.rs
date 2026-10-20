@@ -170,35 +170,29 @@ impl FileReport {
 impl Report for FileReport {
     fn progress(&self, progress: &Progress, detail: Option<&str>) {
         use std::io::Write as _;
-        let mut line = format!(
-            "kbf-installer: proxy: cold start {} (attempt {} of {})",
-            progress.state, progress.attempt, progress.attempts
+        // Every part is a plain value, so the report is the same code whichever parts exist.
+        let part = |text: Option<String>| text.unwrap_or_default();
+        let line = format!(
+            "kbf-installer: proxy: cold start {} (attempt {} of {}){}{}{}{}",
+            progress.state,
+            progress.attempt,
+            progress.attempts,
+            part(progress.reason.map(|r| format!(": {r}"))),
+            part(progress.next_try_s.map(|n| format!(", next try in {n} s"))),
+            part(progress.fix.map(|f| format!("; to fix: {f}"))),
+            part(detail.map(|d| format!(" [{d}]"))),
         );
-        if let Some(reason) = progress.reason {
-            line.push_str(&format!(": {reason}"));
-        }
-        if let Some(next) = progress.next_try_s {
-            line.push_str(&format!(", next try in {next} s"));
-        }
-        if let Some(fix) = progress.fix {
-            line.push_str(&format!("; to fix: {fix}"));
-        }
-        if let Some(detail) = detail {
-            line.push_str(&format!(" [{detail}]"));
-        }
-        // A closed standard error must not stop the boot.
-        let _ = writeln!(std::io::stderr(), "{line}");
         let temp = self.dir.join(format!("{BOOT_FILE}.tmp"));
         let mut bytes = serde_json::to_vec(progress).expect("plain fields serialize");
         bytes.push(b'\n');
         let written = std::fs::write(&temp, bytes)
             .and_then(|()| std::fs::rename(&temp, self.dir.join(BOOT_FILE)));
-        if let Err(e) = written {
-            let _ = writeln!(
-                std::io::stderr(),
-                "kbf-installer: proxy: {BOOT_FILE} was not written: {e}"
-            );
-        }
+        // The second line only when the file was not written.
+        let unwritten = written
+            .err()
+            .map(|e| format!("\nkbf-installer: proxy: {BOOT_FILE} was not written: {e}"));
+        // A closed standard error must not stop the boot.
+        let _ = writeln!(std::io::stderr(), "{line}{}", part(unwritten));
     }
 }
 
@@ -290,22 +284,20 @@ impl ColdBoot<'_> {
             };
             let (reason, detail) = failed;
             last = reason;
-            let final_attempt = attempt == attempts;
+            // No branch on the last attempt: its wait is nothing and the loop runs out.
+            let more = attempt < attempts;
             self.report.progress(
                 &Progress {
-                    state: if final_attempt { "gave-up" } else { "retrying" },
+                    state: ["gave-up", "retrying"][usize::from(more)],
                     attempt,
                     attempts,
                     reason: Some(reason.word()),
                     fix: reason.fix(),
-                    next_try_s: (!final_attempt).then_some(wait.as_secs()),
+                    next_try_s: more.then_some(wait.as_secs()),
                 },
                 detail.as_deref(),
             );
-            if final_attempt {
-                break;
-            }
-            if self.cold.clock.sleep(wait).is_err() {
+            if self.cold.clock.sleep(wait * u32::from(more)).is_err() {
                 return Booted::Stopped;
             }
             wait = (wait * 2).min(self.retry.max_wait);

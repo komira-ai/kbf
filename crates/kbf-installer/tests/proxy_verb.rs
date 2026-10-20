@@ -168,11 +168,23 @@ fn start_with(path: &Path, listener: &TcpListener, stderr: Stdio) -> Reaped {
 /// [`start_with`], and with `block_term` the verb inherits SIGTERM and SIGINT blocked, as from
 /// a launcher that blocked them.
 fn start_masked(path: &Path, listener: &TcpListener, stderr: Stdio, block_term: bool) -> Reaped {
+    start_args(path, listener, stderr, block_term, &[])
+}
+
+/// [`start_masked`] with more flags for the verb.
+fn start_args(
+    path: &Path,
+    listener: &TcpListener,
+    stderr: Stdio,
+    block_term: bool,
+    flags: &[&std::ffi::OsStr],
+) -> Reaped {
     let fd = listener.as_raw_fd();
     let mut command = Command::new(BIN);
     command
         .args(["proxy", "--config"])
         .arg(path)
+        .args(flags)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
@@ -554,6 +566,62 @@ async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
     // SAFETY: signal 0 only checks that the process exists; the child is ours.
     let alive = unsafe { libc::kill(frontend.id().cast_signed(), 0) };
     assert_eq!(alive, 0, "the frontend went down with the proxy");
+}
+
+/// Catches a cold start that cannot say why it failed or where: with no child to adopt and a
+/// `status.json` that cannot be read, the verb reports each try to `boot.json` in its state
+/// directory (the file replaces itself, state `retrying`, the reason's word) and to its standard
+/// error with the detail, and a stop during the wait between tries ends it cleanly.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_start_that_cannot_read_status_reports_each_try_and_stops_cleanly() {
+    let state = kbf_host::testkit::scratch("proxy-bin-cold-state");
+    let update = kbf_host::testkit::scratch("proxy-bin-cold-update");
+    fs::write(update.join("status.json"), b"{not json").expect("status.json");
+    let (path, _ca) = served_config("cold");
+    let table = fs::read_to_string(&path).expect("config text").replacen(
+        "[proxy]\n",
+        &format!("[proxy]\nstate_dir = \"{}\"\n", state.display()),
+        1,
+    );
+    fs::write(&path, table).expect("write");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let flags = [std::ffi::OsStr::new("--update-dir"), update.as_os_str()];
+    let mut proxy = start_args(&path, &listener, Stdio::piped(), false, &flags);
+    drop(listener);
+    let boot = state.join("boot.json");
+    let began = Instant::now();
+    let text = loop {
+        if let Ok(text) = fs::read_to_string(&boot) {
+            if text.contains("retrying") {
+                break text;
+            }
+        }
+        assert!(began.elapsed() < Duration::from_secs(60), "no boot.json");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let json: serde_json::Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(json["reason"], "status-unreadable");
+    // SAFETY: `kill` of our own child.
+    assert_eq!(
+        unsafe { libc::kill(proxy.id().cast_signed(), libc::SIGTERM) },
+        0
+    );
+    let (status, _) = exited(&mut proxy, Duration::from_secs(20));
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "a clean stop");
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut proxy.stderr.take().expect("stderr"), &mut err)
+        .expect("stderr text");
+    assert!(
+        err.contains("cold start (attempt 1 of 10): status-unreadable"),
+        "{err}"
+    );
+    assert!(err.contains(", next try in 2 s"), "{err}");
+    assert!(
+        err.contains("; to fix: start the installer service"),
+        "{err}"
+    );
+    assert!(err.contains(" ["), "the detail goes to the log: {err}");
+    assert!(!err.contains("was not written"), "{err}");
 }
 
 /// Catches a verb that serves with the stop signals still blocked, as a launcher that blocked
