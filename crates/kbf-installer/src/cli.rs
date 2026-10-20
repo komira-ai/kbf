@@ -406,17 +406,34 @@ pub struct ProxyArgs {
     #[arg(long)]
     pub config: Option<std::path::PathBuf>,
     /// The order spool the update API writes and the root half reads: owned by the service
-    /// user. As `run --orders-dir`.
-    #[arg(long, default_value = "/var/lib/kbf-installer/orders")]
-    pub orders_dir: std::path::PathBuf,
+    /// user. As `run --orders-dir`. Default: `orders` in the host's state directory.
+    #[arg(long)]
+    pub orders_dir: Option<std::path::PathBuf>,
     /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
     #[arg(long)]
     pub check: bool,
     /// Root's directory: the proxy reads `status.json` here, to start the installed release
     /// when no frontend child is running, and the update API reads its status. As
-    /// `run --update-dir`.
-    #[arg(long, default_value = "/var/lib/kbf-installer")]
-    pub update_dir: std::path::PathBuf,
+    /// `run --update-dir`. Default: the host's state directory (`/var/lib/kbf-installer`,
+    /// `/var/db/kbf-installer` on a Mac).
+    #[arg(long)]
+    pub update_dir: Option<std::path::PathBuf>,
+}
+
+impl ProxyArgs {
+    /// Root's directory, as the flag gives it; else the host's own (as [`RunArgs::update_dir_in`]).
+    pub fn update_dir_in(&self, layout: &crate::layout::Layout) -> std::path::PathBuf {
+        self.update_dir
+            .clone()
+            .unwrap_or_else(|| layout.update_dir().as_str().into())
+    }
+
+    /// The order spool, as the flag gives it; else the host's own.
+    pub fn orders_dir_in(&self, layout: &crate::layout::Layout) -> std::path::PathBuf {
+        self.orders_dir
+            .clone()
+            .unwrap_or_else(|| layout.orders_dir().as_str().into())
+    }
 }
 
 #[derive(Args)]

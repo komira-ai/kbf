@@ -351,8 +351,8 @@ Options:
       --config <CONFIG>          The installer.toml whose `[proxy]` table configures the proxy (default: the platform's, `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac)
       --json                     Print the result as one JSON object on standard output
       --apply                    Do what the verb says. Without it a mutating verb is a dry run
-      --orders-dir <ORDERS_DIR>  The order spool the update API writes and the root half reads: owned by the service user. As `run --orders-dir` [default: /var/lib/kbf-installer/orders]
+      --orders-dir <ORDERS_DIR>  The order spool the update API writes and the root half reads: owned by the service user. As `run --orders-dir`. Default: `orders` in the host's state directory
       --check                    Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
-      --update-dir <UPDATE_DIR>  Root's directory: the proxy reads `status.json` here, to start the installed release when no frontend child is running, and the update API reads its status. As `run --update-dir` [default: /var/lib/kbf-installer]
+      --update-dir <UPDATE_DIR>  Root's directory: the proxy reads `status.json` here, to start the installed release when no frontend child is running, and the update API reads its status. As `run --update-dir`. Default: the host's state directory (`/var/lib/kbf-installer`, `/var/db/kbf-installer` on a Mac)
   -h, --help                     Print help
 
