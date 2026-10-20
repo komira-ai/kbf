@@ -123,9 +123,27 @@ pub struct Config {
     pub rollback_after_switch: bool,
 }
 
+/// Starts the swap's thread. The real one is [`thread_spawn`]; a test passes one that refuses.
+type Spawn = Box<dyn Fn(Box<dyn FnOnce() + Send>) -> Result<(), String> + Send + Sync>;
+
+fn thread_spawn() -> Spawn {
+    Box::new(|work| {
+        thread::Builder::new()
+            .name("kbf-swap".into())
+            .spawn(work)
+            .map(|_| ())
+            .map_err(spawn_error)
+    })
+}
+
+fn spawn_error(e: std::io::Error) -> String {
+    format!("the swap thread could not start: {e}")
+}
+
 /// The [`Supervisor`] over the swap. See the module documentation.
 pub struct SwapSupervisor {
     parts: Arc<Parts>,
+    spawn: Spawn,
     shared: Arc<Shared>,
     config: Config,
     /// `update.json` could not be read at the start: the reason.
@@ -148,6 +166,10 @@ impl SwapSupervisor {
     /// swap thread.
     #[must_use]
     pub fn new(parts: Parts, config: Config) -> SwapSupervisor {
+        SwapSupervisor::with_spawner(parts, config, thread_spawn())
+    }
+
+    fn with_spawner(parts: Parts, config: Config, spawn: Spawn) -> SwapSupervisor {
         let parts = Arc::new(parts);
         let (intent, unreadable) = match FileRecorder::load(&config.state_dir) {
             Ok(intent) => (intent, None),
@@ -160,6 +182,7 @@ impl SwapSupervisor {
         let open = resume.as_ref().map(|i| i.update_id.clone());
         let me = SwapSupervisor {
             parts,
+            spawn,
             shared: Arc::new(Shared::new(active, intent, open)),
             config,
             unreadable,
@@ -170,8 +193,11 @@ impl SwapSupervisor {
                 plan,
                 intent: Box::new(intent),
             }) {
-                me.shared.close();
+                // The death is announced while the update still reads as open, as a swap
+                // thread's own is: whatever stops the process does so before a status says
+                // the update is over.
                 (me.parts.on_death)(&why);
+                me.shared.close();
             }
         }
         me
@@ -185,11 +211,7 @@ impl SwapSupervisor {
     fn launch(&self, job: Job) -> Result<(), String> {
         let parts = Arc::clone(&self.parts);
         let shared = Arc::clone(&self.shared);
-        thread::Builder::new()
-            .name("kbf-swap".into())
-            .spawn(move || work(&parts, &shared, job))
-            .map(|_| ())
-            .map_err(|e| format!("the swap thread could not start: {e}"))
+        (self.spawn)(Box::new(move || work(&parts, &shared, job)))
     }
 
     /// The phase of the open update, or `NotOpen`.
@@ -202,18 +224,16 @@ impl SwapSupervisor {
     }
 
     /// The swap thread never started: the update ends `failed` at `start`.
-    fn launch_failed(&self, why: &str) {
+    fn launch_failed(&self, mut intent: Intent, why: &str) {
         let mut state = self.shared.lock();
         state.open = None;
-        if let Some(mut intent) = state.intent.clone() {
-            intent.phase = Phase::Failed;
-            intent.failure = Some(Failure {
-                step: Step::Start,
-                reason: why.to_owned(),
-            });
-            if self.parts.recorder.record(&intent).is_ok() {
-                state.intent = Some(intent);
-            }
+        intent.phase = Phase::Failed;
+        intent.failure = Some(Failure {
+            step: Step::Start,
+            reason: why.to_owned(),
+        });
+        if self.parts.recorder.record(&intent).is_ok() {
+            state.intent = Some(intent);
         }
     }
 }
@@ -225,11 +245,11 @@ fn work(parts: &Parts, shared: &Shared, job: Job) {
         Ok(Err(halt)) => Some(format!("the swap stopped: {halt}")),
         Err(panic) => Some(format!("the swap thread panicked: {}", panic_text(&*panic))),
     };
-    shared.close();
-    if let Some(why) = death {
+    if let Some(why) = &death {
         tracing::error!(%why, "the handover driver died");
-        (parts.on_death)(&why);
+        (parts.on_death)(why);
     }
+    shared.close();
 }
 
 fn run(parts: &Parts, shared: &Shared, job: Job) -> Result<Phase, Halt> {
@@ -254,7 +274,7 @@ fn run(parts: &Parts, shared: &Shared, job: Job) -> Result<Phase, Halt> {
     let phase = swap.run()?;
     let intent = swap.intent().clone();
     let new = intent.new_slot;
-    let holds = || matches!(parts.admin.role(new), Ok(r) if r.holder);
+    let holds = || parts.admin.role(new).is_ok_and(|r| r.holder);
     shared.lock().active = status::active_after(&intent, holds);
     Ok(phase)
 }
@@ -308,11 +328,11 @@ impl Supervisor for SwapSupervisor {
             .map_err(|e| SupervisorError::Failed(e.to_string()))?;
         // A request left from an update that ended is not this update's.
         while self.parts.requests.next().is_some() {}
-        state.intent = Some(intent);
+        state.intent = Some(intent.clone());
         state.open = Some(id);
         drop(state);
         if let Err(why) = self.launch(Job::Fresh { plan, old_proc }) {
-            self.launch_failed(&why);
+            self.launch_failed(intent, &why);
             return Err(SupervisorError::Failed(why));
         }
         Ok(())

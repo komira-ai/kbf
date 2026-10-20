@@ -63,3 +63,14 @@ fn an_unknown_host_schema_does_not_let_a_migration_through() {
     assert!(why.starts_with("not_additive:"), "{why}");
     assert!(why.contains("does not answer"), "{why}");
 }
+
+#[test]
+fn an_unreadable_status_json_is_not_staged() {
+    let (m, rig) = migrator(5, running(3));
+    rig.knobs(|k| k.status_err = true);
+    let why = refused(m.migrate_forward(&c(B)));
+    assert!(
+        why.starts_with("not_staged:") && why.contains("status.json"),
+        "{why}"
+    );
+}
