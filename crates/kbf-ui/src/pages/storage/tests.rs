@@ -266,6 +266,8 @@ fn the_tables_have_headers_and_the_page_has_headings() {
 #[test]
 fn the_page_is_reachable_from_the_overview_and_the_navigation() {
     let overview = body(&render(&storage_farm(), "/ui"));
+    // The Overview's own list, not the navigation every page has.
+    let overview = &overview[overview.find("<main>").expect("main")..];
     assert!(
         overview.contains("<li><a href=\"/ui/storage\">Storage</a></li>"),
         "{overview}"
