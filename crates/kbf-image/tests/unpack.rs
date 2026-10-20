@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use kbf_image::{Compression, Ownership, Unpack, UnpackError, ensure_paths};
 use support::registry::{Item, gzip, my_ids, tar_of};
-use support::scratch;
+use support::{Scratch, scratch};
 use tar::EntryType;
 
 fn mine() -> Ownership {
@@ -28,8 +28,29 @@ fn dir(path: &str) -> Item<'_> {
     Item::Dir { path, mode: 0o755 }
 }
 
+/// The root filesystem an unpack made, which holds its scratch directory: the files go
+/// when this is dropped.
+struct Rooted {
+    root: PathBuf,
+    _base: Scratch,
+}
+
+impl std::ops::Deref for Rooted {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl AsRef<Path> for Rooted {
+    fn as_ref(&self) -> &Path {
+        &self.root
+    }
+}
+
 /// Unpacks the tars (lowest first) into `<scratch>/<name>/rootfs`.
-fn unpack(name: &str, layers: &[Vec<u8>]) -> (PathBuf, Result<kbf_image::Unpacked, UnpackError>) {
+fn unpack(name: &str, layers: &[Vec<u8>]) -> (Rooted, Result<kbf_image::Unpacked, UnpackError>) {
     unpack_with(name, layers, Unpack::new(mine()))
 }
 
@@ -37,7 +58,7 @@ fn unpack_with(
     name: &str,
     layers: &[Vec<u8>],
     unpack: Unpack,
-) -> (PathBuf, Result<kbf_image::Unpacked, UnpackError>) {
+) -> (Rooted, Result<kbf_image::Unpacked, UnpackError>) {
     let base = scratch(name);
     let sources: Vec<(PathBuf, Compression)> = layers
         .iter()
@@ -50,7 +71,7 @@ fn unpack_with(
         .collect();
     let root = base.join("rootfs");
     let result = unpack.run(&root, &sources);
-    (root, result)
+    (Rooted { root, _base: base }, result)
 }
 
 fn tar(items: &[Item<'_>]) -> Vec<u8> {
