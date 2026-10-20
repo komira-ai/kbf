@@ -334,6 +334,11 @@ fn the_keys_in_the_url_are_encoded_for_the_api() {
     assert_eq!(fake.seen(), ["/v1/shapes/a%3Cb%2Fc"]);
 
     let fake = Fake::default();
+    let (status, _) = page(&fake, "/ui/targets/a%3Cb%2Fc?instance=main&cfg=c");
+    assert_eq!(status, 404);
+    assert_eq!(fake.seen(), ["/v1/shapes/a%3Cb%2Fc?instance=main&cfg=c"]);
+
+    let fake = Fake::default();
     let (status, _) = page(&fake, "/ui/targets/k?instance=%FF&cfg=a%26b");
     assert_eq!(status, 404);
     assert_eq!(fake.seen(), ["/v1/shapes/k?instance=%EF%BF%BD&cfg=a%26b"]);
