@@ -14,7 +14,8 @@
 //!   startup hold);
 //! - [`child_real::ProcChild`] (Linux), the `Child` on processes watched by pidfd;
 //! - [`runtime::SystemClock`] and [`runtime::RequestQueue`], the `Clock` and the `Requests`;
-//! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left.
+//! - [`supervisor`] (Linux), the proxy's start: adopt the children a previous proxy left;
+//! - [`migrator::DbMigrator`], the `Migrator` over the state database.
 //!
 //! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
 //! child control and the fleet read call a child's ports with (U8b); [`admin`] is the
@@ -26,8 +27,9 @@
 //! choose between two live children.
 //!
 //! Still fakes, stated: `RootOrders` (the orders spool and the update API belong to U8b; the
-//! boot reads `status.json` itself) and, in the verb, `Migrator` (who migrates is open:
-//! [`supervisor::NoMigration`] is the hook the boot calls before it starts a child).
+//! boot reads `status.json` itself) and, in the verb, `Migrator`: [`supervisor::NoMigration`]
+//! is the hook the boot calls before it starts a child, and [`migrator::DbMigrator`] is built
+//! but not yet wired into it (a follow-up does that).
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
@@ -48,10 +50,14 @@
 //! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); open
 //!   streams and open worker sessions from the child's admin role view
 //!   ([`ports::ChildAdmin::open_counts`]); queued operations do not gate retire.
-//! - **Migration** (open): who runs the forward Postgres migration, and with which
-//!   credential, is undecided; the swap only calls [`ports::Migrator::migrate_forward`]
-//!   before the candidate starts. For an all-in-one host it runs after the old process
-//!   exits.
+//! - **Migration** (decided, FP section 8): the swap calls [`ports::Migrator::migrate_forward`]
+//!   before the candidate starts (for an all-in-one host, after the old process exits).
+//!   [`migrator::DbMigrator`] is the real one: it applies the installer's embedded,
+//!   expand-only migrations up to the `state_schema` the staged release reports, as the
+//!   role `installer.toml` names, and refuses with a stable word (`installer_too_old`,
+//!   `not_additive`, `database_busy`, `migration_failed`, ...) that leads
+//!   `failure.reason` of step `migrate`. The cold start's boot hook (`Boot.migrator`) still
+//!   gets [`supervisor::NoMigration`]; wiring `DbMigrator` into it is a follow-up.
 //! - **update.json** keeps the recorded process identity of both children
 //!   ([`model::Intent::old_proc`], `new_proc`), which FP section 4 does not list: adoption
 //!   needs pid, start time and executable. A candidate spawned and not yet recorded when
@@ -101,6 +107,7 @@ pub mod child_http;
 pub mod child_real;
 mod cold;
 pub mod gate_real;
+pub mod migrator;
 pub mod model;
 pub mod orders;
 pub mod ports;
@@ -132,6 +139,8 @@ mod fault_tests;
 mod gate_real_tests;
 #[cfg(test)]
 mod gate_tests;
+#[cfg(test)]
+mod migrator_tests;
 #[cfg(test)]
 mod orders_tests;
 #[cfg(test)]
