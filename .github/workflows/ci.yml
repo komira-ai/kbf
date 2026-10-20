@@ -452,10 +452,12 @@ jobs:
       - run: sudo apt-get install -y --no-install-recommends postgresql-common
       - run: sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
       - run: sudo apt-get install -y --no-install-recommends postgresql-client-17
+      # `--workspace`, as the first run: a `-p kbf-installer` build is another instance of the
+      # installer (without the sandbox flag) whose `root_of` lines no test runs.
       - name: Run the installer's backup round trip under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --locked --branch --no-report -p kbf-installer --lib --features test-sandbox -- --include-ignored backup::tests::real_server_round_trip
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch --no-report -- --include-ignored backup::tests::real_server_round_trip
       - name: Report
         env:
           LLVM_COV_FLAGS: -skip-functions
