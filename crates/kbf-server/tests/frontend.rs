@@ -625,6 +625,7 @@ impl kbf_route::MapSource for Dialled {
         Some(kbf_route::MapView {
             map: Arc::clone(&self.map),
             previous: None,
+            earlier: Vec::new(),
         })
     }
 

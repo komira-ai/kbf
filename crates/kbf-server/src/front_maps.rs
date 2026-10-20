@@ -12,8 +12,8 @@ use crate::members::Members;
 
 /// [`Members`] as a [`MapSource`].
 ///
-/// `current` is the newest map this process has seen and the generation before it
-/// ([`Members::view`]); no store is read. `refetch` is what a `STALE_MAP` answer from a
+/// `current` is the newest map this process has seen and the generations before it
+/// ([`Members::view`], which a restart refills from the pins); no store is read. `refetch` is what a `STALE_MAP` answer from a
 /// storage node asks for: it re-reads the map from the state store, which brings in a bump
 /// another frontend committed, and answers the view if that holds a map of the generation
 /// wanted. It does not rebuild the map ([`Members::refresh`] does, on the frontend's
@@ -33,9 +33,14 @@ impl FrontMaps {
 
 impl MapSource for FrontMaps {
     fn current(&self) -> Option<MapView> {
-        self.members
-            .view()
-            .map(|(map, previous)| MapView { map, previous })
+        self.members.view().map(|(map, mut history)| {
+            let earlier = history.split_off(history.len().min(1));
+            MapView {
+                map,
+                previous: history.pop(),
+                earlier,
+            }
+        })
     }
 
     fn refetch(&self, at_least: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {

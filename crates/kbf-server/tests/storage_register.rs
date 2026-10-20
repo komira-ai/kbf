@@ -1141,7 +1141,7 @@ async fn a_heartbeat_brings_a_node_the_map_it_missed() {
 
 /// A membership service that answers every call with the map it holds (a garbled one, or a
 /// valid one), which a test replaces.
-struct Garbled(Arc<Mutex<pb::Map>>);
+struct Garbled(Arc<Mutex<pb::Map>>, Vec<pb::Map>);
 
 impl Garbled {
     fn map(&self) -> pb::Map {
@@ -1160,6 +1160,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
             boot: 1,
             heartbeat_interval_ms: 1,
             map: Some(self.map()),
+            retained_previous: self.1.clone(),
             ..Default::default()
         }))
     }
@@ -1171,6 +1172,7 @@ impl kbf_proto::kbf::map::v1::membership_server::Membership for Garbled {
         Ok(tonic::Response::new(pb::HeartbeatResponse {
             map_generation: 9,
             map: Some(self.map()),
+            retained_previous: self.1.clone(),
             ..Default::default()
         }))
     }
@@ -1209,9 +1211,49 @@ async fn a_map_that_is_not_newer_changes_nothing() {
     );
 }
 
+/// Catches a node that knows only the newest map the frontend sent: a node that has just
+/// started has seen no earlier one, and a blob written under one is looked for nowhere
+/// else. The frontend's `retained_previous` (newest first) joins the node's history, from
+/// the registration and again from the beat, each map once; one the node cannot read, one
+/// that is not older than the newest and a repeat are left out.
+#[tokio::test]
+async fn a_node_keeps_the_maps_the_frontend_retains() {
+    let at = |generation: u64| {
+        let member = kbf_map::Member {
+            id: MemberId(1),
+            addr: "192.0.2.5:1".to_owned(),
+            zone: String::new(),
+            weight: 1,
+            state: MemberState::Active,
+            boot: 0,
+        };
+        let map = kbf_map::Map::new(
+            generation,
+            vec![member],
+            kbf_map::Rule::Rendezvous,
+            1,
+            1,
+            Vec::new(),
+        )
+        .expect("a map");
+        pb::Map::from(&map)
+    };
+    let retained = vec![at(3), pb::Map::default(), at(3), at(9), at(2)];
+    let node = joined_node_retaining(at(4), retained).await;
+    let maps = node.maps();
+    assert_eq!(maps.generation(), 4);
+    let history: Vec<u64> = maps.history().iter().map(|m| m.generation()).collect();
+    assert_eq!(history, [3, 2]);
+}
+
 /// A membership service on a port of its own that admits every node as member 1 at boot 1
 /// and answers with whatever `map` holds, at each call.
 fn serve_membership(map: &Arc<Mutex<pb::Map>>) -> SocketAddr {
+    serve_retaining(map, Vec::new())
+}
+
+/// [`serve_membership`], whose answers also carry `retained` as `retained_previous`.
+fn serve_retaining(map: &Arc<Mutex<pb::Map>>, retained: Vec<pb::Map>) -> SocketAddr {
     let incoming =
         tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
     let addr = incoming.local_addr().expect("address");
@@ -1220,6 +1262,7 @@ fn serve_membership(map: &Arc<Mutex<pb::Map>>) -> SocketAddr {
             .add_service(
                 kbf_proto::kbf::map::v1::membership_server::MembershipServer::new(Garbled(
                     Arc::clone(map),
+                    retained,
                 )),
             )
             .serve_with_incoming(incoming),
@@ -1235,7 +1278,12 @@ async fn joined_by(map: pb::Map) -> Arc<kbf_mapsync::MapHolder> {
 
 /// The node of [`joined_by`]: its registration was answered with member id 1.
 async fn joined_node(map: pb::Map) -> Arc<NodeMap> {
-    let addr = serve_membership(&Arc::new(Mutex::new(map)));
+    joined_node_retaining(map, Vec::new()).await
+}
+
+/// [`joined_node`], with a frontend that sends `retained` along with the map.
+async fn joined_node_retaining(map: pb::Map, retained: Vec<pb::Map>) -> Arc<NodeMap> {
+    let addr = serve_retaining(&Arc::new(Mutex::new(map)), retained);
     let channel = Endpoint::from_shared(format!("http://{addr}"))
         .expect("endpoint")
         .connect_lazy();

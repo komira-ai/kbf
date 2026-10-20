@@ -478,7 +478,9 @@ const fn member_failure(e: &MembershipError) -> StatusCode {
     match e {
         MembershipError::NotRegistered(_) => StatusCode::NOT_FOUND,
         MembershipError::NotSettable(_) => StatusCode::BAD_REQUEST,
-        MembershipError::NotActive { .. } => StatusCode::CONFLICT,
+        MembershipError::NotActive { .. } | MembershipError::PinsFull { .. } => {
+            StatusCode::CONFLICT
+        }
         MembershipError::Store(_) | MembershipError::Contended => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }

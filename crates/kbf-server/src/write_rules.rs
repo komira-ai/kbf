@@ -163,6 +163,12 @@ pub static FAMILIES: LazyLock<Vec<Family>> = LazyLock::new(|| {
             "members (joiner mark)",
             "unfilled/3",
         ),
+        // The maps the last bumps replaced (`members/pins.rs`).
+        fenced(
+            Keys::Under("handoff/pin/"),
+            "members (map pins)",
+            "handoff/pin/00000000000000000001",
+        ),
         fenced(
             Keys::Under("deny/"),
             "members and kbf-enroll-registry",

@@ -216,14 +216,22 @@ impl Joiner {
         self
     }
 
-    /// Puts `map`, as the frontend sent it, in the holder. One the node cannot read is
-    /// warned about and ignored: the next beat sends it again.
-    fn take(&self, map: Option<pb::Map>) {
+    /// Puts `map`, as the frontend sent it, in the holder, with the maps the frontend retains
+    /// from before it (`retained`, newest first). One the node cannot read is warned about
+    /// and ignored: the next beat sends it again. A retained map it cannot read is left out.
+    fn take(&self, map: Option<pb::Map>, retained: Vec<pb::Map>) {
         let Some(map) = map else { return };
         match Map::try_from(map) {
             Ok(map) => {
                 let generation = map.generation();
-                if self.node.maps().offer(map) {
+                let retained = retained.into_iter().filter_map(|m| {
+                    Map::try_from(m)
+                        .inspect_err(|error| {
+                            tracing::warn!(%error, "a retained map this node cannot read ignored");
+                        })
+                        .ok()
+                });
+                if self.node.maps().offer_with_retained(map, retained) {
                     tracing::info!(generation, "storage map taken");
                 }
             }
@@ -258,7 +266,7 @@ impl Joiner {
             })
             .await?
             .into_inner();
-        self.take(answer.map.clone());
+        self.take(answer.map.clone(), answer.retained_previous);
         self.node.registered(MemberId(answer.member_id));
         self.announced = answer.objstore_generation;
         Ok(Joined {
@@ -301,7 +309,7 @@ impl Joiner {
             .await?
             .into_inner();
         self.announced = answer.objstore_generation;
-        self.take(answer.map);
+        self.take(answer.map, answer.retained_previous);
         Ok(answer.map_generation)
     }
 

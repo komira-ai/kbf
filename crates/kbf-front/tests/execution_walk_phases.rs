@@ -263,6 +263,7 @@ impl MapSource for Farm {
         Some(MapView {
             map: Arc::clone(&self.map),
             previous: None,
+            earlier: Vec::new(),
         })
     }
 

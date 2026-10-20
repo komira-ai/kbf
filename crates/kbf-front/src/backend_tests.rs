@@ -440,6 +440,7 @@ impl MapSource for Trio {
         Some(MapView {
             map: Arc::clone(&self.map),
             previous: self.previous.clone(),
+            earlier: Vec::new(),
         })
     }
 
@@ -687,6 +688,7 @@ async fn the_routed_kind_uses_the_storage_node_until_the_map_has_two_members() {
             Some(MapView {
                 map: Arc::new(map),
                 previous: None,
+                earlier: Vec::new(),
             })
         }
         fn refetch(&self, at_least: u64) -> BoxFuture<'_, Result<MapView, RefetchError>> {
