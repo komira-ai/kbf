@@ -832,7 +832,36 @@ fn publish(root: &Path, defect: Option<&str>) -> (Option<i32>, String, String) {
     publish_set(root, &sha_of(&sums), defect)
 }
 
+/// Adds to the fake's API the release tags `tags` (one page) and the compare of the
+/// highest, `TAG`, with `commit`.
+fn tags_standing(root: &Path, tags: &[&str], top: &str, status: &str) {
+    let path = root.join("gh/gh-api.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
+    let mut map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&text).expect("gh-api.json");
+    let refs: Vec<serde_json::Value> = tags
+        .iter()
+        .map(|t| serde_json::json!({ "ref": format!("refs/tags/{t}") }))
+        .collect();
+    map.insert(
+        format!("repos/{REPO}/git/matching-refs/tags/v?per_page=100&page=1"),
+        serde_json::Value::Array(refs),
+    );
+    map.insert(
+        format!("repos/{REPO}/compare/{top}...{COMMIT}"),
+        serde_json::json!({ "status": status }),
+    );
+    std::fs::write(path, serde_json::Value::Object(map).to_string()).expect("gh-api.json");
+}
+
 fn publish_set(root: &Path, set_hash: &str, defect: Option<&str>) -> (Option<i32>, String, String) {
+    // Rule S reads the release tags: `TAG` is the highest and names `COMMIT`, unless the
+    // test has said otherwise.
+    if !std::fs::read_to_string(root.join("gh/gh-api.json"))
+        .is_ok_and(|t| t.contains("matching-refs"))
+    {
+        tags_standing(root, &[TAG], TAG, "identical");
+    }
     let dist = root.join("dist");
     let run = RUN.to_string();
     xtask(
@@ -1123,6 +1152,49 @@ fn publish_refuses_files_that_fail_the_check_before_asking_github() {
     assert_eq!(code, Some(1));
     assert!(err.contains("not an asset of"), "{err}");
     assert_eq!(gh_args(&root), "");
+}
+
+#[test]
+fn publish_refuses_a_commit_a_newer_release_supersedes_before_any_write() {
+    // Catches: Rule S missing from publish, or accepting `behind` (the commit is an
+    // ancestor of the highest tag: a re-run of an old run would publish over a newer
+    // release), `diverged`, or a compare GitHub cannot answer.
+    for status in ["behind", "diverged", "weird"] {
+        let root = scratch("publish-superseded");
+        dist(&root, COMMIT);
+        tags_standing(&root, &[TAG, "v0.2.0"], "v0.2.0", status);
+        let (code, out, err) = publish(&root, None);
+        assert_eq!(code, Some(1), "{status}: {out}");
+        assert!(
+            err.contains(&format!(
+                "superseded: the highest release tag is v0.2.0 and {COMMIT} is not at or \
+                 after it (compare says {status})"
+            )),
+            "{status}: {err}"
+        );
+        let args = gh_args(&root);
+        assert!(!args.contains("release create"), "{status}: {args}");
+        assert!(!args.contains("release upload"), "{status}: {args}");
+        assert!(!args.contains("releases/tags"), "{status}: {args}");
+        assert_eq!(released(&root), vec![], "{status}");
+    }
+}
+
+#[test]
+fn publish_goes_on_when_the_highest_tag_is_an_ancestor_of_the_commit() {
+    // Control for the test above: the highest tag is older than the commit (`ahead`),
+    // and a repository with no release tag at all is not superseded by one.
+    for (tags, top, status) in [
+        (vec![TAG], TAG, "ahead"),
+        (vec![TAG, "v0.1.0-rc1", "latest"], TAG, "identical"),
+    ] {
+        let root = scratch("publish-ahead");
+        dist(&root, COMMIT);
+        tags_standing(&root, &tags, top, status);
+        let (code, _, err) = publish(&root, None);
+        assert_eq!(code, Some(0), "{status}: {err}");
+        assert_eq!(released(&root), verified(&root));
+    }
 }
 
 #[test]
