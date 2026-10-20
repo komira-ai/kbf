@@ -615,12 +615,10 @@ fn register_cold(farm: &Farm) -> (&'static str, &'static str) {
     use kbf_types::object_store_api::{BindingPut, BindingRole, ConnectionPut, Secret};
     const KEY_ID: &str = "AKIDE2EKEYID";
     const SECRET: &str = "e2e-secret-access-key-value";
-    let registry = Registry::open(
-        Arc::clone(&farm.store),
-        &scratch("registry-secrets"),
-        Arc::new(OsRandom),
-    )
-    .expect("registry");
+    // Held to the end: the registry writes its secret files here.
+    let secrets = scratch("registry-secrets");
+    let registry =
+        Registry::open(Arc::clone(&farm.store), &secrets, Arc::new(OsRandom)).expect("registry");
     let name = "cold".parse().expect("name");
     registry
         .put_connection(

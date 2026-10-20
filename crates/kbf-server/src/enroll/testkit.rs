@@ -160,12 +160,10 @@ pub fn register_cold(farm: &Farm) -> u64 {
     use kbf_types::object_store_api::{
         BindingPut, BindingRole, ConnectionName, ConnectionPut, Secret,
     };
-    let registry = Registry::open(
-        Arc::clone(&farm.store),
-        &scratch("registry-secrets"),
-        Arc::new(super::OsRandom),
-    )
-    .expect("a registry");
+    // Held to the end: the registry writes its secret files here.
+    let secrets = scratch("registry-secrets");
+    let registry = Registry::open(Arc::clone(&farm.store), &secrets, Arc::new(super::OsRandom))
+        .expect("a registry");
     let name: ConnectionName = "cold".parse().expect("a name");
     registry
         .put_connection(
