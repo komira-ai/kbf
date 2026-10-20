@@ -41,6 +41,22 @@ struct Go {
     unknown_state: Option<String>,
 }
 
+/// Whether the installer's `state` is no longer what the migration adopted: another
+/// `current` or `previous`, or a release staged or waiting for its confirm.
+pub(super) fn moved_on(journal: &Journal, state: &State) -> bool {
+    let adopted = |role: &str| {
+        journal
+            .adopted
+            .iter()
+            .find(|a| a.role == role)
+            .map(|a| a.commit.clone())
+    };
+    state.current != adopted("current")
+        || state.previous != adopted("previous")
+        || state.staged.is_some()
+        || state.pending_confirm.is_some()
+}
+
 /// Look at the journal and at the installer's state (as `read_state` reads it) and judge
 /// them: the journal must be there, the host not already rolled back, and, once the
 /// migration is done, the installer must not have moved on. Changes nothing. An apply looks
@@ -75,17 +91,7 @@ fn look(
         read => read?,
     };
     if let Some(state) = state {
-        let adopted = |role: &str| {
-            journal
-                .adopted
-                .iter()
-                .find(|a| a.role == role)
-                .map(|a| a.commit.clone())
-        };
-        let moved = state.current != adopted("current")
-            || state.previous != adopted("previous")
-            || state.staged.is_some()
-            || state.pending_confirm.is_some();
+        let moved = moved_on(&journal, &state);
         if journal.phase == Phase::Done && moved {
             return Err(MigrateError::MovedOn(
                 "the installer has activated or staged a release since the migration; \

@@ -352,6 +352,9 @@ pub struct UninstallArgs {
     /// The installer's own unit: stopped and, on Linux, disabled. A Mac without the flag acts
     /// on the package's job, `com.komira.kbf-installer.plist`; a Linux host without it leaves
     /// its unit to the package manager.
+    /// The unit must be `.plist` on a Mac and `.service` on Linux (else exit 2). On a Mac a
+    /// name other than the package's job replaces it as the job acted on: the package's own
+    /// plist is then left in place, while the installer's tree, logs and receipt are removed.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub installer_unit: Option<crate::migrate::Unit>,
 }

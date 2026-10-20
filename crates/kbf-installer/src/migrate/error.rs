@@ -86,6 +86,9 @@ pub enum MigrateError {
     /// Applying an uninstall needs the user that owns the installer's files.
     #[error("uninstalling changes root's files: run it as root (this is uid {have}, not {want})")]
     NotRootToUninstall { have: u32, want: u32 },
+    /// The installer's unit is of the other platform's kind.
+    #[error("--installer-unit {unit}: this host's units are {want}")]
+    UnitKind { unit: String, want: &'static str },
     /// There is nothing to roll back.
     #[error("cannot roll back: this host was not migrated (no migration.json)")]
     NoJournal,
@@ -109,7 +112,9 @@ impl MigrateError {
     /// How the verb ends (docs/design/kbf-installer.md section 2).
     pub fn exit(&self) -> Exit {
         match self {
-            MigrateError::NotRoot { .. } | MigrateError::NotRootToUninstall { .. } => Exit::Usage,
+            MigrateError::NotRoot { .. }
+            | MigrateError::NotRootToUninstall { .. }
+            | MigrateError::UnitKind { .. } => Exit::Usage,
             MigrateError::BadLink { .. }
             | MigrateError::Mislabeled { .. }
             | MigrateError::HalfKit(_)

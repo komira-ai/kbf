@@ -669,3 +669,82 @@ fn a_record_with_nothing_left_to_do_is_taken_away() {
     assert_eq!(report.outcome, Outcome::NothingToMigrate);
     assert!(!record.exists());
 }
+
+/// Catches a rolled-back journal that outlives the host being rolled back. The ways to hand a
+/// rolled-back host to the installer again: `migrate --apply` takes the same journal on to
+/// `Started` and `Done`, so an uninstall after it is refused with nothing removed; `setup`
+/// is refused by the guard while the old layout is there. This pins both, and the one that
+/// is open when the old layout was removed by hand: `setup` then goes ahead, the installer's
+/// state moves on, the journal stays `rolled_back`, and the uninstall must still refuse.
+///
+/// Mutant seen red: the moved-on check removed from the rolled-back arm (the third part
+/// archives the journal of a host the installer runs). The first two parts hold with the
+/// check removed: they pin the paths that already end in a refusal.
+#[test]
+fn a_host_handed_to_the_installer_again_is_refused() {
+    use crate::testkit::C;
+
+    // Rolled back, `setup` refused, `migrate` again: the journal is `done`.
+    let mut rig = Rig::linux("readopt-migrate");
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    let m = rig.migration();
+    rollback_at(&m, &mut rig.host, Mode::Apply, NOON).expect("rollback");
+    assert!(
+        guard(&rig.layout, me()).is_err(),
+        "setup is refused on a rolled-back host with the old layout"
+    );
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate again");
+    let before = rig.snapshot("");
+    let error = apply_at(&mut rig, NOON).expect_err("refused");
+    assert!(matches!(error, MigrateError::Adopted(_)), "{error}");
+    assert_eq!(rig.snapshot(""), before);
+
+    // Rolled back, the old layout removed by hand, `setup` goes ahead and a release becomes
+    // current: the journal still says `rolled_back`.
+    let mut rig = Rig::linux("readopt-setup");
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    let m = rig.migration();
+    rollback_at(&m, &mut rig.host, Mode::Apply, NOON).expect("rollback");
+    fs::remove_file(rig.at("var/lib/kbf-deploy/state.json")).expect("rm");
+    fs::remove_file(rig.at("var/lib/kbf-deploy/helper.json")).expect("rm");
+    guard(&rig.layout, me()).expect("setup is not refused: there is no old layout");
+    Locked::acquire(&rig.layout)
+        .expect("lock")
+        .write(&State {
+            current: Some(commit(C)),
+            ..State::default()
+        })
+        .expect("state");
+    let before = rig.snapshot("");
+    let error = apply_at(&mut rig, NOON).expect_err("refused");
+    assert!(matches!(error, MigrateError::Adopted(_)), "{error}");
+    assert_eq!(error.exit(), Exit::NeedsOperator);
+    assert!(error.to_string().contains("state.json"), "{error}");
+    assert_eq!(rig.snapshot(""), before);
+}
+
+/// Catches a unit of the other platform's kind being acted on: a `.service` on a Mac or a
+/// `.plist` on Linux is a usage error (exit 2) in a dry run and an apply alike, ended before
+/// the lock, the journal or any command, with the host unchanged. The matching kind goes on
+/// as before (`a_named_unit_is_the_one_acted_on`).
+///
+/// Mutant seen red: the kind check removed (the Mac with a `.service` unit then plans and
+/// runs systemd commands).
+#[test]
+fn a_unit_of_the_other_platforms_kind_is_a_usage_error() {
+    for (mut rig, wrong) in [
+        (rolled_back_mac("kind-mac"), "kbf-installer.service"),
+        (Rig::linux("kind-linux"), "com.komira.kbf-installer.plist"),
+    ] {
+        let before = rig.snapshot("");
+        for mode in [Mode::DryRun, Mode::Apply] {
+            let mut u = uninstall_of(&rig);
+            u.installer_unit = Some(unit(wrong));
+            let error = uninstall_at(&u, &mut rig.host, mode, NOON).expect_err("usage");
+            assert_eq!(error.exit(), Exit::Usage, "{wrong} {mode:?}: {error}");
+            assert!(error.to_string().contains(wrong), "{error}");
+        }
+        assert_eq!(rig.snapshot(""), before, "{wrong}");
+        assert!(rig.events.borrow().is_empty(), "{wrong}");
+    }
+}

@@ -12,6 +12,12 @@
 //!    state the installer wrote, means the installer runs this host, and the way out is
 //!    `migrate --rollback`. (An archived journal, `migration.json.rolled-back-...`, is a host
 //!    an earlier uninstall finished: the `state.json` of the adoption it undid is not a reason.) The refusal is [`MigrateError::Adopted`] (exit 5).
+//!    Handing a rolled-back host to the installer again ends in a refusal on every path:
+//!    `migrate --apply` takes the same journal to `Started` and `Done`; `setup` is refused
+//!    (exit 5) while the old layout is there; and when the old layout was removed by hand
+//!    `setup` goes ahead with the journal still `RolledBack`, so the gate also refuses a
+//!    rolled-back journal whose `state.json` differs from what the migration adopted
+//!    (another `current` or `previous`, or a release staged or pending).
 //! 2. **Lock**: the installer's own lock, the one a `run` pass holds, waited for
 //!    [`Uninstall::lock_wait`] and then busy (exit 4), and held to the end, so the plist
 //!    cannot be pulled from under a pass. The refusal is judged again under it.
@@ -24,7 +30,11 @@
 //!    journal is renamed in effect, never deleted. A Linux host's package files (the unit's
 //!    file, the binary, the trust files) belong to the package manager and are left to it: the
 //!    verb stops and disables the installer's unit when `--installer-unit` names it (as the
-//!    rollback does), and archives the journal.
+//!    rollback does), and archives the journal. The unit must be of the platform's kind
+//!    (`.plist` on a Mac, `.service` on Linux), else the verb ends as a usage error (exit 2)
+//!    before anything runs. On a Mac `--installer-unit` replaces the package's job as the one
+//!    booted out, removed and enabled; the package's own plist, if it is another file, is left,
+//!    while the tree, logs and receipt go as always.
 //! 4. **Dry run unless `--apply`**: every step above is printed as the line it would run
 //!    (`remove /path`, `remove tree /path`, the receipt id), one per line, and nothing is
 //!    changed.
@@ -50,7 +60,7 @@ use super::apply::KIT_INSTALLER_JOB;
 use super::error::MigrateError;
 use super::journal::{Journal, Phase};
 use super::newtree::{JOURNAL, StateDir};
-use super::rollback::{ASIDE_PREFIX, aside_names};
+use super::rollback::{ASIDE_PREFIX, aside_names, moved_on};
 use super::roots::Roots;
 use super::services::Services;
 use super::tree::Rules;
@@ -176,7 +186,20 @@ fn look(
         .transpose()?
         .flatten();
     match &journal {
-        Some(j) if j.phase == Phase::RolledBack => {}
+        Some(j) if j.phase == Phase::RolledBack => {
+            // A rollback keeps the new tree and its state.json as the adoption left them. A
+            // state that differs from what the migration adopted was written since: `setup`
+            // goes ahead on a rolled-back host whose old layout is gone, and the journal
+            // stays `rolled_back` while the installer runs the host.
+            if let Some(state) = read_state()?
+                && moved_on(j, &state)
+            {
+                return Err(MigrateError::Adopted(
+                    "the installer's state.json has moved on since the migration that was rolled                      back (a release became current or was staged): the installer manages this                      host again, and removing it would leave kbf unmanaged"
+                        .to_owned(),
+                ));
+            }
+        }
         Some(j) => {
             return Err(MigrateError::Adopted(format!(
                 "the migration is {}, so the installer manages this host: put it back with \
@@ -479,6 +502,21 @@ pub fn uninstall_at<E: Exec>(
     mode: Mode,
     now_secs: u64,
 ) -> Result<Report, MigrateError> {
+    if let Some(unit) = &u.installer_unit {
+        let wanted = match u.layout.platform() {
+            Platform::MacOs => super::units::Kind::Launchd,
+            Platform::Linux => super::units::Kind::Systemd,
+        };
+        if unit.kind() != wanted {
+            return Err(MigrateError::UnitKind {
+                unit: unit.to_string(),
+                want: match wanted {
+                    super::units::Kind::Launchd => ".plist (launchd)",
+                    super::units::Kind::Systemd => ".service (systemd)",
+                },
+            });
+        }
+    }
     let rules = Rules::release(u.owner_uid);
     // The first look takes no lock. It is all of a dry run, and an apply's chance to refuse
     // before it waits for anything.

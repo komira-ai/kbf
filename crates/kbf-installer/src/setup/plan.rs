@@ -691,13 +691,15 @@ fn units(
                 // The installer's job may carry a launchd disable override (the rollback of
                 // an adopted Mac sets one, and the package's removal does not clear it): a
                 // job that is disabled does not load at boot, and `bootstrap` of it fails.
-                // `enable` clears the override and is harmless without one, so it comes before
-                // the bootstrap, and with `--no-start` too (the job is then enabled for the
-                // next boot, as a systemd unit is).
+                // `enable` clears the override and is harmless without one, so it is run
+                // whether or not the job is loaded (a loaded job can carry an override too),
+                // before the bootstrap, and with `--no-start` too (the job is then enabled
+                // for the next boot, as a systemd unit is).
                 let installer = label == MAC_INSTALLER_LABEL;
-                if !(now || installer) || os.launchd_loaded(label)? {
+                if !(now || installer) {
                     continue;
                 }
+                let loaded = os.launchd_loaded(label)?;
                 if installer {
                     p.run(
                         Cmd::new(hp(LAUNCHCTL)?)
@@ -705,7 +707,7 @@ fn units(
                             .arg(format!("system/{label}")),
                     );
                 }
-                if now {
+                if now && !loaded {
                     p.run(
                         Cmd::new(hp(LAUNCHCTL)?)
                             .arg("bootstrap")
