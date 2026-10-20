@@ -2075,25 +2075,21 @@ mod tests {
             .expect_err("no member answers");
         assert!(error.to_string().contains(&dead), "{error}");
 
-        // `serve`, the entry the binary and the SIGTERM path use, ends the same way. A
-        // watchdog raises SIGTERM after 5 s so that a `serve` that ignores the check
-        // returns Ok (drained) and fails here, not hangs; it is called off when `serve`
-        // returns in time.
+        // `serve`, the entry the binary and the SIGTERM path use, ends the same way. It
+        // runs on a thread the test waits on for 5 s: a `serve` that ignores the check
+        // would wait for a signal for ever, and fails here instead of hanging the run.
         let mut node = start(&cli).expect("starts");
         refused(&mut node);
-        let (done, watch) = std::sync::mpsc::channel::<()>();
-        let watchdog = std::thread::spawn(move || {
-            // SAFETY: raise has no preconditions; serve's handler takes the signal. One
-            // line: it runs only when the test is already failing.
-            let _ = watch
-                .recv_timeout(Duration::from_secs(5))
-                .map_err(|_| unsafe { libc::raise(libc::SIGTERM) });
+        let (ended, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            ended.send(node.serve().map_err(|e| e.to_string())).ok();
         });
-        let result = node.serve();
-        drop(done);
-        watchdog.join().expect("watchdog");
-        let error = result.expect_err("serve ends with the refusal");
-        assert!(error.to_string().contains(&dead), "{error}");
+        let served = result.recv_timeout(Duration::from_secs(5));
+        assert!(served.is_ok(), "serve did not end: it ignores the check");
+        let error = served
+            .expect("ended")
+            .expect_err("serve ends with the refusal");
+        assert!(error.contains(&dead), "{error}");
 
         // The same map with a member that answers: the daemon serves until told to stop.
         let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
