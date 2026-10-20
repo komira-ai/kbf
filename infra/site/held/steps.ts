@@ -2,6 +2,8 @@
 // refuses unless the profile's account equals --account. All tool access goes through `Tools`, so the tests drive the
 // steps with a fake and can see exactly which commands ran.
 
+import { APPROVAL_ENVIRONMENT, GITHUB_ENVIRONMENT, oidcSubject } from '../lib/config';
+
 export interface Tools {
   /** Run a read-only command and return its stdout. Throws on a non-zero exit. */
   capture(cmd: string, args: string[]): string;
@@ -110,13 +112,28 @@ export function repoIds(t: Tools, repo: string): { repoId: string; ownerId: stri
   return ids;
 }
 
+const subFor = (i: { fullName: string; repoId: string; ownerId: string }) => oidcSubject({ repo: i.fullName, repoId: i.repoId, ownerId: i.ownerId });
+
 /** Quote a value for a POSIX shell word: single quotes, each embedded quote written as '\''. */
 export const shellQuote = (v: string) => `'${v.replace(/'/g, "'\\''")}'`;
 
 export const OIDC_KEYS = ['repo', 'context', 'job_workflow_ref'];
 
-/** The deployment policies environment `prod` must have, and no others: the existing job runs on main, publish on a v* tag. */
-export const POLICIES: [string, string][] = [['main', 'branch'], ['v*', 'tag']];
+/**
+ * The two GitHub environments of one release, and why there are two (one approval click per release):
+ *  - `prod`: the ONLY environment with a required reviewer. The `publish` job (contents: write) references it, so the
+ *    reviewer is asked once. Policies: branch `main` (dispatch dry runs) and tag `v*` (the tag-push run).
+ *  - `prod-site`: NO reviewer. The site job (id-token: write) references it and `needs` the approved publish job, so the
+ *    site cannot start before the GitHub release exists and the reviewer is not asked a second time. Policy: tag `v*` only.
+ *    The AWS role trusts this environment in its `sub`, so the approved publish job can never assume it.
+ */
+export interface EnvSpec { name: string; reviewer: boolean; policies: [string, string][] }
+export const ENVIRONMENTS: EnvSpec[] = [
+  { name: APPROVAL_ENVIRONMENT, reviewer: true, policies: [['main', 'branch'], ['v*', 'tag']] },
+  { name: GITHUB_ENVIRONMENT, reviewer: false, policies: [['v*', 'tag']] },
+];
+/** Kept for the tests: the policies of the approval environment. */
+export const POLICIES: [string, string][] = ENVIRONMENTS[0].policies;
 
 /** True when a failed `gh api` call was an HTTP 404 (gh prints "(HTTP 404)" on stderr, which execFileSync puts in the message). */
 function isNotFound(e: unknown): boolean {
@@ -151,7 +168,7 @@ export function reviewerId(t: Tools, login: string): number {
 
 export function github(t: Tools, o: Options): void {
   const repo = o.repo!;
-  repoIds(t, repo); // read-only; refuses a --repo that is not the repository's exact name
+  const ids = repoIds(t, repo); // read-only; refuses a --repo that is not the repository's exact name
   const reviewer = reviewerId(t, o.reviewer!);
   const act = (args: string[], input?: string) => {
     const shown = input === undefined ? args : [...args, '--input', '-', `<<< ${shellQuote(input)}`];
@@ -161,29 +178,30 @@ export function github(t: Tools, o: Options): void {
     } else t.log(`DRY-RUN: gh ${shown.join(' ')}`);
   };
   if (!o.apply) t.log('# dry run: nothing is executed. Re-run with --apply to act.');
-  // PUT replaces the whole protection set, so it always carries every field it manages.
-  const body = JSON.stringify({
-    reviewers: [{ type: 'User', id: reviewer }],
-    prevent_self_review: false, // the tag pusher is the approver; with this on, a release would deadlock
-    can_admins_bypass: false,
-    deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
-  });
-  const env = ghGet(t, repo, 'environments/prod');
-  const rule = reviewerRule(env);
-  const dbp = env?.deployment_branch_policy;
-  const envOk =
-    rule !== undefined && rule.ids.length === 1 && rule.ids[0] === reviewer && rule.preventSelf === false &&
-    env.can_admins_bypass === false && dbp?.protected_branches === false && dbp?.custom_branch_policies === true;
-  if (envOk) t.log('# environment prod already has this reviewer, self-review off, admin bypass off, custom policies');
-  else act(['api', '-X', 'PUT', `repos/${repo}/environments/prod`], body);
-  const pols = ghGet(t, repo, 'environments/prod/deployment-branch-policies')?.branch_policies ?? [];
-  for (const [name, type] of POLICIES) {
-    if (pols.some((p: any) => p.name === name && p.type === type)) t.log(`# policy ${name}/${type} already present`);
-    else act(['api', '-X', 'POST', `repos/${repo}/environments/prod/deployment-branch-policies`, '-f', `name=${name}`, '-f', `type=${type}`]);
-  }
-  for (const p of pols) {
-    if (!POLICIES.some(([n, ty]) => n === p.name && ty === p.type)) {
-      t.log(`# WARNING: extra policy ${p.name}/${p.type} is not removed here; delete it by hand (vars refuses while it exists)`);
+  for (const e of ENVIRONMENTS) {
+    // PUT replaces the whole protection set, so it always carries every field it manages.
+    const body = JSON.stringify({
+      reviewers: e.reviewer ? [{ type: 'User', id: reviewer }] : [],
+      prevent_self_review: false, // the tag pusher is the approver; with this on, a release would deadlock
+      can_admins_bypass: false,
+      deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+    });
+    const env = ghGet(t, repo, `environments/${e.name}`);
+    const rule = reviewerRule(env);
+    const dbp = env?.deployment_branch_policy;
+    const reviewersOk = e.reviewer ? rule !== undefined && rule.ids.length === 1 && rule.ids[0] === reviewer && rule.preventSelf === false : rule === undefined || rule.ids.length === 0;
+    const envOk = env !== undefined && reviewersOk && env.can_admins_bypass === false && dbp?.protected_branches === false && dbp?.custom_branch_policies === true;
+    if (envOk) t.log(`# environment ${e.name} already has ${e.reviewer ? 'this reviewer' : 'no reviewer'}, admin bypass off, custom policies`);
+    else act(['api', '-X', 'PUT', `repos/${repo}/environments/${e.name}`], body);
+    const pols = ghGet(t, repo, `environments/${e.name}/deployment-branch-policies`)?.branch_policies ?? [];
+    for (const [name, type] of e.policies) {
+      if (pols.some((p: any) => p.name === name && p.type === type)) t.log(`# ${e.name}: policy ${name}/${type} already present`);
+      else act(['api', '-X', 'POST', `repos/${repo}/environments/${e.name}/deployment-branch-policies`, '-f', `name=${name}`, '-f', `type=${type}`]);
+    }
+    for (const p of pols) {
+      if (!e.policies.some(([n, ty]) => n === p.name && ty === p.type)) {
+        t.log(`# WARNING: ${e.name} has an extra policy ${p.name}/${p.type}; it is not removed here, delete it by hand (vars refuses while it exists)`);
+      }
     }
   }
   act([
@@ -191,9 +209,12 @@ export function github(t: Tools, o: Options): void {
     '-F', 'use_default=false', '-F', 'use_immutable_subject=true',
     ...OIDC_KEYS.flatMap((k) => ['-f', `include_claim_keys[]=${k}`]),
   ]);
+  t.log(`# The role must trust environment ${GITHUB_ENVIRONMENT} (not ${APPROVAL_ENVIRONMENT}); its sub is:`);
+  t.log(`#   ${subFor(ids)}`);
+  t.log('# If the stack was deployed with another environment in its trust, re-run the `site` step (diff, then --apply).');
   t.log('# REMINDER (not run): before relying on the role, run a manual workflow from site-publish.yml@refs/heads/main in');
-  t.log("# environment prod that prints the token's sub and job_workflow_ref (never the token), and compare the sub with the");
-  t.log('# one in infra/site/README.md. vars checks the GitHub settings, not the token.');
+  t.log(`# environment ${GITHUB_ENVIRONMENT} that prints the token's sub and job_workflow_ref (never the token), and compare the sub with the`);
+  t.log('# one above. vars checks the GitHub settings, not the token.');
 }
 
 export const OIDC_URL = 'https://token.actions.githubusercontent.com';
@@ -276,19 +297,25 @@ export function checkGithub(t: Tools, repo: string): string[] {
     }
   };
   const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
-  const env = get('environments/prod');
-  const dbp = env?.deployment_branch_policy;
-  if (!dbp || dbp.protected_branches !== false || dbp.custom_branch_policies !== true) {
-    bad.push('environment prod is missing or does not use custom branch policies only');
-  }
-  const rule = reviewerRule(env);
-  if (!rule || rule.ids.length === 0) bad.push('environment prod has no required reviewer');
-  else if (rule.preventSelf !== false) bad.push('environment prod does not allow the tag pusher to approve (prevent_self_review must be false)');
-  if (env?.can_admins_bypass !== false) bad.push('environment prod lets administrators bypass its protection rules');
-  const pols = get('environments/prod/deployment-branch-policies')?.branch_policies;
-  const want = POLICIES.map((p) => p.join('/')).sort();
-  if (!Array.isArray(pols) || !same(pols.map((p: any) => `${p.name}/${p.type}`).sort(), want)) {
-    bad.push('environment prod does not deploy from exactly the branch main and the tags v*');
+  for (const e of ENVIRONMENTS) {
+    const env = get(`environments/${e.name}`);
+    const dbp = env?.deployment_branch_policy;
+    if (!dbp || dbp.protected_branches !== false || dbp.custom_branch_policies !== true) {
+      bad.push(`environment ${e.name} is missing or does not use custom branch policies only`);
+    }
+    const rule = reviewerRule(env);
+    if (e.reviewer) {
+      if (!rule || rule.ids.length === 0) bad.push(`environment ${e.name} has no required reviewer`);
+      else if (rule.preventSelf !== false) bad.push(`environment ${e.name} does not allow the tag pusher to approve (prevent_self_review must be false)`);
+    } else if (rule && rule.ids.length > 0) {
+      bad.push(`environment ${e.name} has a required reviewer: it would raise a second approval prompt per release (only ${APPROVAL_ENVIRONMENT} has one)`);
+    }
+    if (env?.can_admins_bypass !== false) bad.push(`environment ${e.name} lets administrators bypass its protection rules`);
+    const pols = get(`environments/${e.name}/deployment-branch-policies`)?.branch_policies;
+    const want = e.policies.map((p) => p.join('/')).sort();
+    if (!Array.isArray(pols) || !same(pols.map((p: any) => `${p.name}/${p.type}`).sort(), want)) {
+      bad.push(`environment ${e.name} does not deploy from exactly ${e.policies.map(([n, ty]) => `${ty} ${n}`).join(' and ')}`);
+    }
   }
   const tmpl = get('actions/oidc/customization/sub');
   if (!tmpl || tmpl.use_default !== false || tmpl.use_immutable_subject !== true || !same(tmpl.include_claim_keys, OIDC_KEYS)) {
@@ -313,9 +340,10 @@ export function vars(t: Tools, o: Options): void {
     ['KBF_SITE_PUBLISH_ROLE_ARN', val('PublishRoleArn')],
   ];
   if (rows.some(([, v]) => !v)) throw new Refused('stack kbf-prod-site has no outputs; run site --apply first');
-  t.log(`# Environment prod of ${o.repo} is as expected. Run:`);
-  for (const [k, v] of rows) t.log(`gh variable set ${k} --env prod --repo ${o.repo} --body ${shellQuote(v!)}`);
-  t.log(`# Region is always ${REGION}.`);
+  t.log(`# Environments ${ENVIRONMENTS.map((e) => e.name).join(' and ')} of ${o.repo} are as expected. The variables belong to ${GITHUB_ENVIRONMENT}, the environment of the job that assumes the role. Run:`);
+  for (const [k, v] of rows) t.log(`gh variable set ${k} --env ${GITHUB_ENVIRONMENT} --repo ${o.repo} --body ${shellQuote(v!)}`);
+  t.log(`# Region is always ${REGION}. The role's trust must name environment ${GITHUB_ENVIRONMENT}; its sub is:`);
+  t.log(`#   ${subFor(repoIds(t, o.repo!))}`);
 }
 
 export function main(argv: string[], t: Tools): void {

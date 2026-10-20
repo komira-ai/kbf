@@ -1,4 +1,4 @@
-import { POLICIES, Refused, Tools, checkGithub, main, parse, shellQuote } from '../held/steps';
+import { ENVIRONMENTS, POLICIES, Refused, Tools, checkGithub, main, parse, shellQuote } from '../held/steps';
 
 const ACCOUNT = '123456789012';
 const REPO = 'example-org/example-repo';
@@ -39,6 +39,8 @@ const envJson = (over: Record<string, unknown> = {}, rule: Record<string, unknow
 const polsJson = (...p: [string, string][]) => JSON.stringify({ branch_policies: p.map(([name, type]) => ({ name, type })) });
 const GOOD_ENV = envJson();
 const GOOD_POLS = polsJson(['main', 'branch'], ['v*', 'tag']);
+const SITE_ENV = envJson({}, null); // prod-site: no reviewer rule
+const SITE_POLS = polsJson(['v*', 'tag']);
 const GOOD_TMPL = JSON.stringify({ use_default: false, use_immutable_subject: true, include_claim_keys: ['repo', 'context', 'job_workflow_ref'] });
 const STACK = JSON.stringify([
   { OutputKey: 'BucketName', OutputValue: `kbf-prod-site-${ACCOUNT}` },
@@ -47,6 +49,9 @@ const STACK = JSON.stringify([
 ]);
 const answers = (over: Record<string, string | Error> = {}) => ({
   'sts get-caller-identity': ACCOUNT,
+  // prod-site first: a fake key matches by substring, and 'environments/prod' is a prefix of 'environments/prod-site'
+  'environments/prod-site/deployment-branch-policies': SITE_POLS,
+  'environments/prod-site': SITE_ENV,
   'environments/prod/deployment-branch-policies': GOOD_POLS,
   'environments/prod': GOOD_ENV,
   'oidc/customization/sub': GOOD_TMPL,
@@ -93,7 +98,7 @@ describe('account guard', () => {
 describe('dry run', () => {
   const GH = ['github', '--repo', REPO, '--reviewer', REVIEWER];
   const NOT_FOUND = new Error('gh: Not Found (HTTP 404)');
-  const NOTHING = { 'environments/prod/deployment-branch-policies': NOT_FOUND, 'environments/prod': NOT_FOUND };
+  const NOTHING = { 'environments/prod-site/deployment-branch-policies': NOT_FOUND, 'environments/prod-site': NOT_FOUND, 'environments/prod/deployment-branch-policies': NOT_FOUND, 'environments/prod': NOT_FOUND };
   test('github prints the gh commands and executes none', () => {
     const f = fake(answers(NOTHING));
     main(GH, f.t);
@@ -108,14 +113,16 @@ describe('dry run', () => {
     expect(f.text()).toContain('-f name=v* -f type=tag');
     expect(f.text()).toContain('include_claim_keys[]=job_workflow_ref');
     expect(f.text()).toContain('REMINDER');
+    expect(f.text()).toContain(`DRY-RUN: gh api -X PUT repos/${REPO}/environments/prod-site --input -`);
+    // the role-trust sub the operator needs, for prod-site (not prod)
+    expect(f.text()).toContain(`repo:example-org@111/example-repo@222:environment:prod-site:job_workflow_ref:${REPO}/.github/workflows/site-publish.yml@refs/heads/main`);
+    expect(f.text()).not.toContain('environment:prod:job_workflow_ref');
   });
-  test('github --apply on a bare repo runs the environment write with the body on stdin, both policies, and the sub template', () => {
+  test('github --apply on a bare repo writes prod (reviewer, main + v*), then prod-site (no reviewer, v* tag only), then the sub template', () => {
     const f = fake(answers(NOTHING));
     main([...GH, '--apply'], f.t);
     const streamed = f.calls.filter((c) => c.kind === 'stream');
-    expect(streamed.map((c) => c.args.slice(0, 3).join(' '))).toEqual([
-      `api -X PUT`, `api -X POST`, `api -X POST`, `api -X PUT`,
-    ].map((x) => x));
+    expect(streamed.map((c) => c.args.slice(0, 3).join(' '))).toEqual(['api -X PUT', 'api -X POST', 'api -X POST', 'api -X PUT', 'api -X POST', 'api -X PUT']);
     expect(streamed[0].args).toContain(`repos/${REPO}/environments/prod`);
     expect(JSON.parse(streamed[0].input!)).toEqual({
       reviewers: [{ type: 'User', id: REVIEWER_ID }],
@@ -123,9 +130,17 @@ describe('dry run', () => {
       can_admins_bypass: false,
       deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
     });
-    expect(streamed[1].args.join(' ')).toContain('-f name=main -f type=branch');
-    expect(streamed[2].args.join(' ')).toContain('-f name=v* -f type=tag');
-    expect(streamed[3].args.join(' ')).toContain('oidc/customization/sub');
+    expect(streamed[1].args.join(' ')).toContain('environments/prod/deployment-branch-policies -f name=main -f type=branch');
+    expect(streamed[2].args.join(' ')).toContain('environments/prod/deployment-branch-policies -f name=v* -f type=tag');
+    expect(streamed[3].args).toContain(`repos/${REPO}/environments/prod-site`);
+    expect(JSON.parse(streamed[3].input!)).toEqual({
+      reviewers: [],
+      prevent_self_review: false,
+      can_admins_bypass: false,
+      deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+    });
+    expect(streamed[4].args.join(' ')).toContain('environments/prod-site/deployment-branch-policies -f name=v* -f type=tag');
+    expect(streamed[5].args.join(' ')).toContain('oidc/customization/sub');
   });
   test('github --apply is idempotent: with everything present only the (idempotent) sub template is written', () => {
     const f = fake(answers());
@@ -133,9 +148,29 @@ describe('dry run', () => {
     const streamed = f.calls.filter((c) => c.kind === 'stream').map((c) => c.args.join(' '));
     expect(streamed).toHaveLength(1);
     expect(streamed[0]).toContain('oidc/customization/sub');
-    expect(f.text()).toContain('policy main/branch already present');
-    expect(f.text()).toContain('policy v*/tag already present');
-    expect(f.text()).toContain('already has this reviewer');
+    expect(f.text()).toContain('prod: policy main/branch already present');
+    expect(f.text()).toContain('prod: policy v*/tag already present');
+    expect(f.text()).toContain('prod-site: policy v*/tag already present');
+    expect(f.text()).toContain('environment prod already has this reviewer');
+    expect(f.text()).toContain('environment prod-site already has no reviewer');
+  });
+  test('github adds the v* tag policy to prod-site when it is missing, and sets no reviewer on it', () => {
+    const f = fake(answers({ 'environments/prod-site/deployment-branch-policies': polsJson() }));
+    main([...GH, '--apply'], f.t);
+    const posts = f.calls.filter((c) => c.kind === 'stream' && c.args.includes('POST'));
+    expect(posts).toHaveLength(1);
+    expect(posts[0].args.join(' ')).toContain(`repos/${REPO}/environments/prod-site/deployment-branch-policies -f name=v* -f type=tag`);
+  });
+  test.each([
+    ['a required reviewer', envJson({}, {})],
+    ['admins can bypass', envJson({ can_admins_bypass: true }, null)],
+    ['protected branches rather than custom', envJson({ deployment_branch_policy: { protected_branches: true, custom_branch_policies: false } }, null)],
+  ] as [string, string][])('github rewrites prod-site when it has %s, with an empty reviewer list', (_n, env) => {
+    const f = fake(answers({ 'environments/prod-site': env }));
+    main([...GH, '--apply'], f.t);
+    const puts = f.calls.filter((c) => c.kind === 'stream' && c.args.includes(`repos/${REPO}/environments/prod-site`));
+    expect(puts).toHaveLength(1);
+    expect(JSON.parse(puts[0].input!).reviewers).toEqual([]);
   });
   test('github adds only the missing tag policy, and only the missing main policy', () => {
     for (const [have, missing] of [[['main', 'branch'], 'name=v* -f type=tag'], [['v*', 'tag'], 'name=main -f type=branch']] as [[string, string], string][]) {
@@ -172,11 +207,11 @@ describe('dry run', () => {
       const posts = f.calls.filter((c) => c.kind === 'stream' && c.args.includes('POST'));
       expect(posts).toHaveLength(1);
       expect(posts[0].args.join(' ')).toContain(create);
-      expect(f.text()).toContain(`WARNING: extra policy ${wrong[0]}/${wrong[1]}`);
+      expect(f.text()).toContain(`prod has an extra policy ${wrong[0]}/${wrong[1]}`);
       expect(f.calls.some((c) => c.args.includes('DELETE'))).toBe(false);
     }
   });
-  test.each(['environments/prod', 'environments/prod/deployment-branch-policies'])('github aborts, before any write, when reading %s fails with something other than a 404', (path) => {
+  test.each(['environments/prod', 'environments/prod/deployment-branch-policies', 'environments/prod-site', 'environments/prod-site/deployment-branch-policies'])('github aborts, before any write, when reading %s fails with something other than a 404', (path) => {
     for (const msg of ['gh: Resource not accessible by personal access token (HTTP 403)', 'error connecting to api.github.com', 'gh: Server Error (HTTP 500)']) {
       const f = fake(answers({ [path]: new Error(msg) }));
       expect(() => main([...GH, '--apply'], f.t)).toThrow(/not with a 404/);
@@ -191,7 +226,7 @@ describe('dry run', () => {
   test('github warns about an extra policy and does not delete it', () => {
     const f = fake(answers({ 'environments/prod/deployment-branch-policies': polsJson(['main', 'branch'], ['v*', 'tag'], ['dev', 'branch']) }));
     main([...GH, '--apply'], f.t);
-    expect(f.text()).toContain('WARNING: extra policy dev/branch');
+    expect(f.text()).toContain('prod has an extra policy dev/branch');
     expect(f.calls.some((c) => c.args.includes('DELETE'))).toBe(false);
   });
   test('github refuses a reviewer that is not a user, before any write', () => {
@@ -288,7 +323,9 @@ describe('vars', () => {
     go();
     const sets = f.lines.filter((l) => l.startsWith('gh variable set'));
     expect(sets).toHaveLength(3);
-    expect(sets[0]).toBe(`gh variable set KBF_SITE_BUCKET --env prod --repo ${REPO} --body 'kbf-prod-site-${ACCOUNT}'`);
+    expect(sets[0]).toBe(`gh variable set KBF_SITE_BUCKET --env prod-site --repo ${REPO} --body 'kbf-prod-site-${ACCOUNT}'`);
+    expect(sets.every((l) => l.includes('--env prod-site '))).toBe(true); // the job that assumes the role is in prod-site
+    expect(f.text()).toContain('environment:prod-site:job_workflow_ref:');
   });
   test.each([
     ['environment missing', { 'environments/prod': new Error('404') }],
@@ -298,6 +335,13 @@ describe('vars', () => {
     ['only the v* tag policy', { 'environments/prod/deployment-branch-policies': polsJson(['v*', 'tag']) }],
     ['v* as a branch policy, not a tag policy', { 'environments/prod/deployment-branch-policies': polsJson(['main', 'branch'], ['v*', 'branch']) }],
     ['a wildcard branch policy', { 'environments/prod/deployment-branch-policies': polsJson(['*', 'branch'], ['v*', 'tag']) }],
+    ['prod-site environment missing', { 'environments/prod-site': new Error('404') }],
+    ['prod-site with no v* tag policy', { 'environments/prod-site/deployment-branch-policies': polsJson() }],
+    ['prod-site with only a branch main policy', { 'environments/prod-site/deployment-branch-policies': polsJson(['main', 'branch']) }],
+    ['prod-site admitting v* as a branch', { 'environments/prod-site/deployment-branch-policies': polsJson(['v*', 'branch']) }],
+    ['prod-site admitting main too', { 'environments/prod-site/deployment-branch-policies': polsJson(['v*', 'tag'], ['main', 'branch']) }],
+    ['a required reviewer on prod-site (a second click)', { 'environments/prod-site': envJson({}, {}) }],
+    ['admin bypass on prod-site', { 'environments/prod-site': envJson({ can_admins_bypass: true }, null) }],
     ['no required reviewer', { 'environments/prod': envJson({}, null) }],
     ['an empty reviewer list', { 'environments/prod': envJson({}, { reviewers: [] }) }],
     ['self-review prevented', { 'environments/prod': envJson({}, { prevent_self_review: true }) }],
@@ -320,8 +364,15 @@ describe('vars', () => {
     const rev = fake(answers({ 'environments/prod/deployment-branch-policies': polsJson(['v*', 'tag'], ['main', 'branch']) }));
     expect(checkGithub(rev.t, REPO)).toEqual([]);
   });
-  test('the policy set is exactly main (branch) and v* (tag)', () => {
+  test('the policy set of prod is exactly main (branch) and v* (tag); prod-site is v* (tag) only with no reviewer', () => {
     expect(POLICIES).toEqual([['main', 'branch'], ['v*', 'tag']]);
+    expect(ENVIRONMENTS).toEqual([
+      { name: 'prod', reviewer: true, policies: [['main', 'branch'], ['v*', 'tag']] },
+      { name: 'prod-site', reviewer: false, policies: [['v*', 'tag']] },
+    ]);
+  });
+  test('exactly one environment has a reviewer, so a release asks for one approval', () => {
+    expect(ENVIRONMENTS.filter((e) => e.reviewer).map((e) => e.name)).toEqual(['prod']);
   });
 });
 
