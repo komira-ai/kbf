@@ -151,6 +151,7 @@ pub const ALLOWED: &[&str] = &[
     "reapi_max_streams",
     "worker_max_streams",
     "unservable_wait_secs",
+    "default_platform",
     "memory_ladder_gib",
     "finished_retention_secs",
     "shutdown_timeout_secs",
@@ -1006,7 +1007,10 @@ impl<'a> Prepared<'a> {
 
         let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
         let recording = crate::history::install(recording, history.as_ref());
-        let default_memory = listeners.memory_ladder.first();
+        let defaults = kbf_front::Defaults {
+            memory: listeners.memory_ladder.first(),
+            platform: listeners.default_platform,
+        };
         let durable = state.is_some();
         let farm = Farm::new(
             backend.clone(),
@@ -1168,7 +1172,7 @@ impl<'a> Prepared<'a> {
                 streams,
                 authorizers,
                 &recorder,
-                default_memory,
+                defaults,
                 Relaying {
                     farm: Arc::clone(&farm) as Arc<dyn Handed>,
                     successor: successor.clone(),
@@ -1182,7 +1186,7 @@ impl<'a> Prepared<'a> {
                 streams,
                 authorizers,
                 &recorder,
-                default_memory,
+                defaults,
             ),
         };
         let reapi_routes = Routes::from(

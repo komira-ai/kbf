@@ -77,6 +77,8 @@ pub struct Listeners {
     /// platform, or none that does is large enough) before it is refused
     /// FAILED_PRECONDITION.
     pub unservable_wait: Duration,
+    /// The OS and architecture of an action that names neither (`--default-platform`).
+    pub default_platform: kbf_front::DefaultPlatform,
     /// The memory rungs of an action: the first is what an action that names no size
     /// books, the others are what it climbs through when it passes its own memory
     /// limit, before a whole host (`--memory-ladder-gib`).
@@ -692,7 +694,10 @@ where
         history.with_blobs(blobs, budget.clone())
     });
     let recording = crate::history::install(recording, history.as_ref());
-    let default_memory = listeners.memory_ladder.first();
+    let defaults = kbf_front::Defaults {
+        memory: listeners.memory_ladder.first(),
+        platform: listeners.default_platform,
+    };
     let farm = Farm::new(
         Arc::clone(&cache),
         listeners.unservable_wait,
@@ -855,7 +860,7 @@ where
             kbf_front::OpenStreams { closing, progress },
             authorizers,
             &recorder,
-            default_memory,
+            defaults,
         ),
         None => kbf_front::routes_recorded(
             cache,
@@ -864,7 +869,7 @@ where
             progress,
             authorizers,
             &recorder,
-            default_memory,
+            defaults,
         ),
     };
     let authenticate = AuthenticateLayer::new(policy.authenticator);
