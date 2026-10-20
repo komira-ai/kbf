@@ -293,6 +293,11 @@ fn once_the_slot_is_filled_every_call_is_the_swap_supervisors() {
 
 /// The root half's `status.json` showing release `B` kept with `state_schema` 3.
 fn kept_b(cfg: &HandoverConfig) {
+    kept_b_with_schema(cfg, 3);
+}
+
+/// As [`kept_b`], with the kept release's `state_schema` as given.
+fn kept_b_with_schema(cfg: &HandoverConfig, state_schema: u32) {
     let running = State {
         current: Some(c(A)),
         staged: Some(c(B)),
@@ -300,7 +305,7 @@ fn kept_b(cfg: &HandoverConfig) {
     };
     let memory = Memory {
         staged: Some(KeptFacts {
-            state_schema: 3,
+            state_schema,
             ..kept(B)
         }),
         ..Memory::default()
@@ -396,6 +401,31 @@ fn an_installer_toml_that_cannot_be_read_ends_the_update_at_migrate() {
         failure.reason
     );
     assert_eq!(rig.count("spawn"), 0);
+    assert!(rig.alive(Slot::A));
+}
+
+/// Catches a production migrator that does nothing: with no apply hook (the real
+/// `Database::migrate_within`) and a database that cannot be reached, a kept release ends the
+/// update `failed` at step `migrate` as `database_error`, no candidate is started, and the old
+/// child is untouched. A migrator that answered `Ok` here would go on to spawn slot B.
+#[test]
+fn the_real_migration_against_an_unreachable_database_ends_the_update_at_migrate() {
+    let (cfg, spool, root) = config("migrate-real-unreachable");
+    // Schema 1 is within what this installer embeds, so the migration reaches the database.
+    kept_b_with_schema(&cfg, 1);
+    let mut handover = Handover::new(&cfg, spool);
+    let rig = Rig::new(None);
+    let deaths = Arc::new(Mutex::new(Vec::new()));
+    cfg.gate.fill(host_over(&rig, root, &deaths));
+    handover.start(&spec("u1")).expect("accepted");
+    let failure = failed_update(&handover);
+    assert_eq!(failure.step, Step::Migrate);
+    assert!(
+        failure.reason.starts_with("database_error:"),
+        "{}",
+        failure.reason
+    );
+    assert_eq!(rig.count("spawn"), 0, "no candidate was started");
     assert!(rig.alive(Slot::A));
 }
 
