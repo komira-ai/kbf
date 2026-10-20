@@ -564,11 +564,21 @@ Crash and conflict points in the flusher:
   digest, crc32c from the bytes, for both kinds of block), so the key holds the same
   bytes. On `AlreadyExists` (`conditional_put`) the flusher reads the footer back; if it
   matches, it commits `ObjectFlushed`.
-- If it does not match, the flusher commits `Command::FlushConflict { object }`: the
-  object **stays staged**, its blobs stay `Present` and are read from the local block,
-  the flusher stops retrying it, and an alert fires. It is not marked `Corrupt`, because
-  `ObjectUnreachable { Corrupt }` makes `s.blob()` answer `Unavailable` and would stop
-  reads of good local bytes. An operator resolves it; the block is never evicted.
+- If it does not match, the key is another object's: the member and boot of a node
+  writer are numbers its frontend's state store hands out, and a frontend moved to a
+  fresh state store hands out a pair an earlier store gave to another node, so
+  `cas/<member>/<boot>/<seq>` can name an object of another lifetime. The conditional
+  PUT never overwrites it. The flusher moves the numbering of this writer past the range
+  the other lifetime used (the microseconds since the Unix epoch, if that is past the
+  next number), copies the object's records into a block of their own, marks the object
+  `ObjectUnreachable { Missing }` just before that block's `PutStaged` commits (the blobs
+  are `Unavailable` for exactly that commit, so the `PutStaged` heals them into the new
+  object), and frees the old block. The new object flushes under a key of its own and
+  the other object is not touched. It is not marked `Corrupt`; it is not the bytes that
+  are wrong. A failure before the mark is retried with the flush backoff; a failure of
+  the last commit leaves the blobs unavailable until uploaded again, as for a corrupt
+  record. An object a build before this one left in `Conflict` (it stayed staged and was
+  not retried) is moved the same way by the first round that finds it.
 - A record whose SHA-256 fails in the flusher's re-read means the local disk damaged
   it. The block is not uploaded; it is marked `ObjectUnreachable { Corrupt }` (reads
   stop, as they should), and its blobs heal by re-upload.
@@ -932,7 +942,7 @@ directory entries** at a simulated crash:
 | a segment-upload block flushed, crash before `ObjectFlushed`, reflushed: footers equal, no `FlushConflict` | a false conflict from a footer built two ways |
 | a restart with an open upload, and a crash between sync and `PutStaged` on an upload block: no `.blk` left, no budget consumed | orphan files filling the disk |
 | `Begin`s whose totals pass the hot store's budget: the excess goes direct; tier disk use stays under the budget | open uploads uncounted |
-| a same-key object whose footer differs: `FlushConflict`, blobs still `Present` and read locally | a conflict stopping reads of good bytes |
+| a same-key object whose footer differs: the records staged again under a number past the other lifetime's, flushed next round, the other object untouched | a conflict stranding a segment on the tier for ever, or walking the earlier lifetime's numbers one conflict at a time |
 | `ObjectFlushed` commit refused: the block is not evicted | evicting the only copy on a local flag |
 | a tiny budget never evicts a staged block; at the budget writes fall back to direct PUTs | eviction of the only copy; writes refused at the budget |
 | a wrong or missing `TIER` refuses start; with `--hot-store-abandon` objects become `Missing`, re-upload heals, no `NOT_FOUND` | a mount mistake destroying the index |

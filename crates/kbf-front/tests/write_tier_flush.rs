@@ -16,8 +16,10 @@ use bytes::Bytes;
 use common::faulty::PutFault;
 use common::pseudo_random;
 use kbf_front::{CacheError, FLUSH_BACKOFF_FIRST, FlushRound};
-use kbf_meta::{Applied, Command, ObjectId, ServerId, StagedPut, StagedState, TierId};
-use kbf_objstore::{Capabilities, ObjectStore};
+use kbf_meta::{
+    Applied, Command, ObjectId, ServerId, StagedPut, StagedState, TierId, UnreachableReason,
+};
+use kbf_objstore::{ByteRange, Capabilities, ObjectStore};
 use kbf_segments::IndexEntry;
 use kbf_segments::layout::encode_footer;
 use support::{CONDITIONAL, Farm, SEGMENT, TestBlob, blobs, key, later, start, verified};
@@ -61,8 +63,11 @@ fn foreign_segment(len: u64) -> Bytes {
 /// as this object's flush because some footer parsed there. `ObjectFlushed` would
 /// commit, the block become an evictable copy, and once it is evicted every read would
 /// go to the store, which holds the other object's bytes: acknowledged blobs lost.
+/// Also catches a conflict that leaves the object staged: its space is freed only by a
+/// flush, so it would never be, and the blobs would be read from a block that cannot
+/// be evicted.
 #[tokio::test]
-async fn a_key_holding_another_well_formed_segment_of_equal_length_is_a_conflict() {
+async fn a_key_holding_another_well_formed_segment_of_equal_length_is_staged_again() {
     let farm = Farm::new(CONDITIONAL);
     let cache = farm.start(GIB).await;
     let blobs = blobs(1, 2, 4096);
@@ -70,15 +75,44 @@ async fn a_key_holding_another_well_formed_segment_of_equal_length_is_a_conflict
     let object = farm.log.object_of(&blobs[0].digest);
     let key = key(&cache, object);
     let other = foreign_segment(committed_len(&farm, object));
-    farm.store.put_new(&key, other, None).await.expect("put");
+    farm.store
+        .put_new(&key, other.clone(), None)
+        .await
+        .expect("put");
     let round = cache.flush_tier(later()).await.expect("round");
     assert_eq!((round.conflicts, round.flushed), (vec![object], vec![]));
-    assert_eq!(farm.log.staged_state(object), Some(StagedState::Conflict));
-    assert_eq!(farm.log.applied("object_flushed"), 0);
-    assert!(farm.has_block(object) && !farm.has_copy(object));
+    assert_eq!(farm.log.applied("flush_conflict"), 0);
+    assert_eq!(farm.log.staged_state(object), None);
+    assert_eq!(
+        farm.log.unreachable(object),
+        Some(UnreachableReason::Missing)
+    );
+    assert!(!farm.has_block(object), "the block is freed");
+    let moved = farm.log.object_of(&blobs[0].digest);
+    assert_ne!(moved, object);
+    assert_eq!(farm.log.object_of(&blobs[1].digest), moved);
+    assert_eq!(farm.log.staged_state(moved), Some(StagedState::Sealed));
     for b in &blobs {
         assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
     }
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!((round.conflicts, round.flushed), (vec![], vec![moved]));
+    assert_eq!(farm.log.staged_state(moved), None);
+    assert!(farm.has_copy(moved) && !farm.has_block(moved));
+    for b in &blobs {
+        assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
+    }
+    assert_eq!(
+        stored(&farm, &key, other.len()).await,
+        other,
+        "the other object is untouched"
+    );
+}
+
+/// The first `len` bytes the store holds under `key`.
+async fn stored(farm: &Farm, key: &kbf_objstore::ObjectKey, len: usize) -> Bytes {
+    let range = ByteRange::new(0, len as u64).expect("range");
+    farm.store.get_range(key, range).await.expect("get")
 }
 
 /// Catches: our own PUT read back with another (well-formed) footer taken as a flush:
@@ -109,9 +143,11 @@ async fn an_own_put_read_back_with_another_footer_is_not_flushed() {
 
 /// Catches: a restart that does not count a conflict object as staged and sweeps its
 /// block as an orphan. That block is the object's only good copy (the key holds
-/// another object), so its blobs would be lost.
+/// another object), so its blobs would be lost. And a conflict that an earlier build
+/// committed (`FlushConflict`, which no build commits now) that stays staged for ever:
+/// the first round after the restart stages its records again and frees its block.
 #[tokio::test]
-async fn a_conflict_objects_block_survives_a_restart_and_is_read_locally() {
+async fn a_conflict_an_earlier_build_left_is_staged_again_after_a_restart() {
     let farm = Farm::new(CONDITIONAL);
     let cache = farm.start(GIB).await;
     let blobs = blobs(1, 2, 4096);
@@ -120,8 +156,13 @@ async fn a_conflict_objects_block_survives_a_restart_and_is_read_locally() {
     let key = key(&cache, object);
     let other = Bytes::from_static(b"some other object under this key");
     farm.store.put_new(&key, other, None).await.expect("put");
-    let round = cache.flush_tier(later()).await.expect("round");
-    assert_eq!(round.conflicts, [object]);
+    let t = later();
+    for command in [
+        Command::SealStaged { object },
+        Command::FlushConflict { object },
+    ] {
+        assert!(matches!(farm.log.commit(command), Applied::Tier(Ok(()))));
+    }
     drop(cache);
 
     let fs = farm.fs.restart();
@@ -135,9 +176,19 @@ async fn a_conflict_objects_block_survives_a_restart_and_is_read_locally() {
     for b in &blobs {
         assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
     }
-    assert_eq!(farm.log.unreachable(object), None);
+    let round = cache.flush_tier(t).await.expect("round");
+    assert_eq!(round.conflicts, [object]);
+    assert_eq!(farm.log.staged_state(object), None);
+    assert!(fs.contents(&kbf_tier::block_name(object)).is_none());
+    let moved = farm.log.object_of(&blobs[0].digest);
+    assert_ne!(moved, object);
     let round = cache.flush_tier(later()).await.expect("round");
-    assert_eq!(round, FlushRound::default(), "a conflict is not retried");
+    assert_eq!(round.flushed, [moved]);
+    for b in &blobs {
+        assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
+    }
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round, FlushRound::default());
 }
 
 /// Catches: a round that takes its [`kbf_front::FLUSHES_PER_ROUND`] oldest sealed

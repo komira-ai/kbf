@@ -11,8 +11,14 @@
 //!   moved to another object.
 //! - **`AlreadyExists`** (a store with conditional writes, after an earlier attempt
 //!   whose answer was lost): the footer is read back; if it is ours the flush is done,
-//!   else `FlushConflict` commits, the object stays staged and is read locally, and the
-//!   flusher stops retrying it.
+//!   else the key is another object's (a frontend moved to a fresh state store hands out
+//!   a member and boot that an earlier store gave to another node, so the keys are
+//!   named again). The numbering moves past the range the other lifetime used
+//!   ([`Cache::leave_numbering`]), and the object's records are staged again as an
+//!   object of their own, which flushes under a key of its own; the object is marked
+//!   unreachable so the records heal into it, and its block is freed. The other
+//!   object is never touched. An object a build before this one left in `Conflict` is
+//!   taken the same way at the start of a round.
 //! - **Every record is hashed** as its pieces are read, on the cache's hashing pool
 //!   (off the runtime workers): the daemon's digests were trusted when the upload was
 //!   acknowledged, so this is where they are checked. The footer is written only once
@@ -39,8 +45,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use kbf_meta::{Applied, Command, ObjectId, StagedObject, StagedState, UnreachableReason};
 use kbf_objstore::{BodyStream, ObjectStore, ObjectStoreError};
+use kbf_segments::Footer;
 use kbf_segments::layout::{encode_footer, footer_len};
-use kbf_segments::{Footer, IndexEntry};
 use kbf_tier::WriteTier;
 use kbf_types::Digest;
 
@@ -182,7 +188,9 @@ pub struct FlushRound {
     pub sealed: Vec<ObjectId>,
     /// Objects flushed: in the store, `ObjectFlushed` committed.
     pub flushed: Vec<ObjectId>,
-    /// Objects whose key holds another object: `FlushConflict` committed.
+    /// Objects whose key holds another object: their records were staged again under a
+    /// new key (an object an earlier build left in conflict counts when it is staged
+    /// again).
     pub conflicts: Vec<ObjectId>,
     /// Objects with a record that failed its digest: marked unreachable as corrupt, the
     /// records that were sound staged again as an object of their own.
@@ -326,7 +334,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let due = self
             .writer
             .query(move |s| {
-                let ours = |o: &StagedObject| (o.tier(), o.state()) == (tier, StagedState::Sealed);
+                // A conflict is taken too: a build before this one left them staged.
+                let ours = |o: &StagedObject| {
+                    o.tier() == tier
+                        && matches!(o.state(), StagedState::Sealed | StagedState::Conflict)
+                };
                 let sealed = s.staged_objects().filter(|(_, o)| ours(o));
                 let sealed = sealed.filter(|(object, _)| !waiting.contains(object));
                 // One flusher: an object none of whose digests this node flushes waits.
@@ -343,18 +355,25 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 let due = order.into_iter().filter_map(|(object, first)| {
                     let o = s.staged(object)?;
                     let blobs: Vec<(Digest, u64)> = o.blobs().map(|(d, at)| (*d, at)).collect();
-                    Some((object, o.committed_len(), blobs, first))
+                    Some((object, o.committed_len(), blobs, first, o.state()))
                 });
                 due.collect::<Vec<_>>()
             })
             .await?;
         let mut done = BTreeSet::new();
-        for (object, len, blobs, first) in due {
+        for (object, len, blobs, first, state) in due {
             if !first.is_subset(&done) {
                 // An object it waits for failed this round: it waits for the next.
                 continue;
             }
-            match self.flush_one(staging, object, len, &blobs).await {
+            let flushed = if state == StagedState::Conflict {
+                self.reseat(staging, object, &blobs)
+                    .await
+                    .map(|()| Flushed::Conflict)
+            } else {
+                self.flush_one(staging, object, len, &blobs).await
+            };
+            match flushed {
                 Ok(Flushed::Done) => {
                     staging.done(object);
                     done.insert(object);
@@ -444,10 +463,36 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 "object {key} read back with another footer after its PUT"
             )));
         }
-        tracing::error!(%object, %key, "the store holds another object under a staged object's key; it stays staged, read locally, until an operator acts");
-        self.commit_tier(Command::FlushConflict { object }).await?;
+        tracing::warn!(%object, %key, "the store holds another object under a staged object's key; staging its records again under a new key");
         staging.counters.conflicts.add(1);
+        self.reseat(staging, object, blobs).await?;
         Ok(Flushed::Conflict)
+    }
+
+    /// Moves a staged `object` whose key is another object's (`blobs`, its records and
+    /// their offsets in its block) to an object of its own: the numbering leaves the
+    /// range that the other lifetime of this member and boot used, the records are
+    /// staged again ([`Cache::restage`]), the object is marked unreachable just before
+    /// they commit so they heal into the new object, and its block is freed.
+    ///
+    /// Every step before the mark can fail and be tried again (the object is still
+    /// staged). A failure of the last commit comes back as an error but is not tried
+    /// again: the object has left the queue, and those blobs are unavailable until
+    /// uploaded again, as for a corrupt object ([`Cache::drop_mismatched`]).
+    ///
+    /// # Errors
+    /// The copy, the mark or the store failed before the mark committed.
+    async fn reseat(
+        &self,
+        staging: &Staging,
+        object: ObjectId,
+        blobs: &[(Digest, u64)],
+    ) -> Result<(), CacheError> {
+        self.writer.leave_numbering();
+        self.restage(staging, object, blobs, Some(UnreachableReason::Missing))
+            .await?;
+        let _ = staging.tier.discard(object);
+        Ok(())
     }
 
     /// Handles a staged object with records that fail their digests: counts and logs
@@ -470,7 +515,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         staging.counters.corrupt.add(1);
         self.mark_unreachable(object, UnreachableReason::Corrupt)
             .await?;
-        if let Err(e) = self.restage(staging, object, &found.good).await {
+        let good: Vec<(Digest, u64)> = found.good.iter().map(|e| (e.digest, e.offset)).collect();
+        if let Err(e) = self.restage(staging, object, &good, None).await {
             tracing::error!(%object, error = %e, sound = found.good.len(), "the sound records of a corrupt staged object could not be stored again; they are unavailable until uploaded again");
         }
         let _ = staging.tier.discard(object);
@@ -487,7 +533,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         staging: &Staging,
         object: ObjectId,
-        good: &[IndexEntry],
+        good: &[(Digest, u64)],
+        mark: Option<UnreachableReason>,
     ) -> Result<(), CacheError> {
         if good.is_empty() {
             return Ok(());
@@ -495,10 +542,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let mut spans = Vec::with_capacity(good.len());
         let mut listed = Vec::with_capacity(good.len());
         let mut at = 0u64;
-        for entry in good {
-            let size = entry.digest.size_bytes;
-            spans.push((entry.offset, entry.offset + size));
-            listed.push((entry.digest, at));
+        for (digest, offset) in good {
+            let size = digest.size_bytes;
+            spans.push((*offset, offset + size));
+            listed.push((*digest, at));
             at += size;
         }
         if let Some(range) = self.reserve_range(at).await {
@@ -516,6 +563,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 Ok(range)
             };
             let range = blocking(&self.writer.metrics, Box::new(copy)).await?;
+            if let Some(reason) = mark {
+                self.mark_unreachable(object, reason).await?;
+            }
             return self.stage_range(range, listed).await;
         }
         let total = at + footer_len(good.len() as u64);
@@ -530,7 +580,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .read_footer(&key, total)
             .await
             .map_err(read_back)?;
-        let placed = placed(&footer, &key, sound, good.iter().map(|e| e.digest))?;
+        let placed = placed(&footer, &key, sound, good.iter().map(|(d, _)| *d))?;
+        if let Some(reason) = mark {
+            self.mark_unreachable(object, reason).await?;
+        }
         self.writer.commit_segment(placed).await
     }
 

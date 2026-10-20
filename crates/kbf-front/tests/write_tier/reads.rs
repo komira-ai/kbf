@@ -5,7 +5,7 @@
 
 use kbf_front::{CacheError, MAX_DECODED_BLOB_BYTES, READ_WINDOW_BYTES};
 use kbf_meta::{Applied, Command, UnreachableReason};
-use kbf_objstore::Capabilities;
+use kbf_objstore::{Capabilities, ObjectStore as _};
 use kbf_store::Fs as _;
 use kbf_tier::{block_name, seg_name};
 
@@ -204,6 +204,35 @@ async fn sound_records_go_to_the_store_when_the_tier_has_no_room() {
     assert_eq!(read, blobs[0].bytes);
     let bad = cache.read_blob(&blobs[1].digest).await;
     assert!(matches!(bad, Err(CacheError::Unreachable(_))), "{bad:?}");
+}
+
+/// Catches the records of a conflicting object lost, or left staged, when the tier has
+/// no room for a block of their own: they are streamed to the store under a key past
+/// the other object's, indexed there, and read back, and the old block is freed.
+#[tokio::test]
+async fn a_conflicting_object_with_no_room_to_stage_again_goes_to_the_store() {
+    let farm = Farm::new(super::support::CONDITIONAL);
+    let cache = farm.start(10_000).await;
+    let blobs = blobs(1, 2, 4096);
+    cache.store_blobs(verified(&blobs)).await.expect("stored");
+    let object = farm.log.object_of(&blobs[0].digest);
+    let key = cache.object_key(object).expect("key");
+    let other = bytes::Bytes::from_static(b"some other object under this key");
+    farm.store.put_new(&key, other, None).await.expect("put");
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.conflicts, [object], "{round:?}");
+    assert_eq!(farm.log.staged_state(object), None);
+    assert_eq!(
+        farm.log.unreachable(object),
+        Some(UnreachableReason::Missing)
+    );
+    assert!(!farm.has_block(object));
+    let (moved, staged) = farm.log.located(&blobs[0].digest);
+    assert_eq!(staged, None, "in the store, not staged");
+    assert!(moved.object.seq() > object.seq());
+    for b in &blobs {
+        assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
+    }
 }
 
 /// Catches a flush whose block cannot be read taken for a flush, or ending the round:
