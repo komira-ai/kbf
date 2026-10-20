@@ -82,11 +82,16 @@ fn is_branch(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
 }
 
-/// A run's `path` without the `@<ref>` GitHub may append.
-fn file_of(run: &Value) -> Option<&str> {
-    run["path"]
-        .as_str()
-        .map(|p| p.split('@').next().unwrap_or(p))
+/// A run's `path` without the `@refs/heads/<branch>` GitHub appends to a workflow that ran
+/// from a branch. A path with any other `@` (another branch, a tag, a commit) is the file
+/// as some other ref had it, so it names no file at all.
+fn file_of<'a>(run: &'a Value, branch: &str) -> Option<&'a str> {
+    let path = run["path"].as_str()?;
+    match path.split_once('@') {
+        None => Some(path),
+        Some((file, r)) if r.strip_prefix("refs/heads/") == Some(branch) => Some(file),
+        Some(_) => None,
+    }
 }
 
 /// The latest run in `runs` that is the push run of `file` for `sha` on `branch`.
@@ -97,7 +102,7 @@ fn latest<'a>(runs: &'a [Value], file: &str, sha: &str, branch: &str) -> Option<
             r["head_sha"] == sha
                 && r["head_branch"] == branch
                 && r["event"] == "push"
-                && file_of(r) == Some(path.as_str())
+                && file_of(r, branch) == Some(path.as_str())
         })
         .max_by_key(|r| {
             (
@@ -129,20 +134,33 @@ fn standing(runs: &[Value], file: &str, sha: &str, branch: &str) -> Standing {
     }
 }
 
+/// The most runs one request asks for. One commit's push runs of one workflow are a handful
+/// (a push, a few re-runs), so a full page means the list may be cut short, and the latest
+/// run may be on a page not read: `listed` refuses rather than judge a partial list.
+const PAGE: usize = 100;
+
 /// The runs of the workflow `file` for `sha` on `branch`, as GitHub lists them.
 fn listed(gh: &Path, repo: &str, file: &str, sha: &str, branch: &str) -> Result<Vec<Value>, Error> {
     let runs = api(
         gh,
         &format!(
             "repos/{repo}/actions/workflows/{file}/runs?head_sha={sha}&event=push\
-             &branch={branch}&per_page=100"
+             &branch={branch}&per_page={PAGE}"
         ),
     )?;
-    Ok(runs
+    let runs = runs
         .as_ref()
         .and_then(|v| v["workflow_runs"].as_array())
         .cloned()
-        .unwrap_or_default())
+        .unwrap_or_default();
+    if runs.len() >= PAGE {
+        return Err(Error::Refused(vec![format!(
+            "{file}: GitHub listed {} runs for {sha} on {branch}, a full page; the latest may be \
+             on a page this verb does not read",
+            runs.len()
+        )]));
+    }
+    Ok(runs)
 }
 
 /// The `release gates` verb: the lines to print.

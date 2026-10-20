@@ -298,13 +298,25 @@ fn a_workflow_is_matched_by_its_path_never_by_its_name() {
             json!(format!(".github/workflows/{f}.evil@refs/heads/main")),
         )]
     });
+    // The file as another ref had it is not the file at this push.
+    for (name, at) in [
+        ("other-branch", "refs/heads/other".to_owned()),
+        ("a-tag", "refs/tags/v1".to_owned()),
+        ("a-sha", SHA.to_owned()),
+        ("branch-prefix", "refs/heads/main2".to_owned()),
+        ("empty-ref", String::new()),
+    ] {
+        assert_red_for_every_workflow(name, |f| {
+            vec![spoof(f, json!(format!(".github/workflows/{f}@{at}")))]
+        });
+    }
 }
 
 #[test]
 fn the_path_may_carry_the_ref_github_appends() {
     // Catches: a gate that is red forever because GitHub wrote `path@ref`.
-    let fx = fx("path-ref");
-    fx.green_but(
+    let first = fx("path-ref");
+    first.green_but(
         "ci.yml",
         vec![with(
             run("ci.yml", 11),
@@ -312,8 +324,19 @@ fn the_path_may_carry_the_ref_github_appends() {
             json!(".github/workflows/ci.yml@refs/heads/main"),
         )],
     );
-    let (code, _, err) = fx.gates();
+    let (code, _, err) = first.gates();
     assert_eq!(code, Some(0), "{err}");
+    // Only the ref of the push being judged: `main` here, whatever GitHub wrote for `ci`.
+    for file in ["beta.yml", "artifacts.yml"] {
+        let fx = fx(&format!("path-ref-{file}"));
+        let path = format!(".github/workflows/{file}@refs/heads/{BRANCH}");
+        fx.green_but(
+            file,
+            vec![with(run(file, id_of(file)), "path", json!(path))],
+        );
+        let (code, _, err) = fx.gates();
+        assert_eq!(code, Some(0), "{file}: {err}");
+    }
 }
 
 #[test]
@@ -356,6 +379,32 @@ fn of_several_runs_the_latest_decides() {
             vec![
                 numbered("ci.yml", 2, 6, 1, "success"),
                 numbered("ci.yml", 1, 5, 1, "failure"),
+            ],
+            false,
+        ),
+        // The run number decides before the attempt: run 6 attempt 1 is newer than run 5
+        // attempt 3, whatever their order in the list.
+        (
+            "beta.yml",
+            vec![
+                numbered("beta.yml", 1, 5, 3, "success"),
+                numbered("beta.yml", 2, 6, 1, "failure"),
+            ],
+            true,
+        ),
+        (
+            "beta.yml",
+            vec![
+                numbered("beta.yml", 2, 6, 1, "failure"),
+                numbered("beta.yml", 1, 5, 3, "success"),
+            ],
+            true,
+        ),
+        (
+            "ci.yml",
+            vec![
+                numbered("ci.yml", 1, 5, 3, "failure"),
+                numbered("ci.yml", 2, 6, 1, "success"),
             ],
             false,
         ),
@@ -607,5 +656,28 @@ fn a_branch_with_a_slash_is_asked_for_as_it_is() {
         fx.put(vec![(path(f), json!({ "workflow_runs": [r] }))]);
     }
     let (code, _, err) = fx.gates_with(&[("--branch", "release/x.y_z-1")]);
+    assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
+fn a_full_page_of_runs_is_refused_not_judged_as_the_whole_list() {
+    // Catches: the latest run on a page this verb does not read, with a green one on the
+    // page it did: a full page is red, one run fewer is judged.
+    let page = |n: usize| -> Vec<Value> {
+        (0..n)
+            .map(|i| with(run("ci.yml", 1000 + i as u64), "run_number", json!(i + 1)))
+            .collect()
+    };
+    let fx1 = fx("page-full");
+    fx1.green_but("ci.yml", page(100));
+    let (code, out, err) = fx1.gates();
+    assert_eq!(code, Some(1), "{out}{err}");
+    assert!(
+        err.contains("ci.yml:") && err.contains("full page"),
+        "{err}"
+    );
+    let fx2 = fx("page-short");
+    fx2.green_but("ci.yml", page(99));
+    let (code, _, err) = fx2.gates();
     assert_eq!(code, Some(0), "{err}");
 }

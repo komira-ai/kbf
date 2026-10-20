@@ -91,7 +91,8 @@ fn render(doc: &ResultDoc, tag: &str, since: Option<&str>, commits: &[String]) -
         "Nothing in this release is flagged as not reversible.",
     );
     out.push_str(&format!(
-        "\n## Gamma escapes\n\n{} scenario(s) only gamma found.\n",
+        "\n## {:?} escapes\n\n{} scenario(s) only gamma found.\n",
+        doc.stage,
         doc.escapes.len()
     ));
     for e in &doc.escapes {

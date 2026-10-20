@@ -734,6 +734,7 @@ fn the_gamma_notes_carry_the_bake_the_load_and_the_waiver() {
     );
     assert!(notes.contains("actions 1500 (needs 1000)"), "{notes}");
     assert!(notes.contains("builds 12 (needs 10)"), "{notes}");
+    assert!(notes.contains("## Gamma escapes\n\n0 scenario"), "{notes}");
     assert!(
         notes.contains("- waived min-load by op: holiday week\n"),
         "{notes}"
@@ -763,7 +764,10 @@ fn the_beta_notes_carry_the_gates_the_escapes_and_the_withdrawn() {
         notes.contains("- waived min-load by op: holiday week\n"),
         "{notes}"
     );
-    assert!(notes.contains("2 scenario(s) only gamma found."), "{notes}");
+    assert!(
+        notes.contains("## Beta escapes\n\n2 scenario(s) only gamma found.\n"),
+        "{notes}"
+    );
     assert!(notes.contains("## Withdrawn\n\n- v0.9.0\n"), "{notes}");
 }
 

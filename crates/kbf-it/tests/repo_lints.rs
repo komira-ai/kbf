@@ -40,6 +40,8 @@
 //!   another set (module `release_artifacts`);
 //! - the beta smoke workflow's Buck2 pin and its actions' commits drifting from
 //!   the copies they are of `ci.yml`'s (module `beta_pins`);
+//! - `beta.yml` gaining a `continue-on-error`, a job-level `if:` or a step condition beyond the
+//!   two it has, which would let a green run mean less than a PASSED beta (module `beta_succeeds`);
 //! - the test job's coverage gate step skipped by a condition, or its no-lowering check on
 //!   pull requests dropped or made conditional on something else, which lets floors fall
 //!   (module `coverage_wiring`);
@@ -56,6 +58,7 @@ mod attested_assets;
 mod attested_bundles;
 mod bake_operator_side;
 mod beta_pins;
+mod beta_succeeds;
 mod coverage_wiring;
 mod interpreters;
 mod kbf_spawns;
