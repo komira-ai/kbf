@@ -12,6 +12,13 @@
 //! name the certificate carries and against the CA file, with the bearer token sent only on
 //! a connection that did that.
 //!
+//! It is refused through `sudo` (`app::update_verb`): it takes the API address, its CA and the
+//! token file from its caller, which `deploy` refuses of a sudo caller for the same reason.
+//!
+//! Until the proxy has a source for the schema the host runs, the API refuses every `POST`
+//! before anything is fetched (`start_blocked`, exit 1 or 3 here), so no frontend can be
+//! deployed through this verb yet.
+//!
 //! Exit codes are `deploy`'s: 0 for `done` (and for a frontend that already runs the
 //! commit, which the summary says), 1 for `failed`, `rolled_back`, a timeout or an API that
 //! does not answer, 2 for a usage error, 3 when the release is incompatible or incomplete,

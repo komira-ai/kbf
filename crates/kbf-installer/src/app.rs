@@ -283,12 +283,39 @@ fn finish_setup(
     e.exit()
 }
 
+/// Whether the caller came through `sudo` from another account: sudo sets `SUDO_UID` to the
+/// caller's uid and a caller cannot unset it for the command (the test `deploy` makes).
+fn sudo_caller() -> bool {
+    std::env::var_os("SUDO_UID").is_some_and(|u| u != "0")
+}
+
+/// `update`, refused through `sudo`. The verb takes `--api`, `--api-ca`, `--api-server-name`
+/// and `--token-file` from its caller, and `--api` is required, so through sudo root would
+/// read a file the caller chose and send it to an address the caller chose (a local TLS
+/// server with the caller's own CA reads the token from the bearer header). It needs no root:
+/// run it as the account that may read the token file.
+fn update_verb(
+    args: &crate::cli::UpdateArgs,
+    via_sudo: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Exit {
+    if via_sudo {
+        let _ = writeln!(
+            err,
+            "kbf-installer: update: not accepted through sudo; it needs no root, run it as the account that reads the token file"
+        );
+        return Exit::Usage;
+    }
+    crate::deploy::update::run(args, out, err)
+}
+
 /// Carry out `cli` as the user `euid`. A verb that fails or is not built says so: as text on
 /// `err`, or with `--json` as one object on `out`. A verb that succeeds prints nothing here.
 pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
     // `update` prints its own summary line and needs no root: it is a client of the update API.
     if let Verb::Update(args) = &cli.verb {
-        return crate::deploy::update::run(args, out, err);
+        return update_verb(args, sudo_caller(), out, err);
     }
     let name = cli.verb.name();
     let mut say = |code: Exit, text: String, json: serde_json::Value| {

@@ -707,3 +707,35 @@ fn update_runs_without_root_and_reports_its_own_usage_errors() {
     assert!(!parse(&args).verb.needs_root());
     assert_eq!(parse(&args).verb.name(), "update");
 }
+
+/// Catches `update` taking a caller-chosen API address and token file as root: through sudo
+/// (`SUDO_UID` of another account) it is refused as a usage error before the token file is
+/// read or any address is dialed, and says why. Fails without the refusal: the run would go to
+/// the address and report the unreadable token file instead.
+#[test]
+fn update_is_refused_through_sudo_before_it_reads_anything() {
+    let Verb::Update(args) = parse(&[
+        "update",
+        "--commit",
+        B,
+        "--frontend",
+        "--api",
+        "127.0.0.1:1",
+        "--token-file",
+        "/nonexistent/token",
+    ])
+    .verb
+    else {
+        panic!("an update");
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(update_verb(&args, true, &mut out, &mut err), Exit::Usage);
+    let err = String::from_utf8(err).expect("text");
+    assert!(out.is_empty());
+    assert!(err.contains("not accepted through sudo"), "{err}");
+    assert!(!err.contains("/nonexistent"), "{err}");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    update_verb(&args, false, &mut out, &mut err);
+    let err = String::from_utf8(err).expect("text");
+    assert!(!err.contains("through sudo"), "{err}");
+}
