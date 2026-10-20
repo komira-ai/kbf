@@ -65,6 +65,21 @@ user or directory is created by a script.
   the users. `purge` (deb) does the same and drops the package's record: the package owns
   none of what `setup` and the operator write, so it deletes none of it.
 
+## In CI: the real package, attested
+
+`ci.yml`'s `packages` job builds the deb and the rpm from the test-only stub and the
+fixtures under `testdata/` on every pull request (x86_64). `artifacts.yml` builds the real
+one: each Linux job (`linux-x86_64` on `ubuntu-24.04`, `linux-arm64` on
+`ubuntu-24.04-arm`, each with its own pinned nfpm and `gh`) runs the same verbs on the
+`kbf-installer` it has just built, with a trust directory `cargo xtask pkg-trust` writes (the
+pinned `gh`, the Sigstore trusted root `gh` fetched, and an `installer.conf` whose
+`SOURCE_REFS` is the branch the package is attested on), installs it in a fresh Ubuntu
+container (`cargo xtask pkg-install-test`, with `--probe`s that the packaged `gh` runs and
+the binary names the commit), and `cargo xtask pkg-asset` makes
+`kbf-installer-<commit>-<platform>.deb` an asset, listed in `SHA256SUMS` and attested with
+a bundle ([docs/artifacts.md](../../docs/artifacts.md#the-kbf-installer-package-deb)).
+Two call sites, one way to build: both go through `pkg-config` and `pkg-build`.
+
 ## What the units run
 
 - `kbf-installer.service` runs `/usr/bin/kbf-installer run`. It names no unit: `run` restarts
