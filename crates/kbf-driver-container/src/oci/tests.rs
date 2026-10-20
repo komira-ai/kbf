@@ -246,7 +246,8 @@ fn the_start_removes_the_unpacks_a_killed_daemon_left() {
 /// into `/usr`.
 #[test]
 fn the_helper_root_is_made_once_and_again_without_error() {
-    let dir = scratch("rootfs").join("root");
+    let base = scratch("rootfs");
+    let dir = base.join("root");
     helper::prepare_rootfs(&dir).expect("made");
     helper::prepare_rootfs(&dir).expect("made again");
     for (name, target) in [
