@@ -18,6 +18,7 @@ use kbf_state::sqlite::{
     Options, SqliteError, SqliteStore, StoreLock, Summary, backup, check_backup, restore_locked,
 };
 use kbf_state::{Clock, Cond, Revision, Store, SystemClock, Txn};
+use kbf_testkit::dir::TestDir;
 use rusqlite::Connection;
 
 fn put(store: &SqliteStore, key: &str, value: &str) -> Revision {
@@ -283,7 +284,7 @@ fn the_tool_lock_is_the_stores_lock() {
 
 /// A directory with the state file's directory `real/`, a link `alias` to it, and a link
 /// `link.db` to `real/state.db`.
-fn linked(name: &str) -> PathBuf {
+fn linked(name: &str) -> TestDir {
     let dir = scratch(name);
     fs::create_dir(dir.join("real")).expect("a directory");
     std::os::unix::fs::symlink("real", dir.join("alias")).expect("a linked directory");
@@ -484,7 +485,11 @@ fn a_state_file_with_a_second_name_is_refused() {
     }
     assert!(!dir.join("hl.db.lock").exists(), "refused before the lock");
     // A directory has several links of its own; it is not a second name of a state file.
-    let refused = SqliteStore::open(&dir, Arc::clone(&clock), Options::default())
+    // It is one inside the test's directory: an open makes `<name>.lock` beside its
+    // argument, which for `dir` itself would be a file outside the directory removed on drop.
+    let subdir = dir.join("a-directory");
+    fs::create_dir(&subdir).expect("a directory");
+    let refused = SqliteStore::open(&subdir, Arc::clone(&clock), Options::default())
         .expect_err("a directory is no state file");
     assert!(
         !matches!(refused, SqliteError::HardLinked { .. }),
