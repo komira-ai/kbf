@@ -542,7 +542,7 @@ fn check_value(kind: Want, value: &str) -> Result<(), &'static str> {
 }
 
 /// A path of plain characters. Text that looks like what a file holds is called that.
-fn check_path(value: &str) -> Result<(), &'static str> {
+pub(super) fn check_path(value: &str) -> Result<(), &'static str> {
     if value.contains("-----") || value.contains('\n') || value.len() > 4096 {
         return Err("must be the path of a file, not its contents: secrets stay in files");
     }

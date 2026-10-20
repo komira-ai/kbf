@@ -89,6 +89,31 @@ includes a hand-set `api-listen` on a run without `--api-listen` (no flag means 
 `127.0.0.1:8982`); the message names `--api-listen` as the way forward, which is to pass the
 address that is in the file.
 
+### The deploy config of a frontend and an all-in-one host
+
+`--deploy-stage gamma|prod` makes `setup` write `/etc/kbf-installer/deploy.json` (root's, mode
+0644, written atomically), so `kbf-installer deploy` needs no flag naming the API, the token or
+the stage. Without `--deploy-stage` nothing is written, and every other `--deploy-*` flag needs
+it; a node mode takes none of them.
+
+| flag | key | default |
+|---|---|---|
+| `--deploy-stage` | `stage` | required to write the file |
+| `--deploy-api` | `api` | the proxy's public port: `[proxy] listen` of `installer.toml` (an unspecified address read as loopback), else `127.0.0.1:8980` |
+| `--deploy-token-file` | `token_file` | `[proxy] operator_token_file` of `installer.toml` |
+| `--deploy-api-ca` | `api_ca` | none (the system's roots) |
+| `--deploy-server-name` | `api_server_name` | none (the API address's IP) |
+
+The token and the CA are referenced by path and are the operator's: `setup` never creates,
+copies or reads them. Before it touches the host it checks that each exists, is a regular file
+(a link is not followed), is owned by root or the service user, and that the token is mode 0600
+or 0400 and the CA is not writable by group or others; a failure is exit 5 naming the flag and
+the one command that fixes it. The five keys above are `setup`'s and are rewritten from the
+flags on every run (a run again with the same flags changes nothing); any other key in the file
+(`cas`, `cas_ca`, `cas_server_name`) is kept. A file that is not a JSON object is left alone and
+named. The sudoers rule that lets the deploy account run `deploy` is a held step, written out in
+`docs/design/gamma-deploy.md`, "The host's config: who writes it, and the sudoers rule".
+
 ## What it does, in this order
 
 1. Checks it is root (and, to apply, that its own binary is root's alone), checks the flags

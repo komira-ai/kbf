@@ -105,6 +105,16 @@ Options:
           The private key of --daemon-cert (a file of mode 0600 owned by the service user). Required for all-in-one
       --node-id <NODE_ID>
           The daemon half's node name, a DNS label unique in the cell. Required for all-in-one
+      --deploy-stage <DEPLOY_STAGE>
+          The stage this host is, gamma or prod: setup writes /etc/kbf-installer/deploy.json so `kbf-installer deploy` binds an offer to it. frontend, all-in-one
+      --deploy-api <DEPLOY_API>
+          The operator API deploy calls, as a loopback IP:PORT. Default: the proxy's public port (installer.toml `[proxy] listen`, else 127.0.0.1:8980)
+      --deploy-api-ca <DEPLOY_API_CA>
+          A PEM file of the CA the API's certificate is verified against (absolute path; it must exist). Default: the system's roots only
+      --deploy-server-name <DEPLOY_SERVER_NAME>
+          The DNS name the API's certificate carries. Default: the API address's IP
+      --deploy-token-file <DEPLOY_TOKEN_FILE>
+          The operator token's file (absolute path, mode 0600 or 0400, owned by root; it must exist: setup never creates or copies it). Default: installer.toml `[proxy] operator_token_file`
       --installer-config <INSTALLER_CONFIG>
           The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which is the only value setup accepts. The same flag, with the same meaning, as on `run`
   -h, --help

@@ -19,9 +19,8 @@ use super::{
 };
 use crate::CommitId;
 
-/// Where the host says which operator API to call and where its token is, so a caller
-/// that may only run `deploy` names neither.
-pub const CONFIG: &str = "/etc/kbf-installer/deploy.json";
+pub use super::host_config::CONFIG;
+use super::host_config::HostConfig;
 
 pub const USAGE: &str = "usage: kbf-installer deploy --commit <40hex> [--api <127.0.0.1:port>] \
 [--api-ca <pem>] [--api-server-name <dns>] [--token-file <path>] [--config <path>] \
@@ -240,28 +239,10 @@ fn policy(
     })
 }
 
-/// What the host's config file says.
-#[derive(Default)]
-struct HostConfig {
-    /// The proxy's public port, which serves every call of the deploy.
-    api: Option<String>,
-    /// CA certificates (PEM) the API's certificate is verified against, besides the system's.
-    api_ca: Option<PathBuf>,
-    /// The name the API's certificate carries.
-    api_server_name: Option<String>,
-    token_file: Option<PathBuf>,
-    /// The local REAPI listener the CAS smoke uses.
-    cas: Option<String>,
-    cas_ca: Option<PathBuf>,
-    cas_server_name: Option<String>,
-    /// `gamma` or `prod`: the stage this host is.
-    stage: Option<String>,
-}
-
 /// `{"api": "127.0.0.1:port", "token_file": "/path", "cas": "http://127.0.0.1:port"}` (and
 /// `api_ca`, `api_server_name`, `cas_ca`, `cas_server_name`, `stage`). Read only when a flag is
 /// missing; it must be a regular file owned by root and writable by no one else.
-fn read_config(path: &Path, owner: u32, needed: bool) -> Result<HostConfig, String> {
+pub(crate) fn read_config(path: &Path, owner: u32, needed: bool) -> Result<HostConfig, String> {
     if !needed {
         return Ok(HostConfig::default());
     }
@@ -280,22 +261,7 @@ fn read_config(path: &Path, owner: u32, needed: bool) -> Result<HostConfig, Stri
         return Err(format!("config {} must be owned by root", path.display()));
     }
     let text = fs::read_to_string(path).map_err(why("config"))?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(why("config"))?;
-    let get = |key: &str| {
-        v.get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    };
-    Ok(HostConfig {
-        api: get("api"),
-        api_ca: get("api_ca").map(PathBuf::from),
-        api_server_name: get("api_server_name"),
-        token_file: get("token_file").map(PathBuf::from),
-        cas: get("cas"),
-        cas_ca: get("cas_ca").map(PathBuf::from),
-        cas_server_name: get("cas_server_name"),
-        stage: get("stage"),
-    })
+    HostConfig::parse(&text).map_err(|e| format!("config {} {e}", path.display()))
 }
 
 fn number(name: &str, text: &str) -> Result<u64, String> {

@@ -26,6 +26,7 @@ mod frontend;
 mod frontend_addr;
 #[cfg(test)]
 mod frontend_addr_tests;
+pub mod host_config;
 mod nodes;
 pub mod offer;
 mod post;
