@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Architecture - kbf</title>
-<meta name="description" content="Architecture of kbf.">
+<meta name="description" content="The three roles of a kbf farm, the path of a remote execution, storage and its logs, and how the parts talk.">
 <link rel="stylesheet" href="theme.css">
 <link rel="stylesheet" href="style.css">
 <script src="site.js" defer></script>
@@ -23,7 +23,196 @@
 </div></header>
 <main id="main" class="wrap">
 <h1>Architecture</h1>
-<div class="notice notice-warn"><p>This page is written after the design review of the home page and the quick start.</p></div>
+<p class="lede">kbf is a frontend, storage nodes and daemons. This page says what each does, how one remote execution moves through them, where state lives and how the parts talk. <span class="tag tag-ok">works today</span> is in the code; <span class="tag tag-planned">specified</span> is designed and not built. The reasoning behind the shape is on <a href="design.html">the design page</a>.</p>
+
+<p class="toc">On this page: <a href="#roles">the roles</a> <a href="#picture">the picture</a> <a href="#request">a remote execution</a> <a href="#storage">storage</a> <a href="#logs">metadata and state</a> <a href="#talk">how the parts talk</a> <a href="#planned">not built yet</a></p>
+
+<h2 id="roles">Three roles</h2>
+<p>A farm is made of three roles. The <code>kbf</code> binary runs one of them, or two or three in one process, chosen by <code>--mode</code>.</p>
+<ul class="parts">
+  <li><h3>frontend</h3><p>The one address clients, daemons and storage nodes know. It serves REAPI v2 to Buck2 and Bazel, schedules actions, serves the listener daemons and storage nodes connect to, and serves the operator API. It holds no blobs: cache calls are passed to storage. Its scheduler state is in a state store, Postgres or SQLite.</p></li>
+  <li><h3>storage</h3><p>The content-addressable store and the action cache. Blobs are placed by digest across storage nodes, two copies of each. A node has a fast local tier, a metadata log on local disk, and a cold store, a directory or an S3-compatible bucket, where every blob ends up.</p></li>
+  <li><h3>daemon</h3><p>The worker. It opens one outbound mutual-TLS stream to the frontend and listens on no port. It reports what the machine is, runs the leases it is given, and moves blobs to and from storage. A Linux daemon runs each action in a rootless <code>crun</code> container; a Mac daemon runs it as plain processes with the process tree, memory and network watched.</p></li>
+</ul>
+<p>The two combined modes are the same roles in one process: <code>storage-and-daemon</code> reads and writes the node's own storage in-process, so the daemon's input cache and the storage node's local data are one cache on one disk, and <code>all-in-one</code> runs all three. Nothing else changes between a split farm and a single machine.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Mode</th><th>Frontend</th><th>Storage</th><th>Daemon</th><th>Its durable state</th></tr></thead>
+<tbody>
+<tr><td><code>frontend</code></td><td>yes</td><td></td><td></td><td>The state store.</td></tr>
+<tr><td><code>storage</code></td><td></td><td>yes</td><td></td><td>Hot tier, metadata log, cold store.</td></tr>
+<tr><td><code>daemon</code></td><td></td><td></td><td>yes</td><td>The data directory: lease scratch, the input cache.</td></tr>
+<tr><td><code>storage-and-daemon</code></td><td></td><td>yes</td><td>yes</td><td>Both of the above, one cache.</td></tr>
+<tr><td><code>all-in-one</code></td><td>yes</td><td>yes</td><td>yes</td><td>All of the above.</td></tr>
+</tbody></table></div>
+
+<h2 id="picture">The picture</h2>
+<figure class="stage flow">
+<div class="svg-scroll"><svg viewBox="0 0 900 410" role="img" aria-labelledby="arch-t arch-d">
+<title id="arch-t">The parts of a kbf farm and who dials whom</title>
+<desc id="arch-d">A build tool connects to the frontend. The frontend keeps its state in a state store and talks to two storage nodes, which copy blobs between them and flush to an object store. Daemons dial the frontend for work and move blob bytes to and from the storage nodes.</desc>
+<rect class="node" x="20" y="150" width="140" height="70" rx="10"/>
+<text class="t1" x="90" y="180" text-anchor="middle">Buck2/Bazel</text>
+<text class="t2" x="90" y="202" text-anchor="middle">REAPI v2 client</text>
+
+<rect class="node hot" x="270" y="95" width="230" height="180" rx="10"/>
+<text class="t1" x="385" y="125" text-anchor="middle">frontend</text>
+<text class="t2" x="385" y="152" text-anchor="middle">REAPI listener</text>
+<text class="t2" x="385" y="174" text-anchor="middle">scheduler and queue</text>
+<text class="t2" x="385" y="196" text-anchor="middle">worker listener (mTLS)</text>
+<text class="t2" x="385" y="218" text-anchor="middle">operator API</text>
+<text class="t2" x="385" y="240" text-anchor="middle">storage map</text>
+
+<rect class="node" x="300" y="325" width="170" height="55" rx="10"/>
+<text class="t1" x="385" y="350" text-anchor="middle">state store</text>
+<text class="t2" x="385" y="369" text-anchor="middle">Postgres or SQLite</text>
+
+<rect class="node cool" x="640" y="40" width="240" height="95" rx="10"/>
+<text class="t1" x="760" y="70" text-anchor="middle">storage node</text>
+<text class="t2" x="760" y="94" text-anchor="middle">hot tier, metadata log</text>
+<text class="t2" x="760" y="114" text-anchor="middle">primary for some digests</text>
+
+<rect class="node cool" x="640" y="165" width="240" height="95" rx="10"/>
+<text class="t1" x="760" y="195" text-anchor="middle">storage node</text>
+<text class="t2" x="760" y="219" text-anchor="middle">hot tier, metadata log</text>
+<text class="t2" x="760" y="239" text-anchor="middle">replica for those digests</text>
+
+<rect class="node" x="680" y="325" width="200" height="55" rx="10"/>
+<text class="t1" x="780" y="350" text-anchor="middle">cold store</text>
+<text class="t2" x="780" y="369" text-anchor="middle">S3 bucket or directory</text>
+
+<rect class="node hot" x="20" y="315" width="200" height="75" rx="10"/>
+<text class="t1" x="120" y="345" text-anchor="middle">daemons</text>
+<text class="t2" x="120" y="367" text-anchor="middle">crun, or native on a Mac</text>
+
+<path class="edge" d="M160 185 L270 185"/>
+<text class="lab" x="215" y="172" text-anchor="middle">REAPI</text>
+<path class="edge" d="M385 275 L385 325"/>
+<path class="edge" d="M500 130 L640 88"/>
+<text class="lab" x="570" y="96" text-anchor="middle">cache calls</text>
+<path class="edge" d="M500 235 L640 215"/>
+<text class="lab" x="570" y="248" text-anchor="middle">register, map</text>
+<path class="edge" d="M760 135 L760 165"/>
+<text class="lab" x="840" y="154" text-anchor="middle">copy</text>
+<path class="edge" d="M780 260 L780 325"/>
+<text class="lab" x="840" y="298" text-anchor="middle">flush</text>
+<path class="edge" d="M200 315 L300 275"/>
+<text class="lab" x="130" y="296" text-anchor="middle">work stream</text>
+<path class="edge" d="M120 390 L120 402 L892 402 L892 215 L880 215"/>
+<text class="lab" x="520" y="396" text-anchor="middle">blob bytes, inputs and outputs</text>
+</svg></div>
+<figcaption class="small muted">Dashed lines are connections, drawn from the side that dials. Work goes from the frontend to a daemon over the stream the daemon opened. Blob bytes never travel on that stream: a daemon moves them directly to and from the storage nodes that own each blob.</figcaption>
+</figure>
+
+<h2 id="request">A remote execution, step by step</h2>
+<p>Buck2 or Bazel needs no kbf component. It speaks REAPI to the frontend's address.</p>
+<ol class="steps">
+  <li>
+    <h3>The client uploads what is missing <span class="tag tag-ok">works today</span></h3>
+    <p>The tool asks <code>FindMissingBlobs</code> and sends the inputs the farm lacks. The frontend passes the calls to the storage nodes by digest and does not hold a blob: a ByteStream write goes through it to the blob's primary node, which copies it to the second owner.</p>
+  </li>
+  <li>
+    <h3>The action cache is asked first <span class="tag tag-ok">works today</span></h3>
+    <p>On <code>Execute</code>, unless the client set <code>skip_cache_lookup</code>, the frontend looks the action up in the action cache. A hit must pass the closure check: the stored result and every blob it names are present and readable, or the lookup is a miss. A hit answers at once with <code>cached_result</code> set and nothing runs. Clients cannot write the action cache: <code>UpdateActionResult</code> is always <code>PERMISSION_DENIED</code>, and only a daemon that ran the action writes an entry.</p>
+  </li>
+  <li>
+    <h3>The inputs are checked <span class="tag tag-ok">works today</span></h3>
+    <p>The <code>Action</code>, its <code>Command</code> and the input tree must be in the CAS. Each missing blob becomes a <code>MISSING</code> violation in one <code>FAILED_PRECONDITION</code>, as REAPI asks, so the client uploads and calls again. A platform no daemon could ever run, or a malformed one, is refused here too.</p>
+  </li>
+  <li>
+    <h3>The action is queued <span class="tag tag-ok">works today</span></h3>
+    <p>The scheduler keys each operation by instance name and action digest. A second caller for the same hermetic action joins the running one instead of starting another. Work waits in a queue ordered by urgency, then arrival. While it waits, the open stream gets the operation again every 30 seconds by default, so a load balancer's idle timeout does not cut it.</p>
+  </li>
+  <li>
+    <h3>A lease is granted to a daemon <span class="tag tag-ok">works today</span></h3>
+    <p>The scheduler picks a live daemon that can run the platform and has room. It writes the grant to the state store, and only then sends <code>Start</code>; before that the daemon has only a <code>LeaseOffer</code> and runs nothing. A lease the store does not know can never run. How the daemon is chosen is on <a href="design.html#placement">the design page</a>.</p>
+  </li>
+  <li>
+    <h3>The daemon runs it <span class="tag tag-ok">works today</span></h3>
+    <p>On Linux the container driver reads the image from the <code>container-image</code> platform property, which must name one architecture's manifest by digest, not a tag. It builds the input tree in the lease's scratch directory, makes a lease cgroup and runs the action with <code>crun</code> in a fresh rootless container that is never reused. The container has a network namespace with nothing configured, so no action has network; its root is the read-only image, and it writes only to <code>/tmp</code>, <code>/var/tmp</code>, <code>/run</code>, <code>/root</code> and the input root. On a Mac the native driver runs the action as processes.</p>
+  </li>
+  <li>
+    <h3>Outputs go to storage <span class="tag tag-ok">works today</span></h3>
+    <p>The daemon hashes each output file once, asks which blobs storage lacks, and uploads them as whole segments to the nodes that own them, then sends <code>Result</code> on its stream. Until the frontend has sent a storage map, the daemon moves blobs through the frontend's worker listener; once it has one, directly to storage.</p>
+  </li>
+  <li>
+    <h3>The result is accepted and answered <span class="tag tag-ok">works today</span></h3>
+    <p>The frontend accepts a result only from the daemon that holds the operation's current lease and only if every output is stored. A result with exit code 0 and no <code>do_not_cache</code> is written to the action cache before the callers are answered, so the next build, on any machine, gets a hit. A run that exits non-zero, such as a failing test, is returned to the caller and not cached. Failures that are the farm's, not the action's, take other paths; <a href="design.html#admission">the design page</a> lists them.</p>
+  </li>
+</ol>
+
+<h2 id="storage">Storage</h2>
+<h3>Members and the map</h3>
+<p>A storage node registers with the frontend and heartbeats to it. It does not talk to the state store; the frontend keeps the member rows there and pushes the map, the list of members with the rule that places a blob, down the node's stream and to every daemon. A node's identity, its member id and its boot counter come from the state store, so no node picks its own.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>State</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>joining</code></td><td>Admitted to a farm that already holds data. Takes writes at once, is never the primary and is read last.</td></tr>
+<tr><td><code>catching_up</code></td><td>Rebuilding its index. A read it cannot find answers <code>UNAVAILABLE</code>, never <code>NOT_FOUND</code>, because it may hold a blob it has not indexed yet.</td></tr>
+<tr><td><code>active</code></td><td>A full owner.</td></tr>
+<tr><td><code>draining</code></td><td>Takes no new writes and is still read in rank order.</td></tr>
+<tr><td><code>down</code></td><td>Its membership row expired (15 seconds after its last heartbeat by default). It stays in the map for a dwell, 300 seconds by default, before it leaves and its blobs have other owners.</td></tr>
+</tbody></table></div>
+<p>An operator can mark an <code>active</code> member <code>planned_down</code> for a restart (<code>POST /v1/members/{id}</code>): writes skip it at once while reads fail over, so a planned restart does not fail uploads. <a href="updates.html">Updates</a> uses it. An operator promotes a <code>joining</code> member with the same route.</p>
+
+<h3>Placement and replication</h3>
+<ul>
+  <li><strong>Placement</strong> is rendezvous hashing over the digest, the member id and the member's weight, so removing a member moves only the blobs that resolved to it and there is no ring state to coordinate. The top two members are the owners. Every storage call carries the map generation its caller used; a node that holds a newer one answers <code>STALE_MAP</code> and the caller refetches and retries.</li>
+  <li><strong>Writes</strong> go once to the primary, the first write owner. It streams the blob to the second owner and acknowledges when both hold it on the hot tier, so a client on a slow link uploads each byte once. If the second owner is unreachable, the primary acknowledges after its own durable write and records a repair debt in its journal; the debt is settled later and the frontend is told of it. A blob is never held whole in memory on the way.</li>
+  <li><strong>Reads</strong> try the owners in rank order, then the owners of the previous map generation, then the cold store through an owner's index. A read that breaks after its first byte resumes on the next owner from the bytes already passed.</li>
+  <li><strong>Action cache entries</strong> are sharded by action digest. An entry is committed only after the blobs it names are acknowledged, so a hit never points at missing files.</li>
+</ul>
+
+<h3>The write tier and the cold store</h3>
+<p><code>--hot-store</code> is a directory on a fast disk. Uploads from several callers are grouped into shared segments, one object-store PUT and one metadata commit per segment, written to the hot tier and flushed to the cold store in the background by the blob's first owner. The tier's budget is 80% of the filesystem's free space less a floor, or <code>--hot-store-max-bytes</code>; at the budget, writes go straight to the cold store. A blob over 16 MiB is streamed and never held whole. Without a hot store, every upload goes straight to the cold store.</p>
+<p>The cold store is where every blob ends up: <code>s3://bucket/prefix?endpoint=...</code> for MinIO, RustFS or S3, with the key pair from the standard <code>AWS_</code> variables, or <code>file:///dir</code>, which refuses writes that would leave under 5% of its filesystem free and evicts the least recently used objects to stay above that. Objects are keyed under the id of the node's metadata log. A daemon-only host needs no cold-store credential, and the unit checks in <code>kbf-deploy</code> refuse to give it one.</p>
+<p>If both owners of an unflushed blob are lost, the digests get loss marks: an action-cache entry whose result blob is marked is a miss, and the action runs again. A node whose index is lost rebuilds it from the footers the segments carry; the action cache is not rebuilt, because its entries live only in the node's log, so those actions run again.</p>
+
+<h2 id="logs">Metadata and state</h2>
+<p>Two kinds of log or store hold two kinds of state, and they are not the same thing.</p>
+<div class="table-wrap"><table>
+<thead><tr><th>State</th><th>Kept in</th><th>Details</th></tr></thead>
+<tbody>
+<tr><td>Operations, leases, the queue, membership, the map, cordons, the desired release</td><td>The frontend's state store: <code>--state-store postgres:///kbf?host=/run/postgresql</code> or <code>sqlite:///path</code></td><td>Written before each change is acknowledged and replayed at start. Postgres is required for two frontend processes side by side, which an update needs; SQLite is held by one process. A URL with a password is refused. Every start of a frontend is a new epoch, so a daemon kills the leases it held before; a handover to a successor keeps the epoch.</td></tr>
+<tr><td>The CAS index, the action cache</td><td>A node's metadata log, <code>--meta-dir</code> (default <code>&lt;hot store&gt;/meta</code>)</td><td>A single-voter Raft log on local disk. An empty directory makes a new log with a new id; every later start reads the id from the directory.</td></tr>
+<tr><td>Blob bytes</td><td>Hot tier, then cold store</td><td>Segments with self-describing footers.</td></tr>
+</tbody></table></div>
+<p>The metadata log has a <em>machine version</em>, <code>V1</code> to <code>V5</code> in this build. A start raises the log to the version a feature needs (the write tier, eviction, node writers) once, and the raise is one-way: an older binary refuses a log raised past what it runs. <code>kbf --version --json</code> reports the highest version a build runs as <code>meta_log</code>. <a href="updates.html#skew">Updates</a> says what this means for rollback.</p>
+<p>No log is replicated between nodes. Each storage node has its own single-voter log, and the second copy of a blob, not of the log, is what protects the data. The Raft core itself (<code>kbf-raft</code>) can run several voters; running three on three hosts is <span class="tag tag-planned">specified</span>.</p>
+
+<h2 id="talk">How the parts talk</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Connection</th><th>Protocol</th><th>Security</th></tr></thead>
+<tbody>
+<tr><td>Build tool to frontend, port 8980</td><td>REAPI v2 over gRPC: <code>Execute</code>, <code>WaitExecution</code>, <code>ActionCache</code>, <code>ContentAddressableStorage</code>, <code>ByteStream</code></td><td>Plain text, or TLS with the server's certificate only (<code>--reapi-tls-cert</code>, <code>--reapi-tls-key</code>); a client certificate identifies no caller. <code>--reapi-auth-policy</code> takes an allow, deny, any, all and instance-prefix policy and checks no credential yet. Credential policies (a bearer token, an authentication service) are <span class="tag tag-planned">specified</span>.</td></tr>
+<tr><td>Daemon to frontend, port 8981</td><td><code>kbf.worker.v1</code>: one bidirectional <code>Session</code> stream per daemon, carrying small control messages only</td><td>Mutual TLS. The certificate names the role <code>daemon</code> and exactly one DNS name, the node id, so a certificate speaks only for its own node. A deny list of serials, public keys and node ids is read again at every <code>Hello</code>, <code>Heartbeat</code>, <code>Result</code> and blob call.</td></tr>
+<tr><td>Storage node to frontend, port 8981</td><td><code>kbf.map.v1</code> <code>Register</code> and <code>Heartbeat</code>; the map comes back in the answers</td><td>Mutual TLS, role <code>storage</code>. The certificate must name the host the node advertises.</td></tr>
+<tr><td>Frontend and daemon to storage, <code>--storage-listen</code></td><td>REAPI blob calls, <code>kbf.storage.v1</code> (the action store), <code>kbf.worker.v1</code> <code>Segments</code> for whole-segment uploads</td><td>Mutual TLS: each call is judged by the caller's role (frontend, storage or daemon) per endpoint. Without TLS flags a node serves plain text and the address must be loopback.</td></tr>
+<tr><td>Storage node to storage node</td><td>The copy leg of a write, the same ByteStream marked as a copy</td><td>Admitted from the <code>storage</code> role only.</td></tr>
+<tr><td>Storage node to cold store</td><td>S3 API or local files</td><td>The key pair is the node's own process credential, never in a flag.</td></tr>
+<tr><td>Frontend to state store</td><td>SQL</td><td>Postgres over a Unix socket with peer authentication, <code>synchronous_commit</code> on (the start is refused otherwise).</td></tr>
+<tr><td>Operator to frontend, <code>--api-listen</code></td><td>HTTP and JSON under <code>/v1</code>: nodes, members, drain, storage, enrollment, releases, updates</td><td>Reads are open to whoever reaches the address, so bind it where only operators do. A write needs a loopback peer, no <code>Origin</code> header, <code>Authorization: Bearer</code> with the token from <code>--api-token-file</code>, and <code>Content-Type: application/json</code>.</td></tr>
+<tr><td>Node to frontend, <code>--enroll-listen</code></td><td><code>kbf.enroll.v1</code> <code>Enroll</code> and <code>Renew</code></td><td>TLS that authenticates the server only; the node pins the CA fingerprint carried by its token. <a href="install.html#enroll">Install</a> has the flow.</td></tr>
+</tbody></table></div>
+<ul>
+  <li><strong>Roles are in the certificate.</strong> One <code>urn:kbf:role:&lt;name&gt;</code> URI subject alternative name says frontend, storage or daemon. Each listener has a table of which role may call which method; a method not in the table is refused whatever the certificate. A node that is both storage and daemon holds two certificates and presents the one that fits each connection.</li>
+  <li><strong>Certificates come from files</strong> and are re-read every 30 seconds by default (<code>--tls-reload-interval-secs</code>). A new certificate applies to the next handshake, a working configuration replaces the old one only if the new files make one, and a renewal never ends a connection in flight.</li>
+  <li><strong>Plain text is a choice, not a default you can miss.</strong> A listener without its TLS flags serves plain text on any address. When the REAPI or worker listener does so off loopback, the start line ends with a <code>warning=plaintext-off-loopback</code> token. A plain-text worker listener refuses every blob call.</li>
+  <li><strong>Identity of a farm's certificates</strong> can come from your own CA or from enrollment; see <a href="install.html#enroll">Install</a>. A certificate lifetime is the only bound on a leaked key beyond the deny list: there is no CRL or OCSP.</li>
+  <li><strong>The frontend can sit behind a bundled proxy</strong> (<code>kbf-installer proxy</code>) that terminates TLS for every connection on one public port, verifies the client certificate when one is presented, and forwards each HTTP/2 stream to the active frontend process with the verified identity as headers only the proxy can set. It exists so a frontend can be swapped without cutting streams; see <a href="updates.html#frontend">Updates</a>.</li>
+</ul>
+
+<h2 id="planned">Not built yet</h2>
+<div class="notice">
+  <p><span class="tag tag-planned">specified</span> These are in the design documents and absent from the code.</p>
+  <ul>
+    <li>Several frontends sharing one queue, and a leader election among servers. The scheduler runs in one frontend process; a second process runs beside it only during an update.</li>
+    <li>Moving blobs when a member joins or drains. A joining node fills from the writes it takes; copying the old owners' blobs to it is designed in <a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/design/rebalance-handoff.md">the rebalance design</a>.</li>
+    <li>Three-voter metadata logs, and snapshots and compaction of the log.</li>
+    <li>A check that a blob call comes from a daemon that is connected and reads only the inputs of its own leases. Today any certificate the deny list does not refuse can read a blob whose digest it names.</li>
+    <li>Reading a QoS level from a request, preemption of low-urgency work, learned action sizes, and placement scoring beyond the spread described on <a href="design.html#placement">the design page</a>.</li>
+    <li>iOS devices and macOS VMs as lease kinds.</li>
+  </ul>
+</div>
 </main>
 <footer class="site-footer"><div class="wrap"><p>kbf is licensed under the Apache License 2.0.</p>
 <ul><li><a href="https://github.com/komira-ai/kbf">Source on GitHub</a></li></ul></div></footer>
