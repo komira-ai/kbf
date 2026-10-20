@@ -57,7 +57,9 @@ impl Readiness {
 
     /// Whether `/readyz` is 200 at `at`: `slots` has an active slot, and the last passing poll
     /// was of that slot's current child (a slot that was retired and opened again is a new
-    /// child, and inherits nothing) no more than [`FRESH_FOR`] ago.
+    /// child, and inherits nothing) no more than [`FRESH_FOR`] ago. The active slot and its
+    /// generation are two reads: a flip between them can answer 503 for a child that is ready,
+    /// never 200 across a changed child.
     pub(crate) fn is_ready(&self, slots: &ActiveSlot, at: Instant) -> bool {
         let Some(active) = slots.active() else {
             return false;

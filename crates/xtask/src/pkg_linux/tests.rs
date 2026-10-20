@@ -101,15 +101,15 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.put("units/other.service", "x");
                 t.inputs()
             },
-            "other.service: a package unit is named kbf-*.service or kbf-*.socket",
+            "other.service: a package unit is named kbf-*.service, kbf-*.socket or kbf-*.timer",
         ),
         (
-            "a unit that is a timer",
+            "a unit that is a path",
             |t| {
-                t.put("units/kbf-gc.timer", "x");
+                t.put("units/kbf-gc.path", "x");
                 t.inputs()
             },
-            "kbf-gc.timer: a package unit is named kbf-*.service or kbf-*.socket",
+            "kbf-gc.path: a package unit is named kbf-*.service, kbf-*.socket or kbf-*.timer",
         ),
         (
             "a directory among the units",
@@ -662,16 +662,57 @@ fn no_dependency_of_either_package_names_envoy() {
     }
 }
 
-/// The slice is the one non-`.service` unit; any other name is still refused.
+/// The package suggests a Postgres server and does not depend on it: node hosts never use
+/// one, and apt installs `Recommends` by default, which would start a database on every node.
+/// Catches Postgres moving into `depends` (every node gets a server) and the hint vanishing
+/// (the frontend operator is not told what to install).
 #[test]
-fn a_unit_that_is_neither_a_service_nor_the_slice_is_refused() {
+fn postgres_is_suggested_not_required() {
+    for dep in DEB_DEPENDS.iter().chain(RPM_DEPENDS.iter()) {
+        assert!(!dep.to_lowercase().contains("postgres"), "{dep}");
+    }
+    let cfg = config(&[], Platform::LinuxX86_64, "0.0.0+ci");
+    let top: Vec<&str> = cfg.lines().collect();
+    let at = |key: &str| top.iter().position(|l| *l == key).expect(key);
+    assert!(
+        top[at("suggests:") + 1].contains("\"postgresql\""),
+        "the deb suggests postgresql: {cfg}"
+    );
+    assert!(
+        cfg.contains("    suggests:\n      - \"postgresql-server\"\n"),
+        "the rpm suggests postgresql-server: {cfg}"
+    );
+    assert!(!cfg.contains("recommends"), "{cfg}");
+}
+
+/// The slice and the `kbf-*.timer` files (the backup timer) are the units that are not
+/// services; any other name is still refused, and a timer not named `kbf-` is too.
+///
+/// Mutants seen red: the `.timer` suffix not accepted (the backup timer would not package);
+/// any `.timer` accepted.
+#[test]
+fn a_unit_that_is_not_a_service_socket_timer_or_the_slice_is_refused() {
     let t = Tree::new("slice");
     t.put("units/kbf.slice", "[Slice]");
-    assert!(plan(&t.inputs()).is_ok(), "the slice is packaged");
     t.put("units/kbf-x.timer", "[Timer]");
+    let planned = plan(&t.inputs()).expect("the slice and a kbf timer are packaged");
+    assert!(
+        planned
+            .iter()
+            .any(|e| e.dst == "/usr/lib/systemd/system/kbf-x.timer" && e.mode == 0o644),
+        "{planned:?}"
+    );
+    t.put("units/kbf-x.socket", "[Socket]");
+    t.put("units/kbf-x.path", "[Path]");
+    t.put("units/other.timer", "[Timer]");
     let got = refused(plan(&t.inputs()));
-    assert!(got.contains("kbf-x.timer"), "{got}");
-    assert!(!got.contains("kbf.slice:"), "{got}");
+    assert!(got.contains("kbf-x.path"), "{got}");
+    assert!(!got.contains("kbf-x.socket:"), "{got}");
+    assert!(got.contains("other.timer"), "{got}");
+    assert!(
+        !got.contains("kbf.slice:") && !got.contains("kbf-x.timer:"),
+        "{got}"
+    );
 }
 
 /// A `kbf-*.socket` is packaged beside its service, in the same directory and mode.

@@ -93,6 +93,7 @@ async fn farm() -> Arc<RoutedCas> {
     let view = MapView {
         map: Arc::new(map),
         previous: None,
+        earlier: Vec::new(),
     };
     let router = Router::new(Arc::new(Fixed(view)), Arc::new(Plain::default()));
     Arc::new(RoutedCas::new(router, &TransferConfig::default()))

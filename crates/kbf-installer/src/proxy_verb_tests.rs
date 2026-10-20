@@ -8,6 +8,7 @@ use rustix::io::{FdFlags, fcntl_getfd};
 use super::*;
 
 const PROXY: &str = r#"
+database = "postgres:///kbf?host=/nonexistent"
 [proxy]
 operator_token_file = "/etc/kbf/operator.token"
 server_cert_file = "/etc/kbf/tls/server.pem"
@@ -248,7 +249,8 @@ fn errors_map_to_exit_codes_and_words() {
 fn a_descriptor_the_runtime_cannot_use_is_a_failure_to_start() {
     let config = load(&file("serve", PROXY.as_bytes())).expect("valid");
     let regular = OwnedFd::from(fs::File::open(file("fd", b"x")).expect("open"));
-    match serve(config, regular, Path::new("/nonexistent")) {
+    let database = state_database(&file("serve-db", PROXY.as_bytes())).expect("a database");
+    match serve(config, database, regular, Path::new("/nonexistent")) {
         Err(VerbError::Failed(text)) => {
             assert!(text.starts_with("cannot start the proxy: "), "{text}");
         }
@@ -340,6 +342,20 @@ fn the_production_stop_bound_is_ten_seconds() {
     assert_eq!(STOP_BOUND, Duration::from_secs(10));
 }
 
+/// Catches `Stop::production` carrying another bound or another exit than the verb's: its
+/// fields are pinned here. It does not see which `Stop` `serve` builds (a literal `Stop` in
+/// `serve` would pass); `serve` takes its stop from `Stop::production` and reads as such.
+#[test]
+fn the_production_stop_ends_the_process_after_the_bound() {
+    let stop = Stop::production();
+    assert_eq!(stop.bound, STOP_BOUND);
+    assert_eq!(
+        stop.exit as usize,
+        std::process::exit as fn(i32) -> ! as usize
+    );
+    assert!(!stop.seen.load(Ordering::SeqCst));
+}
+
 /// Catches a start that reads as served when it did not: the log line says which slot serves an
 /// adopted child, and that new streams stay held, with the reason, for a held start and for a
 /// supervisor that could not even build its admin client.
@@ -384,4 +400,154 @@ fn proxy_reads_the_installer_toml_setup_wrote_on_the_platform() {
         config_path(&args(Some(PathBuf::from("/x.toml"))), Platform::MacOs),
         PathBuf::from("/x.toml")
     );
+}
+
+/// Catches a database the verb accepts that it could not use, and a refusal that quotes it.
+/// The key is required (a frontend host runs on Postgres); a password is refused because the
+/// file is world-readable; an unusable URL is refused; none of the messages carries the URL or
+/// its parts; and a good one is accepted without being connected to.
+#[test]
+fn the_state_database_is_required_and_its_refusals_never_quote_the_url() {
+    let secret = "postgres://kbf_marker_user:hunter2_marker@127.0.0.1:5432/kbf_marker_db";
+    let at = |name: &str, text: &str| state_database(&file(name, text.as_bytes()));
+    let cases = [
+        (
+            "db-none",
+            "min_generation = 1\n".to_owned(),
+            "state database",
+        ),
+        (
+            "db-password",
+            format!("database = {secret:?}\n"),
+            "carries a password",
+        ),
+        (
+            "db-bad",
+            "database = \"mysql://kbf_marker_user@127.0.0.1/kbf_marker_db\"\n".to_owned(),
+            "not usable",
+        ),
+    ];
+    for (name, text, want) in cases {
+        let why = usage_of(at(name, &text));
+        assert!(why.contains(want), "{name}: {why}");
+        for part in [
+            "hunter2_marker",
+            "kbf_marker_user",
+            "kbf_marker_db",
+            "127.0.0.1",
+        ] {
+            assert!(!why.contains(part), "{name}: {part} in {why}");
+        }
+    }
+    assert!(
+        at(
+            "db-ok",
+            "database = \"postgres:///kbf?host=/nonexistent\"\n"
+        )
+        .is_ok()
+    );
+}
+
+/// Catches `--check` that passes a file the run would refuse for want of a database.
+#[test]
+fn check_refuses_a_file_without_a_database() {
+    let path = file(
+        "check-db",
+        PROXY
+            .replace("database = \"postgres:///kbf?host=/nonexistent\"\n", "")
+            .as_bytes(),
+    );
+    let args = ProxyArgs {
+        config: Some(path),
+        check: true,
+        update_dir: "/nonexistent".into(),
+    };
+    assert!(usage_of(run(&args)).contains("state database"));
+}
+
+/// The verb's start, on a scratch host: the installed release (a stand-in that would fail at
+/// once if it were ever run) is verified, the database is unreachable, and the start is
+/// bounded to one attempt.
+///
+/// Catches a verb that starts the installed release without migrating it first (the
+/// `NoMigration` it used to pass): the attempt must fail as `migration-failed`, in the line the
+/// log gets and in `boot.json`, with nothing recorded as started and no part of the URL
+/// anywhere. A start that skipped the migration would run the stand-in and fail as
+/// `exited-before-ready`.
+///
+/// Mutant seen red: `host_migrator` replaced by a hook that migrates nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_start_migrates_the_installed_release_before_it_runs_it() {
+    use kbf_proxy::Proxy;
+    use kbf_proxy::config::ProxyConfig;
+    use kbf_state::postgres::PostgresConfig;
+    use kbf_state::postgres::schema;
+
+    use crate::proxy::boot::Retry;
+    use crate::proxy::gate_real::ProxyGate;
+    use crate::proxy::gate_real_tests::proxy_table;
+    use crate::proxy::runtime::SystemClock;
+    use crate::testkit::{A, c, host_root};
+
+    let (layout, root) = host_root("proxy-verb-start");
+    let release = layout.join(&layout.release_dir(&c(A)));
+    fs::create_dir_all(&release).expect("release dir");
+    let program = release.join("kbf");
+    // A link to this test binary: an object the coverage tools can read, and a program that
+    // would fail at once if the start ever ran it.
+    std::os::unix::fs::symlink(std::env::current_exe().expect("test binary"), &program)
+        .expect("link");
+    fs::write(release.join(crate::stage::VERIFIED), format!("{A}\n")).expect("VERIFIED");
+    let state_dir = root.join("proxy-state");
+    fs::create_dir_all(&state_dir).expect("state dir");
+    let status = root.join("status.json");
+    // The root half has staged and installed this release and says what schema it needs, so
+    // the migration goes straight to the database.
+    fs::write(
+        &status,
+        format!(
+            "{{\"installed_commit\":\"{A}\",\"staged_commit\":\"{A}\",\"staged\":{{\"protocol\":1,\"min_protocol\":1,\"state_schema\":1}}}}\n"
+        ),
+    )
+    .expect("status.json");
+
+    let config = ProxyConfig::from_toml_str(&proxy_table("verb-start", "")).expect("config");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let (handle, _runner) = Proxy::bind(config.clone(), OwnedFd::from(listener)).expect("proxy");
+    let gate = ProxyGate::new(handle.clone());
+    let url = "postgres://kbf_marker_user:hunter2_marker@127.0.0.1:1/kbf_marker_db";
+    let with = Supervise {
+        database: Database::new(
+            PostgresConfig::parse(url).expect("parses"),
+            schema::embedded(),
+        ),
+        state_dir: state_dir.clone(),
+        proxy_auth_file: config.proxy_auth_file.clone(),
+        upstream: config.upstream,
+        operator_token_file: config.operator_token_file.clone(),
+        status,
+    };
+    let retry = Retry {
+        attempts: 1,
+        first_wait: Duration::from_millis(1),
+        max_wait: Duration::from_millis(1),
+    };
+    let line = start_children(&handle, &gate, &SystemClock::new(), layout, with, retry);
+    assert!(
+        line.starts_with("no frontend child adopted, new streams stay held: ")
+            && line.contains("migration-failed"),
+        "{line}"
+    );
+    let boot = fs::read_to_string(state_dir.join("boot.json")).expect("boot.json");
+    assert!(boot.contains("\"reason\":\"migration-failed\""), "{boot}");
+    assert!(!state_dir.join("children").exists(), "a child was started");
+    for part in [
+        "hunter2_marker",
+        "kbf_marker_user",
+        "kbf_marker_db",
+        "127.0.0.1",
+    ] {
+        assert!(!line.contains(part) && !boot.contains(part), "{part}");
+    }
 }

@@ -313,7 +313,7 @@ impl Drop for Request<'_> {
 }
 
 /// The metadata commands the cache commits, as the `command` label names them.
-pub const COMMANDS: [&str; 19] = [
+pub const COMMANDS: [&str; 20] = [
     "tick",
     "alloc_epoch",
     "put_blob",
@@ -333,6 +333,7 @@ pub const COMMANDS: [&str; 19] = [
     "adopt_segment",
     "rebuild_progress",
     "rebuild_done",
+    "reseat_staged",
 ];
 
 /// The index into [`COMMANDS`] of `command`'s label.
@@ -358,6 +359,7 @@ pub const fn command_label(command: &Command) -> usize {
         Command::AdoptSegment { .. } => 16,
         Command::RebuildProgress { .. } => 17,
         Command::RebuildDone => 18,
+        Command::ReseatStaged { .. } => 19,
     }
 }
 
@@ -792,7 +794,7 @@ pub struct TierCounters {
     pub flushes: Counter,
     /// Flush attempts that failed and will be retried.
     pub flush_failures: Counter,
-    /// Objects whose key held another object: `FlushConflict` committed (alert).
+    /// Objects whose key held another object and were moved to an object of their own (alert).
     pub conflicts: Counter,
     /// Objects with a record that failed its digest on the tier: marked corrupt.
     pub corrupt: Counter,
@@ -802,6 +804,10 @@ pub struct TierCounters {
     pub digest_mismatch: Counter,
     /// Blobs read from the tier's disk (a block or a flushed copy).
     pub local_reads: Counter,
+    /// Objects staged on the tier and not flushed, as a flusher round found them at its start.
+    pub staged_objects: Level,
+    /// The committed bytes of those objects.
+    pub staged_bytes: Level,
 }
 
 impl TierCounters {
@@ -887,6 +893,16 @@ impl TierCounters {
                 "kbf_write_tier_flushed_copy_bytes",
                 "Bytes of flushed copies kept on the tier for local reads",
                 usage.flushed,
+            ),
+            (
+                "kbf_write_tier_staged_objects",
+                "Objects staged on the write tier and not flushed, at the start of the last flusher round",
+                self.staged_objects.get(),
+            ),
+            (
+                "kbf_write_tier_staged_bytes",
+                "Committed bytes of the staged objects not flushed, at the start of the last flusher round",
+                self.staged_bytes.get(),
             ),
             (
                 "kbf_write_tier_unflushed_bytes",

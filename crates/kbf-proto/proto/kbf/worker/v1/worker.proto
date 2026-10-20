@@ -39,6 +39,12 @@
 //
 // A server acknowledges a Result only after the state store holds the row that records
 // it; a daemon that keeps the Result until its ack resends it on the next stream.
+//
+// Welcome.protocol_version is the lesser of the Hello's version and the newest the server
+// speaks, when the Hello's is not below the oldest the server accepts (a Hello below it is
+// refused FAILED_PRECONDITION). A Hello in the server's range is answered with its own
+// version, which a daemon of that version requires. A daemon accepts a Welcome from the
+// oldest version it speaks up to the version its Hello named, never above.
 syntax = "proto3";
 
 package kbf.worker.v1;

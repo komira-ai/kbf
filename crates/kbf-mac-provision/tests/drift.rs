@@ -7,8 +7,8 @@ mod support;
 use std::fs;
 
 use support::{
-    COMMERCE, CONFIG, DROPIN, ERR_LOG, FakeMac, HOMES, INTENT, LOGINWINDOW, PLIST, SOFTWARE_UPDATE,
-    VOLUME, XCODE, apply, check, lines, only_fails,
+    COMMERCE, CONFIG, DROPIN, ERR_LOG, FakeMac, HOMES, INTENT, LOGINWINDOW, ORDERS, PLIST,
+    SOFTWARE_UPDATE, UPDATE_DIR, VOLUME, XCODE, apply, check, lines, only_fails,
 };
 
 type Drift = (&'static str, &'static str, fn(&mut FakeMac), &'static str);
@@ -759,6 +759,30 @@ const DRIFTS: &[Drift] = &[
     ),
     (
         "launchd_label",
+        "the installer's state directory's owner",
+        |m| m.own(UPDATE_DIR, 480, 480),
+        "/var/db/kbf-installer is drwxr-xr-x 480 480, want drwxr-xr-x 0 0",
+    ),
+    (
+        "launchd_label",
+        "no order spool",
+        |m| m.remove(ORDERS),
+        "/var/db/kbf-installer/orders is missing, want drwx------ 480 480",
+    ),
+    (
+        "launchd_label",
+        "the order spool root's",
+        |m| m.own(ORDERS, 0, 0),
+        "/var/db/kbf-installer/orders is drwx------ 0 0, want drwx------ 480 480",
+    ),
+    (
+        "launchd_label",
+        "the order spool open to the group",
+        |m| m.chmod(ORDERS, 0o770),
+        "/var/db/kbf-installer/orders is drwxrwx--- 480 480, want drwx------ 480 480",
+    ),
+    (
+        "launchd_label",
         "the log directory's owner",
         |m| m.own("/Library/Logs/kbf", 480, 480),
         "/Library/Logs/kbf is drwxr-xr-x 480 480, want drwxr-xr-x 0 0",
@@ -864,4 +888,32 @@ fn apply_fixes_each_drift_or_leaves_it_and_changes_nothing() {
         })
         .collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Catches: a fix that follows a link at the order spool (the daemon account could point
+/// it at a directory it does not own, and `apply` would make that directory the daemon's
+/// with mode 700), or that leaves the link, so the installer would read the spool the
+/// link names.
+#[test]
+fn an_order_spool_that_is_a_link_is_replaced_not_followed() {
+    let mac = FakeMac::converged("spool-link");
+    let elsewhere = mac.path("/var/db/elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    mac.chmod("/var/db/elsewhere", 0o755);
+    mac.remove(ORDERS);
+    mac.symlink(&elsewhere, ORDERS);
+    let r = check(&mac);
+    assert!(
+        lines(&r, "FAIL")
+            .iter()
+            .any(|l| l.contains("/var/db/kbf-installer/orders is lrwx")),
+        "{}",
+        r.text
+    );
+    let before = support::ls(&mac, "/var/db/elsewhere");
+    let r = apply(&mac);
+    assert_eq!(r.failed, 0, "{}", r.text);
+    assert_eq!(support::ls(&mac, ORDERS), "drwx------ 480 480");
+    assert!(!mac.path(ORDERS).is_symlink());
+    assert_eq!(support::ls(&mac, "/var/db/elsewhere"), before);
 }

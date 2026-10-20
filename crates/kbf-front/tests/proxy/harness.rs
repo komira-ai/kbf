@@ -462,6 +462,7 @@ impl MapSource for Held {
         Some(MapView {
             map: Arc::clone(&self.0),
             previous: None,
+            earlier: Vec::new(),
         })
     }
 
@@ -530,6 +531,7 @@ impl MapSource for Flicker {
         look.is_multiple_of(2).then(|| MapView {
             map: Arc::clone(&self.map),
             previous: None,
+            earlier: Vec::new(),
         })
     }
 

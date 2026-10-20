@@ -14,6 +14,13 @@
 //! and the reason is on the standard error. A child outlives the proxy: a stop of the proxy
 //! signals the proxy alone (`KillMode=process` in `kbf-proxy.service`).
 //!
+//! The start migrates before it runs anything: the installed release is brought to the
+//! `state_schema` it declares on the database `installer.toml` names (`database`, a URL
+//! without a password) before its child starts ([`crate::proxy::supervisor::host_migrator`]).
+//! A frontend host runs on that database, so a file with no usable `database` is refused
+//! (exit 2, `--check` included) rather than started without a migration; the URL is never
+//! quoted, logged or passed in an argument vector.
+//!
 //! This module and the root helper (`helper/`, `run.rs`) share a binary and nothing else:
 //! `kbf-it`'s layering test fails if the root half ever names `kbf_proxy` or this module.
 //!
@@ -24,7 +31,8 @@
 //! refused (exit 2) too. A stop signal drains for at most 5 s; the process ends within
 //! [`STOP_BOUND`] of the first one is seen, whatever the drain is doing, and at once on a
 //! second. SIGTERM and SIGINT are unblocked at start, so a launcher's inherited mask cannot
-//! hide them.
+//! hide them. SIGHUP is held pending from the first line of the verb until its reload handler
+//! is registered, so a reload asked for the moment the unit is active is delivered, not fatal.
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
@@ -44,6 +52,7 @@ use rustix::net::sockopt::socket_acceptconn;
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::cli::ProxyArgs;
+use crate::database::{Database, DatabaseError};
 use crate::exit::Exit;
 use crate::installer_toml::{InstallerToml, MAX_FILE_BYTES};
 use crate::layout::Platform;
@@ -101,18 +110,44 @@ impl VerbError {
 /// Reads `path` and returns its `[proxy]` table, checked: every refusal of `installer.toml`
 /// and of the table itself, and a file with no `[proxy]` table at all.
 pub fn load(path: &Path) -> Result<ProxyConfig, VerbError> {
-    let usage = |why: String| VerbError::Usage(format!("{}: {why}", path.display()));
+    proxy_table(path, &read_config(path)?)
+}
+
+/// The text of the configuration at `path`, at most `MAX_FILE_BYTES`. The verb reads it once:
+/// `--config` may be a pipe, which cannot be read twice.
+fn read_config(path: &Path) -> Result<String, VerbError> {
     let mut text = String::new();
     std::fs::File::open(path)
         .and_then(|file| {
             file.take(MAX_FILE_BYTES as u64 + 1)
                 .read_to_string(&mut text)
         })
-        .map_err(|e| usage(e.to_string()))?;
-    InstallerToml::parse(&text)
+        .map_err(|e| VerbError::Usage(format!("{}: {e}", path.display())))?;
+    Ok(text)
+}
+
+/// The `[proxy]` table of `text`, the configuration read from `path`.
+fn proxy_table(path: &Path, text: &str) -> Result<ProxyConfig, VerbError> {
+    let usage = |why: String| VerbError::Usage(format!("{}: {why}", path.display()));
+    InstallerToml::parse(text)
         .map_err(|e| usage(e.to_string()))?
         .proxy
         .ok_or_else(|| usage("has no [proxy] table".to_owned()))
+}
+
+/// The state database `installer.toml` at `path` names: every host that runs the proxy has
+/// one, so a file without a usable `database` is a usage error, in words that never quote the
+/// URL (the reader's own: a password in it is refused too).
+pub fn state_database(path: &Path) -> Result<Database, VerbError> {
+    database_of(Database::from_installer_toml(path))
+}
+
+fn database_of(found: Result<Database, DatabaseError>) -> Result<Database, VerbError> {
+    found.map_err(|e| {
+        VerbError::Usage(format!(
+            "the proxy needs the state database to migrate before it starts a release: {e}"
+        ))
+    })
 }
 
 /// The one activated socket, or why there is not exactly one. `listen_pid` and `listen_fds`
@@ -208,6 +243,15 @@ struct Stop {
 }
 
 impl Stop {
+    /// The stop the verb runs with: the bound is [`STOP_BOUND`] and the exit is the process's.
+    fn production() -> Arc<Self> {
+        Arc::new(Self {
+            seen: AtomicBool::new(false),
+            bound: STOP_BOUND,
+            exit: std::process::exit,
+        })
+    }
+
     /// A stop signal arrived. `drain` asks the proxy to stop; it runs for the first signal
     /// only. The thread that enforces the bound is returned for a test to join.
     fn signalled(self: &Arc<Self>, drain: impl FnOnce()) -> JoinHandle<()> {
@@ -223,26 +267,54 @@ impl Stop {
     }
 }
 
-/// Unblocks SIGTERM and SIGINT in this thread, and so in the runtime threads created after it:
-/// the signal mask survives `exec`, and a launcher that blocked them would otherwise leave a
-/// verb that no stop signal reaches.
-fn unblock_stop_signals() {
+/// Changes this thread's mask for `signals`: `how` is `SIG_BLOCK` or `SIG_UNBLOCK`.
+fn change_mask(how: libc::c_int, signals: &[libc::c_int]) {
     // SAFETY: `sigemptyset` and `sigaddset` fill a set owned here; `pthread_sigmask` reads it
     // and changes only this thread's mask.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&raw mut set);
-        libc::sigaddset(&raw mut set, libc::SIGTERM);
-        libc::sigaddset(&raw mut set, libc::SIGINT);
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+        for &signal in signals {
+            libc::sigaddset(&raw mut set, signal);
+        }
+        libc::pthread_sigmask(how, &raw const set, std::ptr::null_mut());
     }
+}
+
+/// Unblocks SIGTERM and SIGINT in this thread, and so in the runtime threads created after it:
+/// the signal mask survives `exec`, and a launcher that blocked them would otherwise leave a
+/// verb that no stop signal reaches.
+fn unblock_stop_signals() {
+    change_mask(libc::SIG_UNBLOCK, &[libc::SIGTERM, libc::SIGINT]);
+}
+
+/// Holds SIGHUP pending from the start of the verb until its handler exists
+/// ([`release_reload_signal`]). A reload can be asked for the moment the unit is active
+/// (`ExecReload`), and until a handler is installed SIGHUP's default action ends the process.
+/// A blocked signal is not lost: it is delivered, to the handler, when it is unblocked. The
+/// runtime threads created in between inherit the block; the thread that unblocks is the one
+/// that serves, and it stays alive for as long as the proxy does.
+fn hold_reload_signal() {
+    change_mask(libc::SIG_BLOCK, &[libc::SIGHUP]);
+}
+
+/// Unblocks SIGHUP: call it only once the handler is registered. It also undoes a block the
+/// launcher left in the mask the verb inherited.
+fn release_reload_signal() {
+    change_mask(libc::SIG_UNBLOCK, &[libc::SIGHUP]);
 }
 
 /// Serves on `listener` until a stop signal. The signal handlers are registered before the
 /// proxy serves, so none is lost to the default action.
-fn serve(config: ProxyConfig, listener: OwnedFd, update_dir: &Path) -> Result<(), VerbError> {
+fn serve(
+    config: ProxyConfig,
+    database: Database,
+    listener: OwnedFd,
+    update_dir: &Path,
+) -> Result<(), VerbError> {
     #[cfg(target_os = "linux")]
     let supervise_with = Supervise {
+        database,
         state_dir: config.state_dir.clone(),
         proxy_auth_file: config.proxy_auth_file.clone(),
         upstream: config.upstream,
@@ -250,21 +322,18 @@ fn serve(config: ProxyConfig, listener: OwnedFd, update_dir: &Path) -> Result<()
         status: update_dir.join("status.json"),
     };
     #[cfg(not(target_os = "linux"))]
-    let _ = update_dir;
+    let _ = (database, update_dir);
     unblock_stop_signals();
     let (handle, runner) = Proxy::bind(config, listener).map_err(VerbError::starting)?;
     let runtime = handle.runtime();
-    let (term, int) = runtime.block_on(async {
+    let (term, int, hup) = runtime.block_on(async {
         (
             signal(SignalKind::terminate()),
             signal(SignalKind::interrupt()),
+            signal(SignalKind::hangup()),
         )
     });
-    let stop = Arc::new(Stop {
-        seen: AtomicBool::new(false),
-        bound: STOP_BOUND,
-        exit: std::process::exit,
-    });
+    let stop = Stop::production();
     for mut signals in [term?, int?] {
         let (handle, stop) = (handle.clone(), Arc::clone(&stop));
         runtime.spawn(async move {
@@ -273,6 +342,31 @@ fn serve(config: ProxyConfig, listener: OwnedFd, update_dir: &Path) -> Result<()
             }
         });
     }
+    // SIGHUP re-reads the certificate, key and client CA (`systemctl reload`, which the renew
+    // hook calls). It never stops the proxy: without this handler its default action would
+    // end the process and cut every stream. A failed reload keeps the old files and counts
+    // itself (`kbf_proxy_tls_reload_failed_total`); this verb installs no `tracing`
+    // subscriber, so the one line that says it happened is written here, to the journal. The
+    // reload reads files and parses X.509, so it runs on the blocking pool, not on a runtime
+    // thread; signals that arrive while one runs coalesce, and the reloader runs one at a time.
+    let mut hup = hup?;
+    let reloading = handle.clone();
+    runtime.spawn(async move {
+        while hup.recv().await.is_some() {
+            let handle = reloading.clone();
+            drop(tokio::task::spawn_blocking(move || {
+                let line = match handle.reload_tls() {
+                    Ok(()) => "reloaded the TLS files".to_owned(),
+                    Err(error) => {
+                        format!("TLS files unusable, the previous ones are kept: {error}")
+                    }
+                };
+                let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {line}");
+            }));
+        }
+    });
+    // The handler exists: a SIGHUP held since the start of the verb is delivered now.
+    release_reload_signal();
     // A closed standard error (a journal that went away) must not stop the proxy from serving.
     #[cfg(target_os = "linux")]
     let _supervised = supervise(&handle, supervise_with);
@@ -283,6 +377,8 @@ fn serve(config: ProxyConfig, listener: OwnedFd, update_dir: &Path) -> Result<()
 /// Where the supervisor finds what it reads.
 #[cfg(target_os = "linux")]
 struct Supervise {
+    /// The state database a release is migrated on before its child starts.
+    database: Database,
     state_dir: std::path::PathBuf,
     proxy_auth_file: std::path::PathBuf,
     upstream: kbf_proxy::config::UpstreamTable,
@@ -317,13 +413,8 @@ impl Drop for Supervised {
 #[cfg(target_os = "linux")]
 fn supervise(handle: &kbf_proxy::ProxyHandle, with: Supervise) -> Supervised {
     use crate::layout::Layout;
-    use crate::proxy::boot::{FileReport, Retry};
-    use crate::proxy::child_real::ProcChild;
-    use crate::proxy::model::Timing;
+    use crate::proxy::boot::Retry;
     use crate::proxy::runtime::SystemClock;
-    use crate::proxy::supervisor::{
-        Boot, NoMigration, adopt_children, child_admin, children_dir, frontend_argv,
-    };
 
     let clock = Arc::new(SystemClock::new());
     let (handle, wait) = (handle.clone(), Arc::clone(&clock));
@@ -332,31 +423,55 @@ fn supervise(handle: &kbf_proxy::ProxyHandle, with: Supervise) -> Supervised {
         .spawn(move || {
             let gate = crate::proxy::gate_real::ProxyGate::new(handle.clone());
             let layout = Layout::linux(kbf_host::Root::host());
-            let child = ProcChild::new(
-                layout,
-                children_dir(&with.state_dir),
-                frontend_argv(&with.proxy_auth_file, with.upstream),
-            );
-            let started =
-                child_admin(&handle, with.upstream, with.operator_token_file).map(|admin| {
-                    let report = FileReport::new(&with.state_dir);
-                    let boot = Boot {
-                        admin: &admin,
-                        clock: &*wait,
-                        migrator: &NoMigration,
-                        report: &report,
-                        status: &with.status,
-                        timing: Timing::frontend(),
-                        retry: Retry::boot(),
-                    };
-                    adopt_children(&gate, &child, &with.state_dir, &boot)
-                });
-            let line = startup_line(started);
+            let line = start_children(&handle, &gate, &*wait, layout, with, Retry::boot());
             let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {line}");
             gate
         })
         .ok();
     Supervised { clock, thread }
+}
+
+/// The start itself, over `layout`: the children, the admin client, the migration hook
+/// ([`host_migrator`] on the database of `with`) and the report. What it says is the line
+/// the log gets.
+#[cfg(target_os = "linux")]
+fn start_children(
+    handle: &kbf_proxy::ProxyHandle,
+    gate: &crate::proxy::gate_real::ProxyGate,
+    clock: &dyn crate::proxy::ports::Clock,
+    layout: crate::layout::Layout,
+    with: Supervise,
+    retry: crate::proxy::boot::Retry,
+) -> String {
+    use crate::proxy::boot::FileReport;
+    use crate::proxy::child_real::ProcChild;
+    use crate::proxy::model::Timing;
+    use crate::proxy::root_orders::StatusFile;
+    use crate::proxy::supervisor::{
+        Boot, adopt_children, child_admin, children_dir, frontend_argv, host_migrator,
+    };
+
+    let child = ProcChild::new(
+        layout,
+        children_dir(&with.state_dir),
+        frontend_argv(&with.proxy_auth_file, with.upstream),
+    );
+    let started = child_admin(handle, with.upstream, with.operator_token_file).map(|admin| {
+        let report = FileReport::new(&with.state_dir);
+        let facts = StatusFile::new(&with.status);
+        let migrator = host_migrator(with.database, &facts, &child);
+        let boot = Boot {
+            admin: &admin,
+            clock,
+            migrator: &migrator,
+            report: &report,
+            status: &with.status,
+            timing: Timing::frontend(),
+            retry,
+        };
+        adopt_children(gate, &child, &with.state_dir, &boot)
+    });
+    startup_line(started)
 }
 
 /// What the supervisor tells the log about how the start went.
@@ -380,7 +495,14 @@ fn config_path(args: &ProxyArgs, platform: Platform) -> PathBuf {
 
 /// The verb. With `--check`, the table is loaded and nothing is bound.
 pub fn run(args: &ProxyArgs) -> Result<(), VerbError> {
-    let config = load(&config_path(args, Platform::current()))?;
+    hold_reload_signal();
+    let path = config_path(args, Platform::current());
+    let text = read_config(&path)?;
+    let config = proxy_table(&path, &text)?;
+    let database = database_of(Database::from_installer_text(
+        &path.display().to_string(),
+        &text,
+    ))?;
     if args.check {
         return Ok(());
     }
@@ -392,7 +514,7 @@ pub fn run(args: &ProxyArgs) -> Result<(), VerbError> {
         std::process::id(),
         FIRST_FD,
     )?;
-    serve(config, listener, &args.update_dir)
+    serve(config, database, listener, &args.update_dir)
 }
 
 #[cfg(test)]
