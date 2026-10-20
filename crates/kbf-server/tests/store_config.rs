@@ -396,6 +396,7 @@ async fn a_proxied_identity_is_admitted_by_its_node_and_role_not_by_a_certificat
         Presented::Proxy(Identity {
             node_id: node.map(str::to_owned),
             role,
+            ips: Vec::new(),
         })
     };
 

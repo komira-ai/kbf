@@ -16,7 +16,7 @@
 //! | no | any | any | [`Trust::Direct`]: identity comes from the peer certificate, as before |
 //! | yes | not loopback, or unknown | any | refused ([`Refusal::NotLoopback`]) |
 //! | yes | loopback | absent or wrong | [`Trust::Unverified`]: the certificate, if any, and nothing from the headers |
-//! | yes | loopback | the secret | [`Trust::Proxied`] with the [`Identity`] of `x-kbf-node-id` and `x-kbf-role` (each optional: none is anonymous), or refused ([`Refusal::Malformed`]) |
+//! | yes | loopback | the secret | [`Trust::Proxied`] with the [`Identity`] of `x-kbf-node-id`, `x-kbf-role` and `x-kbf-node-ips` (each optional: none is anonymous), or refused ([`Refusal::Malformed`]) |
 //!
 //! With the flag set the server is behind the proxy, so a call that reaches it from a
 //! remote address is refused (gRPC `UNAUTHENTICATED`, HTTP 403) before anything reads it.
@@ -33,7 +33,7 @@
 //! reads the certificate itself and stays under its own mutual TLS.
 
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -42,7 +42,7 @@ use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 use futures::future::{Either, Ready, ready};
-use kbf_peer::PeerRole;
+use kbf_peer::{PeerRole, parse_node_ips};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq;
 use tonic::Status;
@@ -60,6 +60,9 @@ pub const PROXY_AUTH: &str = "x-kbf-proxy-auth";
 pub const NODE_ID: &str = "x-kbf-node-id";
 /// The header carrying the role a verified certificate names.
 pub const ROLE: &str = "x-kbf-role";
+/// The header carrying the IP addresses of the verified leaf certificate (comma separated
+/// canonical text, see [`kbf_peer::parse_node_ips`]).
+pub const NODE_IPS: &str = "x-kbf-node-ips";
 /// What every header the server reserves for itself starts with.
 const RESERVED: &str = "x-kbf-";
 
@@ -133,6 +136,9 @@ pub struct Identity {
     pub node_id: Option<String>,
     /// From `x-kbf-role`.
     pub role: Option<PeerRole>,
+    /// From `x-kbf-node-ips`: the IP addresses of the leaf the proxy verified; empty when
+    /// the header is absent.
+    pub ips: Vec<IpAddr>,
 }
 
 /// How far a call's identity headers are to be believed. The layers put it in the request's
@@ -202,6 +208,10 @@ pub fn classify(
         role: single(headers, ROLE)?
             .map(|name| PeerRole::from_name(name).ok_or(Refusal::Malformed(ROLE)))
             .transpose()?,
+        ips: single(headers, NODE_IPS)?
+            .map(|text| parse_node_ips(text).map_err(|_| Refusal::Malformed(NODE_IPS)))
+            .transpose()?
+            .unwrap_or_default(),
     }))
 }
 

@@ -16,6 +16,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use super::*;
 
@@ -47,6 +48,13 @@ struct Fake {
     denied: Vec<String>,
     /// Whether [`Fake::late`] comes back after each move: a cgroup that never empties.
     respawn: bool,
+    /// An exiting thread: the cgroup stays populated while `cgroup.procs` lists nothing
+    /// (the kernel skips a task that has begun exit when it moves a process, and the
+    /// task leaves its cgroup only at the end of exit). Enabling controllers in the
+    /// cgroup is EBUSY this many more times, then works.
+    exiting: RefCell<Option<(String, u32)>>,
+    /// Every pause asked for; none is waited.
+    pauses: RefCell<Vec<Duration>>,
 }
 
 fn parent(cgroup: &str) -> &str {
@@ -216,7 +224,14 @@ impl CgroupFs for Fake {
                         .procs
                         .push(pid);
                 }
-                if cgroup != "/" && !self.procs(cgroup).is_empty() {
+                let exiting = match self.exiting.borrow_mut().as_mut() {
+                    Some((at, left)) if at == cgroup && *left > 0 => {
+                        *left -= 1;
+                        true
+                    }
+                    _ => false,
+                };
+                if exiting || (cgroup != "/" && !self.procs(cgroup).is_empty()) {
                     return Err(errno(rustix::io::Errno::BUSY));
                 }
                 let offered = self.controllers(cgroup);
@@ -266,6 +281,10 @@ impl CgroupFs for Fake {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         Ok(())
+    }
+
+    fn pause(&self, how_long: Duration) {
+        self.pauses.borrow_mut().push(how_long);
     }
 
     fn path(&self, cgroup: &str, file: &str) -> PathBuf {
@@ -497,6 +516,28 @@ fn hosts_and_units_that_cannot_delegate_are_refused_with_the_fix() {
     );
 }
 
+/// Catches the set-up giving up on a cgroup that is still populated by a thread that
+/// has begun to exit: `cgroup.procs` lists nothing, the kernel answers EBUSY until the
+/// thread has left, and that takes longer than a fixed number of immediate tries (a
+/// test binary's second test thread ends as the daemon's set-up starts).
+#[test]
+fn a_cgroup_held_by_an_exiting_thread_is_waited_for() {
+    let fake = Fake::host(UNIT, "cpu memory pids", &[41]);
+    *fake.exiting.borrow_mut() = Some((UNIT.into(), 25));
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    assert_eq!(fake.procs(UNIT), Vec::<u32>::new());
+    assert!(!fake.enabled(UNIT).is_empty(), "{:?}", fake.log());
+    // One pause per refusal, none before the first try.
+    assert_eq!(fake.pauses.borrow().len(), 25);
+}
+
+/// Catches the real mount's pause being a different call than the fake's: it returns
+/// (a zero pause), so the set-up on a real host waits through the same method.
+#[test]
+fn the_mounts_pause_returns() {
+    Mount(Path::new("/sys/fs/cgroup")).pause(Duration::ZERO);
+}
+
 /// Catches a failed move or enable read as done (leases would then fail making their
 /// cgroups), and a cgroup that never empties retried forever: each is an error naming
 /// the file, after a bounded number of tries.
@@ -529,8 +570,14 @@ fn a_move_or_enable_that_fails_stops_the_start() {
         err.contains(&format!("enable controllers in /sys/fs/cgroup{UNIT}")),
         "{err}"
     );
+    // Every refusal was followed by a pause and a new listing and move (the process
+    // that appeared is moved on the next try), until the pauses add up to the bound.
+    let pauses = busy.pauses.borrow();
     let moves = busy.log().iter().filter(|l| l.ends_with("<- 43")).count();
-    assert_eq!(moves, MOVE_TRIES as usize - 1, "{:?}", busy.log());
+    assert_eq!(moves, pauses.len(), "{:?}", busy.log());
+    assert!(pauses.iter().sum::<Duration>() >= MOVE_PAUSE_TOTAL);
+    assert!(pauses.windows(2).all(|w| w[0] <= w[1]));
+    assert!(pauses.iter().all(|p| *p <= MOVE_PAUSE_MAX));
 }
 
 /// Catches `--cgroup-parent` taken without a check (every lease would fail making its
