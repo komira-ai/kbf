@@ -1052,6 +1052,17 @@ fn child_command(args: &[&str]) -> std::process::Command {
             });
         }
     }
+    // No `close_range` here: every descriptor from 3 up is marked close-on-exec instead (the
+    // macOS test harness hands its children some, which the child rightly refuses).
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: the closure runs between fork and exec and makes only `sysconf` and `fcntl`
+        // calls.
+        unsafe {
+            command.pre_exec(|| kbf_testkit::reaped::cloexec_from(3));
+        }
+    }
     command
 }
 

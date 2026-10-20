@@ -100,7 +100,7 @@ pub use crate::cache::{
     MAX_ADMISSION_BYTES, MAX_DECODED_BLOB_BYTES, NEEDS_V3, ObjectKeys, PASS_OPENS_PER_SEC,
     PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, PoolConfig, READ_WINDOW_BYTES, RebuildConfig,
     RebuildReport, RecordStream, STREAM_WINDOW_BYTES, StreamedRecord, TailReport, TailState,
-    TierStartError, TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
+    TierHealth, TierStartError, TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;

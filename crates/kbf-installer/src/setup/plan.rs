@@ -34,16 +34,11 @@ pub const PROXY_UNITS: &[&str] = &["kbf-proxy.socket", "kbf-proxy.service"];
 /// The frontend instance a host without the proxy runs.
 const FRONTEND_UNIT: &str = "kbf-frontend.service";
 pub const INSTALLER_UNIT: &str = "kbf-installer.service";
-/// The daily backup of the state database (`kbf-backup.service` is what it starts): enabled on
-/// the modes that keep their state in Postgres, started with them when `--no-start` is absent
-/// (the schema it dumps is made earlier in the same run).
-pub const BACKUP_TIMER: &str = "kbf-backup.timer";
-/// The unit the timer starts, and the drop-in that gives it its `User=` and state directory: the package's file
-/// carries neither, and its `AssertPathExists=` on this drop-in fails it rather than run as
-/// root where setup has not written it.
-pub const BACKUP_SERVICE_DIR: &str = "/etc/systemd/system/kbf-backup.service.d";
-pub const BACKUP_USER_DROPIN: &str =
-    "/etc/systemd/system/kbf-backup.service.d/10-service-user.conf";
+/// The timer, and the drop-in of the service it started, that an earlier build's setup wrote
+/// (a daily `pg_dump`): setup removes them from a host that has them.
+const OLD_BACKUP_TIMER: &str = "kbf-backup.timer";
+const OLD_BACKUP_DROPIN_DIR: &str = "/etc/systemd/system/kbf-backup.service.d";
+const OLD_BACKUP_DROPIN: &str = "/etc/systemd/system/kbf-backup.service.d/10-service-user.conf";
 /// The longest token file setup reads.
 const MAX_TOKEN_BYTES: u64 = 4096;
 
@@ -96,26 +91,6 @@ pub(crate) fn service_user_name(mode: Mode) -> &'static str {
         Mode::Frontend | Mode::Storage => "kbf-server",
         Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne => "kbf",
     }
-}
-
-/// The state directory under `/var/lib` the backup unit of a mode makes: the one the mode's
-/// own unit makes (the frontend's `kbf-server`, the all-in-one unit's `kbf`), so the backups
-/// sit in the directory of the user that owns them and no stray directory is made.
-fn backup_state_dir(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Frontend | Mode::Storage => "kbf-server",
-        Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne => "kbf",
-    }
-}
-
-/// The drop-in text that makes `kbf-backup.service` run as `user`, the mode's service user (the
-/// one `service_user_name` names), with the mode's state directory `state`: `StateDirectory=`
-/// and the verb's `--dir` are set together, since the packaged unit carries the frontend's.
-/// The names are a fixed set, so nothing here needs escaping.
-pub fn backup_user_dropin(user: &str, state: &str) -> String {
-    format!(
-        "# Written by `kbf-installer setup`: the user the backup runs as and the state directory it\n# writes to, those of the mode's own unit. The package's kbf-backup.service carries neither.\n[Service]\nUser={user}\nStateDirectory=\nStateDirectory={state}\nExecStart=\nExecStart=/usr/bin/kbf-installer --apply backup --dir /var/lib/{state}/backups\n"
-    )
 }
 
 /// Whether the host runs actions in containers: it then needs a subid range and lingering.
@@ -658,6 +633,36 @@ pub fn after_release(
     })
 }
 
+/// What an earlier build's setup left of its daily database backup: the timer it enabled and the
+/// drop-in (and its directory) that gave the backup unit its user. Backups of Postgres are the
+/// operator's, so this setup disables the timer and removes the drop-in. Plans nothing on a host
+/// that never had them. Returns whether a unit definition changed, which needs a reload.
+fn remove_old_backup_timer(
+    p: &mut Pl<'_, '_>,
+    os: &dyn Os,
+    notes: &mut Vec<String>,
+) -> Result<bool, SetupError> {
+    let enabled = os.unit_enabled(OLD_BACKUP_TIMER)?;
+    if enabled {
+        p.run(
+            Cmd::new(hp(SYSTEMCTL)?)
+                .arg("disable")
+                .arg("--now")
+                .arg("--")
+                .arg(OLD_BACKUP_TIMER),
+        );
+    }
+    // The file first: the directory is removed only when empty.
+    let dropin = p.absent(hp(OLD_BACKUP_DROPIN)?)?;
+    let dir = p.absent(hp(OLD_BACKUP_DROPIN_DIR)?)?;
+    if enabled || dropin || dir {
+        notes.push(format!(
+            "{OLD_BACKUP_TIMER} (the database backup an earlier setup enabled) is disabled and its drop-in removed: kbf no longer backs up Postgres, which is the operator's"
+        ));
+    }
+    Ok(dropin || dir)
+}
+
 fn units(
     p: &mut Pl<'_, '_>,
     os: &dyn Os,
@@ -734,38 +739,15 @@ fn units(
                     "{FRONTEND_UNIT} is enabled and the proxy starts the frontend itself: setup does not stop or disable it; do both (systemctl disable --now) before starting the proxy, since the two never run together"
                 ));
             }
-            // The backup runs as the service user, written before the timer is enabled.
-            let mut dropin_changed = false;
-            if v.mode.keeps_state_in_database() {
-                // The name is the one the frontend unit runs as: `service_user_name`, a fixed set.
-                let user = service_user_name(v.mode);
-                dir(p, BACKUP_SERVICE_DIR, 0o755, ctx.root)?;
-                let state = backup_state_dir(v.mode);
-                let changed = file(
-                    p,
-                    BACKUP_USER_DROPIN,
-                    0o644,
-                    ctx.root,
-                    backup_user_dropin(user, state).into_bytes(),
-                )?;
-                // systemd keeps the old definition of a unit until a reload: a drop-in that is
-                // new or changed (a mode change) on a timer that is enabled already needs one
-                // (`systemctl enable` does its own, so a timer enabled below needs none).
-                dropin_changed = changed;
-            }
-            let backup = v
-                .mode
-                .keeps_state_in_database()
-                .then_some((BACKUP_TIMER, !no_start));
+            let backup_gone = remove_old_backup_timer(p, os, &mut notes)?;
             let wanted = mode_units(v.mode, v.proxy.is_some())
                 .iter()
                 .map(|u| (*u, start_mode))
-                .chain(backup)
                 .chain([(INSTALLER_UNIT, !no_start)]);
             // A unit file was taken out of `/etc/systemd/system`: systemd reads the packaged
             // unit of that name from the next reload, and it is enabled whatever was said of
             // the old file (the enable symlink of the old file named the same unit).
-            if !retired.is_empty() || (dropin_changed && os.unit_enabled(BACKUP_TIMER)?) {
+            if !retired.is_empty() || backup_gone {
                 p.run(Cmd::new(hp(SYSTEMCTL)?).arg("daemon-reload"));
             }
             for (unit, now) in wanted {

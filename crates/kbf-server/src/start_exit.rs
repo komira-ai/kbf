@@ -113,8 +113,8 @@ pub fn said(name: &str, e: &(dyn Error + 'static)) -> String {
 pub const STALE_WRITER_HINT: &str = "the frontend's state store is older than this node's \
     metadata log (was it restored from a backup?): the node exits 75, systemd starts it \
     again and each start takes the next boot, so it opens once its boot is past the log's; \
-    wait, do not wipe --meta-dir (docs/deploy/kbf-modes.md, \"After restoring the frontend's \
-    state store\")";
+    wait, do not wipe --meta-dir (docs/deploy/kbf-units.md, \"Exit 2 and exit 75: what \
+    systemd restarts\")";
 
 fn stale_writer(e: &(dyn Error + 'static)) -> bool {
     // `CacheError::StaleWriter` is `transparent`: the source chain does not name the

@@ -52,6 +52,7 @@ fn raw(mode: Mode) -> Raw {
         kbf: serving_flags(mode),
         proxy: Default::default(),
         create_local_database: false,
+        deploy: Default::default(),
         installer_config: None,
     }
 }
@@ -750,15 +751,9 @@ fn each_mode_enables_its_own_units() {
         } else {
             " --now"
         };
-        // The modes that keep their state in Postgres also get the backup timer, started
-        // (the schema it dumps is made before the units are enabled).
-        let backup = mode
-            .keeps_state_in_database()
-            .then(|| "run /usr/bin/systemctl enable --now -- kbf-backup.timer".to_owned());
         let expected: Vec<String> = units
             .iter()
             .map(|u| format!("run /usr/bin/systemctl enable{now} -- {u}"))
-            .chain(backup)
             .chain(["run /usr/bin/systemctl enable --now -- kbf-installer.service".to_owned()])
             .collect();
         assert_eq!(enables, expected, "{mode:?}");
@@ -1216,6 +1211,7 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         kbf: super::kbf_settings::KbfFlags::default(),
         proxy: Default::default(),
         create_local_database: false,
+        deploy: Default::default(),
         installer_config: Some("/tmp/i.toml".to_owned()),
     };
     let mut exec = host();
@@ -1747,6 +1743,8 @@ fn a_view_forwards_reads_and_refuses_steps() {
 #[path = "more_tests.rs"]
 mod more;
 
+#[path = "deploy_config_tests.rs"]
+mod deploy_config_tests;
 #[path = "kbf_settings_tests.rs"]
 mod kbf_settings_tests;
 #[path = "provision_tests.rs"]
@@ -1758,8 +1756,8 @@ mod proxy_tests;
 #[path = "proxy_listen_tests.rs"]
 mod proxy_listen;
 
-#[path = "backup_dropin_tests.rs"]
-mod backup_dropin;
+#[path = "old_backup_tests.rs"]
+mod old_backup;
 
 /// Catches the journal's `kit` flag not reaching the `kbf.toml` decision: on the same Mac with
 /// the same kit file, a finished kit migration (`DoneKit`) lets setup add its keys and keep the

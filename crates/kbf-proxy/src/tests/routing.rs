@@ -358,6 +358,7 @@ async fn inbound_identity_headers_never_reach_the_child() {
                 ("x-kbf-node-id", "an-impostor"),
                 ("x-kbf-role", "daemon"),
                 ("x-kbf-proxy-auth", "guess"),
+                ("x-kbf-client-addr", "203.0.113.66"),
                 ("x-trace", "kept"),
             ],
         )
@@ -374,8 +375,19 @@ async fn inbound_identity_headers_never_reach_the_child() {
         .collect();
     assert_eq!(
         reserved.len(),
+        2,
+        "nothing the client forged survives; only the proxy's secret and its reading of the \
+         client's address are set: {reserved:?}"
+    );
+    assert_eq!(
+        seen[0].get_all("x-kbf-client-addr").iter().count(),
         1,
-        "nothing the client forged survives, and only the proxy's own secret is set: {reserved:?}"
+        "one value"
+    );
+    assert_eq!(
+        seen[0].get("x-kbf-client-addr").map(HeaderValue::as_bytes),
+        Some(super::kit::CLIENT_IP.to_string().as_bytes()),
+        "the connection's address, not the forged one"
     );
     assert_eq!(
         seen[0].get("x-kbf-proxy-auth").map(HeaderValue::as_bytes),
