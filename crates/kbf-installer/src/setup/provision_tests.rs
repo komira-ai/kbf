@@ -983,3 +983,51 @@ fn an_empty_role_or_database_name_is_refused() {
         no_names(&problems);
     }
 }
+
+/// A writer that refuses what holds `needle`: the operator's pipe closing mid-run.
+struct Closes(&'static str);
+
+impl std::io::Write for Closes {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if String::from_utf8_lossy(buf).contains(self.0) {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Catches a closed output being lost: a line setup cannot print about the database (the
+/// dry run's "does not exist yet", a step it is about to run, a step it only plans) stops
+/// setup with an error instead of going on unseen.
+///
+/// Mutant seen red: any of the three `?` dropped from its `writeln!`.
+#[test]
+fn a_closed_output_stops_setup_at_each_database_line() {
+    for (needle, options) in [
+        ("database step: dry run", DRY),
+        ("create the login role", APPLY),
+        ("create the login role", DRY),
+    ] {
+        let world = Shared::default();
+        let mut exec = exec_on(&world);
+        let server = Server::fresh();
+        let backend = Backend {
+            releases: &Unwired,
+            schemas: &server,
+        };
+        let result = run(
+            &linux(),
+            &mut exec,
+            &backend,
+            &flags(),
+            options,
+            &mut Closes(needle),
+        );
+        let err = result.expect_err(needle);
+        assert!(matches!(err, SetupError::Io(_)), "{needle}: {err}");
+    }
+}
