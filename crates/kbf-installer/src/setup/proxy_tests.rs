@@ -7,7 +7,7 @@
 use super::*;
 use crate::installer_toml::InstallerToml;
 use crate::setup::kbf_settings::KbfFlags;
-use crate::setup::proxy::{AuthFlag, DEFAULT_BASE_PORT, ProxyFlags};
+use crate::setup::proxy::{AuthFlag, DEFAULT_BASE_PORT, ProxyFlags, ProxyPlan, leftover_tls_keys};
 
 /// The `installer.toml` of a proxy host with every flag at its default: a file that decodes
 /// with `InstallerToml::parse` and renders back to itself.
@@ -622,6 +622,65 @@ fn the_buck2_policy_reaches_the_table() {
         .proxy
         .expect("table");
     assert_eq!(table.upstream.base_port, 19_000);
+}
+
+/// Catches `--buck2-auth mtls` lost on the way to the file (the third spelling of the flag).
+#[test]
+fn mtls_reaches_the_table() {
+    let mut raw = proxy_raw();
+    raw.proxy.buck2_auth = Some(AuthFlag::Mtls);
+    let mut exec = proxy_host();
+    go_ok(&FakeOs::linux(), &mut exec, &raw);
+    let file = text(&exec, INSTALLER_TOML);
+    assert!(file.contains("buck2_auth = \"mtls\"\n"), "{file}");
+}
+
+/// Catches a `kbf.toml` that does not parse, or has no `[tls]` table, counted as holding
+/// the children's TLS keys: neither has any (the `kbf.toml` check refuses the first by
+/// itself), while a table with one names it.
+#[test]
+fn leftover_tls_keys_are_only_the_ones_in_a_tls_table() {
+    assert!(leftover_tls_keys("not [ toml").is_empty());
+    assert!(leftover_tls_keys("mode = \"frontend\"\n").is_empty());
+    assert_eq!(
+        leftover_tls_keys("[tls]\nworker-tls-key = \"/k\"\n"),
+        ["worker-tls-key"]
+    );
+}
+
+/// Catches `merge` trusting a plan the proxy would refuse: a plan built by hand with bearer
+/// and no key file is an error naming the flag, not a table.
+#[test]
+fn a_plan_the_proxy_would_refuse_is_not_merged() {
+    let plan = ProxyPlan {
+        base_port: DEFAULT_BASE_PORT,
+        buck2_auth: kbf_proxy::auth::Buck2Auth::Bearer,
+        buck2_token_file: None,
+        server_cert: "/etc/kbf/reapi.pem".to_owned(),
+        server_key: "/etc/kbf/reapi.key".to_owned(),
+        client_ca: "/etc/kbf/ca.pem".to_owned(),
+    };
+    let err = plan.merge(None).expect_err("refused");
+    assert!(err.to_string().contains("--proxy"), "{err}");
+}
+
+/// Catches a list of one certificate that is not marked `default` being taken for a different
+/// certificate than the flags' pair: it is the default (the only one), so a rerun with its
+/// files keeps the file byte for byte.
+#[test]
+fn the_only_entry_of_a_server_cert_list_is_the_default() {
+    let one = sni_list();
+    let a = one
+        .find("\n[[proxy.server_cert]]\nnames = [\"a.example\"]")
+        .expect("second entry");
+    let end = one.find("\n[proxy.upstream]").expect("upstream");
+    let there = format!("{}{}", &one[..a], &one[end..])
+        .replace("names = []\n", "names = [\"b.example\"]\n")
+        .replace("default = true\n", "");
+    let mut exec = proxy_host();
+    put(&mut exec, INSTALLER_TOML, 0o644, ROOT, &there);
+    go_ok(&FakeOs::linux(), &mut exec, &proxy_raw());
+    assert_eq!(text(&exec, INSTALLER_TOML), there);
 }
 
 /// Catches the proxy's files going unchecked: a key the service user does not own, or a
