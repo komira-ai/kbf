@@ -429,6 +429,11 @@ are the frontend's, so a denied storage node can still register and beat through
 that predates them. A frontend that predates the list copies it forward in the map
 unchanged.
 
+## `GET /v1/leases` and `GET /v1/queue`
+
+The leases the scheduler holds and the operations waiting for one: open reads, in memory,
+unredacted. Written up in [api-scheduler.md](api-scheduler.md).
+
 ## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
 
 Draining the frontend itself, for a rollout that restarts it (the nodes are drained

@@ -32,7 +32,7 @@ route stays local, and the last column says why.
 Every row is one method and one path. A router `.route(` call that serves two methods has a row
 per method; a custom method (`:cordon`) has a row per verb. The sources of the router are
 `crates/kbf-server/src/{api,release/http,storage_health,health,metrics,http_blobs,
-http_invocations,http_history,enroll/api,managed/http}.rs` and `frontend.rs`, where they are merged.
+http_invocations,http_sched,http_history,enroll/api,managed/http}.rs` and `frontend.rs`, where they are merged.
 
 ### Cluster
 
@@ -40,6 +40,8 @@ http_invocations,http_history,enroll/api,managed/http}.rs` and `frontend.rs`, wh
 |---|---|---|---|
 | cluster status (nodes, software, placement) | `GET /v1/nodes` | [F] | open |
 | list members of the storage map | `GET /v1/members` | [F] | open |
+| leases the scheduler holds (paged, by node) | `GET /v1/leases` | [F] | open |
+| the queue: depth, ages, why work waits | `GET /v1/queue` | [F] | open |
 | cordon a node | `POST /v1/nodes/{node}:cordon` | [F] | write |
 | drain a node | `POST /v1/nodes/{node}:drain` | [F] | write |
 | uncordon a node | `POST /v1/nodes/{node}:uncordon` | [F] | write |
