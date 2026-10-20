@@ -1346,13 +1346,16 @@ dependencies = [
  "kbf-daemon",
  "kbf-driver-container",
  "kbf-front",
+ "kbf-harness",
  "kbf-meta",
  "kbf-node",
  "kbf-objstore",
+ "kbf-outputs",
  "kbf-proto",
  "kbf-segments",
  "kbf-server",
  "kbf-storage",
+ "kbf-testkit",
  "kbf-threads",
  "kbf-transfer",
  "kbf-types",
@@ -1484,6 +1487,7 @@ dependencies = [
  "kbf-driver-container",
  "kbf-enroll",
  "kbf-front",
+ "kbf-harness",
  "kbf-host",
  "kbf-installer",
  "kbf-node",
@@ -1751,6 +1755,25 @@ dependencies = [
  "libc",
  "subtle",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-harness"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "flate2",
+ "kbf-deploy",
+ "kbf-it",
+ "kbf-testkit",
+ "kbf-transfer",
+ "libc",
+ "rcgen",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
 ]
 
 [[package]]

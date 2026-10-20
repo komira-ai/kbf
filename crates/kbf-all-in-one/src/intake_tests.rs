@@ -161,6 +161,7 @@ fn one_digest_is_stored_once_and_an_unfinished_file_not_at_all() {
 /// as a stream, with a write tier and without one, however large.
 #[test]
 fn a_large_file_is_always_taken() {
+    let dir = scratch("intake-large");
     assert_eq!(MAX_UNSTAGED_BLOB_BYTES, 16 << 20);
     let server = server();
     let taking = Taking::new(plane(&server));
@@ -170,7 +171,7 @@ fn a_large_file_is_always_taken() {
     server
         .block_on(taking.finish())
         .expect("both withdrawn, unfinished");
-    let (plane, _handle) = tiered(&server, "intake-large");
+    let (plane, _handle) = tiered(&server, &dir);
     let taking = Taking::new(plane);
     assert!(taking.file(MAX_UNSTAGED_BLOB_BYTES + 1).is_some());
     assert!(taking.file((5 << 30) + 1).is_some());
@@ -196,28 +197,26 @@ fn a_server_half_that_is_gone_fails_the_finish() {
     );
 }
 
-/// A fresh scratch directory for one unit test, beside the test binary.
-fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::current_exe()
+/// A fresh scratch directory for one unit test, beside the test binary, removed when it
+/// drops. (Not `one_cache::under_target`: this module builds off Linux too.)
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    let beside = std::env::current_exe()
         .expect("test binary")
         .parent()
         .expect("deps directory")
-        .join("kbf-all-in-one-unit")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+        .join("kbf-all-in-one-unit");
+    kbf_testkit::dir::TestDir::under(beside, name)
 }
 
 /// The plane over a server started on `server` as `kbf-server` starts one, with a write
-/// tier (a hot store) under a scratch directory `name`; the server's handle, which must
-/// outlive the plane's calls.
+/// tier (a hot store) under `dir`, which the caller binds before the runtime, so it is
+/// removed after the server is gone; the server's handle, which must outlive the plane's
+/// calls.
 fn tiered(
     server: &tokio::runtime::Runtime,
-    name: &str,
+    dir: &std::path::Path,
 ) -> (LocalDataPlane, kbf_server::ServerHandle) {
     use clap::Parser as _;
-    let dir = scratch(name);
     let args = kbf_server::Args::try_parse_from([
         "kbf-server".to_owned(),
         "--listen=127.0.0.1:0".to_owned(),
@@ -257,8 +256,9 @@ fn patterned(seed: u8, len: usize) -> Vec<u8> {
 /// are not committed again; both walks finish cleanly.
 #[test]
 fn a_large_file_streams_onto_the_tier_and_is_stored_once() {
+    let dir = scratch("intake-stream");
     let server = server();
-    let (plane, _handle) = tiered(&server, "intake-stream");
+    let (plane, _handle) = tiered(&server, &dir);
     let bytes = patterned(
         1,
         usize::try_from(MAX_UNSTAGED_BLOB_BYTES + 1).expect("size"),
@@ -286,8 +286,9 @@ fn a_large_file_streams_onto_the_tier_and_is_stored_once() {
 /// the server's check skipped).
 #[test]
 fn a_streamed_file_that_ends_wrong_fails_the_finish() {
+    let dir = scratch("intake-stream-wrong");
     let server = server();
-    let (plane, _handle) = tiered(&server, "intake-stream-wrong");
+    let (plane, _handle) = tiered(&server, &dir);
     let size = usize::try_from(MAX_UNSTAGED_BLOB_BYTES + 1).expect("size");
     let bytes = patterned(2, size + 1);
     let mut hasher = RecordHasher::new();
