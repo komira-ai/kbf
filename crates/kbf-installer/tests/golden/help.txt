@@ -62,7 +62,9 @@ Options:
       --token-file <TOKEN_FILE>
           The enrollment token (a file of mode 0600 or tighter); setup keeps a copy that only kbf reads. For the modes that enroll
       --database <DATABASE>
-          The state database, as postgres:///NAME?host=SOCKET_DIR (no password). Required for `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. The server, the database and the role exist before setup runs
+          The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password). Required for `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. The server exists before setup runs, and so do the role and the database unless --create-local-database makes them
+      --create-local-database
+          For a host whose Postgres runs locally: create the login role and the database the `--database` URL names (owned by the role, no password), as the server's superuser over its Unix socket (peer authentication, no password), if they are not there. Never edits `pg_hba.conf`; refuses, saying which rule to add, when the server does not admit the login. Without it, setup only checks that it can log in
       --no-start
           Enable the units without starting them
       --listen <LISTEN>

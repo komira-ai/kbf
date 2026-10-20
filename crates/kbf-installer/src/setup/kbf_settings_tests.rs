@@ -399,7 +399,7 @@ fn a_key_this_run_has_no_flag_for_is_not_dropped_by_a_rewrite() {
     assert_eq!(text(&exec, KBF_TOML), FRONTEND_GOLDEN);
 
     let mut other = raw.clone();
-    other.database = Some("postgres:///other?host=/run/postgresql".to_owned());
+    other.database = Some("postgres:///other?host=/run/postgresql&user=kbf-server".to_owned());
     let err = go(&FakeOs::linux(), &mut exec, &other, APPLY).expect_err("refused");
     assert_eq!(err.exit(), Exit::NeedsOperator);
     assert!(err.to_string().contains("[scheduler] state-store"), "{err}");

@@ -662,6 +662,29 @@ fn no_dependency_of_either_package_names_envoy() {
     }
 }
 
+/// The package suggests a Postgres server and does not depend on it: node hosts never use
+/// one, and apt installs `Recommends` by default, which would start a database on every node.
+/// Catches Postgres moving into `depends` (every node gets a server) and the hint vanishing
+/// (the frontend operator is not told what to install).
+#[test]
+fn postgres_is_suggested_not_required() {
+    for dep in DEB_DEPENDS.iter().chain(RPM_DEPENDS.iter()) {
+        assert!(!dep.to_lowercase().contains("postgres"), "{dep}");
+    }
+    let cfg = config(&[], Platform::LinuxX86_64, "0.0.0+ci");
+    let top: Vec<&str> = cfg.lines().collect();
+    let at = |key: &str| top.iter().position(|l| *l == key).expect(key);
+    assert!(
+        top[at("suggests:") + 1].contains("\"postgresql\""),
+        "the deb suggests postgresql: {cfg}"
+    );
+    assert!(
+        cfg.contains("    suggests:\n      - \"postgresql-server\"\n"),
+        "the rpm suggests postgresql-server: {cfg}"
+    );
+    assert!(!cfg.contains("recommends"), "{cfg}");
+}
+
 /// The slice and the `kbf-*.timer` files (the backup timer) are the units that are not
 /// services; any other name is still refused, and a timer not named `kbf-` is too.
 ///

@@ -488,3 +488,78 @@ fn the_child_makes_itself_not_dumpable() {
     assert_eq!(after, 0);
     assert_eq!(dumpable(), before, "put back");
 }
+
+/// A description is asked for by the same child as a component, so the same rules come before a
+/// process or a file: a source that is not a plain https URL is refused, and a child that would be
+/// root is refused before the node's key is read (here the files are not there, and the refusal
+/// is still the root one).
+///
+/// Catches the description's call left out of either check (a host's key read and lent to a child
+/// that is not going to start, or a request to a source the settings would not have named).
+///
+/// Mutants: the `refuse_root` call removed from `describe_release` (the error is then the missing
+/// file); the `check_source` call removed (the error is then the child that cannot start).
+#[test]
+fn a_description_is_refused_for_the_same_reasons_before_anything_starts() {
+    use crate::testkit::A;
+    let commit = CommitId::new(A).expect("commit");
+    let platform = ReleasePlatform::LinuxX86_64;
+    let plain_http = Source::Url {
+        base: "http://mirror.example".to_owned(),
+        ca_file: None,
+    };
+    let got = describe_release(&nowhere(), &plain_http, limits(), &commit, platform);
+    assert!(matches!(got, Err(FetchError::Source(..))), "{got:?}");
+
+    let frontend = Source::Frontend(FrontendSource {
+        url: "https://front.example:9000".to_owned(),
+        ca_file: "/nonexistent/ca.pem".into(),
+        node_cert: "/nonexistent/cert.pem".into(),
+        node_key: "/nonexistent/key.pem".into(),
+    });
+    let root = ChildProgram {
+        program: PathBuf::from("/nonexistent/kbf-installer"),
+        run_as: Some(RunAs { uid: 0, gid: 0 }),
+    };
+    let got = describe_release(&root, &frontend, limits(), &commit, platform);
+    assert!(
+        matches!(
+            got,
+            Err(FetchError::Pipe(PipeFault::Root { uid: 0, gid: 0 }))
+        ),
+        "{got:?}"
+    );
+}
+
+/// A description lends the node's identity to a `frontend` source's child as a component does,
+/// and an identity that cannot be read is the identity's fault, before any child exists (the
+/// program here does not, so a check that lets it through would be a `Spawn`).
+///
+/// Catches the identity's fault lost or turned into another (a child started without the
+/// identity it was to be lent), in the describe path as in the component path.
+///
+/// Mutant: `lend_identity` skipped in `describe_release` (red: the child cannot start).
+#[test]
+fn a_description_needs_the_nodes_identity_before_a_child_exists() {
+    use crate::testkit::A;
+    let commit = CommitId::new(A).expect("commit");
+    let frontend = Source::Frontend(FrontendSource {
+        url: "https://front.example:9000".to_owned(),
+        ca_file: "/nonexistent/ca.pem".into(),
+        node_cert: "/nonexistent/cert.pem".into(),
+        node_key: "/nonexistent/key.pem".into(),
+    });
+    let child = ChildProgram {
+        program: PathBuf::from("/nonexistent/kbf-installer"),
+        run_as: Some(RunAs { uid: 7, gid: 7 }),
+    };
+    let got = describe_release(
+        &child,
+        &frontend,
+        limits(),
+        &commit,
+        ReleasePlatform::LinuxX86_64,
+    );
+    assert!(matches!(got, Err(FetchError::Identity(_))), "{got:?}");
+    assert_eq!(got.unwrap_err().word(), "fetch");
+}

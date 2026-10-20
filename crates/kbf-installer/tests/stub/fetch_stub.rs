@@ -4,6 +4,9 @@
 //!
 //! - `emit:TEXT` write TEXT to standard output; `err:TEXT` to standard error;
 //! - `copy:PATH` write the file PATH to standard output; `head:N:PATH` its first N bytes;
+//! - `serve:DIR` (as `fetch-child` only) write the file in DIR named by what the child is asked
+//!   for: its `--sha256`, or `describe` for a `--describe`; a file that is not there is a
+//!   failed fetch (a line on standard error and status 1), as a source without it would be;
 //! - `flood` write to standard output until it breaks; `trickle` one byte every 200 ms;
 //! - `errflood:N` write N bytes to standard error;
 //! - `sleep:SECS` wait; `exit:CODE` end with that status; `kill` end by SIGKILL;
@@ -93,18 +96,43 @@ fn script(args: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// What a `fetch-child` run is asked for: the blob's digest, or `describe`.
+fn asked_for(args: &[String]) -> String {
+    if args.iter().any(|a| a == "--describe") {
+        return "describe".to_owned();
+    }
+    args.iter()
+        .position(|a| a == "--sha256")
+        .and_then(|at| args.get(at + 1))
+        .cloned()
+        .expect("--sha256 or --describe")
+}
+
 fn main() {
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let ops = if args.first().is_some_and(|a| a == "fetch-child") {
-        script(&args)
+    let (ops, asked) = if args.first().is_some_and(|a| a == "fetch-child") {
+        (script(&args), Some(asked_for(&args)))
     } else {
-        args
+        (args, None)
     };
     for op in ops {
         let (name, arg) = op.split_once(':').unwrap_or((op.as_str(), ""));
         match name {
+            "serve" => {
+                let key = asked.as_deref().expect("serve needs a fetch-child run");
+                match std::fs::read(std::path::Path::new(arg).join(key)) {
+                    Ok(bytes) => {
+                        out.write_all(&bytes).expect("write");
+                        out.flush().expect("flush");
+                    }
+                    Err(_) => {
+                        let _ = writeln!(err, "fetch-child: nothing is served as {key}");
+                        leave(1);
+                    }
+                }
+            }
             "emit" => {
                 out.write_all(arg.as_bytes()).expect("write");
                 out.flush().expect("flush");

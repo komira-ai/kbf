@@ -80,6 +80,7 @@ async fn a_blob_only_the_previous_generation_holds_is_not_missing() {
     let cell = Cell::with(MapView {
         map: now.clone(),
         previous: Some(before.clone()),
+        earlier: Vec::new(),
     });
     let router = Router::new(cell, cluster.clone());
     let (blob, digest) = blob_where(|d| {

@@ -7,7 +7,7 @@ min_protocol = 0
 fetch_timeout_s = 900
 max_component_bytes = 536870912
 min_activation_interval_s = 60
-database = "postgres:///kbf?host=/run/postgresql"
+database = "postgres:///kbf?host=/run/postgresql&user=kbf-server"
 
 [proxy]
 operator_token_file = "/etc/kbf/api-token"
