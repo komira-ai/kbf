@@ -221,6 +221,10 @@ impl Child for Procs {
         Some(code)
     }
 
+    fn await_exit(&self, _: &ProcIdent, _: Duration) -> bool {
+        unreachable!("only the cold start waits for an exit; the swap polls `exited`")
+    }
+
     fn terminate(&self, ident: &ProcIdent) -> Result<(), PortError> {
         self.log.push(format!("terminate pid {}", ident.pid));
         let pid = rustix::process::Pid::from_raw(ident.pid.cast_signed()).expect("pid");

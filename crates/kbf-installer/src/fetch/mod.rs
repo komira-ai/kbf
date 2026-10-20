@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::CommitId;
+use crate::installer_toml::InstallerToml;
 use crate::layout::Platform;
 use crate::run::{Confine, RunAs};
 use describe::{Answer, DescribeFault, Described};
@@ -95,6 +96,16 @@ pub struct Limits {
     pub max_component_bytes: u64,
     /// `fetch_timeout_s` as a duration: the whole of one component.
     pub fetch_timeout: Duration,
+}
+
+impl Limits {
+    /// The bounds `toml` sets (the parser keeps both inside their ceilings).
+    pub fn of(toml: &InstallerToml) -> Limits {
+        Limits {
+            max_component_bytes: toml.max_component_bytes,
+            fetch_timeout: Duration::from_secs(u64::from(toml.fetch_timeout_s)),
+        }
+    }
 }
 
 /// One component to pull. A locator and claims: the order named them.

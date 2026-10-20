@@ -7,6 +7,7 @@ use std::cell::Cell;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 
 use kbf_bake::drive::{Fetched, Outcome, drive};
@@ -158,8 +159,16 @@ pub fn observe(
     })
 }
 
+/// A new, empty directory for one test: `<target tmp>/<name>-<pid>-<n>`. The process id alone
+/// is not unique across runs (a container restarts its pids, nextest gives each test a
+/// process), so a directory an earlier run left under the same name and pid is removed first,
+/// and a counter keeps two calls of one process apart.
 pub fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
