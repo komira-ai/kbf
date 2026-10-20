@@ -19,7 +19,7 @@ use super::swap::Swap;
 /// A `[proxy]` table (the keys, without the header) over real files in a scratch directory:
 /// a CA, a server certificate, the operator token and a secret path, as `Proxy::bind` reads
 /// them. `extra` is more top-level keys.
-pub(super) fn proxy_table(name: &str, extra: &str) -> String {
+pub(crate) fn proxy_table(name: &str, extra: &str) -> String {
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
         KeyPair, KeyUsagePurpose, SanType,

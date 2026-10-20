@@ -109,7 +109,7 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
 
     fs::write(
         &file,
-        "[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[proxy.upstream]\nbase_port = 18000\n",
+        "database = \"postgres:///kbf?host=/nonexistent\"\n[proxy]\noperator_token_file = \"/a\"\nserver_cert_file = \"/b\"\nserver_key_file = \"/c\"\nclient_ca_file = \"/d\"\n[proxy.upstream]\nbase_port = 18000\n",
     )
     .expect("write");
     let (exit, out, err) = run_as(1000, &["proxy", "--check", "--config", &path]);

@@ -17,7 +17,11 @@ use kbf_testkit::reaped::{self, Reaped};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-installer");
 
-const TABLE: &str = r#"
+/// The state database of the host, as `installer.toml` names it. Nothing connects to it
+/// here: the start migrates only when it has a release to run.
+const DATABASE: &str = "database = \"postgres:///kbf?host=/nonexistent\"\n";
+
+const TABLE: &str = r#"database = "postgres:///kbf?host=/nonexistent"
 [proxy]
 operator_token_file = "/etc/kbf/operator.token"
 server_cert_file = "/etc/kbf/tls/server.pem"
@@ -62,7 +66,7 @@ fn served_config(name: &str) -> (PathBuf, PathBuf) {
     let ca_file = private("ca.pem", &ca.pem());
     let token = private("operator.token", "operator-token-0123456789-abcdefghijkl");
     let text = format!(
-        "[proxy]\noperator_token_file = {token:?}\nserver_cert_file = {cert:?}\n\
+        "{DATABASE}[proxy]\noperator_token_file = {token:?}\nserver_cert_file = {cert:?}\n\
          server_key_file = {key:?}\nclient_ca_file = {ca_file:?}\n\
          proxy_auth_file = {:?}\n[proxy.upstream]\nbase_port = 18000\n",
         dir.join("proxy-auth"),
@@ -127,6 +131,39 @@ fn check_is_exit_0_for_a_valid_table_and_2_for_every_refusal() {
     }
     let out = run(&["--check"], &good.with_file_name("missing.toml"));
     assert_eq!(out.status.code(), Some(2));
+}
+
+/// Catches a proxy that starts on a host with no database: the start migrates before it runs
+/// a release, so a file without a usable `database` is refused as usage, for `--check` and for
+/// a run alike, and the refusal never quotes the URL or its password.
+#[test]
+fn a_file_without_a_usable_database_is_refused_and_the_url_is_never_quoted() {
+    let proxy = TABLE.replace("database = \"postgres:///kbf?host=/nonexistent\"\n", "");
+    let secret_url = "postgres://kbf_marker_user:hunter2_marker@127.0.0.1:5432/kbf_marker_db";
+    for (name, text, want) in [
+        ("db-none", proxy.clone(), "state database"),
+        (
+            "db-password",
+            format!("database = {secret_url:?}\n{proxy}"),
+            "carries a password",
+        ),
+    ] {
+        let path = config(name, &text);
+        for args in [&["--check"][..], &[][..]] {
+            let out = run(args, &path);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{name}: {err}");
+            assert!(err.contains(want), "{name}: {err}");
+            for secret in [
+                "hunter2_marker",
+                "kbf_marker_user",
+                "kbf_marker_db",
+                "127.0.0.1",
+            ] {
+                assert!(!err.contains(secret), "{name}: {secret} in {err}");
+            }
+        }
+    }
 }
 
 /// Catches a verb that serves without being handed its socket (it would bind a port of its

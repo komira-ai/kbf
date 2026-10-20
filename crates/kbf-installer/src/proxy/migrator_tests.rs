@@ -6,11 +6,19 @@
 use kbf_state::postgres::PostgresConfig;
 use kbf_state::postgres::schema::{self, SchemaError};
 
+use std::cell::RefCell;
+use std::time::Duration;
+
+use kbf_state::postgres::schema::Outcome;
+
 use super::fakes::*;
-use super::migrator::{DbMigrator, Refusal};
-use super::ports::Migrator;
+use super::migrator::{DbMigrator, Refusal, installed_schema};
+use super::model::{Mode, Phase, PortError, Step};
+use super::ports::{Migrator, Ports};
+use super::swap::Swap;
 use crate::database::Database;
-use crate::testkit::{A, B, c};
+use crate::fixtures::{FakeRunner, ran, version_json};
+use crate::testkit::{A, B, C, c};
 
 /// A password and names that must never come back in a message.
 const URL: &str = "postgres://kbf_marker_user:hunter2_marker@127.0.0.1:1/kbf_marker_db";
@@ -195,6 +203,216 @@ fn the_lock_wait_is_handed_to_the_migration() {
         *seen.borrow(),
         [(2, Duration::from_secs(30)), (2, Duration::from_secs(7))]
     );
+}
+
+/// What `apply` hands a recorder: nothing is migrated, the call is written down.
+fn outcome(schema: u32) -> Result<Outcome, SchemaError> {
+    Ok(Outcome {
+        from: None,
+        to: schema,
+        ran: Vec::new(),
+    })
+}
+
+/// Catches a cold start that migrates for a release it knows nothing about, or never asks
+/// the installed release what it needs. The installed release (A; the staged one is B) is
+/// migrated to the schema it declares, with the 30 s bound; a commit that is neither (C) is
+/// refused without asking anyone; and with no probe given, even the installed one is
+/// refused as before. `status.json` unreadable or naming no installed release refuses too.
+///
+/// Mutants seen red: the `installed` comparison dropped (C was asked); the probe called for
+/// the staged release too (B asked); the `Some(ask)` guard dropped (A refused).
+#[test]
+fn the_installed_release_is_migrated_for_the_schema_it_declares() {
+    let (w, _) = World::with_old();
+    let asked = RefCell::new(Vec::new());
+    let applied = RefCell::new(Vec::new());
+    let m = DbMigrator::new(unreachable_db(), &w)
+        .knowing_installed(|release| {
+            asked.borrow_mut().push(release.clone());
+            Ok(4)
+        })
+        .with_apply(Box::new(|_, schema, wait| {
+            applied.borrow_mut().push((schema, wait));
+            outcome(schema)
+        }));
+    m.migrate_forward(&c(A)).expect("the installed release");
+    assert_eq!(*asked.borrow(), [c(A)]);
+    assert_eq!(*applied.borrow(), [(4, Duration::from_secs(30))]);
+
+    // The staged release is known from status.json: nobody is asked.
+    w.st.borrow_mut().staged_schema = 2;
+    m.migrate_forward(&c(B)).expect("the staged release");
+    assert_eq!(
+        asked.borrow().len(),
+        1,
+        "the staged release was asked about"
+    );
+    assert_eq!(applied.borrow()[1].0, 2);
+
+    // Neither staged nor installed, or no way to tell.
+    let why = m.migrate_forward(&c(C)).unwrap_err().0;
+    assert!(why.starts_with("not_staged: "), "{why}");
+    w.st.borrow_mut().installed = None;
+    assert!(
+        m.migrate_forward(&c(A))
+            .unwrap_err()
+            .0
+            .starts_with("not_staged: ")
+    );
+    w.st.borrow_mut().installed = Some(c(A));
+    w.st.borrow_mut().installed_err = true;
+    assert!(
+        m.migrate_forward(&c(A))
+            .unwrap_err()
+            .0
+            .starts_with("not_staged: ")
+    );
+    assert_eq!((asked.borrow().len(), applied.borrow().len()), (1, 2));
+
+    // Without a probe the installed release stays refused.
+    w.st.borrow_mut().installed_err = false;
+    let bare = DbMigrator::new(unreachable_db(), &w);
+    let why = bare.migrate_forward(&c(A)).unwrap_err().0;
+    assert!(why.starts_with("not_staged: "), "{why}");
+}
+
+/// Catches an installed release that cannot say what it needs being migrated for anyway:
+/// the probe's refusal is the migrator's, verbatim, and the database is not asked.
+///
+/// Mutant seen red: the probe's error swallowed into a default schema.
+#[test]
+fn a_release_that_cannot_say_its_schema_is_refused_and_the_database_untouched() {
+    let (w, _) = World::with_old();
+    let applied = RefCell::new(0);
+    let m = DbMigrator::new(unreachable_db(), &w)
+        .knowing_installed(|_| Err(PortError("schema_unknown: no".into())))
+        .with_apply(Box::new(|_, schema, _| {
+            *applied.borrow_mut() += 1;
+            outcome(schema)
+        }));
+    assert_eq!(
+        m.migrate_forward(&c(A)),
+        Err(PortError("schema_unknown: no".into()))
+    );
+    assert_eq!(*applied.borrow(), 0);
+}
+
+const PROGRAM: &str = "/var/lib/kbf-installer/releases/aaaa/kbf";
+
+fn probe(runner: &FakeRunner) -> Result<u32, PortError> {
+    installed_schema(runner, std::path::Path::new(PROGRAM), &c(A))
+}
+
+fn says(stdout: String) -> FakeRunner {
+    FakeRunner::new(move |_| Ok(ran(0, &stdout, "")))
+}
+
+/// Catches the probe running the wrong thing, or running it with the proxy's environment
+/// (the database URL is in no variable, but a release is not given the proxy's), as another
+/// user, or without a bound. It runs the release's own binary, `--version --json`, with an
+/// empty environment, in `/`, as the caller, for at most 10 s, and reads `state_schema`.
+///
+/// Mutants seen red: env passed through; `run_as` set; the bound removed; `--json` dropped.
+#[test]
+fn the_probe_runs_the_release_with_nothing_but_its_flags_and_reads_the_schema() {
+    let runner = says(version_json(A, "release"));
+    assert_eq!(probe(&runner), Ok(7));
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 1);
+    let spawn = &calls[0];
+    assert_eq!(spawn.program, std::path::Path::new(PROGRAM));
+    assert_eq!(spawn.args, ["--version", "--json"]);
+    assert!(spawn.env.is_empty());
+    assert_eq!(spawn.cwd, std::path::Path::new("/"));
+    assert_eq!(spawn.run_as, None);
+    assert_eq!(spawn.timeout, Duration::from_secs(10));
+}
+
+/// Catches each way a release can fail to say its schema being taken for an answer. All are
+/// `schema_unknown`: it does not run; times out; exits non-zero; prints something else; is
+/// another commit's build; is a debug build; or declares a schema that is not a `u32`.
+///
+/// Mutants seen red: exit status not looked at; `check` skipped (another commit's schema
+/// used); the `u32` conversion saturating.
+#[test]
+fn every_way_a_release_fails_to_say_its_schema_is_schema_unknown() {
+    let runs = |answer: std::io::Result<crate::run::Ran>| {
+        let cell = RefCell::new(Some(answer));
+        FakeRunner::new(move |_| cell.borrow_mut().take().expect("asked once"))
+    };
+    let mut timed_out = ran(0, &version_json(A, "release"), "");
+    timed_out.timed_out = true;
+    let mut signalled = ran(0, "", "");
+    signalled.code = None;
+    let huge =
+        version_json(A, "release").replace("\"state_schema\":7", "\"state_schema\":4294967296");
+    let cases = [
+        runs(Err(std::io::ErrorKind::NotFound.into())),
+        runs(Ok(timed_out)),
+        runs(Ok(signalled)),
+        runs(Ok(ran(1, &version_json(A, "release"), ""))),
+        runs(Ok(ran(0, "not json", ""))),
+        runs(Ok(ran(0, &version_json(B, "release"), ""))),
+        runs(Ok(ran(0, &version_json(A, "debug"), ""))),
+        runs(Ok(ran(0, &huge, ""))),
+    ];
+    for runner in cases {
+        let why = probe(&runner).unwrap_err().0;
+        assert!(why.starts_with("schema_unknown: "), "{why}");
+        assert!(!why.contains(PROGRAM), "the path is in {why}");
+    }
+}
+
+/// Catches the swap and the migrator not meeting: the swap hands the DbMigrator the staged
+/// release, which asks `status.json`, migrates to what it declares with the bound, and does
+/// it before the candidate starts. A refusal ends the update at `migrate` with its word, the
+/// old child serving and nothing spawned. (The real schema version of this is in `database`.)
+///
+/// Mutants seen red: the swap's `migrate_forward` call moved after the spawn; the refusal
+/// ignored.
+#[test]
+fn the_swap_runs_the_db_migrator_before_the_candidate_and_stops_on_its_refusal() {
+    let seen = RefCell::new(Vec::new());
+    let (w, old) = World::with_old();
+    w.st.borrow_mut().staged_schema = 2;
+    let m = DbMigrator::new(unreachable_db(), &w).with_apply(Box::new(|_, schema, wait| {
+        w.log_event("migrate");
+        seen.borrow_mut().push((schema, wait));
+        outcome(schema)
+    }));
+    let ports = Ports {
+        migrator: &m,
+        ..w.ports()
+    };
+    let phase = Swap::begin(ports, plan(Mode::Frontend), Some(old))
+        .expect("begins")
+        .run();
+    assert_eq!(phase, Ok(Phase::Done));
+    let log = w.log();
+    let at = |what: &str| log.iter().position(|l| l.starts_with(what)).expect(what);
+    assert!(at("migrate") < at("spawn"), "{log:?}");
+    assert_eq!(*seen.borrow(), [(2, Duration::from_secs(30))]);
+
+    let (w, old) = World::with_old();
+    let m = DbMigrator::new(unreachable_db(), &w)
+        .with_apply(Box::new(|_, _, _| Err(SchemaError::Busy)));
+    let ports = Ports {
+        migrator: &m,
+        ..w.ports()
+    };
+    let phase = Swap::begin(ports, plan(Mode::Frontend), Some(old))
+        .expect("begins")
+        .run();
+    assert_eq!(phase, Ok(Phase::Failed));
+    let failure = w.last_intent().failure.expect("a failure");
+    assert_eq!(failure.step, Step::Migrate);
+    assert!(
+        failure.reason.starts_with("database_busy: "),
+        "{}",
+        failure.reason
+    );
+    assert_eq!(w.count("spawn"), 0, "a candidate started on a refusal");
 }
 
 /// Real schema, real swap: the tests that need a server.

@@ -26,11 +26,13 @@
 //! `status.json` calls installed ([`boot`]). It still cannot run a swap or resume one, or
 //! choose between two live children.
 //!
-//! Still fakes, stated: `RootOrders` (the orders spool and the update API belong to U8b; the
-//! boot reads `status.json` itself) and, in the verb, `Migrator`: [`supervisor::NoMigration`]
-//! is the hook the boot calls before it starts a child, and [`migrator::DbMigrator`] is built
-//! but not yet wired into it (a follow-up does that).
-//!
+//! Still a fake, stated: `RootOrders` (the orders spool and the update API belong to U8b; the
+//! boot reads `status.json` itself). `Migrator` is real in the verb: the cold start's hook is
+//! [`supervisor::host_migrator`], a [`migrator::DbMigrator`] over the database `installer.toml`
+//! names. The swap's `Ports.migrator` has no production caller yet (the verb serves
+//! `NoUpdates`, so no swap runs); when the update API drives one it hands the same
+//! [`migrator::DbMigrator`] to `Ports`.
+
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
 //!   [`ports::ChildAdmin::resume`].
@@ -56,8 +58,17 @@
 //!   expand-only migrations up to the `state_schema` the staged release reports, as the
 //!   role `installer.toml` names, and refuses with a stable word (`installer_too_old`,
 //!   `not_additive`, `database_busy`, `migration_failed`, ...) that leads
-//!   `failure.reason` of step `migrate`. The cold start's boot hook (`Boot.migrator`) still
-//!   gets [`supervisor::NoMigration`]; wiring `DbMigrator` into it is a follow-up.
+//!   `failure.reason` of step `migrate`. **Wired into the cold start:** the verb's boot hook
+//!   (`Boot.migrator`) is [`supervisor::host_migrator`], so before the installed release's
+//!   child starts the database is brought to the `state_schema` that release declares (asked
+//!   of its own `--version --json`, because `status.json` forgets the installed release's
+//!   facts when the root half restarts; the staged release's come from `status.json`). A
+//!   refusal (`schema_unknown` for a release that would not say, plus the words above) is an
+//!   attempt that failed as `migration-failed` with nothing started, retried like any other,
+//!   its word in the log. **No database configured:** the verb refuses to start (and
+//!   `--check` fails, exit 2): a frontend or all-in-one host runs on Postgres, so starting
+//!   without a migration would only move the failure into the child; tests use an
+//!   explicit fake, never a missing key.
 //! - **update.json** keeps the recorded process identity of both children
 //!   ([`model::Intent::old_proc`], `new_proc`), which FP section 4 does not list: adoption
 //!   needs pid, start time and executable. A candidate spawned and not yet recorded when
@@ -136,7 +147,7 @@ mod fakes;
 #[cfg(test)]
 mod fault_tests;
 #[cfg(test)]
-mod gate_real_tests;
+pub(crate) mod gate_real_tests;
 #[cfg(test)]
 mod gate_tests;
 #[cfg(test)]
