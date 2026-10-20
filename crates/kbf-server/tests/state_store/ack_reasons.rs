@@ -170,7 +170,7 @@ fn result_naming(lease: LeaseId, tag: u8) -> worker::Result {
 /// one continues the persisted sequence. The farm still holds X's lease, restored from
 /// its row (the daemon may still run it), so a `Result` of that id that names Y's action
 /// is a MISMATCH and ends nothing; the one that names X's action ends X alone, and Y is
-/// still open until Y's own lease reports. Mutants: a `Bump` that returns the old epoch,
+/// still open until Y's own lease reports; an id no row holds is UNKNOWN_LEASE. Mutants: a `Bump` that returns the old epoch,
 /// a grant that does not persist the next sequence, and a check that does not compare a
 /// `Result`'s action with its lease's.
 async fn a_predecessor_process_s_lease_id_never_names_another_operation(backing: Backing) {
@@ -199,6 +199,17 @@ async fn a_predecessor_process_s_lease_id_never_names_another_operation(backing:
             .expect("an ack");
         assert!(!ack.accepted, "{epoch:?}: {ack:?}");
         assert_eq!(reason_of(&ack), Reason::Mismatch, "{epoch:?}");
+        assert!(!matches!(*y.stage.borrow(), Stage::Done(_)), "Y answered");
+        assert_eq!(disk.rows("done/"), 0, "{epoch:?}");
+
+        // An id no process granted and no row holds (another term): unknown, nothing ends.
+        let foreign = LeaseId::new(y_lease.term + 1000, x_lease.seq);
+        let ack = after
+            .report(&node(), result_naming(foreign, 2))
+            .await
+            .expect("an ack");
+        assert!(!ack.accepted, "{epoch:?}: {ack:?}");
+        assert_eq!(reason_of(&ack), Reason::UnknownLease, "{epoch:?}");
         assert!(!matches!(*y.stage.borrow(), Stage::Done(_)), "Y answered");
         assert_eq!(disk.rows("done/"), 0, "{epoch:?}");
 
@@ -275,4 +286,32 @@ fn each_refusal_logs_its_own_line() {
         assert!(farm.report(&node(), wrong).await.is_some());
     });
     assert!(mismatch.contains("names another action"), "{mismatch}");
+}
+
+/// Catches: a farm that lets a lease it gave up (the operation holds a newer lease on the
+/// same node, so only the sequence tells them apart) past the standing check and leaves
+/// the refusal to the scheduler's newest-grant check: the answer is the same STALE, but
+/// the farm has already treated the Result as its operation's, here as a memory kill it
+/// logs and would count. The refused Result gets its reason and no other line.
+#[test]
+fn a_given_up_lease_s_result_is_refused_before_it_is_read() {
+    let said = logs(async {
+        let (disk, farm, _inbox, first, ticket) = started().await;
+        let (_, mut inbox) = lose_lease(&farm).await;
+        let second = starts(&mut inbox)[0];
+        assert_ne!(first, second);
+
+        let killed = worker::Result {
+            memory_kill: worker::MemoryKill::OwnLimit as i32,
+            ..invalid(first)
+        };
+        let ack = farm.report(&node(), killed).await.expect("an ack");
+        assert!(!ack.accepted);
+        assert_eq!(reason_of(&ack), Reason::Stale);
+        assert!(!matches!(*ticket.stage.borrow(), Stage::Done(_)));
+        assert_eq!(disk.rows("done/"), 0);
+        assert!(accepted(&farm, second).await);
+    });
+    assert!(said.contains("stale attempt"), "{said}");
+    assert!(!said.contains("killed for memory"), "{said}");
 }
