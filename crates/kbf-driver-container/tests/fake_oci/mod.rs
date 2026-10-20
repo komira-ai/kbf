@@ -62,7 +62,10 @@ async fn the_bundle_carries_the_actions_settings() {
     fake.run(1, &spec, &["exit", "0"]).await.expect("ran");
     let config = fake.config_json();
     let process = &config["process"];
-    assert_eq!(process["args"], json!(spec.argv));
+    // The action is the container init's child (`init/kbf_init.rs`): its argv follows `--`.
+    let mut argv = vec!["/dev/kbf-init".to_owned(), "--".to_owned()];
+    argv.extend(spec.argv.iter().cloned());
+    assert_eq!(process["args"], json!(argv));
     assert_eq!(process["cwd"], "/kbf/root/pkg");
     assert_eq!(process["terminal"], false);
     assert_eq!(process["user"]["uid"], 1000);
@@ -87,6 +90,25 @@ async fn the_bundle_carries_the_actions_settings() {
     assert_eq!(linux["cgroupsPath"], "/actions/kbf-lease-1-1/ctr");
     assert_eq!(linux["resources"]["pids"]["limit"], 101);
     assert_eq!(linux["resources"]["unified"]["memory.oom.group"], "1");
+    // The init is installed on the node, executable by others, and bound read-only.
+    let init = config["mounts"]
+        .as_array()
+        .expect("mounts")
+        .iter()
+        .find(|m| m["destination"] == "/dev/kbf-init")
+        .expect("/dev/kbf-init");
+    let installed = std::path::Path::new(init["source"].as_str().expect("source"));
+    assert!(installed.ends_with("oci-bin/kbf-init"), "{init}");
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(installed)
+            .expect("the installed init")
+            .permissions(),
+    );
+    assert_eq!(mode & 0o777, 0o755);
+    assert_eq!(
+        std::fs::read(installed).expect("read"),
+        std::fs::read(env!("KBF_INIT_BINARY")).expect("built")
+    );
     let shm = config["mounts"]
         .as_array()
         .expect("mounts")
@@ -280,14 +302,15 @@ async fn an_exit_one_is_the_actions_unless_crun_logged_an_error() {
     fake.assert_clean(2);
 }
 
-/// Catches a program crun cannot find being the farm's failure, not the action's:
-/// exit 127 and kbf's message on the action's stderr.
+/// Catches a program the container's init cannot find being the farm's failure, not the
+/// action's: exit 127 and kbf's message on the action's stderr.
 #[tokio::test]
-async fn a_program_crun_cannot_find_is_the_actions_exit_127() {
+async fn a_program_the_init_cannot_find_is_the_actions_exit_127() {
     let fake = Fake::new("not-found");
-    fake.knob(
-        "crun-error",
+    fake.init_says(
         "executable file `sh` not found in $PATH: No such file or directory",
+        127,
+        false,
     );
     let mut spec = Spec::new(&image(), "unused");
     spec.env = vec![("PATH".to_owned(), "/bin".to_owned())];

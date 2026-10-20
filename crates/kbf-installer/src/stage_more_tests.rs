@@ -5,7 +5,7 @@ use kbf_host::path::Root;
 
 use super::*;
 use crate::fixtures::macho;
-use crate::state::State;
+use crate::state::{Locked, State};
 
 const ARM64_MACHO: u32 = 0x0100_000c;
 
@@ -238,8 +238,9 @@ fn a_macos_release_is_checked_for_quarantine_and_signature_per_component() {
     );
     assert!(rig.release().join("kbf-daemon").exists());
     assert!(
-        rig.host.join(&rig.host.state_file()).exists(),
-        "macOS state dir"
+        rig.release()
+            .starts_with(rig.dir.join("usr/local/kbf-installer")),
+        "macOS tree"
     );
 
     for (case, fails, code) in [
@@ -280,25 +281,60 @@ fn a_release_directory_that_cannot_be_examined_is_an_error() {
     rig.assert_nothing_installed();
 }
 
-/// Catches an already-installed release returning before the state names it: the same
-/// release found in place is reported as such, and `staged` names it all the same (a crash
-/// between the rename and the state write leaves exactly this).
+/// Catches the pipeline deciding what a verified release is for, by writing the state: on a
+/// host that was never provisioned an install leaves no state and does not even take the
+/// lock, and the same release found in place is reported as such, still with no state. What
+/// the release is (`staged` for a frontend's confirm, `current` for an activation or a first
+/// release) is its asker's to record, after its own checks; a pipeline that wrote `staged`
+/// left it behind when the asker then refused the release.
 ///
-/// Mutant seen red: the early return before `staged` is set.
+/// Mutant planted: the install setting `staged` under the lock, as it did.
 #[test]
-fn an_installed_release_found_again_is_staged_again() {
-    let rig = Rig::new("again");
-    rig.activate(&honest()).expect("first");
-    {
-        let lock = Locked::acquire(&rig.host).expect("lock");
-        lock.write(&State::default()).expect("forget the stage");
+fn the_pipeline_installs_and_never_writes_the_state() {
+    let rig = Rig::new("no-state");
+    let staged = rig.activate(&honest()).expect("installed");
+    assert!(!staged.already_installed);
+    let again = rig.activate(&honest()).expect("found in place");
+    assert!(again.already_installed);
+    assert!(
+        crate::state::read_unlocked(&rig.host)
+            .expect("state")
+            .is_none(),
+        "a state was written"
+    );
+    assert!(
+        !rig.host.join(&rig.host.lock()).exists(),
+        "the lock was taken"
+    );
+}
+
+/// Catches the pipeline changing a state it finds: with a current release and a staged
+/// release of the frontend's on the host, installing another release (new, then found in
+/// place) leaves `state.json` byte for byte as it was and makes no backup of it (a write
+/// would make one).
+///
+/// Mutant planted: the install setting `staged` under the lock, as it did (the other
+/// order's staged release is displaced).
+#[test]
+fn the_pipeline_leaves_a_state_it_finds_as_it_was() {
+    let rig = Rig::new("state-as-found");
+    let seeded = State {
+        current: Some(crate::testkit::c(crate::testkit::A)),
+        staged: Some(crate::testkit::c(crate::testkit::B)),
+        ..State::default()
+    };
+    Locked::acquire(&rig.host)
+        .expect("lock")
+        .write(&seeded)
+        .expect("seed");
+    let file = rig.host.join(&rig.host.state_file());
+    let bytes = fs::read(&file).expect("state.json");
+    for found in [false, true] {
+        let staged = rig.activate(&honest()).expect("installed");
+        assert_eq!(staged.already_installed, found);
+        assert_eq!(fs::read(&file).expect("state.json"), bytes, "{found}");
+        assert!(!rig.host.join(&rig.host.state_backup()).exists(), "{found}");
     }
-    let staged = rig.activate(&honest()).expect("second");
-    assert!(staged.already_installed);
-    let state = crate::state::read_unlocked(&rig.host)
-        .expect("state")
-        .expect("written");
-    assert_eq!(state.staged, Some(commit()));
 }
 
 /// Catches a binary that cannot be started being read as a clean report: the stage ends with
@@ -346,19 +382,24 @@ fn a_component_of_size_zero_is_refused_before_it_is_read() {
     assert!(runner.calls().is_empty());
 }
 
-/// Catches an unusable state being worked around at the last step: with both state files
-/// damaged the release has passed every check, and the stage still refuses (install-failed)
-/// instead of recording a `staged` over a state it cannot read.
+/// Catches the pipeline repairing or reading a state it has no business with: with both state
+/// files damaged the install still completes (the state is its asker's, who reads it first
+/// and refuses on an unusable one), and neither file is touched (S21: an unusable state is
+/// never overwritten as if empty).
 ///
-/// Mutant planted: the read error replaced by an empty state (the damaged file is overwritten).
+/// Mutant planted: the install taking the lock and recording `staged`, as it did (it ended
+/// as `install-failed`).
 #[test]
-fn an_unusable_state_ends_the_install_after_the_checks() {
+fn an_unusable_state_is_left_untouched_by_the_install() {
     let rig = Rig::new("state-unusable");
+    let ruined = b"{ not json".to_vec();
     for file in [rig.host.state_file(), rig.host.state_backup()] {
-        fs::write(rig.host.join(&file), b"{ not json").expect("ruin");
+        fs::write(rig.host.join(&file), &ruined).expect("ruin");
     }
-    let err = rig.activate(&honest()).expect_err("unusable");
-    assert_eq!(err.code(), "install-failed", "{err}");
+    rig.activate(&honest()).expect("installed");
+    for file in [rig.host.state_file(), rig.host.state_backup()] {
+        assert_eq!(fs::read(rig.host.join(&file)).expect("file"), ruined);
+    }
 }
 
 /// Catches the fetch child's own count of the stream being ignored: the file on disk hashes to

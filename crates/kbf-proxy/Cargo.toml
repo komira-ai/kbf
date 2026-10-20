@@ -30,7 +30,7 @@ serde.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls.workspace = true
 toml.workspace = true
 tracing.workspace = true
