@@ -1,4 +1,4 @@
-//! The coverage job's ratchet step prints a command that downloads this run's
+//! The `test` job's ratchet step prints a command that downloads this run's
 //! artifact (`kbf-coverage --run-id ... --artifact ...`), so the step's flags must
 //! name what the job uploads: the run is `$GITHUB_RUN_ID` (the id `gh run download`
 //! takes; `$GITHUB_RUN_NUMBER` is another number), the repository is
@@ -17,7 +17,7 @@ use super::workflows;
 
 /// The workflow and job that run the ratchet.
 const CI: &str = ".github/workflows/ci.yml";
-const JOB: &str = "coverage";
+const JOB: &str = "test";
 
 /// The `with:` input `key` of `step`.
 fn input<'a>(step: &'a workflows::Step, key: &str) -> Option<&'a str> {
