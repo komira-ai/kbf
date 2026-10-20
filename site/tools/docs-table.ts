@@ -76,6 +76,7 @@ export const DOCS: readonly DocEntry[] = [
   d('docs/design/ui-data.md', 'design/ui-data', 'design'),
   d('docs/design/distribution.md', 'design/distribution', 'design'),
   d('docs/design/kbf-installer.md', 'design/kbf-installer', 'partial'),
+  d('docs/design/kbf-ui-v1.md', 'design/kbf-ui-v1', 'design'),
   d('docs/design/pull-updates.md', 'design/pull-updates', 'partial'),
   d('docs/design/split-mode-updates.md', 'design/split-mode-updates', 'partial'),
   d('docs/design/fleet-updates.md', 'design/fleet-updates', 'partial'),
