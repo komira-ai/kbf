@@ -341,7 +341,10 @@ base_port = 18000
             let table: toml::Value =
                 toml::from_str(&format!("listen = {bad}\n{MIN}")).expect("toml");
             let refused = ProxyConfig::from_value(table).expect_err("a bad listen is refused");
-            assert!(matches!(refused, ConfigError::Parse(_)), "{bad}: {refused:?}");
+            assert!(
+                matches!(refused, ConfigError::Parse(_)),
+                "{bad}: {refused:?}"
+            );
             let why = refused.to_string();
             assert!(why.contains("listen"), "{why}");
             for piece in ["farm.example", "192.0.2.10", "2001:db8"] {
