@@ -32,6 +32,10 @@ use std::path::{Path, PathBuf};
 
 use kbf_deploy::unit::{UnitFile, comments_in_continuations};
 
+/// The proxy's two units: `kbf-proxy.socket` and `kbf-proxy.service`.
+#[path = "package_units/proxy.rs"]
+mod proxy;
+
 /// The installer's tree: every program of a kbf unit is under it.
 const TREE: &str = "/var/lib/kbf-installer/";
 /// The release kbf-installer flipped to.
@@ -50,23 +54,26 @@ const INSTALLER_CONFIG: &str = "/etc/kbf/installer.toml";
 const ENVOY_CONFIG: &str = "/etc/kbf/envoy/envoy.json";
 
 /// The files of the package, and nothing else.
-const FILES: [&str; 8] = [
+const FILES: [&str; 10] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
     "kbf-envoy.service",
     "kbf-frontend@.service",
     "kbf-installer.service",
+    "kbf-proxy.service",
+    "kbf-proxy.socket",
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
     "kbf.slice",
 ];
 
 /// The runtime units kbf-installer starts before (`Before=` of its unit).
-const RUNTIME: [&str; 6] = [
+const RUNTIME: [&str; 7] = [
     "kbf-all-in-one.service",
     "kbf-daemon.service",
     "kbf-envoy.service",
     "kbf-frontend@.service",
+    "kbf-proxy.service",
     "kbf-storage-and-daemon.service",
     "kbf-storage.service",
 ];
@@ -114,12 +121,12 @@ fn read(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// The mode a unit file starts: the word after `kbf`. Envoy's and the installer's units
-/// start no mode.
+/// The mode a unit file starts: the word after `kbf`. Envoy's, the installer's and the
+/// proxy's units start no mode.
 fn mode_of(name: &str) -> Option<&str> {
     let stem = name.strip_suffix(".service")?;
     let mode = stem.strip_prefix("kbf-")?.trim_end_matches('@');
-    (!["envoy", "installer"].contains(&mode)).then_some(mode)
+    (!["envoy", "installer", "proxy"].contains(&mode)).then_some(mode)
 }
 
 fn trim(v: &str) -> &str {
@@ -200,6 +207,15 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     for line in comments_in_continuations(text) {
         v("continuation", format!("line {line}"));
     }
+    if name.ends_with(".socket") {
+        let unit = UnitFile::parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
+        proxy::socket_rules(&unit, &mut v);
+        // Catches a socket that runs a program (it only holds a port).
+        if unit.directives().iter().any(|d| d.key.starts_with("Exec")) {
+            v("proxy-socket-pair", "an Exec* directive in a socket".into());
+        }
+        return out;
+    }
     if name == "kbf.slice" {
         let unit = UnitFile::parse(text).expect("kbf.slice parses");
         // Catches a per-host reservation baked into the shared file: MemoryMin= is the
@@ -215,11 +231,12 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     let unit = UnitFile::parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
     let is_envoy = name == "kbf-envoy.service";
     let is_installer = name == "kbf-installer.service";
+    let is_proxy = name == "kbf-proxy.service";
     let mode = mode_of(name);
 
     // Catches a unit that starts with no configuration: ConditionPathExists= skips it.
     let conditions = all(&unit, "Unit", "ConditionPathExists");
-    let own_config = if is_installer {
+    let own_config = if is_installer || is_proxy {
         INSTALLER_CONFIG
     } else {
         CONFIG
@@ -311,6 +328,10 @@ fn violations(name: &str, text: &str) -> Vec<String> {
 
     if is_installer {
         installer_rules(&unit, &start, &pre, &mut v);
+        return out;
+    }
+    if is_proxy {
+        proxy::service_rules(&unit, &start, &pre, &mut v);
         return out;
     }
 
@@ -746,7 +767,7 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
     let mut n = 0;
     for name in FILES.iter().filter(|n| n.ends_with(".service")) {
         let unit = UnitFile::parse(&read(name)).expect("parses");
-        let config = if *name == "kbf-installer.service" {
+        let config = if ["kbf-installer.service", "kbf-proxy.service"].contains(name) {
             INSTALLER_CONFIG
         } else {
             CONFIG
@@ -765,7 +786,7 @@ fn every_service_is_gated_on_its_config_and_its_checks() {
         }
         n += 1;
     }
-    assert_eq!(n, 7, "a unit was not checked");
+    assert_eq!(n, 8, "a unit was not checked");
 }
 
 /// The modes whose units `files` hold, sorted.
