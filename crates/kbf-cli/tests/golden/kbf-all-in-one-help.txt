@@ -390,7 +390,7 @@ Options:
           [default: 200]
 
       --drain-deadline-secs <DRAIN_DEADLINE_SECS>
-          On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0. A second signal, or this many seconds after the first, stops it at once and abandons the leases still running. Used by `kbf daemon`; the combined modes stop their daemon half with the other half
+          On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets the running ones finish and report, waits for their acknowledgements, then exits 0. A second signal, or this many seconds after the first, stops it at once and abandons the leases still running. Used by `kbf daemon` and `kbf storage-and-daemon`; `kbf all-in-one` stops its daemon half with the server half
           
           [default: 600]
 
@@ -491,15 +491,30 @@ Options:
           
           [default: /usr/bin/crun]
 
+      --release-poll-every-secs <SECONDS>
+          How often, in seconds, the active frontend asks GitHub for new releases of `--release-poll-repo` and records the newest one the farm could run as a proposal (`proposals` of `GET /v1/update`). A proposal starts nothing: only an operator's `POST /v1/update/desired` does. The question is one conditional request with no credential, so an unchanged feed costs nothing. 0 turns the poller off. Only the newest 30 releases are read (no further pages), so a `v*` release buried under more than 30 newer releases of other tags is not seen. It needs `--state-store`, which holds the proposals
+          
+          [default: 300]
+
       --mac-session-socket <MAC_SESSION_SOCKET>
           The socket `kbf-mac-session` serves (native-whole-machine)
           
           [default: /var/run/kbf-mac-session/socket]
 
+      --release-poll-repo <OWNER/NAME>
+          The GitHub repository, `owner/name`, whose releases of `v*` tags are polled
+          
+          [default: komira-ai/kbf]
+
       --daemon-user <DAEMON_USER>
           This daemon's own user, which keeps read and remove access to what a whole-machine lease's user writes in its lease directory (native-whole-machine)
           
           [default: _kbf]
+
+      --release-poll-refs <REF>
+          The refs a polled release may have been built from, as its notes say, separated by commas; a release built from another is ignored and counted
+          
+          [default: main]
 
       --pool-users <POOL_USERS>
           How many lease users the pool has (native, macOS, a daemon run as root): every action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon, which runs no action as root; refused for any other

@@ -30,6 +30,11 @@
 //!   attested on, and the built deb as the release asset
 //!   `kbf-installer-<commit>-<platform>.deb`, refused unless it holds the binary of the
 //!   attested tarball and trusts the branch it is attested for.
+//! - `pkg-macos-asset` and `pkg-macos-install-test` ([`pkg_macos_asset`],
+//!   [`pkg_macos_install`]): the Mac `.pkg` as the release asset
+//!   `kbf-installer-<commit>-darwin-arm64.pkg`, refused unless it holds the attested
+//!   binary, the pinned `gh`, a trusted root and trusts the branch it is attested for; and
+//!   its install as root on a Mac, every file checked and nothing started.
 //! - `pkg build --binary <path> --launchd-plist <path> [--trust <path>]... --version <v>
 //!   --out <dir>` and `pkg cask` ([`pkg`]): kbf-installer for a Mac, a `.pkg` that is
 //!   the same bytes on every host and installs a root-owned tree and a LaunchDaemon that
@@ -77,6 +82,9 @@ pub mod pkg;
 pub mod pkg_asset;
 pub mod pkg_install;
 pub mod pkg_linux;
+pub mod pkg_macos_asset;
+#[cfg(target_os = "macos")]
+pub mod pkg_macos_install;
 pub mod pkg_trust;
 pub mod proxy_loom;
 pub mod release;
@@ -324,6 +332,47 @@ enum Verb {
         #[arg(long, default_value = "docker")]
         docker: PathBuf,
     },
+    /// The kbf-installer `.pkg` as a release asset, refused unless it holds the attested
+    /// binary, the pinned gh, a trusted root and trusts the branch it is attested for.
+    PkgMacosAsset {
+        /// The `.pkg` `pkg build` wrote, or the directory holding the one (with
+        /// `--verify-only`: the asset itself).
+        #[arg(long)]
+        package: PathBuf,
+        /// The commit it was built from (`$GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The `kbf-installer-<commit>-darwin-arm64.tar.gz` whose binary the package must hold.
+        #[arg(long)]
+        binary_tarball: PathBuf,
+        /// The branch the package must trust, and is attested for (`$GITHUB_REF`).
+        #[arg(long)]
+        expect_ref: String,
+        /// The pinned `gh` the package's must be byte for byte (optional with --verify-only).
+        #[arg(long)]
+        gh: Option<PathBuf>,
+        /// The directory the asset and its line of `SHA256SUMS.darwin-arm64` go in.
+        #[arg(
+            long,
+            required_unless_present = "verify_only",
+            conflicts_with = "verify_only"
+        )]
+        out: Option<PathBuf>,
+        /// Only check `--package`, which must be named as the asset; write nothing.
+        #[arg(long)]
+        verify_only: bool,
+    },
+    /// Install the `.pkg` on this Mac as root and check what it placed and that nothing
+    /// started (macOS only).
+    PkgMacosInstallTest {
+        /// The `.pkg`, or the directory holding the one.
+        #[arg(long)]
+        package: PathBuf,
+        /// A command to run after the install and what its output must contain:
+        /// `<program> <argument>..::<text>` (the command exits 0).
+        #[arg(long)]
+        probe: Vec<pkg_install::Probe>,
+    },
     /// kbf-installer for a Mac: its `.pkg`, and the Homebrew cask.
     #[command(subcommand)]
     Pkg(PkgVerb),
@@ -392,8 +441,12 @@ enum PkgVerb {
         #[arg(long)]
         trust: Vec<PathBuf>,
         /// The release's version: letters, digits and `. _ + -`.
+        /// (One of the two is required; the verb says so, exit 2.)
+        #[arg(long, conflicts_with = "version_of")]
+        version: Option<String>,
+        /// Take the version from this binary's `--version` (`<version>+<12 of the commit>`).
         #[arg(long)]
-        version: String,
+        version_of: Option<PathBuf>,
         /// The directory the package goes in; created when missing.
         #[arg(long)]
         out: PathBuf,
@@ -841,6 +894,33 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
                 gh: gh.as_deref(),
             },
         ),
+        Verb::PkgMacosAsset {
+            package,
+            commit,
+            binary_tarball,
+            expect_ref,
+            gh,
+            out,
+            verify_only,
+        } => pkg_macos_asset::asset(
+            &pkg_asset::sole(&package, "pkg")?,
+            &commit,
+            &match (&out, verify_only) {
+                (Some(out), false) => pkg_asset::Mode::Add(out),
+                _ => pkg_asset::Mode::VerifyOnly,
+            },
+            &pkg_macos_asset::Check {
+                binary_tarball: &binary_tarball,
+                expect_ref: &expect_ref,
+                gh: gh.as_deref(),
+            },
+        ),
+        #[cfg(target_os = "macos")]
+        Verb::PkgMacosInstallTest { package, probe } => {
+            pkg_macos_install::run_test(&pkg_asset::sole(&package, "pkg")?, &probe)
+        }
+        #[cfg(not(target_os = "macos"))]
+        Verb::PkgMacosInstallTest { .. } => Err(darwin::needs_macos("pkg-macos-install-test")),
         Verb::PkgInstallTest {
             package,
             format,
@@ -872,14 +952,22 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             launchd_plist,
             trust,
             version,
+            version_of,
             out,
-        }) => pkg::build(&pkg::Build {
-            binary: &binary,
-            plist: &launchd_plist,
-            trust: &trust,
-            version: &version,
-            out: &out,
-        }),
+        }) => {
+            let version = match (version, version_of) {
+                (Some(version), _) => version,
+                (None, Some(of)) => pkg_asset::binary_version(&of)?,
+                (None, None) => return Err(Error::Usage("--version or --version-of".to_owned())),
+            };
+            pkg::build(&pkg::Build {
+                binary: &binary,
+                plist: &launchd_plist,
+                trust: &trust,
+                version: &version,
+                out: &out,
+            })
+        }
         Verb::Pkg(PkgVerb::Cask {
             pkg,
             version,

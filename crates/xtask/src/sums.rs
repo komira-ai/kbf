@@ -22,7 +22,7 @@
 //!   (default `refs/heads/main`; a value that is not `refs/heads/<branch>` is a usage
 //!   error), on a GitHub-hosted runner, and every tarball has an SBOM attestation from
 //!   the same workflow: the `gh attestation verify` commands docs/artifacts.md gives.
-//!   A `.deb` (the `kbf-installer` package, [`crate::pkg_asset`]) is listed and verified
+//!   A `.deb` or `.pkg` (the `kbf-installer` package, [`crate::pkg_asset`], [`crate::pkg_macos_asset`]) is listed and verified
 //!   like a tarball except that it has no SBOM attestation: build provenance and its own
 //!   bundle.
 //!   First, before `gh` is run, `<dir>` holds exactly one bundle per listed tarball and
@@ -418,7 +418,7 @@ impl Attestations<'_> {
         tarball: &Line,
         signer: &str,
     ) -> Result<(), Error> {
-        let Some(package) = lines.iter().find(|l| l.name.ends_with(".deb")) else {
+        let Some(package) = lines.iter().find(|l| bundles::is_package(&l.name)) else {
             return Ok(());
         };
         let (deb, tgz) = (dir.join(&package.name), dir.join(&tarball.name));
@@ -527,7 +527,7 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
             a.require(&file, workflow, Some(SBOM_PREDICATE))?;
             a.require_bundle(dir, &l.name, workflow)?;
             printed.push(format!("verified: {} (provenance, SBOM, bundle)", l.name));
-        } else if l.name.ends_with(".deb") {
+        } else if bundles::is_package(&l.name) {
             // A package has build provenance and its own bundle, and no SBOM attestation
             // (docs/artifacts.md): what it holds is the tarball's binary, which has one.
             a.require(&file, workflow, None)?;

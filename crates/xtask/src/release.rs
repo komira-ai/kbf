@@ -215,13 +215,15 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 }
 
 /// Whether `name` is an asset of `commit`: `<binary>-<commit>-<platform>` and
-/// `.tar.gz`, `.cdx.json` or `.deb` (the package; nfpm's own `kbf-installer_<version>_
-/// <arch>.deb` names no commit and is not one).
+/// `.tar.gz`, `.cdx.json`, `.deb` or `.pkg` (the packages; nfpm's own `kbf-installer_<version>_
+/// <arch>.deb` and `pkg build`'s `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
+/// not one).
 fn is_asset_of(name: &str, commit: &str) -> bool {
     let stem = name
         .strip_suffix(".tar.gz")
         .or_else(|| name.strip_suffix(".cdx.json"))
-        .or_else(|| name.strip_suffix(".deb"));
+        .or_else(|| name.strip_suffix(".deb"))
+        .or_else(|| name.strip_suffix(".pkg"));
     let parts = stem.and_then(|s| s.split_once(&format!("-{commit}-")));
     parts
         .is_some_and(|(binary, platform)| !binary.is_empty() && Platform::named(platform).is_some())
@@ -255,7 +257,7 @@ fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error
     let packages: Vec<&str> = lines
         .iter()
         .map(|l| l.name.as_str())
-        .filter(|n| n.ends_with(".deb"))
+        .filter(|n| bundles::is_package(n))
         .collect();
     names.extend(
         tarballs
@@ -340,7 +342,7 @@ impl Release<'_> {
              rebuilds nothing.\n\nVerify an asset before use:\n\n```text\ngh attestation \
              verify <asset> --repo {repo} --signer-workflow \
              {repo}/.github/workflows/{ARTIFACTS_WORKFLOW} --source-ref refs/heads/{MAIN} \
-             --deny-self-hosted-runners\n```\n\nEach tarball and each `.deb` package also has its provenance bundle, \
+             --deny-self-hosted-runners\n```\n\nEach tarball and each package (`.deb` or `.pkg`) also has its provenance bundle, \
              `<asset>{SUFFIX}`, which verifies it with no network but a trusted root \
              (`gh attestation trusted-root > trusted_root.jsonl`):\n\n```text\ngh attestation \
              verify <asset> --bundle <asset>{SUFFIX} --custom-trusted-root trusted_root.jsonl \

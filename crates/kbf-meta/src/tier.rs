@@ -86,8 +86,10 @@ pub enum StagedState {
     /// Sealed: its blob list is final and the flusher may upload it.
     Sealed,
     /// The store holds a different object under its key
-    /// ([`Command::FlushConflict`](crate::Command::FlushConflict)). It stays staged,
-    /// read from its block, and the flusher stops retrying it until an operator acts.
+    /// ([`Command::FlushConflict`](crate::Command::FlushConflict)). It stays staged and
+    /// is read from its block. Builds before the one that stages such an object's
+    /// records again under a new key committed it; the flusher now takes an object in
+    /// this state at the start of a round and moves it, and commits no new one.
     Conflict,
 }
 
@@ -195,6 +197,9 @@ pub enum TierError {
     /// horizon).
     #[error("object {0} is not staged")]
     NotStaged(ObjectId),
+    /// A blob indexed at the object is not listed by the command that moves its records.
+    #[error("a blob indexed at object {0} is not listed in the object its records move to")]
+    Unlisted(ObjectId),
     /// The object is still open; only a sealed object is flushed.
     #[error("object {0} is not sealed")]
     NotSealed(ObjectId),

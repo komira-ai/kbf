@@ -380,6 +380,8 @@ pub(super) struct Writer<M, O> {
     pub(super) next_seq: Arc<AtomicU64>,
     /// The local write tier, once [`Cache::attach_tier`] attached one.
     pub(super) tier: OnceLock<Arc<Staging>>,
+    /// The generation each staged object was staged under ([`Cache::flush_report`]).
+    pub(super) born: super::clear::Born,
     /// When each object was last used, once [`Cache::track_recency`] turned it on.
     pub(super) recency: Recency,
 }
@@ -394,6 +396,7 @@ impl<M, O> Writer<M, O> {
             metrics: CacheMetrics::default(),
             next_seq: Arc::new(AtomicU64::new(1)),
             tier: OnceLock::new(),
+            born: super::clear::Born::default(),
             recency: Recency::default(),
         }
     }
@@ -401,6 +404,19 @@ impl<M, O> Writer<M, O> {
     /// The key of object `id` ([`ObjectKeys::key`]).
     pub(super) fn object_key(&self, id: ObjectId) -> Result<ObjectKey, CacheError> {
         self.keys.key(id)
+    }
+
+    /// Moves the numbering of this writer's objects to the microseconds since the Unix
+    /// epoch, if that is past the next number. A flush that met another object under its
+    /// key calls it: the member and boot were named by another lifetime (a frontend
+    /// moved to a fresh state store hands them out again) whose objects occupy the low
+    /// numbers, so counting on from one number would meet them one by one.
+    pub(super) fn leave_numbering(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let micros = u64::try_from(now.as_micros()).unwrap_or(u64::MAX);
+        self.next_seq.fetch_max(micros, Ordering::Relaxed);
     }
 
     pub(super) fn allocate(&self) -> ObjectId {

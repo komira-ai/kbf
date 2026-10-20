@@ -7,6 +7,7 @@ use std::rc::Rc;
 use kbf_host::testkit::{FakeExec, RUNNER};
 use kbf_host::{Entry, Exec, HostPath, Owner, Perms, Step};
 
+use kbf_state::postgres::Unreached;
 use kbf_state::postgres::schema::Outcome;
 
 use super::backend::{Backend, Migrations, Releases, Schemas};
@@ -22,7 +23,7 @@ use crate::installer_toml::Source;
 use crate::layout::{Layout, Platform};
 use crate::migrate::{MigrateError, Unit};
 
-const DATABASE: &str = "postgres:///kbf?host=/run/postgresql";
+const DATABASE: &str = "postgres:///kbf?host=/run/postgresql&user=kbf-server";
 
 const SRC: &str = "/root/kbf.token";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -48,7 +49,33 @@ fn raw(mode: Mode) -> Raw {
         min_generation: None,
         commit: None,
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
+        kbf: serving_flags(mode),
+        proxy: Default::default(),
+        create_local_database: false,
         installer_config: None,
+    }
+}
+
+/// The `kbf.toml` flags a frontend or all-in-one host cannot be set up without, with nothing
+/// else (the files they name are in [`host`]); none for a node.
+fn serving_flags(mode: Mode) -> super::kbf_settings::KbfFlags {
+    let some = |s: &str| Some(s.to_owned());
+    match mode {
+        Mode::Frontend => super::kbf_settings::KbfFlags {
+            storage_url: some("http://127.0.0.1:8990"),
+            ..Default::default()
+        },
+        Mode::AllInOne => super::kbf_settings::KbfFlags {
+            cold_store: some("file:///var/lib/kbf/cold"),
+            meta_dir: some("/var/lib/kbf-meta"),
+            daemon_server: some("https://farm.example:8981"),
+            daemon_ca_cert: some("/etc/kbf/ca.pem"),
+            daemon_cert: some("/etc/kbf/node.pem"),
+            daemon_key: some("/etc/kbf/node.key"),
+            node_id: some("farm-1"),
+            ..Default::default()
+        },
+        _ => Default::default(),
     }
 }
 
@@ -77,11 +104,29 @@ fn put(exec: &mut FakeExec, path: &str, perms: u32, owner: Owner, bytes: &str) {
 fn host() -> FakeExec {
     let mut exec = FakeExec::new(0);
     put(&mut exec, SRC, 0o600, RUNNER, "tok-abc123\n");
+    // The all-in-one daemon half's CA, certificate and key (`serving_flags`).
+    put(&mut exec, "/etc/kbf/ca.pem", 0o644, ROOT, "ca");
+    put(&mut exec, "/etc/kbf/node.pem", 0o644, ROOT, "cert");
+    put(&mut exec, "/etc/kbf/node.key", 0o600, KBF, "key");
     exec
 }
 
 /// A host with a release installed: `releases/current` is a link.
+/// A Mac's `kbf.toml` as `kbf-mac-provision` leaves it for `raw(Mode::Daemon)`: the keys setup
+/// writes, and `[daemon] update-dir`, which setup only checks on a Mac.
+fn provisioned(mut exec: FakeExec) -> FakeExec {
+    let text = format!(
+        "mode = \"daemon\"\n\n[frontend]\nurl = \"https://farm.example:8443\"\n\n[enroll]\ntoken_file = \"{}\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n",
+        Platform::MacOs.enroll_token()
+    );
+    put(&mut exec, Platform::MacOs.kbf_toml(), 0o640, ROOT, &text);
+    exec
+}
+
 fn released(mut exec: FakeExec, platform: Platform) -> FakeExec {
+    if platform == Platform::MacOs {
+        exec = provisioned(exec);
+    }
     exec.entries.insert(
         hp(&current_release(platform)),
         Entry::Link {
@@ -114,6 +159,8 @@ enum Standing {
     Unmigrated,
     /// A finished migration repointed these units.
     Done(&'static [&'static str]),
+    /// A finished migration adopted a host the Mac kit installed.
+    DoneKit(&'static [&'static str]),
     /// The journal cannot be read.
     Damaged,
 }
@@ -123,7 +170,7 @@ impl Migrations for Standing {
         match self {
             Standing::Fresh => Ok(Vec::new()),
             Standing::Unmigrated => Err(MigrateError::Unmigrated("/var/lib/kbf-deploy".into())),
-            Standing::Done(units) => Ok(units
+            Standing::Done(units) | Standing::DoneKit(units) => Ok(units
                 .iter()
                 .map(|u| Unit::new(u).expect("a unit"))
                 .collect()),
@@ -132,6 +179,10 @@ impl Migrations for Standing {
                 why: "planted".into(),
             }),
         }
+    }
+
+    fn kit_adopted(&self) -> Result<bool, MigrateError> {
+        Ok(matches!(self, Standing::DoneKit(_)))
     }
 }
 
@@ -142,6 +193,8 @@ type Asked = Rc<RefCell<Vec<String>>>;
 struct Server {
     found: Option<u32>,
     down: bool,
+    /// What a login is refused with, when it is.
+    unreached: Option<Unreached>,
     asked: Asked,
 }
 
@@ -150,6 +203,7 @@ impl Server {
         Server {
             found: None,
             down: false,
+            unreached: None,
             asked: Asked::default(),
         }
     }
@@ -158,11 +212,17 @@ impl Server {
 struct Session {
     found: Option<u32>,
     down: bool,
+    unreached: Option<Unreached>,
     url: String,
     asked: Asked,
 }
 
 impl SchemaOps for Session {
+    fn reach(&self) -> Result<(), Unreached> {
+        self.asked.borrow_mut().push(format!("reach {}", self.url));
+        self.unreached.clone().map_or(Ok(()), Err)
+    }
+
     fn setup(&self) -> Result<Outcome, String> {
         self.asked.borrow_mut().push(format!("setup {}", self.url));
         if self.down {
@@ -193,6 +253,7 @@ impl Schemas for Server {
         Ok(Box::new(Session {
             found: self.found,
             down: self.down,
+            unreached: self.unreached.clone(),
             url: url.to_owned(),
             asked: self.asked.clone(),
         }))
@@ -293,8 +354,8 @@ fn settled(units: &[&str]) -> FakeOs {
 }
 
 const DAEMON_TOML: &str =
-    "# Written by `kbf-installer setup`. The mode's other settings are added below the
-# keys it writes; run setup again to change these.
+    "# Written by `kbf-installer setup`; run setup again to change these keys. Another setting
+# goes into the table it belongs to (add the key there, never a second table of the same name).
 mode = \"daemon\"
 
 [frontend]
@@ -302,18 +363,28 @@ url = \"https://farm.example:8443\"
 
 [enroll]
 token_file = \"/etc/kbf/enroll.token\"
+
+[daemon]
+update-dir = \"/var/lib/kbf-installer\"
+orders-dir = \"/var/lib/kbf-installer/orders\"
 ";
 
 const FRONTEND_TOML: &str =
-    "# Written by `kbf-installer setup`. The mode's other settings are added below the
-# keys it writes; run setup again to change these.
+    "# Written by `kbf-installer setup`; run setup again to change these keys. Another setting
+# goes into the table it belongs to (add the key there, never a second table of the same name).
 mode = \"frontend\"
+
+[listener]
+api-listen = \"127.0.0.1:8982\"
 
 [tls]
 api-token-file = \"/etc/kbf/api-token\"
 
+[storage-client]
+storage = \"http://127.0.0.1:8990\"
+
 [scheduler]
-state-store = \"postgres:///kbf?host=/run/postgresql\"
+state-store = \"postgres:///kbf?host=/run/postgresql&user=kbf-server\"
 ";
 
 const DAEMON_INSTALLER_TOML: &str = "release_source = \"frontend\"
@@ -679,9 +750,15 @@ fn each_mode_enables_its_own_units() {
         } else {
             " --now"
         };
+        // The modes that keep their state in Postgres also get the backup timer, started
+        // (the schema it dumps is made before the units are enabled).
+        let backup = mode
+            .keeps_state_in_database()
+            .then(|| "run /usr/bin/systemctl enable --now -- kbf-backup.timer".to_owned());
         let expected: Vec<String> = units
             .iter()
             .map(|u| format!("run /usr/bin/systemctl enable{now} -- {u}"))
+            .chain(backup)
             .chain(["run /usr/bin/systemctl enable --now -- kbf-installer.service".to_owned()])
             .collect();
         assert_eq!(enables, expected, "{mode:?}");
@@ -1136,6 +1213,9 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         min_generation: Some(0),
         commit: None,
         database: Some(DATABASE.to_owned()),
+        kbf: super::kbf_settings::KbfFlags::default(),
+        proxy: Default::default(),
+        create_local_database: false,
         installer_config: Some("/tmp/i.toml".to_owned()),
     };
     let mut exec = host();
@@ -1389,7 +1469,7 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
 fn a_mac_refuses_the_frontend_and_waits_for_a_release() {
     let err = go(&FakeOs::mac(), &mut host(), &raw(Mode::Frontend), APPLY);
     assert!(matches!(err, Err(SetupError::Unsupported(_))), "{err:?}");
-    let mut exec = host();
+    let mut exec = provisioned(host());
     let out = go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
     assert!(
         cmds(&exec).iter().all(|c| !c.contains("kbf-daemon.plist")),
@@ -1601,5 +1681,62 @@ fn a_view_forwards_reads_and_refuses_steps() {
 #[path = "more_tests.rs"]
 mod more;
 
+#[path = "kbf_settings_tests.rs"]
+mod kbf_settings_tests;
+#[path = "provision_tests.rs"]
+mod provision;
+
+#[path = "proxy_tests.rs"]
+mod proxy_tests;
+
 #[path = "proxy_listen_tests.rs"]
 mod proxy_listen;
+
+#[path = "backup_dropin_tests.rs"]
+mod backup_dropin;
+
+/// Catches the journal's `kit` flag not reaching the `kbf.toml` decision: on the same Mac with
+/// the same kit file, a finished kit migration (`DoneKit`) lets setup add its keys and keep the
+/// kit's, and a finished migration of any other host (`Done`) refuses the file as before.
+///
+/// Mutant seen red: `ctx.kit_adopted` left false.
+#[test]
+fn the_journals_kit_flag_picks_the_kbf_toml_decision() {
+    const KIT: &str = "mode = \"daemon\"\n\n[identity]\nnode-id = \"mac-a\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n";
+    let mut os = FakeOs::mac();
+    os.users.push(user("_kbf-fetch", 303));
+    os.users.last_mut().expect("user").home = "/var/empty".to_owned();
+    let go_kit = |standing: Standing| {
+        let mut exec = released(host(), Platform::MacOs);
+        put(&mut exec, "/usr/local/etc/kbf/kbf.toml", 0o640, ROOT, KIT);
+        let r = go_after(
+            &os,
+            &mut exec,
+            &Unwired,
+            &Server::fresh(),
+            standing,
+            &raw(Mode::Daemon),
+            APPLY,
+        );
+        (r, exec)
+    };
+    let (ok, exec) = go_kit(Standing::DoneKit(&[]));
+    ok.expect("kit host");
+    let written = text(&exec, "/usr/local/etc/kbf/kbf.toml");
+    assert!(written.starts_with(KIT.trim_end()), "{written}");
+    assert!(written.contains("[frontend]"), "{written}");
+    assert!(
+        !written.contains("orders-dir"),
+        "a Mac's keys are not written: {written}"
+    );
+    let (refused, _) = go_kit(Standing::Done(&[]));
+    assert!(
+        refused
+            .expect_err("not a kit host")
+            .to_string()
+            .contains("holds other settings"),
+    );
+}
+
+#[path = "update_dirs_tests.rs"]
+mod update_dirs;

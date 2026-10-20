@@ -7,6 +7,7 @@ use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
 use super::error::MigrateError;
+use super::kit::{self, PlistForm};
 use super::roots::Roots;
 use super::tree::{self, Rules};
 use crate::CommitId;
@@ -63,42 +64,63 @@ fn parse_state(bytes: &[u8]) -> Result<OldState, MigrateError> {
     Ok(state)
 }
 
+impl OldState {
+    /// What a host with no `state.json` has: the releases its links name.
+    pub fn from_links(current: Option<CommitId>, previous: Option<CommitId>) -> OldState {
+        OldState {
+            schema: OLD_SCHEMA,
+            current,
+            previous,
+            staged: None,
+            pending_confirm: None,
+            order_floor: 0,
+        }
+    }
+}
+
 /// What the old tools recorded.
 #[derive(Debug)]
 pub struct Old {
     pub state: OldState,
     pub memory: Memory,
+    /// Set for a host the Mac kit installed: there is no state, and the links are it.
+    pub kit: Option<PlistForm>,
 }
 
 /// Read the old state; `None` when the old layout has neither file (not an old host).
-pub fn read(layout: &Layout, roots: &Roots, rules: &Rules) -> Result<Option<Old>, MigrateError> {
+///
+/// `resume` is set when the journal says a kit migration began (see [`kit::read`]).
+pub fn read(
+    layout: &Layout,
+    roots: &Roots,
+    rules: &Rules,
+    resume: bool,
+) -> Result<Option<Old>, MigrateError> {
     let path = layout.join(&roots.old_state);
     let opened = tree::absent(tree::open_root(&path));
     let Some(dir) = opened.map_err(MigrateError::io(roots.old_state.to_string()))? else {
-        return Ok(None);
+        return kit::read(layout, roots, rules, resume);
     };
     let state = tree::read_file(rules, &dir, "state.json", FILE_CAP)?;
     let memory = tree::read_file(rules, &dir, "helper.json", FILE_CAP)?;
     if state.is_none() && memory.is_none() {
-        return Ok(None);
+        return kit::read(layout, roots, rules, resume);
     }
+    kit::refuse_beside_state(layout, roots, rules)?;
     let state = match state {
         Some(bytes) => parse_state(&bytes)?,
         // Only the helper's memory is there: an old host with nothing deployed.
-        None => OldState {
-            schema: OLD_SCHEMA,
-            current: None,
-            previous: None,
-            staged: None,
-            pending_confirm: None,
-            order_floor: 0,
-        },
+        None => OldState::from_links(None, None),
     };
     let memory = match memory {
         Some(bytes) => parse_memory(&bytes)?,
         None => Memory::default(),
     };
-    Ok(Some(Old { state, memory }))
+    Ok(Some(Old {
+        state,
+        memory,
+        kit: None,
+    }))
 }
 
 /// `helper.json` as the deployed helpers wrote it. The helper of `feature/pull-updates` also

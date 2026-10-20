@@ -69,6 +69,10 @@ pub struct Rig {
     pub events: Rc<RefCell<Vec<String>>>,
     /// Make the next `start` fail.
     pub fail_start: Rc<Cell<bool>>,
+    /// The systemd units that are enabled, by file name (none to begin with).
+    pub enabled: Rc<RefCell<BTreeSet<String>>>,
+    /// Make `enable --now` fail.
+    pub fail_enable: Rc<Cell<bool>>,
     /// Called with the verb and the unit file of every service command before it is answered
     /// (`stop`, `start`, `is-active`, `daemon-reload` with no unit): what a test plays as
     /// the host doing something while the migration is in that call.
@@ -76,6 +80,8 @@ pub struct Rig {
     /// How long the migration waits for each lock ([`Migration::lock_wait`]); long, so that a
     /// test which holds a lock for a moment is waited out.
     pub lock_wait: Duration,
+    /// A host the Mac kit installed: it has no old helper, so the migration names none.
+    pub kit: bool,
 }
 
 pub fn put(path: &Path, bytes: &str, mode: u32) {
@@ -87,6 +93,18 @@ pub fn put(path: &Path, bytes: &str, mode: u32) {
 impl Rig {
     pub fn linux(name: &str) -> Rig {
         Rig::new(name, Platform::Linux)
+    }
+
+    /// A host the Mac kit installed (`testdata/kit_host/`), the job in `form`, running: the
+    /// tree, the plist and `kbf.toml` as the kit leaves them, and no old state.
+    pub fn kit(name: &str, platform: Platform, form: super::kit_host::Form) -> Rig {
+        let mut rig = Rig::bare(&format!("kit-{name}"), platform);
+        super::kit_host::lay_out(&rig.host.root, form);
+        rig.kit = true;
+        rig.active
+            .borrow_mut()
+            .insert("com.komira.kbf-daemon.plist".to_owned());
+        rig
     }
 
     pub fn mac(name: &str) -> Rig {
@@ -109,12 +127,16 @@ impl Rig {
         let active = Rc::new(RefCell::new(BTreeSet::new()));
         let events = Rc::new(RefCell::new(Vec::new()));
         let fail_start = Rc::new(Cell::new(false));
+        let enabled = Rc::new(RefCell::new(BTreeSet::new()));
+        let fail_enable = Rc::new(Cell::new(false));
         let on_command: Rc<RefCell<Option<CommandHook>>> = Rc::new(RefCell::new(None));
         host.answer = Box::new({
-            let (active, events, fail_start, root, on_command) = (
+            let (active, events, fail_start, enabled, fail_enable, root, on_command) = (
                 active.clone(),
                 events.clone(),
                 fail_start.clone(),
+                enabled.clone(),
+                fail_enable.clone(),
                 root.clone(),
                 on_command.clone(),
             );
@@ -132,6 +154,9 @@ impl Rig {
                     ("/usr/bin/systemctl", ["daemon-reload"]) => ("daemon-reload", String::new()),
                     ("/usr/bin/systemctl", ["is-active", "--quiet", "--", u]) => {
                         ("is-active", (*u).to_owned())
+                    }
+                    ("/usr/bin/systemctl", ["enable", "--now", "--", u]) => {
+                        ("enable --now", (*u).to_owned())
                     }
                     ("/usr/bin/systemctl", [verb, "--", u]) => (verb, (*u).to_owned()),
                     ("/bin/launchctl", ["bootstrap", "system", plist]) => (
@@ -157,6 +182,28 @@ impl Rig {
                         "",
                         "",
                     )),
+                    "is-enabled" if enabled.borrow().contains(&unit) => {
+                        Ok(reply(0, "enabled\n", ""))
+                    }
+                    "is-enabled" => Ok(reply(1, "disabled\n", "")),
+                    "enable --now" if fail_enable.get() => {
+                        Err(io::Error::other("planted: enable failed"))
+                    }
+                    "enable --now" => {
+                        enabled.borrow_mut().insert(unit.clone());
+                        active.borrow_mut().insert(unit.clone());
+                        record(format!("enable --now {unit}"));
+                        Ok(reply(0, "", ""))
+                    }
+                    "enable" | "disable" => {
+                        if verb == "enable" {
+                            enabled.borrow_mut().insert(unit.clone());
+                        } else {
+                            enabled.borrow_mut().remove(&unit);
+                        }
+                        record(format!("{verb} {unit}"));
+                        Ok(reply(0, "", ""))
+                    }
                     "stop" => {
                         active.borrow_mut().remove(&unit);
                         record(format!("stop {unit}"));
@@ -185,8 +232,11 @@ impl Rig {
             active,
             events,
             fail_start,
+            enabled,
+            fail_enable,
             on_command,
             lock_wait: Duration::from_secs(20),
+            kit: false,
         }
     }
 
@@ -208,7 +258,7 @@ impl Rig {
     }
 
     pub fn binary(&self) -> &'static str {
-        self.roots().binary()
+        self.roots().binary(self.kit, false)
     }
 
     pub fn new_state_dir(&self) -> PathBuf {
@@ -313,7 +363,7 @@ impl Rig {
             },
             owner_uid: me(),
             units: vec![self.daemon()],
-            helper_unit: Some(self.helper()),
+            helper_unit: (!self.kit).then(|| self.helper()),
             installer_unit: Some(match self.platform {
                 Platform::Linux => unit("kbf-installer.service"),
                 Platform::MacOs => unit("com.komira.kbf-installer.plist"),
@@ -322,6 +372,13 @@ impl Rig {
                 source: Source::Url,
                 min_generation: Some(17),
             },
+            node_user: Some(kbf_host::RunUser {
+                name: "kbf".to_owned(),
+                uid: me(),
+                gid: rustix::process::getgid().as_raw(),
+                groups: Vec::new(),
+                home: "/nonexistent".to_owned(),
+            }),
             lock_wait: self.lock_wait,
         }
     }
@@ -423,6 +480,11 @@ impl OldHand {
 /// What `kbf --version --json` of the build in the directory the program is in says, as
 /// that directory's commit's release build.
 fn probe_answer(spawn: &Spawn) -> io::Result<crate::run::Ran> {
+    // A program that is not there cannot be run: a probe of a name the release does not hold
+    // fails here as it does on a host.
+    if !spawn.program.exists() {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
+    }
     let commit = spawn
         .program
         .parent()
@@ -540,8 +602,8 @@ impl Rig {
 
     /// A macOS test-farm host: the same releases with `kbf-daemon`, and the daemon's
     /// LaunchDaemon plist as `kbf-mac-provision` renders it.
-    pub fn testfarm_mac() -> Rig {
-        let rig = Rig::bare("testfarm-mac", Platform::MacOs);
+    pub fn testfarm_mac(name: &str) -> Rig {
+        let rig = Rig::bare(&format!("testfarm-mac-{name}"), Platform::MacOs);
         rig.farm_releases("kbf-daemon");
         put(
             &rig.at("Library/LaunchDaemons/org.example.kbf-daemon.plist"),

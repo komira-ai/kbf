@@ -113,6 +113,12 @@ impl Headers {
         Headers(b"Content-Type: application/json\r\n".to_vec())
     }
 
+    /// The header lines as they go on the wire.
+    #[cfg(test)]
+    pub(crate) fn lines(&self) -> &[u8] {
+        &self.0
+    }
+
     /// These headers, then `other`'s.
     pub fn and(mut self, other: &Headers) -> Headers {
         self.0.extend_from_slice(&other.0);

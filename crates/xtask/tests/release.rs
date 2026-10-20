@@ -1326,6 +1326,40 @@ fn check_accepts_the_installer_package_of_the_commit_with_its_bundle() {
 }
 
 #[test]
+fn check_accepts_the_macos_installer_package_of_the_commit_and_refuses_the_uncommitted_name() {
+    // Catches: a `.pkg` in SHA256SUMS refused as "not an asset of <commit>" (the release of
+    // the first main push that lists the Mac package fails), the package counted with no
+    // bundle, and `pkg build`'s own name (`kbf-installer-<version>-macos-arm64.pkg`, which
+    // names no commit) accepted as an asset.
+    let root = scratch("check-pkg");
+    let accepted = dist(&root, COMMIT);
+    add_deb(
+        &accepted,
+        &format!("kbf-installer-{COMMIT}-darwin-arm64.pkg"),
+        true,
+    );
+    let (code, out, err) = check(&accepted, COMMIT);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        out,
+        format!(
+            "sums: 7 files match; the flipped copy does not\n\
+             names: every listed file is an asset of {COMMIT}\n\
+             bundles: each of the 3 tarballs and 1 package(s) has one provenance bundle\n"
+        )
+    );
+    let root = scratch("check-pkg-foreign");
+    let foreign = dist(&root, COMMIT);
+    add_deb(&foreign, "kbf-installer-0.1.0-macos-arm64.pkg", true);
+    let (code, _, err) = check(&foreign, COMMIT);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.contains("kbf-installer-0.1.0-macos-arm64.pkg: not an asset of"),
+        "{err}"
+    );
+}
+
+#[test]
 fn check_refuses_a_package_with_no_bundle_a_stray_package_bundle_and_a_foreign_package() {
     // Catches: a package released with no bundle a host can verify it with; a bundle of
     // a package that is not listed; and a `.deb` that is not an asset of this commit:

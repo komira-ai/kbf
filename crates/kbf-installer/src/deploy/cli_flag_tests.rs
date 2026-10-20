@@ -64,6 +64,10 @@ impl Rig {
             self.token.to_str().unwrap(),
             "--lock",
             lock.to_str().unwrap(),
+            "--result",
+            self.dir.join("result.json").to_str().unwrap(),
+            "--observe",
+            "127.0.0.1:2",
         ]
         .map(str::to_owned)
         .to_vec()
@@ -105,8 +109,8 @@ fn absent_frontend(rig: &Rig) -> FrontendConfig {
 /// flag whose value is dropped, parsed as another flag's, or not parsed, and an order flag
 /// that is quietly ignored.
 ///
-/// Mutants planted: `--handover-timeout-s` or `--smoke-timeout-s` ignoring its value (the
-/// zero passes); `--order` accepted again.
+/// Mutants planted: `--handover-timeout-s`, `--smoke-timeout-s` or `--settle-timeout-s` ignoring
+/// its value (the zero passes); `--set-hash` accepted unparsed; `--order` accepted again.
 #[test]
 fn every_flag_takes_its_value() {
     let rig = Rig::new("values");
@@ -114,6 +118,7 @@ fn every_flag_takes_its_value() {
         "--node-timeout-s",
         "--handover-timeout-s",
         "--smoke-timeout-s",
+        "--settle-timeout-s",
     ] {
         let (code, out, err) = rig.go(&[flag, "0"], b"", false);
         assert_eq!((code, out.as_str()), (2, ""), "{flag}");
@@ -128,6 +133,65 @@ fn every_flag_takes_its_value() {
     }
     let (code, _, err) = rig.go(&["--allow-offline", "n1,n2"], b"", false);
     assert_ne!(code, 2, "{err}");
+    // The set hash is 64 lower-case hex digits.
+    let (code, out, err) = rig.go(&["--set-hash", "ABC"], b"", false);
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(err.contains("--set-hash"), "{err}");
+    let (code, _, err) = rig.go(&["--set-hash", &"ab".repeat(32)], b"", false);
+    assert_ne!(code, 2, "{err}");
+}
+
+/// Proves an applied deploy that is not told where the gates read does not start (exit 2,
+/// naming `--observe`), a plan does not need it, `--observe` must be loopback and an address,
+/// and `--observe-token-file` is read like the token file. Catches a deploy that defaults the
+/// gate reads to `--api` (which does not serve them) or reads them from a remote address.
+///
+/// Mutants planted: the missing `--observe` allowed with `--apply`.
+#[test]
+fn an_applied_deploy_must_name_the_frontend_it_observes() {
+    let rig = Rig::new("observe");
+    let without: Vec<String> = {
+        let mut a = rig.base();
+        let at = a.iter().position(|x| x == "--observe").unwrap();
+        a.drain(at..=at + 1);
+        a
+    };
+    let host = rig.host(true);
+    let (code, out, err) = rig.go_with(without.clone(), &["--apply"], b"", &host);
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(
+        err.contains("--observe or --observe-base-port is required"),
+        "{err}"
+    );
+    let mut both = rig.base();
+    both.extend(["--observe-base-port".to_owned(), "18000".to_owned()]);
+    let (code, _, err) = rig.go_with(both, &["--apply"], b"", &host);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("give one"), "{err}");
+    for bad in ["80", "65535", "x"] {
+        let mut a = rig.base();
+        let at = a.iter().position(|x| x == "--observe").unwrap();
+        a.splice(
+            at..=at + 1,
+            ["--observe-base-port".to_owned(), bad.to_owned()],
+        );
+        let (code, _, err) = rig.go_with(a, &["--apply"], b"", &host);
+        assert_eq!(code, 2, "{bad}: {err}");
+        assert!(err.contains("--observe-base-port"), "{bad}: {err}");
+    }
+    let (code, _, err) = rig.go_with(without, &[], b"", &host);
+    assert_ne!(code, 2, "a plan needs no --observe: {err}");
+    for bad in ["0.0.0.0:2", "not-an-address"] {
+        let mut a = rig.base();
+        let at = a.iter().position(|x| x == "--observe").unwrap();
+        a[at + 1] = bad.to_owned();
+        let (code, _, err) = rig.go_with(a, &["--apply"], b"", &host);
+        assert_eq!(code, 2, "{bad}: {err}");
+        assert!(err.contains("--observe"), "{bad}: {err}");
+    }
+    let (code, _, err) = rig.go(&["--observe-token-file", "/no/such/token"], b"", false);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--observe-token-file"), "{err}");
 }
 
 /// Proves each run has a request id of its own, in the form the update API accepts (1 to 128
@@ -555,7 +619,12 @@ fn a_stale_offer_ends_the_deploy_and_untrusted_settings_stop_it() {
     if current_uid() == 0 {
         return;
     }
-    let layout = crate::layout::Layout::linux(kbf_host::Root::new(&rig.dir).unwrap());
+    // The deploy reads the settings of the platform it runs on (`HostProbe::at`), so they are
+    // planted where that platform's layout keeps them.
+    let layout = crate::layout::Layout::new(
+        kbf_host::Root::new(&rig.dir).unwrap(),
+        crate::layout::Platform::current(),
+    );
     let settings = layout.join(&layout.settings());
     fs::create_dir_all(settings.parent().unwrap()).unwrap();
     fs::write(&settings, "RUN_AS_UID=65534\n").unwrap();

@@ -12,14 +12,14 @@ inputs, and `crates/xtask/src/pkg_linux.rs` is the one place that says what goes
 |---|---|
 | `sysusers.d/kbf-installer.conf` | the users `kbf`, `kbf-server`, `kbf-fetch`, `kbf-verify` (no login); installed to `/usr/lib/sysusers.d` |
 | `tmpfiles.d/kbf-installer.conf` | `/run/kbf-installer` (0755), `/var/cache/kbf-fetch` (0711); the units author's file, packaged unchanged; installed to `/usr/lib/tmpfiles.d` |
-| `units/` | the unit files (`kbf-*.service`, `kbf.slice`), installed to `/usr/lib/systemd/system`; `testdata/units` is the fixture for the unit tests only |
+| `units/` | the unit files (`kbf-*.service`, `kbf-*.timer`, `kbf.slice`), installed to `/usr/lib/systemd/system`; `testdata/units` is the fixture for the unit tests only |
 | `testdata/` | fixtures for the install test only: two gated units and three stand-in trust files |
 | `test/ubuntu`, `test/fedora` | the fresh systems the install test uses, systemd as PID 1, pinned by digest |
 
 ## What the package holds
 
 - `/usr/bin/kbf-installer` (0755);
-- every file of `packaging/linux/units` (the `kbf-*.service` files and `kbf.slice`; the
+- every file of `packaging/linux/units` (the `kbf-*.service` and `kbf-*.timer` files and `kbf.slice`; the
   unit files are packaging's input from the units author, packaged unchanged) in
   `/usr/lib/systemd/system` (0644);
 - `/usr/share/kbf-installer/trust/`: `gh` (0755), `trusted_root.jsonl`, `installer.conf` (0644);
@@ -41,7 +41,7 @@ A frontend host enables exactly one of two units; they bind the same ports.
   slot per instance). It is kept until the proxy work removes it (frontend-proxy units U7c);
   `kbf-installer setup` enables `kbf-frontend.service`, never the template.
 
-It refuses anything else (a unit named neither `kbf-*.service` nor `kbf.slice`, a fourth trust file, no unit).
+It refuses anything else (a unit named none of `kbf-*.service`, `kbf-*.socket`, `kbf-*.timer` and `kbf.slice`, a fourth trust file, no unit).
 
 Dependencies: deb `crun, uidmap, systemd, ca-certificates`; rpm the same with Fedora's name
 for `uidmap`, `shadow-utils`. Never Podman, never Envoy (a test pins it): Envoy
@@ -58,6 +58,12 @@ user or directory is created by a script.
   `/etc/kbf/kbf.toml` for a node unit, `/etc/kbf/installer.toml` for
   `kbf-installer.service`); the test starts each `--gate` unit without its file (skipped,
   `ConditionResult=no`, no `ExecStart` run) and with it (condition holds).
+- `/etc/kbf/kbf.toml`, the file those gates test, is written by `kbf-installer setup`, not by
+  the package: for a frontend or all-in-one host from flags that name the listeners, the
+  certificates and keys (which the operator provides, owned by the unit's user) and, for a
+  frontend, the storage node, for an all-in-one host the cold store and the daemon half's
+  identity (`docs/deploy/kbf-installer-setup.md`, "The `kbf.toml` flags"). The unit's
+  `ExecStartPre=... --check` reads that file, so a file `setup` wrote is one `kbf --check` accepts.
 - The users and directories come from `systemd-sysusers` and `systemd-tmpfiles`, which
   run at boot, and from `kbf-installer setup`. After `dpkg -i` and before either, they do
   not exist; the test runs both commands as boot does and checks the result.

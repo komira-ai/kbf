@@ -78,13 +78,8 @@ struct Progress {
 #[derive(Clone, Debug)]
 enum State {
     Follower,
-    Candidate {
-        votes: BTreeSet<ServerId>,
-    },
-    Leader {
-        progress: BTreeMap<ServerId, Progress>,
-        since_heartbeat: u32,
-    },
+    Candidate { votes: BTreeSet<ServerId> },
+    Leader { since_heartbeat: u32 },
 }
 
 /// One server's Raft state machine.
@@ -102,6 +97,9 @@ pub struct Raft {
     commit: LogIndex,
     applied: LogIndex,
     state: State,
+    /// What a leader knows of each peer's log. Empty unless this server leads, so the
+    /// leader-only code needs no role check of its own.
+    progress: BTreeMap<ServerId, Progress>,
     leader: Option<ServerId>,
     /// Ticks since the election timer was last reset.
     elapsed: u32,
@@ -160,6 +158,7 @@ impl Raft {
             commit: base.index,
             applied: base.index,
             state: State::Follower,
+            progress: BTreeMap::new(),
             leader: None,
             elapsed: 0,
             timeout: 0,
@@ -261,10 +260,7 @@ impl Raft {
     /// candidate.
     #[must_use]
     pub fn behind_base(&self) -> Vec<ServerId> {
-        let State::Leader { progress, .. } = &self.state else {
-            return Vec::new();
-        };
-        progress
+        self.progress
             .iter()
             .filter(|(_, p)| p.behind_base)
             .map(|(&id, _)| id)
@@ -282,10 +278,7 @@ impl Raft {
     /// draws the next election timeout if one is reset.
     #[must_use]
     pub fn tick(&mut self, entropy: u64) -> Vec<Effect> {
-        if let State::Leader {
-            since_heartbeat, ..
-        } = &mut self.state
-        {
+        if let State::Leader { since_heartbeat } = &mut self.state {
             *since_heartbeat += 1;
             if *since_heartbeat >= self.config.heartbeat_ticks {
                 *since_heartbeat = 0;
@@ -390,6 +383,7 @@ impl Raft {
         };
         self.persist_hard_state();
         self.state = State::Follower;
+        self.progress.clear();
         self.leader = None;
         self.reset_election_timer(entropy);
     }
@@ -416,7 +410,7 @@ impl Raft {
         for peer in peers {
             self.send(peer, MessageKind::VoteRequest { last_log });
         }
-        self.maybe_win();
+        self.win_if_quorum(1);
     }
 
     /// Answers a request from an earlier term with the current term, so the sender
@@ -460,15 +454,14 @@ impl Raft {
             && self.config.membership.is_voter(from)
         {
             votes.insert(from);
-            self.maybe_win();
+            let count = votes.len();
+            self.win_if_quorum(count);
         }
     }
 
-    fn maybe_win(&mut self) {
-        let State::Candidate { votes } = &self.state else {
-            return;
-        };
-        if votes.len() >= self.config.membership.quorum() {
+    /// Takes the leadership if `votes` (this candidate's own included) are a quorum.
+    fn win_if_quorum(&mut self, votes: usize) {
+        if votes >= self.config.membership.quorum() {
             self.become_leader();
         }
     }
@@ -488,10 +481,8 @@ impl Raft {
                 },
             )
         });
-        self.state = State::Leader {
-            progress: progress.collect(),
-            since_heartbeat: 0,
-        };
+        self.progress = progress.collect();
+        self.state = State::Leader { since_heartbeat: 0 };
         self.leader = Some(me);
         // A leader may count replicas only for entries of its own term, so it commits
         // the entries of earlier terms by committing this one.
@@ -531,31 +522,31 @@ impl Raft {
     }
 
     fn broadcast_append(&mut self) {
-        for peer in self.peers() {
-            self.send_append(peer);
+        let targets: Vec<(ServerId, LogIndex)> = self
+            .progress
+            .iter()
+            .map(|(&peer, p)| (peer, p.next))
+            .collect();
+        for (peer, next) in targets {
+            self.send_append(peer, next);
         }
     }
 
-    fn send_append(&mut self, to: ServerId) {
-        let State::Leader { progress, .. } = &self.state else {
-            return;
-        };
-        let Some(p) = progress.get(&to) else {
-            return;
-        };
-        let prev_index = p.next.prev();
+    /// Sends `to` the entries from `next`, the position the leader holds for it.
+    fn send_append(&mut self, to: ServerId, next: LogIndex) {
+        let prev_index = next.prev();
         let base = self.log.base();
         let (prev, entries) = match self.log.term_at(prev_index) {
             Some(term) => (
                 LogId::new(term, prev_index),
-                self.log.slice(p.next, self.config.max_entries_per_append),
+                self.log.slice(next, self.config.max_entries_per_append),
             ),
-            // The entries the peer needs are folded into the snapshot. Probe at the
-            // base instead: a peer that holds it (restored from a copy of this
-            // server's snapshot) accepts and is served from there; any other rejects,
-            // and the rejection is ignored (see `behind_base`).
-            None if prev_index < base.index => (base, Vec::new()),
-            None => return,
+            // The entries the peer needs are folded into the snapshot (a position past
+            // the log's end cannot occur: `next` never passes the last index plus one).
+            // Probe at the base instead: a peer that holds it (restored from a copy of
+            // this server's snapshot) accepts and is served from there; any other
+            // rejects, and the rejection is ignored (see `behind_base`).
+            None => (base, Vec::new()),
         };
         let kind = MessageKind::AppendRequest {
             prev,
@@ -640,10 +631,8 @@ impl Raft {
     fn on_append_response(&mut self, from: ServerId, outcome: AppendOutcome) {
         let last = self.log.last_index();
         let base = self.log.base().index;
-        let State::Leader { progress, .. } = &mut self.state else {
-            return;
-        };
-        let Some(p) = progress.get_mut(&from) else {
+        // Empty unless leading, so this also drops an answer that reaches a non-leader.
+        let Some(p) = self.progress.get_mut(&from) else {
             return;
         };
         match outcome {
@@ -654,10 +643,10 @@ impl Raft {
                 p.matched = p.matched.max(matched);
                 p.next = p.next.max(matched.next());
                 p.behind_base = false;
-                let behind = p.next <= last;
+                let next = p.next;
                 self.advance_commit();
-                if behind {
-                    self.send_append(from);
+                if next <= last {
+                    self.send_append(from, next);
                 }
             }
             AppendOutcome::Rejected { at, last: theirs } => {
@@ -672,7 +661,8 @@ impl Raft {
                     return; // answers a request older than the current position
                 }
                 p.next = at.min(theirs.next()).max(p.matched.next());
-                self.send_append(from);
+                let next = p.next;
+                self.send_append(from, next);
             }
         }
     }
@@ -680,9 +670,6 @@ impl Raft {
     /// Moves the commit index to the highest index of the current term that a majority
     /// of voters hold.
     fn advance_commit(&mut self) {
-        let State::Leader { progress, .. } = &self.state else {
-            return;
-        };
         let me = self.config.id;
         let last = self.log.last_index();
         let quorum = self.config.membership.quorum();
@@ -697,7 +684,7 @@ impl Raft {
                 .config
                 .membership
                 .voters()
-                .filter(|&v| v == me || progress.get(&v).is_some_and(|p| p.matched >= n))
+                .filter(|&v| v == me || self.progress.get(&v).is_some_and(|p| p.matched >= n))
                 .count();
             if held >= quorum {
                 self.commit = n;
@@ -709,13 +696,13 @@ impl Raft {
     }
 
     fn apply_committed(&mut self) {
-        while self.applied < self.commit {
-            // The commit index never passes the end of the log, so this always finds one.
-            let Some(entry) = self.log.entry(self.applied.next()) else {
-                break;
-            };
-            self.effects.push(Effect::Apply(entry.clone()));
-            self.applied = self.applied.next();
+        // The commit index never passes the end of the log, so the slice is all of
+        // (applied, commit].
+        let count =
+            usize::try_from(self.commit.0.saturating_sub(self.applied.0)).unwrap_or(usize::MAX);
+        for entry in self.log.slice(self.applied.next(), count) {
+            self.applied = entry.id.index;
+            self.effects.push(Effect::Apply(entry));
         }
     }
 }

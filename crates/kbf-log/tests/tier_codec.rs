@@ -176,6 +176,7 @@ fn the_golden_set_names_every_tier_command() {
             | Command::AdoptSegment { .. }
             | Command::RebuildProgress { .. }
             | Command::RebuildDone => panic!("{name} is a format-4 command"),
+            Command::ReseatStaged { .. } => panic!("{name} is a format-5 command"),
         };
         seen[i] = true;
     }

@@ -17,7 +17,7 @@ use super::{Cli, Error};
 ///
 /// # Errors
 /// A node no release is built for, or an update directory that cannot be opened.
-pub(crate) fn link(cli: &Cli) -> Result<UpdateLink, Error> {
+pub fn link(cli: &Cli) -> Result<UpdateLink, Error> {
     let Some(dir) = &cli.update_dir else {
         return Ok(UpdateLink::manual(BUILD_COMMIT));
     };

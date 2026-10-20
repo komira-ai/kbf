@@ -236,6 +236,10 @@ struct MemberView {
     weight: u32,
     /// What its registration named; `None` if its row names none or has lapsed.
     protocol: Option<u32>,
+    /// Why a joiner is not promoted yet, when `--auto-promote` is on and it is one
+    /// (`docs/design/rebalance-handoff.md`); absent otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blocked_on: Vec<String>,
 }
 
 /// The storage members of the current map.
@@ -268,9 +272,9 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
     // whose row lapses between the two is listed without a version.
     let read = tokio::task::spawn_blocking(move || {
         let map = members.current_map()?;
-        Ok::<_, MembershipError>((map, members.protocols()?))
+        Ok::<_, MembershipError>((map, members.protocols()?, members.blocked_joiners()?))
     });
-    let (map, protocols) = match read.await {
+    let (map, protocols, blocked) = match read.await {
         Ok(Ok(read)) => read,
         Ok(Err(e)) => {
             let code = match e {
@@ -302,6 +306,9 @@ async fn members_view(State(api): State<Arc<ApiState>>) -> Response {
                     state: state_name(m.state),
                     weight: m.weight,
                     protocol: protocols.get(&m.id).copied().flatten(),
+                    blocked_on: blocked
+                        .get(&m.id)
+                        .map_or_else(Vec::new, |b| b.iter().map(ToString::to_string).collect()),
                 })
                 .collect();
             MembersView {
@@ -478,7 +485,9 @@ const fn member_failure(e: &MembershipError) -> StatusCode {
     match e {
         MembershipError::NotRegistered(_) => StatusCode::NOT_FOUND,
         MembershipError::NotSettable(_) => StatusCode::BAD_REQUEST,
-        MembershipError::NotActive { .. } => StatusCode::CONFLICT,
+        MembershipError::NotActive { .. } | MembershipError::PinsFull { .. } => {
+            StatusCode::CONFLICT
+        }
         MembershipError::Store(_) | MembershipError::Contended => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -979,3 +988,7 @@ mod tests {
         assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
+
+#[cfg(test)]
+#[path = "api_members_tests.rs"]
+mod members_tests;

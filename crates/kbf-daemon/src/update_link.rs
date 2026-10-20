@@ -73,6 +73,13 @@ impl UpdateLink {
         }
     }
 
+    /// Whether this link has an update client behind it, so an order the frontend sends is
+    /// handled; `false` for a node that updates by hand and for no link.
+    #[must_use]
+    pub fn takes_orders(&self) -> bool {
+        self.handle.is_some()
+    }
+
     /// A new stream began and its Welcome named lease epoch `epoch` (0: none). The
     /// status goes out on it, read afresh from the helper.
     pub(crate) fn new_stream(&mut self, epoch: u64, tx: &UnboundedSender<DaemonMessage>) {
