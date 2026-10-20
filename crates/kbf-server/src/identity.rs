@@ -79,13 +79,14 @@ impl PeerCert {
             .map_err(|e| e.to_string())
     }
 
-    /// The caller a proxy verified, which names only `node_id`: no serial or key hash, so a
-    /// `serial` or `spki-sha256` deny entry cannot name it (a `node` entry can), and no IP
-    /// name, so a Membership registration by IP address is refused behind the proxy.
+    /// The caller a proxy verified, which names `node_id` and the IP addresses `ips` of its
+    /// leaf (`x-kbf-node-ips`): no serial or key hash, so a `serial` or `spki-sha256` deny
+    /// entry cannot name it (a `node` entry can). A Membership registration by IP address is
+    /// covered exactly when that address is in `ips`.
     #[must_use]
-    pub fn proxied(node_id: &str) -> Self {
+    pub fn proxied(node_id: &str, ips: &[std::net::IpAddr]) -> Self {
         Self {
-            identity: PeerIdentity::proxied(node_id),
+            identity: PeerIdentity::proxied(node_id, ips),
         }
     }
 
@@ -215,7 +216,7 @@ impl Peers {
             (Self::Certified { .. }, Presented::Proxy(identity)) => identity
                 .node_id
                 .as_deref()
-                .map(|node| Some(PeerCert::proxied(node)))
+                .map(|node| Some(PeerCert::proxied(node, &identity.ips)))
                 .ok_or_else(|| Status::unauthenticated("no client identity from the proxy")),
             (Self::Certified { .. }, Presented::Leaf(leaf)) => self.peer(leaf.as_deref()),
         }

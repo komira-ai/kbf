@@ -679,6 +679,42 @@ fn run_with_an_installer_config_drives_a_helper_that_migrates_first() {
     assert!(with(&[]).schema_step_mut().is_none(), "no flag, no step");
 }
 
+/// Catches `run` building a helper that cannot tell about leases (the stub every build had
+/// until a lease source was wired): the helper `run` builds reads the lease cgroups of the
+/// unit it restarts, below the host root's `/sys/fs/cgroup`, so a populated lease of
+/// `kbf-daemon.service` is one live lease. A unit that never ran (no cgroup), a unit of no
+/// mode and a launchd label each cannot tell, with the reason: the activation is refused
+/// (fail closed), and `run` itself still starts for them.
+///
+/// Mutants seen red: `leases::NotWired` left in `build_helper` (the daemon's lease reads as
+/// "cannot tell"); the cgroup root taken as the real `/sys/fs/cgroup` instead of the host
+/// root's.
+#[test]
+fn run_builds_a_helper_whose_lease_source_reads_the_restarted_units_cgroup() {
+    let (_, root) = seeded("run-lease-source");
+    let lease = root.join("sys/fs/cgroup/kbf.slice/kbf-daemon.service/actions/kbf-lease-1-1");
+    fs::create_dir_all(&lease).expect("lease cgroup");
+    fs::write(lease.join("cgroup.events"), "populated 1\n").expect("events");
+    let source = |flags: &[&str]| {
+        let mut argv = vec!["--root", root.to_str().expect("text"), "run"];
+        argv.extend_from_slice(flags);
+        let Verb::Run(args) = parse(&argv).verb else {
+            panic!("a run");
+        };
+        match build_helper(root.clone(), &args) {
+            Ok(helper) => helper.leases().live(),
+            Err(f) => panic!("{}", f.why),
+        }
+    };
+    assert_eq!(source(&["--unit", "kbf-daemon.service"]), Ok(1));
+    let err = source(&["--unit", "kbf-frontend@a.service"]).expect_err("never ran");
+    assert!(err.contains("no such cgroup"), "{err}");
+    let err = source(&["--unit", "kbf.service"]).expect_err("no mode's unit");
+    assert!(err.contains("is no unit of any mode"), "{err}");
+    let err = source(&["--launchd-label", "com.example.kbf"]).expect_err("not wired");
+    assert!(err.contains("no lease source wired"), "{err}");
+}
+
 /// Catches `run --installer-config` reading the config under a host root that is not an
 /// absolute path (the root is the sandbox flag's; a relative one is refused with its reason
 /// rather than reading from the working directory).
