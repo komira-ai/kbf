@@ -1125,6 +1125,48 @@ fn the_unservable_wait_comes_from_its_flag() {
     );
 }
 
+/// Catches: `--default-platform` parsed but not handed to the listeners (the live
+/// incident's fix would then be off whatever the operator set), a default other than
+/// linux/x86_64, `none` read as a platform, an OS or architecture no daemon runs
+/// accepted (a typo found at the first action instead of at start), and a value with
+/// no architecture.
+#[test]
+fn the_default_platform_comes_from_its_flag() {
+    use clap::Parser;
+    use kbf_front::DefaultPlatform;
+    let parse = |value: Option<&str>| {
+        let args = std::iter::once("kbf-server")
+            .chain(value.into_iter().flat_map(|v| ["--default-platform", v]));
+        kbf_server::Args::try_parse_from(args)
+    };
+    let platform = |value| {
+        parse(value)
+            .expect("flags parse")
+            .listeners()
+            .expect("listeners")
+            .default_platform
+    };
+    assert_eq!(platform(None), DefaultPlatform::LINUX_X86_64);
+    assert_eq!(platform(Some("none")), DefaultPlatform::NONE);
+    assert_eq!(
+        platform(Some("macos/arm64"))
+            .get()
+            .map(|(os, a)| (os, a.name())),
+        Some(("macos", "arm64"))
+    );
+    for bad in [
+        "windows/x86_64",
+        "linux",
+        "linux/mips",
+        "linux/",
+        "/x86_64",
+        "",
+    ] {
+        let err = parse(Some(bad)).expect_err(bad);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+    }
+}
+
 /// Catches: `--memory-ladder-gib` not parsed into the listeners' ladder (a farm that
 /// ignores it books 4 GiB whatever the operator set), a default other than 4, 16 and
 /// 32 GiB, a comma that does not separate rungs, and a ladder that is not ascending

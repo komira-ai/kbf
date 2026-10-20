@@ -112,6 +112,7 @@ use kbf_auth::AuthenticationMetadata;
 use kbf_invocation::{CallKind, ExecuteAnswer};
 
 use crate::backend::Backend;
+use crate::default_platform::{DefaultPlatform, Quiet};
 use crate::described::Described;
 use crate::metrics::{CacheMetrics, OpenExecute};
 use crate::recorder::{ActionLabel, ExecuteCall, Recorder, listing};
@@ -443,6 +444,10 @@ pub struct ExecutionService<D> {
     recorder: Recorder,
     /// The memory an `action` that names no size books, in bytes.
     default_memory: u64,
+    /// The OS and architecture of an `action` that names neither.
+    default_platform: DefaultPlatform,
+    /// Holds the log lines of [`Self::default_platform`] to a few a minute.
+    defaulted_log: Quiet,
 }
 
 /// The gRPC path of Execute, as calls are logged.
@@ -469,7 +474,18 @@ impl<D> ExecutionService<D> {
             authorizers,
             recorder: Recorder::off(),
             default_memory: DEFAULT_RESOURCES.memory_bytes,
+            default_platform: DefaultPlatform::NONE,
+            defaulted_log: Quiet::default(),
         }
+    }
+
+    /// This service, giving an `action` that names no OS, no architecture and no ISA
+    /// level (and asks for nothing only a Mac reports) the OS and architecture of
+    /// `platform` (instead of none): placement only, the digest is the client's.
+    #[must_use]
+    pub const fn with_default_platform(mut self, platform: DefaultPlatform) -> Self {
+        self.default_platform = platform;
+        self
     }
 
     /// This service, booking `bytes` of memory for an `action` that names no size
@@ -698,7 +714,7 @@ impl<D> ExecutionService<D> {
         let platform = properties(platform(&decoded, command.as_ref()))?;
         let kind = lease_kind(&platform)?;
         let booked = booking(&platform, kind, self.default_memory)?;
-        let needs = needs(&platform)?;
+        let needs = self.placed(&action, needs(&platform)?);
         let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
         device_kind(kind, &needs)?;
         let submission = Submission {
@@ -716,6 +732,23 @@ impl<D> ExecutionService<D> {
             described: command.map(Described::of).unwrap_or_default(),
         };
         Ok((submission, command_digest))
+    }
+
+    /// `needs`, given the default platform if it names no OS and no architecture
+    /// ([`DefaultPlatform::apply`]). Placement only: the action's digest is the client's.
+    fn placed(&self, action: &Digest, needs: kbf_caps::Request) -> kbf_caps::Request {
+        let Some(placed) = self.default_platform.apply(&needs) else {
+            return needs;
+        };
+        if let Some(held_back) = self.defaulted_log.turn() {
+            tracing::info!(
+                %action,
+                default_platform = %self.default_platform,
+                held_back,
+                "platform defaulted: the action named no OS and no architecture"
+            );
+        }
+        placed
     }
 
     /// The phases of a walk over a store in the metrics (a walk by the in-process cache

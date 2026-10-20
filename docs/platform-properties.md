@@ -75,6 +75,15 @@ satisfies it for `--unservable-wait-secs` (300 by default; the wait restarts whe
 one does), it fails with `FAILED_PRECONDITION` and that reason. Work larger than every
 worker that satisfies its platform (`gpu=2` where nodes have one) is treated the same.
 
+An action that names no OS, no architecture and no ISA level (an empty platform, or one
+with only properties kbf does not read, such as `pool`) is placed by
+`--default-platform` (`linux/x86_64` by default), so it is never handed to a Mac that
+merely sorts first. The default is not applied to an action that names `OSFamily` or
+`ISA` alone, or asks for `xcode`, an iOS device or a VM image, which only a Mac reports.
+`--default-platform none` applies none. It changes placement only: the action digest and
+the cache key are the client's. Each application is logged with the action digest, at
+most once in ten seconds.
+
 ## `gpu`
 
 `gpu=N` places the action only on a worker with `N` free GPUs, and books those GPUs
