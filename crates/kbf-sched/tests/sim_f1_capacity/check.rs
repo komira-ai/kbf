@@ -2,8 +2,9 @@
 //! checked after every input (catalog section 4, `docs/design/simulation.md`).
 //!
 //! The shadow is written from the scheduler's contract, not from its code: it keeps
-//! its own queue, bookings, leases and dedup map, and its own reference first fit and
-//! unservable verdict, and compares the scheduler's effects and public state with them
+//! its own queue, bookings, leases and dedup map, and its own reference placement (the
+//! least loaded worker with room) and unservable verdict, and compares the scheduler's
+//! effects and public state with them
 //! after each input. Nothing here calls `Resources::fits` or `saturating_sub`: a
 //! mutant there must not also bend the reference.
 //!
@@ -29,7 +30,7 @@
 //! This file is local to the F1 family for now; it is written to move unchanged to the
 //! shared `tests/sim/check.rs` the catalog plans once the other families land theirs.
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 
 use kbf_caps::NodeCaps;
@@ -107,6 +108,30 @@ fn fits_beside(capacity: Axes, room: Room, request: Axes) -> bool {
 /// Whether `request` fits in a whole `capacity`.
 fn fits_whole(capacity: Axes, request: Axes) -> bool {
     (0..3).all(|i| request[i] <= capacity[i])
+}
+
+/// The larger of the CPU and memory shares of `capacity` that `booked` is, as a fraction
+/// `(numerator, denominator)`; an axis with no capacity counts as 0. Integers, written
+/// here and not taken from the scheduler, so a defect in its ranking is not shared.
+fn dominant(capacity: Axes, booked: Axes) -> (u128, u128) {
+    let mut best = (0, 1);
+    for axis in [0, 1] {
+        let (b, c) = (u128::from(booked[axis]), u128::from(capacity[axis]));
+        if c > 0 && b * best.1 > best.0 * c {
+            best = (b, c);
+        }
+    }
+    best
+}
+
+/// How placement ranks two workers, each as its capacity and what it holds: the lesser
+/// share first, then the fewer leases. `Less` is the better place. A tie is left to the
+/// caller: the first by name.
+fn by_load(a: (Axes, Room), b: (Axes, Room)) -> Ordering {
+    let (x, y) = (dominant(a.0, a.1.booked), dominant(b.0, b.1.booked));
+    (x.0 * y.1)
+        .cmp(&(y.0 * x.1))
+        .then(a.1.leases.cmp(&b.1.leases))
 }
 
 #[derive(Clone, Debug)]
@@ -224,6 +249,8 @@ pub struct Stats {
     pub grants: u64,
     /// Grants that left their worker with nothing free on some axis the request used.
     pub exact_fills: u64,
+    /// Workers held, in a round, for an operation that runs alone.
+    pub holds: u64,
     /// Submissions that joined a twin.
     pub joins: u64,
     /// Joins that raised the QoS of a queued twin.
@@ -269,6 +296,9 @@ pub struct Checker {
     touched_workers: BTreeSet<WorkerId>,
     /// The grants of the last round, in order.
     pub last_round: Vec<(OperationId, WorkerId)>,
+    /// The worker each queued operation that runs alone held at the last round:
+    /// placement keeps a hold while that worker could still run it.
+    holds: BTreeMap<OperationId, WorkerId>,
     /// Per operation: the farm time (ms) of its first grant.
     pub granted_at: BTreeMap<OperationId, u64>,
     /// Per operation: the farm time (ms) it was finished.
@@ -307,6 +337,7 @@ impl Checker {
             touched_ops: BTreeSet::new(),
             touched_workers: BTreeSet::new(),
             last_round: Vec::new(),
+            holds: BTreeMap::new(),
             granted_at: BTreeMap::new(),
             finished_at: BTreeMap::new(),
             refused_reason: BTreeMap::new(),
