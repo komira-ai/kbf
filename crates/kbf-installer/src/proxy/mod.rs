@@ -26,6 +26,10 @@
 //! documentation: [`ports::Migrator`] is [`supervisor_swap::ExpandOnlyDefault`] until a real
 //! migrator exists, and the compatibility gate is the API's.
 //!
+//! The update API's seams are bound in [`handover`]: the order spool, `status.json`, the
+//! request map and the restart answer are real there, and so is the supervisor
+//! ([`supervisor_swap::SwapSupervisor`]).
+//!
 //! Not built, stated: [`supervisor::adopt_children`] still adopts a child only when no update
 //! is in flight (the startup hold stays otherwise); starting a first child on a host that has
 //! none and choosing between two live children are not done. `Admin::ready` reports `health`
@@ -91,6 +95,7 @@ pub mod child_http;
 #[cfg(target_os = "linux")]
 pub mod child_real;
 pub mod gate_real;
+pub mod handover;
 pub mod model;
 pub mod orders;
 pub mod ports;
