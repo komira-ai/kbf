@@ -118,6 +118,7 @@ fn a_report_the_scheduler_does_not_take_is_refused() {
         lease: LeaseId::new(farm.lease_epoch(), 99),
         outcome: Outcome::Failed(Failure::Infra),
         measured: None,
+        exit_code: None,
         run: None,
     };
     let now = farm.now();

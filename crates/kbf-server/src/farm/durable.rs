@@ -85,6 +85,7 @@ use super::{
     refused_as,
 };
 use crate::action_usage::Subject;
+use crate::machine::Platform;
 use crate::state_store::StateStore;
 
 use self::inflight::Submitted;
@@ -1154,6 +1155,7 @@ impl State {
             kind: op.request.kind,
             do_not_cache: op.request.do_not_cache,
             queued: now,
+            platform: Platform::of(&op.request.needs),
             // A row from a writer that did not record the subject (an older build)
             // leaves the `action usage:` line naming the empty shape.
             usage: op
