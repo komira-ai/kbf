@@ -306,15 +306,17 @@ pub struct RunArgs {
 
 impl RunArgs {
     /// Root's directory, as the flag gives it; else the host's own.
-    pub fn update_dir_in(&self, _layout: &crate::layout::Layout) -> kbf_host::HostPath {
-        let tip = kbf_host::HostPath::new("/var/lib/kbf-installer").expect("absolute");
-        self.update_dir.clone().unwrap_or(tip)
+    pub fn update_dir_in(&self, layout: &crate::layout::Layout) -> kbf_host::HostPath {
+        self.update_dir
+            .clone()
+            .unwrap_or_else(|| layout.update_dir())
     }
 
     /// The order spool, as the flag gives it; else the host's own.
-    pub fn orders_dir_in(&self, _layout: &crate::layout::Layout) -> kbf_host::HostPath {
-        let tip = kbf_host::HostPath::new("/var/lib/kbf-installer/orders").expect("absolute");
-        self.orders_dir.clone().unwrap_or(tip)
+    pub fn orders_dir_in(&self, layout: &crate::layout::Layout) -> kbf_host::HostPath {
+        self.orders_dir
+            .clone()
+            .unwrap_or_else(|| layout.orders_dir())
     }
 
     /// The service this `run` restarts, when the flags name it; `None` when neither does.
