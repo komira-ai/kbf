@@ -644,3 +644,29 @@ async fn a_report_the_log_cannot_answer_is_an_error() {
     let report = cache.flush_report().await.expect("report");
     assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 1));
 }
+
+/// Catches: the staging dates growing with every object ever staged when nothing asks for
+/// a flush report (a node serving writes whose report nobody polls): the flush round, which
+/// already reads the staged set, drops the date of every object that left it. Two objects
+/// staged are two dates; once the round has flushed them there are none, with no
+/// `flush_report` call in between.
+#[tokio::test]
+async fn a_flush_round_drops_the_dates_of_objects_that_are_no_longer_staged() {
+    let farm = Farm::new(Default::default());
+    let node = Node::new(1, &solo(5));
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(OneFlusher::new(Arc::clone(&node) as _));
+    assert_eq!(cache.dated_objects(), 0);
+    for seed in [1, 2] {
+        cache
+            .store_blobs(vec![big(seed).verified()])
+            .await
+            .expect("stored");
+    }
+    assert_eq!(cache.dated_objects(), 2);
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed.len(), 2);
+    assert_eq!(cache.dated_objects(), 0);
+}

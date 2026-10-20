@@ -323,15 +323,18 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             round.sealed.push(object);
         }
         let (tier, waiting, gate) = (staging.id, staging.waiting(now), self.gate.clone());
-        let (due, (backlog, backlog_bytes)) = self
+        let mark = self.writer.born.mark();
+        let (due, (backlog, backlog_bytes), mut staged) = self
             .writer
             .query(move |s| {
-                let backlog = s
-                    .staged_objects()
-                    .filter(|(_, o)| o.tier() == tier)
-                    .fold((0u64, 0u64), |(n, b), (_, o)| {
+                let mut staged = BTreeSet::new();
+                let backlog = s.staged_objects().filter(|(_, o)| o.tier() == tier).fold(
+                    (0u64, 0u64),
+                    |(n, b), (object, o)| {
+                        staged.insert(object);
                         (n + 1, b + o.committed_len())
-                    });
+                    },
+                );
                 let ours = |o: &StagedObject| (o.tier(), o.state()) == (tier, StagedState::Sealed);
                 let sealed = s.staged_objects().filter(|(_, o)| ours(o));
                 let sealed = sealed.filter(|(object, _)| !waiting.contains(object));
@@ -351,7 +354,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                     let blobs: Vec<(Digest, u64)> = o.blobs().map(|(d, at)| (*d, at)).collect();
                     Some((object, o.committed_len(), blobs, first))
                 });
-                (due.collect::<Vec<_>>(), backlog)
+                (due.collect::<Vec<_>>(), backlog, staged)
             })
             .await?;
         staging.counters.staged_objects.set(backlog);
@@ -385,6 +388,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 }
             }
         }
+        // The staging dates of objects no longer staged here go with the round: nothing
+        // else need call `flush_report` for the dates not to pile up. A flushed object
+        // has left staged state; the others (open, sealed, conflicting) keep theirs.
+        for object in &done {
+            staged.remove(object);
+        }
+        self.writer.born.prune(mark, &staged);
         Ok(round)
     }
 

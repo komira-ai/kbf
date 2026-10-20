@@ -35,7 +35,15 @@ use crate::meta_log::MetaLog;
 #[derive(Default)]
 pub(super) struct Born {
     gate: Mutex<Option<Arc<dyn FlushGate>>>,
-    at: Mutex<BTreeMap<ObjectId, u64>>,
+    at: Mutex<Dates>,
+}
+
+/// The dates, each with the note's sequence number, so a prune can tell a note made
+/// after its query began (whose object the query may not have seen) from an older one.
+#[derive(Default)]
+struct Dates {
+    seq: u64,
+    by_object: BTreeMap<ObjectId, (u64, u64)>,
 }
 
 impl std::fmt::Debug for Born {
@@ -58,16 +66,43 @@ impl Born {
         let held = gate.as_ref().and_then(|g| g.generation()).unwrap_or(0);
         drop(gate);
         let mut at = self.at.lock().unwrap_or_else(PoisonError::into_inner);
-        at.entry(object).or_insert(held);
+        at.seq += 1;
+        let seq = at.seq;
+        at.by_object.entry(object).or_insert((held, seq));
+    }
+
+    /// A mark to take before a query of the staged set, for [`Born::prune`].
+    pub(super) fn mark(&self) -> u64 {
+        self.at.lock().unwrap_or_else(PoisonError::into_inner).seq
+    }
+
+    /// Forgets the date of every object not in `staged`, the staged set a query made
+    /// after [`Born::mark`] returned `mark` saw. A date noted after the mark stays: its
+    /// object may have been staged after the query.
+    pub(super) fn prune(&self, mark: u64, staged: &BTreeSet<ObjectId>) {
+        let mut at = self.at.lock().unwrap_or_else(PoisonError::into_inner);
+        at.by_object
+            .retain(|object, (_, seq)| *seq > mark || staged.contains(object));
     }
 
     /// The clear generation given `held` and the objects this node still has to flush,
-    /// forgetting every date of an object not in `staged`.
-    fn clear(&self, held: u64, staged: &BTreeSet<ObjectId>, mine: &[ObjectId]) -> u64 {
-        let mut at = self.at.lock().unwrap_or_else(PoisonError::into_inner);
-        at.retain(|object, _| staged.contains(object));
-        let oldest = mine.iter().map(|o| at.get(o).copied().unwrap_or(0));
+    /// forgetting every date of an object not in `staged` ([`Born::prune`]).
+    fn clear(&self, held: u64, mark: u64, staged: &BTreeSet<ObjectId>, mine: &[ObjectId]) -> u64 {
+        self.prune(mark, staged);
+        let at = self.at.lock().unwrap_or_else(PoisonError::into_inner);
+        let oldest = mine
+            .iter()
+            .map(|o| at.by_object.get(o).map_or(0, |(held, _)| *held));
         oldest.fold(held, u64::min)
+    }
+
+    /// How many objects have a date.
+    pub(super) fn dated(&self) -> usize {
+        self.at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_object
+            .len()
     }
 }
 
@@ -86,6 +121,15 @@ pub struct FlushReport {
 }
 
 impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
+    /// How many objects this node holds a staging date for. A date lives while its object
+    /// is staged on this node's tier, and is dropped by the next flush round
+    /// ([`Cache::flush_tier`]) or report after the object leaves staged state, so this
+    /// is bounded by the staged objects and the objects staged since.
+    #[must_use]
+    pub fn dated_objects(&self) -> usize {
+        self.writer.born.dated()
+    }
+
     /// The report of this node's unflushed objects now.
     ///
     /// # Errors
@@ -94,6 +138,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     pub async fn flush_report(&self) -> Result<FlushReport, CacheError> {
         // Before the query, so a map taken in between only lowers what is said.
         let held = self.gate.as_ref().and_then(|g| g.generation());
+        let mark = self.writer.born.mark();
         let Some(staging) = self.writer.tier.get() else {
             return Ok(FlushReport {
                 clear_gen: held,
@@ -121,9 +166,38 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             })
             .await?;
         Ok(FlushReport {
-            clear_gen: held.map(|held| self.writer.born.clear(held, &staged, &mine)),
+            clear_gen: held.map(|held| self.writer.born.clear(held, mark, &staged, &mine)),
             staged_objects: staged.len() as u64,
             staged_bytes: bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kbf_meta::Epoch;
+
+    fn object(n: u64) -> ObjectId {
+        ObjectId::new(Epoch::new(1), n)
+    }
+
+    /// Catches: a prune that forgets the date of an object staged after its query began
+    /// (the query's staged set cannot name it, and it would count as staged under
+    /// generation 0, holding the clear generation back for nothing), and one that keeps
+    /// the date of an object the query found gone. Object 1 is dated before the mark and
+    /// not staged: dropped; object 2 is dated before the mark and staged: kept; object 3
+    /// is dated after the mark and not in the set: kept.
+    #[test]
+    fn a_prune_keeps_the_dates_of_staged_objects_and_of_notes_after_its_mark() {
+        let born = Born::default();
+        born.note(object(1));
+        born.note(object(2));
+        let mark = born.mark();
+        born.note(object(3));
+        born.prune(mark, &BTreeSet::from([object(2)]));
+        assert_eq!(born.dated(), 2);
+        born.prune(born.mark(), &BTreeSet::new());
+        assert_eq!(born.dated(), 0);
     }
 }
