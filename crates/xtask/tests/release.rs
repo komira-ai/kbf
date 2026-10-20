@@ -855,6 +855,15 @@ fn tags_standing(root: &Path, tags: &[&str], top: &str, status: &str) {
 }
 
 fn publish_set(root: &Path, set_hash: &str, defect: Option<&str>) -> (Option<i32>, String, String) {
+    publish_tag(root, TAG, set_hash, defect)
+}
+
+fn publish_tag(
+    root: &Path,
+    tag: &str,
+    set_hash: &str,
+    defect: Option<&str>,
+) -> (Option<i32>, String, String) {
     // Rule S reads the release tags: `TAG` is the highest and names `COMMIT`, unless the
     // test has said otherwise.
     if !std::fs::read_to_string(root.join("gh/gh-api.json"))
@@ -873,7 +882,7 @@ fn publish_set(root: &Path, set_hash: &str, defect: Option<&str>) -> (Option<i32
             "--repo",
             REPO,
             "--tag",
-            TAG,
+            tag,
             "--commit",
             COMMIT,
             "--run-id",
@@ -1185,7 +1194,8 @@ fn publish_goes_on_when_the_highest_tag_is_an_ancestor_of_the_commit() {
     // Control for the test above: the highest tag is older than the commit (`ahead`),
     // and a repository with no release tag at all is not superseded by one.
     for (tags, top, status) in [
-        (vec![TAG], TAG, "ahead"),
+        (vec!["v0.0.9"], "v0.0.9", "ahead"),
+        (vec![], TAG, "identical"),
         (vec![TAG, "v0.1.0-rc1", "latest"], TAG, "identical"),
     ] {
         let root = scratch("publish-ahead");
@@ -1194,6 +1204,39 @@ fn publish_goes_on_when_the_highest_tag_is_an_ancestor_of_the_commit() {
         let (code, _, err) = publish(&root, None);
         assert_eq!(code, Some(0), "{status}: {err}");
         assert_eq!(released(&root), verified(&root));
+    }
+}
+
+#[test]
+fn publish_refuses_a_tag_that_is_not_above_the_highest_before_any_write() {
+    // Catches: Rule S comparing only the commit with the highest tag, so a caller could
+    // publish `--tag v0.0.1` for an ahead commit while v0.0.5 exists; a tag equal to the
+    // highest that does not name this commit; a lower tag when the highest names it; a
+    // tag that is no release tag. A re-run (the highest tag names this commit and is
+    // `--tag`) is the control, and it is in `a_rerun_changes_nothing`.
+    for (top, status, tag) in [
+        ("v0.0.5", "ahead", "v0.0.1"),
+        ("v0.0.5", "ahead", "v0.0.5"),
+        ("v0.0.5", "ahead", "latest"),
+        ("v0.0.5", "identical", "v0.0.1"),
+    ] {
+        let root = scratch("publish-low-tag");
+        let dist = dist(&root, COMMIT);
+        tags_standing(&root, &[top], top, status);
+        let sums = std::fs::read_to_string(dist.join("SHA256SUMS")).expect("sums");
+        let (code, out, err) = publish_tag(&root, tag, &sha_of(&sums), None);
+        assert_eq!(code, Some(1), "{tag} {status}: {out}");
+        assert!(
+            err.contains(&format!(
+                "--tag {tag} is no release above the highest release tag {top}"
+            )),
+            "{tag} {status}: {err}"
+        );
+        let args = gh_args(&root);
+        assert!(!args.contains("release create"), "{tag}: {args}");
+        assert!(!args.contains("release upload"), "{tag}: {args}");
+        assert!(!args.contains("releases/tags"), "{tag}: {args}");
+        assert_eq!(released(&root), vec![], "{tag}");
     }
 }
 

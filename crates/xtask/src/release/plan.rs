@@ -14,12 +14,15 @@
 //! highest tag already names, that tag's version again (`reused=true`). Then the push is
 //! classified from the files `--before` to `--sha` changed:
 //!
-//! - `code`: some file ships in a release. Not code: `**.md`, `docs/**`, `.github/**`,
-//!   `site/**`, `infra/**`. `VERSION` is code (a bump releases). A mixed push is code.
+//! - `code`: some file ships in a release. Not code: a root `*.md`, `docs/**`,
+//!   `.github/**`, `site/**`, `infra/**` (a `.md` under `crates/` is code: it may be
+//!   `include_str!`ed). `VERSION` is code (a bump releases). A mixed push is code.
 //! - `site`: some file is under `site/` or `docs/`, which kbf.dev renders.
-//! - `pipeline`: some file is the release machinery itself (`.github/workflows/`,
-//!   `infra/site/`, `crates/xtask/src/release*`): the pipeline does not release a commit
-//!   that changes it; the next push that does not releases both.
+//! - `pipeline`: some file is the release machinery or what it trusts (`.github/`,
+//!   `infra/`, `crates/xtask/`, `crates/kbf-gate/`, `.config/`, `.cargo/`,
+//!   `rust-toolchain*`, `deny.toml`, `Cargo.lock`): the pipeline does not release a
+//!   commit that changes it; the next push that does not releases both. Classes are not
+//!   exclusive: such a file under `crates/` is code too.
 //!
 //! A `--before` of all zeros (a branch's first push) names no earlier commit, and one
 //! this checkout does not hold (a forced push) cannot be diffed: both read as `code=true`
@@ -74,20 +77,30 @@ pub struct Class {
     pub pipeline: bool,
 }
 
-/// A path that ships in no release.
+/// A path that ships in no release. A markdown file under `crates/` may be
+/// `include_str!`ed, so only a root `*.md` and the directories below ship nothing.
 fn ships_nothing(path: &str) -> bool {
-    path.ends_with(".md")
+    (path.ends_with(".md") && !path.contains('/'))
         || ["docs/", ".github/", "site/", "infra/"]
             .iter()
             .any(|dir| path.starts_with(dir))
 }
 
-/// The release machinery: the workflows, the site stack and the xtask `release` verbs.
+/// The release machinery and what it trusts: the workflows and every other file under
+/// `.github/` and `infra/`, all of `crates/xtask/` and `crates/kbf-gate/` (the verdict
+/// and the notes use them), and the toolchain, dependency and policy files. Fail closed:
+/// a push that touches one never releases itself.
 fn is_pipeline(path: &str) -> bool {
     [
-        ".github/workflows/",
-        "infra/site/",
-        "crates/xtask/src/release",
+        ".github/",
+        "infra/",
+        "crates/xtask/",
+        "crates/kbf-gate/",
+        ".config/",
+        ".cargo/",
+        "rust-toolchain",
+        "deny.toml",
+        "Cargo.lock",
     ]
     .iter()
     .any(|prefix| path.starts_with(prefix))
