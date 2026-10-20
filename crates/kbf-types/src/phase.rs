@@ -60,3 +60,49 @@ impl NodePhase {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches: a phase that is not a lease switch reporting one, or a switch (preparing or
+    /// restoring) not naming its lease, which the scheduler keeps while the worker is
+    /// silent.
+    #[test]
+    fn only_preparing_and_restoring_are_switching_and_name_their_lease() {
+        let lease = LeaseId { term: 3, seq: 9 };
+        assert_eq!(NodePhase::Preparing(lease).switching(), Some(lease));
+        assert_eq!(NodePhase::Restoring(lease).switching(), Some(lease));
+        for phase in [
+            NodePhase::Serving,
+            NodePhase::Quarantined("cleanup failed".to_owned()),
+            NodePhase::MemoryPressure,
+            NodePhase::Draining,
+        ] {
+            assert_eq!(phase.switching(), None, "{phase:?}");
+        }
+    }
+
+    /// Catches: two phases with one name (an operator cannot tell a drain from a pause),
+    /// a name other than the documented one, and a default phase that does not serve.
+    #[test]
+    fn each_phase_has_its_own_operator_name() {
+        let lease = LeaseId { term: 1, seq: 1 };
+        let named = [
+            (NodePhase::Serving, "serving"),
+            (NodePhase::Preparing(lease), "preparing"),
+            (NodePhase::Restoring(lease), "restoring"),
+            (NodePhase::Quarantined("why".to_owned()), "quarantined"),
+            (NodePhase::MemoryPressure, "memory_pressure"),
+            (NodePhase::Draining, "draining"),
+        ];
+        for (phase, name) in &named {
+            assert_eq!(phase.name(), *name);
+        }
+        let mut names: Vec<_> = named.iter().map(|(p, _)| p.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), named.len());
+        assert_eq!(NodePhase::default().name(), "serving");
+    }
+}
