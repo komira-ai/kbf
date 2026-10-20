@@ -412,3 +412,69 @@ async fn the_sweeper_frees_expired_rows() {
     }
     panic!("the sweeper never freed the expired row");
 }
+
+/// Catches: an answer that sends a node the map and not the maps before it
+/// (`retained_previous`), on `Register` or on `Heartbeat`: a node that has just started would
+/// then read a blob written before the last change as missing, and no test that fakes the
+/// frontend's answer would notice. Three joins make generations 1, 2, 3.
+#[tokio::test]
+async fn the_answers_carry_the_maps_before_the_newest() {
+    let store = Hooked::new();
+    let (_, mut client) = serve(&store).await;
+    let generations = |maps: &[pb::Map]| -> Vec<u64> {
+        maps.iter()
+            .map(|m| {
+                kbf_map::Map::try_from(m.clone())
+                    .expect("a valid map")
+                    .generation()
+            })
+            .collect()
+    };
+    let mut last = pb::RegisterResponse::default();
+    for i in 1..=3 {
+        last = client
+            .register(request(i))
+            .await
+            .expect("registers")
+            .into_inner();
+    }
+    let newest = kbf_map::Map::try_from(last.map.clone().expect("a map")).expect("valid");
+    assert_eq!(newest.generation(), 3);
+    assert_eq!(
+        generations(&last.retained_previous),
+        [2, 1],
+        "register: newest first, none at or after the map's own generation"
+    );
+
+    let beat = client
+        .heartbeat(pb::HeartbeatRequest {
+            member_id: 1,
+            boot: 1,
+            have_generation: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("beats")
+        .into_inner();
+    assert_eq!(beat.map_generation, 3);
+    assert_eq!(
+        generations(&beat.retained_previous),
+        [2, 1],
+        "heartbeat: a node behind is sent the map and the maps before it"
+    );
+    let current = client
+        .heartbeat(pb::HeartbeatRequest {
+            member_id: 1,
+            boot: 1,
+            have_generation: 3,
+            ..Default::default()
+        })
+        .await
+        .expect("beats")
+        .into_inner();
+    assert_eq!(current.map, None);
+    assert!(
+        current.retained_previous.is_empty(),
+        "a node that is current is sent no maps"
+    );
+}
