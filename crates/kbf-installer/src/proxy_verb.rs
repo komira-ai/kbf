@@ -52,7 +52,7 @@ use rustix::net::sockopt::socket_acceptconn;
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::cli::ProxyArgs;
-use crate::database::Database;
+use crate::database::{Database, DatabaseError};
 use crate::exit::Exit;
 use crate::installer_toml::{InstallerToml, MAX_FILE_BYTES};
 use crate::layout::Platform;
@@ -110,15 +110,26 @@ impl VerbError {
 /// Reads `path` and returns its `[proxy]` table, checked: every refusal of `installer.toml`
 /// and of the table itself, and a file with no `[proxy]` table at all.
 pub fn load(path: &Path) -> Result<ProxyConfig, VerbError> {
-    let usage = |why: String| VerbError::Usage(format!("{}: {why}", path.display()));
+    proxy_table(path, &read_config(path)?)
+}
+
+/// The text of the configuration at `path`, at most `MAX_FILE_BYTES`. The verb reads it once:
+/// `--config` may be a pipe, which cannot be read twice.
+fn read_config(path: &Path) -> Result<String, VerbError> {
     let mut text = String::new();
     std::fs::File::open(path)
         .and_then(|file| {
             file.take(MAX_FILE_BYTES as u64 + 1)
                 .read_to_string(&mut text)
         })
-        .map_err(|e| usage(e.to_string()))?;
-    InstallerToml::parse(&text)
+        .map_err(|e| VerbError::Usage(format!("{}: {e}", path.display())))?;
+    Ok(text)
+}
+
+/// The `[proxy]` table of `text`, the configuration read from `path`.
+fn proxy_table(path: &Path, text: &str) -> Result<ProxyConfig, VerbError> {
+    let usage = |why: String| VerbError::Usage(format!("{}: {why}", path.display()));
+    InstallerToml::parse(text)
         .map_err(|e| usage(e.to_string()))?
         .proxy
         .ok_or_else(|| usage("has no [proxy] table".to_owned()))
@@ -128,7 +139,11 @@ pub fn load(path: &Path) -> Result<ProxyConfig, VerbError> {
 /// one, so a file without a usable `database` is a usage error, in words that never quote the
 /// URL (the reader's own: a password in it is refused too).
 pub fn state_database(path: &Path) -> Result<Database, VerbError> {
-    Database::from_installer_toml(path).map_err(|e| {
+    database_of(Database::from_installer_toml(path))
+}
+
+fn database_of(found: Result<Database, DatabaseError>) -> Result<Database, VerbError> {
+    found.map_err(|e| {
         VerbError::Usage(format!(
             "the proxy needs the state database to migrate before it starts a release: {e}"
         ))
@@ -482,8 +497,12 @@ fn config_path(args: &ProxyArgs, platform: Platform) -> PathBuf {
 pub fn run(args: &ProxyArgs) -> Result<(), VerbError> {
     hold_reload_signal();
     let path = config_path(args, Platform::current());
-    let config = load(&path)?;
-    let database = state_database(&path)?;
+    let text = read_config(&path)?;
+    let config = proxy_table(&path, &text)?;
+    let database = database_of(Database::from_installer_text(
+        &path.display().to_string(),
+        &text,
+    ))?;
     if args.check {
         return Ok(());
     }
