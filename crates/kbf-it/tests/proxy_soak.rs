@@ -84,6 +84,17 @@ const _: () = {
     static KBF_HOOK: extern "C" fn() = kbf_hook;
 };
 
+/// The command that starts the child `name`: `args` and the `--config` flag of a file of the
+/// test's own (empty), so that no child reads the host's /etc/kbf/kbf.toml, which `kbf` reads
+/// when it is given none. The file is under the directory of the child.
+fn command(dir: &Path, name: &str, args: &[String]) -> Command {
+    let own = dir.join(format!("{name}-config"));
+    std::fs::create_dir_all(&own).expect("config dir");
+    let mut command = Command::new(dir.join("bin/kbf"));
+    command.args(args).arg(kbf_testkit::config::flag(&own));
+    command
+}
+
 /// A `kbf` child that has printed its start line; stopped and reaped when dropped (SIGTERM,
 /// then SIGKILL after 3 s), and holding only descriptors 0 to 2.
 struct Child {
@@ -96,8 +107,8 @@ struct Child {
 impl Child {
     fn start(dir: &Path, name: &str, args: &[String]) -> Self {
         let log = std::fs::File::create(dir.join(format!("{name}.log"))).expect("log file");
-        let mut command = Command::new(dir.join("bin/kbf"));
-        command.args(args).stdout(Stdio::piped()).stderr(log);
+        let mut command = command(dir, name, args);
+        command.stdout(Stdio::piped()).stderr(log);
         let mut process = reaped::spawn(&mut command, 3).expect("spawn kbf");
         let mut stdout = BufReader::new(process.stdout.take().expect("stdout"));
         let mut line = String::new();
@@ -648,4 +659,26 @@ fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() 
     handle.shutdown();
     serving.join().expect("the runner thread").expect("run");
     drop((node_a, node_b));
+}
+
+/// Catches a child started with no `--config` of its own: it would read /etc/kbf/kbf.toml
+/// on a host that has one, and this test would then pass or fail by the host it runs on.
+#[test]
+fn every_child_is_started_with_a_config_of_the_tests_own() {
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "soak-config");
+    let words = |command: &Command| -> Vec<String> {
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    };
+    for name in ["storage-a", "frontend-b"] {
+        let argv = words(&command(&dir, name, &["storage".to_owned()]));
+        let own = dir.join(format!("{name}-config/kbf.toml"));
+        assert_eq!(
+            argv,
+            ["storage".to_owned(), format!("--config={}", own.display())]
+        );
+        assert_eq!(std::fs::read(&own).expect("the file"), b"");
+    }
 }

@@ -653,3 +653,29 @@ fn a_farm_reaps_its_processes_before_it_removes_the_scratch() {
         "the scratch was removed while a process still ran in it"
     );
 }
+
+#[test]
+fn a_launched_kbf_child_is_given_a_settings_file_of_the_harnesss_own() {
+    // Catches: a child started with no `--config`, which reads the host's
+    // /etc/kbf/kbf.toml when there is one (and dies on it when the test's user cannot read
+    // it), so a harness test passes on a host without kbf installed and fails on one with it.
+    let d = dir("own-config");
+    let root = d.join("root");
+    std::fs::create_dir_all(&root).expect("root");
+    let mut farm = Farm::supervise(&d, Vec::new());
+    let unit = Rendered {
+        mode: Mode::Storage,
+        argv: vec!["storage".to_owned(), "--x=1".to_owned()],
+        env: Vec::new(),
+    };
+    farm.launch(Path::new("true"), Role::Node(1), &root, unit, None);
+    let file = root.join("kbf.toml");
+    let flags: Vec<_> = farm
+        .spec(Role::Node(1))
+        .argv
+        .iter()
+        .filter(|a| a.starts_with("--config"))
+        .collect();
+    assert_eq!(flags, [&format!("--config={}", file.display())]);
+    assert_eq!(std::fs::read(&file).expect("the file"), b"");
+}
