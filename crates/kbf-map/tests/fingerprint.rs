@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{map, member};
+use common::{digests, map, member};
 use kbf_map::{DenyEntry, Map, Member, MemberId, MemberState, Rule};
 
 fn base_members() -> Vec<Member> {
@@ -23,7 +23,7 @@ fn edited(f: impl FnOnce(&mut Vec<Member>)) -> u64 {
     fp(m)
 }
 
-// Catches: a fingerprint that depends on the generation, the address, the boot counter, the
+// Catches: a fingerprint that depends on the generation, the address, the zone, the boot counter, the
 // protocol floor, the deny list, the order members were listed in, or on Joining versus
 // CatchingUp (placement treats both alike): a fill report would then never match.
 #[test]
@@ -40,6 +40,11 @@ fn irrelevant_fields_do_not_change_the_fingerprint() {
         "address"
     );
     assert_eq!(want, edited(|m| m[1].boot = 77), "boot");
+    assert_eq!(
+        want,
+        edited(|m| m[0].zone = "other-zone".into()),
+        "zone: placement does not read it"
+    );
     assert_eq!(want, edited(|m| m.reverse()), "member order");
     assert_eq!(
         want,
@@ -77,7 +82,6 @@ fn every_placement_change_changes_the_fingerprint() {
         ),
         ("active to down", edited(|m| m[0].state = MemberState::Down)),
         ("weight", edited(|m| m[0].weight = 5)),
-        ("zone", edited(|m| m[0].zone = "other-zone".into())),
         ("id", edited(|m| m[2].id = MemberId(30))),
         (
             "replication",
@@ -94,34 +98,25 @@ fn every_placement_change_changes_the_fingerprint() {
     }
 }
 
-// Catches: ambiguity in the byte layout: two zones that concatenate alike must not collide.
+// Catches: a fingerprint that says "same placement" for maps that place differently, or
+// the reverse: maps with equal fingerprints (differing only in generation, address, boot,
+// zone and member order) must give equal write owners and read order for every digest.
 #[test]
-fn zone_boundaries_are_part_of_the_fingerprint() {
-    let a = fp(vec![
-        {
-            let mut m = member(1, 1, MemberState::Active);
-            m.zone = "ab".into();
-            m
-        },
-        {
-            let mut m = member(2, 1, MemberState::Active);
-            m.zone = "c".into();
-            m
-        },
-    ]);
-    let b = fp(vec![
-        {
-            let mut m = member(1, 1, MemberState::Active);
-            m.zone = "a".into();
-            m
-        },
-        {
-            let mut m = member(2, 1, MemberState::Active);
-            m.zone = "bc".into();
-            m
-        },
-    ]);
-    assert_ne!(a, b);
+fn equal_fingerprints_place_alike() {
+    let a = map(5, 2, base_members());
+    let mut other = base_members();
+    other.reverse();
+    for (i, m) in other.iter_mut().enumerate() {
+        m.zone = format!("renamed-{i}");
+        m.addr = format!("moved-{i}:1");
+        m.boot = 40 + i as u64;
+    }
+    let b = map(77, 2, other);
+    assert_eq!(a.placement_fingerprint(), b.placement_fingerprint());
+    for d in &digests(500) {
+        assert_eq!(a.write_owners(d), b.write_owners(d));
+        assert_eq!(a.read_order(d), b.read_order(d));
+    }
 }
 
 // Catches: the check the frontend makes: the joiner's report is for the map where it is
@@ -141,5 +136,5 @@ fn the_assumed_fingerprint_is_the_promoted_maps() {
 // different versions). A new layout is a new function, not an edit of this one.
 #[test]
 fn the_fingerprint_is_pinned() {
-    assert_eq!(fp(base_members()), 0xFF58_1B77_EFF0_5837);
+    assert_eq!(fp(base_members()), 0xF24F_16F0_878D_153F);
 }

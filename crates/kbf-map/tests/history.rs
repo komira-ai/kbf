@@ -105,3 +105,47 @@ fn a_member_that_left_two_generations_ago_is_still_listed_with_its_old_entry() {
     );
     let _ = ids(&[]);
 }
+
+// Catches: history that mishandles members by state: Draining and Down members of
+// an older map: Draining is still probed (a blob may live there), Down is not; nobody is listed twice, and each
+// is the entry of the map that holds it.
+#[test]
+fn down_and_draining_members_in_history_are_still_listed() {
+    let now = farm(5, &[1, 2, 3]);
+    let mixed = |generation: u64| {
+        map(
+            generation,
+            2,
+            vec![
+                member(1, 1, MemberState::Active),
+                member(2, 1, MemberState::Active),
+                member(3, 1, MemberState::Active),
+                member(7, 1000, MemberState::Draining),
+                member(8, 1000, MemberState::Down),
+            ],
+        )
+    };
+    let newer = mixed(4);
+    let older = mixed(3);
+    let (mut saw7, mut saw8) = (0, 0);
+    for d in &digests(300) {
+        let got = order_ids(&now.read_order_with_history(&[&newer, &older], d));
+        let mut unique = got.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), got.len(), "duplicate in {got:?}");
+        let cur = now.read_order(d);
+        assert_eq!(got[..cur.len()], cur[..], "current first");
+        let mut expect = Vec::new();
+        for m in newer.read_order(d).into_iter().chain(older.read_order(d)) {
+            if !cur.contains(&m) && !expect.contains(&m) {
+                expect.push(m);
+            }
+        }
+        assert_eq!(got[cur.len()..].to_vec(), expect);
+        saw7 += usize::from(got.contains(&MemberId(7)));
+        saw8 += usize::from(got.contains(&MemberId(8)));
+    }
+    assert!(saw7 > 0, "draining member 7 never listed");
+    assert_eq!(saw8, 0, "a Down member is never probed, in any generation");
+}

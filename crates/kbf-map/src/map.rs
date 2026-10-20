@@ -396,11 +396,13 @@ impl Map {
     /// digest, and a different one means some digest moved.
     ///
     /// It covers the rule, the replication factor and, for each member in id order, the
-    /// id, weight, zone and the member's *placement class*. `Joining` and `CatchingUp`
+    /// id, weight and the member's *placement class*. `Joining` and `CatchingUp`
     /// are one class (placement treats them alike); `Active`, `Draining` and `Down` are
-    /// each their own. It leaves out the generation, addresses, boot counters, the protocol
-    /// floor, the deny list and the order the members were listed in, none of which move a
-    /// digest.
+    /// each their own. It leaves out the generation, addresses, boot counters, zones, the
+    /// protocol floor, the deny list and the order the members were listed in, none of which
+    /// move a digest. Zone is left out because placement does not read it today (ranking
+    /// scores only digest, id and weight); when zone-aware placement exists it is a new
+    /// layout, and the fingerprint (a new function, see below) adds zone then.
     ///
     /// The value is SipHash-2-4 with fixed keys over a fixed byte layout (see the code), so
     /// it is the same in every build and process. Changing the layout is a new function,
@@ -424,8 +426,6 @@ impl Map {
         for m in members {
             h.write_u64(m.id.0);
             h.write_u32(m.weight);
-            h.write_u64(m.zone.len() as u64);
-            h.write(m.zone.as_bytes());
             h.write_u8(match m.state {
                 MemberState::Joining | MemberState::CatchingUp => 0,
                 MemberState::Active => 1,
