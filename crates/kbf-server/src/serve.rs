@@ -178,6 +178,8 @@ pub struct Api {
     /// The release store (`--releases-dir`), whose upload route is mounted here and whose
     /// `ReleaseService` the worker listener serves. `None`: the update endpoints answer 503.
     pub releases: Option<Arc<crate::release::ReleaseStore>>,
+    /// The release poller (`--release-poll-every-secs`); `None` turns it off.
+    pub poll: Option<crate::release::poll::Config>,
 }
 
 /// Why the server could not start or stopped.
@@ -399,14 +401,19 @@ pub(crate) fn keepalive(server: Server, timing: StreamTiming) -> Server {
 const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
     operation of an earlier server process is restored, and the server keeps no rollout record";
 
-/// The members a frontend with a state store keeps. Not generic, for the same reason as
+/// The members a frontend with a state store keeps, promoting joiners by their own beats
+/// when `handoff` is given (`--auto-promote`). Not generic, for the same reason as
 /// [`sweeping`].
-pub(crate) fn members_of(state: Option<&crate::StateStore>) -> Option<Arc<Members>> {
+pub(crate) fn members_of(
+    state: Option<&crate::StateStore>,
+    handoff: Option<crate::members::Handoff>,
+) -> Option<Arc<Members>> {
     let state = state?;
-    Some(Arc::new(Members::new(
-        Arc::clone(&state.store),
-        state.members,
-    )))
+    let members = Members::new(Arc::clone(&state.store), state.members);
+    Some(Arc::new(match handoff {
+        Some(handoff) => members.with_handoff(handoff),
+        None => members,
+    }))
 }
 
 /// The storage map daemons are sent: `explicit` if a caller gave one, else the members'
@@ -737,7 +744,7 @@ where
     .recording(recorder.clone());
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
-    let members = members_of(state.as_ref());
+    let members = members_of(state.as_ref(), None);
     let map = map_of(map, members.as_ref())?;
     // The update rows live in the same store, whose handle is shared.
     let update_rows = state
@@ -767,13 +774,21 @@ where
     let reapi_incoming = Incoming::new(reapi_incoming, listeners.reapi_tls);
     let worker_incoming = Incoming::new(worker_incoming, worker_tls);
     let probe_timeout = listeners.store_probe_timeout;
-    let (api_listen, token, local, releases) = api.map_or((None, None, None, None), |api| {
-        (Some(api.listen), api.token, api.local_cache, api.releases)
-    });
+    let (api_listen, token, local, releases, poll) =
+        api.map_or((None, None, None, None, None), |api| {
+            (
+                Some(api.listen),
+                api.token,
+                api.local_cache,
+                api.releases,
+                api.poll,
+            )
+        });
     // One line: a `?` alone on its own line is a never-taken error region, a missed
     // line in the coverage ratchet (it counts lines per generic copy, best copy wins).
     let api_listener = api_listen.map(|l| bind_api(l, &binder)).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
+    let poll_stats = poll.as_ref().map(|_| Arc::default());
     let readiness = Arc::new(Readiness::default());
     let (closer, closing) = kbf_front::closing();
     let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
@@ -821,6 +836,7 @@ where
         Arc::clone(&cache),
         local,
         history.as_ref().map(crate::history::History::stats),
+        poll_stats.clone(),
         members.clone(),
         tls_sources,
     ))
@@ -928,6 +944,12 @@ where
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
         // The rolling-update controller; it starts hosts for the desired release unless the
         // operator wrote `auto_nodes` false or paused it.
+        let _poller = poll_stats
+            .clone()
+            .and_then(|stats| {
+                crate::release::poll::spawn(Arc::clone(&farm), update_store.clone(), poll, stats)
+            })
+            .map(AbortOnDrop);
         let _updates = crate::update::spawn_controller(
             Arc::clone(&farm),
             update_store,

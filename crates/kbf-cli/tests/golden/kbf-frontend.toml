@@ -81,6 +81,12 @@ http2-keepalive-timeout-secs = 20
 listen = "127.0.0.1:8980"
 # The most HTTP/2 streams one connection to the REAPI listener may have open. buck2 keeps one Execute stream open per outstanding action, idle until the action finishes, so this bounds how large a backlog one buck2 invocation can show the farm. The connection's flow-control window is this many streams' windows; above about 2000 streams each stream's window is smaller than 1 MiB so that the product stays under HTTP/2's largest window. At least 1, at most 32767
 reapi-max-streams = 10000
+# How often, in seconds, the active frontend asks GitHub for new releases of `--release-poll-repo` and records the newest one the farm could run as a proposal (`proposals` of `GET /v1/update`). A proposal starts nothing: only an operator's `POST /v1/update/desired` does. The question is one conditional request with no credential, so an unchanged feed costs nothing. 0 turns the poller off. Only the newest 30 releases are read (no further pages), so a `v*` release buried under more than 30 newer releases of other tags is not seen. It needs `--state-store`, which holds the proposals
+release-poll-every-secs = 300
+# The refs a polled release may have been built from, as its notes say, separated by commas; a release built from another is ignored and counted
+release-poll-refs = ["main"]
+# The GitHub repository, `owner/name`, whose releases of `v*` tags are polled
+release-poll-repo = "komira-ai/kbf"
 # The release store (`docs/design/pull-updates.md`, section 6): a directory where the tarballs of a release and their build attestations are kept, uploaded with `PUT /v1/releases/{commit}/{platform}/{name}` on the operator API (which needs the token) and fetched by the nodes through `ReleaseService.Fetch` on the worker listener, behind its mutual TLS. Made if missing. Without it every update endpoint answers 503 saying so
 # releases-dir = "DIR"
 # How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
@@ -131,6 +137,12 @@ unservable-wait-secs = 300
 # storage-client-key = "PATH"
 
 [storage-node]
+# Promote a storage node that joined a farm holding data from joining to active by its own heartbeat once it is filled: every member has flushed what it staged before the join, the joiner has indexed every object in the cold store under the frontend's tail epoch, its placement fingerprint matches, no member is down, and the settle time has passed. Off by default: an operator promotes a joiner (`POST /v1/members/{id}`, state active), which stays the override. Frontends first, then nodes, then this flag.
+auto-promote = false
+# Let --auto-promote promote a joiner although a member was down during its fill. A member that is down and inside its dwell still holds the first phase back. Off by default: a down member may hold the only copy of a blob. Used only with --auto-promote.
+handoff-allow-degraded = false
+# How long, in seconds, all the conditions of --auto-promote must keep holding at the joiner's beats before it is promoted. Used only with --auto-promote.
+handoff-settle-secs = 30
 # How long, in seconds, a down storage member stays in the map before it leaves and its blobs move to other owners
 member-dwell-secs = 300
 # How long, in seconds, a storage node's membership row lives without a heartbeat before the state store expires it and the member goes down in the storage map. Nodes are asked to heartbeat three times as often
