@@ -590,8 +590,8 @@ async fn a_log_raised_past_what_a_binary_runs_refuses_its_open() {
         .expect("a raise");
     let raised = log.applied_index();
     assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
-    let v5 = MachineVersion::new(NonZeroU32::new(5).expect("non-zero"));
-    assert!(log.raise_machine_version(v5).is_err());
+    let v6 = MachineVersion::new(NonZeroU32::new(6).expect("non-zero"));
+    assert!(log.raise_machine_version(v6).is_err());
     assert_eq!(log.machine_version(), MachineVersion::V2);
     drop(log);
     let rolled_back = RaftMetaLog::open_running(
@@ -607,10 +607,10 @@ async fn a_log_raised_past_what_a_binary_runs_refuses_its_open() {
         "{rolled_back:?}"
     );
     let unknown =
-        RaftMetaLog::open_running(fs.restart(), Retention::default(), "kbf/", || Ok(id(4)), v5)
+        RaftMetaLog::open_running(fs.restart(), Retention::default(), "kbf/", || Ok(id(4)), v6)
             .await;
     assert!(
-        matches!(&unknown, Err(RaftLogError::Runs(v)) if *v == v5),
+        matches!(&unknown, Err(RaftLogError::Runs(v)) if *v == v6),
         "{unknown:?}"
     );
     let log = open(&fs.restart(), 4).await;
@@ -618,7 +618,7 @@ async fn a_log_raised_past_what_a_binary_runs_refuses_its_open() {
     assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
     drop(log);
     let dir = fs.restart();
-    let later = append(&dir, Format::V2, &LogCommand::MachineVersion(v5));
+    let later = append(&dir, Format::V2, &LogCommand::MachineVersion(v6));
     let refused = refusal(&dir.restart(), 4).await;
     assert!(
         matches!(&refused, RaftLogError::Decode { index, .. } if *index == later),

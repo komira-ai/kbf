@@ -29,6 +29,20 @@ Every directory on the way to the tool is 0755 root:wheel. The package creates n
 configuration, no release and no user (`kbf`, `_kbf-fetch`, `kbf-verify` and the lease
 users are made by `setup`, as root; a payload cannot make users).
 
+### The release asset
+
+`artifacts.yml`'s `darwin-arm64` job builds the real package from the signed `kbf-installer` it has
+just built: `cargo xtask pkg-trust` writes the trust directory from the pinned darwin `gh`, the
+Sigstore trusted root that `gh` fetched and the branch the package is attested on
+(`installer.conf` is `SOURCE_REFS=<that ref>` and nothing else; per-host settings are written by
+`kbf-installer setup`, not shipped), `cargo xtask pkg build --version-of` writes the package,
+`cargo xtask pkg-macos-install-test` installs it as root on the runner and checks it, and
+`cargo xtask pkg-macos-asset` makes it `kbf-installer-<commit>-darwin-arm64.pkg`, listed in
+`SHA256SUMS.darwin-arm64` and attested with its own bundle. The gh pinned for it is in
+`artifacts.yml` (`GH_VERSION`, `GH_SHA256_AARCH64_DARWIN`). See
+[docs/artifacts.md](../../docs/artifacts.md#the-kbf-installer-package-pkg-macos). The trust files
+are 0755 (`gh`) and 0644, root:wheel, like the Linux package's.
+
 ### Written in Rust, not by `pkgbuild`
 
 nfpm builds the Linux packages and does not write a `.pkg`. `pkgbuild` and `productbuild`

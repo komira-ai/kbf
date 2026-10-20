@@ -26,6 +26,7 @@ async fn a_placement_is_what_the_map_says() {
     let cell = Cell::with(MapView {
         map: now.clone(),
         previous: Some(before.clone()),
+        earlier: Vec::new(),
     });
     let router = Router::new(cell, Cluster::of(4));
     let (_, digest) =

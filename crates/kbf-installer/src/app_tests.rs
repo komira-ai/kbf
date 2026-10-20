@@ -40,7 +40,6 @@ fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
         (vec!["check"], "check", "P10"),
         (vec!["stage"], "stage", "P8"),
         (vec!["activate"], "activate", "P5"),
-        (vec!["fetch-child"], "fetch-child", "P7"),
     ]
 }
 
@@ -76,6 +75,38 @@ fn only_status_and_check_run_without_root() {
                 "{name}: {err}"
             );
         }
+    }
+}
+
+/// The fetch child is built (P7) and runs as the fetch user, not as root: it is not gated on
+/// root, it prints nothing on standard output but the component's bytes (never JSON, whatever
+/// the global flag), and it says why it fetched nothing in one line on standard error.
+///
+/// Catches the child inheriting the "needs root" gate (it would never start as `kbf-fetch`) and
+/// a child that prints prose where the parent counts bytes.
+#[test]
+fn the_fetch_child_is_no_root_verb_and_reports_in_one_line() {
+    let digest = "a".repeat(64);
+    for json in [false, true] {
+        let mut args = vec!["fetch-child"];
+        if json {
+            args.insert(0, "--json");
+        }
+        args.extend([
+            "--kind",
+            "url",
+            "--url",
+            "http://h.example",
+            "--sha256",
+            &digest,
+            "--limit",
+            "10",
+        ]);
+        let (exit, out, err) = run_as(1000, &args);
+        assert_eq!(exit, Exit::Failed, "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.starts_with("fetch-child: "), "{err}");
     }
 }
 
@@ -246,7 +277,8 @@ fn no_command_takes_a_positional_argument() {
     assert!(found.is_empty(), "{found:?}");
 }
 
-/// Catches the public verb list drifting from the contract's table (section 2): the visible
+/// Catches the public verb list drifting from the contract's table (section 2) plus the
+/// state database's `backup` and `restore` (frontend-proxy.md section 11): the visible
 /// verbs, and that the three internal ones stay out of the help.
 #[test]
 fn the_visible_verbs_are_the_contracts() {
@@ -272,6 +304,8 @@ fn the_visible_verbs_are_the_contracts() {
             "migrate",
             "quiesce",
             "check",
+            "backup",
+            "restore",
             "proxy"
         ]
     );
@@ -996,6 +1030,18 @@ fn the_verbs_that_manage_a_host_wait_for_its_migration() {
 /// Mutants to plant: `Verb::FetchChild` or `Verb::Migrate(_)` moved to the `true` arm; `Verb::Setup(_)` to the `false` one.
 #[test]
 fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
+    let digest = "a".repeat(64);
+    let fetch_child = [
+        "fetch-child",
+        "--kind",
+        "url",
+        "--url",
+        "http://h.example",
+        "--sha256",
+        digest.as_str(),
+        "--limit",
+        "10",
+    ];
     let held: [&[&str]; 10] = [
         &["setup", "--mode=frontend"],
         &RUN,
@@ -1014,7 +1060,7 @@ fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
         &["boot-check"],
         &["quiesce"],
         &["migrate"],
-        &["fetch-child"],
+        &fetch_child,
     ];
     for args in held {
         assert!(parse(args).verb.manages_host(), "{args:?} is held");
@@ -1247,3 +1293,6 @@ fn a_path_is_not_joined_to_a_relative_root() {
         PathBuf::from("/srv/root/etc/kbf/installer.toml")
     );
 }
+
+#[path = "app_backup_tests.rs"]
+mod backup_cli;

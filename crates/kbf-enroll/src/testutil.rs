@@ -1,15 +1,13 @@
 //! Helpers the unit tests share.
 
-use std::path::PathBuf;
-
+use kbf_testkit::dir::TestDir;
 use kbf_types::{CaPin, Token, TokenId, TokenSecret};
 
-/// A fresh scratch directory under the system temp dir, resolved through symlinks.
-pub fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-enroll-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    std::fs::canonicalize(&dir).expect("canonical scratch dir")
+/// A fresh scratch directory under the system temp dir, resolved through symlinks, removed
+/// when it drops (declare it before whatever writes into it).
+pub fn scratch(name: &str) -> TestDir {
+    let temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
+    TestDir::under(temp, &format!("kbf-enroll-{name}"))
 }
 
 /// A token with distinguishable parts.

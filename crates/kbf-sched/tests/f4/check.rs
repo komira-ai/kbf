@@ -138,9 +138,6 @@ pub struct Checker {
     ops: Vec<Op>,
     leases: BTreeMap<LeaseId, Lease>,
     queue: BTreeSet<(Reverse<Qos>, OperationId)>,
-    /// The worker each queued operation that runs alone held at the last round: placement
-    /// keeps a hold while that worker could still run it.
-    holds: BTreeMap<OperationId, WorkerId>,
     in_flight: BTreeMap<ActionKey, OperationId>,
     next_seq: u64,
     needs: Vec<kbf_caps::Request>,
@@ -174,7 +171,6 @@ impl Checker {
             ops: Vec::new(),
             leases: BTreeMap::new(),
             queue: BTreeSet::new(),
-            holds: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             next_seq: 0,
             needs: Vec::new(),
