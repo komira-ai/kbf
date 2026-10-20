@@ -123,6 +123,38 @@ describe('site', () => {
     expect(() => main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO], fake(answers({ 'get-open-id-connect-provider': new Error('NoSuchEntity') })).t)).toThrow(/OIDC provider/);
     expect(() => main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO], fake(answers({ 'list-hosted-zones-by-name': JSON.stringify({ HostedZones: [] }) })).t)).toThrow(/hosted zone/);
   });
+  test('--no-domain: no zone lookup, passes -c noDomain=true to cdk, and the default mode does not', () => {
+    const f = fake(answers({ 'list-hosted-zones-by-name': new Error('must not be called') }));
+    main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--no-domain'], f.t);
+    expect(f.ran('route53')).toBe(false);
+    expect(f.ran('-c noDomain=true')).toBe(true);
+    expect(f.ran('cdk diff kbf-prod-site')).toBe(true);
+    expect(f.ran('cdk deploy')).toBe(false);
+    const g = fake(answers());
+    main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO], g.t);
+    expect(g.ran('noDomain')).toBe(false);
+    expect(g.ran('route53')).toBe(true);
+  });
+  test('--no-domain still refuses without the OIDC provider and on an account mismatch', () => {
+    const flags = ['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--no-domain'];
+    expect(() => main(flags, fake(answers({ 'get-open-id-connect-provider': new Error('NoSuchEntity') })).t)).toThrow(/OIDC provider/);
+    const f = fake(answers({ 'sts get-caller-identity': '999999999999' }));
+    expect(() => main(flags, f.t)).toThrow(/not the --account/);
+    expect(f.calls).toHaveLength(1);
+  });
+  test('--no-domain is a flag of site only', () => {
+    expect(() => parse(['dns', '--account', ACCOUNT, '--profile', 'p', '--no-domain'])).toThrow(/unknown flag/);
+    expect(() => parse(['vars', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--no-domain'])).toThrow(/unknown flag/);
+    expect(parse(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--no-domain']).noDomain).toBe(true);
+  });
+  test('--no-domain --apply prints the distribution domain name from the stack outputs', () => {
+    const stack = JSON.stringify([{ OutputKey: 'DistributionDomainName', OutputValue: 'd111111abcdef8.cloudfront.net' }]);
+    const f = fake(answers({ 'describe-stacks': stack }));
+    main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--no-domain', '--apply'], f.t);
+    expect(f.ran('cdk deploy kbf-prod-site')).toBe(true);
+    expect(f.ran('-c noDomain=true')).toBe(true);
+    expect(f.text()).toContain('https://d111111abcdef8.cloudfront.net/');
+  });
   test('never creates an OIDC provider', () => {
     const f = fake(answers());
     main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--apply'], f.t);
@@ -173,6 +205,14 @@ describe('vars', () => {
     const go = () => main(['vars', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO], f.t);
     return { f, go };
   };
+  test('works for the no-domain stack: same three variables, and the cloudfront.net name is shown', () => {
+    const stack = JSON.stringify([...JSON.parse(STACK), { OutputKey: 'DistributionDomainName', OutputValue: 'd111111abcdef8.cloudfront.net' }]);
+    const { f, go } = run({ 'describe-stacks': stack });
+    go();
+    expect(f.lines.filter((l) => l.startsWith('gh variable set'))).toHaveLength(3);
+    expect(f.text()).toContain('https://d111111abcdef8.cloudfront.net/');
+    expect(f.ran('route53')).toBe(false);
+  });
   test('prints the three gh variable set commands when GitHub is as expected', () => {
     const { f, go } = run();
     go();

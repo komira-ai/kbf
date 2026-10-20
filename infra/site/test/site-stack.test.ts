@@ -308,3 +308,69 @@ describe('context parameters', () => {
     expect(() => c.siteConfig(ctx({ ...ok, ...bad }))).toThrow(re);
   });
 });
+
+describe('no-domain mode (before DNS delegation exists)', () => {
+  const synth = (noDomain: boolean, hostedZoneId?: string) => {
+    const app = new App();
+    const stack = new SiteStack(app, { env, config: CONFIG, oidcProviderArn: PROVIDER, noDomain, hostedZoneId });
+    return { template: Template.fromStack(stack), missing: app.synth().manifest.missing ?? [] };
+  };
+  const nd = synth(true); // no hostedZoneId either: nothing may need a zone
+  const withDomain = synth(false, 'Z0TESTZONE');
+  const ids = (tpl: Template, type: string) => Object.keys(tpl.findResources(type));
+
+  test('creates no certificate, no Route 53 record and no alias; the distribution uses the default certificate', () => {
+    nd.template.resourceCountIs('AWS::CertificateManager::Certificate', 0);
+    nd.template.resourceCountIs('AWS::Route53::RecordSet', 0);
+    const dist = Object.values(nd.template.findResources('AWS::CloudFront::Distribution'))[0] as any;
+    const cfg = dist.Properties.DistributionConfig;
+    expect(cfg.Aliases).toBeUndefined();
+    expect(cfg.ViewerCertificate?.AcmCertificateArn).toBeUndefined();
+    expect(JSON.stringify(nd.template.toJSON())).not.toContain('AliasTarget');
+  });
+
+  test('looks up no hosted zone: synth leaves no missing context', () => {
+    expect(nd.missing).toEqual([]);
+  });
+
+  test('the domain mode still has the certificate, both records and the alias (the contrast the tests above rely on)', () => {
+    withDomain.template.resourceCountIs('AWS::CertificateManager::Certificate', 1);
+    withDomain.template.resourceCountIs('AWS::Route53::RecordSet', 2);
+    withDomain.template.hasResourceProperties('AWS::CloudFront::Distribution', {
+      DistributionConfig: Match.objectLike({ Aliases: ['kbf.dev'] }),
+    });
+  });
+
+  test('bucket and distribution keep their logical ids, so adding the domain later updates them in place', () => {
+    for (const type of ['AWS::S3::Bucket', 'AWS::CloudFront::Distribution']) {
+      expect(ids(nd.template, type)).toHaveLength(1);
+      expect(ids(nd.template, type)).toEqual(ids(withDomain.template, type));
+    }
+    // Every other resource of the no-domain stack exists, under the same id, in the domain stack.
+    const all = (tpl: Template) => Object.keys(tpl.toJSON().Resources);
+    for (const id of all(nd.template)) expect(all(withDomain.template)).toContain(id);
+    // The only additions are the certificate and the two records.
+    expect(all(withDomain.template).length - all(nd.template).length).toBe(3);
+  });
+
+  test('the bucket name, OAC, headers policy, router and publish role are the same in both modes', () => {
+    for (const type of ['AWS::S3::Bucket', 'AWS::CloudFront::OriginAccessControl', 'AWS::CloudFront::ResponseHeadersPolicy', 'AWS::CloudFront::Function', 'AWS::IAM::Role']) {
+      expect(nd.template.findResources(type)).toEqual(withDomain.template.findResources(type));
+    }
+  });
+
+  test('outputs the distribution domain name; the other outputs are unchanged', () => {
+    const out = nd.template.toJSON().Outputs;
+    expect(Object.keys(out).sort()).toEqual(['BucketName', 'DistributionDomainName', 'DistributionId', 'PublishRoleArn']);
+    expect(JSON.stringify(out.DistributionDomainName)).toContain('DomainName');
+  });
+
+  test('the router function does not look at the host, so it works on the default *.cloudfront.net name', () => {
+    const ctx: any = {};
+    vm.runInNewContext(ROUTER_SOURCE, ctx);
+    const req = { uri: '/docs/', headers: { host: { value: 'd111111abcdef8.cloudfront.net' } } };
+    const out = ctx.handler({ request: req });
+    expect(out.uri).toBe('/docs/index.html');
+    expect(out.headers.host.value).toBe('d111111abcdef8.cloudfront.net');
+  });
+});

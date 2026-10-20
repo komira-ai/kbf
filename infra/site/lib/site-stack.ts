@@ -15,6 +15,12 @@ export interface SiteStackProps extends Omit<StackProps, 'synthesizer'> {
   oidcProviderArn: string;
   /** Dummy-synth only (tests): skips the hosted zone lookup. Real deploys look the zone up by name. */
   hostedZoneId?: string;
+  /**
+   * No-domain mode: no certificate, no alias, no Route 53 lookup or records; the distribution answers on its own
+   * *.cloudfront.net name with the default certificate. Every other resource and every logical id is unchanged, so a
+   * later deploy without this flag adds the domain to the same bucket and distribution in place.
+   */
+  noDomain?: boolean;
 }
 
 /**
@@ -85,13 +91,14 @@ export class SiteStack extends Stack {
     });
 
     const domain = props.config.domain;
-    const zone = props.hostedZoneId
-      ? route53.HostedZone.fromHostedZoneAttributes(this, 'Zone', { hostedZoneId: props.hostedZoneId, zoneName: domain })
-      : route53.HostedZone.fromLookup(this, 'Zone', { domainName: domain });
-    const cert = new acm.Certificate(this, 'Cert', {
-      domainName: domain,
-      validation: acm.CertificateValidation.fromDns(zone),
-    });
+    const zone = props.noDomain
+      ? undefined
+      : props.hostedZoneId
+        ? route53.HostedZone.fromHostedZoneAttributes(this, 'Zone', { hostedZoneId: props.hostedZoneId, zoneName: domain })
+        : route53.HostedZone.fromLookup(this, 'Zone', { domainName: domain });
+    const cert = zone
+      ? new acm.Certificate(this, 'Cert', { domainName: domain, validation: acm.CertificateValidation.fromDns(zone) })
+      : undefined;
 
     const headers = new cloudfront.ResponseHeadersPolicy(this, 'Headers', {
       responseHeadersPolicyName: c.HEADERS_POLICY_NAME,
@@ -128,8 +135,7 @@ export class SiteStack extends Stack {
 
     this.distribution = new cloudfront.Distribution(this, 'Distribution', {
       comment: `${domain} site and releases`,
-      domainNames: [domain],
-      certificate: cert,
+      ...(cert ? { domainNames: [domain], certificate: cert } : {}),
       defaultRootObject: 'index.html',
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
       httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
@@ -144,9 +150,11 @@ export class SiteStack extends Stack {
       },
     });
 
-    const target = route53.RecordTarget.fromAlias(new targets.CloudFrontTarget(this.distribution));
-    new route53.ARecord(this, 'ARecord', { zone, recordName: domain, target });
-    new route53.AaaaRecord(this, 'AaaaRecord', { zone, recordName: domain, target });
+    if (zone) {
+      const target = route53.RecordTarget.fromAlias(new targets.CloudFrontTarget(this.distribution));
+      new route53.ARecord(this, 'ARecord', { zone, recordName: domain, target });
+      new route53.AaaaRecord(this, 'AaaaRecord', { zone, recordName: domain, target });
+    }
 
     // The publish role: assumed by the kbf reusable workflow only. No CDK, no bootstrap roles, no IAM.
     this.publishRole = new iam.Role(this, 'PublishRole', {
@@ -216,6 +224,7 @@ export class SiteStack extends Stack {
 
     new CfnOutput(this, 'BucketName', { value: this.bucket.bucketName });
     new CfnOutput(this, 'DistributionId', { value: this.distribution.distributionId });
+    new CfnOutput(this, 'DistributionDomainName', { value: this.distribution.distributionDomainName });
     new CfnOutput(this, 'PublishRoleArn', { value: this.publishRole.roleArn });
   }
 }

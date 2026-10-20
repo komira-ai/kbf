@@ -31,6 +31,7 @@ fake so they can see which commands a dry run does and does not run.
 | `--repo` / `-c githubRepo` | `github`, `site`, `vars` | `<owner>/<name>` of the repository that hosts the publish workflow |
 | `-c githubRepoId`, `-c githubOwnerId` | `cdk` (set by `site`) | immutable numeric ids; `site` reads them with read-only `gh api repos/<repo>` |
 | `--domain` / `-c domain` | `dns`, `site` | site name; default `kbf.dev` |
+| `--no-domain` / `-c noDomain=true` | `site` | no certificate, alias or zone; serve on the `*.cloudfront.net` name (see "Before DNS") |
 | `--oidc-provider-arn` / `-c oidcProviderArn` | `site` | the account's existing GitHub OIDC provider; default `arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com` |
 
 Names are fixed: bucket `kbf-prod-site-<account>`, headers policy `kbf-prod-site-headers`, function
@@ -94,6 +95,26 @@ cd infra/site && npm ci --ignore-scripts
 - Step 2: put the registrar's previous nameservers back.
 - Step 1: delete the stack; the zone is RETAINed, delete it in Route 53 by hand once nothing delegates to it.
 - Step 0: delete the environment; restore the sub template with `use_default=true`.
+
+## Before DNS: no-domain mode
+
+While the domain has no delegation yet, deploy the same stack without the domain: no ACM certificate, no alias, no
+Route 53 lookup or records. CloudFront serves the site on its own `*.cloudfront.net` name with the default certificate.
+`held site --no-domain` (context `-c noDomain=true`) does not look up or need the zone, still refuses without the OIDC
+provider or on an account mismatch, and prints the distribution's domain name (stack output `DistributionDomainName`).
+`dns` is not needed.
+
+```sh
+npm run held -- github --repo <owner>/<name>                      # dry run, then add --apply
+npm run held -- site --no-domain --account <id> --profile <profile> --repo <owner>/<name>   # dry run, then add --apply
+npm run held -- vars --account <id> --profile <profile> --repo <owner>/<name>              # prints the gh variable commands and the site URL
+```
+
+Moving to the domain later: run `dns` (step 1), set the nameservers at the registrar (step 2), then run `site` again
+WITHOUT `--no-domain` (dry run first). The bucket and the distribution keep their logical ids (a test compares them
+between the two modes), so nothing is replaced. In place, the deploy adds the certificate (validated in the zone), the
+A and AAAA alias records, and the distribution's alias and certificate; the bucket, OAC, headers policy, router function
+and publish role do not change. The `*.cloudfront.net` name keeps working. The variables do not change.
 
 ## The publish workflow
 

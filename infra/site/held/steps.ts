@@ -22,12 +22,14 @@ export interface Options {
   repo?: string;
   domain: string;
   oidcProviderArn?: string;
+  /** `site` only: deploy without the domain (no certificate, alias or zone); see README "Before DNS". */
+  noDomain: boolean;
 }
 
 const ALLOWED: Record<Command, string[]> = {
   github: ['--repo'],
   dns: ['--account', '--profile', '--domain'],
-  site: ['--account', '--profile', '--repo', '--domain', '--oidc-provider-arn'],
+  site: ['--account', '--profile', '--repo', '--domain', '--oidc-provider-arn', '--no-domain'],
   vars: ['--account', '--profile', '--repo'],
 };
 const REQUIRED: Record<Command, string[]> = {
@@ -40,7 +42,7 @@ const REQUIRED: Record<Command, string[]> = {
 export const USAGE = `usage: npm run held -- <command> [flags]
   github --repo <owner/name> [--apply]
   dns    --account <12 digits> --profile <aws profile> [--domain <name>] [--apply]
-  site   --account <12 digits> --profile <aws profile> --repo <owner/name> [--domain <name>] [--oidc-provider-arn <arn>] [--apply]
+  site   --account <12 digits> --profile <aws profile> --repo <owner/name> [--domain <name>] [--oidc-provider-arn <arn>] [--no-domain] [--apply]
   vars   --account <12 digits> --profile <aws profile> --repo <owner/name>      (read-only; prints commands)
 Dry run unless --apply. There is no --force.`;
 
@@ -48,12 +50,16 @@ export function parse(argv: string[]): Options {
   const [command, ...rest] = argv;
   if (!command || !(command in ALLOWED)) throw new Refused(`unknown or missing command\n${USAGE}`);
   const cmd = command as Command;
-  const o: Options = { command: cmd, apply: false, domain: 'kbf.dev' };
+  const o: Options = { command: cmd, apply: false, domain: 'kbf.dev', noDomain: false };
   const seen = new Set<string>();
   for (let i = 0; i < rest.length; i++) {
     const f = rest[i];
     if (f === '--apply') {
       o.apply = true;
+      continue;
+    }
+    if (f === '--no-domain' && ALLOWED[cmd].includes(f)) {
+      o.noDomain = true;
       continue;
     }
     if (!ALLOWED[cmd].includes(f)) throw new Refused(`unknown flag for ${cmd}: ${f}\n${USAGE}`);
@@ -167,18 +173,28 @@ export function site(t: Tools, o: Options): void {
   } catch {
     throw new Refused(`no GitHub OIDC provider at ${arn}; create one first (it is imported, never created here) or pass --oidc-provider-arn`);
   }
-  const zones = JSON.parse(
-    t.capture('aws', aws(o, 'route53', 'list-hosted-zones-by-name', '--dns-name', o.domain, '--max-items', '1', '--output', 'json')),
-  ).HostedZones as { Name: string }[];
-  if (!zones.some((z) => z.Name === `${o.domain}.`)) throw new Refused(`no ${o.domain} hosted zone in this account; run dns --apply first`);
+  if (o.noDomain) {
+    t.log('# no-domain mode: no certificate, alias or Route 53 records; the zone is not looked up');
+  } else {
+    const zones = JSON.parse(
+      t.capture('aws', aws(o, 'route53', 'list-hosted-zones-by-name', '--dns-name', o.domain, '--max-items', '1', '--output', 'json')),
+    ).HostedZones as { Name: string }[];
+    if (!zones.some((z) => z.Name === `${o.domain}.`)) throw new Refused(`no ${o.domain} hosted zone in this account; run dns --apply first`);
+  }
   const { repoId, ownerId, fullName } = repoIds(t, o.repo!);
   prepare(t);
   const ctx = [
     '-c', `account=${o.account}`, '-c', `domain=${o.domain}`, '-c', `githubRepo=${fullName}`, // GitHub's own spelling: the sub claim uses it
     '-c', `githubRepoId=${repoId}`, '-c', `githubOwnerId=${ownerId}`, '-c', `oidcProviderArn=${arn}`,
+    ...(o.noDomain ? ['-c', 'noDomain=true'] : []),
   ];
   if (o.apply) {
     t.stream('npx', ['cdk', 'deploy', 'kbf-prod-site', '--profile', o.profile!, '--require-approval', 'broadening', ...ctx]);
+    const outs = JSON.parse(
+      t.capture('aws', aws(o, 'cloudformation', 'describe-stacks', '--region', REGION, '--stack-name', 'kbf-prod-site', '--query', 'Stacks[0].Outputs', '--output', 'json')),
+    ) as { OutputKey: string; OutputValue: string }[];
+    const host = outs.find((x) => x.OutputKey === 'DistributionDomainName')?.OutputValue;
+    if (host) t.log(`# The site is served at https://${host}/`);
     t.log(`# Done. Next: npm run held -- vars --account ${o.account} --profile ${o.profile} --repo ${o.repo}`);
   } else {
     t.log('# dry run: cdk diff only. Re-run with --apply to deploy.');
@@ -231,6 +247,8 @@ export function vars(t: Tools, o: Options): void {
   if (rows.some(([, v]) => !v)) throw new Refused('stack kbf-prod-site has no outputs; run site --apply first');
   t.log(`# Environment prod of ${o.repo} is as expected. Run:`);
   for (const [k, v] of rows) t.log(`gh variable set ${k} --env prod --repo ${o.repo} --body ${shellQuote(v!)}`);
+  const host = val('DistributionDomainName');
+  if (host) t.log(`# The distribution answers at https://${host}/`);
   t.log(`# Region is always ${REGION}.`);
 }
 
