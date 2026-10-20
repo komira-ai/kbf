@@ -64,9 +64,12 @@ fn the_package_has_a_unit_for_each_kbf_mode() {
 /// after `kbf` exactly as systemd passes them (`%i` is instance a). A unit names few
 /// flags and leaves the rest to `/etc/kbf/kbf.toml`, which a parser with no file reads as
 /// missing flags, so that one refusal is let through; an unknown flag, another mode's
-/// flag and a value kbf refuses are not.
+/// flag and a value kbf refuses are not. A line that names `--config` (the plain frontend
+/// unit's start) reads a scratch `kbf.toml` in place of the host's.
 #[test]
 fn each_package_unit_command_line_parses_with_kbfs_own_parser() {
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "unit-lines");
+    let config = frontend_config(&dir);
     for (mode, text) in units() {
         let lines = kbf_lines(&text);
         assert!(
@@ -75,10 +78,15 @@ fn each_package_unit_command_line_parses_with_kbfs_own_parser() {
         );
         for line in lines {
             assert!(line[0].starts_with("--mode="), "{mode} {line:?}");
-            let argv: Vec<OsString> = std::iter::once("kbf".to_owned())
-                .chain(line.iter().map(|f| f.replace("%i", "a")))
-                .map(OsString::from)
-                .collect();
+            let words: Vec<String> = line.iter().map(|f| f.replace("%i", "a")).collect();
+            let argv: Vec<OsString> = if words.iter().any(|w| w == "--config") {
+                argv_with(&words, &config)
+            } else {
+                std::iter::once("kbf".to_owned())
+                    .chain(words)
+                    .map(OsString::from)
+                    .collect()
+            };
             match kbf_cli::parse_from(argv) {
                 Ok(_) => {}
                 Err(e) if e.kind() == clap::error::ErrorKind::MissingRequiredArgument => {}
