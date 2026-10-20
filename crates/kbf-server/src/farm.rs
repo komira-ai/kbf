@@ -1188,6 +1188,17 @@ impl State {
         let answers = self.feed(now, event);
         let rerun = self.runs_recorded(operation) > recorded_before;
         let accepted = rerun || answers.iter().any(|a| a.lease == lease);
+        let taken = if accepted {
+            Taken::Accepted
+        } else if !self.finished_by(operation, lease) {
+            Taken::Refused
+        } else if self.write_drops > drops {
+            Taken::Dropped
+        } else if self.finish_held(operation) {
+            Taken::Held
+        } else {
+            Taken::Refused
+        };
         if accepted && let Some((subject, measured)) = &usage {
             action_usage::log(operation, subject, measured, outcome, lease, worker);
         }
@@ -1220,17 +1231,6 @@ impl State {
         if accepted && outcome == Outcome::Failed(Failure::NodeMemoryPressure) {
             memory::pressure(worker, self.sched.memory_pressure(worker));
         }
-        let taken = if accepted {
-            Taken::Accepted
-        } else if !self.finished_by(operation, lease) {
-            Taken::Refused
-        } else if self.write_drops > drops {
-            Taken::Dropped
-        } else if self.finish_held(operation) {
-            Taken::Held
-        } else {
-            Taken::Refused
-        };
         (answers, taken)
     }
 
