@@ -9,6 +9,9 @@
     "build": "node -e \"require('fs').rmSync('build',{recursive:true,force:true})\" && tsc -p tsconfig.browser.json && tsc -p tsconfig.tools.json && node build/tools/tools/build.js",
     "golden": "node -e \"require('fs').rmSync('build',{recursive:true,force:true})\" && tsc -p tsconfig.browser.json && tsc -p tsconfig.tools.json && node build/tools/tools/manifest.js"
   },
+  "engines": {
+    "node": "24.21.0"
+  },
   "devDependencies": {
     "@types/node": "24.19.0",
     "typescript": "5.9.3"

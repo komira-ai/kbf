@@ -27,7 +27,9 @@ function scanText(text: string, code = false): string[] {
       if (a !== '127.0.0.1' && a !== '0.0.0.0' && !/^(?:192\.0\.2|198\.51\.100|203\.0\.113)\./.test(a)) found.push(`an address, ${a}`);
     }
   }
-  for (const m of text.matchAll(/(?<![\w.\/-])\/(?:home|Users|root)\/[A-Za-z0-9._-]+/g)) found.push(`a home path, ${m[0]}`);
+  for (const m of text.matchAll(/(?<![.\/-])\/(?:home|Users|root)\/[A-Za-z0-9._-]+/g)) found.push(`a home path, ${m[0]}`);
+  for (const m of text.matchAll(/\bbuck-out\/\S*/g)) found.push(`a build-farm path, ${m[0]}`);
+  for (const m of text.matchAll(/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}/g)) found.push(`an email address or user@host, ${m[0]}`);
   for (const m of text.matchAll(/\b[a-z][a-z0-9+.-]*:\/\/([A-Za-z0-9.-]+)/g)) {
     const host = m[1];
     if (!PUBLIC_HOSTS.has(host) && !EXAMPLE_HOSTS.has(host)) found.push(`a host, ${host}`);
@@ -53,6 +55,9 @@ test('the scan finds each kind of leak (it can fail)', () => {
   const cases: [string, RegExp][] = [
     [`ssh ${ip}`, /an address/],
     [`cd ${home}/src`, /a home path/],
+    ['at /kbf' + '/root/komira/x.zig:1', /a home path/],
+    ['in buck-' + 'out/v2/tmp/x', /a build-farm path/],
+    ['mail ' + 'a@b' + '.example', /an email address/],
     ['see https://build-7.example.org/x', /a host, build-7\.example\.org/],
     ['at ip-1-2-3-4.compute.internal', /a private or cloud host name/],
     ['arn:aws:iam::123456789012:role/x', /a cloud resource name/],

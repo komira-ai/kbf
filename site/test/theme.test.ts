@@ -12,6 +12,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { readTags } from '../tools/check-dist';
+import { outPath, PAGES } from '../tools/pages';
 import { assetDir, buildReal, copyTree, plant, SITE } from './support';
 
 /** theme.css sha256, as THEME.md states it. */
@@ -31,7 +32,7 @@ test('a one byte edit of the theme changes the digest (the pin can fail)', () =>
 test('the built site ships the pinned theme, and every page loads it before site.css', () => {
   const dist = buildReal('theme');
   assert.equal(sha256(readFileSync(join(dist, assetDir(dist), 'theme.css'))), THEME_SHA256);
-  for (const page of ['index.html', 'install/index.html', 'quickstart/index.html', 'story/index.html', 'docs/config/index.html', '404.html']) {
+  for (const page of PAGES.map((p) => outPath(p.route))) {
     const sheets = readTags(readFileSync(join(dist, page), 'utf8'))
       .tags.filter(([t, a]) => t === 'link' && a.some(([k, v]) => k === 'rel' && v === 'stylesheet'))
       .map(([, a]) => (a.find(([k]) => k === 'href') as [string, string])[1].replace(/^.*\//, ''));

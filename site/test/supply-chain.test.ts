@@ -41,6 +41,11 @@ test('package.json has no runtime dependencies and exact devDependencies', () =>
   assert.deepEqual(Object.keys(pkg.devDependencies).sort(), ['@types/node', 'typescript']);
 });
 
+test('engines pin the same Node as .node-version, and .npmrc makes a mismatch an error', () => {
+  assert.equal(pkg.engines?.node, read(SITE, '.node-version').trim());
+  assert.match(read(SITE, '.npmrc'), /^engine-strict=true$/m);
+});
+
 test('every lockfile entry is from the npm registry, hashed, and runs no install script', () => {
   assert.equal(lock.lockfileVersion, 3);
   assert.deepEqual(lockProblems(lock), []);

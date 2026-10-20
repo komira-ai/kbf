@@ -28,7 +28,7 @@ test('a link to a page that is not built is reported', () => {
   plant(t, 'index.html', 'href="/quickstart/"', 'href="/quickstarts/"');
   const problems = checkLinks(t);
   assert.equal(problems.length > 0, true);
-  assert.match(problems[0], /index\.html: <a href="\/quickstarts\/"> names no file/);
+  assert.match(problems.join('\n'), /index\.html: <a href="\/quickstarts\/"> names no file/);
 });
 
 test('a link without the trailing slash is reported', () => {
