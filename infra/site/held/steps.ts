@@ -5,14 +5,14 @@
 export interface Tools {
   /** Run a read-only command and return its stdout. Throws on a non-zero exit. */
   capture(cmd: string, args: string[]): string;
-  /** Run a command with its output shown (diff, install, tests, deploy). */
-  stream(cmd: string, args: string[]): void;
+  /** Run a command with its output shown (diff, install, tests, deploy); `input` is written to its stdin. */
+  stream(cmd: string, args: string[], input?: string): void;
   log(line: string): void;
 }
 
 export class Refused extends Error {}
 
-export type Command = 'github' | 'dns' | 'site' | 'vars';
+export type Command = 'github' | 'oidc-provider' | 'dns' | 'site' | 'vars';
 
 export interface Options {
   command: Command;
@@ -20,25 +20,29 @@ export interface Options {
   account?: string;
   profile?: string;
   repo?: string;
+  reviewer?: string;
   domain: string;
   oidcProviderArn?: string;
 }
 
 const ALLOWED: Record<Command, string[]> = {
-  github: ['--repo'],
+  github: ['--repo', '--reviewer'],
+  'oidc-provider': ['--account', '--profile'],
   dns: ['--account', '--profile', '--domain'],
   site: ['--account', '--profile', '--repo', '--domain', '--oidc-provider-arn'],
   vars: ['--account', '--profile', '--repo'],
 };
 const REQUIRED: Record<Command, string[]> = {
-  github: ['--repo'],
+  github: ['--repo', '--reviewer'],
+  'oidc-provider': ['--account', '--profile'],
   dns: ['--account', '--profile'],
   site: ['--account', '--profile', '--repo'],
   vars: ['--account', '--profile', '--repo'],
 };
 
 export const USAGE = `usage: npm run held -- <command> [flags]
-  github --repo <owner/name> [--apply]
+  github --repo <owner/name> --reviewer <github login of the approver> [--apply]
+  oidc-provider --account <12 digits> --profile <aws profile> [--apply]   (creates the GitHub OIDC provider only if absent)
   dns    --account <12 digits> --profile <aws profile> [--domain <name>] [--apply]
   site   --account <12 digits> --profile <aws profile> --repo <owner/name> [--domain <name>] [--oidc-provider-arn <arn>] [--apply]
   vars   --account <12 digits> --profile <aws profile> --repo <owner/name>      (read-only; prints commands)
@@ -63,12 +67,14 @@ export function parse(argv: string[]): Options {
     if (f === '--account') o.account = v;
     if (f === '--profile') o.profile = v;
     if (f === '--repo') o.repo = v;
+    if (f === '--reviewer') o.reviewer = v;
     if (f === '--domain') o.domain = v;
     if (f === '--oidc-provider-arn') o.oidcProviderArn = v;
   }
   for (const r of REQUIRED[cmd]) if (!seen.has(r)) throw new Refused(`${r} is required`);
   if (o.account !== undefined && !/^\d{12}$/.test(o.account)) throw new Refused('--account must be 12 digits');
   if (o.repo !== undefined && !/^[\w.-]+\/[\w.-]+$/.test(o.repo)) throw new Refused('--repo must be <owner>/<name>');
+  if (o.reviewer !== undefined && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(o.reviewer)) throw new Refused('--reviewer must be a GitHub login');
   if (cmd === 'vars' && o.apply) throw new Refused('vars has no --apply: it only prints');
   return o;
 }
@@ -109,28 +115,70 @@ export const shellQuote = (v: string) => `'${v.replace(/'/g, "'\\''")}'`;
 
 export const OIDC_KEYS = ['repo', 'context', 'job_workflow_ref'];
 
+/** The deployment policies environment `prod` must have, and no others: the existing job runs on main, publish on a v* tag. */
+export const POLICIES: [string, string][] = [['main', 'branch'], ['v*', 'tag']];
+
+/** Read-only GET of a GitHub API path under the repo; undefined when it fails (404 for an environment not yet created). */
+function ghGet(t: Tools, repo: string, path: string): any {
+  try {
+    return JSON.parse(t.capture('gh', ['api', `repos/${repo}/${path}`]));
+  } catch {
+    return undefined;
+  }
+}
+
+/** The required-reviewer rule of an environment as GitHub reports it: reviewer ids and prevent_self_review. */
+function reviewerRule(env: any): { ids: number[]; preventSelf: unknown } | undefined {
+  const rule = (env?.protection_rules ?? []).find((r: any) => r.type === 'required_reviewers');
+  if (!rule) return undefined;
+  return { ids: (rule.reviewers ?? []).map((r: any) => r.reviewer?.id), preventSelf: rule.prevent_self_review };
+}
+
+/** Read-only: resolve the reviewer login to the numeric id of a user (a team or an organisation cannot approve here). */
+export function reviewerId(t: Tools, login: string): number {
+  const j = JSON.parse(t.capture('gh', ['api', `users/${login}`]));
+  if (j.type !== 'User' || typeof j.id !== 'number') throw new Refused(`--reviewer ${login} is not a GitHub user (nothing was changed)`);
+  t.log(`# reviewer ${j.login ?? login}: user id ${j.id}`);
+  return j.id;
+}
+
 export function github(t: Tools, o: Options): void {
   const repo = o.repo!;
   repoIds(t, repo); // read-only; refuses a --repo that is not the repository's exact name
-  const act = (args: string[]) => {
+  const reviewer = reviewerId(t, o.reviewer!);
+  const act = (args: string[], input?: string) => {
+    const shown = input === undefined ? args : [...args, '--input', '-', `<<< ${shellQuote(input)}`];
     if (o.apply) {
-      t.log(`+ gh ${args.join(' ')}`);
-      t.stream('gh', args);
-    } else t.log(`DRY-RUN: gh ${args.join(' ')}`);
+      t.log(`+ gh ${shown.join(' ')}`);
+      t.stream('gh', args, input);
+    } else t.log(`DRY-RUN: gh ${shown.join(' ')}`);
   };
   if (!o.apply) t.log('# dry run: nothing is executed. Re-run with --apply to act.');
-  act([
-    'api', '-X', 'PUT', `repos/${repo}/environments/prod`,
-    '-F', 'deployment_branch_policy[protected_branches]=false',
-    '-F', 'deployment_branch_policy[custom_branch_policies]=true',
-  ]);
-  let has = false;
-  if (o.apply) {
-    const j = JSON.parse(t.capture('gh', ['api', `repos/${repo}/environments/prod/deployment-branch-policies`]));
-    has = (j.branch_policies ?? []).some((p: any) => p.name === 'main' && p.type === 'branch');
+  // PUT replaces the whole protection set, so it always carries every field it manages.
+  const body = JSON.stringify({
+    reviewers: [{ type: 'User', id: reviewer }],
+    prevent_self_review: false, // the tag pusher is the approver; with this on, a release would deadlock
+    can_admins_bypass: false,
+    deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+  });
+  const env = ghGet(t, repo, 'environments/prod');
+  const rule = reviewerRule(env);
+  const dbp = env?.deployment_branch_policy;
+  const envOk =
+    rule !== undefined && rule.ids.length === 1 && rule.ids[0] === reviewer && rule.preventSelf === false &&
+    env.can_admins_bypass === false && dbp?.protected_branches === false && dbp?.custom_branch_policies === true;
+  if (envOk) t.log('# environment prod already has this reviewer, self-review off, admin bypass off, custom policies');
+  else act(['api', '-X', 'PUT', `repos/${repo}/environments/prod`], body);
+  const pols = ghGet(t, repo, 'environments/prod/deployment-branch-policies')?.branch_policies ?? [];
+  for (const [name, type] of POLICIES) {
+    if (pols.some((p: any) => p.name === name && p.type === type)) t.log(`# policy ${name}/${type} already present`);
+    else act(['api', '-X', 'POST', `repos/${repo}/environments/prod/deployment-branch-policies`, '-f', `name=${name}`, '-f', `type=${type}`]);
   }
-  if (has) t.log('# policy main/branch already present');
-  else act(['api', '-X', 'POST', `repos/${repo}/environments/prod/deployment-branch-policies`, '-f', 'name=main', '-f', 'type=branch']);
+  for (const p of pols) {
+    if (!POLICIES.some(([n, ty]) => n === p.name && ty === p.type)) {
+      t.log(`# WARNING: extra policy ${p.name}/${p.type} is not removed here; delete it by hand (vars refuses while it exists)`);
+    }
+  }
   act([
     'api', '-X', 'PUT', `repos/${repo}/actions/oidc/customization/sub`,
     '-F', 'use_default=false', '-F', 'use_immutable_subject=true',
@@ -139,6 +187,30 @@ export function github(t: Tools, o: Options): void {
   t.log('# REMINDER (not run): before relying on the role, run a manual workflow from site-publish.yml@refs/heads/main in');
   t.log("# environment prod that prints the token's sub and job_workflow_ref (never the token), and compare the sub with the");
   t.log('# one in infra/site/README.md. vars checks the GitHub settings, not the token.');
+}
+
+export const OIDC_URL = 'https://token.actions.githubusercontent.com';
+export const OIDC_AUDIENCE = 'sts.amazonaws.com';
+
+/** Creates the account's GitHub OIDC provider only when absent (an account holds one per URL); never touches an existing one. */
+export function oidcProvider(t: Tools, o: Options): void {
+  checkCaller(t, o);
+  const list = JSON.parse(t.capture('aws', aws(o, 'iam', 'list-open-id-connect-providers', '--output', 'json'))).OpenIDConnectProviderList as
+    | { Arn: string }[]
+    | undefined;
+  const have = (list ?? []).find((p) => p.Arn.endsWith(':oidc-provider/token.actions.githubusercontent.com'));
+  if (have) {
+    t.log(`# GitHub OIDC provider already present: ${have.Arn} (nothing to do)`);
+    return;
+  }
+  const create = aws(o, 'iam', 'create-open-id-connect-provider', '--url', OIDC_URL, '--client-id-list', OIDC_AUDIENCE);
+  if (o.apply) {
+    t.log(`+ aws ${create.join(' ')}`);
+    t.stream('aws', create);
+  } else {
+    t.log('# dry run: nothing is executed. Re-run with --apply to act.');
+    t.log(`DRY-RUN: aws ${create.join(' ')}`);
+  }
 }
 
 export function dns(t: Tools, o: Options): void {
@@ -165,7 +237,7 @@ export function site(t: Tools, o: Options): void {
   try {
     t.capture('aws', aws(o, 'iam', 'get-open-id-connect-provider', '--open-id-connect-provider-arn', arn));
   } catch {
-    throw new Refused(`no GitHub OIDC provider at ${arn}; create one first (it is imported, never created here) or pass --oidc-provider-arn`);
+    throw new Refused(`no GitHub OIDC provider at ${arn}; run: npm run held -- oidc-provider --apply (with this account and profile) first (it is imported, never created here) or pass --oidc-provider-arn`);
   }
   const zones = JSON.parse(
     t.capture('aws', aws(o, 'route53', 'list-hosted-zones-by-name', '--dns-name', o.domain, '--max-items', '1', '--output', 'json')),
@@ -202,9 +274,14 @@ export function checkGithub(t: Tools, repo: string): string[] {
   if (!dbp || dbp.protected_branches !== false || dbp.custom_branch_policies !== true) {
     bad.push('environment prod is missing or does not use custom branch policies only');
   }
+  const rule = reviewerRule(env);
+  if (!rule || rule.ids.length === 0) bad.push('environment prod has no required reviewer');
+  else if (rule.preventSelf !== false) bad.push('environment prod does not allow the tag pusher to approve (prevent_self_review must be false)');
+  if (env?.can_admins_bypass !== false) bad.push('environment prod lets administrators bypass its protection rules');
   const pols = get('environments/prod/deployment-branch-policies')?.branch_policies;
-  if (!Array.isArray(pols) || !same(pols.map((p: any) => [p.name, p.type]), [['main', 'branch']])) {
-    bad.push('environment prod does not deploy from exactly the branch main');
+  const want = POLICIES.map((p) => p.join('/')).sort();
+  if (!Array.isArray(pols) || !same(pols.map((p: any) => `${p.name}/${p.type}`).sort(), want)) {
+    bad.push('environment prod does not deploy from exactly the branch main and the tags v*');
   }
   const tmpl = get('actions/oidc/customization/sub');
   if (!tmpl || tmpl.use_default !== false || tmpl.use_immutable_subject !== true || !same(tmpl.include_claim_keys, OIDC_KEYS)) {
@@ -236,5 +313,5 @@ export function vars(t: Tools, o: Options): void {
 
 export function main(argv: string[], t: Tools): void {
   const o = parse(argv);
-  ({ github, dns, site, vars })[o.command](t, o);
+  ({ github, 'oidc-provider': oidcProvider, dns, site, vars })[o.command](t, o);
 }

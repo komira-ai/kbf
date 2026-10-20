@@ -1,9 +1,11 @@
-import { Refused, Tools, checkGithub, main, parse, shellQuote } from '../held/steps';
+import { POLICIES, Refused, Tools, checkGithub, main, parse, shellQuote } from '../held/steps';
 
 const ACCOUNT = '123456789012';
 const REPO = 'example-org/example-repo';
+const REVIEWER = 'example-approver';
+const REVIEWER_ID = 4242;
 
-interface Call { cmd: string; args: string[]; kind: 'capture' | 'stream' }
+interface Call { cmd: string; args: string[]; kind: 'capture' | 'stream'; input?: string }
 
 /** A fake: `answers` maps "cmd arg arg..." prefixes to stdout; anything else answers "{}". */
 function fake(answers: Record<string, string | Error> = {}) {
@@ -21,14 +23,22 @@ function fake(answers: Record<string, string | Error> = {}) {
       }
       return '{}';
     },
-    stream(cmd, args) { calls.push({ cmd, args, kind: 'stream' }); },
+    stream(cmd, args, input) { calls.push({ cmd, args, kind: 'stream', input }); },
     log: (l) => lines.push(l),
   };
   return { t, calls, lines, text: () => lines.join('\n'), ran: (s: string) => calls.some((c) => [c.cmd, ...c.args].join(' ').includes(s)) };
 }
 
-const GOOD_ENV = JSON.stringify({ deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } });
-const GOOD_POLS = JSON.stringify({ branch_policies: [{ name: 'main', type: 'branch' }] });
+const envJson = (over: Record<string, unknown> = {}, rule: Record<string, unknown> | null = {}) =>
+  JSON.stringify({
+    can_admins_bypass: false,
+    deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+    protection_rules: rule === null ? [] : [{ type: 'required_reviewers', prevent_self_review: false, reviewers: [{ type: 'User', reviewer: { id: REVIEWER_ID } }], ...rule }],
+    ...over,
+  });
+const polsJson = (...p: [string, string][]) => JSON.stringify({ branch_policies: p.map(([name, type]) => ({ name, type })) });
+const GOOD_ENV = envJson();
+const GOOD_POLS = polsJson(['main', 'branch'], ['v*', 'tag']);
 const GOOD_TMPL = JSON.stringify({ use_default: false, use_immutable_subject: true, include_claim_keys: ['repo', 'context', 'job_workflow_ref'] });
 const STACK = JSON.stringify([
   { OutputKey: 'BucketName', OutputValue: `kbf-prod-site-${ACCOUNT}` },
@@ -42,6 +52,7 @@ const answers = (over: Record<string, string | Error> = {}) => ({
   'oidc/customization/sub': GOOD_TMPL,
   'describe-stacks': STACK,
   'list-hosted-zones-by-name': JSON.stringify({ HostedZones: [{ Name: 'kbf.dev.' }] }),
+  [`api users/${REVIEWER}`]: JSON.stringify({ login: REVIEWER, id: REVIEWER_ID, type: 'User' }),
   [`api repos/${REPO}`]: JSON.stringify({ full_name: REPO, id: 222, owner: { id: 111 } }),
   ...over,
 });
@@ -54,45 +65,115 @@ describe('flag parsing', () => {
   test('an account that is not 12 digits, a missing profile and a bad repo are refused', () => {
     expect(() => parse(['dns', '--account', '12', '--profile', 'p'])).toThrow(/12 digits/);
     expect(() => parse(['dns', '--account', ACCOUNT])).toThrow(/--profile/);
-    expect(() => parse(['github', '--repo', 'nope'])).toThrow(/owner/);
+    expect(() => parse(['github', '--repo', 'nope', '--reviewer', REVIEWER])).toThrow(/owner/);
+    expect(() => parse(['github', '--repo', REPO])).toThrow(/--reviewer is required/);
+    expect(() => parse(['github', '--repo', REPO, '--reviewer', 'a b'])).toThrow(/GitHub login/);
+    expect(() => parse(['oidc-provider', '--account', ACCOUNT])).toThrow(/--profile/);
+    expect(() => parse(['oidc-provider', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO])).toThrow(/unknown flag/);
   });
   test('vars has no --apply', () => {
     expect(() => parse(['vars', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO, '--apply'])).toThrow(/no --apply/);
   });
   test('dry run is the default', () => {
-    expect(parse(['github', '--repo', REPO]).apply).toBe(false);
-    expect(parse(['github', '--repo', REPO, '--apply']).apply).toBe(true);
+    expect(parse(['github', '--repo', REPO, '--reviewer', REVIEWER]).apply).toBe(false);
+    expect(parse(['github', '--repo', REPO, '--reviewer', REVIEWER, '--apply']).apply).toBe(true);
+    expect(parse(['oidc-provider', '--account', ACCOUNT, '--profile', 'p']).apply).toBe(false);
   });
 });
 
 describe('account guard', () => {
-  test.each(['dns', 'site', 'vars'])('%s refuses before doing anything else when the profile is another account', (cmd) => {
+  test.each(['dns', 'site', 'vars', 'oidc-provider'])('%s refuses before doing anything else when the profile is another account', (cmd) => {
     const f = fake(answers({ 'sts get-caller-identity': '999999999999' }));
-    const flags = ['--account', ACCOUNT, '--profile', 'p', ...(cmd === 'dns' ? [] : ['--repo', REPO])];
+    const flags = ['--account', ACCOUNT, '--profile', 'p', ...(cmd === 'dns' || cmd === 'oidc-provider' ? [] : ['--repo', REPO])];
     expect(() => main([cmd, ...flags], f.t)).toThrow(/not the --account/);
     expect(f.calls).toHaveLength(1);
   });
 });
 
 describe('dry run', () => {
+  const GH = ['github', '--repo', REPO, '--reviewer', REVIEWER];
+  const NOTHING = { 'environments/prod/deployment-branch-policies': new Error('404'), 'environments/prod': new Error('404') };
   test('github prints the gh commands and executes none', () => {
-    const f = fake(answers());
-    main(['github', '--repo', REPO], f.t);
+    const f = fake(answers(NOTHING));
+    main(GH, f.t);
     expect(f.calls.filter((c) => c.kind === 'stream')).toHaveLength(0);
     expect(f.calls.every((c) => c.cmd === 'gh' && c.args[0] === 'api' && !c.args.includes('-X'))).toBe(true);
-    expect(f.text()).toContain(`DRY-RUN: gh api -X PUT repos/${REPO}/environments/prod`);
-    expect(f.text()).toContain('custom_branch_policies]=true');
-    expect(f.text()).toContain('name=main');
+    expect(f.text()).toContain(`DRY-RUN: gh api -X PUT repos/${REPO}/environments/prod --input -`);
+    expect(f.text()).toContain(`"reviewers":[{"type":"User","id":${REVIEWER_ID}}]`);
+    expect(f.text()).toContain('"prevent_self_review":false');
+    expect(f.text()).toContain('"can_admins_bypass":false');
+    expect(f.text()).toContain('"custom_branch_policies":true');
+    expect(f.text()).toContain('-f name=main -f type=branch');
+    expect(f.text()).toContain('-f name=v* -f type=tag');
     expect(f.text()).toContain('include_claim_keys[]=job_workflow_ref');
     expect(f.text()).toContain('REMINDER');
   });
-  test('github --apply runs the three writes, skipping the branch policy that exists', () => {
+  test('github --apply on a bare repo runs the environment write with the body on stdin, both policies, and the sub template', () => {
+    const f = fake(answers(NOTHING));
+    main([...GH, '--apply'], f.t);
+    const streamed = f.calls.filter((c) => c.kind === 'stream');
+    expect(streamed.map((c) => c.args.slice(0, 3).join(' '))).toEqual([
+      `api -X PUT`, `api -X POST`, `api -X POST`, `api -X PUT`,
+    ].map((x) => x));
+    expect(streamed[0].args).toContain(`repos/${REPO}/environments/prod`);
+    expect(JSON.parse(streamed[0].input!)).toEqual({
+      reviewers: [{ type: 'User', id: REVIEWER_ID }],
+      prevent_self_review: false,
+      can_admins_bypass: false,
+      deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+    });
+    expect(streamed[1].args.join(' ')).toContain('-f name=main -f type=branch');
+    expect(streamed[2].args.join(' ')).toContain('-f name=v* -f type=tag');
+    expect(streamed[3].args.join(' ')).toContain('oidc/customization/sub');
+  });
+  test('github --apply is idempotent: with everything present only the (idempotent) sub template is written', () => {
     const f = fake(answers());
-    main(['github', '--repo', REPO, '--apply'], f.t);
+    main([...GH, '--apply'], f.t);
     const streamed = f.calls.filter((c) => c.kind === 'stream').map((c) => c.args.join(' '));
-    expect(streamed).toHaveLength(2);
-    expect(streamed[0]).toContain('-X PUT');
-    expect(streamed[1]).toContain('oidc/customization/sub');
+    expect(streamed).toHaveLength(1);
+    expect(streamed[0]).toContain('oidc/customization/sub');
+    expect(f.text()).toContain('policy main/branch already present');
+    expect(f.text()).toContain('policy v*/tag already present');
+    expect(f.text()).toContain('already has this reviewer');
+  });
+  test('github adds only the missing tag policy, and only the missing main policy', () => {
+    for (const [have, missing] of [[['main', 'branch'], 'name=v* -f type=tag'], [['v*', 'tag'], 'name=main -f type=branch']] as [[string, string], string][]) {
+      const f = fake(answers({ 'environments/prod/deployment-branch-policies': polsJson(have) }));
+      main([...GH, '--apply'], f.t);
+      const posts = f.calls.filter((c) => c.kind === 'stream' && c.args.includes('POST'));
+      expect(posts).toHaveLength(1);
+      expect(posts[0].args.join(' ')).toContain(missing);
+    }
+  });
+  test.each([
+    ['another reviewer', envJson({}, { reviewers: [{ type: 'User', reviewer: { id: 7 } }] })],
+    ['two reviewers', envJson({}, { reviewers: [{ type: 'User', reviewer: { id: REVIEWER_ID } }, { type: 'User', reviewer: { id: 7 } }] })],
+    ['no reviewer rule', envJson({}, null)],
+    ['self-review prevented', envJson({}, { prevent_self_review: true })],
+    ['admins can bypass', envJson({ can_admins_bypass: true })],
+    ['protected branches rather than custom', envJson({ deployment_branch_policy: { protected_branches: true, custom_branch_policies: false } })],
+  ] as [string, string][])('github rewrites the environment when %s', (_n, env) => {
+    const f = fake(answers({ 'environments/prod': env }));
+    main([...GH, '--apply'], f.t);
+    const puts = f.calls.filter((c) => c.kind === 'stream' && c.args.includes('repos/' + REPO + '/environments/prod'));
+    expect(puts).toHaveLength(1);
+    expect(JSON.parse(puts[0].input!).reviewers).toEqual([{ type: 'User', id: REVIEWER_ID }]);
+  });
+  test('github warns about an extra policy and does not delete it', () => {
+    const f = fake(answers({ 'environments/prod/deployment-branch-policies': polsJson(['main', 'branch'], ['v*', 'tag'], ['dev', 'branch']) }));
+    main([...GH, '--apply'], f.t);
+    expect(f.text()).toContain('WARNING: extra policy dev/branch');
+    expect(f.calls.some((c) => c.args.includes('DELETE'))).toBe(false);
+  });
+  test('github refuses a reviewer that is not a user, before any write', () => {
+    const f = fake(answers({ [`api users/${REVIEWER}`]: JSON.stringify({ login: REVIEWER, id: 5, type: 'Organization' }) }));
+    expect(() => main([...GH, '--apply'], f.t)).toThrow(/not a GitHub user/);
+    expect(f.calls.filter((c) => c.kind === 'stream')).toHaveLength(0);
+  });
+  test('the reviewer is never baked into the source', () => {
+    const src = require('fs').readFileSync(require('path').join(__dirname, '..', 'held', 'steps.ts'), 'utf8');
+    expect(src).not.toMatch(/reviewers: \[\{ type: 'User', id: \d/);
+    expect(src).not.toContain(REVIEWER);
   });
   test('dns and site run cdk diff, never deploy', () => {
     for (const cmd of [['dns'], ['site', '--repo', REPO]]) {
@@ -132,7 +213,7 @@ describe('site', () => {
 
 describe('--repo cross-check', () => {
   const other = JSON.stringify({ full_name: 'other-owner/example-repo', id: 999, owner: { id: 888 } });
-  test.each([['github', []], ['site', ['--account', ACCOUNT, '--profile', 'p']]] as [string, string[]][])(
+  test.each([['github', ['--reviewer', REVIEWER]], ['site', ['--account', ACCOUNT, '--profile', 'p']]] as [string, string[]][])(
     '%s refuses a --repo whose GitHub full_name differs, before any write or cdk call',
     (cmd, extra) => {
       const f = fake(answers({ [`api repos/${REPO}`]: other }));
@@ -183,8 +264,16 @@ describe('vars', () => {
   test.each([
     ['environment missing', { 'environments/prod': new Error('404') }],
     ['protected branches rather than custom', { 'environments/prod': JSON.stringify({ deployment_branch_policy: { protected_branches: true, custom_branch_policies: false } }) }],
-    ['a second branch policy', { 'environments/prod/deployment-branch-policies': JSON.stringify({ branch_policies: [{ name: 'main', type: 'branch' }, { name: 'dev', type: 'branch' }] }) }],
-    ['a wildcard branch policy', { 'environments/prod/deployment-branch-policies': JSON.stringify({ branch_policies: [{ name: '*', type: 'branch' }] }) }],
+    ['a third policy', { 'environments/prod/deployment-branch-policies': polsJson(['main', 'branch'], ['v*', 'tag'], ['dev', 'branch']) }],
+    ['only the main branch policy (the tag publish job would be rejected)', { 'environments/prod/deployment-branch-policies': polsJson(['main', 'branch']) }],
+    ['only the v* tag policy', { 'environments/prod/deployment-branch-policies': polsJson(['v*', 'tag']) }],
+    ['v* as a branch policy, not a tag policy', { 'environments/prod/deployment-branch-policies': polsJson(['main', 'branch'], ['v*', 'branch']) }],
+    ['a wildcard branch policy', { 'environments/prod/deployment-branch-policies': polsJson(['*', 'branch'], ['v*', 'tag']) }],
+    ['no required reviewer', { 'environments/prod': envJson({}, null) }],
+    ['an empty reviewer list', { 'environments/prod': envJson({}, { reviewers: [] }) }],
+    ['self-review prevented', { 'environments/prod': envJson({}, { prevent_self_review: true }) }],
+    ['admin bypass allowed', { 'environments/prod': envJson({ can_admins_bypass: true }) }],
+    ['admin bypass unreported', { 'environments/prod': envJson({ can_admins_bypass: undefined }) }],
     ['the default sub template', { 'oidc/customization/sub': JSON.stringify({ use_default: true }) }],
     ['a sub template without job_workflow_ref', { 'oidc/customization/sub': JSON.stringify({ use_default: false, use_immutable_subject: true, include_claim_keys: ['repo', 'context'] }) }],
     ['a mutable subject', { 'oidc/customization/sub': JSON.stringify({ use_default: false, use_immutable_subject: false, include_claim_keys: ['repo', 'context', 'job_workflow_ref'] }) }],
@@ -197,7 +286,47 @@ describe('vars', () => {
     const { go } = run({ 'describe-stacks': '[]' });
     expect(go).toThrow(/no outputs/);
   });
-  test('checkGithub returns no mismatch for the settings that github sets', () => {
+  test('checkGithub returns no mismatch for the settings that github sets, in either policy order', () => {
     expect(checkGithub(fake(answers()).t, REPO)).toEqual([]);
+    const rev = fake(answers({ 'environments/prod/deployment-branch-policies': polsJson(['v*', 'tag'], ['main', 'branch']) }));
+    expect(checkGithub(rev.t, REPO)).toEqual([]);
+  });
+  test('the policy set is exactly main (branch) and v* (tag)', () => {
+    expect(POLICIES).toEqual([['main', 'branch'], ['v*', 'tag']]);
+  });
+});
+
+describe('oidc-provider', () => {
+  const ARGS = ['oidc-provider', '--account', ACCOUNT, '--profile', 'p'];
+  const ABSENT = { 'list-open-id-connect-providers': JSON.stringify({ OpenIDConnectProviderList: [{ Arn: `arn:aws:iam::${ACCOUNT}:oidc-provider/other.example.com` }] }) };
+  const PRESENT = { 'list-open-id-connect-providers': JSON.stringify({ OpenIDConnectProviderList: [{ Arn: `arn:aws:iam::${ACCOUNT}:oidc-provider/token.actions.githubusercontent.com` }] }) };
+  const CREATE = 'iam create-open-id-connect-provider --url https://token.actions.githubusercontent.com --client-id-list sts.amazonaws.com --profile p';
+  test('dry run when absent prints the exact create and runs nothing', () => {
+    const f = fake(answers(ABSENT));
+    main(ARGS, f.t);
+    expect(f.calls.filter((c) => c.kind === 'stream')).toHaveLength(0);
+    expect(f.text()).toContain(`DRY-RUN: aws ${CREATE}`);
+  });
+  test('--apply when absent creates exactly once', () => {
+    const f = fake(answers(ABSENT));
+    main([...ARGS, '--apply'], f.t);
+    const streamed = f.calls.filter((c) => c.kind === 'stream');
+    expect(streamed).toHaveLength(1);
+    expect(streamed[0].args.join(' ')).toBe(CREATE);
+  });
+  test.each([[false], [true]])('when present (apply=%s) nothing is created', (apply) => {
+    const f = fake(answers(PRESENT));
+    main([...ARGS, ...(apply ? ['--apply'] : [])], f.t);
+    expect(f.ran('create-open-id-connect-provider')).toBe(false);
+    expect(f.calls.filter((c) => c.kind === 'stream')).toHaveLength(0);
+    expect(f.text()).toContain('already present');
+  });
+  test('an empty provider list counts as absent', () => {
+    const f = fake(answers({ 'list-open-id-connect-providers': '{}' }));
+    main([...ARGS, '--apply'], f.t);
+    expect(f.ran(CREATE)).toBe(true);
+  });
+  test('the site step still never creates one and now points at this step', () => {
+    expect(() => main(['site', '--account', ACCOUNT, '--profile', 'p', '--repo', REPO], fake(answers({ 'get-open-id-connect-provider': new Error('NoSuchEntity') })).t)).toThrow(/held -- oidc-provider --apply/);
   });
 });
