@@ -43,11 +43,6 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "a secret file removed in the same function, before any assertion can fail",
     ),
     (
-        "crates/kbf-server/tests/state_golden.rs",
-        1,
-        "removed by the test on success (a failing run keeps the files to read)",
-    ),
-    (
         "crates/xtask/src/darwin/mac.rs",
         1,
         "product code: a call's directory, removed by the Drop of its guard",
