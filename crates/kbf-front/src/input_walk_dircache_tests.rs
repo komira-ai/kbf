@@ -467,6 +467,8 @@ enum Latency {
 struct Figures {
     reads: usize,
     asks: usize,
+    /// The digests those calls named.
+    digests: usize,
     mean: Duration,
     p95: Duration,
 }
@@ -531,6 +533,7 @@ async fn build(
     Figures {
         reads: store.total_reads(),
         asks: store.ask_calls(),
+        digests: store.total_asked(),
         mean: waits.iter().sum::<Duration>() / waits.len() as u32,
         p95: sorted[(sorted.len() * 95).div_ceil(100) - 1],
     }
@@ -556,9 +559,18 @@ async fn figures(actions: usize, per_wave: usize, gap: Duration) {
         let now = build(actions, per_wave, gap, latency, true).await;
         println!(
             "{actions} actions in waves of {per_wave} every {gap:?}, {name}: \
-             before: {} store reads, {} FindMissing, presubmit mean {:?} p95 {:?} | \
-             after: {} store reads, {} FindMissing, presubmit mean {:?} p95 {:?}",
-            tip.reads, tip.asks, tip.mean, tip.p95, now.reads, now.asks, now.mean, now.p95
+             before: {} store reads, {} FindMissing ({} digests), presubmit mean {:?} p95 {:?} | \
+             after: {} store reads, {} FindMissing ({} digests), presubmit mean {:?} p95 {:?}",
+            tip.reads,
+            tip.asks,
+            tip.digests,
+            tip.mean,
+            tip.p95,
+            now.reads,
+            now.asks,
+            now.digests,
+            now.mean,
+            now.p95
         );
         assert!(now.reads < tip.reads, "{name}: {now:?} vs {tip:?}");
         assert!(now.mean <= tip.mean, "{name}: {now:?} vs {tip:?}");
