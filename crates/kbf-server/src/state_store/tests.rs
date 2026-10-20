@@ -144,13 +144,9 @@ fn an_unreachable_postgres_store_refuses_the_open_without_the_password() {
     assert!(!format!("{after} {after:?}").contains("hunter2"));
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "kbf-server-state-uri-{}-{name}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A fresh directory for `name`, removed when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::test_dir::scratch_dir(&format!("kbf-server-state-uri-{name}"))
 }
 
 fn mode(path: &std::path::Path) -> u32 {
@@ -180,7 +176,6 @@ fn a_sqlite_value_opens_its_file_and_holds_it() {
     );
     drop(store);
     uri.open().expect("free once the first is gone");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a store opened without the writer fence (a handle left over from an earlier
@@ -210,7 +205,6 @@ fn every_open_takes_the_next_writer_generation_and_fences_the_one_before() {
     Fenced::take(Arc::clone(&second.store), Some(2)).expect("a successor");
     assert_eq!(second.store.txn(write()).unwrap_err(), StoreError::Fenced);
     drop(second);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a successor that takes a store it was not told about, and one that does not
@@ -246,7 +240,6 @@ fn a_store_opened_after_a_handover_expects_its_generation_and_keeps_the_epoch() 
         .expect("the generation it was told");
     assert_eq!(successor.epoch, EpochPolicy::Keep);
     assert_eq!(generation(&successor), 2);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a scheduler that opened a store with a generation row it cannot read taking
@@ -265,7 +258,6 @@ fn a_generation_row_that_is_not_a_number_refuses_the_open() {
     let refused = uri.open().err().expect("junk");
     assert!(matches!(refused, StateError::Open(_)), "{refused:?}");
     assert!(refused.to_string().contains("generation"), "{refused}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: the scheduler's state (every operation's request, every lease) readable by
@@ -288,7 +280,6 @@ fn the_state_directory_and_files_are_private() {
     }
     assert!(seen >= 2, "the file and its lock were checked: {seen}");
     drop(store);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Catches: a path that cannot be a state file (a directory) taken, and an error that
@@ -297,7 +288,7 @@ fn the_state_directory_and_files_are_private() {
 fn a_sqlite_value_that_cannot_be_opened_names_the_path() {
     let dir = scratch("bad");
     std::fs::create_dir_all(&dir).expect("dir");
-    let refused = StateStoreUri::Sqlite(dir.clone())
+    let refused = StateStoreUri::Sqlite(dir.to_path_buf())
         .open()
         .err()
         .expect("a directory");
@@ -313,8 +304,7 @@ fn a_sqlite_value_that_cannot_be_opened_names_the_path() {
     let refused = under.open().err().expect("no directory");
     assert!(matches!(refused, StateError::Open(_)), "{refused:?}");
     assert!(refused.to_string().contains("a-file"), "{refused}");
-    let _ = std::fs::remove_dir_all(&dir);
-    let mut lock = dir.into_os_string();
+    let mut lock = dir.as_os_str().to_owned();
     lock.push(".lock");
     let _ = std::fs::remove_file(lock);
 }

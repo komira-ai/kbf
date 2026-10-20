@@ -128,6 +128,8 @@ pub mod storage_node;
 pub mod store_config;
 pub mod stores;
 pub mod streams;
+#[cfg(test)]
+mod test_dir;
 mod timeout;
 pub mod token;
 pub mod update;

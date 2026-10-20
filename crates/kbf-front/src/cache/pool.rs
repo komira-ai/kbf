@@ -33,6 +33,14 @@
 //! writer, so the bound holds for it too. Not covered: the files other callers
 //! write (a `Segments` upload's ranges, `Cache::store_blobs`' segments), which have their
 //! own bounds.
+//!
+//! **Not counted** in `kbf_bytes_in_flight`: the pool's own copies. A buffered blob is
+//! appended chunk by chunk into a buffer of the pool's (`append`) and a streaming blob's
+//! chunk is copied into the queue to its writer (`Bytes::copy_from_slice`); both are
+//! write-tier internals beside the counted receive buffer or message they were copied
+//! from, so the gauge, and the bound on a large `Write` read from it, understates
+//! resident memory by those copies (a blob of at most [`BUFFERED_BLOB_BYTES`] once more,
+//! a few chunks of a streaming one).
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;

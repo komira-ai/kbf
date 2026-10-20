@@ -133,6 +133,7 @@ const EVERY: [&str; 8] = [
 fn f4_1_steady_state() {
     let reach = sweep(Scenario::Steady);
     assert_reached(&reach, &EVERY);
+    assert_reached(&reach, &["an action that runs alone holds a worker"]);
 }
 
 /// Catches, besides F4.1's: expiry that is early or late (I3), a result accepted from
