@@ -156,4 +156,13 @@ async fn a_node_reports_its_fill_and_is_promoted_by_its_own_heartbeat() {
     joiner.beat(&joined).await.expect("beat");
     let after = members.current_map().expect("read").expect("a map");
     assert_eq!(after.member(c).map(|m| m.state), Some(MemberState::Active));
+
+    // A registration again (a restart, or a lapsed row) is a new boot, which has done no pass.
+    assert_eq!(fill.beat().tail_epoch_done, 1);
+    joiner.register().await.expect("registers again");
+    assert_eq!(
+        fill.beat().tail_epoch_done,
+        0,
+        "a new boot has done no pass"
+    );
 }

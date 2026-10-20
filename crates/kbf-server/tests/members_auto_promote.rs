@@ -580,6 +580,27 @@ fn without_the_setting_nothing_is_promoted_automatically_and_the_operator_still_
     assert!(s.store.fake.get("unfilled/3").expect("read").is_none());
 }
 
+/// Catches: a frontend that does not have the setting promoting a joiner whose fence another
+/// frontend opened (a mixed rollout, or the setting taken off): every condition holds and
+/// the settle time has passed, and the beats of the joiner that reach the frontend without
+/// the setting promote nothing. The frontend with it promotes at its next beat. Mutant seen
+/// red: the beat deciding without checking the setting.
+#[test]
+fn a_frontend_without_the_setting_never_promotes_over_a_fence_another_opened() {
+    let s = scene();
+    let epoch = s.open_fence();
+    let plain = members(&s.store, 2, None);
+    s.beat(&plain, &s.c, Progress::CaughtUp, s.done(epoch));
+    s.store.clock.advance(SETTLE * 2);
+    s.beat(&plain, &s.c, Progress::CaughtUp, s.done(epoch));
+    s.store.clock.advance(SETTLE * 2);
+    s.beat(&plain, &s.c, Progress::CaughtUp, s.done(epoch));
+    assert_eq!(s.state(), Some(MemberState::Joining));
+    s.beat_joiner(Progress::CaughtUp, s.done(epoch));
+    s.joiner_after(SETTLE, s.done(epoch));
+    assert_eq!(s.state(), Some(MemberState::Active));
+}
+
 /// Catches: a farm with a member `Down` inside its dwell filling a joiner: that member may
 /// hold the only copy of a blob it staged. The fence stays shut while it is down; when it
 /// has left the map the fence opens, but the join is degraded and the joiner is withheld for
