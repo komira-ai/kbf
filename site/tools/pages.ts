@@ -150,10 +150,13 @@ export function outPath(route: string): string {
 
 /**
  * The pages of the page copy name each other as '<source>.html' (the copy was written for a flat directory). Writes
- * those as the routes they are served at; an internal '.html' link that names no page is an error.
+ * those as the routes they are served at; an internal '.html' link that names no page is an error. A link to a file of
+ * the repository on the branch the copy was written against (feature/arch-v2, since merged) names main: the copy stays
+ * as written and the build says where the file is now.
  */
 export function rewriteLinks(html: string, pages: readonly Page[]): string {
   const bySource = new Map(pages.map((p) => [p.source, p.route]));
+  html = html.replaceAll(`${REPO_URL}/blob/feature/arch-v2/`, `${REPO_URL}/blob/main/`);
   return html.replace(/(\bhref=")([a-z0-9-]+)\.html(#[^"]*)?"/g, (_m, pre: string, name: string, frag: string | undefined) => {
     const route = bySource.get(name);
     if (route === undefined) throw new Error(`pages: a link to ${name}.html, which is no page`);

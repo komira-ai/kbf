@@ -5,9 +5,13 @@
 // broken link on a deployed site is a 404 for a visitor and nothing in the build would say so.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { test } from 'node:test';
+import { listFiles } from '../tools/check-dist';
+import { rewriteLinks } from '../tools/pages';
 import { checkLinks, checkRepoLinks, fileOf } from '../tools/links';
-import { buildReal, copyTree, plant, REPO } from './support';
+import { buildReal, copyTree, plant, REPO, SITE } from './support';
 
 const dist = buildReal('links');
 
@@ -78,4 +82,13 @@ test('a stylesheet or script at an asset id that is not built is reported', () =
   const t = copyTree(dist, 'links-asset');
   plant(t, 'install/index.html', /\/assets\/[0-9a-f]+\/theme\.css/, '/assets/0000000000000000/theme.css');
   assert.match(checkLinks(t).join('\n'), /install\/index\.html: <link href="\/assets\/0+\/theme\.css"> names no file/);
+});
+
+test('a blob link on feature/arch-v2 in the page copy is served as a link on main, and no such link is left in the build', () => {
+  const html = '<a href="https://github.com/komira-ai/kbf/blob/feature/arch-v2/docs/design/distribution.md#x">d</a>';
+  assert.equal(rewriteLinks(html, []), '<a href="https://github.com/komira-ai/kbf/blob/main/docs/design/distribution.md#x">d</a>');
+  assert.equal(rewriteLinks('<a href="https://github.com/komira-ai/kbf/blob/main/a.md">a</a>', []), '<a href="https://github.com/komira-ai/kbf/blob/main/a.md">a</a>');
+  for (const f of listFiles(dist).filter((x) => x.endsWith('.html'))) assert.equal(readFileSync(join(dist, f), 'utf8').includes('/blob/feature/arch-v2/'), false, f);
+  // The page copy itself is untouched: it still holds such links, so the check above is on the rewrite, not on the copy.
+  assert.equal(readFileSync(join(SITE, 'content', 'install.html'), 'utf8').includes('blob/feature/arch-v2/'), true);
 });
