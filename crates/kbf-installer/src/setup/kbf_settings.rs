@@ -302,6 +302,17 @@ const SPECS: [Spec; 20] = [
     ),
 ];
 
+/// The flags a `--proxy` host does not take: the listeners (the proxy owns the public address
+/// and gives each child loopback ports on its command line) and the worker listener's
+/// certificate pair (the children serve plain h2c).
+const PROXY_REFUSED: [&str; 5] = [
+    "listen",
+    "worker-listen",
+    "api-listen",
+    "worker-tls-cert",
+    "worker-tls-key",
+];
+
 /// The `(table, key)` pairs `mode` writes.
 pub fn written(mode: Mode) -> Vec<(&'static str, &'static str)> {
     SPECS
@@ -409,7 +420,7 @@ impl KbfFlags {
         ]
     }
 
-    fn get(&self, flag: &str) -> Option<&str> {
+    pub(super) fn get(&self, flag: &str) -> Option<&str> {
         self.slots()
             .into_iter()
             .find(|(name, _)| *name == flag)
@@ -418,12 +429,27 @@ impl KbfFlags {
 
     /// Check the flags for `mode`: the settings to write, or a line per problem pushed to
     /// `problems`. Files are checked later ([`check_files`]); this needs no host.
-    pub fn validate(&self, mode: Mode, problems: &mut Vec<String>) -> Vec<Setting> {
+    ///
+    /// On a `--proxy` host (`proxy`) the children are told their loopback listeners by the
+    /// proxy and speak plain h2c behind it, so the listener flags and the worker listener's
+    /// certificate are refused (a value nothing would read); the REAPI pair and the worker
+    /// client CA are the proxy's, and come back among the settings for the caller to move
+    /// out of `kbf.toml`.
+    pub fn validate(&self, mode: Mode, proxy: bool, problems: &mut Vec<String>) -> Vec<Setting> {
         let name = super::validate::mode_name(mode);
         let mut out = Vec::new();
         let mut bad = false;
         for s in &SPECS {
             let given = s.flag.and_then(|f| self.get(f));
+            if let (true, Some(flag), Some(_)) = (proxy, s.flag, given)
+                && PROXY_REFUSED.contains(&flag)
+            {
+                problems.push(format!(
+                    "--{flag} is not taken with --proxy: the proxy tells its children their loopback listeners and they serve plain h2c behind it"
+                ));
+                bad = true;
+                continue;
+            }
             if !s.takes.mode(mode) {
                 if let (Some(flag), Some(_)) = (s.flag, given) {
                     problems.push(format!(
@@ -468,18 +494,19 @@ impl KbfFlags {
             }
         }
         if !bad {
-            self.together(mode, problems);
+            self.together(mode, proxy, problems);
         }
         out
     }
 
     /// The flags that only work in company.
-    fn together(&self, mode: Mode, problems: &mut Vec<String>) {
+    fn together(&self, mode: Mode, proxy: bool, problems: &mut Vec<String>) {
         let groups: [&[&str]; 2] = [
             &["reapi-tls-cert", "reapi-tls-key"],
             &["worker-tls-cert", "worker-tls-key", "worker-client-ca"],
         ];
-        for group in groups {
+        // With the proxy the worker group is not one: the client CA is the proxy's alone.
+        for group in groups.iter().take(if proxy { 1 } else { 2 }) {
             let given = group.iter().filter(|f| self.get(f).is_some()).count();
             if given != 0 && given != group.len() {
                 problems.push(format!(

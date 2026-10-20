@@ -7,6 +7,7 @@
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+use super::proxy_tests::{proxy_host, proxy_raw};
 use super::*;
 use crate::deploy::host_config::{CONFIG, HostConfig};
 use crate::setup::deploy_config::DeployFlags;
@@ -156,7 +157,7 @@ fn the_api_and_the_token_default_to_the_proxy_the_host_names() {
         ("", "127.0.0.1:8980"),
         ("listen = \"0.0.0.0:8443\"\n", "127.0.0.1:8443"),
         ("listen = \"[::]:8443\"\n", "[::1]:8443"),
-        ("listen = \"127.0.0.2:9000\"\n", "127.0.0.2:9000"),
+        ("listen = \"127.0.0.1:9000\"\n", "127.0.0.1:9000"),
         ("listen = \"[::1]:9000\"\n", "[::1]:9000"),
     ];
     for (listen, api) in cases {
@@ -619,4 +620,170 @@ fn a_file_the_service_user_owns_is_accepted() {
         &with(Mode::Frontend, all_flags()),
     );
     assert_eq!(text(&exec, CONFIG), GOLDEN);
+}
+
+/// The token setup makes on this run: `host()` has none, as a fresh host has none.
+const MADE_TOKEN: &str = "/etc/kbf/api-token";
+
+fn fresh_host() -> FakeExec {
+    released(host(), Platform::Linux)
+}
+
+/// Catches the first run of a fresh host being refused for a token its own run makes: with the
+/// default token path named (or defaulted from the `[proxy]` table this very run writes), no
+/// token on the host, both the apply and the dry run succeed; the apply leaves the token (mode
+/// 0600, never printed) and a `deploy.json` that names it, in one run.
+///
+/// Mutants planted: the exemption dropped (the first-run refusal returns); the exemption widened
+/// to any absent token path (the next test goes red).
+#[test]
+fn a_first_run_may_name_the_token_it_makes() {
+    let mut exec = fresh_host();
+    let named = DeployFlags {
+        deploy_token_file: some(MADE_TOKEN),
+        ..stage_only()
+    };
+    let dry = Options {
+        apply: false,
+        no_start: false,
+    };
+    go(
+        &FakeOs::linux(),
+        &mut exec,
+        &with(Mode::Frontend, named.clone()),
+        dry,
+    )
+    .expect("dry run");
+    assert!(!exists(&exec, MADE_TOKEN) && !exists(&exec, CONFIG));
+
+    let out = go_ok(&FakeOs::linux(), &mut exec, &with(Mode::Frontend, named));
+    assert_eq!(file_meta(&exec, MADE_TOKEN).0, 0o600);
+    let config = HostConfig::parse(&text(&exec, CONFIG)).expect("parses");
+    assert_eq!(
+        config.token_file.as_deref(),
+        Some(std::path::Path::new(MADE_TOKEN))
+    );
+    assert!(
+        !out.contains(&text(&exec, MADE_TOKEN).trim().to_owned()),
+        "{out}"
+    );
+
+    // The common first run: the `--proxy` flags and the stage only; the token is the proxy's.
+    let mut exec = proxy_host();
+    let mut raw = proxy_raw();
+    raw.deploy = stage_only();
+    go_ok(&FakeOs::linux(), &mut exec, &raw);
+    let config = HostConfig::parse(&text(&exec, CONFIG)).expect("parses");
+    assert_eq!(
+        config.token_file.as_deref(),
+        Some(std::path::Path::new(MADE_TOKEN))
+    );
+    assert!(exists(&exec, MADE_TOKEN));
+}
+
+/// Catches the exemption being wider than the token setup makes: another absent path is still
+/// refused, and the made token's path with a wrong mode is still refused (setup keeps a token
+/// that is there, so it would not fix it).
+///
+/// Mutants planted: the path comparison dropped; the exemption applied when the file exists.
+#[test]
+fn only_the_token_setup_makes_may_be_absent() {
+    let mut exec = fresh_host();
+    let raw = with(
+        Mode::Frontend,
+        DeployFlags {
+            deploy_token_file: some("/etc/kbf/other.token"),
+            ..stage_only()
+        },
+    );
+    let err = go(&FakeOs::linux(), &mut exec, &raw, APPLY).expect_err("refused");
+    assert!(err.to_string().contains("does not exist"), "{err}");
+
+    let mut exec = fresh_host();
+    put(&mut exec, MADE_TOKEN, 0o644, ROOT, SECRET);
+    let raw = with(
+        Mode::Frontend,
+        DeployFlags {
+            deploy_token_file: some(MADE_TOKEN),
+            ..stage_only()
+        },
+    );
+    let err = go(&FakeOs::linux(), &mut exec, &raw, APPLY).expect_err("refused");
+    assert!(err.to_string().contains("chmod 600"), "{err}");
+}
+
+/// Catches the token mode check narrowed to 0600: deploy accepts 0400, so setup must.
+///
+/// Mutant planted: `0o600 | 0o400` reduced to `0o600`.
+#[test]
+fn a_read_only_token_is_accepted() {
+    let mut exec = rig();
+    put(&mut exec, TOKEN, 0o400, ROOT, SECRET);
+    go_ok(
+        &FakeOs::linux(),
+        &mut exec,
+        &with(Mode::Frontend, all_flags()),
+    );
+    assert!(exists(&exec, CONFIG));
+}
+
+/// Catches a CA check that looks only at the group bit: a CA writable by others alone is refused.
+///
+/// Mutant planted: the mask `0o022` narrowed to `0o020`.
+#[test]
+fn a_ca_writable_by_others_only_is_refused() {
+    let mut exec = rig();
+    put(&mut exec, CA, 0o646, ROOT, CA_BODY);
+    let err = go(
+        &FakeOs::linux(),
+        &mut exec,
+        &with(Mode::Frontend, all_flags()),
+        APPLY,
+    )
+    .expect_err("refused");
+    assert!(err.to_string().contains("chmod go-w"), "{err}");
+}
+
+/// Catches a parse error that echoes the offending value: a key of the wrong type holding a
+/// canary is refused, and neither the error of the reader nor setup's refusal contains it.
+///
+/// Mutant planted: the error text replaced by the serde error, which quotes the value.
+#[test]
+fn a_wrong_type_key_is_refused_without_its_value() {
+    let canary = "424242417";
+    let body = format!("{{\"api\": {canary}}}");
+    let why = HostConfig::parse(&body).expect_err("wrong type");
+    assert!(!why.contains(canary), "{why}");
+
+    let mut exec = rig();
+    put(&mut exec, CONFIG, 0o644, ROOT, &body);
+    let err = go(
+        &FakeOs::linux(),
+        &mut exec,
+        &with(Mode::Frontend, all_flags()),
+        APPLY,
+    )
+    .expect_err("refused");
+    assert!(matches!(err, SetupError::NeedsOperator(_)), "{err}");
+    assert!(!err.to_string().contains(canary), "{err}");
+    assert_eq!(text(&exec, CONFIG), body);
+}
+
+/// Catches the loopback test missing the mapped form: `::ffff:127.0.0.1` is loopback too.
+///
+/// Mutant planted: `.to_canonical()` dropped in `api_addr`.
+#[test]
+fn a_mapped_loopback_api_is_accepted() {
+    let mut exec = rig();
+    let flags = DeployFlags {
+        deploy_api: some("[::ffff:127.0.0.1]:8443"),
+        ..stage_only()
+    };
+    let flags = DeployFlags {
+        deploy_token_file: some(TOKEN),
+        ..flags
+    };
+    go_ok(&FakeOs::linux(), &mut exec, &with(Mode::Frontend, flags));
+    let config = HostConfig::parse(&text(&exec, CONFIG)).expect("parses");
+    assert_eq!(config.api.as_deref(), Some("[::ffff:127.0.0.1]:8443"));
 }

@@ -105,6 +105,14 @@ Options:
           The private key of --daemon-cert (a file of mode 0600 owned by the service user). Required for all-in-one
       --node-id <NODE_ID>
           The daemon half's node name, a DNS label unique in the cell. Required for all-in-one
+      --proxy
+          Set this frontend host up behind `kbf-installer proxy`: write the `[proxy]` table of installer.toml and enable kbf-proxy.socket and kbf-proxy.service instead of kbf-frontend.service. Only for `--mode=frontend`. The proxy takes --reapi-tls-cert, --reapi-tls-key and --worker-client-ca; the listener flags are not taken
+      --proxy-base-port <PROXY_BASE_PORT>
+          The first loopback port of the frontend children the proxy starts (1024 to 65521); slot A uses it and the four after, slot B ten above. Default 18000. With --proxy
+      --buck2-auth <BUCK2_AUTH>
+          How REAPI and Buck2 callers authenticate to the proxy; default none. With --proxy [possible values: none, bearer, mtls]
+      --buck2-token-file <BUCK2_TOKEN_FILE>
+          The Buck2 API key file, an absolute path, for --buck2-auth bearer
       --deploy-stage <DEPLOY_STAGE>
           The stage this host is, gamma or prod: setup writes /etc/kbf-installer/deploy.json so `kbf-installer deploy` binds an offer to it. frontend, all-in-one
       --deploy-api <DEPLOY_API>
@@ -114,7 +122,7 @@ Options:
       --deploy-server-name <DEPLOY_SERVER_NAME>
           The DNS name the API's certificate carries. Default: the API address's IP
       --deploy-token-file <DEPLOY_TOKEN_FILE>
-          The operator token's file (absolute path, mode 0600 or 0400, owned by root; it must exist: setup never creates or copies it). Default: installer.toml `[proxy] operator_token_file`
+          The operator token's file (absolute path, mode 0600 or 0400, owned by root; it must exist, except the token setup makes itself, /etc/kbf/api-token on Linux). Default: installer.toml `[proxy] operator_token_file`
       --installer-config <INSTALLER_CONFIG>
           The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which is the only value setup accepts. The same flag, with the same meaning, as on `run`
   -h, --help

@@ -157,6 +157,9 @@ pub struct SetupArgs {
     /// storage): each sets the kbf flag of its name.
     #[command(flatten)]
     pub kbf: crate::setup::kbf_settings::KbfFlags,
+    /// A frontend host behind `kbf-installer proxy`: the `[proxy]` table of installer.toml.
+    #[command(flatten)]
+    pub proxy: crate::setup::proxy::ProxyFlags,
     /// The host's deploy config (`/etc/kbf-installer/deploy.json`) of a frontend or all-in-one
     /// host: the stage and, if the proxy is not where installer.toml says, where deploy calls.
     #[command(flatten)]
@@ -302,7 +305,8 @@ pub struct MigrateArgs {
     /// The old helper's unit: stopped and disabled, so the installer is the only manager.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub helper_unit: Option<crate::migrate::Unit>,
-    /// The installer's own unit, which a rollback stops and disables first.
+    /// The installer's own unit: enabled and started as the last step of a migration, stopped
+    /// and disabled first by a rollback.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub installer_unit: Option<crate::migrate::Unit>,
     /// Where the host gets its releases: decides where the replay floor is seeded from.

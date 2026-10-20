@@ -9,8 +9,10 @@
 //!   an unspecified address read as loopback; the packaged port when there is none), and the
 //!   token to the `[proxy] operator_token_file` of the same file, so a host that has told
 //!   `setup` where the proxy is gives only the stage.
-//! - The token and the CA are referenced by path and never copied, created or read: they are
-//!   the operator's. Each must exist, be a regular file (a link is not followed), and have a
+//! - The token and the CA are referenced by path and never copied or read: they are the
+//!   operator's. The one exception is the token `setup` makes on this run for a host that serves
+//!   the API (the packaged `operator_token_file`): it may be absent, because it is there when
+//!   `deploy` runs. Every other file must exist, be a regular file (a link is not followed), and have a
 //!   safe owner and mode; the refusal says the one command that fixes it. A flag that holds
 //!   PEM text or a token is refused as not a path.
 //! - Setup owns five keys of the file (`api`, `api_ca`, `api_server_name`, `token_file`,
@@ -26,6 +28,7 @@ use kbf_proxy::config::ProxyConfig;
 
 use super::kbf_settings::check_path;
 use super::os::View;
+use super::paths;
 use super::plan::{Ctx, Outcome};
 use super::{SetupError, validate::mode_name};
 use crate::cli::Mode;
@@ -56,7 +59,7 @@ pub struct DeployFlags {
     #[arg(long)]
     pub deploy_server_name: Option<String>,
     /// The operator token's file (absolute path, mode 0600 or 0400, owned by root; it must
-    /// exist: setup never creates or copies it). Default: installer.toml `[proxy]
+    /// exist, except the token setup makes itself, /etc/kbf/api-token on Linux). Default: installer.toml `[proxy]
     /// operator_token_file`.
     #[arg(long)]
     pub deploy_token_file: Option<String>,
@@ -273,9 +276,12 @@ fn check_file(
     };
     let meta = match HostPath::new(path).map(|p| exec.stat(&p)) {
         Ok(Ok(Some(meta))) => meta,
+        // The token setup itself makes on this run (plan::operator_token, for a host that serves
+        // the API): absent now, it is there when `deploy` runs, so a first run may name it.
+        Ok(Ok(None)) if token && path == paths::api_token(ctx.platform) => return None,
         Ok(Ok(None)) => {
             return Some(format!(
-                "{flag}: {path} does not exist; {what} is the operator's and setup never creates or copies it: place it, then run setup again (install -o root -g root -m {} SOURCE {path})",
+                "{flag}: {path} does not exist; {what} is the operator's and setup never copies it: place it, then run setup again (install -o root -g root -m {} SOURCE {path})",
                 if token { "0600" } else { "0644" }
             ));
         }

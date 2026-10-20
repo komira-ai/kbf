@@ -38,6 +38,7 @@ pub mod os;
 pub mod paths;
 pub mod plan;
 pub mod provision;
+pub mod proxy;
 pub mod validate;
 
 #[cfg(test)]
@@ -174,7 +175,8 @@ pub struct Options {
 
 /// The `installer.toml` this run leaves: the file that is there with the flags' settings put
 /// in, or the defaults with them. A file that is not valid is not overwritten (the operator
-/// decides), and a floor never goes down.
+/// decides), and a floor never goes down. Its `[proxy]` table is kept; on a `--proxy` host the
+/// keys the flags give are put in it ([`proxy::ProxyPlan::merge`]).
 pub fn installer_settings(
     exec: &dyn Exec,
     v: &Valid,
@@ -216,6 +218,9 @@ pub fn installer_settings(
         }
         _ => (None, None),
     };
+    if let Some(plan) = &v.proxy {
+        settings.proxy = Some(plan.merge(settings.proxy.take())?);
+    }
     Ok(settings)
 }
 
@@ -275,9 +280,10 @@ fn find_shadows(
     exec: &dyn Exec,
     mode: Mode,
     journalled: &[crate::migrate::Unit],
+    proxy: bool,
 ) -> Result<Vec<Shadow>, SetupError> {
     let mut found = Vec::new();
-    for unit in plan::mode_units(mode) {
+    for unit in plan::mode_units(mode, proxy) {
         let path = format!("/etc/systemd/system/{unit}");
         let Some(Entry::File { bytes, .. }) = exec.inspect(&HostPath::new(&path)?)? else {
             continue;
@@ -333,12 +339,15 @@ pub fn run(
     let ctx = plan::context(os, valid.mode)?;
     let journalled = migrated_units(backend, ctx.platform)?;
     let shadows = if ctx.platform == Platform::Linux {
-        find_shadows(&*exec, valid.mode, &journalled)?
+        find_shadows(&*exec, valid.mode, &journalled, valid.proxy.is_some())?
     } else {
         Vec::new()
     };
     let service_uid = ctx.service.as_ref().map(|u| u.uid);
     kbf_settings::check_files(&*exec, &valid.kbf, service_uid)?;
+    if let Some(proxy) = &valid.proxy {
+        kbf_settings::check_files(&*exec, &proxy.files(), service_uid)?;
+    }
     let proxy = match valid.deploy {
         Some(_) => installer_settings(&*exec, &valid, ctx.platform)?.proxy,
         None => None,
@@ -467,6 +476,7 @@ pub fn cli(
         commit: args.commit.clone(),
         database: args.database.clone(),
         kbf: args.kbf.clone(),
+        proxy: args.proxy.clone(),
         create_local_database: args.create_local_database,
         deploy: args.deploy.clone(),
         installer_config: args.installer_config.as_ref().map(ToString::to_string),
