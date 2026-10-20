@@ -261,6 +261,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     #[must_use]
     pub fn render_metrics(&self) -> String {
         let mut out = self.writer.metrics.render();
+        // The process's, not this cache's: what every request in the process holds.
+        kbf_storage::in_flight::render(&mut out);
         if let Some(staging) = self.writer.tier.get() {
             let usage = staging.tier.usage();
             let unflushed = staging.tier.unflushed(Instant::now());
