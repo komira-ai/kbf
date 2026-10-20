@@ -13,7 +13,54 @@ use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use super::api::{Http, Operator, Request};
+use std::io::{self, Write};
+use std::net::TcpStream;
+
+use super::api::{Operator, Reply, Request, parse_reply, read_all};
+
+/// The most a reply from the observed frontend may be (a `/metrics` page, a listing).
+const REPLY_MAX: usize = 16 * 1024 * 1024;
+
+/// A plain HTTP/1.1 client to a loopback address: the frontend's children listen without TLS
+/// behind the proxy, and only the proxy's public port (`--api`) speaks it. One request per
+/// connection, the bearer token on each.
+pub struct Http {
+    addr: SocketAddr,
+    token: String,
+    timeout: Duration,
+}
+
+impl Http {
+    /// `addr` must be loopback: the token is sent in the clear.
+    pub fn new(addr: SocketAddr, token: String, timeout: Duration) -> io::Result<Http> {
+        if !addr.ip().to_canonical().is_loopback() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the observed frontend's address must be loopback",
+            ));
+        }
+        Ok(Http {
+            addr,
+            token,
+            timeout,
+        })
+    }
+}
+
+impl Operator for Http {
+    fn send(&self, request: &Request) -> io::Result<Reply> {
+        let mut stream = TcpStream::connect_timeout(&self.addr, self.timeout)?;
+        stream.set_read_timeout(Some(self.timeout))?;
+        stream.set_write_timeout(Some(self.timeout))?;
+        // The observed frontend is only read from: a body is never sent.
+        let head = format!(
+            "{} {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            request.method, request.path, self.addr, self.token
+        );
+        stream.write_all(head.as_bytes())?;
+        parse_reply(&read_all(&mut stream, REPLY_MAX)?)
+    }
+}
 
 /// The slot stride, and the operator listener's offset in a slot.
 pub const SLOT_STRIDE: u16 = 10;

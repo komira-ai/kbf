@@ -1,17 +1,53 @@
-use std::cell::{Cell, RefCell};
 use std::io;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::api::{Http, Operator, Reply, Request, parse_reply};
+use super::api::{Operator, Reply, Request};
 use super::observe::Observe;
 use super::*;
+use crate::proxy::api::model::{RollbackBlocked, StatusBody, UpdateId, UpdateRequest};
+use crate::proxy::model::{Failure, Phase, Step as FailedStep};
 use crate::testkit::{A, B, c};
 
 const TARGET: &str = A;
 const OLD: &str = B;
+
+/// The farm's time in seconds, which moves only when the deploy sleeps.
+#[derive(Clone, Default)]
+struct Time(Arc<AtomicU64>);
+
+impl Time {
+    fn get(&self) -> u64 {
+        self.0.load(SeqCst)
+    }
+
+    fn set(&self, to: u64) {
+        self.0.store(to, SeqCst);
+    }
+}
+
+/// The request id the options of these tests carry.
+const REQUEST_ID: &str = "deploy-test";
+
+/// Seconds after the POST that the update API shows each phase (`Farm::phase_of`).
+const FRONTEND_TIMELINE: [(u64, Phase); 8] = [
+    (0, Phase::Accepted),
+    (5, Phase::Staged),
+    (10, Phase::Starting),
+    (20, Phase::Switching),
+    (25, Phase::Baking),
+    (35, Phase::Nodes),
+    (45, Phase::Draining),
+    (55, Phase::Done),
+];
+/// Seconds after the POST that the new frontend offers the commit (the `nodes` phase).
+const OFFER_AT: u64 = 35;
+/// Seconds after the POST that the update is `done`.
+const DONE_AT: u64 = 55;
 
 /// How a node ends after the desired release is set.
 #[derive(Clone)]
@@ -39,6 +75,9 @@ struct NodeScript {
     /// Seconds after the desired release is set from which the node shows
     /// `activated_unconfirmed` (its step has begun) until it confirms.
     activated_at: Option<u64>,
+    /// The new frontend lists the node only this many seconds after it offered the commit:
+    /// the node has to reconnect to it first.
+    relisted_after: Option<u64>,
 }
 
 fn node(id: &'static str, platform: &'static str, fate: Fate) -> NodeScript {
@@ -49,19 +88,37 @@ fn node(id: &'static str, platform: &'static str, fate: Fate) -> NodeScript {
         fate,
         stale: None,
         activated_at: None,
+        relisted_after: None,
     }
 }
 
+/// How the update API treats the frontend update the deploy asks for.
 #[derive(Clone, Copy, PartialEq)]
 enum FrontendFate {
-    Confirm,
-    Revert,
+    /// Through the phases of [`FRONTEND_TIMELINE`] to `done`, offering the commit to the
+    /// nodes on the way.
+    Done,
+    /// `failed` ten seconds after the POST, at step `start`.
+    Failed,
+    /// `rolled_back` twenty seconds after the POST, with no failure.
+    RolledBack,
+    /// Stays in `baking` for ever.
     Hang,
+    /// Answers the POST with 409 `update_open`.
     Busy,
-    /// Shows the previous order, confirmed, until the new one reverts.
-    StaleThenRevert,
-    /// Accepts the order but the reply names none.
-    NoOrderId,
+    /// Answers the POST with 409 and this code.
+    Refuses(&'static str),
+    /// Answers the POST with 422.
+    Incomplete,
+    /// `done`, but the new frontend never offers the commit to the nodes.
+    NoOffer,
+    /// Shows the update before ours, `done`, for this many seconds after the POST.
+    Lagging(u64),
+    /// Shows our update in `nodes` and never goes on.
+    StuckInNodes,
+    /// Shows our update going on for this many seconds after the POST, then another one
+    /// (`u-2`, `baking`): a person aborted ours and started it.
+    Replaced(u64),
 }
 
 /// How one call of the API is made to go wrong.
@@ -73,30 +130,50 @@ enum Breaks {
     Status(u16),
     /// Answered 200 with this body.
     Body(&'static str),
+    /// Carried out, and the answer lost: the connection closes without one.
+    Lost,
+    /// Answered with this status and this body.
+    Raw(u16, &'static str),
 }
 
-/// Calls (`"METHOD path"`, as a prefix) that go wrong, from the start or only once the desired release
-/// is set.
-#[derive(Clone, Copy)]
+/// Calls (`"METHOD path"`, as a prefix) that go wrong, from the start or only once the
+/// new frontend has offered the commit, and for how many calls.
 struct Broken {
     call: &'static str,
     how: Breaks,
     after_desired: bool,
+    /// Only once the frontend update has been accepted.
+    after_post: bool,
+    /// How many calls go wrong; the rest are answered.
+    times: usize,
+    hits: AtomicUsize,
 }
 
 /// A farm the operator API plays, driven by a clock that only moves when the deploy sleeps.
+/// It is the same farm whether the deploy calls it directly (the [`Operator`] it is) or over
+/// TLS (`tls::with_tls` serves [`Farm::answer`]).
 struct Farm {
-    now: Rc<Cell<u64>>,
-    log: RefCell<Vec<String>>,
+    now: Time,
+    log: Mutex<Vec<String>>,
+    /// The farm's time of each logged call.
+    times: Mutex<Vec<u64>>,
     nodes: Vec<NodeScript>,
     complete: Vec<&'static str>,
-    desired_at: Cell<Option<u64>>,
-    generation: Cell<u64>,
     frontend_fate: FrontendFate,
-    frontend_at: Cell<Option<u64>>,
-    in_flight_at_start: bool,
+    /// Every body POSTed to the frontend update route that parsed as an update request.
+    posted: Mutex<Vec<UpdateRequest>>,
+    /// The farm's time of the first accepted POST: the start of update `u-1`.
+    frontend_at: Mutex<Option<u64>>,
+    /// The phase of the update before ours, which the status shows until ours is accepted;
+    /// none when the API has run no update.
+    previous: Option<Phase>,
+    /// What the API answers an accepted POST with.
+    accepted_status: u16,
+    /// The commit has been the desired release since before the deploy started.
+    offered_at_start: bool,
+    /// Every body POSTed to the frontend update route, as it was sent.
+    raw: Mutex<Vec<Vec<u8>>>,
     upload_status: u16,
-    desired_status: u16,
     ready: bool,
     members_active_after: u64,
     /// `/v1/members` lists no member at all.
@@ -106,33 +183,36 @@ struct Farm {
     cordoned: Option<&'static str>,
     /// `/v1/nodes` has no `nodes` key at all.
     nodes_key_missing: bool,
-    /// `/v1/nodes` lists no node once the desired release is set.
+    /// `/v1/nodes` lists no node once the commit is offered.
     empty_after_desired: bool,
     broken: Vec<Broken>,
     /// `/metrics` at a farm time (seconds): the text, or `None` for a 503.
-    metrics: Box<dyn Fn(u64) -> Option<String>>,
+    metrics: Box<dyn Fn(u64) -> Option<String> + Send + Sync>,
     builds: Vec<Build>,
     /// Rows or invocations per page of a listing; 0 is one page.
     page: usize,
     /// Calls the fake does not know. It answers them 404 and notes them here, so a test that
     /// leans on a call the fake never learned fails instead of passing on a silent default.
-    unknown: RefCell<Vec<String>>,
+    unknown: Mutex<Vec<String>>,
     /// Every call the observed frontend ([`ObservedApi`]) was asked.
-    observed_log: RefCell<Vec<String>>,
+    observed_log: Mutex<Vec<String>>,
     /// Both children answer (an ambiguous farm).
     both_children: bool,
     /// Seconds the child that handed over goes on answering after the frontend order.
     old_child_drains: u64,
     /// What that child says on `/metrics` while it drains; the farm's script when `None`.
-    retiring_metrics: Option<Box<dyn Fn(u64) -> Option<String>>>,
+    retiring_metrics: Option<Box<dyn Fn(u64) -> Option<String> + Send + Sync>>,
     /// The update API names no serving slot after the order (a status that does not say).
     status_names_no_slot: bool,
+    /// The slot the status names as serving before any update of this deploy (the previous
+    /// update's), when it names one.
+    previous_slot: Option<&'static str>,
     /// The serving slot each resolution was told.
-    resolves: RefCell<Vec<Option<observe::Slot>>>,
+    resolves: Mutex<Vec<Option<observe::Slot>>>,
     /// Calls a child that was not serving refused, and the reads each child answered (with
     /// whether the frontend order had been posted).
-    refused: RefCell<Vec<String>>,
-    child_reads: RefCell<Vec<(observe::Slot, bool)>>,
+    refused: Mutex<Vec<String>>,
+    child_reads: Mutex<Vec<(observe::Slot, bool)>>,
 }
 
 /// A build the fake farm knows: running from `from` to `to` (seconds), whose actions had
@@ -183,20 +263,53 @@ impl Gauges {
     }
 }
 
+impl Broken {
+    fn new(call: &'static str, how: Breaks) -> Broken {
+        Broken {
+            call,
+            how,
+            after_desired: false,
+            after_post: false,
+            times: usize::MAX,
+            hits: AtomicUsize::new(0),
+        }
+    }
+
+    /// Only once the new frontend has offered the commit.
+    fn after_desired(mut self) -> Broken {
+        self.after_desired = true;
+        self
+    }
+
+    /// Only once the frontend update has been accepted.
+    fn after_post(mut self) -> Broken {
+        self.after_post = true;
+        self
+    }
+
+    /// Only for the first `n` matching calls.
+    fn times(mut self, n: usize) -> Broken {
+        self.times = n;
+        self
+    }
+}
+
 impl Farm {
-    fn new(now: Rc<Cell<u64>>, nodes: Vec<NodeScript>) -> Farm {
+    fn new(now: Time, nodes: Vec<NodeScript>) -> Farm {
         Farm {
             now,
-            log: RefCell::new(Vec::new()),
+            log: Mutex::new(Vec::new()),
+            times: Mutex::new(Vec::new()),
             nodes,
             complete: vec!["linux-x86_64", "darwin-arm64"],
-            desired_at: Cell::new(None),
-            generation: Cell::new(7),
-            frontend_fate: FrontendFate::Confirm,
-            frontend_at: Cell::new(None),
-            in_flight_at_start: false,
+            frontend_fate: FrontendFate::Done,
+            posted: Mutex::new(Vec::new()),
+            frontend_at: Mutex::new(None),
+            previous: Some(Phase::Done),
+            accepted_status: 202,
+            offered_at_start: false,
+            raw: Mutex::new(Vec::new()),
             upload_status: 201,
-            desired_status: 200,
             ready: true,
             members_active_after: 0,
             no_members: false,
@@ -209,32 +322,35 @@ impl Farm {
             metrics: Box::new(|_| Some(healthy().text())),
             builds: Vec::new(),
             page: 0,
-            unknown: RefCell::new(Vec::new()),
-            observed_log: RefCell::new(Vec::new()),
+            unknown: Mutex::new(Vec::new()),
+            observed_log: Mutex::new(Vec::new()),
             both_children: false,
             old_child_drains: 100_000,
             retiring_metrics: None,
             status_names_no_slot: false,
-            resolves: RefCell::new(Vec::new()),
-            refused: RefCell::new(Vec::new()),
-            child_reads: RefCell::new(Vec::new()),
+            previous_slot: None,
+            resolves: Mutex::new(Vec::new()),
+            refused: Mutex::new(Vec::new()),
+            child_reads: Mutex::new(Vec::new()),
         }
     }
 
-    /// `/metrics` is the same at every scrape.
-    /// The scripted failure for `call`, if one applies.
-    fn broken_reply(&self, call: &str) -> Option<io::Result<Reply>> {
-        let b = self.broken.iter().find(|b| {
-            call.starts_with(b.call) && (!b.after_desired || self.desired_at.get().is_some())
-        })?;
-        Some(match b.how {
-            Breaks::Io => Err(io::Error::other("the API is down")),
-            Breaks::Status(s) => Farm::reply(s, json!({})),
-            Breaks::Body(text) => Ok(Reply {
-                status: 200,
-                body: text.as_bytes().to_vec(),
-            }),
-        })
+    /// The scripted failure that applies to `call`, if one does; each match uses up one of
+    /// its `times`. A call is named whole, or by a prefix that ends in `*`.
+    fn break_of(&self, call: &str, _r: &Request) -> Option<Breaks> {
+        self.broken
+            .iter()
+            .find(|b| {
+                let named = match b.call.strip_suffix('*') {
+                    Some(prefix) => call.starts_with(prefix),
+                    None => call == b.call,
+                };
+                named
+                    && (!b.after_desired || self.desired_at().is_some())
+                    && (!b.after_post || self.frontend_at.lock().unwrap().is_some())
+                    && b.hits.fetch_add(1, SeqCst) < b.times
+            })
+            .map(|b| b.how)
     }
 
     fn rfc3339(secs: u64) -> String {
@@ -316,18 +432,138 @@ impl Farm {
 
     fn requests(&self, prefix: &str) -> usize {
         self.log
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .filter(|l| l.starts_with(prefix))
             .count()
     }
 
     fn index_of(&self, line: &str) -> Option<usize> {
-        self.log.borrow().iter().position(|l| l == line)
+        self.log.lock().unwrap().iter().position(|l| l == line)
+    }
+
+    /// The farm's time of the first `line` after the first `after`.
+    fn first_at(&self, line: &str, after: &str) -> Option<u64> {
+        let start = self.index_of(after)?;
+        let log = self.log.lock().unwrap();
+        let at = log.iter().skip(start).position(|l| l == line)? + start;
+        Some(self.times.lock().unwrap()[at])
+    }
+
+    /// Seconds since update `u-1` was accepted.
+    fn since_post(&self) -> Option<u64> {
+        let at = (*self.frontend_at.lock().unwrap())?;
+        Some(self.now.get().saturating_sub(at))
+    }
+
+    /// The farm's time at which the new frontend offered the commit, if it has.
+    fn desired_at(&self) -> Option<u64> {
+        if self.offered_at_start {
+            return Some(0);
+        }
+        let offers = matches!(
+            self.frontend_fate,
+            FrontendFate::Done | FrontendFate::Lagging(_) | FrontendFate::StuckInNodes
+        );
+        let at = (*self.frontend_at.lock().unwrap())? + OFFER_AT;
+        (offers && self.now.get() >= at).then_some(at)
+    }
+
+    /// The phase update `u-1` is in `e` seconds after it was accepted.
+    fn phase_at(&self, e: u64) -> (Phase, Option<Failure>) {
+        let by_time = FRONTEND_TIMELINE
+            .iter()
+            .rev()
+            .find(|(at, _)| e >= *at)
+            .map_or(Phase::Accepted, |(_, phase)| *phase);
+        match self.frontend_fate {
+            FrontendFate::Failed if e >= 10 => (
+                Phase::Failed,
+                Some(Failure {
+                    step: FailedStep::Start,
+                    reason: "the candidate exited".to_owned(),
+                }),
+            ),
+            FrontendFate::RolledBack if e >= 20 => (Phase::RolledBack, None),
+            FrontendFate::Hang => (by_time.min(Phase::Baking), None),
+            FrontendFate::StuckInNodes => (by_time.min(Phase::Nodes), None),
+            _ => (by_time, None),
+        }
+    }
+
+    /// `GET /v1/update/frontend`.
+    fn frontend_status(&self) -> StatusBody {
+        let (id, phase, failure) = match self.since_post() {
+            Some(e) if matches!(self.frontend_fate, FrontendFate::Replaced(n) if e >= n) => {
+                (Some("u-2"), Some(Phase::Baking), None)
+            }
+            Some(e) if !matches!(self.frontend_fate, FrontendFate::Lagging(n) if e < n) => {
+                let (phase, failure) = self.phase_at(e);
+                (Some("u-1"), Some(phase), failure)
+            }
+            _ => (self.previous.map(|_| "u-0"), self.previous, None),
+        };
+        StatusBody {
+            update_id: id.map(|id| UpdateId(id.to_owned())),
+            from: id.map(|_| c(OLD)),
+            to: id.map(|_| c(TARGET)),
+            phase,
+            since: id.map(|_| 0),
+            active_slot: self.named_slot().map(|w| {
+                if w == "a" {
+                    crate::proxy::model::Slot::A
+                } else {
+                    crate::proxy::model::Slot::B
+                }
+            }),
+            restart_pending: false,
+            rollback_allowed: false,
+            rollback_blocked_reason: Some(RollbackBlocked::NotSwitched),
+            old: None,
+            new: None,
+            failure,
+        }
+    }
+
+    /// `POST /v1/update/frontend`, as the API answers it: a request id it has seen gets the
+    /// update it started then; another while that update exists is 409.
+    fn accept(&self, body: &[u8]) -> io::Result<Reply> {
+        self.raw.lock().unwrap().push(body.to_vec());
+        let request: UpdateRequest = match serde_json::from_slice(body) {
+            Ok(request) => request,
+            Err(e) => {
+                return Farm::reply(
+                    400,
+                    json!({"error": "bad_request", "message": e.to_string()}),
+                );
+            }
+        };
+        let mut posted = self.posted.lock().unwrap();
+        let known = posted.iter().any(|p| p.request_id == request.request_id);
+        posted.push(request.clone());
+        let refusal = match self.frontend_fate {
+            FrontendFate::Busy => Some((409, "update_open")),
+            FrontendFate::Refuses(code) => Some((409, code)),
+            FrontendFate::Incomplete => Some((422, "incomplete_release")),
+            _ if !known && self.frontend_at.lock().unwrap().is_some() => Some((409, "update_open")),
+            _ => None,
+        };
+        if let Some((status, code)) = refusal {
+            return Farm::reply(status, json!({"error": code, "message": "not now"}));
+        }
+        self.frontend_at
+            .lock()
+            .unwrap()
+            .get_or_insert(self.now.get());
+        Farm::reply(
+            self.accepted_status,
+            json!({"update_id": "u-1", "phase": "accepted"}),
+        )
     }
 
     fn node_json(&self, n: &NodeScript) -> Value {
-        let elapsed = self.desired_at.get().map(|t| self.now.get() - t);
+        let elapsed = self.desired_at().map(|t| self.now.get() - t);
         let stale = n
             .stale
             .filter(|(_, _, until)| elapsed.is_none_or(|e| e < *until));
@@ -369,6 +605,22 @@ impl Farm {
         })
     }
 
+    /// The answer a scripted failure gives.
+    fn broken(how: Breaks) -> io::Result<Reply> {
+        match how {
+            Breaks::Io | Breaks::Lost => Err(io::Error::other("the API is down")),
+            Breaks::Status(s) => Farm::reply(s, json!({})),
+            Breaks::Raw(status, body) => Ok(Reply {
+                status,
+                body: body.as_bytes().to_vec(),
+            }),
+            Breaks::Body(text) => Ok(Reply {
+                status: 200,
+                body: text.as_bytes().to_vec(),
+            }),
+        }
+    }
+
     fn reply(status: u16, body: Value) -> io::Result<Reply> {
         Ok(Reply {
             status,
@@ -377,27 +629,56 @@ impl Farm {
     }
 }
 
-impl Operator for Farm {
-    fn send(&self, r: &Request) -> io::Result<Reply> {
+impl Farm {
+    /// The farm's answer to `r`: the effect of the call, unless the call is broken.
+    fn answer(&self, r: &Request) -> io::Result<Reply> {
         self.log
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .push(format!("{} {}", r.method, r.path));
-        let now = self.now.get();
+        self.times.lock().unwrap().push(self.now.get());
         let call = format!("{} {}", r.method, r.path);
-        if let Some(reply) = self.broken_reply(&call) {
-            return reply;
+        let broken = self.break_of(&call, r);
+        match broken {
+            None => self.serve(r),
+            Some(Breaks::Io) => Err(io::Error::other("the API is down")),
+            Some(Breaks::Status(s)) => Farm::reply(s, json!({})),
+            Some(Breaks::Raw(status, body)) => Ok(Reply {
+                status,
+                body: body.as_bytes().to_vec(),
+            }),
+            Some(Breaks::Body(text)) => Ok(Reply {
+                status: 200,
+                body: text.as_bytes().to_vec(),
+            }),
+            Some(Breaks::Lost) => {
+                let _ = self.serve(r);
+                Err(io::Error::other("the answer was lost"))
+            }
         }
+    }
+
+    fn serve(&self, r: &Request) -> io::Result<Reply> {
+        let now = self.now.get();
         match (r.method, r.path.as_str()) {
             ("PUT", _) => Farm::reply(self.upload_status, json!({"sha256": "x", "size": 1})),
             ("GET", "/v1/nodes") => {
                 if self.nodes_key_missing {
                     return Farm::reply(200, json!({"server": {"commit": self.server_commit}}));
                 }
-                let vanished = self.empty_after_desired && self.desired_at.get().is_some();
+                let vanished = self.empty_after_desired && self.desired_at().is_some();
                 let nodes: Vec<Value> = if vanished {
                     Vec::new()
                 } else {
-                    self.nodes.iter().map(|n| self.node_json(n)).collect()
+                    self.nodes
+                        .iter()
+                        .filter(|n| {
+                            let since = self.desired_at().map(|t| now - t);
+                            n.relisted_after
+                                .is_none_or(|after| since.is_none_or(|s| s >= after))
+                        })
+                        .map(|n| self.node_json(n))
+                        .collect()
                 };
                 Farm::reply(
                     200,
@@ -432,64 +713,29 @@ impl Operator for Farm {
                 Farm::reply(200, json!({"generation": 3, "members": members}))
             }
             ("GET", "/v1/update") => {
-                let desired = if self.desired_at.get().is_some() {
-                    json!({"commit": TARGET, "generation": self.generation.get()})
+                let desired = if self.desired_at().is_some() {
+                    json!({"commit": TARGET, "generation": 8})
                 } else {
-                    json!({"commit": OLD, "generation": self.generation.get()})
+                    json!({"commit": OLD, "generation": 7})
                 };
-                let frontend = match (self.frontend_at.get(), self.in_flight_at_start) {
-                    (None, true) => json!({"order_id": 1, "state": "pending"}),
-                    (None, false) => json!({"order_id": 1, "state": "confirmed"}),
-                    (Some(t), _) => {
-                        let state = match self.frontend_fate {
-                            FrontendFate::Confirm if now >= t + 10 => "confirmed",
-                            FrontendFate::Revert | FrontendFate::StaleThenRevert
-                                if now >= t + 10 =>
-                            {
-                                "reverted"
-                            }
-                            _ => "activating",
-                        };
-                        if self.frontend_fate == FrontendFate::StaleThenRevert && now < t + 10 {
-                            json!({"order_id": 1, "state": "confirmed"})
-                        } else {
-                            json!({"order_id": 2, "state": state})
-                        }
-                    }
-                };
-                Farm::reply(200, json!({"desired": desired, "frontend": frontend}))
-            }
-            ("POST", "/v1/update/desired") => {
-                if self.desired_status == 200 {
-                    self.desired_at.set(Some(now));
-                    self.generation.set(8);
-                }
-                Farm::reply(self.desired_status, json!({}))
-            }
-            ("POST", "/v1/update/frontend") => {
-                if self.frontend_fate == FrontendFate::Busy {
-                    return Farm::reply(409, json!({"error": "busy"}));
-                }
-                self.frontend_at.set(Some(now));
-                if self.frontend_fate == FrontendFate::NoOrderId {
-                    return Farm::reply(202, json!({}));
-                }
-                Farm::reply(202, json!({"order_id": 2}))
+                Farm::reply(200, json!({"desired": desired}))
             }
             ("GET", "/v1/update/frontend") => {
-                let named = self
-                    .frontend_at
-                    .get()
-                    .filter(|_| !self.status_names_no_slot);
-                let slot = named.map(|_| match self.serving_child() {
-                    observe::Slot::A => "a",
-                    observe::Slot::B => "b",
-                });
-                Farm::reply(200, json!({"active_slot": slot}))
+                // A newer API may say more than this client reads.
+                let mut status = serde_json::to_value(self.frontend_status()).unwrap();
+                status["a_later_field"] = json!({"x": 1});
+                Farm::reply(200, status)
             }
+            ("POST", "/v1/update/frontend") => self.accept(&r.body),
+            // The deploy never does this: the new frontend offers the commit. The farm
+            // takes it, so a deploy that does is seen doing it.
+            ("POST", "/v1/update/desired") => Farm::reply(200, json!({})),
             ("GET", "/readyz") => Farm::reply(if self.ready { 200 } else { 503 }, json!({})),
             _ => {
-                self.unknown.borrow_mut().push(call);
+                self.unknown
+                    .lock()
+                    .unwrap()
+                    .push(format!("{} {}", r.method, r.path));
                 Farm::reply(404, json!({}))
             }
         }
@@ -523,31 +769,54 @@ struct Child<'a> {
     slot: observe::Slot,
 }
 
+/// Seconds after the POST that the proxy switches to the new child (`Switching`).
+const SWITCH_AT: u64 = 20;
+
 impl Farm {
-    /// The child that serves now: slot A until the frontend order is posted, slot B after
-    /// (A again once a reverting order has reverted).
+    /// The farm's time at which the new child begins to serve: when the update reaches
+    /// `switching`, unless it ends before it (failed, rolled back, refused).
+    fn switched_at(&self) -> Option<u64> {
+        let posted = (*self.frontend_at.lock().unwrap())?;
+        let never = matches!(
+            self.frontend_fate,
+            FrontendFate::Failed
+                | FrontendFate::RolledBack
+                | FrontendFate::Busy
+                | FrontendFate::Refuses(_)
+                | FrontendFate::Incomplete
+        );
+        (!never).then_some(posted + SWITCH_AT)
+    }
+
+    /// The child that serves now: slot A until the update switches, slot B after.
     fn serving_child(&self) -> observe::Slot {
-        match self.frontend_at.get() {
-            None => observe::Slot::A,
-            Some(t)
-                if matches!(
-                    self.frontend_fate,
-                    FrontendFate::Revert | FrontendFate::StaleThenRevert
-                ) && self.now.get() >= t + 10 =>
-            {
-                observe::Slot::A
-            }
-            Some(_) => observe::Slot::B,
+        match self.switched_at() {
+            Some(t) if self.now.get() >= t => observe::Slot::B,
+            _ => observe::Slot::A,
         }
     }
 
+    /// The slot the status names as serving: none while no update is known.
+    fn named_slot(&self) -> Option<&'static str> {
+        if self.status_names_no_slot {
+            return None;
+        }
+        if self.frontend_at.lock().unwrap().is_some() {
+            return Some(match self.serving_child() {
+                observe::Slot::A => "a",
+                observe::Slot::B => "b",
+            });
+        }
+        self.previous_slot
+    }
+
     /// Whether `slot`'s child answers. The serving one does; the one that handed over keeps
-    /// draining, and answers, until `old_child_drains` seconds after the frontend order.
+    /// draining, and answers, until `old_child_drains` seconds after the switch.
     fn child_alive(&self, slot: observe::Slot) -> bool {
         if self.both_children || self.serving_child() == slot {
             return true;
         }
-        match self.frontend_at.get() {
+        match self.switched_at() {
             Some(t) if slot == observe::Slot::A => self.now.get() < t + self.old_child_drains,
             _ => false,
         }
@@ -556,7 +825,7 @@ impl Farm {
 
 impl Observe for SlotObs<'_> {
     fn resolve(&self, serving: Option<observe::Slot>) -> Result<observe::Observed<'_>, String> {
-        self.0.resolves.borrow_mut().push(serving);
+        self.0.resolves.lock().unwrap().push(serving);
         let slot = observe::choose(serving, |s| self.0.child_alive(s))?;
         let other = if slot == observe::Slot::A {
             observe::Slot::B
@@ -582,14 +851,14 @@ impl Operator for Child<'_> {
         if !self.farm.child_alive(self.slot) {
             self.farm
                 .refused
-                .borrow_mut()
+                .lock().unwrap()
                 .push(format!("{}: {} {}", self.slot, r.method, r.path));
             return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
         }
         self.farm
             .child_reads
-            .borrow_mut()
-            .push((self.slot, self.farm.frontend_at.get().is_some()));
+            .lock().unwrap()
+            .push((self.slot, self.farm.frontend_at.lock().unwrap().is_some()));
         // The child that handed over reports its own series, not the farm's script.
         let retiring = self.slot != self.farm.serving_child();
         if let (true, "/metrics", Some(script)) =
@@ -611,9 +880,9 @@ impl Operator for ObservedApi<'_> {
     fn send(&self, r: &Request) -> io::Result<Reply> {
         let f = self.0;
         let call = format!("{} {}", r.method, r.path);
-        f.observed_log.borrow_mut().push(call.clone());
-        if let Some(reply) = f.broken_reply(&call) {
-            return reply;
+        f.observed_log.lock().unwrap().push(call.clone());
+        if let Some(how) = f.break_of(&call, r) {
+            return Farm::broken(how);
         }
         let now = f.now.get();
         match (r.method, r.path.as_str()) {
@@ -629,14 +898,20 @@ impl Operator for ObservedApi<'_> {
                 None => Farm::reply(404, json!({"error": "no_record"})),
             },
             _ => {
-                f.unknown.borrow_mut().push(format!("observe: {call}"));
+                f.unknown.lock().unwrap().push(format!("observe: {call}"));
                 Farm::reply(404, json!({}))
             }
         }
     }
 }
 
-struct Clk(Rc<Cell<u64>>);
+impl Operator for Farm {
+    fn send(&self, r: &Request) -> io::Result<Reply> {
+        self.answer(r)
+    }
+}
+
+struct Clk(Time);
 
 impl Clock for Clk {
     fn now(&self) -> u64 {
@@ -665,7 +940,7 @@ impl Check for FixedCheck {
 }
 
 fn opts(apply: bool) -> Options {
-    let mut o = Options::new(c(TARGET), "linux-x86_64");
+    let mut o = Options::new(c(TARGET), "linux-x86_64", REQUEST_ID.to_owned());
     o.apply = apply;
     o.node_timeout = Duration::from_secs(1800);
     o
@@ -712,18 +987,23 @@ fn go(farm: &Farm) -> Summary {
 }
 
 fn farm(nodes: Vec<NodeScript>) -> Farm {
-    Farm::new(Rc::new(Cell::new(0)), nodes)
+    Farm::new(Time::default(), nodes)
 }
 
 mod gaps;
 mod gates;
+mod tls;
+mod update_api;
+
+use tls::run_tls;
 
 // ---- the whole deploy --------------------------------------------------------------
 
-/// Proves the happy path ends 0 with every step, node and check recorded. Catches a deploy
-/// that skips a step or reports a node it never saw confirm.
+/// Proves the happy path ends 0 with every step, node and check recorded, the frontend
+/// updated first and the nodes only watched. Catches a deploy that skips a step, reports a
+/// node it never saw confirm, orders a node, or sets the desired release itself.
 #[test]
-fn a_clean_deploy_confirms_every_node_updates_the_frontend_and_checks_the_farm() {
+fn a_clean_deploy_updates_the_frontend_first_then_watches_the_nodes_and_checks_the_farm() {
     let f = farm(two_nodes());
     let s = go(&f);
     assert_eq!(
@@ -735,14 +1015,7 @@ fn a_clean_deploy_confirms_every_node_updates_the_frontend_and_checks_the_farm()
     let names: Vec<_> = s.steps.iter().map(|x| x.name.as_str()).collect();
     assert_eq!(
         names,
-        [
-            "bundle",
-            "preflight",
-            "baseline",
-            "desired",
-            "nodes",
-            "frontend"
-        ]
+        ["bundle", "preflight", "baseline", "frontend", "nodes"]
     );
     assert_eq!(
         s.previous_desired,
@@ -755,33 +1028,45 @@ fn a_clean_deploy_confirms_every_node_updates_the_frontend_and_checks_the_farm()
     assert!(s.nodes.iter().all(|n| n.state == "confirmed"));
     assert_eq!(s.nodes.len(), 2);
     assert_eq!(
-        s.frontend.as_ref().map(|x| x.state.as_str()),
-        Some("confirmed")
+        s.frontend,
+        Some(summary::Frontend {
+            update_id: Some("u-1".to_owned()),
+            phase: Some(Phase::Done),
+            failure: None,
+            already_running: false,
+        })
     );
     assert_eq!(s.post.cas_smoke.as_deref(), Some("pass"));
     assert_eq!(s.post.members_active, Some(true));
     assert_eq!(s.post.nodes_on_commit, Some(true));
     assert_eq!(s.post.readyz, Some(true));
-    // The nodes are rolled before the frontend is updated.
-    let desired = f.index_of("POST /v1/update/desired").unwrap();
-    let frontend = f.index_of("POST /v1/update/frontend").unwrap();
-    assert!(desired < frontend);
-    // Never orders a node.
+    // One request, the one the design names, and nothing that sets the desired release or
+    // orders a node.
+    assert_eq!(
+        *f.posted.lock().unwrap(),
+        [UpdateRequest {
+            commit: c(TARGET),
+            request_id: REQUEST_ID.to_owned(),
+            nodes: true,
+            rollback: false,
+        }]
+    );
+    assert_eq!(f.requests("POST"), 1);
+    assert_eq!(f.requests("POST /v1/update/desired"), 0);
     assert_eq!(f.requests("POST /v1/nodes"), 0);
+    // The frontend is updated, and `done`, before the nodes are looked at again.
+    assert!(
+        f.first_at("GET /v1/nodes", "POST /v1/update/frontend") >= Some(DONE_AT),
+        "{:?}",
+        f.log.lock().unwrap()
+    );
     let json: Value = serde_json::from_str(&s.line()).unwrap();
-    assert_eq!(json["schema"], 1);
+    assert_eq!(json["schema"], 2);
     assert_eq!(json["started"], "2026-09-21T14:13:20Z");
-}
-
-/// Proves `--frontend-first` flips the order, and only the order.
-#[test]
-fn frontend_first_updates_the_frontend_before_setting_the_desired_release() {
-    let f = farm(two_nodes());
-    let mut o = opts(true);
-    o.order = Order::FrontendFirst;
-    let s = run_with(&f, &o, SmokeResult::Pass, None);
-    assert_eq!(s.exit, 0, "{}", s.line());
-    assert!(f.index_of("POST /v1/update/frontend") < f.index_of("POST /v1/update/desired"));
+    assert_eq!(json["frontend"]["update_id"], "u-1");
+    assert_eq!(json["frontend"]["phase"], "done");
+    assert!(json["frontend"].get("failure").is_none());
+    assert!(json["frontend"].get("already_running").is_none());
 }
 
 /// Proves that without `--apply` nothing is written. Catches a plan that mutates.
@@ -830,7 +1115,7 @@ fn the_bundle_is_uploaded_to_the_store_paths() {
     let mut input: &[u8] = &bundle;
     let s = run_with(&f, &opts(true), SmokeResult::Pass, Some(&mut input));
     assert_eq!(s.exit, 0, "{}", s.line());
-    let log = f.log.borrow();
+    let log = f.log.lock().unwrap();
     for want in [
         format!("PUT /v1/releases/{TARGET}/linux-x86_64/kbf"),
         format!("PUT /v1/releases/{TARGET}/linux-x86_64/kbf.attestation"),
@@ -966,15 +1251,15 @@ fn a_farm_that_reports_no_nodes_is_refused_before_anything_is_set() {
     assert_eq!(f.requests("POST"), 0);
 }
 
-/// Proves the wait does not finish on an empty node list (the list read after the desired
-/// release is set), and times out instead. Catches `all()` on an empty list passing.
+/// Proves the wait does not finish on an empty node list (the list read after the commit is
+/// offered), and times out instead. Catches `all()` on an empty list passing.
 #[test]
 fn an_empty_node_list_while_waiting_is_not_every_node_confirmed() {
     let mut f = farm(two_nodes());
     f.empty_after_desired = true;
     let s = go(&f);
     assert_eq!((s.exit, s.reason.as_str()), (1, "node_not_confirmed"));
-    assert_eq!(f.requests("POST /v1/update/frontend"), 0);
+    assert_eq!(f.requests("POST /v1/update/frontend"), 1);
 }
 
 /// Proves the post check needs at least one node on the commit.
@@ -1051,31 +1336,18 @@ fn a_failed_installer_check_refuses_and_an_unavailable_one_is_recorded() {
 #[test]
 fn a_frontend_update_in_flight_is_busy() {
     let mut f = farm(two_nodes());
-    f.in_flight_at_start = true;
+    f.previous = Some(Phase::Baking);
     let s = go(&f);
     assert_eq!((s.exit, s.reason.as_str()), (4, "frontend_busy"));
     assert_eq!(f.requests("POST"), 0);
 }
 
-// ---- step 4 --------------------------------------------------------------------------
-
-#[test]
-fn a_409_on_the_desired_release_is_a_refusal() {
-    let mut f = farm(two_nodes());
-    f.desired_status = 409;
-    let s = go(&f);
-    assert_eq!((s.exit, s.reason.as_str()), (3, "release_incomplete"));
-    assert_eq!(f.requests("POST /v1/update/frontend"), 0);
-    f.desired_status = 500;
-    assert_eq!(go(&f).exit, 1);
-}
-
 // ---- step 5: nodes -------------------------------------------------------------------
 
-/// Proves a node that never confirms times out, the deploy stops, and the frontend is not
-/// touched.
+/// Proves a node that never confirms times out and the deploy stops there, after the frontend
+/// update (which the nodes follow) and before any post check.
 #[test]
-fn a_node_that_never_confirms_times_out_and_the_frontend_is_left_alone() {
+fn a_node_that_never_confirms_times_out_after_the_frontend_was_updated() {
     let f = farm(vec![
         node("a-store", "linux-x86_64", Fate::Confirm(100)),
         node("b-store", "linux-x86_64", Fate::Never),
@@ -1095,7 +1367,8 @@ fn a_node_that_never_confirms_times_out_and_the_frontend_is_left_alone() {
         .map(|n| (n.id.as_str(), n.state.as_str()))
         .collect();
     assert_eq!(by, [("a-store", "confirmed"), ("b-store", "timed_out")]);
-    assert_eq!(f.requests("POST /v1/update/frontend"), 0);
+    assert_eq!(f.requests("POST /v1/update/frontend"), 1);
+    assert_eq!(s.frontend.unwrap().phase, Some(Phase::Done));
     assert!(s.post.readyz.is_none());
 }
 
@@ -1125,8 +1398,7 @@ fn the_first_unconfirmed_node_stops_the_deploy_and_later_nodes_are_not_waited_fo
         ]
     );
     // Stopped when the first failed, not after the rest would have confirmed.
-    assert!(f.now.get() < 100, "waited {} s", f.now.get());
-    assert_eq!(f.requests("POST /v1/update/frontend"), 0);
+    assert!(f.now.get() < DONE_AT + 100, "waited {} s", f.now.get());
     assert!(s.detail.contains("a-store"));
 }
 
@@ -1146,8 +1418,9 @@ fn a_refusal_and_an_unsupported_node_are_named() {
     assert_eq!(s.exit, 1);
 }
 
-/// Proves each node gets its own budget, started when the one before it confirms: two nodes
-/// that take 1000 s each pass a 1500 s budget. Catches one shared clock for all nodes.
+/// Proves each node gets its own budget, started when the one before it confirms: two
+/// nodes that confirm 980 s and then 1000 s into the wait pass a 1500 s budget. Catches one
+/// shared clock for all nodes.
 #[test]
 fn each_node_has_its_own_budget() {
     let f = farm(vec![
@@ -1158,21 +1431,21 @@ fn each_node_has_its_own_budget() {
     o.node_timeout = Duration::from_secs(1500);
     let s = run_with(&f, &o, SmokeResult::Pass, None);
     assert_eq!(s.exit, 0, "{}", s.line());
-    assert!(
-        s.nodes.iter().all(|n| n.secs >= 995 && n.secs <= 1010),
-        "{:?}",
-        s.nodes
-    );
+    // The wait starts when the update is `done`, 20 s after the commit was offered.
+    let secs: Vec<_> = s.nodes.iter().map(|n| n.secs).collect();
+    assert!((975..=990).contains(&secs[0]), "{secs:?}");
+    assert!((995..=1010).contains(&secs[1]), "{secs:?}");
 }
 
 /// Proves a `reverted` left by an older offer is not this deploy's verdict.
 #[test]
 fn a_state_left_from_an_older_offer_is_not_this_deploys() {
     let mut n = node("a-store", "linux-x86_64", Fate::Confirm(100));
-    n.stale = Some(("reverted", 7, 30));
+    n.stale = Some(("reverted", 7, 40));
     let f = farm(vec![n]);
-    // For 30 s after the desired release is set the node still reports the state of the
-    // offer before it (generation 7); that is not this deploy's verdict.
+    // For 40 s after the commit is offered the node still reports the state of the offer
+    // before it (generation 7), 20 s of them while the deploy waits; that is not this
+    // deploy's verdict.
     let s = go(&f);
     assert_eq!(s.exit, 0, "{}", s.line());
 }
@@ -1187,70 +1460,7 @@ fn a_node_confirmed_on_another_commit_is_not_confirmed() {
     assert_eq!((s.exit, s.nodes[0].state.as_str()), (1, "timed_out"));
 }
 
-/// Proves another order's `confirmed` is not ours: the new instance's record is waited for.
-#[test]
-fn a_confirmed_record_of_an_earlier_order_is_not_ours() {
-    let mut f = farm(two_nodes());
-    f.frontend_fate = FrontendFate::StaleThenRevert;
-    let s = go(&f);
-    assert_eq!(
-        (s.exit, s.reason.as_str()),
-        (1, "frontend_reverted"),
-        "{}",
-        s.line()
-    );
-}
-
-/// Proves an accepted order whose reply names no order id is an API error: the stale
-/// `confirmed` of the previous order must not pass the step, and no post check runs.
-#[test]
-fn an_accepted_order_without_an_order_id_is_an_api_error() {
-    let mut f = farm(two_nodes());
-    f.frontend_fate = FrontendFate::NoOrderId;
-    let s = go(&f);
-    assert_eq!(
-        (s.exit, s.reason.as_str()),
-        (1, "api_error"),
-        "{}",
-        s.line()
-    );
-    assert_eq!(s.post, PostResult::default());
-}
-
-// ---- step 6: the frontend ------------------------------------------------------------
-
-/// Proves a reverted frontend is a failure that says the old instance serves, and that no
-/// post check is run on a farm in that state.
-#[test]
-fn a_reverted_frontend_fails_and_leaves_the_old_instance_serving() {
-    let mut f = farm(two_nodes());
-    f.frontend_fate = FrontendFate::Revert;
-    let s = go(&f);
-    assert_eq!((s.exit, s.reason.as_str()), (1, "frontend_reverted"));
-    assert!(s.detail.contains("old one is serving"));
-    assert_eq!(s.frontend.as_ref().unwrap().state, "reverted");
-    assert_eq!(s.post, PostResult::default());
-}
-
-#[test]
-fn a_frontend_that_never_finishes_the_handover_times_out() {
-    let mut f = farm(two_nodes());
-    f.frontend_fate = FrontendFate::Hang;
-    let mut o = opts(true);
-    o.handover_timeout = Duration::from_secs(60);
-    let s = run_with(&f, &o, SmokeResult::Pass, None);
-    assert_eq!((s.exit, s.reason.as_str()), (1, "frontend_timeout"));
-}
-
-#[test]
-fn a_409_on_the_frontend_update_is_busy() {
-    let mut f = farm(two_nodes());
-    f.frontend_fate = FrontendFate::Busy;
-    let s = go(&f);
-    assert_eq!((s.exit, s.reason.as_str()), (4, "frontend_busy"));
-}
-
-// ---- step 7: post checks ---------------------------------------------------------------
+// ---- step 6: post checks ---------------------------------------------------------------
 
 /// Proves every post check runs after one fails, and any failure is exit 1.
 #[test]
@@ -1291,9 +1501,9 @@ fn an_empty_members_list_fails_the_post_check() {
 /// A clock that steps back once, 1000 s, the first time a sleep brings the farm's time to
 /// `at` seconds (a step of the clock, as an NTP correction makes).
 struct StepBack {
-    farm: Rc<Cell<u64>>,
+    farm: Time,
     at: u64,
-    skew: Cell<u64>,
+    skew: Time,
 }
 
 impl Clock for StepBack {
@@ -1313,7 +1523,7 @@ fn with_step_back(farm: &Farm, at: u64) -> Summary {
     let clock = StepBack {
         farm: farm.now.clone(),
         at,
-        skew: Cell::new(0),
+        skew: Time::default(),
     };
     let smoke = FixedSmoke(SmokeResult::Pass);
     let check = FixedCheck(Ok(true));
@@ -1328,13 +1538,16 @@ fn with_step_back(farm: &Farm, at: u64) -> Summary {
     deploy(&env, &opts(true), None)
 }
 
-/// Proves a clock that steps back while nodes are awaited does not panic the deploy (the
-/// elapsed time reads 0). Catches `now - last` on u64 in `wait_nodes`.
+/// Proves a clock that steps back while the frontend update is followed, or while nodes are
+/// awaited, does not panic the deploy (the elapsed time reads 0). Catches `now - start` on
+/// u64 in the frontend step, and `now - last` in `wait_nodes`.
 #[test]
-fn a_clock_that_steps_back_while_nodes_are_awaited_does_not_panic() {
-    let f = farm(two_nodes());
-    let s = with_step_back(&f, 10);
-    assert_eq!(s.exit, 0, "{}", s.line());
+fn a_clock_that_steps_back_while_the_frontend_or_the_nodes_are_awaited_does_not_panic() {
+    for at in [10, DONE_AT + 5] {
+        let f = farm(two_nodes());
+        let s = with_step_back(&f, at);
+        assert_eq!(s.exit, 0, "{at}: {}", s.line());
+    }
 }
 
 /// The same while the members are awaited. Catches `now - start` on u64 in `post_checks`.
@@ -1342,7 +1555,7 @@ fn a_clock_that_steps_back_while_nodes_are_awaited_does_not_panic() {
 fn a_clock_that_steps_back_while_members_are_awaited_does_not_panic() {
     let mut f = farm(two_nodes());
     f.members_active_after = 100_000;
-    let s = with_step_back(&f, 230);
+    let s = with_step_back(&f, 250);
     assert_eq!(
         (s.exit, s.post.members_active),
         (1, Some(false)),
@@ -1355,7 +1568,7 @@ fn a_clock_that_steps_back_while_members_are_awaited_does_not_panic() {
 #[test]
 fn members_that_are_catching_up_are_waited_for_and_then_fail() {
     let mut f = farm(two_nodes());
-    f.members_active_after = 300; // the roll ends around 200 s
+    f.members_active_after = 300; // the roll ends around 235 s
     let s = go(&f);
     assert_eq!(s.exit, 0, "{}", s.line());
     let mut f = farm(two_nodes());
@@ -1402,73 +1615,7 @@ fn a_second_deploy_cannot_take_the_lock() {
 
 // ---- the client ------------------------------------------------------------------------
 
-#[test]
-fn replies_are_parsed_plain_and_chunked() {
-    let plain = parse_reply(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}").unwrap();
-    assert_eq!((plain.status, plain.body.as_slice()), (201, &b"{}"[..]));
-    let chunked = parse_reply(
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;x=y\r\nde\r\n0\r\n\r\n",
-    )
-    .unwrap();
-    assert_eq!(chunked.body, b"abcde");
-    assert!(parse_reply(b"HTTP/1.1 200 OK").is_err());
-    assert!(parse_reply(b"nonsense\r\n\r\n").is_err());
-    assert!(parse_reply(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n").is_err());
-    assert_eq!(plain.json(), Some(json!({})));
-}
-
-/// Proves the client sends the bearer token and the right content type, and refuses an
-/// address that is not loopback (the token goes in clear).
-#[test]
-fn the_http_client_sends_the_token_and_only_to_loopback() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = std::thread::spawn(move || {
-        let mut seen = Vec::new();
-        for _ in 0..2 {
-            let (mut s, _) = listener.accept().unwrap();
-            // The whole request: its head, then as many body bytes as it announces.
-            let mut got = Vec::new();
-            loop {
-                let mut buf = [0u8; 1024];
-                let n = s.read(&mut buf).unwrap();
-                got.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&got).into_owned();
-                if let Some(end) = text.find("\r\n\r\n") {
-                    let want = text
-                        .lines()
-                        .find_map(|l| l.strip_prefix("Content-Length: "))
-                        .map_or(0, |v| v.trim().parse::<usize>().unwrap());
-                    if got.len() >= end + 4 + want {
-                        break;
-                    }
-                }
-            }
-            seen.push(String::from_utf8_lossy(&got).into_owned());
-            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
-                .unwrap();
-        }
-        seen
-    });
-    let http = Http::new(addr, "tok".to_owned(), Duration::from_secs(5)).unwrap();
-    assert_eq!(http.send(&Request::get("/v1/nodes")).unwrap().status, 200);
-    http.send(&Request::post_json(
-        "/v1/update/desired",
-        &json!({"commit": "x"}),
-    ))
-    .unwrap();
-    let seen = server.join().unwrap();
-    assert!(seen[0].starts_with("GET /v1/nodes HTTP/1.1"));
-    assert!(seen[0].contains("Authorization: Bearer tok"));
-    assert!(!seen[0].contains("Content-Type"));
-    assert!(seen[1].contains("Content-Type: application/json"));
-    assert!(seen[1].ends_with("{\"commit\":\"x\"}"));
-    let remote = "192.0.2.1:80".parse().unwrap();
-    assert!(Http::new(remote, "t".into(), Duration::from_secs(1)).is_err());
-    let _ = Request::put_raw("/x", vec![1]);
-}
+mod client;
 
 #[test]
 fn utc_names_the_date() {
@@ -1515,6 +1662,8 @@ mod cli_tests {
         let commit = "a".repeat(40);
         for (flag, value) in [
             ("--api", "127.0.0.1:1"),
+            ("--api-ca", "/etc/shadow"),
+            ("--api-server-name", "farm.example"),
             ("--token-file", "/etc/shadow"),
             ("--config", "/var/tmp/x/deploy.json"),
             ("--lock", "/var/tmp/x/lock"),
@@ -1564,8 +1713,9 @@ mod cli_tests {
                 "127.0.0.1:1",
                 "--token-file",
                 "/x",
+                // The order of the update is the API's: nodes first is gone.
                 "--order",
-                "x",
+                "nodes-first",
             ],
             &[
                 "--commit",
@@ -1610,13 +1760,17 @@ mod cli_tests {
     fn the_host_config_fills_the_api_and_the_token_file() {
         let token = token("cfg-tok", 0o600, GOOD);
         let (_, dir) = crate::testkit::host_root("cfg");
+        let ca = dir.join("ca.pem");
+        fs::write(&ca, crate::deploy::smoke_tests::pki("farm.example").0).unwrap();
         let conf = dir.join("deploy.json");
         let write = |mode: u32, body: &str| {
             fs::write(&conf, body).unwrap();
             fs::set_permissions(&conf, fs::Permissions::from_mode(mode)).unwrap();
         };
         let body = format!(
-            "{{\"api\": \"127.0.0.1:1\", \"token_file\": {:?}}}",
+            "{{\"api\": \"127.0.0.1:1\", \"api_ca\": {:?}, \"api_server_name\": \"farm.example\", \
+             \"token_file\": {:?}}}",
+            ca.to_str().unwrap(),
             token.to_str().unwrap()
         );
         let lock = dir.join("run/lock");
@@ -1652,26 +1806,31 @@ mod cli_tests {
         assert!(err.contains("--api is required"), "{err}");
         // Every setting the config can give is given by a flag: the config is not read at all.
         write(0o666, &body);
-        let flags = [
-            "--api",
-            "127.0.0.1:1",
-            "--token-file",
-            token.to_str().unwrap(),
+        let all = [
+            ("--api", "127.0.0.1:1"),
+            ("--api-ca", ca.to_str().unwrap()),
+            ("--api-server-name", "farm.example"),
+            ("--token-file", token.to_str().unwrap()),
+            ("--cas", "https://127.0.0.1:1"),
+            ("--cas-ca", ca.to_str().unwrap()),
+            ("--cas-server-name", "farm.example"),
         ];
-        let ca = dir.join("ca.pem");
-        fs::write(&ca, crate::deploy::smoke_tests::pki("farm.example").0).unwrap();
-        let mut with_cas = flags.to_vec();
-        with_cas.extend([
-            "--cas",
-            "https://127.0.0.1:1",
-            "--cas-ca",
-            ca.to_str().unwrap(),
-            "--cas-server-name",
-            "farm.example",
-        ]);
-        assert_eq!(go(argv(&with_cas)).0, 1);
-        // Without the --cas flags the config is read for them, so a config others may write is refused.
-        assert_eq!(go(argv(&flags)).0, 2);
+        let without = |left_out: Option<&str>| {
+            let flags: Vec<&str> = all
+                .iter()
+                .filter(|(flag, _)| Some(*flag) != left_out)
+                .flat_map(|(flag, value)| [*flag, *value])
+                .collect();
+            go(argv(&flags))
+        };
+        assert_eq!(without(None).0, 1);
+        // Leave out any one and the config is read for it, so a config others may write is
+        // refused.
+        for (flag, _) in all {
+            let (code, err) = without(Some(flag));
+            assert_eq!(code, 2, "{flag}");
+            assert!(err.contains("no one else may write"), "{flag}: {err}");
+        }
         // No config and no flags.
         let none = dir.join("absent.json");
         let (code, _) = go(vec![
@@ -1744,6 +1903,8 @@ mod cli_tests {
         fs::set_permissions(&conf, fs::Permissions::from_mode(0o644)).unwrap();
         let commit = "a".repeat(40);
         let tok = token("cfg-cas-tok", 0o600, GOOD);
+        let ca = d2.join("ca.pem");
+        fs::write(&ca, crate::deploy::smoke_tests::pki("farm.example").0).unwrap();
         let (code, _, err) = run(&[
             "--commit",
             &commit,
@@ -1751,6 +1912,10 @@ mod cli_tests {
             conf.to_str().unwrap(),
             "--api",
             "127.0.0.1:1",
+            "--api-ca",
+            ca.to_str().unwrap(),
+            "--api-server-name",
+            "farm.example",
             "--token-file",
             tok.to_str().unwrap(),
             "--lock",
@@ -1839,12 +2004,19 @@ mod cli_tests {
         let (_, dir) = crate::testkit::host_root("cli-lock");
         let lock_path = dir.join("run/lock");
         let held = super::lock(&lock_path).unwrap().unwrap();
+        let ca = dir.join("ca.pem");
+        fs::write(&ca, crate::deploy::smoke_tests::pki("farm.example").0).unwrap();
+        let ca = ca.to_str().unwrap().to_owned();
         let common = |api: &str| {
             [
                 "--commit",
                 super::TARGET,
                 "--api",
                 api,
+                "--api-ca",
+                ca.as_str(),
+                "--api-server-name",
+                "farm.example",
                 "--token-file",
                 token.to_str().unwrap(),
                 "--lock",

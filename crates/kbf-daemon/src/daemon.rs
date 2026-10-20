@@ -19,6 +19,15 @@
 //! before the first Heartbeat, each stream sends the node's software status
 //! (`NodeStatus`, see [`crate::status`]).
 //!
+//! **Drain.** [`Daemon::run_draining`] takes the stop signals as a channel. On the first
+//! the daemon drains: its Hello says [`NodePhase::Draining`] (resent on the stream, and
+//! first on every later one), so the server offers it no lease and keeps the ones it
+//! holds while the heartbeats go on; a Start that still arrives is refused with a Result
+//! the server runs again (`UNAVAILABLE`); the runs go on, report and are acknowledged as
+//! always. It returns, so the process exits 0, once no lease runs and no Result is
+//! unacknowledged, connected or not. A second signal, or the drain deadline, returns at
+//! once, and the runs still going are abandoned as [`Daemon::run`] abandons them.
+//!
 //! A runtime that switches a Mac's GUI session for a whole-machine lease hands the
 //! daemon its phase ([`Daemon::with_phase`]; `docs/design/worker-protocol.md#node-phases`):
 //! every Hello carries the newest, and a change resends the Hello on the stream. A
@@ -82,7 +91,7 @@ use kbf_proto::worker::{
     worker_client::WorkerClient,
 };
 use kbf_types::{LeaseId, NodePhase};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tonic::transport::Endpoint;
 
@@ -224,6 +233,13 @@ pub struct Daemon {
     map: Option<MapLink>,
     /// The update client; see [`Self::with_update`].
     update: UpdateLink,
+    /// Whether the drain has begun, as [`Self::run_draining`] sets it; `None` for a
+    /// daemon run by [`Self::run`], which never drains.
+    drain: Option<watch::Receiver<bool>>,
+    /// The drain's state as the loops last took it: set once the first signal came.
+    draining: bool,
+    /// Notified when the daemon is draining and has nothing left to wait for.
+    drained: Arc<Notify>,
     events: Option<mpsc::UnboundedSender<Event>>,
     leases: Leases,
     done: mpsc::UnboundedReceiver<Done>,
@@ -274,6 +290,7 @@ enum Wake {
     Pressure,
     MapAsked,
     Update,
+    Drain,
 }
 
 impl Daemon {
@@ -322,6 +339,9 @@ impl Daemon {
             pressure: None,
             map: None,
             update: UpdateLink::off(),
+            drain: None,
+            draining: false,
+            drained: Arc::new(Notify::new()),
             events: None,
             leases: Leases::new(runtimes, done_tx),
             done,
@@ -455,6 +475,9 @@ impl Daemon {
     /// The phase every Hello carries: the runtime's, or memory pressure in place of
     /// serving while the backstop has the node paused.
     fn phase(&self) -> NodePhase {
+        if self.draining && self.phase_now == NodePhase::Serving {
+            return NodePhase::Draining;
+        }
         if let Some(why) = self.update.gate() {
             return NodePhase::Quarantined(why);
         }
@@ -477,6 +500,37 @@ impl Daemon {
         let stall = *backstop.stall.borrow_and_update();
         backstop.paused = pressure::paused(stall, backstop.above, leases);
         self.phase() != before
+    }
+
+    /// Takes the drain's newest state; returns whether the phase a Hello carries
+    /// changed.
+    fn take_drain(&mut self) -> bool {
+        let Some(drain) = &mut self.drain else {
+            return false;
+        };
+        let began = *drain.borrow_and_update();
+        let before = self.phase();
+        self.draining = began;
+        self.phase() != before
+    }
+
+    /// Wakes [`Self::run_draining`] when the daemon is draining and nothing is left to
+    /// wait for: no lease runs and every Result is acknowledged.
+    fn check_drained(&self) {
+        if self.draining && self.leases.running().is_empty() && self.unacked.is_empty() {
+            self.drained.notify_one();
+        }
+    }
+
+    /// Takes the drain, tells the server when the phase changed, and completes it when
+    /// there is nothing left to wait for. A method of its own, not lines in the session
+    /// loop (see [`Self::settle_update`]).
+    fn settle_drain(&mut self, tx: &UnboundedSender<DaemonMessage>) {
+        if self.take_drain() {
+            tracing::info!(phase = self.phase().name(), "node phase changed");
+            send(tx, daemon_message::Message::Hello(self.hello()));
+        }
+        self.check_drained();
     }
 
     /// Lists `images` in every `NodeStatus`, sorted and each once: the container
@@ -525,6 +579,39 @@ impl Daemon {
         tokio::select! {
             () = self.reconnect_forever() => {}
             () = shutdown => tracing::info!("shutting down"),
+        }
+    }
+
+    /// Runs the daemon like [`Self::run`], but drains on the first of `signals` (a
+    /// `()` for each SIGTERM or SIGINT): see the module documentation. Returns when
+    /// the drain is complete (no lease runs, no Result is unacknowledged), at the
+    /// second signal, or `deadline` after the first; `signals` closing does not stop it.
+    pub async fn run_draining(
+        mut self,
+        mut signals: mpsc::UnboundedReceiver<()>,
+        deadline: Duration,
+    ) {
+        #[cfg(target_os = "linux")]
+        crate::numa::log_layout();
+        let (begin, began) = watch::channel(false);
+        self.drain = Some(began);
+        let drained = Arc::clone(&self.drained);
+        let stop = async {
+            // A closed channel is no signal.
+            if signals.recv().await.is_none() {
+                std::future::pending::<()>().await;
+            }
+            tracing::info!(?deadline, "draining: no new leases; running ones finish");
+            begin.send_replace(true);
+            tokio::select! {
+                _ = signals.recv() => tracing::warn!("second signal: stopping at once"),
+                () = sleep(deadline) => tracing::warn!(?deadline, "drain deadline: stopping"),
+                () = drained.notified() => tracing::info!("drained: stopping"),
+            }
+        };
+        tokio::select! {
+            () = self.reconnect_forever() => {}
+            () = stop => {}
         }
     }
 
@@ -623,6 +710,7 @@ impl Daemon {
         self.take_driver_report();
         self.take_phase();
         self.take_pressure();
+        self.take_drain();
         let hello_sent = self.clock.now();
         send(&tx, daemon_message::Message::Hello(self.hello()));
         self.emit(Event::HelloSent);
@@ -684,6 +772,7 @@ impl Daemon {
                 Some(()) = pressure_changed(self.pressure.as_mut()) => Wake::Pressure,
                 () = map_asked(self.map.as_mut()) => Wake::MapAsked,
                 Some(()) = self.update.changed() => Wake::Update,
+                Some(()) = drain_changed(self.drain.as_mut()) => Wake::Drain,
             };
             // First, whatever woke the loop: the clock may have jumped over a suspend.
             self.recheck();
@@ -722,10 +811,11 @@ impl Daemon {
                     }
                 }
                 // The request for a map is sent below, whatever woke the loop.
-                Wake::Pressure | Wake::MapAsked | Wake::Update => {}
+                Wake::Pressure | Wake::MapAsked | Wake::Update | Wake::Drain => {}
             }
             self.ask_map(&tx);
             self.settle_update(&tx);
+            self.settle_drain(&tx);
             // Whatever woke the loop, leases may have started or ended.
             if self.take_pressure() {
                 tracing::info!(phase = self.phase().name(), "node phase changed");
@@ -920,6 +1010,14 @@ impl Daemon {
                     "contact with the server is lost; not starting",
                 )
             })
+        } else if self.draining {
+            start.lease_id.map(|id| {
+                failure(
+                    lease_id(id),
+                    Code::Unavailable,
+                    "the node is draining; not starting",
+                )
+            })
         } else if let Some(why) = self.update.gate() {
             start
                 .lease_id
@@ -1003,6 +1101,7 @@ impl Daemon {
                 out = &mut fut => (Some(out), None),
                 Some(done) = self.done.recv() => (None, Some(done)),
                 () = sleep(wait) => (None, None),
+                Some(()) = drain_changed(self.drain.as_mut()) => (None, None),
             };
             // First: the clock may have jumped over a suspend.
             self.recheck();
@@ -1012,6 +1111,8 @@ impl Daemon {
             if let Some(done) = done {
                 self.finished(None, done);
             }
+            self.take_drain();
+            self.check_drained();
         }
     }
 
@@ -1081,6 +1182,12 @@ async fn driver_changed(driver: Option<&mut watch::Receiver<DriverReport>>) -> O
     driver?.changed().await.ok()
 }
 
+/// Completes when the drain has a state the daemon has not taken; never for a daemon
+/// that does not drain, or once its sender is gone.
+async fn drain_changed(drain: Option<&mut watch::Receiver<bool>>) -> Option<()> {
+    drain?.changed().await.ok()
+}
+
 /// Completes when `phase` has a value the daemon has not taken; never without one.
 async fn phase_changed(phase: Option<&mut watch::Receiver<NodePhase>>) -> Option<()> {
     phase?.changed().await.ok()
@@ -1101,6 +1208,7 @@ fn wire_phase(phase: &NodePhase) -> Option<worker::NodePhase> {
         NodePhase::Restoring(lease) => (Phase::Restoring, Some(*lease), ""),
         NodePhase::Quarantined(reason) => (Phase::Quarantined, None, reason.as_str()),
         NodePhase::MemoryPressure => (Phase::MemoryPressure, None, ""),
+        NodePhase::Draining => (Phase::Draining, None, ""),
     };
     Some(worker::NodePhase {
         phase: state.into(),

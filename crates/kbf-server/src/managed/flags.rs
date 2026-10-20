@@ -30,8 +30,10 @@ pub(crate) fn args() -> [Arg; 2] {
             .help(
                 "Serve the admin calls (GET role, POST quiesce, resume, takeover, \
                  stand-down) on this loopback address. Anything that is not a loopback \
-                 address is refused at start: the calls move the scheduler's role and carry \
-                 no credential. Needs --state-store.",
+                 address is refused at start: the calls move the scheduler's role. With \
+                 --proxy-auth-file every call must present the proxy's secret \
+                 (x-kbf-proxy-auth) or is refused 403; without it the calls take no \
+                 credential, which is for a host with no proxy. Needs --state-store.",
             ),
         Arg::new(AWAIT)
             .long("await-takeover")

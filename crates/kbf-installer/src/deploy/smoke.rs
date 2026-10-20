@@ -118,7 +118,7 @@ impl Smoke for CasSmoke {
 }
 
 /// `n` bytes from the operating system's random source.
-fn random(n: usize) -> Result<Vec<u8>, String> {
+pub(super) fn random(n: usize) -> Result<Vec<u8>, String> {
     let mut bytes = vec![0; n];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut bytes))

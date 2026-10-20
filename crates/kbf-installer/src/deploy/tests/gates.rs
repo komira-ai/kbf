@@ -22,7 +22,7 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// The farm's `/metrics` is `healthy()` with `change` applied at farm time `t`.
-fn script(f: &mut Farm, change: impl Fn(u64, &mut Gauges) + 'static) {
+fn script(f: &mut Farm, change: impl Fn(u64, &mut Gauges) + Send + Sync + 'static) {
     f.metrics = Box::new(move |t| {
         let mut g = healthy();
         change(t, &mut g);
@@ -42,9 +42,9 @@ fn run_gated_with(f: &Farm, test: &str, tweak: impl FnOnce(&mut Options)) -> (Su
     tweak(&mut o);
     let s = run_with(f, &o, SmokeResult::Pass, None);
     assert!(
-        f.unknown.borrow().is_empty(),
+        f.unknown.lock().unwrap().is_empty(),
         "calls the fake does not know: {:?}",
-        f.unknown.borrow()
+        f.unknown.lock().unwrap()
     );
     let doc = ResultDoc::from_bytes(&fs::read(&path).expect("the document is there"))
         .expect("the document reads");
@@ -107,9 +107,9 @@ fn a_plan_neither_scrapes_nor_writes_a_document() {
     let s = run_with(&f, &o, SmokeResult::Pass, None);
     assert_eq!(s.exit, 0, "{}", s.line());
     assert!(
-        f.observed_log.borrow().is_empty(),
+        f.observed_log.lock().unwrap().is_empty(),
         "a plan reads no gate: {:?}",
-        f.observed_log.borrow()
+        f.observed_log.lock().unwrap()
     );
     assert!(!path.exists());
 }
@@ -507,11 +507,7 @@ fn every_page_is_read() {
 #[test]
 fn an_unreadable_listing_or_build_is_red() {
     let mut f = farm(two_nodes());
-    f.broken.push(Broken {
-        call: "GET /v1/invocations?state=open",
-        how: Breaks::Status(404),
-        after_desired: false,
-    });
+    f.broken.push(Broken::new("GET /v1/invocations?state=open*", Breaks::Status(404)));
     let (s, _) = run_gated(&f, "off");
     assert_eq!((s.exit, s.reason.as_str()), (3, "gate_red"), "{}", s.line());
     for part in [name::INFLIGHT, "absent", "preflight"] {
@@ -524,11 +520,7 @@ fn an_unreadable_listing_or_build_is_red() {
 
     let mut f = farm(two_nodes());
     f.builds = vec![build("b-gone", 22, Some(27), &[])];
-    f.broken.push(Broken {
-        call: "GET /v1/invocations/b-gone/actions",
-        how: Breaks::Status(404),
-        after_desired: false,
-    });
+    f.broken.push(Broken::new("GET /v1/invocations/b-gone/actions*", Breaks::Status(404)));
     let (s, doc) = run_gated(&f, "gone");
     red_at(&s, name::FARM_FAILURES, "absent", "b-gone");
     assert_eq!(gate(&doc, name::FARM_FAILURES).measured, None);
@@ -577,11 +569,11 @@ fn a_node_that_reverts_is_gate_f_red() {
 #[test]
 fn a_frontend_that_reverts_is_gate_f_red() {
     let mut f = farm(two_nodes());
-    f.frontend_fate = FrontendFate::Revert;
+    f.frontend_fate = FrontendFate::Failed;
     let (s, doc) = run_gated(&f, "frontend-revert");
     assert_eq!(
         (s.exit, s.reason.as_str()),
-        (1, "frontend_reverted"),
+        (1, "frontend_failed"),
         "{}",
         s.line()
     );
@@ -613,11 +605,7 @@ fn a_failed_deploy_still_writes_finished() {
     );
 
     let mut f = farm(two_nodes());
-    f.broken.push(Broken {
-        call: "GET /v1/releases",
-        how: Breaks::Io,
-        after_desired: false,
-    });
+    f.broken.push(Broken::new("GET /v1/releases", Breaks::Io));
     let (s, doc) = run_gated(&f, "early");
     assert_eq!(s.exit, 1);
     assert_eq!(doc.status, Status::Red);
@@ -713,7 +701,7 @@ fn a_document_that_cannot_be_started_stops_the_deploy_before_it_begins() {
         "{}",
         s.line()
     );
-    assert!(f.log.borrow().is_empty(), "{:?}", f.log.borrow());
+    assert!(f.log.lock().unwrap().is_empty(), "{:?}", f.log.lock().unwrap());
 }
 
 // ---- where the gates read ----------------------------------------------------------
@@ -734,11 +722,11 @@ fn gate_reads_go_to_the_observed_frontend_and_update_calls_to_the_api() {
     assert_eq!(s.exit, 0, "{}", s.line());
     let on_api = |l: &String| l.contains("/metrics") || l.contains("/v1/invocations");
     assert!(
-        !f.log.borrow().iter().any(on_api),
+        !f.log.lock().unwrap().iter().any(on_api),
         "gate reads reached --api: {:?}",
-        f.log.borrow()
+        f.log.lock().unwrap()
     );
-    let seen = f.observed_log.borrow();
+    let seen = f.observed_log.lock().unwrap();
     assert!(seen.iter().any(|l| l == "GET /metrics"));
     assert!(
         seen.iter()
@@ -777,7 +765,7 @@ fn run_slots(f: &Farm, test: &str) -> (Summary, ResultDoc) {
     let mut o = opts(true);
     o.result = Some(path.clone());
     let s = run_observing(f, &o, SmokeResult::Pass, None, &SlotObs(f));
-    assert!(f.unknown.borrow().is_empty(), "{:?}", f.unknown.borrow());
+    assert!(f.unknown.lock().unwrap().is_empty(), "{:?}", f.unknown.lock().unwrap());
     let doc = ResultDoc::from_bytes(&fs::read(&path).unwrap()).unwrap();
     (s, doc)
 }
@@ -804,11 +792,11 @@ fn the_gates_follow_the_serving_child_across_the_frontend_handover() {
     );
     // Slot B does not exist before the order: those attempts are refused, nothing else is.
     assert!(
-        f.refused.borrow().iter().all(|l| l.starts_with("slot b: ")),
+        f.refused.lock().unwrap().iter().all(|l| l.starts_with("slot b: ")),
         "{:?}",
-        f.refused.borrow()
+        f.refused.lock().unwrap()
     );
-    let reads = f.child_reads.borrow();
+    let reads = f.child_reads.lock().unwrap();
     assert!(
         reads
             .iter()
@@ -821,7 +809,7 @@ fn the_gates_follow_the_serving_child_across_the_frontend_handover() {
             .any(|(s, after)| *after && *s == observe::Slot::B)
     );
     assert_eq!(
-        *f.resolves.borrow(),
+        *f.resolves.lock().unwrap(),
         [None, Some(observe::Slot::B)],
         "the preflight probes, the frontend step is told the serving slot"
     );
@@ -914,16 +902,16 @@ fn the_loss_counter_has_a_baseline_per_child() {
 #[test]
 fn a_reverted_frontend_order_points_the_gates_at_the_old_child_again() {
     let mut f = farm(two_nodes());
-    f.frontend_fate = FrontendFate::Revert;
+    f.frontend_fate = FrontendFate::Failed;
     let (s, _) = run_slots(&f, "revert-follow");
     assert_eq!(
         (s.exit, s.reason.as_str()),
-        (1, "frontend_reverted"),
+        (1, "frontend_failed"),
         "{}",
         s.line()
     );
     assert_eq!(
-        *f.resolves.borrow(),
+        *f.resolves.lock().unwrap(),
         [None, Some(observe::Slot::A)],
         "the update API names the old slot as serving after the revert"
     );
@@ -972,7 +960,7 @@ fn two_live_children_and_no_serving_slot_is_refused_at_the_preflight() {
         "{}",
         s.detail
     );
-    assert!(f.child_reads.borrow().is_empty());
+    assert!(f.child_reads.lock().unwrap().is_empty());
 }
 
 // ---- two sealers -------------------------------------------------------------------

@@ -95,8 +95,21 @@ pub enum ReleaseError {
         pending: String,
         got: String,
     },
+    #[error(
+        "release {0} is current already: the first release is the only one setup installs, use update"
+    )]
+    NotFirst(CommitId),
     #[error("no swap is pending, and {0} is not the current release")]
     NotPending(CommitId),
+    #[error("{0} is staged and has not been confirmed or dropped: one frontend update at a time")]
+    FrontendBusy(CommitId),
+    #[error("{0} is the installed release already")]
+    AlreadyInstalled(CommitId),
+    #[error("{commit} is not the staged release ({})", staged.as_ref().map_or("none staged".to_owned(), ToString::to_string))]
+    NotStaged {
+        commit: CommitId,
+        staged: Option<CommitId>,
+    },
     #[error("a confirm window of {0} s is outside the {min} to {max} s the host allows", min = crate::activate::WINDOW_MIN_SECS, max = crate::activate::WINDOW_MAX_SECS)]
     Window(u64),
 }

@@ -15,6 +15,9 @@ use tokio::task::JoinHandle;
 
 use super::*;
 
+#[path = "managed/admin_secret.rs"]
+mod admin_secret;
+
 #[path = "managed/proxy.rs"]
 mod proxy;
 

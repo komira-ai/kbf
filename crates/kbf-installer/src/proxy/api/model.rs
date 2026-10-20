@@ -27,8 +27,10 @@ pub struct NewChild {
     pub open_streams: u64,
 }
 
-/// The body of `POST /v1/update/frontend`. Unknown fields are refused.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+/// The body of `POST /v1/update/frontend`. Unknown fields are refused. The `deploy` verb is
+/// the client: it builds the body from this type and reads the answer as [`StatusBody`], so
+/// the two ends cannot name a field differently.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateRequest {
     pub commit: CommitId,
@@ -53,7 +55,7 @@ pub struct ForceRetireRequest {
 
 /// `GET /v1/update/frontend`. With no update, everything but `restart_pending` and
 /// `rollback_allowed` is null.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusBody {
     pub update_id: Option<UpdateId>,
     pub from: Option<CommitId>,
@@ -72,7 +74,7 @@ pub struct StatusBody {
 
 /// Why `rollback` is refused (FP section 4: "after switched while the old child lives
 /// and no node updated").
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RollbackBlocked {
     NoUpdate,
