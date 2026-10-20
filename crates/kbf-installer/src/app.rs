@@ -330,6 +330,14 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
     let rehearsal = root != Path::new("/");
     let (layout, mut exec) = host(root)?;
     let user = probe_user(&exec, &args.fetch_user, rehearsal)?;
+    // A node that is not on a host with the user simply has no owner for its spool: the
+    // migration says so and leaves the node's `kbf.toml` as it is.
+    let node_user = kbf_host::user::lookup(
+        &exec,
+        crate::setup::plan::service_user_name(crate::cli::Mode::Daemon),
+    )
+    .ok()
+    .flatten();
     let m = migrate::Migration {
         roots: migrate::Roots::new(layout.platform()),
         layout,
@@ -348,6 +356,7 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
             },
             min_generation: args.min_generation,
         },
+        node_user,
         lock_wait: operator::LOCK_WAIT,
     };
     let mode = if apply {

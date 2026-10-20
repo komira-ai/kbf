@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kbf_host::{Exec, Mode};
 
 use super::apply::{remove_note, rules};
+use super::daemon_dirs;
 use super::error::MigrateError;
 use super::journal::{Journal, Phase};
 use super::newtree::StateDir;
@@ -292,6 +293,7 @@ pub fn rollback_at<E: Exec>(
             );
         }
     }
+    daemon_dirs::restore(m, svc.exec, mode, &mut report)?;
     svc.reload().map_err(MigrateError::io("daemon-reload"))?;
     if let Some(helper) = &journal.helper_unit {
         svc.enable(helper)
