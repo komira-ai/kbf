@@ -114,7 +114,7 @@ fn last_of_class_cordoned(seed: u64) -> World {
         }
     }
     // The uncordon itself places what waited for arm (the reference checks exactly
-    // which: arm is first in name order, so other work may take some of its room).
+    // which: other work may take some of its room).
     let by_uncordon = ops_of(&w, ARM, c, unc).iter().any(|id| {
         seen.grants
             .get(id)

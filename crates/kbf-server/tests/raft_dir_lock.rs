@@ -12,13 +12,36 @@ use std::thread::JoinHandle;
 use kbf_meta::Retention;
 use kbf_server::RaftMetaLog;
 
-/// An empty directory of its own for `name`.
-fn dir(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-server-raft-dir-lock")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A directory of its own for `name`, removed when it drops; the raft directory is
+/// `d` in it, not yet made.
+struct Dir {
+    path: PathBuf,
+    _dir: kbf_testkit::dir::TestDir,
+}
+
+impl std::ops::Deref for Dir {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for Dir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+fn dir(name: &str) -> Dir {
+    let dir = kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-raft-dir-lock-{name}"),
+    );
+    Dir {
+        path: dir.join("d"),
+        _dir: dir,
+    }
 }
 
 /// Catches: a raft directory two open logs write at once (no lock, or a lock taken
@@ -42,7 +65,6 @@ async fn a_second_open_of_one_raft_dir_is_refused_until_the_first_is_dropped() {
     let again = again.expect("an open after the first log was dropped");
     assert_eq!(again.bootstraps(), 1);
     drop(again);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A child process caught between `fork` and `exec`. It holds a copy of every
@@ -130,5 +152,4 @@ async fn a_child_forked_while_the_log_was_open_does_not_keep_the_dir_locked_afte
     assert_eq!(again.bootstraps(), 1);
     drop(again);
     child.finish();
-    let _ = std::fs::remove_dir_all(&dir);
 }

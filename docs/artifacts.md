@@ -79,8 +79,10 @@ tests the crate there.
 
 A pull request into `feature/arch-v2` builds only the Linux files: the macOS job and the
 sums are skipped there to spare the macOS runners, and the push to `feature/arch-v2`
-builds and attests all of them for its head. A newer push to `feature/arch-v2` cancels
-the older push's run; every commit on `main` keeps a run of its own.
+builds and attests all of them for its head. A newer push to `feature/arch-v2` never
+cancels a running build: it replaces only a run still waiting to start, so a recent
+attested release always finishes even under steady merges. Every commit on `main` keeps
+a run of its own.
 
 `<commit>` is the full SHA of the commit built (`GITHUB_SHA`: on `main`, the pushed
 commit; on a pull request, the test merge commit). Each tarball holds one release binary (`cargo build

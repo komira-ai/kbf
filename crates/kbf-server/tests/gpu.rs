@@ -51,7 +51,8 @@ fn capacity_reads_the_gpu_entry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gpu_serves_one_lease_at_a_time() {
     let cell = support::Cell::start().await;
-    // Name order puts the CPU-only node first: first fit would pick it.
+    // Name order puts the CPU-only node first, and nothing is booked on it: a placement
+    // that ignored the GPU would pick it.
     let mut cpu_only = cell.daemon("node-a", 4, 8).await;
     let mut gpu_node = FakeDaemon::connect(cell.worker_addr, hello_with_gpus("node-g", "1"))
         .await

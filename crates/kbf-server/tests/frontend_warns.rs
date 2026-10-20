@@ -92,10 +92,8 @@ async fn a_state_store_without_tls_flags_warns_that_members_are_not_routed_to() 
         "{}",
         log.text()
     );
-    let state = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("frontend-warns")
-        .join(format!("state-{}", std::process::id()));
-    std::fs::create_dir_all(&state).expect("directory");
+    let state =
+        kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "frontend-warns-state");
     let store = format!(
         "--state-store=sqlite://{}",
         state.join("state.db").display()
