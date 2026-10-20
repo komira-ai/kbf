@@ -217,12 +217,13 @@ impl ProxyConfig {
         Ok(config)
     }
 
-    /// The server certificates as the TLS layer takes them: the `[[server_cert]]` list, or the
-    /// single pair as one default entry with no names.
+    /// The server certificates as the TLS layer takes them: the single pair as one default
+    /// entry with no names, or the `[[server_cert]]` list (a checked table has only one of
+    /// the two).
     #[must_use]
     pub fn cert_entries(&self) -> Vec<CertEntry> {
         match (&self.server_cert_file, &self.server_key_file) {
-            (Some(cert), Some(key)) if self.server_cert.is_empty() => vec![CertEntry {
+            (Some(cert), Some(key)) => vec![CertEntry {
                 names: Vec::new(),
                 cert: cert.clone(),
                 key: key.clone(),
@@ -376,7 +377,8 @@ key_file = "/etc/kbf/tls/worker.key"
         let entries = c.cert_entries();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].names, ["reapi.example.com"]);
-        assert!(entries[0].default && !entries[1].default);
+        assert!(entries[0].default);
+        assert!(!entries[1].default);
         assert_eq!(entries[1].key, PathBuf::from("/etc/kbf/tls/worker.key"));
     }
 

@@ -20,7 +20,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use x509_parser::extensions::GeneralName;
 
-use crate::config::{TlsError, certificates, pem_error, read_file, validity};
+use crate::config::{TlsError, certificates, pem_error, read_file};
 
 /// One certificate, the names it is served for, and whether it is the default.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,7 +62,7 @@ fn normal(name: &str) -> String {
 impl SniCerts {
     /// Checks the shape of `entries` without reading a file: at least one entry; exactly one
     /// default among two or more; every named entry's names are plain DNS names (not empty,
-    /// no wildcard); an entry with no names is the default; no name appears twice (names
+    /// letters, digits, `-`, `_` and `.` only: no wildcard); an entry with no names is the default; no name appears twice (names
     /// compare case-insensitively).
     ///
     /// # Errors
@@ -91,7 +91,10 @@ impl SniCerts {
             }
             for name in &entry.names {
                 let name = normal(name);
-                if name.is_empty() || name.contains('*') || name.contains(char::is_whitespace) {
+                let letters = name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_');
+                if name.is_empty() || !letters {
                     return bad(format!("{name:?} is not a plain DNS name"));
                 }
                 if !seen.insert(name.clone()) {
@@ -117,10 +120,11 @@ impl SniCerts {
         Self::check_entries(entries)?;
         let provider = rustls::crypto::ring::default_provider();
         let mut by_name = HashMap::new();
-        let mut default = None;
+        let mut built = Vec::with_capacity(entries.len());
         let (mut first_not_after, mut any_expired) = (i64::MAX, false);
         for entry in entries {
             let chain = certificates(&entry.cert, &read_file(&entry.cert)?)?;
+            let facts = Facts::of(&chain[0], &entry.cert)?;
             let key = PrivateKeyDer::from_pem_slice(&read_file(&entry.key)?)
                 .map_err(|e| pem_error(&entry.key, e))?;
             let signing = provider
@@ -135,13 +139,11 @@ impl SniCerts {
                     entry.cert.display()
                 ))
             })?;
-            let (not_after, expired) = validity(&certified.cert[0], &entry.cert)?;
-            first_not_after = first_not_after.min(not_after);
-            any_expired |= expired;
-            let sans = dns_names(&certified.cert[0], &entry.cert)?;
+            first_not_after = first_not_after.min(facts.not_after);
+            any_expired |= facts.expired;
             for name in &entry.names {
                 let name = normal(name);
-                if !sans.iter().any(|san| covers(san, &name)) {
+                if !facts.dns_names.iter().any(|san| covers(san, &name)) {
                     return Err(TlsError::Config(format!(
                         "the name {name} is not a subject alternative name of {}",
                         entry.cert.display()
@@ -149,16 +151,15 @@ impl SniCerts {
                 }
                 by_name.insert(name, Arc::clone(&certified));
             }
-            if entry.default || entries.len() == 1 {
-                default = Some(certified);
-            }
+            built.push(certified);
         }
-        // `check_entries` guaranteed one default, so this is always `Some`.
-        let default = default.ok_or_else(|| TlsError::Config("no default".to_owned()))?;
+        // `check_entries` guaranteed exactly one default among two or more entries, and a
+        // list of one is its own.
+        let at = entries.iter().position(|e| e.default).unwrap_or(0);
         Ok(Self {
             inner: Arc::new(Inner {
                 by_name,
-                default,
+                default: Arc::clone(&built[at]),
                 first_not_after,
                 any_expired,
             }),
@@ -191,32 +192,39 @@ impl ResolvesServerCert for SniCerts {
     }
 }
 
-/// The DNS names in the leaf's subject alternative name extension, lowercased.
-fn dns_names(
-    leaf: &rustls::pki_types::CertificateDer<'_>,
-    path: &Path,
-) -> Result<Vec<String>, TlsError> {
-    let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
-        .map_err(|e| pem_error(path, format!("the leaf is not an X.509 certificate: {e}")))?;
-    let names = match parsed.subject_alternative_name() {
-        Ok(Some(san)) => san
-            .value
-            .general_names
-            .iter()
-            .filter_map(|n| match n {
+/// What the leaf says about itself, read from one parse.
+struct Facts {
+    /// The end of its validity, in seconds since the epoch.
+    not_after: i64,
+    /// Whether that end has passed.
+    expired: bool,
+    /// Its DNS subject alternative names, lowercased. A certificate with no such extension,
+    /// or one that does not parse, has none, and so no configured name matches it.
+    dns_names: Vec<String>,
+}
+
+impl Facts {
+    fn of(leaf: &rustls::pki_types::CertificateDer<'_>, path: &Path) -> Result<Self, TlsError> {
+        let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref())
+            .map_err(|e| pem_error(path, format!("the leaf is not an X.509 certificate: {e}")))?;
+        let validity = parsed.validity();
+        let dns_names = parsed
+            .subject_alternative_name()
+            .ok()
+            .flatten()
+            .into_iter()
+            .flat_map(|san| san.value.general_names.iter())
+            .filter_map(|name| match name {
                 GeneralName::DNSName(dns) => Some(normal(dns)),
                 _ => None,
             })
-            .collect(),
-        Ok(None) => Vec::new(),
-        Err(e) => {
-            return Err(pem_error(
-                path,
-                format!("unreadable subject alternative names: {e}"),
-            ));
-        }
-    };
-    Ok(names)
+            .collect();
+        Ok(Self {
+            not_after: validity.not_after.timestamp(),
+            expired: validity.time_to_expiration().is_none(),
+            dns_names,
+        })
+    }
 }
 
 /// Whether the certificate name `san` covers `name`: equal, or `*.rest` and `name` is one

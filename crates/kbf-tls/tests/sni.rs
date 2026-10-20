@@ -11,7 +11,7 @@ use rcgen::ExtendedKeyUsagePurpose::ServerAuth;
 use rustls::DigitallySignedStruct;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use support::{Ca, Leaf, ca, dir, leaf};
+use support::{Ca, Leaf, ca, dir, leaf, leaf_with_sans};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const PUBLIC: &str = "reapi.example.com";
@@ -209,7 +209,7 @@ fn a_wildcard_san_covers_one_label() {
     let d = dir("wildcard");
     let ok = entry(&d, "wild", &wild, &["a.example.com"], true);
     SniCerts::from_config(&[ok]).expect("one label");
-    for bad in ["a.b.example.com", "example.com"] {
+    for bad in ["a.b.example.com", "example.com", ".example.com", "example"] {
         let e = entry(&d, "wild", &wild, &[bad], true);
         assert!(
             matches!(SniCerts::from_config(&[e]), Err(TlsError::Config(_))),
@@ -318,4 +318,69 @@ fn an_expired_leaf_is_refused_only_when_asked() {
         certs.reject_expired(),
         Err(TlsError::Expired { .. })
     ));
+}
+
+/// Names are letters, digits, `-`, `_` and `.`; anything else (a wildcard, a space, a slash, or
+/// nothing) is refused before a file is read, and ordinary names pass.
+///
+/// Kills: a name check that lets a pattern or an empty name into the table.
+#[test]
+fn only_plain_names_pass_the_shape_check() {
+    let named = |name: &str| CertEntry {
+        names: vec![name.to_owned()],
+        cert: "unused.pem".into(),
+        key: "unused.key".into(),
+        default: true,
+    };
+    for ok in ["reapi.example.com", "a-b.example", "x_y.example", "A9."] {
+        SniCerts::check_entries(&[named(ok)]).expect("a plain name");
+    }
+    for bad in ["", ".", "*.example", "a b.example", "a/b.example", "a:b"] {
+        assert!(SniCerts::check_entries(&[named(bad)]).is_err(), "{bad:?}");
+    }
+}
+
+/// Files that are not a usable certificate or key are refused with the file named: a key that
+/// is not PEM, a key block that is not a key, a certificate block that is not a certificate.
+///
+/// Kills: a bad file that panics, is skipped, or is reported without saying which.
+#[test]
+fn unusable_files_are_refused_naming_the_file() {
+    let p = pair("junk");
+    let junk =
+        |label: &str| format!("-----BEGIN {label}-----\nAAAAAAAAAAAA\n-----END {label}-----\n");
+    let mut not_pem = two(&p, true);
+    std::fs::write(&not_pem[0].key, "not a key").expect("write");
+    let why = refused(&not_pem);
+    assert!(why.contains("public.key"), "{why}");
+    not_pem = two(&p, true);
+    std::fs::write(&not_pem[0].key, junk("PRIVATE KEY")).expect("write");
+    let why = refused(&not_pem);
+    assert!(why.contains("public.key"), "{why}");
+    let not_pem = two(&p, true);
+    std::fs::write(&not_pem[0].cert, junk("CERTIFICATE")).expect("write");
+    let why = refused(&not_pem);
+    assert!(why.contains("public.pem"), "{why}");
+}
+
+/// A certificate with other kinds of names, or with none, has no DNS name to match: the
+/// configured name is refused, and a nameless default still loads.
+///
+/// Kills: a URI or IP name read as a DNS name; a certificate with no names crashing the check.
+#[test]
+fn only_dns_names_count_as_the_certificates_names() {
+    let ca = ca("san CA");
+    let d = dir("san-kinds");
+    let uri = rcgen::SanType::URI("urn:example:thing".try_into().expect("ia5"));
+    let dns = rcgen::SanType::DnsName("real.example.com".try_into().expect("ia5"));
+    let mixed = leaf_with_sans(&ca, vec![uri, dns]);
+    let ok = entry(&d, "mixed", &mixed, &["real.example.com"], true);
+    SniCerts::from_config(&[ok]).expect("the DNS name counts");
+    let wrong = entry(&d, "mixed", &mixed, &["thing"], true);
+    assert!(SniCerts::from_config(&[wrong]).is_err());
+    let none = leaf_with_sans(&ca, Vec::new());
+    let named = entry(&d, "none", &none, &["real.example.com"], true);
+    assert!(refused(&[named]).contains("subject alternative"));
+    let nameless = entry(&d, "none", &none, &[], true);
+    SniCerts::from_config(&[nameless]).expect("a default with no names needs no SAN");
 }
