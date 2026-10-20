@@ -23,7 +23,9 @@
 //! and they are small; a larger one is a link), and `/ui/updates` (Updates: the
 //! desired release, the releases, and each host's update, from `GET /v1/update`,
 //! `GET /v1/nodes` and, where it answers, `GET /v1/update/hosts`; read-only, with the
-//! operator-API command to set the desired release shown as text).
+//! operator-API command to set the desired release shown as text), `/ui/leases` (Leases:
+//! `GET /v1/leases`, filtered by `?node=` and paged by the API's own links) and
+//! `/ui/queue` (Queue: `GET /v1/queue`).
 //!
 //! A mount routes `GET` under [`PREFIX`] to [`respond`], gives it a [`Source`] that asks
 //! the server's own read routes, and sends every header of [`Answer::headers`]
@@ -176,6 +178,8 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
             pages::action(source, id, digest).await
         }
         ["updates"] => pages::updates(source).await,
+        ["leases"] => pages::leases(source, query).await,
+        ["queue"] => pages::queue(source).await,
         _ => pages::not_found(path),
     }
 }

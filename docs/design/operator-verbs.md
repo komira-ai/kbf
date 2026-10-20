@@ -146,7 +146,7 @@ default, `--ui=false` turns them off. Open: no gate, whatever the REAPI policy s
 |---|---|---|---|
 | the Overview page | `GET /ui` | [F] | none (open) |
 | the same, with a trailing slash | `GET /ui/` | [F] | none (open) |
-| every other page and the stylesheet (`/ui/builds`, `/ui/builds/{id}`, `/ui/updates`, `/ui/static/kbf.css`) | `GET /ui/{*rest}` | [F] | none (open) |
+| every other page and the stylesheet (`/ui/builds`, `/ui/builds/{id}`, `/ui/updates`, `/ui/leases`, `/ui/queue`, `/ui/static/kbf.css`) | `GET /ui/{*rest}` | [F] | none (open) |
 
 ### Health
 
