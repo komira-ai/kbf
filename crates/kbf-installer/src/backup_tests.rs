@@ -525,12 +525,16 @@ fn the_process_runner_reports_what_the_program_said() {
     assert_eq!(Process.run("true", &[]), Ok(()));
     let err = Process.run("false", &[]).unwrap_err();
     assert!(err.starts_with("false failed (exit status: 1)"), "{err}");
-    // `ls` of a path that is not there says so on standard error and exits 2.
+    // `ls` of a path that is not there says so on standard error and exits nonzero (2 for GNU
+    // `ls`, 1 for the BSD `ls` of a Mac): the status is the program's, the exact text of one is
+    // pinned by `false` above, and the message names the path the program complained about.
     let err = Process
         .run("ls", &["/kbf-no-such-directory-for-the-test".into()])
         .unwrap_err();
+    let status = err.strip_prefix("ls failed (exit status: ");
     assert!(
-        err.starts_with("ls failed (exit status: 2): ")
+        status.is_some_and(|rest| rest.starts_with(|c| matches!(c, '1'..='9')))
+            && err.contains("): ")
             && err.contains("kbf-no-such-directory-for-the-test"),
         "{err}"
     );
