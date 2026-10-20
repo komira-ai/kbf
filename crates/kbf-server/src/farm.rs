@@ -336,6 +336,17 @@ enum Taken {
     Dropped,
 }
 
+impl Taken {
+    /// The `accepted` of the `ResultAck` this is answered with; `None` for no ack at all.
+    const fn ack(self) -> Option<bool> {
+        match self {
+            Self::Accepted => Some(true),
+            Self::Refused => Some(false),
+            Self::Held | Self::Dropped => None,
+        }
+    }
+}
+
 impl Farm {
     /// A farm over `cache`, with an empty scheduler of a new term that refuses queued work once no live worker has been able to run it for
     /// `unservable_wait`, and keeps a finished operation, which WaitExecution still
@@ -952,12 +963,8 @@ impl Farm {
         for settled in answers {
             self.deliver(settled).await;
         }
-        let accepted = match taken {
-            Taken::Accepted => true,
-            Taken::Refused => false,
-            // The ack is sent when the store has taken the record, or never.
-            Taken::Held | Taken::Dropped => return None,
-        };
+        // None: the ack is sent when the store has taken the record, or never.
+        let accepted = taken.ack()?;
         Some(ResultAck {
             lease_id: Some(wire_lease),
             accepted,
@@ -1172,7 +1179,6 @@ impl State {
             measured,
             run,
         } = report;
-        let drops = self.write_drops;
         // Taken first: a report that finishes the operation may drop its callers.
         let usage = measured.and_then(|measured| {
             let (_, waiter) = self.first_waiter(operation)?;
@@ -1188,16 +1194,16 @@ impl State {
         let answers = self.feed(now, event);
         let rerun = self.runs_recorded(operation) > recorded_before;
         let accepted = rerun || answers.iter().any(|a| a.lease == lease);
+        // Finished by this lease and not answered: the finish waits for the store, or the
+        // record was dropped unwritten.
         let taken = if accepted {
             Taken::Accepted
         } else if !self.finished_by(operation, lease) {
             Taken::Refused
-        } else if self.write_drops > drops {
-            Taken::Dropped
         } else if self.finish_held(operation) {
             Taken::Held
         } else {
-            Taken::Refused
+            Taken::Dropped
         };
         if accepted && let Some((subject, measured)) = &usage {
             action_usage::log(operation, subject, measured, outcome, lease, worker);
@@ -1236,17 +1242,14 @@ impl State {
 
     /// Whether the scheduler finished `operation` with `lease`'s result.
     fn finished_by(&self, operation: OperationId, lease: LeaseId) -> bool {
-        matches!(
-            self.sched.state(operation),
-            Some(OpState::Completed { lease: l, .. } | OpState::Failed { lease: l, .. }) if *l == lease
-        )
+        self.sched.state(operation).and_then(finished_lease) == Some(lease)
     }
 
     /// Whether `lease`'s `Start` was sent, the scheduler finished its operation with its
     /// result, and the finish waits for the state store.
     fn finish_held_of(&self, lease: LeaseId) -> bool {
         self.machine.sent(lease).is_some_and(|sent| {
-            self.finished_by(sent.operation, lease) && self.finish_held(sent.operation)
+            self.finished_by(sent.operation, lease) & self.finish_held(sent.operation)
         })
     }
 
@@ -1611,20 +1614,31 @@ impl State {
         self.keep_finished(answer.operation, answer.waiters.clone());
         // A result whose finish waited for the store is acknowledged to its sender's
         // newest stream: the store has taken the row.
-        let ack = self.owed.remove(&answer.lease).and_then(|worker| {
-            let link = self.links.get(&worker)?;
-            let ack = ResultAck {
-                lease_id: Some(wire_lease(answer.lease)),
-                accepted: true,
-            };
-            Some((link.outbound.clone(), ack))
-        });
+        let ack = self
+            .owed
+            .remove(&answer.lease)
+            .and_then(|worker| self.links.get(&worker))
+            .map(|link| {
+                let ack = ResultAck {
+                    lease_id: Some(wire_lease(answer.lease)),
+                    accepted: true,
+                };
+                (link.outbound.clone(), ack)
+            });
         Settled {
             finished,
             write,
             stages,
             ack,
         }
+    }
+}
+
+/// The lease whose result finished an operation in `state`, if it is finished.
+const fn finished_lease(state: &OpState) -> Option<LeaseId> {
+    match state {
+        OpState::Completed { lease, .. } | OpState::Failed { lease, .. } => Some(*lease),
+        _ => None,
     }
 }
 
