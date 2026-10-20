@@ -225,8 +225,8 @@ pub struct Cli {
     /// On the first SIGTERM or SIGINT the daemon drains: it takes no new lease, lets
     /// the running ones finish and report, waits for their acknowledgements, then exits
     /// 0. A second signal, or this many seconds after the first, stops it at once and
-    /// abandons the leases still running. Used by `kbf daemon`; the combined modes stop
-    /// their daemon half with the other half.
+    /// abandons the leases still running. Used by `kbf daemon` and `kbf
+    /// storage-and-daemon`; `kbf all-in-one` stops its daemon half with the server half.
     #[arg(long, default_value_t = 600)]
     drain_deadline_secs: u64,
     /// Where the kernel reports memory pressure stall information. For tests only.
@@ -510,6 +510,18 @@ impl NodeHandle {
     /// The signal handlers cannot be installed, or no storage member is reachable from
     /// this host ([`kbf_daemon::reach`]).
     pub fn serve(self) -> Result<(), Error> {
+        self.serve_alongside(std::future::pending())
+    }
+
+    /// [`Self::serve`] for a daemon beside another half in the same process: the first
+    /// signal drains as `serve` does (the half beside it is not told until the drain is
+    /// over, so a running lease still reaches its blobs through it), and `other` completing
+    /// (that half stopped on its own) stops the daemon at once, abandoning the leases
+    /// still running.
+    ///
+    /// # Errors
+    /// As [`Self::serve`].
+    pub fn serve_alongside(self, other: impl Future<Output = ()>) -> Result<(), Error> {
         // A signal handler is registered with the runtime's reactor, so the runtime's
         // context is entered while it is made.
         let (term, int) = {
@@ -520,15 +532,29 @@ impl NodeHandle {
             )
         };
         let (signals, received) = tokio::sync::mpsc::unbounded_channel();
-        let deadline = self.drain_deadline;
+        self.tokio.spawn(forward(term, int, signals));
+        self.drain_on(received, other)
+    }
+
+    /// Drains on the first of `received` and ends at the second, at the drain deadline,
+    /// or when `other` completes, whichever is first ([`Daemon::run_draining`]).
+    fn drain_on(
+        self,
+        received: tokio::sync::mpsc::UnboundedReceiver<()>,
+        other: impl Future<Output = ()>,
+    ) -> Result<(), Error> {
         let Self {
             tokio,
             daemon,
+            drain_deadline,
             reach,
-            ..
         } = self;
-        tokio.spawn(forward(term, int, signals));
-        let serving = Box::pin(daemon.run_draining(received, deadline));
+        let serving = Box::pin(async {
+            tokio::select! {
+                () = daemon.run_draining(received, drain_deadline) => {}
+                () = other => tracing::warn!("the half beside the daemon stopped: stopping"),
+            }
+        });
         tokio.block_on(serve_or_refuse(serving, reach))
     }
 
@@ -2106,6 +2132,53 @@ mod tests {
             .serve_until(async { tokio::time::sleep(Duration::from_millis(100)).await })
             .expect("nothing to refuse");
 
+        kbf_outputs::remove_tree(&dir).expect("clean");
+    }
+
+    /// Catches a daemon beside another half that does not drain on the first signal
+    /// (`drain_on` running the daemon with `run`, which ignores signals), and one that
+    /// keeps running when the half beside it has stopped. An idle node with a signal
+    /// waiting returns at once, and so does one whose other half has stopped, with no
+    /// signal; each runs on a thread the test waits on for 5 s, so a defect fails here
+    /// instead of hanging the run.
+    #[test]
+    fn a_daemon_beside_another_half_drains_on_a_signal_and_stops_when_the_other_does() {
+        let dir = scratch("drain-on");
+        tls_files(&dir);
+        let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+        let cli = Cli::try_parse_from([
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            flag("data-dir", &dir),
+            flag("xcode-apps", &dir.join("Applications")),
+        ])
+        .expect("flags");
+        let ends = |signalled: bool| {
+            let node = start_with(&cli, remote).expect("starts");
+            let (signals, received) = tokio::sync::mpsc::unbounded_channel();
+            if signalled {
+                signals.send(()).expect("sent");
+            }
+            let (ended, result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let other = async move {
+                    if signalled {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                ended.send(node.drain_on(received, other).is_ok()).ok();
+                drop(signals);
+            });
+            result.recv_timeout(Duration::from_secs(5))
+        };
+        assert_eq!(ends(true), Ok(true), "no drain on the first signal");
+        assert_eq!(ends(false), Ok(true), "the other half's stop was ignored");
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 
