@@ -656,6 +656,22 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         Verb::RecordRelease(a) => record_release(root_of(cli), euid, cli.apply, &a.commit),
         Verb::Gc(g) => gc(root_of(cli), cli.apply, g.keep),
         Verb::Quiesce => quiesce(root_of(cli)),
+        // The fetch child writes the component to `out` (standard output, a pipe the root
+        // parent reads) and says why it could not on `err`, one line. It runs as the fetch
+        // user, so no root check applies, and it prints no JSON: its output is the bytes.
+        Verb::FetchChild(args) => {
+            let written = crate::fetch::child::fetch(args, out).and_then(|n| {
+                out.flush().map_err(crate::fetch::child::ChildFault::Out)?;
+                Ok(n)
+            });
+            return match written {
+                Ok(_) => Exit::Ok,
+                Err(why) => {
+                    let _ = writeln!(err, "fetch-child: {why}");
+                    Exit::Failed
+                }
+            };
+        }
         Verb::Backup(args) => {
             run_backup(&backup::Process, root_of(cli), cli.apply, args, &mut said)
         }
