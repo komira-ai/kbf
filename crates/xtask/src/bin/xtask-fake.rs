@@ -55,7 +55,8 @@
 //!   appends `<name> <arguments>` as one line to `systemd-args` next to the fake's own
 //!   file and exits 0: the host's systemd, as `packaging/install.sh` calls it.
 //!
-//! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
+//! `XTASK_FAKE_DEFECT` plants one defect of the real build (`beta-bundle-any-commit`: the
+//! bundle check ignores the commit for the beta workflow's bundles only): `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
 //! builds), `fails-other` (a malformed override fails, but not on the override),
 //! `build-fails` (every build fails), `json-fails` (`kbf --version --json` exits 1), `stamp-fails` (every build with an override
@@ -302,7 +303,10 @@ fn verify_bundle(dir: &Path, sha256: &str, file: &str, bundle: &str, rest: &[Str
             })
         })
         .unwrap_or_default();
-    let by_commit = !defect("bundle-any-commit");
+    // `beta-bundle-any-commit` is `bundle-any-commit` for the beta workflow's bundles only,
+    // so the artifacts controls pass and the beta control is the one reached.
+    let beta = flags.iter().any(|f| f.ends_with("/beta.yml"));
+    let by_commit = !(defect("bundle-any-commit") || (beta && defect("beta-bundle-any-commit")));
     let by_bytes = !defect("bundle-any-file");
     let wanted = if by_commit {
         flags.join(" ")
