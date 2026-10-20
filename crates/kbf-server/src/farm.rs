@@ -1163,10 +1163,10 @@ impl State {
         let exit_code = exit_code.map_or_else(|| "-".to_owned(), |code| code.to_string());
         match outcome {
             Outcome::Completed { .. } => {
-                tracing::info!(%operation, %lease, %node, accepted, exit_code, "lease finished ok");
+                tracing::info!(%operation, %lease, %node, accepted, %exit_code, "lease finished ok");
             }
             Outcome::Failed(failure) => {
-                tracing::warn!(%operation, %lease, %node, ?failure, accepted, exit_code, "lease finished failed");
+                tracing::warn!(%operation, %lease, %node, ?failure, accepted, %exit_code, "lease finished failed");
             }
         }
         if accepted && outcome == Outcome::Failed(Failure::NodeMemoryPressure) {
@@ -1412,7 +1412,7 @@ impl State {
         let platform = first.map(|(_, w)| &w.platform);
         let os_family = platform.map_or("-", |p| p.os_family);
         let isa = platform.map_or("-", |p| p.isa.as_str());
-        tracing::info!(%operation, %lease, %node, key, os_family, isa, "lease granted");
+        tracing::info!(%operation, %lease, %node, key, %os_family, %isa, "lease granted");
         self.record_granted(grant);
         self.send_for(&grant.worker, grant.operation, |w| {
             server_message::Message::LeaseOffer(LeaseOffer {

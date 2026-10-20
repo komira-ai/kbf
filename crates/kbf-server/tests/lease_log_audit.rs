@@ -97,7 +97,13 @@ async fn a_granted_lease_names_the_os_family_and_isa_the_action_asked_for() {
         &[("OSFamily", "Linux"), ("ISA", "x86-64")],
     )
     .await;
-    granted(&Cell::start().await, "audit-mac", MAC, &[("OSFamily", "Darwin")]).await;
+    granted(
+        &Cell::start().await,
+        "audit-mac",
+        MAC,
+        &[("OSFamily", "Darwin")],
+    )
+    .await;
     granted(&Cell::start().await, "audit-none", LINUX, &[]).await;
 
     let linux = the_line("lease granted", "audit-linux");
