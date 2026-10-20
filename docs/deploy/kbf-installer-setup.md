@@ -159,6 +159,13 @@ address that is in the file.
    TOML refuses a table written twice, and so does `kbf` (exit 2, `duplicate key`). A `daemon`
    or `storage-and-daemon` file has a `[daemon]` table (`update-dir`, `orders-dir`), so a
    `data_dir` or other daemon key goes under that header, not under a new `[daemon]`.
+
+   On a Mac setup writes neither `update-dir` nor `orders-dir`: `kbf-mac-provision` is the one
+   writer of the daemon's `kbf.toml`. Setup checks the file instead. `update-dir` must be there
+   and be the installer's state directory; `orders-dir` must be absent (the node uses
+   `<update-dir>/orders`) or be the installer's. A missing or different key, or no file, is
+   refused with exit 5, naming the key and saying `kbf-mac-provision` renders it; run it
+   again, then setup. Linux hosts get both keys written, as above.
 10. The units, last: the mode's unit and `kbf-installer.service`, `systemctl enable`, with
    `--now` for a node's unit when a release is installed and `--no-start` is not given (the
    installer's own service does not wait for either). A unit that makes a frontend
