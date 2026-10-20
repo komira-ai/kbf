@@ -729,3 +729,196 @@ async fn a_sighup_with_a_missing_key_keeps_the_old_certificate_and_names_the_fil
     let (status, took) = exited(&mut child, Duration::from_secs(10));
     assert_eq!(status.and_then(|s| s.code()), Some(0), "after {took:?}");
 }
+
+/// Catches a verb that dies of a SIGHUP sent before its handler exists (`ExecReload` can run
+/// as soon as the unit is active, and the default action of SIGHUP ends the process). The
+/// launcher here blocks SIGHUP, so the signals sent right after the spawn stay pending in the
+/// verb until it unblocks them; unblocking before the handler is registered delivers them to
+/// the default action. The verb must survive them, serve, reload once the handler exists
+/// (its standard error says so), and still stop on SIGTERM with 0.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sighup_sent_before_the_handler_exists_does_not_kill_the_verb() {
+    let (path, ca) = served_config("hup-early");
+    let log = path.parent().expect("dir").join("verb.log");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let mut child = start_masked(
+        &path,
+        &listener,
+        Stdio::from(fs::File::create(&log).expect("log file")),
+        true,
+    );
+    drop(listener);
+    // As early as possible, and repeatedly while the verb starts.
+    for _ in 0..20 {
+        send(&child, libc::SIGHUP);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+    let started = Instant::now();
+    while !fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("reloaded the TLS files")
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the held SIGHUP never reloaded"
+        );
+        assert!(
+            child.try_wait().expect("wait").is_none(),
+            "an early SIGHUP stopped the verb"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    send(&child, libc::SIGTERM);
+    let (status, took) = exited(&mut child, Duration::from_secs(10));
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "after {took:?}");
+}
+
+/// Catches a reload that cuts streams open at the swap: 50 connections each hold a stream
+/// (a request sent but not yet answered to the client) across a SIGHUP that installs a renewed certificate,
+/// and every one completes with 200 afterwards, on a connection that still takes a new request.
+#[tokio::test(flavor = "current_thread")]
+async fn fifty_open_streams_all_complete_across_a_reload() {
+    let (path, served_ca) = served_config("hup-streams");
+    let dir = path.parent().expect("dir").to_owned();
+    let ca_a = dir.join("a-ca.pem");
+    fs::copy(&served_ca, &ca_a).expect("copy the old CA");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let child = start_masked(&path, &listener, Stdio::piped(), true);
+    drop(listener);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca_a, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+
+    let mut open = Vec::new();
+    for _ in 0..50 {
+        let (send_request, connection) = h2::client::handshake(tls(addr, &ca_a).await)
+            .await
+            .expect("h2 handshake");
+        tokio::spawn(connection);
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://proxy.test/healthz")
+            .body(())
+            .expect("a request");
+        let (response, body) = send_request
+            .clone()
+            .ready()
+            .await
+            .expect("capacity")
+            .send_request(request, false)
+            .expect("send");
+        open.push((send_request, response, body));
+    }
+
+    let ca_b = issue(&dir, "b-");
+    for file in ["server.pem", "server.key"] {
+        fs::rename(dir.join(format!("b-{file}")), dir.join(file)).expect("replace");
+    }
+    fs::copy(&ca_b, &served_ca).expect("replace the client CA");
+    send(&child, libc::SIGHUP);
+    until_served_by(addr, &ca_b).await;
+
+    // Each stream sent before the reload is answered, and its connection takes a new request.
+    for (send_request, response, _body) in open {
+        let first = tokio::time::timeout(Duration::from_secs(20), response)
+            .await
+            .expect("an answer")
+            .expect("the stream survived the reload");
+        assert_eq!(first.status().as_u16(), 200);
+        let request = http::Request::builder()
+            .uri("http://proxy.test/healthz")
+            .body(())
+            .expect("a request");
+        let (response, _) = send_request
+            .ready()
+            .await
+            .expect("the connection survived the reload")
+            .send_request(request, true)
+            .expect("send");
+        assert_eq!(response.await.expect("a response").status().as_u16(), 200);
+    }
+}
+
+/// Catches a handshake that fails while the certificate is swapped: a client that trusts both
+/// the old and the new CA handshakes in a tight loop while SIGHUP arrives, and every
+/// handshake, before, during and after the swap, succeeds (it sees the old certificate or the
+/// new one, never an error).
+#[tokio::test(flavor = "current_thread")]
+async fn handshakes_racing_a_reload_see_the_old_or_the_new_certificate() {
+    let (path, served_ca) = served_config("hup-race");
+    let dir = path.parent().expect("dir").to_owned();
+    let ca_a = dir.join("a-ca.pem");
+    fs::copy(&served_ca, &ca_a).expect("copy the old CA");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let child = start_masked(&path, &listener, Stdio::piped(), true);
+    drop(listener);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca_a, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+
+    let ca_b = issue(&dir, "b-");
+    for file in ["server.pem", "server.key"] {
+        fs::rename(dir.join(format!("b-{file}")), dir.join(file)).expect("replace");
+    }
+    let both = dir.join("both-ca.pem");
+    let mut text = fs::read_to_string(&ca_a).expect("old CA");
+    text.push_str(&fs::read_to_string(&ca_b).expect("new CA"));
+    fs::write(&both, text).expect("both CAs");
+    fs::copy(&ca_b, &served_ca).expect("replace the client CA");
+
+    let mut handshakes = 0_u32;
+    let mut seen_new = false;
+    let mut signalled = false;
+    let started = Instant::now();
+    while !seen_new || handshakes < 200 {
+        assert!(started.elapsed() < Duration::from_secs(30), "no swap seen");
+        if handshakes == 50 && !signalled {
+            send(&child, libc::SIGHUP);
+            signalled = true;
+        }
+        try_tls(addr, &both)
+            .await
+            .unwrap_or_else(|e| panic!("handshake {handshakes} failed: {e}"));
+        handshakes += 1;
+        seen_new = signalled && try_tls(addr, &ca_b).await.is_ok();
+    }
+}
+
+/// Catches a SIGHUP that cancels or restarts a stop under way: SIGTERM with a client holding a
+/// connection starts the drain, a SIGHUP follows, and the verb still ends within the stop
+/// bound of the SIGTERM (it does not keep serving, and does not hang on the reload).
+#[tokio::test(flavor = "current_thread")]
+async fn a_sighup_during_the_stop_does_not_cancel_it() {
+    let (path, ca) = served_config("hup-during-stop");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let mut child = start(&path, &listener);
+    drop(listener);
+    let (status, _) = tokio::time::timeout(Duration::from_secs(30), get(addr, &ca, "/healthz"))
+        .await
+        .expect("the proxy answers");
+    assert_eq!(status, 200);
+    let _idle = std::net::TcpStream::connect(addr).expect("an idle client");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    send(&child, libc::SIGTERM);
+    let (early, _) = exited(&mut child, Duration::from_millis(500));
+    assert!(
+        early.is_none(),
+        "the SIGTERM drains while a client is connected"
+    );
+    send(&child, libc::SIGHUP);
+    let (status, took) = exited(&mut child, Duration::from_secs(12));
+    let status = status.unwrap_or_else(|| panic!("still running {took:?} after the SIGTERM"));
+    assert!(status.code().is_some(), "ended by a signal: {status:?}");
+    assert!(took < Duration::from_secs(10), "after {took:?}");
+}

@@ -24,7 +24,8 @@
 //! refused (exit 2) too. A stop signal drains for at most 5 s; the process ends within
 //! [`STOP_BOUND`] of the first one is seen, whatever the drain is doing, and at once on a
 //! second. SIGTERM and SIGINT are unblocked at start, so a launcher's inherited mask cannot
-//! hide them.
+//! hide them. SIGHUP is held pending from the first line of the verb until its reload handler
+//! is registered, so a reload asked for the moment the unit is active is delivered, not fatal.
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
@@ -222,20 +223,41 @@ impl Stop {
     }
 }
 
-/// Unblocks SIGTERM, SIGINT and SIGHUP in this thread, and so in the runtime threads created
-/// after it: the signal mask survives `exec`, and a launcher that blocked them would otherwise
-/// leave a verb that no stop signal and no reload reaches.
-fn unblock_stop_signals() {
+/// Changes this thread's mask for `signals`: `how` is `SIG_BLOCK` or `SIG_UNBLOCK`.
+fn change_mask(how: libc::c_int, signals: &[libc::c_int]) {
     // SAFETY: `sigemptyset` and `sigaddset` fill a set owned here; `pthread_sigmask` reads it
     // and changes only this thread's mask.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&raw mut set);
-        libc::sigaddset(&raw mut set, libc::SIGTERM);
-        libc::sigaddset(&raw mut set, libc::SIGINT);
-        libc::sigaddset(&raw mut set, libc::SIGHUP);
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+        for &signal in signals {
+            libc::sigaddset(&raw mut set, signal);
+        }
+        libc::pthread_sigmask(how, &raw const set, std::ptr::null_mut());
     }
+}
+
+/// Unblocks SIGTERM and SIGINT in this thread, and so in the runtime threads created after it:
+/// the signal mask survives `exec`, and a launcher that blocked them would otherwise leave a
+/// verb that no stop signal reaches.
+fn unblock_stop_signals() {
+    change_mask(libc::SIG_UNBLOCK, &[libc::SIGTERM, libc::SIGINT]);
+}
+
+/// Holds SIGHUP pending from the start of the verb until its handler exists
+/// ([`release_reload_signal`]). A reload can be asked for the moment the unit is active
+/// (`ExecReload`), and until a handler is installed SIGHUP's default action ends the process.
+/// A blocked signal is not lost: it is delivered, to the handler, when it is unblocked. The
+/// runtime threads created in between inherit the block; the thread that unblocks is the one
+/// that serves, and it stays alive for as long as the proxy does.
+fn hold_reload_signal() {
+    change_mask(libc::SIG_BLOCK, &[libc::SIGHUP]);
+}
+
+/// Unblocks SIGHUP: call it only once the handler is registered. It also undoes a block the
+/// launcher left in the mask the verb inherited.
+fn release_reload_signal() {
+    change_mask(libc::SIG_UNBLOCK, &[libc::SIGHUP]);
 }
 
 /// Serves on `listener` until a stop signal. The signal handlers are registered before the
@@ -293,6 +315,8 @@ fn serve(config: ProxyConfig, listener: OwnedFd) -> Result<(), VerbError> {
             }));
         }
     });
+    // The handler exists: a SIGHUP held since the start of the verb is delivered now.
+    release_reload_signal();
     // A closed standard error (a journal that went away) must not stop the proxy from serving.
     #[cfg(target_os = "linux")]
     let _supervised = supervise(&handle, &state_dir, &proxy_auth_file, upstream);
@@ -331,6 +355,7 @@ fn supervise(
 
 /// The verb. With `--check`, the table is loaded and nothing is bound.
 pub fn run(args: &ProxyArgs) -> Result<(), VerbError> {
+    hold_reload_signal();
     let config = load(&args.config)?;
     if args.check {
         return Ok(());
