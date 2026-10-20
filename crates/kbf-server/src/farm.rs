@@ -71,7 +71,7 @@ pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
 pub use handover::UNTRACED_LOOKS;
 pub use phase::Reported;
 
-use self::ack::{Standing, refusal};
+use self::ack::{Verdict, refusal};
 use self::durable::Durable;
 use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
@@ -341,6 +341,18 @@ enum Taken {
     Held,
     /// The scheduler took it, and the record was dropped unwritten: never acknowledged.
     Dropped,
+}
+
+impl Taken {
+    /// The `accepted` and `reason` of the `ResultAck` this is answered with; `None` for no
+    /// ack at all.
+    const fn ack(self) -> Option<(bool, Reason)> {
+        match self {
+            Self::Accepted => Some((true, Reason::Accepted)),
+            Self::Refused(reason) => Some((false, reason)),
+            Self::Held | Self::Dropped => None,
+        }
+    }
 }
 
 impl Farm {
@@ -892,22 +904,23 @@ impl Farm {
         let (standing, recorded) = {
             let mut state = self.lock();
             let standing = state.standing(lease, worker);
-            let recorded =
-                matches!(standing, Standing::Holds(operation, ..) if state.is_recorded(operation));
+            let recorded = standing
+                .as_ref()
+                .is_ok_and(|(operation, ..)| state.is_recorded(*operation));
             // A copy of a result the scheduler took whose finish waits for the store is
             // acknowledged with the first.
-            if matches!(standing, Standing::Held) {
+            if matches!(standing, Err(Verdict::Held)) {
                 state.owed.insert(lease, worker.clone());
             }
             (standing, recorded)
         };
         let (operation, action, stamp) = match standing {
-            Standing::Holds(operation, action, stamp) => (operation, action, stamp),
-            Standing::Held => {
+            Ok(holding) => holding,
+            Err(Verdict::Held) => {
                 tracing::info!(%worker, %lease, "result held: its record is not written yet; no ack");
                 return None;
             }
-            Standing::Refused(reason) => {
+            Err(Verdict::Refused(reason)) => {
                 ack::log_refusal(worker, lease, reason);
                 return Some(refusal(wire_lease, reason));
             }
@@ -957,15 +970,8 @@ impl Farm {
         for settled in answers {
             self.deliver(settled).await;
         }
-        let (accepted, reason) = match taken {
-            Taken::Accepted => (true, Reason::Accepted),
-            Taken::Refused(reason) => {
-                ack::log_refusal(worker, lease, reason);
-                (false, reason)
-            }
-            // The ack is sent when the store has taken the record, or never.
-            Taken::Held | Taken::Dropped => return None,
-        };
+        // None: the ack is sent when the store has taken the record, or never.
+        let (accepted, reason) = taken.ack()?;
         Some(ResultAck {
             lease_id: Some(wire_lease),
             accepted,
@@ -1181,7 +1187,6 @@ impl State {
             measured,
             run,
         } = report;
-        let drops = self.write_drops;
         // Taken first: a report that finishes the operation may drop its callers.
         let usage = measured.and_then(|measured| {
             let (_, waiter) = self.first_waiter(operation)?;
@@ -1197,6 +1202,24 @@ impl State {
         let answers = self.feed(now, event);
         let rerun = self.runs_recorded(operation) > recorded_before;
         let accepted = rerun || answers.iter().any(|a| a.lease == lease);
+        // Not answered: refused, or finished by this lease with the finish waiting for the
+        // store, or with its record dropped unwritten (a finish neither held nor answered).
+        let taken = if accepted {
+            Taken::Accepted
+        } else {
+            let verdict = self
+                .standing(lease, worker)
+                .err()
+                .unwrap_or(Verdict::Refused(Reason::Stale));
+            match verdict {
+                Verdict::Held => Taken::Held,
+                Verdict::Refused(Reason::Duplicate) => Taken::Dropped,
+                Verdict::Refused(reason) => {
+                    ack::log_refusal(worker, lease, reason);
+                    Taken::Refused(reason)
+                }
+            }
+        };
         if accepted && let Some((subject, measured)) = &usage {
             action_usage::log(operation, subject, measured, outcome, lease, worker);
         }
@@ -1229,20 +1252,6 @@ impl State {
         if accepted && outcome == Outcome::Failed(Failure::NodeMemoryPressure) {
             memory::pressure(worker, self.sched.memory_pressure(worker));
         }
-        let taken = if accepted {
-            Taken::Accepted
-        } else {
-            match self.standing(lease, worker) {
-                Standing::Held => Taken::Held,
-                // The scheduler finished the operation, its finish is neither written nor
-                // held, and a write was given up on during this feed: this one.
-                Standing::Refused(Reason::Duplicate) if self.write_drops > drops => Taken::Dropped,
-                Standing::Refused(reason) => Taken::Refused(reason),
-                // Another report of the lease finished first, or the lease was given up
-                // while the outputs were checked.
-                Standing::Holds(..) => Taken::Refused(Reason::Stale),
-            }
-        };
         (answers, taken)
     }
 
@@ -1588,15 +1597,18 @@ impl State {
         self.keep_finished(answer.operation, answer.waiters.clone());
         // A result whose finish waited for the store is acknowledged to its sender's
         // newest stream: the store has taken the row.
-        let ack = self.owed.remove(&answer.lease).and_then(|worker| {
-            let link = self.links.get(&worker)?;
-            let ack = ResultAck {
-                lease_id: Some(wire_lease(answer.lease)),
-                accepted: true,
-                reason: Reason::Accepted as i32,
-            };
-            Some((link.outbound.clone(), ack))
-        });
+        let ack = self
+            .owed
+            .remove(&answer.lease)
+            .and_then(|worker| self.links.get(&worker))
+            .map(|link| {
+                let ack = ResultAck {
+                    lease_id: Some(wire_lease(answer.lease)),
+                    accepted: true,
+                    reason: Reason::Accepted as i32,
+                };
+                (link.outbound.clone(), ack)
+            });
         Settled {
             finished,
             write,

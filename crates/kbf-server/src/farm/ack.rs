@@ -7,31 +7,45 @@ use kbf_proto::worker::{self, ResultAck, ResultAckReason as Reason};
 
 use super::{Digest, LeaseId, OpState, OperationId, Stamp, State, WorkerId};
 
-/// What a `Result`'s lease stands for.
+/// Why a `Result` is not taken now.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Standing {
-    /// The worker holds the operation's current lease: the operation, the action its
-    /// `Start` named, and the server's times for the run.
-    Holds(OperationId, Digest, Stamp),
+pub(super) enum Verdict {
     /// The scheduler finished the operation with this lease's result, and the finish
     /// waits for the state store: the `Result` is acknowledged when it is written.
     Held,
-    /// The `Result` is not taken, for this reason.
+    /// The `Result` is refused, for this reason.
     Refused(Reason),
 }
 
+/// The lease whose result finished an operation in `state`, if it is finished.
+const fn finished_lease(state: &OpState) -> Option<LeaseId> {
+    match state {
+        OpState::Completed { lease, .. } | OpState::Failed { lease, .. } => Some(*lease),
+        _ => None,
+    }
+}
+
 impl State {
-    /// What `lease` stands for as `worker`'s `Result` names it. Only this process's leases
-    /// are in the machine's started table, so a lease of an earlier process (another
+    /// What `lease` stands for as `worker`'s `Result` names it: the operation, the action
+    /// its `Start` named and the server's times for the run, if `worker` holds the
+    /// operation's current lease; else why the `Result` is not taken. Only this process's
+    /// leases are in the machine's started table, so a lease of an earlier process (another
     /// term) is unknown; one whose operation was answered since is remembered
     /// ([`State::answered`]) for as long as the scheduler keeps the operation.
-    pub(super) fn standing(&self, lease: LeaseId, worker: &WorkerId) -> Standing {
+    ///
+    /// # Errors
+    /// The [`Verdict`] on the `Result`.
+    pub(super) fn standing(
+        &self,
+        lease: LeaseId,
+        worker: &WorkerId,
+    ) -> Result<(OperationId, Digest, Stamp), Verdict> {
         let Some(sent) = self.machine.sent(lease) else {
-            return Standing::Refused(if self.answered.contains_key(&lease) {
+            return Err(Verdict::Refused(if self.answered.contains_key(&lease) {
                 Reason::Duplicate
             } else {
                 Reason::UnknownLease
-            });
+            }));
         };
         let operation = sent.operation;
         match self.sched.state(operation) {
@@ -45,21 +59,17 @@ impl State {
                     lease: held,
                     worker: holder,
                 },
-            ) if *held == lease && holder == worker => {
-                Standing::Holds(operation, sent.action, sent.stamp)
-            }
-            Some(OpState::Completed { lease: l, .. } | OpState::Failed { lease: l, .. })
-                if *l == lease =>
-            {
-                if self.finish_held(operation) {
-                    Standing::Held
+            ) if *held == lease && holder == worker => Ok((operation, sent.action, sent.stamp)),
+            Some(state) if finished_lease(state) == Some(lease) => {
+                Err(if self.finish_held(operation) {
+                    Verdict::Held
                 } else {
-                    Standing::Refused(Reason::Duplicate)
-                }
+                    Verdict::Refused(Reason::Duplicate)
+                })
             }
             // Given up, granted again (to this node or another), held by another node, or
             // finished with another lease's result: not the current attempt.
-            _ => Standing::Refused(Reason::Stale),
+            _ => Err(Verdict::Refused(Reason::Stale)),
         }
     }
 }
@@ -76,10 +86,7 @@ pub(super) fn log_refusal(worker: &WorkerId, lease: LeaseId, reason: Reason) {
         Reason::UnknownLease => {
             tracing::warn!(%worker, %lease, "result refused: unknown lease, or one of another epoch");
         }
-        Reason::Mismatch => {
-            tracing::warn!(%worker, %lease, "result refused: it names another action");
-        }
-        Reason::Unspecified | Reason::Accepted => {}
+        _ => tracing::warn!(%worker, %lease, "result refused: it names another action"),
     }
 }
 

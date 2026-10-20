@@ -1158,11 +1158,7 @@ impl Daemon {
         if let Some(tx) = tx {
             send(tx, daemon_message::Message::Result(result.clone()));
         }
-        if !acks::has_room(
-            self.unacked.len(),
-            self.config.max_unacked,
-            self.unacked.contains_key(&id),
-        ) {
+        if self.unacked.len() >= self.config.max_unacked {
             tracing::error!(lease = %id, kept = self.unacked.len(), "too many unacknowledged results: this one is sent once and not kept");
             self.granted.remove(&id);
             return;
