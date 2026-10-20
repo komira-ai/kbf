@@ -9,7 +9,7 @@ on:
       - infra/site/**
       - .github/workflows/site-infra.yml
   push:
-    branches: [main, feature/arch-v2]
+    branches: [main]
     paths:
       - infra/site/**
       - .github/workflows/site-infra.yml

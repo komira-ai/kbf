@@ -102,7 +102,9 @@ fn bundle_json(sha: &str, flags: &str) -> String {
     format!("{bundle}\n")
 }
 
-/// The branch the development line is built and attested on (docs/artifacts.md).
+/// The branch the development line was built and attested on until main became the only
+/// integration branch (docs/artifacts.md). Kept: attestations it signed still exist and
+/// must verify as that branch's, never as main's.
 const DEV_REF: &str = "refs/heads/feature/arch-v2";
 
 /// What the release path leaves: `<root>/dist` packaged and summed as the workflow

@@ -4,6 +4,11 @@ Status: design. Nothing in this page is built except where it says **[F]** (read
 **[V]** is something to verify by measurement before relying on it. Open pull requests and issues are named by number;
 re-check their state before acting on this page, because the table in section 12 rots first.
 
+After the cutover, `main` is the only integration branch and the workflows know no other. The
+`feature/arch-v2` references below that describe the plan, the status table (section 12) and the
+decisions (section 13) are history as written, and are kept as such; the statements about what
+the workflows do now say `main`.
+
 ## 0. The plan in one page
 
 Every merge runs a **beta**: GitHub Actions stands up a whole farm on loopback (a frontend, three storage-and-daemon nodes,
@@ -133,8 +138,8 @@ no job; the lint instead checks that `release.yml` verifies the verdict (section
 `artifacts.yml` is the build stage and is not changed in kind. **[F]** It builds `kbf`, `kbf-daemon`, `kbf-server`,
 `kbf-deploy` and `kbf-installer` for linux x86_64, linux arm64 and darwin arm64 (docs/artifacts.md lists which binary for
 which platform), deterministic tarballs, SBOMs, `SHA256SUMS`; on a push to main
-or feature/arch-v2 `attest` adds provenance and SBOM attestations and `verify` checks them. An attestation names its ref,
-so a feature/arch-v2 asset does not verify as main's.
+`attest` adds provenance and SBOM attestations and `verify` checks them. An attestation names its ref,
+so an asset attested on another branch (historically feature/arch-v2) does not verify as main's.
 
 What the stages add:
 
@@ -170,7 +175,7 @@ Two layers, because "on every merge" and "a merge must not wait an hour" pull ap
   one, since smoke needs one platform). Measure that in B-0 before the check is made required; the order of preference is the
   `merge_group` build's output, then smoke's own build. Smoke is unattested and says so in its result document.
   `merge_group` runs repository code from the queue ref with no fork code, so the root-level helpers are acceptable there.
-- **Full, after the merge** (`push` to feature/arch-v2 and main): rolling update of every role under a running build,
+- **Full, after the merge** (`push` to main): rolling update of every role under a running build,
   kill-a-node, the Envoy swap, the all-in-one variant, N/N-1, on the attested bytes. It is a job of `artifacts.yml`
   (`needs: verify`, on `push` only) so the order after attestation needs no `workflow_run` (which runs from the default
   branch's workflow file and carries its own trust caveats). A red full run does not revert anything; it **blocks the

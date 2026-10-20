@@ -22,7 +22,7 @@ test-group = 'mac-provision-scratch'
 
 # The pull-request profile (`cargo nextest run --profile pr`, and `cargo llvm-cov nextest
 # --profile pr`): the fast gate. A pull request runs every test except the slow ones named
-# below; the push to feature/arch-v2 and main runs them all, with the default profile
+# below; the push to main runs them all, with the default profile
 # (.github/workflows/beta.yml, job test-x86).
 #
 # The slow set is every test that took 10 seconds or more in the full run on a hosted x86
