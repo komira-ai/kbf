@@ -150,6 +150,7 @@ pub fn router(
     enroll: Option<Arc<EnrollApi>>,
 ) -> Router {
     let enrollment = crate::enroll::api::routes(token.clone(), enroll);
+    let scheduler = crate::http_sched::router(Arc::clone(&farm));
     Router::new()
         .route(NODES, get(nodes))
         .route(MEMBERS, get(members_view))
@@ -165,6 +166,7 @@ pub fn router(
             update,
         }))
         .merge(enrollment)
+        .merge(scheduler)
 }
 
 /// The drain as it is now.

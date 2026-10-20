@@ -7,10 +7,15 @@ pub(crate) mod memory;
 mod outage;
 mod phase;
 mod recover;
+mod snapshot;
 mod state;
 mod view;
 
 pub use recover::{Fate, Recovered, RecoveredLease};
+pub use snapshot::{
+    Avoided, LeasePhase, LeaseView, MAX_AVOIDED, QueueGroup, QueueView, Snapshot, WaitingGroup,
+    platform_label,
+};
 pub use state::OpState;
 
 use std::cmp::Reverse;
@@ -86,6 +91,9 @@ struct Operation {
     /// Its leases lost ([`RequeueReason::is_loss`]), counted toward the cap
     /// ([`Scheduler::with_loss_requeues`]).
     losses: u32,
+    /// When it last entered the queue: its submission, or the give-up of its lease
+    /// ([`Scheduler::queue_snapshot`] ages the queue from it).
+    queued_at: FarmTime,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -110,6 +118,9 @@ struct Held {
     /// When and to which session its `Start` was emitted; `None` until its grant is
     /// committed.
     start_sent: Option<StartSent>,
+    /// When the grant was made (proposed), and when the worker reported it started.
+    granted_at: FarmTime,
+    started_at: Option<FarmTime>,
 }
 
 /// When a `Start` was emitted, and the worker session and daemon process it was sent to.
@@ -419,6 +430,7 @@ impl Scheduler {
                 not_started: 0,
                 losses: 0,
                 avoid: BTreeSet::new(),
+                queued_at: self.now,
             },
         );
         Vec::new()
@@ -468,6 +480,7 @@ impl Scheduler {
         // Only an operation that holds a lease is requeued, so every call is a give-up.
         op.losses += u32::from(reason.is_loss());
         op.state = OpState::Queued;
+        op.queued_at = self.now;
         self.queue.insert((Reverse(op.request.qos.clone()), id));
     }
 
@@ -561,6 +574,8 @@ impl Scheduler {
                     booked,
                     device,
                     start_sent: None,
+                    granted_at: self.now,
+                    started_at: None,
                 },
             );
             effects.push(Effect::Commit(ControlRecord::Lease(LeaseGrant {
@@ -712,6 +727,9 @@ impl Scheduler {
                 lease,
                 worker: worker.clone(),
             };
+            if let Some(held) = self.held.get_mut(&lease) {
+                held.started_at = Some(self.now);
+            }
         }
     }
 
