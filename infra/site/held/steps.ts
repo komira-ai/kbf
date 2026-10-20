@@ -4,15 +4,24 @@
 
 export interface Tools {
   /** Run a read-only command and return its stdout. Throws on a non-zero exit. */
-  capture(cmd: string, args: string[]): string;
+  capture(cmd: string, args: string[], cwd?: string): string;
   /** Run a command with its output shown (diff, install, tests, deploy). */
-  stream(cmd: string, args: string[]): void;
+  stream(cmd: string, args: string[], cwd?: string): void;
   log(line: string): void;
+  // The members below serve `upload` only (temporary: removed by site-publish.yml).
+  /** A new empty scratch directory outside the repository. */
+  mkScratch(): string;
+  /** Delete a directory made by mkScratch. */
+  removeScratch(dir: string): void;
+  readFile(path: string): string;
+  writeFile(path: string, data: string): void;
+  /** Relative paths ('/'-separated) of every file under dir, sorted. */
+  listFiles(dir: string): string[];
 }
 
 export class Refused extends Error {}
 
-export type Command = 'github' | 'dns' | 'site' | 'vars';
+export type Command = 'github' | 'dns' | 'site' | 'vars' | 'upload';
 
 export interface Options {
   command: Command;
@@ -24,6 +33,8 @@ export interface Options {
   oidcProviderArn?: string;
   /** `site` only: deploy without the domain (no certificate, alias or zone); see README "Before DNS". */
   noDomain: boolean;
+  /** `upload` only: the 40-hex commit whose site/ is built and uploaded. */
+  commit?: string;
 }
 
 const ALLOWED: Record<Command, string[]> = {
@@ -31,12 +42,14 @@ const ALLOWED: Record<Command, string[]> = {
   dns: ['--account', '--profile', '--domain'],
   site: ['--account', '--profile', '--repo', '--domain', '--oidc-provider-arn', '--no-domain'],
   vars: ['--account', '--profile', '--repo'],
+  upload: ['--account', '--profile', '--commit'], // temporary: removed by site-publish.yml
 };
 const REQUIRED: Record<Command, string[]> = {
   github: ['--repo'],
   dns: ['--account', '--profile'],
   site: ['--account', '--profile', '--repo'],
   vars: ['--account', '--profile', '--repo'],
+  upload: ['--account', '--profile', '--commit'],
 };
 
 export const USAGE = `usage: npm run held -- <command> [flags]
@@ -44,6 +57,7 @@ export const USAGE = `usage: npm run held -- <command> [flags]
   dns    --account <12 digits> --profile <aws profile> [--domain <name>] [--apply]
   site   --account <12 digits> --profile <aws profile> --repo <owner/name> [--domain <name>] [--oidc-provider-arn <arn>] [--no-domain] [--apply]
   vars   --account <12 digits> --profile <aws profile> --repo <owner/name>      (read-only; prints commands)
+  upload --account <12 digits> --profile <aws profile> --commit <40-hex sha> [--apply]   (temporary: builds site/ at that commit and uploads it)
 Dry run unless --apply. There is no --force.`;
 
 export function parse(argv: string[]): Options {
@@ -71,10 +85,12 @@ export function parse(argv: string[]): Options {
     if (f === '--repo') o.repo = v;
     if (f === '--domain') o.domain = v;
     if (f === '--oidc-provider-arn') o.oidcProviderArn = v;
+    if (f === '--commit') o.commit = v;
   }
   for (const r of REQUIRED[cmd]) if (!seen.has(r)) throw new Refused(`${r} is required`);
   if (o.account !== undefined && !/^\d{12}$/.test(o.account)) throw new Refused('--account must be 12 digits');
   if (o.repo !== undefined && !/^[\w.-]+\/[\w.-]+$/.test(o.repo)) throw new Refused('--repo must be <owner>/<name>');
+  if (o.commit !== undefined && !/^[0-9a-f]{40}$/.test(o.commit)) throw new Refused('--commit must be a full 40-hex commit sha');
   if (cmd === 'vars' && o.apply) throw new Refused('vars has no --apply: it only prints');
   return o;
 }
@@ -252,7 +268,91 @@ export function vars(t: Tools, o: Options): void {
   t.log(`# Region is always ${REGION}.`);
 }
 
+// temporary: removed by site-publish.yml
+// Uploads the website built from a COMMITTED sha, with the operator's own profile (never the CI role), until the publish
+// workflow exists. Order: build and check-dist, then the sync passes, then version.txt, then the invalidation.
+export const UPLOAD_CACHE = {
+  immutable: 'public, max-age=31536000, immutable',
+  page: 'public, max-age=60, s-maxage=300',
+  version: 'no-cache',
+};
+
+export function upload(t: Tools, o: Options): void {
+  checkCaller(t, o);
+  const sha = o.commit!;
+  let kind = '';
+  try {
+    kind = t.capture('git', ['cat-file', '-t', sha]).trim();
+  } catch {
+    /* not an object */
+  }
+  if (kind !== 'commit') throw new Refused(`${sha} is not a commit of this repository (fetch it first); nothing was built`);
+  const outs = JSON.parse(
+    t.capture('aws', aws(o, 'cloudformation', 'describe-stacks', '--region', REGION, '--stack-name', 'kbf-prod-site', '--query', 'Stacks[0].Outputs', '--output', 'json')),
+  ) as { OutputKey: string; OutputValue: string }[];
+  const bucket = outs.find((x) => x.OutputKey === 'BucketName')?.OutputValue;
+  const dist = outs.find((x) => x.OutputKey === 'DistributionId')?.OutputValue;
+  if (!bucket || !dist) throw new Refused('stack kbf-prod-site has no outputs; run site --apply first');
+
+  const scratch = t.mkScratch();
+  const wt = `${scratch}/wt`;
+  let added = false;
+  try {
+    t.stream('git', ['worktree', 'add', '--detach', wt, sha]);
+    added = true;
+    const site = `${wt}/site`;
+    const want = t.readFile(`${site}/.node-version`).trim();
+    const have = t.capture('node', ['--version'], site).trim().replace(/^v/, '');
+    if (have !== want) throw new Refused(`site/.node-version at ${sha} is ${want}, this node is ${have}; use exactly ${want} (nothing was built)`);
+    t.stream('npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund'], site);
+    t.stream('npm', ['run', 'build'], site);
+    try {
+      t.stream('node', ['-e', "require('./build/tools/tools/check-dist.js').checkDist('dist')"], site); // check-dist: CSP, links, hygiene
+    } catch {
+      throw new Refused('check-dist failed on the built dist; nothing was uploaded');
+    }
+    const dir = `${site}/dist`;
+    const files = t.listFiles(dir);
+    t.writeFile(`${scratch}/version.txt`, `${sha}\n`);
+
+    const target = `s3://${bucket}/`;
+    const dry = o.apply ? [] : ['--dryrun'];
+    const notReleases = ['--exclude', 'releases/*']; // last, so it wins: the sync never touches releases/
+    const pass = (include: string, type: string, cache: string) => [
+      's3', 'sync', dir, target, '--delete', '--exclude', '*', '--include', include, ...notReleases,
+      '--content-type', type, '--cache-control', cache, ...dry,
+    ];
+    const syncs = [
+      pass('assets/*.js', 'text/javascript', UPLOAD_CACHE.immutable),
+      pass('assets/*.css', 'text/css', UPLOAD_CACHE.immutable),
+      pass('*.html', 'text/html; charset=utf-8', UPLOAD_CACHE.page),
+      // Anything else in the bucket that the build no longer has goes too; files already uploaded above are skipped.
+      ['s3', 'sync', dir, target, '--delete', ...notReleases, '--exclude', 'version.txt', ...dry],
+    ];
+    const cp = ['s3', 'cp', `${scratch}/version.txt`, `${target}version.txt`, '--content-type', 'text/plain', '--cache-control', UPLOAD_CACHE.version, ...dry];
+    const invalidate = ['cloudfront', 'create-invalidation', '--distribution-id', dist, '--paths', '/*'];
+
+    t.log(`# commit ${sha}: ${files.length} files built and checked; they go to s3://${bucket}/ (never releases/):`);
+    for (const f of files) t.log(`#   ${f}  ${f.startsWith('assets/') ? 'immutable' : 'page'}`);
+    t.log(`#   version.txt  (the commit sha)`);
+    if (!o.apply) t.log('# dry run: aws s3 --dryrun lists the uploads and deletes below; nothing is written. Re-run with --apply.');
+    for (const a of syncs) {
+      t.log(`${o.apply ? '+' : 'DRY-RUN:'} aws ${[...a, '--profile', o.profile!].join(' ')}`);
+      t.stream('aws', aws(o, ...a));
+    }
+    t.log(`${o.apply ? '+' : 'DRY-RUN:'} aws ${[...cp, '--profile', o.profile!].join(' ')}`);
+    t.stream('aws', aws(o, ...cp));
+    if (o.apply) {
+      t.log(`+ aws ${[...invalidate, '--profile', o.profile!].join(' ')}`);
+      t.stream('aws', aws(o, ...invalidate));
+    } else t.log(`DRY-RUN: aws ${[...invalidate, '--profile', o.profile!].join(' ')}`);
+  } finally {
+    if (added) t.stream('git', ['worktree', 'remove', '--force', wt]);
+    t.removeScratch(scratch);
+  }
+}
+
 export function main(argv: string[], t: Tools): void {
   const o = parse(argv);
-  ({ github, dns, site, vars })[o.command](t, o);
+  ({ github, dns, site, vars, upload })[o.command](t, o);
 }

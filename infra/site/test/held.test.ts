@@ -6,8 +6,10 @@ const REPO = 'example-org/example-repo';
 interface Call { cmd: string; args: string[]; kind: 'capture' | 'stream' }
 
 /** A fake: `answers` maps "cmd arg arg..." prefixes to stdout; anything else answers "{}". */
-function fake(answers: Record<string, string | Error> = {}) {
+function fake(answers: Record<string, string | Error> = {}, failStream = '') {
   const calls: Call[] = [];
+  const written: Record<string, string> = {};
+  const removed: string[] = [];
   const lines: string[] = [];
   const t: Tools = {
     capture(cmd, args) {
@@ -21,10 +23,18 @@ function fake(answers: Record<string, string | Error> = {}) {
       }
       return '{}';
     },
-    stream(cmd, args) { calls.push({ cmd, args, kind: 'stream' }); },
+    stream(cmd, args) {
+      calls.push({ cmd, args, kind: 'stream' });
+      if (failStream && [cmd, ...args].join(' ').includes(failStream)) throw new Error('failed');
+    },
     log: (l) => lines.push(l),
+    mkScratch: () => '/scratch/x',
+    removeScratch: (d) => { removed.push(d); },
+    readFile: () => '24.21.0\n',
+    writeFile: (p, d) => { written[p] = d; },
+    listFiles: () => ['404.html', 'assets/abc/app.js', 'assets/abc/site.css', 'index.html'],
   };
-  return { t, calls, lines, text: () => lines.join('\n'), ran: (s: string) => calls.some((c) => [c.cmd, ...c.args].join(' ').includes(s)) };
+  return { t, calls, lines, written, removed, text: () => lines.join('\n'), ran: (s: string) => calls.some((c) => [c.cmd, ...c.args].join(' ').includes(s)) };
 }
 
 const GOOD_ENV = JSON.stringify({ deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } });
@@ -35,8 +45,11 @@ const STACK = JSON.stringify([
   { OutputKey: 'DistributionId', OutputValue: 'EDIST123' },
   { OutputKey: 'PublishRoleArn', OutputValue: `arn:aws:iam::${ACCOUNT}:role/kbf-prod-publish` },
 ]);
+const SHA = 'a'.repeat(40);
 const answers = (over: Record<string, string | Error> = {}) => ({
   'sts get-caller-identity': ACCOUNT,
+  'cat-file -t': 'commit\n',
+  'node --version': 'v24.21.0\n',
   'environments/prod/deployment-branch-policies': GOOD_POLS,
   'environments/prod': GOOD_ENV,
   'oidc/customization/sub': GOOD_TMPL,
@@ -239,5 +252,108 @@ describe('vars', () => {
   });
   test('checkGithub returns no mismatch for the settings that github sets', () => {
     expect(checkGithub(fake(answers()).t, REPO)).toEqual([]);
+  });
+});
+
+// temporary: removed by site-publish.yml
+describe('upload', () => {
+  const flags = (...extra: string[]) => ['upload', '--account', ACCOUNT, '--profile', 'p', '--commit', SHA, ...extra];
+  const aws3 = (f: ReturnType<typeof fake>) => f.calls.filter((c) => c.cmd === 'aws' && c.args[0] === 's3');
+  const str = (c: Call) => [c.cmd, ...c.args].join(' ');
+
+  test('a dry run writes nothing: every s3 call is --dryrun, no invalidation, no version.txt upload', () => {
+    const f = fake(answers());
+    main(flags(), f.t);
+    expect(aws3(f).length).toBeGreaterThanOrEqual(5);
+    for (const c of aws3(f)) expect(c.args).toContain('--dryrun');
+    expect(f.ran('create-invalidation')).toBe(false);
+    expect(f.text()).toContain('DRY-RUN: aws cloudfront create-invalidation');
+    expect(f.text()).toContain('assets/abc/app.js');
+  });
+
+  test('--apply: sync passes, then version.txt, then the invalidation last', () => {
+    const f = fake(answers());
+    main(flags('--apply'), f.t);
+    const aws = f.calls.filter((c) => c.cmd === 'aws').map(str);
+    const lastSync = aws.map((l, i) => (l.includes('s3 sync') ? i : -1)).reduce((a, b) => Math.max(a, b));
+    const cp = aws.findIndex((l) => l.includes('s3 cp') && l.includes('version.txt'));
+    const inv = aws.findIndex((l) => l.includes('create-invalidation'));
+    expect(aws.some((l) => l.includes('--dryrun'))).toBe(false);
+    expect(aws.findIndex((l) => l.includes('s3 sync'))).toBeLessThan(cp);
+    expect(lastSync).toBeLessThan(cp);
+    expect(cp).toBeLessThan(inv);
+    expect(inv).toBe(aws.length - 1);
+    expect(aws[inv]).toContain('--paths /*');
+    expect(aws[inv]).toContain('--distribution-id EDIST123');
+    expect(f.written['/scratch/x/version.txt']).toBe(`${SHA}\n`);
+  });
+
+  test('every sync excludes releases/ last, deletes, and targets the bucket from the stack outputs', () => {
+    const f = fake(answers());
+    main(flags('--apply'), f.t);
+    const syncs = f.calls.filter((c) => c.cmd === 'aws' && c.args[1] === 'sync');
+    expect(syncs).toHaveLength(4);
+    for (const c of syncs) {
+      expect(c.args).toContain('--delete');
+      expect(c.args).toContain(`s3://kbf-prod-site-${ACCOUNT}/`);
+      const i = c.args.lastIndexOf('--exclude');
+      expect(c.args[i + 1] === 'releases/*' || c.args[i + 1] === 'version.txt').toBe(true);
+      expect(c.args.join(' ')).toContain("--exclude releases/*");
+      const inc = c.args.indexOf('--include');
+      if (inc >= 0) expect(c.args.indexOf('--exclude', inc)).toBeGreaterThan(inc); // releases exclusion follows every include
+    }
+    expect(f.calls.some((c) => c.args.includes('releases/latest.json') || c.args.some((a) => a.endsWith('/releases/')))).toBe(false);
+  });
+
+  test('content types and cache-control per class: assets immutable, pages short', () => {
+    const f = fake(answers());
+    main(flags('--apply'), f.t);
+    const line = (inc: string) => str(f.calls.find((c) => c.args.includes(inc))!);
+    expect(line('assets/*.js')).toContain('--content-type text/javascript --cache-control public, max-age=31536000, immutable');
+    expect(line('assets/*.css')).toContain('--content-type text/css --cache-control public, max-age=31536000, immutable');
+    expect(line('*.html')).toContain('--content-type text/html; charset=utf-8 --cache-control public, max-age=60, s-maxage=300');
+  });
+
+  test('refuses a sha that is not a commit before building, and removes nothing it did not make', () => {
+    const f = fake(answers({ 'cat-file -t': new Error('bad object') }));
+    expect(() => main(flags('--apply'), f.t)).toThrow(/not a commit/);
+    expect(f.ran('worktree add')).toBe(false);
+    const g = fake(answers({ 'cat-file -t': 'tree\n' }));
+    expect(() => main(flags(), g.t)).toThrow(/not a commit/);
+  });
+
+  test('refuses when node is not the version in site/.node-version, before npm ci', () => {
+    const f = fake(answers({ 'node --version': 'v20.19.4\n' }));
+    expect(() => main(flags('--apply'), f.t)).toThrow(/24\.21\.0.*20\.19\.4/);
+    expect(f.ran('npm ci')).toBe(false);
+    expect(f.ran('s3')).toBe(false);
+    expect(f.ran('worktree remove')).toBe(true); // the temporary worktree is removed even on refusal
+    expect(f.removed).toEqual(['/scratch/x']);
+  });
+
+  test('refuses when check-dist fails, before any s3 call', () => {
+    const f = fake(answers(), 'check-dist');
+    expect(() => main(flags('--apply'), f.t)).toThrow(/check-dist failed/);
+    expect(f.calls.some((c) => c.args[0] === 's3' || c.args[0] === 'cloudfront')).toBe(false);
+    expect(f.ran('worktree remove')).toBe(true);
+  });
+
+  test('builds in a detached worktree at the sha, with install scripts off, and removes it afterwards', () => {
+    const f = fake(answers());
+    main(flags(), f.t);
+    const order = f.calls.map(str);
+    expect(order.findIndex((l) => l.includes(`worktree add --detach /scratch/x/wt ${SHA}`))).toBeGreaterThanOrEqual(0);
+    expect(f.ran('npm ci --ignore-scripts --no-audit --no-fund')).toBe(true);
+    expect(f.ran('npm run build')).toBe(true);
+    expect(order.findIndex((l) => l.includes('check-dist'))).toBeLessThan(order.findIndex((l) => l.includes('s3 sync')));
+    expect(order[order.length - 1]).toContain('worktree remove --force /scratch/x/wt');
+  });
+
+  test('the account guard applies, and a short or non-hex commit is refused', () => {
+    const f = fake(answers({ 'sts get-caller-identity': '999999999999' }));
+    expect(() => main(flags(), f.t)).toThrow(/not the --account/);
+    expect(f.calls).toHaveLength(1);
+    expect(() => parse(['upload', '--account', ACCOUNT, '--profile', 'p', '--commit', 'main'])).toThrow(/40-hex/);
+    expect(() => parse(['upload', '--account', ACCOUNT, '--profile', 'p'])).toThrow(/--commit/);
   });
 });
