@@ -912,3 +912,90 @@ fn a_deploy_with_an_unattested_host_binary_is_refused_without_running_it() {
     assert_eq!(s.exit, 0, "{}", s.line());
     assert_eq!(ran, 1);
 }
+
+/// (d) Proves the real attestation check hands `gh` the tarball and the bundle's attestation
+/// as files the user can read, in a home of its own, through the stage's `GhCheck::verify`:
+/// an accepting `gh` is `Ok` and the scratch directory is gone after; a refusing `gh`, an
+/// untrusted `gh` (which is never started), a work directory that cannot be made and `gh`
+/// failing to start are all errors. Catches a check that verifies other bytes than it was
+/// given, drops the trust check, or reads a refusal as acceptance.
+///
+/// Mutants planted: the attestation file written with the tarball's bytes; the `verify`
+/// result mapped to `Ok`.
+#[test]
+fn the_gh_attestation_check_verifies_the_bytes_it_is_given() {
+    use crate::attest::GhCheck;
+    use crate::fixtures::{me, ran, trusted_host};
+    use crate::layout::{Layout, Platform};
+    use crate::run::Spawn;
+    use std::sync::{Arc, Mutex};
+
+    let (_, dir) = crate::testkit::host_root("deploy-offer-gh-attest");
+    let host = Layout::new(kbf_host::Root::new("/").unwrap(), Platform::Linux);
+    let mut settings = crate::settings::Settings::defaults(&host);
+    settings.run_as = me();
+    let commit = c(TARGET);
+    let seen: Arc<Mutex<Vec<(Spawn, Vec<u8>, Vec<u8>, bool)>>> = Arc::default();
+    let check =
+        |code: i32, trust: kbf_host::testkit::FakeExec, work: std::path::PathBuf, switch| {
+            let log = seen.clone();
+            struct Gh(Box<dyn Fn(&Spawn) -> std::io::Result<crate::run::Ran>>);
+            impl crate::run::Runner for Gh {
+                fn run(&self, s: &Spawn) -> std::io::Result<crate::run::Ran> {
+                    (self.0)(s)
+                }
+            }
+            let runner = Gh(Box::new(move |s: &Spawn| {
+                let arg = |i: usize| std::path::PathBuf::from(&s.args[i]);
+                let (tar, bundle) = (arg(2), arg(4));
+                let readable = std::fs::metadata(&tar).is_ok_and(|m| {
+                    std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o044 == 0o044
+                });
+                log.lock().unwrap().push((
+                    s.clone(),
+                    std::fs::read(&tar).unwrap(),
+                    std::fs::read(&bundle).unwrap(),
+                    readable,
+                ));
+                if code < 0 {
+                    Err(std::io::Error::other("no gh"))
+                } else {
+                    Ok(ran(code, "", "no"))
+                }
+            }));
+            GhAttest::new(
+                work,
+                GhCheck::pinned(&host, &settings),
+                Box::new(trust),
+                Box::new(runner),
+                switch,
+            )
+        };
+    let work = dir.join("work");
+    let ok = check(0, trusted_host(), work.clone(), true);
+    assert_eq!(ok.verify(&commit, b"the tarball", b"the bundle"), Ok(()));
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1, b"the tarball");
+        assert_eq!(seen[0].2, b"the bundle");
+        assert!(seen[0].3);
+        assert_eq!(seen[0].0.run_as, Some(me()));
+    }
+    assert!(std::fs::read_dir(&work).unwrap().next().is_none());
+    let no = check(1, trusted_host(), work.clone(), false);
+    assert!(
+        no.verify(&commit, b"t", b"b")
+            .unwrap_err()
+            .contains("NotAttested")
+    );
+    let broken = check(-1, trusted_host(), work.clone(), false);
+    assert!(broken.verify(&commit, b"t", b"b").is_err());
+    let before = seen.lock().unwrap().len();
+    let untrusted = check(0, kbf_host::testkit::FakeExec::new(0), work.clone(), false);
+    assert!(untrusted.verify(&commit, b"t", b"b").is_err());
+    assert_eq!(seen.lock().unwrap().len(), before);
+    std::fs::write(dir.join("blocker"), b"").unwrap();
+    let stuck = check(0, trusted_host(), dir.join("blocker").join("work"), false);
+    assert!(stuck.verify(&commit, b"t", b"b").is_err());
+}

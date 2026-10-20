@@ -398,6 +398,26 @@ pub struct GhAttest {
     switch_user: bool,
 }
 
+impl GhAttest {
+    /// The check of `gh`, working in `work`; `switch_user` hands the scratch files to
+    /// `gh.run_as` (only root can).
+    pub fn new(
+        work: PathBuf,
+        gh: GhCheck,
+        trust: Box<dyn Exec>,
+        runner: Box<dyn Runner>,
+        switch_user: bool,
+    ) -> GhAttest {
+        GhAttest {
+            work,
+            gh,
+            trust,
+            runner,
+            switch_user,
+        }
+    }
+}
+
 impl Attest for GhAttest {
     fn verify(&self, commit: &CommitId, tarball: &[u8], attestation: &[u8]) -> Result<(), String> {
         let io = |e: std::io::Error| format!("attestation: {e}");
@@ -454,13 +474,13 @@ impl HostProbe {
         let settings = Settings::load(&HostExec::new(base.clone()), &layout)
             .map_err(|e| format!("installer settings: {e}"))?;
         let work = layout.join(&layout.work_dir());
-        let attest = GhAttest {
-            work: work.clone(),
-            gh: GhCheck::pinned(&layout, &settings),
-            trust: Box::new(HostExec::new(base.clone())),
-            runner: Box::new(SystemRunner),
-            switch_user: as_root,
-        };
+        let attest = GhAttest::new(
+            work.clone(),
+            GhCheck::pinned(&layout, &settings),
+            Box::new(HostExec::new(base.clone())),
+            Box::new(SystemRunner),
+            as_root,
+        );
         Ok(HostProbe {
             work,
             run_as: as_root.then_some(settings.run_as),
