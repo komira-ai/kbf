@@ -154,6 +154,11 @@ address that is in the file.
    the keys this run writes is rewritten. What counts as another setting is relative to the run:
    a `listen` in the file that this run gives no `--listen` for is the operator's, and the file
    is kept or refused, never rewritten without it.
+
+   Add another setting to the table it belongs to, never as a second table of the same name:
+   TOML refuses a table written twice, and so does `kbf` (exit 2, `duplicate key`). A `daemon`
+   or `storage-and-daemon` file has a `[daemon]` table (`update-dir`, `orders-dir`), so a
+   `data_dir` or other daemon key goes under that header, not under a new `[daemon]`.
 10. The units, last: the mode's unit and `kbf-installer.service`, `systemctl enable`, with
    `--now` for a node's unit when a release is installed and `--no-start` is not given (the
    installer's own service does not wait for either). A unit that makes a frontend

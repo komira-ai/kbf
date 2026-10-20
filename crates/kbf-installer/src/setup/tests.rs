@@ -333,8 +333,8 @@ fn settled(units: &[&str]) -> FakeOs {
 }
 
 const DAEMON_TOML: &str =
-    "# Written by `kbf-installer setup`. The mode's other settings are added below the
-# keys it writes; run setup again to change these.
+    "# Written by `kbf-installer setup`; run setup again to change these keys. Another setting
+# goes into the table it belongs to (add the key there, never a second table of the same name).
 mode = \"daemon\"
 
 [frontend]
@@ -349,8 +349,8 @@ orders-dir = \"/var/lib/kbf-installer/orders\"
 ";
 
 const FRONTEND_TOML: &str =
-    "# Written by `kbf-installer setup`. The mode's other settings are added below the
-# keys it writes; run setup again to change these.
+    "# Written by `kbf-installer setup`; run setup again to change these keys. Another setting
+# goes into the table it belongs to (add the key there, never a second table of the same name).
 mode = \"frontend\"
 
 [listener]

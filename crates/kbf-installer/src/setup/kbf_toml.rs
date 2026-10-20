@@ -71,8 +71,8 @@ impl Ours<'_> {
     pub fn render(&self) -> String {
         let keys = self.keys();
         let mut out = String::from(
-            "# Written by `kbf-installer setup`. The mode's other settings are added below the\n\
-             # keys it writes; run setup again to change these.\n",
+            "# Written by `kbf-installer setup`; run setup again to change these keys. Another setting\n\
+             # goes into the table it belongs to (add the key there, never a second table of the same name).\n",
         );
         out.push_str(&format!("mode = \"{}\"\n", self.mode));
         for at in TABLE_ORDER {
