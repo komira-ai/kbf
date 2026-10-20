@@ -55,7 +55,7 @@ pub(crate) fn code_of(status: ExitStatus) -> i32 {
 /// How long a dropped child is waited for after its `SIGKILL`. A killed process exits
 /// once it leaves the system call it is in; a child still there at the limit is left
 /// to tokio's orphan queue (`kill_on_drop`).
-const REAP_ON_DROP: std::time::Duration = std::time::Duration::from_secs(5);
+const REAP_ON_DROP: Duration = Duration::from_secs(5);
 
 /// A running `crun`, killed and reaped when dropped. tokio's `kill_on_drop` alone sends
 /// the `SIGKILL` and leaves the reaping to its orphan queue, so an aborted `crun run`
@@ -67,13 +67,17 @@ struct Reaped(tokio::process::Child);
 
 impl Drop for Reaped {
     fn drop(&mut self) {
-        let child = &mut self.0;
-        let _ = child.start_kill();
-        let deadline = std::time::Instant::now() + REAP_ON_DROP;
-        // `Ok(None)`: not exited yet. An error is not a process to wait for.
-        while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        let _ = self.0.start_kill();
+        wait_exited(&mut self.0, REAP_ON_DROP);
+    }
+}
+
+/// Polls `child` until it has exited (and so is reaped) or `limit` has passed.
+fn wait_exited(child: &mut tokio::process::Child, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    // `Ok(None)`: not exited yet. An error is not a process to wait for.
+    while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -379,6 +383,31 @@ mod tests {
                 "round {round}: pid {pid} is still there after its future was dropped"
             );
         }
+    }
+
+    /// Catches a wait for a killed child that returns early or never returns: with the
+    /// limit passed it gives up on a child that still runs (and leaves it running), and
+    /// with room it returns once the killed child has been reaped.
+    #[test]
+    fn the_wait_for_a_child_is_bounded_and_ends_when_it_is_reaped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let mut child = Command::new("sleep").arg("600").spawn().expect("sleep");
+            wait_exited(&mut child, Duration::from_millis(20));
+            assert!(
+                matches!(child.try_wait(), Ok(None)),
+                "a child that was not killed is gone"
+            );
+            child.start_kill().expect("kill");
+            wait_exited(&mut child, Duration::from_secs(30));
+            assert!(
+                matches!(child.try_wait(), Ok(Some(_))),
+                "the killed child is not reaped"
+            );
+        });
     }
 
     /// The `Io` hook `crun run` is given has nothing to close once the child has the
