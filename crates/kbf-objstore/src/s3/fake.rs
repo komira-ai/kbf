@@ -328,7 +328,7 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<State>>) -> Option<()> {
         };
         if held {
             // Until the caller closes the connection; then the request is lost.
-            while sock.read(&mut chunk).await.is_ok_and(|n| n > 0) {}
+            let _ = tokio::io::copy(&mut sock, &mut tokio::io::sink()).await;
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
             state.held_aborts -= 1;
             return None;
