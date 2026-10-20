@@ -59,6 +59,7 @@ mod capabilities;
 mod cas;
 mod closure;
 mod cpu;
+mod default_platform;
 mod described;
 mod execution;
 mod finished_row;
@@ -102,6 +103,7 @@ pub use crate::cache::{
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
+pub use crate::default_platform::{BadDefaultPlatform, DefaultPlatform};
 pub use crate::described::Described;
 pub use crate::execution::{
     BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, Closer, Closing, DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN,
@@ -233,13 +235,27 @@ where
         Progress::off(),
         authorizers,
         &Recorder::off(),
-        DEFAULT_RESOURCES.memory_bytes,
+        Defaults {
+            memory: DEFAULT_RESOURCES.memory_bytes,
+            platform: DefaultPlatform::NONE,
+        },
     )
 }
 
+/// What an `action` that names less than the farm needs is given.
+#[derive(Clone, Copy, Debug)]
+pub struct Defaults {
+    /// The memory an `action` that names no size books, in bytes
+    /// ([`ExecutionService::with_default_memory`]).
+    pub memory: u64,
+    /// The OS and architecture of an `action` that names neither
+    /// ([`ExecutionService::with_default_platform`]).
+    pub platform: DefaultPlatform,
+}
+
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
-/// `recorder`, open streams re-sent at each tick of `progress`, and an `action` that
-/// names no memory size booking `default_memory` bytes ([`ExecutionService::with_default_memory`]).
+/// `recorder`, open streams re-sent at each tick of `progress`, and an `action` given
+/// `defaults` where it names no memory size, OS or architecture.
 pub fn routes_recorded<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
@@ -247,7 +263,7 @@ pub fn routes_recorded<M, O, D>(
     progress: Progress,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    default_memory: u64,
+    defaults: Defaults,
 ) -> Routes
 where
     M: MetaLog,
@@ -263,7 +279,8 @@ where
         )
         .recording(recorder.clone())
         .with_progress(progress)
-        .with_default_memory(default_memory),
+        .with_default_memory(defaults.memory)
+        .with_default_platform(defaults.platform),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -291,7 +308,7 @@ pub fn routes_proxied<D>(
     streams: OpenStreams,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    default_memory: u64,
+    defaults: Defaults,
 ) -> Routes
 where
     D: Dispatch,
@@ -303,7 +320,7 @@ where
         streams,
         authorizers,
         recorder,
-        default_memory,
+        defaults,
         |execution, _, _| execution,
     )
 }
@@ -329,7 +346,7 @@ pub fn routes_relayed<D>(
     streams: OpenStreams,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    default_memory: u64,
+    defaults: Defaults,
     relaying: Relaying,
 ) -> Routes
 where
@@ -344,7 +361,7 @@ where
         streams,
         authorizers,
         recorder,
-        default_memory,
+        defaults,
         move |execution, closing, progress| {
             let streams = OpenStreams { closing, progress };
             Relay::new(execution, relaying.farm, relaying.successor, counted)
@@ -364,7 +381,7 @@ fn proxied<D, E>(
     streams: OpenStreams,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
-    default_memory: u64,
+    defaults: Defaults,
     wrap: impl FnOnce(ExecutionService<D>, Closing, Progress) -> E,
 ) -> Routes
 where
@@ -380,7 +397,8 @@ where
     )
     .recording(recorder.clone())
     .with_progress(progress.clone())
-    .with_default_memory(default_memory);
+    .with_default_memory(defaults.memory)
+    .with_default_platform(defaults.platform);
     let execution = ExecutionServer::new(wrap(service, closing, progress))
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);

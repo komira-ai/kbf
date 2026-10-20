@@ -24,6 +24,7 @@ use super::{Registry, RegistryError};
 use crate::members::Members;
 use crate::store_config::acks::{Acks, NodeStatus as Reported, denied};
 use crate::store_config::{Snapshot, SourceError, StoreConfigSource};
+use crate::stores::{DEFAULT_MIN_PUT_RATE, region_or_default};
 
 /// What the worker listener serves from the registry: the registration the nodes fetch and
 /// the acks their heartbeats leave. One value, so `Membership` (which announces the
@@ -72,11 +73,16 @@ impl RegistrySource {
             connection: connection.name.to_string(),
             role: "cold".to_owned(),
             endpoint: connection.endpoint,
-            region: connection.region,
+            // What the frontend verified the store with (`registry.rs` builds the URI the
+            // same way): a node must not fall back to its own flag's region or rate.
+            region: region_or_default(&connection.region),
             bucket: binding.bucket,
             prefix: binding.prefix,
             conditional_put: connection.conditional_put,
-            min_put_rate: connection.min_put_rate.map_or(0, std::num::NonZeroU64::get),
+            min_put_rate: connection
+                .min_put_rate
+                .unwrap_or(DEFAULT_MIN_PUT_RATE)
+                .get(),
             access_key_id: connection.access_key_id,
             secret_access_key: secret.expose().to_owned(),
             // A new generation is the only way the secret changes, so the generation is

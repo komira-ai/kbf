@@ -66,6 +66,16 @@ pub(crate) const DEFAULT_MIN_PUT_RATE: NonZeroU64 = NonZeroU64::new(1 << 20).exp
 /// The signing region an S3 URI gets without `region`.
 pub(crate) const DEFAULT_REGION: &str = "us-east-1";
 
+/// `region`, or [`DEFAULT_REGION`] when it is empty: the region a store is verified and
+/// opened with, whoever reads the registration.
+pub(crate) fn region_or_default(region: &str) -> String {
+    if region.is_empty() {
+        DEFAULT_REGION.to_owned()
+    } else {
+        region.to_owned()
+    }
+}
+
 /// A store the server can be pointed at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreUri {

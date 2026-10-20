@@ -14,5 +14,9 @@ rustix = { workspace = true, features = ["fs"] }
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# Scratch directories the tests own (kbf_testkit::dir).
+kbf-testkit.workspace = true
+
 [lints]
 workspace = true
