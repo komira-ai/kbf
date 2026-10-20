@@ -602,7 +602,9 @@ async fn membership_takes_the_proxys_storage_node_and_covers_by_its_name() {
     let refused = ip.expect_err("an IP address is no name without x-kbf-node-ips");
     assert_eq!(refused.code(), Code::PermissionDenied);
     assert!(
-        refused.message().contains("do not cover"),
+        refused.message().contains("do not cover")
+            && refused.message().contains("upgrade kbf-proxy")
+            && !refused.message().contains("reissue"),
         "{}",
         refused.message()
     );

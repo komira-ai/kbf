@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "created": 1000,
+  "target": "gamma",
+  "commit": "abababababababababababababababababababab",
+  "set_hash": "86fb10522bd8a5532f4cefc7d0d9559b9f00c54202491d27bbc4568e49f975b1",
+  "platforms": [
+    "darwin-arm64",
+    "linux-x86_64"
+  ],
+  "beta": {
+    "kind": "attested",
+    "run_id": "beta-0001"
+  },
+  "meta_log": 4,
+  "previous": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+  "previous_meta_log": 4,
+  "reversible": true
+}
