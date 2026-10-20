@@ -24,7 +24,6 @@
 
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use super::child_real::{Argv, ProcChild};
@@ -250,10 +249,23 @@ impl Source for HostSource<'_> {
         let program = self.child.program(release);
         let file = |path: &Path| std::fs::symlink_metadata(path).ok().filter(|m| m.is_file());
         // The binary is what exec runs, so a link is followed; the marker is a plain file.
-        let Some(binary) = std::fs::metadata(&program).ok().filter(|m| m.is_file()) else {
+        if std::fs::metadata(&program)
+            .ok()
+            .filter(|m| m.is_file())
+            .is_none()
+        {
             return Err(Reason::BinaryMissing);
-        };
-        if binary.permissions().mode() & 0o111 == 0 {
+        }
+        // Executable by the user the child runs as (the proxy's own): the kernel's answer for
+        // this very path, which is what the spawn needs, not whether some execute bit is set.
+        if rustix::fs::accessat(
+            rustix::fs::CWD,
+            &program,
+            rustix::fs::Access::EXEC_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )
+        .is_err()
+        {
             return Err(Reason::BinaryNotExecutable);
         }
         let marker = program

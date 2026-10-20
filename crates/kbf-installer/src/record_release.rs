@@ -7,7 +7,8 @@
 //! `state.json`. This verb checks what can be checked on the files and then vouches:
 //!
 //! - the release directory and `kbf` are plain, owned by the user who runs the verb (root) and
-//!   not writable by group or others, and `kbf` is executable;
+//!   not writable by group or others, and `kbf` and the directory are executable by others (the
+//!   frontend child runs as the proxy's user, not root, so the owner's bit does not count);
 //! - `kbf` starts with the header of the executable this host runs ([`BinaryKind`]), not a
 //!   script or another platform's file.
 //!
@@ -46,6 +47,10 @@ pub enum RecordError {
     #[error("cannot write {path}: {source}")]
     Write { path: String, source: io::Error },
 }
+
+/// The frontend child runs as the proxy's user, which is not root, and the files are root's (the
+/// check requires it): so only the execute bit for others lets it start.
+const NOT_RUNNABLE: &str = "is not executable by the frontend's user (not root); fix: chmod 755 it";
 
 fn refused(path: &Path, why: &'static str) -> RecordError {
     RecordError::Refused {
@@ -121,11 +126,14 @@ fn check(dir: &Path, euid: u32, wanted: BinaryKind) -> Result<(), RecordError> {
         }
         Ok(meta)
     };
-    plain(dir, true)?;
+    let release = plain(dir, true)?;
+    if release.mode() & 0o001 == 0 {
+        return Err(refused(dir, NOT_RUNNABLE));
+    }
     let binary = dir.join(RELEASE_BINARY);
     let meta = plain(&binary, false)?;
-    if meta.mode() & 0o100 == 0 {
-        return Err(refused(&binary, "is not executable"));
+    if meta.mode() & 0o001 == 0 {
+        return Err(refused(&binary, NOT_RUNNABLE));
     }
     let mut header = [0_u8; 64];
     let mut file = fs::File::open(&binary).map_err(|source| RecordError::Read {
