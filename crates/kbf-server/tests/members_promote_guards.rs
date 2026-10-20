@@ -182,12 +182,15 @@ fn a_map_that_moved_under_the_promoting_beat_is_judged_again() {
     let epoch = s.nearly_promoted();
     let operator = members(&s.store, 2, None);
     let a = s.a.id;
+    // What the joiner reports is read from the map: before the hook is armed, which the
+    // first read of the map would take.
+    let fill = s.done(epoch);
     s.store.after_get("map", move || {
         operator
             .plan_down(a, Duration::from_secs(600))
             .expect("plan down");
     });
-    s.joiner_after(SECOND, s.done(epoch));
+    s.joiner_after(SECOND, fill);
     assert_eq!(s.state(), Some(MemberState::Joining));
     assert!(s.blocked().contains(&Block::Down(s.a.id)));
     assert!(s.store.fake.get("unfilled/3").expect("read").is_some());
