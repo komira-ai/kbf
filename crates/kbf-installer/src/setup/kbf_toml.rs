@@ -175,8 +175,17 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
     if differ.is_empty() {
         Decision::Keep
     } else {
+        let api = differ
+            .iter()
+            .any(|d| d.starts_with("[listener] api-listen"));
+        let way = if api {
+            "edit them by hand, or pass --api-listen with the address in the file (a run without it \
+             means the default 127.0.0.1:8982)"
+        } else {
+            "edit them by hand"
+        };
         Decision::Refuse(format!(
-            "{} holds other settings and these keys differ from the flags ({}): edit them by hand",
+            "{} holds other settings and these keys differ from the flags ({}): {way}",
             super::paths::KBF_TOML,
             differ.join("; ")
         ))

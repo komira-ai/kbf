@@ -43,7 +43,7 @@ fn base(mode: Mode) -> KbfFlags {
 /// untouched (exit 2).
 #[test]
 fn every_invalid_setting_is_refused_by_flag_and_without_its_value() {
-    let cases: [(Mode, &str, Mutate, &str); 31] = [
+    let cases: [(Mode, &str, Mutate, &str); 33] = [
         (
             Mode::Frontend,
             "listen",
@@ -230,12 +230,57 @@ fn every_invalid_setting_is_refused_by_flag_and_without_its_value() {
             |k, v| k.daemon_ca_cert = some(v),
             "/etc/kbf/\"SECRET\".pem",
         ),
+        (
+            Mode::AllInOne,
+            "node-id",
+            |k, v| k.node_id = some(v),
+            "farm-",
+        ),
+        (
+            Mode::Frontend,
+            "storage-url",
+            |k, v| k.storage_url = some(v),
+            "https://storage.example:8983/",
+        ),
     ];
     for (mode, flag, set, value) in cases {
         let mut flags = base(mode);
         set(&mut flags, value);
         let (err, exec) = refused(mode, flags);
         assert_clean(&err, &exec, flag, value);
+    }
+}
+
+/// Catches a refusal that says nothing useful: PEM text given as a path is told "not its
+/// contents" (not just "invalid"), and a trailing slash on a URL is named as such.
+#[test]
+fn refusal_messages_name_the_mistake() {
+    let cases: [(&str, Mutate, &str, &str); 3] = [
+        (
+            "reapi-tls-key",
+            |k, v| k.reapi_tls_key = some(v),
+            "-----BEGIN PRIVATE KEY-----\nSECRET\n-----END PRIVATE KEY-----",
+            "not its contents",
+        ),
+        (
+            "reapi-tls-key",
+            |k, v| k.reapi_tls_key = some(v),
+            "-----BEGIN PRIVATE KEY-----SECRET",
+            "not its contents",
+        ),
+        (
+            "storage-url",
+            |k, v| k.storage_url = some(v),
+            "https://storage.example:8983/",
+            "trailing slash",
+        ),
+    ];
+    for (flag, set, value, words) in cases {
+        let mut flags = base(Mode::Frontend);
+        set(&mut flags, value);
+        let (err, _) = refused(Mode::Frontend, flags);
+        let shown = err.to_string();
+        assert!(shown.contains(words), "{flag}: {shown}");
     }
 }
 

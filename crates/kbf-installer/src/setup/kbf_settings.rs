@@ -571,6 +571,13 @@ fn check_node_id(value: &str) -> Result<(), &'static str> {
     }
 }
 
+/// Whether `rest` is a host with a lone trailing `/` and nothing else odd.
+fn plain_but_slash(rest: &str) -> bool {
+    rest.trim_end_matches('/')
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+}
+
 /// `http://host[:port]` or `https://host[:port]` (`https` only when `tls_only`), with no
 /// user, password, path, query or fragment. Plain `http` is for a loopback host, as `kbf`
 /// refuses it anywhere else.
@@ -591,6 +598,9 @@ fn check_url(value: &str, tls_only: bool) -> Result<(), &'static str> {
     let plain = rest
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'));
+    if rest.ends_with('/') && plain_but_slash(rest) {
+        return Err("must have no trailing slash: http(s)://host[:port] and nothing after it");
+    }
     if rest.is_empty() || !plain {
         return Err("must be http(s)://host[:port] and nothing after it");
     }
