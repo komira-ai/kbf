@@ -134,6 +134,100 @@ async fn a_result_naming_another_action_is_a_mismatch() {
     assert!(accepted(&farm, lease).await);
 }
 
+/// Opens a farm over `disk` the way a restarted process does, registers the node, and
+/// submits `tag`'s operation: the farm, the operation's ticket, and every lease it started.
+fn restarted(
+    disk: &Disk,
+    epoch: EpochPolicy,
+    tag: u8,
+) -> (TestFarm, Inbox, kbf_front::Ticket, Vec<LeaseId>) {
+    let farm = disk.farm(epoch);
+    let (_, mut inbox) = register(&farm);
+    let ticket = farm
+        .submit(Submission {
+            request: request(tag),
+            call: None,
+            described: Described::default(),
+        })
+        .expect("submitted");
+    let leases = starts(&mut inbox);
+    (farm, inbox, ticket, leases)
+}
+
+/// A `Result` of `lease` that names the action of `request(tag)`.
+fn result_naming(lease: LeaseId, tag: u8) -> worker::Result {
+    worker::Result {
+        action_digest: Some(kbf_front::digest_to_proto(&request(tag).key.action)),
+        ..invalid(lease)
+    }
+}
+
+/// Catches: a farm restarted over a state store that grants a lease id its predecessor
+/// already granted (the daemon still holds the predecessor's id for operation X, and its
+/// `Result` would finish whichever operation the new farm gave that id to), and one that
+/// applies a predecessor's `Result` to an operation other than the lease's own. The new
+/// process never grants X's id again: a bumped epoch gives it another term, and a kept
+/// one continues the persisted sequence. The farm still holds X's lease, restored from
+/// its row (the daemon may still run it), so a `Result` of that id that names Y's action
+/// is a MISMATCH and ends nothing; the one that names X's action ends X alone, and Y is
+/// still open until Y's own lease reports. Mutants: a `Bump` that returns the old epoch,
+/// a grant that does not persist the next sequence, and a check that does not compare a
+/// `Result`'s action with its lease's.
+async fn a_predecessor_process_s_lease_id_never_names_another_operation(backing: Backing) {
+    for epoch in [EpochPolicy::Bump, EpochPolicy::Keep] {
+        let mut disk = Disk::over(backing);
+        let (before, _inbox, _x, first) = restarted(&disk, EpochPolicy::Keep, 1);
+        let [x_lease] = first[..] else {
+            panic!("one lease expected");
+        };
+        disk.crash(before);
+
+        let (after, _inbox, y, second) = restarted(&disk, epoch, 2);
+        let [y_lease] = second[..] else {
+            panic!("one lease for Y expected, got {second:?}");
+        };
+        assert_ne!(y_lease, x_lease, "{epoch:?}: a lease id was granted twice");
+        match epoch {
+            EpochPolicy::Bump => assert_ne!(y_lease.term, x_lease.term, "the term was kept"),
+            EpochPolicy::Keep => assert_eq!(y_lease, LeaseId::new(x_lease.term, x_lease.seq + 1)),
+        }
+
+        // X's lease, with Y's action: refused, and nothing is answered.
+        let ack = after
+            .report(&node(), result_naming(x_lease, 2))
+            .await
+            .expect("an ack");
+        assert!(!ack.accepted, "{epoch:?}: {ack:?}");
+        assert_eq!(reason_of(&ack), Reason::Mismatch, "{epoch:?}");
+        assert!(!matches!(*y.stage.borrow(), Stage::Done(_)), "Y answered");
+        assert_eq!(disk.rows("done/"), 0, "{epoch:?}");
+
+        // X's lease, with X's action: X's own result, and Y is still open.
+        let ack = after
+            .report(&node(), result_naming(x_lease, 1))
+            .await
+            .expect("an ack");
+        assert!(ack.accepted, "{epoch:?}: {ack:?}");
+        assert!(!matches!(*y.stage.borrow(), Stage::Done(_)), "Y answered");
+        assert_eq!(disk.rows("done/"), 1, "{epoch:?}: X's result only");
+
+        // Y's own lease ends Y.
+        assert!(accepted(&after, y_lease).await, "{epoch:?}");
+        assert!(matches!(ended(&y), Finished::Failed(_)));
+        assert_eq!(disk.rows("done/"), 2, "{epoch:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_predecessor_process_s_lease_id_never_names_another_operation_in_memory() {
+    a_predecessor_process_s_lease_id_never_names_another_operation(Backing::Fake).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_predecessor_process_s_lease_id_never_names_another_operation_in_sqlite() {
+    a_predecessor_process_s_lease_id_never_names_another_operation(Backing::Sqlite).await;
+}
+
 /// What the farm logged on this thread while `scenario` ran on a runtime of its own with
 /// the clock paused.
 fn logs(scenario: impl std::future::Future<Output = ()>) -> String {
