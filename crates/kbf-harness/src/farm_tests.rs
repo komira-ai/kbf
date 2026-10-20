@@ -653,3 +653,58 @@ fn a_farm_reaps_its_processes_before_it_removes_the_scratch() {
         "the scratch was removed while a process still ran in it"
     );
 }
+
+#[test]
+fn a_launched_kbf_child_is_given_a_settings_file_of_the_harnesss_own() {
+    // Catches: a child started with no `--config`, which reads the host's
+    // /etc/kbf/kbf.toml when there is one (and dies on it when the test's user cannot read
+    // it), so a harness test passes on a host without kbf installed and fails on one with it.
+    let d = dir("own-config");
+    let root = d.join("root");
+    std::fs::create_dir_all(&root).expect("root");
+    let mut farm = Farm::supervise(&d, Vec::new());
+    let unit = Rendered {
+        mode: Mode::Storage,
+        argv: vec!["storage".to_owned(), "--x=1".to_owned()],
+        env: Vec::new(),
+    };
+    farm.launch(Path::new("true"), Role::Node(1), &root, unit, None);
+    let file = root.join("kbf.toml");
+    let flags: Vec<_> = farm
+        .spec(Role::Node(1))
+        .argv
+        .iter()
+        .filter(|a| a.starts_with("--config"))
+        .collect();
+    assert_eq!(flags, [&format!("--config={}", file.display())]);
+    assert_eq!(std::fs::read(&file).expect("the file"), b"");
+}
+
+#[test]
+fn a_container_driver_child_is_given_the_settings_file_of_its_root_not_of_its_bin() {
+    // Catches: the `Some(bin)` branch of `launch` (the container driver's, whose child
+    // runs in `bin`) building its flags without `--config`, or putting the file under
+    // `bin` (shared by every child) instead of the child's own root; the `None` test
+    // above pins the other branch only.
+    let d = dir("own-config-bin");
+    let (root, bin) = (d.join("root"), d.join("bin"));
+    for p in [&root, &bin] {
+        std::fs::create_dir_all(p).expect("dir");
+    }
+    let mut farm = Farm::supervise(&d, Vec::new());
+    let unit = Rendered {
+        mode: Mode::Daemon,
+        argv: vec![
+            "daemon".to_owned(),
+            "--oci-runtime=/usr/bin/crun".to_owned(),
+        ],
+        env: Vec::new(),
+    };
+    farm.launch(Path::new("true"), Role::Node(1), &root, unit, Some(&bin));
+    let file = root.join("kbf.toml");
+    let argv = &farm.spec(Role::Node(1)).argv;
+    let flags: Vec<_> = argv.iter().filter(|a| a.starts_with("--config")).collect();
+    assert_eq!(flags, [&format!("--config={}", file.display())], "{argv:?}");
+    assert_eq!(std::fs::read(&file).expect("the file"), b"");
+    assert!(!bin.join("kbf.toml").exists());
+}

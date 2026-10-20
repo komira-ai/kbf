@@ -87,8 +87,25 @@ pub struct Target {
     pub role: Option<String>,
     /// The database name; `None` leaves it to libpq (the role's name).
     pub database: Option<String>,
-    /// The socket directory or host (`host=` or the authority's host).
+    /// The socket directory or host (`host=` or the authority's host, without its port).
     pub host: Option<String>,
+    /// The port (`port=` or the authority's), which also picks the socket file of a socket
+    /// directory; `None` leaves it to libpq.
+    pub port: Option<String>,
+}
+
+/// An authority's `host[:port]`, with `[v6]` brackets taken off; an empty part is `None`.
+fn split_host_port(authority: &str) -> (Option<String>, Option<String>) {
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((host, rest)) => (host, rest.strip_prefix(':').unwrap_or("")),
+            None => (bracketed, ""),
+        }
+    } else {
+        authority.rsplit_once(':').unwrap_or((authority, ""))
+    };
+    let some = |t: &str| Some(unescape(t)).filter(|t| !t.is_empty());
+    (some(host), some(port))
 }
 
 /// `%XX` decoded; a malformed escape stays as written.
@@ -144,7 +161,7 @@ impl Target {
             .next()
             .filter(|u| !u.is_empty())
             .map(unescape);
-        let mut host = Some(unescape(host)).filter(|h| !h.is_empty());
+        let (mut host, mut port) = split_host_port(host);
         let mut database = Some(unescape(path)).filter(|d| !d.is_empty());
         for pair in query.split('&') {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -154,6 +171,7 @@ impl Target {
             match key {
                 "user" => role = Some(value),
                 "host" => host = Some(value),
+                "port" => port = Some(value),
                 "dbname" => database = Some(value),
                 _ => {}
             }
@@ -162,6 +180,7 @@ impl Target {
             role,
             database,
             host,
+            port,
         }
     }
 
@@ -181,6 +200,9 @@ impl Target {
         let mut query = Vec::new();
         if let Some(host) = &self.host {
             query.push(format!("host={}", escape(host)));
+        }
+        if let Some(port) = &self.port {
+            query.push(format!("port={}", escape(port)));
         }
         if let Some(role) = &self.role {
             query.push(format!("user={}", escape(role)));

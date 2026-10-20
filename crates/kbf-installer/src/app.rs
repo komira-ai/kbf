@@ -270,7 +270,7 @@ fn boot_check(root: PathBuf, args: &BootArgs) -> Result<(), Failure> {
 /// belongs to root. Under `--root` (a rehearsal, a test) the tree is the caller's own, so the
 /// owner to expect is the caller: nobody gains anything by it, since root and a stranger
 /// alike only reach what they already could.
-fn owner_uid(rehearsal: bool, euid: u32) -> u32 {
+pub(crate) fn owner_uid(rehearsal: bool, euid: u32) -> u32 {
     if rehearsal { euid } else { 0 }
 }
 

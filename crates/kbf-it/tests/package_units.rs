@@ -743,14 +743,20 @@ fn backup_rules(name: &str, text: &str, v: &mut impl FnMut(&str, String)) {
             "no ConditionPathExists={INSTALLER_CONFIG} in [Unit]"
         ));
     }
-    // Catches a service that would run as root where its drop-in is missing: the unit is
-    // gated on the drop-in that carries its User=.
-    if name == "kbf-backup.service"
-        && !all(&unit, "Unit", "ConditionPathExists").contains(&BACKUP_USER_DROPIN)
-    {
-        bad(format!(
-            "no ConditionPathExists={BACKUP_USER_DROPIN} in [Unit]"
-        ));
+    // Catches a service that would run as root where its drop-in is missing: the unit asserts
+    // the drop-in that carries its User=. An assert, because a failed ConditionPathExists=
+    // skips the unit with exit 0, so a deleted drop-in would end the backups without a failure.
+    if name == "kbf-backup.service" {
+        if !all(&unit, "Unit", "AssertPathExists").contains(&BACKUP_USER_DROPIN) {
+            bad(format!(
+                "no AssertPathExists={BACKUP_USER_DROPIN} in [Unit]"
+            ));
+        }
+        if all(&unit, "Unit", "ConditionPathExists").contains(&BACKUP_USER_DROPIN) {
+            bad(format!(
+                "ConditionPathExists={BACKUP_USER_DROPIN}: a missing drop-in would skip the unit as a success"
+            ));
+        }
     }
     if name == "kbf-backup.timer" {
         // Catches a timer that never fires (no schedule), one that skips the run of a host that
@@ -1455,8 +1461,14 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "kbf-backup.service",
-        "ConditionPathExists=/etc/systemd/system/kbf-backup.service.d/10-service-user.conf\n",
+        "AssertPathExists=/etc/systemd/system/kbf-backup.service.d/10-service-user.conf\n",
         "",
+        "backup",
+    ),
+    (
+        "kbf-backup.service",
+        "AssertPathExists=/etc/systemd/system/kbf-backup.service.d/10-service-user.conf\n",
+        "ConditionPathExists=/etc/systemd/system/kbf-backup.service.d/10-service-user.conf\n",
         "backup",
     ),
     (

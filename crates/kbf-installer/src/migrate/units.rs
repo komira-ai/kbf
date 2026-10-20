@@ -253,11 +253,39 @@ pub fn restore(
     backup: &OwnedFd,
     unit: &Unit,
 ) -> Result<bool, TreeError> {
-    let name = unit.as_str();
-    let Some(bytes) = tree::read_file(rules, backup, name, UNIT_CAP)? else {
+    put_back(rules, units, backup, unit.as_str(), unit)
+}
+
+/// The name `setup` keeps a unit file it retired under in the migration's backup directory:
+/// beside the unit's original, which is a different file (the original is what the old
+/// layout ran; the retired file is what was in the unit directory when `setup` took it out).
+pub fn retired_name(unit: &str) -> String {
+    format!("{unit}.retired")
+}
+
+/// Put back the file `setup` retired in place of `unit`; `false` when it retired none. A
+/// rollback does this only for a unit with no original kept ([`restore`] came back `false`):
+/// where there is an original, the original is what the old layout ran.
+pub fn unretire(
+    rules: &Rules,
+    units: &OwnedFd,
+    backup: &OwnedFd,
+    unit: &Unit,
+) -> Result<bool, TreeError> {
+    put_back(rules, units, backup, &retired_name(unit.as_str()), unit)
+}
+
+fn put_back(
+    rules: &Rules,
+    units: &OwnedFd,
+    backup: &OwnedFd,
+    kept_as: &str,
+    unit: &Unit,
+) -> Result<bool, TreeError> {
+    let Some(bytes) = tree::read_file(rules, backup, kept_as, UNIT_CAP)? else {
         return Ok(false);
     };
-    tree::replace_file(units, name, 0o644, &bytes)?;
+    tree::replace_file(units, unit.as_str(), 0o644, &bytes)?;
     Ok(true)
 }
 

@@ -9,7 +9,7 @@ use kbf_host::{Entry, Exec, HostPath, Owner, Perms, Step};
 
 use kbf_state::postgres::schema::Outcome;
 
-use super::backend::{Backend, Releases, Schemas};
+use super::backend::{Backend, Migrations, Releases, Schemas};
 use super::fake::{FakeOs, user};
 use super::validate::Raw;
 use super::{Options, SetupError, run};
@@ -20,6 +20,7 @@ use crate::exit::Exit;
 use crate::helper::fetcher::FetchError;
 use crate::installer_toml::Source;
 use crate::layout::{Layout, Platform};
+use crate::migrate::{MigrateError, Unit};
 
 const DATABASE: &str = "postgres:///kbf?host=/run/postgresql";
 
@@ -101,6 +102,36 @@ struct Unwired;
 impl Releases for Unwired {
     fn install_first(&self, _: &CommitId) -> Result<(), SetupError> {
         Err(SetupError::Fetch(FetchError::NotWired))
+    }
+}
+
+/// What the migration journal says on the fake host.
+#[derive(Clone, Copy)]
+enum Standing {
+    /// No old layout: nothing to say.
+    Fresh,
+    /// The old layout's state is the host's and no migration finished.
+    Unmigrated,
+    /// A finished migration repointed these units.
+    Done(&'static [&'static str]),
+    /// The journal cannot be read.
+    Damaged,
+}
+
+impl Migrations for Standing {
+    fn units(&self) -> Result<Vec<Unit>, MigrateError> {
+        match self {
+            Standing::Fresh => Ok(Vec::new()),
+            Standing::Unmigrated => Err(MigrateError::Unmigrated("/var/lib/kbf-deploy".into())),
+            Standing::Done(units) => Ok(units
+                .iter()
+                .map(|u| Unit::new(u).expect("a unit"))
+                .collect()),
+            Standing::Damaged => Err(MigrateError::Corrupt {
+                file: "migration.json",
+                why: "planted".into(),
+            }),
+        }
     }
 }
 
@@ -190,10 +221,24 @@ fn go_on(
     raw: &Raw,
     options: Options,
 ) -> Result<String, SetupError> {
+    go_after(os, exec, releases, server, Standing::Fresh, raw, options)
+}
+
+/// [`go_on`] on a host whose migration journal says `standing`.
+fn go_after(
+    os: &FakeOs,
+    exec: &mut FakeExec,
+    releases: &dyn Releases,
+    server: &Server,
+    standing: Standing,
+    raw: &Raw,
+    options: Options,
+) -> Result<String, SetupError> {
     let mut out = Vec::new();
     let backend = Backend {
         releases,
         schemas: server,
+        migrations: &standing,
     };
     run(os, exec, &backend, raw, options, &mut out)?;
     Ok(String::from_utf8(out).expect("text"))
@@ -1243,12 +1288,25 @@ fn each_failure_has_its_exit_code_and_word() {
             "fetch",
         ),
         (
-            SetupError::OldLayout {
+            SetupError::Unmigrated {
                 path: "/x".into(),
                 fetch_user: "kbf-fetch",
             },
             Exit::NeedsOperator,
-            "old_layout",
+            "unmigrated",
+        ),
+        (
+            SetupError::Migrate(MigrateError::NoJournal),
+            Exit::NeedsOperator,
+            "migrate",
+        ),
+        (
+            SetupError::Migrate(MigrateError::Io {
+                what: "x".into(),
+                source: std::io::Error::other("y"),
+            }),
+            Exit::Failed,
+            "migrate",
         ),
         (
             SetupError::ShadowUnit {
@@ -1485,11 +1543,15 @@ fn every_failure_reads_as_a_sentence() {
             "no release fetcher",
         ),
         (
-            SetupError::OldLayout {
+            SetupError::Unmigrated {
                 path: "/usr/local/kbf".into(),
                 fetch_user: "kbf-fetch",
             },
             "/usr/local/kbf",
+        ),
+        (
+            SetupError::Migrate(MigrateError::NoJournal),
+            "no migration.json",
         ),
         (
             SetupError::ShadowUnit {
@@ -1547,3 +1609,6 @@ mod more;
 
 #[path = "proxy_listen_tests.rs"]
 mod proxy_listen;
+
+#[path = "backup_dropin_tests.rs"]
+mod backup_dropin;

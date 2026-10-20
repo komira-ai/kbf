@@ -1,7 +1,8 @@
 //! `backup` and `restore` without a server: the program that dumps is played by a fake that
 //! writes (or fails to write) the file `--file=` names, and everything else is the real file
 //! system under a scratch directory. The round trip over a real server is
-//! `real_server_round_trip` (needs `KBF_TEST_POSTGRES_URL`; the state-postgres CI job runs it).
+//! `real_server_round_trip` (needs `KBF_TEST_POSTGRES_URL`; no CI job selects it yet, see
+//! docs/deploy/kbf-installer-setup.md, "Backup and restore").
 
 use std::cell::RefCell;
 use std::fs;
@@ -565,6 +566,7 @@ fn settings_come_from_installer_toml_and_refuse_a_password() {
                 role: None,
                 database: Some("kbf".to_owned()),
                 host: Some("/run/postgresql".to_owned()),
+                port: None,
             },
             keep: 7
         })
@@ -600,7 +602,7 @@ fn settings_come_from_installer_toml_and_refuse_a_password() {
 /// role (libpq then uses the OS user); another database name is that name; the authority
 /// form and percent escapes read the same.
 ///
-/// Mutants seen red: `user=` ignored; the path's database dropped; `host=` ignored.
+/// Mutants seen red: `user=` ignored; the path's database dropped; `host=` ignored; the authority's port left in the host.
 #[test]
 fn role_database_and_socket_come_from_the_url() {
     let t = Target::parse;
@@ -616,7 +618,8 @@ fn role_database_and_socket_come_from_the_url() {
     assert_eq!(other.host.as_deref(), Some("/var/run/pg"));
     let authority = t("postgres://who@db.example:5433/stuff");
     assert_eq!(authority.role.as_deref(), Some("who"));
-    assert_eq!(authority.host.as_deref(), Some("db.example:5433"));
+    assert_eq!(authority.host.as_deref(), Some("db.example"));
+    assert_eq!(authority.port.as_deref(), Some("5433"));
     assert_eq!(authority.database.as_deref(), Some("stuff"));
     let escaped = t("postgres:///a%5Fb?host=%2Frun%2Fpostgresql&user=kbf%2Dserver");
     assert_eq!(escaped.database.as_deref(), Some("a_b"));
@@ -624,21 +627,33 @@ fn role_database_and_socket_come_from_the_url() {
     assert_eq!(escaped.role.as_deref(), Some("kbf-server"));
     let nothing = t("postgres://");
     assert_eq!(
-        (nothing.role, nothing.database, nothing.host),
-        (None, None, None)
+        (nothing.role, nothing.database, nothing.host, nothing.port),
+        (None, None, None, None)
     );
     // A key spelled `dbname=` names the database; an empty value and a key nobody here reads
     // change nothing; a broken or truncated escape stays as written.
     let keyed = t("postgres:///first?dbname=second&sslmode=disable&user=&host=");
     assert_eq!(keyed.database.as_deref(), Some("second"));
-    assert_eq!((keyed.role, keyed.host), (None, None));
+    assert_eq!((keyed.role, keyed.host, keyed.port), (None, None, None));
+    // A port in the query, one in an authority with a bracketed address, and a bare host.
+    let q = t("postgres:///kbf?host=/run/postgresql&port=5433");
+    assert_eq!(q.port.as_deref(), Some("5433"));
+    assert_eq!(q.host.as_deref(), Some("/run/postgresql"));
+    let v6 = t("postgres://u@[::1]:6543/kbf");
+    assert_eq!(v6.host.as_deref(), Some("::1"));
+    assert_eq!(v6.port.as_deref(), Some("6543"));
+    let plain = t("postgres://u@db.example/kbf");
+    assert_eq!(
+        (plain.host.as_deref(), plain.port),
+        (Some("db.example"), None)
+    );
     assert_eq!(t("postgres:///a%zzb%").database.as_deref(), Some("a%zzb%"));
 }
 
 /// Catches a scratch database made on another role or socket than the configured one, or a
 /// name that is not an identifier.
 ///
-/// Mutants seen red: the role dropped from the scratch URL; the host dropped; the name check removed.
+/// Mutants seen red: the role dropped from the scratch URL; the host dropped; the port dropped; the name check removed.
 #[test]
 fn a_scratch_database_is_on_the_same_server_as_the_same_role() {
     let farm = Target::parse("postgres:///kbf?host=/run/postgresql&user=kbf-server");
@@ -659,21 +674,40 @@ fn a_scratch_database_is_on_the_same_server_as_the_same_role() {
         role: None,
         database: None,
         host: None,
+        port: None,
     };
     assert_eq!(none.url_for("t").expect("name"), "postgres:///t");
     let odd = Target {
         role: Some("a b".into()),
         database: None,
         host: Some("/a b/c".into()),
+        port: None,
     };
     assert_eq!(
         odd.url_for("t").expect("name"),
         "postgres:///t?host=/a%20b/c&user=a%20b"
     );
+    // A port is carried (the default port may be another cluster), and a TCP authority's port
+    // is not glued to its host name.
+    let tcp = Target::parse("postgres://u@db.example:6543/kbf");
+    assert_eq!(
+        tcp.url_for("scratch").expect("name"),
+        "postgres:///scratch?host=db.example&port=6543&user=u"
+    );
+    let sock = Target::parse("postgres:///kbf?host=/run/postgresql&port=5433");
+    assert_eq!(
+        sock.url_for("scratch").expect("name"),
+        "postgres:///scratch?host=/run/postgresql&port=5433"
+    );
     // The round trip is a URL the parser reads back to the same target (database aside).
     let back = Target::parse(&farm.url_for("scratch").expect("name"));
     assert_eq!(back.role, farm.role);
     assert_eq!(back.host, farm.host);
+    assert_eq!(back.port, farm.port);
+    assert_eq!(
+        Target::parse(&tcp.url_for("s").expect("name")).port,
+        tcp.port
+    );
     assert_eq!(back.database.as_deref(), Some("scratch"));
 }
 
@@ -737,7 +771,7 @@ fn pg_tool(name: &str) -> String {
 /// the plpgsql comment); `--single-transaction` dropped is not visible here (see the unit
 /// test of the arguments); the dump taken of another database (rows missing).
 #[test]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL) and pg_dump 17; no CI job selects it yet"]
 fn real_server_round_trip() {
     use kbf_state::postgres::{PostgresConfig, PostgresStore};
     use kbf_state::{Cond, Store, Txn};
