@@ -47,7 +47,7 @@ use serde_json::Value;
 
 use crate::CommitId;
 use api::{Operator, Reply, Request};
-pub use offer::{HostProbe, NoProbe, OfferPolicy, Probe, Stage};
+pub use offer::{Attest, GhAttest, HostProbe, NoProbe, OfferPolicy, Probe, ProbeFault, Stage};
 pub use summary::{Exit, NodeResult, OfferRecord, PostResult, Previous, Step, Summary};
 
 /// Where the installer's lock is.

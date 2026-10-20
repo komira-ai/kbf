@@ -6,7 +6,7 @@ use kbf_gate::{OfferDoc, SetHash};
 use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::deploy::offer::{self, HostProbe, Stage};
+use crate::deploy::offer::{self, Attest, HostProbe, ProbeFault, Stage};
 
 /// The farm's clock at the start of a run (`Clk`).
 const NOW: u64 = 1_790_000_000;
@@ -16,8 +16,44 @@ const HOUR: u64 = 3600;
 struct Says(Result<Option<u64>, String>);
 
 impl Probe for Says {
-    fn meta_log(&self, _: &CommitId, _: &[u8]) -> Result<Option<u64>, String> {
-        self.0.clone()
+    fn meta_log(
+        &self,
+        _: &CommitId,
+        _: &[u8],
+        _: Option<&[u8]>,
+    ) -> Result<Option<u64>, ProbeFault> {
+        self.0.clone().map_err(ProbeFault::Failed)
+    }
+}
+
+/// An attestation check that says `verdict` and keeps what it was shown.
+struct Vouches {
+    verdict: Result<(), String>,
+    seen: std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+}
+
+impl Vouches {
+    fn new(verdict: Result<(), String>) -> std::sync::Arc<Vouches> {
+        std::sync::Arc::new(Vouches {
+            verdict,
+            seen: Default::default(),
+        })
+    }
+}
+
+impl Attest for std::sync::Arc<Vouches> {
+    fn verify(&self, _: &CommitId, tarball: &[u8], attestation: &[u8]) -> Result<(), String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((tarball.to_vec(), attestation.to_vec()));
+        self.verdict.clone()
+    }
+}
+
+fn text(fault: ProbeFault) -> String {
+    match fault {
+        ProbeFault::Unattested(s) | ProbeFault::Failed(s) => s,
     }
 }
 
@@ -107,21 +143,26 @@ fn deploy_with(
     bundle: Option<Vec<u8>>,
     says: Result<Option<u64>, String>,
 ) -> (Farm, Summary) {
+    deploy_probing(policy, bundle, &Says(says))
+}
+
+/// [`deploy_with`], with the probe of the test's choosing.
+fn deploy_probing(
+    policy: OfferPolicy,
+    bundle: Option<Vec<u8>>,
+    probe: &dyn Probe,
+) -> (Farm, Summary) {
     let f = farm(two_nodes());
     let mut o = opts(true);
     o.offer = policy;
     let clock = Clk(f.now.clone());
-    let (smoke, check, probe) = (
-        FixedSmoke(SmokeResult::Pass),
-        FixedCheck(Ok(true)),
-        Says(says),
-    );
+    let (smoke, check) = (FixedSmoke(SmokeResult::Pass), FixedCheck(Ok(true)));
     let env = Env {
         api: &f,
         clock: &clock,
         smoke: &smoke,
         check: &check,
-        probe: &probe,
+        probe,
     };
     let mut input: &[u8] = bundle.as_deref().unwrap_or(&[]);
     let stream: Option<&mut dyn io::Read> =
@@ -521,8 +562,13 @@ fn the_host_probe_unpacks_the_binary_and_reads_its_meta_log() {
             asked: Default::default(),
         });
         // Not root here, so the probe cannot chown its scratch directory to the user.
-        let probe = HostProbe::new(dir.join("work"), None, Box::new(plays.clone()));
-        let answer = probe.meta_log(&commit, &tarball());
+        let probe = HostProbe::new(
+            dir.join("work"),
+            None,
+            Box::new(plays.clone()),
+            Box::new(Vouches::new(Ok(()))),
+        );
+        let answer = probe.meta_log(&commit, &tarball(), Some(b"att"));
         (answer, plays)
     };
     let (answer, plays) = run(version("\"meta_log\":4,", short), 0);
@@ -551,8 +597,13 @@ fn the_host_probe_unpacks_the_binary_and_reads_its_meta_log() {
             timed_out: false,
             asked: Default::default(),
         })),
+        Box::new(Vouches::new(Ok(()))),
     );
-    assert!(not_a_tarball.meta_log(&commit, b"not a tarball").is_err());
+    assert!(
+        not_a_tarball
+            .meta_log(&commit, b"not a tarball", Some(b"att"))
+            .is_err()
+    );
     // The scratch directory is gone.
     let left: Vec<_> = std::fs::read_dir(dir.join("work")).unwrap().collect();
     assert!(left.is_empty(), "{left:?}");
@@ -569,8 +620,13 @@ fn the_host_probe_unpacks_the_binary_and_reads_its_meta_log() {
         timed_out: false,
         asked: Default::default(),
     });
-    let as_me = HostProbe::new(dir.join("work"), Some(me), Box::new(plays.clone()));
-    assert_eq!(as_me.meta_log(&commit, &tarball()), Ok(None));
+    let as_me = HostProbe::new(
+        dir.join("work"),
+        Some(me),
+        Box::new(plays.clone()),
+        Box::new(Vouches::new(Ok(()))),
+    );
+    assert_eq!(as_me.meta_log(&commit, &tarball(), Some(b"att")), Ok(None));
     assert_eq!(plays.asked.lock().unwrap()[0].run_as, Some(me));
 }
 
@@ -603,13 +659,13 @@ fn a_probe_that_cannot_run_refuses() {
         timed_out: true,
         asked: Default::default(),
     });
-    let probe = HostProbe::new(dir.join("work"), None, Box::new(slow));
-    assert!(
-        probe
-            .meta_log(&commit, &tarball)
-            .unwrap_err()
-            .contains("ended")
+    let probe = HostProbe::new(
+        dir.join("work"),
+        None,
+        Box::new(slow),
+        Box::new(Vouches::new(Ok(()))),
     );
+    assert!(text(probe.meta_log(&commit, &tarball, Some(b"att")).unwrap_err()).contains("ended"));
     // A file where the work directory's parent should be.
     std::fs::write(dir.join("blocker"), b"").unwrap();
     let fine = std::sync::Arc::new(Plays {
@@ -618,14 +674,21 @@ fn a_probe_that_cannot_run_refuses() {
         timed_out: false,
         asked: Default::default(),
     });
-    let blocked = HostProbe::new(dir.join("blocker").join("work"), None, Box::new(fine));
-    assert!(
-        blocked
-            .meta_log(&commit, &tarball)
-            .unwrap_err()
-            .starts_with("probe:")
+    let blocked = HostProbe::new(
+        dir.join("blocker").join("work"),
+        None,
+        Box::new(fine),
+        Box::new(Vouches::new(Ok(()))),
     );
-    assert!(NoProbe.meta_log(&commit, &tarball).is_err());
+    assert!(
+        text(
+            blocked
+                .meta_log(&commit, &tarball, Some(b"att"))
+                .unwrap_err()
+        )
+        .starts_with("probe:")
+    );
+    assert!(NoProbe.meta_log(&commit, &tarball, Some(b"att")).is_err());
     assert!(HostProbe::at(&dir, false).is_ok());
     assert!(HostProbe::at(&dir, true).is_ok());
     assert!(HostProbe::at(std::path::Path::new("relative/root"), false).is_err());
@@ -710,4 +773,142 @@ fn sums_that_hash_right_but_do_not_parse_are_refused() {
     );
     refused(&f, &s, "offer_set_mismatch");
     assert!(s.detail.contains("SHA256SUMS line 1"), "{}", s.line());
+}
+
+/// A gzip tarball with a `kbf` in it.
+fn gz_kbf() -> Vec<u8> {
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut b = tar::Builder::new(&mut gz);
+    let mut h = tar::Header::new_gnu();
+    h.set_size(5);
+    h.set_mode(0o755);
+    h.set_cksum();
+    b.append_data(&mut h, "kbf", &b"bytes"[..]).unwrap();
+    b.finish().unwrap();
+    drop(b);
+    gz.finish().unwrap()
+}
+
+/// (d) Proves the host's `kbf` is attested before it is unpacked or run: when the
+/// attestation check refuses, or the bundle has no attestation, the probe's runner is never
+/// asked to start anything and no scratch directory is left; when it vouches, it is shown
+/// the exact tarball and attestation bytes, and then the binary runs once. Catches a probe
+/// that runs first and checks after, and an attestation failure that is ignored.
+///
+/// Mutants planted: the run moved before `attest.verify`; the `verify` error dropped.
+#[test]
+fn the_host_binary_is_attested_before_it_is_run() {
+    let (_, dir) = crate::testkit::host_root("deploy-offer-attest-first");
+    let short = &TARGET[..12];
+    let said = format!(
+        "{{\"commit\":\"{short}\",\"meta_log\":4,\"min_protocol\":3,\"profile\":\"release\",\"protocol\":4,\"state_schema\":1,\"version\":\"0.1.0\"}}"
+    );
+    let plays = || {
+        std::sync::Arc::new(Plays {
+            stdout: said.clone(),
+            code: 0,
+            timed_out: false,
+            asked: Default::default(),
+        })
+    };
+    let commit = c(TARGET);
+    let tar = gz_kbf();
+
+    let (run, no) = (plays(), Vouches::new(Err("not attested".into())));
+    let probe = HostProbe::new(
+        dir.join("work"),
+        None,
+        Box::new(run.clone()),
+        Box::new(no.clone()),
+    );
+    let fault = probe.meta_log(&commit, &tar, Some(b"att")).unwrap_err();
+    assert!(
+        matches!(&fault, ProbeFault::Unattested(d) if d.contains("not attested")),
+        "{fault:?}"
+    );
+    assert_eq!(no.seen.lock().unwrap().len(), 1);
+    assert!(run.asked.lock().unwrap().is_empty());
+    assert!(
+        std::fs::read_dir(dir.join("work")).is_ok_and(|mut d| d.next().is_none())
+            || !dir.join("work").exists()
+    );
+
+    let (run, yes) = (plays(), Vouches::new(Ok(())));
+    let probe = HostProbe::new(
+        dir.join("work"),
+        None,
+        Box::new(run.clone()),
+        Box::new(yes.clone()),
+    );
+    let fault = probe.meta_log(&commit, &tar, None).unwrap_err();
+    assert!(matches!(fault, ProbeFault::Unattested(_)));
+    assert!(yes.seen.lock().unwrap().is_empty());
+    assert!(run.asked.lock().unwrap().is_empty());
+
+    assert_eq!(probe.meta_log(&commit, &tar, Some(b"att")), Ok(Some(4)));
+    assert_eq!(
+        *yes.seen.lock().unwrap(),
+        vec![(tar.clone(), b"att".to_vec())]
+    );
+    assert_eq!(run.asked.lock().unwrap().len(), 1);
+}
+
+/// (d) Proves the deploy refuses an offer whose host tarball is not attested with
+/// `offer_set_unverified`, before any upload and without the binary being run, and does not
+/// when it is attested. Catches `check_bundle` passing no attestation to the probe, and a
+/// refusal of the probe mapped to a different reason.
+///
+/// Mutants planted: the bundle's attestation not passed on; `Unattested` mapped to
+/// `offer_probe_failed`.
+#[test]
+fn a_deploy_with_an_unattested_host_binary_is_refused_without_running_it() {
+    let (_, dir) = crate::testkit::host_root("deploy-offer-attest-deploy");
+    let short = &TARGET[..12];
+    let said = format!(
+        "{{\"commit\":\"{short}\",\"meta_log\":4,\"min_protocol\":3,\"profile\":\"release\",\"protocol\":4,\"state_schema\":1,\"version\":\"0.1.0\"}}"
+    );
+    let mut files = files();
+    files[0].1 = gz_kbf();
+    let sums = sums_of(&files);
+    let mut fields = Fields::good();
+    fields.set_hash = SetHash::of_sums(&sums).as_str().to_owned();
+    let attested = |with_att: bool| {
+        let mut all: Vec<(String, Vec<u8>)> = files.clone();
+        if with_att {
+            all.push((format!("{}.attestation", files[0].0), b"att".to_vec()));
+        }
+        let mut refs: Vec<(&str, &[u8])> = all
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect();
+        refs.push(("SHA256SUMS", &sums));
+        tarball(&refs)
+    };
+    let try_it = |bundle: Vec<u8>, verdict: Result<(), String>| {
+        let run = std::sync::Arc::new(Plays {
+            stdout: said.clone(),
+            code: 0,
+            timed_out: false,
+            asked: Default::default(),
+        });
+        let vouch = Vouches::new(verdict);
+        let probe = HostProbe::new(
+            dir.join("work"),
+            None,
+            Box::new(run.clone()),
+            Box::new(vouch),
+        );
+        let (f, s) = deploy_probing(policy(Stage::Gamma, fields.doc()), Some(bundle), &probe);
+        let ran = run.asked.lock().unwrap().len();
+        (f, s, ran)
+    };
+    let (f, s, ran) = try_it(attested(true), Err("bad signature".into()));
+    refused(&f, &s, "offer_set_unverified");
+    assert_eq!(ran, 0);
+    let (f, s, ran) = try_it(attested(false), Ok(()));
+    refused(&f, &s, "offer_set_unverified");
+    assert_eq!(ran, 0);
+    let (_, s, ran) = try_it(attested(true), Ok(()));
+    assert_eq!(s.exit, 0, "{}", s.line());
+    assert_eq!(ran, 1);
 }

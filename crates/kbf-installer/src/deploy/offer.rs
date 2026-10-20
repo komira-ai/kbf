@@ -13,14 +13,18 @@
 //!   age nor dated in the future beyond clock skew (`created`);
 //! - the bundle carries the release set's `SHA256SUMS`, whose hash is the offer's
 //!   `set_hash`, and every tarball in the bundle is the file that sums name;
-//! - the `kbf` of the host's own platform in the bundle, run as the unprivileged user,
-//!   names the offer's `meta_log` in `--version --json` (a mismatch refuses, and so does
+//! - the `kbf` of the host's own platform in the bundle is attested (offline, by the
+//!   installer's pinned `gh` and trust root, the flags the stage uses), and then, run as
+//!   the unprivileged user, names the offer's `meta_log` in `--version --json` (a mismatch refuses, and so does
 //!   an offer that claims a number where the binary names none, or the reverse);
 //! - every platform the farm runs is one the offer found complete.
 //!
-//! The probe runs bytes the stage has not attested yet, so it runs as the installer's
-//! `RUN_AS` user, never as root, in a scratch directory of its own. Its answer can only
-//! refuse a deploy: the frontend's own update still verifies the attestation offline.
+//! No byte is run before it is attested: the host tarball's attestation is verified first
+//! ([`Attest`], by [`GhAttest`] through `GhCheck::verify`, the stage's own function), and a
+//! tarball that is not attested, or has no attestation in the bundle, is refused before it
+//! is unpacked. Only then does the probe unpack it and run it, as the installer's `RUN_AS`
+//! user, never as root, in a scratch directory of its own. Its answer can only refuse a
+//! deploy: the frontend's own update still verifies the attestation offline.
 //! Without `--offer`, a deploy that names a stage is refused unless `--no-offer` says so;
 //! the summary records either.
 
@@ -37,10 +41,12 @@ use super::bundle::{Bundle, Entry};
 use super::summary::OfferRecord;
 use super::{smoke, why};
 use crate::CommitId;
+use crate::attest::{GhCheck, Tools};
 use crate::binary::Version;
 use crate::layout::{Layout, Platform};
 use crate::run::{RunAs, Runner, Spawn, SystemRunner};
 use crate::settings::Settings;
+use kbf_host::{Exec, HostExec};
 
 /// The most an offer file may be.
 pub const MAX_OFFER: u64 = 64 * 1024;
@@ -280,9 +286,17 @@ pub(super) fn check_bundle(
                 format!("the bundle has no kbf for {host_platform} to read the meta_log from"),
             )
         })?;
+    let attestation = bundle
+        .entries
+        .iter()
+        .find(|e| e.platform == host_platform && e.name == "kbf.attestation")
+        .map(|e| e.bytes.as_slice());
     let staged = probe
-        .meta_log(commit, &host.bytes)
-        .map_err(|e| refuse("offer_probe_failed", e))?;
+        .meta_log(commit, &host.bytes, attestation)
+        .map_err(|e| match e {
+            ProbeFault::Unattested(d) => refuse("offer_set_unverified", d),
+            ProbeFault::Failed(d) => refuse("offer_probe_failed", d),
+        })?;
     if staged != doc.meta_log {
         return Err(refuse(
             "offer_meta_log_mismatch",
@@ -317,19 +331,41 @@ pub(super) fn check_platforms<'a>(
     ))
 }
 
+/// Why a probe gave no answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProbeFault {
+    /// The tarball is not attested (or has no attestation): nothing was run.
+    Unattested(String),
+    /// The attested binary could not be unpacked or run, or named another build.
+    Failed(String),
+}
+
 /// What the staged `kbf` says of itself.
 pub trait Probe {
     /// The `meta_log` of `kbf --version --json` for the tarball `tarball` (the `kbf` of the
-    /// host's platform), which must name `commit`'s release build.
-    fn meta_log(&self, commit: &CommitId, tarball: &[u8]) -> Result<Option<u64>, String>;
+    /// host's platform), which must name `commit`'s release build. `attestation` is the
+    /// bundle's attestation of that tarball; the tarball is not run unless it verifies.
+    fn meta_log(
+        &self,
+        commit: &CommitId,
+        tarball: &[u8],
+        attestation: Option<&[u8]>,
+    ) -> Result<Option<u64>, ProbeFault>;
 }
 
 /// The probe where none is built: it cannot answer, so an offer is refused.
 pub struct NoProbe;
 
 impl Probe for NoProbe {
-    fn meta_log(&self, _: &CommitId, _: &[u8]) -> Result<Option<u64>, String> {
-        Err("this build cannot read a binary's meta_log".to_owned())
+    fn meta_log(
+        &self,
+        _: &CommitId,
+        _: &[u8],
+        _: Option<&[u8]>,
+    ) -> Result<Option<u64>, ProbeFault> {
+        Err(ProbeFault::Failed(
+            "this build cannot read a binary's meta_log".to_owned(),
+        ))
     }
 }
 
@@ -344,6 +380,68 @@ pub struct HostProbe {
     work: PathBuf,
     run_as: Option<RunAs>,
     runner: Box<dyn Runner>,
+    attest: Box<dyn Attest>,
+}
+
+/// Whether a tarball is the attested build of a commit.
+pub trait Attest {
+    fn verify(&self, commit: &CommitId, tarball: &[u8], attestation: &[u8]) -> Result<(), String>;
+}
+
+/// The installer's pinned `gh` and trust root, through [`GhCheck::verify`] (the function
+/// the stage uses), run as the `RUN_AS` user on copies in a scratch directory.
+pub struct GhAttest {
+    work: PathBuf,
+    gh: GhCheck,
+    trust: Box<dyn Exec>,
+    runner: Box<dyn Runner>,
+    switch_user: bool,
+}
+
+impl Attest for GhAttest {
+    fn verify(&self, commit: &CommitId, tarball: &[u8], attestation: &[u8]) -> Result<(), String> {
+        let io = |e: std::io::Error| format!("attestation: {e}");
+        let owner = self.switch_user.then_some(self.gh.run_as);
+        let dir = scratch_in(&self.work, "deploy-attest", owner)?;
+        let home = dir.0.join("gh");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&home)
+            .map_err(io)?;
+        if let Some(user) = owner {
+            std::os::unix::fs::chown(&home, Some(user.uid), Some(user.gid)).map_err(io)?;
+        }
+        let packed = dir.0.join("kbf.tar.gz");
+        let bundle = dir.0.join("kbf.bundle.jsonl");
+        for (path, bytes) in [(&packed, tarball), (&bundle, attestation)] {
+            fs::write(path, bytes).map_err(io)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).map_err(io)?;
+        }
+        let tools = Tools {
+            trust: self.trust.as_ref(),
+            runner: self.runner.as_ref(),
+        };
+        self.gh
+            .verify(&tools, &home, &packed, &bundle, commit)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
+    }
+}
+
+/// A fresh scratch directory under `work`, handed to `owner` when there is one.
+fn scratch_in(work: &Path, prefix: &str, owner: Option<RunAs>) -> Result<Scratch, String> {
+    let io = |e: std::io::Error| format!("probe: {e}");
+    fs::create_dir_all(work).map_err(io)?;
+    let name = format!("{prefix}-{}", hex::encode(smoke::random(8)?));
+    let dir = Scratch(work.join(name));
+    fs::DirBuilder::new()
+        .mode(0o755)
+        .create(&dir.0)
+        .map_err(io)?;
+    if let Some(user) = owner {
+        std::os::unix::fs::chown(&dir.0, Some(user.uid), Some(user.gid)).map_err(io)?;
+    }
+    Ok(dir)
 }
 
 impl HostProbe {
@@ -353,21 +451,37 @@ impl HostProbe {
     pub fn at(root: &Path, as_root: bool) -> Result<HostProbe, String> {
         let base = kbf_host::Root::new(root).map_err(|e| e.to_string())?;
         let layout = Layout::new(base.clone(), Platform::current());
-        let settings = Settings::load(&kbf_host::HostExec::new(base), &layout)
+        let settings = Settings::load(&HostExec::new(base.clone()), &layout)
             .map_err(|e| format!("installer settings: {e}"))?;
+        let work = layout.join(&layout.work_dir());
+        let attest = GhAttest {
+            work: work.clone(),
+            gh: GhCheck::pinned(&layout, &settings),
+            trust: Box::new(HostExec::new(base.clone())),
+            runner: Box::new(SystemRunner),
+            switch_user: as_root,
+        };
         Ok(HostProbe {
-            work: layout.join(&layout.work_dir()),
+            work,
             run_as: as_root.then_some(settings.run_as),
             runner: Box::new(SystemRunner),
+            attest: Box::new(attest),
         })
     }
 
-    /// A probe that works in `work`, as `run_as`, starting the binary with `runner`.
-    pub fn new(work: PathBuf, run_as: Option<RunAs>, runner: Box<dyn Runner>) -> HostProbe {
+    /// A probe that works in `work`, as `run_as`, starting the binary with `runner` once
+    /// `attest` has vouched for the tarball.
+    pub fn new(
+        work: PathBuf,
+        run_as: Option<RunAs>,
+        runner: Box<dyn Runner>,
+        attest: Box<dyn Attest>,
+    ) -> HostProbe {
         HostProbe {
             work,
             run_as,
             runner,
+            attest,
         }
     }
 }
@@ -382,18 +496,28 @@ impl Drop for Scratch {
 }
 
 impl Probe for HostProbe {
-    fn meta_log(&self, commit: &CommitId, tarball: &[u8]) -> Result<Option<u64>, String> {
+    fn meta_log(
+        &self,
+        commit: &CommitId,
+        tarball: &[u8],
+        attestation: Option<&[u8]>,
+    ) -> Result<Option<u64>, ProbeFault> {
+        // Nothing of the tarball is unpacked or run until it is attested.
+        let attestation = attestation.ok_or_else(|| {
+            ProbeFault::Unattested("the bundle carries no attestation for the host's kbf".into())
+        })?;
+        self.attest
+            .verify(commit, tarball, attestation)
+            .map_err(|e| ProbeFault::Unattested(format!("the host's kbf is not attested: {e}")))?;
+        self.run(commit, tarball).map_err(ProbeFault::Failed)
+    }
+}
+
+impl HostProbe {
+    /// Unpack the (attested) tarball and run it.
+    fn run(&self, commit: &CommitId, tarball: &[u8]) -> Result<Option<u64>, String> {
         let io = |e: std::io::Error| format!("probe: {e}");
-        fs::create_dir_all(&self.work).map_err(io)?;
-        let name = format!("deploy-probe-{}", hex::encode(smoke::random(8)?));
-        let dir = Scratch(self.work.join(name));
-        fs::DirBuilder::new()
-            .mode(0o755)
-            .create(&dir.0)
-            .map_err(io)?;
-        if let Some(user) = self.run_as {
-            std::os::unix::fs::chown(&dir.0, Some(user.uid), Some(user.gid)).map_err(io)?;
-        }
+        let dir = scratch_in(&self.work, "deploy-probe", self.run_as)?;
         let packed = dir.0.join("kbf.tar.gz");
         fs::write(&packed, tarball).map_err(io)?;
         let binary = dir.0.join("kbf");
