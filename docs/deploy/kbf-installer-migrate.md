@@ -77,6 +77,19 @@ refused, exit 2, before any release is run):
      --database` the same. Its first look asks the database (the same call as `setup`'s dry
      run) and, when it cannot be asked, refuses with exit 2 naming what must exist, before any program runs
      and in a dry run too. A database whose schema is ahead of this installer is refused (exit 1).
+   - **Whose connection it is.** The URL names no role, so the database is asked as the user running the verb:
+     root for an apply, the invoking user for a dry run (as `setup` does, step 7 of `kbf-installer-setup.md`).
+     A host with a correct `kbf` role and database is still refused, exit 2, when its server does not let that
+     user in to the `kbf` database (peer authentication through a `pg_ident` map, or a local `trust` rule);
+     the refusal's text names the server's own reason first and then says this.
+   - **The release must be able to open the store.** The units run the adopted `current`, so the first look
+     reads the `state_schema` that release's `--version --json` reports: the newest Postgres schema the build
+     embeds a migration for. `0` means it embeds none and cannot open the store the units are switched to;
+     the run is refused with exit 3 before anything is changed, a dry run too, and the way out is a release
+     that can in `current` (the old tools) or a migration without `--mode`. A `previous` that reports `0` is
+     adopted with a warning: a revert to it cannot open the store. Only that number is checked: the migration
+     does not start the release against the database, so a build that reports a schema and still cannot open
+     this store (a flag it does not know, a schema outside what it supports) is found by the start.
    - A dry run lists the schema step (create, bring forward, or nothing to apply), the units whose
      `--state-store` would move, and the warning below. It asks the database and changes nothing.
    - An apply, once it holds both locks and has looked again, runs the installer's schema step (the one
@@ -126,8 +139,9 @@ and the installer is stopped with its lock held, so it writes no state while the
 
 Not done by the migration: `installer.toml` (the `min_generation` to put there is printed as the
 report's value; `setup` writes the file), the users, and the `orders/` directory (`setup`); on a frontend or
-all-in-one host, installing Postgres and creating its `kbf` role and database (`setup`; the migration refuses
-while they are absent), and the `kbf.toml` `state-store` key (see step 6).
+all-in-one host, installing Postgres and creating its `kbf` role and database (the host preparation's: design
+section 11 has `setup` do it, and `setup` as built does not; the migration refuses while they are absent),
+and the `kbf.toml` `state-store` key (see step 6).
 
 ## The test farm's hosts
 
