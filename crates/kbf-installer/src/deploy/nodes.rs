@@ -193,4 +193,28 @@ mod tests {
         assert_eq!(of(json!({"update": {"platform": "beos-ppc"}})), None);
         assert_eq!(of(json!({})), None);
     }
+
+    /// Proves the release-set hash is none for a listing that names nothing for the commit (no
+    /// release of it, or one with no components), and is the same whatever order the store
+    /// lists the components in. Catches an empty set hashed as if it were a release.
+    ///
+    /// Mutants planted: the empty check removed (the hash of nothing is returned); the lines
+    /// left unsorted.
+    #[test]
+    fn the_set_hash_is_none_for_nothing_and_independent_of_order() {
+        use super::set_hash;
+        let c = |sha: &str, name: &str| json!({"sha256": sha, "name": name});
+        let rel = |comps: Vec<serde_json::Value>| {
+            json!({"releases": [{"commit": "abc", "platforms": [
+                {"platform": "linux-x86_64", "components": comps}]}]})
+        };
+        assert!(set_hash(&json!({"releases": []}), "abc").is_none());
+        assert!(set_hash(&rel(vec![]), "abc").is_none());
+        assert!(set_hash(&rel(vec![c("1", "a")]), "other").is_none());
+        let one = set_hash(&rel(vec![c("1", "a"), c("2", "b")]), "abc").expect("hash");
+        let two = set_hash(&rel(vec![c("2", "b"), c("1", "a")]), "abc").expect("hash");
+        assert_eq!(one, two);
+        let other = set_hash(&rel(vec![c("1", "a")]), "abc").expect("hash");
+        assert_ne!(one, other);
+    }
 }

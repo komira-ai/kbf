@@ -618,3 +618,51 @@ fn a_header_on_the_last_line_and_an_array_of_tables() {
     fs::write(kbf_toml(&rig), [0xff, 0xfe]).expect("bytes");
     assert!(matches!(run(&mut rig, Mode::Apply).0, Outcome::Left(_)));
 }
+
+/// Catches a rollback that overwrites a file the operator changed after the migration, in the
+/// two shapes the byte comparison alone does not separate: a changed file whose kept original
+/// already had the keys (nothing was added, so the file is no "original plus the keys"), and a
+/// migrated file in which an operator then pointed one of the two keys elsewhere (a table that
+/// is no longer the original plus OUR keys). Both are left as they are, with the warning, and
+/// the kept original stays for the operator.
+///
+/// Mutants seen red: `added.is_empty() ||` removed from the restore (the first case is then
+/// overwritten with the kept copy); the `wanted` check of `only_the_keys_added` removed (the
+/// second case is then overwritten with the original, losing the operator's directory).
+#[test]
+fn a_rollback_leaves_a_file_the_operator_changed_in_either_shape() {
+    let kept = |rig: &Rig| rig.new_state_dir().join("migration-units/kbf.toml");
+    let migrated = insert(
+        NODE,
+        &[
+            ("update-dir", UPDATE.to_owned()),
+            ("orders-dir", ORDERS.to_owned()),
+        ],
+    );
+
+    // The original had both keys already; the operator then added a table.
+    let mut rig = Rig::linux("restore-edited-had-keys");
+    put_toml(&rig, &migrated);
+    put(&kept(&rig), &migrated, 0o600);
+    let edited = format!("{migrated}\n[extra]\nx = 1\n");
+    fs::write(kbf_toml(&rig), &edited).expect("edit");
+    let report = restore_flaky(&mut rig, None, None).expect("restore");
+    assert_eq!(read(&rig), edited);
+    assert_eq!(fs::read_to_string(kept(&rig)).expect("kept"), migrated);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(report.warnings[0].contains("left as it is"));
+    assert!(report.lines.is_empty(), "{:?}", report.lines);
+
+    // The original had neither; the operator changed what the migration wrote.
+    let mut rig = Rig::linux("restore-edited-other-dir");
+    put_toml(&rig, &migrated);
+    put(&kept(&rig), NODE, 0o600);
+    let moved = migrated.replace(UPDATE, "/srv/their-own");
+    assert_ne!(moved, migrated);
+    fs::write(kbf_toml(&rig), &moved).expect("edit");
+    let report = restore_flaky(&mut rig, None, None).expect("restore");
+    assert_eq!(read(&rig), moved);
+    assert_eq!(fs::read_to_string(kept(&rig)).expect("kept"), NODE);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(report.lines.is_empty(), "{:?}", report.lines);
+}
