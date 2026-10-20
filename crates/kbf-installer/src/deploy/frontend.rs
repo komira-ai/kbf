@@ -1,7 +1,8 @@
 //! Step 4: the frontend update, through the update API the proxy serves
 //! (`docs/design/frontend-proxy.md`, section 4).
 //!
-//! `POST /v1/update/frontend {commit, request_id, nodes: true, rollback: false}` starts it, and
+//! `POST /v1/update/frontend {commit, request_id, nodes, rollback: false}` (`nodes` is
+//! [`super::Options::nodes`]: true for a deploy) starts it, and
 //! `GET /v1/update/frontend` is read until the update the POST named is `done` (the step
 //! succeeds), `failed` or `rolled_back` (it fails, with the step and the reason the API gave).
 //! The deploy does not set the desired release: with `nodes: true` the new frontend does, once
@@ -196,7 +197,7 @@ impl Run<'_> {
             &UpdateRequest {
                 commit: self.opts.commit.clone(),
                 request_id: self.opts.request_id.clone(),
-                nodes: true,
+                nodes: self.opts.nodes,
                 rollback: false,
             },
         );

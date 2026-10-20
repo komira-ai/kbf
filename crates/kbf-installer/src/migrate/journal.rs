@@ -50,6 +50,11 @@ pub struct Journal {
     /// rollback takes and leaves none.
     #[serde(default)]
     pub kit: bool,
+    /// A kit host's rollback moved `installer.toml` and the installer's tree aside under this
+    /// suffix (`.rolled-back-<UTC time>`), chosen once so a rollback run again finishes with
+    /// the same one.
+    #[serde(default)]
+    pub aside: Option<String>,
 }
 
 impl Journal {
@@ -62,6 +67,7 @@ impl Journal {
             stopped: Vec::new(),
             adopted: Vec::new(),
             kit: false,
+            aside: None,
         }
     }
 

@@ -609,15 +609,13 @@ fn node_with_a_lease(farm: &Farm) -> Option<usize> {
 /// failed action, the log says `run dropped`), a frontend that fails an action because the
 /// member it ran on is planned down, and a member that does not come back.
 ///
-/// Today it is `#[ignore]`d for a finding of the product, not of the test: the actions all
-/// complete (the dropped lease is run again on another node or the restarted one), but
-/// the victim logs `run dropped; cleaning up` when it gets SIGTERM, because a node does not
-/// drain the leases it runs before it stops (kbf#1087). Run it with `--run-ignored all`.
+/// A node that stopped its leases at SIGTERM completed every action too (the dropped lease
+/// is run again on another node), so the test reads the logs: the victim drains (kbf#1087),
+/// and no process logs `run dropped`.
 ///
 /// It runs about half a minute and is on the slow list of the pull-request gate
 /// (`.config/nextest.toml`); the beta workflow runs it.
 #[test]
-#[ignore = "kbf#1087: SIGTERM of a node stops a running lease without draining it: `run dropped` is logged and the action is rerun elsewhere"]
 fn a_loaded_node_restarts_planned_down_and_loses_no_action() {
     // No plain daemon: every lease runs on a node's own daemon half.
     let topology = Topology {

@@ -31,7 +31,7 @@ fn new_bin(rig: &Rig) -> String {
 /// Catches `migrate` answering "nothing to migrate" for a Mac the kit installed, and a
 /// migration that is not whole: both releases adopted from the links, state schema 2 with
 /// `current` and `previous` as the links named them, the plist repointed at the installer's
-/// tree with every other byte kept, the kit's tree and `kbf.toml` untouched, the version
+/// tree with every other byte kept, the kit's tree untouched and `kbf.toml` with the node's two keys added, the version
 /// asked of `releases/<sha>/kbf`, and nothing made in the old tools' places (no
 /// `/var/db/kbf-deploy`, no lock file).
 ///
@@ -82,10 +82,18 @@ fn a_kit_host_is_adopted_from_its_links_and_plist_in_both_forms() {
             tree,
             "the kit's tree is kept"
         );
-        assert_eq!(
-            fs::read(at(&rig.host.root, KBF_TOML_PATH)).expect("toml"),
-            toml
+        // Only the node's two keys are new: the layout's directories, in the `[daemon]` table.
+        let wanted = String::from_utf8(toml).expect("text").replacen(
+            "[daemon]\n",
+            "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\norders-dir = \"/var/db/kbf-installer/orders\"\n",
+            1,
         );
+        assert_eq!(
+            fs::read_to_string(at(&rig.host.root, KBF_TOML_PATH)).expect("toml"),
+            wanted,
+            "{form:?}"
+        );
+        assert!(rig.at("var/db/kbf-installer/orders").is_dir());
         assert!(!rig.at("var/db/kbf-deploy").exists());
         assert!(!rig.at("var/run/kbf-deploy.lock").exists());
         let journal = rig.json(&rig.new_state_dir().join("migration.json"));
@@ -182,6 +190,374 @@ fn rolling_back_a_kit_host_restores_the_kits_plist_and_links() {
         let again = rollback(&m, &mut rig.host, Mode::Apply).expect("again");
         assert!(again.to_string().contains("already rolled back"));
     }
+}
+
+const INSTALLER_JOB: &str = "com.komira.kbf-installer.plist";
+const INSTALLER_TOML_PATH: &str = "usr/local/etc/kbf/installer.toml";
+const INSTALLER_TOML: &str = "[installer]\nmin_generation = 17\n";
+
+/// A kit host the installer adopted and now runs: `installer.toml` written (as `setup` does)
+/// and the installer's own job loaded.
+fn adopted_with_installer(name: &str, form: Form) -> Rig {
+    let mut rig = Rig::kit(name, Platform::MacOs, form);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    put(&rig.at(INSTALLER_TOML_PATH), INSTALLER_TOML, 0o644);
+    rig.active.borrow_mut().insert(INSTALLER_JOB.to_owned());
+    rig.events.borrow_mut().clear();
+    rig
+}
+
+/// The entries of `dir` (below the rig's root) named `<name>.rolled-back-...`, sorted.
+fn asides(rig: &Rig, dir: &str, name: &str) -> Vec<String> {
+    let prefix = format!("{name}.rolled-back-");
+    let mut found: Vec<String> = fs::read_dir(rig.at(dir))
+        .expect("dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
+    found.sort();
+    found
+}
+
+/// Catches a kit-host rollback that leaves the installer able to act on a Mac the kit manages
+/// again (the kit refuses to manage a Mac while `/usr/local/kbf-installer` exists, and a
+/// KeepAlive job gated on `installer.toml` would start a binary that moved): after the kit's
+/// plist and job are back the installer's job is booted out and disabled, `installer.toml`
+/// and the tree are moved aside under one dated suffix (the toml first), the journal stays,
+/// and the report says to reinstall the .pkg. The old-host rollback is a different test.
+///
+/// Mutant seen red: `installer.toml` left out of the moves; the installer's job left
+/// booted out before the kit's own is back (the order assertion, red on the first run of
+/// this test before the change).
+/// Catches a kit-host rollback that stops the installer's job only when `--installer-unit`
+/// names it: without the flag the job must still be booted out and disabled before either
+/// file moves, or launchd could start `kbf-installer run` from a tree that is moving.
+///
+/// Mutant seen red: the kit branch's default job removed (`None` skips the stop).
+#[test]
+fn a_kit_rollback_stops_the_installer_job_without_the_flag() {
+    let mut rig = adopted_with_installer("hands-off-noflag", Form::New);
+    let mut m = rig.migration();
+    m.installer_unit = None;
+    let report = rollback(&m, &mut rig.host, Mode::Apply).expect("rollback");
+    assert_eq!(report.outcome, Outcome::RolledBack);
+    assert!(!rig.active.borrow().contains(INSTALLER_JOB));
+    let events = rig.events.borrow().clone();
+    let disabled = events
+        .iter()
+        .position(|e| e.starts_with(&format!("disable {INSTALLER_JOB}")))
+        .unwrap_or_else(|| panic!("no disable in {events:?}"));
+    assert!(
+        events[disabled].ends_with("links=true"),
+        "disabled while the files were still in place: {events:?}"
+    );
+    assert!(!rig.at("usr/local/kbf-installer").exists());
+    assert!(!rig.at(INSTALLER_TOML_PATH).exists());
+}
+
+#[test]
+fn rolling_back_a_kit_host_leaves_no_installer_able_to_act() {
+    for form in [Form::New, Form::Old] {
+        let mut rig = adopted_with_installer(&format!("hands-off-{form:?}"), form);
+        let mut m = rig.migration();
+        m.installer_unit = Some(unit(INSTALLER_JOB));
+        let report = rollback(&m, &mut rig.host, Mode::Apply).expect("rollback");
+
+        assert_eq!(report.outcome, Outcome::RolledBack);
+        assert_eq!(
+            fs::read_to_string(at(&rig.host.root, PLIST_PATH)).expect("plist"),
+            plist_of(form),
+            "{form:?}"
+        );
+        let current = rig.at("usr/local/kbf/current");
+        assert_eq!(
+            fs::read_link(current).expect("link").to_str(),
+            Some(format!("releases/{CURRENT}").as_str())
+        );
+        assert!(rig.active.borrow().contains("com.komira.kbf-daemon.plist"));
+
+        // The installer's job: not loaded, disabled, after the kit's job came back and
+        // while its files were still where they were.
+        assert!(!rig.active.borrow().contains(INSTALLER_JOB));
+        let events = rig.events.borrow().clone();
+        let at_event = |what: &str| {
+            events
+                .iter()
+                .position(|e| e.starts_with(what))
+                .unwrap_or_else(|| panic!("{what} not in {events:?}"))
+        };
+        let (started, stopped, disabled) = (
+            at_event("start com.komira.kbf-daemon.plist"),
+            at_event(&format!("stop {INSTALLER_JOB}")),
+            at_event(&format!("disable {INSTALLER_JOB}")),
+        );
+        assert!(started < stopped && stopped < disabled, "{events:?}");
+        assert!(events[stopped].ends_with("links=true"), "{events:?}");
+
+        // The files: gone from their places, a sibling with the same suffix each.
+        assert!(!rig.at("usr/local/kbf-installer").exists());
+        assert!(!rig.at(INSTALLER_TOML_PATH).exists());
+        let tree = asides(&rig, "usr/local", "kbf-installer");
+        let toml = asides(&rig, "usr/local/etc/kbf", "installer.toml");
+        assert_eq!((tree.len(), toml.len()), (1, 1), "{form:?}");
+        let suffix = |name: &str, base: &str| name.strip_prefix(base).expect("prefix").to_owned();
+        let suffix_tree = suffix(&tree[0], "kbf-installer");
+        assert_eq!(suffix_tree, suffix(&toml[0], "installer.toml"));
+        assert!(
+            suffix_tree.starts_with(".rolled-back-") && suffix_tree.ends_with('Z'),
+            "{suffix_tree}"
+        );
+        assert_eq!(
+            suffix_tree.len(),
+            ".rolled-back-".len() + 16,
+            "{suffix_tree}"
+        );
+        assert_eq!(
+            fs::read_to_string(rig.at("usr/local/etc/kbf").join(&toml[0])).expect("kept"),
+            INSTALLER_TOML
+        );
+        assert!(
+            rig.at("usr/local")
+                .join(&tree[0])
+                .join("releases/current")
+                .exists(),
+            "the tree moved whole"
+        );
+
+        // The record stays.
+        assert!(rig.new_state_dir().join("migration.json").is_file());
+        let shown = report.to_string();
+        assert!(
+            shown.contains("reinstall the kbf-installer .pkg"),
+            "{shown}"
+        );
+        assert!(shown.contains(&suffix_tree), "{shown}");
+    }
+}
+
+const NOON: u64 = 1_792_497_600; // 2026-10-20T12:00:00Z
+const NOON_SUFFIX: &str = ".rolled-back-20261020T120000Z";
+const LATER: u64 = NOON + 3600;
+
+fn rolled_back_at(rig: &mut Rig, now: u64) -> Result<Report, MigrateError> {
+    let mut m = rig.migration();
+    m.installer_unit = Some(unit(INSTALLER_JOB));
+    rollback_at(&m, &mut rig.host, Mode::Apply, now)
+}
+
+/// Everything under `usr/local` and `var/db`, which is where a rollback moves things.
+fn host_files(rig: &Rig) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    (rig.snapshot("usr/local"), rig.snapshot("var/db"))
+}
+
+/// Catches a second rollback that moves again, runs launchctl again or fails: the aside
+/// suffix is the clock's second of the first rollback (UTC, fixed width), and a rollback
+/// after it says it is done and changes no file and runs no command.
+///
+/// Mutant seen red: the `RolledBack` phase not written for a kit host (the second run
+/// boots the job out and reports a rollback again).
+#[test]
+fn a_second_kit_rollback_moves_nothing_twice() {
+    let mut rig = adopted_with_installer("twice", Form::New);
+    rolled_back_at(&mut rig, NOON).expect("rollback");
+    let tree = format!("kbf-installer{NOON_SUFFIX}");
+    assert!(rig.at("usr/local").join(&tree).is_dir());
+    assert!(
+        rig.at("usr/local/etc/kbf")
+            .join(format!("installer.toml{NOON_SUFFIX}"))
+            .is_file()
+    );
+    let (files, events) = (host_files(&rig), rig.events.borrow().clone());
+
+    let again = rolled_back_at(&mut rig, LATER).expect("again");
+    assert_eq!(again.outcome, Outcome::NothingToMigrate);
+    assert!(again.to_string().contains("already rolled back"));
+    assert_eq!(host_files(&rig), files);
+    assert_eq!(*rig.events.borrow(), events);
+    let journal = rig.json(&rig.new_state_dir().join("migration.json"));
+    assert_eq!(journal["aside"], NOON_SUFFIX);
+    assert_eq!(journal["phase"], "rolled_back");
+}
+
+/// Catches a rollback that overwrites a dated name, or half moves: with a name taken
+/// (the tree's, then `installer.toml`'s) the rollback is refused naming it, nothing is moved
+/// and the blocker keeps its bytes; the job is already booted out by then (it comes before
+/// the moves), and once the blocker is gone the same verb run again finishes, with the
+/// suffix the first run chose (not the second run's later one).
+///
+/// Mutant seen red: the target check dropped (the blocker's bytes replaced).
+#[test]
+fn a_dated_name_that_is_taken_is_refused_and_a_rerun_finishes() {
+    for (dir, name, blocker_is_dir) in [
+        ("usr/local", "kbf-installer", true),
+        ("usr/local/etc/kbf", "installer.toml", false),
+    ] {
+        let mut rig = adopted_with_installer(&format!("taken-{name}"), Form::Old);
+        let blocker = rig.at(dir).join(format!("{name}{NOON_SUFFIX}"));
+        if blocker_is_dir {
+            fs::create_dir(&blocker).expect("blocker");
+        } else {
+            put(&blocker, "someone else's\n", 0o644);
+        }
+        let before = rig.snapshot("usr/local");
+        let error = rolled_back_at(&mut rig, NOON).expect_err("refused");
+        assert!(
+            matches!(&error, MigrateError::Conflict(w) if w.contains(&format!("{name}{NOON_SUFFIX}"))),
+            "{error}"
+        );
+        assert_eq!(error.exit(), Exit::NeedsOperator);
+        assert!(rig.at("usr/local/kbf-installer").is_dir());
+        assert!(rig.at(INSTALLER_TOML_PATH).is_file());
+        assert_eq!(
+            rig.snapshot("usr/local"),
+            before,
+            "nothing moved, nothing replaced"
+        );
+        assert!(
+            !rig.active.borrow().contains(INSTALLER_JOB),
+            "booted out first"
+        );
+        let journal = rig.json(&rig.new_state_dir().join("migration.json"));
+        assert_ne!(journal["phase"], "rolled_back");
+        assert_eq!(journal["aside"], NOON_SUFFIX, "the suffix is chosen once");
+
+        if blocker_is_dir {
+            fs::remove_dir(&blocker).expect("clear");
+        } else {
+            fs::remove_file(&blocker).expect("clear");
+        }
+        let report = rolled_back_at(&mut rig, LATER).expect("finished");
+        assert_eq!(report.outcome, Outcome::RolledBack);
+        assert!(!rig.at("usr/local/kbf-installer").exists());
+        assert!(!rig.at(INSTALLER_TOML_PATH).exists());
+        assert_eq!(
+            asides(&rig, "usr/local", "kbf-installer"),
+            [format!("kbf-installer{NOON_SUFFIX}")]
+        );
+        assert_eq!(
+            asides(&rig, "usr/local/etc/kbf", "installer.toml"),
+            [format!("installer.toml{NOON_SUFFIX}")]
+        );
+    }
+}
+
+/// Catches a rollback that cannot finish after dying between the two moves: with
+/// `installer.toml` already aside (as a run that died after its first move left it) the
+/// run again moves the tree under the toml's suffix, the journal's, and moves the toml no
+/// more.
+///
+/// Mutant seen red: the suffix chosen again on every run (the two names then differ).
+#[test]
+fn a_rollback_that_died_between_the_moves_finishes_with_the_same_suffix() {
+    let mut rig = adopted_with_installer("between", Form::New);
+    let blocker = rig
+        .at("usr/local")
+        .join(format!("kbf-installer{NOON_SUFFIX}"));
+    fs::create_dir(&blocker).expect("blocker");
+    rolled_back_at(&mut rig, NOON).expect_err("stopped before the moves");
+    fs::remove_dir(&blocker).expect("clear");
+    fs::rename(
+        rig.at(INSTALLER_TOML_PATH),
+        rig.at("usr/local/etc/kbf")
+            .join(format!("installer.toml{NOON_SUFFIX}")),
+    )
+    .expect("the first move, done by the run that died");
+
+    let report = rolled_back_at(&mut rig, LATER).expect("finished");
+    assert_eq!(report.outcome, Outcome::RolledBack);
+    assert!(
+        rig.at("usr/local")
+            .join(format!("kbf-installer{NOON_SUFFIX}"))
+            .is_dir()
+    );
+    assert_eq!(
+        asides(&rig, "usr/local/etc/kbf", "installer.toml"),
+        [format!("installer.toml{NOON_SUFFIX}")]
+    );
+    assert!(!rig.at("usr/local/kbf-installer").exists());
+}
+
+/// Catches a dry run that acts, and a plan that does not say it: nothing moves, no
+/// command runs, and the plan names the installer's job and files.
+///
+/// Not run as mutants: the plan line missing.
+#[test]
+fn a_kit_rollback_dry_run_says_what_it_would_move_and_moves_nothing() {
+    let mut rig = adopted_with_installer("dry-rollback", Form::New);
+    let (files, events) = (host_files(&rig), rig.events.borrow().clone());
+    let mut m = rig.migration();
+    m.installer_unit = Some(unit(INSTALLER_JOB));
+    let report = rollback_at(&m, &mut rig.host, Mode::DryRun, NOON).expect("plan");
+    assert_eq!(report.outcome, Outcome::Planned);
+    let shown = report.to_string();
+    assert!(
+        shown.contains("move installer.toml and the installer's tree aside"),
+        "{shown}"
+    );
+    assert_eq!(host_files(&rig), files);
+    assert_eq!(*rig.events.borrow(), events);
+    assert!(rig.active.borrow().contains(INSTALLER_JOB));
+}
+
+/// Catches `migrate --apply` crashing, or silently re-adopting a Mac the kit manages again,
+/// after a kit rollback: with the tree aside, `migrate` and `guard` (so `setup`) are refused
+/// with the way back (reinstall the .pkg) and change nothing; once a tree is there again (the
+/// package reinstalled) `migrate` goes ahead from the kit's links and clears the suffix.
+///
+/// Mutant seen red: the refusal left out (`migrate` makes a new tree from nothing).
+#[test]
+fn after_a_kit_rollback_migrate_and_setup_say_to_reinstall_the_package() {
+    let mut rig = adopted_with_installer("reinstall", Form::New);
+    rolled_back_at(&mut rig, NOON).expect("rollback");
+
+    let before = rig.snapshot("");
+    for error in [
+        run_migrate(&mut rig, &never(), Mode::Apply).expect_err("migrate"),
+        run_migrate(&mut rig, &never(), Mode::DryRun).expect_err("plan"),
+        guard(&rig.layout, me()).expect_err("setup's guard"),
+    ] {
+        assert!(matches!(error, MigrateError::KitRolledBack), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("reinstall the kbf-installer .pkg")
+        );
+        assert_eq!(error.exit(), Exit::NeedsOperator);
+    }
+    assert_eq!(rig.snapshot(""), before, "refusing changes nothing");
+
+    // The package is installed again: a tree is there, and the host is the kit's to hand over.
+    fs::create_dir_all(rig.at("usr/local/kbf-installer")).expect("the package's tree");
+    let report = run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate again");
+    assert_eq!(report.outcome, Outcome::Migrated);
+    let journal = rig.json(&rig.new_state_dir().join("migration.json"));
+    assert_eq!(journal["phase"], "done");
+    assert_eq!(journal["aside"], serde_json::Value::Null);
+}
+
+/// Catches the old-host rollback changing: it keeps the installer's tree and its
+/// `installer.toml` where they are, moves nothing aside and says the tree is kept.
+///
+/// Mutant seen red: the kit branch run for every host (the tree is moved).
+#[test]
+fn an_old_host_rollback_keeps_the_installer_tree_and_toml() {
+    let mut rig = Rig::mac("old-host-keeps");
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    put(&rig.at(INSTALLER_TOML_PATH), INSTALLER_TOML, 0o644);
+    let mut m = rig.migration();
+    m.installer_unit = Some(unit(INSTALLER_JOB));
+    let report = rollback_at(&m, &mut rig.host, Mode::Apply, NOON).expect("rollback");
+    assert_eq!(report.outcome, Outcome::RolledBack);
+    assert!(rig.at("usr/local/kbf-installer/releases").is_dir());
+    assert_eq!(
+        fs::read_to_string(rig.at(INSTALLER_TOML_PATH)).expect("kept"),
+        INSTALLER_TOML
+    );
+    assert!(asides(&rig, "usr/local", "kbf-installer").is_empty());
+    assert!(asides(&rig, "usr/local/etc/kbf", "installer.toml").is_empty());
+    let shown = report.to_string();
+    assert!(shown.contains("The new tree is kept"), "{shown}");
+    assert!(!shown.contains(".pkg"), "{shown}");
 }
 
 /// What a test does to a kit host to make it half of one.

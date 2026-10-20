@@ -50,7 +50,7 @@ impl Durable for Fsync {
 /// Writes the intent record under `dir`.
 pub struct FileRecorder {
     dir: PathBuf,
-    sync: Box<dyn Durable>,
+    sync: Box<dyn Durable + Send + Sync>,
 }
 
 impl FileRecorder {
@@ -58,7 +58,7 @@ impl FileRecorder {
         FileRecorder::with_sync(dir, Box::new(Fsync))
     }
 
-    pub(super) fn with_sync(dir: &Path, sync: Box<dyn Durable>) -> FileRecorder {
+    pub(super) fn with_sync(dir: &Path, sync: Box<dyn Durable + Send + Sync>) -> FileRecorder {
         FileRecorder {
             dir: dir.to_owned(),
             sync,
