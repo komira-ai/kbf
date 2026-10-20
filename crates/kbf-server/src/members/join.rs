@@ -45,7 +45,7 @@ pub(super) const BOOTSTRAP: Duration = Duration::from_secs(60);
 const FORMING: &str = "meta/members_forming";
 
 /// The prefix of the marks of members that were admitted as joiners and not yet promoted.
-const UNFILLED: &str = "unfilled/";
+pub(super) const UNFILLED: &str = "unfilled/";
 
 pub(super) fn unfilled_key(id: MemberId) -> String {
     format!("{UNFILLED}{}", id.0)
