@@ -350,6 +350,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct HostProbe {
     work: PathBuf,
     run_as: Option<RunAs>,
+    runner: Box<dyn Runner>,
 }
 
 impl HostProbe {
@@ -363,12 +364,17 @@ impl HostProbe {
         Ok(HostProbe {
             work: layout.join(&layout.work_dir()),
             run_as: root.then_some(settings.run_as),
+            runner: Box::new(SystemRunner),
         })
     }
 
-    /// A probe that works in `work`, as `run_as`.
-    pub fn new(work: PathBuf, run_as: Option<RunAs>) -> HostProbe {
-        HostProbe { work, run_as }
+    /// A probe that works in `work`, as `run_as`, starting the binary with `runner`.
+    pub fn new(work: PathBuf, run_as: Option<RunAs>, runner: Box<dyn Runner>) -> HostProbe {
+        HostProbe {
+            work,
+            run_as,
+            runner,
+        }
     }
 }
 
@@ -400,7 +406,8 @@ impl Probe for HostProbe {
         crate::archive::unpack_one(&packed, "kbf", &binary, MAX_BINARY, PROBE_TIMEOUT)
             .map_err(|e| format!("probe: the kbf tarball: {e:?}"))?;
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).map_err(io)?;
-        let ran = SystemRunner
+        let ran = self
+            .runner
             .run(&Spawn {
                 program: binary,
                 args: vec!["--version".into(), "--json".into()],

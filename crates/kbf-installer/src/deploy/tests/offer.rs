@@ -461,41 +461,111 @@ fn the_offer_file_is_read_only_through_the_validated_parse() {
     assert!(offer::read(&dir.join("absent.json")).is_err());
 }
 
-/// (d) Proves the real probe unpacks the host's `kbf` tarball, runs `--version --json` and
-/// returns what it prints: a number, none, and a refusal for a binary that names another
-/// commit or fails. Catches a probe that returns a constant or skips the commit check.
+/// A runner that answers every program with `stdout` (or the exit code `code`), and keeps
+/// what it was asked to run.
+struct Plays {
+    stdout: String,
+    code: i32,
+    asked: std::sync::Mutex<Vec<crate::run::Spawn>>,
+}
+
+impl crate::run::Runner for std::sync::Arc<Plays> {
+    fn run(&self, spawn: &crate::run::Spawn) -> io::Result<crate::run::Ran> {
+        self.asked.lock().unwrap().push(spawn.clone());
+        Ok(crate::run::Ran {
+            code: Some(self.code),
+            stdout: self.stdout.clone().into_bytes(),
+            stderr: Vec::new(),
+            timed_out: false,
+        })
+    }
+}
+
+/// (d) Proves the real probe unpacks the host's `kbf` tarball, starts `kbf --version --json`
+/// as the unprivileged user in a scratch directory with an empty environment, and returns
+/// what it prints: a number, none, and a refusal for a binary that names another commit,
+/// fails, or is not a tarball with a `kbf` in it. The scratch directory is gone after.
+/// Catches a probe that returns a constant, skips the commit check, runs as root, or leaves
+/// bytes behind.
 ///
-/// Mutants planted: the probe returning `Ok(None)`; the commit check removed.
+/// Mutants planted: the probe returning `Ok(None)`; the commit check removed; `run_as` not
+/// passed on.
 #[test]
-fn the_host_probe_runs_the_binary_and_reads_its_meta_log() {
+fn the_host_probe_unpacks_the_binary_and_reads_its_meta_log() {
     let (_, dir) = crate::testkit::host_root("deploy-offer-probe");
-    let probe = HostProbe::new(dir.join("work"), None);
     let short = &TARGET[..12];
-    let script = |body: &str| {
+    let version = |meta: &str, commit: &str| {
+        format!(
+            "{{\"commit\":\"{commit}\",{meta}\"min_protocol\":3,\"profile\":\"release\",\"protocol\":4,\"state_schema\":1,\"version\":\"0.1.0\"}}"
+        )
+    };
+    let tarball = || {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         let mut b = tar::Builder::new(&mut gz);
-        let bytes = format!("#!/bin/sh\n{body}\n").into_bytes();
         let mut h = tar::Header::new_gnu();
-        h.set_size(bytes.len() as u64);
+        h.set_size(5);
         h.set_mode(0o755);
         h.set_cksum();
-        b.append_data(&mut h, "kbf", &bytes[..]).unwrap();
+        b.append_data(&mut h, "kbf", &b"bytes"[..]).unwrap();
         b.finish().unwrap();
         drop(b);
         gz.finish().unwrap()
     };
-    let said = |meta: &str, commit: &str| {
-        format!(
-            "echo '{{\"commit\":\"{commit}\",{meta}\"min_protocol\":3,\"profile\":\"release\",\"protocol\":4,\"state_schema\":1,\"version\":\"0.1.0\"}}'"
-        )
-    };
     let commit = c(TARGET);
-    let run = |body: &str| probe.meta_log(&commit, &script(body));
-    assert_eq!(run(&said("\"meta_log\":4,", short)), Ok(Some(4)));
-    assert_eq!(run(&said("", short)), Ok(None));
-    assert!(run(&said("\"meta_log\":4,", "bbbbbbbbbbbb")).is_err());
-    assert!(run("exit 3").is_err());
+    let run = |stdout: String, code: i32| {
+        let plays = std::sync::Arc::new(Plays {
+            stdout,
+            code,
+            asked: Default::default(),
+        });
+        // Not root here, so the probe cannot chown its scratch directory to the user.
+        let probe = HostProbe::new(dir.join("work"), None, Box::new(plays.clone()));
+        let answer = probe.meta_log(&commit, &tarball());
+        (answer, plays)
+    };
+    let (answer, plays) = run(version("\"meta_log\":4,", short), 0);
+    assert_eq!(answer, Ok(Some(4)));
+    let asked = plays.asked.lock().unwrap();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].args, ["--version", "--json"]);
+    assert!(asked[0].env.is_empty());
+    assert!(asked[0].program.ends_with("kbf"));
+    assert!(asked[0].program.starts_with(dir.join("work")));
+    drop(asked);
+    assert_eq!(run(version("", short), 0).0, Ok(None));
+    assert!(
+        run(version("\"meta_log\":4,", "bbbbbbbbbbbb"), 0)
+            .0
+            .is_err()
+    );
+    assert!(run(String::new(), 3).0.is_err());
+    assert!(run("not json".into(), 0).0.is_err());
+    let not_a_tarball = HostProbe::new(
+        dir.join("work"),
+        None,
+        Box::new(std::sync::Arc::new(Plays {
+            stdout: version("", short),
+            code: 0,
+            asked: Default::default(),
+        })),
+    );
+    assert!(not_a_tarball.meta_log(&commit, b"not a tarball").is_err());
     // The scratch directory is gone.
     let left: Vec<_> = std::fs::read_dir(dir.join("work")).unwrap().collect();
     assert!(left.is_empty(), "{left:?}");
+    // The user the settings name is what the binary runs as (here the test's own user, which
+    // the scratch directory can be handed to without being root).
+    // SAFETY: geteuid and getegid have no preconditions and cannot fail.
+    let me = crate::run::RunAs {
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+    };
+    let plays = std::sync::Arc::new(Plays {
+        stdout: version("", short),
+        code: 0,
+        asked: Default::default(),
+    });
+    let as_me = HostProbe::new(dir.join("work"), Some(me), Box::new(plays.clone()));
+    assert_eq!(as_me.meta_log(&commit, &tarball()), Ok(None));
+    assert_eq!(plays.asked.lock().unwrap()[0].run_as, Some(me));
 }
