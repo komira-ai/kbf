@@ -531,6 +531,13 @@ fn a_cgroup_held_by_an_exiting_thread_is_waited_for() {
     assert_eq!(fake.pauses.borrow().len(), 25);
 }
 
+/// Catches the real mount's pause being a different call than the fake's: it returns
+/// (a zero pause), so the set-up on a real host waits through the same method.
+#[test]
+fn the_mounts_pause_returns() {
+    Mount(Path::new("/sys/fs/cgroup")).pause(Duration::ZERO);
+}
+
 /// Catches a failed move or enable read as done (leases would then fail making their
 /// cgroups), and a cgroup that never empties retried forever: each is an error naming
 /// the file, after a bounded number of tries.
