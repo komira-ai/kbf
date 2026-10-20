@@ -329,7 +329,8 @@ fn user_found(
 fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String, Failure> {
     let rehearsal = root != Path::new("/");
     let (layout, mut exec) = host(root)?;
-    let user = probe_user(&exec, &args.fetch_user, rehearsal)?;
+    let owner = owner_uid(rehearsal, rustix::process::geteuid().as_raw());
+    let (user, made) = probe_account(&mut exec, &layout, args, apply, rehearsal, owner)?;
     let m = migrate::Migration {
         roots: migrate::Roots::new(layout.platform()),
         layout,
@@ -337,7 +338,7 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
             uid: user.uid,
             gid: user.gid,
         },
-        owner_uid: owner_uid(rehearsal, rustix::process::geteuid().as_raw()),
+        owner_uid: owner,
         units: args.units.clone(),
         helper_unit: args.helper_unit.clone(),
         installer_unit: args.installer_unit.clone(),
@@ -371,7 +372,85 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
         exit: e.exit(),
         why: e.to_string(),
     })?;
-    Ok(report.to_string().trim_end().to_owned())
+    let mut shown = made;
+    shown.push(report.to_string().trim_end().to_owned());
+    Ok(shown.join("\n"))
+}
+
+/// The account the version probe runs as, and the lines of the steps that made it. The first
+/// step of an applying migration (before the first look at the old layout runs a binary): on a
+/// Mac with the platform's own fetch account (no `--fetch-user`, or its name), that has an old
+/// layout to migrate, the account is made when it is not there ([`make_fetch_user`]). Not in a
+/// dry run (it changes nothing, so the account must exist already, and says how it comes to),
+/// not in a rollback, and not in a rehearsal under `--root` (the host's accounts are not the
+/// rehearsal's to change).
+fn probe_account<E: kbf_host::Exec>(
+    exec: &mut E,
+    layout: &Layout,
+    args: &MigrateArgs,
+    apply: bool,
+    rehearsal: bool,
+    owner: u32,
+) -> Result<(kbf_host::RunUser, Vec<String>), Failure> {
+    let platform = layout.platform();
+    let standard = setup::plan::fetch_user(platform);
+    let name = args.fetch_user.as_deref().unwrap_or(standard);
+    let mut made = Vec::new();
+    if apply
+        && !args.rollback
+        && !rehearsal
+        && name == standard
+        && matches!(
+            migrate::guard(layout, owner),
+            Err(migrate::MigrateError::Unmigrated(_))
+        )
+    {
+        made = make_fetch_user(exec, platform)?;
+    }
+    let user = probe_user(&*exec, name, rehearsal).map_err(|f| {
+        if !apply && name == standard && platform == Platform::MacOs {
+            Failure {
+                why: format!(
+                    "{}; a dry run changes nothing and cannot make it: `migrate --apply` creates it, the way setup does",
+                    f.why
+                ),
+                ..f
+            }
+        } else {
+            f
+        }
+    })?;
+    Ok((user, made))
+}
+
+/// The fetch account on a Mac, made by the plan `setup` uses for it ([`setup::plan::fetch_user_plan`]:
+/// one definition of the account, so what `migrate` makes is what `setup` finds): the lines
+/// of the steps run, none when the account is there with the shape `setup` makes. An account
+/// of the wrong shape (uid, shell, home) is refused, not changed. On Linux the package's
+/// sysusers entry makes `kbf-fetch` when the package is installed, which `migrate` needs
+/// anyway, so there is nothing to make (and `setup` is not a prerequisite there either).
+fn make_fetch_user<E: kbf_host::Exec>(
+    exec: &mut E,
+    platform: Platform,
+) -> Result<Vec<String>, Failure> {
+    if platform != Platform::MacOs {
+        return Ok(Vec::new());
+    }
+    let plan = {
+        let os = setup::os::SystemOs::new(&*exec, platform);
+        setup::plan::fetch_user_plan(&os, &*exec)
+    }
+    .map_err(|e| Failure {
+        exit: e.exit(),
+        why: e.to_string(),
+    })?;
+    let mut lines = Vec::new();
+    for step in plan.steps() {
+        exec.apply(step)
+            .map_err(|e| Failure::from(format!("{step}: {e}")))?;
+        lines.push(format!("+ {step}"));
+    }
+    Ok(lines)
 }
 
 /// Refuses while the old layout's state is the host's and no migration finished.
@@ -744,6 +823,10 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "app_fetch_user_tests.rs"]
+mod fetch_user_tests;
 
 /// Start `me` in this process's place with this process's arguments; returns only the error
 /// of a start that failed. Not `Command::exec`: the standard library puts SIGPIPE back to its

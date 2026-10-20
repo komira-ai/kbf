@@ -176,8 +176,9 @@ fn a_dry_run_says_the_installer_will_be_enabled_and_does_not() {
     );
 }
 
-/// Catches an enable made when the operator named no installer unit (a kit Mac, whose
-/// installer is the kit's): nothing about the installer is run.
+/// Catches an enable made when the operator named no installer unit on an old host (a kit Mac
+/// is the exception: `kit_installer_job_tests` enables the package's job there): nothing about
+/// the installer is run.
 ///
 /// Mutant seen red: the `Option` ignored and the unit's name constant used.
 #[test]
