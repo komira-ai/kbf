@@ -530,3 +530,36 @@ fn a_description_is_refused_for_the_same_reasons_before_anything_starts() {
         "{got:?}"
     );
 }
+
+/// A description lends the node's identity to a `frontend` source's child as a component does,
+/// and an identity that cannot be read is the identity's fault, before any child exists (the
+/// program here does not, so a check that lets it through would be a `Spawn`).
+///
+/// Catches the identity's fault lost or turned into another (a child started without the
+/// identity it was to be lent), in the describe path as in the component path.
+///
+/// Mutant: `lend_identity` skipped in `describe_release` (red: the child cannot start).
+#[test]
+fn a_description_needs_the_nodes_identity_before_a_child_exists() {
+    use crate::testkit::A;
+    let commit = CommitId::new(A).expect("commit");
+    let frontend = Source::Frontend(FrontendSource {
+        url: "https://front.example:9000".to_owned(),
+        ca_file: "/nonexistent/ca.pem".into(),
+        node_cert: "/nonexistent/cert.pem".into(),
+        node_key: "/nonexistent/key.pem".into(),
+    });
+    let child = ChildProgram {
+        program: PathBuf::from("/nonexistent/kbf-installer"),
+        run_as: Some(RunAs { uid: 7, gid: 7 }),
+    };
+    let got = describe_release(
+        &child,
+        &frontend,
+        limits(),
+        &commit,
+        ReleasePlatform::LinuxX86_64,
+    );
+    assert!(matches!(got, Err(FetchError::Identity(_))), "{got:?}");
+    assert_eq!(got.unwrap_err().word(), "fetch");
+}

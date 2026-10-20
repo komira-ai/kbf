@@ -10,7 +10,9 @@
 //! network format that goes wrong goes wrong there. The parent reads that form and nothing
 //! else. It is still the word of a child that read a stranger's bytes, so the parent holds
 //! every field to its shape again ([`Description::select`]) before one of them names a file
-//! to fetch.
+//! to fetch. The child is told the host's platform and writes that platform's entries only
+//! (the `url` file lists every complete one): the entries of the others are not read, so a
+//! fault in one of them is no fault of this host's release.
 //!
 //! The form is lines of single-space separated words, ended by a newline:
 //!
@@ -58,8 +60,9 @@ pub struct Described {
     pub bundle_size: u64,
 }
 
-/// What a source says a commit holds, every platform it names.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+/// What a source says a commit holds: every platform it names, or (when the child was asked
+/// about one platform) that one.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Description {
     pub commit: String,
     pub components: Vec<Described>,
@@ -127,11 +130,29 @@ struct Schema {
     schema: u64,
 }
 
+/// The `url` source's JSON with its entries left unread, so that the ones of other platforms can
+/// be passed over without being held to the shape of an entry.
+#[derive(Deserialize)]
+struct Listing {
+    commit: String,
+    components: Vec<serde_json::Value>,
+}
+
+/// Whether an entry of `entry`'s platform is one that was asked about: every entry when no
+/// platform was.
+fn asked(platform: Option<&str>, entry: Option<&str>) -> bool {
+    platform.is_none_or(|p| entry == Some(p))
+}
+
 impl Answer {
     /// What the `url` source's file says (`docs/api.md`): the JSON of schema [`SCHEMA`], read
     /// here in the child. A file that is not JSON of that shape, or of another schema, is a
     /// refusal that says so.
-    pub fn from_json(file: &[u8]) -> Answer {
+    ///
+    /// With a `platform`, the entries of other platforms are skipped unread: the file lists every
+    /// complete platform, and a fault in what the host does not take is no fault of its release.
+    /// (An entry that does not name its platform as a string is not of the platform asked.)
+    pub fn from_json(file: &[u8], platform: Option<&str>) -> Answer {
         match serde_json::from_slice::<Schema>(file) {
             Ok(Schema { schema: SCHEMA }) => {}
             Ok(Schema { schema }) => {
@@ -141,19 +162,39 @@ impl Answer {
             }
             Err(e) => return Answer::Refused(format!("the file has no schema: {e}")),
         }
-        match serde_json::from_slice::<Description>(file) {
-            Ok(description) => Answer::Described(description),
-            Err(e) => Answer::Refused(format!("the file is not a description: {e}")),
+        let not_one =
+            |e: serde_json::Error| Answer::Refused(format!("the file is not a description: {e}"));
+        let listing = match serde_json::from_slice::<Listing>(file) {
+            Ok(listing) => listing,
+            Err(e) => return not_one(e),
+        };
+        let mut components = Vec::new();
+        for entry in listing.components {
+            let of = entry.get("platform").and_then(serde_json::Value::as_str);
+            if !asked(platform, of) {
+                continue;
+            }
+            match serde_json::from_value::<Described>(entry) {
+                Ok(entry) => components.push(entry),
+                Err(e) => return not_one(e),
+            }
         }
+        Answer::Described(Description {
+            commit: listing.commit,
+            components,
+        })
     }
 
-    /// What `ReleaseService.Describe` answered.
-    pub fn from_proto(said: ReleaseDescription) -> Answer {
+    /// What `ReleaseService.Describe` answered. With a `platform`, the entries of other
+    /// platforms are dropped, as for [`Answer::from_json`] (a frontend is asked for one platform
+    /// and gives that one; this does not rely on it).
+    pub fn from_proto(said: ReleaseDescription, platform: Option<&str>) -> Answer {
         Answer::Described(Description {
             commit: said.commit,
             components: said
                 .components
                 .into_iter()
+                .filter(|c| asked(platform, Some(&c.platform)))
                 .map(|c| Described {
                     name: c.name,
                     platform: c.platform,

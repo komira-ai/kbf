@@ -531,6 +531,45 @@ fn a_commit_the_source_will_not_describe_is_refused_with_its_words() {
     }
 }
 
+/// What the child sends back as a description is read strictly, and whatever is wrong with it is
+/// a release that could not be had (`Unavailable`, the word `fetch`), never a verdict on what
+/// arrived (`Rejected`, the word `stage`): bytes that are not the form, and bytes past the bound
+/// of a description alike. The first is the parser's refusal reaching the fetcher; the second is
+/// the pipe's `Oversize`, which for a component is a verdict on a source that sent more than it
+/// declared and for a description is only an answer that cannot be used.
+///
+/// Catches a description's fault carried to the frontend as `stage`, a too-long description worded
+/// as a size the source "declared" (nothing declares one), and a parse fault lost on the way.
+///
+/// Mutant: `Oversize` left to the pipe's error (red: `Rejected`).
+#[test]
+fn a_description_that_cannot_be_read_is_a_refused_fetch() {
+    let long = "component ".repeat(1700);
+    assert!(long.len() > 16 * 1024);
+    let cases: [(&[u8], &str); 3] = [
+        (b"not the form", "it does not end in a newline"),
+        (
+            b"description 2 x\n",
+            "the first line is not `description 1 <commit>`",
+        ),
+        (long.as_bytes(), "it is longer than 16384 bytes"),
+    ];
+    for (n, (said, why)) in cases.into_iter().enumerate() {
+        let rig = Rig::new(&format!("update-unreadable-{n}"));
+        rig.shelve("describe", said);
+        let ops = rig.shelf_ops();
+        let fetcher = rig.fetcher(Some(&ops), Answers::honest());
+        assert_eq!(
+            fetcher.fetch(&rec(Vec::new())),
+            Err(FetchError::Unavailable(format!(
+                "the description is not usable: {why}"
+            ))),
+            "{n}"
+        );
+        assert!(!rig.work().exists(), "nothing was made");
+    }
+}
+
 /// A description that is not complete for the host (only another platform's component), of
 /// another commit, or with a component the host cannot use, is refused with what is wrong
 /// (`fetch`, as a source's refusal is) and nothing is made.

@@ -249,8 +249,9 @@ fn child_flags(source: &Source, c: &Component<'_>, lend: Option<&OwnedFd>) -> Ve
     flags
 }
 
-/// The flags of `fetch-child` that ask `source` what `commit` holds. A frontend is also told
-/// the platform (it describes only that one); a `url` source's file lists them all.
+/// The flags of `fetch-child` that ask `source` what `commit` holds, told the platform: a
+/// frontend describes only that one, and the child skips the entries of the others in a `url`
+/// source's file (which lists them all) unread.
 fn describe_flags(
     source: &Source,
     commit: &CommitId,
@@ -264,9 +265,7 @@ fn describe_flags(
         // One byte more than the most, so that a child that writes more is seen to.
         (describe::MAX_BYTES + 1).to_string().into(),
     ];
-    if matches!(source, Source::Frontend(_)) {
-        flags.extend(["--platform".into(), platform.as_str().into()]);
-    }
+    flags.extend(["--platform".into(), platform.as_str().into()]);
     flags.extend(source_flags(source, lend));
     flags
 }
@@ -381,8 +380,9 @@ pub fn fetch_component(
 /// ([`describe`]); the parent holds that to the order's commit, the host's platform and the
 /// bounds of a release before it names a file. `limits.max_component_bytes` is the most a
 /// tarball may be, as for [`fetch_component`]. A source that says it will not describe the
-/// commit, or an answer that cannot be used, is [`FetchError::Describe`]. A source that cannot
-/// be reached is a pipe fault.
+/// commit, or an answer that cannot be used (one that is not the form, or is longer than
+/// [`describe::MAX_BYTES`]), is [`FetchError::Describe`]. A source that cannot be reached is a
+/// pipe fault.
 pub fn describe_release(
     child: &ChildProgram,
     source: &Source,
@@ -407,7 +407,16 @@ pub fn describe_release(
         lent.as_ref().map(AsFd::as_fd),
         caps,
         &mut said,
-    )?;
+    )
+    .map_err(|fault| match fault {
+        // For a component this is a source that sent more than it declared; a description
+        // declares nothing, and one that is too long is only one that cannot be used.
+        PipeFault::Oversize { .. } => {
+            DescribeFault::unusable(&format!("it is longer than {} bytes", describe::MAX_BYTES))
+                .into()
+        }
+        other => FetchError::from(other),
+    })?;
     drop(lent);
     match Answer::parse(&said)? {
         Answer::Refused(why) => Err(DescribeFault::Refused(why).into()),

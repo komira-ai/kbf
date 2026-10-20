@@ -244,10 +244,10 @@ fn the_urls_json_is_read_by_schema() {
     );
     let good = json("1", ",\"generated\":\"later\"", &one);
     assert_eq!(
-        Answer::from_json(good.as_bytes()),
+        Answer::from_json(good.as_bytes(), None),
         Answer::Described(description(vec![entry("kbf", "linux-x86_64")]))
     );
-    let refused = |file: &str| match Answer::from_json(file.as_bytes()) {
+    let refused = |file: &str| match Answer::from_json(file.as_bytes(), None) {
         Answer::Refused(why) => why,
         other => panic!("{file}: {other:?}"),
     };
@@ -279,9 +279,96 @@ fn the_frontends_answer_keeps_each_field() {
         }],
     };
     assert_eq!(
-        Answer::from_proto(said),
+        Answer::from_proto(said, None),
         Answer::Described(description(vec![entry("kbf", "linux-x86_64")]))
     );
+}
+
+/// When the child is told a platform it writes that platform's entries and passes over the others
+/// unread: an entry of another platform that is not even well formed (a size that is not a number,
+/// a platform that is not a string, something that is not an entry at all) is no obstacle, in the
+/// `url` file and in a frontend's answer alike. An entry of the platform asked is still held to
+/// the shape of one, and with no platform asked every entry is read, so a fault in any is a
+/// fault.
+///
+/// Catches the whole description refused for what the host does not take, the platform filter
+/// matching on a prefix or a case, and a faulty entry of the host's own platform let through.
+///
+/// Mutants: the filter removed from `from_json` and from `from_proto` (red); `entry == Some(p)`
+/// replaced by `true` (red).
+#[test]
+fn the_platform_asked_for_is_all_that_is_read() {
+    use kbf_proto::update::{ReleaseComponent, ReleaseDescription};
+    let well_formed = |platform: &str| {
+        serde_json::json!({
+            "name": "kbf", "platform": platform, "tarball": format!("kbf-{A}-{platform}.tar.gz"),
+            "sha256": SHA, "size": 1000, "bundle_sha256": BUNDLE, "bundle_size": 500,
+        })
+    };
+    let mine = well_formed("linux-x86_64");
+    let file = |others: &[serde_json::Value]| {
+        let mut components = others.to_vec();
+        components.push(mine.clone());
+        serde_json::json!({"schema": 1, "commit": A, "components": components})
+            .to_string()
+            .into_bytes()
+    };
+    let broken = [
+        serde_json::json!({"name": "kbf", "platform": "linux-arm64", "size": "big"}),
+        serde_json::json!({"platform": "linux-arm64"}),
+        serde_json::json!({"platform": 7, "size": []}),
+        serde_json::json!({"platform": "Linux-x86_64"}),
+        serde_json::json!({"platform": "linux-x86_64-"}),
+        serde_json::json!("not an entry"),
+        serde_json::json!(42),
+    ];
+    let want = Answer::Described(description(vec![entry("kbf", "linux-x86_64")]));
+    for other in &broken {
+        let bytes = file(std::slice::from_ref(other));
+        assert_eq!(
+            Answer::from_json(&bytes, Some("linux-x86_64")),
+            want,
+            "{other}"
+        );
+        // Asked about every platform, the same file is not a description.
+        assert!(
+            matches!(Answer::from_json(&bytes, None), Answer::Refused(_)),
+            "{other}"
+        );
+    }
+    // The platform asked about is held to the shape of an entry.
+    let bytes = file(&[serde_json::json!({"platform": "linux-arm64"})]);
+    assert!(matches!(
+        Answer::from_json(&bytes, Some("linux-arm64")),
+        Answer::Refused(_)
+    ));
+    // Another platform's entry that is well formed is passed over too.
+    let arm = well_formed("linux-arm64");
+    assert_eq!(Answer::from_json(&file(&[arm]), Some("linux-x86_64")), want);
+
+    let component = |platform: &str, bundle_sha256: &str| ReleaseComponent {
+        name: "kbf".to_owned(),
+        platform: platform.to_owned(),
+        tarball: format!("kbf-{A}-{platform}.tar.gz"),
+        sha256: SHA.to_owned(),
+        size: 1000,
+        bundle_sha256: bundle_sha256.to_owned(),
+        bundle_size: 500,
+    };
+    let said = ReleaseDescription {
+        commit: A.to_owned(),
+        components: vec![
+            component("linux-arm64", ""),
+            component("linux-x86_64", BUNDLE),
+        ],
+    };
+    assert_eq!(Answer::from_proto(said.clone(), Some("linux-x86_64")), want);
+    assert_eq!(Answer::from_proto(said.clone(), Some("darwin-arm64")), {
+        Answer::Described(description(Vec::new()))
+    });
+    // Every platform asked for: the broken one is kept, and the form cannot hold it.
+    let all = Answer::from_proto(said, None);
+    assert!(all.render().starts_with("refused "), "{}", all.render());
 }
 
 /// A good description of the host's platform gives back its components, in the order the

@@ -1709,6 +1709,49 @@ fn the_url_source_is_described_from_its_json() {
     assert_eq!(server.hits(), [json_path()]);
 }
 
+/// An entry of another platform is not read, not even to find it malformed: the `url` file lists
+/// every platform, a host takes its own, and a fault in what the host does not take (a size that
+/// is not a number, a digest that is empty, a name with a space in it) is no reason to refuse the
+/// release. The same holds for a frontend that does not filter by the platform it was asked.
+///
+/// Catches the whole description refused for another platform's entry (the file would be read as
+/// a whole, or the child would render every entry), which is the property the docs state.
+///
+/// Mutants: the platform not sent to the `url` child (red); the entries of other platforms kept by
+/// the child (red).
+#[test]
+fn a_malformed_entry_of_another_platform_is_not_read() {
+    let (pki, leaf) = pki_and_server();
+    let honest = json_file(1, COMMIT, &[entry("linux-arm64"), entry("linux-x86_64")]);
+    let spoiled = |key: &str, value: serde_json::Value| {
+        let mut file: serde_json::Value = serde_json::from_slice(&honest).expect("json");
+        file["components"][0][key] = value;
+        file.to_string().into_bytes()
+    };
+    let files = [
+        spoiled("size", serde_json::json!("big")),
+        spoiled("bundle_sha256", serde_json::json!("")),
+        spoiled("name", serde_json::json!("kbf kbf-daemon")),
+    ];
+    for (n, file) in files.into_iter().enumerate() {
+        let server = Https::start(&leaf, Plan::Files(vec![(json_path(), file)]));
+        let rig = Rig::new(&format!("describe-url-other-{n}"));
+        let source = rig.url_source(&format!("{}/mirror", server.url()), &pki.ca_pem());
+        let got = rig.describe(&source, ReleasePlatform::LinuxX86_64);
+        assert_eq!(got.expect("described"), [entry("linux-x86_64")], "{n}");
+    }
+
+    let mut other = entry("linux-arm64");
+    other.bundle_sha256 = String::new();
+    other.name = "kbf\nkbf-daemon".to_owned();
+    let said = proto_of(COMMIT, &[other, entry("linux-x86_64")]);
+    let grpc = Grpc::describing(&leaf, &pki.ca_pem(), Describing::Of(said));
+    let rig = Rig::new("describe-frontend-other");
+    let source = rig.frontend(&grpc.url(), &pki.ca_pem(), &pki.client());
+    let got = rig.describe(&source, ReleasePlatform::LinuxX86_64);
+    assert_eq!(got.expect("described"), [entry("linux-x86_64")]);
+}
+
 /// A `url` source that answers `404` or `409` for the file (the route of `docs/api.md` does, for a
 /// commit it holds nothing of or nothing complete of) has said there is nothing to describe: the
 /// source's answer, naming the file, and not a failure of the child. Any other status is a
@@ -1949,6 +1992,52 @@ fn the_child_writes_the_description_in_the_form() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), want);
 }
 
+/// Told a platform, the child writes that platform's entries only, and does not read the others:
+/// an entry of another platform that is not even well formed is passed over (here its size is a
+/// string), where a child told no platform refuses the whole file for it.
+///
+/// Catches the platform not reaching the `url` reader (the `--platform` flag taken for a
+/// frontend's alone), and the child choosing among platforms by reading all of them first.
+///
+/// Mutant: `args.platform` passed as `None` to the JSON reader (red: refused).
+#[test]
+fn the_child_writes_only_the_platform_it_is_told() {
+    let (pki, leaf) = pki_and_server();
+    let mut file: serde_json::Value = serde_json::from_slice(&json_file(
+        1,
+        COMMIT,
+        &[entry("linux-arm64"), entry("linux-x86_64")],
+    ))
+    .expect("json");
+    file["components"][0]["size"] = serde_json::json!("big");
+    let server = Https::start(
+        &leaf,
+        Plan::Files(vec![(
+            "/releases/".to_owned() + COMMIT + ".json",
+            file.to_string().into_bytes(),
+        )]),
+    );
+    let rig = Rig::new("hand-describe-platform");
+    let ca = rig.write("ca.pem", &pki.ca_pem());
+    let mut args = describe_args(&server.url(), &ca, 16 * 1024 + 1);
+    let out = by_hand(&args);
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("refused the file is not a description"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    args.extend(["--platform", "linux-x86_64"].map(str::to_owned));
+    let out = by_hand(&args);
+    assert!(out.status.success(), "{}", said(&out));
+    let e = entry("linux-x86_64");
+    let want = format!(
+        "description 1 {COMMIT}\ncomponent {} {} {} {} {} {} {}\n",
+        e.name, e.platform, e.tarball, e.sha256, e.size, e.bundle_sha256, e.bundle_size
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
 /// A file cut at the child's limit is not a description: it is read as far as the limit and
 /// refused, with the child's words, as one line and success.
 ///
@@ -2131,6 +2220,41 @@ fn the_frontend_child_writes_a_refusal_for_two_statuses() {
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
     assert!(said(&out).contains("Internal: it broke"), "{}", said(&out));
+}
+
+/// A frontend describe that is given a URL with a path, or whose frontend is not there, is a
+/// failed fetch of the child that says which (as for a blob), and nothing is written.
+///
+/// Catches either failure taken for an answer (a refusal written for a frontend that was never
+/// asked), and the describe path skipping the URL check the blob path makes.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_frontend_describe_that_cannot_start_or_connect_fails_the_child() {
+    let (pki, _) = pki_and_server();
+    let id = identity_of(&pki, &pki.client());
+    let lent = Lent {
+        id: &id,
+        at: 4,
+        tidy: true,
+    };
+    let what = ["--describe", COMMIT, "--platform", "linux-x86_64"];
+    let out = frontend_asked("https://localhost:1/path", &what, 16 * 1024 + 1, &lent);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(
+        said(&out).contains("not a plain https URL"),
+        "{}",
+        said(&out)
+    );
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    };
+    let url = format!("https://localhost:{port}");
+    let out = frontend_asked(&url, &what, 16 * 1024 + 1, &lent);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(said(&out).contains("source unreachable"), "{}", said(&out));
 }
 
 // ------------------------------------------------------ the whole of it, on the real child

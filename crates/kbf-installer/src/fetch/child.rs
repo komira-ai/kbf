@@ -65,8 +65,9 @@ pub struct ChildArgs {
     /// fetching a blob.
     #[arg(long)]
     pub describe: Option<String>,
-    /// `frontend` with `--describe`: the one platform to ask about (a `url` source's file
-    /// lists every platform).
+    /// With `--describe`: the one platform to write the entries of. A `frontend` source is asked
+    /// for it; a `url` source's file lists every platform, and the entries of the others are
+    /// skipped unread. Without it, every platform the source names is written.
     #[arg(long, requires = "describe")]
     pub platform: Option<String>,
     /// The most bytes written to standard output (a description: at most
@@ -256,7 +257,7 @@ fn describe_url(args: &ChildArgs, commit: &str, out: &mut dyn Write) -> Result<u
                 .take(args.limit)
                 .read_to_end(&mut file)
                 .map_err(|e| ChildFault::Unreachable(e.to_string()))?;
-            Answer::from_json(&file)
+            Answer::from_json(&file, args.platform.as_deref())
         }
         404 | 409 => Answer::Refused(format!("{url} answered {status}")),
         _ => return Err(ChildFault::Status(status.to_string())),
@@ -321,7 +322,10 @@ fn describe_frontend(
             platform: args.platform.clone().unwrap_or_default(),
         };
         match ReleaseServiceClient::new(channel).describe(asked).await {
-            Ok(said) => Ok(Answer::from_proto(said.into_inner())),
+            Ok(said) => Ok(Answer::from_proto(
+                said.into_inner(),
+                args.platform.as_deref(),
+            )),
             Err(s) if matches!(s.code(), Code::NotFound | Code::FailedPrecondition) => {
                 Ok(Answer::Refused(status_line(&s)))
             }
@@ -406,15 +410,10 @@ pub fn fetch(args: &ChildArgs, out: &mut dyn Write) -> Result<u64, ChildFault> {
             max: most,
         });
     }
-    if let Some(platform) = &args.platform {
-        if args.kind == Kind::Url {
-            return Err(ChildFault::Flags(
-                "a url source's file lists every platform",
-            ));
-        }
-        if ReleasePlatform::parse(platform).is_none() {
-            return Err(ChildFault::Platform(platform.clone()));
-        }
+    if let Some(platform) = &args.platform
+        && ReleasePlatform::parse(platform).is_none()
+    {
+        return Err(ChildFault::Platform(platform.clone()));
     }
     match (args.kind, args.identity_fd) {
         (Kind::Url, None) => {
