@@ -228,15 +228,13 @@ Refusing is safe; the operator retries after pins lapse.
 
 Optional fields with new numbers; an old peer ignores them.
 
-- `HeartbeatRequest` (today fields 1 to 10, last is `writes_known`; PR 3 takes 11 to 14 for `flush_clear_gen`, `flush_known`, `staged_objects`, `staged_bytes`, so the later fields take 15 and up): `flush_clear_gen`,
-  `flush_known`, `tail_epoch_done` (the ack carries the node's boot, which the heartbeat already sends as `boot`), `fill_fp`, `staged_objects`, `staged_bytes`, `drained`,
-  `seen_gen` (sent by map consumers that are frontends).
-- `HeartbeatResponse` (today `map_generation`, `map`, `objstore_generation`): `tail_epoch`,
-  `drain_confirmed`.
+- `HeartbeatRequest` (fields 1 to 14 exist: 1 to 10 end at `writes_known`, and PR 3 (#1293) took 11 to 14 for `flush_clear_gen` 11, `flush_known` 12, `staged_objects` 13, `staged_bytes` 14; PR 4 (#1294) takes `tail_epoch_done` = 15, the ack that carries the node's boot, which the heartbeat already sends as `boot`; the later fields `fill_fp`, `drained` and `seen_gen` (sent by map consumers that are frontends) take 16 and up).
+- `HeartbeatResponse` (fields 1 to 4 exist: `map_generation` 1, `map` 2, `objstore_generation` 3, and `retained_previous` 4 from PR 2 (#1296); PR 4 takes `tail_epoch` = 5; `drain_confirmed` takes 6 and up).
 - **Corrected.** `map.proto` has no separate map-fetch rpc: `service Membership` has
   `Register` and `Heartbeat`, and the map rides in `RegisterResponse.map` and
   `HeartbeatResponse.map`. The `retained_previous` field therefore goes on those two
-  responses, not on a `MapResponse` message.
+  responses (`RegisterResponse.retained_previous` = 6, `HeartbeatResponse.retained_previous` = 4),
+  not on a `MapResponse` message.
 - Store keys: `handoff/base`, `meta/tail_epoch`, and the mark bodies above.
 - `kbf-map`: the three additions in section 2.
 - HTTP: `GET /v1/members` gains `phase`, `epoch`, `blocked_on[]`, `degraded`, `drained`; a
@@ -399,10 +397,11 @@ All from `feature/arch-v2`.
 
 **`map.proto`**
 - `service Membership` has `Register` (`map.proto:86`) and `Heartbeat` (`:90`); the map is in
-  `RegisterResponse.map` (field 4) and `HeartbeatResponse.map` (field 2). `HeartbeatRequest`
-  has fields 1 to 10 (`member_id`, `boot`, `have_generation`, `catching_up`, `repair_debts`,
-  `debts_known`, `applied_objstore_generation`, `apply_status`, `open_writes`,
-  `writes_known`); `HeartbeatResponse` has `map_generation`, `map`, `objstore_generation`.
+  `RegisterResponse.map` (field 4) and `HeartbeatResponse.map` (field 2). When this survey was
+  made `HeartbeatRequest` had fields 1 to 10 (`member_id`, `boot`, `have_generation`,
+  `catching_up`, `repair_debts`, `debts_known`, `applied_objstore_generation`,
+  `apply_status`, `open_writes`, `writes_known`) and `HeartbeatResponse` had `map_generation`,
+  `map`, `objstore_generation`; section 5 has the numbers as they are now.
 
 **Rebuild, flusher, previous map**
 - The rebuild is keyed on the meta log, not on the Joining state: `storage_node.rs:722-731`
