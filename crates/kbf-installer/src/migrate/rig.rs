@@ -73,6 +73,11 @@ pub struct Rig {
     pub enabled: Rc<RefCell<BTreeSet<String>>>,
     /// Make `enable --now` fail.
     pub fail_enable: Rc<Cell<bool>>,
+    /// The package receipts `pkgutil` knows, by identifier (none to begin with).
+    pub receipts: Rc<RefCell<BTreeSet<String>>>,
+    /// Make every command of this verb fail (`bootout` is `stop`; `pkgutil --forget` is
+    /// `forget`; `launchctl enable` is `enable`), until it is `None` again.
+    pub fail_verb: Rc<RefCell<Option<String>>>,
     /// Called with the verb and the unit file of every service command before it is answered
     /// (`stop`, `start`, `is-active`, `daemon-reload` with no unit): what a test plays as
     /// the host doing something while the migration is in that call.
@@ -118,7 +123,7 @@ impl Rig {
     }
 
     /// A scratch host with the services played and nothing on it but `run/`.
-    fn bare(name: &str, platform: Platform) -> Rig {
+    pub fn bare(name: &str, platform: Platform) -> Rig {
         root_umask();
         let mut host = ScratchHost::new(&format!("migrate-{name}"));
         host.euid = me();
@@ -129,6 +134,8 @@ impl Rig {
         let fail_start = Rc::new(Cell::new(false));
         let enabled = Rc::new(RefCell::new(BTreeSet::new()));
         let fail_enable = Rc::new(Cell::new(false));
+        let receipts = Rc::new(RefCell::new(BTreeSet::new()));
+        let fail_verb: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let on_command: Rc<RefCell<Option<CommandHook>>> = Rc::new(RefCell::new(None));
         host.answer = Box::new({
             let (active, events, fail_start, enabled, fail_enable, root, on_command) = (
@@ -140,6 +147,7 @@ impl Rig {
                 root.clone(),
                 on_command.clone(),
             );
+            let (receipts, fail_verb) = (receipts.clone(), fail_verb.clone());
             move |cmd| {
                 let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
                 let current = root.join(match platform {
@@ -159,6 +167,8 @@ impl Rig {
                         ("enable --now", (*u).to_owned())
                     }
                     ("/usr/bin/systemctl", [verb, "--", u]) => (verb, (*u).to_owned()),
+                    ("/usr/sbin/pkgutil", ["--pkg-info", id]) => ("pkg-info", (*id).to_owned()),
+                    ("/usr/sbin/pkgutil", ["--forget", id]) => ("forget", (*id).to_owned()),
                     ("/bin/launchctl", ["bootstrap", "system", plist]) => (
                         "start",
                         plist.rsplit('/').next().expect("a name").to_owned(),
@@ -176,7 +186,16 @@ impl Rig {
                 if let Some(hook) = on_command.borrow().as_ref() {
                     hook(verb, &unit);
                 }
+                if fail_verb.borrow().as_deref() == Some(verb) {
+                    return Err(io::Error::other(format!("planted: {verb} failed")));
+                }
                 match verb {
+                    "pkg-info" => Ok(reply(i32::from(!receipts.borrow().contains(&unit)), "", "")),
+                    "forget" => {
+                        receipts.borrow_mut().remove(&unit);
+                        record(format!("forget {unit}"));
+                        Ok(reply(0, "", ""))
+                    }
                     "is-active" => Ok(reply(
                         i32::from(!active.borrow().contains(&unit)) * 3,
                         "",
@@ -234,6 +253,8 @@ impl Rig {
             fail_start,
             enabled,
             fail_enable,
+            receipts,
+            fail_verb,
             on_command,
             lock_wait: Duration::from_secs(20),
             kit: false,

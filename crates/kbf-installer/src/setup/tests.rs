@@ -1402,7 +1402,7 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
     let mut exec = released(host(), Platform::MacOs);
     go_ok(&os, &mut exec, &raw(Mode::Daemon));
     let c = cmds(&exec);
-    assert_eq!(c.len(), 8, "{c:?}");
+    assert_eq!(c.len(), 9, "{c:?}");
     assert_eq!(
         c[0],
         "run /usr/bin/dscl . -create /Groups/_kbf-fetch PrimaryGroupID 303"
@@ -1416,10 +1416,14 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
     );
     assert_eq!(
         c[6],
-        "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-installer.plist"
+        "run /bin/launchctl enable system/com.komira.kbf-installer"
     );
     assert_eq!(
         c[7],
+        "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-installer.plist"
+    );
+    assert_eq!(
+        c[8],
         "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist"
     );
     assert_eq!(
@@ -1469,6 +1473,57 @@ fn a_mac_refuses_the_frontend_and_waits_for_a_release() {
     let mut exec = released(host(), Platform::MacOs);
     go_ok(&os, &mut exec, &raw(Mode::Daemon));
     assert!(cmds(&exec).iter().all(|c| !c.contains("launchctl")));
+}
+
+/// Catches a Mac whose installer job is left disabled after a reinstall: a rollback of an
+/// adopted Mac disables `system/com.komira.kbf-installer` (`launchctl disable`) and the
+/// package's removal does not clear it, so `setup` must `launchctl enable` the job before it
+/// bootstraps it (the bootstrap of a disabled job fails, and a disabled job is not loaded at
+/// boot). The daemon's job is not the installer's to enable, a job that is loaded already is
+/// left alone, and `--no-start` still clears the override (without bootstrapping) so the next
+/// boot loads the job.
+///
+/// Mutants seen red: the `enable` removed (the order and the count); the `enable` dropped under
+/// `--no-start`. Not run as mutants: the `enable` put after the bootstrap; the `enable` given to
+/// every label; the `enable` emitted for a loaded job.
+#[test]
+fn a_mac_clears_the_installer_jobs_disable_before_it_bootstraps_it() {
+    let launchctl = |exec: &FakeExec| -> Vec<String> {
+        cmds(exec)
+            .into_iter()
+            .filter(|c| c.contains("launchctl"))
+            .collect()
+    };
+    let mut exec = released(host(), Platform::MacOs);
+    go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
+    assert_eq!(
+        launchctl(&exec),
+        [
+            "run /bin/launchctl enable system/com.komira.kbf-installer",
+            "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-installer.plist",
+            "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist",
+        ]
+    );
+
+    let mut exec = released(host(), Platform::MacOs);
+    let none = Options {
+        apply: true,
+        no_start: true,
+    };
+    go(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon), none).expect("setup");
+    assert_eq!(
+        launchctl(&exec),
+        ["run /bin/launchctl enable system/com.komira.kbf-installer"]
+    );
+
+    let mut os = FakeOs::mac();
+    os.loaded.insert("com.komira.kbf-installer".to_owned());
+    let mut exec = released(host(), Platform::MacOs);
+    go_ok(&os, &mut exec, &raw(Mode::Daemon));
+    assert_eq!(
+        launchctl(&exec),
+        ["run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist"]
+    );
 }
 
 #[test]

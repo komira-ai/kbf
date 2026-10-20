@@ -17,6 +17,7 @@ Commands:
   gc              Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
   boot-check      Run before each start of a release on trial; counts the start
   migrate         Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's tree, or put it back with `--rollback`. A dry run without `--apply`
+  uninstall       Remove what the package left on a host that is rolled back or was never adopted: the LaunchDaemon plist, its receipt, disable override, logs and the files a rollback moved aside (a Mac). A dry run without `--apply`
   quiesce         For maintainer scripts: take the lock; exit 5 while a swap is pending
   check           Validate the installer's configuration, trust files and path chain
   backup          Dump the state database to the backup directory and keep the newest few; run by kbf-backup.timer as the service user, who connects as the role installer.toml's database URL names
@@ -269,6 +270,21 @@ Options:
       --window-secs <WINDOW_SECS>  [default: 900]
       --apply                      Do what the verb says. Without it a mutating verb is a dry run
   -h, --help                       Print help
+
+=== kbf-installer uninstall --help ===
+Remove what the package left on a host that is rolled back or was never adopted: the LaunchDaemon plist, its receipt, disable override, logs and the files a rollback moved aside (a Mac). A dry run without `--apply`
+
+Usage: kbf-installer uninstall [OPTIONS]
+
+Options:
+      --installer-unit <INSTALLER_UNIT>
+          The installer's own unit: stopped and, on Linux, disabled. A Mac without the flag acts on the package's job, `com.komira.kbf-installer.plist`; a Linux host without it leaves its unit to the package manager
+      --json
+          Print the result as one JSON object on standard output
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help
+          Print help
 
 === kbf-installer quiesce --help ===
 For maintainer scripts: take the lock; exit 5 while a swap is pending

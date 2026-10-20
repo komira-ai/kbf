@@ -65,6 +65,10 @@ pub enum Verb {
     /// Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's
     /// tree, or put it back with `--rollback`. A dry run without `--apply`.
     Migrate(MigrateArgs),
+    /// Remove what the package left on a host that is rolled back or was never adopted: the
+    /// LaunchDaemon plist, its receipt, disable override, logs and the files a rollback moved
+    /// aside (a Mac). A dry run without `--apply`.
+    Uninstall(UninstallArgs),
     /// For maintainer scripts: take the lock; exit 5 while a swap is pending.
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
@@ -344,6 +348,15 @@ pub struct MigrateArgs {
 }
 
 #[derive(Args)]
+pub struct UninstallArgs {
+    /// The installer's own unit: stopped and, on Linux, disabled. A Mac without the flag acts
+    /// on the package's job, `com.komira.kbf-installer.plist`; a Linux host without it leaves
+    /// its unit to the package manager.
+    #[arg(long, value_parser = crate::migrate::Unit::new)]
+    pub installer_unit: Option<crate::migrate::Unit>,
+}
+
+#[derive(Args)]
 pub struct BackupArgs {
     /// installer.toml, under the host root: its `database` key names the database to dump and
     /// its `backup_keep` how many backups stay (default 7).
@@ -420,6 +433,7 @@ impl Verb {
             Verb::Gc(_) => "gc",
             Verb::BootCheck(_) => "boot-check",
             Verb::Migrate(_) => "migrate",
+            Verb::Uninstall(_) => "uninstall",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
             Verb::Backup(_) => "backup",
@@ -472,6 +486,9 @@ impl Verb {
             | Verb::BootCheck(_)
             | Verb::Quiesce
             | Verb::Migrate(_)
+            // `uninstall` is for a host the installer does not manage (rolled back, or never
+            // adopted), and an old-layout host that was never adopted is one.
+            | Verb::Uninstall(_)
             | Verb::Proxy(_)
             // `update` only POSTs to the proxy's API as an unprivileged client, and the proxy
             // exists only on a new-layout host; the root half of an update (`run`) is guarded.
@@ -498,6 +515,7 @@ impl Verb {
             | Verb::RecordRelease(_)
             | Verb::Gc(_)
             | Verb::Migrate(_)
+            | Verb::Uninstall(_)
             | Verb::Quiesce
             | Verb::Backup(_)
             | Verb::Restore(_)

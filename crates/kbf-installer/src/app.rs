@@ -18,7 +18,8 @@ use kbf_host::{HostExec, HostPath, Root};
 use crate::activate;
 use crate::backup;
 use crate::cli::{
-    BackupArgs, BootArgs, Cli, MigrateArgs, ReleaseSource, RestoreArgs, RunArgs, ServiceArgs, Verb,
+    BackupArgs, BootArgs, Cli, MigrateArgs, ReleaseSource, RestoreArgs, RunArgs, ServiceArgs,
+    UninstallArgs, Verb,
 };
 use crate::database::Database;
 use crate::exit::Exit;
@@ -386,6 +387,31 @@ fn migrate_verb(root: PathBuf, apply: bool, args: &MigrateArgs) -> Result<String
     Ok(shown.join("\n"))
 }
 
+/// `uninstall`: the report to print, or why it stopped. Nothing is looked up: the verb
+/// removes files and a job, and runs no program of the host's releases.
+fn uninstall_verb(root: PathBuf, apply: bool, args: &UninstallArgs) -> Result<String, Failure> {
+    let rehearsal = root != Path::new("/");
+    let (layout, mut exec) = host(root)?;
+    let u = migrate::Uninstall {
+        roots: migrate::Roots::new(layout.platform()),
+        layout,
+        owner_uid: owner_uid(rehearsal, rustix::process::geteuid().as_raw()),
+        installer_unit: args.installer_unit.clone(),
+        lock_wait: operator::LOCK_WAIT,
+    };
+    let mode = if apply {
+        kbf_host::Mode::Apply
+    } else {
+        kbf_host::Mode::DryRun
+    };
+    migrate::uninstall(&u, &mut exec, mode)
+        .map(|report| report.to_string().trim_end().to_owned())
+        .map_err(|e| Failure {
+            exit: e.exit(),
+            why: e.to_string(),
+        })
+}
+
 /// The account the version probe runs as, and the lines of the steps that made it. The first
 /// step of an applying migration (before the first look at the old layout runs a binary): on a
 /// Mac with the platform's own fetch account (no `--fetch-user`, or its name), that has an old
@@ -692,9 +718,14 @@ fn update_verb(
 /// How a `migrate` that went through ends: its report on `out`, as text, or with `--json` as
 /// one object. (A failure is said like every other verb's, by `dispatch`.)
 fn finish_migrate(json: bool, apply: bool, report: &str, out: &mut dyn Write) -> Exit {
+    finish_report("migrate", json, apply, report, out)
+}
+
+/// [`finish_migrate`] for the verb `verb`, which reports the same way (`uninstall`).
+fn finish_report(verb: &str, json: bool, apply: bool, report: &str, out: &mut dyn Write) -> Exit {
     // A closed pipe is the reader's business; the exit code still tells.
     let _ = if json {
-        let object = serde_json::json!({"verb": "migrate", "apply": apply, "message": report});
+        let object = serde_json::json!({"verb": verb, "apply": apply, "message": report});
         writeln!(out, "{object}")
     } else {
         writeln!(out, "{report}")
@@ -768,6 +799,10 @@ pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) 
         // be said like every other verb's.
         Verb::Migrate(args) => match migrate_verb(root_of(cli), cli.apply, args) {
             Ok(report) => return finish_migrate(cli.json, cli.apply, &report, out),
+            Err(failure) => Err(failure),
+        },
+        Verb::Uninstall(args) => match uninstall_verb(root_of(cli), cli.apply, args) {
+            Ok(report) => return finish_report(name, cli.json, cli.apply, &report, out),
             Err(failure) => Err(failure),
         },
         Verb::Confirm(n) => operate(root_of(cli), cli.apply, n.service.restart(), |o| {

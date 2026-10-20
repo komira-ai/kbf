@@ -107,6 +107,30 @@ the journal, stays. Re-adopting means reinstalling the kbf-installer `.pkg`; unt
 again `migrate --apply` and `setup` refuse (exit 5) and say so. The old-host rollback above is
 unchanged and keeps the tree.
 
+### Removing the installer afterwards: `kbf-installer uninstall`
+
+A rollback undoes an adoption, not the package: the installer never removes itself, so a rolled-back
+Mac still has `/Library/LaunchDaemons/com.komira.kbf-installer.plist`, `/Library/Logs/kbf-installer`,
+the package receipt (`pkgutil --pkgs`), the launchd disable override of `com.komira.kbf-installer`
+(the rollback set it) and the `.rolled-back-<time>` files. `kbf-installer uninstall [--apply]` removes
+them. It is refused (exit 5) unless the host is rolled back (journal phase `rolled_back`) or was never
+adopted (no journal and no `state.json`), and takes the installer's lock (exit 4 while a `run` pass holds
+it). Without `--apply` it prints each path it would remove and the receipt id, one per line, and changes
+nothing. On a Mac it boots the job out (only if loaded), removes the plist, runs `launchctl enable
+system/com.komira.kbf-installer` (clearing the override, so a reinstalled package is not left
+disabled), runs `pkgutil --forget com.komira.kbf-installer` (only if the receipt is there), removes the
+log directory, `installer.toml`, the installer's tree and every `<name>.rolled-back-<UTC time>` of both,
+and last archives the journal as `migration.json.rolled-back-<time>` in `/var/db/kbf-installer`: the
+journal is kept, never deleted. `uninstall.json` in that directory records the suffix and the steps
+done after each one, so a run that died is finished by running it again; a host already clean says
+"nothing to uninstall" and exits 0. On Linux the package's files (binary, unit file, trust files) are
+the package manager's and are left: `--installer-unit kbf-installer.service` stops and disables the unit
+and the journal is archived. `--installer-unit` names another job on a Mac.
+
+`setup` runs `launchctl enable system/com.komira.kbf-installer` before it bootstraps the job (also with
+`--no-start`), so installing the package again and running `setup` works on a Mac whose override was
+set by a rollback.
+
 Not done by the migration: `installer.toml` (the `min_generation` to put there is printed as the
 report's value; `setup` writes the file), the users, and the `orders/` directory (`setup`).
 

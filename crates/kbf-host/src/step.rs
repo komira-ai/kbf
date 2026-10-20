@@ -240,6 +240,10 @@ pub enum Step {
     Symlink { path: HostPath, target: PathBuf },
     /// Remove the file, link or empty directory at `path`.
     Remove { path: HostPath },
+    /// Remove the file, link or directory at `path` and everything below it, never through
+    /// a link (a link is removed, not followed). For a tree a package or a rollback left
+    /// behind; `Remove` is for the one file.
+    RemoveTree { path: HostPath },
     /// Run an external tool; a non-zero exit fails the step.
     Run(Cmd),
     /// Run an external tool and write what `filter` makes of its standard output to
@@ -281,6 +285,7 @@ impl fmt::Display for Step {
                 write!(f, "link {path} -> {}", Quoted(&target.to_string_lossy()))
             }
             Step::Remove { path } => write!(f, "remove {path}"),
+            Step::RemoveTree { path } => write!(f, "remove tree {path}"),
             Step::Run(cmd) => write!(f, "run {cmd}"),
             Step::Capture {
                 cmd,
@@ -399,6 +404,12 @@ mod tests {
                 r#"link /srv/a -> "/srv/b c""#,
             ),
             (Step::Remove { path: p("/etc/x") }, "remove /etc/x"),
+            (
+                Step::RemoveTree {
+                    path: p("/Library/Logs/kbf-installer"),
+                },
+                "remove tree /Library/Logs/kbf-installer",
+            ),
             (
                 Step::Run(Cmd::new(p("/usr/bin/systemctl")).arg("daemon-reload")),
                 "run /usr/bin/systemctl daemon-reload",

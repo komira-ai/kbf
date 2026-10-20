@@ -121,10 +121,13 @@ pub(super) fn refuse_if_installer_moved_aside(
     Ok(())
 }
 
+/// What a kit host's rollback appends to the names it moves aside, before the UTC time.
+pub(super) const ASIDE_PREFIX: &str = ".rolled-back-";
+
 /// The two things a kit host's rollback moves aside, each as the directory it is in and its
 /// name: `installer.toml` (the installer job's `KeepAlive` is gated on it, so it goes first)
 /// and the installer's tree.
-fn aside_names(layout: &Layout) -> [(String, String); 2] {
+pub(super) fn aside_names(layout: &Layout) -> [(String, String); 2] {
     let toml = layout.installer_toml();
     let (config_dir, toml_name) = toml.as_str().rsplit_once('/').expect("an absolute path");
     let tree = layout.install_root();
@@ -326,7 +329,7 @@ pub fn rollback_at<E: Exec>(
         let suffix = match journal.aside.clone() {
             Some(suffix) => suffix,
             None => {
-                let suffix = format!(".rolled-back-{}", utc_stamp(now_secs));
+                let suffix = format!("{ASIDE_PREFIX}{}", utc_stamp(now_secs));
                 journal.aside = Some(suffix.clone());
                 state_dir.put_journal(&journal)?;
                 suffix
