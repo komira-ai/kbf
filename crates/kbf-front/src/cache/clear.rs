@@ -177,6 +177,21 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 mod tests {
     use super::*;
     use kbf_meta::Epoch;
+    use kbf_types::{Digest, DigestFunction};
+
+    /// A gate that holds the generation it is made with.
+    #[derive(Debug)]
+    struct At(u64);
+
+    impl FlushGate for At {
+        fn flushes(&self, _: &Digest) -> bool {
+            true
+        }
+
+        fn generation(&self) -> Option<u64> {
+            Some(self.0)
+        }
+    }
 
     fn object(n: u64) -> ObjectId {
         ObjectId::new(Epoch::new(1), n)
@@ -199,5 +214,33 @@ mod tests {
         assert_eq!(born.dated(), 2);
         born.prune(born.mark(), &BTreeSet::new());
         assert_eq!(born.dated(), 0);
+    }
+
+    /// Catches: a clear generation that is the held one while an older object is
+    /// unflushed, one that forgets an object's first date, and one that does not count an
+    /// object it never dated as the oldest. Object 1 is dated 7, object 2 is dated 9; a
+    /// date noted again does not move; with both to flush the clear generation is 7, with
+    /// only 2 it is 9, with an undated object among them 0, with none the held 12; and
+    /// the dates of objects not staged are gone afterwards.
+    #[test]
+    fn the_clear_generation_is_the_oldest_date_of_what_is_left_to_flush() {
+        let born = Born::default();
+        let digest = Digest::new(DigestFunction::Sha256, [0; 32], 0);
+        assert!(At(1).flushes(&digest));
+        assert_eq!(format!("{born:?}"), "Born { .. }");
+        born.judge_by(Arc::new(At(7)));
+        born.note(object(1));
+        born.judge_by(Arc::new(At(9)));
+        born.note(object(2));
+        born.note(object(1));
+        let staged = BTreeSet::from([object(1), object(2)]);
+        let mark = born.mark();
+        assert_eq!(born.clear(12, mark, &staged, &[object(1), object(2)]), 7);
+        assert_eq!(born.clear(12, mark, &staged, &[object(2)]), 9);
+        assert_eq!(born.clear(12, mark, &staged, &[object(2), object(3)]), 0);
+        assert_eq!(born.clear(12, mark, &staged, &[]), 12);
+        let left = BTreeSet::from([object(2)]);
+        assert_eq!(born.clear(12, mark, &left, &[object(2)]), 9);
+        assert_eq!(born.dated(), 1);
     }
 }

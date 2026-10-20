@@ -520,8 +520,17 @@ async fn a_node_that_holds_no_generation_cannot_say() {
 /// stages nothing, so everything it ever staged is flushed at the held generation.
 #[tokio::test]
 async fn a_cache_without_a_tier_is_clear_at_the_held_generation() {
-    let cache =
-        kbf_front::Cache::memory().with_flush_gate(OneFlusher::new(Node::new(1, &solo(4)) as _));
+    // Over the farm's own log and store, so the same instantiation of the report that
+    // the tiered tests run takes both ways at its tier check.
+    let farm = Farm::new(Default::default());
+    let cache = kbf_front::Cache::open(
+        farm.log.clone(),
+        farm.store.clone(),
+        kbf_objstore::KeyPrefix::default(),
+    )
+    .await
+    .expect("open")
+    .with_flush_gate(OneFlusher::new(Node::new(1, &solo(4)) as _));
     let report = cache.flush_report().await.expect("report");
     assert_eq!(
         (report.clear_gen, report.staged_objects, report.staged_bytes),
