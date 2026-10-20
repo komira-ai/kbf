@@ -29,6 +29,10 @@ pub use crate::topology::{
     Bins, Driver, FarmError, Limits, NodeMode, ProcRecord, Role, Topology, daemon_id, node_id,
 };
 
+/// The bearer token the frontend of a [`Farm::start`] farm is given (32 or more visible
+/// characters, as the API requires), for the operator calls a scenario makes.
+pub const API_TOKEN: &str = "rehearsal-api-token-of-32-or-more-visible-chars";
+
 struct Member {
     role: Role,
     spec: Spec,
@@ -287,7 +291,7 @@ impl Farm {
         pki.issue_reapi(&etc, &["localhost"]);
         // The unit names `--api-token-file <etc>/api-token`; the harness's API calls only read.
         let token = etc.join("api-token");
-        crate::pki::write_private(&token, b"rehearsal-api-token-of-32-or-more-visible-chars\n");
+        crate::pki::write_private(&token, format!("{API_TOKEN}\n").as_bytes());
         farm.ca = std::fs::read(etc.join("ca.pem")).expect("ca");
         let cfg = settings(
             &root,
@@ -737,6 +741,36 @@ impl Farm {
     pub fn ports(&self) -> Option<(&Ports, std::ops::Range<u16>)> {
         let (claim, ports) = self.claim.as_ref()?;
         Some((ports, claim.base()..claim.base() + crate::ports::BLOCK))
+    }
+
+    /// `POST path` with the JSON `body` to the frontend's operator API, as an operator with
+    /// the farm's token does: the status code and the body, or `None` while nothing answers.
+    #[must_use]
+    pub fn post(&self, path: &str, body: &str) -> Option<(u16, String)> {
+        api::post(self.api, API_TOKEN, path, body)
+    }
+
+    /// The storage members the frontend lists; `None` while it does not answer.
+    #[must_use]
+    pub fn members(&self) -> Option<Vec<api::Member>> {
+        api::members(self.api)
+    }
+
+    /// The member of storage node `n` (a [`Role::Node`]): the one whose address is node
+    /// `n`'s loopback address. `None` while the frontend does not list it.
+    #[must_use]
+    pub fn member_of(&self, n: usize) -> Option<api::Member> {
+        let prefix = format!("{}:", loopback(n));
+        self.members()?
+            .into_iter()
+            .find(|m| m.addr.trim_start_matches("https://").starts_with(&prefix))
+    }
+
+    /// Every line of every process's output, of every generation of it (a restart keeps
+    /// what the process before it printed), that holds `needle`, each as `file: line`.
+    #[must_use]
+    pub fn log_hits(&self, needle: &str) -> Vec<String> {
+        crate::procs::log_hits(&self.logs, needle)
     }
 
     /// The frontend's operator API port (on loopback).

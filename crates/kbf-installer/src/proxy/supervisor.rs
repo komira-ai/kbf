@@ -9,7 +9,8 @@
 //! - **One slot has a live recorded child** (still the recorded process): its `role` is
 //!   read. An active child is adopted. A candidate (the proxy stopped between starting it
 //!   and its takeover) is waited for, made to take the generation, and then routed to.
-//! - **No slot has one**: the root half's `installed_commit` (`status.json`) is started in
+//! - **No slot has one**: the root half's `installed_commit` (`status.json`) is brought to
+//!   the schema it needs ([`host_migrator`]; before any process starts), started in
 //!   slot A as a candidate, made to take the generation (a cold start with an epoch bump,
 //!   FP sections 6 and 8: [`super::cold`], the same steps as a restart in the middle of an
 //!   update) and routed to. If `status.json` names no release, or its binary is missing or
@@ -35,11 +36,14 @@ use super::boot::{Booted, ColdBoot, Reason, Report, Retry, Source};
 use super::child_http::Headers;
 use super::cold::{Cold, ReadyRule};
 use super::gate_real::{ProxyGate, gate_slot};
+use super::migrator::{DbMigrator, installed_schema};
 use super::model::{PortError, ProcIdent, RoleState, Slot, Start, Timing};
-use super::ports::{Child as _, ChildAdmin, Clock, Migrator};
+use super::ports::{Child as _, ChildAdmin, Clock, Migrator, StatusFacts};
 use super::record::FileRecorder;
 use super::root_orders::installed_commit;
 use crate::CommitId;
+use crate::database::Database;
+use crate::run::{Runner, SystemRunner};
 
 /// How the start ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -129,7 +133,7 @@ pub struct Boot<'a> {
     pub admin: &'a dyn ChildAdmin,
     pub clock: &'a dyn Clock,
     /// Runs the release's forward migration before its child starts. The verb passes
-    /// [`NoMigration`] until the installer's migrator is wired in.
+    /// [`host_migrator`]'s: the proxy does not start a release on a schema it cannot run on.
     pub migrator: &'a dyn Migrator,
     pub report: &'a dyn Report,
     pub status: &'a Path,
@@ -137,15 +141,42 @@ pub struct Boot<'a> {
     pub retry: Retry,
 }
 
-/// The migration hook of a proxy whose installer migrator is not wired in: it migrates
-/// nothing, and says so in the log. The child still opens the store itself, as a candidate,
-/// and a store it cannot open stops it before it takes the generation.
+/// The migration hook of a proxy that starts on a database a test does not have: it migrates
+/// nothing. Production never has it ([`host_migrator`] is the verb's).
+#[cfg(test)]
 pub struct NoMigration;
 
+#[cfg(test)]
 impl Migrator for NoMigration {
     fn migrate_forward(&self, _release: &CommitId) -> Result<(), PortError> {
         Ok(())
     }
+}
+
+/// The verb's migration hook: [`DbMigrator`] over the database `installer.toml` names, for
+/// the release a cold start is about to run. `facts` is the root half's `status.json`; the
+/// installed release's `state_schema` (which `status.json` does not keep across a restart of
+/// the root half) is asked of its own binary under `child`'s layout, run as the proxy's user.
+/// A refusal carries a stable word ([`super::migrator::Refusal::word`]) and no part of the
+/// database URL.
+pub fn host_migrator<'a>(
+    database: Database,
+    facts: &'a dyn StatusFacts,
+    child: &'a ProcChild,
+) -> DbMigrator<'a> {
+    host_migrator_with(&SystemRunner, database, facts, child)
+}
+
+/// [`host_migrator`] running the release's version probe with `runner`.
+pub(super) fn host_migrator_with<'a>(
+    runner: &'a dyn Runner,
+    database: Database,
+    facts: &'a dyn StatusFacts,
+    child: &'a ProcChild,
+) -> DbMigrator<'a> {
+    DbMigrator::new(database, facts).knowing_installed(move |release| {
+        installed_schema(runner, &child.program(release), release)
+    })
 }
 
 /// Adopt what a previous proxy left, or start the installed release. `child` reads the

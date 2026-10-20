@@ -98,13 +98,21 @@ impl Database {
             path: shown.clone(),
             why: e.kind().to_string(),
         })?;
+        Database::from_installer_text(&shown, &text)
+    }
+
+    /// [`Database::from_installer_toml`] over text already read from the file named `shown`.
+    ///
+    /// # Errors
+    /// [`DatabaseError`]: the text, the key or the URL is wrong.
+    pub fn from_installer_text(shown: &str, text: &str) -> Result<Database, DatabaseError> {
         let table: toml::Table = text
             .parse()
-            .map_err(|_| DatabaseError::NotToml(shown.clone()))?;
+            .map_err(|_| DatabaseError::NotToml(shown.to_owned()))?;
         let Some(url) = table.get("database").and_then(toml::Value::as_str) else {
-            return Err(DatabaseError::NoDatabase(shown));
+            return Err(DatabaseError::NoDatabase(shown.to_owned()));
         };
-        let config = check_url(&shown, url)?;
+        let config = check_url(shown, url)?;
         Ok(Database::new(config, schema::embedded()))
     }
 

@@ -317,6 +317,8 @@ impl Joiner {
                 catching_up: self.catch_up.is_catching_up(),
                 applied_objstore_generation,
                 apply_status: apply_status.into(),
+                // Not reported yet: the node's cache is not asked here, so it cannot say.
+                ..Default::default()
             })
             .await?
             .into_inner();
