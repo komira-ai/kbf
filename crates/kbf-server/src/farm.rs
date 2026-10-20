@@ -68,6 +68,7 @@ mod durable;
 mod handover;
 mod phase;
 mod record;
+pub mod sched_view;
 
 pub use durable::{DONE_FLOOR, EpochPolicy, SESSION_RENEWAL, StateError};
 pub use handover::UNTRACED_LOOKS;
