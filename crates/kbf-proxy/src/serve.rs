@@ -140,7 +140,19 @@ impl<U: UpdateHandler + 'static> Service<U> {
             Route::Ready if self.core.is_ready() => text(StatusCode::OK, "ok"),
             Route::Ready => text(StatusCode::SERVICE_UNAVAILABLE, "not ready"),
             Route::Metrics => {
-                let body = self.core.metrics.render(&self.core.slots, &self.core.queue);
+                let child = crate::child_metrics::fetch(
+                    &self.core,
+                    request.headers().get(header::AUTHORIZATION).cloned(),
+                )
+                .await;
+                let mut body = self
+                    .core
+                    .metrics
+                    .render(&self.core.slots, &self.core.queue)
+                    .into_bytes();
+                if let Some(child) = child {
+                    body.extend_from_slice(child.as_bytes());
+                }
                 let mut response = text(StatusCode::OK, body);
                 response.headers_mut().insert(
                     header::CONTENT_TYPE,
