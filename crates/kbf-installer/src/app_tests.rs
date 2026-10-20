@@ -153,8 +153,16 @@ fn run_defaults_its_directories_to_the_layouts_on_every_platform() {
         let Verb::Run(args) = parse(&["run"]).verb else {
             panic!("run");
         };
-        assert_eq!(args.update_dir_in(&layout), layout.update_dir(), "{platform:?}");
-        assert_eq!(args.orders_dir_in(&layout), layout.orders_dir(), "{platform:?}");
+        assert_eq!(
+            args.update_dir_in(&layout),
+            layout.update_dir(),
+            "{platform:?}"
+        );
+        assert_eq!(
+            args.orders_dir_in(&layout),
+            layout.orders_dir(),
+            "{platform:?}"
+        );
     }
     let Verb::Run(args) = parse(&["run", "--update-dir", "/srv/u", "--orders-dir", "/srv/o"]).verb
     else {
