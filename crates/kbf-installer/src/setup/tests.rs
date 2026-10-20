@@ -11,7 +11,6 @@ use kbf_state::postgres::schema::Outcome;
 
 use super::backend::{Backend, Migrations, Releases, Schemas};
 use super::fake::{FakeOs, user};
-use super::paths::{API_TOKEN, ENROLL_TOKEN, INSTALLER_TOML, KBF_TOML};
 use super::validate::Raw;
 use super::{Options, SetupError, run};
 use crate::CommitId;
@@ -28,6 +27,11 @@ const DATABASE: &str = "postgres:///kbf?host=/run/postgresql";
 const SRC: &str = "/root/kbf.token";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const SECRET: &str = "abababababababababababababababababababababababababababababababab";
+/// What Linux `setup` writes (the Mac's are in `a_mac_node_gets_its_fetch_account_and_launchd_jobs`).
+const KBF_TOML: &str = "/etc/kbf/kbf.toml";
+const INSTALLER_TOML: &str = "/etc/kbf/installer.toml";
+const ENROLL_TOKEN: &str = "/etc/kbf/enroll.token";
+const API_TOKEN: &str = "/etc/kbf/api-token";
 const ROOT: Owner = Owner { uid: 0, gid: 0 };
 const KBF: Owner = Owner { uid: 990, gid: 990 };
 const KBF_SERVER: Owner = Owner { uid: 989, gid: 989 };
@@ -44,7 +48,7 @@ fn raw(mode: Mode) -> Raw {
         min_generation: None,
         commit: None,
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
-        installer_config: INSTALLER_TOML.to_owned(),
+        installer_config: None,
     }
 }
 
@@ -656,7 +660,7 @@ fn a_missing_service_user_is_refused_before_any_write() {
 #[test]
 fn each_mode_enables_its_own_units() {
     let want: [(Mode, &[&str]); 5] = [
-        (Mode::Frontend, &["kbf-frontend@a.service"]),
+        (Mode::Frontend, &["kbf-frontend.service"]),
         (Mode::Storage, &["kbf-storage.service"]),
         (Mode::Daemon, &["kbf-daemon.service"]),
         (Mode::StorageAndDaemon, &["kbf-storage-and-daemon.service"]),
@@ -1116,7 +1120,7 @@ fn a_release_already_installed_is_not_fetched_and_a_dry_run_only_names_the_fetch
 fn problems(mutate: impl Fn(&mut Raw)) -> String {
     let mut r = raw(Mode::Daemon);
     mutate(&mut r);
-    r.validate().expect_err("refused").join("; ")
+    r.validate(Platform::Linux).expect_err("refused").join("; ")
 }
 
 /// Catches a flag check that stops at the first problem, or lets a bad one through: every
@@ -1132,7 +1136,7 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         min_generation: Some(0),
         commit: None,
         database: Some(DATABASE.to_owned()),
-        installer_config: "/tmp/i.toml".to_owned(),
+        installer_config: Some("/tmp/i.toml".to_owned()),
     };
     let mut exec = host();
     let err = go(&FakeOs::linux(), &mut exec, &bad, APPLY).expect_err("refused");
@@ -1155,7 +1159,7 @@ fn the_modes_that_enroll_need_a_frontend_and_a_token_and_the_others_refuse_them(
         let mut r = raw(mode);
         r.frontend_url = Some("https://farm.example".to_owned());
         r.token_file = Some(SRC.to_owned());
-        let found = r.validate().expect_err("refused").join("; ");
+        let found = r.validate(Platform::Linux).expect_err("refused").join("; ");
         assert!(
             found.contains("--frontend-url is for the modes that enroll"),
             "{found}"
@@ -1167,12 +1171,12 @@ fn the_modes_that_enroll_need_a_frontend_and_a_token_and_the_others_refuse_them(
         let mut r = raw(mode);
         r.release_source = Some(ReleaseSource::Frontend);
         r.release_url = None;
-        let found = r.validate().expect_err("refused").join("; ");
+        let found = r.validate(Platform::Linux).expect_err("refused").join("; ");
         assert!(found.contains("does not enroll"), "{found}");
         let mut r = raw(mode);
         r.release_url = None;
         assert!(
-            r.validate()
+            r.validate(Platform::Linux)
                 .expect_err("url needed")
                 .join(";")
                 .contains("needs --release-url")
@@ -1204,7 +1208,7 @@ fn urls_are_https_with_nothing_hidden() {
     let ok = |url: &str| {
         let mut r = raw(Mode::Daemon);
         r.frontend_url = Some(url.to_owned());
-        r.validate().expect("valid").frontend_url
+        r.validate(Platform::Linux).expect("valid").frontend_url
     };
     assert_eq!(
         ok("https://Farm.Example/").as_deref(),
@@ -1222,7 +1226,7 @@ fn the_release_source_flags_agree() {
         let mut r = raw(Mode::Daemon);
         r.release_source = Some(s);
         r.release_url = u.map(str::to_owned);
-        r.validate()
+        r.validate(Platform::Linux)
     };
     assert!(check(ReleaseSource::Url, None).is_err());
     assert!(check(ReleaseSource::Frontend, Some("https://m.example")).is_err());
@@ -1245,7 +1249,7 @@ fn the_release_source_flags_agree() {
 fn a_first_release_cannot_come_from_the_frontend() {
     let mut r = raw(Mode::Daemon);
     r.commit = Some(COMMIT.parse().expect("commit"));
-    let found = r.validate().expect_err("refused").join("; ");
+    let found = r.validate(Platform::Linux).expect_err("refused").join("; ");
     assert!(found.contains("cannot come from the frontend"), "{found}");
 }
 
@@ -1352,8 +1356,14 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
         c[7],
         "run /bin/launchctl bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist"
     );
-    assert_eq!(file_meta(&exec, ENROLL_TOKEN), (0o600, ROOT));
-    assert_eq!(file_meta(&exec, KBF_TOML), (0o640, ROOT));
+    assert_eq!(
+        file_meta(&exec, "/usr/local/etc/kbf/enroll.token"),
+        (0o600, ROOT)
+    );
+    assert_eq!(
+        file_meta(&exec, "/usr/local/etc/kbf/kbf.toml"),
+        (0o640, ROOT)
+    );
     let orders = exec.entries.get(&hp("/var/db/kbf-installer/orders"));
     assert!(matches!(
         orders,
@@ -1362,7 +1372,17 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
             ..
         })
     ));
-    assert!(text(&exec, INSTALLER_TOML).contains("node_cert = \"/var/db/kbf/pki/daemon.pem\""));
+    assert!(
+        text(&exec, "/usr/local/etc/kbf/installer.toml")
+            .contains("node_cert = \"/var/db/kbf/pki/daemon.pem\"")
+    );
+    // kbf.toml points the daemon at the token where setup put it, not at a Linux path.
+    assert!(
+        text(&exec, "/usr/local/etc/kbf/kbf.toml")
+            .contains("token_file = \"/usr/local/etc/kbf/enroll.token\""),
+        "{}",
+        text(&exec, "/usr/local/etc/kbf/kbf.toml")
+    );
 }
 
 #[test]

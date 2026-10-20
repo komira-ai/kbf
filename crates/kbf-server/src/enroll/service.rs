@@ -48,10 +48,6 @@ use crate::object_store::{ColdStoreView, RegistryError, cold_store_view};
 const MAX_ZONE: usize = 63;
 /// The longest `host:port` accepted (a DNS name, a colon and a port).
 const MAX_ADVERTISE: usize = 260;
-/// The generation of the `NodeConfig` this frontend sends when no object store is
-/// registered: the flags that make the rest of it change only at a restart. A registration
-/// of the cold store (`objstore/gen`) adds its own generation ([`config_generation`]).
-pub const CONFIG_GENERATION: u64 = 1;
 /// Seconds between a node's looks at its certificate files, as the answer tells it.
 const TLS_RELOAD_INTERVAL_S: u32 = 30;
 
@@ -67,11 +63,22 @@ pub struct NodeSettings {
     pub storage_port: u32,
 }
 
-/// The generation of the `NodeConfig` told with `cold` in it: [`CONFIG_GENERATION`] plus the
-/// registry's, so a node that renews after a store was registered, changed or taken back
-/// is sent the configuration again.
-pub(super) fn config_generation(cold: &ColdStoreView) -> u64 {
-    CONFIG_GENERATION.saturating_add(cold.generation)
+/// The generation of `config`: a digest of everything else in it, so it differs exactly
+/// when something the node receives differs (a moved worker, CAS or storage endpoint, a
+/// registered, changed or withdrawn cold store, other roles, the reload interval) and a
+/// restarted frontend with other `--enroll-*` flags needs no counter anyone must raise.
+/// It is not ordered: a node compares it for equality only (`Renew` sends the
+/// configuration when it is not the node's), so a frontend put back to an earlier endpoint
+/// sends that configuration again. The low bit is set so it is never 0, the number of a
+/// node that holds nothing.
+fn content_generation(config: &pb::NodeConfig) -> u64 {
+    let digest = Sha256::digest(prost::Message::encode_to_vec(&pb::NodeConfig {
+        generation: 0,
+        ..config.clone()
+    }));
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(head) | 1
 }
 
 /// The status of a refusal: its code and its message, nothing else.
@@ -314,13 +321,13 @@ impl Core {
         })
     }
 
-    /// The `NodeConfig` of an answer for a node that holds `enrolled`'s roles. The cold
+    /// The `NodeConfig` of an answer (its generation: [`content_generation`]) for a node that holds `enrolled`'s roles. The cold
     /// store (its URI, with no key in it) goes to a node with the storage role only: a
     /// daemon has no use for it.
     pub(super) fn config(&self, enrolled: &Enrolled, cold: &ColdStoreView) -> pb::NodeConfig {
         let storage = enrolled.certs.iter().any(|cert| cert.role == Role::Storage);
-        pb::NodeConfig {
-            generation: config_generation(cold),
+        let config = pb::NodeConfig {
+            generation: 0,
             roles: enrolled
                 .certs
                 .iter()
@@ -334,6 +341,10 @@ impl Core {
             tls_reload_interval_s: TLS_RELOAD_INTERVAL_S,
             frontend_url: String::new(),
             credential_mode: pb::CredentialMode::Keys.into(),
+        };
+        pb::NodeConfig {
+            generation: content_generation(&config),
+            ..config
         }
     }
 

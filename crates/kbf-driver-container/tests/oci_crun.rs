@@ -98,6 +98,25 @@ async fn the_sandbox_is_what_the_config_says() {
     cell.assert_clean(1);
 }
 
+/// Catches `personality` with `ADDR_NO_RANDOMIZE` being refused inside the sandbox (the
+/// filter answered ENOSYS, so `kcov`, `gdb`, `rr` and `valgrind` could not start): the
+/// image's `linux64 -R` sets that flag on itself and runs a command, and the command
+/// must run.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn a_process_may_turn_off_its_own_address_randomization() {
+    let cell = Cell::new("no-randomize");
+    let script = r#"
+        linux64 -R /bin/echo "no-randomize ran" 2>&1
+        echo "code $?"
+    "#;
+    let result = run(&cell, 1, &sh(script)).await.expect("ran");
+    let out = cell.stdout(&result);
+    assert_eq!(result.exit_code, 0, "{out}\n{}", cell.stderr(&result));
+    assert!(out.contains("no-randomize ran\ncode 0"), "{out}");
+    cell.assert_clean(1);
+}
+
 /// The first subordinate uid of the test's user: what container id 0 is on the host.
 fn first_subordinate_id() -> u32 {
     let uid = rustix::process::getuid().as_raw().to_string();
