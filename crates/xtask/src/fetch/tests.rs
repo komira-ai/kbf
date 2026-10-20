@@ -88,10 +88,11 @@ fn tar_gz(path: &str) -> Unpack {
 }
 
 /// `install` of `bytes` (pinned at their own digest) into a fresh `out`.
-fn install_own(name: &str, bytes: &[u8], unpack: &Unpack) -> (Result<(), Error>, PathBuf) {
-    let _out_own = scratch(name);
-    let out = _out_own.join("bin").join("tool");
-    (install(bytes, &Sha256::of(bytes), unpack, &out), out)
+/// The caller holds the directory (the last element) while it reads `out`.
+fn install_own(name: &str, bytes: &[u8], unpack: &Unpack) -> (Result<(), Error>, PathBuf, TestDir) {
+    let own = scratch(name);
+    let out = own.join("bin").join("tool");
+    (install(bytes, &Sha256::of(bytes), unpack, &out), out, own)
 }
 
 #[test]
@@ -168,7 +169,7 @@ fn a_mismatch_names_both_digests() {
 fn a_matching_raw_download_is_installed_executable() {
     // Catches: a raw download altered on the way to disk, a file left without the
     // execute bits (the job's next step runs it), or a part file left beside it.
-    let (result, out) = install_own("raw", TOOL, &Unpack::Raw);
+    let (result, out, _own) = install_own("raw", TOOL, &Unpack::Raw);
     result.expect("install");
     assert_eq!(std::fs::read(&out).expect("read"), TOOL);
     let mode = std::fs::metadata(&out).expect("stat").permissions().mode();
@@ -192,7 +193,7 @@ fn each_format_yields_the_tool() {
         ("tar-xz", xz(&tar()), xz_tar),
         ("zip", zip(), zip_member_of("tool-1.0/tool")),
     ] {
-        let (result, out) = install_own(name, &bytes, &unpack);
+        let (result, out, _own) = install_own(name, &bytes, &unpack);
         result.expect(name);
         assert_eq!(std::fs::read(&out).expect("read"), TOOL, "{name}");
     }
@@ -217,7 +218,7 @@ fn an_archive_that_does_not_decode_is_an_unpack_error_with_nothing_written() {
     ] {
         // Not `name` alone: each_format_yields_the_tool installs a "zst" at the same
         // time, in the same process, and its file made this test fail at random.
-        let (result, out) = install_own(&format!("undecodable-{name}"), &bytes, &unpack);
+        let (result, out, _own) = install_own(&format!("undecodable-{name}"), &bytes, &unpack);
         assert!(
             matches!(result, Err(Error::Unpack(_))),
             "{name}: {result:?}"
@@ -240,7 +241,7 @@ fn a_missing_member_or_one_that_is_not_a_regular_file_is_refused() {
         ("tool-1.0", Error::NotAFile(member("tool-1.0"))),
     ];
     for (path, expected) in cases {
-        let (result, out) = install_own(path, &archive, &tar_gz(path));
+        let (result, out, _own) = install_own(path, &archive, &tar_gz(path));
         assert_eq!(result, Err(expected));
         assert!(!out.exists() && !part_path(&out).exists(), "{path}");
     }
@@ -265,7 +266,8 @@ fn a_missing_zip_member_or_one_that_is_not_a_regular_file_is_refused() {
         ("tool-1.0/", Error::NotAFile(member("tool-1.0/"))),
     ];
     for (path, expected) in cases {
-        let (result, out) = install_own(&format!("zip-{path}"), &archive, &zip_member_of(path));
+        let (result, out, _own) =
+            install_own(&format!("zip-{path}"), &archive, &zip_member_of(path));
         assert_eq!(result, Err(expected), "{path}");
         assert!(!out.exists() && !part_path(&out).exists(), "{path}");
     }
@@ -283,7 +285,7 @@ fn a_zip_entry_that_cannot_be_read_is_an_unpack_error() {
         archive[at + i + 10] = 12;
         at += i + 4;
     }
-    let (result, out) = install_own("zip-method", &archive, &zip_member_of("tool-1.0/tool"));
+    let (result, out, _own) = install_own("zip-method", &archive, &zip_member_of("tool-1.0/tool"));
     assert!(matches!(result, Err(Error::Unpack(_))), "{result:?}");
     assert!(!out.exists() && !part_path(&out).exists());
 }

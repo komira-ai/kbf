@@ -214,19 +214,19 @@ fn stamps_reports_a_cargo_that_does_not_start() {
 }
 
 /// A `kbf-server` (the fake, hard-linked) whose `--version` names `stamp`.
-fn server(name: &str, stamp: &str) -> PathBuf {
+fn server(name: &str, stamp: &str) -> (PathBuf, TestDir) {
     let dir = scratch(name);
     let bin = dir.join("kbf-server");
     std::fs::hard_link(FAKE, &bin).expect("link");
     std::fs::write(dir.join("kbf-server.stamp"), stamp).expect("stamp");
-    bin
+    (bin, dir)
 }
 
 #[test]
 fn check_passes_the_commit_the_binary_names_and_fails_another() {
     // Catches: a check that does not compare the stamp with the commit given (the
     // control inside the check catches one that accepts anything).
-    let bin = server("check", &HEAD[..12]);
+    let (bin, _own) = server("check", &HEAD[..12]);
     let run = |commit: &str| {
         let out = xtask(Path::new("."), &["build-commit", "check"])
             .arg(&bin)
@@ -257,13 +257,13 @@ fn check_passes_the_commit_the_binary_names_and_fails_another() {
 
 /// A `kbf` (the fake, hard-linked) whose `--version` names `stamp` and whose
 /// `--version --json` prints `json`.
-fn kbf(name: &str, stamp: &str, json: &str) -> PathBuf {
+fn kbf(name: &str, stamp: &str, json: &str) -> (PathBuf, TestDir) {
     let dir = scratch(name);
     let bin = dir.join("kbf");
     std::fs::hard_link(FAKE, &bin).expect("link");
     std::fs::write(dir.join("kbf.stamp"), stamp).expect("stamp");
     std::fs::write(dir.join("kbf.json"), json).expect("json");
-    bin
+    (bin, dir)
 }
 
 /// The identity `kbf --version --json` prints, as a release build of `commit` makes it.
@@ -280,7 +280,7 @@ fn check_json_passes_a_release_build_of_the_commit_and_names_what_is_wrong() {
     // prints no object, ships; and a `--json` that accepts the control commit.
     let stamp = &HEAD[..12];
     let run = |name: &str, json: &str| {
-        let bin = kbf(name, stamp, json);
+        let (bin, _own) = kbf(name, stamp, json);
         outcome(
             xtask(Path::new("."), &["build-commit", "check", "--json"])
                 .arg(&bin)
@@ -333,7 +333,7 @@ fn check_json_reports_a_json_form_that_fails_or_is_not_an_object() {
     // Catches: a `--version --json` that exits non-zero passed over, or reported as the
     // plain form failing (the message names the form that failed); and valid JSON that
     // is not an object (an array, a bare string) read as an object with no fields.
-    let bin = kbf("json-fails", &HEAD[..12], &identity(&HEAD[..12], "release"));
+    let (bin, _own) = kbf("json-fails", &HEAD[..12], &identity(&HEAD[..12], "release"));
     let out = xtask(Path::new("."), &["build-commit", "check", "--json"])
         .arg(&bin)
         .arg(HEAD)
@@ -352,7 +352,7 @@ fn check_json_reports_a_json_form_that_fails_or_is_not_an_object() {
         )
     );
     for json in ["[1]\n", "\"release\"\n"] {
-        let bin = kbf("json-array", &HEAD[..12], json);
+        let (bin, _own) = kbf("json-array", &HEAD[..12], json);
         let out = xtask(Path::new("."), &["build-commit", "check", "--json"])
             .arg(&bin)
             .arg(HEAD)
@@ -377,7 +377,7 @@ fn check_without_json_does_not_run_the_json_form() {
     // Catches: the identity check made implicit for every binary, so the kbf-server and
     // kbf-daemon checks (which print no JSON) would fail: here a `kbf` whose JSON is
     // wrong still passes a plain check.
-    let bin = kbf("json-not-asked", &HEAD[..12], "garbage");
+    let (bin, _own) = kbf("json-not-asked", &HEAD[..12], "garbage");
     let out = xtask(Path::new("."), &["build-commit", "check"])
         .arg(&bin)
         .arg(HEAD)

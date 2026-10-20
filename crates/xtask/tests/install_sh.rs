@@ -225,6 +225,8 @@ struct Run {
     root: PathBuf,
     /// The lines the fake `systemd-sysusers` and `systemd-tmpfiles` logged.
     systemd: Vec<String>,
+    /// The directory `root` is in; last, so it is removed after everything above.
+    _dir: TestDir,
 }
 
 /// Every path under `dir` with its mode, directories with a trailing `/`.
@@ -277,7 +279,7 @@ impl Run {
 fn run_in(name: &str, files: Release, args: &[&str], extra_path: Option<&Path>, root: bool) -> Run {
     let dir = scratch(name);
     let path = path_with_fake_systemd(&dir);
-    run_with_path(&dir, files, args, extra_path, root, path)
+    run_with_path(dir, files, args, extra_path, root, path)
 }
 
 /// Copies the fake to `to` and returns once it can be executed.
@@ -311,7 +313,7 @@ fn path_with_fake_systemd(dir: &Path) -> std::ffi::OsString {
 
 /// [`run_in`] with the whole PATH given (before `extra_path`).
 fn run_with_path(
-    dir: &Path,
+    dir: TestDir,
     files: Release,
     args: &[&str],
     extra_path: Option<&Path>,
@@ -358,6 +360,7 @@ fn run_with_path(
             .lines()
             .map(str::to_owned)
             .collect(),
+        _dir: dir,
     }
 }
 
@@ -485,7 +488,7 @@ fn a_host_without_systemd_tools_is_refused_before_anything_is_placed() {
         std::os::unix::fs::symlink(found, bin.join(tool)).expect("link");
     }
     let r = run_with_path(
-        &dir,
+        dir,
         release().clone(),
         &[],
         None,

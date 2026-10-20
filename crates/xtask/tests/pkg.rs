@@ -73,21 +73,21 @@ fn the_stub_prints_its_arguments_on_both_outputs_and_exits_0() {
 
 /// The stub with a descriptor open for writing on it, as a forked child leaves it:
 /// running it is `ETXTBSY` until the descriptor is closed.
-fn held_open(name: &str) -> (PathBuf, std::fs::File) {
-    let _stub_own = scratch(name);
-    let stub = _stub_own.join("kbf-installer");
+fn held_open(name: &str) -> (PathBuf, std::fs::File, TestDir) {
+    let own = scratch(name);
+    let stub = own.join("kbf-installer");
     let held = std::fs::OpenOptions::new()
         .append(true)
         .open(&stub)
         .expect("open the stub for writing");
-    (stub, held)
+    (stub, held, own)
 }
 
 #[test]
 fn a_stub_held_open_for_writing_is_busy_to_a_plain_run() {
     // Catches: the two tests below passing on a file that is not busy at all, which
     // would prove neither the retry nor the deadline.
-    let (stub, _held) = held_open("busy-plain");
+    let (stub, _held, _own) = held_open("busy-plain");
     let err = Command::new(&stub).output().expect_err("the stub is busy");
     assert_eq!(err.kind(), io::ErrorKind::ExecutableFileBusy, "{err}");
 }
@@ -95,7 +95,7 @@ fn a_stub_held_open_for_writing_is_busy_to_a_plain_run() {
 #[test]
 fn a_busy_stub_runs_once_the_descriptor_closes() {
     // Catches: a run that gives up on the first ETXTBSY (the coverage job's failure).
-    let (stub, held) = held_open("busy-closes");
+    let (stub, held, _own) = held_open("busy-closes");
     let closer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
         drop(held);
@@ -132,7 +132,7 @@ fn a_stub_that_stays_busy_fails_with_busy_at_the_deadline() {
     // Catches: a retry with no end (the test would hang), and one that hides the error
     // it gave up on. The run is in a thread so that a loop without a deadline fails
     // this test instead of hanging the suite.
-    let (stub, _held) = held_open("busy-forever");
+    let (stub, _held, _own) = held_open("busy-forever");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let started = Instant::now();
