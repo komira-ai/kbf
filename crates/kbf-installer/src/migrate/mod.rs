@@ -219,6 +219,18 @@ pub fn guard(layout: &Layout, owner_uid: u32) -> Result<(), MigrateError> {
     standing(layout, owner_uid).map(drop)
 }
 
+/// Whether a finished migration (journal phase `Done`) adopted a host the Mac kit installed:
+/// the journal says so (`kit`), not the files. `setup` then keeps the kit's `kbf.toml` and
+/// adds to it. A journal of a migration begun, rolled back or never made says no.
+pub fn kit_adopted(layout: &Layout, owner_uid: u32) -> Result<bool, MigrateError> {
+    let rules = tree::Rules::release(owner_uid);
+    let journal = newtree::StateDir::open(layout, &rules)?
+        .map(|t| t.journal())
+        .transpose()?
+        .flatten();
+    Ok(journal.is_some_and(|j| j.kit && j.phase == journal::Phase::Done))
+}
+
 /// What the migration left on this host, for `setup`. The units a finished migration
 /// (journal phase `Done`) repointed; they are the ones `setup` may retire where they shadow
 /// the packaged unit of the same name. A host with no old layout and no finished migration
@@ -255,9 +267,11 @@ mod installer_unit_tests;
 #[cfg(test)]
 mod kit_adopt_tests;
 #[cfg(test)]
-mod kit_host;
+pub(crate) mod kit_host;
 #[cfg(test)]
 mod kit_host_tests;
+#[cfg(test)]
+mod kit_installer_job_tests;
 #[cfg(test)]
 mod kit_marker_tests;
 #[cfg(test)]
@@ -267,7 +281,7 @@ mod moved_tests;
 #[cfg(test)]
 mod refusal_tests;
 #[cfg(test)]
-mod rig;
+pub(crate) mod rig;
 #[cfg(test)]
 mod rollback_tests;
 #[cfg(test)]
