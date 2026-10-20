@@ -11,6 +11,11 @@ use crate::Error;
 use crate::package::read;
 use crate::sums::SUMS;
 
+/// The stage whose verdict a release carries, the one `release verdict-write` writes. Beta
+/// now; Gamma when the bake exists (its own change: the trigger moves with it, and a Gamma
+/// verdict needs a bake record, which `verdict-write` refuses to do without).
+pub const GATE_STAGE: Stage = Stage::Beta;
+
 /// The shortest bake a release accepts: 24 hours.
 pub const MIN_BAKE_SECS: u64 = 24 * 60 * 60;
 

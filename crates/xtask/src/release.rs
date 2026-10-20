@@ -43,13 +43,23 @@
 //!   changed; the files it lacks are uploaded. A re-run therefore creates no second
 //!   release and replaces no asset. It refuses first when the highest release tag is not
 //!   at `--commit` or an ancestor of it ([`tags::superseded`]).
+//! - `release tag --repo <owner/repo> --sha <sha> --tag <tag> --message-file <file>
+//!   [--tagger <login>] [--output <file>] [--gh <program>]` ([`tag`]): the annotated tag
+//!   `--tag` at `--sha` through the GitHub API, create-only, after the same stale-run
+//!   guards as `publish`. A tag that already exists is reused only when it names this
+//!   commit with this message. Prints `tag=` and `created=true|false`.
+//! - `release verdict-write <dir> --commit <sha> --tag <tag> --run-id <id> --ci-run <id>
+//!   --beta-run <id> --artifacts-run <id> --out <file> [...]` ([`verdict_write`]): the
+//!   verdict document the tag's message carries, for the stage [`verdict::GATE_STAGE`].
 
 mod git;
 pub mod notes;
 pub mod offer;
 pub mod plan;
+pub mod tag;
 pub mod tags;
 pub mod verdict;
+pub mod verdict_write;
 
 use std::io::Write;
 use std::path::Path;
@@ -97,6 +107,16 @@ fn api(gh: &Path, path: &str) -> Result<Option<Value>, Error> {
     let json = serde_json::from_slice(&out.stdout);
     json.map(Some)
         .map_err(|e| Error::Failed(format!("gh api {path}: not JSON: {e}")))
+}
+
+/// Appends `lines` to `output` (on Actions, `GITHUB_OUTPUT`), one per line.
+fn append_output(output: &Path, lines: &[String]) -> Result<(), Error> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output)
+        .and_then(|mut f| writeln!(f, "{}", lines.join("\n")))
+        .map_err(Error::spawn(format!("append to {}", output.display())))
 }
 
 /// Runs `gh <args>`; an error holds what it printed on stderr.
@@ -175,12 +195,7 @@ pub fn locate(
     }
     let line = format!("run-id={id}");
     if let Some(output) = output {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(output)
-            .and_then(|mut f| writeln!(f, "{line}"))
-            .map_err(Error::spawn(format!("append to {}", output.display())))?;
+        append_output(output, std::slice::from_ref(&line))?;
     }
     Ok(vec![
         format!("{commit} is on {MAIN}; run {id} of {ARTIFACTS_WORKFLOW} built it"),
