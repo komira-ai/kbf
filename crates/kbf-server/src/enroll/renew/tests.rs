@@ -9,10 +9,10 @@ use kbf_types::{RefusalReason, Role};
 use rcgen::{KeyPair, PublicKeyData as _};
 use x509_parser::prelude::{FromDer as _, X509Certificate};
 
-use crate::enroll::service::CONFIG_GENERATION;
+use crate::enroll::service::NodeSettings;
 use crate::enroll::testkit::{
-    Farm, START, csr, csr_bad_signature, enroll_request, farm, key, node, renew_request, spec,
-    token,
+    Farm, START, csr, csr_bad_signature, enroll_request, farm, key, node, renew_request,
+    service_with, spec, token,
 };
 
 const ADVERTISE: &str = "s1.nodes.test:8983";
@@ -20,11 +20,22 @@ const ROLES: [Role; 2] = [Role::Storage, Role::Daemon];
 
 /// A farm with `node-01` enrolled for both roles at `START`, and its keys.
 fn enrolled(name: &str) -> (Farm, Vec<KeyPair>) {
+    let (farm, keys, _) = enrolled_holding(name);
+    (farm, keys)
+}
+
+/// As [`enrolled`], and the configuration the enrollment answered with: what the node holds.
+fn enrolled_holding(name: &str) -> (Farm, Vec<KeyPair>, pb::NodeConfig) {
     let farm = farm(name);
     let tok = token(&farm, 1, &spec(&ROLES));
     let (request, keys) = enroll_request(&tok, "node-01", &ROLES, ADVERTISE);
-    farm.service.enroll_now(&request).expect("enrolled");
-    (farm, keys)
+    let held = farm
+        .service
+        .enroll_now(&request)
+        .expect("enrolled")
+        .config
+        .expect("a configuration");
+    (farm, keys, held)
 }
 
 fn refused(result: Result<pb::RenewResponse, RefusalReason>) -> RefusalReason {
@@ -39,11 +50,11 @@ fn refused(result: Result<pb::RenewResponse, RefusalReason>) -> RefusalReason {
 /// the storage host out of the certificate, or sends a configuration the node holds.
 #[test]
 fn a_renewal_issues_new_certificates_for_the_same_keys() {
-    let (farm, keys) = enrolled("renew-ok");
+    let (farm, keys, held) = enrolled_holding("renew-ok");
     let before = list_nodes(&*farm.store).expect("nodes");
     farm.advance(120);
     let mut request = renew_request("node-01", &ROLES, &keys, farm.now());
-    request.config_generation = CONFIG_GENERATION;
+    request.config_generation = held.generation;
     let answer = farm.service.renew_now(&request).expect("renewed");
 
     assert_eq!(answer.server_time, START + 120);
@@ -86,13 +97,13 @@ fn a_renewal_issues_new_certificates_for_the_same_keys() {
 /// Catches: a configuration change that never reaches nodes that only renew.
 #[test]
 fn a_node_with_an_older_configuration_is_sent_the_current_one() {
-    let (farm, keys) = enrolled("renew-config");
+    let (farm, keys, held) = enrolled_holding("renew-config");
     farm.advance(120);
     let mut request = renew_request("node-01", &ROLES, &keys, farm.now());
-    request.config_generation = CONFIG_GENERATION + 1;
+    request.config_generation = held.generation + 1;
     let answer = farm.service.renew_now(&request).expect("renewed");
     let config = answer.config.expect("a configuration");
-    assert_eq!(config.generation, CONFIG_GENERATION);
+    assert_eq!(config.generation, held.generation);
     assert_eq!(config.roles, ["storage", "daemon"]);
 }
 
@@ -359,18 +370,18 @@ fn the_node_client_recognises_the_renewal_refusal_and_does_not_retry_it() {
 /// configuration sent at every renewal once a store is registered.
 #[test]
 fn a_renewal_after_a_store_was_registered_carries_it_once() {
-    let (farm, keys) = enrolled("renew-cold");
-    let registry_generation = crate::enroll::testkit::register_cold(&farm);
+    let (farm, keys, held) = enrolled_holding("renew-cold");
+    crate::enroll::testkit::register_cold(&farm);
     farm.advance(120);
     let mut request = renew_request("node-01", &ROLES, &keys, farm.now());
-    request.config_generation = CONFIG_GENERATION;
+    request.config_generation = held.generation;
     let config = farm
         .service
         .renew_now(&request)
         .expect("renewed")
         .config
         .expect("a node on the old generation is sent the configuration");
-    assert_eq!(config.generation, CONFIG_GENERATION + registry_generation);
+    assert_ne!(config.generation, held.generation);
     assert!(
         config
             .cold_store
@@ -404,12 +415,12 @@ fn a_renewal_after_a_store_was_registered_carries_it_once() {
 /// it never got.
 #[test]
 fn a_renewal_while_only_the_cold_store_cannot_be_read_is_store_unavailable() {
-    let (farm, keys) = enrolled("renew-cold-unreadable");
+    let (farm, keys, held) = enrolled_holding("renew-cold-unreadable");
     crate::enroll::testkit::register_cold(&farm);
     farm.advance(120);
     let before = list_nodes(&*farm.store).expect("nodes");
     let mut request = renew_request("node-01", &ROLES, &keys, farm.now());
-    request.config_generation = CONFIG_GENERATION;
+    request.config_generation = held.generation;
     farm.store
         .txn(Txn::new().put("objstore/gen", [0xffu8, 0xff], Cond::Any))
         .expect("store")
@@ -484,5 +495,59 @@ fn a_renewal_by_a_fenced_frontend_reading_the_cold_store_is_not_signer() {
     assert_eq!(
         refused(service.renew_now(&request)),
         RefusalReason::NotSigner
+    );
+}
+
+/// A node enrolled while the frontend named endpoint A, renewing after the frontend was
+/// restarted with endpoint B, is sent B once; a renewal after that, and a renewal after a
+/// restart with the same flags, are sent nothing.
+///
+/// Catches: a moved worker endpoint that never reaches an enrolled node (a generation that
+/// ignores the endpoint, so `Renew` answers "no change" for ever and the node needs a
+/// re-enrollment), and a configuration re-sent at every renewal or at every frontend
+/// restart (needless churn on the node's `node.json`).
+#[test]
+fn a_renewal_after_the_worker_endpoint_moved_carries_the_new_one_once() {
+    let (mut farm, keys, held) = enrolled_holding("renew-moved");
+    assert_eq!(held.worker_endpoint, "https://front.test:7443");
+
+    farm.service = service_with(&farm.store, &farm.ca, crate::enroll::testkit::settings());
+    farm.advance(120);
+    let mut same = renew_request("node-01", &ROLES, &keys, farm.now());
+    same.config_generation = held.generation;
+    assert_eq!(
+        farm.service.renew_now(&same).expect("renewed").config,
+        None,
+        "a restart with the same flags changes nothing"
+    );
+
+    farm.service = service_with(
+        &farm.store,
+        &farm.ca,
+        NodeSettings {
+            worker_endpoint: "https://proxy.test:443".to_owned(),
+            ..crate::enroll::testkit::settings()
+        },
+    );
+    farm.advance(120);
+    let mut moved = renew_request("node-01", &ROLES, &keys, farm.now());
+    moved.config_generation = held.generation;
+    let config = farm
+        .service
+        .renew_now(&moved)
+        .expect("renewed")
+        .config
+        .expect("a node on the old endpoint is sent the new configuration");
+    assert_eq!(config.worker_endpoint, "https://proxy.test:443");
+    assert_ne!(config.generation, held.generation);
+    assert_eq!(config.roles, ["storage", "daemon"]);
+
+    farm.advance(120);
+    let mut again = renew_request("node-01", &ROLES, &keys, farm.now());
+    again.config_generation = config.generation;
+    assert_eq!(
+        farm.service.renew_now(&again).expect("renewed").config,
+        None,
+        "the node holds the generation it was sent"
     );
 }
