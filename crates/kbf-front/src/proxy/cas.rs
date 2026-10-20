@@ -17,7 +17,7 @@ use kbf_proto::reapi::{
     GetChunkMappingRequest, GetChunkMappingResponse, GetTreeRequest, GetTreeResponse,
     RegisterChunkMappingRequest, RegisterChunkMappingResponse, SpliceBlobRequest,
     SpliceBlobResponse, SplitBlobRequest, SplitBlobResponse, batch_read_blobs_response,
-    batch_update_blobs_request, batch_update_blobs_response,
+    batch_update_blobs_response,
 };
 use tonic::{Request, Response, Status, Streaming};
 
@@ -56,22 +56,27 @@ impl ProxyCas {
         authorize(&**authorizer, caller, call, instance).await
     }
 
-    /// Stores one batch item on its writer, or says why not.
-    async fn store_one(&self, item: batch_update_blobs_request::Request) -> Result<(), Status> {
-        let digest = wire::digest(item.digest.as_ref())?;
-        if item.compressor != reapi::compressor::Value::Identity as i32 {
+    /// Stores one batch item (its digest, compressor and counted data) on its writer, or
+    /// says why not.
+    async fn store_one(
+        &self,
+        digest: Option<&reapi::Digest>,
+        compressor: i32,
+        data: Bytes,
+    ) -> Result<(), Status> {
+        let digest = wire::digest(digest)?;
+        if compressor != reapi::compressor::Value::Identity as i32 {
             return Err(Status::invalid_argument(format!(
-                "blob {digest}: compressor {} is not supported",
-                item.compressor
+                "blob {digest}: compressor {compressor} is not supported",
             )));
         }
-        let actual = kbf_segments::sha256(&item.data);
+        let actual = kbf_segments::sha256(&data);
         if actual != digest {
             return Err(Status::invalid_argument(format!(
                 "blob {digest}: the data is {actual}"
             )));
         }
-        self.owners.put(&digest, Bytes::from(item.data)).await
+        self.owners.put(&digest, data).await
     }
 
     fn unimplemented<T>(call: &str) -> Result<T, Status> {
@@ -126,10 +131,23 @@ impl ContentAddressableStorage for ProxyCas {
                 "batch carries {total} bytes; at most {MAX_BATCH_TOTAL_BYTES} are allowed"
             )));
         }
-        let responses = stream::iter(request.requests)
-            .map(|item| async move {
-                let digest = item.digest.clone();
-                let stored = self.store_one(item).await;
+        // Every blob of the batch is in memory from the decoded request until its own
+        // store is done, not only the 32 in flight: counted (`kbf_bytes_in_flight`) from
+        // here, each given back when its store has finished with it.
+        let items: Vec<_> = request
+            .requests
+            .into_iter()
+            .map(|r| {
+                (
+                    r.digest,
+                    r.compressor,
+                    kbf_storage::in_flight::counted(r.data),
+                )
+            })
+            .collect();
+        let responses = stream::iter(items)
+            .map(|(digest, compressor, data)| async move {
+                let stored = self.store_one(digest.as_ref(), compressor, data).await;
                 batch_update_blobs_response::Response {
                     digest,
                     status: Some(stored.map_or_else(|e| wire::rpc_status(&e), |()| wire::rpc_ok())),
@@ -170,20 +188,28 @@ impl ContentAddressableStorage for ProxyCas {
                     Ok(digest) => self.owners.read_blob(&digest).await,
                     Err(e) => Err(e),
                 };
-                let (data, status) = match read {
-                    Ok(bytes) => (bytes.to_vec(), wire::rpc_ok()),
-                    Err(e) => (Vec::new(), wire::rpc_status(&e)),
+                // The copy the response carries is counted (`kbf_bytes_in_flight`) until
+                // the handler returns it; the blob it was copied from is given back here.
+                let (data, status, held) = match read {
+                    Ok(bytes) => (
+                        bytes.to_vec(),
+                        wire::rpc_ok(),
+                        Some(kbf_storage::in_flight::hold(bytes.len() as u64)),
+                    ),
+                    Err(e) => (Vec::new(), wire::rpc_status(&e), None),
                 };
-                batch_read_blobs_response::Response {
+                let response = batch_read_blobs_response::Response {
                     digest: Some(asked),
                     data,
                     compressor: reapi::compressor::Value::Identity as i32,
                     status: Some(status),
-                }
+                };
+                (response, held)
             })
             .buffered(BATCH_PARALLELISM)
             .collect::<Vec<_>>()
             .await;
+        let (responses, _held): (Vec<_>, Vec<_>) = responses.into_iter().unzip();
         Ok(Response::new(BatchReadBlobsResponse { responses }))
     }
 

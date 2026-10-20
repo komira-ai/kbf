@@ -330,18 +330,51 @@ async fn a_segment_on_the_tier_is_written_there_and_built_as_its_range() {
 }
 
 /// Catches: a segment's receive buffer not counted in `kbf_bytes_in_flight` from its
-/// allocation (a declared length is held whether or not its pages are touched), and the
-/// built segment's body dropping the count while the cache still holds it. Bounds from
-/// below only: the gauge is the process's and other tests add to it.
+/// allocation (a declared length is held whether or not its pages are touched), the
+/// built segment's body dropping the count while the cache still holds it, and, for a
+/// trusted segment on a cache with no room on a write tier, the whole-segment copy
+/// `verify_built` makes (records and a rebuilt footer, up to 33 MiB) not counted, or
+/// counted only until the body it replaces is dropped. Bounds from below in a process
+/// that runs other tests (the gauge is the process's); exact under cargo-nextest, where
+/// this test has the process to itself: the copy alone is counted once the original is
+/// gone, and nothing is left counted once the copy is dropped.
 ///
-/// Mutant: `Receiving::new` not holding the buffer.
-#[test]
-fn a_received_segment_is_counted_while_it_is_held() {
+/// Mutants: `Receiving::new` not holding the buffer; the body `verify_built` returns
+/// made with `Bytes::from` (the copy uncounted).
+#[tokio::test]
+async fn a_received_segment_is_counted_while_it_is_held() {
     let (declared, records) = segment(5, 300);
     let length = declared.length;
+    let process = kbf_storage::in_flight::process();
     let received = send(&declared, &records, 64, &in_order(records.len(), 64));
-    assert!(kbf_storage::in_flight::process().current() >= length);
+    assert!(process.current() >= length);
     let built = received.check(&declared).expect("built");
-    assert!(kbf_storage::in_flight::process().current() >= length);
+    assert!(process.current() >= length);
     assert_eq!(built.body.len() as u64, length);
+
+    // The trusted case: the cache has no room on a tier, so the segment is hashed here
+    // and the rebuilt copy is what `store_segment` PUTs.
+    let mut trusted = Receiving::new(&declared, true, None);
+    trusted.put(&declared, 0, &records).expect("put");
+    let unverified = trusted.check(&declared).expect("built");
+    assert!(!unverified.verified);
+    let cache = crate::Cache::memory();
+    let verified = cache.verify_built(unverified).await.expect("verified");
+    assert!(verified.verified);
+    assert_eq!(verified.body.len() as u64, length);
+    assert!(process.current() >= length, "the copy is counted");
+    if std::env::var_os("NEXTEST").is_some() {
+        // `built` (the first segment) and the copy; nothing of the body the copy replaced.
+        assert_eq!(
+            process.current(),
+            2 * length,
+            "the copy, and not its original"
+        );
+        drop(built);
+        assert_eq!(process.current(), length, "only the copy is counted");
+        drop(verified);
+        assert_eq!(process.current(), 0, "given back with the copy");
+    } else {
+        eprintln!("exact count skipped: the process gauge is exact only under cargo-nextest");
+    }
 }

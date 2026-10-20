@@ -125,7 +125,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         let messages = stream::unfold((read, Bytes::new()), |(mut read, mut window)| async move {
             while window.is_empty() {
                 // The spent window's count is given back before the next is read, not
-                // after: an empty slice still holds its buffer.
+                // after, whatever `split_to` left of it (`Bytes` 1.12 releases a buffer
+                // cut to its end, so today this drop is belt and braces).
                 drop(std::mem::take(&mut window));
                 match read.next().await? {
                     Ok(next) => window = next,

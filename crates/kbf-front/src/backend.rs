@@ -313,7 +313,11 @@ impl Plane for Remote {
     }
 
     fn render_metrics(&self) -> String {
-        self.metrics.render()
+        let mut out = self.metrics.render();
+        // The process's, as `Cache::render_metrics` adds it: this frontend buffers
+        // bodies for its requests (batch blobs, Segments uploads, whole-blob reads) too.
+        kbf_storage::in_flight::render(&mut out);
+        out
     }
 
     fn leadership(&self) -> Option<Leadership> {

@@ -1689,6 +1689,27 @@ async fn a_frontend_without_a_state_store_has_no_storage_health() {
     assert!(!scrape.contains("kbf_under_replicated_blobs"), "{scrape}");
 }
 
+/// Catches: a `--storage` frontend, whose backend is the proxy kind (`Backend::remote`)
+/// and not the cache, with no `kbf_bytes_in_flight` or `kbf_bytes_in_flight_peak` family
+/// on its `/metrics`. (The routed kind renders through the same `Remote`: its unit test
+/// is `backend_tests`.)
+///
+/// Mutant: `Remote::render_metrics` returning `self.metrics.render()` alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_storage_frontend_exports_the_bytes_in_flight() {
+    let node = Node::start().await;
+    let front =
+        Front::start(&flags(&[&format!("--storage=http://{}", node.addr)]).expect("parses")).await;
+    let (code, scrape) = get_text(front.api, "/metrics").await;
+    assert_eq!(code, 200);
+    for family in ["kbf_bytes_in_flight", "kbf_bytes_in_flight_peak"] {
+        assert!(
+            scrape.contains(&format!("# TYPE {family} gauge\n{family} ")),
+            "{family} missing from {scrape}"
+        );
+    }
+}
+
 /// Catches: `--history-objects` taken by a frontend and not wired (a frontend whose
 /// `/metrics` never names history, one that starts over a directory it does not open),
 /// and one taken without the state store its index rows go to: refused before anything

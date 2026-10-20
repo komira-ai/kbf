@@ -21,7 +21,10 @@
 //! (per message, not per byte). [`render`] appends the Prometheus text.
 //!
 //! **Not counted:** the segment writer's own buffer (bounded by the write config), the
-//! object store's and the write tier's internals, and the copies tonic makes encoding or
+//! object store's and the write tier's internals (among them the copies of the frontend's
+//! write pool, `cache/pool.rs`, and of its streamed store, `cache/stream_store.rs`: a few
+//! MiB per write that the large-`Write` bound of a few messages does not include, so it
+//! understates resident memory by that much), and the copies tonic makes encoding or
 //! decoding a message. **The daemon seam:** the daemon holds bytes through the same
 //! [`process`] gauge ([`counted`], [`Held`]) and has only to [`render`] it on a
 //! `--metrics-listen` listener, which it does not have yet.
@@ -75,8 +78,12 @@ impl Gauge {
 
     fn take(&self, bytes: u64) {
         let now = self.current.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        // A compare-and-swap loop on most targets.
-        self.peak.fetch_max(now, Ordering::Relaxed);
+        // Most takes do not raise the peak: a load, no read-modify-write (a
+        // compare-and-swap loop on most targets) unless `now` is above it. A racing take
+        // that sees a stale peak only does the `fetch_max`, which keeps the larger.
+        if now > self.peak.load(Ordering::Relaxed) {
+            self.peak.fetch_max(now, Ordering::Relaxed);
+        }
     }
 
     fn give(&self, bytes: u64) {

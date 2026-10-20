@@ -10,8 +10,9 @@ use kbf_types::Digest;
 
 use super::fake::{Mem, patterned, serve, sha};
 use super::{raw_write, upload_name};
+use crate::Storage as _;
 use crate::in_flight::process;
-use crate::service::STREAM_FROM_BYTES;
+use crate::service::{RemoteStorage, STREAM_FROM_BYTES};
 
 const MIB: usize = 1 << 20;
 
@@ -213,4 +214,47 @@ async fn a_write_that_fails_or_is_abandoned_gives_everything_back() {
         }
     }
     assert!(process().peak() >= MIB as u64);
+}
+
+/// Catches: a whole-blob read through a storage client (`RemoteStorage::read_blob`, what
+/// the proxy frontend reads a blob with) whose buffer is not counted (current 0 while the
+/// caller holds the blob), counted at the wrong size, or built twice: the chunks collected
+/// and then joined into a second whole-blob copy (the peak near twice the blob, where one
+/// buffer and a chunk or two reach the blob and a few MiB). Exact while the caller holds
+/// the blob, 0 once it is dropped.
+///
+/// Mutants: the chunks collected and `concat`enated, as before; the joined `Bytes` made
+/// with `Bytes::from` (current 0); the buffer's hold made `hold(0)`.
+#[tokio::test]
+async fn a_remote_whole_blob_read_is_held_once_and_given_back() {
+    let Some(_turn) = turn().await else {
+        return;
+    };
+    let mem = std::sync::Arc::new(Mem::default());
+    let channel = serve(&mem, 1 << 30).await;
+    let blob = patterned(20 * MIB);
+    let digest = sha(&blob);
+    mem.blobs
+        .lock()
+        .expect("lock")
+        .insert(digest, bytes::Bytes::from(blob.clone()));
+
+    let remote = RemoteStorage::new(channel, 0);
+    let got = remote.read_blob(&digest).await.expect("read_blob");
+    assert_eq!(got.len(), blob.len());
+    assert!(got[..] == blob[..], "the bytes");
+    assert_eq!(
+        process().current(),
+        blob.len() as u64,
+        "the blob, counted once, while the caller holds it"
+    );
+    let peak = process().peak();
+    assert!(peak >= blob.len() as u64, "the blob is held whole: {peak}");
+    assert!(
+        peak <= blob.len() as u64 + 4 * MIB as u64,
+        "one buffer and a chunk or two, not two copies: {peak}"
+    );
+    drop(got);
+    forget(&mem);
+    given_back("after the blob is dropped").await;
 }
