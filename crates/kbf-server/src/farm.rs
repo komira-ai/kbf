@@ -75,7 +75,7 @@ use crate::fault;
 use crate::fleet::{
     NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes, needs_attention,
 };
-use crate::machine::{FarmMachine, Sent, Waiter};
+use crate::machine::{FarmMachine, Platform, Sent, Waiter};
 use crate::memory;
 use crate::missing;
 use crate::run_record;
@@ -882,6 +882,7 @@ impl Farm {
         let ran_on = (worker, stamp);
         // Read before `outcome`, which drops a failed run's result.
         let measured = Measured::of(&result);
+        let exit_code = action_usage::exit_code(&result);
         let run = recorded.then(|| {
             let usage = measured.as_ref().map(Measured::usage);
             run_record::of(&result, usage, stamp, SystemTime::now())
@@ -895,6 +896,7 @@ impl Farm {
                 lease,
                 outcome,
                 measured,
+                exit_code,
                 run,
             };
             // Parked before the feed: the transaction that finishes the operation writes
@@ -1034,6 +1036,7 @@ impl Dispatch for Farm {
             do_not_cache: submission.request.do_not_cache,
             queued: SystemTime::now(),
             usage,
+            platform: Platform::of(&submission.request.needs),
         });
         let name = state.machine.name(waiter);
         if let Some((call, shape)) = submission.call.take().zip(shape) {
@@ -1117,6 +1120,7 @@ impl State {
             lease,
             outcome,
             measured,
+            exit_code,
             run,
         } = report;
         // Taken first: a report that finishes the operation may drop its callers.
@@ -1155,6 +1159,8 @@ impl State {
             self.record_ran(operation, lease, run);
         }
         let (operation, node) = (name, worker);
+        // `-` when the worker reported no run (a failure before the action executed).
+        let _exit_code = exit_code.map_or_else(|| "-".to_owned(), |code| code.to_string());
         match outcome {
             Outcome::Completed { .. } => {
                 tracing::info!(%operation, %lease, %node, accepted, "lease finished ok");
@@ -1399,9 +1405,13 @@ impl State {
         );
         // The key joins the daemon's `lease phases:` line (`lease=`) to the action, also
         // for a lease whose result is never taken (cancelled).
-        let key = self
-            .first_waiter(grant.operation)
-            .map(|(_, w)| tracing::field::display(w.usage.key));
+        let first = self.first_waiter(grant.operation);
+        let key = first.map(|(_, w)| tracing::field::display(w.usage.key));
+        // What the action asked for, parsed (`-` when it named none), so an audit can
+        // find a Linux action leased to a Mac.
+        let platform = first.map(|(_, w)| &w.platform);
+        let os_family = platform.map_or("-", |p| p.os_family);
+        let isa = platform.map_or("-", |p| p.isa.as_str());
         tracing::info!(%operation, %lease, %node, key, "lease granted");
         self.record_granted(grant);
         self.send_for(&grant.worker, grant.operation, |w| {
@@ -1569,6 +1579,8 @@ struct Report {
     lease: LeaseId,
     outcome: Outcome,
     measured: Option<Measured>,
+    /// The exit code of the action's run, if the worker reported one ([`action_usage::exit_code`]).
+    exit_code: Option<i32>,
     run: Option<kbf_invocation::Run>,
 }
 
