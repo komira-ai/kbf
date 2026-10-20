@@ -621,6 +621,12 @@ fn role_database_and_socket_come_from_the_url() {
         (None, None, None)
     );
     assert!(Target::parse("mysql:///x").is_err());
+    // A key spelled `dbname=` names the database; an empty value and a key nobody here reads
+    // change nothing; a broken or truncated escape stays as written.
+    let keyed = t("postgres:///first?dbname=second&sslmode=disable&user=&host=");
+    assert_eq!(keyed.database.as_deref(), Some("second"));
+    assert_eq!((keyed.role, keyed.host), (None, None));
+    assert_eq!(t("postgres:///a%zzb%").database.as_deref(), Some("a%zzb%"));
 }
 
 /// Catches a scratch database made on another role or socket than the configured one, or a
@@ -642,6 +648,22 @@ fn a_scratch_database_is_on_the_same_server_as_the_same_role() {
     for bad in ["", "1x", "a-b", "a b", "x?host=/evil", &"n".repeat(64)] {
         assert!(farm.url_for(bad).is_err(), "{bad}");
     }
+    // Nothing to carry gives no query; a host that needs escaping is escaped.
+    let none = Target {
+        role: None,
+        database: None,
+        host: None,
+    };
+    assert_eq!(none.url_for("t").expect("name"), "postgres:///t");
+    let odd = Target {
+        role: Some("a b".into()),
+        database: None,
+        host: Some("/a b/c".into()),
+    };
+    assert_eq!(
+        odd.url_for("t").expect("name"),
+        "postgres:///t?host=/a%20b/c&user=a%20b"
+    );
     // The round trip is a URL the parser reads back to the same target (database aside).
     let back = Target::parse(&farm.url_for("scratch").expect("name")).expect("parses");
     assert_eq!(back.role, farm.role);

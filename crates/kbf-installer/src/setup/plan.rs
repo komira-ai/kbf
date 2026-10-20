@@ -90,24 +90,12 @@ fn service_user_name(mode: Mode) -> &'static str {
 }
 
 /// The drop-in text that makes `kbf-backup.service` run as `user`, the mode's service user (the
-/// one `service_user_name` names, which is the frontend unit's `User=`).
-///
-/// # Errors
-/// `user` is not a plain account name (it goes into a unit file).
-pub fn backup_user_dropin(user: &str) -> Result<String, SetupError> {
-    let plain = !user.is_empty()
-        && user.len() <= 32
-        && user
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c));
-    if !plain {
-        return Err(SetupError::Unsupported(
-            "the service user's name is not one a unit file can carry".to_owned(),
-        ));
-    }
-    Ok(format!(
+/// one `service_user_name` names, which is the frontend unit's `User=`). The names are a fixed
+/// set of account names, so nothing here needs escaping.
+pub fn backup_user_dropin(user: &str) -> String {
+    format!(
         "# Written by `kbf-installer setup`: the user the backup runs as, the service user of the\n# frontend. The package's kbf-backup.service carries none.\n[Service]\nUser={user}\n"
-    ))
+    )
 }
 
 /// Whether the host runs actions in containers: it then needs a subid range and lingering.
@@ -555,20 +543,15 @@ fn units(
         Platform::Linux => {
             // The backup runs as the service user, written before the timer is enabled.
             if v.mode.keeps_state_in_database() {
-                let user = ctx
-                    .service
-                    .as_ref()
-                    .map(|u| u.name.as_str())
-                    .ok_or_else(|| {
-                        SetupError::Unsupported("no service user for the backup unit".to_owned())
-                    })?;
+                // The name is the one the frontend unit runs as: `service_user_name`, a fixed set.
+                let user = service_user_name(v.mode);
                 dir(p, BACKUP_SERVICE_DIR, 0o755, ctx.root)?;
                 file(
                     p,
                     BACKUP_USER_DROPIN,
                     0o644,
                     ctx.root,
-                    backup_user_dropin(user)?.into_bytes(),
+                    backup_user_dropin(user).into_bytes(),
                 )?;
             }
             let backup = v

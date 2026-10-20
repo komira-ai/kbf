@@ -5,7 +5,7 @@
 use super::*;
 use crate::helper::fetcher::fake::FakeFetcher;
 use crate::setup::backend::{Fetching, Postgres};
-use crate::setup::plan::{BACKUP_USER_DROPIN, backup_user_dropin};
+use crate::setup::plan::BACKUP_USER_DROPIN;
 use crate::testkit::{A, c};
 use kbf_host::testkit::ScratchHost;
 
@@ -710,16 +710,4 @@ fn the_backup_unit_runs_as_the_modes_service_user() {
     let mut exec = released(host(), Platform::Linux);
     go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
     assert!(write_index(&exec, BACKUP_USER_DROPIN).is_none());
-}
-
-/// Catches an account name that could add a line to the unit, or no name at all.
-#[test]
-fn the_dropin_refuses_a_name_a_unit_file_cannot_carry() {
-    assert_eq!(
-        backup_user_dropin("kbf-server").expect("plain"),
-        backup_user_dropin("kbf-server").expect("again")
-    );
-    for bad in ["", "a\nExecStart=/bin/sh", "a b", "root;x", &"u".repeat(33)] {
-        assert!(backup_user_dropin(bad).is_err(), "{bad:?}");
-    }
 }

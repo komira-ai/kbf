@@ -149,11 +149,13 @@ impl Target {
         let mut database = Some(unescape(path)).filter(|d| !d.is_empty());
         for pair in query.split('&') {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            let value = Some(unescape(value)).filter(|v| !v.is_empty());
+            let Some(value) = Some(unescape(value)).filter(|v| !v.is_empty()) else {
+                continue;
+            };
             match key {
-                "user" if value.is_some() => role = value,
-                "host" if value.is_some() => host = value,
-                "dbname" if value.is_some() => database = value,
+                "user" => role = Some(value),
+                "host" => host = Some(value),
+                "dbname" => database = Some(value),
                 _ => {}
             }
         }
