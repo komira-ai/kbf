@@ -29,7 +29,9 @@ use kbf_proto::worker::{
 use kbf_server::identity::Presented;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL};
 use kbf_server::members_rpc::MembershipService;
-use kbf_server::proxy_auth::{Identity, NODE_ID, PROXY_AUTH, ProxyAuthLayer, ProxySecret, ROLE};
+use kbf_server::proxy_auth::{
+    Identity, NODE_ID, NODE_IPS, PROXY_AUTH, ProxyAuthLayer, ProxySecret, ROLE,
+};
 use kbf_server::token::ApiToken;
 use kbf_server::{Api, Behind, DenyList, Listeners, bind_server_with_options};
 use kbf_state::Store;
@@ -101,6 +103,7 @@ fn start_denying(with_proxy: bool, deny_list: Option<DenyList>) -> Server_ {
         hello_wait: Duration::from_millis(300),
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
@@ -581,11 +584,12 @@ async fn register(
     client.register(request).await.map(drop)
 }
 
-/// Catches: Membership admitting a proxied caller by anything but the role and the one name
-/// the proxy forwarded. The SAN check has no certificate behind the proxy, so the
-/// conservative rule holds: the proxied node must be the host of both the instance id and
-/// the address, an IP address is covered by nothing, and another node's host is refused;
-/// the role must be `storage`, and without the secret the caller is anonymous.
+/// Catches: Membership admitting a proxied caller by anything but the role and the names
+/// the proxy forwarded. With no `x-kbf-node-ips` (a leaf with no IP name, or an older proxy)
+/// the proxied node must be the host of both the instance id and the address, an IP address
+/// is covered by nothing, and another node's host is refused (`membership_covers_the_ips_...`
+/// is the case with the header); the role must be `storage`, and without the secret the
+/// caller is anonymous.
 ///
 /// Mutants seen red: the role not checked; the node name widened to any host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -596,10 +600,12 @@ async fn membership_takes_the_proxys_storage_node_and_covers_by_its_name() {
         .await
         .expect("the proxied node is its own host");
     let ip = register(&mut client, &storage, "storage-1", "192.0.2.5:8982").await;
-    let refused = ip.expect_err("an IP address has no name behind the proxy");
+    let refused = ip.expect_err("an IP address is no name without x-kbf-node-ips");
     assert_eq!(refused.code(), Code::PermissionDenied);
     assert!(
-        refused.message().contains("do not cover"),
+        refused.message().contains("do not cover")
+            && refused.message().contains("upgrade kbf-proxy")
+            && !refused.message().contains("reissue"),
         "{}",
         refused.message()
     );
@@ -650,6 +656,183 @@ async fn membership_takes_the_proxys_storage_node_and_covers_by_its_name() {
     );
     let identity = Presented::Proxy(Identity::default());
     assert_eq!(open.admit_presented(&identity).expect("open"), None);
+}
+
+/// [`forwarded`] with the leaf's addresses in `x-kbf-node-ips`.
+fn forwarded_with_ips(node: &str, ips: &str) -> Vec<(String, String)> {
+    let mut claims = forwarded(node, "storage");
+    claims.push((NODE_IPS.to_owned(), ips.to_owned()));
+    claims
+}
+
+/// [`put`], but a repeated name keeps both values.
+fn append<T>(request: &mut tonic::Request<T>, name: &str, value: &str) {
+    let key = tonic::metadata::MetadataKey::from_bytes(name.as_bytes()).expect("a key");
+    let value: MetadataValue<_> = value.parse().expect("a value");
+    request.metadata_mut().append(key, value);
+}
+
+async fn joined(
+    client: &mut MembershipClient<Channel>,
+    claims: &[(String, String)],
+    instance: &str,
+    at: &str,
+) -> Result<pb::RegisterResponse, Status> {
+    let mut request = tonic::Request::new(registration(instance, at));
+    for (name, value) in claims {
+        append(&mut request, name, value);
+    }
+    client
+        .register(request)
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+async fn beat(
+    client: &mut MembershipClient<Channel>,
+    claims: &[(String, String)],
+    member: &pb::RegisterResponse,
+) -> Result<(), Status> {
+    let mut request = tonic::Request::new(pb::HeartbeatRequest {
+        member_id: member.member_id,
+        boot: member.boot,
+        ..pb::HeartbeatRequest::default()
+    });
+    for (name, value) in claims {
+        put(&mut request, name, value);
+    }
+    client.heartbeat(request).await.map(drop)
+}
+
+/// Catches: a storage node that registers by IP address (`<ip>:8983`, as the farm's do)
+/// refused behind the proxy although its leaf certificate holds that address. The proxy
+/// forwards the leaf's IP names in `x-kbf-node-ips`; Membership covers `instance_id` and
+/// `addr` by the node's DNS name and exactly those addresses, for registration and for every
+/// heartbeat, and no other address: not another node's (`.2`), not a longer one that begins
+/// the same (`.10` against `.1`, either way), not the same address spelled as IPv4-mapped
+/// IPv6, not a different port's host, and nothing when the header is absent.
+///
+/// Mutants seen red: `PeerIdentity::proxied` drops the addresses; the heartbeat's `holds`
+/// ignores them (another node's beat on this member passes); a prefix or substring match; the
+/// mapped form equated with the IPv4 one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn membership_covers_the_ips_the_proxy_forwarded_from_the_leaf() {
+    let mut client = membership(secret()).await;
+    let one = forwarded_with_ips("spoolr-node-01", "192.0.2.1");
+    let member = joined(&mut client, &one, "192.0.2.1:8983", "192.0.2.1:8983")
+        .await
+        .expect("a node registers by the IP its leaf holds");
+    beat(&mut client, &one, &member)
+        .await
+        .expect("and beats for the member it registered");
+
+    // The same node by a name or by its IPs: both are its own.
+    let named = forwarded_with_ips("spoolr-node-01", "192.0.2.1,fd00::1");
+    joined(&mut client, &named, "spoolr-node-01", "[fd00::1]:8983")
+        .await
+        .expect("an IPv6 address among several, and its DNS name");
+
+    let refuse = |what: &'static str, result: Result<pb::RegisterResponse, Status>| {
+        let status = result.expect_err(what);
+        assert_eq!(status.code(), Code::PermissionDenied, "{what}: {status}");
+        assert!(
+            status.message().contains("do not cover"),
+            "{what}: {status}"
+        );
+    };
+    refuse(
+        "another node's address",
+        joined(&mut client, &one, "192.0.2.2:8983", "192.0.2.2:8983").await,
+    );
+    refuse(
+        "the instance id covered but not the address",
+        joined(&mut client, &one, "192.0.2.1:8983", "192.0.2.2:8983").await,
+    );
+    refuse(
+        "the address covered but not the instance id",
+        joined(&mut client, &one, "192.0.2.2:8983", "192.0.2.1:8983").await,
+    );
+    refuse(
+        "a longer address that begins with the leaf's",
+        joined(&mut client, &one, "192.0.2.10:8983", "192.0.2.10:8983").await,
+    );
+    let ten = forwarded_with_ips("spoolr-node-10", "192.0.2.10");
+    refuse(
+        "a shorter address that the leaf's begins with",
+        joined(&mut client, &ten, "192.0.2.1:8983", "192.0.2.1:8983").await,
+    );
+    let mapped = forwarded_with_ips("spoolr-node-01", "::ffff:192.0.2.1");
+    refuse(
+        "an IPv4-mapped IPv6 name is not the IPv4 address",
+        joined(&mut client, &mapped, "192.0.2.1:8983", "192.0.2.1:8983").await,
+    );
+    refuse(
+        "no header, no address",
+        joined(
+            &mut client,
+            &forwarded("spoolr-node-01", "storage"),
+            "192.0.2.1:8983",
+            "192.0.2.1:8983",
+        )
+        .await,
+    );
+
+    // Another node's leaf does not hold this member: its beat is refused.
+    let two = forwarded_with_ips("spoolr-node-02", "192.0.2.2");
+    let status = beat(&mut client, &two, &member)
+        .await
+        .expect_err("a beat from a leaf that does not hold the member");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status}");
+    let status = beat(
+        &mut client,
+        &forwarded("spoolr-node-01", "storage"),
+        &member,
+    )
+    .await
+    .expect_err("a beat with no addresses");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status}");
+}
+
+/// Catches: `x-kbf-node-ips` believed on a call that is not the proxy's, or read partly. A
+/// registration by IP with the header but no secret is anonymous (UNAUTHENTICATED), with the
+/// header malformed, repeated or too long it is refused PERMISSION_DENIED before Membership
+/// reads it, and the address of a well-formed header that does not match is not covered.
+///
+/// Mutants seen red: the header read without the secret; a malformed element skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forged_or_malformed_ips_header_registers_nothing() {
+    let mut client = membership(secret()).await;
+    let mut bare = forwarded_with_ips("spoolr-node-01", "192.0.2.1");
+    bare.remove(0);
+    let status = joined(&mut client, &bare, "192.0.2.1:8983", "192.0.2.1:8983")
+        .await
+        .expect_err("no secret");
+    assert_eq!(status.code(), Code::Unauthenticated, "{status}");
+
+    for value in [
+        "192.0.2.1,junk",
+        "junk,192.0.2.1",
+        "192.0.2.1,",
+        "",
+        " 192.0.2.1",
+    ] {
+        let status = joined(
+            &mut client,
+            &forwarded_with_ips("spoolr-node-01", value),
+            "192.0.2.1:8983",
+            "192.0.2.1:8983",
+        )
+        .await
+        .expect_err(value);
+        assert_eq!(status.code(), Code::PermissionDenied, "{value:?}: {status}");
+        assert!(status.message().contains(NODE_IPS), "{value:?}: {status}");
+    }
+    let mut twice = forwarded_with_ips("spoolr-node-01", "192.0.2.1");
+    twice.push((NODE_IPS.to_owned(), "192.0.2.2".to_owned()));
+    let status = joined(&mut client, &twice, "192.0.2.1:8983", "192.0.2.1:8983")
+        .await
+        .expect_err("a repeated header");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status}");
 }
 
 fn token() -> ApiToken {
