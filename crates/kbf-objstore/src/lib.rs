@@ -17,6 +17,8 @@ pub mod footers;
 mod fs_store;
 pub mod listing;
 mod memory;
+pub mod probe;
+mod released;
 pub mod s3;
 mod types;
 
@@ -32,6 +34,7 @@ pub use fs_store::{
 };
 pub use kbf_threads::disk::Space;
 pub use memory::MemoryStore;
+pub use released::{Released, StillHeld};
 pub use types::{
     ByteRange, Capabilities, KeyError, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey,
     ObjectStoreError, PageSize,

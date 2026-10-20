@@ -221,12 +221,12 @@ mod more;
 /// by `gh` (with the unprivileged user, a scratch home and the order's commit) and then
 /// run once, as the unprivileged user with an empty environment and a 10 s limit, and is
 /// installed as `releases/<commit>/` holding the 0755 binary and the `VERIFIED` marker,
-/// with nothing of the download left, root's, and the state's `staged` naming it. The
-/// scratch directories are gone, and the cycle's view of the release is what the binary
-/// declared.
+/// root's and with nothing of the download left. The scratch directories are gone, and the
+/// cycle's view of the release is what the binary declared. (The state is left alone:
+/// `the_pipeline_installs_and_never_writes_the_state`.)
 ///
-/// Mutants seen red: the probe run with no `run_as`; the marker not written; the state
-/// not updated; `dl/` left in the release.
+/// Mutants seen red: the probe run with no `run_as`; the marker not written; `dl/` left in
+/// the release.
 #[test]
 fn an_honest_release_is_verified_in_order_and_installed_with_its_marker() {
     let rig = Rig::new("honest");
@@ -287,10 +287,6 @@ fn an_honest_release_is_verified_in_order_and_installed_with_its_marker() {
     );
     assert_eq!(installed.profile, "release");
 
-    let state = crate::state::read_unlocked(&rig.host)
-        .expect("state")
-        .expect("written");
-    assert_eq!(state.staged, Some(commit()));
     let left: Vec<_> = fs::read_dir(rig.work()).expect("work").collect();
     assert!(left.is_empty(), "scratch left: {left:?}");
 }

@@ -1,0 +1,78 @@
+# kbf-installer proxy: the one public port of a frontend host (TLS, identity, routing, the
+# hold of an update, the update API) and the supervisor of the frontend children it starts.
+# Static unit, installed disabled under /usr/lib/systemd/system/; `kbf-installer setup`
+# enables it with kbf-proxy.socket, which holds the public port (socket activation, one
+# descriptor: LISTEN_FDS=1). Its [proxy] table is in /etc/kbf/installer.toml; the unit
+# passes that file by flag and nothing by environment.
+# kbf docs/design/frontend-proxy.md, sections 2, 5 and 6; kbf-proxy-api.md, section 11.
+#
+# Not the root helper: kbf-installer.service stages and flips releases as root, this
+# service runs as the frontend's own user and only executes the releases the root half
+# staged (/var/lib/kbf-installer/releases/<commit>/kbf, world-readable). It replaces the
+# kbf-frontend@.service instances on a host that uses it: the proxy starts slot a and slot b
+# itself (`kbf --mode=frontend`, each slot on its own loopback ports; no `--instance`: the
+# two slots do not hand over to each other), so enable one or the other, never both.
+#
+# The children are this unit's processes but not its main process. KillMode=process makes a
+# stop or restart of the proxy signal the proxy alone: the frontends keep serving the
+# builds they hold, and the restarted proxy adopts them by pid, start time and executable.
+# systemd logs "left-over process" for them at every restart; that is expected here.
+# Only the proxy is ever signalled, SIGKILL after TimeoutStopSec included (KillMode=process
+# applies to every signal the manager sends), so a build in flight is never cut short by a
+# unit stop; the proxy ends within 10 s of SIGTERM by its own bound.
+[Unit]
+Description=kbf frontend proxy and supervisor of the frontend children
+Requires=kbf-proxy.socket
+After=kbf-proxy.socket
+Wants=network-online.target
+After=network-online.target
+# The root half stages releases and reverts a trial one: it is up first.
+After=kbf-installer.service
+ConditionPathExists=/etc/kbf/installer.toml
+# A crash that repeats quickly must not use up systemd's start limit (5 starts in 10 s) and
+# leave the public port with no one behind it.
+StartLimitIntervalSec=0
+
+[Service]
+# simple, not notify: the verb never sends READY=1, so a notify unit would never finish
+# starting. The socket is already held, so a client that arrives meanwhile waits in the backlog.
+Type=simple
+# Not the daemon's user: the children it starts are frontends, which hold the state store
+# and the operator token, and run as kbf-server (as kbf-frontend@.service does). The state
+# directories are created for it by systemd: the proxy's own (update.json, the pid files of
+# its children) and the frontend's.
+User=kbf-server
+Slice=kbf.slice
+StateDirectory=kbf-proxy kbf-server
+StateDirectoryMode=0750
+# The proxy-auth secret: tmpfs, so per boot, and kept across a restart of the proxy so the
+# adopted children keep accepting its identity headers.
+RuntimeDirectory=kbf-proxy
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+# `--check` loads the whole file the way a run does and exits 2 on a bad table.
+ExecStartPre=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --check
+ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# A crash restarts at once; a stop is not a crash. Exit 2 is a table the verb refused: a
+# restart cannot fix it.
+Restart=on-failure
+RestartSec=1
+RestartPreventExitStatus=2
+# The front door must be the last thing the kernel kills under memory pressure, and a swap
+# would slow every stream at once. The descriptors are every client connection and every
+# upstream one.
+OOMScoreAdjust=-900
+MemorySwapMax=0
+LimitNOFILE=1048576
+# The children inherit this sandbox, so it is what a frontend can live with: no new
+# privileges, a private /tmp and no home directories. No ProtectSystem=strict: a frontend
+# writes where its kbf.toml says.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
