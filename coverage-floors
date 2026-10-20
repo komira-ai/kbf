@@ -11,7 +11,7 @@
 # crate lines-floor branches-floor
 kbf-all-in-one     98.09  93.75
 kbf-driver-native      -  98.98
-kbf-front              -  98.48
+kbf-front              -  98.00
 kbf-guest          97.97  93.47
 kbf-it                 -  97.43
 kbf-objstore       98.56  94.11

@@ -51,3 +51,9 @@ pub trait MapSource: Send + Sync {
     /// it reads `current`.
     fn changes(&self) -> watch::Receiver<u64>;
 }
+
+/// Planted by a throwaway probe PR: a function no test calls.
+pub fn probe_untested(x: u32) -> u32 {
+    let y = x + 1;
+    if y > 3 { y * 2 } else { y }
+}
