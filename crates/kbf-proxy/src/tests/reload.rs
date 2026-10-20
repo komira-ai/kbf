@@ -95,7 +95,9 @@ async fn a_failed_reload_keeps_the_old_unit_and_counts() {
     };
     new.install(&paths, &mismatched, &new.ca_pem);
     assert!(reload().is_err());
-    // A file that is not there.
+    // A file that is not there (the certificate pair repaired, so the missing CA is the one
+    // fault).
+    new.install(&paths, &new.server(), &new.ca_pem);
     std::fs::remove_file(&paths.client_ca).expect("remove");
     let missing = reload().expect_err("a missing file");
     assert!(

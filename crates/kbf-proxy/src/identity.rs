@@ -8,10 +8,11 @@
 //! make the identity ambiguous, so the certificate is refused rather than guessed at.
 
 use std::io;
+use std::net::IpAddr;
 use std::path::Path;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
-use kbf_peer::{PeerRole, RoleError, names_of, role_of};
+use kbf_peer::{IpsError, PeerRole, RoleError, names_of, node_ips_value, role_of};
 
 use crate::files::{self, Place};
 
@@ -21,6 +22,9 @@ pub const NODE_ID: &str = "x-kbf-node-id";
 pub const ROLE: &str = "x-kbf-role";
 /// The per-boot secret, `x-kbf-proxy-auth`.
 pub const PROXY_AUTH: &str = "x-kbf-proxy-auth";
+/// The IP addresses of the verified leaf certificate, `x-kbf-node-ips`: canonical text,
+/// sorted, comma separated, at most [`kbf_peer::NODE_IPS_MAX`]; absent when it names none.
+pub const NODE_IPS: &str = "x-kbf-node-ips";
 /// The reserved prefix: no header of a client or of a child's answer passes with it.
 pub const RESERVED_PREFIX: &str = "x-kbf-";
 /// The bytes of the secret.
@@ -33,6 +37,8 @@ pub struct Identity {
     pub node_id: String,
     /// The certificate's role.
     pub role: PeerRole,
+    /// The IP addresses in the certificate's subjectAltName, as given.
+    pub ips: Vec<IpAddr>,
 }
 
 /// Why a certificate gives no identity.
@@ -44,23 +50,31 @@ pub enum IdentityError {
     /// The certificate has no usable node id: this many DNS names (a wildcard counts as none).
     #[error("the certificate must name exactly one node by DNS name; it names {0}")]
     NodeId(usize),
+    /// More IP addresses than one header holds.
+    #[error("{0}")]
+    Ips(#[from] IpsError),
     /// A value that is not a legal header value.
     #[error("not a legal header value")]
     HeaderValue,
 }
 
-/// The identity of a DER certificate.
+/// The identity of a DER certificate. `der` is the verified **leaf**; the IP addresses are
+/// its own, never those of an intermediate.
 ///
 /// # Errors
-/// [`IdentityError::Role`] or [`IdentityError::NodeId`].
+/// [`IdentityError::Role`], [`IdentityError::NodeId`] or [`IdentityError::Ips`].
 pub fn identity_of(der: &[u8]) -> Result<Identity, IdentityError> {
     let role = role_of(der)?;
     let names = names_of(der)?;
     match names.dns() {
-        [one] if is_node_name(one) => Ok(Identity {
-            node_id: one.clone(),
-            role,
-        }),
+        [one] if is_node_name(one) => {
+            node_ips_value(names.ips())?;
+            Ok(Identity {
+                node_id: one.clone(),
+                role,
+                ips: names.ips().to_vec(),
+            })
+        }
         other => Err(IdentityError::NodeId(
             other.iter().filter(|n| is_node_name(n)).count(),
         )),
@@ -161,11 +175,12 @@ fn remove_reserved(headers: &mut HeaderMap) {
 }
 
 /// Prepares a request's headers for the child: strips every inbound `x-kbf-*` header, then
-/// sets `x-kbf-proxy-auth` and, with a verified certificate, `x-kbf-node-id` and
-/// `x-kbf-role`. Each header has exactly one value afterwards.
+/// sets `x-kbf-proxy-auth` and, with a verified certificate, `x-kbf-node-id`,
+/// `x-kbf-role` and, if the leaf names IP addresses, `x-kbf-node-ips`. Each header has exactly one value afterwards.
 ///
 /// # Errors
-/// [`IdentityError::HeaderValue`]: the node id is not a legal header value. The caller
+/// [`IdentityError::HeaderValue`]: the node id is not a legal header value;
+/// [`IdentityError::Ips`]: too many addresses. The caller
 /// refuses the stream; the inbound headers are already stripped.
 pub fn forward_headers(
     headers: &mut HeaderMap,
@@ -176,6 +191,9 @@ pub fn forward_headers(
     if let Some(id) = identity {
         headers.insert(NODE_ID, value(&id.node_id)?);
         headers.insert(ROLE, value(id.role.name())?);
+        if let Some(ips) = node_ips_value(&id.ips)? {
+            headers.insert(NODE_IPS, value(&ips)?);
+        }
     }
     headers.insert(PROXY_AUTH, value(&secret.hex())?);
     Ok(())
@@ -205,11 +223,19 @@ mod tests {
     use rcgen::{CertificateParams, KeyPair, SanType};
 
     fn cert(dns: &[&str], role: Option<&str>) -> Vec<u8> {
+        cert_with_ips(dns, role, &[])
+    }
+
+    fn cert_with_ips(dns: &[&str], role: Option<&str>, ips: &[&str]) -> Vec<u8> {
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
         let mut sans: Vec<SanType> = dns
             .iter()
             .map(|d| SanType::DnsName((*d).try_into().expect("ia5")))
             .collect();
+        sans.extend(
+            ips.iter()
+                .map(|ip| SanType::IpAddress(ip.parse().expect("an address"))),
+        );
         if let Some(role) = role {
             sans.push(SanType::URI(
                 format!("{}{role}", kbf_peer::ROLE_URI_PREFIX)
@@ -311,6 +337,7 @@ mod tests {
         let id = Identity {
             node_id: "node-1.farm".into(),
             role: PeerRole::Storage,
+            ips: Vec::new(),
         };
         let mut h = HeaderMap::new();
         h.append(NODE_ID, HeaderValue::from_static("forged"));
@@ -321,11 +348,77 @@ mod tests {
         assert!(h.get(PROXY_AUTH).expect("secret").is_sensitive());
     }
 
+    /// The leaf's IP names become `x-kbf-node-ips`: canonical, compressed, sorted, once each.
+    ///
+    /// Kills: the header omitted; unsorted or uncompressed text; a duplicate kept; the
+    /// header set for a certificate with no IP name; a forged inbound copy surviving.
+    #[test]
+    fn the_leafs_ips_are_forwarded_sorted_and_canonical() {
+        let id = identity_of(&cert_with_ips(
+            &["spoolr-node-01"],
+            Some("storage"),
+            &[
+                "192.0.2.10",
+                "fd00:0:0:0:0:0:0:1",
+                "192.0.2.1",
+                "192.0.2.10",
+            ],
+        ))
+        .expect("identity");
+        assert_eq!(
+            id.ips.len(),
+            4,
+            "the identity holds them as the leaf lists them"
+        );
+        let mut h = HeaderMap::new();
+        h.append(NODE_IPS, HeaderValue::from_static("198.51.100.9"));
+        forward_headers(&mut h, Some(&id), &secret()).expect("forward");
+        assert_eq!(h.get_all(NODE_IPS).iter().count(), 1);
+        assert_eq!(
+            h.get(NODE_IPS).expect("ips"),
+            "192.0.2.1,192.0.2.10,fd00::1"
+        );
+
+        let none = identity_of(&cert(&["spoolr-node-01"], Some("storage"))).expect("identity");
+        let mut h = HeaderMap::new();
+        h.append(NODE_IPS, HeaderValue::from_static("198.51.100.9"));
+        forward_headers(&mut h, Some(&none), &secret()).expect("forward");
+        assert!(
+            h.get(NODE_IPS).is_none(),
+            "no IP name, no header, no forged one"
+        );
+        // No certificate: none either.
+        let mut h = HeaderMap::new();
+        h.append(NODE_IPS, HeaderValue::from_static("198.51.100.9"));
+        forward_headers(&mut h, None, &secret()).expect("forward");
+        assert!(h.get(NODE_IPS).is_none());
+    }
+
+    /// A leaf that names more addresses than the header holds is refused like one with two
+    /// DNS names, never cut short.
+    ///
+    /// Kills: truncation at the limit; no limit.
+    #[test]
+    fn a_leaf_with_too_many_ips_gives_no_identity() {
+        let many = |n: u8| -> Vec<String> { (1..=n).map(|i| format!("192.0.2.{i}")).collect() };
+        fn refs(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        let ok = many(16);
+        assert!(identity_of(&cert_with_ips(&["n"], Some("storage"), &refs(&ok))).is_ok());
+        let too = many(17);
+        assert_eq!(
+            identity_of(&cert_with_ips(&["n"], Some("storage"), &refs(&too))),
+            Err(IdentityError::Ips(IpsError::TooMany(17)))
+        );
+    }
+
     #[test]
     fn an_unprintable_node_id_is_refused_after_the_strip() {
         let id = Identity {
             node_id: "bad\nname".into(),
             role: PeerRole::Daemon,
+            ips: Vec::new(),
         };
         let mut h = HeaderMap::new();
         h.insert(ROLE, HeaderValue::from_static("storage"));

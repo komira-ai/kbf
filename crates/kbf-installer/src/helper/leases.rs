@@ -5,9 +5,12 @@
 //!
 //! The real sources are [`CgroupLeases`] (Linux: the lease cgroups of the daemon's
 //! `actions/` cgroup) and [`PoolLeases`] (macOS: the processes of the lease-user pool,
-//! which launchd runs a lease's jobs as). They are not yet chosen by the binary; until
-//! they are, it uses [`NotWired`], which says it cannot tell, and an activation is
-//! refused (fail closed).
+//! which launchd runs a lease's jobs as). `run` chooses by the service it restarts
+//! ([`for_restart`]): a mode's systemd unit gets [`CgroupLeases`]; a launchd label still
+//! gets [`NotWired`] (nothing configures the pool), which says it cannot tell, and an
+//! activation is refused (fail closed). A frontend's unit holds no leases, so its count would
+//! always read idle: [`frontend_unit`] names it, and the helper refuses a node activation
+//! that would restart it.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -15,7 +18,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::cli::Mode;
+use crate::helper::restart::Restart;
 use crate::run::{Runner, Spawn};
+use crate::setup::plan::mode_units;
 
 /// How many leases are live on this host.
 pub trait LeaseSource {
@@ -136,6 +142,83 @@ impl LeaseSource for PoolLeases<'_> {
             }
         }
         Ok(busy.len())
+    }
+}
+
+/// The lease source of the service `restart` restarts, on a host whose cgroup2 mount is at
+/// `cgroup_root` ([`CGROUP_ROOT`] under the host root).
+///
+/// - A systemd unit of a `kbf` mode gets [`CgroupLeases`] of that unit, which fails closed
+///   while the unit's cgroup does not exist. The units are the ones `setup` enables
+///   ([`mode_units`]); an instance of a template (`kbf-frontend@b.service`) and the plain
+///   form of a unit (`kbf-frontend.service`, for a host without the proxy) are the same
+///   mode's.
+/// - Any other unit gets a source that cannot tell, whatever cgroup the unit has: the leases
+///   of a unit that is no mode's are not the daemon's, so a count read from it would be
+///   "idle" by accident.
+/// - A launchd label gets [`NotWired`]: nothing configures the lease-user pool
+///   (`first_uid`, `users`) that [`PoolLeases`] needs, so a Mac cannot take an activation.
+pub fn for_restart(restart: &Restart, cgroup_root: &Path) -> Box<dyn LeaseSource> {
+    match restart {
+        Restart::Systemd(unit) if is_mode_unit(unit) => {
+            Box::new(CgroupLeases::of_unit(cgroup_root, unit))
+        }
+        Restart::Systemd(unit) => Box::new(CannotTell(format!(
+            "{unit:?} is no unit of any mode of kbf, so its leases are not known"
+        ))),
+        Restart::Launchd(_) => Box::new(NotWired),
+    }
+}
+
+/// The unit `restart` restarts, when it is a frontend's (`kbf --mode=frontend`: the
+/// family of the unit `setup` names for that mode). A frontend holds no leases, so a count
+/// read from its cgroup is "idle" whether or not it serves; the helper uses this to refuse a
+/// node `activate` that would restart it. A launchd label is never one.
+pub fn frontend_unit(restart: &Restart) -> Option<&str> {
+    match restart {
+        Restart::Systemd(unit) if is_unit_of(unit, &[Mode::Frontend]) => Some(unit.as_str()),
+        Restart::Systemd(_) | Restart::Launchd(_) => None,
+    }
+}
+
+/// Whether `unit` is a unit of some mode.
+fn is_mode_unit(unit: &str) -> bool {
+    use clap::ValueEnum;
+    is_unit_of(unit, Mode::value_variants())
+}
+
+/// Whether `unit` is a unit of one of `modes`: of the same family as one `setup` names for it.
+fn is_unit_of(unit: &str, modes: &[Mode]) -> bool {
+    family(unit).is_some_and(|f| {
+        modes
+            .iter()
+            .flat_map(|m| mode_units(*m))
+            .any(|u| family(u) == Some(f))
+    })
+}
+
+/// The family of a unit file name: `kbf-frontend` for `kbf-frontend.service` and for every
+/// instance of its template, `kbf-frontend@<instance>.service`. A name that is neither, or
+/// whose instance is empty or holds more than a unit instance does (a `/` would leave the
+/// slice), has none.
+fn family(unit: &str) -> Option<&str> {
+    let name = unit.strip_suffix(".service")?;
+    match name.split_once('@') {
+        None => Some(name),
+        Some((stem, instance)) => (!instance.is_empty()
+            && instance
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c)))
+        .then_some(stem),
+    }
+}
+
+/// A source that cannot tell, and says why.
+struct CannotTell(String);
+
+impl LeaseSource for CannotTell {
+    fn live(&self) -> Result<usize, String> {
+        Err(self.0.clone())
     }
 }
 

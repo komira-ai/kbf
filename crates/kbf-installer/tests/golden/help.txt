@@ -16,6 +16,7 @@ Commands:
   record-release  Record a release placed on the host by hand as its first
   gc              Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
   boot-check      Run before each start of a release on trial; counts the start
+  migrate         Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's tree, or put it back with `--rollback`. A dry run without `--apply`
   quiesce         For maintainer scripts: take the lock; exit 5 while a swap is pending
   check           Validate the installer's configuration, trust files and path chain
   proxy           Serve the frontend host's public port: route each stream to the active child frontend
