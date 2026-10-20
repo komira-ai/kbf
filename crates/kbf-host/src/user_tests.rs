@@ -98,6 +98,221 @@ fn a_getent_that_fails_is_an_error() {
     assert!(matches!(err, UserError::Query { .. }), "{err}");
 }
 
+// A Mac: `dscl` and `id -G`. The records are what the real Mac B (macOS 27.0.1) printed for
+// `_kbf`: dscl's own order (alphabetical), not the order the keys were asked in.
+
+const MAC_RECORD: &str =
+    "NFSHomeDirectory: /var/empty\nPrimaryGroupID: 309\nUniqueID: 309\nUserShell: /usr/bin/false\n";
+const MAC_GROUPS: &str = "309 12 61 701 100\n";
+const DS_ABSENT: &str = "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\n";
+
+/// A Mac whose `dscl` answers `(status, stdout, stderr)` and whose `id -G` prints `groups`;
+/// asking for `getent` fails the test, as there is none on a Mac.
+fn mac(dscl: (i32, &'static str, &'static str), groups: &'static str) -> FakeExec {
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(move |cmd| {
+        Ok(match cmd.program.as_str() {
+            DSCL => reply(dscl.0, dscl.1, dscl.2),
+            ID => reply(0, groups, ""),
+            other => panic!("a Mac has no {other}"),
+        })
+    });
+    exec
+}
+
+/// Red first: on the code before this change a Mac lookup ran `getent`, which a Mac does not
+/// have, so every lookup failed. Catches a Mac arm that asks `getent`, reads the keys by
+/// position (dscl prints them alphabetically, so the uid would be the home), or drops `id -G`'s
+/// groups.
+#[test]
+fn a_mac_user_is_read_by_key_through_dscl_and_id() {
+    let exec = mac((0, MAC_RECORD, ""), MAC_GROUPS);
+    let user = lookup_on(&exec, "_kbf", UserDb::Dscl)
+        .expect("lookup")
+        .expect("a user");
+    let want = RunUser {
+        name: "_kbf".to_owned(),
+        uid: 309,
+        gid: 309,
+        groups: vec![309, 12, 61, 701, 100],
+        home: "/var/empty".to_owned(),
+    };
+    assert_eq!(user, want);
+    let asked: Vec<String> = exec
+        .queries
+        .borrow()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            concat!(
+                "/usr/bin/dscl . -read /User",
+                "s/_kbf UniqueID PrimaryGroupID NFSHomeDirectory UserShell"
+            ),
+            "/usr/bin/id -G -- _kbf"
+        ]
+    );
+}
+
+/// Catches `native` choosing wrong: the Linux test host reads `getent`.
+#[test]
+fn the_native_database_is_the_build_hosts() {
+    let want = if cfg!(target_os = "macos") {
+        UserDb::Dscl
+    } else {
+        UserDb::Getent
+    };
+    assert_eq!(UserDb::native(), want);
+    let exec = host(PASSWD, "991\n");
+    if want == UserDb::Getent {
+        assert!(lookup(&exec, "kbf").expect("lookup").is_some());
+    }
+}
+
+/// Catches an absent Mac user read as an error (dscl exits non-zero with `eDSRecordNotFound`,
+/// on either stream), and a different failure read as "absent".
+#[test]
+fn an_absent_mac_user_is_none_and_other_failures_are_errors() {
+    for (stdout, stderr) in [("", DS_ABSENT), (DS_ABSENT, "")] {
+        let exec = mac((56, stdout, stderr), "");
+        assert_eq!(
+            lookup_on(&exec, "_kbf", UserDb::Dscl).expect("lookup"),
+            None
+        );
+    }
+    let exec = mac((1, "", "dscl: broken\n"), "");
+    let err = lookup_on(&exec, "_kbf", UserDb::Dscl).expect_err("exit 1");
+    assert!(matches!(err, UserError::Query { .. }), "{err}");
+    // A success that names the error is not a record: refused, not "absent".
+    let exec = mac((0, DS_ABSENT, ""), "");
+    let err = lookup_on(&exec, "_kbf", UserDb::Dscl).expect_err("not a record");
+    assert!(matches!(err, UserError::Output { .. }), "{err}");
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|_| Err(io::Error::from(io::ErrorKind::NotFound)));
+    let err = lookup_on(&exec, "_kbf", UserDb::Dscl).expect_err("no dscl");
+    assert!(matches!(err, UserError::Query { .. }), "{err}");
+}
+
+/// Catches a Mac record the lookup does not understand being taken as a user: each row is one
+/// malformed `dscl` answer (or `id -G` answer), each refused with `Output`.
+#[test]
+fn a_mac_answer_that_is_not_a_user_is_refused() {
+    let rows: [(&str, &'static str, &'static str); 17] = [
+        (
+            "a value that is only a space",
+            "NFSHomeDirectory: \nPrimaryGroupID: 309\nUniqueID: 309\nUserShell: /s\n",
+            "309\n",
+        ),
+        (
+            "a uid with a trailing space",
+            "NFSHomeDirectory: /h\nPrimaryGroupID: 309\nUniqueID: 309 \nUserShell: /s\n",
+            "309\n",
+        ),
+        (
+            "a uid with a sign",
+            "NFSHomeDirectory: /h\nPrimaryGroupID: 309\nUniqueID: +309\nUserShell: /s\n",
+            "309\n",
+        ),
+        (
+            "a uid past u32",
+            "NFSHomeDirectory: /h\nPrimaryGroupID: 309\nUniqueID: 99999999999999999999\nUserShell: /s\n",
+            "309\n",
+        ),
+        (
+            "CRLF line ends",
+            "NFSHomeDirectory: /h\r\nPrimaryGroupID: 309\r\nUniqueID: 309\r\nUserShell: /s\r\n",
+            "309\n",
+        ),
+        (
+            "a home with a trailing space",
+            "NFSHomeDirectory: /h \nPrimaryGroupID: 309\nUniqueID: 309\nUserShell: /s\n",
+            "309\n",
+        ),
+        (
+            "no home",
+            "PrimaryGroupID: 309\nUniqueID: 309\nUserShell: /bin/sh\n",
+            "309\n",
+        ),
+        (
+            "no uid",
+            "NFSHomeDirectory: /h\nPrimaryGroupID: 309\nUserShell: /bin/sh\n",
+            "309\n",
+        ),
+        (
+            "no shell",
+            "NFSHomeDirectory: /h\nPrimaryGroupID: 309\nUniqueID: 309\n",
+            "309\n",
+        ),
+        (
+            "uid not a number",
+            "NFSHomeDirectory: /h\nPrimaryGroupID: 309\nUniqueID: x\nUserShell: /s\n",
+            "309\n",
+        ),
+        (
+            "gid not a number",
+            "NFSHomeDirectory: /h\nPrimaryGroupID: g\nUniqueID: 309\nUserShell: /s\n",
+            "309\n",
+        ),
+        (
+            "a duplicate key",
+            "NFSHomeDirectory: /h\nUniqueID: 1\nUniqueID: 2\nPrimaryGroupID: 3\nUserShell: /s\n",
+            "3\n",
+        ),
+        (
+            "an unasked key",
+            "NFSHomeDirectory: /h\nPrimaryGroupID: 309\nUniqueID: 309\nUserShell: /s\nRealName: x\n",
+            "309\n",
+        ),
+        (
+            "a line with no key",
+            "NFSHomeDirectory: /h\nbare\n",
+            "309\n",
+        ),
+        (
+            "a two-line value",
+            "NFSHomeDirectory:\n /a\n /b\nPrimaryGroupID: 309\nUniqueID: 309\nUserShell: /s\n",
+            "309\n",
+        ),
+        ("no primary group in id", MAC_RECORD, "12\n"),
+        ("a group not a number", MAC_RECORD, "309 staff\n"),
+    ];
+    for (why, record, groups) in rows {
+        let exec = mac((0, record, ""), groups);
+        let err = lookup_on(&exec, "_kbf", UserDb::Dscl).expect_err(why);
+        assert!(matches!(err, UserError::Output { .. }), "{why}: {err}");
+    }
+    // Key with an empty value and nothing indented after it (end of output, or a next key).
+    for record in ["NFSHomeDirectory:\n", "NFSHomeDirectory:\nUniqueID: 1\n"] {
+        let exec = mac((0, record, ""), "309\n");
+        let err = lookup_on(&exec, "_kbf", UserDb::Dscl).expect_err(record);
+        assert!(matches!(err, UserError::Output { .. }), "{record:?}: {err}");
+    }
+}
+
+/// Catches a home with a space (which dscl prints as `Key:` then an indented line) being
+/// refused or read with the indent; and an id failing on a Mac being read as a user.
+#[test]
+fn a_mac_home_on_the_next_line_is_read_and_a_failing_id_is_an_error() {
+    let record = "NFSHomeDirectory:\n /Volumes/Data Disk/kbf\nPrimaryGroupID: 309\nUniqueID: 309\nUserShell: /usr/bin/false\n";
+    let exec = mac((0, record, ""), MAC_GROUPS);
+    let user = lookup_on(&exec, "_kbf", UserDb::Dscl)
+        .expect("lookup")
+        .expect("a user");
+    assert_eq!(user.home, "/Volumes/Data Disk/kbf");
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|cmd| {
+        Ok(if cmd.program.as_str() == DSCL {
+            reply(0, MAC_RECORD, "")
+        } else {
+            reply(1, "", "id: _kbf: no such user")
+        })
+    });
+    let err = lookup_on(&exec, "_kbf", UserDb::Dscl).expect_err("id fails");
+    assert!(matches!(err, UserError::Query { .. }), "{err}");
+}
+
 fn me() -> (u32, u32) {
     (
         rustix::process::getuid().as_raw(),
