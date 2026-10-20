@@ -94,13 +94,12 @@ pub fn child_admin(
     token_file: PathBuf,
 ) -> Result<Admin, String> {
     let loopback = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    secret_headers(
-        handle
-            .admin_headers()
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_bytes())),
-    )
-    .map(|secret| {
+    let admin_headers = handle.admin_headers();
+    let pairs: Vec<(&str, &[u8])> = admin_headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_bytes()))
+        .collect();
+    secret_headers(&pairs).map(|secret| {
         Admin::new(
             move |slot| loopback(table.admin_port(gate_slot(slot))),
             move |slot| loopback(table.port(gate_slot(slot), Target::Operator)),
@@ -115,12 +114,10 @@ pub fn child_admin(
 ///
 /// # Errors
 /// A header value the client refuses to send (never, for the 64 hex digits the proxy's secret is).
-fn secret_headers<'a>(
-    pairs: impl IntoIterator<Item = (&'a str, &'a [u8])>,
-) -> Result<Headers, String> {
+fn secret_headers(pairs: &[(&str, &[u8])]) -> Result<Headers, String> {
     pairs
-        .into_iter()
-        .try_fold(Headers::new(), |headers, (name, value)| {
+        .iter()
+        .try_fold(Headers::new(), |headers, &(name, value)| {
             headers.with(name, value)
         })
         .map_err(|e| format!("the proxy secret is not a header value: {e}"))

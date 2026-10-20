@@ -781,12 +781,12 @@ fn a_recorded_candidate_refused_the_generation_is_left_as_it_is_and_the_hold_sta
 /// refused with the reason, and the proxy's real secret (64 hex digits) is accepted.
 #[test]
 fn a_secret_the_client_cannot_send_is_refused_with_the_reason() {
-    let why = secret_headers([("x-secret", &[0xff_u8][..])]).expect_err("non-ASCII");
+    let why = secret_headers(&[("x-secret", &[0xff_u8][..])]).expect_err("non-ASCII");
     assert!(
         why.contains("the proxy secret is not a header value"),
         "{why}"
     );
-    assert!(secret_headers([("x-secret", &b"abcdef"[..])]).is_ok());
+    assert!(secret_headers(&[("x-secret", &b"abcdef"[..])]).is_ok());
 }
 
 /// What a fixture operator port received: the first request's head, as text.
