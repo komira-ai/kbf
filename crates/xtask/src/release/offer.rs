@@ -47,7 +47,7 @@ use crate::sums::{self, SUMS};
 pub const BETA_WORKFLOW: &str = "beta.yml";
 
 /// The most a `kbf --version --json` file may hold.
-const IDENTITY_CAP: u64 = 8192;
+pub(super) const IDENTITY_CAP: u64 = 8192;
 
 /// The attestation checks, behind a seam so tests use recorded answers.
 pub trait Attester {
@@ -153,7 +153,8 @@ pub struct Request<'a> {
     pub beta: Evidence<'a>,
     /// `kbf --version --json` of the offered build.
     pub version_json: Option<&'a Path>,
-    /// The commit the farm runs now, a full SHA.
+    /// The commit a walk-back returns to, a full SHA: the one the farm runs (`release
+    /// offer`), or the release before this one (`release stage-offer`).
     pub previous: Option<&'a str>,
     /// `kbf --version --json` of the previous build.
     pub previous_version_json: Option<&'a Path>,
@@ -249,7 +250,12 @@ fn describe(l: Limit) -> String {
 
 /// What is missing for `platform` in the listed files of `dir`: its tarball, the SBOM
 /// beside it, the bundle beside it.
-fn incomplete(dir: &Path, listed: &[String], commit: &str, platform: Platform) -> Vec<String> {
+pub(super) fn incomplete(
+    dir: &Path,
+    listed: &[String],
+    commit: &str,
+    platform: Platform,
+) -> Vec<String> {
     let suffix = format!("-{commit}-{}.tar.gz", platform.name());
     let tarballs: Vec<&String> = listed.iter().filter(|n| n.ends_with(&suffix)).collect();
     if tarballs.is_empty() {
@@ -419,7 +425,7 @@ fn read_beta(path: &Path) -> Result<ResultDoc, String> {
 }
 
 /// The bytes of `offer.json`; a document a reader would refuse is not rendered.
-fn render(doc: &OfferDoc) -> Result<Vec<u8>, Error> {
+pub(super) fn render(doc: &OfferDoc) -> Result<Vec<u8>, Error> {
     doc.to_bytes().map_err(|e| Error::Failed(e.to_string()))
 }
 

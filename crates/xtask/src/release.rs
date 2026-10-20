@@ -31,16 +31,41 @@
 //! - `release notes <dir> ... --out <file>` ([`notes`]): the same checks, then the
 //!   release's notes: commits since the previous `v*` tag, the verdict's summary, what
 //!   is not reversible, the gamma escapes and what is withdrawn.
+//! - `release plan --repo <owner/repo> --sha <sha> --before <sha> [--repo-dir <checkout>]
+//!   [--freeze <text>] [--output <file>] [--gh <program>]` ([`plan`]): the next version
+//!   (`VERSION` and the release tags), the push's class (code, site, pipeline), and the
+//!   refusals: a freeze, a base below an existing tag, a superseded commit ([`tags::superseded`]).
+//!   Prints `key=value` lines and appends them to `--output`.
+//! - `release previous --repo <owner/repo> --sha <sha> --platform <p> --binary <name>...
+//!   --out <dir> [--trusted-root <file>] [--output <file>] [--gh <program>]` ([`previous`]):
+//!   the release before `--sha` for the tests that need an N-1: the highest release tag
+//!   that names a strict ancestor of it, its release downloaded and verified as `release
+//!   offer` verifies one, and only then the named binaries taken out into `--out`. With no
+//!   such tag it prints `previous-source=none`; a failed call is an error, never "no tags".
+//!   Prints `key=value` lines and appends them to `--output`.
+//! - `release stage-offer --repo <owner/repo> --sha <sha> --out <dir> [--output <file>]
+//!   [--trusted-root <file>] [--runner-platform <p>] [--gh <program>]` ([`stage_offer`]): for
+//!   gamma only, the offer for the release of `--sha` and the bundle a deploy is handed.
+//!   The release is downloaded and verified before any of its files runs; its `kbf` and its
+//!   N-1's (`release previous`) give the `meta_log` numbers; beta is waived for a fixed reason
+//!   by a fixed operator. A commit with no release is `staged=false` and exit 0; a commit a
+//!   newer release supersedes is an error. Prints `key=value` lines and appends them to
+//!   `--output`; `--out` is made last.
 //! - `release publish <dir> --repo <owner/repo> --tag <tag> --commit <sha> --run-id <id>
 //!   [--gh <program>]` ([`publish`]): `check`, then creates release `<tag>` with every
 //!   file of `<dir>` (the bundles beside their tarballs). When the release exists,
 //!   every asset it holds must be one of these files, byte for byte, or nothing is
 //!   changed; the files it lacks are uploaded. A re-run therefore creates no second
-//!   release and replaces no asset.
+//!   release and replaces no asset. It refuses first when the highest release tag is not
+//!   at `--commit` or an ancestor of it ([`tags::superseded`]).
 
 mod git;
 pub mod notes;
 pub mod offer;
+pub mod plan;
+pub mod previous;
+pub mod stage_offer;
+pub mod tags;
 pub mod verdict;
 
 use std::io::Write;
@@ -331,6 +356,8 @@ pub fn publish(dir: &Path, r: &Release) -> Result<Vec<String>, Error> {
             r.set_hash.as_str()
         )]));
     }
+    // Rule S, before the first read of the release: an old run does nothing.
+    tags::superseded(r.gh, r.repo, r.commit)?;
     let paths: Vec<String> = names
         .iter()
         .map(|n| dir.join(n).display().to_string())

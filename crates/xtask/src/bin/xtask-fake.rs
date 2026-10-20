@@ -22,7 +22,16 @@
 //!   no `kbf.stamp` next to it, it reads both from a trailer on its own file (`kbf_says`
 //!   below), so a copy packaged into a tarball and extracted elsewhere says what the
 //!   tarball's bytes say. With `XTASK_FAKE_ANNOUNCE` set, it also prints the path it was
-//!   run as on stderr.
+//!   run as on stderr. When what the trailer says `--version --json` prints is exactly
+//!   `fail`, `hang` or `env` (a line end after it), it does that instead: exits 1, never
+//!   answers, or prints its working directory (`cwd=<path>`) and the environment it was
+//!   started with (`NAME=value` per line), so a test can see a binary run (and with what)
+//!   through the trailer alone, which an environment variable cannot do for a program
+//!   started with none. Two more: `orphan` (a line end after it) leaves a process holding
+//!   its output for a few seconds and exits 0; and `tamper <name>` (the line ends, and the
+//!   rest of the trailer is what it prints) first appends a byte to `../assets/<name>` and
+//!   rewrites that file's line in `../assets/SHA256SUMS`, as a binary run in the directory
+//!   `release stage-offer` runs it in could.
 //! - Run as `kbf-installer`, it is the STUB of the real kbf-installer, which the package
 //!   build and its macOS install test ship until the real tool is built there (one path
 //!   change in `crates/xtask/tests/pkg_macos.rs`): it prints `kbf-installer-stub` and
@@ -39,6 +48,8 @@
 //!   `fakeAttestations`, the line `<SHA-256 of the file> <flags>` (the flags without the
 //!   two that name files). It appends one line to `gh-env` next to it: the proxy and
 //!   no-proxy variables it ran under (`NAME=value`, empty when unset).
+//! - Run as `gh attestation trusted-root`, it prints a line of JSON, as the trusted root
+//!   is one (it appends its arguments to `gh-args` like every `gh` call).
 //! - Run as `gh api <path>`, it prints the value under the key `<path>` of the JSON
 //!   object in `gh-api.json` next to it, or `gh: Not Found (HTTP 404)` on stderr and
 //!   exits 1 when there is none: the GitHub API, as a test wrote it.
@@ -78,13 +89,15 @@
 //! `api-fails` (every `gh api` exits 1 with an HTTP 502), `api-jobs-fail` (the same for a
 //! path with `/jobs` in it, the list of a run's jobs, alone) or `api-garbage` (every `gh
 //! api` prints something that is not JSON). Of releases: `release-fails` (every `gh
-//! release` command exits 1). Of sudo:
+//! release` command exits 1). Of the trusted root: `trusted-root-fails` (`gh attestation
+//! trusted-root` exits 1). Of sudo:
 //! `tests-fail` (it exits 101, as a failed test binary does) or `fails:<a>,<b>,...`
 //! (it exits 101 when one of its arguments is one of `<a>`, `<b>`, ..., so some units
 //! of several fail). Of systemd: `systemd-fails` (every systemd tool exits 1).
 use std::io::Write;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 use sha2::Digest;
 
@@ -127,17 +140,75 @@ fn kbf_says(argv0: &str) -> (String, String) {
     (stamp.to_owned(), json.to_owned())
 }
 
+/// Appends a byte to the release file `../assets/<name>` and makes its line of
+/// `../assets/SHA256SUMS` say the new digest: the change a binary run in a sibling of
+/// `assets` can make to a release that was verified before it ran.
+fn tamper(name: &str) {
+    let assets = Path::new("../assets");
+    let file = assets.join(name);
+    let mut bytes = std::fs::read(&file).expect("the release file");
+    bytes.push(b'x');
+    std::fs::write(&file, &bytes).expect("write the release file");
+    let digest = hex::encode(sha2::Sha256::digest(&bytes));
+    let sums = assets.join("SHA256SUMS");
+    let text = std::fs::read_to_string(&sums).expect("SHA256SUMS");
+    let mut edited = String::new();
+    for line in text.lines() {
+        let listed = line.split_once("  ").map(|(_, n)| n);
+        let new = match listed {
+            Some(n) if n == name => format!("{digest}  {name}"),
+            _ => line.to_owned(),
+        };
+        edited.push_str(&new);
+        edited.push('\n');
+    }
+    std::fs::write(&sums, edited).expect("write SHA256SUMS");
+}
+
 /// `kbf --version` and `kbf --version --json`, as [`kbf_says`] has them.
+#[allow(clippy::zombie_processes)] // `orphan` leaves its process behind on purpose
 fn kbf(argv0: &str, args: &[String]) -> ExitCode {
     // Where a test sees which file was run.
     if std::env::var_os("XTASK_FAKE_ANNOUNCE").is_some() {
         eprintln!("xtask-fake: kbf runs as {argv0}");
     }
+    if args == ["--hold"] {
+        // The process `orphan` leaves behind: it ends by itself.
+        std::thread::sleep(Duration::from_secs(3));
+        return ExitCode::SUCCESS;
+    }
     if args == ["--version", "--json"] {
         if defect("json-fails") {
             return ExitCode::FAILURE;
         }
-        print!("{}", kbf_says(argv0).1);
+        let json = kbf_says(argv0).1;
+        let tampering = json.strip_prefix("tamper ");
+        if let Some((name, rest)) = tampering.and_then(|t| t.split_once('\n')) {
+            tamper(name);
+            print!("{rest}");
+            return ExitCode::SUCCESS;
+        }
+        match json.as_str() {
+            "orphan\n" => {
+                // It inherits the output, so the reader of it waits on it and not on us.
+                Command::new(argv0)
+                    .arg("--hold")
+                    .spawn()
+                    .expect("a process to leave behind");
+            }
+            "fail\n" => return ExitCode::FAILURE,
+            "hang\n" => loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            },
+            "env\n" => {
+                let cwd = std::env::current_dir().expect("a working directory");
+                println!("cwd={}", cwd.display());
+                for (name, value) in std::env::vars_os() {
+                    println!("{}={}", name.to_string_lossy(), value.to_string_lossy());
+                }
+            }
+            _ => print!("{json}"),
+        }
     } else {
         println!("kbf 0.1.0+{}", kbf_says(argv0).0);
     }
@@ -233,6 +304,7 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
     match args[0].as_str() {
         "api" => return api(dir, &args[1]),
         "release" => return release(dir, args),
+        "attestation" if args[1] == "trusted-root" => return trusted_root(),
         _ => {}
     }
     let file = args
@@ -255,6 +327,16 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
     }
     eprintln!("xtask-fake: no attestation of {file} verifies with {flags}");
     ExitCode::FAILURE
+}
+
+/// `gh attestation trusted-root`: one line of JSON, or a failure.
+fn trusted_root() -> ExitCode {
+    if defect("trusted-root-fails") {
+        eprintln!("gh: the trusted root could not be fetched");
+        return ExitCode::FAILURE;
+    }
+    println!("{{\"fake\":\"trusted root\"}}");
+    ExitCode::SUCCESS
 }
 
 /// `flags` as one string, without the pair `--source-digest <commit>`.

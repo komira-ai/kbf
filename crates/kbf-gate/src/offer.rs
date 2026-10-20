@@ -74,7 +74,9 @@ pub struct OfferDoc {
     /// The highest metadata-log machine version the offered build runs; absent when its
     /// `kbf --version --json` was not given or lacks it.
     pub meta_log: Option<u64>,
-    /// The commit the farm runs now, which a walk-back returns to; absent when none was given.
+    /// The commit a walk-back returns to: the one the farm runs when an operator made the offer,
+    /// the release before the offered one when the release pipeline did; absent when none was
+    /// given.
     pub previous: Option<CommitId>,
     /// `meta_log` of the previous build; absent when unknown.
     pub previous_meta_log: Option<u64>,
