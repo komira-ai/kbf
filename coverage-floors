@@ -14,10 +14,9 @@ kbf-driver-native      -  98.98
 kbf-front              -  98.48
 kbf-guest          97.97  93.47
 kbf-it                 -  97.43
-kbf-objstore       98.56  94.00
+kbf-objstore       98.56  94.11
 kbf-raft           97.91  86.42
 kbf-segments       98.34  91.93
 kbf-sim            98.35  89.28
 kbf-sim-cell       93.85  87.00
-kbf-state          72.58  77.48
 kbf-types              -  98.36
