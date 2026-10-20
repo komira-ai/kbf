@@ -53,10 +53,17 @@ pub fn is_bundle(name: &str) -> bool {
     name.ends_with(SUFFIX)
 }
 
+/// Whether the asset `name` is a `kbf-installer` package: the deb of a Linux job or the
+/// `.pkg` of the macOS one.
+pub fn is_package(name: &str) -> bool {
+    name.ends_with(".deb") || name.ends_with(".pkg")
+}
+
 /// Whether the asset `name` has a provenance bundle: a tarball, or a package (the
-/// `kbf-installer` deb), but not an SBOM, which is a subject of the sums' attestation only.
+/// `kbf-installer` deb or `.pkg`), but not an SBOM, which is a subject of the sums'
+/// attestation only.
 pub fn needs_bundle(name: &str) -> bool {
-    name.ends_with(".tar.gz") || name.ends_with(".deb")
+    name.ends_with(".tar.gz") || is_package(name)
 }
 
 /// `commit` with its last hex digit changed: a commit the bundle was not made for.

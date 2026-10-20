@@ -36,8 +36,9 @@ by `crates/kbf-it/tests/release_artifacts`.
 ## What is built
 
 Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
-([below](#provenance-bundles-verifying-a-tarball-offline)), and two Debian packages of
-`kbf-installer` ([below](#the-kbf-installer-package-deb)), built by one job per platform:
+([below](#provenance-bundles-verifying-a-tarball-offline)), two Debian packages of
+`kbf-installer` ([below](#the-kbf-installer-package-deb)) and one macOS package of it
+([below](#the-kbf-installer-package-pkg-macos)), built by one job per platform:
 
 | Asset | Runner | Target |
 |---|---|---|
@@ -59,12 +60,13 @@ and released like the others, so a package or an operator takes it by digest fro
 files. It is not a component of the release it installs on a host, and it does not
 update itself (the design's section 1).
 
-The packages are the two Linux jobs' as well:
+The packages are the two Linux jobs' debs and the macOS job's `.pkg`:
 
 | Asset | Built by | Holds |
 |---|---|---|
 | `kbf-installer-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf-installer` of the tarball of the same name, the units, the pinned `gh` for amd64 and a trust directory |
 | `kbf-installer-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
+| `kbf-installer-<commit>-darwin-arm64.pkg` | the `darwin-arm64` job (`macos-15`, `cargo xtask pkg build`) | the `kbf-installer` of the tarball of the same name, its LaunchDaemon property list, the pinned darwin `gh` and a trust directory |
 
 The set above is pinned: `crates/kbf-it/tests/release_artifacts` fails a pull request
 that drops one of these files from the workflow, packages one that is not listed, or
@@ -267,7 +269,7 @@ How a bundle is made, and what is checked of it:
 - **Not in `SHA256SUMS`.** The bundle is made after the sums, from the files they list, so
   they cannot list it. `cargo xtask verify-assets sums` leaves out names that end
   `.sigstore.json`, and `cargo xtask release check` holds the directory to one
-  `<tarball>.sigstore.json` per tarball (and per `.deb`) the sums list and none for anything else.
+  `<tarball>.sigstore.json` per tarball (and per `.deb` and `.pkg`) the sums list and none for anything else.
 - **Its size and shape.** A bundle is one line of JSON (`mediaType` of a Sigstore bundle,
   `dsseEnvelope`, `verificationMaterial`) of at most 256 KiB, the room a host's order
   record has for one. `release check` refuses an empty file, two bundles in one file and
@@ -345,6 +347,70 @@ file you give it, so the verification above is the operator's step; the package 
 signed with a key and is not published through an apt repository; and the trusted root
 inside it is a snapshot, which a later Sigstore key rotation outdates (no code reads its
 `valid_until` yet).
+
+## The kbf-installer package (pkg, macOS)
+
+A Mac gets `kbf-installer` the same way, as one file that holds everything it needs to verify a
+release offline ([packaging/macos/README.md](../packaging/macos/README.md)). The `darwin-arm64`
+job builds it from the signed binary it has just built and checked: the pinned darwin `gh`
+(the 2.102.0 release's `macOS_arm64` zip, checked by SHA-256 before use), the Sigstore trusted
+root that `gh` fetched, and an `installer.conf` from `cargo xtask pkg-trust`, then `cargo xtask
+pkg build` writes the package (the same bytes for the same inputs; `pkgbuild` is not
+deterministic). It installs these entries, all root:wheel, at the paths of the installer's macOS
+layout (`crates/kbf-installer/src/layout.rs`; a test compares the package's paths with it):
+
+| Path | Mode | Layout |
+|---|---|---|
+| `/usr/local/kbf-installer/bin/kbf-installer` | 0755 | the install root, `Layout::install_root` |
+| `/usr/local/kbf-installer/trust/gh` | 0755 | `Layout::gh`: the pinned `gh` that verifies attestations offline |
+| `/usr/local/kbf-installer/trust/trusted_root.jsonl` | 0644 | `Layout::trusted_root` |
+| `/usr/local/kbf-installer/trust/installer.conf` | 0644 | `Layout::settings`, below |
+| `/Library/LaunchDaemons/com.komira.kbf-installer.plist` | 0644 | not loaded, and not running until `/usr/local/etc/kbf/installer.toml` (`Layout::installer_toml`) exists |
+| `/var/db/kbf-installer`, `/Library/Logs/kbf-installer` | 0700, 0755 | the state directory (`Layout::state_dir`) and the job's log directory, empty |
+
+`installer.conf` is exactly `SOURCE_REFS=refs/heads/<branch>`, **the branch the package is
+attested on**, as in the deb: a package built on `main` trusts `main` releases, one built on
+`feature/arch-v2` trusts that branch's. It sets nothing else, so `RUN_AS_UID` and `RUN_AS_GID` are
+the installer's defaults (`nobody`). What is per host is not shipped: `kbf-installer setup`
+writes `installer.toml` (and `kbf.toml`, the tokens, the users) at adopt time.
+
+`cargo xtask pkg-macos-install-test` installs the package as root on the runner
+(`sudo -n installer -pkg ... -target /`) and checks that Apple's `pkgutil` lists the paths this
+repository's reader finds, every file and directory it added is root:wheel with its mode and bytes,
+the job is not loaded and nothing is running, `installer.toml` does not exist, the installed `gh`
+runs and the installed `kbf-installer --version --json` names the commit. Then `cargo xtask
+pkg-macos-asset` makes it the asset `kbf-installer-<commit>-darwin-arm64.pkg` and lists it in
+`SHA256SUMS.darwin-arm64`, refusing it unless it holds exactly the files above (no script, nothing
+else), the binary is byte for byte the one in the tarball `build-commit check-asset` and
+`darwin-asset` checked, `gh` is the pinned one, the trusted root is JSON lines, the property list is
+gated, `installer.conf` trusts the branch it is attested for, and its `PackageInfo` version ends
+`+<the first 12 digits of the commit>`.
+
+It is attested like the deb: build provenance (one subject of the `SHA256SUMS` attestation, and
+alone, with its bundle `kbf-installer-<commit>-darwin-arm64.pkg.sigstore.json` in
+`bundles-darwin-arm64`) and **no SBOM attestation**. The verify job checks both offline and runs
+`cargo xtask pkg-macos-asset --verify-only` on the signed file. The package itself is not signed
+(no Developer ID): Gatekeeper does not open it by double click, and the binary inside is signed ad
+hoc, as the tarballs' are; the verification below is the operator's step.
+
+```text
+gh run download <run-id> -R komira-ai/kbf -n assets-darwin-arm64 -n bundles-darwin-arm64 -n sha256sums-darwin-arm64
+shasum -a 256 --check --strict --ignore-missing SHA256SUMS
+gh attestation verify kbf-installer-<commit>-darwin-arm64.pkg \
+  --bundle kbf-installer-<commit>-darwin-arm64.pkg.sigstore.json \
+  --custom-trusted-root trusted_root.jsonl \
+  --repo komira-ai/kbf \
+  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
+  --source-ref refs/heads/feature/arch-v2 \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --source-digest <commit> \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --deny-self-hosted-runners
+sudo installer -pkg kbf-installer-<commit>-darwin-arm64.pkg -target /
+```
+
+(The flags are the installer's, as for the deb.) Installing places files and starts nothing; `sudo
+/usr/local/kbf-installer/bin/kbf-installer setup` configures the host.
 
 ## Where the files are, and for how long
 
