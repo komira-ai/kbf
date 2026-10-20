@@ -90,7 +90,8 @@ fn the_installer_unit_runs_the_installed_binary() {
     let text =
         fs::read_to_string(repo_file("packaging/linux/units/kbf-installer.service")).expect("unit");
     let progs = programs(&text);
-    assert!(progs.len() >= 2, "{progs:?}");
+    // The unit has no ExecStartPre (`check` is not built), so ExecStart is the one program.
+    assert!(progs.iter().any(|(key, _)| *key == "ExecStart"), "{progs:?}");
     for (key, program) in progs {
         assert_eq!(program, "/usr/bin/kbf-installer", "{key}");
     }
