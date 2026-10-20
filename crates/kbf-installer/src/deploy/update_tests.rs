@@ -11,7 +11,7 @@ use clap::Parser;
 use serde_json::{Value, json};
 
 use super::api::{Operator, Reply, Request};
-use super::update::{finish, run};
+use super::update::{finish, installer_exit, request_id, run};
 use super::{Check, Clock, Env, NoCheck, NoSmoke, Options};
 use crate::cli::{Cli, Verb};
 use crate::exit::Exit;
@@ -282,4 +282,97 @@ fn a_bad_address_or_token_is_a_usage_error_before_anything_is_sent() {
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).expect("mode");
     let why = usage(&["--api", "127.0.0.1:8443", "--token-file", path]);
     assert!(why.contains("0600"), "{why}");
+}
+
+#[test]
+fn the_summarys_exit_is_the_installers_by_code() {
+    use super::summary::Exit as Summary;
+    for exit in [
+        Summary::Ok,
+        Summary::Plan,
+        Summary::Failed,
+        Summary::Usage,
+        Summary::Refused,
+        Summary::Busy,
+        Summary::NeedsOperator,
+    ] {
+        assert_eq!(
+            i32::from(installer_exit(exit).code()),
+            exit.code(),
+            "{exit:?}"
+        );
+    }
+}
+
+fn no_random(_: usize) -> Result<Vec<u8>, String> {
+    Err("no entropy".into())
+}
+
+fn fixed_random(n: usize) -> Result<Vec<u8>, String> {
+    Ok(vec![0xab; n])
+}
+
+#[test]
+fn a_request_id_is_the_one_given_or_a_random_one_and_no_random_is_a_usage_error() {
+    assert_eq!(request_id(Some("mine"), no_random), Ok("mine".to_owned()));
+    let made = request_id(None, fixed_random).expect("made");
+    assert_eq!(made, format!("update-{}", "ab".repeat(16)));
+    let why = request_id(None, no_random).expect_err("refused");
+    assert!(why.contains("no entropy"), "{why}");
+}
+
+fn token_in(name: &str) -> std::path::PathBuf {
+    let dir = kbf_host::testkit::scratch(name);
+    let path = dir.join("token");
+    std::fs::write(&path, "t".repeat(40)).expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    path
+}
+
+#[test]
+fn an_unreadable_or_empty_ca_file_is_a_usage_error() {
+    let token = token_in("update-ca");
+    let token = token.to_str().expect("utf8");
+    let why = usage(&[
+        "--api",
+        "127.0.0.1:8443",
+        "--token-file",
+        token,
+        "--api-ca",
+        "/no/such/ca.pem",
+    ]);
+    assert!(why.contains("--api-ca"), "{why}");
+    let empty = std::path::Path::new(token).with_file_name("ca.pem");
+    std::fs::write(&empty, "not a certificate").expect("write");
+    let why = usage(&[
+        "--api",
+        "127.0.0.1:8443",
+        "--token-file",
+        token,
+        "--api-ca",
+        empty.to_str().expect("utf8"),
+    ]);
+    assert!(why.contains("--api"), "{why}");
+}
+
+#[test]
+fn a_proxy_that_does_not_answer_ends_the_run_with_one_summary_line_and_exit_one() {
+    // Nothing listens on port 1: every call is refused, and the time given runs out.
+    let token = token_in("update-refused");
+    let a = args(&[
+        "--api",
+        "127.0.0.1:1",
+        "--token-file",
+        token.to_str().expect("utf8"),
+        "--handover-timeout-s",
+        "1",
+        "--request-id",
+        ID,
+    ]);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(run(&a, &mut out, &mut err), Exit::Failed);
+    let line: Value = serde_json::from_slice(&out).expect("one JSON line");
+    assert_eq!(line["reason"], "api_error");
+    assert_eq!(line["commit"], B);
+    assert!(String::from_utf8(err).expect("text").contains(B));
 }

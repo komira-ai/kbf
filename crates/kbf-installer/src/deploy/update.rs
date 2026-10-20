@@ -25,48 +25,25 @@ use std::time::Duration;
 use super::api::{Https, Trust};
 use super::cli::{CALL_TIMEOUT, host_platform, read_token};
 use super::smoke::random;
-use super::summary::Summary;
+use super::summary;
 use super::{Check, Env, NoCheck, NoSmoke, Options, SystemClock, update_frontend};
 use crate::cli::UpdateArgs;
 use crate::exit::Exit;
 
+/// How often the status is read while the update goes on.
+const POLL: Duration = Duration::from_secs(1);
+
 /// `update` for `args`: the summary goes to `out` (one line), what a person needs to fix a
 /// usage error to `err`.
 pub fn run(args: &UpdateArgs, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
-    let usage = |err: &mut dyn Write, why: &str| {
-        let _ = writeln!(err, "kbf-installer: update: {why}");
-        Exit::Usage
+    let (api, options) = match plan(args, random) {
+        Ok(plan) => plan,
+        Err(why) => {
+            let _ = writeln!(err, "kbf-installer: update: {why}");
+            return Exit::Usage;
+        }
     };
-    let addr: SocketAddr = match args.api.parse() {
-        Ok(a) => a,
-        Err(_) => return usage(err, &format!("--api {:?} is not host:port", args.api)),
-    };
-    let request_id = match &args.request_id {
-        Some(id) => id.clone(),
-        None => match random(16) {
-            Ok(bytes) => format!("update-{}", hex::encode(bytes)),
-            Err(e) => return usage(err, &format!("no request id: {e}")),
-        },
-    };
-    let token = match read_token(&args.token_file) {
-        Ok(t) => t,
-        Err(why) => return usage(err, &why),
-    };
-    let ca_pem = match args.api_ca.as_ref().map(fs::read).transpose() {
-        Ok(pem) => pem,
-        Err(e) => return usage(err, &format!("--api-ca: {e}")),
-    };
-    let trust = Trust {
-        server_name: args.api_server_name.clone(),
-        ca_pem,
-    };
-    let api = match Https::new(addr, &trust, token, CALL_TIMEOUT) {
-        Ok(api) => api,
-        Err(e) => return usage(err, &format!("--api: {e}")),
-    };
-    let mut options = Options::new(args.commit.clone(), host_platform(), request_id);
-    options.nodes = args.nodes;
-    options.handover_timeout = Duration::from_secs(args.handover_timeout_s);
+    let _ = writeln!(err, "kbf-installer: update: {}", options.commit);
     let (clock, check) = (SystemClock, NoCheck);
     let env = Env {
         api: &api,
@@ -74,21 +51,67 @@ pub fn run(args: &UpdateArgs, out: &mut dyn Write, err: &mut dyn Write) -> Exit 
         smoke: &NoSmoke,
         check: &check as &dyn Check,
     };
-    let _ = writeln!(err, "kbf-installer: update: {}", options.commit);
     finish(&env, &options, out)
 }
 
-/// Run the update and print its summary; the exit code the summary names.
-pub(super) fn finish(env: &Env, options: &Options, out: &mut dyn Write) -> Exit {
-    // Placeholder: asks nothing of the API.
-    let _ = (env, options, out, update_frontend, exit_of);
-    Exit::Failed
+/// The client and the options for `args`, or what is wrong with them. `rng` is the random
+/// source of a request id the caller did not give.
+fn plan(
+    args: &UpdateArgs,
+    rng: fn(usize) -> Result<Vec<u8>, String>,
+) -> Result<(Https, Options), String> {
+    let addr: SocketAddr = args
+        .api
+        .parse()
+        .map_err(|_| format!("--api {:?} is not host:port", args.api))?;
+    let request_id = request_id(args.request_id.as_deref(), rng)?;
+    let token = read_token(&args.token_file)?;
+    let ca_pem = args
+        .api_ca
+        .as_ref()
+        .map(|path| fs::read(path).map_err(|e| format!("--api-ca {}: {e}", path.display())))
+        .transpose()?;
+    let trust = Trust {
+        server_name: args.api_server_name.clone(),
+        ca_pem,
+    };
+    let api = Https::new(addr, &trust, token, CALL_TIMEOUT).map_err(|e| format!("--api: {e}"))?;
+    let mut options = Options::new(args.commit.clone(), host_platform(), request_id);
+    options.nodes = args.nodes;
+    options.poll = POLL;
+    options.handover_timeout = Duration::from_secs(args.handover_timeout_s);
+    Ok((api, options))
 }
 
-/// The summary's exit as the installer's: the two enums share their codes.
-fn exit_of(summary: &Summary) -> Exit {
-    Exit::ALL
-        .into_iter()
-        .find(|e| i32::from(e.code()) == summary.exit)
-        .unwrap_or(Exit::Failed)
+/// The request id the caller gave, else a random one.
+pub(super) fn request_id(
+    given: Option<&str>,
+    rng: fn(usize) -> Result<Vec<u8>, String>,
+) -> Result<String, String> {
+    match given {
+        Some(id) => Ok(id.to_owned()),
+        None => rng(16)
+            .map(|bytes| format!("update-{}", hex::encode(bytes)))
+            .map_err(|e| format!("no request id: {e}")),
+    }
+}
+
+/// Run the update and print its summary; the exit code it names.
+pub(super) fn finish(env: &Env, options: &Options, out: &mut dyn Write) -> Exit {
+    let (summary, exit) = update_frontend(env, options);
+    let _ = writeln!(out, "{}", summary.line());
+    installer_exit(exit)
+}
+
+/// The summary's exit as the installer's. The two enums share their codes; an update ends
+/// in `Ok`, `Failed`, `Refused` or `Busy`, and the rest are here so that the match is whole.
+pub(super) fn installer_exit(exit: summary::Exit) -> Exit {
+    match exit {
+        summary::Exit::Ok | summary::Exit::Plan => Exit::Ok,
+        summary::Exit::Failed => Exit::Failed,
+        summary::Exit::Usage => Exit::Usage,
+        summary::Exit::Refused => Exit::Refused,
+        summary::Exit::Busy => Exit::Busy,
+        summary::Exit::NeedsOperator => Exit::NeedsOperator,
+    }
 }

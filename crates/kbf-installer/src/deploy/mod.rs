@@ -32,11 +32,11 @@ pub mod smoke;
 #[cfg(test)]
 pub(super) mod smoke_tests;
 mod summary;
+#[cfg(test)]
+mod tests;
 pub mod update;
 #[cfg(test)]
 mod update_tests;
-#[cfg(test)]
-mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -294,8 +294,9 @@ pub fn deploy(env: &Env, opts: &Options, bundle: Option<&mut dyn Read>) -> Summa
 
 /// The frontend step of a deploy, alone: ask the update API to swap the frontend and wait for
 /// the update to end. `kbf-installer update --frontend` is this. No bundle, no preflight, no
-/// node watch and no smoke: the summary holds the one step.
-pub fn update_frontend(env: &Env, opts: &Options) -> Summary {
+/// node watch and no smoke: the summary holds the one step. The exit is the summary's own
+/// (`Ok` for an update that is `done`, or already runs the commit).
+pub fn update_frontend(env: &Env, opts: &Options) -> (Summary, Exit) {
     let mut run = Run {
         env,
         opts,
@@ -304,11 +305,12 @@ pub fn update_frontend(env: &Env, opts: &Options) -> Summary {
     };
     let outcome = run.step("frontend", |r| r.update_frontend());
     run.sum.ended = summary::utc(env.clock.now());
-    match outcome {
-        Ok(()) => run.sum.end(Exit::Ok, "", ""),
-        Err(f) => run.sum.end(f.exit, f.reason, &f.detail),
-    }
-    run.sum
+    let (exit, reason, detail) = match outcome {
+        Ok(()) => (Exit::Ok, "", String::new()),
+        Err(f) => (f.exit, f.reason, f.detail),
+    };
+    run.sum.end(exit, reason, &detail);
+    (run.sum, exit)
 }
 
 impl Run<'_> {

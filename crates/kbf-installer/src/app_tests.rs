@@ -688,3 +688,19 @@ fn run_with_an_installer_config_refuses_a_relative_host_root() {
     let refused = build_helper(PathBuf::from("relative-root"), &args).err();
     assert!(refused.is_some_and(|f| !f.why.is_empty()));
 }
+
+/// Catches `update` being gated on root (it is a client of the update API and runs as
+/// whoever can read the token file) or not reaching its own code: a bad address is its own
+/// usage error, as an ordinary user, and prints no summary.
+#[test]
+fn update_runs_without_root_and_reports_its_own_usage_errors() {
+    let args = ["update", "--commit", B, "--frontend", "--api", "nowhere"];
+    let (exit, out, err) = run_as(1000, &args);
+    assert_eq!(exit, Exit::Usage);
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.contains("update: --api") && err.contains("host:port"),
+        "{err}"
+    );
+    assert!(!parse(&args).verb.needs_root());
+}
