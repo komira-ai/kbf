@@ -191,6 +191,12 @@ message HeartbeatRequest {
   // finished a pass again. 0 is also what an older node sends, and reads as "no pass done".
   // Numbers 11 to 14 are the flush report of the same handoff.
   uint64 tail_epoch_done = 15;
+  // The placement fingerprint (Map.placement_fingerprint) of the map this node held when the
+  // pass that tail_epoch_done reports began, computed with this node assumed Active
+  // (Map.assuming): the frontend accepts a joiner's report only when it equals its own for
+  // the current map, so a pass begun under another placement is never taken as the fill
+  // (docs/design/rebalance-handoff.md, section 3). 0 with tail_epoch_done 0: no pass done.
+  uint64 fill_fp = 16;
 }
 
 // A closed set: a node never sends free text about its store, so a credential cannot ride

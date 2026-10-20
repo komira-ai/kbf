@@ -508,6 +508,10 @@ pub struct Args {
     /// Build history: `--history-objects` and `--history-index-root`.
     #[command(flatten)]
     pub history: crate::history::HistoryFlags,
+    /// The release poller: `--release-poll-every-secs`, `--release-poll-repo` and
+    /// `--release-poll-refs`.
+    #[command(flatten)]
+    pub release_poll: crate::release::poll::PollFlags,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -856,6 +860,7 @@ impl Args {
             token,
             local_cache,
             releases,
+            poll: self.release_poll.config(),
         }))
     }
 

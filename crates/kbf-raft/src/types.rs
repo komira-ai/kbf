@@ -106,8 +106,14 @@ impl Membership {
         voters: impl IntoIterator<Item = ServerId>,
         learners: impl IntoIterator<Item = ServerId>,
     ) -> Result<Self, ConfigError> {
-        let voters: BTreeSet<ServerId> = voters.into_iter().collect();
-        let learners: BTreeSet<ServerId> = learners.into_iter().collect();
+        Self::from_sets(voters.into_iter().collect(), learners.into_iter().collect())
+    }
+
+    /// [`Membership::new`] past the generic part, so one body serves every caller.
+    fn from_sets(
+        voters: BTreeSet<ServerId>,
+        learners: BTreeSet<ServerId>,
+    ) -> Result<Self, ConfigError> {
         if voters.is_empty() {
             return Err(ConfigError::NoVoters);
         }
@@ -237,8 +243,14 @@ mod tests {
             Err(ConfigError::VoterAndLearner(ServerId(2)))
         );
         let m = Membership::new(ids(&[1, 2, 3]), ids(&[4])).unwrap();
-        assert!(m.is_voter(ServerId(1)) && !m.is_voter(ServerId(4)));
-        assert!(m.contains(ServerId(4)) && !m.contains(ServerId(5)));
+        assert_eq!(
+            [m.is_voter(ServerId(1)), m.is_voter(ServerId(4))],
+            [true, false]
+        );
+        assert_eq!(
+            [m.contains(ServerId(4)), m.contains(ServerId(5))],
+            [true, false]
+        );
     }
 
     /// Catches: a configuration whose heartbeat is not shorter than the election
