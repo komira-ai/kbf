@@ -41,6 +41,7 @@ pub const TEXT_FORMAT: &str = "text/plain; version=0.0.4; charset=utf-8";
 struct Extras {
     local: Option<Arc<LocalCache>>,
     history: Option<Arc<crate::history::Stats>>,
+    poll: Option<Arc<crate::release::poll::Stats>>,
 }
 
 impl Extras {
@@ -51,6 +52,9 @@ impl Extras {
         }
         if let Some(history) = self.history {
             history.render(out);
+        }
+        if let Some(poll) = self.poll {
+            poll.render(out);
         }
     }
 }
@@ -81,6 +85,7 @@ pub fn router<M, O>(
     cache: Arc<Cache<M, O>>,
     local: Option<Arc<LocalCache>>,
     history: Option<Arc<crate::history::Stats>>,
+    poll: Option<Arc<crate::release::poll::Stats>>,
     members: Option<Arc<Members>>,
     tls: Vec<TlsSource>,
 ) -> Router
@@ -92,7 +97,11 @@ where
         .route("/metrics", get(metrics::<M, O>))
         .with_state(Sources {
             cache,
-            extras: Extras { local, history },
+            extras: Extras {
+                local,
+                history,
+                poll,
+            },
             members,
             tls: tls.into(),
         })
@@ -150,7 +159,7 @@ impl NodeMetrics {
         M: MetaLog,
         O: ObjectStore + 'static,
     {
-        let routes = router(cache, local, None, None, tls.into_iter().collect());
+        let routes = router(cache, local, None, None, None, tls.into_iter().collect());
         // `pending` is its stop, so it ends only when the task is aborted; an error of
         // the accept loop has nothing to be reported to.
         // The node is not behind the proxy: no secret, so `gate_requests` admits a direct caller.

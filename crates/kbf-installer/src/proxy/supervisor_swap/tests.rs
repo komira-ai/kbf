@@ -541,6 +541,34 @@ fn the_slot_that_serves_after_an_update_follows_how_it_ended() {
     assert_eq!(active_after(&intent(Phase::Quiescing, None), &never), old);
 }
 
+/// The window between the swap thread recording its last phase and closing the update: the
+/// update still reads as open, its record already ended. The status names the slot that serves
+/// once the update ended that way, not the one a live update in a later phase would name
+/// (`failed` and `rolled_back` sort after `switched`).
+#[test]
+fn the_status_of_an_update_that_ended_but_is_not_closed_names_the_slot_that_serves() {
+    let (old, new) = (Slot::A, Slot::B);
+    for (phase, step, serves) in [
+        (Phase::Failed, Some(Step::Abort), old),
+        (Phase::Failed, Some(Step::Start), old),
+        (Phase::Failed, Some(Step::Migrate), old),
+        (Phase::Failed, Some(Step::Confirm), new),
+        // No store answer for the new slot: it does not hold.
+        (Phase::Failed, Some(Step::Restart), old),
+        (Phase::RolledBack, None, old),
+        (Phase::Done, None, new),
+    ] {
+        let h = harness("sw-status-ended");
+        {
+            let mut state = h.sup.shared.lock();
+            state.intent = Some(intent(phase, step));
+            state.open = Some("u".into());
+        }
+        let update = h.sup.status().update.expect("the update");
+        assert_eq!(update.active_slot, serves, "{phase:?} {step:?}");
+    }
+}
+
 fn rig_config(h: &Harness, timing: Timing, spawn: Spawn) -> SwapSupervisor {
     let sink = Arc::clone(&h.deaths);
     let parts = h.rig.parts(&h.requests, move |why| {

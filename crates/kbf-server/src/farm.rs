@@ -8,9 +8,11 @@
 //!
 //! **Single node.** The control log is this process: a record the scheduler asks to
 //! commit is committed as soon as it is appended, and fed straight back (see
-//! [`State::feed`]). The replicated log replaces exactly that step. Since the leases
-//! die with the process, each process grants them under its own term, so a lease id
-//! names one lease ever and an earlier process's `Result` is refused (issue #137).
+//! [`State::feed`]). The replicated log replaces exactly that step. Each process grants
+//! leases under its own term (and a store continues the sequence), so a lease id
+//! names one lease ever (issue #137). Under a state store the predecessor's own leases are
+//! restored (`take_stored`): its `Result` ends its own operation until the daemon's heartbeat omits
+//! the lease, and one naming another action is a MISMATCH; an id no row holds is UNKNOWN_LEASE.
 //! Operations die with it too, so the term is part of every operation name (issue
 //! #154). The term, and the lease epoch `Welcome` names, come from the metadata log
 //! ([`MetaLog::leadership`]):
