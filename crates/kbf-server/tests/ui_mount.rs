@@ -4,7 +4,7 @@
 
 mod pages;
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use kbf_invocation::Outcome;
@@ -230,10 +230,10 @@ async fn hostile_path_parameters_are_refused_on_the_pages_and_the_read_routes() 
 
 /// Opens a connection from `from` to `api`, sends a `GET` of `path` and reads only the
 /// head of the answer: the body is left unread, so the server holds the read open.
-async fn open_read(api: SocketAddr, from: &str, path: &str) -> (TcpStream, String) {
+async fn open_read(api: SocketAddr, from: Ipv4Addr, path: &str) -> (TcpStream, String) {
     let socket = TcpSocket::new_v4().expect("a socket");
     socket
-        .bind(format!("{from}:0").parse().expect("an address"))
+        .bind(SocketAddr::from((from, 0)))
         .expect("bind a loopback address");
     let mut stream = socket.connect(api).await.expect("connect");
     let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\n\r\n");
@@ -253,10 +253,10 @@ async fn open_read(api: SocketAddr, from: &str, path: &str) -> (TcpStream, Strin
 }
 
 /// A `GET` of `path` from `from`, read to its end.
-async fn get_from(api: SocketAddr, from: &str, path: &str) -> u16 {
+async fn get_from(api: SocketAddr, from: Ipv4Addr, path: &str) -> u16 {
     let socket = TcpSocket::new_v4().expect("a socket");
     socket
-        .bind(format!("{from}:0").parse().expect("an address"))
+        .bind(SocketAddr::from((from, 0)))
         .expect("bind a loopback address");
     let mut stream = socket.connect(api).await.expect("connect");
     let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
@@ -289,10 +289,12 @@ async fn a_caller_with_slow_reads_open_cannot_starve_another_or_the_ui() {
         format!("/v1/blobs/{}", text(&small)),
     );
     let api = server.api;
+    // Another loopback address: a second caller, to the server that sees the peer address.
+    let other = Ipv4Addr::new(127, 0, 0, 2);
 
     let mut slow = Vec::new();
     for _ in 0..kbf_server::read_limit::PER_CALLER {
-        let (stream, head) = open_read(api, "127.0.0.1", &big).await;
+        let (stream, head) = open_read(api, Ipv4Addr::LOCALHOST, &big).await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         slow.push(stream);
     }
@@ -303,8 +305,8 @@ async fn a_caller_with_slow_reads_open_cannot_starve_another_or_the_ui() {
     assert_eq!(server.get("/v1/invocations/b1").await.code, 429);
 
     // Another caller reads, and so does a page of the same caller (its own bound).
-    assert_eq!(get_from(api, "127.0.0.2", &small).await, 200);
-    assert_eq!(get_from(api, "127.0.0.2", "/v1/invocations/b1").await, 200);
+    assert_eq!(get_from(api, other, &small).await, 200);
+    assert_eq!(get_from(api, other, "/v1/invocations/b1").await, 200);
     let page = server.get("/ui/builds?id=b1").await;
     assert_eq!(page.code, 200, "{}", page.text());
 

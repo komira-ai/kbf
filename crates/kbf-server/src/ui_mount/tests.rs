@@ -82,7 +82,7 @@ async fn the_source_asks_a_route_as_the_lowest_trust_and_bounds_the_answer() {
 #[tokio::test]
 async fn the_pages_serve_get_and_head_and_refuse_every_other_method_with_the_headers() {
     let pages = pages(InProcess::new(api()));
-    let get = send(&pages, Method::GET, "/ui", "10.0.0.1").await;
+    let get = send(&pages, Method::GET, "/ui", "192.0.2.1").await;
     assert_eq!(get.status(), StatusCode::OK);
     assert!(
         get.headers()["content-type"]
@@ -93,10 +93,10 @@ async fn the_pages_serve_get_and_head_and_refuse_every_other_method_with_the_hea
     let page = text(get).await;
     assert!(page.contains("<title>Overview - kbf</title>"), "{page}");
 
-    let slash = send(&pages, Method::GET, "/ui/", "10.0.0.1").await;
+    let slash = send(&pages, Method::GET, "/ui/", "192.0.2.1").await;
     assert_eq!(slash.status(), StatusCode::OK);
 
-    let head = send(&pages, Method::HEAD, "/ui", "10.0.0.1").await;
+    let head = send(&pages, Method::HEAD, "/ui", "192.0.2.1").await;
     assert_eq!(head.status(), StatusCode::OK);
     assert!(text(head).await.is_empty());
 
@@ -115,7 +115,7 @@ async fn the_pages_serve_get_and_head_and_refuse_every_other_method_with_the_hea
             "/ui/static/kbf.css",
             "/ui/builds/x",
         ] {
-            let refused = send(&pages, method.clone(), path, "10.0.0.1").await;
+            let refused = send(&pages, method.clone(), path, "192.0.2.1").await;
             assert_eq!(
                 refused.status(),
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -157,12 +157,12 @@ async fn every_answer_under_ui_carries_the_security_headers() {
         ("/ui/builds/%00", 400),
         (long.as_str(), 400),
     ] {
-        let response = send(&pages, Method::GET, path, "10.0.0.1").await;
+        let response = send(&pages, Method::GET, path, "192.0.2.1").await;
         assert_eq!(response.status().as_u16(), status, "{path}");
         assert_headers(&response, path);
     }
     let too_long = format!("/ui/{}", "a/".repeat(crate::read_limit::MAX_PATH_BYTES));
-    let response = send(&pages, Method::GET, &too_long, "10.0.0.1").await;
+    let response = send(&pages, Method::GET, &too_long, "192.0.2.1").await;
     assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
     assert_headers(&response, "a path too long");
 }
@@ -174,15 +174,15 @@ async fn ui_reads_are_bounded_per_caller_with_the_headers_on_the_429() {
     let pages = pages(InProcess::new(api()));
     let mut held = Vec::new();
     for _ in 0..PER_CALLER {
-        held.push(send(&pages, Method::GET, "/ui", "10.0.0.1").await);
+        held.push(send(&pages, Method::GET, "/ui", "192.0.2.1").await);
     }
-    let refused = send(&pages, Method::GET, "/ui", "10.0.0.1").await;
+    let refused = send(&pages, Method::GET, "/ui", "192.0.2.1").await;
     assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(refused.headers()["retry-after"], "1");
     assert_headers(&refused, "429");
-    let other = send(&pages, Method::GET, "/ui", "10.0.0.2").await;
+    let other = send(&pages, Method::GET, "/ui", "192.0.2.2").await;
     assert_eq!(other.status(), StatusCode::OK);
     drop(held);
-    let after = send(&pages, Method::GET, "/ui", "10.0.0.1").await;
+    let after = send(&pages, Method::GET, "/ui", "192.0.2.1").await;
     assert_eq!(after.status(), StatusCode::OK);
 }

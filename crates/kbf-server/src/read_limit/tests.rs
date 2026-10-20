@@ -60,24 +60,24 @@ async fn a_caller_holds_at_most_its_share_and_gets_the_slot_back() {
     let router = router(&limit);
     let mut held = Vec::new();
     for _ in 0..PER_CALLER {
-        held.push(ok(&router, "10.0.0.1").await);
+        held.push(ok(&router, "192.0.2.1").await);
     }
     assert_eq!(limit.callers(), 1);
 
-    let refused = call(&router, "/v1/thing/x", Some("10.0.0.1"), None).await;
+    let refused = call(&router, "/v1/thing/x", Some("192.0.2.1"), None).await;
     assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(refused.headers()["retry-after"], "1");
 
     // Another caller is not affected by the first one being full.
-    let other = ok(&router, "10.0.0.2").await;
+    let other = ok(&router, "192.0.2.2").await;
     assert_eq!(limit.callers(), 2);
     drop(other);
     assert_eq!(limit.callers(), 1);
 
     // One answer dropped frees one slot, and only one.
     held.pop();
-    let again = ok(&router, "10.0.0.1").await;
-    let still = call(&router, "/v1/thing/x", Some("10.0.0.1"), None).await;
+    let again = ok(&router, "192.0.2.1").await;
+    let still = call(&router, "/v1/thing/x", Some("192.0.2.1"), None).await;
     assert_eq!(still.status(), StatusCode::TOO_MANY_REQUESTS);
     drop((again, held));
     assert_eq!(limit.callers(), 0, "an idle server remembers no caller");
@@ -91,10 +91,10 @@ async fn a_caller_holds_at_most_its_share_and_gets_the_slot_back() {
 async fn the_slot_is_held_until_the_body_is_dropped_and_the_size_is_kept() {
     let limit = ReadLimit::new(1);
     let router = router(&limit);
-    let response = ok(&router, "10.0.0.1").await;
+    let response = ok(&router, "192.0.2.1").await;
     assert_eq!(response.body().size_hint().exact(), Some(12));
     assert!(!response.body().is_end_stream());
-    let refused = call(&router, "/v1/thing/x", Some("10.0.0.1"), None).await;
+    let refused = call(&router, "/v1/thing/x", Some("192.0.2.1"), None).await;
     assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
     // Reading the body to its end is not the end of the answer; dropping it is.
     let bytes = response
@@ -104,7 +104,7 @@ async fn the_slot_is_held_until_the_body_is_dropped_and_the_size_is_kept() {
         .expect("a body")
         .to_bytes();
     assert_eq!(&bytes[..], b"twelve bytes");
-    ok(&router, "10.0.0.1").await;
+    ok(&router, "192.0.2.1").await;
 }
 
 /// Catches: the caller taken from the address when the proxy named a node (mutant:
@@ -130,7 +130,7 @@ async fn a_node_the_proxy_named_has_a_bound_of_its_own() {
     let again = call(
         &router,
         "/v1/thing/x",
-        Some("127.0.0.9"),
+        Some("192.0.2.9"),
         Some(proxied(Some("n1"))),
     )
     .await;
@@ -174,7 +174,7 @@ async fn a_target_that_is_not_a_plain_path_is_refused_before_it_is_read() {
     let router = router(&limit);
     let status = |path: String| {
         let router = router.clone();
-        async move { call(&router, &path, Some("10.0.0.1"), None).await.status() }
+        async move { call(&router, &path, Some("192.0.2.1"), None).await.status() }
     };
     let segment = "a".repeat(MAX_SEGMENT_BYTES);
     assert_eq!(status(format!("/v1/thing/{segment}")).await, StatusCode::OK);
@@ -221,7 +221,7 @@ async fn a_target_that_is_not_a_plain_path_is_refused_before_it_is_read() {
 async fn a_refusal_is_the_apis_json_error() {
     let limit = ReadLimit::new(0);
     let router = router(&limit);
-    let refused = call(&router, "/v1/thing/x", Some("10.0.0.1"), None).await;
+    let refused = call(&router, "/v1/thing/x", Some("192.0.2.1"), None).await;
     assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(refused.headers()["content-type"], "application/json");
     let body = refused
