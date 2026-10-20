@@ -48,7 +48,9 @@ impl State {
             }));
         };
         let operation = sent.operation;
-        match self.sched.state(operation) {
+        let state = self.sched.state(operation);
+        // One body for both states: a guard on the alternatives would be two copies of it.
+        let current = match state {
             Some(
                 OpState::Leased {
                     lease: held,
@@ -59,18 +61,22 @@ impl State {
                     lease: held,
                     worker: holder,
                 },
-            ) if *held == lease && holder == worker => Ok((operation, sent.action, sent.stamp)),
-            Some(state) if finished_lease(state) == Some(lease) => {
-                Err(if self.finish_held(operation) {
-                    Verdict::Held
-                } else {
-                    Verdict::Refused(Reason::Duplicate)
-                })
-            }
-            // Given up, granted again (to this node or another), held by another node, or
-            // finished with another lease's result: not the current attempt.
-            _ => Err(Verdict::Refused(Reason::Stale)),
+            ) => *held == lease && holder == worker,
+            _ => false,
+        };
+        if current {
+            return Ok((operation, sent.action, sent.stamp));
         }
+        // Given up, granted again (to this node or another), held by another node, or
+        // finished with another lease's result: not the current attempt.
+        if state.and_then(finished_lease) != Some(lease) {
+            return Err(Verdict::Refused(Reason::Stale));
+        }
+        Err(if self.finish_held(operation) {
+            Verdict::Held
+        } else {
+            Verdict::Refused(Reason::Duplicate)
+        })
     }
 }
 
