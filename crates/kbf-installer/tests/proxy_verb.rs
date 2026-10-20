@@ -200,9 +200,11 @@ fn start_args(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
-    // SAFETY: only async-signal-safe calls (`sigprocmask` family included) and `setenv`, which is safe here: the child is a
-    // fresh fork of a test thread that holds no environment lock, and nothing else in this
-    // file forks with a hook.
+    // SAFETY: async-signal-safe calls (`sigprocmask` family, `fcntl`, `dup2`, `getpid`) and
+    // `setenv`, which is not: if another thread of this test binary held the environment or
+    // allocator lock at `fork`, the child would block before `exec` (the start then fails
+    // on its 30 s wait, never wrongly passes). The pid is only known after `fork`, so it
+    // cannot be set earlier, and a wrapper shell is not allowed by the interpreter budget.
     unsafe {
         command.pre_exec(move || {
             if block_term {

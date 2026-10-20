@@ -13,10 +13,10 @@
 //! [`crate::forked`] (a child held between `fork` and `exec`): they cover the other ways a
 //! forked child touches a test's descriptors.
 
-use std::io;
+use std::io::{self, BufRead as _, BufReader};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::process::CommandExt as _;
-use std::process::{Child, Command};
+use std::process::{Child, ChildStdout, Command};
 use std::time::{Duration, Instant};
 
 /// How long [`Reaped`] waits for a child to exit after SIGTERM before it sends SIGKILL.
@@ -58,6 +58,27 @@ impl Drop for Reaped {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Reads the first line `stdout` delivers, waiting at most `within`, and returns it with the
+/// reader (keep it: dropping it closes the pipe under the child). A child that never prints
+/// fails the test with `TimedOut` instead of hanging it. The read runs on a thread that stays
+/// blocked until the child writes or exits, so the guard must still stop the child.
+///
+/// # Errors
+/// The read error, or `TimedOut`.
+pub fn first_line(
+    stdout: ChildStdout,
+    within: Duration,
+) -> io::Result<(String, BufReader<ChildStdout>)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let _ = tx.send(reader.read_line(&mut line).map(|_| (line, reader)));
+    });
+    rx.recv_timeout(within)
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no line within the deadline"))?
 }
 
 /// Marks every descriptor from `first` up close-on-exec in the calling process. Meant for a
@@ -109,8 +130,41 @@ fn cloexec_from_with(first: i32, range: fn(i32) -> bool) {
     }
 }
 
+/// Asks the kernel to SIGKILL this process when its parent dies, for a `pre_exec` hook. `parent`
+/// is the pid of the process that forked; if it is no longer this process's parent (it died
+/// between `fork` and here, so the signal would never come) the hook fails and the spawn with
+/// it.
+#[cfg(target_os = "linux")]
+fn die_with_parent(parent: i32) -> io::Result<()> {
+    // SAFETY: `prctl` with `PR_SET_PDEATHSIG` takes two integers; `getppid` reads a pid.
+    let (set, now) = unsafe {
+        (
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL),
+            libc::getppid(),
+        )
+    };
+    death_signal_outcome(set, now, parent)
+}
+
+/// The verdict on the `prctl` result `set` and the current parent pid `now`. Its own function
+/// so a test can reach the refusal of a failed `prctl`, which the kernel never gives here.
+#[cfg(target_os = "linux")]
+fn death_signal_outcome(set: i32, now: i32, parent: i32) -> io::Result<()> {
+    if set != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if now != parent {
+        return Err(io::Error::other("the parent died before the child started"));
+    }
+    Ok(())
+}
+
 /// Starts `command` with every descriptor from `keep_below` up close-on-exec, and returns
-/// the guarded child. Hooks the caller put on `command` with `pre_exec` run first, so one
+/// the guarded child. On Linux the child is also killed (SIGKILL) when the parent dies
+/// without running destructors, as when the harness is killed. The kernel ties that signal
+/// to the thread that forked, not the process: call this from a thread that outlives the
+/// child (a test's own thread does; a short-lived helper thread would kill the child as it
+/// ends). Hooks the caller put on `command` with `pre_exec` run first, so one
 /// that moves a descriptor into place keeps it by putting it below `keep_below`.
 ///
 /// # Errors
@@ -118,7 +172,20 @@ fn cloexec_from_with(first: i32, range: fn(i32) -> bool) {
 pub fn spawn(command: &mut Command, keep_below: i32) -> io::Result<Reaped> {
     // SAFETY: the hook makes only async-signal-safe calls (`syscall`, `sysconf`, `fcntl`).
     unsafe { command.pre_exec(cloexec_hook(keep_below)) };
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: the hook makes only async-signal-safe calls (`prctl`, `getppid`).
+        let parent = unsafe { libc::getpid() };
+        unsafe { command.pre_exec(death_hook(parent)) };
+    }
     command.spawn().map(Reaped)
+}
+
+/// The `pre_exec` hook [`spawn`] installs for the death signal. Its own function so a test can
+/// run it in the test process: inside the forked child no coverage is recorded.
+#[cfg(target_os = "linux")]
+fn death_hook(parent: i32) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
+    move || die_with_parent(parent)
 }
 
 /// The `pre_exec` hook [`spawn`] installs. Its own function so a test can run it in the
@@ -232,5 +299,141 @@ mod tests {
             libc::close(below);
             libc::close(above);
         }
+    }
+
+    /// Catches a hook that accepts a parent that is not the real one (the "parent died before
+    /// the child started" race would then leave an unguarded child): run in the test process,
+    /// a wrong parent pid is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_death_signal_hook_refuses_a_parent_that_is_gone() {
+        // SAFETY: reads this process's own parent pid.
+        let real = unsafe { libc::getppid() };
+        let refused = die_with_parent(real + 1);
+        assert!(refused.is_err());
+        // Clear the signal this call set on the test thread: it must not outlive the check.
+        // SAFETY: `prctl` with `PR_SET_PDEATHSIG` takes two integers.
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0) };
+    }
+
+    /// Catches a hook that refuses the real parent, or that sets no signal: run here with the
+    /// true parent pid it succeeds and the thread's death signal is SIGKILL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_death_signal_hook_accepts_the_real_parent_and_arms_sigkill() {
+        // SAFETY: reads this process's own parent pid.
+        let real = unsafe { libc::getppid() };
+        death_hook(real)().expect("the real parent is accepted");
+        let mut armed: libc::c_int = 0;
+        // SAFETY: `PR_GET_PDEATHSIG` writes one int through the pointer.
+        let got = unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut armed as *mut libc::c_int) };
+        // Clear the signal before asserting: it must not outlive the check.
+        // SAFETY: `prctl` with `PR_SET_PDEATHSIG` takes two integers.
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0) };
+        assert_eq!(got, 0);
+        assert_eq!(armed, libc::SIGKILL);
+    }
+
+    /// Catches a guard that waits out the whole grace period (or kills) for a child that stops
+    /// on SIGTERM: such a child is gone well before [`GRACE`] ends.
+    #[test]
+    fn dropping_the_guard_of_a_child_that_stops_on_sigterm_does_not_wait_out_the_grace() {
+        let child = spawn(Command::new("sleep").arg("30"), 3).expect("spawn");
+        let pid = child.id().cast_signed();
+        let started = Instant::now();
+        drop(child);
+        assert!(started.elapsed() < GRACE);
+        // SAFETY: signal 0 only probes; the pid was reaped by the guard.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
+    /// Catches a verdict that lets a failed `prctl` through: a non-zero result is an error even
+    /// when the parent matches, and a zero result with the right parent is accepted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_death_signal_verdict_refuses_a_failed_prctl() {
+        assert!(death_signal_outcome(-1, 7, 7).is_err());
+        assert!(death_signal_outcome(0, 7, 7).is_ok());
+    }
+
+    /// Catches a guard that returns without reaping, or that never escalates: a child that
+    /// ignores SIGTERM is killed after the grace period and is gone (no process, no zombie)
+    /// when the guard is dropped.
+    #[test]
+    fn dropping_the_guard_kills_a_child_that_ignores_sigterm() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        // SAFETY: the hook only calls `signal`, which is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let child = spawn(&mut command, 3).expect("spawn");
+        let pid = child.id().cast_signed();
+        drop(child);
+        // SAFETY: signal 0 only probes; the pid was reaped by the guard.
+        let probe = unsafe { libc::kill(pid, 0) };
+        assert_eq!(probe, -1, "the child is still there");
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    /// Catches a guard that signals a child that already exited and was waited for.
+    #[test]
+    fn dropping_the_guard_of_an_exited_child_returns_at_once() {
+        let mut child = spawn(&mut Command::new("true"), 3).expect("spawn");
+        child.wait().expect("wait");
+        let started = Instant::now();
+        drop(child);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    fn piped(program: &str, args: &[&str]) -> Reaped {
+        let mut command = Command::new(program);
+        command.args(args).stdout(std::process::Stdio::piped());
+        spawn(&mut command, 3).expect("spawn")
+    }
+
+    /// Catches a `first_line` that hangs or mislabels a silent child: no line within the
+    /// deadline is `TimedOut`.
+    #[test]
+    fn first_line_of_a_silent_child_times_out() {
+        let mut child = piped("sleep", &["30"]);
+        let out = child.stdout.take().expect("stdout");
+        let err = first_line(out, Duration::from_millis(100)).expect_err("silent");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// Catches a `first_line` that returns a read error as a line or swallows it: bytes that
+    /// are not UTF-8 surface as the read error itself, not as `TimedOut`.
+    #[test]
+    fn first_line_passes_a_read_error_through() {
+        let mut child = piped("printf", &["\\377\\n"]);
+        let out = child.stdout.take().expect("stdout");
+        let err = first_line(out, Duration::from_secs(10)).expect_err("not UTF-8");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Catches a `first_line` that drops the line or the reader: both come back, and the
+    /// reader still holds what follows.
+    #[test]
+    fn first_line_returns_the_line_and_the_reader() {
+        let mut child = piped("printf", &["one\\ntwo\\n"]);
+        let out = child.stdout.take().expect("stdout");
+        let (line, mut reader) = first_line(out, Duration::from_secs(10)).expect("line");
+        assert_eq!(line, "one\n");
+        let mut next = String::new();
+        reader.read_line(&mut next).expect("next");
+        assert_eq!(next, "two\n");
+    }
+
+    /// Catches a `spawn` that wraps or hides the start error: a program that does not exist
+    /// is the OS error.
+    #[test]
+    fn spawn_of_a_missing_program_is_the_start_error() {
+        let err =
+            spawn(&mut Command::new("/nonexistent/kbf-testkit-program"), 3).expect_err("missing");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }
