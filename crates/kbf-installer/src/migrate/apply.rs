@@ -239,6 +239,8 @@ pub fn migrate<E: Exec>(
             plan(m, exec, &mut report)?;
             return Ok(report);
         }
+        // A Mac's kbf.toml is the provisioner's: refuse before anything is stopped or written.
+        daemon_dirs::preflight(m, exec)?;
         let probed = [
             first.old.state.current.clone(),
             first.old.state.previous.clone(),

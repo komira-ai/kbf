@@ -112,7 +112,21 @@ fn host() -> FakeExec {
 }
 
 /// A host with a release installed: `releases/current` is a link.
+/// A Mac's `kbf.toml` as `kbf-mac-provision` leaves it for `raw(Mode::Daemon)`: the keys setup
+/// writes, and `[daemon] update-dir`, which setup only checks on a Mac.
+fn provisioned(mut exec: FakeExec) -> FakeExec {
+    let text = format!(
+        "mode = \"daemon\"\n\n[frontend]\nurl = \"https://farm.example:8443\"\n\n[enroll]\ntoken_file = \"{}\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n",
+        Platform::MacOs.enroll_token()
+    );
+    put(&mut exec, Platform::MacOs.kbf_toml(), 0o640, ROOT, &text);
+    exec
+}
+
 fn released(mut exec: FakeExec, platform: Platform) -> FakeExec {
+    if platform == Platform::MacOs {
+        exec = provisioned(exec);
+    }
     exec.entries.insert(
         hp(&current_release(platform)),
         Entry::Link {
@@ -1449,7 +1463,7 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
 fn a_mac_refuses_the_frontend_and_waits_for_a_release() {
     let err = go(&FakeOs::mac(), &mut host(), &raw(Mode::Frontend), APPLY);
     assert!(matches!(err, Err(SetupError::Unsupported(_))), "{err:?}");
-    let mut exec = host();
+    let mut exec = provisioned(host());
     let out = go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
     assert!(
         cmds(&exec).iter().all(|c| !c.contains("kbf-daemon.plist")),

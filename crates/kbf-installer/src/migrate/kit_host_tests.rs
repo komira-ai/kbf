@@ -189,7 +189,11 @@ fn the_kbf_toml_is_the_kits() {
     let daemon = table["daemon"].as_table().expect("[daemon]");
     let mut got: Vec<&str> = daemon.keys().map(String::as_str).collect();
     got.sort_unstable();
-    assert_eq!(got, ["data-dir", "driver"], "no data-max-bytes by default");
+    assert_eq!(
+        got,
+        ["data-dir", "driver", "update-dir"],
+        "no data-max-bytes by default; update-dir is the provisioner's"
+    );
     assert_eq!(
         daemon["driver"].as_array().map(|a| a.len()),
         Some(1),

@@ -514,7 +514,8 @@ pub fn after_release(
         token_file: v.token_file.as_ref().map(|_| paths::enroll_token(platform)),
         api_token_file: serves_api(v.mode).then_some(paths::api_token(platform)),
         state_store: v.database.as_deref(),
-        update: takes_orders(v.mode).then_some(UpdateDirs {
+        // A Mac's keys are kbf-mac-provision's: checked below, never written.
+        update: (takes_orders(v.mode) && platform != Platform::MacOs).then_some(UpdateDirs {
             update_dir: &update_dir,
             orders_dir: &orders_dir,
         }),
@@ -529,6 +530,16 @@ pub fn after_release(
         }
         None => None,
     };
+    if platform == Platform::MacOs && takes_orders(v.mode) {
+        // No file: provision has not run. A file that is not TOML is `decide`'s to name.
+        let table = current
+            .as_deref()
+            .map_or_else(|| Some(toml::Table::new()), |t| t.parse().ok());
+        if let Some(table) = table {
+            kbf_toml::check_provisioned(&table, &update_dir, &orders_dir)
+                .map_err(SetupError::NeedsOperator)?;
+        }
+    }
     match kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path) {
         Decision::Write(text) => {
             let existed = current.is_some();

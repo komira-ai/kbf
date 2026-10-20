@@ -31,7 +31,7 @@ fn new_bin(rig: &Rig) -> String {
 /// Catches `migrate` answering "nothing to migrate" for a Mac the kit installed, and a
 /// migration that is not whole: both releases adopted from the links, state schema 2 with
 /// `current` and `previous` as the links named them, the plist repointed at the installer's
-/// tree with every other byte kept, the kit's tree untouched and `kbf.toml` with the node's two keys added, the version
+/// tree with every other byte kept, the kit's tree untouched and `kbf.toml` byte for byte (G9), the version
 /// asked of `releases/<sha>/kbf`, and nothing made in the old tools' places (no
 /// `/var/db/kbf-deploy`, no lock file).
 ///
@@ -82,18 +82,12 @@ fn a_kit_host_is_adopted_from_its_links_and_plist_in_both_forms() {
             tree,
             "the kit's tree is kept"
         );
-        // Only the node's two keys are new: the layout's directories, in the `[daemon]` table.
-        let wanted = String::from_utf8(toml).expect("text").replacen(
-            "[daemon]\n",
-            "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\norders-dir = \"/var/db/kbf-installer/orders\"\n",
-            1,
-        );
+        // G9: a Mac's kbf.toml is kbf-mac-provision's, so migrate leaves it byte for byte.
         assert_eq!(
-            fs::read_to_string(at(&rig.host.root, KBF_TOML_PATH)).expect("toml"),
-            wanted,
+            fs::read(at(&rig.host.root, KBF_TOML_PATH)).expect("toml"),
+            toml,
             "{form:?}"
         );
-        assert!(rig.at("var/db/kbf-installer/orders").is_dir());
         assert!(!rig.at("var/db/kbf-deploy").exists());
         assert!(!rig.at("var/run/kbf-deploy.lock").exists());
         let journal = rig.json(&rig.new_state_dir().join("migration.json"));

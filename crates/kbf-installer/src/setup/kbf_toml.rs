@@ -50,6 +50,38 @@ pub struct UpdateDirs<'a> {
 /// The keys of [`UpdateDirs`], as `(table, key)`.
 pub const UPDATE_KEYS: [(&str, &str); 2] = [("daemon", "update-dir"), ("daemon", "orders-dir")];
 
+/// Whether a Mac's `kbf.toml` carries the node's directories as `kbf-mac-provision` renders
+/// them: `[daemon] update-dir` is there and is `update_dir`, and `orders-dir` is absent (the
+/// node derives `<update-dir>/orders`, `kbf_update::Config::new`) or is `orders_dir`. The
+/// installer never writes these on a Mac. The message names the key and prints no path.
+///
+/// # Errors
+/// What is missing or differs, one line.
+pub fn check_provisioned(table: &Table, update_dir: &str, orders_dir: &str) -> Result<(), String> {
+    let refuse = |why: String| {
+        Err(format!(
+            "kbf.toml {why}: kbf-mac-provision renders it (run it again); the installer does not write it on a Mac"
+        ))
+    };
+    for (key, want, required) in [
+        ("update-dir", update_dir, true),
+        ("orders-dir", orders_dir, false),
+    ] {
+        match lookup(table, "daemon", key) {
+            None if required => return refuse(format!("has no [daemon] {key}")),
+            Some(v) => match v.as_str() {
+                None => return refuse(format!("[daemon] {key} is not text")),
+                Some(have) if have != want => {
+                    return refuse(format!("[daemon] {key} is not the installer's directory"));
+                }
+                Some(_) => {}
+            },
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 /// The tables of the file, in the order they are written: every table a setting can be in
 /// (a test renders each mode's file and compares it with its golden, so a missing one fails).
 const TABLE_ORDER: [&str; 9] = [
