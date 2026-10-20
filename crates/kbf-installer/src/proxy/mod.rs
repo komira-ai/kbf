@@ -26,13 +26,16 @@
 //! `status.json` calls installed ([`boot`]). It still cannot run a swap or resume one, or
 //! choose between two live children.
 //!
-//! Still a fake, stated: `RootOrders` (the orders spool and the update API belong to U8b; the
-//! boot reads `status.json` itself). `Migrator` is real in the verb: the cold start's hook is
-//! [`supervisor::host_migrator`], a [`migrator::DbMigrator`] over the database `installer.toml`
-//! names. The swap's `Ports.migrator` has no production caller yet (the verb serves
-//! `NoUpdates`, so no swap runs); when the update API drives one it hands the same
-//! [`migrator::DbMigrator`] to `Ports`.
-
+//! The update API's seams are bound in [`handover`]: the order spool, `status.json`, the
+//! request map and the restart answer are real there, and the supervisor is a refusal until a
+//! swap is run behind the API.
+//!
+//! `Migrator` is real in the verb: the cold start's hook is [`supervisor::host_migrator`], a
+//! [`migrator::DbMigrator`] over the database `installer.toml` names. The swap's
+//! `Ports.migrator` has no production caller yet (no swap runs behind the update API); when
+//! one does, it hands the same [`migrator::DbMigrator`] to `Ports`.
+//! [`root_orders::SpoolRootOrders`] is real and nothing builds it yet.
+//!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
 //!   [`ports::ChildAdmin::resume`].
@@ -118,6 +121,7 @@ pub mod child_http;
 pub mod child_real;
 mod cold;
 pub mod gate_real;
+pub mod handover;
 pub mod migrator;
 pub mod model;
 pub mod orders;

@@ -8,6 +8,7 @@ use hyper::StatusCode;
 
 use super::core::{ApiError, Core, Crash, CrashHook, CrashPoint, Fault, NoCrash, Reply};
 use super::fakes::{COMMIT_C, Rig, facts, idle, req, staged};
+use super::idempotency::Idempotency;
 use super::model::{OldChild, RollbackBlocked, StatusBody, UpdateId, abortable};
 use super::refusal;
 use super::traits::{
@@ -78,6 +79,37 @@ fn post_accepts_and_writes_one_locator_order_and_starts_nothing() {
     assert_eq!(s.from, Some(c(A)));
     assert_eq!(s.to, Some(c(B)));
     assert_eq!(s.phase, Some(Phase::Accepted));
+}
+
+/// Catches a `POST` that spends the installer's work on an update nothing can take over: a
+/// supervisor that says it cannot start refuses the POST with 503 and its own words before
+/// the request id is saved or an order written; the status read still answers; and once the
+/// supervisor can start, the same request id is a fresh request (it was never consumed).
+#[test]
+fn a_supervisor_that_cannot_start_refuses_the_post_before_anything_is_saved_or_written() {
+    let rig = Rig::new("u8b6-blocked");
+    rig.sup.block(Some("handover driver not wired"));
+    let mut core = rig.core();
+    let e = refused(core.post(req(B, "r1")));
+    assert_eq!(
+        (e.status, e.code, e.message.as_str()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "handover_unavailable",
+            "handover driver not wired"
+        )
+    );
+    assert!(written(&rig).is_empty(), "an order was written");
+    assert!(
+        Idempotency::open(&rig.dir).get("r1").is_none(),
+        "the request id was saved"
+    );
+    assert_eq!(body(&mut core).update_id, None);
+
+    rig.sup.block(None);
+    let (_, phase) = accepted(core.post(req(B, "r1")));
+    assert_eq!(phase, Phase::Accepted);
+    assert_eq!(written(&rig).len(), 1);
 }
 
 #[test]
