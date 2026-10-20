@@ -575,3 +575,97 @@ fn a_confirm_that_never_landed_is_not_a_confirm_even_in_the_drain() {
     );
     assert_eq!(w.holders(), vec![Slot::A]);
 }
+
+/// Catches a cold start that starts the release serving: no child holds the generation, so
+/// the release is started waiting and then told to take over.
+#[test]
+fn a_cold_start_starts_the_release_waiting_and_then_takes_over() {
+    let w = draining();
+    w.kill_pid(100);
+    w.kill_pid(101);
+    w.st.borrow_mut().starts.clear();
+    w.proxy_restart();
+    let intent = w.last_intent();
+    let mut swap = Swap::adopt(
+        w.ports(),
+        Plan::resumed(&intent, Timing::frontend()),
+        intent,
+    );
+    assert_eq!(swap.run(), Ok(Phase::Done), "{:#?}", w.log());
+    assert_eq!(since_restart(&w, "admin:takeover B"), 1, "{:#?}", w.log());
+    assert_eq!(
+        since_restart(&w, "admin:takeover B limit 10000 ms"),
+        1,
+        "the cold start passes the plan's limit"
+    );
+    assert_eq!(w.holders(), vec![Slot::B]);
+    assert_eq!(w.st.borrow().starts, vec![(Slot::B, Start::Candidate)]);
+}
+
+/// A restart after the switch with both children dead, ready to cold start the new release.
+fn cold_restart(w: &World) -> Swap<'_> {
+    w.kill_pid(100);
+    w.kill_pid(101);
+    w.proxy_restart();
+    let intent = w.last_intent();
+    Swap::adopt(
+        w.ports(),
+        Plan::resumed(&intent, Timing::frontend()),
+        intent,
+    )
+}
+
+/// Catches held streams that expire silently: a cold start whose takeover finds streams held past
+/// the hold's limit expires them (UNAVAILABLE) and says how many in the update's notes, and the
+/// younger ones are fed to the new child.
+///
+/// Mutants to plant: the note dropped; the count not compared with zero.
+#[test]
+fn a_cold_start_notes_the_held_streams_that_expired_before_it_served() {
+    use super::ports::Gate as _;
+    let w = draining();
+    let mut swap = cold_restart(&w);
+    w.hold(secs(15)).expect("hold");
+    w.hold_streams_aged(2, secs(20));
+    w.hold_streams(1);
+    assert_eq!(swap.run(), Ok(Phase::Done), "{:#?}", w.log());
+    assert_eq!(w.count("gate:expired 2"), 1, "{:#?}", w.log());
+    assert!(
+        swap.notes()
+            .iter()
+            .any(|n| n.contains("2 held streams expired with UNAVAILABLE")),
+        "{:?}",
+        swap.notes()
+    );
+    assert_eq!(w.st.borrow().fed.last(), Some(&(Slot::B, 1)));
+}
+
+/// Catches a cold start that reports a gate refusing the release as an ordinary failed try: the
+/// takeover landed, so the proxy cannot go on (it would route to a dead slot); the restart stops
+/// with the gate's reason, as a halt.
+#[test]
+fn a_gate_that_refuses_the_release_after_a_cold_takeover_halts_the_restart() {
+    let w = draining();
+    let mut swap = cold_restart(&w);
+    w.st.borrow_mut().release_err = true;
+    let Err(Halt::Port(why)) = swap.run() else {
+        panic!("not a halt: {:#?}", w.log());
+    };
+    assert!(why.contains("release refused"), "{why}");
+}
+
+/// Catches a restart that cannot be stopped while it waits for the cold-started child: a stop
+/// during the wait for ready ends the restart as interrupted, with the child left running and
+/// not recorded as gone.
+#[test]
+fn a_shutdown_while_a_cold_started_child_is_awaited_interrupts_the_restart() {
+    let w = draining();
+    w.script(Script {
+        ready_after: None,
+        exit_after: None,
+    });
+    let mut swap = cold_restart(&w);
+    w.set_limit(secs(0));
+    assert_eq!(swap.run(), Err(Halt::Interrupted), "{:#?}", w.log());
+    assert_eq!(w.count("terminate") + w.count("kill pid"), 0);
+}

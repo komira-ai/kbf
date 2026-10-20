@@ -30,8 +30,6 @@ struct World {
     users: BTreeMap<String, (u32, u32)>,
     enabled: BTreeSet<String>,
     active: BTreeSet<String>,
-    /// What `kbf check-args` exits with.
-    check_args: i32,
     /// Whether `swapon --show` lists a swap area.
     swap: bool,
     /// What `ss -Hltn` prints.
@@ -66,7 +64,6 @@ fn host(name: &str) -> (ScratchHost, Rc<RefCell<World>>) {
         ]),
         enabled: BTreeSet::new(),
         active: BTreeSet::new(),
-        check_args: 0,
         swap: true,
         listening: "LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*\n".to_owned(),
     }));
@@ -100,7 +97,6 @@ fn host(name: &str) -> (ScratchHost, Rc<RefCell<World>>) {
             }
             (SWAPON, _) => reply(0, if w.swap { "/swapfile\n" } else { "" }, ""),
             (SS, _) => reply(0, &w.listening, ""),
-            (_, ["check-args", ..]) => reply(w.check_args, "", ""),
             _ => reply(0, "", ""),
         })
     });
@@ -329,9 +325,9 @@ fn the_all_in_one_unit_waits_for_readyz_and_installs_a_new_kbf() {
     );
 }
 
-/// The refusals, each before any step: a key file others can read or another user owns, a file the unit reads missing, a
-/// unit kbf's own parser refuses (rule `parse`), a kbf that is not there, a build node
-/// whose user does not linger, and a storage node with no S3 endpoint set.
+/// The refusals, each before any step: a key file others can read or another user owns, a
+/// file the unit reads missing, a kbf that is not there, a build node whose user does not
+/// linger, and a storage node with no S3 endpoint set.
 /// Catches each of these installed anyway.
 #[test]
 fn an_install_is_refused_before_any_step() {
@@ -387,11 +383,6 @@ fn an_install_is_refused_before_any_step() {
             .insert("kbf".to_owned(), (uid + 1, gid));
     });
     assert!(matches!(&e, HostError::NotOwned { .. }), "{e}");
-    let e = refused("parse", Mode::Daemon, &|_, w| w.borrow_mut().check_args = 2);
-    assert!(
-        matches!(&e, HostError::Units(f) if f.iter().any(|f| f.to_string().starts_with("FAIL parse:"))),
-        "{e}"
-    );
     let e = refused("no-kbf", Mode::Storage, &|exec, _| {
         fs::remove_file(exec.at("/usr/local/bin/kbf")).expect("rm");
     });
@@ -623,22 +614,18 @@ fn optional_environment_files_are_not_required_and_a_directory_is_no_file() {
     );
 }
 
-/// The frontend on a fresh host: its unit, then the SQLite state store's directory made
-/// the server user's alone before the unit starts, and the wait for `/readyz` on the
-/// operator API it now serves (it was refused as not built). Catches the state directory
-/// left for kbf to make (it runs as a user that cannot write under `/var/lib`), a
-/// frontend unit started with no readiness wait, and the frontend refused again.
+/// The frontend on a fresh host: its unit, then the wait for `/readyz` on the operator
+/// API it serves. Its state store is Postgres, which the installer owns, so no state
+/// directory is made for it. Catches a directory made for a SQLite file the frontend no
+/// longer opens, and a frontend unit started with no readiness wait.
 #[test]
-fn the_frontend_unit_is_installed_with_its_state_directory() {
+fn the_frontend_unit_is_installed_with_no_state_directory() {
     let (exec, _) = host("install-mode-frontend");
-    let (uid, gid) = me();
     let a = install(Mode::Frontend, None);
     let (p, _) = plan_here(&exec, &a).expect("plan");
     assert_eq!(
         tail(&p),
         [
-            "mkdir /var/lib/kbf-server (0755)".to_owned(),
-            format!("mkdir /var/lib/kbf-server/state (0700, owner {uid}:{gid})"),
             "run /usr/bin/systemctl daemon-reload".to_owned(),
             "run /usr/bin/systemctl enable kbf-frontend@.service".to_owned(),
             "run /usr/bin/systemctl start kbf-frontend@a.service".to_owned(),
@@ -648,7 +635,9 @@ fn the_frontend_unit_is_installed_with_its_state_directory() {
 }
 
 /// The frontend's unit is a template with two instances, and a serving one is never
-/// restarted: a restart drains it and every new build is refused until the next start.
+/// restarted by the install: a restart drains it and every new build is refused until the
+/// next start. The Postgres unit has no control socket, so the note names the restart and
+/// not `kbf frontend handover`, which would fail.
 /// Catches an update that restarts (or stops) the serving instance instead of leaving the
 /// handover to `kbf frontend handover`, an install that starts the second instance beside
 /// the first (two frontends would ask each other for the listeners), a template enabled
@@ -697,7 +686,8 @@ fn a_serving_frontend_instance_is_not_restarted_by_an_update() {
     );
     assert!(
         out.contains(
-            "kbf-frontend@b.service is serving and is not restarted: run `kbf frontend handover`"
+            "kbf-frontend@b.service is serving and is not restarted: its state store cannot be \
+             handed over: `systemctl restart` it"
         ),
         "{out}"
     );
@@ -788,10 +778,10 @@ fn write_ok(r: &Result<(), HostError>) {
 }
 
 /// The directories each unit's flags make, from the rendered units: the storage-and-daemon
-/// unit's metadata log and hot store beside its data directory, the frontend's state
-/// directory (the parent of the SQLite file, from the flag), the all-in-one's none
-/// beyond its own. Catches a flag whose directory is left to kbf, which makes it as a
-/// user that may not, and a state directory taken from the wrong flag.
+/// unit's metadata log and hot store beside its data directory, the frontend's none (its
+/// state store is Postgres), the all-in-one's none beyond its own. Catches a flag whose
+/// directory is left to kbf, which makes it as a user that may not, and a directory
+/// taken from the wrong flag.
 #[test]
 fn the_directories_come_from_the_flags_the_units_carry() {
     let dirs = |mode: Mode| {
@@ -811,10 +801,41 @@ fn the_directories_come_from_the_flags_the_units_carry() {
             "/var/lib/kbf/hot 700",
         ]
     );
-    assert_eq!(dirs(Mode::Frontend), ["/var/lib/kbf-server/state 700"]);
+    assert_eq!(dirs(Mode::Frontend), Vec::<String>::new());
     assert_eq!(
         dirs(Mode::Storage),
         ["/var/lib/kbf-server/raft 700", "/var/lib/kbf/hot 700"]
+    );
+}
+
+/// A SQLite state file in a directory no other flag makes (the rendered units have none
+/// today: the all-in-one's is in `--data-dir`) gets its directory made, 0700, once. Catches
+/// the directory of a `sqlite://` file left for kbf to make, and one made again beside
+/// the data directory's own mode.
+#[test]
+fn a_sqlite_state_files_directory_is_made_unless_another_flag_made_it() {
+    let dirs = |flags: &str| {
+        let unit = UnitFile::parse(&format!(
+            "[Service]\nExecStart=/usr/local/bin/kbf all-in-one {flags}\n"
+        ))
+        .expect("a unit");
+        directories(&unit)
+            .expect("directories")
+            .into_iter()
+            .map(|(p, bits)| format!("{p} {bits:o}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        dirs("--state-store=sqlite:///srv/kbf/state/state.db"),
+        ["/srv/kbf/state 700"]
+    );
+    assert_eq!(
+        dirs("--data-dir=/srv/kbf --state-store=sqlite:///srv/kbf/state.db"),
+        ["/srv/kbf 755"]
+    );
+    assert_eq!(
+        dirs("--state-store=postgres:///kbf?host=/run/postgresql"),
+        Vec::<String>::new()
     );
 }
 
@@ -887,7 +908,6 @@ fn a_hot_store_the_unit_user_cannot_reach_is_refused() {
             &UnitText::new(a.mode.unit_name(), kbf),
             &UnitText::new(SLICE, slice),
             true,
-            None,
         )
         .expect("checks")
     };
@@ -937,7 +957,6 @@ fn root_is_not_refused_a_hot_store_under_a_0700_directory() {
         &UnitText::new(mode.unit_name(), kbf),
         &UnitText::new(SLICE, slice),
         true,
-        None,
     )
     .expect("checks");
     assert!(
@@ -972,7 +991,6 @@ fn rule_traverse_is_skipped_with_a_note_where_it_cannot_read() {
             &UnitText::new(mode.unit_name(), unit),
             &UnitText::new(SLICE, slice),
             true,
-            None,
         )
         .expect("checks")
     };

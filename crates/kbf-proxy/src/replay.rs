@@ -267,6 +267,11 @@ mod tests {
             );
         }
         assert!(!may_retry(EXEC, Failure::Connect, &b, MAX_ATTEMPTS));
+        // A fenced answer is retried only while the window is open: once an answer closed it,
+        // the request may have had an effect.
+        let mut answered = whole(0);
+        answered.close();
+        assert!(!may_retry(EXEC, Failure::Fenced, &answered, 1));
         // A request that overflowed the buffer is never replayed, even on a refused stream.
         let mut big = ReplayBuffer::new(1);
         assert!(!big.push(2));

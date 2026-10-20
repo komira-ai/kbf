@@ -187,7 +187,15 @@ it is listed `unsupported`, and a rollout halts at it (it never skips a host sil
 
 **ReleaseService.Fetch.** On the worker listener, admitted nodes only (mutual TLS). The argument is 64 lowercase
 hex digits and nothing else; an unknown digest is `NOT_FOUND`. The server never builds a path from anything but the
-validated digest. Chunks are at most 1 MiB. **The caller is the installer's fetch child (section 7.1), not the `kbf` process.**
+validated digest. Chunks are at most 1 MiB. **The caller is the installer's fetch child (section 7.1), not the `kbf` process.** It serves the release's tarballs and its attestation bundles, each under the digest of its bytes.
+
+**ReleaseService.Describe.** For a caller that was given no offer (a `frontend_update` order is a locator). `DescribeRequest{commit, platform}`
+(`platform` optional) returns a `ReleaseDescription{commit, components}`: per described platform, the tarballs a host of it needs, each with
+its `sha256` and `size` and its bundle's `bundle_sha256` and `bundle_size`; a platform is described only when it is complete, as for an offer.
+Admitted as `Fetch` is (one row of the role table). `INVALID_ARGUMENT` for a commit that is not 40 lowercase hex digits or an unknown platform,
+`NOT_FOUND` for a commit with no stored tarball, `FAILED_PRECONDITION` naming what an incomplete platform lacks. The same description is
+`GET /v1/releases/{commit}` as JSON, the file `releases/<commit>.json` of a `url` source (`docs/api.md`). It is a claim; the installer verifies
+what it fetches (`kbf-installer.md` section 5).
 
 **The order, as the node relays it.** `UpdateOrder` is unchanged and carries `order_id`, `epoch`, `verb`, `commit` and
 `window_s`. The "update to commit `<hash>`" order is `VERB_ACTIVATE`. It gains one additive field, `uint64 generation = 6`
@@ -246,7 +254,7 @@ installer verifies each bundle against the pinned root. **Envoy is a dependency,
 never fetches it. Release-manifest and Envoy-component pinning, and cross-version Envoy upgrades, are deferred (section 12).
 
 **The disk index is the source of truth for bytes.** The release store on disk (`files/<sha256>` and
-`index/<commit>/<platform>/<name>`, with attestation bundles) is authoritative for what the frontend can serve. The
+`index/<commit>/<platform>/<name>`, with attestation bundles, which are also named by their digest in `files/`) is authoritative for what the frontend can serve. The
 `update/release/...` rows are metadata over it (digest, size, attestation present); a lost or stale row is rebuilt from
 the disk index, never the reverse. The desired release, the slot, the per-host phase rows and the policy are state-store rows.
 
@@ -259,6 +267,8 @@ the disk index, never the reverse. The desired release, the slot, the per-host p
   exactly one regular file named `<name>`; that is an early failure for mistakes, not trust. Path segments are
   validated (40 lowercase hex, a known platform, a known name) and never joined raw.
 - `GET /v1/releases`: commits with, per platform, which components are present and whether the platform is complete.
+- `GET /v1/releases/{commit}`: the description `ReleaseService.Describe` gives for every complete platform, as JSON (section 5): the
+  files of the release by digest, and the `releases/<commit>.json` of a `url` source.
 - `POST /v1/update/desired {commit}`: the commit needs at least one complete platform (else 409). Compare-and-set
   on `update/desired`; the counter gives the new generation only when the commit differs from the current one.
 - `GET /v1/update`: `{desired, releases}`. The policy fields are set through `POST /v1/update/policy` (admin). There is no auto-update endpoint.
@@ -272,14 +282,21 @@ keeps one offer per complete platform; each session sends its node's platform of
 `Welcome` and whenever that offer changes (the same offer is never sent twice on a session).
 A look that fails keeps the table. The node's platform is read from its first `Hello`.
 The rollout controller (`kbf-server/src/update`) runs on the frontend with a state store, once a
-farm tick, and starts no host unless `update/policy.auto_nodes` is true (hosts already in a step
-are always moved). Its orders go out as `UpdateOrder` on the host's stream with the `Welcome`
+farm tick, and starts no host when an operator wrote `update/policy.auto_nodes` false or paused the
+run (a policy never written reads as `auto_nodes` true: the desired write is the click; hosts already
+in a step are always moved). Its orders go out as `UpdateOrder` on the host's stream with the `Welcome`
 epoch (an order of another epoch is refused before it is sent); a confirmation carries an id
 of its own, drawn from the order counter, because a node drops a repeated id. Its facts come
-from the farm and each node's `UpdateStatus` of its current stream. **Not yet:** hosts with a
-storage half are never started (the planned-down mark and the member join are U3, #914, in
-`feature/arch-v2`), and no operator action starts a run with `auto_nodes` off.
+from the farm and each node's `UpdateStatus` of its current stream. A Linux host
+is joined to its storage member by the address it advertised at enrollment, matched exactly; the
+mark is `Members::plan_down` and its undoing `Members::undo_plan`; a host that matches no member is
+never started. **Not yet:** no operator action starts a run with `auto_nodes` written off.
 `GET /v1/nodes` lists `update` per node and `GET /v1/update/hosts` its detail (`docs/api.md`).
+
+**Mixed versions.** `auto_nodes` is a plain bool in the `update/policy` row, so a row that does not
+carry it reads false; a policy row that was never written reads as the defaults, true. An old frontend's
+`set_paused` on a never-written row stores a row without `auto_nodes`, so a new frontend reads `auto_nodes`
+off after the resume until an operator writes `true`.
 
 After `Welcome`, and to every connected node at every change of the desired release or of a platform's
 completeness, the frontend sends an `UpdateOffer` for that node's platform. `UpdateStatus` is kept as the newest per

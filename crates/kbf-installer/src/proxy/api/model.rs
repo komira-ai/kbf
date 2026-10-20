@@ -12,8 +12,8 @@ use crate::proxy::model::{Failure, Phase, Slot};
 #[serde(transparent)]
 pub struct UpdateId(pub String);
 
-/// The old child's counters: streams are counted by the proxy, executions and queued
-/// operations are reported by the child (Q8; `open_sessions` is dropped).
+/// The old child's counters: streams are counted by the proxy; `open_executions` and
+/// `queued_operations` are the wire's fields for what the child reports of itself (Q8).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OldChild {
     pub open_streams: u64,

@@ -78,6 +78,12 @@
 mod stages;
 mod yaml;
 
+mod jobs;
+pub use jobs::{
+    dispatch_inputs, job_env, job_environment, job_needs, job_outputs, job_permission_levels,
+    push_filters,
+};
+
 use yaml::{Node, Value};
 
 /// The keys GitHub reads at the top of a workflow file.
@@ -300,6 +306,19 @@ pub fn job_condition(text: &str, job: &str) -> Result<Option<String>, String> {
             .map(|c| Some(c.to_owned()))
             .ok_or_else(|| format!("the `if:` of job `{job}` is not a string")),
     }
+}
+
+/// The names of the jobs of a workflow text, in file order. An error when the text does not
+/// parse or has no `jobs` mapping.
+pub fn job_names(text: &str) -> Result<Vec<String>, String> {
+    let root = yaml::load(text)?;
+    let Some(Value::Map(jobs)) = get(top_of(&root)?, "jobs").map(|j| &j.value) else {
+        return Err("the workflow has no `jobs` mapping".to_owned());
+    };
+    Ok(jobs
+        .iter()
+        .filter_map(|(k, _)| k.as_str().map(str::to_owned))
+        .collect())
 }
 
 /// One step with a `run:` script, in a workflow job or an action file's composite

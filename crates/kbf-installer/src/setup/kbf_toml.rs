@@ -1,4 +1,4 @@
-//! The `/etc/kbf/kbf.toml` that `setup` writes: the host's mode, the frontend URL and the
+//! The `kbf.toml` (`/etc/kbf`, `/usr/local/etc/kbf` on a Mac) that `setup` writes: the host's mode, the frontend URL and the
 //! enrollment token's path (the keys enrollment reads, `kbf-enroll`'s `KEYS`), and on a host
 //! that serves the operator API, the path of its token (`api-token-file`, group `tls`) and, on a
 //! host that keeps its state in Postgres, the database (`state-store`, group `scheduler`).
@@ -104,8 +104,9 @@ fn has_other_settings(table: &Table) -> bool {
     })
 }
 
-/// Decide what `setup` does with the existing file `current` (`None`: there is none).
-pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
+/// Decide what `setup` does with the existing file `current` (`None`: there is none), which
+/// is at `path` (named in what it refuses).
+pub fn decide(current: Option<&str>, ours: &Ours<'_>, path: &str) -> Decision {
     let wanted = ours.render();
     let Some(text) = current else {
         return Decision::Write(wanted);
@@ -118,8 +119,8 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
         Err(e) => {
             return Decision::Refuse(format!(
                 "{} is not valid TOML ({}): fix it or remove it, then run setup again",
-                super::paths::KBF_TOML,
-                e.message()
+                path,
+                crate::installer_toml::redact(e.message())
             ));
         }
     };
@@ -133,6 +134,9 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
         .map(|(at, key, value)| {
             if at.is_empty() {
                 format!("{key} should be {value:?}")
+            } else if at == "scheduler" {
+                // The database URL is never printed, not even one without a password.
+                format!("[{at}] {key} should be the --database URL")
             } else {
                 format!("[{at}] {key} should be {value:?}")
             }
@@ -143,7 +147,7 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>) -> Decision {
     } else {
         Decision::Refuse(format!(
             "{} holds other settings and these keys differ from the flags ({}): edit them by hand",
-            super::paths::KBF_TOML,
+            path,
             differ.join("; ")
         ))
     }

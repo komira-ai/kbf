@@ -7,6 +7,7 @@
 //! A recorded process that is gone or whose pid now belongs to another process is not
 //! ours: nothing signals it.
 
+use super::cold::{Cold, ColdError, ReadyRule};
 use super::model::{Failure, Halt, Intent, Phase, Plan, Slot, Step};
 use super::ports::Ports;
 use super::swap::{Flow, Swap};
@@ -196,12 +197,12 @@ impl<'a> Swap<'a> {
     /// Start `release` in `slot` where no child serves, wait until it is ready, make it
     /// take the generation (with no live holder the child bumps the epoch: FP section 8)
     /// and route to it. The process is recorded as soon as it exists. `Err` is the reason
-    /// it did not come up.
+    /// it did not come up. The steps are [`Cold`]'s, which the proxy's boot runs too.
     fn cold_start(&mut self, slot: Slot, release: &CommitId) -> Result<Result<(), String>, Halt> {
-        let t = self.plan.timing;
-        let ident = match self.ports.child.spawn(slot, release) {
+        let cold = self.cold();
+        let ident = match cold.spawn(slot, release) {
             Ok(i) => i,
-            Err(e) => return Ok(Err(format!("spawn: {e}"))),
+            Err(e) => return Ok(Err(e.to_string())),
         };
         if slot == self.intent.old_slot {
             self.intent.old_proc = Some(ident.clone());
@@ -211,31 +212,44 @@ impl<'a> Swap<'a> {
             self.new_alive = true;
         }
         self.save()?;
-        let first = self.now();
-        loop {
-            if let Some(code) = self.ports.child.exited(&ident) {
-                self.mark_gone(slot);
-                return Ok(Err(format!("the new process exited with {code}")));
+        match cold.await_ready(slot, &ident) {
+            Ok(()) => {}
+            Err(ColdError::Stopped(halt)) => return Err(halt),
+            Err(e) => {
+                if matches!(e, ColdError::Exited(_)) {
+                    self.mark_gone(slot);
+                }
+                return Ok(Err(e.to_string()));
             }
-            if matches!(self.ports.admin.ready(slot), Ok(r) if r.all()) {
-                break;
-            }
-            if self.now().saturating_sub(first) >= t.ready_within {
-                return Ok(Err(format!("not ready in {} s", t.ready_within.as_secs())));
-            }
-            self.sleep(t.poll)?;
         }
         self.cold_takeover(slot)
     }
 
     /// Make `slot`, the only live child, take the generation and serve.
     fn cold_takeover(&mut self, slot: Slot) -> Result<Result<(), String>, Halt> {
-        let t = self.plan.timing;
-        if let Err(e) = self.ports.admin.takeover(slot, t.takeover) {
-            return Ok(Err(format!("takeover: {e}")));
+        match self.cold().take_over(slot) {
+            Ok(expired) => {
+                if expired > 0 {
+                    self.note(format!("{expired} held streams expired with UNAVAILABLE"));
+                }
+                self.active = slot;
+                Ok(Ok(()))
+            }
+            Err(e @ ColdError::Takeover(_)) => Ok(Err(e.to_string())),
+            Err(e) => Err(Halt::Port(e.to_string())),
         }
-        self.release_held(slot)?;
-        Ok(Ok(()))
+    }
+
+    fn cold(&self) -> Cold<'a> {
+        let ports = self.ports;
+        Cold {
+            child: ports.child,
+            admin: ports.admin,
+            gate: ports.gate,
+            clock: ports.clock,
+            timing: self.plan.timing,
+            ready: ReadyRule::Full,
+        }
     }
 
     /// The proxy stopped inside a rollback (the intent says so; no phase does). The store

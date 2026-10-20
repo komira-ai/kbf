@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 
 use kbf_host::exec::Entry;
-use kbf_host::step::{Owner, Perms};
+use kbf_host::step::{Cmd, Owner, Perms};
 use kbf_host::testkit::{FakeExec, reply};
 
 use super::*;
@@ -29,6 +29,32 @@ fn first_in_service(text: &str, line: &str) -> String {
 fn last_in_service(text: &str, line: &str) -> String {
     assert_eq!(text.matches("\n[Install]\n").count(), 1);
     text.replace("\n[Install]\n", &format!("\n{line}\n\n[Install]\n"))
+}
+
+/// `value` as the unit's `--state-store`: in the place of the one the unit gives (the last
+/// one wins, so a second flag before it would change nothing), else as a new flag.
+///
+/// A frontend whose store is not Postgres hands over, so its unit gets the control socket
+/// and the preserved directory the rule `handover` then asks for: the defect planted is
+/// the store alone.
+fn with_state_store(mode: Mode, text: &str, value: &str) -> String {
+    let flag = format!("--state-store={value}");
+    let text = match text.find("--state-store=") {
+        Some(at) => {
+            let end = text[at..].find([' ', '\n']).map_or(text.len(), |i| at + i);
+            format!("{}{flag}{}", &text[..at], &text[end..])
+        }
+        None => text.replacen(&format!("/kbf {mode}"), &format!("/kbf {mode} {flag}"), 1),
+    };
+    if mode != Mode::Frontend {
+        return text;
+    }
+    let socket = " --handover-socket=/run/kbf-frontend/control.sock";
+    let text = text.replacen(&flag, &format!("{flag}{socket}"), 1);
+    first_in_service(
+        &text,
+        "RuntimeDirectory=kbf-frontend\nRuntimeDirectoryPreserve=yes",
+    )
 }
 
 /// One planted defect: its rule, what it does to a mode's rendered unit, and the modes
@@ -198,34 +224,18 @@ fn rows() -> Vec<Row> {
             },
             fails: BUILDS,
         },
-        // The metadata log put under the daemon's data directory.
+        // A state store that is neither scheme (any mode that gives one), and a SQLite
+        // file in the frontend's unit, which is Postgres only. The other modes take the
+        // SQLite file: the all-in-one's own unit names one.
         Row {
-            rule: "meta-dir",
-            plant: |_, t| match t.lines().find(|l| l.contains("--meta-dir=")) {
-                Some(l) => t.replace(l, &format!("    --meta-dir={}/raft \\", config().data_dir)),
-                None => t.to_owned(),
-            },
-            fails: &[Mode::StorageAndDaemon, Mode::AllInOne],
+            rule: "state-store",
+            plant: |m, t| with_state_store(m, t, "file:///var/lib/kbf/state"),
+            fails: ALL,
         },
         Row {
             rule: "state-store",
-            // The frontend's unit gives a state store already (the last one wins): put the
-            // Postgres URI in its place; the other modes get it as a new flag.
-            plant: |m, t| {
-                if t.contains("--state-store=sqlite://") {
-                    t.replace(
-                        "--state-store=sqlite://",
-                        "--state-store=postgres://db/kbf#",
-                    )
-                } else {
-                    t.replacen(
-                        &format!("/kbf {m}"),
-                        &format!("/kbf {m} --state-store=postgres://db/kbf"),
-                        1,
-                    )
-                }
-            },
-            fails: ALL,
+            plant: |m, t| with_state_store(m, t, "sqlite:///var/lib/kbf/state.db"),
+            fails: &[Mode::Frontend],
         },
         // A failure that repeats quickly ends in start-limit-hit: no delay, or a limit.
         Row {
@@ -301,8 +311,8 @@ fn file(bits: u32, uid: u32, text: &str) -> Entry {
     }
 }
 
-/// A node with kbf installed, and a key file `key`; kbf refuses every command line
-/// (`check-args` exits 2) and `getent passwd kbf-server` is uid 990.
+/// A node with kbf installed, and a key file `key`, and `getent passwd kbf-server` is
+/// uid 990.
 fn node(key: Entry) -> FakeExec {
     let mut exec = FakeExec::new(0);
     let at = |p: &str| HostPath::new(p).expect("absolute");
@@ -325,9 +335,8 @@ fn node(key: Entry) -> FakeExec {
     exec
 }
 
-/// The rules that read the node, per mode: `parse` runs kbf for every mode;
-/// `credential` reads the key file's owner and mode only for the units that hold it
-/// (a 0640 key or one another user owns fails storage and storage-and-daemon, and no
+/// The rules that read the node, per mode: `credential` reads the key file's owner and
+/// mode only for the units that hold it (a 0640 key or one another user owns fails storage and storage-and-daemon, and no
 /// other; a key the server user owns passes storage and fails storage-and-daemon, whose
 /// key is root's alone).
 /// Catches each of these run on the wrong modes or on none.
@@ -338,8 +347,7 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
         SLICE,
         shared::render_slice(&c, Some(1500)).expect("renders"),
     );
-    let cases: [(&str, Entry, &[Mode]); 4] = [
-        ("parse", file(0o600, 0, ""), &Mode::ALL),
+    let cases: [(&str, Entry, &[Mode]); 3] = [
         (
             "credential",
             file(0o640, 0, ""),
@@ -362,18 +370,17 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
         for mode in Mode::ALL {
             let text = render(&c, Some(1500), mode).expect("renders");
             let unit = UnitText::new(mode.unit_name(), text);
-            let r = check_on_host(&exec, &c, mode, &unit, &slice, true, None).expect("runs");
+            let r = check_on_host(&exec, &c, mode, &unit, &slice, true).expect("runs");
             let hits = r.failures.iter().filter(|f| f.rule == rule).count();
             let want = usize::from(fails.contains(&mode));
             if hits != want {
                 wrong.push(format!("{rule} on {mode}: {:?}", lines(&r)));
             }
-            // No other node rule fires on the clean node (`parse` aside, which this kbf
-            // refuses).
+            // No other node rule fires on the clean node.
             let others: Vec<String> = r
                 .failures
                 .iter()
-                .filter(|f| f.rule != rule && f.rule != "parse")
+                .filter(|f| f.rule != rule)
                 .map(ToString::to_string)
                 .collect();
             if !others.is_empty() {
@@ -382,4 +389,27 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
         }
     }
     assert_eq!(wrong, Vec::<String>::new());
+}
+
+/// The test-farm layout: the metadata log under the daemon's data directory
+/// (`KBF_DATA_DIR=/var/lib/kbf`, `KBF_META_DIR=/var/lib/kbf/av2-meta`). `install-units`
+/// renders it, so `check-units` must pass every unit it renders. Catches a rule that
+/// refuses a layout the same tool wrote (a removed rule did, on every
+/// `storage-and-daemon` node).
+#[test]
+fn every_unit_install_units_renders_passes_check_units_with_meta_under_data() {
+    let text = EXAMPLE.replace(
+        "KBF_META_DIR=/var/lib/kbf-server/raft",
+        "KBF_META_DIR=/var/lib/kbf/av2-meta",
+    );
+    assert!(text.contains("KBF_META_DIR=/var/lib/kbf/av2-meta"));
+    let c = LinuxConfig::parse(&text).expect("valid settings");
+    assert_eq!(c.data_dir.to_string(), "/var/lib/kbf");
+    for mode in Mode::ALL {
+        let unit = render(&c, Some(1500), mode).expect("renders");
+        let r = check(&c, mode, &unit, true).expect("a unit");
+        assert_eq!(lines(&r), Vec::<String>::new(), "{mode}");
+    }
+    let unit = render(&c, Some(1500), Mode::StorageAndDaemon).expect("renders");
+    assert!(unit.contains("--meta-dir=/var/lib/kbf/av2-meta"), "{unit}");
 }

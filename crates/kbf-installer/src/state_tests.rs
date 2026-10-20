@@ -1,6 +1,7 @@
 use std::fs::TryLockError;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -52,7 +53,46 @@ fn the_lock_is_held_while_a_locked_lives() {
     );
     held.write(&full_state()).expect("write");
     drop(held);
-    other.try_lock().expect("free once dropped");
+    free_once_dropped(&other);
+}
+
+/// The lock on `other` is free the moment the holder is dropped: one try, no wait.
+///
+/// `Locked`'s `Drop` unlocks explicitly, so a child forked meanwhile and still holding a
+/// duplicate of the descriptor does not keep the `flock` held.
+fn free_once_dropped(other: &File) {
+    other
+        .try_lock()
+        .expect("the lock is free once its holder is dropped");
+}
+
+/// Catches a lock that is not released once its holder is dropped while processes are being
+/// spawned: the drop must free it for good, though a forked child briefly keeps a duplicate
+/// of the descriptor.
+///
+/// Mutant: the `Drop` of `Locked` removed (the close alone releases the lock): with the
+/// spawner thread running, the single `try_lock` failed 6 of 300 rounds before the unlock
+/// on drop. `tests/state_lock.rs` holds the deterministic version with a forked child.
+#[test]
+fn the_lock_is_free_after_a_drop_while_children_are_spawned() {
+    let (root, dir) = host_root("deploy-host-state-lock-spawn");
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawner = {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = std::process::Command::new("/bin/true").status();
+            }
+        })
+    };
+    for _ in 0..300 {
+        let held = Locked::acquire(&root).expect("lock");
+        let other = File::open(dir.join("run/kbf-installer/lock")).expect("the lock file exists");
+        drop(held);
+        free_once_dropped(&other);
+    }
+    stop.store(true, Ordering::Relaxed);
+    spawner.join().expect("spawner");
 }
 
 /// Catches a lock file or state file another user can read or write: the state says
@@ -199,6 +239,20 @@ fn a_state_this_build_does_not_know_is_refused() {
         );
         assert!(err.to_string().contains(why), "{text}: {err}");
     }
+}
+
+/// Catches a lock file that cannot be opened being read as a lock that was taken: with the
+/// lock's directory made and a directory where the file goes, `acquire` ends with the lock
+/// error naming the lock file.
+#[test]
+fn a_lock_file_that_cannot_be_opened_is_a_lock_error_naming_it() {
+    let (root, dir) = host_root("lock-file-is-a-directory");
+    fs::create_dir_all(dir.join("run/kbf-installer/lock")).expect("a directory for the file");
+    let err = Locked::acquire(&root).expect_err("cannot open");
+    assert!(
+        matches!(&err, StateError::Lock { path, .. } if path.ends_with("kbf-installer/lock")),
+        "{err}"
+    );
 }
 
 /// Catches errors read as "no state" or passed over: a lock whose directory is missing,

@@ -324,3 +324,125 @@ fn a_control_character_in_the_database_url_is_escaped() {
     let back: toml::Table = format!("k = {rendered}").parse().expect("valid TOML");
     assert_eq!(back["k"].as_str(), Some("a\u{1}b\tc"));
 }
+
+/// Catches a message that repeats text a person may have put a credential in. A syntax error
+/// names its line and the parser's reason, not the line; a URL with user information, a query
+/// or a fragment is refused by rule, without the URL. (`password` is what must not appear.)
+///
+/// Mutants to plant: `Syntax(e.to_string())`; the URL back in either refusal.
+#[test]
+fn a_refusal_never_repeats_the_text_that_may_hold_a_password() {
+    let found = problems("confirm_window_s = 900\ndatabase = postgres://u:password@h/db\n");
+    assert!(found.contains("line 2:"), "{found}");
+    for text in [
+        "database = postgres://u:password@h/db\n",
+        "release_source = \"url\"\nrelease_url = \"https://u:password@h/x\"\n",
+        "release_source = \"url\"\nrelease_url = \"https://h/x?token=password\"\n",
+        "release_source = \"url\"\nrelease_url = \"https://h/x#password\"\n",
+    ] {
+        let found = problems(text);
+        assert!(!found.contains("password"), "{text:?}: {found}");
+    }
+    let found = problems("release_source = \"url\"\nrelease_url = \"https://u:password@h/x\"\n");
+    assert!(found.contains("must not carry user information"), "{found}");
+    // The flags go through the same check.
+    let found = https_base_named("--release-url", "https://u:password@h/x").expect_err("refused");
+    assert!(
+        !found.contains("password") && found.starts_with("--release-url"),
+        "{found}"
+    );
+}
+
+/// Catches a value typed into the wrong place reaching a message: the URL is planted as a
+/// key, a table header, a value of the wrong type and a value of a key that checks it, and
+/// neither `Display` nor `Debug` of the error may hold it. (`PW` is the password.)
+///
+/// Mutants to plant: `redact` returning the message as it came; a `{v:?}`, `{r:?}` or
+/// `{other:?}` back in the key checks.
+#[test]
+fn a_value_in_the_wrong_place_is_never_repeated() {
+    const URL: &str = "postgres://u:PW@h/x";
+    for text in [
+        format!("\"{URL}\" = 1\n"),
+        format!("[\"{URL}\"]\n"),
+        format!("confirm_window_s = \"{URL}\"\n"),
+        format!("source_refs = [\"{URL}\"]\n"),
+        format!("release_source = \"{URL}\"\n"),
+        format!("node_cert = \"{URL}\"\nnode_key = \"{URL}\"\n"),
+        format!("database = [\"{URL}\"]\n"),
+        format!("database = {URL}\n"),
+    ] {
+        let err = InstallerToml::parse(&text).expect_err("refused");
+        let shown = format!("{err} {err:?}");
+        assert!(
+            !shown.contains("PW") && !shown.contains("postgres:"),
+            "{text:?}: {shown}"
+        );
+    }
+    // The URL schemes the check meets before it knows the URL is not https.
+    for url in [
+        "http://u:PW@h/x",
+        "HTTPS://u:PW@h/x",
+        "postgres://u:PW@h/x",
+        "http://h/x?token=PW",
+    ] {
+        let found = url_problem(url);
+        assert!(!found.contains("PW"), "{url}: {found}");
+        for label in ["--release-url", "--frontend-url"] {
+            let found = https_base_named(label, url).expect_err("refused");
+            assert!(!found.contains("PW") && found.starts_with(label), "{found}");
+        }
+    }
+}
+
+/// Catches the line number counted from the end of the error's span instead of its start, and
+/// the arm for an error with no span (a `custom` one) going unrun.
+#[test]
+fn a_syntax_error_names_the_line_it_starts_on() {
+    let text = "confirm_window_s = 900\nfetch_timeout_s = [\n1,\n2\n]\n";
+    let found = problems(text);
+    assert!(found.contains("line 2:"), "{found}");
+    let custom = <toml::de::Error as serde::de::Error>::custom("a reason `with text`");
+    assert_eq!(
+        syntax_line("x", &custom),
+        "a reason (the text is not shown)"
+    );
+}
+
+const PROXY: &str = r#"
+[proxy]
+listen = "192.0.2.10:8443"
+operator_token_file = "/etc/kbf/operator.token"
+server_cert_file = "/etc/kbf/tls/server.pem"
+server_key_file = "/etc/kbf/tls/server.key"
+client_ca_file = "/etc/kbf/tls/ca.pem"
+
+[proxy.upstream]
+base_port = 18000
+"#;
+
+/// Catches `render` dropping the operator's `[proxy]` table (a `setup` run that rewrites the
+/// file would erase it, and with it `listen`): the rendered file parses back to the same
+/// table, and a second render is byte for byte the first.
+#[test]
+fn the_proxy_table_survives_a_render() {
+    let parsed = InstallerToml::parse(PROXY).expect("parses");
+    let listen = parsed.proxy.as_ref().and_then(|p| p.listen);
+    assert_eq!(listen, Some("192.0.2.10:8443".parse().unwrap()));
+    let text = parsed.render();
+    assert_eq!(InstallerToml::parse(&text).expect("parses back"), parsed);
+    assert_eq!(InstallerToml::parse(&text).unwrap().render(), text);
+    assert!(
+        text.contains("\n[proxy]\n") && text.contains("[proxy.upstream]"),
+        "{text}"
+    );
+}
+
+/// Catches `listen` reaching the file unchecked, and the message echoing the value: the
+/// refusal names the key, as the file's others do.
+#[test]
+fn a_bad_proxy_listen_names_the_key_not_the_value() {
+    let why = problems(&PROXY.replace("192.0.2.10:8443", "farm.example:8443"));
+    assert!(why.contains("listen"), "{why}");
+    assert!(!why.contains("farm.example"), "{why}");
+}

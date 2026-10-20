@@ -2,24 +2,18 @@ use std::cell::RefCell;
 use std::os::unix::fs::MetadataExt;
 
 use super::*;
+use kbf_testkit::dir::TestDir;
 
-/// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("xtask-pkg-unit")
-        .join(format!("{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// An empty directory of its own for one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    let beside = std::env::current_exe().expect("test binary");
+    let deps = beside.parent().expect("deps");
+    TestDir::under(deps.join("xtask-pkg-unit"), name)
 }
 
 /// The inputs a package is built from, in `dir`.
 struct Tree {
-    dir: PathBuf,
+    dir: TestDir,
 }
 
 impl Tree {
@@ -107,7 +101,7 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.put("units/other.service", "x");
                 t.inputs()
             },
-            "other.service: a package unit is named kbf-*.service",
+            "other.service: a package unit is named kbf-*.service or kbf-*.socket",
         ),
         (
             "a unit that is a timer",
@@ -115,7 +109,7 @@ fn the_plan_refuses_what_the_package_does_not_ship() {
                 t.put("units/kbf-gc.timer", "x");
                 t.inputs()
             },
-            "kbf-gc.timer: a package unit is named kbf-*.service",
+            "kbf-gc.timer: a package unit is named kbf-*.service or kbf-*.socket",
         ),
         (
             "a directory among the units",
@@ -453,7 +447,7 @@ impl Model {
 fn built(
     name: &str,
     leave: impl Fn(&str, &str) -> Vec<(String, String)>,
-) -> (Result<Vec<String>, Error>, PathBuf, Model) {
+) -> (Result<Vec<String>, Error>, TestDir, Model) {
     let dir = scratch(name);
     let source = dir.join("kbf-installer");
     std::fs::write(&source, "binary").expect("source");
@@ -471,7 +465,8 @@ fn built(
         epoch: 77,
     };
     let result = super::build(&mut model.nfpm(&source, leave), &build);
-    (result, out, model)
+    // The caller holds the directory, which the output is in, until it is done.
+    (result, dir, model)
 }
 
 /// Package bytes that depend on the environment's time only.
@@ -485,7 +480,8 @@ fn by_epoch(format: &str, seen: &str) -> Vec<(String, String)> {
 
 #[test]
 fn a_package_that_depends_on_the_epoch_alone_is_built_twice_and_the_same() {
-    let (result, out, model) = built("build-same", by_epoch);
+    let (result, dir, model) = built("build-same", by_epoch);
+    let out = dir.join("out");
     let printed = result.expect("reproducible");
     assert_eq!(printed.len(), 2);
     assert!(printed[0].ends_with("kbf-installer.deb"), "{printed:?}");
@@ -676,6 +672,36 @@ fn a_unit_that_is_neither_a_service_nor_the_slice_is_refused() {
     let got = refused(plan(&t.inputs()));
     assert!(got.contains("kbf-x.timer"), "{got}");
     assert!(!got.contains("kbf.slice:"), "{got}");
+}
+
+/// A `kbf-*.socket` is packaged beside its service, in the same directory and mode.
+#[test]
+fn a_socket_unit_is_packaged_beside_the_services_with_the_same_mode() {
+    let t = Tree::new("socket");
+    t.put("units/kbf-x.socket", "[Socket]");
+    t.put("units/other.socket", "[Socket]");
+    let got = refused(plan(&t.inputs()));
+    assert!(
+        got.contains("other.socket: a package unit is named"),
+        "{got}"
+    );
+    assert!(!got.contains("kbf-x.socket:"), "{got}");
+    std::fs::remove_file(t.dir.join("units/other.socket")).expect("rm");
+    let entries = plan(&t.inputs()).expect("a socket is a plan");
+    let find = |n: &str| {
+        entries
+            .iter()
+            .find(|e| e.dst.ends_with(&format!("/{n}")))
+            .map(|e| (e.dst.clone(), e.mode))
+            .expect(n)
+    };
+    let (sock, sock_mode) = find("kbf-x.socket");
+    let (svc, svc_mode) = find("kbf-node.service");
+    assert_eq!(sock_mode, svc_mode);
+    assert_eq!(
+        sock.rsplit_once('/').map(|p| p.0),
+        svc.rsplit_once('/').map(|p| p.0)
+    );
 }
 
 #[test]

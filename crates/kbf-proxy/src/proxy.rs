@@ -21,6 +21,7 @@ use crate::core::{Core, now};
 use crate::identity::{ProxySecret, SecretOrigin, admin_headers};
 use crate::metrics::Metrics;
 use crate::pool::tcp_connector;
+use crate::probe::poll;
 use crate::security::Security;
 use crate::serve::serve;
 use crate::slot::{ActiveSlot, HoldGuard};
@@ -69,8 +70,7 @@ impl Proxy {
         let (slots, startup) = ActiveSlot::starting(hold_max);
         let metrics = Arc::new(Metrics::default());
         let paths = TlsPaths {
-            cert: cfg.server_cert_file,
-            key: cfg.server_key_file,
+            certs: cfg.cert_entries(),
             client_ca: cfg.client_ca_file,
         };
         let tls =
@@ -140,6 +140,7 @@ impl ProxyRunner {
         runtime.block_on(async move {
             let abandon = Arc::clone(&core);
             tokio::spawn(async move { abandon.abandon_startup_after(hold_max).await });
+            tokio::spawn(poll(Arc::clone(&core)));
             serve(core, updates, listener, Acceptor::Tls(tls), stopped).await;
         });
         Ok(())

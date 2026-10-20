@@ -39,6 +39,8 @@ struct Rig {
     leases: FakeLeases,
     /// The restarts the start-up made (the links were missing and were made).
     base: usize,
+    /// The unit the helper restarts.
+    unit: String,
     platform: Platform,
     /// The service manager and the process table.
     service: ServiceRecorder,
@@ -101,8 +103,42 @@ impl Rig {
         Rig::build(name, Platform::Linux, 0, true)
     }
 
+    /// A frontend host that has no release yet, as `setup` finds it: no state, no links, no
+    /// service running. The first release comes from `setup`, not from the rig.
+    fn bare_frontend(name: &str) -> Rig {
+        Rig::seeded(name, Platform::Linux, 0, true, false, UNIT)
+    }
+
     /// The same host with `min_activation_interval_secs` set.
     fn build(name: &str, platform: Platform, min_interval: u64, frontend_host: bool) -> Rig {
+        Rig::build_as(name, platform, min_interval, frontend_host, UNIT)
+    }
+
+    /// The same host on Linux, its helper restarting `unit`.
+    fn restarting(name: &str, unit: &str) -> Rig {
+        Rig::build_as(name, Platform::Linux, 0, false, unit)
+    }
+
+    fn build_as(
+        name: &str,
+        platform: Platform,
+        min_interval: u64,
+        frontend_host: bool,
+        unit: &str,
+    ) -> Rig {
+        Rig::seeded(name, platform, min_interval, frontend_host, true, unit)
+    }
+
+    /// The host, running release A or (`running` false) with nothing installed, its helper
+    /// restarting `unit`.
+    fn seeded(
+        name: &str,
+        platform: Platform,
+        min_interval: u64,
+        frontend_host: bool,
+        running: bool,
+        unit: &str,
+    ) -> Rig {
         let mut host = ScratchHost::new(&format!("helper-{name}"));
         let root = host.root.clone();
         for sub in [
@@ -115,31 +151,32 @@ impl Rig {
         ] {
             fs::create_dir_all(root.join(sub)).expect("seed");
         }
-        let dir = root.join("var/lib/kbf-installer/releases").join(A);
-        fs::create_dir_all(&dir).expect("release");
-        fs::write(dir.join("kbf"), b"binary").expect("binary");
-        let service = ServiceRecorder::running(
-            4242,
-            root.join("var/lib/kbf-installer/releases")
-                .join(A)
-                .join("kbf"),
-        );
+        let service = if running {
+            let dir = root.join("var/lib/kbf-installer/releases").join(A);
+            fs::create_dir_all(&dir).expect("release");
+            fs::write(dir.join("kbf"), b"binary").expect("binary");
+            ServiceRecorder::running(4242, dir.join("kbf"))
+        } else {
+            ServiceRecorder::default()
+        };
         host.answer = service.answer();
         let layout = Layout::new(Root::new(&root).expect("absolute"), platform);
         if frontend_host {
             write_kbf_toml(&layout, "mode = \"frontend\"\n");
         }
-        Locked::acquire(&layout)
-            .expect("lock")
-            .write(&State {
-                current: Some(c(A)),
-                ..State::default()
-            })
-            .expect("state");
+        if running {
+            Locked::acquire(&layout)
+                .expect("lock")
+                .write(&State {
+                    current: Some(c(A)),
+                    ..State::default()
+                })
+                .expect("state");
+        }
         let cfg = Config {
             update_dir: kbf_host::HostPath::new("/var/lib/kbf-installer").expect("path"),
             orders_dir: kbf_host::HostPath::new("/var/lib/kbf-installer/orders").expect("path"),
-            restart: Restart::Systemd(UNIT.to_owned()),
+            restart: Restart::Systemd(unit.to_owned()),
             window_secs: 600,
             starts: 3,
             min_activation_interval_secs: min_interval,
@@ -162,6 +199,7 @@ impl Rig {
             fetcher,
             leases,
             base: 0,
+            unit: unit.to_owned(),
             platform,
             service,
         };
@@ -227,7 +265,7 @@ impl Rig {
             .exec()
             .log
             .iter()
-            .filter(|s| matches!(s, Step::Run(cmd) if cmd.args == ["restart", "--", UNIT]))
+            .filter(|s| matches!(s, Step::Run(cmd) if cmd.args == ["restart", "--", self.unit.as_str()]))
             .count()
             - self.base
     }
@@ -447,6 +485,40 @@ fn a_lease_source_that_cannot_answer_refuses_the_activation() {
     assert_eq!(rig.fetcher.count(), 0);
     assert_eq!(rig.current(), Some(c(A)));
     assert!(rig.refusal().contains("cannot tell"), "{}", rig.refusal());
+}
+
+/// Catches a node `activate` taken when the unit the helper restarts is a frontend's. A
+/// frontend holds no leases, so a running one reads as idle and the lease check lets the
+/// order through; the swap would then restart the frontend, which moves by `frontend_update`
+/// (the proxy owns its streams). The order is refused before any fetch, with no live lease
+/// and no restart, for the template's instance and for the plain unit; the same order for the
+/// daemon's unit, with the same idle lease source, is taken.
+///
+/// Mutants seen red: the check removed (both frontend units swap); the check refusing every
+/// unit (the daemon's order is refused).
+#[test]
+fn an_activation_is_refused_when_the_restarted_unit_is_a_frontends() {
+    for unit in ["kbf-frontend@a.service", "kbf-frontend.service"] {
+        let mut rig = Rig::restarting("frontend-unit", unit);
+        rig.order(5, Verb::Activate, B);
+        rig.cycle(T0);
+        let why = format!(
+            "denied: order 5: {unit:?} is a frontend's unit; a frontend moves by frontend_update, \
+             and an activate would restart it"
+        );
+        let seen = (
+            rig.fetcher.count(),
+            rig.current(),
+            rig.restarts(),
+            rig.refusal(),
+        );
+        assert_eq!(seen, (0, Some(c(A)), 0, why), "{unit}");
+    }
+    let mut rig = Rig::restarting("daemon-unit", "kbf-daemon.service");
+    rig.order(5, Verb::Activate, B);
+    rig.cycle(T0);
+    let seen = (rig.fetcher.count(), rig.current(), rig.restarts());
+    assert_eq!(seen, (1, Some(c(B)), 1));
 }
 
 /// Catches a confirm that does not keep the swap, one that names the wrong swap, and a
@@ -1720,3 +1792,5 @@ fn the_same_activation_again_while_on_trial_is_a_repeat() {
 }
 
 mod frontend_tests;
+mod pipeline_fetcher_tests;
+mod staged_tests;

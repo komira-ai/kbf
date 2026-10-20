@@ -55,8 +55,9 @@ lists the mode's flags. There is no `node` mode and no `enroll` word.
   `/sys/devices/system/node/online` (rule `cpuset`, only when a unit sets a list), the
   files the unit's `EnvironmentFile=` lines name (rule `credential`), the storage unit's
   `User=` (`getent passwd`, rule `credential`), the owner and mode of each directory above a
-  `file://` `--hot-store` (rule `traverse`), and `kbf check-args` (rule `parse`).
-  Run it on the node, as root, for all of them.
+  `file://` `--hot-store` (rule `traverse`). It does not run `kbf`: whether `kbf` takes a
+  unit's flags is `kbf --mode=<mode> --check` on the node (below). Run it on the node, as
+  root, for all of them.
 
 It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/system`,
 `service.d/` and prefix drop-ins) or changes made with `systemctl set-property` or
@@ -75,15 +76,13 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `caps` | a mode that runs builds (`daemon`, `storage-and-daemon`, `all-in-one`) with `MemoryMax=`, `MemoryHigh=`, `CPUQuota=` or `AllowedCPUs=` on its unit: builds are capped by the daemon's own `actions/memory.max`, and a limit on the unit caps the supervisor with them |
 | `swap` | a mode that runs builds with `MemorySwapMax=` on its unit: its leases live in the unit's cgroup and may swap |
 | `oom` | a mode that runs builds without an integer `OOMScoreAdjust=` below 0, the build containers' score (a host-wide OOM kill takes the highest score first) |
-| `meta-dir` | `storage-and-daemon` or `all-in-one` with `--meta-dir` equal to `--data-dir` or under it (compared after resolving `.` and `..`) |
 | `credential` | the cold store's key reaching a mode without a storage half (`daemon`, `all-in-one`); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user; in the `storage-and-daemon` unit, any way of giving the key but the one `EnvironmentFile=<KBF_ETC>/s3.env` (below), and on the node that file not a plain file of root's with mode 0600 |
 | `storage` | a `storage` or `storage-and-daemon` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` (for `storage-and-daemon`, exactly that path: no `-`, quotes or wildcard) |
-| `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
+| `state-store` | in the frontend's unit, a `--state-store` that is not a `postgres://` or `postgresql://` URI (a `sqlite://` file is named as dropped); in any unit, a URI that carries a password, an empty or relative SQLite path (the all-in-one's), another scheme, or a value that names a variable (below) |
 | `traverse` | on the node, a `file://` `--hot-store` with an existing directory above it that the unit's `User=` cannot enter (no execute bit for it as owner, group member or other); the message names the directory, its mode and owner, and the user. `install-units --mode` refuses it too, before any step |
 | `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
 | `restart` | a node unit (`storage`, `daemon`, `storage-and-daemon`) without `RestartSec=5` and, in `[Unit]`, `StartLimitIntervalSec=0`: systemd's defaults (100 ms, 5 starts in 10 s) end a quickly repeating failure in `start-limit-hit` with the unit down. The frontend keeps `Restart=on-failure` without them: an old frontend that drained after a handover exits 0 and must stay down |
-| `stop` | a mode that drains on SIGTERM (every mode but `daemon`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
-| `parse` | flags that `kbf <mode>` refuses |
+| `stop` | a mode that drains on SIGTERM (every mode but `daemon`, whose finite stop the `package_units` test checks) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 
 **`delegate`.** systemd reads `Delegate=` this way (systemd.resource-control(5), and
 `config_parse_delegate` in systemd's `src/core/load-fragment.c`): a boolean delegates
@@ -192,7 +191,7 @@ way: a file the daemon reads by a flag, the service manager's own environment wi
   not own, or one with a group or other bit (mode 0600 or 0400);
   `--storage=<KBF_STORAGE_URL>` (required, `https://`) with the frontend's worker
   certificate as its client identity (`--storage-client-cert`, `--storage-client-key`)
-  and `--storage-ca=ca.pem`; and `--state-store=sqlite://<KBF_STATE_DIR>/state.db`
+  and `--storage-ca=ca.pem`; and `--state-store=<KBF_STATE_STORE>`
   (below). It runs as `KBF_SERVER_USER`, who must own the keys.
 
 `render-units --mode storage` refuses settings without `MINIO_S3_ENDPOINT`: the
@@ -282,16 +281,34 @@ store older than its nodes' boots, because it learns a node's boot only when the
 registers, after the frontend is up. Until a node has opened it serves nothing, though
 its registration put it in the frontend's map; calls routed to it fail.
 
-### The state store: SQLite only
+### The state store: Postgres for the frontend
 
-kbf opens a SQLite file or Postgres (`postgres:///kbf?host=/run/postgresql`), but no unit
-is rendered for Postgres yet: that comes with the cutover. Rule
-`state-store` fails a `--state-store` that is not `sqlite:///<absolute path>`: a
-`postgres://` or `postgresql://` URI (postgres is not wired yet), any other scheme, a
-SQLite path that is empty, relative or not normal, and a `--state-store=${VAR}`
-(systemd expands the variable into the command line, so the rule cannot read the store
-it names, and what it holds is in argv, readable by every user). A unit with no
-`--state-store` passes. No message repeats the value.
+The frontend's state store is Postgres (CEO ruling: SQLite is dropped for it). The unit
+gives `--state-store=<KBF_STATE_STORE>`, a `postgres://` URI from the host's settings; the
+default is the host's socket, `postgres:///kbf?host=/run/postgresql`. The URI carries no
+password (kbf refuses one: the command line is readable by every user on the node), so
+the database is reached by the socket or by the server user's own role. The database and
+its schema are `kbf-installer`'s; `install-units` makes no state directory for the
+frontend, and `KBF_STATE_DIR` is gone (a settings file that still sets it is refused as an
+unknown key, naming the line).
+
+Rule `state-store` fails, in the frontend's unit, a `--state-store` that is not a
+`postgres://` or `postgresql://` URI (a `sqlite://` one is named as dropped), and in any
+unit a URI that carries a password (user information with a colon, or a `password`
+parameter), a `sqlite://` path that is empty, relative or not normal, another scheme, and a
+`--state-store=${VAR}` (systemd expands the variable into the command line, so the rule
+cannot read the store it names, and what it holds is in argv, readable by every user). A
+unit with no `--state-store` passes. No message repeats the value.
+
+The unit gives no `--handover-socket` (nor a `RuntimeDirectory=` for one): `kbf frontend`
+refuses a Postgres `--state-store` together with it (`HandoverError::PostgresStore`: a Postgres
+store cannot give up its writer role), and the bundled proxy of `docs/design/frontend-proxy.md`
+replaces the handover. Rule `handover` asks for the socket and the preserved directory only
+when the store is SQLite or absent, and fails a unit that gives the socket beside a Postgres
+store. An update of a Postgres frontend is a restart, not `kbf frontend handover`.
+
+The all-in-one unit still names its SQLite file, so that rule takes `sqlite:///<absolute
+path>` there until the farm is moved (below).
 
 ### Updating a frontend without failing a build: `kbf-frontend@.service`
 
@@ -331,9 +348,10 @@ runs out, 90 s (`DefaultTimeoutStopSec=`) when the unit gives none. So both unit
 90 s default would cut them), and rule `stop` refuses either
 missing or changed: it reads `TimeoutSec=` too (it sets the stop timeout as well; the
 last of the two wins) and the drop-ins. It asks for the word `infinity`: `0` means no
-timeout to systemd as well, but reads as "at once" to a person. A daemon is not held:
-it does not drain on SIGTERM (the operator API's `POST /v1/nodes/{node}:drain` empties a
-node before it is stopped).
+timeout to systemd as well, but reads as "at once" to a person. A daemon is not held for ever:
+it drains on SIGTERM up to `--drain-deadline-secs` (600 by default), then stops, so its
+unit has `KillSignal=SIGTERM` and a finite `TimeoutStopSec=660` (the deadline plus 60 s);
+a hung daemon still lets a reboot through.
 
 ### storage-and-daemon and the cold store's key
 
@@ -453,9 +471,8 @@ fails a test until it has a group.
 `kbf <mode> --check` parses the flags and the file, runs the startup checks a start runs,
 prints each problem on standard error and exits without starting anything: 0 when nothing
 stops the start (standard output says `kbf <mode>: ok`), 2 when it is refused, 75 when it
-is not ready yet (a restart may help). `kbf check-args <mode> ...` stays for
-`kbf-deploy linux check-units`: it parses the flags only (no file, no host checks, as
-before) and prints a one-line deprecation note as the last line on standard error.
+is not ready yet (a restart may help). `kbf check-args` is gone: `kbf-deploy linux
+check-units` and `install-units` no longer run `kbf`, and `--kbf-bin` is gone with it.
 
 ## Enrollment is part of the start
 
@@ -498,7 +515,7 @@ themselves. There is no `node` mode and no `enroll` word.
    the template `kbf-frontend@.service`; 0644, root's),
    the directories the unit's flags name (the unit's user's: `--data-dir` 0755,
    `--meta-dir`, a `file://` hot or cold store, and the directory of a `--state-store`
-   SQLite file 0700), then `daemon-reload`, enable
+   SQLite file 0700, which only the all-in-one unit names), then `daemon-reload`, enable
    and restart; with nothing changed, enable and start only if the unit is not. The frontend
    is enabled as the template and `kbf-frontend@a` is started only if neither instance is
    active: a serving instance is never restarted, the plan says to run `kbf frontend
@@ -511,16 +528,3 @@ There is no `--uninstall` for a mode's unit yet. A node moving from the converge
 (`kbf-server.service`) to `kbf-storage.service` stops the old ones first
 (`systemctl disable --now kbf-daemon.service kbf-server.service`): both would hold the
 same directories.
-
-## Upgrade kbf before kbf-deploy
-
-Rule `parse` runs `<kbf> check-args <mode> <flags...>`. A `kbf` older than
-`check-args` refuses the word, so `check-units --mode` fails any mode's unit with:
-
-```text
-FAIL parse: kbf daemon refuses the flags of kbf-daemon.service (/usr/local/bin/kbf check-args: exit 2): error: unrecognized subcommand 'check-args'
-```
-
-(`all-in-one` the same, with its name.) Install the new `kbf` before running the new
-`kbf-deploy` on a node, or check offline: on a machine with no `kbf` at the unit's
-path and no `--kbf-bin`, the rule is skipped with a `SKIP parse:` line.

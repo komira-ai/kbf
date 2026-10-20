@@ -17,7 +17,8 @@ use support::{Ca, Evil, NOW, ca_true, custom_extension, dns, make_ca, role_uri};
 
 fn ca() -> &'static Ca {
     static CA: OnceLock<Ca> = OnceLock::new();
-    CA.get_or_init(|| make_ca("refusals"))
+    // A static is never dropped, so the CA keeps no directory (the tests read no file).
+    CA.get_or_init(|| make_ca("refusals").without_files())
 }
 
 fn check(tbs: &[u8], route: Route) -> Result<(), Refusal> {

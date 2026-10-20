@@ -18,23 +18,26 @@ build.
 
 ## Pull request labels
 
-Two labels opt a pull request in to the work that is otherwise skipped, to spare the
-small macOS runner pool. Adding either to an open pull request starts a run.
+A pull request runs the two jobs of `ci.yml` (`lint`, and `test` on the fast set) and nothing
+else; the full suite, the macOS jobs and the packages run on a push to `main` or
+`feature/arch-v2` (`beta.yml`). One label opts a pull request in to more, to spare the small
+macOS runner pool. Adding it to an open pull request starts a run.
 
 | Label | Effect |
 |---|---|
 | `needs-artifacts` | `artifacts.yml` builds, packages and sums the files for the pull request (never for the darwin-arm64 job of a pull request into `feature/arch-v2`, which no label enables: nothing is attested from a pull request, and the push to `feature/arch-v2` builds it) |
-| `macos` | `ci.yml`'s `native-macos` job runs on a pull request into `feature/arch-v2`, where it is skipped without the label. Pushes, pull requests into `main` and the merge queue run it as before. The job builds and tests on its own runner; it does not use the darwin-arm64 artifacts build |
 
-`ci.yml` runs on the `labeled` event so that the label starts something. Any label added
-to a pull request therefore starts a whole `ci` run, which replaces the pull request's
-earlier run: add the labels together, before the run you want to keep. The condition of
-`native-macos` is pinned by `crates/kbf-it/tests/release_artifacts`.
+`artifacts.yml` runs on the `labeled` event so that the label starts something. Any label
+added to a pull request therefore starts a whole `artifacts` run, which replaces the pull
+request's earlier run: add labels together, before the run you want to keep. `native-macos`
+and `pkg-macos` run in `beta.yml` on every push and never on a pull request; that is pinned
+by `crates/kbf-it/tests/release_artifacts`.
 
 ## What is built
 
 Thirteen tarballs, each with its SBOM and (once the push is attested) its provenance bundle
-([below](#provenance-bundles-verifying-a-tarball-offline)), built by one job per platform:
+([below](#provenance-bundles-verifying-a-tarball-offline)), and two Debian packages of
+`kbf-installer` ([below](#the-kbf-installer-package-deb)), built by one job per platform:
 
 | Asset | Runner | Target |
 |---|---|---|
@@ -55,6 +58,13 @@ updates it ([kbf-installer.md](design/kbf-installer.md)); it is built, signed, a
 and released like the others, so a package or an operator takes it by digest from these
 files. It is not a component of the release it installs on a host, and it does not
 update itself (the design's section 1).
+
+The packages are the two Linux jobs' as well:
+
+| Asset | Built by | Holds |
+|---|---|---|
+| `kbf-installer-<commit>-linux-x86_64.deb` | the `linux-x86_64` job (`ubuntu-24.04`, nfpm for amd64) | the `kbf-installer` of the tarball of the same name, the units, the pinned `gh` for amd64 and a trust directory |
+| `kbf-installer-<commit>-linux-arm64.deb` | the `linux-arm64` job (`ubuntu-24.04-arm`, nfpm for arm64) | the same for arm64 |
 
 The set above is pinned: `crates/kbf-it/tests/release_artifacts` fails a pull request
 that drops one of these files from the workflow, packages one that is not listed, or
@@ -250,11 +260,12 @@ How a bundle is made, and what is checked of it:
   artifact `bundles-linux` or `bundles-darwin-arm64`.
 - **Not an SBOM's.** The SBOM attestation of a tarball carries the whole SBOM and can be
   larger than a bundle may be (below); it is not given to a host. A tarball has exactly
-  one bundle, and nothing else has one.
+  one bundle, a `kbf-installer` package has exactly one (`<package>.sigstore.json`, the
+  same kind of attestation over the one `.deb`), and nothing else has one.
 - **Not in `SHA256SUMS`.** The bundle is made after the sums, from the files they list, so
   they cannot list it. `cargo xtask verify-assets sums` leaves out names that end
   `.sigstore.json`, and `cargo xtask release check` holds the directory to one
-  `<tarball>.sigstore.json` per tarball the sums list and none for anything else.
+  `<tarball>.sigstore.json` per tarball (and per `.deb`) the sums list and none for anything else.
 - **Its size and shape.** A bundle is one line of JSON (`mediaType` of a Sigstore bundle,
   `dsseEnvelope`, `verificationMaterial`) of at most 256 KiB, the room a host's order
   record has for one. `release check` refuses an empty file, two bundles in one file and
@@ -275,6 +286,63 @@ How a bundle is made, and what is checked of it:
   tarball's bundle for another commit, and a copy of the first tarball with a byte
   flipped. The bundles in `dir` are first held to one per listed tarball and none for
   anything else, so a stray bundle fails the `verify-*` job rather than the release.
+
+## The kbf-installer package (deb)
+
+`kbf-installer` is installed by a package manager and never updates itself
+([kbf-installer.md](design/kbf-installer.md) section 1; the installer takes the `kbf`
+releases it installs from the files above, not its own replacement), so its deb is the
+way a host gets it. Each Linux job builds it from the binary it has just built and
+checked (`cargo xtask pkg-trust`, `pkg-config`, `pkg-build`: nfpm, pinned by SHA-256,
+builds it twice and the bytes must match), installs, runs and removes it in a fresh
+Ubuntu 24.04 container (`cargo xtask pkg-install-test`), and then `cargo xtask pkg-asset`
+makes it the asset `kbf-installer-<commit>-<platform>.deb` and lists it in `SHA256SUMS`,
+refusing it unless:
+
+- `usr/bin/kbf-installer` is byte for byte the binary in the tarball
+  `build-commit check-asset` checked for the commit;
+- its control file says the architecture of the platform;
+- `/usr/share/kbf-installer/trust/gh` is the pinned `gh` the job downloaded (checked by
+  SHA-256 before use) and executable, `trusted_root.jsonl` is the Sigstore trusted root
+  that `gh` fetched, and `installer.conf` is exactly `SOURCE_REFS=refs/heads/<branch>`,
+  **the branch the package is attested on**: a package built on `main` trusts `main`
+  releases and one built on `feature/arch-v2` trusts that branch's, never the other.
+
+It is attested like a tarball: build provenance (as one subject of the `SHA256SUMS`
+attestation, and alone, with its bundle `kbf-installer-<commit>-<platform>.deb.sigstore.json`
+in `bundles-linux`) and **no SBOM attestation**: provenance and a bundle only. (Its
+binary has an SBOM, in the tarball's; the `gh` it carries has none here.) The verify job
+checks both offline with the installer's flags, and runs `cargo xtask pkg-asset
+--verify-only` on the signed file, so the package that was attested is the one whose
+contents were checked.
+
+To install one, verify it first, then `dpkg -i` (every flag is the installer's: `GhCheck::args`
+in `crates/kbf-installer/src/attest.rs`; the host has no pinned `gh` before this
+package, so use the operator's own):
+
+```text
+gh run download <run-id> -R komira-ai/kbf -n assets-linux-x86_64 -n bundles-linux -n sha256sums-linux
+sha256sum --check --strict --ignore-missing SHA256SUMS
+gh attestation trusted-root > trusted_root.jsonl
+gh attestation verify kbf-installer-<commit>-linux-x86_64.deb \
+  --bundle kbf-installer-<commit>-linux-x86_64.deb.sigstore.json \
+  --custom-trusted-root trusted_root.jsonl \
+  --repo komira-ai/kbf \
+  --signer-workflow komira-ai/kbf/.github/workflows/artifacts.yml \
+  --cert-oidc-issuer https://token.actions.githubusercontent.com \
+  --source-ref refs/heads/feature/arch-v2 \
+  --source-digest <commit> \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --deny-self-hosted-runners
+sudo dpkg -i kbf-installer-<commit>-linux-x86_64.deb
+```
+
+(`--source-ref` is the branch the package was built on: `refs/heads/main` for a release's
+package.) Known limits: a package manager checks no Sigstore attestation, only the package
+file you give it, so the verification above is the operator's step; the package is not
+signed with a key and is not published through an apt repository; and the trusted root
+inside it is a snapshot, which a later Sigstore key rotation outdates (no code reads its
+`valid_until` yet).
 
 ## Where the files are, and for how long
 
@@ -328,16 +396,24 @@ fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
 publish`).
 
 Two further verbs read the annotated `v*` tag, whose message is the gamma verdict
-(`docs/design/kbf-cicd.md`, section 8.1; `release.yml` does not run them yet).
-`cargo xtask release verdict` refuses a lightweight tag, a commit not on main, a message
+(`docs/design/kbf-cicd.md`, section 8.1). `verify` runs both, on a checkout of the whole
+history (the tag object and `origin/main` must be there): `cargo xtask release verdict`
+refuses a lightweight tag, a commit not on main, a message
 that is not a green gamma verdict, a verdict that names another commit, tag or set (the
 set hash is the SHA-256 of `SHA256SUMS`, `kbf_gate::SetHash::of_sums`), a bake under 24
 hours, and a thin bake without a recorded `min-load` waiver; it prints `set-hash=<hex>`.
-`cargo xtask release notes` runs the same checks and writes the notes. `release publish`
-takes that hash as `--set-hash` and publishes nothing when the files are another set.
+`cargo xtask release notes` runs the same checks and writes the notes, which `verify`
+uploads as the artifact `release-notes`, so a dry run shows them. `verify` passes the hash
+to `publish` as a job output, and `release publish` takes it as `--set-hash` and publishes
+nothing when the files are another set. The `publish` job runs in the `prod` environment,
+whose required reviewer approves it.
 
-The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA. Only
-`verify` runs then: every check above, and nothing is published. On every pull request
+The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA and the
+annotated tag to check. Only `verify` runs then: every check above, and nothing is
+published (`publish` runs only for a pushed tag, and only `publish` holds a write scope).
+`crates/kbf-it/tests/release_workflow` holds the file to this: the verdict step, the
+`prod` environment, a `v*` tag push and a dispatch as the only triggers (no pull request),
+pinned actions and an empty top-level `permissions`. On every pull request
 into `main`, CI asks GitHub the same on-`main` question for the pull request's base
 commit (which must pass) and its merge commit (which must be refused), so a check that
 accepts every commit, or none, fails there (`cargo xtask release main-control`).

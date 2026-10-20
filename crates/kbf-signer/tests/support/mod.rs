@@ -11,6 +11,7 @@ use kbf_ca::{
     Signer, SystemEntropy,
 };
 use kbf_signer::{SignerServer, bind};
+use kbf_testkit::dir::TestDir;
 use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
@@ -40,12 +41,31 @@ pub fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-/// A scratch directory, new and empty, resolved through symlinks.
-pub fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-signer-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    std::fs::canonicalize(&dir).expect("canonical scratch dir")
+/// A scratch directory, new and empty, removed when this is dropped. `path` is resolved
+/// through symlinks.
+pub struct Scratch {
+    pub path: PathBuf,
+    _dir: Option<TestDir>,
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// The directory is under the system's temporary directory and not the target directory:
+/// the signer's sockets are inside it, and a socket's path must fit in 108 bytes, which a
+/// deep checkout's target directory can exceed.
+pub fn scratch(name: &str) -> Scratch {
+    let dir = TestDir::under(std::env::temp_dir(), &format!("kbf-signer-{name}"));
+    let path = std::fs::canonicalize(&dir).expect("canonical scratch dir");
+    Scratch {
+        path,
+        _dir: Some(dir),
+    }
 }
 
 /// A splitmix64 stream: deterministic serials.
@@ -70,7 +90,16 @@ pub struct Ca {
     pub root: Vec<u8>,
     pub spki: Vec<u8>,
     pub root_subject: Vec<u8>,
-    pub scratch: PathBuf,
+    pub scratch: Scratch,
+}
+
+impl Ca {
+    /// Removes the CA's files now, keeping only what was read from them. For a CA held in
+    /// a `static`, which is never dropped and would leave its directory behind.
+    pub fn without_files(mut self) -> Ca {
+        self.scratch._dir = None;
+        self
+    }
 }
 
 pub fn make_ca(name: &str) -> Ca {

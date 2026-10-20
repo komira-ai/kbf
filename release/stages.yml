@@ -19,15 +19,18 @@ stages:
     after: []
     result: SHA256SUMS
     events: [pull_request, merge_group, push]
-  # The full end-to-end run against the built files. Planned: no job exists yet. The change
-  # that adds the beta job to artifacts.yml deletes the `planned` line below and lists the
-  # job (and the job that attests its result, as `signing: true`) under `jobs`.
+  # The full run, on a push: everything the pull-request gate (ci.yml) leaves out. The whole
+  # nextest run with its slow tests, the Arm run, the jobs that need a service, root, crun
+  # or a Mac, the Linux packages, and the end-to-end smoke of beta.yml (scenario B0, the farm
+  # under Buck2 load), which builds its own binaries, so its result says it is unattested.
+  # The full run on the attested bytes (a job of artifacts.yml, after `verify`), and the
+  # `signing: true` job that attests its result, are added to `jobs` by the changes that
+  # build them. beta.yml runs on a push only: no pull request and no merge queue entry.
   - name: beta
     runs: actions
-    planned: true
     after: [build]
     result: beta-result.json
-    events: [merge_group, push]
+    events: [push]
   # The operator's own deployment follows the beta result; it is not an Actions job.
   - name: gamma
     runs: operator
@@ -62,6 +65,30 @@ jobs:
     stage: build
   - job: artifacts.yml#verify-darwin-arm64
     stage: build
+  - job: beta.yml#smoke
+    stage: beta
+  - job: beta.yml#test-x86
+    stage: beta
+  - job: beta.yml#test-arm
+    stage: beta
+  - job: beta.yml#state-postgres
+    stage: beta
+  - job: beta.yml#objstore-s3
+    stage: beta
+  - job: beta.yml#crun-x86
+    stage: beta
+  - job: beta.yml#crun-arm
+    stage: beta
+  - job: beta.yml#m2-container
+    stage: beta
+  - job: beta.yml#native-macos
+    stage: beta
+  - job: beta.yml#pkg-macos
+    stage: beta
+  - job: beta.yml#packages
+    stage: beta
+  - job: beta.yml#m1-cell
+    stage: beta
   - job: release.yml#verify
     stage: prod
   - job: release.yml#publish

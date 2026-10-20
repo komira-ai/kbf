@@ -29,6 +29,9 @@ pub enum DocError {
     /// A waiver without who or why.
     #[error("waiver for `{0}` names no operator or no reason")]
     Waiver(String),
+    /// An offer document a reader refuses.
+    #[error("offer document: {0}")]
+    Offer(String),
     /// A hash that is not lower-case hex of the right length.
     #[error("`{0}` is not a lower-case hex string of {1} characters")]
     Hex(String, &'static str),

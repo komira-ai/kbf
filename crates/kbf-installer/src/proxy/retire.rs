@@ -1,10 +1,11 @@
 //! Step 10 (drain and retire) and the operator's rollback.
 //!
-//! A child that has served is only ever told SIGTERM, and only when it is provably idle.
+//! A child that has served is only ever told SIGTERM, and only when it is provably idle:
+//! the proxy's permits and the child's counts are zero and the gate's `retire` closed the slot.
 //! There is no timeout and no SIGKILL on this path: a stuck stream stays visible in the
 //! status until the operator force-retires it (U8b).
 
-use super::model::{CrashPoint, Halt, Mode, Phase, RoleState, Slot, Step};
+use super::model::{CrashPoint, Halt, Mode, Phase, Retired, RoleState, Slot, Step};
 use super::swap::{Flow, Swap};
 
 impl Swap<'_> {
@@ -21,7 +22,8 @@ impl Swap<'_> {
 
     /// Wait until `slot` is idle, send SIGTERM once, and wait for the exit. Idle means all
     /// of: the slot is not the active one, the proxy holds no permit on it, and the child
-    /// reports no open execution and no queued operation. If the child cannot be asked, it
+    /// reports no open stream and no open session (queued operations do not count: the new
+    /// holder serves them). If the child cannot be asked, it
     /// is not provably idle. A child that exits by itself ends the wait at once.
     pub(super) fn retire(&mut self, slot: Slot) -> Result<(), Halt> {
         if !self.slot_alive(slot) {
@@ -38,7 +40,7 @@ impl Swap<'_> {
                 self.mark_gone(slot);
                 return Ok(());
             }
-            if !terminated && self.idle(slot) {
+            if !terminated && self.idle(slot) && self.ports.gate.retire(slot) == Retired::Closed {
                 if let Err(e) = self.ports.child.terminate(&ident) {
                     self.note(format!("SIGTERM to {slot:?} failed: {e}"));
                 }

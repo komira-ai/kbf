@@ -60,7 +60,7 @@ pub enum CheckError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
     pub failures: Vec<Failure>,
-    /// Lines about a rule not checked, such as `SKIP parse: ...`; not failures.
+    /// Lines about a rule not checked, such as `SKIP traverse: ...`; not failures.
     pub notes: Vec<String>,
     /// The summary line: `UNITS OK: ...` or `UNITS BROKEN: ...`.
     pub summary: String,
@@ -168,7 +168,7 @@ pub(super) fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
             "KBF_API_TOKEN_FILE",
             Value::Text(c.api_token_file.to_string()),
         ),
-        ("KBF_STATE_DIR", Value::Text(c.state_dir.to_string())),
+        ("KBF_STATE_STORE", Value::Text(c.state_store.clone())),
         ("DAEMON_TUNING_ARGS", Value::Lines(tuning)),
         ("KBF_LISTEN_HOST", Value::Text(c.listen_host())),
         ("KBF_HOST_NAME", Value::Text(c.host_name.clone())),

@@ -2,24 +2,21 @@
 
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use kbf_state::conformance::Backend;
 use kbf_state::sqlite::{Options, SqliteStore};
 use kbf_state::{Clock, Conflict, ManualClock, Store, Txn};
+use kbf_testkit::dir::TestDir;
 
 /// A new, empty directory under the test target directory (cargo's, on a disk that syncs
 /// like the one the store runs on). Its name carries `name`, the process and a count, so
-/// no two tests in one run, and no two runs, share one.
-pub fn scratch(name: &str) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let n = NEXT.fetch_add(1, Ordering::SeqCst);
-    let id = std::process::id();
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("kbf-state-{name}-{id}-{n}"));
-    std::fs::create_dir(&dir).expect("create a scratch directory of its own");
-    dir
+/// no two tests in one run, and no two runs, share one; it is removed when the returned
+/// value is dropped, so a test declares it before the stores and children that use it.
+pub fn scratch(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("kbf-state-{name}"))
 }
 
 /// Opens a store in `dir` with `options` on a manual clock.
@@ -36,6 +33,9 @@ pub fn open_manual(dir: &Path, options: Options) -> (SqliteStore, Arc<ManualCloc
 pub struct SqliteBackend {
     name: &'static str,
     opened: AtomicUsize,
+    /// The directories handed to the stores, removed when the backend is dropped (a
+    /// store an `open` returned lives in its directory, so they are kept here).
+    dirs: Mutex<Vec<TestDir>>,
 }
 
 impl SqliteBackend {
@@ -43,6 +43,7 @@ impl SqliteBackend {
         SqliteBackend {
             name,
             opened: AtomicUsize::new(0),
+            dirs: Mutex::new(Vec::new()),
         }
     }
 }
@@ -54,7 +55,10 @@ impl Backend for SqliteBackend {
         let n = self.opened.fetch_add(1, Ordering::SeqCst);
         let dir = scratch(&format!("{}-{n}", self.name));
         let clock: Arc<dyn Clock> = clock;
-        SqliteStore::open(&dir.join("state.db"), clock, Options::default()).expect("open")
+        let store =
+            SqliteStore::open(&dir.join("state.db"), clock, Options::default()).expect("open");
+        self.dirs.lock().expect("the list of directories").push(dir);
+        store
     }
 
     fn restart(&self, store: SqliteStore) -> SqliteStore {
