@@ -8,10 +8,14 @@
 
 mod support;
 
+use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
+use kbf_daemon::connect::Resolve;
 use kbf_daemon::{Daemon, DaemonConfig, FakeRuntime, NodeReport, TlsFiles, storage_nodes};
 use kbf_map::{Member, MemberId, MemberState};
 use kbf_route::{Liveness, Nodes as _};
@@ -173,6 +177,69 @@ async fn a_certificate_that_cannot_be_read_fails_the_attempt_not_the_daemon() {
     timeout(PROMPT, sessions.recv())
         .await
         .expect("the daemon connects once the certificate is back")
+        .expect("server running");
+    daemon.abort();
+    server.abort();
+}
+
+/// Names the server by the addresses the test gives, the same on every round.
+struct Listed(Vec<SocketAddr>);
+
+impl Resolve for Listed {
+    fn resolve(&self, _: String, _: u16) -> BoxFuture<'static, io::Result<Vec<SocketAddr>>> {
+        let answer = self.0.clone();
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+/// The failure `a_renewed_certificate_is_presented_by_the_next_connection` had in a CI run
+/// ("the daemon connects with the renewed certificate: Elapsed(())", after 5.6 s),
+/// reproduced on purpose: its way of waiting (600 ms with no session, then `PROMPT`) is
+/// shorter than one attempt of the daemon can be.
+///
+/// The server is named by two addresses. The first accepts a connection and never answers
+/// the handshake, so the daemon waits there for its welcome timeout (10 s) with the identity
+/// it read before the certificate was replaced, and its attempt on the real server comes
+/// after `PROMPT` has run out. The likeliest cause of the CI failure is a listener of
+/// another test, silent on `::1` at this server's port number (the old URL names
+/// `localhost`, which can resolve to `::1` as well as to `127.0.0.1`). The run kept no
+/// record of the daemon's attempts, so that is a candidate and not a finding; a stalled
+/// address here is the same wait without a dependence on the host's resolver.
+///
+/// This test is red on purpose. The change after it dials a literal address and waits for
+/// the daemon's own events, not for the clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_old_wait_fails_when_an_attempt_outlasts_prompt() {
+    let authority = Authority::new();
+    let pki = authority.pki(&scratch("identity-outlasts"));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let served = listener.local_addr().expect("address");
+    let (mut sessions, server) = serve_worker(pki.server_tls(), listener);
+    // Nothing accepts here: a dial connects, sends its hello and waits for an answer.
+    let stall = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let stalled = stall.local_addr().expect("address");
+
+    let url = format!("https://{served}");
+    let mut config = DaemonConfig::new(url, pki.client.clone(), "node-1".to_owned());
+    config.reconnect_after = Duration::from_millis(5);
+    config.reconnect_max = Duration::from_millis(40);
+    let runtime = Arc::new(FakeRuntime::new(Duration::ZERO));
+    let report = NodeReport::new([("cpus", "1"), ("drivers", "fake"), ("mem_gib", "1")]);
+    let daemon = Daemon::new(config, runtime, report).expect("daemon config");
+    let daemon = daemon.with_resolver(Arc::new(Listed(vec![stalled, served])));
+    let daemon = tokio::spawn(daemon.run(std::future::pending()));
+
+    // The old test, line for line.
+    assert!(
+        timeout(Duration::from_millis(600), sessions.recv())
+            .await
+            .is_err(),
+        "the server took a session from a daemon with an expired certificate"
+    );
+    authority.renew(&pki.client);
+    timeout(PROMPT, sessions.recv())
+        .await
+        .expect("the daemon connects with the renewed certificate")
         .expect("server running");
     daemon.abort();
     server.abort();

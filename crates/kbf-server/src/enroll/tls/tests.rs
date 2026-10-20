@@ -176,3 +176,61 @@ async fn the_certificate_is_renewed_at_half_life_and_a_failure_is_retried_in_a_m
     assert!(!looping.is_finished(), "the loop never ends");
     looping.abort();
 }
+
+/// The failure the test above had in two CI runs, reproduced on purpose. Its way of waiting
+/// (move the paused clock by hand, then give the blocking pool a fixed stretch of real time
+/// to catch up) loses to an attempt that is slow to finish.
+///
+/// The first attempt is held at a gate, as a loaded runner holds a thread that is unwinding
+/// its first panic. The clock is moved to one second short of the retry as the test above
+/// counts it, and the attempt is released. The loop arms its one-minute sleep when the
+/// attempt ends, at that reading of the clock, so the retry falls due a minute after the
+/// 59th second and the test's last second reaches nothing. `settle` gives up with "never
+/// happened: the retry", the text of the failed runs.
+///
+/// This test is red on purpose. The change after it replaces both with tests that read the
+/// schedule from the attempts themselves.
+#[tokio::test(start_paused = true)]
+async fn the_old_choreography_fails_when_the_first_attempt_finishes_late() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let farm = farm("tls-late");
+    let tls = std::sync::Arc::new(
+        FrontendTls::start(&farm.ca, &names(), now(), &mut SystemEntropy).expect("tls"),
+    );
+    let half = 86_400 / 2;
+    let attempts = std::sync::Arc::new(AtomicU32::new(0));
+    let counted = std::sync::Arc::clone(&attempts);
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    // Attempt 1 waits at the gate and then dies; later ones succeed.
+    let clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync> =
+        std::sync::Arc::new(move || match counted.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                let held = gate.lock().expect("the gate").recv();
+                held.expect("the test releases the attempt");
+                panic!("the renewal task dies")
+            }
+            _ => now(),
+        });
+    let looping = tokio::spawn(std::sync::Arc::clone(&tls).keep_fresh_by(
+        std::sync::Arc::clone(&farm.ca),
+        clock,
+        None,
+    ));
+    let tried = || attempts.load(Ordering::SeqCst);
+    let_it_sleep().await;
+
+    tokio::time::advance(Duration::from_secs(half)).await;
+    settle("the first attempt", || tried() == 1).await;
+    let_it_sleep().await;
+    // The attempt is out, so no sleep is armed. Fifty-nine seconds pass, and then it ends.
+    tokio::time::advance(Duration::from_secs(59)).await;
+    let_it_sleep().await;
+    release.send(()).expect("the attempt is waiting");
+    let_it_sleep().await;
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle("the retry", || tried() == 2).await;
+    looping.abort();
+}
