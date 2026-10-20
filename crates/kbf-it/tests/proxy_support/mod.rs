@@ -3,7 +3,7 @@
 //! proxy, the `Execute` streams a Buck2 build holds open, and reads of a child's own count
 //! of them. Each soak says in its own header what it proves with them.
 
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::{BufReader, Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{ChildStdout, Command, ExitCode, Stdio};
@@ -85,9 +85,11 @@ impl Child {
         let mut command = kbf_command(dir, args);
         command.stdout(Stdio::piped()).stderr(log);
         let mut process = reaped::spawn(&mut command, 3).expect("spawn kbf");
-        let mut stdout = BufReader::new(process.stdout.take().expect("stdout"));
-        let mut line = String::new();
-        stdout.read_line(&mut line).expect("a start line");
+        let (line, stdout) = reaped::first_line(
+            process.stdout.take().expect("stdout"),
+            Duration::from_secs(60),
+        )
+        .unwrap_or_else(|e| panic!("no start line from {name}: {e}"));
         Self {
             process,
             line,

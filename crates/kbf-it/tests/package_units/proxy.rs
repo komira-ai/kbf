@@ -10,7 +10,7 @@ use kbf_deploy::unit::UnitFile;
 use super::{INSTALLER, INSTALLER_CONFIG, all, read, rules_of, trim, violations};
 
 /// The rules of this module, by the tag a violation starts with.
-pub(super) const RULES: [&str; 12] = [
+pub(super) const RULES: [&str; 13] = [
     "proxy-socket-pair",
     "proxy-socket-accept",
     "proxy-socket-port",
@@ -19,6 +19,7 @@ pub(super) const RULES: [&str; 12] = [
     "proxy-user",
     "proxy-env",
     "proxy-harden",
+    "proxy-reload",
     "proxy-restart",
     "proxy-state",
     "proxy-stop",
@@ -118,6 +119,17 @@ pub(super) fn service_rules(
         v(
             "proxy-kill",
             format!("KillMode= is {:?}, not process", get("KillMode")),
+        );
+    }
+    // Catches a certificate renewal that cannot reach the proxy without ending its streams:
+    // no reload at all (the renew hook would restart), a reload that restarts (the old
+    // proxy's streams are cut), or one that signals anything but the main process with HUP
+    // (TERM drains and stops it; without $MAINPID the command names no process).
+    let reloads = all(unit, "Service", "ExecReload");
+    if reloads != ["/bin/kill -HUP $MAINPID"] {
+        v(
+            "proxy-reload",
+            format!("ExecReload= is {reloads:?}, not /bin/kill -HUP $MAINPID alone"),
         );
     }
     // Catches a notify unit: the verb never sends READY=1, so systemd would wait out the
@@ -295,6 +307,30 @@ const MUTANTS: &[(&str, &str, &str, &str)] = &[
         "\nStateDirectoryMode=0750\n",
         "\nStateDirectoryMode=0750\nEnvironment=LISTEN_FDS=1\n",
         "proxy-env",
+    ),
+    (
+        "kbf-proxy.service",
+        "ExecReload=/bin/kill -HUP $MAINPID\n",
+        "",
+        "proxy-reload",
+    ),
+    (
+        "kbf-proxy.service",
+        "ExecReload=/bin/kill -HUP $MAINPID\n",
+        "ExecReload=/bin/systemctl restart kbf-proxy\n",
+        "proxy-reload",
+    ),
+    (
+        "kbf-proxy.service",
+        "ExecReload=/bin/kill -HUP $MAINPID\n",
+        "ExecReload=/bin/kill -TERM $MAINPID\n",
+        "proxy-reload",
+    ),
+    (
+        "kbf-proxy.service",
+        "ExecReload=/bin/kill -HUP $MAINPID\n",
+        "ExecReload=/bin/kill -HUP\n",
+        "proxy-reload",
     ),
     (
         "kbf-proxy.service",

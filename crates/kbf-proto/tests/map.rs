@@ -276,6 +276,34 @@ fn the_cold_store_registration_fields_are_pinned() {
     assert_eq!(beat.encode_to_vec(), [0x38, 4, 0x40, 3], "fields 7 and 8");
 }
 
+// Catches: the maps a frontend retains from before the newest sent on a number that a later
+// field reuses, or in a shape an older node cannot skip: they are a repeated message on 6
+// (Register) and 4 (Heartbeat), after every field an older build knows, so an older node
+// ignores them and reads the rest as before. The bytes are pinned.
+#[test]
+fn the_retained_previous_maps_are_pinned() {
+    let register = pb::RegisterResponse {
+        retained_previous: vec![pb::Map::default(), pb::Map::default()],
+        ..Default::default()
+    };
+    assert_eq!(
+        register.encode_to_vec(),
+        [0x32, 0, 0x32, 0],
+        "field 6, twice"
+    );
+    let answer = pb::HeartbeatResponse {
+        retained_previous: vec![pb::Map::default()],
+        ..Default::default()
+    };
+    assert_eq!(answer.encode_to_vec(), [0x22, 0], "field 4");
+    assert!(
+        pb::HeartbeatResponse::decode(&[0x18, 9][..])
+            .expect("an older frontend's answer")
+            .retained_previous
+            .is_empty()
+    );
+}
+
 // Catches: a status enum whose zero is a real outcome (an older node's heartbeat, which
 // has no such field, would then read as a report) and an unknown number that decodes
 // (the frontend must be able to refuse a status it does not know).

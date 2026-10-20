@@ -24,6 +24,7 @@ use kbf_tier::{
 };
 use kbf_types::Digest;
 
+use super::flush::RESEAT_ATTEMPTS;
 use super::write_group::Writer;
 use super::{Cache, CacheError, unexpected};
 use crate::meta_log::MetaLog;
@@ -390,6 +391,69 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             }
             other => Err(unexpected(&other)),
         }
+    }
+
+    /// Commits one `ReseatStaged` that moves the records of `from` (staged here, its key
+    /// held by another object) to the synced range `synced`, which holds them, sealed,
+    /// and answers the range committed.
+    ///
+    /// # Errors
+    ///
+    /// The commit was refused or failed [`RESEAT_ATTEMPTS`] times. Nothing changed:
+    /// `from` is staged as it was, and the range is answered as failed (its block
+    /// removed) unless the committed state shows the commit applied anyway.
+    pub(super) async fn reseat_staged(
+        &self,
+        staging: &Staging,
+        synced: Synced,
+        blobs: Vec<(Digest, u64)>,
+        from: ObjectId,
+    ) -> Result<(), CacheError> {
+        let put = StagedPut {
+            object: synced.object(),
+            end: synced.end(),
+            seal: true,
+            blobs,
+        };
+        match self.reseat(staging.id, from, put, false).await {
+            Ok(()) => {
+                self.born.carry(from, synced.object());
+                staging.tier.committed(synced);
+                staging.counters.staged.add(1);
+                Ok(())
+            }
+            Err(e) => {
+                self.answer_lost_put(staging, synced).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Commits a `ReseatStaged` of `from` to `to` (in the store when `stored`), tried
+    /// up to [`RESEAT_ATTEMPTS`] times when the log cannot answer: the command is a
+    /// no-op when it applied already. A refusal (or any other answer) is not tried again.
+    pub(super) async fn reseat(
+        &self,
+        tier: TierId,
+        from: ObjectId,
+        to: StagedPut,
+        stored: bool,
+    ) -> Result<(), CacheError> {
+        let command = Command::ReseatStaged {
+            tier,
+            from,
+            to,
+            stored,
+        };
+        let mut failed = None;
+        for _ in 0..RESEAT_ATTEMPTS {
+            match self.commit(command.clone()).await {
+                Ok(Applied::Tier(Ok(()))) => return Ok(()),
+                Ok(other) => return Err(unexpected(&other)),
+                Err(e) => failed = Some(e),
+            }
+        }
+        Err(failed.map_or_else(|| CacheError::Internal("no attempt".to_owned()), Into::into))
     }
 
     /// Answers a range whose `PutStaged` commit failed. A log can apply a command and

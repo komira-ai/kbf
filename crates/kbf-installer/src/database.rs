@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use kbf_state::postgres::schema::{self, Migration, Outcome, SchemaError};
-use kbf_state::postgres::{ConfigError, PostgresConfig};
+use kbf_state::postgres::{ConfigError, PostgresConfig, Unreached};
 
 /// Why the database cannot be reached from `installer.toml`.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -50,6 +50,22 @@ pub enum DatabaseError {
     /// The URL carries a password, in a world-readable file.
     #[error("the `database` URL in {0} carries a password; use peer authentication")]
     Password(String),
+}
+
+/// The `database` URL of the file `shown`, parsed and refused when it carries a password. The
+/// one place the rule lives: `setup`, `run` and `backup` all hold the file's URL to it.
+///
+/// # Errors
+/// [`DatabaseError::BadUrl`] or [`DatabaseError::Password`]; neither quotes the URL.
+pub(crate) fn check_url(shown: &str, url: &str) -> Result<PostgresConfig, DatabaseError> {
+    let config = PostgresConfig::parse(url).map_err(|why| DatabaseError::BadUrl {
+        path: shown.to_owned(),
+        why,
+    })?;
+    if config.has_password() {
+        return Err(DatabaseError::Password(shown.to_owned()));
+    }
+    Ok(config)
 }
 
 /// What runs before a release starts, so the installer's helper can be tested without a
@@ -88,13 +104,7 @@ impl Database {
         let Some(url) = table.get("database").and_then(toml::Value::as_str) else {
             return Err(DatabaseError::NoDatabase(shown));
         };
-        let config = PostgresConfig::parse(url).map_err(|why| DatabaseError::BadUrl {
-            path: shown.clone(),
-            why,
-        })?;
-        if config.has_password() {
-            return Err(DatabaseError::Password(shown));
-        }
+        let config = check_url(&shown, url)?;
         Ok(Database::new(config, schema::embedded()))
     }
 
@@ -175,6 +185,13 @@ impl SchemaStep for Database {
 /// test's fake stands in for a server, so the lines `setup` prints after the schema runner
 /// answers are tested without one. The errors are their text: that is all `setup` prints.
 pub trait SchemaOps {
+    /// Logs in to the database and drops the connection: what `setup` asks first, so a login
+    /// the server refuses is told apart (and refused with a recipe) before any schema work.
+    ///
+    /// # Errors
+    /// What stopped the login; never the server's own words.
+    fn reach(&self) -> Result<(), Unreached>;
+
     /// Creates or brings forward the schema.
     fn setup(&self) -> Result<Outcome, String>;
 
@@ -183,12 +200,29 @@ pub trait SchemaOps {
 }
 
 impl SchemaOps for Database {
+    fn reach(&self) -> Result<(), Unreached> {
+        kbf_state::postgres::reach(&self.config)
+    }
+
     fn setup(&self) -> Result<Outcome, String> {
-        Database::setup(self).map_err(|e| e.to_string())
+        Database::setup(self).map_err(redacted)
     }
 
     fn plan(&self) -> Result<(Option<u32>, u32), String> {
-        Database::plan(self).map_err(|e| e.to_string())
+        Database::plan(self).map_err(redacted)
+    }
+}
+
+/// What `setup` prints for a schema error. The server's own words quote the role and the
+/// database (`permission denied for database "..."`), which come from the operator's URL, so
+/// they are left to the server's log; every other error is about versions and migrations.
+fn redacted(err: SchemaError) -> String {
+    match err {
+        SchemaError::Database(_) => {
+            "the server refused a statement; its log says which (the role must be able to create a schema in the database)"
+                .to_owned()
+        }
+        other => other.to_string(),
     }
 }
 

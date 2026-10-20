@@ -202,3 +202,38 @@ async fn a_result_waits_for_a_closure_object_the_gate_holds_elsewhere() {
         vec![key(&cache, entry.output), key(&cache, entry.result)]
     );
 }
+
+/// Catches: the flush order lost when the object an entry's result waits for is moved
+/// to a new object after another object holds its key (N1). The result must wait for
+/// the new object, or the store holds a result before its output: with the order lost
+/// the result (older, so first in id order) is PUT first.
+#[tokio::test]
+async fn a_result_waits_for_a_closure_object_that_moved() {
+    let farm = Farm::new(support::CONDITIONAL);
+    let cache = farm.start(GIB).await;
+    let entry = entry(&farm, &cache).await;
+    let taken = bytes::Bytes::from_static(b"another object under the output's key");
+    let at = key(&cache, entry.output);
+    kbf_objstore::ObjectStore::put_new(&farm.store, &at, taken, None)
+        .await
+        .expect("put");
+
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.conflicts, vec![entry.output]);
+    assert_eq!(round.flushed, Vec::<ObjectId>::new(), "{round:?}");
+    let len = usize::try_from(SEGMENT).expect("size") + 1;
+    let moved = farm.log.object_of(&TestBlob::new(2, len).digest);
+    assert_ne!(moved, entry.output);
+    let result = entry.result;
+    let waits = farm.log.state(move |s| s.flush_waits(result));
+    assert_eq!(waits, std::collections::BTreeSet::from([moved]));
+
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed, vec![moved, entry.result], "{round:?}");
+    let puts = farm.store.put_keys();
+    assert_eq!(
+        puts[puts.len() - 2..],
+        [key(&cache, moved), key(&cache, entry.result)],
+        "the moved output is PUT before the result"
+    );
+}

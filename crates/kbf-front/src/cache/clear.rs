@@ -8,7 +8,8 @@
 //!   generation of the map the node's flush gate held when its first `PutStaged`
 //!   committed ([`Born::note`]). The date is volatile: an object the process did not
 //!   date (staged before a restart, or while the gate held no map) counts as staged under
-//!   generation 0, the oldest, until it is flushed. A restart therefore holds the clear
+//!   generation 0, the oldest, until it is flushed. A re-seat (`ReseatStaged`) moves the
+//!   date to the object that takes its place ([`Born::carry`]). A restart therefore holds the clear
 //!   generation back until the objects it found are flushed, never lets it run ahead.
 //! - **Only what this node flushes.** The objects counted are the staged ones the gate
 //!   says this node flushes under the map it holds now: an object only another node
@@ -69,6 +70,21 @@ impl Born {
         at.seq += 1;
         let seq = at.seq;
         at.by_object.entry(object).or_insert((held, seq));
+    }
+
+    /// Moves the date of `from` to `to`, the object a re-seat staged in its place: it
+    /// holds the same records, staged at the same time. A `from` with no date leaves `to`
+    /// with none either (generation 0). The move is a note, so a prune whose query
+    /// began before it keeps it; `from`'s date goes with the next prune, once `from` is
+    /// no longer staged.
+    pub(super) fn carry(&self, from: ObjectId, to: ObjectId) {
+        let mut at = self.at.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(&(held, _)) = at.by_object.get(&from) else {
+            return;
+        };
+        at.seq += 1;
+        let seq = at.seq;
+        at.by_object.insert(to, (held, seq));
     }
 
     /// A mark to take before a query of the staged set, for [`Born::prune`].

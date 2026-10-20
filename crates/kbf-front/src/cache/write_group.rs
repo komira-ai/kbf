@@ -406,6 +406,19 @@ impl<M, O> Writer<M, O> {
         self.keys.key(id)
     }
 
+    /// Moves the numbering of this writer's objects to the microseconds since the Unix
+    /// epoch, if that is past the next number. A flush that met another object under its
+    /// key calls it: the member and boot were named by another lifetime (a frontend
+    /// moved to a fresh state store hands them out again) whose objects occupy the low
+    /// numbers, so counting on from one number would meet them one by one.
+    pub(super) fn leave_numbering(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let micros = u64::try_from(now.as_micros()).unwrap_or(u64::MAX);
+        self.next_seq.fetch_max(micros, Ordering::Relaxed);
+    }
+
     pub(super) fn allocate(&self) -> ObjectId {
         ObjectId::of(self.names_as, self.next_seq.fetch_add(1, Ordering::Relaxed))
     }

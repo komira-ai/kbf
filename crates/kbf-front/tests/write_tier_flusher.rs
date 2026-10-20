@@ -13,9 +13,10 @@ use std::sync::Arc;
 
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_meta::StagedState;
+use kbf_objstore::ObjectStore;
 use kbf_storage::flush::OneFlusher;
 use kbf_storage::replicate::MapSource;
-use support::{Farm, SEGMENT, TestBlob, later};
+use support::{CONDITIONAL, Farm, SEGMENT, TestBlob, blobs, key, later, verified};
 
 const GIB: u64 = 1 << 30;
 
@@ -678,4 +679,44 @@ async fn a_flush_round_drops_the_dates_of_objects_that_are_no_longer_staged() {
     let round = cache.flush_tier(later()).await.expect("round");
     assert_eq!(round.flushed.len(), 2);
     assert_eq!(cache.dated_objects(), 0);
+}
+
+/// Catches: a re-seat that loses the staging date. A staged object whose key another
+/// object holds in the store is staged again under a new id; the date is of the staging,
+/// not of the id, so it moves with the records. Left under the old id, the next prune
+/// drops it and the moved object counts as undated (generation 0), holding the clear
+/// generation at 0 until it is flushed (the handoff stalls). Staged under 5, moved after
+/// the map is 7: the clear generation stays 5 with the moved object unflushed, and is
+/// the held 7 once it is flushed.
+#[tokio::test]
+async fn a_moved_conflicting_object_keeps_its_staging_generation() {
+    let farm = Farm::new(CONDITIONAL);
+    let node = Node::new(1, &solo(5));
+    let cache = farm
+        .start(GIB)
+        .await
+        .with_flush_gate(OneFlusher::new(Arc::clone(&node) as _));
+    let blobs = blobs(1, 2, 4096);
+    cache.store_blobs(verified(&blobs)).await.expect("stored");
+    let object = farm.log.object_of(&blobs[0].digest);
+    let taken = bytes::Bytes::from_static(b"some other object under this key");
+    farm.store
+        .put_new(&key(&cache, object), taken, None)
+        .await
+        .expect("put");
+    node.set(&solo(7));
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.conflicts, [object], "{round:?}");
+    let moved = farm.log.object_of(&blobs[0].digest);
+    assert_ne!(moved, object);
+    assert_eq!(farm.log.staged_state(moved), Some(StagedState::Sealed));
+    // The round pruned: the moved object's date is the one thing left.
+    let report = cache.flush_report().await.expect("report");
+    assert_eq!((report.clear_gen, report.staged_objects), (Some(5), 1));
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed, [moved], "{round:?}");
+    assert_eq!(
+        cache.flush_report().await.expect("report").clear_gen,
+        Some(7)
+    );
 }
