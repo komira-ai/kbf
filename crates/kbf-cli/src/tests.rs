@@ -942,11 +942,7 @@ fn the_parser_takes_the_mode_flag_and_the_file_flags() {
     for line in [
         &["kbf", "--mode=daemon", "--check"][..],
         &["kbf", "--mode=storage"],
-        &[
-            "kbf",
-            "--mode=daemon",
-            "--config=/etc/kbf/kbf.toml",
-        ],
+        &["kbf", "--mode=daemon", "--config=/etc/kbf/kbf.toml"],
         &["kbf", "storage-and-daemon", "--check"],
     ] {
         assert_eq!(check(line), Ok(()), "{line:?}");
@@ -957,7 +953,7 @@ fn the_parser_takes_the_mode_flag_and_the_file_flags() {
     let e = check(&["kbf", "--mode=daemon", "--bogus"]).expect_err("refused");
     assert!(e.contains("unexpected argument"), "{e}");
     // `--label` is gone: a unit that still passes it is refused, naming the flag.
-    let e = check(&["kbf", CHECK_ARGS, "--mode=daemon", "--label=a=b"]).expect_err("refused");
+    let e = check(&["kbf", "--mode=daemon", "--label=a=b"]).expect_err("refused");
     assert!(e.contains("--label"), "{e}");
     // A flag with a file that is not there: the file is what is refused.
     let e = check(&["kbf", "--mode=daemon", "--config=/x", "--bogus"]).expect_err("refused");
