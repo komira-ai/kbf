@@ -70,7 +70,10 @@ pub const STATE_MODE: u32 = 0o700;
 /// The installer's configuration, which `kbf-installer setup` writes and whose existence
 /// opens the gate.
 pub const GATE: &str = "/usr/local/etc/kbf/installer.toml";
-/// What the property list runs: the installed tool in its service mode.
+/// The launchd job `run` kickstarts after a swap: the node's daemon (`MAC_DAEMON_LABEL` of
+/// `kbf-installer setup`; Macs are nodes only).
+pub const DAEMON_LABEL: &str = "com.komira.kbf-daemon";
+/// What the property list runs: the installed tool, in `run`, naming [`DAEMON_LABEL`].
 pub const PROGRAM: &str = "/usr/local/kbf-installer/bin/kbf-installer";
 
 /// The package's file name for `version`.
@@ -113,7 +116,8 @@ pub fn gate_problems(plist: &str) -> Vec<String> {
             "runs the installed tool in its service mode",
             format!(
                 "<key>ProgramArguments</key><array><string>{PROGRAM}</string>\
-                 <string>serve</string></array>"
+                 <string>run</string><string>--launchd-label</string><string>{DAEMON_LABEL}</string>\
+                 </array>"
             ),
         ),
         (

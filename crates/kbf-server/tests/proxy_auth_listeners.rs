@@ -103,6 +103,7 @@ fn start_denying(with_proxy: bool, deny_list: Option<DenyList>) -> Server_ {
         hello_wait: Duration::from_millis(300),
         tick: Duration::from_millis(50),
         unservable_wait: kbf_sched::UNSERVABLE_WAIT,
+        default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
