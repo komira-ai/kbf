@@ -116,21 +116,24 @@ impl Checker {
             if op.wait.is_some() || verdict != Verdict::Servable {
                 notes.push((id, verdict));
             }
-            // A servable operation that fits nowhere now and runs alone on some worker
-            // that could run it (an action at the worker's whole memory) holds one
-            // worker, so that it empties: the one it held last round while that could
-            // still run it, else the one with the fewest leases, then the least booked,
-            // then the first by name.
-            let alone = m
-                .iter()
-                .any(|&i| exclusive(self.workers[live[i]].capacity, op.request.resources));
+            // A servable operation that fits nowhere now and would run alone on some
+            // worker (an action at the whole memory of a worker that could run it) holds
+            // one worker it would run alone on, so that it empties: the one it held last
+            // round while that could still run it, else the one with the fewest leases,
+            // then the least booked, then the first by name. A worker with less memory
+            // than the action asks for, or with more, is not one.
+            let alone_on = |i: usize| {
+                let capacity = self.workers[live[i]].capacity;
+                fits(capacity, op.request.resources) && exclusive(capacity, op.request.resources)
+            };
+            let alone = m.iter().any(|&i| alone_on(i));
             if !placed && verdict == Verdict::Servable && alone {
                 let could: Vec<usize> = m
                     .iter()
                     .copied()
                     .filter(|&i| {
                         let skipped = held_back.contains(&i) || (elsewhere && avoided(i));
-                        !skipped && fits(self.workers[live[i]].capacity, op.request.resources)
+                        !skipped && alone_on(i)
                     })
                     .collect();
                 let kept = self

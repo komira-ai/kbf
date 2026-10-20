@@ -480,11 +480,14 @@ impl Check {
                     }
                 }
             };
-            // An action at a worker's whole memory that fits nowhere now holds a worker
-            // (F4 and F1 model which); this reference does not, so it fails loudly if
-            // F3's world ever sends one.
+            // An action at the whole memory of a worker that could run it that fits
+            // nowhere now holds a worker (F4 and F1 model which); this reference does
+            // not, so it fails loudly if F3's world ever sends one.
             let alone = names.iter().any(|w| {
-                usable(w, false) && exclusive(self.workers[w].capacity, request.resources)
+                let capacity = self.workers[w].capacity;
+                usable(w, false)
+                    && capacity.fits(&request.resources)
+                    && exclusive(capacity, request.resources)
             });
             self.ensure(
                 !(fit.is_none() && class == Class::Servable && alone),

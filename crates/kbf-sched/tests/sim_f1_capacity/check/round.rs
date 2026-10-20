@@ -133,22 +133,21 @@ impl Checker {
             if expected.len() == ROUND && v != Verdict::Servable {
                 self.stats.verdicts_past_cut += 1;
             }
-            // A servable operation that fits nowhere now and runs alone on some worker
-            // that could run it (an action at the worker's whole memory) holds one
-            // worker, so that it empties: the one it held last round while that could
-            // still run it, else the one with the fewest leases, then the least booked,
-            // then the first by name.
-            let mut alone = false;
-            for name in &names {
-                alone |= exclusive(self.workers[name].capacity, res) && self.matches(need, name);
-            }
+            // A servable operation that fits nowhere now and would run alone on some
+            // worker (an action at the whole memory of a worker that could run it)
+            // holds one worker it would run alone on, so that it empties: the one it
+            // held last round while that could still run it, else the one with the
+            // fewest leases, then the least booked, then the first by name. A worker
+            // with less memory than the action asks for, or with more, is not one.
+            let mut alone_on = |name: &WorkerId| {
+                let capacity = self.workers[name].capacity;
+                exclusive(capacity, res) && fits_whole(capacity, res) && self.matches(need, name)
+            };
+            let alone = names.iter().any(&mut alone_on);
             if v == Verdict::Servable && alone {
                 let mut could: Vec<&WorkerId> = Vec::new();
                 for name in &names {
-                    if !held_back.contains(name)
-                        && fits_whole(self.workers[name].capacity, res)
-                        && self.matches(need, name)
-                    {
+                    if !held_back.contains(name) && alone_on(name) {
                         could.push(name);
                     }
                 }

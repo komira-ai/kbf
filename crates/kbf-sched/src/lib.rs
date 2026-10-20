@@ -32,8 +32,9 @@
 //! - whole-machine leases: one goes only to a worker that holds no lease, and books
 //!   all of it, so nothing is placed beside it; one that fits nowhere holds a worker
 //!   that could run it, in queue (QoS) order, and less urgent work is not placed there
-//!   until it has emptied. An action at a worker's whole memory (the last step of the
-//!   memory ladder) runs alone and holds a worker the same way;
+//!   until it has emptied. An action at the whole memory of a worker that could run it
+//!   (the last step of the memory ladder) runs alone there and holds such a worker the
+//!   same way; an action below the memory of every worker that could run it holds none;
 //! - work no live worker can run (none satisfies its platform, or none that does is
 //!   large enough) waits with a reason its callers see, and is refused after
 //!   [`UNSERVABLE_WAIT`], the refusal committed before its callers are answered;

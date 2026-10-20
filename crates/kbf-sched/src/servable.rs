@@ -149,31 +149,18 @@ impl Servable {
         Some((name, booked, device))
     }
 
-    /// Whether `request` runs only on a worker that holds no other lease: a whole-machine
-    /// lease, or an action at the whole memory of a worker that could run it
-    /// ([`Worker::exclusive`]). Such a request fitting nowhere holds a worker
-    /// ([`Servable::reserve`]), because placement spreads work over the workers: left to
-    /// itself, none would ever empty while work keeps arriving.
-    pub(crate) fn needs_empty_worker(
-        &mut self,
-        workers: &BTreeMap<WorkerId, Worker>,
-        request: &Request,
-    ) -> bool {
-        if request.kind == LeaseKind::WholeMachine {
-            return true;
-        }
-        let at = self.matching(workers, request);
-        self.memo[at]
-            .1
-            .iter()
-            .any(|&i| workers[&self.live[i]].exclusive(request))
-    }
-
-    /// The worker to hold for a `request` that [needs an empty
-    /// worker](Servable::needs_empty_worker) and fits nowhere now: `kept` if it still
-    /// could run it, else the one that could which holds the fewest leases, then has the
-    /// least booked, then comes first by name. Never one in `reserved`, nor one in
+    /// The worker to hold for a `request` that fits nowhere now and would run with no
+    /// other lease on it ([`Worker::would_run_alone`]): a whole-machine lease, or an
+    /// action at the whole memory of a worker that could run it. `kept` if it still
+    /// could, else the one it would run alone on which holds the fewest leases, then has
+    /// the least booked, then comes first by name. Never one in `reserved`, nor one in
     /// `avoid` while [`Servable::fit`] skips it.
+    ///
+    /// Placement spreads work over the workers: left to itself, none would ever empty
+    /// while work keeps arriving, hence the hold. A request that asks for less than the
+    /// memory of every worker that could run it holds nothing, however small another
+    /// worker of the farm is, and a bigger worker that has room for it beside others is
+    /// not held: it takes the request when its cores free.
     pub(crate) fn reserve(
         &mut self,
         workers: &BTreeMap<WorkerId, Worker>,
@@ -191,7 +178,7 @@ impl Servable {
             .filter(|name| {
                 !reserved.contains(*name)
                     && !skip.contains(*name)
-                    && workers[*name].capacity.fits(&request.resources)
+                    && workers[*name].would_run_alone(request)
             })
             .collect();
         if let Some(kept) = kept.filter(|kept| candidates.contains(kept)) {
