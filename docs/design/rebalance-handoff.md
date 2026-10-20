@@ -37,7 +37,7 @@ never data, and the three cases a copy-between-nodes design misses are covered:
   other members flush after it are adopted by a standing tail pass (P3).
 - **r=1.** A joiner owns nothing under the current map at r=1, so a fill check against the
   current owner sets is vacuous. The check is made against the map computed as if the joiner
-  were Active (P1 of kbf-map below).
+  were Active (the `owners_assuming` addition in PR 1 of section 9).
 
 Primitives, all additive:
 
@@ -80,8 +80,8 @@ Grafts from two other designs that were considered:
 A joiner is filled when all of these hold:
 
 1. Its index is rebuilt (the rebuild of its meta log is done, `CaughtUp`).
-2. Every object staged anywhere before the barrier is flushed: every fresh Active or Draining
-   member reports `flush_clear_gen >= g_j`.
+2. Every object staged anywhere before the barrier is flushed: every fresh member that can
+   flush, whatever its state, reports `flush_clear_gen >= g_j`.
 3. A tail pass that started after that barrier has finished on the joiner
    (`tail_epoch_done >= e`).
 4. The joiner's fill report carries the current placement fingerprint, computed with the
@@ -112,14 +112,19 @@ Map states are unchanged: `joining`, `catching-up`, `active`, `draining`, `down`
 
 ### Join
 
-The `unfilled/<id>` mark, today an empty presence mark, becomes `{g_j, fp, phase, epoch}`.
+The `unfilled/<id>` mark, today an empty presence mark, becomes `{g_j, fp, phase, epoch, fence_boots}`.
 A reader that predates this sees a mark and treats the node as unfilled, as today.
 
 - **Phase A, flushing.** The joiner is `joining`, takes writes, is never rank 1, is read last,
   and runs its index rebuild (a node registering with an unfinished rebuild registers
   rebuilding and is written `joining` when the farm holds data; this exists today). A to B
-  fires in the sweeper's `refresh` when every fresh Active or Draining member has
-  `flush_clear_gen >= g_j`. A Down member still inside its dwell blocks it. The frontend then
+  fires in the sweeper's `refresh` when every fresh member has `flush_clear_gen >= g_j`,
+  whatever its state: Active, Draining, Joining and CatchingUp, including the joiner itself and
+  any second concurrent joiner. P1 lets a node of any state flush a blob it does not own, so a
+  second joiner can hold staged blobs of other owners; counting only Active and Draining
+  members would let the barrier pass while those blobs are still staged. A member that has
+  not yet reported `flush_known` is not fresh and blocks. A Down member still inside its dwell
+  blocks it. The frontend then
   bumps `meta/tail_epoch` to e, writes `{phase=B, epoch=e, fp}` and writes `handoff/base` if
   absent.
 - **Phase B, adopting.** B to Active runs in the joiner's own beat, inside `touch`, as one
@@ -132,6 +137,12 @@ A reader that predates this sees a mark and treats the node as unfilled, as toda
   - the settle time has passed since all of these first held;
   - the sampled audit passed;
   - the row is still `joining` (not `draining`) and the mark version matches.
+- **Owner boots at the fence.** When the frontend bumps `tail_epoch` to e it records, in the
+  mark body, the boot of every write owner it will later ask (Active, Joining, CatchingUp) as
+  `fence_boots`, read from the map it bumped under. A node's `tail_epoch_done` ack carries the
+  boot that did the pass, and the ack is accepted only if it equals the recorded boot; an
+  ack from another boot is stale (the index of a restarted node may be rebuilding). The drop
+  re-confirm (below) checks the same recorded boots.
 - The swap deletes `unfilled/<id>` and writes `meta/members_formed` in one transaction.
 - **Pass 2.** After the first tail pass succeeds the joiner repeats an incremental pass;
   `complete` requires zero new adoptions, or a restart of the pass if the fingerprint changed.
@@ -139,7 +150,7 @@ A reader that predates this sees a mark and treats the node as unfilled, as toda
 
 ### Drain
 
-The `draining/<id>` mark holds `{g_d, fp, phase, epoch}`.
+The `draining/<id>` mark holds `{g_d, fp, phase, epoch, fence_boots}`; `fence_boots` is written with the A to B bump.
 
 - **A.** The drainer takes no writes and is read first. P1 makes it flush everything it stages.
 - **A to B.** When its `flush_clear_gen >= g_d` the frontend bumps `tail_epoch` and writes
@@ -156,22 +167,29 @@ The `draining/<id>` mark holds `{g_d, fp, phase, epoch}`.
   `drained=true`, and the operator runs `finish_drain` (or `--drain-auto-leave` does);
   `--exit-on-drained` exits the process.
 
-Drop conditions, all required: the object is flushed with the read-back confirmed; it is not
-staged; the node is not a write owner of any of its blobs, or is Draining; and the guarantee is
-epoch-barrier based, with a per-blob check as the re-confirm. The barrier: the B to C condition
-above (every write owner reports `tail_epoch_done >= e`, so each has adopted every blob listed
-at epoch e). The re-confirm, run by the drainer per object just before dropping it: (1) read the
-object back from the cold store and verify its digest; (2) for the object's blob digests, send
-each current owner (from the current map, including Joining and CatchingUp) a `FindMissingBlobs`
-request in batches of at most 1000 digests, and require an empty missing set from every owner;
-(3) require each owner's boot, taken from the map, to equal the boot recorded at the epoch
-fence, so a restarted owner (whose index may be rebuilding) fails the check and the object is
-retried later. Bandwidth bound: at most one cold-store read per dropped object and
-ceil(blobs/1000) x owners small RPCs per object, rate-limited by the drop delay and a per-drain
-cap of 4 concurrent objects; the heartbeat carries no per-blob data. The audit stays a
-probabilistic extra, not part of the guarantee. `EVICT_GRACE` has elapsed;
-and a drop delay has elapsed. The drop never deletes from the cold store. Reclaim outside a
-drain is out of scope; disk-pressure eviction continues as today.
+Drop conditions, all required:
+
+1. The object is flushed and the cold-store read-back (digest verified) succeeded.
+2. The object is not staged.
+3. The node is not a write owner of any of its blobs, or is Draining.
+4. The epoch barrier holds: the B to C condition above (every write owner reports
+   `tail_epoch_done >= e` with a matching fingerprint), so each has adopted every blob listed
+   at epoch e.
+5. The per-blob re-confirm, run by the drainer per object just before dropping it: for the
+   object's blob digests, send each current owner (from the current map, including Joining
+   and CatchingUp) a `FindMissingBlobs` request in batches of at most 1000 digests, and require
+   an empty missing set from every owner.
+6. The boot check: each owner's boot, taken from the map, equals its boot in `fence_boots`
+   (the boot recorded at the epoch fence). A restarted owner, whose index may be rebuilding,
+   fails the check and the object is retried later.
+7. `EVICT_GRACE` has elapsed.
+8. The drop delay has elapsed.
+
+Bandwidth bound: at most one cold-store read per dropped object and ceil(blobs/1000) x owners
+small RPCs per object, rate-limited by the drop delay and a per-drain cap of 4 concurrent
+objects; the heartbeat carries no per-blob data. The audit stays a probabilistic extra, not
+part of the guarantee. The drop never deletes from the cold store. Reclaim outside a drain is
+out of scope (section 8 says what disk-pressure eviction does).
 
 ### Pin and its release
 
@@ -188,7 +206,7 @@ operator retries after one completes.
 Optional fields with new numbers; an old peer ignores them.
 
 - `HeartbeatRequest` (today fields 1 to 10, last is `writes_known`): `flush_clear_gen`,
-  `flush_known`, `tail_epoch_done`, `fill_fp`, `staged_objects`, `staged_bytes`, `drained`,
+  `flush_known`, `tail_epoch_done` (the ack carries the node's boot, which the heartbeat already sends as `boot`), `fill_fp`, `staged_objects`, `staged_bytes`, `drained`,
   `seen_gen` (sent by map consumers that are frontends).
 - `HeartbeatResponse` (today `map_generation`, `map`, `objstore_generation`): `tail_epoch`,
   `drain_confirmed`.
@@ -232,7 +250,7 @@ Spec tests:
    barrier.
 2. **A node holds a blob until the new owner confirms.** Drain with the flush held by fault
    injection: no drop. Release it: the fence closes and the drop happens. Mutants, each red:
-   drop at Draining; ignore one member's ack; skip the re-confirm; key the confirm without the
+   drop at Draining; ignore one member's ack; drop Joining and CatchingUp owners from the ack set; drop Joining and CatchingUp owners from the confirm set (each separately: a blob only a Joining owner lacks must block the drop); skip the re-confirm; key the confirm without the
    boot; skip the release signal.
 3. **A rebuild after a wipe stays catching-up.** Exists today (see Verified facts). Added: the
    tail does not skip the rebuild, and a joiner wiped mid-fill is not reported complete.
@@ -281,6 +299,10 @@ Extra tests:
   flusher gate then picks it; tested.
 - r=1 promotion needs its own test and soak before the default flips.
 - No non-drain reclaim: disk grows on displaced owners until pressure eviction.
+- Disk-pressure eviction outside a drain is a drop path without the per-blob confirm. Nothing
+  is lost, because the cold store keeps the object, but a false miss is possible: if the owner
+  has not adopted the object yet, a read that reaches it before the tail does can miss. The
+  design does not change that path; the confirm applies only to the drain drop.
 - The `file://` fallback adds scan load and large pulls if enabled; default off, throttled.
 
 ## 9. Pull request plan
@@ -293,7 +315,7 @@ Extra tests:
 | 3 | Orphan flush and `flush_clear_gen` | `kbf-storage` flush, `kbf-front` cache flush, proto fields, staged metric | M | Red first: Draining and r=1 staged blobs never flush today | 5 |
 | 4 | Tail adoption | `kbf-front` cache tail, `kbf-objstore` conformance case, wire fields | M | Red first: a segment flushed by another member after the rebuild is not readable today; per-member cursor mutant | 5 |
 | 5 | Automatic promotion | `members.rs` (`refresh`, `touch`), `join.rs`, mark phases, rules, audit, `--auto-promote` default off | L | Red first: spec test 1 end to end plus mutants | 6 |
-| 6 | Drain completion and drop | `draining/<id>` phases, `drain_confirmed`, `Cache::drop_confirmed`, `seen_gen`, `finish_drain`, flags; fixes the notes in `update/mod.rs`, `members.rs`, `operator-verbs.md`, `docs/api.md`, the "8.4" cross-reference in `architecture-v2.md`, P6 | L | Red first: spec test 2 with all mutants | 7 |
+| 6 | Drain completion and drop | node-to-node `FindMissingBlobs` client on owners (peer addresses and auth from the map; unavailable-owner and retry handling) with its tests, `draining/<id>` phases, `drain_confirmed`, `Cache::drop_confirmed`, `seen_gen`, `finish_drain`, flags; fixes the notes in `update/mod.rs`, `members.rs`, `operator-verbs.md`, `docs/api.md`, the "8.4" cross-reference in `architecture-v2.md`, P6 | L | Red first: spec test 2 with all mutants | 7 |
 | 7 | Node-pull tier (only if the owner answers 1 below with a node-local store) | handoff engine for `file://` | M | default off | none |
 | 8 | Operator surface and defaults | `GET /v1/members` fields, backlog metric, `blocked_on[]`; flip `--auto-promote` after soak | S | Soak with r=1 and r=3 | none |
 
