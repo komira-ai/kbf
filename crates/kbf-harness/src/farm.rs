@@ -167,6 +167,11 @@ pub fn control_socket(dir: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("kbf-farm-{:x}.sock", path_tag(dir)))
 }
 
+/// The frontend's `--default-platform` on a test box: every node is this host, whatever
+/// its architecture. The unit's default (`linux/x86_64`) leaves an action that names no
+/// architecture with no worker on an aarch64 host.
+const ONE_HOST_PLATFORM: &str = "--default-platform=none";
+
 impl Farm {
     /// Renders the units and starts a process from each, then waits for each process's
     /// start line. `dir` holds every process's directories (and must be fresh); `logs`
@@ -184,6 +189,7 @@ impl Farm {
     ///   is planted and `--id-files` stands for `/etc/subuid`;
     /// - with [`Driver::Native`], `--driver=native` replaces it and `KBF_IMAGES` is empty
     ///   (only the container driver takes `--image`);
+    /// - the frontend's `--default-platform` is `none` (the nodes are this host);
     /// - the frontend's control socket is in the temporary directory (a `RuntimeDirectory=`
     ///   is systemd's, and a scratch path is too long for a socket's);
     /// - the topology's [`Limits`] and overrides are set on top.
@@ -314,6 +320,7 @@ impl Farm {
         let unit = overrides(
             Role::Frontend,
             unit.replace(&[state])
+                .set(&[ONE_HOST_PLATFORM.to_owned()])
                 .append(&[control])
                 .set(&topo.limits.frontend),
         );
