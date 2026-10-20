@@ -503,6 +503,28 @@ fn a_mac_host_comes_over_through_launchd() {
     );
 }
 
+/// Catches a rig that lets a job be bootstrapped twice: launchd refuses a loaded job, so the
+/// rig must too, or the test above would pass without the start booting the job out.
+///
+/// Mutant seen red: the rig's refusal dropped (the bootstrap of a loaded job succeeds).
+#[test]
+fn the_rig_refuses_to_bootstrap_a_loaded_job() {
+    use kbf_host::{Cmd, Exec, Step, path::HostPath};
+    let mut rig = Rig::mac("mac-refuses");
+    let daemon = "com.komira.kbf-daemon.plist";
+    rig.active.borrow_mut().insert(daemon.to_owned());
+    let bootstrap = Cmd::new(HostPath::new("/bin/launchctl").expect("path"))
+        .arg("bootstrap")
+        .arg("system")
+        .arg("/Library/LaunchDaemons/com.komira.kbf-daemon.plist");
+    let error = rig
+        .host
+        .apply(&Step::Run(bootstrap))
+        .expect_err("a loaded job is refused");
+    assert!(error.to_string().contains("is loaded"), "{error}");
+    assert!(rig.events.borrow().is_empty());
+}
+
 /// Catches a launchd start that bootstraps a loaded job, which a real launchd refuses (the
 /// rig refuses it too): the start boots the job out first.
 ///
