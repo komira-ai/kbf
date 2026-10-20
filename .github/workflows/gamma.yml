@@ -1,0 +1,138 @@
+# Gamma: our own build farm, deployed from a release that was cut.
+#
+# The `release` workflow cuts a release on a push to main (gates, plan, verify, tag, publish).
+# When that run completes, this file follows it. A `workflow_run` runs the default branch's
+# copy of this file with this repository's token and the environment's credentials, so it checks
+# out no ref of the run and gives a script nothing of the run's text: the commit and the run
+# arrive through `env:`, and `cargo xtask` checks them.
+#
+# `offer` has read scopes, no credentials and no environment. `cargo xtask gamma evidence`
+# asks GitHub whether that run was a push to main whose publish job succeeded; a push that cut
+# nothing (docs only) leaves the run green and this file with nothing to do. Then `cargo xtask
+# release stage-offer` downloads the release, verifies every attestation before it runs
+# anything of it, makes the offer for gamma (the fixed waiver of beta, never for prod) and
+# writes `offer.json` and the release's files into one tar, which is uploaded for three days.
+#
+# `deploy` is the one job that reaches the farm: the Tailscale identity of its tag may ssh to
+# the one gamma host as the one deploy account, which sudo lets run the one command of
+# `cargo xtask gamma sudoers-line` and nothing else. `cargo xtask gamma deploy` refuses unless
+# the commit is the highest release tag, sends the tar on standard input and keeps the
+# installer's summary out of the log and the artifact: the table and the uploaded file are the
+# redacted one. The tar is bytes, not trust: the host verifies the attestations itself.
+#
+# Inert until configured: with any of the repository variables GAMMA_HOST, GAMMA_USER and
+# TS_TAG unset, `deploy` is skipped, which is a green run. Deleting one is the stop switch.
+# The OAuth client is the only credential, a secret of the `gamma` environment, which allows
+# deployments from main only, and it reaches one step, after `cargo xtask` is built. Nothing
+# here names a host or a user. The workflow lint (crates/kbf-it/tests/workflows/workflow_run.rs)
+# holds this file to all of that.
+name: gamma
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+# One deploy at a time. A newer run queues behind a running deploy, which is never cancelled
+# mid-roll; a queued run for a commit that is no longer the highest release is refused before
+# anything reaches the farm.
+concurrency:
+  group: gamma
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  offer:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+    outputs:
+      staged: ${{ steps.stage.outputs.staged }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # Built before any step holds the token, so no build script runs beside it.
+      - run: cargo build -p xtask --locked
+      - name: The release run was a push to main whose publish job succeeded
+        id: evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask gamma evidence --repo "$GITHUB_REPOSITORY" --sha "$SHA" --run-id "$RUN_ID" --output "$GITHUB_OUTPUT"
+      - name: Verify the release, make the offer for gamma and stage the tar
+        id: stage
+        if: ${{ steps.evidence.outputs.released == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask release stage-offer --repo "$GITHUB_REPOSITORY" --sha "$SHA" --out "$RUNNER_TEMP/offer" --output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.stage.outputs.staged == 'true' }}
+        with:
+          name: gamma-offer
+          path: ${{ runner.temp }}/offer
+          retention-days: 3
+          if-no-files-found: error
+
+  deploy:
+    needs: [offer]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && needs.offer.outputs.staged == 'true' && vars.GAMMA_HOST != '' && vars.GAMMA_USER != '' && vars.TS_TAG != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    environment: gamma
+    permissions:
+      contents: read
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # Built before the step that holds the OAuth client, so no build script runs beside it.
+      - run: cargo build -p xtask --locked
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gamma-offer
+          path: ${{ runner.temp }}/offer
+      - uses: tailscale/github-action@a392da0a182bba0e9613b6243ebd69529b1878aa # v4.1.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ vars.TS_TAG }}
+          use-cache: true
+      # GitHub prints a variable in the log of a step whose environment has it, so only this
+      # step has these two; `gamma deploy` masks them before it prints anything else.
+      - name: Deploy on the gamma host
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GAMMA_HOST: ${{ vars.GAMMA_HOST }}
+          GAMMA_USER: ${{ vars.GAMMA_USER }}
+        run: cargo xtask gamma deploy --repo "$GITHUB_REPOSITORY" --sha "$SHA" --host "$GAMMA_HOST" --user "$GAMMA_USER" --bundle "$RUNNER_TEMP/offer/bundle.tar" --raw "$RUNNER_TEMP/raw.json" --summary summary.json
+      - name: Table of the nodes by platform and state
+        if: ${{ always() }}
+        run: cargo xtask gamma summary --file summary.json --output "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: gamma-summary
+          path: summary.json
+          if-no-files-found: warn
+          retention-days: 30

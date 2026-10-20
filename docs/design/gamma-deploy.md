@@ -50,6 +50,12 @@ The token in the token file is the operator token the proxy checks on every rout
 probes. Where `setup` puts that file is the proxy's design (`docs/design/frontend-proxy.md`,
 section 4, "Auth"), not this verb's.
 
+The sudoers line is generated, not written by hand: `cargo xtask gamma sudoers-line --user <account>` prints it, and
+`cargo xtask gamma deploy` (the step of `gamma.yml`, `docs/design/kbf-cicd.md` section 5.4) sends its command from the same
+argument list, with the commit as forty `[0-9a-f]` classes and no wildcard. A test holds the two together: the pattern
+allows the command sent for a real commit and no other, and none of the flags sent is one this verb refuses through
+`sudo`. The account may not be `root` (a root caller is not "through sudo", so the flags above would not be refused).
+
 A farm whose `/v1/nodes` lists no node (an empty list, or no `nodes` array) is refused in
 preflight (exit 3, `no_nodes`); the wait for nodes and the post check each need at least one
 node, so an empty list never reads as "every node confirmed".

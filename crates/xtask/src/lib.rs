@@ -51,6 +51,11 @@
 //!   the files a push run of the artifacts workflow on `main` built and attested for a
 //!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
 //!   replaces nothing.
+//! - `gamma {evidence,deploy,summary,sudoers-line,held-steps}` ([`gamma`]): the steps of
+//!   `gamma.yml`, which follows a cut release to the one gamma host: whether the release run
+//!   published, the deploy through `tailscale ssh` and `sudo` (refused unless the commit is
+//!   the highest release), its summary with no node or host in it, the sudoers line, and the
+//!   settings a person makes once (printed, never applied).
 //! - `crun-tests [--sudo <path>]` ([`crun_tests`]): the container driver's real-`crun`
 //!   tests on a hosted Linux runner, each test target in its own `Delegate=yes` system
 //!   unit.
@@ -76,6 +81,7 @@ pub mod crun_tests;
 pub mod darwin;
 pub mod entitlements;
 pub mod fetch;
+pub mod gamma;
 pub mod installer_tarball;
 pub mod package;
 pub mod pkg;
@@ -399,6 +405,10 @@ enum Verb {
     /// A GitHub release of a `main` commit's attested assets, never rebuilt.
     #[command(subcommand)]
     Release(ReleaseVerb),
+    /// The steps of `gamma.yml`: the release run's evidence, the deploy on the gamma host,
+    /// its table, the sudoers line and the settings a person makes once.
+    #[command(subcommand)]
+    Gamma(GammaVerb),
     /// Run the container driver's real-crun tests on a hosted Linux runner, each
     /// test target in its own Delegate=yes system unit as this user.
     CrunTests {
@@ -630,6 +640,88 @@ impl SubjectArgs {
             main_ref: &self.main_ref,
         }
     }
+}
+
+#[derive(Subcommand)]
+enum GammaVerb {
+    /// Whether run `--run-id` of the release workflow released `--sha`: a push to main that
+    /// succeeded, whose publish job succeeded. Prints `released=<true|false>`.
+    Evidence {
+        /// The repository, `<owner>/<repo>` (on Actions, `GITHUB_REPOSITORY`).
+        #[arg(long)]
+        repo: String,
+        /// The commit the run is for, a full SHA (the triggering run's `head_sha`).
+        #[arg(long)]
+        sha: String,
+        /// The release run (the triggering run's `id`).
+        #[arg(long)]
+        run_id: u64,
+        /// Append `released=<true|false>` to this file (on Actions, `GITHUB_OUTPUT`).
+        #[arg(long)]
+        output: PathBuf,
+        /// The `gh` program.
+        #[arg(long, default_value = "gh")]
+        gh: PathBuf,
+    },
+    /// Run `kbf-installer deploy` on the gamma host over Tailscale SSH, for the highest
+    /// release only, and write the summary without any node or host in it.
+    Deploy {
+        /// The repository, `<owner>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// The released commit, a full SHA.
+        #[arg(long)]
+        sha: String,
+        /// The gamma host's tailnet name (masked in the log).
+        #[arg(long)]
+        host: String,
+        /// The deploy account on it (masked in the log).
+        #[arg(long)]
+        user: String,
+        /// The tar `release stage-offer` wrote, sent on standard input.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Where the installer's own summary goes; it names nodes and is never uploaded.
+        #[arg(long)]
+        raw: PathBuf,
+        /// Where the redacted summary goes.
+        #[arg(long)]
+        summary: PathBuf,
+        /// The `tailscale` program.
+        #[arg(long, default_value = "tailscale")]
+        tailscale: PathBuf,
+        /// The `gh` program.
+        #[arg(long, default_value = "gh")]
+        gh: PathBuf,
+    },
+    /// Append a table of the redacted summary to a file (`GITHUB_STEP_SUMMARY`).
+    Summary {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// The sudoers line that lets the deploy account run the deploy command as root.
+    SudoersLine {
+        /// The deploy account on the gamma host.
+        #[arg(long)]
+        user: String,
+    },
+    /// Print the settings a person makes once. It changes nothing.
+    HeldSteps {
+        /// The repository, `<owner>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// The gamma host's tailnet name.
+        #[arg(long)]
+        host: String,
+        /// The deploy account on it.
+        #[arg(long)]
+        user: String,
+        /// The Tailscale tag the runner joins as.
+        #[arg(long, default_value = "tag:kbf-gamma-ci")]
+        tag: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -963,6 +1055,42 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         Verb::VerifyAssets(VerifyAssets::Sums { dir }) => {
             Ok(vec![sums::verify_sums(&dir, fetch::Sha256::of)?])
         }
+        Verb::Gamma(GammaVerb::Evidence {
+            repo,
+            sha,
+            run_id,
+            output,
+            gh,
+        }) => gamma::evidence(&gh, &repo, &sha, run_id, &output),
+        Verb::Gamma(GammaVerb::Deploy {
+            repo,
+            sha,
+            host,
+            user,
+            bundle,
+            raw,
+            summary,
+            tailscale,
+            gh,
+        }) => gamma::deploy(&gamma::Deploy {
+            gh: &gh,
+            tailscale: &tailscale,
+            repo: &repo,
+            sha: &sha,
+            host: &host,
+            user: &user,
+            bundle: &bundle,
+            raw: &raw,
+            summary: &summary,
+        }),
+        Verb::Gamma(GammaVerb::Summary { file, output }) => gamma::summary(&file, &output),
+        Verb::Gamma(GammaVerb::SudoersLine { user }) => Ok(vec![gamma::sudoers_line(&user)?]),
+        Verb::Gamma(GammaVerb::HeldSteps {
+            repo,
+            host,
+            user,
+            tag,
+        }) => gamma::held_steps(&repo, &host, &user, &tag),
         Verb::Release(ReleaseVerb::Locate {
             repo,
             commit,
