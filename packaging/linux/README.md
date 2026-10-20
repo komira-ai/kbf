@@ -66,6 +66,20 @@ the binary names the commit), and `cargo xtask pkg-asset` makes
 a bundle ([docs/artifacts.md](../../docs/artifacts.md#the-kbf-installer-package-deb)).
 Two call sites, one way to build: both go through `pkg-config` and `pkg-build`.
 
+## What the units run
+
+- `kbf-installer.service` runs `/usr/bin/kbf-installer run`. It names no unit: `run` restarts
+  the unit `setup` enabled for the `mode` of `/etc/kbf/kbf.toml` (on a frontend or all-in-one
+  host it also reads the state database from `/etc/kbf/installer.toml`), so one packaged unit
+  serves every mode. `--unit` and `--launchd-label` still name the service by hand. The unit has
+  no `ExecStartPre=`: the contract's `check` is not built, and a stub would fail every start.
+- Each mode unit runs `/var/lib/kbf-installer/releases/current/kbf`, the link the installer
+  creates and flips (`layout.rs`), after `kbf-installer boot-check`. The frontend template
+  runs its `slots/%i` link.
+- `crates/kbf-it/tests/package_installer_verbs.rs` parses every `kbf-installer` command line of
+  these units, and of the macOS property list, with the binary's own parser and refuses a verb that
+  is not built; it also holds the exec path to the layout's.
+
 ## Commands
 
 ```

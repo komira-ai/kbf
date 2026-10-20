@@ -36,8 +36,7 @@ use kbf_types::{NodeId, RefusalReason, Role};
 use sha2::{Digest as _, Sha256};
 
 use super::service::{
-    EnrollService, advertise_refused, certs_of, config_generation, csrs_of, registry_reason,
-    renew_after,
+    EnrollService, advertise_refused, certs_of, csrs_of, registry_reason, renew_after,
 };
 
 impl EnrollService {
@@ -106,8 +105,8 @@ impl EnrollService {
         Ok(pb::RenewResponse {
             certs: certs_of(&renewed.certs),
             ca_bundle_pem: core.ca.bundle_pem().into_bytes(),
-            config: (request.config_generation != config_generation(&cold))
-                .then(|| core.config(&renewed, &cold)),
+            config: Some(core.config(&renewed, &cold))
+                .filter(|config| config.generation != request.config_generation),
             server_time: now,
             renew_after: renew_after(now, &renewed.certs),
         })

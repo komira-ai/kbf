@@ -12,6 +12,8 @@ use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+use kbf_tls::CertEntry;
+
 use crate::tls::TlsPaths;
 
 /// A certificate and its key, as PEM, and the certificate's DER.
@@ -50,6 +52,12 @@ impl Pki {
     pub(crate) fn server(&self) -> Leaf {
         let name = SanType::DnsName("localhost".try_into().expect("ia5"));
         self.leaf(vec![name], ExtendedKeyUsagePurpose::ServerAuth, false)
+    }
+
+    /// A server certificate for the DNS name `name`.
+    pub(crate) fn server_named(&self, name: &str) -> Leaf {
+        let san = SanType::DnsName(name.try_into().expect("ia5"));
+        self.leaf(vec![san], ExtendedKeyUsagePurpose::ServerAuth, false)
     }
 
     /// A server certificate whose validity ended before now.
@@ -110,8 +118,12 @@ impl Pki {
     /// the client CA.
     pub(crate) fn write(&self, dir: &Path, server: &Leaf) -> TlsPaths {
         let paths = TlsPaths {
-            cert: dir.join("server.pem"),
-            key: dir.join("server.key"),
+            certs: vec![CertEntry {
+                names: Vec::new(),
+                cert: dir.join("server.pem"),
+                key: dir.join("server.key"),
+                default: true,
+            }],
             client_ca: dir.join("ca.pem"),
         };
         self.install(&paths, server, &self.ca_pem);
@@ -121,8 +133,8 @@ impl Pki {
     /// Replaces the three files whole (write aside, rename), as a renewal tool does.
     pub(crate) fn install(&self, paths: &TlsPaths, server: &Leaf, ca_pem: &str) {
         for (path, content) in [
-            (&paths.cert, &server.cert),
-            (&paths.key, &server.key),
+            (&paths.certs[0].cert, &server.cert),
+            (&paths.certs[0].key, &server.key),
             (&paths.client_ca, &ca_pem.to_owned()),
         ] {
             let aside = path.with_extension("new");
