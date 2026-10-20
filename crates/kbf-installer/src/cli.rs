@@ -57,6 +57,9 @@ pub enum Verb {
     Gc(GcArgs),
     /// Run before each start of a release on trial; counts the start.
     BootCheck(BootArgs),
+    /// Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's
+    /// tree, or put it back with `--rollback`. A dry run without `--apply`.
+    Migrate(MigrateArgs),
     /// For maintainer scripts: take the lock; exit 5 while a swap is pending.
     Quiesce,
     /// Validate the installer's configuration, trust files and path chain.
@@ -234,6 +237,34 @@ pub struct RunArgs {
 }
 
 #[derive(Args)]
+pub struct MigrateArgs {
+    /// Put the old layout back instead (refused once the installer has moved the host on).
+    #[arg(long)]
+    pub rollback: bool,
+    /// A unit that runs kbf from `/usr/local/kbf/current`, to repoint at the installer's tree
+    /// (repeat for several; `.service`, or `.plist` for launchd).
+    #[arg(long = "unit", value_parser = crate::migrate::Unit::new)]
+    pub units: Vec<crate::migrate::Unit>,
+    /// The old helper's unit: stopped and disabled, so the installer is the only manager.
+    #[arg(long, value_parser = crate::migrate::Unit::new)]
+    pub helper_unit: Option<crate::migrate::Unit>,
+    /// The installer's own unit, which a rollback stops and disables first.
+    #[arg(long, value_parser = crate::migrate::Unit::new)]
+    pub installer_unit: Option<crate::migrate::Unit>,
+    /// Where the host gets its releases: decides where the replay floor is seeded from.
+    #[arg(long, value_enum, default_value = "url")]
+    pub release_source: ReleaseSource,
+    /// The lowest generation an order may carry: the floor when there is no frontend to ask.
+    /// Without it and without a frontend the host starts with no generation floor, and the
+    /// run says so.
+    #[arg(long)]
+    pub min_generation: Option<u64>,
+    /// The unprivileged user the old binaries' `--version --json` runs as.
+    #[arg(long, default_value = "kbf-fetch")]
+    pub fetch_user: String,
+}
+
+#[derive(Args)]
 pub struct ProxyArgs {
     /// The installer.toml whose `[proxy]` table configures the proxy.
     #[arg(long, default_value = "/etc/kbf/installer.toml")]
@@ -262,6 +293,7 @@ impl Verb {
             Verb::Rollback(_) => "rollback",
             Verb::Gc(_) => "gc",
             Verb::BootCheck(_) => "boot-check",
+            Verb::Migrate(_) => "migrate",
             Verb::Quiesce => "quiesce",
             Verb::Check => "check",
             Verb::Proxy(_) => "proxy",
@@ -277,8 +309,38 @@ impl Verb {
         !matches!(self, Verb::Status | Verb::Check | Verb::Proxy(_))
     }
 
+    /// Whether the verb changes what a host runs or how it is managed, so it must not run
+    /// while the old layout's state is the host's and unmigrated (the old helper and the
+    /// installer never both manage one host; `migrate` is how that ends). `status`, `check`,
+    /// `boot-check`, `quiesce` and `migrate` itself change no release; `fetch-child` is the
+    /// unprivileged process a verb that does manage the host starts, and manages nothing.
+    ///
+    /// Every verb is named (no `_`): a verb added later does not compile until it says
+    /// which it is.
+    pub fn manages_host(&self) -> bool {
+        match self {
+            Verb::Setup(_)
+            | Verb::Run(_)
+            | Verb::Update(_)
+            | Verb::Confirm(_)
+            | Verb::Revert(_)
+            | Verb::Rollback(_)
+            | Verb::Gc(_)
+            | Verb::Stage
+            | Verb::Activate => true,
+            Verb::Status
+            | Verb::Check
+            | Verb::BootCheck(_)
+            | Verb::Quiesce
+            | Verb::Migrate(_)
+            | Verb::Proxy(_)
+            | Verb::FetchChild => false,
+        }
+    }
+
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
-    /// verbs that exist (`run`, `boot-check`, `proxy`, the operator's verbs and `setup`).
+    /// verbs that exist (`run`, `boot-check`, `proxy`, the operator's verbs, `setup` and
+    /// `migrate`).
     pub fn built_by(&self) -> Option<&'static str> {
         match self {
             Verb::Run(_)
@@ -288,6 +350,7 @@ impl Verb {
             | Verb::Revert(_)
             | Verb::Rollback(_)
             | Verb::Gc(_)
+            | Verb::Migrate(_)
             | Verb::Quiesce
             | Verb::Setup(_) => None,
             Verb::Check => Some("P10"),
