@@ -884,6 +884,7 @@ impl Farm {
         let refused = ResultAck {
             lease_id: Some(wire_lease),
             accepted: false,
+            reason: 0,
         };
         let (holding, recorded, held) = {
             let mut state = self.lock();
@@ -961,6 +962,7 @@ impl Farm {
         Some(ResultAck {
             lease_id: Some(wire_lease),
             accepted,
+            reason: 0,
         })
     }
 
@@ -1616,6 +1618,7 @@ impl State {
             let ack = ResultAck {
                 lease_id: Some(wire_lease(answer.lease)),
                 accepted: true,
+                reason: 0,
             };
             Some((link.outbound.clone(), ack))
         });

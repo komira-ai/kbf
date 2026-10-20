@@ -262,7 +262,7 @@ async fn a_result_ack_is_reported() {
     peer.ack_result(Some((1, 6)), false);
     let (_, (lease, accepted)) = h
         .event(PROMPT, |e| match e {
-            Event::ResultAcknowledged { lease, accepted } => Some((*lease, *accepted)),
+            Event::ResultAcknowledged { lease, accepted, .. } => Some((*lease, *accepted)),
             _ => None,
         })
         .await

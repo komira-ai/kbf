@@ -265,7 +265,14 @@ pub struct DaemonConfig {
     /// HTTP/2 keepalive on the worker stream's channel, normally
     /// [`KeepAlive::DEFAULT`]; the binary gives its blob channel the same.
     pub keep_alive: KeepAlive,
+    /// The most Results the daemon keeps for resending until the server acknowledges
+    /// them, normally [`MAX_UNACKED`]. Over it a new Result is sent once and not kept.
+    pub max_unacked: usize,
 }
+
+/// The default [`DaemonConfig::max_unacked`]: far above the Results a node has in flight,
+/// so only a server that never acknowledges reaches it.
+pub const MAX_UNACKED: usize = 1024;
 
 impl DaemonConfig {
     /// A configuration for one server URL, with the production fence time.
@@ -281,6 +288,7 @@ impl DaemonConfig {
             welcome_timeout: Duration::from_secs(10),
             recheck_every: RECHECK_EVERY,
             keep_alive: KeepAlive::DEFAULT,
+            max_unacked: MAX_UNACKED,
         }
     }
 

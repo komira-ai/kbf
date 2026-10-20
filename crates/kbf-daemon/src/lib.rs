@@ -41,6 +41,7 @@
 //! crate, so a binary here naming them would be a cycle Cargo refuses. It never offers
 //! [`LocalRuntime`], which isolates nothing.
 
+mod acks;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod cache;
 pub mod cas;
@@ -88,7 +89,9 @@ pub const BUILD_COMMIT: &str = env!("KBF_BUILD_COMMIT");
 
 pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
-pub use config::{Args, DaemonConfig, FENCE_AFTER, KeepAlive, RECHECK_EVERY, TlsFiles};
+pub use config::{
+    Args, DaemonConfig, FENCE_AFTER, KeepAlive, MAX_UNACKED, RECHECK_EVERY, TlsFiles,
+};
 pub use contact::{Acked, Contact};
 pub use cpu_pool::CpuPool;
 pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError, superseded};
