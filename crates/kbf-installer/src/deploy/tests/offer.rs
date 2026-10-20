@@ -171,8 +171,10 @@ fn deploy_mode(
     o.offer = policy;
     let clock = Clk(f.now.clone());
     let (smoke, check) = (FixedSmoke(SmokeResult::Pass), FixedCheck(Ok(true)));
+    let observed = Obs(&f);
     let env = Env {
         api: &f,
+        observe: &observed,
         clock: &clock,
         smoke: &smoke,
         check: &check,
