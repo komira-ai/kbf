@@ -92,6 +92,7 @@ pub mod history;
 pub mod http_blobs;
 mod http_history;
 pub mod http_invocations;
+pub mod http_sched;
 pub mod identity;
 pub mod join;
 mod listen;

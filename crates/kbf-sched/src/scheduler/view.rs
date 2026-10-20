@@ -79,6 +79,12 @@ impl Scheduler {
         self.ops.get(&operation).map(|op| &op.request.qos)
     }
 
+    /// The leader term this scheduler grants leases under.
+    #[must_use]
+    pub const fn term(&self) -> u64 {
+        self.term
+    }
+
     /// How many operations wait for a lease.
     #[must_use]
     pub fn queued_len(&self) -> usize {
