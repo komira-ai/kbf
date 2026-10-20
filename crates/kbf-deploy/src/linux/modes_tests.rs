@@ -2,13 +2,13 @@
 //! every rule and matches its golden, and each planted defect turns its rule red.
 
 use std::cell::RefCell;
-use std::os::unix::process::ExitStatusExt as _;
+use std::io;
 use std::path::Path;
-use std::process::{ExitStatus, Output};
+use std::process::Output;
 use std::rc::Rc;
 
 use kbf_host::exec::Entry;
-use kbf_host::step::{Owner, Perms};
+use kbf_host::step::{Cmd, Owner, Perms};
 use kbf_host::testkit::{FakeExec, reply};
 
 use super::*;
@@ -394,15 +394,13 @@ fn the_mode_verbs_write_the_slice_and_one_unit_and_read_it_back() {
     assert_eq!(names, ["kbf-all-in-one.service", "kbf.slice"]);
     let slice = std::fs::read_to_string(out.join("kbf.slice")).expect("slice");
     assert_eq!(slice, golden("modes", "kbf.slice"));
-    let r =
-        crate::linux::check_mode_unit(&FakeExec::new(501), &cfg, &out, Mode::AllInOne, true, None)
-            .expect("checks");
+    let r = crate::linux::check_mode_unit(&FakeExec::new(501), &cfg, &out, Mode::AllInOne, true)
+        .expect("checks");
     assert_eq!(lines(&r), Vec::<String>::new());
 
-    let e =
-        crate::linux::check_mode_unit(&FakeExec::new(501), &cfg, &out, Mode::Daemon, true, None)
-            .err()
-            .map(|e| e.to_string());
+    let e = crate::linux::check_mode_unit(&FakeExec::new(501), &cfg, &out, Mode::Daemon, true)
+        .err()
+        .map(|e| e.to_string());
     assert!(
         e.as_deref()
             .is_some_and(|e| e.starts_with("cannot read ") && e.contains("kbf-daemon.service")),
@@ -413,10 +411,9 @@ fn the_mode_verbs_write_the_slice_and_one_unit_and_read_it_back() {
         "[Service]\nSlice kbf.slice\n",
     )
     .expect("garble");
-    let e =
-        crate::linux::check_mode_unit(&FakeExec::new(501), &cfg, &out, Mode::AllInOne, true, None)
-            .err()
-            .map(|e| e.to_string());
+    let e = crate::linux::check_mode_unit(&FakeExec::new(501), &cfg, &out, Mode::AllInOne, true)
+        .err()
+        .map(|e| e.to_string());
     assert_eq!(
         e.as_deref(),
         Some("kbf-all-in-one.service: line 2: not [Section], a comment or Key=value")
@@ -442,8 +439,7 @@ fn the_mode_verbs_write_the_slice_and_one_unit_and_read_it_back() {
     assert!(matches!(e, Some(crate::linux::Refusal::Config(_))), "{e:?}");
     assert!(!dir.join("unwritten").exists());
     let e =
-        crate::linux::check_mode_unit(&FakeExec::new(501), &none, &out, Mode::AllInOne, true, None)
-            .err();
+        crate::linux::check_mode_unit(&FakeExec::new(501), &none, &out, Mode::AllInOne, true).err();
     assert!(matches!(e, Some(crate::linux::Refusal::Config(_))), "{e:?}");
 }
 
@@ -468,10 +464,9 @@ fn on_host<E: Exec>(
     c: &LinuxConfig,
     mode: Mode,
     text: &str,
-    kbf_bin: Option<&HostPath>,
 ) -> Result<Report, ParseError> {
     let unit = UnitText::new(mode.unit_name(), text);
-    check_on_host(exec, c, mode, &unit, &slice(c), true, kbf_bin)
+    check_on_host(exec, c, mode, &unit, &slice(c), true)
 }
 
 /// The rendered `kbf.slice`.
@@ -479,114 +474,33 @@ fn slice(c: &LinuxConfig) -> UnitText {
     UnitText::new(SLICE, shared::render_slice(c, Some(1500)).expect("renders"))
 }
 
-fn kbf_at(exec: &mut FakeExec, path: &str) {
+/// Catches a check that runs `kbf` (rule `parse` is retired: whether `kbf` takes a unit's
+/// flags is kbf-cli's tests', crates/kbf-cli/tests/deploy_units.rs), a binary at the
+/// unit's path that makes a note, and a garbled unit read as an empty one.
+#[test]
+fn no_kbf_is_run_and_a_garbled_unit_is_refused() {
+    let c = config();
+    let text = render(&c, Some(1500), Mode::AllInOne).expect("renders");
+    let (mut exec, asked) = host(Ok(reply(2, "", "never asked")));
     let entry = Entry::File {
         perms: Perms::new(0o755),
         owner: Owner { uid: 0, gid: 0 },
         bytes: Vec::new(),
     };
-    exec.entries
-        .insert(HostPath::new(path).expect("absolute"), entry);
-}
-
-/// Catches rule `parse` not run (the mutant: no `kbf check-args` at all, so a unit with
-/// a flag kbf refuses passes), run with other words than `check-args <mode> <flags>`,
-/// a refusal that does not fail the unit or loses kbf's message, a mode not built yet
-/// or a unit that fails `exec` handed to kbf, and `--kbf-bin` not preferred over the
-/// unit's own binary. The real kbf's answers are crates/kbf-cli/tests/deploy_units.rs's.
-#[test]
-fn the_parse_rule_runs_kbf_check_args_on_a_built_modes_flags() {
-    let c = config();
-    let text = render(&c, Some(1500), Mode::Daemon).expect("renders");
-    let flags: Vec<String> = UnitFile::parse(&text).expect("a unit").exec_start()[2..]
-        .iter()
-        .map(|w| (*w).to_owned())
-        .collect();
-    let given = HostPath::new("/opt/kbf/bin/kbf").expect("absolute");
-
-    let (exec, asked) = host(Ok(reply(0, "", "")));
-    let r = on_host(&exec, &c, Mode::Daemon, &text, Some(&given)).expect("runs");
-    assert_eq!((lines(&r), r.notes.len()), (Vec::<String>::new(), 0));
-    let mut want = vec![
-        "/opt/kbf/bin/kbf".to_owned(),
-        "check-args".into(),
-        "daemon".into(),
-    ];
-    want.extend(flags);
-    assert_eq!(*asked.borrow(), [want]);
-
-    let refusal = "error: unexpected argument '--bogus-flag' found\n\nUsage: kbf daemon\n";
-    let (mut exec, asked) = host(Ok(reply(2, "", refusal)));
-    kbf_at(&mut exec, "/usr/local/bin/kbf");
-    let r = on_host(&exec, &c, Mode::Daemon, &text, None).expect("runs");
-    assert_eq!(
-        lines(&r),
-        [
-            "FAIL parse: kbf daemon refuses the flags of kbf-daemon.service (/usr/local/bin/kbf check-args: exit 2): error: unexpected argument '--bogus-flag' found"
-        ]
+    exec.entries.insert(
+        HostPath::new("/usr/local/bin/kbf").expect("absolute"),
+        entry,
     );
-    assert_eq!(r.summary, "UNIT BROKEN: 1 failed check(s)");
-    assert_eq!(asked.borrow()[0][0], "/usr/local/bin/kbf");
-
-    let killed = Output {
-        status: ExitStatus::from_raw(9),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    };
-    let (exec, _) = host(Ok(killed));
-    let r = on_host(&exec, &c, Mode::Daemon, &text, Some(&given)).expect("runs");
-    assert_eq!(
-        lines(&r),
-        [
-            "FAIL parse: kbf daemon refuses the flags of kbf-daemon.service (/opt/kbf/bin/kbf check-args: killed by a signal): (nothing on stderr)"
-        ]
-    );
-
-    // A unit that starts an old binary: kbf is not asked.
-    let old = text.replace("/kbf daemon \\", "/kbf-daemon \\");
-    let (exec, asked) = host(Ok(reply(2, "", "never asked")));
-    let r = on_host(&exec, &c, Mode::Daemon, &old, Some(&given)).expect("runs");
-    assert_eq!(r.notes.len(), 0);
-    assert!(asked.borrow().is_empty());
-}
-
-/// Catches a missing kbf binary read as a failure or a pass with no word (the operator
-/// must see that the flags went unparsed), a `--kbf-bin` that cannot run passed or
-/// skipped instead of refused, and a garbled unit read as an empty one.
-#[test]
-fn the_parse_rule_is_skipped_without_kbf_and_refused_when_kbf_cannot_run() {
-    let c = config();
-    let text = render(&c, Some(1500), Mode::AllInOne).expect("renders");
-    let (exec, asked) = host(Ok(reply(0, "", "")));
-    let r = on_host(&exec, &c, Mode::AllInOne, &text, None).expect("runs");
+    let r = on_host(&exec, &c, Mode::AllInOne, &text).expect("runs");
     assert_eq!(lines(&r), Vec::<String>::new());
-    assert_eq!(
-        r.notes,
-        [
-            TRUSTED_NOTE,
-            "SKIP parse: no kbf binary at /usr/local/bin/kbf, so the flags of kbf all-in-one were not parsed; give --kbf-bin PATH to parse them with another"
-        ]
-    );
+    assert_eq!(r.notes, [TRUSTED_NOTE]);
     assert_eq!(
         r.summary,
         "UNIT OK: kbf-all-in-one.service runs kbf all-in-one"
     );
-    assert!(asked.borrow().is_empty());
+    assert!(asked.borrow().is_empty(), "{:?}", asked.borrow());
 
-    let given = HostPath::new("/nonexistent/kbf").expect("absolute");
-    let (exec, _) = host(Err(io::Error::from(io::ErrorKind::NotFound)));
-    let e = on_host(&exec, &c, Mode::AllInOne, &text, Some(&given)).err();
-    assert_eq!(
-        e.map(|e| e.to_string()).as_deref(),
-        Some("cannot run /nonexistent/kbf check-args: entity not found")
-    );
-    let e = on_host(
-        &exec,
-        &c,
-        Mode::AllInOne,
-        "[Service]\nSlice kbf.slice\n",
-        None,
-    );
+    let e = on_host(&exec, &c, Mode::AllInOne, "[Service]\nSlice kbf.slice\n");
     assert!(
         matches!(&e, Err(ParseError::Unit { name, .. }) if name == "kbf-all-in-one.service"),
         "{e:?}"
@@ -746,7 +660,7 @@ fn drop_ins_apply_after_the_unit_in_file_name_order() {
     let out = dir.join("units");
     crate::linux::render_mode_unit(&cfg, &out, Some(1500), Mode::Daemon).expect("renders");
     let run = || {
-        crate::linux::check_mode_unit(&FakeExec::new(0), &cfg, &out, Mode::Daemon, true, None)
+        crate::linux::check_mode_unit(&FakeExec::new(0), &cfg, &out, Mode::Daemon, true)
             .map(|r| lines(&r))
             .map_err(|e| e.to_string())
     };
@@ -833,7 +747,7 @@ fn a_build_modes_unit_and_slice_keep_every_cpu_of_the_node() {
         "kbf-daemon.service.d/cpus.conf",
         "[Service]\nAllowedCPUs=0-3\n",
     );
-    let r = check_on_host(&exec, &c, Mode::Daemon, &narrow, &slice(&c), true, None).expect("runs");
+    let r = check_on_host(&exec, &c, Mode::Daemon, &narrow, &slice(&c), true).expect("runs");
     // `caps` refuses any AllowedCPUs= without reading the node; `cpuset` is the one that
     // reads it (a list of every CPU is no cap, and only this rule can tell).
     let rules: Vec<&str> = r.failures.iter().map(|f| f.rule).collect();
@@ -841,7 +755,7 @@ fn a_build_modes_unit_and_slice_keep_every_cpu_of_the_node() {
     let wide_slice =
         slice(&c).with_drop_in("kbf.slice.d/n.conf", "[Slice]\nAllowedMemoryNodes=1\n");
     let unit = UnitText::new(Mode::Daemon.unit_name(), daemon.as_str());
-    let r = check_on_host(&exec, &c, Mode::Daemon, &unit, &wide_slice, true, None).expect("runs");
+    let r = check_on_host(&exec, &c, Mode::Daemon, &unit, &wide_slice, true).expect("runs");
     assert_eq!(
         lines(&r),
         [
@@ -853,7 +767,7 @@ fn a_build_modes_unit_and_slice_keep_every_cpu_of_the_node() {
         "kbf-frontend@.service.d/cpus.conf",
         "[Service]\nAllowedCPUs=0\n",
     );
-    let r = check_on_host(&exec, &c, Mode::Frontend, &f, &wide_slice, true, None).expect("runs");
+    let r = check_on_host(&exec, &c, Mode::Frontend, &f, &wide_slice, true).expect("runs");
     assert_eq!(lines(&r), Vec::<String>::new());
 }
 
@@ -878,7 +792,7 @@ fn on_the_node_an_environment_file_holding_the_key_fails_rule_credential() {
         let text = render(&c, Some(1500), mode).expect("renders");
         let unit = UnitText::new(mode.unit_name(), text)
             .with_drop_in(format!("{}.d/env.conf", mode.unit_name()), drop_in);
-        let r = check_on_host(&exec, &c, mode, &unit, &slice(&c), true, None).expect("runs");
+        let r = check_on_host(&exec, &c, mode, &unit, &slice(&c), true).expect("runs");
         let want: Vec<String> = if mode == Mode::Daemon {
             vec!["FAIL credential: kbf-daemon.service gives a build node the cold store's key (EnvironmentFile=/etc/kbf/daemon.env, which sets AWS_ACCESS_KEY_ID): a build node holds no credential, and its builds run as its user".to_owned()]
         } else {
@@ -897,9 +811,7 @@ fn rule_stop_reads_the_drop_ins() {
     let text = render(&c, Some(1500), Mode::AllInOne).expect("renders");
     let exec = FakeExec::new(0);
     let fails = |unit: &UnitText| -> Vec<String> {
-        lines(
-            &check_on_host(&exec, &c, Mode::AllInOne, unit, &slice(&c), true, None).expect("runs"),
-        )
+        lines(&check_on_host(&exec, &c, Mode::AllInOne, unit, &slice(&c), true).expect("runs"))
     };
     let unit = UnitText::new(Mode::AllInOne.unit_name(), text);
     assert_eq!(fails(&unit), Vec::<String>::new());
