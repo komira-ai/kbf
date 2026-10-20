@@ -1,0 +1,389 @@
+# Rebalance and handoff (av2-13)
+
+Status: design. Nothing in this document is built unless it says "today". It replaces the
+"handoff copy ... is not built" notes in `architecture-v2.md` (sections 6, 8.4 and the P6 row)
+with a mechanism, and says what each pull request changes. Every claim about the code under
+"Verified facts" was read from `feature/arch-v2`; where the first draft of this design was
+wrong, the correction is marked **Corrected**.
+
+## 1. The problem
+
+A node joins or drains: the map moves to generation g+1 and some digests change owners.
+Today:
+
+- A joiner registers `joining` with an `unfilled/<id>` mark when the farm holds data. It takes
+  writes, is never rank 1 and is read last. Nothing fills it but the writes it takes, so an
+  operator promotes it by hand (`POST /v1/members/{id}`, `Members::set_state`). A joiner
+  promoted early reads as missing for blobs that only an old owner holds, because the router
+  keeps one previous map.
+- A drain stops writes to the node and reads it first, but nothing tells the node when it may
+  drop a blob, and nothing moves a staged (not yet flushed) blob off it.
+- The one-flusher gate (`OneFlusher`) lets only rank 1 of `write_owners` flush a staged object.
+  A Draining or displaced node is never rank 1, so its staged blobs are stranded.
+
+The spec red test is: a join in the middle of a build never yields a false miss; a node keeps
+a blob until the new owner confirms it; a rebuild after a wipe stays catching-up; and the
+rebuild never collides with keys written by old servers.
+
+## 2. Mechanism: cold store first
+
+The cold store is the handoff channel. A blob is handed off when its bytes are durable in the
+cold store (flushed and read back) and the new owner has adopted the object that holds it into
+its index. No new node-to-node byte stream is needed, a crash at any step loses progress and
+never data, and the three cases a copy-between-nodes design misses are covered:
+
+- **Orphaned staged blobs.** Any node that is not a write owner of a digest flushes it (P1).
+- **Blobs staged after the rebuild.** The index rebuild of a joiner is one-shot. Objects that
+  other members flush after it are adopted by a standing tail pass (P3).
+- **r=1.** A joiner owns nothing under the current map at r=1, so a fill check against the
+  current owner sets is vacuous. The check is made against the map computed as if the joiner
+  were Active (P1 of kbf-map below).
+
+Primitives, all additive:
+
+- **P1 orphan flush.** A node flushes a staged object when it is rank 1 for the digest, or
+  when it is not a write owner of it at all (this includes Draining). Duplicate flushes are
+  harmless: object keys are disjoint (`cas/<member>/<boot>/<seq>`); the cost is PUT bytes,
+  bounded by the staged volume.
+- **P2 `flush_clear_gen`.** The highest generation g such that every object the node staged
+  before it held map g is flushed. It is node-local, volatile, and recomputed from the staged
+  set after a restart.
+- **P3 tail adoption** (`kbf-front/src/cache/tail.rs`). Lists the cold store for objects
+  written by other members and commits `AdoptSegment` through the path the rebuild uses.
+  **Corrected:** the rebuild resumes from one lexicographic key, which is sound only because it
+  is one pass. A standing tail cannot keep one global cursor: keys sort by member, then boot,
+  then seq, so a new object of member 2 sorts before a cursor that has reached member 5. The
+  tail keeps one cursor per member (the last key listed under `cas/<member>/`, resumed with
+  `ListToken::after`), takes the member set from the map plus every member that has ever been
+  in it, and lists a member's prefix afresh when its cursor is lost. Boots of one member rise,
+  so a new boot sorts after the cursor.
+- **P4 epoch fence.** `meta/tail_epoch` in the state store plus per-node acknowledgements
+  (`tail_epoch_done`). No clocks are involved in the ordering argument.
+- **P5 durable `handoff/base` pin** of the pre-change map, shipped first and independently.
+
+Additions to `kbf-map`: `Map::owners_assuming(id, Active)`, `placement_fingerprint`,
+`read_order_with_history`.
+
+Grafts from two other designs that were considered:
+
+- From pull-by-new-owner: the placement fingerprint and generation on every fill and fence
+  report, so a stale report is rejected; a settle timer; a `degraded` flag that blocks
+  automatic promotion; an in-transaction check that the row is not Draining plus a mark
+  version check; a second tail pass; the pin cap.
+- From push-by-previous-owner: a sampled audit, a confirm keyed `(digest, owner, boot)`, a
+  re-confirm just before any drop, the full drop conditions, and the drain surface (`drained`,
+  `finish_drain`, `--exit-on-drained`).
+- A fallback for a per-node `file://` cold store (section 9, PR 7).
+
+## 3. Definition of filled
+
+A joiner is filled when all of these hold:
+
+1. Its index is rebuilt (the rebuild of its meta log is done, `CaughtUp`).
+2. Every object staged anywhere before the barrier is flushed: every fresh Active or Draining
+   member reports `flush_clear_gen >= g_j`.
+3. A tail pass that started after that barrier has finished on the joiner
+   (`tail_epoch_done >= e`).
+4. The joiner's fill report carries the current placement fingerprint, computed with the
+   joiner assumed Active.
+5. A sampled audit confirms that the joiner indexes the sampled digests.
+
+**Corrected (audit).** The first draft assumed an ordered scan of the local index. There is
+none: `MetaState.blobs` is a private `BTreeMap<Digest, BlobEntry>` and no public method
+enumerates or ranges over it. The audit therefore needs a small new reader, a
+`MetaState::sample_digests(from, n)` that returns up to `n` digests at or after `from` in
+digest order (PR 1b below). The audit samples from the objects the tail adopted (their
+footers list their digests), asks the joiner's own index through `blob()`, and for the owner
+view asks `find_missing` on the joiner. The strong guarantee is the barrier, the fence and
+the fingerprint match; the audit is defence in depth and is probabilistic.
+
+**Corrected (listing consistency).** The fence argument needs a listing that started after a
+PUT was acknowledged to show it. The code states the opposite as the contract: the object
+store "needs no consistent listing and no read-after-write", and a listing may miss writes made
+while it runs. `file://` gives the property in practice (a fresh listing after a synced write
+re-reads every header); no source on the branch states it for S3, MinIO or RustFS. The design
+therefore does not assume it silently: PR 4 adds a conformance case, `list_sees_completed_put`,
+to `kbf-objstore`'s suite and runs it in the S3 job; a backend that fails it cannot enable
+auto-promotion; and the second tail pass (section 4) is the guard against a lagging listing.
+
+## 4. State machine and marks
+
+Map states are unchanged: `joining`, `catching-up`, `active`, `draining`, `down`.
+
+### Join
+
+The `unfilled/<id>` mark, today an empty presence mark, becomes `{g_j, fp, phase, epoch}`.
+A reader that predates this sees a mark and treats the node as unfilled, as today.
+
+- **Phase A, flushing.** The joiner is `joining`, takes writes, is never rank 1, is read last,
+  and runs its index rebuild (a node registering with an unfinished rebuild registers
+  rebuilding and is written `joining` when the farm holds data; this exists today). A to B
+  fires in the sweeper's `refresh` when every fresh Active or Draining member has
+  `flush_clear_gen >= g_j`. A Down member still inside its dwell blocks it. The frontend then
+  bumps `meta/tail_epoch` to e, writes `{phase=B, epoch=e, fp}` and writes `handoff/base` if
+  absent.
+- **Phase B, adopting.** B to Active runs in the joiner's own beat, inside `touch`, as one
+  compare-and-swap, when all hold:
+  - `--auto-promote` is on;
+  - the index is `CaughtUp` and `tail_epoch_done >= e`;
+  - the report's fingerprint equals the frontend's (assuming Active);
+  - the farm is not `degraded` (no member was Down or missing from the source set during the
+    fence), unless `--handoff-allow-degraded`;
+  - the settle time has passed since all of these first held;
+  - the sampled audit passed;
+  - the row is still `joining` (not `draining`) and the mark version matches.
+- The swap deletes `unfilled/<id>` and writes `meta/members_formed` in one transaction.
+- **Pass 2.** After the first tail pass succeeds the joiner repeats an incremental pass;
+  `complete` requires zero new adoptions, or a restart of the pass if the fingerprint changed.
+  This is the guard for a listing that lags a PUT.
+
+### Drain
+
+The `draining/<id>` mark holds `{g_d, fp, phase, epoch}`.
+
+- **A.** The drainer takes no writes and is read first. P1 makes it flush everything it stages.
+- **A to B.** When its `flush_clear_gen >= g_d` the frontend bumps `tail_epoch` and writes
+  `handoff/base`.
+- **B to C (confirmed).** Every fresh Active member has `tail_epoch_done >= e` with a matching
+  fingerprint, none is degraded, and the settle and pin-release conditions hold. The heartbeat
+  response then carries `drain_confirmed`.
+- **C.** The node evicts only objects that meet every drop condition below, reports
+  `drained=true`, and the operator runs `finish_drain` (or `--drain-auto-leave` does);
+  `--exit-on-drained` exits the process.
+
+Drop conditions, all required: the object is flushed with the read-back confirmed; it is not
+staged; the node is not a write owner of any of its blobs, or is Draining; every blob is
+confirmed in the cold store and adopted by every current owner, keyed `(digest, owner, boot)`;
+a fresh re-confirm just before the drop passes with the same boot; `EVICT_GRACE` has elapsed;
+and a drop delay has elapsed. The drop never deletes from the cold store. Reclaim outside a
+drain is out of scope; disk-pressure eviction continues as today.
+
+### Pin and its release
+
+`handoff/base` pins the map before the change so reads can fall back to it. Today the previous
+map is one deep in all five places that hold it, so two quick map bumps lose the generation
+before them. The pin is released on a signal, not a dwell guess: the fence is closed at
+generation >= g_p and every frontend has reported, in a new `seen_gen` field, a generation at
+or beyond g_p. A dwell stays only as a floor. The cap is 4 open handoffs; beyond it a new join
+is refused (it does not register) and a new drain request is refused. Refusing is safe; the
+operator retries after one completes.
+
+## 5. Protocol and flag changes (all additive)
+
+Optional fields with new numbers; an old peer ignores them.
+
+- `HeartbeatRequest` (today fields 1 to 10, last is `writes_known`): `flush_clear_gen`,
+  `flush_known`, `tail_epoch_done`, `fill_fp`, `staged_objects`, `staged_bytes`, `drained`,
+  `seen_gen` (sent by map consumers that are frontends).
+- `HeartbeatResponse` (today `map_generation`, `map`, `objstore_generation`): `tail_epoch`,
+  `drain_confirmed`.
+- **Corrected.** `map.proto` has no separate map-fetch rpc: `service Membership` has
+  `Register` and `Heartbeat`, and the map rides in `RegisterResponse.map` and
+  `HeartbeatResponse.map`. The `retained_previous` field therefore goes on those two
+  responses, not on a `MapResponse` message.
+- Store keys: `handoff/base`, `meta/tail_epoch`, and the mark bodies above.
+- `kbf-map`: the three additions in section 2.
+- HTTP: `GET /v1/members` gains `phase`, `epoch`, `blocked_on[]`, `degraded`, `drained`; a
+  `finish_drain` verb.
+- Flags (not environment variables): `--auto-promote` (default off), `--handoff-settle-secs`,
+  `--handoff-release-secs` (the floor), `--tail-interval-secs`, `--adopt-bytes-per-sec`,
+  `--drain-auto-leave`, `--exit-on-drained`, `--handoff-allow-degraded` (default false),
+  `--handoff-node-pull` (default off).
+- Mixed versions: an old frontend drops the new row fields, which stalls a handoff and never
+  corrupts one. Roll frontends first, then nodes, then turn on `--auto-promote`. An old
+  frontend never auto-promotes; manual `active` still works.
+
+## 6. What changes in the manual promotion of #1156
+
+- Today a joiner stays `joining` until an operator posts `active`; the `unfilled/<id>` mark is
+  cleared only there.
+- After: the joiner is promoted inside its own beat when section 3 holds and `--auto-promote`
+  is on. The swap is the same transaction as `set_state(Active)` (mark delete,
+  `members_formed`, version check) with the added not-Draining check.
+- Unchanged: join semantics (takes writes, never rank 1, read last), the mark as the only
+  gate, and `POST active` as the override and rollback. The default is off until soak, so the
+  first release behaves as today plus the durable pin.
+- New: `blocked_on[]` and `degraded` say why a node is not promoted.
+
+## 7. Red tests
+
+Tests are written first and must fail on today's code before the change.
+
+Spec tests:
+
+1. **A join mid-build never gives a false miss.** Stage blob B on A, unflushed. Join J while it
+   rebuilds. Reads find B through promotion, two further generation bumps and a frontend
+   restart; zero `NOT_FOUND`. Mutants that must go red: a 1-deep previous map; no flush
+   barrier.
+2. **A node holds a blob until the new owner confirms.** Drain with the flush held by fault
+   injection: no drop. Release it: the fence closes and the drop happens. Mutants, each red:
+   drop at Draining; ignore one member's ack; skip the re-confirm; key the confirm without the
+   boot; skip the release signal.
+3. **A rebuild after a wipe stays catching-up.** Exists today (see Verified facts). Added: the
+   tail does not skip the rebuild, and a joiner wiped mid-fill is not reported complete.
+4. **No key collision with old-server objects.** Exists today for the rebuild. Added: the tail
+   adopts old-layout objects once, never re-adopts `cas/<self>/`, and ignores frozen
+   old-layout prefixes.
+
+Extra tests:
+
+- Restart mid-fill: the joiner's `tail_epoch_done` and `complete` reset, it redoes the pass,
+  and a stale report is rejected by fingerprint or freshness.
+- Frontend swap mid-fill: another frontend finishes from store state; two frontends cannot
+  double-promote (mark version); a concurrent drain request beats an auto-promotion beat.
+- Previous owner down: a Down member inside its dwell blocks A to B; after the dwell the join
+  proceeds with `degraded` set and auto-promotion refuses unless allowed; manual `active`
+  works; a returning node flushes under P1 and the tail adopts its objects.
+- r=1: promotion strands no staged blob; the fill check uses `owners_assuming`.
+- Stale fingerprint: a map change mid-fill invalidates the report and restarts the fence.
+- Sampled audit: a planted skipped blob is caught (mutant: audit disabled, promotion wrongly
+  proceeds).
+- Mixed frontend: dropped fields cause no auto-promotion; manual `active` works.
+- Pin cap: the fifth concurrent handoff is refused.
+- Orphan flush: the expectation in `flush/tests.rs` that a Draining member stops flushing is
+  rewritten (Draining and displaced nodes now flush); duplicate flush is harmless.
+- Per-member tail cursor: an object written by a lower-numbered member after the cursor passed
+  a higher one is adopted (mutant: one global cursor).
+- Listing conformance: `list_sees_completed_put` on every backend that enables auto-promotion.
+
+## 8. Risks
+
+- Liveness over safety: a slow or Down member blocks promotion and drain. `blocked_on[]` and
+  the manual override are the mitigation.
+- A staged-only blob held by a node that dies before flushing is lost. The orphan flush
+  narrows the window; replication still bounds it. Manual `active` with a Down member is
+  dangerous and is documented as such.
+- Duplicate flush bytes from P1; watch PUT cost in soak.
+- The flusher gate is a core path; it needs the soak and the rewritten test. With no gate set
+  every staged object flushes today, so a gate-less node is unaffected.
+- Mixed-version rows stall old frontends; roll frontends first.
+- Listing order and list-after-PUT visibility (section 3): a violation breaks the fence
+  argument; mitigated by the conformance case and pass 2.
+- The audit is probabilistic.
+- A frontend that never reports `seen_gen` blocks pin release; the cap bounds the cost and an
+  operator can force release.
+- Promotion changes the primary: the promoted node can become rank 1 for some digests, so the
+  flusher gate then picks it; tested.
+- r=1 promotion needs its own test and soak before the default flips.
+- No non-drain reclaim: disk grows on displaced owners until pressure eviction.
+- The `file://` fallback adds scan load and large pulls if enabled; default off, throttled.
+
+## 9. Pull request plan
+
+| # | PR | Touches | Size | Proof | Unblocks |
+|---|---|---|---|---|---|
+| 1 | kbf-map additions | `kbf-map` | S | Unit tests: `owners_assuming` at r=1; fingerprint stable and changing; `read_order_with_history` dedup | 2, 4, 5 |
+| 1b | Digest sampling reader | `kbf-meta` `MetaState::sample_digests` | S | Unit tests: order, bound, resume point | 5 |
+| 2 | Durable previous-map pin | `members.rs`, `front_maps.rs`, `kbf-route` router, `kbf-mapsync` holder, `kbf-daemon` map, `map.proto` | M | Red first: two quick bumps plus a frontend restart gives a false miss; mutant: back to 1-deep; cap enforced. Fixes the hole independent of handoff | 5, 6 |
+| 3 | Orphan flush and `flush_clear_gen` | `kbf-storage` flush, `kbf-front` cache flush, proto fields, staged metric | M | Red first: Draining and r=1 staged blobs never flush today | 5 |
+| 4 | Tail adoption | `kbf-front` cache tail, `kbf-objstore` conformance case, wire fields | M | Red first: a segment flushed by another member after the rebuild is not readable today; per-member cursor mutant | 5 |
+| 5 | Automatic promotion | `members.rs` (`refresh`, `touch`), `join.rs`, mark phases, rules, audit, `--auto-promote` default off | L | Red first: spec test 1 end to end plus mutants | 6 |
+| 6 | Drain completion and drop | `draining/<id>` phases, `drain_confirmed`, `Cache::drop_confirmed`, `seen_gen`, `finish_drain`, flags; fixes the notes in `update/mod.rs`, `members.rs`, `operator-verbs.md`, `docs/api.md`, the "8.4" cross-reference in `architecture-v2.md`, P6 | L | Red first: spec test 2 with all mutants | 7 |
+| 7 | Node-pull tier (only if the owner answers 1 below with a node-local store) | handoff engine for `file://` | M | default off | none |
+| 8 | Operator surface and defaults | `GET /v1/members` fields, backlog metric, `blocked_on[]`; flip `--auto-promote` after soak | S | Soak with r=1 and r=3 | none |
+
+Order: 1 first (1b beside it); 2, 3 and 4 in parallel after 1 (2 needs only 1); 5 needs 2, 3, 4
+and 1b; 6 needs 5; 7 and 8 last.
+
+## 10. Verified facts
+
+All from `feature/arch-v2`.
+
+**Cold-store keys and listing**
+- Node object keys are `<root>cas/<member:016x>/<boot:016x>/<seq:016x>`
+  (`crates/kbf-front/src/cache/write_group.rs:312`); epoch keys `<legacy>cas/<epoch>/<seq>` (`:307`);
+  other-log keys `<root><log id>/cas/<epoch>/<seq>` (`:317`). Numbers are 16 lowercase hex digits
+  (`write_group.rs:272-273`, `cache.rs:427-428`), so byte order is numeric order.
+- Keys are ordered by seq only inside one `(member, boot)` or epoch; across the prefix the
+  order is member, boot, seq. Legacy and node layouts do not interleave.
+- `rebuild_index` (`crates/kbf-front/src/cache/rebuild.rs:~100-175`) resumes from a stored
+  `Rebuild::Pending { after }` key with `ListToken::after(&ObjectKey)` and commits
+  `RebuildProgress` every batch (`:~176-190`). Foreign keys are counted and skipped (`:~205`).
+- `ObjectStore::list(prefix, after, max_keys) -> ListPage` returns keys ascending
+  (`crates/kbf-objstore/src/lib.rs:~116-123`); token types at `types.rs:~190-230`.
+- S3: ListObjectsV2 with `start-after` and `continuation-token`
+  (`crates/kbf-objstore/src/s3/mod.rs:464-490`; wire tests `tests/s3_wire.rs:236`, `:275`).
+  `file://`: `fs_store.rs:548-600`. Memory: `memory.rs:112`. Conformance:
+  `conformance.rs:400-527`.
+
+**List-after-PUT and sharing**
+- The store contract says kbf needs no consistent listing and no read-after-write
+  (`crates/kbf-objstore/src/lib.rs:6-8`); a listing may miss concurrent writes
+  (`listing.rs:12-14`). A fresh `file://` listing re-reads every header (`fs_store.rs:36-42`).
+  No code or doc states list-after-PUT for S3, MinIO or RustFS; the conformance suite does not
+  check it.
+- Only `file` and `s3` URIs are accepted (`crates/kbf-server/src/stores.rs:17`, `:104`).
+- Farm modes use one `s3://` cold store (`docs/deploy/kbf-modes.md:153`;
+  `docs/api.md:594-603`, one store registered for every storage node;
+  `architecture-v2.md` section 8, a new owner rebuilds from segments an earlier owner flushed).
+  Single-box modes use `file://` (`kbf-modes.md:386`; `docs/deploy/storage-node.md:272`);
+  `file://` is single-writer (`storage-node.md:281`). The test-farm unit uses an `s3://` store
+  that is loopback unless `MINIO_S3_ENDPOINT` is remote; the rehearsal harness defaults to a
+  directory (`docs/design/kbf-cicd.md:232,241`). No doc says "every node shares one store".
+
+**Index and `put_unowned`**
+- `MetaState.blobs` is private (`crates/kbf-meta/src/state.rs:320`); public readers are
+  `blob_count`, `action_count`, `blob`, `touch_for`, `find_missing`, `action`,
+  `action_closure`, `stored_objects`, `lacking`. The nearest ordered view is
+  `StagedObject::blobs()` (`tier.rs:131`), one object only. The `Storage` trait
+  (`crates/kbf-storage/src/lib.rs:71`) has no enumeration method.
+- `put_unowned` defaults to `put` (`lib.rs:140`), forwards nothing, and is on the wire as the
+  `kbf-unowned-copy` header (`service/mod.rs:91`; client `service/client.rs:73-88`, `:313`;
+  server `bytestream.rs:74-90`). It is honoured only for the frontend's identity and a non-leg
+  write (`service/generation.rs:39`, `admission.rs:157-169`).
+
+**`map.proto`**
+- `service Membership` has `Register` (`map.proto:86`) and `Heartbeat` (`:90`); the map is in
+  `RegisterResponse.map` (field 4) and `HeartbeatResponse.map` (field 2). `HeartbeatRequest`
+  has fields 1 to 10 (`member_id`, `boot`, `have_generation`, `catching_up`, `repair_debts`,
+  `debts_known`, `applied_objstore_generation`, `apply_status`, `open_writes`,
+  `writes_known`); `HeartbeatResponse` has `map_generation`, `map`, `objstore_generation`.
+
+**Rebuild, flusher, previous map**
+- The rebuild is keyed on the meta log, not on the Joining state: `storage_node.rs:722-731`
+  builds `CatchUp::rebuilding()` for a `--frontend` node whose log has no finished rebuild;
+  `rebuild.rs:73-79` runs it and holds the start-up pass. The registered state is
+  `catching-up`; a farm with data writes it `joining` (`tests/members_join.rs:173`).
+- Tests that exist (no test uses the label "13a"):
+  `crates/kbf-server/src/storage_rebuild_tests.rs` `wipe_rebuild_holds_blobs_in_a_bucket`,
+  `wipe_rebuild_holds_blobs_in_a_directory`, `a_restart_mid_rebuild_resumes_and_stays_catching_up`,
+  `a_finished_rebuild_is_not_run_again_by_a_restart`,
+  `a_failed_rebuild_is_tried_again_and_the_node_stays_catching_up`,
+  `a_node_without_a_frontend_owes_no_rebuild`; `startup_pass.rs`
+  `the_start_pass_waits_for_the_rebuild`; `tests/storage_register.rs`
+  `a_rebuilding_node_registers_catching_up_and_is_promoted_on_its_report`,
+  `a_new_node_joining_an_old_farm_stays_joining_through_its_first_beats`;
+  `tests/members_join.rs` `a_new_node_that_registers_rebuilding_joins_and_is_not_promoted_by_its_beat`,
+  `a_node_joining_a_farm_with_data_is_never_primary`,
+  `an_unfilled_joiner_stays_joining_through_a_restart_and_a_beat`.
+- `OneFlusher::flushes` is true only with a map and an own id, a map at least as new as the
+  newest generation heard of, and rank 1 of `write_owners(digest)`
+  (`crates/kbf-storage/src/flush/mod.rs:64-76`); applied at `kbf-front/src/cache/flush.rs:335`.
+  `MemberState::takes_writes` is `!Draining` (`kbf-map/src/map.rs:55-57`), so a Draining member
+  is never rank 1; `flush/tests.rs:144-145` asserts it stops flushing. No other flush path for
+  a displaced node was found. With no gate set (`cache.rs:202`) every staged object flushes.
+- The previous map is one deep in `members.rs:573,624`, `kbf-mapsync/src/holder.rs:22,54`,
+  `kbf-daemon/src/map.rs:114-122`, `front_maps.rs:38` and `kbf-route/src/router.rs:245-248`.
+
+## 11. Open questions for the owner
+
+1. **Is the cold store shared in every deployment?** Updated by the facts: farm modes
+   (storage, storage-and-daemon) use one `s3://` bucket and the registration API sends one
+   store to every node; the single-box modes use `file://`, which is single-writer. So PR 7
+   (node-pull for `file://`) is needed only if a multi-node farm is ever run with per-node
+   `file://` stores, which no doc describes. Confirm that such a deployment does not exist or
+   is unsupported.
+2. **Pin-cap overflow policy.** The design refuses a join or drain beyond 4 open handoffs.
+   Is refusing acceptable to operators, versus deferring write ownership?
+3. **Liveness versus safety on Down members.** Promotion waits while a Down member is inside
+   its dwell, and a manual `active` overrides. Confirm that default.
+4. **Is `seen_gen` reporting by frontends acceptable** as the pin release signal (a new field
+   and a frontend heartbeat), versus a dwell only?
+5. **Default for `--auto-promote`**, and who signs off on the flip (soak criteria at r=1 and
+   r=3).
+6. **Non-drain reclaim** stays out of scope. Confirm, because joins will never free space on
+   the displaced owners.
+
+Added by the verification, needing an owner answer: **which S3-compatible stores must auto-promotion
+support?** The design requires the new conformance case to pass on each; today no source states
+the property for any of them.
