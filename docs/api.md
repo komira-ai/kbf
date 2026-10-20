@@ -169,6 +169,7 @@ placement, and, after the list, the oldest protocol version among them:
 | `node_id` | the id its daemon registered with |
 | `connected` | whether its newest stream is still open |
 | `protocol` | the `kbf.worker.v1` version the `Welcome` that answered the `Hello` opening its newest stream named: the lesser of the `Hello`'s version and the newest the server speaks, so a daemon whose `Hello` names 5 against a server speaking 3 shows 3 ([worker-protocol.md](design/worker-protocol.md)); `null` if no version is known (a `Hello` naming 0, which is not a version, from a server that accepts it). A `Hello` resent on the stream does not change it, and a node that returns on another version shows the new one. It stays after the stream closes: it is the version the node last spoke |
+| `blocked_on` | only on a `joining` member, only when the frontend runs with `--auto-promote`: a list of sentences saying what holds its automatic promotion back (a member that has not flushed, a tail epoch not acknowledged, a member down, the settle time). Absent otherwise; an empty answer for a joiner means only its next beat or the next sweep is owed |
 | `oldest_protocol` | the least `protocol` among the listed nodes whose `protocol` is not `null`, connected or not (a node whose stream closed may return on the version it last spoke); `null` if no listed node names one. Nodes that name none are not in it |
 | `protocol_unknown` | how many listed nodes have a `null` `protocol`. They are never counted in `oldest_protocol`, so `oldest_protocol` says "every node but these speaks at least this": a reader that needs every node reads it with `protocol_unknown` equal to 0 |
 | `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a daemon that predates it. An empty string or list is a value the node could not read |
@@ -223,8 +224,10 @@ The registration is judged against the map's floor once, when it is made
 named, and nothing judges it again.
 
 A node that registers for the first time in a farm formed more than a minute ago is
-`joining` until the operator promotes it with `POST /v1/members/{id}`; the server does not
-promote on its own, so a script that waits for `active` waits for that. A server without a state store keeps no members and answers `404`; a state
+`joining` until the operator promotes it with `POST /v1/members/{id}`; unless the frontend runs
+with `--auto-promote` (off by default) the server does not promote on its own, so a script that
+waits for `active` waits for that. With it, the joiner's own heartbeat promotes it once it is
+filled (`docs/design/rebalance-handoff.md`), and `POST` stays the override. A server without a state store keeps no members and answers `404`; a state
 store that cannot be read answers `503`. The view reads the map and then the member rows
 (for `protocol`), so a stored map or a stored member row that does not decode answers
 `500` for the whole view, not a list without that member's version: the store is up and

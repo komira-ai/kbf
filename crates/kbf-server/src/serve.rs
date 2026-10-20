@@ -399,14 +399,19 @@ pub(crate) fn keepalive(server: Server, timing: StreamTiming) -> Server {
 const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
     operation of an earlier server process is restored, and the server keeps no rollout record";
 
-/// The members a frontend with a state store keeps. Not generic, for the same reason as
+/// The members a frontend with a state store keeps, promoting joiners by their own beats
+/// when `handoff` is given (`--auto-promote`). Not generic, for the same reason as
 /// [`sweeping`].
-pub(crate) fn members_of(state: Option<&crate::StateStore>) -> Option<Arc<Members>> {
+pub(crate) fn members_of(
+    state: Option<&crate::StateStore>,
+    handoff: Option<crate::members::Handoff>,
+) -> Option<Arc<Members>> {
     let state = state?;
-    Some(Arc::new(Members::new(
-        Arc::clone(&state.store),
-        state.members,
-    )))
+    let members = Members::new(Arc::clone(&state.store), state.members);
+    Some(Arc::new(match handoff {
+        Some(handoff) => members.with_handoff(handoff),
+        None => members,
+    }))
 }
 
 /// The storage map daemons are sent: `explicit` if a caller gave one, else the members'
@@ -737,7 +742,7 @@ where
     .recording(recorder.clone());
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
-    let members = members_of(state.as_ref());
+    let members = members_of(state.as_ref(), None);
     let map = map_of(map, members.as_ref())?;
     // The update rows live in the same store, whose handle is shared.
     let update_rows = state
