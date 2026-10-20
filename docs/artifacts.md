@@ -18,18 +18,20 @@ build.
 
 ## Pull request labels
 
-Two labels opt a pull request in to the work that is otherwise skipped, to spare the
-small macOS runner pool. Adding either to an open pull request starts a run.
+A pull request runs the two jobs of `ci.yml` (`lint`, and `test` on the fast set) and nothing
+else; the full suite, the macOS jobs and the packages run on a push to `main` or
+`feature/arch-v2` (`beta.yml`). One label opts a pull request in to more, to spare the small
+macOS runner pool. Adding it to an open pull request starts a run.
 
 | Label | Effect |
 |---|---|
 | `needs-artifacts` | `artifacts.yml` builds, packages and sums the files for the pull request (never for the darwin-arm64 job of a pull request into `feature/arch-v2`, which no label enables: nothing is attested from a pull request, and the push to `feature/arch-v2` builds it) |
-| `macos` | `ci.yml`'s `native-macos` job runs on a pull request into `feature/arch-v2`, where it is skipped without the label. Pushes, pull requests into `main` and the merge queue run it as before. The job builds and tests on its own runner; it does not use the darwin-arm64 artifacts build |
 
-`ci.yml` runs on the `labeled` event so that the label starts something. Any label added
-to a pull request therefore starts a whole `ci` run, which replaces the pull request's
-earlier run: add the labels together, before the run you want to keep. The condition of
-`native-macos` is pinned by `crates/kbf-it/tests/release_artifacts`.
+`artifacts.yml` runs on the `labeled` event so that the label starts something. Any label
+added to a pull request therefore starts a whole `artifacts` run, which replaces the pull
+request's earlier run: add labels together, before the run you want to keep. `native-macos`
+and `pkg-macos` run in `beta.yml` on every push and never on a pull request; that is pinned
+by `crates/kbf-it/tests/release_artifacts`.
 
 ## What is built
 
