@@ -2,7 +2,8 @@
 
 CDK (TypeScript, us-east-1) for a static site and its release downloads: a private S3 bucket behind CloudFront (origin
 access control), a Route 53 zone, a certificate, and an IAM role that the publish workflow assumes through GitHub OIDC.
-It is self-contained: nothing else in this repository depends on Node.
+It is self-contained: the Rust workspace does not depend on Node; Node is used only by `infra/site` and `site/` (the website's
+build), both with lockfiles and `--ignore-scripts`.
 
 The bucket holds the site build at its root and each release under `releases/<version>/`, with `releases/latest.json`.
 The publish workflow uploads with `aws s3`; it does not run CDK and has no rights beyond the bucket and one

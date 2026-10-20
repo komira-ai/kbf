@@ -1,6 +1,6 @@
 # Tests of the site infrastructure app (infra/site): CDK assertion tests and the held CLI's tests. Runs only when
-# that directory (or this file) changes. The app is self-contained Node/TypeScript; nothing else in the repository
-# depends on Node. GitHub-hosted runner, commit-pinned actions, no token rights beyond reading the checkout.
+# that directory (or this file) changes. The app is self-contained Node/TypeScript; the Rust workspace does not depend on
+# Node, and the only other Node code is the website build in site/ (site.yml). GitHub-hosted runner, commit-pinned actions, no token rights beyond reading the checkout.
 name: site-infra
 
 on:
