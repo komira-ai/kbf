@@ -528,3 +528,160 @@ fn a_follower_skips_the_entries_its_snapshot_holds() {
         }
     );
 }
+
+fn vote_response(term: u64, granted: bool) -> Message {
+    Message {
+        term: Term(term),
+        kind: MessageKind::VoteResponse { granted },
+    }
+}
+
+/// Catches: a core that answers, or adopts the term of, a message from itself or from
+/// a server outside the group (a stray or spoofed sender could depose the leader or
+/// win a vote), and accessors that report another identity or leader.
+#[test]
+fn messages_from_itself_or_from_outside_the_group_change_nothing() {
+    let mut raft = Raft::new(three(S2), 0).unwrap();
+    assert_eq!(raft.id(), S2);
+    assert_eq!(raft.leader(), None);
+    let later = Message {
+        term: Term(7),
+        kind: MessageKind::VoteRequest {
+            last_log: LogId::default(),
+        },
+    };
+    assert_eq!(raft.receive(S2, later.clone(), 0), vec![]);
+    assert_eq!(raft.receive(ServerId(9), later, 0), vec![]);
+    assert_eq!(raft.hard_state().term, Term(0));
+    assert_eq!(raft.role(), Role::Follower);
+
+    let heard = raft.receive(S1, append(1, LogId::default(), vec![cmd(1, 1)], 0), 0);
+    assert_eq!(
+        outcome(&heard, S1),
+        AppendOutcome::Accepted {
+            matched: LogIndex(1)
+        }
+    );
+    assert_eq!(raft.leader(), Some(S1), "the leader of the term is known");
+}
+
+/// Catches: a candidate that counts a granted vote from a learner (a learner is no
+/// part of the quorum, so two disjoint sets could each "win"), and one that stops
+/// counting voters once a learner has answered.
+#[test]
+fn a_granted_vote_from_a_learner_does_not_count() {
+    let mut candidate = Raft::new(three(S1), 0).unwrap();
+    let _ = tick_until_active(&mut candidate);
+    assert_eq!(candidate.role(), Role::Candidate);
+    assert_eq!(candidate.hard_state().term, Term(1));
+    assert_eq!(candidate.receive(S4, vote_response(1, true), 0), vec![]);
+    assert_eq!(
+        candidate.role(),
+        Role::Candidate,
+        "a learner's vote wins nothing"
+    );
+    assert_eq!(candidate.receive(S2, vote_response(1, false), 0), vec![]);
+    assert_eq!(candidate.role(), Role::Candidate, "a refusal wins nothing");
+    let _ = candidate.receive(S2, vote_response(1, true), 0);
+    assert_eq!(
+        candidate.role(),
+        Role::Leader,
+        "one voter and itself are a quorum of 3"
+    );
+    assert_eq!(candidate.leader(), Some(S1));
+}
+
+/// Catches: a leader that follows an append request of its own term (two leaders in
+/// one term cannot exist; obeying one would truncate its log or hand over the term),
+/// and one that replies to it.
+#[test]
+fn a_leader_ignores_an_append_request_of_its_own_term() {
+    let mut leader = Raft::new(config(S1, &[S1], &[S4]), 0).unwrap();
+    let _ = tick_until_active(&mut leader);
+    assert_eq!(leader.role(), Role::Leader);
+    let forged = append(1, LogId::default(), vec![cmd(1, 1), cmd(1, 2)], 2);
+    assert_eq!(leader.receive(S4, forged, 0), vec![]);
+    assert_eq!(leader.role(), Role::Leader);
+    assert_eq!(leader.leader(), Some(S1));
+    assert_eq!(leader.entries().len(), 1, "only its own blank entry");
+}
+
+/// Catches: a follower that persists and acknowledges entries that are not numbered
+/// consecutively after `prev` (a hole in the log), and one that lets a leader replace
+/// an entry it already committed.
+#[test]
+fn a_follower_drops_malformed_requests_and_never_replaces_a_committed_entry() {
+    let mut follower = Raft::new(three(S2), 0).unwrap();
+    // Adopting the sender's term is persisted; nothing else may follow.
+    let only_the_term = |effects: Vec<Effect>| {
+        effects
+            .iter()
+            .all(|e| matches!(e, Effect::PersistHardState(_)))
+    };
+    let hole = append(1, LogId::default(), vec![cmd(1, 2)], 0);
+    assert!(only_the_term(follower.receive(S1, hole, 0)));
+    assert!(follower.entries().is_empty());
+
+    let first = append(1, LogId::default(), vec![cmd(1, 1), cmd(1, 2)], 2);
+    let effects = follower.receive(S1, first, 0);
+    assert_eq!(applied(&effects), vec![LogIndex(1), LogIndex(2)]);
+    assert_eq!(follower.commit_index(), LogIndex(2));
+
+    let rewrite = append(2, LogId::default(), vec![cmd(2, 1)], 2);
+    assert!(only_the_term(follower.receive(S3, rewrite, 0)));
+    assert_eq!(follower.entries(), [cmd(1, 1), cmd(1, 2)]);
+    assert_eq!(follower.commit_index(), LogIndex(2));
+}
+
+/// Catches: a leader that trusts an acknowledgement for entries it never sent (a
+/// forged or corrupted `matched` beyond its log would move the peer's position past
+/// the end, and could commit entries no one holds).
+#[test]
+fn a_leader_ignores_an_acknowledgement_beyond_its_own_log() {
+    let mut leader = Raft::new(config(S1, &[S1], &[S4]), 0).unwrap();
+    let _ = tick_until_active(&mut leader);
+    let bogus = Message {
+        term: Term(1),
+        kind: MessageKind::AppendResponse {
+            outcome: AppendOutcome::Accepted {
+                matched: LogIndex(5),
+            },
+        },
+    };
+    assert_eq!(leader.receive(S4, bogus, 0), vec![]);
+    let heartbeat = tick_until_active(&mut leader);
+    let MessageKind::AppendRequest { prev, entries, .. } = sent_to(&heartbeat, S4).kind else {
+        panic!("not an append: {heartbeat:?}");
+    };
+    assert_eq!(prev, LogId::default(), "the peer is still at the start");
+    assert_eq!(entries.len(), 1, "and is still sent the blank entry");
+}
+
+/// Catches: a deposed leader that keeps its picture of the peers (it would still report
+/// peers as behind its snapshot, and answer a late rejection with an append of a term
+/// it no longer leads).
+#[test]
+fn a_deposed_leader_forgets_its_peers_and_ignores_late_answers() {
+    let mut leader = Raft::new(config(S1, &[S1], &[S4]), 0).unwrap();
+    let _ = tick_until_active(&mut leader);
+    for c in [b"a", b"b", b"c"] {
+        let _ = leader.propose(c.to_vec()).unwrap();
+    }
+    let base = LogId::new(Term(1), LogIndex(3));
+    assert_eq!(leader.compact(LogIndex(3)), Ok(base));
+    let probe = sent_to(&tick_until_active(&mut leader), S4);
+    let mut empty = Raft::new(config(S4, &[S1], &[S4]), 0).unwrap();
+    let rejection = sent_to(&empty.receive(S1, probe, 0), S1);
+    let _ = leader.receive(S4, rejection.clone(), 0);
+    assert_eq!(leader.behind_base(), vec![S4]);
+
+    let _ = leader.receive(S4, reply_with_term(9), 0);
+    assert_eq!(leader.role(), Role::Follower);
+    assert_eq!(leader.behind_base(), Vec::<ServerId>::new());
+    let late = Message {
+        term: Term(9),
+        kind: rejection.kind,
+    };
+    assert_eq!(leader.receive(S4, late, 0), vec![]);
+    assert_eq!(leader.behind_base(), Vec::<ServerId>::new());
+}

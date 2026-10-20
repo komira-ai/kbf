@@ -619,7 +619,12 @@ fn a_stale_offer_ends_the_deploy_and_untrusted_settings_stop_it() {
     if current_uid() == 0 {
         return;
     }
-    let layout = crate::layout::Layout::linux(kbf_host::Root::new(&rig.dir).unwrap());
+    // The deploy reads the settings of the platform it runs on (`HostProbe::at`), so they are
+    // planted where that platform's layout keeps them.
+    let layout = crate::layout::Layout::new(
+        kbf_host::Root::new(&rig.dir).unwrap(),
+        crate::layout::Platform::current(),
+    );
     let settings = layout.join(&layout.settings());
     fs::create_dir_all(settings.parent().unwrap()).unwrap();
     fs::write(&settings, "RUN_AS_UID=65534\n").unwrap();
