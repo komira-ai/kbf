@@ -38,6 +38,7 @@ fn identity(role: PeerRole) -> Identity {
     Identity {
         node_id: "node-1.farm".into(),
         role,
+        ips: Vec::new(),
     }
 }
 
@@ -251,6 +252,7 @@ async fn an_identity_that_cannot_be_a_header_is_refused() {
     let bad = Identity {
         node_id: "bad\nname".into(),
         role: PeerRole::Daemon,
+        ips: Vec::new(),
     };
     let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(Some(bad))).await;
     let reply = rig.client().await.unary(WORKER).await;
@@ -347,6 +349,7 @@ async fn http_paths_are_refused_with_http_statuses() {
     let bad = Identity {
         node_id: "bad\nname".into(),
         role: PeerRole::Daemon,
+        ips: Vec::new(),
     };
     let rig = Rig::start_secure(Buck2Auth::None, Access::Plain(Some(bad))).await;
     let reply = rig.client().await.plain("GET", OPERATOR, b"").await;

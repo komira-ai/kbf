@@ -3,11 +3,12 @@
 //! [`ProxyConfig`] is read once at start (SIGHUP reloads the certificate files only, not
 //! this table). Unknown keys are refused, so a typo is an error at start, not a default.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use kbf_tls::{CertEntry, SniCerts};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::Buck2Auth;
 use crate::hold::{HEADER_BYTES, STREAM_WINDOW_BYTES};
@@ -33,7 +34,7 @@ pub enum ConfigError {
 /// slot the REAPI, worker and operator listeners are at offsets 0, 1 and 2, the admin
 /// calls at 3 and enrollment at 4. The offsets are the frozen contract with the children
 /// (design section 7).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTable {
     /// The first port of slot A (1024 to [`MAX_BASE_PORT`]).
@@ -69,7 +70,7 @@ impl UpstreamTable {
 }
 
 /// Pre-stream and keepalive limits (design section 3). Every field has a default.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Limits {
     /// TLS handshake, HTTP/2 preface and request-head timeouts, in seconds.
@@ -130,7 +131,7 @@ impl Limits {
 }
 
 /// One `[[server_cert]]` table.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerCert {
     /// The DNS names this certificate is served for; each must be in its subject alternative
@@ -147,11 +148,16 @@ pub struct ServerCert {
 }
 
 /// The `[proxy]` table.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     /// The children's ports.
     pub upstream: UpstreamTable,
+    /// The public address, as `host:port`. The proxy does not read it: it takes the socket
+    /// `kbf-proxy.socket` hands it. `kbf-installer setup` turns it into the socket's drop-in
+    /// (`ListenStream=`); unset, the socket keeps the port the package ships.
+    #[serde(default, deserialize_with = "listen_address")]
+    pub listen: Option<SocketAddr>,
     /// REAPI and Buck2 authentication; default `none`.
     #[serde(default)]
     pub buck2_auth: Buck2Auth,
@@ -186,6 +192,22 @@ pub struct ProxyConfig {
     /// Limits.
     #[serde(default)]
     pub limits: Limits,
+}
+
+/// Reads `listen`. The error names the key and never the value, as the rest of the file's
+/// refusals do.
+fn listen_address<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SocketAddr>, D::Error> {
+    use serde::de::Error;
+    const WHY: &str = "listen: must be a socket address, host:port with a port from 1 to 65535 (an IPv6 host in brackets)";
+    match toml::Value::deserialize(deserializer)? {
+        toml::Value::String(text) => match text.parse::<SocketAddr>() {
+            Ok(addr) if addr.port() != 0 => Ok(Some(addr)),
+            _ => Err(D::Error::custom(WHY)),
+        },
+        _ => Err(D::Error::custom(WHY)),
+    }
 }
 
 fn default_secret_file() -> PathBuf {
@@ -450,6 +472,74 @@ key_file = "/etc/kbf/tls/worker.key"
             ProxyConfig::from_value(low),
             Err(ConfigError::Invalid(_))
         ));
+    }
+
+    /// Catches `listen` being unknown to the closed reader (the proxy would refuse the very
+    /// file `setup` reads), or read as anything but a socket address.
+    #[test]
+    fn listen_is_a_socket_address() {
+        let with = |v: &str| ProxyConfig::from_toml_str(&format!("listen = {v}\n{MIN}"));
+        assert_eq!(ProxyConfig::from_toml_str(MIN).expect("valid").listen, None);
+        assert_eq!(
+            with("\"192.0.2.10:8443\"").expect("v4").listen,
+            Some("192.0.2.10:8443".parse().unwrap())
+        );
+        assert_eq!(
+            with("\"[2001:db8::1]:8980\"").expect("v6").listen,
+            Some("[2001:db8::1]:8980".parse().unwrap())
+        );
+    }
+
+    /// Catches an unvalidated `listen` (a host name, no port, port 0, a number) reaching a
+    /// drop-in, and an error that echoes the value instead of naming the key.
+    #[test]
+    fn a_bad_listen_is_refused_naming_the_key_not_the_value() {
+        for bad in [
+            "\"farm.example:8980\"",
+            "\"192.0.2.10\"",
+            "\"192.0.2.10:0\"",
+            "\"2001:db8::1:8980\"",
+            "\"\"",
+            "8980",
+            "[\"192.0.2.10:8980\"]",
+        ] {
+            // Through `from_value`, as `installer.toml` is read: `from_toml_str` adds the
+            // source line to a parse error, which is the reader of a bare table's to decide.
+            let table: toml::Value =
+                toml::from_str(&format!("listen = {bad}\n{MIN}")).expect("toml");
+            let refused = ProxyConfig::from_value(table).expect_err("a bad listen is refused");
+            assert!(
+                matches!(refused, ConfigError::Parse(_)),
+                "{bad}: {refused:?}"
+            );
+            let why = refused.to_string();
+            assert!(why.contains("listen"), "{why}");
+            for piece in ["farm.example", "192.0.2.10", "2001:db8"] {
+                assert!(!why.contains(piece), "{why} echoes the value");
+            }
+        }
+    }
+
+    /// Catches `Serialize` dropping or reshaping a key: `setup` rewrites `installer.toml` from
+    /// the parsed table, so a table must come back equal.
+    #[test]
+    fn a_table_serializes_back_to_itself() {
+        let text = format!(
+            "listen = \"192.0.2.10:8443\"\nbuck2_auth = \"bearer\"\nbuck2_token_file = \"/k\"\n{MIN}\n[limits]\nmax_streams = 100\n"
+        );
+        let config = ProxyConfig::from_toml_str(&text).expect("valid");
+        let again = toml::to_string(&config).expect("serializes");
+        assert_eq!(ProxyConfig::from_toml_str(&again).expect("valid"), config);
+    }
+
+    /// Catches `setup`'s rewrite dropping or reshaping the `[[server_cert]]` list: names,
+    /// files and the default flag come back equal.
+    #[test]
+    fn a_table_with_server_certs_serializes_back_to_itself() {
+        let config = ProxyConfig::from_toml_str(&two_certs("")).expect("valid");
+        assert_eq!(config.server_cert.len(), 2);
+        let again = toml::to_string(&config).expect("serializes");
+        assert_eq!(ProxyConfig::from_toml_str(&again).expect("valid"), config);
     }
 
     #[test]
