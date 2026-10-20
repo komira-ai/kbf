@@ -104,20 +104,10 @@ pub fn run(args: &[OsString]) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps directory")
-            .join("kbf-driver-container-unit")
-            .join(format!("unpack-layers-{name}-{}", std::process::id()));
-        let _ = crate::remove::remove_tree(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        dir
+    fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+        crate::unit_dir(&format!("unpack-layers-{name}"))
     }
 
     /// A tar of one file `path`, owned by the running user (which an unprivileged

@@ -58,13 +58,18 @@ async fn get(addr: SocketAddr, path: &str) -> (u16, String, String) {
     (code, head.to_ascii_lowercase(), body.to_owned())
 }
 
-/// What a scrape of the lost-blob families must hold, whoever serves it.
+/// What a scrape of the lost-blob families and the in-flight gauges must hold, whoever
+/// serves it.
 fn assert_lost_blob_series(body: &str) {
     for line in [
         "# TYPE kbf_cache_lost_blobs gauge",
         "kbf_cache_lost_blobs 0",
         "# TYPE kbf_cache_blob_losses_total counter",
         "kbf_cache_blob_losses_total 0",
+        // The bytes the node holds for requests in flight: a storage node's Writes are
+        // counted in the process gauge it exports.
+        "# TYPE kbf_bytes_in_flight gauge",
+        "# TYPE kbf_bytes_in_flight_peak gauge",
     ] {
         assert!(body.lines().any(|l| l == line), "{line:?} in\n{body}");
     }

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::CommitId;
 use crate::activate::{self, Activated, Arm, Confirmed, Expiry};
-use crate::layout::{Layout, Platform};
+use crate::layout::{self, Layout, Platform};
 use crate::release::{self, ReleaseError};
 use crate::spool::{Entry, read_capped};
 use crate::state::{self, Locked, State, StateError};
@@ -26,7 +26,7 @@ mod frontend;
 use crate::database::SchemaStep;
 use crate::helper::fetcher::{Fetcher, InstalledRelease, ReleaseLocator};
 use crate::helper::host_mode;
-use crate::helper::leases::LeaseSource;
+use crate::helper::leases::{self, LeaseSource};
 use crate::helper::memory::{Event, Memory, StagedFacts};
 use crate::helper::order::{self, Claims, Order, Verb};
 use crate::helper::restart::{self, Restart};
@@ -87,7 +87,7 @@ pub struct Helper<E: Exec> {
 }
 
 fn memory_path(host: &Layout) -> HostPath {
-    HostPath::new(&format!("{}/helper.json", host.state_dir().as_str()))
+    HostPath::new(&format!("{}/{}", host.state_dir().as_str(), layout::MEMORY))
         .expect("the state directory and a plain name")
 }
 
@@ -125,6 +125,12 @@ impl<E: Exec> Helper<E> {
     #[cfg(test)]
     pub(crate) fn schema_step_mut(&mut self) -> Option<&mut (dyn SchemaStep + 'static)> {
         self.schema.as_deref_mut()
+    }
+
+    /// The lease source, for a test to see what a caller wired.
+    #[cfg(test)]
+    pub(crate) fn leases(&self) -> &dyn LeaseSource {
+        self.leases.as_ref()
     }
 
     /// The host's executor, for a test to read what was done.
@@ -528,6 +534,14 @@ impl<E: Exec> Helper<E> {
         memory: &mut Memory,
     ) -> Result<(), String> {
         let id = order.id;
+        // A frontend holds no leases, so the lease check below would let this through, and
+        // the swap would restart it: a frontend moves by `frontend_update`, never by this.
+        if let Some(unit) = leases::frontend_unit(&self.cfg.restart) {
+            return Err(format!(
+                "denied: order {id}: {unit:?} is a frontend's unit; a frontend moves by \
+                 frontend_update, and an activate would restart it"
+            ));
+        }
         // Fail closed: an activation without the release's claims is not taken.
         let Some(claims) = &order.claims else {
             return Err(format!(

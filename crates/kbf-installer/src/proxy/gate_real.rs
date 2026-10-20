@@ -85,6 +85,23 @@ impl ProxyGate {
     }
 }
 
+impl ProxyGate {
+    /// Take the startup hold and keep it in this gate, so the [`Gate::release_into`] that
+    /// follows ends it the way a swap's does, and a start that cannot finish leaves it in
+    /// force, as an adoption that never ran does.
+    ///
+    /// # Errors
+    /// The startup hold is gone already (adopted before, or taken).
+    pub fn keep_startup_hold(&self) -> Result<(), PortError> {
+        let guard = self
+            .handle
+            .startup_hold()
+            .ok_or_else(|| PortError("the startup hold is gone: adoption already ran".into()))?;
+        *self.guard.lock().unwrap_or_else(PoisonError::into_inner) = Some(guard);
+        Ok(())
+    }
+}
+
 impl Gate for ProxyGate {
     fn hold(&self, max: Duration) -> Result<(), PortError> {
         let guard = self.handle.slots().hold(max).map_err(refused)?;

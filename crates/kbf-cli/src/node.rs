@@ -14,7 +14,7 @@
 //!    fix exits 2.
 //! 3. Builds the mode's command line from `kbf.toml`, the configuration the frontend sent
 //!    and the certificate files, parses it with the mode's own parser
-//!    ([`crate::parse_from`], the same one `kbf check-args` and the units use, so a flag
+//!    ([`crate::parse_from`], the same one the units use, so a flag
 //!    the mode would refuse is refused here the same way) and runs the mode in this
 //!    process.
 //! 4. While the mode runs, renews the certificates at half their life
@@ -39,7 +39,11 @@
 //! (`NodeConfig.cold_store`), never a key. This build does not fetch keys from the
 //! frontend (`kbf_enroll::keys` is not called): the object-store client uses the
 //! credentials of the process, as `kbf storage` does, and a frontend that asks for
-//! `KEYS` mode is told so on stderr.
+//! `KEYS` mode is told so on stderr. The frontend builds `cold_store` from the store
+//! registered for the farm (`kbf cluster object-store`): the bucket, prefix, endpoint
+//! and put settings, nothing else. A farm with no store registered sends none, and a
+//! storage node cannot start; one enrolled before the registration asks the frontend
+//! once, at its next start, for the configuration it lacks ([`refresh_cold_store`]).
 //!
 //! Exit codes are [`crate::enroll`]'s until the mode starts, and the mode's own after.
 
@@ -230,6 +234,37 @@ pub fn plan(
         ));
     }
     Ok(argv)
+}
+
+/// A storage half cannot start without the cold store, and a node enrolled before the farm
+/// registered one holds none until its next renewal. Asks the frontend once, now, for the
+/// configuration (a renewal, which sends it when the node's generation is not the
+/// frontend's). Any other node, and one that holds a cold store, is returned as it is; a
+/// frontend that cannot be reached or refuses is told on stderr and the node as it was is
+/// returned, so the plan says what is missing.
+///
+/// # Errors
+/// The runtime could not be built.
+fn refresh_cold_store(
+    loaded: &Loaded,
+    node: Enrolled,
+    want: Want,
+    env: &Env,
+) -> Result<Enrolled, Failure> {
+    if !want.roles.contains(Role::Storage) || !node.config.cold_store.is_empty() {
+        return Ok(node);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let renewer = Renewer::new(loaded, &node, env, 0);
+    match runtime.block_on(renewer.attempt((env.now)())) {
+        Ok(fresh) => Ok(fresh),
+        Err(error) => {
+            eprintln!("kbf: cannot ask the frontend for the cold store: {error}");
+            Ok(node)
+        }
+    }
 }
 
 /// Parses the mode's command line `argv` together with the settings of `kbf.toml`: the
@@ -522,7 +557,13 @@ pub fn run_with(
     // only after the node had enrolled.
     crate::check_settings(want.mode, &args.config).map_err(Failure::Settings)?;
     let outcome = enroll_with_retry(&loaded, want, env)?;
-    let node = outcome.node;
+    // An enrollment just made was sent the frontend's configuration; only an older one can
+    // lack a store registered since.
+    let node = if outcome.fresh {
+        outcome.node
+    } else {
+        refresh_cold_store(&loaded, outcome.node, want, env)?
+    };
     if wants_keys(&node.config) {
         eprintln!(
             "kbf: warning: the frontend asks for object-store keys to be fetched; this \

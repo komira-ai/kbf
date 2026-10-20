@@ -52,21 +52,10 @@ pub async fn make(dir: &Path) -> std::io::Result<Vec<(&'static str, OsString)>> 
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-native-unit")
-            .join(format!("home-{name}-{}", std::process::id()));
-        // Absent unless a run with this pid left it.
-        let _ = kbf_outputs::remove_tree(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        dir
+    fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+        crate::unit_dir(&format!("home-{name}"))
     }
 
     /// Catches: a variable that names a directory that is not made (a tool that writes

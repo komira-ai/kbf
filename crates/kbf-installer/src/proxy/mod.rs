@@ -19,17 +19,29 @@
 //! Child control over HTTP: [`child_http`] is the blocking loopback client that the real
 //! child control and the fleet read call a child's ports with (U8b); [`admin`] is the
 //! `ChildAdmin` built on it (`admin_protocol` 1, sending the proxy secret header on every
-//! call), and nothing else calls it yet.
+//! call). The proxy verb builds it in [`supervisor::child_admin`] and uses it for the start:
+//! [`supervisor::adopt_children`] adopts a child a previous proxy left (an active one at
+//! once, a candidate after it takes the generation) and, where none runs, starts the release
+//! `status.json` calls installed ([`boot`]). It still cannot run a swap or resume one, or
+//! choose between two live children.
 //!
-//! Still fakes, stated: `Migrator` (who migrates is open), `RootOrders` (the orders spool
-//! and `status.json` reader belong to the update API's unit, U8b). Until the proxy verb
-//! wires [`admin`] in, it cannot run a swap or resume one, start a first child or choose
-//! between two live ones, so [`supervisor::adopt_children`] adopts a child only when no
-//! update is in flight.
+//! Still fakes, stated: `RootOrders` (the orders spool and the update API belong to U8b; the
+//! boot reads `status.json` itself) and, in the verb, `Migrator` (who migrates is open:
+//! [`supervisor::NoMigration`] is the hook the boot calls before it starts a child).
 //!
 //! Assumptions, each in one place:
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
 //!   [`ports::ChildAdmin::resume`].
+//! - **Cold start** ([`boot`]). With no live child the proxy starts `installed_commit` of
+//!   `status.json`, running `releases/<sha>/kbf` (never `releases/current`) in slot A as a
+//!   candidate, and makes it take the generation: no live holder, so the child bumps the epoch
+//!   (FP section 8). It starts nothing unless the binary is executable and the release has
+//!   its `VERIFIED` marker. A failed attempt is stopped (SIGKILL only if the process never
+//!   answered ready, SIGTERM otherwise) and tried again after 2, 4, ... 30 s, ten attempts in
+//!   all; then the streams stay held until the proxy restarts. "Ready" for this boot is the
+//!   child's operator `/readyz` alone, because the health and capabilities probes are not built
+//!   ([`cold::ReadyRule`]); the takeover is the final check. The reason of each failed attempt
+//!   is a fixed word in `boot.json` (state directory) and the log.
 //! - **Start.** A frontend host starts the new child as a candidate (`--await-takeover`,
 //!   [`model::Start`]); an all-in-one host starts the new process, and the old release put
 //!   back after a failed start, to serve at once, because no takeover is ever sent there.
@@ -82,9 +94,12 @@
 pub mod admin;
 mod aio;
 pub mod api;
+#[cfg(target_os = "linux")]
+pub mod boot;
 pub mod child_http;
 #[cfg(target_os = "linux")]
 pub mod child_real;
+mod cold;
 pub mod gate_real;
 pub mod model;
 pub mod orders;
