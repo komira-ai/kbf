@@ -5,7 +5,7 @@
 //! Catches:
 //! - a package unit for a mode `kbf` does not have (the files and `kbf_cli::names::MODES`
 //!   drifting apart);
-//! - (ignored until `kbf --mode=<mode> --check` exists, P12) a unit whose
+//! - a unit whose
 //!   `ExecStart=` or `ExecStartPre=` `kbf` line is a command line `kbf <mode>` refuses.
 
 use std::ffi::OsString;
@@ -57,10 +57,13 @@ fn the_package_has_a_unit_for_each_kbf_mode() {
     assert_eq!(have, want);
 }
 
-/// Catches a unit command line `kbf <mode>` refuses. `kbf <mode> --check` is P12 and
-/// `kbf node` and `kbf enroll` are #966, so this test is ignored until they land.
+/// Catches a unit command line `kbf <mode>` refuses: every `kbf` line of a package unit
+/// (`ExecStartPre=` `--check` and `ExecStart=`) is parsed by kbf's own parser, the words
+/// after `kbf` exactly as systemd passes them (`%i` is instance a). A unit names few
+/// flags and leaves the rest to `/etc/kbf/kbf.toml`, which a parser with no file reads as
+/// missing flags, so that one refusal is let through; an unknown flag, another mode's
+/// flag and a value kbf refuses are not.
 #[test]
-#[ignore = "P12: `kbf --mode=<mode> --check` does not exist yet"]
 fn each_package_unit_command_line_parses_with_kbfs_own_parser() {
     for (mode, text) in units() {
         let lines = kbf_lines(&text);
@@ -69,16 +72,16 @@ fn each_package_unit_command_line_parses_with_kbfs_own_parser() {
             "{mode}: fewer kbf lines than a check and a start"
         );
         for line in lines {
-            // [--mode=M, flags...]; today's parser takes the mode as a word (the subcommand
-            // forms stay as aliases), and %i is instance a.
-            let m = line[0].strip_prefix("--mode=").expect("--mode=");
-            let argv: Vec<OsString> = ["kbf", "check-args", m]
-                .into_iter()
-                .map(str::to_owned)
-                .chain(line[1..].iter().map(|f| f.replace("%i", "a")))
+            assert!(line[0].starts_with("--mode="), "{mode} {line:?}");
+            let argv: Vec<OsString> = std::iter::once("kbf".to_owned())
+                .chain(line.iter().map(|f| f.replace("%i", "a")))
                 .map(OsString::from)
                 .collect();
-            kbf_cli::check_args(&argv).unwrap_or_else(|e| panic!("{mode} {line:?}: {e}"));
+            match kbf_cli::parse_from(argv) {
+                Ok(_) => {}
+                Err(e) if e.kind() == clap::error::ErrorKind::MissingRequiredArgument => {}
+                Err(e) => panic!("{mode} {line:?}: {e}"),
+            }
         }
     }
 }

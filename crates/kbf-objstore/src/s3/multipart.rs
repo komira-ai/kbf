@@ -96,9 +96,11 @@ impl Upload {
     }
 
     /// Aborts the upload; a failure is logged (the lifecycle rule is the backstop).
+    /// Still open until the abort ended: a write dropped while it is on the wire (its
+    /// caller went away) is aborted again by [`Drop`], from a task of its own.
     async fn abort(mut self) {
-        self.open = false;
         abort(&self.conn, &self.key, &self.id).await;
+        self.open = false;
     }
 }
 

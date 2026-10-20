@@ -2,12 +2,16 @@
 //! together, reloaded as one unit, and the handshake that turns an accepted connection into
 //! a verified peer.
 //!
-//! - **Reload.** [`TlsReloader::reload`] re-reads all three files and builds a new
+//! - **Reload.** [`TlsReloader::reload`] re-reads every certificate and key file and the client CA and builds a new
 //!   configuration; it replaces the old one only if the whole build succeeds, so a handshake
 //!   never sees a new certificate with the old CA or the reverse. A failed reload keeps the
 //!   old configuration, ticks `kbf_proxy_tls_reload_failed_total` and logs the error (which
 //!   names a file, never its content). Only handshakes that start afterwards see the new
 //!   configuration; an open connection keeps the one it was accepted under.
+//! - **Certificates.** One port, several server certificates: the one a handshake presents
+//!   is chosen by the name in the ClientHello (see [`kbf_tls::SniCerts`]), and a handshake
+//!   with no name or an unknown one gets the default. The client side (the optional client
+//!   certificate and the farm CA that verifies it) does not depend on the name.
 //! - **Handshake.** A client certificate is optional, and one that fails verification is a
 //!   handshake error, never an anonymous client (see
 //!   [`kbf_tls::server_config_optional_client`]). A certificate that verifies is read once,
@@ -23,6 +27,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
+use kbf_tls::{CertEntry, SniCerts};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
@@ -30,13 +35,12 @@ use crate::identity::{Identity, identity_of};
 use crate::metrics::Metrics;
 use crate::pool::BoxIo;
 
-/// The three files the configuration is made of.
+/// The files the configuration is made of.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TlsPaths {
-    /// The PEM certificate chain, leaf first.
-    pub cert: PathBuf,
-    /// The PEM private key of the leaf.
-    pub key: PathBuf,
+    /// The server certificates, each with its key, the names it is served for and which one
+    /// is the default (see [`kbf_tls::SniCerts::from_config`]).
+    pub certs: Vec<CertEntry>,
     /// The PEM bundle of the farm CA that client certificates must chain to.
     pub client_ca: PathBuf,
 }
@@ -101,17 +105,12 @@ impl TlsReloader {
     }
 
     fn build(paths: &TlsPaths, reject_expired: bool) -> Result<Arc<ServerConfig>, TlsReloadError> {
-        let (cert, key, ca) = (
-            read(&paths.cert)?,
-            read(&paths.key)?,
-            read(&paths.client_ca)?,
-        );
-        Ok(kbf_tls::server_config_optional_client(
-            &cert,
-            &key,
-            &ca,
-            reject_expired,
-        )?)
+        let mut certs = SniCerts::from_config(&paths.certs)?;
+        if reject_expired {
+            certs = certs.reject_expired()?;
+        }
+        let ca = read(&paths.client_ca)?;
+        Ok(kbf_tls::server_config_optional_client_sni(certs, &ca)?)
     }
 
     /// The configuration a handshake that starts now uses.
@@ -119,7 +118,7 @@ impl TlsReloader {
         Arc::clone(&self.current.read().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Re-reads certificate, key and client CA, and replaces the configuration if the three
+    /// Re-reads the certificates, keys and client CA, and replaces the configuration if the three
     /// make a working one. On any failure the old configuration stays, the failure is
     /// counted and logged, and the error is returned.
     ///
