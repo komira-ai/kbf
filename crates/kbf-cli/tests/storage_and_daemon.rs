@@ -421,3 +421,67 @@ fn a_start_either_half_refuses_says_which() {
     assert!(out.starts_with("kbf-storage "), "{out}");
     assert!(err.contains("kbf storage-and-daemon: daemon: "), "{err}");
 }
+
+/// Catches a SIGTERM that arrives while the node is still starting killing the process by
+/// the signal's default action (kbf#1087): the node is told to register with a frontend
+/// that never answers, so its start waits in the registration, with the storage half's
+/// stores open. A `systemctl stop` then must stop it cleanly and exit 0, not end it by
+/// SIGTERM (no exit code), which hard-kills a storage member other nodes replicate to.
+/// Waits for the start's own log line (`cold store:`), logged after the process is
+/// running its start, so the signal is sent while it waits and not before it runs.
+#[test]
+fn a_sigterm_while_the_node_is_still_starting_stops_it_cleanly() {
+    use std::io::Read as _;
+
+    let dir = scratch("sigterm-at-start");
+    pki(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    crun(
+        &bin,
+        &dir.join("data"),
+        FAKE_CRUN,
+        &["write-lines", "$UPPER/out/file.txt", "a file"],
+    );
+    let worker: SocketAddr = "127.0.0.1:1".parse().expect("address");
+    // An empty file, so that a host's own /etc/kbf/kbf.toml is not read.
+    let config = dir.join("empty.toml");
+    std::fs::write(&config, "").expect("write");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    // Port 1 refuses, and the registration retries until the frontend answers.
+    let flags: Vec<String> = node_flags(&dir, worker)
+        .into_iter()
+        .chain(["--frontend=http://127.0.0.1:1".to_owned()])
+        .chain([format!("--config={}", config.display())])
+        .collect();
+    let mut child = Command::new(BIN)
+        .args(&flags)
+        .args(cgroup_tree(&bin))
+        .arg(oci_runtime(&bin))
+        .env("PATH", image_path(&bin))
+        .current_dir(&bin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let running = Running(child);
+    let mut seen = Vec::new();
+    let mut byte = [0_u8; 1];
+    let deadline = Instant::now() + PROMPT;
+    while !String::from_utf8_lossy(&seen).contains("cold store:") {
+        assert!(Instant::now() < deadline, "no start log line");
+        let got = stderr.read(&mut byte).expect("read");
+        assert_eq!(got, 1, "the node ended: {}", String::from_utf8_lossy(&seen));
+        seen.push(byte[0]);
+    }
+    // The start is waiting in the registration: it must be still running, no start line.
+    std::thread::sleep(Duration::from_millis(500));
+    let pid = rustix::process::Pid::from_child(&running.0);
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("SIGTERM");
+    let status = running.wait();
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}

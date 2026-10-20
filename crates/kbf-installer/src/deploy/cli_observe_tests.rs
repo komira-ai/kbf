@@ -1,0 +1,478 @@
+//! `cli::run` over real sockets: two listening fakes, one for the update API (`--api`) and one
+//! for the frontend the gates read. The unit tests hand `deploy` its clients; these prove the
+//! command line builds them from the right addresses, which no fake client can.
+//!
+//! The update API answers a preflight that passes; the observed frontend's `/metrics` reports
+//! storage under-replicated, so the deploy ends at the preflight gate (exit 3, `gate_red`)
+//! without changing anything. What the test looks at is which listener was asked what.
+
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener};
+use std::os::unix::fs::PermissionsExt;
+use std::sync::{Arc, Mutex};
+
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
+use serde_json::{Value, json};
+
+use super::cli::{self, FrontendConfig, Host, current_uid};
+use crate::testkit::{A, B};
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+/// A listener that answers `GET`s from `answer(path)` as `(status, body)` and keeps the
+/// request lines it saw.
+struct Fake {
+    addr: SocketAddr,
+    seen: Arc<Mutex<Vec<String>>>,
+    /// The CA that vouches for the listener's certificate, when it speaks TLS (the update API
+    /// is TLS only; the observed frontend's operator port is plain HTTP).
+    ca: Option<String>,
+}
+
+/// The name the update API's test certificate carries.
+const API_NAME: &str = "farm.example";
+
+impl Fake {
+    fn start(answer: impl Fn(&str) -> (u16, String) + Send + 'static) -> Fake {
+        Fake::on(TcpListener::bind("127.0.0.1:0").unwrap(), answer)
+    }
+
+    /// The same under TLS, as the update API is served.
+    fn start_tls(answer: impl Fn(&str) -> (u16, String) + Send + 'static) -> Fake {
+        let (ca, cert, key) = super::smoke_tests::pki(API_NAME);
+        let certs = CertificateDer::pem_slice_iter(cert.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut fake = Fake::serve(listener, Some(Arc::new(config)), answer);
+        fake.ca = Some(ca);
+        fake
+    }
+
+    fn on(listener: TcpListener, answer: impl Fn(&str) -> (u16, String) + Send + 'static) -> Fake {
+        Fake::serve(listener, None, answer)
+    }
+
+    fn serve(
+        listener: TcpListener,
+        tls: Option<Arc<ServerConfig>>,
+        answer: impl Fn(&str) -> (u16, String) + Send + 'static,
+    ) -> Fake {
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(tcp) = stream else { return };
+                let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                let mut stream: Box<dyn ReadWrite> = match &tls {
+                    Some(config) => match ServerConnection::new(Arc::clone(config)) {
+                        Ok(conn) => Box::new(StreamOwned::new(conn, tcp)),
+                        Err(_) => continue,
+                    },
+                    None => Box::new(tcp),
+                };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                let text = String::from_utf8_lossy(&head).into_owned();
+                let line = text.lines().next().unwrap_or("").to_owned();
+                let path = line.split(' ').nth(1).unwrap_or("").to_owned();
+                log.lock().unwrap().push(line);
+                let (status, body) = answer(&path);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        Fake {
+            addr,
+            seen,
+            ca: None,
+        }
+    }
+
+    /// The flags that tell the deploy how to verify this listener's certificate, with the CA
+    /// written under `dir`; none for a plain listener.
+    fn trust_flags(&self, dir: &std::path::Path) -> Vec<String> {
+        let Some(ca) = &self.ca else {
+            return Vec::new();
+        };
+        let file = dir.join("api-ca.pem");
+        fs::write(&file, ca).unwrap();
+        vec![
+            "--api-ca".to_owned(),
+            file.to_str().unwrap().to_owned(),
+            "--api-server-name".to_owned(),
+            API_NAME.to_owned(),
+        ]
+    }
+
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    fn saw_metrics(&self) -> bool {
+        self.seen().iter().any(|l| l.starts_with("GET /metrics"))
+    }
+}
+
+/// An update API whose preflight passes for `A` on one Linux node.
+fn update_api() -> Fake {
+    update_api_serving(None)
+}
+
+/// The same, whose frontend status names `serving` (`a` or `b`) as the serving slot.
+fn update_api_serving(serving: Option<&'static str>) -> Fake {
+    Fake::start_tls(move |path| {
+        let body: Option<Value> = match path {
+            "/v1/nodes" => Some(json!({"server": {"commit": &A[..12]}, "nodes": [{
+                "node_id": "n1", "connected": true, "placement": {"state": "serving"},
+                "update": {"state": "confirmed", "running_commit": &B[..12], "platform": "linux-x86_64",
+                           "offered_generation": 7, "up_to_date": false, "availability": "ok"}}]})),
+            "/v1/releases" => Some(json!({"releases": [{"commit": A, "platforms": [{
+                "platform": "linux-x86_64", "complete": true,
+                "components": [{"name": "kbf", "sha256": "x", "size": 1, "attested": true}]}]}]})),
+            "/v1/update" => Some(json!({"desired": {"commit": B, "generation": 7},
+                                        "frontend": {"order_id": 1, "state": "confirmed"}})),
+            "/v1/update/frontend" => Some(json!({"active_slot": serving, "restart_pending": false,
+                                                "rollback_allowed": false})),
+            _ => None,
+        };
+        body.map_or((404, "{}".to_owned()), |b| (200, b.to_string()))
+    })
+}
+
+/// A frontend whose storage is under-replicated.
+fn frontend() -> Fake {
+    Fake::start(|path| {
+        match path {
+        "/metrics" => (
+            200,
+            "kbf_frontend_relay_untraced 0\nkbf_cache_lost_blobs 0\nkbf_cache_blob_losses_total 1\n\
+             kbf_under_replicated_blobs 2\n"
+                .to_owned(),
+        ),
+        _ => (404, "{}".to_owned()),
+    }
+    })
+}
+
+struct Run {
+    code: i32,
+    summary: Value,
+}
+
+fn run(name: &str, api: &Fake, observe_flags: &[String]) -> Run {
+    let (_, dir) = crate::testkit::host_root(&format!("deploy-observe-{name}"));
+    let token = dir.join("token");
+    fs::write(&token, "0123456789abcdef0123456789abcdef0123456789abcdef\n").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut args: Vec<String> = [
+        "--commit",
+        A,
+        "--api",
+        &api.addr.to_string(),
+        "--token-file",
+        token.to_str().unwrap(),
+        "--lock",
+        dir.join("lock").to_str().unwrap(),
+        "--result",
+        dir.join("result.json").to_str().unwrap(),
+        "--platform",
+        "linux-x86_64",
+        "--apply",
+        "--stage",
+        "gamma",
+        "--no-offer",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    args.extend(api.trust_flags(&dir));
+    args.extend(observe_flags.iter().cloned());
+    let host = Host {
+        root: true,
+        config_owner: current_uid(),
+        frontend: FrontendConfig {
+            toml: dir.join("none.toml"),
+            units: Vec::new(),
+        },
+        installer_root: dir.clone(),
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = cli::run(
+        &args,
+        &mut std::io::empty(),
+        &mut out,
+        &mut err,
+        false,
+        &host,
+    );
+    let line = String::from_utf8(out).unwrap();
+    let summary = serde_json::from_str(line.trim()).unwrap_or_else(|_| {
+        panic!("no summary: {line:?} {}", String::from_utf8_lossy(&err));
+    });
+    Run { code, summary }
+}
+
+fn ended_at_the_storage_gate(r: &Run) {
+    assert_eq!(r.code, 3, "{}", r.summary);
+    assert_eq!(r.summary["reason"], "gate_red", "{}", r.summary);
+    assert!(
+        r.summary["detail"]
+            .as_str()
+            .unwrap()
+            .contains("e_under_replicated"),
+        "{}",
+        r.summary
+    );
+}
+
+/// Proves `--observe` makes the command line read `/metrics` from that address and not from
+/// `--api`: the observed listener is asked for `/metrics`, the update API never is, and the
+/// deploy ends at the storage gate the observed listener's metrics decide. Catches an
+/// observe client built from the update API's address.
+///
+/// Mutants planted: `observe` defaulting to `--api` in `cli::run`.
+#[test]
+fn observe_names_the_listener_the_gates_read() {
+    let (api, front) = (update_api(), frontend());
+    let r = run(
+        "fixed",
+        &api,
+        &["--observe".to_owned(), front.addr.to_string()],
+    );
+    ended_at_the_storage_gate(&r);
+    assert!(front.saw_metrics(), "{:?}", front.seen());
+    assert!(
+        !api.seen()
+            .iter()
+            .any(|l| l.contains("/metrics") || l.contains("/v1/invocations")),
+        "gate reads reached --api: {:?}",
+        api.seen()
+    );
+    assert!(api.seen().iter().any(|l| l.starts_with("GET /v1/nodes")));
+}
+
+/// Proves `--observe-base-port` finds the serving child by its slot's operator port (base
+/// plus 2 for slot A, plus 12 for slot B): with the update API naming no serving slot, the
+/// only child that answers is read. Here slot B's port is closed and slot A's is the fake.
+/// Catches a wrong offset and a probe that does not run.
+///
+/// Mutants planted: slot A's operator offset changed.
+#[test]
+fn observe_base_port_reads_the_child_that_answers() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let front = Fake::on(listener, |path| match path {
+        "/metrics" => (
+            200,
+            "kbf_under_replicated_blobs 2\nkbf_cache_lost_blobs 0\n".to_owned(),
+        ),
+        _ => (404, "{}".to_owned()),
+    });
+    let api = update_api();
+    let base = (port - 2).to_string();
+    let r = run("slots", &api, &["--observe-base-port".to_owned(), base]);
+    assert!(front.saw_metrics(), "{:?} {}", front.seen(), r.summary);
+    assert!(
+        !api.seen().iter().any(|l| l.contains("/metrics")),
+        "{:?}",
+        api.seen()
+    );
+    assert_eq!(r.code, 3, "{}", r.summary);
+}
+
+// ---- a signal -----------------------------------------------------------------------
+
+const CHILD_DIR: &str = "KBF_TEST_SIGNAL_CHILD_DIR";
+
+/// The deploy that the signal tests interrupt, run in a child process of the test binary: an
+/// update API that never answers, so the deploy is in its first request when the signal comes.
+/// Without the variable set (a normal run of the suite) it does nothing.
+#[test]
+fn signal_child_entry() {
+    let Some(dir) = std::env::var_os(CHILD_DIR).map(std::path::PathBuf::from) else {
+        return;
+    };
+    let marker = dir.join("started");
+    let api = Fake::start_tls(move |_| {
+        let _ = fs::write(&marker, b"x");
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        (404, "{}".to_owned())
+    });
+    let token = dir.join("token");
+    fs::write(&token, "0123456789abcdef0123456789abcdef0123456789abcdef\n").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let args: Vec<String> = [
+        "--commit",
+        A,
+        "--api",
+        &api.addr.to_string(),
+        "--token-file",
+        token.to_str().unwrap(),
+        "--lock",
+        dir.join("lock").to_str().unwrap(),
+        "--result",
+        dir.join("result.json").to_str().unwrap(),
+        "--platform",
+        "linux-x86_64",
+        "--observe",
+        "127.0.0.1:2",
+        "--apply",
+        "--stage",
+        "gamma",
+        "--no-offer",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let mut args = args;
+    args.extend(api.trust_flags(&dir));
+    let host = Host {
+        root: true,
+        config_owner: current_uid(),
+        frontend: FrontendConfig {
+            toml: dir.join("none.toml"),
+            units: Vec::new(),
+        },
+        installer_root: dir.clone(),
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    cli::run(
+        &args,
+        &mut std::io::empty(),
+        &mut out,
+        &mut err,
+        false,
+        &host,
+    );
+}
+
+/// Proves a deploy ended by SIGTERM or SIGINT leaves its document finished red, naming the
+/// signal, and exits 128 plus the signal. The deploy runs in a child process, stuck in its first
+/// request; the signal is sent once that request has arrived. Catches a signal path that
+/// leaves the document `RUNNING` (the process is killed by its default action).
+///
+/// Mutants planted: the handlers not armed in `cli::run`.
+#[test]
+fn a_signal_seals_the_document_red_and_exits_128_plus_the_signal() {
+    for (signal, code, word) in [
+        (libc::SIGTERM, 143, "SIGTERM"),
+        (libc::SIGINT, 130, "SIGINT"),
+    ] {
+        let (_, dir) = crate::testkit::host_root(&format!("deploy-signal-{word}"));
+        let _ = fs::remove_file(dir.join("started"));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "deploy::cli_observe_tests::signal_child_entry",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_DIR, &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let waited = std::time::Instant::now();
+        while !dir.join("started").exists() {
+            assert!(
+                waited.elapsed().as_secs() < 60,
+                "the child never made its request"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // SAFETY: signals the child this test spawned.
+        unsafe { libc::kill(child.id() as libc::pid_t, signal) };
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(waited.elapsed().as_secs() < 120, "the child did not end");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(code), "{word}: {status:?}");
+        let doc =
+            kbf_gate::ResultDoc::from_bytes(&fs::read(dir.join("result.json")).unwrap()).unwrap();
+        assert_eq!(doc.status, kbf_gate::Status::Red, "{word}");
+        assert!(doc.finished.is_some() && !doc.passed());
+        assert_eq!(
+            doc.note.as_deref(),
+            Some(format!("interrupted by {word}").as_str())
+        );
+    }
+}
+
+/// Two listeners at the operator ports of a base port's slot A and slot B.
+fn both_slots(a: &'static str, b: &'static str) -> (u16, Fake, Fake) {
+    loop {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = probe.local_addr().unwrap().port().saturating_sub(2);
+        drop(probe);
+        if !(1024..=60_000).contains(&base) {
+            continue;
+        }
+        let (Ok(la), Ok(lb)) = (
+            TcpListener::bind(("127.0.0.1", base + 2)),
+            TcpListener::bind(("127.0.0.1", base + 12)),
+        ) else {
+            continue;
+        };
+        let metrics = |text: &'static str| {
+            move |path: &str| match path {
+                "/metrics" => (200, text.to_owned()),
+                _ => (404, "{}".to_owned()),
+            }
+        };
+        return (base, Fake::on(la, metrics(a)), Fake::on(lb, metrics(b)));
+    }
+}
+
+/// Proves the production wiring reads the child that handed over: with `--observe-base-port`,
+/// the update API naming slot B as serving, and slot A still answering and reporting an
+/// untraced relay, the deploy ends red naming gate B and slot A, over real sockets. The
+/// serving child (B) is healthy, so only the old child's report can make it red. Catches a
+/// `Slots` resolver that lists no other child (only the unit-test fake had one).
+///
+/// Mutants planted: `Slots::resolve` listing no other child.
+#[test]
+fn the_old_child_that_reports_untraced_relays_is_read_over_real_sockets() {
+    let (base, old, serving) = both_slots(
+        "kbf_frontend_relay_untraced 1\nkbf_cache_lost_blobs 0\nkbf_cache_blob_losses_total 1\n",
+        "kbf_frontend_relay_untraced 0\nkbf_cache_lost_blobs 0\nkbf_cache_blob_losses_total 1\n\
+         kbf_under_replicated_blobs 0\n",
+    );
+    let api = update_api_serving(Some("b"));
+    let r = run(
+        "old-child",
+        &api,
+        &["--observe-base-port".to_owned(), base.to_string()],
+    );
+    assert_eq!(r.code, 3, "{}", r.summary);
+    assert_eq!(r.summary["reason"], "gate_red", "{}", r.summary);
+    let detail = r.summary["detail"].as_str().unwrap();
+    for part in ["b_relay_untraced", "slot a"] {
+        assert!(detail.contains(part), "`{part}` missing from {detail}");
+    }
+    assert!(old.saw_metrics() && serving.saw_metrics());
+}
