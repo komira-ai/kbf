@@ -55,11 +55,11 @@ pub fn run(args: &UpdateArgs, out: &mut dyn Write, err: &mut dyn Write) -> Exit 
     let (clock, check) = (SystemClock, NoCheck);
     let env = Env {
         api: &api,
+        observe: &NoObserve,
         clock: &clock,
         smoke: &NoSmoke,
         check: &check as &dyn Check,
         probe: &NoProbe,
-        observe: &NoObserve,
     };
     finish(&env, &options, out)
 }

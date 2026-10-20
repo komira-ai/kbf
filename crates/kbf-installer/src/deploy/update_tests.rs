@@ -11,7 +11,7 @@ use clap::Parser;
 use serde_json::{Value, json};
 
 use super::api::{Operator, Reply, Request};
-use super::observe::NoObserve;
+use super::observe::{NoObserve, Observe};
 use super::update::{finish, installer_exit, request_id, run};
 use super::{Check, Clock, Env, NoCheck, NoProbe, NoSmoke, Options};
 use crate::cli::{Cli, Verb};
@@ -128,11 +128,11 @@ fn go(api: &Api, nodes: bool) -> (Exit, Value) {
     let check = NoCheck;
     let env = Env {
         api,
+        observe: &NoObserve,
         clock: &clock,
         smoke: &NoSmoke,
         check: &check as &dyn Check,
         probe: &NoProbe,
-        observe: &NoObserve,
     };
     let mut out = Vec::new();
     let exit = finish(&env, &options(nodes), &mut out);
@@ -378,4 +378,12 @@ fn a_proxy_that_does_not_answer_ends_the_run_with_one_summary_line_and_exit_one(
     assert_eq!(line["reason"], "api_error");
     assert_eq!(line["commit"], B);
     assert!(String::from_utf8(err).expect("text").contains(B));
+}
+
+/// `update` runs no gate, so it is given no frontend to read: asking for one is an error, not a
+/// read of whichever frontend happens to answer.
+#[test]
+fn the_update_verb_has_no_frontend_to_observe() {
+    let why = NoObserve.resolve(None).err().expect("no frontend");
+    assert_eq!(why, "this verb observes no frontend");
 }
