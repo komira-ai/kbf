@@ -73,6 +73,9 @@ fn look(m: &Migration, rules: &Rules) -> Result<Look, MigrateError> {
             .push("already migrated: nothing to do".to_owned());
         return Ok(Look::Settled(report));
     }
+    if let Some(journal) = &journal {
+        super::rollback::refuse_if_installer_moved_aside(&m.layout, journal)?;
+    }
     let resume = journal.as_ref().is_some_and(Journal::kit_begun);
     let Some(old) = old::read(&m.layout, &m.roots, rules, resume)? else {
         if journal.is_some() {
@@ -279,6 +282,7 @@ pub fn migrate<E: Exec>(
     tree.sweep_partials()?;
     let mut journal = journal.unwrap_or_else(|| Journal::new(Vec::new(), None));
     journal.phase = Phase::Started;
+    journal.aside = None;
     journal.kit = kit;
     journal.units = m.units.clone();
     journal.helper_unit = m.helper_unit.clone();
