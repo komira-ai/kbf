@@ -173,6 +173,23 @@ fn run_defaults_its_directories_to_the_layouts_on_every_platform() {
     assert_eq!(args.orders_dir_in(&layout).as_str(), "/srv/o");
 }
 
+/// Catches the parser putting the Linux directories back as `proxy` defaults: without the flags
+/// they are unset (so the layout's apply), with them they are what was typed.
+#[test]
+fn proxy_leaves_its_directories_to_the_layout_unless_flagged() {
+    let Verb::Proxy(args) = parse(&["proxy"]).verb else {
+        panic!("proxy");
+    };
+    assert_eq!((args.update_dir, args.orders_dir), (None, None));
+    let Verb::Proxy(args) =
+        parse(&["proxy", "--update-dir", "/srv/u", "--orders-dir", "/srv/o"]).verb
+    else {
+        panic!("proxy");
+    };
+    assert_eq!(args.update_dir, Some("/srv/u".into()));
+    assert_eq!(args.orders_dir, Some("/srv/o".into()));
+}
+
 /// Catches the proxy verb asking for root (it runs as the service user), a refused table
 /// leaving as anything but a usage error with its path, and `--json` losing the reason.
 #[test]
@@ -213,8 +230,8 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
         !Verb::Proxy(ProxyArgs {
             config: Some(file),
             check: true,
-            update_dir: "/var/lib/kbf-installer".into(),
-            orders_dir: "/var/lib/kbf-installer/orders".into(),
+            update_dir: Some("/var/lib/kbf-installer".into()),
+            orders_dir: Some("/var/lib/kbf-installer/orders".into()),
         })
         .needs_root()
     );
