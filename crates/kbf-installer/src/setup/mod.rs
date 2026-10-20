@@ -353,18 +353,11 @@ pub fn run(
     if !shadows.is_empty() {
         let mark = if options.apply { "+" } else { "DRY-RUN:" };
         for shadow in &shadows {
-            writeln!(
-                out,
-                "{mark} retire {} (shadows the packaged unit; original kept)",
-                shadow.path
-            )?;
+            let path = &shadow.path;
+            writeln!(out, "{mark} retire {path} (shadows the packaged unit; original kept)")?;
         }
-        steps += emit(
-            &plan::retire(&*exec, &ctx, &shadows)?,
-            exec,
-            options.apply,
-            out,
-        )?;
+        let retire = plan::retire(&*exec, &ctx, &shadows)?;
+        steps += emit(&retire, exec, options.apply, out)?;
         notes.push(
             "retired unit files are kept in the migration's backup; `kbf-installer migrate --rollback` puts them back"
                 .to_owned(),
