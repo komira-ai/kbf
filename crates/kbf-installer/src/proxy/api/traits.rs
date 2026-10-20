@@ -195,6 +195,12 @@ pub enum SupervisorError {
 /// The U7 swap. Every call is made by the one actor, so an implementation sees them one
 /// at a time. `start` is idempotent on `update_id`.
 pub trait Supervisor: Send {
+    /// Why `start` cannot be called at all, when that is known before an update is
+    /// accepted. `POST` then answers 503 with this text, and saves no `request_id` and
+    /// writes no order, so the installer does not fetch a release that nothing can take
+    /// over. `None` is a supervisor that can start.
+    fn start_blocked(&self) -> Option<String>;
+
     fn start(&mut self, spec: &UpdateSpec) -> Result<(), SupervisorError>;
     fn abort(&mut self) -> Result<Phase, SupervisorError>;
     fn rollback(&mut self) -> Result<Phase, SupervisorError>;

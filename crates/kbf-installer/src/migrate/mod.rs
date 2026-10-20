@@ -44,6 +44,13 @@
 //!    units started. The state comes before the links because a link with no state beside
 //!    it reads as a host whose state is lost. Re-run: links and units are compared and only
 //!    what differs is done; a unit stopped by an earlier run is started by this one.
+//!    Last of step 5, **the installer's unit** is enabled (`--installer-unit`), after the old helper is
+//!    disabled, the new layout is in place and the stopped units are started: `systemctl
+//!    enable --now` when `is-enabled` does not say `enabled` (`launchctl bootstrap` when the
+//!    job is not loaded), the question and the command `setup` uses, so a migrated host takes
+//!    orders without a `setup` run. It is before the journal says done: a unit that will not
+//!    come up ends the run ([`MigrateError::InstallerUnit`]) and a run again finishes it.
+//!    Nothing else is started: not the frontend, not the proxy. Re-run after `done`: a no-op.
 //! 6. **Journal** `migration.json` says `done`. From then on `migrate` is a no-op and
 //!    [`guard`] lets `setup` through.
 //!
@@ -235,6 +242,8 @@ pub fn standing(layout: &Layout, owner_uid: u32) -> Result<Vec<Unit>, MigrateErr
 mod coverage_tests;
 #[cfg(test)]
 mod floor_tests;
+#[cfg(test)]
+mod installer_unit_tests;
 #[cfg(test)]
 mod kit_adopt_tests;
 #[cfg(test)]

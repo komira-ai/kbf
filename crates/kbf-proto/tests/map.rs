@@ -405,3 +405,28 @@ fn the_heartbeat_flush_report_is_fields_eleven_to_fourteen() {
         (0, 0, 0)
     );
 }
+
+// Catches: the tail fence fields moved to other numbers, or not varints (a node and a
+// frontend of two builds would read each other's epoch as something else), and an older
+// peer that fails on them. The bytes are pinned: the ack is field 15 of the heartbeat
+// (tag 0x78), the fence field 5 of its answer (tag 0x28); a peer that sends neither writes
+// no bytes, and one that predates them decodes both as 0.
+#[test]
+fn the_tail_epoch_fields_are_pinned() {
+    let beat = pb::HeartbeatRequest {
+        tail_epoch_done: 5,
+        ..Default::default()
+    };
+    assert_eq!(beat.encode_to_vec(), [0x78, 5], "field 15");
+    let answer = pb::HeartbeatResponse {
+        tail_epoch: 6,
+        ..Default::default()
+    };
+    assert_eq!(answer.encode_to_vec(), [0x28, 6], "field 5");
+    assert_eq!(pb::HeartbeatRequest::default().encode_to_vec(), []);
+    assert_eq!(pb::HeartbeatResponse::default().encode_to_vec(), []);
+    let old = pb::HeartbeatRequest::decode(&[0x08, 1, 0x10, 2][..]).expect("decodes");
+    assert_eq!(old.tail_epoch_done, 0);
+    let older = pb::HeartbeatResponse::decode(&[0x18, 9][..]).expect("decodes");
+    assert_eq!(older.tail_epoch, 0);
+}
