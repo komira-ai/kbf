@@ -136,7 +136,8 @@ fn compare(tag: &str, status: &str) -> (String, Value) {
     )
 }
 
-/// The ref of the annotated tag `tag`, and the tag object it names, which names `commit`.
+/// The ref of the annotated tag `tag`, and the tag object it names, which names `commit`;
+/// and GitHub's compare of `commit` against N, which says `ahead`.
 fn annotated(tag: &str, commit: &str) -> Vec<(String, Value)> {
     let object = hex::encode(sha2::Sha256::digest(tag))[..40].to_owned();
     let reference = json!({ "object": { "type": "tag", "sha": object } });
@@ -144,6 +145,7 @@ fn annotated(tag: &str, commit: &str) -> Vec<(String, Value)> {
     vec![
         (format!("repos/{REPO}/git/ref/tags/{tag}"), reference),
         (format!("repos/{REPO}/git/tags/{object}"), annotation),
+        compare(commit, "ahead"),
     ]
 }
 
@@ -338,7 +340,9 @@ impl Fx {
 fn the_previous_release_is_verified_and_its_binaries_are_unpacked_into_out() {
     // Catches: the wrong platform's tarball taken (the darwin `kbf` says another thing), the
     // object id of the ref printed in place of the tag's commit, a file written without
-    // the executable bit, a file written that was not asked for, a scratch left behind.
+    // the executable bit or writable by others, a file written that was not asked for, a
+    // scratch left behind, a download without `--repo` (the checkout's repository would be
+    // used).
     let f = world("accept");
     let (code, out, err) = f.run(&[], None);
     assert_eq!(code, Some(0), "{err}");
@@ -351,10 +355,16 @@ fn the_previous_release_is_verified_and_its_binaries_are_unpacked_into_out() {
         let want = asset_bytes(binary, "linux-x86_64", PREV);
         let got = std::fs::read(&path).expect("binary");
         assert_eq!(got, want, "{binary}");
+        // Owner-executable, and not writable by group or others whatever the umask.
         let mode = mode_of(&path);
         assert_ne!(mode & 0o100, 0, "{binary}: mode {mode:o}");
+        assert_eq!(mode & 0o022, 0, "{binary}: mode {mode:o}");
     }
     assert!(f.tmp_is_empty(), "the scratch directory was left");
+    // The release is asked of the repository named, not of the checkout's.
+    let asked = f.gh_args();
+    let download = format!("release download {TAG} --repo {REPO} --dir ");
+    assert!(asked.contains(&download), "{asked}");
 }
 
 #[test]
@@ -581,6 +591,24 @@ fn a_tag_that_is_not_annotated_or_not_a_commit_or_not_there_is_refused() {
 }
 
 #[test]
+fn a_tag_whose_commit_is_not_an_ancestor_of_the_commit_is_refused() {
+    // Catches: the commit a tag names taken on the word of the tag's name alone: the scan
+    // compared `v0.1.2...N` and said `ahead`, but the commit the tag object names is N
+    // itself, a newer one, one on another line of history, or one GitHub cannot compare.
+    let mut gone = found(TAG, PREV);
+    let compared = compare(PREV, "ahead").0;
+    gone.retain(|(path, _)| *path != compared);
+    let why = format!("compare/{PREV}...{SHA}: not found");
+    refuses_tag("commit-compare-404", gone, &why);
+    for status in ["identical", "behind", "diverged", "weird"] {
+        let mut more = found(TAG, PREV);
+        more.push(compare(PREV, status));
+        let why = format!("no ancestor of {SHA}: compare says \"{status}\"");
+        refuses_tag(&format!("commit-{status}"), more, &why);
+    }
+}
+
+#[test]
 fn a_download_that_fails_is_an_error() {
     // Catches: a failed `gh release download` ignored, so that whatever is in the scratch
     // directory is verified or unpacked.
@@ -606,7 +634,7 @@ fn damage_sum(f: &Fx) {
 }
 
 fn damage_unlisted(f: &Fx) {
-    std::fs::write(f.asset("extra.sh"), b"#!/bin/sh\n").expect("write");
+    std::fs::write(f.asset("extra.txt"), b"stray\n").expect("write");
 }
 
 fn damage_no_bundle(f: &Fx) {
@@ -645,7 +673,7 @@ fn a_tarball_that_does_not_match_its_line_is_refused() {
 fn a_file_the_sums_do_not_list_is_refused() {
     // Catches: everything downloaded trusted, not only what SHA256SUMS lists: nothing else
     // checks that a stray file is absent.
-    let why = "not listed in SHA256SUMS: extra.sh";
+    let why = "not listed in SHA256SUMS: extra.txt";
     refuses_damaged("unlisted", damage_unlisted, why);
 }
 
@@ -722,6 +750,35 @@ fn an_out_that_cannot_be_made_or_written_is_an_error_and_nothing_is_replaced() {
 }
 
 #[test]
+fn a_later_refusal_removes_the_files_this_run_wrote_and_keeps_the_one_that_was_there() {
+    // Catches: a half-populated out/: `kbf` is written (it sorts first) and then the
+    // `kbf-server` already there is refused, which would leave a `kbf` of this run beside
+    // a `kbf-server` of another.
+    let f = world("out-has-server");
+    std::fs::create_dir_all(f.out()).expect("out");
+    std::fs::write(f.out().join("kbf-server"), "mine").expect("kbf-server");
+    let (code, _, err) = f.run(&[], None);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("write "), "{err}");
+    assert_eq!(names_in(&f.out()), ["kbf-server"]);
+    let kept = std::fs::read_to_string(f.out().join("kbf-server")).expect("kbf-server");
+    assert_eq!(kept, "mine");
+}
+
+#[test]
+fn a_binary_named_twice_is_unpacked_once_and_out_may_be_nested() {
+    // Catches: a repeated --binary written twice, the second time refused as a file
+    // already there; and --out made with `create_dir`, which needs its parent.
+    let f = world("twice-nested");
+    let nested = f.out().join("a/b");
+    let mut args = args_for(SHA, s(&nested));
+    args.extend(["--binary", "kbf"]);
+    let (code, _, err) = f.xtask(&f.root.join("tmp"), &args, None);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(names_in(&nested), ["kbf", "kbf-server"]);
+}
+
+#[test]
 fn a_scratch_directory_that_cannot_be_made_is_an_error() {
     // Catches: a failure to make the download directory ignored, so the download or the
     // verification meets a directory that is not there.
@@ -760,6 +817,8 @@ fn an_output_file_that_cannot_be_written_fails_the_run() {
     let (code, _, err) = f.run(&["--output", s(&missing)], None);
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("append to"), "{err}");
+    // The output file is written last: the binaries are already in out/ (documented).
+    assert_eq!(names_in(&f.out()), ["kbf", "kbf-server"]);
 }
 
 #[test]

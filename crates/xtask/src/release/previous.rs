@@ -17,23 +17,32 @@
 //! With one, and only for that tag:
 //!
 //! 1. the tag is resolved: its ref names a tag object (a lightweight tag is refused: a
-//!    release tag carries its verdict in its message) and that names a commit;
+//!    release tag carries its verdict in its message) and that names a commit. The scan
+//!    compared names; this commit is compared again and must itself be a strict ancestor of
+//!    N, so a branch of the tag's name, or a tag made since the scan, cannot stand in;
 //! 2. the release of that tag must exist. A tag with no release is an error, not a step back
 //!    to a lower tag: N-1 is the release before N, not the newest that happens to be whole;
 //! 3. its assets are downloaded into a directory of this process alone;
 //! 4. they are verified as `release offer` verifies a release for that commit: `release
 //!    check` (`SHA256SUMS`, names, one bundle per tarball) and `verify-assets attestations`
-//!    (provenance, SBOM and bundle of each asset; offline when `--trusted-root` is given);
+//!    (provenance, SBOM and bundle of each asset). The bundles are checked offline when
+//!    `--trusted-root` is given; the provenance and SBOM attestations are always asked of
+//!    GitHub, so the token needs `contents: read` and `attestations: read` either way;
 //! 5. only then are the `--binary` names of `--platform` taken out of their tarballs
 //!    (`<binary>-<commit>-<platform>.tar.gz`, exactly the one entry `package` writes) into
 //!    `--out`, mode 0755. Every tarball is read before the first file is written, and a
-//!    file already in `--out` is refused, not replaced.
+//!    file already in `--out` is refused, not replaced; the files this run wrote before the
+//!    refusal are removed again.
 //!
 //! A refusal in steps 1 to 4, or a binary the release lacks, leaves `--out` as it was (it
 //! is made once every requested tarball has been read) and `--output` untouched. On
 //! success it prints `previous-tag`, `previous-sha` (the commit the tag names) and
 //! `previous-source=release` as `key=value` lines, and appends them to `--output` (on
-//! Actions, `GITHUB_OUTPUT`).
+//! Actions, `GITHUB_OUTPUT`). `--output` is written last: if it cannot be written the run
+//! fails with the binaries already in `--out`.
+//!
+//! This is the previous release tag, not the commit the farm runs: it is no input to
+//! `release offer --previous` or to `reversible` (a rollback goes to what the farm runs).
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -85,6 +94,13 @@ fn must_api(gh: &Path, path: &str) -> Result<Value, Error> {
     found.ok_or_else(|| Error::Failed(format!("gh api {path}: not found (HTTP 404)")))
 }
 
+/// What GitHub's compare of `base` (a tag or a commit) against `sha` says: `ahead` when
+/// `base` is a strict ancestor of `sha`.
+fn compare_status(gh: &Path, repo: &str, base: &str, sha: &str) -> Result<String, Error> {
+    let compared = must_api(gh, &format!("repos/{repo}/compare/{base}...{sha}"))?;
+    Ok(compared["status"].as_str().unwrap_or("nothing").to_owned())
+}
+
 /// The highest release tag of `repo` that names a strict ancestor of `sha`, if any.
 fn previous_tag(gh: &Path, repo: &str, sha: &str) -> Result<Option<String>, Error> {
     let mut versions = tag_versions(gh, repo)?;
@@ -92,12 +108,11 @@ fn previous_tag(gh: &Path, repo: &str, sha: &str) -> Result<Option<String>, Erro
     versions.sort_unstable();
     for version in versions.into_iter().rev() {
         let tag = version.tag();
-        let compared = must_api(gh, &format!("repos/{repo}/compare/{tag}...{sha}"))?;
-        let status = compared["status"].as_str().unwrap_or("nothing");
+        let status = compare_status(gh, repo, &tag, sha)?;
         if status == "ahead" {
             return Ok(Some(tag));
         }
-        if !matches!(status, "identical" | "behind" | "diverged") {
+        if !matches!(status.as_str(), "identical" | "behind" | "diverged") {
             return Err(Error::Failed(format!(
                 "compare {tag}...{sha} says {status:?}: expected ahead, identical, behind or \
                  diverged"
@@ -170,8 +185,17 @@ fn unpack(a: &PreviousArgs, tag: &str, commit: &str, scratch: &Path) -> Result<(
         binaries.push((binary, bytes));
     }
     make_dir(&a.out)?;
+    let mut written: Vec<PathBuf> = Vec::new();
     for (binary, bytes) in binaries {
-        write_executable(&a.out.join(binary), &bytes)?;
+        let path = a.out.join(binary);
+        if let Err(refused) = write_executable(&path, &bytes) {
+            // A file already there is not replaced, and what this run wrote stays no longer.
+            for done in &written {
+                let _ = std::fs::remove_file(done);
+            }
+            return Err(refused);
+        }
+        written.push(path);
     }
     Ok(())
 }
@@ -184,6 +208,13 @@ fn scratch_path() -> PathBuf {
 /// The lines to print for the release `tag`, after its binaries are unpacked.
 fn previous_release(a: &PreviousArgs, tag: &str) -> Result<Vec<String>, Error> {
     let commit = tag_commit(&a.gh, &a.repo, tag)?;
+    let status = compare_status(&a.gh, &a.repo, &commit, &a.sha)?;
+    if status != "ahead" {
+        return Err(Error::Failed(format!(
+            "{tag} names {commit}, which is no ancestor of {}: compare says {status:?}",
+            a.sha
+        )));
+    }
     let scratch = scratch_path();
     let unpacked = unpack(a, tag, &commit, &scratch);
     // Nothing in it is needed after the run, whatever its result.
