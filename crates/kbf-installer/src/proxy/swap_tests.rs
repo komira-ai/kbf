@@ -112,6 +112,10 @@ fn an_old_child_that_never_drains_is_never_signalled_in_24_hours() {
             Box::new(|w: &World| w.sessions(Slot::A, 1, None)),
         ),
         (
+            "the gate never opened the slot, so it cannot be retired",
+            Box::new(|w: &World| w.st.borrow_mut().never_opened.push(Slot::A)),
+        ),
+        (
             "the child cannot be asked",
             Box::new(|w: &World| w.st.borrow_mut().open_counts_err = true),
         ),
@@ -626,4 +630,38 @@ fn an_old_child_that_cannot_resume_leaves_the_new_child_serving_and_fails_the_ro
     before(&w, "admin:resume B", "release_into B");
     assert_eq!(w.holders(), vec![Slot::B]);
     assert_eq!(w.count("terminate"), 0, "neither child is retired");
+}
+
+/// Catches a frontend swap that starts the new child serving: it must wait (`--await-takeover`)
+/// so that the takeover, after the old child quiesced, is the only moment it holds the
+/// generation.
+#[test]
+fn the_new_child_of_a_frontend_swap_is_started_to_wait_for_the_takeover() {
+    let (w, old) = World::with_old();
+    assert_eq!(
+        go(&w, plan(Mode::Frontend), old),
+        Ok(Phase::Done),
+        "{:#?}",
+        w.log()
+    );
+    assert_eq!(w.count("admin:takeover B"), 1, "{:#?}", w.log());
+    assert_eq!(w.st.borrow().starts, vec![(Slot::B, Start::Candidate)]);
+    assert_eq!(w.holders(), vec![Slot::B]);
+}
+
+/// Catches a takeover sent without the plan's limit (the child's own deadline): a swap that
+/// passes zero or a constant leaves the child with a bound the plan did not choose, so both
+/// the switch and the cold start after a restart must pass `timing.takeover`.
+#[test]
+fn the_takeover_carries_the_plans_limit() {
+    let (w, old) = World::with_old();
+    let mut p = plan(Mode::Frontend);
+    p.timing.takeover = Duration::from_millis(7_321);
+    assert_eq!(go(&w, p, old), Ok(Phase::Done), "{:#?}", w.log());
+    assert_eq!(
+        w.count("admin:takeover B limit 7321 ms"),
+        1,
+        "{:#?}",
+        w.log()
+    );
 }
