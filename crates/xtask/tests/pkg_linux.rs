@@ -226,3 +226,230 @@ fn pkg_config_takes_the_version_from_the_binary_or_from_the_flag_and_not_both() 
     let neither = run(&[], "neither");
     assert_eq!(neither.status.code(), Some(2), "{}", text(&neither.stderr));
 }
+
+#[test]
+fn the_fake_installer_answers_only_a_lone_version_flag_with_the_stamp() {
+    // Catches: the stamped `--version` answer given to any single argument (a stub that
+    // prints a version for `boot-check` hides the real installer's behaviour from the
+    // tests that run it).
+    let dir = scratch("fake-installer");
+    let installer = dir.join("kbf-installer");
+    std::fs::hard_link(env!("CARGO_BIN_EXE_xtask-fake"), &installer).expect("link the fake");
+    let run = |arg: &str| {
+        Command::new(&installer)
+            .arg(arg)
+            .env("XTASK_FAKE_INSTALLER_VERSION", "0123456789ab")
+            .output()
+            .expect("run the fake")
+    };
+    assert_eq!(
+        text(&run("--version").stdout),
+        "kbf-installer 0.1.0+0123456789ab\n"
+    );
+    let other = run("boot-check");
+    assert!(other.status.success());
+    assert_eq!(
+        text(&other.stdout),
+        "kbf-installer-stub boot-check\n",
+        "{}",
+        text(&other.stderr)
+    );
+}
+
+#[test]
+fn pkg_install_test_names_a_directory_without_the_package_of_its_format() {
+    // Catches: `--format rpm` looking for a `.deb` (or the reverse), and a directory with
+    // no package of the format going on to docker.
+    let dir = scratch("install-no-package");
+    let pkgs = dir.join("pkgs");
+    std::fs::create_dir_all(&pkgs).expect("pkgs");
+    std::fs::write(pkgs.join("kbf-installer_1_amd64.deb"), b"deb").expect("deb");
+    let args = |format: &'static str| {
+        let (pkgs, dir) = (s(&pkgs).to_owned(), s(&dir).to_owned());
+        move || {
+            xtask(&[
+                "pkg-install-test",
+                "--package",
+                &pkgs,
+                "--format",
+                format,
+                "--listing",
+                &format!("{dir}/listing.txt"),
+                "--image-dir",
+                &dir,
+                "--docker",
+                FALSE,
+            ])
+        }
+    };
+    let rpm = args("rpm")();
+    assert_eq!(rpm.status.code(), Some(1), "{}", text(&rpm.stderr));
+    let said = text(&rpm.stderr);
+    assert!(said.contains("expected one .rpm file in"), "{said}");
+    // The deb is found, so the run goes on to docker, which is `false`.
+    let deb = args("deb")();
+    assert!(
+        text(&deb.stderr).contains("docker") || text(&deb.stderr).contains("listing"),
+        "{}",
+        text(&deb.stderr)
+    );
+    assert!(!text(&deb.stderr).contains("expected one"));
+}
+
+fn tgz(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
+    let gzip = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::fast());
+    let mut tar = tar::Builder::new(gzip);
+    for (path, mode, bytes) in files {
+        let mut h = tar::Header::new_ustar();
+        h.set_path(format!("./{path}")).expect("path");
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(bytes.len() as u64);
+        h.set_mode(*mode);
+        h.set_cksum();
+        tar.append(&h, *bytes).expect("append");
+    }
+    tar.into_inner().expect("tar").finish().expect("gzip")
+}
+
+/// A deb as nfpm writes one, holding `binary`, a `gh`, and the trust files for `source_ref`.
+fn deb_of(binary: &[u8], source_ref: &str) -> Vec<u8> {
+    let control = tgz(&[(
+        "control",
+        0o644,
+        b"Package: kbf-installer\nArchitecture: amd64\n",
+    )]);
+    let conf = format!("SOURCE_REFS={source_ref}\n");
+    let data = tgz(&[
+        ("usr/bin/kbf-installer", 0o755, binary),
+        ("usr/share/kbf-installer/trust/gh", 0o755, b"the pinned gh"),
+        (
+            "usr/share/kbf-installer/trust/installer.conf",
+            0o644,
+            conf.as_bytes(),
+        ),
+        (
+            "usr/share/kbf-installer/trust/trusted_root.jsonl",
+            0o644,
+            b"{\"mediaType\":\"trustedroot\"}\n",
+        ),
+    ]);
+    let mut out = b"!<arch>\n".to_vec();
+    for (name, body) in [
+        ("debian-binary", &b"2.0\n"[..]),
+        ("control.tar.gz", &control),
+        ("data.tar.gz", &data),
+    ] {
+        out.extend(
+            format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                format!("{name}/"),
+                0,
+                0,
+                0,
+                "100644",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        out.extend(body);
+        if body.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+const MAIN: &str = "refs/heads/main";
+
+#[test]
+fn pkg_trust_writes_the_trust_directory_and_refuses_a_ref_no_host_would_load() {
+    // Catches: the verb not wired to its writer (no file, or `installer.conf` of another
+    // ref), a mode other than 0755 for `gh`, and a branch outside `refs/heads/` accepted.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("trust");
+    let (gh, root) = (dir.join("gh"), dir.join("root.jsonl"));
+    std::fs::write(&gh, b"the pinned gh").expect("gh");
+    std::fs::write(&root, b"{\"mediaType\":\"trustedroot\"}\n").expect("root");
+    let out = dir.join("trust");
+    let run = |source_ref: &str| {
+        xtask(&[
+            "pkg-trust",
+            "--gh",
+            s(&gh),
+            "--trusted-root",
+            s(&root),
+            "--source-ref",
+            source_ref,
+            "--out",
+            s(&out),
+        ])
+    };
+    let bad = run("main");
+    assert_eq!(bad.status.code(), Some(1), "{}", text(&bad.stderr));
+    assert!(!out.exists());
+    let good = run("refs/heads/feature/arch-v2");
+    assert_eq!(good.status.code(), Some(0), "{}", text(&good.stderr));
+    assert_eq!(
+        std::fs::read_to_string(out.join("installer.conf")).expect("conf"),
+        "SOURCE_REFS=refs/heads/feature/arch-v2\n"
+    );
+    assert_eq!(std::fs::read(out.join("gh")).expect("gh"), b"the pinned gh");
+    let mode = std::fs::metadata(out.join("gh")).expect("meta").permissions().mode();
+    assert_eq!(mode & 0o777, 0o755);
+}
+
+#[test]
+fn pkg_asset_adds_the_package_as_the_asset_or_only_verifies_it() {
+    // Catches: `--out` and `--verify-only` swapped (the verify job writing into a
+    // directory, the build job writing nothing), the package found by directory not
+    // reaching the check, a refused package leaving an asset behind, and a deb that is
+    // not the attested binary's accepted.
+    let dir = scratch("asset");
+    let binary: &[u8] = b"\x7fELF the kbf-installer";
+    let tarball = dir.join(format!("kbf-installer-{COMMIT}-linux-x86_64.tar.gz"));
+    std::fs::write(&tarball, tgz(&[("kbf-installer", 0o755, binary)])).expect("tarball");
+    let pkgs = dir.join("pkgs");
+    std::fs::create_dir_all(&pkgs).expect("pkgs");
+    std::fs::write(pkgs.join("kbf-installer_0.1.0_amd64.deb"), deb_of(binary, MAIN)).expect("deb");
+    let out = dir.join("dist");
+    let run = |package: &Path, mode: &[&str]| {
+        let mut args = vec![
+            "pkg-asset",
+            "--package",
+            s(package),
+            "--platform",
+            "linux-x86_64",
+            "--commit",
+            COMMIT,
+            "--binary-tarball",
+            s(&tarball),
+            "--expect-ref",
+            MAIN,
+        ];
+        args.extend(mode);
+        xtask(&args)
+    };
+    let name = format!("kbf-installer-{COMMIT}-linux-x86_64.deb");
+    let added = run(&pkgs, &["--out", s(&out)]);
+    assert_eq!(added.status.code(), Some(0), "{}", text(&added.stderr));
+    assert!(out.join(&name).is_file());
+    let sums = std::fs::read_to_string(out.join("SHA256SUMS.linux-x86_64")).expect("sums");
+    assert!(sums.trim_end().ends_with(&format!("  {name}")), "{sums}");
+    let before = std::fs::read_dir(&out).expect("dist").count();
+    let verified = run(&out.join(&name), &["--verify-only"]);
+    assert_eq!(verified.status.code(), Some(0), "{}", text(&verified.stderr));
+    assert!(text(&verified.stdout).contains(&name), "{}", text(&verified.stdout));
+    assert_eq!(std::fs::read_dir(&out).expect("dist").count(), before);
+    // A package of another binary: refused by either mode, and nothing is written.
+    let other = dir.join("other");
+    std::fs::create_dir_all(&other).expect("other");
+    std::fs::write(other.join("p.deb"), deb_of(b"another binary", MAIN)).expect("deb");
+    let fresh = dir.join("fresh");
+    let refused = run(&other, &["--out", s(&fresh)]);
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
+    assert!(text(&refused.stderr).contains("is not the binary of"), "{}", text(&refused.stderr));
+    assert!(!fresh.exists());
+    let refused = run(&other.join("p.deb"), &["--verify-only"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", text(&refused.stderr));
+}

@@ -409,12 +409,16 @@ impl Attestations<'_> {
     /// The controls on the packages' bundles, each a verification that must be refused: the
     /// first package against the bundle of the first tarball, and that tarball against
     /// the package's bundle (a bundle is its own asset's, whatever the extension), and
-    /// the package for another commit. Nothing to do when no package is listed.
-    fn package_controls(&self, dir: &Path, lines: &[Line], signer: &str) -> Result<(), Error> {
+    /// the package for another commit. `tarball` is the first tarball of the sums (the
+    /// caller has one: it flipped a byte of it). Nothing to do when no package is listed.
+    fn package_controls(
+        &self,
+        dir: &Path,
+        lines: &[Line],
+        tarball: &Line,
+        signer: &str,
+    ) -> Result<(), Error> {
         let Some(package) = lines.iter().find(|l| l.name.ends_with(".deb")) else {
-            return Ok(());
-        };
-        let Some(tarball) = lines.iter().find(|l| l.name.ends_with(".tar.gz")) else {
             return Ok(());
         };
         let (deb, tgz) = (dir.join(&package.name), dir.join(&tarball.name));
@@ -560,7 +564,7 @@ pub fn verify_attestations(dir: &Path, a: &Attestations) -> Result<Vec<String>, 
         .filter(|l| l.name.ends_with(".tar.gz"))
         .nth(1)
         .map(|l| l.name.as_str());
-    a.package_controls(dir, &lines, workflow)?;
+    a.package_controls(dir, &lines, first, workflow)?;
     a.bundle_controls(dir, &first.name, second, &flipped_path, workflow)?;
     printed.push(
         "attestations: every asset verifies; another signer workflow, another tarball's \

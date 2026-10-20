@@ -29,7 +29,11 @@ fn tgz(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
     for (path, mode, bytes) in files {
         let mut h = tar::Header::new_ustar();
         h.set_path(format!("./{path}")).expect("path");
-        h.set_entry_type(tar::EntryType::Regular);
+        h.set_entry_type(if path.ends_with('/') {
+            tar::EntryType::Directory
+        } else {
+            tar::EntryType::Regular
+        });
         h.set_size(bytes.len() as u64);
         h.set_mode(*mode);
         h.set_cksum();
@@ -72,6 +76,8 @@ struct Fix {
     root: String,
     arch: &'static str,
     drop: Option<&'static str>,
+    /// A directory entry ahead of the files, as nfpm writes `./usr/`.
+    dirs: bool,
 }
 
 impl Fix {
@@ -85,6 +91,7 @@ impl Fix {
             root: ROOT.to_owned(),
             arch: "amd64",
             drop: None,
+            dirs: false,
         }
     }
 
@@ -110,6 +117,9 @@ impl Fix {
             ),
         ];
         files.retain(|(p, _, _)| Some(*p) != self.drop);
+        if self.dirs {
+            files.insert(0, ("usr/", 0o755, &[]));
+        }
         ar(&[
             ("debian-binary", b"2.0\n"),
             ("control.tar.gz", &control_tgz),
@@ -532,4 +542,94 @@ fn the_version_is_what_the_installer_says_after_its_name_and_nothing_else() {
     ] {
         assert_eq!(version_of(ok, out), None, "{ok} {out:?}");
     }
+}
+
+/// An `ar` header of 60 bytes with `size` as its size field and `end` as its terminator.
+fn raw_ar(size: &str, end: &str) -> Vec<u8> {
+    let mut out = b"!<arch>\n".to_vec();
+    out.extend(format!("{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}{end}", "x/", 0, 0, 0, "100644", size).as_bytes());
+    out
+}
+
+/// The problems of `deb` as the package for `MAIN` on x86_64.
+fn problems_of(name: &str, deb: &[u8]) -> Vec<String> {
+    let (_, _, tarball, gh) = world(name, &Fix::new(), &Fix::new().binary, Platform::LinuxX86_64);
+    problems(
+        deb,
+        &check(Platform::LinuxX86_64, &tarball, MAIN, Some(&gh)),
+    )
+    .expect("problems")
+}
+
+#[test]
+fn a_damaged_archive_is_named_not_taken_for_a_package() {
+    // Catches: an `ar` header without its terminator or with no size read as a member
+    // (or a panic), a control or data tarball that is not gzip or not a tar, a deb with
+    // no data tarball, and a tar cut short inside a file, each accepted or reported as
+    // something else than what is wrong with the package.
+    let bad = raw_ar("10", "XX");
+    assert_eq!(
+        problems_of("ar-end", &bad),
+        ["an ar member header without its terminator"]
+    );
+    let bad = raw_ar("abc", "`\n");
+    assert_eq!(
+        problems_of("ar-size", &bad),
+        ["x/: an ar member with no size"]
+    );
+    let good = tgz(&[("control", 0o644, b"Architecture: amd64\n")]);
+    let junk_gz = ar(&[("control.tar.gz", b"not gzip"), ("data.tar.gz", &good)]);
+    assert!(
+        problems_of("junk-control", &junk_gz)[0].starts_with("control.tar.gz: not a gzip stream"),
+        "{:?}",
+        problems_of("junk-control", &junk_gz)
+    );
+    let no_data = ar(&[("control.tar.gz", &good)]);
+    assert_eq!(
+        problems_of("no-data", &no_data),
+        ["has no data.tar.gz (nfpm is configured for gzip)"]
+    );
+    let junk_data = ar(&[("control.tar.gz", &good), ("data.tar.gz", b"not gzip")]);
+    let got = problems_of("junk-data", &junk_data);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].starts_with("data.tar.gz: not a gzip stream"), "{got:?}");
+    // A gzip stream of bytes that are no tar header.
+    let not_tar = {
+        use std::io::Write;
+        let mut gz = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&[7u8; 1024]).expect("write");
+        gz.finish().expect("gzip")
+    };
+    let got = problems_of("not-tar", &ar(&[("control.tar.gz", &not_tar), ("data.tar.gz", &not_tar)]));
+    assert!(got[0].starts_with("control.tar.gz: not a tar"), "{got:?}");
+    assert!(got.iter().any(|p| p.starts_with("data.tar.gz: not a tar")), "{got:?}");
+    // A file whose bytes end before its header says.
+    let cut = {
+        use std::io::Write;
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_ustar();
+        h.set_path("./usr/bin/kbf-installer").expect("path");
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(1000);
+        h.set_mode(0o755);
+        h.set_cksum();
+        tar.append(&h, &[1u8; 1000][..]).expect("append");
+        let mut raw = tar.into_inner().expect("tar");
+        raw.truncate(512 + 10);
+        let mut gz = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&raw).expect("write");
+        gz.finish().expect("gzip")
+    };
+    let got = problems_of("cut", &ar(&[("control.tar.gz", &good), ("data.tar.gz", &cut)]));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].starts_with("data.tar.gz: usr/bin/kbf-installer: "), "{got:?}");
+}
+
+#[test]
+fn directory_entries_of_the_data_tarball_are_not_files_of_the_package() {
+    // Catches: nfpm's `./usr/` directory entries taken for files (a package that holds
+    // everything refused), or the files after them lost.
+    let mut fix = Fix::new();
+    fix.dirs = true;
+    assert_eq!(found("dirs", &fix, MAIN), Vec::<String>::new());
 }

@@ -1005,3 +1005,6 @@ pub fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod usage_tests;
