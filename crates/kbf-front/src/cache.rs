@@ -826,7 +826,7 @@ pub use rebuild::{ADOPT_RECORDS, RebuildConfig, RebuildReport};
 pub(crate) use stream::TierRange;
 pub use stream::{RecordStream, StreamedRecord};
 pub use tail::{TailReport, TailState};
-pub use tier::{TierStartError, TierStartup};
+pub use tier::{TierHealth, TierStartError, TierStartup};
 pub use touches::TouchConfig;
 use touches::Touches;
 pub(crate) use upload::BuiltSegment;
