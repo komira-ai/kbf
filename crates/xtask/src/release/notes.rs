@@ -166,17 +166,13 @@ fn render(
     found: &[String],
 ) -> String {
     let mut out = format!("# {tag}\n\n## Before you click\n");
-    // The verdict's own lines first, then what the builds say, once each.
-    let mut not_reversible = doc.not_reversible.clone();
-    for line in found {
-        if !not_reversible.contains(line) {
-            not_reversible.push(line.clone());
-        }
-    }
+    // Only what verify computed from the two builds (`found`). The verdict's own
+    // `not_reversible` list is deliberately NOT read: a list typed into a tag is not a
+    // source (CEO ruling), so verify is the single source of this section.
     section(
         &mut out,
         "### Not reversible",
-        &not_reversible,
+        found,
         "Nothing in this release is flagged as not reversible: the metadata log and the wire \
          protocol are the previous release's.",
     );

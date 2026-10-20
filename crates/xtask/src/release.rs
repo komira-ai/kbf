@@ -37,8 +37,8 @@
 //!   first release).
 //! - `release notes <dir> ... --version-json <file> [--previous-version-json <file>] --out
 //!   <file>` ([`notes`]): the same checks, then the release's notes: first "Before you
-//!   click" (what is not reversible, the verdict's lines and what `kbf_gate::reversible`
-//!   and the `protocol` of the two builds' `kbf --version --json` say, unknown counting as
+//!   click" (what is not reversible, as `kbf_gate::reversible` and the `protocol` of the two
+//!   builds' `kbf --version --json` say and never from the verdict's own list, unknown counting as
 //!   not reversible; the waivers; the verdict in a line), then the commits since the
 //!   previous release, the verdict, the gamma escapes and what is withdrawn. Without the
 //!   identity of the previous release, when there is one, it refuses (fail closed).
