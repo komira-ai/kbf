@@ -33,7 +33,10 @@
 
 use clap::ValueEnum;
 use kbf_proxy::auth::Buck2Auth;
-use kbf_proxy::config::{MAX_BASE_PORT, ProxyConfig, SLOT_STRIDE};
+use kbf_proxy::config::{MAX_BASE_PORT, SLOT_STRIDE};
+// The one name of the proxy's table the rest of `setup` may use (the layering test lets only
+// this file name `kbf_proxy`).
+pub(super) use kbf_proxy::config::ProxyConfig;
 
 use super::SetupError;
 use super::kbf_settings::{KbfFlags, Setting, check_path};

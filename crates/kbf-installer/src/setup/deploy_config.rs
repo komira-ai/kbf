@@ -24,12 +24,12 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use kbf_host::{Entry, Exec, HostPath, Kind, Perms, Planner};
-use kbf_proxy::config::ProxyConfig;
 
 use super::kbf_settings::check_path;
 use super::os::View;
 use super::paths;
 use super::plan::{Ctx, Outcome};
+use super::proxy::ProxyConfig;
 use super::{SetupError, validate::mode_name};
 use crate::cli::Mode;
 use crate::deploy::host_config::{CONFIG, HostConfig};
