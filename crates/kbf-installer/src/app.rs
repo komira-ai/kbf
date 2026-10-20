@@ -124,9 +124,9 @@ struct Target {
 
 /// The target of `run`: the service its flags name, else (Linux) the unit of the mode in the
 /// host's `kbf.toml`, which is how the one packaged `kbf-installer.service` serves every mode.
-/// A unit found that way on a frontend or all-in-one host reads `/etc/kbf/installer.toml`
-/// when `--installer-config` is not given (`setup` wrote it there); a Mac names its launchd
-/// label in the property list.
+/// A unit found that way on a frontend or all-in-one host reads the host's `installer.toml`
+/// (`/etc/kbf`, `/usr/local/etc/kbf` on a Mac) when `--installer-config` is not given (`setup`
+/// wrote it there); a Mac names its launchd label in the property list.
 fn target_of(root: &Path, args: &RunArgs) -> Result<Target, Failure> {
     if let Some(service) = args.named_service() {
         return Ok(Target {
@@ -136,10 +136,8 @@ fn target_of(root: &Path, args: &RunArgs) -> Result<Target, Failure> {
     }
     let (layout, _) = host(root.to_path_buf()).map_err(usage)?;
     let service = derived_service(&layout, layout.platform())?;
-    // INSTALLER_TOML is a constant absolute host path, so it always parses.
-    let default = (args.installer_config.is_none() && service.runs_database_mode()).then(|| {
-        HostPath::new(setup::paths::INSTALLER_TOML).expect("INSTALLER_TOML is an absolute path")
-    });
+    let default = (args.installer_config.is_none() && service.runs_database_mode())
+        .then(|| layout.installer_toml());
     let installer_config = args.installer_config.clone().or(default);
     Ok(Target {
         service,

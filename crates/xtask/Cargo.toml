@@ -47,6 +47,8 @@ ureq.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+# The Mac layout's paths, for `tests/pkg_macos.rs`: the gate is where `setup` writes.
+kbf-installer.workspace = true
 # A scratch directory a test owns and removes (the unit tests).
 kbf-testkit.workspace = true
 rcgen.workspace = true

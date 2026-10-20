@@ -12,11 +12,12 @@ use kbf_state::{
     Changes, Commit, CommitStats, Conflict, Revision, ScanPage, ScanRange, Store, StoreError,
     StoreTime, Txn, Versioned,
 };
-use kbf_types::object_store_api::{BindingRole, MemberStanding, NodeStatus};
+use kbf_types::object_store_api::{BindingRole, Convergence, MemberStanding, NodeStatus};
 
 use super::super::tests::{Counting, SENTINEL, as_store, bind, fake, name, put, scratch};
 use super::*;
 use crate::members::{Members, MembershipConfig, Progress, Registrant};
+use crate::stores::{DEFAULT_MIN_PUT_RATE, DEFAULT_REGION};
 
 const SECOND: &str = "SECOND-s3-secret-0a1b2c3d4e5f";
 
@@ -110,6 +111,58 @@ fn a_snapshot_is_the_binding_the_connection_and_the_secret_at_one_generation() {
         (config.secret_version, config.secret_access_key.as_str()),
         (3, SECOND)
     );
+}
+
+// Catches a source that hands a node the registration's empty fields as they are: a
+// connection registered with no region and no `min_put_rate` is delivered with the region
+// and rate the frontend's probe verified the store with (`registry.rs` builds the URI with
+// the same defaults). A node falls back to its own `--cold-store` flag for an empty field,
+// and that flag is frozen at enroll time, so it could run with settings nobody verified.
+#[test]
+fn an_unset_region_and_rate_are_delivered_as_the_verified_defaults() {
+    let store = as_store(&fake());
+    let (registry, source) = source(&store, &scratch("src-defaults").join("s"));
+    registry
+        .put_connection(&name("cold"), &put(SENTINEL))
+        .expect("connection");
+    registry
+        .put_binding(BindingRole::Cold, &bind("cold", "bucket"))
+        .expect("binding");
+    let config = source.snapshot().expect("snapshot").config.expect("bound");
+    assert_eq!(config.region, DEFAULT_REGION);
+    assert_eq!(config.min_put_rate, DEFAULT_MIN_PUT_RATE.get());
+}
+
+// Catches a defaulting that overrides what was registered, or one field's default applied
+// to the other: an explicit region with no rate keeps the region, and an explicit rate with
+// no region keeps the rate.
+#[test]
+fn explicit_region_and_rate_are_delivered_unchanged_each_without_the_other() {
+    for (label, region, rate) in [
+        ("src-region", Some("eu-test-1"), None),
+        ("src-rate", None, Some(4096)),
+    ] {
+        let store = as_store(&fake());
+        let (registry, source) = source(&store, &scratch(label).join("s"));
+        let mut connection = put(SENTINEL);
+        connection.region = region.map(str::to_owned);
+        connection.min_put_rate = rate.and_then(std::num::NonZeroU64::new);
+        registry
+            .put_connection(&name("cold"), &connection)
+            .expect("connection");
+        registry
+            .put_binding(BindingRole::Cold, &bind("cold", "bucket"))
+            .expect("binding");
+        let config = source.snapshot().expect("snapshot").config.expect("bound");
+        assert_eq!(
+            (config.region.as_str(), config.min_put_rate),
+            (
+                region.unwrap_or(DEFAULT_REGION),
+                rate.unwrap_or(DEFAULT_MIN_PUT_RATE.get())
+            ),
+            "{label}"
+        );
+    }
 }
 
 /// A store that runs `hook` after every `scan_prefix` it serves: a write by the other
@@ -493,4 +546,145 @@ fn acks_that_cannot_be_read_show_no_nodes() {
     assert_eq!(reports.nodes().len(), 1);
     down.store(true, Ordering::SeqCst);
     assert!(reports.nodes().is_empty());
+}
+
+// Catches a report that keeps a node converged after the registry moved on: a node that
+// acked `ok` at generation 2 is converged at 2; after a secret rotation (generation 3) it
+// is `pending`, still shows the generation it applied (2, not the registry's), and the
+// farm is not converged until it acks 3. A report judged against generation 0, or one that
+// shows the registry's generation as the node's, fails here.
+#[test]
+fn a_node_that_applied_an_older_generation_is_pending_after_a_rotation() {
+    let rig = rig("rep-stale");
+    bound(&rig.registry);
+    let (a, boot) = join(&rig.members, "node-a");
+    rig.members
+        .set_state(a, MemberState::Active)
+        .expect("active");
+    rig.acks
+        .record(a, boot, &beat(2, ApplyStatus::Ok))
+        .expect("record");
+    let generation = rig.registry.generation().expect("generation");
+    assert_eq!(generation, 2);
+    let before = rig.reports.nodes();
+    assert_eq!(
+        (before[0].status, before[0].applied_generation),
+        (NodeStatus::Ok, Some(2))
+    );
+    assert!(Convergence::of(generation, before).converged);
+
+    let mut next = put(SECOND);
+    next.region = Some("eu-test-1".to_owned());
+    next.conditional_put = Some(true);
+    next.min_put_rate = std::num::NonZeroU64::new(4096);
+    rig.registry
+        .put_connection(&name("cold"), &next)
+        .expect("rotate");
+    let generation = rig.registry.generation().expect("generation");
+    assert_eq!(generation, 3);
+    let after = rig.reports.nodes();
+    assert_eq!(
+        (after[0].status, after[0].applied_generation),
+        (NodeStatus::Pending, Some(2))
+    );
+    let farm = Convergence::of(generation, after);
+    assert!((farm.converged, farm.expected, farm.applied) == (false, 1, 0));
+
+    rig.acks
+        .record(a, boot, &beat(3, ApplyStatus::Ok))
+        .expect("record");
+    assert!(Convergence::of(generation, rig.reports.nodes()).converged);
+}
+
+/// A rig whose store clock the test holds, with members that live 60 s and dwell 10 s
+/// once down (an ack lives 15 s).
+fn rig_with_clock(label: &str) -> (Rig, Arc<kbf_state::ManualClock>) {
+    let clock = Arc::new(kbf_state::ManualClock::default());
+    clock.advance(Duration::from_secs(1_000));
+    let fake = Arc::new(kbf_state::fake::Fake::with_flaw(
+        Arc::clone(&clock),
+        kbf_state::fake::Flaw::None,
+    ));
+    let store = as_store(&fake);
+    let (registry, _) = source(&store, &scratch(label).join("s"));
+    let members = Arc::new(Members::new(
+        Arc::clone(&store),
+        MembershipConfig {
+            ttl: Duration::from_secs(60),
+            dwell: Duration::from_secs(10),
+            replication: 1,
+        },
+    ));
+    let acks = Arc::new(Acks::new(Arc::clone(&store)));
+    let reports = Reports::new(
+        Arc::clone(&members),
+        Arc::clone(&acks),
+        Arc::clone(&registry),
+    );
+    (
+        Rig {
+            reports,
+            members,
+            acks,
+            registry,
+        },
+        clock,
+    )
+}
+
+// Catches a report that forgets a lapsed member too early or keeps a departed one. Two
+// nodes apply generation 2; the first stops beating and its lease lapses while the second
+// renews its own. During the dwell the first is `Down` in the map, still shown as standing
+// and expected, and the farm is not converged until it acks again or leaves. Once the dwell
+// passes it has left the map, and an ack row it left behind (a heartbeat that landed late)
+// is not reported.
+#[test]
+fn a_down_node_holds_convergence_through_the_dwell_and_a_departed_one_is_not_reported() {
+    let (rig, clock) = rig_with_clock("rep-down");
+    bound(&rig.registry);
+    let generation = rig.registry.generation().expect("generation");
+    let (a, boot_a) = join(&rig.members, "node-a");
+    let (b, boot_b) = join(&rig.members, "node-b");
+    for id in [a, b] {
+        rig.members
+            .set_state(id, MemberState::Active)
+            .expect("active");
+    }
+    let ack = |id, boot| {
+        rig.acks
+            .record(id, boot, &beat(generation, ApplyStatus::Ok))
+            .expect("record");
+    };
+    ack(a, boot_a);
+    ack(b, boot_b);
+    assert!(Convergence::of(generation, rig.reports.nodes()).converged);
+
+    // `a` stops beating; `b` registers again (which renews its lease) and acks.
+    clock.advance(Duration::from_secs(40));
+    let (_, boot_b) = join(&rig.members, "node-b");
+    clock.advance(Duration::from_secs(40));
+    ack(b, boot_b);
+    let map = rig.members.refresh().expect("refresh").expect("a map");
+    let state_of = |m: &kbf_map::Map, id| m.members().iter().find(|x| x.id == id).map(|x| x.state);
+    assert_eq!(state_of(&map, a), Some(MemberState::Down), "a lapsed");
+    assert_eq!(state_of(&map, b), Some(MemberState::Active));
+    let farm = Convergence::of(generation, rig.reports.nodes());
+    assert_eq!(farm.nodes.len(), 2, "the down node is still reported");
+    assert_eq!(
+        (farm.expected, farm.applied, farm.converged),
+        (2, 1, false),
+        "the down node is expected and has not applied"
+    );
+
+    // A late heartbeat of `a` lands, then the dwell runs out: `a` leaves the map.
+    ack(a, boot_a);
+    clock.advance(Duration::from_secs(11));
+    let (_, boot_b) = join(&rig.members, "node-b");
+    ack(b, boot_b);
+    let map = rig.members.refresh().expect("refresh").expect("a map");
+    assert_eq!(state_of(&map, a), None, "a left the map");
+    let farm = Convergence::of(generation, rig.reports.nodes());
+    let ids: Vec<&str> = farm.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(ids, ["node-b:8982"]);
+    assert_eq!((farm.expected, farm.applied, farm.converged), (1, 1, true));
 }

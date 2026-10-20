@@ -198,12 +198,15 @@ fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_passwor
     for mode in [Mode::Frontend, Mode::AllInOne] {
         let mut r = raw(mode);
         r.database = None;
-        let why = r.validate().expect_err("required").join("; ");
+        let why = r
+            .validate(Platform::Linux)
+            .expect_err("required")
+            .join("; ");
         assert!(why.contains("--database is required"), "{why}");
     }
     let mut r = raw(Mode::Daemon);
     r.database = Some(DATABASE.to_owned());
-    let why = r.validate().expect_err("refused").join("; ");
+    let why = r.validate(Platform::Linux).expect_err("refused").join("; ");
     assert!(why.contains("--database is for the modes"), "{why}");
     for bad in [
         "postgres://kbf:hunter2@db.example/kbf",
@@ -211,7 +214,7 @@ fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_passwor
     ] {
         let mut r = raw(Mode::Frontend);
         r.database = Some(bad.to_owned());
-        let why = r.validate().expect_err("refused").join("; ");
+        let why = r.validate(Platform::Linux).expect_err("refused").join("; ");
         assert!(why.contains("password"), "{bad}: {why}");
         assert!(!why.contains("hunter2") && !why.contains(bad), "{why}");
     }
@@ -223,13 +226,13 @@ fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_passwor
     ] {
         let mut r = raw(Mode::Frontend);
         r.database = Some(bad.to_owned());
-        let why = r.validate().expect_err("refused").join("; ");
+        let why = r.validate(Platform::Linux).expect_err("refused").join("; ");
         assert!(why.contains("not a usable Postgres URL"), "{bad}: {why}");
         assert!(!why.contains(bad), "{why}");
     }
     let mut ok = raw(Mode::Frontend);
     ok.database = Some("postgresql:///kbf?host=/run/postgresql".to_owned());
-    assert!(ok.validate().is_ok());
+    assert!(ok.validate(Platform::Linux).is_ok());
 }
 
 /// Catches a setup that writes a settings file somewhere the unit does not read: the unit
@@ -238,8 +241,8 @@ fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_passwor
 #[test]
 fn setup_writes_the_installer_toml_the_unit_reads() {
     let mut r = raw(Mode::Daemon);
-    r.installer_config = "/srv/other.toml".to_owned();
-    let why = r.validate().expect_err("refused").join("; ");
+    r.installer_config = Some("/srv/other.toml".to_owned());
+    let why = r.validate(Platform::Linux).expect_err("refused").join("; ");
     assert!(why.contains("--installer-config is for run"), "{why}");
 }
 
@@ -472,9 +475,12 @@ fn another_scheduler_key_makes_the_file_the_operators() {
     let theirs = format!(
         "mode = \"frontend\"\n[scheduler]\nstate-store = \"{DATABASE}\"\nheartbeat-interval-ms = 500\n"
     );
-    assert_eq!(decide(Some(&theirs), &ours), Decision::Keep);
+    assert_eq!(
+        decide(Some(&theirs), &ours, "/etc/kbf/kbf.toml"),
+        Decision::Keep
+    );
     let other = theirs.replace(DATABASE, "postgres:///other?host=/run/postgresql");
-    let Decision::Refuse(why) = decide(Some(&other), &ours) else {
+    let Decision::Refuse(why) = decide(Some(&other), &ours, "/etc/kbf/kbf.toml") else {
         panic!("refused");
     };
     assert!(why.contains("[scheduler] state-store"), "{why}");
@@ -630,7 +636,7 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
         state_store: Some(DATABASE),
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = \"postgres:///other?host=/run/postgresql\"\nheartbeat-interval-ms = 500\n";
-    let Decision::Refuse(why) = decide(Some(theirs), &ours) else {
+    let Decision::Refuse(why) = decide(Some(theirs), &ours, "/etc/kbf/kbf.toml") else {
         panic!("refused");
     };
     assert!(why.contains("[scheduler] state-store"), "{why}");
@@ -657,7 +663,7 @@ fn an_invalid_config_file_is_refused_without_its_text() {
         state_store: Some(DATABASE),
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = postgres://u:PW@h/x\n";
-    let Decision::Refuse(why) = decide(Some(theirs), &ours) else {
+    let Decision::Refuse(why) = decide(Some(theirs), &ours, "/etc/kbf/kbf.toml") else {
         panic!("refused");
     };
     assert!(why.contains("not valid TOML"), "{why}");
@@ -708,4 +714,138 @@ fn the_backup_unit_runs_as_the_modes_service_user() {
     let mut exec = released(host(), Platform::Linux);
     go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
     assert!(write_index(&exec, BACKUP_USER_DROPIN).is_none());
+}
+
+/// The `<key>`s of the property list's `PathState`: the files its `KeepAlive` waits for.
+fn gate_files(plist: &str) -> Vec<String> {
+    let after = plist
+        .split("<key>PathState</key>")
+        .nth(1)
+        .expect("PathState");
+    let dict = after.split("</dict>").next().expect("a dict");
+    dict.split("<key>")
+        .skip(1)
+        .map(|k| k.split("</key>").next().expect("closed").to_owned())
+        .collect()
+}
+
+/// Catches `setup` writing `installer.toml` where the launchd job does not wait for it: the
+/// job's `KeepAlive` is gated on that file, so on a Mac that setup wrote it elsewhere
+/// (`/etc/kbf`, the Linux path) the installer job would never run and the daemon would find
+/// no `kbf.toml`. Runs the Mac plan, then compares the real plist's gate with the files the
+/// plan wrote, and checks nothing went under `/etc/kbf`.
+#[test]
+fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
+    let mut exec = released(host(), Platform::MacOs);
+    go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
+
+    let files: Vec<String> = exec
+        .entries
+        .iter()
+        .filter(|(_, e)| matches!(e, Entry::File { .. }))
+        .map(|(p, _)| p.to_string())
+        .collect();
+    let written: Vec<&String> = files
+        .iter()
+        .filter(|p| p.ends_with("/installer.toml"))
+        .collect();
+    let plist = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/macos/com.komira.kbf-installer.plist"),
+    )
+    .expect("the packaged property list");
+    assert_eq!(
+        written,
+        gate_files(&plist).iter().collect::<Vec<_>>(),
+        "setup wrote installer.toml somewhere the launchd gate does not wait"
+    );
+    // The node job reads kbf.toml from the layout; setup wrote it there.
+    assert!(
+        files.iter().any(|p| p == Platform::MacOs.kbf_toml()),
+        "{files:?}"
+    );
+    assert!(
+        !files.iter().any(|p| p.starts_with("/etc/kbf")),
+        "a Mac keeps nothing in /etc/kbf: {files:?}"
+    );
+    // The configuration directory is made where the files go, and no Linux one is made.
+    let dirs: Vec<String> = exec
+        .entries
+        .iter()
+        .filter(|(_, e)| matches!(e, Entry::Dir { .. }))
+        .map(|(p, _)| p.to_string())
+        .collect();
+    assert!(
+        dirs.iter().any(|d| d == "/usr/local/etc/kbf"),
+        "no Mac config directory: {dirs:?}"
+    );
+    assert!(
+        !dirs.iter().any(|d| d.starts_with("/etc/kbf")),
+        "a Linux config directory on a Mac: {dirs:?}"
+    );
+}
+
+/// Catches one of the config paths left on the Linux directory on one platform (a Mac
+/// `api_token` or `config_dir` at `/etc/kbf` reaches no test that runs the daemon plan):
+/// each file sits directly in its platform's `config_dir`, which is `/etc/kbf` on Linux and
+/// `/usr/local/etc/kbf` on macOS, and the `Layout` paths are the `Platform` ones.
+///
+/// Mutants seen red: the Mac `config_dir` and the Mac `api_token` each set to the Linux path.
+#[test]
+fn every_config_path_lies_in_its_platforms_config_dir() {
+    for (platform, dir) in [
+        (Platform::Linux, "/etc/kbf"),
+        (Platform::MacOs, "/usr/local/etc/kbf"),
+    ] {
+        assert_eq!(platform.config_dir(), dir);
+        let layout = crate::layout::Layout::new(kbf_host::Root::new("/").expect("root"), platform);
+        assert_eq!(layout.config_dir().to_string(), dir);
+        for (file, path, held) in [
+            ("kbf.toml", platform.kbf_toml(), layout.kbf_toml()),
+            (
+                "installer.toml",
+                platform.installer_toml(),
+                layout.installer_toml(),
+            ),
+            (
+                "enroll.token",
+                platform.enroll_token(),
+                layout.enroll_token(),
+            ),
+            ("api-token", platform.api_token(), layout.api_token()),
+        ] {
+            assert_eq!(
+                std::path::Path::new(path).parent(),
+                Some(std::path::Path::new(dir)),
+                "{platform:?} {file}: {path}"
+            );
+            assert_eq!(held.to_string(), path, "{platform:?} {file}");
+        }
+    }
+}
+
+/// Catches `--installer-config` being pinned to the Linux path on a Mac: the only value setup
+/// accepts there is the Mac's own, and the Linux one is refused.
+#[test]
+fn setup_accepts_only_the_platforms_installer_toml_as_installer_config() {
+    let mut r = raw(Mode::Daemon);
+    r.installer_config = Some("/usr/local/etc/kbf/installer.toml".to_owned());
+    r.validate(Platform::MacOs).expect("the Mac's own file");
+    let why = r
+        .validate(Platform::Linux)
+        .expect_err("not Linux's")
+        .join("; ");
+    assert!(
+        why.contains("setup writes /etc/kbf/installer.toml"),
+        "{why}"
+    );
+    r.installer_config = Some("/etc/kbf/installer.toml".to_owned());
+    let why = r
+        .validate(Platform::MacOs)
+        .expect_err("not the Mac's")
+        .join("; ");
+    assert!(
+        why.contains("setup writes /usr/local/etc/kbf/installer.toml"),
+        "{why}"
+    );
 }
