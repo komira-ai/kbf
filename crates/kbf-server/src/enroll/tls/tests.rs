@@ -1,9 +1,14 @@
 //! The enroll listener's own certificate: issued by the CA for the frontend's names, kept
 //! fresh under one key, and never replaced by a failed attempt.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kbf_ca::SystemEntropy;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use super::*;
 use crate::enroll::testkit::{FRONTEND, START, farm};
@@ -79,24 +84,68 @@ fn a_certificate_needs_names_it_can_carry() {
     assert!(FrontendTls::start(&farm.ca, &bad, START, &mut SystemEntropy).is_err());
 }
 
-/// Waits (in real time, with the paused clock untouched) until `done` holds: the renewal
-/// runs on the blocking pool, which paused time does not drive.
-async fn settle(what: &str, done: impl Fn() -> bool) {
-    for _ in 0..2_000 {
-        if done() {
-            return;
-        }
-        tokio::task::yield_now().await;
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    panic!("never happened: {what}");
+/// Half the life of the certificates the test CA issues (86 400 seconds): when the renewal
+/// loop makes its first attempt.
+const HALF: u64 = 86_400 / 2;
+
+/// A renewal loop over a fresh certificate, watched from the test.
+///
+/// Every attempt reports itself from its blocking thread before it renews, and the test
+/// reads those reports and nothing else. The paused clock moves only when the runtime has
+/// nothing to run and a timer is waiting (tokio also holds it still while a blocking task
+/// runs), so the loop's one pending sleep is all that ever moves it, and it jumps there
+/// when the loop arms it. The test has no `advance`, no sleep and no timeout while an
+/// attempt is out: how long the blocking pool takes changes how long the test runs, never
+/// what it sees.
+struct Watched {
+    /// How many certificates the earlier attempts had installed, as each attempt began.
+    seen: UnboundedReceiver<u64>,
+    looping: JoinHandle<()>,
+    /// When the loop was started, on the paused clock.
+    start: Instant,
 }
 
-/// Lets the loop that just finished an attempt reach its next sleep.
-async fn let_it_sleep() {
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-        std::thread::sleep(Duration::from_millis(1));
+impl Watched {
+    /// Starts the loop. `reading` is the clock each attempt issues by (the attempts are
+    /// counted from 0), asked on the attempt's blocking thread after it has reported.
+    fn new(
+        farm: &crate::enroll::testkit::Farm,
+        reading: impl Fn(u32) -> i64 + Send + Sync + 'static,
+    ) -> Self {
+        let tls = FrontendTls::start(&farm.ca, &names(), now(), &mut SystemEntropy);
+        let tls = Arc::new(tls.expect("tls"));
+        let (told, seen) = tokio::sync::mpsc::unbounded_channel();
+        let served = tls.source();
+        let calls = AtomicU32::new(0);
+        let clock: Arc<dyn Fn() -> i64 + Send + Sync> = Arc::new(move || {
+            // A test that has gone away does not stop the attempt.
+            let _ = told.send(served.reloads().applied);
+            reading(calls.fetch_add(1, Ordering::SeqCst))
+        });
+        let start = Instant::now();
+        let looping = tokio::spawn(tls.keep_fresh_by(Arc::clone(&farm.ca), clock, None));
+        Self {
+            seen,
+            looping,
+            start,
+        }
+    }
+
+    /// The next attempt's report: when it began, in whole seconds of the paused clock since
+    /// the loop was started, and how many certificates the attempts before it had
+    /// installed.
+    ///
+    /// # Panics
+    /// If the loop ended: its clock, and with it the sending end, was dropped.
+    async fn next(&mut self) -> (u64, u64) {
+        let applied = self.seen.recv().await.expect("the loop ended");
+        (self.start.elapsed().as_secs(), applied)
+    }
+}
+
+impl Drop for Watched {
+    fn drop(&mut self) {
+        self.looping.abort();
     }
 }
 
@@ -104,133 +153,92 @@ async fn let_it_sleep() {
 /// fails (the CA refuses, or the task dies) is tried again after one minute and not
 /// sooner; and after a success the next one is half a life away, not a minute.
 ///
+/// The test reads the schedule from the attempts themselves: each reports when it was
+/// made (on the paused clock) and how many certificates the attempts before it had
+/// installed. Five are expected:
+///
+/// 1. at half the life, which kills its task;
+/// 2. a minute later, which the CA refuses (a clock before the build's floor);
+/// 3. a minute later, which succeeds;
+/// 4. half a life later, which succeeds;
+/// 5. half a life later again.
+///
 /// Catches: a renewal at the full lifetime (nodes would meet an expired frontend for
 /// the second half of every certificate), at once or too often (a CA hammered), a retry
 /// that waits the half life (a day without a certificate after one refusal), a loop that
-/// ends at its first failure, and a success that keeps the one-minute rhythm.
+/// ends at its first failure (the report of the next attempt never comes), and a success
+/// that keeps the one-minute rhythm.
 #[tokio::test(start_paused = true)]
 async fn the_certificate_is_renewed_at_half_life_and_a_failure_is_retried_in_a_minute() {
-    use std::sync::atomic::{AtomicU32, Ordering};
-
     let farm = farm("tls-schedule");
-    let tls = std::sync::Arc::new(
-        FrontendTls::start(&farm.ca, &names(), now(), &mut SystemEntropy).expect("tls"),
-    );
-    let half = 86_400 / 2;
-    let attempts = std::sync::Arc::new(AtomicU32::new(0));
-    let counted = std::sync::Arc::clone(&attempts);
-    // Attempt 1 kills its task, attempt 2 is refused by the CA (a clock before the
-    // build's floor), later ones succeed.
-    let clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync> =
-        std::sync::Arc::new(move || match counted.fetch_add(1, Ordering::SeqCst) {
-            0 => panic!("the renewal task dies"),
-            1 => 1_000,
-            _ => now(),
-        });
-    let looping = tokio::spawn(std::sync::Arc::clone(&tls).keep_fresh_by(
-        std::sync::Arc::clone(&farm.ca),
-        clock,
-        None,
-    ));
-    let tried = || attempts.load(Ordering::SeqCst);
-    let applied = || tls.source().reloads().applied;
-    let_it_sleep().await;
+    let mut run = Watched::new(&farm, |attempt| match attempt {
+        0 => panic!("the renewal task dies"),
+        1 => 1_000,
+        _ => now(),
+    });
 
-    tokio::time::advance(Duration::from_secs(half - 1)).await;
-    let_it_sleep().await;
-    assert_eq!(tried(), 0, "nothing before half the life");
-    tokio::time::advance(Duration::from_secs(1)).await;
-    settle("the first attempt", || tried() == 1).await;
-    let_it_sleep().await;
-    assert_eq!(applied(), 0);
-
-    tokio::time::advance(Duration::from_secs(59)).await;
-    let_it_sleep().await;
-    assert_eq!(tried(), 1, "a retry waits a minute after a task that died");
-    tokio::time::advance(Duration::from_secs(1)).await;
-    settle("the retry", || tried() == 2).await;
-    let_it_sleep().await;
     assert_eq!(
-        applied(),
-        0,
-        "the CA refused: the served certificate is unchanged"
+        run.next().await,
+        (HALF, 0),
+        "the first attempt is at half the life; it dies"
     );
-
-    tokio::time::advance(Duration::from_secs(59)).await;
-    let_it_sleep().await;
-    assert_eq!(tried(), 2, "a retry waits a minute after a refusal");
-    tokio::time::advance(Duration::from_secs(1)).await;
-    settle("the renewal", || applied() == 1).await;
-    let_it_sleep().await;
-    assert_eq!(tried(), 3);
-
-    tokio::time::advance(Duration::from_secs(60)).await;
-    let_it_sleep().await;
     assert_eq!(
-        tried(),
-        3,
-        "after a success the next one is half a life away"
+        run.next().await,
+        (HALF + 60, 0),
+        "a dead task is retried a minute later, not sooner"
     );
-    tokio::time::advance(Duration::from_secs(half - 60)).await;
-    settle("the next renewal", || applied() == 2).await;
-    assert!(!looping.is_finished(), "the loop never ends");
-    looping.abort();
+    assert_eq!(
+        run.next().await,
+        (HALF + 120, 0),
+        "a refusal is retried a minute later and installed nothing"
+    );
+    assert_eq!(
+        run.next().await,
+        (2 * HALF + 120, 1),
+        "after a success the next is half a life away"
+    );
+    assert_eq!(
+        run.next().await,
+        (3 * HALF + 120, 2),
+        "and again: the loop never ends"
+    );
 }
 
-/// The failure the test above had in two CI runs, reproduced on purpose. Its way of waiting
-/// (move the paused clock by hand, then give the blocking pool a fixed stretch of real time
-/// to catch up) loses to an attempt that is slow to finish.
+/// A retry is due a minute after the failed attempt ended, not a minute after it began.
 ///
-/// The first attempt is held at a gate, as a loaded runner holds a thread that is unwinding
-/// its first panic. The clock is moved to one second short of the retry as the test above
-/// counts it, and the attempt is released. The loop arms its one-minute sleep when the
-/// attempt ends, at that reading of the clock, so the retry falls due a minute after the
-/// 59th second and the test's last second reaches nothing. `settle` gives up with "never
-/// happened: the retry", the text of the failed runs.
+/// The first attempt is held at a gate while the clock moves 59 seconds, and is then
+/// released. This is the interleaving that the first version of the test above lost to a
+/// slow runner (it moved the clock by hand and waited, in real time, for the loop to
+/// notice that an attempt had ended): here the test decides it, so it is the same every
+/// run, and the retry is 59 + 60 seconds after the attempt began.
 ///
-/// This test is red on purpose. The change after it replaces both with tests that read the
-/// schedule from the attempts themselves.
+/// Catches: a retry on a fixed rhythm from the start of the attempt (a slow CA would be
+/// asked again while it is still working), and a retry timed before the attempt has ended.
 #[tokio::test(start_paused = true)]
-async fn the_old_choreography_fails_when_the_first_attempt_finishes_late() {
-    use std::sync::atomic::{AtomicU32, Ordering};
-
+async fn a_retry_is_a_minute_after_the_attempt_ended_not_after_it_began() {
     let farm = farm("tls-late");
-    let tls = std::sync::Arc::new(
-        FrontendTls::start(&farm.ca, &names(), now(), &mut SystemEntropy).expect("tls"),
-    );
-    let half = 86_400 / 2;
-    let attempts = std::sync::Arc::new(AtomicU32::new(0));
-    let counted = std::sync::Arc::clone(&attempts);
     let (release, gate) = std::sync::mpsc::channel::<()>();
-    let gate = std::sync::Mutex::new(gate);
-    // Attempt 1 waits at the gate and then dies; later ones succeed.
-    let clock: std::sync::Arc<dyn Fn() -> i64 + Send + Sync> =
-        std::sync::Arc::new(move || match counted.fetch_add(1, Ordering::SeqCst) {
-            0 => {
-                let held = gate.lock().expect("the gate").recv();
-                held.expect("the test releases the attempt");
-                panic!("the renewal task dies")
-            }
-            _ => now(),
-        });
-    let looping = tokio::spawn(std::sync::Arc::clone(&tls).keep_fresh_by(
-        std::sync::Arc::clone(&farm.ca),
-        clock,
-        None,
-    ));
-    let tried = || attempts.load(Ordering::SeqCst);
-    let_it_sleep().await;
+    let gate = Mutex::new(gate);
+    let mut run = Watched::new(&farm, move |attempt| match attempt {
+        0 => {
+            let held = gate.lock().expect("the gate").recv();
+            held.expect("the test releases the attempt");
+            panic!("the renewal task dies")
+        }
+        _ => now(),
+    });
 
-    tokio::time::advance(Duration::from_secs(half)).await;
-    settle("the first attempt", || tried() == 1).await;
-    let_it_sleep().await;
-    // The attempt is out, so no sleep is armed. Fifty-nine seconds pass, and then it ends.
+    assert_eq!(
+        run.next().await,
+        (HALF, 0),
+        "the first attempt is at half the life"
+    );
+    // The attempt is out and the clock is the test's to move: 59 seconds pass before it ends.
     tokio::time::advance(Duration::from_secs(59)).await;
-    let_it_sleep().await;
     release.send(()).expect("the attempt is waiting");
-    let_it_sleep().await;
-
-    tokio::time::advance(Duration::from_secs(1)).await;
-    settle("the retry", || tried() == 2).await;
-    looping.abort();
+    assert_eq!(
+        run.next().await,
+        (HALF + 59 + 60, 0),
+        "the retry is a minute after the attempt ended"
+    );
 }
