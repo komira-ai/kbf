@@ -334,7 +334,11 @@ async fn the_attempt_after_a_stalled_one_presents_the_renewed_certificate() {
     drop(held);
     let failed = daemon.connected_after_renewal(&mut sessions).await;
     let marker = format!("({stalled})");
-    assert_eq!(failed.len(), 1, "the stalled attempt fails once: {failed:?}");
+    assert_eq!(
+        failed.len(),
+        1,
+        "the stalled attempt fails once: {failed:?}"
+    );
     assert!(
         failed.iter().all(|attempt| attempt.contains(&marker)),
         "an attempt that began after the renewal failed: {failed:?}"
