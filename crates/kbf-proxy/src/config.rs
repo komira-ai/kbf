@@ -189,6 +189,19 @@ impl ProxyConfig {
         Ok(config)
     }
 
+    /// Reads and checks the `[proxy]` table of a larger file (`installer.toml`) that the caller
+    /// has already parsed: the same table, the same refusals as [`ProxyConfig::from_toml_str`].
+    ///
+    /// # Errors
+    /// [`ConfigError`].
+    pub fn from_value(table: toml::Value) -> Result<Self, ConfigError> {
+        let config: Self = table
+            .try_into()
+            .map_err(|e| ConfigError::Parse(e.to_string()))?;
+        config.check()?;
+        Ok(config)
+    }
+
     fn check(&self) -> Result<(), ConfigError> {
         if !(1024..=MAX_BASE_PORT).contains(&self.upstream.base_port) {
             return Err(ConfigError::Invalid(
@@ -251,6 +264,25 @@ base_port = 18000
             PathBuf::from("/run/kbf-proxy/proxy-auth")
         );
         assert_eq!(c.state_dir, PathBuf::from("/var/lib/kbf-proxy"));
+    }
+
+    #[test]
+    fn a_table_read_from_a_larger_file_gets_the_same_checks() {
+        let value: toml::Value = toml::from_str(MIN).expect("toml");
+        assert_eq!(
+            ProxyConfig::from_value(value).expect("valid"),
+            ProxyConfig::from_toml_str(MIN).expect("valid")
+        );
+        let unknown: toml::Value = toml::from_str(&format!("surprise = 1\n{MIN}")).expect("toml");
+        assert!(matches!(
+            ProxyConfig::from_value(unknown),
+            Err(ConfigError::Parse(_))
+        ));
+        let low: toml::Value = toml::from_str(&MIN.replace("18000", "80")).expect("toml");
+        assert!(matches!(
+            ProxyConfig::from_value(low),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]
