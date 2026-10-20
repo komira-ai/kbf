@@ -705,4 +705,5 @@ fn update_runs_without_root_and_reports_its_own_usage_errors() {
         "{err}"
     );
     assert!(!parse(&args).verb.needs_root());
+    assert_eq!(parse(&args).verb.name(), "update");
 }
