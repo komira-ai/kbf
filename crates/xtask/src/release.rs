@@ -43,6 +43,14 @@
 //!   offer` verifies one, and only then the named binaries taken out into `--out`. With no
 //!   such tag it prints `previous-source=none`; a failed call is an error, never "no tags".
 //!   Prints `key=value` lines and appends them to `--output`.
+//! - `release stage-offer --repo <owner/repo> --sha <sha> --out <dir> [--output <file>]
+//!   [--trusted-root <file>] [--runner-platform <p>] [--gh <program>]` ([`stage_offer`]): for
+//!   gamma only, the offer for the release of `--sha` and the bundle a deploy is handed.
+//!   The release is downloaded and verified before any of its files runs; its `kbf` and its
+//!   N-1's (`release previous`) give the `meta_log` numbers; beta is waived for a fixed reason
+//!   by a fixed operator. A commit with no release is `staged=false` and exit 0; a commit a
+//!   newer release supersedes is an error. Prints `key=value` lines and appends them to
+//!   `--output`; `--out` is made last.
 //! - `release publish <dir> --repo <owner/repo> --tag <tag> --commit <sha> --run-id <id>
 //!   [--gh <program>]` ([`publish`]): `check`, then creates release `<tag>` with every
 //!   file of `<dir>` (the bundles beside their tarballs). When the release exists,
@@ -56,6 +64,7 @@ pub mod notes;
 pub mod offer;
 pub mod plan;
 pub mod previous;
+pub mod stage_offer;
 pub mod tags;
 pub mod verdict;
 

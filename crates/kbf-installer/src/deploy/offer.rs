@@ -247,7 +247,7 @@ pub(super) fn parse_sums(sums: &[u8]) -> Result<BTreeMap<String, String>, String
 
 /// The checks that need the bundle: its `SHA256SUMS` is the offer's set, each tarball is
 /// the file the sums name, and the host's `kbf` names the offer's `meta_log`.
-pub(super) fn check_bundle(
+pub fn check_bundle(
     doc: &OfferDoc,
     bundle: &Bundle,
     commit: &CommitId,

@@ -130,7 +130,7 @@ fn object_of(answer: &Value) -> (Option<&str>, Option<&str>) {
 
 /// The commit the annotated release tag `tag` names: its ref names a tag object, and that
 /// names a commit.
-fn tag_commit(gh: &Path, repo: &str, tag: &str) -> Result<String, Error> {
+pub(super) fn tag_commit(gh: &Path, repo: &str, tag: &str) -> Result<String, Error> {
     let found = must_api(gh, &format!("repos/{repo}/git/ref/tags/{tag}"))?;
     let (Some("tag"), Some(object)) = object_of(&found) else {
         return Err(Error::Failed(format!(
