@@ -52,11 +52,10 @@ pub const COMMAND_READ_BYTES: u64 = 1024 * 1024;
 /// How long one blob read may take before its part of the answer is left out.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What `/failures` reads from the CAS for one failure it lists.
+/// What `/failures` reads from the CAS for one failure it lists, in the order of the
+/// page's `failures`.
 #[derive(Debug)]
 pub(crate) struct Read {
-    /// The failure's place in the page's `failures`.
-    index: usize,
     /// The Action blob, for the platform and the timeout.
     action: Digest,
     /// The Command blob, once the recorder has read its digest from the Action.
@@ -125,7 +124,6 @@ pub(super) fn entry(b: &mut Builder, r: &ActionRow, base: &str, index: usize) ->
         logs.push(log);
     }
     b.reads.push(Read {
-        index,
         action: r.action,
         command: r.command,
         stdout: listing.and_then(|l| l.stdout),
@@ -178,10 +176,9 @@ pub(crate) async fn fill<M, O>(
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    for read in reads {
-        let Some(slot) = value.pointer_mut(&format!("/failures/{}", read.index)) else {
-            continue;
-        };
+    // The reads are in the order of the page's `failures`.
+    let slots = value["failures"].as_array_mut().into_iter().flatten();
+    for (slot, read) in slots.zip(reads) {
         if blobs_on && let Some(command) = command(cache, read).await {
             slot["command"] = command;
             slot["command_available"] = true.into();

@@ -238,3 +238,78 @@ fn a_very_long_command_is_cut_from_the_end_and_says_so() {
     );
     assert_eq!(shown["working_directory"], "wd", "never cut");
 }
+
+/// Catches: a log whose object the store no longer holds (the index still names it)
+/// shown as an empty tail or taken for a blob that was never held; it is `unreadable`.
+#[tokio::test]
+async fn a_blob_the_store_lost_is_unreadable() {
+    use kbf_objstore::{ObjectStore, PageSize};
+    let cache = Cache::memory();
+    let held = stored(&cache, b"a log the store will lose").await;
+    let page = cache
+        .objects()
+        .list(cache.prefix(), None, PageSize::MAX)
+        .await
+        .expect("a listing");
+    for object in &page.objects {
+        cache.objects().delete(&object.key).await.expect("deleted");
+    }
+    let lost = tail(&cache, &held).await;
+    assert_eq!(
+        lost,
+        Err(Omitted::Unreadable),
+        "{} objects deleted",
+        page.objects.len()
+    );
+}
+
+fn read(action: Digest, command: Option<Digest>) -> Read {
+    Read {
+        action,
+        command,
+        stdout: None,
+        stderr: None,
+    }
+}
+
+/// Catches: a blob over the bound read anyway, a missing one that answers, and a command
+/// built from an Action or Command that does not decode (garbage in the CAS must not
+/// become an empty command shown as the real one).
+#[tokio::test]
+async fn a_command_is_read_only_from_small_blobs_that_decode() {
+    let cache = Cache::memory();
+    let big = Digest::new(DigestFunction::Sha256, [3; 32], COMMAND_READ_BYTES + 1);
+    assert!(blob(&cache, &big).await.is_none(), "over the bound");
+    let gone = Digest::new(DigestFunction::Sha256, [4; 32], 5);
+    assert!(blob(&cache, &gone).await.is_none(), "not held");
+    let held = stored(&cache, b"x").await;
+    assert_eq!(blob(&cache, &held).await.as_deref(), Some(&b"x"[..]));
+
+    // A byte string that is no message: tag 0xff... is an invalid wire type.
+    let garbage = stored(&cache, &[0xff, 0xff, 0xff]).await;
+    let command = stored(&cache, &Command::default().encode_to_vec()).await;
+    let action = stored(&cache, &Action::default().encode_to_vec()).await;
+    assert!(
+        command_of(&cache, read(garbage, Some(command)))
+            .await
+            .is_none()
+    );
+    assert!(
+        command_of(&cache, read(action, Some(garbage)))
+            .await
+            .is_none()
+    );
+    assert!(command_of(&cache, read(action, None)).await.is_none());
+    assert!(
+        command_of(&cache, read(action, Some(command)))
+            .await
+            .is_some()
+    );
+}
+
+async fn command_of(
+    cache: &Cache<kbf_front::MemoryMetaLog, kbf_objstore::MemoryStore>,
+    read: Read,
+) -> Option<serde_json::Value> {
+    command(cache, &read).await
+}

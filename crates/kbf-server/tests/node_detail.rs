@@ -108,6 +108,8 @@ async fn an_id_with_a_write_suffix_or_a_path_below_it_is_404() {
     let api = cell.api.expect("an API address");
     let _node = cell.daemon("linux-1", 8, 16).await;
     let _colon = cell.daemon("host:8080", 8, 16).await;
+    // A node that registered under a name that is a write's path is still no node to read.
+    let _odd = cell.daemon("odd:drain", 8, 16).await;
     for path in [
         "/v1/nodes/linux-1:cordon",
         "/v1/nodes/linux-1:drain",
@@ -115,6 +117,7 @@ async fn an_id_with_a_write_suffix_or_a_path_below_it_is_404() {
         "/v1/nodes/host%3A8080:cordon",
         "/v1/nodes/ghost:cordon",
         "/v1/nodes/ghost",
+        "/v1/nodes/odd%3Adrain",
     ] {
         let (code, body) = get(api, path).await;
         assert_eq!(code, 404, "{path}: {body}");

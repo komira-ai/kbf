@@ -373,10 +373,13 @@ async fn failures_of_an_unknown_record_are_no_record_and_the_route_is_off_withou
 async fn what_the_cas_cannot_give_is_said_not_guessed() {
     let base = format!("/v1/invocations/{INV}/failures");
 
-    // The blob route off: nothing is read, whatever the cache holds.
+    // The blob route off: nothing is read, whatever the cache holds (the logs, the Action
+    // and the Command are all there).
     let off = Server::with(PAGES_ONLY);
     let (held_out, held_err) = (off.store(b"out").await, off.store(b"err").await);
-    exit_two(&off, (held_out, held_err)).await;
+    let command = compile(&off).await;
+    let action = action_of(&off, &command).await;
+    exit_two(&off, (action, command), (held_out, held_err)).await;
     let page = off.ok(&base).await;
     let row = &failures(&page)[0];
     for log in ["stdout", "stderr"] {
@@ -393,7 +396,7 @@ async fn what_the_cas_cannot_give_is_said_not_guessed() {
     // The blob route on, and the cache holding none of it.
     let server = Server::with(OPEN);
     let huge = Digest::new(kbf_types::DigestFunction::Sha256, [7; 32], 65 * 1024 * 1024);
-    exit_two(&server, (digest(63), huge)).await;
+    exit_two(&server, (digest(61), digest(60)), (digest(63), huge)).await;
     let page = server.ok(&base).await;
     let row = &failures(&page)[0];
     assert_eq!(row["stdout"]["available"], false);
@@ -590,14 +593,14 @@ async fn the_failure_is_the_last_attempts_and_a_cached_failure_has_none() {
     server.stop().await;
 }
 
-/// One action, `digest(61)`, that exited 2 with the logs `logs` (stdout, stderr), and
-/// whose Command digest, `digest(60)`, the recorder has read.
-async fn exit_two(server: &Server, logs: (Digest, Digest)) {
-    let known = digest(61);
+/// One action `action`, that exited 2 with the logs `logs` (stdout, stderr), and whose
+/// Command digest, `command`, the recorder has read: `blobs` is `(action, command)`.
+async fn exit_two(server: &Server, blobs: (Digest, Digest), logs: (Digest, Digest)) {
+    let (known, command) = blobs;
     server
         .feed([
             queued(INV, "main", at(0), known, 1),
-            names_command(known, digest(60)),
+            names_command(known, command),
             finished(
                 1,
                 1,
