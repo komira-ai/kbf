@@ -26,10 +26,13 @@ impl Probe for Says {
     }
 }
 
+/// What one attestation check was shown: the commit, the tarball and the attestation.
+type Shown = (String, Vec<u8>, Vec<u8>);
+
 /// An attestation check that says `verdict` and keeps what it was shown.
 struct Vouches {
     verdict: Result<(), String>,
-    seen: std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+    seen: std::sync::Mutex<Vec<Shown>>,
 }
 
 impl Vouches {
@@ -42,11 +45,12 @@ impl Vouches {
 }
 
 impl Attest for std::sync::Arc<Vouches> {
-    fn verify(&self, _: &CommitId, tarball: &[u8], attestation: &[u8]) -> Result<(), String> {
-        self.seen
-            .lock()
-            .unwrap()
-            .push((tarball.to_vec(), attestation.to_vec()));
+    fn verify(&self, commit: &CommitId, tarball: &[u8], attestation: &[u8]) -> Result<(), String> {
+        self.seen.lock().unwrap().push((
+            commit.as_str().to_owned(),
+            tarball.to_vec(),
+            attestation.to_vec(),
+        ));
         self.verdict.clone()
     }
 }
@@ -152,8 +156,18 @@ fn deploy_probing(
     bundle: Option<Vec<u8>>,
     probe: &dyn Probe,
 ) -> (Farm, Summary) {
+    deploy_mode(true, policy, bundle, probe)
+}
+
+/// [`deploy_probing`], as a plan (`apply` false) or an apply.
+fn deploy_mode(
+    apply: bool,
+    policy: OfferPolicy,
+    bundle: Option<Vec<u8>>,
+    probe: &dyn Probe,
+) -> (Farm, Summary) {
     let f = farm(two_nodes());
-    let mut o = opts(true);
+    let mut o = opts(apply);
     o.offer = policy;
     let clock = Clk(f.now.clone());
     let (smoke, check) = (FixedSmoke(SmokeResult::Pass), FixedCheck(Ok(true)));
@@ -475,7 +489,8 @@ fn no_offer_is_refused_unless_deliberately_waived() {
 /// regular file: an unknown field, a hand-edited `reversible`, a link and an oversize file
 /// are all refused, and the good file is read.
 ///
-/// Mutants planted: the link check removed (metadata followed); the size cap removed.
+/// Mutants planted: O_NOFOLLOW removed (the link followed); the size cap removed; the cap
+/// off by one in either direction; the parse error shown whole.
 #[test]
 fn the_offer_file_is_read_only_through_the_validated_parse() {
     let (_, dir) = crate::testkit::host_root("deploy-offer-read");
@@ -494,11 +509,44 @@ fn the_offer_file_is_read_only_through_the_validated_parse() {
     assert!(offer::read(&write("edited.json", edited.as_bytes())).is_err());
     let link = dir.join("link.json");
     std::os::unix::fs::symlink(dir.join("good.json"), &link).unwrap();
-    assert!(offer::read(&link).is_err());
-    // Trailing blanks are valid JSON, so only the size cap can refuse this one.
+    assert_eq!(
+        offer::read(&link).unwrap_err(),
+        "--offer is a symbolic link"
+    );
+    // The size cap is inclusive: trailing blanks are valid JSON, so only the cap can refuse
+    // the one-over file, and the one at the cap is read.
     let mut big = good.clone();
-    big.resize(offer::MAX_OFFER as usize + 1, b' ');
-    assert!(offer::read(&write("big.json", &big)).is_err());
+    big.resize(offer::MAX_OFFER as usize, b' ');
+    assert!(offer::read(&write("at-cap.json", &big)).is_ok());
+    big.push(b' ');
+    let over = offer::read(&write("big.json", &big)).unwrap_err();
+    assert!(over.contains("larger than"), "{over}");
+    // Not a regular file: a directory, and a FIFO (which must not block the open).
+    let not_file = offer::read(&dir).unwrap_err();
+    assert_eq!(not_file, "--offer is not a regular file");
+    let fifo = dir.join("fifo.json");
+    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    assert_eq!(
+        offer::read(&fifo).unwrap_err(),
+        "--offer is not a regular file"
+    );
+    // A refusal never repeats what the file held, however the parse failed.
+    let secret = "SECRET-MARKER-9";
+    let typed = text.replace(
+        "\"created\": ",
+        &format!("\"created\": \"{secret}\", \"x\": "),
+    );
+    let unknown = text.replacen('{', &format!("{{\"{secret}\": 1,"), 1);
+    let bad_hash = text.replace(Fields::good().set_hash.as_str(), secret);
+    for (name, body) in [("typed", typed), ("unknown", unknown), ("hash", bad_hash)] {
+        assert_ne!(body, text, "{name}");
+        let e = offer::read(&write(&format!("{name}.json"), body.as_bytes())).unwrap_err();
+        assert!(!e.contains(secret), "{name}: {e}");
+    }
+    let e = offer::read(&write("edited2.json", edited.as_bytes())).unwrap_err();
+    assert!(e.contains("reversible"), "{e}");
     assert!(offer::read(&dir.join("absent.json")).is_err());
 }
 
@@ -531,7 +579,7 @@ impl crate::run::Runner for std::sync::Arc<Plays> {
 /// bytes behind.
 ///
 /// Mutants planted: the probe returning `Ok(None)`; the commit check removed; `run_as` not
-/// passed on.
+/// passed on; the exit code not checked.
 #[test]
 fn the_host_probe_unpacks_the_binary_and_reads_its_meta_log() {
     let (_, dir) = crate::testkit::host_root("deploy-offer-probe");
@@ -587,6 +635,9 @@ fn the_host_probe_unpacks_the_binary_and_reads_its_meta_log() {
             .is_err()
     );
     assert!(run(String::new(), 3).0.is_err());
+    // A non-zero exit refuses even when stdout is a good answer.
+    let failed = run(version("\"meta_log\":4,", short), 3).0.unwrap_err();
+    assert!(text(failed).contains("ended"));
     assert!(run("not json".into(), 0).0.is_err());
     let not_a_tarball = HostProbe::new(
         dir.join("work"),
@@ -848,7 +899,7 @@ fn the_host_binary_is_attested_before_it_is_run() {
     assert_eq!(probe.meta_log(&commit, &tar, Some(b"att")), Ok(Some(4)));
     assert_eq!(
         *yes.seen.lock().unwrap(),
-        vec![(tar.clone(), b"att".to_vec())]
+        vec![(TARGET.to_owned(), tar.clone(), b"att".to_vec())]
     );
     assert_eq!(run.asked.lock().unwrap().len(), 1);
 }
@@ -1000,4 +1051,106 @@ fn the_gh_attestation_check_verifies_the_bytes_it_is_given() {
     std::fs::write(dir.join("blocker"), b"").unwrap();
     let stuck = check(0, trusted_host(), dir.join("blocker").join("work"), false);
     assert!(stuck.verify(&commit, b"t", b"b").is_err());
+}
+
+/// (d) Proves a plan (no `--apply`) runs the same bundle checks an apply does, so a dry run
+/// cannot say OK for a bundle the apply would refuse: a bundle of another set, a tarball the
+/// sums do not name, an unattested host binary and a `meta_log` other than the offer's are
+/// each refused in plan mode, with nothing uploaded; the good bundle plans (exit 0, no
+/// upload, no update). The probe and the attestation run in a plan too: they are read-only (a scratch
+/// directory, the pinned `gh`, the binary as the unprivileged user) and need no `--apply`.
+/// Catches `check_bundle` skipped unless applying.
+///
+/// Mutants planted: `check_bundle` only when `apply`; the plan returning before the probe.
+#[test]
+fn a_plan_runs_the_bundle_checks_an_apply_would() {
+    let plan = |fields: &Fields, bundle: Vec<u8>, says: Result<Option<u64>, String>| {
+        deploy_mode(
+            false,
+            policy(Stage::Gamma, fields.doc()),
+            Some(bundle),
+            &Says(says),
+        )
+    };
+    let mut other_set = Fields::good();
+    other_set.set_hash = SetHash::of_sums(b"another set").as_str().to_owned();
+    let (f, s) = plan(&other_set, good_bundle(), Ok(Some(4)));
+    refused(&f, &s, "offer_set_mismatch");
+
+    let mut swapped = files();
+    swapped[0].1 = b"not the file the sums name".to_vec();
+    let bundle = bundle_of(&swapped, Some(&sums_of(&files())));
+    let (f, s) = plan(&Fields::good(), bundle, Ok(Some(4)));
+    refused(&f, &s, "offer_file_mismatch");
+
+    let (f, s) = plan(&Fields::good(), good_bundle(), Ok(Some(9)));
+    refused(&f, &s, "offer_meta_log_mismatch");
+
+    let (f, s) = plan(&Fields::good(), good_bundle(), Err("no".into()));
+    refused(&f, &s, "offer_probe_failed");
+
+    let (f, s) = plan(&Fields::good(), good_bundle(), Ok(Some(4)));
+    assert_eq!((s.exit, s.reason.as_str()), (0, ""), "{}", s.line());
+    assert_eq!(f.requests("PUT"), 0, "{}", s.line());
+    assert_eq!(f.requests("POST"), 0, "{}", s.line());
+}
+
+/// (d) Proves that with two platforms' attestations in the bundle, the one verified is the
+/// host's `kbf` against the host's own attestation, for the deployed commit, and only that
+/// one: the other platform's tarball and attestation are never shown to the check. Catches an
+/// attestation looked up for another platform, a tarball paired with the wrong attestation,
+/// and a check given another commit.
+///
+/// Mutants planted: the attestation taken from the first `kbf.attestation` of any platform;
+/// the platform filter on the tarball removed; the commit passed to `verify` replaced.
+#[test]
+fn only_the_hosts_kbf_is_attested_against_its_own_attestation() {
+    let (_, dir) = crate::testkit::host_root("deploy-offer-attest-platform");
+    let short = &TARGET[..12];
+    let said = format!(
+        "{{\"commit\":\"{short}\",\"meta_log\":4,\"min_protocol\":3,\"profile\":\"release\",\"protocol\":4,\"state_schema\":1,\"version\":\"0.1.0\"}}"
+    );
+    // The darwin tarball sorts first, so a lookup that ignores the platform finds it first.
+    let mut files = files();
+    files[0].1 = gz_kbf();
+    files.swap(0, 1);
+    let host_tar = files[1].1.clone();
+    assert_eq!(files[1].0, tar_name("kbf", "linux-x86_64"));
+    let sums = sums_of(&files);
+    let mut fields = Fields::good();
+    fields.set_hash = SetHash::of_sums(&sums).as_str().to_owned();
+    let mut all = files.clone();
+    all.push((
+        format!("{}.attestation", files[0].0),
+        b"att-darwin".to_vec(),
+    ));
+    all.push((format!("{}.attestation", files[1].0), b"att-linux".to_vec()));
+    let mut refs: Vec<(&str, &[u8])> = all
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
+    refs.push(("SHA256SUMS", &sums));
+    let vouch = Vouches::new(Ok(()));
+    let run = std::sync::Arc::new(Plays {
+        stdout: said,
+        code: 0,
+        timed_out: false,
+        asked: Default::default(),
+    });
+    let probe = HostProbe::new(
+        dir.join("work"),
+        None,
+        Box::new(run),
+        Box::new(vouch.clone()),
+    );
+    let (_, s) = deploy_probing(
+        policy(Stage::Gamma, fields.doc()),
+        Some(tarball(&refs)),
+        &probe,
+    );
+    assert_eq!(s.exit, 0, "{}", s.line());
+    assert_eq!(
+        *vouch.seen.lock().unwrap(),
+        vec![(TARGET.to_owned(), host_tar, b"att-linux".to_vec())]
+    );
 }

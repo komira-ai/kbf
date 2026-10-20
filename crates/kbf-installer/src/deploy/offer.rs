@@ -30,11 +30,12 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::io::Read;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use kbf_gate::{OfferDoc, SetHash, Target};
+use kbf_gate::{DocError, OfferDoc, SetHash, Target};
 use sha2::{Digest, Sha256};
 
 use super::bundle::{Bundle, Entry};
@@ -113,17 +114,35 @@ fn refuse(reason: &'static str, detail: impl Into<String>) -> Refused {
 }
 
 /// Read `offer.json`: a regular file of at most [`MAX_OFFER`] bytes, parsed only through
-/// [`OfferDoc::from_bytes`].
+/// [`OfferDoc::from_bytes`]. The file is opened once, without following a link, and judged
+/// and read through that descriptor, so nothing can be swapped between the check and the
+/// read. A refusal never repeats the file's contents.
 pub fn read(path: &Path) -> Result<OfferDoc, String> {
-    let meta = fs::symlink_metadata(path).map_err(why("--offer"))?;
+    // O_NONBLOCK so that opening a FIFO cannot hang; a regular file reads the same.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => "--offer is a symbolic link".to_owned(),
+            _ => format!("--offer: {e}"),
+        })?;
+    let meta = file.metadata().map_err(why("--offer"))?;
     if !meta.file_type().is_file() {
         return Err("--offer is not a regular file".to_owned());
     }
-    if meta.len() > MAX_OFFER {
+    let mut bytes = Vec::new();
+    file.take(MAX_OFFER + 1)
+        .read_to_end(&mut bytes)
+        .map_err(why("--offer"))?;
+    if bytes.len() as u64 > MAX_OFFER {
         return Err(format!("--offer is larger than {MAX_OFFER} bytes"));
     }
-    let bytes = fs::read(path).map_err(why("--offer"))?;
-    OfferDoc::from_bytes(&bytes).map_err(why("--offer"))
+    OfferDoc::from_bytes(&bytes).map_err(|e| match e {
+        DocError::Offer(refusal) => format!("--offer: offer document: {refusal}"),
+        // A JSON error can quote the value it met; say only that the file is not an offer.
+        _ => "--offer: not a valid offer document".to_owned(),
+    })
 }
 
 impl OfferPolicy {

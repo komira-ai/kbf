@@ -43,7 +43,7 @@ values then come only from the root-owned config. Scope the sudoers rule to the 
 list too, with no wildcard: `deploy --apply --json --commit` followed by forty `[0-9a-f]`
 classes, then `--offer <the path of offer.json>` and `--bundle -`. `--offer` is the one new flag
 a sudo caller may give; the rule pins its path, and the file is read only as a regular file of
-at most 64 KiB, through the same validated parse every reader of an offer uses.
+at most 64 KiB (opened once, without following a link, and read through that descriptor), through the same validated parse every reader of an offer uses.
 
 The token in the token file is the operator token the proxy checks on every route but its
 probes. Where `setup` puts that file is the proxy's design (`docs/design/frontend-proxy.md`,
@@ -73,13 +73,26 @@ release it is about to move is the one the offer is for. Nothing is taken from a
   the file those sums name, by its bytes (`offer_file_mismatch`). A bundle with no
   `SHA256SUMS`, or no bundle, refuses (`offer_set_unverified`): the deploy cannot say which set
   it moves. Attestation bundles are not in the sums; they are verified offline downstream.
-- **The `meta_log`**: the `kbf` of the host's platform in the bundle is unpacked to a scratch
-  directory under the installer's work directory and run as `kbf --version --json`, as the
-  installer's `RUN_AS` user (never root; as itself in a plan). Its `meta_log` must equal the
+- **The `meta_log`**: the `kbf` of the host's platform in the bundle is first attested offline
+  (the installer's pinned `gh` and trust root, the flags the stage uses, on copies in a scratch
+  directory; a tarball with no attestation in the bundle, or one that does not verify, is
+  `offer_set_unverified` and nothing of it is unpacked or run). Only then is it unpacked to a
+  scratch directory under the installer's work directory and run as `kbf --version --json`, as
+  the installer's `RUN_AS` user (never root; as itself in a plan). Its `meta_log` must equal the
   offer's, `null` included both ways: a binary naming none where the offer claims one, or the
   reverse, is refused (`offer_meta_log_mismatch`). This closes the offer's `meta_log` being
-  supplied by an operator as files. The binary is not attested yet when it runs; its answer can
-  only refuse a deploy, and the frontend's own update still verifies the attestation.
+  supplied by an operator as files. The answer can only refuse a deploy.
+- **A plan checks the same.** Without `--apply` the set, the files, the attestation and the
+  probe all run (they only read and write a scratch directory, and run an attested binary as
+  the unprivileged user); only the upload and the update are skipped. A dry run therefore
+  cannot say OK for a bundle the apply would refuse.
+- **What the offer does not prove.** It is an unsigned record. Its `previous` and
+  `previous_meta_log` are not checked against the running farm, so the bake must not treat
+  `reversible` as proof that a rollback works: it says what the offer's author wrote, derived
+  from numbers nobody here confirmed. Only the host platform's `kbf` is attested at deploy
+  time. The other platforms' tarballs are bound only by `SHA256SUMS`, and `SHA256SUMS` only by
+  the offer's `set_hash`, which is itself unsigned; the frontend's offline attestation check
+  at update time is the backstop for them.
 - **Age**: `created` may be at most `--offer-max-age-h` hours old (default 72;
   `offer_stale`) and at most 300 s ahead of the host's clock (`offer_future`).
 - **Platforms**: every platform the farm runs (the nodes' and the host's) is one the offer found
