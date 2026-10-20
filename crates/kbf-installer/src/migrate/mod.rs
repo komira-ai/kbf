@@ -231,6 +231,10 @@ mod coverage_tests;
 #[cfg(test)]
 mod floor_tests;
 #[cfg(test)]
+mod kit_host;
+#[cfg(test)]
+mod kit_host_tests;
+#[cfg(test)]
 mod lock_tests;
 #[cfg(test)]
 mod moved_tests;
