@@ -17,7 +17,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn toml_file(body: &str) -> PathBuf {
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = kbf_host::testkit::scratch(&format!("database-{n}"));
+    let dir = kbf_host::testkit::scratch(&format!("database-{}-{n}", std::process::id()));
     let file = dir.join("installer.toml");
     fs::write(&file, body).expect("written");
     file
