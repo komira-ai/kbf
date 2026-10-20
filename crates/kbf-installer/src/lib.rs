@@ -53,6 +53,7 @@ pub mod activate;
 pub mod app;
 pub mod archive;
 pub mod attest;
+pub mod backup;
 pub mod binary;
 pub mod cli;
 pub mod darwin;
@@ -60,8 +61,9 @@ pub mod database;
 pub mod deploy;
 pub mod envoy;
 pub mod exit;
-#[cfg(test)]
-mod fixtures;
+pub mod fetch;
+#[cfg(any(test, feature = "testkit"))]
+pub mod fixtures;
 #[cfg(any(test, feature = "testkit"))]
 pub mod golden;
 pub mod helper;
@@ -71,6 +73,7 @@ pub mod migrate;
 pub mod proxy;
 pub mod proxy_verb;
 pub mod record;
+pub mod record_release;
 pub mod refusal;
 pub mod release;
 pub mod run;

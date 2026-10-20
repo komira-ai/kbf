@@ -210,7 +210,9 @@ impl Release {
     fn bundled(&self) -> Vec<(String, String)> {
         self.sums()
             .into_iter()
-            .filter(|(_, name)| name.ends_with(".tar.gz") || name.ends_with(".deb"))
+            .filter(|(_, name)| {
+                name.ends_with(".tar.gz") || name.ends_with(".deb") || name.ends_with(".pkg")
+            })
             .collect()
     }
 
@@ -218,7 +220,13 @@ impl Release {
     /// `dist` (distinct bytes: an attestation covers a digest), listed in `SHA256SUMS`
     /// (sorted by name, as `sums assemble` leaves it).
     fn add_deb(&self, platform: &str) -> String {
-        let name = format!("kbf-installer-{COMMIT}-{platform}.deb");
+        self.add_package(platform, "deb")
+    }
+
+    /// Adds the `kbf-installer` package of `platform` with the extension `ext` (`deb`, or
+    /// `pkg` for the Mac's), as [`Release::add_deb`] does.
+    fn add_package(&self, platform: &str, ext: &str) -> String {
+        let name = format!("kbf-installer-{COMMIT}-{platform}.{ext}");
         let bytes = format!("the kbf-installer package for {platform}");
         std::fs::write(self.dist.join(&name), &bytes).expect("deb");
         let mut lines: Vec<String> = std::fs::read_to_string(self.dist.join("SHA256SUMS"))
@@ -970,6 +978,44 @@ fn with_deb(name: &str) -> (Release, String) {
     let deb = r.add_deb("linux-x86_64");
     r.attest(None);
     (r, deb)
+}
+
+#[test]
+fn the_mac_package_is_verified_like_the_deb_for_provenance_and_its_own_bundle() {
+    // Catches: a `.pkg` in the macOS SHA256SUMS refused as "neither a tarball, a package
+    // nor an SBOM" (verify-darwin-arm64 failing on the first push that lists one), a `.pkg`
+    // verified without its bundle, asked for an SBOM attestation it does not have, and the
+    // package controls (its bundle verifying the tarball and the reverse) not run for it.
+    let one = [("darwin-arm64", &["kbf-installer"][..])];
+    let r = Release::build_with("pkg-good", &one);
+    let pkg = r.add_package("darwin-arm64", "pkg");
+    r.attest(None);
+    let (code, out, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(0), "{err}: {out}");
+    assert!(
+        out.lines()
+            .any(|l| l == format!("verified: {pkg} (provenance, bundle)")),
+        "{out}"
+    );
+    let calls = r.gh_calls();
+    let path = r.dist.join(&pkg);
+    let on_pkg: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.starts_with(&format!("attestation verify {} ", s(&path))))
+        .collect();
+    assert_eq!(on_pkg.len(), 4, "{on_pkg:#?}");
+    assert!(
+        on_pkg.iter().all(|c| !c.contains(SBOM_PREDICATE)),
+        "{on_pkg:#?}"
+    );
+    // Its bundle is required: removed, the listing is refused.
+    std::fs::remove_file(r.bundle_of(&pkg)).expect("remove");
+    let (code, _, err) = r.verify(WORKFLOW, None);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.contains(&format!("{pkg}: no provenance bundle")),
+        "{err}"
+    );
 }
 
 #[test]

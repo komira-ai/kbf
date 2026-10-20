@@ -34,6 +34,16 @@ pub const PROXY_UNITS: &[&str] = &["kbf-proxy.socket", "kbf-proxy.service"];
 /// The frontend instance a host without the proxy runs.
 const FRONTEND_UNIT: &str = "kbf-frontend.service";
 pub const INSTALLER_UNIT: &str = "kbf-installer.service";
+/// The daily backup of the state database (`kbf-backup.service` is what it starts): enabled on
+/// the modes that keep their state in Postgres, started with them when `--no-start` is absent
+/// (the schema it dumps is made earlier in the same run).
+pub const BACKUP_TIMER: &str = "kbf-backup.timer";
+/// The unit the timer starts, and the drop-in that gives it its `User=` and state directory: the package's file
+/// carries neither, and its `AssertPathExists=` on this drop-in fails it rather than run as
+/// root where setup has not written it.
+pub const BACKUP_SERVICE_DIR: &str = "/etc/systemd/system/kbf-backup.service.d";
+pub const BACKUP_USER_DROPIN: &str =
+    "/etc/systemd/system/kbf-backup.service.d/10-service-user.conf";
 /// The longest token file setup reads.
 const MAX_TOKEN_BYTES: u64 = 4096;
 
@@ -86,6 +96,26 @@ fn service_user_name(mode: Mode) -> &'static str {
         Mode::Frontend | Mode::Storage => "kbf-server",
         Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne => "kbf",
     }
+}
+
+/// The state directory under `/var/lib` the backup unit of a mode makes: the one the mode's
+/// own unit makes (the frontend's `kbf-server`, the all-in-one unit's `kbf`), so the backups
+/// sit in the directory of the user that owns them and no stray directory is made.
+fn backup_state_dir(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Frontend | Mode::Storage => "kbf-server",
+        Mode::Daemon | Mode::StorageAndDaemon | Mode::AllInOne => "kbf",
+    }
+}
+
+/// The drop-in text that makes `kbf-backup.service` run as `user`, the mode's service user (the
+/// one `service_user_name` names), with the mode's state directory `state`: `StateDirectory=`
+/// and the verb's `--dir` are set together, since the packaged unit carries the frontend's.
+/// The names are a fixed set, so nothing here needs escaping.
+pub fn backup_user_dropin(user: &str, state: &str) -> String {
+    format!(
+        "# Written by `kbf-installer setup`: the user the backup runs as and the state directory it\n# writes to, those of the mode's own unit. The package's kbf-backup.service carries neither.\n[Service]\nUser={user}\nStateDirectory=\nStateDirectory={state}\nExecStart=\nExecStart=/usr/bin/kbf-installer --apply backup --dir /var/lib/{state}/backups\n"
+    )
 }
 
 /// Whether the host runs actions in containers: it then needs a subid range and lingering.
@@ -433,6 +463,23 @@ fn operator_token(
     Ok(())
 }
 
+/// Take the unit files `shadows` out of `/etc/systemd/system`, each after a copy of its
+/// bytes is in the migration's backup directory (root's 0700, where the originals of the
+/// migration are): a crash between the two leaves the file in place and the copy made, and a
+/// run again finishes. Nothing is deleted that was not first kept.
+pub fn retire(exec: &dyn Exec, ctx: &Ctx, shadows: &[super::Shadow]) -> Result<Plan, SetupError> {
+    let view = View(exec);
+    let mut p = Planner::new(&view);
+    let backup = format!("{}/migration-units", ctx.layout.state_dir());
+    dir(&mut p, &backup, 0o700, ctx.root)?;
+    for shadow in shadows {
+        let kept = format!("{backup}/{}", crate::migrate::retired_name(shadow.unit));
+        file(&mut p, &kept, 0o600, ctx.root, shadow.bytes.clone())?;
+        p.absent(hp(&shadow.path)?)?;
+    }
+    Ok(p.finish())
+}
+
 /// The part after the first release: `kbf.toml`, then the units. `released` says whether a
 /// release is installed (or, in a dry run, would be). Reads the host, changes nothing.
 pub fn after_release(
@@ -442,6 +489,7 @@ pub fn after_release(
     ctx: &Ctx,
     released: bool,
     no_start: bool,
+    retired: &[&str],
 ) -> Result<Outcome, SetupError> {
     let view = View(exec);
     let mut p = Planner::new(&view);
@@ -489,7 +537,7 @@ pub fn after_release(
         Decision::Refuse(why) => return Err(SetupError::NeedsOperator(why)),
     }
 
-    units(&mut p, os, v, ctx.platform, released, no_start, &mut notes)?;
+    notes.extend(units(&mut p, os, v, ctx, released, no_start, retired)?);
     Ok(Outcome {
         plan: p.finish(),
         notes,
@@ -500,11 +548,12 @@ fn units(
     p: &mut Pl<'_, '_>,
     os: &dyn Os,
     v: &Valid,
-    platform: Platform,
+    ctx: &Ctx,
     released: bool,
     no_start: bool,
-    notes: &mut Vec<String>,
-) -> Result<(), SetupError> {
+    retired: &[&str],
+) -> Result<Vec<String>, SetupError> {
+    let mut notes = Vec::new();
     // The mode's units are started when the operator did not forbid it and a release is
     // there to run. The installer's own service has nothing to wait for. A unit that makes a
     // frontend is never started here: starting one takes the state database and the public
@@ -529,7 +578,7 @@ fn units(
     } else {
         true
     };
-    match platform {
+    match ctx.platform {
         Platform::MacOs => {
             let wanted = [
                 (MAC_INSTALLER_LABEL, !no_start),
@@ -552,12 +601,42 @@ fn units(
                     "{FRONTEND_UNIT} is enabled and the proxy starts the frontend itself: setup does not stop or disable it; do both (systemctl disable --now) before starting the proxy, since the two never run together"
                 ));
             }
+                        // The backup runs as the service user, written before the timer is enabled.
+            let mut dropin_changed = false;
+            if v.mode.keeps_state_in_database() {
+                // The name is the one the frontend unit runs as: `service_user_name`, a fixed set.
+                let user = service_user_name(v.mode);
+                dir(p, BACKUP_SERVICE_DIR, 0o755, ctx.root)?;
+                let state = backup_state_dir(v.mode);
+                let changed = file(
+                    p,
+                    BACKUP_USER_DROPIN,
+                    0o644,
+                    ctx.root,
+                    backup_user_dropin(user, state).into_bytes(),
+                )?;
+                // systemd keeps the old definition of a unit until a reload: a drop-in that is
+                // new or changed (a mode change) on a timer that is enabled already needs one
+                // (`systemctl enable` does its own, so a timer enabled below needs none).
+                dropin_changed = changed;
+            }
+            let backup = v
+                .mode
+                .keeps_state_in_database()
+                .then_some((BACKUP_TIMER, !no_start));
             let wanted = mode_units(v.mode, v.proxy.is_some())
                 .iter()
                 .map(|u| (*u, start_mode))
+                .chain(backup)
                 .chain([(INSTALLER_UNIT, !no_start)]);
+            // A unit file was taken out of `/etc/systemd/system`: systemd reads the packaged
+            // unit of that name from the next reload, and it is enabled whatever was said of
+            // the old file (the enable symlink of the old file named the same unit).
+            if !retired.is_empty() || (dropin_changed && os.unit_enabled(BACKUP_TIMER)?) {
+                p.run(Cmd::new(hp(SYSTEMCTL)?).arg("daemon-reload"));
+            }
             for (unit, now) in wanted {
-                if !os.unit_enabled(unit)? {
+                if retired.contains(&unit) || !os.unit_enabled(unit)? {
                     let mut cmd = Cmd::new(hp(SYSTEMCTL)?).arg("enable");
                     if now {
                         cmd = cmd.arg("--now");
@@ -567,5 +646,5 @@ fn units(
             }
         }
     }
-    Ok(())
+    Ok(notes)
 }

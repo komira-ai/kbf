@@ -184,6 +184,11 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
     for unit in &journal.units {
         if units::restore(&rules, &units_dir, &backup, unit)? {
             report.line(mode, format!("{unit}: the original is back"));
+        } else if units::unretire(&rules, &units_dir, &backup, unit)? {
+            report.line(
+                mode,
+                format!("{unit}: the file setup retired is back (it had no original)"),
+            );
         }
     }
     svc.reload().map_err(MigrateError::io("daemon-reload"))?;

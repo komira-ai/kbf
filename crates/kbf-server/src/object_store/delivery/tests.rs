@@ -18,6 +18,7 @@ use super::super::tests::{Counting, SENTINEL, as_store, bind, fake, name, put, s
 use super::*;
 use crate::members::{Members, MembershipConfig, Progress, Registrant};
 use crate::stores::{DEFAULT_MIN_PUT_RATE, DEFAULT_REGION};
+use kbf_testkit::dir::TestDir;
 
 const SECOND: &str = "SECOND-s3-secret-0a1b2c3d4e5f";
 
@@ -48,7 +49,8 @@ fn bound(registry: &Registry) {
 #[test]
 fn a_connection_without_a_binding_is_generation_zero() {
     let store = as_store(&fake());
-    let (registry, source) = source(&store, &scratch("src-none").join("s"));
+    let root = scratch("src-none");
+    let (registry, source) = source(&store, &root.join("s"));
     assert_eq!(source.snapshot().expect("snapshot").generation, 0);
     registry
         .put_connection(&name("cold"), &put(SENTINEL))
@@ -65,7 +67,8 @@ fn a_connection_without_a_binding_is_generation_zero() {
 #[test]
 fn a_snapshot_is_the_binding_the_connection_and_the_secret_at_one_generation() {
     let store = as_store(&fake());
-    let (registry, source) = source(&store, &scratch("src-whole").join("s"));
+    let root = scratch("src-whole");
+    let (registry, source) = source(&store, &root.join("s"));
     bound(&registry);
     let snapshot = source.snapshot().expect("snapshot");
     assert_eq!(snapshot.generation, 2);
@@ -121,7 +124,8 @@ fn a_snapshot_is_the_binding_the_connection_and_the_secret_at_one_generation() {
 #[test]
 fn an_unset_region_and_rate_are_delivered_as_the_verified_defaults() {
     let store = as_store(&fake());
-    let (registry, source) = source(&store, &scratch("src-defaults").join("s"));
+    let root = scratch("src-defaults");
+    let (registry, source) = source(&store, &root.join("s"));
     registry
         .put_connection(&name("cold"), &put(SENTINEL))
         .expect("connection");
@@ -143,7 +147,8 @@ fn explicit_region_and_rate_are_delivered_unchanged_each_without_the_other() {
         ("src-rate", None, Some(4096)),
     ] {
         let store = as_store(&fake());
-        let (registry, source) = source(&store, &scratch(label).join("s"));
+        let root = scratch(label);
+        let (registry, source) = source(&store, &root.join("s"));
         let mut connection = put(SENTINEL);
         connection.region = region.map(str::to_owned);
         connection.min_put_rate = rate.and_then(std::num::NonZeroU64::new);
@@ -260,7 +265,8 @@ fn raced(dir: &Path, writes: Option<u64>) -> (RegistrySource, Arc<AtomicU64>) {
 // never the new key under the old generation (or the old endpoint with the new key).
 #[test]
 fn a_write_between_the_pieces_makes_the_reading_again() {
-    let (source, turns) = raced(&scratch("src-race").join("s"), Some(1));
+    let root = scratch("src-race");
+    let (source, turns) = raced(&root.join("s"), Some(1));
     let snapshot = source.snapshot().expect("snapshot");
     assert_eq!(turns.load(Ordering::SeqCst), 1, "the rotation landed once");
     assert_eq!(snapshot.generation, 3, "the rotation made generation 3");
@@ -274,7 +280,8 @@ fn a_write_between_the_pieces_makes_the_reading_again() {
 // the constant allows, each of which the rival disturbed once.
 #[test]
 fn a_registry_that_never_holds_still_is_a_store_failure() {
-    let (source, turns) = raced(&scratch("src-churn").join("s"), None);
+    let root = scratch("src-churn");
+    let (source, turns) = raced(&root.join("s"), None);
     let err = source.snapshot().expect_err("it never settles");
     assert_eq!(err, SourceError::Store);
     assert_eq!(turns.load(Ordering::SeqCst), READINGS as u64);
@@ -286,7 +293,8 @@ fn a_registry_that_never_holds_still_is_a_store_failure() {
 #[test]
 fn a_failing_state_store_is_an_error_not_an_empty_registration() {
     let inner = as_store(&fake());
-    let dir = scratch("src-down").join("s");
+    let root = scratch("src-down");
+    let dir = root.join("s");
     let (registry, _) = source(&inner, &dir);
     bound(&registry);
     let down = Arc::new(AtomicBool::new(false));
@@ -308,7 +316,8 @@ fn a_failing_state_store_is_an_error_not_an_empty_registration() {
 #[test]
 fn a_secret_file_that_is_gone_is_secret_unavailable() {
     let store = as_store(&fake());
-    let dir = scratch("src-gone").join("s");
+    let root = scratch("src-gone");
+    let dir = root.join("s");
     let (registry, source) = source(&store, &dir);
     bound(&registry);
     for entry in std::fs::read_dir(&dir).expect("dir") {
@@ -363,11 +372,14 @@ struct Rig {
     members: Arc<Members>,
     acks: Arc<Acks>,
     registry: Arc<Registry>,
+    /// Last: the registry's secret files outlive every use of it.
+    _root: TestDir,
 }
 
 fn rig(label: &str) -> Rig {
     let store = as_store(&fake());
-    let (registry, _) = source(&store, &scratch(label).join("s"));
+    let root = scratch(label);
+    let (registry, _) = source(&store, &root.join("s"));
     let members = members(&store);
     let acks = Arc::new(Acks::new(Arc::clone(&store)));
     Rig {
@@ -379,6 +391,7 @@ fn rig(label: &str) -> Rig {
         members,
         acks,
         registry,
+        _root: root,
     }
 }
 
@@ -513,7 +526,8 @@ fn interleaved(
 #[test]
 fn a_store_that_fails_mid_reading_is_a_store_failure() {
     let inner = as_store(&fake());
-    let dir = scratch("src-mid").join("s");
+    let root = scratch("src-mid");
+    let dir = root.join("s");
     let (registry, _) = source(&inner, &dir);
     bound(&registry);
     let down = Arc::new(AtomicBool::new(false));
@@ -537,7 +551,8 @@ fn a_store_that_fails_mid_reading_is_a_store_failure() {
 #[test]
 fn acks_that_cannot_be_read_show_no_nodes() {
     let store = as_store(&fake());
-    let (registry, _) = source(&store, &scratch("rep-acks-down").join("s"));
+    let root = scratch("rep-acks-down");
+    let (registry, _) = source(&store, &root.join("s"));
     let members = members(&store);
     let (acks_store, down) = interleaved(Arc::clone(&store), Box::new(|| {}));
     let acks = Arc::new(Acks::new(acks_store));
@@ -606,7 +621,8 @@ fn rig_with_clock(label: &str) -> (Rig, Arc<kbf_state::ManualClock>) {
         kbf_state::fake::Flaw::None,
     ));
     let store = as_store(&fake);
-    let (registry, _) = source(&store, &scratch(label).join("s"));
+    let root = scratch(label);
+    let (registry, _) = source(&store, &root.join("s"));
     let members = Arc::new(Members::new(
         Arc::clone(&store),
         MembershipConfig {
@@ -627,6 +643,7 @@ fn rig_with_clock(label: &str) -> (Rig, Arc<kbf_state::ManualClock>) {
             members,
             acks,
             registry,
+            _root: root,
         },
         clock,
     )
