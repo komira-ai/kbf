@@ -4,6 +4,8 @@ Status: design, nothing built beyond what is marked [F]. Data before visuals: th
 
 It builds on `invocations.md` and `invocations-api.md` (the per-build record and its read API) and on `architecture-v2.md` (frontend serves REAPI, scheduler and UI; a state store behind the `kbf-state` trait, SQLite and Postgres first; sharded storage). It does not redo them; it lists what the UI adds.
 
+The UI itself (pages, access, serving, tests, rollout) is designed in [kbf-ui-v1.md](kbf-ui-v1.md); where the two differ on serving or access, that document wins (its R0 rewrites the `--read-listen` and SQLite text here).
+
 ## Summary
 
 The UI is a set of read-only pages over one JSON read API; an agent calls the same API and sees everything a page shows. What it answers, and what is missing today:
