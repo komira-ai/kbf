@@ -3,7 +3,7 @@
 Status: built in `crates/kbf-installer/src/deploy/`. It drives the update API the frontend's
 proxy serves (`docs/design/frontend-proxy.md`, sections 4, 5 and 9), frontend first.
 
-`kbf-installer deploy --commit <40hex> --stage gamma|prod --offer offer.json --apply [--json] [--bundle -]` runs on the frontend host, as root, and drives the frontend's public port through one release.
+`kbf-installer deploy --commit <40hex> --stage gamma|prod --offer offer.json|- --apply [--json] [--bundle -]` runs on the frontend host, as root, and drives the frontend's public port through one release.
 It orders no node, sets no desired release and rolls nothing back: it asks the update API to
 swap the frontend, waits for that update to be `done`, and then watches the nodes, which the
 new frontend rolls (one storage node at a time) once it has baked.
@@ -42,9 +42,10 @@ environment carries `SUDO_UID`, set to the caller's uid), `deploy` refuses `--ap
 `--offer-max-age-h` with exit 2: the caller would choose where root sends the token and which file it reads. Those
 values then come only from the root-owned config. Scope the sudoers rule to the exact argument
 list too, with no wildcard: `deploy --apply --json --commit` followed by forty `[0-9a-f]`
-classes, then `--offer <the path of offer.json>` and `--bundle -`. `--offer` is the one new flag
-a sudo caller may give; the rule pins its path, and the file is read only as a regular file of
-at most 64 KiB (opened once, without following a link, and read through that descriptor), through the same validated parse every reader of an offer uses.
+classes, then `--offer -` and `--bundle -`. `--offer` is the one flag a sudo caller may give, and
+only as `-`: the offer is the `offer.json` in the bundle (see "The offer"), so the caller names no
+file for root to read, and any other value is exit 2. `HOST_FLAGS` in `deploy/cli.rs` is the list
+of flags refused there (public, so that what builds the argument list can test it holds none).
 
 The token in the token file is the operator token the proxy checks on every route but its
 probes. Where `setup` puts that file is the proxy's design (`docs/design/frontend-proxy.md`,
@@ -67,14 +68,17 @@ creates or copies the token.
 
 The sudoers rule is a held step for the person who owns the host's accounts; no code writes
 it. Install it with `visudo -f /etc/sudoers.d/kbf-deploy` (mode 0440, root:root), as one line
-with no wildcard, where `ACCOUNT` is the deploy account, `OFFER` the absolute path of the
-`offer.json` the pipeline copies to the host, and `[0-9a-f]` is repeated forty times for the
-commit:
+with no wildcard, where `ACCOUNT` is the deploy account and `[0-9a-f]` is repeated forty times
+for the commit:
 
 ```
-ACCOUNT ALL=(root) NOPASSWD: /usr/bin/kbf-installer deploy --apply --json --commit [0-9a-f]...[0-9a-f] --offer OFFER --bundle -
+ACCOUNT ALL=(root) NOPASSWD: /usr/bin/kbf-installer deploy --apply --json --commit [0-9a-f]...[0-9a-f] --offer - --bundle -
 Defaults!/usr/bin/kbf-installer env_reset
 ```
+
+The offer and the release travel in one tar on standard input (`--offer -` reads the offer from
+it), so the pipeline writes no file on the host: there is no path for the rule to pin and no
+second command that could write one.
 
 Nothing else is allowed through `sudo`: the flags `deploy` refuses there (`--api`, `--token-file`,
 `--config`, `--stage`, `--no-offer`, ...) are exactly the ones that would let the caller choose
@@ -87,6 +91,17 @@ where root sends the token, and the rule does not list `SSL_CERT_FILE` or `SSL_C
 It is a record, not a command: the deploy does not act on what it says, it refuses unless the
 release it is about to move is the one the offer is for. Nothing is taken from a file name.
 
+- **Where the offer is**: a file (`--offer offer.json`, read as a regular file of at most 64 KiB,
+  opened once without following a link and read through that descriptor), or the bundle's own
+  (`--offer -`, which needs `--bundle -`, and is the only form `sudo` allows). In the bundle it
+  is the entry named exactly `offer.json`: one entry, not empty, at most 64 KiB, read and not
+  uploaded (`Offer.json` and `offer.json.attestation` are no release file, so they are exit 2
+  as any stray entry is). Either way it is parsed only through the validated `OfferDoc` parse,
+  and every check below is the same. A bundle with no such entry is refused as `offer_missing`
+  and one whose entry is not an offer as `offer_unreadable`; neither repeats what the entry
+  held. The bundle's offer can be read only once the bundle is, so the `offer` step passes for
+  it, and its record in the summary and its stage, commit and age checks (`offer_wrong_stage`,
+  `offer_wrong_commit`, `offer_future`, `offer_stale`) happen in the `bundle` step.
 - **Which stage this host is** (`--stage gamma|prod`, else the `stage` key of
   `/etc/kbf-installer/deploy.json`): the offer's `target` must be it. The stage is the host's
   own, never read from the offer and never given by a `sudo` caller, so an offer for prod
@@ -114,10 +129,21 @@ release it is about to move is the one the offer is for. Nothing is taken from a
   probe all run (they only read and write a scratch directory, and run an attested binary as
   the unprivileged user); only the upload and the update are skipped. A dry run therefore
   cannot say OK for a bundle the apply would refuse.
-- **What the offer does not prove.** It is an unsigned record. Its `previous` and
-  `previous_meta_log` are not checked against the running farm, so the bake must not treat
-  `reversible` as proof that a rollback works: it says what the offer's author wrote, derived
-  from numbers nobody here confirmed. Only the host platform's `kbf` is attested at deploy
+- **Reversibility**: an offer that claims `reversible: true` is checked against the build this
+  host runs now. The host runs `<current release>/kbf --version --json` as the installer's
+  `RUN_AS` user (never root; as itself in a plan) and takes its `meta_log`; the claim holds only
+  if the offer's `meta_log` is at most that number. A running build that names none, or does
+  not answer, is unknown, and unknown is not reversible: the claim is refused as
+  `offer_reversible_overclaim` before the first upload. A claim that holds is recorded as
+  `offer.host_reversible: true`. An offer that claims `reversible: false` is not asked: the
+  probe is not run, the deploy goes on, and the summary has no `host_reversible`. An
+  irreversible release is deployed all the same; it is the bake that must know it cannot go
+  back. The offer's `previous` and `previous_meta_log` stay the author's word: they are
+  recorded, never checked against the farm.
+- **What the offer does not prove.** It is an unsigned record. `host_reversible` reads the build
+  of the frontend host only: a node still at another commit than the host's `current` one is
+  not covered, so the bake must not treat `reversible` as proof that a rollback works on every
+  node. Only the host platform's `kbf` is attested at deploy
   time. The other platforms' tarballs are bound only by `SHA256SUMS`, and `SHA256SUMS` only by
   the offer's `set_hash`, which is itself unsigned; the frontend's offline attestation check
   at update time is the backstop for them.
@@ -126,11 +152,13 @@ release it is about to move is the one the offer is for. Nothing is taken from a
 - **Platforms**: every platform the farm runs (the nodes' and the host's) is one the offer found
   complete (`offer_platform`).
 
-All of them are checked before the first upload, in the steps `offer` (stage, commit, age), then
-`bundle` (set, files, `meta_log`) and `preflight` (platforms); a refusal is exit 3 and the farm
-is untouched. The summary's `offer` object carries the offer's `commit`, `set_hash`, `created`,
-`reversible`, `previous`, `meta_log` and `previous_meta_log`, copied from the validated document,
-for the bake's hand-off file; the deploy does not write that file itself. Not built: the offer
+All of them are checked before the first upload, in the steps `offer` (stage, commit, age of a
+file's offer), then `bundle` (a bundle's offer, set, files, `meta_log`, `reversible`) and
+`preflight` (platforms); a refusal is exit 3 and the farm is untouched. The summary's `offer`
+object carries the offer's `commit`, `set_hash`, `created`, `reversible`, `previous`, `meta_log`
+and `previous_meta_log`, copied from the validated document, and the host's own `host_reversible`
+when it confirmed the claim, for the bake's hand-off file; the deploy does not write that file
+itself. Not built: the offer
 does not yet bound the generation (`expect_generation`), which stays with the update API.
 
 ## Steps
@@ -139,7 +167,8 @@ Each is a named entry in the summary's `steps`, with its duration.
 
 1. `bundle`: with `--bundle -`, a tar on standard input holding
    `<name>-<commit>-<platform>.tar.gz` and the same plus `.attestation`, for `kbf` and
-   `kbf-daemon` only. Any other entry is exit 2 before an upload. Each file is
+   `kbf-daemon` only, and the two entries read and not uploaded: `SHA256SUMS` and, for
+   `--offer -`, `offer.json`. Any other entry is exit 2 before an upload. Each file is
    `PUT /v1/releases/{commit}/{platform}/{name}`; other bytes under a stored key is 409, exit 3.
    This is bytes, not trust: every node and the frontend's own update verify the
    attestation offline.

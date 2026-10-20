@@ -155,6 +155,12 @@ pub struct OfferRecord {
     pub meta_log: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_meta_log: Option<u64>,
+    /// `Some(true)` when the offer claims `reversible` and this host confirmed it against
+    /// the `meta_log` of the build it runs now (`offer::check_reversible`); the offer's own
+    /// word is `reversible` above. Absent when the offer claims no reversibility (nothing was
+    /// asked of the host) or no offer was checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_reversible: Option<bool>,
 }
 
 impl OfferRecord {
@@ -169,6 +175,7 @@ impl OfferRecord {
             previous: None,
             meta_log: None,
             previous_meta_log: None,
+            host_reversible: None,
         }
     }
 
