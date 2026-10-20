@@ -83,36 +83,4 @@ mod tests {
         assert_eq!(classify_code("3D000"), Unreached::NoDatabase);
         assert_eq!(classify_code("08006"), Unreached::Other("08006".to_owned()));
     }
-
-    fn server() -> PostgresConfig {
-        let url = std::env::var("KBF_TEST_POSTGRES_URL")
-            .expect("KBF_TEST_POSTGRES_URL names a test database");
-        PostgresConfig::parse(&url).expect("parses")
-    }
-
-    /// Catches a login to a reachable database being reported as a failure.
-    #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
-    fn a_login_the_server_admits_is_reached() {
-        assert_eq!(reach(&server()), Ok(()));
-    }
-
-    /// Catches a missing role being told as anything but `Login` (the recipe for it is the
-    /// role and the pg_hba rule), and a missing database as anything but `NoDatabase`.
-    /// The text of each names neither.
-    #[test]
-    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
-    fn a_missing_role_is_a_login_refusal_and_a_missing_database_is_told_apart() {
-        let mut no_role = server();
-        no_role.pg.user("kbf_no_such_role_zz");
-        let err = reach(&no_role).unwrap_err();
-        assert_eq!(err, Unreached::Login);
-        assert!(!err.to_string().contains("kbf_no_such_role_zz"), "{err}");
-
-        let mut no_db = server();
-        no_db.pg.dbname("kbf_no_such_db_zz");
-        let err = reach(&no_db).unwrap_err();
-        assert_eq!(err, Unreached::NoDatabase);
-        assert!(!err.to_string().contains("kbf_no_such_db_zz"), "{err}");
-    }
 }

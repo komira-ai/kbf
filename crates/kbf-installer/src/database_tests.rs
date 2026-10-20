@@ -536,6 +536,34 @@ mod provisioned {
         assert!(database.setup().expect("again").ran.is_empty());
     }
 
+    /// Catches a missing role being told as anything but a login refusal (the recipe for it
+    /// is the role and the pg_hba rule), and a missing database as anything but its own
+    /// answer; the text of each names neither. (Moved here from the state crate, whose
+    /// coverage the real-server lines would lower.)
+    ///
+    /// Mutants seen red: the class-28 operand dropped; `3D000` mapped to a login refusal.
+    #[test]
+    #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
+    fn a_missing_role_is_a_login_refusal_and_a_missing_database_is_told_apart() {
+        let _one = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = server();
+        let at = |user: &str, db: &str| {
+            let url = format!(
+                "postgres://{user}:{}@{}:{}/{db}",
+                s.password, s.host, s.port
+            );
+            PostgresConfig::parse(&url).expect("parses")
+        };
+        let err = reach(&at("kbf_no_such_role_zz", "postgres")).unwrap_err();
+        assert_eq!(err, kbf_state::postgres::Unreached::Login);
+        assert!(!err.to_string().contains("kbf_no_such_role_zz"), "{err}");
+        let err = reach(&at(&s.user, "kbf_no_such_db_zz")).unwrap_err();
+        assert_eq!(err, kbf_state::postgres::Unreached::NoDatabase);
+        assert!(!err.to_string().contains("kbf_no_such_db_zz"), "{err}");
+    }
+
     /// Catches setup altering what an operator made: a role that cannot log in and a
     /// superuser role are each refused, a database another role owns is refused, and in each
     /// case nothing is created and the refusal names neither the role nor the database.

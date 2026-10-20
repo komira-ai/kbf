@@ -1030,4 +1030,5 @@ fn a_closed_output_stops_setup_at_each_database_line() {
         let err = result.expect_err(needle);
         assert!(matches!(err, SetupError::Io(_)), "{needle}: {err}");
     }
+    std::io::Write::flush(&mut Closes("")).expect("flush");
 }
