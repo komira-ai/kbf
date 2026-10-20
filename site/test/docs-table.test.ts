@@ -27,7 +27,12 @@ test('every source of the table is a file of the repository', () => {
 
 test('every document under docs/ is published or excluded on purpose, and every exclusion exists', () => {
   const listed = new Set([...DOCS.map((d) => d.source), ...EXCLUDE]);
-  assert.deepEqual(markdownUnder('docs').filter((f) => !listed.has(f)), []);
+  assert.deepEqual(
+    markdownUnder('docs').filter((f) => !listed.has(f)),
+    [],
+    'a document under docs/ is not in the docs table: add a row for it to site/tools/docs-table.ts ' +
+      '(or list it in EXCLUDE), then run `npm run golden` in site/ and commit test/golden.manifest (CONTRIBUTING.md, "Documentation")',
+  );
   assert.deepEqual(EXCLUDE.filter((f) => !existsSync(join(REPO, f))), []);
   assert.deepEqual(EXCLUDE.filter((f) => DOCS.some((d) => d.source === f)), [], 'a file is either published or excluded');
 });
