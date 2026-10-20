@@ -300,6 +300,56 @@ mod tests {
         assert_eq!(code_of(ExitStatus::from_raw(15)), 143);
     }
 
+    /// Catches a `crun` that is aborted (its future dropped, which `Running::force` does
+    /// when the grace after `cgroup.kill` runs out) and is still there, alive or a
+    /// zombie, when the drop returns: the clean then ran `crun delete` beside a
+    /// `crun run` that had not been reaped. Each round starts a child that publishes its
+    /// pid through a fifo (the test blocks on the read, no timer), drops the `execute`
+    /// future, and looks for the pid at once. Rounds repeat so a child that dies fast
+    /// enough on its own cannot hide a driver that does not wait.
+    #[test]
+    fn a_dropped_crun_is_reaped_before_the_drop_returns() {
+        let dir = crate::unit_dir("crun-dropped-reaped");
+        let fifo = dir.join("pid");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RWXU,
+            0,
+        )
+        .expect("mkfifo");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        for round in 0..25 {
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg("echo $$ > \"$1\"; exec sleep 600")
+                .arg("sh")
+                .arg(&fifo);
+            let pid = runtime.block_on(async {
+                let mut run = Box::pin(KillOnDrop.execute(command));
+                let read = fifo.clone();
+                let published = tokio::task::spawn_blocking(move || {
+                    std::fs::read_to_string(read).expect("the child's pid")
+                });
+                let pid = tokio::select! {
+                    _ = &mut run => panic!("round {round}: sleep 600 ended"),
+                    pid = published => pid.expect("reader").trim().to_owned(),
+                };
+                drop(run);
+                pid
+            });
+            assert!(
+                !Path::new("/proc").join(&pid).exists(),
+                "round {round}: pid {pid} is still there after its future was dropped"
+            );
+        }
+    }
+
     /// The `Io` hook `crun run` is given has nothing to close once the child has the
     /// files (the crate calls it for `create` and `exec`, not `run`).
     #[tokio::test]
