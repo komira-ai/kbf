@@ -50,6 +50,7 @@ fn frontend() -> (SocketAddr, Arc<Hooked>) {
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
+        default_platform: kbf_front::DefaultPlatform::NONE,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
         streams: kbf_server::StreamTiming::default(),
