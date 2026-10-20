@@ -190,21 +190,22 @@ async fn the_platform_is_matched_before_the_spread() {
     linux_c.no_work().await;
 }
 
-/// Catches: an action at a node's whole memory starved by spreading, and a hold that
-/// does not keep later work off the node. Two nodes of 4 cores and 8 GiB hold two small
-/// leases each. An action that books 8 GiB, the whole of a node, fits nowhere, so it holds
-/// the node with the fewest leases, the first by name on a tie (`node-a`): the small
-/// action submitted behind it goes to `node-b`, where least-booked placement alone would
-/// have taken `node-a` (a tie, then the name). When `node-a`'s two leases end, the
-/// action starts on it with the node's 8 GiB.
+/// The contract of an action at a node's whole memory: callers wait for it. Two nodes of
+/// 4 cores and 8 GiB hold two small leases each. An action that books 8 GiB, the whole of
+/// a node, fits nowhere, and no node is held for it: the small action submitted behind it
+/// goes to `node-a`, which least-booked placement gives it (a tie, then the name). When
+/// `node-a`'s leases have all ended, the action starts on it with the node's 8 GiB.
+///
+/// Catches: a hold for whole-memory actions, which would keep `node-a` from the work
+/// behind it and send that to `node-b`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_whole_node_action_holds_a_node_and_starts_when_it_empties() {
+async fn a_whole_node_action_waits_for_a_node_to_empty_and_holds_none() {
     const HOST: Size = &[("kbf-book-mem-gib", "8")];
     let cell = Cell::start().await;
     let mut a = cell.daemon("node-a", 4, 8).await;
     let mut b = cell.daemon("node-b", 4, 8).await;
     let _small = hold(&cell, "small", &[], &[DEFAULT; 4]).await;
-    let on_a = starts(&mut a).await;
+    let mut on_a = starts(&mut a).await;
     assert_eq!((on_a.len(), starts(&mut b).await.len()), (2, 2));
 
     let _host = hold(&cell, "host", &[], &[HOST]).await;
@@ -212,12 +213,10 @@ async fn a_whole_node_action_holds_a_node_and_starts_when_it_empties() {
     b.no_work().await;
 
     let _later = hold(&cell, "later", &[], &[DEFAULT]).await;
-    assert_eq!(
-        starts(&mut b).await.len(),
-        1,
-        "work behind the held action goes to the other node"
-    );
-    a.no_work().await;
+    let behind = starts(&mut a).await;
+    assert_eq!(behind.len(), 1, "work behind it is not kept off node-a");
+    on_a.extend(behind);
+    b.no_work().await;
 
     let result = output(&cell, "small output", 0).await;
     for start in &on_a {
@@ -226,32 +225,4 @@ async fn a_whole_node_action_holds_a_node_and_starts_when_it_empties() {
     let host = a.start().await;
     assert_eq!(host.memory_bytes, 8 << 30, "the whole node");
     b.no_work().await;
-}
-
-/// Catches: an action holding a node because another node is smaller than it. `node-a`
-/// has 4 GiB and `node-b` 16: an action that books 2 cores and 8 GiB is "at the whole
-/// memory" of `node-a` by the comparison alone, though that node cannot run it, and
-/// once held `node-b`, so a one-core action then waited with a core free there. `node-a`
-/// holds four leases and `node-b` three (each takes the next lease in turn, `node-a`
-/// first), so neither has two cores for the action; it holds nothing, and the one-core
-/// action starts on `node-b`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_node_too_small_for_an_action_does_not_make_it_hold_another() {
-    const WIDE: Size = &[("kbf-book-cpus", "2"), ("kbf-book-mem-gib", "8")];
-    let cell = Cell::start().await;
-    let mut a = cell.daemon("node-a", 4, 4).await;
-    let mut b = cell.daemon("node-b", 4, 16).await;
-    let _small = hold(&cell, "small", &[], &[DEFAULT; 7]).await;
-    assert_eq!(
-        (starts(&mut a).await.len(), starts(&mut b).await.len()),
-        (4, 3)
-    );
-
-    let _wide = hold(&cell, "wide", &[], &[WIDE]).await;
-    a.no_work().await;
-    b.no_work().await;
-
-    let _later = hold(&cell, "later", &[], &[DEFAULT]).await;
-    assert_eq!(starts(&mut b).await.len(), 1, "a core is free on node-b");
-    a.no_work().await;
 }

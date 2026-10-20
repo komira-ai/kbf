@@ -53,6 +53,12 @@ RuntimeDirectoryPreserve=yes
 # `--check` loads the whole file the way a run does and exits 2 on a bad table.
 ExecStartPre=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml --check
 ExecStart=/usr/bin/kbf-installer proxy --config /etc/kbf/installer.toml
+# `systemctl reload` is SIGHUP to the proxy: it re-reads the server certificate, key and client
+# CA and swaps them in as one unit, and no open stream is cut. The command exits 0 at once; a
+# rejected file shows only as one journal line from the proxy and as
+# kbf_proxy_tls_reload_failed_total, with the old files still served. The renewal hook runs it
+# after the last file is in place. Not a restart: that would end every stream.
+ExecReload=/bin/kill -HUP $MAINPID
 KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=15

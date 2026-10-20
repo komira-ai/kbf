@@ -63,6 +63,8 @@ fn one_apply_converges_a_fresh_mac() {
             "CHANGE xcode: installed Xcode 18A000 at /Applications/Xcode-27.0.app",
             "CHANGE default_developer_dir: xcode-select -s /Applications/Xcode-27.0.app/Contents/Developer",
             "CHANGE launchd_label: wrote /usr/local/etc/kbf/kbf.toml, root's, mode 644",
+            "CHANGE launchd_label: /var/db/kbf-installer root's, mode 755",
+            "CHANGE launchd_label: /var/db/kbf-installer/orders _kbf's, mode 700",
             "CHANGE launchd_label: wrote /Library/LaunchDaemons/org.example.kbf-daemon.plist and restarted the job (error log truncated)",
         ]
     );
@@ -85,6 +87,8 @@ fn one_apply_converges_a_fresh_mac() {
     for (path, want) in [
         (PLIST, "-rw-r--r-- 0 0"),
         (CONFIG, "-rw-r--r-- 0 0"),
+        ("/var/db/kbf-installer", "drwxr-xr-x 0 0"),
+        ("/var/db/kbf-installer/orders", "drwx------ 480 480"),
         ("/usr/local/etc/kbf", "drwxr-xr-x 0 0"),
         (DROPIN, "-rw-r--r-- 0 0"),
         ("/Library/Logs/kbf", "drwxr-xr-x 0 0"),

@@ -439,12 +439,11 @@ fn config_for(state: &Path) -> Config {
     ))
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-enroll-config-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+/// A directory removed when it drops, its path canonical.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
     // Resolve a symlinked temp dir (macOS) so the walk below sees real directories.
-    std::fs::canonicalize(&dir).unwrap()
+    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    kbf_testkit::dir::TestDir::under(temp, &format!("kbf-enroll-config-{name}"))
 }
 
 fn mkdir(path: &Path, mode: u32) {

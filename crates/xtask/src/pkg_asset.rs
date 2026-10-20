@@ -105,10 +105,10 @@ fn architecture(platform: Platform) -> &'static str {
 }
 
 /// One regular file of a tar: its path without a leading `./` or `/`, its mode, bytes.
-struct Member {
-    path: String,
-    mode: u32,
-    bytes: Vec<u8>,
+pub(crate) struct Member {
+    pub(crate) path: String,
+    pub(crate) mode: u32,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// What a tar reader's error says of the archive.
@@ -117,7 +117,7 @@ fn not_a_tar(e: std::io::Error) -> String {
 }
 
 /// The regular files of the gzip-compressed tar `tgz`.
-fn members(tgz: &[u8]) -> Result<Vec<Member>, String> {
+pub(crate) fn members(tgz: &[u8]) -> Result<Vec<Member>, String> {
     let mut tar = Vec::new();
     flate2::read::GzDecoder::new(tgz)
         .read_to_end(&mut tar)

@@ -59,12 +59,14 @@ env:
   CYCLONEDX_SHA256_AARCH64_DARWIN: 4c53dfa21e70b65bf7f8d2592aadde3bcb02c1a40b6ec63b877e5ca65a29e180
   CYCLONEDX_SHA256_X86_64_LINUX: fb8dbee9f182173e062a64a387b21a0badc6fab8b2abf9294973f012972bf6d8
   CYCLONEDX_SHA256_AARCH64_LINUX: 7bf131ca5389b07a4f10c182bcf8a5ad339d64408b6f0d8f6834a0bd6120a06a
-  # The kbf-installer package (deb) of each Linux job: nfpm builds it, and its trust directory
+  # The kbf-installer package of each job (the deb of a Linux job, the .pkg of the macOS one): nfpm builds the deb, and its trust directory
   # holds a pinned gh. Both are release archives checked against their SHA-256 before use (the
   # values the projects publish with them, recomputed when pinned; the archive's, not the program's).
   GH_VERSION: 2.102.0
   GH_SHA256_X86_64_LINUX: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
   GH_SHA256_AARCH64_LINUX: 7862c86c72f43df3a2d93ddde6f473285b4e2af61b494849846827e513ef6484
+  # The macOS arm64 zip of the same release, for the .pkg's trust directory.
+  GH_SHA256_AARCH64_DARWIN: da922c20d1792e5b2cbf375593d7a658acf034c12c84e007e71c76ef959c337e
   NFPM_VERSION: 2.48.0
   NFPM_SHA256_X86_64_LINUX: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
   NFPM_SHA256_AARCH64_LINUX: a9a75213763783b7669719e505474c748c5ad7dc66591a195619deb50f85c2f4
@@ -88,6 +90,8 @@ jobs:
       TARGET: aarch64-apple-darwin
       # The oldest macOS the binaries support: a property of the build, not of the runner.
       MACOSX_DEPLOYMENT_TARGET: "14.0"
+      # The branch the package trusts, and is attested for; see linux-x86_64.
+      PKG_SOURCE_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -144,6 +148,29 @@ jobs:
         run: cargo xtask build-commit check-asset "dist/kbf-$GITHUB_SHA-darwin-arm64.tar.gz" "$GITHUB_SHA"
       - name: The packaged kbf-installer names the commit and a release build
         run: cargo xtask build-commit check-asset "dist/kbf-installer-$GITHUB_SHA-darwin-arm64.tar.gz" "$GITHUB_SHA"
+      # The kbf-installer package (packaging/macos/README.md): the signed binary of this job, the
+      # real LaunchDaemon property list, and a trust directory of the pinned gh, the Sigstore trusted
+      # root and an installer.conf that trusts the branch this commit is attested on
+      # (`PKG_SOURCE_REF`: the pushed branch on a push), at the paths the installer's macOS layout
+      # reads. A Mac has what it needs to verify a release offline from this one file. Installer
+      # installs it as root on this runner and every file, owner and mode is checked, and that no job
+      # started; `pkg-macos-asset` then refuses it unless it holds the binary of the tarball checked
+      # above and trusts that branch, and lists it in SHA256SUMS. The package is not signed (no
+      # Developer ID): Gatekeeper does not open it by double click, and `installer -pkg` or MDM does.
+      - name: Fetch the pinned gh, for the package's trust directory
+        run: cargo xtask fetch --url "https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_macOS_arm64.zip" --sha256 "$GH_SHA256_AARCH64_DARWIN" --out "$RUNNER_TEMP/tools/gh" --extract zip --member "gh_${GH_VERSION}_macOS_arm64/bin/gh"
+      - name: Fetch the Sigstore trusted root with the pinned gh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: $RUNNER_TEMP/tools/gh attestation trusted-root > "$RUNNER_TEMP/trusted_root.jsonl"
+      - name: Write the package's trust directory
+        run: cargo xtask pkg-trust --gh "$RUNNER_TEMP/tools/gh" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl" --source-ref "$PKG_SOURCE_REF" --out target/pkg-trust
+      - name: Build the kbf-installer package
+        run: cargo xtask pkg build --binary "target/$TARGET/release/kbf-installer" --launchd-plist packaging/macos/com.komira.kbf-installer.plist --trust target/pkg-trust/gh --trust target/pkg-trust/installer.conf --trust target/pkg-trust/trusted_root.jsonl --version-of "target/$TARGET/release/kbf-installer" --out target/pkg/out
+      - name: Install the package as root, and check what it placed and that nothing started
+        run: cargo xtask pkg-macos-install-test --package target/pkg/out --probe "/usr/local/kbf-installer/trust/gh --version::gh version $GH_VERSION" --probe "/usr/local/kbf-installer/bin/kbf-installer --version --json::${GITHUB_SHA:0:12}"
+      - name: The package is the attested binary and trusts this branch, and is an asset
+        run: cargo xtask pkg-macos-asset --package target/pkg/out --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-darwin-arm64.tar.gz" --expect-ref "$PKG_SOURCE_REF" --gh "$RUNNER_TEMP/tools/gh" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-darwin-arm64
@@ -685,6 +712,14 @@ jobs:
         env:
           BUNDLE: ${{ steps.provenance-kbf-installer-darwin-arm64.outputs.bundle-path }}
         run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-darwin-arm64.tar.gz.sigstore.json"
+      - id: provenance-kbf-installer-pkg-darwin-arm64
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kbf-installer-${{ github.sha }}-darwin-arm64.pkg
+      - name: Name the bundle of the kbf-installer package for darwin-arm64
+        env:
+          BUNDLE: ${{ steps.provenance-kbf-installer-pkg-darwin-arm64.outputs.bundle-path }}
+        run: cp "$BUNDLE" "dist/kbf-installer-${GITHUB_SHA}-darwin-arm64.pkg.sigstore.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bundles-darwin-arm64
@@ -749,7 +784,7 @@ jobs:
   # that was pushed (`--source-ref "$GITHUB_REF"`), with read-only scopes, on the macOS files.
   # The files are assembled again into a SHA256SUMS that must be byte for byte the one the
   # sums job published and the attest job signed, then checked against it, then each verified.
-  # Each tarball is also verified against its own bundle; see verify-linux.
+  # Each tarball and the package is also verified against its own bundle; see verify-linux.
   verify-darwin-arm64:
     needs: [attest-darwin-arm64]
     if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/arch-v2') }}
@@ -789,3 +824,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_WORKFLOW_REF" --source-ref "$GITHUB_REF" --commit "$GITHUB_SHA" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
+      - name: The signed darwin-arm64 package holds the attested binary and trusts this branch
+        run: cargo xtask pkg-macos-asset --verify-only --package "dist/kbf-installer-$GITHUB_SHA-darwin-arm64.pkg" --commit "$GITHUB_SHA" --binary-tarball "dist/kbf-installer-$GITHUB_SHA-darwin-arm64.tar.gz" --expect-ref "$GITHUB_REF"
