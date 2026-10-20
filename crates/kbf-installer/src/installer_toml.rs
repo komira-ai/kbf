@@ -460,6 +460,7 @@ fn render_proxy(p: &ProxyConfig, out: &mut String) {
     out.push_str(&format!("proxy_auth_file = {}\n", path(&p.proxy_auth_file)));
     out.push_str(&format!("state_dir = {}\n", path(&p.state_dir)));
     out.push_str(&format!("hold_max_s = {}\n", p.hold_max_s));
+    out.push_str(&format!("ui = {}\n", p.ui));
     for cert in &p.server_cert {
         out.push_str("\n[[proxy.server_cert]]\n");
         let names: Vec<String> = cert.names.iter().map(|n| toml_string(n)).collect();
