@@ -347,7 +347,7 @@ async fn start<O: ObjectStore>(
         None,
         (log, Fixed(store), prefix, id),
         (|| Ok(pending::<()>()), &repair_dir),
-        None,
+        (None, None),
         rebuild,
     )
     .await
