@@ -985,6 +985,45 @@ fn stage_copies_and_records_the_release_and_moves_no_link() {
     );
 }
 
+/// Catches a release that `install` makes current staying staged as well: with B staged, the
+/// install of B makes it current (A previous) and nothing is staged; with C staged, the
+/// install of B leaves C staged (another release's decision is not this one's).
+///
+/// Mutants planted: `staged` kept by the switch; `staged` cleared whatever it names.
+#[test]
+fn installing_the_staged_release_makes_it_current_and_no_longer_staged() {
+    let stage_on = |exec: &mut ScratchHost, root: &Layout, commit: &str, from: &Path| {
+        let a = Install {
+            commit: c(commit),
+            from: from.to_owned(),
+        };
+        stage(exec, root, me(), &a, Mode::Apply, &mut Vec::new()).expect("stage");
+    };
+    for (staged, want) in [(B, None), (C, Some(c(C)))] {
+        let (mut exec, root) = host(&format!("install-staged-{staged}"));
+        let a = source(&format!("install-staged-a-{staged}"), "kbf A", None);
+        let b = source(&format!("install-staged-b-{staged}"), "kbf B", None);
+        let other = source(&format!("install-staged-c-{staged}"), "kbf C", None);
+        install_on(&mut exec, &root, A, &a, Mode::Apply).expect("install A");
+        stage_on(
+            &mut exec,
+            &root,
+            staged,
+            if staged == B { &b } else { &other },
+        );
+        assert_eq!(state_of(&root).staged, Some(c(staged)));
+
+        install_on(&mut exec, &root, B, &b, Mode::Apply).expect("install B");
+        let s = state_of(&root);
+        assert_eq!(
+            (s.current, s.previous),
+            (Some(c(B)), Some(c(A))),
+            "{staged}"
+        );
+        assert_eq!(s.staged, want, "{staged}");
+    }
+}
+
 /// Catches a stage that replaces a release or leaves a half copy: a release directory with
 /// other bytes is refused and keeps its bytes, and a source with nothing to copy is
 /// refused before the lock.
