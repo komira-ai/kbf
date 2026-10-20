@@ -13,7 +13,8 @@
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
 //! | `meta/members_formed` | nothing | for ever: the cluster has had an `Active` member |
 //! | `meta/members_forming` | nothing | a minute from the first `Active` member |
-//! | `unfilled/<id>` | nothing | for ever, until the member is made `Active` |
+//! | `unfilled/<id>` | nothing, or the fill phase of [`Handoff`] (module `handoff`) | for ever, until the member is made `Active` |
+//! | `meta/tail_epoch` | the tail epoch, 8 bytes | for ever (written only with [`Members::with_handoff`]) |
 //! | `deny/<kind>/<value>` | the reason and the time it was added | for ever, until [`Members::allow`] |
 //!
 //! and the counters `member-id` and `boot/<id>`. The store assigns both numbers, so no
@@ -69,7 +70,9 @@
 //!
 //! **Joiners.** A node the farm has not seen before, registering after the farm's first
 //! bootstrap minute, is `Joining` with an `unfilled/<id>` mark and is promoted by
-//! [`Members::set_state`] only (module `join`); the paragraph below is for the others.
+//! [`Members::set_state`] (module `join`), or, with [`Members::with_handoff`], by its own
+//! beat once it is filled (modules `fence` and `promote`); the paragraph below is for the
+//! others.
 //!
 //! **Promotion.** A node's own request moves it in two ways only. A registration saying the
 //! index is whole ([`Progress::CaughtUp`]) writes `Active`, so a rolling restart leaves
@@ -107,23 +110,29 @@ use std::time::Duration;
 use kbf_map::{DenyEntry, Map, MapError, Member, MemberId, MemberState, Rule};
 use kbf_mapsync::{MapSource, RETAINED_MAPS};
 use kbf_proto::kbf::map::v1 as pb;
-use kbf_state::{Cond, Store, StoreError, StoreTime, Txn, Version, Versioned};
+use kbf_state::{Cond, Store, StoreError, StoreTime, Txn, Versioned};
 use prost::Message as _;
 use tokio::sync::watch;
 
 use crate::storage_health::{
-    Debts, MemberReport, NotIdle, Planned, Report, Reported, StorageHealth, Writes, node_idle,
-    storage_health,
+    MemberReport, NotIdle, Planned, Report, Reported, StorageHealth, node_idle, storage_health,
 };
 use crate::worker::named_protocol;
 
 mod denials;
 pub use denials::Denial;
 mod assign;
+mod blocked;
+mod fence;
+mod handoff;
 mod join;
 mod pins;
+mod promote;
+mod row;
 pub use assign::{LastBoot, MAX_SEED};
+pub use handoff::{Block, Fill, Handoff, fill_fp};
 use pins::pin_key;
+use row::{Live, decode_row, encode_row};
 mod look;
 pub use look::{MemberLook, MembersLook};
 
@@ -327,130 +336,6 @@ pub enum MembershipError {
     Map(#[from] MapError),
 }
 
-/// A stored member row: the member as the map will hold it, its boot counter, the newest
-/// debts report and the protocol version its node registered with.
-#[derive(Clone, PartialEq, prost::Message)]
-struct Row {
-    #[prost(message, optional, tag = "1")]
-    member: Option<pb::Member>,
-    #[prost(uint64, tag = "2")]
-    boot: u64,
-    #[prost(message, optional, tag = "3")]
-    report: Option<StoredReport>,
-    /// The `protocol` of the registration that wrote the row. 0 is absent: a row written
-    /// before this field existed (or by a registration that named none) reads as a node
-    /// whose version is not known ([`named_protocol`]).
-    #[prost(uint32, tag = "4")]
-    protocol: u32,
-    /// The store's clock, in nanoseconds, at which an operator's planned restart of this
-    /// member ends (0: none). Past it, a heartbeat of the member returns it to `Active`.
-    /// A frontend built before this field existed drops it when it rewrites the row, so
-    /// a plan outlives it there: no plan while one serves the same store.
-    #[prost(uint64, tag = "5")]
-    planned_until_nanos: u64,
-}
-
-/// [`Report`] as stored.
-#[derive(Clone, PartialEq, prost::Message)]
-struct StoredReport {
-    #[prost(bool, tag = "1")]
-    known: bool,
-    #[prost(uint64, tag = "2")]
-    debts: u64,
-    /// The store's clock at receipt, in nanoseconds.
-    #[prost(uint64, tag = "3")]
-    at_nanos: u64,
-    #[prost(bool, tag = "4")]
-    writes_known: bool,
-    #[prost(uint64, tag = "5")]
-    open_writes: u64,
-    /// The map generation the node held when it reported.
-    #[prost(uint64, tag = "6")]
-    generation: u64,
-}
-
-impl From<&Report> for StoredReport {
-    fn from(report: &Report) -> Self {
-        let (known, debts) = report.said.debts.to_wire();
-        let (writes_known, open_writes) = report.said.writes.to_wire();
-        Self {
-            known,
-            debts,
-            at_nanos: u64::try_from(report.at.as_duration().as_nanos()).unwrap_or(u64::MAX),
-            writes_known,
-            open_writes,
-            generation: report.said.generation,
-        }
-    }
-}
-
-impl From<&StoredReport> for Report {
-    fn from(stored: &StoredReport) -> Self {
-        Self {
-            said: Reported {
-                debts: Debts::from_wire(stored.known, stored.debts),
-                writes: Writes::from_wire(stored.writes_known, stored.open_writes),
-                generation: stored.generation,
-            },
-            at: StoreTime::from_duration(Duration::from_nanos(stored.at_nanos)),
-        }
-    }
-}
-
-/// A decoded row and the version it was read at.
-struct Live {
-    member: Member,
-    boot: u64,
-    report: Option<Report>,
-    /// What its registration named; `None` for a row that names none.
-    protocol: Option<u32>,
-    planned_until: Option<StoreTime>,
-    version: Version,
-}
-
-fn decode_row(stored: &Versioned) -> Result<Live, MembershipError> {
-    let row = Row::decode(stored.value.as_slice())
-        .map_err(|e| MembershipError::Corrupt(format!("member row: {e}")))?;
-    let mut member = Member::try_from(row.member.unwrap_or_default())
-        .map_err(|e| MembershipError::Corrupt(format!("member row: {e}")))?;
-    // The row's counter is the authority (a row written before the map named boots has
-    // none inside the member).
-    member.boot = row.boot;
-    Ok(Live {
-        member,
-        boot: row.boot,
-        report: row.report.as_ref().map(Report::from),
-        protocol: named_protocol(row.protocol),
-        planned_until: (row.planned_until_nanos > 0)
-            .then(|| StoreTime::from_duration(Duration::from_nanos(row.planned_until_nanos))),
-        version: stored.version,
-    })
-}
-
-/// The value of the row of `member` at `boot`, for a node that registered naming
-/// `protocol`, with `report` as its newest debts report and `planned_until` the end of an
-/// operator's planned restart.
-fn encode_row(
-    member: &Member,
-    boot: u64,
-    protocol: Option<u32>,
-    report: Option<&Report>,
-    planned_until: Option<StoreTime>,
-) -> Vec<u8> {
-    Row {
-        member: Some(pb::Member::from(member)),
-        boot,
-        report: report.map(StoredReport::from),
-        protocol: protocol.unwrap_or(0),
-        planned_until_nanos: planned_until.map_or(0, |at| {
-            u64::try_from(at.as_duration().as_nanos())
-                .unwrap_or(u64::MAX)
-                .max(1)
-        }),
-    }
-    .encode_to_vec()
-}
-
 fn decode_map(stored: &Versioned) -> Result<Map, MembershipError> {
     let wire = pb::Map::decode(stored.value.as_slice())
         .map_err(|e| MembershipError::Corrupt(format!("map: {e}")))?;
@@ -574,9 +459,9 @@ fn plan(
 /// How a row is rewritten in place.
 #[derive(Clone, Copy)]
 enum Touch {
-    /// A heartbeat of this boot, what it reports and what it says it owes: a whole time to
-    /// live more, and the debts report replaced.
-    Beat(u64, Progress, Reported),
+    /// A heartbeat of this boot, what it reports, what it says it owes and what it says of
+    /// the handoff: a whole time to live more, and the debts report replaced.
+    Beat(u64, Progress, Reported, Fill),
     /// An administrator's state change: the time to live it had.
     State(MemberState),
     /// An administrator's planned restart of an `Active` member: `Down` in the row, with
@@ -605,6 +490,8 @@ pub struct Members {
     generation: watch::Sender<u64>,
     /// The oldest protocol this build accepts: the least floor of any map it makes.
     oldest: u32,
+    /// Automatic promotion of joiners ([`Members::with_handoff`]); `None`: by an operator only.
+    handoff: Option<Handoff>,
 }
 
 impl Members {
@@ -631,7 +518,18 @@ impl Members {
             seen: Mutex::default(),
             generation: watch::Sender::new(0),
             oldest,
+            handoff: None,
         }
+    }
+
+    /// These members with automatic promotion of joiners on ([`Handoff`]; `--auto-promote`):
+    /// a joiner is made `Active` by its own beat when it is filled (module `promote`), and
+    /// [`Members::refresh`] runs the fence that says so (module `fence`). An operator's
+    /// `set_state(Active)` stays the override.
+    #[must_use]
+    pub fn with_handoff(mut self, handoff: Handoff) -> Self {
+        self.handoff = Some(handoff);
+        self
     }
 
     /// Notes `map` as seen: if it is newer than the last, keeps it (and the one it
@@ -688,6 +586,12 @@ impl Members {
         Ok(Arc::new(MemberMap {
             members: Arc::clone(self),
         }))
+    }
+
+    /// The settings of automatic promotion, if it is on ([`Members::with_handoff`]).
+    #[must_use]
+    pub fn handoff(&self) -> Option<Handoff> {
+        self.handoff
     }
 
     /// The configuration.
@@ -808,7 +712,7 @@ impl Members {
             let txn = txn
                 .put_ttl(
                     &key,
-                    encode_row(&member, boot, protocol, None, None),
+                    encode_row(&member, boot, protocol, None, None, Fill::default()),
                     self.config.ttl,
                     cond,
                 )
@@ -851,7 +755,24 @@ impl Members {
         said: Reported,
         holder: Option<&dyn Fn(&str) -> bool>,
     ) -> Result<u64, MembershipError> {
-        if self.touch(id, Touch::Beat(boot, progress, said), holder)? {
+        self.heartbeat_with(id, boot, progress, said, Fill::default(), holder)
+    }
+
+    /// [`Members::heartbeat`] for a node that also says how far its flush and its tail have
+    /// got (`fill`). A joiner's beat that finds it filled promotes it ([`Handoff`]).
+    ///
+    /// # Errors
+    /// As [`Members::heartbeat`].
+    pub fn heartbeat_with(
+        &self,
+        id: MemberId,
+        boot: u64,
+        progress: Progress,
+        said: Reported,
+        fill: Fill,
+        holder: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<u64, MembershipError> {
+        if self.touch(id, Touch::Beat(boot, progress, said, fill), holder)? {
             return Ok(self.refresh()?.map_or(0, |map| map.generation()));
         }
         Ok(self.current_map()?.map_or(0, |map| map.generation()))
@@ -989,19 +910,27 @@ impl Members {
                 return Err(MembershipError::NotHolder(id));
             }
             let before = live.member.state;
+            let mut step = promote::Step::none();
             let ttl = match how {
-                Touch::Beat(boot, _, _) if boot != live.boot => {
+                Touch::Beat(boot, _, _, _) if boot != live.boot => {
                     return Err(MembershipError::Superseded {
                         id,
                         boot,
                         current: live.boot,
                     });
                 }
-                Touch::Beat(_, progress, said) => {
+                Touch::Beat(_, progress, said, fill) => {
                     live.report = Some(Report {
                         said,
                         at: self.store.now(),
                     });
+                    live.fill = fill;
+                    if before == MemberState::Joining {
+                        step = self.beat_step(&live, progress)?;
+                        if step.promote {
+                            live.member.state = MemberState::Active;
+                        }
+                    }
                     if before == MemberState::CatchingUp && progress == Progress::CaughtUp {
                         live.member.state = MemberState::Active;
                     }
@@ -1060,10 +989,12 @@ impl Members {
                     live.protocol,
                     live.report.as_ref(),
                     live.planned_until,
+                    live.fill,
                 ),
                 ttl,
                 Cond::Version(stored.version),
             );
+            put = step.apply(put, id);
             if live.member.state == MemberState::Active && before != MemberState::Active {
                 put = self.formed(put)?;
             }
@@ -1204,11 +1135,22 @@ impl Members {
     /// members whose dwell ran out leave, new and changed rows enter, and the map's deny
     /// list becomes the `deny/` rows ([`Members::denied`]). Returns the map after, and
     /// bumps the generation by one compare-and-set only if something changed (an entry
-    /// added or removed is a change).
+    /// added or removed is a change). With [`Members::with_handoff`] it then moves the
+    /// marks of the joiners along ([`Members::advance`]): a failure of that is logged, never
+    /// returned, since the map is what the caller asked for and the next call tries again.
     ///
     /// # Errors
     /// The store failing; [`MembershipError::Contended`].
     pub fn refresh(&self) -> Result<Option<Map>, MembershipError> {
+        let map = self.refresh_map()?;
+        if let Err(error) = self.advance() {
+            tracing::warn!(%error, "advancing the joiners' handoff failed; tried again at the next refresh");
+        }
+        Ok(map)
+    }
+
+    /// The map's part of [`Members::refresh`].
+    fn refresh_map(&self) -> Result<Option<Map>, MembershipError> {
         for _ in 0..ATTEMPTS {
             let stored = self.store.get(MAP_KEY)?;
             let current = stored.as_ref().map(decode_map).transpose()?;
