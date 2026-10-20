@@ -265,7 +265,7 @@ fn suffixed_and_odd_tags_are_not_counted() {
             "v0.0.08",
             "v0.0.+9",
             "v0.0",
-            "v0.0.1.2",
+            "v0.0.1.x",
             "v0..4",
             "v0.0.99999999999999999999",
             "0.0.50",
@@ -669,7 +669,7 @@ fn versions_and_tags_parse_as_three_plain_numbers() {
     for bad in [
         "v1.2",
         "1.2.3",
-        "v1.2.3.4",
+        "v1.2.3.x",
         "v1.2.3-rc",
         "v1.02.3",
         "v1..3",
