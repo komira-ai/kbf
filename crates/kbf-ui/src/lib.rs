@@ -15,12 +15,15 @@
 //!   new look is a new stylesheet.
 //!
 //! The pages, under [`PREFIX`]: `/ui` (Overview: where the pages are; it reads no route
-//! yet), `/ui/builds` (Builds: look a build up by id; with `?id=`, its
-//! summary from `GET /v1/invocations/{id}`), `/ui/builds/{id}` (Build: the summary
-//! and a page of `GET /v1/invocations/{id}/actions`), and
+//! yet), `/ui/builds` (Builds: the recent builds of `GET /v1/invocations`, filtered by
+//! state and instance; with `?id=`, one build's summary from `GET /v1/invocations/{id}`),
+//! `/ui/builds/{id}` (Build: the summary, a page of `GET /v1/invocations/{id}/failures`
+//! and a page of `.../actions`), and
 //! `/ui/builds/{id}/actions/{digest}` (Action: `GET /v1/invocations/{id}/actions/
-//! {digest}`, with stdout and stderr shown as text when the blob route links them
-//! and they are small; a larger one is a link), and `/ui/updates` (Updates: the
+//! {digest}`; for a failed action its failure class, command and log tails from
+//! `/failures`, each tail with a link that downloads the whole log; else stdout and stderr
+//! shown as text when the blob route links them and they are small; a larger one is a
+//! link), and `/ui/updates` (Updates: the
 //! desired release, the releases, and each host's update, from `GET /v1/update`,
 //! `GET /v1/nodes` and, where it answers, `GET /v1/update/hosts`; read-only, with the
 //! operator-API command to set the desired release shown as text).
@@ -173,7 +176,7 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
         ["builds"] => pages::builds(source, query).await,
         ["builds", id] if !id.is_empty() => pages::build(source, id, query).await,
         ["builds", id, "actions", digest] if !id.is_empty() && !digest.is_empty() => {
-            pages::action(source, id, digest).await
+            pages::action(source, id, digest, query).await
         }
         ["updates"] => pages::updates(source).await,
         _ => pages::not_found(path),
