@@ -3,7 +3,9 @@
 //! /v1/update/pause` and `POST /v1/update/resume`.
 //!
 //! - `GET /v1/update` is open like `GET /v1/nodes`: the desired release (`null` before any),
-//!   and the commits the release store holds with whether each platform is complete.
+//!   and the commits the release store holds with whether each platform is complete. Its
+//!   `proposals` are the releases the poller (`release::poll`) found, oldest first: a
+//!   proposal starts nothing.
 //! - `POST /v1/update/desired {"commit": "<40 hex>"}` offers the commit: the store must hold
 //!   it complete (tarball and attestation) for at least one platform, else `409` naming
 //!   what is missing. The row's generation moves only when the commit differs from the
@@ -43,7 +45,7 @@ use crate::api::{error, json, operator_gate};
 use crate::farm::Farm;
 use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
-use crate::update::{Desired, Policy, Release, RowError, Rows};
+use crate::update::{Desired, Policy, Proposal, Release, RowError, Rows};
 
 struct Update {
     store: Option<Arc<ReleaseStore>>,
@@ -105,6 +107,17 @@ pub(crate) fn desired_view(desired: Option<&Desired>) -> serde_json::Value {
     })
 }
 
+/// A proposal of the release poller as the operator sees it. A proposal starts nothing: the
+/// operator offers the commit with `POST /v1/update/desired`.
+fn proposal_view(p: &Proposal) -> serde_json::Value {
+    json!({
+        "commit": p.commit,
+        "tag": p.tag,
+        "published_at_secs": p.published_at_secs,
+        "proposed_at_ms": p.proposed_at_ms,
+    })
+}
+
 /// The policy row as the operator sees it: durations in seconds.
 pub(crate) fn policy_view(p: &Policy) -> serde_json::Value {
     let secs = |d: std::time::Duration| d.as_secs();
@@ -149,12 +162,17 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
         return unavailable("the release store", "--releases-dir");
     };
     let policy_rows = rows.clone();
+    let proposal_rows = rows.clone();
     let desired = match blocking(move || rows.desired()).await {
         Ok(stored) => stored.value,
         Err(e) => return row_failed(&e),
     };
     let policy = match blocking(move || policy_rows.policy_if_set()).await {
         Ok(policy) => policy,
+        Err(e) => return row_failed(&e),
+    };
+    let proposals = match blocking(move || proposal_rows.proposals()).await {
+        Ok(held) => held,
         Err(e) => return row_failed(&e),
     };
     // Without a policy row nothing is paused (the defaults).
@@ -175,6 +193,7 @@ async fn view(State(update): State<Arc<Update>>) -> Response {
             "desired": desired_view(desired.as_ref()),
             "paused": paused,
             "policy": policy.as_ref().map_or(serde_json::Value::Null, policy_view),
+            "proposals": proposals.iter().map(proposal_view).collect::<Vec<_>>(),
             "releases": releases,
         }),
     )

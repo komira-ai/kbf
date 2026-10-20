@@ -430,3 +430,19 @@ fn the_tail_epoch_fields_are_pinned() {
     let older = pb::HeartbeatResponse::decode(&[0x18, 9][..]).expect("decodes");
     assert_eq!(older.tail_epoch, 0);
 }
+
+// Catches: the fill fingerprint moved to another number or made something other than a
+// varint (a node and a frontend of two builds would compare different values), and an
+// older peer that fails on it. Field 16 takes a two-byte tag (0x80 0x01); a node that sends
+// none writes no bytes, and one that predates it decodes 0, which never equals a real
+// fingerprint of a joiner's pass (the frontend also needs tail_epoch_done).
+#[test]
+fn the_fill_fingerprint_field_is_pinned() {
+    let beat = pb::HeartbeatRequest {
+        fill_fp: 7,
+        ..Default::default()
+    };
+    assert_eq!(beat.encode_to_vec(), [0x80, 0x01, 7], "field 16");
+    let old = pb::HeartbeatRequest::decode(&[0x78, 5][..]).expect("decodes");
+    assert_eq!((old.tail_epoch_done, old.fill_fp), (5, 0));
+}

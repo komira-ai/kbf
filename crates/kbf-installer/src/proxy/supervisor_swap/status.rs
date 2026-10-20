@@ -65,7 +65,14 @@ pub(super) fn assemble(
     let Some(intent) = intent else {
         return SupervisorStatus::default();
     };
-    let serving = if open { serving_live(&intent) } else { active };
+    // An open update whose record has ended (the swap thread has not closed it yet) serves
+    // where the ending says: `serving_live` reads a `failed` record as past the switch.
+    let holds = || parts.admin.role(intent.new_slot).is_ok_and(|r| r.holder);
+    let serving = if open {
+        active_after(&intent, &holds)
+    } else {
+        active
+    };
     let running = if serving == intent.new_slot {
         intent.to.clone()
     } else {
