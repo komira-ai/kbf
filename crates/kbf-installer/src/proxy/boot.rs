@@ -100,6 +100,11 @@ impl Reason {
                 "install the release with the installer so it carries its VERIFIED marker \
                  (a hand-placed one: docs/design/frontend-proxy.md), then restart kbf-proxy",
             ),
+            Reason::MigrationFailed => Some(
+                "the log line of the attempt starts with the refusal's word (database_error, \
+                 database_busy, installer_too_old, not_additive, schema_unknown, ...); fix the \
+                 database or update the kbf-installer package, then restart kbf-proxy",
+            ),
             _ => None,
         }
     }

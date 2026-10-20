@@ -34,15 +34,17 @@ test-group = 'mac-provision-scratch'
 # `[profile.default.junit]` below), list the `testcase`s with a `time` of 10 or more, and
 # write each as `binary_id(=<package or package::test file>) & test(=<name>)`. A test that
 # grows slow and is not listed makes the fast gate slower, not wrong; a listed name that no
-# longer exists excludes nothing.
+# longer exists excludes nothing. A test is also listed, whatever its time, when it needs more
+# disk than a hosted runner reliably has free (one_read's 5 GiB blob test writes about 13 GB):
+# keep such entries when regenerating from the timings.
 [profile.pr]
 default-filter = '''
 not (
   (binary_id(=kbf-all-in-one) & test(=plane::tests::put_chunks_streams_a_large_blob_and_stores_a_small_one))
   | (binary_id(=kbf-all-in-one::memory) & (test(=a_2_gib_output_streams_onto_the_tier_in_bounded_memory) | test(=a_2_gib_remote_upload_is_written_through_to_the_tier_in_bounded_memory) | test(=without_a_tier_a_256_mib_output_streams_to_the_store_in_bounded_memory)))
-  | (binary_id(=kbf-all-in-one::one_read) & (test(=with_a_tier_a_file_over_1_gib_is_read_once) | test(=without_a_tier_a_file_over_1_gib_is_read_once)))
+  | (binary_id(=kbf-all-in-one::one_read) & (test(=with_a_tier_a_file_over_1_gib_is_read_once) | test(=without_a_tier_a_file_over_1_gib_is_read_once) | test(=a_blob_over_5_gib_is_not_refused_for_its_size)))
   | (binary_id(=kbf-cli::all_in_one) & test(=an_input_is_on_the_nodes_disk_once))
-  | (binary_id(=kbf-cli::rehearsal_in_a_box) & (test(=a_killed_storage_node_loses_no_blob) | test(=three_storage_nodes_run_an_action)))
+  | (binary_id(=kbf-cli::rehearsal_in_a_box) & (test(=a_killed_storage_node_loses_no_blob) | test(=a_loaded_node_restarts_planned_down_and_loses_no_action) | test(=three_storage_nodes_run_an_action)))
   | (binary_id(=kbf-cli::storage_and_daemon) & test(=storage_and_daemon_runs_an_action_over_its_own_storage))
   | (binary_id(=kbf-daemon::member_wiring) & test(=a_daemon_half_behind_its_node_is_told_so_by_its_own_node))
   | (binary_id(=kbf-driver-container::fake_crun) & test(=no_round_of_a_dropped_run_races_the_clean))

@@ -625,6 +625,7 @@ impl kbf_route::MapSource for Dialled {
         Some(kbf_route::MapView {
             map: Arc::clone(&self.map),
             previous: None,
+            earlier: Vec::new(),
         })
     }
 
@@ -754,13 +755,12 @@ fn a_state_store_that_is_neither_postgres_nor_sqlite_or_holds_a_password_is_refu
     }
 }
 
-/// A fresh directory under the test target directory, for one test.
-fn scratch_dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("frontend-state")
-        .join(format!("{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("directory");
-    dir
+/// A fresh directory under the test target directory, for one test, removed when it drops.
+fn scratch_dir(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("frontend-state-{name}"),
+    )
 }
 
 /// Catches `--state-store` accepted and ignored by a frontend (the scheduler would run
@@ -821,15 +821,15 @@ async fn the_start_line_warns_of_plain_text_off_loopback() {
 /// A CA and the certificates issued from it, written under a directory.
 struct Pki {
     ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
-    dir: PathBuf,
+    dir: kbf_testkit::dir::TestDir,
 }
 
 impl Pki {
     fn new(name: &str) -> Self {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("frontend-tls")
-            .join(format!("{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("directory");
+        let dir = kbf_testkit::dir::TestDir::under(
+            env!("CARGO_TARGET_TMPDIR"),
+            &format!("frontend-tls-{name}"),
+        );
         let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
         ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         ca.distinguished_name
@@ -1276,7 +1276,6 @@ async fn a_frontend_with_a_releases_dir_serves_the_release_store() {
         got.extend_from_slice(&chunk.data);
     }
     assert_eq!(got, tarball);
-    std::fs::remove_dir_all(&dir).expect("clean");
 }
 
 /// Catches a frontend whose operator API does not serve `GET /v1/denied`: the route is
@@ -1332,7 +1331,6 @@ async fn a_frontend_serves_the_deny_list_listing() {
     assert_eq!(list.denied.len(), 1, "{body}");
     assert_eq!(list.denied[0].entry, "node mac-07");
     assert_eq!(list.denied[0].reason, "retired");
-    std::fs::remove_dir_all(&dir).expect("clean");
 }
 
 /// Catches a `--reapi-tls-cert` and `--reapi-tls-key` that a frontend takes and does not
@@ -1541,8 +1539,8 @@ async fn the_drain_endpoint_and_a_close_reach_a_frontend() {
     let node = Node::start().await;
     let url = format!("--storage=http://{}", node.addr);
     let token = "kbf-test-token-0123456789abcdef0123456789";
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("front-token-{}", std::process::id()));
+    let token_dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "front-token");
+    let path = token_dir.join("token");
     std::fs::write(&path, format!("{token}\n")).expect("write the token");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     let token_flag = format!("--api-token-file={}", path.display());
@@ -1653,6 +1651,7 @@ async fn a_frontend_with_a_state_store_shows_the_storage_health() {
             zone: String::new(),
             catching_up: true,
             protocol: kbf_server::members::PROTOCOL,
+            ..Default::default()
         })
         .await
         .expect("registers");
@@ -1839,7 +1838,8 @@ async fn a_frontend_with_members_writes_where_the_map_says() {
         (a.port(), direct(&client_flags, a.port())),
         (b.port(), direct(&client_flags, b.port())),
     ];
-    let state = scratch_dir("routed").join("state.db");
+    let routed = scratch_dir("routed");
+    let state = routed.join("state.db");
     let mut more = vec![
         format!("--storage=https://localhost:{}", a.port()),
         "--readyz-store-timeout-ms=2000".to_owned(),
@@ -1872,6 +1872,7 @@ async fn a_frontend_with_members_writes_where_the_map_says() {
         zone: String::new(),
         protocol: kbf_server::members::PROTOCOL,
         catching_up: false,
+        ..Default::default()
     };
     // One member: still that node, whatever address it advertises.
     membership
@@ -2088,5 +2089,4 @@ async fn a_frontend_with_a_secrets_dir_serves_the_object_store_routes() {
         .expect("the directory cannot be made")
         .to_string();
     assert!(said.starts_with("--object-store-secrets-dir "), "{said}");
-    std::fs::remove_dir_all(&dir).expect("clean");
 }

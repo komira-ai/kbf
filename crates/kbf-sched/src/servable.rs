@@ -93,11 +93,20 @@ impl Servable {
         self.memo.len() - 1
     }
 
-    /// The first live worker, in name order and not in `reserved`, that serves
-    /// `request`'s kind, satisfies its platform and has room for it now. Books it there
-    /// and returns the worker with what was booked: the request vector for an action,
-    /// the worker's whole capacity for a whole-machine lease; and the iOS device, for a
-    /// request that asks for one ([`Worker::free_device`]).
+    /// The least loaded live worker not in `reserved` that serves `request`'s kind,
+    /// satisfies its platform and has room for it now: the one with the least booked, as
+    /// a share of its capacity (the larger of its CPU and memory shares), then the fewest
+    /// leases, then the first by name ([`Worker::load`]). Books it there and returns the
+    /// worker with what was booked: the request vector for an action, the worker's whole
+    /// capacity for a whole-machine lease; and the iOS device, for a request that asks for
+    /// one ([`Worker::free_device`]).
+    ///
+    /// The platform and room are decided first and the load only ranks the workers that
+    /// pass: a Mac is never the least loaded worker for Linux work. A whole-machine lease,
+    /// and an action at the whole host's memory, go only to a worker with no lease, so
+    /// every candidate has nothing booked and the first by name is taken. Such an action
+    /// waits until some worker's free memory meets its request; nothing reserves a worker
+    /// for it.
     ///
     /// A worker in `avoid` (one the operation's earlier runs ended on as the farm's
     /// fault) is skipped while a worker placement may use outside it could run the
@@ -116,11 +125,13 @@ impl Servable {
             .1
             .iter()
             .map(|&i| &self.live[i])
-            .find(|name| {
+            .filter(|name| {
                 !reserved.contains(*name)
                     && !skip.contains(*name)
                     && workers[*name].has_room(request)
-            })?
+            })
+            // The first of the least loaded: `live` is in name order.
+            .min_by_key(|name| workers[*name].load())?
             .clone();
         let worker = workers.get_mut(&name).expect("live workers are registered");
         let booked = match request.kind {
@@ -143,7 +154,9 @@ impl Servable {
     /// The worker to hold for a whole-machine `request` that fits nowhere now: `kept`
     /// if it still could run it, else the one that could which holds the fewest leases,
     /// then has the least booked, then comes first by name. Never one in `reserved`,
-    /// nor one in `avoid` while [`Servable::fit`] skips it.
+    /// nor one in `avoid` while [`Servable::fit`] skips it. Only a whole-machine lease
+    /// holds a worker (the caller asks only for one); an action at a worker's whole
+    /// memory waits until some worker has no lease, and nothing reserves one for it.
     pub(crate) fn reserve(
         &mut self,
         workers: &BTreeMap<WorkerId, Worker>,

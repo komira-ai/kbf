@@ -98,6 +98,13 @@ pub trait Migrations {
     /// [`MigrateError::Unmigrated`] when the old layout's state is the host's and no
     /// migration finished; any other error is a journal or tree that cannot be read.
     fn units(&self) -> Result<Vec<Unit>, MigrateError>;
+
+    /// Whether the journal says a finished migration adopted a host the Mac kit installed
+    /// (`kit`, phase done): the host's `kbf.toml` is the kit's.
+    ///
+    /// # Errors
+    /// A journal or tree that cannot be read.
+    fn kit_adopted(&self) -> Result<bool, MigrateError>;
 }
 
 /// The host's own migration journal, read through [`migrate::standing`].
@@ -116,6 +123,10 @@ impl Journaled {
 impl Migrations for Journaled {
     fn units(&self) -> Result<Vec<Unit>, MigrateError> {
         migrate::standing(&self.layout, self.owner_uid)
+    }
+
+    fn kit_adopted(&self) -> Result<bool, MigrateError> {
+        migrate::kit_adopted(&self.layout, self.owner_uid)
     }
 }
 

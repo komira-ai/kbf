@@ -320,7 +320,8 @@ fn verify_bundle(dir: &Path, sha256: &str, file: &str, bundle: &str, rest: &[Str
     let beta = flags.iter().any(|f| f.ends_with("/beta.yml"));
     let by_commit = !(defect("bundle-any-commit") || (beta && defect("beta-bundle-any-commit")));
     let by_bytes = !(defect("bundle-any-file")
-        || (defect("bundle-deb-bundle-any") && bundle.ends_with(".deb.sigstore.json")));
+        || (defect("bundle-deb-bundle-any")
+            && (bundle.ends_with(".deb.sigstore.json") || bundle.ends_with(".pkg.sigstore.json"))));
     let wanted = if by_commit {
         flags.join(" ")
     } else {

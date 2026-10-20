@@ -3,7 +3,7 @@
 Status: built in `crates/kbf-installer/src/deploy/`. It drives the update API the frontend's
 proxy serves (`docs/design/frontend-proxy.md`, sections 4, 5 and 9), frontend first.
 
-`kbf-installer deploy --commit <40hex> --apply [--json] [--bundle -]` runs on the frontend host, as root, and drives the frontend's public port through one release.
+`kbf-installer deploy --commit <40hex> --stage gamma|prod --offer offer.json --apply [--json] [--bundle -]` runs on the frontend host, as root, and drives the frontend's public port through one release.
 It orders no node, sets no desired release and rolls nothing back: it asks the update API to
 swap the frontend, waits for that update to be `done`, and then watches the nodes, which the
 new frontend rolls (one storage node at a time) once it has baked.
@@ -37,11 +37,14 @@ read when the flags give every key it could (`api`, `api_ca`, `api_server_name`,
 `cas`, `cas_ca`, `cas_server_name`). The token file must be a regular file, mode 0600 or 0400.
 The address must be loopback: a deploy drives the proxy of its own host. Run through `sudo` (the
 environment carries `SUDO_UID`, set to the caller's uid), `deploy` refuses `--api`, `--api-ca`,
-`--api-server-name`, `--token-file`, `--config`, `--lock`, `--platform` and the `--cas*` flags
-with exit 2: the caller would choose where root sends the token and which file it reads. Those
+`--api-server-name`, `--token-file`, `--config`, `--lock`, `--platform`, `--result`, `--observe`,
+`--observe-base-port`, `--observe-token-file`, the `--cas*` flags, `--stage`, `--no-offer` and
+`--offer-max-age-h` with exit 2: the caller would choose where root sends the token and which file it reads. Those
 values then come only from the root-owned config. Scope the sudoers rule to the exact argument
 list too, with no wildcard: `deploy --apply --json --commit` followed by forty `[0-9a-f]`
-classes, then `--bundle -`.
+classes, then `--offer <the path of offer.json>` and `--bundle -`. `--offer` is the one new flag
+a sudo caller may give; the rule pins its path, and the file is read only as a regular file of
+at most 64 KiB (opened once, without following a link, and read through that descriptor), through the same validated parse every reader of an offer uses.
 
 The token in the token file is the operator token the proxy checks on every route but its
 probes. Where `setup` puts that file is the proxy's design (`docs/design/frontend-proxy.md`,
@@ -50,6 +53,58 @@ section 4, "Auth"), not this verb's.
 A farm whose `/v1/nodes` lists no node (an empty list, or no `nodes` array) is refused in
 preflight (exit 3, `no_nodes`); the wait for nodes and the post check each need at least one
 node, so an empty list never reads as "every node confirmed".
+
+## The offer
+
+`--offer offer.json` is the document `cargo xtask release offer` writes (`kbf_gate::OfferDoc`).
+It is a record, not a command: the deploy does not act on what it says, it refuses unless the
+release it is about to move is the one the offer is for. Nothing is taken from a file name.
+
+- **Which stage this host is** (`--stage gamma|prod`, else the `stage` key of
+  `/etc/kbf-installer/deploy.json`): the offer's `target` must be it. The stage is the host's
+  own, never read from the offer and never given by a `sudo` caller, so an offer for prod
+  cannot be used to deploy a gamma host or the reverse. An `--apply` with no stage is exit 2
+  (it would skip the rule below); a plan with none checks no offer.
+- **No offer**: a deploy that names a stage and gives no `--offer` is refused (exit 3,
+  `offer_required`) unless `--no-offer` says so. `--no-offer` is logged on standard error and
+  recorded in the summary (`offer.kind: "waived"`); it is for a test farm.
+- **The commit**: the offer's `commit` is `--commit` (`offer_wrong_commit`).
+- **The set**: with an offer the bundle must carry `SHA256SUMS` (one entry, not uploaded). Its
+  SHA-256 is the offer's `set_hash` (`offer_set_mismatch`), and every tarball in the bundle is
+  the file those sums name, by its bytes (`offer_file_mismatch`). A bundle with no
+  `SHA256SUMS`, or no bundle, refuses (`offer_set_unverified`): the deploy cannot say which set
+  it moves. Attestation bundles are not in the sums; they are verified offline downstream.
+- **The `meta_log`**: the `kbf` of the host's platform in the bundle is first attested offline
+  (the installer's pinned `gh` and trust root, the flags the stage uses, on copies in a scratch
+  directory; a tarball with no attestation in the bundle, or one that does not verify, is
+  `offer_set_unverified` and nothing of it is unpacked or run). Only then is it unpacked to a
+  scratch directory under the installer's work directory and run as `kbf --version --json`, as
+  the installer's `RUN_AS` user (never root; as itself in a plan). Its `meta_log` must equal the
+  offer's, `null` included both ways: a binary naming none where the offer claims one, or the
+  reverse, is refused (`offer_meta_log_mismatch`). This closes the offer's `meta_log` being
+  supplied by an operator as files. The answer can only refuse a deploy.
+- **A plan checks the same.** Without `--apply` the set, the files, the attestation and the
+  probe all run (they only read and write a scratch directory, and run an attested binary as
+  the unprivileged user); only the upload and the update are skipped. A dry run therefore
+  cannot say OK for a bundle the apply would refuse.
+- **What the offer does not prove.** It is an unsigned record. Its `previous` and
+  `previous_meta_log` are not checked against the running farm, so the bake must not treat
+  `reversible` as proof that a rollback works: it says what the offer's author wrote, derived
+  from numbers nobody here confirmed. Only the host platform's `kbf` is attested at deploy
+  time. The other platforms' tarballs are bound only by `SHA256SUMS`, and `SHA256SUMS` only by
+  the offer's `set_hash`, which is itself unsigned; the frontend's offline attestation check
+  at update time is the backstop for them.
+- **Age**: `created` may be at most `--offer-max-age-h` hours old (default 72;
+  `offer_stale`) and at most 300 s ahead of the host's clock (`offer_future`).
+- **Platforms**: every platform the farm runs (the nodes' and the host's) is one the offer found
+  complete (`offer_platform`).
+
+All of them are checked before the first upload, in the steps `offer` (stage, commit, age), then
+`bundle` (set, files, `meta_log`) and `preflight` (platforms); a refusal is exit 3 and the farm
+is untouched. The summary's `offer` object carries the offer's `commit`, `set_hash`, `created`,
+`reversible`, `previous`, `meta_log` and `previous_meta_log`, copied from the validated document,
+for the bake's hand-off file; the deploy does not write that file itself. Not built: the offer
+does not yet bound the generation (`expect_generation`), which stays with the update API.
 
 ## Steps
 
@@ -114,6 +169,65 @@ Each is a named entry in the summary's `steps`, with its duration.
 
 Without `--apply` steps 1 to 3 run read-only (the bundle is checked, not uploaded) and the
 result is `plan`.
+
+## Gates and the result document
+
+An applied deploy is judged by seven gate rows (six gates) and writes them, with the
+deploy's own outcome, to a `kbf-gate` result document: `--result <path>` (a host flag, like
+`--api`: refused through `sudo`; the config's `result` key; default
+`/var/lib/kbf-installer/deploy-result.json`). The document is written `RUNNING` before the
+first request and `FINISHED` before `deploy` returns; a document that cannot be written ends
+the deploy first (`result_unwritable`). `--set-hash <64hex>` is the hash of the release set
+(`SHA256SUMS`); without it the document carries a hash of what `GET /v1/releases` lists for
+the commit. `--settle-timeout-s` (default 600) is gate E's window.
+
+**Where the gates read.** Either `--observe <127.0.0.1:port>` (one frontend that does not move)
+or `--observe-base-port <N>` (the children of the frontend proxy: slot A listens from `N`, slot B
+from `N + 10`, the operator listener is at offset 2 of a slot) is required with `--apply`
+(exit 2 without one, or with both; host flags; config keys `observe`, `observe_base_port`).
+`--observe-token-file` (host flag; key `observe_token_file`) defaults to the `--token-file`
+token: one operator token guards both. The gates do not read `--api`: the public proxy answers
+`/metrics` itself (its own `kbf_proxy_*` counters, not the frontend's) and serves the update
+routes, and no `/v1` path carries `kbf_frontend_relay_untraced` or the cache gauges, so only
+the serving child's operator listener can be read. Release and update calls go only to `--api`.
+Both addresses must be loopback.
+
+With `--observe-base-port` the deploy follows the handover. It resolves the serving child at
+the preflight and again after every frontend step: the slot `GET /v1/update/frontend` names in
+`active_slot` (present while that update is known), else the only child that answers
+`/metrics`; none answering, or both with no slot named, ends the deploy (`observe_unresolved`).
+The result document's `observed` lists `<step>: <child>` each time the child read changes
+(for example `preflight: slot a 127.0.0.1:18002`, then `frontend: slot b 127.0.0.1:18012; also slot a 127.0.0.1:18002`).
+
+**The child that handed over is read too.** It is the one that reports `kbf_frontend_relay_untraced` (set by `Farm::follow` on the fenced farm), and the successor never does; it keeps draining after the swap. So at every scrape after a handover the other slot is scraped as well, when it answers: gate B, `kbf_cache_lost_blobs` and the loss counter apply to it, and a red names it (`[read from slot a …]`). One that does not answer has finished and is not waited for. `kbf_cache_lost_blobs` and `kbf_cache_blob_losses_total` are folded from the metadata log (`MetaState`), so on the shared Raft log both children report the same numbers; an in-memory log begins again in a new process. The loss counter is therefore judged per child: a child's baseline is the deploy's first reading while its own reading is not below it (a shared log: a loss across the handover shows), else its own first reading (a fresh process); a counter that falls within one child is still red.
+
+**Signals.** `SIGTERM` and `SIGINT` seal a still-`RUNNING` document red, `interrupted by SIGTERM`, before the process exits 128 + the signal (a finished document is left alone). Only a `SIGKILL` or a crash leaves it `RUNNING`, which no reader counts as a pass.
+[A] Before any update has run on a host the API names no slot, so the preflight probes; a host
+where both children are left running after an earlier swap needs the older one stopped.
+
+`/metrics` is scraped from the observed frontend at the preflight, after the frontend step (the
+deploy is frontend-first: `--api` is the proxy's public port, over TLS, and the update the
+deploy starts there hands the frontend over before the nodes roll), at every poll of the node
+wait and at the post checks. A measurement that is
+not there is red: a scrape that fails or cannot be parsed, a series that is missing, a
+listing that is cut off. The first red ends the deploy (`gate_red`; exit 1, or 3 in the
+preflight where nothing has changed) and the detail names the gate, the value and the host step.
+
+| Gate row | Reads | Red when |
+|---|---|---|
+| `a_inflight_ids` | `GET /v1/invocations?state=open` at the preflight, at each node's confirmation and after the frontend step; then `?since=&until=` over the whole deploy | a listing cannot be read (also when the route is off: it needs `--history-objects`) or is partial |
+| `b_relay_untraced` | `kbf_frontend_relay_untraced` at every scrape | any scrape is above 0 or lacks the series |
+| `c_farm_class_failures` | every recorded id's `/actions` pages, after the deploy (also after a failed one) | an attempt ended `infra`, `lost` or `lost_*` (client-side filter), an id cannot be read, or its record is `rows_capped` (not every attempt is visible) |
+| `d_lost_blobs`, `d_blob_losses_delta` | `kbf_cache_lost_blobs`; `kbf_cache_blob_losses_total` minus its first scrape | any scrape is above 0 or lacks the series; the counter went backwards within one child. A fresh frontend child with an in-memory metadata log restarts the counter at 0 (its first reading is its baseline), so a loss made in the handover window before that reading is visible only while the old child still answers; the durable Raft log has no such gap (both children read the same history) |
+| `e_under_replicated` | `kbf_under_replicated_blobs` | not 0 at the preflight (a farm that reports no series at all is refused there as `gate_unjudgeable`, exit 3: it needs storage members that have reported, as the post check on `/v1/members` already does); not back to 0 within the settle window after a node's step; the next node's step began (`activated_unconfirmed`) or confirmed before that |
+| `f_auto_revert` | node states and the frontend update's end | a node reverted by its own timer, or the frontend update ended `failed` or `rolled_back` |
+
+The deploy never orders a node, so gate E cannot hold the drain system's next step; it
+watches and fails the deploy when the next step ran before the repair.
+
+The one-line summary on standard output stays beside the document until the callers read the
+document instead, and is removed on 2026-12-01. Exit 0 is a `green` document, exit 5
+(`smoke_skipped`) is `extended` (no decision, not a pass), every other exit is `red`.
 
 The order of the old nodes-first deploy (`--order`, and a `POST /v1/update/desired` made by
 the deploy) is gone: the desired release is the new frontend's to set, after it has baked,

@@ -397,3 +397,25 @@ async fn a_revert_opens_the_gate() {
     let (code, _) = result_of(&mut peer).await;
     assert_eq!(code, Code::Ok as i32);
 }
+
+/// Catches a link that misreports whether the node takes orders: only a link with a client
+/// does. Setup's `kbf.toml` tests read this to tell a node that was given its update
+/// directories from one that updates by hand.
+///
+/// Mutant: `takes_orders` always true (red on the manual and off links).
+#[tokio::test]
+async fn only_a_link_with_a_client_takes_orders() {
+    assert!(!UpdateLink::off().takes_orders());
+    assert!(!UpdateLink::manual(BUILD_COMMIT).takes_orders());
+    let dir = support::scratch("update-takes-orders");
+    helper_says(&dir, "idle", "", "", 0);
+    let (handle, worker) = start(Config::new(
+        dir,
+        PLATFORM.to_owned(),
+        BUILD_COMMIT.to_owned(),
+    ))
+    .expect("start");
+    let worker = tokio::spawn(worker.run());
+    assert!(UpdateLink::new(handle).takes_orders());
+    worker.abort();
+}

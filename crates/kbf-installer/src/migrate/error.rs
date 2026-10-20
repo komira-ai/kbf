@@ -34,6 +34,16 @@ pub enum MigrateError {
     /// text the binary printed, which nobody has vetted: it is shown quoted and escaped.
     #[error("releases/{dir} holds a build of {probed:?}: its name does not match its binary")]
     Mislabeled { dir: String, probed: String },
+    /// A tree and no plist, or a plist and no `releases/` or `current`: half of what the Mac
+    /// kit installs, so not a host to adopt.
+    #[error("not a whole kit host: {0}")]
+    HalfKit(String),
+    /// The kit's job runs something that is neither of the kit's two argument forms.
+    #[error("the kit's job is in no form this knows: {0}")]
+    UnknownPlist(String),
+    /// The kit's job is on a host that is not a Mac.
+    #[error("{0} is the Mac kit's job file and this is not a Mac")]
+    KitOnLinux(String),
     /// `--version --json` of an old release could not be had.
     #[error("{release}: the version probe failed: {why}")]
     Probe { release: String, why: String },
@@ -52,6 +62,20 @@ pub enum MigrateError {
         "this host still has the old layout's state ({0}) and is not migrated: run `kbf-installer migrate --apply` first"
     )]
     Unmigrated(String),
+    /// A kit host was rolled back and the installer's tree was moved aside with it: what is
+    /// asked of the installer cannot be done from here, and the next step is the package.
+    #[error(
+        "this Mac was rolled back to the Mac kit and the installer's tree was moved aside: \
+         reinstall the kbf-installer .pkg to hand the host to the installer again"
+    )]
+    KitRolledBack,
+    /// The migration is written but the installer's own unit would not come up: without it
+    /// the host takes no orders. The journal is not `done`, so a run again finishes it.
+    #[error(
+        "{unit} could not be enabled and started ({why}): the host is moved but takes no orders; \
+         fix the unit, then run `kbf-installer migrate --apply` again"
+    )]
+    InstallerUnit { unit: String, why: String },
     /// A rollback that would throw away what the installer did since.
     #[error("cannot roll back: {0}")]
     MovedOn(String),
@@ -81,6 +105,9 @@ impl MigrateError {
             MigrateError::NotRoot { .. } => Exit::Usage,
             MigrateError::BadLink { .. }
             | MigrateError::Mislabeled { .. }
+            | MigrateError::HalfKit(_)
+            | MigrateError::UnknownPlist(_)
+            | MigrateError::KitOnLinux(_)
             | MigrateError::Probe { .. } => Exit::Refused,
             // A swap of the old tool on trial, and the disagreements only a person settles.
             MigrateError::Pending { .. }
@@ -89,7 +116,9 @@ impl MigrateError {
             | MigrateError::FloorUnavailable(_)
             | MigrateError::Conflict(_)
             | MigrateError::Unmigrated(_)
+            | MigrateError::KitRolledBack
             | MigrateError::MovedOn(_)
+            | MigrateError::InstallerUnit { .. }
             | MigrateError::NoJournal => Exit::NeedsOperator,
             // The old tools' lock or the installer's, held past the wait: ask again.
             MigrateError::State(StateError::Busy { .. }) => Exit::Busy,

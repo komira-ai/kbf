@@ -266,7 +266,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> Plane for Local<M, O> {
 struct Remote {
     storage: Arc<dyn Storage>,
     metrics: CacheMetrics,
-    /// Unused while a node's [`Held`] gives no epoch: nothing is remembered of one node.
+    /// Of one node, whose [`Held`] gives no epoch, only the content cache of decoded
+    /// Directories is used (every Directory it holds is still asked about); nothing is
+    /// remembered as verified.
     trees: Trees,
 }
 

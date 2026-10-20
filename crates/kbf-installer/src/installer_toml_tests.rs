@@ -35,6 +35,31 @@ fn the_database_key_is_accepted_and_rendered() {
     assert_eq!(InstallerToml::default().database, None);
 }
 
+/// Catches the `backup_keep` bound drifting: `kbf-installer backup` deletes every backup
+/// beyond this many, so 0 (which would delete the one just written) and an absurd count are
+/// refused, 1 and 365 are accepted, a default file leaves the key out of its canonical form,
+/// and a set value survives `render`.
+///
+/// Mutants seen red: the lower bound 0 (`0` accepted); `render` dropping the key.
+#[test]
+fn backup_keep_is_bounded_and_rendered_only_when_set() {
+    for ok in [1, 7, 365] {
+        let parsed = InstallerToml::parse(&format!("backup_keep = {ok}\n")).expect("parses");
+        assert_eq!(parsed.backup_keep, Some(ok));
+        assert!(parsed.render().ends_with(&format!("backup_keep = {ok}\n")));
+    }
+    for bad in ["0", "366", "-1", "\"7\""] {
+        assert!(
+            InstallerToml::parse(&format!("backup_keep = {bad}\n")).is_err(),
+            "{bad}"
+        );
+    }
+    let default = InstallerToml::default();
+    assert_eq!(default.backup_keep, None);
+    assert!(!default.render().contains("backup_keep"));
+    assert_eq!(DEFAULT_BACKUP_KEEP, 7);
+}
+
 /// Catches `render` writing the database URL with Rust's Debug escaping, which is not TOML
 /// (a `'` came out as `\'` and a non-ASCII character as `\u{..}`): the rendered file must
 /// parse back to the same URL.
@@ -564,6 +589,54 @@ mod read {
         );
         assert_eq!(why(read(&exec)), "invalid: installer.toml: it is not UTF-8");
     }
+}
+
+/// The `installer.toml` of a proxy host, as `setup --proxy` writes it with every flag at its
+/// default.
+const PROXY_HOST: &str = include_str!("../tests/golden/proxy_host/installer.toml");
+
+/// Catches a `[proxy]` table that `render` drops or spells differently from the proxy's own
+/// parser (the bug that made `setup` delete a hand-written table): the golden decodes to a
+/// table, renders back byte for byte, and a table with every key off its default (bearer
+/// auth with its key file, other paths, limits) survives a render and a parse unchanged.
+#[test]
+fn the_proxy_table_is_rendered_and_read_back_with_every_key() {
+    let parsed = InstallerToml::parse(PROXY_HOST).expect("parses");
+    assert!(parsed.proxy.is_some());
+    assert_eq!(parsed.render(), PROXY_HOST);
+
+    let odd = PROXY_HOST
+        .replace(
+            "buck2_auth = \"none\"",
+            "buck2_auth = \"bearer\"\nbuck2_token_file = \"/etc/kbf/bearer\"",
+        )
+        .replace("/run/kbf-proxy/proxy-auth", "/run/other/auth")
+        .replace("/var/lib/kbf-proxy", "/var/lib/other")
+        .replace("hold_max_s = 20", "hold_max_s = 7")
+        .replace("base_port = 18000", "base_port = 19010")
+        .replace("max_streams = 8192", "max_streams = 100")
+        .replace("max_connections = 50000", "max_connections = 5000")
+        .replace(
+            "max_connections_per_ip = 2000",
+            "max_connections_per_ip = 20",
+        )
+        .replace("pre_stream_timeout_s = 10", "pre_stream_timeout_s = 11")
+        .replace("memory_budget_mib = 8192", "memory_budget_mib = 4096")
+        .replace(
+            "max_header_list_bytes = 16384",
+            "max_header_list_bytes = 8192",
+        )
+        .replace("keepalive_interval_s = 30", "keepalive_interval_s = 31")
+        .replace("keepalive_ack_s = 20", "keepalive_ack_s = 21");
+    let back = InstallerToml::parse(&odd).expect("parses");
+    assert_eq!(back.render(), odd);
+    assert_eq!(InstallerToml::parse(&back.render()).expect("again"), back);
+}
+
+/// Catches a file with no `[proxy]` table growing one: a host that has none renders none.
+#[test]
+fn no_proxy_table_renders_no_proxy_keys() {
+    assert!(!InstallerToml::default().render().contains("proxy"));
 }
 
 const PROXY: &str = r#"

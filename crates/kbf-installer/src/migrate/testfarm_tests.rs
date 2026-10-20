@@ -220,7 +220,7 @@ fn a_rolled_back_test_farm_host_starts_its_node_from_the_old_tree() {
 /// runs `kbf-daemon` from the installer's tree, and the node starts from it.
 #[test]
 fn a_macos_test_farm_host_migrates_and_its_node_starts() {
-    let mut rig = Rig::testfarm_mac();
+    let mut rig = Rig::testfarm_mac("migrates");
     let report = migrate_farm(&mut rig, &["org.example.kbf-daemon.plist"], Mode::Apply);
     assert_eq!(report.outcome, Outcome::Migrated);
     let now = fs::read_to_string(rig.at("Library/LaunchDaemons/org.example.kbf-daemon.plist"))
@@ -235,4 +235,114 @@ fn a_macos_test_farm_host_migrates_and_its_node_starts() {
     assert_starts(&rig, &command, FARM_X, &before[1..]);
     let state = rig.json(&rig.new_state_dir().join("state.json"));
     assert_eq!(state["current"], FARM_X);
+}
+
+/// The programs a migration's probes ran, as file names.
+fn probed(runner: &crate::fixtures::FakeRunner) -> Vec<String> {
+    runner
+        .calls()
+        .iter()
+        .map(|c| {
+            let name = c.program.file_name().expect("a program");
+            name.to_string_lossy().into_owned()
+        })
+        .collect()
+}
+
+/// Catches a probe of the wrong binary on an old-host Mac. The pre-av2 pilot and dev
+/// installer left `kbf-daemon` only in a release, and the old `state.json` (schema 1) names
+/// no binary, so the probe takes the one the release holds: `kbf-daemon` for the test farm's
+/// Mac, `kbf` for an old-host Mac whose release holds `kbf`. The rig's runner fails a
+/// program that is not there, so the wrong name ends the migration.
+///
+/// Mutants seen red: `Roots::binary` always `kbf` (the farm Mac's probe fails: no such
+/// file); always `kbf-daemon` on a Mac (the `kbf` Mac fails).
+#[test]
+fn an_old_host_mac_is_probed_for_the_binary_its_release_holds() {
+    for (mut rig, want) in [
+        (Rig::testfarm_mac("probe"), "kbf-daemon"),
+        (Rig::mac("probe-kbf"), "kbf"),
+    ] {
+        let runner = runner();
+        let mut m = rig.migration();
+        m.units = vec![unit(if want == "kbf" {
+            "com.komira.kbf-daemon.plist"
+        } else {
+            "org.example.kbf-daemon.plist"
+        })];
+        let report = migrate(
+            &m,
+            &mut rig.host,
+            &Hooks {
+                runner: &runner,
+                verifier: &NotWired,
+                frontend: &NoFrontend,
+            },
+            Mode::Apply,
+        )
+        .unwrap_or_else(|e| panic!("{want}: {e}"));
+        assert_eq!(report.outcome, Outcome::Migrated, "{want}");
+        assert_eq!(probed(&runner), [want; 2], "{want}");
+    }
+}
+
+/// Linux is as it was: asked `kbf`, and a release that also holds a `kbf-daemon` (the
+/// separate daemon binary only Linux builds) is still asked `kbf`.
+///
+/// Mutant seen red: the `kbf-daemon` choice taken on Linux too.
+#[test]
+fn a_linux_host_is_probed_for_kbf_even_where_a_release_holds_kbf_daemon() {
+    let mut rig = Rig::testfarm_linux("probe");
+    for sha in [FARM_X, FARM_Y] {
+        put(
+            &rig.at(&format!("usr/local/kbf/releases/{sha}/kbf-daemon")),
+            "daemon",
+            0o755,
+        );
+    }
+    let runner = runner();
+    let mut m = rig.migration();
+    m.units = vec![unit("kbf-daemon.service")];
+    migrate(
+        &m,
+        &mut rig.host,
+        &Hooks {
+            runner: &runner,
+            verifier: &NotWired,
+            frontend: &NoFrontend,
+        },
+        Mode::Apply,
+    )
+    .expect("migrates");
+    assert_eq!(probed(&runner), ["kbf"; 2]);
+}
+
+/// Catches a release that holds neither binary being passed as probed: an old-host Mac whose
+/// release holds no `kbf-daemon` is asked `kbf`, which is not there either, and the
+/// migration ends in a probe failure naming the release, with nothing changed. (It is also
+/// what makes the rig's runner refuse a program that does not exist, which the tests above
+/// rely on.)
+///
+/// Mutant seen red: the rig's runner answering for a program that is not there.
+#[test]
+fn a_mac_release_holding_neither_binary_is_a_probe_failure_and_changes_nothing() {
+    let mut rig = Rig::testfarm_mac("neither");
+    fs::remove_file(rig.at(&format!("usr/local/kbf/releases/{FARM_X}/kbf-daemon"))).expect("rm");
+    let before = rig.snapshot("");
+    let mut m = rig.migration();
+    m.units = vec![unit("org.example.kbf-daemon.plist")];
+    let error = migrate(
+        &m,
+        &mut rig.host,
+        &Hooks {
+            runner: &runner(),
+            verifier: &NotWired,
+            frontend: &NoFrontend,
+        },
+        Mode::Apply,
+    )
+    .expect_err("no binary to ask");
+    assert!(matches!(error, MigrateError::Probe { .. }), "{error}");
+    assert!(error.to_string().contains(FARM_X), "{error}");
+    assert_eq!(rig.snapshot(""), before);
 }

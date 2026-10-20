@@ -3,7 +3,7 @@
 //! proxy, the `Execute` streams a Buck2 build holds open, and reads of a child's own count
 //! of them. Each soak says in its own header what it proves with them.
 
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::{BufReader, Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{ChildStdout, Command, ExitCode, Stdio};
@@ -85,9 +85,11 @@ impl Child {
         let mut command = kbf_command(dir, args);
         command.stdout(Stdio::piped()).stderr(log);
         let mut process = reaped::spawn(&mut command, 3).expect("spawn kbf");
-        let mut stdout = BufReader::new(process.stdout.take().expect("stdout"));
-        let mut line = String::new();
-        stdout.read_line(&mut line).expect("a start line");
+        let (line, stdout) = reaped::first_line(
+            process.stdout.take().expect("stdout"),
+            Duration::from_secs(60),
+        )
+        .unwrap_or_else(|e| panic!("no start line from {name}: {e}"));
         Self {
             process,
             line,
@@ -153,19 +155,58 @@ pub async fn until(what: &str, mut done: impl FnMut() -> bool) {
     assert!(met, "{what}");
 }
 
+/// The ports of a base, as the proxy's static table has them.
+const OFFSETS: [u16; 8] = [0, 1, 2, 3, 10, 11, 12, 13];
+
+/// The claims of this process, kept until it exits (a lock lives as long as its file).
+static CLAIMED: std::sync::Mutex<Vec<std::fs::File>> = std::sync::Mutex::new(Vec::new());
+
 /// A base port such that the REAPI, worker, operator and admin ports of slot A (the base plus
-/// 0 to 3) and of slot B (plus 10 to 13), as the proxy's static table has them, are free now.
+/// 0 to 3) and of slot B (plus 10 to 13), as the proxy's static table has them, are free now
+/// and stay claimed against every other test process using this function.
+///
+/// Probing alone is not enough: the probe's sockets are closed before the children bind, and
+/// nextest runs each test in its own process, so two tests whose pid-derived bases are a few
+/// apart (their port sets overlap) probe the same free ports and then one child finds its port
+/// taken, exits, and the swap respawns it as a candidate. Each port is therefore also claimed
+/// by an exclusive lock on a file named for it, held until this process exits. The bases stay
+/// below the ephemeral range, so no outgoing connection takes one of them either.
 pub fn free_base() -> u16 {
-    let mut base = 20_000 + (std::process::id() % 20_000) as u16;
+    const FIRST: u16 = 20_000;
+    const SPAN: u16 = 12_000;
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("proxy-ports");
+    std::fs::create_dir_all(&dir).expect("the port claims' directory");
+    let mut base = FIRST + (std::process::id() % u32::from(SPAN)) as u16;
     loop {
-        let bound: Vec<_> = [0, 1, 2, 3, 10, 11, 12, 13]
+        let mut claims = Vec::new();
+        for o in OFFSETS {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join(format!("{}.lock", base + o)))
+                .expect("a port's claim file");
+            if file.try_lock().is_ok() {
+                claims.push(file);
+            } else {
+                break;
+            }
+        }
+        let bound: Vec<_> = OFFSETS
             .iter()
             .filter_map(|o| TcpListener::bind((Ipv4Addr::LOCALHOST, base + o)).ok())
             .collect();
-        if bound.len() == 8 {
+        if claims.len() == OFFSETS.len() && bound.len() == OFFSETS.len() {
+            CLAIMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(claims);
             return base;
         }
         base += 20;
+        if base + 13 >= FIRST + SPAN {
+            base = FIRST;
+        }
     }
 }
 

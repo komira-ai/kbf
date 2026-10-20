@@ -369,6 +369,9 @@ impl Core {
 
     /// The checks every new update passes before anything is saved or written.
     fn preflight(&mut self, req: &UpdateRequest) -> Result<InstallerStatus, ApiError> {
+        if let Some(why) = self.parts.supervisor.start_blocked() {
+            return Err(ApiError::unavailable("handover_unavailable", why));
+        }
         if self.is_open() {
             return Err(ApiError::conflict(
                 "update_open",

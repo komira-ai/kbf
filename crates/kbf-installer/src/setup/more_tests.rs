@@ -54,7 +54,10 @@ fn the_database_goes_to_both_files_and_its_schema_is_made_between_them() {
         text(&exec, INSTALLER_TOML)
     );
     assert_eq!(text(&exec, KBF_TOML), FRONTEND_TOML);
-    assert_eq!(*server.asked.borrow(), [format!("setup {DATABASE}")]);
+    assert_eq!(
+        *server.asked.borrow(),
+        [format!("reach {DATABASE}"), format!("setup {DATABASE}")]
+    );
     let at = |needle: &str| {
         out.find(needle)
             .unwrap_or_else(|| panic!("{needle}: {out}"))
@@ -85,7 +88,10 @@ fn a_dry_run_asks_the_server_and_changes_nothing() {
         dry,
     )
     .expect("dry run");
-    assert_eq!(*server.asked.borrow(), [format!("plan {DATABASE}")]);
+    assert_eq!(
+        *server.asked.borrow(),
+        [format!("reach {DATABASE}"), format!("plan {DATABASE}")]
+    );
     assert!(
         out.contains("database step: dry run: would create the schema at version 3"),
         "{out}"
@@ -153,7 +159,7 @@ fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
     };
     assert_eq!(installer_writes(&exec), 1);
     let up = Server::fresh();
-    let mut os = settled(&["kbf-frontend.service"]);
+    let mut os = settled(&["kbf-frontend.service", "kbf-backup.timer"]);
     os.users.push(user("kbf-server", 989));
     let out = go_on(&os, &mut exec, &Unwired, &up, &raw(Mode::Frontend), APPLY).expect("finished");
     assert_eq!(
@@ -230,7 +236,7 @@ fn the_database_flag_is_required_where_there_is_state_and_refused_with_a_passwor
         assert!(!why.contains(bad), "{why}");
     }
     let mut ok = raw(Mode::Frontend);
-    ok.database = Some("postgresql:///kbf?host=/run/postgresql".to_owned());
+    ok.database = Some("postgresql:///kbf?host=/run/postgresql&user=kbf".to_owned());
     assert!(ok.validate(Platform::Linux).is_ok());
 }
 
@@ -642,6 +648,8 @@ fn another_scheduler_key_makes_the_file_the_operators() {
         token_file: None,
         api_token_file: None,
         state_store: Some(DATABASE),
+        update: None,
+        extra: &[],
     };
     let theirs = format!(
         "mode = \"frontend\"\n[scheduler]\nstate-store = \"{DATABASE}\"\nheartbeat-interval-ms = 500\n"
@@ -682,6 +690,55 @@ fn without_password_keeps_the_user_and_the_rest() {
     }
 }
 
+/// A database made for one test and dropped with it, `kbf_t_<pid>_<n>`: the schema `setup`
+/// creates is not in the server's shared database, where another test binary (the server's
+/// "refused start" test) expects none.
+struct ScratchDatabase {
+    name: String,
+    server: String,
+}
+
+impl ScratchDatabase {
+    fn new() -> ScratchDatabase {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("kbf_t_{}_{n}", std::process::id());
+        let server = std::env::var("KBF_TEST_POSTGRES_URL").expect("a test database");
+        postgres::Client::connect(&server, postgres::NoTls)
+            .expect("the test server")
+            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+            .expect("create the test's database");
+        ScratchDatabase { name, server }
+    }
+
+    /// The server's URL with this database in place of its own (the query is kept).
+    fn url(&self) -> String {
+        let (head, query) = self
+            .server
+            .split_once('?')
+            .map_or((self.server.as_str(), None), |(h, q)| (h, Some(q)));
+        let (scheme, rest) = head.split_once("://").expect("a postgres:// URL");
+        let authority = rest.split_once('/').map_or(rest, |(a, _)| a);
+        let mut url = format!("{scheme}://{authority}/{}", self.name);
+        if let Some(query) = query {
+            url.push('?');
+            url.push_str(query);
+        }
+        url
+    }
+}
+
+impl Drop for ScratchDatabase {
+    fn drop(&mut self) {
+        if let Ok(mut admin) = postgres::Client::connect(&self.server, postgres::NoTls) {
+            let _ = admin.batch_execute(&format!(
+                "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
+                self.name
+            ));
+        }
+    }
+}
+
 /// Catches `setup` not reaching a real database through its own seam (the fake-server tests
 /// drive `run` alone): on a fake host, with the real `Postgres` seam, the dry run says what it
 /// would do and creates nothing, `--apply` creates the schema, and a second `--apply` finds
@@ -689,11 +746,9 @@ fn without_password_keeps_the_user_and_the_rest() {
 #[test]
 #[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
 fn setup_creates_the_schema_over_a_real_server() {
-    let url = std::env::var("KBF_TEST_POSTGRES_URL").expect("a test database");
+    let scratch = ScratchDatabase::new();
+    let url = scratch.url();
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("connect");
-    client
-        .batch_execute("DROP SCHEMA IF EXISTS kbf_state CASCADE")
-        .expect("start with no schema");
     let mut r = raw(Mode::Frontend);
     r.database = Some(without_password(&url));
     let backend = Backend {
@@ -806,6 +861,8 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
         token_file: None,
         api_token_file: None,
         state_store: Some(DATABASE),
+        update: None,
+        extra: &[],
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = \"postgres:///other?host=/run/postgresql\"\nheartbeat-interval-ms = 500\n";
     let Decision::Refuse(why) = decide(Some(theirs), &ours, "/etc/kbf/kbf.toml") else {
@@ -833,6 +890,8 @@ fn an_invalid_config_file_is_refused_without_its_text() {
         token_file: None,
         api_token_file: None,
         state_store: Some(DATABASE),
+        update: None,
+        extra: &[],
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = postgres://u:PW@h/x\n";
     let Decision::Refuse(why) = decide(Some(theirs), &ours, "/etc/kbf/kbf.toml") else {
@@ -899,6 +958,9 @@ fn gate_files(plist: &str) -> Vec<String> {
 #[test]
 fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
     let mut exec = released(host(), Platform::MacOs);
+    // What the fixture host holds before setup (certificates the checks look for) is not
+    // setup's: only files setup made are compared.
+    let planted: Vec<String> = exec.entries.keys().map(ToString::to_string).collect();
     go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
 
     let files: Vec<String> = exec
@@ -906,6 +968,7 @@ fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
         .iter()
         .filter(|(_, e)| matches!(e, Entry::File { .. }))
         .map(|(p, _)| p.to_string())
+        .filter(|p| !planted.contains(p))
         .collect();
     let written: Vec<&String> = files
         .iter()

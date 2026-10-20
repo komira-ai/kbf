@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- kbf arch-v2 daemon (kbf_av2_mac.sh): edit the config, not this file. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.komira.kbf-daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/kbf/current/kbf</string>
+    <string>--mode=daemon</string>
+    <string>--config</string>
+    <string>/usr/local/etc/kbf/kbf.toml</string>
+  </array>
+  <key>UserName</key>
+  <string>_kbf</string>
+  <key>GroupName</key>
+  <string>_kbf</string>
+  <key>WorkingDirectory</key>
+  <string>/usr/local/kbf/work/daemon</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/usr/local/kbf/work/daemon</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/usr/local/kbf/log/kbf-daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/usr/local/kbf/log/kbf-daemon.err.log</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>65536</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>65536</integer>
+  </dict>
+</dict>
+</plist>

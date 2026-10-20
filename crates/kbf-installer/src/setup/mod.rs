@@ -33,14 +33,21 @@
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
 
 pub mod backend;
+pub mod kbf_settings;
 pub mod kbf_toml;
 pub mod os;
 pub mod paths;
 pub mod plan;
+pub mod provision;
+pub mod proxy;
 pub mod validate;
 
 #[cfg(test)]
-mod fake;
+pub(crate) mod fake;
+#[cfg(test)]
+mod fetch_user_tests;
+#[cfg(test)]
+mod kit_adopted_tests;
 #[cfg(test)]
 mod tests;
 
@@ -175,7 +182,8 @@ pub struct Options {
 
 /// The `installer.toml` this run leaves: the file that is there with the flags' settings put
 /// in, or the defaults with them. A file that is not valid is not overwritten (the operator
-/// decides), and a floor never goes down.
+/// decides), and a floor never goes down. Its `[proxy]` table is kept; on a `--proxy` host the
+/// keys the flags give are put in it ([`proxy::ProxyPlan::merge`]).
 pub fn installer_settings(
     exec: &dyn Exec,
     v: &Valid,
@@ -217,6 +225,9 @@ pub fn installer_settings(
         }
         _ => (None, None),
     };
+    if let Some(plan) = &v.proxy {
+        settings.proxy = Some(plan.merge(settings.proxy.take())?);
+    }
     Ok(settings)
 }
 
@@ -276,9 +287,10 @@ fn find_shadows(
     exec: &dyn Exec,
     mode: Mode,
     journalled: &[crate::migrate::Unit],
+    proxy: bool,
 ) -> Result<Vec<Shadow>, SetupError> {
     let mut found = Vec::new();
-    for unit in plan::mode_units(mode) {
+    for unit in plan::mode_units(mode, proxy) {
         let path = format!("/etc/systemd/system/{unit}");
         let Some(Entry::File { bytes, .. }) = exec.inspect(&HostPath::new(&path)?)? else {
             continue;
@@ -331,13 +343,19 @@ pub fn run(
         os.trusted_binary()?;
     }
     let valid = raw.validate(os.platform()).map_err(SetupError::Invalid)?;
-    let ctx = plan::context(os, valid.mode)?;
+    let mut ctx = plan::context(os, valid.mode)?;
     let journalled = migrated_units(backend, ctx.platform)?;
+    ctx.kit_adopted = backend.migrations.kit_adopted()?;
     let shadows = if ctx.platform == Platform::Linux {
-        find_shadows(&*exec, valid.mode, &journalled)?
+        find_shadows(&*exec, valid.mode, &journalled, valid.proxy.is_some())?
     } else {
         Vec::new()
     };
+    let service_uid = ctx.service.as_ref().map(|u| u.uid);
+    kbf_settings::check_files(&*exec, &valid.kbf, service_uid)?;
+    if let Some(proxy) = &valid.proxy {
+        kbf_settings::check_files(&*exec, &proxy.files(), service_uid)?;
+    }
     let mut notes = Vec::new();
 
     let before = plan::before_release(os, &*exec, &valid, &ctx)?;
@@ -364,10 +382,28 @@ pub fn run(
     // The schema is made after `installer.toml` is in place and before anything is fetched or
     // enabled: a database that cannot be reached stops setup with no release and no unit.
     if let Some(url) = &valid.database {
-        let schema = backend.schemas.of(url)?;
-        let line = database_step(&*schema, mode_name(valid.mode), options.apply)
-            .map_err(SetupError::Database)?;
-        writeln!(out, "{line}")?;
+        let created = match &valid.local_database {
+            Some(local) => provision::provision(os, exec, local, options.apply, out)?,
+            None => provision::Next::Schema,
+        };
+        if created == provision::Next::Pending {
+            writeln!(
+                out,
+                "kbf-installer setup ({}): database step: dry run: the database does not exist yet, so its schema would be created after it",
+                mode_name(valid.mode)
+            )?;
+        } else {
+            let schema = backend.schemas.of(url)?;
+            schema
+                .reach()
+                .map_err(|why| provision::unreached(&why, valid.mode))?;
+            if let Some(local) = &valid.local_database {
+                provision::check_service_login(os, &*exec, local, valid.mode)?;
+            }
+            let line = database_step(&*schema, mode_name(valid.mode), options.apply)
+                .map_err(SetupError::Database)?;
+            writeln!(out, "{line}")?;
+        }
     }
 
     let mut have_release = released(&*exec, &ctx.layout)?;
@@ -446,6 +482,9 @@ pub fn cli(
         min_generation: args.min_generation,
         commit: args.commit.clone(),
         database: args.database.clone(),
+        kbf: args.kbf.clone(),
+        proxy: args.proxy.clone(),
+        create_local_database: args.create_local_database,
         installer_config: args.installer_config.as_ref().map(ToString::to_string),
     };
     let options = Options {

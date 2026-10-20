@@ -103,6 +103,43 @@ pub fn platform_state(releases: &Value, commit: &str, platform: &str) -> &'stati
     }
 }
 
+/// The hash of the release set the store holds for `commit`: the SHA-256 of the sorted lines
+/// `<sha256>  <platform>/<name>`, one per component (and attestation) it lists. `None` when
+/// the listing names nothing for the commit. It is the hash of what is being deployed, in the
+/// `SHA256SUMS` manner but not the same bytes; a caller that has `SHA256SUMS` passes its hash
+/// (`--set-hash`).
+pub fn set_hash(releases: &Value, commit: &str) -> Option<kbf_gate::SetHash> {
+    let mut lines: Vec<String> = releases
+        .get("releases")?
+        .as_array()?
+        .iter()
+        .filter(|r| r.get("commit").and_then(Value::as_str) == Some(commit))
+        .flat_map(|r| {
+            r.get("platforms")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .flat_map(|p| {
+            let platform = p.get("platform").and_then(Value::as_str).unwrap_or("");
+            p.get("components")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(move |c| {
+                    let sha = c.get("sha256").and_then(Value::as_str).unwrap_or("");
+                    let name = c.get("name").and_then(Value::as_str).unwrap_or("");
+                    format!("{sha}  {platform}/{name}\n")
+                })
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort();
+    Some(kbf_gate::SetHash::of_sums(lines.concat().as_bytes()))
+}
+
 /// The desired release from `GET /v1/update`.
 pub fn desired(update: &Value) -> Option<Previous> {
     let d = update.get("desired")?;
@@ -155,5 +192,29 @@ mod tests {
         assert_eq!(of(json!({"software": {"arch": "arm64"}})), None);
         assert_eq!(of(json!({"update": {"platform": "beos-ppc"}})), None);
         assert_eq!(of(json!({})), None);
+    }
+
+    /// Proves the release-set hash is none for a listing that names nothing for the commit (no
+    /// release of it, or one with no components), and is the same whatever order the store
+    /// lists the components in. Catches an empty set hashed as if it were a release.
+    ///
+    /// Mutants planted: the empty check removed (the hash of nothing is returned); the lines
+    /// left unsorted.
+    #[test]
+    fn the_set_hash_is_none_for_nothing_and_independent_of_order() {
+        use super::set_hash;
+        let c = |sha: &str, name: &str| json!({"sha256": sha, "name": name});
+        let rel = |comps: Vec<serde_json::Value>| {
+            json!({"releases": [{"commit": "abc", "platforms": [
+                {"platform": "linux-x86_64", "components": comps}]}]})
+        };
+        assert!(set_hash(&json!({"releases": []}), "abc").is_none());
+        assert!(set_hash(&rel(vec![]), "abc").is_none());
+        assert!(set_hash(&rel(vec![c("1", "a")]), "other").is_none());
+        let one = set_hash(&rel(vec![c("1", "a"), c("2", "b")]), "abc").expect("hash");
+        let two = set_hash(&rel(vec![c("2", "b"), c("1", "a")]), "abc").expect("hash");
+        assert_eq!(one, two);
+        let other = set_hash(&rel(vec![c("1", "a")]), "abc").expect("hash");
+        assert_ne!(one, other);
     }
 }

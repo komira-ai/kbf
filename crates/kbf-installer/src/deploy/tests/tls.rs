@@ -205,11 +205,14 @@ pub(super) fn run_tls(
         let clock = Clk(farm.now.clone());
         let smoke = FixedSmoke(smoke);
         let check = FixedCheck(Ok(true));
+        let observed = Obs(farm);
         let env = Env {
             api: https,
+            observe: &observed,
             clock: &clock,
             smoke: &smoke,
             check: &check,
+            probe: &NoProbe,
         };
         deploy(&env, o, bundle)
     })

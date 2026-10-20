@@ -101,13 +101,13 @@ pub trait Gate {
 }
 
 /// Forward, backward-compatible Postgres migrations. The kbf child never alters tables
-/// (CEO 14:58Z), so this runs before the candidate starts.
-///
-/// OPEN: who implements it (a root-half order or the proxy) and with which database
-/// credential is undecided. The swap needs only this call.
+/// (CEO 14:58Z), so this runs before the candidate starts. The real one is
+/// [`super::migrator::DbMigrator`].
 pub trait Migrator {
     /// Apply every forward migration release `release` needs. Idempotent: running it
-    /// again after a crash changes nothing.
+    /// again after a crash changes nothing. An `Err` text starts with a stable refusal
+    /// word and a colon ([`super::migrator::Refusal::word`]); it never carries the
+    /// database URL.
     fn migrate_forward(&self, release: &CommitId) -> Result<(), PortError>;
 }
 
@@ -141,6 +141,28 @@ pub trait RootOrders {
 
     /// Drop the staged release; `current` was never touched (Q2).
     fn revert(&self, commit: &CommitId) -> Result<(), PortError>;
+}
+
+/// The two facts of the root half's `status.json` that the migration reads, and nothing
+/// that writes an order. Every [`RootOrders`] has them; the proxy's start has no order spool
+/// (that is the update API's), so it reads them through
+/// [`super::root_orders::StatusFile`] alone.
+pub trait StatusFacts {
+    /// As [`RootOrders::staged`].
+    fn staged(&self) -> Result<Option<StagedFacts>, PortError>;
+
+    /// As [`RootOrders::installed`].
+    fn installed(&self) -> Result<Option<CommitId>, PortError>;
+}
+
+impl<T: RootOrders> StatusFacts for T {
+    fn staged(&self) -> Result<Option<StagedFacts>, PortError> {
+        RootOrders::staged(self)
+    }
+
+    fn installed(&self) -> Result<Option<CommitId>, PortError> {
+        RootOrders::installed(self)
+    }
 }
 
 /// Time. `now` is the wall clock as a duration since the Unix epoch, so a bake start

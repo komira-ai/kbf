@@ -291,9 +291,18 @@ What the code does today:
   worker is feasible for it only if its node report lists a driver that serves the
   kind (`container`, `native`, `fake` or `local` for `action`, `native-whole-machine` for
   `whole_machine`; see [capabilities.md](capabilities.md#driver-entries)).
-- A placement round walks the queue in order and gives each operation to the first
-  live, feasible worker, in name order, whose capabilities satisfy its platform and
-  that has room for it. An action has room where its free room (capacity minus
+- A placement round walks the queue in order and gives each operation to the least
+  loaded live, feasible worker whose capabilities satisfy its platform and that has
+  room for it: the one with the least booked as a share of its capacity (the larger of
+  its CPU share and its memory share, each booked over capacity, compared exactly in
+  integers), then the fewest leases, then the first in name order. Work therefore
+  spreads over the farm instead of filling the first worker. The platform and the room
+  are decided first and the load only ranks the workers that pass, so a Mac is never the
+  least loaded worker for Linux work. The memory share counts what leases booked, though
+  admission does not (below), and is not capped at 1: a worker booked past its memory is
+  still more loaded than one booked less. A whole-machine lease, and an action at a
+  worker's whole memory, go only to a worker with no lease, so their candidates tie and
+  the first by name is taken. An action has room where its free room (capacity minus
   bookings) fits the whole request on every axis and no whole-machine lease is held. A
   `whole_machine` lease has room only on a worker that holds no lease and is at least
   its request large; it books the worker's whole capacity, which its `Start` carries.
@@ -305,7 +314,14 @@ What the code does today:
   urgent, or as urgent and younger) is placed there, so that worker empties as its
   leases end; operations before it still are. The hold lasts while the operation is
   queued and the worker could run it (live, not cordoned, feasible). No lease is ever
-  stopped for it. A large `action` request has no such hold yet (issue #169).
+  stopped for it. An `action` holds no worker: one at the whole memory of a worker (the
+  last rung of the memory ladder, which runs alone there) waits until some worker's
+  free memory meets its request, that is, until a worker has no lease. Under sustained
+  spread load that wait can be long, and nothing reserves a worker for it; callers
+  wait. A large `action` request has no such hold either (issue #169), and spreading
+  makes it likelier to wait than first fit did: with eight one-core leases on two
+  workers of eight cores, first fit leaves one worker empty and a six-core action runs
+  at once, while spreading leaves four on each and it waits for cores to free.
 - A request with `ios.device=1` has room only where a device the worker reports
   satisfies every `ios.device.*` attribute of the request and no lease holds it, and
   where the worker holds no other device lease (`DEVICE_LEASES_PER_WORKER` = 1, until
