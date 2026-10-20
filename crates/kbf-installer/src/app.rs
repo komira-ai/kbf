@@ -20,11 +20,12 @@ use crate::cli::{BootArgs, Cli, RunArgs, Verb};
 use crate::database::Database;
 use crate::exit::Exit;
 use crate::helper::cycle::{Config, Helper, HelperError};
+use crate::helper::fetcher_host::HostFetcher;
+use crate::helper::leases;
 use crate::helper::operator::{self, Operator};
 use crate::helper::restart::Restart;
 use crate::helper::serve::{FileIdentity, Flow, PASS_INTERVAL, Serve};
 use crate::helper::service::HostProcs;
-use crate::helper::{fetcher, leases};
 use crate::layout::{Layout, Platform};
 use crate::proxy_verb;
 use crate::release::ReleaseError;
@@ -116,6 +117,14 @@ fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
     run_from(root, args, &me, watch)
 }
 
+/// The `installer.toml` the fetcher reads: `--installer-config`, else the file `setup` writes.
+fn installer_toml_of(args: &RunArgs) -> HostPath {
+    match &args.installer_config {
+        Some(path) => path.clone(),
+        None => crate::layout::path(setup::paths::INSTALLER_TOML),
+    }
+}
+
 /// The helper `run` drives: the host's, with the schema step of `--installer-config` attached
 /// when the flag is given.
 fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failure> {
@@ -136,13 +145,18 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
         starts: args.starts,
         min_activation_interval_secs: args.min_activation_interval_secs,
     };
-    // The release fetcher and the lease source are wired by later changes; until then an
-    // activation of a release that is not installed, and every activation, is refused.
+    // The fetcher reads `installer.toml` (the flag's, else the host's own) at each fetch. The
+    // lease source is wired by a later change; until then every activation is refused before
+    // it fetches (the cycle checks leases first), and a frontend update is refused after its
+    // download, at the pipeline's lease step.
+    let fetcher = HostFetcher::on_host(layout.clone(), installer_toml_of(args), || {
+        Box::new(leases::NotWired)
+    });
     let mut helper = Helper::new(
         layout,
         exec,
         cfg,
-        Box::new(fetcher::NotWired),
+        Box::new(fetcher),
         Box::new(leases::NotWired),
         Box::new(HostProcs::new(platform)),
     );

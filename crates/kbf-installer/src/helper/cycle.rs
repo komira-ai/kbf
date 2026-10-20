@@ -137,6 +137,12 @@ impl<E: Exec> Helper<E> {
         &mut self.exec
     }
 
+    /// The fetcher, for a test to see what a caller attached.
+    #[cfg(test)]
+    pub(crate) fn fetcher(&self) -> &dyn Fetcher {
+        &*self.fetcher
+    }
+
     /// The fetcher, replaced by a test.
     #[cfg(test)]
     pub(super) fn set_fetcher(&mut self, fetcher: Box<dyn Fetcher>) {

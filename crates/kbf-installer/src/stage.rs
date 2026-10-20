@@ -71,6 +71,7 @@ use crate::binary::{Arch, BinaryKind, Version};
 use crate::darwin;
 use crate::helper::fetcher::InstalledRelease;
 use crate::helper::leases::LeaseSource;
+use crate::installer_toml::InstallerToml;
 use crate::layout::{Layout, Platform};
 use crate::refusal::{ArchiveFault, FactsFault, Refusal, TrustFault, VersionFault, WHAT_PROBE};
 use crate::run::{Runner, Spawn};
@@ -209,6 +210,25 @@ pub struct Supported {
     pub state_schema: u64,
 }
 
+/// What this build of the installer understands, which is what [`Policy::of`] gives a host.
+///
+/// **Decision D3 (open, with the lead):** these numbers decide which releases a host can ever
+/// accept, and the installer never updates itself, so a release that raises one is refused
+/// (`installer_too_old`) until a newer installer is put on the host by hand. They are the
+/// numbers of the first protocol (1 and 1) and the newest state schema this build embeds a
+/// migration for (the installer migrates the database to the release's schema before the
+/// swap, so a schema it does not embed is one it cannot reach). The installer cannot link
+/// `kbf-server` for the protocol numbers; `kbf-cli`'s test
+/// `the_installer_understands_what_kbf_declares` fails when a release would declare more
+/// than these.
+pub fn supported() -> Supported {
+    Supported {
+        protocol: 1,
+        min_protocol: 1,
+        state_schema: u64::from(kbf_state::postgres::schema::latest()),
+    }
+}
+
 /// What the host decides about how a release is verified.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -220,6 +240,20 @@ pub struct Policy {
     pub min_protocol: u64,
     pub supported: Supported,
     pub timeouts: Timeouts,
+}
+
+impl Policy {
+    /// The policy of a host whose `installer.toml` is `toml`: its component cap and operator
+    /// floor, this build's [`supported`] numbers, the contract's timeouts and binary cap.
+    pub fn of(toml: &InstallerToml) -> Policy {
+        Policy {
+            max_component_bytes: toml.max_component_bytes,
+            max_binary_bytes: MAX_BINARY,
+            min_protocol: u64::from(toml.min_protocol),
+            supported: supported(),
+            timeouts: Timeouts::DEFAULT,
+        }
+    }
 }
 
 /// A release that passed every check and is installed in `releases/<commit>/`. The state does

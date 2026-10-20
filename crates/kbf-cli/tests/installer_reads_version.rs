@@ -45,3 +45,44 @@ fn the_installer_parses_what_kbf_prints() {
     }
     assert_eq!(parsed.platform, None);
 }
+
+/// The installer refuses a release that declares a `protocol`, `min_protocol` or
+/// `state_schema` above the numbers it understands (`installer_too_old`), and it is put on a
+/// host by hand, never updated by a release. So the numbers `kbf --version --json` declares
+/// must never pass those the installer of the same build understands: the day the worker
+/// protocol or the state schema moves on, this fails until the installer's numbers move with
+/// it (decision D3: they are the lead's to raise).
+///
+/// Catches a protocol bump, a `min_protocol` raise or a new migration that would leave every
+/// host's installer refusing the next release as too old.
+///
+/// Mutants planted: `kbf_installer::stage::supported()` with `protocol: 0`; the server's
+/// `PROTOCOL_VERSION` raised to 2.
+#[test]
+fn the_installer_understands_what_kbf_declares() {
+    let said = kbf_cli::version::identity();
+    let num = |k: &str| {
+        said[k]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{k} is a number"))
+    };
+    let understood = kbf_installer::stage::supported();
+    assert!(
+        understood.protocol >= num("protocol"),
+        "kbf speaks protocol {}, the installer understands {}",
+        num("protocol"),
+        understood.protocol
+    );
+    assert!(
+        understood.min_protocol >= num("min_protocol"),
+        "kbf's oldest protocol is {}, the installer understands {}",
+        num("min_protocol"),
+        understood.min_protocol
+    );
+    assert!(
+        understood.state_schema >= num("state_schema"),
+        "kbf embeds schema {}, the installer understands {}",
+        num("state_schema"),
+        understood.state_schema
+    );
+}

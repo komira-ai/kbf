@@ -18,8 +18,10 @@
 //!   empty plan; changed flags rewrite the files atomically and never restart a running
 //!   service. An operator floor (`min_generation`) only goes up.
 //! - The first release comes through [`Releases`], the installer's one downloader (the
-//!   [`Fetcher`](crate::helper::fetcher::Fetcher); the binary has none wired in yet, so
-//!   `--commit` stops before `kbf.toml` with that reason). On a frontend or all-in-one host the
+//!   [`Fetcher`](crate::helper::fetcher::Fetcher); the binary's is
+//!   [`HostFetcher`](crate::helper::fetcher_host::HostFetcher), which reads `installer.toml`
+//!   when asked, so it sees the file this run wrote; a fetch that fails stops `--commit` before
+//!   `kbf.toml` with its reason). On a frontend or all-in-one host the
 //!   state database's schema is created or brought forward ([`Schemas`]) once `installer.toml`
 //!   is written, and a unit that makes a frontend is enabled and never started.
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
@@ -47,7 +49,9 @@ use self::validate::{Raw, Valid, mode_name};
 use crate::cli::{Mode, SetupArgs};
 use crate::database::database_step;
 use crate::exit::Exit;
-use crate::helper::fetcher::{FetchError, NotWired};
+use crate::helper::fetcher::FetchError;
+use crate::helper::fetcher_host::HostFetcher;
+use crate::helper::leases;
 use crate::installer_toml::{InstallerToml, Source};
 use crate::layout::{Layout, Platform};
 use crate::release::ReleaseError;
@@ -356,6 +360,17 @@ pub fn run(
     Ok(())
 }
 
+/// The fetcher of the first release (`--commit`): the host's own, which reads
+/// `installer_config` when it is asked.
+///
+/// Its lease source is the one the helper has, [`NotWired`](crate::helper::leases::NotWired),
+/// which refuses at the verify pipeline's lease step, after the download. Nothing can be live
+/// on a host with no release, but only the order kind says so: a pipeline that skips the lease
+/// step for a frontend update (komira-ai/kbf#1235) is what lets this run to the end.
+fn first_release_fetcher(layout: Layout, installer_config: HostPath) -> HostFetcher {
+    HostFetcher::on_host(layout, installer_config, || Box::new(leases::NotWired))
+}
+
 /// The verb as the binary runs it, on the host under `root`.
 pub fn cli(
     root: PathBuf,
@@ -383,10 +398,11 @@ pub fn cli(
         apply,
         no_start: args.no_start,
     };
-    // The installer has no release fetcher wired in yet (the fetch child is a later change):
-    // `--commit` says so and stops before it writes `kbf.toml`.
+    // The first release is fetched after `installer.toml` is written and the fetch user made,
+    // both by this run, so the fetcher reads them when `--commit` asks, not now.
     let layout = Layout::new(Root::new(&root)?, platform);
-    let releases = Fetching::new(&NotWired, layout, HostExec::new(Root::new(&root)?));
+    let fetcher = first_release_fetcher(layout.clone(), args.installer_config.clone());
+    let releases = Fetching::new(&fetcher, layout, HostExec::new(Root::new(&root)?));
     let backend = Backend {
         releases: &releases,
         schemas: &Postgres,
