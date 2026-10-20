@@ -151,13 +151,15 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      # The cache holds target/, and a push run left its coverage counters in
-      # target/llvm-cov-target (*.profraw, *.profdata). `llvm-cov report` merges every profile
-      # there, so a run that restored them reported counters from another source version
-      # (lines no test reaches marked missed) or failed ('profile file is not compatible').
-      # Every run starts with none of them.
-      - name: Drop coverage profiles the cache restored
-        run: if [ -d target/llvm-cov-target ]; then find target/llvm-cov-target -name '*.profraw' -delete; find target/llvm-cov-target -name '*.profdata' -delete; fi
+      # The cache holds target/, and a push run left the WORKSPACE's instrumented test binaries
+      # and coverage profiles in target/llvm-cov-target. `llvm-cov report` reads every
+      # instrumented binary and profile there, so a run that restored them merged a binary built
+      # from older sources (its old lines, now blank or doc lines, reported as missed) or failed
+      # ('profile file is not compatible'). `llvm-cov clean --workspace` removes the workspace's
+      # own artifacts and profiles and keeps the dependencies' builds, which are what the cache
+      # is for.
+      - name: Drop the workspace's coverage artifacts the cache restored
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
       # nextest runs a process per test, so a test's line coverage must not rest on another
       # test of the process: a `tracing` macro evaluates its fields only when a subscriber is
       # registered, so a test that runs one installs its own (`tracing::subscriber::set_default`
@@ -240,9 +242,9 @@ jobs:
           name: coverage
           path: target/coverage/lcov.info
           if-no-files-found: error
-      # and the cache it saves holds none of this run's profiles either
+      # and the cache it saves holds none of this run's workspace coverage artifacts either
       - if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
-        run: if [ -d target/llvm-cov-target ]; then find target/llvm-cov-target -name '*.profraw' -delete; find target/llvm-cov-target -name '*.profdata' -delete; fi
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov clean --workspace
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.event_name == 'push' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
