@@ -48,6 +48,14 @@ export function zoneConfig(get: (key: string) => unknown): ZoneConfig {
   return { account, domain };
 }
 
+/** `-c noDomain=true` reaches CDK as the string 'true'; anything else non-empty must not silently pick domain mode. */
+export function noDomain(get: (key: string) => unknown): boolean {
+  const v = get('noDomain');
+  if (v === undefined || v === null || v === '' || v === false || v === 'false') return false;
+  if (v === true || v === 'true') return true;
+  throw new Error(`-c noDomain must be true or false, got '${String(v)}'`);
+}
+
 export function siteConfig(get: (key: string) => unknown): SiteConfig {
   const base = zoneConfig(get);
   const repo = String(get('githubRepo') ?? '');

@@ -1,5 +1,5 @@
 import { App } from 'aws-cdk-lib';
-import { REGION, siteConfig, zoneConfig } from '../lib/config';
+import { REGION, noDomain, siteConfig, zoneConfig } from '../lib/config';
 import { ZoneStack } from '../lib/dns-stack';
 import { SiteStack } from '../lib/site-stack';
 
@@ -17,7 +17,7 @@ if (get('githubRepoId') !== undefined) {
   new SiteStack(app, {
     env,
     config: siteConfig(get),
-    noDomain: get('noDomain') === true || get('noDomain') === 'true',
+    noDomain: noDomain(get),
     oidcProviderArn:
       (get('oidcProviderArn') as string | undefined) ??
       `arn:aws:iam::${zone.account}:oidc-provider/token.actions.githubusercontent.com`,

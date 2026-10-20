@@ -305,6 +305,16 @@ describe('upload', () => {
     expect(f.calls.some((c) => c.args.includes('releases/latest.json') || c.args.some((a) => a.endsWith('/releases/')))).toBe(false);
   });
 
+  test('the final catch-all sync keeps releases/ and the live version.txt out of its --delete', () => {
+    const f = fake(answers());
+    main(flags('--apply'), f.t);
+    const syncs = f.calls.filter((c) => c.cmd === 'aws' && c.args[1] === 'sync');
+    const last = syncs[syncs.length - 1].args.join(' ');
+    expect(last).not.toContain('--include');
+    expect(last).toContain('--exclude releases/*');
+    expect(last).toContain('--exclude version.txt');
+  });
+
   test('content types and cache-control per class: assets immutable, pages short', () => {
     const f = fake(answers());
     main(flags('--apply'), f.t);
