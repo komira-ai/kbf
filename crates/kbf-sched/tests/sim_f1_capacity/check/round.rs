@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use kbf_types::{ControlRecord, Effect, LeaseId, OperationId, WorkerId};
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
 
 use super::{
     Checker, Held, Room, State, add, by_load, exclusive, fits_beside, fits_whole, queue_key,
@@ -83,10 +82,6 @@ impl Checker {
         let mut expected = Vec::new();
         let mut verdicts = Vec::new();
         let mut left_over = false;
-        // The workers held this round for an operation that runs alone: nothing after it
-        // in the queue is placed there. And which operation holds which.
-        let mut held_back: BTreeSet<WorkerId> = BTreeSet::new();
-        let mut holds: BTreeMap<OperationId, WorkerId> = BTreeMap::new();
         for &id in &order {
             let (need, res) = (self.ops[&id].need, self.ops[&id].resources);
             if expected.len() < ROUND {
@@ -94,10 +89,7 @@ impl Checker {
                 let mut placed: Option<&WorkerId> = None;
                 for name in &names {
                     let cap = self.workers[name].capacity;
-                    if !held_back.contains(name)
-                        && fits_beside(cap, booked[name], res)
-                        && self.matches(need, name)
-                    {
+                    if fits_beside(cap, booked[name], res) && self.matches(need, name) {
                         let better = placed.is_none_or(|best| {
                             let load = |n: &WorkerId| (self.workers[n].capacity, booked[n]);
                             by_load(load(name), load(best)) == Ordering::Less
@@ -133,43 +125,8 @@ impl Checker {
             if expected.len() == ROUND && v != Verdict::Servable {
                 self.stats.verdicts_past_cut += 1;
             }
-            // A servable operation that fits nowhere now and would run alone on some
-            // worker (an action at the whole memory of a worker that could run it)
-            // holds one worker it would run alone on, so that it empties: the one it
-            // held last round while that could still run it, else the one with the
-            // fewest leases, then the least booked, then the first by name. A worker
-            // with less memory than the action asks for, or with more, is not one.
-            let mut alone_on = |name: &WorkerId| {
-                let capacity = self.workers[name].capacity;
-                exclusive(capacity, res) && fits_whole(capacity, res) && self.matches(need, name)
-            };
-            let alone = names.iter().any(&mut alone_on);
-            if v == Verdict::Servable && alone {
-                let mut could: Vec<&WorkerId> = Vec::new();
-                for name in &names {
-                    if !held_back.contains(name) && alone_on(name) {
-                        could.push(name);
-                    }
-                }
-                let kept = self
-                    .holds
-                    .get(&id)
-                    .and_then(|held| could.iter().copied().find(|name| *name == held));
-                let emptiest = || {
-                    could
-                        .iter()
-                        .copied()
-                        .min_by_key(|name| (booked[*name].leases, booked[*name].booked))
-                };
-                if let Some(name) = kept.or_else(emptiest) {
-                    held_back.insert(name.clone());
-                    holds.insert(id, name.clone());
-                }
-            }
             verdicts.push((id, v));
         }
-        self.stats.holds += holds.len() as u64;
-        self.holds = holds;
         if expected.len() == ROUND {
             self.stats.full_rounds += 1;
             self.stats.cut_rounds += u64::from(left_over);
