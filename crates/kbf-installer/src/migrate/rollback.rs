@@ -18,6 +18,7 @@ use super::old::OldLock;
 use super::services::Services;
 use super::tree::{self, Rules};
 use super::units;
+use super::units::Unit;
 use super::{Migration, Outcome, Report};
 use crate::backup::utc_stamp;
 use crate::layout::Layout;
@@ -192,6 +193,10 @@ fn plan(mode: Mode, kit: bool, unknown_state: Option<String>) -> Report {
 }
 
 /// Put the host back on the old layout, or (in a dry run) say what would be done.
+/// The package's installer job on a Mac (`packaging/macos`), stopped by a kit-host rollback
+/// when `--installer-unit` names none.
+const KIT_INSTALLER_JOB: &str = "com.komira.kbf-installer.plist";
+
 pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Report, MigrateError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -302,19 +307,24 @@ pub fn rollback_at<E: Exec>(
         // nothing of the installer may be able to act. The job goes first, then the file its
         // `KeepAlive` waits on, then the tree it would run; a run that died between them
         // finds the same suffix in the journal and finishes with it.
-        if let Some(installer) = &m.installer_unit {
-            if svc
-                .is_active(installer)
-                .map_err(MigrateError::io(installer.as_str()))?
-            {
-                svc.stop(installer)
-                    .map_err(MigrateError::io(installer.as_str()))?;
-                report.line(mode, format!("booted out {installer}"));
-            }
-            svc.disable(installer)
+        // A kit host's installer job is always the package's, named or not: its `KeepAlive`
+        // waits on the `installer.toml` moved aside below, so it is stopped first in every
+        // case, and the order of the two moves cannot let it start.
+        let installer = match &m.installer_unit {
+            Some(named) => named.clone(),
+            None => Unit::new(KIT_INSTALLER_JOB).expect("a plist name"),
+        };
+        if svc
+            .is_active(&installer)
+            .map_err(MigrateError::io(installer.as_str()))?
+        {
+            svc.stop(&installer)
                 .map_err(MigrateError::io(installer.as_str()))?;
-            report.line(mode, format!("disabled {installer}"));
+            report.line(mode, format!("booted out {installer}"));
         }
+        svc.disable(&installer)
+            .map_err(MigrateError::io(installer.as_str()))?;
+        report.line(mode, format!("disabled {installer}"));
         let suffix = match journal.aside.clone() {
             Some(suffix) => suffix,
             None => {

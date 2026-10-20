@@ -221,6 +221,32 @@ fn asides(rig: &Rig, dir: &str, name: &str) -> Vec<String> {
 /// Mutant seen red: `installer.toml` left out of the moves; the installer's job left
 /// booted out before the kit's own is back (the order assertion, red on the first run of
 /// this test before the change).
+/// Catches a kit-host rollback that stops the installer's job only when `--installer-unit`
+/// names it: without the flag the job must still be booted out and disabled before either
+/// file moves, or launchd could start `kbf-installer run` from a tree that is moving.
+///
+/// Mutant seen red: the kit branch's default job removed (`None` skips the stop).
+#[test]
+fn a_kit_rollback_stops_the_installer_job_without_the_flag() {
+    let mut rig = adopted_with_installer("hands-off-noflag", Form::New);
+    let mut m = rig.migration();
+    m.installer_unit = None;
+    let report = rollback(&m, &mut rig.host, Mode::Apply).expect("rollback");
+    assert_eq!(report.outcome, Outcome::RolledBack);
+    assert!(!rig.active.borrow().contains(INSTALLER_JOB));
+    let events = rig.events.borrow().clone();
+    let disabled = events
+        .iter()
+        .position(|e| e.starts_with(&format!("disable {INSTALLER_JOB}")))
+        .unwrap_or_else(|| panic!("no disable in {events:?}"));
+    assert!(
+        events[disabled].ends_with("links=true"),
+        "disabled while the files were still in place: {events:?}"
+    );
+    assert!(!rig.at("usr/local/kbf-installer").exists());
+    assert!(!rig.at(INSTALLER_TOML_PATH).exists());
+}
+
 #[test]
 fn rolling_back_a_kit_host_leaves_no_installer_able_to_act() {
     for form in [Form::New, Form::Old] {
