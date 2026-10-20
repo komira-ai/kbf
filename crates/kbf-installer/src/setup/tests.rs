@@ -113,7 +113,21 @@ fn host() -> FakeExec {
 }
 
 /// A host with a release installed: `releases/current` is a link.
+/// A Mac's `kbf.toml` as `kbf-mac-provision` leaves it for `raw(Mode::Daemon)`: the keys setup
+/// writes, and `[daemon] update-dir`, which setup only checks on a Mac.
+fn provisioned(mut exec: FakeExec) -> FakeExec {
+    let text = format!(
+        "mode = \"daemon\"\n\n[frontend]\nurl = \"https://farm.example:8443\"\n\n[enroll]\ntoken_file = \"{}\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n",
+        Platform::MacOs.enroll_token()
+    );
+    put(&mut exec, Platform::MacOs.kbf_toml(), 0o640, ROOT, &text);
+    exec
+}
+
 fn released(mut exec: FakeExec, platform: Platform) -> FakeExec {
+    if platform == Platform::MacOs {
+        exec = provisioned(exec);
+    }
     exec.entries.insert(
         hp(&current_release(platform)),
         Entry::Link {
@@ -1457,7 +1471,7 @@ fn a_mac_node_gets_its_fetch_account_and_launchd_jobs() {
 fn a_mac_refuses_the_frontend_and_waits_for_a_release() {
     let err = go(&FakeOs::mac(), &mut host(), &raw(Mode::Frontend), APPLY);
     assert!(matches!(err, Err(SetupError::Unsupported(_))), "{err:?}");
-    let mut exec = host();
+    let mut exec = provisioned(host());
     let out = go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
     assert!(
         cmds(&exec).iter().all(|c| !c.contains("kbf-daemon.plist")),
@@ -1692,7 +1706,7 @@ mod backup_dropin;
 /// Mutant seen red: `ctx.kit_adopted` left false.
 #[test]
 fn the_journals_kit_flag_picks_the_kbf_toml_decision() {
-    const KIT: &str = "mode = \"daemon\"\n\n[identity]\nnode-id = \"mac-a\"\n";
+    const KIT: &str = "mode = \"daemon\"\n\n[identity]\nnode-id = \"mac-a\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n";
     let mut os = FakeOs::mac();
     os.users.push(user("_kbf-fetch", 303));
     os.users.last_mut().expect("user").home = "/var/empty".to_owned();
@@ -1714,9 +1728,10 @@ fn the_journals_kit_flag_picks_the_kbf_toml_decision() {
     ok.expect("kit host");
     let written = text(&exec, "/usr/local/etc/kbf/kbf.toml");
     assert!(written.starts_with(KIT.trim_end()), "{written}");
+    assert!(written.contains("[frontend]"), "{written}");
     assert!(
-        written.contains("update-dir = \"/var/db/kbf-installer\""),
-        "{written}"
+        !written.contains("orders-dir"),
+        "a Mac's keys are not written: {written}"
     );
     let (refused, _) = go_kit(Standing::Done(&[]));
     assert!(

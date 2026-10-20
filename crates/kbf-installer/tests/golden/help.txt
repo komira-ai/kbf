@@ -147,11 +147,11 @@ Options:
       --json
           Print the result as one JSON object on standard output
       --update-dir <UPDATE_DIR>
-          Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it [default: /var/lib/kbf-installer]
+          Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it. Default: the host's state directory (`/var/lib/kbf-installer`, `/var/db/kbf-installer` on a Mac)
       --apply
           Do what the verb says. Without it a mutating verb is a dry run
       --orders-dir <ORDERS_DIR>
-          The order spool: owned by the service user, mode 0700, inside a root-owned parent [default: /var/lib/kbf-installer/orders]
+          The order spool: owned by the service user, mode 0700, inside a root-owned parent. Default: `orders` in the state directory
       --unit <UNIT>
           The systemd unit to restart after a swap (Linux). Without it and without `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one packaged kbf-installer.service serves every mode
       --launchd-label <LAUNCHD_LABEL>
