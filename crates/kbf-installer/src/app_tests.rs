@@ -358,8 +358,7 @@ fn no_command_takes_a_positional_argument() {
     assert!(found.is_empty(), "{found:?}");
 }
 
-/// Catches the public verb list drifting from the contract's table (section 2) plus the
-/// state database's `backup` and `restore` (frontend-proxy.md section 11): the visible
+/// Catches the public verb list drifting from the contract's table (section 2): the visible
 /// verbs, and that the three internal ones stay out of the help.
 #[test]
 fn the_visible_verbs_are_the_contracts() {
@@ -385,8 +384,6 @@ fn the_visible_verbs_are_the_contracts() {
             "migrate",
             "quiesce",
             "check",
-            "backup",
-            "restore",
             "proxy"
         ]
     );
@@ -1542,6 +1539,3 @@ fn a_path_is_not_joined_to_a_relative_root() {
         PathBuf::from("/srv/root/etc/kbf/installer.toml")
     );
 }
-
-#[path = "app_backup_tests.rs"]
-mod backup_cli;

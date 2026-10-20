@@ -159,7 +159,7 @@ fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
     };
     assert_eq!(installer_writes(&exec), 1);
     let up = Server::fresh();
-    let mut os = settled(&["kbf-frontend.service", "kbf-backup.timer"]);
+    let mut os = settled(&["kbf-frontend.service"]);
     os.users.push(user("kbf-server", 989));
     let out = go_on(&os, &mut exec, &Unwired, &up, &raw(Mode::Frontend), APPLY).expect("finished");
     assert_eq!(
