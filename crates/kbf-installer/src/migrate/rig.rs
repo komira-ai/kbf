@@ -69,6 +69,10 @@ pub struct Rig {
     pub events: Rc<RefCell<Vec<String>>>,
     /// Make the next `start` fail.
     pub fail_start: Rc<Cell<bool>>,
+    /// The systemd units that are enabled, by file name (none to begin with).
+    pub enabled: Rc<RefCell<BTreeSet<String>>>,
+    /// Make `enable --now` fail.
+    pub fail_enable: Rc<Cell<bool>>,
     /// Called with the verb and the unit file of every service command before it is answered
     /// (`stop`, `start`, `is-active`, `daemon-reload` with no unit): what a test plays as
     /// the host doing something while the migration is in that call.
@@ -123,12 +127,16 @@ impl Rig {
         let active = Rc::new(RefCell::new(BTreeSet::new()));
         let events = Rc::new(RefCell::new(Vec::new()));
         let fail_start = Rc::new(Cell::new(false));
+        let enabled = Rc::new(RefCell::new(BTreeSet::new()));
+        let fail_enable = Rc::new(Cell::new(false));
         let on_command: Rc<RefCell<Option<CommandHook>>> = Rc::new(RefCell::new(None));
         host.answer = Box::new({
-            let (active, events, fail_start, root, on_command) = (
+            let (active, events, fail_start, enabled, fail_enable, root, on_command) = (
                 active.clone(),
                 events.clone(),
                 fail_start.clone(),
+                enabled.clone(),
+                fail_enable.clone(),
                 root.clone(),
                 on_command.clone(),
             );
@@ -146,6 +154,9 @@ impl Rig {
                     ("/usr/bin/systemctl", ["daemon-reload"]) => ("daemon-reload", String::new()),
                     ("/usr/bin/systemctl", ["is-active", "--quiet", "--", u]) => {
                         ("is-active", (*u).to_owned())
+                    }
+                    ("/usr/bin/systemctl", ["enable", "--now", "--", u]) => {
+                        ("enable --now", (*u).to_owned())
                     }
                     ("/usr/bin/systemctl", [verb, "--", u]) => (verb, (*u).to_owned()),
                     ("/bin/launchctl", ["bootstrap", "system", plist]) => (
@@ -171,6 +182,28 @@ impl Rig {
                         "",
                         "",
                     )),
+                    "is-enabled" if enabled.borrow().contains(&unit) => {
+                        Ok(reply(0, "enabled\n", ""))
+                    }
+                    "is-enabled" => Ok(reply(1, "disabled\n", "")),
+                    "enable --now" if fail_enable.get() => {
+                        Err(io::Error::other("planted: enable failed"))
+                    }
+                    "enable --now" => {
+                        enabled.borrow_mut().insert(unit.clone());
+                        active.borrow_mut().insert(unit.clone());
+                        record(format!("enable --now {unit}"));
+                        Ok(reply(0, "", ""))
+                    }
+                    "enable" | "disable" => {
+                        if verb == "enable" {
+                            enabled.borrow_mut().insert(unit.clone());
+                        } else {
+                            enabled.borrow_mut().remove(&unit);
+                        }
+                        record(format!("{verb} {unit}"));
+                        Ok(reply(0, "", ""))
+                    }
                     "stop" => {
                         active.borrow_mut().remove(&unit);
                         record(format!("stop {unit}"));
@@ -199,6 +232,8 @@ impl Rig {
             active,
             events,
             fail_start,
+            enabled,
+            fail_enable,
             on_command,
             lock_wait: Duration::from_secs(20),
             kit: false,
@@ -337,6 +372,13 @@ impl Rig {
                 source: Source::Url,
                 min_generation: Some(17),
             },
+            node_user: Some(kbf_host::RunUser {
+                name: "kbf".to_owned(),
+                uid: me(),
+                gid: rustix::process::getgid().as_raw(),
+                groups: Vec::new(),
+                home: "/nonexistent".to_owned(),
+            }),
             lock_wait: self.lock_wait,
         }
     }

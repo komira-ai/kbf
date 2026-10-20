@@ -44,7 +44,7 @@ pub enum Verb {
     Status,
     /// Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap.
     Run(RunArgs),
-    /// Order an update of this host's own frontend (root, inline).
+    /// Swap this host's frontend through the proxy's update API, and wait for it.
     Update(UpdateArgs),
     /// Keep the pending swap, naming its activation.
     Confirm(ActivationArgs),
@@ -172,9 +172,32 @@ pub struct UpdateArgs {
     /// The release to update to (40 hex characters).
     #[arg(long)]
     pub commit: CommitId,
-    /// Update this host's frontend. Node updates come on the frontend's order, not from here.
+    /// Update this host's frontend: ask the update API of the proxy to swap it, and wait.
     #[arg(long, required = true)]
     pub frontend: bool,
+    /// The proxy's public address, `127.0.0.1:port`: the update API is served there.
+    #[arg(long)]
+    pub api: String,
+    /// CA certificates (PEM) the API's certificate is verified against, besides the system's.
+    #[arg(long)]
+    pub api_ca: Option<std::path::PathBuf>,
+    /// The name the API's certificate carries (the address's own IP when none is given).
+    #[arg(long)]
+    pub api_server_name: Option<String>,
+    /// The operator token the API takes: a file of mode 0600 or 0400. `setup` writes it here.
+    #[arg(long, default_value = "/etc/kbf/api-token")]
+    pub token_file: std::path::PathBuf,
+    /// Have the new frontend update the nodes once it has baked. Without it only the
+    /// frontend is swapped.
+    #[arg(long)]
+    pub nodes: bool,
+    /// Names this update to the API, so a run repeated after a lost connection is the same
+    /// update. Random when not given.
+    #[arg(long)]
+    pub request_id: Option<String>,
+    /// How long to wait for the update to end, the new frontend's bake included.
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
+    pub handover_timeout_s: u64,
 }
 
 #[derive(Args)]
@@ -301,7 +324,8 @@ pub struct MigrateArgs {
     /// The old helper's unit: stopped and disabled, so the installer is the only manager.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub helper_unit: Option<crate::migrate::Unit>,
-    /// The installer's own unit, which a rollback stops and disables first.
+    /// The installer's own unit: enabled and started as the last step of a migration, stopped
+    /// and disabled first by a rollback.
     #[arg(long, value_parser = crate::migrate::Unit::new)]
     pub installer_unit: Option<crate::migrate::Unit>,
     /// Where the host gets its releases: decides where the replay floor is seeded from.
@@ -359,11 +383,16 @@ pub struct ProxyArgs {
     /// `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac).
     #[arg(long)]
     pub config: Option<std::path::PathBuf>,
+    /// The order spool the update API writes and the root half reads: owned by the service
+    /// user. As `run --orders-dir`.
+    #[arg(long, default_value = "/var/lib/kbf-installer/orders")]
+    pub orders_dir: std::path::PathBuf,
     /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
     #[arg(long)]
     pub check: bool,
     /// Root's directory: the proxy reads `status.json` here, to start the installed release
-    /// when no frontend child is running.
+    /// when no frontend child is running, and the update API reads its status. As
+    /// `run --update-dir`.
     #[arg(long, default_value = "/var/lib/kbf-installer")]
     pub update_dir: std::path::PathBuf,
 }
@@ -401,12 +430,19 @@ impl Verb {
     }
 
     /// Every verb but `status`, `check`, `proxy` (which runs as the unprivileged service
-    /// user), `backup` and `restore` needs root. `backup` and `restore` run as the user that
-    /// is the database's role under peer authentication, which root is not.
+    /// user), `update` (a client of the proxy's update API: it needs whoever can read the
+    /// token file, which is the only thing it asks of its user), `backup` and `restore` needs
+    /// root. `backup` and `restore` run as the user that is the database's role under peer
+    /// authentication, which root is not.
     pub fn needs_root(&self) -> bool {
         !matches!(
             self,
-            Verb::Status | Verb::Check | Verb::Proxy(_) | Verb::Backup(_) | Verb::Restore(_)
+            Verb::Status
+                | Verb::Check
+                | Verb::Proxy(_)
+                | Verb::Update(_)
+                | Verb::Backup(_)
+                | Verb::Restore(_)
         )
     }
 
@@ -422,7 +458,6 @@ impl Verb {
         match self {
             Verb::Setup(_)
             | Verb::Run(_)
-            | Verb::Update(_)
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
@@ -436,6 +471,10 @@ impl Verb {
             | Verb::Quiesce
             | Verb::Migrate(_)
             | Verb::Proxy(_)
+            // `update` only POSTs to the proxy's API as an unprivileged client, and the proxy
+            // exists only on a new-layout host; the root half of an update (`run`) is guarded.
+            // `dispatch` returns for it before the old-layout guard, so the table says so.
+            | Verb::Update(_)
             | Verb::Backup(_)
             | Verb::Restore(_)
             | Verb::FetchChild(_) => false,
@@ -450,6 +489,7 @@ impl Verb {
             Verb::Run(_)
             | Verb::BootCheck(_)
             | Verb::Proxy(_)
+            | Verb::Update(_)
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
@@ -463,7 +503,6 @@ impl Verb {
             | Verb::FetchChild(_) => None,
             Verb::Check => Some("P10"),
             Verb::Status => Some("P4"),
-            Verb::Update(_) => Some("P13"),
             Verb::Activate => Some("P5"),
             Verb::Stage => Some("P8"),
         }
