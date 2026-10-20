@@ -44,7 +44,7 @@ pub enum Verb {
     Status,
     /// Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap.
     Run(RunArgs),
-    /// Order an update of this host's own frontend (root, inline).
+    /// Swap this host's frontend through the proxy's update API, and wait for it.
     Update(UpdateArgs),
     /// Keep the pending swap, naming its activation.
     Confirm(ActivationArgs),
@@ -141,9 +141,32 @@ pub struct UpdateArgs {
     /// The release to update to (40 hex characters).
     #[arg(long)]
     pub commit: CommitId,
-    /// Update this host's frontend. Node updates come on the frontend's order, not from here.
+    /// Update this host's frontend: ask the update API of the proxy to swap it, and wait.
     #[arg(long, required = true)]
     pub frontend: bool,
+    /// The proxy's public address, `127.0.0.1:port`: the update API is served there.
+    #[arg(long)]
+    pub api: String,
+    /// CA certificates (PEM) the API's certificate is verified against, besides the system's.
+    #[arg(long)]
+    pub api_ca: Option<std::path::PathBuf>,
+    /// The name the API's certificate carries (the address's own IP when none is given).
+    #[arg(long)]
+    pub api_server_name: Option<String>,
+    /// The operator token the API takes: a file of mode 0600 or 0400. `setup` writes it here.
+    #[arg(long, default_value = "/etc/kbf/api-token")]
+    pub token_file: std::path::PathBuf,
+    /// Have the new frontend update the nodes once it has baked. Without it only the
+    /// frontend is swapped.
+    #[arg(long)]
+    pub nodes: bool,
+    /// Names this update to the API, so a run repeated after a lost connection is the same
+    /// update. Random when not given.
+    #[arg(long)]
+    pub request_id: Option<String>,
+    /// How long to wait for the update to end, the new frontend's bake included.
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
+    pub handover_timeout_s: u64,
 }
 
 #[derive(Args)]
@@ -271,10 +294,11 @@ impl Verb {
         }
     }
 
-    /// Every verb but `status`, `check` and `proxy` (which runs as the unprivileged service
-    /// user) needs root.
+    /// Every verb but `status`, `check`, `proxy` (which runs as the unprivileged service
+    /// user) and `update` (a client of the proxy's update API: it needs whoever can read the
+    /// token file, which is the only thing it asks of its user) needs root.
     pub fn needs_root(&self) -> bool {
-        !matches!(self, Verb::Status | Verb::Check | Verb::Proxy(_))
+        !matches!(self, Verb::Status | Verb::Check | Verb::Proxy(_) | Verb::Update(_))
     }
 
     /// The pull request of the contract (section 9) that builds the verb, `None` for the
@@ -284,6 +308,7 @@ impl Verb {
             Verb::Run(_)
             | Verb::BootCheck(_)
             | Verb::Proxy(_)
+            | Verb::Update(_)
             | Verb::Confirm(_)
             | Verb::Revert(_)
             | Verb::Rollback(_)
@@ -292,7 +317,6 @@ impl Verb {
             | Verb::Setup(_) => None,
             Verb::Check => Some("P10"),
             Verb::Status => Some("P4"),
-            Verb::Update(_) => Some("P13"),
             Verb::Activate => Some("P5"),
             Verb::Stage => Some("P8"),
             Verb::FetchChild => Some("P7"),

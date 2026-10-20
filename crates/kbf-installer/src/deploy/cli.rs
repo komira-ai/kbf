@@ -30,7 +30,7 @@ pub const USAGE: &str = "usage: kbf-installer deploy --commit <40hex> [--api <12
 
 /// How long one call to the API may take, a release upload included (each read and write
 /// of the connection is held to it).
-const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Where the CAS smoke dials and how it verifies a TLS listener; from the flags, else the
 /// host's config. With no address the frontend's own config names it ([`smoke_for`]).

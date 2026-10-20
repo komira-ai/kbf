@@ -32,6 +32,9 @@ pub mod smoke;
 #[cfg(test)]
 pub(super) mod smoke_tests;
 mod summary;
+pub mod update;
+#[cfg(test)]
+mod update_tests;
 #[cfg(test)]
 mod tests;
 
@@ -118,6 +121,9 @@ pub struct Options {
     pub request_id: String,
     /// Without it: read-only steps, then print the plan.
     pub apply: bool,
+    /// Ask the new frontend to update the nodes once it has baked (the update API's `nodes`).
+    /// `deploy` does; `update` leaves it to the caller.
+    pub nodes: bool,
     pub node_timeout: Duration,
     /// The whole frontend step: the POST (and its retries) and the wait for `done`. It
     /// includes the new frontend's bake.
@@ -138,6 +144,7 @@ impl Options {
             commit,
             request_id,
             apply: false,
+            nodes: true,
             node_timeout: Duration::from_secs(1800),
             handover_timeout: Duration::from_secs(3600),
             smoke_timeout: Duration::from_secs(60),
@@ -280,6 +287,25 @@ pub fn deploy(env: &Env, opts: &Options, bundle: Option<&mut dyn Read>) -> Summa
     run.sum.ended = summary::utc(env.clock.now());
     match outcome {
         Ok(()) => {}
+        Err(f) => run.sum.end(f.exit, f.reason, &f.detail),
+    }
+    run.sum
+}
+
+/// The frontend step of a deploy, alone: ask the update API to swap the frontend and wait for
+/// the update to end. `kbf-installer update --frontend` is this. No bundle, no preflight, no
+/// node watch and no smoke: the summary holds the one step.
+pub fn update_frontend(env: &Env, opts: &Options) -> Summary {
+    let mut run = Run {
+        env,
+        opts,
+        sum: Summary::new(&opts.commit, env.clock.now()),
+        expected: BTreeMap::new(),
+    };
+    let outcome = run.step("frontend", |r| r.update_frontend());
+    run.sum.ended = summary::utc(env.clock.now());
+    match outcome {
+        Ok(()) => run.sum.end(Exit::Ok, "", ""),
         Err(f) => run.sum.end(f.exit, f.reason, &f.detail),
     }
     run.sum

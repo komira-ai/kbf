@@ -29,14 +29,8 @@ fn run_as(euid: u32, args: &[&str]) -> (Exit, String, String) {
 /// Every verb of the contract's table and the pull request that builds it. The verbs that
 /// are not built say so with the phase; the ones that are built (`run`, `setup` and the operator's) are not here.
 fn stubs() -> Vec<(Vec<&'static str>, &'static str, &'static str)> {
-    let commit: &'static str = B;
     vec![
         (vec!["status"], "status", "P4"),
-        (
-            vec!["update", "--commit", commit, "--frontend"],
-            "update",
-            "P13",
-        ),
         (vec!["check"], "check", "P10"),
         (vec!["stage"], "stage", "P8"),
         (vec!["activate"], "activate", "P5"),

@@ -286,6 +286,10 @@ fn finish_setup(
 /// Carry out `cli` as the user `euid`. A verb that fails or is not built says so: as text on
 /// `err`, or with `--json` as one object on `out`. A verb that succeeds prints nothing here.
 pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
+    // `update` prints its own summary line and needs no root: it is a client of the update API.
+    if let Verb::Update(args) = &cli.verb {
+        return crate::deploy::update::run(args, out, err);
+    }
     let name = cli.verb.name();
     let mut say = |code: Exit, text: String, json: serde_json::Value| {
         // A closed pipe is the reader's business; the exit code still tells.
