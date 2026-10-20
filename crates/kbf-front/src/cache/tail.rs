@@ -56,13 +56,12 @@ impl TailState {
         })
     }
 
-    /// Records `seq` of `writer` as handled, joining the ranges next to it.
+    /// Records `seq` of `writer` as handled, joining the ranges next to it. `seq` is one
+    /// [`TailState::holds`] answered no to: a pass skips what it holds, so it never
+    /// handles a seq twice.
     fn insert(&mut self, writer: Writer, seq: u64) {
         let ranges = self.seqs.entry(writer).or_default();
         let at = ranges.partition_point(|&(_, end)| end < seq);
-        if ranges.get(at).is_some_and(|&(start, _)| start <= seq) {
-            return;
-        }
         let joins_next = ranges
             .get(at)
             .is_some_and(|&(start, _)| seq.checked_add(1) == Some(start));
@@ -247,29 +246,25 @@ mod tests {
 
     /// Catches: a range set that forgets a seq, claims one it never saw, or leaves a run of
     /// consecutive seqs as many ranges (the state would grow with every object). Seqs go
-    /// in the order that exercises a new range, each join (before, after, both) and a
-    /// repeat; the ranges and the answers are checked after each.
+    /// in the order that exercises a new range and each join (before, after, both); the
+    /// ranges and the answers are checked after each.
     #[test]
     fn seqs_collapse_to_ranges_and_only_those_are_held() {
         let w = writer(5);
         let mut state = TailState::default();
         assert!(!state.holds(w, 3));
-        for (seq, ranges) in [
-            (3, 1),
-            (5, 2),
-            (4, 1),
-            (3, 1),
-            (10, 2),
-            (9, 2),
-            (7, 3),
-            (8, 2),
-        ] {
+        for (seq, ranges) in [(3, 1), (5, 2), (4, 1), (10, 2), (9, 2), (7, 3), (8, 2)] {
             state.insert(w, seq);
             assert!(state.holds(w, seq), "{seq}");
             assert_eq!(state.ranges(), ranges, "after {seq}");
         }
-        assert_eq!(state.seqs[&w], [(3, 5), (7, 10)]);
-        for missing in [0, 2, 6, 11, u64::MAX] {
+        // A seq beside a range on its low side only, then on its high side only.
+        for (seq, ranges) in [(12, 3), (13, 3)] {
+            state.insert(w, seq);
+            assert_eq!(state.ranges(), ranges, "after {seq}");
+        }
+        assert_eq!(state.seqs[&w], [(3, 5), (7, 10), (12, 13)]);
+        for missing in [0, 2, 6, 11, 14, u64::MAX] {
             assert!(!state.holds(w, missing), "{missing}");
         }
         assert!(!state.holds(writer(6), 3), "another writer's seq 3");
@@ -284,6 +279,7 @@ mod tests {
         state.insert(w, u64::MAX);
         state.insert(w, 0);
         assert_eq!(state.seqs[&w], [(0, 0), (u64::MAX, u64::MAX)]);
-        assert!(state.holds(w, u64::MAX) && state.holds(w, 0));
+        assert!(state.holds(w, u64::MAX));
+        assert!(state.holds(w, 0));
     }
 }

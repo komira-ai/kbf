@@ -408,7 +408,7 @@ async fn an_epoch_writers_own_objects_add_nothing_and_are_read_once() {
 
 /// Catches: a failed footer read taken as the object being no segment (a transient error
 /// then drops a segment for good): the pass fails, remembers nothing, and the next pass
-/// reads and adopts it. Also an object too short to be a segment is counted skipped and
+/// reads and adopts it. Also an object too short to be a segment, and one with a torn tail, are counted skipped and
 /// not read again, and one deleted between the listing and the read is counted gone and
 /// read again if it comes back. Mutants seen red: `SkipReason::Read` counted as skipped
 /// (the first pass succeeds without the blobs); `Gone` remembered (the object that comes
@@ -442,8 +442,14 @@ async fn failed_short_and_gone_objects_are_told_apart() {
             Bytes::from_static(b"0123456789"),
         )
         .await;
+    bucket
+        .put(
+            "kbf/cas/0000000000000009/0000000000000001/0000000000000002",
+            Bytes::from(vec![7_u8; 100]),
+        )
+        .await;
     let ok = node.tail_pass(&mut state, reads()).await.expect("pass");
-    assert_eq!((ok.segments, ok.skipped), (2, 1));
+    assert_eq!((ok.segments, ok.skipped), (2, 2), "short, and torn");
     assert_holds(&node, &theirs).await;
     let again = node.tail_pass(&mut state, reads()).await.expect("pass");
     assert!(again.quiet(), "{again:?}");
