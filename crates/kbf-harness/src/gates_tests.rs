@@ -1,0 +1,625 @@
+//! The gates over planted evidence. Every test starts from a passing run (`pass()`),
+//! changes one thing, and names the defect that a gate which let it through would hide.
+
+use std::collections::BTreeMap;
+
+use super::*;
+use crate::scrape::Scrapes;
+
+/// A scrape of the frontend: it holds no cache, so it carries no lost-blob series.
+fn sample(at: f64, execute_errors: f64) -> Sample {
+    let series = BTreeMap::from([(EXECUTE_ERRORS.to_owned(), execute_errors)]);
+    Sample { at, series }
+}
+
+/// A scrape of a storage node.
+fn node_sample(at: f64, lost: f64, losses: f64) -> Sample {
+    let series = BTreeMap::from([
+        (LOST_BLOBS.to_owned(), lost),
+        (BLOB_LOSSES.to_owned(), losses),
+    ]);
+    Sample { at, series }
+}
+
+fn scrapes(samples: Vec<Sample>) -> Scrapes {
+    Scrapes {
+        samples,
+        failed: 0,
+        last_error: None,
+    }
+}
+
+fn build(ok: bool, failed: Result<u64, String>) -> BuildResult {
+    BuildResult {
+        kind: "compile".to_owned(),
+        ok,
+        failed_actions: failed,
+    }
+}
+
+/// What a healthy ten-second run measured: two builds, eleven scrapes of the frontend and
+/// of each of three storage nodes, nothing lost.
+struct Run {
+    builds: Vec<BuildResult>,
+    scrapes: Scrapes,
+    nodes: Vec<(String, Scrapes)>,
+    exited: Vec<(String, String)>,
+    whole: Result<(), String>,
+    stopped: Vec<(String, String)>,
+    hung: bool,
+}
+
+fn pass() -> Run {
+    Run {
+        builds: vec![build(true, Ok(0)), build(true, Ok(0))],
+        scrapes: scrapes((0..11).map(|i| sample(f64::from(i), 0.0)).collect()),
+        nodes: (1..=3)
+            .map(|n| {
+                let samples = (0..11)
+                    .map(|i| node_sample(f64::from(i), 0.0, 0.0))
+                    .collect();
+                (format!("node-{n}"), scrapes(samples))
+            })
+            .collect(),
+        exited: Vec::new(),
+        whole: Ok(()),
+        stopped: vec![("frontend".to_owned(), "exit 0".to_owned())],
+        hung: false,
+    }
+}
+
+fn gates(run: &Run) -> Vec<Gate> {
+    Evidence {
+        builds: &run.builds,
+        scrapes: &run.scrapes,
+        nodes: &run.nodes,
+        exited_during_load: &run.exited,
+        farm_whole: &run.whole,
+        stopped: &run.stopped,
+        hung: run.hung,
+        load: (
+            "2026-10-18T00:00:00Z".to_owned(),
+            "2026-10-18T00:00:10Z".to_owned(),
+        ),
+        load_secs: 10.0,
+        stop: (
+            "2026-10-18T00:00:10Z".to_owned(),
+            "2026-10-18T00:00:12Z".to_owned(),
+        ),
+        scrape_every_secs: 1.0,
+    }
+    .gates()
+}
+
+/// The verdict of the gate `name`.
+fn verdict(gates: &[Gate], name: &str) -> Verdict {
+    gates
+        .iter()
+        .find(|g| g.name == name)
+        .unwrap_or_else(|| panic!("no gate {name}"))
+        .verdict
+}
+
+/// The names of the failed gates.
+fn failed(run: &Run) -> Vec<String> {
+    gates(run)
+        .into_iter()
+        .filter(|g| g.verdict == Verdict::Fail)
+        .map(|g| g.name)
+        .collect()
+}
+
+#[test]
+fn a_healthy_run_passes_every_gate() {
+    // Catches: a control that is red already, which would make every planted defect
+    // below go red for the wrong reason.
+    let run = pass();
+    assert_eq!(failed(&run), Vec::<String>::new());
+    assert!(all_pass(&gates(&run)));
+    assert_eq!(gates(&run).len(), 11);
+}
+
+#[test]
+fn the_gates_carry_every_field_of_the_document() {
+    // Catches: a renamed or missing field (the offer to gamma reads `name`, `measured`,
+    // `threshold`, `verdict`, `started` and `finished`).
+    let first = serde_json::to_value(&gates(&pass())[0]).expect("json");
+    let mut keys: Vec<&str> = first
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "finished",
+            "measured",
+            "name",
+            "started",
+            "threshold",
+            "verdict"
+        ]
+    );
+    assert_eq!(first["verdict"], "PASS");
+}
+
+#[test]
+fn zero_builds_is_red() {
+    // Catches: a load loop that never ran a build passing every gate on its empty list.
+    let mut run = pass();
+    run.builds.clear();
+    assert!(failed(&run).contains(&"builds_run".to_owned()));
+}
+
+#[test]
+fn a_failed_build_is_red() {
+    // Catches: builds_failed ignoring a nonzero exit or a timeout.
+    let mut run = pass();
+    run.builds.push(build(false, Ok(0)));
+    assert_eq!(failed(&run), ["builds_failed"]);
+}
+
+#[test]
+fn a_failed_action_is_red() {
+    // Catches: a build that exits 0 with a failed action in its event log (an action
+    // Buck2 retried or tolerated) not being counted.
+    let mut run = pass();
+    run.builds.push(build(true, Ok(2)));
+    assert_eq!(failed(&run), ["actions_failed"]);
+}
+
+#[test]
+fn an_unreadable_event_log_is_a_failure() {
+    // Catches: a log that cannot be parsed counting as zero failed actions (fail open).
+    let mut run = pass();
+    run.builds.push(build(true, Err("not gzip".to_owned())));
+    assert_eq!(failed(&run), ["actions_failed"]);
+}
+
+#[test]
+fn a_lost_blob_in_any_scrape_is_red_even_if_the_last_is_zero() {
+    // Catches: the gauge read in the last scrape alone, so a loss that fell back to zero
+    // (the blob uploaded again) hid the loss; and the counter, which never falls, being
+    // the only evidence.
+    let mut run = pass();
+    run.nodes[1].1.samples[5] = node_sample(5.0, 1.0, 0.0);
+    assert_eq!(failed(&run), ["lost_blobs_gauge"]);
+}
+
+#[test]
+fn the_lost_blob_gates_sum_the_storage_nodes() {
+    // Catches: one node's reading taken for the farm's (the first, the last or the
+    // largest), so that a loss on the other nodes is not counted: two nodes that each
+    // lost one blob read 2.
+    let mut run = pass();
+    for node in [0, 2] {
+        run.nodes[node].1.samples[3] = node_sample(3.0, 1.0, 0.0);
+        run.nodes[node].1.samples[10] = node_sample(10.0, 0.0, 1.0);
+    }
+    let gates = gates(&run);
+    for name in ["lost_blobs_gauge", "blob_losses"] {
+        let gate = gates.iter().find(|g| g.name == name).expect("gate");
+        assert_eq!(gate.verdict, Verdict::Fail, "{name}");
+        assert_eq!(gate.measured, json!(2.0), "{name}");
+    }
+}
+
+#[test]
+fn the_frontends_series_are_not_the_lost_blob_evidence() {
+    // Catches: the gates reading the frontend's scrapes (which a frontend that grows the
+    // series would satisfy) instead of the storage nodes', and a farm with no storage
+    // node scraped passing on nothing.
+    let mut run = pass();
+    run.nodes.clear();
+    for s in &mut run.scrapes.samples {
+        s.series.insert(LOST_BLOBS.to_owned(), 0.0);
+        s.series.insert(BLOB_LOSSES.to_owned(), 0.0);
+    }
+    assert_eq!(failed(&run), ["lost_blobs_gauge", "blob_losses"]);
+    let gate = gates(&run)
+        .into_iter()
+        .find(|g| g.name == "blob_losses")
+        .expect("gate");
+    assert!(gate.detail.expect("detail").contains("no storage node"));
+}
+
+#[test]
+fn the_loss_counter_is_a_delta() {
+    // Catches: the counter compared with zero instead of with its first reading (a farm
+    // that restarted over a store that already lost blobs is not this run's loss), and
+    // a loss the gauge missed.
+    let mut run = pass();
+    for s in &mut run.nodes[2].1.samples {
+        s.series.insert(BLOB_LOSSES.to_owned(), 7.0);
+    }
+    assert_eq!(failed(&run), Vec::<String>::new());
+    run.nodes[2].1.samples[10]
+        .series
+        .insert(BLOB_LOSSES.to_owned(), 8.0);
+    assert_eq!(failed(&run), ["blob_losses"]);
+}
+
+#[test]
+fn the_execute_error_counter_is_a_delta() {
+    // Catches: the absolute value used (a start value of 3 read as three failures), or an
+    // increase ignored.
+    let mut run = pass();
+    for s in &mut run.scrapes.samples {
+        s.series.insert(EXECUTE_ERRORS.to_owned(), 3.0);
+    }
+    assert_eq!(failed(&run), Vec::<String>::new());
+    run.scrapes.samples[10]
+        .series
+        .insert(EXECUTE_ERRORS.to_owned(), 4.0);
+    assert_eq!(failed(&run), ["execute_errors"]);
+}
+
+#[test]
+fn an_absent_metric_fails_its_gate_in_the_first_scrape_and_in_a_later_one() {
+    // Catches: an absent series read as zero, so a metric the frontend stops exporting
+    // turns its gate green.
+    for scrape in [0, 7] {
+        let mut run = pass();
+        run.scrapes.samples[scrape].series.remove(EXECUTE_ERRORS);
+        assert_eq!(failed(&run), ["execute_errors"], "scrape {scrape}");
+    }
+}
+
+#[test]
+fn one_storage_nodes_missing_series_fails_the_gate_whatever_the_others_read() {
+    // Catches: the lost-blob gates summing what is there (a node that stopped exporting,
+    // or whose node never answered, adding nothing to a sum of zeros), so that the one
+    // node that lost a blob is the one the gate cannot see; and a detail that does not say
+    // which node.
+    for node in 0..3 {
+        for scrape in [0, 7] {
+            for (name, gate) in [
+                (LOST_BLOBS, "lost_blobs_gauge"),
+                (BLOB_LOSSES, "blob_losses"),
+            ] {
+                let mut run = pass();
+                run.nodes[node].1.samples[scrape].series.remove(name);
+                assert_eq!(
+                    failed(&run),
+                    [gate],
+                    "{name} from node {node}, scrape {scrape}"
+                );
+                let detail = gates(&run)
+                    .into_iter()
+                    .find(|g| g.name == gate)
+                    .and_then(|g| g.detail)
+                    .expect("detail");
+                let who = format!("node-{}: {name} is absent from scrape {scrape}", node + 1);
+                assert!(detail.contains(&who), "{detail}");
+            }
+        }
+    }
+}
+
+#[test]
+fn fewer_than_two_scrapes_pass_no_series_gate() {
+    // Catches: a run whose scraper never got a page passing on a difference of nothing.
+    let mut run = pass();
+    run.scrapes.samples.truncate(1);
+    run.nodes[0].1.samples.truncate(1);
+    let failed = failed(&run);
+    for gate in [
+        "execute_errors",
+        "lost_blobs_gauge",
+        "blob_losses",
+        "scrape_coverage",
+    ] {
+        assert!(failed.contains(&gate.to_owned()), "{gate} in {failed:?}");
+    }
+}
+
+#[test]
+fn a_family_with_labels_is_summed() {
+    // Catches: a labelled series (`name{class="x"}`, which a by-class counter will be)
+    // read as absent, or only its first label counted.
+    let mut s = sample(0.0, 0.0);
+    s.series.remove(EXECUTE_ERRORS);
+    s.series
+        .insert(format!("{EXECUTE_ERRORS}{{class=\"a\"}}"), 2.0);
+    s.series
+        .insert(format!("{EXECUTE_ERRORS}{{class=\"b\"}}"), 3.0);
+    assert_eq!(s.value(EXECUTE_ERRORS), Some(5.0));
+    assert_eq!(s.value("kbf_no_such"), None);
+}
+
+#[test]
+fn a_flaky_scrape_is_a_harness_defect() {
+    // Catches: scrape_coverage not noticing a scraper that read a page in only half of
+    // the seconds, which would leave a loss between two scrapes unseen.
+    let mut run = pass();
+    run.scrapes.samples.truncate(5);
+    assert_eq!(failed(&run), ["scrape_coverage"]);
+}
+
+#[test]
+fn scrapes_that_failed_count_against_coverage() {
+    // Catches: a coverage measured against the length of the load alone. The scrapes of
+    // the settling window and the last one are extra, so a scraper that failed one in four
+    // of its tries still reached the load's scrape count and passed.
+    let mut run = pass();
+    run.scrapes.failed = 4;
+    assert_eq!(failed(&run), ["scrape_coverage"]);
+    // Three failures of fourteen tries: 11 of 14 is 0.79, under 0.9.
+    run.scrapes.failed = 3;
+    assert_eq!(failed(&run), ["scrape_coverage"]);
+    // One of twelve tries is 11 of 12, which is 0.92.
+    run.scrapes.failed = 1;
+    assert!(failed(&run).is_empty(), "{:?}", failed(&run));
+}
+
+#[test]
+fn a_farm_that_is_not_whole_is_red() {
+    // Catches: a node or member that is still running but is no longer part of the farm
+    // (deregistered, or wedged) passing because the builds went to the others.
+    let mut run = pass();
+    run.whole = Err("nodes connected: [], expected [\"node-1\"]".to_owned());
+    assert_eq!(failed(&run), ["farm_whole"]);
+    let gate = gates(&run)
+        .into_iter()
+        .find(|g| g.name == "farm_whole")
+        .expect("gate");
+    assert!(gate.detail.expect("detail").contains("expected"));
+}
+
+#[test]
+fn a_process_that_exited_during_the_load_is_red() {
+    // Catches: a crash of a role the load survived (a retry hid it) passing.
+    let mut run = pass();
+    run.exited
+        .push(("node-2".to_owned(), "signal 9".to_owned()));
+    assert_eq!(failed(&run), ["processes_alive"]);
+    let detail = gates(&run)
+        .into_iter()
+        .find(|g| g.name == "processes_alive")
+        .and_then(|g| g.detail);
+    assert_eq!(detail.as_deref(), Some("node-2: signal 9"));
+}
+
+#[test]
+fn a_process_that_did_not_exit_zero_on_term_is_red() {
+    // Catches: a farm that has to be killed to stop passing.
+    let mut run = pass();
+    run.stopped
+        .push(("daemon-1".to_owned(), "exit 1".to_owned()));
+    assert_eq!(failed(&run), ["clean_stop"]);
+    let gates = gates(&run);
+    let stop = gates.iter().find(|g| g.name == "clean_stop").expect("gate");
+    // The stop gate's window is the stop's, not the load's.
+    assert_eq!(stop.started, "2026-10-18T00:00:10Z");
+    assert_eq!(stop.finished, "2026-10-18T00:00:12Z");
+}
+
+#[test]
+fn a_hang_is_red() {
+    // Catches: a run that hit its wall-clock bound passing on what it had measured.
+    let mut run = pass();
+    run.hung = true;
+    assert_eq!(failed(&run), ["hang"]);
+    assert_eq!(verdict(&gates(&run), "hang"), Verdict::Fail);
+}
+
+#[test]
+fn no_gates_is_not_a_pass() {
+    // Catches: `all_pass` on an empty table, for a run that failed before it judged.
+    assert!(!all_pass(&[]));
+}
+
+#[test]
+fn a_load_of_no_time_has_no_scrape_coverage() {
+    // Catches: a division by a zero load time (NaN, which compares false either way) giving a
+    // verdict by accident.
+    let run = pass();
+    let g = Evidence {
+        builds: &run.builds,
+        scrapes: &run.scrapes,
+        nodes: &run.nodes,
+        exited_during_load: &run.exited,
+        farm_whole: &run.whole,
+        stopped: &run.stopped,
+        hung: false,
+        load: (String::new(), String::new()),
+        load_secs: 0.0,
+        stop: (String::new(), String::new()),
+        scrape_every_secs: 1.0,
+    }
+    .gates();
+    assert_eq!(verdict(&g, "scrape_coverage"), Verdict::Fail);
+}
+
+/// The frontend's execute-error counter, one reading per scrape.
+fn execute_errors(run: &mut Run, readings: &[f64]) {
+    run.scrapes.samples = readings
+        .iter()
+        .enumerate()
+        .map(|(i, v)| sample(i as f64, *v))
+        .collect();
+}
+
+/// The detail of the gate `name`.
+fn detail(run: &Run, name: &str) -> String {
+    gates(run)
+        .into_iter()
+        .find(|g| g.name == name)
+        .and_then(|g| g.detail)
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_counter_that_falls_is_red_whatever_the_ends_say() {
+    // Catches: a counter that went down (a restarted process: its counts began again from
+    // zero) read as "nothing happened". Mutants: the verdict `measured == 0.0` becomes
+    // `<= 0.0` (a delta of -5 passes), or the fall is not looked for (the ends of
+    // [5, ..., 5, 0, 5] agree, and so do a spike's: 0, 5, 0).
+    let mut run = pass();
+    execute_errors(
+        &mut run,
+        &[5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 0.0],
+    );
+    assert_eq!(failed(&run), ["execute_errors"], "a fall to zero");
+    assert!(detail(&run, "execute_errors").contains("reset"));
+    execute_errors(
+        &mut run,
+        &[5.0, 5.0, 5.0, 5.0, 5.0, 0.0, 5.0, 5.0, 5.0, 5.0, 5.0],
+    );
+    assert_eq!(failed(&run), ["execute_errors"], "a fall and a rise back");
+    execute_errors(
+        &mut run,
+        &[0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    assert_eq!(failed(&run), ["execute_errors"], "a spike in the middle");
+    // The same for a storage node's counter, whichever node it is.
+    for node in 0..3 {
+        let mut run = pass();
+        for (i, s) in run.nodes[node].1.samples.iter_mut().enumerate() {
+            s.series
+                .insert(BLOB_LOSSES.to_owned(), if i == 5 { 2.0 } else { 4.0 });
+        }
+        assert_eq!(failed(&run), ["blob_losses"], "node {node}");
+    }
+}
+
+#[test]
+fn a_gauge_below_zero_is_not_zero() {
+    // Catches: the verdict read as "not above zero": a lost-blob gauge of -1 is not a
+    // healthy reading but a defect of what exports it. Mutant: `measured == 0.0` becomes
+    // `<= 0.0` in `nodes_gate`.
+    let mut run = pass();
+    for s in &mut run.nodes[1].1.samples {
+        s.series.insert(LOST_BLOBS.to_owned(), -1.0);
+    }
+    assert_eq!(failed(&run), ["lost_blobs_gauge"]);
+}
+
+#[test]
+fn a_counter_is_judged_by_its_last_reading_less_its_first() {
+    // Catches: the first reading taken from the second scrape (a rise between the first two
+    // scrapes, 0 then 7, hides) and the last taken from before the end; the existing delta
+    // tests change the last reading alone. Mutants: `v[0]` -> `v[1]`, `v[len - 1]` ->
+    // `v[len - 2]` in `counter_delta`.
+    let mut run = pass();
+    execute_errors(
+        &mut run,
+        &[0.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0],
+    );
+    assert_eq!(
+        failed(&run),
+        ["execute_errors"],
+        "a rise in the first interval"
+    );
+    execute_errors(
+        &mut run,
+        &[7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 9.0],
+    );
+    assert_eq!(
+        failed(&run),
+        ["execute_errors"],
+        "a rise in the last interval"
+    );
+    execute_errors(
+        &mut run,
+        &[7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 7.0],
+    );
+    assert_eq!(
+        failed(&run),
+        Vec::<String>::new(),
+        "a counter that stood still"
+    );
+}
+
+#[test]
+fn a_reading_that_is_not_a_finite_number_is_red() {
+    // Catches: NaN and infinities passing by accident of comparison (`NaN == 0.0` is false
+    // today, but `f64::max` skips a NaN, so the gauge's maximum would not see one, and a
+    // difference of two infinities is NaN). Each is red, in the middle of a series as at its
+    // ends, with the reason. Mutant: `series` accepts every `f64`.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for at in [0, 5, 10] {
+            let mut run = pass();
+            run.scrapes.samples[at]
+                .series
+                .insert(EXECUTE_ERRORS.to_owned(), bad);
+            assert_eq!(failed(&run), ["execute_errors"], "{bad} at {at}");
+            assert!(
+                detail(&run, "execute_errors").contains("not a finite number"),
+                "{}",
+                detail(&run, "execute_errors")
+            );
+            let mut run = pass();
+            run.nodes[2].1.samples[at]
+                .series
+                .insert(LOST_BLOBS.to_owned(), bad);
+            assert_eq!(failed(&run), ["lost_blobs_gauge"], "{bad} at {at}");
+        }
+    }
+}
+
+#[test]
+fn the_scrape_coverage_threshold_is_inclusive_at_the_boundary() {
+    // Catches: a threshold off by one in either direction. Nine scrapes of ten tries in a
+    // ten-second load are exactly 0.9: a pass; nine of eleven are 0.82: a fail. Mutant:
+    // `coverage >= MIN_SCRAPE_COVERAGE` becomes `>`.
+    assert!((MIN_SCRAPE_COVERAGE - 0.9).abs() < f64::EPSILON);
+    let mut run = pass();
+    run.scrapes.samples.truncate(9);
+    run.scrapes.failed = 1;
+    assert_eq!(failed(&run), Vec::<String>::new());
+    let gate = gates(&run)
+        .into_iter()
+        .find(|g| g.name == "scrape_coverage")
+        .expect("gate");
+    assert_eq!(gate.measured, json!(0.9));
+    run.scrapes.failed = 2;
+    assert_eq!(failed(&run), ["scrape_coverage"]);
+}
+
+/// A run in which the gate `name`, and only it, fails: the planted defect for each gate.
+/// A gate that is added without a case here fails [`every_gate_has_a_case_that_fails_it_alone`].
+fn broken(name: &str) -> Run {
+    let mut run = pass();
+    match name {
+        "builds_run" => run.builds.clear(),
+        "builds_failed" => run.builds[0].ok = false,
+        "actions_failed" => run.builds[0].failed_actions = Ok(1),
+        "execute_errors" => {
+            run.scrapes.samples[10]
+                .series
+                .insert(EXECUTE_ERRORS.to_owned(), 1.0);
+        }
+        "lost_blobs_gauge" => run.nodes[0].1.samples[4] = node_sample(4.0, 1.0, 0.0),
+        "blob_losses" => run.nodes[0].1.samples[10] = node_sample(10.0, 0.0, 1.0),
+        "scrape_coverage" => run.scrapes.failed = 5,
+        "processes_alive" => run
+            .exited
+            .push(("node-2".to_owned(), "signal 9".to_owned())),
+        "farm_whole" => run.whole = Err("nodes connected: []".to_owned()),
+        "clean_stop" => run
+            .stopped
+            .push(("daemon-1".to_owned(), "exit 1".to_owned())),
+        "hang" => run.hung = true,
+        other => panic!("gate {other} has no failing case: add it to `broken`"),
+    }
+    run
+}
+
+#[test]
+fn every_gate_has_a_case_that_fails_it_alone() {
+    // Catches: a gate that is never seen red, the kind that cannot fail: every gate the
+    // evidence produces must name a planted defect (`broken`) that turns it, and nothing
+    // else, red; the control (`pass`) is green. A gate added without its case fails here.
+    // Mutant: any gate's verdict made constant `PASS` (or its row dropped, which the count
+    // in `a_healthy_run_passes_every_gate` also sees).
+    let names: Vec<String> = gates(&pass()).into_iter().map(|g| g.name).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for name in &names {
+        assert_eq!(failed(&broken(name)), [name.as_str()], "{name}");
+        assert!(seen.insert(name.clone()), "{name} is listed twice");
+    }
+    assert_eq!(names.len(), 11);
+}
