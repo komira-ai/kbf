@@ -10,6 +10,7 @@
 
 mod support;
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,7 @@ use kbf_daemon::Runtime;
 use kbf_driver_native::network::Isolation;
 use kbf_driver_native::xcode;
 use kbf_driver_native::{NativeConfig, NativeRuntime};
+use kbf_testkit::dir::TestDir;
 use support::{MemoryCas, Spec, config, run, runtime, scratch, stderr, stdout, user_folder, work};
 
 /// The actions' `PATH`.
@@ -217,7 +219,11 @@ async fn no_action_writes_outside_its_lease() {
     open.isolation = Isolation::None;
     // The runtimes first: a start sweeps the scratch root, the other lease included.
     let (sandboxed, open) = (runtime(sandboxed, &cas), runtime(open, &cas));
-    let tmp = PathBuf::from(format!("/tmp/kbf-sandbox-test-{}", std::process::id()));
+    // A directory in `/tmp` holds the file the actions try to make there; open to every
+    // user, as `/tmp` itself is, so only the sandbox stands between an action and it.
+    let in_tmp = TestDir::under("/tmp", "kbf-sandbox-test");
+    std::fs::set_permissions(&in_tmp, std::fs::Permissions::from_mode(0o777)).expect("open");
+    let tmp = in_tmp.join("file");
     let domain = format!("kbf.sandbox-test.{}", std::process::id());
 
     let to = Targets::fresh(&dir, &tmp, &domain);
@@ -294,7 +300,6 @@ async fn no_action_writes_outside_its_lease() {
     }
     forget(&domain);
     to.forget_user_files();
-    let _ = std::fs::remove_file(&tmp);
 }
 
 /// Catches a profile that also refuses the writes an action must make: in its working
