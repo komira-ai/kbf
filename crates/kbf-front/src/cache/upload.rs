@@ -131,7 +131,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// # Errors
     /// [`CacheError::DigestMismatch`] for the first record that does not hash to its
     /// digest; [`CacheError::Internal`] if the hashing job failed.
-    async fn verify_built(&self, segment: BuiltSegment) -> Result<BuiltSegment, CacheError> {
+    pub(crate) async fn verify_built(
+        &self,
+        segment: BuiltSegment,
+    ) -> Result<BuiltSegment, CacheError> {
         let BuiltSegment { body, entries, .. } = segment;
         let records_len = Footer::parse(&body, body.len() as u64)?.records_len();
         let work = body.clone();
@@ -152,8 +155,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         // The same entry count as the declared footer, so the same length.
         let footer = encode_footer(records_len, &found.good);
         let records = &body[..usize::try_from(records_len).unwrap_or(body.len())];
+        // A fresh whole-segment copy (up to a segment's length), counted
+        // (`kbf_bytes_in_flight`) from its allocation until `store_segment` is done with
+        // it; the body it replaces is given back as this returns.
+        let copy = kbf_storage::in_flight::hold((records.len() + footer.len()) as u64);
+        let verified = [records, footer.as_slice()].concat();
         Ok(BuiltSegment {
-            body: Bytes::from([records, footer.as_slice()].concat()),
+            body: kbf_storage::in_flight::counted_with(verified, copy),
             entries: found.good,
             verified: true,
             staged: None,
