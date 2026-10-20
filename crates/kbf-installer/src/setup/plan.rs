@@ -477,6 +477,7 @@ pub fn after_release(
         token_file: v.token_file.as_ref().map(|_| paths::enroll_token(platform)),
         api_token_file: serves_api(v.mode).then_some(paths::api_token(platform)),
         state_store: v.database.as_deref(),
+        extra: &v.kbf,
     };
     let current = match exec.inspect(&hp(kbf_toml_path)?)? {
         Some(Entry::File { bytes, .. }) => Some(String::from_utf8_lossy(&bytes).into_owned()),

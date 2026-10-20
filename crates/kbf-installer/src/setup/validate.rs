@@ -7,6 +7,7 @@
 //! `frontend` and `all-in-one` hosts do not enroll, so they take neither and fetch from a
 //! file server.
 
+use super::kbf_settings::{KbfFlags, Setting};
 use super::paths;
 use crate::CommitId;
 use crate::cli::{Mode, ReleaseSource};
@@ -26,6 +27,8 @@ pub struct Raw {
     pub commit: Option<CommitId>,
     /// `--database`: the state database's URL.
     pub database: Option<String>,
+    /// The listener, certificate and storage-client flags of a frontend or all-in-one host.
+    pub kbf: KbfFlags,
     /// `--create-local-database`.
     pub create_local_database: bool,
     /// `--installer-config`, as the host path it names; `None` is the platform's default.
@@ -48,6 +51,8 @@ pub struct Valid {
     /// The state database's `postgres://` URL, for the modes that keep their state there. It
     /// has no password and no character a TOML string would escape. No message quotes it.
     pub database: Option<String>,
+    /// The `kbf.toml` settings the listener, certificate and storage flags give.
+    pub kbf: Vec<Setting>,
     /// With `--create-local-database`: what to create, from the URL.
     pub local_database: Option<LocalDatabase>,
 }
@@ -116,6 +121,7 @@ impl Raw {
         };
 
         let (database, local_database) = self.database(&mut problems);
+        let kbf = self.kbf.validate(self.mode, &mut problems);
         let installer_toml = paths::installer_toml(platform);
         if self
             .installer_config
@@ -146,6 +152,7 @@ impl Raw {
                 min_generation: self.min_generation,
                 commit: self.commit.clone(),
                 database,
+                kbf,
                 local_database,
             }),
             _ => Err(problems),

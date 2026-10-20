@@ -31,6 +31,7 @@
 //! - `kbf.toml` is written after every file a unit needs, and the units after it.
 
 pub mod backend;
+pub mod kbf_settings;
 pub mod kbf_toml;
 pub mod os;
 pub mod paths;
@@ -335,6 +336,8 @@ pub fn run(
     } else {
         Vec::new()
     };
+    let service_uid = ctx.service.as_ref().map(|u| u.uid);
+    kbf_settings::check_files(&*exec, &valid.kbf, service_uid)?;
     let mut notes = Vec::new();
 
     let before = plan::before_release(os, &*exec, &valid, &ctx)?;
@@ -450,6 +453,7 @@ pub fn cli(
         min_generation: args.min_generation,
         commit: args.commit.clone(),
         database: args.database.clone(),
+        kbf: args.kbf.clone(),
         create_local_database: args.create_local_database,
         installer_config: args.installer_config.as_ref().map(ToString::to_string),
     };

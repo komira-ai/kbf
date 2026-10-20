@@ -648,6 +648,7 @@ fn another_scheduler_key_makes_the_file_the_operators() {
         token_file: None,
         api_token_file: None,
         state_store: Some(DATABASE),
+        extra: &[],
     };
     let theirs = format!(
         "mode = \"frontend\"\n[scheduler]\nstate-store = \"{DATABASE}\"\nheartbeat-interval-ms = 500\n"
@@ -859,6 +860,7 @@ fn an_error_about_a_file_never_repeats_the_database_url() {
         token_file: None,
         api_token_file: None,
         state_store: Some(DATABASE),
+        extra: &[],
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = \"postgres:///other?host=/run/postgresql\"\nheartbeat-interval-ms = 500\n";
     let Decision::Refuse(why) = decide(Some(theirs), &ours, "/etc/kbf/kbf.toml") else {
@@ -886,6 +888,7 @@ fn an_invalid_config_file_is_refused_without_its_text() {
         token_file: None,
         api_token_file: None,
         state_store: Some(DATABASE),
+        extra: &[],
     };
     let theirs = "mode = \"frontend\"\n[scheduler]\nstate-store = postgres://u:PW@h/x\n";
     let Decision::Refuse(why) = decide(Some(theirs), &ours, "/etc/kbf/kbf.toml") else {
@@ -926,6 +929,9 @@ fn gate_files(plist: &str) -> Vec<String> {
 #[test]
 fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
     let mut exec = released(host(), Platform::MacOs);
+    // What the fixture host holds before setup (certificates the checks look for) is not
+    // setup's: only files setup made are compared.
+    let planted: Vec<String> = exec.entries.keys().map(ToString::to_string).collect();
     go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
 
     let files: Vec<String> = exec
@@ -933,6 +939,7 @@ fn the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac() {
         .iter()
         .filter(|(_, e)| matches!(e, Entry::File { .. }))
         .map(|(p, _)| p.to_string())
+        .filter(|p| !planted.contains(p))
         .collect();
     let written: Vec<&String> = files
         .iter()
