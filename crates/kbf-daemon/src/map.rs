@@ -115,11 +115,12 @@ impl HeldMaps {
     /// and may move between the reads: a retained map that is not older than `map` is the
     /// same map or a newer one, and is left out.
     fn view(&self, map: Arc<Map>) -> MapView {
+        let newest = map.generation();
         let mut history = self
             .holder
             .history()
             .into_iter()
-            .filter(|retained| retained.generation() < map.generation());
+            .filter(|retained| retained.generation() < newest);
         let previous = history.next();
         MapView {
             map,
