@@ -143,6 +143,13 @@ fn die_with_parent(parent: i32) -> io::Result<()> {
             libc::getppid(),
         )
     };
+    death_signal_outcome(set, now, parent)
+}
+
+/// The verdict on the `prctl` result `set` and the current parent pid `now`. Its own function
+/// so a test can reach the refusal of a failed `prctl`, which the kernel never gives here.
+#[cfg(target_os = "linux")]
+fn death_signal_outcome(set: i32, now: i32, parent: i32) -> io::Result<()> {
     if set != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -302,11 +309,51 @@ mod tests {
         unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, 0) };
     }
 
-    fn piped(script: &str) -> Reaped {
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", script])
-            .stdout(std::process::Stdio::piped());
+    /// Catches a verdict that lets a failed `prctl` through: a non-zero result is an error even
+    /// when the parent matches, and a zero result with the right parent is accepted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_death_signal_verdict_refuses_a_failed_prctl() {
+        assert!(death_signal_outcome(-1, 7, 7).is_err());
+        assert!(death_signal_outcome(0, 7, 7).is_ok());
+    }
+
+    /// Catches a guard that returns without reaping, or that never escalates: a child that
+    /// ignores SIGTERM is killed after the grace period and is gone (no process, no zombie)
+    /// when the guard is dropped.
+    #[test]
+    fn dropping_the_guard_kills_a_child_that_ignores_sigterm() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        // SAFETY: the hook only calls `signal`, which is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let child = spawn(&mut command, 3).expect("spawn");
+        let pid = child.id().cast_signed();
+        drop(child);
+        // SAFETY: signal 0 only probes; the pid was reaped by the guard.
+        let probe = unsafe { libc::kill(pid, 0) };
+        assert_eq!(probe, -1, "the child is still there");
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    /// Catches a guard that signals a child that already exited and was waited for.
+    #[test]
+    fn dropping_the_guard_of_an_exited_child_returns_at_once() {
+        let mut child = spawn(&mut Command::new("true"), 3).expect("spawn");
+        child.wait().expect("wait");
+        let started = Instant::now();
+        drop(child);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    fn piped(program: &str, args: &[&str]) -> Reaped {
+        let mut command = Command::new(program);
+        command.args(args).stdout(std::process::Stdio::piped());
         spawn(&mut command, 3).expect("spawn")
     }
 
@@ -314,7 +361,7 @@ mod tests {
     /// deadline is `TimedOut`.
     #[test]
     fn first_line_of_a_silent_child_times_out() {
-        let mut child = piped("sleep 30");
+        let mut child = piped("sleep", &["30"]);
         let out = child.stdout.take().expect("stdout");
         let err = first_line(out, Duration::from_millis(100)).expect_err("silent");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
@@ -324,7 +371,7 @@ mod tests {
     /// are not UTF-8 surface as the read error itself, not as `TimedOut`.
     #[test]
     fn first_line_passes_a_read_error_through() {
-        let mut child = piped("printf '\\377\\n'");
+        let mut child = piped("printf", &["\\377\\n"]);
         let out = child.stdout.take().expect("stdout");
         let err = first_line(out, Duration::from_secs(10)).expect_err("not UTF-8");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -334,7 +381,7 @@ mod tests {
     /// reader still holds what follows.
     #[test]
     fn first_line_returns_the_line_and_the_reader() {
-        let mut child = piped("echo one; echo two");
+        let mut child = piped("printf", &["one\\ntwo\\n"]);
         let out = child.stdout.take().expect("stdout");
         let (line, mut reader) = first_line(out, Duration::from_secs(10)).expect("line");
         assert_eq!(line, "one\n");
