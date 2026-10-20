@@ -877,7 +877,8 @@ impl Members {
                 .map(|stored| decode_row(&stored))
                 .transpose()?
                 .is_some_and(|live| live.member.state == MemberState::Draining);
-            if !draining {
+            // As for a join, only a farm that holds data has a handoff to bound.
+            if !draining && self.holds_data()? {
                 self.pins_full()?;
             }
         }

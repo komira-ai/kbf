@@ -243,6 +243,11 @@ async fn held_maps_view_the_holder_and_give_up_on_a_map_that_never_comes() {
     let error = maps.refetch(9).await.expect_err("never comes");
     assert_eq!(error.at_least, 9);
     assert!(error.reason.contains("5s"), "{error}");
+    assert_eq!(
+        *holder.asks().borrow(),
+        9,
+        "the wait was recorded for the session"
+    );
 }
 
 /// Catches a view that shows one map before the newest: a blob written before several quick
@@ -265,11 +270,6 @@ async fn held_maps_view_every_map_the_holder_retains() {
     assert_eq!(earlier, [6, 5, 4]);
     let history: Vec<u64> = view.history().iter().map(|m| m.generation()).collect();
     assert_eq!(history, [7, 6, 5, 4]);
-    assert_eq!(
-        *holder.asks().borrow(),
-        9,
-        "the wait was recorded for the session"
-    );
 }
 
 fn config(in_flight: usize) -> TransferConfig {

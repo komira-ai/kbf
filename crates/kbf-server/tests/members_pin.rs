@@ -233,3 +233,19 @@ fn a_join_or_a_drain_past_the_cap_is_refused() {
     m.set_state(three.id, MemberState::Draining)
         .expect("the pins lapsed");
 }
+
+/// Catches a cap that bites a farm that is still forming: inside the bootstrap window the
+/// farm holds no data, so a handoff has nothing to move, and five nodes registered in a row
+/// (four pins) can still be joined by a sixth and drained.
+#[test]
+fn a_farm_that_holds_no_data_has_no_cap() {
+    let s = Hooked::new();
+    let m = frontend(&s);
+    let ids: Vec<MemberId> = (1..=5)
+        .map(|i| m.register(&node(i)).expect("register").id)
+        .collect();
+    assert_eq!(pins(&s), 4);
+    m.register(&node(6)).expect("a sixth node while forming");
+    m.set_state(ids[1], MemberState::Draining)
+        .expect("a drain while forming");
+}
