@@ -462,6 +462,9 @@ impl Farm {
             }
             None => (unit, root, Vec::new()),
         };
+        // Every child reads a settings file of the harness's own (empty), never the host's
+        // /etc/kbf/kbf.toml, which `kbf` reads when it is given no `--config`.
+        let unit = unit.append(&[kbf_testkit::config::flag(root)]);
         env.extend(unit.env.iter().cloned());
         let spec = Spec {
             name: role.to_string(),

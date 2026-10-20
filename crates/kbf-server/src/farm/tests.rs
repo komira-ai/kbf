@@ -56,3 +56,72 @@ fn a_result_without_detail_that_is_a_farm_fault_names_the_fault() {
         );
     }
 }
+
+/// Catches: a `Result` answered with an ack the farm owes for another reason, or none:
+/// an accepted one says accepted, a refused one says not, and one whose record is held
+/// for the state store or was dropped is not acknowledged at all.
+#[test]
+fn only_a_taken_or_a_refused_result_is_acknowledged() {
+    assert_eq!(Taken::Accepted.ack(), Some(true));
+    assert_eq!(Taken::Refused.ack(), Some(false));
+    assert_eq!(Taken::Held.ack(), None);
+    assert_eq!(Taken::Dropped.ack(), None);
+}
+
+/// Catches: a report the scheduler does not take (its lease is not the operation's
+/// current one: given up and granted again while the outputs were checked) classed as
+/// held for the store or dropped, which would withhold the ack of a lease that is plainly
+/// refused: it is refused, and nothing is answered.
+#[test]
+fn a_report_the_scheduler_does_not_take_is_refused() {
+    let farm = Farm::new(
+        Arc::new(Cache::memory()),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let worker = WorkerId::new("node-a");
+    let caps = kbf_caps::NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
+        .expect("caps")
+        .with_drivers(["container"]);
+    let capacity = kbf_types::Resources::new(4_000, 8 << 30);
+    let (outbound, _inbox) = mpsc::unbounded_channel();
+    farm.register(
+        &worker,
+        DaemonInstance::new("daemon"),
+        DaemonInstance::new(""),
+        Reported::serving(capacity, caps),
+        outbound,
+        ServerMessage::default(),
+    );
+    let request = kbf_sched::Request {
+        key: kbf_types::ActionKey {
+            instance: "main".to_owned(),
+            action: Digest::new(kbf_types::DigestFunction::Sha256, [1; 32], 1),
+        },
+        qos: kbf_types::Qos::Ci,
+        kind: kbf_types::LeaseKind::Action,
+        resources: kbf_types::Resources::new(1_000, 1 << 30),
+        hermetic: true,
+        do_not_cache: false,
+        needs: kbf_caps::Request::default(),
+    };
+    farm.submit(Submission {
+        request,
+        call: None,
+        described: kbf_front::Described::default(),
+    })
+    .expect("submitted");
+    let report = Report {
+        lease: LeaseId::new(farm.lease_epoch(), 99),
+        outcome: Outcome::Failed(Failure::Infra),
+        measured: None,
+        exit_code: None,
+        run: None,
+    };
+    let now = farm.now();
+    let (answers, taken) = farm
+        .lock()
+        .take_report(now, &worker, OperationId(0), report);
+    assert!(answers.is_empty());
+    assert_eq!(taken, Taken::Refused);
+}

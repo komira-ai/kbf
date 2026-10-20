@@ -104,7 +104,8 @@ pub(super) fn beat(joined: &pb::RegisterResponse, boot: u64) -> pb::HeartbeatReq
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_frontend_binds_a_storage_certificate_to_the_names_it_carries() {
     let pki = Pki::new("membership-names");
-    let state = scratch_dir("membership-names").join("state.db");
+    let dir = scratch_dir("membership-names");
+    let state = dir.join("state.db");
     let front = Front::start(&tls_flags(&pki, &state, &[])).await;
     let mut a = storage_node(&pki, front.worker, &["node-a"]).await;
     let mut b = storage_node(&pki, front.worker, &["node-b"]).await;

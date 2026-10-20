@@ -183,7 +183,11 @@ fn a_cordoned_worker_gets_no_new_lease_and_keeps_its_running_ones() {
     h.worker("b");
     h.submit(1);
     let [first] = h.place().try_into().expect("one grant");
-    assert_eq!(first.worker, w("a"), "first fit takes a");
+    assert_eq!(
+        first.worker,
+        w("a"),
+        "both idle: the first by name takes it"
+    );
 
     h.cordon("a");
     assert_eq!(h.s.cordon(&w("a")), Some(&Cordon::Cordoned));

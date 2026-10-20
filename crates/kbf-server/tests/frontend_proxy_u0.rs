@@ -13,7 +13,6 @@
 #[path = "support/hooked.rs"]
 mod hooked;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,13 +44,9 @@ fn config() -> MembershipConfig {
     }
 }
 
-/// A new, empty directory under cargo's test target directory.
-fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("u0-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+/// A new, empty directory under cargo's test target directory, removed when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("u0-{name}"))
 }
 
 // ---- (a) a fenced child survives -----------------------------------------------------

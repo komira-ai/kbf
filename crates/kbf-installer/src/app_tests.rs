@@ -118,7 +118,8 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
     assert!(
         !Verb::Proxy(ProxyArgs {
             config: Some(file),
-            check: true
+            check: true,
+            update_dir: "/var/lib/kbf-installer".into(),
         })
         .needs_root()
     );
@@ -265,6 +266,7 @@ fn the_visible_verbs_are_the_contracts() {
             "confirm",
             "revert",
             "rollback",
+            "record-release",
             "gc",
             "boot-check",
             "migrate",
@@ -562,6 +564,48 @@ fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
         exit(Operator::NeedsOperator("x".to_owned())),
         Exit::NeedsOperator
     );
+}
+
+/// Catches `record-release` not running through the dispatcher, or its refusals leaving with
+/// another exit: as root, files that are not a release (a release that was never placed, a
+/// binary that is not the executable this host runs, a host root that is not absolute) end with
+/// the exit of the refusal and the program on the line; a release error keeps the exit of
+/// the release verbs.
+///
+/// Mutants planted: the verb dispatched to `gc`; the refusal folded into the failure exit.
+#[test]
+fn record_release_runs_through_the_dispatcher_and_refuses_what_is_not_a_release() {
+    use crate::record_release::RecordError;
+    use crate::release::ReleaseError;
+    let (_, root) = seeded("record-release");
+    let root_arg = root.to_str().expect("text");
+    for commit in [A, B] {
+        let (exit, _, err) = run_as(
+            0,
+            &[
+                "--root",
+                root_arg,
+                "--apply",
+                "record-release",
+                "--commit",
+                commit,
+            ],
+        );
+        assert_eq!(exit, Exit::Refused, "{commit}: {err}");
+        assert!(err.starts_with("kbf-installer: "), "{err}");
+    }
+    let (exit, _, err) = run_as(0, &["--root", "relative", "record-release", "--commit", A]);
+    assert_eq!(exit, Exit::Failed, "{err}");
+
+    let release = |e: ReleaseError| Failure::from(RecordError::Release(e)).exit;
+    assert_eq!(release(ReleaseError::NotFirst(c(A))), Exit::Failed);
+    let read = io::Error::from(io::ErrorKind::NotFound);
+    let refused = Failure::from(RecordError::Read {
+        path: "p".to_owned(),
+        source: read,
+    });
+    assert_eq!(refused.exit, Exit::Refused);
+    assert!(refused.why.contains("cannot read p"), "{}", refused.why);
 }
 
 /// Catches a frontend or all-in-one unit that activates releases with no database migration
@@ -952,13 +996,14 @@ fn the_verbs_that_manage_a_host_wait_for_its_migration() {
 /// Mutants to plant: `Verb::FetchChild` or `Verb::Migrate(_)` moved to the `true` arm; `Verb::Setup(_)` to the `false` one.
 #[test]
 fn the_guard_holds_the_verbs_that_manage_a_host_and_only_those() {
-    let held: [&[&str]; 9] = [
+    let held: [&[&str]; 10] = [
         &["setup", "--mode=frontend"],
         &RUN,
         &["update", "--commit", B, "--frontend"],
         &["confirm", "--id=1-5", "--unit", "kbf.service"],
         &["revert", "--id=1-5", "--unit", "kbf.service"],
         &["rollback", "--unit", "kbf.service"],
+        &["record-release", "--commit", A],
         &["gc"],
         &["stage"],
         &["activate"],
