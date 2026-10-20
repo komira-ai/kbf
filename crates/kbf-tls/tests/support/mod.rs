@@ -73,6 +73,20 @@ pub fn leaf(ca: &Ca, name: &str, usage: ExtendedKeyUsagePurpose, expired: bool) 
     }
 }
 
+/// A leaf of `ca` with exactly the subject alternative names `sans` (none: no extension).
+pub fn leaf_with_sans(ca: &Ca, sans: Vec<rcgen::SanType>) -> Leaf {
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+    params.subject_alt_names = sans;
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let key = KeyPair::generate().expect("leaf key");
+    let cert = params.signed_by(&key, &ca.issuer).expect("sign leaf");
+    Leaf {
+        cert: cert.pem(),
+        key: key.serialize_pem(),
+        der: cert.der().to_vec(),
+    }
+}
+
 pub fn server_leaf(ca: &Ca) -> Leaf {
     leaf(ca, "localhost", ExtendedKeyUsagePurpose::ServerAuth, false)
 }

@@ -719,3 +719,128 @@ async fn a_token_past_its_expiry_is_refused_token_expired() {
     assert_eq!(uses(&farm), 0);
     assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
 }
+
+/// The URI `register_cold` registers, as a node is told it: encoded, with the settings that
+/// are not the defaults, and nothing of the key pair.
+const COLD_URI: &str = "s3://farm-cold/cold/main/?endpoint=http%3A%2F%2Fs3.test%3A9000\
+                        &region=eu-west-1&conditional-put=true&min-put-rate=2048";
+
+/// A storage node enrolled while a cold store is registered is told that store, and the
+/// answer's configuration generation moves with the registry's.
+///
+/// Catches: the enroll answer carrying no cold store (the node cannot start its storage
+/// half: `kbf node` refuses a storage config without one), a URI that is not the
+/// registered bucket, prefix, endpoint, region and put settings, and a generation that
+/// does not change when the registration does (a renewing node would never learn of it).
+#[tokio::test]
+async fn a_storage_node_is_told_the_registered_cold_store() {
+    let farm = farm("enroll-cold");
+    let registry_generation = crate::enroll::testkit::register_cold(&farm);
+    let tok = token(&farm, 1, &spec(&[Role::Storage, Role::Daemon]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage, Role::Daemon], ADVERTISE);
+    let config = call(&farm, request)
+        .await
+        .expect("enrolled")
+        .config
+        .expect("config");
+    assert_eq!(config.cold_store, COLD_URI);
+    assert_eq!(config.generation, CONFIG_GENERATION + registry_generation);
+    assert_ne!(config.generation, CONFIG_GENERATION);
+    // The text is a store URI the server's own parser reads back as the registered store.
+    let parsed: crate::stores::StoreUri = config.cold_store.parse().expect("a store URI");
+    let s3 = parsed.as_s3().expect("an S3 store");
+    assert_eq!(
+        (s3.bucket.as_str(), s3.prefix.as_str(), s3.endpoint.as_str()),
+        ("farm-cold", "cold/main/", "http://s3.test:9000")
+    );
+    assert_eq!(s3.region, "eu-west-1");
+    assert!(s3.conditional_put);
+    assert_eq!(s3.min_put_rate.get(), 2048);
+}
+
+/// No answer carries the registered key pair, whatever it is spelt like and wherever in
+/// the answer it might be put.
+///
+/// Catches: a URI (or any field of the answer) built with the access key id or the
+/// secret, as a `?access_key=` query or userinfo: the whole answer is encoded and
+/// searched for both, and the URI's query is checked to hold only the keys of a store URI.
+#[tokio::test]
+async fn the_answer_carries_no_key_of_the_registered_store() {
+    use prost::Message as _;
+    let farm = farm("enroll-cold-secret");
+    crate::enroll::testkit::register_cold(&farm);
+    let tok = token(&farm, 1, &spec(&[Role::Storage]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage], ADVERTISE);
+    let answer = call(&farm, request).await.expect("enrolled");
+    let bytes = answer.encode_to_vec();
+    let has = |needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+    assert!(has("farm-cold"), "the search does see the URI");
+    for secret in [
+        crate::enroll::testkit::COLD_SECRET,
+        crate::enroll::testkit::COLD_ACCESS_KEY,
+    ] {
+        assert!(!has(secret), "the answer holds {secret}");
+    }
+    let uri = answer.config.expect("config").cold_store;
+    let query = uri.split_once('?').expect("a query").1;
+    let keys: Vec<String> = form_urlencoded::parse(query.as_bytes())
+        .map(|(key, _)| key.into_owned())
+        .collect();
+    assert_eq!(
+        keys,
+        ["endpoint", "region", "conditional-put", "min-put-rate"]
+    );
+    assert!(!uri.contains('@'), "no userinfo");
+}
+
+/// A node with no storage role is told no store, and a farm with none registered tells
+/// none and keeps the base generation.
+///
+/// Catches: a daemon-only node learning where the farm's objects are (it has no use for
+/// them), and a farm without a registration sending a made-up store or a generation that
+/// moved for nothing.
+#[tokio::test]
+async fn only_a_storage_node_with_a_registration_is_told_a_cold_store() {
+    let farm = farm("enroll-cold-roles");
+    let tok = token(&farm, 1, &spec(&[Role::Storage]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage], ADVERTISE);
+    let config = call(&farm, request)
+        .await
+        .expect("enrolled")
+        .config
+        .expect("config");
+    assert_eq!(config.cold_store, "", "nothing registered, nothing sent");
+    assert_eq!(config.generation, CONFIG_GENERATION);
+
+    crate::enroll::testkit::register_cold(&farm);
+    let tok = token(&farm, 2, &spec(&[Role::Daemon]));
+    let (request, _) = enroll_request(&tok, "node-02", &[Role::Daemon], "");
+    let config = call(&farm, request)
+        .await
+        .expect("enrolled")
+        .config
+        .expect("config");
+    assert_eq!(config.cold_store, "", "a daemon is told no store");
+}
+
+/// A registry that cannot be read refuses the enrollment before the token is spent.
+///
+/// Catches: a token consumed by an enrollment whose answer could not say where the store
+/// is (the node would hold a config with none and the token would be gone), and an
+/// unreadable registration answered as "none registered".
+#[tokio::test]
+async fn an_unreadable_registration_refuses_the_enrollment_and_spends_no_token() {
+    use kbf_state::{Cond, Txn};
+    let farm = farm("enroll-cold-corrupt");
+    crate::enroll::testkit::register_cold(&farm);
+    let txn = Txn::new().put("objstore/bind/cold", vec![0xff, 0xff, 0xff], Cond::Any);
+    farm.store.txn(txn).expect("store").expect("committed");
+    let tok = token(&farm, 1, &spec(&[Role::Storage]));
+    let (request, _) = enroll_request(&tok, "node-01", &[Role::Storage], ADVERTISE);
+    assert_is(
+        &refused(call(&farm, request).await),
+        RefusalReason::StoreUnavailable,
+    );
+    assert_eq!(uses(&farm), 0, "the token was not spent");
+    assert!(list_nodes(&*farm.store).expect("nodes").is_empty());
+}
