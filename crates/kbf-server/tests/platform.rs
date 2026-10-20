@@ -46,9 +46,9 @@ async fn next(ops: &mut Streaming<Operation>) -> Operation {
         .expect("an update")
 }
 
-/// Catches: placement that ignores the platform. The Mac registers first and sorts
-/// first by name, so first fit without matching would give it the Linux action, and the
-/// Linux daemon the Mac action.
+/// Catches: placement that ignores the platform. The Mac registers first, sorts first
+/// by name and holds nothing, so placement without matching would give it the Linux
+/// action, and the Linux daemon the Mac action.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_action_runs_on_a_daemon_of_its_platform() {
     let cell = Cell::start().await;

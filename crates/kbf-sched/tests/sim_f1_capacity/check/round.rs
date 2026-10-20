@@ -1,12 +1,17 @@
-//! One placement round, checked against a reference first fit and the reference
-//! unservable verdict: I1, I6, I7 and I8 for each grant, I10 and L2 for waiting reasons
-//! and refusals, I11 for the round.
+//! One placement round, checked against a reference placement (each operation to the
+//! least loaded worker with room) and the reference unservable verdict: I1, I6, I7 and
+//! I8 for each grant, I10 and L2 for waiting reasons and refusals, I11 for the round.
 
 use std::collections::BTreeMap;
 
 use kbf_types::{ControlRecord, Effect, LeaseId, OperationId, WorkerId};
 
-use super::{Checker, Held, Room, State, add, exclusive, fits_beside, fits_whole, queue_key};
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
+
+use super::{
+    Checker, Held, Room, State, add, by_load, exclusive, fits_beside, fits_whole, queue_key,
+};
 
 /// At most this many grants per round: the catalog's number, written here rather than
 /// read from `kbf_sched::PLACEMENT_ROUND`, so that a change to the constant is caught.
@@ -52,7 +57,7 @@ impl Checker {
     }
 
     /// One placement round (a tick after its expiry, or an uncordon): the grants must
-    /// be the reference first fit's, in order; waiting reasons and refusals must agree
+    /// be the reference placement's, in order; waiting reasons and refusals must agree
     /// with the reference verdict and the unservable wait.
     pub(super) fn round(&mut self, effects: &[Effect]) {
         self.stats.rounds += 1;
@@ -78,15 +83,28 @@ impl Checker {
         let mut expected = Vec::new();
         let mut verdicts = Vec::new();
         let mut left_over = false;
+        // The workers held this round for an operation that runs alone: nothing after it
+        // in the queue is placed there. And which operation holds which.
+        let mut held_back: BTreeSet<WorkerId> = BTreeSet::new();
+        let mut holds: BTreeMap<OperationId, WorkerId> = BTreeMap::new();
         for &id in &order {
             let (need, res) = (self.ops[&id].need, self.ops[&id].resources);
             if expected.len() < ROUND {
-                let mut placed = None;
+                // The least loaded worker with room; of equals, the first by name.
+                let mut placed: Option<&WorkerId> = None;
                 for name in &names {
                     let cap = self.workers[name].capacity;
-                    if fits_beside(cap, booked[name], res) && self.matches(need, name) {
-                        placed = Some(name.clone());
-                        break;
+                    if !held_back.contains(name)
+                        && fits_beside(cap, booked[name], res)
+                        && self.matches(need, name)
+                    {
+                        let better = placed.is_none_or(|best| {
+                            let load = |n: &WorkerId| (self.workers[n].capacity, booked[n]);
+                            by_load(load(name), load(best)) == Ordering::Less
+                        });
+                        if better {
+                            placed = Some(name);
+                        }
                     }
                     if fits_whole(cap, res)
                         && !fits_beside(cap, booked[name], res)
@@ -96,7 +114,7 @@ impl Checker {
                         self.stats.overbooked_skips += 1;
                     }
                 }
-                if let Some(name) = placed {
+                if let Some(name) = placed.cloned() {
                     let cap = self.workers[&name].capacity;
                     let b = booked.get_mut(&name).expect("live");
                     b.booked = add(b.booked, res);
@@ -115,8 +133,44 @@ impl Checker {
             if expected.len() == ROUND && v != Verdict::Servable {
                 self.stats.verdicts_past_cut += 1;
             }
+            // A servable operation that fits nowhere now and runs alone on some worker
+            // that could run it (an action at the worker's whole memory) holds one
+            // worker, so that it empties: the one it held last round while that could
+            // still run it, else the one with the fewest leases, then the least booked,
+            // then the first by name.
+            let mut alone = false;
+            for name in &names {
+                alone |= exclusive(self.workers[name].capacity, res) && self.matches(need, name);
+            }
+            if v == Verdict::Servable && alone {
+                let mut could: Vec<&WorkerId> = Vec::new();
+                for name in &names {
+                    if !held_back.contains(name)
+                        && fits_whole(self.workers[name].capacity, res)
+                        && self.matches(need, name)
+                    {
+                        could.push(name);
+                    }
+                }
+                let kept = self
+                    .holds
+                    .get(&id)
+                    .and_then(|held| could.iter().copied().find(|name| *name == held));
+                let emptiest = || {
+                    could
+                        .iter()
+                        .copied()
+                        .min_by_key(|name| (booked[*name].leases, booked[*name].booked))
+                };
+                if let Some(name) = kept.or_else(emptiest) {
+                    held_back.insert(name.clone());
+                    holds.insert(id, name.clone());
+                }
+            }
             verdicts.push((id, v));
         }
+        self.stats.holds += holds.len() as u64;
+        self.holds = holds;
         if expected.len() == ROUND {
             self.stats.full_rounds += 1;
             self.stats.cut_rounds += u64::from(left_over);
@@ -265,7 +319,7 @@ impl Checker {
                 .position(|(a, b)| a != b)
                 .unwrap_or(got.len().min(expected.len()));
             let what = format!(
-                "the round granted {} leases, the reference first fit {}; first difference \
+                "the round granted {} leases, the reference placement {}; first difference \
                  at #{first}: got {:?}, want {:?}",
                 got.len(),
                 expected.len(),

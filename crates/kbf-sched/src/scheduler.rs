@@ -27,6 +27,7 @@ use kbf_types::{
 use crate::cordon::Cordons;
 use crate::fence::{HANDOVER_GRACE, LEASE_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
+use crate::load::Load;
 use crate::requeue::{Requeue, RequeueReason};
 use crate::servable::{Servable, Verdict};
 use memory::{MemoryLadder, MemoryState};
@@ -157,6 +158,11 @@ pub(crate) struct Worker {
 impl Worker {
     pub(crate) fn free(&self) -> Resources {
         self.capacity.saturating_sub(self.booked)
+    }
+
+    /// How loaded it is: what placement ranks the workers that have room by.
+    pub(crate) fn load(&self) -> Load {
+        Load::new(self.booked, self.capacity, self.leases)
     }
 
     pub(crate) fn alive(&self, now: FarmTime) -> bool {
@@ -465,20 +471,25 @@ impl Scheduler {
         self.queue.insert((Reverse(op.request.qos.clone()), id));
     }
 
-    /// One placement round. Each queued operation, most urgent first, goes to the first
-    /// live worker (in name order) that serves its lease kind, satisfies its platform
-    /// and has room for it, up to [`PLACEMENT_ROUND`] grants. An action has room where
-    /// its CPUs, GPUs and VM slots are free and no whole-machine lease is held; its
-    /// memory is only checked against the worker's, never against what other leases
-    /// hold ([`Worker::has_room`]); a
+    /// One placement round. Each queued operation, most urgent first, goes to the least
+    /// loaded live worker that serves its lease kind, satisfies its platform and has room
+    /// for it, up to [`PLACEMENT_ROUND`] grants: the one with the least booked, as a
+    /// share of its capacity (the larger of its CPU and memory shares), then the fewest
+    /// leases, then the first by name ([`Worker::load`]), so work spreads over the farm
+    /// instead of filling one worker after another. An action has room where its CPUs,
+    /// GPUs and VM slots are free and no whole-machine lease is held; its memory is only
+    /// checked against the worker's, never against what other leases hold
+    /// ([`Worker::has_room`]), though what they hold ranks the workers; a
     /// whole-machine lease only on a worker that holds no lease, and it books all of it.
     ///
-    /// A whole-machine operation that fits nowhere holds one worker that could run it
+    /// A whole-machine operation, or an action at a worker's whole memory (it runs
+    /// alone: [`Worker::exclusive`]), that fits nowhere holds one worker that could run it
     /// (the one it held last round while that still could, else the one with fewest
     /// leases): no operation after it in queue order (less urgent, or as urgent and
     /// younger) is placed there, so the worker empties as its leases end. Work before
     /// it in queue order still is, so a reservation never holds back more urgent work.
-    /// It lasts while the operation is queued and the worker could run it.
+    /// It lasts while the operation is queued and the worker could run it. No other
+    /// operation holds a worker.
     ///
     /// Every queued operation is also checked against what live workers could ever give
     /// it: one that no live worker satisfies, or that is larger than every one that
@@ -511,8 +522,8 @@ impl Scheduler {
                 servable.verdict(&self.workers, request)
             };
             if !fitted
-                && request.kind == LeaseKind::WholeMachine
                 && verdict == Verdict::Servable
+                && servable.needs_empty_worker(&self.workers, request)
                 && let Some(name) = servable.reserve(
                     &self.workers,
                     request,

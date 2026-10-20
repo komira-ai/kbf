@@ -4,8 +4,9 @@
 //!
 //! The shadow is a reference model, not a copy of the scheduler's state: it keeps its
 //! own cordons and drains, its own bookings, liveness, holdings and queue, computes the
-//! placement round and each queued operation's verdict by first fit over the workers in
-//! name order, and compares what the scheduler did with that.
+//! placement round (each operation to the least loaded worker with room, the first by
+//! name of equals) and each queued operation's verdict, and compares what the scheduler
+//! did with that.
 //!
 //! Checked: I1 (lease ids unique, increasing), I2 (`Start` only for the current,
 //! committed grant), I3 (one holding per operation; `leases_on` is the holdings), I4
@@ -21,7 +22,7 @@
 //! exactly), I10 and L2 (refused exactly
 //! at the tick an unbroken unservable run reaches the wait; work only cordoned workers
 //! could run is never refused; the reason is the last one stated, the wait appended),
-//! I11 (each round's grants are the reference first fit's, in order), I14 (the queue is
+//! I11 (each round's grants are the reference placement's, in order), I14 (the queue is
 //! the queued operations, in urgency then submission order). I12 and I13 belong to the
 //! cell and dedup families (F2, F1): every request here is unique, and no daemon is
 //! modelled. L1 is [`Check::finish`].
@@ -30,7 +31,7 @@
 //! (`tests/sim/check.rs`) lands with F1, written in parallel; this one moves there
 //! once both are in.
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -89,6 +90,30 @@ fn room(
         && request.vms <= capacity.vms.saturating_sub(booked.vms)
         && request.memory_bytes <= capacity.memory_bytes
         && (!exclusive(capacity, request) || leases == 0)
+}
+
+/// The larger of the CPU and memory shares of `capacity` that `booked` is, as a fraction
+/// `(numerator, denominator)`; an axis with no capacity counts as 0. Integers, written
+/// here and not taken from the scheduler, so a defect in its ranking is not shared.
+fn dominant(capacity: Resources, booked: Resources) -> (u128, u128) {
+    let mut best = (0, 1);
+    for (b, c) in [
+        (booked.cpu_millis, capacity.cpu_millis),
+        (booked.memory_bytes, capacity.memory_bytes),
+    ] {
+        if c > 0 && u128::from(b) * best.1 > best.0 * u128::from(c) {
+            best = (u128::from(b), u128::from(c));
+        }
+    }
+    best
+}
+
+/// How placement ranks two workers, each as its capacity, what its holdings book and how
+/// many leases they are: the lesser share first, then the fewer leases. `Less` is the
+/// better place. A tie is left to the caller: the first by name.
+fn by_load(a: (Resources, Resources, usize), b: (Resources, Resources, usize)) -> Ordering {
+    let (x, y) = (dominant(a.0, a.1), dominant(b.0, b.1));
+    (x.0 * y.1).cmp(&(y.0 * x.1)).then(a.2.cmp(&b.2))
 }
 
 #[derive(Clone, Debug)]
@@ -378,7 +403,8 @@ impl Check {
         }
     }
 
-    /// The reference round at `now`: first fit in queue order.
+    /// The reference round at `now`: in queue order, each operation to the least loaded
+    /// worker with room.
     fn round(&mut self) -> Round {
         // Per worker: what its holdings book, how many there are, and whether one holds
         // the node alone.
@@ -414,27 +440,36 @@ impl Check {
                     && !self.ops[&id].avoid.contains(w)
                     && self.workers[w].capacity.fits(&request.resources)
             });
-            let fit = names.iter().find(|w| {
-                let (held, leases, whole) = booked.get(*w).copied().unwrap_or_default();
-                usable(w, false)
-                    && room(
-                        self.workers[*w].capacity,
-                        held,
-                        whole,
-                        leases,
-                        request.resources,
-                    )
-                    && !(elsewhere && self.ops[&id].avoid.contains(*w))
-            });
+            // The least loaded worker with room; of equals, the first by name.
+            let load = |w: &WorkerId| {
+                let (held, leases, _) = booked.get(w).copied().unwrap_or_default();
+                (self.workers[w].capacity, held, leases)
+            };
+            let fit = names
+                .iter()
+                .filter(|w| {
+                    let (held, leases, whole) = booked.get(*w).copied().unwrap_or_default();
+                    usable(w, false)
+                        && room(
+                            self.workers[*w].capacity,
+                            held,
+                            whole,
+                            leases,
+                            request.resources,
+                        )
+                        && !(elsewhere && self.ops[&id].avoid.contains(*w))
+                })
+                .min_by(|a, b| by_load(load(a), load(b)))
+                .filter(|_| round.grants.len() < PLACEMENT_ROUND);
             let class = match fit {
-                Some(w) if round.grants.len() < PLACEMENT_ROUND => {
+                Some(w) => {
                     let alone = exclusive(self.workers[w].capacity, request.resources);
                     let b = booked.entry(w.clone()).or_default();
                     *b = (b.0.saturating_add(request.resources), b.1 + 1, b.2 || alone);
                     round.grants.push((id, w.clone()));
                     Class::Servable
                 }
-                _ => {
+                None => {
                     let large = |w: &&WorkerId| self.workers[*w].capacity.fits(&request.resources);
                     if names.iter().filter(|w| usable(w, false)).any(|w| large(&w)) {
                         Class::Servable
@@ -445,6 +480,17 @@ impl Check {
                     }
                 }
             };
+            // An action at a worker's whole memory that fits nowhere now holds a worker
+            // (F4 and F1 model which); this reference does not, so it fails loudly if
+            // F3's world ever sends one.
+            let alone = names.iter().any(|w| {
+                usable(w, false) && exclusive(self.workers[w].capacity, request.resources)
+            });
+            self.ensure(
+                !(fit.is_none() && class == Class::Servable && alone),
+                "I11",
+                || format!("{id} runs alone and fits nowhere: the scheduler holds a worker for it"),
+            );
             let op = self.ops.get_mut(&id).expect("queued ops exist");
             op.since = match (class, op.last_class) {
                 (Class::Unservable, Some(Class::Unservable)) => op.since,
@@ -739,7 +785,7 @@ impl Check {
     ) {
         self.ensure(grants == round.grants, "I11", || {
             format!(
-                "round granted {grants:?}, first fit gives {:?}",
+                "round granted {grants:?}, the reference places {:?}",
                 round.grants
             )
         });

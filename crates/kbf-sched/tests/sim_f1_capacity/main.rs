@@ -14,7 +14,7 @@
 //! L1's bound is each scenario's `horizon`, set with a wide margin (F1.4's is 23,200 s),
 //! not the catalog's "backlog plus G plus one round". Here L1 proves that the work
 //! finishes and that the world quiesces; how soon work is placed is checked by the
-//! reference first fit every round (I11), not by L1.
+//! reference placement every round (I11), not by L1.
 //!
 //! Each scenario also asserts that its sweep
 //! reached the situations it is about, so a check that cannot fail shows up as a
@@ -112,12 +112,18 @@ fn f1_3_whole_gpus() {
 #[test]
 fn f1_4_qos_order_when_saturated() {
     let (mut passed, mut skips, mut refusals, mut promotions) = (0, 0, 0, 0);
+    let mut holds = 0;
     sweep(0..8, QosOrder::default, |s, w| {
         passed += s.interactive_passed_older;
         skips += s.same_level_skips;
         refusals += w.check.stats.refusals;
         promotions += w.check.stats.promotions;
+        holds += w.check.stats.holds;
     });
+    assert!(
+        holds > 0,
+        "no action that runs alone held a worker while it waited"
+    );
     assert!(
         passed > 0,
         "no interactive operation passed older, less urgent work"

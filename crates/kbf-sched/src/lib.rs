@@ -19,10 +19,12 @@
 //!   registering: a farm fault, below), after the handover grace if it went to another
 //!   daemon process registered as the worker (issue #140), else once its `Start` has
 //!   been out for G;
-//! - first-fit placement of a CPU, memory and GPU request onto worker capacity, GPUs
-//!   whole and held by one lease each until it ends, on workers whose node report
-//!   lists a driver serving the lease kind and satisfies the action's platform
-//!   (`kbf-caps` matching);
+//! - placement of a CPU, memory and GPU request onto worker capacity, GPUs whole and
+//!   held by one lease each until it ends, on workers whose node report lists a driver
+//!   serving the lease kind and satisfies the action's platform (`kbf-caps` matching),
+//!   spread over the workers that have room: to the one with the least booked, as a
+//!   share of its capacity (the larger of its CPU and memory shares), then the fewest
+//!   leases, then the first by name;
 //! - iOS device leases ([`DEVICE_LEASES_PER_WORKER`]): a request with `ios.device=1`
 //!   goes only to a worker whose report lists a device satisfying every device
 //!   attribute of the request, books that one device by id until the lease ends, and
@@ -30,7 +32,8 @@
 //! - whole-machine leases: one goes only to a worker that holds no lease, and books
 //!   all of it, so nothing is placed beside it; one that fits nowhere holds a worker
 //!   that could run it, in queue (QoS) order, and less urgent work is not placed there
-//!   until it has emptied;
+//!   until it has emptied. An action at a worker's whole memory (the last step of the
+//!   memory ladder) runs alone and holds a worker the same way;
 //! - work no live worker can run (none satisfies its platform, or none that does is
 //!   large enough) waits with a reason its callers see, and is refused after
 //!   [`UNSERVABLE_WAIT`], the refusal committed before its callers are answered;
@@ -68,8 +71,8 @@
 //!   give-up past it ends the operation with [`kbf_types::Failure::Infra`], proposed
 //!   through the log.
 //!
-//! Not yet: placement scoring (alignment, best fit), a reservation for a large
-//! `action` request (issue #169), reclaimed room and preemption, a budget for the
+//! Not yet: placement scoring beyond the spread (alignment, best fit), a reservation for
+//! a large `action` request (issue #169), reclaimed room and preemption, a budget for the
 //! leases given up for reconnection, and committing submissions so that a new leader
 //! inherits the queue. In v0 the scheduler runs on the leader only.
 //!
@@ -82,6 +85,7 @@ mod cordon;
 mod devices;
 pub mod fence;
 mod input;
+mod load;
 mod requeue;
 mod scheduler;
 mod servable;
