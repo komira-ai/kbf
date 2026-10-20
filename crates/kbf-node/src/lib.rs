@@ -1221,7 +1221,9 @@ mod data_dir;
 mod instance;
 mod run;
 mod transfer;
-mod update;
+/// The node's update client, set up from `--update-dir` (public for the tests that read a
+/// host's `kbf.toml` into a node: kbf-cli's).
+pub mod update;
 mod whole_machine;
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use kbf_host::{Exec, Mode};
 
+use super::daemon_dirs;
 use super::error::MigrateError;
 use super::floor::{self, Seeded};
 use super::journal::{Adopted, Journal, Phase};
@@ -391,6 +392,8 @@ pub fn migrate<E: Exec>(
         let outcome = units::rewrite(&rules, &units_dir, &backup, unit, &new_bin)?;
         report.line(mode, format!("{unit}: {}", describe(outcome)));
     }
+    // Before the services start again: a node reads its keys when it starts.
+    daemon_dirs::add(m, svc.exec, mode, &mut report)?;
     svc.reload().map_err(MigrateError::io("daemon-reload"))?;
 
     for unit in journal.stopped.clone() {
@@ -498,6 +501,7 @@ fn plan<E: Exec>(m: &Migration, exec: &mut E, report: &mut Report) -> Result<(),
         Mode::DryRun,
         "copy or verify each release, repoint the links, rewrite the units",
     );
+    daemon_dirs::add(m, svc.exec, Mode::DryRun, report)?;
     Ok(())
 }
 

@@ -4,15 +4,18 @@
 //! host that keeps its state in Postgres, the database (`state-store`, group `scheduler`). A
 //! `frontend` or `all-in-one` host also has the listener, certificate, storage and daemon-half
 //! keys the flags of [`super::kbf_settings`] give. Everything else in the file is the mode's own
-//! flags, which the operator or the package adds; `setup` never writes an update or installer
-//! key (those are `installer.toml`).
+//! flags, which the operator or the package adds. A host whose daemon takes update orders
+//! (`daemon`, `storage-and-daemon`) also has `[daemon] update-dir` and `orders-dir`, the
+//! installer's directories ([`crate::layout::Layout`]): without them the node updates by hand
+//! and ignores every order. `all-in-one` has neither, as its in-process daemon refuses
+//! `--update-dir`. The installer's own settings are `installer.toml`, never here.
 //!
 //! A file that exists is not overwritten blindly: when every key in it is one `setup`
 //! writes, `setup` rewrites it; when it holds other settings, `setup` leaves it alone if
 //! its own keys already say what the flags say, and refuses (exit 5) if they differ, naming
 //! them, since rewriting would lose settings it cannot see. What counts as another setting is
-//! relative to this run: a key is `setup`'s when it is one of the five above or one the flags
-//! of this run give, so a file that holds a listener `setup` has no flag for in this run is
+//! relative to this run: a key is `setup`'s when it is one of the five above, the update
+//! directories of a mode that has them, or one the flags of this run give, so a file that holds a listener `setup` has no flag for in this run is
 //! the operator's and is never rewritten.
 
 use toml::{Table, Value};
@@ -28,9 +31,24 @@ pub struct Ours<'a> {
     pub api_token_file: Option<&'a str>,
     /// The state database of a frontend or all-in-one host: `[scheduler] state-store`.
     pub state_store: Option<&'a str>,
+    /// `[daemon] update-dir` and `orders-dir` of a host whose daemon takes orders, both or
+    /// neither.
+    pub update: Option<UpdateDirs<'a>>,
     /// The listener, certificate, storage and daemon-half settings of this run.
     pub extra: &'a [Setting],
 }
+
+/// The installer's directories as the node's `kbf.toml` names them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpdateDirs<'a> {
+    /// Root's directory, where the installer writes `status.json`.
+    pub update_dir: &'a str,
+    /// The order spool, the node's.
+    pub orders_dir: &'a str,
+}
+
+/// The keys of [`UpdateDirs`], as `(table, key)`.
+pub const UPDATE_KEYS: [(&str, &str); 2] = [("daemon", "update-dir"), ("daemon", "orders-dir")];
 
 /// The tables of the file, in the order they are written: every table a setting can be in
 /// (a test renders each mode's file and compares it with its golden, so a missing one fails).
@@ -84,6 +102,10 @@ impl Ours<'_> {
                 keys.push((table, key, v.to_owned()));
             }
         }
+        if let Some(dirs) = &self.update {
+            keys.push(("daemon", "update-dir", dirs.update_dir.to_owned()));
+            keys.push(("daemon", "orders-dir", dirs.orders_dir.to_owned()));
+        }
         keys.extend(self.extra.iter().map(|s| (s.table, s.key, s.value.clone())));
         keys
     }
@@ -109,7 +131,7 @@ fn lookup<'t>(table: &'t Table, at: &str, key: &str) -> Option<&'t Value> {
 }
 
 /// Whether `table` holds a key that is not one `setup` writes in this run: the five it can
-/// always write, or one of `ours.extra`.
+/// always write, the update directories if this run has them, or one of `ours.extra`.
 fn has_other_settings(table: &Table, ours: &Ours<'_>) -> bool {
     const MINE: [(&str, &str); 5] = [
         ("", "mode"),
@@ -118,12 +140,20 @@ fn has_other_settings(table: &Table, ours: &Ours<'_>) -> bool {
         ("tls", "api-token-file"),
         ("scheduler", "state-store"),
     ];
+    let update = if ours.update.is_some() {
+        UPDATE_KEYS.as_slice()
+    } else {
+        &[]
+    };
     let mine = |at: &str, key: &str| {
-        MINE.contains(&(at, key)) || ours.extra.iter().any(|s| s.table == at && s.key == key)
+        MINE.contains(&(at, key))
+            || update.contains(&(at, key))
+            || ours.extra.iter().any(|s| s.table == at && s.key == key)
     };
     table.iter().any(|(k, v)| match v {
         Value::Table(inner) => {
             let known = MINE.iter().any(|(t, _)| *t == k.as_str())
+                || update.iter().any(|(t, _)| *t == k.as_str())
                 || ours.extra.iter().any(|s| s.table == k.as_str());
             !known || inner.keys().any(|key| !mine(k, key))
         }
@@ -165,6 +195,9 @@ pub fn decide(current: Option<&str>, ours: &Ours<'_>, path: &str) -> Decision {
                 // Paths and URLs the operator typed stay out of the message, as the database
                 // URL does: the key is named and the flag it came from is the way to see it.
                 format!("[{at}] {key} differs from its flag")
+            } else if UPDATE_KEYS.contains(&(at, key)) {
+                // A path of the installer's layout, not a secret; the key is named all the same.
+                format!("[{at}] {key} differs from the installer's directory")
             } else if at == "scheduler" {
                 // The database URL is never printed, not even one without a password.
                 format!("[{at}] {key} should be the --database URL")

@@ -73,6 +73,8 @@ pub const NEW_SUFFIX: &str = ".new";
 pub const STAGE_PREFIX: &str = ".stage-";
 /// The helper's memory (replay floors, the last event), beside the state.
 pub const MEMORY: &str = "helper.json";
+/// The order spool, in the state directory.
+pub const ORDERS: &str = "orders";
 /// The state file's name, and the copy of the last good one.
 pub const STATE_FILE: &str = "state.json";
 pub const STATE_BACKUP: &str = "state.json.bak";
@@ -291,6 +293,19 @@ impl Layout {
     /// `state.json.bak`: the last state that read back whole.
     pub fn state_backup(&self) -> HostPath {
         path_in(self.platform.state_dir(), STATE_BACKUP)
+    }
+
+    /// The directory the node's update client reads `status.json` from: the state directory,
+    /// root's. A node's `kbf.toml` names it as `[daemon] update-dir`.
+    pub fn update_dir(&self) -> HostPath {
+        self.state_dir()
+    }
+
+    /// The order spool, `orders/` in the state directory: owned by the user the node runs
+    /// as (mode 0700, inside root's directory). A node's `kbf.toml` names it as
+    /// `[daemon] orders-dir`.
+    pub fn orders_dir(&self) -> HostPath {
+        path_in(self.platform.state_dir(), ORDERS)
     }
 
     /// The lock the state is read and written under.

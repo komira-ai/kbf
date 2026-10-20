@@ -337,6 +337,13 @@ impl Rig {
                 source: Source::Url,
                 min_generation: Some(17),
             },
+            node_user: Some(kbf_host::RunUser {
+                name: "kbf".to_owned(),
+                uid: me(),
+                gid: rustix::process::getgid().as_raw(),
+                groups: Vec::new(),
+                home: "/nonexistent".to_owned(),
+            }),
             lock_wait: self.lock_wait,
         }
     }

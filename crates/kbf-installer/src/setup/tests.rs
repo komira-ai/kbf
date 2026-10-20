@@ -342,6 +342,10 @@ url = \"https://farm.example:8443\"
 
 [enroll]
 token_file = \"/etc/kbf/enroll.token\"
+
+[daemon]
+update-dir = \"/var/lib/kbf-installer\"
+orders-dir = \"/var/lib/kbf-installer/orders\"
 ";
 
 const FRONTEND_TOML: &str =
@@ -1665,3 +1669,6 @@ mod proxy_listen;
 
 #[path = "backup_dropin_tests.rs"]
 mod backup_dropin;
+
+#[path = "update_dirs_tests.rs"]
+mod update_dirs;

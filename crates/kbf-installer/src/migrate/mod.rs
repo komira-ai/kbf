@@ -63,6 +63,7 @@
 //! [`crate::helper::status`] for `status.json`.
 
 mod apply;
+mod daemon_dirs;
 pub mod error;
 pub mod floor;
 pub mod journal;
@@ -128,6 +129,10 @@ pub struct Migration {
     /// installer and the old helper never both run.
     pub installer_unit: Option<Unit>,
     pub seed: Seed,
+    /// The user a node's unit runs as (Linux), who owns the order spool the migration makes
+    /// for a node it adds `update-dir` to; `None` when there is no such user (a Mac's daemon
+    /// is root's, and needs none).
+    pub node_user: Option<kbf_host::RunUser>,
     /// How long each of the two locks (the old tools', the installer's) is waited for before
     /// the verb ends busy (exit 4): a verb of the old tools can hold theirs for a long time,
     /// and a migration queued behind it holds up whatever else wants the installer's.
