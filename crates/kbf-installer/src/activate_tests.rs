@@ -840,3 +840,63 @@ fn a_first_release_never_replaces_one_and_must_be_installed() {
     );
     assert!(state::read_unlocked(&layout).expect("read").is_none());
 }
+
+/// Catches a frontend stage of a release that is not on the host: it records a `staged` that
+/// names nothing a confirm could swap in, and holds every other update off as busy. A release
+/// with no directory and one whose directory holds no binary are both `NotInstalled`, and
+/// neither writes the state; the same release installed is staged, and staging it again
+/// changes nothing.
+///
+/// Mutants to plant: the `has_binary` check removed from `stage_frontend`; the state written
+/// before the check.
+#[test]
+fn a_frontend_stage_needs_the_release_on_the_host_and_writes_nothing_otherwise() {
+    let (exec, layout) = host("stage-frontend");
+    running(&exec, &layout, A, &[B]);
+    fs::create_dir_all(exec.at(&format!("/var/lib/kbf-installer/releases/{E}"))).expect("empty");
+    let was = state_of(&layout);
+
+    for missing in [D, E] {
+        let err = stage_frontend(&exec, &layout, &c(missing)).expect_err("not on the host");
+        assert!(
+            matches!(&err, ReleaseError::NotInstalled(x) if *x == c(missing)),
+            "{err:?}"
+        );
+        assert_eq!(state_of(&layout), was, "{missing}: the state is as it was");
+    }
+
+    stage_frontend(&exec, &layout, &c(B)).expect("staged");
+    let staged = state_of(&layout);
+    assert_eq!(staged.staged, Some(c(B)));
+    assert_eq!(
+        (&staged.current, &staged.previous),
+        (&was.current, &was.previous)
+    );
+    stage_frontend(&exec, &layout, &c(B)).expect("a repeat");
+    assert_eq!(state_of(&layout), staged);
+}
+
+/// Catches a first release that stays staged once it is current, as an `activate` of a staged
+/// release does not: a `staged` that names the first release (the operator staged it before
+/// setup made it current) is cleared, and a `staged` that names another release stays (it
+/// is another decision's).
+///
+/// Mutants to plant: `staged` carried over unchanged; `staged` cleared whatever it names.
+#[test]
+fn a_first_release_that_was_staged_is_current_and_no_longer_staged() {
+    for (staged, want) in [(A, None), (B, Some(c(B)))] {
+        let (mut exec, layout) = host(&format!("first-staged-{staged}"));
+        seed(&exec, A, 1_000);
+        Locked::acquire(&layout)
+            .expect("lock")
+            .write(&State {
+                staged: Some(c(staged)),
+                ..State::default()
+            })
+            .expect("state");
+        first(&mut exec, &layout, &c(A), &mut Vec::new()).expect("first");
+        let state = state_of(&layout);
+        assert_eq!(state.current, Some(c(A)), "{staged}");
+        assert_eq!(state.staged, want, "{staged}");
+    }
+}
