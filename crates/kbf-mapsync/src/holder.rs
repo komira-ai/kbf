@@ -4,7 +4,11 @@ use kbf_map::Map;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-/// The newest storage map a process was pushed, and the one it replaced.
+/// How many maps before the newest a process retains: the pin cap. A blob written before a
+/// join or a drain is found where it was for this many map changes, not one.
+pub const RETAINED_MAPS: usize = 4;
+
+/// The newest storage map a process was pushed, and the [`RETAINED_MAPS`] it replaced.
 ///
 /// The generation only rises: [`MapHolder::offer`] refuses a map that is not newer than
 /// the one held. Shared by `Arc` between the task that receives pushes and the callers
@@ -19,7 +23,8 @@ pub struct MapHolder {
 #[derive(Debug, Default)]
 struct Held {
     map: Option<Arc<Map>>,
-    previous: Option<Arc<Map>>,
+    /// The maps before `map`, newest first, at most [`RETAINED_MAPS`].
+    history: Vec<Arc<Map>>,
 }
 
 impl Default for MapHolder {
@@ -51,7 +56,10 @@ impl MapHolder {
         {
             return false;
         }
-        held.previous = held.map.replace(Arc::new(map));
+        if let Some(replaced) = held.map.replace(Arc::new(map)) {
+            held.history.insert(0, replaced);
+            held.history.truncate(RETAINED_MAPS);
+        }
         // Announced under the lock the map is stored under, so a waiter that wakes for the
         // generation reads that map or a newer one.
         self.generation.send_replace(generation);
@@ -64,12 +72,43 @@ impl MapHolder {
         self.held.lock().expect("lock").map.clone()
     }
 
+    /// Takes `map` as [`MapHolder::offer`] does, and with it `retained`, the maps a frontend
+    /// kept from before it (`RegisterResponse.retained_previous`): a process that has just
+    /// started has seen none of them. Those that are not older than `map`, or that the
+    /// holder has (by generation), are left out; the history stays newest first and at most
+    /// [`RETAINED_MAPS`] long. `false`, with nothing changed, if `map` is not newer than the
+    /// one held.
+    pub fn offer_with_retained(&self, map: Map, retained: impl IntoIterator<Item = Map>) -> bool {
+        let newest = map.generation();
+        if !self.offer(map) {
+            return false;
+        }
+        let mut held = self.held.lock().expect("lock");
+        for older in retained {
+            let generation = older.generation();
+            if generation < newest && held.history.iter().all(|m| m.generation() != generation) {
+                held.history.push(Arc::new(older));
+            }
+        }
+        held.history
+            .sort_by_key(|m| std::cmp::Reverse(m.generation()));
+        held.history.truncate(RETAINED_MAPS);
+        true
+    }
+
     /// The map the newest one replaced: for the routing layer, which reads a blob written
     /// before a join or a drain where it was. `None` before a second map. Whether that
     /// change has settled is not known here.
     #[must_use]
     pub fn previous(&self) -> Option<Arc<Map>> {
-        self.held.lock().expect("lock").previous.clone()
+        self.held.lock().expect("lock").history.first().cloned()
+    }
+
+    /// The maps before the newest, newest first: [`MapHolder::previous`] and the ones
+    /// before it, at most [`RETAINED_MAPS`].
+    #[must_use]
+    pub fn history(&self) -> Vec<Arc<Map>> {
+        self.held.lock().expect("lock").history.clone()
     }
 
     /// The generation of the newest map; 0 before the first.

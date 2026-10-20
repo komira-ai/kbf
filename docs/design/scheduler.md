@@ -314,16 +314,14 @@ What the code does today:
   urgent, or as urgent and younger) is placed there, so that worker empties as its
   leases end; operations before it still are. The hold lasts while the operation is
   queued and the worker could run it (live, not cordoned, feasible). No lease is ever
-  stopped for it. An `action` at the whole memory of a worker that could run it (the
-  last rung of the memory ladder, which runs alone there) that fits nowhere holds such
-  a worker the same way: spreading keeps every worker holding some lease while work
-  arrives, so without the hold no worker would ever empty for it. A worker with less
-  memory than the action asks for is not one, and a worker with more takes it beside
-  others, so an `action` below the memory of every worker that could run it holds
-  nothing. A large `action` request below that has no such hold yet (issue #169), and
-  spreading makes it likelier to wait than first fit did: with eight one-core leases on
-  two workers of eight cores, first fit leaves one worker empty and a six-core action
-  runs at once, while spreading leaves four on each and it waits for cores to free.
+  stopped for it. An `action` holds no worker: one at the whole memory of a worker (the
+  last rung of the memory ladder, which runs alone there) waits until some worker's
+  free memory meets its request, that is, until a worker has no lease. Under sustained
+  spread load that wait can be long, and nothing reserves a worker for it; callers
+  wait. A large `action` request has no such hold either (issue #169), and spreading
+  makes it likelier to wait than first fit did: with eight one-core leases on two
+  workers of eight cores, first fit leaves one worker empty and a six-core action runs
+  at once, while spreading leaves four on each and it waits for cores to free.
 - A request with `ios.device=1` has room only where a device the worker reports
   satisfies every `ios.device.*` attribute of the request and no lease holds it, and
   where the worker holds no other device lease (`DEVICE_LEASES_PER_WORKER` = 1, until

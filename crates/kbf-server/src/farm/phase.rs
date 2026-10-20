@@ -22,7 +22,8 @@ pub struct Reported {
     pub caps: NodeCaps,
     /// What it is doing besides running leases.
     pub phase: NodePhase,
-    /// The `kbf.worker.v1` version its `Hello` named; `None` if it named none
+    /// The `kbf.worker.v1` version the stream speaks, which the server sets to the one
+    /// `Welcome` names, not the `Hello`'s when that is newer; `None` if none is known
     /// ([`crate::worker::named_protocol`]). Only the first `Hello` of a stream counts: it
     /// is the one `Welcome` answers, and a resent one is not negotiated again
     /// ([`crate::Farm::resize`]).

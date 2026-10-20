@@ -113,6 +113,13 @@ message RegisterRequest {
   // The node is rebuilding its index: it enters the map as CATCHING_UP, not JOINING, and
   // answers what it cannot find UNAVAILABLE until a heartbeat reports the rebuild done.
   bool catching_up = 7;
+  // The member id and boot the node's metadata log last wrote as (0, 0: none, or an older
+  // node that does not say). The frontend gives a node it has not seen the member id named
+  // here when no instance holds it, and a boot above last_boot, so a node whose log has run
+  // before is not refused for a boot it already used and restarted once per old boot. A
+  // known instance keeps the id the frontend holds for it; the report only raises its boot.
+  uint64 last_member_id = 8;
+  uint64 last_boot = 9;
 }
 
 message RegisterResponse {
@@ -127,6 +134,10 @@ message RegisterResponse {
   // fetches the registration when this differs from the one it applied. Only this
   // service, which storage nodes call, carries it: no daemon message does.
   uint64 objstore_generation = 5;
+  // The maps the frontend retains from before `map`, newest first (at most four): a node
+  // that has just started has seen none of them, and a blob written before a join or a
+  // drain is found where it was by them. Empty from an older frontend.
+  repeated Map retained_previous = 6;
 }
 
 message HeartbeatRequest {
@@ -161,6 +172,19 @@ message HeartbeatRequest {
   // Whether this node counts its open writes. False says "I cannot say", never "none": an
   // older node, which sends neither field, reads as false.
   bool writes_known = 10;
+  // The highest map generation g such that every object this node was to flush that it
+  // staged before it held map g is flushed (docs/design/rebalance-handoff.md, P2). Read
+  // only when flush_known is true. Volatile: a restart recomputes it from the staged set,
+  // counting objects it cannot date as the oldest.
+  uint64 flush_clear_gen = 11;
+  // Whether this node reports flush_clear_gen. False says "I cannot say", never
+  // "generation 0": an older node, which sends neither field, reads as false.
+  bool flush_known = 12;
+  // The objects staged on this node's write tier and not yet flushed, and their committed
+  // bytes: the backlog a loss of the node's disk would take. Read only when flush_known is
+  // true.
+  uint64 staged_objects = 13;
+  uint64 staged_bytes = 14;
 }
 
 // A closed set: a node never sends free text about its store, so a credential cannot ride
@@ -187,4 +211,6 @@ message HeartbeatResponse {
   Map map = 2;
   // As RegisterResponse.objstore_generation.
   uint64 objstore_generation = 3;
+  // As RegisterResponse.retained_previous: set only when `map` is.
+  repeated Map retained_previous = 4;
 }
