@@ -37,6 +37,16 @@ pub struct HostConfig {
     pub cas_ca: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cas_server_name: Option<String>,
+    /// The frontend the gates observe, and the file of its token (else the update API's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observe: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observe_base_port: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observe_token_file: Option<PathBuf>,
+    /// Where the result document goes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<PathBuf>,
     /// Keys this version does not know: kept when `setup` rewrites the file.
     #[serde(flatten)]
     pub other: BTreeMap<String, serde_json::Value>,

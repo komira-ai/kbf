@@ -103,6 +103,43 @@ pub fn platform_state(releases: &Value, commit: &str, platform: &str) -> &'stati
     }
 }
 
+/// The hash of the release set the store holds for `commit`: the SHA-256 of the sorted lines
+/// `<sha256>  <platform>/<name>`, one per component (and attestation) it lists. `None` when
+/// the listing names nothing for the commit. It is the hash of what is being deployed, in the
+/// `SHA256SUMS` manner but not the same bytes; a caller that has `SHA256SUMS` passes its hash
+/// (`--set-hash`).
+pub fn set_hash(releases: &Value, commit: &str) -> Option<kbf_gate::SetHash> {
+    let mut lines: Vec<String> = releases
+        .get("releases")?
+        .as_array()?
+        .iter()
+        .filter(|r| r.get("commit").and_then(Value::as_str) == Some(commit))
+        .flat_map(|r| {
+            r.get("platforms")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .flat_map(|p| {
+            let platform = p.get("platform").and_then(Value::as_str).unwrap_or("");
+            p.get("components")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(move |c| {
+                    let sha = c.get("sha256").and_then(Value::as_str).unwrap_or("");
+                    let name = c.get("name").and_then(Value::as_str).unwrap_or("");
+                    format!("{sha}  {platform}/{name}\n")
+                })
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort();
+    Some(kbf_gate::SetHash::of_sums(lines.concat().as_bytes()))
+}
+
 /// The desired release from `GET /v1/update`.
 pub fn desired(update: &Value) -> Option<Previous> {
     let d = update.get("desired")?;
