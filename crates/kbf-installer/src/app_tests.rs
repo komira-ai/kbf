@@ -416,7 +416,7 @@ fn global_flags_may_follow_the_verb() {
 /// scratch host is laid out for that platform too (`/var/db/kbf-installer` on macOS).
 fn seeded(name: &str) -> (Layout, PathBuf) {
     let (layout, root) = host_root_on(&format!("app-{name}"), Platform::current());
-    fs::create_dir_all(root.join("var/lib/kbf-installer/orders")).expect("order spool");
+    fs::create_dir_all(layout.join(&layout.orders_dir())).expect("order spool");
     let release = layout.join(&layout.release_dir(&c(A)));
     fs::create_dir_all(&release).expect("release");
     fs::write(release.join("kbf"), b"x").expect("binary");
@@ -453,12 +453,13 @@ fn run_does_its_passes_and_stops_on_a_state_it_cannot_read() {
     let (layout, root) = seeded("run");
     let (exit, err) = on(&root, &RUN);
     assert_eq!(exit, Exit::Ok, "{err}");
-    let status = fs::read(root.join("var/lib/kbf-installer/status.json")).expect("status.json");
+    let status =
+        fs::read(layout.join(&layout.state_dir()).join("status.json")).expect("status.json");
     let status: Value = serde_json::from_slice(&status).expect("json");
     assert_eq!(status["state"], "refused", "not root: the pass says so");
     let record = kbf_update::record::file_name(1, 2);
     fs::write(
-        root.join("var/lib/kbf-installer/orders").join(record),
+        layout.join(&layout.orders_dir()).join(record),
         b"not an order",
     )
     .expect("record");
@@ -509,7 +510,7 @@ fn run_waits_one_interval_between_two_passes_and_not_after_the_last() {
 #[test]
 fn boot_check_counts_a_start_and_refuses_what_it_cannot_read() {
     let (layout, root) = seeded("boot");
-    let release = root.join("var/lib/kbf-installer/releases").join(B);
+    let release = layout.join(&layout.release_dir(&c(B)));
     fs::create_dir_all(&release).expect("release");
     fs::write(release.join("kbf"), b"x").expect("binary");
     let lock = Locked::acquire(&layout).expect("lock");
@@ -718,7 +719,7 @@ fn record_release_runs_through_the_dispatcher_and_refuses_what_is_not_a_release(
 /// the all-in-one template (`kbf-all-in-one@1.service`) is in the test list.
 #[test]
 fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
-    let (_, root) = seeded("run-database");
+    let (layout, root) = seeded("run-database");
     for unit in [
         "kbf-all-in-one.service",
         "kbf-all-in-one@1.service",
@@ -734,7 +735,10 @@ fn run_on_a_frontend_or_all_in_one_unit_needs_the_installer_config() {
             "{unit}"
         );
         assert!(
-            !root.join("var/lib/kbf-installer/status.json").exists(),
+            !layout
+                .join(&layout.state_dir())
+                .join("status.json")
+                .exists(),
             "{unit}: nothing was done before the refusal"
         );
     }
