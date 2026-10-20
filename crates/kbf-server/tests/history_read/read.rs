@@ -199,6 +199,7 @@ async fn no_index_row_names_an_object_that_was_never_written() {
     failing.objects.fail_puts(true);
     let a = failing.start(PAGES_ONLY);
     a.feed(ran("never", "main", 1, 1, 0)).await;
+    failing.objects.put_attempted().await;
     a.stop().await;
     assert_eq!(failing.objects.puts(), 0);
     for prefix in ["ui/ichunk/", "ui/invid/", "ui/stream/"] {
