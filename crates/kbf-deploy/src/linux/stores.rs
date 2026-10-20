@@ -1,6 +1,6 @@
 //! Rules `storage`, `state-store` and `ports` of [`super::modes`]: where a unit's stores
-//! are, that the state store is a SQLite file named by an absolute path, and that no
-//! two listeners share a port.
+//! are, that the state store is a password-free Postgres URI (a SQLite path in the
+//! all-in-one's unit), and that no two listeners share a port.
 //!
 //! `storage` (the `storage` mode): the unit gives every flag a storage node needs to
 //! serve the farm ([`STORAGE_FLAGS`]: its cold store, its metadata directory, its
@@ -10,14 +10,17 @@
 //! loopback only. `--hot-store` is not required: without it uploads go straight to the
 //! cold store, slower but correct.
 //!
-//! `state-store` (every mode; the flag is the frontend's). The only backend kbf opens
-//! today is SQLite (Postgres is a later backend), so a `--state-store` the unit gives
-//! must be `sqlite:///<absolute path>`. The rule refuses:
+//! `state-store` (every mode; the flag is the frontend's). The frontend's state store is
+//! Postgres and SQLite is dropped for it (CEO ruling); the all-in-one unit still names
+//! its SQLite file until the farm is moved, so there a file is judged by its path. The
+//! rule refuses:
 //!
-//! - A `postgres://` or `postgresql://` value: postgres is not wired yet.
-//! - Any other scheme, or a value with no scheme.
-//! - A `sqlite://` value whose path is empty, relative or not normal (`//`, `.` or
-//!   `..` in it).
+//! - In the frontend's unit, any value that is not a `postgres://` or `postgresql://`
+//!   URI: a `sqlite://` file, another scheme, or none.
+//! - In another unit, a scheme that is neither Postgres nor `sqlite://`, and a
+//!   `sqlite://` value whose path is empty, relative or not normal (`//`, `.` or `..`).
+//! - A Postgres URI that carries a password (user information with a colon, or a
+//!   `password` parameter): kbf refuses one at start, and the command line is readable.
 //! - A value that names a variable (`${VAR}` or `$VAR`): systemd expands it into the
 //!   command line it starts kbf with, so the rule cannot read the store it names, and
 //!   whatever the variable holds is in kbf's argv, which every user can read.
@@ -33,6 +36,7 @@
 
 use kbf_host::path::HostPath;
 
+use super::Mode;
 use super::credential;
 use crate::unit::UnitFile;
 
@@ -167,42 +171,77 @@ fn variable(value: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// Why a `--state-store` value is refused, or `None` when it is `sqlite:///<absolute
-/// path>`.
-fn refusal(value: &str) -> Option<String> {
+/// The part of a Postgres URI after its scheme, or `None` when `value` is not one (or
+/// is nothing but the scheme).
+fn postgres_rest(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("postgres://")
+        .or_else(|| value.strip_prefix("postgresql://"))
+        .filter(|rest| !rest.is_empty())
+}
+
+/// Whether a Postgres URI carries a password: a colon in its user information, or a
+/// `password` parameter (any case). kbf refuses such a URI, whose command line every
+/// user on the node can read.
+pub(super) fn has_password(value: &str) -> bool {
+    let rest = postgres_rest(value).unwrap_or(value);
+    let (before, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let authority = before.split('/').next().unwrap_or("");
+    let user = authority.rsplit_once('@').map(|(user, _)| user);
+    user.is_some_and(|u| u.contains(':'))
+        || query.split('&').any(|pair| {
+            pair.split('=')
+                .next()
+                .is_some_and(|k| k.eq_ignore_ascii_case("password"))
+        })
+}
+
+/// Why a `--state-store` value is refused in the unit of `mode`, or `None`.
+fn refusal(value: &str, mode: Mode) -> Option<String> {
     if let Some(var) = variable(value) {
         return Some(format!(
             "--state-store names ${{{var}}}: systemd expands it into kbf's command line, \
              which every user on the node can read in /proc, and the rule cannot read the \
-             store it names; write sqlite:///<absolute path>"
+             store it names; write the URI itself"
         ));
     }
-    if value.starts_with("postgres://") || value.starts_with("postgresql://") {
-        return Some(
-            "--state-store is a postgres URI: postgres is not wired yet; the state store \
-             is sqlite:///<absolute path>"
-                .to_owned(),
-        );
+    if postgres_rest(value).is_some() {
+        return has_password(value).then(|| {
+            "--state-store carries a password: kbf's command line is readable by every user \
+             on the node, and kbf refuses such a URI; give a socket or a passwordless URI"
+                .to_owned()
+        });
     }
-    let Some(path) = value.strip_prefix("sqlite://") else {
-        return Some(
-            "--state-store is not sqlite:///<absolute path>: SQLite is the only state \
-             store kbf opens"
-                .to_owned(),
-        );
-    };
-    HostPath::new(path).is_err().then(|| {
-        "--state-store is sqlite:// with an empty, relative or not normal path: give \
-         sqlite:///<absolute path>"
-            .to_owned()
-    })
+    let frontend = mode == Mode::Frontend;
+    if let Some(path) = value.strip_prefix("sqlite://") {
+        if frontend {
+            return Some(
+                "--state-store is sqlite:// in a frontend unit: the frontend's state store \
+                 is Postgres (postgres://<host>/<db>), and SQLite is dropped for it"
+                    .to_owned(),
+            );
+        }
+        return HostPath::new(path).is_err().then(|| {
+            "--state-store is sqlite:// with an empty, relative or not normal path: give \
+             sqlite:///<absolute path>"
+                .to_owned()
+        });
+    }
+    Some(
+        if frontend {
+            "--state-store is not postgres://<host>/<db>: the frontend's state store is Postgres"
+        } else {
+            "--state-store is neither postgres://<host>/<db> nor sqlite:///<absolute path>"
+        }
+        .to_owned(),
+    )
 }
 
 /// Rule `state-store`: its failures (at most one, see the module docs).
-pub(super) fn state_store(unit: &UnitFile) -> Vec<String> {
+pub(super) fn state_store(unit: &UnitFile, mode: Mode) -> Vec<String> {
     let words = exec_words(unit);
     flag(&words, "state-store")
-        .and_then(refusal)
+        .and_then(|value| refusal(value, mode))
         .into_iter()
         .collect()
 }

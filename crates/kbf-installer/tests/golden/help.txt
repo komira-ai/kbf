@@ -45,17 +45,23 @@ Options:
       --apply
           Do what the verb says. Without it a mutating verb is a dry run
       --release-source <RELEASE_SOURCE>
-          Where releases are fetched from [default: frontend] [possible values: url, frontend]
+          Where releases are fetched from. Default: the frontend for the modes that enroll, a file server (`url`) for `frontend` and `all-in-one` [possible values: url, frontend]
       --release-url <RELEASE_URL>
           The https base URL of the file server, for --release-source url
       --min-generation <MIN_GENERATION>
-          Refuse orders below this generation
+          Refuse orders below this generation. A floor only goes up
       --commit <COMMIT>
-          The first release to install (40 hex characters)
+          The first release to install (40 hex characters); needs --release-source url
+      --frontend-url <FRONTEND_URL>
+          The frontend to enroll with, as https://host[:port]. For `storage`, `daemon` and `storage-and-daemon`; written to kbf.toml
+      --token-file <TOKEN_FILE>
+          The enrollment token (a file of mode 0600 or tighter); setup keeps a copy that only kbf reads. For the modes that enroll
+      --database <DATABASE>
+          The state database, as postgres:///NAME?host=SOCKET_DIR (no password). Required for `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. The server, the database and the role exist before setup runs
       --no-start
           Enable the units without starting them
       --installer-config <INSTALLER_CONFIG>
-          installer.toml, under the host root: for `--mode frontend` and `all-in-one`, its `database` key names the state database whose schema `setup` creates (or brings forward); without `--apply` it only reports what it would do. Read for those two modes only. The same flag, with the same meaning, as on `run` [default: /etc/kbf/installer.toml]
+          The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root. The same flag, with the same meaning, as on `run` [default: /etc/kbf/installer.toml]
   -h, --help
           Print help
 

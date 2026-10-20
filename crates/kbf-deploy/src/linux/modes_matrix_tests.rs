@@ -31,6 +31,32 @@ fn last_in_service(text: &str, line: &str) -> String {
     text.replace("\n[Install]\n", &format!("\n{line}\n\n[Install]\n"))
 }
 
+/// `value` as the unit's `--state-store`: in the place of the one the unit gives (the last
+/// one wins, so a second flag before it would change nothing), else as a new flag.
+///
+/// A frontend whose store is not Postgres hands over, so its unit gets the control socket
+/// and the preserved directory the rule `handover` then asks for: the defect planted is
+/// the store alone.
+fn with_state_store(mode: Mode, text: &str, value: &str) -> String {
+    let flag = format!("--state-store={value}");
+    let text = match text.find("--state-store=") {
+        Some(at) => {
+            let end = text[at..].find([' ', '\n']).map_or(text.len(), |i| at + i);
+            format!("{}{flag}{}", &text[..at], &text[end..])
+        }
+        None => text.replacen(&format!("/kbf {mode}"), &format!("/kbf {mode} {flag}"), 1),
+    };
+    if mode != Mode::Frontend {
+        return text;
+    }
+    let socket = " --handover-socket=/run/kbf-frontend/control.sock";
+    let text = text.replacen(&flag, &format!("{flag}{socket}"), 1);
+    first_in_service(
+        &text,
+        "RuntimeDirectory=kbf-frontend\nRuntimeDirectoryPreserve=yes",
+    )
+}
+
 /// One planted defect: its rule, what it does to a mode's rendered unit, and the modes
 /// the rule is for.
 struct Row {
@@ -207,25 +233,18 @@ fn rows() -> Vec<Row> {
             },
             fails: &[Mode::StorageAndDaemon, Mode::AllInOne],
         },
+        // A state store that is neither scheme (any mode that gives one), and a SQLite
+        // file in the frontend's unit, which is Postgres only. The other modes take the
+        // SQLite file: the all-in-one's own unit names one.
         Row {
             rule: "state-store",
-            // The frontend's unit gives a state store already (the last one wins): put the
-            // Postgres URI in its place; the other modes get it as a new flag.
-            plant: |m, t| {
-                if t.contains("--state-store=sqlite://") {
-                    t.replace(
-                        "--state-store=sqlite://",
-                        "--state-store=postgres://db/kbf#",
-                    )
-                } else {
-                    t.replacen(
-                        &format!("/kbf {m}"),
-                        &format!("/kbf {m} --state-store=postgres://db/kbf"),
-                        1,
-                    )
-                }
-            },
+            plant: |m, t| with_state_store(m, t, "file:///var/lib/kbf/state"),
             fails: ALL,
+        },
+        Row {
+            rule: "state-store",
+            plant: |m, t| with_state_store(m, t, "sqlite:///var/lib/kbf/state.db"),
+            fails: &[Mode::Frontend],
         },
         // A failure that repeats quickly ends in start-limit-hit: no delay, or a limit.
         Row {

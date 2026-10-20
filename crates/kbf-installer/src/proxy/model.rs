@@ -159,16 +159,18 @@ impl Readiness {
     }
 }
 
-/// What the child itself counts (Q8). Streams are counted by the proxy's permits, not here.
+/// What the child itself counts (Q8): the Execute and WaitExecution streams it has open, and
+/// the worker sessions it has open. Operations queued and not yet leased are not counted: they
+/// live in the shared store, and the new holder serves them (design §5 step 10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenCounts {
-    pub open_executions: u64,
-    pub queued_operations: u64,
+    pub open_streams: u64,
+    pub open_sessions: u64,
 }
 
 impl OpenCounts {
     pub fn idle(self) -> bool {
-        self.open_executions == 0 && self.queued_operations == 0
+        self.open_streams == 0 && self.open_sessions == 0
     }
 }
 

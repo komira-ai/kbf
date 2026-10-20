@@ -1,7 +1,7 @@
 //! Test doubles for the seams of the update API, and a rig that assembles them.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use super::idempotency::Idempotency;
 use super::model::{NewChild, OldChild, UpdateId};
 use super::traits::{
     Clock, Compat, CompatGate, ForwardError, Forwarder, InstallerState, InstallerStatus,
-    OrderError, OrderWriter, RestartMarker, Retired, RunningUpdate, StagedWire, StatusError,
+    OrderError, OrderWriter, RestartPending, Retired, RunningUpdate, StagedWire, StatusError,
     StatusReader, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec,
 };
 use crate::CommitId;
@@ -354,6 +354,15 @@ pub fn staged(commit: &str) -> InstallerStatus {
     }
 }
 
+/// The restart answer, set from the test.
+pub struct FakeRestart(pub Arc<AtomicBool>);
+
+impl RestartPending for FakeRestart {
+    fn restart_pending(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// Every seam, with handles to look at and change them.
 pub struct Rig {
     pub dir: PathBuf,
@@ -363,6 +372,7 @@ pub struct Rig {
     pub gate: FakeGate,
     pub clock: Arc<FakeClock>,
     pub die: Arc<Mutex<Option<CrashPoint>>>,
+    pub restart: Arc<AtomicBool>,
 }
 
 impl Rig {
@@ -379,15 +389,12 @@ impl Rig {
             },
             clock: Arc::new(FakeClock(AtomicU64::new(0))),
             die: Arc::new(Mutex::new(None)),
+            restart: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn set_status(&self, s: InstallerStatus) {
         *self.status.0.lock().unwrap() = Ok(s);
-    }
-
-    pub fn marker_path(&self) -> PathBuf {
-        self.dir.join("restart-pending")
     }
 
     /// A core over this rig's state directory (a second call is a restarted process).
@@ -398,7 +405,7 @@ impl Rig {
             status: Box::new(self.status.clone()),
             compat: Box::new(self.gate.clone()),
             clock: self.clock.clone(),
-            marker: RestartMarker::new(self.marker_path()),
+            restart: Box::new(FakeRestart(self.restart.clone())),
             requests: Idempotency::open(&self.dir),
             hook: Box::new(DieAt(self.die.clone())),
             config: Config::default(),

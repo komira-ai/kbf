@@ -17,8 +17,16 @@
 # already holds must be one of the verified files, byte for byte, or the run fails and
 # changes nothing.
 #
-# Run by hand (workflow_dispatch) with a commit, only the verify job runs: a dry run of
-# every check that publishes nothing.
+# The tag is annotated and its message is the gamma verdict (docs/design/kbf-cicd.md,
+# section 8.1). The verify job also checks it (cargo xtask release verdict): green, for this
+# tag, this commit on main and the set of files SHA256SUMS lists, after a bake of 24 hours or
+# more. It writes the release notes (cargo xtask release notes) and uploads them as the
+# artifact `release-notes`, so a dry run shows them before anyone approves. The publish job
+# runs in the `prod` environment, whose required reviewer approves it.
+#
+# Run by hand (workflow_dispatch) with a commit and a tag, only the verify job runs: a dry run
+# of every check that publishes nothing. The workflow lint (crates/kbf-it/tests/release_workflow)
+# holds this file to all of that.
 name: release
 
 on:
@@ -28,6 +36,10 @@ on:
     inputs:
       commit:
         description: The full SHA of a commit on main, checked as a release would check it; nothing is published
+        required: true
+        type: string
+      tag:
+        description: The annotated v* tag whose message is the gamma verdict, checked as a release would check it
         required: true
         type: string
 
@@ -57,11 +69,17 @@ jobs:
     env:
       # The tag's commit on a tag push; the input on a dry run.
       COMMIT: ${{ github.event_name == 'push' && github.sha || inputs.commit }}
+      # The pushed tag; the input on a dry run.
+      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
     outputs:
       run-id: ${{ steps.locate.outputs.run-id }}
+      set-hash: ${{ steps.verdict.outputs.set-hash }}
     steps:
+      # The whole history, every branch and every tag: the annotated tag object (whose
+      # message is the verdict) and origin/main, which the verdict and the notes read.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - run: rustup toolchain install
       # Built before any step holds a token, so no build script runs beside one.
@@ -106,6 +124,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml" --commit "$COMMIT" --trusted-root "$RUNNER_TEMP/trusted_root.jsonl"
+      - name: The tag's message is a green gamma verdict for this commit and these files
+        id: verdict
+        run: cargo xtask release verdict dist --tag "$TAG" --commit "$COMMIT" --output "$GITHUB_OUTPUT"
+      - name: Write the release notes
+        run: cargo xtask release notes dist --tag "$TAG" --commit "$COMMIT" --out release-notes.md
+      # Shown by a dry run; the release is made from the verified files only.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-notes
+          path: release-notes.md
+          retention-days: 7
+          if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-assets
@@ -119,6 +149,8 @@ jobs:
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # The required reviewer of this environment approves the publish.
+    environment: prod
     permissions:
       contents: write
     steps:
@@ -136,4 +168,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ needs.verify.outputs.run-id }}
-        run: cargo xtask release publish dist --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" --run-id "$RUN_ID"
+          SET_HASH: ${{ needs.verify.outputs.set-hash }}
+        run: cargo xtask release publish dist --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" --run-id "$RUN_ID" --set-hash "$SET_HASH"
+      # The kbf.dev upload (packages, attestations, checksums to the bucket, and the site
+      # sync) goes here, after the release exists, through a GitHub OIDC deploy role. It is
+      # a separate change: it adds its scope to WRITERS in
+      # crates/kbf-it/tests/release_workflow and settles how the workflow lint admits
+      # `id-token: write` under a tag push.

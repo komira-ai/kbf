@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::CommitId;
+use crate::proxy::model::{Failure, Phase};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
@@ -103,10 +104,23 @@ impl NodeResult {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// The frontend update the deploy asked the update API for.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Frontend {
-    pub order_id: u64,
-    pub state: String,
+    /// The API's id of the update; none when no update was made.
+    pub update_id: Option<String>,
+    /// The last phase the API reported for it.
+    pub phase: Option<Phase>,
+    /// What the API said went wrong, when the update ended `failed` or `rolled_back`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+    /// The frontend already ran the commit, so the API made no update.
+    #[serde(skip_serializing_if = "is_false")]
+    pub already_running: bool,
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// The post-deploy checks; `None` is a check that did not run.
@@ -145,7 +159,7 @@ pub struct Summary {
 impl Summary {
     pub fn new(commit: &CommitId, now: u64) -> Summary {
         Summary {
-            schema: 1,
+            schema: 2,
             commit: commit.to_string(),
             previous_desired: None,
             generation: None,

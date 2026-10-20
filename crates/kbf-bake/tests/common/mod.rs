@@ -4,7 +4,10 @@
 #![allow(dead_code)]
 
 use std::cell::Cell;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use kbf_bake::drive::{Fetched, Outcome, drive};
 use kbf_bake::eval::{Decision, Evaluator, Observation};
@@ -229,4 +232,57 @@ impl Bake {
 /// A farm whose requests grow by `per_tick` each interval since [`T0`].
 pub fn growing(per_tick: f64) -> impl FnMut(u64) -> Result<Farm, String> {
     move |t| Ok(Farm::healthy(1.0 + per_tick * ((t - T0) / INTERVAL) as f64))
+}
+
+/// A server on a port of its own that answers every request with `status` and `body`, and hands
+/// the raw request text (head and body) to the channel. The URL is its origin.
+pub fn api(status: &'static str, body: &str) -> (String, mpsc::Receiver<String>) {
+    api_with(status, body, || {})
+}
+
+/// [`api`], running `on_request` when a request has arrived, before it is answered.
+pub fn api_with(
+    status: &'static str,
+    body: &str,
+    on_request: impl Fn() + Send + 'static,
+) -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = mpsc::channel();
+    let body = body.to_owned();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                got.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&got).into_owned();
+                // The request is whole when its head is and the body has the length it declared.
+                let whole = text.split_once("\r\n\r\n").is_some_and(|(head, rest)| {
+                    let declared = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    rest.len() >= declared
+                });
+                if n == 0 || whole {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&got).into_owned());
+            on_request();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (url, rx)
 }
