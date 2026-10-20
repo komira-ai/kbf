@@ -12,7 +12,6 @@
 
 use std::future::pending;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use kbf_enroll::client::{Enrollment, connect, enroll};
@@ -28,11 +27,13 @@ use kbf_types::{Role, RoleSet, Token};
 
 const API_TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("kbf-frontend-enroll-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// A new, empty directory for one test, removed when it drops: bind it before the
+/// frontend it holds files for, so it is removed after that frontend has stopped.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-frontend-enroll-{name}"),
+    )
 }
 
 fn flags(more: &[String]) -> FrontendFlags {

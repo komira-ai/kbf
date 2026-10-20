@@ -3,9 +3,7 @@
 mod support;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -60,21 +58,19 @@ impl Server {
 /// The token the test servers' writes need.
 const TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
-/// A token file holding `content`, mode 0600, unique to this call.
-fn token_file(content: &str) -> PathBuf {
+/// A token file holding `content`, mode 0600, in a directory of its own, read at once
+/// (the directory is removed when this returns).
+fn token_from(content: &str) -> ApiToken {
     use std::os::unix::fs::PermissionsExt;
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-api");
-    std::fs::create_dir_all(&dir).expect("a token directory");
-    let path = dir.join(format!("token-{}-{n}", std::process::id()));
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-api-token");
+    let path = dir.join("token");
     std::fs::write(&path, content).expect("write the token");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-    path
+    ApiToken::from_file(&path).expect("a usable token")
 }
 
 fn token() -> ApiToken {
-    ApiToken::from_file(&token_file(&format!("{TOKEN}\n"))).expect("a usable token")
+    token_from(&format!("{TOKEN}\n"))
 }
 
 fn start() -> Server {

@@ -6,8 +6,6 @@
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use clap::Parser as _;
@@ -54,24 +52,23 @@ impl Log {
     }
 }
 
-fn file(content: &[u8], mode: u32) -> String {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-proxy-auth-warns");
-    std::fs::create_dir_all(&dir).expect("a directory");
-    let path = dir.join(format!(
-        "file-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
+/// A file in a directory of its own (which the caller keeps), and its path.
+fn file(content: &[u8], mode: u32) -> (kbf_testkit::dir::TestDir, String) {
+    let dir = kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        "kbf-server-proxy-auth-warns",
+    );
+    let path = dir.join("file");
     std::fs::write(&path, content).expect("write the file");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-    path.to_str().expect("UTF-8").to_owned()
+    let path = path.to_str().expect("UTF-8").to_owned();
+    (dir, path)
 }
 
 /// What `Args::proxy` logs for a deny list of `entries`, with or without the proxy flag.
 fn logged(entries: &str, behind: bool) -> String {
-    let list = file(entries.as_bytes(), 0o600);
-    let secret = file(&[0x5a; 32], 0o600);
+    let (_list_dir, list) = file(entries.as_bytes(), 0o600);
+    let (_secret_dir, secret) = file(&[0x5a; 32], 0o600);
     let mut argv = vec![
         "kbf-server",
         "--listen=127.0.0.1:0",

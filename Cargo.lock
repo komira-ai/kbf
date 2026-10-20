@@ -1841,6 +1841,7 @@ dependencies = [
  "httparse",
  "hyper",
  "kbf-cli",
+ "kbf-gate",
  "kbf-host",
  "kbf-installer",
  "kbf-proto",

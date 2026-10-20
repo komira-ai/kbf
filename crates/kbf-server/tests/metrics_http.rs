@@ -125,6 +125,10 @@ async fn metrics_count_what_the_reapi_listener_serves() {
     assert!(!body.contains("kbf_local_cache"), "{body}");
     // The loss-mark families, read from the metadata state at the scrape.
     assert!(body.contains("# TYPE kbf_cache_lost_blobs gauge"), "{body}");
+    assert!(
+        body.contains("# TYPE kbf_bytes_in_flight_peak gauge"),
+        "{body}"
+    );
     assert_eq!(sample(&body, "kbf_cache_lost_blobs"), 0);
     assert_eq!(sample(&body, "kbf_cache_blob_losses_total"), 0);
 
@@ -176,6 +180,12 @@ async fn metrics_count_what_the_reapi_listener_serves() {
     ] {
         assert_eq!(sample(&body, series), value, "{series}");
     }
+    // The upload's bytes were held in memory once, which the peak keeps (the current
+    // count is not asserted: the gauge is the process's and other tests add to it).
+    assert!(
+        sample(&body, "kbf_bytes_in_flight_peak") >= data.len() as u64,
+        "{body}"
+    );
 }
 
 /// Catches the one cache's fill missing from `/metrics` on a process that has one

@@ -26,8 +26,8 @@ use kbf_server::storage_health::{Class, Debts, NotIdle, Reported as Said, Writes
 use kbf_server::update::{Controller, FactsSource, FarmFacts, HostPhase, Release, Rows, ports};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, ScanRange, Store,
-    StoreError, StoreTime, Txn, Versioned,
+    Changes, Commit, CommitStats, Cond, Conflict, ManualClock, Revision, ScanPage, ScanRange,
+    Store, StoreError, StoreTime, Txn, Versioned,
 };
 use kbf_types::{NodeId, Resources, Role, RoleSet, TokenId, TokenSecret, WorkerId};
 use tokio::sync::mpsc;
@@ -288,6 +288,35 @@ impl Rig {
             .into_iter()
             .find(|m| m.id == id)
             .expect("listed")
+    }
+
+    /// Rewrites the stored row of member `id` so its address reads `spelling`, as a row an
+    /// older build wrote (before `register` stored the canonical spelling) would. The
+    /// spelling must be the same length as the stored address, so the encoded row stays valid.
+    fn rewrite_member_addr(&self, id: MemberId, spelling: &str) {
+        let rows = self.store.scan_prefix("member/").expect("a scan");
+        let (key, row) = rows
+            .into_iter()
+            .find(|(key, _)| key.rsplit('/').next() == Some(&id.0.to_string()))
+            .expect("the member's row");
+        let stored = self.member_look(id).addr;
+        assert_eq!(stored.len(), spelling.len(), "same length");
+        let at = row
+            .value
+            .windows(stored.len())
+            .position(|w| w == stored.as_bytes())
+            .expect("the address in the row");
+        let mut value = row.value.clone();
+        value[at..at + spelling.len()].copy_from_slice(spelling.as_bytes());
+        self.store
+            .txn(Txn::new().put_ttl(
+                key,
+                value,
+                std::time::Duration::from_secs(3600),
+                Cond::Version(row.version),
+            ))
+            .expect("the store")
+            .expect("rewritten");
     }
 
     /// The storage half restarts: the process registers again, a new boot counter, `Active`.
@@ -914,6 +943,74 @@ fn two_members_at_one_address_in_two_cases_link_nothing() {
         "a host joined to no one started"
     );
     assert!(!cordoned(&rig.farm, &daemon.id));
+}
+
+/// Catches a host left unlinked from a member row an older build wrote in mixed case (the
+/// build before `Members::register` stored the canonical spelling). The row is written
+/// straight to the store as `S1.Example:7000`, which `register` can no longer produce; the
+/// registry holds `s1.example:7000`, the canonical spelling enrollment stores. The member's
+/// look reads the legacy spelling back, and the host is still joined to it and started
+/// (marked down), because `link` reads both sides through `canonical_addr`. No other test
+/// reaches the member side of that call: every row `register` writes is already canonical.
+///
+/// Mutant seen red: `canonical_addr` removed from the member side of the comparison in
+/// `update/session.rs` `link` (`m.addr == *advertised`): the host stays unlinked, never marked.
+#[test]
+fn a_host_is_linked_to_a_member_row_an_older_build_wrote_in_mixed_case() {
+    let mut rig = rig();
+    let node = rig.member("storage-1", "s1.example:7000");
+    let _peer = rig.member("storage-2", "s2.example:7000");
+    rig.rewrite_member_addr(node, "S1.Example:7000");
+    assert_eq!(
+        rig.member_look(node).addr,
+        "S1.Example:7000",
+        "the legacy row reads back as written"
+    );
+    rig.enrolled("linux-1", "s1.example:7000");
+    let mut daemon = rig.daemon("linux-1");
+    rig.facts();
+    assert_eq!(rig.observer.unlinked(&daemon.id), None);
+    let mut orders = Vec::new();
+    until(&mut rig, &mut daemon, LOOKS, &mut orders, |rig, _| {
+        rig.member_look(node).planned_down
+    });
+    assert!(rig.phase("linux-1").is_some(), "the host was started");
+    assert!(cordoned(&rig.farm, &daemon.id));
+}
+
+/// Catches an address match that is a prefix test. The only members are supersets of the
+/// advertised `s1.example:7000`: `s1.example:70001`, alone and then with `s1.example:7000x`.
+/// The host is not started (no row, no cordon, no order) and its reason says no member
+/// registered the address.
+///
+/// Mutant seen red: the comparison replaced by `m.addr.starts_with(advertised)` (with one
+/// superset the host is linked and started; with two it is unlinked for the other reason,
+/// "more than one", so the reason is checked too).
+#[test]
+fn members_at_a_longer_address_than_the_advertised_one_link_nothing() {
+    for supersets in [
+        &["s1.example:70001"][..],
+        &["s1.example:70001", "s1.example:7000x"][..],
+    ] {
+        let mut rig = rig();
+        for (n, addr) in supersets.iter().enumerate() {
+            rig.member(&format!("long-{n}"), addr);
+        }
+        rig.enrolled("linux-1", "s1.example:7000");
+        let mut daemon = rig.daemon("linux-1");
+        for _ in 0..LOOKS {
+            rig.tick();
+        }
+        assert_eq!(daemon.orders(), [], "{supersets:?}");
+        assert_eq!(rig.phase("linux-1"), None, "{supersets:?}");
+        assert!(!cordoned(&rig.farm, &daemon.id), "{supersets:?}");
+        rig.facts();
+        let why = rig.observer.unlinked(&daemon.id).expect("not linked");
+        assert!(
+            why.contains("no storage member registered"),
+            "{supersets:?}: {why}"
+        );
+    }
 }
 
 /// Catches a Linux host with no storage half (it enrolled for the daemon role alone, so it

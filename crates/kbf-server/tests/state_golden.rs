@@ -29,7 +29,6 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use kbf_caps::NodeCaps;
 use kbf_front::{Cache, Described, Finished, Submission};
@@ -290,16 +289,11 @@ async fn write_into(dir: &Path) {
     std::fs::write(&rows, text).expect("the rows are written");
     drop(store);
     std::fs::copy(scratch.join("state.db"), &db).expect("the file is copied");
-    std::fs::remove_dir_all(&scratch).expect("the scratch is removed");
 }
 
-fn tempdir() -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("kbf-state-golden-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+/// A scratch directory, removed when it drops.
+fn tempdir() -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-state-golden")
 }
 
 /// Writes the golden of this release. Run by a person on the release commit (see the
@@ -418,14 +412,13 @@ async fn read_back(golden: &Path) {
     );
     drop(farm);
     drop(store);
-    std::fs::remove_dir_all(&scratch).expect("the scratch is removed");
 
     queue_fate_and_cordon_recovered(golden, &name).await;
     loss_recovered(golden, &name).await;
 }
 
 /// A new store over a copy of `golden`, and the scratch directory holding it.
-fn copy_of(golden: &Path) -> (Arc<SqliteStore>, PathBuf) {
+fn copy_of(golden: &Path) -> (Arc<SqliteStore>, kbf_testkit::dir::TestDir) {
     let scratch = tempdir();
     let copy = scratch.join("state.db");
     std::fs::copy(golden, &copy).expect("a copy");
@@ -446,7 +439,7 @@ fn keys_of(store: &SqliteStore, prefix: &str) -> Vec<String> {
 /// node is uncordoned grants it at the raised booking, which takes it out of the queue
 /// by the `queue/` key and writes its lease.
 async fn queue_fate_and_cordon_recovered(golden: &Path, name: &str) {
-    let (store, scratch) = copy_of(golden);
+    let (store, _scratch) = copy_of(golden);
     assert_eq!(
         keys_of(&store, "queue/"),
         ["queue/0000000000000000"],
@@ -502,14 +495,13 @@ async fn queue_fate_and_cordon_recovered(golden: &Path, name: &str) {
     );
     drop(farm);
     drop(store);
-    std::fs::remove_dir_all(&scratch).expect("the scratch is removed");
 }
 
 /// `op-2` lost its lease once (`loss/` row of 1) and holds a new one on `node-b`. A
 /// registration of `node-b` that holds no lease loses it again: the farm counts from the
 /// stored count and writes 2.
 async fn loss_recovered(golden: &Path, name: &str) {
-    let (store, scratch) = copy_of(golden);
+    let (store, _scratch) = copy_of(golden);
     let [loss_key] = &keys_of(&store, "loss/")[..] else {
         panic!("{name}: expected one loss/ row");
     };
@@ -540,17 +532,15 @@ async fn loss_recovered(golden: &Path, name: &str) {
     );
     drop(farm);
     drop(store);
-    std::fs::remove_dir_all(&scratch).expect("the scratch is removed");
 }
 
 /// Catches: a writer that replaces a released golden (the file the next release must still
 /// read would then be one the new code wrote).
 #[tokio::test(start_paused = true)]
 async fn the_writer_refuses_to_replace_a_golden() {
-    let dir = tempdir();
-    let scratch = dir.clone();
+    let scratch = tempdir();
+    let dir = scratch.to_path_buf();
     std::fs::write(dir.join(format!("v{SCHEMA_VERSION}.db")), b"kept").expect("a file");
     let wrote = tokio::spawn(async move { write_into(&dir).await }).await;
     assert!(wrote.is_err(), "the writer replaced an existing golden");
-    let _ = std::fs::remove_dir_all(&scratch);
 }

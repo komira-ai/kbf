@@ -110,6 +110,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(super) struct Receiving {
     /// The segment's bytes, unless they go to `tier`: then empty.
     buffer: Vec<u8>,
+    /// The buffer's length, counted as held (`kbf_bytes_in_flight`) from its allocation:
+    /// the declared length, whether or not its pages are touched.
+    held: kbf_storage::in_flight::Held<'static>,
     /// The records' range on the write tier, when they are written there, and the
     /// writes to it.
     tier: Option<(Arc<TierRange>, Arc<TierWrites>)>,
@@ -199,8 +202,10 @@ impl Receiving {
         } else {
             vec![0; length]
         };
+        let held = kbf_storage::in_flight::hold(buffer.len() as u64);
         Self {
             buffer,
+            held,
             tier: tier.map(|range| (Arc::new(range), Arc::default())),
             ranges: BTreeMap::new(),
             by_offset,
@@ -408,6 +413,7 @@ impl Receiving {
             return Err(refused);
         }
         let mut buffer = self.buffer;
+        let held = self.held;
         let mut entries = Vec::with_capacity(declared.entries.len());
         for (i, entry) in declared.entries.iter().enumerate() {
             let crc32c = if self.trusted {
@@ -438,7 +444,7 @@ impl Receiving {
         // tail after the records.
         buffer[declared.records_len as usize..].copy_from_slice(&footer);
         Ok(BuiltSegment {
-            body: Bytes::from(buffer),
+            body: kbf_storage::in_flight::counted_with(buffer, held),
             entries,
             verified: !self.trusted,
             staged: None,
