@@ -89,6 +89,20 @@ impl From<ReleaseError> for Failure {
     }
 }
 
+/// A release error keeps the exit of the release verbs; files that are not a release are a
+/// refusal (exit 2), not a failure to try again.
+impl From<crate::record_release::RecordError> for Failure {
+    fn from(e: crate::record_release::RecordError) -> Failure {
+        match e {
+            crate::record_release::RecordError::Release(e) => Failure::from(e),
+            other => Failure {
+                exit: Exit::Refused,
+                why: other.to_string(),
+            },
+        }
+    }
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -239,13 +253,7 @@ fn record_release(
         apply,
         &mut std::io::stderr(),
     )
-    .map_err(|e| match e {
-        crate::record_release::RecordError::Release(e) => Failure::from(e),
-        other => Failure {
-            exit: Exit::Refused,
-            why: other.to_string(),
-        },
-    })
+    .map_err(Failure::from)
 }
 
 fn gc(root: PathBuf, apply: bool, keep: usize) -> Result<(), Failure> {

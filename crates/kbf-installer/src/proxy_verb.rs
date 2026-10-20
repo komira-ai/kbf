@@ -304,9 +304,10 @@ struct Supervised {
 impl Drop for Supervised {
     fn drop(&mut self) {
         self.clock.stop();
-        if let Some(thread) = self.thread.take() {
-            let _gate = thread.join();
-        }
+        // `None` when the thread never started; the gate is dropped with the join's result.
+        self.thread.take().into_iter().for_each(|thread| {
+            drop(thread.join());
+        });
     }
 }
 
@@ -320,7 +321,7 @@ fn supervise(handle: &kbf_proxy::ProxyHandle, with: Supervise) -> Supervised {
     use crate::proxy::model::Timing;
     use crate::proxy::runtime::SystemClock;
     use crate::proxy::supervisor::{
-        Boot, NoMigration, Startup, adopt_children, child_admin, children_dir, frontend_argv,
+        Boot, NoMigration, adopt_children, child_admin, children_dir, frontend_argv,
     };
 
     let clock = Arc::new(SystemClock::new());
@@ -335,9 +336,8 @@ fn supervise(handle: &kbf_proxy::ProxyHandle, with: Supervise) -> Supervised {
                 children_dir(&with.state_dir),
                 frontend_argv(&with.proxy_auth_file, with.upstream),
             );
-            let line = match child_admin(&handle, with.upstream, with.operator_token_file) {
-                Err(why) => format!("no frontend child adopted, new streams stay held: {why}"),
-                Ok(admin) => {
+            let started =
+                child_admin(&handle, with.upstream, with.operator_token_file).map(|admin| {
                     let report = FileReport::new(&with.state_dir);
                     let boot = Boot {
                         admin: &admin,
@@ -348,21 +348,26 @@ fn supervise(handle: &kbf_proxy::ProxyHandle, with: Supervise) -> Supervised {
                         timing: Timing::frontend(),
                         retry: Retry::boot(),
                     };
-                    match adopt_children(&gate, &child, &with.state_dir, &boot) {
-                        Startup::Adopted { active } => {
-                            format!("the frontend child in slot {active:?} serves")
-                        }
-                        Startup::Held(why) => {
-                            format!("no frontend child adopted, new streams stay held: {why}")
-                        }
-                    }
-                }
-            };
+                    adopt_children(&gate, &child, &with.state_dir, &boot)
+                });
+            let line = startup_line(started);
             let _ = writeln!(std::io::stderr(), "kbf-installer: proxy: {line}");
             gate
         })
         .ok();
     Supervised { clock, thread }
+}
+
+/// What the supervisor tells the log about how the start went.
+#[cfg(target_os = "linux")]
+fn startup_line(started: Result<crate::proxy::supervisor::Startup, String>) -> String {
+    use crate::proxy::supervisor::Startup;
+    match started {
+        Ok(Startup::Adopted { active }) => format!("the frontend child in slot {active:?} serves"),
+        Ok(Startup::Held(why)) | Err(why) => {
+            format!("no frontend child adopted, new streams stay held: {why}")
+        }
+    }
 }
 
 /// The verb. With `--check`, the table is loaded and nothing is bound.

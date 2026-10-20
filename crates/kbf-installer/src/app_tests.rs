@@ -565,6 +565,48 @@ fn the_operators_verbs_run_through_the_dispatcher_with_their_own_exits() {
     );
 }
 
+/// Catches `record-release` not running through the dispatcher, or its refusals leaving with
+/// another exit: as root, files that are not a release (a release that was never placed, a
+/// binary that is not the executable this host runs, a host root that is not absolute) end with
+/// the exit of the refusal and the program on the line; a release error keeps the exit of
+/// the release verbs.
+///
+/// Mutants planted: the verb dispatched to `gc`; the refusal folded into the failure exit.
+#[test]
+fn record_release_runs_through_the_dispatcher_and_refuses_what_is_not_a_release() {
+    use crate::record_release::RecordError;
+    use crate::release::ReleaseError;
+    let (_, root) = seeded("record-release");
+    let root_arg = root.to_str().expect("text");
+    for commit in [A, B] {
+        let (exit, _, err) = run_as(
+            0,
+            &[
+                "--root",
+                root_arg,
+                "--apply",
+                "record-release",
+                "--commit",
+                commit,
+            ],
+        );
+        assert_eq!(exit, Exit::Refused, "{commit}: {err}");
+        assert!(err.starts_with("kbf-installer: "), "{err}");
+    }
+    let (exit, _, err) = run_as(0, &["--root", "relative", "record-release", "--commit", A]);
+    assert_eq!(exit, Exit::Failed, "{err}");
+
+    let release = |e: ReleaseError| Failure::from(RecordError::Release(e)).exit;
+    assert_eq!(release(ReleaseError::NotFirst(c(A))), Exit::Failed);
+    let read = io::Error::from(io::ErrorKind::NotFound);
+    let refused = Failure::from(RecordError::Read {
+        path: "p".to_owned(),
+        source: read,
+    });
+    assert_eq!(refused.exit, Exit::Refused);
+    assert!(refused.why.contains("cannot read p"), "{}", refused.why);
+}
+
 /// Catches a frontend or all-in-one unit that activates releases with no database migration
 /// and no warning: `run` for the unit of either mode refuses (exit 2, one line) unless
 /// `--installer-config` is given, before it touches the host; a unit of a mode with no

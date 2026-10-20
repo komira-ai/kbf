@@ -93,13 +93,12 @@ pub fn child_admin(
     table: UpstreamTable,
     token_file: PathBuf,
 ) -> Result<Admin, String> {
-    let secret = handle
-        .admin_headers()
-        .iter()
-        .try_fold(Headers::new(), |headers, (name, value)| {
-            headers.with(name.as_str(), value.as_bytes())
-        })
-        .map_err(|e| format!("the proxy secret is not a header value: {e}"))?;
+    let secret = secret_headers(
+        handle
+            .admin_headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    )?;
     let loopback = |port: u16| SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     Ok(Admin::new(
         move |slot| loopback(table.admin_port(gate_slot(slot))),
@@ -108,6 +107,21 @@ pub fn child_admin(
         move || std::fs::read(&token_file),
         Deadlines::frontend(),
     ))
+}
+
+/// The proxy's secret headers as the child client sends them.
+///
+/// # Errors
+/// A header value the client refuses to send (never, for the 64 hex digits the proxy's secret is).
+fn secret_headers<'a>(
+    pairs: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<Headers, String> {
+    pairs
+        .into_iter()
+        .try_fold(Headers::new(), |headers, (name, value)| {
+            headers.with(name, value)
+        })
+        .map_err(|e| format!("the proxy secret is not a header value: {e}"))
 }
 
 /// What the start needs beyond the children and the gate: the child's admin calls, the

@@ -135,27 +135,27 @@ fn check(dir: &Path, euid: u32, wanted: BinaryKind) -> Result<(), RecordError> {
     if meta.mode() & 0o001 == 0 {
         return Err(refused(&binary, NOT_RUNNABLE));
     }
-    let mut header = [0_u8; 64];
-    let mut file = fs::File::open(&binary).map_err(|source| RecordError::Read {
-        path: binary.display().to_string(),
-        source,
-    })?;
-    let read = file.read(&mut header).map_err(|source| RecordError::Read {
-        path: binary.display().to_string(),
-        source,
-    })?;
-    if BinaryKind::of(&header[..read]) != wanted {
+    // One failure for both steps: a file that opens and then fails to read is no more a release
+    // than one that does not open.
+    let mut header = Vec::with_capacity(64);
+    fs::File::open(&binary)
+        .and_then(|file| file.take(64).read_to_end(&mut header))
+        .map_err(|source| RecordError::Read {
+            path: binary.display().to_string(),
+            source,
+        })?;
+    if BinaryKind::of(&header) != wanted {
         return Err(refused(&binary, "is not the executable this host runs"));
     }
-    match fs::symlink_metadata(dir.join(VERIFIED)) {
-        Ok(m) if !m.is_file() => Err(refused(&dir.join(VERIFIED), "is not a plain file")),
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(RecordError::Read {
-            path: dir.join(VERIFIED).display().to_string(),
-            source,
-        }),
+    // The marker is absent (a hand placement) or a plain file (a repeat); anything else, a
+    // directory or a path that cannot be examined, is not ours to vouch over.
+    let marker = dir.join(VERIFIED);
+    let usable = fs::symlink_metadata(&marker)
+        .map_or_else(|e| e.kind() == io::ErrorKind::NotFound, |m| m.is_file());
+    if !usable {
+        return Err(refused(&marker, "is not a plain file"));
     }
+    Ok(())
 }
 
 /// Write the `VERIFIED` marker unless it is there.

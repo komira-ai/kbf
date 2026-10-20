@@ -395,3 +395,21 @@ fn the_production_retry_is_ten_attempts_from_two_seconds_doubling_to_thirty() {
     assert_eq!(run.notes.last().attempt, 10);
     assert_eq!(run.notes.last().attempts, 10);
 }
+
+/// Catches a boot that outlives the proxy while a child is being waited for: a stop during the
+/// wait for ready ends the boot as stopped (not as a failed try that is retried), with the one
+/// process it started left as it is, nothing signalled and no second try.
+#[test]
+fn a_shutdown_while_waiting_for_ready_stops_the_boot_and_leaves_the_child() {
+    let run = Run::new();
+    run.world.script(Script {
+        ready_after: None,
+        exit_after: None,
+    });
+    run.world.set_limit(secs(0));
+    assert_eq!(run.boot(retry(5)), Booted::Stopped);
+    let w = &run.world;
+    assert_eq!(w.count("spawn"), 1);
+    assert_eq!(w.count("terminate") + w.count("kill pid"), 0);
+    assert_eq!(run.notes.states(), ["starting"]);
+}

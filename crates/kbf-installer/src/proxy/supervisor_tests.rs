@@ -220,6 +220,8 @@ fn an_adoption_the_gate_refuses_is_reported_as_held() {
 /// takeovers fail first.
 struct ScriptAdmin<'a> {
     role: RoleInfo,
+    /// The role call fails (the child never answers it).
+    role_err: bool,
     ready_after: u32,
     polls: Cell<u32>,
     takeovers: Cell<u32>,
@@ -231,6 +233,9 @@ struct ScriptAdmin<'a> {
 
 impl ChildAdmin for ScriptAdmin<'_> {
     fn role(&self, _slot: Slot) -> Result<RoleInfo, PortError> {
+        if self.role_err {
+            return Err(PortError("admin port closed".into()));
+        }
         Ok(self.role)
     }
 
@@ -323,6 +328,7 @@ impl<'a> Env<'a> {
                     holder: true,
                     state: RoleState::Active,
                 },
+                role_err: false,
                 ready_after: 0,
                 polls: Cell::new(0),
                 takeovers: Cell::new(0),
@@ -683,4 +689,167 @@ fn the_startup_hold_stays_in_force_while_an_adopted_candidate_is_awaited() {
         "the gate held the startup hold at every poll"
     );
     assert_eq!(bound_slot(&gate), Some(kbf_proxy::slot::Slot::A));
+}
+
+/// Catches an adoption of a child nobody could ask: a live recorded child whose role never
+/// answers is not routed to, and the reason names the slot; the startup hold stays in force.
+#[test]
+fn a_live_child_whose_role_cannot_be_read_is_not_adopted_and_the_hold_stays() {
+    let rig = rig("supervisor-role-err");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Active)
+        .expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident]);
+    let after = rig.restarted();
+    let (gate, _runner) = gate();
+    let mut env = Env::new(&rig, &gate);
+    env.admin.role_err = true;
+    let Startup::Held(why) = adopt_children(&gate, &after, &state_dir(&rig), &env.boot()) else {
+        panic!("adopted a child whose role is unknown");
+    };
+    assert!(
+        why.contains("the live child in slot A cannot be adopted"),
+        "{why}"
+    );
+    assert!(gate.handle.snapshot().holding);
+    assert_eq!(gate.active(), None);
+}
+
+/// Catches a candidate taking the generation without the startup hold: with the hold gone (taken
+/// by someone else) the recorded candidate is left alone, no takeover is asked for, and the
+/// reason is returned.
+#[test]
+fn a_recorded_candidate_is_left_alone_when_the_startup_hold_is_gone() {
+    let rig = rig("supervisor-cand-nohold");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Candidate)
+        .expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident]);
+    let after = rig.restarted();
+    let (gate, _runner) = gate();
+    let mut env = Env::new(&rig, &gate);
+    env.admin.role = RoleInfo {
+        holder: false,
+        state: RoleState::Candidate,
+    };
+    let _taken = gate.handle.startup_hold().expect("the startup hold");
+    let Startup::Held(why) = adopt_children(&gate, &after, &state_dir(&rig), &env.boot()) else {
+        panic!("took the generation without the hold");
+    };
+    assert!(why.contains("startup hold is gone"), "{why}");
+    assert_eq!(env.admin.takeovers.get(), 0);
+    assert_eq!(gate.active(), None);
+}
+
+/// Catches a refused takeover reported as adopted: the recorded candidate that is refused the
+/// generation is left running ("the process is left as it is"), the hold stays and nothing is
+/// routed.
+#[test]
+fn a_recorded_candidate_refused_the_generation_is_left_as_it_is_and_the_hold_stays() {
+    let rig = rig("supervisor-cand-refused");
+    let ident = rig
+        .child
+        .spawn(Slot::A, &c(A), Start::Candidate)
+        .expect("spawn");
+    let _stop = Cleanup(&rig.child, vec![ident.clone()]);
+    let after = rig.restarted();
+    let (gate, _runner) = gate();
+    let mut env = Env::new(&rig, &gate);
+    env.admin.role = RoleInfo {
+        holder: false,
+        state: RoleState::Candidate,
+    };
+    env.admin.takeover_fails.set(1);
+    let Startup::Held(why) = adopt_children(&gate, &after, &state_dir(&rig), &env.boot()) else {
+        panic!("reported adopted after a refused takeover");
+    };
+    assert!(
+        why.contains("the recorded candidate in slot A did not come up")
+            && why.contains("takeover: refused")
+            && why.contains("left as it is"),
+        "{why}"
+    );
+    assert_eq!(env.admin.takeovers.get(), 1);
+    assert!(alive(ident.pid), "the process is not signalled");
+    assert!(gate.handle.snapshot().holding);
+    assert_eq!(gate.active(), None);
+}
+
+/// Catches a secret that cannot be sent being swallowed: a header value with a non-ASCII byte is
+/// refused with the reason, and the proxy's real secret (64 hex digits) is accepted.
+#[test]
+fn a_secret_the_client_cannot_send_is_refused_with_the_reason() {
+    let why = secret_headers([("x-secret", &[0xff_u8][..])]).expect_err("non-ASCII");
+    assert!(
+        why.contains("the proxy secret is not a header value"),
+        "{why}"
+    );
+    assert!(secret_headers([("x-secret", &b"abcdef"[..])]).is_ok());
+}
+
+/// What a fixture operator port received: the first request's head, as text.
+fn serve_once(listener: TcpListener) -> std::thread::JoinHandle<String> {
+    use std::io::{Read as _, Write as _};
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).expect("read") == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .expect("answer");
+        String::from_utf8_lossy(&head).into_owned()
+    })
+}
+
+/// Catches an admin client wired to the wrong place: the desired-release offer of each slot goes
+/// to that slot's operator port, with the proxy's secret and the operator token read from the
+/// file at the call (a missing file is the error of the token, not of the network).
+#[test]
+fn the_child_admin_offers_a_release_to_the_operator_port_of_its_slot() {
+    use crate::proxy::admin::AdminError;
+    let (gate, _runner) = gate();
+    let token_file = kbf_host::testkit::scratch("supervisor-child-admin").join("operator.token");
+    let offset = UpstreamTable { base_port: 0 }.port(kbf_proxy::slot::Slot::A, Target::Operator);
+    let stride =
+        UpstreamTable { base_port: 0 }.port(kbf_proxy::slot::Slot::B, Target::Operator) - offset;
+
+    let table = UpstreamTable { base_port: 20_000 };
+    let missing = child_admin(&gate.handle, table, token_file.clone()).expect("admin");
+    assert!(
+        matches!(
+            missing.try_post_desired(Slot::A, &c(A)),
+            Err(AdminError::Token(std::io::ErrorKind::NotFound))
+        ),
+        "no token file"
+    );
+
+    std::fs::write(&token_file, "operator-token\n").expect("token");
+    for (slot, extra) in [(Slot::A, 0), (Slot::B, stride)] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let table = UpstreamTable {
+            base_port: port - offset - extra,
+        };
+        let admin = child_admin(&gate.handle, table, token_file.clone()).expect("admin");
+        let seen = serve_once(listener);
+        admin.try_post_desired(slot, &c(A)).expect("offered");
+        let head = seen.join().expect("fixture");
+        assert!(head.starts_with("POST /v1/update/desired "), "{head}");
+        assert!(
+            head.contains("authorization: Bearer operator-token\r\n"),
+            "{head}"
+        );
+        for (name, value) in gate.handle.admin_headers().iter() {
+            let line = format!("{}: {}\r\n", name.as_str(), value.to_str().expect("ASCII"));
+            assert!(head.contains(&line), "{line:?} in {head}");
+        }
+    }
 }

@@ -258,3 +258,108 @@ fn a_binary_only_its_owner_can_execute_is_refused_with_the_fix() {
     run(&mut exec, &layout, A, true).expect("0755 is recorded");
     assert!(dir.join(VERIFIED).exists());
 }
+
+/// A scratch host whose state already says `staged`, as a hand placement after a `stage` leaves it.
+fn host_staging(name: &str, staged: &str) -> (ScratchHost, Layout) {
+    let (exec, layout) = host(name);
+    Locked::acquire(&layout)
+        .expect("lock")
+        .write(&crate::state::State {
+            staged: Some(c(staged)),
+            ..crate::state::State::default()
+        })
+        .expect("state");
+    (exec, layout)
+}
+
+fn staged(layout: &Layout) -> Option<CommitId> {
+    Locked::acquire(layout)
+        .expect("lock")
+        .read()
+        .expect("read")
+        .and_then(|s| s.staged)
+}
+
+/// Catches a release that is current and still staged: the rule of the state is that every verb
+/// making a release current drops a `staged` that names it, and `record-release` is one. A
+/// `staged` naming the recorded commit is cleared; one naming another commit is not touched.
+///
+/// Mutants to plant: `staged` carried over by `first`; `staged` cleared whatever it names.
+#[test]
+fn recording_a_staged_release_clears_it_and_another_staged_release_stays() {
+    for (name, staged_commit, want) in [("same", A, None), ("other", B, Some(c(B)))] {
+        let (mut exec, layout) = host_staging(&format!("staged-{name}"), staged_commit);
+        place(&exec, A);
+        run(&mut exec, &layout, A, true).expect("recorded");
+        assert_eq!(current(&layout), Some(c(A)), "{name}");
+        assert_eq!(staged(&layout), want, "{name}");
+    }
+}
+
+/// Catches a dry run that touches the state: a staged release stays staged until `--apply`.
+#[test]
+fn a_dry_run_leaves_the_staged_release_alone() {
+    let (mut exec, layout) = host_staging("staged-dry", A);
+    place(&exec, A);
+    run(&mut exec, &layout, A, false).expect("dry run");
+    assert_eq!(staged(&layout), Some(c(A)));
+}
+
+/// Catches a release directory that is a file being vouched for, or a marker that is not a plain
+/// file (a directory of that name): each is refused, naming the path, with nothing written.
+#[test]
+fn a_release_directory_that_is_a_file_or_a_marker_that_is_a_directory_is_refused() {
+    let (mut exec, layout) = host("dir-is-file");
+    let dir = exec.at(&format!("/var/lib/kbf-installer/releases/{A}"));
+    fs::write(&dir, b"not a directory").expect("file");
+    let err = run(&mut exec, &layout, A, true).expect_err("a file");
+    assert!(err.to_string().contains("is not a directory"), "{err}");
+    assert_eq!(current(&layout), None);
+
+    let (mut exec, layout) = host("marker-is-dir");
+    let dir = place(&exec, A);
+    fs::create_dir(dir.join(VERIFIED)).expect("dir");
+    let err = run(&mut exec, &layout, A, true).expect_err("a directory");
+    assert!(err.to_string().contains("is not a plain file"), "{err}");
+    assert_eq!(current(&layout), None);
+}
+
+/// Catches an unreadable `kbf` being vouched for: a binary only its execute bits describe cannot
+/// be examined, so it is refused as unreadable. (Root reads any file, so there is nothing to
+/// refuse as root.)
+#[test]
+fn a_binary_that_cannot_be_read_is_refused() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let (mut exec, layout) = host("unreadable");
+    let dir = place(&exec, A);
+    fs::set_permissions(dir.join("kbf"), fs::Permissions::from_mode(0o111)).expect("mode");
+    let err = run(&mut exec, &layout, A, true).expect_err("unreadable");
+    assert!(matches!(err, RecordError::Read { .. }), "{err}");
+    assert!(err.to_string().contains("cannot read"), "{err}");
+    assert_eq!(current(&layout), None);
+}
+
+/// Catches a marker that fails to write being reported as recorded: the release directory the
+/// owner cannot write into makes the marker fail after the state went first, the error says
+/// where, and the repeat (the directory fixed) writes the marker and changes nothing else.
+#[test]
+fn a_marker_that_cannot_be_written_is_an_error_and_the_repeat_writes_it() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let (mut exec, layout) = host("marker-unwritable");
+    let dir = place(&exec, A);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("mode");
+    let err = run(&mut exec, &layout, A, true).expect_err("not writable");
+    assert!(matches!(err, RecordError::Write { .. }), "{err}");
+    assert!(err.to_string().contains("cannot write"), "{err}");
+    assert_eq!(current(&layout), Some(c(A)), "the state went first");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("mode");
+    run(&mut exec, &layout, A, true).expect("repeat");
+    assert_eq!(
+        fs::read_to_string(dir.join(VERIFIED)).expect("marker"),
+        format!("{A}\n")
+    );
+}

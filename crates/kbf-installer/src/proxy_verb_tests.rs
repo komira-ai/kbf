@@ -339,3 +339,25 @@ fn a_second_stop_signal_ends_the_process_at_once() {
 fn the_production_stop_bound_is_ten_seconds() {
     assert_eq!(STOP_BOUND, Duration::from_secs(10));
 }
+
+/// Catches a start that reads as served when it did not: the log line says which slot serves an
+/// adopted child, and that new streams stay held, with the reason, for a held start and for a
+/// supervisor that could not even build its admin client.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_supervisors_line_says_what_the_start_did() {
+    use crate::proxy::model::Slot;
+    use crate::proxy::supervisor::Startup;
+    assert_eq!(
+        startup_line(Ok(Startup::Adopted { active: Slot::B })),
+        "the frontend child in slot B serves"
+    );
+    assert_eq!(
+        startup_line(Ok(Startup::Held("both slots have a live child".into()))),
+        "no frontend child adopted, new streams stay held: both slots have a live child"
+    );
+    assert_eq!(
+        startup_line(Err("the proxy secret is not a header value".into())),
+        "no frontend child adopted, new streams stay held: the proxy secret is not a header value"
+    );
+}
