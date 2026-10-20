@@ -295,10 +295,14 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     // Every program the unit runs is the installer's: the package replaces
     // /usr/bin/kbf-installer, the installer replaces the tree. Only the two root checks
     // carry a `+`; a `-` would ignore a failed gate, and `!`, `@`, `:` change the sandbox.
+    // The proxy's reload is the one `ExecReload` a unit may have, and it runs a program outside
+    // the installer's tree (`/bin/kill`): `proxy-reload` pins its exact text, so the generic
+    // exec and reload rules skip that one key there.
     let execs: Vec<(&str, &str)> = unit
         .directives()
         .iter()
         .filter(|d| d.section == "Service" && d.key.starts_with("Exec"))
+        .filter(|d| !(is_proxy && d.key == "ExecReload"))
         .map(|d| (d.key.as_str(), trim(&d.value)))
         .collect();
     for (key, value) in &execs {
@@ -325,7 +329,7 @@ fn violations(name: &str, text: &str) -> Vec<String> {
     }
     // Catches a reload that restarts: Envoy's hot restart is kbf-installer's, and
     // `systemctl restart` closes every stream the old Envoy holds. No unit has a reload
-    // until the hot restart exists.
+    // until the hot restart exists; the proxy's is SIGHUP, under `proxy-reload`.
     for (key, value) in &execs {
         if *key == "ExecReload" || value.contains("systemctl") {
             v("reload", format!("{key}={value}"));
