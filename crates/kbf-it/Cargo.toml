@@ -42,6 +42,8 @@ tracing-subscriber.workspace = true
 xtask.workspace = true
 
 [dev-dependencies]
+# `tests/object_store_e2e`: the operator routes on a real listener.
+axum = { workspace = true, features = ["http1", "tokio"] }
 bytes.workspace = true
 futures.workspace = true
 # The proxy soak (tests/proxy_soak.rs) is an h2 client of the proxy library, and runs this
@@ -54,6 +56,13 @@ hex.workspace = true
 http.workspace = true
 kbf-cli.workspace = true
 kbf-front.workspace = true
+# `tests/object_store_e2e`: the registration's journey from an operator PUT to a storage
+# node's heartbeat; the S3 service the nodes and the frontend's probe talk to is the fake.
+kbf-map.workspace = true
+kbf-objstore = { workspace = true, features = ["testkit"] }
+kbf-state = { workspace = true, features = ["test-support"] }
+kbf-storage.workspace = true
+kbf-types.workspace = true
 # The Envoy render the real-Envoy tests (tests/envoy_box, tests/envoy_check.rs) run.
 kbf-installer.workspace = true
 # `tests/package_trust.rs`: the installer's settings parser reads the `installer.conf`

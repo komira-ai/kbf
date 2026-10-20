@@ -5,6 +5,7 @@ mod crash;
 mod files;
 mod leaks;
 mod rules;
+mod view;
 
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
