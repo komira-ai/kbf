@@ -6,7 +6,6 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::ops::Deref;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -31,8 +30,8 @@ use kbf_proto::worker::{
 };
 use kbf_server::token::ApiToken;
 use kbf_server::{
-    Api, Bound, Listeners, MemoryLadder, RaftMetaLog, ServeError, StreamLimits, bind_server,
-    bind_server_with_api,
+    Api, Bound, Listeners, MemoryLadder, RaftMetaLog, ServeError, StreamLimits,
+    bind_server_with_map,
 };
 use kbf_store::FaultFs;
 use prost::Message;
@@ -185,6 +184,8 @@ pub struct Cell {
     stopped: Option<oneshot::Receiver<()>>,
     /// The server's invocation records.
     pub recorder: kbf_front::Recorder,
+    /// The server's frontend drain.
+    pub drain: Arc<kbf_server::Drain>,
     client: Client,
 }
 
@@ -231,6 +232,29 @@ impl Cell {
         Self::start_with(wait, kbf_sched::FINISHED_RETENTION).await
     }
 
+    /// A cell that gives an action naming no OS or architecture `default_platform`, as
+    /// `--default-platform` sets it. (The other cells give it none, so that a test of
+    /// the platform match sees the match.)
+    pub async fn start_with_default_platform(default_platform: kbf_front::DefaultPlatform) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+            None,
+            None,
+            default_platform,
+        )
+        .await
+    }
+
     /// A cell that books and climbs `ladder`, as `--memory-ladder-gib` sets it. The
     /// other cells book 1 GiB first ([`small_ladder`]), so the small nodes of these
     /// tests can run an action that names no size.
@@ -266,6 +290,57 @@ impl Cell {
             retention,
             small_ladder(),
             streams,
+        )
+        .await
+    }
+
+    /// A cell that sends its daemons the storage map `map` holds.
+    pub async fn start_with_map(map: Arc<dyn kbf_mapsync::MapSource>) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            None,
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+            Some(map),
+            None,
+            kbf_front::DefaultPlatform::NONE,
+        )
+        .await
+    }
+
+    /// A cell whose scheduler keeps its state in `state` (and writes the build history it
+    /// names, if any), and that serves the operator API without a token: its `/metrics`
+    /// is at [`Cell::api`].
+    pub async fn start_with_state(state: kbf_server::StateStore) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let api = Api {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            token: None,
+            local_cache: None,
+            releases: None,
+            poll: None,
+        };
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve_with_map(
+            cache,
+            store,
+            Some(api),
+            None,
+            wait,
+            retention,
+            small_ladder(),
+            StreamLimits::DEFAULT,
+            None,
+            Some(state),
+            kbf_front::DefaultPlatform::NONE,
         )
         .await
     }
@@ -320,6 +395,9 @@ impl Cell {
         let api = Api {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
+            local_cache: None,
+            releases: None,
+            poll: None,
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store, None).await;
@@ -445,6 +523,37 @@ impl Cell {
         ladder: MemoryLadder,
         streams: StreamLimits,
     ) -> Self {
+        Self::serve_with_map(
+            cache,
+            store,
+            api_config,
+            raft_dir,
+            wait,
+            retention,
+            ladder,
+            streams,
+            None,
+            None,
+            kbf_front::DefaultPlatform::NONE,
+        )
+        .await
+    }
+
+    /// [`Cell::serve`], sending its daemons the storage map `map` holds if given.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_with_map(
+        cache: Arc<Cache<GateLog, SharedStore>>,
+        store: SharedStore,
+        api_config: Option<Api>,
+        raft_dir: Option<FaultFs>,
+        wait: Duration,
+        retention: Duration,
+        ladder: MemoryLadder,
+        streams: StreamLimits,
+        map: Option<Arc<dyn kbf_mapsync::MapSource>>,
+        state: Option<kbf_server::StateStore>,
+        default_platform: kbf_front::DefaultPlatform,
+    ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
             worker: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -454,13 +563,15 @@ impl Cell {
             hello_wait: HELLO_WAIT,
             tick: Duration::from_millis(50),
             unservable_wait: wait,
+            default_platform,
             memory_ladder: ladder,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
+            streams: kbf_server::StreamTiming::default(),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
             segments: kbf_front::SegmentsConfig::DEFAULT,
-            streams,
+            stream_limits: streams,
         };
         let (stop, stop_rx) = oneshot::channel::<()>();
         let (stopped_tx, stopped) = oneshot::channel::<()>();
@@ -480,23 +591,22 @@ impl Cell {
                     let shutdown = async move {
                         let _ = stop_rx.await;
                     };
-                    match server_api {
-                        None => {
-                            let bound = bind_server(server_cache, listeners, shutdown);
-                            run(bound.expect("bind"), bound_tx).await;
-                        }
-                        Some(api) => {
-                            let bound =
-                                bind_server_with_api(server_cache, listeners, Some(api), shutdown);
-                            run(bound.expect("bind"), bound_tx).await;
-                        }
-                    }
+                    let bound = bind_server_with_map(
+                        server_cache,
+                        listeners,
+                        server_api,
+                        kbf_auth::Policy::allow_all(),
+                        state,
+                        map,
+                        shutdown,
+                    );
+                    run(bound.expect("bind"), bound_tx).await;
                 });
                 drop(runtime);
                 let _ = stopped_tx.send(());
             })
             .expect("a server thread");
-        let (reapi, worker, api, recorder) = bound_rx.await.expect("the server binds");
+        let (reapi, worker, api, recorder, drain) = bound_rx.await.expect("the server binds");
         Self {
             cache,
             store,
@@ -506,23 +616,35 @@ impl Cell {
             stop: Some(stop),
             stopped: Some(stopped),
             recorder,
+            drain,
             client: Client::connect(reapi, worker).await,
         }
     }
 }
 
+/// What a started server tells the test: its REAPI, worker and operator API addresses,
+/// its invocation records and its frontend drain.
+type Started = (
+    SocketAddr,
+    SocketAddr,
+    Option<SocketAddr>,
+    kbf_front::Recorder,
+    Arc<kbf_server::Drain>,
+);
+
 /// Says where `bound` listens on `addresses`, then serves it until it stops.
 async fn run(
     bound: Bound<impl Future<Output = Result<(), ServeError>>>,
-    addresses: oneshot::Sender<(
-        SocketAddr,
-        SocketAddr,
-        Option<SocketAddr>,
-        kbf_front::Recorder,
-    )>,
+    addresses: oneshot::Sender<Started>,
 ) {
     let recorder = bound.recorder.clone();
-    let _ = addresses.send((bound.reapi, bound.worker, bound.api, recorder));
+    let _ = addresses.send((
+        bound.reapi,
+        bound.worker,
+        bound.api,
+        recorder,
+        Arc::clone(&bound.drain),
+    ));
     bound.serving.await.expect("serve");
 }
 
@@ -530,11 +652,8 @@ async fn run(
 /// this call.
 fn api_token() -> ApiToken {
     use std::os::unix::fs::PermissionsExt;
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-cell");
-    std::fs::create_dir_all(&dir).expect("a token directory");
-    let path = dir.join(format!("token-{}-{n}", std::process::id()));
+    let dir = kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-cell");
+    let path = dir.join("token");
     std::fs::write(&path, format!("{API_TOKEN}\n")).expect("write the token");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     ApiToken::from_file(&path).expect("a usable token")
@@ -731,6 +850,8 @@ pub struct FakeDaemon {
     seq: u64,
     /// The lease epoch the Welcome named (0 before it).
     pub epoch: u64,
+    /// The storage map the Welcome carried.
+    pub map: Option<kbf_proto::kbf::map::v1::Map>,
 }
 
 impl FakeDaemon {
@@ -758,6 +879,7 @@ impl FakeDaemon {
                 assert_eq!(w.protocol_version, 1);
                 assert_eq!(w.heartbeat_interval_ms, INTERVAL.as_millis() as u64);
                 d.epoch = w.epoch;
+                d.map = w.map;
                 Ok(d)
             }
             other => panic!("expected Welcome, got {other:?}"),
@@ -787,6 +909,7 @@ impl FakeDaemon {
             kept: VecDeque::new(),
             seq: 0,
             epoch: 0,
+            map: None,
         })
     }
 
@@ -843,6 +966,17 @@ impl FakeDaemon {
             }
             self.kept.push_back(m);
         }
+    }
+
+    /// The generation of the next `MapUpdate`, within `within`.
+    pub async fn map_update_within(&mut self, within: Duration) -> Option<u64> {
+        self.expect_within(within, |m| match m {
+            server_message::Message::MapUpdate(u) => {
+                Some(u.map.as_ref().map_or(0, |m| m.generation))
+            }
+            _ => None,
+        })
+        .await
     }
 
     pub async fn expect<T>(

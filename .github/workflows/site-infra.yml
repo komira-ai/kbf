@@ -1,0 +1,42 @@
+# Tests of the site infrastructure app (infra/site): CDK assertion tests and the held CLI's tests. Runs only when
+# that directory (or this file) changes. The app is self-contained Node/TypeScript; nothing else in the repository
+# depends on Node. GitHub-hosted runner, commit-pinned actions, no token rights beyond reading the checkout.
+name: site-infra
+
+on:
+  pull_request:
+    paths:
+      - infra/site/**
+      - .github/workflows/site-infra.yml
+  push:
+    branches: [main, feature/arch-v2]
+    paths:
+      - infra/site/**
+      - .github/workflows/site-infra.yml
+
+permissions: {}
+
+concurrency:
+  group: site-infra-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  site-infra:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: infra/site
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 20.19.4
+          cache: npm
+          cache-dependency-path: infra/site/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test

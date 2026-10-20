@@ -39,7 +39,7 @@ What the existing sims do not cover:
   `Cancel`, never suspends and never sends a `Hello` from a stale session out of order.
 - **Server restarts.** No sim replaces the leader's state; the scheduler's state is
   in memory and a restart loses it (issue
-  [#137](https://github.com/komira-ai/komira-build-farm/issues/137) was found while
+  [#137](https://github.com/komira-ai/kbf/issues/137) was found while
   writing this catalog).
 - **Platform and cordon together**, and **rollouts**: no sim drives `RolloutDriver`.
 - **Scale.** At most three workers and 40 operations.
@@ -55,7 +55,7 @@ carry it out:
 |---|---|---|
 | Operation states `Queued -> Leased -> Running -> Completed / Failed`, and `Refused` | `scheduler.rs` | yes |
 | Commit before `Start`; one accepted result per operation, by the newest committed grant in log order | `scheduler.rs` (`lease_committed`, `report`, `result_committed`) | yes |
-| First fit: queue order, then the first live worker in name order whose caps satisfy the platform and whose free room fits CPU, memory and whole GPUs | `servable.rs` (`fit`) | yes |
+| Spread: queue order, then the least loaded live worker (the least booked share of its CPU or memory, then the fewest leases, then name order) whose caps satisfy the platform and whose free room fits CPU, memory and whole GPUs | `servable.rs` (`fit`), `load.rs` | yes |
 | At most `PLACEMENT_ROUND` = 256 grants per tick | `scheduler.rs` (`place`) | yes |
 | Request sizes: one core and 4 GiB, or `kbf-book-cpus` / `kbf-book-mem-gib`, plus `gpu` | `kbf-front/src/execution.rs` (the scheduler sees `Resources`) | sizes yes; parsing is the front's tests |
 | QoS order: urgency, then submission order; a more urgent joiner promotes | `scheduler.rs` (`queue`, `submit`) | yes |
@@ -74,7 +74,7 @@ carry it out:
 
 **Planned, so not simulated** (a scenario for any of these waits for the code): the
 infra retry budget (issue
-[#22](https://github.com/komira-ai/komira-build-farm/issues/22)), placement scoring and
+[#22](https://github.com/komira-ai/kbf/issues/22)), placement scoring and
 best fit, learned sizes, protected floors, reclaimed room and preemption of `batch`,
 fair turns within a QoS level, drivers in placement, `RUN_ON` on the wire (today the
 daemon self-fences every lease), a `Started` message from the daemon, re-adopting runs
@@ -109,9 +109,9 @@ per-pool slots shared across rollouts, canary and soak, and the rollout steps af
   the replay command; the scenario is fixed in its own PR with a test that failed
   before, or lands `#[ignore = "issue #N"]`.
 - **Coverage.** A new test raises measured coverage of `kbf-sched` and `kbf-server`,
-  and the ratchet in `coverage-baseline` must match the measurement exactly, so each
-  PR lowers the rows with `kbf-coverage tighten`, the command the failing coverage
-  job prints (see CONTRIBUTING.md).
+  and the gate holds every crate to 99% of lines and branches, or its floor in
+  `coverage-floors`; a PR that raises a crate's coverage raises the floor with
+  `kbf-coverage raise` (see CONTRIBUTING.md).
 
 ## 4. Invariants
 
@@ -135,7 +135,7 @@ the following. "Live" means heard from within G; "grant" means a `Commit` of a
 | I8 | **No grant to a cordoned worker,** in any cordon state, across its sessions. | shadow cordons |
 | I9 | **Drain never kills.** A lease on a cordoned worker that stays live and lists it is never given up. Drain states are true: `Drained` only with no lease held, `Draining` only before its deadline and with a lease, `Paused` only at or after its deadline and only an operator moves it on. | shadow, `cordon`, `leases_on` |
 | I10 | **Refused only for a stated reason.** A refusal follows a `Waiting` with a reason for that operation; the operation was queued; at every tick of an unbroken run of at least the unservable wait before it, no live, uncordoned worker could run it (platform and whole capacity), and no cordoned one could either. The refusal's reason is the last stated reason with the wait appended. | reference verdict per tick |
-| I11 | **Placement follows the queue.** Each round's grants are what a reference first fit gives: queued operations in (urgency descending, operation id ascending) order, each to the first live, uncordoned worker in name order that satisfies its platform and has free room, at most 256. This implies QoS order: an operation is never passed over for a less urgent one that fits on a worker it also fits on. | reference model |
+| I11 | **Placement follows the queue.** Each round's grants are what a reference placement gives: queued operations in (urgency descending, operation id ascending) order, each to the least loaded live, uncordoned worker that satisfies its platform and has free room (load: the larger of the booked shares of its CPU and its memory, then its lease count, then name order; the reference compares the shares in integers, written apart from the scheduler's), at most 256. A host-rung action (at a worker's whole memory) waits until some worker's free memory meets its request; under sustained spread load that wait can be long, and nothing reserves a worker for it. This implies QoS order: an operation is never passed over for a less urgent one that fits on a worker it also fits on. | reference model |
 | I12 | **Self-fenced work never runs twice at once** (cell sims, with a daemon model). | run intervals per operation |
 | I13 | **Dedup.** A joinable request with an unfinished twin of the same instance and digest joins it; a non-joinable one never joins; a join never lowers QoS and a promoted operation is placed in its new order. | shadow in-flight map |
 | I14 | **The queue is the set of queued operations.** Each `Queued` operation not awaiting a refusal is queued once, at its current QoS; nothing else is. | `queued()` vs `state` |
@@ -151,7 +151,7 @@ the following. "Live" means heard from within G; "grant" means a `Commit` of a
 | L3 | A lease lost to a reboot is granted again within one heartbeat and one round of the new session's first heartbeat, not after G. |
 | L4 | A lease whose `Start` was lost on a live session is granted again no sooner than `START_GRACE` after the `Start`, and its operation is answered by the newer lease. |
 
-Liveness under sustained load is **not** an invariant today: first fit holds nothing
+Liveness under sustained load is **not** an invariant today: placement holds nothing
 back for large requests, and there are no fair turns within a level, so a large
 request, or `batch` work under a steady stream of more urgent work, can wait for as
 long as smaller or more urgent work keeps arriving (F1.5, F1.6). Bounding that waits

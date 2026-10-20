@@ -532,8 +532,22 @@ fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// The lock a changing verb holds until it returns.
+///
+/// An `flock` belongs to the open file description, not to the descriptor, and a
+/// description lives until every copy of the descriptor is closed. A process forked while
+/// the lock is held (any spawn of a child by another thread of this process, as in a
+/// test binary that runs verbs on one thread and starts programs on others) carries a
+/// copy until it execs, so closing the file would leave the lock held for as long as
+/// that takes. Dropping unlocks first, which no copy outlives.
 struct Lock {
-    _file: File,
+    file: File,
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // An error leaves the close that follows to release the lock, as before.
+        let _ = self.file.unlock();
+    }
 }
 
 fn take_lock(host: &dyn AdminHost, paths: &Paths, out: &mut dyn Write) -> Result<Lock, Stop> {
@@ -550,7 +564,7 @@ fn take_lock(host: &dyn AdminHost, paths: &Paths, out: &mut dyn Write) -> Result
     let mut waited = 0;
     loop {
         let why = match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return Ok(Lock { _file: file }),
+            Ok(()) => return Ok(Lock { file }),
             Err(why) => why,
         };
         if waited == LOCK_WAIT {

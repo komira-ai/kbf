@@ -1,0 +1,544 @@
+//! The memory policy against real rootless `crun` and a real cgroup v2 kernel: each
+//! lease's hard cap (`memory.max` = booking x 1.5 + 512 MiB) with `memory.oom.group=1`,
+//! swap left allowed, the driver's swap watch (`SwapKill`), and the classification of
+//! an OOM kill by the lease cgroup's `memory.events`: at the lease's own cap it is
+//! `OutOfMemory`; without it (the `actions/` backstop, or the host) it is `BusyNode`.
+//!
+//! Set up as `tests/crun.rs` is (see there): `cargo xtask crun-tests` runs these
+//! with `--include-ignored` in a unit with `Delegate=yes`.
+//!
+//! Each test's cell cgroup stands in for `actions/`. Where a test needs the kernel to
+//! OOM-kill, its cell sets `memory.swap.max=0`: a node whose swap is full. With swap
+//! free, a lease at its cap is reclaimed into swap (the policy sets no per-lease
+//! `memory.swap.max`), and the driver's swap watch kills it
+//! ([`past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory`]); a lease
+//! swapped below its cap is not killed ([`swapped_below_its_cap_a_lease_is_not_killed`]),
+//! nor is one the host swapped that then pushes a few MiB more into swap at its cap
+//! ([`swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed`]).
+//! The tests that need swap fail on a node without it.
+
+mod support;
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use kbf_daemon::{Runtime, RuntimeError};
+use kbf_driver_container::SwapKill;
+use kbf_types::{LeaseId, Resources};
+use support::real::{Cell, describe, sh};
+use support::store_action;
+use support::swap_kill::{Logs, assert_swap_kill};
+
+const MIB: u64 = 1 << 20;
+
+/// The cap `memory.max` the driver gives a lease that booked `booked` bytes.
+fn cap(booked: u64) -> u64 {
+    booked + booked / 2 + 512 * MIB
+}
+
+fn write(dir: &Path, file: &str, value: &str) {
+    std::fs::write(dir.join(file), value).unwrap_or_else(|e| panic!("write {file}: {e}"));
+}
+
+fn read_u64(dir: &Path, file: &str) -> u64 {
+    let text = std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+    text.trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("{file}: {text:?}"))
+}
+
+/// Fails the test unless the node has swap.
+fn require_swap() {
+    let swap_kib: u64 = std::fs::read_to_string("/proc/meminfo")
+        .expect("meminfo")
+        .lines()
+        .find_map(|l| l.strip_prefix("SwapTotal:"))
+        .and_then(|v| v.trim().strip_suffix("kB")?.trim().parse().ok())
+        .expect("SwapTotal");
+    assert!(
+        swap_kib > 0,
+        "this test needs a node with swap; this one has none"
+    );
+}
+
+/// What the lease cgroup `lease` holds and counts now, for a failure message.
+fn state(lease: &Path) -> String {
+    let read = |f: &str| {
+        std::fs::read_to_string(lease.join(f))
+            .map_or_else(|e| format!("({e})"), |t| t.trim().replace('\n', ","))
+    };
+    format!(
+        "memory.current {}, memory.swap.current {}, memory.events {}",
+        read("memory.current"),
+        read("memory.swap.current"),
+        read("memory.events")
+    )
+}
+
+/// Waits until a process whose command name is `comm` runs anywhere under `lease`.
+async fn wait_for(lease: &Path, comm: &str) {
+    for _ in 0..1200 {
+        let mut pending = vec![lease.to_owned()];
+        while let Some(dir) = pending.pop() {
+            let procs = std::fs::read_to_string(dir.join("cgroup.procs")).unwrap_or_default();
+            if procs.split_whitespace().any(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == comm)
+            }) {
+                return;
+            }
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no {comm} under {}:{}", lease.display(), describe(lease));
+}
+
+/// Catches a lease killed past its cap reported as anything but `OutOfMemory` with its
+/// cap, an OOM kill that takes a neighbour lease with it, and a missing OOM group (the
+/// "oom.group off" mutant, on the lease and the container: the kernel kills only `dd`,
+/// the action's other child `sleep 3600` lives on, and the run ends at its timeout).
+///
+/// Lease 1 books 16 MiB (cap 536 MiB) and reads 700 MiB into one buffer; lease 2 sleeps
+/// beside it, in the same `actions/`, and must still be running afterwards.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn past_its_cap_an_action_dies_alone_and_is_out_of_memory() {
+    let cell = Cell::new("own-cap");
+    write(&cell.cgroup, "memory.swap.max", "0");
+
+    let neighbour = store_action(&cell.cas, &sh("exec sleep 120"));
+    let work = cell.work(2, neighbour, Resources::new(1000, 16 * MIB));
+    let runtime = Arc::clone(&cell.runtime);
+    let second = tokio::spawn(async move { runtime.run(work).await });
+    wait_for(&cell.cgroup.join(cell.name(2)), "sleep").await;
+
+    let mut spec = sh("sleep 3600 & dd if=/dev/zero of=/dev/null bs=700M count=1; wait");
+    spec.timeout = Some(Duration::from_secs(60));
+    let action = store_action(&cell.cas, &spec);
+    let outcome = cell
+        .runtime
+        .run(cell.work(1, action, Resources::new(1000, 16 * MIB)))
+        .await;
+    let want = cap(16 * MIB);
+    assert!(
+        matches!(outcome, Err(RuntimeError::OutOfMemory { used, limit }) if limit == want && used > 16 * MIB),
+        "{outcome:?}"
+    );
+    cell.assert_clean(1);
+
+    assert!(
+        cell.container_exists(2),
+        "the neighbour lease died with the one past its cap"
+    );
+    cell.runtime.kill(LeaseId::new(cell.term, 2)).await;
+    let outcome = second.await.expect("join");
+    assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
+    cell.assert_clean(2);
+}
+
+/// Catches a busy node's kill read as the action's own (the "classify by exit code
+/// alone" mutant: both end with SIGKILL, 137), which would double the booking of an
+/// action that never reached its cap. The action books 1 GiB (cap 2 GiB) and reads
+/// 200 MiB; the cell, standing in for `actions/`, allows 64 MiB, so the kernel's OOM
+/// killer runs for the cell's limit, not the lease's.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn killed_by_the_actions_backstop_within_its_cap_is_a_busy_node() {
+    let cell = Cell::new("backstop");
+    write(&cell.cgroup, "memory.max", "64M");
+    write(&cell.cgroup, "memory.swap.max", "0");
+    let action = store_action(
+        &cell.cas,
+        &sh("dd if=/dev/zero of=/dev/null bs=200M count=1"),
+    );
+    let outcome = cell
+        .runtime
+        .run(cell.work(1, action, Resources::new(1000, 1 << 30)))
+        .await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::BusyNode(ref why))
+            if why.contains("oom 0, max 0")
+                && why.contains("time(s) for the actions/ cgroup's own limit during the lease")),
+        "{outcome:?}"
+    );
+    cell.assert_clean(1);
+}
+
+/// Catches a cap with no buffer above the booking (the "cap = booking" mutant): an
+/// action that books 64 MiB and holds 300 MiB, past its booking and within its cap of
+/// 608 MiB, runs to exit 0 with no swap to fall back on.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn past_its_booking_within_its_cap_an_action_runs() {
+    let cell = Cell::new("buffer");
+    write(&cell.cgroup, "memory.swap.max", "0");
+    let action = store_action(
+        &cell.cas,
+        &sh("dd if=/dev/zero of=/dev/null bs=300M count=1"),
+    );
+    let result = cell
+        .runtime
+        .run(cell.work(1, action, Resources::new(1000, 64 * MIB)))
+        .await
+        .expect("ran within its cap");
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    cell.assert_clean(1);
+}
+
+/// Catches a lease past its cap left to swap (the "watch off" mutant: the action
+/// holds its buffer until its 60 s timeout), a kill reported as anything but the
+/// lease's own out-of-memory kill (the "busy node for an own-cap kill" mutant), a kill
+/// that is slow, and one that takes a neighbour lease with it.
+///
+/// With swap free, lease 1 books 16 MiB (cap 536 MiB) and fills one 900 MiB buffer
+/// (`dd` then blocks writing it into a pipe nobody reads), so reclaim at its cap moves
+/// some 360 MiB of it to swap, past the 128 MiB floor this cell's watch is given; the
+/// watch samples every second. Lease 2 sleeps beside it and must still be running.
+/// The kill is checked as `assert_swap_kill` says: past its cap overall, with its own
+/// swap past the floor by the watch's log line. Also catches a threshold that drops the
+/// floor (the "0 floor" mutant: its kill line names the 4 MiB share of the booking).
+/// RAM plus swap past the cap by the floor is no promise: the kill sample may find RAM
+/// below the cap.
+/// The buffer is random, not zeros: a kernel that splits huge pages under reclaim
+/// (crun-x86's) drops zero-filled pages for the shared zero page, so a buffer of
+/// zeros shrinks below the cap and never reaches swap.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
+    require_swap();
+    let cell = Cell::with("swap-kill", |config| {
+        config.swap_kill = SwapKill {
+            floor_bytes: 128 * MIB,
+            ..SwapKill::DEFAULT
+        };
+    });
+
+    let neighbour = store_action(&cell.cas, &sh("exec sleep 120"));
+    let work = cell.work(2, neighbour, Resources::new(1000, 16 * MIB));
+    let runtime = Arc::clone(&cell.runtime);
+    let second = tokio::spawn(async move { runtime.run(work).await });
+    wait_for(&cell.cgroup.join(cell.name(2)), "sleep").await;
+
+    let mut spec = sh("dd if=/dev/urandom bs=900M count=1 iflag=fullblock | sleep 3600");
+    spec.timeout = Some(Duration::from_secs(60));
+    let action = store_action(&cell.cas, &spec);
+    let started = Instant::now();
+    let runtime = Arc::clone(&cell.runtime);
+    let work = cell.work(1, action, Resources::new(1000, 16 * MIB));
+    let logs = Logs::capture();
+    let mut first = tokio::spawn(async move { runtime.run(work).await });
+    // What the lease looked like each second, for the failure message.
+    let lease = cell.cgroup.join(cell.name(1));
+    let mut seen = Vec::new();
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut first => break outcome.expect("join"),
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                seen.push(format!("{:?}: {}", started.elapsed(), state(&lease)));
+            }
+        }
+    };
+    let took = started.elapsed();
+    assert_swap_kill(
+        &outcome,
+        &logs.text(),
+        cap(16 * MIB),
+        128 * MIB,
+        &seen.join("\n"),
+    );
+    drop(logs);
+    assert!(took < Duration::from_secs(20), "killed after {took:?}");
+    println!("killed {took:?} after the start: {outcome:?}");
+    cell.assert_clean(1);
+
+    assert!(
+        cell.container_exists(2),
+        "the neighbour lease died with the one past its cap"
+    );
+    cell.runtime.kill(LeaseId::new(cell.term, 2)).await;
+    let outcome = second.await.expect("join");
+    assert!(matches!(outcome, Err(RuntimeError::Killed)), "{outcome:?}");
+    cell.assert_clean(2);
+}
+
+/// Catches the swap watch killing on swap alone (the "ignores max events" mutant), as
+/// host pressure would have it: a lease well below its cap holds a 150 MiB buffer of
+/// random bytes (`dd` blocked writing it into a pipe nobody reads yet; random, so
+/// reclaim cannot drop it as zero pages), the test reclaims 100 MiB
+/// from it (`memory.reclaim`, the kernel's reclaim run on that one cgroup, standing in
+/// for the host's), so its `memory.swap.current` rises with no `max` event, past the
+/// 8 MiB floor this cell's watch is given, and the action still exits 0 after the watch
+/// has sampled it for several seconds. Also catches a lease that reclaim cannot move
+/// to swap (a per-lease `memory.swap.max=0` mutant).
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn swapped_below_its_cap_a_lease_is_not_killed() {
+    require_swap();
+    const FLOOR: u64 = 8 * MIB;
+    let cell = Cell::with("swap", |config| {
+        config.swap_kill = SwapKill {
+            floor_bytes: FLOOR,
+            percent: 0,
+            every: Duration::from_millis(200),
+        };
+    });
+    let spec =
+        sh("dd if=/dev/urandom bs=150M count=1 iflag=fullblock | { sleep 10; cat >/dev/null; }");
+    let action = store_action(&cell.cas, &spec);
+    let work = cell.work(1, action, Resources::new(1000, 256 * MIB));
+    let runtime = Arc::clone(&cell.runtime);
+    let run = tokio::spawn(async move { runtime.run(work).await });
+    let lease = cell.cgroup.join(cell.name(1));
+    wait_for(&lease, "sleep").await;
+    // The buffer is anonymous memory: `anon` in `memory.stat`, not the file's cache.
+    let anon = |lease: &Path| {
+        std::fs::read_to_string(lease.join("memory.stat"))
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix("anon ")?.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+    };
+    let mut held = 0;
+    for _ in 0..100 {
+        held = anon(&lease);
+        if held >= 150 * MIB {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(held >= 150 * MIB, "the buffer is not held: {held} bytes");
+    // EAGAIN when it reclaimed less than asked; what it moved is read below.
+    let _ = std::fs::write(lease.join("memory.reclaim"), "200M");
+    let swapped = read_u64(&lease, "memory.swap.current");
+    assert!(
+        swapped > FLOOR,
+        "the premise: the lease holds more than the watch's floor in swap: {}",
+        state(&lease)
+    );
+    let events = std::fs::read_to_string(lease.join("memory.events")).expect("memory.events");
+    assert!(
+        events.lines().any(|l| l == "max 0"),
+        "the premise: the lease never reached its cap: {events}"
+    );
+    let result = run.await.expect("join").expect("ran");
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    println!("{swapped} bytes of the lease in swap; it ran to exit 0");
+    cell.assert_clean(1);
+}
+
+/// Catches the swap watch killing a lease for swap the host put there (the
+/// absolute-swap rule, seen on crun-arm and crun-x86): a lease that host pressure
+/// swapped out, and that then reaches its own cap and pushes more into swap there,
+/// but less than the threshold, runs to exit 0. Production configuration: no
+/// `memory.swap.max` on the lease.
+///
+/// The lease books 256 MiB, holds a 300 MiB buffer of random bytes (`dd` blocked
+/// writing it into a pipe nobody reads) and writes a 128 MiB file into its working
+/// directory, synced, so its pages are clean. The test reclaims from the lease
+/// (`memory.reclaim`, standing in for host pressure: no `max` event) until little is
+/// left in RAM: the file's pages are dropped and the buffer goes to swap, past the
+/// 192 MiB floor this cell's watch is given. One reclaim is not enough on crun-arm,
+/// which kept 51 and 84 MB in RAM after one (pages written to swap stay in RAM, as
+/// swap cache, until a later reclaim drops them). The test then lowers the lease's
+/// `memory.max` to 64 MiB above what it holds in RAM, so the action can reach its cap.
+/// The action reads the file a few times (its page cache hits the cap: `max` grows,
+/// and reclaim drops the clean pages), then holds 24 new 4 MiB buffers at once,
+/// started 500 ms apart. Together they are more than the lease's RAM and headroom, so
+/// at its cap reclaim must push some of the lease into swap: `max` grows and swap
+/// rises in the same interval, with the lease holding far more than the floor in
+/// swap. The absolute-swap rule kills it there.
+///
+/// The pieces are small and far apart, and the headroom wide, so that one piece at a
+/// time fills at the cap: crun-arm's kernel OOM-killed the lease at the cap this
+/// test sets, with swap free, when it filled 64 MiB at once against 16 MiB of
+/// headroom, and again with six 16 MiB pieces 300 ms apart against 64 MiB (80 MB
+/// charged within one 200 ms sample, then `memory.events` `oom 1`, `oom_kill 13`).
+/// The driver reports such a kill as the lease's own out-of-memory kill, rightly: its
+/// cap ran the OOM killer. The swap watch's kill is `cgroup.kill`, which counts no
+/// `oom_kill`, so when the cell's `oom_kill` grew during the run the test fails on
+/// that premise, naming the kernel, rather than as a kill by the watch.
+///
+/// What the lease can push into swap itself at its cap is bounded: what it held in
+/// RAM after the reclaim, its cap's headroom, the 96 MiB of buffers and a little
+/// (8 MiB) for `cat` and the shell. The test asserts both premises before the action
+/// reaches its cap: the buffers are more than RAM and headroom (the push is forced),
+/// and the bound is below the floor (a kill is the rule's error, never the lease's).
+/// Clean file pages for the `max` events, not written ones: a lease at so tight a cap
+/// that writes is OOM-killed by the kernel (seen on both real-crun jobs) before its dirty
+/// pages are written back.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
+    require_swap();
+    const FLOOR: u64 = 192 * MIB;
+    // The buffer the host swaps out; the buffers the action holds at its cap (`PIECES`
+    // of `PIECE`), the headroom it is given there, and what `cat` and the shell may add.
+    const BUFFER: u64 = 300 * MIB;
+    const PIECE: u64 = 4 * MIB;
+    const PIECES: u64 = 24;
+    const PUSH: u64 = PIECE * PIECES;
+    const HEADROOM: u64 = 64 * MIB;
+    const SLACK: u64 = 8 * MIB;
+    let cell = Cell::with("swap-held", |config| {
+        config.swap_kill = SwapKill {
+            floor_bytes: FLOOR,
+            percent: 0,
+            every: Duration::from_millis(200),
+        };
+    });
+    let mut spec = sh(&format!(
+        "dd if=/dev/urandom bs={buffer}M count=1 iflag=fullblock 2>/dev/null | {{ \
+         dd if=/dev/zero of=f bs=1M count=128 2>/dev/null; sync; sleep 15; i=0; \
+         while [ $i -lt 5 ]; do cat f >/dev/null; i=$((i + 1)); done; \
+         rm -f f; i=0; while [ $i -lt {PIECES} ]; do \
+         dd if=/dev/urandom bs={piece}M count=1 iflag=fullblock 2>/dev/null | sleep 15 & \
+         sleep 0.5; i=$((i + 1)); done; wait; }}",
+        buffer = BUFFER / MIB,
+        piece = PIECE / MIB,
+    ));
+    spec.timeout = Some(Duration::from_secs(120));
+    let action = store_action(&cell.cas, &spec);
+    let work = cell.work(1, action, Resources::new(1000, 256 * MIB));
+    let runtime = Arc::clone(&cell.runtime);
+    let mut run = tokio::spawn(async move { runtime.run(work).await });
+    let lease = cell.cgroup.join(cell.name(1));
+    wait_for(&lease, "sleep").await;
+    // The buffer is anonymous memory: `anon` in `memory.stat`, not the file's cache.
+    let anon = |lease: &Path| {
+        std::fs::read_to_string(lease.join("memory.stat"))
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix("anon ")?.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+    };
+    let mut held = 0;
+    for _ in 0..100 {
+        held = anon(&lease);
+        if held >= BUFFER {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(held >= BUFFER, "the buffer is not held: {held} bytes");
+    // EAGAIN when it reclaimed less than asked; what it moved is read below. Again,
+    // until little is left in RAM: what one reclaim wrote to swap can stay in RAM as
+    // swap cache until the next.
+    let mut reclaims = Vec::new();
+    for _ in 0..10 {
+        let _ = std::fs::write(lease.join("memory.reclaim"), "1G");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        reclaims.push(state(&lease));
+        if read_u64(&lease, "memory.current") < 8 * MIB {
+            break;
+        }
+    }
+    let swapped = read_u64(&lease, "memory.swap.current");
+    assert!(
+        swapped > FLOOR,
+        "the premise: host pressure moved more than the watch's floor to swap: {}",
+        reclaims.join("\n")
+    );
+    let ram = read_u64(&lease, "memory.current");
+    assert!(
+        PUSH > ram + HEADROOM,
+        "the premise: the buffers at the cap are more than the lease's RAM and headroom: {}",
+        reclaims.join("\n")
+    );
+    assert!(
+        ram + HEADROOM + PUSH + SLACK < FLOOR,
+        "the premise: what the lease can push into swap at its cap is below the floor: {}",
+        reclaims.join("\n")
+    );
+    write(&lease, "memory.max", &(ram + HEADROOM).to_string());
+    let events = |lease: &Path, key: &str| {
+        std::fs::read_to_string(lease.join("memory.events"))
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix(key)?.strip_prefix(' ')?.parse::<u64>().ok())
+            })
+    };
+    let max_events = |lease: &Path| events(lease, "max");
+    assert_eq!(
+        max_events(&lease),
+        Some(0),
+        "the premise: the lease had not reached its cap before: {}",
+        state(&lease)
+    );
+
+    // What the lease counted while the action ran at its cap, for the premises: the
+    // swap it held in the first sample that counted `max` events, and whether between
+    // two samples its `max` events grew and its swap rose (where the absolute-swap
+    // rule kills). A sample that cannot be read (after the action's exit, the lease
+    // cgroup is gone) counts nothing. And the processes the kernel's OOM killer killed
+    // in the cell meanwhile: the cell's `memory.events` counts its leases' kills too,
+    // and stays readable after the driver removes the lease cgroup, which on
+    // crun-x86 came within one sample of the kill.
+    let cell_kills = || events(&cell.cgroup, "oom_kill").unwrap_or(0);
+    let kills_before = cell_kills();
+    let mut seen = Vec::new();
+    let mut at_cap = 0;
+    let mut swap_at_cap = None;
+    let mut last: Option<(u64, u64)> = None;
+    let mut pushed_at_cap = false;
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut run => break outcome.expect("join"),
+            () = tokio::time::sleep(Duration::from_millis(200)) => {
+                let swap = std::fs::read_to_string(lease.join("memory.swap.current"))
+                    .ok()
+                    .and_then(|t| t.trim().parse::<u64>().ok());
+                if let (Some(max), Some(swap)) = (max_events(&lease), swap) {
+                    if at_cap == 0 && max > 0 {
+                        swap_at_cap = Some(swap);
+                    }
+                    at_cap = at_cap.max(max);
+                    if let Some((max_before, swap_before)) = last {
+                        pushed_at_cap |= max > max_before && swap > swap_before;
+                    }
+                    last = Some((max, swap));
+                }
+                seen.push(state(&lease));
+            }
+        }
+    };
+    let kernel_kills = cell_kills().saturating_sub(kills_before);
+    let result = match outcome {
+        Ok(result) => result,
+        Err(e) if kernel_kills > 0 => panic!(
+            "the premise: the kernel's OOM killer does not run at the cap this test sets; \
+             it killed {kernel_kills} process(es), and the driver reported that as {e:?}: {}",
+            seen.join("\n")
+        ),
+        Err(e) => panic!("{e:?}\n{}", seen.join("\n")),
+    };
+    assert_eq!(result.exit_code, 0, "{result:?}\n{}", seen.join("\n"));
+    assert!(
+        at_cap > 0,
+        "the premise: the action reached its cap: {}",
+        seen.join("\n")
+    );
+    assert!(
+        swap_at_cap.is_some_and(|swap| swap > FLOOR),
+        "the premise: the lease held more than the floor in swap when it reached its cap: {}",
+        seen.join("\n")
+    );
+    assert!(
+        pushed_at_cap,
+        "the premise: at its cap the lease pushed more into swap: {}",
+        seen.join("\n")
+    );
+    println!(
+        "{swapped} bytes in swap from the reclaim, {at_cap} max events at the cap; it ran to exit 0"
+    );
+    cell.assert_clean(1);
+}

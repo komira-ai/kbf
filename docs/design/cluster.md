@@ -1,5 +1,7 @@
 # One binary, three subcommands, two modes
 
+> **Superseded by [architecture-v2.md](architecture-v2.md).** kbf is now four parts (frontend, state store, storage, daemon) with a stateless frontend behind a load balancer, digest-sharded storage and no elected leader, so the leader-elected scheduler (5.2), the Raft join protocol and voter selection (5.3) and Envoy routing (6) are replaced. Carried over: the two tested modes, trusted-network and isolated-storage (3.1, 3.2), peer fetch, the flush race and hot blobs (4.3), `TierDown`/`TierUp` with the dwell and `--hot-store-abandon` (4.4), and the `Takeover` epoch idea. The rest of this file is kept as history.
+
 Status: design, nothing built. Revised again on 2026-10-15 for the owner's decisions on subcommands, discovery and staged routing, and for the answers to the open questions (section 10). Labels: **[F]** fact checked against `main` while writing this revision, **[F#744]** carried from the first draft of this document and not re-checked, **[I]** inference, **[D]** owner decision (2026-10-15), **[V]** verify before building on it.
 
 This revision replaces the roles, data-path and leader-only-upload parts of the first draft. It does not modify `ha.md` (PR #303); section 11 says how the two relate.
@@ -158,14 +160,14 @@ kbf server --node-id=ID --advertise=ADDR --join=SEEDS --cluster-id=CID --electab
     --raft-dir=... --hot-store=file://... --cold-store=s3://...
 
 # all-in-one: server and daemon in one process (trusted mode)
-kbf all-in-one --node-id=ID --advertise=ADDR --join=SEEDS --cluster-id=CID --electable \
+kbf --mode=all-in-one --node-id=ID --advertise=ADDR --join=SEEDS --cluster-id=CID --electable \
     --raft-dir=... --hot-store=file://... --cold-store=s3://... --reserve-cpus=N
 
 # daemon: build node, no server half, no credentials (isolated mode, Macs)
-kbf daemon --join=SEEDS --cluster-id=CID --reserve-cpus=N
+kbf --mode=daemon --join=SEEDS --cluster-id=CID --reserve-cpus=N
 
 # the first node of a new cluster, started once
-kbf all-in-one --bootstrap --voter-count=3 --electable --node-id=ID --advertise=ADDR ...
+kbf --mode=all-in-one --bootstrap --voter-count=3 --electable --node-id=ID --advertise=ADDR ...
 ```
 
 `SEEDS` is a few addresses or a DNS name, comma separated; it is the only host input anywhere (5.3). Resolution is a pure function of (subcommand, `--electable`), and nothing else decides a node's type:

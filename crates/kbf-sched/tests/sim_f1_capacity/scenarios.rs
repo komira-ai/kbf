@@ -38,14 +38,16 @@ fn cut(rng: &mut SimRng, total: u64, parts: u64) -> Vec<u64> {
 /// F1.1 exact packing: one to three equal workers, each filled at second 0 by requests
 /// whose sizes sum to its capacity exactly on every axis, and one request of one more
 /// unit on one axis (a millicore or a GPU; a byte of memory is not booked against the
-/// worker, so it is not one of them). Every piece is granted in the first round and
-/// fills its worker exactly; the extra unit waits and is granted at the first release
-/// that frees its axis, not before.
+/// worker, so it is not one of them). The same cut serves every worker, a piece for
+/// each worker before the next piece: placement takes the least loaded worker, so it
+/// gives each worker one copy of every piece (it does not pack unequal pieces). Every
+/// piece is granted in the first round and fills its worker exactly; the extra unit
+/// waits and is granted at the first release that frees its axis, not before.
 #[derive(Debug, Default)]
 pub struct ExactPacking {
     workers: u64,
     extra: Option<(WaiterId, usize)>,
-    /// Per piece: its worker index, its axes and when it ends.
+    /// Per piece: the number of its copy (one per worker), its axes and when it ends.
     pieces: Vec<(WaiterId, usize, [u64; 3], u64)>,
     pub full_at_start: u64,
     pub extra_on_axis: [u64; 3],
@@ -71,16 +73,19 @@ impl Scenario for ExactPacking {
             return;
         }
         let mut key = 0;
-        for i in 0..self.workers {
-            let cap = w.fleet[usize::try_from(i).unwrap()].capacity;
-            let parts = rng.between(2, 6);
-            let cpu = cut(rng, cap.cpu_millis, parts);
-            let mem = cut(rng, cap.memory_bytes, parts);
-            let mut gpus = vec![0; usize::try_from(parts).unwrap()];
-            for _ in 0..cap.gpus {
-                gpus[usize::try_from(rng.below(parts)).unwrap()] += 1;
-            }
-            for p in 0..usize::try_from(parts).unwrap() {
+        // One cut of the capacity, a piece for every worker before the next piece: placement
+        // takes the least loaded worker, which is the next one that has not got this piece
+        // yet, so each worker ends with the whole cut.
+        let cap = w.fleet[0].capacity;
+        let parts = rng.between(2, 6);
+        let cpu = cut(rng, cap.cpu_millis, parts);
+        let mem = cut(rng, cap.memory_bytes, parts);
+        let mut gpus = vec![0; usize::try_from(parts).unwrap()];
+        for _ in 0..cap.gpus {
+            gpus[usize::try_from(rng.below(parts)).unwrap()] += 1;
+        }
+        for p in 0..usize::try_from(parts).unwrap() {
+            for i in 0..self.workers {
                 let res = Resources::new(cpu[p], mem[p]).with_gpus(gpus[p]);
                 let secs = rng.between(100, 200);
                 let waiter = w.submit(request(key, Qos::Ci, res, ANY), secs);
@@ -477,7 +482,7 @@ impl Scenario for QosOrder {
 /// F1.5 a large request behind small ones: two or three 64-core workers filled with
 /// one-core requests, then a 64-core request, then a steady stream of one-core requests
 /// at about the rate the fleet frees cores. Today the small ones take each freed core
-/// and the large one waits while they keep coming (first fit holds nothing back; a wait
+/// and the large one waits while they keep coming (placement holds nothing back; a wait
 /// bound is planned); it runs once they stop (L1).
 #[derive(Debug, Default)]
 pub struct LargeBehindSmall {
@@ -558,7 +563,7 @@ impl Scenario for LargeBehindSmall {
 
 /// F1.6 `batch` under steady `interactive`: `batch` requests of two to four cores queued
 /// at the start, and one-core `interactive` requests arriving faster than the fleet runs
-/// them. Every interactive request is no larger than any batch one, so first fit gives
+/// them. Every interactive request is no larger than any batch one, so placement gives
 /// every freed core to interactive work while some waits: no batch operation is granted
 /// in a round that ends with interactive work queued. Batch runs once the stream stops
 /// and its backlog drains (L1). Fair turns and preemption are planned.

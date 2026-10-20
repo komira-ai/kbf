@@ -10,8 +10,9 @@
 //! [`parse`] reads the file; the repository lints (`crates/kbf-it/tests/repo_lints.rs`)
 //! hold it against what the tree contains. [`new_rows`] is `cargo xtask budget-diff`:
 //! the list may only shrink, so a row a change adds is refused, whatever its file is.
-//! The one exception is a section the base list has no header for: the change that
-//! adds the header brings the section's first rows. A header the base has may not go
+//! One exception is a section the base list has no header for: the change that
+//! adds the header brings the section's first rows. The other exception is
+//! [`SANCTIONED`], rows the CEO ruled in by name. A header the base has may not go
 //! (an empty section keeps it), so a section cannot be dropped and brought back full.
 
 use std::collections::BTreeMap;
@@ -19,6 +20,14 @@ use std::collections::BTreeSet;
 
 /// The budget file, relative to the repository root.
 pub const BUDGET: &str = "tools/interpreter_budget.tsv";
+
+/// Rows a change may add although the list only shrinks, each ruled in by the CEO by
+/// name (and nothing else is: a row here is as much a ruling as a row of the list):
+///
+/// - `packaging/install.sh`, ruled in with the installer packaging work: the curl|sh
+///   entry of `kbf-installer`, the one shell file the distribution keeps (download,
+///   verify sha256, place the payload files); every other builder is Rust.
+pub const SANCTIONED: &[(Section, &str)] = &[(Section::Files, "packaging/install.sh")];
 
 /// One section of the budget file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -165,6 +174,7 @@ pub fn new_rows(base: &str, head: &str) -> Result<Vec<Row>, Vec<String>> {
         .into_iter()
         .filter(|r| base_headers.contains(&r.section))
         .filter(|r| !listed.contains(&(r.section, r.key.as_str())))
+        .filter(|r| !SANCTIONED.contains(&(r.section, r.key.as_str())))
         .collect())
 }
 
@@ -199,6 +209,27 @@ mod tests {
                 line: 5
             }]
         );
+    }
+
+    #[test]
+    fn a_sanctioned_row_is_not_new_but_only_in_its_own_section_and_by_its_key() {
+        // Catches: an exception that lets any shell row through (every other new row
+        // stays refused), that matches by key across sections, or that matches by
+        // prefix (`packaging/install.sh.bak`, `packaging/install.sh2`).
+        let (section, key) = SANCTIONED[0];
+        assert_eq!((section, key), (Section::Files, "packaging/install.sh"));
+        let head = BASE.replace("b.py\tto delete\n", "packaging/install.sh\tentry\n");
+        assert_eq!(new_rows(BASE, &head), Ok(vec![]));
+        for other in [
+            "packaging/install.sh.bak\tx\n[src-sh-c]\n",
+            "packaging/install.sh2\tx\n[src-sh-c]\n",
+        ] {
+            let head = BASE.replace("[src-sh-c]\n", other);
+            let rows = new_rows(BASE, &head).expect("both parse");
+            assert_eq!(rows.len(), 1, "{other:?}");
+        }
+        let head = BASE.replace("[src-sh-c]\n", "[src-sh-c]\npackaging/install.sh\tx\n");
+        assert_eq!(keys(&new_rows(BASE, &head).expect("parse")).len(), 1);
     }
 
     #[test]

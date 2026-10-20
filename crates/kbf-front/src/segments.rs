@@ -50,11 +50,12 @@ mod connection;
 mod upload;
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use kbf_meta::{Epoch, ObjectId};
+use kbf_meta::{Epoch, LegacyWriter, NodeWriter, ObjectId, Writer};
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{
@@ -63,6 +64,7 @@ use kbf_proto::worker::{
     ReadRangeResponse,
 };
 use kbf_segments::RecordHasher;
+use kbf_storage::service::{OpenWrite, OpenWrites};
 use kbf_types::Digest;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -133,6 +135,8 @@ struct Shared<M, O> {
     waiting: AtomicUsize,
     next: AtomicU64,
     uploads: Mutex<HashMap<u64, Arc<Upload>>>,
+    /// What counts the uploads as open writes, if the node reports them.
+    open_writes: Option<OpenWrites>,
 }
 
 #[derive(Debug)]
@@ -150,6 +154,10 @@ enum Phase {
     Receiving {
         segments: Vec<Receiving>,
         _admitted: Admitted,
+        /// The upload counted as an open write on its node: from `Begin` until the commit
+        /// that was started for it ends (it is moved into that detached task) or it is
+        /// dropped.
+        _open: Option<OpenWrite>,
     },
     Committing,
     /// Committed or failed; the answer is in [`Upload::done`].
@@ -296,8 +304,22 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
                 waiting: AtomicUsize::new(0),
                 next: AtomicU64::new(1),
                 uploads: Mutex::new(HashMap::new()),
+                open_writes: None,
             }),
         }
+    }
+
+    /// The service counting each upload in `open_writes` from its `Begin` until its commit
+    /// ends or it is dropped, so a node that reports its open writes does not report none
+    /// while a daemon is uploading. Call before the service is cloned or served.
+    ///
+    /// # Panics
+    /// If the service has been cloned.
+    #[must_use]
+    pub fn with_open_writes(mut self, open_writes: OpenWrites) -> Self {
+        let shared = Arc::get_mut(&mut self.shared).expect("set before the service is cloned");
+        shared.open_writes = Some(open_writes);
+        self
     }
 
     /// How many `Begin` calls are waiting for admission now: what a test watches to
@@ -315,7 +337,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
 
     /// The upload `id`, if the caller's connection owns it.
     fn upload<T>(&self, request: &Request<T>, id: u64) -> Result<Arc<Upload>, Status> {
-        let caller = self.shared.connections.of(request.remote_addr());
+        let caller = self.shared.connections.of(kbf_tls::remote_addr(request));
         let upload = lock(&self.shared.uploads).get(&id).cloned();
         upload
             .filter(|u| u.owner.as_ref().map(Connection::id) == caller.as_ref().map(Connection::id))
@@ -364,6 +386,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         upload: Arc<Upload>,
         segments: Vec<Receiving>,
         admitted: Admitted,
+        _open: Option<OpenWrite>,
     ) {
         let answer = async {
             let built = check_all(Arc::clone(&upload), segments).await?;
@@ -383,7 +406,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         &self,
         request: Request<BeginRequest>,
     ) -> Result<Response<BeginResponse>, Status> {
-        let owner = self.shared.connections.of(request.remote_addr());
+        // Counted from the call, so a refused or cancelled Begin gives it back.
+        let open = self.shared.open_writes.as_ref().map(OpenWrites::begin);
+        let owner = self.shared.connections.of(kbf_tls::remote_addr(&request));
         let segments: Vec<(u64, &[u8])> = request
             .get_ref()
             .segments
@@ -452,6 +477,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             phase: Mutex::new(Phase::Receiving {
                 segments,
                 _admitted: admitted,
+                _open: open,
             }),
             last_call: Mutex::new(Instant::now()),
             done,
@@ -555,12 +581,14 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                 Phase::Receiving {
                     segments,
                     _admitted: admitted,
+                    _open: open,
                 } => {
                     tokio::spawn(Self::commit_task(
                         Arc::clone(&self.shared.cache),
                         Arc::clone(&upload),
                         segments,
                         admitted,
+                        open,
                     ));
                 }
                 Phase::Dropped => {
@@ -593,10 +621,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             .zip(found)
             .map(|(digest, location)| BlobLocation {
                 digest: Some(wire::digest_to_proto(digest)),
-                object: location.map(|l| ObjectRef {
-                    epoch: l.object.epoch().get(),
-                    seq: l.object.seq(),
-                }),
+                object: location.map(|l| object_ref(l.object)),
                 offset: location.map_or(0, |l| l.offset),
             })
             .collect();
@@ -618,7 +643,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             )));
         }
         let object = object.ok_or_else(|| Status::invalid_argument("no object named"))?;
-        let id = ObjectId::new(Epoch::new(object.epoch), object.seq);
+        let id = object_id(&object)?;
         match self
             .shared
             .cache
@@ -629,11 +654,57 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                 bytes: bytes.to_vec(),
             })),
             None => Err(Status::not_found(format!(
-                "object {}/{} holds no {length} bytes at {offset}",
-                object.epoch, object.seq
+                "object {id} holds no {length} bytes at {offset}"
             ))),
         }
     }
+}
+
+/// `object` on the wire: an epoch writer's with `member`, `boot` and `log` zero, a node
+/// writer's with `epoch` and `log` zero, another log's epoch writer's with `member` and
+/// `boot` zero.
+fn object_ref(object: ObjectId) -> ObjectRef {
+    let (epoch, member, boot, log) = match object.writer() {
+        Writer::Epoch(e) => (e.get(), 0, 0, 0),
+        Writer::Node(n) => (0, n.member().get(), n.boot().get(), 0),
+        Writer::Legacy(l) => (l.epoch().get(), 0, 0, l.log().get()),
+    };
+    ObjectRef {
+        epoch,
+        seq: object.seq(),
+        member,
+        boot,
+        log,
+    }
+}
+
+/// The object `object` names: an epoch writer's when `member`, `boot` and `log` are all
+/// zero, a node writer's when `epoch` and `log` are zero and `member` and `boot` are not,
+/// another log's epoch writer's when `member` and `boot` are zero and `epoch` and `log`
+/// are not.
+///
+/// # Errors
+/// INVALID_ARGUMENT for any other combination.
+fn object_id(object: &ObjectRef) -> Result<ObjectId, Status> {
+    let writer = match (
+        object.epoch,
+        NonZeroU64::new(object.member),
+        NonZeroU64::new(object.boot),
+        NonZeroU64::new(object.log),
+    ) {
+        (epoch, None, None, None) => Writer::Epoch(Epoch::new(epoch)),
+        (0, Some(member), Some(boot), None) => Writer::Node(NodeWriter::new(member, boot)),
+        (epoch, None, None, Some(log)) if epoch != 0 => {
+            Writer::Legacy(LegacyWriter::new(log, Epoch::new(epoch)))
+        }
+        _ => {
+            return Err(Status::invalid_argument(
+                "an object names an epoch alone, a member and a boot alone, or a log and an \
+                 epoch alone",
+            ));
+        }
+    };
+    Ok(ObjectId::of(writer, object.seq))
 }
 
 #[cfg(test)]

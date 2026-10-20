@@ -1,7 +1,6 @@
-//! The OCI backend against real rootless `crun`, with the same setup as `podman.rs`
-//! (`cargo xtask podman-tests`: a `Delegate=yes` unit, the busybox image in the user's
-//! Podman store, `crun` and `uidmap` on the runner). Podman is used here only for what
-//! the backend uses it for: the image, pulled and exported once.
+//! The OCI backend against real rootless `crun`, with the same setup as `crun.rs`
+//! (`cargo xtask crun-tests`: a `Delegate=yes` unit, `crun` and `uidmap` on the runner;
+//! the busybox image is fetched by the driver's own image store, digest-verified).
 //!
 //! Every test is `#[ignore]` with that reason and the verb runs them with
 //! `--include-ignored`; run without the setup a test fails, it never skips silently.
@@ -10,9 +9,6 @@
 //! `crun run`'s, and the image unpacked with the ids the action sees.
 
 mod support;
-
-// The helper containers run this binary in its `__chown-dirs` mode.
-kbf_driver_container::chown_dirs_test_hook!();
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -50,20 +46,21 @@ async fn run(
 }
 
 /// Catches the sandbox being less than `config.json` says, read from inside: the
-/// action is root with every id a subordinate id, alone in its pid namespace, with the
-/// constant hostname and loopback only, behind a seccomp filter with Podman's eleven
+/// action is the unprivileged uid 1000 (no capability held, the bounding set kept) with every
+/// id a subordinate id, alone in its pid namespace, with the
+/// constant hostname and loopback only, behind a seccomp filter with the eleven
 /// capabilities, and with no id of the daemon user (a file the daemon owns is
 /// `nobody`'s). The first lease unpacks the image, so this also runs the whole
-/// pull-export-unpack path.
+/// fetch-and-unpack path.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn the_sandbox_is_what_the_config_says() {
-    let cell = Cell::oci("sandbox");
+    let cell = Cell::new("sandbox");
     let script = r#"
         echo "uid $(id -u):$(id -g) pid $$ host $(hostname)"
         echo "map $(cat /proc/self/uid_map)"
         echo "net $(ls /sys/class/net | tr '\n' ' ')"
-        grep -E '^(Seccomp|NoNewPrivs|CapEff|CapBnd|CapAmb):' /proc/self/status
+        grep -E '^(Seccomp|NoNewPrivs|CapEff|CapPrm|CapBnd|CapAmb):' /proc/self/status
         echo "fds $(ls /proc/self/fd | tr '\n' ' ')"
         echo "kcore $(wc -c < /proc/kcore)"
         (echo x > /proc/sys/kernel/hostname) 2>/dev/null && echo "proc-sys writable" || echo "proc-sys read-only"
@@ -78,14 +75,17 @@ async fn the_sandbox_is_what_the_config_says() {
     let out = cell.stdout(&result);
     assert_eq!(result.exit_code, 0, "{out}\n{}", cell.stderr(&result));
     let subuid = first_subordinate_id();
-    assert!(out.contains("uid 0:0 pid 1 host localhost"), "{out}");
+    // Pid 1 is the container's init (`init/kbf_init.rs`), and the action is its child.
+    assert!(out.contains("uid 1000:1000 pid 2 host localhost"), "{out}");
     assert!(
         out.contains(&format!("map          0 {subuid:>10}      65536")),
         "{out}"
     );
     assert!(out.contains("net lo"), "{out}");
     assert!(out.contains("Seccomp:\t2"), "{out}");
-    assert!(out.contains("CapEff:\t00000000800405fb"), "{out}");
+    // A non-root process holds no capability after `exec`, whatever the bounding set.
+    assert!(out.contains("CapEff:\t0000000000000000"), "{out}");
+    assert!(out.contains("CapPrm:\t0000000000000000"), "{out}");
     assert!(out.contains("CapBnd:\t00000000800405fb"), "{out}");
     assert!(out.contains("CapAmb:\t0000000000000000"), "{out}");
     // 0, 1, 2 and the descriptor `ls` itself holds: nothing of the host leaks in.
@@ -95,6 +95,25 @@ async fn the_sandbox_is_what_the_config_says() {
     assert!(out.contains("root read-only"), "{out}");
     assert!(out.contains("tmp writable"), "{out}");
     assert!(out.contains("remount refused"), "{out}");
+    cell.assert_clean(1);
+}
+
+/// Catches `personality` with `ADDR_NO_RANDOMIZE` being refused inside the sandbox (the
+/// filter answered ENOSYS, so `kcov`, `gdb`, `rr` and `valgrind` could not start): the
+/// image's `linux64 -R` sets that flag on itself and runs a command, and the command
+/// must run.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn a_process_may_turn_off_its_own_address_randomization() {
+    let cell = Cell::new("no-randomize");
+    let script = r#"
+        linux64 -R /bin/echo "no-randomize ran" 2>&1
+        echo "code $?"
+    "#;
+    let result = run(&cell, 1, &sh(script)).await.expect("ran");
+    let out = cell.stdout(&result);
+    assert_eq!(result.exit_code, 0, "{out}\n{}", cell.stderr(&result));
+    assert!(out.contains("no-randomize ran\ncode 0"), "{out}");
     cell.assert_clean(1);
 }
 
@@ -117,9 +136,9 @@ fn first_subordinate_id() -> u32 {
 /// is closed by design, and this is the check that it stays closed): fifty short
 /// actions in a row, each with its own code, and a signal death as the shell reports it.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn every_exit_code_is_the_actions_own() {
-    let cell = Cell::oci("exit-codes");
+    let cell = Cell::new("exit-codes");
     let started = Instant::now();
     for seq in 1..=50_u64 {
         let code = i32::try_from(seq * 5 % 256).expect("small");
@@ -131,24 +150,98 @@ async fn every_exit_code_is_the_actions_own() {
         cell.assert_clean(seq);
     }
     eprintln!("50 leases in {:?}", started.elapsed());
-    // The action is pid 1 of its namespace, which ignores a signal from inside it, so a
-    // death by signal is shown through a child: its status as the shell reports it.
+    // A death by signal is the shell's `128 + n`, whether the action dies of it itself
+    // (it is the init's child, not pid 1, so the signal is delivered) or a child does.
+    for (seq, (script, code)) in (51..).zip([
+        ("kill -KILL $$", 137),
+        ("kill -TERM $$", 143),
+        ("sh -c 'kill -KILL $$'; exit $(($? - 128))", 9),
+    ]) {
+        let result = cell.run(seq, &sh(script)).await.expect("ran");
+        assert_eq!(result.exit_code, code, "{script}");
+        cell.assert_clean(seq);
+    }
+}
+
+/// Catches an orphaned process staying a zombie, which the mopm pilot found
+/// (`src/core/test_proc.zig`: a test kills its process group and `kill(-pgid, 0)` still
+/// finds it, because the orphan was adopted by a container's pid 1 that never waits).
+/// The action starts a session leader in the background from a subshell that exits
+/// at once, so the leader is an orphan; the action kills it, and 2 s later it must not
+/// be in `/proc` at all (a zombie is, and so is a group that `kill(-pgid, 0)` finds).
+/// Pid 1 must be the init and the leader its child. The mutant: an init that waits only
+/// for the action leaves `Z` and exit 3.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn an_orphan_is_reaped_so_a_killed_group_is_gone() {
+    let cell = Cell::new("reaper");
+    let script = r#"
+        ( /bin/setsid /bin/sh -c 'echo $$ > /tmp/leader; exec /bin/sleep 300' & )
+        n=0
+        while [ ! -s /tmp/leader ] && [ $n -lt 50 ]; do /bin/sleep 1; n=$((n + 1)); done
+        leader=$(cat /tmp/leader)
+        echo "pid1 $(tr '\0' ' ' < /proc/1/cmdline)"
+        echo "parent $(sed -n 's/^PPid:[[:space:]]*//p' /proc/$leader/status)"
+        kill -9 $leader
+        /bin/sleep 2
+        if [ -e /proc/$leader ]; then echo "leftover $(cat /proc/$leader/stat)"; exit 3; fi
+        echo reaped
+    "#;
+    let result = cell.run(1, &sh(script)).await.expect("ran");
+    let out = cell.stdout(&result);
+    assert_eq!(result.exit_code, 0, "{out}\n{}", cell.stderr(&result));
+    assert!(out.contains("pid1 /dev/kbf-init -- /bin/sh -c "), "{out}");
+    assert!(out.contains("\nparent 1\n"), "{out}");
+    assert!(out.ends_with("reaped\n"), "{out}");
+    cell.assert_clean(1);
+}
+
+/// Catches the init's report file being reachable by the action (same user, same pid
+/// namespace): through `/proc/1/fd/0` it could forge the words the driver reads as the
+/// init's. The init is not dumpable, so its `/proc` entries are closed to the action, and
+/// it cannot trace it either.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn the_action_cannot_reach_the_inits_report_file() {
+    let cell = Cell::new("reaper-report");
+    let script = r#"
+        (echo forged > /proc/1/fd/0) 2>/dev/null && echo "write opened" || echo "write denied"
+        (cat /proc/1/fd/0 > /dev/null) 2>/dev/null && echo "read opened" || echo "read denied"
+        exit 5
+    "#;
+    let result = cell.run(1, &sh(script)).await.expect("ran");
+    let out = cell.stdout(&result);
+    assert_eq!(result.exit_code, 5, "{out}\n{}", cell.stderr(&result));
+    assert_eq!(out, "write denied\nread denied\n");
+    cell.assert_clean(1);
+}
+
+/// Catches the init outliving or outwaiting the action: a lease ends with the action's
+/// status when the action exits while a background process of it still runs (the
+/// container's other processes die with its first, as they did when that was the
+/// action), within seconds and not the background process's 300.
+#[tokio::test]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
+async fn the_lease_ends_with_the_action_whatever_it_left_running() {
+    let cell = Cell::new("reaper-ends");
+    let started = Instant::now();
     let result = cell
-        .run(51, &sh("sh -c 'kill -KILL $$'; echo status=$?"))
+        .run(1, &sh("sleep 300 & sleep 300 & exit 4"))
         .await
         .expect("ran");
-    assert_eq!(result.exit_code, 0);
-    assert_eq!(cell.stdout(&result), "status=137\n");
+    assert_eq!(result.exit_code, 4, "{}", cell.stderr(&result));
+    assert!(started.elapsed().as_secs() < 60, "{:?}", started.elapsed());
+    cell.assert_clean(1);
 }
 
 /// Catches a program crun cannot start being the farm's failure, not the action's:
-/// the same cases as the Podman path, through `crun`'s own log (a bare name with no
+/// the same cases a stand-in `crun` is run for, through `crun`'s own log (a bare name with no
 /// `PATH`, one missing on the `PATH`, a missing path: exit 127; a file that is not
 /// executable and a directory: 126), each with kbf's message.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn a_program_crun_cannot_start_is_the_actions_failure() {
-    let cell = Cell::oci("program");
+    let cell = Cell::new("program");
     let action = |argv: &[&str], env: &[(&str, &str)]| {
         let mut spec = sh("unused");
         spec.argv = argv.iter().map(|a| (*a).to_owned()).collect();
@@ -187,9 +280,9 @@ async fn a_program_crun_cannot_start_is_the_actions_failure() {
 /// hand-back, and nothing it writes to `/tmp` or elsewhere in the container's writable
 /// places comes back as an output.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn outputs_come_back_through_the_overlay_and_the_hand_over() {
-    let cell = Cell::oci("outputs");
+    let cell = Cell::new("outputs");
     let mut spec = sh(
         "cat in.txt > out/copy.txt; umask 077; mkdir out/priv; echo secret > out/priv/f; \
          echo scratch > /tmp/not-an-output",
@@ -215,10 +308,10 @@ async fn outputs_come_back_through_the_overlay_and_the_hand_over() {
 /// behind on real `crun`: a timed-out action keeps its partial stdout, and a killed
 /// lease is clean when `kill` returns.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn timeout_and_kill_leave_nothing_behind() {
     use kbf_daemon::Runtime;
-    let cell = Cell::oci("timeout-kill");
+    let cell = Cell::new("timeout-kill");
     let mut spec = sh("echo started; sleep 300");
     spec.timeout = Some(std::time::Duration::from_secs(2));
     let outcome = run(&cell, 1, &spec).await;
@@ -256,9 +349,9 @@ fn store_for(cell: &Cell, spec: &Spec) -> kbf_proto::reapi::Digest {
 /// cgroup (a child of the lease's) is the configured limit, and the lease cgroup keeps
 /// its own memory limit and `memory.oom.group`.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn the_container_cgroup_carries_the_pids_limit_and_the_oom_group() {
-    let cell = Cell::oci_with("limits", |c| c.limits.pids = 321);
+    let cell = Cell::with("limits", |c| c.limits.pids = 321);
     let lease = cell.cgroup.join(cell.name(1));
     let script = format!(
         "cat /sys/fs/cgroup/pids.max; cat /sys/fs/cgroup/memory.oom.group; \
@@ -275,10 +368,10 @@ async fn the_container_cgroup_carries_the_pids_limit_and_the_oom_group() {
 /// Catches an image not unpacked with the ids the action sees: after the first lease,
 /// the unpacked root is owned by the first subordinate id and `/bin` inside is root's.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn the_unpacked_image_is_owned_by_the_containers_ids() {
     use std::os::unix::fs::MetadataExt as _;
-    let cell = Cell::oci("image-owner");
+    let cell = Cell::new("image-owner");
     let result = cell
         .run(
             1,
@@ -302,7 +395,7 @@ async fn the_unpacked_image_is_owned_by_the_containers_ids() {
 
 /// A cache and a tree store beside `config`'s scratch directory: leases bind the large
 /// Directory nodes of an input root from the tree store, not link them.
-fn with_trees(config: &mut kbf_driver_container::PodmanConfig) {
+fn with_trees(config: &mut kbf_driver_container::ContainerConfig) {
     let dir = PathBuf::from(format!("{}-cache", config.scratch.display()));
     support::force_remove(&dir);
     std::fs::create_dir_all(&dir).expect("cache dir");
@@ -324,9 +417,9 @@ fn with_trees(config: &mut kbf_driver_container::PodmanConfig) {
 /// read-write as the container's root. Every attempt is refused, the first with
 /// `EROFS`'s own words, and the next lease reads the tree whole.
 #[tokio::test]
-#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+#[ignore = "needs rootless crun and a delegated cgroup: run by cargo xtask crun-tests"]
 async fn a_sandbox_cannot_change_a_shared_tree_or_lift_its_read_only_flag() {
-    let cell = Cell::oci_with("trees-ro", with_trees);
+    let cell = Cell::with("trees-ro", with_trees);
     let mut spec = sh("grep ' /kbf/root/tc ' /proc/self/mountinfo; \
          echo \"first: $(sh -c 'echo x > tc/new' 2>&1)\"; \
          for try in 'echo x > tc/new' 'echo x >> tc/lib/f1' 'truncate -s0 tc/lib/f1' 'chmod u+w tc/lib/f1' \

@@ -1,0 +1,628 @@
+//! The migration end to end on a scratch host with the old layout: what it writes, in
+//! what order it stops, copies, repoints and starts, and what a repeat does.
+
+use std::cell::RefCell;
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::rc::Rc;
+
+use serde_json::json;
+
+use super::rig::*;
+use super::*;
+use crate::testkit::{A, B};
+
+fn never() -> FnVerifier {
+    FnVerifier(Box::new(|_, _| Err("no pipeline here".to_owned())))
+}
+
+/// The pipeline played: it installs `releases/<claimed>` with the marker, from bytes of its own.
+fn installing(rig: &Rig, calls: Rc<RefCell<Vec<(String, String)>>>) -> FnVerifier {
+    let tree = rig.new_tree().join("releases");
+    FnVerifier(Box::new(move |claimed, probed| {
+        calls
+            .borrow_mut()
+            .push((claimed.to_string(), probed.commit.clone()));
+        let dir = tree.join(claimed.as_str());
+        put(&dir.join("kbf"), "verified bytes", 0o755);
+        put(&dir.join("VERIFIED"), "", 0o644);
+        Ok(())
+    }))
+}
+
+/// Catches the heart of the migration: a Linux host with the dev installer's layout
+/// comes over whole. Both releases are copied with the old bytes and no `VERIFIED`, the
+/// links are relative, `state.json` is schema 2 with the floor carried and seeded,
+/// `status.json` names both releases as unverified, the unit points at the new link, the
+/// old helper is off, and the old tree and state are exactly as they were.
+///
+/// Mutants seen red: a `VERIFIED` written for a copy; the status without the
+/// `unverified` list; `previous` not adopted; the floor's order id not carried.
+#[test]
+fn a_dev_installer_host_is_adopted_unverified_and_the_old_layout_is_kept() {
+    let mut rig = Rig::linux("full");
+    let old_tree = rig.snapshot("usr/local/kbf");
+    let old_state = rig.snapshot("var/lib/kbf-deploy");
+    let report = run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+
+    assert_eq!(report.outcome, Outcome::Migrated);
+    assert_eq!(report.unverified, vec![commit(A), commit(B)]);
+    assert_eq!(report.min_generation, Some(17));
+    let shown = report.to_string();
+    assert!(shown.contains("UNVERIFIED"), "{shown}");
+    assert!(
+        shown.contains("copied UNVERIFIED: no pipeline here"),
+        "{shown}"
+    );
+    assert!(!shown.contains("NO REPLAY FLOOR"), "{shown}");
+
+    let tree = rig.new_tree();
+    for (c, body) in [(A, "binary of A"), (B, "binary of B")] {
+        let dir = tree.join("releases").join(c);
+        assert_eq!(fs::read_to_string(dir.join("kbf")).expect("binary"), body);
+        assert!(
+            !dir.join("VERIFIED").exists(),
+            "a copy never carries the marker"
+        );
+        assert_eq!(
+            fs::metadata(dir.join("kbf")).expect("meta").mode() & 0o777,
+            0o755
+        );
+    }
+    assert_eq!(
+        fs::read_link(tree.join("releases/current"))
+            .expect("link")
+            .to_str(),
+        Some(A)
+    );
+    assert_eq!(
+        fs::read_link(tree.join("releases/previous"))
+            .expect("link")
+            .to_str(),
+        Some(B)
+    );
+
+    let state = rig.json(&tree.join("state.json"));
+    assert_eq!(
+        state,
+        json!({
+            "schema": 2, "current": A, "previous": B, "staged": null, "pending_confirm": null,
+            "floor": {"epoch": 3, "order_id": 42, "generation": 17},
+            "serving_instance": null, "last_acked_order_id": 42, "unacked": []
+        })
+    );
+    assert_eq!(
+        fs::metadata(tree.join("state.json")).expect("meta").mode() & 0o777,
+        0o600
+    );
+    let status = rig.json(&tree.join("status.json"));
+    assert_eq!(status["unverified"], json!([A, B]));
+    assert_eq!(status["installed_commit"], json!(A));
+    assert_eq!(status["state"], json!("idle"));
+    // The facts the current build reported are the status's `staged` (shown while current).
+    assert_eq!(status["staged"]["protocol"], json!(4));
+    assert_eq!(
+        fs::metadata(tree.join("status.json")).expect("meta").mode() & 0o777,
+        0o644
+    );
+
+    let unit = fs::read_to_string(rig.at("etc/systemd/system/kbf-daemon.service")).expect("unit");
+    assert_eq!(
+        unit,
+        "[Service]\nExecStart=/var/lib/kbf-installer/releases/current/kbf daemon\n"
+    );
+    assert_eq!(
+        fs::read_to_string(tree.join("migration-units/kbf-daemon.service")).expect("backup"),
+        OLD_UNIT
+    );
+    let journal = rig.json(&tree.join("migration.json"));
+    assert_eq!(journal["phase"], json!("done"));
+
+    assert_eq!(
+        rig.snapshot("usr/local/kbf"),
+        old_tree,
+        "the old tree is untouched"
+    );
+    let mut after = rig.snapshot("var/lib/kbf-deploy");
+    assert!(
+        after
+            .remove("MIGRATED")
+            .expect("the note")
+            .contains("rollback path")
+    );
+    assert_eq!(after, old_state, "the old state is untouched");
+}
+
+/// Catches a service that runs from a tree being replaced, and a helper left to manage
+/// the host: the helper and the unit stop before the links exist, the helper is disabled
+/// (not restarted), and the unit starts only after the links, the state and the unit file
+/// are in place.
+///
+/// Mutants seen red: stopping after `set_link` (`links=true` on the stop events); starting
+/// the helper again with the units.
+#[test]
+fn services_stop_before_the_links_move_and_start_after_everything_is_written() {
+    let mut rig = Rig::linux("order");
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    assert_eq!(
+        *rig.events.borrow(),
+        [
+            "stop kbf-helper.service links=false",
+            "stop kbf-daemon.service links=false",
+            "disable kbf-helper.service links=false",
+            "daemon-reload links=true",
+            "start kbf-daemon.service links=true",
+            "enable --now kbf-installer.service links=true",
+        ]
+    );
+    let active = rig.active.borrow();
+    assert!(active.contains("kbf-daemon.service") && !active.contains("kbf-helper.service"));
+}
+
+/// Catches a dry run that changes anything: no file under the root differs afterwards, no
+/// service is touched, and the plan says what the real run would do.
+///
+/// Mutant seen red: the `Mode::DryRun` early return moved below the stop.
+#[test]
+fn a_dry_run_changes_nothing() {
+    let mut rig = Rig::linux("dry");
+    let before = rig.snapshot("");
+    let report = run_migrate(&mut rig, &never(), Mode::DryRun).expect("plan");
+    assert_eq!(report.outcome, Outcome::Planned);
+    assert_eq!(rig.snapshot(""), before);
+    assert!(rig.host.log.is_empty() && rig.events.borrow().is_empty());
+    let shown = report.to_string();
+    assert!(
+        shown.contains("DRY-RUN: release") && shown.contains("kbf-helper.service: stop it"),
+        "{shown}"
+    );
+    assert_eq!(report.min_generation, Some(17));
+    rig.active.borrow_mut().remove("kbf-daemon.service");
+    let report = run_migrate(&mut rig, &never(), Mode::DryRun).expect("plan");
+    assert!(
+        report
+            .to_string()
+            .contains("kbf-daemon.service: it is not running")
+    );
+}
+
+/// Catches trust in the verify pipeline's word or a skipped pipeline: a release it installs
+/// with the marker is adopted verified with the pipeline's bytes (no copy of the old
+/// ones), it is called with the commit the probe named, and one that says Ok without
+/// writing the marker is treated as unverified, with that reason.
+///
+/// Mutants seen red: the `verified` re-check after `Ok(())` removed; the pipeline called
+/// with the directory name's commit but not the probe's version.
+#[test]
+fn the_verify_pipeline_decides_and_its_ok_is_checked() {
+    let mut rig = Rig::linux("verified");
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let pipeline = installing(&rig, calls.clone());
+    let report = run_migrate(&mut rig, &pipeline, Mode::Apply).expect("migrate");
+    assert!(report.unverified.is_empty());
+    assert!(!report.to_string().contains("UNVERIFIED"));
+    let dir = rig.new_tree().join("releases").join(A);
+    assert_eq!(
+        fs::read_to_string(dir.join("kbf")).expect("bytes"),
+        "verified bytes"
+    );
+    assert!(dir.join("VERIFIED").exists());
+    assert_eq!(
+        *calls.borrow(),
+        [
+            (A.to_owned(), A[..12].to_owned()),
+            (B.to_owned(), B[..12].to_owned())
+        ]
+    );
+    // Nothing unverified: the key is not there, as in every status the helper writes.
+    assert!(
+        rig.json(&rig.new_tree().join("status.json"))
+            .get("unverified")
+            .is_none()
+    );
+
+    let mut rig = Rig::linux("liar");
+    let liar = FnVerifier(Box::new(|_, _| Ok(())));
+    let report = run_migrate(&mut rig, &liar, Mode::Apply).expect("migrate");
+    assert_eq!(report.unverified, vec![commit(A), commit(B)]);
+    assert!(report.to_string().contains("wrote no VERIFIED marker"));
+    assert!(
+        !rig.new_tree()
+            .join("releases")
+            .join(A)
+            .join("VERIFIED")
+            .exists()
+    );
+}
+
+/// Catches a probe that runs with more than it needs: the old binary is asked for
+/// `--version --json` (and nothing else) by the path in the old tree, as the fetch user,
+/// with an empty environment, from `/`, for at most ten seconds.
+///
+/// Mutants seen red: `env` passed through; `run_as` None; the wrong binary on macOS.
+#[test]
+fn the_probe_runs_unprivileged_bounded_and_with_nothing() {
+    let mut rig = Rig::linux("spawn");
+    let seen = runner();
+    run_with(&mut rig, &seen, &never(), &NoFrontend, Mode::Apply).expect("migrate");
+    let calls = seen.calls();
+    assert_eq!(calls.len(), 2);
+    for (spawn, c) in calls.iter().zip([A, B]) {
+        assert_eq!(
+            spawn.program,
+            rig.at(&format!("usr/local/kbf/releases/{c}/kbf"))
+        );
+        assert_eq!(spawn.args, ["--version", "--json"]);
+        assert!(spawn.env.is_empty());
+        assert_eq!(spawn.cwd.to_str(), Some("/"));
+        assert_eq!(
+            spawn.run_as,
+            Some(RunAs {
+                uid: 65534,
+                gid: 65534
+            })
+        );
+        assert_eq!(spawn.timeout, std::time::Duration::from_secs(10));
+    }
+}
+
+/// Catches a repeat that does harm: after a finished migration `migrate` is a no-op (no
+/// command runs, no file changes), and on a host with no old layout it says so.
+#[test]
+fn a_finished_migration_is_not_run_again_and_a_new_host_has_nothing_to_do() {
+    let mut rig = Rig::linux("again");
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    let (files, commands) = (rig.snapshot(""), rig.events.borrow().len());
+    let again = run_migrate(&mut rig, &never(), Mode::Apply).expect("again");
+    assert_eq!(again.outcome, Outcome::AlreadyMigrated);
+    assert_eq!(rig.snapshot(""), files);
+    assert_eq!(rig.events.borrow().len(), commands);
+
+    let mut fresh = Rig::linux("fresh");
+    fs::remove_file(fresh.at("var/lib/kbf-deploy/state.json")).expect("rm");
+    fs::remove_file(fresh.at("var/lib/kbf-deploy/helper.json")).expect("rm");
+    let none = run_migrate(&mut fresh, &never(), Mode::Apply).expect("nothing");
+    assert_eq!(none.outcome, Outcome::NothingToMigrate);
+    assert!(!fresh.new_tree().exists());
+}
+
+/// Catches a crash between the stop and the start that strands a service: the first run
+/// stops the units and fails to start the daemon; the second finds the daemon not running,
+/// still starts it (the journal remembers), leaves the helper stopped, keeps the copy it
+/// already made (same directory, not recopied), and does not lower a floor that is higher
+/// than what it would seed.
+///
+/// Mutants seen red: `stopped` rebuilt from what is running (the daemon never restarted);
+/// the floor written with `seeded.floor` instead of `raise`; the copy always redone.
+#[test]
+fn a_run_that_died_before_the_start_is_finished_by_the_next() {
+    let mut rig = Rig::linux("crash");
+    rig.fail_start.set(true);
+    let err = run_migrate(&mut rig, &never(), Mode::Apply).expect_err("start fails");
+    assert!(err.to_string().contains("planted: start failed"), "{err}");
+    assert!(rig.active.borrow().is_empty(), "both stopped, none started");
+    let tree = rig.new_tree();
+    assert_eq!(
+        rig.json(&tree.join("migration.json"))["phase"],
+        json!("started")
+    );
+    let inode = fs::metadata(tree.join("releases").join(A))
+        .expect("meta")
+        .ino();
+    // Someone with a higher floor than this run would seed (an earlier run with a flag).
+    let mut state = rig.json(&tree.join("state.json"));
+    state["floor"]["generation"] = json!(99);
+    fs::write(
+        tree.join("state.json"),
+        serde_json::to_vec(&state).expect("json"),
+    )
+    .expect("write");
+
+    rig.fail_start.set(false);
+    let report = run_migrate(&mut rig, &never(), Mode::Apply).expect("finish");
+    assert_eq!(report.outcome, Outcome::Migrated);
+    let active = rig.active.borrow();
+    assert!(active.contains("kbf-daemon.service") && !active.contains("kbf-helper.service"));
+    assert_eq!(
+        fs::metadata(tree.join("releases").join(A))
+            .expect("meta")
+            .ino(),
+        inode
+    );
+    let state = rig.json(&tree.join("state.json"));
+    assert_eq!(
+        state["floor"]["generation"],
+        json!(99),
+        "a floor only goes up"
+    );
+    assert_eq!(
+        rig.json(&tree.join("migration.json"))["phase"],
+        json!("done")
+    );
+    let unit = fs::read_to_string(rig.at("etc/systemd/system/kbf-daemon.service")).expect("unit");
+    assert!(unit.contains("/var/lib/kbf-installer/releases/current/kbf"));
+}
+
+/// Catches a leftover that survives or is trusted: a half copy (`releases/.stage-<commit>.adopt`) is swept, the installer's own stage
+/// directories are not, and an
+/// unreferenced release directory with other content and no marker is replaced by the old
+/// release's bytes; one with the same content is kept as it is.
+///
+/// Mutants seen red: `sweep_partials` removed; the `Some(_)` arm of `adopt` keeping the stale dir.
+#[test]
+fn leftovers_of_an_interrupted_copy_are_swept_or_replaced() {
+    let mut rig = Rig::linux("leftover");
+    let tree = rig.new_tree();
+    let partial = format!("releases/.stage-{A}.adopt");
+    let theirs = format!("releases/.stage-{A}.k3j2h4g5");
+    put(&tree.join(&partial).join("junk"), "x", 0o644);
+    put(&tree.join(&theirs).join("keep-me"), "x", 0o644);
+    put(
+        &tree.join("releases").join(A).join("kbf"),
+        "a stale half copy",
+        0o755,
+    );
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    assert!(!tree.join(&partial).exists());
+    assert!(
+        tree.join(&theirs).join("keep-me").exists(),
+        "only its own scratch is swept"
+    );
+    assert_eq!(
+        fs::read_to_string(tree.join("releases").join(A).join("kbf")).expect("bytes"),
+        "binary of A"
+    );
+    assert!(tree.join("releases").join(A).join("manifest.json").exists());
+}
+
+/// Catches a previous release that is invented or dropped: a host with no `previous`
+/// adopts one release, makes no `previous` link, and the `previous` link an earlier,
+/// interrupted run made is removed (the release it named is left for the installer's gc).
+#[test]
+fn a_host_without_a_previous_release_gets_no_previous_link() {
+    let mut rig = Rig::linux("noprev");
+    let tree = rig.new_tree();
+    // An earlier run got as far as the links (and failed to start the units).
+    rig.fail_start.set(true);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect_err("start fails");
+    assert!(tree.join("releases/previous").symlink_metadata().is_ok());
+    // Then the old host lost its `previous`.
+    rig.fail_start.set(false);
+    fs::remove_file(rig.at("usr/local/kbf/previous")).expect("rm");
+    rig.write_old_state(Some(A), None, None, None);
+    let report = run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    assert_eq!(report.unverified, vec![commit(A)]);
+    assert!(tree.join("releases/previous").symlink_metadata().is_err());
+    let state = rig.json(&tree.join("state.json"));
+    assert_eq!(
+        (state["current"].clone(), state["previous"].clone()),
+        (json!(A), json!(null))
+    );
+}
+
+/// Catches a unit that does not run kbf being rewritten, a missing one failing the run,
+/// and the report not saying which: three units, one of each kind.
+#[test]
+fn each_unit_is_rewritten_left_alone_or_skipped_and_the_report_says_which() {
+    let mut rig = Rig::linux("units");
+    put(
+        &rig.at("etc/systemd/system/other.service"),
+        "[Service]\nExecStart=/bin/true\n",
+        0o644,
+    );
+    let mut m = rig.migration();
+    m.units = vec![
+        unit("kbf-daemon.service"),
+        unit("other.service"),
+        unit("absent.service"),
+    ];
+    let report = migrate(
+        &m,
+        &mut rig.host,
+        &Hooks {
+            runner: &runner(),
+            verifier: &never(),
+            frontend: &NoFrontend,
+        },
+        Mode::Apply,
+    )
+    .expect("migrate");
+    let shown = report.to_string();
+    assert!(shown.contains("kbf-daemon.service: repointed"), "{shown}");
+    assert!(
+        shown.contains("other.service: does not run kbf from the old link"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("absent.service: no such unit file"),
+        "{shown}"
+    );
+    assert_eq!(
+        fs::read_to_string(rig.at("etc/systemd/system/other.service")).expect("unit"),
+        "[Service]\nExecStart=/bin/true\n"
+    );
+}
+
+/// Catches the macOS path using Linux's: a Mac host's plist is rewritten to the Mac tree
+/// (`/usr/local/kbf-installer`), the state goes to `/var/db/kbf-installer`, the probe asks
+/// `kbf` (a macOS release holds only that), launchd is stopped with `bootout`, restarted with `bootstrap`, and the
+/// helper is disabled in the system domain.
+///
+/// Mutants seen red: the Linux roots used on macOS; `bootstrap` given the label, not the plist.
+#[test]
+fn a_mac_host_comes_over_through_launchd() {
+    let mut rig = Rig::mac("mac");
+    let seen = runner();
+    run_with(&mut rig, &seen, &never(), &NoFrontend, Mode::Apply).expect("migrate");
+    assert!(
+        seen.calls()[0]
+            .program
+            .ends_with("releases/".to_owned() + A + "/kbf")
+    );
+    let tree = rig.new_tree();
+    assert_eq!(tree, rig.at("usr/local/kbf-installer"));
+    assert_eq!(
+        fs::read_link(tree.join("releases/current"))
+            .expect("link")
+            .to_str(),
+        Some(A)
+    );
+    assert!(
+        rig.at("var/db/kbf-installer/state.json").exists() && !tree.join("state.json").exists()
+    );
+    let plist = fs::read_to_string(rig.at("Library/LaunchDaemons/com.komira.kbf-daemon.plist"))
+        .expect("plist");
+    assert!(
+        plist.contains("<string>/usr/local/kbf-installer/releases/current/kbf-daemon</string>"),
+        "{plist}"
+    );
+    assert_eq!(
+        *rig.events.borrow(),
+        [
+            "stop com.komira.kbf-helper.plist links=false",
+            "stop com.komira.kbf-daemon.plist links=false",
+            "disable com.komira.kbf-helper.plist links=false",
+            "start com.komira.kbf-daemon.plist links=true",
+            "start com.komira.kbf-installer.plist links=true",
+        ]
+    );
+    let bootstraps: Vec<_> = rig
+        .host
+        .log
+        .iter()
+        .map(ToString::to_string)
+        .filter(|l| l.contains("bootstrap"))
+        .collect();
+    assert_eq!(bootstraps.len(), 2);
+    assert!(
+        bootstraps[0]
+            .ends_with("bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist"),
+        "{bootstraps:?}"
+    );
+}
+
+/// Catches the files written in a shape the next reader refuses: after a migration the
+/// installer's own reader reads `state.json` (schema 2, `unacked` a list, the floor seeded),
+/// the node's reader reads `status.json` (the string `refusal`, `unverified` named), and the
+/// helper's reader reads `helper.json` with the replay floor in both kinds of order. A
+/// stand-in shape that only looked like the real one (`unacked: null`, `refusal: null`)
+/// fails the first two.
+///
+/// Mutants seen red: `helper.json` not written (an old order replays); the floor of the
+/// frontend kind left at zero.
+#[test]
+fn the_written_files_are_read_by_the_installer_the_node_and_the_helper() {
+    let mut rig = Rig::linux("readers");
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    let dir = rig.new_state_dir();
+
+    let state = crate::state::read_unlocked(&rig.layout)
+        .expect("the installer reads it")
+        .expect("there is one");
+    assert_eq!(state.current, Some(commit(A)));
+    assert_eq!(state.previous, Some(commit(B)));
+    assert_eq!(
+        (
+            state.floor.epoch,
+            state.floor.order_id,
+            state.floor.generation
+        ),
+        (3, 42, 17)
+    );
+    assert_eq!(state.last_acked_order_id, 42);
+    assert!(state.unacked.is_empty() && state.pending_confirm.is_none());
+
+    let kbf_update::helper::Helper::Reported(report) =
+        kbf_update::helper::read(&dir.join("status.json"))
+    else {
+        panic!("the node cannot read status.json");
+    };
+    assert_eq!(report.installed.as_deref(), Some(A));
+    assert_eq!(report.previous.as_deref(), Some(B));
+    assert_eq!(report.acked_order_id, 42);
+    assert_eq!(
+        rig.json(&dir.join("status.json"))["unverified"],
+        json!([A, B])
+    );
+
+    let memory: crate::helper::memory::Memory =
+        serde_json::from_slice(&fs::read(dir.join("helper.json")).expect("helper.json"))
+            .expect("the helper reads it");
+    assert_eq!((memory.acked_epoch, memory.acked_order_id), (3, 42));
+    assert_eq!((memory.frontend_epoch, memory.frontend_order_id), (3, 42));
+    assert_eq!(
+        fs::metadata(dir.join("helper.json")).expect("meta").mode() & 0o777,
+        0o600
+    );
+}
+
+/// Catches a re-run that lowers the replay memory, or reads a damaged one as empty: a
+/// `helper.json` an earlier run (or the installer) left with higher floors keeps them, in
+/// both kinds of order; one that does not parse stops the run naming the file.
+///
+/// Mutants seen red: the earlier memory ignored (zero start); the earlier pair replaced by
+/// the seeded one.
+#[test]
+fn an_earlier_replay_memory_is_raised_never_lowered_and_a_damaged_one_stops_the_run() {
+    let mut rig = Rig::linux("memory-rerun");
+    rig.fail_start.set(true);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect_err("start fails");
+    let path = rig.new_state_dir().join("helper.json");
+    let mut earlier: crate::helper::memory::Memory =
+        serde_json::from_slice(&fs::read(&path).expect("written")).expect("memory");
+    assert_eq!((earlier.acked_epoch, earlier.acked_order_id), (3, 42));
+    earlier.acked_epoch = 9;
+    earlier.acked_order_id = 100;
+    earlier.frontend_epoch = 3;
+    earlier.frontend_order_id = 77;
+    fs::write(&path, serde_json::to_vec(&earlier).expect("json")).expect("write");
+
+    rig.fail_start.set(false);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    let now: crate::helper::memory::Memory =
+        serde_json::from_slice(&fs::read(&path).expect("read")).expect("memory");
+    assert_eq!((now.acked_epoch, now.acked_order_id), (9, 100));
+    assert_eq!((now.frontend_epoch, now.frontend_order_id), (3, 77));
+
+    let mut rig = Rig::linux("memory-damaged");
+    rig.fail_start.set(true);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect_err("start fails");
+    fs::write(rig.new_state_dir().join("helper.json"), "not json").expect("write");
+    rig.fail_start.set(false);
+    let error = run_migrate(&mut rig, &never(), Mode::Apply).expect_err("stops");
+    assert!(
+        matches!(
+            error,
+            MigrateError::Corrupt {
+                file: "helper.json",
+                ..
+            }
+        ),
+        "{error}"
+    );
+}
+
+/// Catches a failed copy leaving a half release behind: a source that cannot be copied (a
+/// link inside it) leaves neither the `.stage-` directory in `releases/` nor a release directory,
+/// so the next run starts clean and nothing half-written can be linked.
+///
+/// Mutant seen red: the scratch directory not removed when `fill` fails.
+#[test]
+fn a_copy_that_fails_leaves_no_scratch_and_no_release() {
+    let rig = Rig::linux("copy-fails");
+    std::os::unix::fs::symlink(
+        "/etc/passwd",
+        rig.at(&format!("usr/local/kbf/releases/{A}/passwd")),
+    )
+    .expect("link");
+    let rules = tree::Rules::release(me());
+    let new = super::newtree::NewTree::create(&rig.layout, &rules).expect("tree");
+    let src = tree::open_root(&rig.at(&format!("usr/local/kbf/releases/{A}"))).expect("open");
+    assert!(new.copy_in(&commit(A), &src).is_err());
+    let tree = rig.new_tree();
+    let left: Vec<_> = fs::read_dir(tree.join("releases"))
+        .expect("releases")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}

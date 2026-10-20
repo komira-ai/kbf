@@ -1,0 +1,33 @@
+release_source = "url"
+release_url = "https://releases.example/kbf"
+confirm_window_s = 900
+confirm_window_max_s = 1800
+min_generation = 0
+min_protocol = 0
+fetch_timeout_s = 900
+max_component_bytes = 536870912
+min_activation_interval_s = 60
+database = "postgres:///kbf?host=/run/postgresql&user=kbf-server"
+
+[proxy]
+operator_token_file = "/etc/kbf/api-token"
+server_cert_file = "/etc/kbf/reapi.pem"
+server_key_file = "/etc/kbf/reapi.key"
+client_ca_file = "/etc/kbf/ca.pem"
+buck2_auth = "none"
+proxy_auth_file = "/run/kbf-proxy/proxy-auth"
+state_dir = "/var/lib/kbf-proxy"
+hold_max_s = 20
+
+[proxy.upstream]
+base_port = 18000
+
+[proxy.limits]
+pre_stream_timeout_s = 10
+max_connections = 50000
+max_connections_per_ip = 2000
+max_streams = 8192
+memory_budget_mib = 8192
+max_header_list_bytes = 16384
+keepalive_interval_s = 30
+keepalive_ack_s = 20

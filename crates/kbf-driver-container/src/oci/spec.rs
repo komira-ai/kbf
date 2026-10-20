@@ -1,8 +1,8 @@
 //! `config.json` for one action's container, built with `oci-spec`'s typed builders.
 //!
-//! The counterpart of `podman::create_args`: each flag Podman is given there has its
-//! line here (the table is in [`action_config`]'s documentation), and what Podman adds
-//! on its own is [`hardening`](super::hardening).
+//! Each isolation setting of an action's container has its line here (the table is in
+//! [`action_config`]'s documentation); the capability set, masked paths and seccomp
+//! filter are [`hardening`](super::hardening).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,20 +18,20 @@ use oci_spec::runtime::{
 use super::hardening::{
     CAPABILITIES, MASKED_PATHS, READONLY_PATHS, SeccompError, held_capabilities, seccomp,
 };
-use crate::podman::{ContainerSpec, EXEC_ROOT};
+use super::init;
+use crate::container::{ACTION_ID, ContainerSpec, EXEC_ROOT};
 use crate::subids::DaemonIds;
 
 /// The OCI version the file declares (what `crun spec` writes).
 const OCI_VERSION: &str = "1.0.0";
 
-/// The hostname of every action's container: Podman's, and so the same on every node.
+/// The hostname of every action's container, the same on every node.
 pub(crate) const HOSTNAME: &str = "localhost";
 
 /// The lease directories an action's container writes to, and the destination of each:
 /// disk-backed (a `tmpfs` would count against the lease's memory), owned by the
 /// container's root, discarded with the lease. The image's root is read-only; these are
-/// the places an action writes besides `/kbf/root` (Podman's container root is writable
-/// everywhere, a difference the PR description states).
+/// the places an action writes besides `/kbf/root`.
 pub(crate) const WRITABLE: [(&str, &str); 4] = [
     ("tmp", "/tmp"),
     ("var-tmp", "/var/tmp"),
@@ -105,11 +105,13 @@ pub(crate) struct Placement<'a> {
     pub ids: &'a DaemonIds,
     /// Go's name for the node's architecture, for the seccomp profile.
     pub arch: &'a str,
+    /// The container's first process (`init`), on the node.
+    pub init: &'a Path,
 }
 
-/// The mounts of an action: the standard ones of `crun spec --rootless`, the hosts file,
+/// The mounts of an action: the standard ones of `crun spec --rootless`, the `hosts`, `hostname` and `resolv.conf` files,
 /// the exec-root overlay, the shared trees read-only inside it, and [`WRITABLE`].
-fn mounts(spec: &ContainerSpec) -> Vec<Mount> {
+fn mounts(spec: &ContainerSpec, init: &Path) -> Vec<Mount> {
     let shm = format!("size={}m", spec.limits.shm_mib);
     let open = ["rbind", "ro", "nosuid", "noexec", "nodev"];
     let mut mounts = vec![
@@ -145,8 +147,12 @@ fn mounts(spec: &ContainerSpec) -> Vec<Mount> {
             "cgroup",
             &["nosuid", "noexec", "nodev", "relatime", "ro"],
         ),
+        // Into the `/dev` above, a `tmpfs` made for this container: no mount point in the
+        // image. Executable (no `noexec`): it is the container's first process.
+        bind(init, init::DEST, &["rbind", "ro", "nosuid", "nodev"]),
         bind(&spec.dir.join("etc/hosts"), "/etc/hosts", &open),
         bind(&spec.dir.join("etc/hostname"), "/etc/hostname", &open),
+        bind(&spec.dir.join("etc/resolv.conf"), "/etc/resolv.conf", &open),
     ];
     let overlay = format!(
         "lowerdir={},upperdir={},workdir={},{OVERLAY_OPTIONS}",
@@ -183,6 +189,16 @@ fn mounts(spec: &ContainerSpec) -> Vec<Mount> {
     mounts
 }
 
+/// The container's `process.args`: the init, then `--` and the action's own argv. The
+/// init runs the action as its child and reaps what the action leaves orphaned.
+fn init_argv(argv: &[String]) -> Vec<String> {
+    [init::DEST, "--"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(argv.iter().cloned())
+        .collect()
+}
+
 fn rlimit(typ: PosixRlimitType, value: u64) -> PosixRlimit {
     built(
         PosixRlimitBuilder::default()
@@ -193,9 +209,7 @@ fn rlimit(typ: PosixRlimitType, value: u64) -> PosixRlimit {
     )
 }
 
-/// The namespaces a container gets, each new: the same six Podman gives an action
-/// (`--network=none` leaves the network namespace with loopback only) and a private
-/// cgroup namespace.
+/// The namespaces a container gets, each new (the network namespace has loopback only).
 pub(crate) fn namespaces() -> Vec<LinuxNamespace> {
     use LinuxNamespaceType::{Cgroup, Ipc, Mount, Network, Pid, User, Uts};
     [Pid, Network, Ipc, Uts, User, Cgroup, Mount]
@@ -205,8 +219,8 @@ pub(crate) fn namespaces() -> Vec<LinuxNamespace> {
 }
 
 /// The process environment: the Command's variables, then `HOSTNAME` and `HOME` unless
-/// it sets them, as Podman 4.9 adds them (`podman::create_args`): `HOSTNAME=localhost`
-/// and the home of uid 0, `/root`, which are the same on every node.
+/// it sets them: `HOSTNAME=localhost` and `HOME=/root`, the writable home directory (owned by
+/// the action's uid, which the image's user database need not name), the same on every node.
 pub(crate) fn environment(env: &[(String, String)]) -> Vec<String> {
     let mut out: Vec<String> = env.iter().map(|(n, v)| format!("{n}={v}")).collect();
     for (name, default) in [("HOSTNAME", HOSTNAME), ("HOME", "/root")] {
@@ -219,19 +233,19 @@ pub(crate) fn environment(env: &[(String, String)]) -> Vec<String> {
 
 /// The `config.json` of the container for `spec`.
 ///
-/// | Podman (`podman::create_args`)           | here                                              |
+/// | Isolation                                | `config.json`                                     |
 /// |------------------------------------------|---------------------------------------------------|
-/// | `--network=none`                         | a new network namespace, nothing configured (crun brings `lo` up) |
-/// | `--userns=nomap`, `--user=0:0`           | `uidMappings`/`gidMappings` container `0..65536` to the daemon user's first subordinate range; `process.user` 0:0 |
-/// | `--unsetenv-all`, `--env`                | `process.env` is the Command's variables only      |
-/// | `--entrypoint`, `--workdir`              | `process.args`, `process.cwd`                      |
-/// | `--cgroup-parent`, `memory.oom.group=1`  | `cgroupsPath` a child of the lease cgroup, `unified` `memory.oom.group`       |
-/// | `--pids-limit`                           | `resources.pids.limit`                             |
-/// | `--ulimit nofile, nproc`                 | `process.rlimits`                                  |
-/// | `--shm-size`                             | the `/dev/shm` tmpfs `size=`                       |
-/// | `--oom-score-adj=0`                      | `process.oomScoreAdj`                              |
-/// | `--hostname=localhost`                   | `hostname`                                         |
-/// | `--volume root:/kbf/root:O,...`          | an `overlay` mount at `/kbf/root`                  |
+/// | no network                               | a new network namespace, nothing configured (crun brings `lo` up) |
+/// | no id of the daemon user, not root       | `uidMappings`/`gidMappings` container `0..65536` to the daemon user's first subordinate range; `process.user` 1000:1000 |
+/// | only the Command's environment           | `process.env` is the Command's variables only      |
+/// | the Command's argv and directory         | `process.args`, `process.cwd`                      |
+/// | the lease cgroup, `memory.oom.group=1`   | `cgroupsPath` a child of the lease cgroup, `unified` `memory.oom.group`       |
+/// | a pids limit                             | `resources.pids.limit`                             |
+/// | `nofile` and `nproc` ulimits             | `process.rlimits`                                  |
+/// | `/dev/shm` size                          | the `/dev/shm` tmpfs `size=`                       |
+/// | the kernel's default OOM score           | `process.oomScoreAdj`                              |
+/// | hostname `localhost`                     | `hostname`                                         |
+/// | the input root, writes in `upper`        | an `overlay` mount at `/kbf/root`                  |
 ///
 /// No memory or CPU limit is set here: the lease cgroup carries them.
 ///
@@ -259,8 +273,10 @@ pub(crate) fn action_config(
     let process = built(
         ProcessBuilder::default()
             .terminal(false)
-            .user(built(UserBuilder::default().uid(0u32).gid(0u32).build()))
-            .args(spec.argv.clone())
+            .user(built(
+                UserBuilder::default().uid(ACTION_ID).gid(ACTION_ID).build(),
+            ))
+            .args(init_argv(&spec.argv))
             .env(environment(&spec.env))
             .cwd(PathBuf::from(cwd))
             .capabilities(capabilities)
@@ -309,7 +325,7 @@ pub(crate) fn action_config(
             .root(root)
             .hostname(HOSTNAME)
             .process(process)
-            .mounts(mounts(spec))
+            .mounts(mounts(spec, placement.init))
             .linux(linux)
             .build(),
     ))
@@ -342,7 +358,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::podman::tests::spec;
+    use crate::container::tests::spec;
     use kbf_daemon::trees::SharedMount;
 
     fn ids() -> DaemonIds {
@@ -361,6 +377,7 @@ mod tests {
             cgroup: "/kbf.slice/actions/kbf-lease-1-2",
             ids: &ids(),
             arch: "amd64",
+            init: Path::new("/scratch/oci-bin/kbf-init"),
         };
         let config = action_config(spec, &placement).expect("config");
         serde_json::from_slice(&render(&config).expect("render")).expect("json")
@@ -398,12 +415,82 @@ mod tests {
                 cgroup: "/kbf.slice/actions/kbf-lease-1-2",
                 ids: &ids(),
                 arch: "amd64",
+                init: Path::new("/scratch/oci-bin/kbf-init"),
             };
             render(&action_config(&spec(), &placement).expect("config")).expect("render")
         };
         let first = build();
         for _ in 0..30 {
             assert_eq!(build(), first);
+        }
+    }
+
+    /// Catches the action being the container's first process again (nothing then reaps
+    /// what it orphans), the init's mount missing, writable or in the image's root (a
+    /// mount point written into the image shared by every lease), or one the action
+    /// cannot execute: `process.args` is the init, `--`, then the action's argv unchanged;
+    /// the init is a read-only bind into `/dev`, after `/dev` is mounted, without `noexec`.
+    #[test]
+    fn the_action_runs_as_the_child_of_a_reaping_init() {
+        let mut spec = spec();
+        spec.argv = vec!["/bin/tool".to_owned(), "-c".to_owned(), "true".to_owned()];
+        let config = config_of(&spec);
+        assert_eq!(
+            config["process"]["args"],
+            json!(["/dev/kbf-init", "--", "/bin/tool", "-c", "true"])
+        );
+        let mounts = config["mounts"].as_array().expect("mounts");
+        let at = |dest: &str| mounts.iter().position(|m| m["destination"] == dest);
+        let init = at("/dev/kbf-init").expect("the init is mounted");
+        assert!(at("/dev").expect("/dev") < init, "into the /dev tmpfs");
+        assert_eq!(mounts[init]["type"], "bind");
+        assert_eq!(mounts[init]["source"], "/scratch/oci-bin/kbf-init");
+        let options: Vec<&str> = mounts[init]["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(options.contains(&"ro"), "{options:?}");
+        assert!(!options.contains(&"noexec"), "{options:?}");
+    }
+
+    /// Catches the action running as root (a mode-000 file would be readable, a
+    /// directory it does not own writable), and as an id its namespace does not map
+    /// (the container would not start): the process is uid and gid 1000, and the
+    /// mappings that hold id 1000 are the only ones, from container id 0.
+    #[test]
+    fn the_action_runs_as_an_unprivileged_id_its_namespace_maps() {
+        let config = config_of(&spec());
+        assert_eq!(config["process"]["user"], json!({"uid": 1000, "gid": 1000}));
+        for (key, host) in [("uidMappings", 100_000), ("gidMappings", 200_000)] {
+            let maps = config["linux"][key].as_array().expect(key);
+            assert_eq!(maps.len(), 1, "{key}");
+            assert_eq!(maps[0]["containerID"], 0);
+            assert_eq!(maps[0]["hostID"], host);
+            assert!(maps[0]["size"].as_u64().expect("size") > 1000, "{key}");
+        }
+    }
+
+    /// Catches an action container without its own `hosts`, `hostname` or `resolv.conf`
+    /// (the image's, or none, would answer a lookup), or one of them writable: each is a
+    /// read-only bind of the file the lease wrote under its `etc/`.
+    #[test]
+    fn the_name_files_are_read_only_binds_of_the_leases_own() {
+        let config = config_of(&spec());
+        let mounts = config["mounts"].as_array().expect("mounts");
+        for name in ["hosts", "hostname", "resolv.conf"] {
+            let dest = format!("/etc/{name}");
+            let found = mounts.iter().find(|m| m["destination"] == dest);
+            assert!(found.is_some(), "no mount of {dest}");
+            let mount = found.expect("checked");
+            assert_eq!(mount["type"], "bind");
+            assert_eq!(
+                mount["source"],
+                format!("/scratch/kbf-lease-1-2/etc/{name}")
+            );
+            let options = mount["options"].as_array().expect("options");
+            assert!(options.iter().any(|o| o == "ro"), "{dest}: {options:?}");
         }
     }
 
@@ -456,10 +543,10 @@ mod tests {
         );
     }
 
-    /// Catches the Command's variables being reordered or dropped, and Podman's two
-    /// defaults being added when the Command sets them (or not added when it does not).
+    /// Catches the Command's variables being reordered or dropped, and the two defaults
+    /// being added when the Command sets them (or not added when it does not).
     #[test]
-    fn the_environment_is_the_commands_then_podmans_two_defaults() {
+    fn the_environment_is_the_commands_then_the_two_defaults() {
         let var = |n: &str, v: &str| (n.to_owned(), v.to_owned());
         assert_eq!(environment(&[]), ["HOSTNAME=localhost", "HOME=/root"]);
         assert_eq!(

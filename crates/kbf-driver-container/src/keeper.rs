@@ -11,7 +11,7 @@
 //! other end of. The daemon never writes it; when the daemon dies the kernel closes
 //! that end, the keeper reads end-of-file and writes the lease cgroup's `cgroup.kill`,
 //! which kills every process in the lease, the container's among them. It writes it
-//! again every second, [`KILL_TRIES`] times in all: a `podman start` the dead daemon
+//! again every second, [`KILL_TRIES`] times in all: a `crun run` the dead daemon
 //! left in flight can still put the container's first process in the lease after the
 //! first write. It stops early once the cgroup is gone (the next start's sweep removed
 //! it). The container, the lease cgroup and the scratch directory stay for that sweep;
@@ -88,19 +88,10 @@ impl Drop for Keeper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    fn dir(name: &str) -> PathBuf {
-        let dir = std::env::current_exe()
-            .expect("test binary")
-            .parent()
-            .expect("deps")
-            .join("kbf-driver-container-unit")
-            .join(format!("keeper-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
+    fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+        crate::unit_dir(&format!("keeper-{name}"))
     }
 
     /// Whether `file` holds `text` within `within`.
@@ -131,7 +122,7 @@ mod tests {
 
     /// Catches a keeper that does not kill the lease cgroup when the daemon's end of
     /// its pipe closes (the bug: a killed daemon's container runs on), one that writes
-    /// once only (a `podman start` in flight escapes it), and one that kills while the
+    /// once only (a `crun run` in flight escapes it), and one that kills while the
     /// daemon holds the pipe. A plain file stands in for `cgroup.kill`.
     #[test]
     fn a_keeper_kills_the_cgroup_again_and_again_once_its_pipe_closes() {

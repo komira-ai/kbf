@@ -1,0 +1,504 @@
+//! Backup and restore of the state database (docs/design/frontend-proxy.md section 11): the
+//! code behind `kbf-installer backup`, which `kbf-backup.service` (run by `kbf-backup.timer`)
+//! calls, and `kbf-installer restore`.
+//!
+//! The only programs run are `pg_dump` and `pg_restore`, behind [`Tool`] so that everything
+//! around them is tested without a server. A backup is one custom-format dump
+//! (`pg_restore` reads it, and can restore a part of it):
+//!
+//! 1. the backup directory is made, or checked, and closed to everyone but its owner (0700);
+//! 2. a temp file of an earlier run that crashed is removed;
+//! 3. `pg_dump` writes the temp file, whose name is not a backup's;
+//! 4. the file must be non-empty and `pg_restore --list` must read it (0600, fsync);
+//! 5. a rename gives it its name, `kbf-<UTC time>.dump`, and the directory is synced: a backup
+//!    is a whole file or it is not there;
+//! 6. only then are the backups beyond the newest `backup_keep` (default 7) removed.
+//!
+//! Any failure removes the temp file, leaves every older backup alone and ends in an error,
+//! which the unit turns into a failed state. The database is named by `installer.toml`'s
+//! `database` key, which never carries a password, so the URL is safe in the command line;
+//! no message here quotes it. Peer authentication means the verb runs as the service user, who connects as the role the
+//! URL names:
+//! the user the unit runs as (its `User=` comes from setup's drop-in), through a
+//! `pg_ident` map or by being the role.
+
+use std::ffi::OsString;
+use std::fs;
+use std::io::Read;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use crate::database::check_url;
+use crate::installer_toml::{DEFAULT_BACKUP_KEEP, InstallerToml};
+
+/// The mode of the backup directory.
+const DIR_MODE: u32 = 0o700;
+/// The mode of a backup.
+const FILE_MODE: u32 = 0o600;
+/// How much of a program's standard error an error line carries.
+const STDERR_TAIL: usize = 2000;
+/// The most of `installer.toml` read (the closed reader's own cap, so one bound).
+const MAX_FILE_BYTES: u64 = crate::installer_toml::MAX_FILE_BYTES as u64;
+
+/// What a run of an external program can say.
+pub trait Tool {
+    /// Runs `program` with `args`, discarding its output.
+    ///
+    /// # Errors
+    /// One line: the program could not start, or exited with a failure.
+    fn run(&self, program: &str, args: &[OsString]) -> Result<(), String>;
+}
+
+/// The real programs: no standard input, no standard output kept, the end of standard error
+/// in the error.
+pub struct Process;
+
+impl Tool for Process {
+    fn run(&self, program: &str, args: &[OsString]) -> Result<(), String> {
+        let out = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("cannot run {program}: {}", e.kind()))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = &out.stderr;
+        let tail = String::from_utf8_lossy(&err[err.len().saturating_sub(STDERR_TAIL)..]);
+        Err(format!(
+            "{program} failed ({}): {}",
+            out.status,
+            tail.trim()
+        ))
+    }
+}
+
+/// What the `database` URL says about who connects and where: the one source of the role,
+/// the database and the socket directory (setup, the frontend and this verb read the same
+/// URL; nothing here assumes a name). On a real host it is
+/// `postgres:///kbf?host=/run/postgresql&user=kbf-server`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Target {
+    /// The role (`user=` or the user part of the authority); `None` leaves it to libpq, which
+    /// takes the name of the OS user.
+    pub role: Option<String>,
+    /// The database name; `None` leaves it to libpq (the role's name).
+    pub database: Option<String>,
+    /// The socket directory or host (`host=` or the authority's host, without its port).
+    pub host: Option<String>,
+    /// The port (`port=` or the authority's), which also picks the socket file of a socket
+    /// directory; `None` leaves it to libpq.
+    pub port: Option<String>,
+}
+
+/// An authority's `host[:port]`, with `[v6]` brackets taken off; an empty part is `None`.
+fn split_host_port(authority: &str) -> (Option<String>, Option<String>) {
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((host, rest)) => (host, rest.strip_prefix(':').unwrap_or("")),
+            None => (bracketed, ""),
+        }
+    } else {
+        authority.rsplit_once(':').unwrap_or((authority, ""))
+    };
+    let some = |t: &str| Some(unescape(t)).filter(|t| !t.is_empty());
+    (some(host), some(port))
+}
+
+/// `%XX` decoded; a malformed escape stays as written.
+fn unescape(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| char::from(c).to_digit(16);
+        if b[i] == b'%'
+            && let (Some(h), Some(l)) = (
+                b.get(i + 1).and_then(|c| hex(*c)),
+                b.get(i + 2).and_then(|c| hex(*c)),
+            )
+        {
+            out.push(u8::try_from(h * 16 + l).unwrap_or(b'%'));
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Escapes what a URL path or query value cannot carry as it is.
+fn escape(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.bytes() {
+        if c.is_ascii_alphanumeric() || b"-_.~/".contains(&c) {
+            out.push(char::from(c));
+        } else {
+            out.push_str(&format!("%{c:02X}"));
+        }
+    }
+    out
+}
+
+impl Target {
+    /// Reads `url` (`postgres://` or `postgresql://`, which [`check_url`] has already held to
+    /// be a URL without a password). Whatever it does not say stays `None`.
+    #[must_use]
+    pub fn parse(url: &str) -> Target {
+        let rest = url
+            .strip_prefix("postgresql://")
+            .or_else(|| url.strip_prefix("postgres://"))
+            .unwrap_or(url);
+        let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let (userinfo, host) = authority.rsplit_once('@').unwrap_or(("", authority));
+        let mut role = userinfo
+            .split(':')
+            .next()
+            .filter(|u| !u.is_empty())
+            .map(unescape);
+        let (mut host, mut port) = split_host_port(host);
+        let mut database = Some(unescape(path)).filter(|d| !d.is_empty());
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let Some(value) = Some(unescape(value)).filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            match key {
+                "user" => role = Some(value),
+                "host" => host = Some(value),
+                "port" => port = Some(value),
+                "dbname" => database = Some(value),
+                _ => {}
+            }
+        }
+        Target {
+            role,
+            database,
+            host,
+            port,
+        }
+    }
+
+    /// The URL of the database `name` on the same server, for the same role: a scratch
+    /// database for a restore test. `name` is a plain identifier.
+    ///
+    /// # Errors
+    /// `name` is not 1 to 63 of letters, digits and underscores, not starting with a digit.
+    pub fn url_for(&self, name: &str) -> Result<String, String> {
+        let plain = !name.is_empty()
+            && name.len() <= 63
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+        if !plain {
+            return Err("a database name is 1 to 63 letters, digits and underscores".to_owned());
+        }
+        let mut query = Vec::new();
+        if let Some(host) = &self.host {
+            query.push(format!("host={}", escape(host)));
+        }
+        if let Some(port) = &self.port {
+            query.push(format!("port={}", escape(port)));
+        }
+        if let Some(role) = &self.role {
+            query.push(format!("user={}", escape(role)));
+        }
+        let query = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        Ok(format!("postgres:///{name}{query}"))
+    }
+}
+
+/// What `installer.toml` says a backup needs.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Settings {
+    /// The `database` URL (no password).
+    pub url: String,
+    /// Who connects, to what, where.
+    pub target: Target,
+    /// How many backups to keep.
+    pub keep: u32,
+}
+
+impl Settings {
+    /// Reads the installer's configuration at `path`: the closed reader, so a file `check`
+    /// refuses is refused here too, and the URL held to the no-password rule.
+    ///
+    /// # Errors
+    /// One line, never quoting the URL.
+    pub fn read(path: &Path) -> Result<Settings, String> {
+        let shown = path.display().to_string();
+        let mut text = String::new();
+        fs::File::open(path)
+            .and_then(|f| f.take(MAX_FILE_BYTES + 1).read_to_string(&mut text))
+            .map_err(|e| format!("{shown}: {}", e.kind()))?;
+        let file = InstallerToml::parse(&text).map_err(|e| e.to_string())?;
+        let Some(url) = file.database else {
+            return Err(format!(
+                "{shown} has no `database = \"postgres://...\"` setting"
+            ));
+        };
+        check_url(&shown, &url).map_err(|e| e.to_string())?;
+        let target = Target::parse(&url);
+        Ok(Settings {
+            url,
+            target,
+            keep: file.backup_keep.unwrap_or(DEFAULT_BACKUP_KEEP),
+        })
+    }
+}
+
+/// Where and how to dump.
+pub struct Spec<'a> {
+    /// The backup directory.
+    pub dir: &'a Path,
+    /// The database (no password).
+    pub url: &'a str,
+    /// How many backups stay, this one included (at least 1).
+    pub keep: u32,
+    /// The program that dumps.
+    pub pg_dump: &'a str,
+    /// The program that restores and lists.
+    pub pg_restore: &'a str,
+}
+
+/// What a backup did.
+#[derive(Debug)]
+pub struct Done {
+    /// The backup.
+    pub file: PathBuf,
+    /// Its size.
+    pub bytes: u64,
+    /// The names of the older backups removed, oldest first.
+    pub removed: Vec<String>,
+}
+
+/// The name of a backup made at `secs` since the epoch: `kbf-YYYYMMDDTHHMMSSZ.dump`, UTC and
+/// fixed width, so names sort as times.
+#[must_use]
+pub fn stamp(secs: u64) -> String {
+    format!("kbf-{}.dump", utc_stamp(secs))
+}
+
+/// `YYYYMMDDTHHMMSSZ` for `secs` since the epoch, UTC and fixed width.
+#[must_use]
+pub fn utc_stamp(secs: u64) -> String {
+    // Days since the epoch to a civil date (Howard Hinnant's `civil_from_days`).
+    let days = i64::try_from(secs / 86_400).unwrap_or(i64::MAX / 2);
+    let rest = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
+/// Whether `name` is a finished backup of this tool (what [`stamp`] writes).
+#[must_use]
+pub fn is_backup_name(name: &str) -> bool {
+    let Some(time) = name
+        .strip_prefix("kbf-")
+        .and_then(|n| n.strip_suffix(".dump"))
+    else {
+        return false;
+    };
+    let b = time.as_bytes();
+    b.len() == 16
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'T'
+        && b[9..15].iter().all(u8::is_ascii_digit)
+        && b[15] == b'Z'
+}
+
+/// The name the dump is written to before it is a backup.
+fn temp_name(name: &str) -> String {
+    format!(".{name}.tmp")
+}
+
+/// Whether `name` is the temp file of a run (finished or not).
+fn is_temp_name(name: &str) -> bool {
+    name.strip_prefix('.')
+        .and_then(|n| n.strip_suffix(".tmp"))
+        .is_some_and(is_backup_name)
+}
+
+/// `result`'s error as one line naming `what` was being done to `path`.
+fn ctx<T>(result: std::io::Result<T>, what: &str, path: &Path) -> Result<T, String> {
+    result.map_err(|e| format!("{what} {}: {}", path.display(), e.kind()))
+}
+
+fn words(args: &[&str]) -> Vec<OsString> {
+    args.iter().map(OsString::from).collect()
+}
+
+/// Makes the backup directory (and its parents) or checks it: a real directory, ours, then
+/// closed to everyone else.
+fn prepare_dir(dir: &Path) -> Result<(), String> {
+    let shown = dir.display();
+    match fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => {
+            let me = rustix::process::geteuid().as_raw();
+            if m.uid() != me {
+                return Err(format!("{shown} is owned by another user"));
+            }
+        }
+        Ok(_) => return Err(format!("{shown} is not a directory")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let made = fs::DirBuilder::new()
+                .recursive(true)
+                .mode(DIR_MODE)
+                .create(dir);
+            ctx(made, "cannot make", dir)?;
+        }
+        Err(e) => return Err(format!("{shown}: {}", e.kind())),
+    }
+    let closed = fs::set_permissions(dir, fs::Permissions::from_mode(DIR_MODE));
+    ctx(closed, "cannot close to other users", dir)
+}
+
+/// The names in `dir` for which `keep` says yes, sorted.
+fn names_where(dir: &Path, keep: fn(&str) -> bool) -> Result<Vec<String>, String> {
+    let list = fs::read_dir(dir).map_err(|e| format!("{}: {}", dir.display(), e.kind()))?;
+    let mut names: Vec<String> = list
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| keep(n))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Dumps the database into `spec.dir` as the backup named for `now_secs`, then removes the
+/// older backups beyond `spec.keep`.
+///
+/// # Errors
+/// One line. After any error the older backups are all still there and no temp file is.
+pub fn backup(tool: &dyn Tool, spec: &Spec<'_>, now_secs: u64) -> Result<Done, String> {
+    prepare_dir(spec.dir)?;
+    for stale in names_where(spec.dir, is_temp_name)? {
+        let gone = fs::remove_file(spec.dir.join(&stale));
+        ctx(gone, "cannot remove the leftover", &spec.dir.join(&stale))?;
+    }
+    let name = stamp(now_secs);
+    let file = spec.dir.join(&name);
+    if fs::symlink_metadata(&file).is_ok() {
+        return Err(format!("{name} already exists; not replacing it"));
+    }
+    let temp = spec.dir.join(temp_name(&name));
+    let made = dump_to(tool, spec, &temp).and_then(|bytes| {
+        sync(&temp)?;
+        ctx(
+            fs::rename(&temp, &file),
+            "cannot give the dump its name",
+            &file,
+        )?;
+        sync(spec.dir)?;
+        Ok(bytes)
+    });
+    let bytes = match made {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = fs::remove_file(&temp);
+            return Err(e);
+        }
+    };
+    let pruned = prune(spec.dir, &name, spec.keep);
+    let removed = pruned
+        .map_err(|e| format!("{name} is written, but removing the old backups failed: {e}"))?;
+    Ok(Done {
+        file,
+        bytes,
+        removed,
+    })
+}
+
+/// Runs the dump into `temp` and checks it: not empty, closed to others, listed by pg_restore.
+fn dump_to(tool: &dyn Tool, spec: &Spec<'_>, temp: &Path) -> Result<u64, String> {
+    let mut out = OsString::from("--file=");
+    out.push(temp);
+    let mut args = words(&["--format=custom", "--no-comments"]);
+    args.push(out);
+    let mut database = OsString::from("--dbname=");
+    database.push(spec.url);
+    args.push(database);
+    tool.run(spec.pg_dump, &args)?;
+
+    let meta = fs::symlink_metadata(temp)
+        .map_err(|e| format!("{} wrote no file: {}", spec.pg_dump, e.kind()))?;
+    if !meta.is_file() || meta.len() == 0 {
+        return Err(format!("{} wrote an empty file", spec.pg_dump));
+    }
+    let closed = fs::set_permissions(temp, fs::Permissions::from_mode(FILE_MODE));
+    ctx(closed, "cannot close the dump to other users", temp)?;
+    let mut list = words(&["--list"]);
+    list.push(temp.as_os_str().to_owned());
+    tool.run(spec.pg_restore, &list)
+        .map_err(|e| format!("the dump did not verify: {e}"))?;
+    Ok(meta.len())
+}
+
+/// Flushes `path` (a file or a directory) to disk.
+fn sync(path: &Path) -> Result<(), String> {
+    let synced = fs::File::open(path).and_then(|f| f.sync_all());
+    ctx(synced, "cannot sync", path)
+}
+
+/// Removes the oldest backups so that `keep` stay, `new` among them (it is never removed).
+fn prune(dir: &Path, new: &str, keep: u32) -> Result<Vec<String>, String> {
+    let mut older = names_where(dir, is_backup_name)?;
+    older.retain(|n| n != new);
+    let room = usize::try_from(keep.max(1) - 1).unwrap_or(usize::MAX);
+    let excess = older.len().saturating_sub(room);
+    let mut removed = Vec::new();
+    for name in older.drain(..excess) {
+        fs::remove_file(dir.join(&name)).map_err(|e| format!("{name}: {}", e.kind()))?;
+        removed.push(name);
+    }
+    Ok(removed)
+}
+
+/// Restores `file` into the database `url` names, which must be empty of kbf's schema: one
+/// transaction, stopping at the first error, with the owner and privileges of the dump left
+/// out (the role that connects owns what is made).
+///
+/// # Errors
+/// One line; the database is as it was.
+pub fn restore(tool: &dyn Tool, pg_restore: &str, url: &str, file: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(file) {
+        Ok(m) if m.is_file() => {}
+        _ => return Err(format!("{}: not a regular file", file.display())),
+    }
+    let mut args = words(&[
+        "--exit-on-error",
+        "--single-transaction",
+        "--no-owner",
+        "--no-privileges",
+    ]);
+    let mut database = OsString::from("--dbname=");
+    database.push(url);
+    args.push(database);
+    args.push(file.as_os_str().to_owned());
+    tool.run(pg_restore, &args)
+}
+
+#[cfg(test)]
+#[path = "backup_tests.rs"]
+mod tests;

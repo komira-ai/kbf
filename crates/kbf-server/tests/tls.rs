@@ -2,7 +2,7 @@
 //! by the server's flags.
 
 use std::future::pending;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use clap::Parser;
 use futures::channel::mpsc::unbounded;
@@ -19,7 +19,7 @@ use kbf_proto::worker::{
 use kbf_server::{Args, bind_server, bind_server_with_policy};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 struct Pki {
-    dir: PathBuf,
+    dir: kbf_testkit::dir::TestDir,
     ca: String,
     client_cert: String,
     client_key: String,
@@ -37,8 +37,10 @@ struct Pki {
 /// written under a directory of their own named `name`, so tests running at the same
 /// time never read each other's half-written files.
 fn pki(name: &str) -> Pki {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("kbf-server-tls-{name}"));
-    std::fs::create_dir_all(&dir).expect("create the TLS directory");
+    let dir = kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-tls-{name}"),
+    );
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca.distinguished_name
@@ -50,6 +52,11 @@ fn pki(name: &str) -> Pki {
     let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("CA key")).expect("CA");
     let leaf = |names: Vec<String>, cn: &str, eku: ExtendedKeyUsagePurpose| {
         let mut params = CertificateParams::new(names).expect("leaf params");
+        if eku == ExtendedKeyUsagePurpose::ClientAuth {
+            // The daemon role, as the worker listener requires.
+            let role = "urn:kbf:role:daemon".try_into().expect("an IA5 name");
+            params.subject_alt_names.push(SanType::URI(role));
+        }
         params.distinguished_name.push(DnType::CommonName, cn);
         params.extended_key_usages = vec![eku];
         let key = KeyPair::generate().expect("leaf key");
@@ -498,6 +505,7 @@ fn a_mixed_config_warns_about_exactly_the_plain_text_listener() {
 #[test]
 fn the_binary_refuses_to_start_with_a_mismatched_reapi_key() {
     let pki = pki("reapi-binary");
+    let (_stores_dir, stores) = stores("tls-mismatch");
     let mut child = Command::new(env!("CARGO_BIN_EXE_kbf-server"))
         .args([
             "--listen",
@@ -509,7 +517,7 @@ fn the_binary_refuses_to_start_with_a_mismatched_reapi_key() {
             "--reapi-tls-key",
             &path(&pki.dir, "client.key"),
         ])
-        .args(stores("tls-mismatch"))
+        .args(stores)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -535,18 +543,17 @@ fn the_binary_refuses_to_start_with_a_mismatched_reapi_key() {
 
 /// `--cold-store` and `--meta-dir` flags over fresh directories named for `name`, under the
 /// target directory: every start of the binary needs both.
-fn stores(name: &str) -> [String; 4] {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let next_store = || NEXT.fetch_add(1, Ordering::Relaxed);
-    let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-server-stores")
-        .join(format!("{name}-{}-{}", std::process::id(), next_store()));
-    let _ = std::fs::remove_dir_all(&base);
-    [
+/// The directory is removed when it drops, so the caller keeps it as long as the server.
+fn stores(name: &str) -> (kbf_testkit::dir::TestDir, [String; 4]) {
+    let base = kbf_testkit::dir::TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-stores-{name}"),
+    );
+    let flags = [
         "--cold-store".to_owned(),
         format!("file://{}", base.join("cold").display()),
         "--meta-dir".to_owned(),
         base.join("meta").display().to_string(),
-    ]
+    ];
+    (base, flags)
 }

@@ -41,7 +41,7 @@ use std::time::Instant;
 use kbf_proto::reapi::Digest;
 
 use crate::cache::{Cache, InputStats};
-use crate::cas::{Cas, Fetch, label};
+use crate::cas::{Cas, Fetch, Fill, label};
 use crate::tree::{
     Copies, CountedReads, Loaded, TreeError, WritePhases, io as io_error, make_directories, millis,
 };
@@ -88,8 +88,8 @@ impl TreeConfig {
 }
 
 /// A host directory a driver mounts read-only into the action's input root. The
-/// driver's other half of this interface: the OCI runtime backend and the podman
-/// driver both take these from [`Inputs::mounts`].
+/// driver's other half of this interface: the container driver takes these from
+/// [`Inputs::mounts`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedMount {
     /// Where it appears, from the input root: `/`-separated, no leading slash, never
@@ -186,7 +186,7 @@ impl Trees {
     /// [`Trees::materialize`] behind a pointer: compiled once whatever the CAS.
     async fn materialize_dyn(
         &self,
-        cas: &dyn Fetch,
+        cas: &dyn Fill,
         in_flight: usize,
         cache: &Cache,
         root: &Digest,

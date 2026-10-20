@@ -5,6 +5,10 @@
 //! `kbf_host::Plan` of steps and carries it out with `kbf_host::execute`, which prints
 //! each step as `DRY-RUN: <step>` by default and does it only with `--apply`.
 //!
+//! - [`host`]: the host side of commit-confirm deploys: the releases' layout on disk,
+//!   the deploy state and its lock, and `host status` (read-only); and the SQLite
+//!   state store's file backed up online (`host state-backup`) and restored offline
+//!   under the store's own lock (`host state-restore`).
 //! - [`https`]: a small HTTPS client (rustls with ring, the host's trusted roots) for
 //!   the kits that download or check over TLS.
 //! - [`config`]: `--config FILE`, `KEY=VALUE` lines over a closed key set; an unknown
@@ -17,11 +21,10 @@
 //! The kits:
 //! - [`minio`]: `minio buckets` (kbf's buckets, their policy and a service account key
 //!   file) and `minio nodeport` (a NodePort Service for a MinIO's S3 port).
-//! - [`linux`]: a converged storage node's systemd units, rendered from compiled-in
-//!   templates (`linux render-units`) and checked against the host's priorities
-//!   (`linux check-units`); and, as root, the units installed and the services started
-//!   (`linux install-units`), the pinned images pulled as the kbf user (`linux
-//!   image-pull`) and the swapfile (`linux swap`).
+//! - [`linux`]: the systemd unit of one mode of the one `kbf` binary, rendered from
+//!   compiled-in templates (`linux render-units --mode`) and checked (`linux check-units
+//!   --mode`); and, as root, the unit installed and started (`linux install-units
+//!   --mode`) and the swapfile (`linux swap`).
 //! - [`mdm`]: an Apple MDM on one Linux host: its pinned upstream archives fetched
 //!   (`mdm fetch`), its services installed as root (`mdm install`), and read-only
 //!   checks of what runs (`mdm verify`); and, on an operator's own machine, an erase
@@ -40,6 +43,7 @@
 pub mod cli;
 pub mod config;
 pub mod envoy;
+pub mod host;
 pub mod https;
 pub mod linux;
 pub mod log;

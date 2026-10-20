@@ -4,9 +4,11 @@
 
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+use kbf_testkit::dir::TestDir;
 
 const ACT: &str = env!("CARGO_BIN_EXE_kbf-act");
 
@@ -21,13 +23,8 @@ fn output(args: &[&str]) -> Output {
 }
 
 /// A fresh directory for one test, under Cargo's per-target temporary directory.
-fn dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("old dir");
-    }
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir
+fn dir(name: &str) -> TestDir {
+    TestDir::under(env!("CARGO_TARGET_TMPDIR"), name)
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -176,6 +173,37 @@ fn paths_are_renamed_linked_and_chmodded() {
     );
     let mode = std::fs::metadata(&to).expect("to").permissions().mode();
     assert_eq!(mode & 0o7777, 0o640, "{mode:o}");
+}
+
+/// Catches: `sleep-once` sleeping on every run (a fake that must stall one call and
+/// then answer would stall them all), not sleeping on the first, or leaving no flag
+/// behind; and a flag it cannot make passing as a sleep that happened.
+#[test]
+fn sleep_once_sleeps_only_in_the_first_run() {
+    let dir = dir("act-sleep-once");
+    let flag = dir.join("flag").display().to_string();
+    let started = Instant::now();
+    let out = output(&["sleep-once", &flag, "0.4", ";", "echo", "first"]);
+    assert_eq!(text(&out.stdout), "first\n", "{out:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(Path::new(&flag).exists(), "the flag is made");
+
+    let started = Instant::now();
+    let out = output(&["sleep-once", &flag, "30", ";", "echo", "second"]);
+    assert_eq!(text(&out.stdout), "second\n", "{out:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let nowhere = dir.join("no/dir/flag").display().to_string();
+    let out = output(&["sleep-once", &nowhere, "30"]);
+    assert_ne!(out.status.code(), Some(0), "{out:?}");
 }
 
 /// Catches: `wait-for` returning before the path exists (a test gated on it would go
@@ -662,7 +690,7 @@ fn checks_pass_and_fail_on_what_they_name() {
 
 /// Catches: `zeros` writing other than that many zero bytes, or on the wrong stream;
 /// `leads` printing other than whether the process leads its group and its session
-/// (a test that the fake podman starts the action in a session of its own would pass
+/// (a test that the fake crun starts the action in a session of its own would pass
 /// either way); `ignore-signal` not ignoring the signal, or reporting a signal that
 /// cannot be ignored as ignored.
 #[test]

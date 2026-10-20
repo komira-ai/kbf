@@ -14,13 +14,34 @@
 //!   with the base commit and the pull request's merge commit, so a check that accepts
 //!   every commit (or none) fails there instead of at a release.
 //! - `release check <dir> --commit <sha>` ([`check`]): `<dir>` passes `verify-assets
-//!   sums`, and every file `SHA256SUMS` lists is `<binary>-<sha>-<platform>.tar.gz` or
-//!   `.cdx.json`: the assets of that commit and no other.
+//!   sums`, every file `SHA256SUMS` lists is `<binary>-<sha>-<platform>.tar.gz` or
+//!   `.cdx.json`: the assets of that commit and no other, and each tarball has exactly
+//!   one provenance bundle, `<tarball>.sigstore.json`, whose one subject is that
+//!   tarball's digest ([`bundles`]), and no bundle is there for anything else.
+//! - `release verdict <dir> --repo-dir <checkout> --tag <tag> --commit <sha> [--main-ref
+//!   <ref>] [--output <file>]` ([`verdict`]): the annotated tag's message is a green
+//!   gamma verdict for that tag, that commit (on main) and the set `<dir>`'s `SHA256SUMS`
+//!   hashes to, after a bake of 24 hours or more. Prints `set-hash=<hex>`, which
+//!   `publish --set-hash` must be given.
+//! - `release offer <dir> --repo <owner/repo> --commit <sha> --platform <p>... (--beta-result
+//!   <file> | --waive-beta <reason> --operator <name>) [--previous <sha> --version-json <file>
+//!   --previous-version-json <file>] [--plan] --out <offer.json>` ([`offer`]): the checks
+//!   that make a commit offerable, and `offer.json`, the record a deploy reads. It sets
+//!   nothing on any farm.
+//! - `release notes <dir> ... --out <file>` ([`notes`]): the same checks, then the
+//!   release's notes: commits since the previous `v*` tag, the verdict's summary, what
+//!   is not reversible, the gamma escapes and what is withdrawn.
 //! - `release publish <dir> --repo <owner/repo> --tag <tag> --commit <sha> --run-id <id>
 //!   [--gh <program>]` ([`publish`]): `check`, then creates release `<tag>` with every
-//!   file of `<dir>`. When the release exists, every asset it holds must be one of
-//!   these files, byte for byte, or nothing is changed; the files it lacks are
-//!   uploaded. A re-run therefore creates no second release and replaces no asset.
+//!   file of `<dir>` (the bundles beside their tarballs). When the release exists,
+//!   every asset it holds must be one of these files, byte for byte, or nothing is
+//!   changed; the files it lacks are uploaded. A re-run therefore creates no second
+//!   release and replaces no asset.
+
+mod git;
+pub mod notes;
+pub mod offer;
+pub mod verdict;
 
 use std::io::Write;
 use std::path::Path;
@@ -29,7 +50,8 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::Error;
-use crate::build_commit::is_commit;
+use crate::build_commit::full_commit;
+use crate::bundles;
 use crate::fetch::Sha256;
 use crate::package::{Platform, read};
 use crate::sums::{self, SUMS};
@@ -40,23 +62,16 @@ pub const MAIN: &str = "main";
 /// The workflow whose push runs on `main` build and attest the assets.
 pub const ARTIFACTS_WORKFLOW: &str = "artifacts.yml";
 
-/// The artifacts such a run leaves, all of which a release needs.
-pub const ARTIFACTS: [&str; 4] = [
+/// The artifacts such a run leaves, all of which a release needs: the files, the sums,
+/// and the provenance bundles of each platform group's tarballs (the `attest-*` jobs').
+pub const ARTIFACTS: [&str; 6] = [
     "assets-darwin-arm64",
     "assets-linux-x86_64",
     "assets-linux-arm64",
     "sha256sums",
+    "bundles-darwin-arm64",
+    "bundles-linux",
 ];
-
-/// A full commit SHA, or a usage error naming the flag.
-fn full_commit(flag: &str, commit: &str) -> Result<(), Error> {
-    if commit.len() == 40 && is_commit(commit) {
-        return Ok(());
-    }
-    Err(Error::Usage(format!(
-        "{flag} {commit:?} is not a full commit SHA (40 lowercase hex digits)"
-    )))
-}
 
 /// `gh api <path>`: the JSON it printed, or `None` when GitHub answered 404.
 fn api(gh: &Path, path: &str) -> Result<Option<Value>, Error> {
@@ -187,18 +202,22 @@ pub fn main_control(gh: &Path, repo: &str, on: &str, off: &str) -> Result<String
 }
 
 /// Whether `name` is an asset of `commit`: `<binary>-<commit>-<platform>` and
-/// `.tar.gz` or `.cdx.json`.
+/// `.tar.gz`, `.cdx.json`, `.deb` or `.pkg` (the packages; nfpm's own `kbf-installer_<version>_
+/// <arch>.deb` and `pkg build`'s `kbf-installer-<version>-macos-arm64.pkg` name no commit and are
+/// not one).
 fn is_asset_of(name: &str, commit: &str) -> bool {
     let stem = name
         .strip_suffix(".tar.gz")
-        .or_else(|| name.strip_suffix(".cdx.json"));
+        .or_else(|| name.strip_suffix(".cdx.json"))
+        .or_else(|| name.strip_suffix(".deb"))
+        .or_else(|| name.strip_suffix(".pkg"));
     let parts = stem.and_then(|s| s.split_once(&format!("-{commit}-")));
     parts
         .is_some_and(|(binary, platform)| !binary.is_empty() && Platform::named(platform).is_some())
 }
 
 /// The `release check` verb: the lines to print, then every file name of `dir`
-/// (`SHA256SUMS` first).
+/// (`SHA256SUMS` first, then the listed files, then the bundles).
 fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error> {
     full_commit("--commit", commit)?;
     let sums_line = sums::verify_sums(dir, Sha256::of)?;
@@ -211,11 +230,40 @@ fn checked(dir: &Path, commit: &str) -> Result<(Vec<String>, Vec<String>), Error
     if !foreign.is_empty() {
         return Err(Error::Refused(foreign));
     }
+    let unpaired = bundles::pairing(dir, &lines)?;
+    if !unpaired.is_empty() {
+        return Err(Error::Refused(unpaired));
+    }
     let mut names = vec![SUMS.to_owned()];
-    names.extend(lines.into_iter().map(|l| l.name));
+    names.extend(lines.iter().map(|l| l.name.clone()));
+    let tarballs: Vec<&str> = lines
+        .iter()
+        .map(|l| l.name.as_str())
+        .filter(|n| n.ends_with(".tar.gz"))
+        .collect();
+    let packages: Vec<&str> = lines
+        .iter()
+        .map(|l| l.name.as_str())
+        .filter(|n| bundles::is_package(n))
+        .collect();
+    names.extend(
+        tarballs
+            .iter()
+            .chain(&packages)
+            .map(|t| bundles::name_of(t)),
+    );
+    let and_packages = if packages.is_empty() {
+        String::new()
+    } else {
+        format!(" and {} package(s)", packages.len())
+    };
     let printed = vec![
         sums_line,
         format!("names: every listed file is an asset of {commit}"),
+        format!(
+            "bundles: each of the {} tarballs{and_packages} has one provenance bundle",
+            tarballs.len()
+        ),
     ];
     Ok((printed, names))
 }
@@ -235,6 +283,9 @@ pub struct Release<'a> {
     pub commit: &'a str,
     /// The run of the artifacts workflow that built and attested them.
     pub run_id: u64,
+    /// The set hash the gamma verdict names (`release verdict` prints it): the files must
+    /// be that set, or nothing is published.
+    pub set_hash: &'a kbf_gate::SetHash,
     /// The `gh` program.
     pub gh: &'a Path,
     /// An empty directory, for the assets the release already holds.
@@ -242,7 +293,8 @@ pub struct Release<'a> {
 }
 
 impl Release<'_> {
-    /// The release's notes: where the files come from, and how to verify one.
+    /// The release's notes: where the files come from, and how to verify one, online
+    /// and (for a tarball) offline with the bundle released beside it.
     fn notes(&self) -> String {
         let repo = self.repo;
         format!(
@@ -251,9 +303,18 @@ impl Release<'_> {
              rebuilds nothing.\n\nVerify an asset before use:\n\n```text\ngh attestation \
              verify <asset> --repo {repo} --signer-workflow \
              {repo}/.github/workflows/{ARTIFACTS_WORKFLOW} --source-ref refs/heads/{MAIN} \
-             --deny-self-hosted-runners\n```\n",
+             --deny-self-hosted-runners\n```\n\nEach tarball and each package (`.deb` or `.pkg`) also has its provenance bundle, \
+             `<asset>{SUFFIX}`, which verifies it with no network but a trusted root \
+             (`gh attestation trusted-root > trusted_root.jsonl`):\n\n```text\ngh attestation \
+             verify <asset> --bundle <asset>{SUFFIX} --custom-trusted-root trusted_root.jsonl \
+             --repo {repo} --signer-workflow {repo}/.github/workflows/{ARTIFACTS_WORKFLOW} \
+             --cert-oidc-issuer {ISSUER} --source-ref refs/heads/{MAIN} --source-digest \
+             {commit} --predicate-type {PROVENANCE} --deny-self-hosted-runners\n```\n",
             id = self.run_id,
             commit = self.commit,
+            SUFFIX = bundles::SUFFIX,
+            ISSUER = bundles::ISSUER,
+            PROVENANCE = bundles::PROVENANCE,
         )
     }
 }
@@ -261,6 +322,15 @@ impl Release<'_> {
 /// The `release publish` verb: the lines to print.
 pub fn publish(dir: &Path, r: &Release) -> Result<Vec<String>, Error> {
     let (mut printed, names) = checked(dir, r.commit)?;
+    let held_set = verdict::set_hash_of(dir)?;
+    if &held_set != r.set_hash {
+        return Err(Error::Refused(vec![format!(
+            "the files in {} are set {}, the gamma verdict names set {}: gamma ran other bytes",
+            dir.display(),
+            held_set.as_str(),
+            r.set_hash.as_str()
+        )]));
+    }
     let paths: Vec<String> = names
         .iter()
         .map(|n| dir.join(n).display().to_string())

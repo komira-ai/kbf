@@ -1,6 +1,6 @@
 //! Simulation family F3, the scheduler's half: platform routing, cordon and drain
 //! together, including the last worker of a class (`docs/design/simulation.md`
-//! section 5, F3; the catalog is komira-ai/komira-build-farm#139). The rollout half
+//! section 5, F3; the catalog is komira-ai/kbf#139). The rollout half
 //! (`RolloutDriver` over this scheduler) is `kbf-server`'s `tests/sim_rollout.rs`.
 //!
 //! The world (`f3_fleet/world.rs`): four workers in name order, `arm` (the only Linux
@@ -114,7 +114,7 @@ fn last_of_class_cordoned(seed: u64) -> World {
         }
     }
     // The uncordon itself places what waited for arm (the reference checks exactly
-    // which: arm is first in name order, so other work may take some of its room).
+    // which: other work may take some of its room).
     let by_uncordon = ops_of(&w, ARM, c, unc).iter().any(|id| {
         seen.grants
             .get(id)

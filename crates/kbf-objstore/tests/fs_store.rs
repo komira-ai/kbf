@@ -3,27 +3,29 @@
 //! files that are not what it wrote and failing file system calls.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_objstore::{
-    ByteRange, Floor, FsStore, FsStoreError, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError,
-    PageSize, Room, Space, conformance, objects_source,
+    ByteRange, Floor, FsStore, FsStoreError, KeyPrefix, ListToken, ObjectKey, ObjectStore,
+    ObjectStoreError, PageSize, Room, Space, conformance, objects_source,
 };
+use kbf_testkit::dir::TestDir;
+use kbf_testkit::forked::ForkedChild;
 use sha2::{Digest, Sha256};
 
 /// A floor every file system the tests run on meets: one byte.
 const FLOOR: Floor = Floor::Bytes(1);
 
-/// A fresh, absent directory for `name`, under the target directory.
-fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-objstore-fs")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A fresh, empty directory for `name`, under the target directory, removed when the
+/// returned value is dropped (declare it before anything that holds files in it).
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-objstore-fs-{name}"),
+    )
 }
 
 fn key(name: &str) -> ObjectKey {
@@ -54,8 +56,13 @@ async fn passes_conformance_with_conditional_writes() {
     let report = conformance::run(&store, &prefix).await;
     assert!(report.passed(), "{report}");
     assert_eq!(report.skipped().count(), 0, "{report}");
+    // The run deleted what it wrote: the bucket is empty.
+    let left = store
+        .list(&KeyPrefix::default(), None, PageSize::MAX)
+        .await
+        .expect("list");
+    assert!(left.objects.is_empty(), "{:?}", left.objects);
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// Catches a store that does not outlive its process (objects kept in memory, or under
@@ -85,7 +92,243 @@ async fn objects_survive_a_reopen_and_torn_writes_do_not() {
     assert_eq!(page.objects[0].key, k);
     assert_eq!(page.objects[0].size, body.len() as u64);
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
+/// Catches a paged listing of a directory that loses, repeats or misorders keys across
+/// pages (pages of 2 over 9 keys), lists a key outside the prefix, or lists a file that
+/// is not an object: a write in flight in `tmp/` (even one with a whole header) or a
+/// foreign file in a shard directory.
+#[tokio::test]
+async fn a_paged_listing_is_the_written_key_set_and_nothing_else() {
+    let dir = scratch("paged");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let mut want = Vec::new();
+    for i in [5, 0, 8, 3, 1, 7, 2, 6, 4] {
+        let k = key(&format!("cas/{i:02}"));
+        store
+            .put_new(&k, Bytes::from(vec![b'x'; i + 1]), None)
+            .await
+            .expect("put");
+        want.push((k.as_str().to_owned(), i as u64 + 1));
+    }
+    want.sort();
+    store
+        .put_new(&key("other/00"), Bytes::from_static(b"o"), None)
+        .await
+        .expect("put");
+    let in_flight = [b"kbf-obj1\0\x06cas/99".as_slice(), b"body"].concat();
+    std::fs::write(dir.join("tmp").join("7"), in_flight).expect("plant tmp");
+    std::fs::write(
+        dir.join("objects").join("00").join("stray"),
+        b"not an object",
+    )
+    .expect("plant a foreign file");
+
+    let cas = KeyPrefix::new("cas/").expect("prefix");
+    let mut got = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .list(&cas, after.as_ref(), PageSize::new(2).expect("size"))
+            .await
+            .expect("list");
+        assert!(page.objects.len() <= 2, "{page:?}");
+        got.extend(
+            page.objects
+                .into_iter()
+                .map(|o| (o.key.as_str().to_owned(), o.size)),
+        );
+        match page.next {
+            Some(t) => after = Some(t),
+            None => break,
+        }
+    }
+    assert_eq!(got, want);
+    drop(store);
+}
+
+/// Catches a fresh listing [`ListToken::after`] a key served from the kept keys of an
+/// earlier listing of the same prefix that was abandoned after its first page: a
+/// rebuild resuming from the last key it finished would miss every object written
+/// since that listing began. The abandoned listing's own next page may still be cut
+/// from its keys (the contract lets a listing miss recent writes); a fresh token reads
+/// the directory again.
+#[tokio::test]
+async fn a_fresh_listing_after_a_key_sees_objects_written_since_an_abandoned_one() {
+    let dir = scratch("fresh-after");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    for name in ["cas/a", "cas/b", "cas/c"] {
+        store
+            .put_new(&key(name), Bytes::from_static(b"x"), None)
+            .await
+            .expect("put");
+    }
+    let cas = KeyPrefix::new("cas/").expect("prefix");
+    let size = PageSize::new(1).expect("size");
+    let first = store.list(&cas, None, size).await.expect("list");
+    assert_eq!(first.objects[0].key.as_str(), "cas/a");
+    assert!(first.next.is_some(), "{first:?}");
+    // The listing is abandoned here; a new object lands after its first page.
+    store
+        .put_new(&key("cas/bb"), Bytes::from_static(b"x"), None)
+        .await
+        .expect("put");
+    let fresh = store
+        .list(&cas, Some(&ListToken::after(&key("cas/b"))), size)
+        .await
+        .expect("list");
+    let keys: Vec<&str> = fresh.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(keys, ["cas/bb"]);
+    drop(store);
+}
+
+/// Catches a `Released` that completes while a handle is open (a restart over the
+/// directory would be refused), one that never completes once the last handle is dropped,
+/// and one that holds the store open itself. The handle is dropped on another thread
+/// only after `wait` has been polled once; no clock is involved.
+#[tokio::test]
+async fn released_completes_when_the_last_handle_is_dropped_and_the_directory_is_free() {
+    let dir = scratch("released");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let clone = store.clone();
+    let released = store.released();
+    drop(store);
+    assert!(
+        matches!(FsStore::open(&dir, FLOOR), Err(FsStoreError::Locked { .. })),
+        "a clone still holds the directory"
+    );
+    let (polled_tx, polled_rx) = std::sync::mpsc::channel::<()>();
+    let dropper = std::thread::spawn(move || {
+        polled_rx.recv().expect("the waiter polled");
+        drop(clone);
+    });
+    let waiting = released.wait_within(Duration::from_secs(60));
+    tokio::pin!(waiting);
+    // One poll that finds the handle still open: it is pending.
+    assert!(
+        futures::poll!(waiting.as_mut()).is_pending(),
+        "completed with a handle open"
+    );
+    polled_tx.send(()).expect("the dropper waits");
+    waiting.await.expect("released");
+    dropper.join().expect("dropper");
+    FsStore::open(&dir, FLOOR).expect("the directory is free when the wait returns");
+}
+
+/// A store already closed: the wait returns at once.
+#[tokio::test]
+async fn released_of_a_closed_store_returns_at_once() {
+    let dir = scratch("released-closed");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let released = store.released();
+    drop(store);
+    released.wait_within(Duration::ZERO).await.expect("closed");
+}
+
+/// Catches a wait that outlives its limit when a clone is leaked (a hang in a stop that
+/// must end), and one that reports the wrong count: the limit passes in virtual time, to
+/// the instant, and the error names the directory and the two live handles.
+#[tokio::test(start_paused = true)]
+async fn released_with_a_leaked_clone_ends_at_the_limit_and_counts_the_handles() {
+    let dir = scratch("released-leaked");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let leaked = store.clone();
+    let released = store.released();
+    let limit = Duration::from_secs(10);
+    let start = tokio::time::Instant::now();
+    let held = released.wait_within(limit).await.expect_err("still held");
+    assert_eq!(start.elapsed(), limit);
+    assert_eq!(
+        (held.clones, &held.dir, held.limit),
+        (2, &dir.to_path_buf(), limit)
+    );
+    assert!(held.to_string().contains("2 live handle"), "{held}");
+    drop((store, leaked));
+}
+
+/// Catches a store that tells its watchers the directory is free while it is still
+/// locked, on every run: a hook on the dropping thread, just before the unlock, polls the
+/// wait registered earlier, starts a fresh wait and tries the directory. Both waits must be
+/// pending and the directory must still refuse a second open; after the drop the first
+/// wait is over and the open works. Mutants: `Inner::drop` sets the flag before the unlock
+/// (the fresh wait sees it), opens and wakes before it (both see it), or wakes before the
+/// unlock and sets the flag after (the registered wait looks, sleeps again and is never
+/// woken: it ends at its limit).
+#[test]
+fn the_wait_is_pending_and_the_directory_refused_until_the_unlock() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::Context;
+
+    type Wait = Pin<Box<dyn Future<Output = Result<(), kbf_objstore::StillHeld>> + Send>>;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let _entered = runtime.enter();
+    let dir = scratch("released-hook");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let released = store.released();
+    let wait: Arc<Mutex<Option<Wait>>> = Arc::new(Mutex::new(None));
+    let seen: Arc<Mutex<Vec<(bool, bool, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let fresh = Arc::new(Mutex::new(Some(store.released())));
+    {
+        let (wait, seen, dir, fresh) = (
+            Arc::clone(&wait),
+            Arc::clone(&seen),
+            dir.to_path_buf(),
+            Arc::clone(&fresh),
+        );
+        released.before_unlock(move || {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut guard = wait.lock().expect("wait");
+            let pending = guard
+                .as_mut()
+                .expect("armed")
+                .as_mut()
+                .poll(&mut cx)
+                .is_pending();
+            let mut again = Box::pin(
+                fresh
+                    .lock()
+                    .expect("fresh")
+                    .take()
+                    .expect("once")
+                    .wait_within(Duration::from_secs(30)),
+            );
+            let fresh_pending = again.as_mut().poll(&mut cx).is_pending();
+            let refused = FsStore::open(&dir, FLOOR).is_err();
+            seen.lock()
+                .expect("seen")
+                .push((pending, fresh_pending, refused));
+        });
+    }
+    *wait.lock().expect("wait") = Some(Box::pin(released.wait_within(Duration::from_secs(30))));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(
+        wait.lock()
+            .expect("wait")
+            .as_mut()
+            .expect("armed")
+            .as_mut()
+            .poll(&mut cx)
+            .is_pending(),
+        "pending while the store is open"
+    );
+    drop(store);
+    assert_eq!(*seen.lock().expect("seen"), vec![(true, true, true)]);
+    let done = wait
+        .lock()
+        .expect("wait")
+        .as_mut()
+        .expect("armed")
+        .as_mut()
+        .poll(&mut cx);
+    assert!(
+        matches!(done, std::task::Poll::Ready(Ok(()))),
+        "released after the unlock"
+    );
+    FsStore::open(&dir, FLOOR).expect("the directory is free");
 }
 
 /// Catches two stores sharing one directory: the second would empty `tmp/` under the
@@ -109,7 +352,33 @@ fn a_second_open_is_refused_until_the_first_store_closes() {
     );
     drop(first);
     drop(FsStore::open(&dir, FLOOR).expect("open after the first closed"));
-    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
+/// Catches a lock the last handle's drop releases only by closing its descriptor, which
+/// a process forked while the store was open keeps held until it execs. A process that
+/// spawns children from one thread while another reopens a directory (the tests of one
+/// test binary run on threads of one process) is then refused its own reopen with
+/// `Locked` for as long as a child is between fork and exec. The child here is held
+/// before exec until the reopen has been tried, so the interleaving is the failing one
+/// every time. A clone is held across the fork too: the directory is unlocked when the
+/// last handle goes, not before.
+///
+/// Mutant: the `Drop` of `DirLock` removed: `Locked` from the reopen.
+#[test]
+fn a_child_forked_while_the_store_was_open_does_not_keep_the_dir_locked_after_the_drop() {
+    let dir = scratch("lock-forked");
+    let first = FsStore::open(&dir, FLOOR).expect("open");
+    let clone = first.clone();
+    let child = ForkedChild::before_exec();
+    drop(first);
+    assert!(
+        matches!(FsStore::open(&dir, FLOOR), Err(FsStoreError::Locked { .. })),
+        "a clone is still open, and the directory was not locked"
+    );
+    drop(clone);
+    let again = FsStore::open(&dir, FLOOR);
+    drop(again.expect("an open after the last handle was dropped, with the child alive"));
+    child.finish();
 }
 
 /// Catches a write that replaces an existing object (a rename where a link belongs):
@@ -151,7 +420,6 @@ async fn of_concurrent_writers_of_one_key_exactly_one_wins() {
         "a temporary file was left behind"
     );
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// Catches a read that trusts the file under a key's name: a file holding another
@@ -194,7 +462,6 @@ async fn a_file_that_is_not_the_key_s_object_is_refused() {
     let keys: Vec<&str> = listed.objects.iter().map(|o| o.key.as_str()).collect();
     assert_eq!(keys, ["a"], "{listed:?}");
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// Catches a write past the free-space floor: with a floor no file system meets the
@@ -218,7 +485,6 @@ async fn a_write_under_the_free_space_floor_is_refused() {
     roomy.put_new(&k, body.clone(), None).await.expect("put");
     assert_eq!(roomy.get_range(&k, all(4)).await.expect("read"), body);
     drop(roomy);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// Catches a shard scan that reports the file's length rather than the object's (the
@@ -265,7 +531,6 @@ async fn a_scan_reads_each_shard_s_headers() {
     let full = FsStore::open(&dir, Floor::Bytes(u64::MAX)).expect("open");
     assert!(full.under_floor().expect("statvfs"));
     drop(full);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// Catches a file system failure reported as anything but a transport error that names
@@ -310,7 +575,6 @@ async fn file_system_failures_name_the_operation_and_the_path() {
     let put = store.put_new(&key("other"), body, None).await;
     transport("put without tmp", put, "create", &dir.join("tmp").join("1"));
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// Catches an open that reports a directory it cannot create as anything but an I/O
@@ -328,7 +592,6 @@ fn an_open_that_cannot_create_the_directory_says_where() {
     let text = e.to_string();
     let want = format!("create {}: ", file.join("store").display());
     assert!(text.starts_with(&want), "{text}");
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 const GIB: u64 = 1 << 30;
@@ -383,7 +646,6 @@ async fn keep_free_is_5_percent_and_at_least_1_gib() {
     available.store(5 * GIB - 1, Ordering::Relaxed);
     assert!(store.under_floor().expect("room"));
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// Catches a refused write that wakes no evictor (mutant: no notify in the floor
@@ -428,7 +690,6 @@ async fn a_refused_write_wakes_refused_full() {
         .await
         .expect("a refusal before the wait wakes it");
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// Catches a fake file system for eviction tests that does not count the store's own
@@ -461,7 +722,6 @@ async fn a_file_system_of_objects_counts_the_object_files() {
         .len();
     assert_eq!(store.room().expect("room").available, total - 2 * one);
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }
 
 /// Catches: a streamed write that failed (its body broke, or ended short) leaving its
@@ -501,5 +761,4 @@ async fn a_failed_streamed_write_leaves_no_file() {
     let left = std::fs::read_dir(dir.join("tmp")).expect("tmp").count();
     assert_eq!(left, 0, "files left in tmp/");
     drop(store);
-    std::fs::remove_dir_all(&dir).expect("remove");
 }

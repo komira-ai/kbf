@@ -1,0 +1,348 @@
+=== kbf-installer --help ===
+The one root tool for setting up a kbf host and for updating it.
+
+Mutating verbs only say what they would do unless --apply is given. Exit codes: 0 ok, 1 failed, 2 usage or a missing prerequisite, 3 refused (verification or policy), 4 busy (another run holds the lock), 5 needs an operator.
+
+Usage: kbf-installer [OPTIONS] <COMMAND>
+
+Commands:
+  setup           First install: accounts, directories, installer.toml, the first release
+  status          What is installed, staged and pending, and the last refusal
+  run             Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap
+  update          Swap this host's frontend through the proxy's update API, and wait for it
+  confirm         Keep the pending swap, naming its activation
+  revert          Undo the pending swap, naming its activation
+  rollback        Point `current` at `previous`, with no confirm window
+  record-release  Record a release placed on the host by hand as its first
+  gc              Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
+  boot-check      Run before each start of a release on trial; counts the start
+  migrate         Adopt the old layout (`/usr/local/kbf`, the deploy kit's state) into the installer's tree, or put it back with `--rollback`. A dry run without `--apply`
+  quiesce         For maintainer scripts: take the lock; exit 5 while a swap is pending
+  check           Validate the installer's configuration, trust files and path chain
+  backup          Dump the state database to the backup directory and keep the newest few; run by kbf-backup.timer as the service user, who connects as the role installer.toml's database URL names
+  restore         Restore a backup into an empty state database, as the service user, who connects as the role installer.toml's database URL names
+  proxy           Serve the frontend host's public port: route each stream to the active child frontend
+  help            Print this message or the help of the given subcommand(s)
+
+Options:
+      --json
+          Print the result as one JSON object on standard output
+
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+=== kbf-installer setup --help ===
+First install: accounts, directories, installer.toml, the first release
+
+Usage: kbf-installer setup [OPTIONS] --mode <MODE>
+
+Options:
+      --json
+          Print the result as one JSON object on standard output
+      --mode <MODE>
+          The kbf mode this host runs (`kbf --mode=...`) [possible values: frontend, storage, daemon, storage-and-daemon, all-in-one]
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --release-source <RELEASE_SOURCE>
+          Where releases are fetched from. Default: the frontend for the modes that enroll, a file server (`url`) for `frontend` and `all-in-one` [possible values: url, frontend]
+      --release-url <RELEASE_URL>
+          The https base URL of the file server, for --release-source url
+      --min-generation <MIN_GENERATION>
+          Refuse orders below this generation. A floor only goes up
+      --commit <COMMIT>
+          The first release to install (40 hex characters); needs --release-source url
+      --frontend-url <FRONTEND_URL>
+          The frontend to enroll with, as https://host[:port]. For `storage`, `daemon` and `storage-and-daemon`; written to kbf.toml
+      --token-file <TOKEN_FILE>
+          The enrollment token (a file of mode 0600 or tighter); setup keeps a copy that only kbf reads. For the modes that enroll
+      --database <DATABASE>
+          The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password). Required for `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. The server exists before setup runs, and so do the role and the database unless --create-local-database makes them
+      --create-local-database
+          For a host whose Postgres runs locally: create the login role and the database the `--database` URL names (owned by the role, no password), as the server's superuser over its Unix socket (peer authentication, no password), if they are not there. Never edits `pg_hba.conf`; refuses, saying which rule to add, when the server does not admit the login. Without it, setup only checks that it can log in
+      --no-start
+          Enable the units without starting them
+      --listen <LISTEN>
+          The public REAPI listener, as IP:PORT (kbf's --listen). frontend, all-in-one
+      --worker-listen <WORKER_LISTEN>
+          The worker listener (daemons and storage nodes dial it), as IP:PORT. frontend, all-in-one
+      --api-listen <API_LISTEN>
+          The operator API listener, as IP:PORT; default 127.0.0.1:8982. frontend, all-in-one
+      --reapi-tls-cert <REAPI_TLS_CERT>
+          The REAPI listener's certificate (PEM file, absolute path); needs --reapi-tls-key
+      --reapi-tls-key <REAPI_TLS_KEY>
+          The REAPI listener's private key (a file of mode 0600 owned by the service user)
+      --worker-tls-cert <WORKER_TLS_CERT>
+          The worker listener's certificate; needs --worker-tls-key and --worker-client-ca
+      --worker-tls-key <WORKER_TLS_KEY>
+          The worker listener's private key (a file of mode 0600 owned by the service user)
+      --worker-client-ca <WORKER_CLIENT_CA>
+          The CA that daemons' and storage nodes' certificates must chain to
+      --storage-url <STORAGE_URL>
+          The storage node the frontend proxies blobs to (kbf's --storage), as http(s)://host[:port] with nothing after it. Required for frontend. https needs --storage-ca, --storage-client-cert and --storage-client-key; http is for a loopback host only
+      --storage-ca <STORAGE_CA>
+          The CA the storage node's certificate chains to. frontend
+      --storage-client-cert <STORAGE_CLIENT_CERT>
+          The frontend's certificate toward the storage node. frontend
+      --storage-client-key <STORAGE_CLIENT_KEY>
+          The private key of --storage-client-cert (a file of mode 0600 owned by the service user). frontend
+      --cold-store <COLD_STORE>
+          The cold store, as file:///absolute/path. Required for all-in-one
+      --meta-dir <META_DIR>
+          The directory of the metadata log, an absolute path outside the data directory. Required for all-in-one
+      --daemon-server <DAEMON_SERVER>
+          The worker listener the daemon half dials, as https://host[:port] (kbf's --server); the host must be a name of the worker certificate. Required for all-in-one
+      --daemon-ca-cert <DAEMON_CA_CERT>
+          The CA of the worker certificate, for the daemon half (kbf's --ca-cert). Required for all-in-one
+      --daemon-cert <DAEMON_CERT>
+          The daemon half's client certificate (kbf's --cert), role daemon. Required for all-in-one
+      --daemon-key <DAEMON_KEY>
+          The private key of --daemon-cert (a file of mode 0600 owned by the service user). Required for all-in-one
+      --node-id <NODE_ID>
+          The daemon half's node name, a DNS label unique in the cell. Required for all-in-one
+      --proxy
+          Set this frontend host up behind `kbf-installer proxy`: write the `[proxy]` table of installer.toml and enable kbf-proxy.socket and kbf-proxy.service instead of kbf-frontend.service. Only for `--mode=frontend`. The proxy takes --reapi-tls-cert, --reapi-tls-key and --worker-client-ca; the listener flags are not taken
+      --proxy-base-port <PROXY_BASE_PORT>
+          The first loopback port of the frontend children the proxy starts (1024 to 65521); slot A uses it and the four after, slot B ten above. Default 18000. With --proxy
+      --buck2-auth <BUCK2_AUTH>
+          How REAPI and Buck2 callers authenticate to the proxy; default none. With --proxy [possible values: none, bearer, mtls]
+      --buck2-token-file <BUCK2_TOKEN_FILE>
+          The Buck2 API key file, an absolute path, for --buck2-auth bearer
+      --installer-config <INSTALLER_CONFIG>
+          The installer.toml `setup` writes (and reads, to keep what it does not set), under the host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which is the only value setup accepts. The same flag, with the same meaning, as on `run`
+  -h, --help
+          Print help
+
+=== kbf-installer status --help ===
+What is installed, staged and pending, and the last refusal
+
+Usage: kbf-installer status [OPTIONS]
+
+Options:
+      --json   Print the result as one JSON object on standard output
+      --apply  Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help   Print help
+
+=== kbf-installer run --help ===
+Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap
+
+Usage: kbf-installer run [OPTIONS]
+
+Options:
+      --json
+          Print the result as one JSON object on standard output
+      --update-dir <UPDATE_DIR>
+          Root's directory: status.json goes here. Root-owned, mode 0755, so the node can read it. Default: the host's state directory (`/var/lib/kbf-installer`, `/var/db/kbf-installer` on a Mac)
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --orders-dir <ORDERS_DIR>
+          The order spool: owned by the service user, mode 0700, inside a root-owned parent. Default: `orders` in the state directory
+      --unit <UNIT>
+          The systemd unit to restart after a swap (Linux). Without it and without `--launchd-label`, the unit of the mode in the host's kbf.toml, which is how the one packaged kbf-installer.service serves every mode
+      --launchd-label <LAUNCHD_LABEL>
+          The launchd label to kickstart after a swap (macOS)
+      --window-secs <WINDOW_SECS>
+          The confirm window the boot check gives a release on trial (120 to 1800) [default: 900]
+      --starts <STARTS>
+          The starts a release on trial gets before it is reverted (Linux) [default: 3]
+      --min-activation-interval-secs <MIN_ACTIVATION_INTERVAL_SECS>
+          The fewest seconds between one activation and the next [default: 60]
+      --passes <PASSES>
+          Stop after this many passes (a rehearsal or a test); without it, run until stopped
+      --installer-config <INSTALLER_CONFIG>
+          installer.toml, under the host root: its `database` key is the state database the installer migrates to what a release needs before that release is activated. Required when the unit restarted after a swap is a frontend's or the all-in-one's, unless the unit comes from kbf.toml's mode (no --unit): then the host's installer.toml (/etc/kbf, /usr/local/etc/kbf on a Mac) is the default
+  -h, --help
+          Print help
+
+=== kbf-installer update --help ===
+Swap this host's frontend through the proxy's update API, and wait for it
+
+Usage: kbf-installer update [OPTIONS] --commit <COMMIT> --frontend --api <API>
+
+Options:
+      --commit <COMMIT>
+          The release to update to (40 hex characters)
+      --json
+          Print the result as one JSON object on standard output
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --frontend
+          Update this host's frontend: ask the update API of the proxy to swap it, and wait
+      --api <API>
+          The proxy's public address, `127.0.0.1:port`: the update API is served there
+      --api-ca <API_CA>
+          CA certificates (PEM) the API's certificate is verified against, besides the system's
+      --api-server-name <API_SERVER_NAME>
+          The name the API's certificate carries (the address's own IP when none is given)
+      --token-file <TOKEN_FILE>
+          The operator token the API takes: a file of mode 0600 or 0400. `setup` writes it here [default: /etc/kbf/api-token]
+      --nodes
+          Have the new frontend update the nodes once it has baked. Without it only the frontend is swapped
+      --request-id <REQUEST_ID>
+          Names this update to the API, so a run repeated after a lost connection is the same update. Random when not given
+      --handover-timeout-s <HANDOVER_TIMEOUT_S>
+          How long to wait for the update to end, the new frontend's bake included [default: 3600]
+  -h, --help
+          Print help
+
+=== kbf-installer confirm --help ===
+Keep the pending swap, naming its activation
+
+Usage: kbf-installer confirm [OPTIONS] --id <ID>
+
+Options:
+      --id <ID>                        The activation: `<epoch>-<order id>`
+      --json                           Print the result as one JSON object on standard output
+      --apply                          Do what the verb says. Without it a mutating verb is a dry run
+      --unit <UNIT>                    The systemd unit to restart after a swap (Linux)
+      --launchd-label <LAUNCHD_LABEL>  The launchd label to kickstart after a swap (macOS)
+  -h, --help                           Print help
+
+=== kbf-installer revert --help ===
+Undo the pending swap, naming its activation
+
+Usage: kbf-installer revert [OPTIONS] --id <ID>
+
+Options:
+      --id <ID>                        The activation: `<epoch>-<order id>`
+      --json                           Print the result as one JSON object on standard output
+      --apply                          Do what the verb says. Without it a mutating verb is a dry run
+      --unit <UNIT>                    The systemd unit to restart after a swap (Linux)
+      --launchd-label <LAUNCHD_LABEL>  The launchd label to kickstart after a swap (macOS)
+  -h, --help                           Print help
+
+=== kbf-installer rollback --help ===
+Point `current` at `previous`, with no confirm window
+
+Usage: kbf-installer rollback [OPTIONS]
+
+Options:
+      --json                           Print the result as one JSON object on standard output
+      --unit <UNIT>                    The systemd unit to restart after a swap (Linux)
+      --apply                          Do what the verb says. Without it a mutating verb is a dry run
+      --launchd-label <LAUNCHD_LABEL>  The launchd label to kickstart after a swap (macOS)
+  -h, --help                           Print help
+
+=== kbf-installer record-release --help ===
+Record a release placed on the host by hand as its first
+
+Checks its files, writes its `VERIFIED` marker and makes it current, so the frontend proxy can start it. The operator vouches for the commit; nothing is fetched or attested.
+
+Usage: kbf-installer record-release [OPTIONS] --commit <COMMIT>
+
+Options:
+      --commit <COMMIT>
+          The release to record (40 hex characters): `releases/<commit>/kbf` must be there
+
+      --json
+          Print the result as one JSON object on standard output
+
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+=== kbf-installer gc --help ===
+Remove the releases nothing needs: current, previous, staged, the swap on trial and any a process executes from stay, and so do the newest `--keep` others
+
+Usage: kbf-installer gc [OPTIONS]
+
+Options:
+      --json         Print the result as one JSON object on standard output
+      --keep <KEEP>  The releases to keep besides the ones that must stay [default: 1]
+      --apply        Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help         Print help
+
+=== kbf-installer boot-check --help ===
+Run before each start of a release on trial; counts the start
+
+Usage: kbf-installer boot-check [OPTIONS]
+
+Options:
+      --json                       Print the result as one JSON object on standard output
+      --window-secs <WINDOW_SECS>  [default: 900]
+      --apply                      Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help                       Print help
+
+=== kbf-installer quiesce --help ===
+For maintainer scripts: take the lock; exit 5 while a swap is pending
+
+Usage: kbf-installer quiesce [OPTIONS]
+
+Options:
+      --json   Print the result as one JSON object on standard output
+      --apply  Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help   Print help
+
+=== kbf-installer check --help ===
+Validate the installer's configuration, trust files and path chain
+
+Usage: kbf-installer check [OPTIONS]
+
+Options:
+      --json   Print the result as one JSON object on standard output
+      --apply  Do what the verb says. Without it a mutating verb is a dry run
+  -h, --help   Print help
+
+=== kbf-installer backup --help ===
+Dump the state database to the backup directory and keep the newest few; run by kbf-backup.timer as the service user, who connects as the role installer.toml's database URL names
+
+Usage: kbf-installer backup [OPTIONS]
+
+Options:
+      --installer-config <INSTALLER_CONFIG>
+          installer.toml, under the host root: its `database` key names the database to dump and its `backup_keep` how many backups stay (default 7) [default: /etc/kbf/installer.toml]
+      --json
+          Print the result as one JSON object on standard output
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --dir <DIR>
+          The backup directory: made 0700 when it is not there, owned by the user that runs this [default: /var/lib/kbf-server/backups]
+      --pg-dump <PG_DUMP>
+          The `pg_dump` program (a name looked up in PATH, or a path) [default: pg_dump]
+      --pg-restore <PG_RESTORE>
+          The `pg_restore` program, which checks the dump can be read [default: pg_restore]
+  -h, --help
+          Print help
+
+=== kbf-installer restore --help ===
+Restore a backup into an empty state database, as the service user, who connects as the role installer.toml's database URL names
+
+Usage: kbf-installer restore [OPTIONS] --file <FILE>
+
+Options:
+      --file <FILE>
+          The backup to restore (a file `backup` wrote)
+      --json
+          Print the result as one JSON object on standard output
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --installer-config <INSTALLER_CONFIG>
+          installer.toml, under the host root: its `database` key names the database to restore into (unless --database does), which must be empty of kbf's schema [default: /etc/kbf/installer.toml]
+      --database <DATABASE>
+          Restore into this database instead, for a restore test: a bare NAME (a database on the server and socket installer.toml names, for the role it names) or a URL with no password
+      --pg-restore <PG_RESTORE>
+          The `pg_restore` program (a name looked up in PATH, or a path) [default: pg_restore]
+  -h, --help
+          Print help
+
+=== kbf-installer proxy --help ===
+Serve the frontend host's public port: route each stream to the active child frontend
+
+Usage: kbf-installer proxy [OPTIONS]
+
+Options:
+      --config <CONFIG>          The installer.toml whose `[proxy]` table configures the proxy (default: the platform's, `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac)
+      --json                     Print the result as one JSON object on standard output
+      --apply                    Do what the verb says. Without it a mutating verb is a dry run
+      --orders-dir <ORDERS_DIR>  The order spool the update API writes and the root half reads: owned by the service user. As `run --orders-dir` [default: /var/lib/kbf-installer/orders]
+      --check                    Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
+      --update-dir <UPDATE_DIR>  Root's directory: the proxy reads `status.json` here, to start the installed release when no frontend child is running, and the update API reads its status. As `run --update-dir` [default: /var/lib/kbf-installer]
+  -h, --help                     Print help
+

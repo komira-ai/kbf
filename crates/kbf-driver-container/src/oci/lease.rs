@@ -1,17 +1,16 @@
-//! [`Backend`] for [`Oci`]: what the lease code asks of a runtime, answered with a
-//! bundle, `crun run` and helper containers.
+//! What the lease code asks of [`Oci`], answered with a bundle, `crun run` and helper
+//! containers: whether the image is usable, who may write the lease's directories,
+//! making and starting the container, how it ended, signalling it, removing what it left.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
-use kbf_daemon::cache::Disabled;
-
 use super::crun::{RunEnd, log_path};
-use super::{JobError, Mapping, Oci, at, helper, spec};
-use crate::backend::{Backend, Dirs, Run, Running};
+use super::{JobError, Mapping, Oci, at, helper, init, spec};
+use crate::container::{CONTAINER_OWNER, ContainerSpec, Dirs, Ended};
 use crate::image::{ImageCheckError, ImageRef};
-use crate::podman::{CONTAINER_OWNER, ContainerSpec, Ended};
-use crate::program::{Said, crun_words};
+use crate::program::{Said, crun_words, init_words};
+use crate::running::Running;
 
 /// The mode of the lease directory and of the small files in it the container reads:
 /// the container's ids are not the daemon user's, so they reach them as "others".
@@ -20,6 +19,16 @@ const OPEN_FILE: u32 = 0o644;
 
 /// The `hosts` file of every action's container: loopback only, as `--network=none`.
 const HOSTS: &str = "127.0.0.1 localhost\n::1 localhost\n";
+
+/// The `resolv.conf` of every action's container: the one nameserver a namespace with
+/// loopback only has, 127.0.0.1, which nothing listens on. A name that is not in `hosts`
+/// then fails at once with a refused query, which glibc reports as `EAI_AGAIN` (a
+/// transient failure, as a node without a reachable resolver gives), never as `EAI_NONAME`
+/// (no such host) and never as a wait for a timeout. glibc fails at once on the refused
+/// query; musl sends on an unconnected socket and would wait out its default 5 s twice per
+/// lookup, which `timeout:1 attempts:1` bounds. The image's own file, if it ships one, is
+/// covered.
+pub(crate) const RESOLV_CONF: &str = "nameserver 127.0.0.1\noptions timeout:1 attempts:1\n";
 
 /// Writes `bytes` to `path`, readable by others.
 async fn write_open(path: &Path, bytes: &[u8]) -> Result<(), JobError> {
@@ -59,8 +68,8 @@ impl Oci {
         self.run_jobs("give", Mapping::Setup, &[job]).await
     }
 
-    /// Writes the bundle of `spec`: `config.json` and the `hosts` and `hostname` files it
-    /// binds.
+    /// Writes the bundle of `spec`: `config.json` and the `hosts`, `hostname` and `resolv.conf`
+    /// files it binds.
     async fn write_bundle(&self, spec: &ContainerSpec) -> Result<(), JobError> {
         open_dir(&spec.dir).await?;
         let etc = spec.dir.join("etc");
@@ -68,12 +77,14 @@ impl Oci {
         write_open(&etc.join("hosts"), HOSTS.as_bytes()).await?;
         let hostname = format!("{}\n", spec::HOSTNAME);
         write_open(&etc.join("hostname"), hostname.as_bytes()).await?;
+        write_open(&etc.join("resolv.conf"), RESOLV_CONF.as_bytes()).await?;
         let rootfs = self.images.rootfs_of(&spec.image_digest);
         let placement = spec::Placement {
             rootfs: &rootfs,
             cgroup: &spec.cgroup_parent,
             ids: &self.ids,
             arch: self.arch,
+            init: &self.init,
         };
         let bytes = spec::render(&spec::action_config(spec, &placement)?)?;
         let bundle = spec.dir.join("bundle");
@@ -83,32 +94,26 @@ impl Oci {
     }
 }
 
-impl Backend for Oci {
+impl Oci {
     /// The image is unpacked, once per digest and off the action path; a lease finds it
     /// there with one `stat`.
-    async fn check_pinned(&self, image: &ImageRef) -> Result<(), ImageCheckError> {
+    pub(crate) async fn check_pinned(&self, image: &ImageRef) -> Result<(), ImageCheckError> {
         self.images.ensure(self, image).await
-    }
-
-    /// The overlay is the kernel's, mounted by `crun`: nothing of Podman's storage is
-    /// involved.
-    fn cache_usable(&self) -> Result<(), Disabled> {
-        Ok(())
     }
 
     /// One helper container runs this daemon's `__chown-dirs` mode over the directories
     /// (the lease's `rw` directory, which holds `/tmp` and the other places the action
     /// writes, among them).
-    async fn give(&self, owner: &str, dirs: &Dirs<'_>) -> Result<(), String> {
+    pub(crate) async fn give(&self, owner: &str, dirs: &Dirs<'_>) -> Result<(), String> {
         Ok(self.hand_over(owner, dirs).await?)
     }
 
-    async fn create(&self, spec: &ContainerSpec) -> Result<(), String> {
+    pub(crate) async fn create(&self, spec: &ContainerSpec) -> Result<(), String> {
         Ok(self.write_bundle(spec).await?)
     }
 
     /// `crun run` on a thread of its own; it ends when the container does.
-    fn start(
+    pub(crate) fn start(
         &self,
         spec: &ContainerSpec,
         stdout: std::fs::File,
@@ -118,23 +123,27 @@ impl Backend for Oci {
         let (dir, name) = (spec.dir.clone(), spec.name.clone());
         let bundle = dir.join("bundle");
         let thread = format!("crun-{name}");
-        let run = async move { crun.run(&dir, &name, &bundle, stdout, stderr).await };
-        Run::spawn(thread, run).map(Running::Run)
+        // The init's stdin: where it says why the program could not be started.
+        let report = init::create_report(&dir)?;
+        let run = async move { crun.run(&dir, &name, &bundle, report, stdout, stderr).await };
+        Running::spawn(thread, run)
     }
 
     /// `crun run`'s exit status is the action's, unless `crun` itself failed: told by an
     /// error record in its log.
-    async fn ended(
+    pub(crate) async fn ended(
         &self,
         spec: &ContainerSpec,
         running: &Running,
-        _stderr: &Path,
     ) -> Result<Ended, String> {
         match running.run_end() {
             RunEnd::Exited(0) => Ok(Ended::Exited(0)),
             RunEnd::Exited(code) => {
                 let log = tokio::fs::read_to_string(log_path(&spec.dir)).await;
-                if crun_words(&log.unwrap_or_default()).is_empty() {
+                let report = tokio::fs::read_to_string(init::report_path(&spec.dir)).await;
+                if crun_words(&log.unwrap_or_default()).is_empty()
+                    && init_words(&report.unwrap_or_default()).is_empty()
+                {
                     Ok(Ended::Exited(code))
                 } else {
                     Ok(Ended::NotRun(format!("exited {code}")))
@@ -144,11 +153,11 @@ impl Backend for Oci {
         }
     }
 
-    fn said(&self, spec: &ContainerSpec, stderr: &Path) -> Said {
-        Said::crun(&log_path(&spec.dir), stderr)
+    pub(crate) fn said(&self, spec: &ContainerSpec, stderr: &Path) -> Said {
+        Said::crun(&log_path(&spec.dir), stderr).with_report(&init::report_path(&spec.dir))
     }
 
-    async fn terminate(&self, name: &str) -> Result<(), String> {
+    pub(crate) async fn terminate(&self, name: &str) -> Result<(), String> {
         self.crun.kill(&self.lease(name), name, 15).await
     }
 
@@ -156,17 +165,11 @@ impl Backend for Oci {
     /// its container as it exits), and the removal of the container, its cgroup and
     /// its state when it did not. Always run rather than guessed from the state
     /// directory's layout, which is `crun`'s to change.
-    fn remove(&self, name: &str) -> Result<(), String> {
+    pub(crate) fn remove(&self, name: &str) -> Result<(), String> {
         self.crun.delete_blocking(&self.lease(name), name)
     }
 
-    fn remove_dir(&self, dir: &Path) -> Result<(), String> {
+    pub(crate) fn remove_dir(&self, dir: &Path) -> Result<(), String> {
         Ok(self.remove_dir_blocking(dir)?)
-    }
-
-    /// Nothing: a lease's `crun` state is inside its scratch directory, which the
-    /// driver's sweep lists.
-    fn owned(&self, _owner: &str) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
     }
 }

@@ -1,0 +1,62 @@
+//! `kbf.worker.v1.Segments`: the handlers of [`crate::Storage::segments`], each call
+//! admitted first.
+
+use kbf_proto::worker::segments_server::Segments;
+use kbf_proto::worker::{
+    BeginRequest, BeginResponse, CommitRequest, CommitResponse, LocateRequest, LocateResponse,
+    PutRangeRequest, PutRangeResponse, ReadRangeRequest, ReadRangeResponse,
+};
+use tonic::{Request, Response, Status};
+
+use super::{Endpoint, StorageService, generation};
+
+#[tonic::async_trait]
+impl Segments for StorageService {
+    async fn begin(
+        &self,
+        request: Request<BeginRequest>,
+    ) -> Result<Response<BeginResponse>, Status> {
+        self.guard(&request, Endpoint::Segments)?;
+        // Counted while it waits for the map, as a write is; the store's own count of the
+        // upload (from its `Begin`, for as long as the upload lives) takes over from it.
+        let _open = self.open_writes.begin();
+        self.check_map(generation::requested(&request)?).await?;
+        self.segments.begin(request).await
+    }
+
+    async fn put_range(
+        &self,
+        request: Request<PutRangeRequest>,
+    ) -> Result<Response<PutRangeResponse>, Status> {
+        self.guard(&request, Endpoint::Segments)?;
+        self.check_map(generation::requested(&request)?).await?;
+        self.segments.put_range(request).await
+    }
+
+    async fn commit(
+        &self,
+        request: Request<CommitRequest>,
+    ) -> Result<Response<CommitResponse>, Status> {
+        self.guard(&request, Endpoint::Segments)?;
+        self.check_map(generation::requested(&request)?).await?;
+        self.segments.commit(request).await
+    }
+
+    async fn locate(
+        &self,
+        request: Request<LocateRequest>,
+    ) -> Result<Response<LocateResponse>, Status> {
+        self.guard(&request, Endpoint::Segments)?;
+        self.check_map(generation::requested(&request)?).await?;
+        self.segments.locate(request).await
+    }
+
+    async fn read_range(
+        &self,
+        request: Request<ReadRangeRequest>,
+    ) -> Result<Response<ReadRangeResponse>, Status> {
+        self.guard(&request, Endpoint::Segments)?;
+        self.check_map(generation::requested(&request)?).await?;
+        self.segments.read_range(request).await
+    }
+}

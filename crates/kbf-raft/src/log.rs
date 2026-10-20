@@ -74,10 +74,6 @@ impl Log {
         self.offset(index).map(|i| self.entries[i].id.term)
     }
 
-    pub(crate) fn entry(&self, index: LogIndex) -> Option<&Entry> {
-        self.offset(index).map(|i| &self.entries[i])
-    }
-
     /// Up to `max` entries starting at `from`.
     pub(crate) fn slice(&self, from: LogIndex, max: usize) -> Vec<Entry> {
         match self.offset(from) {
@@ -127,7 +123,7 @@ mod tests {
         log.truncate_from(LogIndex(2));
         assert_eq!(log.last_id(), LogId::new(Term(1), LogIndex(1)));
         log.push(e(4, 2));
-        assert_eq!(log.entry(LogIndex(2)), Some(&e(4, 2)));
+        assert_eq!(log.slice(LogIndex(2), 1), vec![e(4, 2)]);
     }
 
     /// Catches: restoring a log with a gap, a repeated index or a falling term, which
@@ -159,8 +155,7 @@ mod tests {
         assert_eq!(log.base(), base);
         assert_eq!(log.term_at(LogIndex(10)), Some(Term(3)));
         assert_eq!(log.term_at(LogIndex(9)), None);
-        assert_eq!(log.entry(LogIndex(10)), None);
-        assert_eq!(log.entry(LogIndex(11)), Some(&e(3, 11)));
+        assert_eq!(log.slice(LogIndex(11), 1), vec![e(3, 11)]);
         assert!(log.slice(LogIndex(10), 9).is_empty());
         assert_eq!(log.slice(LogIndex(11), 9), vec![e(3, 11), e(4, 12)]);
         log.truncate_from(LogIndex(10));

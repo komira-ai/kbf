@@ -17,13 +17,13 @@ use kbf_proto::reapi::platform::Property;
 use kbf_proto::reapi::{
     Action, ActionResult, Command, Digest, Directory, ExecuteRequest, Platform,
 };
-use kbf_server::{Api, Listeners, WorkerTls, bind_server_with_api};
+use kbf_server::{Api, Listeners, TlsSource, WorkerTls, bind_server_with_api};
 use kbf_transfer::{TransferConfig, Transfers};
 use prost::Message as _;
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tonic::transport::{Certificate, Channel, Endpoint, Identity, ServerTlsConfig};
+use tonic::transport::{Channel, Endpoint};
 
 use super::tests::{fake, scratch, surveyed};
 
@@ -36,33 +36,39 @@ use clap::Parser as _;
 /// How long the test waits for what should happen promptly.
 const PROMPT: Duration = Duration::from_secs(30);
 
-/// How long the daemon may take from its start to the server's Welcome. Its survey is
-/// held for 20 s, so a daemon that waits for it takes 20 s at least.
-const HELLO_WITHIN: Duration = Duration::from_secs(2);
+/// How long the first survey's `xcodebuild` stays held unless the test releases it:
+/// longer than [`PROMPT`], so a daemon that sends Hello only after its first survey
+/// cannot be welcomed within [`PROMPT`] and the test fails by order, not by a clock.
+const SURVEY_HELD_SECS: u32 = 120;
 
 /// A CA, a client certificate for node `mac-1` (`node.pem`, `node.key`: the server
-/// takes the node id from its one DNS name) and a server certificate for `localhost`,
-/// the client's files written into `dir`; returns the server's TLS.
-fn pki(dir: &Path) -> ServerTlsConfig {
+/// takes the node id from its one DNS name, and requires the daemon role) and a server
+/// certificate for `localhost`, the client's files written into `dir`; returns the
+/// server's TLS.
+fn pki(dir: &Path) -> TlsSource {
     let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
-    let leaf = |names: Vec<String>| {
+    let leaf = |names: Vec<String>, sans: Vec<rcgen::SanType>| {
         let key = KeyPair::generate().expect("key");
-        let cert = CertificateParams::new(names)
-            .expect("params")
-            .signed_by(&key, &ca)
-            .expect("sign");
+        let mut params = CertificateParams::new(names).expect("params");
+        params.subject_alt_names.extend(sans);
+        let cert = params.signed_by(&key, &ca).expect("sign");
         (cert.pem(), key.serialize_pem())
     };
-    let (node, node_key) = leaf(vec!["mac-1".to_owned()]);
+    let role = "urn:kbf:role:daemon".try_into().expect("an IA5 name");
+    let (node, node_key) = leaf(vec!["mac-1".to_owned()], vec![rcgen::SanType::URI(role)]);
     std::fs::write(dir.join("ca.pem"), ca.pem()).expect("write");
     std::fs::write(dir.join("node.pem"), node).expect("write");
     std::fs::write(dir.join("node.key"), node_key).expect("write");
-    let (server, server_key) = leaf(vec!["localhost".to_owned()]);
-    ServerTlsConfig::new()
-        .identity(Identity::from_pem(server, server_key))
-        .client_ca_root(Certificate::from_pem(ca.pem()))
+    let (server, server_key) = leaf(vec!["localhost".to_owned()], Vec::new());
+    TlsSource::fixed(
+        "worker",
+        server.as_bytes(),
+        server_key.as_bytes(),
+        Some(ca.pem().as_bytes()),
+    )
+    .expect("server TLS")
 }
 
 /// `GET /v1/nodes`, as JSON.
@@ -180,17 +186,22 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
         hello_wait: Duration::from_secs(2),
         tick: Duration::from_millis(50),
         unservable_wait: Duration::from_secs(300),
+        default_platform: kbf_front::DefaultPlatform::NONE,
         memory_ladder: kbf_server::MemoryLadder::default(),
         finished_retention: Duration::from_secs(60),
         shutdown_timeout: Duration::from_secs(10),
+        streams: kbf_server::StreamTiming::default(),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         segments: kbf_front::SegmentsConfig::DEFAULT,
-        streams: kbf_server::StreamLimits::DEFAULT,
+        stream_limits: kbf_server::StreamLimits::DEFAULT,
     };
     let api = Api {
         listen: loopback,
         token: None,
+        local_cache: None,
+        releases: None,
+        poll: None,
     };
     let cache = Arc::new(kbf_front::Cache::memory());
     let bound = bind_server_with_api(cache, listeners, Some(api), pending()).expect("bind");
@@ -200,7 +211,7 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     let go = dir.join("go");
     let apps = dir.join("Applications");
     let developer_dir = apps.join("Xcode_1.app/Contents/Developer");
-    let wait = format!("wait-for {} 20", go.display());
+    let wait = format!("wait-for {} {SURVEY_HELD_SECS}", go.display());
     fake(
         &developer_dir.join(kbf_driver_native::xcode::XCODEBUILD),
         &format!("-version\t-\t{wait} ; echo Build version 1A1\n*\t-\t{wait}\n"),
@@ -243,7 +254,6 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     let real_developer_dir = std::fs::canonicalize(&developer_dir).expect("real");
     config.xcodes = [("1A1".to_owned(), real_developer_dir.clone())].into();
 
-    let started = Instant::now();
     let (daemon, mut reports) = native_with(&cli, config, &xcrun).expect("the native daemon");
     let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(daemon.with_events(events).run(pending()));
@@ -259,9 +269,12 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     });
     let welcomed = welcomed.await;
     assert!(welcomed.is_ok(), "not welcomed: {before:#?}");
-    let hello = started.elapsed();
-    eprintln!("startup_tests: welcomed {hello:.2?} after the start, the survey held");
-    assert!(hello < HELLO_WITHIN, "Hello waited: {hello:?}");
+    // Order, not speed: the survey cannot answer before the test writes `go`, which it
+    // does only below, and the Welcome was awaited above. So a Welcome seen here came
+    // while the first survey was unfinished, however slow the machine was to get here;
+    // a daemon that sends Hello after its survey is never welcomed within PROMPT. The
+    // survey's state is read below through the API, which is polled (the daemon's first
+    // listing of the Xcodes is asynchronous, so reading it here would race).
 
     let software = software_until(api, |s| !s.is_null()).await;
     assert_eq!(

@@ -187,7 +187,7 @@ Why network-on waits: a NAT guest reaches whatever the host reaches, the host it
 and the rest of the farm's network included **[A]**. Keeping a guest off the farm's
 own services needs packet-filter rules on the host, which need root **[A]**, and
 guest-to-guest isolation is not designed either. The planned egress cache (draft PR
-[#192](https://github.com/komira-ai/komira-build-farm/pull/192)) is the natural way out
+[#192](https://github.com/komira-ai/kbf/pull/192)) is the natural way out
 for a UI test that needs a backend; network-on VM leases are designed with it, not
 before. Probe P3 records what a network-off guest has (expected: `lo0` only) and what a
 NAT guest can reach.
@@ -361,9 +361,9 @@ gives it **[V]**:
 
 The hosted macOS job (`native-macos`) runs `crates/kbf-vmm/tests/signing.rs` (ignored
 by default, run with `--ignored`): it signs the `kbf-vmm` stub with `sign-darwin`,
-which must apply the entitlement and pass, and a copy named `kbf-daemon`, which must
+which must apply the entitlement and pass, and a copy named `kbf`, which must
 pass with none; `darwin-asset` must accept both packaged. It then signs copies by hand
-and requires the check and `darwin-asset` to refuse each: `kbf-daemon` with the
+and requires the check and `darwin-asset` to refuse each: `kbf` with the
 virtualization entitlement, `kbf-mac-session` with `get-task-allow`, `kbf-vmm` with
 `get-task-allow` as well, `kbf-vmm` with none, `kbf-vmm` with `get-task-allow` in its
 place, and any binary when the list is missing (which `sign-darwin` must refuse

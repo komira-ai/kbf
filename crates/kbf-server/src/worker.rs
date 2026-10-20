@@ -33,7 +33,20 @@
 //!   the operator API. Otherwise it is kept as the node's newest software status,
 //!   unless a newer stream of the node has registered since;
 //! - after the server ends a stream, nothing more is read from it;
-//! - an `Offer` is not read yet.
+//! - a `MapRequest` is answered with a `MapUpdate` of the storage map the server holds
+//!   now, when it holds one (the `map_push` module);
+//! - an `UpdateStatus` the deny list now refuses ends the stream. Otherwise it is kept
+//!   as the node's newest update status, unless a newer stream of the node has
+//!   registered since ([`Farm::update_status`]); the operator API serves it
+//!   ([`crate::update_status`]);
+//! - an `Offer` from a daemon is not read: offers go the other way.
+//!
+//! A server given a [`MapSource`] ([`WorkerService::with_map`]) names its map in
+//! `Welcome`, and sends a `MapUpdate` each time the source's map changes. A server given
+//! [`Offers`] ([`WorkerService::with_offers`]) sends each node an `UpdateOffer` for its
+//! platform right after `Welcome` (when a complete release is desired for it) and again at
+//! each change; a node on a platform no release is built for is sent none. The platform is
+//! read from the first `Hello`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -41,8 +54,7 @@ use std::time::Duration;
 
 use futures::{Stream, stream};
 use kbf_caps::NodeCaps;
-use kbf_front::MetaLog;
-use kbf_objstore::ObjectStore;
+use kbf_mapsync::MapSource;
 use kbf_proto::worker::{
     Capability, DaemonMessage, HeartbeatAck, Hello, Phase, ServerMessage, Welcome, daemon_message,
     server_message, worker_server::Worker,
@@ -54,7 +66,9 @@ use tokio::time::timeout;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::farm::{Farm, Outbound, Reported, StreamId};
-use crate::identity::{PeerCert, Peers};
+use crate::identity::{PeerCert, Peers, presented};
+use crate::map_push::MapFeed;
+use crate::release::offers::{OfferFeed, Offers, platform_of};
 
 /// The `kbf.worker.v1` version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -63,21 +77,35 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// first, so there is no N-1 yet.
 pub const OLDEST_PROTOCOL_VERSION: u32 = 1;
 
+/// The protocol version a wire field names: `None` for 0. Versions start at 1, and
+/// proto3 cannot tell a 0 from a field the sender never set (a `Hello` or a storage
+/// registration from a build that predates the field, or a stored row written before
+/// the field existed), so a 0 is a node whose version is not known and not a node that
+/// speaks version 0.
+#[must_use]
+pub const fn named_protocol(wire: u32) -> Option<u32> {
+    if wire == 0 { None } else { Some(wire) }
+}
+
 /// The `Worker` service over a [`Farm`].
 #[derive(Debug)]
-pub struct WorkerService<M, O> {
-    farm: Arc<Farm<M, O>>,
+pub struct WorkerService {
+    farm: Arc<Farm>,
     peers: Peers,
     heartbeat_interval: Duration,
     hello_wait: Duration,
+    map: MapFeed,
+    offers: OfferFeed,
+    /// The oldest and the newest `Hello` version a session accepts.
+    protocols: (u32, u32),
 }
 
-impl<M, O> WorkerService<M, O> {
+impl WorkerService {
     /// The service over `farm`, knowing its daemons as `peers`. `Welcome` asks daemons
     /// for a heartbeat every `heartbeat_interval`; a stream that sends no `Hello` within
     /// `hello_wait` is ended DEADLINE_EXCEEDED.
     pub const fn new(
-        farm: Arc<Farm<M, O>>,
+        farm: Arc<Farm>,
         peers: Peers,
         heartbeat_interval: Duration,
         hello_wait: Duration,
@@ -87,7 +115,35 @@ impl<M, O> WorkerService<M, O> {
             peers,
             heartbeat_interval,
             hello_wait,
+            map: MapFeed::NONE,
+            offers: OfferFeed::NONE,
+            protocols: (OLDEST_PROTOCOL_VERSION, PROTOCOL_VERSION),
         }
+    }
+
+    /// The service accepting `Hello` versions from `oldest` and answering a newer one
+    /// with `newest`. Only a test of the negotiation needs a range other than this
+    /// build's: both are 1 today.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn with_protocols(mut self, oldest: u32, newest: u32) -> Self {
+        self.protocols = (oldest, newest);
+        self
+    }
+
+    /// The service sending the storage map `map` holds to each daemon: in `Welcome`, and
+    /// in a `MapUpdate` each time it changes.
+    #[must_use]
+    pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
+        self.map = MapFeed::new(map);
+        self
+    }
+
+    /// The service sending each node the `UpdateOffer` `offers` gives its platform.
+    #[must_use]
+    pub fn with_offers(mut self, offers: Arc<Offers>) -> Self {
+        self.offers = OfferFeed::new(offers);
+        self
     }
 }
 
@@ -95,20 +151,14 @@ impl<M, O> WorkerService<M, O> {
 pub type SessionStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send>>;
 
 #[tonic::async_trait]
-impl<M, O> Worker for WorkerService<M, O>
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+impl Worker for WorkerService {
     type SessionStream = SessionStream;
 
     async fn session(
         &self,
         request: Request<Streaming<DaemonMessage>>,
     ) -> Result<Response<SessionStream>, Status> {
-        let certs = request.peer_certs();
-        let leaf = certs.as_deref().and_then(|chain| chain.first());
-        let peer = self.peers.peer(leaf.map(AsRef::as_ref))?;
+        let peer = self.peers.peer_of(&presented(request.extensions()))?;
         let mut inbound = request.into_inner();
         let first = timeout(self.hello_wait, inbound.message())
             .await
@@ -118,29 +168,31 @@ where
                 "the first message of a session must be Hello",
             ));
         };
-        let version = hello.protocol_version;
-        if !(OLDEST_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
-            return Err(Status::failed_precondition(format!(
-                "protocol version {version} is not accepted; this server speaks \
-                 {OLDEST_PROTOCOL_VERSION} to {PROTOCOL_VERSION}"
-            )));
-        }
+        let (oldest, newest) = self.protocols;
+        let version = negotiate(hello.protocol_version, oldest, newest)?;
         if hello.node_id.is_empty() {
             return Err(Status::invalid_argument("Hello has no node_id"));
         }
         self.peers.admit(peer.as_ref(), &hello.node_id).await?;
-        let reported = reported(&hello).map_err(Status::invalid_argument)?;
+        let mut reported = reported(&hello).map_err(Status::invalid_argument)?;
+        // The stream speaks what `Welcome` names, which a newer daemon's `Hello` may exceed.
+        reported.protocol = Some(version);
         let worker = WorkerId::new(hello.node_id);
         let instance = DaemonInstance::new(hello.instance_id);
         let predecessor = DaemonInstance::new(hello.predecessor_instance_id);
+        // Subscribed before the map is read: a change between the two is sent again as a
+        // `MapUpdate`, never missed.
+        let changes = self.map.subscribe();
         let welcome = message(server_message::Message::Welcome(Welcome {
             protocol_version: version,
             heartbeat_interval_ms: u64::try_from(self.heartbeat_interval.as_millis())
                 .unwrap_or(u64::MAX),
             epoch: self.farm.lease_epoch(),
+            map: self.map.welcome_map(),
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;
+        let platform = platform_of(&reported.caps);
         let stream = self.farm.register(
             &worker,
             instance,
@@ -150,7 +202,11 @@ where
             welcome,
         );
         tracing::info!(%worker, ?capacity, "worker registered");
+        // After `register`, which queued the `Welcome`: the first update follows it.
+        self.map.push(changes, &outbound);
+        self.offers.push(platform, &outbound);
         let session = Session {
+            map: self.map.clone(),
             farm: Arc::clone(&self.farm),
             peers: self.peers.clone(),
             peer,
@@ -165,9 +221,30 @@ where
     }
 }
 
+/// The version a session speaks, which `Welcome` names: the lesser of `hello`, the
+/// version the `Hello` names, and `newest`, when `hello` is at least `oldest`.
+///
+/// A `Hello` in `oldest..=newest` is answered with its own version, which a daemon of
+/// that version requires (it checks that `Welcome` names the version it sent). A `Hello`
+/// above `newest` is a daemon newer than this server: it is answered with `newest`, and a
+/// daemon newer than this server must accept a `Welcome` below its own version (the daemon
+/// does, down to the oldest it speaks). A `Hello` below `oldest` is refused.
+///
+/// # Errors
+/// FAILED_PRECONDITION: `hello` is below `oldest`.
+fn negotiate(hello: u32, oldest: u32, newest: u32) -> Result<u32, Status> {
+    if hello < oldest {
+        return Err(Status::failed_precondition(format!(
+            "protocol version {hello} is not accepted; this server speaks {oldest} to {newest}"
+        )));
+    }
+    Ok(hello.min(newest))
+}
+
 /// One stream after its first `Hello`.
-struct Session<M, O> {
-    farm: Arc<Farm<M, O>>,
+struct Session {
+    map: MapFeed,
+    farm: Arc<Farm>,
     peers: Peers,
     /// The stream's client certificate (`None` in plain text).
     peer: Option<PeerCert>,
@@ -175,7 +252,7 @@ struct Session<M, O> {
     stream: StreamId,
 }
 
-impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
+impl Session {
     /// Handles the stream's messages until it ends, or one of them ends it.
     async fn serve(self, mut inbound: Streaming<DaemonMessage>, outbound: Outbound) {
         let worker = &self.worker;
@@ -266,6 +343,23 @@ impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
                 let _ = farm.node_status(worker, stream, status);
                 None
             }
+            Some(daemon_message::Message::MapRequest(_)) => {
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
+                self.map.answer()
+            }
+            Some(daemon_message::Message::UpdateStatus(status)) => {
+                // A revoked daemon's status must not reach the operator API either.
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
+                // Kept as the node's newest, unless a newer stream of the node has
+                // registered since.
+                let _ = farm.update_status(worker, stream, status);
+                None
+            }
+            // The frontend sends offers; one from a daemon is not read.
             Some(daemon_message::Message::Offer(_)) => None,
             None => {
                 tracing::warn!(%worker, "an empty daemon message ignored");
@@ -276,13 +370,14 @@ impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
     }
 }
 
-fn message(message: server_message::Message) -> ServerMessage {
+pub(crate) fn message(message: server_message::Message) -> ServerMessage {
     ServerMessage {
         message: Some(message),
     }
 }
 
-/// What a `Hello` reports: [`capacity`], [`caps`] and [`phase`].
+/// What a `Hello` reports: [`capacity`], [`caps`] and [`phase`], and the version it
+/// speaks ([`named_protocol`] of `protocol_version`).
 ///
 /// # Errors
 /// Any of the three is malformed.
@@ -291,6 +386,7 @@ pub fn reported(hello: &Hello) -> Result<Reported, String> {
         capacity: capacity(hello)?,
         caps: caps(hello)?,
         phase: phase(hello)?,
+        protocol: named_protocol(hello.protocol_version),
     })
 }
 
@@ -316,6 +412,7 @@ pub fn phase(hello: &Hello) -> Result<NodePhase, String> {
         Ok(Phase::Restoring) => NodePhase::Restoring(lease()?),
         Ok(Phase::Quarantined) => NodePhase::Quarantined(reported.reason.clone()),
         Ok(Phase::MemoryPressure) => NodePhase::MemoryPressure,
+        Ok(Phase::Draining) => NodePhase::Draining,
         Err(_) => NodePhase::Quarantined(format!(
             "the node reports phase {}, which this server does not know",
             reported.phase
@@ -372,4 +469,56 @@ fn entry(capabilities: &[Capability], key: &str) -> Result<Option<u64>, String> 
         })
     })
     .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::Code;
+
+    use super::{named_protocol, negotiate};
+
+    /// Catches: a wire 0 (a field its sender never set) taken for a version, so that a
+    /// node naming none would read as speaking version 0 and pull the oldest version of
+    /// a list down to it; and a version that is changed or dropped on the way.
+    #[test]
+    fn a_wire_zero_names_no_protocol_and_any_other_number_is_itself() {
+        assert_eq!(named_protocol(0), None);
+        assert_eq!(named_protocol(1), Some(1));
+        assert_eq!(named_protocol(u32::MAX), Some(u32::MAX));
+    }
+
+    /// Catches: a `Welcome` that names the server's newest version for a `Hello` in range
+    /// (the integration tests speak version 1 to a server of version 1, so they cannot
+    /// tell it from the `Hello`'s own: an older daemon requires its own version back);
+    /// the greater of the two for a `Hello` above the newest (a daemon newer than the
+    /// server would be told a version the server does not speak); that `Hello` refused,
+    /// as it was before; and an accepted range with the oldest bound moved out.
+    #[test]
+    fn a_hello_is_answered_with_the_lesser_of_its_version_and_the_newest() {
+        assert_eq!(negotiate(1, 1, 3).expect("the oldest"), 1);
+        assert_eq!(negotiate(2, 1, 3).expect("in range"), 2);
+        assert_eq!(negotiate(3, 1, 3).expect("the newest"), 3);
+        assert_eq!(negotiate(5, 1, 3).expect("newer than the server"), 3);
+        assert_eq!(negotiate(u32::MAX, 1, 3).expect("far newer"), 3);
+        assert_eq!(negotiate(1, 1, 1).expect("the only version"), 1);
+        assert_eq!(negotiate(2, 1, 1).expect("above the only version"), 1);
+    }
+
+    /// Catches: a version below the oldest accepted (the check dropped, or the bound
+    /// moved out by one), the wrong code, and a message that does not name the version
+    /// refused and the range the server speaks.
+    #[test]
+    fn a_hello_below_the_oldest_is_refused_naming_the_range() {
+        let status = negotiate(0, 1, 3).expect_err("below the oldest");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        let said = "protocol version 0 is not accepted";
+        assert!(status.message().contains(said), "{}", status.message());
+        assert!(status.message().contains("1 to 3"), "{}", status.message());
+        assert_eq!(
+            negotiate(1, 2, 3)
+                .expect_err("below a raised oldest")
+                .code(),
+            Code::FailedPrecondition
+        );
+    }
 }

@@ -69,3 +69,77 @@ fn other_drivers_and_cas_are_refused() {
         assert!(refused.to_string().contains(says), "{refused}");
     }
 }
+
+/// Catches an all-in-one that keeps no durable state when `--state-store` is left out
+/// (the scheduler would run in memory and a restart lose its queue), one whose default is
+/// still a SQLite file in the data directory, one that puts the default anywhere but the
+/// local Postgres socket whatever `--data-dir` says, and one that replaces a store the
+/// operator named.
+#[test]
+fn the_state_store_defaults_to_the_local_postgres_socket() {
+    let store = |extra: &[&str]| {
+        let given = [&["--driver=container"], extra].concat();
+        flags(&given).expect("flags").server.state_store
+    };
+    let local = Some(kbf_server::StateStoreUri::local_postgres());
+    assert_eq!(store(&[]), local);
+    assert_eq!(store(&["--data-dir=/srv/kbf"]), local);
+    assert_eq!(
+        store(&[
+            "--data-dir=/srv/kbf",
+            "--state-store=sqlite:///elsewhere/s.db"
+        ]),
+        Some(kbf_server::StateStoreUri::Sqlite("/elsewhere/s.db".into()))
+    );
+    assert_eq!(
+        store(&["--state-store=postgres:///other?host=/run/postgresql"]),
+        Some(
+            "postgres:///other?host=/run/postgresql"
+                .parse()
+                .expect("parses")
+        )
+    );
+}
+
+/// Catches an all-in-one that takes a Postgres URL with a password (the command line is
+/// world-readable) or one it cannot use, and a value of another kind.
+#[test]
+fn a_password_an_unusable_url_and_another_kind_of_value_are_refused() {
+    for (value, says) in [
+        (
+            "postgres://kbf:hunter2@db.example/kbf",
+            "must carry no password",
+        ),
+        ("postgres://", "needs a URL with a host"),
+        ("file:///x", "only postgres:///"),
+    ] {
+        let arg = format!("--state-store={value}");
+        let refused = flags(&["--driver=container", &arg]).expect_err(value);
+        let said = refused.to_string();
+        assert!(said.contains(says), "{value}: {said}");
+        assert!(!said.contains("hunter2"), "{value}: {said}");
+    }
+}
+
+/// Catches a refused `--state-store` that quotes its value back: clap echoes the value of
+/// a parser's refusal (`invalid value '...'`), the command line is world-readable, and
+/// the error goes to stderr and the journal. Each value holds a password in a form a
+/// mistyped URL takes: user information, no `://`, a scheme position, and a parameter.
+#[test]
+fn a_refused_state_store_never_echoes_its_value() {
+    for value in [
+        "postgres://kbf:hunter2@db/x",
+        "postgres:kbf:hunter2@db/x",
+        "postgres:kbf:hunter2@db://x",
+        "postgres://db/x?user=kbf&password=hunter2",
+        "sqlite://hunter2",
+    ] {
+        let arg = format!("--state-store={value}");
+        let refused = flags(&["--driver=container", &arg]).expect_err(value);
+        let said = refused.to_string();
+        for secret in ["hunter2", "kbf:", "kbf@", "password="] {
+            assert!(!said.contains(secret), "{value}: {said}");
+        }
+        assert!(said.contains("--state-store: "), "{value}: {said}");
+    }
+}

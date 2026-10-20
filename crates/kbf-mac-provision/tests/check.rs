@@ -42,6 +42,7 @@ fn a_fresh_mac_fails_every_item_apply_sets() {
             "updates_auto_install_security",
             "updates_config_data",
             "appstore_auto_update",
+            "xcode_disable_manifest_sandbox",
             "ssh_password_auth",
             "firewall",
             "time_server",
@@ -52,8 +53,8 @@ fn a_fresh_mac_fails_every_item_apply_sets() {
         "{}",
         r.text
     );
-    assert!(r.text.ends_with("check: 10 pass, 20 fail\n"), "{}", r.text);
-    assert_eq!(r.text.lines().count(), 31);
+    assert!(r.text.ends_with("check: 10 pass, 21 fail\n"), "{}", r.text);
+    assert_eq!(r.text.lines().count(), 32);
     assert_eq!(mac.writes(), Vec::<String>::new());
 }
 
@@ -65,7 +66,7 @@ fn a_converged_mac_passes_every_item() {
     let mac = FakeMac::converged("converged");
     let r = check(&mac);
     assert_eq!(r.failed, 0, "{}", r.text);
-    assert!(r.text.ends_with("check: 30 pass, 0 fail\n"), "{}", r.text);
+    assert!(r.text.ends_with("check: 31 pass, 0 fail\n"), "{}", r.text);
     for want in [
         "PASS updates_auto_download: AutomaticDownload = 0 (the SoftwareUpdate payload is removed in macOS 27",
         "PASS filevault: off",
@@ -99,6 +100,21 @@ fn the_job_renders_as_the_golden_property_list() {
         support::golden_plist(p.short_sha())
     );
     assert_eq!(kbf_mac_provision::launchd::plist_path(&p), PLIST);
+}
+
+/// Catches: a rendering defect in the node's `kbf.toml`: a key in the wrong table, a
+/// missing `mode` or `driver`, a label dropped or reordered, a value of another profile
+/// key. The golden is written by hand (`support/golden.rs`), not by the renderer.
+#[test]
+fn the_node_config_renders_as_the_golden_file() {
+    let mac = FakeMac::fresh("golden-config");
+    let text = mac.profile_text();
+    let p = kbf_mac_provision::profile::Profile::parse(text.as_bytes()).unwrap();
+    assert_eq!(
+        kbf_mac_provision::launchd::render_config(&p),
+        support::golden_config(p.short_sha())
+    );
+    assert_eq!(kbf_mac_provision::launchd::NODE_CONFIG, support::CONFIG);
 }
 
 /// Catches: entries that are not drift reported as drift: an images list beside the
