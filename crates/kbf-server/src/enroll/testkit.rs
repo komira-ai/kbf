@@ -2,9 +2,8 @@
 //! CA made in a scratch directory, the service over both), tokens, and certificate requests
 //! built the way a node builds them (and some it would not).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use kbf_ca::{CLOCK_FLOOR_UNIX, ISSUED_AT_OID, Policy, SystemEntropy};
@@ -12,6 +11,7 @@ use kbf_enroll_registry::{TokenSpec, create_token};
 use kbf_proto::kbf::enroll::v1 as pb;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
+use kbf_testkit::dir::TestDir;
 use kbf_types::{NodeId, Role, RoleSet, TokenId, TokenSecret};
 use rcgen::{Attribute, CertificateParams, DistinguishedName, KeyPair};
 
@@ -23,14 +23,47 @@ pub const START: i64 = CLOCK_FLOOR_UNIX + 86_400;
 /// The one name this test frontend serves.
 pub const FRONTEND: &str = "front.test";
 
-/// A scratch directory no other test uses (a path that does not exist yet).
-pub fn scratch(name: &str) -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    std::env::temp_dir().join(format!(
-        "kbf-enroll-svc-{}-{}-{name}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
+/// A path no other test uses and nothing has made yet (a CA directory must be made by
+/// the code under test, with its own mode), inside a directory removed when this drops.
+pub struct Scratch {
+    path: PathBuf,
+    /// Last: the parent outlives every use of `path`.
+    _root: TestDir,
+}
+
+impl Scratch {
+    /// A fresh path inside a new test directory under `root`.
+    pub fn under(root: impl AsRef<Path>, name: &str) -> Self {
+        Self::of(TestDir::under(root, name))
+    }
+
+    fn of(root: TestDir) -> Self {
+        Self {
+            path: root.join("d"),
+            _root: root,
+        }
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// A scratch path beside the unit test binary, removed with its parent on drop.
+pub fn scratch(name: &str) -> Scratch {
+    Scratch::of(crate::test_dir::scratch_dir(&format!(
+        "kbf-enroll-svc-{name}"
+    )))
 }
 
 /// A state store, a CA and the service over them.
@@ -39,6 +72,8 @@ pub struct Farm {
     pub store: Arc<dyn Store>,
     pub ca: Arc<Ca>,
     pub service: EnrollService,
+    /// The CA directory; last so it is removed after everything that used it.
+    _dir: Scratch,
 }
 
 /// A farm whose store clock reads `start` (unix seconds) and whose CA, made in a new
@@ -65,6 +100,7 @@ pub fn farm_at(name: &str, start: i64) -> Farm {
         store,
         ca,
         service,
+        _dir: dir,
     }
 }
 
@@ -124,12 +160,10 @@ pub fn register_cold(farm: &Farm) -> u64 {
     use kbf_types::object_store_api::{
         BindingPut, BindingRole, ConnectionName, ConnectionPut, Secret,
     };
-    let registry = Registry::open(
-        Arc::clone(&farm.store),
-        &scratch("registry-secrets"),
-        Arc::new(super::OsRandom),
-    )
-    .expect("a registry");
+    // Held to the end: the registry writes its secret files here.
+    let secrets = scratch("registry-secrets");
+    let registry = Registry::open(Arc::clone(&farm.store), &secrets, Arc::new(super::OsRandom))
+        .expect("a registry");
     let name: ConnectionName = "cold".parse().expect("a name");
     registry
         .put_connection(

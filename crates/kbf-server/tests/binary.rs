@@ -9,15 +9,42 @@ use std::time::{Duration, Instant};
 
 use kbf_proto::reapi::GetCapabilitiesRequest;
 use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
+use kbf_testkit::dir::TestDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-server");
 const ANY_PORT: [&str; 4] = ["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"];
 /// How long a test waits for the server to print its start line or to exit.
 const BOUND: Duration = Duration::from_secs(10);
 
+/// A server command, and the directory of the default stores [`server`] made for it, which
+/// lives as long as the command and the [`Running`] made from it.
+struct Cmd {
+    cmd: Command,
+    dir: Option<TestDir>,
+}
+
+impl std::ops::Deref for Cmd {
+    type Target = Command;
+
+    fn deref(&self) -> &Command {
+        &self.cmd
+    }
+}
+
+impl std::ops::DerefMut for Cmd {
+    fn deref_mut(&mut self) -> &mut Command {
+        &mut self.cmd
+    }
+}
+
 /// A running server, killed and reaped when dropped, so a failed assertion (or a wait
-/// that ran out) never leaves it running or hangs the test.
-struct Running(Child);
+/// that ran out) never leaves it running or hangs the test. The directory, if any, is
+/// removed after the server is gone (a field drops after the `Drop` body has run).
+struct Running(
+    Child,
+    // Held only to be dropped after the server is gone, which removes its directory.
+    #[allow(dead_code)] Option<TestDir>,
+);
 
 impl Running {
     fn pid(&self) -> i32 {
@@ -67,35 +94,39 @@ fn first_line(what: &str, out: impl Read + Send + 'static) -> String {
 }
 
 /// The server with exactly `args`.
-fn bare(args: &[&str]) -> Command {
-    let mut c = Command::new(BIN);
-    c.args(args)
+fn bare(args: &[&str]) -> Cmd {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args)
         .env_remove("AWS_ACCESS_KEY_ID")
         .env_remove("AWS_SECRET_ACCESS_KEY");
-    c
+    Cmd { cmd, dir: None }
 }
 
 /// The server with `args`, over a `file://` cold store and metadata directory of its own
 /// (in a fresh directory under the target directory) unless `args` name a cold store:
 /// every start needs one, and most tests are about something else.
-fn server(args: &[&str]) -> Command {
+fn server(args: &[&str]) -> Cmd {
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(0);
     if args.contains(&"--cold-store") {
         return bare(args);
     }
-    let base = fresh_dir(&format!(
-        "default-stores-{}",
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let base = TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!(
+            "kbf-server-default-stores-{}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ),
+    );
     let cold = format!("file://{}", base.join("cold").display());
     let mut c = bare(args);
     c.args(["--cold-store", &cold, "--meta-dir"])
         .arg(base.join("meta"));
+    c.dir = Some(base);
     c
 }
 
-fn with_keys(mut c: Command) -> Command {
+fn with_keys(mut c: Cmd) -> Cmd {
     c.env("AWS_ACCESS_KEY_ID", "kbf-test-access")
         .env("AWS_SECRET_ACCESS_KEY", "kbf-test-secret");
     c
@@ -104,12 +135,13 @@ fn with_keys(mut c: Command) -> Command {
 /// Runs to exit and returns the exit code and stderr. A server that is still running
 /// after `BOUND` (it started when it should have refused) is killed and reaped, and
 /// the test fails.
-fn fails(mut c: Command) -> (Option<i32>, String) {
+fn fails(mut c: Cmd) -> (Option<i32>, String) {
     let mut child = Running(
         c.stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn kbf-server"),
+        c.dir.take(),
     );
     let deadline = Instant::now() + BOUND;
     let status = loop {
@@ -129,12 +161,13 @@ fn fails(mut c: Command) -> (Option<i32>, String) {
 }
 
 /// Starts the server, reads its start line, and returns it with the REAPI address.
-fn started(mut c: Command) -> (Running, String, SocketAddr) {
+fn started(mut c: Cmd) -> (Running, String, SocketAddr) {
     let mut child = Running(
         c.stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn kbf-server"),
+        c.dir.take(),
     );
     let line = first_line("start", child.0.stdout.take().expect("stdout"));
     let reapi = line
@@ -247,7 +280,7 @@ fn thread_flags_size_the_runtime_and_are_logged() {
     c.args(ANY_PORT)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = Running(c.spawn().expect("spawn kbf-server"));
+    let mut child = Running(c.spawn().expect("spawn kbf-server"), None);
     first_line("start", child.0.stdout.take().expect("stdout"));
     // A thread carries its name only once it has run its first instructions, which can
     // be after the start line: wait for the count (up to 10 s) rather than read it once.
@@ -292,7 +325,7 @@ fn the_server_uses_every_cpu_and_refuses_a_reserve() {
     c.args(ANY_PORT)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = Running(c.spawn().expect("spawn kbf-server"));
+    let mut child = Running(c.spawn().expect("spawn kbf-server"), None);
     first_line("start", child.0.stdout.take().expect("stdout"));
     let mut stderr = child.0.stderr.take().expect("stderr");
     interrupt(child);
@@ -308,7 +341,7 @@ fn the_server_uses_every_cpu_and_refuses_a_reserve() {
         c.args(ANY_PORT)
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let mut child = Running(c.spawn().expect("spawn kbf-server"));
+        let mut child = Running(c.spawn().expect("spawn kbf-server"), None);
         let status = child.exit_status(flag);
         assert_eq!(status.code(), Some(2), "{flag}");
         let mut stderr = String::new();
@@ -351,16 +384,10 @@ fn api_listen_serves_the_operator_api() {
     interrupt(child);
 }
 
-/// A token file holding `content` with `mode`, under `name`.
+/// A token file holding `content` with `mode`, in a directory of its own named for `name`.
 #[cfg(unix)]
-fn token_file(name: &str, content: &str, mode: u32) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-binary");
-    std::fs::create_dir_all(&dir).expect("a token directory");
-    let path = dir.join(format!("{name}-{}", std::process::id()));
-    std::fs::write(&path, content).expect("write the token");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-    path
+fn token_file(name: &str, content: &str, mode: u32) -> Owned {
+    file_in_fresh_dir(name, content, mode)
 }
 
 /// One POST to `api` with `headers`; the response.
@@ -434,21 +461,23 @@ fn an_unsafe_api_token_file_stops_the_start() {
 #[cfg(target_os = "linux")]
 #[test]
 fn sigint_is_caught_before_the_start_line_is_printed() {
-    let file = file_server(&fresh_dir("sigint-file"));
-    let s3 = raft_server(&fresh_dir("sigint-s3"));
+    let (file_dir, s3_dir) = (fresh_dir("sigint-file"), fresh_dir("sigint-s3"));
+    let file = file_server(&file_dir);
+    let s3 = raft_server(&s3_dir);
     for (mode, c) in [("file", file), ("s3", s3)] {
         held_at_the_start_line_then_interrupted(mode, c);
     }
 }
 
 #[cfg(target_os = "linux")]
-fn held_at_the_start_line_then_interrupted(mode: &str, mut c: Command) {
+fn held_at_the_start_line_then_interrupted(mode: &str, mut c: Cmd) {
     let (stdout, full) = full_pipe();
     let mut child = Running(
         c.stdout(full)
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn kbf-server"),
+        c.dir.take(),
     );
     drop(c); // the server now holds the only write end
     let pid = child.pid();
@@ -576,13 +605,57 @@ fn s3_mode_refuses_what_is_missing_or_wrong() {
     }
 }
 
-/// A fresh, absent directory for `name`, under the target directory.
-fn fresh_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-server-binary")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A path in a directory of its own, removed with it when this drops.
+#[derive(Debug)]
+struct Owned {
+    path: std::path::PathBuf,
+    _dir: TestDir,
+}
+
+impl std::ops::Deref for Owned {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for Owned {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
+impl AsRef<std::path::Path> for Owned {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+/// A fresh, absent directory for `name`, under the target directory, removed (with
+/// whatever the server made in it) when it drops.
+fn fresh_dir(name: &str) -> Owned {
+    let dir = TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-binary-{name}"),
+    );
+    Owned {
+        path: dir.join("d"),
+        _dir: dir,
+    }
+}
+
+/// A file in a directory of its own, removed with it when this drops.
+fn file_in_fresh_dir(name: &str, content: &str, mode: u32) -> Owned {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TestDir::under(
+        env!("CARGO_TARGET_TMPDIR"),
+        &format!("kbf-server-binary-{name}"),
+    );
+    let path = dir.join("file");
+    std::fs::write(&path, content).expect("write the file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    Owned { path, _dir: dir }
 }
 
 /// The `--cold-store` URI of an S3 store that does no I/O until used (nothing listens
@@ -591,7 +664,7 @@ const IDLE_S3: &str = "s3://kbf-test?endpoint=http://127.0.0.1:9";
 
 /// A server over a `file://` cold store in `base/cold` with its metadata log in
 /// `base/meta`, on any port.
-fn file_server(base: &std::path::Path) -> Command {
+fn file_server(base: &std::path::Path) -> Cmd {
     let cold = format!("file://{}", base.join("cold").display());
     let mut c = server(&["--cold-store", &cold, "--meta-dir"]);
     c.arg(base.join("meta")).args(ANY_PORT);
@@ -600,12 +673,12 @@ fn file_server(base: &std::path::Path) -> Command {
 
 /// An `s3://` cold store that does no I/O until used, with its metadata log in `dir`
 /// (the store does no I/O until used).
-fn raft_server(dir: &std::path::Path) -> Command {
+fn raft_server(dir: &std::path::Path) -> Cmd {
     raft_server_on(dir, &ANY_PORT)
 }
 
 /// [`raft_server`] with the listener flags `listen` instead of [`ANY_PORT`].
-fn raft_server_on(dir: &std::path::Path, listen: &[&str]) -> Command {
+fn raft_server_on(dir: &std::path::Path, listen: &[&str]) -> Cmd {
     let mut c = with_keys(server(&["--cold-store", IDLE_S3, "--meta-dir"]));
     c.arg(dir).args(listen);
     c
@@ -730,9 +803,9 @@ fn a_hot_store_attaches_a_tier_and_holds_the_metadata_log() {
 #[cfg(unix)]
 #[test]
 fn the_start_logs_every_resolved_store_path_and_budget() {
-    let log_of = |mut c: Command| {
+    let log_of = |mut c: Cmd| {
         c.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = Running(c.spawn().expect("spawn kbf-server"));
+        let mut child = Running(c.spawn().expect("spawn kbf-server"), None);
         first_line("start", child.0.stdout.take().expect("stdout"));
         let mut stderr = child.0.stderr.take().expect("stderr");
         interrupt(child);
@@ -936,7 +1009,8 @@ fn a_plain_text_listener_off_loopback_starts_and_serves_with_one_warning() {
 #[test]
 fn a_raft_start_line_names_the_log_then_the_plain_text_warning() {
     let listen = ["--listen", "127.0.0.1:0", "--worker-listen", "0.0.0.0:0"];
-    let c = raft_server_on(&fresh_dir("raft-plain-text"), &listen);
+    let dir = fresh_dir("raft-plain-text");
+    let c = raft_server_on(&dir, &listen);
     let (child, line, _) = started(c);
     let id = log_id(&line);
     let want = format!(" log={id} warning=plaintext-off-loopback:worker");
@@ -1048,11 +1122,10 @@ fn a_storage_flag_that_is_not_a_url_stops_the_start() {
 #[cfg(unix)]
 #[test]
 fn the_reapi_auth_policy_flag_is_read_at_start() {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-server-binary");
-    std::fs::create_dir_all(&dir).expect("a policy directory");
-    let bad = dir.join(format!("bad-policy-{}.json", std::process::id()));
+    let dir = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "kbf-server-binary-policy");
+    let bad = dir.join("bad-policy.json");
     std::fs::write(&bad, r#"{"authenticationPolicy": {"jwt": {}}}"#).expect("write");
-    let deny = dir.join(format!("deny-policy-{}.json", std::process::id()));
+    let deny = dir.join("deny-policy.json");
     std::fs::write(&deny, r#"{"authenticationPolicy": {"deny": "closed"}}"#).expect("write");
 
     let mut c = server(&ANY_PORT);
