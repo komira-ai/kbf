@@ -169,6 +169,7 @@ placement, and, after the list, the oldest protocol version among them:
 | `node_id` | the id its daemon registered with |
 | `connected` | whether its newest stream is still open |
 | `protocol` | the `kbf.worker.v1` version the `Welcome` that answered the `Hello` opening its newest stream named: the lesser of the `Hello`'s version and the newest the server speaks, so a daemon whose `Hello` names 5 against a server speaking 3 shows 3 ([worker-protocol.md](design/worker-protocol.md)); `null` if no version is known (a `Hello` naming 0, which is not a version, from a server that accepts it). A `Hello` resent on the stream does not change it, and a node that returns on another version shows the new one. It stays after the stream closes: it is the version the node last spoke |
+| `blocked_on` | only on a `joining` member, only when the frontend runs with `--auto-promote`: a list of sentences saying what holds its automatic promotion back (a member that has not flushed, a tail epoch not acknowledged, a member down, the settle time). Absent otherwise; an empty answer for a joiner means only its next beat or the next sweep is owed |
 | `oldest_protocol` | the least `protocol` among the listed nodes whose `protocol` is not `null`, connected or not (a node whose stream closed may return on the version it last spoke); `null` if no listed node names one. Nodes that name none are not in it |
 | `protocol_unknown` | how many listed nodes have a `null` `protocol`. They are never counted in `oldest_protocol`, so `oldest_protocol` says "every node but these speaks at least this": a reader that needs every node reads it with `protocol_unknown` equal to 0 |
 | `software` | the newest `NodeStatus` it sent ([worker-protocol.md](design/worker-protocol.md#nodestatus)); `null` from a daemon that predates it. An empty string or list is a value the node could not read |
@@ -223,8 +224,10 @@ The registration is judged against the map's floor once, when it is made
 named, and nothing judges it again.
 
 A node that registers for the first time in a farm formed more than a minute ago is
-`joining` until the operator promotes it with `POST /v1/members/{id}`; the server does not
-promote on its own, so a script that waits for `active` waits for that. A server without a state store keeps no members and answers `404`; a state
+`joining` until the operator promotes it with `POST /v1/members/{id}`; unless the frontend runs
+with `--auto-promote` (off by default) the server does not promote on its own, so a script that
+waits for `active` waits for that. With it, the joiner's own heartbeat promotes it once it is
+filled (`docs/design/rebalance-handoff.md`), and `POST` stays the override. A server without a state store keeps no members and answers `404`; a state
 store that cannot be read answers `503`. The view reads the map and then the member rows
 (for `protocol`), so a stored map or a stored member row that does not decode answers
 `500` for the whole view, not a list without that member's version: the store is up and
@@ -1209,6 +1212,14 @@ could not keep. Without the flag these families are absent and nothing is record
 | `kbf_history_pending_rows` | gauge | index rows the writer has not applied yet |
 | `kbf_history_open_invocations` | gauge | invocations the writer holds state for |
 
+The release poller (`--release-poll-every-secs`, on the active frontend) adds these families
+while it runs; without it they are absent.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_release_poll_polls_total`, `kbf_release_poll_not_modified_total`, `kbf_release_poll_proposals_total`, `kbf_release_poll_errors_total` | counter | the release poller's polls begun, polls answered "not modified", proposals written and polls that failed (the request, the feed or the update rows); present only when the poller runs |
+| `kbf_release_poll_ignored_total{reason}` | counter | feed entries that were not candidates, by the first reason met: `malformed`, `draft`, `prerelease`, `not_version_tag`, `no_commit`, `ref_not_allowed`, `no_checksums`, `unattested` |
+
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and
 `GET /v1/nodes`). `kbf_sched_queued` low while buck2 has many Executes open means they have not
@@ -1787,7 +1798,14 @@ row of the state store. Without `--state-store` every answer is `503` naming it;
 for the whole of its retries is `503` with `Retry-After: 1`: send it again.
 
 - `GET /v1/update` is open: `{"desired": null | {"generation", "commit", "set_at_ms"},
-  "paused": bool, "policy": null | {...}, "releases": <the body of GET /v1/releases>}`. `policy`
+  "paused": bool, "policy": null | {...}, "proposals": [...], "releases": <the body of GET /v1/releases>}`.
+  `proposals` are the releases the release poller found (`--release-poll-every-secs`), oldest
+  first, each `{"commit", "tag", "published_at_secs", "proposed_at_ms"}`: the newest published
+  GitHub release of a `v*` tag whose notes name an allowed ref and a commit and that lists
+  `SHA256SUMS` and a provenance bundle for each tarball. Nothing is verified and nothing is
+  started: a proposal is a suggestion, and the run starts when an operator offers the commit
+  with `POST /v1/update/desired`. The poller asks GitHub's public API with no credential, on
+  the active frontend only, with a conditional request, and backs off after a failure. `policy`
   is the `update/policy` row when the operator wrote one (`paused`, `auto_nodes`,
   `auto_frontend`, `new_work_only_to_updated`, `accept_failing_builds`, `max_hosts_out`,
   `min_serving` and the limits in seconds), else `null`; `paused` is its flag (false without

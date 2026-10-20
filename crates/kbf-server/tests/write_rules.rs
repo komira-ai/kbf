@@ -10,7 +10,7 @@ use std::time::Duration;
 use kbf_enroll_registry::{TokenSpec, bump_ca_generation, create_token};
 use kbf_history::IndexRoot;
 use kbf_server::members::{Members, MembershipConfig, PROTOCOL, Progress, Registrant};
-use kbf_server::update::{Policy, Release, Rows};
+use kbf_server::update::{Policy, Proposal, Release, Rows};
 use kbf_server::write_rules::{Rule, classify};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{ManualClock, Store};
@@ -109,6 +109,22 @@ fn what_the_update_rows_write_is_fenced() {
         .expect("an offer");
     rows.set_policy(&Policy::default()).expect("a policy");
     assert!(assert_all_fenced(store.as_ref(), "the update rows") >= 2);
+}
+
+// Catches: the release poller's proposal rows being written by a family the table does not
+// name as fenced: a handed-over child could then write them after a takeover (#1155, #1181).
+#[test]
+fn what_the_release_poller_writes_is_fenced() {
+    let store = store();
+    let rows = Rows::new(Arc::clone(&store));
+    let proposal = Proposal {
+        commit: "a".repeat(40),
+        tag: "v1".to_owned(),
+        published_at_secs: 1,
+        proposed_at_ms: 1,
+    };
+    assert!(rows.propose(&proposal).expect("a proposal"));
+    assert_eq!(assert_all_fenced(store.as_ref(), "the release poller"), 1);
 }
 
 // Catches: the same for enrollment: a token row and the CA generation. The registry's other
