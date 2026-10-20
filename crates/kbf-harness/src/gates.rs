@@ -1,0 +1,336 @@
+//! The gates of scenario B0 (docs/design/kbf-cicd.md, section 4.4), evaluated from what
+//! the run measured. Pure: no process, no clock. Every gate is a row of the result
+//! document (`name`, `measured`, `threshold`, `verdict`, `started`, `finished`).
+//!
+//! The rule that runs through all of them is fail closed: a metric that is not there is
+//! not zero. A series absent from the first scrape, or from any later one, fails its
+//! gate, so a metric the frontend stops exporting cannot turn a gate green, and a run
+//! with no builds, or too few scrapes to take a difference, passes nothing. A value that is
+//! not a finite number (`NaN`, an infinity) fails its gate too, and a counter that falls
+//! between two scrapes was reset (a restart), which no delta of its ends can show.
+
+use serde::Serialize;
+use serde_json::{Value, json};
+
+use crate::scrape::{Sample, Scrapes};
+
+/// The failed-Execute counter (no by-class counter exists yet).
+pub const EXECUTE_ERRORS: &str = "kbf_execute_errors_total";
+/// Blobs marked lost now.
+pub const LOST_BLOBS: &str = "kbf_cache_lost_blobs";
+/// Blobs ever marked lost.
+pub const BLOB_LOSSES: &str = "kbf_cache_blob_losses_total";
+
+/// The fewest of a second's scrapes that must have succeeded, as a fraction.
+pub const MIN_SCRAPE_COVERAGE: f64 = 0.9;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum Verdict {
+    #[serde(rename = "PASS")]
+    Pass,
+    #[serde(rename = "FAIL")]
+    Fail,
+}
+
+/// One row of the result document's `gates`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Gate {
+    pub name: String,
+    pub measured: Value,
+    pub threshold: String,
+    pub verdict: Verdict,
+    pub started: String,
+    pub finished: String,
+    /// Why it failed, or what was measured, in words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// One build of the load.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuildResult {
+    /// What it built (`compile`, `pause`, `upload`).
+    pub kind: String,
+    /// Exit status 0, inside its time bound.
+    pub ok: bool,
+    /// Actions that failed in its event log, or why the log could not be read.
+    pub failed_actions: Result<u64, String>,
+}
+
+/// What the scenario measured.
+pub struct Evidence<'a> {
+    pub builds: &'a [BuildResult],
+    pub scrapes: &'a Scrapes,
+    /// Each storage node's `/metrics`, by node name: the lost-blob series are the nodes',
+    /// the frontend holds no cache.
+    pub nodes: &'a [(String, Scrapes)],
+    /// Roles that ended during the load without being ended: role and how.
+    pub exited_during_load: &'a [(String, String)],
+    /// Roles' ends when the farm was stopped: role and how (`exit 0` is clean).
+    pub stopped: &'a [(String, String)],
+    /// Whether the farm was still whole when the load and its settling ended (every node
+    /// connected, every storage member active), or what it lacked.
+    pub farm_whole: &'a Result<(), String>,
+    /// Whether the scenario's wall-clock bound was hit.
+    pub hung: bool,
+    /// The window the load ran in, as two timestamps, and its length in seconds.
+    pub load: (String, String),
+    pub load_secs: f64,
+    /// The window the farm was stopped in.
+    pub stop: (String, String),
+    /// How often the scraper scrapes, in seconds.
+    pub scrape_every_secs: f64,
+}
+
+/// A series' values in every scrape, or why one is missing.
+fn series(scrapes: &Scrapes, name: &str) -> Result<Vec<f64>, String> {
+    if scrapes.samples.len() < 2 {
+        return Err(format!(
+            "{} scrape(s): a difference needs two",
+            scrapes.samples.len()
+        ));
+    }
+    scrapes
+        .samples
+        .iter()
+        .enumerate()
+        .map(|(i, s): (usize, &Sample)| {
+            let value = s.value(name).ok_or_else(|| {
+                format!(
+                    "{name} is absent from scrape {i} of {}",
+                    scrapes.samples.len()
+                )
+            })?;
+            if value.is_finite() {
+                Ok(value)
+            } else {
+                Err(format!(
+                    "{name} is {value} in scrape {i}: not a finite number"
+                ))
+            }
+        })
+        .collect()
+}
+
+/// How much a counter grew over the scrapes `v` (at least two): the last less the first, and
+/// an error if it fell between any two, which is a reset: the counter's process restarted,
+/// and the difference of the ends is no longer the number of events.
+fn counter_delta(v: &[f64]) -> Result<f64, String> {
+    if let Some(i) = (1..v.len()).find(|i| v[*i] < v[*i - 1]) {
+        return Err(format!(
+            "went down from {} to {} between scrapes {} and {i}: reset",
+            v[i - 1],
+            v[i],
+            i - 1
+        ));
+    }
+    Ok(v[v.len() - 1] - v[0])
+}
+
+/// The largest value of the scrapes `v`.
+fn gauge_max(v: &[f64]) -> Result<f64, String> {
+    Ok(v.iter().copied().fold(f64::MIN, f64::max))
+}
+
+impl Evidence<'_> {
+    fn row(
+        &self,
+        name: &str,
+        measured: Value,
+        threshold: &str,
+        pass: bool,
+        detail: Option<String>,
+    ) -> Gate {
+        let (started, finished) = if matches!(name, "clean_stop") {
+            self.stop.clone()
+        } else {
+            self.load.clone()
+        };
+        Gate {
+            name: name.to_owned(),
+            measured,
+            threshold: threshold.to_owned(),
+            verdict: if pass { Verdict::Pass } else { Verdict::Fail },
+            started,
+            finished,
+            detail,
+        }
+    }
+
+    /// A gate on how a series moved over the run.
+    fn series_gate(
+        &self,
+        name: &str,
+        metric: &str,
+        threshold: &str,
+        reduce: impl Fn(&[f64]) -> Result<f64, String>,
+    ) -> Gate {
+        match series(self.scrapes, metric).and_then(|values| Ok((reduce(&values)?, values.len()))) {
+            Ok((measured, scrapes)) => self.row(
+                name,
+                json!(measured),
+                threshold,
+                measured == 0.0,
+                Some(format!("{metric} over {scrapes} scrapes")),
+            ),
+            Err(why) => self.row(name, Value::Null, threshold, false, Some(why)),
+        }
+    }
+
+    /// A gate on how a series of the storage nodes moved over the run: `reduce` of each
+    /// node's scrapes, summed over the nodes. Fails closed on no node at all, and on a
+    /// node whose series is absent from any of its scrapes, whatever the others read.
+    fn nodes_gate(
+        &self,
+        name: &str,
+        metric: &str,
+        threshold: &str,
+        reduce: impl Fn(&[f64]) -> Result<f64, String>,
+    ) -> Gate {
+        let reads: Vec<(&str, Result<f64, String>)> = self
+            .nodes
+            .iter()
+            .map(|(node, scrapes)| {
+                let read = series(scrapes, metric).and_then(|values| reduce(&values));
+                (node.as_str(), read)
+            })
+            .collect();
+        let why: Vec<String> = reads
+            .iter()
+            .filter_map(|(node, read)| read.as_ref().err().map(|e| format!("{node}: {e}")))
+            .collect();
+        if reads.is_empty() || !why.is_empty() {
+            let why = if reads.is_empty() {
+                "no storage node was scraped".to_owned()
+            } else {
+                why.join("; ")
+            };
+            return self.row(name, Value::Null, threshold, false, Some(why));
+        }
+        let measured: f64 = reads
+            .iter()
+            .filter_map(|(_, read)| read.as_ref().ok())
+            .sum();
+        self.row(
+            name,
+            json!(measured),
+            threshold,
+            measured == 0.0,
+            Some(format!(
+                "{metric} summed over {} storage nodes",
+                reads.len()
+            )),
+        )
+    }
+
+    /// Every gate, in the order of the design.
+    #[must_use]
+    pub fn gates(&self) -> Vec<Gate> {
+        let builds = u64::try_from(self.builds.len()).unwrap_or(u64::MAX);
+        let failed_builds = self.builds.iter().filter(|b| !b.ok).count();
+        let failed_actions: u64 = self
+            .builds
+            .iter()
+            .map(|b| b.failed_actions.as_ref().map_or(1, |n| *n))
+            .sum();
+        let unreadable: Vec<String> = self
+            .builds
+            .iter()
+            .filter_map(|b| b.failed_actions.as_ref().err().cloned())
+            .collect();
+        // The scrapes that gave a page, of the scrapes tried, or of the scrapes the load
+        // should have seen if the scraper tried fewer (one stuck on a wedged frontend): so
+        // neither a failed scrape nor a missed one is made up for by the scrapes of the
+        // settling window.
+        let coverage = if self.load_secs > 0.0 {
+            let got = self.scrapes.samples.len() as f64;
+            let tried = got + self.scrapes.failed as f64;
+            got / tried.max(self.load_secs / self.scrape_every_secs)
+        } else {
+            0.0
+        };
+        let clean = |ends: &[(String, String)]| {
+            ends.iter()
+                .filter(|(_, how)| how != "exit 0")
+                .map(|(role, how)| format!("{role}: {how}"))
+                .collect::<Vec<_>>()
+        };
+        let unclean = clean(self.stopped);
+        let exited: Vec<String> = self
+            .exited_during_load
+            .iter()
+            .map(|(role, how)| format!("{role}: {how}"))
+            .collect();
+        vec![
+            self.row("builds_run", json!(builds), "at least 1", builds >= 1, None),
+            self.row(
+                "builds_failed",
+                json!(failed_builds),
+                "0",
+                failed_builds == 0,
+                None,
+            ),
+            self.row(
+                "actions_failed",
+                json!(failed_actions),
+                "0",
+                failed_actions == 0,
+                (!unreadable.is_empty()).then(|| {
+                    format!("event logs unreadable (each counts as a failure): {unreadable:?}")
+                }),
+            ),
+            self.series_gate("execute_errors", EXECUTE_ERRORS, "delta 0", counter_delta),
+            self.nodes_gate(
+                "lost_blobs_gauge",
+                LOST_BLOBS,
+                "max 0 in every scrape of every storage node",
+                gauge_max,
+            ),
+            self.nodes_gate(
+                "blob_losses",
+                BLOB_LOSSES,
+                "delta 0 on every storage node",
+                counter_delta,
+            ),
+            self.row(
+                "scrape_coverage",
+                json!(coverage),
+                "at least 0.9",
+                coverage >= MIN_SCRAPE_COVERAGE,
+                self.scrapes.last_error.clone(),
+            ),
+            self.row(
+                "processes_alive",
+                json!(exited.len()),
+                "0",
+                exited.is_empty(),
+                (!exited.is_empty()).then(|| exited.join("; ")),
+            ),
+            self.row(
+                "farm_whole",
+                json!(self.farm_whole.is_ok()),
+                "true: every node connected, every storage member active",
+                self.farm_whole.is_ok(),
+                self.farm_whole.as_ref().err().cloned(),
+            ),
+            self.row(
+                "clean_stop",
+                json!(unclean.len()),
+                "0",
+                unclean.is_empty(),
+                (!unclean.is_empty()).then(|| unclean.join("; ")),
+            ),
+            self.row("hang", json!(self.hung), "false", !self.hung, None),
+        ]
+    }
+}
+
+/// Whether every gate passed (and there is at least one).
+#[must_use]
+pub fn all_pass(gates: &[Gate]) -> bool {
+    !gates.is_empty() && gates.iter().all(|g| g.verdict == Verdict::Pass)
+}
+
+#[cfg(test)]
+#[path = "gates_tests.rs"]
+mod tests;
