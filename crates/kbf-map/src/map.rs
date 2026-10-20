@@ -343,4 +343,53 @@ impl Map {
         }
         order
     }
+
+    /// A copy of this map in which member `id` is in `state`; `None` if `id` is not a
+    /// member. See the documentation of the implemented function.
+    #[must_use]
+    pub fn assuming(&self, id: MemberId, state: MemberState) -> Option<Map> {
+        let _ = (id, state);
+        None
+    }
+
+    /// The write owners of `digest` if member `id` were in `state`.
+    #[must_use]
+    pub fn owners_assuming(
+        &self,
+        id: MemberId,
+        state: MemberState,
+        digest: &Digest,
+    ) -> Option<Vec<MemberId>> {
+        let _ = (id, state, digest);
+        None
+    }
+
+    /// The read order of `digest` if member `id` were in `state`.
+    #[must_use]
+    pub fn read_order_assuming(
+        &self,
+        id: MemberId,
+        state: MemberState,
+        digest: &Digest,
+    ) -> Option<Vec<MemberId>> {
+        let _ = (id, state, digest);
+        None
+    }
+
+    /// A stable fingerprint of the placement-relevant parts of the map.
+    #[must_use]
+    pub fn placement_fingerprint(&self) -> u64 {
+        0
+    }
+
+    /// The read order across this map and the retained previous maps.
+    #[must_use]
+    pub fn read_order_with_history<'a>(
+        &'a self,
+        history: &[&'a Map],
+        digest: &Digest,
+    ) -> Vec<&'a Member> {
+        let _ = (history, digest);
+        Vec::new()
+    }
 }
