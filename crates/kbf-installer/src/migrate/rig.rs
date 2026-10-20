@@ -69,6 +69,9 @@ pub struct Rig {
     pub events: Rc<RefCell<Vec<String>>>,
     /// Make the next `start` fail.
     pub fail_start: Rc<Cell<bool>>,
+    /// How many `launchctl print` answers a job gives after its start without a pid (loaded,
+    /// not yet running); each start sets the count again.
+    pub start_lag: Rc<Cell<u32>>,
     /// Called with the verb and the unit file of every service command before it is answered
     /// (`stop`, `start`, `is-active`, `daemon-reload` with no unit): what a test plays as
     /// the host doing something while the migration is in that call.
@@ -123,6 +126,8 @@ impl Rig {
         let active = Rc::new(RefCell::new(BTreeSet::new()));
         let events = Rc::new(RefCell::new(Vec::new()));
         let fail_start = Rc::new(Cell::new(false));
+        let start_lag = Rc::new(Cell::new(0));
+        let lag_left = Rc::new(Cell::new(0));
         let on_command: Rc<RefCell<Option<CommandHook>>> = Rc::new(RefCell::new(None));
         host.answer = Box::new({
             let (active, events, fail_start, root, on_command) = (
@@ -132,6 +137,7 @@ impl Rig {
                 root.clone(),
                 on_command.clone(),
             );
+            let (start_lag, lag_left) = (start_lag.clone(), lag_left.clone());
             move |cmd| {
                 let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
                 let current = root.join(match platform {
@@ -148,6 +154,7 @@ impl Rig {
                         ("is-active", (*u).to_owned())
                     }
                     ("/usr/bin/systemctl", [verb, "--", u]) => (verb, (*u).to_owned()),
+                    ("/bin/sleep", ["1"]) => ("wait", String::new()),
                     ("/bin/launchctl", ["bootstrap", "system", plist]) => (
                         "start",
                         plist.rsplit('/').next().expect("a name").to_owned(),
@@ -166,11 +173,21 @@ impl Rig {
                     hook(verb, &unit);
                 }
                 match verb {
-                    "is-active" => Ok(reply(
-                        i32::from(!active.borrow().contains(&unit)) * 3,
-                        "",
-                        "",
-                    )),
+                    "is-active" => {
+                        let running = active.borrow().contains(&unit);
+                        // `launchctl print`: a running job shows its pid, a job just started
+                        // may not have one yet.
+                        let lagging = running && lag_left.get() > 0;
+                        if lagging {
+                            lag_left.set(lag_left.get() - 1);
+                        }
+                        let out = if running && !lagging {
+                            "\tpid = 812\n"
+                        } else {
+                            ""
+                        };
+                        Ok(reply(i32::from(!running) * 3, out, ""))
+                    }
                     "stop" => {
                         active.borrow_mut().remove(&unit);
                         record(format!("stop {unit}"));
@@ -179,6 +196,7 @@ impl Rig {
                     "start" if fail_start.get() => Err(io::Error::other("planted: start failed")),
                     "start" => {
                         active.borrow_mut().insert(unit.clone());
+                        lag_left.set(start_lag.get());
                         record(format!("start {unit}"));
                         Ok(reply(0, "", ""))
                     }
@@ -199,6 +217,7 @@ impl Rig {
             active,
             events,
             fail_start,
+            start_lag,
             on_command,
             lock_wait: Duration::from_secs(20),
             kit: false,

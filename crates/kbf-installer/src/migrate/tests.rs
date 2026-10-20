@@ -481,6 +481,7 @@ fn a_mac_host_comes_over_through_launchd() {
             "stop com.komira.kbf-helper.plist links=false",
             "stop com.komira.kbf-daemon.plist links=false",
             "disable com.komira.kbf-helper.plist links=false",
+            "enable com.komira.kbf-daemon.plist links=true",
             "start com.komira.kbf-daemon.plist links=true",
         ]
     );
@@ -496,6 +497,49 @@ fn a_mac_host_comes_over_through_launchd() {
         bootstraps[0]
             .ends_with("bootstrap system /Library/LaunchDaemons/com.komira.kbf-daemon.plist"),
         "{bootstraps:?}"
+    );
+}
+
+/// Catches a Mac migration that reports `started` for a job launchd has loaded and not run:
+/// the start waits for the pid (here after two looks without one), and a job that never runs
+/// fails the migration naming the unit, before the journal says done, so the same command
+/// finishes it once the job runs.
+///
+/// Mutants seen red: no wait after `bootstrap`; the wait given up after one look.
+#[test]
+fn a_mac_migration_waits_for_the_job_and_can_be_run_again() {
+    let mut rig = Rig::mac("mac-wait");
+    rig.start_lag.set(2);
+    run_migrate(&mut rig, &never(), Mode::Apply).expect("migrate");
+    let waits = rig
+        .events
+        .borrow()
+        .iter()
+        .filter(|e| e.starts_with("wait"))
+        .count();
+    assert_eq!(waits, 2);
+
+    let mut stuck = Rig::mac("mac-stuck");
+    stuck.start_lag.set(1000);
+    let error = run_migrate(&mut stuck, &never(), Mode::Apply).expect_err("never runs");
+    assert!(
+        error.to_string().contains("com.komira.kbf-daemon.plist"),
+        "{error}"
+    );
+    let waits = stuck
+        .events
+        .borrow()
+        .iter()
+        .filter(|e| e.starts_with("wait"))
+        .count();
+    assert_eq!(waits, 29, "thirty looks, a pause between each");
+    stuck.start_lag.set(0);
+    run_migrate(&mut stuck, &never(), Mode::Apply).expect("the same command finishes it");
+    assert!(
+        stuck
+            .active
+            .borrow()
+            .contains("com.komira.kbf-daemon.plist")
     );
 }
 

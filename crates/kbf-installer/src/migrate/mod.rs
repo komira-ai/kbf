@@ -254,6 +254,8 @@ mod rig;
 #[cfg(test)]
 mod rollback_tests;
 #[cfg(test)]
+mod services_tests;
+#[cfg(test)]
 mod testfarm_tests;
 #[cfg(test)]
 mod tests;
