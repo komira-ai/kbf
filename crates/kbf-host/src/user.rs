@@ -221,7 +221,8 @@ fn dscl<E: Exec>(exec: &E, name: &str) -> Result<Option<(u32, u32, String)>, Use
     let (Some(uid), Some(gid), Some(home), Some(_)) = (uid, gid, home, shell) else {
         return Err(bad());
     };
-    let digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
+    // A value is never empty here (`exact` refused that), so "all digits" is the whole check.
+    let digits = |v: &str| v.bytes().all(|b| b.is_ascii_digit());
     let (true, true) = (digits(&uid), digits(&gid)) else {
         return Err(bad());
     };
