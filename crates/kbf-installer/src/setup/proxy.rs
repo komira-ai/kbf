@@ -339,12 +339,12 @@ fn default_cert(c: &ProxyConfig) -> Option<(&std::path::Path, &std::path::Path)>
     if let (Some(cert), Some(key)) = (&c.server_cert_file, &c.server_key_file) {
         return Some((cert, key));
     }
-    let entry = c
-        .server_cert
-        .iter()
+    let list = &c.server_cert;
+    let only = list.first().filter(|_| list.len() == 1);
+    list.iter()
         .find(|e| e.default)
-        .or_else(|| (c.server_cert.len() == 1).then(|| &c.server_cert[0]))?;
-    Some((&entry.cert_file, &entry.key_file))
+        .or(only)
+        .map(|e| (e.cert_file.as_path(), e.key_file.as_path()))
 }
 
 /// Copy the keys `setup` owns from `from` into `to`. The `[[server_cert]]` list is the
