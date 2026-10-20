@@ -262,14 +262,14 @@ fn a_descriptor_the_runtime_cannot_use_is_a_failure_to_start() {
 fn check_stops_at_the_table_and_a_run_needs_its_socket() {
     let path = file("run", PROXY.as_bytes());
     let args = |check| ProxyArgs {
-        config: path.clone(),
+        config: Some(path.clone()),
         check,
     };
     assert_eq!(run(&args(true)), Ok(()));
     let text = usage_of(run(&args(false)));
     assert!(text.contains("LISTEN_PID"), "{text}");
     let missing = ProxyArgs {
-        config: path.with_file_name("none.toml"),
+        config: Some(path.with_file_name("none.toml")),
         check: true,
     };
     assert!(usage_of(run(&missing)).contains("No such file"));
@@ -336,4 +336,27 @@ fn a_second_stop_signal_ends_the_process_at_once() {
 #[test]
 fn the_production_stop_bound_is_ten_seconds() {
     assert_eq!(STOP_BOUND, Duration::from_secs(10));
+}
+
+/// Catches a `proxy` that reads `/etc/kbf/installer.toml` on a Mac, where `setup` writes
+/// `/usr/local/etc/kbf/installer.toml`: with no `--config` the file is the platform's, and a
+/// flag wins.
+#[test]
+fn proxy_reads_the_installer_toml_setup_wrote_on_the_platform() {
+    let args = |config| ProxyArgs {
+        config,
+        check: true,
+    };
+    assert_eq!(
+        config_path(&args(None), Platform::Linux),
+        PathBuf::from("/etc/kbf/installer.toml")
+    );
+    assert_eq!(
+        config_path(&args(None), Platform::MacOs),
+        PathBuf::from("/usr/local/etc/kbf/installer.toml")
+    );
+    assert_eq!(
+        config_path(&args(Some(PathBuf::from("/x.toml"))), Platform::MacOs),
+        PathBuf::from("/x.toml")
+    );
 }

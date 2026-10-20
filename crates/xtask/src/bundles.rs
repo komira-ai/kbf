@@ -2,7 +2,8 @@
 //! the Sigstore bundle of the one build provenance attestation the `attest-*` job signed
 //! for that tarball alone, so a host can verify the tarball offline
 //! (`gh attestation verify <tarball> --bundle <bundle>`) without fetching anything from
-//! GitHub.
+//! GitHub. The `kbf-installer` deb (`<binary>-<commit>-<platform>.deb`) has one too,
+//! and everything here says "tarball" of it as well ([`needs_bundle`]).
 //!
 //! A bundle is made after `SHA256SUMS` (the attestation signs the sums' files), so the
 //! sums cannot list it: [`is_bundle`] is how `verify-assets sums` knows to leave it
@@ -50,6 +51,12 @@ pub fn name_of(tarball: &str) -> String {
 /// Whether the file name `name` is a bundle's (it is not an asset `SHA256SUMS` lists).
 pub fn is_bundle(name: &str) -> bool {
     name.ends_with(SUFFIX)
+}
+
+/// Whether the asset `name` has a provenance bundle: a tarball, or a package (the
+/// `kbf-installer` deb), but not an SBOM, which is a subject of the sums' attestation only.
+pub fn needs_bundle(name: &str) -> bool {
+    name.ends_with(".tar.gz") || name.ends_with(".deb")
 }
 
 /// `commit` with its last hex digit changed: a commit the bundle was not made for.
@@ -176,10 +183,7 @@ fn check_subject(
 /// # Errors
 /// `dir` or a bundle in it cannot be read.
 pub fn pairing(dir: &Path, lines: &[Line]) -> Result<Vec<String>, Error> {
-    let tarballs: Vec<&Line> = lines
-        .iter()
-        .filter(|l| l.name.ends_with(".tar.gz"))
-        .collect();
+    let tarballs: Vec<&Line> = lines.iter().filter(|l| needs_bundle(&l.name)).collect();
     let present: Vec<String> = files_in(dir)?
         .into_iter()
         .filter(|n| is_bundle(n))

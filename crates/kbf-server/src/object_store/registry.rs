@@ -22,7 +22,7 @@ use super::rows::{
 };
 use super::secrets::{SecretError, SecretFiles};
 use crate::enroll::Random;
-use crate::stores::{DEFAULT_MIN_PUT_RATE, DEFAULT_REGION, DEFAULT_S3_PREFIX, S3Uri, StoreUri};
+use crate::stores::{DEFAULT_MIN_PUT_RATE, DEFAULT_S3_PREFIX, S3Uri, StoreUri, region_or_default};
 
 /// How old an unreferenced file must be before a sweep removes it.
 pub const SWEEP_GRACE: Duration = Duration::from_secs(600);
@@ -206,11 +206,7 @@ fn cold_uri(bind: &BindRow, conn: &ConnRow) -> Result<String, RegistryError> {
         bucket: bind.bucket.clone(),
         prefix,
         endpoint: conn.endpoint.clone(),
-        region: if conn.region.is_empty() {
-            DEFAULT_REGION.to_owned()
-        } else {
-            conn.region.clone()
-        },
+        region: region_or_default(&conn.region),
         conditional_put: conn.conditional_put,
         min_put_rate: NonZeroU64::new(conn.min_put_rate).unwrap_or(DEFAULT_MIN_PUT_RATE),
     };
