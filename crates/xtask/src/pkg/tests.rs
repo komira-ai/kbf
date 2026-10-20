@@ -430,7 +430,16 @@ fn the_gate_refuses_a_job_that_starts_without_the_configuration() {
             "<string>/usr/local/kbf-installer/bin/kbf-installer</string>",
             "<string>/usr/local/bin/kbf-installer</string>",
         ),
-        ("<string>serve</string>", "<string>setup</string>"),
+        ("<string>run</string>", "<string>setup</string>"),
+        ("<string>run</string>", "<string>serve</string>"),
+        (
+            "<string>com.komira.kbf-daemon</string>",
+            "<string>com.komira.other</string>",
+        ),
+        (
+            "<string>--launchd-label</string>",
+            "<string>--unit</string>",
+        ),
     ] {
         let p = mutant(from, to);
         assert_eq!(p.len(), 1, "{to}: {p:?}");
