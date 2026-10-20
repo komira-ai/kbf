@@ -23,12 +23,40 @@ The held steps are one small CLI, `held/main.ts`, run as `npm run held -- <comma
 repository allows no shell scripts). It calls `aws`, `gh` and `cdk` with argument arrays, and its tests drive it with a
 fake so they can see which commands a dry run does and does not run.
 
+## One approval per release: two environments
+
+A release asks the reviewer once. Two GitHub environments split the work:
+
+| environment | reviewer | deployment policies | referenced by |
+|---|---|---|---|
+| `prod` | the one required reviewer | branch `main`, tag `v*` | the `publish` job (`contents: write`, no `id-token`) |
+| `prod-site` | none | tag `v*` only | the site job (`id-token: write`, no repo write), which `needs` `publish` |
+
+GitHub pauses a job for review when it references an environment with required reviewers
+([reviewing deployments](https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/reviewing-deployments);
+[environments](https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment):
+"Only one of the required reviewers needs to approve the job"). Reviewers are optional there, and deployment branch/tag
+policies are a separate rule a job must satisfy; an environment without reviewers does not pause. A job's OIDC token carries
+`environment:<name>` in its `sub` whenever the job declares `environment:`
+([OIDC reference](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect)).
+Sequential jobs in the same environment are separate pending deployments, which is why a second job in `prod` would have
+been a second click. Two jobs cannot share one click without running in parallel (losing the order) or holding contents:write
+and id-token:write together. So: `publish` (in `prod`) is approved; the site job `needs` it, runs in `prod-site` without a
+prompt, and the role trusts `prod-site`, so the approved `publish` job (which has `contents: write`) cannot assume the role.
+Ordering comes from `needs`; the site job's own guard (in `site-publish.yml`) also downloads the GitHub release, which exists
+only after `publish` ran. What the documentation does not state, and only a real run shows: that a `prod-site` job with no
+reviewer starts immediately, is admitted by the tag policy, and carries `environment:prod-site` in its `sub` (probe, below).
+The cost of no reviewer on `prod-site`: a workflow on a `v*` tag that calls `site-publish.yml` directly would not be
+paused; the guard job (commit on `main`, attestations) and the repository's ruleset on who may push `v*` tags are what
+stand there.
+
 ## Parameters
 
 | parameter | where | meaning |
 |---|---|---|
-| `--account` / `-c account` | `dns`, `site`, `vars` | 12-digit id of the AWS account; also checked against the profile's account |
-| `--profile` | `dns`, `site`, `vars` | AWS CLI profile to use |
+| `--account` / `-c account` | `oidc-provider`, `dns`, `site`, `vars` | 12-digit id of the AWS account; also checked against the profile's account |
+| `--profile` | `oidc-provider`, `dns`, `site`, `vars` | AWS CLI profile to use |
+| `--reviewer` | `github` | GitHub login of the person who approves a `prod` deployment (the only reviewer; `prod-site` has none) (a value you pass, never stored in a file) |
 | `--repo` / `-c githubRepo` | `github`, `site`, `vars` | `<owner>/<name>` of the repository that hosts the publish workflow |
 | `-c githubRepoId`, `-c githubOwnerId` | `cdk` (set by `site`) | immutable numeric ids; `site` reads them with read-only `gh api repos/<repo>` |
 | `--domain` / `-c domain` | `dns`, `site` | site name; default `kbf.dev` |
@@ -48,22 +76,40 @@ Both use the legacy synthesizer: no `cdk bootstrap` and no assets.
 
 ## Order
 
-Prerequisite: the AWS account already has the GitHub OIDC identity provider (`token.actions.githubusercontent.com`,
-audience `sts.amazonaws.com`). `site` imports it by ARN and refuses if it is absent; it never creates one (an account
-can hold only one provider for that URL).
+Prerequisite: the AWS account has the GitHub OIDC identity provider (`token.actions.githubusercontent.com`, audience
+`sts.amazonaws.com`). `site` imports it by ARN and refuses if it is absent; it never creates one (an account can hold
+only one provider for that URL). Step `oidc-provider` creates it, and only when it is absent.
 
 ```sh
 cd infra/site && npm ci --ignore-scripts
 ```
 
-0. **GitHub**: `npm run held -- github --repo <owner>/<name>` (dry run), then add `--apply` (needs admin on the repo).
-   - Creates environment `prod` with `deployment_branch_policy` `{protected_branches:false, custom_branch_policies:true}`
-     and one policy `{name:"main", type:"branch"}`. The `sub` below holds the called workflow's ref but NOT the caller's,
-     so this branch policy is what stops a feature-branch caller of `site-publish.yml@refs/heads/main` from assuming the
-     role.
+0. **GitHub**: `npm run held -- github --repo <owner>/<name> --reviewer <login>` (dry run), then add `--apply` (needs admin
+   on the repo). Read-only calls first (the repo's ids, the reviewer's user id, the environment's current settings); each
+   write is skipped when GitHub already shows it, so a second run changes nothing but re-puts the sub template.
+   - Creates or updates environment `prod-site` like `prod` (below) but with NO reviewer (`reviewers: []`), `can_admins_bypass: false`
+     and the single policy `{name:"v*", type:"tag"}`; `vars` refuses if it has a reviewer (that would be a second click) or
+     any other policy. `github` prints the role-trust `sub` the role must have (it names `prod-site`).
+   - Creates or updates environment `prod` with `deployment_branch_policy` `{protected_branches:false,
+     custom_branch_policies:true}`, the required reviewer (the user named by `--reviewer`; a team is not supported),
+     `prevent_self_review: false` and `can_admins_bypass: false`. Self-review stays allowed on purpose: the person who
+     pushes the release tag is the approver, and with it on a release would wait for a second person forever. The
+     environment is one PUT whose body goes on stdin (`--input -`), because that call replaces the whole protection set.
+   - Adds exactly two deployment policies: `{name:"main", type:"branch"}` and `{name:"v*", type:"tag"}`. The tag policy
+     is needed because the release workflow's `publish` job runs on `refs/tags/v*`, which a branch policy never matches;
+     the `main` policy is what stops a feature-branch caller of `site-publish.yml@refs/heads/main` from assuming the
+     role (the `sub` below holds the called workflow's ref but NOT the caller's). A policy that is already there is not
+     posted again; an extra one is reported and left for you to delete (`vars` refuses while it exists).
    - Sets the OIDC sub template to `repo`, `context`, `job_workflow_ref` with the immutable subject (the default
      template's `sub` has no workflow file).
    - Prints, and does not run, a reminder to check the token (see "The OIDC `sub`").
+   - The tag `v*` policy only admits a tag run; who may push a tag is a repository ruleset, which is a separate held
+     setting (see the CICD design notes).
+0b. **OIDC provider**: `npm run held -- oidc-provider --account <id> --profile <profile>` (dry run: lists the account's
+   providers and prints either "already present" or the exact `aws iam create-open-id-connect-provider` it would run),
+   then `--apply`. It creates url `https://token.actions.githubusercontent.com` with client id `sts.amazonaws.com` only when
+   no provider for that URL exists, and never changes an existing one. No thumbprint is passed: IAM validates GitHub's
+   certificate chain itself. Run it before step 3.
 1. **Zone**: `npm run held -- dns --account <id> --profile <profile>` (runs the tests, then `cdk diff`), then `--apply`.
    Creates the zone and prints its four name servers.
 2. **Registrar (by hand)**: at your registrar, set the domain's nameservers to those four hosts (the stack output
@@ -72,19 +118,36 @@ cd infra/site && npm ci --ignore-scripts
    delegation is live (the deploy waits for it).
 3. **Site**: `npm run held -- site --account <id> --profile <profile> --repo <owner>/<name>` (diff), then `--apply`.
    Refuses without the OIDC provider or the zone.
+3b. **Extra deployment policies (by hand)**: before running `vars`, delete any extra deployment policy on environment `prod` or `prod-site`
+   yourself (Settings > Environments > prod); `github` warns about extras and never removes them, and `vars` refuses while one exists.
 4. **Variables**: `npm run held -- vars --account <id> --profile <profile> --repo <owner>/<name>`. It first verifies the
-   GitHub side read-only (environment `prod` exists with custom branch policies, its branch policies are exactly `main`,
-   the sub template is as above) and refuses to print anything if any differs. Then it reads the stack outputs and
-   prints three `gh variable set ... --env prod` commands (`KBF_SITE_BUCKET`, `KBF_SITE_DISTRIBUTION_ID`,
+   GitHub side read-only (environment `prod` exists with custom branch policies, its policies are exactly the branch `main`
+   and the tag `v*`, it has a required reviewer; environment `prod-site` exists with exactly the tag `v*` and NO reviewer, self-review is allowed, administrators cannot bypass, the sub template
+   is as above) and refuses to print anything if any differs. Then it reads the stack outputs and
+   prints three `gh variable set ... --env prod-site` commands (`KBF_SITE_BUCKET`, `KBF_SITE_DISTRIBUTION_ID`,
    `KBF_SITE_PUBLISH_ROLE_ARN`). You run them. Nothing is committed.
+
+### Held for the CEO when this change lands
+
+If the stack `kbf-prod-site` was already deployed (trusting environment `prod`), its role trust must change to `prod-site`:
+re-run step 3 (`site`, diff, then `--apply`; the diff shows the one changed `sub` string), then step 0 (`github`) for
+`prod-site`, then move the three variables (step 4 prints them for `prod-site`; delete the `prod` copies). Not yet
+deployed: nothing to change; just run the steps in order.
+
+### The first release has no gamma verdict
+
+No gamma farm exists yet, so no `v*` tag can pass `release verdict` with a produced verdict. The first tag carries a
+hand-written verdict (the same tag-message format: stage gamma, green, this commit, set hash and tag, a bake of at least 24 h)
+with the CEO's recorded `min-load` waiver for the minimum load, which `xtask/src/release/verdict.rs` already accepts. Nothing is skipped in `verify`: there is no skip flag, and the verdict check
+runs on that tag like any other. Later tags carry gamma's verdict.
 
 ### Undo
 
 - Step 4:
   ```sh
-  gh variable delete KBF_SITE_BUCKET --env prod --repo <owner>/<name>
-  gh variable delete KBF_SITE_DISTRIBUTION_ID --env prod --repo <owner>/<name>
-  gh variable delete KBF_SITE_PUBLISH_ROLE_ARN --env prod --repo <owner>/<name>
+  gh variable delete KBF_SITE_BUCKET --env prod-site --repo <owner>/<name>
+  gh variable delete KBF_SITE_DISTRIBUTION_ID --env prod-site --repo <owner>/<name>
+  gh variable delete KBF_SITE_PUBLISH_ROLE_ARN --env prod-site --repo <owner>/<name>
   ```
 - Step 3: `npx cdk destroy kbf-prod-site` with the same `-c` context and profile, or delete the stack in CloudFormation.
   It removes the distribution, certificate, records, function, headers policy and role. The bucket is RETAINed with every
@@ -94,14 +157,15 @@ cd infra/site && npm ci --ignore-scripts
   versions and delete markers included). Take down the registrar change first if the site must stop resolving.
 - Step 2: put the registrar's previous nameservers back.
 - Step 1: delete the stack; the zone is RETAINed, delete it in Route 53 by hand once nothing delegates to it.
-- Step 0: delete the environment; restore the sub template with `use_default=true`.
+- Step 0b: delete the provider in IAM only if nothing else in the account uses it.
+- Step 0: delete the environments `prod` and `prod-site`; restore the sub template with `use_default=true`.
 
 ## The publish workflow
 
 The role trusts a workflow named exactly `.github/workflows/site-publish.yml`, run from `refs/heads/main`, in GitHub
-environment `prod`. It is a reusable workflow; this directory does not contain it. It must:
+environment `prod-site` (not `prod`, see "One approval per release"). It is a reusable workflow; this directory does not contain it. It must:
 
-- set `permissions: id-token: write` on a job that declares `environment: prod`, inside that file;
+- set `permissions: id-token: write` on a job that declares `environment: prod-site`, inside that file;
 - be called with `uses: <owner>/<name>/.github/workflows/site-publish.yml@refs/heads/main` (a branch ref, not a SHA);
 - read the three variables from step 4, assume the role (1 h session), `aws s3 sync` the site build with
   `--delete --exclude 'releases/*'`, upload each release file as ONE `aws s3api put-object --if-none-match '*'` (see
@@ -114,13 +178,13 @@ Role `kbf-prod-publish`, max session 1 h, trust `sts:AssumeRoleWithWebIdentity` 
 
 - `token.actions.githubusercontent.com:aud` = `sts.amazonaws.com`
 - `token.actions.githubusercontent.com:sub` =
-  `repo:<owner>@<ownerId>/<name>@<repoId>:environment:prod:job_workflow_ref:<owner>/<name>/.github/workflows/site-publish.yml@refs/heads/main`
+  `repo:<owner>@<ownerId>/<name>@<repoId>:environment:prod-site:job_workflow_ref:<owner>/<name>/.github/workflows/site-publish.yml@refs/heads/main`
 
 `<ownerId>` and `<repoId>` are the immutable numeric ids of `gh api repos/<owner>/<name> --jq '.owner.id,.id'`, in the
 immutable-subject form. `job_workflow_ref` is the ref of the workflow file that contains the job: for a reusable
 workflow it is the CALLED file, not the caller. This follows GitHub's documentation of the claim; it is NOT verified
 against a live token. Verify before relying on it: run a manual workflow from `site-publish.yml@refs/heads/main` in
-environment `prod` that prints the token's `sub` and `job_workflow_ref` (never the token itself) and compare. If the
+environment `prod-site` that prints the token's `sub` and `job_workflow_ref` (never the token itself) and compare. If the
 printed `sub` differs, change `PUBLISH_WORKFLOW`, `WORKFLOW_REF` or `GITHUB_ENVIRONMENT` in `lib/config.ts`, re-run
 `npm test`, and redeploy step 3.
 
@@ -183,6 +247,7 @@ before any `--apply`, and the held CLI runs it for `dns` and `site`).
   provider-ARN guards, the zone stack, and the context parameters (the ids come only from context; bad values refused).
   The tests use the documentation account `123456789012` and fake ids.
 - `test/held.test.ts`: flag parsing (`--force` refused), the account guard stops each AWS step after one call, dry runs
-  run no write and no `cdk deploy`, `--apply` runs the tests before `cdk`, `site` passes the ids read from `gh api` as
-  context and never creates a provider, and `vars` prints nothing unless the environment, its branch policy and the
-  sub template are as expected.
+  run no write and no `cdk deploy`, `github` writes, for `prod`, the reviewer, `prevent_self_review=false`, `can_admins_bypass=false` and the
+  two policies, and for `prod-site` an empty reviewer list and the single `v*` tag policy, each exactly once and nothing when present, `oidc-provider` creates only when absent, `--apply` runs the tests before `cdk`, `site` passes the ids read from `gh api` as
+  context and never creates a provider, and `vars` prints nothing unless both environments, their reviewer settings (one reviewer on `prod`, none on `prod-site`), their policy sets
+  (`prod`: exactly `main`/branch and `v*`/tag; `prod-site`: exactly `v*`/tag) and the sub template are as expected.

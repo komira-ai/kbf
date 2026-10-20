@@ -521,7 +521,12 @@ The additions:
    a recorded waiver. A tag with no verdict, or a red one, fails `verify`. **No signing key**: who may push a `v*` tag is
    limited by the tag-protection ruleset on main (M19), and the `publish` job is gated by the `prod` environment's
    required reviewer (item 2). A signing key would add key custody without adding protection beyond those two.
-2. **A `prod` environment with a required reviewer**, as kci's prod, on the `publish` job.
+2. **A `prod` environment with a required reviewer**, as kci's prod, on the `publish` job. **One approval per release:** the
+   kbf.dev deploy job (the only one with `id-token: write`) `needs` `publish` and runs in a second environment, `prod-site`,
+   which has no reviewer and admits `v*` tags only; the AWS role trusts `prod-site`, so the approved `publish` job (which
+   holds `contents: write`) cannot assume it. Details and the held setup: `infra/site/README.md`.
+   **The first release (CEO ruling):** no gamma farm exists yet, so the first tag carries a hand-written verdict with the CEO's
+   recorded `min-load` waiver. `verify` is not changed or skipped for it.
 3. **Release notes**: generated from the commits between the previous release and this one, plus the gamma verdict's summary
    (bake length, load, the gate values) and a list of anything that is not reversible (section 8.3). Notes are an artifact of
    the `verify` job, so a dry run shows them before anyone approves.
