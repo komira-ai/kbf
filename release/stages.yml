@@ -19,12 +19,13 @@ stages:
     after: []
     result: SHA256SUMS
     events: [pull_request, merge_group, push]
-  # The full end-to-end run against the built files. Planned: no job exists yet. The change
-  # that adds the beta job to artifacts.yml deletes the `planned` line below and lists the
-  # job (and the job that attests its result, as `signing: true`) under `jobs`.
+  # The full end-to-end run against the built files. Today one job exists: beta.yml's
+  # smoke (scenario B0, the farm under Buck2 load), which builds its own binaries, so its
+  # result says it is unattested, and runs on the merge queue and on a push. The full run on
+  # the attested bytes (a job of artifacts.yml, after `verify`), and the `signing: true` job
+  # that attests its result, are added to `jobs` by the changes that build them.
   - name: beta
     runs: actions
-    planned: true
     after: [build]
     result: beta-result.json
     events: [merge_group, push]
@@ -62,6 +63,8 @@ jobs:
     stage: build
   - job: artifacts.yml#verify-darwin-arm64
     stage: build
+  - job: beta.yml#smoke
+    stage: beta
   - job: release.yml#verify
     stage: prod
   - job: release.yml#publish

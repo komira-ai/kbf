@@ -17,6 +17,7 @@ Commands:
   boot-check  Run before each start of a release on trial; counts the start
   quiesce     For maintainer scripts: take the lock; exit 5 while a swap is pending
   check       Validate the installer's configuration, trust files and path chain
+  proxy       Serve the frontend host's public port: route each stream to the active child frontend
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -197,4 +198,16 @@ Options:
       --json   Print the result as one JSON object on standard output
       --apply  Do what the verb says. Without it a mutating verb is a dry run
   -h, --help   Print help
+
+=== kbf-installer proxy --help ===
+Serve the frontend host's public port: route each stream to the active child frontend
+
+Usage: kbf-installer proxy [OPTIONS]
+
+Options:
+      --config <CONFIG>  The installer.toml whose `[proxy]` table configures the proxy [default: /etc/kbf/installer.toml]
+      --json             Print the result as one JSON object on standard output
+      --apply            Do what the verb says. Without it a mutating verb is a dry run
+      --check            Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing
+  -h, --help             Print help
 
