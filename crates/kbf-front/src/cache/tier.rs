@@ -384,6 +384,7 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         };
         match applied {
             Applied::Staged(Ok(_)) => {
+                self.born.note(synced.object());
                 staging.tier.committed(synced);
                 staging.counters.staged.add(1);
                 Ok(())
@@ -416,6 +417,7 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         };
         match self.reseat(staging.id, from, put, false).await {
             Ok(()) => {
+                self.born.carry(from, synced.object());
                 staging.tier.committed(synced);
                 staging.counters.staged.add(1);
                 Ok(())

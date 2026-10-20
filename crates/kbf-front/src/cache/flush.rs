@@ -348,9 +348,18 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             round.sealed.push(object);
         }
         let (tier, waiting, gate) = (staging.id, staging.waiting(now), self.gate.clone());
-        let due = self
+        let mark = self.writer.born.mark();
+        let (due, (backlog, backlog_bytes), mut staged) = self
             .writer
             .query(move |s| {
+                let mut staged = BTreeSet::new();
+                let backlog = s.staged_objects().filter(|(_, o)| o.tier() == tier).fold(
+                    (0u64, 0u64),
+                    |(n, b), (object, o)| {
+                        staged.insert(object);
+                        (n + 1, b + o.committed_len())
+                    },
+                );
                 // A conflict is taken too: a build before this one left them staged.
                 let ours = |o: &StagedObject| {
                     o.tier() == tier
@@ -374,9 +383,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                     let blobs: Vec<(Digest, u64)> = o.blobs().map(|(d, at)| (*d, at)).collect();
                     Some((object, o.committed_len(), blobs, first, o.state()))
                 });
-                due.collect::<Vec<_>>()
+                (due.collect::<Vec<_>>(), backlog, staged)
             })
             .await?;
+        staging.counters.staged_objects.set(backlog);
+        staging.counters.staged_bytes.set(backlog_bytes);
         let mut done = BTreeSet::new();
         for (object, len, blobs, first, state) in due {
             if !first.is_subset(&done) {
@@ -413,6 +424,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 }
             }
         }
+        // The staging dates of objects no longer staged here go with the round: nothing
+        // else need call `flush_report` for the dates not to pile up. A flushed object
+        // has left staged state; the others (open, sealed, conflicting) keep theirs.
+        for object in &done {
+            staged.remove(object);
+        }
+        self.writer.born.prune(mark, &staged);
         Ok(round)
     }
 
