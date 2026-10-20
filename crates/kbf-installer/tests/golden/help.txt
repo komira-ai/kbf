@@ -9,7 +9,7 @@ Commands:
   setup           First install: accounts, directories, installer.toml, the first release
   status          What is installed, staged and pending, and the last refusal
   run             Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap
-  update          Order an update of this host's own frontend (root, inline)
+  update          Swap this host's frontend through the proxy's update API, and wait for it
   confirm         Keep the pending swap, naming its activation
   revert          Undo the pending swap, naming its activation
   rollback        Point `current` at `previous`, with no confirm window
@@ -160,16 +160,35 @@ Options:
           Print help
 
 === kbf-installer update --help ===
-Order an update of this host's own frontend (root, inline)
+Swap this host's frontend through the proxy's update API, and wait for it
 
-Usage: kbf-installer update [OPTIONS] --commit <COMMIT> --frontend
+Usage: kbf-installer update [OPTIONS] --commit <COMMIT> --frontend --api <API>
 
 Options:
-      --commit <COMMIT>  The release to update to (40 hex characters)
-      --json             Print the result as one JSON object on standard output
-      --apply            Do what the verb says. Without it a mutating verb is a dry run
-      --frontend         Update this host's frontend. Node updates come on the frontend's order, not from here
-  -h, --help             Print help
+      --commit <COMMIT>
+          The release to update to (40 hex characters)
+      --json
+          Print the result as one JSON object on standard output
+      --apply
+          Do what the verb says. Without it a mutating verb is a dry run
+      --frontend
+          Update this host's frontend: ask the update API of the proxy to swap it, and wait
+      --api <API>
+          The proxy's public address, `127.0.0.1:port`: the update API is served there
+      --api-ca <API_CA>
+          CA certificates (PEM) the API's certificate is verified against, besides the system's
+      --api-server-name <API_SERVER_NAME>
+          The name the API's certificate carries (the address's own IP when none is given)
+      --token-file <TOKEN_FILE>
+          The operator token the API takes: a file of mode 0600 or 0400. `setup` writes it here [default: /etc/kbf/api-token]
+      --nodes
+          Have the new frontend update the nodes once it has baked. Without it only the frontend is swapped
+      --request-id <REQUEST_ID>
+          Names this update to the API, so a run repeated after a lost connection is the same update. Random when not given
+      --handover-timeout-s <HANDOVER_TIMEOUT_S>
+          How long to wait for the update to end, the new frontend's bake included [default: 3600]
+  -h, --help
+          Print help
 
 === kbf-installer confirm --help ===
 Keep the pending swap, naming its activation

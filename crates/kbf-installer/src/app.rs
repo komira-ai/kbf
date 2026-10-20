@@ -569,6 +569,38 @@ fn finish_setup(
     e.exit()
 }
 
+/// Whether the caller came through `sudo` from another account: sudo sets `SUDO_UID` to the
+/// caller's uid and a caller cannot unset it for the command (the test `deploy` makes).
+fn sudo_caller() -> bool {
+    is_sudo_uid(std::env::var_os("SUDO_UID").as_deref())
+}
+
+/// [`sudo_caller`] for a `SUDO_UID` that is `uid`: set, and not root's own.
+fn is_sudo_uid(uid: Option<&std::ffi::OsStr>) -> bool {
+    uid.is_some_and(|u| u != "0")
+}
+
+/// `update`, refused through `sudo`. The verb takes `--api`, `--api-ca`, `--api-server-name`
+/// and `--token-file` from its caller, and `--api` is required, so through sudo root would
+/// read a file the caller chose and send it to an address the caller chose (a local TLS
+/// server with the caller's own CA reads the token from the bearer header). It needs no root:
+/// run it as the account that may read the token file.
+fn update_verb(
+    args: &crate::cli::UpdateArgs,
+    via_sudo: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Exit {
+    if via_sudo {
+        let _ = writeln!(
+            err,
+            "kbf-installer: update: not accepted through sudo; it needs no root, run it as the account that reads the token file"
+        );
+        return Exit::Usage;
+    }
+    crate::deploy::update::run(args, out, err)
+}
+
 /// How a `migrate` that went through ends: its report on `out`, as text, or with `--json` as
 /// one object. (A failure is said like every other verb's, by `dispatch`.)
 fn finish_migrate(json: bool, apply: bool, report: &str, out: &mut dyn Write) -> Exit {
@@ -586,6 +618,10 @@ fn finish_migrate(json: bool, apply: bool, report: &str, out: &mut dyn Write) ->
 /// `err`, or with `--json` as one object on `out`. A verb that succeeds prints nothing here,
 /// except `setup` (its steps) and `migrate` (its report).
 pub fn dispatch(cli: &Cli, euid: u32, out: &mut dyn Write, err: &mut dyn Write) -> Exit {
+    // `update` prints its own summary line and needs no root: it is a client of the update API.
+    if let Verb::Update(args) = &cli.verb {
+        return update_verb(args, sudo_caller(), out, err);
+    }
     let name = cli.verb.name();
     let mut say = |code: Exit, text: String, json: serde_json::Value| {
         // A closed pipe is the reader's business; the exit code still tells.
