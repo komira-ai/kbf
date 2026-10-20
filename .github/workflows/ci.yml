@@ -178,7 +178,9 @@ jobs:
       # it select tests of the workspace build by filter, not by `-p ... --test`: a build of
       # one package leaves out the dev-dependency features of the others, so it would build
       # kbf-installer again without `test-sandbox` and put a copy of its code in the report
-      # that no test runs. The installer's backup round trip
+      # that no test runs. They run the `#[ignore]`d tests only (`--run-ignored only`): the
+      # others ran above, and some (the installer's database:: ones) write files in a scratch
+      # directory another test of the full run creates. The installer's backup round trip
       # (backup::tests::real_server_round_trip) is in the installer filter.
       - name: Run the Postgres tests of kbf-state under coverage
         env:
@@ -187,23 +189,23 @@ jobs:
       - name: Run the installer's Postgres tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-installer) & (test(database::) or test(setup_creates_the_schema) or test(backup::tests::real_server_round_trip))'
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-installer) & (test(database::) or test(setup_creates_the_schema) or test(backup::tests::real_server_round_trip))'
       - name: Run the server's Postgres tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-server) & binary(state_store_postgres)'
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-server) & binary(state_store_postgres)'
       - name: Run the server's restart tests over Postgres under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-server) & binary(state_store) & test(over_postgres)'
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-server) & binary(state_store) & test(over_postgres)'
       - name: Run the two-children swap over Postgres under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-server) & binary(frontend) & test(two_children::fifty_builds_across_a_takeover_over_postgres)'
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-server) & binary(frontend) & test(two_children::fifty_builds_across_a_takeover_over_postgres)'
       - name: Run the frontend process test over Postgres under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored all -E 'package(kbf-cli) & binary(frontend_process) & test(postgres_state_store)'
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov nextest --workspace --locked --branch --no-report --no-fail-fast --run-ignored only -E 'package(kbf-cli) & binary(frontend_process) & test(postgres_state_store)'
       - name: Report
         env:
           LLVM_COV_FLAGS: -skip-functions
@@ -215,7 +217,7 @@ jobs:
       # The base's floors file, checked out beside this one; a base without one (the change
       # that adds the file) has nothing to compare, and the step says so.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: base

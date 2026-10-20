@@ -131,6 +131,15 @@ fn wiring(workflow: &str, job: &str, floors_exist: bool) -> Result<(), String> {
                 .to_owned(),
         );
     }
+    // A failed gate step skips later steps unless the condition says otherwise; a skipped
+    // checkout leaves no base file, which `--allow-missing-base` reads as a base without one.
+    let c = checkout.condition.as_deref().unwrap_or_default();
+    if !c.contains("!cancelled()") && !c.contains("always()") {
+        return Err(format!(
+            "the base checkout runs `if: {c}`, which a failed gate step skips, and the \
+             no-lowering step would then find no base file and pass; add `!cancelled() &&`"
+        ));
+    }
     if at(checkout) >= at(step) {
         return Err("the base checkout comes after the no-lowering step".to_owned());
     }
@@ -151,7 +160,7 @@ mod rules {
     use super::*;
 
     const GATE: &str = "      - run: cargo run -p kbf-coverage --locked -- --lcov l --root r --floors coverage-floors\n";
-    const CHECKOUT: &str = "      - uses: actions/checkout@abc # v7\n        if: ${{ github.event_name == 'pull_request' }}\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          path: base\n";
+    const CHECKOUT: &str = "      - uses: actions/checkout@abc # v7\n        if: ${{ !cancelled() && github.event_name == 'pull_request' }}\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          path: base\n";
     const LOWERING: &str = "      - if: ${{ !cancelled() && github.event_name == 'pull_request' }}\n        run: cargo run -p kbf-coverage --locked -- no-lowering --allow-missing-base --base base/coverage-floors --floors coverage-floors\n";
     const PR: &str = "github.event_name == 'pull_request'";
 
@@ -261,9 +270,19 @@ mod rules {
             (
                 format!(
                     "{GATE}{}{LOWERING}",
-                    CHECKOUT.replace(&format!("        if: ${{{{ {PR} }}}}\n"), "")
+                    CHECKOUT.replace(
+                        &format!("        if: ${{{{ !cancelled() && {PR} }}}}\n"),
+                        ""
+                    )
                 ),
                 "the base checkout is not conditional on pull requests, where there is a base",
+            ),
+            (
+                format!(
+                    "{GATE}{}{LOWERING}",
+                    CHECKOUT.replace("!cancelled() && ", "")
+                ),
+                "the base checkout runs `if: github.event_name == 'pull_request'`, which a failed gate step skips, and the no-lowering step would then find no base file and pass; add `!cancelled() &&`",
             ),
             (
                 format!("{GATE}{}{LOWERING}", CHECKOUT.replace(PR, "true")),
