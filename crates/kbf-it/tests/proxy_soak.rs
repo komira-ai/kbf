@@ -42,10 +42,11 @@ mod proxy_support;
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use kbf_proxy::Proxy;
+use kbf_testkit::dir::TestDir;
 use kbf_proxy::control::NoUpdates;
 use kbf_proxy::slot::{Retire, Slot};
 use proxy_support::{
@@ -70,8 +71,9 @@ const NEW: usize = 30;
 /// or reports `/readyz` 503 beside a ready real child.
 #[test]
 fn the_flip_with_two_hundred_streams_drops_none_and_each_child_serves_its_own() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("proxy-soak-{}", std::process::id()));
+    // Declared first, so it drops last: the children are reaped before it is removed.
+    let scratch = TestDir::under(env!("CARGO_TARGET_TMPDIR"), "proxy-soak");
+    let dir = scratch.path().to_path_buf();
     std::fs::create_dir_all(dir.join("bin")).expect("scratch");
     std::os::unix::fs::symlink(
         std::env::current_exe().expect("this binary"),
