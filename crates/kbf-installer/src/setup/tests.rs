@@ -7,6 +7,7 @@ use std::rc::Rc;
 use kbf_host::testkit::{FakeExec, RUNNER};
 use kbf_host::{Entry, Exec, HostPath, Owner, Perms, Step};
 
+use kbf_state::postgres::Unreached;
 use kbf_state::postgres::schema::Outcome;
 
 use super::backend::{Backend, Migrations, Releases, Schemas};
@@ -22,7 +23,7 @@ use crate::installer_toml::Source;
 use crate::layout::{Layout, Platform};
 use crate::migrate::{MigrateError, Unit};
 
-const DATABASE: &str = "postgres:///kbf?host=/run/postgresql";
+const DATABASE: &str = "postgres:///kbf?host=/run/postgresql&user=kbf-server";
 
 const SRC: &str = "/root/kbf.token";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -48,7 +49,32 @@ fn raw(mode: Mode) -> Raw {
         min_generation: None,
         commit: None,
         database: mode.keeps_state_in_database().then(|| DATABASE.to_owned()),
+        kbf: serving_flags(mode),
+        create_local_database: false,
         installer_config: None,
+    }
+}
+
+/// The `kbf.toml` flags a frontend or all-in-one host cannot be set up without, with nothing
+/// else (the files they name are in [`host`]); none for a node.
+fn serving_flags(mode: Mode) -> super::kbf_settings::KbfFlags {
+    let some = |s: &str| Some(s.to_owned());
+    match mode {
+        Mode::Frontend => super::kbf_settings::KbfFlags {
+            storage_url: some("http://127.0.0.1:8990"),
+            ..Default::default()
+        },
+        Mode::AllInOne => super::kbf_settings::KbfFlags {
+            cold_store: some("file:///var/lib/kbf/cold"),
+            meta_dir: some("/var/lib/kbf-meta"),
+            daemon_server: some("https://farm.example:8981"),
+            daemon_ca_cert: some("/etc/kbf/ca.pem"),
+            daemon_cert: some("/etc/kbf/node.pem"),
+            daemon_key: some("/etc/kbf/node.key"),
+            node_id: some("farm-1"),
+            ..Default::default()
+        },
+        _ => Default::default(),
     }
 }
 
@@ -77,6 +103,10 @@ fn put(exec: &mut FakeExec, path: &str, perms: u32, owner: Owner, bytes: &str) {
 fn host() -> FakeExec {
     let mut exec = FakeExec::new(0);
     put(&mut exec, SRC, 0o600, RUNNER, "tok-abc123\n");
+    // The all-in-one daemon half's CA, certificate and key (`serving_flags`).
+    put(&mut exec, "/etc/kbf/ca.pem", 0o644, ROOT, "ca");
+    put(&mut exec, "/etc/kbf/node.pem", 0o644, ROOT, "cert");
+    put(&mut exec, "/etc/kbf/node.key", 0o600, KBF, "key");
     exec
 }
 
@@ -142,6 +172,8 @@ type Asked = Rc<RefCell<Vec<String>>>;
 struct Server {
     found: Option<u32>,
     down: bool,
+    /// What a login is refused with, when it is.
+    unreached: Option<Unreached>,
     asked: Asked,
 }
 
@@ -150,6 +182,7 @@ impl Server {
         Server {
             found: None,
             down: false,
+            unreached: None,
             asked: Asked::default(),
         }
     }
@@ -158,11 +191,17 @@ impl Server {
 struct Session {
     found: Option<u32>,
     down: bool,
+    unreached: Option<Unreached>,
     url: String,
     asked: Asked,
 }
 
 impl SchemaOps for Session {
+    fn reach(&self) -> Result<(), Unreached> {
+        self.asked.borrow_mut().push(format!("reach {}", self.url));
+        self.unreached.clone().map_or(Ok(()), Err)
+    }
+
     fn setup(&self) -> Result<Outcome, String> {
         self.asked.borrow_mut().push(format!("setup {}", self.url));
         if self.down {
@@ -193,6 +232,7 @@ impl Schemas for Server {
         Ok(Box::new(Session {
             found: self.found,
             down: self.down,
+            unreached: self.unreached.clone(),
             url: url.to_owned(),
             asked: self.asked.clone(),
         }))
@@ -309,11 +349,17 @@ const FRONTEND_TOML: &str =
 # keys it writes; run setup again to change these.
 mode = \"frontend\"
 
+[listener]
+api-listen = \"127.0.0.1:8982\"
+
 [tls]
 api-token-file = \"/etc/kbf/api-token\"
 
+[storage-client]
+storage = \"http://127.0.0.1:8990\"
+
 [scheduler]
-state-store = \"postgres:///kbf?host=/run/postgresql\"
+state-store = \"postgres:///kbf?host=/run/postgresql&user=kbf-server\"
 ";
 
 const DAEMON_INSTALLER_TOML: &str = "release_source = \"frontend\"
@@ -1142,6 +1188,8 @@ fn every_bad_flag_is_named_and_nothing_is_written() {
         min_generation: Some(0),
         commit: None,
         database: Some(DATABASE.to_owned()),
+        kbf: super::kbf_settings::KbfFlags::default(),
+        create_local_database: false,
         installer_config: Some("/tmp/i.toml".to_owned()),
     };
     let mut exec = host();
@@ -1606,6 +1654,11 @@ fn a_view_forwards_reads_and_refuses_steps() {
 
 #[path = "more_tests.rs"]
 mod more;
+
+#[path = "kbf_settings_tests.rs"]
+mod kbf_settings_tests;
+#[path = "provision_tests.rs"]
+mod provision;
 
 #[path = "proxy_listen_tests.rs"]
 mod proxy_listen;

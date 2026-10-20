@@ -12,7 +12,12 @@ sudo kbf-installer setup --mode=daemon \
 sudo kbf-installer --apply setup ...                                                    # do it
 
 sudo kbf-installer setup --mode=frontend --release-url=https://releases.example/kbf \
-    --database='postgres:///kbf?host=/run/postgresql'
+    --database='postgres:///kbf?host=/run/postgresql&user=kbf' --create-local-database \
+    --listen=0.0.0.0:8980 --worker-listen=0.0.0.0:8981 \
+    --worker-tls-cert=/etc/kbf/worker.pem --worker-tls-key=/etc/kbf/worker.key \
+    --worker-client-ca=/etc/kbf/ca.pem \
+    --storage-url=https://storage.example:8983 --storage-ca=/etc/kbf/ca.pem \
+    --storage-client-cert=/etc/kbf/worker.pem --storage-client-key=/etc/kbf/worker.key
 ```
 
 Without `--apply` it prints each step as `DRY-RUN: <step>` and changes nothing. With it, it
@@ -27,13 +32,62 @@ prints `+ <step>` and does the step. It never prints a token.
 
 The modes in the first row enroll with a frontend when they start, so they need its URL and
 an enrollment token. The other two do not enroll; they keep their state in Postgres. The
-server, the database and the role exist before `setup` runs (the operator provides them);
-`--database` says where, as `postgres:///NAME?host=SOCKET_DIR`. A URL with a password is
+server exists before `setup` runs (the operator provides it); the role and the database
+exist too, or `--create-local-database` makes them (see "The state database" below).
+`--database` says where, as `postgres:///NAME?host=SOCKET_DIR&user=ROLE`; the role is
+required, because `setup` runs as root and the service as its own account. A URL with a password is
 refused (`installer.toml` is world-readable), and no message quotes a URL. `--commit` installs
 the first release before the host has enrolled, so it needs `--release-source=url`.
 `--min-generation` is the operator floor for orders; a re-run may raise it and never lowers it.
 `--installer-config` is a flag of `run`; `setup` writes `/etc/kbf/installer.toml`, where the
 installer's unit reads it, and refuses another path. A Mac is a node only (`--mode=daemon`).
+
+### The `kbf.toml` flags of a frontend and an all-in-one host
+
+A node's listeners, certificates and storage URL come from enrollment, so its `kbf.toml` is
+complete with the three keys above. A `frontend` or `all-in-one` host does not enroll; the
+certificates and addresses are the operator's, and `setup` takes them as flags and writes each
+as the key of the `kbf` flag it sets, in the table of that flag's group. The flag names that
+differ from the key are marked.
+
+| flag | `[table] key` | frontend | all-in-one |
+|---|---|---|---|
+| `--listen`, `--worker-listen` | `[listener]` | optional | optional |
+| `--api-listen` | `[listener] api-listen` | default `127.0.0.1:8982` | default `127.0.0.1:8982` |
+| `--reapi-tls-cert`, `--reapi-tls-key` | `[tls]` | both or none | both or none |
+| `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` | `[tls]` | all three or none | all three or none |
+| `--storage-url` (key `storage`) | `[storage-client] storage` | required | refused |
+| `--storage-ca`, `--storage-client-cert`, `--storage-client-key` | `[storage-client]` | all three with `https`, none with `http` | refused |
+| `--cold-store` | `[stores] cold-store` | refused | required, `file:///absolute/path` |
+| `--meta-dir` | `[stores] meta-dir` | refused | required, absolute path |
+| `--daemon-server` (key `server`), `--daemon-ca-cert` (`ca-cert`), `--daemon-cert` (`cert`), `--daemon-key` (`key`), `--node-id` | `[identity]` | refused | required |
+| (none) | `[daemon] driver = "container"` | | always: the only driver `all-in-one` accepts |
+
+A node mode refuses all of them. The rules, all checked before anything is written (exit 2,
+the flag and the rule named, a value never quoted): an address is `IP:PORT`; a file flag is an
+absolute path of plain characters, never the file's text; a URL has no user name, password,
+path or query; `http://` storage is for a loopback host only (as `kbf` refuses any other); the
+files named exist, are regular files (a link is not followed), and a key is owned by the user
+the mode's unit runs as with no group or other permission bit and readable by its owner, as
+`kbf`'s own start-up check requires, and a certificate or CA is owned by root or that user and
+not writable by group or others; an `s3://` cold store is refused because its credentials are
+in the environment, which `setup` does not manage; `--node-id` is a DNS label. Setting what
+`kbf` accepts but `setup` has no flag for (`releases-dir`, `reapi-auth-policy`,
+`worker-deny-list`, `proxy-auth-file`, the tuning keys) stays by hand: such keys survive a
+re-run under the rule below.
+
+What these checks do not cover, so the operator checks it: the directory that holds a key or a
+certificate is not looked at (its owner and mode are the operator's), and `--cold-store` and
+`--meta-dir` are checked as paths only, not for existing, being a directory or being writable
+by the service.
+
+Two edge cases of the rule below, stated plainly. A `kbf.toml` that holds only the keys `setup`
+writes is `setup`'s: a hand edit of one of them (say `listen` or `api-listen`) is rewritten to
+the flags, or the defaults, on the next run, because the file has nothing of the operator's to
+protect. And a file that also holds other settings is refused (exit 5) when a key differs, which
+includes a hand-set `api-listen` on a run without `--api-listen` (no flag means the default
+`127.0.0.1:8982`); the message names `--api-listen` as the way forward, which is to pass the
+address that is in the file.
 
 ## What it does, in this order
 
@@ -80,20 +134,26 @@ installer's unit reads it, and refuses another path. A Mac is a node only (`--mo
    The operator's `[proxy]` table is kept (written back whole, defaults filled in). Its `listen`
    key is read here, as below.
 7. Frontend and all-in-one: the state database's schema is created, or brought forward, by the
-   installer's own migrations; a dry run asks the server and says what it would do. `setup`
-   connects as the user running it (root) unless the URL names a role with `user=`, so the
-   server must let that role in from root (peer authentication through a `pg_ident` map, or a
-   local `trust` rule). A server that cannot be reached stops `setup` here (exit 1), with
-   `installer.toml` written and no release, `kbf.toml` or unit; running it again finishes.
+   installer's own migrations; a dry run asks the server and says what it would do. With
+   `--create-local-database` the role and the database are made first. `setup` then logs in
+   as root with the URL's role and, when the service account exists, as that account, so a
+   server that would admit one and not the other is refused here and not at the first start.
+   A server that cannot be reached, or that refuses a login, stops `setup` here (exit 1)
+   with the recipe below, `installer.toml` written and no release, `kbf.toml` or unit;
+   running it again finishes.
 8. `--commit`: the first release, through the installer's `Fetcher` (the fetch child and the
    verify pipeline) and nothing else, then made `releases/current` with no trial. This build
    has no fetcher wired in, so it stops here with exit 1, before `kbf.toml` and the units.
    When a release is installed already, `--commit` is not fetched.
 9. `/etc/kbf/kbf.toml` (root:service group, 0640): `mode`, `[frontend] url`, `[enroll]
    token_file`, on a frontend or all-in-one host `[tls] api-token-file` and `[scheduler]
-   state-store` (the database URL). A file that holds other settings is kept when these keys
-   match, and refused (exit 5, the keys named) when they differ. A file of only these keys is
-   rewritten.
+   state-store` (the database URL), and the flags of the table above, in the order mode, `[frontend]`,
+   `[enroll]`, `[listener]`, `[tls]`, `[storage-client]`, `[stores]`, `[identity]`, `[daemon]`,
+   `[scheduler]`. A file that holds other settings is kept when the keys this run writes
+   match, and refused (exit 5, the keys named, never a value) when they differ. A file of only
+   the keys this run writes is rewritten. What counts as another setting is relative to the run:
+   a `listen` in the file that this run gives no `--listen` for is the operator's, and the file
+   is kept or refused, never rewritten without it.
 10. The units, last: the mode's unit and `kbf-installer.service`, `systemctl enable`, with
    `--now` for a node's unit when a release is installed and `--no-start` is not given (the
    installer's own service does not wait for either). A unit that makes a frontend
@@ -136,6 +196,64 @@ stops `setup` with exit 5 and names the key, never the value.
 `feature/arch-v2` yet (kbf#1153), so a frontend or all-in-one host enables the units that exist
 (`mode_units` in `src/setup/plan.rs` is the one place to change when they land).
 
+## The state database
+
+`frontend` and `all-in-one` keep their state in one Postgres database on the host. The
+package only suggests the server (`Suggests: postgresql`, rpm `postgresql-server`): the
+package is shared by node hosts, which use none, and apt installs `Recommends` by default,
+which would start a database on every node. `setup` for these two modes refuses clearly when
+no server answers at the URL's socket, and says what to install.
+
+Install the server, then one of these.
+
+**Local server, setup makes the role and database (`--create-local-database`).** `setup` asks
+the server as its superuser, by running `/usr/bin/psql` as the operating-system user
+`postgres` over the Unix socket the URL names: peer authentication, no password anywhere. It
+creates, if missing, a login role (no password, not a superuser, no CREATEDB, CREATEROLE or
+REPLICATION) and a database owned by it, both named by the URL. A re-run creates only what is
+missing. It alters nothing that exists: a role that cannot log in or holds any privilege
+(superuser, CREATEROLE, CREATEDB, REPLICATION, BYPASSRLS), and a database another role owns,
+are refused (exit 1) and left as they are. The names must be
+letters, digits, `_` and `-` (at most 63), the role neither `postgres` nor `pg_`-prefixed,
+and the host a Linux host with a `postgres` account. The server's socket directory comes from
+`host=` and must be absolute; a remote server is never reached this way. `--database` names
+one server: a URL with several hosts or ports is refused, so that the role is never made on
+one server and the login tried on another.
+
+**`setup` never edits `pg_hba.conf` or `pg_ident.conf`.** It logs in the way kbf will and,
+when the server refuses, prints the rules to add. For a role `<role>` in database
+`<database>` and a service account `<service>` (`kbf-server` for `frontend` and `all-in-one`),
+above the first `local` line of `pg_hba.conf`:
+
+```text
+local  <database>  <role>  peer map=kbf
+```
+
+and in `pg_ident.conf`:
+
+```text
+kbf  root       <role>
+kbf  <service>  <role>
+```
+
+then reload the server (`pg_ctl reload`, or `systemctl reload postgresql`; a restart is not
+needed) and run `setup` again. If the role is named like the service account, the first
+`pg_ident` line alone is the missing part for root.
+
+`kbf` is the name of the map and any name works, as long as the `pg_hba.conf` line and the
+`pg_ident.conf` lines use the same one (a host that already has a map, `kbfmap` say, keeps
+it): `setup` never reads either file, it only tries the logins, so it does not know the name.
+
+**Remote or managed server, or a role and database the operator makes.** `setup` does not
+reach a remote server's superuser and holds no password. Create the role (login, no
+superuser) and a database it owns, make the server admit the logins above (with a server over
+TCP, client certificates are out of scope, see `docs/design/frontend-proxy.md` section 11),
+and run `setup` without `--create-local-database`: it only checks that it can log in, then
+creates or brings forward the schema.
+
+No refusal quotes the URL, the role, the database or the socket directory; the server's own
+words, which do, stay in its log.
+
 ## Backup and restore
 
 A frontend or all-in-one host keeps all of kbf's state in its Postgres database, so that
@@ -150,7 +268,10 @@ ones of the mode's own unit). The unit asserts that file, so where `setup` has n
 (or it was deleted) the unit fails, rather than run as root or be skipped as a success. When
 the drop-in changes under a timer that is enabled already (a mode change), `setup` runs
 `systemctl daemon-reload` so the next run uses it. `setup` enables the timer on
-the two modes; the units are in the package like the others (`packaging/linux/units`).
+the two modes; the units are in the package like the others (`packaging/linux/units`). The
+backup runs as the role and in the database that "The state database" above provisions: both
+come from the `database` URL of `installer.toml`, whether `setup` made them
+(`--create-local-database`) or the operator did.
 
 **What the backup is.** `pg_dump` in custom format of the database `installer.toml` names, in
 `/var/lib/<state directory>/backups/kbf-<UTC time>.dump` (for example
@@ -184,7 +305,8 @@ the operator's (kbf does not push anywhere), and a disk lost takes both.
 
 **Prerequisites.** `pg_dump` and `pg_restore` of the same major version as the server, or a
 newer one (the `postgresql-client` package; a client older than the server refuses to dump).
-The package does not depend on it yet. Both are found by name in `PATH`; `--pg-dump` and
+The package does not depend on it: it only suggests the Postgres server (see "The state
+database"), and the server package brings its client on most distributions. Both are found by name in `PATH`; `--pg-dump` and
 `--pg-restore` name other paths.
 
 **The first backup, and its restore test.** The design requires both before the farm depends
@@ -248,6 +370,14 @@ missing user); 3 a release the fetcher rejected; 5 only a person can go on (a `k
 The contract (`docs/design/kbf-installer.md`) is normative; these are the places `setup` does
 something the text does not say or says differently, so a reader can change one or the other.
 
+- **The `kbf.toml` flags (W10 gap B7).** The contract's `kbf.toml` holds the mode and the
+  frontend URL only; a frontend or all-in-one file written so was a file `kbf` refused at start
+  (`--storage` required, no cold store, no daemon identity). `--storage-url` is not
+  `--storage`, which reads as the mode's name beside `--mode=storage`; the daemon half's flags carry
+  `daemon-` because `--cert` and `--server` mean nothing on `setup`'s line. The operator API
+  address has a default because `api-token-file`, which `setup` always writes, requires
+  `api-listen` in `kbf`. `--admin-listen` (the handover port) is not a flag: it belongs to a
+  frontend run under the proxy and needs that unit.
 - **New flags.** The contract's flag list has no way to give the frontend URL it says goes into
   `kbf.toml`, so there is `--frontend-url`. `--token-file` is added to the CLI of P1.
 - **The token's owner.** The contract says 0600 root:kbf. kbf's own loaders (`kbf-enroll`'s

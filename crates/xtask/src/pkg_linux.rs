@@ -66,6 +66,13 @@ pub fn unit_accounts(text: &str) -> Vec<(&'static str, String)> {
 }
 /// The `Depends` of the deb.
 pub const DEB_DEPENDS: [&str; 4] = ["crun", "uidmap", "systemd", "ca-certificates"];
+/// The `Suggests` of the deb: a Postgres server, for a frontend or all-in-one host that keeps
+/// its state on the host. A suggestion, not a `Depends` or `Recommends`: node hosts keep no
+/// state in Postgres, and apt installs recommended packages by default. `setup` refuses a
+/// frontend host with no reachable server, saying what to install.
+pub const DEB_SUGGESTS: [&str; 1] = ["postgresql"];
+/// The `Suggests` of the rpm.
+pub const RPM_SUGGESTS: [&str; 1] = ["postgresql-server"];
 /// The `Requires` of the rpm: Fedora's `uidmap` is `shadow-utils`.
 pub const RPM_DEPENDS: [&str; 4] = ["crun", "shadow-utils", "systemd", "ca-certificates"];
 /// The trust files and their modes: the pinned `gh` and the two data files.
@@ -304,7 +311,8 @@ pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
          homepage: \"https://github.com/komira-ai/kbf\"\n\
          license: \"Apache-2.0\"\n\
          depends:\n{deb}\
-         overrides:\n  rpm:\n    depends:\n{rpm}\
+         suggests:\n{deb_s}\
+         overrides:\n  rpm:\n    depends:\n{rpm}    suggests:\n{rpm_s}\
          deb:\n  compression: \"gzip\"\n\
          rpm:\n  compression: \"gzip\"\n  buildhost: {host}\n\
          contents:\n",
@@ -313,6 +321,8 @@ pub fn config(entries: &[Entry], platform: Platform, version: &str) -> String {
         version = quoted(version),
         deb = list(&DEB_DEPENDS, "  "),
         rpm = list(&RPM_DEPENDS, "      "),
+        deb_s = list(&DEB_SUGGESTS, "  "),
+        rpm_s = list(&RPM_SUGGESTS, "      "),
         host = quoted(BUILD_HOST),
     );
     for e in entries {

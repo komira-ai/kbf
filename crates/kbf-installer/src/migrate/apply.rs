@@ -19,7 +19,7 @@ use crate::CommitId;
 use crate::binary::Version;
 use crate::helper::memory::{Memory, StagedFacts};
 use crate::helper::status;
-use crate::layout;
+use crate::layout::{self, Platform};
 use crate::state::{self, Locked, State};
 
 /// The rules every file read and written is judged by.
@@ -73,7 +73,8 @@ fn look(m: &Migration, rules: &Rules) -> Result<Look, MigrateError> {
             .push("already migrated: nothing to do".to_owned());
         return Ok(Look::Settled(report));
     }
-    let Some(old) = old::read(&m.layout, &m.roots, rules)? else {
+    let resume = journal.as_ref().is_some_and(Journal::kit_begun);
+    let Some(old) = old::read(&m.layout, &m.roots, rules, resume)? else {
         if journal.is_some() {
             return Err(MigrateError::Disagree(
                 "a migration was begun, and the old state it read is gone".to_owned(),
@@ -115,13 +116,18 @@ fn judge(m: &Migration, old: &Old) -> Result<OldTree, MigrateError> {
 }
 
 /// What the plan says of the floor, the staged release and the releases found.
-fn report_plan(
-    report: &mut Report,
-    mode: Mode,
-    seeded: &Seeded,
-    staged: Option<&CommitId>,
-    found: &[Found],
-) {
+fn report_plan(report: &mut Report, mode: Mode, seeded: &Seeded, old: &Old, found: &[Found]) {
+    let staged = old.state.staged.as_ref();
+    if let Some(form) = old.kit {
+        report.line(
+            mode,
+            format!(
+                "a host the Mac kit installed ({}): the links are the state; there is no old \
+                 state or helper memory to carry over",
+                form.describe()
+            ),
+        );
+    }
     report.warnings.extend(seeded.warnings.iter().cloned());
     report.min_generation = seeded.min_generation;
     if let Some(generation) = seeded.min_generation {
@@ -168,14 +174,18 @@ fn unchanged(probed: &[Option<CommitId>; 2], old: &Old) -> Result<(), MigrateErr
 /// The old layout once the services are stopped: read and judged like the looks before it
 /// (the journal is this run's own by now, and is not read), `current` and `previous` as
 /// probed, and the floor raised to what the old helper remembers now (a floor only goes up).
+///
+/// `kit` is set for a kit host, whose journal this run has written: the plist may be one an
+/// earlier run of it repointed.
 fn settle(
     m: &Migration,
     rules: &Rules,
     probed: &[Option<CommitId>; 2],
     claim: &floor::Claim,
     seeded: Seeded,
+    kit: bool,
 ) -> Result<(Old, Seeded), MigrateError> {
-    let Some(old) = old::read(&m.layout, &m.roots, rules)? else {
+    let Some(old) = old::read(&m.layout, &m.roots, rules, kit)? else {
         return Err(MigrateError::Changed("the old state is gone".to_owned()));
     };
     judge(m, &old)?;
@@ -197,7 +207,7 @@ pub fn migrate<E: Exec>(
     // (`found`, and the names it probed them under); what it read is not written from. The
     // source of the floor is asked here too, once: the frontend is a call over the network,
     // not one to make with the locks held.
-    let (found, probed, claim) = {
+    let (found, probed, claim, kit) = {
         let first = match look(m, &rules)? {
             Look::Settled(report) => return Ok(report),
             Look::Old(seen) => seen,
@@ -219,7 +229,7 @@ pub fn migrate<E: Exec>(
                 &mut report,
                 mode,
                 &floor::seed(&first.old.memory, &claim),
-                first.old.state.staged.as_ref(),
+                &first.old,
                 &found,
             );
             plan(m, exec, &mut report)?;
@@ -229,12 +239,15 @@ pub fn migrate<E: Exec>(
             first.old.state.current.clone(),
             first.old.state.previous.clone(),
         ];
-        (found, probed, claim)
+        (found, probed, claim, first.old.kit.is_some())
     };
     // Both locks: no verb of the old tools is mid-way, and no run of the installer changes
     // its state while this one does. Each is waited for `m.lock_wait` and no longer (busy,
     // exit 4), the old tools' first and let go with the error.
-    let _old_lock = OldLock::take(&m.layout, &m.roots, m.lock_wait)?;
+    // A kit host has none: the kit keeps no lock, and none is made for it.
+    let _old_lock = (!kit)
+        .then(|| OldLock::take(&m.layout, &m.roots, m.lock_wait))
+        .transpose()?;
     state::make_lock_dir(&m.layout)?;
     let lock = Locked::acquire_within(&m.layout, m.lock_wait)?;
     // Everything read before the locks may be stale by now: a verb of the old tools (or the
@@ -251,20 +264,22 @@ pub fn migrate<E: Exec>(
         }
     };
     unchanged(&probed, &seen.old)?;
+    if seen.old.kit.is_some() != kit {
+        return Err(MigrateError::Changed(
+            "the host is no longer the kind of host it was: a kit host and an old host \
+             are not each other"
+                .to_owned(),
+        ));
+    }
     let Seen { journal, old, .. } = *seen;
     let seeded = floor::seed(&old.memory, &claim);
     let mut report = Report::new(Outcome::Migrated);
-    report_plan(
-        &mut report,
-        mode,
-        &seeded,
-        old.state.staged.as_ref(),
-        &found,
-    );
+    report_plan(&mut report, mode, &seeded, &old, &found);
     let tree = NewTree::create(&m.layout, &rules)?;
     tree.sweep_partials()?;
     let mut journal = journal.unwrap_or_else(|| Journal::new(Vec::new(), None));
     journal.phase = Phase::Started;
+    journal.kit = kit;
     journal.units = m.units.clone();
     journal.helper_unit = m.helper_unit.clone();
     tree.state.put_journal(&journal)?;
@@ -331,7 +346,7 @@ pub fn migrate<E: Exec>(
     // run again as they were and the run ends before the installer's state, the links or the
     // units are written (the journal and the copies made are in the new tree, and a run again
     // starts from what is there).
-    let (old, seeded) = match settle(m, &rules, &probed, &claim, seeded) {
+    let (old, seeded) = match settle(m, &rules, &probed, &claim, seeded, kit) {
         Ok(settled) => settled,
         Err(error) => {
             for unit in &journal.stopped {
@@ -387,7 +402,10 @@ pub fn migrate<E: Exec>(
     }
     journal.phase = Phase::Done;
     tree.state.put_journal(&journal)?;
-    note_old_state(m)?;
+    // A kit host has no old state directory to leave a note in, and none is made.
+    if !kit {
+        note_old_state(m)?;
+    }
     Ok(report)
 }
 
@@ -434,12 +452,20 @@ fn find(
         let Some(name) = name else { continue };
         let dir = tree.release(name)?;
         tree::digest(rules, &dir)?;
+        let holds_daemon = m.roots.platform == Platform::MacOs
+            && tree::absent(rustix::fs::statat(
+                &dir,
+                layout::RELEASE_DAEMON,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            ))
+            .map_err(MigrateError::io(layout::RELEASE_DAEMON))?
+            .is_some();
         let program: PathBuf = m
             .layout
             .join(&m.roots.old_tree)
             .join("releases")
             .join(name.as_str())
-            .join(m.roots.binary());
+            .join(m.roots.binary(old.kit.is_some(), holds_daemon));
         let version = probe(hooks.runner, program, m.run_as, name)?;
         found.push(Found {
             role,

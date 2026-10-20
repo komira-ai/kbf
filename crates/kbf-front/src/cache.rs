@@ -287,6 +287,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Without a gate every sealed object is flushed.
     #[must_use]
     pub fn with_flush_gate(mut self, gate: Arc<dyn FlushGate>) -> Self {
+        self.writer.born.judge_by(Arc::clone(&gate));
         self.gate = Some(gate);
         self
     }
@@ -790,6 +791,7 @@ fn unexpected(applied: &Applied) -> CacheError {
 }
 
 mod batch;
+mod clear;
 mod consistency;
 mod direct;
 mod evict;
@@ -807,6 +809,7 @@ mod verify;
 mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
+pub use clear::FlushReport;
 pub use consistency::{
     EVICT_BATCH, EvictReady, HeldObject, NEEDS_V3, PASS_OPENS_PER_SEC, PassReport,
 };

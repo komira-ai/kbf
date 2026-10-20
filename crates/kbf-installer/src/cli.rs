@@ -39,7 +39,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Verb {
     /// First install: accounts, directories, installer.toml, the first release.
-    Setup(SetupArgs),
+    Setup(Box<SetupArgs>),
     /// What is installed, staged and pending, and the last refusal.
     Status,
     /// Run by kbf-installer.service: act on the orders kbf wrote, revert an expired swap.
@@ -136,15 +136,27 @@ pub struct SetupArgs {
     /// kbf reads. For the modes that enroll.
     #[arg(long)]
     pub token_file: Option<String>,
-    /// The state database, as postgres:///NAME?host=SOCKET_DIR (no password). Required for
-    /// `frontend` and `all-in-one`: written to installer.toml and, as `state-store`, to
-    /// kbf.toml, and setup creates (or brings forward) its schema. The server, the database
-    /// and the role exist before setup runs.
+    /// The state database, as postgres:///NAME?host=SOCKET_DIR&user=ROLE (no password).
+    /// Required for `frontend` and `all-in-one`: written to installer.toml and, as
+    /// `state-store`, to kbf.toml, and setup creates (or brings forward) its schema. The
+    /// server exists before setup runs, and so do the role and the database unless
+    /// --create-local-database makes them.
     #[arg(long)]
     pub database: Option<String>,
+    /// For a host whose Postgres runs locally: create the login role and the database the
+    /// `--database` URL names (owned by the role, no password), as the server's superuser over
+    /// its Unix socket (peer authentication, no password), if they are not there. Never
+    /// edits `pg_hba.conf`; refuses, saying which rule to add, when the server does not admit
+    /// the login. Without it, setup only checks that it can log in.
+    #[arg(long)]
+    pub create_local_database: bool,
     /// Enable the units without starting them.
     #[arg(long)]
     pub no_start: bool,
+    /// The kbf.toml settings of a frontend or all-in-one host (listeners, certificates,
+    /// storage): each sets the kbf flag of its name.
+    #[command(flatten)]
+    pub kbf: crate::setup::kbf_settings::KbfFlags,
     /// The installer.toml `setup` writes (and reads, to keep what it does not set), under the
     /// host root: `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac, which
     /// is the only value setup accepts. The same flag, with the same meaning, as on `run`.

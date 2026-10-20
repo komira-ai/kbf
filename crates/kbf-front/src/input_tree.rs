@@ -100,7 +100,7 @@ pub(crate) struct Decoded {
 }
 
 impl Decoded {
-    fn cost(&self) -> u64 {
+    pub(crate) fn cost(&self) -> u64 {
         let digests = (self.files.len() + self.dirs.len()) as u64;
         digests
             .saturating_mul(size_of::<Digest>() as u64)
@@ -366,6 +366,19 @@ pub(crate) struct Walked {
     pub(crate) absent: Vec<Digest>,
     /// Directory blobs read from the store.
     pub(crate) dirs_read: u64,
+    /// How long each of those reads took, and each failed read too (a walk over a store).
+    pub(crate) read_times: Vec<std::time::Duration>,
+    /// Of a walk over a store, with its content cache of decoded Directories: the
+    /// Directories it took without reading (from the cache, or from a read another walk
+    /// had open: `dir_cache_merged` of them); the cached ones among them, whose digests
+    /// it put to FindMissing; the reads it led; the entries those pushed out; and the
+    /// bytes held at its end.
+    pub(crate) dir_cache_hits: u64,
+    pub(crate) dirs_present_checked: u64,
+    pub(crate) dir_cache_misses: u64,
+    pub(crate) dir_cache_merged: u64,
+    pub(crate) dir_cache_evicted: u64,
+    pub(crate) dir_cache_bytes: u64,
     /// Directories skipped with everything under them, because an earlier walk verified
     /// them (the walk over a store; the in-process cache counts its own).
     pub(crate) dirs_skipped: u64,

@@ -276,6 +276,34 @@ fn the_cold_store_registration_fields_are_pinned() {
     assert_eq!(beat.encode_to_vec(), [0x38, 4, 0x40, 3], "fields 7 and 8");
 }
 
+// Catches: the maps a frontend retains from before the newest sent on a number that a later
+// field reuses, or in a shape an older node cannot skip: they are a repeated message on 6
+// (Register) and 4 (Heartbeat), after every field an older build knows, so an older node
+// ignores them and reads the rest as before. The bytes are pinned.
+#[test]
+fn the_retained_previous_maps_are_pinned() {
+    let register = pb::RegisterResponse {
+        retained_previous: vec![pb::Map::default(), pb::Map::default()],
+        ..Default::default()
+    };
+    assert_eq!(
+        register.encode_to_vec(),
+        [0x32, 0, 0x32, 0],
+        "field 6, twice"
+    );
+    let answer = pb::HeartbeatResponse {
+        retained_previous: vec![pb::Map::default()],
+        ..Default::default()
+    };
+    assert_eq!(answer.encode_to_vec(), [0x22, 0], "field 4");
+    assert!(
+        pb::HeartbeatResponse::decode(&[0x18, 9][..])
+            .expect("an older frontend's answer")
+            .retained_previous
+            .is_empty()
+    );
+}
+
 // Catches: a status enum whose zero is a real outcome (an older node's heartbeat, which
 // has no such field, would then read as a report) and an unknown number that decodes
 // (the frontend must be able to refuse a status it does not know).
@@ -340,4 +368,40 @@ fn the_heartbeat_open_writes_are_fields_nine_and_ten() {
         "a node that predates the report cannot say"
     );
     assert_eq!(older.open_writes, 0);
+}
+
+// Catches: the flush report moved to other field numbers or colliding with the open-writes
+// report (9, 10). The bytes are pinned: the clear generation on 11, the known flag on 12,
+// the backlog on 13 and 14, each a varint, beside the fields before them. A node that
+// predates the report cannot say: its decode has no flag set, whatever else is on the wire.
+#[test]
+fn the_heartbeat_flush_report_is_fields_eleven_to_fourteen() {
+    let beat = pb::HeartbeatRequest {
+        member_id: 1,
+        flush_clear_gen: 7,
+        flush_known: true,
+        staged_objects: 3,
+        staged_bytes: 300,
+        ..Default::default()
+    };
+    let bytes = [0x08, 1, 0x58, 7, 0x60, 1, 0x68, 3, 0x70, 0xac, 0x02];
+    assert_eq!(beat.encode_to_vec(), bytes, "fields 1 and 11 to 14");
+    assert_eq!(
+        pb::HeartbeatRequest::decode(&bytes[..]).expect("decodes"),
+        beat
+    );
+
+    let older = pb::HeartbeatRequest::decode(&bytes[..2]).expect("decodes");
+    assert!(
+        !older.flush_known,
+        "a node that predates the report cannot say"
+    );
+    assert_eq!(
+        (
+            older.flush_clear_gen,
+            older.staged_objects,
+            older.staged_bytes
+        ),
+        (0, 0, 0)
+    );
 }

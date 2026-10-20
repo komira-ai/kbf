@@ -250,6 +250,28 @@ async fn held_maps_view_the_holder_and_give_up_on_a_map_that_never_comes() {
     );
 }
 
+/// Catches a view that shows one map before the newest: a blob written before several quick
+/// changes is found by the maps the holder retains, newest first, and no more than its cap.
+#[tokio::test]
+async fn held_maps_view_every_map_the_holder_retains() {
+    let holder = Arc::new(MapHolder::new());
+    let maps = HeldMaps::new(Arc::clone(&holder), Duration::from_secs(5));
+    for generation in 1..=8 {
+        holder.offer(map(
+            generation,
+            1,
+            vec![member(1, "localhost:1".to_owned())],
+        ));
+    }
+    let view = maps.current().expect("a map");
+    assert_eq!(view.map.generation(), 8);
+    assert_eq!(view.previous.as_ref().map(|m| m.generation()), Some(7));
+    let earlier: Vec<u64> = view.earlier.iter().map(|m| m.generation()).collect();
+    assert_eq!(earlier, [6, 5, 4]);
+    let history: Vec<u64> = view.history().iter().map(|m| m.generation()).collect();
+    assert_eq!(history, [7, 6, 5, 4]);
+}
+
 fn config(in_flight: usize) -> TransferConfig {
     TransferConfig {
         in_flight,

@@ -1849,6 +1849,7 @@ dependencies = [
  "kbf-proxy",
  "kbf-state",
  "kbf-testkit",
+ "kbf-types",
  "kbf-update",
  "libc",
  "postgres",
