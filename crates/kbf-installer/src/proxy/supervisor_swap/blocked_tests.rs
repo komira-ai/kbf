@@ -119,6 +119,28 @@ fn a_releases_path_that_is_a_file_blocks() {
     );
 }
 
+/// Catches a startup hold that lets a `POST` through: `active` is a guess then, and the idle
+/// slot looks idle. The hold's reason is in the answer; the migrator's is separate.
+#[test]
+fn a_startup_hold_blocks_with_its_reason() {
+    let (sup, _dir) = over("blk-hold", |_, c| {
+        c.startup_hold = Some("no frontend child is running".to_owned());
+    });
+    let why = sup.start_blocked().expect("blocked");
+    assert!(why.contains("startup hold is in force"), "{why}");
+    assert!(why.contains("no frontend child is running"), "{why}");
+}
+
+#[test]
+fn a_migrator_that_can_never_pass_blocks_with_its_reason() {
+    let (sup, _dir) = over("blk-migrator", |_, c| {
+        c.migrator_blocked = Some("schema unknown".to_owned());
+    });
+    let why = sup.start_blocked().expect("blocked");
+    assert!(why.contains("step migrate"), "{why}");
+    assert!(why.contains("schema unknown"), "{why}");
+}
+
 #[test]
 fn a_candidate_slot_that_still_runs_a_process_blocks() {
     let (sup, _dir) = over("blk-busy", |rig, _| rig.occupy(Slot::B));
