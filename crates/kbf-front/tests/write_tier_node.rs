@@ -182,6 +182,7 @@ async fn a_member_and_boot_handed_out_again_by_a_fresh_store_do_not_strand_segme
         (vec![object], 0)
     );
     assert_eq!(second.log.staged_state(object), None);
+    assert_eq!(second.log.losses(), (0, 0), "a move is not a loss");
     let moved = second.log.object_of(&written[0].digest);
     assert!(
         moved.seq() > 3,

@@ -14,11 +14,16 @@
 //!   else the key is another object's (a frontend moved to a fresh state store hands out
 //!   a member and boot that an earlier store gave to another node, so the keys are
 //!   named again). The numbering moves past the range the other lifetime used
-//!   ([`Cache::leave_numbering`]), and the object's records are staged again as an
-//!   object of their own, which flushes under a key of its own; the object is marked
-//!   unreachable so the records heal into it, and its block is freed. The other
-//!   object is never touched. An object a build before this one left in `Conflict` is
-//!   taken the same way at the start of a round.
+//!   (`Writer::leave_numbering`), the object's records are copied into a block of their
+//!   own and synced (or, if the tier has no room, streamed to the store), and one
+//!   `ReseatStaged` moves the index entries, the flush order and the staged table entry
+//!   to the new object in a single commit: nothing is marked unreachable or counted as
+//!   lost, no blob is unavailable at any point, and a crash or failure before the commit
+//!   leaves the object and its block as they were. The old block is freed after the
+//!   commit; the other object is never touched. An object a build before this one left
+//!   in `Conflict` is taken the same way at the start of a round. The copy is not
+//!   hashed on the tier path, so a record the disk had damaged is found, as for any
+//!   staged object, by the new object's flush.
 //! - **Every record is hashed** as its pieces are read, on the cache's hashing pool
 //!   (off the runtime workers): the daemon's digests were trusted when the upload was
 //!   acknowledged, so this is where they are checked. The footer is written only once
@@ -43,7 +48,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt;
-use kbf_meta::{Applied, Command, ObjectId, StagedObject, StagedState, UnreachableReason};
+use kbf_meta::{
+    Applied, Command, ObjectId, StagedObject, StagedPut, StagedState, UnreachableReason,
+};
 use kbf_objstore::{BodyStream, ObjectStore, ObjectStoreError};
 use kbf_segments::Footer;
 use kbf_segments::layout::{encode_footer, footer_len};
@@ -179,6 +186,19 @@ pub(super) fn flush_backoff(failures: u32) -> Duration {
     FLUSH_BACKOFF_FIRST
         .saturating_mul(1 << doublings)
         .min(FLUSH_BACKOFF_MAX)
+}
+
+/// How many times the commit that moves a staged object is tried before the move is
+/// given up for this round (the block is synced and held while it is tried).
+pub(super) const RESEAT_ATTEMPTS: u32 = 3;
+
+/// Whether `error` says the block file of a staged object is gone.
+fn block_gone(error: &kbf_tier::TierError) -> bool {
+    match error {
+        kbf_tier::TierError::UnknownBlock(_) => true,
+        kbf_tier::TierError::Io { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 /// What one [`Cache::flush_tier`] round did.
@@ -464,24 +484,34 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             )));
         }
         tracing::warn!(%object, %key, "the store holds another object under a staged object's key; staging its records again under a new key");
-        staging.counters.conflicts.add(1);
         self.reseat(staging, object, blobs).await?;
+        staging.counters.conflicts.add(1);
         Ok(Flushed::Conflict)
     }
 
     /// Moves a staged `object` whose key is another object's (`blobs`, its records and
-    /// their offsets in its block) to an object of its own: the numbering leaves the
-    /// range that the other lifetime of this member and boot used, the records are
-    /// staged again ([`Cache::restage`]), the object is marked unreachable just before
-    /// they commit so they heal into the new object, and its block is freed.
+    /// their offsets in its block) to an object of its own, in one commit.
     ///
-    /// Every step before the mark can fail and be tried again (the object is still
-    /// staged). A failure of the last commit comes back as an error but is not tried
-    /// again: the object has left the queue, and those blobs are unavailable until
-    /// uploaded again, as for a corrupt object ([`Cache::drop_mismatched`]).
+    /// The numbering leaves the range that the other lifetime of this member and boot
+    /// used (`Writer::leave_numbering`); the records are
+    /// copied into a block of their own (or streamed to the store, if the tier has no
+    /// room) and made durable; and one `ReseatStaged` moves every index entry to the new
+    /// object, carries the flush order over to it and takes `object` out of the staged
+    /// table. Until that commit nothing about `object` has changed, so a failure or a
+    /// crash before it leaves the object and its block as they were, to be tried
+    /// again; after it, the old block is freed. No blob is unavailable at any point,
+    /// and none is counted as lost.
+    ///
+    /// The copy is not hashed on the tier path: a record the disk damaged is found by
+    /// the new object's flush, which hashes every record, as for any staged object.
+    ///
+    /// A block that is gone (the file is missing: nothing can produce the records) ends
+    /// the object instead of repeating every round: it is marked unreachable as missing,
+    /// which is a loss, and counted as one.
     ///
     /// # Errors
-    /// The copy, the mark or the store failed before the mark committed.
+    /// The copy, the store or the commit failed, after the commit was tried
+    /// [`RESEAT_ATTEMPTS`] times; nothing changed.
     async fn reseat(
         &self,
         staging: &Staging,
@@ -489,8 +519,15 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         blobs: &[(Digest, u64)],
     ) -> Result<(), CacheError> {
         self.writer.leave_numbering();
-        self.restage(staging, object, blobs, Some(UnreachableReason::Missing))
-            .await?;
+        match self.restage(staging, object, blobs, Some(object)).await {
+            Ok(()) => {}
+            Err(CacheError::Tier(e)) if block_gone(&e) => {
+                tracing::error!(%object, error = %e, "the block of a staged object whose key holds another object is gone; its records are lost");
+                self.mark_unreachable(object, UnreachableReason::Missing)
+                    .await?;
+            }
+            Err(e) => return Err(e),
+        }
         let _ = staging.tier.discard(object);
         Ok(())
     }
@@ -526,18 +563,29 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// Stores `good` (records of `object`'s block, each at its offset there) again as an
     /// object of their own, back to back, copied from the block a piece at a time: on
-    /// the write tier, a block of its own staged with one `PutStaged` (flushed, and so
-    /// hashed again, by a later round), when the tier has room; else in the store,
-    /// hashed again as the pieces go, and indexed with one `PutBlobs`.
+    /// the write tier, a block of its own, synced, when the tier has room; else in the
+    /// store, hashed again as the pieces go. Then one commit says where they are: with
+    /// `from` (an object whose key holds another object), a `ReseatStaged` that moves
+    /// the entries off `from`; without (a corrupt object, already marked unreachable),
+    /// a `PutStaged` or `PutBlobs` that heals them. A staged copy is flushed, and so
+    /// hashed again, by a later round.
     async fn restage(
         &self,
         staging: &Staging,
         object: ObjectId,
         good: &[(Digest, u64)],
-        mark: Option<UnreachableReason>,
+        from: Option<ObjectId>,
     ) -> Result<(), CacheError> {
         if good.is_empty() {
-            return Ok(());
+            // Nothing to move: the object only leaves the table.
+            let Some(from) = from else { return Ok(()) };
+            let empty = StagedPut {
+                object: self.writer.allocate(),
+                end: 0,
+                seal: true,
+                blobs: Vec::new(),
+            };
+            return self.writer.reseat(staging.id, from, empty, true).await;
         }
         let mut spans = Vec::with_capacity(good.len());
         let mut listed = Vec::with_capacity(good.len());
@@ -563,10 +611,17 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 Ok(range)
             };
             let range = blocking(&self.writer.metrics, Box::new(copy)).await?;
-            if let Some(reason) = mark {
-                self.mark_unreachable(object, reason).await?;
-            }
-            return self.stage_range(range, listed).await;
+            let (staging, synced) = self.sync_range(range).await?;
+            let at = synced.offset();
+            let blobs = listed.into_iter().map(|(d, o)| (d, at + o)).collect();
+            return match from {
+                Some(from) => {
+                    self.writer
+                        .reseat_staged(&staging, synced, blobs, from)
+                        .await
+                }
+                None => self.writer.put_staged(&staging, synced, blobs, true).await,
+            };
         }
         let total = at + footer_len(good.len() as u64);
         let found = Found::default();
@@ -581,10 +636,19 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .await
             .map_err(read_back)?;
         let placed = placed(&footer, &key, sound, good.iter().map(|(d, _)| *d))?;
-        if let Some(reason) = mark {
-            self.mark_unreachable(object, reason).await?;
-        }
-        self.writer.commit_segment(placed).await
+        let Some(from) = from else {
+            return self.writer.commit_segment(placed).await;
+        };
+        let put = StagedPut {
+            object: sound,
+            end: total,
+            seal: true,
+            blobs: placed
+                .into_iter()
+                .map(|(digest, location)| (digest, location.offset))
+                .collect(),
+        };
+        self.writer.reseat(staging.id, from, put, true).await
     }
 
     /// The body of an object read from `object`'s block: the bytes of `spans` (ranges

@@ -197,6 +197,9 @@ pub enum TierError {
     /// horizon).
     #[error("object {0} is not staged")]
     NotStaged(ObjectId),
+    /// A blob indexed at the object is not listed by the command that moves its records.
+    #[error("a blob indexed at object {0} is not listed in the object its records move to")]
+    Unlisted(ObjectId),
     /// The object is still open; only a sealed object is flushed.
     #[error("object {0} is not sealed")]
     NotSealed(ObjectId),

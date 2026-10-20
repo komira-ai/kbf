@@ -142,6 +142,17 @@ fn each_command_has_its_own_label() {
             after: String::new(),
         },
         Command::RebuildDone,
+        Command::ReseatStaged {
+            tier: kbf_meta::TierId::new(1),
+            from: object,
+            to: kbf_meta::StagedPut {
+                object,
+                end: 0,
+                seal: true,
+                blobs: Vec::new(),
+            },
+            stored: false,
+        },
     ];
     let labels: Vec<&str> = commands
         .iter()

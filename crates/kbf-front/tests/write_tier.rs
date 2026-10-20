@@ -315,11 +315,8 @@ async fn a_key_holding_another_object_is_a_conflict_and_the_blobs_move_to_a_new_
     let round = cache.flush_tier(later()).await.expect("round");
     assert_eq!((round.conflicts, round.flushed), (vec![object], vec![]));
     assert_eq!(farm.log.staged_state(object), None);
-    assert_eq!(
-        farm.log.unreachable(object),
-        Some(kbf_meta::UnreachableReason::Missing),
-        "marked as missing, not corrupt"
-    );
+    assert_eq!(farm.log.unreachable(object), None, "marked nothing");
+    assert_eq!(farm.log.losses(), (0, 0), "a move is not a loss");
     assert!(!farm.has_block(object));
     let moved = farm.log.object_of(&blobs[0].digest);
     assert_ne!(moved, object);
@@ -1032,7 +1029,7 @@ async fn a_log_answering_with_another_commands_outcome_is_an_internal_error() {
         .put_new(&key(&cache, other), taken, None)
         .await
         .expect("put");
-    farm.log.answer_wrong("object_unreachable", 1);
+    farm.log.answer_wrong("reseat_staged", 1);
     let round = cache.flush_tier(later()).await.expect("round");
     assert!(
         round.retrying.contains(&(other, FLUSH_BACKOFF_FIRST)),
@@ -1194,4 +1191,38 @@ async fn concurrent_uploads_share_one_staged_segment() {
     }
     assert!(farm.log.applied("put_staged") < b.len(), "grouped");
     assert!(farm.store.put_keys().is_empty());
+}
+
+/// Catches: a staged object whose key is taken, and whose block is gone, answered from
+/// the store's other object (the wrong bytes) or marked unreachable (N6): neither its
+/// short bytes at the first record nor the missing range of the second marks the staged
+/// object. Both the object not yet flushed and one an earlier build left in conflict.
+#[tokio::test]
+async fn a_staged_object_whose_key_is_taken_and_block_is_gone_is_unreachable_unmarked() {
+    for conflict in [false, true] {
+        let farm = Farm::new(CONDITIONAL);
+        let cache = farm.start(GIB).await;
+        let blobs = blobs(1, 2, 4096);
+        cache.store_blobs(verified(&blobs)).await.expect("stored");
+        let object = farm.log.object_of(&blobs[0].digest);
+        let other = Bytes::from_static(b"some other object under this key");
+        let at = key(&cache, object);
+        farm.store.put_new(&at, other, None).await.expect("put");
+        if conflict {
+            let seal = Command::SealStaged { object };
+            let flagged = Command::FlushConflict { object };
+            assert!(matches!(farm.log.commit(seal), Applied::Tier(Ok(()))));
+            assert!(matches!(farm.log.commit(flagged), Applied::Tier(Ok(()))));
+        }
+        farm.fs.remove(&block_name(object)).expect("remove");
+        for b in &blobs {
+            let read = cache.read_blob(&b.digest).await;
+            assert!(
+                matches!(read, Err(CacheError::Unreachable(_))),
+                "conflict {conflict}: {read:?}"
+            );
+        }
+        assert_eq!(farm.log.unreachable(object), None, "conflict {conflict}");
+        assert_eq!(farm.log.losses(), (0, 0), "conflict {conflict}");
+    }
 }

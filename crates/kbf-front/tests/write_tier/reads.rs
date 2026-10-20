@@ -222,10 +222,8 @@ async fn a_conflicting_object_with_no_room_to_stage_again_goes_to_the_store() {
     let round = cache.flush_tier(later()).await.expect("round");
     assert_eq!(round.conflicts, [object], "{round:?}");
     assert_eq!(farm.log.staged_state(object), None);
-    assert_eq!(
-        farm.log.unreachable(object),
-        Some(UnreachableReason::Missing)
-    );
+    assert_eq!(farm.log.unreachable(object), None, "marked nothing");
+    assert_eq!(farm.log.losses(), (0, 0), "a move is not a loss");
     assert!(!farm.has_block(object));
     let (moved, staged) = farm.log.located(&blobs[0].digest);
     assert_eq!(staged, None, "in the store, not staged");
