@@ -52,6 +52,27 @@ pub enum MigrateError {
         "this host still has the old layout's state ({0}) and is not migrated: run `kbf-installer migrate --apply` first"
     )]
     Unmigrated(String),
+    /// A frontend or all-in-one host moves to Postgres, and Postgres, the `kbf` role or the
+    /// `kbf` database is not there to be asked. The migration creates none of them.
+    #[error(
+        "the state database cannot be asked ({0}): Postgres, its `kbf` role and its `kbf` database must exist before this runs, \
+         and the server must let in the user running this verb (the URL names no role, so it connects as that user); \
+         migrate creates none of them"
+    )]
+    NoStateDatabase(String),
+    /// The schema step was refused (a database ahead of this installer, a contract step, a
+    /// server that refused a migration).
+    #[error("the state database's schema step was refused: {0}")]
+    StateSchema(String),
+    /// The units of a host that moves to Postgres run `current`, and that build embeds no
+    /// state schema (`--version --json` says `state_schema` 0): it cannot open the store the
+    /// units are switched to, and the farm would be stopped for a start that fails.
+    #[error(
+        "release {release} (current) embeds no state schema (its --version --json says state_schema 0): \
+         it cannot open the Postgres store the units are switched to; put a release that can in current \
+         with the old tools first, or migrate without --mode to stay on the SQLite file"
+    )]
+    NoPostgresSchema { release: String },
     /// A rollback that would throw away what the installer did since.
     #[error("cannot roll back: {0}")]
     MovedOn(String),
@@ -78,9 +99,11 @@ impl MigrateError {
     /// How the verb ends (docs/design/kbf-installer.md section 2).
     pub fn exit(&self) -> Exit {
         match self {
-            MigrateError::NotRoot { .. } => Exit::Usage,
+            // A missing prerequisite: a root to be, a Postgres to have.
+            MigrateError::NotRoot { .. } | MigrateError::NoStateDatabase(_) => Exit::Usage,
             MigrateError::BadLink { .. }
             | MigrateError::Mislabeled { .. }
+            | MigrateError::NoPostgresSchema { .. }
             | MigrateError::Probe { .. } => Exit::Refused,
             // A swap of the old tool on trial, and the disagreements only a person settles.
             MigrateError::Pending { .. }
@@ -95,6 +118,7 @@ impl MigrateError {
             MigrateError::State(StateError::Busy { .. }) => Exit::Busy,
             MigrateError::State(e) if e.needs_operator() => Exit::NeedsOperator,
             MigrateError::Corrupt { .. }
+            | MigrateError::StateSchema(_)
             | MigrateError::Tree(_)
             | MigrateError::State(_)
             | MigrateError::Io { .. } => Exit::Failed,

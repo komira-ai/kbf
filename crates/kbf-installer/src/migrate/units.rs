@@ -165,6 +165,85 @@ pub fn rewrite_text(kind: Kind, text: &str, new_bin: &str) -> Option<String> {
     (out != text).then_some(out)
 }
 
+/// The flag whose value names the state store.
+const STORE_FLAG: &str = "--state-store=";
+
+/// `line` with the value of every `--state-store=sqlite://...` replaced by `url`. The flag
+/// must open a word (after white space, a quote or `>`), and its value runs to white space,
+/// a quote, `<` or the line's continuation backslash.
+fn switch_store_line(line: &str, url: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find(STORE_FLAG) {
+        let (head, tail) = rest.split_at(at + STORE_FLAG.len());
+        let opened = head[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '>'));
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '\\'))
+            .unwrap_or(tail.len());
+        let (value, after) = tail.split_at(end);
+        out.push_str(head);
+        out.push_str(if opened && value.starts_with("sqlite://") {
+            url
+        } else {
+            value
+        });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `text` with the SQLite store of the command line replaced by `url`: on the lines of an
+/// `Exec*=` setting and the lines its trailing backslashes continue (the flags of a unit the
+/// kit renders are on those), or a launchd `<string>`. `None` when nothing changes.
+pub fn switch_store_text(kind: Kind, text: &str, url: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut continued = false;
+    for line in text.split_inclusive('\n') {
+        let on_command = continued || holds_path(kind, line);
+        continued = on_command && line.trim_end().ends_with('\\');
+        if on_command {
+            out.push_str(&switch_store_line(line, url));
+        } else {
+            out.push_str(line);
+        }
+    }
+    (out != text).then_some(out)
+}
+
+/// Give the unit file `unit` of `units` the state store `url` in place of its SQLite file,
+/// keeping the original in `backup` the first time. `Already` when the unit names a Postgres
+/// store; `NotOurs` when it names no store this changes.
+pub fn switch_store(
+    rules: &Rules,
+    units: &OwnedFd,
+    backup: &OwnedFd,
+    unit: &Unit,
+    url: &str,
+) -> Result<UnitOutcome, TreeError> {
+    let name = unit.as_str();
+    let Some(bytes) = tree::read_file(rules, units, name, UNIT_CAP)? else {
+        return Ok(UnitOutcome::Missing);
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let Some(new) = switch_store_text(unit.kind(), &text, url) else {
+        let postgres = text.contains("--state-store=postgres");
+        return Ok(if postgres {
+            UnitOutcome::Already
+        } else {
+            UnitOutcome::NotOurs
+        });
+    };
+    if tree::read_file(rules, backup, name, UNIT_CAP)?.is_none() {
+        tree::replace_file(backup, name, 0o600, &bytes)?;
+    }
+    tree::replace_file(units, name, 0o644, new.as_bytes())?;
+    Ok(UnitOutcome::Rewritten)
+}
+
 /// What is to be done to a unit file, from everything that is read to decide it.
 enum Judged {
     Nothing(UnitOutcome),

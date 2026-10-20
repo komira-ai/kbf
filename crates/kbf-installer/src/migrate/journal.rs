@@ -46,6 +46,11 @@ pub struct Journal {
     /// rollback starts again at its own).
     pub stopped: Vec<Unit>,
     pub adopted: Vec<Adopted>,
+    /// The Postgres URL the units' `--state-store` was switched to, when this migration
+    /// moved the host's state store (a frontend or all-in-one host); `None` for a node. A
+    /// rollback says by it that the units are back on the SQLite file. A journal written
+    /// before the field existed reads as `None` (serde reads a missing `Option` so).
+    pub state_store: Option<String>,
 }
 
 impl Journal {
@@ -57,6 +62,7 @@ impl Journal {
             helper_unit,
             stopped: Vec::new(),
             adopted: Vec::new(),
+            state_store: None,
         }
     }
 

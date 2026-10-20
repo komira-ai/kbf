@@ -94,8 +94,9 @@ fn look(
     })))
 }
 
-/// What the rollback says it does.
-fn plan(mode: Mode, unknown_state: Option<String>) -> Report {
+/// What the rollback says it does. `store_moved`: the migration switched the host's state
+/// store to Postgres, so the restored units name the SQLite file again.
+fn plan(mode: Mode, unknown_state: Option<String>, store_moved: bool) -> Report {
     let mut report = Report::new(match mode {
         Mode::DryRun => Outcome::Planned,
         Mode::Apply => Outcome::RolledBack,
@@ -110,6 +111,19 @@ fn plan(mode: Mode, unknown_state: Option<String>) -> Report {
         mode,
         "restore the units' originals, enable the old helper, start what ran before",
     );
+    if store_moved {
+        // The migration moved the host's state store: the original unit names the SQLite
+        // file, which was never touched. Nothing is copied back from Postgres.
+        report.line(
+            mode,
+            "the units' --state-store names the SQLite file again, as the file was left",
+        );
+        report.warnings.push(
+            "what the farm wrote to Postgres since the migration is not copied back: the host \
+             starts on the SQLite state it had, and the Postgres database is left as it is"
+                .to_owned(),
+        );
+    }
     report
 }
 
@@ -123,7 +137,8 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
         Look::Go(go) => go,
     };
     if mode == Mode::DryRun {
-        return Ok(plan(mode, first.unknown_state));
+        let store_moved = first.journal.state_store.is_some();
+        return Ok(plan(mode, first.unknown_state, store_moved));
     }
     if exec.euid() != m.owner_uid {
         return Err(MigrateError::NotRoot {
@@ -149,7 +164,7 @@ pub fn rollback<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Repo
         Look::Settled(report) => return Ok(report),
         Look::Go(go) => *go,
     };
-    let mut report = plan(mode, unknown_state);
+    let mut report = plan(mode, unknown_state, journal.state_store.is_some());
     let mut svc = Services {
         exec,
         roots: &m.roots,

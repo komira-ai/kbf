@@ -12,6 +12,7 @@ use super::newtree::{NewTree, StateDir};
 use super::old::{self, Old, OldLock, OldTree};
 use super::probe::probe;
 use super::services::Services;
+use super::store::{self, StateStore};
 use super::tree::{self, Rules};
 use super::units::{self, Unit, UnitOutcome};
 use super::{Hooks, Migration, Outcome, Report};
@@ -146,6 +147,47 @@ fn report_plan(
     }
 }
 
+/// What a dry run says of the move to Postgres: what the database is, what the schema step
+/// would do, and which units get their `--state-store` switched.
+fn report_store_plan(report: &mut Report, store: &StateStore, schema: &str, units: &[Unit]) {
+    report.line(
+        Mode::DryRun,
+        format!("state database ({}): {schema}", store.url),
+    );
+    let named: Vec<&str> = units.iter().map(Unit::as_str).collect();
+    report.line(
+        Mode::DryRun,
+        format!(
+            "--state-store=sqlite://... of the --unit units [{}] becomes {}: the SQLite file is \
+             left as it is and no state is copied",
+            named.join(", "),
+            store.url
+        ),
+    );
+    report.warnings.push(store::FRESH_START.to_owned());
+}
+
+/// The releases of a host that moves to Postgres, judged for the store its units are given. A
+/// build whose `--version --json` says `state_schema` 0 embeds no migration and cannot open
+/// it. The units run `current`, which is refused with it; a revert runs `previous`, which is
+/// adopted with a warning.
+fn judge_releases(found: &[Found]) -> Result<Vec<String>, MigrateError> {
+    let mut warnings = Vec::new();
+    for f in found.iter().filter(|f| f.version.state_schema == 0) {
+        if f.role == "current" {
+            return Err(MigrateError::NoPostgresSchema {
+                release: f.name.to_string(),
+            });
+        }
+        warnings.push(format!(
+            "release {} ({}) embeds no state schema (state_schema 0): a revert to it cannot open the \
+             Postgres store the units are switched to",
+            f.name, f.role
+        ));
+    }
+    Ok(warnings)
+}
+
 /// `current` and `previous` as the first look found and probed them must still be what the
 /// old state names under the locks: a release probed is not one adopted in its place.
 fn unchanged(probed: &[Option<CommitId>; 2], old: &Old) -> Result<(), MigrateError> {
@@ -197,7 +239,7 @@ pub fn migrate<E: Exec>(
     // (`found`, and the names it probed them under); what it read is not written from. The
     // source of the floor is asked here too, once: the frontend is a call over the network,
     // not one to make with the locks held.
-    let (found, probed, claim) = {
+    let (found, probed, claim, notes) = {
         let first = match look(m, &rules)? {
             Look::Settled(report) => return Ok(report),
             Look::Old(seen) => seen,
@@ -211,8 +253,22 @@ pub fn migrate<E: Exec>(
                 want: m.owner_uid,
             });
         }
+        // A host that moves to Postgres is refused before any program runs or anything is
+        // changed when its database cannot be asked: the migration creates none of it.
+        let schema = m
+            .state_store
+            .as_ref()
+            .map(|store| store.look().map(|line| (store, line)))
+            .transpose()?;
         let claim = floor::claim(&m.seed, hooks.frontend)?;
         let found = find(m, hooks, &rules, &first.old_tree, &first.old)?;
+        // The units of such a host run `current`: one that cannot open the store is refused
+        // here, with nothing changed, and what is only a warning is carried to the report.
+        let notes = if schema.is_some() {
+            judge_releases(&found)?
+        } else {
+            Vec::new()
+        };
         if mode == Mode::DryRun {
             let mut report = Report::new(Outcome::Planned);
             report_plan(
@@ -222,6 +278,10 @@ pub fn migrate<E: Exec>(
                 first.old.state.staged.as_ref(),
                 &found,
             );
+            if let Some((store, schema)) = &schema {
+                report_store_plan(&mut report, store, schema, &m.units);
+            }
+            report.warnings.extend(notes);
             plan(m, exec, &mut report)?;
             return Ok(report);
         }
@@ -229,7 +289,7 @@ pub fn migrate<E: Exec>(
             first.old.state.current.clone(),
             first.old.state.previous.clone(),
         ];
-        (found, probed, claim)
+        (found, probed, claim, notes)
     };
     // Both locks: no verb of the old tools is mid-way, and no run of the installer changes
     // its state while this one does. Each is waited for `m.lock_wait` and no longer (busy,
@@ -261,12 +321,23 @@ pub fn migrate<E: Exec>(
         old.state.staged.as_ref(),
         &found,
     );
+    report.warnings.extend(notes);
+    // The schema comes before anything is stopped or written: nothing reads that database
+    // yet, so the old frontend keeps serving meanwhile, and a refusal of the step (a database
+    // ahead of this installer, a server that will not migrate) leaves the host as it was.
+    // The step is idempotent, so a run again does it again.
+    if let Some(store) = &m.state_store {
+        let done = store.database.setup().map_err(MigrateError::StateSchema)?;
+        report.line(mode, format!("state database: {done}"));
+        report.warnings.push(store::FRESH_START.to_owned());
+    }
     let tree = NewTree::create(&m.layout, &rules)?;
     tree.sweep_partials()?;
     let mut journal = journal.unwrap_or_else(|| Journal::new(Vec::new(), None));
     journal.phase = Phase::Started;
     journal.units = m.units.clone();
     journal.helper_unit = m.helper_unit.clone();
+    journal.state_store = m.state_store.as_ref().map(|s| s.url.clone());
     tree.state.put_journal(&journal)?;
 
     // The unit files are read and judged now, before a release is copied and long before a
@@ -372,9 +443,26 @@ pub fn migrate<E: Exec>(
         "state.json (schema 2), helper.json (the replay floor) and status.json written",
     );
 
+    let mut on_postgres = false;
     for unit in &m.units {
         let outcome = units::rewrite(&rules, &units_dir, &backup, unit, &new_bin)?;
         report.line(mode, format!("{unit}: {}", describe(outcome)));
+        if let Some(store) = &m.state_store {
+            let outcome = units::switch_store(&rules, &units_dir, &backup, unit, &store.url)?;
+            on_postgres |= matches!(outcome, UnitOutcome::Rewritten | UnitOutcome::Already);
+            report.line(
+                mode,
+                format!("{unit}: {}", store::describe(outcome, &store.url)),
+            );
+        }
+    }
+    if m.state_store.is_some() && !on_postgres {
+        report.warnings.push(
+            "no unit gives --state-store, so none was switched to Postgres: the store is the \
+             one kbf.toml (`[scheduler] state-store`) or the mode's default names; check it \
+             before the host is relied on"
+                .to_owned(),
+        );
     }
     svc.reload().map_err(MigrateError::io("daemon-reload"))?;
 

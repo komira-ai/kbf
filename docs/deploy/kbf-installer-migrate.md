@@ -11,7 +11,8 @@ re-run rules are in the module docs of `crates/kbf-installer/src/migrate/mod.rs`
 
 ```text
 kbf-installer migrate [--apply] --unit kbf-daemon.service [--unit ...] \
-    --helper-unit kbf-helper.service [--installer-unit kbf-installer.service] [--min-generation N] [--release-source url|frontend]
+    --helper-unit kbf-helper.service [--installer-unit kbf-installer.service] [--min-generation N] [--release-source url|frontend] \
+    [--mode frontend|all-in-one|storage|daemon|storage-and-daemon]
 kbf-installer migrate --rollback [--apply]
 ```
 
@@ -64,6 +65,47 @@ refused, exit 2, before any release is run):
    state beside it reads as a lost state), `status.json` (the shape the node reads, with `unverified`
    added) and the units' `Exec*=` lines (the first original of each unit is kept in
    `migration-units/`), reloads the unit manager, and starts what it stopped.
+6. **A frontend or all-in-one host** (`--mode frontend` or `--mode all-in-one`) also crosses to Postgres in
+   the same run (`docs/design/frontend-proxy.md` section 11); a node (`storage`, `daemon`,
+   `storage-and-daemon`) keeps no server state, and a run with no `--mode` makes no database step. The first
+   crossing cannot be a swap, and **no state is copied**: the farm starts on an empty database, the SQLite
+   file is not read, not copied and not changed, and a Postgres row is never copied back.
+   - Postgres, its `kbf` role and its `kbf` database must exist already: they are the host preparation's
+     (design section 11 has the package depend on Postgres; `setup` as built needs the database too and
+     creates neither, and it refuses while the old state is unmigrated, so they come first). The migration
+     creates none of them. The URL is section 11's, `postgres:///kbf?host=/run/postgresql`: give `setup
+     --database` the same. Its first look asks the database (the same call as `setup`'s dry
+     run) and, when it cannot be asked, refuses with exit 2 naming what must exist, before any program runs
+     and in a dry run too. A database whose schema is ahead of this installer is refused (exit 1).
+   - **Whose connection it is.** The URL names no role, so the database is asked as the user running the verb:
+     root for an apply, the invoking user for a dry run (as `setup` does, step 7 of `kbf-installer-setup.md`).
+     A host with a correct `kbf` role and database is still refused, exit 2, when its server does not let that
+     user in to the `kbf` database (peer authentication through a `pg_ident` map, or a local `trust` rule);
+     the refusal's text names the server's own reason first and then says this.
+   - **The release must be able to open the store.** The units run the adopted `current`, so the first look
+     reads the `state_schema` that release's `--version --json` reports: the newest Postgres schema the build
+     embeds a migration for. `0` means it embeds none and cannot open the store the units are switched to;
+     the run is refused with exit 3 before anything is changed, a dry run too, and the way out is a release
+     that can in `current` (the old tools) or a migration without `--mode`. A `previous` that reports `0` is
+     adopted with a warning: a revert to it cannot open the store. Only that number is checked: the migration
+     does not start the release against the database, so a build that reports a schema and still cannot open
+     this store (a flag it does not know, a schema outside what it supports) is found by the start.
+   - A dry run lists the schema step (create, bring forward, or nothing to apply), the units whose
+     `--state-store` would move, and the warning below. It asks the database and changes nothing.
+   - An apply, once it holds both locks and has looked again, runs the installer's schema step (the one
+     `setup` runs: the embedded, expand-only migrations up to this installer's newest) **before anything is
+     stopped**: nothing reads that database yet, and a refusal (a contract step pending, a server that will
+     not migrate; exit 1) leaves the host as it was. It then stops, writes and starts as in step 5, with one
+     more edit per `--unit`: in the `Exec*=` lines (and the lines their backslashes continue), a
+     `--state-store=sqlite://...` becomes `--state-store=postgres:///kbf?host=/run/postgresql`. The first
+     original of the unit, SQLite flag included, is kept like any other. A unit that names a Postgres store
+     already is reported and left; a unit that gives no `--state-store` is left, and when no unit was
+     switched the report warns that the store is then whatever `kbf.toml` (`[scheduler] state-store`) or the
+     mode's default names: a flag on the unit's command line overrides the key, and the key itself is not
+     edited.
+   - The warning every plan and run carries: the store starts empty, so nodes enroll again and the cordons,
+     `desired`, the release index, the run history and the builds in flight are not carried over. Drain the
+     farm first.
 
    The old tools' lock is `flock(2)` on `/run/kbf-deploy.lock` (macOS `/var/run/kbf-deploy.lock`).
    On Linux that is where the deploy kit took its own (`File::lock` on that path, in the `state.rs`
@@ -72,15 +114,20 @@ refused, exit 2, before any release is run):
    migration: a build that locks with `fcntl` or on another path is not excluded by this lock.
 
 Every step can be run again: a finished migration is a no-op; one that stopped half way is finished by
-the next run (the journal `migration.json` remembers what was stopped); a floor only goes up; a copy
-with the source's digest is kept, any other leftover is replaced, scratch is swept. While the old
+the next run (the journal `migration.json` remembers what was stopped, and the Postgres URL the units were
+switched to); a floor only goes up; a copy with the source's digest is kept, any other leftover is replaced,
+scratch is swept; the schema step finds its work done, and a unit already on Postgres is left as it is.
+A host migrated without `--mode` stays on its SQLite file (a finished migration is a no-op); to cross it,
+roll back (`migrate --rollback --apply`) and migrate again with `--mode`. While the old
 state exists and no migration finished, `run`, the operator's verbs (`confirm`, `revert`,
 `rollback`, `gc`) and `setup` of a mode with a database refuse (exit 5) and name this verb; the
 rest of `setup` calls the same check when it is built. `status.json` names `unverified` releases
 until the helper's first pass rewrites it (the helper does not carry the list yet; the journal
 `migration.json` and the missing `VERIFIED` marker do).
 
-`--rollback` stops the installer's own unit, restores the unit files, enables the helper again and
+`--rollback` stops the installer's own unit, restores the unit files (on a frontend or all-in-one host that
+puts the SQLite `--state-store` back; the file was never touched and nothing is copied back from Postgres, so
+what the farm wrote there since is not in it, and the database is left as it is), enables the helper again and
 starts what ran before. The old tree and state are never modified (a note, `MIGRATED`, is added to the old state
 directory and removed again), which is why this works. It is refused once the installer has activated,
 staged or put a release on trial since (exit 5): use `kbf-installer rollback` then. If the
@@ -91,7 +138,10 @@ rollback waited is seen and refuses it, a rollback another run finished meanwhil
 and the installer is stopped with its lock held, so it writes no state while the old layout comes back.
 
 Not done by the migration: `installer.toml` (the `min_generation` to put there is printed as the
-report's value; `setup` writes the file), the users, and the `orders/` directory (`setup`).
+report's value; `setup` writes the file), the users, and the `orders/` directory (`setup`); on a frontend or
+all-in-one host, installing Postgres and creating its `kbf` role and database (the host preparation's: design
+section 11 has `setup` do it, and `setup` as built does not; the migration refuses while they are absent),
+and the `kbf.toml` `state-store` key (see step 6).
 
 ## The test farm's hosts
 

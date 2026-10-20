@@ -323,6 +323,7 @@ impl Rig {
                 min_generation: Some(17),
             },
             lock_wait: self.lock_wait,
+            state_store: None,
         }
     }
 

@@ -44,11 +44,23 @@
 //! 6. **Journal** `migration.json` says `done`. From then on `migrate` is a no-op and
 //!    [`guard`] lets `setup` through.
 //!
+//! A frontend or all-in-one host (`--mode`) also crosses to Postgres, in the same run
+//! (`store`, docs/design/frontend-proxy.md section 11): the first look asks the database
+//! and refuses when Postgres, the `kbf` role or the `kbf` database is absent (a dry run
+//! shows the schema step and the switch); an apply, once it holds both locks and has looked
+//! again, runs the installer's schema step ([`crate::database`], the one `setup` runs)
+//! before it stops anything, so a refusal of the step leaves the host as it was; then the
+//! stop of step 5 follows, and each unit's `--state-store=sqlite://...` is switched to the
+//! Postgres URL together with its `Exec*=` path, before the start. **No state is copied**
+//! and the SQLite file is not touched. Re-run: the schema step is idempotent, a unit that
+//! names Postgres is left as it is. A node has no server state and none of this.
+//!
 //! [`rollback`] undoes steps 5 and 6 while the installer has not moved on: the units get
-//! their originals back, the helper is enabled again, the units are started. The old
-//! tree and state were never touched, which is why this is possible. An apply of it takes
-//! the same two locks and decides from what it reads under them, so a release the installer
-//! activated while it waited is seen.
+//! their originals back (on a frontend or all-in-one host that includes the SQLite
+//! `--state-store`; nothing is copied back from Postgres), the helper is enabled again, the
+//! units are started. The old tree and state were never touched, which is why this is
+//! possible. An apply of it takes the same two locks and decides from what it reads under
+//! them, so a release the installer activated while it waited is seen.
 //!
 //! Stand-ins that remain: [`Verifier`], which asks for a release to be fetched from the
 //! configured source and verified from its commit alone (the migration holds no order, so no
@@ -69,6 +81,7 @@ mod probe;
 mod rollback;
 pub mod roots;
 mod services;
+mod store;
 pub mod tree;
 pub mod units;
 
@@ -81,6 +94,7 @@ pub use error::MigrateError;
 pub use floor::{FrontendFloor, NoFrontend, Seed, Source};
 pub use rollback::rollback;
 pub use roots::Roots;
+pub use store::{LOCAL_POSTGRES, StateDatabase, StateStore};
 pub use units::Unit;
 
 use crate::CommitId;
@@ -128,6 +142,9 @@ pub struct Migration {
     /// the verb ends busy (exit 4): a verb of the old tools can hold theirs for a long time,
     /// and a migration queued behind it holds up whatever else wants the installer's.
     pub lock_wait: Duration,
+    /// The state store of a frontend or all-in-one host, which the migration moves to
+    /// Postgres; `None` for a node, which keeps none.
+    pub state_store: Option<StateStore>,
 }
 
 /// The programs and servers a migration asks.
@@ -230,6 +247,8 @@ mod refusal_tests;
 mod rig;
 #[cfg(test)]
 mod rollback_tests;
+#[cfg(test)]
+mod store_tests;
 #[cfg(test)]
 mod testfarm_tests;
 #[cfg(test)]
