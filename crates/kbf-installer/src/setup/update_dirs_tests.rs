@@ -66,48 +66,117 @@ fn the_modes_whose_daemon_takes_orders_get_the_installers_directories() {
     }
 }
 
-/// Catches the keys and the spool `setup` makes drifting apart: the directory the orders key
-/// names is the one made for the service user (0700), on Linux and on a Mac, whose state
-/// directory differs (`/var/db/kbf-installer`, as the Mac provisioner writes it).
+/// Catches the keys and the spool `setup` makes drifting apart: on Linux the directory the
+/// orders key names is the one made for the service user (0700). A Mac's state directory differs
+/// (`/var/db/kbf-installer`), and there the keys are `kbf-mac-provision`'s: setup leaves the
+/// file as it was and still makes the same spool.
 ///
 /// Mutant seen red: the spool made 0755.
 #[test]
 fn the_orders_key_names_the_directory_setup_makes() {
-    for platform in [Platform::Linux, Platform::MacOs] {
-        let os = if platform == Platform::Linux {
-            FakeOs::linux()
-        } else {
-            FakeOs::mac()
-        };
-        let mut exec = released(host(), platform);
-        go_ok(&os, &mut exec, &raw(Mode::Daemon));
-        let path = platform.kbf_toml();
-        let [update, orders] = written(&exec, path);
-        let l = layout(platform);
-        assert_eq!(
-            update.as_deref(),
-            Some(l.update_dir().as_str()),
-            "{platform:?}"
-        );
-        assert_eq!(
-            orders.as_deref(),
-            Some(l.orders_dir().as_str()),
-            "{platform:?}"
-        );
-        let made = exec.entries.get(&hp(orders.as_deref().expect("orders")));
-        assert!(
-            matches!(made, Some(Entry::Dir { perms, .. }) if perms.bits() == 0o700),
-            "{platform:?}: {made:?}"
-        );
-    }
-    assert_eq!(
-        layout(Platform::Linux).update_dir().as_str(),
-        "/var/lib/kbf-installer"
+    let mut exec = released(host(), Platform::Linux);
+    go_ok(&FakeOs::linux(), &mut exec, &raw(Mode::Daemon));
+    let [update, orders] = written(&exec, Platform::Linux.kbf_toml());
+    let l = layout(Platform::Linux);
+    assert_eq!(update.as_deref(), Some(l.update_dir().as_str()));
+    assert_eq!(orders.as_deref(), Some(l.orders_dir().as_str()));
+    let made = exec.entries.get(&hp(orders.as_deref().expect("orders")));
+    assert!(
+        matches!(made, Some(Entry::Dir { perms, .. }) if perms.bits() == 0o700),
+        "{made:?}"
     );
+    assert_eq!(l.update_dir().as_str(), "/var/lib/kbf-installer");
     assert_eq!(
         layout(Platform::MacOs).orders_dir().as_str(),
         "/var/db/kbf-installer/orders"
     );
+}
+
+/// Catches a setup that writes the Mac's `[daemon]` keys (G9: `kbf-mac-provision` is the one
+/// writer) or lets a wrong one pass. On a Mac, provisioned or not by the kit: the file with
+/// `update-dir` (and no `orders-dir`, or the layout's) is kept byte for byte; a file without
+/// `update-dir`, with another one, with another `orders-dir`, a key that is not text, or no
+/// file at all, is refused (exit 5) naming the key and `kbf-mac-provision`, and no path.
+///
+/// Mutants seen red: the Mac writing both keys as Linux does; the check dropped (a wrong key
+/// accepted); `orders-dir` required; a non-text `orders-dir` let through.
+#[test]
+fn a_mac_is_checked_and_never_written() {
+    let base = "mode = \"daemon\"\n\n[frontend]\nurl = \"https://farm.example:8443\"\n\n[enroll]\ntoken_file = \"/etc/kbf/enroll.token\"\n\n";
+    let token = Platform::MacOs.enroll_token();
+    let base = base.replace("/etc/kbf/enroll.token", token);
+    let keep = [
+        "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n",
+        "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\norders-dir = \"/var/db/kbf-installer/orders\"\n",
+    ];
+    for daemon in keep {
+        let file = format!("{base}{daemon}");
+        let mut exec = released(host(), Platform::MacOs);
+        put(&mut exec, Platform::MacOs.kbf_toml(), 0o640, ROOT, &file);
+        go_ok(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon));
+        assert_eq!(text(&exec, Platform::MacOs.kbf_toml()), file);
+    }
+    let refuse = [
+        ("", "has no [daemon] update-dir"),
+        (
+            "[daemon]\nupdate-dir = \"/elsewhere\"\n",
+            "[daemon] update-dir is not the installer's directory",
+        ),
+        (
+            "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\norders-dir = \"/elsewhere\"\n",
+            "[daemon] orders-dir is not the installer's directory",
+        ),
+        (
+            "[daemon]\nupdate-dir = 3\n",
+            "[daemon] update-dir is not text",
+        ),
+        (
+            "[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\norders-dir = 3\n",
+            "[daemon] orders-dir is not text",
+        ),
+    ];
+    for (daemon, why) in refuse {
+        let file = format!("{base}{daemon}");
+        let mut exec = released(host(), Platform::MacOs);
+        put(&mut exec, Platform::MacOs.kbf_toml(), 0o640, ROOT, &file);
+        let err = go(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err(why);
+        assert_eq!(err.exit(), Exit::NeedsOperator, "{why}");
+        let said = err.to_string();
+        assert!(
+            said.contains(why) && said.contains("kbf-mac-provision renders it"),
+            "{said}"
+        );
+        assert!(
+            !said.contains("/var/db") && !said.contains("/elsewhere"),
+            "{said}"
+        );
+        assert_eq!(
+            text(&exec, Platform::MacOs.kbf_toml()),
+            file,
+            "refused: unchanged"
+        );
+    }
+    let mut exec = host();
+    exec.entries.remove(&hp(Platform::MacOs.kbf_toml()));
+    let err = go(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err("no file");
+    assert_eq!(err.exit(), Exit::NeedsOperator);
+    assert!(err.to_string().contains("has no [daemon] update-dir"));
+    assert!(!exec.entries.contains_key(&hp(Platform::MacOs.kbf_toml())));
+}
+
+/// Catches the Mac check judging a file that is not TOML as missing keys: `decide` names it.
+#[test]
+fn a_mac_kbf_toml_that_is_not_toml_is_named_as_such() {
+    let mut exec = released(host(), Platform::MacOs);
+    put(
+        &mut exec,
+        Platform::MacOs.kbf_toml(),
+        0o640,
+        ROOT,
+        "mode = [",
+    );
+    let err = go(&FakeOs::mac(), &mut exec, &raw(Mode::Daemon), APPLY).expect_err("refused");
+    assert!(err.to_string().contains("not valid TOML"), "{err}");
 }
 
 /// Catches a rerun that rewrites or duplicates: setup run twice writes `kbf.toml` once, and a

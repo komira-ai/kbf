@@ -59,6 +59,9 @@ fn farm_flags(dir: &Path, worker: SocketAddr) -> Vec<String> {
     let at = |name: &str| dir.join(name).display().to_string();
     vec![
         "--listen=127.0.0.1:0".to_owned(),
+        // The node is this host, whatever its architecture: the default (`linux/x86_64`)
+        // would leave an action on an aarch64 host with no worker.
+        "--default-platform=none".to_owned(),
         format!("--worker-listen={worker}"),
         format!("--worker-tls-cert={}", at("frontend.pem")),
         format!("--worker-tls-key={}", at("frontend.key")),

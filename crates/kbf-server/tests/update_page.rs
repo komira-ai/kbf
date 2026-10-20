@@ -119,6 +119,7 @@ fn start(policy: kbf_auth::Policy, dir: &Dir) -> (Running, Arc<dyn Store>) {
         token: Some(ApiToken::from_file(&path).expect("a usable token")),
         local_cache: None,
         releases: Some(releases),
+        poll: None,
     };
     let bound = bind_server_with_state(
         Arc::new(Cache::<MemoryMetaLog, MemoryStore>::memory()),
