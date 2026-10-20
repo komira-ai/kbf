@@ -9,7 +9,8 @@
 //!   that runs builds, the kbf user has subuid and subgid ranges and lingers;
 //! - `kbf` is an executable in `--bin-dir` (or, without it, in `KBF_BIN_DIR`);
 //! - the rendered unit passes `check-units --mode MODE --installable` on this host
-//!   ([`modes::check_on_host`]), its flags parsed by that `kbf`'s own `check-args`;
+//!   ([`modes::check_on_host`]); `kbf` is not run on the unit's flags (kbf-cli's tests
+//!   parse each rendered unit, and `kbf --mode=MODE --check` checks them on the host);
 //! - every file the unit reads is there: each `EnvironmentFile=` (the cold store's key,
 //!   the state store's URI), each file a `--*key=` or `--*token-file=` flag names the
 //!   unit's user's alone (owner and no group or other bit: kbf reads it as that user),
@@ -101,7 +102,6 @@ fn plan_with<E: Exec>(
         &UnitText::new(name.clone(), text.clone()),
         &UnitText::new(SLICE, slice.clone()),
         true,
-        Some(&bin),
     )?;
     if !report.failures.is_empty() {
         return Err(HostError::Units(report.failures));

@@ -74,6 +74,19 @@ in the environment, which `setup` does not manage; `--node-id` is a DNS label. S
 `worker-deny-list`, `proxy-auth-file`, the tuning keys) stays by hand: such keys survive a
 re-run under the rule below.
 
+What these checks do not cover, so the operator checks it: the directory that holds a key or a
+certificate is not looked at (its owner and mode are the operator's), and `--cold-store` and
+`--meta-dir` are checked as paths only, not for existing, being a directory or being writable
+by the service.
+
+Two edge cases of the rule below, stated plainly. A `kbf.toml` that holds only the keys `setup`
+writes is `setup`'s: a hand edit of one of them (say `listen` or `api-listen`) is rewritten to
+the flags, or the defaults, on the next run, because the file has nothing of the operator's to
+protect. And a file that also holds other settings is refused (exit 5) when a key differs, which
+includes a hand-set `api-listen` on a run without `--api-listen` (no flag means the default
+`127.0.0.1:8982`); the message names `--api-listen` as the way forward, which is to pass the
+address that is in the file.
+
 ## What it does, in this order
 
 1. Checks it is root (and, to apply, that its own binary is root's alone), checks the flags
@@ -110,6 +123,8 @@ re-run under the rule below.
    modes `database`. Settings a flag does not cover are kept from the file that is there. A
    file that does not parse (it is closed: an unknown key, a wrong type or a value out of
    bounds is refused) is left alone (exit 5). The release source is read only from this file.
+   The operator's `[proxy]` table is kept (written back whole, defaults filled in). Its `listen`
+   key is read here, as below.
 7. Frontend and all-in-one: the state database's schema is created, or brought forward, by the
    installer's own migrations; a dry run asks the server and says what it would do. `setup`
    connects as the user running it (root) unless the URL names a role with `user=`, so the
@@ -147,6 +162,22 @@ order makes the half-done host safe: `kbf.toml` and the units come last, so a st
 no config that a unit would start from. Changed flags rewrite the files they own atomically and
 never restart anything; a floor only goes up; a file `setup` cannot safely rewrite stops it
 with exit 5.
+
+**The proxy's public address.** `kbf-proxy.socket` ships listening on port 8980. A frontend or
+all-in-one host that needs another address sets `listen = "host:port"` in the `[proxy]` table
+of `installer.toml` (an IPv6 host in brackets; port 1 to 65535; the table must be complete, as
+the proxy reads it too). On Linux `setup` then writes
+`/etc/systemd/system/kbf-proxy.socket.d/listen.conf` (root:root 0644, atomically) with exactly
+
+    [Socket]
+    ListenStream=
+    ListenStream=<the address>
+
+The empty first line clears the packaged port. With no `listen`, `setup` writes no drop-in and
+removes the one an earlier run wrote. Changing the file never restarts anything: the output
+says to run `systemctl daemon-reload` and then `systemctl restart kbf-proxy.socket`, which the
+operator does when the public port may drop the connections waiting in it. A bad `listen`
+stops `setup` with exit 5 and names the key, never the value.
 
 **Proxy units.** The bundled proxy's units (`kbf-proxy.service` and `.socket`) are not on
 `feature/arch-v2` yet (kbf#1153), so a frontend or all-in-one host enables the units that exist

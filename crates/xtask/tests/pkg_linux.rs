@@ -5,7 +5,8 @@
 //! by CI (the `packages` job), and the logic is tested in `src/pkg_linux/tests.rs` and
 //! `src/pkg_install/tests.rs`.
 
-use std::path::{Path, PathBuf};
+use kbf_testkit::dir::TestDir;
+use std::path::Path;
 use std::process::{Command, Output};
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
@@ -13,15 +14,11 @@ const STUB: &str = env!("CARGO_BIN_EXE_kbf-installer-stub");
 const FALSE: &str = "/usr/bin/false";
 
 /// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("xtask-pkg")
-        .join(name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).expect("clear scratch");
-    }
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+fn scratch(name: &str) -> TestDir {
+    TestDir::under(
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("xtask-pkg"),
+        name,
+    )
 }
 
 /// Copies the repository's packaging inputs and the stub into `dir`.

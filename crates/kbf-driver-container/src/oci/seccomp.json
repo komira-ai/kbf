@@ -561,6 +561,74 @@
 		},
 		{
 			"names": [
+				"personality"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [
+				{
+					"index": 0,
+					"value": 4294705151,
+					"valueTwo": 0,
+					"op": "SCMP_CMP_MASKED_EQ"
+				}
+			],
+			"comment": "kbf: personality(persona | ADDR_NO_RANDOMIZE) for the four personas allowed above. ADDR_NO_RANDOMIZE (0x40000) turns off address-space randomization for the calling process and the programs it execs inside this container only, which an action may choose for itself; kcov, gdb, rr and valgrind set it. The comparison masks that one bit out of the argument and requires the rest to be one of the allowed personas, so READ_IMPLIES_EXEC (0x400000), the other flags and any other persona stay refused (ENOSYS), as in the upstream profile.",
+			"includes": {},
+			"excludes": {}
+		},
+		{
+			"names": [
+				"personality"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [
+				{
+					"index": 0,
+					"value": 4294705151,
+					"valueTwo": 8,
+					"op": "SCMP_CMP_MASKED_EQ"
+				}
+			],
+			"comment": "kbf: personality(persona | ADDR_NO_RANDOMIZE) for the four personas allowed above. ADDR_NO_RANDOMIZE (0x40000) turns off address-space randomization for the calling process and the programs it execs inside this container only, which an action may choose for itself; kcov, gdb, rr and valgrind set it. The comparison masks that one bit out of the argument and requires the rest to be one of the allowed personas, so READ_IMPLIES_EXEC (0x400000), the other flags and any other persona stay refused (ENOSYS), as in the upstream profile.",
+			"includes": {},
+			"excludes": {}
+		},
+		{
+			"names": [
+				"personality"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [
+				{
+					"index": 0,
+					"value": 4294705151,
+					"valueTwo": 131072,
+					"op": "SCMP_CMP_MASKED_EQ"
+				}
+			],
+			"comment": "kbf: personality(persona | ADDR_NO_RANDOMIZE) for the four personas allowed above. ADDR_NO_RANDOMIZE (0x40000) turns off address-space randomization for the calling process and the programs it execs inside this container only, which an action may choose for itself; kcov, gdb, rr and valgrind set it. The comparison masks that one bit out of the argument and requires the rest to be one of the allowed personas, so READ_IMPLIES_EXEC (0x400000), the other flags and any other persona stay refused (ENOSYS), as in the upstream profile.",
+			"includes": {},
+			"excludes": {}
+		},
+		{
+			"names": [
+				"personality"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [
+				{
+					"index": 0,
+					"value": 4294705151,
+					"valueTwo": 131080,
+					"op": "SCMP_CMP_MASKED_EQ"
+				}
+			],
+			"comment": "kbf: personality(persona | ADDR_NO_RANDOMIZE) for the four personas allowed above. ADDR_NO_RANDOMIZE (0x40000) turns off address-space randomization for the calling process and the programs it execs inside this container only, which an action may choose for itself; kcov, gdb, rr and valgrind set it. The comparison masks that one bit out of the argument and requires the rest to be one of the allowed personas, so READ_IMPLIES_EXEC (0x400000), the other flags and any other persona stay refused (ENOSYS), as in the upstream profile.",
+			"includes": {},
+			"excludes": {}
+		},
+		{
+			"names": [
 				"sync_file_range2"
 			],
 			"action": "SCMP_ACT_ALLOW",
