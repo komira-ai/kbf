@@ -1,8 +1,8 @@
 //! `kbf storage`: the storage node (`docs/design/architecture-v2.md`, sections 3 and 13
 //! P2). The cache the server has, the same stores and the same write tier, served over
 //! gRPC by [`kbf_storage::service`] and nothing else: no REAPI, no scheduler, no
-//! worker streams, no operator API, and no state store (the node reaches that only
-//! through a frontend, section 6).
+//! worker streams, no operator API (only `GET /metrics`, on `--metrics-listen` when
+//! given), and no state store (the node reaches that only through a frontend, section 6).
 //!
 //! **The flags** are `kbf-server`'s own for what a storage node keeps (the object
 //! stores, the metadata log, the write tier and its bounds, the logs, the thread pools,
@@ -55,7 +55,7 @@ use kbf_front::{Cache, CacheStorage, MetaLog as _, ObjectKeys, RebuildConfig, Se
 use kbf_log::{FarmLogId, MachineVersion};
 use kbf_mapsync::MapHolder;
 use kbf_meta::{NodeWriter, Retention};
-use kbf_objstore::{KeyPrefix, ObjectStore};
+use kbf_objstore::{KeyPrefix, ObjectStore, StillHeld};
 use kbf_storage::repair::{RepairConfig, Repairs};
 use kbf_storage::service::CatchUp;
 use kbf_store::StdFs;
@@ -64,18 +64,19 @@ use kbf_threads::disk::Statvfs;
 use kbf_tls::{TlsFiles, TlsSource};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
+use crate::cold_apply::{ColdPick, Fixed, Registrable};
 use crate::join::{self, Joined, Joiner};
+use crate::listen::Binder;
+use crate::metrics::bind_node_sockets;
 use crate::node_map::NodeMap;
 use crate::rebuild::Background;
 use crate::replication::{REPAIR_DIR, Registered, bind_node};
-use crate::serve::{ServeError, StorageListener, StorageSocket, bind_storage_socket};
+use crate::serve::{ServeError, StorageListener, StorageSocket};
 use crate::start::{AbortOnDrop, open_cold_file};
 use crate::startup_pass::StartPass;
 use crate::stores::{FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{
-    Args, ConfigError, RaftMetaLog, SERVER_VERSION, StartFailure, interrupted, s3_store, sizes_on,
-};
+use crate::{Args, ConfigError, RaftMetaLog, SERVER_VERSION, StartFailure, interrupted, sizes_on};
 
 /// The flags of [`Args`] a storage node takes, besides the thread flags
 /// ([`kbf_threads::PoolArgs`]): where its bytes are and how they are written.
@@ -113,6 +114,8 @@ const REGISTRATION: [&str; 4] = [
     "storage_zone",
     "storage_weight",
 ];
+/// The id of `--metrics-listen`.
+const METRICS: &str = "metrics_listen";
 /// The ids of the three TLS flags, in the order [`StorageFlags::tls`] reads them.
 const TLS: [&str; 3] = ["storage_tls_cert", "storage_tls_key", "storage_client_ca"];
 
@@ -124,6 +127,8 @@ pub struct StorageFlags {
     pub server: Args,
     /// Where the node listens.
     pub listen: SocketAddr,
+    /// Where the node serves `GET /metrics` over plain HTTP, if anywhere.
+    pub metrics: Option<SocketAddr>,
     /// The server certificate, its key and the client CA, all three or none.
     pub tls: Option<[PathBuf; 3]>,
     /// The frontend to register with (`http://` or `https://`), if any.
@@ -136,6 +141,15 @@ pub struct StorageFlags {
     pub weight: u32,
     /// How the repair worker of a node that registered with a frontend is paced.
     pub repair: RepairConfig,
+    /// Where the S3 key pair comes from (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`):
+    /// the process environment, unless a test says otherwise.
+    pub env: fn(&str) -> Option<String>,
+}
+
+/// The process environment, as [`StorageFlags::env`] reads it.
+#[must_use]
+pub fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
 /// The long names of the flags of [`Args`] that `kbf storage` hides and refuses by name
@@ -172,6 +186,16 @@ pub fn command() -> Command {
             .help(
                 "Where the node serves gRPC. Without the TLS flags it serves plain text, and \
                  the address must be loopback.",
+            ),
+    )
+    .arg(
+        Arg::new(METRICS)
+            .long("metrics-listen")
+            .value_name("ADDR")
+            .value_parser(clap::value_parser!(SocketAddr))
+            .help(
+                "Serves GET /metrics (Prometheus text) over plain HTTP here. Off unless given. \
+                 Reads are open to whoever reaches it: bind it where only operators do.",
             ),
     )
     .arg(path(
@@ -276,12 +300,14 @@ pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
     Ok(StorageFlags {
         server,
         listen,
+        metrics: m.get_one::<SocketAddr>(METRICS).copied(),
         tls,
         frontend,
         advertise,
         zone: text(REGISTRATION[2]).unwrap_or_default(),
         weight: m.get_one::<u32>(REGISTRATION[3]).copied().unwrap_or(1),
         repair: RepairConfig::default(),
+        env: process_env,
     })
 }
 
@@ -373,6 +399,14 @@ impl StorageFlags {
         Ok(Some(joiner.with_node(node)))
     }
 
+    /// Whether the node may hold the keys of a registered cold store: it registers with a
+    /// frontend and its cold store is an `s3://` bucket. Such a node turns off core dumps
+    /// before it starts ([`crate::cold_apply::harden_process`]).
+    #[must_use]
+    pub fn may_hold_keys(&self) -> bool {
+        self.frontend.is_some() && matches!(self.server.cold_store, Some(StoreUri::S3(_)))
+    }
+
     /// The `Segments` uploads the node keeps: `--segment-upload-*`.
     fn segments(&self) -> SegmentsConfig {
         SegmentsConfig {
@@ -382,20 +416,31 @@ impl StorageFlags {
     }
 }
 
+/// How long [`StorageHandle::serve`] waits for the cold store's lock after serving ends.
+/// A stop that works finishes it in milliseconds (the abort of the cache's tasks and the
+/// end of its writer threads); ten seconds is far past that and short of any supervisor's
+/// patience. Past it the lock is left to the process's exit.
+pub const COLD_RELEASE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// A started storage node: bound, its write tier attached and its flusher (and any
 /// start-up pass) running, not yet serving.
 pub struct StorageHandle {
     /// Where the node listens.
     pub addr: SocketAddr,
+    /// Where it serves `/metrics`, when `--metrics-listen` is given.
+    pub metrics: Option<SocketAddr>,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
     _background: Background,
+    /// When the cold store is a directory: completes when its lock is released.
+    cold_released: Option<kbf_objstore::Released>,
     maps: Arc<MapHolder>,
     catch_up: CatchUp,
     repairs: Option<Arc<Repairs>>,
     _joiner: Option<AbortOnDrop>,
     _repair: Option<AbortOnDrop>,
+    _metrics: Option<AbortOnDrop>,
 }
 
 impl StorageHandle {
@@ -430,20 +475,78 @@ impl StorageHandle {
     }
 
     /// Serves until the shutdown future given to [`start_storage`] completes and the
-    /// calls in flight end.
+    /// calls in flight end. With a `file://` cold store it then waits for the store's
+    /// lock to be released, so a start over the same directories can follow at once: the
+    /// node's tasks are aborted and the cache they and the service held is closed, but
+    /// its own background tasks and writer threads end after it is dropped, not before.
+    /// The wait is bounded by [`COLD_RELEASE_DEADLINE`]; past it this logs one warning
+    /// (the store's directory and how many handles are alive) and returns, because the
+    /// process's exit releases the lock whatever still holds it, and the units run this
+    /// with `TimeoutStopSec=infinity`, where a wait with no end would be a stop with none.
+    ///
+    /// The other serve paths (`storage_half::serve`, `start::serve`) wait for nothing: the
+    /// process exits when they return, and its exit frees the lock.
+    ///
+    /// The tasks that hold handles on the cold store, to look at when the warning shows:
+    /// the cache's touch flusher (`kbf-front`, `cache/touches.rs`) and its write-pool
+    /// threads (`cache/pool.rs`).
     ///
     /// # Errors
     /// The listener fails while serving.
     pub async fn serve(self) -> Result<(), ServeError> {
+        let (served, released) = self.serve_checked(COLD_RELEASE_DEADLINE).await;
+        if let Err(held) = released {
+            tracing::warn!(
+                dir = %held.dir.display(),
+                clones = held.clones,
+                limit = ?held.limit,
+                "the cold store is still open after serving ended; its lock is released when the process exits"
+            );
+        }
+        served
+    }
+
+    /// [`StorageHandle::serve`] without the warning, saying whether the cold store was
+    /// released within `limit` (on the runtime's clock): what the tests call, so a
+    /// handle leaked by the node fails a test instead of hanging it or passing unseen.
+    /// The result of serving comes first.
+    #[doc(hidden)]
+    pub async fn serve_checked(
+        self,
+        limit: Duration,
+    ) -> (Result<(), ServeError>, Result<(), StillHeld>) {
         let Self {
+            addr: _,
+            metrics: _,
+            start_line: _,
             serving,
             _flusher,
             _background,
+            cold_released,
+            maps,
+            catch_up,
+            repairs,
             _joiner,
             _repair,
-            ..
+            _metrics,
         } = self;
-        serving.await
+        let served = serving.await;
+        // Everything the handle holds goes, so what is left holding the stores is not it.
+        drop((
+            _flusher,
+            _background,
+            maps,
+            catch_up,
+            repairs,
+            _joiner,
+            _repair,
+            _metrics,
+        ));
+        let released = match cold_released {
+            Some(released) => released.wait_within(limit).await,
+            None => Ok(()),
+        };
+        (served, released)
     }
 }
 
@@ -475,19 +578,19 @@ where
                 flags,
                 listener,
                 &stores,
-                (store, files),
+                (Fixed(store), files),
                 FILE_PREFIX_ROOT,
                 shutdown,
             )
             .await
         }
         StoreUri::S3(uri) => {
-            let store = s3_store(uri, |name| std::env::var(name).ok())?;
+            let cold = Registrable::new(uri, flags.env)?;
             over(
                 flags,
                 listener,
                 &stores,
-                (store, None),
+                (cold, None),
                 &uri.prefix,
                 shutdown,
             )
@@ -497,16 +600,16 @@ where
 }
 
 /// [`start_storage`] over the object store the cold store's URI named.
-async fn over<O, S, F>(
+async fn over<C, S, F>(
     flags: &StorageFlags,
     listener: StorageListener,
     stores: &Stores,
-    (store, files): (O, Option<kbf_objstore::FsStore>),
+    (cold, files): (C, Option<kbf_objstore::FsStore>),
     prefix_root: &str,
     shutdown: S,
 ) -> Result<StorageHandle, Box<dyn Error>>
 where
-    O: ObjectStore + 'static,
+    C: ColdPick,
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
@@ -514,6 +617,7 @@ where
     let meta = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
     let (prefix, log) = (meta.store_prefix(), meta.log_id());
     let grace = Duration::from_millis(args.cold_store_evict_grace_ms);
+    let cold_released = files.as_ref().map(kbf_objstore::FsStore::released);
     let pass = files.map(|files| StartPass::over_raft(files, grace));
     // After the log is open: it refuses a directory that holds files it did not write.
     let repair_dir = stores.meta_dir.join(REPAIR_DIR);
@@ -521,9 +625,9 @@ where
         flags,
         listener,
         stores.hot.as_ref(),
-        (meta, store, prefix, log),
+        (meta, cold, prefix, log),
         (shutdown, &repair_dir),
-        pass,
+        (pass, cold_released),
         RebuildConfig::default(),
     )
     .await
@@ -532,27 +636,35 @@ where
 /// The cache, its write tier, flusher and pass, and the listener over them. With
 /// `--frontend` the listener is bound and the node registered before the cache opens,
 /// so the cache writes as the registration's member and boot ([`open_registered`]).
-async fn assemble<O, S, F>(
+async fn assemble<C, S, F>(
     flags: &StorageFlags,
     listener: StorageListener,
     hot: Option<&Hot>,
-    (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
+    (meta, cold, prefix, log): (RaftMetaLog<StdFs>, C, KeyPrefix, FarmLogId),
     (shutdown, repair_dir): (S, &Path),
-    pass: Option<StartPass<RaftMetaLog<StdFs>>>,
+    (pass, cold_released): (
+        Option<StartPass<RaftMetaLog<StdFs>>>,
+        Option<kbf_objstore::Released>,
+    ),
     rebuild: RebuildConfig,
 ) -> Result<StorageHandle, Box<dyn Error>>
 where
-    O: ObjectStore + 'static,
+    C: ColdPick,
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    let socket = bind_storage_socket(listener.listen)?;
-    let (cache, registered) = open_cache(flags, socket, (meta, store, prefix, log)).await?;
+    // One start, one bind budget for both listeners, spent before the first await (a
+    // `Binder` is not `Send`).
+    let (socket, metrics) = bind_node_sockets(listener.listen, flags.metrics, &Binder::new())?;
+    let (cache, registered) = open_cache(flags, socket, (meta, cold, prefix, log)).await?;
     let cache = cache
         .with_writes(flags.server.write_config())
         .with_write_pool(flags.server.write_pool_config());
     let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
+    let (metrics, _metrics) = metrics
+        .map(|m| m.serve(Arc::clone(&cache), None, listener.tls.clone()))
+        .unzip();
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
@@ -564,6 +676,7 @@ where
     let node = bind_node(flags, listener, registered, storage, repair_dir, stop)?;
     Ok(StorageHandle {
         addr: node.addr,
+        metrics,
         start_line: format!(
             "kbf-storage {SERVER_VERSION} storage={} log={log}",
             node.addr
@@ -571,11 +684,13 @@ where
         serving: node.serving,
         _flusher,
         _background,
+        cold_released,
         maps: node.maps,
         catch_up,
         repairs: node.repairs,
         _joiner: node.joiner,
         _repair: node.repair,
+        _metrics,
     })
 }
 
@@ -594,11 +709,11 @@ where
 /// # Errors
 /// A TLS file or the frontend URL is refused, or the cache cannot be opened
 /// ([`open_registered`]).
-pub(crate) async fn open_cache<O: ObjectStore>(
+pub(crate) async fn open_cache<C: ColdPick>(
     flags: &StorageFlags,
     socket: StorageSocket,
-    (meta, store, prefix, log): (RaftMetaLog<StdFs>, O, KeyPrefix, FarmLogId),
-) -> Result<(Cache<RaftMetaLog<StdFs>, O>, Registered), Box<dyn Error>> {
+    (meta, cold, prefix, log): (RaftMetaLog<StdFs>, C, KeyPrefix, FarmLogId),
+) -> Result<(Cache<RaftMetaLog<StdFs>, C::Store>, Registered), Box<dyn Error>> {
     let keys = ObjectKeys {
         root: prefix_root(&prefix, log)?,
         legacy: prefix,
@@ -614,6 +729,11 @@ pub(crate) async fn open_cache<O: ObjectStore>(
             };
             let mut joiner = joiner.with_catch_up(catch_up.clone());
             let joined = joiner.join().await;
+            // The store is chosen after the registration and before the cache opens: the
+            // keys the frontend registered are probed first (`crate::cold_apply`), and the
+            // heartbeats report what became of them from the first one.
+            let (store, applied) = cold.registered(&joiner, &joined).await?;
+            let joiner = joiner.with_applied(applied);
             let cache = open_registered(meta, store, keys, &joined).await?;
             let joiner = Some((joiner, joined));
             (
@@ -627,7 +747,7 @@ pub(crate) async fn open_cache<O: ObjectStore>(
             )
         }
         None => (
-            Cache::open_under(meta, store, keys).await?,
+            Cache::open_under(meta, cold.alone()?, keys).await?,
             Registered {
                 socket,
                 node,
@@ -713,13 +833,24 @@ fn one_voter(voters: usize) -> Result<(), String> {
 #[must_use]
 pub fn run(flags: &StorageFlags) -> ExitCode {
     crate::log_file::init(&flags.server);
-    match serve(flags) {
+    match harden(flags).and_then(|()| serve(flags)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprint!("{}", crate::start_said("kbf storage", e.as_ref()));
             StartFailure::of(e.as_ref()).code()
         }
     }
+}
+
+/// Turns off core dumps for a node that may hold registered keys.
+///
+/// # Errors
+/// The process cannot be hardened: the node does not start holding keys it cannot protect.
+pub fn harden(flags: &StorageFlags) -> Result<(), Box<dyn Error>> {
+    if flags.may_hold_keys() {
+        crate::cold_apply::harden_process()?;
+    }
+    Ok(())
 }
 
 fn serve(flags: &StorageFlags) -> Result<(), Box<dyn Error>> {
@@ -739,3 +870,7 @@ mod tests;
 #[cfg(test)]
 #[path = "storage_rebuild_tests.rs"]
 mod rebuild_tests;
+
+#[cfg(test)]
+#[path = "storage_release_tests.rs"]
+mod release_tests;
