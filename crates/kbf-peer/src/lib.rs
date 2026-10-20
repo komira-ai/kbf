@@ -156,6 +156,12 @@ impl PeerNames {
         &self.dns
     }
 
+    /// The IP addresses, in the order the certificate lists them.
+    #[must_use]
+    pub fn ips(&self) -> &[IpAddr] {
+        &self.ips
+    }
+
     /// Whether one of the names is `host`: a bare host, without port or brackets (see
     /// [`host_of`]). A host that parses as an IP address is covered by an IP name of
     /// the same address and by no DNS name; any other host is covered by a DNS name equal
@@ -234,15 +240,16 @@ pub struct PeerIdentity {
 
 impl PeerIdentity {
     /// The identity of a caller whose certificate a TLS-terminating proxy verified and
-    /// which names only `node_id`: that one DNS name, and no serial or key hash (the proxy
-    /// does not forward them), so a `serial` or `spki-sha256` deny entry cannot name it and
-    /// an IP address is covered by no name.
+    /// which names `node_id` and the IP addresses `ips` that certificate's leaf holds (the
+    /// proxy's `x-kbf-node-ips`): that one DNS name and exactly those addresses, and no
+    /// serial or key hash (the proxy does not forward them), so a `serial` or `spki-sha256`
+    /// deny entry cannot name it. An IP address outside `ips` is covered by no name.
     #[must_use]
-    pub fn proxied(node_id: &str) -> Self {
+    pub fn proxied(node_id: &str, ips: &[IpAddr]) -> Self {
         Self {
             names: PeerNames {
                 dns: vec![node_id.to_owned()],
-                ips: Vec::new(),
+                ips: ips.to_vec(),
             },
             serial: String::new(),
             spki_sha256: String::new(),
@@ -278,6 +285,62 @@ impl PeerIdentity {
             DenyEntry::Node(node) => self.names.has_dns_name(node),
         })
     }
+}
+
+/// The most IP addresses one `x-kbf-node-ips` header holds.
+pub const NODE_IPS_MAX: usize = 16;
+
+/// The `x-kbf-node-ips` value for `ips`: canonical text (IPv6 compressed), sorted, each
+/// address once, comma separated with no space; `None` for no address.
+///
+/// # Errors
+/// [`IpsError::TooMany`]: more than [`NODE_IPS_MAX`] distinct addresses.
+pub fn node_ips_value(ips: &[IpAddr]) -> Result<Option<String>, IpsError> {
+    let mut ips = ips.to_vec();
+    ips.sort_unstable();
+    ips.dedup();
+    if ips.len() > NODE_IPS_MAX {
+        return Err(IpsError::TooMany(ips.len()));
+    }
+    if ips.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        ips.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    ))
+}
+
+/// The addresses of an `x-kbf-node-ips` value, all or none: at most [`NODE_IPS_MAX`]
+/// comma-separated addresses, each in the canonical text [`node_ips_value`] writes
+/// (so no space, no empty element, no zone or port, no uncompressed IPv6), none twice.
+/// An IPv4-mapped IPv6 address stays IPv6 and equals no IPv4 name.
+///
+/// # Errors
+/// [`IpsError::Malformed`] for anything else.
+pub fn parse_node_ips(value: &str) -> Result<Vec<IpAddr>, IpsError> {
+    let mut ips = Vec::new();
+    for part in value.split(',') {
+        let ip: IpAddr = part.parse().map_err(|_| IpsError::Malformed)?;
+        if ip.to_string() != part || ips.contains(&ip) || ips.len() == NODE_IPS_MAX {
+            return Err(IpsError::Malformed);
+        }
+        ips.push(ip);
+    }
+    Ok(ips)
+}
+
+/// Why an IP list cannot be forwarded or read.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum IpsError {
+    /// More distinct addresses than [`NODE_IPS_MAX`].
+    #[error("the certificate names {0} IP addresses; at most {NODE_IPS_MAX} are forwarded")]
+    TooMany(usize),
+    /// Not a list of canonical addresses.
+    #[error("not a list of distinct canonical IP addresses")]
+    Malformed,
 }
 
 /// The identity a DER certificate gives a deny list.

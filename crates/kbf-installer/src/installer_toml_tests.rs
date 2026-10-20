@@ -408,3 +408,41 @@ fn a_syntax_error_names_the_line_it_starts_on() {
         "a reason (the text is not shown)"
     );
 }
+
+const PROXY: &str = r#"
+[proxy]
+listen = "192.0.2.10:8443"
+operator_token_file = "/etc/kbf/operator.token"
+server_cert_file = "/etc/kbf/tls/server.pem"
+server_key_file = "/etc/kbf/tls/server.key"
+client_ca_file = "/etc/kbf/tls/ca.pem"
+
+[proxy.upstream]
+base_port = 18000
+"#;
+
+/// Catches `render` dropping the operator's `[proxy]` table (a `setup` run that rewrites the
+/// file would erase it, and with it `listen`): the rendered file parses back to the same
+/// table, and a second render is byte for byte the first.
+#[test]
+fn the_proxy_table_survives_a_render() {
+    let parsed = InstallerToml::parse(PROXY).expect("parses");
+    let listen = parsed.proxy.as_ref().and_then(|p| p.listen);
+    assert_eq!(listen, Some("192.0.2.10:8443".parse().unwrap()));
+    let text = parsed.render();
+    assert_eq!(InstallerToml::parse(&text).expect("parses back"), parsed);
+    assert_eq!(InstallerToml::parse(&text).unwrap().render(), text);
+    assert!(
+        text.contains("\n[proxy]\n") && text.contains("[proxy.upstream]"),
+        "{text}"
+    );
+}
+
+/// Catches `listen` reaching the file unchecked, and the message echoing the value: the
+/// refusal names the key, as the file's others do.
+#[test]
+fn a_bad_proxy_listen_names_the_key_not_the_value() {
+    let why = problems(&PROXY.replace("192.0.2.10:8443", "farm.example:8443"));
+    assert!(why.contains("listen"), "{why}");
+    assert!(!why.contains("farm.example"), "{why}");
+}
