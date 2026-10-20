@@ -139,6 +139,7 @@ pub mod update;
 pub mod update_hosts;
 pub mod update_status;
 pub mod verbs;
+pub mod vitals;
 pub mod worker;
 pub mod worker_roles;
 pub mod write_rules;

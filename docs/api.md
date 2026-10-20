@@ -753,8 +753,12 @@ no registered member.
 { "members_total": 3, "members_active": 3, "not_active": [], "silent": [],
   "unreported": [], "debts_total": 3, "under_replicated_blobs": 3,
   "reasons": ["3 blobs owed"],
-  "nodes": [ { "id": 1, "state": "active", "planned_down": false, "repair_debts": 3, "open_writes": 0, "generation": 12 },
-             { "id": 2, "state": "active", "planned_down": false, "repair_debts": 0, "open_writes": null, "generation": 12 } ] }
+  "nodes": [ { "id": 1, "state": "active", "planned_down": false, "repair_debts": 3, "open_writes": 0, "generation": 12,
+               "unflushed_bytes": 1048576, "unflushed_blocks": 2, "oldest_unflushed_ms": 4200,
+               "budget_bytes": 107374182400, "used_bytes": 2097152, "flush_failures": 0, "flush_conflicts": 0 },
+             { "id": 2, "state": "active", "planned_down": false, "repair_debts": 0, "open_writes": null, "generation": 12,
+               "unflushed_bytes": null, "unflushed_blocks": null, "oldest_unflushed_ms": null,
+               "budget_bytes": null, "used_bytes": null, "flush_failures": null, "flush_conflicts": null } ] }
 ```
 
 - `under_replicated_blobs`: the number, or `null` while unknown. A gate treats `null` as
@@ -778,6 +782,15 @@ no registered member.
   rollout only when every other member is `ACTIVE` and fresh, no copy is owed anywhere, and
   the node itself reports no open write from a map at least as new as the one that stopped
   routing writes to it (`Members::node_idle`, in-process, with the reasons).
+- The write-tier health of each node, from its heartbeat (read-only; no decision depends on
+  it): `unflushed_bytes` and `unflushed_blocks` (acknowledged data on the node's local disk
+  not yet in the cold store: what losing the disk would take), `oldest_unflushed_ms` (the
+  age of the oldest such block, 0 with none), `budget_bytes` and `used_bytes` (the tier's
+  budget and the bytes counted against it), and `flush_failures` and `flush_conflicts`
+  (counts since the node started). Each is `null` when the report is stale, when the node
+  has not heartbeated since it registered, when it has no write tier, or when it is an older
+  build that does not send it; `null` is unknown, never zero, and a real `0` is shown as
+  `0`. A value above 2^53 - 1 is not a count: it is shown as `null`.
 
 The number is as old as the newest heartbeat. A copy owed since then is not in it, so
 whoever acts on a zero keeps new writes away from the node first (drains it), then reads
