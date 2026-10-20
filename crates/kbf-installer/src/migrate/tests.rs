@@ -506,7 +506,8 @@ fn a_mac_host_comes_over_through_launchd() {
 /// Catches a rig that lets a job be bootstrapped twice: launchd refuses a loaded job, so the
 /// rig must too, or the test above would pass without the start booting the job out.
 ///
-/// Mutant seen red: the rig's refusal dropped (the bootstrap of a loaded job succeeds).
+/// Mutant it catches (not run; the `expect_err` fails by construction): the rig's refusal
+/// dropped, so the bootstrap of a loaded job succeeds.
 #[test]
 fn the_rig_refuses_to_bootstrap_a_loaded_job() {
     use kbf_host::{Cmd, Exec, Step, path::HostPath};
