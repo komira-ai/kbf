@@ -75,6 +75,12 @@ struct World {
     diff: Option<String>,
     /// A call whose line holds the first text fails, printing the second on stderr.
     fail: Option<(&'static str, &'static str)>,
+    /// How many calls that would fail pass first.
+    fail_after: usize,
+    /// How many calls the failure matched so far.
+    matched: Cell<usize>,
+    /// A call whose line holds this text cannot be started.
+    spawn_fail: Option<&'static str>,
     /// The gitlink `git update-index` staged.
     staged: RefCell<Option<String>>,
     /// Whether `gh pr merge` ran.
@@ -114,6 +120,9 @@ fn world() -> World {
         commit_moves_head: true,
         diff: None,
         fail: None,
+        fail_after: 0,
+        matched: Cell::new(0),
+        spawn_fail: None,
         staged: RefCell::new(None),
         merged: Cell::new(false),
         calls: RefCell::new(Vec::new()),
@@ -136,7 +145,24 @@ impl World {
 
     fn broken(&self, line: &str) -> Option<Ran> {
         let (needle, why) = self.fail?;
-        line.contains(needle).then(|| broke(why))
+        if !line.contains(needle) {
+            return None;
+        }
+        let seen = self.matched.get();
+        self.matched.set(seen + 1);
+        (seen >= self.fail_after).then(|| broke(why))
+    }
+
+    fn unstartable(&self, line: &str) -> Option<Error> {
+        let needle = self.spawn_fail?;
+        if !line.contains(needle) {
+            return None;
+        }
+        let what = "the program".to_owned();
+        Some(Error::Spawn {
+            what,
+            why: "no such file".to_owned(),
+        })
     }
 
     fn api_answer(&self, path: &str) -> Ran {
@@ -227,6 +253,9 @@ fn changed(w: &World) -> bool {
 impl Tools for World {
     fn gh(&self, args: &[&str]) -> Result<Ran, Error> {
         let line = self.record("gh", args);
+        if let Some(error) = self.unstartable(&line) {
+            return Err(error);
+        }
         if let Some(broken) = self.broken(&line) {
             return Ok(broken);
         }
@@ -247,6 +276,9 @@ impl Tools for World {
 
     fn git(&self, args: &[&str]) -> Result<Ran, Error> {
         let line = self.record("git", args);
+        if let Some(error) = self.unstartable(&line) {
+            return Err(error);
+        }
         if let Some(broken) = self.broken(&line) {
             return Ok(broken);
         }
@@ -737,6 +769,58 @@ fn a_failing_close_of_an_older_pull_request_is_an_error() {
     w.prs = listing(&[pr(5, "1.2.0", "OPEN", true)]);
     w.fail = Some(("gh pr close", "boom"));
     assert_eq!(failed(run(&w)), "gh pr close: boom");
+}
+
+#[test]
+fn a_program_that_cannot_be_started_is_an_error() {
+    // Catches: a `gh` or `git` that is not there read as an empty answer (no tag, no list,
+    // no clone), at each of the three places that run one.
+    let needles = [
+        "gh api repos/komira-ai/kbf/commits",
+        "gh pr list",
+        "git clone",
+        "gh pr create",
+    ];
+    for needle in needles {
+        let mut w = world();
+        w.spawn_fail = Some(needle);
+        let got = run(&w);
+        let spawned = matches!(got, Err(Error::Spawn { .. }));
+        assert!(spawned, "{needle}: {got:?}");
+    }
+}
+
+#[test]
+fn an_open_pull_request_whose_auto_merge_cannot_be_turned_on_is_an_error() {
+    // Catches: a failed `gh pr merge` on an existing pull request passed over.
+    let mut w = world();
+    w.prs = listing(&[pr(7, "1.2.3", "OPEN", false)]);
+    w.fail = Some(("gh pr merge", "boom"));
+    assert_eq!(failed(run(&w)), "gh pr merge: boom");
+}
+
+#[test]
+fn an_existing_branch_whose_gitlink_cannot_be_read_is_an_error() {
+    // Catches: a branch that exists, whose contents cannot be read, taken for a branch to
+    // reuse (or for none).
+    let mut w = world();
+    w.set(&ref_path(), json!({}));
+    w.fail = Some(("gh api repos/example-org/internal/contents", "boom"));
+    let why = failed(run(&w));
+    assert!(why.ends_with("boom"), "{why}");
+    assert!(!changed(&w));
+}
+
+#[test]
+fn a_gitlink_that_cannot_be_read_after_the_commit_is_an_error_before_the_push() {
+    // Catches: a push after a commit that was not looked at (the check after the commit
+    // reads the tree again).
+    let mut w = world();
+    w.fail = Some(("ls-tree", "boom"));
+    w.fail_after = 1;
+    let why = failed(run(&w));
+    assert!(why.ends_with("boom"), "{why}");
+    assert!(w.did("commit --quiet") && !w.did("push --quiet"));
 }
 
 fn args_with(flag: &str, value: &str) -> BumpArgs {
