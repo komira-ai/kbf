@@ -1,6 +1,6 @@
 //! Topology parsing, placement and the start-up fallbacks of `--lease-placement`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::*;
 
