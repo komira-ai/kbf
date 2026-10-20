@@ -236,7 +236,7 @@ pub fn migrate<E: Exec>(
                 &first.old,
                 &found,
             );
-            plan(m, exec, &mut report)?;
+            plan(m, exec, first.old.kit.is_some(), &mut report)?;
             return Ok(report);
         }
         let probed = [
@@ -410,8 +410,8 @@ pub fn migrate<E: Exec>(
     // Last, with the old helper disabled and the new layout in place: the installer's own
     // unit, so the migrated host takes orders without a separate `setup`. Before the journal
     // says done, so a failure here is a run again, not a host that looks finished.
-    if let Some(installer) = &m.installer_unit {
-        enable_installer(&mut svc, installer, mode, &mut report)?;
+    if let Some(installer) = installer_job(m, kit) {
+        enable_installer(&mut svc, &installer, mode, &mut report)?;
     }
     journal.phase = Phase::Done;
     tree.state.put_journal(&journal)?;
@@ -420,6 +420,21 @@ pub fn migrate<E: Exec>(
         note_old_state(m)?;
     }
     Ok(report)
+}
+
+/// The package's installer job on a Mac (`packaging/macos`). A kit host's installer is always
+/// this job, named or not, so a migration enables it when `--installer-unit` names none. (The
+/// same constant, with the same value, is in `rollback.rs`, which stops it; they are to be one
+/// definition.)
+pub(super) const KIT_INSTALLER_JOB: &str = "com.komira.kbf-installer.plist";
+
+/// The installer's unit this migration enables: the one `--installer-unit` names, else on a kit
+/// host the package's job. An old host without the flag has none (its units are the operator's).
+fn installer_job(m: &Migration, kit: bool) -> Option<Unit> {
+    match &m.installer_unit {
+        Some(named) => Some(named.clone()),
+        None => kit.then(|| Unit::new(KIT_INSTALLER_JOB).expect("a plist name")),
+    }
 }
 
 /// Enable the installer's unit and start it unless it is enabled already: the same question
@@ -516,7 +531,12 @@ fn find(
 }
 
 /// What a dry run says about the services.
-fn plan<E: Exec>(m: &Migration, exec: &mut E, report: &mut Report) -> Result<(), MigrateError> {
+fn plan<E: Exec>(
+    m: &Migration,
+    exec: &mut E,
+    kit: bool,
+    report: &mut Report,
+) -> Result<(), MigrateError> {
     let svc = Services {
         exec,
         roots: &m.roots,
@@ -532,7 +552,7 @@ fn plan<E: Exec>(m: &Migration, exec: &mut E, report: &mut Report) -> Result<(),
         };
         report.line(Mode::DryRun, format!("{unit}: {what}"));
     }
-    if let Some(installer) = &m.installer_unit {
+    if let Some(installer) = &installer_job(m, kit) {
         let enabled = svc
             .is_enabled(installer)
             .map_err(MigrateError::io(installer.as_str()))?;

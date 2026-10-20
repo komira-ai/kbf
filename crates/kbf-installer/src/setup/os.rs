@@ -27,6 +27,8 @@ pub trait Os {
     }
     /// The account `name`, `None` when the host has none.
     fn user(&self, name: &str) -> io::Result<Option<RunUser>>;
+    /// The login shell of the account `name` (which exists).
+    fn login_shell(&self, name: &str) -> io::Result<String>;
     /// The text of `/etc/subuid` and `/etc/subgid` (empty when the file is missing).
     fn subuid(&self) -> io::Result<String>;
     fn subgid(&self) -> io::Result<String>;
@@ -125,6 +127,37 @@ impl Os for SystemOs<'_> {
 
     fn user(&self, name: &str) -> io::Result<Option<RunUser>> {
         kbf_host::user::lookup(&View(self.exec), name).map_err(io::Error::other)
+    }
+
+    fn login_shell(&self, name: &str) -> io::Result<String> {
+        let (cmd, field, sep) = match self.platform {
+            // name:password:uid:gid:gecos:home:shell
+            Platform::Linux => (
+                Cmd::new(Self::path(kbf_host::user::GETENT)?)
+                    .arg("passwd")
+                    .arg("--")
+                    .arg(name),
+                6,
+                ':',
+            ),
+            // `UserShell: /usr/bin/false`
+            Platform::MacOs => (
+                Cmd::new(Self::path(DSCL)?)
+                    .arg(".")
+                    .arg("-read")
+                    .arg(format!("/Users/{name}"))
+                    .arg("UserShell"),
+                1,
+                ' ',
+            ),
+        };
+        let out = kbf_host::exec::succeeded(&cmd, self.exec.query(&cmd)?)?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.trim_end()
+            .split(sep)
+            .nth(field)
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::other(format!("no login shell of {name} in {text:?}")))
     }
 
     fn subuid(&self) -> io::Result<String> {
