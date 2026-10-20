@@ -360,11 +360,16 @@ pub struct ProxyArgs {
     /// `/etc/kbf/installer.toml`, `/usr/local/etc/kbf/installer.toml` on a Mac).
     #[arg(long)]
     pub config: Option<std::path::PathBuf>,
+    /// The order spool the update API writes and the root half reads: owned by the service
+    /// user. As `run --orders-dir`.
+    #[arg(long, default_value = "/var/lib/kbf-installer/orders")]
+    pub orders_dir: std::path::PathBuf,
     /// Check the `[proxy]` table and exit: 0 if it is valid, 2 if not. Binds nothing.
     #[arg(long)]
     pub check: bool,
     /// Root's directory: the proxy reads `status.json` here, to start the installed release
-    /// when no frontend child is running.
+    /// when no frontend child is running, and the update API reads its status. As
+    /// `run --update-dir`.
     #[arg(long, default_value = "/var/lib/kbf-installer")]
     pub update_dir: std::path::PathBuf,
 }

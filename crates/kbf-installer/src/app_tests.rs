@@ -190,6 +190,7 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
             config: Some(file),
             check: true,
             update_dir: "/var/lib/kbf-installer".into(),
+            orders_dir: "/var/lib/kbf-installer/orders".into(),
         })
         .needs_root()
     );
