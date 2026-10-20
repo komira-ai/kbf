@@ -6,7 +6,7 @@
 //! host to follow), the body read to a limit, and the whole call under one timeout. Written
 //! over hyper's connection API: the server already links hyper through tonic and axum.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -17,6 +17,7 @@ use hyper::http::uri::{Authority, Scheme};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::net::TcpStream;
+use tokio::sync::OnceCell;
 use tokio_rustls::TlsConnector;
 
 use super::{FetchError, Fetched, Source};
@@ -41,7 +42,7 @@ pub struct GithubSource {
     path: String,
     timeout: Duration,
     roots: Roots,
-    tls: OnceLock<Result<TlsConnector, String>>,
+    tls: OnceCell<Result<TlsConnector, String>>,
 }
 
 impl std::fmt::Debug for GithubSource {
@@ -74,31 +75,39 @@ impl GithubSource {
             path: format!("/repos/{repo}/releases?per_page=30"),
             timeout,
             roots,
-            tls: OnceLock::new(),
+            tls: OnceCell::new(),
         })
     }
 
-    /// The TLS client, made on first use (loading the system store is not free).
-    fn connector(&self) -> Result<&TlsConnector, FetchError> {
-        let made = self.tls.get_or_init(|| {
-            let certs = match &self.roots {
-                Roots::System => rustls_native_certs::load_native_certs().certs,
-                Roots::Given(certs) => certs.clone(),
-            };
-            let mut store = rustls::RootCertStore::empty();
-            let (added, _ignored) = store.add_parsable_certificates(certs);
-            if added == 0 {
-                return Err("no trusted root certificates".to_owned());
-            }
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let mut config = rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .expect("the ring provider supports the default TLS versions")
-                .with_root_certificates(store)
-                .with_no_client_auth();
-            config.alpn_protocols = vec![b"http/1.1".to_vec()];
-            Ok(TlsConnector::from(Arc::new(config)))
-        });
+    /// The TLS client, made on first use. Loading the system store reads files, so it runs
+    /// on the blocking pool, never on the runtime's workers.
+    async fn connector(&self) -> Result<&TlsConnector, FetchError> {
+        let made = self
+            .tls
+            .get_or_init(|| async {
+                let certs = match &self.roots {
+                    Roots::System => tokio::task::spawn_blocking(|| {
+                        rustls_native_certs::load_native_certs().certs
+                    })
+                    .await
+                    .map_err(|e| format!("loading the system roots: {e}"))?,
+                    Roots::Given(certs) => certs.clone(),
+                };
+                let mut store = rustls::RootCertStore::empty();
+                let (added, _ignored) = store.add_parsable_certificates(certs);
+                if added == 0 {
+                    return Err("no trusted root certificates".to_owned());
+                }
+                let provider = Arc::new(rustls::crypto::ring::default_provider());
+                let mut config = rustls::ClientConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .expect("the ring provider supports the default TLS versions")
+                    .with_root_certificates(store)
+                    .with_no_client_auth();
+                config.alpn_protocols = vec![b"http/1.1".to_vec()];
+                Ok(TlsConnector::from(Arc::new(config)))
+            })
+            .await;
         made.as_ref()
             .map_err(|why| FetchError::Transport(format!("TLS: {why}")))
     }
@@ -117,7 +126,8 @@ impl GithubSource {
             let name = ServerName::try_from(host.to_owned())
                 .map_err(|e| FetchError::Transport(e.to_string()))?;
             let stream = self
-                .connector()?
+                .connector()
+                .await?
                 .connect(name, tcp)
                 .await
                 .map_err(|e| FetchError::Transport(format!("TLS: {e}")))?;

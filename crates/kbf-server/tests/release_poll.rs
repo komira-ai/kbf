@@ -464,7 +464,7 @@ async fn the_poller_reads_the_fake_api_and_a_second_poll_is_a_304() {
     let rows = Rows::new(Arc::clone(&store));
     let stats = Arc::new(Stats::default());
     let mut poller = Poller::new(source(addr), rows.clone(), config(addr), Arc::clone(&stats));
-    let now = FarmTime::from_millis(42);
+    let now = FarmTime::from_millis(1_792_886_400_000);
     let first = poller.cycle(now, || true).await;
     assert!(
         matches!(first, Cycle::Proposed(ref p) if p.commit == C && p.tag == "v0.9.1"),

@@ -16,11 +16,21 @@ const BUNDLE_SUFFIX: &str = ".sigstore.json";
 /// The checksum asset every release holds.
 const SUMS: &str = "SHA256SUMS";
 
+/// The longest tag read, in bytes (a git ref may be far longer; a release tag is not).
+pub const TAG_MAX: usize = 128;
+
+/// How far past now a publication time may lie (clock skew between GitHub and this host).
+pub const FUTURE_SLACK_SECS: i64 = 24 * 60 * 60;
+
 /// Why an entry of the feed is not a candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ignore {
-    /// Not an object, or without a string tag, a publication time or an asset list.
+    /// Not an object, or without a string tag (of at most [`TAG_MAX`] bytes), a publication
+    /// time or an asset list.
     Malformed,
+    /// Published after the latest time allowed ([`FUTURE_SLACK_SECS`] past now): a time that
+    /// far ahead would make the entry the newest for good.
+    Future,
     /// A draft.
     Draft,
     /// A pre-release.
@@ -39,8 +49,9 @@ pub enum Ignore {
 
 impl Ignore {
     /// Every reason, in the order the metrics list them.
-    pub const ALL: [Ignore; 8] = [
+    pub const ALL: [Ignore; 9] = [
         Ignore::Malformed,
+        Ignore::Future,
         Ignore::Draft,
         Ignore::Prerelease,
         Ignore::NotVersionTag,
@@ -55,6 +66,7 @@ impl Ignore {
     pub fn label(self) -> &'static str {
         match self {
             Ignore::Malformed => "malformed",
+            Ignore::Future => "future",
             Ignore::Draft => "draft",
             Ignore::Prerelease => "prerelease",
             Ignore::NotVersionTag => "not_version_tag",
@@ -98,17 +110,24 @@ pub fn entries(body: &[u8]) -> Result<Vec<Value>, String> {
     }
 }
 
-/// Whether `entry` is a candidate, with `refs` the refs a release may be built from.
+/// Whether `entry` is a candidate, with `refs` the refs a release may be built from and
+/// `latest_secs` the latest publication time (Unix seconds) believed.
 ///
 /// # Errors
 /// The reason it is not.
-pub fn judge(entry: &Value, refs: &[String]) -> Result<Candidate, Ignore> {
+pub fn judge(entry: &Value, refs: &[String], latest_secs: i64) -> Result<Candidate, Ignore> {
     let tag = entry["tag_name"].as_str().ok_or(Ignore::Malformed)?;
+    if tag.len() > TAG_MAX {
+        return Err(Ignore::Malformed);
+    }
     let published = entry["published_at"].as_str().ok_or(Ignore::Malformed)?;
     let published_at_secs =
         time::OffsetDateTime::parse(published, &time::format_description::well_known::Rfc3339)
             .map_err(|_| Ignore::Malformed)?
             .unix_timestamp();
+    if published_at_secs > latest_secs {
+        return Err(Ignore::Future);
+    }
     let assets = entry["assets"].as_array().ok_or(Ignore::Malformed)?;
     let notes = entry["body"].as_str().unwrap_or_default();
     if entry["draft"].as_bool().unwrap_or(false) {
@@ -167,6 +186,9 @@ mod tests {
 
     const C: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    /// A "now" after the fixtures' publication time.
+    const LATEST: i64 = 1_800_000_000;
+
     fn refs() -> Vec<String> {
         vec!["main".to_owned()]
     }
@@ -202,7 +224,7 @@ mod tests {
     /// Catches a well-formed release that is turned away, and its fields read wrongly.
     #[test]
     fn a_published_attested_release_is_a_candidate() {
-        let got = judge(&release(), &refs()).expect("candidate");
+        let got = judge(&release(), &refs(), LATEST).expect("candidate");
         assert_eq!(got.tag, "v1.2");
         assert_eq!(got.commit, C);
         assert_eq!(got.published_at_secs, 1_792_458_123);
@@ -219,6 +241,14 @@ mod tests {
             (with("published_at", json!("yesterday")), Ignore::Malformed),
             (with("published_at", Value::Null), Ignore::Malformed),
             (with("assets", Value::Null), Ignore::Malformed),
+            (
+                with("tag_name", json!(format!("v{}", "9".repeat(TAG_MAX)))),
+                Ignore::Malformed,
+            ),
+            (
+                with("published_at", json!("9999-12-31T23:59:59Z")),
+                Ignore::Future,
+            ),
             (with("draft", json!(true)), Ignore::Draft),
             (with("prerelease", json!(true)), Ignore::Prerelease),
             (with("tag_name", json!("nightly")), Ignore::NotVersionTag),
@@ -269,8 +299,26 @@ mod tests {
             ),
         ];
         for (entry, want) in cases {
-            assert_eq!(judge(&entry, &refs()), Err(want), "{entry}");
+            assert_eq!(judge(&entry, &refs(), LATEST), Err(want), "{entry}");
         }
+    }
+
+    /// Catches the tag cap and the future cap being off by one: the longest tag and the
+    /// latest time allowed are candidates, one past each is not.
+    #[test]
+    fn the_caps_on_tag_length_and_future_time_hold_at_the_edge() {
+        let tag = format!("v{}", "9".repeat(TAG_MAX - 1));
+        assert_eq!(tag.len(), TAG_MAX);
+        assert!(judge(&with("tag_name", json!(tag)), &refs(), LATEST).is_ok());
+        let at = |secs: i64| {
+            let t = time::OffsetDateTime::from_unix_timestamp(secs).unwrap();
+            let text = t
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            judge(&with("published_at", json!(text)), &refs(), LATEST)
+        };
+        assert!(at(LATEST).is_ok());
+        assert_eq!(at(LATEST + 1), Err(Ignore::Future));
     }
 
     /// Catches the allowed refs being ignored: the same release is a candidate when its ref
@@ -278,9 +326,9 @@ mod tests {
     #[test]
     fn the_allowed_refs_decide() {
         let r = with("body", json!(notes(C, "release")));
-        assert_eq!(judge(&r, &refs()), Err(Ignore::RefNotAllowed));
+        assert_eq!(judge(&r, &refs(), LATEST), Err(Ignore::RefNotAllowed));
         let both = vec!["main".to_owned(), "release".to_owned()];
-        assert!(judge(&r, &both).is_ok());
+        assert!(judge(&r, &both, LATEST).is_ok());
     }
 
     /// Catches a tarball with a bundle for another file passing, and a second tarball
@@ -296,7 +344,7 @@ mod tests {
                 {"name": b},
             ]),
         );
-        assert_eq!(judge(&r, &refs()), Err(Ignore::Unattested));
+        assert_eq!(judge(&r, &refs(), LATEST), Err(Ignore::Unattested));
     }
 
     /// Catches the labels colliding or the index disagreeing with the list the metrics use.

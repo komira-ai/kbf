@@ -13,7 +13,8 @@ use super::*;
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const RUNNING: &str = "cccccccccccc";
-const NOW: FarmTime = FarmTime::from_millis(5_000);
+/// 2026-10-25T00:00:00Z: after every release the fixtures publish.
+const NOW: FarmTime = FarmTime::from_millis(1_792_886_400_000);
 
 /// A source that answers from a script and remembers the `ETag`s it was asked with.
 #[derive(Default)]
@@ -142,7 +143,7 @@ async fn a_new_v_release_becomes_a_proposal() {
         commit: A.to_owned(),
         tag: "v1".to_owned(),
         published_at_secs: 1_792_458_123,
-        proposed_at_ms: 5_000,
+        proposed_at_ms: NOW.as_millis(),
     };
     assert_eq!(got, Cycle::Proposed(want.clone()));
     assert_eq!(r.rows.proposals().unwrap(), vec![want]);
@@ -597,4 +598,115 @@ fn decide_picks_the_newest_and_none_from_nothing() {
     // A running commit shorter than a short hash names nothing.
     assert!(decide(vec![c(A, 1)], &[], None, "a").is_some());
     assert!(decide(vec![c(A, 1)], &[], None, "aaaaaaa").is_none());
+}
+
+// Catches: a release dated far ahead becoming the permanent newest and suppressing every
+// later proposal; and the cap being measured from the wrong clock (a day of skew is allowed).
+#[tokio::test]
+async fn a_release_dated_in_the_future_is_ignored_and_later_ones_are_still_proposed() {
+    let mut r = rig();
+    r.script.say(feed(
+        "e1",
+        &[
+            release("v9", A, "9999-12-31T23:59:59Z"),
+            release("v1", B, "2026-10-20T00:00:00Z"),
+        ],
+    ));
+    let got = r.poller.cycle(NOW, || true).await;
+    assert!(
+        matches!(&got, Cycle::Proposed(p) if p.commit == B),
+        "{got:?}"
+    );
+    assert_eq!(r.stats.ignored(Ignore::Future), 1);
+    // The next real release, after the far-future one was seen, is proposed.
+    let c = "d".repeat(40);
+    r.script
+        .say(feed("e2", &[release("v2", &c, "2026-10-24T00:00:00Z")]));
+    let got = r.poller.cycle(NOW, || true).await;
+    assert!(
+        matches!(&got, Cycle::Proposed(p) if p.commit == c),
+        "{got:?}"
+    );
+    // A day ahead of now is skew, a second more is not.
+    let ahead = |secs: i64| {
+        let t = time::OffsetDateTime::from_unix_timestamp(secs).unwrap();
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let now_secs = i64::try_from(NOW.as_millis() / 1000).unwrap();
+    let e = "e".repeat(40);
+    let f = "f".repeat(40);
+    r.script.say(feed(
+        "e3",
+        &[
+            release("v4", &f, &ahead(now_secs + 86_400 + 1)),
+            release("v3", &e, &ahead(now_secs + 86_400)),
+        ],
+    ));
+    let got = r.poller.cycle(NOW, || true).await;
+    assert!(
+        matches!(&got, Cycle::Proposed(p) if p.commit == e),
+        "{got:?}"
+    );
+    assert_eq!(r.stats.ignored(Ignore::Future), 2);
+}
+
+// Catches: a hostile tag of any length being read; the cap is on bytes of the tag.
+#[tokio::test]
+async fn an_overlong_tag_is_malformed() {
+    let mut r = rig();
+    let long = format!("v{}", "1".repeat(feed::TAG_MAX));
+    r.script
+        .say(feed("e1", &[release(&long, A, "2026-10-20T00:00:00Z")]));
+    assert_eq!(r.poller.cycle(NOW, || true).await, Cycle::Nothing);
+    assert_eq!(r.stats.ignored(Ignore::Malformed), 1);
+    assert!(r.rows.proposals().unwrap().is_empty());
+}
+
+// Catches: two releases of the same second both being proposed, or the choice depending on
+// feed order or on the commit's hash: exactly one is proposed, the higher version tag (as
+// numbers: v1.10 is above v1.9), and a later feed holding the other proposes nothing.
+#[tokio::test]
+async fn releases_of_the_same_second_propose_exactly_one_the_higher_tag() {
+    let at = "2026-10-20T00:00:00Z";
+    for order in [[0, 1], [1, 0]] {
+        let mut r = rig();
+        // The higher tag has the LOWER commit, so a commit order would pick the other.
+        let pair = [release("v1.10", A, at), release("v1.9", B, at)];
+        let entries: Vec<Value> = order.iter().map(|i| pair[*i].clone()).collect();
+        r.script.say(feed("e1", &entries));
+        let got = r.poller.cycle(NOW, || true).await;
+        assert!(
+            matches!(&got, Cycle::Proposed(p) if p.commit == A),
+            "{got:?}"
+        );
+        r.script.say(feed("e2", &entries));
+        assert_eq!(r.poller.cycle(NOW, || true).await, Cycle::Nothing);
+        assert_eq!(r.rows.proposals().unwrap().len(), 1);
+    }
+}
+
+// Catches: the `>=` of "no newer than a proposal held" becoming `>`: a release of the same
+// second as the held proposal, with another commit, is not proposed.
+#[tokio::test]
+async fn a_release_of_the_second_already_proposed_is_not_proposed_again() {
+    let mut r = rig();
+    let at = "2026-10-20T00:00:00Z";
+    r.script.say(feed("e1", &[release("v1.9", B, at)]));
+    r.poller.cycle(NOW, || true).await;
+    r.script.say(feed("e2", &[release("v1.10", A, at)]));
+    assert_eq!(r.poller.cycle(NOW, || true).await, Cycle::Nothing);
+    assert_eq!(r.rows.proposals().unwrap().len(), 1);
+    let held = r.rows.proposals().unwrap();
+    let c = Candidate {
+        tag: "v1.10".to_owned(),
+        commit: A.to_owned(),
+        published_at_secs: held[0].published_at_secs,
+    };
+    assert_eq!(decide(vec![c.clone()], &held, None, RUNNING), None);
+    let later = Candidate {
+        published_at_secs: c.published_at_secs + 1,
+        ..c
+    };
+    assert!(decide(vec![later], &held, None, RUNNING).is_some());
 }

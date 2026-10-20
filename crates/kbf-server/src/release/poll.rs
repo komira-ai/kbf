@@ -18,6 +18,12 @@
 //!   limit's `Retry-After` (or reset time) is honoured if longer. No credential is ever
 //!   sent (phase 2, which reads the newest successful artifacts run, needs a read token
 //!   and is a held item).
+//! - **Newest page only.** One request reads the newest 30 releases (GitHub lists by
+//!   creation time, newest first); the `Link` header is not followed. The newest `v*`
+//!   release is on that page unless more than 30 releases of other tags are newer.
+//! - **Hostile feed.** An entry published more than a day ahead of now, or with a tag over
+//!   128 bytes, is ignored and counted, so it can neither become the newest for good nor
+//!   cost memory.
 //! - **Metrics** ([`Stats::render`]): `kbf_release_poll_polls_total`,
 //!   `_not_modified_total`, `_proposals_total`, `_errors_total` and
 //!   `_ignored_total{reason}` for the entries that were not candidates.
@@ -69,7 +75,7 @@ pub struct Config {
 /// The flags of the poller.
 #[derive(Clone, Debug, clap::Args)]
 pub struct PollFlags {
-    /// How often, in seconds, the active frontend asks GitHub for new releases of `--release-poll-repo` and records the newest one the farm could run as a proposal (`proposals` of `GET /v1/update`). A proposal starts nothing: only an operator's `POST /v1/update/desired` does. The question is one conditional request with no credential, so an unchanged feed costs nothing. 0 turns the poller off. It needs `--state-store`, which holds the proposals
+    /// How often, in seconds, the active frontend asks GitHub for new releases of `--release-poll-repo` and records the newest one the farm could run as a proposal (`proposals` of `GET /v1/update`). A proposal starts nothing: only an operator's `POST /v1/update/desired` does. The question is one conditional request with no credential, so an unchanged feed costs nothing. 0 turns the poller off. Only the newest 30 releases are read (no further pages), so a `v*` release buried under more than 30 newer releases of other tags is not seen. It needs `--state-store`, which holds the proposals
     #[arg(long, value_name = "SECONDS", default_value_t = 300)]
     pub release_poll_every_secs: u64,
     /// The GitHub repository, `owner/name`, whose releases of `v*` tags are polled
@@ -336,9 +342,12 @@ impl<S: Source> Poller<S> {
         if !active() {
             return Cycle::Dropped;
         }
+        let latest = i64::try_from(now.as_millis() / 1000)
+            .unwrap_or(i64::MAX)
+            .saturating_add(feed::FUTURE_SLACK_SECS);
         let mut candidates = Vec::new();
         for entry in &entries {
-            match feed::judge(entry, &self.config.refs) {
+            match feed::judge(entry, &self.config.refs, latest) {
                 Ok(candidate) => candidates.push(candidate),
                 Err(reason) => {
                     self.stats.ignored[reason.index()].fetch_add(1, Ordering::Relaxed);
@@ -397,7 +406,20 @@ async fn blocking<T: Send + 'static>(
     crate::release::desired::blocking(call).await
 }
 
-/// The candidate to propose, if any: the newest, unless it is the release already desired
+/// The dot-separated numbers a tag starts with after its `v` (`v1.10.2-rc` is `[1, 10, 2]`),
+/// compared as numbers so that `v1.10` is above `v1.9`.
+fn tag_numbers(tag: &str) -> Vec<u64> {
+    let digits = tag
+        .strip_prefix('v')
+        .unwrap_or(tag)
+        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .next()
+        .unwrap_or_default();
+    digits.split('.').map_while(|n| n.parse().ok()).collect()
+}
+
+/// The candidate to propose, if any: the newest (releases of the same second: the higher
+/// version tag, then the higher commit, so one is chosen the same way every time), unless it is the release already desired
 /// or running, or no newer than the newest proposal held (older and same releases are never
 /// proposed, and a release is proposed once).
 #[must_use]
@@ -407,9 +429,13 @@ pub fn decide(
     desired: Option<&str>,
     running: &str,
 ) -> Option<Candidate> {
-    let newest = candidates
-        .into_iter()
-        .max_by(|a, b| (a.published_at_secs, &a.commit).cmp(&(b.published_at_secs, &b.commit)))?;
+    let newest = candidates.into_iter().max_by(|a, b| {
+        (a.published_at_secs, tag_numbers(&a.tag), &a.commit).cmp(&(
+            b.published_at_secs,
+            tag_numbers(&b.tag),
+            &b.commit,
+        ))
+    })?;
     let is_running = running.len() >= 7 && newest.commit.starts_with(running);
     let is_desired = desired == Some(newest.commit.as_str());
     let already = held
