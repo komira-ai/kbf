@@ -139,9 +139,7 @@ pub async fn check_first_map(
     // session ask the frontend for it.
     let mut changes = maps.changes();
     let _ = changes.wait_for(|generation| *generation > 0).await;
-    let Some(map) = maps.current() else {
-        return Ok(());
-    };
+    let map = maps.current().expect("a generation above 0 is a held map");
     let addrs: Vec<String> = map
         .members()
         .iter()
@@ -244,7 +242,8 @@ mod tests {
         let error = check_first_map(maps, None, LONG).await.expect_err("fails");
         let said = error.to_string();
         assert_eq!(error.tried.len(), 2);
-        assert!(said.contains(&a) && said.contains(&b), "{said}");
+        assert!(said.contains(&a), "{said}");
+        assert!(said.contains(&b), "{said}");
         assert!(said.contains("address on the storage network"), "{said}");
         assert!(said.contains("127.0.0.x"), "{said}");
     }
@@ -266,7 +265,22 @@ mod tests {
             None
         );
         assert_eq!(network_of(&[one("198.51.100.4:1"), one("store-1:1")]), None);
+        assert_eq!(network_of(&[one("[::1]:1")]), None);
         assert_eq!(network_of(&[]), None);
+    }
+
+    /// Catches: a hint written as `()` or `(None)` when the addresses are names.
+    #[test]
+    fn the_error_without_a_known_network_has_no_hint() {
+        let error = NoStorageReachable {
+            tried: vec![Unreachable {
+                addr: "store-1:8983".to_owned(),
+                reason: "refused".to_owned(),
+            }],
+        };
+        let said = error.to_string();
+        assert!(said.contains("store-1:8983 (refused)"), "{said}");
+        assert!(said.contains("storage network, and a route"), "{said}");
     }
 
     /// Catches: this process's own member counted as a peer to reach (it is served

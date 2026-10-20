@@ -2072,6 +2072,12 @@ mod tests {
             .expect("a reachable member does not end it");
         drop(live);
 
+        // A daemon that keeps no map (the in-process one) has no check to end it.
+        start_with(&cli, remote)
+            .expect("starts")
+            .serve_until(async { tokio::time::sleep(Duration::from_millis(100)).await })
+            .expect("nothing to refuse");
+
         kbf_outputs::remove_tree(&dir).expect("clean");
     }
 

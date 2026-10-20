@@ -337,14 +337,11 @@ mod tests {
             let map = Map::new(1, vec![member], Rule::Rendezvous, 1, 0, Vec::new());
             let maps = Arc::clone(&node.reach.as_ref().expect("armed").maps);
             assert!(maps.offer(map.expect("a map")));
-            node.serve_until(async {
+            let served = node.serve_until(async {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            })
-            .map_err(|e| e.to_string())
+            });
+            assert!(served.is_ok(), "{served:?}");
         });
-        served
-            .await
-            .expect("joined")
-            .expect("its own member is not tried");
+        served.await.expect("its own member is not tried");
     }
 }
