@@ -509,8 +509,8 @@ and offers nothing. The cancel hold of Q6 is not built: it is the owner's decisi
 
 Prod is `release.yml`, extended. **[F]** today: a pushed `v*` tag on a commit on main whose `artifacts.yml` push run exists;
 the `verify` job checks the sums and every attestation; the `publish` job, the only one with `contents: write`, attaches the
-already-built files and is idempotent; a dispatch with a commit is a dry-run verify. It has no notes, no environment approval
-and no dependency on any earlier stage.
+already-built files and is idempotent, in the `prod` environment; a dispatch with a commit is a dry-run verify. The verdict
+check and the notes (items 1 to 3) are built. It has no dependency on any earlier stage.
 
 The additions:
 
@@ -524,7 +524,14 @@ The additions:
 2. **A `prod` environment with a required reviewer**, as kci's prod, on the `publish` job.
 3. **Release notes**: generated from the commits between the previous release and this one, plus the gamma verdict's summary
    (bake length, load, the gate values) and a list of anything that is not reversible (section 8.3). Notes are an artifact of
-   the `verify` job, so a dry run shows them before anyone approves.
+   the `verify` job, so a dry run shows them before anyone approves, and they are the body of the GitHub release
+   (`release publish --notes-file`, followed by how to verify the files). They open with "Before you click": what is not
+   reversible, the waivers and the verdict in a line. The not-reversible list is the verdict's own lines united with what
+   the builds say: `kbf --version --json` of this release and of the previous stable release, each run (`release identity`)
+   only from a tarball whose attestation `verify` has already checked, compared with `kbf_gate::reversible` (`meta_log`;
+   unknown is not reversible) and for a changed or unstated `protocol`. A first release has nothing to go back to. If a
+   previous release exists and its identity cannot be read, the notes are not written (fail closed). Migrations are
+   taken from the verdict only.
 4. **Nothing is pushed to farms.** After `publish` the release is the attested files on the GitHub release. A farm that runs
    the public release finds them through its frontend's release poller, and its operator sets the desired commit (section 6).
 

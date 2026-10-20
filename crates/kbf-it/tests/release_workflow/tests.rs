@@ -89,8 +89,8 @@ fn a_verdict_before_the_files_are_checked_is_refused() {
 fn a_verdict_against_another_main_is_refused() {
     // Catches: main-only weakened by pointing the on-main test at another ref.
     let found = plant(
-        "--output \"$GITHUB_OUTPUT\"\n      - name: Write",
-        "--main-ref origin/feature/arch-v2 --output \"$GITHUB_OUTPUT\"\n      - name: Write",
+        "--output \"$GITHUB_OUTPUT\"\n      # What the release changes",
+        "--main-ref origin/feature/arch-v2 --output \"$GITHUB_OUTPUT\"\n      # What the release changes",
     );
     red(&found, "main ref other than `origin/main`");
 }
@@ -392,4 +392,105 @@ fn a_dispatch_or_env_of_another_shape_is_an_error_not_an_empty_answer() {
         let err = problems(&text.replace(from, to)).expect_err(want);
         assert!(err.contains(want), "want `{want}`: {err}");
     }
+}
+
+#[test]
+fn publish_must_release_the_notes_verify_wrote() {
+    // Catches: the release body regressing to a fixed text (the approver reads notes
+    // nobody publishes). Mutants: `--notes-file` dropped; naming another file; the
+    // artifact not downloaded, downloaded under another name, or into another directory.
+    red(
+        &plant(" --notes-file release-notes.md", ""),
+        "not given `--notes-file release-notes.md`",
+    );
+    red(
+        &plant("--notes-file release-notes.md", "--notes-file other.md"),
+        "not given `--notes-file release-notes.md`",
+    );
+    let download = "          name: release-notes\n      - name: Create the release";
+    red(
+        &plant(
+            download,
+            "          name: release-assets\n      - name: Create the release",
+        ),
+        "does not download the artifact `release-notes`",
+    );
+    red(
+        &plant(
+            download,
+            "          name: release-notes\n          path: dist\n      - name: Create the release",
+        ),
+        "does not download the artifact `release-notes`",
+    );
+    red(
+        &plant(
+            "      # The notes the approver read in the dry run and in verify: the release body.\n      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1\n        with:\n          name: release-notes\n",
+            "",
+        ),
+        "does not download the artifact `release-notes`",
+    );
+}
+
+#[test]
+fn the_notes_are_given_the_identity_of_both_builds() {
+    // Catches: irreversibility left to whatever a human typed into the tag. Mutants:
+    // no `--version-json`; no previous release's file; no identity step at all.
+    red(
+        &plant(" --version-json version.json", ""),
+        "not given `--version-json`",
+    );
+    red(
+        &plant(" --previous-version-json \"$PREVIOUS_IDENTITY\"", ""),
+        "not given `--previous-version-json",
+    );
+    red(
+        &plant(
+            "cargo xtask release identity",
+            "cargo xtask release identit",
+        ),
+        "never runs `release identity`",
+    );
+}
+
+#[test]
+fn a_binary_runs_only_after_its_files_are_attested() {
+    // Catches: an unattested binary executed in the job that approves releases.
+    // Mutants: a binary run by hand; this release's attestation step lost before the
+    // run; the previous release's step lost, or under another condition than the run it
+    // guards.
+    red(
+        &plant(
+            "cargo xtask release identity dist ",
+            "cargo xtask release identity other ",
+        ),
+        "not `release identity` on `dist` or `previous`",
+    );
+    red(
+        &plant(
+            "cargo xtask verify-assets attestations dist ",
+            "cargo xtask verify-assets attestations dst ",
+        ),
+        "runs a binary unpacked from `dist/` without an earlier",
+    );
+    red(
+        &plant(
+            "cargo xtask verify-assets attestations previous ",
+            "cargo xtask verify-assets attestations prev ",
+        ),
+        "runs a binary unpacked from `previous/` without an earlier",
+    );
+    red(
+        &plant(
+            "      - name: Verify the previous release's attestations as these were\n        if: ${{ steps.previous.outputs.previous != '' }}\n",
+            "      - name: Verify the previous release's attestations as these were\n",
+        ),
+        "runs a binary unpacked from `previous/` without an earlier",
+    );
+    red(
+        &plant(
+            "run: cargo xtask release identity dist --commit \"$COMMIT\" --out version.json",
+            "run: dist/kbf --version --json > version.json",
+        ),
+        "not `release identity` on `dist` or `previous`",
+    );
 }

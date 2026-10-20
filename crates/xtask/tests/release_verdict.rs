@@ -544,10 +544,46 @@ fn with_notes(name: &str, change: impl FnOnce(&mut ResultDoc)) -> Fx {
     fx
 }
 
-fn notes_of(fx: &Fx) -> String {
+/// `kbf --version --json` of the build of `commit`, with the fields given.
+fn identity(commit: &str, meta_log: Option<u64>, protocol: Option<u64>) -> String {
+    let mut v = serde_json::json!({"commit": &commit[..12], "profile": "release"});
+    if let Some(m) = meta_log {
+        v["meta_log"] = m.into();
+    }
+    if let Some(p) = protocol {
+        v["protocol"] = p.into();
+    }
+    v.to_string()
+}
+
+/// `release notes` with this release's identity `cur` and the previous release's `prev`
+/// (as the workflow writes them, one file each); the result of the run and the notes file.
+fn notes_run(fx: &Fx, cur: &str, prev: Option<&str>) -> (Ran, PathBuf) {
     let out = fx.root.join("notes.md");
-    let (code, stdout, err) = run(fx, "notes", TAG, RELEASE, &["--out", out.to_str().unwrap()]);
-    assert_eq!(code, Some(0), "{stdout}{err}");
+    let cur_file = fx.root.join("version.json");
+    std::fs::write(&cur_file, cur).unwrap();
+    let mut extra = vec![
+        "--version-json",
+        cur_file.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ];
+    let prev_file = fx.root.join("previous-version.json");
+    if let Some(p) = prev {
+        std::fs::write(&prev_file, p).unwrap();
+        extra.extend(["--previous-version-json", prev_file.to_str().unwrap()]);
+    }
+    (run(fx, "notes", TAG, RELEASE, &extra), out)
+}
+
+/// The notes of a release whose builds both say `meta_log` 3 and `protocol` 1 (a first
+/// release has no previous build to say it).
+fn notes_of(fx: &Fx) -> String {
+    let cur = identity(RELEASE, Some(3), Some(1));
+    let has_previous = !fx.git(&["tag", "--list", "v0.9.0"]).is_empty();
+    let prev = has_previous.then(|| identity(&fx.first, Some(3), Some(1)));
+    let ((code, o, err), out) = notes_run(fx, &cur, prev.as_deref());
+    assert_eq!(code, Some(0), "{o}{err}");
     std::fs::read_to_string(out).unwrap()
 }
 
@@ -577,24 +613,372 @@ fn the_first_release_lists_all_its_history() {
     );
 }
 
+/// The part of `notes` between the heading `from` and the next `## ` heading.
+fn part<'a>(notes: &'a str, from: &str) -> &'a str {
+    let start = notes
+        .find(from)
+        .unwrap_or_else(|| panic!("no {from} in {notes}"));
+    let rest = &notes[start + from.len()..];
+    &rest[..rest.find("\n## ").unwrap_or(rest.len())]
+}
+
 #[test]
-fn the_notes_list_what_is_not_reversible_and_say_so_when_nothing_is() {
+fn the_verdicts_not_reversible_lines_and_the_all_clear_open_the_notes() {
     // Catches: a notes writer that omits the section (the offer's warning must reach the
-    // people who click approve).
+    // people who click approve), or says nothing when there is nothing.
     let notes = notes_of(&with_notes("notes-irreversible", |d| {
-        d.not_reversible = vec!["raises the node log version".to_owned()];
+        d.not_reversible = vec!["drops the legacy index".to_owned()];
     }));
     assert!(
-        notes.contains("## Not reversible\n\n- raises the node log version\n"),
+        part(&notes, "## Before you click")
+            .contains("### Not reversible\n\n- drops the legacy index\n\n"),
         "{notes}"
     );
     let notes = notes_of(&with_notes("notes-reversible", |_| {}));
     assert!(
-        notes.contains(
-            "## Not reversible\n\nNothing in this release is flagged as not reversible.\n"
+        part(&notes, "## Before you click")
+            .contains("### Not reversible\n\nNothing in this release is flagged as not reversible"),
+        "{notes}"
+    );
+}
+
+#[test]
+fn before_you_click_comes_first_with_waivers_and_the_verdict_in_a_line() {
+    // Catches: the section anywhere but first (the reviewer reads the top), waivers left
+    // to the detail section, a verdict summary that is not there.
+    let notes = notes_of(&with_notes("notes-order", |d| {
+        d.waivers = vec![Waiver::new("min-load", "op", "holiday week").unwrap()];
+    }));
+    let at = |h: &str| notes.find(h).unwrap_or_else(|| panic!("no {h} in {notes}"));
+    assert!(
+        notes.starts_with("# v0.10.0\n\n## Before you click\n"),
+        "{notes}"
+    );
+    assert!(
+        at("## Before you click") < at("## Commits since"),
+        "{notes}"
+    );
+    assert!(at("## Commits since") < at("## Gamma verdict"), "{notes}");
+    let top = part(&notes, "## Before you click");
+    assert!(
+        top.contains("### Waivers\n\n- min-load waived by op: holiday week\n"),
+        "{notes}"
+    );
+    assert!(
+        top.contains(
+            "### Verdict\n\n- green for the set it names; bake: 24h 00m, 1 gate(s), 0 warning(s);"
         ),
         "{notes}"
     );
+    let none = notes_of(&with_notes("notes-no-waiver", |_| {}));
+    assert!(
+        none.contains("### Waivers\n\nNo gate or condition is waived.\n"),
+        "{none}"
+    );
+}
+
+/// The notes of a release whose previous release (`v0.9.0`) was built with `prev`
+/// (`meta_log`, `protocol`) and which is built with `cur`.
+fn notes_between(
+    name: &str,
+    cur: (Option<u64>, Option<u64>),
+    prev: (Option<u64>, Option<u64>),
+) -> String {
+    let fx = with_notes(name, |_| {});
+    let ((code, o, err), out) = notes_run(
+        &fx,
+        &identity(RELEASE, cur.0, cur.1),
+        Some(&identity(&fx.first, prev.0, prev.1)),
+    );
+    assert_eq!(code, Some(0), "{o}{err}");
+    std::fs::read_to_string(out).unwrap()
+}
+
+const RAISED: &str = "meta_log raised from 3 (v0.9.0) to 4: v0.9.0 cannot open the metadata log this release writes, so there is no going back to it";
+
+#[test]
+fn a_raised_meta_log_is_not_reversible_though_the_verdict_says_nothing() {
+    // Catches: notes that read the verdict's lines only (nobody types the log version
+    // into a tag), or a comparison the wrong way round or off by one (equal is reversible,
+    // and so is a lower number).
+    let notes = notes_between("meta-raised", (Some(4), Some(1)), (Some(3), Some(1)));
+    assert!(
+        part(&notes, "## Before you click").contains(&format!("- {RAISED}\n")),
+        "{notes}"
+    );
+    for (name, cur) in [("meta-equal", 3), ("meta-lower", 2)] {
+        let notes = notes_between(name, (Some(cur), Some(1)), (Some(3), Some(1)));
+        assert!(!notes.contains("meta_log"), "{name}: {notes}");
+        assert!(
+            notes.contains("Nothing in this release is flagged"),
+            "{name}: {notes}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_meta_log_counts_as_not_reversible() {
+    // Catches: fail-open, an unstated number read as reversible, on either side.
+    let unknown =
+        "- meta_log is not stated by this release or by v0.9.0: unknown counts as not reversible\n";
+    for (name, cur, prev) in [
+        ("meta-unknown-cur", None, Some(3)),
+        ("meta-unknown-prev", Some(3), None),
+        ("meta-unknown-both", None, None),
+    ] {
+        let notes = notes_between(name, (cur, Some(1)), (prev, Some(1)));
+        assert!(
+            part(&notes, "## Before you click").contains(unknown),
+            "{name}: {notes}"
+        );
+    }
+}
+
+#[test]
+fn a_changed_or_unstated_protocol_is_listed_and_an_equal_one_is_not() {
+    // Catches: the protocol ignored, or listed when it did not change.
+    let notes = notes_between("proto-changed", (Some(3), Some(2)), (Some(3), Some(1)));
+    assert!(
+        part(&notes, "## Before you click").contains("- wire protocol 1 (v0.9.0) to 2: "),
+        "{notes}"
+    );
+    let notes = notes_between("proto-unknown", (Some(3), None), (Some(3), Some(1)));
+    assert!(
+        notes.contains(
+            "- wire protocol is not stated by this release or by v0.9.0: unknown counts as changed"
+        ),
+        "{notes}"
+    );
+    let notes = notes_between("proto-equal", (Some(3), Some(1)), (Some(3), Some(1)));
+    assert!(!notes.contains("- wire protocol"), "{notes}");
+}
+
+#[test]
+fn a_line_the_verdict_and_the_builds_both_state_is_listed_once() {
+    // Catches: the union as a concatenation.
+    let fx = with_notes("notes-union", |d| {
+        d.not_reversible = vec![RAISED.to_owned(), "drops the legacy index".to_owned()];
+    });
+    let ((code, o, err), out) = notes_run(
+        &fx,
+        &identity(RELEASE, Some(4), Some(1)),
+        Some(&identity(&fx.first, Some(3), Some(1))),
+    );
+    assert_eq!(code, Some(0), "{o}{err}");
+    let notes = std::fs::read_to_string(out).unwrap();
+    assert_eq!(notes.matches(RAISED).count(), 1, "{notes}");
+    assert!(notes.contains("- drops the legacy index\n"), "{notes}");
+}
+
+#[test]
+fn the_first_release_has_nothing_to_go_back_to() {
+    // Catches: a first release called reversible (`reversible(_, None)` is false).
+    let fx = fx("notes-first-irreversible");
+    fx.annotate(TAG, RELEASE, &msg(&good()));
+    let notes = notes_of(&fx);
+    assert!(
+        part(&notes, "## Before you click")
+            .contains("- first release: there is no earlier release to go back to\n"),
+        "{notes}"
+    );
+}
+
+#[test]
+fn notes_refuse_when_what_is_not_reversible_cannot_be_determined() {
+    // Catches: fail-open, notes written with the identity of the previous release absent,
+    // wrong (another commit's), not JSON, or a field that is not a number.
+    let fx = with_notes("notes-closed", |_| {});
+    let cur = identity(RELEASE, Some(3), Some(1));
+    let bad: Vec<(&str, Option<String>, &str)> = vec![
+        (
+            "no previous identity",
+            None,
+            "--previous-version-json is required",
+        ),
+        (
+            "another commit",
+            Some(identity(RELEASE, Some(3), Some(1))),
+            "names commit",
+        ),
+        ("not JSON", Some("meta_log=3".to_owned()), "not JSON"),
+        (
+            "not a number",
+            Some(format!(
+                r#"{{"commit":"{}","meta_log":"3"}}"#,
+                &fx.first[..12]
+            )),
+            "meta_log \"3\" is not a whole number",
+        ),
+        (
+            "protocol not a number",
+            Some(format!(
+                r#"{{"commit":"{}","meta_log":3,"protocol":-1}}"#,
+                &fx.first[..12]
+            )),
+            "protocol -1 is not a whole number",
+        ),
+    ];
+    for (what, prev, why) in bad {
+        let ((code, _, err), out) = notes_run(&fx, &cur, prev.as_deref());
+        assert_eq!(code, Some(1), "{what}: {err}");
+        assert!(err.contains(why), "{what}: {err}");
+        assert!(!out.exists(), "{what}: notes were written");
+    }
+    // A file that is not there.
+    let out = fx.root.join("notes.md");
+    let gone = fx.root.join("gone.json");
+    let (code, _, err) = run(
+        &fx,
+        "notes",
+        TAG,
+        RELEASE,
+        &[
+            "--version-json",
+            fx.root.join("version.json").to_str().unwrap(),
+            "--previous-version-json",
+            gone.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("gone.json"), "{err}");
+    // This release's own identity is as strict.
+    let ((code, _, err), out) = notes_run(&fx, "{}", Some(&identity(&fx.first, Some(3), Some(1))));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("names commit"), "{err}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn the_current_identity_is_required() {
+    // Catches: `--version-json` made optional (a release whose own log version is unread).
+    let fx = with_notes("notes-no-cur", |_| {});
+    let out = fx.root.join("notes.md");
+    let (code, _, err) = run(
+        &fx,
+        "notes",
+        TAG,
+        RELEASE,
+        &["--out", out.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--version-json"), "{err}");
+}
+
+#[test]
+fn an_empty_previous_identity_path_is_none_given() {
+    // The workflow passes the path as an empty string when there is no previous release.
+    // Catches: the empty path read as a file (a first release refused), or as an answer
+    // when a previous release exists (it must still refuse: fail closed).
+    let first = fx("notes-empty-first");
+    first.annotate(TAG, RELEASE, &msg(&good()));
+    let cur = first.root.join("version.json");
+    std::fs::write(&cur, identity(RELEASE, Some(3), Some(1))).unwrap();
+    let out = first.root.join("notes.md");
+    let args = [
+        "--version-json",
+        cur.to_str().unwrap(),
+        "--previous-version-json",
+        "",
+        "--out",
+        out.to_str().unwrap(),
+    ];
+    let (code, o, err) = run(&first, "notes", TAG, RELEASE, &args);
+    assert_eq!(code, Some(0), "{o}{err}");
+    let second = with_notes("notes-empty-second", |_| {});
+    let (code, _, err) = run(&second, "notes", TAG, RELEASE, &args);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("--previous-version-json is required"), "{err}");
+}
+
+#[test]
+fn a_previous_identity_for_a_first_release_is_a_usage_error() {
+    // Catches: an identity of some other build quietly ignored.
+    let fx = fx("notes-first-prev");
+    fx.annotate(TAG, RELEASE, &msg(&good()));
+    let ((code, _, err), _) = notes_run(
+        &fx,
+        &identity(RELEASE, Some(3), Some(1)),
+        Some(&identity(&fx.first, Some(3), Some(1))),
+    );
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("there is no previous release"), "{err}");
+}
+
+/// A repository with `v0.8.0` (stable, on main), `v0.9.0-rc1` (a release candidate on
+/// main), `v0.9.5` (stable but on the side branch) and the release `v0.10.0`.
+fn with_tag_zoo(name: &str) -> Fx {
+    let fx = with_notes(name, |_| {});
+    fx.git(&["tag", "-d", "v0.9.0"]);
+    fx.git(&["tag", "v0.8.0", &fx.first]);
+    fx.git(&["tag", "v0.9.0-rc1", &fx.first]);
+    fx.git(&["tag", "v0.9.5", &fx.side]);
+    fx
+}
+
+#[test]
+fn the_previous_release_is_the_nearest_stable_ancestor() {
+    // Catches: the neighbour in the tag list taken as the previous release (here a
+    // release candidate, then a tag on a branch that is not main's history), either of
+    // which makes the commit list and the reversibility check about the wrong release.
+    let fx = with_tag_zoo("previous-zoo");
+    let cur = identity(RELEASE, Some(3), Some(1));
+    let prev = identity(&fx.first, Some(3), Some(1));
+    let ((code, o, err), out) = notes_run(&fx, &cur, Some(&prev));
+    assert_eq!(code, Some(0), "{o}{err}");
+    let notes = std::fs::read_to_string(out).unwrap();
+    assert!(notes.contains("## Commits since v0.8.0\n"), "{notes}");
+    let output = fx.root.join("out");
+    let (code, o, err) = xtask(&[
+        "release",
+        "previous",
+        "--repo-dir",
+        fx.repo().to_str().unwrap(),
+        "--tag",
+        TAG,
+        "--commit",
+        RELEASE,
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(0), "{err}");
+    let expected = format!("previous=v0.8.0\nprevious-commit={}\n", fx.first);
+    assert_eq!(o, expected);
+    assert_eq!(std::fs::read_to_string(output).unwrap(), expected);
+}
+
+#[test]
+fn a_first_release_has_no_previous_and_the_verb_says_so() {
+    // Catches: empty lines missing (the workflow's `if: previous != ''` then reads a
+    // stale output) and a tag of no place in `v*` taking another's.
+    let fx = fx("previous-none");
+    fx.git(&["tag", "v0.20.0", &fx.first]);
+    for tag in [TAG, "rc1"] {
+        let (code, o, err) = xtask(&[
+            "release",
+            "previous",
+            "--repo-dir",
+            fx.repo().to_str().unwrap(),
+            "--tag",
+            tag,
+            "--commit",
+            RELEASE,
+        ]);
+        assert_eq!(code, Some(0), "{err}");
+        assert_eq!(o, "previous=\nprevious-commit=\n", "{tag}");
+    }
+    let (code, _, err) = xtask(&[
+        "release",
+        "previous",
+        "--repo-dir",
+        fx.repo().to_str().unwrap(),
+        "--tag",
+        TAG,
+        "--commit",
+        "abc",
+    ]);
+    assert_eq!(code, Some(2), "{err}");
 }
 
 #[test]
@@ -625,13 +1009,10 @@ fn the_notes_carry_the_verdict_summary_the_escapes_and_the_withdrawn() {
 fn no_notes_are_written_for_a_verdict_that_fails() {
     // Catches: notes made from an unchecked tag message.
     let fx = with_notes("notes-red", |d| d.status = Status::Red);
-    let out = fx.root.join("notes.md");
-    let (code, _, err) = run(
+    let ((code, _, err), out) = notes_run(
         &fx,
-        "notes",
-        TAG,
-        RELEASE,
-        &["--out", out.to_str().unwrap()],
+        &identity(RELEASE, Some(3), Some(1)),
+        Some(&identity(&fx.first, Some(3), Some(1))),
     );
     assert_eq!(code, Some(1), "{err}");
     assert!(!out.exists());
@@ -688,8 +1069,21 @@ fn a_long_history_is_cut_and_counted() {
     let mut d = good();
     d.commit = CommitId::parse(&head).unwrap();
     fx.annotate(TAG, &head, &msg(&d));
+    let cur_file = fx.root.join("version.json");
+    std::fs::write(&cur_file, identity(&head, Some(3), Some(1))).unwrap();
     let out = fx.root.join("notes.md");
-    let (code, o, err) = run(&fx, "notes", TAG, &head, &["--out", out.to_str().unwrap()]);
+    let (code, o, err) = run(
+        &fx,
+        "notes",
+        TAG,
+        &head,
+        &[
+            "--version-json",
+            cur_file.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
     assert_eq!(code, Some(0), "{o}{err}");
     let notes = std::fs::read_to_string(out).unwrap();
     // 205 + first + release commit = 207 commits; 200 listed.
@@ -704,13 +1098,20 @@ fn a_tag_outside_the_release_names_is_a_first_release() {
     let mut d = good();
     d.tag = Some("rc1".to_owned());
     fx.annotate("rc1", RELEASE, &msg(&d));
+    let cur_file = fx.root.join("version.json");
+    std::fs::write(&cur_file, identity(RELEASE, Some(3), Some(1))).unwrap();
     let out = fx.root.join("notes.md");
     let (code, o, err) = run(
         &fx,
         "notes",
         "rc1",
         RELEASE,
-        &["--out", out.to_str().unwrap()],
+        &[
+            "--version-json",
+            cur_file.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ],
     );
     assert_eq!(code, Some(0), "{o}{err}");
     assert!(
@@ -795,12 +1196,19 @@ fn notes_that_cannot_be_written_fail() {
     let fx = fx("notes-unwritable");
     fx.annotate(TAG, RELEASE, &msg(&good()));
     let out = fx.root.join("missing-dir").join("notes.md");
+    let cur = fx.root.join("version.json");
+    std::fs::write(&cur, identity(RELEASE, Some(3), Some(1))).unwrap();
     let (code, _, err) = run(
         &fx,
         "notes",
         TAG,
         RELEASE,
-        &["--out", out.to_str().unwrap()],
+        &[
+            "--version-json",
+            cur.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ],
     );
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("write "), "{err}");
