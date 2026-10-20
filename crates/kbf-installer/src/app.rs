@@ -203,8 +203,8 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
     let (layout, exec) = host(root)?;
     let platform = layout.platform();
     let cfg = Config {
-        update_dir: args.update_dir.clone(),
-        orders_dir: args.orders_dir.clone(),
+        update_dir: args.update_dir_in(&layout),
+        orders_dir: args.orders_dir_in(&layout),
         restart: target.service.restart(),
         window_secs: args.window_secs,
         starts: args.starts,

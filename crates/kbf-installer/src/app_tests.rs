@@ -143,6 +143,28 @@ fn the_fetch_child_takes_a_blob_or_a_release() {
     );
 }
 
+/// Catches `run` watching the Linux state directory on a Mac: without `--update-dir` and
+/// `--orders-dir` the directories are the layout's, the ones `setup` and the Mac provisioner
+/// write, for each platform; the flags still win.
+#[test]
+fn run_defaults_its_directories_to_the_layouts_on_every_platform() {
+    for platform in [Platform::Linux, Platform::MacOs] {
+        let (layout, _) = crate::testkit::host_root_on("run-dirs", platform);
+        let Verb::Run(args) = parse(&["run"]).verb else {
+            panic!("run");
+        };
+        assert_eq!(args.update_dir_in(&layout), layout.update_dir(), "{platform:?}");
+        assert_eq!(args.orders_dir_in(&layout), layout.orders_dir(), "{platform:?}");
+    }
+    let Verb::Run(args) = parse(&["run", "--update-dir", "/srv/u", "--orders-dir", "/srv/o"]).verb
+    else {
+        panic!("run");
+    };
+    let (layout, _) = crate::testkit::host_root_on("run-dirs-flags", Platform::MacOs);
+    assert_eq!(args.update_dir_in(&layout).as_str(), "/srv/u");
+    assert_eq!(args.orders_dir_in(&layout).as_str(), "/srv/o");
+}
+
 /// Catches the proxy verb asking for root (it runs as the service user), a refused table
 /// leaving as anything but a usage error with its path, and `--json` losing the reason.
 #[test]
