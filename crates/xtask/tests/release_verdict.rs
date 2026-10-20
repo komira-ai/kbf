@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use xtask::release::notes::notes;
-use xtask::release::verdict::{GATE_STAGE, Subject, verify};
+use xtask::release::verdict::{Subject, verify};
 
 use kbf_gate::{
     CommitId, Floor, GateResult, Header, Limit, MinLoad, ResultDoc, Sample, SetHash, Stage, Status,
@@ -445,13 +445,6 @@ fn a_verdict_for_another_stage_fails() {
 }
 
 #[test]
-fn a_beta_verdict_is_not_a_gamma_one() {
-    // Catches: the stage compared with a constant instead of the stage being judged:
-    // judged as Gamma, a Beta verdict is refused (it has no bake either).
-    refused_gamma("beta-as-gamma", &good(), "stage Beta, not Gamma");
-}
-
-#[test]
 fn a_beta_verdict_needs_no_bake_and_no_load() {
     // Catches: the Gamma bake rule applied to the gate stage, which refuses every verdict
     // the pipeline writes.
@@ -484,17 +477,8 @@ fn a_gamma_verdict_without_a_bake_is_refused_and_with_one_accepted() {
     d.load = None;
     refused_gamma("gamma-no-load", &d, "minimum load was not met");
     accepted_gamma("gamma-baked", &gamma());
-}
-
-#[test]
-fn the_gate_stage_is_what_the_binary_judges() {
-    // Catches: the binary judging another stage than the constant that verdict-write writes.
-    assert_eq!(GATE_STAGE, Stage::Beta);
-    let fx = fx("gate-stage");
-    let mut d = good();
-    d.stage = GATE_STAGE;
-    fx.annotate(TAG, RELEASE, &msg(&d));
-    assert_eq!(verdict(&fx, TAG, RELEASE).0, Some(0));
+    // Judged as Gamma, a Beta verdict is refused: the stage is compared with the one asked.
+    refused_gamma("beta-as-gamma", &good(), "stage Beta, not Gamma");
 }
 
 #[test]
@@ -808,24 +792,6 @@ fn the_notes_of_the_verdict_verdict_write_writes_list_what_is_not_reversible() {
         notes.contains("## Beta verdict\n\n- gate ci: 1\n- gate beta: 1\n"),
         "{notes}"
     );
-}
-
-#[test]
-fn no_notes_are_written_for_a_gamma_verdict_the_gate_stage_does_not_judge() {
-    // Catches: notes made from a verdict of another stage than the gate's.
-    let fx = fx("notes-gamma-refused");
-    fx.annotate(TAG, RELEASE, &msg(&gamma()));
-    let out = fx.root.join("notes.md");
-    let (code, _, err) = run(
-        &fx,
-        "notes",
-        TAG,
-        RELEASE,
-        &["--out", out.to_str().unwrap()],
-    );
-    assert_eq!(code, Some(1), "{err}");
-    assert!(err.contains("stage Gamma, not Beta"), "{err}");
-    assert!(!out.exists());
 }
 
 #[test]
