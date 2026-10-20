@@ -72,7 +72,7 @@ for the node's daemon, `MAC_DAEMON_LABEL`) and waits for `installer.toml` under
 `/usr/local/etc/kbf`; the tool is at `bin/kbf-installer` in the prefix. If the real
 layout (`layout.rs`, contract P2) puts the macOS configuration or the tool elsewhere,
 change the property list and `GATE`/`PROGRAM` in `crates/xtask/src/pkg.rs`; the tests
-follow the constants. `kbf-installer setup` writes `installer.toml` at `/etc/kbf/installer.toml` on every platform (`setup/paths.rs`), while `layout.rs` and `GATE` name `/usr/local/etc/kbf` for a Mac: the two disagree, and a Mac's job waits for a file `setup` does not write. Until the real binary builds on the runner, CI packages a stub
+follow the constants. Every configuration path `kbf-installer` uses (`setup`, `run`, `proxy`) comes from `layout.rs`: `/etc/kbf` on Linux, `/usr/local/etc/kbf` on a Mac, so on a Mac `setup` writes `installer.toml`, `kbf.toml` and the tokens where the property list's gate and `GATE` wait. `setup::tests` (`the_launchd_gate_is_the_installer_toml_setup_writes_on_a_mac`) compares the plist's gate with the file the Mac plan writes. Until the real binary builds on the runner, CI packages a stub
 (`xtask-fake` run as `kbf-installer`, which prints its arguments); `INSTALLER` in
 `crates/xtask/tests/pkg_macos.rs` is the one path to change, and the step that needs the
 real tool (`check` refusing a user-owned prefix) runs when it is.
