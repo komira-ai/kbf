@@ -4,23 +4,17 @@ use std::path::{Path, PathBuf};
 use super::sha1::{cksum, sha1_hex};
 use super::tree::Node;
 use super::*;
+use kbf_testkit::dir::TestDir;
 
 mod read;
 
 const BINARY_BYTES: &[u8] = b"kbf-installer's bytes";
 
-/// An empty directory of its own for one test.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("xtask-pkg-unit")
-        .join(format!("{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+/// An empty directory of its own for one test, removed when it drops.
+fn scratch(name: &str) -> TestDir {
+    let beside = std::env::current_exe().expect("test binary");
+    let deps = beside.parent().expect("deps");
+    TestDir::under(deps.join("xtask-pkg-unit"), name)
 }
 
 /// The committed LaunchDaemon property list.
@@ -430,7 +424,16 @@ fn the_gate_refuses_a_job_that_starts_without_the_configuration() {
             "<string>/usr/local/kbf-installer/bin/kbf-installer</string>",
             "<string>/usr/local/bin/kbf-installer</string>",
         ),
-        ("<string>serve</string>", "<string>setup</string>"),
+        ("<string>run</string>", "<string>setup</string>"),
+        ("<string>run</string>", "<string>serve</string>"),
+        (
+            "<string>com.komira.kbf-daemon</string>",
+            "<string>com.komira.other</string>",
+        ),
+        (
+            "<string>--launchd-label</string>",
+            "<string>--unit</string>",
+        ),
     ] {
         let p = mutant(from, to);
         assert_eq!(p.len(), 1, "{to}: {p:?}");

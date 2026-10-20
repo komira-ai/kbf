@@ -191,15 +191,21 @@ impl Exec for FakeExec {
     }
 }
 
-/// A fresh, empty directory for one test: `<target>/tmp/kbf-host/<name>`. Every crate
-/// that uses it shares that directory, so `name` must be unique among them.
+/// A fresh, empty directory for one test: `<target>/tmp/kbf-host/<pid>/<name>`. `name`
+/// must be unique among the tests of one process; the process id keeps it apart from
+/// other processes of the same target, which `cargo nextest` runs one per test and
+/// which would otherwise empty each other's directory.
 pub fn scratch(name: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let target = exe
         .ancestors()
         .nth(3)
         .expect("<target>/<profile>/deps/<test binary>");
-    let dir = target.join("tmp").join("kbf-host").join(name);
+    let dir = target
+        .join("tmp")
+        .join("kbf-host")
+        .join(std::process::id().to_string())
+        .join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("make the scratch directory");
     dir
