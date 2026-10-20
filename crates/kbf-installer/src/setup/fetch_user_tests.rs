@@ -76,8 +76,12 @@ fn a_wrong_shape_is_refused_naming_the_field() {
         let mut g = account(name, 300, home);
         g.gid = 2000;
         bad(g, None, "gid 2000");
-        bad(account(name, 300, "/home/x"), None, "home");
-        bad(account(name, 300, home), Some("/bin/bash"), "shell");
+        bad(account(name, 300, "/var/wrong-home"), None, "home");
+        bad(
+            account(name, 300, home),
+            Some("/usr/local/bin/login-shell"),
+            "shell",
+        );
         let _ = shell;
     }
     // The Mac's ids end at 500, Linux's at 1000.

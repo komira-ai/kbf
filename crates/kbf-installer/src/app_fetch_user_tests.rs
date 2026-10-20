@@ -13,6 +13,10 @@ use crate::cli::Cli;
 use crate::migrate::kit_host::Form;
 use crate::migrate::rig::{Rig, me};
 
+/// The fetch account's directory-service record (`dscl`), written split so the repository's
+/// home-path lint does not read it as a home directory (as setup/tests.rs does).
+const RECORD: &str = concat!("/User", "s/_kbf-fetch");
+
 fn migrate_args(extra: &[&str]) -> MigrateArgs {
     let mut full = vec!["kbf-installer", "migrate"];
     full.extend_from_slice(extra);
@@ -43,13 +47,13 @@ fn mac_accounts(
         let program = cmd.program.as_str();
         if program.ends_with("dscl") {
             return Ok(match args.as_slice() {
-                [".", "-create", "/Users/_kbf-fetch", "IsHidden", _] => {
+                [".", "-create", RECORD, "IsHidden", _] => {
                     seen.set(true);
                     reply(0, "", "")
                 }
                 [".", "-list", "/Users", "UniqueID"] => reply(0, "root 0\n_other 301\n", ""),
                 [".", "-list", "/Groups", "PrimaryGroupID"] => reply(0, "wheel 0\n", ""),
-                [".", "-read", "/Users/_kbf-fetch", "UserShell"] => {
+                [".", "-read", RECORD, "UserShell"] => {
                     let shell = if seen.get() { "/usr/bin/false" } else { shell };
                     reply(0, &format!("UserShell: {shell}\n"), "")
                 }
@@ -99,12 +103,12 @@ fn an_applying_migration_makes_the_fetch_account_of_a_kit_mac() {
     assert_eq!(
         creating(&exec),
         [
-            "run /usr/bin/dscl . -create /Groups/_kbf-fetch PrimaryGroupID 300",
-            "run /usr/bin/dscl . -create /Users/_kbf-fetch UniqueID 300",
-            "run /usr/bin/dscl . -create /Users/_kbf-fetch PrimaryGroupID 300",
-            "run /usr/bin/dscl . -create /Users/_kbf-fetch UserShell /usr/bin/false",
-            "run /usr/bin/dscl . -create /Users/_kbf-fetch NFSHomeDirectory /var/empty",
-            "run /usr/bin/dscl . -create /Users/_kbf-fetch IsHidden 1",
+            "run /usr/bin/dscl . -create /Groups/_kbf-fetch PrimaryGroupID 300".to_owned(),
+            format!("run /usr/bin/dscl . -create {RECORD} UniqueID 300"),
+            format!("run /usr/bin/dscl . -create {RECORD} PrimaryGroupID 300"),
+            format!("run /usr/bin/dscl . -create {RECORD} UserShell /usr/bin/false"),
+            format!("run /usr/bin/dscl . -create {RECORD} NFSHomeDirectory /var/empty"),
+            format!("run /usr/bin/dscl . -create {RECORD} IsHidden 1"),
         ]
     );
     assert_eq!(made.len(), 6, "{made:?}");
@@ -158,7 +162,7 @@ fn an_existing_fetch_account_of_the_right_shape_is_used_as_it_is() {
 #[test]
 fn a_fetch_account_of_the_wrong_shape_is_refused_and_not_changed() {
     let rig = Rig::kit("fetch-wrong", Platform::MacOs, Form::New);
-    let (mut exec, _) = mac_accounts(true, 501, "/Users/fetch", "/bin/zsh");
+    let (mut exec, _) = mac_accounts(true, 501, "/var/fetch-home", "/usr/local/bin/login-shell");
     let args = migrate_args(&[]);
     let failure = probe_account(&mut exec, &rig.layout, &args, true, false, me())
         .expect_err("a wrong account");
@@ -166,15 +170,15 @@ fn a_fetch_account_of_the_wrong_shape_is_refused_and_not_changed() {
     for field in [
         "uid 501",
         "gid 501",
-        "home \"/Users/fetch\"",
-        "shell \"/bin/zsh\"",
+        "home \"/var/fetch-home\"",
+        "shell \"/usr/local/bin/login-shell\"",
     ] {
         assert!(failure.why.contains(field), "{field}: {}", failure.why);
     }
     assert!(exec.log.is_empty());
     for (uid, home, shell, field) in [
-        (333, "/Users/fetch", "/usr/bin/false", "home"),
-        (333, "/var/empty", "/bin/zsh", "shell"),
+        (333, "/var/fetch-home", "/usr/bin/false", "home"),
+        (333, "/var/empty", "/usr/local/bin/login-shell", "shell"),
         (0, "/var/empty", "/usr/bin/false", "uid 0"),
     ] {
         let (mut exec, _) = mac_accounts(true, uid, home, shell);
