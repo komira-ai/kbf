@@ -30,12 +30,17 @@ on:
 
 permissions: {}
 
-# A newer push to a branch replaces an older one's run: only the head of a branch is
-# tested in full. A cancelled run is "not run", never "passed": its smoke result file
-# stays RUNNING and no artifact is uploaded.
+# One beta run at a time in the whole repository, main and feature/arch-v2 alike. GitHub
+# keeps at most one running and one pending run per concurrency group: a run queued while
+# another runs waits as pending, and a newer pending run replaces (cancels) the older
+# pending one, so the newest push waits its turn and a run in progress is never cancelled
+# (docs.github.com, "Control the concurrency of workflows and jobs": "any previously pending
+# job or workflow in the concurrency group will be canceled"; a running one is cancelled only
+# with `cancel-in-progress: true`). A pending run that is replaced is "not run", never
+# "passed".
 concurrency:
-  group: beta-${{ github.ref }}
-  cancel-in-progress: true
+  group: beta
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
