@@ -561,3 +561,46 @@ impl Down for MemberReport {
         }
     }
 }
+
+// Catches: write-tier values kept after the report that carried them went stale (an
+// operator would read a dead node's last numbers as current), values shown for a node that
+// sent none, and an unset value shown as zero. A fresh report shows its values, with a real
+// 0 distinct from unknown; a stale one and a missing one show every value unknown.
+#[test]
+fn a_nodes_vitals_are_shown_only_while_its_report_is_fresh() {
+    use kbf_server::vitals::Vitals;
+
+    let said = Vitals {
+        unflushed_bytes: Some(0),
+        used_bytes: Some(5),
+        ..Vitals::NONE
+    };
+    let with = |seconds| {
+        let mut member = reported(1, MemberState::Active, Debts::Known(0), seconds);
+        if let Some(report) = member.report.as_mut() {
+            report.said.vitals = said;
+        }
+        member
+    };
+    assert_eq!(judge(&[with(100)]).nodes[0].vitals, said, "fresh");
+    assert_eq!(
+        judge(&[with(100 - FRESH.as_secs())]).nodes[0].vitals,
+        said,
+        "as old as the window"
+    );
+    assert_eq!(
+        judge(&[with(100 - FRESH.as_secs() - 1)]).nodes[0].vitals,
+        Vitals::NONE,
+        "a second past the window: unknown, not the last numbers"
+    );
+    let silent = MemberReport {
+        report: None,
+        ..with(100)
+    };
+    assert_eq!(judge(&[silent]).nodes[0].vitals, Vitals::NONE);
+    assert_eq!(
+        judge(&[active(1, 0)]).nodes[0].vitals,
+        Vitals::NONE,
+        "a node that sends none"
+    );
+}

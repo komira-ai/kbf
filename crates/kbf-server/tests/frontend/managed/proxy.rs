@@ -21,7 +21,9 @@ async fn a_candidate_behind_the_proxy_gates_its_operator_port() {
     let node = Node::start().await;
     let store = shared();
     let _holder = Child::start(&managed_flags(&node, &[]), &store).await;
-    let worker = format!("--worker-listen=127.0.0.1:{}", free_port());
+    // Held to the end of the test, so no other test process can bind the number.
+    let reserved = kbf_testkit::port::Reserved::new();
+    let worker = format!("--worker-listen={}", reserved.addr());
     let behind = format!("--proxy-auth-file={}", secret.display());
     let candidate = Child::start(
         &managed_flags(&node, &["--await-takeover", &worker, &behind]),

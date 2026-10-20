@@ -32,6 +32,7 @@ use kbf_storage::service::CatchUp;
 
 use crate::members::fill_fp;
 use crate::node_map::NodeMap;
+use crate::vitals::Vitals;
 
 /// Passes of one attempt: the first, the repeat that is the guard, and what a node that is
 /// still being written to by others may need before one is quiet.
@@ -77,11 +78,15 @@ pub struct Beat {
     pub tail_epoch_done: u64,
     /// The fingerprint of the map that pass began under (0: none).
     pub fill_fp: u64,
+    /// The write tier's health as the last round found it (every value unknown before
+    /// the first round, and with no tier).
+    pub vitals: Vitals,
 }
 
 #[derive(Debug, Default)]
 struct Inner {
     flush: Option<FlushReport>,
+    vitals: Vitals,
     /// The newest epoch the frontend answered with.
     learned: u64,
     done: u64,
@@ -107,6 +112,11 @@ impl FillState {
     /// a test says it.
     pub fn flushed(&self, report: Option<FlushReport>) {
         self.inner().flush = report;
+    }
+
+    /// The write tier's health now. [`round`] makes it; a test says it.
+    pub fn tiered(&self, vitals: Vitals) {
+        self.inner().vitals = vitals;
     }
 
     /// The epoch the frontend's answer carried. It is followed, not maximised: a frontend
@@ -155,6 +165,7 @@ impl FillState {
             staged_bytes: flush.staged_bytes,
             tail_epoch_done: done,
             fill_fp: fp,
+            vitals: inner.vitals,
         }
     }
 }
@@ -190,6 +201,7 @@ pub(crate) async fn round<M: MetaLog, O: ObjectStore>(
     tail: &mut TailState,
     reads: FooterReads,
 ) {
+    fill.tiered(Vitals::from_tier(cache.tier_health()));
     match cache.flush_report().await {
         Ok(report) => fill.flushed(Some(report)),
         Err(error) => {

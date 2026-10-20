@@ -793,8 +793,8 @@ where
     let (closer, closing) = kbf_front::closing();
     let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
     let drain = Arc::new(drain);
-    let health_routes =
-        crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
+    let checks =
+        crate::health::cache_checks(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
     let blob_routes = crate::http_blobs::router(
         Arc::clone(&cache),
         BlobReaders::from_policy(&policy),
@@ -831,7 +831,7 @@ where
         token,
         Arc::clone(&farm),
     ))
-    .merge(health_routes)
+    .merge(crate::health::routes(&checks, &farm, members.as_ref()))
     .merge(crate::metrics::router(
         Arc::clone(&cache),
         local,

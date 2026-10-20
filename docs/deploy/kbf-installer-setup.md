@@ -136,6 +136,32 @@ kit's `kbf.toml`. `setup` then keeps every key the kit wrote byte for byte and o
 it needs that are missing; a key that is there with another value is refused (exit 5), naming the
 key. See [installing on macOS](kbf-installer-macos.md).
 
+### The deploy config of a frontend and an all-in-one host
+
+`--deploy-stage gamma|prod` makes `setup` write `/etc/kbf-installer/deploy.json` (root's, mode
+0644, written atomically), so `kbf-installer deploy` needs no flag naming the API, the token or
+the stage. Without `--deploy-stage` nothing is written, and every other `--deploy-*` flag needs
+it; a node mode takes none of them.
+
+| flag | key | default |
+|---|---|---|
+| `--deploy-stage` | `stage` | required to write the file |
+| `--deploy-api` | `api` | the proxy's public port: `[proxy] listen` of `installer.toml` (an unspecified address read as loopback), else `127.0.0.1:8980` |
+| `--deploy-token-file` | `token_file` | `[proxy] operator_token_file` of `installer.toml` |
+| `--deploy-api-ca` | `api_ca` | none (the system's roots) |
+| `--deploy-server-name` | `api_server_name` | none (the API address's IP) |
+
+The token and the CA are referenced by path and are the operator's: `setup` never copies or
+reads them, and creates none but the first operator token (the default token, which a first
+run may therefore name before it exists). Before it touches the host it checks that each exists, is a regular file
+(a link is not followed), is owned by root or the service user, and that the token is mode 0600
+or 0400 and the CA is not writable by group or others; a failure is exit 5 naming the flag and
+the one command that fixes it. The five keys above are `setup`'s and are rewritten from the
+flags on every run (a run again with the same flags changes nothing); any other key in the file
+(`cas`, `cas_ca`, `cas_server_name`) is kept. A file that is not a JSON object is left alone and
+named. The sudoers rule that lets the deploy account run `deploy` is a held step, written out in
+`docs/design/gamma-deploy.md`, "The host's config: who writes it, and the sudoers rule".
+
 ## What it does, in this order
 
 1. Checks it is root and, to apply, that its own binary is root's alone. Checks the flags (every
@@ -161,16 +187,25 @@ key. See [installing on macOS](kbf-installer-macos.md).
    `--create-local-database` the role and the database are made first. A server that cannot be
    reached, or refuses a login, stops `setup` here (exit 1) with `installer.toml` written and no
    release, `kbf.toml` or unit; running it again finishes.
-8. `--commit`: the first release, through the installer's fetcher. The binary has no fetcher wired
-   in, so `--commit` stops here with exit 1, before `kbf.toml` and the units. When a release is
-   installed already, `--commit` is not fetched and a note says so.
-9. `/etc/kbf/kbf.toml`, as above.
-10. The units, last. On Linux `systemctl enable`, with `--now` unless `--no-start`: the mode's unit
+8. `--commit`: the first release, through the installer's fetcher (the fetch child and the verify
+   pipeline), then made `releases/current` with no trial. The fetcher is the host's own: it reads
+   `installer.toml` and `installer.conf` and looks up the fetch user when `--commit` asks, so the
+   files this run wrote count. A fetch that cannot be made (the `frontend` source, which has no
+   address or CA key in `installer.toml` yet; a missing fetch user) or that fails stops `setup`
+   here with exit 1, before `kbf.toml` and the units. The branches a release may be attested for
+   are `SOURCE_REFS` of `installer.conf` (default `refs/heads/main`); `source_refs` of
+   `installer.toml` can only narrow that list, and a list with no ref in common refuses the fetch.
+   When a release is installed already, `--commit` is not fetched and a note says so.
+9. `/etc/kbf-installer/deploy.json`, only when `--deploy-stage` is given (see "The deploy config of a frontend and an all-in-one host").
+10. `/etc/kbf/kbf.toml`, as above.
+11. The units, last. On Linux `systemctl enable`, with `--now` unless `--no-start`: the mode's unit
     (only when a release is installed), and `kbf-installer.service`. `kbf-frontend.service`,
     `kbf-all-in-one.service` and the proxy units are enabled and never started by `setup`: starting
     one takes the database, the TLS files and the port. A unit that is enabled already is left
-    alone, and nothing is restarted. The two Postgres modes also get `kbf-backup.timer` (see
-    "Backup and restore") and a drop-in that gives `kbf-backup.service` its `User=`. On a Mac it
+    alone, and nothing is restarted. On a host that an earlier build set up with
+    `kbf-backup.timer`, `setup` also disables the timer if it is enabled, removes the drop-in an
+    earlier `setup` wrote for `kbf-backup.service` (and its directory), and reloads systemd; a
+    host that never had them gets no such step. On a Mac it
     runs `launchctl bootstrap system /Library/LaunchDaemons/<label>.plist` for
     `com.komira.kbf-installer` (unless `--no-start`) and for `com.komira.kbf-daemon` (only with a
     release and without `--no-start`), each only if the job is not loaded.
@@ -233,6 +268,7 @@ keeps the table, enables `kbf-frontend.service` as before and says so.
 | `--proxy-base-port` (default 18000, 1024 to 65521) | `[proxy.upstream] base_port`: slot A uses it and the four after, slot B ten above |
 | `--buck2-auth none\|bearer\|mtls`, `--buck2-token-file` | `[proxy] buck2_auth`, `buck2_token_file` (a key file only with `bearer`) |
 | (none) | `[proxy] operator_token_file`: the operator token `setup` makes |
+| (none) | `[proxy] ui = true`: the proxy serves the read-only web UI at `/ui`, open (no certificate or token), `GET` and `HEAD` only; set `ui = false` in `installer.toml` to make `/ui` a 404 |
 
 `setup` enables `kbf-proxy.socket` and `kbf-proxy.service` instead of `kbf-frontend.service`,
 writes none of the three TLS files into `kbf.toml` (the children speak plain h2c behind the proxy),
@@ -273,45 +309,18 @@ at the URL's socket.
   without `--create-local-database`: it checks that it can log in, then creates or brings forward
   the schema.
 
-## Backup and restore
-
-`kbf-backup.timer` starts `kbf-backup.service` daily (a host that was down runs it at start; each
-run is delayed by up to an hour). The service runs `kbf-installer --apply backup` as the host's
-service user (`kbf-server` on a frontend, `kbf` on an all-in-one host) through the drop-in
-`/etc/systemd/system/kbf-backup.service.d/10-service-user.conf`, which `setup` writes. The unit
-asserts that file, so without it the unit fails rather than run as root. The role and database
-are those in the `database` URL of `installer.toml`.
-
-A backup is `pg_dump` in custom format, written to `<state directory>/backups/kbf-<UTC time>.dump`
-(`/var/lib/kbf-server/backups` on a frontend, `/var/lib/kbf/backups` on all-in-one; the directory
-is 0700, each file 0600). A run writes a temp file, checks it is not empty and that `pg_restore
---list` can read it, renames it into place, and then removes the oldest beyond the newest
-`backup_keep` (`installer.toml`, 1 to 365, default 7). Any failure exits 1 and leaves older backups
-alone. `pg_dump` and `pg_restore` must be of the server's major version or newer. The backups are
-on the host's own disk; a copy elsewhere is the operator's.
-
-To test a restore, take one backup, then restore it into a scratch database:
-
-```text
-sudo systemctl start kbf-backup.service
-sudo -u postgres createdb --owner=<role> kbf_restore_test
-sudo -u <service user> kbf-installer --apply restore \
-    --file <state directory>/backups/kbf-<time>.dump --database kbf_restore_test
-sudo -u postgres dropdb kbf_restore_test
-```
-
-`restore` runs `pg_restore` in one transaction that stops at the first error, and refuses a
-database that already holds kbf's schema. To restore the real state, stop the frontend unit, drop
-and re-create the database, run `restore` without `--database`, and start the unit.
+Backups of the database are the operator's: Postgres is a runtime dependency that the operator
+provides, and its own backup and restore tools apply. Neither `setup` nor the package runs one,
+and `kbf-installer` has no `backup` or `restore` verb.
 
 ## Exit codes
 
 | code | meaning in `setup` |
 |---|---|
 | 0 | done, or a dry run that found nothing wrong |
-| 1 | failed: the database cannot be reached, `--commit` (this build has no fetcher), a step failed, no free id for the fetch account or no subid room, an unreadable migration journal |
+| 1 | failed: the database cannot be reached, `--commit` (the fetch could not be made or did not finish: a `frontend` source, no fetch user, a source that cannot be reached), a step failed, no free id for the fetch account or no subid room, an unreadable migration journal |
 | 2 | usage or a missing prerequisite: not root (`setup writes /etc and manages services: run it with sudo`), a binary root does not own alone, bad flags, a bad token file, a missing `kbf` or `kbf-server` user, a Mac mode other than `daemon` |
-| 3 | the fetcher rejected the release (not reachable in this build) |
+| 3 | the fetcher rejected the release: what arrived failed a check (size, digest, attestation, shape, the binary's report) |
 | 5 | only a person can go on: the old layout unmigrated, a shadowing unit, a `kbf.toml` or `installer.toml` `setup` will not overwrite, a floor that would go down, a wrong fetch account, a Mac `kbf.toml` that is not provisioned |
 
 `setup` does not take a lock, so it never exits 4.

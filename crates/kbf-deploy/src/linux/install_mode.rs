@@ -1,5 +1,5 @@
 //! `linux install-units --mode MODE`: one mode's unit of the one `kbf` binary on the
-//! host (docs/deploy/kbf-modes.md, "Installing a mode's unit").
+//! host (docs/deploy/kbf-units.md, "Installing a mode's unit").
 //!
 //! It checks the host first, read only, and each refusal says the fix:
 //! - the host has the cgroup v2 memory controller (every unit sets a memory limit or

@@ -474,6 +474,18 @@ impl Child for World {
             self.log_event(format!("spawn {slot:?} refused"));
             return Err(PortError("exec failed".into()));
         }
+        self.refresh();
+        if self
+            .st
+            .borrow()
+            .procs
+            .iter()
+            .any(|p| p.slot == slot && p.alive)
+        {
+            // As the real port: one child to a slot, a stopped one still counts until gone.
+            self.log_event(format!("spawn {slot:?} refused: live child"));
+            return Err(PortError(format!("slot {slot:?} has a live child already")));
+        }
         let script = self.st.borrow_mut().scripts.pop_front().unwrap_or_default();
         let ident = self.push(slot, release.clone(), script);
         self.st.borrow_mut().starts.push((slot, start));
@@ -514,6 +526,34 @@ impl Child for World {
         match st.procs.get((ident.pid as usize).wrapping_sub(100)) {
             Some(p) if p.alive => None,
             _ => Some(0),
+        }
+    }
+
+    /// The wait runs on the fake's own time: it moves to the exit, or by `limit`.
+    fn await_exit(&self, ident: &ProcIdent, limit: Duration) -> bool {
+        self.log_event(format!("await_exit pid {}", ident.pid));
+        let left = {
+            self.refresh();
+            let st = self.st.borrow();
+            match st.procs.get((ident.pid as usize).wrapping_sub(100)) {
+                Some(p) if p.alive => Some(
+                    p.script
+                        .exit_after
+                        .map(|d| (p.spawned_at + d).saturating_sub(self.now.get())),
+                ),
+                _ => None,
+            }
+        };
+        match left {
+            None => true,
+            Some(Some(left)) if left <= limit => {
+                self.advance(left);
+                self.exited(ident).is_some()
+            }
+            Some(_) => {
+                self.advance(limit);
+                false
+            }
         }
     }
 

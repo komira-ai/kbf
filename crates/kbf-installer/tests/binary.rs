@@ -51,8 +51,7 @@ fn status(root: &Path) -> serde_json::Value {
 
 /// Catches a helper that cannot do one pass of its own: it writes a world-readable
 /// status.json and exits 0 (here as a non-root user, so with the installer's refusal); with an order it cannot
-/// carry out (the binary has no fetcher yet, and no cgroup of the unit's leases exists on
-/// this root), the pass ends and the refusal is the node's to read, not a crash.
+/// carry out (no cgroup of the unit's leases exists on this root), the pass ends and the refusal is the node's to read, not a crash.
 ///
 /// Mutant seen red: `leases::NotWired` left in `build_helper` (the refusal says there is no
 /// lease source wired in, not that the unit's cgroup is missing).
@@ -97,7 +96,7 @@ fn one_pass_reports_the_host_and_a_refused_order() {
 
     // An activation: the binary reads the leases of the daemon's unit from its cgroup, and
     // this scratch root has none, so it cannot tell and the order is refused with that
-    // reason (fail closed), and the pass ends. (It has no fetcher yet either.)
+    // reason (fail closed), and the pass ends before any fetch.
     let record = kbf_update::OrderRecord {
         order_id: 2,
         epoch: 1,

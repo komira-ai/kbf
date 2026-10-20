@@ -159,7 +159,7 @@ fn a_run_that_stopped_at_the_database_is_finished_by_running_again() {
     };
     assert_eq!(installer_writes(&exec), 1);
     let up = Server::fresh();
-    let mut os = settled(&["kbf-frontend.service", "kbf-backup.timer"]);
+    let mut os = settled(&["kbf-frontend.service"]);
     os.users.push(user("kbf-server", 989));
     let out = go_on(&os, &mut exec, &Unwired, &up, &raw(Mode::Frontend), APPLY).expect("finished");
     assert_eq!(
@@ -911,6 +911,32 @@ fn an_invalid_config_file_is_refused_without_its_text() {
     assert!(
         !shown.contains("PW") && !shown.contains("postgres:"),
         "{shown}"
+    );
+}
+
+/// `setup`'s first release is fetched by the host's fetcher, which reads `installer.toml` and
+/// the fetch user when it is asked (`setup` builds it before it has written the file or made
+/// the user): on a scratch host with neither, the fetch is `Unavailable` with a reason, where
+/// the unwired fetcher said it had none at all (`NotWired`, code `not_implemented`).
+///
+/// Catches `cli` building its backend on `NotWired` again (`--commit` would stop with "no
+/// fetcher wired in" whatever the host holds). `cli` itself is root's and cannot run in a
+/// test, so the mutant is also caught by the compiler: the function this tests is unused
+/// when `cli` does not call it.
+///
+/// Mutants planted: `cli` building `Fetching::new(&NotWired, ..)`.
+#[test]
+fn the_first_release_is_fetched_by_the_host_fetcher_not_the_unwired_one() {
+    use crate::helper::fetcher::{Fetcher, ReleaseLocator};
+    let (_, layout) = scratch("first-release-fetcher");
+    let fetcher = crate::setup::first_release_fetcher(layout, None);
+    let got = fetcher.fetch(&ReleaseLocator {
+        commit: c(A),
+        components: Vec::new(),
+    });
+    assert!(
+        matches!(&got, Err(FetchError::Unavailable(why)) if !why.is_empty()),
+        "{got:?}"
     );
 }
 
