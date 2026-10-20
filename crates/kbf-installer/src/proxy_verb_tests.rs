@@ -468,8 +468,8 @@ fn check_stops_at_the_table_and_a_run_needs_its_socket() {
     let path = file("run", PROXY.as_bytes());
     let args = |check| ProxyArgs {
         config: Some(path.clone()),
-        update_dir: path.with_file_name("update"),
-        orders_dir: path.with_file_name("orders"),
+        update_dir: Some(path.with_file_name("update")),
+        orders_dir: Some(path.with_file_name("orders")),
         check,
     };
     assert_eq!(run(&args(true), Path::new("/")), Ok(()));
@@ -489,8 +489,8 @@ fn a_root_that_is_not_absolute_is_a_usage_error() {
     let path = file("rel-root", PROXY.as_bytes());
     let args = ProxyArgs {
         config: Some(path.clone()),
-        update_dir: path.with_file_name("update"),
-        orders_dir: path.with_file_name("orders"),
+        update_dir: Some(path.with_file_name("update")),
+        orders_dir: Some(path.with_file_name("orders")),
         check: false,
     };
     let result = run(&args, Path::new("relative"));
