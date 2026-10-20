@@ -911,7 +911,7 @@ impl Farm {
             // acknowledged with the first, to the node that sent the first: a copy from
             // another node, which never held the lease, is owed nothing.
             if matches!(standing, Err(Verdict::Held)) {
-                state.owed.entry(lease).or_insert_with(|| worker.clone());
+                state.owed.entry(lease).or_insert(worker.clone());
             }
             (standing, recorded)
         };
