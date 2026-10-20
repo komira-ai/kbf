@@ -314,11 +314,10 @@ fn the_old_layout_refusal_names_the_command_and_the_hand_route() {
 /// on the old flags: a regular file at `/etc/systemd/system/<the mode's unit>` (systemd reads
 /// `/etc` before `/usr/lib`, and `setup` skips a unit that is already enabled) stops setup
 /// with exit 5 and `unit_shadow` before any step, dry run or apply, naming the file and the
-/// fix. The frontend's instance is shadowed by its template's file too. A link (what
-/// `systemctl link` makes), another mode's file, and no file are not refused.
+/// fix. A link (what `systemctl link` makes), another mode's file, and no file are not
+/// refused.
 ///
-/// Mutants to plant: the check dropped; the check on the unit name only (frontend template
-/// missed); the check refusing a link; the check refusing another mode's file; the check after
+/// Mutants to plant: the check dropped; the check refusing a link; the check refusing another mode's file; the check after
 /// the first plan is applied.
 #[test]
 fn a_regular_file_shadowing_the_packaged_unit_stops_setup_before_any_step() {
@@ -327,8 +326,7 @@ fn a_regular_file_shadowing_the_packaged_unit_stops_setup_before_any_step() {
         (Mode::Daemon, "kbf-daemon.service"),
         (Mode::Storage, "kbf-storage.service"),
         (Mode::AllInOne, "kbf-all-in-one.service"),
-        (Mode::Frontend, "kbf-frontend@a.service"),
-        (Mode::Frontend, "kbf-frontend@.service"),
+        (Mode::Frontend, "kbf-frontend.service"),
     ];
     for (mode, file) in cases {
         let path = format!("/etc/systemd/system/{file}");
