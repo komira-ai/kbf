@@ -648,6 +648,9 @@ fn the_command_line_leaves_a_finished_document_on_an_api_failure() {
         "--result",
         result.to_str().unwrap(),
         "--apply",
+        "--stage",
+        "gamma",
+        "--no-offer",
         "--observe",
         "127.0.0.1:2",
     ]
@@ -660,6 +663,7 @@ fn the_command_line_leaves_a_finished_document_on_an_api_failure() {
             toml: dir.join("none.toml"),
             units: Vec::new(),
         },
+        installer_root: dir.clone(),
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = cli::run(

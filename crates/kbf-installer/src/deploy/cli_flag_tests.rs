@@ -43,6 +43,7 @@ impl Rig {
             root,
             config_owner: current_uid(),
             frontend: absent_frontend(self),
+            installer_root: self.dir.clone(),
         }
     }
 
@@ -242,6 +243,7 @@ fn the_config_is_read_only_when_a_flag_is_missing_and_must_be_a_file() {
             ("--cas", "http://127.0.0.1:1"),
             ("--cas-ca", "/no/such/ca.pem"),
             ("--cas-server-name", "kbf.example"),
+            ("--stage", "gamma"),
         ];
         for (flag, value) in all {
             if flag != skip {
@@ -253,6 +255,7 @@ fn the_config_is_read_only_when_a_flag_is_missing_and_must_be_a_file() {
             lock.to_str().unwrap().to_owned(),
             "--config".to_owned(),
             unreachable.to_owned(),
+            "--no-offer".to_owned(),
         ]);
         list
     };
@@ -268,6 +271,7 @@ fn the_config_is_read_only_when_a_flag_is_missing_and_must_be_a_file() {
         "--cas",
         "--cas-ca",
         "--cas-server-name",
+        "--stage",
     ] {
         let (code, out, err) = rig.go_with(base(skip), &[], b"", &host);
         assert_eq!((code, out.as_str()), (2, ""), "{skip}");
@@ -338,16 +342,19 @@ fn what_stops_a_deploy_before_it_starts_is_a_usage_error() {
 #[test]
 fn apply_wants_root_and_a_smoke_that_can_be_built() {
     let rig = Rig::new("apply");
-    let (code, out, err) = rig.go(&["--apply"], b"", false);
+    let (code, out, err) = rig.go(&["--apply", "--stage", "gamma", "--no-offer"], b"", false);
     assert_eq!((code, out.as_str()), (2, ""));
     assert!(err.contains("--apply must run as root"), "{err}");
 
-    let (code, _, err) = rig.go(&["--apply"], b"", true);
+    let (code, _, err) = rig.go(&["--apply", "--stage", "gamma", "--no-offer"], b"", true);
     assert_eq!(code, 1, "no smoke to build, the API is what fails: {err}");
 
     let (code, out, err) = rig.go(
         &[
             "--apply",
+            "--stage",
+            "gamma",
+            "--no-offer",
             "--cas",
             "http://127.0.0.1:1",
             "--cas-ca",
@@ -432,4 +439,198 @@ fn a_config_that_cannot_be_read_is_a_usage_error() {
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!((code, out.as_str()), (2, ""));
     assert!(err.contains("config:"), "{err}");
+}
+
+// ---- the offer flags -----------------------------------------------------------------
+
+use super::offer::{OfferPolicy, Stage};
+
+impl Rig {
+    /// `parse` of the base flags and `extra`, not through sudo.
+    fn parse(&self, extra: &[&str]) -> Result<cli::Args, String> {
+        let mut args = self.base();
+        args.extend(extra.iter().map(|s| (*s).to_owned()));
+        cli::parse(&args, false, current_uid())
+    }
+
+    fn policy(&self, extra: &[&str]) -> Result<OfferPolicy, String> {
+        self.parse(extra).map(|a| a.options.offer)
+    }
+
+    /// A valid gamma offer in a file of its own.
+    fn offer_file(&self) -> String {
+        let doc = serde_json::json!({
+            "version": 1, "created": 1_790_000_000u64, "target": "gamma", "commit": self.commit,
+            "set_hash": "f".repeat(64), "platforms": ["linux-x86_64"],
+            "beta": {"kind": "attested", "run_id": "1"},
+            "meta_log": 4, "previous": "b".repeat(40), "previous_meta_log": 4, "reversible": true,
+        });
+        let path = self.dir.join("offer.json");
+        fs::write(&path, doc.to_string()).unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+}
+
+/// (b) Proves how the deploy knows its stage: `--stage gamma|prod`, else the host config's
+/// `stage`, and nothing else (not the offer). An apply, an `--offer` or a `--no-offer` with
+/// no stage is a usage error, so no offer rule is skipped by leaving the stage out; a plan
+/// with none is unchecked. Catches an apply that runs with no stage, a stage the config does
+/// not supply, and a stage spelled as anything but the two.
+///
+/// Mutants planted: the apply-needs-stage check removed; the config key `stage` not read; a
+/// third stage word accepted.
+#[test]
+fn the_stage_comes_from_the_flag_or_the_host_config() {
+    let rig = Rig::new("stage");
+    assert!(matches!(rig.policy(&[]), Ok(OfferPolicy::Unchecked)));
+    for extra in [
+        &["--apply"][..],
+        &["--no-offer"],
+        &["--offer", "/x/offer.json"],
+    ] {
+        let err = rig.policy(extra).unwrap_err();
+        assert!(err.contains("--stage"), "{extra:?}: {err}");
+    }
+    assert!(
+        rig.policy(&["--stage", "beta"])
+            .unwrap_err()
+            .contains("gamma or prod")
+    );
+    assert!(matches!(
+        rig.policy(&["--stage", "prod", "--no-offer"]),
+        Ok(OfferPolicy::Waived(Stage::Prod))
+    ));
+    let config = rig.dir.join("deploy.json");
+    fs::write(&config, r#"{"stage": "prod"}"#).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let from_config = rig.policy(&["--config", config.to_str().unwrap(), "--no-offer"]);
+    assert!(
+        matches!(from_config, Ok(OfferPolicy::Waived(Stage::Prod))),
+        "{from_config:?}"
+    );
+}
+
+/// (g) Proves a named stage with no `--offer` is `Missing` (the deploy then refuses), that
+/// `--no-offer` is the only way past, and that `--offer` with `--no-offer` is a usage error.
+///
+/// Mutants planted: the default made `Waived`; the exclusion removed.
+#[test]
+fn a_stage_without_an_offer_is_missing_unless_waived() {
+    let rig = Rig::new("missing");
+    assert!(matches!(
+        rig.policy(&["--stage", "gamma"]),
+        Ok(OfferPolicy::Missing(Stage::Gamma))
+    ));
+    assert!(matches!(
+        rig.policy(&["--stage", "gamma", "--no-offer"]),
+        Ok(OfferPolicy::Waived(Stage::Gamma))
+    ));
+    let both = rig.policy(&[
+        "--stage",
+        "gamma",
+        "--no-offer",
+        "--offer",
+        &rig.offer_file(),
+    ]);
+    assert!(both.unwrap_err().contains("exclude"));
+}
+
+/// (a, e) Proves `--offer` reads the file through the validated parse (a file that is not an
+/// offer is a usage error naming the flag) and the age limit defaults to 72 hours, is
+/// `--offer-max-age-h` when given, and cannot be zero.
+///
+/// Mutants planted: the default 72 made 720; the flag's value ignored.
+#[test]
+fn the_offer_flag_reads_the_file_and_the_age_limit_has_a_default() {
+    let rig = Rig::new("offerflag");
+    let file = rig.offer_file();
+    let max_age = |extra: &[&str]| {
+        let mut flags = vec!["--stage", "gamma", "--offer", &file];
+        flags.extend_from_slice(extra);
+        match rig.policy(&flags) {
+            Ok(OfferPolicy::Offer { max_age, .. }) => max_age,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(max_age(&[]), Duration::from_secs(72 * 3600));
+    assert_eq!(
+        max_age(&["--offer-max-age-h", "5"]),
+        Duration::from_secs(5 * 3600)
+    );
+    assert!(
+        rig.policy(&[
+            "--stage",
+            "gamma",
+            "--offer",
+            &file,
+            "--offer-max-age-h",
+            "0"
+        ])
+        .is_err()
+    );
+    let junk = rig.dir.join("junk.json");
+    fs::write(&junk, "{}").unwrap();
+    let err = rig
+        .policy(&["--stage", "gamma", "--offer", junk.to_str().unwrap()])
+        .unwrap_err();
+    assert!(err.contains("--offer"), "{err}");
+}
+
+/// (g) Proves end to end that a gamma apply with no offer ends in a refusal on the summary
+/// line (exit 3, `offer_required`) before any call to the API (which here is a closed port),
+/// and that `--no-offer` goes on to the API (which then fails, exit 1) and says so on the
+/// summary. Catches a deploy that reaches the farm without an offer.
+///
+/// Mutant planted: the missing-offer step let through.
+#[test]
+fn a_gamma_apply_with_no_offer_is_refused_before_the_farm_is_asked() {
+    let rig = Rig::new("nooffer");
+    let (code, out, _) = rig.go(&["--apply", "--stage", "gamma"], b"", true);
+    assert_eq!(code, 3, "{out}");
+    let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(line["reason"], "offer_required");
+    assert_eq!(line["steps"].as_array().unwrap().len(), 1, "{out}");
+    let (code, out, err) = rig.go(&["--apply", "--stage", "gamma", "--no-offer"], b"", true);
+    assert_eq!(code, 1, "{out} {err}");
+    assert!(err.contains("--no-offer"), "{err}");
+    let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(line["offer"]["kind"], "waived");
+}
+
+/// Proves a gamma apply with a valid but old offer gets as far as reading the offer and
+/// building the probe, and ends in the offer's own refusal (exit 3, `offer_stale`) on the
+/// summary line; and that settings the host does not trust stop the deploy before it starts
+/// (exit 2), since the user the probe runs as comes from them. Catches an offer that is parsed
+/// and then not applied, and a probe built from settings nobody vouched for.
+///
+/// Mutant planted: the probe error ignored (the deploy goes on with no probe).
+#[test]
+fn a_stale_offer_ends_the_deploy_and_untrusted_settings_stop_it() {
+    let rig = Rig::new("stale");
+    let (code, out, _) = rig.go(
+        &["--apply", "--stage", "gamma", "--offer", &rig.offer_file()],
+        b"",
+        true,
+    );
+    assert_eq!(code, 3, "{out}");
+    let line: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(line["reason"], "offer_stale");
+    assert_eq!(line["offer"]["kind"], "offer");
+    if current_uid() == 0 {
+        return;
+    }
+    let layout = crate::layout::Layout::linux(kbf_host::Root::new(&rig.dir).unwrap());
+    let settings = layout.join(&layout.settings());
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, "RUN_AS_UID=65534\n").unwrap();
+    let (code, out, err) = rig.go(
+        &["--apply", "--stage", "gamma", "--offer", &rig.offer_file()],
+        b"",
+        true,
+    );
+    assert_eq!((code, out.as_str()), (2, ""), "{err}");
+    assert!(
+        err.contains("installer.conf") || err.contains("settings"),
+        "{err}"
+    );
 }

@@ -202,6 +202,9 @@ fn run(name: &str, api: &Fake, observe_flags: &[String]) -> Run {
         "--platform",
         "linux-x86_64",
         "--apply",
+        "--stage",
+        "gamma",
+        "--no-offer",
     ]
     .map(str::to_owned)
     .to_vec();
@@ -214,6 +217,7 @@ fn run(name: &str, api: &Fake, observe_flags: &[String]) -> Run {
             toml: dir.join("none.toml"),
             units: Vec::new(),
         },
+        installer_root: dir.clone(),
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = cli::run(
@@ -336,6 +340,9 @@ fn signal_child_entry() {
         "--observe",
         "127.0.0.1:2",
         "--apply",
+        "--stage",
+        "gamma",
+        "--no-offer",
     ]
     .map(str::to_owned)
     .to_vec();
@@ -348,6 +355,7 @@ fn signal_child_entry() {
             toml: dir.join("none.toml"),
             units: Vec::new(),
         },
+        installer_root: dir.clone(),
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     cli::run(

@@ -212,6 +212,7 @@ pub(super) fn run_tls(
             clock: &clock,
             smoke: &smoke,
             check: &check,
+            probe: &NoProbe,
         };
         deploy(&env, o, bundle)
     })
