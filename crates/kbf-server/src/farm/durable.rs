@@ -1001,7 +1001,7 @@ impl State {
 
     /// Whether the finish of `operation` (its answer or refusal) is held back, unwritten.
     /// Bounded by what is held, which is capped.
-    fn finish_held(&self, operation: OperationId) -> bool {
+    pub(super) fn finish_held(&self, operation: OperationId) -> bool {
         self.unwritten.iter().flatten().any(|effect| match effect {
             Effect::Answer(answer) => answer.operation == operation,
             Effect::Refuse(refusal) => refusal.operation == operation,
@@ -1016,6 +1016,8 @@ impl State {
         for effect in dropped {
             if let Effect::Answer(answer) = effect {
                 self.parked.remove(&answer.lease);
+                // Never written, so never acknowledged: the daemon keeps the result.
+                self.owed.remove(&answer.lease);
             }
         }
     }
