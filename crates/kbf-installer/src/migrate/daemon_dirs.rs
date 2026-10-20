@@ -18,6 +18,10 @@
 //! equal to the layout's) is left alone; a key that names another directory is the operator's
 //! and is reported, never changed. Re-run: the keys are there, so nothing is done.
 //!
+//! A Mac is the exception: `kbf-mac-provision` is the one writer of its `kbf.toml`, so there
+//! migrate writes nothing and checks instead (`update-dir` there and the layout's, `orders-dir`
+//! absent or the layout's), and refuses, before anything is stopped, when it is not.
+//!
 //! The first original of the file is kept, byte for byte, beside the units' originals
 //! (`migration-units/kbf.toml`), because a rollback puts the old layout back and an old `kbf`
 //! may refuse keys it does not know: [`restore`] writes it back when the file is still the
@@ -29,7 +33,8 @@ use toml::{Table, Value};
 use super::error::MigrateError;
 use super::{Migration, Report};
 use crate::cli::Mode as KbfMode;
-use crate::setup::kbf_toml::UPDATE_KEYS;
+use crate::layout::Platform;
+use crate::setup::kbf_toml::{UPDATE_KEYS, check_provisioned};
 use crate::setup::plan::takes_orders;
 
 /// What became of the file.
@@ -39,6 +44,10 @@ pub enum Outcome {
     Added,
     /// Both are there already, as the layout has them.
     Already,
+    /// A Mac: `kbf-mac-provision` is the one writer of its `kbf.toml`, so nothing was written;
+    /// the keys it rendered are the layout's (`orders-dir` may be absent: the node derives
+    /// `<update-dir>/orders`, `kbf_update::Config::new`).
+    Provisioned,
     /// The host's mode has no update client in its daemon, or it is not a node.
     NotANode,
     /// There is no `kbf.toml`: `setup` writes one.
@@ -195,6 +204,10 @@ pub fn add<E: Exec>(
                 m.layout.kbf_toml()
             ),
         ),
+        Outcome::Provisioned => report.line(
+            mode,
+            "kbf.toml: [daemon] update-dir and orders-dir are as kbf-mac-provision renders them",
+        ),
         Outcome::Left(why) => report.warnings.push(format!(
             "{}: the node's update-dir and orders-dir were not added, and it updates by hand until \
              they are ({why})",
@@ -203,6 +216,29 @@ pub fn add<E: Exec>(
         Outcome::NotANode | Outcome::NoFile => {}
     }
     Ok(outcome)
+}
+
+/// The refusal a Mac's `migrate --apply` makes before it changes anything: [`add`] checks the
+/// same keys on a Mac (and writes nothing there), but runs after the services are stopped.
+///
+/// # Errors
+/// The Mac's `kbf.toml` lacks the node's `update-dir`, or has a key that is not the layout's.
+pub fn preflight<E: Exec>(m: &Migration, exec: &mut E) -> Result<(), MigrateError> {
+    if m.layout.platform() == Platform::MacOs {
+        decide(m, exec, Mode::DryRun)?;
+    }
+    Ok(())
+}
+
+/// A Mac is provisioned, not edited ([`crate::setup::kbf_toml::check_provisioned`]).
+fn mac_keys(m: &Migration, table: &Table) -> Result<Outcome, MigrateError> {
+    check_provisioned(
+        table,
+        m.layout.update_dir().as_str(),
+        m.layout.orders_dir().as_str(),
+    )
+    .map(|()| Outcome::Provisioned)
+    .map_err(MigrateError::Conflict)
 }
 
 fn decide<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Outcome, MigrateError> {
@@ -230,6 +266,9 @@ fn decide<E: Exec>(m: &Migration, exec: &mut E, mode: Mode) -> Result<Outcome, M
         .is_some_and(takes_orders);
     if !node {
         return Ok(Outcome::NotANode);
+    }
+    if m.layout.platform() == Platform::MacOs {
+        return mac_keys(m, &table);
     }
     let missing = match missing(m, &table) {
         Ok(missing) if missing.is_empty() => return Ok(Outcome::Already),

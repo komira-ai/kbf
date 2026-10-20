@@ -119,6 +119,7 @@ fn start_with(releases: bool, state: bool) -> Frontend {
         token: Some(ApiToken::from_file(&path).expect("a usable token")),
         local_cache: None,
         releases,
+        poll: None,
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     // Allows everything, and names `farm.getAuthorizer`, which turns `GET /v1/update/hosts` on.
