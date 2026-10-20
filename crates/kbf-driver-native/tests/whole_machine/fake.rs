@@ -35,6 +35,11 @@ pub struct State {
     /// Verbs that wait until [`FakeSession::release`].
     pub hold: BTreeSet<&'static str>,
     released: bool,
+    /// While set, a `wait` whose process has ended does not log or return until
+    /// [`FakeSession::release_waits`]: the dropped runtime's wait that ends late.
+    pub hold_waits: bool,
+    /// How many `wait`s have been called (they may still block).
+    pub waits_entered: usize,
     /// The leases whose users the boot reset says it deleted.
     pub deleted_by_reset: Vec<LeaseId>,
     /// The process group of the action that runs.
@@ -58,6 +63,12 @@ impl FakeSession {
     /// Lets held verbs return.
     pub fn release(&self) {
         self.state().released = true;
+        self.0.1.notify_all();
+    }
+
+    /// Lets `wait`s held by [`State::hold_waits`] log and return.
+    pub fn release_waits(&self) {
+        self.state().hold_waits = false;
         self.0.1.notify_all();
     }
 
@@ -163,7 +174,17 @@ impl Session for FakeSession {
     }
 
     fn wait(&self, mut running: Child) -> Result<Exit, String> {
+        self.state().waits_entered += 1;
         let status = running.wait().map_err(|e| e.to_string())?;
+        {
+            let state = self.state();
+            drop(
+                self.0
+                    .1
+                    .wait_timeout_while(state, HOLD, |s| s.hold_waits)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
         self.verb("wait", None)?;
         Ok(Exit {
             code: status.code(),

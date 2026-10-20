@@ -59,14 +59,15 @@ fn log_down(_: &Path, _: Duration) -> io::Result<String> {
     Err(io::Error::other("log is down"))
 }
 
-fn sandboxed(name: &str) -> (NativeConfig, Arc<MemoryCas>) {
+/// The scratch directory first: declare it before the runtime, so it goes last.
+fn sandboxed(name: &str) -> (support::Scratch, NativeConfig, Arc<MemoryCas>) {
     let dir = scratch(name);
     let mut config = config(&dir);
     let link = dir.join("sandbox-exec");
     kbf_testkit::act::link_self(&link).expect("link");
     std::fs::write(format!("{}.rules", link.display()), "").expect("rules");
     config.isolation = Isolation::Sandbox(link);
-    (config, Arc::new(MemoryCas::default()))
+    (dir, config, Arc::new(MemoryCas::default()))
 }
 
 /// Catches: refusals never reaching the result (the operator sees `EPERM` only), another
@@ -75,7 +76,7 @@ fn sandboxed(name: &str) -> (NativeConfig, Arc<MemoryCas>) {
 /// log that cannot be read failing the lease, and a read without a sandbox.
 #[tokio::test]
 async fn a_failed_action_gets_its_own_denials_in_its_stderr() {
-    let (mut config, cas) = sandboxed("denials-note");
+    let (_dir, mut config, cas) = sandboxed("denials-note");
     config.denial_log = log_with_two;
     let rt = runtime(config.clone(), &cas);
 
@@ -106,7 +107,7 @@ async fn a_failed_action_gets_its_own_denials_in_its_stderr() {
     assert_eq!(READS.load(Ordering::SeqCst), before + 1);
 
     // A log that cannot be read leaves the result as the action made it.
-    let (mut config, cas) = sandboxed("denials-down");
+    let (_dir, mut config, cas) = sandboxed("denials-down");
     config.denial_log = log_down;
     let rt = runtime(config, &cas);
     let result = run(&rt, &cas, 1, &Spec::act("echo --stderr own ; exit 4"))
@@ -117,7 +118,7 @@ async fn a_failed_action_gets_its_own_denials_in_its_stderr() {
 
     // A failure with no refusal of its own keeps its stderr as it was: nothing says a
     // sandbox failed it, and another lease's paths are not this lease's to show.
-    let (mut config, cas) = sandboxed("denials-others");
+    let (_dir, mut config, cas) = sandboxed("denials-others");
     config.denial_log = log_others_only;
     config.denial_schedule = quick(50);
     let record = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -138,7 +139,7 @@ async fn a_failed_action_gets_its_own_denials_in_its_stderr() {
 
     // A note that would push stderr past the stdio limit is left out: the limit
     // would drop the action's own stderr with it.
-    let (mut config, cas) = sandboxed("denials-limit");
+    let (_dir, mut config, cas) = sandboxed("denials-limit");
     config.denial_log = log_with_two;
     config.outputs.max_stdio_bytes = 100;
     let rt = runtime(config, &cas);
@@ -156,7 +157,7 @@ async fn a_failed_action_gets_its_own_denials_in_its_stderr() {
         ),
         ("denials-locked", log_locks_stderr),
     ] {
-        let (mut config, cas) = sandboxed(name);
+        let (_dir, mut config, cas) = sandboxed(name);
         config.denial_log = reader;
         let rt = runtime(config, &cas);
         let spec = Spec::act("pgid ; echo --stderr own failure ; exit 3");
@@ -196,7 +197,7 @@ fn log_shows_it_late(file: &Path, window: Duration) -> io::Result<String> {
 /// the first holding the action's own refusal.
 #[tokio::test]
 async fn a_refusal_the_log_shows_late_is_still_in_stderr() {
-    let (mut config, cas) = sandboxed("denials-late");
+    let (_dir, mut config, cas) = sandboxed("denials-late");
     config.denial_log = log_shows_it_late;
     config.denial_schedule = quick(2000);
     let rt = runtime(config, &cas);
