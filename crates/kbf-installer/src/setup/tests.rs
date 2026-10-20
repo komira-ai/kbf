@@ -145,6 +145,8 @@ enum Standing {
     Unmigrated,
     /// A finished migration repointed these units.
     Done(&'static [&'static str]),
+    /// A finished migration adopted a host the Mac kit installed.
+    DoneKit(&'static [&'static str]),
     /// The journal cannot be read.
     Damaged,
 }
@@ -154,7 +156,7 @@ impl Migrations for Standing {
         match self {
             Standing::Fresh => Ok(Vec::new()),
             Standing::Unmigrated => Err(MigrateError::Unmigrated("/var/lib/kbf-deploy".into())),
-            Standing::Done(units) => Ok(units
+            Standing::Done(units) | Standing::DoneKit(units) => Ok(units
                 .iter()
                 .map(|u| Unit::new(u).expect("a unit"))
                 .collect()),
@@ -163,6 +165,10 @@ impl Migrations for Standing {
                 why: "planted".into(),
             }),
         }
+    }
+
+    fn kit_adopted(&self) -> Result<bool, MigrateError> {
+        Ok(matches!(self, Standing::DoneKit(_)))
     }
 }
 
@@ -1674,6 +1680,48 @@ mod proxy_listen;
 
 #[path = "backup_dropin_tests.rs"]
 mod backup_dropin;
+
+/// Catches the journal's `kit` flag not reaching the `kbf.toml` decision: on the same Mac with
+/// the same kit file, a finished kit migration (`DoneKit`) lets setup add its keys and keep the
+/// kit's, and a finished migration of any other host (`Done`) refuses the file as before.
+///
+/// Mutant seen red: `ctx.kit_adopted` left false.
+#[test]
+fn the_journals_kit_flag_picks_the_kbf_toml_decision() {
+    const KIT: &str = "mode = \"daemon\"\n\n[identity]\nnode-id = \"mac-a\"\n";
+    let mut os = FakeOs::mac();
+    os.users.push(user("_kbf-fetch", 303));
+    os.users.last_mut().expect("user").home = "/var/empty".to_owned();
+    let go_kit = |standing: Standing| {
+        let mut exec = released(host(), Platform::MacOs);
+        put(&mut exec, "/usr/local/etc/kbf/kbf.toml", 0o640, ROOT, KIT);
+        let r = go_after(
+            &os,
+            &mut exec,
+            &Unwired,
+            &Server::fresh(),
+            standing,
+            &raw(Mode::Daemon),
+            APPLY,
+        );
+        (r, exec)
+    };
+    let (ok, exec) = go_kit(Standing::DoneKit(&[]));
+    ok.expect("kit host");
+    let written = text(&exec, "/usr/local/etc/kbf/kbf.toml");
+    assert!(written.starts_with(KIT.trim_end()), "{written}");
+    assert!(
+        written.contains("update-dir = \"/var/db/kbf-installer\""),
+        "{written}"
+    );
+    let (refused, _) = go_kit(Standing::Done(&[]));
+    assert!(
+        refused
+            .expect_err("not a kit host")
+            .to_string()
+            .contains("holds other settings"),
+    );
+}
 
 #[path = "update_dirs_tests.rs"]
 mod update_dirs;

@@ -41,7 +41,11 @@ pub mod proxy;
 pub mod validate;
 
 #[cfg(test)]
-mod fake;
+pub(crate) mod fake;
+#[cfg(test)]
+mod fetch_user_tests;
+#[cfg(test)]
+mod kit_adopted_tests;
 #[cfg(test)]
 mod tests;
 
@@ -335,8 +339,9 @@ pub fn run(
         os.trusted_binary()?;
     }
     let valid = raw.validate(os.platform()).map_err(SetupError::Invalid)?;
-    let ctx = plan::context(os, valid.mode)?;
+    let mut ctx = plan::context(os, valid.mode)?;
     let journalled = migrated_units(backend, ctx.platform)?;
+    ctx.kit_adopted = backend.migrations.kit_adopted()?;
     let shadows = if ctx.platform == Platform::Linux {
         find_shadows(&*exec, valid.mode, &journalled, valid.proxy.is_some())?
     } else {

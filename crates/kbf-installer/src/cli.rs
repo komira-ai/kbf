@@ -336,9 +336,11 @@ pub struct MigrateArgs {
     /// run says so.
     #[arg(long)]
     pub min_generation: Option<u64>,
-    /// The unprivileged user the old binaries' `--version --json` runs as.
-    #[arg(long, default_value = "kbf-fetch")]
-    pub fetch_user: String,
+    /// The unprivileged user the old binaries' `--version --json` runs as. Without the flag it
+    /// is the fetch account of the platform (`kbf-fetch`; `_kbf-fetch` on a Mac), which on a
+    /// Mac an applying migration creates when it is not there (the way `setup` does).
+    #[arg(long)]
+    pub fetch_user: Option<String>,
 }
 
 #[derive(Args)]
