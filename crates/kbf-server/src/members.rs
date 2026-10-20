@@ -7,6 +7,7 @@
 //! | key | value | lives |
 //! |---|---|---|
 //! | `instance/<instance id>` | the member id | for ever: a node that returns keeps its id |
+//! | `member-owner/<id>` | the instance id: written with `instance/<instance id>`, so one id is never given to two instances | for ever |
 //! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter, its newest debts report and the protocol version it registered naming | `ttl` after the last heartbeat |
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
@@ -118,9 +119,11 @@ use crate::worker::named_protocol;
 
 mod denials;
 pub use denials::Denial;
+mod assign;
 mod join;
 mod pins;
 use pins::pin_key;
+pub use assign::{LastBoot, MAX_SEED};
 mod look;
 pub use look::{MemberLook, MembersLook};
 
@@ -466,6 +469,12 @@ fn boot_counter(id: MemberId) -> String {
     format!("boot/{}", id.0)
 }
 
+/// The claim on a member id: `member-owner/<id>` holds the instance that has it, written
+/// with the instance's own row so no two instances are ever given one id.
+fn owner_key(id: MemberId) -> String {
+    format!("member-owner/{}", id.0)
+}
+
 fn instance_key(instance: &str) -> String {
     format!("instance/{instance}")
 }
@@ -709,6 +718,20 @@ impl Members {
     /// [`MembershipError::Contended`]; [`MembershipError::PinsFull`] for a new instance that
     /// would join a farm holding data while the pins are at the cap (it gets no identity).
     pub fn register(&self, who: &Registrant) -> Result<Registration, MembershipError> {
+        self.register_after(who, None)
+    }
+
+    /// [`Members::register`] for a node that says which member and boot its metadata log
+    /// last wrote as (`last`; `None` for a node that has no log history or an older node
+    /// that does not say). The store assigns numbers the log will accept: see `assign`.
+    ///
+    /// # Errors
+    /// As [`Members::register`].
+    pub fn register_after(
+        &self,
+        who: &Registrant,
+        last: Option<LastBoot>,
+    ) -> Result<Registration, MembershipError> {
         if who.instance_id.is_empty() || who.addr.is_empty() || who.weight == 0 {
             return Err(MembershipError::Invalid(
                 "an instance id, an address and a weight of at least 1 are required",
@@ -726,7 +749,7 @@ impl Members {
         if self.store.get(&instance_key(&who.instance_id))?.is_none() && self.holds_data()? {
             self.pins_full()?;
         }
-        let (id, boot) = self.assign(&who.instance_id)?;
+        let (id, boot) = self.assign(&who.instance_id, last)?;
         let member = Member {
             id,
             // The spelling enrollment stores, so the update controller can join a host to it.
@@ -746,32 +769,6 @@ impl Members {
         )?;
         let map = self.refresh()?.ok_or(MembershipError::NoMap)?;
         Ok(Registration { id, boot, map })
-    }
-
-    /// The id of `instance` (assigned on first sight, with its `unfilled/` mark if the farm
-    /// holds data) and a new boot counter for it.
-    fn assign(&self, instance: &str) -> Result<(MemberId, u64), MembershipError> {
-        let key = instance_key(instance);
-        for _ in 0..ATTEMPTS {
-            let (id, txn) = match self.store.get(&key)? {
-                Some(known) => {
-                    let id = MemberId(decode_id(&known.value)?);
-                    let txn = Txn::new().check(&key, Cond::Version(known.version));
-                    (id, txn.next(boot_counter(id)))
-                }
-                None => {
-                    // A counter has no precondition, so it cannot conflict.
-                    let taken = self.store.txn(Txn::new().next(ID_COUNTER))?;
-                    let id = MemberId(taken.map_err(|_| MembershipError::Contended)?.counters[0]);
-                    let txn = Txn::new().put(&key, id.0.to_be_bytes(), Cond::Absent);
-                    (id, self.unfilled_if_data(txn, id)?.next(boot_counter(id)))
-                }
-            };
-            if let Ok(commit) = self.store.txn(txn)? {
-                return Ok((id, commit.counters[0]));
-            }
-        }
-        Err(MembershipError::Contended)
     }
 
     /// Stores `member`'s row with a whole time to live, unless a newer boot is there, and

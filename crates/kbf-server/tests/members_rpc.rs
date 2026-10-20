@@ -60,7 +60,28 @@ fn request(i: u32) -> pb::RegisterRequest {
         zone: "a".to_owned(),
         protocol: PROTOCOL,
         catching_up: false,
+        ..Default::default()
     }
+}
+
+/// Catches: the report of the node's log history dropped between the wire and the store (the
+/// request's `last_member_id` and `last_boot` not read): a node that says it last wrote as
+/// member 3 at boot 5 is answered member 3 at boot 6, not member 1 at boot 1. Mutant: the
+/// service passes `None` to `register_after`, red.
+#[tokio::test]
+async fn register_reads_the_nodes_last_member_and_boot() {
+    let store = Hooked::new();
+    let (_members, mut client) = serve(&store).await;
+    let got = client
+        .register(pb::RegisterRequest {
+            last_member_id: 3,
+            last_boot: 5,
+            ..request(1)
+        })
+        .await
+        .expect("registers")
+        .into_inner();
+    assert_eq!((got.member_id, got.boot), (3, 6));
 }
 
 /// Catches: a registration answer that lacks what the node needs (the store's id and
