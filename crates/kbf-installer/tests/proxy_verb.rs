@@ -214,7 +214,10 @@ fn start_args(
         .stdout(Stdio::null())
         .stderr(stderr);
     // A test that passes its own `--update-dir` (a `status.json` it wrote) is not given a second.
-    if !flags.iter().any(|flag| flag.to_str() == Some("--update-dir")) {
+    if !flags
+        .iter()
+        .any(|flag| flag.to_str() == Some("--update-dir"))
+    {
         command.arg("--update-dir").arg(update_dir_of(path));
     }
     // SAFETY: only async-signal-safe calls (`sigprocmask` family included) and `setenv`, which is safe here: the child is a
@@ -577,12 +580,10 @@ async fn a_recorded_frontend_is_adopted_and_outlives_the_proxy_that_stops() {
             let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
         }
     });
-    let table = fs::read_to_string(&path)
-        .expect("config text")
-        .replace(
-            "base_port = 18000",
-            &format!("base_port = {}", admin_port - 3),
-        );
+    let table = fs::read_to_string(&path).expect("config text").replace(
+        "base_port = 18000",
+        &format!("base_port = {}", admin_port - 3),
+    );
     fs::write(&path, table).expect("write");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
