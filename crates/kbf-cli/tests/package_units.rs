@@ -25,7 +25,7 @@ fn units() -> Vec<(String, String)> {
                 .strip_suffix(".service")?
                 .trim_end_matches('@')
                 .to_owned();
-            (!["envoy", "installer"].contains(&mode.as_str()))
+            (!["envoy", "installer", "proxy"].contains(&mode.as_str()))
                 .then(|| (mode, std::fs::read_to_string(&p).expect("read")))
         })
         .collect();

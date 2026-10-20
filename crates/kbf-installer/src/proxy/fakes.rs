@@ -80,6 +80,8 @@ pub struct State {
     pub migrate_err: Option<String>,
     pub takeover: Takeover,
     pub quiesce_takes: Duration,
+    /// How each child was started, in order.
+    pub starts: Vec<(Slot, Start)>,
     pub open_counts_err: bool,
     pub desired_err: bool,
     pub resume_fails: Vec<Slot>,
@@ -122,6 +124,12 @@ pub struct State {
     pub fed: Vec<(Slot, usize)>,
     pub expired: usize,
     pub active: Slot,
+    /// `clear_active` ran and no release has set a slot since.
+    pub cleared: bool,
+    /// Slots the gate closed (`retire` answered `Closed`) and no release opened again.
+    pub retired: Vec<Slot>,
+    /// Slots the gate never opened: `retire` answers `NeverOpened`.
+    pub never_opened: Vec<Slot>,
     pub requests: Vec<(Duration, Request)>,
     pub events: Vec<(Duration, String)>,
     pub limit: Duration,
@@ -153,6 +161,7 @@ impl World {
                 migrate_err: None,
                 takeover: Takeover::Ok,
                 quiesce_takes: Duration::from_millis(200),
+                starts: Vec::new(),
                 open_counts_err: false,
                 desired_err: false,
                 resume_fails: Vec::new(),
@@ -183,6 +192,9 @@ impl World {
                 fed: Vec::new(),
                 expired: 0,
                 active: Slot::A,
+                cleared: false,
+                retired: Vec::new(),
+                never_opened: Vec::new(),
                 requests: Vec::new(),
                 events: Vec::new(),
                 limit: START + secs(48 * 3600),
@@ -447,7 +459,7 @@ fn gone(slot: Slot) -> PortError {
 }
 
 impl Child for World {
-    fn spawn(&self, slot: Slot, release: &CommitId) -> Result<ProcIdent, PortError> {
+    fn spawn(&self, slot: Slot, release: &CommitId, start: Start) -> Result<ProcIdent, PortError> {
         let failing = {
             let mut st = self.st.borrow_mut();
             let n = st.spawn_counts.entry(slot).or_insert(0);
@@ -461,6 +473,14 @@ impl Child for World {
         }
         let script = self.st.borrow_mut().scripts.pop_front().unwrap_or_default();
         let ident = self.push(slot, release.clone(), script);
+        self.st.borrow_mut().starts.push((slot, start));
+        if start == Start::Active {
+            // Serves from its first moment: it holds the generation itself.
+            let mut st = self.st.borrow_mut();
+            let p = st.procs.last_mut().expect("just pushed");
+            p.state = RoleState::Active;
+            p.holder = true;
+        }
         self.log_event(format!(
             "spawn {slot:?} {} pid {}",
             &release.as_str()[..4],
@@ -544,8 +564,11 @@ impl ChildAdmin for World {
         .ok_or_else(|| gone(slot))
     }
 
-    fn takeover(&self, slot: Slot, _limit: Duration) -> Result<(), PortError> {
-        self.log_event(format!("admin:takeover {slot:?}"));
+    fn takeover(&self, slot: Slot, limit: Duration) -> Result<(), PortError> {
+        self.log_event(format!(
+            "admin:takeover {slot:?} limit {} ms",
+            limit.as_millis()
+        ));
         let mode = self.st.borrow().takeover;
         match mode {
             Takeover::Err => return Err(PortError("takeover refused".into())),
@@ -691,6 +714,8 @@ impl Gate for World {
             st.held.clear();
             st.hold_on = false;
             st.active = slot;
+            st.cleared = false;
+            st.retired.retain(|r| *r != slot);
             st.fed.push((slot, n));
             n
         };
@@ -721,6 +746,31 @@ impl Gate for World {
     fn open_streams(&self, slot: Slot) -> u64 {
         let now = self.now.get();
         self.st.borrow().permits.get(&slot).map_or(0, |u| u.at(now))
+    }
+
+    fn clear_active(&self) {
+        self.log_event("clear_active");
+        self.st.borrow_mut().cleared = true;
+    }
+
+    fn retire(&self, slot: Slot) -> Retired {
+        let open = self.open_streams(slot);
+        let mut st = self.st.borrow_mut();
+        let answer = if st.never_opened.contains(&slot) {
+            Retired::NeverOpened
+        } else if st.retired.contains(&slot) {
+            Retired::AlreadyClosed
+        } else if slot == st.active && !st.cleared {
+            Retired::Current
+        } else if open > 0 {
+            Retired::Busy(open)
+        } else {
+            st.retired.push(slot);
+            Retired::Closed
+        };
+        drop(st);
+        self.log_event(format!("gate:retire {slot:?} {answer:?}"));
+        answer
     }
 }
 
