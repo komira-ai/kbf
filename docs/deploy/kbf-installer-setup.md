@@ -168,8 +168,11 @@ named. The sudoers rule that lets the deploy account run `deploy` is a held step
    with the recipe below, `installer.toml` written and no release, `kbf.toml` or unit;
    running it again finishes.
 8. `--commit`: the first release, through the installer's `Fetcher` (the fetch child and the
-   verify pipeline) and nothing else, then made `releases/current` with no trial. This build
-   has no fetcher wired in, so it stops here with exit 1, before `kbf.toml` and the units.
+   verify pipeline) and nothing else, then made `releases/current` with no trial. The fetcher
+   is the host's own: it reads `installer.toml` and `installer.conf` and finds the fetch user
+   when `--commit` asks, so the files this run wrote count. When a fetch cannot be made (the
+   `frontend` source, which has no address or CA key yet, a missing fetch user) or fails,
+   `setup` stops here with exit 1, before `kbf.toml` and the units.
    When a release is installed already, `--commit` is not fetched.
 9. `/etc/kbf/kbf.toml` (root:service group, 0640): `mode`, `[frontend] url`, `[enroll]
    token_file`, on a frontend or all-in-one host `[tls] api-token-file` and `[scheduler]

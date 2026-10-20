@@ -434,6 +434,163 @@ fn a_syntax_error_names_the_line_it_starts_on() {
     );
 }
 
+mod read {
+    use kbf_host::exec::Entry;
+    use kbf_host::path::HostPath;
+    use kbf_host::step::{Owner, Perms};
+    use kbf_host::testkit::FakeExec;
+
+    use super::*;
+
+    const FILE: &str = "/etc/kbf/installer.toml";
+    const ROOT: Owner = Owner { uid: 0, gid: 0 };
+
+    fn dir(mode: u32, owner: Owner) -> Entry {
+        Entry::Dir {
+            perms: Perms::new(mode),
+            owner,
+        }
+    }
+
+    fn file(bytes: &[u8], mode: u32, owner: Owner) -> Entry {
+        Entry::File {
+            perms: Perms::new(mode),
+            owner,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    /// A host as `setup` leaves it: root's 0644 file in root's 0755 `/etc/kbf` in `/etc`.
+    fn host(text: &str) -> FakeExec {
+        let mut exec = FakeExec::new(0);
+        for at in ["/etc", "/etc/kbf"] {
+            exec.entries
+                .insert(HostPath::new(at).expect("path"), dir(0o755, ROOT));
+        }
+        exec.entries.insert(
+            HostPath::new(FILE).expect("path"),
+            file(text.as_bytes(), 0o644, ROOT),
+        );
+        exec
+    }
+
+    fn read(exec: &FakeExec) -> Result<InstallerToml, ReadError> {
+        InstallerToml::read(exec, &HostPath::new(FILE).expect("path"))
+    }
+
+    /// The word of a refusal: the code `Refusal` gives it, or `invalid` for a file that is not
+    /// an `installer.toml`.
+    fn why(result: Result<InstallerToml, ReadError>) -> String {
+        match result.expect_err("refused") {
+            ReadError::Untrusted(refusal) => refusal.code().to_owned(),
+            ReadError::Invalid(e) => format!("invalid: {e}"),
+        }
+    }
+
+    /// A root-owned file nobody else can write is read and parsed as `parse` would.
+    ///
+    /// Catches a reader that returns the defaults for a file it did read, and one that parses
+    /// something other than the file's bytes.
+    #[test]
+    fn a_trusted_file_is_read_and_parsed() {
+        let text = "release_source = \"url\"\nrelease_url = \"https://mirror.example\"\nmin_protocol = 3\n";
+        let got = read(&host(text)).expect("trusted");
+        assert_eq!(got, InstallerToml::parse(text).expect("parses"));
+        assert_eq!(got.min_protocol, 3);
+    }
+
+    /// The file decides where releases come from and which are refused, so whoever can write
+    /// it decides: a file owned by anyone but root, or writable by group or others, or in a
+    /// directory that is, is refused with the trust rule's code, and nothing of its content is
+    /// used (it holds a valid file that a hostile owner would write).
+    ///
+    /// Catches the check removed (the farm's `/etc/kbf` is root's, but a mis-set one would
+    /// pass), the owner check on the file alone (not its directory), and a mode mask that
+    /// lets group or others write.
+    ///
+    /// Mutants planted: `trusted_chain` call removed; the chain asked about the file only.
+    #[test]
+    fn a_file_root_does_not_alone_control_is_refused() {
+        let text = "release_source = \"url\"\nrelease_url = \"https://mirror.example\"\n";
+        let user = Owner {
+            uid: 1000,
+            gid: 1000,
+        };
+        let mut owned = host(text);
+        owned.entries.insert(
+            HostPath::new(FILE).expect("path"),
+            file(text.as_bytes(), 0o644, user),
+        );
+        assert_eq!(why(read(&owned)), "untrusted-owner");
+
+        for mode in [0o664, 0o646, 0o666] {
+            let mut open = host(text);
+            open.entries.insert(
+                HostPath::new(FILE).expect("path"),
+                file(text.as_bytes(), mode, ROOT),
+            );
+            assert_eq!(why(read(&open)), "untrusted-writable", "{mode:o}");
+        }
+
+        let mut above = host(text);
+        above
+            .entries
+            .insert(HostPath::new("/etc/kbf").expect("path"), dir(0o775, ROOT));
+        assert_eq!(why(read(&above)), "untrusted-writable", "the directory");
+        above
+            .entries
+            .insert(HostPath::new("/etc/kbf").expect("path"), dir(0o755, user));
+        assert_eq!(
+            why(read(&above)),
+            "untrusted-owner",
+            "the directory's owner"
+        );
+    }
+
+    /// A file that is not there, one that cannot be read, and a directory or a link where it
+    /// should be are each refused as untrusted (never read as the defaults: a host whose file
+    /// is unreadable must not fetch from the default source).
+    ///
+    /// Catches a missing file read as the defaults and an I/O error swallowed.
+    #[test]
+    fn a_missing_unreadable_or_misplaced_file_is_refused() {
+        let mut exec = host("");
+        exec.entries.remove(&HostPath::new(FILE).expect("path"));
+        assert_eq!(why(read(&exec)), "untrusted-missing");
+        let err = InstallerToml::read(&exec, &HostPath::new(FILE).expect("path"))
+            .expect_err("missing")
+            .to_string();
+        assert_eq!(err, format!("{FILE} is not trusted: it is missing"));
+
+        let unreadable = HostPath::new("/unreadable").expect("path");
+        let got = InstallerToml::read(&host(""), &unreadable);
+        assert_eq!(why(got), "untrusted-unreadable");
+
+        exec.entries
+            .insert(HostPath::new(FILE).expect("path"), dir(0o755, ROOT));
+        assert_eq!(why(read(&exec)), "untrusted-link");
+    }
+
+    /// A trusted file that is not an `installer.toml` is refused with the parser's own reason
+    /// (every problem it lists), and one that is not UTF-8 is refused rather than read lossily.
+    ///
+    /// Catches parse errors lost on the way, and bytes turned into replacement characters.
+    #[test]
+    fn a_trusted_file_with_bad_content_is_refused_with_the_parsers_reason() {
+        let got = why(read(&host("release_source = \"carrier-pigeon\"\n")));
+        assert!(
+            got.starts_with("invalid: installer.toml:") && got.contains("release_source"),
+            "{got}"
+        );
+        let mut exec = host("");
+        exec.entries.insert(
+            HostPath::new(FILE).expect("path"),
+            file(b"database = \"\xff\"\n", 0o644, ROOT),
+        );
+        assert_eq!(why(read(&exec)), "invalid: installer.toml: it is not UTF-8");
+    }
+}
+
 /// The `installer.toml` of a proxy host, as `setup --proxy` writes it with every flag at its
 /// default.
 const PROXY_HOST: &str = include_str!("../tests/golden/proxy_host/installer.toml");

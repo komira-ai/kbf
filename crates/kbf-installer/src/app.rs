@@ -23,12 +23,13 @@ use crate::cli::{
 use crate::database::Database;
 use crate::exit::Exit;
 use crate::helper::cycle::{Config, Helper, HelperError};
+use crate::helper::fetcher_host::HostFetcher;
 use crate::helper::host_mode;
+use crate::helper::leases;
 use crate::helper::operator::{self, Operator};
 use crate::helper::restart::Restart;
 use crate::helper::serve::{FileIdentity, Flow, PASS_INTERVAL, Serve};
 use crate::helper::service::HostProcs;
-use crate::helper::{fetcher, leases};
 use crate::layout::{Layout, Platform};
 use crate::migrate;
 use crate::proxy_verb;
@@ -198,6 +199,15 @@ fn run(root: PathBuf, args: &RunArgs) -> Result<(), Failure> {
     run_from(root, args, &me, watch)
 }
 
+/// The `installer.toml` the fetcher reads: `--installer-config`, else the file `setup` writes
+/// on the host's platform.
+fn installer_toml_of(args: &RunArgs, layout: &Layout) -> HostPath {
+    match &args.installer_config {
+        Some(path) => path.clone(),
+        None => layout.installer_toml(),
+    }
+}
+
 /// The helper `run` drives: the host's, with the schema step of `--installer-config` attached
 /// when the flag is given.
 fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failure> {
@@ -220,15 +230,21 @@ fn build_helper(root: PathBuf, args: &RunArgs) -> Result<Helper<HostExec>, Failu
         min_activation_interval_secs: args.min_activation_interval_secs,
     };
     // The leases are those of the unit restarted after a swap, read below the host root's
-    // cgroup mount. The release fetcher is wired by a later change; until then an
-    // activation of a release that is not installed is refused.
+    // cgroup mount; the helper and each fetch's pipeline get a source of their own. The
+    // fetcher reads `installer.toml` (the flag's, else the host's own) at each fetch.
     let cgroups = HostPath::new(leases::CGROUP_ROOT).expect("CGROUP_ROOT is an absolute path");
-    let lease_source = leases::for_restart(&cfg.restart, &layout.join(&cgroups));
+    let cgroup_root = layout.join(&cgroups);
+    let lease_source = leases::for_restart(&cfg.restart, &cgroup_root);
+    let restart = cfg.restart.clone();
+    let installer_toml = installer_toml_of(args, &layout);
+    let fetcher = HostFetcher::on_host(layout.clone(), installer_toml, move || {
+        leases::for_restart(&restart, &cgroup_root)
+    });
     let mut helper = Helper::new(
         layout,
         exec,
         cfg,
-        Box::new(fetcher::NotWired),
+        Box::new(fetcher),
         lease_source,
         Box::new(HostProcs::new(platform)),
     );

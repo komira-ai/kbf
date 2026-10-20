@@ -880,6 +880,65 @@ fn run_with_an_installer_config_refuses_a_relative_host_root() {
     assert!(refused.is_some_and(|f| !f.why.is_empty()));
 }
 
+fn run_args(extra: &[&str]) -> RunArgs {
+    let mut argv = RUN.to_vec();
+    argv.extend_from_slice(extra);
+    let Verb::Run(args) = parse(&argv).verb else {
+        panic!("a run");
+    };
+    args
+}
+
+/// The file the fetcher reads is `--installer-config` when it is given and the file `setup`
+/// writes when it is not.
+///
+/// Catches the flag ignored (the fetcher would read a file the operator did not name) and a
+/// default that is not `setup`'s file.
+///
+/// Mutants planted: the flag's arm returning the default.
+#[test]
+fn the_fetcher_reads_the_flags_installer_toml_else_the_one_setup_writes() {
+    let root = || kbf_host::Root::new("/").expect("root");
+    let linux = Layout::new(root(), Platform::Linux);
+    let mac = Layout::new(root(), Platform::MacOs);
+    assert_eq!(
+        installer_toml_of(&run_args(&[]), &linux).as_str(),
+        "/etc/kbf/installer.toml"
+    );
+    assert_eq!(
+        installer_toml_of(&run_args(&[]), &mac).as_str(),
+        "/usr/local/etc/kbf/installer.toml"
+    );
+    let flagged = run_args(&["--installer-config", "/srv/kbf/installer.toml"]);
+    assert_eq!(
+        installer_toml_of(&flagged, &linux).as_str(),
+        "/srv/kbf/installer.toml"
+    );
+}
+
+/// `run` builds its helper with the host's fetcher, not the build's `NotWired`: a fetch on a
+/// scratch host with no `installer.toml` (and no fetch user, on a box that has none) is
+/// `Unavailable` with a reason, where the unwired fetcher says it has no fetcher at all.
+///
+/// Catches `build_helper` going back to `fetcher::NotWired` (every fetch refused with no reason
+/// to act on).
+///
+/// Mutants planted: `Box::new(fetcher::NotWired)` in place of the host fetcher.
+#[test]
+fn run_builds_its_helper_with_the_host_fetcher_not_the_unwired_one() {
+    let (_, root) = seeded("run-fetcher");
+    let helper = build_helper(root, &run_args(&[])).unwrap_or_else(|f| panic!("{}", f.why));
+    let rec = crate::helper::fetcher::ReleaseLocator {
+        commit: c(B),
+        components: Vec::new(),
+    };
+    let got = helper.fetcher().fetch(&rec);
+    assert!(
+        matches!(&got, Err(crate::helper::fetcher::FetchError::Unavailable(why)) if !why.is_empty()),
+        "{got:?}"
+    );
+}
+
 /// Catches `update` being gated on root (it is a client of the update API and runs as
 /// whoever can read the token file) or not reaching its own code: a bad address is its own
 /// usage error, as an ordinary user, and prints no summary.

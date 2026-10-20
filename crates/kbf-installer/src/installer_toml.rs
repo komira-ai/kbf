@@ -12,8 +12,13 @@
 
 use std::path::PathBuf;
 
+use kbf_host::exec::{Entry, Exec, Kind};
+use kbf_host::path::HostPath;
 use kbf_proxy::config::ProxyConfig;
 use serde::Deserialize;
+
+use crate::refusal::{Refusal, TrustFault};
+use crate::trust::trusted_chain;
 
 /// The largest file read.
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
@@ -120,6 +125,17 @@ pub enum ConfigError {
     Syntax(String),
     #[error("installer.toml:\n{}", .0.join("\n"))]
     Invalid(Vec<String>),
+}
+
+/// Why the file at a path could not be taken as the installer's settings.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    /// It is missing, not a plain file, owned by someone but root, writable by group or
+    /// others, or in a directory that is ([`trusted_chain`]).
+    #[error("{0}")]
+    Untrusted(Refusal),
+    #[error("{0}")]
+    Invalid(ConfigError),
 }
 
 fn absolute(key: &str, value: &Option<String>, problems: &mut Vec<String>) -> Option<PathBuf> {
@@ -254,6 +270,39 @@ fn syntax_line(text: &str, error: &toml::de::Error) -> String {
 }
 
 impl InstallerToml {
+    /// The settings in `file`, read through `trust` (the host's own executor, or a test's).
+    ///
+    /// The file decides where a release comes from and which versions the host refuses, so
+    /// it is held to the rule of the trust files ([`trusted_chain`]): a plain file of root's
+    /// that group and others cannot write, in directories of root's that they cannot write.
+    /// `setup` leaves it so (root:root 0644 in a root-owned 0755 directory).
+    ///
+    /// # Errors
+    /// [`ReadError::Untrusted`] when the rule is not met (or the file cannot be read),
+    /// [`ReadError::Invalid`] when its content is not an `installer.toml`.
+    pub fn read(trust: &dyn Exec, file: &HostPath) -> Result<InstallerToml, ReadError> {
+        let untrusted = |fault| {
+            ReadError::Untrusted(Refusal::Untrusted {
+                path: file.as_str().into(),
+                fault,
+            })
+        };
+        let read = trust
+            .inspect(file)
+            .map_err(|e| untrusted(TrustFault::Unreadable(e)))?;
+        let Some(entry) = read else {
+            return Err(untrusted(TrustFault::Missing));
+        };
+        // A link, a directory or a device where the file should be.
+        let Entry::File { bytes, .. } = entry else {
+            return Err(untrusted(TrustFault::Link));
+        };
+        trusted_chain(trust, file, Kind::File).map_err(ReadError::Untrusted)?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| ReadError::Invalid(ConfigError::Syntax("it is not UTF-8".to_owned())))?;
+        InstallerToml::parse(&text).map_err(ReadError::Invalid)
+    }
+
     pub fn parse(text: &str) -> Result<InstallerToml, ConfigError> {
         if text.len() > MAX_FILE_BYTES {
             return Err(ConfigError::TooLarge(text.len()));
