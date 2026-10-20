@@ -532,3 +532,34 @@ fn the_capture_sink_flushes_without_effect() {
     keep.flush().expect("nothing to flush");
     assert_eq!(*keep.0.lock().expect("lock"), b"ab");
 }
+
+/// A capture whose pipe is still open when the grace is over returns what it kept so
+/// far, without waiting for the pipe to end: a child's grandchild can hold the pipe long
+/// after the child is gone. The write end stays open for the whole test, so the reader
+/// can only end by the deadline, never by the pipe ending.
+///
+/// Mutant seen red: the `Timeout | Disconnected` arm of [`Capture::finish`] returning
+/// `Err(io::ErrorKind::TimedOut.into())`.
+#[test]
+fn a_capture_whose_pipe_outlives_its_grace_returns_what_it_kept() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+    writer.write_all(b"before").expect("written");
+    let capture = capture(reader);
+    // The reader copies on its own thread: wait until it has kept the bytes.
+    let waited = Instant::now();
+    while capture.kept.lock().expect("lock").len() < 6 {
+        assert!(
+            waited.elapsed() < Duration::from_secs(30),
+            "the reader never kept the bytes"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let kept = capture
+        .finish(Instant::now())
+        .expect("a pipe still open at the deadline is not an error");
+    assert_eq!(kept, b"before");
+    drop(writer);
+}

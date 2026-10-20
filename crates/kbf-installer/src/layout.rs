@@ -61,6 +61,8 @@ pub const PREVIOUS: &str = "previous";
 pub const NEW_SUFFIX: &str = ".new";
 /// A release being installed is made under this prefix in `releases/`, then renamed.
 pub const STAGE_PREFIX: &str = ".stage-";
+/// The helper's memory (replay floors, the last event), beside the state.
+pub const MEMORY: &str = "helper.json";
 /// The state file's name, and the copy of the last good one.
 pub const STATE_FILE: &str = "state.json";
 pub const STATE_BACKUP: &str = "state.json.bak";
