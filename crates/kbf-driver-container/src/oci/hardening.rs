@@ -397,4 +397,70 @@ mod tests {
         assert_eq!(profile_arch("aarch64"), Some("arm64"));
         assert_eq!(profile_arch("riscv64"), None);
     }
+
+    /// Whether the filter lets `personality(persona)` through on `arch`: some allow
+    /// entry for it whose every argument test holds (`SCMP_CMP_EQ`: the argument is
+    /// `value`; `SCMP_CMP_MASKED_EQ`: the argument masked by `value` is `valueTwo`).
+    fn personality_allowed(arch: &str, persona: u64) -> bool {
+        let section =
+            serde_json::to_value(seccomp(arch, &CAPABILITIES).expect("section")).expect("json");
+        section["syscalls"]
+            .as_array()
+            .expect("syscalls")
+            .iter()
+            .filter(|c| c["action"] == "SCMP_ACT_ALLOW")
+            .filter(|c| {
+                c["names"]
+                    .as_array()
+                    .is_some_and(|n| n.iter().any(|n| n == "personality"))
+            })
+            .any(|call| {
+                let args = call["args"].as_array().expect("personality has arguments");
+                args.iter().all(|arg| {
+                    assert_eq!(arg["index"], 0, "personality has one argument");
+                    let value = arg["value"].as_u64().expect("value");
+                    match arg["op"].as_str().expect("op") {
+                        "SCMP_CMP_EQ" => persona == value,
+                        "SCMP_CMP_MASKED_EQ" => {
+                            persona & value == arg["valueTwo"].as_u64().expect("valueTwo")
+                        }
+                        other => panic!("unexpected comparison {other}"),
+                    }
+                })
+            })
+    }
+
+    /// Catches `personality` being refused with `ADDR_NO_RANDOMIZE` set (what `kcov`,
+    /// `gdb`, `rr` and `valgrind` ask for, and the profile answered ENOSYS), and the
+    /// opposite mistake of opening it wider than that one flag: the values the profile
+    /// always allowed stay allowed, each with and without `ADDR_NO_RANDOMIZE`, while
+    /// `READ_IMPLIES_EXEC`, other flags and arbitrary values stay refused.
+    #[test]
+    fn personality_allows_addr_no_randomize_and_nothing_wider() {
+        const ADDR_NO_RANDOMIZE: u64 = 0x0004_0000;
+        const READ_IMPLIES_EXEC: u64 = 0x0040_0000;
+        let base = [0x0, 0x8, 0x2_0000, 0x2_0008];
+        for arch in ["amd64", "arm64"] {
+            for persona in base {
+                assert!(personality_allowed(arch, persona), "{arch} {persona:#x}");
+                let with = persona | ADDR_NO_RANDOMIZE;
+                assert!(personality_allowed(arch, with), "{arch} {with:#x}");
+            }
+            // The query.
+            assert!(personality_allowed(arch, 0xffff_ffff), "{arch} query");
+            for refused in [
+                READ_IMPLIES_EXEC,
+                READ_IMPLIES_EXEC | ADDR_NO_RANDOMIZE,
+                READ_IMPLIES_EXEC | 0x8,
+                0x0002_0000 | 0x0000_0001,
+                0x0000_0001 | ADDR_NO_RANDOMIZE,
+                0x0001_0000 | ADDR_NO_RANDOMIZE,
+                0x0200_0000,
+                0x1234_5678,
+                0xffff_fffe,
+            ] {
+                assert!(!personality_allowed(arch, refused), "{arch} {refused:#x}");
+            }
+        }
+    }
 }
