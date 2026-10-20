@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use futures::executor::block_on;
 use serde_json::{Value, json};
 
-use crate::pages::{ACTION, BUILD, BUILDS, OVERVIEW, PAGES, UPDATES};
+use crate::pages::{ACTION, BUILD, BUILDS, NODE, NODES, OVERVIEW, PAGES, UPDATES};
 use crate::read::Page;
 use crate::{Answer, CONTENT_SECURITY_POLICY, Fetched, Source, SourceError, respond};
 
@@ -277,6 +277,102 @@ pub(crate) fn updates_farm() -> Fake {
         .json(HOSTS_URL, &hosts_doc())
 }
 
+/// The markup a hostile node or build would send in every string the pages show.
+pub(crate) const HOSTILE: &str = "<script>alert(1)</script>\"'&<img src=x onerror=alert(2)>";
+
+/// A node as `GET /v1/nodes` lists it, with `lease_count` and `booked`.
+pub(crate) fn fleet_node(id: &str, placement: &str, leases: u64, cpu: u64) -> Value {
+    json!({
+        "node_id": id, "connected": true, "protocol": 3,
+        "software": {"os_name": "macOS", "os_version": "15.1", "os_build": "24B83",
+            "kernel": "", "daemon_version": "0.1.0", "xcode_builds": [], "xcodes": []},
+        "needs_attention": [],
+        "placement": {"state": placement},
+        "phase": {"state": "serving"},
+        "update": {"state": "confirmed", "up_to_date": true, "availability": "ok"},
+        "lease_count": leases,
+        "booked": {"cpu_millis": cpu, "memory_bytes": 2_147_483_648_u64, "gpus": 1, "vms": 4},
+    })
+}
+
+/// A node whose every string is `HOSTILE`, quarantined and in need of attention.
+pub(crate) fn hostile_node() -> Value {
+    let mut n = fleet_node(HOSTILE, "serving", 1, 500);
+    n["connected"] = json!(false);
+    n["protocol"] = Value::Null;
+    n["software"] = json!({"os_name": HOSTILE, "os_version": HOSTILE, "daemon_version": HOSTILE});
+    n["needs_attention"] = json!([HOSTILE]);
+    n["placement"] = json!({"state": HOSTILE});
+    n["phase"] = json!({"state": "quarantined", "reason": HOSTILE});
+    n["update"] = json!({"state": HOSTILE, "up_to_date": null, "availability": HOSTILE});
+    n
+}
+
+/// `GET /v1/nodes` of the fleet fixtures: a Mac and a hostile node.
+pub(crate) fn fleet_nodes() -> Value {
+    json!({"server": {"version": "0.1.0+bbbbbbbbbbbb", "commit": COMMIT_B},
+        "nodes": [fleet_node("mac-1", "draining", 7, 3500), hostile_node()],
+        "oldest_protocol": 3, "protocol_unknown": 1})
+}
+
+/// `GET /v1/nodes/mac-1`: the list entry and its capacity, free and leases.
+pub(crate) fn fleet_node_detail() -> Value {
+    let mut n = fleet_node("mac-1", "draining", 2, 3500);
+    n["capacity"] =
+        json!({"cpu_millis": 8000, "memory_bytes": 17_179_869_184_u64, "gpus": 2, "vms": 6});
+    n["free"] =
+        json!({"cpu_millis": 4500, "memory_bytes": 15_032_385_536_u64, "gpus": 1, "vms": 2});
+    n["leases"] = json!(["117399224320012061.42", HOSTILE]);
+    n
+}
+
+/// `GET /v1/health` of the fleet fixtures: not ready, a failing check, every count its
+/// own value, storage with an unknown under-replicated count.
+pub(crate) fn health_doc() -> Value {
+    json!({"ready": false,
+        "failing": [{"check": "store", "reason": HOSTILE}],
+        "nodes": {"total": 21, "serving": 5, "cordoned": 3, "draining": 2, "drained": 4,
+            "quarantined": 1, "disconnected": 6},
+        "queue": {"depth": 9, "oldest_age_ms": null},
+        "leases": 13,
+        "storage": {"members_active": 2, "members_total": 3, "under_replicated_blobs": null}})
+}
+
+/// A build of `GET /v1/invocations`.
+pub(crate) fn listed(id: &str) -> Value {
+    json!({"id": id, "first_seen": "2026-10-11T09:00:00.000000Z",
+        "last_seen": "2026-10-11T09:01:00.000000Z", "state": "closed", "complete": true,
+        "counts": {"ran": 11, "hits": 12, "failed": 13}, "instances": ["main", HOSTILE],
+        "href": format!("/v1/invocations/{id}")})
+}
+
+/// The Overview's build list URL.
+pub(crate) const LATEST_URL: &str = "/v1/invocations?page_size=10";
+
+/// A read API that answers the routes of the Overview, Nodes and Node pages.
+pub(crate) fn fleet_farm() -> Fake {
+    Fake::default()
+        .json("/v1/health", &health_doc())
+        .json("/v1/nodes", &fleet_nodes())
+        .json("/v1/nodes/mac-1", &fleet_node_detail())
+        .json(
+            LATEST_URL,
+            &json!({"invocations": [listed("build-1"), listed(HOSTILE)],
+                "next_page": "/v1/invocations?page_size=10&page_token=t"}),
+        )
+}
+
+/// The fake that makes `page` answer `200` on its contract paths.
+fn fake_for(page: &Page) -> Fake {
+    if page.name == UPDATES.name {
+        updates_farm()
+    } else if [OVERVIEW.name, NODES.name, NODE.name].contains(&page.name) {
+        fleet_farm()
+    } else {
+        farm()
+    }
+}
+
 pub(crate) fn render(fake: &Fake, path_and_query: &str) -> Answer {
     let (path, query) = path_and_query
         .split_once('?')
@@ -433,6 +529,8 @@ fn contract_table() -> Vec<(&'static Page, Vec<String>)> {
             ],
         ),
         (&ACTION, vec![action_page()]),
+        (&NODES, vec!["/ui/nodes".to_owned()]),
+        (&NODE, vec!["/ui/nodes/mac-1".to_owned()]),
         (&UPDATES, vec!["/ui/updates".to_owned()]),
     ]
 }
@@ -457,11 +555,7 @@ fn every_page_reads_only_the_routes_it_declares() {
     for (page, paths) in &table {
         let mut used = vec![false; page.reads.len()];
         for path in paths {
-            let fake = if page.name == UPDATES.name {
-                updates_farm()
-            } else {
-                farm()
-            };
+            let fake = fake_for(page);
             let answer = render(&fake, path);
             assert_eq!(answer.status(), 200, "{path}: {}", body(&answer));
             let seen = fake.seen();
@@ -594,7 +688,7 @@ fn routing() {
     );
     assert!(body(&css).contains("prefers-color-scheme: dark"));
 
-    let slash = render(&fake, "/ui/");
+    let slash = render(&fleet_farm(), "/ui/");
     assert_eq!(slash.status(), 200);
     assert_eq!(
         slash.headers()[0],

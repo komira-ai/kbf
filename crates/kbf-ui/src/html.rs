@@ -164,6 +164,16 @@ impl Html {
         })
     }
 
+    /// `<meta http-equiv="refresh" content="N">`: reload the page's own URL after
+    /// `seconds`. Only an integer is ever written (no `url=` part), so the browser
+    /// can only come back to the page it is on; `http-equiv` is in no attribute
+    /// allowlist, this is the one place it is written.
+    pub(crate) fn refresh(&mut self, seconds: u32) -> &mut Self {
+        self.raw("<meta http-equiv=\"refresh\" content=\"")
+            .raw(&seconds.to_string())
+            .raw("\">")
+    }
+
     /// The document written.
     pub(crate) fn finish(self) -> String {
         self.out

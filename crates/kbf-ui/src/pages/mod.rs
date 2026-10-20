@@ -11,7 +11,17 @@ use crate::{Answer, PREFIX, Source};
 
 mod action;
 mod build;
+mod nodes;
+mod overview;
+mod refresh;
 mod updates;
+
+#[cfg(test)]
+pub(crate) use nodes::{NODE, NODES};
+pub(crate) use nodes::{node, nodes};
+#[cfg(test)]
+pub(crate) use overview::OVERVIEW;
+pub(crate) use overview::overview;
 
 pub(crate) use action::action;
 #[cfg(test)]
@@ -27,13 +37,6 @@ pub(crate) use updates::updates;
 /// The Builds page's path: the build id lookup, moved here from the prefix itself.
 pub(crate) const BUILDS_PATH: &str = "/ui/builds";
 
-/// Overview: the first page. It reads no route yet; the pages that carry the farm's
-/// health and the latest builds come with their routes.
-pub(crate) const OVERVIEW: Page = Page {
-    name: "Overview",
-    reads: &[],
-};
-
 /// Builds: look a build up by id.
 pub(crate) const BUILDS: Page = Page {
     name: "Builds",
@@ -42,7 +45,7 @@ pub(crate) const BUILDS: Page = Page {
 
 /// Every page, for the contract test.
 #[cfg(test)]
-pub(crate) const PAGES: [&Page; 5] = [&OVERVIEW, &BUILDS, &BUILD, &ACTION, &UPDATES];
+pub(crate) const PAGES: [&Page; 7] = [&OVERVIEW, &BUILDS, &BUILD, &ACTION, &NODES, &NODE, &UPDATES];
 
 /// What a path segment keeps unencoded: RFC 3986's unreserved characters.
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
@@ -116,30 +119,6 @@ pub(crate) fn not_found(path: &str) -> Answer {
         });
     });
     Answer::html(404, body)
-}
-
-/// The Overview page: where the pages are. It reads no route.
-pub(crate) fn overview() -> Answer {
-    let body = layout::page(OVERVIEW.name, PREFIX, &[], |h| {
-        h.el("h1", &[], |h| {
-            h.text("Overview");
-        });
-        h.el("p", &[attr("class", "hint")], |h| {
-            h.text(
-                "A read-only view of the farm: every page shows what the farm's own API \
-                 answers, and lists the routes it read at its foot.",
-            );
-        });
-        h.el("ul", &[], |h| {
-            for (path, label) in [(BUILDS_PATH, "Builds"), (UPDATES_PATH, "Updates")] {
-                let href = Href::root_relative(path).expect("a page's path is root-relative");
-                h.el("li", &[], |h| {
-                    h.link(&href, label);
-                });
-            }
-        });
-    });
-    Answer::html(200, body)
 }
 
 /// The Builds page: a form for a build's id and, with `?id=`, that build's summary.

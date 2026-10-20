@@ -13,24 +13,6 @@ fn page(fake: &Fake, path: &str) -> (u16, String) {
     (a.status(), body(&a))
 }
 
-/// Catches: the Overview reading a route, missing a link to a page, or the lookup left
-/// at the prefix (the form of Builds moved to `/ui/builds`, so `/ui` has none).
-#[test]
-fn overview_links_the_pages_and_reads_nothing() {
-    let fake = farm();
-    for path in ["/ui", "/ui/"] {
-        let (status, html) = page(&fake, path);
-        assert_eq!(status, 200);
-        assert!(html.contains("<title>Overview - kbf</title>"), "{html}");
-        for link in ["/ui/builds", "/ui/updates"] {
-            assert!(html.contains(&format!("<a href=\"{link}\">")), "{html}");
-        }
-        assert!(!html.contains("<form"), "{html}");
-        assert!(html.contains("Nothing: this page read no route."), "{html}");
-    }
-    assert!(fake.seen().is_empty());
-}
-
 /// Catches: the lookup form missing, a read made without an id, the footer not
 /// saying nothing was read.
 #[test]

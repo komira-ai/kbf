@@ -143,6 +143,14 @@ table.rows th { color: var(--muted); font-weight: 500; }
 .problem { color: var(--fail-fg); }
 .outputs { list-style: none; padding: 0; }
 
+/* The auto-refresh choice: the current one is bracketed and bold, not only coloured. */
+.refresh { color: var(--muted); }
+.refresh .current { font-weight: 600; color: var(--fg); }
+.refresh .current::before { content: "["; }
+.refresh .current::after { content: "]"; }
+
+table.rows td ul { margin: 0; padding-left: var(--space-3); }
+
 footer.reads { color: var(--muted); border-top: 1px solid var(--line); margin-top: var(--space-4); }
 footer.reads h2 { font-size: 0.95rem; }
 footer.reads ul { padding-left: var(--space-3); }
