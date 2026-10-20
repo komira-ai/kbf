@@ -39,6 +39,16 @@ fn binary(installed: &Path) -> RunningBinary {
     RunningBinary::from_paths(&exe, installed).expect("identity")
 }
 
+/// The root half's `status.json` as an idle host with `A` installed writes it.
+fn write_idle_status(cfg: &HandoverConfig) {
+    fs::create_dir(cfg.status_file.parent().expect("dir")).expect("update dir");
+    fs::write(
+        &cfg.status_file,
+        format!(r#"{{"installed_commit":"{A}","state":"idle"}}"#),
+    )
+    .expect("status.json");
+}
+
 /// The ids of the records in `dir`, in order.
 fn order_ids(dir: &Path) -> Vec<u64> {
     let mut ids: Vec<u64> = fs::read_dir(dir)
@@ -87,12 +97,7 @@ fn the_seams_start_with_no_status_file_and_the_api_has_no_update() {
 #[test]
 fn each_seam_is_bound_to_its_own_place() {
     let cfg = config("bound");
-    fs::create_dir(cfg.status_file.parent().expect("dir")).expect("update dir");
-    fs::write(
-        &cfg.status_file,
-        format!(r#"{{"installed_commit":"{A}","state":"idle"}}"#),
-    )
-    .expect("status.json");
+    write_idle_status(&cfg);
     Idempotency::open(&cfg.state_dir)
         .insert("saved-before", &c(B), false, false)
         .expect("a saved request");
@@ -195,7 +200,37 @@ fn spool_of(cfg: &HandoverConfig) -> OrderSpool {
 fn a_post_is_refused_and_nothing_reaches_the_spool_or_the_request_map() {
     let cfg = config("post");
     let mut core = Core::new(parts(&cfg).expect("the seams"));
-    let refused = match core.post(request("r1")) {
+    assert_unwired_refusal(&mut core, "r1");
+    assert_eq!(order_ids(&cfg.orders_dir), Vec::<u64>::new());
+    assert!(Idempotency::open(&cfg.state_dir).get("r1").is_none());
+    assert!(matches!(core.status(), Reply::Status(_)));
+    match core.abort() {
+        Err(Fault::Api(e)) => assert_eq!(e.code, "no_update_open"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Catches a refusal that holds only because the root half has not written a `status.json`
+/// (the `POST` of the test above would fail with `status_unreadable` without the unwired
+/// supervisor, and write nothing either way): with a status of an idle host and a commit other
+/// than the installed one, nothing but the supervisor stands in the way, and the `POST` is
+/// still 503 `handover_unavailable`, `orders/` stays empty, no request id is saved, and a
+/// second `POST` of the same id is refused the same way (it is not the replay of an accepted
+/// update).
+#[test]
+fn a_post_is_refused_by_the_unwired_supervisor_when_the_root_half_is_idle() {
+    let cfg = config("post-idle");
+    write_idle_status(&cfg);
+    let mut core = Core::new(parts(&cfg).expect("the seams"));
+    assert_unwired_refusal(&mut core, "r1");
+    assert_unwired_refusal(&mut core, "r1");
+    assert_eq!(order_ids(&cfg.orders_dir), Vec::<u64>::new());
+    assert!(Idempotency::open(&cfg.state_dir).get("r1").is_none());
+}
+
+/// The `POST` of `request_id` is refused as an API with no driver refuses it.
+fn assert_unwired_refusal(core: &mut Core, request_id: &str) {
+    let refused = match core.post(request(request_id)) {
         Err(Fault::Api(e)) => e,
         other => panic!("not refused: {other:?}"),
     };
@@ -207,13 +242,6 @@ fn a_post_is_refused_and_nothing_reaches_the_spool_or_the_request_map() {
             "handover driver not wired"
         )
     );
-    assert_eq!(order_ids(&cfg.orders_dir), Vec::<u64>::new());
-    assert!(Idempotency::open(&cfg.state_dir).get("r1").is_none());
-    assert!(matches!(core.status(), Reply::Status(_)));
-    match core.abort() {
-        Err(Fault::Api(e)) => assert_eq!(e.code, "no_update_open"),
-        other => panic!("{other:?}"),
-    }
 }
 
 /// Catches a supervisor that claims an update or a start it cannot do: the unwired one has

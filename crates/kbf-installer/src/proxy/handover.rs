@@ -24,6 +24,24 @@
 //! is refused with 503 `handover_unavailable` before its request id is saved or an order
 //! written ([`Supervisor::start_blocked`]), so the root half does not fetch and stage a
 //! release that nothing can take over. Nothing here changes what the proxy serves.
+//!
+//! **Fail fast, on purpose.** An order spool that cannot be opened ends the start
+//! ([`HandoverError::Orders`]), and with it the data plane: the verb exits 2, which the unit
+//! does not restart. While no driver is wired the spool is not even written to, so this is a
+//! choice and not a need: a host whose `orders/` the service user cannot use is a host where
+//! the update API could never work, and a proxy that serves while its update route is dead
+//! hides that until the first update. The alternative is to serve and answer 503 on the update
+//! route only; take it by returning a `Parts` over a spool that refuses, not by skipping the
+//! error here.
+//!
+//! **What the swap adapter's PR changes here.**
+//! - The adapter needs the proxy's gate, which the verb builds after it has bound its
+//!   listeners, and [`parts`] is called before the bind (so that a spool error is a usage error
+//!   before anything is bound). The adapter's PR builds the parts after the gate exists, or
+//!   passes the gate in [`HandoverConfig`]. `Core::new` asks the supervisor for its status
+//!   (the resume of an update in flight), so the supervisor must exist before the `Core`.
+//! - [`HandoverConfig`] holds only what the seams above read. The adapter's PR adds what it
+//!   needs besides: the slot addresses, the proxy secret and the token path.
 
 use std::io;
 use std::path::PathBuf;
@@ -59,7 +77,8 @@ pub struct HandoverConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum HandoverError {
     /// `orders/` or the counter cannot be opened: a directory the service user cannot write,
-    /// or a counter another build wrote. The operator's to fix.
+    /// or a counter another build wrote. The operator's to fix; it ends the start (see the
+    /// module doc, "Fail fast").
     #[error("the order spool at {}: {source}", dir.display())]
     Orders { dir: PathBuf, source: SpoolError },
     /// The running program cannot be identified, so `restart_pending` has no answer.
