@@ -244,4 +244,28 @@ mod tests {
         assert_eq!(Slot::parse("b"), Some(Slot::B));
         assert_eq!(Slot::parse("c"), None);
     }
+
+    /// Proves the observer refuses an address that is not loopback (the token goes in the
+    /// clear) and accepts both loopback spellings, an IPv4-mapped IPv6 loopback included.
+    /// Catches the check dropped, or inverted.
+    ///
+    /// Mutants planted: the loopback test removed; `to_canonical` dropped (the mapped
+    /// spelling is then refused).
+    #[test]
+    fn only_a_loopback_address_is_observed() {
+        let t = Duration::from_secs(1);
+        for addr in ["203.0.113.9:80", "[2001:db8::1]:80", "0.0.0.0:80"] {
+            let e = Http::new(addr.parse().expect("addr"), "tok".to_owned(), t)
+                .err()
+                .expect("refused");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{addr}");
+            assert!(e.to_string().contains("must be loopback"), "{addr}: {e}");
+        }
+        for addr in ["127.0.0.1:80", "[::1]:80", "[::ffff:127.0.0.1]:80"] {
+            assert!(
+                Http::new(addr.parse().expect("addr"), "tok".to_owned(), t).is_ok(),
+                "{addr}"
+            );
+        }
+    }
 }

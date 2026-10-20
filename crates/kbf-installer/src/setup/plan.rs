@@ -150,6 +150,9 @@ pub struct Ctx {
     pub root: Owner,
     /// The user the mode's unit runs as (Linux); a Mac runs the daemon as root.
     pub service: Option<RunUser>,
+    /// The migration's journal says a Mac the kit installed was adopted (kit, phase done):
+    /// its `kbf.toml` is the kit's and `setup` only adds to it.
+    pub kit_adopted: bool,
 }
 
 impl Ctx {
@@ -182,6 +185,7 @@ pub fn context(os: &dyn Os, mode: Mode) -> Result<Ctx, SetupError> {
         layout: Layout::new(kbf_host::Root::new("/")?, platform),
         root: os.root_owner(),
         service,
+        kit_adopted: false,
     })
 }
 
@@ -280,6 +284,89 @@ fn free_mac_id(users: &str, groups: &str) -> Result<u32, SetupError> {
         .ok_or(SetupError::NoFreeId)
 }
 
+/// What an existing fetch account must be, for the confinement of the fetch child to mean
+/// what the design says (`kbf-installer.md`: the child runs as `kbf-fetch`, `_kbf-fetch` on a
+/// Mac, with no fallback to another user): a system account (not root, below the first
+/// ordinary id), no login shell, no home. These are the values `setup` creates it with and
+/// the package's sysusers entry makes.
+struct FetchShape {
+    below: u32,
+    home: &'static str,
+    shells: &'static [&'static str],
+}
+
+fn fetch_shape(platform: Platform) -> FetchShape {
+    match platform {
+        Platform::Linux => FetchShape {
+            below: 1000,
+            home: "/nonexistent",
+            shells: &["/usr/sbin/nologin", "/sbin/nologin"],
+        },
+        Platform::MacOs => FetchShape {
+            below: 500,
+            home: "/var/empty",
+            shells: &["/usr/bin/false"],
+        },
+    }
+}
+
+/// Refuses an existing fetch account that is not the shape `setup` makes: the reason names
+/// the account and the field. Nothing is changed on the host, since a wrong account may be
+/// someone's, and the operator decides what to do with it.
+fn check_fetch_shape(os: &dyn Os, user: &RunUser) -> Result<(), SetupError> {
+    let want = fetch_shape(os.platform());
+    let shell = os.login_shell(&user.name)?;
+    let mut wrong = Vec::new();
+    if user.uid == 0 || user.uid >= want.below {
+        wrong.push(format!(
+            "uid {} (a system account: 1 to {})",
+            user.uid,
+            want.below - 1
+        ));
+    }
+    if user.gid == 0 || user.gid >= want.below {
+        wrong.push(format!(
+            "gid {} (a system group: 1 to {})",
+            user.gid,
+            want.below - 1
+        ));
+    }
+    if user.home != want.home {
+        wrong.push(format!("home {:?} (want {:?})", user.home, want.home));
+    }
+    if !want.shells.contains(&shell.as_str()) {
+        wrong.push(format!("shell {shell:?} (want {:?})", want.shells[0]));
+    }
+    if wrong.is_empty() {
+        return Ok(());
+    }
+    Err(SetupError::NeedsOperator(format!(
+        "the account {} exists and is not the fetch account setup makes: {}; the fetch child runs as it with no fallback to another user, so fix or remove the account, then run again",
+        user.name,
+        wrong.join(", ")
+    )))
+}
+
+/// The fetch account is there with the right shape, or its creation is a step of `p`. One
+/// function for `setup` and for `migrate` (which needs the account for the version probe
+/// before `setup` can have run), so there is one definition of the account.
+pub fn ensure_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os) -> Result<(), SetupError> {
+    let name = fetch_user(os.platform());
+    match os.user(name)? {
+        Some(user) => check_fetch_shape(os, &user),
+        None => create_fetch_user(p, os, name),
+    }
+}
+
+/// The plan that makes the fetch account, empty when it is there already; reads the host,
+/// changes nothing.
+pub fn fetch_user_plan(os: &dyn Os, exec: &dyn Exec) -> Result<Plan, SetupError> {
+    let view = View(exec);
+    let mut p = Planner::new(&view);
+    ensure_fetch_user(&mut p, os)?;
+    Ok(p.finish())
+}
+
 fn create_fetch_user(p: &mut Pl<'_, '_>, os: &dyn Os, name: &str) -> Result<(), SetupError> {
     match os.platform() {
         Platform::Linux => p.run(
@@ -365,10 +452,7 @@ pub fn before_release(
     let view = View(exec);
     let mut p = Planner::new(&view);
 
-    let fetch = fetch_user(platform);
-    if os.user(fetch)?.is_none() {
-        create_fetch_user(&mut p, os, fetch)?;
-    }
+    ensure_fetch_user(&mut p, os)?;
     if let (Some(user), true) = (&ctx.service, runs_actions(v.mode)) {
         add_subids(&mut p, user, "subuid", &os.subuid()?)?;
         add_subids(&mut p, user, "subgid", &os.subgid()?)?;
@@ -514,7 +598,8 @@ pub fn after_release(
         token_file: v.token_file.as_ref().map(|_| paths::enroll_token(platform)),
         api_token_file: serves_api(v.mode).then_some(paths::api_token(platform)),
         state_store: v.database.as_deref(),
-        update: takes_orders(v.mode).then_some(UpdateDirs {
+        // A Mac's keys are kbf-mac-provision's: checked below, never written.
+        update: (takes_orders(v.mode) && platform != Platform::MacOs).then_some(UpdateDirs {
             update_dir: &update_dir,
             orders_dir: &orders_dir,
         }),
@@ -529,7 +614,21 @@ pub fn after_release(
         }
         None => None,
     };
-    match kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path) {
+    if platform == Platform::MacOs && takes_orders(v.mode) {
+        // No file: provision has not run. A file that is not TOML is `decide`'s to name.
+        let table = current
+            .as_deref()
+            .map_or_else(|| Some(toml::Table::new()), |t| t.parse().ok());
+        if let Some(table) = table {
+            kbf_toml::check_provisioned(&table, &update_dir, &orders_dir)
+                .map_err(SetupError::NeedsOperator)?;
+        }
+    }
+    let decision = match (&current, ctx.kit_adopted) {
+        (Some(text), true) => kbf_toml::decide_adopted(text, &ours, kbf_toml_path),
+        _ => kbf_toml::decide(current.as_deref(), &ours, kbf_toml_path),
+    };
+    match decision {
         Decision::Write(text) => {
             let existed = current.is_some();
             // root:<service group> 0640: the service reads it, nobody else; only root writes.

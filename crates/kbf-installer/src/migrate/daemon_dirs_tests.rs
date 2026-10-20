@@ -4,6 +4,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 
 use super::*;
+use crate::exit::Exit;
 use crate::migrate::rig::*;
 
 const UPDATE: &str = "/var/lib/kbf-installer";
@@ -373,27 +374,134 @@ fn a_rollback_puts_the_original_back_unless_the_operator_changed_it() {
     );
 }
 
-/// Catches the Mac paths: a host the Mac kit installed (mode `daemon`) gets the keys with the
-/// layout's Mac directories (`/var/db/kbf-installer`, as the Mac provisioner writes), and its
-/// spool is made for the file's owner, root on a host, as the Mac daemon is root's.
+/// Catches migrate writing a Mac's `kbf.toml` (G9: `kbf-mac-provision` is its one writer), on a
+/// kit Mac and on a Mac the kit never touched, and a check that lets a wrong file pass. The
+/// file with `update-dir` (and `orders-dir` absent or the layout's) is left byte for byte, no
+/// spool is made and no original is kept; a file without `update-dir`, or with a key that is not
+/// the layout's or not text, is refused (exit 5) naming the key and `kbf-mac-provision`, and
+/// no path, in a dry run and in an apply, before anything is written. A Linux node still gets
+/// both keys (`an_adopted_node_gets_both_keys_in_its_daemon_table_and_nothing_else_moves`).
 ///
-/// Not run as a mutant: the Linux paths written on a Mac (the layout supplies both).
+/// Mutants seen red: a Mac written like a Linux host; the check dropped; `orders-dir` required;
+/// a non-text `orders-dir` let through.
 #[test]
-fn a_kit_mac_gets_the_state_directory_of_a_mac() {
+fn a_mac_kbf_toml_is_checked_and_never_written() {
     use crate::migrate::kit_host::{Form, KBF_TOML_PATH, at};
-    let mut rig = Rig::kit("keys-mac", crate::layout::Platform::MacOs, Form::New);
-    fs::create_dir_all(rig.new_state_dir().join("migration-units")).expect("backup dir");
-    let (outcome, _) = run(&mut rig, Mode::Apply);
-    assert_eq!(outcome, Outcome::Added);
-    let now = fs::read_to_string(at(&rig.host.root, KBF_TOML_PATH)).expect("kbf.toml");
-    assert_eq!(
-        keys(&now),
-        (
-            Some("/var/db/kbf-installer".to_owned()),
-            Some("/var/db/kbf-installer/orders".to_owned())
+    let provisioned = |orders: &str| {
+        format!(
+            "mode = \"daemon\"\n\n[daemon]\nupdate-dir = \"/var/db/kbf-installer\"\n{orders}driver = [\"native\"]\n"
         )
+    };
+    for (name, text) in [
+        ("absent", provisioned("")),
+        (
+            "equal",
+            provisioned("orders-dir = \"/var/db/kbf-installer/orders\"\n"),
+        ),
+    ] {
+        for mode in [Mode::DryRun, Mode::Apply] {
+            // A kit Mac, whose file is the kit fixture.
+            let mut rig = Rig::kit(
+                &format!("keys-mac-{name}-{mode:?}"),
+                crate::layout::Platform::MacOs,
+                Form::New,
+            );
+            fs::create_dir_all(rig.new_state_dir().join("migration-units")).expect("dir");
+            let path = at(&rig.host.root, KBF_TOML_PATH);
+            let before = fs::read(&path).expect("kbf.toml");
+            let (outcome, report) = run(&mut rig, mode);
+            assert_eq!(outcome, Outcome::Provisioned, "{name} {mode:?}");
+            assert!(
+                report
+                    .to_string()
+                    .contains("as kbf-mac-provision renders them")
+            );
+            assert_eq!(fs::read(&path).expect("kbf.toml"), before);
+            assert!(!rig.at("var/db/kbf-installer/orders").exists());
+            assert!(
+                !rig.new_state_dir()
+                    .join("migration-units/kbf.toml")
+                    .exists()
+            );
+
+            // A Mac with no kit marker: any Mac is provisioned.
+            let mut rig = Rig::mac(&format!("keys-mac-plain-{name}-{mode:?}"));
+            let plain = at(&rig.host.root, KBF_TOML_PATH);
+            put(&plain, &text, 0o640);
+            fs::create_dir_all(rig.new_state_dir().join("migration-units")).expect("dir");
+            let (outcome, _) = run(&mut rig, mode);
+            assert_eq!(outcome, Outcome::Provisioned);
+            assert_eq!(fs::read_to_string(&plain).expect("kbf.toml"), text);
+            assert!(!rig.at("var/db/kbf-installer/orders").exists());
+        }
+    }
+    for (daemon, why) in [
+        ("", "has no [daemon] update-dir"),
+        (
+            "update-dir = \"/elsewhere\"\n",
+            "[daemon] update-dir is not the installer's directory",
+        ),
+        (
+            "update-dir = \"/var/db/kbf-installer\"\norders-dir = \"/elsewhere\"\n",
+            "[daemon] orders-dir is not the installer's directory",
+        ),
+        ("update-dir = 7\n", "[daemon] update-dir is not text"),
+        (
+            "update-dir = \"/var/db/kbf-installer\"\norders-dir = 7\n",
+            "[daemon] orders-dir is not text",
+        ),
+    ] {
+        for mode in [Mode::DryRun, Mode::Apply] {
+            let mut rig = Rig::mac("keys-mac-refused");
+            let plain = at(&rig.host.root, KBF_TOML_PATH);
+            let text = format!("mode = \"daemon\"\n\n[daemon]\n{daemon}driver = [\"native\"]\n");
+            put(&plain, &text, 0o640);
+            let m = rig.migration();
+            let mut report = Report::new(super::super::Outcome::Migrated);
+            let err = add(&m, &mut rig.host, mode, &mut report).expect_err(why);
+            assert_eq!(err.exit(), Exit::NeedsOperator, "{why}");
+            let said = err.to_string();
+            assert!(
+                said.contains(why) && said.contains("kbf-mac-provision renders it"),
+                "{said}"
+            );
+            assert!(
+                !said.contains("/var/db") && !said.contains("/elsewhere"),
+                "{said}"
+            );
+            assert_eq!(
+                fs::read_to_string(&plain).expect("kbf.toml"),
+                text,
+                "{why}: nothing written"
+            );
+        }
+    }
+}
+
+/// Catches a Mac `migrate --apply` that refuses only after it has stopped the node's job and
+/// written the new tree: the refusal comes first, so the host is as it was.
+///
+/// Mutant seen red: the preflight call dropped (the refusal then comes after the first write).
+#[test]
+fn a_mac_apply_with_a_wrong_kbf_toml_changes_nothing() {
+    use crate::migrate::kit_host::{Form, KBF_TOML_PATH, at};
+    let mut rig = Rig::kit(
+        "keys-mac-preflight",
+        crate::layout::Platform::MacOs,
+        Form::New,
     );
-    assert!(rig.at("var/db/kbf-installer/orders").is_dir());
+    let path = at(&rig.host.root, KBF_TOML_PATH);
+    let text = fs::read_to_string(&path)
+        .expect("kbf.toml")
+        .replace("/var/db/kbf-installer", "/elsewhere");
+    fs::write(&path, &text).expect("plant");
+    let (before, events) = (rig.snapshot("usr/local"), rig.events.borrow().len());
+    let never = FnVerifier(Box::new(|_, _| Err("no pipeline here".to_owned())));
+    let err = run_migrate(&mut rig, &never, Mode::Apply).expect_err("refused");
+    assert_eq!(err.exit(), Exit::NeedsOperator);
+    assert_eq!(rig.snapshot("usr/local"), before);
+    assert_eq!(rig.events.borrow().len(), events, "no job touched");
+    assert!(!rig.new_state_dir().exists() || !rig.new_state_dir().join("migration.json").exists());
 }
 
 /// A host that fails the `n`th look or the `n`th step it is asked for, and does the rest on
@@ -617,4 +725,52 @@ fn a_header_on_the_last_line_and_an_array_of_tables() {
     put(&kbf_toml(&rig), "x", 0o640);
     fs::write(kbf_toml(&rig), [0xff, 0xfe]).expect("bytes");
     assert!(matches!(run(&mut rig, Mode::Apply).0, Outcome::Left(_)));
+}
+
+/// Catches a rollback that overwrites a file the operator changed after the migration, in the
+/// two shapes the byte comparison alone does not separate: a changed file whose kept original
+/// already had the keys (nothing was added, so the file is no "original plus the keys"), and a
+/// migrated file in which an operator then pointed one of the two keys elsewhere (a table that
+/// is no longer the original plus OUR keys). Both are left as they are, with the warning, and
+/// the kept original stays for the operator.
+///
+/// Mutants seen red: `added.is_empty() ||` removed from the restore (the first case is then
+/// overwritten with the kept copy); the `wanted` check of `only_the_keys_added` removed (the
+/// second case is then overwritten with the original, losing the operator's directory).
+#[test]
+fn a_rollback_leaves_a_file_the_operator_changed_in_either_shape() {
+    let kept = |rig: &Rig| rig.new_state_dir().join("migration-units/kbf.toml");
+    let migrated = insert(
+        NODE,
+        &[
+            ("update-dir", UPDATE.to_owned()),
+            ("orders-dir", ORDERS.to_owned()),
+        ],
+    );
+
+    // The original had both keys already; the operator then added a table.
+    let mut rig = Rig::linux("restore-edited-had-keys");
+    put_toml(&rig, &migrated);
+    put(&kept(&rig), &migrated, 0o600);
+    let edited = format!("{migrated}\n[extra]\nx = 1\n");
+    fs::write(kbf_toml(&rig), &edited).expect("edit");
+    let report = restore_flaky(&mut rig, None, None).expect("restore");
+    assert_eq!(read(&rig), edited);
+    assert_eq!(fs::read_to_string(kept(&rig)).expect("kept"), migrated);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(report.warnings[0].contains("left as it is"));
+    assert!(report.lines.is_empty(), "{:?}", report.lines);
+
+    // The original had neither; the operator changed what the migration wrote.
+    let mut rig = Rig::linux("restore-edited-other-dir");
+    put_toml(&rig, &migrated);
+    put(&kept(&rig), NODE, 0o600);
+    let moved = migrated.replace(UPDATE, "/srv/their-own");
+    assert_ne!(moved, migrated);
+    fs::write(kbf_toml(&rig), &moved).expect("edit");
+    let report = restore_flaky(&mut rig, None, None).expect("restore");
+    assert_eq!(read(&rig), moved);
+    assert_eq!(fs::read_to_string(kept(&rig)).expect("kept"), NODE);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(report.lines.is_empty(), "{:?}", report.lines);
 }
