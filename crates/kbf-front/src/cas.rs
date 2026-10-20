@@ -251,6 +251,10 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
                 }
             };
         let mut responses = Vec::with_capacity(request.digests.len());
+        // The copies the response carries, counted (`kbf_bytes_in_flight`) until the
+        // handler returns them; the blobs they were copied from (`read`) are counted
+        // by the cache until then too.
+        let mut copies = kbf_storage::in_flight::hold(0);
         for (asked, parsed) in request.digests.iter().zip(parsed) {
             // `read` answers every digest that parsed, unless the index holds two
             // digests at one location (corrupt): the one left out fails alone.
@@ -262,7 +266,10 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
                 })
             });
             let (data, status) = match answer {
-                Ok(bytes) => (bytes.to_vec(), wire::rpc_ok()),
+                Ok(bytes) => {
+                    copies.add(bytes.len() as u64);
+                    (bytes.to_vec(), wire::rpc_ok())
+                }
                 Err(e) => (Vec::new(), wire::rpc_status(&e)),
             };
             responses.push(batch_read_blobs_response::Response {
@@ -277,7 +284,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
             .call(&metadata, &caller, &request.instance_name, &|| {
                 CallKind::Downloaded(downloaded as u64)
             });
-        Ok(Response::new(BatchReadBlobsResponse { responses }))
+        let response = Response::new(BatchReadBlobsResponse { responses });
+        drop(copies);
+        Ok(response)
     }
 
     type GetTreeStream = Stream<GetTreeResponse>;

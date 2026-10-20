@@ -24,8 +24,9 @@
 //! object store's and the write tier's internals (among them the copies of the frontend's
 //! write pool, `cache/pool.rs`, and of its streamed store, `cache/stream_store.rs`: a few
 //! MiB per write that the large-`Write` bound of a few messages does not include, so it
-//! understates resident memory by that much), and the copies tonic makes encoding or
-//! decoding a message. **The daemon seam:** the daemon holds bytes through the same
+//! understates resident memory by that much), the response copies of a Segments
+//! `ReadRange` (one range, returned as the handler's value) and of `GetTree` (a page of
+//! directories), and the copies tonic makes encoding or decoding a message. **The daemon seam:** the daemon holds bytes through the same
 //! [`process`] gauge ([`counted`], [`Held`]) and has only to [`render`] it on a
 //! `--metrics-listen` listener, which it does not have yet.
 

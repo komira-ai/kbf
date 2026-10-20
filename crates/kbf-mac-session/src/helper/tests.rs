@@ -17,10 +17,12 @@ fn my_gid() -> u32 {
     rustix::process::getgid().as_raw()
 }
 
+/// The scratch directory is shared with a rig started over it again (a reboot), and
+/// declared last so it is removed after the helper that uses it.
 pub(super) struct Rig {
     pub(super) host: FakeHost,
     pub(super) helper: Helper,
-    pub(super) dir: PathBuf,
+    pub(super) dir: std::sync::Arc<kbf_testkit::dir::TestDir>,
 }
 
 /// A helper whose lease range starts at the test's own uid (so a lease created first
@@ -33,9 +35,13 @@ pub(super) fn rig(name: &str, len: u32) -> Rig {
     rig
 }
 
-pub(super) fn rig_with(name: &str, range: UidRange, dir: Option<PathBuf>) -> Rig {
+pub(super) fn rig_with(
+    name: &str,
+    range: UidRange,
+    dir: Option<std::sync::Arc<kbf_testkit::dir::TestDir>>,
+) -> Rig {
     trace();
-    let dir = dir.unwrap_or_else(|| scratch(&format!("helper-{name}")));
+    let dir = dir.unwrap_or_else(|| std::sync::Arc::new(scratch(&format!("helper-{name}"))));
     let homes = dir.join("Users");
     let _ = std::fs::create_dir(&homes);
     let host = FakeHost::default();
@@ -298,7 +304,7 @@ fn only_live_leases_in_range_are_acted_on() {
             "6.1",
             vec!["/usr/bin/true".to_owned()],
             empty(),
-            fds(&rig.dir),
+            fds(rig.dir.path()),
         )
         .unwrap_err();
     assert!(error.contains("was deleted"), "{error}");
@@ -337,7 +343,7 @@ fn run_starts_the_process_as_the_lease_user_in_the_lease_directory() {
     let rig = rig("run", 2);
     rig.helper.user_create("7.1", None).unwrap();
     let (mut out, write) = std::io::pipe().unwrap();
-    let mut fds = fds(&rig.dir);
+    let mut fds = fds(rig.dir.path());
     fds[1] = write.into();
     let argv = act_argv("id ; pwd ; env HOME");
     let mut child = rig.helper.run("7.1", argv, Vec::new(), fds).unwrap();
@@ -347,7 +353,7 @@ fn run_starts_the_process_as_the_lease_user_in_the_lease_directory() {
     let want = format!(
         "{}\n{}\n{}\n",
         me(),
-        std::fs::canonicalize(&rig.dir).unwrap().display(),
+        std::fs::canonicalize(rig.dir.path()).unwrap().display(),
         rig.dir.join("Users/kbf-lease-7-1").display()
     );
     assert_eq!(text, want);
@@ -358,7 +364,7 @@ fn run_refuses_a_bad_request() {
     let rig = rig("run-bad", 2);
     rig.helper.user_create("8.1", None).unwrap();
     let true_ = || vec!["/usr/bin/true".to_owned()];
-    let three = fds(&rig.dir).into_iter().take(3).collect();
+    let three = fds(rig.dir.path()).into_iter().take(3).collect();
     let error = rig
         .helper
         .run("8.1", true_(), Vec::new(), three)
@@ -366,18 +372,18 @@ fn run_refuses_a_bad_request() {
     assert!(error.contains("got 3 descriptors"), "{error}");
     let error = rig
         .helper
-        .run("8.1", Vec::new(), Vec::new(), fds(&rig.dir))
+        .run("8.1", Vec::new(), Vec::new(), fds(rig.dir.path()))
         .unwrap_err();
     assert!(error.contains("empty"), "{error}");
     let error = rig
         .helper
-        .run("8.x", true_(), Vec::new(), fds(&rig.dir))
+        .run("8.x", true_(), Vec::new(), fds(rig.dir.path()))
         .unwrap_err();
     assert!(error.contains("not <term>.<seq>"), "{error}");
     let missing = vec!["/no/such/program".to_owned()];
     let error = rig
         .helper
-        .run("8.1", missing, Vec::new(), fds(&rig.dir))
+        .run("8.1", missing, Vec::new(), fds(rig.dir.path()))
         .unwrap_err();
     assert!(error.starts_with("starting /no/such/program"), "{error}");
 }
@@ -553,7 +559,7 @@ fn requests_are_routed_and_stray_descriptors_refused() {
         lease: lease(),
         grant: None,
     };
-    let stray = reply(rig.helper.handle(create.clone(), fds(&rig.dir)));
+    let stray = reply(rig.helper.handle(create.clone(), fds(rig.dir.path())));
     assert_eq!(
         stray,
         Reply::Refused {
@@ -570,7 +576,7 @@ fn requests_are_routed_and_stray_descriptors_refused() {
         env: Vec::new(),
         session: crate::proto::Session::Background,
     };
-    let Outcome::Running(mut child) = rig.helper.handle(run.clone(), fds(&rig.dir)) else {
+    let Outcome::Running(mut child) = rig.helper.handle(run.clone(), fds(rig.dir.path())) else {
         panic!("run did not start");
     };
     assert!(child.wait().unwrap().success());
@@ -743,7 +749,13 @@ fn a_gui_run_waits_for_the_lease_user_s_gui_domain() {
     let true_ = || vec!["/usr/bin/true".to_owned()];
     let gui = |lease: &str| {
         rig.helper
-            .run_in(lease, true_(), Vec::new(), fds(&rig.dir), Session::Gui)
+            .run_in(
+                lease,
+                true_(),
+                Vec::new(),
+                fds(rig.dir.path()),
+                Session::Gui,
+            )
             .unwrap_err()
     };
     let not_held = "does not hold the GUI session; session-login first";

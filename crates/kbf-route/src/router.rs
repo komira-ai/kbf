@@ -143,6 +143,31 @@ impl Router {
         })
     }
 
+    /// A number that changes whenever what a "this blob is held" answer rests on may have
+    /// changed: the map's generation, and the id and boot of every member in it. A caller
+    /// that remembers an answer beside this number may trust it only while the number is
+    /// the same: a new generation moves blobs between owners, and a restarted owner (a
+    /// new boot) may have lost what it held only in RAM.
+    ///
+    /// `None` when no map has arrived, or when any member's boot is 0 (unknown: a restart
+    /// of that member could not be told), so that nothing is remembered.
+    #[must_use]
+    pub fn epoch(&self) -> Option<u64> {
+        use std::hash::{Hash as _, Hasher as _};
+        let view = self.view().ok()?;
+        let members = view.map.members();
+        if members.iter().any(|m| m.boot == 0) {
+            return None;
+        }
+        // The default hasher has fixed keys: equal inputs give equal numbers.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        view.map.generation().hash(&mut hasher);
+        for member in members {
+            (member.id, member.boot).hash(&mut hasher);
+        }
+        Some(hasher.finish())
+    }
+
     /// How many blobs are being read for waiting callers right now: for a gauge, and for
     /// tests.
     #[must_use]

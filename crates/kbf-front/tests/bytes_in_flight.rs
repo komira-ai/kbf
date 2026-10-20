@@ -14,6 +14,7 @@ use common::{Blob, Farm, pseudo_random};
 use futures::channel::mpsc;
 use kbf_front::{MAX_UNSTAGED_BLOB_BYTES, READ_WINDOW_BYTES};
 use kbf_proto::google::bytestream::{ReadRequest, WriteRequest};
+use kbf_proto::reapi::{BatchReadBlobsRequest, Digest as Wire};
 use kbf_storage::in_flight::process;
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -258,6 +259,56 @@ async fn a_batch_update_is_counted_and_given_back() {
     assert!(peak >= 3 * MIB as u64, "the batch is held: {peak}");
     assert!(peak <= 6 * MIB as u64, "held once: {peak}");
     given_back("after the batch").await;
+}
+
+/// Catches: a BatchReadBlobs of blobs that lie back to back in one segment not counted: the
+/// one range GET that serves the run (`Cache::read_joined`, every blob a slice of it) and
+/// the copies the response carries (`CasService::batch_read_blobs`). At the point the
+/// handler has built its answer both are alive, so the peak is the batch twice over; the
+/// run alone, or the copies alone, is the batch once. All of it is given back.
+///
+/// Mutants: `read_joined` returning the GET's bytes uncounted (peak one batch); the
+/// response copies not held (peak one batch).
+#[tokio::test]
+async fn a_batch_read_counts_the_joined_get_and_the_response_copies() {
+    let _turn = turn().await;
+    let farm = Farm::start().await;
+    // Odd seeds: the generator makes `seed | 1`, so 100 and 101 would be one blob.
+    let blobs: Vec<Blob> = (0..12)
+        .map(|i| Blob::new(pseudo_random(MIB, 101 + 2 * i)))
+        .collect();
+    farm.upload(&blobs.iter().collect::<Vec<_>>()).await;
+    given_back("after the upload").await;
+    process().reset_peak();
+    let digests = blobs
+        .iter()
+        .map(|b| Wire {
+            hash: b.digest.hash_hex(),
+            size_bytes: b.digest.size_bytes as i64,
+        })
+        .collect();
+
+    let answer = farm
+        .cas()
+        .batch_read_blobs(BatchReadBlobsRequest {
+            instance_name: "main".into(),
+            digests,
+            ..Default::default()
+        })
+        .await
+        .expect("BatchReadBlobs")
+        .into_inner();
+
+    let batch = (12 * MIB) as u64;
+    let got: usize = answer.responses.iter().map(|r| r.data.len()).sum();
+    assert_eq!(got as u64, batch, "every blob answered");
+    let peak = process().peak();
+    assert!(peak >= 2 * batch, "the GET and the copies are held: {peak}");
+    assert!(
+        peak <= 2 * batch + READ_WINDOW_BYTES,
+        "held once each: {peak}"
+    );
+    given_back("after the batch read").await;
 }
 
 /// Catches: the gauge missing from `/metrics` (a renamed or dropped family), or exporting

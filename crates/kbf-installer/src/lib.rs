@@ -67,6 +67,7 @@ pub mod golden;
 pub mod helper;
 pub mod installer_toml;
 pub mod layout;
+pub mod migrate;
 pub mod proxy;
 pub mod proxy_verb;
 pub mod record;

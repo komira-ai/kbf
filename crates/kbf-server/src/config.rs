@@ -290,6 +290,14 @@ pub struct Args {
     /// refused FAILED_PRECONDITION. The wait restarts whenever one can.
     #[arg(long, default_value_t = kbf_sched::UNSERVABLE_WAIT.as_secs())]
     pub unservable_wait_secs: u64,
+    /// The OS and architecture, as `<os>/<arch>` (`linux` or `macos`; `x86_64` or
+    /// `arm64`), of an action whose platform names no OS, no architecture and no ISA
+    /// level, so that it is not given to whichever node sorts first, a Mac among them.
+    /// Not applied to an action that asks for `xcode` or an iOS device, which only a
+    /// Mac reports. `none` applies no default: such an action runs on any node that
+    /// fits. Placement only: the action's digest and cache key do not change.
+    #[arg(long, default_value_t = kbf_front::DefaultPlatform::LINUX_X86_64)]
+    pub default_platform: kbf_front::DefaultPlatform,
     /// The memory rungs of an action, in GiB, ascending and each at least 1. The first
     /// is what an action that names no size (`kbf-book-mem-gib`) books. An action that
     /// passes its own memory limit runs again on the next rung above what it booked,
@@ -709,6 +717,7 @@ impl Args {
             hello_wait: Duration::from_secs(10),
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
+            default_platform: self.default_platform,
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: match self.shutdown_timeout_secs {

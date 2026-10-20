@@ -9,17 +9,8 @@ use kbf_proto::reapi::platform::Property;
 
 use super::*;
 
-pub(crate) fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::current_exe()
-        .expect("test binary")
-        .parent()
-        .expect("deps")
-        .join("kbf-driver-native-unit")
-        .join(format!("xcode-{name}-{}", std::process::id()));
-    // Absent unless a run with this pid left it.
-    let _ = kbf_outputs::remove_tree(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+pub(crate) fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::unit_dir(&format!("xcode-{name}"))
 }
 
 /// Catches: a build read from the wrong line, kept with its spacing, or made up
@@ -53,12 +44,8 @@ pub(crate) fn fake(dir: &Path, name: &str, script: &str) -> PathBuf {
 /// runs kbf-testkit's act steps (`kbf_testkit::act`) instead of the tests.
 pub(crate) fn act() -> PathBuf {
     static LINK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    LINK.get_or_init(|| {
-        let link = scratch("act").join(kbf_testkit::act::NAME);
-        kbf_testkit::act::link_self(&link).expect("link");
-        link
-    })
-    .clone()
+    LINK.get_or_init(|| crate::act_link(&crate::unit_root().join("act")))
+        .clone()
 }
 
 /// Makes `path` a link to this test binary, which answers as the fake tool its base
