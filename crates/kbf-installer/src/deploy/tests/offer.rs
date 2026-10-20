@@ -935,11 +935,13 @@ fn the_gh_attestation_check_verifies_the_bytes_it_is_given() {
     let mut settings = crate::settings::Settings::defaults(&host);
     settings.run_as = me();
     let commit = c(TARGET);
-    let seen: Arc<Mutex<Vec<(Spawn, Vec<u8>, Vec<u8>, bool)>>> = Arc::default();
+    type Seen = (Spawn, Vec<u8>, Vec<u8>, bool);
+    let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
     let check =
         |code: i32, trust: kbf_host::testkit::FakeExec, work: std::path::PathBuf, switch| {
             let log = seen.clone();
-            struct Gh(Box<dyn Fn(&Spawn) -> std::io::Result<crate::run::Ran>>);
+            type Answer = Box<dyn Fn(&Spawn) -> std::io::Result<crate::run::Ran>>;
+            struct Gh(Answer);
             impl crate::run::Runner for Gh {
                 fn run(&self, s: &Spawn) -> std::io::Result<crate::run::Ran> {
                     (self.0)(s)
