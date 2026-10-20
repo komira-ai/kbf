@@ -124,9 +124,7 @@ fn plist_problems(plist: &str) -> Vec<String> {
         ));
     }
     // Catches a gate the layout does not read: the job would wait for a file nothing writes.
-    let config = layout(Platform::MacOs).kbf_toml();
-    let dir = Path::new(config.as_str()).parent().expect("a directory");
-    let gate = format!("<key>{}/installer.toml</key>", dir.display());
+    let gate = format!("<key>{}</key>", layout(Platform::MacOs).installer_toml());
     if !plist.contains(&gate) {
         found.push(format!("gate: KeepAlive is not gated on {gate}"));
     }
@@ -188,8 +186,9 @@ fn the_runtime_units_exec_the_layouts_current_release() {
             .filter(|c| c.starts_with(&current_kbf()))
             .count();
     }
-    // Four mode units, a check and a start each (the frontend template runs its slot).
-    assert_eq!(checked, 8);
+    // Five mode units, a check and a start each: the four node modes and the plain
+    // frontend (kbf-frontend.service); the frontend template runs its slot.
+    assert_eq!(checked, 10);
 }
 
 /// `(file, from, to, rule)`: one defect per rule, planted in a copy of the real file.

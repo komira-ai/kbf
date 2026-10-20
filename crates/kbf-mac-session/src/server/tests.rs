@@ -71,7 +71,7 @@ impl CallerCheck for Scripted {
 struct Served {
     host: FakeHost,
     client: Client,
-    dir: PathBuf,
+    dir: kbf_testkit::dir::TestDir,
 }
 
 /// A helper over a fake host, serving on a socket in a scratch directory.
@@ -595,7 +595,7 @@ fn serve_returns_when_accept_fails() {
         let settings = Settings {
             range: UidRange::new(600, 601).unwrap(),
             gid: 20,
-            homes: dir.clone(),
+            homes: dir.to_path_buf(),
             schedules: SweepPlan {
                 named: Vec::new(),
                 owned: Vec::new(),

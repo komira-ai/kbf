@@ -23,12 +23,10 @@ use kbf_types::object_store_api::{Secret, Verified};
 use tokio::runtime::Handle;
 
 use crate::enroll::{OsRandom, Random};
+use crate::stores::region_or_default;
 
 /// The longest a whole probe may take, however the store behaves.
 pub const PROBE_BUDGET: Duration = Duration::from_secs(20);
-
-/// The signing region when a connection names none.
-const DEFAULT_REGION: &str = "us-east-1";
 
 /// What the probe writes.
 const PROBE_BODY: &[u8] = b"kbf-probe";
@@ -120,11 +118,7 @@ pub fn check_endpoint(endpoint: &str) -> Result<(), OriginFault> {
 fn store(target: &ProbeTarget<'_>) -> Result<S3Store, S3ConfigError> {
     S3Store::new(S3Config {
         endpoint: target.endpoint.to_owned(),
-        region: if target.region.is_empty() {
-            DEFAULT_REGION.to_owned()
-        } else {
-            target.region.to_owned()
-        },
+        region: region_or_default(target.region),
         bucket: target.bucket.to_owned(),
         credentials: Credentials::new(target.access_key_id, target.secret.expose()),
         capabilities: Capabilities {

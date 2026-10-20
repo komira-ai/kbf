@@ -53,11 +53,10 @@ use kbf_types::object_store_api::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::probe::{OriginFault, Probe, ProbeTarget, S3Probe, check_endpoint, check_origin};
+use super::probe::{OriginFault, Probe, ProbeTarget, check_endpoint, check_origin};
 use super::registry::{Registry, RegistryError};
 use super::secrets::SecretError;
 use crate::api::{gate, json};
-use crate::enroll::OsRandom;
 use crate::proxy_auth::Caller;
 use crate::token::ApiToken;
 
@@ -88,17 +87,6 @@ pub trait AckSource: Send + Sync {
     fn nodes(&self) -> Vec<NodeConvergence>;
 }
 
-/// An [`AckSource`] that knows no node: every convergence is `false` until a real one is
-/// wired.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoAcks;
-
-impl AckSource for NoAcks {
-    fn nodes(&self) -> Vec<NodeConvergence> {
-        Vec::new()
-    }
-}
-
 /// What the routes need: the registry, the probe that checks a store before anything is
 /// written, and where the nodes' reports come from.
 pub struct ObjectStoreApi {
@@ -116,27 +104,6 @@ impl ObjectStoreApi {
             probe,
             acks,
         }
-    }
-}
-
-impl ObjectStoreApi {
-    /// The API over the registry in `store`, with secret files in `dir` (made 0700), probing
-    /// stores with the S3 client on `runtime` and reading the nodes' reports from `acks`.
-    ///
-    /// # Errors
-    /// The directory cannot be made or listed, or a registry row cannot be read.
-    pub fn open(
-        store: Arc<dyn kbf_state::Store>,
-        dir: &std::path::Path,
-        runtime: tokio::runtime::Handle,
-        acks: Arc<dyn AckSource>,
-    ) -> Result<Self, RegistryError> {
-        let registry = Registry::open(store, dir, Arc::new(OsRandom))?;
-        Ok(Self::new(
-            Arc::new(registry),
-            Arc::new(S3Probe::new(runtime)),
-            acks,
-        ))
     }
 }
 
