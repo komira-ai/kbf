@@ -442,13 +442,18 @@ fn node() -> WorkerId {
 
 /// Registers `node-a` with room for four actions, as a daemon opening a stream does.
 fn register(farm: &TestFarm) -> (StreamId, Inbox) {
+    register_as(farm, &node())
+}
+
+/// Registers `worker` the same way.
+fn register_as(farm: &TestFarm, worker: &WorkerId) -> (StreamId, Inbox) {
     let caps = NodeCaps::from_report([("arch", "x86_64"), ("os", "linux")])
         .expect("caps")
         .with_drivers(["container"]);
     let reported = Reported::serving(Resources::new(4_000, 8 * GIB), caps);
     let (outbound, inbox) = mpsc::unbounded_channel();
     let stream = farm.register(
-        &node(),
+        worker,
         DaemonInstance::new("daemon"),
         DaemonInstance::new(""),
         reported,

@@ -908,9 +908,10 @@ impl Farm {
                 .as_ref()
                 .is_ok_and(|(operation, ..)| state.is_recorded(*operation));
             // A copy of a result the scheduler took whose finish waits for the store is
-            // acknowledged with the first.
+            // acknowledged with the first, to the node that sent the first: a copy from
+            // another node, which never held the lease, is owed nothing.
             if matches!(standing, Err(Verdict::Held)) {
-                state.owed.insert(lease, worker.clone());
+                state.owed.entry(lease).or_insert_with(|| worker.clone());
             }
             (standing, recorded)
         };
