@@ -57,6 +57,7 @@
 //!   through the adopt path above, with the startup hold in force until it decides.
 
 mod migrator;
+mod mirror;
 mod status;
 
 #[cfg(test)]
@@ -68,14 +69,24 @@ mod rig;
 #[cfg(test)]
 mod tests;
 
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use super::api::traits::{Retired, Supervisor, SupervisorError, SupervisorStatus, UpdateSpec};
-use super::model::{Mode, Phase, ProcIdent, Slot, Timing};
-use super::ports::{Child, ChildAdmin, Clock, Gate, Migrator, Recorder, RootOrders};
+use super::model::{
+    Failure, Halt, Intent, Mode, Phase, Plan, ProcIdent, Request, Slot, Step, Timing,
+};
+use super::ports::{
+    Child, ChildAdmin, Clock, Gate, Migrator, Ports, Recorder, Requests, RootOrders,
+};
+use super::record::FileRecorder;
 use super::runtime::RequestQueue;
+use super::swap::Swap;
+use mirror::{Mirror, Shared};
 
 pub use migrator::{ExpandOnlyDefault, RunningSchema};
 
@@ -88,8 +99,13 @@ pub struct Parts {
     pub recorder: Arc<dyn Recorder + Send + Sync>,
     pub orders: Arc<dyn RootOrders + Send + Sync>,
     pub clock: Arc<dyn Clock + Send + Sync>,
+    /// Where `abort` goes; the swap reads it.
     pub requests: Arc<RequestQueue>,
+    /// The process identity of the child serving in a slot, recorded in `update.json` so a
+    /// restarted proxy can adopt it (`ProcChild::recorded` on a host).
     pub old_proc: Box<dyn Fn(Slot) -> Option<ProcIdent> + Send + Sync>,
+    /// Runs once on the swap thread when it dies of a panic or a port it cannot do without;
+    /// the verb passes what stops its process loudly. Not run for a shutdown.
     pub on_death: Box<dyn Fn(&str) + Send + Sync>,
 }
 
@@ -98,52 +114,267 @@ pub struct Parts {
 pub struct Config {
     pub mode: Mode,
     pub timing: Timing,
+    /// The proxy's state directory: `update.json` is read from it at the start.
     pub state_dir: PathBuf,
+    /// The slot that serves now, from the start-up adoption. A recorded update that is
+    /// still open decides its own.
     pub active: Slot,
+    /// Allow `rollback` after the switch. Off: see the module's "what does not work".
     pub rollback_after_switch: bool,
 }
 
-/// Placeholder that starts nothing: the tests of the real one are red against it.
-#[allow(dead_code)]
+/// The [`Supervisor`] over the swap. See the module documentation.
 pub struct SwapSupervisor {
     parts: Arc<Parts>,
+    shared: Arc<Shared>,
     config: Config,
+    /// `update.json` could not be read at the start: the reason.
+    unreadable: Option<String>,
+}
+
+enum Job {
+    Fresh {
+        plan: Plan,
+        old_proc: Option<ProcIdent>,
+    },
+    Adopt {
+        plan: Plan,
+        intent: Box<Intent>,
+    },
 }
 
 impl SwapSupervisor {
+    /// Build the supervisor and, if `update.json` shows an update in flight, resume it on a
+    /// swap thread.
     #[must_use]
     pub fn new(parts: Parts, config: Config) -> SwapSupervisor {
-        SwapSupervisor {
-            parts: Arc::new(parts),
+        let parts = Arc::new(parts);
+        let (intent, unreadable) = match FileRecorder::load(&config.state_dir) {
+            Ok(intent) => (intent, None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+        let active = intent
+            .as_ref()
+            .map_or(config.active, |i| status::active_after(i, || false));
+        let resume = intent.clone().filter(|i| !i.phase.is_terminal());
+        let open = resume.as_ref().map(|i| i.update_id.clone());
+        let me = SwapSupervisor {
+            parts,
+            shared: Arc::new(Shared::new(active, intent, open)),
             config,
+            unreadable,
+        };
+        if let Some(intent) = resume {
+            let plan = Plan::resumed(&intent, me.config.timing);
+            if let Err(why) = me.launch(Job::Adopt {
+                plan,
+                intent: Box::new(intent),
+            }) {
+                me.shared.close();
+                (me.parts.on_death)(&why);
+            }
+        }
+        me
+    }
+
+    /// Wait until no swap thread is alive, for at most `limit`; true if none is.
+    pub fn wait_closed(&self, limit: Duration) -> bool {
+        self.shared.wait_closed(limit)
+    }
+
+    fn launch(&self, job: Job) -> Result<(), String> {
+        let parts = Arc::clone(&self.parts);
+        let shared = Arc::clone(&self.shared);
+        thread::Builder::new()
+            .name("kbf-swap".into())
+            .spawn(move || work(&parts, &shared, job))
+            .map(|_| ())
+            .map_err(|e| format!("the swap thread could not start: {e}"))
+    }
+
+    /// The phase of the open update, or `NotOpen`.
+    fn open_phase(&self) -> Result<Phase, SupervisorError> {
+        let state = self.shared.lock();
+        match (&state.open, &state.intent) {
+            (Some(_), Some(intent)) => Ok(intent.phase),
+            _ => Err(SupervisorError::NotOpen),
         }
     }
 
-    pub fn wait_closed(&self, _limit: Duration) -> bool {
-        true
+    /// The swap thread never started: the update ends `failed` at `start`.
+    fn launch_failed(&self, why: &str) {
+        let mut state = self.shared.lock();
+        state.open = None;
+        if let Some(mut intent) = state.intent.clone() {
+            intent.phase = Phase::Failed;
+            intent.failure = Some(Failure {
+                step: Step::Start,
+                reason: why.to_owned(),
+            });
+            if self.parts.recorder.record(&intent).is_ok() {
+                state.intent = Some(intent);
+            }
+        }
     }
 }
 
+/// The swap thread: run the job, record where it ended, and say loudly if it died.
+fn work(parts: &Parts, shared: &Shared, job: Job) {
+    let death = match catch_unwind(AssertUnwindSafe(|| run(parts, shared, job))) {
+        Ok(Ok(_) | Err(Halt::Interrupted)) => None,
+        Ok(Err(halt)) => Some(format!("the swap stopped: {halt}")),
+        Err(panic) => Some(format!("the swap thread panicked: {}", panic_text(&*panic))),
+    };
+    shared.close();
+    if let Some(why) = death {
+        tracing::error!(%why, "the handover driver died");
+        (parts.on_death)(&why);
+    }
+}
+
+fn run(parts: &Parts, shared: &Shared, job: Job) -> Result<Phase, Halt> {
+    let recorder = Mirror {
+        inner: &*parts.recorder,
+        shared,
+    };
+    let ports = Ports {
+        child: &*parts.child,
+        admin: &*parts.admin,
+        gate: &*parts.gate,
+        migrator: &*parts.migrator,
+        recorder: &recorder,
+        orders: &*parts.orders,
+        clock: &*parts.clock,
+        requests: &*parts.requests,
+    };
+    let mut swap = match job {
+        Job::Fresh { plan, old_proc } => Swap::begin(ports, plan, old_proc)?,
+        Job::Adopt { plan, intent } => Swap::adopt(ports, plan, *intent),
+    };
+    let phase = swap.run()?;
+    let intent = swap.intent().clone();
+    let new = intent.new_slot;
+    let holds = || matches!(parts.admin.role(new), Ok(r) if r.holder);
+    shared.lock().active = status::active_after(&intent, holds);
+    Ok(phase)
+}
+
+fn panic_text(panic: &(dyn Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_owned())
+}
+
 impl Supervisor for SwapSupervisor {
-    fn start(&mut self, _spec: &UpdateSpec) -> Result<(), SupervisorError> {
-        Err(SupervisorError::Failed(
-            "the handover driver is not wired".into(),
-        ))
+    fn start(&mut self, spec: &UpdateSpec) -> Result<(), SupervisorError> {
+        if let Some(why) = &self.unreadable {
+            return Err(SupervisorError::Refused(format!(
+                "update.json is unreadable ({why}); both children are left as they are"
+            )));
+        }
+        let id = spec.update_id.0.clone();
+        let mut state = self.shared.lock();
+        if state.open.as_ref() == Some(&id)
+            || state.intent.as_ref().is_some_and(|i| i.update_id == id)
+        {
+            return Ok(());
+        }
+        if let Some(open) = &state.open {
+            return Err(SupervisorError::Refused(format!(
+                "update {open} is still open"
+            )));
+        }
+        let from = spec.from.clone().ok_or_else(|| {
+            SupervisorError::Refused("the running commit is not known".to_owned())
+        })?;
+        let plan = Plan {
+            update_id: id.clone(),
+            request_id: spec.request_id.clone(),
+            mode: self.config.mode,
+            from,
+            to: spec.to.clone(),
+            nodes: spec.nodes,
+            rollback: spec.rollback,
+            old_slot: state.active,
+            timing: self.config.timing,
+        };
+        let old_proc = (self.parts.old_proc)(state.active);
+        let intent = Intent::begin(&plan, old_proc.clone(), self.parts.clock.now().as_secs());
+        self.parts
+            .recorder
+            .record(&intent)
+            .map_err(|e| SupervisorError::Failed(e.to_string()))?;
+        // A request left from an update that ended is not this update's.
+        while self.parts.requests.next().is_some() {}
+        state.intent = Some(intent);
+        state.open = Some(id);
+        drop(state);
+        if let Err(why) = self.launch(Job::Fresh { plan, old_proc }) {
+            self.launch_failed(&why);
+            return Err(SupervisorError::Failed(why));
+        }
+        Ok(())
     }
 
     fn abort(&mut self) -> Result<Phase, SupervisorError> {
-        Err(SupervisorError::NotOpen)
+        let phase = self.open_phase()?;
+        self.parts.requests.push(Request::Abort);
+        Ok(phase)
     }
 
     fn rollback(&mut self) -> Result<Phase, SupervisorError> {
-        Err(SupervisorError::NotOpen)
+        let phase = self.open_phase()?;
+        if !self.config.rollback_after_switch {
+            return Err(SupervisorError::Refused(
+                "rollback after the switch is not supported: the old child stood down at the \
+                 switch and a child that stood down cannot serve again"
+                    .to_owned(),
+            ));
+        }
+        self.parts.requests.push(Request::Rollback);
+        Ok(phase)
     }
 
-    fn force_retire(&mut self, _reason: &str) -> Result<Retired, SupervisorError> {
-        Err(SupervisorError::NotOpen)
+    fn force_retire(&mut self, reason: &str) -> Result<Retired, SupervisorError> {
+        let intent = {
+            let state = self.shared.lock();
+            state.intent.clone().filter(|_| state.open.is_some())
+        };
+        let Some(intent) = intent.filter(status::has_old_phase) else {
+            return Err(SupervisorError::NotOpen);
+        };
+        let slot = status::draining_slot(&intent);
+        let ident = if slot == intent.old_slot {
+            intent.old_proc.clone()
+        } else {
+            intent.new_proc.clone()
+        };
+        let Some(ident) = ident else {
+            return Err(SupervisorError::Refused(
+                "the old child is not recorded".into(),
+            ));
+        };
+        if self.parts.child.exited(&ident).is_some() {
+            return Err(SupervisorError::Refused("the old child is gone".into()));
+        }
+        let dropped = self.parts.gate.open_streams(slot);
+        self.parts
+            .child
+            .terminate(&ident)
+            .map_err(|e| SupervisorError::Failed(format!("SIGTERM to {slot:?}: {e}")))?;
+        tracing::warn!(reason, dropped, ?slot, "old child told to end");
+        Ok(Retired {
+            dropped_streams: dropped,
+        })
     }
 
     fn status(&self) -> SupervisorStatus {
-        SupervisorStatus::default()
+        let (intent, active, open) = {
+            let state = self.shared.lock();
+            (state.intent.clone(), state.active, state.open.is_some())
+        };
+        status::assemble(&self.parts, intent, active, open)
     }
 }
