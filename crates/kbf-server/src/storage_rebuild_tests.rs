@@ -27,6 +27,7 @@ use tonic::transport::Endpoint;
 
 use super::{assemble, command, parse};
 use crate::RaftMetaLog;
+use crate::cold_apply::Fixed;
 use crate::replication::REPAIR_DIR;
 
 /// The fake frontend: every registration is member 1 at the next boot, answered with a
@@ -342,9 +343,9 @@ async fn start<O: ObjectStore>(
         &flags,
         flags.listener().expect("a listener"),
         None,
-        (log, store, prefix, id),
+        (log, Fixed(store), prefix, id),
         (|| Ok(pending::<()>()), &repair_dir),
-        None,
+        (None, None),
         rebuild,
     )
     .await
@@ -561,6 +562,12 @@ async fn a_finished_rebuild_is_not_run_again_by_a_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_rebuild_is_tried_again_and_the_node_stays_catching_up() {
     let dir = scratch("retry");
+    // A subscriber for the whole process: the rebuild task logs from a worker thread, which
+    // a subscriber set for this thread would not reach, and a `tracing` macro evaluates its
+    // fields (rebuild.rs) only where one is installed, whatever else ran in the process.
+    let _ = tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt().with_ansi(false).finish(),
+    );
     let frontend = Frontend::start();
     let bucket = Bucket::new();
     let old = old_segments(&bucket, 0x11, 3).await;

@@ -92,6 +92,7 @@ fn joined(member_id: u64, boot: u64) -> Joined {
         boot,
         interval: Duration::from_secs(1),
         generation: 1,
+        objstore_generation: 0,
     }
 }
 
