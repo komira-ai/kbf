@@ -15,7 +15,8 @@
 //! - **Q3** `resume` is an admin call that reloads fully, then re-takes the generation:
 //!   [`ports::ChildAdmin::resume`].
 //! - **Q8** open streams come from the proxy ([`ports::Gate::open_streams`]); open
-//!   executions and queued operations from the child ([`ports::ChildAdmin::open_counts`]).
+//!   streams and open worker sessions from the child's admin role view
+//!   ([`ports::ChildAdmin::open_counts`]); queued operations do not gate retire.
 //! - **Migration** (open): who runs the forward Postgres migration, and with which
 //!   credential, is undecided; the swap only calls [`ports::Migrator::migrate_forward`]
 //!   before the candidate starts. For an all-in-one host it runs after the old process
@@ -66,6 +67,7 @@ pub mod ports;
 pub mod record;
 mod recover;
 mod retire;
+pub mod root_orders;
 pub mod running_binary;
 mod swap;
 
@@ -89,6 +91,8 @@ mod reconcile_tests;
 mod record_tests;
 #[cfg(test)]
 mod recover_tests;
+#[cfg(test)]
+mod root_orders_tests;
 #[cfg(test)]
 mod swap_tests;
 
