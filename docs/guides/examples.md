@@ -12,9 +12,11 @@ What kbf supports on this listener, so the examples make sense:
 - Digests are SHA-256 only.
 - The listener serves plain text, or TLS with a server certificate (`--reapi-tls-cert`,
   `--reapi-tls-key`). It asks clients for **no client certificate**. Behind a TLS-terminating
-  front, the front ends TLS for the client-facing name. Who may call is set by
-  `--reapi-auth-policy` ([reapi-auth.md](../reapi-auth.md)), not by a client certificate.
-  The policy variants that read a client certificate or a token are planned, not built.
+  front, the front ends TLS for the client-facing name. Who may call the listener itself is
+  set by `--reapi-auth-policy` ([reapi-auth.md](../reapi-auth.md)), not by a client
+  certificate. The bundled proxy of a packaged frontend host can require a bearer token or a
+  client certificate in front of the listener; see
+  [Authentication behind the bundled proxy](#authentication-behind-the-bundled-proxy).
 - Clients never write the action cache. `UpdateActionResult` is always refused with
   `PERMISSION_DENIED`, so a client's own cache uploads of results do not reach kbf's action
   cache. Only the farm stores results of actions it ran.
@@ -28,8 +30,11 @@ A `.bazelrc` for a farm behind a TLS front:
 
 ```text
 # .bazelrc
-build:kbf --remote_executor=grpcs://frontend.example.com
-build:kbf --remote_cache=grpcs://frontend.example.com
+build:kbf --remote_executor=grpcs://frontend.example.com:8980
+build:kbf --remote_cache=grpcs://frontend.example.com:8980
+build:kbf --spawn_strategy=remote
+build:kbf --noremote_local_fallback
+build:kbf --noremote_upload_local_results
 build:kbf --remote_instance_name=main
 build:kbf --remote_timeout=300s
 build:kbf --remote_default_exec_properties=OSFamily=Linux
@@ -39,8 +44,14 @@ build:kbf --remote_default_exec_properties=container-image=docker://registry.exa
 
 Use it with `bazel build --config=kbf //...`.
 
+- `--spawn_strategy=remote` and `--noremote_local_fallback` keep actions from running on
+  your machine. `--noremote_upload_local_results` stops Bazel from uploading the results of
+  actions that did run locally: only the farm writes the action cache, and kbf refuses
+  `UpdateActionResult` (see above), so without the flag Bazel tries an upload for every
+  local action and gets `PERMISSION_DENIED`.
 - `--remote_executor` takes `grpc`, `grpcs` or `unix`, and `grpcs` is the default when no
-  scheme is given. `--remote_cache` takes the same kinds of address.
+  scheme is given. Without a port, `grpcs` means port 443, and kbf listens on 8980, so
+  write the port. `--remote_cache` takes those addresses and also `http://` and `https://`.
 - `--remote_instance_name` is passed as the instance name. Leave it out for the empty
   instance name.
 - `--remote_default_exec_properties` gives the properties for an execution platform that
@@ -52,8 +63,9 @@ Use it with `bazel build --config=kbf //...`.
   certificate.
 - Bazel also has `--tls_client_certificate` and `--tls_client_key` for client
   authentication. kbf's REAPI listener does not ask for a client certificate, so they do
-  not authenticate you to kbf. A front in front of kbf may use them.
-- `--remote_header=Name=Value` adds a header to every request, for a front that wants one.
+  not authenticate you to the listener itself. The bundled proxy in front of it may require
+  one (see below).
+- `--remote_header=Name=Value` adds a header to every request, for a proxy that wants one.
 
 Per-target or per-platform properties go in `exec_properties` on a `platform`:
 
@@ -80,8 +92,15 @@ cc_binary(
 )
 ```
 
-Pass the platforms with Bazel's own platform flags (`--platforms`,
-`--extra_execution_platforms`); those are Bazel's, not kbf's.
+`exec_properties` on a `platform` take effect when that platform is an execution platform.
+Make it one with `--extra_execution_platforms=//:linux_x86_64`, or with
+`register_execution_platforms` in `MODULE.bazel`. `--platforms` names the target platform
+and does not choose where an action runs. These flags are Bazel's, not kbf's. If you do not
+want platform targets, `--remote_default_exec_properties` above is simpler.
+
+The `container-image` value in the `.bazelrc` above applies to Linux workers only; a Mac
+worker ignores it (see [The container image](#the-container-image)). The `macos_arm64`
+platform therefore does not set it.
 
 ## Buck2
 
@@ -93,13 +112,16 @@ Put the farm's addresses in the `[buck2_re_client]` section of `.buckconfig`:
   digest_algorithms = SHA256
 
 [buck2_re_client]
-  engine_address = grpc://frontend.example.com:443
-  action_cache_address = grpc://frontend.example.com:443
-  cas_address = grpc://frontend.example.com:443
+  engine_address = grpc://frontend.example.com:8980
+  action_cache_address = grpc://frontend.example.com:8980
+  cas_address = grpc://frontend.example.com:8980
   tls = true
   tls_ca_certs = /path/to/ca.pem
   instance_name = main
+  execution_concurrency_limit = 1000
 ```
+
+These are the settings kbf's own Buck2 sample projects use.
 
 - `engine_address`, `action_cache_address` and `cas_address` are the engine, the action
   cache and the CAS. For kbf all three are the REAPI address.
@@ -108,11 +130,14 @@ Put the farm's addresses in the `[buck2_re_client]` section of `.buckconfig`:
 - `tls_ca_certs` is a PEM CA bundle to trust. Without it Buck2 uses a default bundle,
   which is right for a front with a public certificate.
 - `tls_client_cert` is Buck2's setting for a client certificate and key. kbf's REAPI
-  listener does not ask for one.
+  listener does not ask for one, but the bundled proxy may require one (see below).
+- `execution_concurrency_limit` caps how many actions Buck2 runs remotely at once. Buck2
+  keeps one `Execute` stream open per outstanding action, and the REAPI listener allows
+  10000 streams (`--reapi-max-streams`), so keep the limit below that.
 - `instance_name` is passed on execution, action cache and CAS requests. Leave it out for
   the empty instance name.
 - `http_headers` (a comma-separated list of `Header: Value`) is sent with every request,
-  for a front that wants one.
+  for a proxy that wants one.
 - For a plain-text address on a trusted network, use `tls = false` and
   `grpc://<host>:8980`.
 
@@ -154,6 +179,24 @@ remote_execution_properties = {"OSFamily": "Darwin", "ISA": "arm-a64"},
 Buck2 has one remote execution service per checkout, so every remote action of a checkout
 goes to the one `engine_address`. kbf routes each action by its `OSFamily`, so a Linux
 action goes to a Linux worker and a Darwin action to a Mac.
+
+## Authentication behind the bundled proxy
+
+A packaged frontend host runs a proxy in front of the REAPI listener. The proxy's
+`buck2_auth` setting decides who may call; the setup flags are in
+[kbf-installer-setup.md](../deploy/kbf-installer-setup.md). There are three modes.
+
+- `none`: anyone who can reach the address may call. Use it only on a network you trust.
+- `bearer`: every call must carry `Authorization: Bearer <token>`. A client certificate is
+  neither needed nor enough, and a wrong token is refused even next to a good certificate.
+  In Bazel, add `--remote_header=Authorization=Bearer <token>`. In Buck2, set
+  `http_headers = Authorization: Bearer <token>` in `[buck2_re_client]`.
+- `mtls`: every call must present a client certificate that the proxy verifies. In Bazel,
+  set `--tls_client_certificate` and `--tls_client_key`. In Buck2, set `tls_client_cert`.
+  These do authenticate you to the proxy.
+
+A token on the command line or in a checked-in file is readable by others: keep it in a
+user-local `.bazelrc` or `.buckconfig.local` that you do not commit.
 
 ## Platform properties kbf reads
 
@@ -204,7 +247,7 @@ container-image=docker://registry.example.com/build@sha256:<digest>
 
 ### Memory booking
 
-Every action books 1 core and a share of memory on the worker it runs on. Two properties
+Every action books 1 core and 4 GiB of memory on the worker it runs on. Two properties
 change the booking:
 
 - `kbf-book-cpus=N` books `N` whole cores.
@@ -230,10 +273,13 @@ Neither key is allowed on a `kbf-lease=whole_machine` action, which books the wh
 
 `kbf all-in-one` runs the REAPI service, the scheduler, the storage and a daemon in one
 process. It is for a trusted single box or for development: builds run beside the farm's
-state and its cold store, as one user. It uses the container driver only.
+state and its cold store, as one user. It is Linux only and uses the container driver only;
+elsewhere `kbf all-in-one` exits with status 2.
 
 This is the flag set kbf's unit template uses, with the certificate files you need as
-placeholders:
+placeholders. `--server=https://localhost:8981` is checked against the worker certificate,
+so `worker.pem` must name `localhost` (or add `--tls-server-name`). How to make the CA and
+the node's certificate is in [kbf-modes.md](../deploy/kbf-modes.md#a-nodes-certificate).
 
 ```text
 kbf all-in-one \
@@ -264,7 +310,9 @@ kbf all-in-one \
   `--worker-*` certificate flags. `--server`, `--ca-cert`, `--cert` and `--key` are the
   daemon half's side of that connection.
 - `--cold-store=file://...` is a directory, so the box needs no S3 service and holds no key.
-  Add `--hot-store=file:///fast/kbf` to put a fast disk in front of it.
+  Add `--hot-store=file:///fast/kbf` to put a fast disk in front of it. In all-in-one the
+  single cache keeps no flushed copies on the hot store, so it holds only blobs not yet
+  flushed.
 - `--state-store` names the scheduler's state. The default of `kbf all-in-one` is Postgres
   on the host's socket; this example names a SQLite file instead.
 - `--api-token-file` must be a file of mode 0600 or 0400 holding one token of at least 32
@@ -280,6 +328,9 @@ The client side, on the same machine:
 # .bazelrc
 build:kbf --remote_executor=grpc://127.0.0.1:8980
 build:kbf --remote_cache=grpc://127.0.0.1:8980
+build:kbf --spawn_strategy=remote
+build:kbf --noremote_local_fallback
+build:kbf --noremote_upload_local_results
 build:kbf --remote_default_exec_properties=OSFamily=Linux
 build:kbf --remote_default_exec_properties=container-image=docker://registry.example.com/build@sha256:<digest>
 ```
@@ -296,3 +347,7 @@ build:kbf --remote_default_exec_properties=container-image=docker://registry.exa
 An all-in-one farm on an arm64 machine should start with `--default-platform=none`, or its
 actions must name `ISA=arm64`; the default places an action that names no platform on
 `linux/x86_64`.
+
+Planned: client-certificate and token variants of `--reapi-auth-policy` on the REAPI
+listener itself; today the bundled proxy supplies bearer and mTLS authentication in front
+of it.

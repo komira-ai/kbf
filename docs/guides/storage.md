@@ -1,9 +1,9 @@
 # How kbf stores your build's data
 
 This guide is for an operator who is choosing hardware for a kbf farm and wants to know
-what survives which failure. It describes what the code does at the commit named in the
-pull request that added this page. Anything designed and not built is in a paragraph that
-starts "Planned:". For depth, read [the storage design](../design/storage.md) and
+what survives which failure. It describes what the code does as of the kbf version this
+page ships with. Anything designed and not built is in the closing paragraph that starts
+"Planned:". For depth, read [the storage design](../design/storage.md) and
 [the write path design](../design/write-path.md).
 
 ## What kbf keeps
@@ -33,7 +33,7 @@ directory.
 
 | Place | What it holds | Flag | Put it on |
 |---|---|---|---|
-| Cold store | Every blob, packed into large segment objects. The durable home. | `--cold-store` | An S3-compatible bucket, or a directory on a large disk |
+| Cold store | Every blob, packed into large segment objects. The durable home. | `--cold-store` | One shared S3-compatible bucket for a farm of several nodes; a directory on a large disk for a single box |
 | Hot store (the write tier) | Recent uploads, until they are flushed to the cold store. Optional. | `--hot-store` | A local SSD or NVMe, as a `file://` directory |
 | Metadata log | The index (digest to segment and offset) and the action cache. | `--meta-dir`, or `<hot store>/meta` | A local disk that nothing else fills |
 
@@ -42,28 +42,44 @@ A store URI is `file:///absolute/path` or
 A `file://` directory on a tmpfs is a store in RAM; kbf has no `memory:` store.
 
 The hot store's size is not a flag. Its budget is 80% of its file system's free space after
-the floor below is kept free, lowered by `--hot-store-max-bytes` if you set it. When the
+the floor below is kept free (the floor is never more than half of what is free, so a nearly
+full disk gets a small budget, not none), plus the bytes the tier already holds, and lowered
+by `--hot-store-max-bytes` if you set it. When the
 hot store is at its budget, writes skip it and go straight to the cold store. If the cold
 store is down too, those writes fail with `UNAVAILABLE`.
 
 Without a hot store, uploads go straight to the cold store and a farm on one disk can name
 that disk as its cold store.
 
+A farm of more than one storage node uses one shared S3 bucket as its cold store. A
+`file://` cold store is for a single box: a directory is locked to one process, so two
+nodes cannot share it.
+
 ## Storage members and their states
 
 A storage node started with `--frontend` registers with a frontend and becomes a **member**
 of the storage map. The frontend assigns the member an id and a boot counter, and keeps a
-map: a generation number, the members with address, zone, weight and state, and the
-replication factor. `GET /v1/members` lists it. A node started without `--frontend` is a
+map: a generation number, and the members with address, zone, weight and state, and the
+replication factor. `GET /v1/members` lists the generation and, for each member, its id,
+address, state, weight and protocol. A node started without `--frontend` is a
 one-member farm of itself.
 
 | State | Takes writes | Holds the data it owns | Read |
 |---|---|---|---|
-| `joining` | yes, but never as the first owner | no | last |
-| `catching_up` | yes, but never as the first owner | no | last |
+| `joining` | yes, but not as the first owner while a settled member can be | no | last |
+| `catching_up` | yes, but not as the first owner while a settled member can be | no | last |
 | `active` | yes | yes | in rank order |
-| `draining` | no; its successor takes its place at once | yes | in rank order, before its successor |
+| `draining` | no; its successor takes its place at once (see the note below) | yes | in rank order, before its successor |
 | `down` | it keeps its place for the dwell; writers skip it and record a repair debt | yes | never listed |
+
+A joiner is first owner only when the farm has no settled member, as in a farm that is
+just forming, and then the best-scored joiner is the primary. With a replication factor of
+1 a joiner owns nothing.
+
+A drain needs at least three members. A chain with fewer write owners than the
+replication factor is refused, and a draining member is not a write owner. With two
+members, draining one leaves one write owner for a factor of 2, so every write answers
+`UNAVAILABLE` until the drain ends.
 
 Which state a node gets:
 
@@ -73,10 +89,18 @@ Which state a node gets:
   `joining` until an operator runs `kbf cluster member <id> --state active --token-file F`,
   or until the frontend runs with `--auto-promote` and the joiner has filled. Nothing copies
   blobs that existed before the node joined to it by default, so promote it when that is
-  acceptable.
+  acceptable. With `--auto-promote`, the frontend waits until the joiner has indexed every
+  object in the cold store and every member has flushed what it staged before the join,
+  and then the joiner's own heartbeat promotes it. The joiner is filled from the shared cold
+  store, not from other nodes. `--handoff-settle-secs` (30 by default) is how long all the
+  conditions must keep holding, and `--handoff-allow-degraded` lets a promotion go ahead
+  although a member was down during the fill. While `--auto-promote` holds a joiner,
+  `GET /v1/members` shows a `blocked_on` list for it that says what it waits for.
 - A node whose metadata log has not finished rebuilding its index registers as
-  `catching_up`. It serves from the start, rebuilds in the background, and becomes `active`
-  on its first heartbeat after the rebuild is done.
+  `catching_up`, unless it is a node the farm has not seen before, joining a farm that holds
+  data: that node is `joining` whatever it says about its index. A `catching_up` node
+  serves from the start, rebuilds in the background, and becomes `active` on its first
+  heartbeat after the rebuild is done.
 - A member whose heartbeat lapses for `--member-ttl-secs` (15 by default) becomes `down`.
   It stays in the map for `--member-dwell-secs` (300 by default). After the dwell it leaves
   the map and its share of the digests moves to the other members.
@@ -86,8 +110,8 @@ Which state a node gets:
 kbf places a blob with weighted rendezvous hashing. Every member gets a score for the
 blob's digest that does not depend on the other members, and the owners are the members
 with the highest scores. Adding or removing a member moves only the digests that member
-wins. A member's share is set by `--storage-weight` (default 1), and `--storage-zone` sets
-a zone label.
+wins. A member's share is set by `--storage-weight` (default 1). `--storage-zone` records a
+zone label; placement does not use it yet.
 
 The **replication factor** is 2: each blob has two owners, the first called the primary.
 The factor is clamped to the number of members, so a one-node farm keeps one copy. It is
@@ -110,7 +134,8 @@ loopback only, judges calls by the map but copies nothing.
 Reads try the owners in rank order, then the previous generation's owners, so a blob
 written before a join or a drain is found where it was. A read is `NOT_FOUND` only if every
 owner says it does not hold the blob. If an owner could not answer, the read is
-`UNAVAILABLE`.
+`UNAVAILABLE`. A read that finds a blob on only one owner does not copy it to the other;
+only a repair debt does.
 
 `GET /v1/storage` reports `under_replicated_blobs`, the number of blobs that are owed a
 second copy. It is `null` (unknown) unless every member is `active` and has reported
@@ -128,12 +153,13 @@ With a hot store, the write path changes:
    its directory entry.
 2. Its location is committed to the metadata log, which is synced. The blob is marked
    **staged** and the client is answered.
-3. A block is **sealed** after 30 seconds, or when it reaches the segment limit. The
-   flusher runs once a second. It re-reads every record, checks its SHA-256, writes the
+3. A block is **sealed** after 30 seconds, or when it reaches the segment limit of 128
+   MiB. The flusher runs once a second. It re-reads every record, checks its SHA-256, writes the
    segment to the cold store, reads the footer back, and commits that the object is
    flushed. Only then is the blob in the cold store.
 4. A flushed block stays on the hot store as a read cache until space is needed. Only
-   flushed copies are evicted.
+   flushed copies are evicted. (Under `kbf all-in-one` the one cache keeps no flushed copies
+   on the hot store, so there this step does not hold.)
 
 | Moment | What survives |
 |---|---|
@@ -141,8 +167,10 @@ With a hot store, the write path changes:
 | After the answer, before the flush | **Not** the loss of the hot store's disk. With replication 2 and a second member, the second owner holds a copy; on one node, the blob is lost. |
 | After the flush | Loss of the hot store. The blob is in the cold store, and the cold store's own durability applies. |
 
-The flush takes about 30 seconds (the seal delay) plus one put, and longer while the cold
-store is down. The tier is not flushed at shutdown: a block left on the hot store holds
+The flush starts at most about 31 seconds after the block is opened (the 30-second seal
+delay plus the next once-a-second flusher round; a block that reaches 128 MiB is sealed
+sooner), then takes one put, and longer while the cold store is down. No flag changes these
+timings. The tier is not flushed at shutdown: a block left on the hot store holds
 acknowledged bytes the cold store does not have yet, so do not delete a hot store you have
 not drained.
 
@@ -151,9 +179,9 @@ staged on this node, the node refuses to start, so that a wrong mount does not d
 index. `--hot-store-abandon=<id>` (the id is in the refusal) is the way out when the disk
 is really gone. See [Loss marks](#loss-marks-and-unreachable-blobs).
 
-Only the first owner of a blob flushes it, so two owners do not put the same bytes in the
-cold store twice. A node that is the owner of no blob's chain, such as a draining member,
-flushes what it staged.
+Every node flushes what it staged. At replication factor 2 both owners of a blob put it
+into the cold store, as two objects, so a shared bucket holds each blob twice and you
+should size it, and its cost, for twice the data.
 
 ## The cold store
 
@@ -172,8 +200,8 @@ signs requests with SigV4 and uses path-style addressing. Put the endpoint in th
 `conditional-put=true` for a store that refuses to overwrite a key, and
 `min-put-rate=BYTES_PER_SEC`. The key pair comes from `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY`, never from the URI. An object over 16 MiB is uploaded as a
-multipart upload and aborted on any failure. `https://` endpoints are refused in this
-build: it says "TLS is not built yet", so the store must be reached over `http`.
+multipart upload and aborted on any failure. The store must be reached over `http`;
+`https://` endpoints are refused in this build.
 
 **Registering the store through the operator API.** An operator can give the farm's keys to
 the storage nodes through the frontend instead of through each node's environment. The
@@ -187,7 +215,8 @@ frontend must be started with `--object-store-secrets-dir DIR`, `--api-listen`,
 3. `GET /v1/object-stores` shows the desired state and which nodes have applied it.
 
 `kbf cluster object-store ...` calls the same routes. Every route needs the bearer token,
-reads included. The registration only supplies keys: a node still names its store with
+reads included, and the calls must come from the frontend host (see Planned restarts).
+The registration only supplies keys: a node still names its store with
 `--cold-store`, and the registered store must be the same endpoint, bucket and prefix, or
 the node keeps its flag and reports `identity_mismatch`. A node with a `file://` cold store
 never takes the registration. A node reads the registration at its start, so rotating a key
@@ -197,8 +226,7 @@ bodies, the error codes and the rotation steps.
 ## Free-space floors
 
 kbf keeps free space on each disk it writes to. The floor is 5% of the file system, and at
-least 1 GiB. It is not configurable by an operator; `--cold-store-floor-bytes` exists for
-tests and you should not set it.
+least 1 GiB. The floor is not configurable.
 
 - A write to a `file://` cold store that would leave less free than the floor is refused,
   and the upload is answered `UNAVAILABLE`.
@@ -209,7 +237,8 @@ tests and you should not set it.
   any lost blob: `FindMissingBlobs` reports it missing and the client uploads it again, or
   an action cache entry that needed it is a miss and the action runs again.
 - An S3 cold store is never evicted from.
-- The hot store's budget is computed from its free space after the same floor.
+- The hot store's budget is computed from its free space after the same floor (capped at
+  half of what is free, as above).
 
 Size a `file://` cold store for the cache you want to keep. Eviction cuts the seven days a
 blob is promised after a hit down to 60 seconds, so a download that comes later than that
@@ -232,7 +261,8 @@ a loss, because the cold store can answer again. `kbf_cache_lost_blobs` shows th
 that are lost now, and `kbf_cache_blob_losses_total` counts every blob ever marked.
 
 **When every owner of a blob is down,** the router has nobody to ask. The read fails with
-`UNAVAILABLE` ("every owner of the digest is down"), and the client sees a failure for that
+`UNAVAILABLE` with the message "every owner of `<digest>` is down", where `<digest>` is
+the blob's hex digest, and the client sees a failure for that
 blob. kbf does not answer `NOT_FOUND` and does not invent a copy. The blob is unreachable
 until an owner returns and heartbeats. A build tool that retries on `UNAVAILABLE` waits; one
 that does not fails the action. A member that has been down for longer than the dwell
@@ -283,7 +313,9 @@ the log and the blobs are unreachable.
 ## Planned restarts
 
 To restart a storage node without making writers wait on it, set it `planned_down` first.
-The call needs the operator token and goes to the frontend's operator API:
+The call needs the operator token and goes to the frontend's operator API. Run it on the
+frontend host: the write gate accepts only a loopback peer with no `Origin` header, the
+bearer token and `Content-Type: application/json`.
 
 ```sh
 curl -X POST \
@@ -296,7 +328,8 @@ curl -X POST \
 `kbf cluster member 3 --state planned-down --for-secs 900 --token-file F` does the same.
 `for_secs` is 1 to 86400 and defaults to 900.
 
-- Without it, a stopped node is `down` in the map only 15 seconds after its last heartbeat.
+- Without it, a stopped node is `down` in the map only `--member-ttl-secs` (15 by default)
+  after its last heartbeat.
   Until then, a write whose primary is the stopped node dials it first, and an action cache
   commit is refused `UNAVAILABLE`.
 - With it, the member is `down` in a new map generation at once. Routers, chain primaries
@@ -309,15 +342,27 @@ curl -X POST \
   `catching_up` while it rebuilds. `{"state": "active"}` undoes the plan.
 - If it never returns, it leaves the map at the end of the dwell, like any `down` member.
 
-Before you stop a node, read `GET /v1/storage`. Stop it only when `under_replicated_blobs`
-is `0`, every other member is `active` and the node reports no open writes.
+After `planned_down` the node is no longer `active`, so `under_replicated_blobs` stays
+`null` for the whole restart. Read `GET /v1/storage` instead, and stop the node only when
+all of these hold:
+
+- `not_active` lists only this node, and `silent` and `unreported` are empty.
+- `debts_total` is `0`. It sums the debts of the `active` members, so it does not include
+  this node.
+- In `nodes`, this node's `repair_debts` and `open_writes` are both `0`, and its
+  `generation` is at least the generation that stopped routing writes to it. A `null` is
+  unknown, not zero.
 
 ## Planned
 
 Planned: more than one voter per metadata log, with snapshots, so a lost disk does not lose
 the index. Planned: scheduled garbage collection, so blobs expire by `min_ttl` (7 days) and
 the action cache by `action_ttl` (30 days); no collection runs today, so nothing expires
-except by eviction on a `file://` cold store. Planned: moving a joiner's data to it on a
-join and off a node on a drain by a handoff, described in
-[rebalance-handoff.md](../design/rebalance-handoff.md). Planned: zstd compression, and
-serving large blobs as content-defined chunks.
+except by eviction on a `file://` cold store. Planned: a drain that finishes by itself, where
+a draining node drops a blob only after its new owner confirms it, described in
+[rebalance-handoff.md](../design/rebalance-handoff.md); today a draining member keeps its
+data until an operator removes it. Planned: only the first owner of a blob flushes it, and
+the second owner drops its copy once the flush is confirmed. Planned: zone-aware
+placement. Planned: a replication factor that is a flag. Planned: `https://` endpoints for
+the S3 cold store. Planned: zstd compression, and serving large blobs as content-defined
+chunks.
