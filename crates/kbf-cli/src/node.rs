@@ -14,7 +14,7 @@
 //!    fix exits 2.
 //! 3. Builds the mode's command line from `kbf.toml`, the configuration the frontend sent
 //!    and the certificate files, parses it with the mode's own parser
-//!    ([`crate::parse_from`], the same one `kbf check-args` and the units use, so a flag
+//!    ([`crate::parse_from`], the same one the units use, so a flag
 //!    the mode would refuse is refused here the same way) and runs the mode in this
 //!    process.
 //! 4. While the mode runs, renews the certificates at half their life
