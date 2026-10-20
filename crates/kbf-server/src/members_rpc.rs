@@ -112,10 +112,11 @@ impl MembershipService {
     }
 
     /// Admits a caller that presents `presented`: as [`Self::admit_leaf`] for a certificate;
-    /// for an identity a proxy forwarded, if its role is `storage` and it names a node, which
-    /// is then the one name it has: a registration or heartbeat whose instance id or address
-    /// has any other host, an IP address included, is refused PERMISSION_DENIED by the check
-    /// of [`covered`], as there is no certificate behind the proxy to cover it.
+    /// for an identity a proxy forwarded, if its role is `storage` and it names a node, whose
+    /// names are then that node and the IP addresses the proxy forwarded from the leaf: a
+    /// registration or heartbeat whose instance id or address has any other host (an IP
+    /// address the leaf does not hold included) is refused PERMISSION_DENIED by the check of
+    /// [`covered`].
     ///
     /// # Errors
     /// As [`Self::admit_leaf`]; and UNAUTHENTICATED for a proxied identity with no role or
@@ -128,7 +129,9 @@ impl MembershipService {
             return Ok(None);
         }
         match (identity.role, identity.node_id.as_deref()) {
-            (Some(PeerRole::Storage), Some(node)) => Ok(Some(PeerCert::proxied(node))),
+            (Some(PeerRole::Storage), Some(node)) => {
+                Ok(Some(PeerCert::proxied(node, &identity.ips)))
+            }
             (Some(PeerRole::Storage) | None, _) => Err(Status::unauthenticated(
                 "the proxy forwarded no node id and storage role",
             )),
@@ -179,13 +182,19 @@ pub(crate) fn refuse_denied(peer: &PeerCert, denied: &[DenyEntry]) -> Result<(),
 ///
 /// # Errors
 /// PERMISSION_DENIED: they do not, saying what the certificate names and what to do.
-fn covered(names: &PeerNames, field: &str, value: &str) -> Result<(), Status> {
-    if names.covers(host_of(value)) {
+fn covered(names: &PeerNames, proxied: bool, field: &str, value: &str) -> Result<(), Status> {
+    let host = host_of(value);
+    if names.covers(host) {
         return Ok(());
     }
+    let fix = if proxied && host.parse::<std::net::IpAddr>().is_ok() && names.ips().is_empty() {
+        "the proxy did not forward this node's IP SANs; upgrade kbf-proxy, \
+         or register directly over mTLS"
+    } else {
+        "reissue it with the node's DNS or IP names"
+    };
     Err(Status::permission_denied(format!(
-        "the storage certificate's names ({names}) do not cover {field} {value:?}; \
-         reissue it with the node's DNS or IP names"
+        "the storage certificate's names ({names}) do not cover {field} {value:?}; {fix}"
     )))
 }
 
@@ -247,8 +256,10 @@ impl Membership for MembershipService {
         }
         if let Some(peer) = &peer {
             let names = peer.identity().names();
-            covered(names, "instance_id", &req.instance_id)?;
-            covered(names, "addr", &req.addr)?;
+            // A proxied identity carries no serial (see `PeerIdentity::proxied`).
+            let proxied = peer.identity().serial().is_empty();
+            covered(names, proxied, "instance_id", &req.instance_id)?;
+            covered(names, proxied, "addr", &req.addr)?;
         }
         let who = Registrant {
             instance_id: req.instance_id,

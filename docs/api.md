@@ -93,14 +93,17 @@ listener:
   other gate, the token included: the secret says who forwarded the request, not that the
   caller may write.
 - Every `x-kbf-*` header is removed from every request, whatever the result, so nothing
-  past this check can read one. The proxy sets `x-kbf-node-id` and `x-kbf-role` for a call
+  past this check can read one. The proxy sets `x-kbf-node-id`, `x-kbf-role` and `x-kbf-node-ips` for a call
   whose client certificate it verified; the worker listener takes those (and no TLS flag)
   in place of a certificate: the role table, the `Hello.node_id` binding, the blob calls
   and `Membership`'s role check use them. A `Hello` whose node id is not the proxy's
   `x-kbf-node-id` is refused `PERMISSION_DENIED`. A `Membership` registration
-  or heartbeat has no certificate names behind the proxy: the one name is the proxied node
-  id, so the host of its instance id and its address must be that name (up to ASCII case; an IP
-  address is refused). The proxied role must be `storage`.
+  or heartbeat has no certificate behind the proxy: its names are the proxied node id and
+  the IP addresses in `x-kbf-node-ips` (those of the verified leaf; see
+  `docs/design/frontend-proxy.md` section 3), so the host of its instance id and its address
+  must be that name (up to ASCII case) or one of those addresses (exact equality). A
+  malformed, repeated or oversized `x-kbf-node-ips` is refused `PERMISSION_DENIED`; without
+  one, an IP host is refused. The proxied role must be `storage`.
 
 What the flag does not do, and what the proxy must do:
 
@@ -588,7 +591,20 @@ must be a subset of the token's); and only then the CA: each CSR is parsed
 verifies) and a certificate is issued for it. A CSR is therefore parsed only for a caller
 who proved the secret. The answer carries one certificate per role, the CA bundle (PEM),
 the frontend's clock (`server_time`), `renew_after` (half-way through the shortest life)
-and the `NodeConfig`. A storage node must send `advertise` (`host:port`) and no other node
+and the `NodeConfig`. A node granted the `storage` role is told the farm's cold store in
+`NodeConfig.cold_store`: the store registered with `kbf cluster object-store` (the `cold`
+binding), as `s3://bucket/prefix/?endpoint=...&region=...`, with `conditional-put` and
+`min-put-rate` when they are not the defaults. The URI is built from the registered
+endpoint, region, bucket, prefix and settings only: **never** the access key id, the secret
+or any other query key (the key pair reaches a node through `ColdStore.GetStoreConfig`, over
+its storage certificate). A farm with nothing registered sends an empty `cold_store`, and a
+daemon-only node is sent none. `NodeConfig.generation` is 1 plus the registry's generation,
+so a node that renews after a store was registered, changed or taken back is sent the
+configuration again; a storage node that holds none asks once at its next start. A
+registry that cannot be read refuses the call (`StoreUnavailable`) before the token is
+spent. The node uses the `cold_store` it is sent with its own process credentials, so the
+frontend decides which endpoint receives the node's signed requests: the same trust as the
+worker and CAS endpoints the frontend already sends in `NodeConfig`. A storage node must send `advertise` (`host:port`) and no other node
 may; the host may not be a frontend name, `localhost`, or a loopback, unspecified,
 link-local or multicast address. Set `node.advertise` in `kbf.toml` on a storage node.
 
