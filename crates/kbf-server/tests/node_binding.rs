@@ -174,6 +174,7 @@ fn hello(node: &str) -> daemon_message::Message {
         protocol_version: 1,
         node_id: node.to_owned(),
         capabilities: vec![
+            entry("os", "linux"),
             entry("arch", "x86_64"),
             entry("cpus", "1"),
             entry("mem_gib", "1"),

@@ -419,6 +419,18 @@ pub struct CacheMetrics {
     /// Directory blobs the input-tree checks read from the store, counted as each read
     /// starts.
     pub execute_dir_reads: Counter,
+    /// Of an input-tree check over a store (`input_walk`): the time reading Directories,
+    /// and the time asking which files are held. The two phases run one after the other
+    /// and add up to the check less its bookkeeping.
+    pub execute_walk_dirs: Histogram,
+    pub execute_walk_files: Histogram,
+    /// Directories read from the store by checks over a store; Directories skipped with
+    /// all under them because an earlier check verified them; FindMissing calls for
+    /// files; files asked about.
+    pub execute_walk_dirs_read: Counter,
+    pub execute_walk_dirs_skipped: Counter,
+    pub execute_walk_file_asks: Counter,
+    pub execute_walk_files_checked: Counter,
     /// One call of the scheduler's submit from an Execute, the wait for its lock
     /// included.
     pub execute_submit: Histogram,
@@ -490,6 +502,12 @@ impl Default for CacheMetrics {
             execute_presubmit_in_flight: Gauge::default(),
             execute_walk: Histogram::new(Unit::Seconds),
             execute_dir_reads: Counter::default(),
+            execute_walk_dirs: Histogram::new(Unit::Seconds),
+            execute_walk_files: Histogram::new(Unit::Seconds),
+            execute_walk_dirs_read: Counter::default(),
+            execute_walk_dirs_skipped: Counter::default(),
+            execute_walk_file_asks: Counter::default(),
+            execute_walk_files_checked: Counter::default(),
             execute_submit: Histogram::new(Unit::Seconds),
             sched_lock_wait: Histogram::new(Unit::Seconds),
             sched_queued: Level::default(),
@@ -610,6 +628,18 @@ impl CacheMetrics {
                 &self.execute_walk,
             ),
             (
+                "kbf_execute_walk_dirs_seconds",
+                "The directory phase of one input-tree check over a store: Directories read \
+                 (those not remembered as verified)",
+                &self.execute_walk_dirs,
+            ),
+            (
+                "kbf_execute_walk_files_seconds",
+                "The file phase of one input-tree check over a store: the FindMissing calls \
+                 for the files its Directories name",
+                &self.execute_walk_files,
+            ),
+            (
                 "kbf_execute_submit_seconds",
                 "The scheduler's submit called from one Execute, the wait for its lock included",
                 &self.execute_submit,
@@ -645,6 +675,27 @@ impl CacheMetrics {
             self.execute_dir_reads.get(),
         );
         for (name, help, counter) in [
+            (
+                "kbf_execute_walk_dirs_read_total",
+                "Directories the Execute input checks read from the store",
+                &self.execute_walk_dirs_read,
+            ),
+            (
+                "kbf_execute_walk_dirs_skipped_total",
+                "Directories an Execute input check skipped with everything under them \
+                 because an earlier check found them held within the last minute",
+                &self.execute_walk_dirs_skipped,
+            ),
+            (
+                "kbf_execute_walk_file_asks_total",
+                "FindMissing calls the Execute input checks made for files",
+                &self.execute_walk_file_asks,
+            ),
+            (
+                "kbf_execute_walk_files_checked_total",
+                "Files the Execute input checks asked about",
+                &self.execute_walk_files_checked,
+            ),
             (
                 "kbf_input_directories_cached_total",
                 "Directories an input check took from the decoded-directory cache, touching \

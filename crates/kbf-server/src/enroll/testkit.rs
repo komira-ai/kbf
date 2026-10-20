@@ -75,15 +75,26 @@ pub fn farm(name: &str) -> Farm {
 
 /// The service over `store` and `ca`.
 pub fn service_over(store: &Arc<dyn Store>, ca: &Arc<Ca>) -> EnrollService {
+    service_with(store, ca, settings())
+}
+
+/// What the test frontend tells nodes unless a test starts it with other flags.
+pub fn settings() -> NodeSettings {
+    NodeSettings {
+        worker_endpoint: "https://front.test:7443".to_owned(),
+        cas_endpoint: String::new(),
+        storage_port: 8983,
+    }
+}
+
+/// The service over `store` and `ca` as a frontend started with `settings` makes it: a
+/// restart with other `--enroll-*` flags is a new service over the same store and CA.
+pub fn service_with(store: &Arc<dyn Store>, ca: &Arc<Ca>, settings: NodeSettings) -> EnrollService {
     EnrollService::new(
         Arc::clone(store),
         Arc::clone(ca),
         &[FRONTEND.to_owned()],
-        NodeSettings {
-            worker_endpoint: "https://front.test:7443".to_owned(),
-            cas_endpoint: String::new(),
-            storage_port: 8983,
-        },
+        settings,
     )
 }
 

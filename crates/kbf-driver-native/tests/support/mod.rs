@@ -26,6 +26,7 @@ use kbf_proto::reapi::platform::Property;
 use kbf_proto::reapi::{
     Action, ActionResult, Command, Digest, Directory, DirectoryNode, FileNode, Platform, Tree,
 };
+use kbf_testkit::dir::TestDir;
 use kbf_types::{LeaseId, Resources};
 use prost::Message;
 
@@ -105,8 +106,18 @@ impl Cas for MemoryCas {
 pub fn act() -> PathBuf {
     static LINK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     LINK.get_or_init(|| {
-        let link = scratch("act").join(kbf_testkit::act::NAME);
-        kbf_testkit::act::link_self(&link).expect("link");
+        // One directory for every run of this binary (a link that lives as long as the
+        // process cannot be a `TestDir`): remade by rename, so no run leaves another.
+        let exe = std::env::current_exe().expect("test binary");
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("kbf-driver-native-act")
+            .join(exe.file_name().expect("a file name"));
+        std::fs::create_dir_all(&dir).expect("act directory");
+        let link = dir.join(kbf_testkit::act::NAME);
+        let made = dir.join(format!(".act-{}", std::process::id()));
+        let _ = std::fs::remove_file(&made);
+        kbf_testkit::act::link_self(&made).expect("link");
+        std::fs::rename(&made, &link).expect("place the link");
         link
     })
     .clone()
@@ -245,17 +256,42 @@ fn directory_of(cas: &MemoryCas, inputs: &[(String, Vec<u8>)]) -> Directory {
     }
 }
 
-/// A fresh scratch directory for one test, under Cargo's per-target temporary
-/// directory.
-pub fn scratch(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-driver-native")
-        .join(format!("{name}-{}", std::process::id()));
-    if std::fs::symlink_metadata(&dir).is_ok() {
-        kbf_outputs::remove_tree(&dir).expect("clear old scratch");
+/// A scratch directory a test owns: a [`TestDir`] that, when the test passed, is first
+/// removed with the driver's own tree removal (it opens a directory a test closed, and
+/// does not recurse once per level). Declare it before anything that runs in it, so
+/// those are gone first.
+#[derive(Debug)]
+pub struct Scratch(TestDir);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.0.path()
     }
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // After a panic the `TestDir` keeps or removes the directory: a second panic
+        // while unwinding would abort the process.
+        if !std::thread::panicking() && std::fs::symlink_metadata(self.0.path()).is_ok() {
+            kbf_outputs::remove_tree(self.0.path()).expect("remove scratch");
+        }
+    }
+}
+
+/// A fresh scratch directory for one test, under Cargo's per-target temporary
+/// directory, removed when it is dropped.
+pub fn scratch(name: &str) -> Scratch {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kbf-driver-native");
+    Scratch(TestDir::under(root, name))
 }
 
 /// A configuration for tests: a fast poll, everything else the default. Also turns on
