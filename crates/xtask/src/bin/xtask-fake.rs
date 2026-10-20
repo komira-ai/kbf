@@ -27,7 +27,11 @@
 //!   answers, or prints its working directory (`cwd=<path>`) and the environment it was
 //!   started with (`NAME=value` per line), so a test can see a binary run (and with what)
 //!   through the trailer alone, which an environment variable cannot do for a program
-//!   started with none.
+//!   started with none. Two more: `orphan` (a line end after it) leaves a process holding
+//!   its output for a few seconds and exits 0; and `tamper <name>` (the line ends, and the
+//!   rest of the trailer is what it prints) first appends a byte to `../assets/<name>` and
+//!   rewrites that file's line in `../assets/SHA256SUMS`, as a binary run in the directory
+//!   `release stage-offer` runs it in could.
 //! - Run as `kbf-installer`, it is the STUB of the real kbf-installer, which the package
 //!   build and its macOS install test ship until the real tool is built there (one path
 //!   change in `crates/xtask/tests/pkg_macos.rs`): it prints `kbf-installer-stub` and
@@ -85,7 +89,7 @@
 //! of several fail). Of systemd: `systemd-fails` (every systemd tool exits 1).
 use std::io::Write;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use sha2::Digest;
@@ -129,18 +133,62 @@ fn kbf_says(argv0: &str) -> (String, String) {
     (stamp.to_owned(), json.to_owned())
 }
 
+/// Appends a byte to the release file `../assets/<name>` and makes its line of
+/// `../assets/SHA256SUMS` say the new digest: the change a binary run in a sibling of
+/// `assets` can make to a release that was verified before it ran.
+fn tamper(name: &str) {
+    let assets = Path::new("../assets");
+    let file = assets.join(name);
+    let mut bytes = std::fs::read(&file).expect("the release file");
+    bytes.push(b'x');
+    std::fs::write(&file, &bytes).expect("write the release file");
+    let digest = hex::encode(sha2::Sha256::digest(&bytes));
+    let sums = assets.join("SHA256SUMS");
+    let text = std::fs::read_to_string(&sums).expect("SHA256SUMS");
+    let mut edited = String::new();
+    for line in text.lines() {
+        let listed = line.split_once("  ").map(|(_, n)| n);
+        let new = match listed {
+            Some(n) if n == name => format!("{digest}  {name}"),
+            _ => line.to_owned(),
+        };
+        edited.push_str(&new);
+        edited.push('\n');
+    }
+    std::fs::write(&sums, edited).expect("write SHA256SUMS");
+}
+
 /// `kbf --version` and `kbf --version --json`, as [`kbf_says`] has them.
+#[allow(clippy::zombie_processes)] // `orphan` leaves its process behind on purpose
 fn kbf(argv0: &str, args: &[String]) -> ExitCode {
     // Where a test sees which file was run.
     if std::env::var_os("XTASK_FAKE_ANNOUNCE").is_some() {
         eprintln!("xtask-fake: kbf runs as {argv0}");
+    }
+    if args == ["--hold"] {
+        // The process `orphan` leaves behind: it ends by itself.
+        std::thread::sleep(Duration::from_secs(3));
+        return ExitCode::SUCCESS;
     }
     if args == ["--version", "--json"] {
         if defect("json-fails") {
             return ExitCode::FAILURE;
         }
         let json = kbf_says(argv0).1;
+        let tampering = json.strip_prefix("tamper ");
+        if let Some((name, rest)) = tampering.and_then(|t| t.split_once('\n')) {
+            tamper(name);
+            print!("{rest}");
+            return ExitCode::SUCCESS;
+        }
         match json.as_str() {
+            "orphan\n" => {
+                // It inherits the output, so the reader of it waits on it and not on us.
+                Command::new(argv0)
+                    .arg("--hold")
+                    .spawn()
+                    .expect("a process to leave behind");
+            }
             "fail\n" => return ExitCode::FAILURE,
             "hang\n" => loop {
                 std::thread::sleep(Duration::from_secs(3600));

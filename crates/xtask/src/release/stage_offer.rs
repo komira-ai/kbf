@@ -23,13 +23,18 @@
 //! 5. only then the `kbf` of `--runner-platform` is taken out of its tarball and run
 //!    ([`version_json`]);
 //! 6. the release before it ([`previous`]) is fetched and verified the same way and its `kbf`
-//!    run too. With no earlier release the offer is not reversible; any error is an error;
+//!    run too. Its commit is the offer's `previous`: the offer says whether going back to
+//!    that release is reversible, and the host compares its own running build when it
+//!    applies it. With no earlier release the offer is not reversible; any error is an error;
 //! 7. the platforms the release completes ([`farm_platforms`]): those with every tarball a
 //!    host of the platform needs ([`ReleasePlatform::components`]), each with its SBOM and
 //!    bundle. A platform that lacks one is left out and printed (`platform-skipped=<p>`), not
 //!    an error: the host refuses an offer only when a node of a left-out platform exists. If
 //!    no platform is complete the verb refuses;
-//! 8. [`offer::plan`] makes the offer, for gamma, with beta waived;
+//! 8. [`offer::plan`] makes the offer, for gamma, with beta waived. It checks the release
+//!    again, hashes and attestations of every file, now that both `kbf` have run (both run
+//!    as the user that can write the downloaded files): a file a run changed is refused,
+//!    never bundled;
 //! 9. `--out` is made, now that only writes can fail, and holds `offer.json` and
 //!    `bundle.tar`;
 //! 10. `--output` gets the lines, last: if it cannot be written the run fails with `--out`
@@ -184,17 +189,14 @@ impl Outcome {
     }
 }
 
-/// The attestations were verified before anything was run (step 4); the offer's own check of
-/// them would ask GitHub for each of them a second time.
-struct Verified;
-
-impl Attester for Verified {
-    fn artifacts(&self, _dir: &Path, _commit: &str) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn beta(&self, _result: &Path, _commit: &str) -> Result<(), Error> {
-        Ok(())
+/// The check of the attestations of every file of a release, with `scratch` an empty
+/// directory for the flipped copy it makes.
+fn attester<'a>(a: &'a StageOfferArgs, root: &'a Path, scratch: &'a Path) -> Gh<'a> {
+    Gh {
+        repo: &a.repo,
+        trusted_root: Some(root),
+        gh: &a.gh,
+        scratch,
     }
 }
 
@@ -291,39 +293,44 @@ fn farm_platforms(
 }
 
 /// `binary --version --json` into the file `out`, run as little as it can be: in its own
-/// directory, with no environment, no input, at most `wait`, and at most [`IDENTITY_CAP`]
-/// bytes of answer. It must exit 0. A binary that outlasts `wait` is killed.
+/// directory, with no environment, no input, no stderr (it would go to the job's public log),
+/// at most `wait`, and at most [`IDENTITY_CAP`] bytes of answer. It must exit 0. A binary that
+/// outlasts `wait` is killed, and one whose output does not end within `wait` of its exit (a
+/// process it left holding the pipe) is an error.
 ///
 /// Run only on a binary taken from a release that was verified: it is the attested build, but
 /// it is still not given the job's credentials.
 ///
 /// # Errors
-/// The binary does not start, outlasts `wait`, answers with more than the cap, fails, or
-/// `out` cannot be written.
+/// The binary does not start, outlasts `wait`, leaves its output open, answers with more than
+/// the cap, fails, or `out` cannot be written.
 pub fn version_json(binary: &Path, out: &Path, wait: Duration) -> Result<(), Error> {
     let what = || format!("{} --version --json", binary.display());
+    let failed = |e: std::io::Error| Error::spawn(what())(e);
     let mut child = Command::new(binary)
         .args(["--version", "--json"])
         .env_clear()
         .current_dir(binary.parent().unwrap_or(Path::new(".")))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(Error::spawn(binary.display().to_string()))?;
     let stdout = child.stdout.take().expect("the child's stdout is piped");
     // Read while it runs, so that a full pipe cannot hold it; past the cap the pipe closes
-    // and the child's next write fails.
-    let reader = std::thread::spawn(move || {
+    // and the child's next write fails. The answer comes back by channel, not by join: a
+    // process the child left holding the pipe would hold a join for as long as it lives.
+    let (send, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let got = stdout.take(IDENTITY_CAP + 1).read_to_end(&mut bytes);
-        got.map(|_| bytes)
+        // The receiver is gone once the wait ran out, and then nobody needs the answer.
+        let _ = send.send(got.map(|_| bytes));
     });
     let deadline = Instant::now() + wait;
     let mut late = false;
     loop {
-        let polled = child.try_wait().map_err(Error::spawn(what()))?;
-        if polled.is_some() {
+        if child.try_wait().map_err(failed)?.is_some() {
             break;
         }
         if Instant::now() >= deadline {
@@ -334,17 +341,16 @@ pub fn version_json(binary: &Path, out: &Path, wait: Duration) -> Result<(), Err
         std::thread::sleep(POLL);
     }
     // Reaped in every case; a killed child closes its pipe, which ends the reader.
-    let status = child.wait().map_err(Error::spawn(what()))?;
+    let status = child.wait().map_err(failed)?;
     if late {
         return Err(Error::Failed(format!(
             "{}: no answer within {wait:?}",
             what()
         )));
     }
-    let bytes = reader
-        .join()
-        .expect("reading a pipe does not panic")
-        .map_err(Error::spawn(what()))?;
+    let open = |_| Error::Failed(format!("{}: its output did not end", what()));
+    let ended = answer.recv_timeout(wait).map_err(open)?;
+    let bytes = ended.map_err(failed)?;
     if bytes.len() as u64 > IDENTITY_CAP {
         return Err(Error::Failed(format!(
             "{}: more than {IDENTITY_CAP} bytes",
@@ -417,8 +423,10 @@ fn stage_release(a: &StageOfferArgs, tag: &str, scratch: &Path) -> Result<Staged
         Some(platform) => platform,
         None => host_platform()?,
     };
-    let (assets, flipped) = (scratch.join("assets"), scratch.join("flipped"));
-    for dir in [&assets, &flipped] {
+    let assets = scratch.join("assets");
+    // Each check of the attestations flips a copy of the release into a directory of its own.
+    let (flipped, rechecked) = (scratch.join("flipped"), scratch.join("rechecked"));
+    for dir in [&assets, &flipped, &rechecked] {
         make_dir(dir)?;
     }
     let root = match &a.trusted_root {
@@ -435,13 +443,7 @@ fn stage_release(a: &StageOfferArgs, tag: &str, scratch: &Path) -> Result<Staged
     )?;
     // 4. Verified, before any of it is run.
     super::check(&assets, &a.sha)?;
-    let attester = Gh {
-        repo: &a.repo,
-        trusted_root: Some(root.as_path()),
-        gh: &a.gh,
-        scratch: &flipped,
-    };
-    attester.artifacts(&assets, &a.sha)?;
+    attester(a, &root, &flipped).artifacts(&assets, &a.sha)?;
     // 5. The runner's own `kbf`, out of the verified tarball.
     let tarball = assets.join(format!("kbf-{}-{}.tar.gz", a.sha, platform.name()));
     let bytes = packaged_binary(&tarball, &read(&tarball)?, "kbf")?;
@@ -464,7 +466,7 @@ fn stage_release(a: &StageOfferArgs, tag: &str, scratch: &Path) -> Result<Staged
             skipped.into_iter().map(|(_, why)| why).collect(),
         ));
     }
-    // 8. The offer.
+    // 8. The offer, which checks the release a second time: the runs above could write to it.
     let farm: Vec<Platform> = complete.iter().map(|p| platform_of(*p)).collect();
     let reason = waiver_reason(tag);
     let doc = offer::plan(
@@ -482,7 +484,7 @@ fn stage_release(a: &StageOfferArgs, tag: &str, scratch: &Path) -> Result<Staged
             previous_version_json: before.as_ref().map(|b| b.version.as_path()),
             now: system_clock(),
         },
-        &Verified,
+        &attester(a, &root, &rechecked),
     )?;
     // 9. Everything is in memory; `--out` is made, and written.
     let offer_bytes = render(&doc)?;

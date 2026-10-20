@@ -83,11 +83,11 @@ fn the_caps_and_the_platform_and_component_lists_are_the_installers() {
     for platform in all {
         components.extend(platform.components());
     }
-    components.sort_unstable();
-    components.dedup();
-    let mut known = installer::COMPONENTS.to_vec();
-    known.sort_unstable();
-    assert_eq!(components, known);
+    // Every component a release stages is one the installer takes. Not the reverse: the
+    // installer may take one (`kbf-daemon`) that no platform of the release stages yet.
+    for component in components {
+        assert!(installer::COMPONENTS.contains(&component), "{component}");
+    }
 }
 
 #[test]
@@ -292,6 +292,20 @@ fn a_binary_that_never_answers_is_killed_after_the_wait() {
     assert!(start.elapsed() < LONG, "waited {:?}", start.elapsed());
     assert!(!a.out.exists());
     assert!(a.dir.exists());
+}
+
+#[test]
+fn a_process_left_holding_the_output_does_not_hold_the_run() {
+    // Catches: a join on the reader of the output, which a process the binary left running
+    // (it exits 0 at once, and the process holds the pipe for 3 s) holds for as long as it
+    // lives: the run must end with an error within the wait, not with the process.
+    let start = Instant::now();
+    let a = asked("orphan", "orphan\n", Duration::from_millis(300));
+    let waited = start.elapsed();
+    let why = a.result.expect_err("an open output").to_string();
+    assert!(why.contains("its output did not end"), "{why}");
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    assert!(!a.out.exists());
 }
 
 #[test]

@@ -62,8 +62,9 @@ fn standard(json: &str) -> Vec<(String, Vec<u8>)> {
 enum Prev<'a> {
     /// None: N's tag is the only one.
     Nothing,
-    /// `PREV_TAG` is a release of `PREV` whose `kbf` answers this.
-    Released(&'a str),
+    /// `PREV_TAG` is a release of `PREV` whose `kbf` answers the first for linux-x86_64 and
+    /// the second for linux-arm64.
+    Released(&'a str, &'a str),
     /// `PREV_TAG` is a tag with no release.
     Unreleased,
 }
@@ -79,7 +80,7 @@ fn world(name: &str, assets: Vec<(String, Vec<u8>)>, prev: Prev) -> Fx {
     let mut more = tag_answers(TAG, SHA);
     match prev {
         Prev::Nothing => {}
-        Prev::Released(_) => {
+        Prev::Released(..) => {
             tags.push((PREV_TAG, "ahead"));
             more.extend(found(PREV_TAG, PREV, SHA));
         }
@@ -90,10 +91,10 @@ fn world(name: &str, assets: Vec<(String, Vec<u8>)>, prev: Prev) -> Fx {
     }
     f.github_for(SHA, &tags, more);
     f.publish(TAG, SHA, &assets);
-    if let Prev::Released(json) = prev {
+    if let Prev::Released(x86_64, arm64) = prev {
         let before = [
-            runnable("linux-x86_64", PREV, json),
-            plain("kbf", "linux-arm64", PREV),
+            runnable("linux-x86_64", PREV, x86_64),
+            runnable("linux-arm64", PREV, arm64),
             plain("kbf", "darwin-arm64", PREV),
         ];
         f.publish(PREV_TAG, PREV, &before);
@@ -429,7 +430,7 @@ fn the_release_before_decides_whether_going_back_is_reversible() {
     ] {
         let answer = identity(PREV, before);
         let assets = standard(&identity(SHA, 4));
-        let f = world(name, assets, Prev::Released(&answer));
+        let f = world(name, assets, Prev::Released(&answer, &answer));
         let (code, out, err) = f.run(&[], None);
         assert_eq!(code, Some(0), "{name}: {err}");
         assert_eq!(value(&out, "previous-source"), "release", "{name}");
@@ -450,9 +451,43 @@ fn a_release_before_that_cannot_be_fetched_or_run_is_an_error() {
     let ran = f.run(&[], None);
     f.assert_refused(ran, &format!("releases/tags/{PREV_TAG}: not found"));
     let assets = standard(&identity(SHA, 4));
-    let f = world("prev-fails", assets, Prev::Released("fail\n"));
+    let f = world("prev-fails", assets, Prev::Released("fail\n", "fail\n"));
     let ran = f.run(&[], None);
     f.assert_refused(ran, "--version --json: exit status");
+}
+
+#[test]
+fn the_release_before_is_run_as_the_runner_platform_and_verified_with_the_trusted_root() {
+    // Catches: the release before run for linux-x86_64 whatever the runner (its linux-x86_64
+    // `kbf` fails here, and its linux-arm64 one says a `meta_log` of 5), and its bundles
+    // verified without the trusted root, over the network: every verification of a bundle,
+    // of either release, names the root.
+    let mut assets = standard(&identity(SHA, 4));
+    assets[1] = runnable("linux-arm64", SHA, &identity(SHA, 4));
+    let before = identity(PREV, 5);
+    let f = world("prev-arm", assets, Prev::Released("fail\n", &before));
+    let (code, _, err) = f.run_with(Some("linux-arm64"), &[], None);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(f.offer().previous_meta_log, Some(5));
+    let asked = f.gh_args();
+    let bundled: Vec<&str> = asked.lines().filter(|l| l.contains("--bundle")).collect();
+    assert!(!bundled.is_empty(), "{asked}");
+    for line in bundled {
+        assert!(line.contains("--custom-trusted-root"), "{line}");
+    }
+}
+
+#[test]
+fn a_release_file_a_kbf_changed_while_it_ran_is_refused_not_bundled() {
+    // Catches: the release verified once, before the runs, and bundled as the runs left it
+    // (the offer's own check of the files left to a stand-in): the runner's `kbf` appends a
+    // byte to the linux-arm64 tarball and makes its line of SHA256SUMS say so, which the
+    // hashes agree with and only the attestation of the file does not.
+    let answer = identity(SHA, 4);
+    let tamper = format!("tamper kbf-{SHA}-linux-arm64.tar.gz\n{answer}");
+    let f = world("changed", standard(&tamper), Prev::Nothing);
+    let ran = f.run(&[], None);
+    f.assert_refused(ran, "no build provenance attestation signed by");
 }
 
 #[test]
@@ -516,18 +551,20 @@ fn a_runner_platform_the_release_has_no_kbf_for_is_an_error() {
 #[cfg(target_os = "linux")]
 #[test]
 fn without_a_runner_platform_the_hosts_own_is_used() {
-    // Catches: a default that is not this host's platform: every platform's `kbf` runs
-    // here, so a host mapped to a platform whose tarball is missing is what fails.
-    let json = identity(SHA, 4);
+    // Catches: a default that is not this host's platform: each platform's `kbf` runs here
+    // and says a `meta_log` of its own (4 for linux-x86_64, 7 for linux-arm64, 9 for the
+    // Mac), so a host mapped to another platform is found by the offer's.
     let assets = vec![
-        runnable("linux-x86_64", SHA, &json),
-        runnable("linux-arm64", SHA, &json),
-        runnable("darwin-arm64", SHA, &json),
+        runnable("linux-x86_64", SHA, &identity(SHA, 4)),
+        runnable("linux-arm64", SHA, &identity(SHA, 7)),
+        runnable("darwin-arm64", SHA, &identity(SHA, 9)),
     ];
     let f = world("host-platform", assets, Prev::Nothing);
     let (code, out, err) = f.run_with(None, &[], None);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(value(&out, "staged"), "true");
+    let want = if cfg!(target_arch = "aarch64") { 7 } else { 4 };
+    assert_eq!(f.offer().meta_log, Some(want));
 }
 
 #[test]

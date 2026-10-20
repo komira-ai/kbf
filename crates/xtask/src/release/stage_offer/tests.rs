@@ -127,14 +127,6 @@ fn a_platform_without_its_sbom_or_its_bundle_is_left_out() {
 }
 
 #[test]
-fn the_offers_own_attestation_check_is_a_check_already_made() {
-    // Catches: the stand-in asking a question (or refusing): the release is verified once,
-    // before anything runs, and the offer must not ask GitHub for every file again.
-    Verified.artifacts(Path::new("dir"), SHA).expect("no question");
-    Verified.beta(Path::new("result"), SHA).expect("no question");
-}
-
-#[test]
 fn the_trusted_root_is_what_gh_printed_and_a_gh_that_cannot_run_is_an_error() {
     // Catches: a root that is not written where the verification reads it, a write that
     // fails ignored, and a gh that does not start taken for an empty root. `true` is a gh

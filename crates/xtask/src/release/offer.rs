@@ -153,7 +153,8 @@ pub struct Request<'a> {
     pub beta: Evidence<'a>,
     /// `kbf --version --json` of the offered build.
     pub version_json: Option<&'a Path>,
-    /// The commit the farm runs now, a full SHA.
+    /// The commit a walk-back returns to, a full SHA: the one the farm runs (`release
+    /// offer`), or the release before this one (`release stage-offer`).
     pub previous: Option<&'a str>,
     /// `kbf --version --json` of the previous build.
     pub previous_version_json: Option<&'a Path>,
