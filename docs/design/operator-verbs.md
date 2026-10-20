@@ -32,7 +32,7 @@ route stays local, and the last column says why.
 Every row is one method and one path. A router `.route(` call that serves two methods has a row
 per method; a custom method (`:cordon`) has a row per verb. The sources of the router are
 `crates/kbf-server/src/{api,release/http,storage_health,health,metrics,http_blobs,
-http_invocations,http_sched,http_history,enroll/api,managed/http}.rs` and `frontend.rs`, where they are merged.
+http_invocations,http_sched,http_history,enroll/api,managed/http,ui_mount}.rs` and `frontend.rs`, where they are merged.
 
 ### Cluster
 
@@ -138,6 +138,17 @@ route on this branch: all three are out of scope of the object-store series (Q5)
 | outcomes of shapes across builds | `GET /v1/grid` | [V] #891 | policy |
 | runs of an action digest | `GET /v1/actions/{digest}/runs` | [V] #891 | policy |
 | runs on a node in a window | `GET /v1/runs` | [V] #891 | policy |
+
+### The web UI
+
+The pages of `kbf-ui`, read-only HTML under `/ui` ([api.md](../api.md#get-ui-the-web-ui)); on by
+default, `--ui=false` turns them off. Open: no gate, whatever the REAPI policy says.
+
+| Verb | Method and route | Status | Gate |
+|---|---|---|---|
+| the Overview page | `GET /ui` | [F] | none (open) |
+| the same, with a trailing slash | `GET /ui/` | [F] | none (open) |
+| every other page and the stylesheet (`/ui/builds`, `/ui/builds/{id}`, `/ui/updates`, `/ui/static/kbf.css`) | `GET /ui/{*rest}` | [F] | none (open) |
 
 ### Health
 

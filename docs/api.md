@@ -103,7 +103,10 @@ listener:
   `docs/design/frontend-proxy.md` section 3), so the host of its instance id and its address
   must be that name (up to ASCII case) or one of those addresses (exact equality). A
   malformed, repeated or oversized `x-kbf-node-ips` is refused `PERMISSION_DENIED`; without
-  one, an IP host is refused. The proxied role must be `storage`.
+  one, an IP host is refused. The proxied role must be `storage`. The proxy also sets
+  `x-kbf-client-addr`, the address the client connected from (canonical IP text, no
+  port), on every call; only the per-caller read bound uses it, and a value that is not one
+  IP address is refused `PERMISSION_DENIED` (HTTP 403).
 
 What the flag does not do, and what the proxy must do:
 
@@ -1747,6 +1750,42 @@ ignored, as RFC 9110 allows, and the whole blob is sent. Every `200` and `206` s
 | `500` | the cache's own records disagree |
 
 Errors are JSON, `{"error": "<why>"}`, as everywhere in this API.
+
+## `GET /ui`: the web UI
+
+Read-only pages for people with a browser, server-rendered HTML from the `kbf-ui` crate
+([design](design/kbf-ui-v1.md)). On the operator API listener, **on by default**:
+`--ui=false` turns it off and every `/ui` path is then a `404`. Without `--api-listen`
+there is nothing to mount it on.
+
+- **Open.** No login, no certificate, no token, whatever the REAPI policy says: the pages
+  are served to whoever reaches the port, and show everything unredacted, including the
+  logs of builds and the arguments of failed commands. The routes the pages read that the
+  policy gates on the network (the build pages, run logs, blobs, `GET /v1/update/hosts`)
+  are asked in process with every caller allowed; asked over the network they keep their
+  gates. Keep the operator API on loopback, or behind the proxy and a network you trust.
+- **Read-only.** `GET` and `HEAD`; every other method is `405`. The write routes and their
+  token are unchanged, and the pages mount none of them.
+- **Pages:** `GET /ui` and `GET /ui/` (Overview), `GET /ui/builds` (look a build up by id), `/ui/builds/{id}`,
+  `/ui/builds/{id}/actions/{digest}`, `/ui/updates`, and the stylesheet at
+  `/ui/static/kbf.css`. Each page lists, at its foot, the `/v1` routes it read, each a link
+  to the JSON.
+- **Headers on every `/ui` answer**, errors included: `Content-Security-Policy:
+  default-src 'none'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri
+  'none'; form-action 'self'` (no script of any kind; the form is the Builds id lookup, a
+  `GET`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
+  `Cache-Control: no-store`.
+- **Bounds.** Each caller has at most 4 reads open at once on `/ui`, and 4 on the read
+  routes the pages use (`/v1/blobs`, `/v1/invocations` and below, `/v1/runs` and the history
+  routes, `/v1/update/hosts`): the fifth is `429` with `Retry-After: 1`, before its handler
+  runs, and a slot is held until the answer's body has been sent or dropped. A caller is
+  the node the proxy named, else the client address the proxy forwarded in
+  `x-kbf-client-addr` (believed only of a call that presented the proxy secret; the header
+  on any other call is stripped unread), else the peer address. So behind the proxy each
+  browser has its own bound; behind a proxy that sends no such header, browsers share the
+  proxy's address and so share one bound. A path longer than 2048 bytes, or a query longer
+  than 4096, is `414`; a path segment longer than 256 bytes, or one that decodes to a
+  control character, is `400`.
 
 ## `STALE_MAP` on a storage node's gRPC calls
 

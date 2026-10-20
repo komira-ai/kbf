@@ -10,5 +10,6 @@ mod edges;
 mod flog;
 #[path = "../pages/mod.rs"]
 mod pages;
+mod raw;
 mod read;
 mod world;

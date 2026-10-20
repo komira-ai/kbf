@@ -34,8 +34,7 @@ use crate::drain::Drain;
 use crate::farm::{Farm, StateError};
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::Readiness;
-use crate::http_blobs::{BlobReaders, ReadBudget};
-use crate::http_invocations::InvocationReaders;
+use crate::http_blobs::ReadBudget;
 use crate::identity::{DenyList, Peers};
 use crate::listen::Binder;
 use crate::members::{Members, MembershipError};
@@ -46,6 +45,7 @@ use crate::state_store::StateStore;
 use crate::store_config::service::ColdStoreService;
 use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
+use crate::ui_mount::bind_server_with_options;
 use crate::worker::WorkerService;
 use crate::worker_roles::WorkerRolesLayer;
 use kbf_mapsync::MapSource;
@@ -698,7 +698,9 @@ where
 /// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]), and
 /// the storage map `map` sent to daemons ([`bind_server_with_map`]), and a TLS-terminating
 /// `proxy` in front of every listener (`--proxy-auth-file`, [`crate::proxy_auth`]; `None`:
-/// the server is reached directly).
+/// the server is reached directly), and the web UI under `/ui` on the operator API
+/// ([`crate::ui_mount`]) when `ui` is given and the operator API listens
+/// ([`crate::ui_mount::bind_server_with_options`] is this with the UI on).
 ///
 /// # Errors
 /// As [`bind_server_with_state`].
@@ -706,7 +708,7 @@ where
     clippy::too_many_arguments,
     reason = "every option the bind functions delegate"
 )]
-pub fn bind_server_with_options<M, O>(
+pub fn bind_server_with_ui<M, O>(
     cache: Arc<Cache<M, O>>,
     listeners: Listeners,
     api: Option<Api>,
@@ -715,6 +717,7 @@ pub fn bind_server_with_options<M, O>(
     storage: Option<tonic::transport::Endpoint>,
     map: Option<Arc<dyn MapSource>>,
     proxy: Option<Behind>,
+    ui: bool,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
 where
@@ -795,18 +798,14 @@ where
     let drain = Arc::new(drain);
     let checks =
         crate::health::cache_checks(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
-    let blob_routes = crate::http_blobs::router(
-        Arc::clone(&cache),
-        BlobReaders::from_policy(&policy),
-        budget.clone(),
-    );
-    let page_routes = crate::http_invocations::router(
-        recorder.clone(),
-        Arc::clone(&cache),
-        InvocationReaders::from_policy(&policy),
-        history.as_ref().map(crate::history::History::reads),
+    let reads = crate::ui_mount::Reads {
+        cache: Arc::clone(&cache),
+        recorder: recorder.clone(),
+        history: history.as_ref().map(crate::history::History::reads),
         budget,
-    );
+        farm: Arc::clone(&farm),
+        rows: update_rows.clone(),
+    };
     let offers =
         crate::release::offers::offers_of(releases.clone(), update_rows.clone(), listeners.tick);
     let api_routes = crate::api::router(
@@ -820,11 +819,6 @@ where
     )
     .merge(crate::verbs::routes(token.clone(), members.clone()))
     .merge(crate::release::router(releases.clone(), token.clone()))
-    .merge(crate::update_hosts::router(
-        Arc::clone(&farm),
-        update_rows.clone(),
-        crate::update_hosts::FarmReaders::from_policy(&policy),
-    ))
     .merge(crate::release::desired::router(
         releases.clone(),
         update_rows,
@@ -839,13 +833,13 @@ where
         poll_stats.clone(),
         members.clone(),
         tls_sources,
-    ))
-    .merge(blob_routes)
-    .merge(page_routes);
+    ));
     // The storage health, if there are members: no branch in this generic function.
     let api_routes = members.iter().fold(api_routes, |routes, members| {
         routes.merge(crate::storage_health::router(Arc::clone(members)))
     });
+    // The gated reads (blobs, builds, runs, host updates) under the policy, and `/ui`.
+    let api_routes = crate::ui_mount::mount(api_routes, &reads, &policy, ui);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
