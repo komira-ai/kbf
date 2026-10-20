@@ -739,3 +739,13 @@ fn update_is_refused_through_sudo_before_it_reads_anything() {
     let err = String::from_utf8(err).expect("text");
     assert!(!err.contains("through sudo"), "{err}");
 }
+
+/// Catches a sudo test that takes root's own `SUDO_UID` or an unset one for another account
+/// (an operator running as root would be refused), or a caller's uid for none.
+#[test]
+fn only_a_sudo_uid_of_another_account_is_a_sudo_caller() {
+    use std::ffi::OsStr;
+    assert!(!is_sudo_uid(None));
+    assert!(!is_sudo_uid(Some(OsStr::new("0"))));
+    assert!(is_sudo_uid(Some(OsStr::new("1000"))));
+}

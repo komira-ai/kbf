@@ -286,7 +286,12 @@ fn finish_setup(
 /// Whether the caller came through `sudo` from another account: sudo sets `SUDO_UID` to the
 /// caller's uid and a caller cannot unset it for the command (the test `deploy` makes).
 fn sudo_caller() -> bool {
-    std::env::var_os("SUDO_UID").is_some_and(|u| u != "0")
+    is_sudo_uid(std::env::var_os("SUDO_UID").as_deref())
+}
+
+/// [`sudo_caller`] for a `SUDO_UID` that is `uid`: set, and not root's own.
+fn is_sudo_uid(uid: Option<&std::ffi::OsStr>) -> bool {
+    uid.is_some_and(|u| u != "0")
 }
 
 /// `update`, refused through `sudo`. The verb takes `--api`, `--api-ca`, `--api-server-name`
