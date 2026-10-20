@@ -152,4 +152,17 @@ mod tests {
         assert!(empty.is_empty());
         assert_eq!(empty, Platform::new());
     }
+
+    /// Catches: a length that counts something other than the distinct properties, or an
+    /// empty platform that says it holds some (or one that holds some saying it is empty).
+    #[test]
+    fn length_and_emptiness_follow_the_properties() {
+        let none = Platform::new();
+        assert_eq!((none.len(), none.is_empty()), (0, true));
+        let two = Platform::from_properties([("a", "1"), ("b", "")]).unwrap();
+        assert_eq!((two.len(), two.is_empty()), (2, false));
+        let mut one = Platform::new();
+        one.insert("a", "1").unwrap();
+        assert_eq!((one.len(), one.is_empty()), (1, false));
+    }
 }

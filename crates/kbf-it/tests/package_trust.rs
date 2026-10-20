@@ -95,7 +95,7 @@ fn the_installer_reads_the_branch_pkg_trust_wrote_and_no_other() {
     // trusting a branch other than the one it was built on.
     let refs = [
         DEFAULT_REF,
-        "refs/heads/feature/arch-v2",
+        "refs/heads/team/topic-2",
         "refs/heads/release/1.2_x-y",
     ];
     for source_ref in refs {
@@ -118,7 +118,7 @@ fn xtask_and_the_installer_agree_on_which_refs_are_branches() {
     // ref the installer refuses (which `pkg-asset` would then ship).
     for r in [
         "refs/heads/main",
-        "refs/heads/feature/arch-v2",
+        "refs/heads/team/topic-2",
         "refs/heads/a.b_c-d/e",
         "refs/heads/-x",
         "main",

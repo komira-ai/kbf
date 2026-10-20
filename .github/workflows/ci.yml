@@ -5,7 +5,7 @@
 #
 # A pull request runs only this. The rest of the suite (the slow tests, the Arm run, the
 # jobs that need a service, root, crun or a Mac, the packages and the beta smoke) runs on a
-# push to main or feature/arch-v2, in beta.yml. This workflow runs on those pushes too, so
+# push to main, in beta.yml. This workflow runs on those pushes too, so
 # the merged result meets the same gate and the Cargo cache below is saved.
 #
 # The Cargo cache (registry, git checkouts and target) is keyed on the runner, the job,
@@ -17,7 +17,7 @@ on:
   pull_request:
   merge_group:
   push:
-    branches: [main, feature/arch-v2]
+    branches: [main]
 
 permissions: {}
 

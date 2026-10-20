@@ -1,0 +1,27 @@
+[package]
+name = "kbf-blackbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# T009's black-box suites, tests only: see README.md. No library target and no binary of
+# its own; the farm's processes are found beside the test binary (`kbf_harness::stand_in`).
+# Everything is a dev-dependency, so nothing here is linked into a shipped binary.
+
+[dev-dependencies]
+# The farm of real `kbf` processes, started from the units `kbf-deploy` renders.
+kbf-harness.workspace = true
+# The REAPI messages and client of the driven session (tests/all_in_one.rs).
+kbf-proto.workspace = true
+# The act steps the stand-in `crun` runs through this test binary, and a scratch directory.
+kbf-testkit.workspace = true
+kbf-transfer.workspace = true
+prost.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tonic = { workspace = true, features = ["tls-ring"] }
+
+[lints]
+workspace = true

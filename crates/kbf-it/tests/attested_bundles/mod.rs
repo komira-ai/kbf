@@ -4,7 +4,7 @@
 //! A host verifies a tarball offline with one file, `<tarball>.sigstore.json`, the
 //! Sigstore bundle of a build provenance attestation whose only subject is that tarball
 //! (docs/artifacts.md). Nothing about it runs on a pull request: the attest jobs sign
-//! only on a push to `main` or `feature/arch-v2`, so a tarball added to a build job
+//! only on a push to `main`, so a tarball added to a build job
 //! without its steps would pass every pull request check and turn the branch red, or
 //! worse, release without a bundle. [`gaps`] reads the workflows and names the tarball:
 //!

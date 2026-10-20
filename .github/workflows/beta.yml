@@ -1,5 +1,5 @@
 # Everything the pull-request gate (ci.yml: lint, and test on the fast set) leaves out, run
-# on a push to main or feature/arch-v2 and never on a pull request: the whole nextest run
+# on a push to main and never on a pull request: the whole nextest run
 # with its slow tests, the Arm run, the jobs that need a service or a root or a Mac
 # (Postgres, S3 stores, crun, the M1 and M2 cells, macOS), the Linux packages, and the beta
 # smoke below. The stage lint (crates/kbf-it/tests/workflows/stages.rs) allows `push` only.
@@ -26,11 +26,11 @@ name: beta
 
 on:
   push:
-    branches: [main, feature/arch-v2]
+    branches: [main]
 
 permissions: {}
 
-# One beta run at a time in the whole repository, main and feature/arch-v2 alike. GitHub
+# One beta run at a time in the whole repository. GitHub
 # keeps at most one running and one pending run per concurrency group: a run queued while
 # another runs waits as pending, and a newer pending run replaces (cancels) the older
 # pending one, so the newest push waits its turn and a run in progress is never cancelled
