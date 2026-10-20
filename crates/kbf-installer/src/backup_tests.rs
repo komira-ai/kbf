@@ -584,6 +584,14 @@ fn settings_come_from_installer_toml_and_refuse_a_password() {
         err.contains("password") && !err.contains("hunter2"),
         "{err}"
     );
+    // The keyword form passes the URL check but names no role or database the verbs can use,
+    // so it is refused with the file's name, not guessed at.
+    let kw = conf("database = \"host=/run/postgresql dbname=kbf user=kbf-server\"\n");
+    let err = Settings::read(&kw).unwrap_err();
+    assert!(
+        err.contains("installer.toml") && err.contains("postgres://"),
+        "{err}"
+    );
     let err = Settings::read(&scratch().join("none.toml")).unwrap_err();
     assert!(err.contains("none.toml"), "{err}");
 }
