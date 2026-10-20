@@ -89,16 +89,16 @@ async fn granted(cell: &Cell, name: &str, caps: &[(&str, &str)], platform: &[(&s
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_granted_lease_names_the_os_family_and_isa_the_action_asked_for() {
     capture();
-    let cell = Cell::start().await;
+    // One cell per action: with two idle nodes the scheduler may pick either.
     granted(
-        &cell,
+        &Cell::start().await,
         "audit-linux",
         LINUX,
         &[("OSFamily", "Linux"), ("ISA", "x86-64")],
     )
     .await;
-    granted(&cell, "audit-mac", MAC, &[("OSFamily", "Darwin")]).await;
-    granted(&cell, "audit-none", LINUX, &[]).await;
+    granted(&Cell::start().await, "audit-mac", MAC, &[("OSFamily", "Darwin")]).await;
+    granted(&Cell::start().await, "audit-none", LINUX, &[]).await;
 
     let linux = the_line("lease granted", "audit-linux");
     assert!(has(&linux, "os_family=linux"), "{linux:?}");
@@ -118,7 +118,6 @@ async fn a_granted_lease_names_the_os_family_and_isa_the_action_asked_for() {
 async fn a_finished_lease_names_the_exit_code_or_a_dash() {
     capture();
     let cell = Cell::start().await;
-
     let mut exited = cell.daemon("audit-exit", 4, 8).await;
     let job = Job::new("exits 126", &[]);
     cell.upload(&job.blobs()).await;
@@ -128,6 +127,8 @@ async fn a_finished_lease_names_the_exit_code_or_a_dash() {
     assert!(exited.report(ran(start.lease_id, &result)).await.accepted);
     done(&mut ops).await;
 
+    // Another cell: with two idle nodes the second action may go to the first.
+    let cell = Cell::start().await;
     let mut broken = cell.daemon("audit-infra", 4, 8).await;
     let job = Job::new("never runs", &[]);
     cell.upload(&job.blobs()).await;
