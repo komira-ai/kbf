@@ -147,10 +147,10 @@ impl Trees {
             return None;
         }
         let &(at, seq) = inner.dirs.get(dir)?;
-        let believed = now.saturating_duration_since(at) < self.ttl
-            && inner.floor.is_none_or(|floor| at >= floor);
+        // No floor check: `distrust` clears the entries, and `record` refuses any that
+        // began before the floor, so an entry here never predates it.
         inner.recency.remove(&seq);
-        if !believed {
+        if now.saturating_duration_since(at) >= self.ttl {
             inner.dirs.remove(dir);
             return None;
         }
