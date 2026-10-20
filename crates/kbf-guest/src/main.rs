@@ -49,8 +49,14 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    if let Err(e) = session::refuse_root_here() {
+    run(Cli::parse(), session::refuse_root_here())
+}
+
+/// Runs the subcommand `cli` names, unless `root` is the refusal to run as root
+/// ([`session::refuse_root_here`]): then it says why on stderr and exits 2, with
+/// nothing run and nothing created.
+fn run(cli: Cli, root: Result<(), String>) -> ExitCode {
+    if let Err(e) = root {
         eprintln!("{e}");
         return ExitCode::from(2);
     }
@@ -103,4 +109,38 @@ fn serve(
     });
     let served = agent.serve(&listener);
     served.map_err(|e| format!("accepting: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A command line of `kbf-guest` with `args`.
+    fn cli(args: &[&str]) -> Cli {
+        Cli::parse_from(std::iter::once("kbf-guest").chain(args.iter().copied()))
+    }
+
+    /// A `serve` whose token file does not exist, so that it fails (exit 1) if it runs
+    /// at all.
+    const SERVE_WITHOUT_A_TOKEN: [&str; 5] = [
+        "serve",
+        "--unix-socket=/nonexistent/kbf-guest.sock",
+        "--token-file=/nonexistent/kbf-guest.token",
+        "--inputs=/nonexistent/inputs",
+        "--outputs=/nonexistent/outputs",
+    ];
+
+    /// Catches a root process that goes on to run its subcommand (mutants: the refusal
+    /// dropped, or answered with another status): given the refusal, `session` and
+    /// `serve` both exit 2, where without it `session` exits 0 and a `serve` with no
+    /// token file exits 1, so the status shows the subcommand did not run.
+    #[test]
+    fn a_process_that_is_root_exits_2_before_running_its_subcommand() {
+        let refusal = || Err("kbf-guest refuses to run as root".to_owned());
+        let serve = &SERVE_WITHOUT_A_TOKEN;
+        assert_eq!(run(cli(&["session"]), refusal()), ExitCode::from(2));
+        assert_eq!(run(cli(serve), refusal()), ExitCode::from(2));
+        assert_eq!(run(cli(&["session"]), Ok(())), ExitCode::SUCCESS);
+        assert_eq!(run(cli(serve), Ok(())), ExitCode::FAILURE);
+    }
 }

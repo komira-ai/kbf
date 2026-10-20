@@ -184,6 +184,8 @@ impl Scheduler {
                     booked: request.resources,
                     device: None,
                     start_sent: Some(sent),
+                    granted_at: self.now,
+                    started_at: None,
                 };
                 self.held.insert(lease, held);
                 self.awaited.entry(worker.clone()).or_insert(until);
@@ -212,6 +214,7 @@ impl Scheduler {
                 avoid,
                 not_started,
                 losses,
+                queued_at: self.now,
             },
         );
     }

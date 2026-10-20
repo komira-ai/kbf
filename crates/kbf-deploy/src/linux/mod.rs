@@ -7,7 +7,7 @@
 //!   ([`modes`]). It writes nothing else, so it needs no `--apply`.
 //! - `kbf-deploy linux check-units --config FILE --dir DIR --mode MODE [--installable]`
 //!   checks the two, each with its drop-ins (`<name>.d/*.conf`), against [`modes`]'
-//!   rules (docs/deploy/kbf-modes.md) and prints one `FAIL <rule>: <reason>` line per
+//!   rules (docs/deploy/kbf-units.md) and prints one `FAIL <rule>: <reason>` line per
 //!   broken rule. It does not run `kbf`: whether `kbf` takes a unit's flags is
 //!   `kbf --mode=<mode> --check`'s answer, and kbf-cli's tests parse each rendered unit.
 //!

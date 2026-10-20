@@ -104,6 +104,7 @@ pub use scheduler::memory::{
     NOT_STARTED_RERUNS,
 };
 pub use scheduler::{
-    FINISHED_RETENTION, Fate, OpState, PLACEMENT_ROUND, Recovered, RecoveredLease, Scheduler,
-    UNSERVABLE_WAIT,
+    Avoided, FINISHED_RETENTION, Fate, LeasePhase, LeaseView, MAX_AVOIDED, OpState,
+    PLACEMENT_ROUND, QueueGroup, QueueView, Recovered, RecoveredLease, Scheduler, Snapshot,
+    UNSERVABLE_WAIT, WaitingGroup, platform_label,
 };

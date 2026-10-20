@@ -173,6 +173,23 @@ fn run_defaults_its_directories_to_the_layouts_on_every_platform() {
     assert_eq!(args.orders_dir_in(&layout).as_str(), "/srv/o");
 }
 
+/// Catches the parser putting the Linux directories back as `proxy` defaults: without the flags
+/// they are unset (so the layout's apply), with them they are what was typed.
+#[test]
+fn proxy_leaves_its_directories_to_the_layout_unless_flagged() {
+    let Verb::Proxy(args) = parse(&["proxy"]).verb else {
+        panic!("proxy");
+    };
+    assert_eq!((args.update_dir, args.orders_dir), (None, None));
+    let Verb::Proxy(args) =
+        parse(&["proxy", "--update-dir", "/srv/u", "--orders-dir", "/srv/o"]).verb
+    else {
+        panic!("proxy");
+    };
+    assert_eq!(args.update_dir, Some("/srv/u".into()));
+    assert_eq!(args.orders_dir, Some("/srv/o".into()));
+}
+
 /// Catches the proxy verb asking for root (it runs as the service user), a refused table
 /// leaving as anything but a usage error with its path, and `--json` losing the reason.
 #[test]
@@ -213,8 +230,8 @@ fn the_proxy_verb_runs_unprivileged_and_refuses_a_bad_table_as_usage() {
         !Verb::Proxy(ProxyArgs {
             config: Some(file),
             check: true,
-            update_dir: "/var/lib/kbf-installer".into(),
-            orders_dir: "/var/lib/kbf-installer/orders".into(),
+            update_dir: Some("/var/lib/kbf-installer".into()),
+            orders_dir: Some("/var/lib/kbf-installer/orders".into()),
         })
         .needs_root()
     );
@@ -341,8 +358,7 @@ fn no_command_takes_a_positional_argument() {
     assert!(found.is_empty(), "{found:?}");
 }
 
-/// Catches the public verb list drifting from the contract's table (section 2) plus the
-/// state database's `backup` and `restore` (frontend-proxy.md section 11): the visible
+/// Catches the public verb list drifting from the contract's table (section 2): the visible
 /// verbs, and that the three internal ones stay out of the help.
 #[test]
 fn the_visible_verbs_are_the_contracts() {
@@ -368,8 +384,6 @@ fn the_visible_verbs_are_the_contracts() {
             "migrate",
             "quiesce",
             "check",
-            "backup",
-            "restore",
             "proxy"
         ]
     );
@@ -878,6 +892,65 @@ fn run_with_an_installer_config_refuses_a_relative_host_root() {
     };
     let refused = build_helper(PathBuf::from("relative-root"), &args).err();
     assert!(refused.is_some_and(|f| !f.why.is_empty()));
+}
+
+fn run_args(extra: &[&str]) -> RunArgs {
+    let mut argv = RUN.to_vec();
+    argv.extend_from_slice(extra);
+    let Verb::Run(args) = parse(&argv).verb else {
+        panic!("a run");
+    };
+    args
+}
+
+/// The file the fetcher reads is `--installer-config` when it is given and the file `setup`
+/// writes when it is not.
+///
+/// Catches the flag ignored (the fetcher would read a file the operator did not name) and a
+/// default that is not `setup`'s file.
+///
+/// Mutants planted: the flag's arm returning the default.
+#[test]
+fn the_fetcher_reads_the_flags_installer_toml_else_the_one_setup_writes() {
+    let root = || kbf_host::Root::new("/").expect("root");
+    let linux = Layout::new(root(), Platform::Linux);
+    let mac = Layout::new(root(), Platform::MacOs);
+    assert_eq!(
+        installer_toml_of(&run_args(&[]), &linux).as_str(),
+        "/etc/kbf/installer.toml"
+    );
+    assert_eq!(
+        installer_toml_of(&run_args(&[]), &mac).as_str(),
+        "/usr/local/etc/kbf/installer.toml"
+    );
+    let flagged = run_args(&["--installer-config", "/srv/kbf/installer.toml"]);
+    assert_eq!(
+        installer_toml_of(&flagged, &linux).as_str(),
+        "/srv/kbf/installer.toml"
+    );
+}
+
+/// `run` builds its helper with the host's fetcher, not the build's `NotWired`: a fetch on a
+/// scratch host with no `installer.toml` (and no fetch user, on a box that has none) is
+/// `Unavailable` with a reason, where the unwired fetcher says it has no fetcher at all.
+///
+/// Catches `build_helper` going back to `fetcher::NotWired` (every fetch refused with no reason
+/// to act on).
+///
+/// Mutants planted: `Box::new(fetcher::NotWired)` in place of the host fetcher.
+#[test]
+fn run_builds_its_helper_with_the_host_fetcher_not_the_unwired_one() {
+    let (_, root) = seeded("run-fetcher");
+    let helper = build_helper(root, &run_args(&[])).unwrap_or_else(|f| panic!("{}", f.why));
+    let rec = crate::helper::fetcher::ReleaseLocator {
+        commit: c(B),
+        components: Vec::new(),
+    };
+    let got = helper.fetcher().fetch(&rec);
+    assert!(
+        matches!(&got, Err(crate::helper::fetcher::FetchError::Unavailable(why)) if !why.is_empty()),
+        "{got:?}"
+    );
 }
 
 /// Catches `update` being gated on root (it is a client of the update API and runs as
@@ -1466,6 +1539,3 @@ fn a_path_is_not_joined_to_a_relative_root() {
         PathBuf::from("/srv/root/etc/kbf/installer.toml")
     );
 }
-
-#[path = "app_backup_tests.rs"]
-mod backup_cli;
