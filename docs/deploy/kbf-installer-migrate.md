@@ -64,6 +64,10 @@ refused, exit 2, before any release is run):
    state beside it reads as a lost state), `status.json` (the shape the node reads, with `unverified`
    added) and the units' `Exec*=` lines (the first original of each unit is kept in
    `migration-units/`), reloads the unit manager, and starts what it stopped.
+   Last, with `--installer-unit`, it enables the installer's own unit and starts it (`systemctl enable
+   --now` unless `is-enabled` says enabled; `launchctl bootstrap` unless the job is loaded: what `setup`
+   does), so the migrated host takes orders without a `setup` run. A unit that will not come up ends the
+   run with exit 5 before the journal says done; run it again. The frontend and the proxy are never started.
 
    The old tools' lock is `flock(2)` on `/run/kbf-deploy.lock` (macOS `/var/run/kbf-deploy.lock`).
    On Linux that is where the deploy kit took its own (`File::lock` on that path, in the `state.rs`
