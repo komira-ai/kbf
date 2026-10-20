@@ -43,9 +43,9 @@ use super::model::PortError;
 use super::model::{Mode, Phase, ProcIdent, Slot, Timing};
 use super::orders::OrderSpool;
 use super::ports::{Child, Gate};
-use super::ports::{ChildAdmin, Migrator, RootOrders};
+use super::ports::{ChildAdmin, Migrator};
 use super::record::FileRecorder;
-use super::root_orders::SpoolRootOrders;
+use super::root_orders::{SpoolRootOrders, StatusFile};
 use super::runtime::{RequestQueue, SystemClock};
 use super::supervisor_swap::{Config, Parts, SwapSupervisor};
 use crate::CommitId;
@@ -223,16 +223,16 @@ pub(super) type ApplyHook =
 /// refusal `database_error: ...` of step `migrate`, with [`DatabaseError`](crate::database::DatabaseError)'s
 /// words (they carry the path, never a password: the file may not carry one).
 pub struct StateDbMigrator {
-    orders: Arc<dyn RootOrders + Send + Sync>,
+    facts: StatusFile,
     installer_toml: PathBuf,
     apply: Option<ApplyHook>,
 }
 
 impl StateDbMigrator {
     #[must_use]
-    pub fn new(orders: Arc<dyn RootOrders + Send + Sync>, installer_toml: PathBuf) -> Self {
+    pub fn new(status_file: impl Into<PathBuf>, installer_toml: PathBuf) -> Self {
         StateDbMigrator {
-            orders,
+            facts: StatusFile::new(status_file),
             installer_toml,
             apply: None,
         }
@@ -243,7 +243,7 @@ impl Migrator for StateDbMigrator {
     fn migrate_forward(&self, release: &CommitId) -> Result<(), PortError> {
         let db = Database::from_installer_toml(&self.installer_toml)
             .map_err(|e| PortError(format!("database_error: {e}")))?;
-        let migrator = DbMigrator::new(db, &*self.orders);
+        let migrator = DbMigrator::new(db, &self.facts);
         match &self.apply {
             None => migrator.migrate_forward(release),
             Some(apply) => {
@@ -268,7 +268,7 @@ fn build(cfg: &HandoverConfig, spool: &OrderSpool, host: &Host, seams: &Seams) -
     });
     let migrator = StateDbMigrator {
         apply: seams.apply.clone(),
-        ..StateDbMigrator::new(orders.clone(), cfg.installer_toml.clone())
+        ..StateDbMigrator::new(&cfg.status_file, cfg.installer_toml.clone())
     };
     let recorded = Arc::clone(&host.recorded);
     let parts = Parts {

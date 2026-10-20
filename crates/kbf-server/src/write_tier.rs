@@ -37,9 +37,10 @@ pub enum WriteTierError {
 /// `cache` with the hot store's tier attached, and what its start found; the cache as it
 /// was when there is no hot store.
 ///
-/// With a tier, the Raft log is first raised to machine version 2, whose format carries
-/// the tier's commands ([`RaftMetaLog::raise_machine_version`]; a log already there
-/// commits nothing; from then on a binary that runs only version 1 refuses the log), then
+/// With a tier, the Raft log is first raised to machine version 5, whose format carries
+/// the tier's commands, including the move of a conflicting staged object's records
+/// ([`RaftMetaLog::raise_machine_version`]; a log already there commits nothing; from
+/// then on a binary that runs only an earlier version refuses the log), then
 /// the tier's start recovers the directory against the committed staged table, which
 /// outlives the process ([`Cache::attach_tier`]). Without a tier the log is not touched,
 /// so it stays one an older binary reads.
@@ -83,7 +84,7 @@ where
     };
     cache
         .meta()
-        .raise_machine_version(MachineVersion::V2)
+        .raise_machine_version(MachineVersion::V5)
         .map_err(WriteTierError::Log)?;
     let (cache, startup) = cache.attach_tier(fs, options, SERVER, hot.abandon).await?;
     tracing::info!(

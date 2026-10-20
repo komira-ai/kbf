@@ -76,10 +76,13 @@ The server checks the version, the node id, that the client certificate names th
 node id and neither is denied ([below](#node-identity-and-the-deny-list)), the capacity
 entries and the entries placement matches (`arch`; a repeated single-valued entry; a
 countable entry that is not a whole number). If any fails, it ends the stream with an
-error status (`FAILED_PRECONDITION` for an unaccepted version, `PERMISSION_DENIED` for
+error status (`FAILED_PRECONDITION` for a version below the oldest, `PERMISSION_DENIED` for
 a certificate that does not name the node or a denied one, `UNAVAILABLE` while the
 deny list cannot be read, `INVALID_ARGUMENT` otherwise). A stream that sends no `Hello` within 10 seconds ends
-`DEADLINE_EXCEEDED`. On success it answers `Welcome` with the version it will speak,
+`DEADLINE_EXCEEDED`. On success it answers `Welcome` with the version it will speak (the lesser of the
+`Hello`'s and the newest the server speaks: a `Hello` newer than the server is answered
+with the server's newest, not refused, and a daemon accepts a `Welcome` from the oldest
+version it speaks up to the one its `Hello` named),
 the heartbeat interval in milliseconds, and its **lease epoch** (see
 [Server restarts and the lease epoch](#server-restarts-and-the-lease-epoch)).
 
@@ -456,7 +459,7 @@ to the action cache, unless the action is `do_not_cache`, **before** the operati
 callers are answered.
 
 The server answers every `Result` that names a lease with `ResultAck { lease_id,
-accepted }`. `accepted` is true when the `Result` became the operation's result, and
+accepted, reason }`. `accepted` is true when the `Result` became the operation's result, and
 for a memory kill or lost run the scheduler took (the operation then runs again, or is
 answered).
 It is false when the lease is unknown (a lease of another
@@ -464,6 +467,21 @@ process is), held by another node, no longer the operation's current lease, when
 `Result` names another action, or when the operation already finished (a duplicate).
 A copy of a memory kill already taken is refused: its lease is no longer current.
 A refused result never reaches the action cache.
+
+`reason` says why, and is a new field within version 1 (a daemon that predates it reads
+`accepted`; a server that predates it leaves the reason unspecified, which a daemon takes
+as "acknowledged, forget the Result"):
+
+| reason | when |
+|---|---|
+| `ACCEPTED` | the `Result` became the operation's result (or a memory kill or lost run the scheduler took) |
+| `DUPLICATE` | the operation is already answered: the first valid writer won |
+| `STALE` | the lease was given up or granted again, or another node holds it: the `Result` is of an earlier attempt |
+| `UNKNOWN_LEASE` | the server never granted the lease: an unknown one, or one of another lease epoch |
+| `MISMATCH` | the `Result` names another action than its lease runs |
+
+There is no attempt number on the wire: the lease id is the attempt, because a lease id
+is unique per grant and a re-grant of the operation gets a new one.
 
 The ack follows the commit: the server sends it once the state store has taken the row
 that records the result, never before. While the store refuses the write the server
@@ -479,7 +497,12 @@ Until a daemon receives the `ResultAck` for a lease, it keeps the `Result`:
 - every new stream resends it right after `Welcome`, before the first `Heartbeat`;
 - a `Result` produced while disconnected goes out the same way.
 
-Once acknowledged, accepted or not, the daemon forgets it.
+Once acknowledged, accepted or not, whatever the reason, the daemon forgets it, and
+makes no resend decision from `accepted`. The daemon keeps at most 1024 unacknowledged
+Results (`DaemonConfig::max_unacked`); over that a new Result is sent once and not
+kept, and the oldest stay. The Results it keeps survive a session drop and reconnect, not
+a restart of the daemon process: a restart loses the run with it, and the server re-grants
+the lease as a new attempt (`predecessor_instance_id` makes that quick).
 
 ### Server restarts and the lease epoch
 

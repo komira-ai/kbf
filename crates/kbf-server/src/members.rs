@@ -7,6 +7,7 @@
 //! | key | value | lives |
 //! |---|---|---|
 //! | `instance/<instance id>` | the member id | for ever: a node that returns keeps its id |
+//! | `member-owner/<id>` | the instance id: written with `instance/<instance id>`, so one id is never given to two instances | for ever |
 //! | `member/<id>` | the member (address, zone, weight, admin state), its boot counter, its newest debts report and the protocol version it registered naming | `ttl` after the last heartbeat |
 //! | `down/<id>` | nothing | `dwell` from the moment the member went `Down` |
 //! | `map` | the current `kbf.map.v1.Map` | for ever; a change is one compare-and-set |
@@ -104,7 +105,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_map::{DenyEntry, Map, MapError, Member, MemberId, MemberState, Rule};
-use kbf_mapsync::MapSource;
+use kbf_mapsync::{MapSource, RETAINED_MAPS};
 use kbf_proto::kbf::map::v1 as pb;
 use kbf_state::{Cond, Store, StoreError, StoreTime, Txn, Version, Versioned};
 use prost::Message as _;
@@ -118,7 +119,11 @@ use crate::worker::named_protocol;
 
 mod denials;
 pub use denials::Denial;
+mod assign;
 mod join;
+mod pins;
+pub use assign::{LastBoot, MAX_SEED};
+use pins::pin_key;
 mod look;
 pub use look::{MemberLook, MembersLook};
 
@@ -298,6 +303,16 @@ pub enum MembershipError {
         /// Its state.
         state: MemberState,
     },
+    /// The pins are at the cap: a new join or drain is refused until one lapses.
+    #[error(
+        "{held} maps from before recent changes are pinned (the cap is {cap}): try again after the dwell"
+    )]
+    PinsFull {
+        /// How many pins the store holds.
+        held: usize,
+        /// The cap.
+        cap: usize,
+    },
     /// Another writer kept winning the compare-and-set.
     #[error("gave up after {ATTEMPTS} attempts against other writers")]
     Contended,
@@ -454,6 +469,12 @@ fn boot_counter(id: MemberId) -> String {
     format!("boot/{}", id.0)
 }
 
+/// The claim on a member id: `member-owner/<id>` holds the instance that has it, written
+/// with the instance's own row so no two instances are ever given one id.
+fn owner_key(id: MemberId) -> String {
+    format!("member-owner/{}", id.0)
+}
+
 fn instance_key(instance: &str) -> String {
     format!("instance/{instance}")
 }
@@ -566,18 +587,19 @@ enum Touch {
     UndoPlan,
 }
 
-/// The maps a process has seen: the newest, and the generation it replaced.
+/// The maps a process has seen: the newest, and the generations before it.
 #[derive(Default)]
 struct Seen {
     latest: Option<Arc<Map>>,
-    previous: Option<Arc<Map>>,
+    /// Newest first, all older than `latest`, at most [`RETAINED_MAPS`].
+    history: Vec<Arc<Map>>,
 }
 
 /// Membership over a state store.
 pub struct Members {
     store: Arc<dyn Store>,
     config: MembershipConfig,
-    /// The newest map this process has seen, whoever bumped it, and the one before it.
+    /// The newest map this process has seen, whoever bumped it, and those before it.
     seen: Mutex<Seen>,
     /// Its generation (0 before any): [`MapSource::changes`].
     generation: watch::Sender<u64>,
@@ -612,28 +634,45 @@ impl Members {
         }
     }
 
-    /// Notes `map` as seen: if it is newer than the last, keeps it and wakes the
-    /// [`MapSource::changes`] receivers.
-    fn publish(&self, map: &Map) {
+    /// Notes `map` as seen: if it is newer than the last, keeps it (and the one it
+    /// replaced) and wakes the [`MapSource::changes`] receivers. `older` are maps the
+    /// store holds from before `map` (the pins, or the map a bump replaced): those this
+    /// process does not have join its history, which stays newest first and at most
+    /// [`RETAINED_MAPS`] long.
+    fn publish(&self, map: &Map, older: Vec<Map>) {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         if seen
             .latest
             .as_ref()
             .is_none_or(|l| l.generation() < map.generation())
         {
-            seen.previous = seen.latest.replace(Arc::new(map.clone()));
+            if let Some(replaced) = seen.latest.replace(Arc::new(map.clone())) {
+                seen.history.insert(0, replaced);
+            }
             self.generation.send_replace(map.generation());
         }
+        let newest = seen.latest.as_ref().map_or(0, |l| l.generation());
+        for map in older {
+            let generation = map.generation();
+            if generation < newest && seen.history.iter().all(|m| m.generation() != generation) {
+                seen.history.push(Arc::new(map));
+            }
+        }
+        seen.history
+            .sort_by_key(|m| std::cmp::Reverse(m.generation()));
+        seen.history.truncate(RETAINED_MAPS);
     }
 
-    /// The newest map this process has seen and the one it replaced, which a call routed
-    /// by the newer finds a blob written before the change in. `None` before any map.
-    /// Reads no store: [`Members::current_map`] does, and publishes what it finds.
+    /// The newest map this process has seen and the generations before it, newest first
+    /// (a blob written before a change is found in them), at most [`RETAINED_MAPS`]. A
+    /// restarted process has the maps the pins hold after its first read of the store
+    /// ([`Members::current_map`]). `None` before any map. Reads no store:
+    /// [`Members::current_map`] does, and publishes what it finds.
     #[must_use]
-    pub fn view(&self) -> Option<(Arc<Map>, Option<Arc<Map>>)> {
+    pub fn view(&self) -> Option<(Arc<Map>, Vec<Arc<Map>>)> {
         let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let latest = seen.latest.clone()?;
-        Some((latest, seen.previous.clone()))
+        Some((latest, seen.history.clone()))
     }
 
     /// The map the push protocol reads: its current value (`None` until the first member
@@ -676,8 +715,23 @@ impl Members {
     /// before the protocol is judged, so a store that fails is this and not
     /// [`MembershipError::Protocol`]); [`MembershipError::Protocol`] for a node below the
     /// floor; [`MembershipError::Superseded`] if a newer registration of the instance won;
-    /// [`MembershipError::Contended`].
+    /// [`MembershipError::Contended`]; [`MembershipError::PinsFull`] for a new instance that
+    /// would join a farm holding data while the pins are at the cap (it gets no identity).
     pub fn register(&self, who: &Registrant) -> Result<Registration, MembershipError> {
+        self.register_after(who, None)
+    }
+
+    /// [`Members::register`] for a node that says which member and boot its metadata log
+    /// last wrote as (`last`; `None` for a node that has no log history or an older node
+    /// that does not say). The store assigns numbers the log will accept: see `assign`.
+    ///
+    /// # Errors
+    /// As [`Members::register`].
+    pub fn register_after(
+        &self,
+        who: &Registrant,
+        last: Option<LastBoot>,
+    ) -> Result<Registration, MembershipError> {
         if who.instance_id.is_empty() || who.addr.is_empty() || who.weight == 0 {
             return Err(MembershipError::Invalid(
                 "an instance id, an address and a weight of at least 1 are required",
@@ -690,7 +744,12 @@ impl Members {
                 min: floor,
             });
         }
-        let (id, boot) = self.assign(&who.instance_id)?;
+        // A new instance on a farm that holds data is a joiner ([`Members::assign`]): refused,
+        // before it gets an identity or a mark, when the pins are full.
+        if self.store.get(&instance_key(&who.instance_id))?.is_none() && self.holds_data()? {
+            self.pins_full()?;
+        }
+        let (id, boot) = self.assign(&who.instance_id, last)?;
         let member = Member {
             id,
             // The spelling enrollment stores, so the update controller can join a host to it.
@@ -710,32 +769,6 @@ impl Members {
         )?;
         let map = self.refresh()?.ok_or(MembershipError::NoMap)?;
         Ok(Registration { id, boot, map })
-    }
-
-    /// The id of `instance` (assigned on first sight, with its `unfilled/` mark if the farm
-    /// holds data) and a new boot counter for it.
-    fn assign(&self, instance: &str) -> Result<(MemberId, u64), MembershipError> {
-        let key = instance_key(instance);
-        for _ in 0..ATTEMPTS {
-            let (id, txn) = match self.store.get(&key)? {
-                Some(known) => {
-                    let id = MemberId(decode_id(&known.value)?);
-                    let txn = Txn::new().check(&key, Cond::Version(known.version));
-                    (id, txn.next(boot_counter(id)))
-                }
-                None => {
-                    // A counter has no precondition, so it cannot conflict.
-                    let taken = self.store.txn(Txn::new().next(ID_COUNTER))?;
-                    let id = MemberId(taken.map_err(|_| MembershipError::Contended)?.counters[0]);
-                    let txn = Txn::new().put(&key, id.0.to_be_bytes(), Cond::Absent);
-                    (id, self.unfilled_if_data(txn, id)?.next(boot_counter(id)))
-                }
-            };
-            if let Ok(commit) = self.store.txn(txn)? {
-                return Ok((id, commit.counters[0]));
-            }
-        }
-        Err(MembershipError::Contended)
     }
 
     /// Stores `member`'s row with a whole time to live, unless a newer boot is there, and
@@ -833,6 +866,18 @@ impl Members {
     pub fn set_state(&self, id: MemberId, state: MemberState) -> Result<Map, MembershipError> {
         if state == MemberState::Down {
             return Err(MembershipError::NotSettable(state));
+        }
+        if state == MemberState::Draining {
+            let draining = self
+                .store
+                .get(&member_key(id))?
+                .map(|stored| decode_row(&stored))
+                .transpose()?
+                .is_some_and(|live| live.member.state == MemberState::Draining);
+            // As for a join, only a farm that holds data has a handoff to bound.
+            if !draining && self.holds_data()? {
+                self.pins_full()?;
+            }
         }
         self.touch(id, Touch::State(state), None)?;
         self.refresh()?.ok_or(MembershipError::NoMap)
@@ -1139,7 +1184,9 @@ impl Members {
     pub fn current_map(&self) -> Result<Option<Map>, MembershipError> {
         let stored = self.store.get(MAP_KEY)?;
         let map = stored.as_ref().map(decode_map).transpose()?;
-        map.iter().for_each(|m| self.publish(m));
+        if let Some(m) = &map {
+            self.publish(m, self.pins()?);
+        }
         Ok(map)
     }
 
@@ -1180,12 +1227,30 @@ impl Members {
                 &self.config,
             )?
             else {
-                current.iter().for_each(|m| self.publish(m));
+                if let Some(m) = &current {
+                    self.publish(m, self.pins()?);
+                }
                 return Ok(current);
             };
-            let cond = stored.map_or(Cond::Absent, |s| Cond::Version(s.version));
+            let cond = stored
+                .as_ref()
+                .map_or(Cond::Absent, |s| Cond::Version(s.version));
             let wire = pb::Map::from(&plan.map).encode_to_vec();
             let mut txn = Txn::new().put(MAP_KEY, wire, cond);
+            // The map this bump replaces is pinned in the same transaction, for the dwell,
+            // and the pin that falls out of the cap goes with it.
+            if let Some(replaced) = stored.as_ref().zip(current.as_ref()) {
+                let generation = replaced.1.generation();
+                txn = txn.put_ttl(
+                    pin_key(generation),
+                    replaced.0.value.clone(),
+                    self.config.dwell,
+                    Cond::Any,
+                );
+                if let Some(gone) = generation.checked_sub(RETAINED_MAPS as u64) {
+                    txn = txn.delete(pin_key(gone), Cond::Any);
+                }
+            }
             for id in &plan.newly_down {
                 txn = txn.put_ttl(down_key(*id), Vec::new(), self.config.dwell, Cond::Any);
             }
@@ -1193,7 +1258,7 @@ impl Members {
                 txn = txn.check(member_key(*id), *cond);
             }
             if self.store.txn(txn)?.is_ok() {
-                self.publish(&plan.map);
+                self.publish(&plan.map, current.into_iter().collect());
                 return Ok(Some(plan.map));
             }
         }

@@ -35,6 +35,7 @@ pub mod kbf_toml;
 pub mod os;
 pub mod paths;
 pub mod plan;
+pub mod provision;
 pub mod validate;
 
 #[cfg(test)]
@@ -360,10 +361,28 @@ pub fn run(
     // The schema is made after `installer.toml` is in place and before anything is fetched or
     // enabled: a database that cannot be reached stops setup with no release and no unit.
     if let Some(url) = &valid.database {
-        let schema = backend.schemas.of(url)?;
-        let line = database_step(&*schema, mode_name(valid.mode), options.apply)
-            .map_err(SetupError::Database)?;
-        writeln!(out, "{line}")?;
+        let created = match &valid.local_database {
+            Some(local) => provision::provision(os, exec, local, options.apply, out)?,
+            None => provision::Next::Schema,
+        };
+        if created == provision::Next::Pending {
+            writeln!(
+                out,
+                "kbf-installer setup ({}): database step: dry run: the database does not exist yet, so its schema would be created after it",
+                mode_name(valid.mode)
+            )?;
+        } else {
+            let schema = backend.schemas.of(url)?;
+            schema
+                .reach()
+                .map_err(|why| provision::unreached(&why, valid.mode))?;
+            if let Some(local) = &valid.local_database {
+                provision::check_service_login(os, &*exec, local, valid.mode)?;
+            }
+            let line = database_step(&*schema, mode_name(valid.mode), options.apply)
+                .map_err(SetupError::Database)?;
+            writeln!(out, "{line}")?;
+        }
     }
 
     let mut have_release = released(&*exec, &ctx.layout)?;
@@ -431,6 +450,7 @@ pub fn cli(
         min_generation: args.min_generation,
         commit: args.commit.clone(),
         database: args.database.clone(),
+        create_local_database: args.create_local_database,
         installer_config: args.installer_config.as_ref().map(ToString::to_string),
     };
     let options = Options {

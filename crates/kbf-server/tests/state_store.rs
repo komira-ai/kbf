@@ -34,6 +34,8 @@ use kbf_types::{
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
+#[path = "state_store/ack_reasons.rs"]
+mod ack_reasons;
 #[path = "state_store/budgets.rs"]
 mod budgets;
 #[path = "state_store/fate.rs"]
@@ -46,6 +48,8 @@ mod handover;
 mod result_ack;
 #[path = "state_store/subject.rs"]
 mod subject;
+#[path = "state_store/takeover.rs"]
+mod takeover;
 mod thread_log;
 
 const GIB: u64 = 1 << 30;

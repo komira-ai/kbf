@@ -27,6 +27,7 @@ mod frontend_addr;
 #[cfg(test)]
 mod frontend_addr_tests;
 mod nodes;
+pub mod offer;
 mod post;
 pub mod smoke;
 #[cfg(test)]
@@ -49,7 +50,8 @@ use serde_json::Value;
 
 use crate::CommitId;
 use api::{Operator, Reply, Request};
-pub use summary::{Exit, NodeResult, PostResult, Previous, Step, Summary};
+pub use offer::{Attest, GhAttest, HostProbe, NoProbe, OfferPolicy, Probe, ProbeFault, Stage};
+pub use summary::{Exit, NodeResult, OfferRecord, PostResult, Previous, Step, Summary};
 
 /// Where the installer's lock is.
 pub const LOCK: &str = "/run/kbf-installer/lock";
@@ -136,6 +138,8 @@ pub struct Options {
     pub poll: Duration,
     /// How long members have to become active after the roll.
     pub members_timeout: Duration,
+    /// What the deploy requires of an offer (docs/design/gamma-deploy.md, "The offer").
+    pub offer: OfferPolicy,
 }
 
 impl Options {
@@ -152,6 +156,7 @@ impl Options {
             host_platform: host_platform.to_owned(),
             poll: Duration::from_secs(5),
             members_timeout: Duration::from_secs(120),
+            offer: OfferPolicy::Unchecked,
         }
     }
 }
@@ -162,6 +167,8 @@ pub struct Env<'a> {
     pub clock: &'a dyn Clock,
     pub smoke: &'a dyn Smoke,
     pub check: &'a dyn Check,
+    /// Reads the `meta_log` of the staged `kbf` (only an offer asks).
+    pub probe: &'a dyn Probe,
 }
 
 /// The installer lock, held while a deploy runs. Dropping it releases it.
@@ -315,6 +322,9 @@ pub fn update_frontend(env: &Env, opts: &Options) -> (Summary, Exit) {
 
 impl Run<'_> {
     fn go(&mut self, bundle: Option<&mut dyn Read>) -> Result<(), Fail> {
+        if !matches!(self.opts.offer, OfferPolicy::Unchecked) {
+            self.step("offer", |r| r.check_offer())?;
+        }
         self.step("bundle", |r| r.upload(bundle))?;
         self.step("preflight", |r| r.preflight())?;
         self.step("baseline", |r| r.baseline())?;
@@ -337,11 +347,59 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// Step 0, when a stage is named: the offer (or the `--no-offer`) the deploy runs under.
+    /// What needs the bundle is checked in step 1, before a byte is uploaded.
+    fn check_offer(&mut self) -> Result<(), Fail> {
+        let refused = |(reason, detail): offer::Refused| fail(Exit::Refused, reason, detail);
+        self.sum.offer = self.opts.offer.record();
+        match &self.opts.offer {
+            OfferPolicy::Missing(stage) => Err(fail(
+                Exit::Refused,
+                "offer_required",
+                format!(
+                    "a {} deploy needs --offer offer.json (--no-offer is the deliberate exception)",
+                    stage.word()
+                ),
+            )),
+            OfferPolicy::Unchecked | OfferPolicy::Waived(_) => Ok(()),
+            OfferPolicy::Offer {
+                stage,
+                doc,
+                max_age,
+            } => offer::check_header(
+                *stage,
+                doc,
+                &self.opts.commit,
+                self.env.clock.now(),
+                *max_age,
+            )
+            .map_err(refused),
+        }
+    }
+
     /// Step 1: put the bundle's files in the store.
     fn upload(&mut self, bundle: Option<&mut dyn Read>) -> Result<(), Fail> {
+        if matches!(self.opts.offer, OfferPolicy::Offer { .. }) && bundle.is_none() {
+            return Err(fail(
+                Exit::Refused,
+                "offer_set_unverified",
+                "with --offer the bundle (--bundle -) must carry the release and its SHA256SUMS",
+            ));
+        }
         let Some(input) = bundle else { return Ok(()) };
-        let entries = bundle::read(input, &self.opts.commit)
+        let bundle = bundle::read_bundle(input, &self.opts.commit)
             .map_err(|e| fail(Exit::Usage, "bad_bundle", e))?;
+        if let OfferPolicy::Offer { doc, .. } = &self.opts.offer {
+            offer::check_bundle(
+                doc,
+                &bundle,
+                &self.opts.commit,
+                &self.opts.host_platform,
+                self.env.probe,
+            )
+            .map_err(|(reason, detail)| fail(Exit::Refused, reason, detail))?;
+        }
+        let entries = bundle.entries;
         if !self.opts.apply {
             return Ok(());
         }
@@ -405,6 +463,10 @@ impl Run<'_> {
                 "node_platform_unknown",
                 format!("no platform for {}", unknown.join(", ")),
             ));
+        }
+        if let OfferPolicy::Offer { doc, .. } = &self.opts.offer {
+            offer::check_platforms(doc, &wanted)
+                .map_err(|(reason, detail)| fail(Exit::Refused, reason, detail))?;
         }
         let releases = self.get_json("/v1/releases").map_err(io)?;
         let mut missing = Vec::new();

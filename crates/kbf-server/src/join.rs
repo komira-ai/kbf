@@ -31,7 +31,7 @@ use tonic::transport::Channel;
 use tonic::{Code, Status};
 
 use crate::cold_apply::Applied;
-use crate::members::PROTOCOL;
+use crate::members::{LastBoot, PROTOCOL};
 use crate::node_map::NodeMap;
 use crate::storage_health::{Debts, Writes};
 
@@ -106,6 +106,7 @@ pub struct Joiner {
     open_writes: Option<OpenWrites>,
     catch_up: CatchUp,
     node: Arc<NodeMap>,
+    last: Option<LastBoot>,
     /// What the heartbeats say about the cold-store registration.
     applied: Applied,
     /// The registration generation the frontend last announced.
@@ -127,9 +128,18 @@ impl Joiner {
             open_writes: None,
             catch_up: CatchUp::caught_up(),
             node: Arc::new(NodeMap::new(Arc::new(MapHolder::new()))),
+            last: None,
             applied: Applied::unreported(),
             announced: 0,
         }
+    }
+
+    /// The joiner of a node whose metadata log last wrote as `last`: every registration
+    /// says so, and the frontend gives a boot above it ([`LastBoot`]).
+    #[must_use]
+    pub fn with_last_boot(mut self, last: Option<LastBoot>) -> Self {
+        self.last = last;
+        self
     }
 
     /// Draws the jitter of every wait from `unit` (a number in `[0, 1)`) instead of the
@@ -216,14 +226,22 @@ impl Joiner {
         self
     }
 
-    /// Puts `map`, as the frontend sent it, in the holder. One the node cannot read is
-    /// warned about and ignored: the next beat sends it again.
-    fn take(&self, map: Option<pb::Map>) {
+    /// Puts `map`, as the frontend sent it, in the holder, with the maps the frontend retains
+    /// from before it (`retained`, newest first). One the node cannot read is warned about
+    /// and ignored: the next beat sends it again. A retained map it cannot read is left out.
+    fn take(&self, map: Option<pb::Map>, retained: Vec<pb::Map>) {
         let Some(map) = map else { return };
         match Map::try_from(map) {
             Ok(map) => {
                 let generation = map.generation();
-                if self.node.maps().offer(map) {
+                let retained = retained.into_iter().filter_map(|m| {
+                    Map::try_from(m)
+                        .inspect_err(|error| {
+                            tracing::warn!(%error, "a retained map this node cannot read ignored");
+                        })
+                        .ok()
+                });
+                if self.node.maps().offer_with_retained(map, retained) {
                     tracing::info!(generation, "storage map taken");
                 }
             }
@@ -255,10 +273,12 @@ impl Joiner {
                 zone: who.zone.clone(),
                 protocol: PROTOCOL,
                 catching_up: self.catch_up.is_catching_up(),
+                last_member_id: self.last.map_or(0, |l| l.member),
+                last_boot: self.last.map_or(0, |l| l.boot),
             })
             .await?
             .into_inner();
-        self.take(answer.map.clone());
+        self.take(answer.map.clone(), answer.retained_previous);
         self.node.registered(MemberId(answer.member_id));
         self.announced = answer.objstore_generation;
         Ok(Joined {
@@ -297,11 +317,13 @@ impl Joiner {
                 catching_up: self.catch_up.is_catching_up(),
                 applied_objstore_generation,
                 apply_status: apply_status.into(),
+                // Not reported yet: the node's cache is not asked here, so it cannot say.
+                ..Default::default()
             })
             .await?
             .into_inner();
         self.announced = answer.objstore_generation;
-        self.take(answer.map);
+        self.take(answer.map, answer.retained_previous);
         Ok(answer.map_generation)
     }
 

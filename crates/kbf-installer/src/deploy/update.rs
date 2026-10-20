@@ -33,7 +33,7 @@ use super::api::{Https, Trust};
 use super::cli::{CALL_TIMEOUT, host_platform, read_token};
 use super::smoke::random;
 use super::summary;
-use super::{Check, Env, NoCheck, NoSmoke, Options, SystemClock, update_frontend};
+use super::{Check, Env, NoCheck, NoProbe, NoSmoke, Options, SystemClock, update_frontend};
 use crate::cli::UpdateArgs;
 use crate::exit::Exit;
 
@@ -57,6 +57,7 @@ pub fn run(args: &UpdateArgs, out: &mut dyn Write, err: &mut dyn Write) -> Exit 
         clock: &clock,
         smoke: &NoSmoke,
         check: &check as &dyn Check,
+        probe: &NoProbe,
     };
     finish(&env, &options, out)
 }

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use super::api::{Operator, Reply, Request};
 use super::update::{finish, installer_exit, request_id, run};
-use super::{Check, Clock, Env, NoCheck, NoSmoke, Options};
+use super::{Check, Clock, Env, NoCheck, NoProbe, NoSmoke, Options};
 use crate::cli::{Cli, Verb};
 use crate::exit::Exit;
 use crate::testkit::{A, B, c};
@@ -130,6 +130,7 @@ fn go(api: &Api, nodes: bool) -> (Exit, Value) {
         clock: &clock,
         smoke: &NoSmoke,
         check: &check as &dyn Check,
+        probe: &NoProbe,
     };
     let mut out = Vec::new();
     let exit = finish(&env, &options(nodes), &mut out);
