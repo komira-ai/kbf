@@ -4,7 +4,6 @@
 
 use std::future::ready;
 use std::io;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kbf_meta::Retention;
@@ -53,10 +52,9 @@ impl Log {
     }
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kbf-release-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+/// A new, empty directory for one test, removed when it drops.
+fn scratch(name: &str) -> kbf_testkit::dir::TestDir {
+    crate::test_dir::scratch_dir(&format!("kbf-release-{name}"))
 }
 
 /// A node whose cold store is `cold`, told to stop at once.

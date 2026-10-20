@@ -2,7 +2,7 @@
 //! node `kbf storage` starts, with the storage it serves handed to the caller and the
 //! node's one cache honoured.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,13 +18,9 @@ use kbf_storage::local_cache::LocalCache;
 use kbf_storage::service::RemoteStorage;
 use sha2::Digest as _;
 
-fn dir(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("storage-half")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("directory");
-    dir
+/// A directory of its own, removed when it drops.
+fn dir(name: &str) -> kbf_testkit::dir::TestDir {
+    kbf_testkit::dir::TestDir::under(env!("CARGO_TARGET_TMPDIR"), &format!("storage-half-{name}"))
 }
 
 /// The flags of `kbf storage`, plain text on a loopback port, and these.
@@ -55,7 +51,8 @@ fn never() -> std::io::Result<std::future::Pending<()>> {
 /// listener, and one written over gRPC is read through the handle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_handle_is_the_storage_the_listener_serves() {
-    let half = start(&flags(&file_stores(&dir("same"))), never)
+    let dir = dir("same");
+    let half = start(&flags(&file_stores(&dir)), never)
         .await
         .expect("starts");
     let line = half.start_line().to_owned();
@@ -86,7 +83,8 @@ async fn the_handle_is_the_storage_the_listener_serves() {
 /// so a second attach is refused; without one there is nothing to attach to.
 #[tokio::test]
 async fn the_one_cache_counts_the_storage_halfs_bytes() {
-    let mut shared = flags(&file_stores(&dir("one-cache")));
+    let dir = dir("one-cache");
+    let mut shared = flags(&file_stores(&dir));
     let local = Arc::new(LocalCache::new());
     shared.server.local_cache = Some(Arc::clone(&local));
     let half = start(&shared, never).await.expect("starts");
@@ -100,8 +98,9 @@ async fn the_one_cache_counts_the_storage_halfs_bytes() {
 /// Catches a half that serves past its shutdown future, or never starts serving.
 #[tokio::test]
 async fn the_half_stops_when_told() {
+    let dir = dir("stop");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let half = start(&flags(&file_stores(&dir("stop"))), || {
+    let half = start(&flags(&file_stores(&dir)), || {
         Ok(async move {
             let _ = stopped.await;
         })
