@@ -285,6 +285,8 @@ impl ChildAdmin for ScriptAdmin<'_> {
 struct FastClock<'a> {
     now: Cell<Duration>,
     on_wait: Box<dyn Fn() + 'a>,
+    /// Set: the next sleep says the proxy is shutting down.
+    halt: Cell<bool>,
 }
 
 impl Clock for FastClock<'_> {
@@ -293,6 +295,9 @@ impl Clock for FastClock<'_> {
     }
 
     fn sleep(&self, d: Duration) -> Result<(), crate::proxy::model::Halt> {
+        if self.halt.get() {
+            return Err(crate::proxy::model::Halt::Interrupted);
+        }
         let wait = d == Duration::from_secs(2);
         // A stopped process needs a moment to be gone before the next try starts.
         std::thread::sleep(Duration::from_millis(if wait { 200 } else { 1 }));
@@ -339,6 +344,7 @@ impl<'a> Env<'a> {
             clock: FastClock {
                 now: Cell::new(Duration::ZERO),
                 on_wait: Box::new(|| {}),
+                halt: Cell::new(false),
             },
             notes: Notes::default(),
             status: state_dir(rig).join("status.json"),
@@ -504,6 +510,7 @@ fn a_refused_takeover_is_retried_with_a_new_process_that_then_serves() {
             // The wait between the tries: the first process must be gone by now.
             *seen.borrow_mut() = child_pid_record(child);
         }),
+        halt: Cell::new(false),
     };
     let boot = Boot {
         clock: &clock,
@@ -554,6 +561,27 @@ fn a_boot_that_cannot_start_gives_up_after_the_cap_and_holds() {
     assert!(why.contains("takeover-failed"), "{why}");
     assert_eq!(env.admin.takeovers.get(), 3);
     assert_eq!(reasons(&env), ["takeover-failed"; 3]);
+    assert!(gate.handle.snapshot().holding);
+    assert_eq!(gate.active(), None);
+}
+
+/// Catches a shutdown in the middle of the cold start being reported as a failure to start:
+/// the proxy told to stop while it waits between two tries holds with the shutdown as the
+/// reason (not an installed release that "did not start"), and no stream was released.
+#[test]
+fn a_proxy_told_to_stop_between_two_tries_holds_and_says_it_is_shutting_down() {
+    let rig = rig("supervisor-cold-stopped");
+    let (gate, _runner) = gate();
+    let env = Env::new(&rig, &gate);
+    env.admin.takeover_fails.set(99);
+    env.clock.halt.set(true);
+    env.install(A);
+    verify(&rig, A);
+    let outcome = adopt_children(&gate, &rig.child, &state_dir(&rig), &env.boot());
+    let ident = rig.child.recorded(Slot::A).map(|r| r.ident);
+    let _stop = Cleanup(&rig.child, ident.into_iter().collect());
+    assert_eq!(outcome, Startup::Held("the proxy is shutting down".into()));
+    assert_eq!(env.admin.takeovers.get(), 1, "stopped after the first try");
     assert!(gate.handle.snapshot().holding);
     assert_eq!(gate.active(), None);
 }
