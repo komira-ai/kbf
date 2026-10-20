@@ -583,6 +583,7 @@ fn registration(instance: &str, at: &str) -> pb::RegisterRequest {
         zone: "a".to_owned(),
         protocol: PROTOCOL,
         catching_up: false,
+        ..Default::default()
     }
 }
 
