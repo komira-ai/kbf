@@ -7,12 +7,14 @@ use std::time::{Duration, Instant};
 
 use super::rig::{Rig, quick};
 use super::status::active_after;
-use super::{Parts, SwapSupervisor};
+use super::{Parts, Spawn, SwapSupervisor, panic_text, spawn_error};
 use crate::proxy::api::model::{OldChild, UpdateId};
 use crate::proxy::api::traits::{Retired, Supervisor, SupervisorError, UpdateSpec};
 use crate::proxy::model::{
-    Failure, Intent, Locator, Mode, Phase, Plan, Slot, StagedFacts, Step, Timing, Verb,
+    AdoptError, Failure, Intent, Locator, Mode, Phase, Plan, ProcIdent, Request, Slot, StagedFacts,
+    Step, Timing, Verb,
 };
+use crate::proxy::ports::{Child, ChildAdmin, Gate, Recorder, RootOrders};
 use crate::proxy::runtime::RequestQueue;
 use crate::testkit::{A, B, C, c};
 
@@ -49,18 +51,35 @@ fn harness(name: &str) -> Harness {
 }
 
 fn harness_with(name: &str, timing: Timing, rollback: bool) -> Harness {
+    custom(name, timing, rollback, |_| {})
+}
+
+/// A harness whose parts `tweak` changes before the supervisor is built.
+fn custom(name: &str, timing: Timing, rollback: bool, tweak: impl FnOnce(&mut Parts)) -> Harness {
     let dir = kbf_host::testkit::scratch(name);
     let rig = Rig::new(Some(dir.clone()));
     let requests = Arc::new(RequestQueue::new());
     let deaths = Arc::new(Mutex::new(Vec::new()));
-    let sup = build(&rig, &requests, &dir, &deaths, timing, rollback);
+    let sink = Arc::clone(&deaths);
+    let mut parts = rig.parts(&requests, move |why| {
+        sink.lock().unwrap().push(why.to_owned());
+    });
+    tweak(&mut parts);
+    let mut config = Rig::config(dir.to_path_buf());
+    config.timing = timing;
+    config.rollback_after_switch = rollback;
     Harness {
         rig,
         requests,
         dir,
         deaths,
-        sup,
+        sup: SwapSupervisor::new(parts, config),
     }
+}
+
+/// A spawner that cannot start a thread.
+fn no_threads() -> Spawn {
+    Box::new(|_| Err("no threads left".into()))
 }
 
 fn spec(update_id: &str, from: Option<&str>, to: &str) -> UpdateSpec {
@@ -520,4 +539,251 @@ fn the_slot_that_serves_after_an_update_follows_how_it_ended() {
     assert_eq!(active_after(&restart, || false), old);
     assert_eq!(active_after(&intent(Phase::Switched, None), never), new);
     assert_eq!(active_after(&intent(Phase::Quiescing, None), never), old);
+}
+
+fn rig_config(h: &Harness, timing: Timing, spawn: Spawn) -> SwapSupervisor {
+    let sink = Arc::clone(&h.deaths);
+    let parts = h.rig.parts(&h.requests, move |why| {
+        sink.lock().unwrap().push(why.to_owned());
+    });
+    let mut config = Rig::config(h.dir.to_path_buf());
+    config.timing = timing;
+    SwapSupervisor::with_spawner(parts, config, spawn)
+}
+
+#[test]
+fn a_swap_thread_that_cannot_start_ends_the_update_failed_at_start() {
+    let mut h = harness("sw-nothread");
+    h.sup = rig_config(&h, quick(), no_threads());
+    let r = h.sup.start(&spec("u1", Some(A), B));
+    assert!(
+        matches!(&r, Err(SupervisorError::Failed(m)) if m.contains("no threads")),
+        "{r:?}"
+    );
+    let update = h.sup.status().update.expect("the update is shown");
+    assert_eq!(update.phase, Phase::Failed);
+    assert_eq!(update.failure.map(|f| f.step), Some(Step::Start));
+    assert_eq!(record_on_disk(&h.dir).phase, Phase::Failed);
+    assert!(h.sup.wait_closed(WAIT), "nothing is left open");
+    assert_eq!(h.rig.count("spawn"), 0);
+}
+
+#[test]
+fn the_status_never_runs_ahead_of_update_json() {
+    let mut h = harness("sw-nothread-record");
+    h.sup = rig_config(&h, quick(), no_threads());
+    h.rig.knobs(|k| k.fail_record = Some(Phase::Failed));
+    assert!(h.sup.start(&spec("u1", Some(A), B)).is_err());
+    // The record of the failure was refused, so it is not shown.
+    assert_eq!(phase_of(&h.sup), Some(Phase::Staged));
+    assert_eq!(record_on_disk(&h.dir).phase, Phase::Staged);
+}
+
+#[test]
+fn a_record_that_cannot_be_written_refuses_the_start_before_anything_runs() {
+    let mut h = harness("sw-norecord");
+    h.rig.knobs(|k| k.fail_record = Some(Phase::Staged));
+    let r = h.sup.start(&spec("u1", Some(A), B));
+    assert!(
+        matches!(&r, Err(SupervisorError::Failed(m)) if m.contains("refused")),
+        "{r:?}"
+    );
+    assert!(h.rig.log().is_empty());
+    assert_eq!(phase_of(&h.sup), None);
+}
+
+#[test]
+fn a_port_the_swap_cannot_do_without_runs_on_death() {
+    let mut h = harness("sw-halt");
+    h.rig.knobs(|k| k.fail_record = Some(Phase::Preflight));
+    h.sup.start(&spec("u1", Some(A), B)).unwrap();
+    assert!(h.sup.wait_closed(WAIT));
+    let deaths = h.deaths.lock().unwrap().clone();
+    assert_eq!(deaths.len(), 1, "{deaths:?}");
+    assert!(deaths[0].starts_with("the swap stopped:"), "{deaths:?}");
+}
+
+#[test]
+fn a_request_left_from_an_earlier_update_is_not_this_updates() {
+    let mut h = harness("sw-stale");
+    h.requests.push(Request::Abort);
+    h.sup.start(&spec("u1", Some(A), B)).unwrap();
+    assert!(h.sup.wait_closed(WAIT));
+    assert_eq!(
+        phase_of(&h.sup),
+        Some(Phase::Done),
+        "the stale abort did nothing"
+    );
+}
+
+#[test]
+fn a_panic_is_told_whatever_its_payload() {
+    let text: Box<dyn std::any::Any + Send> = Box::new("a str");
+    assert_eq!(panic_text(&*text), "a str");
+    let text: Box<dyn std::any::Any + Send> = Box::new(String::from("a string"));
+    assert_eq!(panic_text(&*text), "a string");
+    let other: Box<dyn std::any::Any + Send> = Box::new(5_u32);
+    assert_eq!(panic_text(&*other), "no message");
+    assert!(spawn_error(std::io::Error::other("x")).contains("could not start"));
+}
+
+/// An update held in the bake, so that the old child is alive beside the serving one.
+fn baking(name: &str, tweak: impl FnOnce(&mut Parts)) -> Harness {
+    let timing = Timing {
+        bake: Duration::from_secs(30),
+        ..quick()
+    };
+    let mut h = custom(name, timing, false, tweak);
+    h.sup.start(&spec("u1", Some(A), B)).unwrap();
+    until("baking", || phase_of(&h.sup) == Some(Phase::Baking));
+    h
+}
+
+fn end_bake(h: &Harness) {
+    h.rig.stop(true);
+    assert!(h.sup.wait_closed(WAIT));
+}
+
+#[test]
+fn force_retire_refuses_an_old_child_that_was_never_recorded() {
+    let mut h = baking("sw-fr-unrecorded", |p| p.old_proc = Box::new(|_| None));
+    let r = h.sup.force_retire("x");
+    assert!(
+        matches!(&r, Err(SupervisorError::Refused(m)) if m.contains("not recorded")),
+        "{r:?}"
+    );
+    end_bake(&h);
+}
+
+#[test]
+fn force_retire_refuses_an_old_child_that_is_gone() {
+    let mut h = baking("sw-fr-gone", |_| {});
+    h.rig.kill(Slot::A);
+    let r = h.sup.force_retire("x");
+    assert!(
+        matches!(&r, Err(SupervisorError::Refused(m)) if m.contains("gone")),
+        "{r:?}"
+    );
+    end_bake(&h);
+}
+
+#[test]
+fn force_retire_says_so_when_the_signal_cannot_be_sent() {
+    let mut h = baking("sw-fr-signal", |_| {});
+    h.rig.knobs(|k| k.terminate_err = true);
+    let r = h.sup.force_retire("x");
+    assert!(
+        matches!(&r, Err(SupervisorError::Failed(m)) if m.contains("SIGTERM")),
+        "{r:?}"
+    );
+    end_bake(&h);
+}
+
+#[test]
+fn force_retire_after_a_rollback_ends_the_new_child_and_the_status_shows_it() {
+    let timing = Timing {
+        bake: Duration::from_secs(30),
+        ..quick()
+    };
+    let mut h = harness_with("sw-fr-rollback", timing, true);
+    h.rig.knobs(|k| k.streams = [0, 2]);
+    h.sup.start(&spec("u1", Some(A), B)).unwrap();
+    until("baking", || phase_of(&h.sup) == Some(Phase::Baking));
+    h.sup.rollback().unwrap();
+    until("draining the new child", || {
+        phase_of(&h.sup) == Some(Phase::Draining)
+    });
+    let update = h.sup.status().update.expect("update");
+    assert_eq!(update.active_slot, Slot::A, "the old child serves again");
+    assert_eq!(update.old.map(|o| o.open_streams), Some(2));
+    let retired = h.sup.force_retire("a stuck stream").unwrap();
+    assert_eq!(retired.dropped_streams, 2);
+    assert_eq!(h.rig.count("terminate pid 101"), 1);
+    assert!(h.sup.wait_closed(WAIT));
+    assert_eq!(last_intent(&h.rig).phase, Phase::RolledBack);
+}
+
+fn stopped_at_starting(name: &str) -> Harness {
+    let mut h = harness(name);
+    h.rig.knobs(|k| k.ready = false);
+    h.sup.start(&spec("u1", Some(A), B)).unwrap();
+    until("the candidate", || h.rig.count("spawn B") == 1);
+    h.rig.stop(true);
+    assert!(h.sup.wait_closed(WAIT));
+    h
+}
+
+#[test]
+fn a_restart_that_finds_the_candidate_dead_puts_the_old_child_back() {
+    let h = stopped_at_starting("sw-restart-dead");
+    h.rig.kill(Slot::B);
+    h.rig.stop(false);
+    let again = build(&h.rig, &h.requests, &h.dir, &h.deaths, quick(), false);
+    assert!(again.wait_closed(WAIT));
+    assert_eq!(failure(&h.rig).step, Step::Restart);
+    let update = again.status().update.expect("update");
+    assert_eq!((update.phase, update.active_slot), (Phase::Failed, Slot::A));
+}
+
+#[test]
+fn a_restart_that_cannot_read_the_root_halfs_status_fails_at_restart_and_asks_the_store() {
+    let timing = Timing {
+        bake: Duration::from_secs(30),
+        ..quick()
+    };
+    let mut h = harness_with("sw-restart-status", timing, false);
+    h.sup.start(&spec("u1", Some(A), B)).unwrap();
+    until("baking", || phase_of(&h.sup) == Some(Phase::Baking));
+    end_bake(&h);
+    h.rig.knobs(|k| k.status_err = true);
+    h.rig.stop(false);
+    let again = build(&h.rig, &h.requests, &h.dir, &h.deaths, quick(), false);
+    assert!(again.wait_closed(WAIT));
+    assert_eq!(failure(&h.rig).step, Step::Restart);
+    // The new child holds the generation, so it is the one that serves.
+    assert_eq!(again.status().update.expect("update").active_slot, Slot::B);
+}
+
+#[test]
+fn the_rig_answers_for_a_slot_with_nothing_in_it_as_a_port_would() {
+    let rig = Rig::new(None);
+    let nothing = Slot::B;
+    let limit = Duration::from_secs(1);
+    assert!(rig.role(nothing).is_err());
+    assert!(rig.takeover(nothing, limit).is_err());
+    assert!(rig.quiesce(nothing).is_err());
+    assert!(rig.stand_down(nothing).is_err());
+    assert!(rig.resume(nothing).is_err());
+    assert!(rig.open_counts(nothing).is_err());
+    assert!(!rig.ready(nothing).expect("answers").all());
+    let ident = ProcIdent {
+        pid: 7,
+        start_time: 7,
+        exe: "/x".into(),
+    };
+    assert_eq!(rig.adopt(nothing, &ident), Err(AdoptError::Gone(7)));
+    assert_eq!(rig.exited(&ident), Some(0));
+    assert_eq!(rig.retire(Slot::A), crate::proxy::model::Retired::Current);
+    assert_eq!(rig.retire(nothing), crate::proxy::model::Retired::Closed);
+    rig.kill(nothing);
+    rig.record(&intent(Phase::Staged, None))
+        .expect("kept in memory");
+    rig.clear_active();
+    rig.frontend_update(&spec("u", None, B).order)
+        .expect("logged");
+    assert!(
+        rig.ready(Slot::A).expect("answers").all(),
+        "the old child is up"
+    );
+}
+
+#[test]
+fn a_restart_whose_swap_thread_cannot_start_runs_on_death() {
+    let h = stopped_at_starting("sw-restart-nothread");
+    h.rig.stop(false);
+    let again = rig_config(&h, quick(), no_threads());
+    let deaths = h.deaths.lock().unwrap().clone();
+    assert_eq!(deaths.len(), 1, "{deaths:?}");
+    assert!(deaths[0].contains("no threads"), "{deaths:?}");
+    assert!(again.wait_closed(WAIT), "the update is not left open");
 }

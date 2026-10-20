@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::super::model::{
-    AdoptError, CrashPoint, Halt, Intent, Locator, Mode, OpenCounts, PortError, ProcIdent,
-    Readiness, Retired, RoleInfo, RoleState, Slot, StagedFacts, Start, Timing,
+    AdoptError, CrashPoint, Halt, Intent, Locator, Mode, OpenCounts, Phase, PortError, ProcIdent,
+    Readiness, Retired, RoleInfo, RoleState, Slot, StagedFacts, Start, Timing, verify_ident,
 };
 use super::super::ports::{Child, ChildAdmin, Clock, Gate, Migrator, Recorder, RootOrders};
 use super::super::record::FileRecorder;
@@ -35,6 +35,12 @@ pub struct Knobs {
     pub takeover_err: bool,
     /// The staged commit `status.json` shows.
     pub staged: Option<CommitId>,
+    /// `status.json` cannot be read: the staged release and the installed commit both fail.
+    pub status_err: bool,
+    /// The recorder refuses the record of this phase.
+    pub fail_record: Option<Phase>,
+    /// SIGTERM to a child fails.
+    pub terminate_err: bool,
     /// Streams the proxy has bound to a slot, and the child counts the same.
     pub streams: [u64; 2],
 }
@@ -109,6 +115,9 @@ impl Rig {
                     ready: true,
                     takeover_err: false,
                     staged: Some(c(B)),
+                    status_err: false,
+                    fail_record: None,
+                    terminate_err: false,
                     streams: [0, 0],
                 },
                 installed: Some(c(A)),
@@ -152,6 +161,13 @@ impl Rig {
 
     pub fn alive(&self, slot: Slot) -> bool {
         self.st().procs[ix(slot)].as_ref().is_some_and(|p| p.alive)
+    }
+
+    /// The process in `slot` dies on its own.
+    pub fn kill(&self, slot: Slot) {
+        if let Some(p) = self.st().procs[ix(slot)].as_mut() {
+            p.alive = false;
+        }
     }
 
     pub fn phases(&self) -> Vec<super::super::model::Phase> {
@@ -199,12 +215,25 @@ impl Rig {
     }
 }
 
-fn gone(slot: Slot) -> PortError {
-    PortError(format!("nothing answers in slot {slot:?}"))
+/// The live process in `slot`, or the error a port gives for a slot nothing answers in.
+fn proc_mut(st: &mut St, slot: Slot) -> Result<&mut Proc, PortError> {
+    st.procs[ix(slot)]
+        .as_mut()
+        .filter(|p| p.alive)
+        .ok_or_else(|| PortError(format!("nothing answers in slot {slot:?}")))
+}
+
+/// `slot`'s process holds the generation, and no other does.
+fn hold(st: &mut St, slot: Slot) -> Result<(), PortError> {
+    let _ = proc_mut(st, slot.other()).map(|p| p.holder = false);
+    let p = proc_mut(st, slot)?;
+    p.holder = true;
+    p.state = RoleState::Active;
+    Ok(())
 }
 
 impl Child for Rig {
-    fn spawn(&self, slot: Slot, release: &CommitId, start: Start) -> Result<ProcIdent, PortError> {
+    fn spawn(&self, slot: Slot, release: &CommitId, _start: Start) -> Result<ProcIdent, PortError> {
         assert!(
             !self.st().knobs.spawn_panics,
             "the spawn exploded in the test"
@@ -213,31 +242,28 @@ impl Child for Rig {
         let pid = st.next_pid;
         st.next_pid += 1;
         let ident = ident_of(pid, release);
-        let (state, holder) = match start {
-            Start::Active => (RoleState::Active, true),
-            Start::Candidate => (RoleState::Candidate, false),
-        };
+        // The frontend swap starts candidates only; a start that serves at once is the cold
+        // start of a host with no child, which this code does not do.
         st.procs[ix(slot)] = Some(Proc {
             alive: true,
-            state,
-            holder,
+            state: RoleState::Candidate,
+            holder: false,
             ident: ident.clone(),
         });
-        st.log.push(format!("spawn {slot:?} {start:?}"));
+        st.log.push(format!("spawn {slot:?} Candidate"));
         Ok(ident)
     }
 
     fn adopt(&self, slot: Slot, recorded: &ProcIdent) -> Result<(), AdoptError> {
-        match &self.st().procs[ix(slot)] {
-            Some(p) if p.alive && p.ident == *recorded => Ok(()),
-            Some(p) if p.alive => Err(AdoptError::Recycled { pid: recorded.pid }),
-            _ => Err(AdoptError::Gone(recorded.pid)),
+        match self.st().procs[ix(slot)].as_ref().filter(|p| p.alive) {
+            None => Err(AdoptError::Gone(recorded.pid)),
+            Some(p) => verify_ident(recorded, &p.ident),
         }
     }
 
     fn exited(&self, ident: &ProcIdent) -> Option<i32> {
-        let st = self.st();
-        let live = st
+        let live = self
+            .st()
             .procs
             .iter()
             .flatten()
@@ -246,37 +272,39 @@ impl Child for Rig {
     }
 
     fn terminate(&self, ident: &ProcIdent) -> Result<(), PortError> {
-        let mut st = self.st();
-        st.log.push(format!("terminate pid {}", ident.pid));
-        for p in st.procs.iter_mut().flatten() {
-            if p.ident.pid == ident.pid {
-                p.alive = false;
-            }
+        self.end(ident, "terminate");
+        if self.st().knobs.terminate_err {
+            Err(PortError("no such process".into()))
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     fn kill_unserved(&self, ident: &ProcIdent) -> Result<(), PortError> {
+        self.end(ident, "kill");
+        Ok(())
+    }
+}
+
+impl Rig {
+    /// The process `ident` names ends, and the call is logged.
+    fn end(&self, ident: &ProcIdent, how: &str) {
         let mut st = self.st();
-        st.log.push(format!("kill pid {}", ident.pid));
+        st.log.push(format!("{how} pid {}", ident.pid));
         for p in st.procs.iter_mut().flatten() {
             if p.ident.pid == ident.pid {
                 p.alive = false;
             }
         }
-        Ok(())
     }
 }
 
 impl ChildAdmin for Rig {
     fn role(&self, slot: Slot) -> Result<RoleInfo, PortError> {
-        match &self.st().procs[ix(slot)] {
-            Some(p) if p.alive => Ok(RoleInfo {
-                holder: p.holder,
-                state: p.state,
-            }),
-            _ => Err(gone(slot)),
-        }
+        proc_mut(&mut self.st(), slot).map(|p| RoleInfo {
+            holder: p.holder,
+            state: p.state,
+        })
     }
 
     fn takeover(&self, slot: Slot, _limit: Duration) -> Result<(), PortError> {
@@ -285,61 +313,31 @@ impl ChildAdmin for Rig {
         if st.knobs.takeover_err {
             return Err(PortError("takeover refused".into()));
         }
-        if let Some(p) = st.procs[ix(slot.other())].as_mut() {
-            p.holder = false;
-        }
-        match st.procs[ix(slot)].as_mut() {
-            Some(p) if p.alive => {
-                p.holder = true;
-                p.state = RoleState::Active;
-                Ok(())
-            }
-            _ => Err(gone(slot)),
-        }
+        hold(&mut st, slot)
     }
 
     fn quiesce(&self, slot: Slot) -> Result<(), PortError> {
         self.say(format!("admin:quiesce {slot:?}"));
-        match self.st().procs[ix(slot)].as_mut() {
-            Some(p) if p.alive => {
-                p.state = RoleState::Quiesced;
-                Ok(())
-            }
-            _ => Err(gone(slot)),
-        }
+        proc_mut(&mut self.st(), slot).map(|p| p.state = RoleState::Quiesced)
     }
 
     fn stand_down(&self, slot: Slot) -> Result<(), PortError> {
         self.say(format!("admin:stand_down {slot:?}"));
-        match self.st().procs[ix(slot)].as_mut() {
-            Some(p) if p.alive => {
-                p.state = RoleState::StoodDown;
-                p.holder = false;
-                Ok(())
-            }
-            _ => Err(gone(slot)),
-        }
+        proc_mut(&mut self.st(), slot).map(|p| {
+            p.state = RoleState::StoodDown;
+            p.holder = false;
+        })
     }
 
     fn resume(&self, slot: Slot) -> Result<(), PortError> {
         self.say(format!("admin:resume {slot:?}"));
-        let mut st = self.st();
-        if let Some(p) = st.procs[ix(slot.other())].as_mut() {
-            p.holder = false;
-        }
-        match st.procs[ix(slot)].as_mut() {
-            Some(p) if p.alive => {
-                p.state = RoleState::Active;
-                p.holder = true;
-                Ok(())
-            }
-            _ => Err(gone(slot)),
-        }
+        hold(&mut self.st(), slot)
     }
 
     fn ready(&self, slot: Slot) -> Result<Readiness, PortError> {
-        let st = self.st();
-        let up = st.procs[ix(slot)].as_ref().is_some_and(|p| p.alive) && st.knobs.ready;
+        let mut st = self.st();
+        let ready = st.knobs.ready;
+        let up = proc_mut(&mut st, slot).is_ok() && ready;
         Ok(Readiness {
             readyz: up,
             health: up,
@@ -348,14 +346,12 @@ impl ChildAdmin for Rig {
     }
 
     fn open_counts(&self, slot: Slot) -> Result<OpenCounts, PortError> {
-        let st = self.st();
-        match &st.procs[ix(slot)] {
-            Some(p) if p.alive => Ok(OpenCounts {
-                open_streams: st.knobs.streams[ix(slot)],
-                open_sessions: 0,
-            }),
-            _ => Err(gone(slot)),
-        }
+        let mut st = self.st();
+        let open_streams = st.knobs.streams[ix(slot)];
+        proc_mut(&mut st, slot).map(|_| OpenCounts {
+            open_streams,
+            open_sessions: 0,
+        })
     }
 
     fn post_desired(&self, slot: Slot, commit: &CommitId) -> Result<(), PortError> {
@@ -393,11 +389,8 @@ impl Gate for Rig {
     }
 
     fn retire(&self, slot: Slot) -> Retired {
-        let st = self.st();
-        if slot == st.active {
+        if slot == self.st().active {
             Retired::Current
-        } else if st.knobs.streams[ix(slot)] > 0 {
-            Retired::Busy(st.knobs.streams[ix(slot)])
         } else {
             Retired::Closed
         }
@@ -416,6 +409,9 @@ impl Migrator for Rig {
 
 impl Recorder for Rig {
     fn record(&self, intent: &Intent) -> Result<(), Halt> {
+        if self.st().knobs.fail_record == Some(intent.phase) {
+            return Err(Halt::Port("update.json refused the record".into()));
+        }
         if let Some(dir) = &self.dir {
             FileRecorder::new(dir).record(intent)?;
         }
@@ -435,7 +431,11 @@ impl RootOrders for Rig {
     }
 
     fn staged(&self) -> Result<Option<StagedFacts>, PortError> {
-        Ok(self.st().knobs.staged.clone().map(|commit| StagedFacts {
+        let st = self.st();
+        if st.knobs.status_err {
+            return Err(PortError("status.json unreadable".into()));
+        }
+        Ok(st.knobs.staged.clone().map(|commit| StagedFacts {
             commit,
             protocol: 7,
             min_protocol: 5,
@@ -445,7 +445,11 @@ impl RootOrders for Rig {
     }
 
     fn installed(&self) -> Result<Option<CommitId>, PortError> {
-        Ok(self.st().installed.clone())
+        let st = self.st();
+        if st.knobs.status_err {
+            return Err(PortError("status.json unreadable".into()));
+        }
+        Ok(st.installed.clone())
     }
 
     fn confirm(&self, commit: &CommitId) -> Result<(), PortError> {
